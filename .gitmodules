@@ -1,30 +1,40 @@
 [submodule "external/diagnostics"]
 	path = external/diagnostics
 	url = https://github.com/ros/diagnostics.git
+	ignore = untracked
 [submodule "external/f1tenth_gym"]
 	path = external/f1tenth_gym
 	url = https://github.com/f1tenth/f1tenth_gym.git
+	ignore = untracked
 [submodule "external/f1tenth_maps"]
 	path = external/f1tenth_maps
 	url = https://github.com/CPS-TUWien/f1tenth_maps.git
+	ignore = untracked
 [submodule "external/f1tenth_racetracks"]
 	path = external/f1tenth_racetracks
 	url = https://github.com/f1tenth/f1tenth_racetracks.git
+	ignore = untracked
 [submodule "external/f1tenth-racing-stack-ICRA22"]
 	path = external/f1tenth-racing-stack-ICRA22
 	url = https://github.com/zzjun725/f1tenth-racing-stack-ICRA22.git
+	ignore = untracked
 [submodule "external/f1tenth_system"]
 	path = external/f1tenth_system
 	url = https://github.com/f1tenth/f1tenth_system.git
+	ignore = untracked
 [submodule "external/korea_teams/F1tenthKorea2024"]
 	path = external/korea_teams/F1tenthKorea2024
 	url = https://github.com/HMCL-UNIST/F1tenthKorea2024.git
+	ignore = untracked
 [submodule "external/korea_teams/f1tenth_tada"]
 	path = external/korea_teams/f1tenth_tada
 	url = https://github.com/arti1117/f1tenth_tada.git
+	ignore = untracked
 [submodule "external/korea_teams/KORA_K3"]
 	path = external/korea_teams/KORA_K3
 	url = https://github.com/hajaemingood/KORA_K3.git
+	ignore = untracked
 [submodule "external/korea_teams/project_The_4th_F1TENTH_Korea_championship"]
 	path = external/korea_teams/project_The_4th_F1TENTH_Korea_championship
 	url = https://github.com/JihyunKim725/project_The_4th_F1TENTH_Korea_championship.git
+	ignore = untracked
