@@ -21,6 +21,17 @@ src/
   docs/         screenshots
 ```
 
+## Getting the code
+`~/F1tenth/src` is a git repository (initialized 2026-09-07); the third-party stacks and map
+collections under `external/` are submodules pinned to the commits this work was done against.
+```bash
+git clone --recurse-submodules <url> ~/F1tenth/src      # or: git submodule update --init --recursive
+bash ~/F1tenth/src/external/setup_colcon_ignore.sh        # colcon must not build vesc_driver, teleop_tools, gym, maps ...
+pip install -e ~/F1tenth/src/f1sim && cd ~/F1tenth && colcon build --symlink-install
+```
+Ignored on purpose: `__pycache__`, `*.egg-info`, W&B folders, checkpoints (`*.pt`, `*.onnx`, they live
+in `~/f1sim_runs`) and the rendered videos in `docs/` (re-render with `f1sim.learn.watch`).
+
 ## Why not f1tenth_gym
 | f1tenth_gym | f1sim |
 |---|---|
