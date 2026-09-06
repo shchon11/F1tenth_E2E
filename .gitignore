@@ -1,0 +1,14 @@
+# python / build
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+# training artefacts (runs live in ~/f1sim_runs)
+wandb/
+*.pt
+*.onnx
+*.trt
+*.log
+# generated videos (re-render with f1sim.learn.watch --record / --highlights)
+docs/*.mp4

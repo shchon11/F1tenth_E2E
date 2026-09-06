@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>f1sim viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1116; color: #d8dee9; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #c { width: 100%; height: 100%; display: block; }
+  #hud { position: absolute; left: 12px; top: 10px; background: rgba(14,17,22,.75); border: 1px solid #2a2f3a; border-radius: 8px; padding: 8px 12px; min-width: 210px; pointer-events: none; }
+  #hud b { color: #fff; }
+  #hud .row { display: flex; justify-content: space-between; gap: 14px; }
+  #help { position: absolute; right: 12px; bottom: 10px; color: #8892a6; font-size: 12px; background: rgba(14,17,22,.6); padding: 6px 10px; border-radius: 6px; }
+  #status { position: absolute; left: 12px; bottom: 10px; color: #8892a6; font-size: 12px; }
+  .bad { color: #ff5f56; }
+  .good { color: #7ee787; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><b id="hud-title">f1sim</b><div id="hud-body"></div></div>
+<div id="help">[ ] focus car &nbsp;·&nbsp; C camera (chase/top/orbit/overview/closeup) &nbsp;·&nbsp; L lidar &nbsp;·&nbsp; R raceline &nbsp;·&nbsp; T trails</div>
+<div id="status">connecting…</div>
+<script>
+  window.addEventListener('error', e => { document.getElementById('status').textContent = 'JS error: ' + e.message + ' @' + (e.filename||'').split('/').pop() + ':' + e.lineno; });
+  window.addEventListener('unhandledrejection', e => { document.getElementById('status').textContent = 'JS error: ' + (e.reason && e.reason.message || e.reason); });
+</script>
+<script type="importmap">
+{ "imports": { "three": "./three/three.module.js", "three/addons/": "./three/addons/" } }
+</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

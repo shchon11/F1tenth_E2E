@@ -1,0 +1,9 @@
+free_thresh: 0.196
+image: random_1.pgm
+negate: 0
+occupied_thresh: 0.65
+origin:
+- -12.886597976572709
+- -11.812179505360845
+- 0.0
+resolution: 0.05

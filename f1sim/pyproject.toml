@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "f1sim"
+version = "0.1.0"
+description = "GPU-vectorized F1TENTH simulator for RL/IL e2e planner training (Hokuyo 2D LiDAR, VESC)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "torch", "scipy", "pyyaml", "pillow", "matplotlib", "websockets"]
+
+[project.optional-dependencies]
+gym = ["gymnasium>=0.29"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["f1sim*"]
+
+[tool.setuptools.package-data]
+f1sim = ["assets/*.glb", "viewer/static/*.html", "viewer/static/*.js", "viewer/static/three/*.js",
+         "viewer/static/three/addons/*/*.js"]

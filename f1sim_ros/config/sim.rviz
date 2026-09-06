@@ -1,0 +1,57 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Value: true
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Topic:
+        Durability Policy: Transient Local
+        Value: /map
+      Value: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Size (m): 0.05
+      Style: Points
+      Topic:
+        Value: /scan
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Name: VESC odom
+      Topic:
+        Value: /odom
+      Keep: 200
+      Shape:
+        Color: 255; 170; 0
+        Shaft Length: 0.2
+        Head Length: 0.1
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Name: Ground truth
+      Topic:
+        Value: /ego_racecar/odom
+      Keep: 200
+      Shape:
+        Color: 255; 0; 0
+        Shaft Length: 0.2
+        Head Length: 0.1
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Value: true
+  Global Options:
+    Fixed Frame: map
+  Tools:
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Scale: 30
+    Saved: ~

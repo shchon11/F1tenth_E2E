@@ -1,0 +1,20 @@
+# f1sim configuration for the ROS bridge. Any field of f1sim.params dataclasses can be set here.
+vehicle: {}
+actuator:
+  cmd_delay: 0.03
+lidar:
+  n_beams: 1080
+  fov: 4.71238898
+  range_max: 10.0
+  rate: 40.0
+  mount_x: 0.27
+odom: {}
+imu:
+  enabled: true
+  imu_rate: 100.0
+sim:
+  physics_dt: 0.001
+  control_rate: 40.0
+  terminate_on_collision: false     # in ROS the car stops against the wall instead of freezing
+rand:
+  enabled: true
