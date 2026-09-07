@@ -354,7 +354,12 @@ ignored), and it is what blackbox2022_3's side corridors are. Half of them turn 
 their first leg, so their end is out of sight from the mouth, as in a real side corridor: the
 policy cannot learn "enter only if no end wall is visible". From ppo_v11 every real map trains
 plain, with boxes and with pockets; ppo_v12 = the same run restarted from ppo_v11's checkpoint with
-the bend-biased pockets. ppo_v11 starts
+the bend-biased pockets. Neither learned the pockets (0.18 -> 0.19 crashes per car on pocket tracks
+over 200 updates, the same pockets trapping the same cars), and the log said why: KL to the init
+0.027 after 200 updates. The KL-to-init term (1.0, decaying over 40M steps) was meant to protect the
+DAgger init in ppo_v9; every warm-started run re-armed it and spent its first ~300 updates pinned
+to its start. ppo_v13 = from ppo_v12's checkpoint with `--kl-coef 0.2 --kl-decay 10e6` and the elbow
+pockets. ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
 at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else
 at most 0.06.
