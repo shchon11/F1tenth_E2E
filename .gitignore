@@ -12,3 +12,4 @@ wandb/
 *.log
 # generated videos (re-render with f1sim.learn.watch --record / --highlights)
 docs/*.mp4
+!docs/promo.mp4

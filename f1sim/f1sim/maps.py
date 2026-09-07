@@ -34,7 +34,8 @@ REAL = {
     "blackbox2022_2": (os.path.join(TUW, "blackbox2022_2.yaml"), "duct", 0.35, "TU Wien BlackBox race 2022", None, 0.15),
     "blackbox2022_3": (os.path.join(TUW, "blackbox2022_3.yaml"), "duct", 0.30, "TU Wien BlackBox race 2022"),
     "korea_2025_iccas": (os.path.join(KOR, "KORA_K3", "src", "kora_k3", "maps", "real.yaml"), "duct", 0.35, "4th F1TENTH Korea Championship 2025 (ICCAS) race track, team SLAM map", (3.0, 0.0), 0.05,
-                         dict(keep_region=True, outer_walls=True)),   # raw SLAM: spray through the doors, specks; hall walls are walls
+                         dict(keep_region=True, unknown_floor_depth=5.0)),   # raw SLAM: spray, specks. The outline is a hose too
+                                                                              # (track built from ducts in a bigger hall): floor beyond
 }
 CENTERLINE_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "f1sim", "centerlines")
 

@@ -1,5 +1,12 @@
 # F1TENTH e2e planner workspace
 
+<p align="center">
+  <img src="docs/promo.gif" width="800" alt="f1sim: 3D LiDAR over a real competition venue, 256 agents training, the LiDAR-only policy's attention, and a race with opponents"/>
+  <br/>
+  <sub>30 s tour (<a href="docs/promo.mp4">mp4</a>): LiDAR traced in 3D on the Korea championship map, 256 agents training in parallel, what the LiDAR-only policy attends to, and a race against opponents with rear detection boxes. Rendered headless by <code>f1sim/scripts/promo_video.py</code>.</sub>
+</p>
+
+
 Goal: a realistic, fast F1TENTH simulator (ROS 2 Humble) for training an end-to-end
 LiDAR-only planner (RL and/or IL) and deploying it on the real car (Hokuyo 1080-beam 2D
 LiDAR, VESC, Jetson AGX).
@@ -84,9 +91,10 @@ Config is a dataclass tree (`f1sim/params.py`) and can be loaded from yaml (`Con
   `blackbox2022_1..3` (TU Wien BlackBox races),
   `korea_2025_iccas` (4th F1TENTH Korea Championship 2025 at ICCAS, KORA team SLAM map; loaded
   with the SLAM clean-up: only the hall's free region is kept -- a 0.15 m opening cuts the leaks
-  through which scan rays sprayed out of the doors -- floating specks are dropped, the unseen
-  interiors of the hoses count as hose, and mapped walls that back onto the outside are tall walls
-  instead of hoses; `Track.from_ros_map(keep_region=True, outer_walls=True)`). Practice
+  through which scan rays sprayed out of the gaps -- floating specks are dropped and the unseen
+  interiors of the hoses count as hose. The rectangular outline is the outer duct hose of a track
+  built inside a bigger hall, so beyond it the LiDAR sees floor for 5 m; `outer_walls=True` exists
+  for maps whose outline really is a wall; `Track.from_ros_map(keep_region=True, ...)`). Practice
   tracks of Korean teams and the CTU Prague `plechaty` venue are deliberately not in the catalog
   (not competition layouts). The Korea championship organizers publish no map files
   (tracks are built on site and mapped by the teams; the orientation decks only show a venue photo:
