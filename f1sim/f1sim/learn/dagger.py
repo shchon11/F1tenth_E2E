@@ -29,7 +29,7 @@ class StepBuffer:
         self.scan, self.pro, self.lab, self.newep = [], [], [], []
 
     def add(self, scan_now, proprio, label, new_episode):
-        self.scan.append(scan_now.to(torch.float16).cpu()); self.pro.append(proprio.cpu())
+        self.scan.append(scan_now.to(torch.float16).cpu()); self.pro.append(proprio.to(torch.float16).cpu())   # a 1 s proprio history is 322 floats/sample
         self.lab.append(label.cpu()); self.newep.append(new_episode.cpu())
 
     def finalize(self):
@@ -51,7 +51,7 @@ class StepBuffer:
             blocked = blocked | self.N[cur_t, b] | (cur_t == 0)
             cur_t = torch.where(blocked, cur_t, cur_t - 1)
         scan = torch.stack(stack, 1).to(device, torch.float32)
-        return scan, self.P[t, b].to(device), self.L[t, b].to(device)
+        return scan, self.P[t, b].to(device).float(), self.L[t, b].to(device)
 
 
 def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0):
@@ -105,6 +105,7 @@ def main():
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the student outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--teacher-speed", type=float, default=1.0, help="scale on the teacher's speed profile (0.9: fewer teacher crashes through the plan tracker)")
     ap.add_argument("--hist-len", type=int, default=0, help="proprio history rows in the observation")
+    ap.add_argument("--keep-iters", type=int, default=5, help="aggregate the data of at most this many recent iterations (host RAM)")
     ap.add_argument("--eval-steps", type=int, default=800); ap.add_argument("--wandb", default="online")
     a = ap.parse_args()
     device = torch.device(a.device)
@@ -127,7 +128,7 @@ def main():
         beta = 1.0 if it == 0 else a.beta0 * (0.5 ** (it - 1))
         tm = common.Timer()
         buf = collect(env, model, teacher, a.steps, beta, device, StepBuffer(spec.scan_stack), noise=0.05 if it else 0.0).finalize()
-        bufs.append(buf); t_col = tm.lap()
+        bufs.append(buf); bufs = bufs[-a.keep_iters:]; t_col = tm.lap()        # host RAM: keep the last few iterations (14 GB laptop)
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log); t_tr = tm.lap()
         m = common.rollout_metrics(env, lambda o: model.act(*flatten_obs(o), deterministic=True)[0], a.eval_steps, a.speed_cap); t_ev = tm.lap()
         tm_ = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps, a.speed_cap) if it == 0 else tm_
