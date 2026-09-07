@@ -187,22 +187,41 @@ def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSp
     return u, z
 
 
-_ilqr_compiled = None
+def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSpec, wb: float, s_max: float, v_max: float):
+    """Whole tracker step as one function (compiled into a single CUDA graph on the GPU): decode the plan,
+    build the reference, predict over the latency, run the iLQR. Returns (u (B,N,2), z (B,N+1,6), ref)."""
+    k, Lp, v0, v1 = decode(action, v_meas, v_max, speed_cap, spec)
+    ref = reference(k, Lp, v0, v1, spec, v_meas)
+    v = v_meas.abs()
+    Le = wb + spec.k_us * v * v
+    steer_now = torch.atan(yaw_rate * Le / v.clamp_min(0.5)).clamp(-s_max, s_max)
+    psi0 = yaw_rate * delay
+    z0 = torch.stack([v * delay, 0.5 * v * psi0 * delay, psi0, (v + u_prev[:, 1] * delay).clamp_min(0.0),
+                      torch.where(v > 0.5, steer_now, u_prev[:, 0]), u_prev[:, 1]], 1)
+    u, z = ilqr(z0, ref, warm, spec, wb, s_max, v_max)
+    return u, z, ref
 
 
-def ilqr_fast(z0, ref, u_warm, spec, wb, s_max, v_max):
-    global _ilqr_compiled
-    if z0.is_cuda:
-        if _ilqr_compiled is None:
-            try:
-                _ilqr_compiled = torch.compile(ilqr, dynamic=False, mode="reduce-overhead")   # CUDA graphs: 19 ms / 2048 envs
-            except Exception:
-                _ilqr_compiled = ilqr
+_solve_compiled = {}
+
+
+def solve_fast(*args, **kw):
+    """solve() through torch.compile(mode="reduce-overhead") on CUDA (one graph per (batch, spec))."""
+    if not args[0].is_cuda:
+        return solve(*args, **kw)
+    key = (args[0].shape[0], id(args[7]))
+    f = _solve_compiled.get(key)
+    if f is None:
         try:
-            return _ilqr_compiled(z0, ref, u_warm, spec, wb, s_max, v_max)
+            f = torch.compile(solve, dynamic=False, mode="reduce-overhead")
         except Exception:
-            _ilqr_compiled = ilqr
-    return ilqr(z0, ref, u_warm, spec, wb, s_max, v_max)
+            f = solve
+        _solve_compiled[key] = f
+    try:
+        return f(*args, **kw)
+    except Exception:
+        _solve_compiled[key] = solve
+        return solve(*args, **kw)
 
 
 class PlanTracker:
@@ -226,22 +245,17 @@ class PlanTracker:
         optional), delay: calibrated command latency [s] (float or (B,), default spec.delay)
         -> (steer [rad], speed cmd [m/s]) (B,2)"""
         sp = self.spec
-        k, Lp, v0, v1 = decode(action, v_meas, self.v_max, speed_cap, sp)
-        ref = reference(k, Lp, v0, v1, sp, v_meas)
-        # predict over the command latency (body frame at decision time). The car is still turning with
-        # its *measured* yaw rate, whatever the servo did with the last command
-        v = v_meas.abs(); tau = sp.delay if delay is None else delay
-        Le = self.wb + sp.k_us * v * v
-        if yaw_rate is None:
-            yaw_rate = v * torch.tan(self.u_prev[:, 0]) / Le
-        steer_now = torch.atan(yaw_rate * Le / v.clamp_min(0.5)).clamp(-self.s_max, self.s_max)
-        psi0 = yaw_rate * tau
-        z0 = torch.stack([v * tau, 0.5 * v * psi0 * tau, psi0, (v + self.u_prev[:, 1] * tau).clamp_min(0.0),
-                          torch.where(v > 0.5, steer_now, self.u_prev[:, 0]), self.u_prev[:, 1]], 1)
+        v = v_meas.abs()
+        if yaw_rate is None:                                       # no IMU: assume the last command took
+            yaw_rate = v * torch.tan(self.u_prev[:, 0]) / (self.wb + sp.k_us * v * v)
+        if delay is None:
+            delay = torch.full_like(v, sp.delay)
+        elif not torch.is_tensor(delay):
+            delay = torch.full_like(v, float(delay))
         warm = torch.cat([self.u_seq[:, 1:], self.u_seq[:, -1:]], 1)
-        u, z = ilqr_fast(z0, ref, warm, sp, self.wb, self.s_max, self.v_max)
-        u, z = u.clone(), z.clone()                       # CUDA-graph outputs are reused by the next run: keep copies
+        u, z, ref = solve_fast(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
+        u, z, ref = u.clone(), z.clone(), ref.clone()             # CUDA-graph outputs are reused by the next run
         self.u_seq = u; self.u_prev = u[:, 0].clone(); self.last_ref = ref; self.last_pred = z[:, :, :4]
-        k = max(1, int(round(sp.v_cmd_lead / sp.dt)))
-        v_cmd = torch.minimum(z[:, k, 3], speed_cap)
+        k_ = max(1, int(round(sp.v_cmd_lead / sp.dt)))
+        v_cmd = torch.minimum(z[:, k_, 3], speed_cap)
         return torch.stack([u[:, 0, 0], v_cmd], 1)

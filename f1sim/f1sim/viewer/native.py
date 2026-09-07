@@ -87,6 +87,7 @@ class NativeViewer:
         import threading
         self._lock = threading.RLock()
         self._worker = None; self._worker_err = None
+        self._snap = None; self._sel = None; self.env_ids = None
         self._t_wall0 = None; self._t_sim0 = None
         self._orbit = [math.radians(-35), math.radians(30), 4.0]   # azimuth, elevation, distance
         self._drag = None
@@ -156,20 +157,45 @@ class NativeViewer:
 
     # ------------------------------------------------------------------ state
     def update(self, r):
-        """Snapshot a StepResult (torch) into numpy for rendering: a handful of device->host copies."""
-        sel = torch.nonzero(self.sim.tid == self.track_index).flatten()[: self.max_cars]
-        n = sel.numel()
-        if n == 0:
+        """Hand the latest StepResult to the render thread: no GPU work at all on the sim thread (the
+        result's tensors are fresh objects every step, so reading them later is safe)."""
+        with self._lock:
+            self._snap = (r, r.t)
+
+    def _pull(self):
+        """Render thread: gather the newest snapshot on the GPU (its own CUDA stream, so the sim's stream
+        is not held up), one device->host copy, numpy frame dict."""
+        with self._lock:
+            snap = self._snap; self._snap = None
+        if snap is None:
             return
-        env_ids = sel.cpu().numpy()
-        f = int((env_ids == self.focus).nonzero()[0][0]) if self.focus in env_ids else 0
-        fe = int(env_ids[f])
-        pack = torch.cat([r.state[sel], r.attitude[sel], r.lap[sel, None].float(), r.collision[sel, None].float(),
-                          r.s[sel, None], r.wall_dist[sel, None], self.sim.car_rear[sel], self.sim.car_dims[sel, 0:1]], 1).detach().cpu().numpy()
-        scan = torch.stack([r.scan[fe], r.scan_type[fe].float()], 0).cpu().numpy()
+        if self.sim.device.type == "cuda":
+            if getattr(self, "_rstream", None) is None:
+                self._rstream = torch.cuda.Stream()
+            with torch.cuda.stream(self._rstream):
+                self._rstream.wait_stream(torch.cuda.current_stream())
+                return self._pull_gather(snap)
+        return self._pull_gather(snap)
+
+    def _pull_gather(self, snap):
+        r, t = snap
+        sel = torch.nonzero(self.sim.tid == self.track_index).flatten()[: self.max_cars] if self._sel is None else self._sel
+        if self._sel is None and self.sim.track.T == 1:
+            self._sel = sel
+        if sel.numel() == 0:
+            return
+        fe = int(self.focus) if 0 <= int(self.focus) < r.scan.shape[0] else 0
         Pk = ("mount_x", "mount_y", "mount_z", "mount_yaw", "mount_roll", "mount_pitch")
-        pv = torch.stack([self.sim.P[k][fe] for k in Pk]).cpu().numpy()
-        fr = {"t": r.t, "n": n, "x": pack[:, 0], "y": pack[:, 1], "yaw": pack[:, 2], "vx": pack[:, 3], "steer": pack[:, 6],
+        pack_t = torch.cat([r.state[sel], r.attitude[sel], r.lap[sel, None].float(), r.collision[sel, None].float(),
+                            r.s[sel, None], r.wall_dist[sel, None], self.sim.car_rear[sel], self.sim.car_dims[sel, 0:1]], 1)
+        nb = r.scan.shape[1]
+        flat = torch.cat([pack_t.reshape(-1), r.scan[fe], r.scan_type[fe].float(), torch.stack([self.sim.P[k][fe] for k in Pk])]).cpu().numpy()
+        pshape = pack_t.shape; n = pshape[0]
+        pack = flat[:n * pshape[1]].reshape(pshape)
+        scan = flat[n * pshape[1]:n * pshape[1] + 2 * nb].reshape(2, nb); pv = flat[n * pshape[1] + 2 * nb:]
+        env_ids = sel.cpu().numpy() if self.env_ids is None or len(self.env_ids) != n else self.env_ids
+        f = int((env_ids == fe).nonzero()[0][0]) if fe in env_ids else 0
+        fr = {"t": t, "n": n, "x": pack[:, 0], "y": pack[:, 1], "yaw": pack[:, 2], "vx": pack[:, 3], "steer": pack[:, 6],
               "roll": pack[:, 7], "pitch": pack[:, 8], "lap": pack[:, 9], "coll": pack[:, 10], "s": pack[:, 11], "wall": pack[:, 12],
               "rear": pack[:, 13:17], "len": pack[:, 17], "scan": scan[0], "scan_type": scan[1].astype(np.int32),
               "focus": f, "focus_env": fe, "ids": env_ids, "P": {k: float(pv[i]) for i, k in enumerate(Pk)}}
@@ -231,18 +257,21 @@ class NativeViewer:
                             now_ = time.perf_counter(); self._sim_rate = (self.sim.t - sim_rate0) / max(1e-3, now_ - t_rate); t_rate, sim_rate0 = now_, self.sim.t
                         if realtime:
                             lead = (self.sim.t - sim_t0) - (time.perf_counter() - t0)
+                            self._lead = lead
                             if lead > 0: time.sleep(min(lead, 0.05))
                             elif lead < -0.5: t0 = time.perf_counter(); sim_t0 = self.sim.t   # can't keep up: re-anchor
                 except Exception as e:                  # surface in the main thread
                     self._worker_err = e; self.alive = False
             self._worker = threading.Thread(target=worker, daemon=True); self._worker.start()
+            self._lead = 0.0; t_last = 0.0
             while self.alive:
+                # the sim's real-time pace comes first: render only while the sim is ahead of the wall
+                # clock (in the time it would otherwise sleep); if it cannot keep up at all, 2 fps
+                if realtime and self._sim_rate > 0.0 and self._lead < 0.004 and time.perf_counter() - t_last < 0.5:
+                    time.sleep(0.004); continue
                 t_r = time.perf_counter()
-                self.render()
-                # the sim's real-time pace comes first: while it lags, render rarely so the GIL is the sim's
-                fps = self.max_fps or 30
-                if realtime and 0.0 < self._sim_rate < 0.97: fps = 6.0
-                wait = t_r + 1.0 / fps - time.perf_counter()
+                self.render(); t_last = t_r
+                wait = t_r + 1.0 / (self.max_fps or 30) - time.perf_counter()
                 if wait > 0: time.sleep(wait)
             self._worker.join(timeout=10.0)                          # let the sim step in flight finish before exit
             if self._worker_err is not None:
@@ -288,6 +317,7 @@ class NativeViewer:
             glfw.poll_events()
             if glfw.window_should_close(self.window):
                 self.alive = False; return
+        self._pull()
         with self._lock:
             fr = self._interp()
             if getattr(self, "_trail_pending", False) and self.frame is not None:

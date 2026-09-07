@@ -305,6 +305,7 @@ def main(argv=None):
     ap.add_argument("--highlights", default="", help="headless highlight mode: directory for one mp4 per episode")
     ap.add_argument("--internals", action="store_true", help="also show the raw hidden-layer / conv-feature activations")
     ap.add_argument("--panel-every", type=int, default=3, help="recompute saliency + the panel every k sim steps (GPU launches)")
+    ap.add_argument("--bench", type=float, default=0.0, help="headless: run the interactive loop (threaded, real-time paced) for this many seconds and report the sim rate")
     ap.add_argument("--race-size", type=int, default=1, help="cars per race (>1: opponents in the scan)")
     ap.add_argument("--opponent", default="teacher", choices=["teacher", "policy"], help="who drives the other cars of a race")
     a = ap.parse_args(argv)
@@ -340,7 +341,7 @@ def main(argv=None):
     obs, info = env.reset()
     env.sim.warmup()
     from ..viewer.native import NativeViewer
-    headless = bool(a.record or a.frames or a.highlights)
+    headless = bool(a.record or a.frames or a.highlights or a.bench)
     v = NativeViewer(env.sim, headless=headless, max_cars=a.cars, width=1600, height=900)
     state = {"obs": obs, "last_reload": time.time(), "model": model, "extra": extra}
 
@@ -371,13 +372,21 @@ def main(argv=None):
         return
 
     def compiled_act(m):
-        """The actor's mean as one CUDA graph (launch-bound next to a training job: 12 ms -> ~1 ms)."""
+        """The actor's mean as one CUDA graph (launch-bound next to a training job: 12 ms -> ~1 ms).
+        A hook-free copy: the Introspector's activation hooks would break the graph into eager pieces."""
+        import copy as _copy
+        actor = _copy.deepcopy(m.actor).eval()
+        for mod in actor.modules():
+            mod._forward_hooks.clear(); mod._forward_pre_hooks.clear()
         if device.type != "cuda":
-            return lambda scan, pro: m.actor(scan, pro)
-        try:
-            return torch.compile(m.actor.forward, dynamic=False, mode="reduce-overhead")
-        except Exception:
-            return lambda scan, pro: m.actor(scan, pro)
+            return lambda scan, pro: actor(scan, pro)
+        compiled = torch.compile(actor.forward, dynamic=False, mode="reduce-overhead"); box = {"f": compiled}
+        def f(scan, pro):
+            try:
+                return box["f"](scan, pro)
+            except Exception:
+                box["f"] = actor.forward; return actor(scan, pro)
+        return f
     state["act_fn"] = compiled_act(model)
 
     def step():
@@ -392,40 +401,32 @@ def main(argv=None):
             except Exception:
                 pass
         m = state["model"]
+        prof = state.setdefault("prof", {}); tp = time.perf_counter
+        def lap(name, t0):
+            if a.bench:
+                prof[name] = prof.get(name, 0.0) + tp() - t0        # CPU time only: a sync here would itself stall the sim thread
+            return tp()
+        t0 = tp()
         scan, pro = flatten_obs(state["obs"])
         with torch.no_grad():
             mu_all = state["act_fn"](scan, pro).clone()
             act = mu_all if not a.stochastic else (mu_all + m.actor.log_std.exp() * torch.randn_like(mu_all)).clamp(-1, 1)
+        t0 = lap("act", t0)
         state["k"] = state.get("k", 0) + 1
-        every = state["k"] % a.panel_every == 1 or a.panel_every == 1
-        if every:                                                     # saliency (a backward pass): not every step
-            with torch.no_grad():
-                priv = env.privileged(env.last_result)
-                try:                                                  # a single-car critic cannot value a race (extra opponent inputs)
-                    val = m.critic(scan[v.focus:v.focus + 1], pro[v.focus:v.focus + 1], priv[v.focus:v.focus + 1]).item()
-                except RuntimeError:
-                    val = None
-            sal, mu = intro.saliency(scan, pro, v.focus)
-            v.point_colors = sal_colors(sal)
-            std = m.actor.log_std.exp().detach().cpu().numpy()
-            hid = (intro.h["hidden"][0].float().cpu().numpy(), intro.h["stem"][0].float().cpu().numpy()) if a.internals else None
-            state["panel_args"] = (sal, mu, std, val, hid)
+        t0 = lap("saliency", t0)
         state["obs"], rew, term, trunc, info = env.step(act)
+        t0 = lap("env.step", t0)
         fc = v.focus
-        # numbers for the overlays in one transfer; the images are drawn by the render thread (PIL is slow)
-        st_ = torch.cat([env.sim.state[fc, [3, 6]], env.last_cmd[fc], env.speed_cap[fc:fc + 1]]).cpu().numpy()
-        vmax, smax, cap_, info_ = env.ecfg.v_max_policy, env.s_max, a.speed_cap, step_info
-        v.dash_fn = lambda st_=st_: dash_image(float(st_[0]), float(st_[3]), float(st_[4]), float(st_[1]), float(st_[2]), vmax, smax)
-        if every and "panel_args" in state:
-            sal, mu, std, val, hid = state["panel_args"]
-            plan_ref = env.tracker.last_ref[fc].cpu().numpy() if mode == "plan" else None
-            cmd_ = st_[2:4] if mode == "plan" else None
-            def panel_fn(sal=sal, mu=mu, std=std, val=val, hid=hid, plan_ref=plan_ref, cmd_=cmd_, info_=info_):
-                img = panel_image(sal, mu, std, val, cap_, info_, plan_ref=plan_ref, cmd=cmd_)
-                if hid is not None:
-                    pi = panel_internals(*hid); both = Image.new("RGBA", (480, 430), (0, 0, 0, 0)); both.paste(img, (0, 0)); both.paste(pi, (0, 300)); img = both
-                return img
-            v.panel_fn = panel_fn
+        # everything the overlays need, as GPU clones (no host sync on this thread); the render thread
+        # runs the saliency backward pass, the critic and the PIL drawing at its own pace
+        if state["k"] % 2 == 0:
+            src = {"scan": scan[fc:fc + 1].clone(), "pro": pro[fc:fc + 1].clone(),
+                   "dash": torch.cat([env.sim.state[fc, [3, 6]], env.last_cmd[fc], env.speed_cap[fc:fc + 1]]).clone(),
+                   "plan": env.tracker.last_ref[fc].clone() if mode == "plan" else None,
+                   "priv": env.privileged(env.last_result)[fc:fc + 1].clone() if state["k"] % (2 * a.panel_every) == 0 else None,
+                   "model": m, "info": step_info}
+            v.overlay_src = src
+        lap("overlay data", t0)
         age = time.time() - mtime
         v.extra_hud = ["", f"POLICY  {step_info}",
                        f"        file {os.path.basename(ckpt_path)}, saved {age / 60:.0f} min ago (auto-reloads)   output: " + ("local plan -> iLQR tracker" if mode == "plan" else "steer + speed")]
@@ -433,6 +434,52 @@ def main(argv=None):
             v.plan = env.plan_world(v.focus); v.plan_pred = env.plan_world(v.focus, predicted=True)
         return env.last_result
 
+    # capture every CUDA graph (actor, tracker, LiDAR post-processing) in the main thread: the sim thread
+    # cannot record new graphs and would silently fall back to eager kernels (3x slower)
+    for _ in range(8):
+        step()
+    vmax, smax = env.ecfg.v_max_policy, env.s_max
+    cache = {}
+    def dash_fn():
+        src = getattr(v, "overlay_src", None)
+        if src is None or time.perf_counter() - cache.get("t_dash", 0.0) < 0.2: return v.dash
+        cache["t_dash"] = time.perf_counter()
+        d = src["dash"].cpu().numpy()
+        return dash_image(float(d[0]), float(d[3]), float(d[4]), float(d[1]), float(d[2]), vmax, smax)
+    def panel_fn():
+        src = getattr(v, "overlay_src", None)
+        if src is None or src is cache.get("last"): return v.panel
+        if time.perf_counter() - cache.get("t_panel", 0.0) < 0.5: return v.panel   # saliency + panel at most 2 Hz
+        cache["t_panel"] = time.perf_counter()
+        cache["last"] = src; m_ = src["model"]
+        with torch.no_grad():
+            try:
+                val = m_.critic(src["scan"], src["pro"], src["priv"]).item() if src.get("priv") is not None else cache.get("val")
+            except RuntimeError:
+                val = None
+        sal, mu = intro.saliency(src["scan"], src["pro"], 0)
+        cache["sal"], cache["val"] = sal, val
+        v.point_colors = sal_colors(sal)
+        std = m_.actor.log_std.exp().detach().cpu().numpy()
+        plan_ref = src["plan"].cpu().numpy() if src["plan"] is not None else None
+        cmd_ = src["dash"][2:4].cpu().numpy() if mode == "plan" else None
+        img = panel_image(sal, mu, std, val, a.speed_cap, src["info"], plan_ref=plan_ref, cmd=cmd_)
+        if a.internals:
+            pi = panel_internals(intro.h["hidden"][0].float().cpu().numpy(), intro.h["stem"][0].float().cpu().numpy())
+            both = Image.new("RGBA", (480, 430), (0, 0, 0, 0)); both.paste(img, (0, 0)); both.paste(pi, (0, 300)); img = both
+        return img
+    v.dash_fn = dash_fn; v.panel_fn = panel_fn
+    if a.bench:
+        t_end = time.time() + a.bench; n = {"f": 0}; orig_render = v.render
+        def timed_render():
+            orig_render(); n["f"] += 1
+            if time.time() > t_end: v.alive = False
+        v.render = timed_render; t0 = time.time(); s0 = env.sim.t
+        v.run(step, realtime=not a.fast)
+        dt = time.time() - t0
+        print(f"bench: sim {(env.sim.t - s0) / dt:.2f}x real time, render {n['f'] / dt:.1f} fps, {a.cars} cars, {dt:.0f} s", flush=True)
+        k = max(1, state.get("k", 1)); print("  per step:", {kk: f"{vv / k * 1e3:.1f} ms" for kk, vv in state.get("prof", {}).items()}, flush=True)
+        v.close(); torch.cuda.synchronize() if device.type == "cuda" else None; os._exit(0)
     if not headless:
         try:
             v.run(step, realtime=not a.fast)

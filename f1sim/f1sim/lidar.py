@@ -202,9 +202,12 @@ class Lidar:
         if not noisy:
             return r_true, r_true, typ
         tid_ = torch.zeros(B, dtype=torch.long, device=pose.device) if tid is None else tid
-        if self._post_fast is not self._post and car_poro is None:     # one CUDA graph for the whole post-processing
-            r, r_true2, typ2 = self._post_fast(r_true, typ, origin, dh, k, tid_, P)
-            return r.clone(), r_true2.clone(), typ2.clone()
+        if compiled and self._post_fast is not self._post and car_poro is None:   # one CUDA graph for the whole post-processing (full batches only)
+            try:
+                r, r_true2, typ2 = self._post_fast(r_true, typ, origin, dh, k, tid_, P)
+                return r.clone(), r_true2.clone(), typ2.clone()
+            except Exception:
+                self._post_fast = self._post                        # inductor/Triton failure: eager from now on
         return self._post(r_true, typ, origin, dh, k, tid_, P, car_poro)
 
     def _post(self, r_true, typ, origin, dh, k, tid, P, car_poro=None):

@@ -82,12 +82,11 @@ class Simulator:
         # piecewise constant per control step, so latency is a lookup into this history)
         self.hist_len = int(math.ceil(max_delay / self.control_dt)) + 2
         self.cmd_hist = torch.zeros(num_envs, self.hist_len, 2, device=self.device)
-        self._roll = self._roll_physics
+        self._roll = self._roll_physics; self._post = self._post_roll
         if self.device.type == "cuda" and self.cfg.sim.compile:
-            try:
-                self._roll = torch.compile(self._roll_physics, dynamic=False, mode=self.cfg.sim.compile_mode)
-            except Exception:
-                self._roll = self._roll_physics
+            self._roll = self._guarded(torch.compile(self._roll_physics, dynamic=False, mode=self.cfg.sim.compile_mode), "_roll", self._roll_physics)
+            if self.cfg.sim.compile_mode == "reduce-overhead":
+                self._post = self._guarded(torch.compile(self._post_roll, dynamic=False, mode="reduce-overhead"), "_post", self._post_roll)
 
         self.state = torch.zeros(num_envs, dyn.STATE_DIM, device=self.device)
         self.ax = torch.zeros(num_envs, device=self.device)
@@ -301,37 +300,52 @@ class Simulator:
         self.steps += 1
 
         # --- collision check on footprint ---
-        wall_dist = self._footprint_clearance(state)
-        hit = wall_dist <= 0.0
         cars = None
         if self.M > 1:
             self.car_collision = self._car_contacts(state)
-            hit = hit | self.car_collision
             cars = self._car_boxes(state)
+        wall_dist, hit, odom_state, s, ds, lateral, lap = (t.clone() for t in self._post(state, self.odom.state, self.cmd, self.s, self.lap, self.tid, P))
+        if self.M > 1:
+            hit = hit | self.car_collision
         self.collided = self.collided | hit
+        self.odom.state = odom_state; self.s = s; self.lap = lap
+        odom = odom_state
 
         # --- sensors ---
         pose = state[:, :3]
         scan, scan_true, scan_type = self.lidar.scan(pose, self.pose_prev, P, self.cfg.lidar.motion_distortion,
                                                      att=att[:, [0, 2]], att_prev=self.att_prev, tid=self.tid, cars=cars)
-        odom = self.odom.update(state[:, dyn.IVX], self.cmd[:, 0], P, self.control_dt)
         imu = imu_samples if self.cfg.imu.enabled else None
         imu_att = imu_state[:, 18:21].clone() if self.cfg.imu.enabled else None
-
-        # --- progress ---
-        if self.track.cl is not None:
-            s, lateral, _ = self.track.project(pose[:, :2], self.tid)
-            ds = s - self.s
-            L = self.track.length[self.tid]
-            ds = torch.where(ds > L / 2, ds - L, torch.where(ds < -L / 2, ds + L, ds))
-            new_s = self.s + ds
-            self.lap += ((new_s >= L) & (ds > 0)).long() - ((new_s < 0) & (ds < 0)).long()
-            self.s = s
-        else:
-            s = torch.zeros(self.B, device=self.device); ds = s; lateral = s
         return StepResult(scan, scan_true, scan_type, att[:, [0, 2]].clone(), odom, state, imu, imu_att,
                           self.collided.clone(), ds, s, lateral, self.lap.clone(), wall_dist, self.t,
                           self.car_collision.clone() if self.M > 1 else None)
+
+    def _guarded(self, compiled, attr, eager):
+        """Compiled callable that falls back to eager for good if inductor/Triton fails at first use."""
+        def f(*args, **kw):
+            try:
+                return compiled(*args, **kw)
+            except Exception:
+                setattr(self, attr, eager)
+                return eager(*args, **kw)
+        return f
+
+    def _post_roll(self, state, odom_state, cmd, s_prev, lap_prev, tid, P):
+        """Footprint clearance, VESC odometry and lane progress for one control step (compiled)."""
+        wall_dist = self._footprint_clearance(state)
+        hit = wall_dist <= 0.0
+        odom_state = self.odom.update_pure(odom_state, state[:, dyn.IVX], cmd[:, 0], P, self.control_dt)
+        if self.track.cl is not None:
+            s, lateral, _ = self.track.project(state[:, :2], tid)
+            ds = s - s_prev
+            L = self.track.length[tid]
+            ds = torch.where(ds > L / 2, ds - L, torch.where(ds < -L / 2, ds + L, ds))
+            new_s = s_prev + ds
+            lap = lap_prev + ((new_s >= L) & (ds > 0)).long() - ((new_s < 0) & (ds < 0)).long()
+        else:
+            s = torch.zeros_like(s_prev); ds = s; lateral = s; lap = lap_prev
+        return wall_dist, hit, odom_state, s, ds, lateral, lap
 
     def _roll_physics(self, state, ax, att, imu_state, cmd_hist, delay_s, P):
         """All substeps of one control period (compiled on CUDA)."""
