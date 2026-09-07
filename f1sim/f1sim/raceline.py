@@ -267,6 +267,8 @@ class Raceline:
     @staticmethod
     def build_cached(track: Track, cache_dir: Optional[str] = None, **kw) -> "Raceline":
         """Raceline.build with an on-disk cache keyed by the track's occupancy + parameters."""
+        if getattr(track, "base", None) is not None:                          # carved variants (pockets): the base's line
+            return Raceline.build_cached(track.base, cache_dir, **kw)
         import hashlib, os
         cache_dir = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "f1sim", "racelines")
         os.makedirs(cache_dir, exist_ok=True)

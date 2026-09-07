@@ -33,6 +33,7 @@ class Track:
     edt_duct: Optional[np.ndarray] = None
     edt_tall: Optional[np.ndarray] = None
     duct_height: float = 0.2                  # [m] duct hose diameter
+    base: Optional["Track"] = None            # the track this one was carved from (pockets): racelines are built on it
 
     def __post_init__(self):
         if self.duct is None or self.tall is None:
@@ -200,6 +201,68 @@ class Track:
         return Track.from_occupancy(occ, res, (origin[0], origin[1]), cl, name, duct=duct, tall=tall,
                                     duct_height=duct_height)
 
+    def with_pockets(self, seed: int = 0, n: int = 3, depth=(1.0, 3.0), width=(0.8, 2.2), min_spacing: float = 5.0) -> "Track":
+        """Copy of the track with n dead-end side pockets carved into the boundary and walled with duct
+        hose: pit-lane mouths, door alcoves, side rooms of a hall. Openings like these are what a
+        LiDAR-only policy mistakes for the track (ppo_v10 died in blackbox2022_3's alcoves at 1.0 crash
+        per car per 20 s while every other held-out map was under 0.06). The lane itself, the centerline
+        and the raceline (built on `base`, the unmodified track) are unchanged."""
+        rng = np.random.default_rng(seed + 7919)
+        if self.centerline is None:
+            raise ValueError("pockets need a centerline")
+        cl = self.centerline; N = len(cl); res = self.resolution
+        tang = np.roll(cl, -1, 0) - np.roll(cl, 1, 0); tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
+        nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+        occ = self.occupancy.copy(); duct = self.duct.copy(); tall = self.tall.copy()
+        H, W = occ.shape
+        lab, _ = ndimage.label(~occ)                                           # the lane = free component of the centerline
+        c0 = int(round((cl[0, 0] - self.origin[0]) / res)); r0 = int(round((cl[0, 1] - self.origin[1]) / res))
+        lane = lab == lab[r0, c0]
+        seg = np.linalg.norm(np.roll(cl, -1, 0) - cl, axis=1).mean()
+        ring_w = self.duct_height + res                                        # pocket wall thickness [m]
+        placed = []; tries = 0
+        while len(placed) < n and tries < 300:
+            tries += 1
+            i = int(rng.integers(N)); side = float(rng.choice([-1.0, 1.0]))
+            if any(min(abs(i - j), N - abs(i - j)) * seg < min_spacing for j in placed):
+                continue
+            # distance to the wall on this side: march along the normal
+            hw = None
+            for k in range(1, int(6.0 / (0.5 * res))):
+                q = cl[i] + side * nrm[i] * (k * 0.5 * res)
+                c = int(round((q[0] - self.origin[0]) / res)); r = int(round((q[1] - self.origin[1]) / res))
+                if not (0 <= r < H and 0 <= c < W):
+                    break
+                if occ[r, c]:
+                    hw = k * 0.5 * res; break
+            if hw is None or hw > 4.0:
+                continue
+            w = float(rng.uniform(*width)); d = float(rng.uniform(*depth))
+            # local window in lane coordinates: u along the lane, v outward on the chosen side
+            ext = hw + d + ring_w + 0.2
+            cx, cy = cl[i]
+            cc0, cc1 = int((cx - ext - self.origin[0]) / res), int((cx + ext - self.origin[0]) / res) + 1
+            rr0, rr1 = int((cy - ext - self.origin[1]) / res), int((cy + ext - self.origin[1]) / res) + 1
+            if cc0 < 0 or rr0 < 0 or cc1 > W or rr1 > H:                       # pocket would run off the map
+                continue
+            gx, gy = np.meshgrid(np.arange(cc0, cc1) * res + self.origin[0], np.arange(rr0, rr1) * res + self.origin[1])
+            dx, dy = gx - cx, gy - cy
+            u = dx * tang[i, 0] + dy * tang[i, 1]; v = side * (dx * nrm[i, 0] + dy * nrm[i, 1])
+            pocket = (np.abs(u) <= w / 2) & (v >= hw - 0.15) & (v <= hw + d)
+            ring = (np.abs(u) <= w / 2 + ring_w) & (v >= hw + 0.05) & (v <= hw + d + ring_w) & ~pocket
+            beyond = (np.abs(u) <= w / 2 + ring_w) & (v > hw + 0.05)
+            lane_w = lane[rr0:rr1, cc0:cc1]
+            if (lane_w & beyond).any():                                       # would tunnel into another part of the lane
+                continue
+            if not pocket.any():
+                continue
+            occ[rr0:rr1, cc0:cc1][pocket] = False; duct[rr0:rr1, cc0:cc1][pocket] = False; tall[rr0:rr1, cc0:cc1][pocket] = False
+            occ[rr0:rr1, cc0:cc1][ring] = True; duct[rr0:rr1, cc0:cc1][ring] = True; tall[rr0:rr1, cc0:cc1][ring] = False
+            placed.append(i)
+        t = Track.from_occupancy(occ, res, self.origin, cl, f"{self.name}_pk{seed}", duct=duct, tall=tall, duct_height=self.duct_height)
+        t.base = self if self.base is None else self.base
+        return t
+
     def with_lane_obstacles(self, seed: int = 0, n: int = 3, size=(0.25, 0.5), min_passage: float = 1.2,
                             min_spacing: float = 4.0, kind: str = "box") -> "Track":
         """Copy of the track with n tall boxes (competition 'static obstacles') dropped into the lane,
@@ -252,8 +315,10 @@ class Track:
         if self.centerline is not None:
             x_lo, x_hi = self.origin[0], self.origin[0] + (W - 1) * self.resolution
             cl = self.centerline.copy(); cl[:, 0] = x_lo + x_hi - cl[:, 0]
-        return Track.from_occupancy(occ, self.resolution, self.origin, cl, self.name + "m", duct=duct, tall=tall,
-                                    duct_height=self.duct_height)
+        t = Track.from_occupancy(occ, self.resolution, self.origin, cl, self.name + "m", duct=duct, tall=tall,
+                                 duct_height=self.duct_height)
+        t.base = None if self.base is None else self.base.mirrored()
+        return t
 
     def grid_key(self):
         """Content hash of the obstacle layers (tracks that differ only in centerline share GPU grids)."""
@@ -267,7 +332,7 @@ class Track:
         cl = None if self.centerline is None else np.ascontiguousarray(self.centerline[::-1])
         return Track(self.occupancy, self.resolution, self.origin, self.edt, cl, self.name + "r",
                      duct=self.duct, tall=self.tall, edt_duct=self.edt_duct, edt_tall=self.edt_tall,
-                     duct_height=self.duct_height)
+                     duct_height=self.duct_height, base=None if self.base is None else self.base.reversed())
 
     @staticmethod
     def generate_random(seed: int = 0, style: str = "competition", resolution: float = 0.05, mirror="auto",

@@ -35,16 +35,18 @@ GEN_TRAIN = ["gen:competition:1000", "gen:competition:1001"]          # 1000 CCW
 DIRS = ("", "~rev", "~mir", "~mir~rev")
 
 
-def _train_set(real):
+def _train_set(real, pockets: bool = True):
     return ([f"real:{n}{d}" for n in real for d in DIRS]
             + [f"rt:{n}{d}" for n in RT_TRAIN for d in DIRS]
             + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]       # 1001 already is 1000's mirror
-            # static box obstacles (CDC 2025 style cardboard boxes) on ~40 % of the tracks
-            + [f"real:{n}+obs{i}{d}" for i, n in enumerate(real) for d in DIRS])
+            # static box obstacles (CDC 2025 style cardboard boxes)
+            + [f"real:{n}+obs{i}{d}" for i, n in enumerate(real) for d in DIRS]
+            # dead-end side pockets (pit-lane mouths, alcoves): the held-out failure mode of ppo_v10
+            + ([f"real:{n}+pk{i}{d}" for i, n in enumerate(real) for d in DIRS] if pockets else []))
 
 
-TRAIN_TRACKS = _train_set(REAL_TRAIN)                # 100 tracks (ppo_v11 on)
-TRAIN_TRACKS_V10 = _train_set(REAL_TRAIN_V10)        # 60 tracks: what ppo_v10 trains on (evaluate it on this)
+TRAIN_TRACKS = _train_set(REAL_TRAIN)                          # 144 tracks (ppo_v11 on): 11 real layouts x 4 x {plain, boxes, pockets} + rt + gen
+TRAIN_TRACKS_V10 = _train_set(REAL_TRAIN_V10, pockets=False)   # 60 tracks: what ppo_v10 trains on (evaluate it on this)
 # Held out entirely: the Korea 2025 championship map (the target venue style) and one TU Wien race.
 EVAL_TRACKS = ["real:korea_2025_iccas", "real:korea_2025_iccas~rev", "real:blackbox2022_3", "real:blackbox2022_3~rev",
                "rt:Monza", "gen:competition:0"]

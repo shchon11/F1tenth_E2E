@@ -8,6 +8,7 @@ Names:  gen:competition:7   gen:hallway:2   gen:circuit:0
 from __future__ import annotations
 
 import glob
+import re
 import os
 import numpy as np
 from typing import List, Optional
@@ -99,11 +100,26 @@ def load(name: str, **kw) -> Track:
     return t
 
 
+def _split_suffix(name: str, key: str):
+    """'real:x+obs1+pk3' , '+pk' -> ('real:x+obs1', '3'); no suffix -> (name, None)."""
+    m = re.search(re.escape(key) + r"(\d+)", name)
+    return (name[:m.start()] + name[m.end():], m.group(1)) if m else (name, None)
+
+
+def _pockets(t: Track, pk):
+    """x+pk<seed>: dead-end side pockets, one per ~25 m of lane (3-8)."""
+    if pk is None:
+        return t
+    L = float(np.linalg.norm(np.roll(t.centerline, -1, 0) - t.centerline, axis=1).sum())
+    return t.with_pockets(seed=int(pk), n=int(np.clip(round(L / 25.0), 3, 8)))
+
+
 def _load_base(name: str, **kw) -> Track:
     if name.startswith("gen:"):
         _, style, seed = (name.split(":") + ["0"])[:3]
         seed, obs = (seed.split("+obs") + [None])[:2]            # gen:competition:3+obs -> random lane obstacles
         return Track.generate_random(int(seed), style=style, lane_obstacles=(obs is not None), **kw)
+    name, pk = _split_suffix(name, "+pk")                    # x+pk<seed>: dead-end side pockets (after +obs)
     if name.startswith("rt:"):
         n = name[3:]
         d = os.path.join(RACETRACKS, n)
@@ -111,7 +127,7 @@ def _load_base(name: str, **kw) -> Track:
         if not ys:
             raise FileNotFoundError(f"racetrack {n} not found under {RACETRACKS}")
         cl = glob.glob(os.path.join(d, "*_centerline.csv"))
-        return Track.from_ros_map(ys[0], centerline_csv=cl[0] if cl else None, name=n, **kw)
+        return _pockets(Track.from_ros_map(ys[0], centerline_csv=cl[0] if cl else None, name=n, **kw), pk)
     if name.startswith("gym:"):
         n = name[4:]
         kw.setdefault("boundary", GYM_BOUNDARY.get(n, "duct"))
@@ -133,7 +149,7 @@ def _load_base(name: str, **kw) -> Track:
         if obs is not None:                                     # real:x+obs<seed>: boxes every ~35 m of lane
             L = float(np.linalg.norm(np.roll(t.centerline, -1, 0) - t.centerline, axis=1).sum())
             t = t.with_lane_obstacles(seed=int(obs), n=int(np.clip(round(L / 35.0), 3, 8)))
-        return t
+        return _pockets(t, pk)
     clearance = kw.pop("min_clearance", None)
     t = Track.from_ros_map(name, **kw)
     return _with_auto_centerline(t, clearance) if clearance else t
