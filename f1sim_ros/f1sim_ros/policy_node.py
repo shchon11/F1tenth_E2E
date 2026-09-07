@@ -43,8 +43,11 @@ class PolicyNode(Node):
         # plan action space: the same iLQR tracker as in training turns the local trajectory into
         # (steer, speed); cmd_delay = the measured command latency of this car (calibrate once)
         self.declare_parameter("wheelbase", 0.3302); self.declare_parameter("cmd_delay", 0.06)
+        # residual servo calibration the stack's steering_angle_to_servo_offset/gain do not absorb (rad, ratio)
+        self.declare_parameter("steer_bias", 0.0); self.declare_parameter("steer_gain", 1.0); self.declare_parameter("speed_gain", 1.0)
+        self.cal = (float(p("steer_bias")), float(p("steer_gain")), float(p("speed_gain")))
         self.tracker = None
-        if self.spec.act_dim == 5:
+        if self.spec.act_dim >= 5:
             from f1sim.mpc import PlanTracker
             self.tracker = PlanTracker(1, self.device, float(p("wheelbase")), self.steer_max, self.spec.v_max)
             self.delay = torch.tensor([float(p("cmd_delay"))], device=self.device)
@@ -92,7 +95,8 @@ class PolicyNode(Node):
         if self.tracker is not None:                                 # local plan -> tracker -> command
             cmd = self.tracker(a, torch.tensor([self.v], device=self.device), torch.tensor([self.speed_cap], device=self.device),
                                torch.tensor([float(imu_mean[2])], device=self.device), delay=self.delay)[0]
-            msg.drive.steering_angle = float(cmd[0]); msg.drive.speed = float(cmd[1])
+            msg.drive.steering_angle = float(max(-self.steer_max, min(self.steer_max, (float(cmd[0]) - self.cal[0]) / self.cal[1])))
+            msg.drive.speed = float(cmd[1]) / self.cal[2]
         else:
             a = a[0].cpu().numpy()
             msg.drive.steering_angle = float(a[0] * self.steer_max)

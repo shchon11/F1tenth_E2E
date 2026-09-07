@@ -162,6 +162,7 @@ class SimParams:
     wall_friction: float = 0.5
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
+    compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
     seed: int = 0
 
 

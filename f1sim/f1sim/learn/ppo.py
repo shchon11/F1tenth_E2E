@@ -85,7 +85,7 @@ def main():
     buf_rew = torch.zeros(T, B, device=device); buf_done = torch.zeros(T, B, device=device); buf_trunc = torch.zeros(T, B, device=device)
     buf_val = torch.zeros(T + 1, B, device=device)
 
-    steps_done = 0; update = 0; t_start = time.time()
+    steps_done = 0; update = 0; t_start = time.time(); last_log = {}
     ep_stats = {"return": [], "progress": [], "collided": [], "lap_time": [], "steps": []}
     n_updates = int(a.total // (T * B))
     while steps_done < a.total:
@@ -172,6 +172,8 @@ def main():
                    "time/rollout_s": t_roll, "time/update_s": t_upd, "time/env_steps_per_s": n / (t_roll + t_upd),
                    "time/elapsed_min": (time.time() - t_start) / 60}
             if n_ep:
+                last_log = {"collision_rate": float(np.mean(ep_stats["collided"])), "progress_m": float(np.mean(ep_stats["progress"])),
+                            "lap_time_s": float(np.mean(ep_stats["lap_time"])) if ep_stats["lap_time"] else float("nan")}
                 log.update({"episode/return": np.mean(ep_stats["return"]), "episode/progress_m": np.mean(ep_stats["progress"]),
                             "episode/collision_rate": np.mean(ep_stats["collided"]), "episode/len_steps": np.mean(ep_stats["steps"]),
                             "episode/count": n_ep})
@@ -183,9 +185,12 @@ def main():
                   f"coll {log.get('episode/collision_rate', float('nan')):.2f} prog {log.get('episode/progress_m', float('nan')):.0f} m "
                   f"lap {log.get('episode/lap_time_s', float('nan')):.1f} s | kl_ref {log['loss/kl_ref']:.3f} | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         if update % a.save_every == 0:
-            save_checkpoint(os.path.join(out, f"ppo_u{update}.pt"), model, {"spec": spec.__dict__, "steps": steps_done, "cap": cap})
-            save_checkpoint(os.path.join(out, "ppo_latest.pt"), model, {"spec": spec.__dict__, "steps": steps_done, "cap": cap})
-    save_checkpoint(os.path.join(out, "ppo_final.pt"), model, {"spec": spec.__dict__, "steps": steps_done, "cap": cap})
+            meta = {"spec": spec.__dict__, "phase": "ppo", "run": a.name, "update": update, "updates": n_updates, "steps": steps_done,
+                    "cap": cap, "action_mode": a.action_mode, "metrics": last_log}
+            save_checkpoint(os.path.join(out, f"ppo_u{update}.pt"), model, meta)
+            save_checkpoint(os.path.join(out, "ppo_latest.pt"), model, meta)
+    save_checkpoint(os.path.join(out, "ppo_final.pt"), model, {"spec": spec.__dict__, "phase": "ppo", "run": a.name, "update": update,
+                                                              "updates": n_updates, "steps": steps_done, "cap": cap, "action_mode": a.action_mode, "metrics": last_log})
     run.finish()
 
 

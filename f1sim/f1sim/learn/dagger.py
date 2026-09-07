@@ -135,8 +135,10 @@ def main():
         print(f"iter {it}: beta {beta:.2f} samples {sum(len(b) for b in bufs)} loss {loss:.4f} | student coll {m['collision_rate']:.2f} "
               f"prog {m['progress_rate_mps']:.2f} m/s lap {m['lap_time_s']:.1f} s | teacher coll {tm_['collision_rate']:.2f} prog {tm_['progress_rate_mps']:.2f} m/s "
               f"lap {tm_['lap_time_s']:.1f} s | {t_col:.0f}+{t_tr:.0f}+{t_ev:.0f} s", flush=True)
-        save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, {"spec": spec.__dict__, "iter": it, "metrics": m})
-        save_checkpoint(os.path.join(out, "student_latest.pt"), model, {"spec": spec.__dict__, "iter": it, "metrics": m})
+        meta = {"spec": spec.__dict__, "phase": "dagger", "run": a.name, "iter": it, "iters": a.iters,
+                "samples": sum(len(b) for b in bufs), "metrics": m, "teacher": tm_, "action_mode": a.action_mode}
+        save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, meta)
+        save_checkpoint(os.path.join(out, "student_latest.pt"), model, meta)
     run.finish()
 
 

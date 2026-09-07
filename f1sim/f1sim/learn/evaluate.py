@@ -20,7 +20,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     model = None
     if not teacher:
         model, _ = load_checkpoint(ckpt, device); model.eval()
-    mode = "plan" if (model is not None and model.meta.get("act_dim", 2) == 5) or (teacher and action_mode == "plan") else "direct"
+    mode = "plan" if (model is not None and model.meta.get("act_dim", 2) >= 5) or (teacher and action_mode == "plan") else "direct"
     env = common.make_env(trs, envs, device, EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode), cfg=cfg, seed=seed)
     env.sim.warmup()
     if teacher:

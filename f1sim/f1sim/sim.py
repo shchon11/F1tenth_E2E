@@ -84,7 +84,7 @@ class Simulator:
         self._roll = self._roll_physics
         if self.device.type == "cuda" and self.cfg.sim.compile:
             try:
-                self._roll = torch.compile(self._roll_physics, dynamic=False)
+                self._roll = torch.compile(self._roll_physics, dynamic=False, mode=self.cfg.sim.compile_mode)
             except Exception:
                 self._roll = self._roll_physics
 
@@ -290,6 +290,8 @@ class Simulator:
         self.att_prev = self.att[:, [0, 2]].clone()
         state, ax, ay, att, imu_state, imu_samples = self._roll(self.state, self.ax, self.att, self.imu_state,
                                                                 self.cmd_hist, delay_s, P)
+        if self.cfg.sim.compile_mode == "reduce-overhead":      # CUDA graphs reuse their output buffers: keep copies
+            state, ax, ay, att, imu_state, imu_samples = (t.clone() for t in (state, ax, ay, att, imu_state, imu_samples))
         state = torch.where(frozen[:, None], self.state, state)
         att = torch.where(frozen[:, None], self.att, att)
         imu_state = torch.where(frozen[:, None], self.imu_state, imu_state)

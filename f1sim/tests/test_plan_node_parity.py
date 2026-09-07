@@ -22,6 +22,6 @@ def test_cpu_tracker_matches_env_tracker():
         cmd_node = node(a[i:i + 1].cpu(), torch.tensor([v_meas]), torch.tensor([5.0]), torch.tensor([yaw_rate]),
                         delay=env.tracker_delay[i:i + 1].cpu())[0]
         env.step(a)
-        cmd_env = env.last_cmd[i].cpu()
+        cmd_env = env.last_cmd_raw[i].cpu()                      # before the env's per-car calibration
         worst = (max(worst[0], abs(float(cmd_node[0] - cmd_env[0]))), max(worst[1], abs(float(cmd_node[1] - cmd_env[1]))))
     assert worst[0] < 2e-3 and worst[1] < 0.05, worst        # rad, m/s

@@ -121,14 +121,18 @@ class F1VecEnv:
             return None, None
 
     def _calibrate_tracker(self, ids: torch.Tensor):
-        """The tracker's latency model is *calibrated* on the real car (measured once, like the odometry
-        gains), so in sim it knows each env's command delay + half the servo lag up to a +-20 ms residual."""
-        P = self.sim.P
-        true = P["cmd_delay"][ids] + 0.5 * P["servo_tau"][ids]
-        err = (torch.rand(ids.numel(), device=self.device, generator=self.sim.gen) - 0.5) * 0.04
+        """The tracker is *calibrated* on the real car the way the odometry is (measured once): in sim it
+        knows each env's command delay + half the servo lag (+-20 ms residual), the servo offset
+        (+-0.01 rad) and gain (+-4 %) and the VESC speed gain (+-3 %); grip stays unknown by decision."""
+        P = self.sim.P; n = ids.numel(); g = self.sim.gen
+        u = lambda a: (torch.rand(n, device=self.device, generator=g) - 0.5) * 2 * a
         if self.tracker_delay is None:
             self.tracker_delay = torch.zeros(self.B, device=self.device)
-        self.tracker_delay[ids] = (true + err).clamp(0.0, 0.2)
+            self.tracker_cal = torch.zeros(self.B, 3, device=self.device)          # steer bias, steer gain, speed gain
+        self.tracker_delay[ids] = (P["cmd_delay"][ids] + 0.5 * P["servo_tau"][ids] + u(0.02)).clamp(0.0, 0.2)
+        self.tracker_cal[ids, 0] = P["steer_bias"][ids] + u(0.01)
+        self.tracker_cal[ids, 1] = P["steer_gain"][ids] * (1 + u(0.04))
+        self.tracker_cal[ids, 2] = P["speed_gain"][ids] * (1 + u(0.03))
 
     def set_teacher(self, teacher):
         """Raceline teacher that drives the opponent cars (opponent == "teacher")."""
@@ -201,7 +205,7 @@ class F1VecEnv:
         if self.act_dim == 2:
             self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
         else:
-            self.prev_action[ids, 3:5] = (speed / e.v_max_policy * 2 - 1)[:, None]
+            self.prev_action[ids, -2:] = (speed / e.v_max_policy * 2 - 1)[:, None]
             self.tracker.reset(ids); self._calibrate_tracker(ids)
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
@@ -223,7 +227,7 @@ class F1VecEnv:
             an = self.teacher_action_to_normalized(cmd)
         else:
             an = self.teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy, self.tracker.spec)
-            an = an.clone(); an[:, 3:5] = ((an[:, 3:5] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
+            an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
         return torch.where(self.learner[:, None], action, an)
 
     # ------------------------------------------------------------------ API
@@ -246,7 +250,10 @@ class F1VecEnv:
             lr = self.last_result
             v_meas = lr.odom[:, 3] if lr is not None else self.sim.state[:, 3]
             yaw_rate = lr.imu[:, :, 2].mean(1) if (lr is not None and lr.imu is not None and lr.imu.shape[1] > 0) else None
-            cmd = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
+            raw = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
+            self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
+            cal = self.tracker_cal
+            cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)
         steer_norm = cmd[:, 0] / self.s_max
         r = self.sim.step(cmd)
         self.last_cmd = cmd

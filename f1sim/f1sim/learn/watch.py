@@ -8,6 +8,7 @@ Headless recording: --record out.mp4 (needs ffmpeg) or --frames dir/ for PNGs.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import time
@@ -17,6 +18,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from ..gym_env import EnvConfig
+from ..params import Config
 from . import common
 from .model import load_checkpoint
 from .obs import flatten_obs
@@ -44,37 +46,130 @@ def sal_colors(sal):
     return c
 
 
-def panel_image(hidden, stem, mu, std, value, speed_cap, step_info):
-    W, H = 480, 300
+def panel_internals(hidden, stem):
+    """Raw activations (--internals): hidden layer as a 16x16 heat grid, scan features as a strip."""
+    W, H = 480, 130
     img = Image.new("RGBA", (W, H), (12, 15, 22, 190)); d = ImageDraw.Draw(img)
     from ..viewer.gl_scene import _font
-    f, fs = _font(15), _font(13)
-    d.text((10, 6), "policy internals", font=f, fill=(255, 255, 255, 255))
-    d.text((10, 232), step_info, font=fs, fill=(180, 190, 210, 255))
-    # hidden layer 256 -> 16x16 heat grid
+    fs = _font(13)
     hgrid = hidden.reshape(16, 16); hg = (hgrid - hgrid.min()) / (hgrid.max() - hgrid.min() + 1e-9)
     for r in range(16):
         for c in range(16):
-            v = float(hg[r, c]); col = (int(255 * v), int(120 * v), int(255 * (1 - v)), 255)
-            d.rectangle((10 + c * 12, 30 + r * 12, 20 + c * 12, 40 + r * 12), fill=col)
-    d.text((10, 215), "hidden 256 (MLP)", font=fs, fill=(180, 190, 210, 255))
-    # stem features 256 -> strip
+            v = float(hg[r, c]); d.rectangle((10 + c * 6, 8 + r * 6, 15 + c * 6, 13 + r * 6), fill=(int(255 * v), int(120 * v), int(255 * (1 - v)), 255))
+    d.text((10, 108), "hidden layer, 256 neurons", font=fs, fill=(180, 190, 210, 255))
     sg = (stem - stem.min()) / (stem.max() - stem.min() + 1e-9)
     for i in range(256):
-        v = float(sg[i]); d.rectangle((210 + (i % 64) * 3, 30 + (i // 64) * 8, 212 + (i % 64) * 3, 36 + (i // 64) * 8), fill=(int(255 * v), int(200 * v), 60, 255))
-    d.text((210, 64), "scan features 256 (conv)", font=fs, fill=(180, 190, 210, 255))
-    # action gauges
-    def gauge(y, name, m, s_):
-        d.text((210, y), f"{name} {m:+.2f} ± {s_:.2f}", font=fs, fill=(230, 230, 235, 255))
-        d.rectangle((210, y + 18, 400, y + 26), fill=(40, 45, 60, 255))
-        cx = 305 + m * 95; d.rectangle((cx - max(2, s_ * 95), y + 18, cx + max(2, s_ * 95), y + 26), fill=(80, 140, 255, 180))
-        d.rectangle((cx - 2, y + 16, cx + 2, y + 28), fill=(255, 255, 255, 255))
-    gauge(90, "steer", mu[0], std[0]); gauge(130, "speed", mu[1], std[1])
-    d.text((210, 172), f"value  {value:7.2f}", font=fs, fill=(230, 230, 235, 255))
-    d.text((210, 190), f"speed cap {speed_cap:.1f} m/s", font=fs, fill=(230, 230, 235, 255))
-    d.text((210, 226), "scan points: red = high saliency", font=fs, fill=(255, 150, 120, 255))
-    d.text((10, 256), "input: 3 scans, VESC speed, IMU, roll/pitch est., last 2 actions", font=fs, fill=(150, 160, 180, 255))
-    d.text((10, 276), "no map, no localization", font=fs, fill=(150, 160, 180, 255))
+        v = float(sg[i]); d.rectangle((130 + (i % 64) * 5, 8 + (i // 64) * 10, 134 + (i % 64) * 5, 16 + (i // 64) * 10), fill=(int(255 * v), int(200 * v), 60, 255))
+    d.text((130, 52), "scan features after the 1D conv, 256", font=fs, fill=(180, 190, 210, 255))
+    return img
+
+
+def panel_image(sal, mu, std, value, speed_cap, step_info, plan_ref=None, cmd=None, angles=None, fov=4.71238898):
+    """The policy panel. Left: where the network is looking (saliency of the scan, per direction).
+    Right: what it decided -- the planned path + speed profile (plan action space) or the steer /
+    speed command (direct), with the exploration noise. Bottom: what it was given."""
+    W, H = 480, 300
+    img = Image.new("RGBA", (W, H), (12, 15, 22, 190)); d = ImageDraw.Draw(img)
+    from ..viewer.gl_scene import _font
+    f, fs, ft = _font(15), _font(13), _font(11)
+    d.text((10, 6), "where the policy looks", font=f, fill=(255, 255, 255, 255))
+    # polar attention plot: car in the centre, bar length = strongest saliency in that 5 deg sector
+    cx, cy, R = 105, 130, 85
+    n = len(sal); ang = np.linspace(-fov / 2, fov / 2, n) if angles is None else np.asarray(angles)
+    bins = 54; edges = np.linspace(-fov / 2, fov / 2, bins + 1)
+    d.ellipse((cx - R, cy - R, cx + R, cy + R), outline=(70, 80, 100, 255))
+    d.ellipse((cx - R / 2, cy - R / 2, cx + R / 2, cy + R / 2), outline=(50, 58, 75, 255))
+    for k in range(bins):
+        m = (ang >= edges[k]) & (ang < edges[k + 1])
+        if not m.any(): continue
+        v = float(sal[m].max()); a_ = 0.5 * (edges[k] + edges[k + 1])
+        ex, ey = cx + (14 + v * (R - 16)) * np.sin(a_), cy - (14 + v * (R - 16)) * np.cos(a_)   # forward = up
+        col = (int(255 * min(1, 0.2 + 1.2 * v)), int(230 * max(0, 1 - 1.4 * v)), int(200 * (1 - v)), 255)
+        d.line((cx + 12 * np.sin(a_), cy - 12 * np.cos(a_), ex, ey), fill=col, width=3)
+    d.polygon([(cx, cy - 10), (cx - 6, cy + 7), (cx + 6, cy + 7)], fill=(235, 235, 240, 255))   # the car, nose up
+    d.text((10, 222), "red sectors: beams that change the decision most", font=ft, fill=(255, 160, 130, 255))
+    d.text((10, 236), "(same colours on the 3D scan points)", font=ft, fill=(170, 180, 200, 255))
+    # decision
+    d.text((220, 6), "what it decided", font=f, fill=(255, 255, 255, 255))
+    if plan_ref is not None:                                   # planned path, top-down, forward = up
+        px, py, pw, ph = 225, 28, 130, 150
+        d.rectangle((px, py, px + pw, py + ph), outline=(70, 80, 100, 255))
+        xs, ys, vs = plan_ref[:, 0], plan_ref[:, 1], plan_ref[:, 3]
+        scale = (ph - 20) / max(1.0, float(np.abs(xs).max()) + 0.3)
+        pts = [(px + pw / 2 - y * scale, py + ph - 10 - x * scale) for x, y in zip(xs, ys)]
+        for i in range(len(pts) - 1):
+            t = min(1.0, vs[i] / 8.0)
+            col = (int(255 * t) if t > 0.5 else int(51 + 0 * t), int(140 + 110 * min(1, 2 * t)) if t < 0.5 else int(250 - 80 * (t - 0.5) * 2), int(255 * (1 - 2 * t)) if t < 0.5 else 40, 255)
+            d.line((pts[i], pts[i + 1]), fill=col, width=4)
+        d.polygon([(px + pw / 2, py + ph - 16), (px + pw / 2 - 5, py + ph - 4), (px + pw / 2 + 5, py + ph - 4)], fill=(235, 235, 240, 255))
+        d.text((px, py + ph + 4), f"planned path, next {max(0.1, float(np.linalg.norm(plan_ref[-1, :2]))):.1f} m; colour = speed", font=ft, fill=(200, 210, 225, 255))
+        d.text((365, 30), "planned speed", font=fs, fill=(230, 230, 235, 255))
+        d.text((365, 48), f"now  {vs[3]:.1f} m/s", font=fs, fill=(230, 230, 235, 255))
+        d.text((365, 66), f"end  {vs[-1]:.1f} m/s", font=fs, fill=(230, 230, 235, 255))
+        d.text((365, 84), f"cap  {speed_cap:.1f} m/s", font=fs, fill=(160, 170, 190, 255))
+        d.text((365, 112), "noise (exploration)", font=ft, fill=(160, 170, 190, 255))
+        d.text((365, 126), f"curvature +-{float(np.mean(std[:-2])) * 1.6:.2f} 1/m", font=ft, fill=(160, 170, 190, 255))
+        d.text((365, 140), f"speed +-{float(np.mean(std[-2:])) * 4:.1f} m/s", font=ft, fill=(160, 170, 190, 255))
+    else:
+        def gauge(y, name, m, s_, txt):
+            d.text((225, y), f"{name}: {txt}", font=fs, fill=(230, 230, 235, 255))
+            d.rectangle((225, y + 18, 455, y + 26), fill=(40, 45, 60, 255))
+            cxg = 340 + m * 115; d.rectangle((cxg - max(2, s_ * 115), y + 18, cxg + max(2, s_ * 115), y + 26), fill=(80, 140, 255, 180))
+            d.rectangle((cxg - 2, y + 16, cxg + 2, y + 28), fill=(255, 255, 255, 255))
+        gauge(34, "steer command", mu[0], std[0], f"{math.degrees(mu[0] * 0.4189):+.1f} deg")
+        gauge(84, "speed command", mu[1], std[1], f"{(mu[1] + 1) * 0.5 * 8.0:.2f} m/s  (cap {speed_cap:.1f})")
+        d.text((225, 134), "blue band = exploration noise around the mean", font=ft, fill=(160, 170, 190, 255))
+    if value is not None and not (isinstance(value, float) and math.isnan(value)):
+        d.text((225, 208), f"critic's value estimate {value:6.1f}", font=ft, fill=(200, 210, 225, 255))
+    if step_info:
+        d.text((225, 224), step_info[:64], font=ft, fill=(180, 190, 210, 255))
+    d.text((10, 258), "given: last 3 LiDAR scans, VESC speed, IMU, roll/pitch estimate, its last 2 actions", font=ft, fill=(150, 160, 180, 255))
+    d.text((10, 274), "not given: map, position, opponents' positions  (LiDAR-only, end to end)", font=ft, fill=(150, 160, 180, 255))
+    return img
+
+
+def dash_image(v, v_cmd, v_cap, steer, steer_cmd, v_max=8.0, steer_max=0.4189):
+    """Bottom-centre dash: a speedometer (needle = measured speed, orange tick = commanded speed,
+    red zone above the cap) and a steering wheel turned by the actual steering angle (x3 for
+    visibility, ghost tick = commanded angle)."""
+    from ..viewer.gl_scene import _font
+    W, H = 540, 180
+    img = Image.new("RGBA", (W, H), (10, 12, 18, 170)); d = ImageDraw.Draw(img)
+    f, fs, fb = _font(13), _font(11), _font(22)
+    # ---- speedometer
+    cx, cy, R = 110, 105, 78
+    a0, a1 = 210.0, -30.0                                          # degrees, clockwise sweep of 240
+    def ang(val): return math.radians(a0 + (a1 - a0) * min(max(val / v_max, 0.0), 1.0))
+    d.arc((cx - R, cy - R, cx + R, cy + R), start=-a0, end=-a1, fill=(90, 100, 120, 255), width=10)
+    if v_cap < v_max:                                              # red zone: beyond the speed cap
+        d.arc((cx - R, cy - R, cx + R, cy + R), start=-math.degrees(ang(v_cap)), end=-a1, fill=(200, 60, 60, 255), width=10)
+    d.arc((cx - R, cy - R, cx + R, cy + R), start=-a0, end=-math.degrees(ang(v)), fill=(80, 200, 255, 255), width=10)
+    for k in range(int(v_max) + 1):
+        t = ang(k); x1, y1 = cx + (R - 14) * math.cos(t), cy - (R - 14) * math.sin(t); x2, y2 = cx + (R - 6) * math.cos(t), cy - (R - 6) * math.sin(t)
+        d.line((x1, y1, x2, y2), fill=(200, 205, 215, 255), width=2)
+        tx, ty = cx + (R - 26) * math.cos(t), cy - (R - 26) * math.sin(t); d.text((tx - 4, ty - 7), str(k), font=fs, fill=(170, 180, 195, 255))
+    t = ang(v_cmd); d.polygon([(cx + (R + 2) * math.cos(t), cy - (R + 2) * math.sin(t)), (cx + (R + 12) * math.cos(t + 0.06), cy - (R + 12) * math.sin(t + 0.06)),
+                               (cx + (R + 12) * math.cos(t - 0.06), cy - (R + 12) * math.sin(t - 0.06))], fill=(255, 160, 40, 255))
+    t = ang(v); d.line((cx, cy, cx + (R - 18) * math.cos(t), cy - (R - 18) * math.sin(t)), fill=(255, 255, 255, 255), width=3)
+    d.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), fill=(255, 255, 255, 255))
+    d.text((cx - 34, cy + 22), f"{v:4.2f}", font=fb, fill=(255, 255, 255, 255)); d.text((cx + 22, cy + 30), "m/s", font=fs, fill=(200, 205, 215, 255))
+    d.text((cx - 62, H - 22), "speed", font=f, fill=(200, 205, 215, 255)); d.text((cx - 10, H - 22), f"cmd {v_cmd:.1f}   cap {v_cap:.0f}", font=fs, fill=(255, 160, 40, 255))
+    # ---- steering wheel
+    wx, wy, r = 340, 92, 58
+    wheel = Image.new("RGBA", (2 * r + 20, 2 * r + 20), (0, 0, 0, 0)); wd = ImageDraw.Draw(wheel); c = r + 10
+    wd.ellipse((c - r, c - r, c + r, c + r), outline=(225, 228, 235, 255), width=9)
+    for a_ in (90, 210, 330):
+        t = math.radians(a_); wd.line((c, c, c + (r - 4) * math.cos(t), c - (r - 4) * math.sin(t)), fill=(200, 205, 215, 255), width=7)
+    wd.ellipse((c - 12, c - 12, c + 12, c + 12), fill=(150, 155, 170, 255))
+    wd.rectangle((c - 3, c - r - 4, c + 3, c - r + 10), fill=(255, 160, 40, 255))           # top marker
+    gain = 3.0
+    wheel = wheel.rotate(math.degrees(steer) * gain, resample=Image.BICUBIC)               # left turn = counter-clockwise
+    img.alpha_composite(wheel, (wx - c, wy - c))
+    t = math.radians(90 + math.degrees(steer_cmd) * gain)                                  # ghost: commanded angle
+    d.line((wx + (r + 6) * math.cos(t), wy - (r + 6) * math.sin(t), wx + (r + 16) * math.cos(t), wy - (r + 16) * math.sin(t)), fill=(255, 160, 40, 200), width=3)
+    d.text((wx + r + 22, wy - 24), f"{math.degrees(steer):+5.1f}°", font=fb, fill=(255, 255, 255, 255))
+    d.text((wx + r + 22, wy + 4), f"cmd {math.degrees(steer_cmd):+.1f}°", font=fs, fill=(255, 160, 40, 255))
+    d.text((wx - 30, H - 22), "steering", font=f, fill=(200, 205, 215, 255)); d.text((wx + 34, H - 22), "(wheel turned x3)", font=fs, fill=(150, 160, 180, 255))
     return img
 
 
@@ -168,7 +263,7 @@ def replay_best(v, rec, model, intro, ep, sink, speed_cap, fps=30, rank=0, realt
         v.point_colors = sal_colors(sal)
         with torch.no_grad():
             std = model.actor.log_std.exp().cpu().numpy()
-        v.panel = panel_image(intro.h["hidden"][0].float().cpu().numpy(), intro.h["stem"][0].float().cpu().numpy(), mu, std, float("nan"), speed_cap, f"replay t={rec.t[t]:.1f}s")
+        v.panel = panel_image(sal, mu, std, None, speed_cap, f"replay t={rec.t[t]:.1f}s")
         v.extra_hud = banner
         v.mode = 0
         v.render()
@@ -190,13 +285,29 @@ def main():
     ap.add_argument("--episodes", type=int, default=0, help="highlight mode: run this many episodes, replay the best agent of each")
     ap.add_argument("--episode-s", type=float, default=40.0); ap.add_argument("--replay-top", type=int, default=1, help="replay the top-k agents")
     ap.add_argument("--highlights", default="", help="headless highlight mode: directory for one mp4 per episode")
+    ap.add_argument("--internals", action="store_true", help="also show the raw hidden-layer / conv-feature activations")
+    ap.add_argument("--panel-every", type=int, default=3, help="recompute saliency + the panel every k sim steps (GPU launches)")
     a = ap.parse_args()
     device = torch.device(a.device)
     ckpt_path = a.run if a.run.endswith(".pt") else next(p for p in (os.path.join(a.run, "ppo_latest.pt"), os.path.join(a.run, "student_latest.pt")) if os.path.exists(p))
     tracks, _ = common.load_tracks([a.map])
-    env = common.make_env(tracks, a.cars, device, EnvConfig(speed_cap=a.speed_cap))
     model, extra = load_checkpoint(ckpt_path, device); model.eval(); intro = Introspector(model)
-    mtime = os.path.getmtime(ckpt_path); step_info = f"ckpt {extra.get('steps', extra.get('iter', 0)) / 1e6:.1f}M steps"
+    mode = "plan" if model.meta.get("act_dim", 2) >= 5 else "direct"        # plan-space policies drive through the tracker
+    cfg = Config(); cfg.sim.compile_mode = "reduce-overhead"                  # CUDA graphs: the sim step is one launch
+    env = common.make_env(tracks, a.cars, device, EnvConfig(speed_cap=a.speed_cap, action_mode=mode), cfg=cfg)
+    def describe(ex, path):
+        """One plain line about the checkpoint: which run, which iteration / update, how it was doing."""
+        run = ex.get("run") or os.path.basename(os.path.dirname(path)); m = ex.get("metrics") or {}
+        if ex.get("phase") == "ppo" or "update" in ex or os.path.basename(path).startswith("ppo"):
+            u, n = ex.get("update"), ex.get("updates")
+            core = f"PPO {run}" + (f"  update {u}" + (f" of {n}" if n else "") if u is not None else "") + f"  {ex.get('steps', 0) / 1e6:.1f}M steps" + (f"  cap {ex['cap']:.1f} m/s" if "cap" in ex else "")
+        else:
+            it, n = ex.get("iter"), ex.get("iters")
+            core = f"DAgger {run}" + (f"  iteration {it + 1}" + (f" of {n}" if n else "") if it is not None else "") + (f"  {ex['samples'] / 1e6:.1f}M samples" if "samples" in ex else "")
+        if m:
+            core += f"   |  at save: collision {m.get('collision_rate', float('nan')):.2f}" + (f", {m['progress_rate_mps']:.1f} m/s" if "progress_rate_mps" in m else "") + (f", lap {m['lap_time_s']:.1f} s" if m.get("lap_time_s") == m.get("lap_time_s") and m.get("lap_time_s") else "")
+        return core
+    mtime = os.path.getmtime(ckpt_path); step_info = describe(extra, ckpt_path)
     obs, info = env.reset()
     env.sim.warmup()
     from ..viewer.native import NativeViewer
@@ -238,21 +349,38 @@ def main():
                 mt = os.path.getmtime(ckpt_path)
                 if mt != mtime:
                     m2, ex = load_checkpoint(ckpt_path, device); m2.eval(); state["model"], state["extra"] = m2, ex
-                    intro.__init__(m2); mtime = mt; step_info = f"ckpt {ex.get('steps', 0) / 1e6:.1f}M steps (reloaded)"
+                    intro.__init__(m2); mtime = mt; step_info = describe(ex, ckpt_path)
             except Exception:
                 pass
         m = state["model"]
         scan, pro = flatten_obs(state["obs"])
         with torch.no_grad():
             act, _ = m.act(scan, pro, deterministic=not a.stochastic)
-            priv = env.privileged(env.last_result)
-            val = m.critic(scan[v.focus:v.focus + 1], pro[v.focus:v.focus + 1], priv[v.focus:v.focus + 1]).item()
-        sal, mu = intro.saliency(scan, pro, v.focus)
-        v.point_colors = sal_colors(sal)
-        std = m.actor.log_std.exp().detach().cpu().numpy()
-        v.panel = panel_image(intro.h["hidden"][v.focus].float().cpu().numpy(), intro.h["stem"][v.focus].float().cpu().numpy(), mu, std, val, a.speed_cap, step_info)
-        v.extra_hud = [f"WATCH {os.path.basename(ckpt_path)}  {step_info}   agents {a.cars}"]
+        state["k"] = state.get("k", 0) + 1
+        if state["k"] % a.panel_every == 1 or a.panel_every == 1:      # saliency (a backward pass) + panel: not every frame
+            with torch.no_grad():
+                priv = env.privileged(env.last_result)
+                val = m.critic(scan[v.focus:v.focus + 1], pro[v.focus:v.focus + 1], priv[v.focus:v.focus + 1]).item()
+            sal, mu = intro.saliency(scan, pro, v.focus)
+            v.point_colors = sal_colors(sal)
+            std = m.actor.log_std.exp().detach().cpu().numpy()
+            state["panel_args"] = (sal, mu, std, val)
         state["obs"], rew, term, trunc, info = env.step(act)
+        if "panel_args" in state and (state["k"] % a.panel_every == 1 or a.panel_every == 1):
+            sal, mu, std, val = state["panel_args"]
+            plan_ref = env.tracker.last_ref[v.focus].cpu().numpy() if mode == "plan" else None
+            v.panel = panel_image(sal, mu, std, val, a.speed_cap, step_info, plan_ref=plan_ref, cmd=env.last_cmd[v.focus].cpu().numpy() if mode == "plan" else None)
+            if a.internals:
+                pi = panel_internals(intro.h["hidden"][0].float().cpu().numpy(), intro.h["stem"][0].float().cpu().numpy())
+                both = Image.new("RGBA", (480, 300 + 130), (0, 0, 0, 0)); both.paste(v.panel, (0, 0)); both.paste(pi, (0, 300)); v.panel = both
+        fc = v.focus
+        st_ = torch.cat([env.sim.state[fc, [3, 6]], env.last_cmd[fc]]).cpu().numpy()           # speed, steer, cmd steer, cmd speed
+        v.dash = dash_image(float(st_[0]), float(st_[3]), float(env.speed_cap[fc]), float(st_[1]), float(st_[2]), env.ecfg.v_max_policy, env.s_max)
+        age = time.time() - mtime
+        v.extra_hud = ["", f"POLICY  {step_info}",
+                       f"        file {os.path.basename(ckpt_path)}, saved {age / 60:.0f} min ago (auto-reloads)   output: " + ("local plan -> iLQR tracker" if mode == "plan" else "steer + speed")]
+        if mode == "plan":                                       # the focus car's plan, coloured by its speed profile
+            v.plan = env.plan_world(v.focus); v.plan_pred = env.plan_world(v.focus, predicted=True)
         return env.last_result
 
     if not headless:

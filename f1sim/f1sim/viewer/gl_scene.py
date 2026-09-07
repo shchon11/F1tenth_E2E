@@ -426,7 +426,7 @@ class Scene:
     def set_hud(self, lines):
         from PIL import Image, ImageDraw, ImageFont
         font = _font(17)
-        w, h = 470, 24 * len(lines) + 16
+        w, h = max(470, int(max((font.getlength(t) for t in lines), default=0)) + 28), 24 * len(lines) + 16
         img = Image.new("RGBA", (w, h), (12, 15, 22, 190))
         d = ImageDraw.Draw(img)
         for i, t in enumerate(lines):
@@ -435,21 +435,25 @@ class Scene:
             self.hud_tex = self.ctx.texture((w, h), 4); self.hud_size = (w, h)
         self.hud_tex.write(img.tobytes())
 
-    def set_panel(self, img):
-        """RGBA PIL image shown at the top-right (activation panel)."""
-        if getattr(self, "panel_tex", None) is None or self.panel_size != img.size:
-            self.panel_tex = self.ctx.texture(img.size, 4); self.panel_size = img.size
-        self.panel_tex.write(img.tobytes())
+    def set_panel(self, img, slot: int = 0):
+        """RGBA PIL image overlay. slot 0: top-right (policy panel), slot 1: bottom-centre (dash)."""
+        if not hasattr(self, "panels"): self.panels = {}
+        tex, size = self.panels.get(slot, (None, None))
+        if tex is None or size != img.size:
+            tex = self.ctx.texture(img.size, 4); size = img.size
+        tex.write(img.tobytes()); self.panels[slot] = (tex, size)
 
     def draw_panel(self):
         import moderngl
-        if getattr(self, "panel_tex", None) is None: return
+        if not getattr(self, "panels", None): return
         self.ctx.disable(moderngl.DEPTH_TEST); self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
-        w, h = self.panel_size
-        self.hud_prog["u_rect"].value = (1 - (w + 12) / self.width, 1 - (h + 12) / self.height, w / self.width, h / self.height)
-        self.panel_tex.use(0); self.hud_prog["u_tex"].value = 0
-        self.hud_vao.render(moderngl.TRIANGLE_STRIP)
+        for slot, (tex, (w, h)) in self.panels.items():
+            if slot == 0: x0, y0 = 1 - (w + 12) / self.width, 1 - (h + 12) / self.height
+            else: x0, y0 = 0.5 - 0.5 * w / self.width, 12 / self.height
+            self.hud_prog["u_rect"].value = (x0, y0, w / self.width, h / self.height)
+            tex.use(0); self.hud_prog["u_tex"].value = 0
+            self.hud_vao.render(moderngl.TRIANGLE_STRIP)
         self.ctx.enable(moderngl.DEPTH_TEST); self.ctx.disable(moderngl.BLEND)
 
     def _build_label_atlas(self):

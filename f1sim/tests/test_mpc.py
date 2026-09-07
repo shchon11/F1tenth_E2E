@@ -6,14 +6,15 @@ WB, SMAX, VMAX = 0.3302, 0.4189, 8.0
 
 
 def test_encode_decode_roundtrip():
-    spec = PlanSpec(); v = torch.full((4,), 3.0)
-    off = torch.tensor([[0.0, 0.0, 0.0], [0.3, 0.6, 0.9], [-0.5, -0.2, 0.4], [1.0, -1.0, 0.0]])
-    a = encode(off, torch.full((4,), 2.0), torch.full((4,), 5.0), VMAX, spec)
-    b, Lp, v0, v1 = decode(a, v, VMAX, torch.full((4,), 9.0), spec)
-    assert torch.allclose(v0, torch.full((4,), 2.0), atol=1e-5) and torch.allclose(v1, torch.full((4,), 5.0), atol=1e-5)
-    from f1sim.mpc import XI
-    g = b[:, 0:1] * XI[None] ** 2 + b[:, 1:2] * XI[None] ** 3 + b[:, 2:3] * XI[None] ** 4
-    assert torch.allclose(g * Lp[:, None], off, atol=1e-5)          # the offsets are reproduced at the stations
+    spec = PlanSpec(); v = torch.full((3,), 3.0)
+    kap = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5], [-1.2, 0.3, 0.8, -0.4]])
+    a = encode(kap, torch.full((3,), 2.0), torch.full((3,), 5.0), VMAX, spec)
+    k, Lp, v0, v1 = decode(a, v, VMAX, torch.full((3,), 9.0), spec)
+    assert torch.allclose(k, kap, atol=1e-5) and torch.allclose(v0, torch.full((3,), 2.0), atol=1e-5) and torch.allclose(v1, torch.full((3,), 5.0), atol=1e-5)
+    from f1sim.mpc import path_points
+    x, y, psi, s = path_points(k, Lp)
+    assert torch.allclose(psi[1, -1], torch.tensor(0.5 * Lp[1]), atol=1e-4)      # constant curvature: heading = kappa * s
+    assert abs(float(x[1, -1] - math.sin(0.5 * Lp[1]) / 0.5)) < 0.02             # ... on a circle of radius 2 m
 
 
 def test_tracker_straight_and_arc():
@@ -21,11 +22,9 @@ def test_tracker_straight_and_arc():
     tr = PlanTracker(3, dev, WB, SMAX, VMAX)
     v = torch.tensor([3.0, 3.0, 3.0], device=dev); cap = torch.full((3,), 8.0, device=dev)
     # env 0: straight plan, env 1: constant left curvature 0.5 1/m, env 2: right curvature
-    spec = tr.spec; Lp = (spec.horizon_s * 3.0)
-    Lp = max(spec.len_min, min(spec.len_max, Lp)); xs = torch.tensor([Lp / 3, 2 * Lp / 3, Lp])
-    R = 2.0; arc = R - torch.sqrt((R ** 2 - xs ** 2).clamp_min(0.0))         # circle of radius R tangent at the origin
-    off = torch.stack([torch.zeros(3), arc, -arc]).to(dev)
-    a = encode(off, torch.full((3,), 3.0, device=dev), torch.full((3,), 3.0, device=dev), VMAX, spec)
+    spec = tr.spec; R = 2.0
+    kap = torch.tensor([[0.0] * 4, [1 / R] * 4, [-1 / R] * 4], device=dev)      # straight, left circle, right circle
+    a = encode(kap, torch.full((3,), 3.0, device=dev), torch.full((3,), 3.0, device=dev), VMAX, spec)
     for _ in range(3):
         cmd = tr(a, v, cap)
     steer = cmd[:, 0].cpu()
@@ -40,7 +39,7 @@ def test_tracker_speed_and_runtime():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     B = 2048 if dev == "cuda" else 64
     tr = PlanTracker(B, dev, WB, SMAX, VMAX)
-    a = torch.zeros(B, ACT_DIM, device=dev); a[:, 3] = 0.5; a[:, 4] = 0.5     # straight, speed target 6 m/s
+    a = torch.zeros(B, ACT_DIM, device=dev); a[:, 4] = 0.5; a[:, 5] = 0.5     # straight, speed target 6 m/s
     v = torch.full((B,), 2.0, device=dev); cap = torch.full((B,), 8.0, device=dev)
     cmd = tr(a, v, cap)
     assert (cmd[:, 1] > 2.3).all() and (cmd[:, 1] < 3.5).all()            # accelerating towards the target, a_max-limited

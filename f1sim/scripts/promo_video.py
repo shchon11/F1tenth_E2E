@@ -102,7 +102,7 @@ def main():
         with torch.no_grad(): act, _ = mf.act(scan, pro, deterministic=True)
         sal, mu = intro.saliency(scan, pro, focus); hold["cols"] = sal_colors(sal)
         std = mf.actor.log_std.exp().detach().cpu().numpy()
-        hold["panel"] = panel_image(intro.h["hidden"][0].float().cpu().numpy(), intro.h["stem"][0].float().cpu().numpy(), mu, std, float("nan"), 7.0, f"ppo_v3 {exf.get('steps', 0) / 1e6:.0f}M steps")
+        hold["panel"] = panel_image(sal, mu, std, None, 7.0, f"ppo_v3 {exf.get('steps', 0) / 1e6:.0f}M steps")
         state["obs"] = env.step(act)[0]
     cut(sink, env, act_chase, 6.0, chase, "ppo_v3  gen:competition:2  cap 7 m/s  deterministic  | points: saliency", focus=focus,
         panel_fn=lambda: hold.get("panel"), colors_fn=lambda: hold.get("cols"))

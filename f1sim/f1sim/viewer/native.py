@@ -75,13 +75,17 @@ class NativeViewer:
         self.point_colors = None               # (N,4) override for the focus car's scan points (e.g. saliency)
         self.plan = None                       # (K,3) world x, y, speed: the focus car's current plan (plan action space)
         self.plan_pred = None                  # (K,3) the tracker's predicted motion along it
-        self.panel = None                      # PIL RGBA image drawn top-right (activations etc.)
+        self.panel = None                      # PIL RGBA image drawn top-right (policy panel)
+        self.dash = None                       # PIL RGBA image drawn bottom-centre (speedometer + steering wheel)
         self.mode = 0
         self.focus = 0
         self.show_lidar = self.show_race = self.show_trails = True
         self.frame: Optional[dict] = None           # latest sim state snapshot (numpy)
         self.prev_frame: Optional[dict] = None
         self._t_frame = 0.0
+        import threading
+        self._lock = threading.RLock()
+        self._worker = None; self._worker_err = None
         self._t_wall0 = None; self._t_sim0 = None
         self._orbit = [math.radians(-35), math.radians(30), 4.0]   # azimuth, elevation, distance
         self._drag = None
@@ -151,26 +155,30 @@ class NativeViewer:
 
     # ------------------------------------------------------------------ state
     def update(self, r):
-        """Snapshot a StepResult (torch) into numpy for rendering."""
+        """Snapshot a StepResult (torch) into numpy for rendering: a handful of device->host copies."""
         sel = torch.nonzero(self.sim.tid == self.track_index).flatten()[: self.max_cars]
         n = sel.numel()
         if n == 0:
             return
-        self.env_ids = sel.cpu().numpy()
-        st = r.state[sel].detach().cpu().numpy()
-        att = r.attitude[sel].detach().cpu().numpy()
-        # focus is an env id; map to its position among the cars on this track
-        f = int((self.env_ids == self.focus).nonzero()[0][0]) if self.focus in self.env_ids else 0
-        fe = int(self.env_ids[f])
-        fr = {"t": r.t, "n": n, "x": st[:, 0], "y": st[:, 1], "yaw": st[:, 2], "vx": st[:, 3], "steer": st[:, 6],
-              "roll": att[:, 0], "pitch": att[:, 1], "lap": r.lap[sel].cpu().numpy(), "coll": r.collision[sel].cpu().numpy(),
-              "s": r.s[sel].cpu().numpy(), "scan": r.scan[fe].cpu().numpy(), "scan_type": r.scan_type[fe].cpu().numpy(),
-              "wall": r.wall_dist[sel].cpu().numpy(), "focus": f, "focus_env": fe, "ids": self.env_ids,
-              "rear": self.sim.car_rear[sel].cpu().numpy(), "len": self.sim.car_dims[sel, 0].cpu().numpy(),
-              "P": {k: float(self.sim.P[k][fe]) for k in ("mount_x", "mount_y", "mount_z", "mount_yaw", "mount_roll", "mount_pitch")}}
-        self.prev_frame, self.frame = self.frame, fr
-        self._t_frame = time.perf_counter()
-        self.scene.push_trail_points(fr["x"], fr["y"])
+        env_ids = sel.cpu().numpy()
+        f = int((env_ids == self.focus).nonzero()[0][0]) if self.focus in env_ids else 0
+        fe = int(env_ids[f])
+        pack = torch.cat([r.state[sel], r.attitude[sel], r.lap[sel, None].float(), r.collision[sel, None].float(),
+                          r.s[sel, None], r.wall_dist[sel, None], self.sim.car_rear[sel], self.sim.car_dims[sel, 0:1]], 1).detach().cpu().numpy()
+        scan = torch.stack([r.scan[fe], r.scan_type[fe].float()], 0).cpu().numpy()
+        Pk = ("mount_x", "mount_y", "mount_z", "mount_yaw", "mount_roll", "mount_pitch")
+        pv = torch.stack([self.sim.P[k][fe] for k in Pk]).cpu().numpy()
+        fr = {"t": r.t, "n": n, "x": pack[:, 0], "y": pack[:, 1], "yaw": pack[:, 2], "vx": pack[:, 3], "steer": pack[:, 6],
+              "roll": pack[:, 7], "pitch": pack[:, 8], "lap": pack[:, 9], "coll": pack[:, 10], "s": pack[:, 11], "wall": pack[:, 12],
+              "rear": pack[:, 13:17], "len": pack[:, 17], "scan": scan[0], "scan_type": scan[1].astype(np.int32),
+              "focus": f, "focus_env": fe, "ids": env_ids, "P": {k: float(pv[i]) for i, k in enumerate(Pk)}}
+        now = time.perf_counter()
+        with self._lock:
+            self.env_ids = env_ids
+            self._dt_frame = max(1e-3, now - self._t_frame) if self.frame is not None else self.sim.control_dt
+            self.prev_frame, self.frame = self.frame, fr
+            self._t_frame = now
+            self._trail_pending = True
 
     def sync(self):
         """Pace the calling loop to wall-clock real time (one call per sim step)."""
@@ -183,12 +191,46 @@ class NativeViewer:
         elif now - target > 0.5:
             self._t_wall0, self._t_sim0 = now, t_sim
 
-    def run(self, step_fn, realtime: bool = True, max_catchup: int = 4):
-        """Drive the sim from the render loop: step_fn() -> StepResult. Renders every vsync with
-        interpolation; steps the sim as often as wall-clock demands (or every frame if not realtime).
-        Call sim.warmup() before creating the viewer, otherwise the first step's JIT compile
-        (10-20 s) stalls the window and the desktop reports it as not responding."""
+    def run(self, step_fn, realtime: bool = True, max_catchup: int = 4, threaded: bool = True):
+        """Drive the sim from the viewer: step_fn() -> StepResult. threaded (default): the sim runs in a
+        worker thread paced to wall-clock real time (as fast as it can otherwise) while this thread
+        renders every vsync with interpolation, so the picture stays smooth even when a training job
+        hogs the GPU and a sim step takes 100 ms. Call sim.warmup() before creating the viewer,
+        otherwise the first step's JIT compile (10-20 s) stalls the window."""
         self.render()                                   # show something before the first step
+        if threaded:
+            import sys, threading
+            sys.setswitchinterval(0.0005)               # the GL thread must not hog the GIL: 30 fps + short slices keep the sim at ~80 % of its solo speed
+            self.max_fps = min(self.max_fps or 30, 30)
+            self._sim_rate = 0.0
+
+            def worker():
+                t0 = time.perf_counter(); sim_t0 = self.sim.t
+                try:
+                    n_ = 0; t_rate = time.perf_counter(); sim_rate0 = self.sim.t
+                    while self.alive:
+                        if self.paused:
+                            time.sleep(0.02); t0 = time.perf_counter(); sim_t0 = self.sim.t; continue
+                        self.update(step_fn()); n_ += 1
+                        if n_ % 10 == 0:                     # sim speed relative to real time, for the HUD
+                            now_ = time.perf_counter(); self._sim_rate = (self.sim.t - sim_rate0) / max(1e-3, now_ - t_rate); t_rate, sim_rate0 = now_, self.sim.t
+                        if realtime:
+                            lead = (self.sim.t - sim_t0) - (time.perf_counter() - t0)
+                            if lead > 0: time.sleep(min(lead, 0.05))
+                            elif lead < -0.5: t0 = time.perf_counter(); sim_t0 = self.sim.t   # can't keep up: re-anchor
+                except Exception as e:                  # surface in the main thread
+                    self._worker_err = e; self.alive = False
+            self._worker = threading.Thread(target=worker, daemon=True); self._worker.start()
+            while self.alive:
+                t_r = time.perf_counter()
+                self.render()
+                if self.headless or not self.max_fps:               # no vsync to pace us: cap the loop ourselves
+                    wait = t_r + 1.0 / (self.max_fps or 60) - time.perf_counter()
+                    if wait > 0: time.sleep(wait)
+            self._worker.join(timeout=10.0)                          # let the sim step in flight finish before exit
+            if self._worker_err is not None:
+                raise self._worker_err
+            return
         t0 = time.perf_counter(); sim_t0 = self.sim.t
         while self.alive:
             if not self.paused:
@@ -212,7 +254,7 @@ class NativeViewer:
             return None
         if pf is None or pf["n"] != fr["n"]:
             return fr
-        dt_frames = max(1e-3, self.sim.control_dt)
+        dt_frames = max(1e-3, getattr(self, "_dt_frame", self.sim.control_dt))   # wall time between sim frames
         a = float(np.clip((time.perf_counter() - self._t_frame) / dt_frames, 0.0, 1.0))
         out = dict(fr)
         for k in ("x", "y", "vx", "steer", "roll", "pitch"):
@@ -229,7 +271,10 @@ class NativeViewer:
             glfw.poll_events()
             if glfw.window_should_close(self.window):
                 self.alive = False; return
-        fr = self._interp()
+        with self._lock:
+            fr = self._interp()
+            if getattr(self, "_trail_pending", False) and self.frame is not None:
+                self.scene.push_trail_points(self.frame["x"], self.frame["y"]); self._trail_pending = False
         if fr is not None:
             self._draw(fr)
         else:
@@ -299,15 +344,17 @@ class NativeViewer:
         if now - self._hud_t > 0.1:
             self._hud_t = now
             coll = int((fr["coll"] > 0.5).sum())
-            lines = [f"f1sim  {self.sim.tracks[self.track_index].name}   {n} cars" + (f"  (track {self.track_index}/{self.sim.track.T})" if self.sim.track.T > 1 else ""),
-                     f"sim time  {fr['t']:7.2f} s      render {self._fps:4.0f} fps",
-                     f"focus car {fr.get('focus_env', f):3d}   speed {fr['vx'][f]:5.2f} m/s   steer {math.degrees(fr['steer'][f]):5.1f} deg",
-                     f"roll {math.degrees(fr['roll'][f]):5.2f} deg   pitch {math.degrees(fr['pitch'][f]):5.2f} deg",
-                     f"lap {int(fr['lap'][f])}   s {fr['s'][f]:6.1f} m   wall {fr['wall'][f]:4.2f} m",
-                     f"collided {coll}/{n}   camera {MODES[self.mode]}" + ("   PAUSED" if self.paused else "")]
+            rate = getattr(self, "_sim_rate", 0.0)
+            lines = [f"{self.sim.tracks[self.track_index].name}   {n} cars   t = {fr['t']:.1f} s   {self._fps:.0f} fps" + (f"   sim {rate:.2f}x real time" if rate else "") + (f"   (track {self.track_index + 1} of {self.sim.track.T})" if self.sim.track.T > 1 else ""),
+                     f"watching car {fr.get('focus_env', f)}      [ ] other car   C camera ({MODES[self.mode]})   L lidar" + ("   PAUSED" if self.paused else ""),
+                     f"  speed {fr['vx'][f]:4.2f} m/s   steering {math.degrees(fr['steer'][f]):+5.1f} deg   body roll {math.degrees(fr['roll'][f]):+4.1f} deg  pitch {math.degrees(fr['pitch'][f]):+4.1f} deg",
+                     f"  lap {int(fr['lap'][f])}, {fr['s'][f]:.1f} m into it      nearest wall {fr['wall'][f]:.2f} m",
+                     f"crashed: {coll} of {n} cars"]
             sc.set_hud(lines + list(self.extra_hud))
             if self.panel is not None:
-                sc.set_panel(self.panel)
+                sc.set_panel(self.panel, slot=0)
+        if self.dash is not None:
+            sc.set_panel(self.dash, slot=1)
         sc.draw_hud()
         sc.draw_panel()
 

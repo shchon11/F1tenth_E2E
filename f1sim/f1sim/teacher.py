@@ -58,32 +58,48 @@ class RacelineTeacher:
 
     @torch.no_grad()
     def plan_action(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None, v_max: float = 8.0,
-                    spec=None) -> torch.Tensor:
-        """The teacher as a *planner*: the raceline segment ahead of the car, expressed in the
-        plan action space (3 lateral offsets at the stations of a plan of length L_p + start/end
-        speeds, normalized), see f1sim.mpc. This is what a plan-space student imitates."""
-        from .mpc import PlanSpec, encode, plan_length, M_INV
+                    spec=None, iters: int = 6) -> torch.Tensor:
+        """The teacher as a *planner*: the raceline segment ahead of the car expressed in the plan
+        action space (f1sim.mpc: curvature knots along the next L_p of arc + start/end speeds).
+        Gauss-Newton fits the knots so the integrated path passes through the raceline points
+        ahead (in the body frame), starting from the raceline's own curvature there; this is what
+        a plan-space student imitates."""
+        from .mpc import N_KNOTS, PlanSpec, encode, path_points, plan_length
         spec = spec or PlanSpec()
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
-        B = xy.shape[0]
-        tid = torch.zeros(B, dtype=torch.long, device=xy.device) if tid is None else tid
+        B = xy.shape[0]; dev = xy.device
+        tid = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
         idx, _ = self.project(xy, tid)
         ds = self.ds[tid]
         Lp = plan_length(vx, spec)
-        # raceline points at 6 arc distances up to L_p ahead, in the body frame
-        fr = torch.linspace(1.0 / 6.0, 1.0, 6, device=xy.device)
-        pidx = (idx[:, None] + ((Lp[:, None] * fr[None]) / ds[:, None]).round().long()) % self.N        # (B,6)
+        # raceline points at 6 arc distances between 0.4 and 1.0 L_p ahead, in the body frame (the near
+        # points are skipped on purpose: like pure pursuit, an off-line car should rejoin gently)
+        M = 6
+        fr = torch.linspace(0.4, 1.0, M, device=dev)
+        pidx = (idx[:, None] + ((Lp[:, None] * fr[None]) / ds[:, None]).round().long()) % self.N        # (B,M)
         pts = self.xy[tid[:, None].expand_as(pidx), pidx] - xy[:, None, :]
         c, s_ = torch.cos(yaw), torch.sin(yaw)
-        bx = pts[..., 0] * c[:, None] + pts[..., 1] * s_[:, None]
-        by = -pts[..., 0] * s_[:, None] + pts[..., 1] * c[:, None]
-        # least squares for g(xi) = b2 xi^2 + b3 xi^3 + b4 xi^4 through (bx/Lp, by/Lp)
-        xi = (bx / Lp[:, None]).clamp(0.0, 1.5)
-        A = torch.stack([xi ** 2, xi ** 3, xi ** 4], 2)                                                  # (B,6,3)
-        AtA = A.transpose(1, 2) @ A + 1e-4 * torch.eye(3, device=xy.device)                              # ridge: points behind the
-        b = torch.linalg.solve(AtA, A.transpose(1, 2) @ (by / Lp[:, None])[..., None]).squeeze(-1)       # car collapse the fit
-        XI = torch.tensor([1 / 3, 2 / 3, 1.0], device=xy.device)
-        offsets = Lp[:, None] * (b[:, 0:1] * XI ** 2 + b[:, 1:2] * XI ** 3 + b[:, 2:3] * XI ** 4)
+        tx = pts[..., 0] * c[:, None] + pts[..., 1] * s_[:, None]
+        ty = -pts[..., 0] * s_[:, None] + pts[..., 1] * c[:, None]
+        # initial knots: the raceline curvature at the knot arc distances
+        kidx = (idx[:, None] + ((Lp[:, None] * torch.linspace(0, 1, N_KNOTS, device=dev)[None]) / ds[:, None]).round().long()) % self.N
+        k_rl = self.kappa[tid[:, None].expand_as(kidx), kidx].clone()
+        k = k_rl.clone()
+        k_lim = 0.85 * spec.kappa_max                              # the teacher never asks for full lock
+
+        def resid(kk):                                             # path samples at the target arc fractions vs targets
+            x, y, _, _ = path_points(kk, Lp, 25)
+            j = (fr * 24).round().long()
+            return torch.cat([x[:, j] - tx, y[:, j] - ty], 1)      # (B,2M)
+        lam, mu, eps = 1e-2, 0.03, 0.02                            # GN damping, ridge towards the raceline's own curvature
+        for _ in range(iters):
+            r0 = resid(k)
+            J = torch.stack([(resid(k + eps * torch.nn.functional.one_hot(torch.tensor(j, device=dev), N_KNOTS).to(k.dtype)[None]) - r0) / eps
+                             for j in range(N_KNOTS)], 2)          # (B,2M,4)
+            A = J.transpose(1, 2) @ J + (lam + mu) * torch.eye(N_KNOTS, device=dev)
+            g = J.transpose(1, 2) @ r0[..., None] + mu * (k - k_rl)[..., None]
+            step = torch.linalg.solve(A, g).squeeze(-1)
+            k = (k - step).clamp(-k_lim, k_lim)
         # speeds from the profile: 0.15 s ahead and at the end of the plan
         v_idx0 = (idx + ((vx.abs() * spec.v_cmd_lead) / ds).round().long()) % self.N
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
@@ -91,7 +107,7 @@ class RacelineTeacher:
         if P is not None:
             grip = torch.sqrt(((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(0.3, 1.5))
             v0 = v0 * grip; v1 = v1 * grip
-        return encode(offsets, v0, v1, v_max, spec)
+        return encode(k, v0, v1, v_max, spec)
 
     def project(self, xy: torch.Tensor, tid: Optional[torch.Tensor] = None):
         tid = torch.zeros(xy.shape[0], dtype=torch.long, device=xy.device) if tid is None else tid

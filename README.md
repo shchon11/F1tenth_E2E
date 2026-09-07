@@ -149,17 +149,20 @@ policy sees is available on the real car; integrated pose/odometry is deliberate
 drifts, and its drift statistics differ between sim and real).
 
 Action spaces (`EnvConfig(action_mode=...)`): `"direct"` = (steer, speed) at 40 Hz;
-`"plan"` = the policy is a *local planner*: 3 lateral offsets of a quartic path over the next
-0.7 s of travel (1.5-6 m, leaves the car straight ahead) plus the target speed 0.15 s ahead and
-at the end of the plan (5 numbers, all in the car's own frame, no pose needed), tracked by an
-iLQR on a kinematic bicycle with understeer, 12 x 50 ms, calibrated latency, IMU yaw rate as the
-initial turning state (`f1sim/mpc.py`, CUDA-graph compiled: 19 ms for 2048 envs). The teacher
-becomes a planner too (`RacelineTeacher.plan_action`: the raceline segment ahead + its speed
-profile, least-squares fitted into the plan space), so DAgger imitates plans and PPO refines
-them; the tracker is the same code on the real car. Teacher through the tracker on the nominal
-car: 0.06 collisions per env per 10 s vs 0.03 driving directly; under full randomization 0.30
-vs 0.17 (the direct teacher is privileged, the tracker is not). The viewer draws the focus car's
-plan coloured by its speed profile (blue slow -> yellow fast) and the tracker's predicted motion.
+`"plan"` = the policy is a *local planner*: 4 curvature knots along the next 0.7 s of travel
+(1.5-6 m of arc, linear in between, integrated into a path that leaves the car straight ahead --
+curvature, not y(x): a hairpin is just a large curvature, a polynomial in x cannot bend back and
+strayed up to 0.8 m from the raceline) plus the target speed 0.15 s ahead and at the end of the
+plan (6 numbers, all in the car's own frame, no pose needed), tracked by an iLQR on a kinematic
+bicycle with understeer, 12 x 50 ms, calibrated latency, IMU yaw rate as the initial turning
+state (`f1sim/mpc.py`, CUDA-graph compiled: 16 ms for 2048 envs). The teacher becomes a planner
+too (`RacelineTeacher.plan_action`: Gauss-Newton fits the knots so the path runs through the
+raceline points 0.4-1.0 L_p ahead, ridge-regularized towards the raceline's own curvature, so an
+off-line car rejoins gently like pure pursuit; residual 0.05-0.2 m), so DAgger imitates plans
+and PPO refines them; the tracker is the same code on the real car. Teacher through the tracker
+on the nominal car matches the direct teacher (3 vs 2 spawn crashes in 32 x 10 s). The viewer
+draws the focus car's plan coloured by its speed profile (blue slow -> yellow fast), the
+tracker's predicted motion, and a dash with a speedometer and a steering wheel.
 
 Races (`EnvConfig(race_size=M, opponent="teacher"|"policy")`): consecutive envs form races of M
 cars on one track instance. Other cars appear in the LiDAR as what a scan plane at ~15 cm
