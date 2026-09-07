@@ -368,7 +368,17 @@ map: at a genuine fork a LiDAR-only policy has no local cue for which branch is 
 held-out set now carries blackbox2022_3 both ways, so "can it drive the geometry" (yes, teacher
 level on every held-out map) and "does it enter forks" are reported separately. The forks did give
 way, just late: ppo_v13 at update 500 had blackbox2022_3 at 0.50 / 0.38 (from ~1.0), the T-junction
-corridors passed and the round alcove the last trap, Korea at 0 of 32 cars. ppo_v11 starts
+corridors passed and the round alcove the last trap, Korea at 0 of 32 cars. ppo_v13's final
+checkpoint (120M steps, cap 8) is the current policy. Deterministic, 20 s per car, crashes per car:
+
+| cap 6 m/s | teacher (map + raceline) | ppo_v13 final (LiDAR only) |
+|---|---|---|
+| 144 training tracks (plain / boxes / pockets) | 0.06 (0.04 / 0.05 / 0.08), 4.22 m/s | 0.05 (0.04 / 0.04 / 0.06), 4.11 m/s |
+| held-out: korea both ways, Monza, gen:0, blackbox2022_3~lane both ways | 0.00-0.06 | 0.00-0.06 |
+| held-out: blackbox2022_3 forward / reverse (forks) | 0.00 / 0.00 | 0.56 / 0.25 |
+| held-out mean, speed | 0.01, 3.87 m/s | 0.12, 3.96 m/s |
+
+ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
 at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else
 at most 0.06.
@@ -382,7 +392,7 @@ python3 -m f1sim.learn.dagger --name dagger_v1 --envs 1024 --iters 8 --steps 250
 python3 -m f1sim.learn.ppo --name ppo_v1 --init ~/f1sim_runs/dagger_v1/student_latest.pt --envs 2048 --total 100e6
 python3 -m f1sim.learn.evaluate ~/f1sim_runs/ppo_v1/ppo_latest.pt --sweep          # held-out tracks + mu/latency/lidar-height sweeps
 python3 -m f1sim.learn.evaluate --teacher                                            # the baseline to beat
-python3 -m f1sim.learn.export ~/f1sim_runs/ppo_v1/ppo_latest.pt --trt               # ONNX (+ TensorRT) for the Jetson
+python3 -m f1sim.learn.export ~/f1sim_runs/ppo_v13/ppo_final.pt --trt               # ONNX (+ TensorRT) for the Jetson
 # races: fine-tune a single-car policy against teacher-driven opponents (only car 0 learns), then self-play
 python3 -m f1sim.learn.ppo --name ppo_race --init ~/f1sim_runs/ppo_v4/ppo_final.pt --race-size 3 --opponent teacher --scan-stride 3 --kl-coef 0
 python3 -m f1sim.learn.ppo --name ppo_selfplay --init ~/f1sim_runs/ppo_race/ppo_final.pt --race-size 3 --opponent policy --scan-stride 3 --kl-coef 0
