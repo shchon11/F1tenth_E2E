@@ -39,7 +39,15 @@ class PolicyNode(Node):
         self.spec = ObsSpec(**extra["spec"]) if extra.get("spec") else ObsSpec()
         self.obs = ObsBuilder(self.spec, self.device)
         self.speed_cap = float(p("speed_cap")); self.steer_max = float(p("steer_max"))
-        self.v = 0.0; self.imu_buf = []; self.att = (0.0, 0.0)
+        self.v = 0.0; self.imu_buf = []; self.att = (0.0, 0.0); self.yaw_rate = 0.0
+        # plan action space: the same iLQR tracker as in training turns the local trajectory into
+        # (steer, speed); cmd_delay = the measured command latency of this car (calibrate once)
+        self.declare_parameter("wheelbase", 0.3302); self.declare_parameter("cmd_delay", 0.06)
+        self.tracker = None
+        if self.spec.act_dim == 5:
+            from f1sim.mpc import PlanTracker
+            self.tracker = PlanTracker(1, self.device, float(p("wheelbase")), self.steer_max, self.spec.v_max)
+            self.delay = torch.tensor([float(p("cmd_delay"))], device=self.device)
         self.create_subscription(Odometry, "odom", self.on_odom, 1)
         self.create_subscription(Imu, "sensors/imu/raw", self.on_imu, 10)
         if VescImuStamped is not None:
@@ -50,7 +58,11 @@ class PolicyNode(Node):
         # warm up
         s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
         with torch.no_grad():
-            self.model.act(s, pr, deterministic=True)
+            a0, _ = self.model.act(s, pr, deterministic=True)
+        if self.tracker is not None:                                 # warm up the tracker's compiled solver too
+            self.tracker(a0, torch.zeros(1, device=self.device), torch.tensor([self.speed_cap], device=self.device), None, delay=self.delay)
+            self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
+        self.obs.reset()
         self.get_logger().info(f"policy {p('checkpoint')} on {self.device}, speed cap {self.speed_cap} m/s")
 
     def on_odom(self, m: Odometry):
@@ -59,6 +71,7 @@ class PolicyNode(Node):
     def on_imu(self, m: Imu):
         self.imu_buf.append([m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z,
                              m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z])
+        self.yaw_rate = m.angular_velocity.z
         if VescImuStamped is None:                                  # no VESC attitude: use the Imu orientation
             self.att = quat_to_rp(m.orientation)
 
@@ -74,10 +87,16 @@ class PolicyNode(Node):
         scan, pro = self.obs.build(r, self.v, imu_mean, self.att, self.speed_cap)
         with torch.no_grad():
             a, _ = self.model.act(scan, pro, deterministic=True)
-        a = a[0].cpu().numpy(); self.obs.push_action(a)
+        self.obs.push_action(a[0])
         msg = AckermannDriveStamped(); msg.header.stamp = m.header.stamp
-        msg.drive.steering_angle = float(a[0] * self.steer_max)
-        msg.drive.speed = float(min((a[1] + 1) * 0.5 * self.spec.v_max, self.speed_cap))
+        if self.tracker is not None:                                 # local plan -> tracker -> command
+            cmd = self.tracker(a, torch.tensor([self.v], device=self.device), torch.tensor([self.speed_cap], device=self.device),
+                               torch.tensor([float(imu_mean[2])], device=self.device), delay=self.delay)[0]
+            msg.drive.steering_angle = float(cmd[0]); msg.drive.speed = float(cmd[1])
+        else:
+            a = a[0].cpu().numpy()
+            msg.drive.steering_angle = float(a[0] * self.steer_max)
+            msg.drive.speed = float(min((a[1] + 1) * 0.5 * self.spec.v_max, self.speed_cap))
         if self.get_parameter("enabled").value:
             self.pub.publish(msg)
         dt = (time.perf_counter() - t0) * 1000
