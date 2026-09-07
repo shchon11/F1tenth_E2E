@@ -202,7 +202,7 @@ class Track:
                                     duct_height=duct_height)
 
     def with_pockets(self, seed: int = 0, n: int = 3, depth=(1.0, 4.0), width=(0.8, 2.4), min_spacing: float = 5.0,
-                     p_bend: float = 0.6) -> "Track":
+                     p_bend: float = 0.6, p_elbow: float = 0.5) -> "Track":
         """Copy of the track with n dead-end side pockets carved into the boundary and walled with duct
         hose: pit-lane mouths, door alcoves, side rooms of a hall. Openings like these are what a
         LiDAR-only policy mistakes for the track (ppo_v10 died in blackbox2022_3's alcoves at 1.0 crash
@@ -210,7 +210,9 @@ class Track:
         and the raceline (built on `base`, the unmodified track) are unchanged. A share p_bend of the
         pockets opens on the outside of a bend, where an approaching car sees it straight ahead: that is
         the configuration that actually traps the policy (a corridor continuing where the track turns);
-        pockets on the side of a straight it ignores after a few updates."""
+        pockets on the side of a straight it ignores after a few updates. A share p_elbow of the
+        pockets turn 90 degrees after their first leg (an elbow), so their end wall is out of sight
+        from the mouth, as it is in a real side corridor: the policy must not rely on seeing a dead end."""
         rng = np.random.default_rng(seed + 7919)
         if self.centerline is None:
             raise ValueError("pockets need a centerline")
@@ -248,8 +250,10 @@ class Track:
             if hw is None or hw > 4.0:
                 continue
             w = float(rng.uniform(*width)); d = float(rng.uniform(*depth))
+            elbow = float(rng.choice([-1.0, 1.0])) if rng.random() < p_elbow else 0.0
+            d2 = float(rng.uniform(1.0, 3.0)) if elbow else 0.0                 # second leg, sideways
             # local window in lane coordinates: u along the lane, v outward on the chosen side
-            ext = hw + d + ring_w + 0.2
+            ext = hw + d + max(w, d2) + ring_w + 0.2
             cx, cy = cl[i]
             cc0, cc1 = int((cx - ext - self.origin[0]) / res), int((cx + ext - self.origin[0]) / res) + 1
             rr0, rr1 = int((cy - ext - self.origin[1]) / res), int((cy + ext - self.origin[1]) / res) + 1
@@ -259,8 +263,11 @@ class Track:
             dx, dy = gx - cx, gy - cy
             u = dx * tang[i, 0] + dy * tang[i, 1]; v = side * (dx * nrm[i, 0] + dy * nrm[i, 1])
             pocket = (np.abs(u) <= w / 2) & (v >= hw - 0.15) & (v <= hw + d)
-            ring = (np.abs(u) <= w / 2 + ring_w) & (v >= hw + 0.05) & (v <= hw + d + ring_w) & ~pocket
-            beyond = (np.abs(u) <= w / 2 + ring_w) & (v > hw + 0.05)
+            if elbow:                                                          # second leg at the end, out of sight
+                pocket |= (elbow * u >= -w / 2) & (elbow * u <= w / 2 + d2) & (v >= hw + d - w) & (v <= hw + d)
+            shell = ndimage.binary_dilation(pocket, iterations=max(1, int(np.ceil(ring_w / res))))
+            ring = shell & ~pocket & (v >= hw + 0.05)
+            beyond = shell & (v > hw + 0.05)
             lane_w = lane[rr0:rr1, cc0:cc1]
             if (lane_w & beyond).any():                                       # would tunnel into another part of the lane
                 continue

@@ -350,7 +350,9 @@ the lane, centerline and raceline (built on the unmodified `base` track) are unt
 teacher never enters one. 60 % of them open on the outside of a bend: a crash map of ppo_v11 at
 update 100 showed that this is the configuration that traps the policy (all 12 crashes on
 icra2022+pk0~mir were in the one pocket straight ahead of a corner; pockets beside a straight are
-ignored), and it is what blackbox2022_3's side corridors are. From ppo_v11 every real map trains
+ignored), and it is what blackbox2022_3's side corridors are. Half of them turn 90 degrees after
+their first leg, so their end is out of sight from the mouth, as in a real side corridor: the
+policy cannot learn "enter only if no end wall is visible". From ppo_v11 every real map trains
 plain, with boxes and with pockets; ppo_v12 = the same run restarted from ppo_v11's checkpoint with
 the bend-biased pockets. ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
