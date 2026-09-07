@@ -347,7 +347,10 @@ follows an opening that looks like the track and stops at its end. Korea, Monza 
 0.06 or below. Hence `+pk<seed>`: `Track.with_pockets` carves 3-8 walled dead-end side pockets
 (0.8-2.2 m wide, 1-3 m deep, duct-hose walls: pit-lane mouths, alcoves) into a map; the lane,
 centerline and raceline (built on the unmodified `base` track) are untouched, so the teacher never
-enters one. From ppo_v11 every real map trains plain, with boxes and with pockets.
+enters one. From ppo_v11 every real map trains plain, with boxes and with pockets. ppo_v11 starts
+from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
+at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else
+at most 0.06.
 Held-out eval = `common.EVAL_TRACKS` (real:korea_2025_iccas and
 real:blackbox2022_3 both ways, rt:Monza, gen:competition:0); `--tracks` takes `train`, `eval` or a
 comma separated catalog list; W&B project `f1sim-e2e`; runs and checkpoints under
