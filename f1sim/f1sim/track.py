@@ -201,12 +201,16 @@ class Track:
         return Track.from_occupancy(occ, res, (origin[0], origin[1]), cl, name, duct=duct, tall=tall,
                                     duct_height=duct_height)
 
-    def with_pockets(self, seed: int = 0, n: int = 3, depth=(1.0, 3.0), width=(0.8, 2.2), min_spacing: float = 5.0) -> "Track":
+    def with_pockets(self, seed: int = 0, n: int = 3, depth=(1.0, 4.0), width=(0.8, 2.4), min_spacing: float = 5.0,
+                     p_bend: float = 0.6) -> "Track":
         """Copy of the track with n dead-end side pockets carved into the boundary and walled with duct
         hose: pit-lane mouths, door alcoves, side rooms of a hall. Openings like these are what a
         LiDAR-only policy mistakes for the track (ppo_v10 died in blackbox2022_3's alcoves at 1.0 crash
         per car per 20 s while every other held-out map was under 0.06). The lane itself, the centerline
-        and the raceline (built on `base`, the unmodified track) are unchanged."""
+        and the raceline (built on `base`, the unmodified track) are unchanged. A share p_bend of the
+        pockets opens on the outside of a bend, where an approaching car sees it straight ahead: that is
+        the configuration that actually traps the policy (a corridor continuing where the track turns);
+        pockets on the side of a straight it ignores after a few updates."""
         rng = np.random.default_rng(seed + 7919)
         if self.centerline is None:
             raise ValueError("pockets need a centerline")
@@ -220,10 +224,16 @@ class Track:
         lane = lab == lab[r0, c0]
         seg = np.linalg.norm(np.roll(cl, -1, 0) - cl, axis=1).mean()
         ring_w = self.duct_height + res                                        # pocket wall thickness [m]
+        ang = np.unwrap(np.arctan2(tang[:, 1], tang[:, 0]))
+        kappa = (np.roll(ang, -1) - np.roll(ang, 1)) / (2 * seg + 1e-9)       # signed: + = left turn
+        w_bend = np.abs(kappa); w_bend = w_bend / w_bend.sum() if w_bend.sum() > 0 else None
         placed = []; tries = 0
         while len(placed) < n and tries < 300:
             tries += 1
-            i = int(rng.integers(N)); side = float(rng.choice([-1.0, 1.0]))
+            if w_bend is not None and rng.random() < p_bend:                  # outside of a bend
+                i = int(rng.choice(N, p=w_bend)); side = -float(np.sign(kappa[i])) or 1.0
+            else:
+                i = int(rng.integers(N)); side = float(rng.choice([-1.0, 1.0]))
             if any(min(abs(i - j), N - abs(i - j)) * seg < min_spacing for j in placed):
                 continue
             # distance to the wall on this side: march along the normal
