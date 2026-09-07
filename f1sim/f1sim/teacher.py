@@ -90,27 +90,39 @@ class RacelineTeacher:
         # initial knots: the raceline curvature at the knot arc distances
         kidx = (idx[:, None] + ((Lp[:, None] * torch.linspace(0, 1, N_KNOTS, device=dev)[None]) / ds[:, None]).round().long()) % self.N
         k_rl = self.kappa[tid[:, None].expand_as(kidx), kidx].clone()
-        k = k_rl.clone()
-        k_lim = 0.85 * spec.kappa_max                              # the teacher never asks for full lock
+        # initial guess = what pure pursuit would do (its lookahead grows with speed, which is exactly the
+        # gain scheduling the direct teacher's rejoin has) blended into the raceline's own curvature ahead:
+        # the fit below only refines this, so an off-line car neither snaps to the line at full lock
+        # (over-correction crashes) nor drifts along beside it (under-correction crashes)
+        ld = (self.k_ld * vx.abs()).clamp(self.ld_min, self.ld_max)
+        tgt = self.xy[tid, (idx + (ld / ds).round().long()) % self.N] - xy
+        alpha = torch.atan2(-tgt[:, 0] * s_ + tgt[:, 1] * c, tgt[:, 0] * c + tgt[:, 1] * s_)
+        k_pp = (2.0 * torch.sin(alpha) / ld).clamp(-spec.kappa_max, spec.kappa_max)
+        w = torch.clamp(1.0 - torch.linspace(0, 1, N_KNOTS, device=dev) * Lp[:, None] / ld[:, None], 0.0, 1.0)   # PP weight fades over the lookahead
+        k = w * k_pp[:, None] + (1 - w) * k_rl
+        k_init = k.clone()
+        gb = self.grip_bin(P, B, dev)
+        k_lim = 0.85 * spec.kappa_max
 
         def resid(kk):                                             # path samples at the target arc fractions vs targets
             x, y, _, _ = path_points(kk, Lp, 25)
             j = (fr * 24).round().long()
             return torch.cat([x[:, j] - tx, y[:, j] - ty], 1)      # (B,2M)
-        lam, mu, eps = 1e-2, 0.03, 0.02                            # GN damping, ridge towards the raceline's own curvature
+        lam, mu, eps = 1e-2, 0.3, 0.02                             # GN damping, ridge towards the pure-pursuit / raceline guess
         for _ in range(iters):
             r0 = resid(k)
             J = torch.stack([(resid(k + eps * torch.nn.functional.one_hot(torch.tensor(j, device=dev), N_KNOTS).to(k.dtype)[None]) - r0) / eps
                              for j in range(N_KNOTS)], 2)          # (B,2M,4)
             A = J.transpose(1, 2) @ J + (lam + mu) * torch.eye(N_KNOTS, device=dev)
-            g = J.transpose(1, 2) @ r0[..., None] + mu * (k - k_rl)[..., None]
+            g = J.transpose(1, 2) @ r0[..., None] + mu * (k - k_init)[..., None]
             step = torch.linalg.solve(A, g).squeeze(-1)
             k = (k - step).clamp(-k_lim, k_lim)
         # speeds from the profile: 0.15 s ahead and at the end of the plan
         v_idx0 = (idx + ((vx.abs() * spec.v_cmd_lead) / ds).round().long()) % self.N
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
-        gb = self.grip_bin(P, B, dev)
-        v0 = self.speed_at(tid, v_idx0, gb); v1 = self.speed_at(tid, v_idx1, gb)
+        _, lat_err = self.project(xy, tid)
+        slow = (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)     # off the line: slow down, like the direct teacher
+        v0 = self.speed_at(tid, v_idx0, gb) * slow; v1 = self.speed_at(tid, v_idx1, gb) * slow
         return encode(k, v0, v1, v_max, spec)
 
     def grip_bin(self, P, B: int, device):

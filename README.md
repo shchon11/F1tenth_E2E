@@ -159,11 +159,15 @@ strayed up to 0.8 m from the raceline) plus the target speed 0.15 s ahead and at
 plan (6 numbers, all in the car's own frame, no pose needed), tracked by an iLQR on a kinematic
 bicycle with understeer, 12 x 50 ms, calibrated latency, IMU yaw rate as the initial turning
 state (`f1sim/mpc.py`, CUDA-graph compiled: 16 ms for 2048 envs). The teacher becomes a planner
-too (`RacelineTeacher.plan_action`: Gauss-Newton fits the knots so the path runs through the
-raceline points 0.4-1.0 L_p ahead, ridge-regularized towards the raceline's own curvature, so an
-off-line car rejoins gently like pure pursuit; residual 0.05-0.2 m), so DAgger imitates plans
-and PPO refines them; the tracker is the same code on the real car. Teacher through the tracker
-on the nominal car matches the direct teacher (3 vs 2 spawn crashes in 32 x 10 s). The viewer
+too (`RacelineTeacher.plan_action`: the knots start from what pure pursuit would do to rejoin
+the line, blended into the raceline's curvature ahead, and Gauss-Newton refines them through the
+raceline points 0.4-1.0 L_p ahead with a ridge back to that guess -- a fit that was free to snap
+back at full lock crashed on every rejoin, one that was too soft drifted off; residual 0.05-0.2 m),
+so DAgger imitates plans and PPO refines them; the tracker is the same code on the real car.
+The teacher's speed profile is computed per grip level (12 profiles per raceline, corner speeds
+and braking points scale with the car's friction, never above the nominal profile) and it slows
+down when off the line. Under full randomization on the training set at a 6 m/s cap it now
+crashes 0.21 times per car per 20 s through the tracker, the direct pure-pursuit teacher 0.24. The viewer
 draws the focus car's plan coloured by its speed profile (blue slow -> yellow fast), the
 tracker's predicted motion, and a dash with a speedometer and a steering wheel.
 
