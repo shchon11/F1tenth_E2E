@@ -83,18 +83,24 @@ def path_points(k: torch.Tensor, Lp: torch.Tensor, n: int = 25):
     return x, y, psi, s
 
 
-def reference(k, Lp, v0, v1, spec: PlanSpec):
-    """Time-indexed reference (B, N+1, 4) = x, y, heading, speed along the plan, walked with the
-    plan's own speed profile (v0 at the start, linear in arc length to v1 at the end)."""
+def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = None):
+    """Time-indexed reference (B, N+1, 4) = x, y, heading, speed along the plan. The speed *target*
+    is the plan's profile (v0 at the start, linear in arc length to v1 at the end); the position
+    reference is walked with the speed the car can actually have: from v_now (measured) towards
+    the profile within a_max, so a car that is slower than its plan is not chased by a reference
+    that has run ahead along the curve (time-free tracking, like pure pursuit)."""
     x, y, psi, s = path_points(k, Lp)
     S = s[:, -1].clamp_min(1e-3)
     dev = k.device; T = spec.N + 1
-    t = torch.arange(T, device=dev, dtype=k.dtype)[None]                   # (1,T)
-    v0c = v0.clamp_min(0.3)[:, None]; c = ((v1 - v0) / S)[:, None] * spec.dt   # s' = v0 + c s  per step
-    growth = (1.0 + c) ** t
-    st = torch.where(c.abs() > 1e-6, v0c * spec.dt * (growth - 1.0) / torch.where(c.abs() > 1e-6, c, torch.ones_like(c)), v0c * spec.dt * t)
-    frac = (st / S[:, None]).clamp(0.0, 1.0)
-    v = v0[:, None] + (v1 - v0)[:, None] * frac
+    st = torch.zeros(k.shape[0], T, device=dev, dtype=k.dtype); v = torch.zeros_like(st)
+    vw = (v0 if v_now is None else v_now.abs()).clamp_min(0.3)
+    for t_ in range(T):
+        frac = (st[:, t_] / S).clamp(0.0, 1.0)
+        v[:, t_] = v0 + (v1 - v0) * frac                                   # target profile at that point of the path
+        if t_ < T - 1:
+            dv = (v[:, t_] - vw).clamp(-spec.a_max * spec.dt, spec.a_max * spec.dt)
+            vw = (vw + dv).clamp_min(0.3)
+            st[:, t_ + 1] = st[:, t_] + vw * spec.dt
     idx = torch.searchsorted(s.contiguous(), st.contiguous()).clamp(1, s.shape[1] - 1)   # (B,T)
     s_lo, s_hi = s.gather(1, idx - 1), s.gather(1, idx)
     w = ((st - s_lo) / (s_hi - s_lo).clamp_min(1e-6)).clamp(0.0, 1.0)
@@ -221,7 +227,7 @@ class PlanTracker:
         -> (steer [rad], speed cmd [m/s]) (B,2)"""
         sp = self.spec
         k, Lp, v0, v1 = decode(action, v_meas, self.v_max, speed_cap, sp)
-        ref = reference(k, Lp, v0, v1, sp)
+        ref = reference(k, Lp, v0, v1, sp, v_meas)
         # predict over the command latency (body frame at decision time). The car is still turning with
         # its *measured* yaw rate, whatever the servo did with the last command
         v = v_meas.abs(); tau = sp.delay if delay is None else delay
