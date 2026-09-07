@@ -45,6 +45,8 @@ def ask() -> Optional[list]:
     stoch = tk.BooleanVar(value=False); line("sample actions like training", ttk.Checkbutton(f, variable=stoch))
     internals = tk.BooleanVar(value=False); line("show raw network activations", ttk.Checkbutton(f, variable=internals))
     fast = tk.BooleanVar(value=False); line("run as fast as possible (no real-time pacing)", ttk.Checkbutton(f, variable=fast))
+    gl = tk.StringVar(value="nvidia"); line("render the window on", ttk.Combobox(f, textvariable=gl, values=["nvidia", "amd"], width=12, state="readonly"))
+    ttk.Label(f, text="'amd' draws through Mesa on the integrated Radeon so the NVIDIA GPU only runs the simulation", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w"); row[0] += 1
     ttk.Label(f, text="in the viewer:  C camera   [ ] other car   L lidar   T trails   S screenshot   space pause", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w", pady=(8, 0)); row[0] += 1
     out = {"args": None}
     def start():
@@ -53,6 +55,7 @@ def ask() -> Optional[list]:
         if stoch.get(): args.append("--stochastic")
         if internals.get(): args.append("--internals")
         if fast.get(): args.append("--fast")
+        args += ["--gl", gl.get()]
         out["args"] = args; root.destroy()
     b = ttk.Frame(f); b.grid(row=row[0], column=0, columnspan=2, pady=(12, 0))
     ttk.Button(b, text="Start", command=start).grid(row=0, column=0, padx=6); ttk.Button(b, text="Cancel", command=root.destroy).grid(row=0, column=1, padx=6)

@@ -306,9 +306,13 @@ def main(argv=None):
     ap.add_argument("--internals", action="store_true", help="also show the raw hidden-layer / conv-feature activations")
     ap.add_argument("--panel-every", type=int, default=3, help="recompute saliency + the panel every k sim steps (GPU launches)")
     ap.add_argument("--bench", type=float, default=0.0, help="headless: run the interactive loop (threaded, real-time paced) for this many seconds and report the sim rate")
+    ap.add_argument("--gl", default="nvidia", choices=["nvidia", "amd"], help="GPU for the window's OpenGL: 'amd' renders on the integrated Radeon through Mesa (PRIME offload) and leaves the NVIDIA GPU to the simulation")
     ap.add_argument("--race-size", type=int, default=1, help="cars per race (>1: opponents in the scan)")
     ap.add_argument("--opponent", default="teacher", choices=["teacher", "policy"], help="who drives the other cars of a race")
     a = ap.parse_args(argv)
+    if a.gl == "amd":                                            # must be set before the first GLX call (window creation)
+        os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "mesa"; os.environ["DRI_PRIME"] = "1"
+        os.environ.pop("__NV_PRIME_RENDER_OFFLOAD", None)
     device = torch.device(a.device)
     run = latest_run() if a.run == "latest" else a.run
     if not run:
