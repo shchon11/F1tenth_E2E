@@ -33,8 +33,9 @@ class Actor(nn.Module):
     def __init__(self, n_stack: int, n_beams: int, proprio_dim: int, hidden: int = 256, log_std_init: float = -0.7, act_dim: int = 2):
         super().__init__()
         self.stem = ScanStem(n_stack, n_beams)
-        self.pro = nn.Sequential(nn.Linear(proprio_dim, 64), nn.GELU())
-        self.mlp = nn.Sequential(nn.Linear(256 + 64, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU())
+        pw = 64 if proprio_dim <= 32 else 128                     # a proprio history (hundreds of inputs) gets a wider embedding
+        self.pro = nn.Sequential(nn.Linear(proprio_dim, pw), nn.GELU())
+        self.mlp = nn.Sequential(nn.Linear(256 + pw, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU())
         self.mu = nn.Linear(hidden, act_dim)
         self.log_std = nn.Parameter(torch.full((act_dim,), log_std_init))
         nn.init.zeros_(self.mu.bias); self.mu.weight.data.mul_(0.1)

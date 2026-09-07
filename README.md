@@ -50,7 +50,7 @@ in `~/f1sim_runs`) and the rendered videos in `docs/` (re-render with `f1sim.lea
 | no IMU | VESC built-in 6-axis IMU (`f1sim/imu.py`): specific force at the sensor with gravity leaking in through roll/pitch and the lever arm from the CoG, speed-proportional vibration at wheel / 2x wheel / motor frequencies + broadband, sensor low-pass, 100 Hz sampling (2 samples per 40 Hz step), bias + random walk, white noise, 16-bit quantization, misalignment, and the VESC's own Mahony-style attitude estimate that bends under sustained acceleration |
 | perfect odometry | VESC dead-reckoning exactly like `vesc_to_odom` (ERPM speed + commanded steering), calibration residuals, drifts realistically (~5 %/lap nominal) |
 | collision = episode end | terminate, or soft wall contact (slide/stop against the wall) |
-| fixed params | every numeric parameter randomized per env on reset (`RandomizationConfig`; ranges widened 2026-09-07: mu 0.55-1.15, delay 0-100 ms, servo 30-120 ms, mass +-15 %, tire stiffness +-30 %, steer/speed gain +-15 %) |
+| fixed params | every numeric parameter randomized per env on reset (`RandomizationConfig`; ranges for a small car with a fast servo on venue floors: mu 0.7-1.1, command delay 5-30 ms, servo 20-60 ms, mass +-10 %, tire stiffness +-20 %, steer/speed gain +-8 %; the earlier extremes (mu 0.55, 100 ms) only taught caution) |
 | LiDAR returns everywhere | glossy hall floor: a floor hit at grazing incidence gives no return (20-95 % at grazing, fading out by 6-20 deg); a duct hose seen edge-on drops returns (0-70 %); hose diameter x0.7-1.3 per env; other cars are porous boxes |
 | unknown = wall | SLAM maps: unknown space within 2 m of the lane is floor for the LiDAR (a beam over the hose sees floor, then something tall), solid for collisions; duct hoses 33 cm laid in segments with 15-35 cm gaps (procedural tracks, 0.12 gaps/m), banner-board fences 1-3 m out on 60 % of venues |
 | ~numpy, 1 env | torch + Triton, thousands of envs on one GPU |
@@ -143,7 +143,10 @@ obs, rew, term, trunc, info = env.step(action)   # action in [-1,1]^2; auto-rese
 ```
 Observation keys: `scan` (k stacked scans, `scan_stride` control steps apart: 3 x stride 3 =
 175 ms of history for velocity cues), `speed` (VESC), `prev_action`, `imu` (step-mean gyro xyz /
-accel xyz, normalized), `imu_att` (VESC roll/pitch estimate). Reward = progress [m] - 10 on
+accel xyz, normalized), `imu_att` (VESC roll/pitch estimate), and optionally `hist`
+(`hist_len` rows of speed / imu / roll-pitch / action, `hist_stride` steps apart: the last second
+of what the car felt and was told, so the actor can identify its own grip and lag instead of
+driving for the worst car in the randomization -- the critic sees those parameters directly). Reward = progress [m] - 10 on
 collision (PPO runs use 50-150, optionally plus a term per m/s of impact speed so a fast crash
 costs more than a nudge) - 0.05 * |steer change| - 0.1 * wall proximity (under a 0.30 m gap) - 0.2 while facing
 backwards along the lane (progress is signed, so driving the wrong way already pays negative reward;

@@ -57,14 +57,14 @@ class VehicleParams:
 @dataclass
 class ActuatorParams:
     # Steering servo: first-order lag + rate limit + angle bias
-    servo_tau: float = 0.05        # [s] time constant
+    servo_tau: float = 0.04        # [s] time constant
     steer_bias: float = 0.0        # [rad] mechanical trim error (randomized)
     steer_gain: float = 1.0        # command scaling error
     # VESC speed loop: first-order tracking of commanded speed via PID-like accel
     motor_tau: float = 0.20        # [s] time constant of speed response
     speed_gain: float = 1.0        # ERPM<->m/s calibration error (randomized)
     # Command latency (sensor -> policy -> actuator), applied as delay buffer on commands
-    cmd_delay: float = 0.03        # [s]
+    cmd_delay: float = 0.015       # [s] LiDAR -> policy -> VESC on the Jetson
     cmd_delay_jitter: float = 0.0  # [s] uniform jitter per step
 
 
@@ -177,22 +177,22 @@ class RandomizationConfig:
     (low, high) scale for fields listed in `scale_fields`."""
     enabled: bool = True
     ranges: Dict[str, RandRange] = field(default_factory=lambda: {
-        # widened 2026-09-07 (sim2real): the v2 policy lost 63 % of episodes at mu 0.7 and 26 % at
-        # 0.1 s delay, both inside what a real car on carpet / a loaded Jetson can show
-        "vehicle.mu": (0.55, 1.15),
-        "vehicle.m": (0.85, 1.15),
+        # 2026-09-07: ranges for a small car with a fast servo and a 10-30 ms LiDAR->policy->VESC pipeline
+        # on venue floors (mu 0.7-1.1); the earlier extremes (mu 0.55, 100 ms delay) only taught caution
+        "vehicle.mu": (0.70, 1.10),
+        "vehicle.m": (0.90, 1.10),
         "vehicle.Iz": (0.8, 1.2),
-        "vehicle.B_f": (0.7, 1.3),
-        "vehicle.B_r": (0.7, 1.3),
+        "vehicle.B_f": (0.8, 1.2),
+        "vehicle.B_r": (0.8, 1.2),
         "vehicle.a_max": (0.6, 1.2),
         "vehicle.mu_f_scale": (0.85, 1.0),
         "vehicle.c_roll": (0.5, 2.0),
-        "actuator.servo_tau": (0.03, 0.12),
-        "actuator.steer_bias": (-0.04, 0.04),
-        "actuator.steer_gain": (0.85, 1.15),
-        "actuator.motor_tau": (0.10, 0.40),
-        "actuator.speed_gain": (0.85, 1.15),
-        "actuator.cmd_delay": (0.0, 0.10),
+        "actuator.servo_tau": (0.02, 0.06),
+        "actuator.steer_bias": (-0.03, 0.03),
+        "actuator.steer_gain": (0.92, 1.08),
+        "actuator.motor_tau": (0.10, 0.30),
+        "actuator.speed_gain": (0.92, 1.08),
+        "actuator.cmd_delay": (0.005, 0.03),
         "vehicle.roll_per_g": (0.7, 1.5),
         "vehicle.pitch_per_g": (0.7, 1.5),
         "vehicle.susp_wn": (0.75, 1.3),

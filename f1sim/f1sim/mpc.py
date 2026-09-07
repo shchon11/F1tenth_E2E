@@ -35,7 +35,7 @@ class PlanSpec:
     v_cmd_lead: float = 0.15       # [s] the first speed target refers to this far ahead
     N: int = 12                    # MPC steps
     dt: float = 0.05               # [s] MPC step
-    delay: float = 0.06            # [s] nominal command latency the tracker predicts over
+    delay: float = 0.035           # [s] nominal command latency the tracker predicts over (delay + half the servo lag)
     k_us: float = 0.003            # [s^2/m] understeer: effective wheelbase L + k_us v^2
     a_max: float = 6.0             # [m/s^2] tracker acceleration bound
     q: Tuple[float, float, float, float] = (1.0, 6.0, 1.0, 0.4)    # x, y, heading, speed tracking weights

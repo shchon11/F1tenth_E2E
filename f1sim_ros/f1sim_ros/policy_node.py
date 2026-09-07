@@ -42,7 +42,7 @@ class PolicyNode(Node):
         self.v = 0.0; self.imu_buf = []; self.att = (0.0, 0.0); self.yaw_rate = 0.0
         # plan action space: the same iLQR tracker as in training turns the local trajectory into
         # (steer, speed); cmd_delay = the measured command latency of this car (calibrate once)
-        self.declare_parameter("wheelbase", 0.3302); self.declare_parameter("cmd_delay", 0.06)
+        self.declare_parameter("wheelbase", 0.3302); self.declare_parameter("cmd_delay", 0.035)
         # residual servo calibration the stack's steering_angle_to_servo_offset/gain do not absorb (rad, ratio)
         self.declare_parameter("steer_bias", 0.0); self.declare_parameter("steer_gain", 1.0); self.declare_parameter("speed_gain", 1.0)
         self.cal = (float(p("steer_bias")), float(p("steer_gain")), float(p("speed_gain")))

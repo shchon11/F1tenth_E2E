@@ -104,13 +104,14 @@ def main():
     ap.add_argument("--speed-cap", type=float, default=8.0); ap.add_argument("--device", default="cuda")
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the student outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--teacher-speed", type=float, default=1.0, help="scale on the teacher's speed profile (0.9: fewer teacher crashes through the plan tracker)")
+    ap.add_argument("--hist-len", type=int, default=0, help="proprio history rows in the observation")
     ap.add_argument("--eval-steps", type=int, default=800); ap.add_argument("--wandb", default="online")
     a = ap.parse_args()
     device = torch.device(a.device)
     names = common.track_names(a.tracks)
     print(f"loading {len(names)} tracks + racelines ...", flush=True)
     tracks, rls = common.load_tracks(names, racelines=True)
-    env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode))
+    env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len))
     teacher = common.make_teacher(rls, env); teacher.speed_scale = a.teacher_speed
     spec = common.obs_spec(env)
     priv_dim = env.privileged(env.reset()[1] and env.last_result).shape[1]

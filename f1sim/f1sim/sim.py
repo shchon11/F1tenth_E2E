@@ -185,7 +185,7 @@ class Simulator:
 
     # ------------------------------------------------------------------ reset
     def sample_spawn(self, n: int, lateral_std: float = 0.3, yaw_std: float = 0.2,
-                     s: Optional[torch.Tensor] = None, tid: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     s: Optional[torch.Tensor] = None, tid: Optional[torch.Tensor] = None, min_clearance: Optional[float] = None) -> torch.Tensor:
         """Random poses along the centerline of each env's track (tid (n,), default track 0). Returns (n, 3)."""
         tid = torch.zeros(n, dtype=torch.long, device=self.device) if tid is None else tid.to(self.device)
         no_cl = ~self.track.cl_ok[tid] if self.track.cl is not None else torch.ones(n, dtype=torch.bool, device=self.device)
@@ -214,7 +214,7 @@ class Simulator:
         yaw = yaw + torch.randn(n, device=self.device, generator=self.gen) * yaw_std
         pose = torch.cat([xy, yaw[:, None]], 1)
         # reject poses too close to walls by pulling them back to the centerline
-        bad = self.track.sample_edt(xy, tid) < self.cfg.vehicle.width
+        bad = self.track.sample_edt(xy, tid) < (self.cfg.vehicle.width if min_clearance is None else min_clearance)
         if bad.any():
             xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
             pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
