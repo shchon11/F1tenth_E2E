@@ -1,9 +1,9 @@
 # F1TENTH e2e planner workspace
 
 <p align="center">
-  <img src="docs/promo.gif" width="800" alt="f1sim: 3D LiDAR over a real competition venue, 256 agents training, the LiDAR-only policy's attention, and a race with opponents"/>
+  <img src="docs/promo.gif" width="800" alt="f1sim viewer footage: policy chase cam with saliency, the local planner's trajectory on the Korea championship map, 256 cars training, a race with rear detection boxes"/>
   <br/>
-  <sub>30 s tour (<a href="docs/promo.mp4">mp4</a>): LiDAR traced in 3D on the Korea championship map, 256 agents training in parallel, what the LiDAR-only policy attends to, and a race against opponents with rear detection boxes. Rendered headless by <code>f1sim/scripts/promo_video.py</code>.</sub>
+  <sub>viewer footage, 30 s (<a href="docs/promo.mp4">mp4</a>): ppo_v3 chase cam with scan saliency and activations, the plan action space on the Korea championship map (trajectory coloured by speed, iLQR tracker), 256 cars of ppo_v4 training, a race against teacher cars. <code>f1sim/scripts/promo_video.py</code>, headless.</sub>
 </p>
 
 
@@ -148,12 +148,26 @@ collision - 0.05 * |steer change| - 0.1 * wall proximity (under a 0.30 m gap). E
 policy sees is available on the real car; integrated pose/odometry is deliberately excluded (it
 drifts, and its drift statistics differ between sim and real).
 
+Action spaces (`EnvConfig(action_mode=...)`): `"direct"` = (steer, speed) at 40 Hz;
+`"plan"` = the policy is a *local planner*: 3 lateral offsets of a quartic path over the next
+0.7 s of travel (1.5-6 m, leaves the car straight ahead) plus the target speed 0.15 s ahead and
+at the end of the plan (5 numbers, all in the car's own frame, no pose needed), tracked by an
+iLQR on a kinematic bicycle with understeer, 12 x 50 ms, calibrated latency, IMU yaw rate as the
+initial turning state (`f1sim/mpc.py`, CUDA-graph compiled: 19 ms for 2048 envs). The teacher
+becomes a planner too (`RacelineTeacher.plan_action`: the raceline segment ahead + its speed
+profile, least-squares fitted into the plan space), so DAgger imitates plans and PPO refines
+them; the tracker is the same code on the real car. Teacher through the tracker on the nominal
+car: 0.06 collisions per env per 10 s vs 0.03 driving directly; under full randomization 0.30
+vs 0.17 (the direct teacher is privileged, the tracker is not). The viewer draws the focus car's
+plan coloured by its speed profile (blue slow -> yellow fast) and the tracker's predicted motion.
+
 Races (`EnvConfig(race_size=M, opponent="teacher"|"policy")`): consecutive envs form races of M
-cars on one track instance. Other cars appear in the LiDAR as oriented boxes standing on the
-floor (length 0.45-0.58 m, width 0.26-0.34 m, height 0.15-0.27 m, 5-30 % of the beams swallowed
--- wheels, gaps, dark parts -- all re-drawn per reset; a scan plane tilted above the roof passes
-over) plus the competition-rule rear detection box every car carries (8-20 cm deep, car-wide,
-spanning 2-8 cm to 28-45 cm above the floor, solid: 0-5 % dropout), hit type 4; car-car contact
+cars on one track instance. Other cars appear in the LiDAR as what a scan plane at ~15 cm
+really meets: the electronics deck / LiDAR tower (12-24 cm), the chassis plate and the four
+wheels only when the plane tilts down onto them (3-12 cm / 0-11 cm), each part with its own
+porosity (wheels 35 %, deck 10 %), sizes scaled per car, plus the small cardboard detection box
+the rules require on the rear bumper (6-11 cm deep, 13-22 cm wide, 8-12 to 22-30 cm high,
+solid: 0-5 % dropout, drawn translucent in the viewer), hit type 4; car-car contact
 (separating-axis test on the footprints including the rear boxes) is a collision for both. Cars spawn staggered 2.5-6 m apart; a crashed car respawns behind its race mates, the
 leader's time limit resets the whole race onto a new track. `opponent="teacher"`: cars 1..M-1
 follow the raceline teacher at a random 0.6-1.0 speed scale (overtaking practice), only car 0's

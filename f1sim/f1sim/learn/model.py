@@ -30,13 +30,13 @@ class ScanStem(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, n_stack: int, n_beams: int, proprio_dim: int, hidden: int = 256, log_std_init: float = -0.7):
+    def __init__(self, n_stack: int, n_beams: int, proprio_dim: int, hidden: int = 256, log_std_init: float = -0.7, act_dim: int = 2):
         super().__init__()
         self.stem = ScanStem(n_stack, n_beams)
         self.pro = nn.Sequential(nn.Linear(proprio_dim, 64), nn.GELU())
         self.mlp = nn.Sequential(nn.Linear(256 + 64, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU())
-        self.mu = nn.Linear(hidden, 2)
-        self.log_std = nn.Parameter(torch.full((2,), log_std_init))
+        self.mu = nn.Linear(hidden, act_dim)
+        self.log_std = nn.Parameter(torch.full((act_dim,), log_std_init))
         nn.init.zeros_(self.mu.bias); self.mu.weight.data.mul_(0.1)
 
     def forward(self, scan, proprio):
@@ -60,11 +60,11 @@ class Critic(nn.Module):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, n_stack: int, n_beams: int, proprio_dim: int, priv_dim: int):
+    def __init__(self, n_stack: int, n_beams: int, proprio_dim: int, priv_dim: int, act_dim: int = 2):
         super().__init__()
-        self.actor = Actor(n_stack, n_beams, proprio_dim)
+        self.actor = Actor(n_stack, n_beams, proprio_dim, act_dim=act_dim)
         self.critic = Critic(n_stack, n_beams, proprio_dim, priv_dim)
-        self.meta = dict(n_stack=n_stack, n_beams=n_beams, proprio_dim=proprio_dim, priv_dim=priv_dim)
+        self.meta = dict(n_stack=n_stack, n_beams=n_beams, proprio_dim=proprio_dim, priv_dim=priv_dim, act_dim=act_dim)
 
     @torch.no_grad()
     def act(self, scan, proprio, deterministic=False):

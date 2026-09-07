@@ -116,8 +116,8 @@ class Simulator:
         self.other_idx = torch.stack([g * self.M + (j + 1 + c) % self.M for c in range(self.M - 1)], 1) if self.M > 1 else None
         self.car_dims = torch.zeros(num_envs, 3, device=self.device)      # LiDAR silhouette: length, width, height
         self.car_porosity = torch.zeros(num_envs, device=self.device)     # fraction of beams a car body swallows
-        # competition rule: a detection box mounted on the rear of every car so the LiDAR of the car behind
-        # gets a solid return: depth, width, bottom, top above the floor (+ its own small porosity)
+        # competition rule: a small detection box on the rear bumper so the LiDAR of the car behind gets
+        # a solid return: depth, width, bottom, top above the floor (+ its own small porosity)
         self.car_rear = torch.zeros(num_envs, 4, device=self.device)
         self.car_rear_porosity = torch.zeros(num_envs, device=self.device)
         self.car_collision = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
@@ -129,21 +129,41 @@ class Simulator:
         u = lambda lo, hi: lo + (hi - lo) * torch.rand(n, device=self.device, generator=self.gen)
         self.car_dims[ids] = torch.stack([u(0.45, 0.58), u(0.26, 0.34), u(0.15, 0.27)], 1)
         self.car_porosity[ids] = u(0.05, 0.30)
-        self.car_rear[ids] = torch.stack([u(0.08, 0.20), u(0.24, 0.34), u(0.02, 0.08), u(0.28, 0.45)], 1)
+        # a small cardboard box strapped to the rear bumper at LiDAR height: depth, width, z bottom, z top
+        self.car_rear[ids] = torch.stack([u(0.06, 0.11), u(0.13, 0.22), u(0.08, 0.12), u(0.22, 0.30)], 1)
         self.car_rear_porosity[ids] = u(0.0, 0.05)
 
+    # what a LiDAR at ~15 cm actually sees of an F1TENTH car: (x, y offsets from the CoG, length,
+    # width, z bottom, z top, porosity). The chassis and wheels sit below a level scan plane and only
+    # show up when the plane tilts; the electronics deck and the rule-mandated rear box are what the
+    # car behind normally gets returns from.
+    CAR_PARTS = (
+        (0.00, 0.000, 0.36, 0.20, 0.03, 0.12, 0.15),     # chassis plate, battery, cabling (open frame)
+        (0.10, 0.000, 0.18, 0.14, 0.12, 0.24, 0.10),     # electronics deck + LiDAR tower
+        (0.165, 0.120, 0.11, 0.045, 0.00, 0.11, 0.35),   # wheels (rubber: weak grazing returns)
+        (0.165, -0.120, 0.11, 0.045, 0.00, 0.11, 0.35),
+        (-0.165, 0.120, 0.11, 0.045, 0.00, 0.11, 0.35),
+        (-0.165, -0.120, 0.11, 0.045, 0.00, 0.11, 0.35),
+    )
+
     def _car_boxes(self, state: torch.Tensor):
-        """Box sets the LiDAR of each env sees: the other cars' bodies and their rear detection boxes."""
+        """Box sets the LiDAR of each env sees: the other cars' parts and their rear detection boxes."""
         o = self.other_idx
         st = state[o]                                                     # (B,C,7)
-        body = (st[:, :, :3], self.car_dims[o], torch.stack([torch.zeros_like(self.car_dims[o][..., 2]), self.car_dims[o][..., 2]], -1),
-                self.car_porosity)
-        rear = self.car_rear[o]                                           # (B,C,4)
-        back = 0.5 * self.car_dims[o][..., 0] + 0.5 * rear[..., 0]        # box centre behind the body centre
-        yaw = st[:, :, 2]
-        pos = torch.stack([st[:, :, 0] - back * torch.cos(yaw), st[:, :, 1] - back * torch.sin(yaw), yaw], -1)
-        rear_box = (pos, torch.stack([rear[..., 0], rear[..., 1], rear[..., 3]], -1), rear[..., 2:4], self.car_rear_porosity)
-        return [body, rear_box]
+        yaw = st[:, :, 2]; c, s_ = torch.cos(yaw), torch.sin(yaw)
+        scale = self.car_dims[o][..., 0] / 0.50                           # bigger / smaller builds
+        sets = []
+        for (ox, oy, lx, ly, zlo, zhi, poro) in self.CAR_PARTS:
+            ox_, oy_ = ox * scale, oy * scale
+            pos = torch.stack([st[:, :, 0] + ox_ * c - oy_ * s_, st[:, :, 1] + ox_ * s_ + oy_ * c, yaw], -1)
+            dims = torch.stack([lx * scale, ly * scale, torch.full_like(scale, zhi)], -1)
+            zr = torch.stack([torch.full_like(scale, zlo), torch.full_like(scale, zhi)], -1)
+            sets.append((pos, dims, zr, self.car_porosity * (poro / 0.175)))
+        rear = self.car_rear[o]                                           # (B,C,4) depth, width, z_lo, z_hi
+        back = 0.5 * self.car_dims[o][..., 0] + 0.5 * rear[..., 0]        # box centre behind the body
+        pos = torch.stack([st[:, :, 0] - back * c, st[:, :, 1] - back * s_, yaw], -1)
+        sets.append((pos, torch.stack([rear[..., 0], rear[..., 1], rear[..., 3]], -1), rear[..., 2:4], self.car_rear_porosity))
+        return sets
 
     def _car_contacts(self, state: torch.Tensor) -> torch.Tensor:
         """Separating-axis test between each car's footprint and the other cars of its race -> (B,) bool."""

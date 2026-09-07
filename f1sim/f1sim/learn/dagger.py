@@ -60,7 +60,7 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
     with torch.no_grad():
         for t in range(steps):
             scan, pro = flatten_obs(obs)
-            label = env.teacher_action_to_normalized(teacher(env.sim.state, env.sim.P, env.sim.tid))
+            label = env.teacher_label(teacher)
             buf.add(scan[:, 0], pro, label, new_ep)
             if beta >= 1.0:
                 a = label
@@ -102,17 +102,18 @@ def main():
     ap.add_argument("--epochs", type=float, default=3.0); ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--beta0", type=float, default=0.6)
     ap.add_argument("--speed-cap", type=float, default=8.0); ap.add_argument("--device", default="cuda")
+    ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the student outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--eval-steps", type=int, default=800); ap.add_argument("--wandb", default="online")
     a = ap.parse_args()
     device = torch.device(a.device)
     names = common.track_names(a.tracks)
     print(f"loading {len(names)} tracks + racelines ...", flush=True)
     tracks, rls = common.load_tracks(names, racelines=True)
-    env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.speed_cap))
+    env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode))
     teacher = common.make_teacher(rls, env)
     spec = common.obs_spec(env)
     priv_dim = env.privileged(env.reset()[1] and env.last_result).shape[1]
-    model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim).to(device)
+    model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim).to(device)
     opt = torch.optim.Adam(model.actor.parameters(), lr=a.lr)
     run = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "tracks": names}, group="dagger", mode=a.wandb)
     out = common.run_dir(a.name)
@@ -127,7 +128,7 @@ def main():
         bufs.append(buf); t_col = tm.lap()
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log); t_tr = tm.lap()
         m = common.rollout_metrics(env, lambda o: model.act(*flatten_obs(o), deterministic=True)[0], a.eval_steps, a.speed_cap); t_ev = tm.lap()
-        tm_ = common.rollout_metrics(env, lambda o: env.teacher_action_to_normalized(teacher(env.sim.state, env.sim.P, env.sim.tid)), a.eval_steps, a.speed_cap) if it == 0 else tm_
+        tm_ = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps, a.speed_cap) if it == 0 else tm_
         log({"dagger/iter": it, "dagger/beta": beta, "dagger/samples": sum(len(b) for b in bufs), "dagger/final_loss": loss,
              **{f"student/{k}": v for k, v in m.items()}, **{f"teacher/{k}": v for k, v in tm_.items()},
              "time/collect_s": t_col, "time/train_s": t_tr, "time/eval_s": t_ev, "time/elapsed_min": (time.time() - t0) / 60})

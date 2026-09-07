@@ -21,6 +21,7 @@ class ObsSpec:
     scan_stack: int = 3
     scan_stride: int = 1          # control steps between stacked scans
     action_history: int = 2
+    act_dim: int = 2              # 2 = (steer, speed); 5 = local plan (f1sim.mpc), tracked by the MPC on both sides
     range_max: float = 10.0
     v_max: float = 8.0            # = EnvConfig.v_max_policy
     gyro_scale: float = 5.0
@@ -29,7 +30,7 @@ class ObsSpec:
 
     @property
     def proprio_dim(self) -> int:
-        return 1 + 2 * self.action_history + 1 + 6 + 2
+        return 1 + self.act_dim * self.action_history + 1 + 6 + 2
 
 
 def flatten_obs(obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -47,11 +48,11 @@ class ObsBuilder:
     def reset(self):
         s = self.spec
         self.scan_hist = torch.ones(1, (s.scan_stack - 1) * s.scan_stride + 1, s.n_beams, device=self.device)
-        self.act_hist = torch.zeros(1, s.action_history, 2, device=self.device)
+        self.act_hist = torch.zeros(1, s.action_history, s.act_dim, device=self.device)
         self._first = True
 
     def push_action(self, action_norm):
-        a = torch.as_tensor(action_norm, dtype=torch.float32, device=self.device).reshape(1, 2)
+        a = torch.as_tensor(action_norm, dtype=torch.float32, device=self.device).reshape(1, self.spec.act_dim)
         self.act_hist = torch.cat([a[:, None, :], self.act_hist[:, :-1]], 1)
 
     def build(self, ranges, speed: float, imu_mean, imu_att, speed_cap: float):

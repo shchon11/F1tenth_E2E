@@ -64,7 +64,7 @@ SCENE_FS = """
 #version 330
 uniform vec3 u_eye; uniform vec3 u_light_dir; uniform sampler2DShadow u_shadow;
 uniform float u_shininess; uniform float u_spec; uniform float u_stripes; uniform float u_shadow_on; uniform float u_grid;
-uniform float u_texel;
+uniform float u_texel; uniform float u_alpha;
 in vec3 v_wpos; in vec3 v_nrm; in vec4 v_col; in vec4 v_lpos; in vec3 v_tint;
 out vec4 f_col;
 float shadow() {
@@ -94,7 +94,7 @@ void main() {
     float d = length(u_eye - v_wpos);
     c = mix(c, vec3(0.055, 0.065, 0.085), clamp((d - 50.0) / 150.0, 0.0, 1.0));
     c = c / (1.0 + c * 0.35);
-    f_col = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
+    f_col = vec4(pow(c, vec3(1.0 / 2.2)), u_alpha);
 }
 """
 SHADOW_VS = """
@@ -147,6 +147,19 @@ MATERIALS = {   # name suffix -> (shininess, specular strength)
 IDENT_INST = np.concatenate([np.eye(4, dtype=np.float32).T.reshape(-1), np.ones(4, np.float32)])
 
 
+def _unit_cube():
+    """Axis-aligned unit cube centred at the origin with per-face normals -> (verts, normals, indices)."""
+    faces = [((1, 0, 0), (0, 1, 0), (0, 0, 1)), ((-1, 0, 0), (0, 0, 1), (0, 1, 0)), ((0, 1, 0), (0, 0, 1), (1, 0, 0)),
+             ((0, -1, 0), (1, 0, 0), (0, 0, 1)), ((0, 0, 1), (1, 0, 0), (0, 1, 0)), ((0, 0, -1), (0, 1, 0), (1, 0, 0))]
+    v, n, idx = [], [], []
+    for k, (nn, a, b) in enumerate(faces):
+        nn, a, b = np.array(nn, np.float32), np.array(a, np.float32), np.array(b, np.float32)
+        for sa, sb in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            v.append(0.5 * (nn + sa * a + sb * b)); n.append(nn)
+        idx += [4 * k, 4 * k + 1, 4 * k + 2, 4 * k, 4 * k + 2, 4 * k + 3]
+    return np.array(v, np.float32), np.array(n, np.float32), np.array(idx, np.int32)
+
+
 class Mesh:
     """Static geometry + dynamic instance buffer (mat4 as 4 columns + tint)."""
 
@@ -179,9 +192,17 @@ class Mesh:
             return
         prog["u_shininess"].value = self.shininess; prog["u_spec"].value = self.spec
         prog["u_stripes"].value = 1.0 if self.stripes else 0.0; prog["u_grid"].value = 1.0 if self.grid else 0.0
+        alpha = getattr(self, "alpha", 1.0)
+        if "u_alpha" in prog: prog["u_alpha"].value = alpha
         if self.cull: self.ctx.enable(moderngl.CULL_FACE)
         else: self.ctx.disable(moderngl.CULL_FACE)
-        self.vao.render(moderngl.TRIANGLES, instances=self.n_inst)
+        if alpha < 1.0:                                   # translucent: blend, keep depth of what is behind
+            self.ctx.enable(moderngl.BLEND); self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self.ctx.depth_mask = False
+            self.vao.render(moderngl.TRIANGLES, instances=self.n_inst)
+            self.ctx.depth_mask = True; self.ctx.disable(moderngl.BLEND)
+        else:
+            self.vao.render(moderngl.TRIANGLES, instances=self.n_inst)
 
 
 class Scene:
@@ -342,6 +363,12 @@ class Scene:
             mat = next((k for k in MATERIALS if gname.endswith(k)), "plastic")
             m = Mesh(self.ctx, self.prog, self.shadow_prog, v, nrm, col, np.asarray(geom.faces).reshape(-1), max_cars, material=mat)
             self.car_meshes.append((slots[group], m))
+        # the rule-mandated rear detection box: unit cube, scaled per car by its instance matrix
+        v, nrm, idx = _unit_cube()
+        col = np.tile(np.array([0.62, 0.48, 0.30, 0.0], np.float32), (len(v), 1))          # cardboard
+        box = Mesh(self.ctx, self.prog, self.shadow_prog, v, nrm, col, idx, max_cars, material="rubber", casts=False)
+        box.alpha = 0.45                                                                   # drawn translucent
+        self.car_meshes.append((6, box))
         self.max_cars = max_cars
         self.label_pos = self.ctx.buffer(reserve=max_cars * 16, dynamic=True)
         self.label_vao = self.ctx.vertex_array(self.label_prog, [(self._quad, "2f", "in_uv"), (self.label_pos, "3f 1f/i", "i_pos", "i_idx")])
@@ -370,6 +397,21 @@ class Scene:
         self.trail_col = np.tile(np.array([0.45, 0.55, 0.7, 0.55], np.float32), (length, 1))
         self.trail_vbo = self.ctx.buffer(reserve=max_cars * length * 7 * 4, dynamic=True)
         self.trail_vao = self.ctx.vertex_array(self.line_prog, [(self.trail_vbo, "3f 4f", "in_pos", "in_col")])
+
+    def set_plan(self, pts, cols=None, col=(0.2, 1.0, 0.4, 0.95), slot=0):
+        """Polyline (K,3) world coordinates with per-vertex colours (K,4) or one colour; slot 0 = the
+        plan (drawn thick), slot 1 = the tracker's predicted motion (thin). None clears the slot."""
+        n_attr = f"plan{slot}_n"
+        if pts is None or len(pts) < 2:
+            setattr(self, n_attr, 0); return
+        cols = np.tile(np.asarray(col, np.float32), (len(pts), 1)) if cols is None else np.asarray(cols, np.float32)
+        data = np.concatenate([np.asarray(pts, np.float32), cols], 1)
+        vbo = getattr(self, f"plan{slot}_vbo", None)
+        if vbo is None or vbo.size < data.nbytes:
+            vbo = self.ctx.buffer(reserve=max(data.nbytes, 64 * 7 * 4), dynamic=True)
+            setattr(self, f"plan{slot}_vbo", vbo)
+            setattr(self, f"plan{slot}_vao", self.ctx.vertex_array(self.line_prog, [(vbo, "3f 4f", "in_pos", "in_col")]))
+        vbo.write(np.ascontiguousarray(data).tobytes()); setattr(self, n_attr, len(pts))
 
     def push_trail_points(self, x, y):
         n = min(len(x), self.trails.shape[0]); x, y = x[:n], y[:n]
@@ -467,6 +509,12 @@ class Scene:
         if show_trails and self.trail_fill > 1:
             for i in range(min(n_cars, self.trails.shape[0])):
                 self.trail_vao.render(moderngl.LINE_STRIP, vertices=self.trail_fill, first=i * self.trail_len + self.trail_len - self.trail_fill)
+        for slot, width in ((1, 1.5), (0, 4.0)):
+            n_ = getattr(self, f"plan{slot}_n", 0)
+            if n_ > 1:
+                self.ctx.line_width = width
+                getattr(self, f"plan{slot}_vao").render(moderngl.LINE_STRIP, vertices=n_)
+        self.ctx.line_width = 1.0
         if show_points:
             self.point_prog["u_vp"].write(_u(vp)); self.point_prog["u_size"].value = 22.0
             self.pts_vao.render(moderngl.POINTS, vertices=self.n_pts)

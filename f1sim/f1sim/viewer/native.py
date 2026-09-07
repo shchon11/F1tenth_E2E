@@ -73,6 +73,8 @@ class NativeViewer:
         self.paused = False
         self.extra_hud = []                    # lines appended to the HUD (teleop bars etc.)
         self.point_colors = None               # (N,4) override for the focus car's scan points (e.g. saliency)
+        self.plan = None                       # (K,3) world x, y, speed: the focus car's current plan (plan action space)
+        self.plan_pred = None                  # (K,3) the tracker's predicted motion along it
         self.panel = None                      # PIL RGBA image drawn top-right (activations etc.)
         self.mode = 0
         self.focus = 0
@@ -164,6 +166,7 @@ class NativeViewer:
               "roll": att[:, 0], "pitch": att[:, 1], "lap": r.lap[sel].cpu().numpy(), "coll": r.collision[sel].cpu().numpy(),
               "s": r.s[sel].cpu().numpy(), "scan": r.scan[fe].cpu().numpy(), "scan_type": r.scan_type[fe].cpu().numpy(),
               "wall": r.wall_dist[sel].cpu().numpy(), "focus": f, "focus_env": fe, "ids": self.env_ids,
+              "rear": self.sim.car_rear[sel].cpu().numpy(), "len": self.sim.car_dims[sel, 0].cpu().numpy(),
               "P": {k: float(self.sim.P[k][fe]) for k in ("mount_x", "mount_y", "mount_z", "mount_yaw", "mount_roll", "mount_pitch")}}
         self.prev_frame, self.frame = self.frame, fr
         self._t_frame = time.perf_counter()
@@ -251,7 +254,7 @@ class NativeViewer:
         view = G.look_at(eye, target, up)
         proj = G.perspective(55.0, self.width / max(1, self.height), 0.05, 300.0)
         # car instances
-        mats = np.zeros((n, 6, 4, 4), np.float32)      # per car: chassis, lidar, wheel_fl, fr, rl, rr
+        mats = np.zeros((n, 7, 4, 4), np.float32)      # per car: chassis, lidar, wheel_fl, fr, rl, rr, rear box
         for i in range(n):
             x, y, yaw = fr["x"][i], fr["y"][i], fr["yaw"][i]
             c, s = math.cos(yaw), math.sin(yaw)
@@ -265,6 +268,10 @@ class NativeViewer:
             for j, w in enumerate(("wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr")):
                 steer = G.rot_z(fr["steer"][i]) if j < 2 else np.eye(4, dtype=np.float32)
                 mats[i, 2 + j] = M @ sc.car_pivots[w] @ steer @ spin
+            d, w_, zlo, zhi = fr["rear"][i]                               # detection box behind the body, on the chassis
+            bx = self.cog_x - 0.5 * fr["len"][i] - 0.5 * d
+            S = np.diag([d, w_, zhi - zlo, 1.0]).astype(np.float32)
+            mats[i, 6] = M @ tilt @ G.trans([bx, 0.0, 0.5 * (zlo + zhi)]) @ S
         tint = np.ones((n, 4), np.float32)
         tint[fr["coll"] > 0.5] = (1.0, 0.35, 0.3, 1.0)
         tint[f] *= (1.0, 1.0, 1.0, 1.0)
@@ -273,6 +280,17 @@ class NativeViewer:
         if self.show_lidar:
             pts, cols = self._scan_points(fr)
             sc.set_points(pts, cols)
+        for slot, src in ((0, self.plan), (1, self.plan_pred)):
+            if src is None or len(src) < 2:
+                sc.set_plan(None, slot=slot); continue
+            p_ = np.asarray(src, np.float32)
+            v = p_[:, 2] if p_.shape[1] > 2 else np.zeros(len(p_), np.float32)
+            t = np.clip(v / 8.0, 0.0, 1.0)[:, None]                        # speed profile: blue (slow) -> green -> yellow (fast)
+            cols = (1 - t) * np.array([0.2, 0.55, 1.0, 0.95], np.float32) + t * np.array([1.0, 0.9, 0.15, 0.95], np.float32)
+            cols = np.where(t < 0.5, (1 - 2 * t) * np.array([0.2, 0.55, 1.0, 0.95], np.float32) + 2 * t * np.array([0.2, 1.0, 0.45, 0.95], np.float32),
+                            (2 - 2 * t) * np.array([0.2, 1.0, 0.45, 0.95], np.float32) + (2 * t - 1) * np.array([1.0, 0.9, 0.15, 0.95], np.float32))
+            if slot == 1: cols[:, 3] = 0.6; cols[:, :3] = 0.5 * cols[:, :3] + 0.5
+            sc.set_plan(np.concatenate([p_[:, :2], np.full((len(p_), 1), 0.05 if slot == 0 else 0.03, np.float32)], 1), cols, slot=slot)
         sc.draw_frame(view, proj, eye, light_center=np.array([fr["x"][f], fr["y"][f], 0.0]),
                       show_points=self.show_lidar, show_race=self.show_race, show_trails=self.show_trails, n_cars=n,
                       focus_xy=(fr["x"][f], fr["y"][f]))

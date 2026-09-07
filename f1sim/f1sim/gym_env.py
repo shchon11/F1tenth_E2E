@@ -19,9 +19,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+import math
+
 import numpy as np
 import torch
 
+from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, encode as plan_encode, decode as plan_decode
 from .params import Config
 from .sim import Simulator, StepResult
 from .track import Track
@@ -50,6 +53,7 @@ class EnvConfig:
     spawn_speed_max: float = 3.0     # random initial speed in [0, this]
     resample_track_on_reset: bool = True   # multi-track sets: pick a random track for each new episode
     scan_stride: int = 1             # frames between stacked scans (3 x stride 3 = 225 ms of history: velocity cues)
+    action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -82,8 +86,14 @@ class F1VecEnv:
         self.opp_scale = torch.ones(self.B, device=self.device)
         self.hist_len = (e.scan_stack - 1) * e.scan_stride + 1
         self.scan_hist = torch.ones(self.B, self.hist_len, self.n_beams, device=self.device)
-        self.prev_action = torch.zeros(self.B, 2, device=self.device)
-        self.act_hist = torch.zeros(self.B, self.ecfg.action_history, 2, device=self.device)
+        self.act_dim = PLAN_DIM if e.action_mode == "plan" else 2
+        self.prev_action = torch.zeros(self.B, self.act_dim, device=self.device)
+        self.act_hist = torch.zeros(self.B, self.ecfg.action_history, self.act_dim, device=self.device)
+        self.tracker = None; self.prev_steer_norm = torch.zeros(self.B, device=self.device); self.last_cmd = torch.zeros(self.B, 2, device=self.device)
+        self.tracker_delay = None
+        if e.action_mode == "plan":
+            self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max, e.v_max_policy)
+            self._calibrate_tracker(torch.arange(self.B, device=self.device))
         self.speed_cap = torch.full((self.B,), float(self.ecfg.speed_cap), device=self.device)
         self.ep_step = torch.zeros(self.B, dtype=torch.long, device=self.device)
         self.lap_start_step = torch.zeros(self.B, dtype=torch.long, device=self.device)   # step of the last finish-line crossing
@@ -99,16 +109,26 @@ class F1VecEnv:
             spaces = {
                 "scan": gym.spaces.Box(0.0, 1.0, (self.ecfg.scan_stack, self.n_beams), np.float32),
                 "speed": gym.spaces.Box(-1.0, 2.0, (1,), np.float32),
-                "prev_action": gym.spaces.Box(-1.0, 1.0, (2 * self.ecfg.action_history,), np.float32),
+                "prev_action": gym.spaces.Box(-1.0, 1.0, (self.act_dim * self.ecfg.action_history,), np.float32),
                 "speed_cap": gym.spaces.Box(0.0, 1.0, (1,), np.float32)}
             if self.ecfg.obs_imu and self.cfg.imu.enabled:
                 spaces["imu"] = gym.spaces.Box(-5.0, 5.0, (6,), np.float32)
                 spaces["imu_att"] = gym.spaces.Box(-2.0, 2.0, (2,), np.float32)
             obs = gym.spaces.Dict(spaces)
-            act = gym.spaces.Box(-1.0, 1.0, (2,), np.float32)
+            act = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
             return obs, act
         except ImportError:
             return None, None
+
+    def _calibrate_tracker(self, ids: torch.Tensor):
+        """The tracker's latency model is *calibrated* on the real car (measured once, like the odometry
+        gains), so in sim it knows each env's command delay + half the servo lag up to a +-20 ms residual."""
+        P = self.sim.P
+        true = P["cmd_delay"][ids] + 0.5 * P["servo_tau"][ids]
+        err = (torch.rand(ids.numel(), device=self.device, generator=self.sim.gen) - 0.5) * 0.04
+        if self.tracker_delay is None:
+            self.tracker_delay = torch.zeros(self.B, device=self.device)
+        self.tracker_delay[ids] = (true + err).clamp(0.0, 0.2)
 
     def set_teacher(self, teacher):
         """Raceline teacher that drives the opponent cars (opponent == "teacher")."""
@@ -178,7 +198,12 @@ class F1VecEnv:
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
         self.sim.reset(ids, poses, speed)
         self.prev_action[ids] = 0.0
-        self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
+        if self.act_dim == 2:
+            self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
+        else:
+            self.prev_action[ids, 3:5] = (speed / e.v_max_policy * 2 - 1)[:, None]
+            self.tracker.reset(ids); self._calibrate_tracker(ids)
+        self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
         self.lap_start_step[ids] = 0; self.prev_lap[ids] = 0
@@ -192,9 +217,14 @@ class F1VecEnv:
             return action
         if self.teacher is None:
             raise RuntimeError("opponent == 'teacher' needs env.set_teacher(RacelineTeacher)")
-        cmd = self.teacher(self.sim.state, self.sim.P, self.sim.tid)
-        cmd = torch.stack([cmd[:, 0], cmd[:, 1] * self.opp_scale], 1)
-        return torch.where(self.learner[:, None], action, self.teacher_action_to_normalized(cmd))
+        if self.act_dim == 2:
+            cmd = self.teacher(self.sim.state, self.sim.P, self.sim.tid)
+            cmd = torch.stack([cmd[:, 0], cmd[:, 1] * self.opp_scale], 1)
+            an = self.teacher_action_to_normalized(cmd)
+        else:
+            an = self.teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy, self.tracker.spec)
+            an = an.clone(); an[:, 3:5] = ((an[:, 3:5] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
+        return torch.where(self.learner[:, None], action, an)
 
     # ------------------------------------------------------------------ API
     def reset(self, seed: Optional[int] = None):
@@ -209,13 +239,21 @@ class F1VecEnv:
 
     def step(self, action: torch.Tensor):
         a = self._opponent_actions(action.to(self.device).clamp(-1.0, 1.0))
-        v_cmd = torch.minimum((a[:, 1] + 1) * 0.5 * self.ecfg.v_max_policy, self.speed_cap)
-        cmd = torch.stack([a[:, 0] * self.s_max, v_cmd], 1)
+        if self.act_dim == 2:
+            v_cmd = torch.minimum((a[:, 1] + 1) * 0.5 * self.ecfg.v_max_policy, self.speed_cap)
+            cmd = torch.stack([a[:, 0] * self.s_max, v_cmd], 1)
+        else:                                                  # plan -> (steer, speed) through the tracker
+            lr = self.last_result
+            v_meas = lr.odom[:, 3] if lr is not None else self.sim.state[:, 3]
+            yaw_rate = lr.imu[:, :, 2].mean(1) if (lr is not None and lr.imu is not None and lr.imu.shape[1] > 0) else None
+            cmd = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
+        steer_norm = cmd[:, 0] / self.s_max
         r = self.sim.step(cmd)
+        self.last_cmd = cmd
         e = self.ecfg
         self.scan_hist = torch.roll(self.scan_hist, 1, 1); self.scan_hist[:, 0] = self._norm_scan(r.scan)
         self.ep_step += 1
-        steer_rate = (a[:, 0] - self.prev_action[:, 0]).abs()
+        steer_rate = (steer_norm - self.prev_steer_norm).abs(); self.prev_steer_norm = steer_norm
         proximity = (e.safe_dist - r.wall_dist).clamp(min=0.0) / e.safe_dist if e.reward_proximity > 0 else 0.0
         reward = (e.reward_progress * r.progress + e.reward_collision * r.collision.float()
                   - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity + e.reward_alive)
@@ -239,6 +277,8 @@ class F1VecEnv:
                 "learner": self.learner}
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
+        if self.tracker is not None:
+            info["plan"] = self.tracker.last_ref                 # (B, N+1, 4) body-frame x, y, heading, speed
         if done.any():
             ids = torch.nonzero(done).flatten()
             info["final"] = {"ids": ids, "return": self.ep_return[ids].clone(), "progress": self.ep_progress[ids].clone(),
@@ -272,5 +312,23 @@ class F1VecEnv:
         return self.sim.state
 
     def teacher_action_to_normalized(self, cmd: torch.Tensor) -> torch.Tensor:
-        """(steer [rad], speed [m/s]) -> policy action in [-1, 1]."""
+        """(steer [rad], speed [m/s]) -> policy action in [-1, 1] (direct action space)."""
         return torch.stack([cmd[:, 0] / self.s_max, cmd[:, 1] / self.ecfg.v_max_policy * 2 - 1], 1).clamp(-1, 1)
+
+    def teacher_label(self, teacher) -> torch.Tensor:
+        """The teacher's action in this env's action space: (steer, speed) or its local plan."""
+        if self.act_dim == 2:
+            return self.teacher_action_to_normalized(teacher(self.sim.state, self.sim.P, self.sim.tid))
+        return teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy, self.tracker.spec)
+
+    def plan_world(self, i: int, predicted: bool = False):
+        """Env i's current plan (or the tracker's predicted motion) as world (K,3) x, y, speed for viewers."""
+        if self.tracker is None or self.tracker.last_ref is None:
+            return None
+        src = self.tracker.last_pred if predicted else self.tracker.last_ref
+        if src is None:
+            return None
+        ref = src[i].cpu().numpy()
+        x, y, yaw = self.sim.state[i, :3].tolist()
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        return np.stack([x + ref[:, 0] * c - ref[:, 1] * s_, y + ref[:, 0] * s_ + ref[:, 1] * c, ref[:, 3]], 1)

@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--race-size", type=int, default=1, help="cars per track instance (>1: opponents in the LiDAR, car-car collisions)")
     ap.add_argument("--opponent", default="policy", choices=["policy", "teacher"], help="who drives cars 1..M-1: the policy (self-play) or the raceline teacher")
     ap.add_argument("--opp-speed", type=float, nargs=2, default=(0.6, 1.0), help="teacher opponents: speed scale range per race")
+    ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the policy outputs a local trajectory (f1sim.mpc)")
     a = ap.parse_args()
     device = torch.device(a.device); torch.manual_seed(a.seed)
     names = common.track_names(a.tracks)
@@ -58,17 +59,17 @@ def main():
                                                               safe_dist=a.safe_dist, max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride,
                                                               race_size=a.race_size, opponent=a.opponent,
-                                                              opp_speed_range=tuple(a.opp_speed)), seed=a.seed, rls=rls)
+                                                              opp_speed_range=tuple(a.opp_speed), action_mode=a.action_mode), seed=a.seed, rls=rls)
     spec = common.obs_spec(env)
     obs, info = env.reset(seed=a.seed)
     priv = env.privileged(env.last_result); priv_dim = priv.shape[1]
     lid = env.learner_ids                                   # races with teacher opponents: only the learners' data is used
     if a.init:
         model, extra = load_checkpoint(a.init, device, override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
-                                                                  "proprio_dim": spec.proprio_dim, "priv_dim": priv_dim})
+                                                                  "proprio_dim": spec.proprio_dim, "priv_dim": priv_dim, "act_dim": env.act_dim})
         print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing")
     else:
-        model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim).to(device)
+        model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim).to(device)
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters(): p_.requires_grad_(False)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
@@ -80,7 +81,7 @@ def main():
     k, N, P = spec.scan_stack, spec.n_beams, spec.proprio_dim
     buf_scan = torch.zeros(T, B, k, N, device=device, dtype=torch.float16)
     buf_pro = torch.zeros(T, B, P, device=device); buf_priv = torch.zeros(T, B, priv_dim, device=device)
-    buf_act = torch.zeros(T, B, 2, device=device); buf_logp = torch.zeros(T, B, device=device)
+    buf_act = torch.zeros(T, B, env.act_dim, device=device); buf_logp = torch.zeros(T, B, device=device)
     buf_rew = torch.zeros(T, B, device=device); buf_done = torch.zeros(T, B, device=device); buf_trunc = torch.zeros(T, B, device=device)
     buf_val = torch.zeros(T + 1, B, device=device)
 
@@ -130,7 +131,7 @@ def main():
         model.train()
         n = T * B
         f_scan = buf_scan.reshape(n, k, N); f_pro = buf_pro.reshape(n, P); f_priv = buf_priv.reshape(n, priv_dim)
-        f_act = buf_act.reshape(n, 2); f_logp = buf_logp.reshape(n); f_adv = adv.reshape(n); f_ret = ret.reshape(n); f_val = buf_val[:T].reshape(n)
+        f_act = buf_act.reshape(n, env.act_dim); f_logp = buf_logp.reshape(n); f_adv = adv.reshape(n); f_ret = ret.reshape(n); f_val = buf_val[:T].reshape(n)
         f_adv = (f_adv - f_adv.mean()) / (f_adv.std() + 1e-8)
         stats = {"pg": [], "vf": [], "ent": [], "kl_ref": [], "approx_kl": [], "clipfrac": []}
         freeze_actor = update < a.critic_warmup
