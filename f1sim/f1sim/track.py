@@ -219,7 +219,7 @@ class Track:
         return t
 
     def with_pockets(self, seed: int = 0, n: int = 3, depth=(1.0, 4.0), width=(0.8, 2.4), min_spacing: float = 5.0,
-                     p_bend: float = 0.6, p_elbow: float = 0.5) -> "Track":
+                     p_bend: float = 0.6, p_elbow: float = 0.5, p_round: float = 0.3) -> "Track":
         """Copy of the track with n dead-end side pockets carved into the boundary and walled with duct
         hose: pit-lane mouths, door alcoves, side rooms of a hall. Openings like these are what a
         LiDAR-only policy mistakes for the track (ppo_v10 died in blackbox2022_3's alcoves at 1.0 crash
@@ -229,7 +229,9 @@ class Track:
         the configuration that actually traps the policy (a corridor continuing where the track turns);
         pockets on the side of a straight it ignores after a few updates. A share p_elbow of the
         pockets turn 90 degrees after their first leg (an elbow), so their end wall is out of sight
-        from the mouth, as it is in a real side corridor: the policy must not rely on seeing a dead end."""
+        from the mouth, as it is in a real side corridor: the policy must not rely on seeing a dead end.
+        A share p_round are round alcoves (a half disc off the wall): the last thing ppo_v13 kept
+        falling into on blackbox2022_3 once it had learned the corridors."""
         rng = np.random.default_rng(seed + 7919)
         if self.centerline is None:
             raise ValueError("pockets need a centerline")
@@ -267,8 +269,11 @@ class Track:
             if hw is None or hw > 4.0:
                 continue
             w = float(rng.uniform(*width)); d = float(rng.uniform(*depth))
-            elbow = float(rng.choice([-1.0, 1.0])) if rng.random() < p_elbow else 0.0
+            round_ = rng.random() < p_round
+            elbow = float(rng.choice([-1.0, 1.0])) if (rng.random() < p_elbow and not round_) else 0.0
             d2 = float(rng.uniform(1.0, 3.0)) if elbow else 0.0                 # second leg, sideways
+            if round_:                                                         # alcove: half disc, mouth = its diameter
+                w = float(rng.uniform(1.2, 3.0)); d = w / 2
             # local window in lane coordinates: u along the lane, v outward on the chosen side
             ext = hw + d + max(w, d2) + ring_w + 0.2
             cx, cy = cl[i]
@@ -279,7 +284,10 @@ class Track:
             gx, gy = np.meshgrid(np.arange(cc0, cc1) * res + self.origin[0], np.arange(rr0, rr1) * res + self.origin[1])
             dx, dy = gx - cx, gy - cy
             u = dx * tang[i, 0] + dy * tang[i, 1]; v = side * (dx * nrm[i, 0] + dy * nrm[i, 1])
-            pocket = (np.abs(u) <= w / 2) & (v >= hw - 0.15) & (v <= hw + d)
+            if round_:
+                pocket = ((u ** 2 + (v - (hw - 0.15)) ** 2 <= (w / 2) ** 2) & (v >= hw - 0.15))
+            else:
+                pocket = (np.abs(u) <= w / 2) & (v >= hw - 0.15) & (v <= hw + d)
             if elbow:                                                          # second leg at the end, out of sight
                 pocket |= (elbow * u >= -w / 2) & (elbow * u <= w / 2 + d2) & (v >= hw + d - w) & (v <= hw + d)
             shell = ndimage.binary_dilation(pocket, iterations=max(1, int(np.ceil(ring_w / res))))

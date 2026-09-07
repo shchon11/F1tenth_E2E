@@ -352,7 +352,8 @@ update 100 showed that this is the configuration that traps the policy (all 12 c
 icra2022+pk0~mir were in the one pocket straight ahead of a corner; pockets beside a straight are
 ignored), and it is what blackbox2022_3's side corridors are. Half of them turn 90 degrees after
 their first leg, so their end is out of sight from the mouth, as in a real side corridor: the
-policy cannot learn "enter only if no end wall is visible". From ppo_v11 every real map trains
+policy cannot learn "enter only if no end wall is visible"; 30 % are round alcoves, the shape
+ppo_v13 was still falling into at update 500 after it had learned the corridors. From ppo_v11 every real map trains
 plain, with boxes and with pockets; ppo_v12 = the same run restarted from ppo_v11's checkpoint with
 the bend-biased pockets. Neither learned the pockets (0.18 -> 0.19 crashes per car on pocket tracks
 over 200 updates, the same pockets trapping the same cars), and the log said why: KL to the init
@@ -365,7 +366,9 @@ the map's 41 m2 of side rooms and corridors (`~lane`, `Track.lane_only`) takes t
 to 0.05 (forward 0.00, reverse 0.09), so the whole remaining held-out gap is fork ambiguity on one
 map: at a genuine fork a LiDAR-only policy has no local cue for which branch is the track. The
 held-out set now carries blackbox2022_3 both ways, so "can it drive the geometry" (yes, teacher
-level on every held-out map) and "does it enter forks" (still yes) are reported separately. ppo_v11 starts
+level on every held-out map) and "does it enter forks" are reported separately. The forks did give
+way, just late: ppo_v13 at update 500 had blackbox2022_3 at 0.50 / 0.38 (from ~1.0), the T-junction
+corridors passed and the round alcove the last trap, Korea at 0 of 32 cars. ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
 at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else
 at most 0.06.
