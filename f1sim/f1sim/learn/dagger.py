@@ -24,8 +24,8 @@ from .obs import PROPRIO_KEYS, flatten_obs
 class StepBuffer:
     """Per-step storage; a training sample (t, b) rebuilds its scan stack from t, t-1, t-2 of env b."""
 
-    def __init__(self, k: int):
-        self.k = k
+    def __init__(self, k: int, stride: int = 1):
+        self.k, self.stride = k, stride
         self.scan, self.pro, self.lab, self.newep = [], [], [], []
 
     def add(self, scan_now, proprio, label, new_episode):
@@ -41,17 +41,21 @@ class StepBuffer:
     def __len__(self):
         return self.T * self.B
 
-    def sample(self, n, device):
-        t = torch.randint(self.T, (n,)); b = torch.randint(self.B, (n,))
+    def samples_at(self, t, b, device):
+        n = t.numel()
         stack = []
         cur_t = t.clone(); blocked = torch.zeros(n, dtype=torch.bool)
-        for j in range(self.k):
+        for _ in range(self.k):
             stack.append(self.S[cur_t, b])
-            # step back one frame unless that crosses an episode boundary
-            blocked = blocked | self.N[cur_t, b] | (cur_t == 0)
-            cur_t = torch.where(blocked, cur_t, cur_t - 1)
+            for _ in range(self.stride):
+                blocked = blocked | self.N[cur_t, b] | (cur_t == 0)
+                cur_t = torch.where(blocked, cur_t, cur_t - 1)
         scan = torch.stack(stack, 1).to(device, torch.float32)
         return scan, self.P[t, b].to(device).float(), self.L[t, b].to(device)
+
+    def sample(self, n, device):
+        t = torch.randint(self.T, (n,)); b = torch.randint(self.B, (n,))
+        return self.samples_at(t, b, device)
 
 
 def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0):
@@ -80,10 +84,10 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
 def train_epochs(model, bufs, epochs, batch, device, opt, log):
     n_total = sum(len(b) for b in bufs)
     steps = max(1, int(epochs * n_total / batch))
-    weights = torch.tensor([len(b) for b in bufs], dtype=torch.float)
+    buffer_weights = torch.tensor([len(b) for b in bufs], dtype=torch.float)
     losses = []
     for i in range(steps):
-        b = bufs[torch.multinomial(weights, 1).item()]
+        b = bufs[torch.multinomial(buffer_weights, 1).item()]
         scan, pro, lab = b.sample(batch, device)
         mu = model.actor(scan, pro)
         loss = F.smooth_l1_loss(mu, lab, beta=0.1)
@@ -105,6 +109,9 @@ def main():
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the student outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--teacher-speed", type=float, default=1.0, help="scale on the teacher's speed profile (0.9: fewer teacher crashes through the plan tracker)")
     ap.add_argument("--hist-len", type=int, default=0, help="proprio history rows in the observation")
+    ap.add_argument("--scan-stack", type=int, default=3); ap.add_argument("--scan-stride", type=int, default=1)
+    ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences before the CNN")
+    ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--keep-iters", type=int, default=5, help="aggregate the data of at most this many recent iterations (host RAM)")
     ap.add_argument("--eval-steps", type=int, default=800); ap.add_argument("--wandb", default="online")
     a = ap.parse_args()
@@ -112,34 +119,38 @@ def main():
     names = common.track_names(a.tracks)
     print(f"loading {len(names)} tracks + racelines ...", flush=True)
     tracks, rls = common.load_tracks(names, racelines=True)
-    env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len))
+    env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
+                                                             scan_stack=a.scan_stack, scan_stride=a.scan_stride))
     teacher = common.make_teacher(rls, env); teacher.speed_scale = a.teacher_speed
     spec = common.obs_spec(env)
     priv_dim = env.privileged(env.reset()[1] and env.last_result).shape[1]
-    model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim).to(device)
+    model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim,
+                        scan_deltas=a.scan_deltas, temporal_encoder=a.temporal_encoder).to(device)
     opt = torch.optim.Adam(model.actor.parameters(), lr=a.lr)
     run = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "tracks": names}, group="dagger", mode=a.wandb)
     out = common.run_dir(a.name)
     log = lambda d: run.log(d)
     env.sim.warmup()
     bufs = []
+    teacher_metrics = None
     t0 = time.time()
     for it in range(a.iters):
         beta = 1.0 if it == 0 else a.beta0 * (0.5 ** (it - 1))
         tm = common.Timer()
-        buf = collect(env, model, teacher, a.steps, beta, device, StepBuffer(spec.scan_stack), noise=0.05 if it else 0.0).finalize()
+        buf = collect(env, model, teacher, a.steps, beta, device, StepBuffer(spec.scan_stack, spec.scan_stride), noise=0.05 if it else 0.0).finalize()
         bufs.append(buf); bufs = bufs[-a.keep_iters:]; t_col = tm.lap()        # host RAM: keep the last few iterations (14 GB laptop)
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log); t_tr = tm.lap()
         m = common.rollout_metrics(env, lambda o: model.act(*flatten_obs(o), deterministic=True)[0], a.eval_steps, a.speed_cap); t_ev = tm.lap()
-        tm_ = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps, a.speed_cap) if it == 0 else tm_
+        if teacher_metrics is None:
+            teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps, a.speed_cap)
         log({"dagger/iter": it, "dagger/beta": beta, "dagger/samples": sum(len(b) for b in bufs), "dagger/final_loss": loss,
-             **{f"student/{k}": v for k, v in m.items()}, **{f"teacher/{k}": v for k, v in tm_.items()},
+             **{f"student/{k}": v for k, v in m.items()}, **{f"teacher/{k}": v for k, v in teacher_metrics.items()},
              "time/collect_s": t_col, "time/train_s": t_tr, "time/eval_s": t_ev, "time/elapsed_min": (time.time() - t0) / 60})
         print(f"iter {it}: beta {beta:.2f} samples {sum(len(b) for b in bufs)} loss {loss:.4f} | student coll {m['collision_rate']:.2f} "
-              f"prog {m['progress_rate_mps']:.2f} m/s lap {m['lap_time_s']:.1f} s | teacher coll {tm_['collision_rate']:.2f} prog {tm_['progress_rate_mps']:.2f} m/s "
-              f"lap {tm_['lap_time_s']:.1f} s | {t_col:.0f}+{t_tr:.0f}+{t_ev:.0f} s", flush=True)
+              f"prog {m['progress_rate_mps']:.2f} m/s lap {m['lap_time_s']:.1f} s | teacher coll {teacher_metrics['collision_rate']:.2f} prog {teacher_metrics['progress_rate_mps']:.2f} m/s "
+              f"lap {teacher_metrics['lap_time_s']:.1f} s | {t_col:.0f}+{t_tr:.0f}+{t_ev:.0f} s", flush=True)
         meta = {"spec": spec.__dict__, "phase": "dagger", "run": a.name, "iter": it, "iters": a.iters,
-                "samples": sum(len(b) for b in bufs), "metrics": m, "teacher": tm_, "action_mode": a.action_mode}
+                "samples": sum(len(b) for b in bufs), "metrics": m, "teacher": teacher_metrics, "action_mode": a.action_mode}
         save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, meta)
         save_checkpoint(os.path.join(out, "student_latest.pt"), model, meta)
     run.finish()

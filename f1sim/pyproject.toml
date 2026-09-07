@@ -7,11 +7,13 @@ name = "f1sim"
 version = "0.1.0"
 description = "GPU-vectorized F1TENTH simulator for RL/IL e2e planner training (Hokuyo 2D LiDAR, VESC)"
 requires-python = ">=3.10"
-dependencies = ["numpy", "torch", "scipy", "pyyaml", "pillow", "matplotlib", "websockets"]
+dependencies = ["numpy", "torch", "scipy", "scikit-image", "pyyaml", "pillow", "matplotlib", "websockets"]
 
 [project.optional-dependencies]
 gym = ["gymnasium>=0.29"]
 dev = ["pytest"]
+learn = ["wandb"]
+viewer = ["moderngl", "glfw", "trimesh"]
 
 [tool.setuptools.packages.find]
 include = ["f1sim*"]

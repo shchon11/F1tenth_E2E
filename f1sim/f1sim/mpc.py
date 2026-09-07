@@ -227,9 +227,11 @@ def solve_fast(*args, **kw):
 class PlanTracker:
     """Per-env state for the plan -> (steer, speed) tracker. Call reset(ids) when envs restart."""
 
-    def __init__(self, num_envs: int, device, wheelbase: float, s_max: float, v_max: float, spec: Optional[PlanSpec] = None):
+    def __init__(self, num_envs: int, device, wheelbase: float, s_max: float, v_max: float, spec: Optional[PlanSpec] = None,
+                 compile_solver: bool = True):
         self.B, self.device, self.wb, self.s_max, self.v_max = num_envs, torch.device(device), wheelbase, s_max, v_max
         self.spec = spec or PlanSpec()
+        self.compile_solver = compile_solver
         self.u_prev = torch.zeros(num_envs, 2, device=self.device)                 # last applied steer, accel
         self.u_seq = torch.zeros(num_envs, self.spec.N, 2, device=self.device)     # warm start
         self.last_ref = None                                                       # (B,N+1,4) body frame plan, for viewers
@@ -253,7 +255,8 @@ class PlanTracker:
         elif not torch.is_tensor(delay):
             delay = torch.full_like(v, float(delay))
         warm = torch.cat([self.u_seq[:, 1:], self.u_seq[:, -1:]], 1)
-        u, z, ref = solve_fast(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
+        solver = solve_fast if self.compile_solver else solve
+        u, z, ref = solver(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
         u, z, ref = u.clone(), z.clone(), ref.clone()             # CUDA-graph outputs are reused by the next run
         self.u_seq = u; self.u_prev = u[:, 0].clone(); self.last_ref = ref; self.last_pred = z[:, :, :4]
         k_ = max(1, int(round(sp.v_cmd_lead / sp.dt)))

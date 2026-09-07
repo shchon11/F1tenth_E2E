@@ -271,7 +271,7 @@ class Track:
 
     @staticmethod
     def generate_random(seed: int = 0, style: str = "competition", resolution: float = 0.05, mirror="auto",
-                        lane_obstacles=False, **kw) -> "Track":
+                        lane_obstacles: bool | int = False, **kw) -> "Track":
         """Procedural tracks. style:
         "competition": control-point loop with hairpins, chicanes and varying width (1.6-2.6 m),
                        duct-hose boundaries in a room with clutter (indoor RoboRacer/F1TENTH events)
@@ -297,7 +297,7 @@ class Track:
             mirror = (seed % 2 == 1)                # odd seeds run clockwise
         t = t.mirrored() if mirror else t
         if lane_obstacles:
-            n_obs = lane_obstacles if isinstance(lane_obstacles, int) else int(np.random.default_rng(seed + 7).integers(1, 5))
+            n_obs = int(np.random.default_rng(seed + 7).integers(1, 5)) if lane_obstacles is True else int(lane_obstacles)
             t = t.with_lane_obstacles(seed=seed, n=n_obs)
         return t
 

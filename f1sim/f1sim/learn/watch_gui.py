@@ -38,13 +38,14 @@ def ask() -> Optional[list]:
     ttk.Label(f, text="'latest' follows the newest run; every run auto-reloads its newest checkpoint", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w"); row[0] += 1
     mp = tk.StringVar(value=common.EVAL_TRACKS[0])
     line("map", ttk.Combobox(f, textvariable=mp, values=maps_, width=34))
-    cars = tk.IntVar(value=32); line("cars", ttk.Spinbox(f, from_=1, to=1024, textvariable=cars, width=8))
+    cars = tk.IntVar(value=8); line("cars", ttk.Spinbox(f, from_=1, to=1024, textvariable=cars, width=8))
     cap = tk.DoubleVar(value=6.0); line("speed cap [m/s]", ttk.Spinbox(f, from_=1.0, to=8.0, increment=0.5, textvariable=cap, width=8))
     race = tk.IntVar(value=1); line("cars per race (1 = no opponents)", ttk.Spinbox(f, from_=1, to=4, textvariable=race, width=8))
     opp = tk.StringVar(value="teacher"); line("opponents driven by", ttk.Combobox(f, textvariable=opp, values=["teacher", "policy"], width=12, state="readonly"))
     stoch = tk.BooleanVar(value=False); line("sample actions like training", ttk.Checkbutton(f, variable=stoch))
     internals = tk.BooleanVar(value=False); line("show raw network activations", ttk.Checkbutton(f, variable=internals))
     fast = tk.BooleanVar(value=False); line("run as fast as possible (no real-time pacing)", ttk.Checkbutton(f, variable=fast))
+    compile_enabled = tk.BooleanVar(value=True); line("compile for real-time simulation", ttk.Checkbutton(f, variable=compile_enabled))
     gl = tk.StringVar(value="nvidia"); line("render the window on", ttk.Combobox(f, textvariable=gl, values=["nvidia", "amd"], width=12, state="readonly"))
     ttk.Label(f, text="'amd' draws through Mesa on the integrated Radeon so the NVIDIA GPU only runs the simulation", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w"); row[0] += 1
     ttk.Label(f, text="in the viewer:  C camera   [ ] other car   L lidar   T trails   S screenshot   space pause", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w", pady=(8, 0)); row[0] += 1
@@ -55,6 +56,7 @@ def ask() -> Optional[list]:
         if stoch.get(): args.append("--stochastic")
         if internals.get(): args.append("--internals")
         if fast.get(): args.append("--fast")
+        if compile_enabled.get(): args.append("--compile")
         args += ["--gl", gl.get()]
         out["args"] = args; root.destroy()
     b = ttk.Frame(f); b.grid(row=row[0], column=0, columnspan=2, pady=(12, 0))

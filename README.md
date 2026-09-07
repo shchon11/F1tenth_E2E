@@ -1,5 +1,8 @@
 # F1TENTH e2e planner workspace
 
+이 PC(RTX 4060 Ti 8GB)의 활성화·학습·뷰어·ROS 실행 명령은 [로컬 실행 안내](docs/local_pc.md)를 참고한다.
+현재 구조의 적합도, 확인된 결함과 다음 비교 실험은 [알고리즘 평가](docs/algorithm_assessment.md)에 정리한다.
+
 <p align="center">
   <img src="docs/promo.gif" width="800" alt="f1sim viewer footage: policy chase cam with saliency, the local planner's trajectory on the Korea championship map, 256 cars training, a race with rear detection boxes"/>
   <br/>
@@ -142,13 +145,13 @@ obs, info = env.reset(seed=0)                    # obs: scan (k, N) in [0,1], sp
 obs, rew, term, trunc, info = env.step(action)   # action in [-1,1]^2; auto-reset, info["final"] on episode end
 ```
 Observation keys: `scan` (k stacked scans, `scan_stride` control steps apart: 3 x stride 3 =
-175 ms of history for velocity cues), `speed` (VESC), `prev_action`, `imu` (step-mean gyro xyz /
+150 ms between the oldest and newest scans at 40 Hz; default stride 1 spans 50 ms), `speed` (VESC), `prev_action`, `imu` (step-mean gyro xyz /
 accel xyz, normalized), `imu_att` (VESC roll/pitch estimate), and optionally `hist`
 (`hist_len` rows of speed / imu / roll-pitch / action, `hist_stride` steps apart: the last second
 of what the car felt and was told, so the actor can identify its own grip and lag instead of
-driving for the worst car in the randomization -- the critic sees those parameters directly). Reward = progress [m] - 10 on
+driving for the worst car in the randomization -- the critic sees those parameters directly). The temporal student used for new runs sees six scans at stride 2 (250 ms) and appends consecutive scan differences before the CNN. Reward = progress [m] - 10 on
 collision (PPO runs use 50-150, optionally plus a term per m/s of impact speed so a fast crash
-costs more than a nudge) - 0.05 * |steer change| - 0.1 * wall proximity (under a 0.30 m gap) - 0.2 while facing
+costs more than a nudge) - 0.05 * |steer change| - 0.5 * distance travelled * wall proximity (under a 0.30 m gap) - 0.2 while facing
 backwards along the lane (progress is signed, so driving the wrong way already pays negative reward;
 this makes it explicit). Everything the
 policy sees is available on the real car; integrated pose/odometry is deliberately excluded (it
@@ -320,13 +323,12 @@ at ~32 Hz instead of 40.
 
 ## Training (`f1sim/learn/`)
 Decisions: LiDAR-only e2e with proprioception (VESC speed, IMU step-mean, VESC roll/pitch estimate,
-last 2 actions, speed cap); reward = centerline progress - 10 * collision - 0.05 * |steer change|
-- 0.1 * proximity (linear ramp once the body-to-wall gap is under 0.30 m: a mild safety margin,
+last 2 actions, speed cap); reward = centerline progress - collision cost - 0.05 * |steer change|
+- 0.5 * distance travelled * proximity (linear ramp once the body-to-wall gap is under 0.30 m: a mild safety margin,
 hugging the hose on the racing line is still allowed); speed cap
-curriculum 4 -> 8 m/s; train tracks = `common.TRAIN_TRACKS` (user-curated: 6 real competition
-SLAM maps + rt:Spielberg/Oschersleben + 2 gen:competition seeds, each in both lap directions via
-the `~rev` modifier, plus the 6 real maps with static box obstacles (`+obs<seed>`, one box per
-~35 m of lane, both directions: 32 tracks, 37 % with obstacles), held-out eval = `common.EVAL_TRACKS` (real:korea_2025_iccas and
+curriculum 4 -> 8 m/s; train tracks = `common.TRAIN_TRACKS` (6 real competition
+SLAM maps + Spielberg/Oschersleben + 28 distinct procedural competition/hallway/circuit geometries,
+with reverse/mirror variants and static-obstacle versions: 112 entries), held-out eval = `common.EVAL_TRACKS` (real:korea_2025_iccas and
 real:blackbox2022_3 both ways, rt:Monza, gen:competition:0); `--tracks` takes `train`, `eval` or a
 comma separated catalog list; W&B project `f1sim-e2e`; runs and checkpoints under
 `~/f1sim_runs/<name>/`. Track galleries: `docs/tracks_*.png` (`scripts/track_gallery.py`).
@@ -343,11 +345,11 @@ python3 -m f1sim.learn.ppo --name ppo_selfplay --init ~/f1sim_runs/ppo_race/ppo_
 ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:2 policy:=$HOME/f1sim_runs/ppo_v1/ppo_latest.pt policy_speed_cap:=5.0
 ```
 * `obs.py`: the one observation encoding, used by the gym env and by the ROS policy node.
-* `model.py`: 1D-conv scan stem + MLP actor (Gaussian, tanh mean), separate critic with the
+* `model.py`: 1D-conv scan stem + MLP actor (Gaussian, tanh mean), optional temporal scan-difference channels, separate critic with the
   privileged vector (true velocities, track-relative pose, wall clearance, randomized params).
 * `dagger.py`: teacher drives / student drives with teacher labels, aggregated buffer, Huber loss.
 * `ppo.py`: asymmetric-critic PPO from the DAgger student, KL-to-imitation regularizer that decays,
-  value clipping, speed-cap curriculum, per-episode metrics (collision rate, progress, lap time).
+  value clipping, speed-cap curriculum, per-episode metrics and per-component reward monitoring.
 * `policy_node.py` (f1sim_ros): /scan + /odom + /sensors/imu -> /drive, same ObsBuilder; the
   launch's `policy:=` argument starts it against the simulated stack.
 
@@ -373,6 +375,7 @@ python3 -m f1sim.learn.watch --run ~/f1sim_runs/ppo_v2/ppo_final.pt --cars 64 --
 `docs/highlight_ppo_v2_ep1.mp4`: best of 64 agents, 20 s episode.
 
 ### Results so far (2026-09-07, W&B project f1sim-e2e)
+Historical direct-control results below predate the current plan-space implementation and the episode-accounting fixes. They do not establish current planner performance; rerun paired evaluations on a fixed simulator configuration.
 | run | setup | held-out competition tracks (cap 6 m/s, 60 s episodes) |
 |---|---|---|
 | teacher | raceline pure pursuit, privileged | laps 25-32 s, collisions 0-1 % |
@@ -393,8 +396,10 @@ mirrored tracks, more DAgger epochs, longer PPO with a higher hallway share.
   PPO fine-tuning with asymmetric critic -> add opponents (multi-car sim + self-play).
 
 ## Open items
-* DAgger + PPO training scripts, student network (1D conv over scan stack), TensorRT export
-* multi-car: opponents in the LiDAR scan, car-car collisions, self-play
+* frozen-checkpoint evaluation on unseen obstacle placements and opponent behaviors; report first-attempt full-distance completion
+* train and compare temporal observation models for dynamic interaction; current CNN is feedforward
+* validate online collision/feasibility checks and real-car stale-input/command watchdog behavior
+* validate exported policy and tracker latency on the target Jetson
 * real-car system identification: measure servo tau, VESC accel limits, actual latency, tire peak
   slip and feed them into `Config` and the randomization ranges
 * maps of the real track(s) + centerlines

@@ -16,7 +16,7 @@ their first observation of the new episode is returned (standard vector-env sema
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from typing import Dict, Optional
 
 import math
@@ -28,6 +28,8 @@ from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, encode as plan_enco
 from .params import Config
 from .sim import Simulator, StepResult
 from .track import Track
+
+REWARD_COMPONENT_KEYS = ("progress", "collision", "collision_speed", "steer_rate", "proximity", "plan_clearance", "wrong_way", "alive")
 
 
 @dataclass
@@ -45,10 +47,12 @@ class EnvConfig:
     reward_progress: float = 1.0     # per meter
     reward_collision: float = -10.0
     reward_steer_rate: float = 0.05  # per unit of normalized steer change
-    reward_proximity: float = 0.1    # per step at zero wall gap, linear in (safe_dist - gap)/safe_dist; 0 = off
+    reward_proximity: float = 0.5
     proximity_speed_ref: float = 0.0 # [m/s] >0: the proximity penalty is scaled by (1 + v / ref): fast past a wall costs more than creeping
     reward_wrong_way: float = 0.2    # per step while facing backwards along the lane (progress is signed anyway; this makes it explicit)
     reward_collision_speed: float = 0.0   # extra collision penalty per m/s of speed at impact (a fast crash costs more than a nudge)
+    reward_plan_clearance: float = 0.0
+    plan_margin: float = 0.15
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
     reward_alive: float = 0.0
     spawn_lateral_std: float = 0.3
@@ -60,6 +64,7 @@ class EnvConfig:
     hist_len: int = 0                # >0: proprioceptive history rows (speed, imu, roll/pitch, action) in the observation
     hist_stride: int = 2             # steps between rows (20 x 2 = the last second): implicit identification of grip / lag
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
+    compile_tracker: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -111,7 +116,8 @@ class F1VecEnv:
             self._math = _math
         self.tracker_delay = None
         if e.action_mode == "plan":
-            self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max, e.v_max_policy)
+            self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
+                                       e.v_max_policy, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
         self.speed_cap = torch.full((self.B,), float(self.ecfg.speed_cap), device=self.device)
         self.ep_step = torch.zeros(self.B, dtype=torch.long, device=self.device)
@@ -121,6 +127,7 @@ class F1VecEnv:
         self.ep_progress = torch.zeros(self.B, device=self.device)
         self.last_result: Optional[StepResult] = None
         self._empty_long = torch.zeros(0, dtype=torch.long, device=self.device); self._empty_float = torch.zeros(0, device=self.device)
+        self._no_plan = torch.zeros(self.B, 1, 4, device=self.device)
         self.single_observation_space, self.single_action_space = self._spaces()
 
     def _spaces(self):
@@ -225,6 +232,7 @@ class F1VecEnv:
         poses = self.sim.sample_spawn(n, e.spawn_lateral_std, e.spawn_yaw_std, s=s, tid=self.sim.tid[ids], min_clearance=e.spawn_min_clearance)
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
         self.sim.reset(ids, poses, speed)
+        self.sim.odom.state[ids, 3] = speed
         self.prev_action[ids] = 0.0
         if self.act_dim == 2:
             self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
@@ -237,11 +245,32 @@ class F1VecEnv:
         self.lap_start_step[ids] = 0; self.prev_lap[ids] = 0
         # fill the scan history with a fresh scan from the new pose. Scanned for the whole batch on the
         # compiled path (fixed shapes -> one CUDA graph); a per-reset partial batch would run eager kernels
-        scan, _, _ = self.sim.lidar.scan(self.sim.state[:, :3], None, self.sim.P, motion_distortion=False, tid=self.sim.tid, compiled=True)
+        cars = self.sim._car_boxes(self.sim.state) if self.M > 1 else None
+        scan, scan_true, scan_type = self.sim.lidar.scan(self.sim.state[:, :3], None, self.sim.P, motion_distortion=False, tid=self.sim.tid, cars=cars, compiled=True)
         self.scan_hist[ids] = self._norm_scan(scan[ids])[:, None, :]
         if self.hist is not None:
             feat = torch.zeros(ids.numel(), 9, device=self.device); feat[:, 0] = speed / e.v_max_policy
             self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.act_dim, device=self.device)], 1)[:, None, :]
+
+        return scan, scan_true, scan_type
+
+    def _reset_result(self, r: StepResult, ids: torch.Tensor, scans: tuple[torch.Tensor, ...]) -> StepResult:
+        """Refresh reset rows without advancing any car or mutating transition info."""
+        current = replace(r, **{f.name: value.clone() for f in fields(r)
+                               if isinstance(value := getattr(r, f.name), torch.Tensor)})
+        current.state[ids] = self.sim.state[ids]
+        current.odom[ids] = self.sim.odom.state[ids]
+        current.s[ids] = self.sim.s[ids]
+        _, lateral, _ = self.sim.track.project(self.sim.state[:, :2], self.sim.tid)
+        current.lateral[ids] = lateral[ids]
+        current.wall_dist[ids] = self.sim._footprint_clearance(self.sim.state)[ids]
+        for target, scan in zip((current.scan, current.scan_true, current.scan_type), scans):
+            target[ids] = scan[ids]
+        for target in (current.attitude, current.imu, current.imu_att, current.collision,
+                       current.progress, current.lap, current.car_collision):
+            if target is not None:
+                target[ids] = 0
+        return current
 
     def _opponent_actions(self, action: torch.Tensor) -> torch.Tensor:
         if self.M == 1 or self.ecfg.opponent != "teacher":
@@ -290,9 +319,10 @@ class F1VecEnv:
         self.last_cmd = cmd
         e = self.ecfg
         self.ep_step += 1
+        plan_ref = self.tracker.last_ref if self.tracker is not None and e.reward_plan_clearance > 0 else self._no_plan
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
-                         self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap)
-        self.scan_hist, steer_rate, reward, self.act_hist, terminated, truncated, crossed, done, self.ep_return, self.ep_progress, flags = (t.clone() for t in out)
+                         self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap, plan_ref)
+        self.scan_hist, steer_rate, reward, reward_components, self.act_hist, terminated, truncated, crossed, done, self.ep_return, self.ep_progress, flags = (t.clone() for t in out)
         self.prev_steer_norm = steer_norm; self.prev_action = a
         if self.hist is not None:
             self.hist = torch.cat([torch.cat([self._last_feat, a], 1)[:, None, :], self.hist[:, :-1]], 1)
@@ -305,10 +335,11 @@ class F1VecEnv:
             self.lap_start_step[crossed] = self.ep_step[crossed]
         else:
             lap_ids = self._empty_long; lap_times = self._empty_float
-        self.prev_lap = r.lap
+        self.prev_lap = r.lap.clone()
         info = {"priv": self._priv(r), "progress": r.progress, "lap": r.lap, "wall_dist": r.wall_dist,
                 "scan_true": r.scan_true, "track_id": self.sim.tid.clone(), "lap_times": lap_times, "lap_ids": lap_ids,
-                "learner": self.learner}
+                "learner": self.learner,
+                "reward_components": dict(zip(REWARD_COMPONENT_KEYS, reward_components.unbind(1)))}
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
         if self.tracker is not None:
@@ -320,21 +351,15 @@ class F1VecEnv:
                              "lap_time": self.ep_step[ids].float() * self.sim.control_dt}
             # final observation of the ended episodes (before auto-reset)
             info["final_obs"] = {k: v[ids].clone() for k, v in obs.items()}
-            self._reset_envs(ids)
+            info["final_priv"] = self.privileged(r)[ids].clone()
+            scans = self._reset_envs(ids)
+            r = self._reset_result(r, ids, scans)
             obs = self._obs(r)
-            fresh = {"scan": self.scan_hist[ids][:, ::e.scan_stride], "speed": (self.sim.state[ids, 3] / e.v_max_policy)[:, None],
-                     "prev_action": self.act_hist[ids].reshape(ids.numel(), -1), "speed_cap": (self.speed_cap[ids] / e.v_max_policy)[:, None]}
-            if self.hist is not None:
-                fresh["hist"] = self.hist[ids][:, ::e.hist_stride].reshape(ids.numel(), -1)
-            for k in obs:
-                obs[k][ids] = fresh[k] if k in fresh else 0.0
-            if self.hist is not None:                              # the next history row of a fresh car starts from its fresh features
-                self._last_feat[ids] = 0.0; self._last_feat[ids, 0] = fresh["speed"][:, 0]
         self.last_result = r
         return obs, reward, terminated, truncated, info
 
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
-                   ep_return, ep_progress, prev_lap):
+                   ep_return, ep_progress, prev_lap, plan_ref):
         """Reward, histories and episode flags as pure tensor math (compiled into one CUDA graph when
         the sim runs in reduce-overhead mode: next to a training job every small kernel waits its turn)."""
         e = self.ecfg
@@ -348,8 +373,25 @@ class F1VecEnv:
             _, yaw_c = self.sim.track.pose_at_s(s, tid)
             wrong_way = (torch.cos(state[:, 2] - yaw_c) < 0.0).float()      # more than 90 deg off the lane direction
         crash = collision.float()
-        reward = (e.reward_progress * progress + e.reward_collision * crash - e.reward_collision_speed * crash * state[:, 3].abs()
-                  - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity - e.reward_wrong_way * wrong_way + e.reward_alive)
+        plan_penalty = torch.zeros_like(wall_dist)
+        if e.reward_plan_clearance > 0 and plan_ref.shape[1] > 1:
+            cosine, sine = torch.cos(state[:, 2])[:, None], torch.sin(state[:, 2])[:, None]
+            plan_x = state[:, 0:1] + plan_ref[:, :, 0] * cosine - plan_ref[:, :, 1] * sine
+            plan_y = state[:, 1:2] + plan_ref[:, :, 0] * sine + plan_ref[:, :, 1] * cosine
+            clearance = self.sim.track.sample_edt(torch.stack([plan_x, plan_y], -1), tid[:, None]).min(1).values
+            clearance = clearance - 0.5 * self.cfg.vehicle.width
+            plan_penalty = (e.plan_margin - clearance).clamp(min=0.0) / e.plan_margin
+        reward_components = torch.stack([
+            e.reward_progress * progress,
+            e.reward_collision * crash,
+            -e.reward_collision_speed * crash * state[:, 3].abs(),
+            -e.reward_steer_rate * steer_rate,
+            -e.reward_proximity * proximity * progress.abs(),
+            -e.reward_plan_clearance * plan_penalty * self.sim.control_dt,
+            -e.reward_wrong_way * wrong_way,
+            torch.full_like(progress, e.reward_alive),
+        ], 1)
+        reward = reward_components.sum(1)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         terminated = collision.clone()
         truncated = (~terminated) & ((ep_step >= e.max_steps) | (lap >= e.laps))
@@ -358,8 +400,8 @@ class F1VecEnv:
             truncated = truncated & ~terminated
         crossed = lap > prev_lap
         done = terminated | truncated
-        flags = torch.stack([done.any(), (crossed & (prev_lap > 0)).any()])
-        return scan_hist, steer_rate, reward, act_hist, terminated, truncated, crossed, done, ep_return + reward, ep_progress + progress, flags
+        flags = torch.stack([done.any(), crossed.any()])
+        return scan_hist, steer_rate, reward, reward_components, act_hist, terminated, truncated, crossed, done, ep_return + reward, ep_progress + progress, flags
 
     PRIV_PARAMS = ("mu", "mu_f_scale", "cmd_delay", "servo_tau", "motor_tau", "roll_per_g", "steer_bias", "speed_gain")
 

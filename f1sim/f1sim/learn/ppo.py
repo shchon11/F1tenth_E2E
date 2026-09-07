@@ -4,9 +4,11 @@
   the imitation policy while the critic warms up.
 - Speed-cap curriculum: the commanded speed cap ramps from `cap0` to `cap1` over `cap_steps`
   env steps (the cap is part of the observation, so the policy stays consistent).
-- Time-limit truncations bootstrap with the current value estimate.
+- Time-limit truncations bootstrap with the final observation value estimate.
 """
 from __future__ import annotations
+
+from collections import deque
 
 import argparse
 import copy
@@ -17,10 +19,20 @@ import time
 import numpy as np
 import torch
 
-from ..gym_env import EnvConfig
+from ..gym_env import EnvConfig, REWARD_COMPONENT_KEYS
 from . import common
 from .model import ActorCritic, load_checkpoint, save_checkpoint
 from .obs import flatten_obs
+from .returns import compute_gae
+
+
+def sample_rollout_action(
+    model: ActorCritic, scan: torch.Tensor, proprio: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the sampled action and its matching log probability for PPO storage."""
+    distribution = model.actor.dist(scan, proprio)
+    action = distribution.sample()
+    return action, distribution.log_prob(action).sum(1)
 
 
 def main():
@@ -41,12 +53,14 @@ def main():
     ap.add_argument("--save-every", type=int, default=25); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--amp", action="store_true", help="bf16 autocast for network forward/backward (~2x faster)")
     ap.add_argument("--collision-penalty", type=float, default=10.0); ap.add_argument("--steer-penalty", type=float, default=0.05)
-    ap.add_argument("--proximity-penalty", type=float, default=0.1, help="per-step penalty at zero wall gap (0 = off)")
+    ap.add_argument("--proximity-penalty", type=float, default=0.5, help="per-metre penalty at zero wall gap (0 = off)")
     ap.add_argument("--safe-dist", type=float, default=0.30, help="[m] body-to-wall gap where the proximity penalty starts")
     ap.add_argument("--wrong-way-penalty", type=float, default=0.2, help="per-step penalty while facing backwards along the lane")
     ap.add_argument("--collision-speed-penalty", type=float, default=0.0, help="extra collision penalty per m/s of impact speed")
     ap.add_argument("--cap-gate", type=float, default=0.0, help=">0: the speed cap only rises while the recent collision rate is below this (safety before speed)")
     ap.add_argument("--proximity-speed-ref", type=float, default=0.0, help="[m/s] scale the proximity penalty by (1 + v/ref)")
+    ap.add_argument("--plan-clearance-penalty", type=float, default=0.0, help="per-second penalty for a plan inside the wall margin")
+    ap.add_argument("--plan-margin", type=float, default=0.15)
     ap.add_argument("--init-log-std", type=float, default=None, help="reset the actor's exploration log-std at start (default: -1.8 in the plan space, whose curvature knots tolerate far less noise than steer/speed; unchanged otherwise)")
     ap.add_argument("--episode-s", type=float, default=40.0)
     ap.add_argument("--scan-stack", type=int, default=3); ap.add_argument("--scan-stride", type=int, default=1, help="control steps between stacked scans")
@@ -55,6 +69,8 @@ def main():
     ap.add_argument("--opponent", default="policy", choices=["policy", "teacher"], help="who drives cars 1..M-1: the policy (self-play) or the raceline teacher")
     ap.add_argument("--opp-speed", type=float, nargs=2, default=(0.6, 1.0), help="teacher opponents: speed scale range per race")
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the policy outputs a local trajectory (f1sim.mpc)")
+    ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
+    ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     a = ap.parse_args()
     device = torch.device(a.device); torch.manual_seed(a.seed)
     names = common.track_names(a.tracks)
@@ -65,6 +81,7 @@ def main():
                                                               reward_steer_rate=a.steer_penalty, reward_proximity=a.proximity_penalty,
                                                               safe_dist=a.safe_dist, reward_wrong_way=a.wrong_way_penalty,
                                                               reward_collision_speed=a.collision_speed_penalty, proximity_speed_ref=a.proximity_speed_ref,
+                                                              reward_plan_clearance=a.plan_clearance_penalty, plan_margin=a.plan_margin,
                                                               max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
                                                               race_size=a.race_size, opponent=a.opponent,
@@ -77,8 +94,11 @@ def main():
         model, extra = load_checkpoint(a.init, device, override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                                                                   "proprio_dim": spec.proprio_dim, "priv_dim": priv_dim, "act_dim": env.act_dim})
         print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing")
+        a.scan_deltas = bool(model.meta.get("scan_deltas", False))
+        a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
     else:
-        model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim).to(device)
+        model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim,
+                            scan_deltas=a.scan_deltas, temporal_encoder=a.temporal_encoder).to(device)
     init_log_std = a.init_log_std if a.init_log_std is not None else (-1.8 if a.action_mode == "plan" else None)
     if init_log_std is not None:
         with torch.no_grad(): model.actor.log_std.fill_(init_log_std)
@@ -97,19 +117,24 @@ def main():
     buf_act = torch.zeros(T, B, env.act_dim, device=device); buf_logp = torch.zeros(T, B, device=device)
     buf_rew = torch.zeros(T, B, device=device); buf_done = torch.zeros(T, B, device=device); buf_trunc = torch.zeros(T, B, device=device)
     buf_val = torch.zeros(T + 1, B, device=device)
+    buf_final_val = torch.zeros(T, B, device=device)
+    buf_reward_components = torch.zeros(T, B, len(REWARD_COMPONENT_KEYS), device=device)
 
     steps_done = 0; update = 0; t_start = time.time(); last_log = {}; cap = a.cap0
     ep_stats = {"return": [], "progress": [], "collided": [], "lap_time": [], "steps": []}
+    collision_history: deque[float] = deque(maxlen=500)
     n_updates = int(a.total // (T * B))
     while steps_done < a.total:
         frac = steps_done / a.total
         if a.cap_gate > 0:                                   # gated: the cap climbs at the scheduled rate only while collisions are under the gate
-            recent = float(np.mean(ep_stats["collided"][-500:])) if ep_stats["collided"] else 1.0
+            recent = float(np.mean(collision_history)) if collision_history else 1.0
             step_cap = (a.cap1 - a.cap0) * (T * B) / a.cap_steps
             cap = min(a.cap1, cap + step_cap) if (recent < a.cap_gate and update > 0) else cap
         else:
             cap = a.cap0 + (a.cap1 - a.cap0) * min(1.0, steps_done / a.cap_steps)
         env.set_speed_cap(cap)
+        obs["speed_cap"] = (env.speed_cap / env.ecfg.v_max_policy)[:, None]
+        priv = env.privileged(env.last_result)
         kl_coef = a.kl_coef * max(0.0, 1.0 - steps_done / a.kl_decay)
         lr = a.lr + (a.lr_end - a.lr) * frac
         for g in opt.param_groups: g["lr"] = lr
@@ -121,29 +146,31 @@ def main():
             for t in range(T):
                 scan, pro = flatten_obs(obs)
                 with ac:
-                    act, logp = model.act(scan, pro)
+                    act, logp = sample_rollout_action(model, scan, pro)
                     val = model.critic(scan[lid], pro[lid], priv[lid]).float()
                 act, logp = act.float(), logp.float()
                 buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
-                obs, rew, term, trunc, info = env.step(act)
+                obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
                 priv = env.privileged(env.last_result)
                 buf_rew[t] = rew[lid]; buf_done[t] = term[lid].float(); buf_trunc[t] = trunc[lid].float()
+                buf_reward_components[t] = torch.stack([info["reward_components"][key][lid] for key in REWARD_COMPONENT_KEYS], 1)
                 ep_stats["lap_time"] += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
+                buf_final_val[t].zero_()
                 if "final" in info:
                     f = info["final"]; m = env.learner[f["ids"]]
+                    final_scan, final_pro = flatten_obs(info["final_obs"])
+                    with ac:
+                        final_val = model.critic(final_scan, final_pro, info["final_priv"]).float()
+                    all_final_val = torch.zeros(env.B, device=device)
+                    all_final_val[f["ids"]] = final_val
+                    buf_final_val[t] = all_final_val[lid]
+                    collision_history.extend(f["collided"][m].float().tolist())
                     ep_stats["return"] += f["return"][m].tolist(); ep_stats["progress"] += f["progress"][m].tolist()
                     ep_stats["collided"] += f["collided"][m].float().tolist(); ep_stats["steps"] += f["steps"][m].tolist()
             scan, pro = flatten_obs(obs)
             with ac:
                 buf_val[T] = model.critic(scan[lid], pro[lid], priv[lid]).float()
-            # GAE; truncation bootstraps with the state's own value (approximation)
-            adv = torch.zeros(T, B, device=device); last = torch.zeros(B, device=device)
-            for t in reversed(range(T)):
-                nonterm = 1.0 - buf_done[t]
-                next_v = torch.where(buf_trunc[t] > 0, buf_val[t], buf_val[t + 1])
-                delta = buf_rew[t] + a.gamma * next_v * nonterm - buf_val[t]
-                last = delta + a.gamma * a.lam * nonterm * (1.0 - buf_trunc[t]) * last
-                adv[t] = last
+            adv = compute_gae(buf_rew, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, a.lam)
             ret = adv + buf_val[:T]
         t_roll = tm.lap()
         # ---------------- update
@@ -190,6 +217,8 @@ def main():
                    "policy/log_std_steer": model.actor.log_std[0].item(), "policy/log_std_speed": model.actor.log_std[1].item(),
                    "time/rollout_s": t_roll, "time/update_s": t_upd, "time/env_steps_per_s": n / (t_roll + t_upd),
                    "time/elapsed_min": (time.time() - t_start) / 60}
+            log.update({f"reward/{key}_per_step": buf_reward_components[:, :, index].mean().item()
+                        for index, key in enumerate(REWARD_COMPONENT_KEYS)})
             if n_ep:
                 last_log = {"collision_rate": float(np.mean(ep_stats["collided"])), "progress_m": float(np.mean(ep_stats["progress"])),
                             "lap_time_s": float(np.mean(ep_stats["lap_time"])) if ep_stats["lap_time"] else float("nan")}

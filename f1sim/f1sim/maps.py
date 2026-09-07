@@ -96,6 +96,11 @@ def _load_base(name: str, **kw) -> Track:
     if name.startswith("gen:"):
         _, style, seed = (name.split(":") + ["0"])[:3]
         seed, obs = (seed.split("+obs") + [None])[:2]            # gen:competition:3+obs -> random lane obstacles
+        if obs:
+            obstacle_seed = int(obs)
+            t = Track.generate_random(int(seed), style=style, **kw)
+            n_obs = int(np.random.default_rng(obstacle_seed + 7).integers(1, 5))
+            return t.with_lane_obstacles(seed=obstacle_seed, n=n_obs)
         return Track.generate_random(int(seed), style=style, lane_obstacles=(obs is not None), **kw)
     if name.startswith("rt:"):
         n = name[3:]

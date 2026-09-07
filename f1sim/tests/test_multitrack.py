@@ -3,8 +3,16 @@ import numpy as np
 import torch
 
 from f1sim import Track, Config, Simulator, maps
+from f1sim.learn.common import TRAIN_TRACKS
 from f1sim.raceline import Raceline
 from f1sim.teacher import RacelineTeacher
+
+
+def test_training_set_contains_distinct_procedural_geometries() -> None:
+    assert len(TRAIN_TRACKS) == 112
+    assert sum(name.startswith("gen:competition:") for name in TRAIN_TRACKS) == 32
+    assert sum(name.startswith("gen:hallway:") for name in TRAIN_TRACKS) == 16
+    assert sum(name.startswith("gen:circuit:") for name in TRAIN_TRACKS) == 8
 
 
 def test_duplicated_track_matches_single_track():

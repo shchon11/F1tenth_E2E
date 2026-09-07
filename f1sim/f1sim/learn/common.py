@@ -21,19 +21,22 @@ WANDB_ENTITY = os.environ.get("WANDB_ENTITY")     # None -> the account's defaul
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "f1sim-e2e")
 
 
-# Training set (user-curated, 2026-09): real competition SLAM maps are the bulk, a few scaled F1
-# circuits and procedural tracks for variety, every map in both lap directions (~rev).
 REAL_TRAIN = ["icra2022", "blackbox2021_1", "blackbox2021_2", "blackbox2021_3", "blackbox2022_1", "blackbox2022_2"]
 RT_TRAIN = ["Spielberg", "Oschersleben"]
-GEN_TRAIN = ["gen:competition:1000", "gen:competition:1001"]          # 1000 CCW, 1001 mirrored (CW)
-TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in ("", "~rev")]
-                + [f"rt:{n}{d}" for n in RT_TRAIN for d in ("", "~rev")]
+GEN_TRAIN = ([f"gen:competition:{seed}" for seed in range(1000, 1016)]
+             + [f"gen:hallway:{seed}" for seed in range(1100, 1108)]
+             + [f"gen:circuit:{seed}" for seed in range(1200, 1204)])
+TRAIN_DIRECTIONS = ("", "~rev", "~mir", "~mir~rev")
+TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in TRAIN_DIRECTIONS]
+                + [f"rt:{n}{d}" for n in RT_TRAIN for d in TRAIN_DIRECTIONS]
                 + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]
-                # static box obstacles (CDC 2025 style cardboard boxes) on ~37 % of the tracks
-                + [f"real:{n}+obs{i}{d}" for i, n in enumerate(REAL_TRAIN) for d in ("", "~rev")])
+                + [f"real:{n}+obs{i}{d}" for i, n in enumerate(REAL_TRAIN) for d in TRAIN_DIRECTIONS])
 # Held out entirely: the Korea 2025 championship map (the target venue style) and one TU Wien race.
 EVAL_TRACKS = ["real:korea_2025_iccas", "real:korea_2025_iccas~rev", "real:blackbox2022_3", "real:blackbox2022_3~rev",
                "rt:Monza", "gen:competition:0"]
+EVAL_OBSTACLE_TRACKS = [f"{name}+obs{seed}{direction}"
+                       for name, seed in (("real:korea_2025_iccas", 101), ("real:blackbox2022_3", 102), ("gen:competition:0", 103))
+                       for direction in ("", "~rev")]
 
 
 def track_names(spec: str = "train") -> List[str]:
@@ -42,6 +45,8 @@ def track_names(spec: str = "train") -> List[str]:
         return list(TRAIN_TRACKS)
     if spec == "eval":
         return list(EVAL_TRACKS)
+    if spec == "eval_obstacles":
+        return list(EVAL_OBSTACLE_TRACKS)
     return [n.strip() for n in spec.split(",") if n.strip()]
 
 

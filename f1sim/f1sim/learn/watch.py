@@ -286,6 +286,37 @@ def latest_run() -> str:
     return best
 
 
+def viewer_config(compile_enabled: bool) -> Config:
+    config = Config()
+    config.sim.compile = compile_enabled
+    config.sim.compile_mode = "default" if compile_enabled else "none"
+    return config
+
+
+def actor_runner(model, device: torch.device, compile_enabled: bool):
+    import copy as _copy
+    actor = _copy.deepcopy(model.actor).eval()
+    for module in actor.modules():
+        module._forward_hooks.clear(); module._forward_pre_hooks.clear()
+    if not compile_enabled or device.type != "cuda":
+        return actor.forward
+    compiled = torch.compile(actor.forward, dynamic=False, mode="reduce-overhead")
+    state = {"call": compiled}
+
+    def run(scan, proprio):
+        try:
+            return state["call"](scan, proprio)
+        except RuntimeError:
+            state["call"] = actor.forward
+            return actor(scan, proprio)
+
+    return run
+
+
+def viewer_threaded(compile_enabled: bool) -> bool:
+    return not compile_enabled
+
+
 def main(argv=None):
     if argv is None and len(sys.argv) == 1:                  # no arguments: the launcher window
         from .watch_gui import ask
@@ -309,6 +340,7 @@ def main(argv=None):
     ap.add_argument("--gl", default="nvidia", choices=["nvidia", "amd"], help="GPU for the window's OpenGL: 'amd' renders on the integrated Radeon through Mesa (PRIME offload) and leaves the NVIDIA GPU to the simulation")
     ap.add_argument("--race-size", type=int, default=1, help="cars per race (>1: opponents in the scan)")
     ap.add_argument("--opponent", default="teacher", choices=["teacher", "policy"], help="who drives the other cars of a race")
+    ap.add_argument("--compile", action="store_true", help="compile CUDA graphs (slow first start; avoid beside training)")
     a = ap.parse_args(argv)
     if a.gl == "amd":                                            # must be set before the first GLX call (window creation)
         os.environ["__GLX_VENDOR_LIBRARY_NAME"] = "mesa"; os.environ["DRI_PRIME"] = "1"
@@ -327,11 +359,12 @@ def main(argv=None):
     sp = extra.get("spec") or {}                                              # the observation layout the policy was trained with
     need_rl = a.race_size > 1 and a.opponent == "teacher"
     tracks, rls = common.load_tracks([a.map], racelines=need_rl)
-    cfg = Config(); cfg.sim.compile_mode = "reduce-overhead"                  # CUDA graphs: the sim step is one launch
+    cfg = viewer_config(a.compile)
     n_cars = a.cars - a.cars % a.race_size
     env = common.make_env(tracks, n_cars, device, EnvConfig(speed_cap=a.speed_cap, action_mode=mode, race_size=a.race_size, opponent=a.opponent,
                                                              scan_stack=sp.get("scan_stack", 3), scan_stride=sp.get("scan_stride", 1),
-                                                             hist_len=sp.get("hist_len", 0), hist_stride=sp.get("hist_stride", 2)), cfg=cfg, rls=rls)
+                                                             hist_len=sp.get("hist_len", 0), hist_stride=sp.get("hist_stride", 2),
+                                                             compile_tracker=a.compile), cfg=cfg, rls=rls)
     def describe(ex, path):
         """One plain line about the checkpoint: which run, which iteration / update, how it was doing."""
         run = ex.get("run") or os.path.basename(os.path.dirname(path)); m = ex.get("metrics") or {}
@@ -378,23 +411,7 @@ def main(argv=None):
         if not headless: v.close()
         return
 
-    def compiled_act(m):
-        """The actor's mean as one CUDA graph (launch-bound next to a training job: 12 ms -> ~1 ms).
-        A hook-free copy: the Introspector's activation hooks would break the graph into eager pieces."""
-        import copy as _copy
-        actor = _copy.deepcopy(m.actor).eval()
-        for mod in actor.modules():
-            mod._forward_hooks.clear(); mod._forward_pre_hooks.clear()
-        if device.type != "cuda":
-            return lambda scan, pro: actor(scan, pro)
-        compiled = torch.compile(actor.forward, dynamic=False, mode="reduce-overhead"); box = {"f": compiled}
-        def f(scan, pro):
-            try:
-                return box["f"](scan, pro)
-            except Exception:
-                box["f"] = actor.forward; return actor(scan, pro)
-        return f
-    state["act_fn"] = compiled_act(model)
+    state["act_fn"] = actor_runner(model, device, a.compile)
 
     def step():
         nonlocal mtime, step_info
@@ -404,7 +421,7 @@ def main(argv=None):
                 mt = os.path.getmtime(ckpt_path)
                 if mt != mtime:
                     m2, ex = load_checkpoint(ckpt_path, device); m2.eval(); state["model"], state["extra"] = m2, ex
-                    intro.__init__(m2); mtime = mt; step_info = describe(ex, ckpt_path); state["act_fn"] = compiled_act(m2)
+                    intro.__init__(m2); mtime = mt; step_info = describe(ex, ckpt_path); state["act_fn"] = actor_runner(m2, device, a.compile)
             except Exception:
                 pass
         m = state["model"]
@@ -482,14 +499,14 @@ def main(argv=None):
             orig_render(); n["f"] += 1
             if time.time() > t_end: v.alive = False
         v.render = timed_render; t0 = time.time(); s0 = env.sim.t
-        v.run(step, realtime=not a.fast)
+        v.run(step, realtime=not a.fast, threaded=viewer_threaded(a.compile))
         dt = time.time() - t0
         print(f"bench: sim {(env.sim.t - s0) / dt:.2f}x real time, render {n['f'] / dt:.1f} fps, {a.cars} cars, {dt:.0f} s", flush=True)
         k = max(1, state.get("k", 1)); print("  per step:", {kk: f"{vv / k * 1e3:.1f} ms" for kk, vv in state.get("prof", {}).items()}, flush=True)
         v.close(); torch.cuda.synchronize() if device.type == "cuda" else None; os._exit(0)
     if not headless:
         try:
-            v.run(step, realtime=not a.fast)
+            v.run(step, realtime=not a.fast, threaded=viewer_threaded(a.compile))
             v.close(); torch.cuda.synchronize() if device.type == "cuda" else None
             os._exit(0)                                          # skip interpreter teardown: CUDA-graph state from the sim thread crashes it
         except KeyboardInterrupt:
