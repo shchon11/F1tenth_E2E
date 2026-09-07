@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import os
 import time
 
@@ -43,6 +44,7 @@ def main():
     ap.add_argument("--proximity-penalty", type=float, default=0.1, help="per-step penalty at zero wall gap (0 = off)")
     ap.add_argument("--safe-dist", type=float, default=0.30, help="[m] body-to-wall gap where the proximity penalty starts")
     ap.add_argument("--wrong-way-penalty", type=float, default=0.2, help="per-step penalty while facing backwards along the lane")
+    ap.add_argument("--init-log-std", type=float, default=None, help="reset the actor's exploration log-std at start (default: -1.8 in the plan space, whose curvature knots tolerate far less noise than steer/speed; unchanged otherwise)")
     ap.add_argument("--episode-s", type=float, default=40.0)
     ap.add_argument("--scan-stack", type=int, default=3); ap.add_argument("--scan-stride", type=int, default=1, help="control steps between stacked scans")
     ap.add_argument("--race-size", type=int, default=1, help="cars per track instance (>1: opponents in the LiDAR, car-car collisions)")
@@ -71,6 +73,10 @@ def main():
         print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing")
     else:
         model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim).to(device)
+    init_log_std = a.init_log_std if a.init_log_std is not None else (-1.8 if a.action_mode == "plan" else None)
+    if init_log_std is not None:
+        with torch.no_grad(): model.actor.log_std.fill_(init_log_std)
+        print(f"actor log_std reset to {init_log_std} (std {math.exp(init_log_std):.3f})")
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters(): p_.requires_grad_(False)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
