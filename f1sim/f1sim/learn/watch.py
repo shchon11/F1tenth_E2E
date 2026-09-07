@@ -320,11 +320,14 @@ def main(argv=None):
     if act_dim not in (2, PLAN_DIM):
         raise SystemExit(f"{ckpt_path}: action dim {act_dim} is from an older plan representation (the current one has {PLAN_DIM}); pick a newer run")
     mode = "plan" if act_dim == PLAN_DIM else "direct"                       # plan-space policies drive through the tracker
+    sp = extra.get("spec") or {}                                              # the observation layout the policy was trained with
     need_rl = a.race_size > 1 and a.opponent == "teacher"
     tracks, rls = common.load_tracks([a.map], racelines=need_rl)
     cfg = Config(); cfg.sim.compile_mode = "reduce-overhead"                  # CUDA graphs: the sim step is one launch
     n_cars = a.cars - a.cars % a.race_size
-    env = common.make_env(tracks, n_cars, device, EnvConfig(speed_cap=a.speed_cap, action_mode=mode, race_size=a.race_size, opponent=a.opponent), cfg=cfg, rls=rls)
+    env = common.make_env(tracks, n_cars, device, EnvConfig(speed_cap=a.speed_cap, action_mode=mode, race_size=a.race_size, opponent=a.opponent,
+                                                             scan_stack=sp.get("scan_stack", 3), scan_stride=sp.get("scan_stride", 1),
+                                                             hist_len=sp.get("hist_len", 0), hist_stride=sp.get("hist_stride", 2)), cfg=cfg, rls=rls)
     def describe(ex, path):
         """One plain line about the checkpoint: which run, which iteration / update, how it was doing."""
         run = ex.get("run") or os.path.basename(os.path.dirname(path)); m = ex.get("metrics") or {}

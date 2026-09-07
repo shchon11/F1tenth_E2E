@@ -17,11 +17,14 @@ from .obs import flatten_obs
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct") -> dict:
     trs, rls = common.load_tracks(tracks, racelines=teacher)
-    model = None
+    model = None; _ = {}
     if not teacher:
         model, _ = load_checkpoint(ckpt, device); model.eval()
     mode = "plan" if (model is not None and model.meta.get("act_dim", 2) >= 5) or (teacher and action_mode == "plan") else "direct"
-    env = common.make_env(trs, envs, device, EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode), cfg=cfg, seed=seed)
+    sp = (_ if teacher else _).get("spec", {}) if not teacher else {}
+    env = common.make_env(trs, envs, device, EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
+                                                        scan_stack=sp.get("scan_stack", 3), scan_stride=sp.get("scan_stride", 1),
+                                                        hist_len=sp.get("hist_len", 0), hist_stride=sp.get("hist_stride", 2)), cfg=cfg, seed=seed)
     env.sim.warmup()
     if teacher:
         t = common.make_teacher(rls, env)
