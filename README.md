@@ -335,6 +335,8 @@ mirrored via the `~rev` / `~mir` modifiers, plus the 6 real maps with static box
 Mirroring came in after ppo_v9, which had been trained on the 8 unmirrored layouts: deterministic,
 20 s per car, 6 m/s cap, it crashed 0.05/car on its training layouts, 0.36 on their mirror images
 (teacher 0.06) and 0.23 on the held-out maps (teacher 0.01) -- memorized layouts, not geometry.
+Its final checkpoint (120M steps, cap 8) sat at 0.35 mirrored / 0.28 held-out: more training on
+the same layouts did not transfer at all. ppo_v10 continues from it on the mirrored set.
 Held-out eval = `common.EVAL_TRACKS` (real:korea_2025_iccas and
 real:blackbox2022_3 both ways, rt:Monza, gen:competition:0); `--tracks` takes `train`, `eval` or a
 comma separated catalog list; W&B project `f1sim-e2e`; runs and checkpoints under
