@@ -329,9 +329,13 @@ last 2 actions, speed cap); reward = centerline progress - 10 * collision - 0.05
 - 0.1 * proximity (linear ramp once the body-to-wall gap is under 0.30 m: a mild safety margin,
 hugging the hose on the racing line is still allowed); speed cap
 curriculum 4 -> 8 m/s; train tracks = `common.TRAIN_TRACKS` (user-curated: 6 real competition
-SLAM maps + rt:Spielberg/Oschersleben + 2 gen:competition seeds, each in both lap directions via
-the `~rev` modifier, plus the 6 real maps with static box obstacles (`+obs<seed>`, one box per
-~35 m of lane, both directions: 32 tracks, 37 % with obstacles), held-out eval = `common.EVAL_TRACKS` (real:korea_2025_iccas and
+SLAM maps + rt:Spielberg/Oschersleben + 2 gen:competition seeds, each in both lap directions and
+mirrored via the `~rev` / `~mir` modifiers, plus the 6 real maps with static box obstacles
+(`+obs<seed>`, one box per ~35 m of lane, all four variants: 60 tracks, 40 % with obstacles).
+Mirroring came in after ppo_v9, which had been trained on the 8 unmirrored layouts: deterministic,
+20 s per car, 6 m/s cap, it crashed 0.05/car on its training layouts, 0.36 on their mirror images
+(teacher 0.06) and 0.23 on the held-out maps (teacher 0.01) -- memorized layouts, not geometry.
+Held-out eval = `common.EVAL_TRACKS` (real:korea_2025_iccas and
 real:blackbox2022_3 both ways, rt:Monza, gen:competition:0); `--tracks` takes `train`, `eval` or a
 comma separated catalog list; W&B project `f1sim-e2e`; runs and checkpoints under
 `~/f1sim_runs/<name>/`. Track galleries: `docs/tracks_*.png` (`scripts/track_gallery.py`).
@@ -360,7 +364,13 @@ ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:2 policy:
 ```bash
 python3 -m f1sim.learn.watch --run ~/f1sim_runs/ppo_v3 --map gen:competition:2 --cars 128        # window, reloads ppo_latest.pt as it changes
 python3 -m f1sim.learn.watch --run ~/f1sim_runs/ppo_v2/ppo_final.pt --cars 256 --record out.mp4  # headless recording (ffmpeg)
+python3 -m f1sim.learn.watch                                                                      # no arguments: launcher window
 ```
+The launcher window picks the run (newest by default), map, cars, cap, opponents, GPU for the
+window, and has "save a video instead of opening a window": a headless 30 fps mp4 of the chosen
+length into `~/f1sim_runs/videos/`, named after the run, map and time. On the command line the
+same is `--record out.mp4 --seconds 20 --fps 30`; `--frames dir/` writes PNGs instead and
+`--highlights dir/ --episodes N` records the best car of each of N episodes.
 Runs its own simulator with N agents on the latest checkpoint of a training run (auto-reload), so
 training is not slowed by rendering. On screen: the focus car's LiDAR points colored by saliency
 (red = beams the policy's action depends on most), the 256 hidden units and 256 scan features as

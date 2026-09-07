@@ -22,15 +22,19 @@ WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "f1sim-e2e")
 
 
 # Training set (user-curated, 2026-09): real competition SLAM maps are the bulk, a few scaled F1
-# circuits and procedural tracks for variety, every map in both lap directions (~rev).
+# circuits and procedural tracks for variety, every map in both lap directions (~rev) and mirrored
+# (~mir). Mirroring was added after ppo_v9: a student trained on the 8 unmirrored layouts crashed
+# 0.05/car/20 s on them but 0.36 on their mirror images (teacher 0.06) -- it had memorized the
+# layouts, not learned geometry -- and 0.23 on the held-out maps.
 REAL_TRAIN = ["icra2022", "blackbox2021_1", "blackbox2021_2", "blackbox2021_3", "blackbox2022_1", "blackbox2022_2"]
 RT_TRAIN = ["Spielberg", "Oschersleben"]
 GEN_TRAIN = ["gen:competition:1000", "gen:competition:1001"]          # 1000 CCW, 1001 mirrored (CW)
-TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in ("", "~rev")]
-                + [f"rt:{n}{d}" for n in RT_TRAIN for d in ("", "~rev")]
-                + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]
-                # static box obstacles (CDC 2025 style cardboard boxes) on ~37 % of the tracks
-                + [f"real:{n}+obs{i}{d}" for i, n in enumerate(REAL_TRAIN) for d in ("", "~rev")])
+DIRS = ("", "~rev", "~mir", "~mir~rev")
+TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in DIRS]
+                + [f"rt:{n}{d}" for n in RT_TRAIN for d in DIRS]
+                + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]   # 1001 already is 1000's mirror
+                # static box obstacles (CDC 2025 style cardboard boxes) on 40 % of the tracks
+                + [f"real:{n}+obs{i}{d}" for i, n in enumerate(REAL_TRAIN) for d in DIRS])
 # Held out entirely: the Korea 2025 championship map (the target venue style) and one TU Wien race.
 EVAL_TRACKS = ["real:korea_2025_iccas", "real:korea_2025_iccas~rev", "real:blackbox2022_3", "real:blackbox2022_3~rev",
                "rt:Monza", "gen:competition:0"]

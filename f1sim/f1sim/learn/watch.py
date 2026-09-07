@@ -89,7 +89,7 @@ def panel_image(sal, mu, std, value, speed_cap, step_info, plan_ref=None, cmd=No
         col = (int(255 * min(1, 0.2 + 1.2 * v)), int(230 * max(0, 1 - 1.4 * v)), int(200 * (1 - v)), 255)
         d.line((cx + 12 * np.sin(a_), cy - 12 * np.cos(a_), ex, ey), fill=col, width=3)
     d.polygon([(cx, cy - 10), (cx - 6, cy + 7), (cx + 6, cy + 7)], fill=(235, 235, 240, 255))   # the car, nose up
-    d.text((10, 222), "red sectors: beams that change the decision most", font=ft, fill=(255, 160, 130, 255))
+    d.text((10, 222), "red = beams that matter most", font=ft, fill=(255, 160, 130, 255))
     d.text((10, 236), "(same colours on the 3D scan points)", font=ft, fill=(170, 180, 200, 255))
     # decision
     d.text((220, 6), "what it decided", font=f, fill=(255, 255, 255, 255))
@@ -104,13 +104,13 @@ def panel_image(sal, mu, std, value, speed_cap, step_info, plan_ref=None, cmd=No
             col = (int(255 * t) if t > 0.5 else int(51 + 0 * t), int(140 + 110 * min(1, 2 * t)) if t < 0.5 else int(250 - 80 * (t - 0.5) * 2), int(255 * (1 - 2 * t)) if t < 0.5 else 40, 255)
             d.line((pts[i], pts[i + 1]), fill=col, width=4)
         d.polygon([(px + pw / 2, py + ph - 16), (px + pw / 2 - 5, py + ph - 4), (px + pw / 2 + 5, py + ph - 4)], fill=(235, 235, 240, 255))
-        d.text((px, py + ph + 4), f"planned path, next {max(0.1, float(np.linalg.norm(plan_ref[-1, :2]))):.1f} m; colour = speed", font=ft, fill=(200, 210, 225, 255))
+        d.text((px, py + ph + 4), f"path ahead {max(0.1, float(np.linalg.norm(plan_ref[-1, :2]))):.1f} m, colour = speed", font=ft, fill=(200, 210, 225, 255))
         d.text((365, 30), "planned speed", font=fs, fill=(230, 230, 235, 255))
         d.text((365, 48), f"now  {vs[3]:.1f} m/s", font=fs, fill=(230, 230, 235, 255))
         d.text((365, 66), f"end  {vs[-1]:.1f} m/s", font=fs, fill=(230, 230, 235, 255))
         d.text((365, 84), f"cap  {speed_cap:.1f} m/s", font=fs, fill=(160, 170, 190, 255))
-        d.text((365, 112), "noise (exploration)", font=ft, fill=(160, 170, 190, 255))
-        d.text((365, 126), f"curvature +-{float(np.mean(std[:-2])) * 1.6:.2f} 1/m", font=ft, fill=(160, 170, 190, 255))
+        d.text((365, 112), "exploration noise", font=ft, fill=(160, 170, 190, 255))
+        d.text((365, 126), f"curv. +-{float(np.mean(std[:-2])) * 1.6:.2f} /m", font=ft, fill=(160, 170, 190, 255))
         d.text((365, 140), f"speed +-{float(np.mean(std[-2:])) * 4:.1f} m/s", font=ft, fill=(160, 170, 190, 255))
     else:
         def gauge(y, name, m, s_, txt):
@@ -123,10 +123,9 @@ def panel_image(sal, mu, std, value, speed_cap, step_info, plan_ref=None, cmd=No
         d.text((225, 134), "blue band = exploration noise around the mean", font=ft, fill=(160, 170, 190, 255))
     if value is not None and not (isinstance(value, float) and math.isnan(value)):
         d.text((225, 208), f"critic's value estimate {value:6.1f}", font=ft, fill=(200, 210, 225, 255))
-    if step_info:
-        d.text((225, 224), step_info[:64], font=ft, fill=(180, 190, 210, 255))
-    d.text((10, 258), "given: last 3 LiDAR scans, VESC speed, IMU, roll/pitch estimate, its last 2 actions", font=ft, fill=(150, 160, 180, 255))
-    d.text((10, 274), "not given: map, position, opponents' positions  (LiDAR-only, end to end)", font=ft, fill=(150, 160, 180, 255))
+    # (which checkpoint this is stands in the HUD's POLICY line; repeating it here collided with the caption)
+    d.text((10, 258), "given: 3 LiDAR scans, VESC speed, IMU, roll/pitch, 1 s history", font=ft, fill=(150, 160, 180, 255))
+    d.text((10, 274), "not given: map, pose, opponents' poses  (LiDAR-only, end to end)", font=ft, fill=(150, 160, 180, 255))
     return img
 
 

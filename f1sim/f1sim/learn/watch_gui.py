@@ -2,9 +2,12 @@
 view settings, press Start. Returns the argument list for f1sim.learn.watch.main."""
 import glob
 import os
+import time
 from typing import Optional
 
 from . import common
+
+VIDEO_DIR = os.path.join(common.RUNS_DIR, "videos")   # recordings from the launcher
 
 
 def _runs():
@@ -46,6 +49,9 @@ def ask() -> Optional[list]:
     internals = tk.BooleanVar(value=False); line("show raw network activations", ttk.Checkbutton(f, variable=internals))
     fast = tk.BooleanVar(value=False); line("run as fast as possible (no real-time pacing)", ttk.Checkbutton(f, variable=fast))
     gl = tk.StringVar(value="nvidia"); line("render the window on", ttk.Combobox(f, textvariable=gl, values=["nvidia", "amd"], width=12, state="readonly"))
+    rec = tk.BooleanVar(value=False); line("save a video instead of opening a window", ttk.Checkbutton(f, variable=rec))
+    secs = tk.DoubleVar(value=20.0); line("video length [s]", ttk.Spinbox(f, from_=2.0, to=600.0, increment=5.0, textvariable=secs, width=8))
+    ttk.Label(f, text=f"headless, 30 fps mp4 into {VIDEO_DIR} (named after the run, map and time)", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w"); row[0] += 1
     ttk.Label(f, text="'amd' draws through Mesa on the integrated Radeon so the NVIDIA GPU only runs the simulation", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w"); row[0] += 1
     ttk.Label(f, text="in the viewer:  C camera   [ ] other car   L lidar   T trails   S screenshot   space pause", foreground="#666").grid(row=row[0], column=0, columnspan=2, sticky="w", pady=(8, 0)); row[0] += 1
     out = {"args": None}
@@ -56,6 +62,10 @@ def ask() -> Optional[list]:
         if internals.get(): args.append("--internals")
         if fast.get(): args.append("--fast")
         args += ["--gl", gl.get()]
+        if rec.get():
+            os.makedirs(VIDEO_DIR, exist_ok=True)
+            tag = f"{os.path.basename(run.get().rstrip('/')) or 'latest'}_{mp.get().replace(':', '-').replace('~', '_')}_{time.strftime('%m%d-%H%M%S')}.mp4"
+            args += ["--record", os.path.join(VIDEO_DIR, tag), "--seconds", str(secs.get())]
         out["args"] = args; root.destroy()
     b = ttk.Frame(f); b.grid(row=row[0], column=0, columnspan=2, pady=(12, 0))
     ttk.Button(b, text="Start", command=start).grid(row=0, column=0, padx=6); ttk.Button(b, text="Cancel", command=root.destroy).grid(row=0, column=1, padx=6)
