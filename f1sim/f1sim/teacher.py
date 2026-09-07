@@ -32,14 +32,20 @@ class RacelineTeacher:
         self.device = torch.device(device)
         rls = [raceline] if isinstance(raceline, Raceline) else list(raceline)     # one per track id
         N = max(len(r.xy) for r in rls)
+        # speed profiles per grip level: the teacher is privileged, so it brakes and corners for the
+        # friction *this* car has (a_lat, a_brake, a_acc all scale with grip), not for a nominal car
+        from .raceline import speed_profile
+        self.grip_levels = np.linspace(0.45, 1.0, 12)      # never faster than the nominal profile: above nominal grip the
+                                                            # limit is tracking error, not the tyres (measured: faster = more crashes)
         xy, v, kap = [], [], []
         for r in rls:
             xr = resample_closed(r.xy, N)
-            s_old = r.s; s_new = np.linspace(0, r.length, N, endpoint=False)
-            xy.append(xr); v.append(np.interp(s_new, np.concatenate([s_old, [r.length]]), np.concatenate([r.v, r.v[:1]])))
-            kap.append(curvature(xr))
+            xy.append(xr); kap.append(curvature(xr))
+            v.append(np.stack([speed_profile(xr, 10.0, 6.0 * g, 4.0 * g, 3.0 * g) for g in self.grip_levels]))   # (K, N)
         self.xy = torch.tensor(np.stack(xy), dtype=torch.float32, device=self.device)     # (T, N, 2)
-        self.v = torch.tensor(np.stack(v), dtype=torch.float32, device=self.device)       # (T, N)
+        self.v_grip = torch.tensor(np.stack(v), dtype=torch.float32, device=self.device)  # (T, K, N)
+        self.v = self.v_grip[:, -1]                                                        # nominal grip (T, N)
+        self.grip_levels_t = torch.tensor(self.grip_levels, dtype=torch.float32, device=self.device)
         self.kappa = torch.tensor(np.stack(kap), dtype=torch.float32, device=self.device) # (T, N) left +
         tan = torch.roll(self.xy, -1, 1) - torch.roll(self.xy, 1, 1)
         self.tan = tan / tan.norm(dim=2, keepdim=True).clamp_min(1e-9)                     # (T, N, 2)
@@ -103,11 +109,24 @@ class RacelineTeacher:
         # speeds from the profile: 0.15 s ahead and at the end of the plan
         v_idx0 = (idx + ((vx.abs() * spec.v_cmd_lead) / ds).round().long()) % self.N
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
-        v0 = self.v[tid, v_idx0] * self.speed_scale; v1 = self.v[tid, v_idx1] * self.speed_scale
-        if P is not None:
-            grip = torch.sqrt(((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(0.3, 1.5))
-            v0 = v0 * grip; v1 = v1 * grip
+        gb = self.grip_bin(P, B, dev)
+        v0 = self.speed_at(tid, v_idx0, gb); v1 = self.speed_at(tid, v_idx1, gb)
         return encode(k, v0, v1, v_max, spec)
+
+    def grip_bin(self, P, B: int, device):
+        """Index of the speed profile matching each env's grip (privileged); nominal when P is None."""
+        if P is None:
+            return torch.full((B,), len(self.grip_levels) - 1, dtype=torch.long, device=device)
+        g = ((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(max=1.0)
+        return (g[:, None] - self.grip_levels_t[None]).abs().argmin(1)
+
+    speed_mode = "grip"          # "grip": per-grip profiles (braking points move too); "sqrt": nominal profile x sqrt(grip)
+
+    def speed_at(self, tid: torch.Tensor, idx: torch.Tensor, gb: torch.Tensor) -> torch.Tensor:
+        if self.speed_mode == "sqrt":
+            g = self.grip_levels_t[gb]
+            return self.v[tid, idx] * torch.sqrt(g) * self.speed_scale
+        return self.v_grip[tid, gb, idx] * self.speed_scale
 
     def project(self, xy: torch.Tensor, tid: Optional[torch.Tensor] = None):
         tid = torch.zeros(xy.shape[0], dtype=torch.long, device=xy.device) if tid is None else tid
@@ -158,10 +177,9 @@ class RacelineTeacher:
             steer = ff + self.k_psi * psi - torch.atan(self.k_e * e / (vx.abs() + self.v_soft))
         steer = steer.clamp(-self.steer_max, self.steer_max)
         v_idx = (idx + ((vx.abs() * self.t_v) / ds).round().long()) % self.N
-        v_cmd = self.v[tid, v_idx] * self.speed_scale
+        v_cmd = self.speed_at(tid, v_idx, self.grip_bin(P, xy.shape[0], xy.device))
         v_cmd = v_cmd * (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)   # slow down when off-line
         if P is not None:
-            grip = (P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)
-            v_cmd = v_cmd * torch.sqrt(grip.clamp(0.3, 1.5)) / P["speed_gain"]
+            v_cmd = v_cmd / P["speed_gain"]
             steer = ((steer - P["steer_bias"]) / P["steer_gain"]).clamp(-self.steer_max, self.steer_max)
         return torch.stack([steer, v_cmd], 1)
