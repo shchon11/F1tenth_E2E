@@ -49,6 +49,7 @@ TRAIN_TRACKS = _train_set(REAL_TRAIN)                          # 144 tracks (ppo
 TRAIN_TRACKS_V10 = _train_set(REAL_TRAIN_V10, pockets=False)   # 60 tracks: what ppo_v10 trains on (evaluate it on this)
 # Held out entirely: the Korea 2025 championship map (the target venue style) and one TU Wien race.
 EVAL_TRACKS = ["real:korea_2025_iccas", "real:korea_2025_iccas~rev", "real:blackbox2022_3", "real:blackbox2022_3~rev",
+               "real:blackbox2022_3~lane", "real:blackbox2022_3~lane~rev",       # the same hall with its forks walled off
                "rt:Monza", "gen:competition:0"]
 
 

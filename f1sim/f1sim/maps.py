@@ -79,13 +79,14 @@ def _with_auto_centerline(track: Track, min_clearance: float, seed_xy=None) -> T
     return track
 
 
-MODIFIERS = ("~rev", "~mir")
+MODIFIERS = ("~rev", "~mir", "~lane")
 _BASE_CACHE = {}
 
 
 def load(name: str, **kw) -> Track:
     """Catalog loader. Trailing modifiers: `~rev` = same map driven the other way round,
-    `~mir` = mirrored map (e.g. real:icra2022~rev, rt:Monza~mir~rev)."""
+    `~mir` = mirrored map (e.g. real:icra2022~rev, rt:Monza~mir~rev), `~lane` = side rooms and
+    dead-end corridors of the map walled off (Track.lane_only)."""
     mods = []
     while name.endswith(MODIFIERS):
         for m in MODIFIERS:
@@ -96,7 +97,7 @@ def load(name: str, **kw) -> Track:
         _BASE_CACHE[ck] = _load_base(name, **kw)
     t = _BASE_CACHE[ck]
     for m in reversed(mods):
-        t = t.reversed() if m == "~rev" else t.mirrored()
+        t = t.reversed() if m == "~rev" else t.mirrored() if m == "~mir" else t.lane_only()
     return t
 
 

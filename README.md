@@ -359,7 +359,13 @@ over 200 updates, the same pockets trapping the same cars), and the log said why
 0.027 after 200 updates. The KL-to-init term (1.0, decaying over 40M steps) was meant to protect the
 DAgger init in ppo_v9; every warm-started run re-armed it and spent its first ~300 updates pinned
 to its start. ppo_v13 = from ppo_v12's checkpoint with `--kl-coef 0.2 --kl-decay 10e6` and the elbow
-pockets. ppo_v11 starts
+pockets. ppo_v13 at update 300 had the pocket tracks at 0.07, equal to plain -- and blackbox2022_3
+unchanged at ~1.0: the learned avoidance does not transfer to that hall's real corridors. Filling
+the map's 41 m2 of side rooms and corridors (`~lane`, `Track.lane_only`) takes the same checkpoint
+to 0.05 (forward 0.00, reverse 0.09), so the whole remaining held-out gap is fork ambiguity on one
+map: at a genuine fork a LiDAR-only policy has no local cue for which branch is the track. The
+held-out set now carries blackbox2022_3 both ways, so "can it drive the geometry" (yes, teacher
+level on every held-out map) and "does it enter forks" (still yes) are reported separately. ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
 at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else
 at most 0.06.

@@ -201,6 +201,23 @@ class Track:
         return Track.from_occupancy(occ, res, (origin[0], origin[1]), cl, name, duct=duct, tall=tall,
                                     duct_height=duct_height)
 
+    def lane_only(self, margin: float = 0.3) -> "Track":
+        """Copy of the track with every free cell farther from the centerline than the local half-width
+        (+ margin) filled in: side rooms, dead-end corridors and other openings of a SLAM map are walled
+        off, the lane itself is untouched. Used as the `~lane` catalog modifier to separate 'can the
+        policy drive this geometry' from 'does it fall into that hall's forks': ppo_v13 on
+        blackbox2022_3 crashed 1.00/car/20 s, on blackbox2022_3~lane 0.05."""
+        from scipy.spatial import cKDTree
+        cl = self.centerline; res = self.resolution; H, W = self.occupancy.shape
+        rc = np.stack([(cl[:, 1] - self.origin[1]) / res, (cl[:, 0] - self.origin[0]) / res])
+        hw = ndimage.map_coordinates(self.edt, rc, order=1, mode="nearest")     # local half-width per centerline point
+        free = ~self.occupancy; fr, fc = np.nonzero(free)
+        d, j = cKDTree(cl).query(np.stack([fc * res + self.origin[0], fr * res + self.origin[1]], 1))
+        fill = np.zeros_like(free); fill[fr[d > hw[j] + margin], fc[d > hw[j] + margin]] = True
+        t = Track.from_occupancy(self.occupancy | fill, res, self.origin, cl, self.name + "l", duct_height=self.duct_height)
+        t.base = self if self.base is None else self.base                      # same raceline
+        return t
+
     def with_pockets(self, seed: int = 0, n: int = 3, depth=(1.0, 4.0), width=(0.8, 2.4), min_spacing: float = 5.0,
                      p_bend: float = 0.6, p_elbow: float = 0.5) -> "Track":
         """Copy of the track with n dead-end side pockets carved into the boundary and walled with duct

@@ -50,3 +50,17 @@ def test_pockets_are_walled_dead_ends_off_the_lane():
     assert np.allclose(Raceline.build_cached(t).xy, Raceline.build_cached(b).xy)       # raceline ignores pockets
     m = maps.load("real:blackbox2021_1+pk0~mir~rev")
     assert m.base is not None and np.allclose(Raceline.build_cached(m).xy, Raceline.build_cached(maps.load("real:blackbox2021_1~mir~rev")).xy)
+
+
+def test_lane_only_walls_off_side_rooms_but_not_the_lane():
+    import numpy as np
+    from f1sim import maps
+    from f1sim.raceline import Raceline
+    b = maps.load("real:blackbox2022_3"); t = maps.load("real:blackbox2022_3~lane")
+    filled = (~b.occupancy & t.occupancy).sum() * t.resolution ** 2
+    assert 20 < filled < 80, filled                                               # its alcoves and corridors (~41 m2)
+    assert not (t.occupancy & ~b.occupancy & False).any()
+    cl = t.centerline; c = np.round((cl[:, 0] - t.origin[0]) / t.resolution).astype(int); r = np.round((cl[:, 1] - t.origin[1]) / t.resolution).astype(int)
+    assert not t.occupancy[r, c].any()                                            # centerline still free
+    assert np.allclose(Raceline.build_cached(t).xy, Raceline.build_cached(b).xy)   # same raceline
+    assert len(maps.load("real:blackbox2022_3~lane~rev").centerline) == len(cl)
