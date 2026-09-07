@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--proximity-penalty", type=float, default=0.1, help="per-step penalty at zero wall gap (0 = off)")
     ap.add_argument("--safe-dist", type=float, default=0.30, help="[m] body-to-wall gap where the proximity penalty starts")
     ap.add_argument("--wrong-way-penalty", type=float, default=0.2, help="per-step penalty while facing backwards along the lane")
+    ap.add_argument("--collision-speed-penalty", type=float, default=0.0, help="extra collision penalty per m/s of impact speed")
     ap.add_argument("--init-log-std", type=float, default=None, help="reset the actor's exploration log-std at start (default: -1.8 in the plan space, whose curvature knots tolerate far less noise than steer/speed; unchanged otherwise)")
     ap.add_argument("--episode-s", type=float, default=40.0)
     ap.add_argument("--scan-stack", type=int, default=3); ap.add_argument("--scan-stride", type=int, default=1, help="control steps between stacked scans")
@@ -59,7 +60,8 @@ def main():
     tracks, rls = common.load_tracks(names, racelines=need_rl)
     env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.cap0, reward_collision=-abs(a.collision_penalty),
                                                               reward_steer_rate=a.steer_penalty, reward_proximity=a.proximity_penalty,
-                                                              safe_dist=a.safe_dist, reward_wrong_way=a.wrong_way_penalty, max_steps=int(a.episode_s * 40),
+                                                              safe_dist=a.safe_dist, reward_wrong_way=a.wrong_way_penalty,
+                                                              reward_collision_speed=a.collision_speed_penalty, max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride,
                                                               race_size=a.race_size, opponent=a.opponent,
                                                               opp_speed_range=tuple(a.opp_speed), action_mode=a.action_mode), seed=a.seed, rls=rls)
