@@ -49,6 +49,8 @@ class EnvConfig:
     proximity_speed_ref: float = 0.0 # [m/s] >0: the proximity penalty is scaled by (1 + v / ref): fast past a wall costs more than creeping
     reward_wrong_way: float = 0.2    # per step while facing backwards along the lane (progress is signed anyway; this makes it explicit)
     reward_collision_speed: float = 0.0   # extra collision penalty per m/s of speed at impact (a fast crash costs more than a nudge)
+    reward_plan_clearance: float = 0.0    # plan mode: per-step penalty when the planned path passes closer than plan_margin to a wall
+    plan_margin: float = 0.35             # [m] (the raceline keeps 0.40): a dense "do not plan into walls" signal, the planner's safety hook
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
     reward_alive: float = 0.0
     spawn_lateral_std: float = 0.3
@@ -121,6 +123,7 @@ class F1VecEnv:
         self.ep_progress = torch.zeros(self.B, device=self.device)
         self.last_result: Optional[StepResult] = None
         self._empty_long = torch.zeros(0, dtype=torch.long, device=self.device); self._empty_float = torch.zeros(0, device=self.device)
+        self._no_plan = torch.zeros(self.B, 1, 4, device=self.device)
         self.single_observation_space, self.single_action_space = self._spaces()
 
     def _spaces(self):
@@ -290,8 +293,9 @@ class F1VecEnv:
         self.last_cmd = cmd
         e = self.ecfg
         self.ep_step += 1
+        plan_ref = self.tracker.last_ref if (self.tracker is not None and e.reward_plan_clearance > 0) else self._no_plan
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
-                         self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap)
+                         self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap, plan_ref)
         self.scan_hist, steer_rate, reward, self.act_hist, terminated, truncated, crossed, done, self.ep_return, self.ep_progress, flags = (t.clone() for t in out)
         self.prev_steer_norm = steer_norm; self.prev_action = a
         if self.hist is not None:
@@ -334,7 +338,7 @@ class F1VecEnv:
         return obs, reward, terminated, truncated, info
 
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
-                   ep_return, ep_progress, prev_lap):
+                   ep_return, ep_progress, prev_lap, plan_ref):
         """Reward, histories and episode flags as pure tensor math (compiled into one CUDA graph when
         the sim runs in reduce-overhead mode: next to a training job every small kernel waits its turn)."""
         e = self.ecfg
@@ -348,8 +352,16 @@ class F1VecEnv:
             _, yaw_c = self.sim.track.pose_at_s(s, tid)
             wrong_way = (torch.cos(state[:, 2] - yaw_c) < 0.0).float()      # more than 90 deg off the lane direction
         crash = collision.float()
+        plan_pen = torch.zeros_like(wall_dist)
+        if e.reward_plan_clearance > 0 and plan_ref.shape[1] > 1:      # clearance of the planned path (world frame) on the map
+            c, sn = torch.cos(state[:, 2])[:, None], torch.sin(state[:, 2])[:, None]
+            px = state[:, 0:1] + plan_ref[:, :, 0] * c - plan_ref[:, :, 1] * sn
+            py = state[:, 1:2] + plan_ref[:, :, 0] * sn + plan_ref[:, :, 1] * c
+            clr = self.sim.track.sample_edt(torch.stack([px, py], -1), tid[:, None]).min(1).values - 0.5 * self.cfg.vehicle.width
+            plan_pen = (e.plan_margin - clr).clamp(min=0.0) / e.plan_margin
         reward = (e.reward_progress * progress + e.reward_collision * crash - e.reward_collision_speed * crash * state[:, 3].abs()
-                  - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity - e.reward_wrong_way * wrong_way + e.reward_alive)
+                  - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity - e.reward_wrong_way * wrong_way
+                  - e.reward_plan_clearance * plan_pen + e.reward_alive)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         terminated = collision.clone()
         truncated = (~terminated) & ((ep_step >= e.max_steps) | (lap >= e.laps))

@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--collision-speed-penalty", type=float, default=0.0, help="extra collision penalty per m/s of impact speed")
     ap.add_argument("--cap-gate", type=float, default=0.0, help=">0: the speed cap only rises while the recent collision rate is below this (safety before speed)")
     ap.add_argument("--proximity-speed-ref", type=float, default=0.0, help="[m/s] scale the proximity penalty by (1 + v/ref)")
+    ap.add_argument("--plan-clearance-penalty", type=float, default=0.0, help="plan mode: per-step penalty when the planned path runs closer than --plan-margin to a wall")
+    ap.add_argument("--plan-margin", type=float, default=0.35)
     ap.add_argument("--init-log-std", type=float, default=None, help="reset the actor's exploration log-std at start (default: -1.8 in the plan space, whose curvature knots tolerate far less noise than steer/speed; unchanged otherwise)")
     ap.add_argument("--episode-s", type=float, default=40.0)
     ap.add_argument("--scan-stack", type=int, default=3); ap.add_argument("--scan-stride", type=int, default=1, help="control steps between stacked scans")
@@ -65,6 +67,7 @@ def main():
                                                               reward_steer_rate=a.steer_penalty, reward_proximity=a.proximity_penalty,
                                                               safe_dist=a.safe_dist, reward_wrong_way=a.wrong_way_penalty,
                                                               reward_collision_speed=a.collision_speed_penalty, proximity_speed_ref=a.proximity_speed_ref,
+                                                              reward_plan_clearance=a.plan_clearance_penalty, plan_margin=a.plan_margin,
                                                               max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
                                                               race_size=a.race_size, opponent=a.opponent,
