@@ -46,6 +46,7 @@ class EnvConfig:
     reward_collision: float = -10.0
     reward_steer_rate: float = 0.05  # per unit of normalized steer change
     reward_proximity: float = 0.1    # per step at zero wall gap, linear in (safe_dist - gap)/safe_dist; 0 = off
+    reward_wrong_way: float = 0.2    # per step while facing backwards along the lane (progress is signed anyway; this makes it explicit)
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
     reward_alive: float = 0.0
     spawn_lateral_std: float = 0.3
@@ -262,8 +263,12 @@ class F1VecEnv:
         self.ep_step += 1
         steer_rate = (steer_norm - self.prev_steer_norm).abs(); self.prev_steer_norm = steer_norm
         proximity = (e.safe_dist - r.wall_dist).clamp(min=0.0) / e.safe_dist if e.reward_proximity > 0 else 0.0
+        wrong_way = 0.0
+        if e.reward_wrong_way > 0 and self.sim.track.cl is not None:
+            _, yaw_c = self.sim.track.pose_at_s(r.s, self.sim.tid)
+            wrong_way = (torch.cos(r.state[:, 2] - yaw_c) < 0.0).float()      # more than 90 deg off the lane direction
         reward = (e.reward_progress * r.progress + e.reward_collision * r.collision.float()
-                  - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity + e.reward_alive)
+                  - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity - e.reward_wrong_way * wrong_way + e.reward_alive)
         self.prev_action = a.clone()
         self.act_hist = torch.cat([a[:, None, :], self.act_hist[:, :-1]], 1)
         self.ep_return += reward; self.ep_progress += r.progress

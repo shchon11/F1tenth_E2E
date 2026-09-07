@@ -67,7 +67,8 @@ class Simulator:
         self.tid = torch.as_tensor(track_ids, dtype=torch.long).to(self.device)
         self.params = ParamSet(self.cfg, num_envs, self.device, self.gen)
         self.P = self.params.P
-        self.lidar = Lidar(self.track, self.cfg.lidar.n_beams, self.cfg.lidar.fov, self.device, compile=self.cfg.sim.compile)
+        self.lidar = Lidar(self.track, self.cfg.lidar.n_beams, self.cfg.lidar.fov, self.device, compile=self.cfg.sim.compile,
+                           post_mode=self.cfg.sim.compile_mode)
 
         self.dt = self.cfg.sim.physics_dt
         self.control_dt = 1.0 / self.cfg.sim.control_rate

@@ -77,6 +77,7 @@ class NativeViewer:
         self.plan_pred = None                  # (K,3) the tracker's predicted motion along it
         self.panel = None                      # PIL RGBA image drawn top-right (policy panel)
         self.dash = None                       # PIL RGBA image drawn bottom-centre (speedometer + steering wheel)
+        self.panel_fn = None; self.dash_fn = None   # callables building those images, run in the render thread
         self.mode = 0
         self.focus = 0
         self.show_lidar = self.show_race = self.show_trails = True
@@ -204,7 +205,21 @@ class NativeViewer:
             self.max_fps = min(self.max_fps or 30, 30)
             self._sim_rate = 0.0
 
+            # torch's CUDA-graph trees keep their state in thread-local storage that only autograd threads
+            # inherit: hand the main thread's state to the sim thread, or every graphed call fails there
+            try:
+                import torch._inductor.cudagraph_trees as _ct
+                _tls = (_ct.local.tree_manager_containers, _ct.local.tree_manager_locks)
+            except Exception:
+                _tls = None
+
             def worker():
+                if _tls is not None:
+                    try:
+                        import torch
+                        torch._C._stash_obj_in_tls("tree_manager_containers", _tls[0]); torch._C._stash_obj_in_tls("tree_manager_locks", _tls[1])
+                    except Exception:
+                        pass
                 t0 = time.perf_counter(); sim_t0 = self.sim.t
                 try:
                     n_ = 0; t_rate = time.perf_counter(); sim_rate0 = self.sim.t
@@ -224,9 +239,11 @@ class NativeViewer:
             while self.alive:
                 t_r = time.perf_counter()
                 self.render()
-                if self.headless or not self.max_fps:               # no vsync to pace us: cap the loop ourselves
-                    wait = t_r + 1.0 / (self.max_fps or 60) - time.perf_counter()
-                    if wait > 0: time.sleep(wait)
+                # the sim's real-time pace comes first: while it lags, render rarely so the GIL is the sim's
+                fps = self.max_fps or 30
+                if realtime and 0.0 < self._sim_rate < 0.97: fps = 6.0
+                wait = t_r + 1.0 / fps - time.perf_counter()
+                if wait > 0: time.sleep(wait)
             self._worker.join(timeout=10.0)                          # let the sim step in flight finish before exit
             if self._worker_err is not None:
                 raise self._worker_err
@@ -351,8 +368,12 @@ class NativeViewer:
                      f"  lap {int(fr['lap'][f])}, {fr['s'][f]:.1f} m into it      nearest wall {fr['wall'][f]:.2f} m",
                      f"crashed: {coll} of {n} cars"]
             sc.set_hud(lines + list(self.extra_hud))
+            if self.panel_fn is not None:
+                self.panel = self.panel_fn()
             if self.panel is not None:
                 sc.set_panel(self.panel, slot=0)
+        if self.dash_fn is not None:
+            self.dash = self.dash_fn()
         if self.dash is not None:
             sc.set_panel(self.dash, slot=1)
         sc.draw_hud()

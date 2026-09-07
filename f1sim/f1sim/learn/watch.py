@@ -370,6 +370,16 @@ def main(argv=None):
         if not headless: v.close()
         return
 
+    def compiled_act(m):
+        """The actor's mean as one CUDA graph (launch-bound next to a training job: 12 ms -> ~1 ms)."""
+        if device.type != "cuda":
+            return lambda scan, pro: m.actor(scan, pro)
+        try:
+            return torch.compile(m.actor.forward, dynamic=False, mode="reduce-overhead")
+        except Exception:
+            return lambda scan, pro: m.actor(scan, pro)
+    state["act_fn"] = compiled_act(model)
+
     def step():
         nonlocal mtime, step_info
         if time.time() - state["last_reload"] > 5.0:
@@ -378,15 +388,17 @@ def main(argv=None):
                 mt = os.path.getmtime(ckpt_path)
                 if mt != mtime:
                     m2, ex = load_checkpoint(ckpt_path, device); m2.eval(); state["model"], state["extra"] = m2, ex
-                    intro.__init__(m2); mtime = mt; step_info = describe(ex, ckpt_path)
+                    intro.__init__(m2); mtime = mt; step_info = describe(ex, ckpt_path); state["act_fn"] = compiled_act(m2)
             except Exception:
                 pass
         m = state["model"]
         scan, pro = flatten_obs(state["obs"])
         with torch.no_grad():
-            act, _ = m.act(scan, pro, deterministic=not a.stochastic)
+            mu_all = state["act_fn"](scan, pro).clone()
+            act = mu_all if not a.stochastic else (mu_all + m.actor.log_std.exp() * torch.randn_like(mu_all)).clamp(-1, 1)
         state["k"] = state.get("k", 0) + 1
-        if state["k"] % a.panel_every == 1 or a.panel_every == 1:      # saliency (a backward pass) + panel: not every frame
+        every = state["k"] % a.panel_every == 1 or a.panel_every == 1
+        if every:                                                     # saliency (a backward pass): not every step
             with torch.no_grad():
                 priv = env.privileged(env.last_result)
                 try:                                                  # a single-car critic cannot value a race (extra opponent inputs)
@@ -396,18 +408,24 @@ def main(argv=None):
             sal, mu = intro.saliency(scan, pro, v.focus)
             v.point_colors = sal_colors(sal)
             std = m.actor.log_std.exp().detach().cpu().numpy()
-            state["panel_args"] = (sal, mu, std, val)
+            hid = (intro.h["hidden"][0].float().cpu().numpy(), intro.h["stem"][0].float().cpu().numpy()) if a.internals else None
+            state["panel_args"] = (sal, mu, std, val, hid)
         state["obs"], rew, term, trunc, info = env.step(act)
-        if "panel_args" in state and (state["k"] % a.panel_every == 1 or a.panel_every == 1):
-            sal, mu, std, val = state["panel_args"]
-            plan_ref = env.tracker.last_ref[v.focus].cpu().numpy() if mode == "plan" else None
-            v.panel = panel_image(sal, mu, std, val, a.speed_cap, step_info, plan_ref=plan_ref, cmd=env.last_cmd[v.focus].cpu().numpy() if mode == "plan" else None)
-            if a.internals:
-                pi = panel_internals(intro.h["hidden"][0].float().cpu().numpy(), intro.h["stem"][0].float().cpu().numpy())
-                both = Image.new("RGBA", (480, 300 + 130), (0, 0, 0, 0)); both.paste(v.panel, (0, 0)); both.paste(pi, (0, 300)); v.panel = both
         fc = v.focus
-        st_ = torch.cat([env.sim.state[fc, [3, 6]], env.last_cmd[fc]]).cpu().numpy()           # speed, steer, cmd steer, cmd speed
-        v.dash = dash_image(float(st_[0]), float(st_[3]), float(env.speed_cap[fc]), float(st_[1]), float(st_[2]), env.ecfg.v_max_policy, env.s_max)
+        # numbers for the overlays in one transfer; the images are drawn by the render thread (PIL is slow)
+        st_ = torch.cat([env.sim.state[fc, [3, 6]], env.last_cmd[fc], env.speed_cap[fc:fc + 1]]).cpu().numpy()
+        vmax, smax, cap_, info_ = env.ecfg.v_max_policy, env.s_max, a.speed_cap, step_info
+        v.dash_fn = lambda st_=st_: dash_image(float(st_[0]), float(st_[3]), float(st_[4]), float(st_[1]), float(st_[2]), vmax, smax)
+        if every and "panel_args" in state:
+            sal, mu, std, val, hid = state["panel_args"]
+            plan_ref = env.tracker.last_ref[fc].cpu().numpy() if mode == "plan" else None
+            cmd_ = st_[2:4] if mode == "plan" else None
+            def panel_fn(sal=sal, mu=mu, std=std, val=val, hid=hid, plan_ref=plan_ref, cmd_=cmd_, info_=info_):
+                img = panel_image(sal, mu, std, val, cap_, info_, plan_ref=plan_ref, cmd=cmd_)
+                if hid is not None:
+                    pi = panel_internals(*hid); both = Image.new("RGBA", (480, 430), (0, 0, 0, 0)); both.paste(img, (0, 0)); both.paste(pi, (0, 300)); img = both
+                return img
+            v.panel_fn = panel_fn
         age = time.time() - mtime
         v.extra_hud = ["", f"POLICY  {step_info}",
                        f"        file {os.path.basename(ckpt_path)}, saved {age / 60:.0f} min ago (auto-reloads)   output: " + ("local plan -> iLQR tracker" if mode == "plan" else "steer + speed")]
@@ -418,6 +436,8 @@ def main(argv=None):
     if not headless:
         try:
             v.run(step, realtime=not a.fast)
+            v.close(); torch.cuda.synchronize() if device.type == "cuda" else None
+            os._exit(0)                                          # skip interpreter teardown: CUDA-graph state from the sim thread crashes it
         except KeyboardInterrupt:
             pass
         v.close(); return

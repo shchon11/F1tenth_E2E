@@ -52,13 +52,20 @@ def ray_box_hits(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor, boxes:
 
 
 class Lidar:
-    def __init__(self, track: TrackTensors, n_beams: int, fov: float, device, max_iters: int = 64,
+    def __init__(self, track: TrackTensors, n_beams: int, fov: float, device, max_iters: int = 64, post_mode: str = "default",
                  compile: bool = True):
         self.track = track
         self.n = n_beams
         self.fov = fov
         self.device = torch.device(device)
         self.max_iters = max_iters
+        self.post_mode = post_mode
+        self._post_fast = self._post
+        if post_mode == "reduce-overhead" and self.device.type == "cuda":
+            try:
+                self._post_fast = torch.compile(self._post, dynamic=False, mode="reduce-overhead")
+            except Exception:
+                self._post_fast = self._post
         self.angles = torch.linspace(-fov / 2, fov / 2, n_beams, device=self.device)   # (N,)
         # beam i is emitted at fraction time_frac[i] of the scan period before the scan timestamp
         self.time_frac = (fov / (2 * math.pi)) * (1.0 - torch.arange(n_beams, device=self.device) / (n_beams - 1))
@@ -194,26 +201,34 @@ class Lidar:
                 car_poro = torch.where(closer, poro[:, None].expand_as(car_poro), car_poro)
         if not noisy:
             return r_true, r_true, typ
-        rm = rmax[:, None]
+        tid_ = torch.zeros(B, dtype=torch.long, device=pose.device) if tid is None else tid
+        if self._post_fast is not self._post and car_poro is None:     # one CUDA graph for the whole post-processing
+            r, r_true2, typ2 = self._post_fast(r_true, typ, origin, dh, k, tid_, P)
+            return r.clone(), r_true2.clone(), typ2.clone()
+        return self._post(r_true, typ, origin, dh, k, tid_, P, car_poro)
+
+    def _post(self, r_true, typ, origin, dh, k, tid, P, car_poro=None):
+        """Noise, spikes, dropouts, incidence-dependent returns -> (ranges, ranges_true, types)."""
+        B = r_true.shape[0]
+        rm = P["range_max"][:, None]
         r = r_true + torch.randn_like(r_true) * (P["noise_std"][:, None] + P["noise_std_rel"][:, None] * r_true)
         u = torch.rand_like(r)
         spike = u < P["spike_prob"][:, None]
         r = torch.where(spike, torch.rand_like(r) * rm, r)
         u = torch.rand_like(r)
         no_return = (u < P["dropout_prob"][:, None]) | (typ == HIT_NONE) | (r_true >= rm - 1e-4)
-        # incidence-dependent returns: glossy floor at grazing incidence, duct hose seen edge-on
         if "floor_dropout" in P:
-            theta = torch.atan(k.abs())                                            # floor incidence, 0 = grazing
+            theta = torch.atan(k.abs())
             p_floor = P["floor_dropout"][:, None] * (1.0 - theta / P["floor_graze"][:, None]).clamp(0.0, 1.0)
-            tid_ = torch.zeros(B, dtype=torch.long, device=pose.device) if tid is None else tid
+            tid_ = torch.zeros(B, dtype=torch.long, device=r.device) if tid is None else tid
             hit_xy = origin[..., :2] + dh * (r_true / torch.sqrt(1.0 + k * k))[..., None]
             nrm = self.track.edt_gradient(hit_xy, tid_[:, None].expand(k.shape), self.track.edt_duct)
             cos_inc = (nrm * dh).sum(-1).abs()
             p_duct = P["duct_graze_dropout"][:, None] * (1.0 - cos_inc / P["duct_graze_cos"][:, None]).clamp(0.0, 1.0)
             u2 = torch.rand_like(r)
             no_return = no_return | ((typ == HIT_GROUND) & (u2 < p_floor)) | ((typ == HIT_DUCT) & (u2 < p_duct))
-        if car_poro is not None:                                               # a car body is not a solid wall: wheels,
-            no_return = no_return | ((typ == HIT_CAR) & (torch.rand_like(r) < car_poro))   # gaps, dark parts (rear box: solid)
+        if car_poro is not None:
+            no_return = no_return | ((typ == HIT_CAR) & (torch.rand_like(r) < car_poro))
         r = r.clamp_min(P["range_min"][:, None])
         r = torch.where(no_return, P["dropout_value"][:, None].expand_as(r), r)
         return r, r_true, typ

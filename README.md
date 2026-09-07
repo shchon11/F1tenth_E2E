@@ -144,7 +144,9 @@ obs, rew, term, trunc, info = env.step(action)   # action in [-1,1]^2; auto-rese
 Observation keys: `scan` (k stacked scans, `scan_stride` control steps apart: 3 x stride 3 =
 175 ms of history for velocity cues), `speed` (VESC), `prev_action`, `imu` (step-mean gyro xyz /
 accel xyz, normalized), `imu_att` (VESC roll/pitch estimate). Reward = progress [m] - 10 on
-collision - 0.05 * |steer change| - 0.1 * wall proximity (under a 0.30 m gap). Everything the
+collision - 0.05 * |steer change| - 0.1 * wall proximity (under a 0.30 m gap) - 0.2 while facing
+backwards along the lane (progress is signed, so driving the wrong way already pays negative reward;
+this makes it explicit). Everything the
 policy sees is available on the real car; integrated pose/odometry is deliberately excluded (it
 drifts, and its drift statistics differ between sim and real).
 
