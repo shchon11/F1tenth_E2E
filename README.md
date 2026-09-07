@@ -166,7 +166,12 @@ too (`RacelineTeacher.plan_action`: the knots start from what pure pursuit would
 the line, blended into the raceline's curvature ahead, and Gauss-Newton refines them through the
 raceline points 0.4-1.0 L_p ahead with a ridge back to that guess -- a fit that was free to snap
 back at full lock crashed on every rejoin, one that was too soft drifted off; residual 0.05-0.2 m),
-so DAgger imitates plans and PPO refines them; the tracker is the same code on the real car.
+so DAgger imitates plans and PPO refines them; the tracker is the same code on the real car:
+`f1sim/mpc_fast.py` is `mpc.solve` for one car as scalar loops compiled with Numba (0.012 ms per
+control step on a laptop core; the torch version is 19,000 tiny ops = 10 ms, which would not fit
+the Jetson's 25 ms budget), checked against the torch solver to 1e-6 and against the training
+env step by step (`tests/test_mpc_fast.py`, `tests/test_plan_node_parity.py`). The policy node uses
+it when `numba` imports and falls back to the torch tracker otherwise.
 The teacher's speed profile is computed per grip level (12 profiles per raceline, corner speeds
 and braking points scale with the car's friction, never above the nominal profile) and it slows
 down when off the line. Under full randomization on the training set at a 6 m/s cap it now

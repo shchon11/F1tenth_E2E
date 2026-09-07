@@ -46,11 +46,16 @@ class PolicyNode(Node):
         # residual servo calibration the stack's steering_angle_to_servo_offset/gain do not absorb (rad, ratio)
         self.declare_parameter("steer_bias", 0.0); self.declare_parameter("steer_gain", 1.0); self.declare_parameter("speed_gain", 1.0)
         self.cal = (float(p("steer_bias")), float(p("steer_gain")), float(p("speed_gain")))
-        self.tracker = None
+        self.tracker = None; self.tracker_fast = False
         if self.spec.act_dim >= 5:
-            from f1sim.mpc import PlanTracker
-            self.tracker = PlanTracker(1, self.device, float(p("wheelbase")), self.steer_max, self.spec.v_max)
-            self.delay = torch.tensor([float(p("cmd_delay"))], device=self.device)
+            self.delay = float(p("cmd_delay"))
+            try:                                                     # numba single-car solver: ~0.01 ms/step, same math as training
+                from f1sim.mpc_fast import PlanTrackerFast
+                self.tracker = PlanTrackerFast(float(p("wheelbase")), self.steer_max, self.spec.v_max); self.tracker_fast = True
+            except Exception as e:                                   # no numba: the torch tracker (~10 ms/step on a CPU core)
+                self.get_logger().warn(f"numba tracker unavailable ({e}); falling back to the torch tracker")
+                from f1sim.mpc import PlanTracker
+                self.tracker = PlanTracker(1, self.device, float(p("wheelbase")), self.steer_max, self.spec.v_max)
         self.create_subscription(Odometry, "odom", self.on_odom, 1)
         self.create_subscription(Imu, "sensors/imu/raw", self.on_imu, 10)
         if VescImuStamped is not None:
@@ -62,8 +67,9 @@ class PolicyNode(Node):
         s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
         with torch.no_grad():
             a0, _ = self.model.act(s, pr, deterministic=True)
-        if self.tracker is not None:                                 # warm up the tracker's compiled solver too
-            self.tracker(a0, torch.zeros(1, device=self.device), torch.tensor([self.speed_cap], device=self.device), None, delay=self.delay)
+        if self.tracker is not None and not self.tracker_fast:       # warm up the torch tracker's compiled solver too
+            self.tracker(a0, torch.zeros(1, device=self.device), torch.tensor([self.speed_cap], device=self.device), None,
+                         delay=torch.tensor([self.delay], device=self.device))
             self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
         self.obs.reset()
         self.get_logger().info(f"policy {p('checkpoint')} on {self.device}, speed cap {self.speed_cap} m/s")
@@ -93,8 +99,11 @@ class PolicyNode(Node):
         self.obs.push_action(a[0])
         msg = AckermannDriveStamped(); msg.header.stamp = m.header.stamp
         if self.tracker is not None:                                 # local plan -> tracker -> command
-            cmd = self.tracker(a, torch.tensor([self.v], device=self.device), torch.tensor([self.speed_cap], device=self.device),
-                               torch.tensor([float(imu_mean[2])], device=self.device), delay=self.delay)[0]
+            if self.tracker_fast:
+                cmd = self.tracker(a[0].cpu().numpy(), self.v, self.speed_cap, float(imu_mean[2]), delay=self.delay)
+            else:
+                cmd = self.tracker(a, torch.tensor([self.v], device=self.device), torch.tensor([self.speed_cap], device=self.device),
+                                   torch.tensor([float(imu_mean[2])], device=self.device), delay=torch.tensor([self.delay], device=self.device))[0]
             msg.drive.steering_angle = float(max(-self.steer_max, min(self.steer_max, (float(cmd[0]) - self.cal[0]) / self.cal[1])))
             msg.drive.speed = float(cmd[1]) / self.cal[2]
         else:
