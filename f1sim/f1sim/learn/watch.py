@@ -8,9 +8,11 @@ Headless recording: --record out.mp4 (needs ffmpeg) or --frames dir/ for PNGs.
 from __future__ import annotations
 
 import argparse
+import glob
 import math
 import os
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -273,9 +275,25 @@ def replay_best(v, rec, model, intro, ep, sink, speed_cap, fps=30, rank=0, realt
             if d > 0: time.sleep(d)
 
 
-def main():
+def latest_run() -> str:
+    """The most recently updated run directory in ~/f1sim_runs that holds a checkpoint."""
+    best, t_best = "", -1.0
+    for d in glob.glob(os.path.join(common.RUNS_DIR, "*")):
+        for ck in ("ppo_latest.pt", "student_latest.pt"):
+            p = os.path.join(d, ck)
+            if os.path.exists(p) and os.path.getmtime(p) > t_best:
+                best, t_best = d, os.path.getmtime(p)
+    return best
+
+
+def main(argv=None):
+    if argv is None and len(sys.argv) == 1:                  # no arguments: the launcher window
+        from .watch_gui import ask
+        argv = ask()
+        if argv is None:
+            return
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", default=os.path.join(common.RUNS_DIR, "ppo_v3"), help="run dir (uses ppo_latest.pt / student_latest.pt) or a .pt file")
+    ap.add_argument("--run", default="latest", help="run dir (uses ppo_latest.pt / student_latest.pt), a .pt file, or 'latest' = the newest run")
     ap.add_argument("--map", default="gen:competition:2"); ap.add_argument("--cars", type=int, default=64)
     ap.add_argument("--speed-cap", type=float, default=6.0); ap.add_argument("--device", default="cuda")
     ap.add_argument("--stochastic", action="store_true", help="sample actions like during training")
@@ -287,14 +305,25 @@ def main():
     ap.add_argument("--highlights", default="", help="headless highlight mode: directory for one mp4 per episode")
     ap.add_argument("--internals", action="store_true", help="also show the raw hidden-layer / conv-feature activations")
     ap.add_argument("--panel-every", type=int, default=3, help="recompute saliency + the panel every k sim steps (GPU launches)")
-    a = ap.parse_args()
+    ap.add_argument("--race-size", type=int, default=1, help="cars per race (>1: opponents in the scan)")
+    ap.add_argument("--opponent", default="teacher", choices=["teacher", "policy"], help="who drives the other cars of a race")
+    a = ap.parse_args(argv)
     device = torch.device(a.device)
-    ckpt_path = a.run if a.run.endswith(".pt") else next(p for p in (os.path.join(a.run, "ppo_latest.pt"), os.path.join(a.run, "student_latest.pt")) if os.path.exists(p))
-    tracks, _ = common.load_tracks([a.map])
+    run = latest_run() if a.run == "latest" else a.run
+    if not run:
+        raise SystemExit(f"no run with a checkpoint under {common.RUNS_DIR}")
+    ckpt_path = run if run.endswith(".pt") else next(p for p in (os.path.join(run, "ppo_latest.pt"), os.path.join(run, "student_latest.pt")) if os.path.exists(p))
     model, extra = load_checkpoint(ckpt_path, device); model.eval(); intro = Introspector(model)
-    mode = "plan" if model.meta.get("act_dim", 2) >= 5 else "direct"        # plan-space policies drive through the tracker
+    act_dim = model.meta.get("act_dim", 2)
+    from ..mpc import ACT_DIM as PLAN_DIM
+    if act_dim not in (2, PLAN_DIM):
+        raise SystemExit(f"{ckpt_path}: action dim {act_dim} is from an older plan representation (the current one has {PLAN_DIM}); pick a newer run")
+    mode = "plan" if act_dim == PLAN_DIM else "direct"                       # plan-space policies drive through the tracker
+    need_rl = a.race_size > 1 and a.opponent == "teacher"
+    tracks, rls = common.load_tracks([a.map], racelines=need_rl)
     cfg = Config(); cfg.sim.compile_mode = "reduce-overhead"                  # CUDA graphs: the sim step is one launch
-    env = common.make_env(tracks, a.cars, device, EnvConfig(speed_cap=a.speed_cap, action_mode=mode), cfg=cfg)
+    n_cars = a.cars - a.cars % a.race_size
+    env = common.make_env(tracks, n_cars, device, EnvConfig(speed_cap=a.speed_cap, action_mode=mode, race_size=a.race_size, opponent=a.opponent), cfg=cfg, rls=rls)
     def describe(ex, path):
         """One plain line about the checkpoint: which run, which iteration / update, how it was doing."""
         run = ex.get("run") or os.path.basename(os.path.dirname(path)); m = ex.get("metrics") or {}
@@ -360,7 +389,10 @@ def main():
         if state["k"] % a.panel_every == 1 or a.panel_every == 1:      # saliency (a backward pass) + panel: not every frame
             with torch.no_grad():
                 priv = env.privileged(env.last_result)
-                val = m.critic(scan[v.focus:v.focus + 1], pro[v.focus:v.focus + 1], priv[v.focus:v.focus + 1]).item()
+                try:                                                  # a single-car critic cannot value a race (extra opponent inputs)
+                    val = m.critic(scan[v.focus:v.focus + 1], pro[v.focus:v.focus + 1], priv[v.focus:v.focus + 1]).item()
+                except RuntimeError:
+                    val = None
             sal, mu = intro.saliency(scan, pro, v.focus)
             v.point_colors = sal_colors(sal)
             std = m.actor.log_std.exp().detach().cpu().numpy()
