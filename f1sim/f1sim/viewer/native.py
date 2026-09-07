@@ -88,6 +88,8 @@ class NativeViewer:
         self._lock = threading.RLock()
         self._worker = None; self._worker_err = None
         self._snap = None; self._sel = None; self.env_ids = None
+        from collections import deque
+        self._frames = deque(maxlen=32); self._play_t = None; self._play_wall = None; self._play_rate = 1.0
         self._t_wall0 = None; self._t_sim0 = None
         self._orbit = [math.radians(-35), math.radians(30), 4.0]   # azimuth, elevation, distance
         self._drag = None
@@ -206,6 +208,7 @@ class NativeViewer:
             self.prev_frame, self.frame = self.frame, fr
             self._t_frame = now
             self._trail_pending = True
+            self._frames.append(fr)                                # playback queue (sim time in fr["t"])
 
     def sync(self):
         """Pace the calling loop to wall-clock real time (one call per sim step)."""
@@ -263,14 +266,12 @@ class NativeViewer:
                 except Exception as e:                  # surface in the main thread
                     self._worker_err = e; self.alive = False
             self._worker = threading.Thread(target=worker, daemon=True); self._worker.start()
-            self._lead = 0.0; t_last = 0.0
+            self._lead = 0.0
             while self.alive:
-                # the sim's real-time pace comes first: render only while the sim is ahead of the wall
-                # clock (in the time it would otherwise sleep); if it cannot keep up at all, 2 fps
-                if realtime and self._sim_rate > 0.0 and self._lead < 0.004 and time.perf_counter() - t_last < 0.5:
-                    time.sleep(0.004); continue
+                # a steady frame rate comes first: the picture plays back at the sim's measured pace
+                # (smoothly, one or two sim frames behind) even when the sim cannot keep real time
                 t_r = time.perf_counter()
-                self.render(); t_last = t_r
+                self.render()
                 wait = t_r + 1.0 / (self.max_fps or 30) - time.perf_counter()
                 if wait > 0: time.sleep(wait)
             self._worker.join(timeout=10.0)                          # let the sim step in flight finish before exit
@@ -294,19 +295,40 @@ class NativeViewer:
 
     # ------------------------------------------------------------------ rendering
     def _interp(self):
-        """Interpolated car poses between the two latest frames (render-side smoothing)."""
-        fr, pf = self.frame, self.prev_frame
-        if fr is None:
-            return None
-        if pf is None or pf["n"] != fr["n"]:
-            return fr
-        dt_frames = max(1e-3, getattr(self, "_dt_frame", self.sim.control_dt))   # wall time between sim frames
-        a = float(np.clip((time.perf_counter() - self._t_frame) / dt_frames, 0.0, 1.0))
-        out = dict(fr)
+        """Frame to draw: a playback clock in sim time runs at the sim's measured pace and stays a
+        little behind the newest frame, so irregular sim frames (a busy GPU) still play smoothly."""
+        frames = list(self._frames)
+        if not frames:
+            return self.frame
+        if len(frames) < 3 or self._worker is None:
+            return frames[-1]
+        now = time.perf_counter()
+        t_new = frames[-1]["t"]; t_old = frames[0]["t"]
+        span = max(1e-3, (t_new - t_old) / max(1, len(frames) - 1))       # sim seconds per pulled frame
+        if self._play_t is None:
+            self._play_t, self._play_wall = t_new - 2 * span, now
+            return frames[-1]
+        # advance at the measured sim rate, nudged to keep ~2 frames of buffer
+        lag = t_new - self._play_t
+        rate = max(0.05, self._sim_rate or 1.0) * float(np.clip(1.0 + 0.5 * (lag - 2 * span) / (2 * span), 0.5, 1.5))
+        self._play_t = min(self._play_t + (now - self._play_wall) * rate, t_new)
+        self._play_wall = now
+        # bracketing frames
+        j = len(frames) - 1
+        while j > 0 and frames[j - 1]["t"] > self._play_t:
+            j -= 1
+        if j == 0:
+            return frames[0]
+        f0, f1 = frames[j - 1], frames[j]
+        if f0["n"] != f1["n"]:
+            return f1
+        a = float(np.clip((self._play_t - f0["t"]) / max(1e-6, f1["t"] - f0["t"]), 0.0, 1.0))
+        out = dict(f1)
         for k in ("x", "y", "vx", "steer", "roll", "pitch"):
-            out[k] = pf[k] + (fr[k] - pf[k]) * a
-        dyaw = (fr["yaw"] - pf["yaw"] + math.pi) % (2 * math.pi) - math.pi
-        out["yaw"] = pf["yaw"] + dyaw * a
+            out[k] = f0[k] + (f1[k] - f0[k]) * a
+        dyaw = (f1["yaw"] - f0["yaw"] + math.pi) % (2 * math.pi) - math.pi
+        out["yaw"] = f0["yaw"] + dyaw * a
+        out["t"] = self._play_t
         return out
 
     def render(self):
