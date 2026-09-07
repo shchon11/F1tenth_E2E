@@ -345,9 +345,14 @@ map showed why: 44 of its 46 held-out crashes were on blackbox2022_3, in that ha
 alcoves and side rooms, slow (2 m/s where the raceline runs 4) and from a comfortable gap: the policy
 follows an opening that looks like the track and stops at its end. Korea, Monza and gen:0 were at
 0.06 or below. Hence `+pk<seed>`: `Track.with_pockets` carves 3-8 walled dead-end side pockets
-(0.8-2.2 m wide, 1-3 m deep, duct-hose walls: pit-lane mouths, alcoves) into a map; the lane,
-centerline and raceline (built on the unmodified `base` track) are untouched, so the teacher never
-enters one. From ppo_v11 every real map trains plain, with boxes and with pockets. ppo_v11 starts
+(0.8-2.4 m wide, 1-4 m deep, duct-hose walls: pit-lane mouths, alcoves, side corridors) into a map;
+the lane, centerline and raceline (built on the unmodified `base` track) are untouched, so the
+teacher never enters one. 60 % of them open on the outside of a bend: a crash map of ppo_v11 at
+update 100 showed that this is the configuration that traps the policy (all 12 crashes on
+icra2022+pk0~mir were in the one pocket straight ahead of a corner; pockets beside a straight are
+ignored), and it is what blackbox2022_3's side corridors are. From ppo_v11 every real map trains
+plain, with boxes and with pockets; ppo_v12 = the same run restarted from ppo_v11's checkpoint with
+the bend-biased pockets. ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
 at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else
 at most 0.06.
