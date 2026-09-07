@@ -26,24 +26,37 @@ WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "f1sim-e2e")
 # (~mir). Mirroring was added after ppo_v9: a student trained on the 8 unmirrored layouts crashed
 # 0.05/car/20 s on them but 0.36 on their mirror images (teacher 0.06) -- it had memorized the
 # layouts, not learned geometry -- and 0.23 on the held-out maps.
-REAL_TRAIN = ["icra2022", "blackbox2021_1", "blackbox2021_2", "blackbox2021_3", "blackbox2022_1", "blackbox2022_2"]
+REAL_TRAIN_V10 = ["icra2022", "blackbox2021_1", "blackbox2021_2", "blackbox2021_3", "blackbox2022_1", "blackbox2022_2"]
+# ppo_v10 still learned only its own layouts (mirrored 0.35 -> 0.21 in 100 updates, held-out flat),
+# so five more community SLAM maps joined for ppo_v11: 11 real base layouts instead of 6.
+REAL_TRAIN = REAL_TRAIN_V10 + ["berlin", "columbia_small", "torino_small", "mtl", "porto"]
 RT_TRAIN = ["Spielberg", "Oschersleben"]
 GEN_TRAIN = ["gen:competition:1000", "gen:competition:1001"]          # 1000 CCW, 1001 mirrored (CW)
 DIRS = ("", "~rev", "~mir", "~mir~rev")
-TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in DIRS]
-                + [f"rt:{n}{d}" for n in RT_TRAIN for d in DIRS]
-                + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]   # 1001 already is 1000's mirror
-                # static box obstacles (CDC 2025 style cardboard boxes) on 40 % of the tracks
-                + [f"real:{n}+obs{i}{d}" for i, n in enumerate(REAL_TRAIN) for d in DIRS])
+
+
+def _train_set(real):
+    return ([f"real:{n}{d}" for n in real for d in DIRS]
+            + [f"rt:{n}{d}" for n in RT_TRAIN for d in DIRS]
+            + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]       # 1001 already is 1000's mirror
+            # static box obstacles (CDC 2025 style cardboard boxes) on ~40 % of the tracks
+            + [f"real:{n}+obs{i}{d}" for i, n in enumerate(real) for d in DIRS])
+
+
+TRAIN_TRACKS = _train_set(REAL_TRAIN)                # 100 tracks (ppo_v11 on)
+TRAIN_TRACKS_V10 = _train_set(REAL_TRAIN_V10)        # 60 tracks: what ppo_v10 trains on (evaluate it on this)
 # Held out entirely: the Korea 2025 championship map (the target venue style) and one TU Wien race.
 EVAL_TRACKS = ["real:korea_2025_iccas", "real:korea_2025_iccas~rev", "real:blackbox2022_3", "real:blackbox2022_3~rev",
                "rt:Monza", "gen:competition:0"]
 
 
 def track_names(spec: str = "train") -> List[str]:
-    """'train' -> TRAIN_TRACKS, 'eval' -> EVAL_TRACKS, otherwise a comma separated catalog list."""
+    """'train' -> TRAIN_TRACKS, 'train_v10' -> the 60-track set ppo_v10 uses, 'eval' -> EVAL_TRACKS,
+    otherwise a comma separated catalog list."""
     if spec == "train":
         return list(TRAIN_TRACKS)
+    if spec == "train_v10":
+        return list(TRAIN_TRACKS_V10)
     if spec == "eval":
         return list(EVAL_TRACKS)
     return [n.strip() for n in spec.split(",") if n.strip()]

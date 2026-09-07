@@ -331,7 +331,9 @@ hugging the hose on the racing line is still allowed); speed cap
 curriculum 4 -> 8 m/s; train tracks = `common.TRAIN_TRACKS` (user-curated: 6 real competition
 SLAM maps + rt:Spielberg/Oschersleben + 2 gen:competition seeds, each in both lap directions and
 mirrored via the `~rev` / `~mir` modifiers, plus the 6 real maps with static box obstacles
-(`+obs<seed>`, one box per ~35 m of lane, all four variants: 60 tracks, 40 % with obstacles).
+(`+obs<seed>`, one box per ~35 m of lane, all four variants). ppo_v10 trains on that 60-track
+set (`--tracks train_v10`); from ppo_v11 five more community SLAM maps (berlin, columbia_small,
+torino_small, mtl, porto: 11 real base layouts) make it 100 tracks (`--tracks train`).
 Mirroring came in after ppo_v9, which had been trained on the 8 unmirrored layouts: deterministic,
 20 s per car, 6 m/s cap, it crashed 0.05/car on its training layouts, 0.36 on their mirror images
 (teacher 0.06) and 0.23 on the held-out maps (teacher 0.01) -- memorized layouts, not geometry.

@@ -33,6 +33,13 @@ REAL = {
     "blackbox2022_1": (os.path.join(TUW, "blackbox2022_1.yaml"), "duct", 0.40, "TU Wien BlackBox race 2022"),
     "blackbox2022_2": (os.path.join(TUW, "blackbox2022_2.yaml"), "duct", 0.35, "TU Wien BlackBox race 2022", None, 0.15),
     "blackbox2022_3": (os.path.join(TUW, "blackbox2022_3.yaml"), "duct", 0.30, "TU Wien BlackBox race 2022"),
+    # community SLAM maps added 2026-09-08 for layout diversity (ppo_v9 memorized its 8 layouts)
+    "berlin": (os.path.join(GYM_MAPS, "berlin.yaml"), "duct", 0.40, "F1TENTH Berlin race map (f1tenth_gym)"),
+    "skirk": (os.path.join(GYM_MAPS, "skirk.yaml"), "duct", 0.40, "Skirkanich hall race (f1tenth_gym)"),
+    "columbia_small": (os.path.join(TUW, "columbia_small.yaml"), "duct", 0.40, "Columbia race map (f1tenth_maps)"),
+    "torino_small": (os.path.join(TUW, "torino_redraw_small.yaml"), "duct", 0.35, "Torino race map, redrawn (f1tenth_maps)"),
+    "mtl": (os.path.join(TUW, "mtl.yaml"), "duct", 0.40, "Montreal race map (f1tenth_maps)", None, 0.15),
+    "porto": (os.path.join(TUW, "porto.yaml"), "duct", 0.30, "Porto race map, narrow (f1tenth_maps)"),
     "korea_2025_iccas": (os.path.join(KOR, "KORA_K3", "src", "kora_k3", "maps", "real.yaml"), "duct", 0.35, "4th F1TENTH Korea Championship 2025 (ICCAS) race track, team SLAM map", (3.0, 0.0), 0.05,
                          dict(keep_region=True, unknown_floor_depth=5.0)),   # raw SLAM: spray, specks. The outline is a hose too
                                                                               # (track built from ducts in a bigger hall): floor beyond
