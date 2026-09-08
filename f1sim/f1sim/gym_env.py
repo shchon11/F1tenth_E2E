@@ -52,6 +52,8 @@ class EnvConfig:
     reward_plan_clearance: float = 0.0    # plan mode: per-step penalty when the planned path passes closer than plan_margin to a wall
     plan_margin: float = 0.35             # [m] (the raceline keeps 0.40): a dense "do not plan into walls" signal, the planner's safety hook
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
+    reward_car_collision: float = 0.0 # races: penalty on top of reward_collision when the crash was into
+                                      # another car (in a race that is a hit on someone else, not just your own race over)
     reward_car_proximity: float = 0.0 # races: per-step penalty for closing on the car AHEAD (the following car
                                       # is the one that must leave room; being overtaken is never penalized)
     car_safe_dist: float = 0.50      # [m] bumper-to-bumper gap to the car ahead below which that penalty starts
@@ -299,7 +301,8 @@ class F1VecEnv:
         self.ep_step += 1
         plan_ref = self.tracker.last_ref if (self.tracker is not None and e.reward_plan_clearance > 0) else self._no_plan
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
-                         self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap, plan_ref)
+                         self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap, plan_ref,
+                         r.car_collision if r.car_collision is not None else self.sim.car_collision)
         self.scan_hist, steer_rate, reward, self.act_hist, terminated, truncated, crossed, done, self.ep_return, self.ep_progress, flags = (t.clone() for t in out)
         self.prev_steer_norm = steer_norm; self.prev_action = a
         if self.hist is not None:
@@ -342,7 +345,7 @@ class F1VecEnv:
         return obs, reward, terminated, truncated, info
 
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
-                   ep_return, ep_progress, prev_lap, plan_ref):
+                   ep_return, ep_progress, prev_lap, plan_ref, car_collision):
         """Reward, histories and episode flags as pure tensor math (compiled into one CUDA graph when
         the sim runs in reduce-overhead mode: next to a training job every small kernel waits its turn)."""
         e = self.ecfg
@@ -356,6 +359,7 @@ class F1VecEnv:
             _, yaw_c = self.sim.track.pose_at_s(s, tid)
             wrong_way = (torch.cos(state[:, 2] - yaw_c) < 0.0).float()      # more than 90 deg off the lane direction
         crash = collision.float()
+        car_crash = (collision & car_collision).float()
         car_pen = torch.zeros_like(wall_dist)
         if self.M > 1 and e.reward_car_proximity > 0:
             xy = state[:, :2].view(-1, self.M, 2); psi = state[:, 2].view(-1, self.M)
@@ -377,7 +381,8 @@ class F1VecEnv:
             plan_pen = (e.plan_margin - clr).clamp(min=0.0) / e.plan_margin
         reward = (e.reward_progress * progress + e.reward_collision * crash - e.reward_collision_speed * crash * state[:, 3].abs()
                   - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity - e.reward_wrong_way * wrong_way
-                  - e.reward_plan_clearance * plan_pen - e.reward_car_proximity * car_pen + e.reward_alive)
+                  - e.reward_plan_clearance * plan_pen - e.reward_car_proximity * car_pen
+                  - e.reward_car_collision * car_crash + e.reward_alive)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         terminated = collision.clone()
         truncated = (~terminated) & ((ep_step >= e.max_steps) | (lap >= e.laps))

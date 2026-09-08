@@ -55,6 +55,7 @@ def main():
     ap.add_argument("--hist-len", type=int, default=0, help="proprio history rows in the observation (20 = the last second at stride 2)")
     ap.add_argument("--race-size", type=int, default=1, help="cars per track instance (>1: opponents in the LiDAR, car-car collisions)")
     ap.add_argument("--opponent", default="policy", choices=["policy", "teacher"], help="who drives cars 1..M-1: the policy (self-play) or the raceline teacher")
+    ap.add_argument("--car-collision-penalty", type=float, default=0.0, help="races: extra penalty for crashing into another car")
     ap.add_argument("--car-proximity-penalty", type=float, default=0.0, help="races: per-step penalty for closing on the car ahead")
     ap.add_argument("--car-safe-dist", type=float, default=0.5, help="[m] bumper gap to the car ahead below which that penalty starts")
     ap.add_argument("--opp-speed", type=float, nargs=2, default=(0.6, 1.0), help="teacher opponents: speed scale range per race")
@@ -74,6 +75,7 @@ def main():
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
                                                               race_size=a.race_size, opponent=a.opponent,
                                                               reward_car_proximity=a.car_proximity_penalty, car_safe_dist=a.car_safe_dist,
+                                                              reward_car_collision=a.car_collision_penalty,
                                                               opp_speed_range=tuple(a.opp_speed), action_mode=a.action_mode), seed=a.seed, rls=rls)
     spec = common.obs_spec(env)
     obs, info = env.reset(seed=a.seed)
