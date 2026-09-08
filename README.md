@@ -426,6 +426,21 @@ where each other car will be at that point of the plan (constant velocity), exac
 `--plan-clearance-penalty` scores it against the map. Planning through the space a car is leaving is
 free; aiming at where it will be is not.
 
+How well it races today, measured against teacher-driven cars (which never yield), 192 learner cars
+per row, crashes and overtakes per car per 20 s:
+
+| speed cap | contact | overtakes | contact per overtake | progress |
+|---|---|---|---|---|
+| 3.5 m/s | 0.18 | 0.26 | 0.7 | 66 m |
+| 5.0 m/s | 0.23 | 0.40 | 0.6 | 74 m |
+| 6.0 m/s | 0.45 | 0.47 | 1.0 | 75 m |
+
+Same-speed racing is fine (0.19-0.28 contact) and wall crashes in traffic are ~0.02, i.e. the driving
+itself does not degrade with cars around. Passing much slower traffic is the open problem, and the
+speed scaling says it is not only judgment: an F1TENTH lane is 1.5-2.0 m and a car is 0.31 m wide, so
+two abreast leave tens of centimetres, and at 6 m/s that gap is beyond what the policy and tracker
+place the car within. Until that improves, racing in traffic belongs at ~5 m/s.
+
 `+obl<seed>` (from ppo_v15) places the boxes **on the track's own racing line** instead of against a
 wall, which is the case the policy is worst at, and the training set grows to 188 tracks
 (`--tracks train`; `train_v14` and `train_v10` still name the earlier sets so their runs stay
