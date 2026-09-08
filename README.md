@@ -378,6 +378,25 @@ checkpoint (120M steps, cap 8) is the current policy. Deterministic, 20 s per ca
 | held-out: blackbox2022_3 forward / reverse (forks) | 0.00 / 0.00 | 0.56 / 0.25 |
 | held-out mean, speed | 0.01, 3.87 m/s | 0.12, 3.96 m/s |
 
+What it can and cannot do (deterministic, 6 held-out/clean maps, 20 s per car, crashes per car,
+6 m/s cap; `scripts`-style probes in the session's scratch, `obs_eval.py` / `race_eval.py`):
+
+| situation | teacher (map + raceline) | ppo_v13 final (LiDAR only) |
+|---|---|---|
+| no obstacles | 0.00 | 0.01 |
+| boxes at the lane side (the kind it trained on) | 0.00 | 0.00 |
+| unseen kinds: big boxes, cylinders, twice as dense | 0.00-0.02 | 0.01-0.03 |
+| obstacles anywhere across the lane | 0.62 | 0.10 |
+| obstacles centred on the raceline | 4.42 | 0.60 |
+| race of 3 vs raceline-teacher cars (never trained with cars) | - | 0.46 (0.44 of it car contact), 0.56 overtakes |
+
+So static-obstacle avoidance generalizes past the kind it trained on, and it is an order of magnitude
+better than the teacher when something sits on the racing line -- the min-curvature optimizer does not
+route around mid-lane obstacles, which is a raceline bug to fix, not a policy limit. Car-to-car is the
+open one: it never trained with opponents, keeps no gap, and touches. ppo_v14 addresses exactly that:
+self-play races of 3 from ppo_v13's checkpoint with a dense penalty for closing on the car ahead
+(`--car-proximity-penalty`, the following car pays, being overtaken never does).
+
 ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
 at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else

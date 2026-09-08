@@ -73,3 +73,26 @@ def test_race_env_with_teacher_opponents():
         obs, rew, term, trunc, info = env.step(a)
         seen += int((env.last_result.scan_type[env.learner] == HIT_CAR).any())
     assert seen > 0                                                     # a learner saw an opponent in its scan
+
+
+def test_car_proximity_penalty_falls_on_the_following_car_only():
+    """Two cars in line: the one behind pays for the gap, the one in front pays nothing."""
+    import torch
+    from f1sim import Config
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    tracks, _ = common.load_tracks(["gen:competition:0"])
+    cfg = Config(); cfg.rand.enabled = False
+    env = common.make_env(tracks, 2, dev, EnvConfig(race_size=2, opponent="policy", reward_car_proximity=1.0, car_safe_dist=0.5,
+                                                    reward_progress=0.0, reward_alive=0.0, reward_steer_rate=0.0, reward_proximity=0.0,
+                                                    reward_wrong_way=0.0), cfg=cfg, seed=1)
+    env.reset(seed=1)
+    st = env.sim.state.clone()
+    st[0, :3] = torch.tensor([0.0, 0.0, 0.0], device=st.device)          # car 0 behind, facing +x
+    st[1, :3] = torch.tensor([env.car_len + 0.2, 0.0, 0.0], device=st.device)   # car 1 a 0.2 m gap ahead
+    st[:, 3] = 0.0
+    env.sim.state = st
+    _, rew, _, _, _ = env.step(torch.zeros(2, env.act_dim, device=st.device))
+    assert rew[0] < -0.3, rew                                             # following car: (0.5-0.2)/0.5 = 0.6
+    assert rew[1] > rew[0] and rew[1] > -0.05, rew                        # leading car: nothing

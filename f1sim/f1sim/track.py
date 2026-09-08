@@ -306,13 +306,16 @@ class Track:
         return t
 
     def with_lane_obstacles(self, seed: int = 0, n: int = 3, size=(0.25, 0.5), min_passage: float = 1.2,
-                            min_spacing: float = 4.0, kind: str = "box") -> "Track":
+                            min_spacing: float = 4.0, kind: str = "box", lateral: str = "side", on_path=None) -> "Track":
         """Copy of the track with n tall boxes (competition 'static obstacles') dropped into the lane,
-        placed against one side so at least min_passage of lane stays open, min_spacing apart."""
+        placed against one side so at least min_passage of lane stays open, min_spacing apart.
+        lateral="random": anywhere across the lane instead (the wider side must still leave min_passage);
+        on_path=(N,2): centred on that path instead (e.g. the raceline -- the exact line the car wants
+        to drive, so it has to leave it); kind="cyl": cylinders of diameter size[0] instead of boxes."""
         rng = np.random.default_rng(seed)
         if self.centerline is None:
             raise ValueError("lane obstacles need a centerline")
-        cl = self.centerline; N = len(cl)
+        cl = self.centerline if on_path is None else np.asarray(on_path, dtype=np.float64); N = len(cl)
         tang = np.roll(cl, -1, 0) - np.roll(cl, 1, 0); tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
         nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
         tall = self.tall.copy(); occ = self.occupancy.copy()
@@ -331,7 +334,16 @@ class Track:
             sx, sy = rng.uniform(*size), rng.uniform(*size)
             if 2 * half_w - sy < min_passage + 0.1:                # lane too narrow for an obstacle
                 continue
-            off = side * (half_w - sy / 2 - 0.05)                 # hug one side
+            if on_path is not None:
+                off = 0.0                                        # exactly on the line the car wants to drive
+                if half_w - sy / 2 < min_passage * 0.5:          # no room to go round on either side
+                    continue
+            elif lateral == "random":
+                off = float(rng.uniform(-(half_w - sy / 2 - 0.05), half_w - sy / 2 - 0.05))
+                if max(half_w - off - sy / 2, half_w + off - sy / 2) < min_passage:   # neither side passable
+                    continue
+            else:
+                off = side * (half_w - sy / 2 - 0.05)             # hug one side
             cx, cy = cl[i] + nrm[i] * off
             c1 = int(round((cx - self.origin[0]) / self.resolution)); r1 = int(round((cy - self.origin[1]) / self.resolution))
             if not (0 <= r1 < H and 0 <= c1 < W) or occ[r1, c1]: continue

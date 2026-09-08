@@ -52,6 +52,9 @@ class EnvConfig:
     reward_plan_clearance: float = 0.0    # plan mode: per-step penalty when the planned path passes closer than plan_margin to a wall
     plan_margin: float = 0.35             # [m] (the raceline keeps 0.40): a dense "do not plan into walls" signal, the planner's safety hook
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
+    reward_car_proximity: float = 0.0 # races: per-step penalty for closing on the car AHEAD (the following car
+                                      # is the one that must leave room; being overtaken is never penalized)
+    car_safe_dist: float = 0.50      # [m] bumper-to-bumper gap to the car ahead below which that penalty starts
     reward_alive: float = 0.0
     spawn_lateral_std: float = 0.3
     spawn_yaw_std: float = 0.2
@@ -86,6 +89,7 @@ class F1VecEnv:
         self.M = e.race_size
         ar = torch.arange(self.B, device=self.device)
         self.race, self.slot = ar // self.M, ar % self.M
+        self.car_len = float(self.cfg.vehicle.lf + self.cfg.vehicle.lr) + 0.17     # wheelbase + overhangs ~ the LiDAR silhouette
         self.learner = torch.ones(self.B, dtype=torch.bool, device=self.device)
         if self.M > 1 and e.opponent == "teacher":
             self.learner[self.slot > 0] = False
@@ -352,6 +356,18 @@ class F1VecEnv:
             _, yaw_c = self.sim.track.pose_at_s(s, tid)
             wrong_way = (torch.cos(state[:, 2] - yaw_c) < 0.0).float()      # more than 90 deg off the lane direction
         crash = collision.float()
+        car_pen = torch.zeros_like(wall_dist)
+        if self.M > 1 and e.reward_car_proximity > 0:
+            xy = state[:, :2].view(-1, self.M, 2); psi = state[:, 2].view(-1, self.M)
+            rel = xy[:, None, :, :] - xy[:, :, None, :]                 # (R, ego, other, 2) in world
+            c_, s_ = torch.cos(psi)[:, :, None], torch.sin(psi)[:, :, None]
+            lx = c_ * rel[..., 0] + s_ * rel[..., 1]                    # along the ego car's nose
+            d = rel.norm(dim=-1) + torch.eye(self.M, device=state.device)[None] * 1e3      # ignore self
+            gap = d - self.car_len                                       # ~bumper to bumper when in line
+            pen = ((e.car_safe_dist - gap).clamp(min=0.0) / e.car_safe_dist) * (lx > 0.0).float()
+            car_pen = pen.amax(2).reshape(-1)                            # the closest car ahead of each car
+            if e.proximity_speed_ref > 0:
+                car_pen = car_pen * (1.0 + state[:, 3].abs() / e.proximity_speed_ref)
         plan_pen = torch.zeros_like(wall_dist)
         if e.reward_plan_clearance > 0 and plan_ref.shape[1] > 1:      # clearance of the planned path (world frame) on the map
             c, sn = torch.cos(state[:, 2])[:, None], torch.sin(state[:, 2])[:, None]
@@ -361,7 +377,7 @@ class F1VecEnv:
             plan_pen = (e.plan_margin - clr).clamp(min=0.0) / e.plan_margin
         reward = (e.reward_progress * progress + e.reward_collision * crash - e.reward_collision_speed * crash * state[:, 3].abs()
                   - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity - e.reward_wrong_way * wrong_way
-                  - e.reward_plan_clearance * plan_pen + e.reward_alive)
+                  - e.reward_plan_clearance * plan_pen - e.reward_car_proximity * car_pen + e.reward_alive)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         terminated = collision.clone()
         truncated = (~terminated) & ((ep_step >= e.max_steps) | (lap >= e.laps))
