@@ -52,6 +52,12 @@ class EnvConfig:
     reward_plan_clearance: float = 0.0    # plan mode: per-step penalty when the planned path passes closer than plan_margin to a wall
     plan_margin: float = 0.35             # [m] (the raceline keeps 0.40): a dense "do not plan into walls" signal, the planner's safety hook
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
+    reward_plan_car: float = 0.0     # races, plan mode: per-step penalty when the planned path passes closer than
+                                     # plan_car_margin to where another car will be at that point of the plan
+                                     # (constant-velocity prediction). The wall version of this signal
+                                     # (reward_plan_clearance) is what taught the policy not to drive into walls;
+                                     # a static bubble around cars cannot tell "following" from "aiming at their back".
+    plan_car_margin: float = 0.55    # [m] centre-to-centre along the plan (a car is ~0.5 m long)
     reward_car_collision: float = 0.0 # races: penalty on top of reward_collision when the crash was into
                                       # another car (in a race that is a hit on someone else, not just your own race over)
     reward_car_proximity: float = 0.0 # races: per-step penalty for closing on the car AHEAD (the following car
@@ -305,7 +311,8 @@ class F1VecEnv:
         self.last_cmd = cmd
         e = self.ecfg
         self.ep_step += 1
-        plan_ref = self.tracker.last_ref if (self.tracker is not None and e.reward_plan_clearance > 0) else self._no_plan
+        plan_ref = (self.tracker.last_ref if (self.tracker is not None and (e.reward_plan_clearance > 0 or e.reward_plan_car > 0))
+                    else self._no_plan)
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap, plan_ref,
                          r.car_collision if r.car_collision is not None else self.sim.car_collision)
@@ -379,15 +386,30 @@ class F1VecEnv:
             if e.proximity_speed_ref > 0:
                 car_pen = car_pen * (1.0 + state[:, 3].abs() / e.proximity_speed_ref)
         plan_pen = torch.zeros_like(wall_dist)
-        if e.reward_plan_clearance > 0 and plan_ref.shape[1] > 1:      # clearance of the planned path (world frame) on the map
+        plan_car = torch.zeros_like(wall_dist)
+        want_plan = (e.reward_plan_clearance > 0 or (e.reward_plan_car > 0 and self.M > 1)) and plan_ref.shape[1] > 1
+        if want_plan:                                                  # the planned path in world coordinates
             c, sn = torch.cos(state[:, 2])[:, None], torch.sin(state[:, 2])[:, None]
             px = state[:, 0:1] + plan_ref[:, :, 0] * c - plan_ref[:, :, 1] * sn
             py = state[:, 1:2] + plan_ref[:, :, 0] * sn + plan_ref[:, :, 1] * c
+        if e.reward_plan_clearance > 0 and plan_ref.shape[1] > 1:      # clearance of that path on the map
             clr = self.sim.track.sample_edt(torch.stack([px, py], -1), tid[:, None]).min(1).values - 0.5 * self.cfg.vehicle.width
             plan_pen = (e.plan_margin - clr).clamp(min=0.0) / e.plan_margin
+        if e.reward_plan_car > 0 and self.M > 1 and plan_ref.shape[1] > 1:
+            T = px.shape[1]
+            t_ = torch.arange(T, device=px.device, dtype=px.dtype) * self.tracker.spec.dt      # time along the plan
+            oxy = state[:, :2].view(-1, self.M, 2); opsi = state[:, 2].view(-1, self.M); ov = state[:, 3].view(-1, self.M)
+            # where each car will be at t (constant velocity along its heading), (R, M, T, 2)
+            fx = oxy[..., 0:1] + (ov * torch.cos(opsi))[..., None] * t_
+            fy = oxy[..., 1:2] + (ov * torch.sin(opsi))[..., None] * t_
+            pxr = px.view(-1, self.M, T); pyr = py.view(-1, self.M, T)
+            d2 = (pxr[:, :, None, :] - fx[:, None, :, :]) ** 2 + (pyr[:, :, None, :] - fy[:, None, :, :]) ** 2   # (R, ego, other, T)
+            d2 = d2 + torch.eye(self.M, device=px.device)[None, :, :, None] * 1e6              # not against itself
+            near = d2.amin(3).amin(2).sqrt().reshape(-1)                                        # closest approach to any car
+            plan_car = (e.plan_car_margin - near).clamp(min=0.0) / e.plan_car_margin
         reward = (e.reward_progress * progress + e.reward_collision * crash - e.reward_collision_speed * crash * state[:, 3].abs()
                   - e.reward_steer_rate * steer_rate - e.reward_proximity * proximity - e.reward_wrong_way * wrong_way
-                  - e.reward_plan_clearance * plan_pen - e.reward_car_proximity * car_pen
+                  - e.reward_plan_clearance * plan_pen - e.reward_car_proximity * car_pen - e.reward_plan_car * plan_car
                   - e.reward_car_collision * car_crash + e.reward_alive)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         terminated = collision.clone()

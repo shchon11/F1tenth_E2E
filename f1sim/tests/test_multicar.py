@@ -120,3 +120,33 @@ def test_mixed_opponents_split_races_between_teacher_and_self_play():
     v = env.sim.state[:, 3].view(-1, 3)
     assert v[:2, 1:].abs().max() > 0.5                           # teacher cars drive anyway
     assert v[2:, 1:].abs().max() < 0.5 * float(v[:2, 1:].abs().max())   # self-play cars obey that, teacher cars do not
+
+
+def test_plan_car_penalty_fires_when_the_plan_aims_at_the_car_ahead():
+    """The planned path is scored against where the other cars will be, not where they are: a plan that
+    runs into a slow car ahead costs, the same plan with that car off to the side costs nothing."""
+    import torch
+    from f1sim import Config
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    tracks, _ = common.load_tracks(["gen:competition:0"])
+    cfg = Config(); cfg.rand.enabled = False
+    def rew(other_xy):
+        env = common.make_env(tracks, 2, dev, EnvConfig(race_size=2, opponent="policy", action_mode="plan", reward_plan_car=1.0,
+                                                        plan_car_margin=0.55, reward_progress=0.0, reward_alive=0.0, reward_steer_rate=0.0,
+                                                        reward_proximity=0.0, reward_wrong_way=0.0, reward_plan_clearance=0.0,
+                                                        reward_collision=0.0, reward_collision_speed=0.0), cfg=cfg, seed=1)
+        env.reset(seed=1)
+        a = torch.zeros(2, env.act_dim, device=env.device)                     # plan: straight ahead
+        env.step(a)                                                            # the tracker builds that plan
+        st = env.sim.state.clone()
+        st[0, :4] = torch.tensor([0.0, 0.0, 0.0, 3.0], device=st.device)       # ego at 3 m/s facing +x
+        st[1, :4] = torch.tensor([other_xy[0], other_xy[1], 0.0, 0.2], device=st.device)   # a crawling car
+        env.sim.state = st
+        _, r, _, _, _ = env.step(a)
+        return float(r[0])
+    in_the_way = rew((0.7, 0.0))
+    off_to_the_side = rew((0.7, 3.0))
+    assert in_the_way < -0.1, in_the_way
+    assert off_to_the_side > -0.01, off_to_the_side

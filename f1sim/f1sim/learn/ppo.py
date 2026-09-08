@@ -56,6 +56,8 @@ def main():
     ap.add_argument("--race-size", type=int, default=1, help="cars per track instance (>1: opponents in the LiDAR, car-car collisions)")
     ap.add_argument("--teacher-race-frac", type=float, default=0.5, help="--opponent mix: share of races driven by the teacher")
     ap.add_argument("--opponent", default="policy", choices=["policy", "teacher", "mix"], help="who drives cars 1..M-1: the policy (self-play) or the raceline teacher")
+    ap.add_argument("--plan-car-penalty", type=float, default=0.0, help="races: penalty when the planned path aims at where another car will be")
+    ap.add_argument("--plan-car-margin", type=float, default=0.55)
     ap.add_argument("--car-collision-penalty", type=float, default=0.0, help="races: extra penalty for crashing into another car")
     ap.add_argument("--car-proximity-penalty", type=float, default=0.0, help="races: per-step penalty for closing on the car ahead")
     ap.add_argument("--car-safe-dist", type=float, default=0.5, help="[m] bumper gap to the car ahead below which that penalty starts")
@@ -78,6 +80,7 @@ def main():
                                                               reward_car_proximity=a.car_proximity_penalty, car_safe_dist=a.car_safe_dist,
                                                               teacher_race_frac=a.teacher_race_frac,
                                                               reward_car_collision=a.car_collision_penalty,
+                                                              reward_plan_car=a.plan_car_penalty, plan_car_margin=a.plan_car_margin,
                                                               opp_speed_range=tuple(a.opp_speed), action_mode=a.action_mode), seed=a.seed, rls=rls)
     spec = common.obs_spec(env)
     obs, info = env.reset(seed=a.seed)

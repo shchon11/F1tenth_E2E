@@ -416,6 +416,16 @@ as every other, so a much slower car ahead is a situation the policy never pract
 `--opponent mix --teacher-race-frac`: a share of the races is driven by the raceline teacher at
 40-80 % speed (those cars do not learn, the lead car does), the rest stays self-play.
 
+That alone did not fix it either, and a contact autopsy said why. Of the learner's contacts with slow
+traffic, 75-89 % have the other car *ahead* (the policy is the following car, so its fault), only 1-5 %
+are the blind teacher car driving into it, and the median closing speed at impact is +0.03 to
++0.34 m/s with a metre of clear lane beside: it is not failing to brake, it tailgates a slower car
+with room to pass and nudges it. A static keep-away bubble cannot express that -- it forbids
+following as much as it forbids nudging -- so `--plan-car-penalty` scores the *planned path* against
+where each other car will be at that point of the plan (constant velocity), exactly as
+`--plan-clearance-penalty` scores it against the map. Planning through the space a car is leaving is
+free; aiming at where it will be is not.
+
 `+obl<seed>` (from ppo_v15) places the boxes **on the track's own racing line** instead of against a
 wall, which is the case the policy is worst at, and the training set grows to 188 tracks
 (`--tracks train`; `train_v14` and `train_v10` still name the earlier sets so their runs stay
