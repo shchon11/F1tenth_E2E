@@ -444,6 +444,13 @@ and a car is 0.31 m wide, so two abreast leave tens of centimetres, and at 6 m/s
 the policy and tracker can place the car. Race in traffic at ~5 m/s and open up when the road is clear.
 Contact per pass is the honest metric here: a policy that never attempts an overtake has no contacts.
 
+Late in a racing run the policy oscillates between cautious and aggressive from checkpoint to
+checkpoint (ppo_v17 swung 0.26-0.45 contacts with no trend), so the final checkpoint is a lottery
+ticket. `scripts/average_checkpoints.py` averages the weights of several late ones; for ppo_v17 the
+mean of updates 1000/1100/1200 beat each of them on three independent seeds -- 0.31 contacts against
+slow traffic versus 0.39 for update 1200, with slightly *more* overtakes (0.56 vs 0.54), i.e. 0.55
+contacts per pass instead of 0.72. Average before you ship.
+
 `+obl<seed>` (from ppo_v15) places the boxes **on the track's own racing line** instead of against a
 wall, which is the case the policy is worst at, and the training set grows to 188 tracks
 (`--tracks train`; `train_v14` and `train_v10` still name the earlier sets so their runs stay
