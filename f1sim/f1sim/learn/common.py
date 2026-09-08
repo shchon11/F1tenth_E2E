@@ -35,18 +35,21 @@ GEN_TRAIN = ["gen:competition:1000", "gen:competition:1001"]          # 1000 CCW
 DIRS = ("", "~rev", "~mir", "~mir~rev")
 
 
-def _train_set(real, pockets: bool = True):
+def _train_set(real, pockets: bool = True, on_line: bool = True):
     return ([f"real:{n}{d}" for n in real for d in DIRS]
             + [f"rt:{n}{d}" for n in RT_TRAIN for d in DIRS]
             + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]       # 1001 already is 1000's mirror
             # static box obstacles (CDC 2025 style cardboard boxes)
             + [f"real:{n}+obs{i}{d}" for i, n in enumerate(real) for d in DIRS]
             # dead-end side pockets (pit-lane mouths, alcoves): the held-out failure mode of ppo_v10
-            + ([f"real:{n}+pk{i}{d}" for i, n in enumerate(real) for d in DIRS] if pockets else []))
+            + ([f"real:{n}+pk{i}{d}" for i, n in enumerate(real) for d in DIRS] if pockets else [])
+            # boxes ON the racing line, not hugging a wall: the case ppo_v13 was worst at (0.49/car/20 s)
+            + ([f"real:{n}+obl{i}{d}" for i, n in enumerate(real) for d in DIRS] if on_line else []))
 
 
-TRAIN_TRACKS = _train_set(REAL_TRAIN)                          # 144 tracks (ppo_v11 on): 11 real layouts x 4 x {plain, boxes, pockets} + rt + gen
-TRAIN_TRACKS_V10 = _train_set(REAL_TRAIN_V10, pockets=False)   # 60 tracks: what ppo_v10 trains on (evaluate it on this)
+TRAIN_TRACKS_V14 = _train_set(REAL_TRAIN, on_line=False)       # 144 tracks: ppo_v11..v14
+TRAIN_TRACKS = _train_set(REAL_TRAIN)                          # 188 tracks (ppo_v15 on): + boxes on the racing line
+TRAIN_TRACKS_V10 = _train_set(REAL_TRAIN_V10, pockets=False, on_line=False)   # 60 tracks: what ppo_v10 trains on (evaluate it on this)
 # Held out entirely: the Korea 2025 championship map (the target venue style) and one TU Wien race.
 EVAL_TRACKS = ["real:korea_2025_iccas", "real:korea_2025_iccas~rev", "real:blackbox2022_3", "real:blackbox2022_3~rev",
                "real:blackbox2022_3~lane", "real:blackbox2022_3~lane~rev",       # the same hall with its forks walled off
@@ -60,6 +63,8 @@ def track_names(spec: str = "train") -> List[str]:
         return list(TRAIN_TRACKS)
     if spec == "train_v10":
         return list(TRAIN_TRACKS_V10)
+    if spec == "train_v14":
+        return list(TRAIN_TRACKS_V14)
     if spec == "eval":
         return list(EVAL_TRACKS)
     return [n.strip() for n in spec.split(",") if n.strip()]

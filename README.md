@@ -403,6 +403,11 @@ open one: it never trained with opponents, keeps no gap, and touches. ppo_v14 ad
 self-play races of 3 from ppo_v13's checkpoint with a dense penalty for closing on the car ahead
 (`--car-proximity-penalty`, the following car pays, being overtaken never does).
 
+`+obl<seed>` (from ppo_v15) places the boxes **on the track's own racing line** instead of against a
+wall, which is the case the policy is worst at, and the training set grows to 188 tracks
+(`--tracks train`; `train_v14` and `train_v10` still name the earlier sets so their runs stay
+reproducible).
+
 ppo_v11 starts
 from ppo_v10's update 300, which on its own 60 tracks is at teacher level (seen 0.02, mirrored 0.07
 at a 6 m/s cap; teacher 0.04) and on held-out 0.28 = blackbox2022_3 1.00 / 0.56, everything else

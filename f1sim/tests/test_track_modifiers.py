@@ -64,3 +64,21 @@ def test_lane_only_walls_off_side_rooms_but_not_the_lane():
     assert not t.occupancy[r, c].any()                                            # centerline still free
     assert np.allclose(Raceline.build_cached(t).xy, Raceline.build_cached(b).xy)   # same raceline
     assert len(maps.load("real:blackbox2022_3~lane~rev").centerline) == len(cl)
+
+
+def test_obstacles_on_the_racing_line_block_it_and_the_teacher_line_routes_around():
+    """+obl<seed>: boxes centred on the line the car wants to drive (not hugging a wall), and the
+    re-planned raceline for that track keeps the car's half width clear of them."""
+    import numpy as np
+    from scipy import ndimage
+    from f1sim import maps
+    from f1sim.raceline import Raceline
+    base = maps.load("real:blackbox2021_1"); t = maps.load("real:blackbox2021_1+obl0")
+    added = t.occupancy & ~base.occupancy
+    assert added.sum() * t.resolution ** 2 > 0.3                       # boxes exist
+    rl0 = Raceline.build_cached(base)
+    rc0 = np.stack([(rl0.xy[:, 1] - t.origin[1]) / t.resolution, (rl0.xy[:, 0] - t.origin[0]) / t.resolution])
+    assert ndimage.map_coordinates(t.edt, rc0, order=1, mode="nearest").min() < 0.05    # they block the old line
+    rl = Raceline.build_cached(t)
+    rc = np.stack([(rl.xy[:, 1] - t.origin[1]) / t.resolution, (rl.xy[:, 0] - t.origin[0]) / t.resolution])
+    assert ndimage.map_coordinates(t.edt, rc, order=1, mode="nearest").min() > 0.155    # the new line clears them
