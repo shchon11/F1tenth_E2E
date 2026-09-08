@@ -426,20 +426,23 @@ where each other car will be at that point of the plan (constant velocity), exac
 `--plan-clearance-penalty` scores it against the map. Planning through the space a car is leaving is
 free; aiming at where it will be is not.
 
-How well it races today, measured against teacher-driven cars (which never yield), 192 learner cars
-per row, crashes and overtakes per car per 20 s:
+`scripts/capability_report.py <ckpt>` prints what a policy can actually do, deterministic, 20 s per
+car, on the held-out maps. For ppo_v17 at update 1000 (crashes per car per 20 s):
 
-| speed cap | contact | overtakes | contact per overtake | progress |
-|---|---|---|---|---|
-| 3.5 m/s | 0.18 | 0.26 | 0.7 | 66 m |
-| 5.0 m/s | 0.23 | 0.40 | 0.6 | 74 m |
-| 6.0 m/s | 0.45 | 0.47 | 1.0 | 75 m |
+| static obstacles | cap 4 | cap 6 |   | racing (vs teacher cars) | contact | overtakes | per pass |
+|---|---|---|---|---|---|---|---|
+| none | 0.00 | 0.04 |   | cap 5, similar speed | 0.04 | 0.46 | 0.09 |
+| boxes at the lane side | 0.00 | 0.00 |   | cap 5, slow traffic | 0.17 | 0.42 | 0.40 |
+| big boxes, cylinders (unseen kinds) | 0.00 | 0.04 |   | cap 6, similar speed | 0.17 | 0.46 | 0.36 |
+| anywhere across the lane | 0.06 | 0.12 |   | cap 6, slow traffic | 0.33 | 0.33 | 1.00 |
+| on the racing line | 0.10 | 0.15 |   | | | | |
 
-Same-speed racing is fine (0.19-0.28 contact) and wall crashes in traffic are ~0.02, i.e. the driving
-itself does not degrade with cars around. Passing much slower traffic is the open problem, and the
-speed scaling says it is not only judgment: an F1TENTH lane is 1.5-2.0 m and a car is 0.31 m wide, so
-two abreast leave tens of centimetres, and at 6 m/s that gap is beyond what the policy and tracker
-place the car within. Until that improves, racing in traffic belongs at ~5 m/s.
+Boxes on the racing line, ppo_v13's worst static case at 0.60, are down to 0.15 now that `+obl`
+tracks are in training. Racing is clean at 5 m/s (a contact every 11 passes against cars of its own
+speed, every 2.5 passes through slow traffic) and degrades sharply at 6: an F1TENTH lane is 1.5-2.0 m
+and a car is 0.31 m wide, so two abreast leave tens of centimetres, and at 6 m/s that is beyond where
+the policy and tracker can place the car. Race in traffic at ~5 m/s and open up when the road is clear.
+Contact per pass is the honest metric here: a policy that never attempts an overtake has no contacts.
 
 `+obl<seed>` (from ppo_v15) places the boxes **on the track's own racing line** instead of against a
 wall, which is the case the policy is worst at, and the training set grows to 188 tracks
