@@ -130,7 +130,8 @@ def min_curvature_raceline(center: np.ndarray, w_left: Optional[np.ndarray] = No
     for it in range(iters):
         ds = float(np.linalg.norm(np.roll(c, -1, 0) - c, axis=1).mean())
         if reparam:
-            p = c; n = normals(p)
+            c = _detour_obstacles(track, c, veh_width / 2 + margin_min)   # an obstacle on the line: go round it first,
+            p = c; n = normals(p)                                          # else both widths collapse and the line sits in it
             wl, wr = track_widths(track, p)
             if width_cap is not None:
                 wl = np.minimum(wl, width_cap); wr = np.minimum(wr, width_cap)
@@ -186,16 +187,36 @@ def min_curvature_raceline(center: np.ndarray, w_left: Optional[np.ndarray] = No
     return race
 
 
-def _push_clear(track: Track, pts: np.ndarray, clearance: float, iters: int = 30, tol: float = 0.02) -> np.ndarray:
-    """Nudge points closer than `clearance` (minus tol) to any obstacle outwards along the distance
-    gradient, smoothing the neighbourhood of moved points so the nudge does not leave a kink
-    (a 1 cm step between 8 cm samples is a curvature of ~1.5 1/m)."""
+def _signed_field(track: Track):
+    """(signed distance, d/dx, d/dy) on the map grid: +distance to the nearest obstacle outside them,
+    -distance to the nearest free cell inside them. The plain EDT is flat zero inside an obstacle, so a
+    point that ended up *in* one (an obstacle dropped on the reference line) has no gradient to escape
+    along; with the signed field it does. Cached on the track."""
     from scipy import ndimage
-    gy, gx = np.gradient(track.edt, track.resolution)
+    c = getattr(track, "_sdf_cache", None)
+    if c is None:
+        inside = ndimage.distance_transform_edt(track.occupancy).astype(np.float32) * track.resolution
+        sd = (track.edt - inside).astype(np.float32)
+        gy, gx = np.gradient(sd, track.resolution)
+        c = (sd, gx.astype(np.float32), gy.astype(np.float32))
+        try:
+            track._sdf_cache = c
+        except Exception:
+            pass
+    return c
+
+
+def _push_clear(track: Track, pts: np.ndarray, clearance: float, iters: int = 30, tol: float = 0.02) -> np.ndarray:
+    """Nudge points closer than `clearance` (minus tol) to any obstacle outwards along the signed
+    distance gradient, smoothing the neighbourhood of moved points so the nudge does not leave a kink
+    (a 1 cm step between 8 cm samples is a curvature of ~1.5 1/m). Points inside an obstacle are pushed
+    out to the nearest free side, which is how a line with a box dropped on it becomes a line around it."""
+    from scipy import ndimage
+    sd, gx, gy = _signed_field(track)
     xy = pts.copy(); N = len(xy); moved = np.zeros(N, bool)
     def clear(xy):
         rc = np.stack([(xy[:, 1] - track.origin[1]) / track.resolution, (xy[:, 0] - track.origin[0]) / track.resolution])
-        return rc, ndimage.map_coordinates(track.edt, rc, order=1, mode="nearest")
+        return rc, ndimage.map_coordinates(sd, rc, order=1, mode="nearest")
     for it in range(iters):
         rc, d = clear(xy)
         bad = d < clearance - tol
@@ -208,9 +229,81 @@ def _push_clear(track: Track, pts: np.ndarray, clearance: float, iters: int = 30
         moved |= bad
         w = ndimage.binary_dilation(moved, iterations=4)            # wrap-around neighbourhood
         w |= np.roll(moved, 4) | np.roll(moved, -4)
-        sm = 0.5 * xy + 0.25 * (np.roll(xy, 1, 0) + np.roll(xy, -1, 0))
-        xy[w] = sm[w]
+        w &= ~bad                                                   # smooth around the detour, never the escaping
+        sm = 0.5 * xy + 0.25 * (np.roll(xy, 1, 0) + np.roll(xy, -1, 0))   # points themselves: averaging them back
+        xy[w] = sm[w]                                               # into the obstacle is how this used to oscillate
     return resample_closed(xy, N) if moved.any() else pts
+
+
+def _smooth_keep_clear(track: Track, pts: np.ndarray, clearance: float, iters: int = 400) -> np.ndarray:
+    """Laplacian smoothing that only accepts a move while the point keeps `clearance`. The fallback
+    reference is a raw map centerline plus detour bumps: collision-free but as noisy as the SLAM map,
+    and a line the tracker cannot follow (curvature spikes) is as useless as one through a wall."""
+    from scipy import ndimage
+    sd, _, _ = _signed_field(track)
+    def clr(xy):
+        rc = np.stack([(xy[:, 1] - track.origin[1]) / track.resolution, (xy[:, 0] - track.origin[0]) / track.resolution])
+        return ndimage.map_coordinates(sd, rc, order=1, mode="nearest")
+    xy = pts.copy()
+    for _ in range(iters):
+        sm = 0.5 * xy + 0.25 * (np.roll(xy, 1, 0) + np.roll(xy, -1, 0))
+        ok = clr(sm) >= clearance
+        if not ok.any():
+            break
+        xy[ok] = sm[ok]
+    return xy
+
+
+def _detour_obstacles(track: Track, pts: np.ndarray, clearance: float, window_m: float = 2.5) -> np.ndarray:
+    """Route a closed line around whatever blocks it: for each blocked stretch, offset the line sideways
+    by a raised-cosine bump over a window, growing the amplitude until the stretch clears and taking the
+    side with more room. Gradient nudging (_push_clear) can only escape a wall it is *near*; a box
+    dropped on the line needs a detour with a shape, or the smoothing pulls the line back into it."""
+    from scipy import ndimage
+    sd, _, _ = _signed_field(track)
+    def clr(xy):
+        rc = np.stack([(xy[:, 1] - track.origin[1]) / track.resolution, (xy[:, 0] - track.origin[0]) / track.resolution])
+        return ndimage.map_coordinates(sd, rc, order=1, mode="nearest")
+    N = len(pts)
+    d = clr(pts)
+    bad = d < clearance - 0.02
+    if not bad.any() or bad.all():
+        return pts
+    ds = float(np.linalg.norm(np.roll(pts, -1, 0) - pts, axis=1).mean())
+    W = max(4, int(round(window_m / max(ds, 1e-6))))
+    idx = np.nonzero(bad)[0]
+    runs = np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1)
+    if len(runs) > 1 and bad[0] and bad[-1]:                       # wrap-around run
+        runs = [np.concatenate([runs[-1], runs[0]])] + runs[1:-1]
+    xy = pts.copy()
+    for run in runs:
+        n = normals(xy)
+        c0 = int(run[len(run) // 2])
+        half = len(run) // 2 + W
+        win = (np.arange(c0 - half, c0 + half + 1)) % N
+        u = np.linspace(-np.pi, np.pi, len(win))
+        bump = 0.5 * (1.0 + np.cos(u))                             # 1 in the middle, 0 and flat at the ends
+        probe = 0.6
+        left = clr(xy[run] + n[run] * probe).mean(); right = clr(xy[run] - n[run] * probe).mean()
+        best = None
+        steps = np.linspace(0.0, 1.0, 26)[None, :, None]                # for the crossing test
+        for side in ((1.0, -1.0) if left >= right else (-1.0, 1.0)):
+            for A in np.linspace(0.15, 1.8, 23):
+                cand = xy.copy()
+                cand[win] = xy[win] + n[win] * (side * A * bump)[:, None]
+                # the offset must sweep through free space the whole way: a bump that merely lands in the
+                # open floor beyond a duct hose has fine clearance at both ends and crosses the boundary
+                sweep = (xy[win][:, None, :] + (cand[win] - xy[win])[:, None, :] * steps).reshape(-1, 2)
+                m = min(float(clr(cand[win]).min()), float(clr(sweep).min()) + 1e-9)
+                if best is None or m > best[0]:
+                    best = (m, cand)
+                if m >= clearance:
+                    break
+            if best is not None and best[0] >= clearance:
+                break
+        if best is not None:
+            xy = best[1]
+    return resample_closed(xy, N)
 
 
 def speed_profile(pts: np.ndarray, v_max: float = 10.0, a_lat: float = 6.0, a_acc: float = 4.0,
@@ -257,10 +350,30 @@ class Raceline:
         if track.centerline is None:
             raise ValueError("track needs a centerline")
         c = resample_closed(track.centerline, len(track.centerline))
+        c = _detour_obstacles(track, c, veh_width / 2 + 0.12)   # obstacles dropped on the centerline (competition boxes)
         wl, wr = track_widths(track, c)
         cap = width_cap_ratio * float(np.median(wl + wr)) if width_cap_ratio else None
         xy = min_curvature_raceline(c, veh_width=veh_width, margin=margin, iters=iters, smooth=smooth,
                                     track=track, width_cap=cap)
+        # Never hand back a line that hits something. The corridor model (one interval along the
+        # reference normal) cannot always route around an obstacle in a narrow lane -- a 0.5 m box in a
+        # 1.7 m lane leaves no feasible band -- and then the optimizer returns a spike through it. The
+        # cleared reference itself is collision-free by construction, so fall back to it.
+        from scipy import ndimage as _ndi
+        def _min_clear(pts):
+            rc = np.stack([(pts[:, 1] - track.origin[1]) / track.resolution, (pts[:, 0] - track.origin[0]) / track.resolution])
+            return float(_ndi.map_coordinates(track.edt, rc, order=1, mode="nearest").min())
+        if _min_clear(xy) < veh_width / 2 or float(np.abs(curvature(xy)).max()) > 4.0:
+            safe = _smooth_keep_clear(track, _detour_obstacles(track, c, veh_width / 2 + 0.10), veh_width / 2 + 0.08)
+            safe = resample_closed(_push_clear(track, safe, veh_width / 2 + 0.05), len(safe))
+            # the first solve started from a reference that ran through the obstacles, so its corridor was
+            # degenerate; from a cleared reference the same optimizer has a well-posed problem
+            retry = min_curvature_raceline(safe, veh_width=veh_width, margin=margin, iters=iters, smooth=smooth,
+                                           track=track, width_cap=cap)
+            cands = [xy, safe, retry]
+            clear_ok = [p for p in cands if _min_clear(p) >= veh_width / 2]
+            xy = (min(clear_ok, key=lambda p: float(np.abs(curvature(p)).max())) if clear_ok
+                  else max(cands, key=_min_clear))      # nothing is clean: take the one that hits least
         v = speed_profile(xy, v_max, a_lat, a_acc, a_brake)
         return Raceline.from_xy(xy, v)
 
@@ -276,7 +389,7 @@ class Raceline:
         params = {k: v.default for k, v in inspect.signature(Raceline.build).parameters.items() if k != "track"}
         params.update(kw)                                  # key includes the *effective* parameters, defaults too
         cl = b"" if track.centerline is None else np.asarray(track.centerline, dtype=np.float32).tobytes()
-        h = hashlib.md5(np.packbits(track.occupancy).tobytes() + cl + repr(sorted(params.items())).encode() + b"rl4").hexdigest()[:12]
+        h = hashlib.md5(np.packbits(track.occupancy).tobytes() + cl + repr(sorted(params.items())).encode() + b"rl12").hexdigest()[:12]
         path = os.path.join(cache_dir, f"{track.name}_{h}.csv")
         if os.path.exists(path):
             return Raceline.load(path)

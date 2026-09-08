@@ -390,9 +390,15 @@ What it can and cannot do (deterministic, 6 held-out/clean maps, 20 s per car, c
 | obstacles centred on the raceline | 4.42 | 0.60 |
 | race of 3 vs raceline-teacher cars (never trained with cars) | - | 0.46 (0.44 of it car contact), 0.56 overtakes |
 
-So static-obstacle avoidance generalizes past the kind it trained on, and it is an order of magnitude
-better than the teacher when something sits on the racing line -- the min-curvature optimizer does not
-route around mid-lane obstacles, which is a raceline bug to fix, not a policy limit. Car-to-car is the
+So static-obstacle avoidance generalizes past the kind it trained on. The raceline row was a bug in
+the *teacher*, since fixed: the reference the optimizer starts from is the map centerline, an obstacle
+dropped on it collapsed both measured widths, the corridor became infeasible and the line went through
+the box -- and the repair step could not push a point out of an obstacle because the plain EDT is flat
+zero inside one. Now `Raceline.build` works on a signed distance field, routes the reference around
+blockages with raised-cosine detours (rejecting any that sweep across a boundary, e.g. hopping a duct
+hose into the hall beyond), and re-solves from that cleared reference, keeping the smoothest
+collision-free candidate. Teacher crashes with boxes on its own line: 4.42 -> 0.09 (0.5-0.9 m boxes:
+4.33 -> 0.96); clean-track racelines are bit-identical in lap time. Car-to-car is the
 open one: it never trained with opponents, keeps no gap, and touches. ppo_v14 addresses exactly that:
 self-play races of 3 from ppo_v13's checkpoint with a dense penalty for closing on the car ahead
 (`--car-proximity-penalty`, the following car pays, being overtaken never does).
