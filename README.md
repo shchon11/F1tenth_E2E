@@ -399,9 +399,16 @@ blockages with raised-cosine detours (rejecting any that sweep across a boundary
 hose into the hall beyond), and re-solves from that cleared reference, keeping the smoothest
 collision-free candidate. Teacher crashes with boxes on its own line: 4.42 -> 0.09 (0.5-0.9 m boxes:
 4.33 -> 0.96); clean-track racelines are bit-identical in lap time. Car-to-car is the
-open one: it never trained with opponents, keeps no gap, and touches. ppo_v14 addresses exactly that:
-self-play races of 3 from ppo_v13's checkpoint with a dense penalty for closing on the car ahead
-(`--car-proximity-penalty`, the following car pays, being overtaken never does).
+open one: it never trained with opponents, keeps no gap, and touches. ppo_v14 addressed exactly that: self-play races of 3
+from ppo_v13's checkpoint with a dense penalty for closing on the car ahead
+(`--car-proximity-penalty`, the following car pays, being overtaken never does). Measured at update
+600 against teacher cars with 192 learner cars per configuration, it did not work: 0.20-0.46 contacts
+per car per 20 s, the same as ppo_v13, while solo driving got better (0.01, 82 m). The reason is
+probably that the policy cannot see a closing speed at all -- three stacked scans one control step
+apart span 50 ms, in which a car closing at 2 m/s moves 10 cm, about the LiDAR's own noise. ppo_v15
+therefore stacks the same three scans 4 steps apart (200 ms, the same tensor shape, so ppo_v14's
+weights load straight in), charges more for hitting a car than a wall
+(`--car-collision-penalty`), and trains on the 188-track set that includes boxes on the racing line.
 
 `+obl<seed>` (from ppo_v15) places the boxes **on the track's own racing line** instead of against a
 wall, which is the case the policy is worst at, and the training set grows to 188 tracks
