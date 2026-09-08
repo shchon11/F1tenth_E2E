@@ -472,6 +472,13 @@ ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:2 policy:
 * `dagger.py`: teacher drives / student drives with teacher labels, aggregated buffer, Huber loss.
 * `ppo.py`: asymmetric-critic PPO from the DAgger student, KL-to-imitation regularizer that decays,
   value clipping, speed-cap curriculum, per-episode metrics (collision rate, progress, lap time).
+The whole deployment path is measured, not assumed: observation build + policy forward + iLQR tracker
+is **0.84 ms per control step on two CPU threads** (25 ms available at 40 Hz), and the full simulated
+stack runs end to end headless -- `ros2 launch f1sim_ros f1tenth_stack_sim.launch.py
+map:=real:korea_2025_iccas viewer:=false teleop:=false policy:=<ckpt>` drives the car at 2.8-4.2 m/s
+through vesc_sim. (The node's own "inference NN ms" line reads 15-28 ms while a training job owns the
+GPU; that is contention, not the model.)
+
 * `policy_node.py` (f1sim_ros): /scan + /odom + /sensors/imu -> /drive, same ObsBuilder; the
   launch's `policy:=` argument starts it against the simulated stack.
 
