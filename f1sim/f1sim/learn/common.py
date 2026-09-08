@@ -78,11 +78,11 @@ def load_tracks(names, racelines: bool = False):
 
 def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg: Optional[Config] = None, seed: int = 0,
              rls=None):
-    """rls: racelines (one per track) -- required when env_cfg.opponent == "teacher" (opponents follow them)."""
+    """rls: racelines (one per track) -- required when env_cfg.opponent in ("teacher", "mix") (opponents follow them)."""
     cfg = cfg or Config()
     cfg.sim.seed = seed
     env = F1VecEnv(tracks, cfg, env_cfg or EnvConfig(), num_envs=num_envs, device=device)
-    if env.M > 1 and env.ecfg.opponent == "teacher":
+    if env.M > 1 and env.ecfg.opponent in ("teacher", "mix"):
         if rls is None:
             rls = [Raceline.build_cached(t) for t in tracks]
         env.set_teacher(make_teacher(rls, env))

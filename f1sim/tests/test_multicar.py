@@ -96,3 +96,27 @@ def test_car_proximity_penalty_falls_on_the_following_car_only():
     _, rew, _, _, _ = env.step(torch.zeros(2, env.act_dim, device=st.device))
     assert rew[0] < -0.3, rew                                             # following car: (0.5-0.2)/0.5 = 0.6
     assert rew[1] > rew[0] and rew[1] > -0.05, rew                        # leading car: nothing
+
+
+def test_mixed_opponents_split_races_between_teacher_and_self_play():
+    """opponent='mix': a share of the races is driven by the raceline teacher (so the policy meets cars
+    much slower than itself, which self-play never produces), the rest is self-play with every car learning."""
+    import torch
+    from f1sim import Config
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    tracks, rls = common.load_tracks(["gen:competition:0"], racelines=True)
+    cfg = Config(); cfg.rand.enabled = False
+    env = common.make_env(tracks, 12, dev, EnvConfig(race_size=3, opponent="mix", teacher_race_frac=0.5,
+                                                     opp_speed_range=(0.4, 0.6), action_mode="plan"), cfg=cfg, seed=2, rls=rls)
+    env.reset(seed=2)
+    lm = env.learner.view(-1, 3)
+    assert lm[:, 0].all()                                        # the lead car of every race learns
+    assert (~lm[:2, 1:]).all() and lm[2:, 1:].all()              # first half teacher-driven, rest self-play
+    a = torch.zeros(12, env.act_dim, device=env.device); a[:, -2:] = -1.0   # policy asks for the lowest speed
+    for _ in range(20):
+        env.step(a)
+    v = env.sim.state[:, 3].view(-1, 3)
+    assert v[:2, 1:].abs().max() > 0.5                           # teacher cars drive anyway
+    assert v[2:, 1:].abs().max() < 0.5 * float(v[:2, 1:].abs().max())   # self-play cars obey that, teacher cars do not

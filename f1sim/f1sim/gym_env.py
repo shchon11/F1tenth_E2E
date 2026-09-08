@@ -69,6 +69,9 @@ class EnvConfig:
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
+    teacher_race_frac: float = 0.0   # opponent == "mix": share of races whose non-lead cars are teacher-driven
+                                     # (self-play alone never produces a much slower car ahead, which is the
+                                     # case a racing policy has to practise: lapping traffic)
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
                                      # "teacher": cars 1..M-1 follow the raceline teacher at a random speed scale
     opp_speed_range: tuple = (0.6, 1.0)   # teacher opponents: speed-profile scale per race per reset
@@ -95,6 +98,9 @@ class F1VecEnv:
         self.learner = torch.ones(self.B, dtype=torch.bool, device=self.device)
         if self.M > 1 and e.opponent == "teacher":
             self.learner[self.slot > 0] = False
+        elif self.M > 1 and e.opponent == "mix":               # first races teacher-driven, rest self-play
+            n_t = int(round(e.teacher_race_frac * (self.B // self.M)))
+            self.learner[(self.race < n_t) & (self.slot > 0)] = False
         self.learner_ids = torch.nonzero(self.learner).flatten()
         self.teacher = None                                    # set_teacher() for opponent == "teacher"
         self.opp_scale = torch.ones(self.B, device=self.device)
@@ -253,7 +259,7 @@ class F1VecEnv:
             self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.act_dim, device=self.device)], 1)[:, None, :]
 
     def _opponent_actions(self, action: torch.Tensor) -> torch.Tensor:
-        if self.M == 1 or self.ecfg.opponent != "teacher":
+        if self.M == 1 or self.ecfg.opponent not in ("teacher", "mix") or bool(self.learner.all()):
             return action
         if self.teacher is None:
             raise RuntimeError("opponent == 'teacher' needs env.set_teacher(RacelineTeacher)")

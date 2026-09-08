@@ -409,6 +409,12 @@ apart span 50 ms, in which a car closing at 2 m/s moves 10 cm, about the LiDAR's
 therefore stacks the same three scans 4 steps apart (200 ms, the same tensor shape, so ppo_v14's
 weights load straight in), charges more for hitting a car than a wall
 (`--car-collision-penalty`), and trains on the 188-track set that includes boxes on the racing line.
+That worked: against cars of its own speed, contact fell from 0.46 to 0.18-0.20 per car per 20 s by
+update 300, and boxes on the racing line from 0.57 to 0.18. What it did not fix is lapping *slower*
+traffic (0.28-0.38), and the reason is the training distribution: in self-play every car is as fast
+as every other, so a much slower car ahead is a situation the policy never practises. Hence
+`--opponent mix --teacher-race-frac`: a share of the races is driven by the raceline teacher at
+40-80 % speed (those cars do not learn, the lead car does), the rest stays self-play.
 
 `+obl<seed>` (from ppo_v15) places the boxes **on the track's own racing line** instead of against a
 wall, which is the case the policy is worst at, and the training set grows to 188 tracks
