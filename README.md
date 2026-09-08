@@ -460,7 +460,7 @@ python3 -m f1sim.learn.dagger --name dagger_v1 --envs 1024 --iters 8 --steps 250
 python3 -m f1sim.learn.ppo --name ppo_v1 --init ~/f1sim_runs/dagger_v1/student_latest.pt --envs 2048 --total 100e6
 python3 -m f1sim.learn.evaluate ~/f1sim_runs/ppo_v1/ppo_latest.pt --sweep          # held-out tracks + mu/latency/lidar-height sweeps
 python3 -m f1sim.learn.evaluate --teacher                                            # the baseline to beat
-python3 -m f1sim.learn.export ~/f1sim_runs/ppo_v13/ppo_final.pt --trt               # ONNX (+ TensorRT) for the Jetson
+python3 -m f1sim.learn.export ~/f1sim_runs/ppo_v13/ppo_final.pt --trt               # one self-contained .onnx (+ .json spec) for the Jetson
 # races: fine-tune a single-car policy against teacher-driven opponents (only car 0 learns), then self-play
 python3 -m f1sim.learn.ppo --name ppo_race --init ~/f1sim_runs/ppo_v4/ppo_final.pt --race-size 3 --opponent teacher --scan-stride 3 --kl-coef 0
 python3 -m f1sim.learn.ppo --name ppo_selfplay --init ~/f1sim_runs/ppo_race/ppo_final.pt --race-size 3 --opponent policy --scan-stride 3 --kl-coef 0
