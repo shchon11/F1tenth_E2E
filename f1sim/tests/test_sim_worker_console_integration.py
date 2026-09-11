@@ -112,8 +112,39 @@ def test_the_facts_reached_the_window(live):
     assert live.window.viewport.color_v_max > 0
 
 
+def gl_state(window):
+    """What the viewport's GL actually is, for a failure message that names the cause.
+
+    `_apply_geometry` returns early while `scene is None` (`viewport.py:511-512`), and `scene` is
+    built in `initializeGL` -- which never runs if the widget's context cannot be made current. So a
+    geometry upload that never arrives is usually a GL-context story, not a worker one, and these
+    three values distinguish them without changing what the test requires.
+    """
+    from PyQt5 import QtWidgets
+    vp = window.viewport
+    app = QtWidgets.QApplication.instance()
+    return (f"platform={app.platformName() if app else None!r} "
+            f"scene={'built' if getattr(vp, 'scene', None) is not None else 'None'} "
+            f"gl_error={getattr(vp, '_gl_error', None)!r} "
+            f"pending_geometry={'yes' if getattr(vp, '_pending_geometry', None) is not None else 'no'} "
+            f"state={window.state}")
+
+
 def test_geometry_uploaded_and_the_viewport_has_a_map(live):
-    live.wait_for(lambda: live.window.viewport.geometry_data is not None, what="geometry upload")
+    try:
+        live.wait_for(lambda: live.window.viewport.geometry_data is not None,
+                      what="geometry upload",
+                      # Default is the fixture's own 300 s, unchanged. The override exists so the
+                      # diagnostic below can be forced to fire on demand and verified, rather than
+                      # being trusted to work during a 16-minute run.
+                      timeout=float(os.environ.get("F1SIM_GEOMETRY_WAIT", "300")))
+    except BaseException:
+        # BaseException, not Exception: `pytest.fail` raises `Failed`, whose MRO is
+        # Failed -> OutcomeException -> BaseException. `issubclass(Failed, Exception)` is False, so
+        # an `except Exception` here catches nothing and the diagnostic stays silent through a
+        # 16-minute run -- which is exactly what happened before this was corrected.
+        print(f"\nGL DIAGNOSTIC at failure: {gl_state(live.window)}", flush=True)
+        raise
     geom = live.window.viewport.geometry_data
     assert geom.nbytes() > 0 and geom.build_ms > 0
     assert geom.bounds[2] > geom.bounds[0] and geom.bounds[3] > geom.bounds[1]

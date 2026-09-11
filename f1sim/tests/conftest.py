@@ -7,6 +7,35 @@ import dataclasses                                                     # noqa: E
 import pytest                                                          # noqa: E402
 
 
+def pytest_configure(config):
+    """Under the software-GL contract, keep headless viewer contexts off EGL.
+
+    `NativeViewer(headless=True)` asks for `create_standalone_context(backend="egl")`
+    (`native.py:120`); EGL ignores `CUDA_VISIBLE_DEVICES` / `LIBGL_ALWAYS_SOFTWARE` /
+    `GALLIUM_DRIVER` and can hand back a GPU context, which also breaks any Qt GLX context made
+    later in the process. Dropping the backend takes the GLX path (llvmpipe under Xvfb).
+
+    moderngl is an optional viewer dependency: without it there is nothing to patch and the
+    non-viewer tests must still collect and run.
+    """
+    if os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1" or not os.environ.get("DISPLAY"):
+        return
+    try:
+        import moderngl
+    except Exception:                          # optional extra absent, or present but unimportable
+        return
+    if getattr(moderngl, "_f1sim_tests_software_gl", False):
+        return
+    original = moderngl.create_standalone_context
+
+    def software_standalone(*args, **kw):
+        kw.pop("backend", None)
+        return original(*args, **kw)
+
+    moderngl.create_standalone_context = software_standalone
+    moderngl._f1sim_tests_software_gl = True
+
+
 @pytest.fixture(scope="session")
 def tmp_legacy_run(tmp_path_factory):
     """A run directory holding one checkpoint the DEFAULT consumer can open, built here.

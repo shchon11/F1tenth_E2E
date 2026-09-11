@@ -1,0 +1,33 @@
+{
+ "_what": "The three systems in the published measured table, as a roster the CLI can load. IDs, checkpoint hashes, arms and cross_runtime are copied verbatim from the roster that was actually scored; only the paths are rewritten as ordinary relative paths.",
+ "_paths": "Relative, and fully expanded (no placeholders). `report` never opens these files \u2014 it reads metadata only \u2014 so the table regenerates from the published rows without any weights. To SCORE fresh, place the real files at these paths; `plan`/`run` re-hash them and refuse a mismatch.",
+ "_scored_roster_sha256": "31da4887a6701a56f1b35c33927c4d47d2177f6277951435dc73d1d99fa823b4",
+ "_subset_reason": "representative subset selected for time before any score was judged",
+ "systems": [
+  {
+   "system_id": "frozen_original@legacy",
+   "path": "checkpoints/frozen_original_48cc698f.pt",
+   "checkpoint_sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef",
+   "controller_arm": "legacy",
+   "note": "immutable read-only copy; ppo_latest.pt is a moving pointer and is refused"
+  },
+  {
+   "system_id": "frozen_original@estimated",
+   "path": "checkpoints/frozen_original_48cc698f.pt",
+   "checkpoint_sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef",
+   "controller_arm": "estimated",
+   "estimator_path": "estimators/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "cross_runtime": true,
+   "note": "legacy-trained under the estimated runtime: a declared cross-runtime reference"
+  },
+  {
+   "system_id": "cl_main_estimated_s501@estimated",
+   "path": "checkpoints/cl_main_estimated_s501_ppo_final.pt",
+   "checkpoint_sha256": "e7f01759708d541136b2165f1a05a9e5a21e63963fd35a732d6eacd75e591d87",
+   "controller_arm": "estimated",
+   "estimator_path": "estimators/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf"
+  }
+ ]
+}

@@ -139,6 +139,14 @@ the budget comparable across tracks of different length. `--tracks eval` uses th
 Report first-attempt outcomes from a frozen checkpoint on the held-out set. Numbers from a run's own
 training tracks are not evidence of generalisation.
 
+To compare several finished checkpoints against each other rather than measure one, use the
+[checkpoint benchmark](benchmark.md): a frozen scenario suite with pinned weights, covering driving,
+stability, per-surface retention, obstacle avoidance and overtaking.
+
+```bash
+python3 -m f1sim.learn.benchmark plan        # matrix and trial counts; loads no checkpoint
+```
+
 ## Watching a run
 
 **With no arguments, this opens the PyQt5 driving console** — one window to pick a policy and a map
@@ -229,6 +237,24 @@ controller × learning interaction.
 That evaluation is separate from the frozen-actor grid across the four arms, which holds one policy
 fixed and varies only the controller; the two answer different questions and neither substitutes for
 the other.
+
+The follow-up asked whether a **training-recipe** change recovers the low-friction loss, screening
+the two existing options — restoring the auxiliary friction-prediction objective (`aux`, whose head
+is supervised with true µ; note the training critic separately receives privileged state and
+parameters including true µ in every recipe, while the **actor** inputs exclude it at training and
+deployment alike) and raising the initial KL coefficient
+from 0.05 to 0.20 (`anchor`) — alone and together, two seeds each, all under the `estimated` arm.
+**No recipe was eligible**: the best reached +1.875 pp mean low-friction gain against a required
+≥ 2 pp. The criteria were fixed before the final selection and before the outcomes were inspected,
+and the threshold was not changed after the fact. For every recipe the two training seeds also
+disagree in sign at low friction, so these runs give insufficient evidence of a robust method-level
+benefit. These are engineering eligibility gates, not a significance or power analysis. Protocol,
+per-trial data and the independent eligibility audit:
+[Can a training-recipe change recover low-friction completion?](research/static-grip-retention-2026-09-12.md).
+
+Note that `aux` is not only an objective change: during the first 10 updates PPO's policy gradient
+and KL term are off while the aux term is active, so it also changes *when* the early policy features
+start moving.
 
 ### Loading a non-legacy checkpoint
 

@@ -12,7 +12,9 @@ the frozen `ppo_race_0910` policy on the `legacy` controller path. Software-rend
 [provenance](docs/media/PROVENANCE-visualizer.md).</sub>
 
 A research workspace: **on-car performance of a learned policy is not established**, and no
-benchmarks are published — see [Status and limitations](#status-and-limitations).
+*throughput* benchmarks are published. Driving results are published only for fixed diagnostic
+scenarios, with their scope stated in each [research note](docs/research/) — see
+[Status and limitations](#status-and-limitations).
 
 ## Quickstart
 
@@ -53,6 +55,7 @@ sim.reset(torch.nonzero(r.collision).flatten())      # partial reset re-samples 
 | [Getting started](docs/getting_started.md) | installation, CPU and GPU, the ROS 2 workspace, troubleshooting |
 | [Architecture](docs/architecture.md) | simulator fidelity, maps, raceline and teacher, the viewer |
 | [Training](docs/training.md) | DAgger, PPO, evaluation, the console, observation and action detail |
+| [Benchmark](docs/benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metrics |
 | [ROS 2](docs/ros2.md) | launch files, topic contracts, teleoperation |
 | [Research notes](docs/research/) | dated experiment reports with protocol, data and scope |
 | [Engineering notes](docs/README.md#engineering-notes) | algorithm assessment, simulator audit, real-data calibration |
@@ -192,6 +195,7 @@ Each is one command here and a section in the linked page.
 | Imitate a teacher | `python3 -m f1sim.learn.dagger --help` | [Training](docs/training.md#dagger) |
 | Reinforcement learning | `python3 -m f1sim.learn.ppo --help` | [Training](docs/training.md#ppo) |
 | Evaluate a checkpoint | `python3 -m f1sim.learn.evaluate --help` | [Training](docs/training.md#evaluation) |
+| Benchmark checkpoints against each other | `python3 -m f1sim.learn.benchmark plan` | [Benchmark](docs/benchmark.md), [measured subset](docs/research/benchmark-v1-2026-09-12.md) |
 | Drive the ROS 2 stack | `ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:3` | [ROS 2](docs/ros2.md) |
 
 The training rows are `--help` on purpose. **The defaults are not a starting point**: `ppo` defaults
@@ -242,6 +246,17 @@ controllers; its **cause is not established**, and a one-seed `legacy`-recipe pr
 
 The arms, and the fact that the default loaders refuse a checkpoint trained under a non-`legacy` one,
 are in [Training](docs/training.md#experimental-friction-aware-control).
+
+**Training-recipe screen: no recipe met the selection criteria.** Four
+recipes × two seeds, each 128 updates / 1 048 576 steps, evaluated on 30 fixed cells / 240 trials per
+checkpoint at a static friction coefficient per episode. **No recipe was eligible**: the best reached
++1.875 pp mean low-friction gain against a required ≥ 2 pp. The criteria were fixed before the final
+selection and before the outcomes were inspected; the threshold was not changed and no recipe was
+selected. For every recipe the two training seeds also **disagree in sign** at low friction, so these
+runs give **insufficient evidence of a robust method-level benefit**. These are engineering
+eligibility gates, not a significance or power analysis
+([research note](docs/research/static-grip-retention-2026-09-12.md), with per-trial data and the
+independent eligibility audit beside it).
 
 **Not established.**
 

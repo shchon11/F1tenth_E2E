@@ -1,0 +1,70 @@
+{
+ "scope": "REPRESENTATIVE SUBSET: 3 systems, 2 weight sets, 102 cells, 816 trials. Chosen for time and checkpoint availability, NOT by performance ranking.",
+ "not_a_full_benchmark": "The initial planned roster had 17 systems; the frozen suite defines 34 cells per system. This subset was chosen for time and availability BEFORE any score was judged, and is not a best-of selection.",
+ "systems": [
+  "frozen_original@legacy",
+  "frozen_original@estimated",
+  "cl_main_estimated_s501@estimated"
+ ],
+ "suite_freeze_sha256": "6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce",
+ "raw_authoritative": {
+  "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/checkpoint-benchmark/scores/run-20260911T205029Z/final3/merged-cells-3systems.jsonl",
+  "sha256": "398816e485000ac9b9dbc42f45395e5006bb85ebb2613637c7a5cfa1c96027bf",
+  "rows": 102,
+  "note": "unchanged; the measurement as produced. Lacks top-level n_envs.",
+  "published_as": "benchmark-v1-2026-09-12-raw-cells.jsonl"
+ },
+ "derived_extract": {
+  "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/checkpoint-benchmark/scores/run-20260911T205029Z/final3/merged-cells-3systems-REPAIRED.jsonl",
+  "sha256": "cb3b51060360be6937145c375ba0977122cc61f10bff35a67b1313b2b5400333",
+  "rows": 102,
+  "repair": "adds ONLY top-level n_envs, taken from the frozen cell declaration (Cell.envs=8), after an independent cardinality check that result.n equalled the declared value on every row. 102/102 repaired, 0 refused. No other key added, changed or removed.",
+  "why": "the runner in force at scoring time did not write top-level n_envs, and report.validate_results requires it.",
+  "published_as": "benchmark-v1-2026-09-12-derived-cells.jsonl"
+ },
+ "source_at_scoring_time": {
+  "__main__.py": "55fd3b878381 -- identical to SOURCE-FREEZE.md",
+  "verdict": "the 102 rows were produced under the declared freeze"
+ },
+ "source_drift_after_scoring": {
+  "f1sim/learn/benchmark/__main__.py": "55fd3b878381 -> 34bd0fb7730d",
+  "tests/benchmark/test_run_path.py": "890eab4a0a64 -> 459f98982d41",
+  "note": "core's closure edited the PRODUCER so future runs emit n_envs. It does not and cannot retroactively add the key to rows already written, which is why the derived extract above exists. Recorded because SOURCE-FREEZE.md declares these files frozen."
+ },
+ "excluded": {
+  "cl_main_estimated_s502@estimated": "cancelled partial, 1/34 cells, rc -15; shed by the VRAM guard when nvidia-smi failed mid-run. Preserved on disk, not a result."
+ },
+ "returncodes": {
+  "frozen_original@legacy": 0,
+  "frozen_original@estimated": 0,
+  "cl_main_estimated_s501@estimated": null
+ },
+ "returncode_caveat": "s501's exit code was never collected: its parent supervisor was terminated before it could reap the child. 34/34 rows and the runner's terminal 'wrote 34 cells' line evidence completion; that is not an observed exit code and is not recorded as one.",
+ "reporter": {
+  "returncode": 0,
+  "rendered": "3 systems, 102 cells"
+ },
+ "leaderboard_md_sha256": "1edab250e81e4112b5da80451a14e5d43807df5b0b00fee26a1bdb03c3e2e472",
+ "published_files": {
+  "note": "Filenames as published in docs/research/. The `path` fields above are the working locations the files were produced at; these are where they live in the repository.",
+  "note_md": "benchmark-v1-2026-09-12.md",
+  "manifest": "benchmark-v1-2026-09-12-manifest.json",
+  "raw_cells_jsonl": "benchmark-v1-2026-09-12-raw-cells.jsonl",
+  "derived_cells_jsonl": "benchmark-v1-2026-09-12-derived-cells.jsonl",
+  "combined_results_json": "benchmark-v1-2026-09-12-results.json \u2014 the same 102 cells as a single JSON payload carrying both hashes; it overlaps the two .jsonl files rather than adding data."
+ },
+ "published_sha256": {
+  "benchmark-v1-2026-09-12-raw-cells.jsonl": "398816e485000ac9b9dbc42f45395e5006bb85ebb2613637c7a5cfa1c96027bf",
+  "benchmark-v1-2026-09-12-derived-cells.jsonl": "cb3b51060360be6937145c375ba0977122cc61f10bff35a67b1313b2b5400333",
+  "benchmark-v1-2026-09-12-results.json": "56ee8598c8359d60cc5f66e5fbefbeedd2a889bba070d7944fdec81349176307"
+ },
+ "report_generated_at": "2026-09-11T21:16:55Z",
+ "report_generated_at_note": "when this report was rendered, NOT when the runs were measured",
+ "systems_not_in_this_table": {
+  "never_started": 13,
+  "started_then_excluded": {
+   "cl_main_estimated_s502@estimated": "cancelled partial, 1/34 cells, rc -15; shed by the VRAM guard when nvidia-smi failed mid-run. Preserved on disk, not a result."
+  },
+  "note": "13 never started plus one cancelled one-cell partial = the 14 not reported here"
+ }
+}

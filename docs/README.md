@@ -9,6 +9,7 @@ Entry point: the [repository README](../README.md).
 | [Getting started](getting_started.md) | installation, CPU and GPU paths, the ROS 2 workspace build, troubleshooting |
 | [Architecture](architecture.md) | simulator fidelity, map catalogue, raceline and teacher, the viewer |
 | [Training](training.md) | DAgger, PPO, evaluation, the watch tool, observation and action detail |
+| [Benchmark](benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metric definitions, adding a checkpoint later |
 | [ROS 2](ros2.md) | launch files, topic contracts, teleoperation |
 | [로컬 실행 안내](local_pc.md) | 이 워크스테이션 전용 실행 명령 (Korean) |
 
@@ -20,6 +21,8 @@ Dated experiment reports: protocol, data, and an explicit statement of what each
 | --- | --- |
 | [Controller-arm evaluation](research/2026-09-11-controller-arm-evaluation.md) | `fixed_low` vs `estimated` on diagnostic scenarios — 72 cells, 1152 trials, with outcome-only data beside it |
 | [Legacy-recipe probe](research/2026-09-11-legacy-recipe-probe.md) | one-seed control asking whether the fine-tuning recipe alone explains the low-friction drop |
+| [Checkpoint benchmark v1 (3-system subset)](research/benchmark-v1-2026-09-12.md) | three systems on the frozen v1 suite — 102 cells, 816 trials, with raw and derived rows; **not** the 17-system benchmark |
+| [Static-grip retention](research/static-grip-retention-2026-09-12.md) | four training recipes × two seeds against a frozen reference — 30 cells, 240 trials per checkpoint; no eligible recipe, with per-trial data and the independent eligibility audit |
 
 ## Engineering notes
 
