@@ -4,11 +4,12 @@ Names:  gen:competition:7   gen:hallway:2   gen:circuit:0
         rt:Spielberg        (any directory of f1tenth_racetracks)
         gym:levine          (levine, berlin, skirk, vegas, stata_basement)
         /abs/path/map.yaml  (any ROS map; centerline csv next to it is picked up)
+    Obstacle suffixes: `+obs<seed>` = boxes hugging the lane edge (the racing line stays clear),
+                       `+rlobs<seed>` = boxes standing on the racing line (the car must plan around)
 """
 from __future__ import annotations
 
 import glob
-import re
 import os
 import numpy as np
 from typing import List, Optional
@@ -25,6 +26,7 @@ GYM_BOUNDARY = {"levine": "wall", "stata_basement": "wall", "berlin": "duct", "s
 # centerline, note[, seed_xy of the lane, despeckle area m^2, extra from_ros_map kwargs]). Practice tracks (plechaty, korea_kim) were
 # dropped from the catalog: not competition layouts.
 TUW = os.path.join(EXTERNAL, "f1tenth_maps", "maps")
+ASSET_MAPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "maps")
 KOR = os.path.join(EXTERNAL, "korea_teams")
 REAL = {
     "icra2022": (os.path.join(EXTERNAL, "f1tenth-racing-stack-ICRA22", "maps", "icra_2.yaml"), "duct", 0.45, "ICRA 2022 F1TENTH Grand Prix track (Philadelphia), team SLAM map"),
@@ -34,13 +36,10 @@ REAL = {
     "blackbox2022_1": (os.path.join(TUW, "blackbox2022_1.yaml"), "duct", 0.40, "TU Wien BlackBox race 2022"),
     "blackbox2022_2": (os.path.join(TUW, "blackbox2022_2.yaml"), "duct", 0.35, "TU Wien BlackBox race 2022", None, 0.15),
     "blackbox2022_3": (os.path.join(TUW, "blackbox2022_3.yaml"), "duct", 0.30, "TU Wien BlackBox race 2022"),
-    # community SLAM maps added 2026-09-08 for layout diversity (ppo_v9 memorized its 8 layouts)
-    "berlin": (os.path.join(GYM_MAPS, "berlin.yaml"), "duct", 0.40, "F1TENTH Berlin race map (f1tenth_gym)"),
-    "skirk": (os.path.join(GYM_MAPS, "skirk.yaml"), "duct", 0.40, "Skirkanich hall race (f1tenth_gym)"),
-    "columbia_small": (os.path.join(TUW, "columbia_small.yaml"), "duct", 0.40, "Columbia race map (f1tenth_maps)"),
-    "torino_small": (os.path.join(TUW, "torino_redraw_small.yaml"), "duct", 0.35, "Torino race map, redrawn (f1tenth_maps)"),
-    "mtl": (os.path.join(TUW, "mtl.yaml"), "duct", 0.40, "Montreal race map (f1tenth_maps)", None, 0.15),
-    "porto": (os.path.join(TUW, "porto.yaml"), "duct", 0.30, "Porto race map, narrow (f1tenth_maps)"),
+    # The venue this car actually raced on, taken from the /map the stack was localising against in
+    # real_data/01_competition (scripts/extract_bag_map.py). 8.4 x 22.6 m, duct hose boundary.
+    "korea_2026_competition": (os.path.join(ASSET_MAPS, "korea_2026_competition.yaml"), "duct", 0.35,
+                               "2026 competition venue, from the team's own recordings"),
     "korea_2025_iccas": (os.path.join(KOR, "KORA_K3", "src", "kora_k3", "maps", "real.yaml"), "duct", 0.35, "4th F1TENTH Korea Championship 2025 (ICCAS) race track, team SLAM map", (3.0, 0.0), 0.05,
                          dict(keep_region=True, unknown_floor_depth=5.0)),   # raw SLAM: spray, specks. The outline is a hose too
                                                                               # (track built from ducts in a bigger hall): floor beyond
@@ -79,14 +78,13 @@ def _with_auto_centerline(track: Track, min_clearance: float, seed_xy=None) -> T
     return track
 
 
-MODIFIERS = ("~rev", "~mir", "~lane")
+MODIFIERS = ("~rev", "~mir")
 _BASE_CACHE = {}
 
 
 def load(name: str, **kw) -> Track:
     """Catalog loader. Trailing modifiers: `~rev` = same map driven the other way round,
-    `~mir` = mirrored map (e.g. real:icra2022~rev, rt:Monza~mir~rev), `~lane` = side rooms and
-    dead-end corridors of the map walled off (Track.lane_only)."""
+    `~mir` = mirrored map (e.g. real:icra2022~rev, rt:Monza~mir~rev)."""
     mods = []
     while name.endswith(MODIFIERS):
         for m in MODIFIERS:
@@ -97,59 +95,84 @@ def load(name: str, **kw) -> Track:
         _BASE_CACHE[ck] = _load_base(name, **kw)
     t = _BASE_CACHE[ck]
     for m in reversed(mods):
-        t = t.reversed() if m == "~rev" else t.mirrored() if m == "~mir" else t.lane_only()
+        t = t.reversed() if m == "~rev" else t.mirrored()
     return t
 
 
-def _split_suffix(name: str, key: str):
-    """'real:x+obs1+pk3' , '+pk' -> ('real:x+obs1', '3'); no suffix -> (name, None)."""
-    m = re.search(re.escape(key) + r"(\d+)", name)
-    return (name[:m.start()] + name[m.end():], m.group(1)) if m else (name, None)
-
-
-def _obstacles_on_line(t: Track, obl):
-    """x+obl<seed>: boxes centred on the track's own racing line, one per ~35 m of lane. The `+obs`
-    variants hug a wall, which the policy learns to slide past; a box *on the line it wants to drive*
-    is the competition case that actually costs it (ppo_v13: 0.00 per car for wall-side boxes, 0.49 for
-    these). The teacher re-plans around them (Raceline.build routes the reference around blockages)."""
-    if obl is None:
-        return t
+def _raceline_obstacles(track: Track, seed: int, n: Optional[int] = None, **kw) -> Track:
+    """Boxes standing on the *raceline*, so the fast line is blocked and the car has to plan around
+    them. `+obs` hugs the wall and leaves the line clear; `+rlobs` does not."""
     from .raceline import Raceline
-    rl = Raceline.build_cached(t)                                # the line before the boxes exist
-    L = float(np.linalg.norm(np.roll(t.centerline, -1, 0) - t.centerline, axis=1).sum())
-    return t.with_lane_obstacles(seed=int(obl) + 811, n=int(np.clip(round(L / 35.0), 3, 8)), on_path=rl.xy)
+    rl = Raceline.build_cached(track)
+    line = rl.xy
+    kw.setdefault("speeds", rl.v)                    # the profile decides the reaction time a box creates
+    if n is None:
+        length = float(np.linalg.norm(np.roll(line, -1, 0) - line, axis=1).sum())
+        n = int(np.clip(round(length / 25.0), 2, 10))          # roughly one box every 25 m of line
+    return track.with_line_obstacles(line, seed=seed, n=n, **kw)
 
 
-def _pockets(t: Track, pk):
-    """x+pk<seed>: dead-end side pockets, one per ~25 m of lane (3-8)."""
-    if pk is None:
-        return t
-    L = float(np.linalg.norm(np.roll(t.centerline, -1, 0) - t.centerline, axis=1).sum())
-    return t.with_pockets(seed=int(pk), n=int(np.clip(round(L / 25.0), 3, 8)))
+def _static_props(track: Track, seed: int, n: Optional[int] = None) -> Track:
+    """`+props<seed>`: modelled obstacles -- boxes, crates, a drum -- placed the way `+obs` places its
+    rectangles, but held as finite convex sections instead of stamped into the grid.
+
+    A separate suffix rather than a replacement for `+obs`. That one rasterises rotated rectangles,
+    and every checkpoint in the catalogue was trained against exactly those; redefining the name
+    would move the ground under those runs without saying so. A caller picks which it wants."""
+    if n is None:
+        L = float(np.linalg.norm(np.roll(track.centerline, -1, 0) - track.centerline, axis=1).sum())
+        n = int(np.clip(round(L / 35.0), 3, 8))
+    return track.with_static_props(seed=seed, n=n)
+
+
+def _split_obstacle_suffix(name: str):
+    """`x+rlobs7` -> (x, 'rlobs', 7); `x+obs7` -> (x, 'obs', 7); `x+pinch7` -> (x, 'pinch', 7);
+    `x+props7` -> (x, 'props', 7); otherwise (name, None, None).
+    `+rlobs` must be tested first: splitting on '+obs' would cut 'x+rlobs7' into 'x+rl' and '7'."""
+    for tag in ("+rlobs", "+obs", "+pinch", "+props"):
+        if tag in name:
+            base, _, spec = name.partition(tag)
+            return base, tag[1:], spec
+    return name, None, None
 
 
 def _load_base(name: str, **kw) -> Track:
     if name.startswith("gen:"):
         _, style, seed = (name.split(":") + ["0"])[:3]
-        seed, obs = (seed.split("+obs") + [None])[:2]            # gen:competition:3+obs -> random lane obstacles
-        return Track.generate_random(int(seed), style=style, lane_obstacles=(obs is not None), **kw)
-    name, pk = _split_suffix(name, "+pk")                    # x+pk<seed>: dead-end side pockets (after +obs)
-    name, obl = _split_suffix(name, "+obl")                  # x+obl<seed>: boxes on the racing line
+        seed, kind, spec = _split_obstacle_suffix(seed)          # gen:competition:3+obs7 / +rlobs7
+        if kind == "rlobs":
+            return _raceline_obstacles(Track.generate_random(int(seed), style=style, **kw), int(spec))
+        if kind == "obs":
+            obstacle_seed = int(spec)
+            t = Track.generate_random(int(seed), style=style, **kw)
+            n_obs = int(np.random.default_rng(obstacle_seed + 7).integers(1, 5))
+            return t.with_lane_obstacles(seed=obstacle_seed, n=n_obs)
+        if kind == "pinch":                                      # gen:x:3+pinch7: the lane closes down
+            t = Track.generate_random(int(seed), style=style, **kw)
+            return t.with_pinches(seed=int(spec), n=int(np.random.default_rng(int(spec) + 5).integers(2, 5)))
+        if kind == "props":                                      # gen:x:3+props7: modelled props
+            return _static_props(Track.generate_random(int(seed), style=style, **kw), int(spec))
+        return Track.generate_random(int(seed), style=style, **kw)
     if name.startswith("rt:"):
-        n = name[3:]
+        n, kind, spec = _split_obstacle_suffix(name[3:])        # rt:Monza+props3
         d = os.path.join(RACETRACKS, n)
         ys = glob.glob(os.path.join(d, "*_map.yaml"))
         if not ys:
             raise FileNotFoundError(f"racetrack {n} not found under {RACETRACKS}")
         cl = glob.glob(os.path.join(d, "*_centerline.csv"))
-        return _pockets(_obstacles_on_line(Track.from_ros_map(ys[0], centerline_csv=cl[0] if cl else None, name=n, **kw), obl), pk)
+        t = Track.from_ros_map(ys[0], centerline_csv=cl[0] if cl else None, name=n, **kw)
+        if kind == "props":                                     # rt:x+props<seed>: modelled props
+            return _static_props(t, int(spec))
+        if kind is not None:
+            raise ValueError(f"racetrack names support '+props<seed>', not '+{kind}': {name!r}")
+        return t
     if name.startswith("gym:"):
         n = name[4:]
         kw.setdefault("boundary", GYM_BOUNDARY.get(n, "duct"))
         clearance = kw.pop("min_clearance", 0.45)
         return _with_auto_centerline(Track.from_ros_map(os.path.join(GYM_MAPS, n + ".yaml"), name=n, **kw), clearance)
     if name.startswith("real:"):
-        n, obs = (name[5:].split("+obs") + [None])[:2]          # real:icra2022+obs3 -> 3 lane obstacles
+        n, kind, spec = _split_obstacle_suffix(name[5:])        # real:icra2022+obs3 / +rlobs3
         entry = REAL[n]; yaml_path, boundary, clearance = entry[:3]; seed_xy = entry[4] if len(entry) > 4 else None
         kw.setdefault("boundary", boundary)
         if len(entry) > 5 and entry[5] is not None:
@@ -161,10 +184,16 @@ def _load_base(name: str, **kw) -> Track:
                 kw.setdefault("seed_xy", seed_xy)
         clearance = kw.pop("min_clearance", clearance)
         t = _with_auto_centerline(Track.from_ros_map(yaml_path, name=n, **kw), clearance, seed_xy)
-        if obs is not None:                                     # real:x+obs<seed>: boxes every ~35 m of lane
+        if kind == "pinch":                                     # real:x+pinch<seed>: the lane closes down
+            return t.with_pinches(seed=int(spec), n=int(np.random.default_rng(int(spec) + 5).integers(2, 5)))
+        if kind == "rlobs":                                     # real:x+rlobs<seed>: boxes ON the raceline
+            return _raceline_obstacles(t, int(spec))
+        if kind == "obs":                                       # real:x+obs<seed>: boxes every ~35 m of lane
             L = float(np.linalg.norm(np.roll(t.centerline, -1, 0) - t.centerline, axis=1).sum())
-            t = t.with_lane_obstacles(seed=int(obs), n=int(np.clip(round(L / 35.0), 3, 8)))
-        return _pockets(_obstacles_on_line(t, obl), pk)
+            t = t.with_lane_obstacles(seed=int(spec), n=int(np.clip(round(L / 35.0), 3, 8)))
+        if kind == "props":                                     # real:x+props<seed>: modelled props
+            t = _static_props(t, int(spec))
+        return t
     clearance = kw.pop("min_clearance", None)
     t = Track.from_ros_map(name, **kw)
     return _with_auto_centerline(t, clearance) if clearance else t

@@ -25,7 +25,7 @@ class ObsSpec:
     hist_len: int = 0             # >0: history of (speed, imu, roll/pitch, action) rows, hist_len rows hist_stride steps apart
     hist_stride: int = 2          # (1 s of history = 20 rows x 2 steps at 40 Hz): the actor can infer grip / lag from its own responses
     range_max: float = 10.0
-    v_max: float = 8.0            # = EnvConfig.v_max_policy
+    v_max: float = 10.0           # = EnvConfig.v_max_policy
     gyro_scale: float = 5.0
     accel_scale: float = 10.0
     att_scale: float = 0.35

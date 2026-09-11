@@ -1,0 +1,98 @@
+[
+ {
+  "file": "/home/shchon11/F1tenth/F1tenth_E2E/docs/media/f1tenth-simulator-demo.mp4",
+  "frames_decoded": 750,
+  "shot_cuts": [
+   150,
+   420,
+   570
+  ],
+  "episode_boundaries": [],
+  "largest_differences": [
+   {
+    "into_frame": 150,
+    "mean_abs_diff": 22.41,
+    "expected": "shot_cut"
+   },
+   {
+    "into_frame": 313,
+    "mean_abs_diff": 8.26,
+    "expected": null
+   },
+   {
+    "into_frame": 314,
+    "mean_abs_diff": 8.45,
+    "expected": null
+   },
+   {
+    "into_frame": 315,
+    "mean_abs_diff": 8.42,
+    "expected": null
+   },
+   {
+    "into_frame": 420,
+    "mean_abs_diff": 22.03,
+    "expected": "shot_cut"
+   },
+   {
+    "into_frame": 570,
+    "mean_abs_diff": 36.45,
+    "expected": "shot_cut"
+   }
+  ],
+  "unexplained_jumps": [],
+  "between_expected_jumps_mean": 3.354,
+  "between_expected_jumps_std": 1.915,
+  "between_expected_jumps_max": 8.45,
+  "threshold_used": 18.67
+ },
+ {
+  "file": "/home/shchon11/F1tenth/F1tenth_E2E/docs/media/f1tenth-learning-demo.mp4",
+  "frames_decoded": 750,
+  "shot_cuts": [
+   300,
+   450,
+   600
+  ],
+  "episode_boundaries": [
+   153
+  ],
+  "largest_differences": [
+   {
+    "into_frame": 153,
+    "mean_abs_diff": 25.43,
+    "expected": "episode_boundary"
+   },
+   {
+    "into_frame": 300,
+    "mean_abs_diff": 22.97,
+    "expected": "shot_cut"
+   },
+   {
+    "into_frame": 450,
+    "mean_abs_diff": 22.21,
+    "expected": "shot_cut"
+   },
+   {
+    "into_frame": 503,
+    "mean_abs_diff": 9.2,
+    "expected": null
+   },
+   {
+    "into_frame": 504,
+    "mean_abs_diff": 9.08,
+    "expected": null
+   },
+   {
+    "into_frame": 600,
+    "mean_abs_diff": 22.28,
+    "expected": "shot_cut"
+   }
+  ],
+  "unexplained_jumps": [],
+  "between_expected_jumps_mean": 3.362,
+  "between_expected_jumps_std": 2.228,
+  "between_expected_jumps_max": 9.2,
+  "threshold_used": 21.19
+ }
+]

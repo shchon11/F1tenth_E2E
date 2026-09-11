@@ -9,7 +9,11 @@ def test_vec_env_shapes_and_autoreset():
     tr = Track.generate_random(0)
     env = F1VecEnv(tr, Config(), EnvConfig(scan_stack=2, scan_subsample=4, max_steps=60), num_envs=32, device="cpu")
     obs, info = env.reset(seed=1)
-    assert obs["scan"].shape == (32, 2, 270) and obs["speed"].shape == (32, 1) and obs["prev_action"].shape == (32, 2 * env.ecfg.action_history)
+    # derived, not hardcoded: subsampling a 1081-beam scan by 4 leaves 271, not 1081 // 4 = 270.
+    # The literal 270 here was written when the LiDAR had 1080 beams and went stale when the
+    # measured count became 1081.
+    n_sub = len(range(0, Config().lidar.n_beams, 4))
+    assert obs["scan"].shape == (32, 2, n_sub) and obs["speed"].shape == (32, 1) and obs["prev_action"].shape == (32, 2 * env.ecfg.action_history)
     assert info["priv"].shape == (32, 8)
     assert torch.isfinite(obs["scan"]).all() and (obs["scan"] >= 0).all() and (obs["scan"] <= 1).all()
     n_final = 0

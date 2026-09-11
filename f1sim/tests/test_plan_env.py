@@ -12,12 +12,14 @@ def test_plan_mode_teacher_drives_through_tracker():
     env = common.make_env(tracks, 32, dev, EnvConfig(action_mode="plan", speed_cap=5.0), cfg=cfg, seed=2)
     teacher = common.make_teacher(rls, env)
     obs, info = env.reset(seed=2)
-    assert env.act_dim == 6 and obs["prev_action"].shape == (32, 12)
+    from f1sim.mpc import ACT_DIM
+    assert env.act_dim == ACT_DIM                                         # not a literal: N_KNOTS moves
+    assert obs["prev_action"].shape == (32, ACT_DIM * env.ecfg.action_history)
     scan, pro = flatten_obs(obs); assert pro.shape[1] == common.obs_spec(env).proprio_dim
     prog = torch.zeros(32, device=dev); coll = 0
     for _ in range(400):
         a = env.teacher_label(teacher)
-        assert a.shape == (32, 6) and a.abs().max() <= 1.0
+        assert a.shape == (32, ACT_DIM) and a.abs().max() <= 1.0
         obs, rew, term, trunc, info = env.step(a)
         prog += info["progress"]; coll += int(term.sum())
         assert "plan" in info and info["plan"].shape[0] == 32

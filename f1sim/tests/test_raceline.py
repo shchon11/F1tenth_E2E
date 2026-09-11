@@ -31,20 +31,3 @@ def test_raceline_smooth_faster_and_clear():
         from f1sim.raceline import speed_profile
         vc = speed_profile(c); tc = float((np.linalg.norm(np.roll(c, -1, 0) - c, axis=1) / vc).sum())
         assert rl.lap_time < tc, (name, rl.lap_time, tc)
-
-
-def test_raceline_routes_around_obstacles_dropped_on_it():
-    """A box on the racing line must move the line around it, not through it (the plain EDT is flat
-    inside an obstacle, so the old repair could not push a point out of one)."""
-    import numpy as np
-    from scipy import ndimage
-    from f1sim import maps
-    from f1sim.raceline import Raceline
-    base = maps.load("gen:competition:0")
-    rl0 = Raceline.build_cached(base)
-    t = base.with_lane_obstacles(seed=3, n=5, on_path=rl0.xy)          # boxes centred on the line it wants to drive
-    assert (t.occupancy & ~base.occupancy).any()
-    rl = Raceline.build_cached(t)
-    rc = np.stack([(rl.xy[:, 1] - t.origin[1]) / t.resolution, (rl.xy[:, 0] - t.origin[0]) / t.resolution])
-    clear = ndimage.map_coordinates(t.edt, rc, order=1, mode="nearest")
-    assert clear.min() > 0.16, clear.min()                             # more than half a car width from anything

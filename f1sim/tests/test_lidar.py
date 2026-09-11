@@ -53,10 +53,13 @@ def test_noise_and_dropout_statistics():
     sim = Simulator(tr, cfg, num_envs=8, device="cpu")
     sim.reset(poses=torch.zeros(8, 3))
     r = sim.step(torch.zeros(8, 2))
-    finite = torch.isfinite(r.scan)
-    drop = 1 - finite.float().mean().item()
+    # A miss reads the driver's 0xFFFF mm sentinel (65.533 m), which is finite and positive, so
+    # `isfinite` alone finds none of them -- the same trap that made calib/sensors.py report a
+    # no-return rate of 0 on the recordings.
+    good = torch.isfinite(r.scan) & (r.scan < cfg.lidar.dropout_value - 1.0)
+    drop = 1 - good.float().mean().item()
     assert 0.03 < drop < 0.07, drop
-    resid = (r.scan - r.scan_true)[finite]
+    resid = (r.scan - r.scan_true)[good]
     assert abs(resid.std().item() - 0.03) < 0.005
 
 

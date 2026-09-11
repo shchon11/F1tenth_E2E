@@ -18,6 +18,77 @@ from .lidar_triton import HAVE_TRITON, trace3d_triton
 HIT_NONE, HIT_DUCT, HIT_TALL, HIT_GROUND, HIT_CAR = 0, 1, 2, 3, 4
 
 
+_CAR_SLICES = {}
+
+
+def car_slices(device):
+    """Outlines of the F1TENTH car mesh (assets/f1tenth_car.glb) at 1 cm height steps, in the car's
+    CoG frame: z (L,), segments (L, S, 4) x0 y0 x1 y1, valid (L, S). Built by
+    scripts/slice_car_mesh.py from the same model the viewer draws, so what the LiDAR hits is what
+    is on screen -- the hand-placed part boxes read 0.60 m long from a rear quarter where the real
+    car (competition bags) reads 0.33 m."""
+    key = str(device)
+    if key not in _CAR_SLICES:
+        import os
+        import numpy as np
+        d = np.load(os.path.join(os.path.dirname(__file__), "assets", "f1tenth_car_slices.npz"))
+        _CAR_SLICES[key] = (torch.as_tensor(d["z"], device=device), torch.as_tensor(d["segs"], device=device),
+                            torch.as_tensor(d["valid"], device=device))
+    return _CAR_SLICES[key]
+
+
+def ray_slices_hits(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor, poses: torch.Tensor,
+                    scale: torch.Tensor, chunk: int = 32):
+    """Beams against the car mesh outlines. origin (B,N,3), dh (B,N,2), k (B,N); poses (B,C,3) x, y,
+    yaw of each car in view; scale (B,C) build size. Returns (3D range (B,N), hit (B,N)).
+
+    The outline used for a beam is the one at the height the beam has where it reaches the car's
+    centre, so a tilted scan plane sees the wheels low and the LiDAR tower high, as a level one at
+    11 cm sees wheels and chassis side by side. Segments are streamed in chunks against every beam
+    with a level mask -- gathering each beam's own outline would build a (B, N, S, 4) tensor, 4.5 GB
+    at training batch size -- and the loop has no data-dependent branches, so it captures into the
+    simulator's CUDA graph like the box path does."""
+    z_lv, segs, valid = car_slices(k.device)
+    B, N = k.shape; L, S, _ = segs.shape
+    dz = float(z_lv[1] - z_lv[0]); z0 = float(z_lv[0])
+    best = torch.full((B, N), float("inf"), device=k.device); hit = torch.zeros(B, N, dtype=torch.bool, device=k.device)
+    slen = torch.sqrt(1.0 + k * k)
+    for c in range(poses.shape[1]):
+        px, py, pyaw = poses[:, c, 0:1], poses[:, c, 1:2], poses[:, c, 2:3]
+        cy, sy = torch.cos(pyaw), torch.sin(pyaw)
+        ox, oy = origin[..., 0] - px, origin[..., 1] - py
+        lx, ly = ox * cy + oy * sy, -ox * sy + oy * cy                       # ray origin in the car frame
+        dx, dy = dh[..., 0] * cy + dh[..., 1] * sy, -dh[..., 0] * sy + dh[..., 1] * cy
+        t_c = (-lx * dx - ly * dy).clamp_min(0.0)                            # along-ray distance to the car centre
+        z_c = origin[..., 2] + k * t_c
+        lvl = ((z_c - z0) / dz).round().long()
+        in_band = (lvl >= 0) & (lvl < L)
+        sc_ = scale[:, c, None]                                              # (B,1)
+        t_best = torch.full((B, N), float("inf"), device=k.device)
+        for l in range(L):
+            n_l = int(valid[l].sum())
+            if n_l == 0:
+                continue
+            on_level = in_band & (lvl == l)
+            for s0 in range(0, n_l, chunk):
+                sg = segs[l, s0:s0 + chunk]                                  # (S',4), same for every beam
+                ax, ay = sg[None, None, :, 0] * sc_[..., None], sg[None, None, :, 1] * sc_[..., None]
+                bx, by = sg[None, None, :, 2] * sc_[..., None], sg[None, None, :, 3] * sc_[..., None]
+                ex, ey = bx - ax, by - ay
+                den = dx[..., None] * ey - dy[..., None] * ex
+                den = torch.where(den.abs() < 1e-9, torch.full_like(den, 1e-9), den)
+                wx, wy = ax - lx[..., None], ay - ly[..., None]
+                t = (wx * ey - wy * ex) / den
+                u = (wx * dy[..., None] - wy * dx[..., None]) / den
+                ok = (t > 0.0) & (u >= 0.0) & (u <= 1.0) & on_level[..., None]
+                t = torch.where(ok, t, torch.full_like(t, float("inf"))).min(-1).values
+                t_best = torch.minimum(t_best, t)
+        r = t_best * slen
+        closer = torch.isfinite(t_best) & (r < best)
+        best = torch.where(closer, r, best); hit = hit | torch.isfinite(t_best)
+    return best, hit
+
+
 def ray_box_hits(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor, boxes: torch.Tensor, dims: torch.Tensor,
                  zrange: Optional[torch.Tensor] = None):
     """Oriented boxes (other cars, their rear detection boxes). origin (B,N,3), dh (B,N,2) unit
@@ -89,8 +160,30 @@ class Lidar:
         if tid is None:
             tid = torch.zeros(origin.shape[0], dtype=torch.long, device=origin.device)
         if HAVE_TRITON and origin.is_cuda:
-            return trace3d_triton(origin, direction_h, k, range_max, tr, tid, self.max_iters, duct_scale)
-        return self._trace_torch(origin, direction_h, k, range_max, tid, duct_scale)
+            r, typ = trace3d_triton(origin, direction_h, k, range_max, tr, tid, self.max_iters, duct_scale)
+        else:
+            r, typ = self._trace_torch(origin, direction_h, k, range_max, tid, duct_scale)
+        # Props merge HERE, at the common return, not inside `_trace_torch`: on CUDA the call above
+        # goes straight to the Triton kernel and never reaches it, so merging there would have given
+        # the two backends different worlds.
+        if getattr(tr, "has_props", False):
+            r, typ = self._merge_props(origin, direction_h, k, range_max, tid, r, typ)
+        return r, typ
+
+    def _merge_props(self, origin, direction_h, k, range_max, tid, r, typ):
+        """Nearest-hit merge of the finite prop sections, the way cars are merged below.
+
+        Props report as HIT_TALL rather than a type of their own. A box in the lane is a static solid
+        obstacle, which is exactly what that type already means, and adding a sixth value would
+        change what every consumer of `typ` sees -- observation encodings included -- for a rebuild
+        of how obstacles are *drawn*. The prop's finiteness is in its geometry, not in its label."""
+        from .prop_math import ray_prisms_hits
+        tr = self.track
+        poses, pn, pd, z_lo, z_hi = tr.props_for(tid)
+        r_p, hit_p = ray_prisms_hits(origin, direction_h, k, poses, pn, pd, z_lo, z_hi)
+        closer = hit_p & (r_p < r) & (r_p <= range_max[:, None])
+        return (torch.where(closer, r_p.to(r.dtype), r),
+                torch.where(closer, torch.full_like(typ, HIT_TALL), typ))
 
     def _trace_torch(self, origin, direction_h, k, range_max, tid, duct_scale=None):
         tr = self.track
@@ -108,9 +201,8 @@ class Lidar:
         for it in range(self.max_iters):
             p = torch.stack([ox + dx * s, oy + dy * s], -1)
             z = oz + k * s
-            d_duct = tr.sample_edt(p, tidN, tr.edt_duct)
+            d_duct, inside = tr.sample_edt(p, tidN, tr.edt_duct, with_inside=True)
             d_tall = tr.sample_edt(p, tidN, tr.edt_tall)
-            inside = tr.sample_edt(p, tidN, torch.ones_like(tr.edt)) > 0.5
             d_duct = torch.where(inside, d_duct, torch.full_like(k, 1e9))
             above = z > duct_h
             d_eff = torch.where(above, d_tall, torch.minimum(d_duct, d_tall))
@@ -126,7 +218,9 @@ class Lidar:
             s_new = torch.where(hit, s, torch.where(ground, s_ground, torch.where(far, s_max, s_next)))
             s = torch.where(done, s, s_new)
             done = done | hit | ground | far
-            if it % 8 == 7 and bool(done.all()):
+            # every iteration on the CPU, where reading the flag is free and the beams that are still
+            # running are a shrinking minority. On CUDA the read is a device sync, so it stays coarse.
+            if (done.all() if not done.is_cuda else (it % 8 == 7 and bool(done.all()))):
                 break
         R = 0.5 * duct_h
         zh = oz + k * s
@@ -193,8 +287,13 @@ class Lidar:
         car_poro = None
         if cars is not None:
             car_poro = torch.zeros_like(r_true)                   # per-beam porosity of whatever car part was hit
-            for boxes, dims, zr, poro in cars:
-                r_car, hit_car = ray_box_hits(origin, dh, k, boxes, dims, zr)
+            for entry in cars:
+                if entry[0] == "mesh":                                       # ("mesh", poses, scale, porosity)
+                    _, poses_, scale_, poro = entry
+                    r_car, hit_car = ray_slices_hits(origin, dh, k, poses_, scale_)
+                else:
+                    boxes, dims, zr, poro = entry
+                    r_car, hit_car = ray_box_hits(origin, dh, k, boxes, dims, zr)
                 closer = hit_car & (r_car < r_true)
                 r_true = torch.where(closer, r_car, r_true)
                 typ = torch.where(closer, torch.full_like(typ, HIT_CAR), typ)

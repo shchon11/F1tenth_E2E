@@ -21,7 +21,7 @@ from typing import Optional, Tuple
 
 import torch
 
-N_KNOTS = 4
+N_KNOTS = 6                       # 6 knots over a 15 m plan is one every 3 m; 4 would be every 5 m
 ACT_DIM = N_KNOTS + 2
 XI = torch.linspace(0.0, 1.0, N_KNOTS)
 
@@ -29,15 +29,24 @@ XI = torch.linspace(0.0, 1.0, N_KNOTS)
 @dataclass
 class PlanSpec:
     kappa_max: float = 1.6         # [1/m] curvature range of the knots (the car's full-lock radius is ~0.74 m)
-    horizon_s: float = 0.7         # plan length = horizon_s * v, clamped to [len_min, len_max]
-    len_min: float = 1.5
-    len_max: float = 6.0
+    horizon_s: float = 1.5         # plan length = horizon_s * v, clamped to [len_min, len_max]
+    len_min: float = 2.0
+    len_max: float = 15.0          # at 10 m/s the plan must be able to hold a braking manoeuvre:
+                                   # slowing 10 -> 4 m/s needs 7 m at 6 m/s^2. The old 0.7 s / 6 m
+                                   # plan covered 5.6 m at 8 m/s against a 9.2 m need, so the plan
+                                   # could not even represent the manoeuvre the corner required.
     v_cmd_lead: float = 0.15       # [s] the first speed target refers to this far ahead
     N: int = 12                    # MPC steps
     dt: float = 0.05               # [s] MPC step
     delay: float = 0.035           # [s] nominal command latency the tracker predicts over (delay + half the servo lag)
     k_us: float = 0.003            # [s^2/m] understeer: effective wheelbase L + k_us v^2
-    a_max: float = 6.0             # [m/s^2] tracker acceleration bound
+    a_max: float = 6.0             # [m/s^2] tracker acceleration bound (drive side)
+    a_brake: float = 5.0           # [m/s^2] braking bound. Asymmetric because the car is: braking is
+                                   # limited by the VESC regen current at -4.2 to -5.7 m/s^2 while the
+                                   # drive side reaches +7. A symmetric +-6 let the tracker plan a
+                                   # deceleration 20 % deeper than the car can produce, so it arrived
+                                   # at corners faster than its own reference said it would -- the
+                                   # error is silent, and it is on the dangerous side.
     q: Tuple[float, float, float, float] = (1.0, 6.0, 1.0, 0.4)    # x, y, heading, speed tracking weights
     qf: Tuple[float, float, float, float] = (2.0, 10.0, 2.0, 0.4)
     r: Tuple[float, float] = (0.3, 0.02)                            # steer, accel effort
@@ -65,9 +74,12 @@ def encode(kappas: torch.Tensor, v_start: torch.Tensor, v_end: torch.Tensor, v_m
                       (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
 
 
-def path_points(k: torch.Tensor, Lp: torch.Tensor, n: int = 25):
+def path_points(k: torch.Tensor, Lp: torch.Tensor, n: int = 25, return_kappa: bool = False):
     """Dense samples of the plan in the body frame: x, y, heading (B,n) and arc length (B,n).
-    Curvature is linear between the knots; heading is its integral, the path the integral of that."""
+    Curvature is linear between the knots; heading is its integral, the path the integral of that.
+
+    `return_kappa` also hands back the interpolated curvature at those samples. It is computed here
+    either way; a speed envelope needs it and would otherwise re-derive the same interpolation."""
     xi = torch.linspace(0.0, 1.0, n, device=k.device, dtype=k.dtype)[None]          # (1,n)
     pos = xi * (N_KNOTS - 1)
     i0 = pos.floor().clamp(max=N_KNOTS - 2).long(); w = pos - i0.to(k.dtype)
@@ -80,25 +92,43 @@ def path_points(k: torch.Tensor, Lp: torch.Tensor, n: int = 25):
     x = torch.cat([torch.zeros_like(psi[:, :1]), torch.cumsum(0.5 * (cx[:, 1:] + cx[:, :-1]) * ds, 1)], 1)
     y = torch.cat([torch.zeros_like(psi[:, :1]), torch.cumsum(0.5 * (sy[:, 1:] + sy[:, :-1]) * ds, 1)], 1)
     s = xi * Lp[:, None]
+    if return_kappa:
+        return x, y, psi, s, kap
     return x, y, psi, s
 
 
-def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = None):
+def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = None,
+              v_limit: Optional[torch.Tensor] = None, a_walk: Optional[torch.Tensor] = None):
     """Time-indexed reference (B, N+1, 4) = x, y, heading, speed along the plan. The speed *target*
     is the plan's profile (v0 at the start, linear in arc length to v1 at the end); the position
     reference is walked with the speed the car can actually have: from v_now (measured) towards
     the profile within a_max, so a car that is slower than its plan is not chased by a reference
-    that has run ahead along the curve (time-free tracking, like pure pursuit)."""
+    that has run ahead along the curve (time-free tracking, like pure pursuit).
+
+    `v_limit` (B, n) caps the speed target at each of `path_points`' samples -- a friction-derived
+    envelope, supplied by the caller; it is interpolated onto the walked arc length the same way the
+    pose is. `a_walk` (B, 2) replaces `spec.a_brake` / `spec.a_max` in the walk with per-env values.
+    Both default to None, which is the original behaviour exactly."""
     x, y, psi, s = path_points(k, Lp)
     S = s[:, -1].clamp_min(1e-3)
     dev = k.device; T = spec.N + 1
     st = torch.zeros(k.shape[0], T, device=dev, dtype=k.dtype); v = torch.zeros_like(st)
     vw = (v0 if v_now is None else v_now.abs()).clamp_min(0.3)
+    a_brk_w = (-spec.a_brake * spec.dt) if a_walk is None else (-a_walk[:, 0] * spec.dt)
+    a_acc_w = (spec.a_max * spec.dt) if a_walk is None else (a_walk[:, 1] * spec.dt)
     for t_ in range(T):
         frac = (st[:, t_] / S).clamp(0.0, 1.0)
         v[:, t_] = v0 + (v1 - v0) * frac                                   # target profile at that point of the path
+        if v_limit is not None:
+            # the envelope at this arc length, linearly interpolated between the path samples
+            pos = frac * (v_limit.shape[1] - 1)
+            i_ = pos.floor().clamp(max=v_limit.shape[1] - 2).long()
+            wgt = pos - i_.to(v.dtype)
+            cap = v_limit.gather(1, i_[:, None])[:, 0] * (1 - wgt) + v_limit.gather(1, i_[:, None] + 1)[:, 0] * wgt
+            v[:, t_] = torch.minimum(v[:, t_], cap)
         if t_ < T - 1:
-            dv = (v[:, t_] - vw).clamp(-spec.a_max * spec.dt, spec.a_max * spec.dt)
+            dv = torch.clamp(v[:, t_] - vw, a_brk_w, a_acc_w) if a_walk is None else \
+                torch.maximum(torch.minimum(v[:, t_] - vw, a_acc_w), a_brk_w)
             vw = (vw + dv).clamp_min(0.3)
             st[:, t_ + 1] = st[:, t_] + vw * spec.dt
     idx = torch.searchsorted(s.contiguous(), st.contiguous()).clamp(1, s.shape[1] - 1)   # (B,T)
@@ -136,15 +166,53 @@ def _jac(z, u, spec: PlanSpec, wb: float):
     return A, Bm
 
 
-def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSpec, wb: float, s_max: float, v_max: float):
+def build_ilqr_consts(spec: PlanSpec, s_max: float, device, dtype=torch.float32):
+    """`ilqr`'s read-only cost and bound tensors, built once by a caller that wants to reuse them.
+
+    Optional. Passing `consts=None` (the default everywhere) builds them inline exactly as before,
+    so training and every existing caller are unchanged.
+
+    It exists because those `torch.tensor(...)` calls are what stops `solve` being CUDA-graph
+    capturable: a CUDA tensor built from a Python tuple is a pageable host-to-device copy, and the
+    first one -- `spec.q` -- fails capture with `cudaErrorStreamCaptureInvalidated`. The viewer
+    builds this tuple once per session and binds it into its own solver; nothing is cached
+    globally, so the tensors live and die with the session that made them.
+
+    `dtype` defaults to float32 because that is what the inline branch produces: it writes
+    `torch.zeros(6, 6, device=dev)` with no dtype, i.e. torch's default. Passing anything else is
+    *not* equivalent to the inline path -- it would carry a different precision through `Vzz` and
+    `Quu` -- so the viewer's fast path only opts in for a float32 session and leaves this default.
+    """
+    dev = torch.device(device)
+    Q = torch.zeros(6, 6, device=dev, dtype=dtype); Q[:4, :4] = torch.diag(torch.tensor(spec.q, device=dev, dtype=dtype))
+    Qf = torch.zeros(6, 6, device=dev, dtype=dtype); Qf[:4, :4] = torch.diag(torch.tensor(spec.qf, device=dev, dtype=dtype))
+    R = torch.diag(torch.tensor(spec.r, device=dev, dtype=dtype)); Rd = torch.diag(torch.tensor(spec.rd, device=dev, dtype=dtype))
+    Q[4:, 4:] = Rd
+    lo = torch.tensor([-s_max, -spec.a_brake], device=dev, dtype=dtype)
+    hi = torch.tensor([s_max, spec.a_max], device=dev, dtype=dtype)
+    E = torch.zeros(6, 2, device=dev, dtype=dtype); E[4, 0] = 1.0; E[5, 1] = 1.0
+    return (Q, Qf, R, Rd, lo, hi, E, torch.eye(2, device=dev, dtype=dtype))
+
+
+def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSpec, wb: float, s_max: float, v_max: float,
+         consts=None, bounds: Optional[torch.Tensor] = None):
     """z0 (B,6) [x,y,psi,v,steer_prev,accel_prev], ref (B,N+1,4), u_warm (B,N,2) -> u (B,N,2), z (B,N+1,6)."""
     B, N, dev = z0.shape[0], spec.N, z0.device
-    Q = torch.zeros(6, 6, device=dev); Q[:4, :4] = torch.diag(torch.tensor(spec.q, device=dev))
-    Qf = torch.zeros(6, 6, device=dev); Qf[:4, :4] = torch.diag(torch.tensor(spec.qf, device=dev))
-    R = torch.diag(torch.tensor(spec.r, device=dev)); Rd = torch.diag(torch.tensor(spec.rd, device=dev))
-    Q[4:, 4:] = Rd                                                     # (u - u_prev)^T Rd (u - u_prev): u_prev lives in the state
-    lo = torch.tensor([-s_max, -spec.a_max], device=dev); hi = torch.tensor([s_max, spec.a_max], device=dev)
-    E = torch.zeros(6, 2, device=dev); E[4, 0] = 1.0; E[5, 1] = 1.0      # picks u_prev out of z
+    if consts is None:                                                 # unchanged path: build inline
+        Q = torch.zeros(6, 6, device=dev); Q[:4, :4] = torch.diag(torch.tensor(spec.q, device=dev))
+        Qf = torch.zeros(6, 6, device=dev); Qf[:4, :4] = torch.diag(torch.tensor(spec.qf, device=dev))
+        R = torch.diag(torch.tensor(spec.r, device=dev)); Rd = torch.diag(torch.tensor(spec.rd, device=dev))
+        Q[4:, 4:] = Rd                                                 # (u - u_prev)^T Rd (u - u_prev): u_prev lives in the state
+        lo = torch.tensor([-s_max, -spec.a_brake], device=dev); hi = torch.tensor([s_max, spec.a_max], device=dev)
+        E = torch.zeros(6, 2, device=dev); E[4, 0] = 1.0; E[5, 1] = 1.0  # picks u_prev out of z
+        eye2 = torch.eye(2, device=dev)
+    else:
+        Q, Qf, R, Rd, lo, hi, E, eye2 = consts
+    if bounds is not None:
+        # Per-env control bounds: (B, 2, 2) as [[steer_lo, accel_lo], [steer_hi, accel_hi]].
+        # Limiting only the reference would leave the solver free to command past the budget, so the
+        # same numbers have to reach the clamp in the forward rollout below.
+        lo, hi = bounds[:, 0], bounds[:, 1]
 
     def rollout(u):
         z = [z0]
@@ -167,7 +235,7 @@ def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSp
             Qz = lz + (A.transpose(1, 2) @ Vz[..., None]).squeeze(-1)
             Qu = lu + (Bm.transpose(1, 2) @ Vz[..., None]).squeeze(-1)
             Qzz = lzz + A.transpose(1, 2) @ Vzz @ A
-            Quu = luu + Bm.transpose(1, 2) @ Vzz @ Bm + 1e-3 * torch.eye(2, device=dev)
+            Quu = luu + Bm.transpose(1, 2) @ Vzz @ Bm + 1e-3 * eye2
             Quz = luz + Bm.transpose(1, 2) @ Vzz @ A
             det = Quu[:, 0, 0] * Quu[:, 1, 1] - Quu[:, 0, 1] * Quu[:, 1, 0]
             inv = torch.stack([torch.stack([Quu[:, 1, 1], -Quu[:, 0, 1]], 1), torch.stack([-Quu[:, 1, 0], Quu[:, 0, 0]], 1)], 1) / det[:, None, None]
@@ -182,23 +250,32 @@ def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSp
             ut = u[:, t] + ks[t] + (Ks[t] @ (zn - z[:, t])[..., None]).squeeze(-1)
             ut = torch.maximum(torch.minimum(ut, hi), lo)
             ut[:, 1] = torch.minimum(ut[:, 1], (v_max - zn[:, 3]) / spec.dt)   # never command past v_max
+            if bounds is not None:
+                # That clamp is below `lo` whenever the state is already past v_max: at v = v_max + 1
+                # and dt = 50 ms it asks for -20 m/s^2. Legacy keeps it (its floor is the spec's
+                # a_brake, and this is the pre-existing behaviour), but a friction-derived floor
+                # exists precisely to say what the tyre can do, so it is re-applied here rather than
+                # silently exceeded. Overspeed is then shed at the budget over several steps.
+                ut[:, 1] = torch.maximum(ut[:, 1], lo[:, 1])
             un[:, t] = ut; zn = _dyn(zn, ut, spec, wb); zs.append(zn)
         u, z = un, torch.stack(zs, 1)
     return u, z
 
 
-def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSpec, wb: float, s_max: float, v_max: float):
+def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSpec, wb: float, s_max: float, v_max: float,
+          consts=None, v_limit: Optional[torch.Tensor] = None, bounds: Optional[torch.Tensor] = None,
+          a_walk: Optional[torch.Tensor] = None):
     """Whole tracker step as one function (compiled into a single CUDA graph on the GPU): decode the plan,
     build the reference, predict over the latency, run the iLQR. Returns (u (B,N,2), z (B,N+1,6), ref)."""
     k, Lp, v0, v1 = decode(action, v_meas, v_max, speed_cap, spec)
-    ref = reference(k, Lp, v0, v1, spec, v_meas)
+    ref = reference(k, Lp, v0, v1, spec, v_meas, v_limit=v_limit, a_walk=a_walk)
     v = v_meas.abs()
     Le = wb + spec.k_us * v * v
     steer_now = torch.atan(yaw_rate * Le / v.clamp_min(0.5)).clamp(-s_max, s_max)
     psi0 = yaw_rate * delay
     z0 = torch.stack([v * delay, 0.5 * v * psi0 * delay, psi0, (v + u_prev[:, 1] * delay).clamp_min(0.0),
                       torch.where(v > 0.5, steer_now, u_prev[:, 0]), u_prev[:, 1]], 1)
-    u, z = ilqr(z0, ref, warm, spec, wb, s_max, v_max)
+    u, z = ilqr(z0, ref, warm, spec, wb, s_max, v_max, consts, bounds=bounds)
     return u, z, ref
 
 
@@ -227,9 +304,15 @@ def solve_fast(*args, **kw):
 class PlanTracker:
     """Per-env state for the plan -> (steer, speed) tracker. Call reset(ids) when envs restart."""
 
-    def __init__(self, num_envs: int, device, wheelbase: float, s_max: float, v_max: float, spec: Optional[PlanSpec] = None):
+    def __init__(self, num_envs: int, device, wheelbase: float, s_max: float, v_max: float, spec: Optional[PlanSpec] = None,
+                 compile_solver: bool = True):
         self.B, self.device, self.wb, self.s_max, self.v_max = num_envs, torch.device(device), wheelbase, s_max, v_max
         self.spec = spec or PlanSpec()
+        self.compile_solver = compile_solver
+        # Per-instance solver override. `None` keeps the module-level selection below, which is what
+        # every existing caller gets. The viewer's CUDA-graph fast path binds one here for its own
+        # tracker only; nothing global is replaced, so other trackers in the process are unaffected.
+        self._solver = None
         self.u_prev = torch.zeros(num_envs, 2, device=self.device)                 # last applied steer, accel
         self.u_seq = torch.zeros(num_envs, self.spec.N, 2, device=self.device)     # warm start
         self.last_ref = None                                                       # (B,N+1,4) body frame plan, for viewers
@@ -253,7 +336,8 @@ class PlanTracker:
         elif not torch.is_tensor(delay):
             delay = torch.full_like(v, float(delay))
         warm = torch.cat([self.u_seq[:, 1:], self.u_seq[:, -1:]], 1)
-        u, z, ref = solve_fast(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
+        solver = self._solver or (solve_fast if self.compile_solver else solve)
+        u, z, ref = solver(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
         u, z, ref = u.clone(), z.clone(), ref.clone()             # CUDA-graph outputs are reused by the next run
         self.u_seq = u; self.u_prev = u[:, 0].clone(); self.last_ref = ref; self.last_pred = z[:, :, :4]
         k_ = max(1, int(round(sp.v_cmd_lead / sp.dt)))

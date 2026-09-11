@@ -1,0 +1,514 @@
+{
+ "generated": "2026-09-11",
+ "produced_by": "work/simulation-videos (outside this repository)",
+ "renderer": {
+  "GL_RENDERER": "llvmpipe (LLVM 15.0.7, 256 bits)",
+  "GL_VERSION": "4.5 (Core Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4",
+  "GL_VENDOR": "Mesa",
+  "is_software": true
+ },
+ "environment": {
+  "LIBGL_ALWAYS_SOFTWARE": "1",
+  "GALLIUM_DRIVER": "llvmpipe",
+  "LP_NUM_THREADS": "2",
+  "OMP_NUM_THREADS": "1",
+  "MKL_NUM_THREADS": "1",
+  "CUDA_VISIBLE_DEVICES": "",
+  "DISPLAY": ":99"
+ },
+ "source_hashes": {
+  "viewer/native.py": "711cb723a0118dace232d788f7cd75fae804c7fe8a0dc0bdacd103f6978e5f77",
+  "viewer/gl_scene.py": "98b879b5c6203a9eb085c298eab1145f680d7ec198cb1e6a01065f134e31cb6b",
+  "viewer/console/theme.py": "416d69d53e9617aae2cb35e33e6d84ead2f615aaebde9e797a82213761fc7975"
+ },
+ "tool_hashes": {
+  "render_lib.py": "fab9c3238644b2bd5ef53a201be5d4459e5744c8ab8b5ede8ada060f4a006197",
+  "shoot.py": "72288b0d070bceec2fc03fd00fefe3ed43ab4c82ea3b93c36b98bb30a0b80978",
+  "clip1.py": "f4a6b6a98352b0ea3851bf035cd4c6e98d7f6ada62718fbac99c9fdcd5e6c64d",
+  "clip2.py": "a13531d3ba7f16b60d24f79f623706238ea64ffdeaa581893f8980feba84d0d8",
+  "train_chart.py": "c091d9c488a329f54d3082bdd0e47e0e197696e3514e87c150fe0b8abd8c388b",
+  "package.py": "48b776bbd5a3dbb486fce0d3edfee1bc30c1db518cf48092e8ef10f5aae8fdff",
+  "deliver.py": "7cf6c6736662b7993d7593bb22b582a15a6c5baafaba9d405b95223cff48df40"
+ },
+ "clips": [
+  {
+   "name": "f1tenth-simulator-demo",
+   "mp4": "f1tenth-simulator-demo.mp4",
+   "probe": {
+    "codec": "h264",
+    "profile": "High",
+    "pix_fmt": "yuv420p",
+    "width": 1920,
+    "height": 1080,
+    "avg_frame_rate": 30.0,
+    "nb_frames": 750,
+    "duration_s": 25.0,
+    "bytes": 10317303,
+    "bit_rate_kbps": 3302
+   },
+   "decode_check": {
+    "full_decode": "ok",
+    "frames": [
+     {
+      "at_s": 0.5,
+      "file": "qa_decoded_0.png",
+      "mean": 121.31,
+      "std": 60.38,
+      "nonblack": true
+     },
+     {
+      "at_s": 12.5,
+      "file": "qa_decoded_1.png",
+      "mean": 105.73,
+      "std": 65.0,
+      "nonblack": true
+     },
+     {
+      "at_s": 24.25,
+      "file": "qa_decoded_2.png",
+      "mean": 103.15,
+      "std": 65.16,
+      "nonblack": true
+     }
+    ],
+    "all_nonblack": true,
+    "distinct": true
+   },
+   "gif": {
+    "source_start_s": 5.5,
+    "seconds": 5.0,
+    "width": 480,
+    "fps": 10,
+    "bytes": 2443481
+   },
+   "render": {
+    "frames": 750,
+    "control_steps": 1000,
+    "fps": 30,
+    "resolution": "1920x1080",
+    "msaa": 4,
+    "shots": [
+     {
+      "camera": "overview",
+      "seconds": 5,
+      "frames": 150,
+      "first_frame": 0
+     },
+     {
+      "camera": "chase",
+      "seconds": 9,
+      "frames": 270,
+      "first_frame": 150
+     },
+     {
+      "camera": "closeup",
+      "seconds": 5,
+      "frames": 150,
+      "first_frame": 420
+     },
+     {
+      "camera": "orbit",
+      "seconds": 6,
+      "frames": 180,
+      "first_frame": 570
+     }
+    ],
+    "gl": {
+     "GL_RENDERER": "llvmpipe (LLVM 15.0.7, 256 bits)",
+     "GL_VERSION": "4.5 (Core Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4",
+     "GL_VENDOR": "Mesa",
+     "is_software": true
+    },
+    "env": {
+     "LIBGL_ALWAYS_SOFTWARE": "1",
+     "GALLIUM_DRIVER": "llvmpipe",
+     "LP_NUM_THREADS": "2",
+     "OMP_NUM_THREADS": "1",
+     "MKL_NUM_THREADS": "1",
+     "CUDA_VISIBLE_DEVICES": "",
+     "DISPLAY": ":99"
+    },
+    "kept_frames": [
+     "f00000_overview.png",
+     "f00045_overview.png",
+     "f00090_overview.png",
+     "f00135_overview.png",
+     "f00180_chase.png",
+     "f00225_chase.png",
+     "f00270_chase.png",
+     "f00315_chase.png",
+     "f00360_chase.png",
+     "f00405_chase.png",
+     "f00450_closeup.png",
+     "f00495_closeup.png",
+     "f00540_closeup.png",
+     "f00585_orbit.png",
+     "f00630_orbit.png",
+     "f00675_orbit.png",
+     "f00720_orbit.png"
+    ],
+    "wall_seconds": 184.8,
+    "render_seconds": 149.6,
+    "ffmpeg": [
+     "nice",
+     "-n",
+     "10",
+     "ffmpeg",
+     "-hide_banner",
+     "-loglevel",
+     "error",
+     "-y",
+     "-f",
+     "rawvideo",
+     "-pix_fmt",
+     "rgb24",
+     "-s",
+     "1920x1080",
+     "-r",
+     "30",
+     "-i",
+     "-",
+     "-an",
+     "-c:v",
+     "libx264",
+     "-preset",
+     "slow",
+     "-crf",
+     "24",
+     "-profile:v",
+     "high",
+     "-pix_fmt",
+     "yuv420p",
+     "-movflags",
+     "+faststart",
+     "-threads",
+     "2",
+     "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/simulation-videos/clip1.mp4"
+    ],
+    "timeline": {
+     "physics_hz": 40.0,
+     "video_fps": 30,
+     "playback_rate": 1.0,
+     "sim_seconds_per_frame": 0.033333,
+     "control_steps_per_frame": 1.3333,
+     "one_step_per_frame": false,
+     "physics_interpolated": false,
+     "note": "1.0x real time: 40 Hz physics, 30 fps video, so 1.333 control steps per frame. The displayed pose and the camera are both taken from one snapshot blended between the two bracketing 40 Hz states; the physics is not."
+    },
+    "world": {
+     "map": "real:korea_2026_competition",
+     "driver": "RacelineTeacher(mode='pp')",
+     "speed_scale": 0.92,
+     "device": "cpu",
+     "config_sim_seed": 7,
+     "torch_global_seed": 7,
+     "domain_randomisation": true,
+     "drawn_mu": 0.92097
+    },
+    "episode_boundaries": [],
+    "map_bounds": [
+     -6.97,
+     -3.0,
+     1.38,
+     19.55
+    ]
+   },
+   "poster": {
+    "file": "f1tenth-simulator-demo-poster.png",
+    "from_frame": "f00270_chase.png",
+    "bytes": 547390
+   },
+   "contact_sheet": {
+    "tiles": [
+     "f00090_overview.png",
+     "f00225_chase.png",
+     "f00315_chase.png",
+     "f00450_closeup.png",
+     "f00540_closeup.png",
+     "f00675_orbit.png"
+    ],
+    "size": "1920x720",
+    "bytes": 881631,
+    "file": "f1tenth-simulator-demo-contact-sheet.png"
+   },
+   "sha256": {
+    "f1tenth-simulator-demo-contact-sheet.png": "ade3bb9dd1f7ce416d8e7fc2233eade2e7b840944641aec2a8ee4ad6e56de6e7",
+    "f1tenth-simulator-demo-poster.png": "01396965572dda6e454ad197c68c6eefa4e7d447598d7156f2381316cf0ee13a",
+    "f1tenth-simulator-demo.gif": "6994d0098d0819bf540344a4a434a246e5d6e66008b8e29fb7b380b974927018",
+    "f1tenth-simulator-demo.mp4": "bd577a076702eb38d47f06f83ba97fbe7f1f9aa413d4015aeb92a1111a5cb9bf"
+   }
+  },
+  {
+   "name": "f1tenth-learning-demo",
+   "mp4": "f1tenth-learning-demo.mp4",
+   "probe": {
+    "codec": "h264",
+    "profile": "High",
+    "pix_fmt": "yuv420p",
+    "width": 1920,
+    "height": 1080,
+    "avg_frame_rate": 30.0,
+    "nb_frames": 750,
+    "duration_s": 25.0,
+    "bytes": 11009014,
+    "bit_rate_kbps": 3523
+   },
+   "decode_check": {
+    "full_decode": "ok",
+    "frames": [
+     {
+      "at_s": 0.5,
+      "file": "qa_decoded_0.png",
+      "mean": 105.82,
+      "std": 63.72,
+      "nonblack": true
+     },
+     {
+      "at_s": 12.5,
+      "file": "qa_decoded_1.png",
+      "mean": 116.15,
+      "std": 63.08,
+      "nonblack": true
+     },
+     {
+      "at_s": 24.25,
+      "file": "qa_decoded_2.png",
+      "mean": 99.16,
+      "std": 63.37,
+      "nonblack": true
+     }
+    ],
+    "all_nonblack": true,
+    "distinct": true
+   },
+   "gif": {
+    "source_start_s": 1.5,
+    "seconds": 5.0,
+    "width": 480,
+    "fps": 10,
+    "bytes": 2468623
+   },
+   "render": {
+    "frames": 750,
+    "control_steps": 999,
+    "fps": 30,
+    "resolution": "1920x1080",
+    "msaa": 4,
+    "shots": [
+     {
+      "camera": "chase",
+      "seconds": 10,
+      "frames": 300,
+      "first_frame": 0
+     },
+     {
+      "camera": "overview",
+      "seconds": 5,
+      "frames": 150,
+      "first_frame": 300
+     },
+     {
+      "camera": "closeup",
+      "seconds": 5,
+      "frames": 150,
+      "first_frame": 450
+     },
+     {
+      "camera": "orbit",
+      "seconds": 5,
+      "frames": 150,
+      "first_frame": 600
+     }
+    ],
+    "gl": {
+     "GL_RENDERER": "llvmpipe (LLVM 15.0.7, 256 bits)",
+     "GL_VERSION": "4.5 (Core Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4",
+     "GL_VENDOR": "Mesa",
+     "is_software": true
+    },
+    "env": {
+     "LIBGL_ALWAYS_SOFTWARE": "1",
+     "GALLIUM_DRIVER": "llvmpipe",
+     "LP_NUM_THREADS": "2",
+     "OMP_NUM_THREADS": "1",
+     "MKL_NUM_THREADS": "1",
+     "CUDA_VISIBLE_DEVICES": "",
+     "DISPLAY": ":99"
+    },
+    "kept_frames": [
+     "f00000_chase.png",
+     "f00045_chase.png",
+     "f00090_chase.png",
+     "f00135_chase.png",
+     "f00180_chase.png",
+     "f00225_chase.png",
+     "f00270_chase.png",
+     "f00315_overview.png",
+     "f00360_overview.png",
+     "f00405_overview.png",
+     "f00450_closeup.png",
+     "f00495_closeup.png",
+     "f00540_closeup.png",
+     "f00585_closeup.png",
+     "f00630_orbit.png",
+     "f00675_orbit.png",
+     "f00720_orbit.png"
+    ],
+    "wall_seconds": 206.5,
+    "render_seconds": 151.4,
+    "ffmpeg": [
+     "nice",
+     "-n",
+     "10",
+     "ffmpeg",
+     "-hide_banner",
+     "-loglevel",
+     "error",
+     "-y",
+     "-f",
+     "rawvideo",
+     "-pix_fmt",
+     "rgb24",
+     "-s",
+     "1920x1080",
+     "-r",
+     "30",
+     "-i",
+     "-",
+     "-an",
+     "-c:v",
+     "libx264",
+     "-preset",
+     "slow",
+     "-crf",
+     "24",
+     "-profile:v",
+     "high",
+     "-pix_fmt",
+     "yuv420p",
+     "-movflags",
+     "+faststart",
+     "-threads",
+     "2",
+     "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/simulation-videos/clip2.mp4"
+    ],
+    "timeline": {
+     "physics_hz": 40.0,
+     "video_fps": 30,
+     "playback_rate": 1.0,
+     "sim_seconds_per_frame": 0.033333,
+     "control_steps_per_frame": 1.3333,
+     "one_step_per_frame": false,
+     "physics_interpolated": false,
+     "note": "1.0x real time: 40 Hz physics, 30 fps video, so 1.333 control steps per frame. The displayed pose and the camera are both taken from one snapshot blended between the two bracketing 40 Hz states; the physics is not."
+    },
+    "world": {
+     "checkpoint": "/home/shchon11/f1sim_runs/cl_main_fixed_low_s501/ppo_final.pt",
+     "checkpoint_sha256": "2f86431805279404919c281fc04d8531b9b530eae0b978f38e6739e2709f25b2",
+     "run": "cl_main_fixed_low_s501",
+     "update": "128/128",
+     "steps": 1048576,
+     "seed": 501,
+     "controller_arm": "fixed_low",
+     "controller_mu_fixed": 0.73423,
+     "estimator_path": null,
+     "flags_fired": [],
+     "action_mode": "plan",
+     "speed_cap_m_s": 9.0,
+     "priv_adapter": "absent_opponent_17_to_21",
+     "obs_spec": {
+      "n_beams": 1081,
+      "scan_stack": 6,
+      "scan_stride": 1,
+      "action_history": 2,
+      "act_dim": 8,
+      "hist_len": 20,
+      "hist_stride": 2,
+      "range_max": 10.0,
+      "v_max": 10.0,
+      "gyro_scale": 5.0,
+      "accel_scale": 10.0,
+      "att_scale": 0.35
+     },
+     "map": "real:korea_2026_competition",
+     "config_sim_seed": 3,
+     "domain_randomisation": true,
+     "drawn_mu": 0.79472,
+     "episodes": [
+      {
+       "index": 0,
+       "first_step": 0,
+       "sim_t": 0.0,
+       "drawn_mu": 0.75466
+      },
+      {
+       "index": 1,
+       "first_step": 204,
+       "sim_t": 5.125,
+       "drawn_mu": 0.79472
+      }
+     ],
+     "events": [
+      {
+       "kind": "collision_reset",
+       "control_step": 204,
+       "sim_t": 5.125,
+       "mu_before": 0.75466,
+       "mu_after": 0.79472
+      }
+     ],
+     "checkpoint_metrics": {
+      "collision_rate": 0.6666666666666666,
+      "progress_m": 130.80003611246744,
+      "collisions_per_km": 5.096838552043199,
+      "lap_time_s": 15.199999809265137,
+      "controller/mu_used_mean": 0.7342299818992615,
+      "controller/mu_used_std": 8.312296732344953e-05,
+      "controller/a_brake_realised_mean": 1.6991036348044872,
+      "controller/a_brake_realised_spread": 1.2533148527145386,
+      "controller/flag_degeneracy_run": 0,
+      "controller/flag_overestimate_run": 0
+     },
+     "device": "cpu"
+    },
+    "episode_boundaries": [
+     {
+      "frame": 153,
+      "sim_t": 5.15,
+      "to_episode": 1
+     }
+    ],
+    "map_bounds": [
+     -6.97,
+     -3.0,
+     1.38,
+     19.55
+    ]
+   },
+   "poster": {
+    "file": "f1tenth-learning-demo-poster.png",
+    "from_frame": "f00135_chase.png",
+    "bytes": 852849
+   },
+   "contact_sheet": {
+    "tiles": [
+     "f00045_chase.png",
+     "f00135_chase.png",
+     "f00225_chase.png",
+     "f00360_overview.png",
+     "f00450_closeup.png",
+     "f00585_closeup.png"
+    ],
+    "size": "1920x720",
+    "bytes": 1050675,
+    "file": "f1tenth-learning-demo-contact-sheet.png"
+   },
+   "sha256": {
+    "f1tenth-learning-demo-contact-sheet.png": "3dd7470db67be4269c408f0cb6aadf2484f0e1ad1bf0c00aa9edc062076d1bae",
+    "f1tenth-learning-demo-poster.png": "57be547b1ec63c7580fc07e4a3a53ee8e97ea5be3d529f2d82e17a0e095fa7b9",
+    "f1tenth-learning-demo.gif": "3858ae4b55b7b2d8be50ffdbbfebee5328550afeb3c16d74142ed60c6c43c2d9",
+    "f1tenth-learning-demo.mp4": "d878acf1dbd37cd51837f9130545b6a783687a82ffebe8d819ae124d9adc00e3"
+   }
+  }
+ ]
+}

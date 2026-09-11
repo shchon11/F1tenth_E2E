@@ -28,12 +28,14 @@ class RacelineTeacher:
                  speed_scale: float = 1.0, steer_max: float = 0.4189,
                  k_e: float = 2.5, k_psi: float = 1.0, v_soft: float = 1.0, k_us: float = 0.003,
                  ff_time: float = 0.05, k_e_pp: float = 0.0,
-                 mu_nominal: float = 1.0489, mu_f_scale_nominal: float = 0.92):
+                 mu_nominal: float = 1.0489, mu_f_scale_nominal: float = 0.92,
+                 recover_time: float = 0.0, v_recover_min: float = 0.6, a_lat_recover: float = 6.0,
+                 v_max_profile: float = 10.0, a_lat: float = 6.0, a_acc: float = 6.0, a_brake: float = 3.0):
         self.device = torch.device(device)
         rls = [raceline] if isinstance(raceline, Raceline) else list(raceline)     # one per track id
         N = max(len(r.xy) for r in rls)
         # speed profiles per grip level: the teacher is privileged, so it brakes and corners for the
-        # friction *this* car has (a_lat, a_brake, a_acc all scale with grip), not for a nominal car
+        # friction *this* car has (a_lat and a_acc scale with grip; braking does not, see below)
         from .raceline import speed_profile
         self.grip_levels = np.linspace(0.45, 1.0, 12)      # never faster than the nominal profile: above nominal grip the
                                                             # limit is tracking error, not the tyres (measured: faster = more crashes)
@@ -41,7 +43,20 @@ class RacelineTeacher:
         for r in rls:
             xr = resample_closed(r.xy, N)
             xy.append(xr); kap.append(curvature(xr))
-            v.append(np.stack([speed_profile(xr, 10.0, 6.0 * g, 4.0 * g, 3.0 * g) for g in self.grip_levels]))   # (K, N)
+            # Measured on the real car (02_pre-competition bags, IMU a_y/a_x smoothed over 200 ms to
+            # drop vibration spikes -- the raw p99 reads 15.9 m/s^2 and is not sustained for even
+            # 0.02 s): lateral 9.2-11.5, longitudinal +6 to +10, braking -5.4 (IMU) / -6.3 (wheel
+            # speed). mu*g in the simulator is 9.5, so the physics already matched; the profile was
+            # planning at 6.0 * grip, i.e. 30-60 % of what the car can do, which also put the
+            # braking point outside the 10 m the LiDAR can see.
+            # a_lat and a_acc scale with grip; braking does not. Measured on the car, the hardest
+            # 200 ms of braking always coincides with the regen current at 95-100 % of its
+            # configured limit, at -4.2 to -5.7 m/s^2 -- well inside mu*g, so the VESC binds first
+            # and the surface never gets a vote. Scaling it by grip made the teacher plan 2.25 m/s^2
+            # of braking on a low-grip draw where the car can still do 5, costing lap time for
+            # nothing.
+            v.append(np.stack([speed_profile(xr, v_max_profile, a_lat * g, a_acc * g, a_brake)
+                               for g in self.grip_levels]))   # (K, N)
         self.xy = torch.tensor(np.stack(xy), dtype=torch.float32, device=self.device)     # (T, N, 2)
         self.v_grip = torch.tensor(np.stack(v), dtype=torch.float32, device=self.device)  # (T, K, N)
         self.v = self.v_grip[:, -1]                                                        # nominal grip (T, N)
@@ -61,6 +76,13 @@ class RacelineTeacher:
         self.speed_scale = speed_scale
         self.steer_max = steer_max
         self.mu_nom, self.mu_f_nom = mu_nominal, mu_f_scale_nominal
+        # recover_time > 0: cap the commanded speed by what can still be turned back onto the lane.
+        # The existing slowdown reads *lateral* error only, so a car sitting on the line facing
+        # backwards is told to drive at full profile speed: measured 3.06 m/s at 180 deg of heading
+        # error, on a commanded radius of 0.74 m -- 12.7 m/s^2 of lateral acceleration against the
+        # ~6 m/s^2 the profile itself assumes. That is not a recovery demonstration, and DAgger can
+        # only teach what the teacher shows, so weighting those samples harder would teach it harder.
+        self.recover_time, self.v_recover_min, self.a_lat_recover = recover_time, v_recover_min, a_lat_recover
 
     @torch.no_grad()
     def plan_action(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None, v_max: float = 8.0,
@@ -123,12 +145,39 @@ class RacelineTeacher:
         _, lat_err = self.project(xy, tid)
         slow = (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)     # off the line: slow down, like the direct teacher
         v0 = self.speed_at(tid, v_idx0, gb) * slow; v1 = self.speed_at(tid, v_idx1, gb) * slow
+        cap = self.heading_speed_cap(yaw, tid, idx)
+        if cap is not None:
+            v0 = torch.minimum(v0, cap); v1 = torch.minimum(v1, cap)
         return encode(k, v0, v1, v_max, spec)
 
+    label_grip = "true"          # "true": per-env grip (privileged); "nominal"/"conservative": constant
+
+    def heading_speed_cap(self, yaw: torch.Tensor, tid: torch.Tensor, idx: torch.Tensor) -> Optional[torch.Tensor]:
+        """Speed from which the car can still turn back onto the lane within `recover_time`.
+
+        Heading change available over a time t at the grip-limited curvature a_lat / v^2 is
+        a_lat * t / v, so recovering a heading error psi needs v <= a_lat * t / psi. Returns None
+        when disabled, leaving the commanded speed exactly as before."""
+        if self.recover_time <= 0:
+            return None
+        tan = self.tan[tid, idx]
+        psi = torch.remainder(torch.atan2(tan[:, 1], tan[:, 0]) - yaw + math.pi, 2 * math.pi) - math.pi
+        return (self.a_lat_recover * self.recover_time / psi.abs().clamp_min(1e-3)).clamp_min(self.v_recover_min)
+
     def grip_bin(self, P, B: int, device):
-        """Index of the speed profile matching each env's grip (privileged); nominal when P is None."""
-        if P is None:
+        """Index of the speed profile this teacher drives on.
+
+        "true" reads each env's randomized mu. That makes the teacher fast, but it also makes the
+        *label* a function of something the student cannot see: two identical scans get speed labels
+        up to 1/0.45 ~ 2.2x apart, and a Huber regression can only learn their conditional mean --
+        too fast in low grip, too slow in high grip. "nominal" and "conservative" pin the profile so
+        the label is a function of the observation alone (the price is a slower target, and a teacher
+        that can over-drive a low-grip car, which is why collection uses `speed_scale` < 1).
+        """
+        if self.label_grip == "nominal" or P is None:
             return torch.full((B,), len(self.grip_levels) - 1, dtype=torch.long, device=device)
+        if self.label_grip == "conservative":
+            return torch.zeros(B, dtype=torch.long, device=device)
         g = ((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(max=1.0)
         return (g[:, None] - self.grip_levels_t[None]).abs().argmin(1)
 
@@ -191,6 +240,9 @@ class RacelineTeacher:
         v_idx = (idx + ((vx.abs() * self.t_v) / ds).round().long()) % self.N
         v_cmd = self.speed_at(tid, v_idx, self.grip_bin(P, xy.shape[0], xy.device))
         v_cmd = v_cmd * (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)   # slow down when off-line
+        cap = self.heading_speed_cap(yaw, tid, idx)
+        if cap is not None:
+            v_cmd = torch.minimum(v_cmd, cap)
         if P is not None:
             v_cmd = v_cmd / P["speed_gain"]
             steer = ((steer - P["steer_bias"]) / P["steer_gain"]).clamp(-self.steer_max, self.steer_max)

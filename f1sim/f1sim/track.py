@@ -15,13 +15,35 @@ import torch
 from scipy import ndimage
 
 
+@dataclass(frozen=True)
+class StaticProp:
+    """One placed obstacle: a style name and where it stands. Not a mesh and not grid cells.
+
+    The alternative -- stamping the obstacle into `tall` the way `with_lane_obstacles` does -- was
+    what made every obstacle a rotated rectangle of a single fixed height, and worse, an obstacle
+    with no top: the tracer treats `tall` as unbounded above, so a 30 cm box drawn on screen was an
+    infinitely high wall to every beam. Keeping the placement as a record instead lets the renderer,
+    the LiDAR and the contact test each read the same finite convex sections."""
+    style: str                                # one of f1sim.props.STYLES
+    x: float
+    y: float
+    yaw: float = 0.0                          # [rad], CCW from world +x
+    seed: int = 0
+    dims: tuple = ()                          # ((key, value), ...) -- a tuple so Track stays hashable
+
+    def build(self):
+        from . import props as _props
+        return _props.build(self.style, seed=self.seed, **dict(self.dims))
+
+
 @dataclass
 class Track:
     """Layered obstacle map.
     occupancy : every obstacle the car can hit (duct | tall)            -> collision, spawn checks
     duct      : low boundary objects (flexible duct hose, height duct_height) -> LiDAR beams pass over them when tilted
     tall      : tall objects (room walls, unknown space, clutter)        -> always block beams
-    Cells that are neither are floor (drivable or not)."""
+    Cells that are neither are floor (drivable or not).
+    props     : placed static obstacles, held analytically rather than rasterised (see StaticProp)."""
     occupancy: np.ndarray            # (H, W) bool
     resolution: float                # [m/cell]
     origin: tuple                    # (x, y) of cell (0, 0) lower-left corner
@@ -33,7 +55,7 @@ class Track:
     edt_duct: Optional[np.ndarray] = None
     edt_tall: Optional[np.ndarray] = None
     duct_height: float = 0.2                  # [m] duct hose diameter
-    base: Optional["Track"] = None            # the track this one was carved from (pockets): racelines are built on it
+    props: tuple = ()                         # (StaticProp, ...); empty on every existing track
 
     def __post_init__(self):
         if self.duct is None or self.tall is None:
@@ -201,121 +223,92 @@ class Track:
         return Track.from_occupancy(occ, res, (origin[0], origin[1]), cl, name, duct=duct, tall=tall,
                                     duct_height=duct_height)
 
-    def lane_only(self, margin: float = 0.3) -> "Track":
-        """Copy of the track with every free cell farther from the centerline than the local half-width
-        (+ margin) filled in: side rooms, dead-end corridors and other openings of a SLAM map are walled
-        off, the lane itself is untouched. Used as the `~lane` catalog modifier to separate 'can the
-        policy drive this geometry' from 'does it fall into that hall's forks': ppo_v13 on
-        blackbox2022_3 crashed 1.00/car/20 s, on blackbox2022_3~lane 0.05."""
-        from scipy.spatial import cKDTree
-        cl = self.centerline; res = self.resolution; H, W = self.occupancy.shape
-        rc = np.stack([(cl[:, 1] - self.origin[1]) / res, (cl[:, 0] - self.origin[0]) / res])
-        hw = ndimage.map_coordinates(self.edt, rc, order=1, mode="nearest")     # local half-width per centerline point
-        free = ~self.occupancy; fr, fc = np.nonzero(free)
-        d, j = cKDTree(cl).query(np.stack([fc * res + self.origin[0], fr * res + self.origin[1]], 1))
-        fill = np.zeros_like(free); fill[fr[d > hw[j] + margin], fc[d > hw[j] + margin]] = True
-        t = Track.from_occupancy(self.occupancy | fill, res, self.origin, cl, self.name + "l", duct_height=self.duct_height)
-        t.base = self if self.base is None else self.base                      # same raceline
-        return t
+    def with_pinches(self, seed: int = 0, n: int = 3, keep: float = 0.45, run: float = 1.6) -> "Track":
+        """Copy of the track with the boundary pushed inward at a few places along the lane.
 
-    def with_pockets(self, seed: int = 0, n: int = 3, depth=(1.0, 4.0), width=(0.8, 2.4), min_spacing: float = 5.0,
-                     p_bend: float = 0.6, p_elbow: float = 0.5, p_round: float = 0.3) -> "Track":
-        """Copy of the track with n dead-end side pockets carved into the boundary and walled with duct
-        hose: pit-lane mouths, door alcoves, side rooms of a hall. Openings like these are what a
-        LiDAR-only policy mistakes for the track (ppo_v10 died in blackbox2022_3's alcoves at 1.0 crash
-        per car per 20 s while every other held-out map was under 0.06). The lane itself, the centerline
-        and the raceline (built on `base`, the unmodified track) are unchanged. A share p_bend of the
-        pockets opens on the outside of a bend, where an approaching car sees it straight ahead: that is
-        the configuration that actually traps the policy (a corridor continuing where the track turns);
-        pockets on the side of a straight it ignores after a few updates. A share p_elbow of the
-        pockets turn 90 degrees after their first leg (an elbow), so their end wall is out of sight
-        from the mouth, as it is in a real side corridor: the policy must not rely on seeing a dead end.
-        A share p_round are round alcoves (a half disc off the wall): the last thing ppo_v13 kept
-        falling into on blackbox2022_3 once it had learned the corridors."""
-        rng = np.random.default_rng(seed + 7919)
+        Measured against the real venues, every generator holds its width almost constant: the ratio
+        of the local width to the narrowest spot near it runs 1.04-1.05 procedurally against 1.98 on
+        the blackbox maps, where a 3 m section closes to 1.5 m and opens again. That is a different
+        problem from a narrow track -- the car arrives carrying speed the gap will not take -- and
+        nothing in the catalogue trains it except a handful of real maps.
+
+        `keep` is the fraction of the local width left at the tightest point; `run` how many metres
+        the squeeze extends over. The lane is never taken below the car's width plus a margin.
+
+        0.45 rather than 0.55: with 0.55 the generated pinch ratio reached 1.53-1.65 while
+        blackbox2022_3 -- the one held-out map the student still fails on, at 9-15 collisions/km
+        against 0.1-5 everywhere else -- sits at the top of the measured range. Training against a
+        milder version of the axis than the test set holds is how that gap stays open.
+        """
         if self.centerline is None:
-            raise ValueError("pockets need a centerline")
-        cl = self.centerline; N = len(cl); res = self.resolution
-        tang = np.roll(cl, -1, 0) - np.roll(cl, 1, 0); tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
-        nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
-        occ = self.occupancy.copy(); duct = self.duct.copy(); tall = self.tall.copy()
+            raise ValueError("pinches need a centerline")
+        rng = np.random.default_rng(seed + 4231)
+        cl = self.centerline
+        edt = ndimage.distance_transform_edt(~self.occupancy).astype(np.float32) * self.resolution
+        occ = self.occupancy.copy(); duct = self.duct.copy() if self.duct is not None else None
+        tall = self.tall.copy() if self.tall is not None else None
         H, W = occ.shape
-        lab, _ = ndimage.label(~occ)                                           # the lane = free component of the centerline
-        c0 = int(round((cl[0, 0] - self.origin[0]) / res)); r0 = int(round((cl[0, 1] - self.origin[1]) / res))
-        lane = lab == lab[r0, c0]
-        seg = np.linalg.norm(np.roll(cl, -1, 0) - cl, axis=1).mean()
-        ring_w = self.duct_height + res                                        # pocket wall thickness [m]
-        ang = np.unwrap(np.arctan2(tang[:, 1], tang[:, 0]))
-        kappa = (np.roll(ang, -1) - np.roll(ang, 1)) / (2 * seg + 1e-9)       # signed: + = left turn
-        w_bend = np.abs(kappa); w_bend = w_bend / w_bend.sum() if w_bend.sum() > 0 else None
-        placed = []; tries = 0
-        while len(placed) < n and tries < 300:
-            tries += 1
-            if w_bend is not None and rng.random() < p_bend:                  # outside of a bend
-                i = int(rng.choice(N, p=w_bend)); side = -float(np.sign(kappa[i])) or 1.0
-            else:
-                i = int(rng.integers(N)); side = float(rng.choice([-1.0, 1.0]))
-            if any(min(abs(i - j), N - abs(i - j)) * seg < min_spacing for j in placed):
+        xs = np.arange(W) * self.resolution + self.origin[0]
+        ys = np.arange(H) * self.resolution + self.origin[1]
+        seg = np.linalg.norm(np.roll(cl, -1, 0) - cl, axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg)[:-1]])
+        placed = []
+        for _ in range(n * 12):
+            if len(placed) >= n:
+                break
+            i = int(rng.integers(len(cl)))
+            if any(abs(s[i] - s[j]) < 4.0 for j in placed):
                 continue
-            # distance to the wall on this side: march along the normal
-            hw = None
-            for k in range(1, int(6.0 / (0.5 * res))):
-                q = cl[i] + side * nrm[i] * (k * 0.5 * res)
-                c = int(round((q[0] - self.origin[0]) / res)); r = int(round((q[1] - self.origin[1]) / res))
-                if not (0 <= r < H and 0 <= c < W):
-                    break
-                if occ[r, c]:
-                    hw = k * 0.5 * res; break
-            if hw is None or hw > 4.0:
+            j = int(round((cl[i, 0] - self.origin[0]) / self.resolution))
+            k = int(round((cl[i, 1] - self.origin[1]) / self.resolution))
+            if not (0 <= j < W and 0 <= k < H):
                 continue
-            w = float(rng.uniform(*width)); d = float(rng.uniform(*depth))
-            round_ = rng.random() < p_round
-            elbow = float(rng.choice([-1.0, 1.0])) if (rng.random() < p_elbow and not round_) else 0.0
-            d2 = float(rng.uniform(1.0, 3.0)) if elbow else 0.0                 # second leg, sideways
-            if round_:                                                         # alcove: half disc, mouth = its diameter
-                w = float(rng.uniform(1.2, 3.0)); d = w / 2
-            # local window in lane coordinates: u along the lane, v outward on the chosen side
-            ext = hw + d + max(w, d2) + ring_w + 0.2
-            cx, cy = cl[i]
-            cc0, cc1 = int((cx - ext - self.origin[0]) / res), int((cx + ext - self.origin[0]) / res) + 1
-            rr0, rr1 = int((cy - ext - self.origin[1]) / res), int((cy + ext - self.origin[1]) / res) + 1
-            if cc0 < 0 or rr0 < 0 or cc1 > W or rr1 > H:                       # pocket would run off the map
+            half = float(edt[k, j])
+            target = max(0.55, half * keep)                 # never below the car plus a margin
+            if half - target < 0.12:
                 continue
-            gx, gy = np.meshgrid(np.arange(cc0, cc1) * res + self.origin[0], np.arange(rr0, rr1) * res + self.origin[1])
-            dx, dy = gx - cx, gy - cy
-            u = dx * tang[i, 0] + dy * tang[i, 1]; v = side * (dx * nrm[i, 0] + dy * nrm[i, 1])
-            if round_:
-                pocket = ((u ** 2 + (v - (hw - 0.15)) ** 2 <= (w / 2) ** 2) & (v >= hw - 0.15))
-            else:
-                pocket = (np.abs(u) <= w / 2) & (v >= hw - 0.15) & (v <= hw + d)
-            if elbow:                                                          # second leg at the end, out of sight
-                pocket |= (elbow * u >= -w / 2) & (elbow * u <= w / 2 + d2) & (v >= hw + d - w) & (v <= hw + d)
-            shell = ndimage.binary_dilation(pocket, iterations=max(1, int(np.ceil(ring_w / res))))
-            ring = shell & ~pocket & (v >= hw + 0.05)
-            beyond = shell & (v > hw + 0.05)
-            lane_w = lane[rr0:rr1, cc0:cc1]
-            if (lane_w & beyond).any():                                       # would tunnel into another part of the lane
+            side = 1.0 if rng.uniform() < 0.5 else -1.0
+            d = np.roll(cl, -1, 0) - np.roll(cl, 1, 0)
+            t_ = d[i] / (np.linalg.norm(d[i]) + 1e-9)
+            nrm = np.array([-t_[1], t_[0]]) * side
+            # a smooth bump of blocked cells hugging one wall, tapering over `run` metres
+            c = cl[i] + nrm * (half + target) / 2
+            rad = (half - target) / 2 + 0.05
+            gx, gy = np.meshgrid(xs, ys)
+            along = ((gx - cl[i, 0]) * t_[0] + (gy - cl[i, 1]) * t_[1])
+            across = ((gx - c[0]) * nrm[0] + (gy - c[1]) * nrm[1])
+            taper = np.clip(1.0 - (np.abs(along) / (run / 2)) ** 2, 0.0, 1.0)
+            hit = (np.abs(across) < rad * taper) & (np.abs(along) < run / 2)
+            if not hit.any():
                 continue
-            if not pocket.any():
+            # The raceline optimiser searches a corridor anchored to the centerline, so a pinch that
+            # covers the centerline leaves no corridor at all and the line is returned running
+            # straight through the blockage -- which then teaches the student to drive into it.
+            # Keep the centerline itself clear by the car's half-width plus a margin.
+            keep_free = np.zeros_like(occ)
+            cj = np.clip(((cl[:, 0] - self.origin[0]) / self.resolution).astype(int), 0, W - 1)
+            ci = np.clip(((cl[:, 1] - self.origin[1]) / self.resolution).astype(int), 0, H - 1)
+            keep_free[ci, cj] = True
+            keep_free = ndimage.binary_dilation(keep_free, iterations=int(round(0.28 / self.resolution)))
+            if (hit & keep_free).any():
                 continue
-            occ[rr0:rr1, cc0:cc1][pocket] = False; duct[rr0:rr1, cc0:cc1][pocket] = False; tall[rr0:rr1, cc0:cc1][pocket] = False
-            occ[rr0:rr1, cc0:cc1][ring] = True; duct[rr0:rr1, cc0:cc1][ring] = True; tall[rr0:rr1, cc0:cc1][ring] = False
+            occ |= hit
+            if duct is not None: duct |= hit
             placed.append(i)
-        t = Track.from_occupancy(occ, res, self.origin, cl, f"{self.name}_pk{seed}", duct=duct, tall=tall, duct_height=self.duct_height)
-        t.base = self if self.base is None else self.base
+        t = Track.from_occupancy(occ, self.resolution, self.origin, self.centerline,
+                                 f"{self.name}_pinch{seed}", duct=duct, tall=tall,
+                                 duct_height=self.duct_height)
+        t.props = self.props                       # placements survive a grid edit
         return t
 
     def with_lane_obstacles(self, seed: int = 0, n: int = 3, size=(0.25, 0.5), min_passage: float = 1.2,
-                            min_spacing: float = 4.0, kind: str = "box", lateral: str = "side", on_path=None) -> "Track":
+                            min_spacing: float = 4.0, kind: str = "box") -> "Track":
         """Copy of the track with n tall boxes (competition 'static obstacles') dropped into the lane,
-        placed against one side so at least min_passage of lane stays open, min_spacing apart.
-        lateral="random": anywhere across the lane instead (the wider side must still leave min_passage);
-        on_path=(N,2): centred on that path instead (e.g. the raceline -- the exact line the car wants
-        to drive, so it has to leave it); kind="cyl": cylinders of diameter size[0] instead of boxes."""
+        placed against one side so at least min_passage of lane stays open, min_spacing apart."""
         rng = np.random.default_rng(seed)
         if self.centerline is None:
             raise ValueError("lane obstacles need a centerline")
-        cl = self.centerline if on_path is None else np.asarray(on_path, dtype=np.float64); N = len(cl)
+        cl = self.centerline; N = len(cl)
         tang = np.roll(cl, -1, 0) - np.roll(cl, 1, 0); tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
         nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
         tall = self.tall.copy(); occ = self.occupancy.copy()
@@ -334,16 +327,7 @@ class Track:
             sx, sy = rng.uniform(*size), rng.uniform(*size)
             if 2 * half_w - sy < min_passage + 0.1:                # lane too narrow for an obstacle
                 continue
-            if on_path is not None:
-                off = 0.0                                        # exactly on the line the car wants to drive
-                if half_w - sy / 2 < min_passage * 0.5:          # no room to go round on either side
-                    continue
-            elif lateral == "random":
-                off = float(rng.uniform(-(half_w - sy / 2 - 0.05), half_w - sy / 2 - 0.05))
-                if max(half_w - off - sy / 2, half_w + off - sy / 2) < min_passage:   # neither side passable
-                    continue
-            else:
-                off = side * (half_w - sy / 2 - 0.05)             # hug one side
+            off = side * (half_w - sy / 2 - 0.05)                 # hug one side
             cx, cy = cl[i] + nrm[i] * off
             c1 = int(round((cx - self.origin[0]) / self.resolution)); r1 = int(round((cy - self.origin[1]) / self.resolution))
             if not (0 <= r1 < H and 0 <= c1 < W) or occ[r1, c1]: continue
@@ -357,6 +341,207 @@ class Track:
             tall[rr0:rr1, cc0:cc1] |= m; occ[rr0:rr1, cc0:cc1] |= m; placed.append(i)
         t = Track.from_occupancy(occ, self.resolution, self.origin, cl, f"{self.name}_obs{seed}", duct=self.duct, tall=tall,
                                  duct_height=self.duct_height)
+        t.props = self.props                       # placements survive a grid edit
+        return t
+
+    def with_static_props(self, seed: int = 0, n: int = 3, styles=None, min_passage: float = 1.2,
+                          min_spacing: float = 4.0, line: Optional[np.ndarray] = None) -> "Track":
+        """Copy of the track carrying n placed props (see StaticProp). Grids are untouched.
+
+        Placement mirrors `with_lane_obstacles` -- hug one side of the lane, leave `min_passage`
+        open, keep `min_spacing` between props -- but the clearance test uses the prop's own
+        circumradius from its declared footprint rather than a drawn box size, and nothing is
+        stamped into `occupancy`/`tall`. A prop that will not fit is skipped and counted; it is never
+        placed and silently left without physics."""
+        from . import props as _props
+        if styles is None:
+            styles = _props.STYLES
+        rng = np.random.default_rng(seed)
+        cl = self.centerline if line is None else np.asarray(line, float)
+        if cl is None:
+            raise ValueError("static props need a centerline or an explicit line")
+        N = len(cl)
+        tang = np.roll(cl, -1, 0) - np.roll(cl, 1, 0)
+        tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
+        nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+        ds = float(np.linalg.norm(np.roll(cl, -1, 0) - cl, axis=1).mean())
+        placed, out, skipped, tries = [], [], 0, 0
+        while len(out) < n and tries < 200:
+            tries += 1
+            i = int(rng.integers(N))
+            if any(min(abs(i - j), N - abs(i - j)) * ds < min_spacing for j in placed):
+                continue
+            style = str(styles[int(rng.integers(len(styles)))])
+            sp = StaticProp(style, 0.0, 0.0, 0.0, seed=int(rng.integers(1 << 30)))
+            env = sp.build().envelope
+            r = float(env.radius)
+            c0 = int(round((cl[i, 0] - self.origin[0]) / self.resolution))
+            r0 = int(round((cl[i, 1] - self.origin[1]) / self.resolution))
+            if not (0 <= r0 < self.occupancy.shape[0] and 0 <= c0 < self.occupancy.shape[1]):
+                continue
+            half_w = float(self.edt[r0, c0])
+            if 2 * half_w - 2 * r < min_passage + 0.1:            # lane too narrow for this prop
+                skipped += 1
+                continue
+            side = float(rng.choice([-1.0, 1.0]))
+            off = side * (half_w - r - 0.05)
+            cx, cy = cl[i] + nrm[i] * off
+            cc = int(round((cx - self.origin[0]) / self.resolution))
+            rr = int(round((cy - self.origin[1]) / self.resolution))
+            if not (0 <= rr < self.occupancy.shape[0] and 0 <= cc < self.occupancy.shape[1]):
+                continue
+            if self.occupancy[rr, cc] or float(self.edt[rr, cc]) < r:
+                skipped += 1
+                continue
+            yaw = float(math.atan2(tang[i, 1], tang[i, 0]) + rng.uniform(-0.35, 0.35))
+            out.append(StaticProp(style, float(cx), float(cy), yaw, seed=sp.seed))
+            placed.append(i)
+        t = Track.from_occupancy(self.occupancy, self.resolution, self.origin, self.centerline,
+                                 f"{self.name}_props{seed}", duct=self.duct, tall=self.tall,
+                                 duct_height=self.duct_height)
+        t.edt_duct, t.edt_tall = self.edt_duct, self.edt_tall
+        t.props = tuple(out)
+        if skipped:
+            t.props_skipped = skipped
+        return t
+
+    def free_width_along(self, point: np.ndarray, direction: np.ndarray, max_m: float = 6.0) -> float:
+        """Distance from `point` along `direction` to the first occupied cell."""
+        step = self.resolution * 0.5
+        H, W = self.occupancy.shape
+        for k in range(1, int(max_m / step)):
+            q = point + direction * (k * step)
+            c = int(round((q[0] - self.origin[0]) / self.resolution))
+            r = int(round((q[1] - self.origin[1]) / self.resolution))
+            if not (0 <= r < H and 0 <= c < W) or self.occupancy[r, c]:
+                return k * step
+        return max_m
+
+    def with_line_obstacles(self, line: np.ndarray, seed: int = 0, n: int = 3, size=(0.25, 0.5),
+                            min_passage: float = 1.0, min_spacing: float = 4.0,
+                            lateral_jitter: float = 0.15, kind: str = "box",
+                            speeds: Optional[np.ndarray] = None,
+                            sight_bands=((0.0, 5.0), (5.0, 9.0), (9.0, 14.0), (14.0, 999.0))) -> "Track":
+        """Boxes standing ON a given line (normally the raceline), not against the wall.
+
+        `with_lane_obstacles` hugs one side so at least `min_passage` stays open *and the fast line
+        stays clear*: the car can ignore the box. A competition box parked on the racing line is the
+        case that actually forces a deviation, which is what makes it a test of seeing and planning
+        rather than of staying on a memorised line. Placement still leaves `min_passage` free on one
+        side, so every obstacle is passable and the track stays drivable.
+
+        Situations, not counts. Drawing positions uniformly along the line puts every box where the
+        track is open, because most of a track is: over the 84 boxes this used to produce, two thirds
+        sat where the car could see more than 9 m ahead and none where it could see under 5. Boxes
+        are drawn round-robin across `sight_bands` -- how many metres of view the approach gives --
+        so the short-view cases are there by construction rather than by luck.
+
+        `speeds`: speed profile matching `line`, kept for callers that want it; the bands themselves
+        are distance, for the reason in the comment below."""
+        rng = np.random.default_rng(seed)
+        line = resample_closed(np.asarray(line, dtype=float), max(len(line), 400))
+        N = len(line)
+        tang = np.roll(line, -1, 0) - np.roll(line, 1, 0)
+        tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
+        nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+        ds = float(np.linalg.norm(np.roll(line, -1, 0) - line, axis=1).mean())
+        tall = self.tall.copy(); occ = self.occupancy.copy()
+        H, W = occ.shape
+        xs = np.arange(W) * self.resolution + self.origin[0]
+        ys = np.arange(H) * self.resolution + self.origin[1]
+        keep_free = np.zeros_like(occ)                   # cells the centerline needs, dilated by the car
+        if self.centerline is not None:
+            cj = np.clip(((self.centerline[:, 0] - self.origin[0]) / self.resolution).astype(int), 0, W - 1)
+            ci = np.clip(((self.centerline[:, 1] - self.origin[1]) / self.resolution).astype(int), 0, H - 1)
+            keep_free[ci, cj] = True
+            keep_free = ndimage.binary_dilation(keep_free, iterations=int(round(0.28 / self.resolution)))
+        def _sight(i_):
+            """How far back along the line the point at i_ is still in view [m]."""
+            out = 0.0
+            for back in range(1, 260):
+                a_ = line[(i_ - back) % N]; b_ = line[i_]
+                d_ = b_ - a_
+                k_ = max(2, int(np.linalg.norm(d_) / (self.resolution * 0.7)))
+                q = a_[None] + np.linspace(0.0, 1.0, k_)[:, None] * d_[None]
+                cj_ = np.clip(((q[:, 0] - self.origin[0]) / self.resolution).astype(int), 0, W - 1)
+                ci_ = np.clip(((q[:, 1] - self.origin[1]) / self.resolution).astype(int), 0, H - 1)
+                if occ0[ci_[1:-1], cj_[1:-1]].any():
+                    break
+                out = back * ds
+            return out
+
+        # Stratify on sight distance in metres, not on reaction time.
+        #
+        # Reaction time -- sight distance over the speed carried there -- is the number that decides
+        # how hard an obstacle is, but the map cannot set it: the *policy* picks the speed. The
+        # raceline profile that positions these boxes has already slowed for anywhere the view is
+        # short (a corner exit is blind but also slow), so stratifying on reaction time returned
+        # nothing under 0.7 s no matter how the candidates were drawn. Screens set beside the lane
+        # were tried and measured: they move sight distance by 0.4-1.5 m, because a block hugging the
+        # wall does not cross a sight line that runs along the corridor, and one that did would block
+        # the passage.
+        #
+        # What the map can set is how many metres of view the car gets. A box 4 m beyond a corner
+        # exit is an easy problem at the teacher's 3 m/s and a hard one at 8, so spreading over sight
+        # distance is what puts the hard cases in reach as PPO raises the cap.
+        occ0 = self.occupancy                             # sight against the bare track, not the boxes
+        v_line = (np.asarray(speeds, float) if speeds is not None and len(speeds) == N
+                  else np.full(N, 4.0))
+        step = max(1, N // 90)                            # sample candidates, scoring is the expensive part
+        cand = list(range(0, N, step))
+        sight = {i_: _sight(i_) for i_ in cand}
+        bands = [[i_ for i_ in cand if lo <= sight[i_] < hi] for lo, hi in sight_bands]
+        for b in bands:
+            rng.shuffle(b)
+        order, b_i = [], 0
+        while any(bands) and len(order) < 400:            # round-robin: every band contributes
+            b = bands[b_i % len(bands)]
+            if b:
+                order.append(b.pop())
+            b_i += 1
+        order += [int(rng.integers(N)) for _ in range(200)]      # fall back to anywhere
+
+        placed = []
+        for i in order:
+            if len(placed) >= n:
+                break
+            if any(min(abs(i - j), N - abs(i - j)) * ds < min_spacing for j in placed):
+                continue
+            sx, sy = rng.uniform(*size), rng.uniform(*size)
+            jitter = rng.uniform(-lateral_jitter, lateral_jitter)
+            centre = line[i] + nrm[i] * jitter
+            w_left = self.free_width_along(line[i], nrm[i])
+            w_right = self.free_width_along(line[i], -nrm[i])
+            # the box spans [jitter - sy/2, jitter + sy/2] laterally; one side must stay passable
+            if max(w_left - (jitter + sy / 2), w_right + (jitter - sy / 2)) < min_passage:
+                continue
+            c1 = int(round((centre[0] - self.origin[0]) / self.resolution))
+            r1 = int(round((centre[1] - self.origin[1]) / self.resolution))
+            if not (0 <= r1 < H and 0 <= c1 < W) or occ[r1, c1]:
+                continue
+            cc0 = max(0, int((centre[0] - 1 - self.origin[0]) / self.resolution))
+            cc1 = min(W, int((centre[0] + 1 - self.origin[0]) / self.resolution) + 1)
+            rr0 = max(0, int((centre[1] - 1 - self.origin[1]) / self.resolution))
+            rr1 = min(H, int((centre[1] + 1 - self.origin[1]) / self.resolution) + 1)
+            gx, gy = np.meshgrid(xs[cc0:cc1], ys[rr0:rr1])
+            dx, dy = gx - centre[0], gy - centre[1]
+            u = dx * tang[i, 0] + dy * tang[i, 1]; v = dx * nrm[i, 0] + dy * nrm[i, 1]
+            m = (np.abs(u) <= sx / 2) & (np.abs(v) <= sy / 2) if kind == "box" else (u ** 2 + v ** 2 <= (sx / 2) ** 2)
+            # A box on the *raceline* may still sit over the *centerline*, and the raceline optimiser
+            # searches a corridor anchored to the centerline: cover that and there is no corridor
+            # left, so the line comes back running straight through the box. Measured on the first
+            # attempt at this set, 24 of 180 tracks had a raceline with zero clearance for exactly
+            # this reason -- tracks that would have taught the student to drive into obstacles.
+            if self.centerline is not None:
+                blocked = m & keep_free[rr0:rr1, cc0:cc1]
+                if blocked.any():
+                    continue
+            tall[rr0:rr1, cc0:cc1] |= m; occ[rr0:rr1, cc0:cc1] |= m
+            placed.append(i)
+        t = Track.from_occupancy(occ, self.resolution, self.origin, self.centerline,
+                                 f"{self.name}_rlobs{seed}", duct=self.duct, tall=tall,
+                                 duct_height=self.duct_height)
+        t.props = self.props                       # placements survive a grid edit
         return t
 
     def mirrored(self) -> "Track":
@@ -371,32 +556,57 @@ class Track:
             cl = self.centerline.copy(); cl[:, 0] = x_lo + x_hi - cl[:, 0]
         t = Track.from_occupancy(occ, self.resolution, self.origin, cl, self.name + "m", duct=duct, tall=tall,
                                  duct_height=self.duct_height)
-        t.base = None if self.base is None else self.base.mirrored()
+        # Props are placements, so mirroring the map has to mirror them too -- carrying them through
+        # unchanged would leave a box floating where the lane no longer is, and dropping them would
+        # make `rt:Monza+props3~mir` quietly a different track from `rt:Monza+props3`.
+        if self.props:
+            x_lo = self.origin[0]
+            x_hi = self.origin[0] + (W - 1) * self.resolution
+            t.props = tuple(StaticProp(p.style, x_lo + x_hi - p.x, p.y, math.pi - p.yaw, p.seed, p.dims)
+                            for p in self.props)
         return t
 
     def grid_key(self):
-        """Content hash of the obstacle layers (tracks that differ only in centerline share GPU grids)."""
+        """Content hash of the obstacle layers (tracks that differ only in centerline share GPU grids).
+
+        Every layer the LiDAR traces has to be in here. `tall` was missing, and `TrackTensors` skips
+        appending edt/edt_duct/edt_tall entirely on a key hit, so two tracks with the same occupancy
+        and duct but different tall silently shared the first one's tall field and the second was
+        traced against geometry it does not have. That is reachable from the public constructor:
+        `from_occupancy` takes `duct` and `tall` as independent arrays, and `from_ros_map`'s
+        unknown-floor handling moves `tall` without touching occupancy or duct. The two obstacle
+        builders happen to write `tall` and `occupancy` together, which is why it went unnoticed.
+        """
         import hashlib
-        h = hashlib.md5(np.packbits(self.occupancy).tobytes()); h.update(np.packbits(self.duct).tobytes())
+        h = hashlib.md5(np.packbits(self.occupancy).tobytes())
+        h.update(np.packbits(self.duct).tobytes())
+        h.update(np.packbits(self.tall).tobytes())
         return (self.occupancy.shape, round(self.resolution, 6), tuple(np.round(self.origin, 4)), float(self.duct_height), h.hexdigest())
 
     def reversed(self) -> "Track":
         """Same map, lap driven the other way round (centerline reversed). Grids are shared, not
         copied, so TrackTensors keeps a single GPU copy for both directions."""
         cl = None if self.centerline is None else np.ascontiguousarray(self.centerline[::-1])
+        # Props stand where they stand: driving the lap the other way round does not move them.
         return Track(self.occupancy, self.resolution, self.origin, self.edt, cl, self.name + "r",
                      duct=self.duct, tall=self.tall, edt_duct=self.edt_duct, edt_tall=self.edt_tall,
-                     duct_height=self.duct_height, base=None if self.base is None else self.base.reversed())
+                     duct_height=self.duct_height, props=self.props)
 
     @staticmethod
     def generate_random(seed: int = 0, style: str = "competition", resolution: float = 0.05, mirror="auto",
-                        lane_obstacles=False, **kw) -> "Track":
+                        lane_obstacles: bool | int = False, **kw) -> "Track":
         """Procedural tracks. style:
-        "competition": control-point loop with hairpins, chicanes and varying width (1.6-2.6 m),
-                       duct-hose boundaries in a room with clutter (indoor RoboRacer/F1TENTH events)
+        "competition": competition-hall layout (_gen_grid): the outline of a random blob of cells on a
+                       2.5-3.3 m grid, so axis-aligned straights and rounded 90 deg corners, duct-hose
+                       boundaries in a room with clutter (indoor RoboRacer/F1TENTH events). This is a
+                       narrow parametric family -- more seeds add little new geometry
+        "control":     control-point loop with hairpins, chicanes and varying width (1.6-2.6 m)
         "circuit":     smooth Fourier loop, wide, duct boundaries (the old generator)
         "hallway":     rectangular building corridor loop with 90 deg corners, tall walls, clutter
                        (Levine-style venues)
+        "serpentine":  a hall with straight walls cut across it, so the lap folds back beside itself
+                       behind a single hose -- the layout every real venue in the catalogue has and
+                       no other generator produces
         mirror: True/False, or "auto" = odd seeds are mirrored (clockwise) so both turn directions
         appear equally often."""
         if style != "hallway":                      # duct-hose venues: 33 cm hoses laid in segments with gaps
@@ -404,19 +614,20 @@ class Track:
             kw.setdefault("duct_height", 0.33)
             kw.setdefault("duct_gaps", 0.12)
             kw.setdefault("banner_fence", 0.0 if rng.uniform() < 0.4 else float(rng.uniform(1.0, 3.0)))
-        if style == "circuit":
-            t = Track._gen_circuit(seed, resolution, **kw)
-        elif style == "hallway":
-            t = Track._gen_hallway(seed, resolution, **kw)
-        elif style == "control":
-            t = Track._gen_competition(seed, resolution, **kw)
-        else:
-            t = Track._gen_grid(seed, resolution, **kw)
+        # NOTE the names: "competition" is the grid/blob generator (_gen_grid), and the older
+        # control-point ellipse generator (_gen_competition) is reachable as "control". Keeping the
+        # mapping explicit -- it used to be an unlabelled else branch, which reads as a bug.
+        builders = {"circuit": Track._gen_circuit, "hallway": Track._gen_hallway,
+                    "control": Track._gen_competition, "competition": Track._gen_grid,
+                    "serpentine": Track._gen_serpentine}
+        if style not in builders:
+            raise ValueError(f"unknown style {style!r}; expected one of {sorted(builders)}")
+        t = builders[style](seed, resolution, **kw)
         if mirror == "auto":
             mirror = (seed % 2 == 1)                # odd seeds run clockwise
         t = t.mirrored() if mirror else t
         if lane_obstacles:
-            n_obs = lane_obstacles if isinstance(lane_obstacles, int) else int(np.random.default_rng(seed + 7).integers(1, 5))
+            n_obs = int(np.random.default_rng(seed + 7).integers(1, 5)) if lane_obstacles is True else int(lane_obstacles)
             t = t.with_lane_obstacles(seed=seed, n=n_obs)
         return t
 
@@ -556,7 +767,7 @@ class Track:
             if _self_clearance_ok(pts, w.max() + 0.5):
                 break
         return Track._rasterize_loop(pts, w, resolution, room_margin, duct_height, rng, n_clutter, clutter_size,
-                                     name=f"competition_{seed}", duct_gaps=duct_gaps, banner_fence=banner_fence)
+                                     name=f"control_{seed}", duct_gaps=duct_gaps, banner_fence=banner_fence)
 
     @staticmethod
     def _gen_grid(seed=0, resolution=0.05, grid=None, pitch=None, width=None, fill=None, r_min=0.7,
@@ -603,6 +814,89 @@ class Track:
                 break
         return Track._rasterize_loop(pts, wv, resolution, room_margin, duct_height, rng, n_clutter, clutter_size,
                                      name=f"competition_{seed}", duct_gaps=duct_gaps, banner_fence=banner_fence)
+
+    @staticmethod
+    def _gen_serpentine(seed=0, resolution=0.05, n_lanes=None, pitch=None, width=None, lane_len=None,
+                        room_margin=2.0, n_points=900, duct_height=0.33, n_clutter=6,
+                        clutter_size=(0.3, 1.0), duct_gaps=0.0, banner_fence=0.0):
+        """A hall with straight walls cut across it, so the lap folds back on itself.
+
+        Every other generator produces a loop that stays away from itself -- _gen_grid even rejects
+        candidates that do not, via _self_clearance_ok -- and measured that way the procedural tracks
+        never come within 5.8 m of themselves while the real venues (korea_2025 2.4 m, icra2022 2.5 m,
+        the 2026 competition hall 2.4 m) all do. That gap is not about lane width: when two parts of
+        the lap twenty metres apart run side by side behind one duct hose, the scan contains open
+        space the car may not drive into, sight lines end at a wall rather than at a corner, and two
+        distant places on the track look alike to a LiDAR with no localisation to disambiguate them.
+
+        Built as a boustrophedon: `n_lanes` parallel lanes joined by U-turns, closed by a return
+        corridor along the top. `pitch` sets how far apart the lanes sit, so `pitch - width` is the
+        thickness of the wall between them and controls directly how tightly the track folds.
+        """
+        rng = np.random.default_rng(seed + 7717)
+        n = int(n_lanes or rng.choice([3, 3, 5]))                    # odd: the last lane ends at the top.
+                                                                     # Two or three fold-backs, not five:
+                                                                     # a comb of hairpins is as far from a
+                                                                     # real hall as a plain oval is, just
+                                                                     # in the other direction. The 2026
+                                                                     # competition map folds twice.
+        # Aim at the fold-back the real venues have (2.4-3.3 m), not at the tightest thing that will
+        # rasterise. A first pass at 2.1-3.0 m of pitch folded to 1.33 m -- tighter than any real
+        # track -- and left a 1.6 m lane with 0.4 m of error budget around a 1.05 m U-turn, which the
+        # teacher could not hold: 20 collisions/km and not one completed lap.
+        p = float(pitch or rng.uniform(3.0, 4.2))
+        w = float(width if width is not None else rng.uniform(1.7, min(2.4, p - 0.9)))
+        Ly = float(lane_len or rng.uniform(9.0, 17.0))               # longer lanes: straights between the turns
+        ret_y = Ly + p / 2 + rng.uniform(1.6, 3.2)                   # return corridor above the block
+        pts = []
+
+        def arc(cx, cy, r, a0, a1, k=26):
+            a = np.linspace(a0, a1, k)
+            pts.extend(np.stack([cx + r * np.cos(a), cy + r * np.sin(a)], 1).tolist())
+
+        # Each cross wall is its own length and the lanes are not evenly spaced: a comb with identical
+        # teeth is one shape with a seed on it, which is the trap _gen_grid already fell into. Some
+        # walls are dropped entirely, leaving a wide bay between two folded sections, so a lap mixes
+        # tight fold-backs with open ground the way the real venues do.
+        depth = Ly * rng.uniform(0.55, 1.0, size=n)                  # how far each wall cuts across
+        gap = p * rng.uniform(0.85, 1.25, size=max(1, n - 1))        # spacing between lanes
+        keep = rng.uniform(size=max(1, n - 1)) > 0.18                # 18 % of the walls are missing
+        x = 0.0
+        for i in range(n):
+            up = (i % 2 == 0)
+            Li = depth[i]
+            y0, y1 = (0.0, Li) if up else (Li, 0.0)
+            pts.append([x, y0]); pts.append([x, y1])
+            if i == n - 1:
+                break
+            g = float(gap[i]) if keep[i] else float(gap[i]) * 2.1    # no wall: the two lanes join up
+            r = g / 2
+            if up:                                                   # U-turn over the top of the wall
+                arc(x + r, Li, r, math.pi, 0.0)
+            else:                                                    # U-turn under the bottom
+                arc(x + r, 0.0, r, math.pi, 2 * math.pi)
+            x += g
+        # Close the loop with rounded corners, not right angles. 96 % of the teacher's collisions on
+        # the first version landed within 10 m of s = 0 -- the seam where the last lane turned into
+        # the return corridor and the corridor turned back down into the first lane. The lane is as
+        # wide there as anywhere, so it was not geometry: two square corners joined by _limit_curvature
+        # leave a curvature spike the tracker cannot hold, and every lap ended at the same two places.
+        xr = x
+        rc = min(p, ret_y - depth[n - 1]) / 2                    # corner radius that fits the corridor
+        pts.append([xr, depth[n - 1]])
+        pts.append([xr, ret_y - rc]); arc(xr - rc, ret_y - rc, rc, 0.0, math.pi / 2)
+        pts.append([rc, ret_y]); arc(rc, ret_y - rc, rc, math.pi / 2, math.pi)
+        pts.append([0.0, rc]); arc(rc, rc, rc, math.pi, 1.5 * math.pi)
+        pts.append([rc, 0.0]); pts.append([0.0, 0.0])
+        pts = np.asarray(pts, float)
+        pts = _chaikin(_densify(pts, 0.2), 3)
+        pts = resample_closed(pts, n_points)
+        pts = _limit_curvature(pts, 0.75)
+        pts = resample_closed(pts, n_points)
+        wv = np.maximum(1.35, w + 0.18 * _smooth_noise(rng, len(pts)))
+        return Track._rasterize_loop(pts, wv, resolution, room_margin, duct_height, rng, n_clutter,
+                                     clutter_size, name=f"serpentine_{seed}", duct_gaps=duct_gaps,
+                                     banner_fence=banner_fence)
 
     @staticmethod
     def _gen_hallway(seed=0, resolution=0.05, size=None, corridor=None, n_points=800, n_clutter=6,
@@ -725,6 +1019,142 @@ class Track:
         return os.path.join(out_dir, name + ".yaml")
 
 
+def _merge_bands(bands, tol: float = 0.01):
+    """Collapse consecutive section bands into their union hull while it costs less than `tol`.
+
+    `props.sections` slices every prop into the same number of bands, but most of these props are
+    extrusions with a small bevel: a cardboard box's four bands differ by the few millimetres of
+    chamfer at its top and bottom, and each one costs the tracer a whole slot to answer the same
+    question. Merging is an over-approximation, never an under-approximation -- the union hull
+    contains both bands -- so the cost is bounded and measurable, and `tol` is exactly that bound:
+    no merged band stands more than `tol` proud of any band it replaced.
+
+    This matters for speed rather than tidiness. `ray_prisms_hits` loops over slots in Python, so
+    four props at four bands each is sixteen passes over a (B, N, K) tensor; merging took a measured
+    +95.7 % step-rate overhead down to a fraction of it."""
+    out, sources = [], []
+    for b in bands:
+        p = _clean_polygon(b["polygon"])
+        cur = out[-1] if out else None
+        if cur is not None and abs(cur["z1"] - b["z0"]) <= 1e-9:
+            src = sources[-1] + [p]
+            u = _relax(_hull(np.vstack(src)), tol)
+            # against every band this run has swallowed, not just the running union: checking only
+            # the union lets a chain of merges each within tol drift the result past tol from the
+            # band it started with.
+            if all(_max_outside(u, s) <= tol for s in src):
+                out[-1] = {"z0": cur["z0"], "z1": float(b["z1"]), "polygon": u}
+                sources[-1] = src
+                continue
+        out.append({"z0": float(b["z0"]), "z1": float(b["z1"]), "polygon": p})
+        sources.append([p])
+    return out
+
+
+def _hull(pts, eps: float = 1e-7):
+    """Convex hull, CCW, with duplicate and collinear vertices removed.
+
+    The cleanup is not tidiness. `ConvexHull` keeps points that lie on a hull edge, so hulling two
+    copies of the same hexagon returns ten vertices describing six edges -- and four consecutive
+    pairs of half-planes are then exactly parallel. `prop_math._polygon_vertices` recovers each
+    vertex by intersecting adjacent planes, so a parallel pair divides by a zero determinant; the
+    epsilon it substitutes makes the vertex finite but enormous, and it grows with the plane
+    offsets, which are world coordinates.
+
+    That is what a degenerate polygon costs: a marker post at the origin reported no contact with a
+    car 3 cm off its flank, and the same post at (6, 3) reported 0.119 m of penetration. The bug is
+    translation-dependent, so it never shows up in a fixture built at the origin."""
+    from scipy.spatial import ConvexHull
+    return _clean_polygon(pts[ConvexHull(pts).vertices], eps)
+
+
+def _clean_polygon(poly, eps: float = 1e-7):
+    """CCW, without duplicate or collinear vertices. Applied to every section, merged or not.
+
+    `props.sections` hulls its own sampled cross-sections and keeps points that lie along an edge,
+    so a plain hexagonal post arrives as a ten-vertex polygon describing six edges -- the extra four
+    are vertices in the middle of edges, and the half-planes either side of each are exactly
+    parallel. See `_hull` for what that costs downstream."""
+    h = np.asarray(poly, np.float64)
+    if _signed_area(h) < 0:
+        h = h[::-1].copy()
+    h = h[np.linalg.norm(h - np.roll(h, 1, 0), axis=1) > eps]
+    while len(h) > 3:
+        a, b, c = np.roll(h, 1, 0), h, np.roll(h, -1, 0)
+        cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        flat = np.abs(cross) <= eps * max(1.0, float(np.abs(h).max()))
+        if not flat.any() or int((~flat).sum()) < 3:
+            break
+        h = h[~flat]
+    return h
+
+
+def _relax(poly, tol):
+    """Drop edges from a convex polygon while the result still contains it, within `tol`.
+
+    Merging two bands hulls their vertices together, and the hull of two nearly-equal bevelled
+    outlines keeps every chamfer corner from both -- a 36 cm box came out with 52 edges. Every edge
+    is a half-plane the ray test evaluates for every beam, so those near-duplicates are paid for on
+    each of them.
+
+    Removing a vertex here means deleting its edge and letting the two neighbouring edges run on to
+    meet, which can only grow the polygon; the new corner is accepted only while it stays within
+    `tol` of the original. So this over-approximates, in the one direction that is safe, by a bounded
+    and measured amount -- never the other way, which would let a beam pass through a drawn surface.
+    """
+    P = np.asarray(poly, np.float64)
+    changed = True
+    while changed and len(P) > 3:
+        changed = False
+        for i in range(len(P)):
+            n = len(P)
+            a0, a1 = P[(i - 1) % n], P[i]
+            b0, b1 = P[(i + 1) % n], P[(i + 2) % n]
+            u, v = a1 - a0, b1 - b0
+            den = u[0] * v[1] - u[1] * v[0]
+            if abs(den) < 1e-12:                                  # parallel: no corner to make
+                continue
+            t = ((b0[0] - a0[0]) * v[1] - (b0[1] - a0[1]) * v[0]) / den
+            x = a0 + t * u
+            cand = np.vstack([P[:i], x[None], P[i + 2:]]) if i + 2 <= n else np.vstack([x[None], P[1:i]])
+            if len(cand) < 3 or _signed_area(cand) <= 0:
+                continue
+            if _max_outside(cand, P) <= tol:
+                P = cand
+                changed = True
+                break
+    return P
+
+
+def _signed_area(p):
+    return float(0.5 * np.sum(p[:, 0] * np.roll(p[:, 1], -1) - np.roll(p[:, 0], -1) * p[:, 1]))
+
+
+def _max_outside(hull, poly):
+    """How far `hull` reaches outside `poly`: true Euclidean distance in metres, 0 where inside.
+
+    Not the largest half-plane violation, which is what this used to compute. That quantity is a
+    *lower* bound on the distance, not an upper one: for the unit square at [-0.5, 0.5] the point
+    (0.51, 0.51) violates each of two planes by 0.01 while standing sqrt(2) * 0.01 away. A merge
+    tolerance built on it would quietly admit merges up to sqrt(K) times looser than it claimed.
+
+    K is a handful of vertices here, so the honest distance is affordable: point to each edge
+    segment, taking the minimum, for the points that are outside at all."""
+    from .prop_math import section_halfplanes
+    H = np.asarray(hull, np.float64)
+    P = np.asarray(poly, np.float64)
+    n, d = section_halfplanes(P, len(P))
+    outside = (H @ n.T - d[None]).max(1) > 0
+    if not outside.any():
+        return 0.0
+    Q = H[outside]
+    A, B = P, np.roll(P, -1, 0)
+    seg = B - A
+    L2 = np.maximum(np.einsum("ij,ij->i", seg, seg), 1e-18)
+    t = np.clip(((Q[:, None, :] - A[None]) * seg[None]).sum(-1) / L2[None], 0.0, 1.0)
+    return float(np.linalg.norm(Q[:, None, :] - (A[None] + t[..., None] * seg[None]), axis=-1).min(1).max())
+
+
 class TrackTensors:
     """GPU-resident copies of one or more tracks, batched: every env carries a track id (tid).
     Distance fields are concatenated into flat buffers with per-track offsets; centerlines are
@@ -778,11 +1208,79 @@ class TrackTensors:
         else:
             self.cl = None
             self.length = torch.zeros(self.T, device=dev)
+        self._build_props()
+
+    # ------------------------------------------------------------------ static props
+    def _build_props(self, k_pad: Optional[int] = None, n_bands: int = 4):
+        """Per-track prop section tensors, padded to a common slot count.
+
+        Every prop contributes one slot per convex section band, so a tapered post is bounded far
+        more tightly than one prism over its whole height would bound it. Bands whose polygon does
+        not change are merged first, which costs a box nothing: its four identical bands collapse
+        back to the single slot it deserves.
+
+        `has_props` is False for every track that has none -- which is every existing track -- and
+        the tracers check it to keep their old path exactly as it was."""
+        self.has_props = any(len(t.props) for t in self.tracks)
+        dev = self.device
+        if not self.has_props:
+            self.k_pad = k_pad = int(k_pad or 8)
+            self.p_poses = torch.zeros(self.T, 0, 3, device=dev, dtype=torch.float32)
+            self.p_n = torch.zeros(self.T, 0, k_pad, 2, device=dev, dtype=torch.float32)
+            self.p_d = torch.zeros(self.T, 0, k_pad, device=dev, dtype=torch.float32)
+            self.p_zlo = torch.zeros(self.T, 0, device=dev, dtype=torch.float32)
+            self.p_zhi = torch.zeros(self.T, 0, device=dev, dtype=torch.float32)
+            return
+        from . import props as _props
+        from .prop_math import section_halfplanes
+        # Bands first, k_pad from what they turned out to need. A band polygon is the convex hull of
+        # the cross-sections across that band, not the prop's base footprint, so it can carry more
+        # edges than the footprint does -- a 16-sided drum with rolling ribs hulls to 32. Fixing the
+        # pad at the footprint's budget made that a hard failure at map load.
+        per_track = []
+        for t in self.tracks:
+            bands = []
+            for sp in t.props:
+                for band in _merge_bands(_props.sections(sp.build(), n_bands=n_bands)):
+                    bands.append((sp, band))
+            per_track.append(bands)
+        need = max((len(b["polygon"]) for bs in per_track for _, b in bs), default=8)
+        self.k_pad = k_pad = int(k_pad or max(8, need))
+        per_track = [[((sp.x, sp.y, sp.yaw),
+                       *section_halfplanes(np.asarray(b["polygon"], np.float64), k_pad),
+                       b["z0"], b["z1"]) for sp, b in bs] for bs in per_track]
+        C = max(len(s) for s in per_track)
+        poses = np.zeros((self.T, C, 3), np.float32)
+        pn = np.zeros((self.T, C, k_pad, 2), np.float32)
+        pd = np.full((self.T, C, k_pad), np.inf, np.float32)
+        zlo = np.zeros((self.T, C), np.float32)
+        zhi = np.zeros((self.T, C), np.float32)          # z_hi <= z_lo marks a dead padding slot
+        for ti, slots in enumerate(per_track):
+            for ci, (pose, n_, d_, z0, z1) in enumerate(slots):
+                poses[ti, ci] = pose
+                pn[ti, ci] = n_
+                pd[ti, ci] = d_
+                zlo[ti, ci], zhi[ti, ci] = z0, z1
+        self.p_poses = torch.from_numpy(poses).to(dev)
+        self.p_n = torch.from_numpy(pn).to(dev)
+        self.p_d = torch.from_numpy(pd).to(dev)
+        self.p_zlo = torch.from_numpy(zlo).to(dev)
+        self.p_zhi = torch.from_numpy(zhi).to(dev)
+
+    def props_for(self, tid: torch.Tensor):
+        """Gather each env's own track's prop slots: (poses, pn, pd, z_lo, z_hi), all leading (B,)."""
+        return (self.p_poses[tid], self.p_n[tid], self.p_d[tid], self.p_zlo[tid], self.p_zhi[tid])
 
     # ------------------------------------------------------------------ grids
-    def sample_edt(self, xy: torch.Tensor, tid: torch.Tensor, field: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def sample_edt(self, xy: torch.Tensor, tid: torch.Tensor, field: Optional[torch.Tensor] = None,
+                   with_inside: bool = False):
         """Nearest-cell EDT lookup on each point's track; outside the grid counts as a wall (0).
-        xy (..., 2), tid (...,) long (broadcastable to xy.shape[:-1]) -> (...)"""
+        xy (..., 2), tid (...,) long (broadcastable to xy.shape[:-1]) -> (...)
+
+        with_inside: also return the in-bounds mask. Callers that want both used to ask twice, the
+        second time against a field of ones -- which allocates a tensor the size of every track's
+        grid put together, on every call, to learn something four comparisons already know.
+        """
         field = self.edt if field is None else field
         tid = torch.broadcast_to(tid, xy.shape[:-1])
         res = self.t_res[tid]; ox = self.t_origin[tid, 0]; oy = self.t_origin[tid, 1]
@@ -792,7 +1290,8 @@ class TrackTensors:
         inside = (col >= 0) & (col < W) & (row >= 0) & (row < H)
         idx = self.t_off[tid] + row.clamp(min=0).minimum(H - 1) * W + col.clamp(min=0).minimum(W - 1)
         d = field[idx].float()
-        return torch.where(inside, d, torch.zeros_like(d))
+        d = torch.where(inside, d, torch.zeros_like(d))
+        return (d, inside) if with_inside else d
 
     def edt_gradient(self, xy: torch.Tensor, tid: torch.Tensor, field: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Unit vector pointing away from the nearest wall (central differences). xy (..., 2), tid (...)."""
@@ -805,10 +1304,27 @@ class TrackTensors:
         return g / (g.norm(dim=-1, keepdim=True) + 1e-9)
 
     # ------------------------------------------------------------------ centerline
-    def project(self, xy: torch.Tensor, tid: torch.Tensor):
-        """Nearest centerline point on each env's track. xy (B,2), tid (B,) -> (s, lateral offset (left +), index)"""
+    def project(self, xy: torch.Tensor, tid: torch.Tensor, prev_idx: Optional[torch.Tensor] = None,
+                window: float = 3.0):
+        """Nearest centerline point on each env's track. xy (B,2), tid (B,) -> (s, lateral offset (left +), index)
+
+        prev_idx: last step's index. Where the lap folds back on itself -- the layout every real
+        venue has, and the one the serpentine generator is built for -- two parts of the lap run
+        within a couple of metres of each other, and a plain global argmin will jump between them.
+        Progress, lap counting and the wrong-way check all read `s`, so a jump of twenty metres is
+        scored as a lap: the teacher measured 34 collisions/km and a 2 s "lap" on a 106 m track
+        purely from this. Given the previous index, the search is restricted to a window of
+        +-`window` metres of arc around it, which cannot straddle a fold. 3 m: a U-turn is about 4 m
+        of arc, so a wider window reaches around it onto the next lane, while at 10 m/s the car
+        covers only 0.25 m per control step.
+        """
         cl = self.cl[tid]                                            # (B, N, 2)
         d2 = ((xy[:, None, :] - cl) ** 2).sum(-1)
+        if prev_idx is not None:
+            L = self.length[tid].clamp_min(1e-6)
+            ds = (self.cl_s[tid] - self.cl_s[tid].gather(1, prev_idx[:, None]))
+            ds = (ds + L[:, None] / 2) % L[:, None] - L[:, None] / 2      # signed arc distance, wrapped
+            d2 = torch.where(ds.abs() <= window, d2, torch.full_like(d2, float("inf")))
         idx = d2.argmin(1)
         ar = torch.arange(xy.shape[0], device=xy.device)
         p, t = cl[ar, idx], self.cl_tangent[tid, idx]
