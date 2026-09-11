@@ -1,10 +1,39 @@
-"""First-attempt trial accounting, independent of simulator autoresets."""
+"""First-attempt trial accounting, independent of simulator autoresets.
+
+Primary metric is `collisions_per_km`: a hazard rate per metre driven, which is comparable
+across tracks and across evaluation budgets. `completion_rate` is a *derived* quantity --
+P(complete) ~ exp(-lambda * L) -- so it mixes policy quality with track length and with the
+time budget, and must never be compared across tracks of different lengths on its own.
+"""
 from __future__ import annotations
 
 from typing import TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
+
+Z95 = 1.959963984540054
+
+
+def wilson_interval(successes: int, n: int, z: float = Z95) -> tuple[float, float] | None:
+    """95 % Wilson score interval for a binomial rate (sane at 0 and n successes)."""
+    if n <= 0:
+        return None
+    p = successes / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z / denom * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (float(max(0.0, centre - half)), float(min(1.0, centre + half)))
+
+
+def poisson_rate_interval(count: int, exposure: float, scale: float = 1.0) -> tuple[float, float] | None:
+    """Exact 95 % interval for a Poisson rate `count / exposure * scale` (chi-square method)."""
+    if exposure <= 0:
+        return None
+    from scipy.stats import chi2
+    lo = 0.0 if count == 0 else float(chi2.ppf(0.025, 2 * count) / 2)
+    hi = float(chi2.ppf(0.975, 2 * (count + 1)) / 2)
+    return (lo / exposure * scale, hi / exposure * scale)
 
 
 class TrialMetrics(TypedDict):
@@ -13,12 +42,17 @@ class TrialMetrics(TypedDict):
     collisions: int
     timeouts: int
     completion_rate: float | None
+    completion_rate_ci95: tuple[float, float] | None
     collision_rate: float | None
     timeout_rate: float | None
     active_vehicle_seconds: float
     distance_m: float
     progress_m: float
     collisions_per_km: float | None
+    collisions_per_km_ci95: tuple[float, float] | None
+    hazard_predicted_completion_rate: float | None
+    budget_laps_available: float | None
+    budget_feasible: bool | None
     progress_rate_mps: float | None
     mean_speed: float | None
     completion_times_s: list[float]
@@ -36,9 +70,15 @@ class TrialMetrics(TypedDict):
 class TrialAccumulator:
     """Mutable counters for exactly one attempt per initial learner."""
 
-    def __init__(self, lengths: NDArray[np.float64], step_dt: float):
+    def __init__(self, lengths: NDArray[np.float64], step_dt: float, *,
+                 time_budget_s: float | None = None, speed_cap: float | None = None):
+        """time_budget_s / speed_cap: recorded so the report can say whether a trial could have
+        finished at all. A budget shorter than length / speed_cap makes every timeout structural,
+        and the resulting completion rate carries no information about the policy."""
         self.lengths = lengths.copy()
         self.step_dt = step_dt
+        self.time_budget_s = time_budget_s
+        self.speed_cap = speed_cap
         self.active = np.ones(lengths.shape, dtype=bool)
         self.progress = np.zeros(lengths.shape)
         self.elapsed = np.zeros(lengths.shape)
@@ -97,12 +137,25 @@ class TrialAccumulator:
         exposure, distance, progress = (float(x.sum()) for x in (self.elapsed, self.distance, self.progress))
         times = self.elapsed[self.completed]
         mean = float(times.mean()) if times.size else None
+        hazard = collisions * 1000 / distance if distance else None
+        median_length = float(np.median(self.lengths)) if n else None
+        laps_available = None
+        if self.time_budget_s and self.speed_cap and median_length:
+            laps_available = self.time_budget_s * self.speed_cap / median_length
         return {
             'initial_trials': n, 'completions': completions, 'collisions': collisions, 'timeouts': timeouts,
             'completion_rate': completions / n if n else None,
+            'completion_rate_ci95': wilson_interval(completions, n),
             'collision_rate': collisions / n if n else None, 'timeout_rate': timeouts / n if n else None,
             'active_vehicle_seconds': exposure, 'distance_m': distance, 'progress_m': progress,
-            'collisions_per_km': collisions * 1000 / distance if distance else None,
+            'collisions_per_km': hazard,
+            'collisions_per_km_ci95': poisson_rate_interval(collisions, distance, 1000.0),
+            # exp(-lambda L): what the completion rate should be if crashes were a uniform hazard.
+            # Close agreement means completion rate adds nothing beyond `collisions_per_km` and length.
+            'hazard_predicted_completion_rate': (float(np.exp(-hazard / 1000 * median_length))
+                                                 if hazard is not None and median_length else None),
+            'budget_laps_available': laps_available,
+            'budget_feasible': None if laps_available is None else bool(laps_available >= 1.05),
             'progress_rate_mps': progress / exposure if exposure else None,
             'mean_speed': distance / exposure if exposure else None,
             'completion_times_s': times.tolist(), 'completion_time_mean_s': mean,

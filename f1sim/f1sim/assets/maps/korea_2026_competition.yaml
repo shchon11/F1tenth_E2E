@@ -1,0 +1,6 @@
+image: korea_2026_competition.pgm
+resolution: 0.05000000074505806
+origin: [-6.97, -3.0, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

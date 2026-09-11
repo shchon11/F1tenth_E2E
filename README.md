@@ -1,405 +1,294 @@
-# F1TENTH e2e planner workspace
+# F1TENTH_E2E
 
-이 PC(RTX 4060 Ti 8GB)의 활성화·학습·뷰어·ROS 실행 명령은 [로컬 실행 안내](docs/local_pc.md)를 참고한다.
-현재 구조의 적합도, 확인된 결함과 다음 비교 실험은 [알고리즘 평가](docs/algorithm_assessment.md)에 정리한다.
+A vectorised simulator and end-to-end local planning stack for F1TENTH. It combines LiDAR, vehicle
+and actuator models with DAgger/PPO training, an iLQR plan tracker, and a driving console. A ROS 2
+Humble bridge integrates the simulator with the existing `f1tenth_system` stack. Several sensor and
+actuator parameters are fitted to recordings from a 1:10 car.
 
-<p align="center">
-  <img src="docs/promo.gif" width="800" alt="f1sim viewer footage: policy chase cam with saliency, the local planner's trajectory on the Korea championship map, 256 cars training, a race with rear detection boxes"/>
-  <br/>
-  <sub>viewer footage, 30 s (<a href="docs/promo.mp4">mp4</a>): ppo_v3 chase cam with scan saliency and activations, the plan action space on the Korea championship map (trajectory coloured by speed, iLQR tracker), 256 cars of ppo_v4 training, a race against teacher cars. <code>f1sim/scripts/promo_video.py</code>, headless.</sub>
-</p>
+[![the f1sim driving console](docs/media/f1tenth-visualizer-overview.png)](docs/media/f1tenth-visualizer-overview.png)
 
+<sub>The driving console (`python3 -m f1sim.learn.watch`) on `real:korea_2026_competition`, driven by
+the frozen `ppo_race_0910` policy on the `legacy` controller path. Software-rendered on CPU —
+[provenance](docs/media/PROVENANCE-visualizer.md).</sub>
 
-Goal: a realistic, fast F1TENTH simulator (ROS 2 Humble) for training an end-to-end
-LiDAR-only planner (RL and/or IL) and deploying it on the real car (Hokuyo 1080-beam 2D
-LiDAR, VESC, Jetson AGX).
+A research workspace: **on-car performance of a learned policy is not established**, and no
+benchmarks are published — see [Status and limitations](#status-and-limitations).
 
-```
-F1tenth/                 ROS 2 workspace (build/ install/ log/ src/)
-src/
-  f1sim/        ROS-independent GPU-vectorized simulator core (pip package, COLCON_IGNORE)
-    f1sim/sim.py, dynamics.py, lidar.py, odom.py, actuators.py, randomization.py, track.py
-    f1sim/raceline.py   min-curvature raceline + friction-limited speed profile
-    f1sim/teacher.py    privileged pure-pursuit teacher on the raceline (IL teacher / RL baseline)
-    f1sim/gym_env.py    vectorized Gymnasium-style env (LiDAR-only obs, progress reward)
-    f1sim/viewer/native.py, gl_scene.py   native OpenGL viewer (moderngl), in-process
-    f1sim/viewer/server.py + static/      optional browser monitor over WebSocket (remote training jobs)
-    f1sim/assets/       procedural F1TENTH car model (GLB), scripts/make_car_model.py
-  f1sim_ros/    ROS 2 bridge: one env in real time with the real car's topics
-  external/     f1tenth_system (humble-devel, vesc + ackermann_mux + f1tenth_stack), f1tenth_racetracks,
-                f1tenth_gym maps, ros/diagnostics (only diagnostic_updater is built)
-  docs/         screenshots
-```
+## Quickstart
 
-## Getting the code
-`~/F1tenth/src` is a git repository (initialized 2026-09-07); the third-party stacks and map
-collections under `external/` are submodules pinned to the commits this work was done against.
+CPU only, no GPU and no ROS.
+
 ```bash
-git clone --recurse-submodules <url> ~/F1tenth/src      # or: git submodule update --init --recursive
-bash ~/F1tenth/src/external/setup_colcon_ignore.sh        # colcon must not build vesc_driver, teleop_tools, gym, maps ...
-pip install -e ~/F1tenth/src/f1sim && cd ~/F1tenth && colcon build --symlink-install
-```
-Ignored on purpose: `__pycache__`, `*.egg-info`, W&B folders, checkpoints (`*.pt`, `*.onnx`, they live
-in `~/f1sim_runs`) and the rendered videos in `docs/` (re-render with `f1sim.learn.watch`).
-
-## Why not f1tenth_gym
-| f1tenth_gym | f1sim |
-|---|---|
-| single-track, linear tires | single-track + Pacejka tires, friction circle on the driven axle, longitudinal load transfer, front/rear grip asymmetry (understeer at the limit), drag + rolling resistance |
-| instant actuators | servo first-order lag + rate limit + trim bias + gain error; VESC speed loop with motor/traction limits; command latency (10 to 80 ms) |
-| ideal 2D ray-cast LiDAR | 3D beam geometry on a layered map: the scan plane follows body roll/pitch (suspension model) and mounting misalignment, so beams hit the floor under braking dive, pass over the duct hoses on the inside of a corner and return clutter/room walls outside the track; motion distortion across the sweep; real-Hokuyo-like tiny range noise, near-zero dropouts |
-| walls only | map layers: duct hoses (low, height 0.2 m), tall objects (room walls, clutter, unknown space), floor; procedural tracks generate a room with random clutter; SLAM maps are classified duct-shell / floor / tall |
-| rigid body | sprung mass: roll ~0.1 rad/g, brake dive / squat ~0.09 rad/g, 2.8 Hz / zeta 0.35 second-order response (all randomized) |
-| no IMU | VESC built-in 6-axis IMU (`f1sim/imu.py`): specific force at the sensor with gravity leaking in through roll/pitch and the lever arm from the CoG, speed-proportional vibration at wheel / 2x wheel / motor frequencies + broadband, sensor low-pass, 100 Hz sampling (2 samples per 40 Hz step), bias + random walk, white noise, 16-bit quantization, misalignment, and the VESC's own Mahony-style attitude estimate that bends under sustained acceleration |
-| perfect odometry | VESC dead-reckoning exactly like `vesc_to_odom` (ERPM speed + commanded steering), calibration residuals, drifts realistically (~5 %/lap nominal) |
-| collision = episode end | terminate, or soft wall contact (slide/stop against the wall) |
-| fixed params | every numeric parameter randomized per env on reset (`RandomizationConfig`; ranges for a small car with a fast servo on venue floors: mu 0.7-1.1, command delay 5-30 ms, servo 20-60 ms, mass +-10 %, tire stiffness +-20 %, steer/speed gain +-8 %; the earlier extremes (mu 0.55, 100 ms) only taught caution) |
-| LiDAR returns everywhere | glossy hall floor: a floor hit at grazing incidence gives no return (20-95 % at grazing, fading out by 6-20 deg); a duct hose seen edge-on drops returns (0-70 %); hose diameter x0.7-1.3 per env; other cars are porous boxes |
-| unknown = wall | SLAM maps: unknown space within 2 m of the lane is floor for the LiDAR (a beam over the hose sees floor, then something tall), solid for collisions; duct hoses 33 cm laid in segments with 15-35 cm gaps (procedural tracks, 0.12 gaps/m), banner-board fences 1-3 m out on 60 % of venues |
-| ~numpy, 1 env | torch + Triton, thousands of envs on one GPU |
-
-## Install
-```bash
-pip install -e src/f1sim        # core (torch already installed; triton optional but used on CUDA)
-cd ~/F1tenth && colcon build --symlink-install     # f1sim_ros + vesc_msgs/vesc_ackermann/ackermann_mux/f1tenth_stack
+git clone --recurse-submodules https://github.com/shchon11/F1tenth_E2E.git
+cd F1tenth_E2E
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e f1sim
+cd f1sim                      # run Python from here: the repo root has a folder that shadows
+                              # the installed package -- see Troubleshooting in Getting started
 ```
 
-## Core usage
+Save as `quickstart.py` and run `python3 quickstart.py`:
+
 ```python
 import torch
 from f1sim import Track, Config, Simulator
-track = Track.generate_random(seed=0)             # or Track.from_ros_map("map.yaml")
-sim = Simulator(track, Config(), num_envs=1024, device="cuda")
-r = sim.step(torch.zeros(1024, 2))               # action = (steer [rad], speed [m/s]) per env
-r.scan, r.odom, r.state, r.collision, r.progress  # see f1sim/sim.py:StepResult
-sim.reset(torch.nonzero(r.collision).flatten())   # partial reset re-samples randomized params
+
+cfg = Config()
+cfg.sim.compile = False                      # torch.compile is a CUDA path; skip it on CPU
+track = Track.generate_random(seed=0)        # or Track.from_ros_map("map.yaml")
+sim = Simulator(track, cfg, num_envs=4, device="cpu")
+
+r = sim.step(torch.zeros(4, 2))              # action = (steer [rad], target speed [m/s]) per env
+print(r.scan.shape, r.odom.shape, r.state.shape)     # (4, 1081) (4, 5) (4, 7)
+sim.reset(torch.nonzero(r.collision).flatten())      # partial reset re-samples the randomised parameters
 ```
-Config is a dataclass tree (`f1sim/params.py`) and can be loaded from yaml (`Config.from_yaml`).
 
-## Maps
-`f1sim/maps.py` is the catalog; every entry loads into the same layered `Track`:
-* `gen:competition:<seed>`: indoor event layouts. The outline of a random blob of cells on a
-  coarse grid (pitch = lane spacing 2.5-3.3 m) becomes the centerline: long straights, 90 deg
-  corners rounded to arcs, hairpins at one-cell peninsulas, folded sections with two lanes
-  separated only by the duct hose, width 1.6-2.4 m varying, room walls + clutter.
-* `gen:hallway:<seed>`: building corridor loops with 90 deg corners and jogs, tall walls, unknown
-  space behind them, bins along the walls (Levine-style venues).
-* `gen:circuit:<seed>`: smooth wide loops (the original generator).
-* `rt:<Name>`: f1tenth_racetracks (Spielberg, Monza, Silverstone, ... 1:10 scale real circuits
-  with centerlines), loaded from `src/external/f1tenth_racetracks`.
-* `gym:<name>`: f1tenth_gym maps (levine, stata_basement = real SLAM hallways with tall walls;
-  berlin, skirk, vegas = drawn tracks with duct boundaries).
-* `real:<name>`: SLAM maps of real physical venues collected from public repos: `icra2022` (the
-  ICRA 2022 F1TENTH Grand Prix track, from a competitor's stack), `blackbox2021_1..3` and
-  `blackbox2022_1..3` (TU Wien BlackBox races),
-  `korea_2025_iccas` (4th F1TENTH Korea Championship 2025 at ICCAS, KORA team SLAM map; loaded
-  with the SLAM clean-up: only the hall's free region is kept -- a 0.15 m opening cuts the leaks
-  through which scan rays sprayed out of the gaps -- floating specks are dropped and the unseen
-  interiors of the hoses count as hose. The rectangular outline is the outer duct hose of a track
-  built inside a bigger hall, so beyond it the LiDAR sees floor for 5 m; `outer_walls=True` exists
-  for maps whose outline really is a wall; `Track.from_ros_map(keep_region=True, ...)`). Practice
-  tracks of Korean teams and the CTU Prague `plechaty` venue are deliberately not in the catalog
-  (not competition layouts). The Korea championship organizers publish no map files
-  (tracks are built on site and mapped by the teams; the orientation decks only show a venue photo:
-  large dark duct hoses on ballroom carpet, banner boards around). `docs/real_venues.png`.
-* any ROS map yaml. Maps without a centerline get one automatically: the drivable region of a loop
-  is an annulus, and the curve equidistant from its outer boundary and its infield is extracted as
-  a contour (`Track.centerline_from_free_space`, cached under `~/.cache/f1sim/centerlines`).
-* lane obstacles: `gen:competition:5+obs` / `real:icra2022+obs2` drop 1-4 tall boxes into the lane
-  against one side (>= 1.2 m passage left), like the static obstacles of the competitions.
-A `Simulator` / `F1VecEnv` takes a list of tracks: every env has a track id, distance fields
-are batched on the GPU (fp16 for big sets), and the gym env re-draws a random track for each
-new episode (`maps.random_set(n)` for a procedural mix). `docs/map_grid.png`, `docs/map_zoo.png`.
+`Config` is a dataclass tree ([`f1sim/f1sim/params.py`](f1sim/f1sim/params.py)); a step returns
+`StepResult` from [`f1sim/f1sim/sim.py`](f1sim/f1sim/sim.py).
 
-## Raceline + teacher
-```python
-from f1sim.raceline import Raceline
-from f1sim.teacher import RacelineTeacher
-rl = Raceline.build(track)                       # 3-10 s per track; Raceline.build_cached caches on disk
-teacher = RacelineTeacher(rl, wheelbase=0.3302, device=sim.device)
-cmd = teacher(sim.state, sim.P)                  # privileged: compensates latency/servo lag/grip
+## Documentation
+
+| | |
+| --- | --- |
+| [Getting started](docs/getting_started.md) | installation, CPU and GPU, the ROS 2 workspace, troubleshooting |
+| [Architecture](docs/architecture.md) | simulator fidelity, maps, raceline and teacher, the viewer |
+| [Training](docs/training.md) | DAgger, PPO, evaluation, the console, observation and action detail |
+| [ROS 2](docs/ros2.md) | launch files, topic contracts, teleoperation |
+| [Research notes](docs/research/) | dated experiment reports with protocol, data and scope |
+| [Engineering notes](docs/README.md#engineering-notes) | algorithm assessment, simulator audit, real-data calibration |
+| [로컬 실행 안내](docs/local_pc.md) | 이 워크스테이션의 실행 명령 (Korean) |
+
+## Requirements
+
+| | |
+| --- | --- |
+| Python | ≥ 3.10 |
+| Required | `numpy`, `torch`, `scipy`, `scikit-image`, `pyyaml`, `pillow`, `matplotlib`, `websockets` |
+| GPU | optional — CUDA is *recommended* for large training runs and real-time multi-car simulation. Training and the estimator also run on CPU (`--device cpu`), slowly. |
+| `[gym]` | `gymnasium` — the vectorised training environment |
+| `[learn]` | `wandb` — experiment logging |
+| `[viewer]` | `moderngl`, `glfw`, `trimesh` — the 3D viewer |
+| PyQt5 | **not in any extra** — required only by the driving console; provide it yourself ([Training](docs/training.md#watching-a-run)) |
+| `[dev]` | `pytest` |
+| ROS 2 | optional — Humble, only for the bridge in `f1sim_ros/` |
+
+Extras are declared in [`f1sim/pyproject.toml`](f1sim/pyproject.toml).
+
+## The driving console
+
+`python3 -m f1sim.learn.watch` opens the console shown above: pick a policy and a map, watch it
+drive, and read what the policy was given against what the simulator actually did.
+
+| | |
+| --- | --- |
+| [chase camera](docs/media/f1tenth-visualizer-chase.png) | from behind the car: LiDAR returns in orange along the duct hoses, the emitted plan, and the tracker's predicted motion |
+| [policy I/O panel](docs/media/f1tenth-visualizer-policy-panel.png) | detail crop — commanded against measured speed, commanded against actual steering, and the load against the episode's true friction limit |
+
+The images were captured on software GL without a GPU, so the frame-rate figures in them are not
+performance numbers; [provenance](docs/media/PROVENANCE-visualizer.md) records the map, driver,
+checkpoint hash, renderer and source hashes.
+
+## Demonstrations
+
+Two 25-second clips, each a single rollout rather than a benchmark. The previews below are 5-second
+excerpts; click either one for the full 1920 × 1080 MP4.
+
+| Simulator | Trained policy |
+| --- | --- |
+| [![simulator demo preview](docs/media/f1tenth-simulator-demo.gif)](docs/media/f1tenth-simulator-demo.mp4) | [![trained policy demo preview](docs/media/f1tenth-learning-demo.gif)](docs/media/f1tenth-learning-demo.mp4) |
+| The **scripted raceline teacher** — the privileged reference driver, **not a learned policy** — on `real:korea_2026_competition`. | Playback of one completed run on the `fixed_low` controller arm. **The car hits a wall at 5.125 s and the episode resets**, marked on screen. |
+
+Maps, checkpoints, per-episode friction, render settings and hashes are in the
+[video provenance](docs/media/PROVENANCE-video.md) and [manifest](docs/media/video-manifest.json);
+what the controller-arm comparisons are and where each stands is in
+[Status and limitations](#status-and-limitations).
+
+## What is simulated
+
+The point of the fidelity is that a policy trained here should not discover an advantage that does
+not exist on the car. Details and the parameter sources are in [Architecture](docs/architecture.md)
+and [Real-data calibration](docs/real_data_calibration.md).
+
+| area | modelled |
+| --- | --- |
+| Vehicle | single-track body with Pacejka tyres, friction circle on the driven axle, longitudinal load transfer, front/rear grip asymmetry, drag and rolling resistance |
+| Suspension | sprung mass with roll and brake-dive/squat response, so the scan plane moves with the body |
+| Actuators | servo lag, rate limit, trim bias and gain error; VESC speed loop with motor and traction limits; command latency |
+| LiDAR | 3D beam geometry against a layered map — beams can pass over duct hoses, strike the floor under braking, and return clutter beyond the track; motion distortion across the sweep; range noise and dropouts |
+| IMU | VESC 6-axis IMU at a 50 Hz sensor clock, phase-scheduled against the 40 Hz control step; gravity leakage through roll/pitch, lever arm from the CoG, speed-dependent vibration, bias and random walk, quantisation, and the VESC's own attitude estimate |
+| Odometry | a model of VESC dead reckoning following `vesc_to_odom`'s formula, with calibration residuals, so it drifts |
+| Maps | duct hoses, tall clutter and room walls, floor, unknown space — procedural layouts and SLAM maps of real venues |
+| Randomisation | a configured set of named ranges in `RandomizationConfig`, re-sampled per environment on reset — **not** every numeric parameter. Some, such as `vehicle.mu_r_scale`, are fixed. |
+
+## Data and action contracts
+
+Control runs at 40 Hz. The LiDAR shares that rate; the IMU runs at 50 Hz and is delivered on its own
+schedule, so a step carries one or two samples depending on the phase.
+
+```mermaid
+flowchart LR
+  SIM["Simulator<br/>physics 1 ms substeps"] -->|scan, odom, IMU| OBS["Observation<br/>learn/obs.py"]
+  OBS --> ACTOR["Actor<br/>scan stem + MLP"]
+  ACTOR -->|8D plan| TRACKER["iLQR tracker<br/>12 x 50 ms"]
+  TRACKER -->|steer, speed| SIM
+  SIM -.->|privileged state| CRITIC["Critic<br/>training only"]
 ```
-Raceline: iterated bounded least squares on the *exact* discrete curvature (denominator
-included), the line re-sampled uniformly and the widths re-measured on the map after every
-Gauss-Newton step, box-QP solved with L-BFGS-B (scipy's lsq_linear/trf stops at 2-3x the optimal
-cost on these systems). The first version linearized the curvature with the centerline spacing
-and never re-parametrized, which rewards bunching points on the inside of corners: it produced
-V-shaped apexes with 3x the curvature of the centerline, and every teacher/DAgger result before
-2026-09-07 used those lines. Safety: 0.40 m free space to the boundary (0.25 x (lane - car) on
-narrow lanes, at least 0.12 m), soft curvature cap ~1.1 1/m (the car's full-lock radius is
-0.74 m), side widths capped at 0.8 x the median lane width so side rooms of SLAM maps do not
-pull the line off the lane. `docs/racelines.png` (`scripts/raceline_gallery.py`).
-Teacher: pure pursuit with understeer compensation (effective wheelbase L + 0.003 v^2, measured
-on the simulated car: 20 % less yaw than kinematic at 4 m/s^2 lateral, 35 % at 6) plus the
-privileged latency/servo/calibration/grip compensation; a Stanley + feed-forward mode exists
-but loses under randomized delays. Speed-profile defaults stay conservative (rear-axle-only
-VESC braking ~3 m/s^2, lateral 6 m/s^2). On the 26-track train+eval set at a 6 m/s cap, 8 envs
-per track for 15 s: 0.09 collisions per env without randomization, 0.13 with (worst: the
-narrow corridor section of blackbox2021_3). `scripts/eval_teacher.py` renders `docs/raceline_*.png`.
 
-## Gym-style vector env (training interface)
-```python
-from f1sim.gym_env import F1VecEnv, EnvConfig
-env = F1VecEnv(track, Config(), EnvConfig(scan_stack=2, scan_subsample=4), num_envs=1024, device="cuda")
-obs, info = env.reset(seed=0)                    # obs: scan (k, N) in [0,1], speed, prev_action; info["priv"] for critics
-obs, rew, term, trunc, info = env.step(action)   # action in [-1,1]^2; auto-reset, info["final"] on episode end
-```
-Observation keys: `scan` (k stacked scans, `scan_stride` control steps apart: 3 x stride 3 =
-150 ms between the oldest and newest scans at 40 Hz; default stride 1 spans 50 ms), `speed` (VESC), `prev_action`, `imu` (step-mean gyro xyz /
-accel xyz, normalized), `imu_att` (VESC roll/pitch estimate), and optionally `hist`
-(`hist_len` rows of speed / imu / roll-pitch / action, `hist_stride` steps apart: the last second
-of what the car felt and was told, so the actor can identify its own grip and lag instead of
-driving for the worst car in the randomization -- the critic sees those parameters directly). The temporal student used for new runs sees six scans at stride 2 (250 ms) and appends consecutive scan differences before the CNN. Reward = progress [m] - 10 on
-collision (PPO runs use 50-150, optionally plus a term per m/s of impact speed so a fast crash
-costs more than a nudge) - 0.05 * |steer change| - 0.5 * distance travelled * wall proximity (under a 0.30 m gap) - 0.2 while facing
-backwards along the lane (progress is signed, so driving the wrong way already pays negative reward;
-this makes it explicit). Everything the
-policy sees is available on the real car; integrated pose/odometry is deliberately excluded (it
-drifts, and its drift statistics differ between sim and real).
+The privileged path is dashed because it exists only during training: the critic sees simulator
+state that the car cannot measure, and the actor never does.
 
-Action spaces (`EnvConfig(action_mode=...)`): `"direct"` = (steer, speed) at 40 Hz;
-`"plan"` = the policy is a *local planner*: 4 curvature knots along the next 0.7 s of travel
-(1.5-6 m of arc, linear in between, integrated into a path that leaves the car straight ahead --
-curvature, not y(x): a hairpin is just a large curvature, a polynomial in x cannot bend back and
-strayed up to 0.8 m from the raceline) plus the target speed 0.15 s ahead and at the end of the
-plan (6 numbers, all in the car's own frame, no pose needed), tracked by an iLQR on a kinematic
-bicycle with understeer, 12 x 50 ms, calibrated latency, IMU yaw rate as the initial turning
-state (`f1sim/mpc.py`, CUDA-graph compiled: 16 ms for 2048 envs). The teacher becomes a planner
-too (`RacelineTeacher.plan_action`: the knots start from what pure pursuit would do to rejoin
-the line, blended into the raceline's curvature ahead, and Gauss-Newton refines them through the
-raceline points 0.4-1.0 L_p ahead with a ridge back to that guess -- a fit that was free to snap
-back at full lock crashed on every rejoin, one that was too soft drifted off; residual 0.05-0.2 m),
-so DAgger imitates plans and PPO refines them; the tracker is the same code on the real car.
-The teacher's speed profile is computed per grip level (12 profiles per raceline, corner speeds
-and braking points scale with the car's friction, never above the nominal profile) and it slows
-down when off the line. Under full randomization on the training set at a 6 m/s cap it now
-crashes 0.21 times per car per 20 s through the tracker, the direct pure-pursuit teacher 0.24. The viewer
-draws the focus car's plan coloured by its speed profile (blue slow -> yellow fast), the
-tracker's predicted motion, and a dash with a speedometer and a steering wheel.
+**Observation** — shapes are **per environment** and depend on `EnvConfig`; the values below are the
+defaults. Every field is available on the real car. Integrated pose is deliberately excluded, because
+it drifts and its drift statistics differ between simulation and reality.
 
-Races (`EnvConfig(race_size=M, opponent="teacher"|"policy")`): consecutive envs form races of M
-cars on one track instance. Other cars appear in the LiDAR as what a scan plane at ~15 cm
-really meets: the electronics deck / LiDAR tower (12-24 cm), the chassis plate and the four
-wheels only when the plane tilts down onto them (3-12 cm / 0-11 cm), each part with its own
-porosity (wheels 35 %, deck 10 %), sizes scaled per car, plus the small cardboard detection box
-the rules require on the rear bumper (6-11 cm deep, 13-22 cm wide, 8-12 to 22-30 cm high,
-solid: 0-5 % dropout, drawn translucent in the viewer), hit type 4; car-car contact
-(separating-axis test on the footprints including the rear boxes) is a collision for both. Cars spawn staggered 2.5-6 m apart; a crashed car respawns behind its race mates, the
-leader's time limit resets the whole race onto a new track. `opponent="teacher"`: cars 1..M-1
-follow the raceline teacher at a random 0.6-1.0 speed scale (overtaking practice), only car 0's
-transitions train (`env.learner`); `"policy"`: every car is driven by the caller (self-play).
-The critic additionally sees the nearest opponent (body-frame offset, closing speed, distance).
-`docs/multicar_lidar.png`.
+| key | shape | meaning |
+| --- | --- | --- |
+| `scan` | `(k, 1081)` | `k` stacked LiDAR scans, `scan_stride` control steps apart, normalised |
+| `speed` | `(1,)` | VESC speed estimate |
+| `imu` | `(6,)` | step-mean gyro and accelerometer, normalised |
+| `imu_att` | `(2,)` | VESC roll/pitch estimate |
+| `prev_action` | `(action_history · act_dim)` | previous **normalised** actions; `action_history` defaults to 2 (so 16 with the 8D plan) |
+| `speed_cap` | `(1,)` | the current curriculum cap |
+| `hist` | `(hist_len · (9 + act_dim))` | optional proprioceptive history: speed (1), IMU (6), roll/pitch (2) and the action; 17 per row with the 8D plan |
 
-## 3D viewer (native, instead of RViz)
+The project is often described as LiDAR-only. That is accurate about *exteroception* — there is no
+camera, no map and no localisation — but the policy does receive proprioception. The intent of
+including it is to make the car's own grip and lag *inferable* from what it felt and was told,
+rather than forcing a policy to drive for the worst case in the randomisation. Whether a trained
+policy actually exploits that is a separate question, and it is not established here.
+
+**Action** — two layers, which are easy to confuse:
+
+- `Simulator.step` takes **raw physical 2D commands**: `(steer [rad], target speed [m/s])`. That is
+  what the quickstart passes.
+- `F1VecEnv.step` takes **normalised actions in [-1, 1]**, either 2D (`direct`) or 8D (`plan`),
+  and converts them — through the tracker in `plan` mode — into the physical command above.
+
+`EnvConfig(action_mode=...)`:
+
+| mode | action | tracked by |
+| --- | --- | --- |
+| `direct` | `(steer, target speed)` at 40 Hz | — |
+| `plan` | **8 numbers**: 6 curvature knots along the next stretch of travel, plus 2 speed heads — the **start and end speed targets of the local plan** | iLQR on a kinematic bicycle with understeer, 12 × 50 ms ([`mpc.py`](f1sim/f1sim/mpc.py)) |
+
+The two speed heads are interpolated **along arc length**, not time: the reference speed at a point
+is `v0 + (v1 - v0) · s/S` for that point's distance `s` along the plan of length `S`. Separately,
+`PlanSpec.v_cmd_lead` (0.15 s) is the lookahead at which `PlanTracker` reads its *predicted* speed to
+form the command — it is not a deadline by which `v0` is reached. Some docstrings still describe an
+older 4-knot, time-referenced design; the implementation is what is written here.
+
+`plan` makes the policy a local planner in the car's own frame, so no pose is needed and the same
+tracker code runs on the vehicle. Curvature is used rather than `y(x)` because a hairpin is simply a
+large curvature, where a polynomial in `x` cannot bend back.
+
+## Workflows
+
+Each is one command here and a section in the linked page.
+
+| | inspect the interface | page |
+| --- | --- | --- |
+| Driving console (PyQt5) | `python3 -m f1sim.learn.watch` | [Training](docs/training.md#watching-a-run) |
+| Legacy GL viewer | `python3 f1sim/scripts/demo_viewer.py --seed 1 --cars 8` | [Architecture](docs/architecture.md#viewer) |
+| Imitate a teacher | `python3 -m f1sim.learn.dagger --help` | [Training](docs/training.md#dagger) |
+| Reinforcement learning | `python3 -m f1sim.learn.ppo --help` | [Training](docs/training.md#ppo) |
+| Evaluate a checkpoint | `python3 -m f1sim.learn.evaluate --help` | [Training](docs/training.md#evaluation) |
+| Drive the ROS 2 stack | `ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:3` | [ROS 2](docs/ros2.md) |
+
+The training rows are `--help` on purpose. **The defaults are not a starting point**: `ppo` defaults
+to `--envs 2048` and `--total 100e6`, so running it bare begins a multi-day job on a large GPU.
+[Training](docs/training.md) gives bounded recipes that finish. These `python -m` invocations work
+from the repository root; plain `import f1sim` there does not — see
+[Getting started](docs/getting_started.md#a-directory-shadowing-trap).
+
+## Repository map
+
+| path | contents |
+| --- | --- |
+| [`f1sim/`](f1sim/) | the simulator package (`pip install -e f1sim`), ROS-independent, `COLCON_IGNORE`d |
+| `f1sim/f1sim/` | `sim.py`, `dynamics.py`, `lidar.py`, `imu.py`, `odom.py`, `actuators.py`, `randomization.py`, `track.py`, `maps.py`, `mpc.py`, `raceline.py`, `teacher.py`, `gym_env.py`, `params.py` |
+| `f1sim/f1sim/learn/` | observation encoding, model, DAgger, PPO, evaluation, export, the watch tool |
+| `f1sim/f1sim/viewer/` | OpenGL viewer (`native.py`, `gl_scene.py`) and the optional browser monitor |
+| [`f1sim/tests/`](f1sim/tests/) | the test suite |
+| [`f1sim/scripts/`](f1sim/scripts/) | viewer demo, map and car-model generation, galleries, benchmarks |
+| [`f1sim_ros/`](f1sim_ros/) | ROS 2 bridge: launch files, `vesc_sim` node, policy node, config, sample maps |
+| [`external/`](external/) | pinned third-party submodules — see [Third-party components](#third-party-components) |
+| [`docs/`](docs/) | documentation and figures |
+
+## Status and limitations
+
+Read this section before treating any number in this repository as a result.
+
+**Working and exercised.** The simulator, the map catalogue, the raceline and teacher, the plan
+action space with its iLQR tracker, the training loops (DAgger and PPO), evaluation, the viewer, and
+the ROS 2 bridge against the unmodified `f1tenth_system` stack.
+
+**In progress.** The plan tracker can run under four controller variants — `legacy` (no explicit
+friction limit, and the default), `fixed_low`, `oracle` and `estimated`. Two separate comparisons
+exist, and they answer different questions:
+
+- a **frozen-actor grid** across all four arms, which holds one policy fixed and varies only the
+  controller. That grid has been run.
+- a **matched-policy comparison** of `fixed_low` against `estimated`, three seeds each, where the
+  actor trains under its own arm. Complete: 72 cells, 1152 trials —
+  [research note](docs/research/2026-09-11-controller-arm-evaluation.md).
+
+**What that evaluation found.** `estimated` completes 87.85 % against `fixed_low`'s 84.38 %, but the
+three training seeds disagree on the sign and the seed spread (~10–11 pp) is wider than the gap, so
+there is **no robust method-level completion gain**. Among trials both arms complete, `estimated` is
+faster in all three seeds by 0.12–0.23 s. Separately, **both** arms fall well short of the frozen
+actor at the lowest friction. That is an observation about the outcome of fine-tuning under these
+controllers; its **cause is not established**, and a one-seed `legacy`-recipe probe did not settle it
+([follow-up](docs/research/2026-09-11-legacy-recipe-probe.md)).
+
+The arms, and the fact that the default loaders refuse a checkpoint trained under a non-`legacy` one,
+are in [Training](docs/training.md#experimental-friction-aware-control).
+
+**Not established.**
+
+- On-car performance of a learned policy is not established, and sim-to-real transfer is untested.
+  That is separate from parameter calibration, several parameters of which *are* fitted to vehicle
+  recordings.
+- No *throughput* benchmarks are published here; measure on your own hardware with
+  [`scripts/benchmark.py`](f1sim/scripts/benchmark.py). Driving results are published only for the
+  fixed diagnostic scenarios in the [research notes](docs/research/), with their scope stated there.
+- No trained checkpoints are distributed with the repository.
+- Generalisation to unseen venues, obstacle placements or opponent behaviour has not been
+  established. The published evaluation uses diagnostic maps that appear in the original actor's
+  recorded training exposure, so it is not an unseen-venue result.
+- Parts of the real-car system identification are still open — servo time constant, VESC
+  acceleration limits, tyre peak slip — so those randomisation ranges are informed estimates. Others
+  (IMU noise and bias, LiDAR extrinsics, calibration gains) are fitted to recordings; see
+  [Real-data calibration](docs/real_data_calibration.md).
+
+## Testing
+
 ```bash
-python3 src/f1sim/scripts/demo_viewer.py --seed 1 --cars 8          # opens a window, GPU sim paced to real time
-python3 src/f1sim/scripts/demo_viewer.py --map track.yaml --cars 1
-python3 src/f1sim/scripts/demo_viewer.py --headless-shots out/      # EGL offscreen screenshots (servers, CI)
-python3 src/f1sim/scripts/demo_viewer.py --web                      # browser monitor on :8765 instead
+cd f1sim && python3 -m pytest tests -q
 ```
-```python
-from f1sim.viewer.native import NativeViewer
-sim.warmup()                                     # JIT-compile kernels first (10-20 s) so the window never stalls
-v = NativeViewer(sim, raceline=rl)               # glfw window; headless=True for EGL offscreen
-v.run(step_fn)                                   # paced loop with interpolation, or:
-r = sim.step(a); v.update(r); v.render()         # drive it yourself
-```
-moderngl renderer in the simulator process: instanced car meshes (up to 64 cars), directional
-shadow map, corrugated duct hoses along the map contours, tall clutter/walls, floor grid,
-raceline colored by target speed, LiDAR hit points colored by what they hit (orange duct,
-magenta object outside the track, cyan floor), car body rolls/pitches on its suspension while
-the wheels stay on the floor, steering/rolling wheels, HUD with roll/pitch/speed/lap.
-1.5 ms/frame for 8 cars on the RTX 5060. Keys: `C` camera (chase / top / orbit / overview /
-closeup), `[` `]` focus car, `L` lidar, `V` raceline, `T` trails, `P` pause, `S` screenshot,
-mouse drag = orbit, wheel = zoom (driving keys W/S/A/D/Shift/Space/R are free for manual mode).
 
-Troubleshooting: a black window with the HUD missing means the GL frames are not presented.
-On this laptop that was caused by `__NV_PRIME_RENDER_OFFLOAD=1` / `__GLX_VENDOR_LIBRARY_NAME=nvidia`
-exported by `~/fsk/src/scripts/fsk-shellrc` while NVIDIA is already the primary GPU
-(`prime-select query` = nvidia); every GLX app is affected, not only f1sim. The viewer now drops
-those variables automatically in that configuration (`F1SIM_KEEP_PRIME_ENV=1` overrides).
+The suite covers LiDAR geometry against analytic values, 3D beam behaviour over obstacles, noise and
+dropout statistics, motion distortion, vehicle dynamics at the limit, actuator and latency timing,
+odometry drift, IMU specific-force and attitude behaviour, and the vectorised environment's
+auto-reset semantics. Most tests run on CPU.
 
-Car model (`scripts/make_car_model.py`, ~48k faces): Traxxas Slash 4x4 proportions, treaded
-short-course tires with split-spoke rims, LCG tub chassis, shock towers with oil shocks
-(springs, blue caps), A-arms, camber links, drive shafts, front bumper with foam, nerf bars,
-motor + spur cover, LiPo with strap, VESC 6 with heatsink, standoffs, laser-cut upper platform,
-Jetson AGX dev kit, power board, USB hub, antenna, Hokuyo UST-10LX (orange band), cabling.
-Nodes `wheel_*` / `lidar` are pivots; geometry names carry a material class
-(rubber/plastic/metal/blue/glass/paint/pcb) that the renderer maps to shading parameters.
+## Third-party components
 
-## ROS 2: f1tenth_system (RoboRacer / F1TENTH) stack on the simulator
-`src/external/f1tenth_system` (humble-devel) is built in this workspace (vesc_msgs,
-vesc_ackermann, ackermann_mux, f1tenth_stack; vesc_driver/urg_node/teleop are COLCON_IGNOREd,
-diagnostic_updater comes from ros/diagnostics). The simulator replaces only the hardware
-drivers: `f1sim_ros/vesc_sim_node.py` speaks vesc_driver's and urg_node's interface, so the
-rest of the stack runs unchanged with its own config files:
-```bash
-ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:3      # viewer window included
-ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=rt:Spielberg viewer:=false publish_gt_tf:=false
-ros2 topic pub -r 40 /drive ackermann_msgs/msg/AckermannDriveStamped "{drive: {steering_angle: 0.1, speed: 2.0}}"
-```
-| topic | type | who |
-|---|---|---|
-| `/drive`, `/teleop` -> `/ackermann_cmd` | AckermannDriveStamped | ackermann_mux (stack) |
-| `/commands/motor/speed` (ERPM), `/commands/servo/position` (0..1) | Float64 | ackermann_to_vesc (stack) -> **vesc_sim** |
-| `/sensors/core` (ERPM, tacho, V, A), `/sensors/servo_position_command` | VescStateStamped, Float64 | **vesc_sim** -> vesc_to_odom (stack) |
-| `/odom` + tf odom->base_link | Odometry | vesc_to_odom (stack), from the sim's telemetry |
-| `/sensors/imu`, `/sensors/imu/raw` | VescImuStamped, Imu | **vesc_sim** |
-| `/scan` (frame laser) | LaserScan | **vesc_sim**; static tf base_link->laser 0.27 0 0.11 as in bringup |
-| `/ego_racecar/odom`, `/map`, `/f1sim/collision`, tf map->odom | sim-only ground truth (disable map->odom when running a localizer) |
-The same `vesc.yaml` (speed_to_erpm_gain 4614, servo gain -1.2135 / offset 0.5304, servo/speed
-limits) is read by vesc_sim, so calibration errors between the stack's numbers and the "true"
-car live in the sim's randomized actuator/odometry parameters, exactly where they are on the
-real car. `f1sim_ros/config/vesc.yaml` is the stack's file with wheelbase 0.3302.
+`external/` contains submodules pinned to the commits this work was developed against. They are
+not vendored copies and keep their own licences.
 
-## Manual driving (racing-game feel)
-`f1sim/teleop.py` turns pedals + stick into the car's (steering, target speed) command with the
-dynamics of a racing game: throttle is *acceleration* (2 m/s^2 at full pedal with a soft pedal
-curve, capped at 5 m/s; Shift/LB boost doubles the push and lifts the cap to 8; `teleop_a_throttle:=`
-and `teleop_v_max:=` to taste), releasing everything coasts down like engine braking, brake is strong,
-holding the brake at standstill engages reverse, throttle brakes while reversing, the target
-never runs more than 2.5 m/s ahead of the measured speed (wall contact / blocked), steering
-lock shrinks with speed (full lock below 2.5 m/s, 35 % at 7+ m/s) with slew-rate limits, and
-keyboard keys are ramped into analog values so digital input feels like a stick. Gamepads get a
-deadzone + gamma curve and analog triggers.
+| submodule | upstream |
+| --- | --- |
+| `f1tenth_system` | https://github.com/f1tenth/f1tenth_system |
+| `f1tenth_gym` | https://github.com/f1tenth/f1tenth_gym |
+| `f1tenth_racetracks` | https://github.com/f1tenth/f1tenth_racetracks |
+| `f1tenth_maps` | https://github.com/CPS-TUWien/f1tenth_maps |
+| `f1tenth-racing-stack-ICRA22` | https://github.com/zzjun725/f1tenth-racing-stack-ICRA22 |
+| `diagnostics` | https://github.com/ros/diagnostics |
+| `korea_teams/*` | Korean F1TENTH team repositories, used as map sources |
 
-* In the simulator window: `ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:3`
-  and drive with W/S, A/D or arrows, Shift boost, Space handbrake, R reset. The window publishes
-  `/teleop`, which goes through ackermann_mux -> ackermann_to_vesc -> the (simulated) VESC like a
-  real joystick; the mux hands back to `/drive` when you stop touching the keys.
-* Gamepad (real car or sim): `... joy:=true joy_preset:=xbox` (left stick steer, RT/LT pedals,
-  LB boost, A handbrake) or `joy_preset:=f1tenth` (the stack's F710 D-mode mapping: left stick Y
-  speed, right stick X steer, hold LB to drive, hold RB for autonomous).
-  Standalone: `ros2 run f1sim_ros teleop --ros-args -p preset:=xbox` or `-p keyboard:=true` in a terminal.
-* Without ROS: `python3 src/f1sim/scripts/demo_viewer.py --manual` (you drive car 0, the others follow the teacher).
+Initialise them with `git submodule update --init --recursive` if the clone omitted
+`--recurse-submodules`. Some must be hidden from `colcon`; see
+[Getting started](docs/getting_started.md#ros-2-workspace).
 
-## ROS 2 bridge (standalone, gym_ros-style)
-```bash
-source install/setup.zsh
-ros2 launch f1sim_ros sim.launch.py                       # random track, rviz
-ros2 launch f1sim_ros sim.launch.py map_yaml:=/abs/path/map.yaml device:=cuda
-ros2 topic pub -r 40 /drive ackermann_msgs/msg/AckermannDriveStamped "{drive: {steering_angle: 0.1, speed: 2.0}}"
-```
-Topics: `/drive` in; `/scan` (laser), `/odom` (odom->base_link, drifting VESC odom),
-`/ego_racecar/odom` (map, ground truth), `/sensors/imu` + `/sensors/imu/raw` (VESC IMU, as
-vesc_driver publishes them), `/map`, `/f1sim/collision` out; `/initialpose` teleports;
-`/f1sim/reset` service. TF: map->odom->base_link->laser. A policy node written against
-these topics runs unchanged on the real car.
-
-Sample maps with centerlines: `f1sim_ros/maps/` (regenerate with `src/f1sim/scripts/make_maps.py`).
-Real track maps: put the SLAM map yaml/pgm and, optionally, `<name>_centerline.csv`
-(f1tenth_racetracks format) next to it.
-
-## Validation (tests/)
-* LiDAR ranges vs analytic circle: max error < 1.5 cells, Triton kernel == torch tracer
-* 3D beams: floor hit range under pitch/roll equals the analytic value, a beam tilted up passes
-  over the 0.2 m duct and returns the wall behind it, tilted down hits the floor before the duct
-* noise / dropout statistics match the configured values
-* motion distortion shifts early beams, leaves the last beam exact
-* straight-line speed tracking, low-speed yaw rate == kinematic bicycle
-* limit cornering: lateral accel saturates below mu*g, understeers instead of spinning
-* full lock + full throttle stays finite; soft wall contact stops the car without blow-up
-* command latency + servo lag timing
-* full laps on random tracks without collision, progress integrates to one lap length
-* odometry drifts, but plausibly
-
-* gym env: shapes, auto-reset semantics, teacher gets positive return / finishes laps
-* IMU: specific-force formula (gravity, lever arm), rest reads (0,0,g), brake dive makes the
-  accelerometer over-read, cornering gyro/lateral match, vibration grows with speed, attitude
-  filter converges at rest and bends under acceleration, per-env bias randomization
-
-Run: `cd src/f1sim && python3 -m pytest tests -q`
-
-## Throughput (RTX 5060 Laptop, 25 ms control step, 1 ms physics, 1080 beams)
-| envs | ms / step | env-steps / s |
-|---|---|---|
-| 1 | 2.8 | 360 |
-| 1024 | 3.5 | 292,000 |
-| 4096 | 11.6 | 352,000 |
-CPU, 1 env, eager: ~30 ms/step (the 3D LiDAR + suspension made the CPU path heavier), so the
-ROS bridge should run on the GPU (4 ms/step, launch default `device:=cuda`); on CPU it publishes
-at ~32 Hz instead of 40.
-
-## Training (`f1sim/learn/`)
-Decisions: LiDAR-only e2e with proprioception (VESC speed, IMU step-mean, VESC roll/pitch estimate,
-last 2 actions, speed cap); reward = centerline progress - collision cost - 0.05 * |steer change|
-- 0.5 * distance travelled * proximity (linear ramp once the body-to-wall gap is under 0.30 m: a mild safety margin,
-hugging the hose on the racing line is still allowed); speed cap
-curriculum 4 -> 8 m/s; train tracks = `common.TRAIN_TRACKS` (6 real competition
-SLAM maps + Spielberg/Oschersleben + 28 distinct procedural competition/hallway/circuit geometries,
-with reverse/mirror variants and static-obstacle versions: 112 entries), held-out eval = `common.EVAL_TRACKS` (real:korea_2025_iccas and
-real:blackbox2022_3 both ways, rt:Monza, gen:competition:0); `--tracks` takes `train`, `eval` or a
-comma separated catalog list; W&B project `f1sim-e2e`; runs and checkpoints under
-`~/f1sim_runs/<name>/`. Track galleries: `docs/tracks_*.png` (`scripts/track_gallery.py`).
-```bash
-cd src/f1sim
-python3 -m f1sim.learn.dagger --name dagger_v1 --envs 1024 --iters 8 --steps 250                # teacher -> student, ~10 min
-python3 -m f1sim.learn.ppo --name ppo_v1 --init ~/f1sim_runs/dagger_v1/student_latest.pt --envs 2048 --total 100e6
-python3 -m f1sim.learn.evaluate ~/f1sim_runs/ppo_v1/ppo_latest.pt --sweep          # held-out tracks + mu/latency/lidar-height sweeps
-python3 -m f1sim.learn.evaluate --teacher                                            # the baseline to beat
-python3 -m f1sim.learn.export ~/f1sim_runs/ppo_v1/ppo_latest.pt --trt               # ONNX (+ TensorRT) for the Jetson
-# races: fine-tune a single-car policy against teacher-driven opponents (only car 0 learns), then self-play
-python3 -m f1sim.learn.ppo --name ppo_race --init ~/f1sim_runs/ppo_v4/ppo_final.pt --race-size 3 --opponent teacher --scan-stride 3 --kl-coef 0
-python3 -m f1sim.learn.ppo --name ppo_selfplay --init ~/f1sim_runs/ppo_race/ppo_final.pt --race-size 3 --opponent policy --scan-stride 3 --kl-coef 0
-ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:2 policy:=$HOME/f1sim_runs/ppo_v1/ppo_latest.pt policy_speed_cap:=5.0
-```
-* `obs.py`: the one observation encoding, used by the gym env and by the ROS policy node.
-* `model.py`: 1D-conv scan stem + MLP actor (Gaussian, tanh mean), optional temporal scan-difference channels, separate critic with the
-  privileged vector (true velocities, track-relative pose, wall clearance, randomized params).
-* `dagger.py`: teacher drives / student drives with teacher labels, aggregated buffer, Huber loss.
-* `ppo.py`: asymmetric-critic PPO from the DAgger student, KL-to-imitation regularizer that decays,
-  value clipping, speed-cap curriculum, per-episode metrics and per-component reward monitoring.
-* `policy_node.py` (f1sim_ros): /scan + /odom + /sensors/imu -> /drive, same ObsBuilder; the
-  launch's `policy:=` argument starts it against the simulated stack.
-
-### Watching training (`f1sim.learn.watch`)
-```bash
-python3 -m f1sim.learn.watch --run ~/f1sim_runs/ppo_v3 --map gen:competition:2 --cars 128        # window, reloads ppo_latest.pt as it changes
-python3 -m f1sim.learn.watch --run ~/f1sim_runs/ppo_v2/ppo_final.pt --cars 256 --record out.mp4  # headless recording (ffmpeg)
-```
-Runs its own simulator with N agents on the latest checkpoint of a training run (auto-reload), so
-training is not slowed by rendering. On screen: the focus car's LiDAR points colored by saliency
-(red = beams the policy's action depends on most), the 256 hidden units and 256 scan features as
-heat grids, action mean/std gauges, the critic's value estimate, checkpoint step count. `[` `]` change
-the focus car. `docs/watch_ppo_v2.mp4` is a 10 s recording of 128 agents on the v2 policy.
-
-Best-of-episode replays (`--episodes N`): every agent's states and scans are recorded for a full
-episode, agents are ranked (clean runs first, then progress), and the winner is replayed from the
-recording with chase camera, saliency, the network panel and a leaderboard. In a window the loop
-is live episode -> replay -> next episode; headless, `--highlights DIR` writes one mp4 per episode:
-```bash
-python3 -m f1sim.learn.watch --run ~/f1sim_runs/ppo_v3 --cars 128 --episodes 5 --episode-s 40 --replay-top 2
-python3 -m f1sim.learn.watch --run ~/f1sim_runs/ppo_v2/ppo_final.pt --cars 64 --episodes 3 --highlights out/   # headless mp4s
-```
-`docs/highlight_ppo_v2_ep1.mp4`: best of 64 agents, 20 s episode.
-
-### Results so far (2026-09-07, W&B project f1sim-e2e)
-Historical direct-control results below predate the current plan-space implementation and the episode-accounting fixes. They do not establish current planner performance; rerun paired evaluations on a fixed simulator configuration.
-| run | setup | held-out competition tracks (cap 6 m/s, 60 s episodes) |
-|---|---|---|
-| teacher | raceline pure pursuit, privileged | laps 25-32 s, collisions 0-1 % |
-| dagger_v1 | 2M samples, 8 iterations | 22 % collisions at 93 % of the teacher's pace |
-| ppo_v1 | penalty 10, gamma 0.99, 52M steps | laps 15-16 s, collisions 40-57 % (plateau) |
-| ppo_v2 | penalty 50, gamma 0.995, cap 4->8 over 60M, 100M steps | laps 15-16 s, collisions 18-37 %; hallway 54 %; ONNX 2 MB, 2-4 ms inference in the ROS node, drives the simulated stack |
-
-Lessons: with 40 s episodes the progress reward (~+160) dwarfs a -10 collision penalty, so v1 learned
-to crash; -50 with gamma 0.995 halved the collision rate at the same lap times. All procedural
-generators traced their loops counter-clockwise, so v1/v2 only ever saw left-turning tracks (visible
-as low progress on Spielberg); odd seeds are now mirrored (`Track.mirrored`). Next: retrain with
-mirrored tracks, more DAgger epochs, longer PPO with a higher hallway share.
-
-## Decisions so far
-* e2e LiDAR-only policy is the goal (localization-free, opponent interaction, research). Classic
-  stack (map + localization + raceline) is the teacher/baseline, not the deliverable.
-* Plan: single-car first. Teacher (done) -> DAgger distillation into the LiDAR student ->
-  PPO fine-tuning with asymmetric critic -> add opponents (multi-car sim + self-play).
-
-## Open items
-* frozen-checkpoint evaluation on unseen obstacle placements and opponent behaviors; report first-attempt full-distance completion
-* train and compare temporal observation models for dynamic interaction; current CNN is feedforward
-* validate online collision/feasibility checks and real-car stale-input/command watchdog behavior
-* validate exported policy and tracker latency on the target Jetson
-* real-car system identification: measure servo tau, VESC accel limits, actual latency, tire peak
-  slip and feed them into `Config` and the randomization ranges
-* maps of the real track(s) + centerlines
+This repository does not currently carry a licence file, so no licence is stated here. The
+third-party components under `external/` are governed by their own.

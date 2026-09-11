@@ -13,7 +13,9 @@ def test_history_rows_match():
     cfg = Config(); cfg.rand.enabled = False
     env = common.make_env(tracks, 2, dev, EnvConfig(action_mode="plan", speed_cap=4.0, hist_len=4, hist_stride=2), cfg=cfg, seed=1)
     teacher = common.make_teacher(rls, env)
-    spec = common.obs_spec(env); assert spec.hist_len == 4 and spec.proprio_dim == 1 + 12 + 1 + 8 + 4 * spec.row_dim
+    spec = common.obs_spec(env)                                   # derive from the spec: the plan
+    assert spec.hist_len == 4                                     # action dimension is not a constant
+    assert spec.proprio_dim == 1 + spec.act_dim * spec.action_history + 1 + 8 + 4 * spec.row_dim
     obs, _ = env.reset(seed=1)
     b = ObsBuilder(spec, "cpu")
     b.push_action(env.act_hist[0, 1].cpu()); b.push_action(env.act_hist[0, 0].cpu())

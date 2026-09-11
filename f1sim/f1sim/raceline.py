@@ -15,7 +15,7 @@ import numpy as np
 from scipy import sparse as sp
 from scipy.optimize import lsq_linear
 
-from .track import Track, resample_closed
+from .track import Track, _limit_curvature, resample_closed
 
 
 # --------------------------------------------------------------------------- geometry
@@ -182,8 +182,44 @@ def min_curvature_raceline(center: np.ndarray, w_left: Optional[np.ndarray] = No
     race = resample_closed(race, N)
     if track is not None:                                # clearance repair: corner cutting past a convex obstacle
         wl, wr = track_widths(track, race)
-        race = _push_clear(track, race, float(np.min(free_space(wl, wr))))
+        clearance = float(np.min(free_space(wl, wr)))
+        race = _push_clear(track, race, clearance)
+        if kappa_max is not None:
+            race = _enforce_turn_radius(race, kappa_max, track, clearance)
+    elif kappa_max is not None:
+        race = _enforce_turn_radius(race, kappa_max)
     return race
+
+
+def _enforce_turn_radius(pts: np.ndarray, kappa_max: float, track: Optional[Track] = None,
+                         clearance: Optional[float] = None, rounds: int = 12, smooth_iters: int = 400) -> np.ndarray:
+    """Make the line's curvature something the car can actually steer.
+
+    The solve treats `kappa_max` as a preference (re-weighted rows), not a constraint, and on some
+    layouts it converges to a line that violates it badly: of 118 catalog tracks two came out at
+    R = 0.27 m and R = 0.45 m against the car's 0.74 m full-lock radius, both ~10 % longer than the
+    same track driven the other way. Those two were also the privileged teacher's worst tracks by a
+    wide margin (12.1 and 5.5 collisions/km against 0.18 over the set) -- an unfollowable line makes
+    an unfollowable label. Laplacian-smooth the offending stretches, push the result back off the
+    boundary, and repeat until the cap holds."""
+    n = len(pts)
+    peak = lambda p: float(np.abs(curvature(p)).max())
+    best = pts
+    for _ in range(rounds):
+        if peak(best) <= kappa_max:
+            break
+        pts = resample_closed(_limit_curvature(pts, 1.0 / kappa_max, iters=smooth_iters), n)
+        if peak(pts) < peak(best):
+            best = pts
+        if track is None or clearance is None:
+            continue
+        # pushing back off the boundary re-introduces curvature at the point it moves, so keep the
+        # pushed line only while it is still the flatter of the two; otherwise smooth again from it
+        pushed = _push_clear(track, pts, clearance)
+        if peak(pushed) < peak(best):
+            best = pushed
+        pts = pushed
+    return best
 
 
 def _push_clear(track: Track, pts: np.ndarray, clearance: float, iters: int = 30, tol: float = 0.02) -> np.ndarray:
@@ -213,7 +249,7 @@ def _push_clear(track: Track, pts: np.ndarray, clearance: float, iters: int = 30
     return resample_closed(xy, N) if moved.any() else pts
 
 
-def speed_profile(pts: np.ndarray, v_max: float = 10.0, a_lat: float = 6.0, a_acc: float = 4.0,
+def speed_profile(pts: np.ndarray, v_max: float = 10.0, a_lat: float = 6.0, a_acc: float = 6.0,
                   a_brake: float = 3.0, v_min: float = 1.0) -> np.ndarray:
     """Friction-ellipse limited speed along a closed path: lateral limit, then forward
     (acceleration) and backward (braking) passes, repeated so the loop closes.
@@ -248,7 +284,7 @@ class Raceline:
 
     @staticmethod
     def build(track: Track, veh_width: float = 0.31, margin: float = 0.40, v_max: float = 10.0,
-              a_lat: float = 6.0, a_acc: float = 4.0, a_brake: float = 3.0, iters: int = 30,
+              a_lat: float = 6.0, a_acc: float = 6.0, a_brake: float = 3.0, iters: int = 30,
               smooth: float = 0.5, width_cap_ratio: float = 0.8) -> "Raceline":
         """margin: free space kept between the car's side and the boundary (0.40 m: the pure-pursuit
         teacher cuts inside the line by up to ~0.15 m at speed, and duct hoses are soft targets anyway).
@@ -274,7 +310,7 @@ class Raceline:
         params = {k: v.default for k, v in inspect.signature(Raceline.build).parameters.items() if k != "track"}
         params.update(kw)                                  # key includes the *effective* parameters, defaults too
         cl = b"" if track.centerline is None else np.asarray(track.centerline, dtype=np.float32).tobytes()
-        h = hashlib.md5(np.packbits(track.occupancy).tobytes() + cl + repr(sorted(params.items())).encode() + b"rl4").hexdigest()[:12]
+        h = hashlib.md5(np.packbits(track.occupancy).tobytes() + cl + repr(sorted(params.items())).encode() + b"rl5").hexdigest()[:12]
         path = os.path.join(cache_dir, f"{track.name}_{h}.csv")
         if os.path.exists(path):
             return Raceline.load(path)

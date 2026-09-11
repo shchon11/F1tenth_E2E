@@ -13,6 +13,7 @@ accelerometer gravity direction (so it is fooled by sustained accelerations, lik
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 from typing import Dict
 
 import torch
@@ -28,10 +29,73 @@ def imu_state_init(B: int, device) -> torch.Tensor:
 
 def sample_indices(rate: float, control_dt: float, dt: float, substeps: int):
     """Substep indices at which the IMU produces a sample within one control step (last sample at
-    the end of the step, spacing 1/rate)."""
+    the end of the step, spacing 1/rate).
+
+    Only correct when `rate * control_dt` is an integer: it assumes the same number of samples in
+    every control step and that the last one lands exactly on the step boundary. 50 Hz on a 40 Hz
+    loop -- what this project runs -- satisfies neither. `sample_schedule` is the general form;
+    this is kept because it is still the right answer for the integer case.
+    """
     K = max(1, int(math.floor(rate * control_dt + 1e-6)))
     idx = [substeps - 1 - int(round((K - 1 - k) / rate / dt)) for k in range(K)]
     return [max(0, i) for i in idx]
+
+
+def sample_schedule(rate: float, control_dt: float, dt: float, substeps: int, max_period: int = 8):
+    """Where a *free-running* IMU's samples fall inside each control step.
+
+    The sensor ticks on its own clock at `rate`, which has no reason to divide the control period.
+    At 50 Hz against a 40 Hz control loop the count per step is not constant: it cycles 1, 1, 1, 2
+    and averages the declared rate exactly. Flooring to a fixed count instead ran the sensor at
+    40 Hz and told its noise model 20 ms had passed when 25 ms had.
+
+    Returns `(schedule, offsets, period)`:
+      * `schedule[p]` -- substep indices at which cycle-step `p` emits, ascending in time
+      * `offsets[p]`  -- how long before the *end* of that control step each sample falls [s], so a
+                         consumer can timestamp it as `now - offset`
+      * `period`      -- control steps per cycle; the layout repeats with this period
+
+    One cycle spans a whole number of both clocks, so the sensor never drifts against the sim.
+    `period` is also how many distinct layouts the substep loop can see, and each one is a separate
+    compiled graph: hence `max_period`, which refuses a rate that would thrash the compile cache
+    rather than silently accepting it.
+    """
+    if not math.isfinite(rate) or rate <= 0.0:
+        raise ValueError(f"imu_rate must be a positive, finite frequency; got {rate!r}")
+    if rate > 1.0 / dt + 1e-9:
+        raise ValueError(
+            f"imu_rate {rate:g} Hz is faster than the {1 / dt:g} Hz physics tick, so two samples "
+            f"would share one substep and the second would repeat the first. Lower the rate or "
+            f"lower sim.physics_dt.")
+    ratio = Fraction(rate * control_dt).limit_denominator(1000)    # samples per control step
+    period, per_cycle = ratio.denominator, ratio.numerator
+    if period > max_period:
+        raise ValueError(
+            f"imu_rate {rate:g} Hz against a {1 / control_dt:g} Hz control loop needs a "
+            f"{period}-step cycle to stay phase-exact (limit {max_period}); pick a rate whose "
+            f"ratio to the control rate is a simpler fraction")
+    schedule: list[list[int]] = [[] for _ in range(period)]
+    offsets: list[list[float]] = [[] for _ in range(period)]
+    for j in range(per_cycle):
+        t = (j + 1) / rate                                         # sensor tick, cycle-relative
+        p = max(0, math.ceil(t / control_dt - 1e-9) - 1)            # the control step it lands in
+        k = min(substeps - 1, max(0, int(round((t - p * control_dt) / dt)) - 1))
+        schedule[p].append(k)
+        offsets[p].append((p + 1) * control_dt - t)
+    # A control step with no sample would make the environment drop the IMU keys from the
+    # observation for that step and change the proprio width (gym_env._obs), so the observation
+    # contract does not survive it. Refuse the rate instead of quietly producing a ragged one.
+    if any(not idx for idx in schedule):
+        empty = [p for p, idx in enumerate(schedule) if not idx]
+        raise ValueError(
+            f"imu_rate {rate:g} Hz is slower than the {1 / control_dt:g} Hz control loop, so "
+            f"control step(s) {empty} of every {period} would carry no IMU sample. The observation "
+            f"assumes at least one sample per step; supporting a slower sensor needs a held-value "
+            f"or explicit-gap contract in gym_env._obs first.")
+    if any(len(set(idx)) != len(idx) for idx in schedule):
+        raise ValueError(
+            f"imu_rate {rate:g} Hz puts two samples in the same physics substep; lower sim.physics_dt")
+    return schedule, offsets, period
 
 
 def specific_force(ax, ay, roll, pitch, roll_rate, pitch_rate, yaw_rate, roll_acc, pitch_acc, yaw_acc, r_vec):
@@ -77,15 +141,34 @@ def substep(imu_state, ax, ay, vx, roll, pitch, roll_rate, pitch_rate, yaw_rate,
     tone_y = torch.sin(ph[:, 0] + 0.7) + 0.5 * torch.sin(ph[:, 1] + 2.1) + 0.7 * torch.sin(ph[:, 2] + 0.3)
     tone_z = torch.sin(ph[:, 0] + 1.9) + 0.5 * torch.sin(ph[:, 1] + 0.4) + 0.7 * torch.sin(ph[:, 2] + 1.4)
     bb = P["vib_broadband"]
-    va = P["vib_accel"] * speed
-    vg = P["vib_gyro"] * speed
+    # Measured over 22 recordings as the rms of the IMU residual above 5 Hz (vehicle motion lives
+    # below that; a 0.2 s moving average, used first, leaves manoeuvre in the residual and made the
+    # standstill bin 46x too noisy). Vibration is not proportional to speed and it is not constant
+    # either -- it switches on the moment the wheels turn and then grows weakly:
+    #   accel rms   0.018 m/s^2 truly still -> 1.42 at 0.5 m/s -> 3.3 at 7.5   (~80x at first motion)
+    #   gyro  rms   0.0025 rad/s            -> 0.150           -> 0.41
+    # `coefficient * speed` alone is silent exactly where the policy reads its proprio history to
+    # infer grip and lag; a speed-independent floor instead leaves a stationary car buzzing at 80x
+    # its real noise. So: a floor that ramps in over the first `vib_onset_v` of wheel speed, plus a
+    # slope on top. Both coefficients are fitted to the *output* of this chain, not to the injection
+    # -- the 40 Hz low-pass and 50 Hz sampling below remove a good part of what is injected here.
+    # The floor is broadband, the slope carries the tones. Road texture and motor idle have no
+    # reason to sit at the wheel frequency, and putting the floor on the tone makes it invisible
+    # where it matters: at 0.5 m/s the wheel turns at 1.6 Hz, below the band this was fitted in,
+    # so a tonal floor left the sim 30 % quiet there. (An earlier version multiplied the floor by
+    # the tone *and* let it act at a standstill, where the phase is frozen -- that gives a constant
+    # offset, not vibration, and read 0.6 rad/s of yaw on a parked car.)
+    onset = (speed / P["vib_onset_v"]).clamp(max=1.0)
+    va_f, va_s = P["vib_accel_floor"] * onset, P["vib_accel"] * speed
+    vg_f, vg_s = P["vib_gyro_floor"] * onset, P["vib_gyro"] * speed
     n = torch.randn(vx.shape[0], 6, device=vx.device)
-    fx = fx + va * (0.6 * (1 - bb) * tone + bb * n[:, 0])
-    fy = fy + va * (0.6 * (1 - bb) * tone_y + bb * n[:, 1])
-    fz = fz + va * (1.0 * (1 - bb) * tone_z + bb * n[:, 2])
-    gx = gx + vg * (0.8 * (1 - bb) * tone_y + bb * n[:, 3])
-    gy = gy + vg * (0.8 * (1 - bb) * tone_z + bb * n[:, 4])
-    gz = gz + vg * (0.5 * (1 - bb) * tone + bb * n[:, 5])
+    m = torch.randn(vx.shape[0], 6, device=vx.device)
+    fx = fx + va_s * (0.6 * (1 - bb) * tone + bb * n[:, 0]) + va_f * m[:, 0]
+    fy = fy + va_s * (0.6 * (1 - bb) * tone_y + bb * n[:, 1]) + va_f * m[:, 1]
+    fz = fz + va_s * (1.0 * (1 - bb) * tone_z + bb * n[:, 2]) + va_f * m[:, 2]
+    gx = gx + vg_s * (0.8 * (1 - bb) * tone_y + bb * n[:, 3]) + vg_f * m[:, 3]
+    gy = gy + vg_s * (0.8 * (1 - bb) * tone_z + bb * n[:, 4]) + vg_f * m[:, 4]
+    gz = gz + vg_s * (0.5 * (1 - bb) * tone + bb * n[:, 5]) + vg_f * m[:, 5]
     gx, gy, gz = misalign(gx, gy, gz, P)
     fx, fy, fz = misalign(fx, fy, fz, P)
     u = torch.stack([gx, gy, gz, fx, fy, fz], 1)

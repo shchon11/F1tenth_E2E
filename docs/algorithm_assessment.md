@@ -175,3 +175,146 @@ remote 최신 `d9795bb`의 mirror 증강을 반영한 60트랙 DAgger는 BlackBo
 다음 실험은 teacher label의 관측 가능성을 측정하고, 전역 raceline 미래 대신 LiDAR 가시거리와 제동거리 안에서 정의되는 mapless local teacher 또는 더 작은 compact plan 표현을 비교하는 것이다. BlackBox를 학습에 넣어 통과시키는 것은 일반화 검증이 아니므로 하지 않는다.
 
 W&B: [112트랙 DAgger](https://wandb.ai/shchon11-hanyang-university/f1sim-e2e/runs/wfxv909a), [plan-clearance PPO](https://wandb.ai/shchon11-hanyang-university/f1sim-e2e/runs/gcftncwf).
+
+## 2026-09-07 정정: "일반화 실패"는 대부분 측정 문제였다
+
+위 generalization 절의 결론을 아래 실행 결과로 정정한다. 근거는 같은 체크포인트
+(`ppo_generalization_v2_4060ti/ppo_final.pt`), 같은 seed 903, 속도 상한 4 m/s, `--protocol trials`이다.
+
+### 트랙별 위험률과 학습 포함 여부
+
+| 트랙 | 학습 포함 | coll/km | 완주 |
+|---|---|---:|---:|
+| `rt:Monza` (444 m) | 아니오 | 0.00 | 0/16 |
+| `gen:competition:0` (68 m) | 아니오 | 1.01 | 15/16 |
+| `real:blackbox2022_2` (181 m) | 예 | 1.72 | 12/16 |
+| `real:blackbox2022_1` (155 m) | 예 | 2.60 | 11/16 |
+| `real:korea_2025_iccas` (46 m) | 아니오 | 4.32 | 13/16 |
+| `real:blackbox2021_2` (173 m) | 예 | 5.27 | 6/16 |
+| `real:blackbox2021_3` (87 m) | **예 (8개 변형)** | **11.99** | 6/16 |
+| `real:blackbox2022_3` (101 m) | 아니오 | 13.75 | 3/16 |
+
+1. **Monza의 0/16은 정책과 무관하다.** 444 m 트랙을 4 m/s 상한으로 한 바퀴 돌려면 최소 111초인데
+   `--steps 2400`은 60초다. 완주는 구조적으로 불가능했고, 실제로는 3.4 km를 달리며 충돌 0회로
+   세트에서 가장 안전하게 주행한 트랙이다. 이전 집계의 timeout 31건은 거의 전부 이 항목이다.
+2. **held-out 여부는 실패를 설명하지 않는다.** 최악 트랙 두 개 중 하나(`blackbox2021_3`)는
+   `real:`, `~rev`, `~mir`, `~mir~rev`, `+obs3` × 4 = 8개 변형으로 학습 셋에 들어있다.
+   8개 트랙에 대한 Spearman(학습 포함, coll/km) = **+0.55**로 부호가 반대다. 측정 가능한
+   메모리제이션 페널티가 없다.
+3. **완주율은 파생량이다.** P(완주) ≈ exp(−λL)로 거의 그대로 재현된다: Korea 예측 0.83 / 실측 0.81,
+   `gen:0` 0.93 / 0.94, `blackbox2022_3` 0.23 / 0.19, `blackbox2021_3` 0.33 / 0.38. 즉 완주율은
+   coll/km와 트랙 길이 외의 정보를 담지 않으며, 길이가 다른 트랙끼리 비교하면 안 된다.
+4. **트랙당 16회는 결론을 낼 표본이 아니다.** 3/16의 95 % Wilson 구간은 [0.07, 0.45]이고 6/16과
+   겹친다. residual plan·temporal loss·GRU에 대한 이전 폐기 판단은 이 노이즈보다 작은 차이 위에 있다.
+
+### Teacher는 이 맵들에서 실패하지 않는다
+
+같은 프로토콜·seed로 privileged teacher를 돌린 결과: `blackbox2022_1`, `blackbox2022_2`,
+`blackbox2021_2`, `blackbox2021_3` 모두 16/16, 0.00 coll/km. held-out `blackbox2022_3`는 31/32,
+0.33 coll/km. 맵·centerline·raceline·목표 거동 모두 4 m/s에서 달성 가능하다. 따라서 학생의 실패는
+teacher가 못 푸는 문제를 물려받은 것이 아니라 순수한 student-teacher 격차다.
+
+### 실패 양상은 코너 과속이 아니라 차선 이탈이다
+
+충돌 순간의 상태를 기록했다(64 env, seed 903, 상한 4 m/s):
+
+| 트랙 | 충돌 | 충돌 시 &#124;lateral&#124; | lane 반폭 | lane 밖 비율 | 충돌 속도 |
+|---|---:|---:|---:|---:|---:|
+| `blackbox2022_3` | 241 | 1.69 m | 1.25 m | 69 % | 2.27 m/s |
+| `blackbox2021_3` | 72 | 0.74 m | 0.90 m | 43 % | 2.08 m/s |
+| `korea_2025_iccas` | 16 | 1.35 m | 1.57 m | 31 % | 2.71 m/s |
+| `blackbox2022_1` | 13 | 1.28 m | 1.63 m | 0 % | 2.30 m/s |
+
+충돌 속도가 상한의 절반 근처이고, 어려운 맵일수록 충돌 지점이 lane 밖이다. 접지력 한계를 넘겨
+스핀하는 것이 아니라 **주행 차선을 잘못 잡은 뒤 저속으로 부딪힌다.** 지각·항법 문제이지 제어 문제가
+아니다. 따라서 다음 병목은 보상 계수나 teacher 속도 라벨이 아니라 관측에서 주행 가능한 통로를
+결정하는 능력이다.
+
+### 이에 따른 코드 변경
+
+| 문제 | 변경 |
+|---|---|
+| 고정 시간 예산이 긴 트랙을 자동 탈락시킴 | `evaluate --budget-laps`(기본 2.0)로 트랙 길이에 비례한 예산, `budget_feasible` 플래그 |
+| 완주율을 정책 성능으로 읽음 | `collisions_per_km`을 1차 지표로, `hazard_predicted_completion_rate`로 파생 관계를 노출 |
+| 점추정 비교 | `completion_rate_ci95`(Wilson), `collisions_per_km_ci95`(Poisson exact) |
+| 학습 셋 평균이 하드 트랙을 가림 | `rollout_metrics(per_track=True)` + DAgger 로그에 worst 트랙 |
+| 벽 옆에 정지하면 proximity 비용 0 | 보상을 centerline progress가 아니라 실제 주행 거리(&#124;v&#124;dt) 기준으로 |
+| KL leash가 PPO 전 구간 유지 | `--kl-decay` 기본값을 `--total`의 20 %로 |
+| teacher 속도 라벨이 관측 불가능한 μ에 의존 | `--teacher-grip {true,nominal,conservative}`, 측정 도구 `python -m f1sim.learn.grip_probe` |
+| raceline에 robustness 예산 없음 | `--raceline-margin` 노출 (기본 0.40 유지) |
+| scan encoder의 수용영역이 270° 중 20° | `--scan-stem resnet`: GroupNorm+residual, 전역 수용영역, beam-angle 채널, 정규화를 우회하는 원본 sector 최근접거리 |
+
+`--scan-stem`은 새 학습의 기본값이 `resnet`이고, 기존 체크포인트는 `scan_stem` 필드가 없으므로
+`plain`으로 그대로 로드된다(회귀 테스트 `tests/test_scan_stem.py`).
+
+### 정정된 표준 평가 명령
+
+```bash
+source /home/shchon11/F1tenth/activate.sh
+
+# 정책: 트랙 길이에 비례한 예산, 트랙당 64회, coll/km과 신뢰구간을 함께 본다
+python -m f1sim.learn.evaluate /path/to/ppo_final.pt \
+  --tracks eval --per-track --protocol trials \
+  --seed 903 --envs 64 --budget-laps 2 --speed-cap 4 \
+  --output algorithm-audit/policy-heldout.json
+
+# 같은 조건의 teacher 기준선 (학생만 실패하는 구간을 분리한다)
+python -m f1sim.learn.evaluate --teacher --action-mode plan \
+  --tracks eval --per-track --protocol trials \
+  --seed 903 --envs 64 --budget-laps 2 --speed-cap 4 \
+  --output algorithm-audit/teacher-heldout.json
+
+# teacher 라벨이 학생이 볼 수 있는 것의 함수인지 측정한다
+python -m f1sim.learn.grip_probe --tracks train --envs 256 --steps 400
+```
+
+`--budget-laps`는 `--protocol trials`에만 적용된다. `rolling`은 위험률을 트랙 간 비교하려면 노출
+시간이 고정되어야 하므로 `--steps`를 그대로 쓴다.
+
+### 이번에 하지 않은 것과 그 이유
+
+- **절차적 트랙을 매 iteration 새로 뽑도록 바꾸지 않았다.** 학습 포함 여부와 실패율의 상관이 +0.55로
+  부호가 반대여서, 트랙 다양성이 현재 병목이라는 증거가 없다. 위 지각 문제를 먼저 분리해야 한다.
+- **보상 항을 추가하지 않았다.** 충돌 -150에 속도당 -20을 이미 물리는데도 어려운 맵에서 14 coll/km이므로,
+  계수가 아니라 원인 행동까지 gradient가 도달하지 않는 것이 문제다. proximity의 척도 오류만 고쳤다.
+- **`--teacher-grip` 기본값을 바꾸지 않았다.** `grip_probe` 측정 없이 바꾸면 teacher가 저마찰 차량을
+  과속시켜 수집 데이터를 망칠 수 있다. 측정 후에 정할 값이다.
+
+## 2026-09-08 teacher가 따라갈 수 없는 raceline
+
+새로 추가한 per-track 로깅이 학습 중에 잡아낸 것이다. Teacher는 112트랙 학습 셋 전체 평균
+0.18 coll/km인데, 최악 두 트랙이 12.13(`real:blackbox2021_3~rev`)과 5.54(`gen:hallway:1100~rev`)였다.
+이전 집계는 평균만 보고했으므로 이 두 트랙은 보이지 않았다.
+
+원인은 raceline이 **차량이 물리적으로 돌 수 없는 곡률을 요구**하는 것이었다. 차량 최소 회전반경은
+전타(s_max = 0.4189 rad, wheelbase 0.3302 m) 기준 **0.742 m**다.
+
+| 트랙 | Rmin | 주행 불가 구간 | 라인 길이 |
+|---|---:|---:|---|
+| `gen:hallway:1100` | 2.82 m | 0 | 35.0 m |
+| `gen:hallway:1100~rev` | **0.27 m** | **7.70 m** (랩의 19 %) | 39.8 m (+14 %) |
+| `real:blackbox2021_3` | 1.40 m | 0 | 87.5 m |
+| `real:blackbox2021_3~rev` | **0.45 m** | **1.67 m** | 95.7 m (+9.4 %) |
+
+118개 카탈로그 트랙 중 이 2개뿐이고, 둘 다 `~rev` 변형이다. 다만 방향 자체가 원인은 아니다:
+같은 트랙의 `~mir~rev`(역시 역방향)는 정상이고, 다른 트랙의 `~rev`는 정방향과 라인 길이가 0.3 %
+이내로 일치한다. min-curvature 해가 특정 초기 파라미터화에서 나쁜 국소해로 수렴하는 문제다.
+`gen:hallway:1100~rev`는 렌더링하면 라인이 코너를 깎지 않고 **바깥 벽을 직각으로 따라간다**.
+
+`min_curvature_raceline`의 `kappa_max`는 행 가중치를 키우는 **soft cap**이라 실현가능성을 보장하지
+않는다. 해결: 최적화 후 `_enforce_turn_radius`로 곡률 상한을 만족할 때까지 Laplacian 평활과 경계
+밀어내기를 번갈아 적용하고, 그 중 가장 평탄한 후보를 채택한다.
+
+| 트랙 | 수정 전 | 수정 후 |
+|---|---|---|
+| `gen:hallway:1100~rev` | Rmin 0.27 m, 불가 7.70 m, L 39.8 | Rmin **1.06 m**, 불가 **0 m**, L **35.4** |
+| `real:blackbox2021_3~rev` | Rmin 0.45 m, 불가 1.67 m, L 95.7 | Rmin **1.00 m**, 불가 **0 m**, L **93.0** |
+
+이미 실현가능하던 라인은 변하지 않는다(`gen:hallway:1100` 35.0/2.82, `blackbox2021_3` 87.5/1.40,
+`blackbox2022_3` 101.4/1.67, `korea` 46.3/2.46 모두 동일). 회귀 테스트는
+`tests/test_raceline_feasibility.py`.
+
+**적용 범위 주의.** 학생의 최악 트랙 5개는 전부 `blackbox2021_3` 변형이었지만 그중 `~mir`,
+`~mir~rev`는 라인이 정상이었다. 따라서 이 수정은 teacher 라벨 품질 결함을 제거하지만
+`blackbox2021_3` 계열이 학생에게 어려운 이유 전체를 설명하지는 않는다. 진행 중인 A/B 학습은
+수정 이전의 캐시된 raceline을 사용하므로 두 런 사이의 비교는 유효하다.

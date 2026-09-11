@@ -28,11 +28,15 @@ def pacejka(alpha: torch.Tensor, B: torch.Tensor, C: torch.Tensor, E: torch.Tens
     return torch.sin(C * torch.atan(Ba - E * (Ba - torch.atan(Ba))))
 
 
+FRICTION_MARGIN = 1.1     # slack for load transfer and one-substep transients
+
+
 def step_dynamics(state: torch.Tensor, steer_target: torch.Tensor, a_cmd: torch.Tensor,
                   ax_prev: torch.Tensor, P: Dict[str, torch.Tensor], servo_tau: torch.Tensor,
                   dt: float):
     """One physics substep. All per-env params in P are (B,) tensors.
-    Returns (new_state, ax, ay) with body-frame accelerations for IMU emulation."""
+    Returns (new_state, ax, ay) with body-frame *specific forces* for IMU emulation, load
+    transfer and the pitch/roll model -- not the state derivatives (see ax_f below)."""
     x, y, yaw = state[:, IX], state[:, IY], state[:, IYAW]
     vx, vy, r, delta = state[:, IVX], state[:, IVY], state[:, IR], state[:, ISTEER]
     m, Iz, lf, lr, h, mu = P["m"], P["Iz"], P["lf"], P["lr"], P["h"], P["mu"]
@@ -94,9 +98,32 @@ def step_dynamics(state: torch.Tensor, steer_target: torch.Tensor, a_cmd: torch.
     ax = w * ax_dyn + (1 - w) * ax_kin
     vydot = w * ay_dyn + (1 - w) * vydot_kin
     rdot = w * rdot_dyn + (1 - w) * rdot_kin
+
+    # ---- friction bound on the blended result ----
+    # The kinematic branch is a constraint, not a force model, and its relaxation term is pure
+    # numerics: caught mid-slide at vx 1.5 m/s with vy -5.2, relax*(vy_kin - vy) alone asks for
+    # 103 m/s^2 of lateral acceleration. Measured, that put 53 m/s^2 (5.5 g) on the emulated
+    # accelerometer where the floor's limit is 8.8, and it wiped vy from -6.3 to -0.4 in 0.4 s --
+    # so a simulated spin recovered on its own while the real car (map16x07 SPIN-AT-LIMIT) stayed
+    # out of shape for four seconds. Whichever branch produced them, four tyre contact patches
+    # carrying mg between them cannot pull more than mu*g, so bound the blended derivatives by it.
+    # The dynamic branch is already inside this circle; the clamp only bites where the model lies.
+    lim = mu * G * FRICTION_MARGIN
+    fx_t, fy_t = ax - vy * r, vydot + vx * r                # provisional specific forces
+    scale = (lim / torch.sqrt(fx_t * fx_t + fy_t * fy_t).clamp_min(1e-6)).clamp(max=1.0)
+    ax = fx_t * scale + vy * r
+    vydot = fy_t * scale - vx * r
+    # same argument about the yaw moment: |Mz| <= mu*m*g*max(lf, lr)
+    rdot_lim = mu * m * G * torch.maximum(lf, lr) / Iz * FRICTION_MARGIN
+    rdot = rdot.clamp(-rdot_lim, rdot_lim)
     vx_n = (vx + ax * dt).clamp(P["v_min"], P["v_max"])
     vy_n = vy + vydot * dt
     r_n = r + rdot * dt
+    # What the IMU (and the load transfer / pitch model) sees is specific force, not the state
+    # derivative: in the rotating body frame f_x = vx_dot - vy*r and f_y = vy_dot + vx*r. Returning
+    # vx_dot as "ax" left the longitudinal channel missing -vy*r, which is ~1.5 m/s^2 at 0.5 m/s of
+    # sideslip and 3 rad/s of yaw -- exactly the cornering states the policy reads to infer grip.
+    ax_f = ax - vy * r_n             # body longitudinal specific force
     ay = vydot + vx * r_n            # body lateral acceleration as an IMU would measure it
 
     # ---- pose integration (use updated body velocity, semi-implicit) ----
@@ -106,7 +133,7 @@ def step_dynamics(state: torch.Tensor, steer_target: torch.Tensor, a_cmd: torch.
     yaw_n = wrap_angle(yaw + r_n * dt)
 
     new = torch.stack([x_n, y_n, yaw_n, vx_n, vy_n, r_n, delta], 1)
-    return new, ax, ay
+    return new, ax_f, ay
 
 
 def wrap_angle(a: torch.Tensor) -> torch.Tensor:

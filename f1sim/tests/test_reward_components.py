@@ -4,7 +4,7 @@ from f1sim import Config, Track
 from f1sim.gym_env import EnvConfig, F1VecEnv, REWARD_COMPONENT_KEYS
 
 
-def test_reward_components_sum_to_reward_and_proximity_is_per_meter() -> None:
+def test_reward_components_sum_to_reward_and_proximity_is_per_meter_driven() -> None:
     cfg = Config()
     cfg.sim.compile_mode = "none"
     cfg.lidar.n_beams = 36
@@ -16,8 +16,10 @@ def test_reward_components_sum_to_reward_and_proximity_is_per_meter() -> None:
     components = info["reward_components"]
     assert tuple(components) == REWARD_COMPONENT_KEYS
     torch.testing.assert_close(sum(components.values()), reward)
-    progress = info["progress"].abs()
-    assert bool((components["proximity"].abs() <= progress * 1.5 + 1e-6).all())
+    # per metre *driven*: scaled by |v| dt, not by centerline progress, so a car that stops next to
+    # a wall still pays and one that reverses away from it is not charged for progress it undid.
+    travelled = env.sim.state[:, 3].abs() * env.sim.control_dt
+    assert bool((components["proximity"].abs() <= travelled * 1.5 + 1e-6).all())
 
 
 def test_plan_clearance_penalizes_a_reference_outside_the_track(monkeypatch) -> None:

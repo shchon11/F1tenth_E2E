@@ -38,6 +38,15 @@ def yaw_to_quat(yaw: float) -> Quaternion:
     q = Quaternion(); q.z = math.sin(yaw / 2); q.w = math.cos(yaw / 2); return q
 
 
+def rpy_to_quat(r: float, p: float, y: float) -> Quaternion:
+    cr, sr, cp, sp, cy, sy = (math.cos(r / 2), math.sin(r / 2), math.cos(p / 2),
+                              math.sin(p / 2), math.cos(y / 2), math.sin(y / 2))
+    q = Quaternion()
+    q.w = cr * cp * cy + sr * sp * sy; q.x = sr * cp * cy - cr * sp * sy
+    q.y = cr * sp * cy + sr * cp * sy; q.z = cr * cp * sy - sr * sp * cy
+    return q
+
+
 def quat_to_yaw(q) -> float:
     return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
 
@@ -134,38 +143,64 @@ class BridgeNode(Node):
         stamp = now.to_msg()
         st = r.state[0].cpu().numpy()
         od = r.odom[0].cpu().numpy()
-        self.publish_scan(r.scan[0].cpu().numpy(), stamp)
+        self.publish_scan(r.scan[0].cpu().numpy(), now)
         self.publish_odom(od, st, stamp)
         self.pub_coll.publish(Bool(data=bool(r.collision[0])))
         if self.pub_imu is not None and r.imu is not None and r.imu.shape[1] > 0:
-            self.publish_imu(r.imu[0].cpu().numpy(), r.imu_att[0].cpu().numpy(), now)
+            self.publish_imu(r.imu[0].cpu().numpy(), r.imu_att[0].cpu().numpy(), now,
+                             r.imu_offsets.cpu().numpy())
         if bool(r.collision[0]) and self.auto_reset:
             self.do_reset()
 
-    def publish_imu(self, samples: np.ndarray, att: np.ndarray, now):
-        """samples (K, 6): gyro xyz, accel xyz at 1/imu_rate spacing ending at `now`."""
+    def publish_imu(self, samples: np.ndarray, att: np.ndarray, now, offsets: np.ndarray):
+        """samples (K, 6): gyro xyz, accel xyz. offsets (K,): seconds before `now` each was taken.
+
+        The IMU runs on its own clock, so the last sample of a control step is generally NOT at the
+        step boundary and the samples are not a fixed count apart -- a 50 Hz sensor on a 40 Hz loop
+        emits 1, 1, 1, 2 per step. Deriving the stamps from an assumed spacing ending at `now` put
+        every sample but the occasional last one at a time it was not taken; the simulator now
+        reports the real offsets and they are used verbatim.
+        """
         from rclpy.duration import Duration
-        K = samples.shape[0]; ts = 1.0 / self.cfg.imu.imu_rate
+        K = samples.shape[0]
         for k in range(K):
             m = Imu(); m.header.frame_id = "imu"
-            m.header.stamp = (now - Duration(seconds=(K - 1 - k) * ts)).to_msg()
+            m.header.stamp = (now - Duration(seconds=float(offsets[k]))).to_msg()
             g, a = samples[k, :3], samples[k, 3:]
             m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z = float(g[0]), float(g[1]), float(g[2])
             m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z = float(a[0]), float(a[1]), float(a[2])
-            m.orientation_covariance[0] = -1.0                      # raw: no orientation
+            # `r.imu_att` is one attitude estimate for the whole control step, measured at its end,
+            # so only the LAST sample has an orientation that belongs to it. Publishing it on the
+            # earlier samples would copy a future attitude backwards; publishing it on none would
+            # leave a consumer subscribing only to this topic without any quaternion at all.
+            if k == K - 1:
+                m.orientation = rpy_to_quat(float(att[0]), float(att[1]), float(att[2]))
+            else:
+                m.orientation_covariance[0] = -1.0                  # not measured at this sample
             self.pub_imu_raw.publish(m)
-        m = Imu(); m.header.frame_id = "imu"; m.header.stamp = now.to_msg()
+        # the summary message carries the LATEST sample, so it is stamped at that sample's time
+        m = Imu(); m.header.frame_id = "imu"
+        m.header.stamp = (now - Duration(seconds=float(offsets[-1]))).to_msg()
         g, a = samples[-1, :3], samples[-1, 3:]
         m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z = float(g[0]), float(g[1]), float(g[2])
         m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z = float(a[0]), float(a[1]), float(a[2])
-        r, p, y = float(att[0]), float(att[1]), float(att[2])
-        cr, sr, cp, sp, cy, sy = math.cos(r / 2), math.sin(r / 2), math.cos(p / 2), math.sin(p / 2), math.cos(y / 2), math.sin(y / 2)
-        m.orientation.w = cr * cp * cy + sr * sp * sy; m.orientation.x = sr * cp * cy - cr * sp * sy
-        m.orientation.y = cr * sp * cy + sr * cp * sy; m.orientation.z = cr * cp * sy - sr * sp * cy
+        m.orientation = rpy_to_quat(float(att[0]), float(att[1]), float(att[2]))
         self.pub_imu.publish(m)
 
-    def publish_scan(self, ranges: np.ndarray, stamp):
+    def publish_scan(self, ranges: np.ndarray, now):
+        """LaserScan.header.stamp is the acquisition time of the FIRST ray, per the ROS 2
+        message definition, not of the scan's completion. `now` is the end of the control step,
+        which is when the LAST ray was traced (Lidar.scan anchors time_frac at 0 for the final
+        beam), so the header goes back by one full sweep.
+
+        The convention a particular driver actually used when the raw bags were recorded is a
+        separate, unvalidated question -- this only makes what we publish self-consistent with the
+        metadata we publish beside it.
+        """
         m = self.sim.scan_meta()
+        from rclpy.duration import Duration
+        sweep = m["time_increment"] * (len(ranges) - 1)
+        stamp = (now - Duration(seconds=sweep)).to_msg()
         msg = LaserScan()
         msg.header.stamp = stamp; msg.header.frame_id = self.laser_frame
         msg.angle_min, msg.angle_max, msg.angle_increment = m["angle_min"], m["angle_max"], m["angle_increment"]

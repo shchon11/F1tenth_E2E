@@ -8,11 +8,39 @@ from f1sim.raceline import Raceline
 from f1sim.teacher import RacelineTeacher
 
 
-def test_training_set_contains_distinct_procedural_geometries() -> None:
-    assert len(TRAIN_TRACKS) == 112
-    assert sum(name.startswith("gen:competition:") for name in TRAIN_TRACKS) == 32
-    assert sum(name.startswith("gen:hallway:") for name in TRAIN_TRACKS) == 16
-    assert sum(name.startswith("gen:circuit:") for name in TRAIN_TRACKS) == 8
+def test_training_set_covers_the_diversity_axes() -> None:
+    """The set has to cover the axes the real venues occupy, not hit a particular size.
+
+    Counting tracks says nothing: the previous set was 112 names of which 32 came from one
+    generator whose own docstring says more seeds add little new geometry, while the layout every
+    real venue actually has -- a lap that folds back beside itself behind one hose -- appeared in
+    none of them. Measured, procedural tracks never came within 5.8 m of themselves against 2.4-3.3 m
+    for the real ones, held their width to a 1.05 pinch ratio against 1.35-1.98, and carried no
+    obstacle on the racing line at all.
+
+    So this asserts coverage of each axis, and asserts nothing about the total.
+    """
+    n = len(TRAIN_TRACKS)
+    def share(pred):
+        return sum(bool(pred(t)) for t in TRAIN_TRACKS) / n
+
+    # Fold-back -- a lap running beside itself behind one hose -- is the axis the real venues have
+    # and no generator did. `serpentine` was written for it and is held back until the centerline
+    # projection can carry procedural folds (see common.GEN_TRAIN), so the exposure comes from the
+    # real maps that fold: icra2022 at 2.48 m, korea_2026 at 2.36 m.
+    assert any("icra2022" in t for t in TRAIN_TRACKS)
+    assert share(lambda t: "+pinch" in t) > 0.05                     # the lane closes down
+    assert share(lambda t: t.startswith("gen:control:")) > 0.05      # hairpins, chicanes, width
+    assert share(lambda t: "+rlobs" in t) > 0.10                     # obstacles ON the racing line
+    assert share(lambda t: "obs" in t) > 0.20                        # obstacles of either kind
+    assert share(lambda t: t.startswith("real:")) > 0.25             # real venue geometry
+    # no single generator may dominate the way gen:competition used to
+    for fam in ("gen:competition:", "gen:hallway:", "gen:circuit:", "gen:control:"):
+        assert share(lambda t, f=fam: t.startswith(f)) < 0.30, fam
+    # hallway scans are near-indistinguishable between far-apart places (aliasing 0.087 against
+    # 0.28-0.58 elsewhere): keep it present but small
+    assert share(lambda t: t.startswith("gen:hallway:")) < 0.10
+    assert len(set(TRAIN_TRACKS)) == n                               # no duplicates
 
 
 def test_duplicated_track_matches_single_track():

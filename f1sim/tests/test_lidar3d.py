@@ -38,8 +38,12 @@ def test_pitch_hits_floor_at_analytic_range(device):
     mid = sim.cfg.lidar.n_beams // 2
     assert typ[0, mid] == 3
     assert abs(r[0, mid].item() - 0.15 / math.tan(pitch)) < 1e-3   # sensor height drops to 0.15*cos(pitch)
-    # beams at the sides are horizontal -> no floor, nothing within range
-    assert typ[0, 0] == 0 and not torch.isfinite(sim.lidar.scan(torch.zeros(1, 3, device=sim.device), None, sim.P, False, True, att=att)[0][0, 0])
+    # beams at the sides are horizontal -> no floor, nothing within range. The delivered scan reads
+    # the driver's no-return sentinel there, not inf: urg_node on this car emits 0xFFFF mm on every
+    # recording checked, and a policy trained against inf would meet a number it had never seen.
+    assert typ[0, 0] == 0
+    noisy = sim.lidar.scan(torch.zeros(1, 3, device=sim.device), None, sim.P, False, True, att=att)[0]
+    assert abs(noisy[0, 0].item() - sim.cfg.lidar.dropout_value) < 1e-3
 
 
 @pytest.mark.parametrize("device", DEVICES)

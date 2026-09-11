@@ -33,6 +33,8 @@ class StepResult:
     odom: torch.Tensor          # (B, 5) VESC odom: x, y, yaw, v, yaw_rate (drifting)
     state: torch.Tensor         # (B, 7) ground truth: x, y, yaw, vx, vy, yaw_rate, steer
     imu: Optional[torch.Tensor] # (B, K, 6) IMU samples this step: gyro xyz [rad/s], accel xyz [m/s^2] (None if disabled)
+                                # K varies between steps: the sensor runs on its own clock, so a
+                                # 50 Hz IMU on a 40 Hz loop delivers 1, 1, 1, 2, ... per step
     imu_att: Optional[torch.Tensor]  # (B, 3) VESC attitude estimate roll, pitch, yaw [rad] (drifting yaw)
     collision: torch.Tensor     # (B,) bool
     progress: torch.Tensor      # (B,) meters advanced along centerline this step (signed)
@@ -42,6 +44,10 @@ class StepResult:
     wall_dist: torch.Tensor     # (B,) min distance from footprint corners to wall
     t: float                    # sim time [s]
     car_collision: Optional[torch.Tensor] = None   # (B,) bool: contact with another car this step (races)
+    imu_offsets: Optional[torch.Tensor] = None     # (K,) seconds before the END of this control step
+                                                   # that each IMU sample was taken. Timestamp a
+                                                   # sample as `step_end - imu_offsets[k]`; the last
+                                                   # one is NOT generally at the step boundary.
 
 
 class Simulator:
@@ -95,13 +101,31 @@ class Simulator:
         self.att = torch.zeros(num_envs, 4, device=self.device)          # roll, roll_rate, pitch, pitch_rate
         self.att_prev = torch.zeros(num_envs, 2, device=self.device)
         self.imu_state = imu_model.imu_state_init(num_envs, self.device)
-        self.imu_idx = imu_model.sample_indices(self.cfg.imu.imu_rate, self.control_dt, self.dt, self.substeps)
+        # The IMU runs on its own clock. 50 Hz against a 40 Hz control loop does not divide, so the
+        # number of samples in a control step cycles 1, 1, 1, 2 rather than being constant; the
+        # schedule below is that cycle, and `imu_offsets_sched` says how long before each step's end
+        # every sample falls so consumers can timestamp them. `imu_ts` is the sensor's own period,
+        # which is now what the samples are actually spaced by -- `sample()` uses it for the gyro
+        # bias random walk (sqrt(ts)), for integrating the gyro into the attitude estimate and for
+        # the complementary-filter gain (ts / tau).
+        self.imu_schedule, self.imu_offsets_sched, self.imu_period = imu_model.sample_schedule(
+            self.cfg.imu.imu_rate, self.control_dt, self.dt, self.substeps)
+        self._imu_phase = 0
         self.imu_ts = 1.0 / self.cfg.imu.imu_rate
+        self._imu_offsets = [torch.tensor(o, device=self.device) for o in self.imu_offsets_sched]
         self.cmd = torch.zeros(num_envs, 2, device=self.device)        # last commanded (steer, speed)
         self.odom = VescOdom(num_envs, self.device)
         self.s = torch.zeros(num_envs, device=self.device)
+        self.cl_idx = torch.zeros(num_envs, dtype=torch.long, device=self.device)   # last centerline index:
+                                                                                    # anchors the windowed
+                                                                                    # projection (see
+                                                                                    # Track.project)
         self.lap = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.collided = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: Prop contact seen inside a substep, latched until `step` reads it. A box can be entered
+        #: and pushed back out between two control steps, and a collision that the physics resolved
+        #: but nothing reported is a collision the caller never learns about.
+        self.prop_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self.steps = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.t = 0.0
         # footprint corner offsets in body frame relative to CoG
@@ -124,6 +148,21 @@ class Simulator:
         self._resample_car_dims(ar)
         self.reset()
 
+    @property
+    def imu_idx(self):
+        """Substep indices this control step emits at (the current phase of the sample schedule)."""
+        return self.imu_schedule[self._imu_phase]
+
+    @property
+    def imu_rate_delivered(self) -> float:
+        """[Hz] the rate IMU samples come out at, averaged over one schedule cycle.
+
+        Equal to `cfg.imu.imu_rate` by construction now that the schedule is phase-exact; kept as
+        the thing consumers should read, so a future rate that cannot be scheduled exactly is
+        visible rather than assumed.
+        """
+        return sum(len(idx) for idx in self.imu_schedule) / (self.imu_period * self.control_dt)
+
     def _resample_car_dims(self, ids: torch.Tensor):
         n = ids.numel()
         u = lambda lo, hi: lo + (hi - lo) * torch.rand(n, device=self.device, generator=self.gen)
@@ -138,7 +177,7 @@ class Simulator:
     # show up when the plane tilts; the electronics deck and the rule-mandated rear box are what the
     # car behind normally gets returns from.
     CAR_PARTS = (
-        (0.00, 0.000, 0.36, 0.20, 0.03, 0.12, 0.15),     # chassis plate, battery, cabling (open frame)
+        (0.00, 0.000, 0.36, 0.20, 0.03, 0.05, 0.15),     # chassis plate, battery, cabling (open frame)  [EXPERIMENT z_hi 0.05]
         (0.10, 0.000, 0.18, 0.14, 0.12, 0.24, 0.10),     # electronics deck + LiDAR tower
         (0.165, 0.120, 0.11, 0.045, 0.00, 0.11, 0.35),   # wheels (rubber: weak grazing returns)
         (0.165, -0.120, 0.11, 0.045, 0.00, 0.11, 0.35),
@@ -153,7 +192,9 @@ class Simulator:
         yaw = st[:, :, 2]; c, s_ = torch.cos(yaw), torch.sin(yaw)
         scale = self.car_dims[o][..., 0] / 0.50                           # bigger / smaller builds
         sets = []
-        for (ox, oy, lx, ly, zlo, zhi, poro) in self.CAR_PARTS:
+        if getattr(self.cfg.lidar, "car_model", "mesh") == "mesh":
+            sets.append(("mesh", st[:, :, :3].contiguous(), scale, self.car_porosity))
+        for (ox, oy, lx, ly, zlo, zhi, poro) in ([] if sets else self.CAR_PARTS):
             ox_, oy_ = ox * scale, oy * scale
             pos = torch.stack([st[:, :, 0] + ox_ * c - oy_ * s_, st[:, :, 1] + ox_ * s_ + oy_ * c, yaw], -1)
             dims = torch.stack([lx * scale, ly * scale, torch.full_like(scale, zhi)], -1)
@@ -215,10 +256,49 @@ class Simulator:
         pose = torch.cat([xy, yaw[:, None]], 1)
         # reject poses too close to walls by pulling them back to the centerline
         bad = self.track.sample_edt(xy, tid) < (self.cfg.vehicle.width if min_clearance is None else min_clearance)
+        if getattr(self.track, "has_props", False):
+            # Props are not in the EDT, so the wall test above cannot see them and a car would spawn
+            # standing inside a crate. Reject on the same geometry the contact test uses; if the
+            # centerline fallback is itself blocked, nudge along the lane until it is not.
+            bad = bad | self._spawn_in_prop(pose, tid)
+            if bad.any():
+                xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
+                pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
+                still = bad & self._spawn_in_prop(pose, tid)   # the centerline point may be blocked too
+                # Walk a full lap in even steps rather than a few short nudges. Stopping early and
+                # returning the pose anyway would spawn the car inside a crate and call it a spawn;
+                # if a whole lap has nowhere to stand, that is a broken map and it says so.
+                L = self.track.length[tid].clamp_min(1e-6)
+                for j in range(1, 33):
+                    idx = torch.nonzero(still, as_tuple=True)[0]
+                    if not idx.numel():
+                        break
+                    s_alt = (s[idx] + L[idx] * (j / 33.0)) % L[idx]
+                    xy_a, yaw_a = self.track.pose_at_s(s_alt, tid[idx])
+                    p_alt = torch.cat([xy_a, yaw_a[:, None]], 1)
+                    ok = ~self._spawn_in_prop(p_alt, tid[idx])
+                    pose[idx[ok]] = p_alt[ok]
+                    still[idx[ok]] = False
+                if bool(still.any()):
+                    raise RuntimeError(
+                        f"{int(still.sum())} env(s) have no spawn pose clear of the placed props "
+                        f"anywhere on their lap; the track's props block the centerline")
+            return pose
         if bad.any():
             xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
             pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
         return pose
+
+    def _spawn_in_prop(self, pose: torch.Tensor, tid: torch.Tensor) -> torch.Tensor:
+        """Whether each candidate spawn pose has its footprint overlapping a prop."""
+        from .prop_math import prism_contacts
+        c, s_ = torch.cos(pose[:, 2]), torch.sin(pose[:, 2])
+        R = torch.stack([torch.stack([c, -s_], -1), torch.stack([s_, c], -1)], -2)
+        pts = torch.einsum("bij,kj->bki", R, self.corners) + pose[:, None, :2]
+        poses, pn, pd, z_lo, z_hi = self.track.props_for(tid)
+        h = self.car_dims[:pose.shape[0], 2] if self.car_dims.shape[0] >= pose.shape[0] else 0.25
+        depth, _, _ = prism_contacts(pts[:, [0, 1, 3, 2]], poses, pn, pd, z_lo, z_hi, h)
+        return depth > 0
 
     def reset(self, env_ids: Optional[torch.Tensor] = None, poses: Optional[torch.Tensor] = None,
               speed: Optional[torch.Tensor] = None, track_ids: Optional[torch.Tensor] = None):
@@ -250,25 +330,51 @@ class Simulator:
         self.cmd_hist[env_ids] = self.cmd[env_ids][:, None, :]
         self.odom.reset(env_ids, poses)
         if self.track.cl is not None:
-            s, _, _ = self.track.project(poses[:, :2], self.tid[env_ids])
-            self.s[env_ids] = s
+            s, _, i0 = self.track.project(poses[:, :2], self.tid[env_ids])   # global: no history yet
+            self.s[env_ids] = s; self.cl_idx[env_ids] = i0
         self.lap[env_ids] = 0
         self.collided[env_ids] = False
         self.car_collision[env_ids] = False
+        self.prop_touched[env_ids] = False
         self.steps[env_ids] = 0
         self._resample_car_dims(env_ids)
 
     # ------------------------------------------------------------------ warm-up
     def warmup(self):
-        """Run one throw-away step to trigger torch.compile / Triton JIT (10-20 s on first use),
-        then restore the state. Call this before opening a window or starting a real-time loop."""
+        """Run throw-away steps to trigger torch.compile / Triton JIT (10-20 s on first use), then
+        restore the state. Call this before opening a window or starting a real-time loop.
+
+        One step per IMU schedule phase, because each phase emits a different number of samples at
+        different substeps and so compiles to its own graph -- warming only the first would leave
+        the rest to compile inside the real-time loop.
+
+        Everything the steps touch has to be put back, including the sensor phase: leaving it
+        advanced would slide the IMU's sample grid against `t` for the rest of the run.
+        """
         keep = {k: getattr(self, k).clone() for k in ("state", "ax", "ay", "att", "att_prev", "pose_prev", "cmd",
-                                                     "cmd_hist", "s", "lap", "collided", "steps", "imu_state")}
-        odom, t = self.odom.state.clone(), self.t
-        self.step(torch.zeros(self.B, 2, device=self.device))
+                                                     "cmd_hist", "s", "lap", "collided", "steps", "imu_state",
+                                                     "cl_idx", "car_collision", "prop_touched")}
+        odom, t, phase = self.odom.state.clone(), self.t, self._imu_phase
+        # The throw-away steps consume randomness from two places, not one: `self.gen` (spawn draws,
+        # command-delay jitter) and the GLOBAL torch generator, which is what imu.sample's
+        # torch.randn and the lidar/odom noise's *_like calls use. Both are rewound, so a seeded run
+        # does not depend on whether warmup was called.
+        #
+        # Verified on CPU by tests/test_sim_audit.py. The CUDA global stream is restored the same
+        # way but is NOT verified here -- no seeded-equivalence claim is made for CUDA until the
+        # cached-CUDA run checks it.
+        rng_local = self.gen.get_state()
+        rng_cpu = torch.get_rng_state()
+        rng_cuda = torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None
+        for _ in range(self.imu_period):
+            self.step(torch.zeros(self.B, 2, device=self.device))
         for k, v in keep.items():
             getattr(self, k).copy_(v)
-        self.odom.state.copy_(odom); self.t = t
+        self.odom.state.copy_(odom); self.t = t; self._imu_phase = phase
+        self.gen.set_state(rng_local)
+        torch.set_rng_state(rng_cpu)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 
@@ -288,8 +394,11 @@ class Simulator:
 
         self.pose_prev = self.state[:, :3].clone()
         self.att_prev = self.att[:, [0, 2]].clone()
+        # the sample layout belongs to this step's phase; capture it before the phase advances
+        imu_offsets = self._imu_offsets[self._imu_phase]
         state, ax, ay, att, imu_state, imu_samples = self._roll(self.state, self.ax, self.att, self.imu_state,
                                                                 self.cmd_hist, delay_s, P)
+        self._imu_phase = (self._imu_phase + 1) % self.imu_period
         if self.cfg.sim.compile_mode == "reduce-overhead":      # CUDA graphs reuse their output buffers: keep copies
             state, ax, ay, att, imu_state, imu_samples = (t.clone() for t in (state, ax, ay, att, imu_state, imu_samples))
         state = torch.where(frozen[:, None], self.state, state)
@@ -304,9 +413,18 @@ class Simulator:
         if self.M > 1:
             self.car_collision = self._car_contacts(state)
             cars = self._car_boxes(state)
-        wall_dist, hit, odom_state, s, ds, lateral, lap = (t.clone() for t in self._post(state, self.odom.state, self.cmd, self.s, self.lap, self.tid, P))
+        wall_dist, hit, odom_state, s, ds, lateral, lap, cl_idx = (
+            t.clone() for t in self._post(state, self.odom.state, self.cmd, self.s, self.lap, self.tid, P, self.cl_idx))
+        self.cl_idx = cl_idx
         if self.M > 1:
             hit = hit | self.car_collision
+        if getattr(self.track, "has_props", False):
+            # `_post` reads the occupancy EDT and props are not in it, so without this a car drives
+            # through a box: `terminate_on_collision` never fires, and with soft walls the contact is
+            # resolved by `_resolve_wall_contact` yet never reported. `prop_touched` also carries the
+            # substeps, because a box can be entered and pushed back out inside one control step.
+            hit = hit | self.prop_touched | (self._prop_contact(state)[0] > 0)
+        self.prop_touched.zero_()          # in place: `warmup` restores by copy_ into this tensor
         self.collided = self.collided | hit
         self.odom.state = odom_state; self.s = s; self.lap = lap
         odom = odom_state
@@ -319,7 +437,8 @@ class Simulator:
         imu_att = imu_state[:, 18:21].clone() if self.cfg.imu.enabled else None
         return StepResult(scan, scan_true, scan_type, att[:, [0, 2]].clone(), odom, state, imu, imu_att,
                           self.collided.clone(), ds, s, lateral, self.lap.clone(), wall_dist, self.t,
-                          self.car_collision.clone() if self.M > 1 else None)
+                          self.car_collision.clone() if self.M > 1 else None,
+                          imu_offsets if self.cfg.imu.enabled else None)
 
     def _guarded(self, compiled, attr, eager):
         """Compiled callable that falls back to eager for good if inductor/Triton fails at first use."""
@@ -331,13 +450,13 @@ class Simulator:
                 return eager(*args, **kw)
         return f
 
-    def _post_roll(self, state, odom_state, cmd, s_prev, lap_prev, tid, P):
+    def _post_roll(self, state, odom_state, cmd, s_prev, lap_prev, tid, P, cl_idx):
         """Footprint clearance, VESC odometry and lane progress for one control step (compiled)."""
         wall_dist = self._footprint_clearance(state)
         hit = wall_dist <= 0.0
         odom_state = self.odom.update_pure(odom_state, state[:, dyn.IVX], cmd[:, 0], P, self.control_dt)
         if self.track.cl is not None:
-            s, lateral, _ = self.track.project(state[:, :2], tid)
+            s, lateral, cl_idx = self.track.project(state[:, :2], tid, prev_idx=cl_idx)
             ds = s - s_prev
             L = self.track.length[tid]
             ds = torch.where(ds > L / 2, ds - L, torch.where(ds < -L / 2, ds + L, ds))
@@ -345,7 +464,7 @@ class Simulator:
             lap = lap_prev + ((new_s >= L) & (ds > 0)).long() - ((new_s < 0) & (ds < 0)).long()
         else:
             s = torch.zeros_like(s_prev); ds = s; lateral = s; lap = lap_prev
-        return wall_dist, hit, odom_state, s, ds, lateral, lap
+        return wall_dist, hit, odom_state, s, ds, lateral, lap, cl_idx
 
     def _roll_physics(self, state, ax, att, imu_state, cmd_hist, delay_s, P):
         """All substeps of one control period (compiled on CUDA)."""
@@ -399,12 +518,51 @@ class Simulator:
         # sample_edt is distance to wall cell center; subtract half a cell for the surface
         return d.min(1).values - 0.5 * self.track.t_res[self.tid]
 
+    def _prop_contact(self, state: torch.Tensor):
+        """Penetration depth and outward normal against the placed props: (pen (B,), n (B,2)).
+
+        Deliberately not routed through `_footprint_clearance`. That test samples the EDT at the
+        car's four corners, which cannot see an obstacle that fits between them: a 5 cm marker post
+        standing under the middle of the car leaves all four corners clear, so the car drives through
+        it. SAT over both polygons' edge normals finds containment as readily as edge crossing.
+
+        The normal has to come from the contacted prop as well. `edt_gradient` reads the occupancy
+        grid, and props are not in the grid -- it would return the direction away from the nearest
+        *wall*, which is unrelated to the box the car is actually touching."""
+        from .prop_math import prism_contacts
+        tr = self.track
+        poses, pn, pd, z_lo, z_hi = tr.props_for(self.tid)
+        # `self.corners` is [front-left, front-right, rear-left, rear-right] -- a bow tie, not a
+        # perimeter. SAT takes edge normals from consecutive pairs, so feeding it that order hands it
+        # the rectangle's two diagonals as separating axes and misses the axes that matter. [0,1,3,2]
+        # walks the perimeter. The stored order is left as it is because `_footprint_clearance` and
+        # `_car_boxes` index it, and reordering it there would be a change to code that is not mine.
+        # `[:, [0, 1, 3, 2]]` would say the same thing, but advanced indexing with a Python list
+        # builds the index tensor from host memory, and that host-to-device copy invalidates a CUDA
+        # graph capture (`cudaErrorStreamCaptureInvalidated`). Same four corners, same perimeter
+        # order, no host data.
+        fl, fr, rl, rr = self._footprint_corners(state).unbind(1)
+        corners = torch.stack((fl, fr, rr, rl), 1)
+        # Body height, not CoG height: `vehicle.h` is where the mass sits (0.074 m) and doubling it
+        # is not a silhouette. `car_dims[:, 2]` is the height the LiDAR already uses for this car.
+        depth, normal, _ = prism_contacts(corners, poses, pn, pd, z_lo, z_hi, self.car_dims[:, 2])
+        return depth.clamp_min(0.0), normal
+
     def _resolve_wall_contact(self, state: torch.Tensor) -> torch.Tensor:
         """Soft wall: push CoG out along EDT gradient and kill the into-wall velocity component."""
         clr = self._footprint_clearance(state)
         pen = (-clr).clamp_min(0.0)
         touching = pen > 0
         n = self.track.edt_gradient(state[:, :2], self.tid)            # away from wall (world)
+        if getattr(self.track, "has_props", False):
+            # Whichever of wall or prop is deeper owns this step's normal. Blending two normals
+            # would push the car somewhere neither contact asks for.
+            pen_p, n_p = self._prop_contact(state)
+            self.prop_touched = self.prop_touched | (pen_p > 0)   # substeps, read once per step
+            prop_deeper = pen_p > pen
+            pen = torch.where(prop_deeper, pen_p, pen)
+            n = torch.where(prop_deeper[:, None], n_p.to(n.dtype), n)
+            touching = pen > 0
         yaw = state[:, dyn.IYAW]
         c, s = torch.cos(yaw), torch.sin(yaw)
         vwx = state[:, dyn.IVX] * c - state[:, dyn.IVY] * s
@@ -426,7 +584,21 @@ class Simulator:
 
     # ------------------------------------------------------------------ introspection
     def scan_meta(self) -> Dict[str, float]:
+        """Header fields for the scan this simulator actually produces.
+
+        The timing is derived from `control_dt`, not from `cfg.lidar.rate`, because that is what the
+        simulator does: `step` emits exactly one scan per control step, and the motion-distortion
+        interpolation in `Lidar.scan` spreads the beams over `pose - pose_prev`, which is one control
+        step. `cfg.lidar.rate` never reaches either. At the default 40 Hz LiDAR on a 40 Hz control
+        loop the two are identical (sweep 18.75 ms either way); they only diverge if someone
+        configures a LiDAR rate different from the control rate, and then the old expression
+        published a scan period and sweep the simulator was not running at.
+
+        The absolute phase of the sweep against a real driver's header convention is NOT validated
+        here -- only that the published duration matches the poses the beams were traced from.
+        """
         lp = self.cfg.lidar
+        sweep = (lp.fov / (2 * math.pi)) * self.control_dt          # what time_frac actually spans
         return dict(angle_min=-lp.fov / 2, angle_max=lp.fov / 2, angle_increment=self.lidar.angle_increment,
-                    range_min=lp.range_min, range_max=lp.range_max, scan_time=1.0 / lp.rate,
-                    time_increment=(lp.fov / (2 * math.pi)) / lp.rate / (lp.n_beams - 1))
+                    range_min=lp.range_min, range_max=lp.range_max, scan_time=self.control_dt,
+                    time_increment=sweep / (lp.n_beams - 1))

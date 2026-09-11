@@ -28,8 +28,11 @@ def main():
     out = a.out or os.path.splitext(a.ckpt)[0] + ".onnx"
     m = ActorOnly(model.actor).eval()
     scan, pro = torch.rand(1, k, N), torch.rand(1, P)
+    # dynamo=False: torch>=2.6 defaults to the dynamo exporter, which needs `onnxscript` and is not
+    # installed here. The TorchScript path handles both scan stems (GroupNorm, adaptive pooling included).
     torch.onnx.export(m, (scan, pro), out, input_names=["scan", "proprio"], output_names=["action"], opset_version=17,
-                      dynamic_axes={"scan": {0: "batch"}, "proprio": {0: "batch"}, "action": {0: "batch"}})
+                      dynamic_axes={"scan": {0: "batch"}, "proprio": {0: "batch"}, "action": {0: "batch"}},
+                      dynamo=False)
     import json
     with open(os.path.splitext(out)[0] + ".json", "w") as f:
         json.dump({"spec": spec, "meta": model.meta}, f, indent=1)

@@ -34,5 +34,5 @@ def test_plan_tracker_can_skip_compiled_solver(monkeypatch) -> None:
     import f1sim.mpc as mpc
     monkeypatch.setattr(mpc, "solve_fast", lambda *args: (_ for _ in ()).throw(AssertionError("compiled solver called")))
     tracker = PlanTracker(1, "cpu", 0.33, 0.4, 4.0, compile_solver=False)
-    command = tracker(torch.zeros(1, 6), torch.ones(1), torch.full((1,), 4.0))
+    command = tracker(torch.zeros(1, mpc.ACT_DIM), torch.ones(1), torch.full((1,), 4.0))
     assert command.shape == (1, 2)

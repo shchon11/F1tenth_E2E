@@ -235,9 +235,10 @@ class VescSimNode(Node):
             m.state.displacement = int(self.tacho); m.state.distance_traveled = int(abs(self.tacho))
             m.state.temp_fet = 35.0; m.state.temp_motor = 40.0; m.state.fault_code = 0
             self.pub_core.publish(m)
-        self.publish_scan(r.scan[0].cpu().numpy(), stamp)
+        self.publish_scan(r.scan[0].cpu().numpy(), now)
         if r.imu is not None and r.imu.shape[1] > 0:
-            self.publish_imu(r.imu[0].cpu().numpy(), r.imu_att[0].cpu().numpy(), now)
+            self.publish_imu(r.imu[0].cpu().numpy(), r.imu_att[0].cpu().numpy(), now,
+                             r.imu_offsets.cpu().numpy())
         self.publish_ground_truth(st, od, stamp)
         self.pub_coll.publish(Bool(data=bool(r.collision[0])))
         if bool(r.collision[0]) and self.auto_reset:
@@ -249,8 +250,19 @@ class VescSimNode(Node):
             if not self.viewer.alive:
                 rclpy.shutdown()
 
-    def publish_scan(self, ranges, stamp):
+    def publish_scan(self, ranges, now):
+        """LaserScan.header.stamp is the acquisition time of the FIRST ray, per the ROS 2
+        message definition, not of the scan's completion. `now` is the end of the control step,
+        which is when the LAST ray was traced (Lidar.scan anchors time_frac at 0 for the final
+        beam), so the header goes back by one full sweep.
+
+        The convention a particular driver actually used when the raw bags were recorded is a
+        separate, unvalidated question -- this only makes what we publish self-consistent with the
+        metadata we publish beside it.
+        """
         m = self.sim.scan_meta()
+        sweep = m["time_increment"] * (len(ranges) - 1)
+        stamp = (now - Duration(seconds=sweep)).to_msg()
         msg = LaserScan(); msg.header.stamp = stamp; msg.header.frame_id = self.laser_frame
         msg.angle_min, msg.angle_max, msg.angle_increment = m["angle_min"], m["angle_max"], m["angle_increment"]
         msg.time_increment, msg.scan_time = m["time_increment"], m["scan_time"]
@@ -258,19 +270,39 @@ class VescSimNode(Node):
         msg.ranges = ranges.astype(np.float32).tolist()
         self.pub_scan.publish(msg)
 
-    def publish_imu(self, samples, att, now):
-        K = samples.shape[0]; ts = 1.0 / self.cfg.imu.imu_rate
+    def publish_imu(self, samples, att, now, offsets):
+        # The sensor runs on its own clock: the last sample of a control step is generally not at
+        # the step boundary and the count per step varies (1, 1, 1, 2 at 50 Hz on a 40 Hz loop), so
+        # the simulator reports each sample's offset before `now` and they are used as given.
+        K = samples.shape[0]
         for k in range(K):
-            m = Imu(); m.header.frame_id = "imu"; m.header.stamp = (now - Duration(seconds=(K - 1 - k) * ts)).to_msg()
+            m = Imu(); m.header.frame_id = "imu"; m.header.stamp = (now - Duration(seconds=float(offsets[k]))).to_msg()
             g, a = samples[k, :3], samples[k, 3:]
             m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z = map(float, g)
             m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z = map(float, a)
-            m.orientation = rpy_to_quat(float(att[0]), float(att[1]), float(att[2]))
+            # `att` is one attitude estimate for the whole control step, measured at its end, so
+            # only the LAST sample has an orientation that belongs to it. Copying it onto the
+            # earlier samples would attribute a future attitude to them; omitting it everywhere
+            # would leave a consumer of this topic alone without any quaternion.
+            if k == K - 1:
+                m.orientation = rpy_to_quat(float(att[0]), float(att[1]), float(att[2]))
+            else:
+                m.orientation_covariance[0] = -1.0              # not measured at this sample
             self.pub_imu_raw.publish(m)
         if self.pub_imu is not None:
-            v = VescImuStamped(); v.header.stamp = now.to_msg(); v.header.frame_id = "imu"
+            # the summary message reports the LATEST sample, so it is stamped at that sample's time
+            v = VescImuStamped(); v.header.frame_id = "imu"
+            v.header.stamp = (now - Duration(seconds=float(offsets[-1]))).to_msg()
             g, a = samples[-1, :3], samples[-1, 3:]
-            v.imu.ypr.x, v.imu.ypr.y, v.imu.ypr.z = math.degrees(float(att[2])), math.degrees(float(att[1])), math.degrees(float(att[0]))
+            # Measured against the quaternion in the SAME VescImuStamped message across four
+            # recordings (competition / pre-competition / SPIN): ypr.x = -roll, ypr.y = +pitch,
+            # ypr.z = -yaw, in degrees, with yaw wrapped. p95 of the summed deviation rounds to 0.
+            # The previous (yaw, pitch, roll) tuple did not match the dataset in name or in sign, so
+            # anything reading these fields off a bag and off this node disagreed. The quaternion
+            # below stays canonical; ypr is the hardware's own convention.
+            roll, pitch, yaw = float(att[0]), float(att[1]), float(att[2])
+            v.imu.ypr.x, v.imu.ypr.y, v.imu.ypr.z = (-math.degrees(roll), math.degrees(pitch),
+                                                     -math.degrees(yaw))
             v.imu.linear_acceleration.x, v.imu.linear_acceleration.y, v.imu.linear_acceleration.z = (float(a[0]) / 9.81, float(a[1]) / 9.81, float(a[2]) / 9.81)   # VESC reports g
             v.imu.angular_velocity.x, v.imu.angular_velocity.y, v.imu.angular_velocity.z = (math.degrees(float(g[0])), math.degrees(float(g[1])), math.degrees(float(g[2])))   # deg/s
             v.imu.orientation = rpy_to_quat(float(att[0]), float(att[1]), float(att[2]))

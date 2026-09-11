@@ -11,7 +11,7 @@ from f1sim.gym_env import EnvConfig
 from f1sim.learn import common
 from f1sim.learn.model import load_checkpoint
 from f1sim.learn.obs import flatten_obs
-from f1sim.learn.watch import Introspector, panel_image, sal_colors
+from f1sim.learn.watch import Introspector, bev_image, sal_colors
 from f1sim.viewer.native import NativeViewer
 
 W, H, FPS = 1280, 720, 30
@@ -101,8 +101,7 @@ def main():
         scan, pro = flatten_obs(state["obs"])
         with torch.no_grad(): act, _ = mf.act(scan, pro, deterministic=True)
         sal, mu = intro.saliency(scan, pro, focus); hold["cols"] = sal_colors(sal)
-        std = mf.actor.log_std.exp().detach().cpu().numpy()
-        hold["panel"] = panel_image(sal, mu, std, None, 7.0, f"ppo_v3 {exf.get('steps', 0) / 1e6:.0f}M steps")
+        hold["panel"] = bev_image(scan[focus].float().cpu().numpy(), float(env.range_max), sal=sal)
         state["obs"] = env.step(act)[0]
     cut(sink, env, act_chase, 6.0, chase, "ppo_v3  gen:competition:2  cap 7 m/s  deterministic  | points: saliency", focus=focus,
         panel_fn=lambda: hold.get("panel"), colors_fn=lambda: hold.get("cols"))
