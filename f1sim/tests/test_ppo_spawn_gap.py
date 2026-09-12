@@ -34,7 +34,10 @@ def _env_cfg_for(monkeypatch, extra_argv):
     argv = ["ppo", "--device", "cpu", "--envs", "2", "--race-size", "2",
             "--opponent", "mixed", "--tracks", "dummy", "--wandb", "disabled"] + list(extra_argv)
     monkeypatch.setattr("sys.argv", argv)
-    monkeypatch.setattr(ppo.common, "track_names", lambda spec: ["dummy"])
+    # **kw: `track_names` has grown `draws` and `seed`, and a stub with the narrower
+    # signature fails as a TypeError raised inside `ppo.main` that reads like a bug in
+    # the caller rather than in the double.
+    monkeypatch.setattr(ppo.common, "track_names", lambda spec, **kw: ["dummy"])
     monkeypatch.setattr(ppo.common, "load_tracks", lambda names, **kw: ([object()], None))
 
     def capture(tracks, num_envs, device, env_cfg=None, **kw):
