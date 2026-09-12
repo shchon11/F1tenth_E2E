@@ -14,11 +14,20 @@ def open_field(size=60.0, res=0.1):
 
 
 def clean_sim(n=1, **imu):
-    """No randomization, no IMU noise/vibration/bias unless overridden."""
+    """No randomization, no IMU noise/vibration/bias/shock and a flat floor unless overridden."""
     cfg = Config(); cfg.rand.enabled = False; cfg.actuator.cmd_delay = 0.0
     cfg.imu.gyro_noise = 0.0; cfg.imu.accel_noise = 0.0; cfg.imu.vib_accel = 0.0; cfg.imu.vib_gyro = 0.0
     cfg.imu.vib_accel_floor = 0.0; cfg.imu.vib_gyro_floor = 0.0   # the floor is the larger of the two
     cfg.imu.gyro_bias_walk = 0.0; cfg.imu.quant_gyro = 1e-9; cfg.imu.quant_accel = 1e-9
+    # Two later additions that this helper never learnt about, and both of them are sources of
+    # exactly the noise every test here measures the absence of:
+    #   `vehicle.road_tilt` (the attitude model, 2026-09-13) drives the suspension from an OU
+    #     process, so "a parked car is quiet" read 0.13 rad/s of roll rate on a flat floor and four
+    #     tests in this file were failing before the wheel model was written. `test_attitude_model`
+    #     is where that term belongs and is tested.
+    #   `imu.shock_rate` (the wheel model, 2026-09-13) fires impacts while the wheels turn, which
+    #     is a third term in "vibration scales with speed".
+    cfg.vehicle.road_tilt = 0.0; cfg.imu.shock_rate = 0.0
     for k, v in imu.items():
         setattr(cfg.imu, k, v)
     sim = Simulator(open_field(), cfg, num_envs=n, device="cpu")
@@ -64,7 +73,12 @@ def test_gravity_leaks_into_accelerometer_under_pitch():
         r = sim.step(torch.tensor([[0.0, 0.0]]))
     ax_true = sim.ax[0].item(); pitch = r.attitude[0, 1].item()
     imu_ax = r.imu[0, -1, 3].item()
-    assert ax_true < -2.0 and pitch > 0.01                          # braking, nose down
+    # Braking, nose down. The dive bound follows `vehicle.dive_per_g`, which the competition bags
+    # measured at 0.008 rad/g (0.5 deg/g -- the recordings show almost no dive at the -0.45 g the
+    # regen limit allows); at the ~0.47 g this brake reaches that is 0.0037 rad. The 0.01 this
+    # replaces predates that measurement and has been failing since it landed.
+    assert ax_true < -2.0, ax_true
+    assert pitch > 0.6 * sim.cfg.vehicle.dive_per_g * abs(ax_true) / G, (pitch, ax_true)
     assert abs(imu_ax - (ax_true - G * math.sin(pitch))) < 0.35     # low-pass lag + lever arm terms
     assert imu_ax < ax_true                                         # over-reads the deceleration
 

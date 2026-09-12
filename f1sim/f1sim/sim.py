@@ -31,7 +31,9 @@ class StepResult:
     scan_type: torch.Tensor     # (B, N) int32 what each beam hit: 0 none, 1 duct, 2 tall object, 3 floor
     attitude: torch.Tensor      # (B, 2) body roll, pitch [rad] (sprung mass)
     odom: torch.Tensor          # (B, 5) VESC odom: x, y, yaw, v, yaw_rate (drifting)
-    state: torch.Tensor         # (B, 7) ground truth: x, y, yaw, vx, vy, yaw_rate, steer
+    state: torch.Tensor         # (B, 8) ground truth: x, y, yaw, vx, vy, yaw_rate, steer, omega_r
+                                # omega_r is rear-axle angular speed [rad/s]; it was appended, so
+                                # the first seven columns are untouched
     imu: Optional[torch.Tensor] # (B, K, 6) IMU samples this step: gyro xyz [rad/s], accel xyz [m/s^2] (None if disabled)
                                 # K varies between steps: the sensor runs on its own clock, so a
                                 # 50 Hz IMU on a 40 Hz loop delivers 1, 1, 1, 2, ... per step
@@ -48,6 +50,15 @@ class StepResult:
                                                    # that each IMU sample was taken. Timestamp a
                                                    # sample as `step_end - imu_offsets[k]`; the last
                                                    # one is NOT generally at the step boundary.
+    odom_t: Optional[torch.Tensor] = None          # (B,) the stamp this step's /odom sample carries
+                                                   # [s]. NOT `t`: the publish offset jitters by the
+                                                   # measured distribution (odom.VescOdom.stamp), and
+                                                   # a wheel-slip detector's whole input distribution
+                                                   # is made of that. None with vehicle.wheel_model
+                                                   # off, where the stamp is exactly `t`.
+    motor_current: Optional[torch.Tensor] = None   # (B,) emulated VESC `current_motor` [A], the
+                                                   # third input the traction guard takes. None with
+                                                   # vehicle.wheel_model off.
 
 
 class Simulator:
@@ -78,6 +89,11 @@ class Simulator:
 
         self.dt = self.cfg.sim.physics_dt
         self.control_dt = 1.0 / self.cfg.sim.control_rate
+        #: Read once, here: `vehicle.wheel_model` selects which longitudinal model `dynamics.py`
+        #: runs, which speed the VESC loop closes on, whether `odom.py` quantises and jitters, and
+        #: whether the IMU gets its impact term. It is structural -- baked into the compiled graph
+        #: -- so `viewer/graph_fastpath.py` guards it and changing it needs a new Simulator.
+        self.wheel_model = bool(self.cfg.vehicle.wheel_model)
         self.substeps = max(1, int(round(self.control_dt / self.dt)))
         max_delay = 0.0
         for k, (lo, hi) in self.cfg.rand.ranges.items():
@@ -115,6 +131,10 @@ class Simulator:
         self._imu_offsets = [torch.tensor(o, device=self.device) for o in self.imu_offsets_sched]
         self.cmd = torch.zeros(num_envs, 2, device=self.device)        # last commanded (steer, speed)
         self.odom = VescOdom(num_envs, self.device)
+        #: The stamp the previous /odom sample carried, per env. `VescOdom.stamp` needs it for the
+        #: catch-up branch, and it lives here rather than in the odometry state because the draw
+        #: happens in `step`, outside the compiled region.
+        self._odom_t_prev = torch.zeros(num_envs, device=self.device)
         self.s = torch.zeros(num_envs, device=self.device)
         self.cl_idx = torch.zeros(num_envs, dtype=torch.long, device=self.device)   # last centerline index:
                                                                                     # anchors the windowed
@@ -317,6 +337,10 @@ class Simulator:
         st[:, :3] = poses
         if speed is not None:
             st[:, dyn.IVX] = speed
+        # The rear wheel starts *rolling* at the spawn speed, not stopped: a car spawned at 4 m/s
+        # with omega_r = 0 is a car spawned mid-lock, which would fire the guard on every reset and
+        # put a 4 m/s slip transient at the head of every episode.
+        st[:, dyn.IOMEGA] = st[:, dyn.IVX] / self.P["r_w"][env_ids]
         self.state[env_ids] = st
         self.ax[env_ids] = 0.0
         self.ay[env_ids] = 0.0
@@ -329,6 +353,7 @@ class Simulator:
             self.cmd[env_ids, 1] = speed
         self.cmd_hist[env_ids] = self.cmd[env_ids][:, None, :]
         self.odom.reset(env_ids, poses)
+        self._odom_t_prev[env_ids] = self.t
         if self.track.cl is not None:
             s, _, i0 = self.track.project(poses[:, :2], self.tid[env_ids])   # global: no history yet
             self.s[env_ids] = s; self.cl_idx[env_ids] = i0
@@ -353,7 +378,8 @@ class Simulator:
         """
         keep = {k: getattr(self, k).clone() for k in ("state", "ax", "ay", "att", "att_prev", "pose_prev", "cmd",
                                                      "cmd_hist", "s", "lap", "collided", "steps", "imu_state",
-                                                     "cl_idx", "car_collision", "prop_touched")}
+                                                     "cl_idx", "car_collision", "prop_touched",
+                                                     "_odom_t_prev")}
         odom, t, phase = self.odom.state.clone(), self.t, self._imu_phase
         # The throw-away steps consume randomness from two places, not one: `self.gen` (spawn draws,
         # command-delay jitter) and the GLOBAL torch generator, which is what imu.sample's
@@ -396,11 +422,12 @@ class Simulator:
         self.att_prev = self.att[:, [0, 2]].clone()
         # the sample layout belongs to this step's phase; capture it before the phase advances
         imu_offsets = self._imu_offsets[self._imu_phase]
-        state, ax, ay, att, imu_state, imu_samples = self._roll(self.state, self.ax, self.att, self.imu_state,
-                                                                self.cmd_hist, delay_s, P)
+        state, ax, ay, att, imu_state, imu_samples, i_motor = self._roll(
+            self.state, self.ax, self.att, self.imu_state, self.cmd_hist, delay_s, P)
         self._imu_phase = (self._imu_phase + 1) % self.imu_period
         if self.cfg.sim.compile_mode == "reduce-overhead":      # CUDA graphs reuse their output buffers: keep copies
-            state, ax, ay, att, imu_state, imu_samples = (t.clone() for t in (state, ax, ay, att, imu_state, imu_samples))
+            state, ax, ay, att, imu_state, imu_samples, i_motor = (
+                t.clone() for t in (state, ax, ay, att, imu_state, imu_samples, i_motor))
         state = torch.where(frozen[:, None], self.state, state)
         att = torch.where(frozen[:, None], self.att, att)
         imu_state = torch.where(frozen[:, None], self.imu_state, imu_state)
@@ -435,10 +462,19 @@ class Simulator:
                                                      att=att[:, [0, 2]], att_prev=self.att_prev, tid=self.tid, cars=cars)
         imu = imu_samples if self.cfg.imu.enabled else None
         imu_att = imu_state[:, 18:21].clone() if self.cfg.imu.enabled else None
+        # The /odom stamp is drawn here, outside `_post`: it is one cheap draw per step and keeping
+        # it out of the compiled region means the sample layout of the graph does not depend on the
+        # switch. With the wheel model off there is no jitter to model and the stamp is exactly `t`.
+        if self.wheel_model:
+            odom_t = self.odom.stamp(self.t, self._odom_t_prev, P, self.control_dt)
+            self._odom_t_prev = odom_t
+        else:
+            odom_t = None
         return StepResult(scan, scan_true, scan_type, att[:, [0, 2]].clone(), odom, state, imu, imu_att,
                           self.collided.clone(), ds, s, lateral, self.lap.clone(), wall_dist, self.t,
                           self.car_collision.clone() if self.M > 1 else None,
-                          imu_offsets if self.cfg.imu.enabled else None)
+                          imu_offsets if self.cfg.imu.enabled else None,
+                          odom_t, i_motor if self.wheel_model else None)
 
     def _guarded(self, compiled, attr, eager):
         """Compiled callable that falls back to eager for good if inductor/Triton fails at first use."""
@@ -454,7 +490,12 @@ class Simulator:
         """Footprint clearance, VESC odometry and lane progress for one control step (compiled)."""
         wall_dist = self._footprint_clearance(state)
         hit = wall_dist <= 0.0
-        odom_state = self.odom.update_pure(odom_state, state[:, dyn.IVX], cmd[:, 0], P, self.control_dt)
+        # vesc_to_odom publishes ERPM, i.e. the WHEEL speed. With the wheel model on those differ
+        # from the body speed exactly when the axle slips, which is what makes the odometry a slip
+        # sensor; with it off `omega_r * r_w` is identically `vx` and this is the old call.
+        v_odom = state[:, dyn.IOMEGA] * P["r_w"] if self.wheel_model else state[:, dyn.IVX]
+        odom_state = self.odom.update_pure(odom_state, v_odom, cmd[:, 0], P, self.control_dt,
+                                           quantise=self.wheel_model)
         if self.track.cl is not None:
             s, lateral, cl_idx = self.track.project(state[:, :2], tid, prev_idx=cl_idx)
             ds = s - s_prev
@@ -478,8 +519,10 @@ class Simulator:
         ou_k = 1.0 - ou_a
         ou_s = P["road_tilt"] * torch.sqrt(1.0 - ou_k * ou_k)
         imu_on = self.cfg.imu.enabled
+        wheel_on = self.wheel_model
         r_vec = torch.stack([P["imu_x"] - P["lr"], P["imu_y"], P["imu_z"] - P["h"]], 1)
         samples = []
+        a_cmd_last = torch.zeros_like(ax)
         soft_wall = not self.cfg.sim.terminate_on_collision
         ar = torch.arange(self.B, device=state.device)
         for k in range(self.substeps):
@@ -487,9 +530,13 @@ class Simulator:
             idx = torch.ceil(age / self.control_dt).long().clamp(0, self.hist_len - 1)
             eff = cmd_hist[ar, idx]                                   # (B,2) command in effect
             steer_tgt = servo_target(eff[:, 0], P)
-            a_cmd = vesc_accel(eff[:, 1], state[:, dyn.IVX], P)
+            # The VESC loop closes on ERPM -- the wheel -- not on the body. See actuators.vesc_accel.
+            v_fb = state[:, dyn.IOMEGA] * P["r_w"] if wheel_on else state[:, dyn.IVX]
+            a_cmd = vesc_accel(eff[:, 1], v_fb, P)
+            a_cmd_last = dyn.motor_accel(a_cmd, v_fb, P)     # after the limits: what is applied
             r_old = state[:, dyn.IR]
-            state, ax, ay = dyn.step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt)
+            state, ax, ay = dyn.step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt,
+                                              wheel=wheel_on)
             # sprung mass: roll to the outside of the corner, dive under braking, squat under throttle
             w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s
             w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s
@@ -505,14 +552,21 @@ class Simulator:
             if imu_on:
                 yaw_acc = (state[:, dyn.IR] - r_old) / self.dt
                 imu_state = imu_model.substep(imu_state, ax, ay, state[:, dyn.IVX], roll, pitch, roll_rate, pitch_rate,
-                                              state[:, dyn.IR], roll_acc, pitch_acc, yaw_acc, r_vec, P, self.dt)
+                                              state[:, dyn.IR], roll_acc, pitch_acc, yaw_acc, r_vec, P, self.dt,
+                                              shock=wheel_on)
                 if k in self.imu_idx:
                     smp, imu_state = imu_model.sample(imu_state, P, self.imu_ts)
                     samples.append(smp)
             if soft_wall:
                 state = self._resolve_wall_contact(state)
         imu_samples = torch.stack(samples, 1) if samples else torch.zeros(state.shape[0], 0, 6, device=state.device)
-        return state, ax, ay, torch.stack([roll, roll_rate, pitch, pitch_rate, w_roll, w_pitch], 1), imu_state, imu_samples
+        # `/sensors/core` `current_motor`, the guard's third (optional) input. The VESC commands a
+        # current, and the torque it produces is that current times a constant: this inverts the
+        # last substep's motor torque through `amp_per_nm`, which is calibrated in ActuatorParams
+        # against the one place the recordings pin it -- the regen limit.
+        i_motor = a_cmd_last * P["m"] * P["r_w"] * P["amp_per_nm"]
+        return (state, ax, ay, torch.stack([roll, roll_rate, pitch, pitch_rate, w_roll, w_pitch], 1),
+                imu_state, imu_samples, i_motor)
 
     # ------------------------------------------------------------------ helpers
     def _footprint_corners(self, state: torch.Tensor) -> torch.Tensor:

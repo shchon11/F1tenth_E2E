@@ -55,6 +55,67 @@ class VehicleParams:
                                # (-9.2 and -10.6 also appear in the recordings, but the motor
                                # current is *positive* at those instants: they are impacts.)
     v_switch: float = 7.319    # [m/s] above this, accel scales with v_switch/v (power limit)
+    # ---- rear axle as a rotating body (2026-09-13) ----------------------------------------
+    # `wheel_model` off reproduces the model that was here before: rear longitudinal force set
+    # straight from the commanded acceleration, wheel speed == body speed, so the wheel can neither
+    # spin nor lock. On, the parameters below are live. See dynamics.py and
+    # docs/research/wheel-model-2026-09-13.md.
+    wheel_model: bool = True
+    drive_split_r: float = 0.50
+                               # fraction of the drivetrain's torque delivered to the REAR axle.
+                               # The F1TENTH platform is a Traxxas Slash 4x4: one motor, a centre
+                               # driveshaft through a slipper clutch, so the split is essentially
+                               # 50/50 and fixed by the drivetrain -- while the *load* split is not.
+                               # That is the whole mechanism behind a brake lock on this car. Under
+                               # braking the load moves forward (Fzr falls from 17.6 to ~13.5 N at
+                               # -5 m/s^2), so the rear axle is asked for half the force on 37 % of
+                               # the weight and lets go first, taking the single ERPM speed with it.
+                               # The arithmetic it produces is what the recordings show:
+                               # m*a_brake*r_w = 1.03 N m needs 18.7 N total, 9.35 N at the rear,
+                               # against a rear capacity of mu*Fzr = 14.2 N at mu 1.05 (60 % margin,
+                               # no lock) and 9.85 N at mu 0.73 (no margin -- so any cornering, any
+                               # bump, and it locks). Set it to 1.0 for a rear-drive car.
+    r_w: float = 0.055         # [m] rear wheel rolling radius. MEASURED twice over: `imu.tire_d`
+                               # 0.11 m is the tyre diameter this platform's vibration model was
+                               # already built on, and the recordings' own VESC calibration agrees
+                               # -- `speed_to_erpm_gain` comes out of the bags as 4202.7 ERPM per
+                               # m/s (competition) and 4514.9 (pre-competition), and
+                               # gain = 60/(2*pi*r_w) * (gear ratio * pole pairs) puts that ratio at
+                               # 24.2 and 26.0, i.e. the stock ~8:1 drivetrain on a 6-pole motor.
+    I_w: float = 5.0e-4        # [kg m^2] rotational inertia of the whole driven assembly, referred
+                               # to the wheel. It sets how fast a wheel can let go:
+                               # a_wheel = r_w*(T - r_w*Fx)/I_w.
+                               #
+                               # Two estimates, and they disagree, so both are stated. From PARTS:
+                               # four wheels at ~90 g on 0.055 m are ~7.6e-4 together, and a
+                               # 3650-class rotor (~4e-6 kg m^2) reflected through the ~11:1 total
+                               # reduction adds ~4.4e-4, so a 4x4 drivetrain is of order 1.2e-3.
+                               # From the RECORDINGS: a lock takes the wheel from 5-7 m/s to zero in
+                               # 60-100 ms (20260826-173704 t=46.5, 7.65 -> 0.00 in 100 ms;
+                               # 20260826-194702 t=9.5, 5.05 -> 0.00 in 59 ms), i.e. 50-86 m/s^2
+                               # sustained, and against the m*a_brake*r_w = 1.03 N m the regen limit
+                               # allows -- less the sliding tyre's own torque -- that needs I <= 6e-4.
+                               # The parts figure cannot produce the locks the car demonstrably has.
+                               # 5.0e-4 is the recordings' number and matches the independent
+                               # estimate in ../real-car-tcs/REPORT.md section 9 ("order 5e-4"); the
+                               # gap is a real limitation, recorded in
+                               # docs/research/wheel-model-2026-09-13.md rather than averaged away.
+                               # The DR range (0.6, 1.8) spans 3e-4 to 9e-4.
+    # Longitudinal magic formula, the same normalized shape `pacejka()` uses for the lateral axis.
+    # ASSUMPTIONS with textbook ranges -- a slip-ratio sweep needs a dynamometer or a wheel-speed
+    # sensor per corner, and this car has neither. What the recordings *do* pin is the outcome:
+    # see the acceptance table in docs/research/wheel-model-2026-09-13.md.
+    B_x: float = 12.0          # stiffness factor: peak longitudinal force at kappa ~ 0.15, the
+                               # usual value for rubber on a hard smooth floor
+    C_x: float = 1.50          # shape factor (Pacejka '89 longitudinal 1.4-1.8); with E_x below it
+                               # puts the full-slide plateau at 0.71 of peak
+    E_x: float = 0.55          # curvature factor (longitudinal 0.4-0.8)
+    v_slip_eps: float = 0.50   # [m/s] the slip ratio's denominator is held at this from below. It
+                               # plays the part `v_blend_min` plays laterally: kappa is a ratio to
+                               # the ground speed and stops meaning anything as that goes to zero.
+                               # 0.5 m/s is half the guard's own `v_lock_min` and a tenth of the
+                               # slowest labelled slip event in the recordings, so nothing this
+                               # model is judged on happens inside the regularised region.
     # Rolling resistance + aero drag (decel = c_roll + c_drag * v^2)
     c_roll: float = 0.1        # [m/s^2]
     c_drag: float = 0.01       # [1/m]
@@ -87,6 +148,15 @@ class ActuatorParams:
     # VESC speed loop: first-order tracking of commanded speed via PID-like accel
     motor_tau: float = 0.20        # [s] time constant of speed response
     speed_gain: float = 1.0        # ERPM<->m/s calibration error (randomized)
+    amp_per_nm: float = 29.2       # [A per N m at the wheel] motor current per unit drive torque,
+                                   # used only to emulate `/sensors/core` `current_motor` for the
+                                   # traction guard's optional spin gate. MEASURED at the one point
+                                   # the recordings pin it: through the hardest 200 ms of braking
+                                   # the regen current sits at 95-100 % of the configured -30 A and
+                                   # the car reaches -4.2 to -5.7 m/s^2, so 30 A buys
+                                   # m * a_brake * r_w = 1.03 N m. Cross-check on the drive side:
+                                   # the +63 A peak in the recordings comes out as 10.5 m/s^2, above
+                                   # the sustained a_max of 7 as a launch transient should be.
     # Command latency (sensor -> policy -> actuator), applied as delay buffer on commands
     cmd_delay: float = 0.015       # [s] LiDAR -> policy -> VESC on the Jetson. Calibrated against the
                                    # *total* command-to-yaw lag, which is what a recording can show:
@@ -170,6 +240,31 @@ class OdomParams:
     steer_offset: float = 0.0          # [rad] residual servo-offset calibration error (randomized)
     steer_gain_err: float = 0.0        # residual servo-gain calibration error (randomized)
     yaw_rate_noise_std: float = 0.02   # [rad/s]
+    # ---- ERPM channel artefacts (live only with vehicle.wheel_model) -----------------------
+    # MEASURED over the 22 recordings' 88 975 /odom steps; see
+    # docs/real_data_calibration.md "The ERPM channel".
+    erpm_quantum: float = 2.3794e-4    # [m/s] one ERPM step. The smallest non-zero |dv| in each
+                                       # competition bag lands here to within one float32 ulp, and
+                                       # 1/q = 4202.7 is the VESC `speed_to_erpm_gain`. The nine
+                                       # pre-competition bags ran a different gain, 4514.9
+                                       # (q = 2.2149e-4); the DR range spans both. It is small next
+                                       # to `speed_noise_std`, and it is here because it is real and
+                                       # because a detector trained on a continuous wheel speed has
+                                       # no reason to expect a lattice.
+    stamp_jitter_std: float = 0.0024   # [s] sd of the publish offset of an /odom sample against the
+                                       # nominal grid. The measured step distribution is median
+                                       # 19.998 ms with p5 14.375 and p95 25.570; a Gaussian offset
+                                       # of 2.4 ms reproduces both (the step is a difference of two
+                                       # offsets, so its sd is 2.4*sqrt(2) = 3.39 ms) and puts
+                                       # 7.1 % of steps under 15 ms against a measured 7.22 %.
+    stamp_jitter_burst: float = 0.0012 # fraction of samples published immediately after the
+                                       # previous one ("catch-up") instead of on the grid. The
+                                       # measured rate: 0.12 % of the recordings' 88 975 steps are
+                                       # shorter than 5 ms, down to 0.057 ms. A Gaussian offset
+                                       # bounded by half a period cannot produce those at all, and
+                                       # they are the steps that make one ERPM quantum read as tens
+                                       # of m/s^2 -- the artefact `TractionParams.min_diff_dt`
+                                       # exists for (real-car REPORT.md section 5).
 
 
 @dataclass
@@ -238,6 +333,38 @@ class ImuParams:
     vib_broadband: float = 0.4     # fraction of vib amplitude that is broadband (white) instead of tonal
     tire_d: float = 0.11           # [m]
     gear_ratio: float = 8.0        # motor revs per wheel rev (Slash 4x4 stock ~ 8-10)
+    # ---- impact / shock (live only with vehicle.wheel_model) -------------------------------
+    # The vibration model above is stationary: it never produces the isolated spikes the
+    # recordings are full of, and `traction.A_BODY_MAX` -- the clamp the whole guard depends on --
+    # exists *because* of those. MEASURED over 1088 s of motion in the 22 bags: |a_x| exceeds
+    # mu*g (10.3) 0.291 times a second, 20 m/s^2 0.079, 30 m/s^2 0.045, 50 m/s^2 0.021, 100 m/s^2
+    # 0.005, peaking at 120.4. That tail is close to a power law, rate ~ A^-1.75, so the magnitude
+    # is drawn as a Pareto variate rather than a Gaussian one -- a Gaussian fitted to the 20 m/s^2
+    # rate would put nothing at all above 50.
+    #
+    # Both coefficients are fitted to the OUTPUT of this chain, as the `vib_*` ones are, because a
+    # 5 ms pulse loses most of its height to the 40 Hz corner and most of its firings to the 50 Hz
+    # sampling: injecting at the measured 0.29/s delivered 0.037/s, a factor of 8 short. Fitted
+    # against all five measured thresholds (scratch fit, 96 envs x 12.5 s at 4 m/s):
+    #   threshold          10.3     20     30     50    100 m/s^2
+    #   measured, /s      0.291  0.079  0.045  0.021  0.005
+    #   emulated, /s      0.281  0.096  0.041  0.013  0.004
+    # The deep end is ~1.6x light, and that is where it stays: fattening it further (a lower
+    # `shock_alpha`) overshoots the 20 m/s^2 bin, which is the one the guard's clamp actually lives
+    # next to.
+    shock_rate: float = 2.40       # [1/s of motion] rate of injected impacts
+    shock_accel: float = 10.3      # [m/s^2] scale of the drawn magnitude (its minimum). mu*g, so
+                                   # the smallest modelled shock is exactly the one that starts to
+                                   # matter -- anything under it is already covered by `vib_*`.
+    shock_alpha: float = 1.60      # Pareto tail exponent. The injected tail is a little fatter than
+                                   # the measured one (1.75, from the rate falling 0.291 -> 0.005 /s
+                                   # between 10.3 and 100 m/s^2) because the filter eats the short
+                                   # spikes hardest.
+    shock_tau: float = 0.005       # [s] decay of one impact. A chassis impact is not a single
+                                   # sample: it rings, and a delta shorter than the sensor's 40 Hz
+                                   # low-pass would be filtered away before it was ever sampled.
+                                   # 5 ms keeps a spike visible at 50 Hz, which is how the real
+                                   # ones survive to reach the guard.
     # VESC attitude filter (Mahony-like): gyro integration corrected toward the accelerometer
     # gravity direction with time constant ahrs_tau (~1/kp, VESC default kp 0.3); the correction is
     # down-weighted when |accel| deviates from g (VESC accel_confidence_decay), so sustained
@@ -286,6 +413,28 @@ class RandomizationConfig:
                                                 # deploying, or the policy will brake later than the
                                                 # car can.
         "vehicle.mu_f_scale": (0.85, 1.0),
+        # The wheel model's own parameters. `I_w` and the slip curve are assumptions (see
+        # VehicleParams), so their ranges are wide enough to contain the values a measurement would
+        # plausibly return rather than tight around a number nobody measured.
+        "vehicle.I_w": (0.6, 1.4),           # 3e-4 to 7e-4. Deliberately NOT stretched to the
+                                             # 1.2e-3 the parts count gives: the recordings bound it
+                                             # at 6e-4 (see VehicleParams.I_w), and a range whose
+                                             # upper half the evidence excludes is not a range, it
+                                             # is a way of averaging a disagreement away
+        "vehicle.drive_split_r": (0.45, 0.60),   # absolute: the slipper clutch and the diffs move
+                                                 # the split a little, and 1.0 (rear drive) is a
+                                                 # different car rather than a draw from this one
+        "vehicle.B_x": (0.7, 1.4),
+        "vehicle.C_x": (0.93, 1.13),        # 1.40-1.70: full-slide plateau 0.59-0.81 of peak
+        "vehicle.E_x": (0.40, 0.80),        # absolute, the textbook longitudinal span
+        "vehicle.r_w": (0.97, 1.03),        # tyre wear and pressure; the ERPM gain is calibrated
+                                            # against it on the car, so it cannot drift far
+        "odom.erpm_quantum": (2.20e-4, 2.40e-4),   # the two VESC gains the recordings were made on
+        "odom.stamp_jitter_std": (0.6, 1.8),
+        "odom.stamp_jitter_burst": (0.0, 0.004),
+        "imu.shock_rate": (0.0, 2.5),       # venue floors differ by far more than the 22 bags show;
+                                            # 0 is a clean floor, 2.5x the fitted rate is a bad one
+        "imu.shock_accel": (0.7, 1.5),
         "vehicle.c_roll": (0.5, 2.0),
         "actuator.servo_tau": (0.02, 0.06),
         "actuator.steer_bias": (-0.03, 0.03),
@@ -337,6 +486,8 @@ class RandomizationConfig:
         "imu.ahrs_tau": (0.5, 2.0),
     })
     scale_fields: Tuple[str, ...] = (
+        "vehicle.I_w", "vehicle.B_x", "vehicle.C_x", "vehicle.r_w",
+        "odom.stamp_jitter_std", "imu.shock_rate", "imu.shock_accel",
         "vehicle.mu", "vehicle.m", "vehicle.Iz", "vehicle.B_f", "vehicle.B_r",
         "vehicle.a_max", "vehicle.a_brake", "vehicle.c_roll", "vehicle.roll_per_g", "vehicle.pitch_per_g", "vehicle.dive_per_g", "vehicle.road_tilt", "vehicle.susp_wn",
         "actuator.steer_gain", "actuator.speed_gain", "lidar.duct_scale",

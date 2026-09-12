@@ -6,6 +6,8 @@ is the step where the pass completes.
 """
 import torch
 
+from f1sim import dynamics as dyn
+
 from f1sim import Config, Track
 from f1sim.gym_env import EnvConfig, F1VecEnv, REWARD_COMPONENT_KEYS
 
@@ -95,7 +97,7 @@ def test_a_car_out_of_contention_is_not_scored() -> None:
 
 def _state(rows):
     """(x, y, yaw, vx) per car, repeated over the races of a 2-car env."""
-    st = torch.zeros(len(rows), 7)
+    st = torch.zeros(len(rows), dyn.STATE_DIM)
     for i, (x, y, yaw, vx) in enumerate(rows):
         st[i, 0], st[i, 1], st[i, 2], st[i, 3] = x, y, yaw, vx
     return st
@@ -163,7 +165,7 @@ def test_a_teacher_opponent_holds_speed_behind_a_car() -> None:
     """The raceline teacher is blind; without this it drives into the car it was just passed by."""
     env = _race(n=2)
     env.sim.s[:] = torch.tensor([5.0, 4.0])                     # car 1 is 1 m behind car 0
-    st = torch.zeros(2, 7); st[:, 3] = torch.tensor([3.0, 6.0]) # car 0 slow, car 1 fast
+    st = torch.zeros(2, dyn.STATE_DIM); st[:, 3] = torch.tensor([3.0, 6.0]) # car 0 slow, car 1 fast
     follow, v_cap = env.follow_cap(st)
     assert follow.tolist() == [False, True]                      # only the one with a car ahead
     assert abs(float(v_cap[1]) - 3.0 * env.ecfg.opp_follow_ratio) < 1e-6

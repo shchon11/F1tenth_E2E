@@ -225,7 +225,7 @@ class RacelineTeacher:
 
     def __call__(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
                  offset: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """state (B,7) ground truth -> action (B,2) = (steer [rad], speed [m/s]).
+        """state (B,8) ground truth -> action (B,2) = (steer [rad], speed [m/s]).
         P: the simulator's per-env parameter dict (privileged). When given, the teacher
         compensates command latency, servo lag, actuator calibration and scales speed with grip.
         tid: per-env track id (which raceline to follow).

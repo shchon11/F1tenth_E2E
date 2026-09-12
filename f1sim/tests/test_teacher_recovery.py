@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 import torch
 
+from f1sim import dynamics as dyn
+
 from f1sim.raceline import Raceline
 from f1sim.teacher import RacelineTeacher
 
@@ -32,7 +34,7 @@ def _state_at(teacher: RacelineTeacher, heading_error_deg: float, speed: float =
     point = teacher.xy[0, 0]
     tangent = teacher.tan[0, 0]
     yaw = math.atan2(float(tangent[1]), float(tangent[0])) + math.radians(heading_error_deg)
-    state = torch.zeros(1, 7)
+    state = torch.zeros(1, dyn.STATE_DIM)
     state[0, 0], state[0, 1], state[0, 2], state[0, 3] = point[0], point[1], yaw, speed
     return state
 

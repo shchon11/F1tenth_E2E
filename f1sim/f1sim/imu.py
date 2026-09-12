@@ -5,6 +5,7 @@ Per substep (1 kHz):
   a_s    = a_cog + alpha x r + omega x (omega x r)                  rigid-body accel at the sensor
   f      = a_s - g_body(roll, pitch)                                specific force (gravity leaks in)
   + tonal vibration at wheel / 2x wheel / motor frequency and broadband vibration, both ~ speed
+  + impact shock: a Pareto-tailed, exponentially decaying impulse train (`vehicle.wheel_model` only)
   -> sensor misalignment -> 2nd-order low-pass at `bandwidth`
 At the IMU sample instants (rate Hz): + bias (+ random walk) + white noise -> quantize.
 The VESC attitude estimate integrates the gyro and slowly pulls roll/pitch toward the
@@ -23,8 +24,13 @@ TWO_PI = 2 * math.pi
 
 
 def imu_state_init(B: int, device) -> torch.Tensor:
-    """Loop-carried IMU state (B, 21): lp position (6), lp velocity (6), phases (3), gyro bias walk (3), ahrs (3)."""
-    return torch.zeros(B, 21, device=device)
+    """Loop-carried IMU state (B, 22): lp position (6), lp velocity (6), phases (3), gyro bias
+    walk (3), ahrs (3), impact shock (1).
+
+    The shock slot was appended, not inserted: `sim.py` reads the attitude estimate at columns
+    18:21 and nothing about those moved.
+    """
+    return torch.zeros(B, 22, device=device)
 
 
 def sample_indices(rate: float, control_dt: float, dt: float, substeps: int):
@@ -127,8 +133,11 @@ def misalign(vx, vy, vz, P: Dict[str, torch.Tensor]):
 
 
 def substep(imu_state, ax, ay, vx, roll, pitch, roll_rate, pitch_rate, yaw_rate, roll_acc, pitch_acc, yaw_acc,
-            r_vec, P: Dict[str, torch.Tensor], dt: float):
-    """Advance vibration phases and the sensor low-pass by one physics substep. Returns new state."""
+            r_vec, P: Dict[str, torch.Tensor], dt: float, shock: bool = False):
+    """Advance vibration phases and the sensor low-pass by one physics substep. Returns new state.
+
+    `shock` (from `vehicle.wheel_model`) adds the impact term; see below.
+    """
     lp, lpv, ph = imu_state[:, 0:6], imu_state[:, 6:12], imu_state[:, 12:15]
     fx, fy, fz = specific_force(ax, ay, roll, pitch, roll_rate, pitch_rate, yaw_rate, roll_acc, pitch_acc, yaw_acc, r_vec)
     gx, gy, gz = roll_rate, pitch_rate, yaw_rate
@@ -169,6 +178,40 @@ def substep(imu_state, ax, ay, vx, roll, pitch, roll_rate, pitch_rate, yaw_rate,
     gx = gx + vg_s * (0.8 * (1 - bb) * tone_y + bb * n[:, 3]) + vg_f * m[:, 3]
     gy = gy + vg_s * (0.8 * (1 - bb) * tone_z + bb * n[:, 4]) + vg_f * m[:, 4]
     gz = gz + vg_s * (0.5 * (1 - bb) * tone + bb * n[:, 5]) + vg_f * m[:, 5]
+    sh_out = imu_state[:, 21:22]
+    if shock:
+        # Impact / shock. The vibration model above is stationary by construction and never produces
+        # an isolated spike; the recordings are full of them, reaching -101 m/s^2 at
+        # 20260826-173704 t=46.465 and +20 in several places, and `traction.A_BODY_MAX` -- the clamp
+        # the guard's hardest detection depends on -- exists only because of them. Training a
+        # detector against a clean accelerometer would give it no reason to clamp.
+        #
+        # One decaying impulse train, magnitude Pareto-distributed so the *rate* above a threshold
+        # falls as a power law the way the measured one does (a Gaussian fitted at 20 m/s^2 puts
+        # nothing at all above 50). `shock_rate` and `shock_accel` are fitted to the OUTPUT of this
+        # chain -- after the low-pass and the 50 Hz sampling below -- exactly as the `vib_*`
+        # coefficients are, because a 5 ms pulse loses most of its height to a 40 Hz corner.
+        #
+        # Gated on wheel motion by the same `onset` the vibration floor uses: a parked car is not
+        # being hit. Two things here are assumptions rather than measurements, and are marked as
+        # such: only the x channel's exceedance rate was measured, so the split across the three
+        # accelerometer axes (1.0 / 0.7 / 0.7, i.e. an impact that is not axis-aligned) is a guess;
+        # and the gyro is left alone entirely, because a real impact shocks it too but nothing here
+        # measures by how much and inventing a number would be worse than omitting one.
+        #
+        # The sign is drawn once per impact and carried in the state with the magnitude. Re-drawing
+        # it every substep would turn a decaying pulse into 5 ms of white noise, which is the one
+        # thing the vibration model above already does.
+        ru = torch.rand(vx.shape[0], 3, device=vx.device)
+        fire = (ru[:, 0] < P["shock_rate"] * dt * onset).to(fx.dtype)
+        # Pareto(alpha) with scale shock_accel: P(M > m) = (shock_accel / m)^alpha for m >= scale.
+        mag = P["shock_accel"] * ru[:, 1].clamp_min(1e-9) ** (-1.0 / P["shock_alpha"])
+        sgn = torch.where(ru[:, 2] < 0.5, -1.0, 1.0)
+        sh = imu_state[:, 21] * torch.exp(-dt / P["shock_tau"]) + fire * mag * sgn
+        fx = fx + sh
+        fy = fy + 0.7 * sh
+        fz = fz + 0.7 * sh
+        sh_out = sh[:, None]
     gx, gy, gz = misalign(gx, gy, gz, P)
     fx, fy, fz = misalign(fx, fy, fz, P)
     u = torch.stack([gx, gy, gz, fx, fy, fz], 1)
@@ -177,7 +220,7 @@ def substep(imu_state, ax, ay, vx, roll, pitch, roll_rate, pitch_rate, yaw_rate,
     lpa = wc * wc * (u - lp) - 2 * 0.7 * wc * lpv
     lpv = lpv + lpa * dt
     lp = lp + lpv * dt
-    return torch.cat([lp, lpv, ph, imu_state[:, 15:21]], 1)
+    return torch.cat([lp, lpv, ph, imu_state[:, 15:21], sh_out], 1)
 
 
 def sample(imu_state, P: Dict[str, torch.Tensor], ts: float):
@@ -208,5 +251,6 @@ def sample(imu_state, P: Dict[str, torch.Tensor], ts: float):
     roll_e = roll_e + k * (roll_acc - roll_e)
     pitch_e = pitch_e + k * (pitch_acc - pitch_e)
     yaw_e = torch.remainder(yaw_e + math.pi, TWO_PI) - math.pi
-    new_state = torch.cat([imu_state[:, 0:15], bias_walk, torch.stack([roll_e, pitch_e, yaw_e], 1)], 1)
+    new_state = torch.cat([imu_state[:, 0:15], bias_walk, torch.stack([roll_e, pitch_e, yaw_e], 1),
+                           imu_state[:, 21:22]], 1)
     return torch.cat([gyro, acc], 1), new_state
