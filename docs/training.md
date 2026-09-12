@@ -166,13 +166,46 @@ rather than silently ignored. Each step, `info["opp_event"]` reports `id` (0 = n
 1-based index into `brake, stop, shift, weave`), `time_left` in seconds and the `offset` in metres
 each car is holding, for a viewer or a logger.
 
+**Evaluating against them.** Training against a behaviour and never measuring it is how a recipe
+gets adopted on a number that does not cover the thing it changed. Two places measure it now:
+
+* `python3 -m f1sim.learn.evaluate --race-size 2 --opponent teacher --opp-events brake,stop,shift
+  --opp-event-rate 3` takes the same flags and reports the traffic metrics — passes, pace against
+  the opponent, engagement time, contacts — under `traffic` in every result, `--per-track`
+  included. Quick check, no roster, no freeze, not a benchmark score.
+* The benchmark's **T (traffic) family**, frozen as suite v2.1, is the scored version: brake / stop
+  / shift at 3.0 per opponent per 10 s is one of its four scenarios, on five held-out maps at two
+  friction levels. See [the benchmark's traffic family](benchmark.md#the-t-traffic-family). The
+  scenario's event rate is chosen so that an event actually lands while the learner is in
+  contention, which is measured rather than assumed.
+
 ## Evaluation
 
 ```bash
 CKPT="$HOME/f1sim_runs/ppo_v1/ppo_final.pt"
 python3 -m f1sim.learn.evaluate "$CKPT" --per-track --protocol trials --envs 64 --speed-cap 4
 python3 -m f1sim.learn.evaluate --teacher --action-mode plan --per-track --protocol trials
+
+# in traffic: a slower car, a car at pace, or one that brakes and stops and changes lane
+python3 -m f1sim.learn.evaluate "$CKPT" --per-track --envs 64 \
+    --race-size 2 --opponent teacher --opp-speed-range 0.5 0.7
+python3 -m f1sim.learn.evaluate "$CKPT" --per-track --envs 64 \
+    --race-size 2 --opponent teacher --opp-events brake,stop,shift --opp-event-rate 3
 ```
+
+Any run with an opponent adds a `traffic` block to each result: `passes` and
+`passes_per_learner_min`, `pace_vs_opponent` (the learners' arc over the opponents' arc over the
+same steps), `contention_fraction` / `following_fraction` / `attacking_fraction`, `car_contacts`,
+`wall_collisions`, and — when events are on — `opp_event_in_window_fraction`, the share of event
+time the learner was actually close enough to have to react to. `--contention-range` and
+`--attack-range` set the two windows; the defaults are the env's own `overtake_range` (12 m) and
+the benchmark's tight 3 m. A solo run reports `"traffic": null` with the reason, never zeros.
+
+The definitions are the benchmark's own — `learn.benchmark.overtake.TrafficMeter` is the same
+`TrafficTrace` and the same pass detector the frozen T cells use — so a quick check and a scored
+cell are measuring one thing. What differs is the protocol: `evaluate` runs auto-resetting envs
+where there is no such thing as a trial, so these are rates over the rollout rather than per-trial
+outcomes, and they are not comparable with a T table.
 
 `--protocol trials` runs independent fixed-length attempts; `rolling` runs continuously with
 auto-reset. `--budget-laps` sets the time budget as laps of the track at the speed cap, which makes
