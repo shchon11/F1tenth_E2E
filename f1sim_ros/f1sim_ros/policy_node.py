@@ -35,10 +35,44 @@ def install_grip_arm(tracker, arm: str, device, mu: float = None):
     return grip.install(graph=False)
 from f1sim.learn.obs import ObsBuilder, ObsSpec
 
+from f1sim_ros.traction import TractionGuard, TractionParams
+
 try:
     from vesc_msgs.msg import VescImuStamped
 except ImportError:
     VescImuStamped = None
+
+try:
+    from vesc_msgs.msg import VescStateStamped
+except ImportError:
+    VescStateStamped = None
+
+
+def build_traction_guard(arm: str, overrides: str = ""):
+    """The `traction` parameter, as a `TractionGuard` or None.
+
+    `off` (the default) installs nothing at all: no subscription is used for it, no command is
+    touched, and the node behaves exactly as it did before this existed. `on` installs the guard
+    validated in `scripts/replay_traction.py` against the 22 real recordings. `overrides` is the
+    `traction_params` parameter: `name=value` pairs, comma or whitespace separated, applied to
+    `TractionParams` -- every threshold is reachable from the launch line without editing code.
+
+    Raises rather than falling back: an unreadable traction configuration on a car that is about to
+    drive is not something to paper over with a default.
+    """
+    if arm in ("off", ""):
+        return None
+    if arm != "on":
+        raise ValueError(f"traction must be 'off' or 'on', got {arm!r}")
+    kw = {}
+    fields = TractionParams.__dataclass_fields__
+    for item in str(overrides).replace(",", " ").split():
+        name, sep, value = item.partition("=")
+        if not sep or name not in fields:
+            raise ValueError(f"traction_params entry {item!r} is not NAME=VALUE for one of: "
+                             f"{', '.join(sorted(fields))}")
+        kw[name] = int(value) if fields[name].type == "int" else float(value)
+    return TractionGuard(TractionParams(**kw).validate())
 
 
 G = 9.80665
@@ -168,6 +202,22 @@ class PolicyNode(Node):
         self.controller_arm = str(p("controller"))
         self.grip = install_grip_arm(self.tracker, self.controller_arm, self.device,
                                      mu=(float(p("grip_mu")) or None))
+        # Traction guard: wheel lock / launch spin from `/odom` wheel speed against the IMU, with
+        # the speed command shaped when either fires. OFF by default -- it has been validated only
+        # by replaying the recordings (`scripts/replay_traction.py`), never on the moving car, and
+        # it is the one thing in this node that can raise a commanded speed the policy lowered.
+        # See docs/ros2.md, "Traction guard".
+        self.declare_parameter("traction", "off"); self.declare_parameter("traction_params", "")
+        self.traction_arm = str(p("traction"))
+        self.traction = build_traction_guard(self.traction_arm, str(p("traction_params")))
+        #: Latest body longitudinal acceleration [m/s^2] and motor current [A] for the guard, with
+        #: the times they were taken. The guard is fed at the `/odom` rate -- 50 Hz on this car, and
+        #: the rate the replay validated it at -- not at the scan rate, so no wheel-speed sample is
+        #: skipped; `shape` then runs once per published command.
+        self.ax_body = None; self.t_ax = None
+        self.motor_current = None; self.t_current = None
+        if self.traction is not None and VescStateStamped is not None:
+            self.create_subscription(VescStateStamped, "sensors/core", self.on_core, 1)
         self.create_subscription(Odometry, "odom", self.on_odom, 1)
         self.create_subscription(Imu, "sensors/imu/raw", self.on_imu, 10)
         if VescImuStamped is not None:
@@ -187,14 +237,47 @@ class PolicyNode(Node):
         self.obs.reset()
         self.get_logger().info(f"policy {p('checkpoint')} on {self.device}, speed cap {self.speed_cap} m/s, "
                                f"controller {self.controller_arm}"
-                               + (f" (mu {float(self.grip.mu[0]):.3f})" if self.grip is not None else ""))
+                               + (f" (mu {float(self.grip.mu[0]):.3f})" if self.grip is not None else "")
+                               + f", traction {self.traction_arm}"
+                               + ("" if self.traction is None else
+                                  f" (lock past {self.traction.p.lock_accel:.1f} m/s^2 wheel decel "
+                                  f"and {self.traction.p.lock_rate:.1f} m/s^2 residual, spin past "
+                                  f"{self.traction.p.spin_accel:.1f} / {self.traction.p.spin_rate:.1f}, "
+                                  f"release authority {self.traction.p.release_max:.1f} m/s)"))
+        if self.traction is not None and VescStateStamped is None:
+            self.get_logger().warning(
+                "vesc_msgs is not importable, so /sensors/core motor current is unavailable: the "
+                "traction guard will not require drive torque before calling a launch spin.")
 
     def on_odom(self, m: Odometry):
         v = m.twist.twist.linear.x
         if not math.isfinite(v):            # a NaN speed must not reach the actor, nor count as fresh
             return
         self.v = v
-        self.t_odom = self.clock()
+        self.t_odom = now = self.clock()
+        if self.traction is not None:
+            # Stale inputs are passed as None rather than as their last value: the guard holds its
+            # filters over a missing sample, and `update` re-seeds rather than detecting across a
+            # gap longer than `max_step_dt`.
+            fresh = lambda t: t is not None and now - t <= self.timeout
+            st = self.traction.update(now, v, self.ax_body if fresh(self.t_ax) else None,
+                                      self.motor_current if fresh(self.t_current) else None)
+            if st.changed:
+                self.get_logger().info(
+                    f"traction {st.state}: wheel {st.wheel_speed:+.2f} m/s at "
+                    f"{st.wheel_accel:+.1f} m/s^2, body {st.body_speed:+.2f} m/s at "
+                    f"{st.body_accel:+.1f} m/s^2 (residual {st.residual:+.1f}, slip {st.slip:+.2f}), "
+                    f"{st.locks} locks / {st.spins} spins so far")
+
+    def on_core(self, m):
+        """`/sensors/core` motor current, the drive-torque corroboration for a spin. Optional: the
+        guard treats None as "no information" rather than as "no torque", and one recording has no
+        such topic at all."""
+        i = getattr(getattr(m, "state", None), "current_motor", None)
+        if i is None or not math.isfinite(float(i)):
+            return
+        self.motor_current = float(i)
+        self.t_current = self.clock()
 
     def clock(self):
         """Monotonic seconds. A method so tests can drive it without a ROS clock."""
@@ -265,6 +348,7 @@ class PolicyNode(Node):
         row = [raw[0], raw[1], raw[2], *self._accel_to_si(raw[3], raw[4], raw[5])]
         self.imu_buf.append(row)
         self.imu_stamps.append(now)
+        self.ax_body = row[3]; self.t_ax = now      # SI body x acceleration, for the traction guard
         # Bounded: one scan period at 50 Hz is a couple of samples, so anything beyond a handful
         # means the consumer stalled and the oldest of them do not belong to the next scan.
         while len(self.imu_buf) > IMU_BUF_MAX:
@@ -334,6 +418,10 @@ class PolicyNode(Node):
         stitching the new one onto them feeds the policy an action history that never happened."""
         self._inhibited = False
         self.obs.reset()
+        if self.traction is not None:
+            # Same argument as the observation history: the wheel-speed derivative, the body-speed
+            # estimate and any latched release describe a segment that is over.
+            self.traction.reset()
         if self.tracker is not None:
             self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
         self.get_logger().info("sensors recovered: observation and tracker history cleared")
@@ -377,11 +465,20 @@ class PolicyNode(Node):
             cmd = self.tracker(a, torch.tensor([self.v], device=self.device), torch.tensor([self.speed_cap], device=self.device),
                                torch.tensor([float(imu_mean[2])], device=self.device), delay=self.delay)[0]
             msg.drive.steering_angle = float(max(-self.steer_max, min(self.steer_max, (float(cmd[0]) - self.cal[0]) / self.cal[1])))
-            msg.drive.speed = float(cmd[1]) / self.cal[2]
+            speed = float(cmd[1])
         else:
             a = a[0].cpu().numpy()
             msg.drive.steering_angle = float(a[0] * self.steer_max)
-            msg.drive.speed = float(min((a[1] + 1) * 0.5 * self.spec.v_max, self.speed_cap))
+            speed = float(min((a[1] + 1) * 0.5 * self.spec.v_max, self.speed_cap))
+        if self.traction is not None:
+            # Last thing before the command leaves, and *before* `speed_gain`: the guard reasons in
+            # the car's own m/s -- it compares the command against a body speed estimated from this
+            # car's sensors -- while the published field is that speed divided by the calibration
+            # gain, so shaping the published number would mix the two scales whenever the gain is
+            # not 1. A released brake or a capped launch is about the wheel, not about the plan, so
+            # nothing upstream needs to know it happened.
+            speed = min(self.traction.shape(speed), self.speed_cap)
+        msg.drive.speed = float(speed) / self.cal[2] if self.tracker is not None else float(speed)
         if self.get_parameter("enabled").value:
             self.pub.publish(msg)
         dt = (time.perf_counter() - t0) * 1000
