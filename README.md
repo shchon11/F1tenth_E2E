@@ -129,7 +129,9 @@ checkpoint hash, renderer and source hashes.
 The console's third page, **환경**, is an environment editor: paint duct hoses and tall walls, draw
 wall polylines, place the built-in props, import GLB / OBJ / STL meshes as obstacles, and save the
 result as `scene:<name>` — a catalogue entry the simulator, the trainer and the driving page all
-load. See [Environment editor](docs/environment_editor.md).
+load. A **랜덤 트랙 생성** panel builds closed tracks from a recipe of features — straights,
+chicanes, slaloms, corners, hairpins — at a chosen size and seed, as editable scenes
+(`python -m f1sim.trackgen` for batches). See [Environment editor](docs/environment_editor.md).
 
 [![the environment editor](docs/media/f1tenth-environment-editor.png)](docs/media/f1tenth-environment-editor.png)
 

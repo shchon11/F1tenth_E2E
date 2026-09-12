@@ -283,13 +283,21 @@ def sample_path(points: Sequence, closed: bool, step: float = PATH_STEP) -> np.n
             return P[n - 1] - P[n - 2]
         return 0.5 * (P[i + 1] - P[i - 1])
 
+    def unit(v, L):
+        m = float(np.linalg.norm(v))
+        return v * (L / m) if m > 1e-12 else v
+
     segs = [(i, i + 1) for i in range(n - 1)] + ([(n - 1, 0)] if closed else [])
     out = []
     for k, (i, j) in enumerate(segs):
         chord = P[j] - P[i]
         L = float(np.linalg.norm(chord))
-        t0 = cr_tangent(i) if smooth[i] else chord
-        t1 = cr_tangent(j) if smooth[j] else chord
+        # A smooth vertex contributes the *direction* of its Catmull-Rom tangent; the magnitude
+        # is the segment's own chord. Uniform Catmull-Rom hands a short segment next to a long
+        # one a tangent many times its length, and the curve loops -- exactly what a tight arc
+        # feeding a long straight produced.
+        t0 = unit(cr_tangent(i), L) if smooth[i] else chord
+        t1 = unit(cr_tangent(j), L) if smooth[j] else chord
         curved = smooth[i] or smooth[j]
         m = max(2, int(math.ceil((1.5 if curved else 1.0) * L / step)) + 1)
         seg = _hermite(P[i], P[j], t0, t1, m) if curved else np.linspace(0, 1, m)[:, None] * chord + P[i]

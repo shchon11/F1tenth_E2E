@@ -172,6 +172,18 @@ def _load_base(name: str, **kw) -> Track:
         base, _, spec = name.rpartition("+hard")
         from .hard_obstacles import with_hard_obstacles
         return with_hard_obstacles(_load_base(base, **kw), int(spec))
+    if name.startswith("gen:recipe:"):
+        # gen:recipe:<seed>: the environment editor's random track generator with its default
+        # recipe (straights, chicanes, fast slaloms; corners, sweepers, hairpins), 20 m, 1.6 m lane
+        from .trackgen import TrackRecipe, generate
+        seed, kind, spec = _split_obstacle_suffix(name[len("gen:recipe:"):])
+        t = generate(TrackRecipe(), int(seed)).to_scene(f"recipe_{seed}").to_track()
+        t.name = f"gen:recipe:{seed}"
+        if kind == "props":
+            return _static_props(t, int(spec))
+        if kind:
+            raise ValueError(f"gen:recipe takes +props<seed> only, not +{kind}")
+        return t
     if name.startswith("gen:"):
         _, style, seed = (name.split(":") + ["0"])[:3]
         seed, kind, spec = _split_obstacle_suffix(seed)          # gen:competition:3+obs7 / +rlobs7

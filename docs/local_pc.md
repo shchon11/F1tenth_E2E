@@ -39,6 +39,14 @@ python -m f1sim.scene validate korea_edit                             # 센터�
 python -m f1sim.learn.ppo --tracks scene:my_hall,scene:korea_edit ... # 학습에도 그대로
 ```
 
+랜덤 트랙은 에디터의 **랜덤 트랙 생성** 패널(항목·규모·seed)이나 셸에서 만든다:
+
+```bash
+python -m f1sim.trackgen --name batch --seed 100 --count 20 --size 20 \
+    --runs straight,chicane,slalom_fast --turns corner,sweeper,hairpin=1   # scene:batch_100 … 119
+python -m f1sim.learn.watch --map gen:recipe:3                              # 기본 레시피, 저장 없이
+```
+
 자세한 도구 설명은 [Environment editor](environment_editor.md).
 
 ## 학습 시작점

@@ -576,3 +576,30 @@ def test_painted_duct_becomes_an_editable_path(page):
     pg.undo()                         # the drag
     pg.undo()                         # the conversion
     assert pg.state.doc.paths == [] and pg.state.doc.painted_duct.any()
+
+
+def test_generator_card_makes_an_editable_track(page):
+    pg, vp = page
+    pg.spin_gen_seed.setValue(4)
+    pg.combo_gen_size.setCurrentIndex(0)                      # 소
+    chk, cnt = pg._gen_feature_widgets["hairpin"]
+    chk.setChecked(True)
+    cnt.setValue(1)
+    pg._gen_feature_widgets["cone_slalom"][0].setChecked(False)
+    n = vp.geometries
+    assert pg.generate_track()
+    _wait_geometry(pg, vp, n)
+    doc = pg.state.doc
+    assert doc.track_path is not None and doc.centerline is not None
+    assert doc.source["generator"] == "trackgen" and doc.source["features"].count("hairpin") == 1
+    assert doc.name.startswith("rand_4")
+    assert pg.state.dirty
+    seed_before = pg.spin_gen_seed.value()
+    pg.state.mark_saved()                                     # no discard dialog
+    pg._regenerate()
+    assert pg.spin_gen_seed.value() == seed_before + 1 and pg.state.doc.name.startswith("rand_5")
+    # the generated path is editable like any track path
+    q = pg.state.doc.track_path
+    pg.state.select_path(q.id, 0)
+    pg.toggle_vertex_smooth()
+    assert pg.state.undo_label() == "직선↔곡선"

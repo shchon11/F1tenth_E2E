@@ -103,6 +103,39 @@ becomes its hull per band — bake it into the grid if that matters. The editor 
 footprint overlaps a wall, and the validator refuses one the renderer cannot build, so a collider
 you cannot see is not something a scene can contain.
 
+## Random tracks from a recipe
+
+**랜덤 트랙 생성** (left column) builds a closed track from the features you tick — 직선, 시케인,
+고속/저속 슬라럼, 콘 슬라럼 between the turns; 90° 코너, 완만한 커브, 유턴(헤어핀), 역방향 코너 as the
+turns — at a chosen 규모 (소/중/대), 차선 폭 and seed. A count of 자동 lets the generator pick how
+many; a number fixes it. The result is an ordinary scene whose lane is one closed **track path**,
+so it is immediately editable by handle, and the same features and seed always give the same track.
+
+[![a generated track in the editor](media/f1tenth-trackgen.png)](media/f1tenth-trackgen.png)
+
+<sub>Seed 14 of the default recipe with cone slalom, slow slalom and reverse corner enabled: a
+chicane, a fast slalom, a cone slalom (the posts along the top straight), two sweepers and three
+corners over 66 m. Real console on software GL; [manifest](media/trackgen-manifest-2026-09-13.json).</sub>
+
+[![eight generated tracks](media/f1tenth-trackgen-gallery.png)](media/f1tenth-trackgen-gallery.png)
+
+<sub>Eight recipes and seeds drawn with matplotlib from the generator's output (centreline, the two
+hoses, ▲ cone posts): all features; hairpin plus corners; a two-hairpin oval; a slalom-heavy lap.</sub>
+
+How it works (`f1sim/f1sim/trackgen.py`): a lap is a ring of turns joined by runs. Turn features
+are drawn until their signed angles sum to 360°; run features fill the gaps. Each run is a length
+along the current heading plus a fixed lateral term (a chicane's offset), each turn a chord that
+scales with its radius, so closing the loop is a linear condition on the run lengths and turn radii.
+Random lengths and radii are projected onto that condition by bounded least squares (never below a
+feature's minimum length or a drivable radius), the lap is rejected if it crosses or comes within a
+lane plus a hose of itself, and the survivor is scaled to the requested size. Slalom amplitudes are
+capped by the curvature at which the inner hoses of two bends would fold into each other.
+
+From a shell, `python -m f1sim.trackgen --name batch --seed 100 --count 20 --size 20 --runs
+straight,chicane=1,slalom_fast --turns corner,sweeper,hairpin=1` writes twenty scenes
+`scene:batch_100 … scene:batch_119` for a training set; `--dry-run` prints the laps without saving.
+`gen:recipe:<seed>` is the default recipe as a catalogue name, for a quick look without saving.
+
 ## Validate and drive
 
 **검증** saves the scene and runs `python -m f1sim.scene validate` in a subprocess (this is the
@@ -138,9 +171,10 @@ venue, or `gen:competition:3+props7` to move the props around.
 | | |
 | --- | --- |
 | `f1sim/f1sim/scene.py` | `SceneDoc`, `PathSpec` (straight/curved vertices, `sample_path`), `PropPlacement`, `AssetInfo`; paint/fill/bake operations, path rasterisation, live corridor check; asset import; `python -m f1sim.scene import / validate / export-ros` |
+| `f1sim/f1sim/trackgen.py` | random closed tracks from a feature recipe; `python -m f1sim.trackgen`; `gen:recipe:<seed>` |
 | `f1sim/f1sim/props.py` | the `mesh` prop style (`path`, `scale`, `up`) beside the six built-ins |
 | `f1sim/f1sim/maps.py` | the `scene:` prefix and `scene_names()` |
 | `f1sim/f1sim/viewer/contours.py`, `geometry.py` | torch-free marching-squares contours and the geometry build the worker and the editor share |
 | `f1sim/f1sim/viewer/console/editor_viewport.py` | free camera, ground picking, overlays (cursor, selection, preview band, gizmo) |
 | `f1sim/f1sim/viewer/console/env_editor.py` | the page: tools, undo stack, geometry builder thread, subprocess jobs, inspector, asset library |
-| `f1sim/tests/test_scene*.py`, `test_editor_viewport.py`, `test_env_editor.py` | round-trips, LiDAR against imported meshes, picking, tools and undo, the hand-off |
+| `f1sim/tests/test_scene*.py`, `test_trackgen.py`, `test_editor_viewport.py`, `test_env_editor.py` | round-trips, LiDAR against imported meshes, picking, tools and undo, the hand-off |

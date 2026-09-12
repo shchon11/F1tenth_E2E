@@ -1057,6 +1057,9 @@ class EnvEditorPage(QtWidgets.QWidget):
         new.add(self.btn_new)
         lv.addWidget(new)
 
+        # -- random track from a recipe of features (f1sim.trackgen)
+        lv.addWidget(self._build_generator_card())
+
         # -- start from a catalogue map: the same grouped picker the driving page uses. The list
         # arrives from the worker (map names need torch); until then the search box still accepts
         # a typed name such as `real:korea_2026_competition`.
@@ -1406,6 +1409,100 @@ class EnvEditorPage(QtWidgets.QWidget):
 
         self._fill_library()
         self._install_shortcuts()
+
+    def _build_generator_card(self) -> QtWidgets.QWidget:
+        from f1sim import trackgen as TG
+        card = Card("랜덤 트랙 생성")
+        row = QtWidgets.QHBoxLayout()
+        self.combo_gen_size = QtWidgets.QComboBox()
+        for k, v in TG.SIZES.items():
+            self.combo_gen_size.addItem(k, v)
+        self.combo_gen_size.setCurrentIndex(1)
+        row.addWidget(FieldRow("규모", self.combo_gen_size), 1)
+        self.spin_gen_lane = QtWidgets.QDoubleSpinBox()
+        self.spin_gen_lane.setRange(0.8, 4.0)
+        self.spin_gen_lane.setSingleStep(0.1)
+        self.spin_gen_lane.setValue(1.6)
+        self.spin_gen_lane.setSuffix(" m")
+        row.addWidget(FieldRow("차선 폭", self.spin_gen_lane))
+        self.spin_gen_seed = QtWidgets.QSpinBox()
+        self.spin_gen_seed.setRange(0, 999999)
+        self.spin_gen_seed.setValue(int(time.time()) % 1000)
+        row.addWidget(FieldRow("seed", self.spin_gen_seed))
+        card.add(row)
+        # features: a checkbox (may appear) and a count (-1 = free, shown as "자동")
+        self._gen_feature_widgets: Dict[str, Tuple[QtWidgets.QCheckBox, QtWidgets.QSpinBox]] = {}
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(SP[1])
+        grid.setVerticalSpacing(2)
+        items = [("run", k, v) for k, v in TG.RUN_FEATURES.items()] + [("turn", k, v) for k, v in TG.TURN_FEATURES.items()]
+        default_on = {"straight", "chicane", "slalom_fast", "corner", "sweeper", "hairpin"}
+        for i, (_grp, key, spec) in enumerate(items):
+            chk = QtWidgets.QCheckBox(spec["label"])
+            chk.setChecked(key in default_on)
+            chk.setToolTip(spec["hint"])
+            cnt = QtWidgets.QSpinBox()
+            cnt.setRange(-1, 8)
+            cnt.setValue(-1)
+            cnt.setSpecialValueText("자동")
+            cnt.setToolTip("개수. '자동'이면 무작위로 몇 개든")
+            cnt.setFixedWidth(64)
+            chk.toggled.connect(cnt.setEnabled)
+            cnt.setEnabled(chk.isChecked())
+            grid.addWidget(chk, i // 2, (i % 2) * 2)
+            grid.addWidget(cnt, i // 2, (i % 2) * 2 + 1)
+            self._gen_feature_widgets[key] = (chk, cnt)
+        card.add(grid)
+        gr = QtWidgets.QHBoxLayout()
+        self.btn_generate = QtWidgets.QPushButton("생성")
+        self.btn_generate.setObjectName("PrimaryButton")
+        self.btn_generate.clicked.connect(self.generate_track)
+        gr.addWidget(self.btn_generate)
+        self.btn_regenerate = QtWidgets.QPushButton("다른 seed 로 다시")
+        self.btn_regenerate.setObjectName("GhostButton")
+        self.btn_regenerate.clicked.connect(self._regenerate)
+        gr.addWidget(self.btn_regenerate)
+        card.add(gr)
+        self.gen_note = label("고른 항목들로 닫힌 트랙을 무작위로 만듭니다. 결과는 트랙 경로라서 바로 꼭짓점을 잡아 고칠 수 있고, "
+                              "같은 항목·seed 면 같은 트랙이 나옵니다. 배치 생성은 `python -m f1sim.trackgen`.", "hint")
+        card.add(self.gen_note)
+        return card
+
+    def generator_recipe(self):
+        from f1sim import trackgen as TG
+        runs = {k: (cnt.value() if chk.isChecked() else 0) for k, (chk, cnt) in self._gen_feature_widgets.items()
+                if k in TG.RUN_FEATURES}
+        turns = {k: (cnt.value() if chk.isChecked() else 0) for k, (chk, cnt) in self._gen_feature_widgets.items()
+                 if k in TG.TURN_FEATURES}
+        return TG.TrackRecipe(runs=runs, turns=turns, size_m=float(self.combo_gen_size.currentData()),
+                              lane_width=float(self.spin_gen_lane.value()))
+
+    def generate_track(self, seed: Optional[int] = None) -> bool:
+        from f1sim import trackgen as TG
+        if not self._confirm_discard():
+            return False
+        seed = int(self.spin_gen_seed.value()) if seed is None else int(seed)
+        recipe = self.generator_recipe()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            g = TG.generate(recipe, seed)
+        except RuntimeError as exc:
+            self._set_status(str(exc), danger=True)
+            return False
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        name = self._unique_name(f"rand_{seed}")
+        doc = g.to_scene(name)
+        self.load_doc(doc, dirty=True)
+        feats = " · ".join(dict.fromkeys(TG.RUN_FEATURES.get(f, TG.TURN_FEATURES.get(f, {})).get("label", f)
+                                         for f in g.features))
+        self._set_status(f"'{name}' 생성 · 길이 {g.length_m:.1f} m · {g.attempts}번째 시도 · {feats}. "
+                         f"손질한 뒤 저장하세요.")
+        return True
+
+    def _regenerate(self):
+        self.spin_gen_seed.setValue(self.spin_gen_seed.value() + 1)
+        self.generate_track()
 
     def _install_shortcuts(self):
         def sc(seq, fn):
