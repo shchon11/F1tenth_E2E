@@ -170,7 +170,7 @@ real/bb22-1#hard:*           extreme patterns, placement seed drawn at run time
 The registry offers only the families a given track's loader can carry. Seed `*` means "anywhere": the
 console draws one at session start and shows the concrete scenario in its facts strip so a placement
 worth keeping can be pinned, while training expands it into `--obstacle-draws N` rasterised variants
-from `--seed`. Grammar, the 59-entry catalogue and the conversion table: [tracks.md](docs/tracks.md).
+from `--seed`. Grammar, the catalogue and the conversion table: [tracks.md](docs/tracks.md).
 
 The three groups answer one question — **has the policy seen this floor?** 학습 is the maps a policy
 trains on (53 base tracks, 149 variants); 검증 is maps never used for training in any form (8 base
@@ -244,7 +244,7 @@ parameter is fitted to: [calibration](docs/real_data_calibration.md); weaknesses
 | Odometry | VESC dead reckoning following `vesc_to_odom`'s formula with calibration residuals, so it drifts — and deliberately not offered to the policy |
 | LiDAR | 1081 beams over 270°, cast in **3D** against a layered map — beams pass over a low duct hose, strike the floor under dive, see clutter beyond the track; motion distortion across the sweep; range noise and dropouts |
 | IMU | VESC 6-axis unit on its own 50 Hz clock against the 40 Hz control step; gravity leakage through roll/pitch, CoG lever arm, speed-dependent vibration, bias and random walk, quantisation, and a model of the VESC's own attitude estimate |
-| Randomisation | a *configured set* of [named ranges](docs/architecture.md#what-is-randomised) (49 entries when written) re-sampled per environment on reset — **not** every numeric parameter; `vehicle.mu_r_scale`, for one, is fixed |
+| Randomisation | a *configured set* of [named ranges](docs/architecture.md#what-is-randomised) (51 in `RandomizationConfig.ranges` today) re-sampled per environment on reset — **not** every numeric parameter; `vehicle.mu_r_scale`, for one, has no entry at all |
 
 **Calibrated 2026-09-13: the attitude model.** The accelerometer path for body roll had failed twice;
 the gyro path settled it — integrate the roll/pitch rate, band-pass out bias, regress against the same
