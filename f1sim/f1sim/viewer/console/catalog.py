@@ -8,6 +8,11 @@ and the list fills in when they arrive.
 
 `RUNS_DIR` is duplicated from `f1sim.learn.common` rather than imported for exactly that reason;
 `check_runs_dir_matches()` in the worker asserts the two agree, so the copy cannot drift silently.
+
+The *names* are no longer in that bargain. `f1sim.tracks` -- the registry and the scenario grammar
+-- is torch-free, so the console formats, parses and groups a scenario itself; what still comes
+from the worker is the catalogue as the worker can actually load it (which racetrack directories
+and gym maps exist on its disk), which is a fact about the worker's filesystem, not about naming.
 """
 from __future__ import annotations
 
@@ -15,6 +20,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+from ... import tracks
 
 RUNS_DIR = os.path.join(os.path.expanduser("~"), "f1sim_runs")
 CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt")
@@ -82,82 +89,93 @@ def list_runs(runs_dir: str = RUNS_DIR) -> List[RunInfo]:
 
 @dataclass
 class MapCatalog:
-    """Named map groups, delivered by the worker.
+    """The base tracks the worker can load, in the project's three groups.
 
-    The groups come straight from the project's own split constants in `f1sim.learn.common`
-    (`EVAL_TRACKS`, `EVAL_OBSTACLE_TRACKS`, `TRAIN_TRACKS`). They are worth showing because a map
-    from the evaluation split and one from the training split answer different questions, and a
-    flat list of several hundred names makes it easy to read an answer off the wrong one.
+    What changed and why: this used to be five groups of *loader names*, and a loader name is a map
+    with a direction, an obstacle family and a placement seed glued to it
+    (`real:korea_2026_competition+rlobs213~mir~rev`). Two hundred of those in one list is not a list
+    of maps. The groups are now three, they hold **base track ids** (`real/korea26`), and the
+    direction / obstacle / seed choices are three little controls next to the list.
 
-    What they are *not* is a statement about the checkpoint you happen to have selected. Runs in
-    this project were resumed with different splits and some W&B track metadata is broken, so the
-    only thing the label can honestly claim is "this is the project's default split", never "this
-    policy has never seen this map". The UI names them accordingly and says so in the tooltip.
+    The three groups answer one question -- has the policy seen this floor? -- which is the only
+    thing a group label here can honestly claim. It is a claim about the *project's* split, not
+    about the checkpoint you happen to have selected: runs here were resumed with different
+    `--tracks`, so `GROUP_CAVEAT` says so wherever a label appears.
+
+    `entries` carries the display name, family and note for every id in `groups` *and* for every
+    other track in the catalogue, so the search box can reach a map that is in neither split
+    (`rt/silverstone`, `gym/levine`) without a group for it.
 
     `ready` stays False until the worker has replied, so the UI can say "목록 읽는 중" instead of
     pretending the catalog is empty.
     """
     groups: Dict[str, List[str]] = field(default_factory=dict)
+    entries: Dict[str, dict] = field(default_factory=dict)
     ready: bool = False
     error: Optional[str] = None
 
     @property
     def total(self) -> int:
-        seen = set()
-        for names in self.groups.values():
-            seen.update(names)
-        return len(seen)
+        return len(self.entries) or len({n for names in self.groups.values() for n in names})
 
-    def group_of(self, name: str) -> Optional[str]:
+    def ids(self) -> List[str]:
+        """Every track, group members first (in group order), then the rest of the catalogue."""
+        out = [n for g in GROUP_ORDER for n in self.groups.get(g, [])]
+        out += [n for g, names in self.groups.items() if g not in GROUP_ORDER for n in names]
+        out += [i for i in self.entries if i not in set(out)]
+        return list(dict.fromkeys(out))
+
+    def entry(self, track_id: str) -> dict:
+        e = self.entries.get(track_id)
+        if e:
+            return e
+        return {"id": track_id, "family": track_id.split("/", 1)[0], "display": track_id,
+                "legacy": track_id, "note": "", "obstacles": list(tracks.OBSTACLES)}
+
+    def display(self, track_id: str) -> str:
+        return self.entry(track_id).get("display") or track_id
+
+    def obstacle_options(self, track_id: str) -> List[str]:
+        return list(self.entry(track_id).get("obstacles") or ("",))
+
+    def group_of(self, track_id: str) -> Optional[str]:
         for g, names in self.groups.items():
-            if name in names:
+            if track_id in names:
                 return g
         return None
 
     def first(self) -> Optional[str]:
+        for g in GROUP_ORDER:
+            if self.groups.get(g):
+                return self.groups[g][0]
         for names in self.groups.values():
             if names:
                 return names[0]
         return None
 
 
-#: Group order and the one-line explanation shown under each. Order matters: the first group is
-#: the default selection. The names say "프로젝트 정의" rather than "미학습" on purpose -- see the
-#: MapCatalog docstring. Keep these in sync with `sim_worker.map_catalog()`.
-#: The environment editor's scenes (`scene:<name>`, see `f1sim.scene`). First, and only present in a
-#: worker's catalogue when the user has made at least one; the GUI lists them itself through
-#: `list_scenes` below without waiting for the worker.
-SCENES_GROUP = "내 환경 (에디터)"
+#: The three groups, their order, the one sentence each has to earn, and the caveat that goes with
+#: any of them. Defined in `f1sim.tracks` next to the split rules that generate them -- that module
+#: is torch-free for exactly this reason -- and re-exported here because every console module
+#: already imports this one.
+SCENES_GROUP = tracks.GROUP_SCENES
+TRAIN_GROUP = tracks.GROUP_TRAIN
+HELDOUT_GROUP = tracks.GROUP_HELDOUT
+GROUP_ORDER = list(tracks.GROUP_ORDER)
+GROUP_HINT = dict(tracks.GROUP_HINT)
+GROUP_CAVEAT = tracks.GROUP_CAVEAT
 
-GROUP_ORDER = [
-    SCENES_GROUP,
-    "기본 평가셋",
-    "장애물 (상자·궤짝·드럼)",
-    "기본 학습셋",
-    "이전 실험 재현 (격자 장애물)",
-    "전체 카탈로그",
-]
-GROUP_HINT = {
-    SCENES_GROUP: ("환경 페이지에서 직접 만들거나 고친 환경입니다 (~/f1sim_scenes, 또는 $F1SIM_SCENES). "
-                   "덕트·벽·장애물·불러온 메시가 그대로 시뮬레이터와 LiDAR 에 반영됩니다."),
-    "기본 평가셋": "프로젝트 정의 평가 분할 (common.EVAL_TRACKS)",
-    "장애물 (상자·궤짝·드럼)": ("평가 맵에 상자·나무궤짝·드럼 같은 입체 장애물을 놓은 변형입니다. "
-                        "차가 실제로 부딪히고 LiDAR 에도 잡힙니다. 이름 뒤 숫자는 배치 seed 입니다."),
-    "기본 학습셋": "프로젝트 정의 학습 분할 (common.TRAIN_TRACKS)",
-    "이전 실험 재현 (격자 장애물)": ("이전 실험이 학습·평가에 쓰던 장애물 세트입니다 "
-                            "(common.EVAL_OBSTACLE_TRACKS). 점유 격자에 찍어 넣는 방식이라 "
-                            "높이가 하나인 회전 사각형이고 윗면이 없습니다 — 위 입체 장애물과 "
-                            "다른 것입니다. 예전 결과를 재현할 때 쓰세요."),
-    "전체 카탈로그": "로드 가능한 모든 이름",
-}
-#: Shown wherever a group label appears. The split is a project convention, not a per-checkpoint
-#: fact, and the UI must not let the two be confused.
-GROUP_CAVEAT = ("이 분류는 프로젝트가 정의한 기본 분할입니다. 선택한 체크포인트가 실제로 어떤 맵으로 "
-                "학습됐는지는 해당 run의 학습 manifest를 봐야 알 수 있습니다.")
+#: What the search box says it does. The groups are three; the catalogue is larger than the three,
+#: and typing is how the rest of it is reached.
+SEARCH_HINT = "검색하면 세 그룹 밖의 맵(다른 레이스트랙, gym 맵, 생성 시드)까지 전부 찾습니다."
 
 
 def list_scenes() -> List[dict]:
     """The editor's saved scenes, newest first -- `f1sim.scene.list_scenes`, re-exported so the GUI
-    can fill the `내 환경 (에디터)` group itself. Pure filesystem, torch-free."""
+    can fill the `내 환경` group itself. Pure filesystem, torch-free."""
     from ...scene import list_scenes as _list_scenes
     return _list_scenes()
+
+
+def scene_ids() -> List[str]:
+    return [f"scene/{s['name']}" for s in list_scenes()]

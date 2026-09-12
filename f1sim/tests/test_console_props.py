@@ -164,23 +164,25 @@ def test_geometry_counts_and_sizes_include_the_props():
 
 
 # ----------------------------------------------------------------- catalogue
-def test_the_props_group_is_offered_and_labelled_the_same_on_both_sides():
-    from f1sim.viewer.console.catalog import GROUP_HINT, GROUP_ORDER
-    from f1sim.learn import common
-    label = "장애물 (상자·궤짝·드럼)"
-    assert label in GROUP_ORDER and label in GROUP_HINT
-    hint = GROUP_HINT[label]
-    # The label must not suggest these are decoration: the car collides with them and the LiDAR
-    # returns them, so a "보기 전용" style of wording would be actively misleading.
-    assert "보기 전용" not in label and "보기 전용" not in hint
-    assert "부딪" in hint and "LiDAR" in hint, (
-        "the hint has to say the obstacles are real to the simulation")
-    # The group is built over the eval maps rather than a hand-picked few, so every kind the
-    # `+props` suffix supports is reachable. (An earlier version asserted against a
-    # `PROP_SHOWCASE_MAPS` constant that no longer exists, because the demo list it named was
-    # replaced by the eval set.)
-    kinds = {n.split(":")[0] for n in common.EVAL_TRACKS if ":" in n}
-    assert {"real", "rt", "gen"} <= kinds
+def test_modelled_props_are_an_obstacle_option_not_a_group():
+    """These used to be a catalogue group ("장애물 (상자·궤짝·드럼)"), which made a *map with boxes
+    on it* a different map from the same map without. They are one choice of the obstacle control
+    now, offered on every track whose loader can carry them, and the label still has to say they
+    are real to the simulation rather than decoration."""
+    from f1sim import tracks
+    from f1sim.viewer.console.catalog import GROUP_ORDER
+    assert "장애물 (상자·궤짝·드럼)" not in GROUP_ORDER
+    assert "props" in tracks.OBSTACLES
+    hint = tracks.OBSTACLE_HINT["props"]
+    assert tracks.OBSTACLE_LABEL["props"] == "입체"
+    assert "보기 전용" not in hint
+    assert "볼록" in hint and "격자" in hint, (
+        "the hint has to separate modelled props from the rasterised boxes")
+    # Reachable on every family whose loader accepts `+props`, which is what the group used to be
+    # hand-built over.
+    for tid in ("real/korea26", "rt/monza", "gen/comp-0", "scene/anything"):
+        assert "props" in tracks.get(tid).obstacle_options(), tid
+    assert tracks.resolve("rt/monza#props:3") == "rt:Monza+props3"
 
 
 @pytest.mark.parametrize("name", ["real:korea_2026_competition", "rt:Monza", "gen:competition:0"])

@@ -61,7 +61,6 @@ import numpy as np
 
 from .console import protocol as P
 from .console.protocol import LatestSlot
-from .console.catalog import SCENES_GROUP
 
 #: Frames the worker will let pile up before dropping the oldest. Two is enough to cover a hiccup
 #: in the console without storing latency: what the viewer wants is the newest state, not a queue.
@@ -178,6 +177,16 @@ class StartConfigError(ValueError):
 # Module level and torch-free on purpose: the console-side tests and the worker lifecycle tests can
 # exercise them without importing torch or starting a process.
 
+def tracks_display(spec: str) -> str:
+    """A scenario in Korean (`Blackbox 2022 #1 · 역방향 · 주행선 위 (시드 44)`), or the raw name
+    when it is not a catalogue scenario at all."""
+    from .. import tracks as T
+    try:
+        return T.display(spec)
+    except Exception:
+        return str(spec)
+
+
 def validate_start_config(cfg: P.SessionConfig) -> None:
     """Reject a start we cannot honour, before anything expensive happens.
 
@@ -190,6 +199,14 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
         raise StartConfigError(f"레이스당 차량 수는 1 이상이어야 합니다 (받은 값 {cfg.cars_per_race}).")
     if not str(cfg.map_name).strip():
         raise StartConfigError("맵을 선택해 주세요.")
+    # A malformed scenario is the user's typing, not a bug, and saying so here costs nothing --
+    # the alternative is a traceback from the loader after the checkpoint has already been read.
+    from .. import tracks as _tracks
+    if _tracks.is_spec(str(cfg.map_name)):
+        try:
+            _tracks.parse(str(cfg.map_name))
+        except _tracks.TrackError as exc:
+            raise StartConfigError(str(exc)) from exc
     if cfg.speed_cap is not None and not (0.0 < float(cfg.speed_cap) <= 30.0):
         raise StartConfigError(f"속도 상한 {cfg.speed_cap} m/s 는 범위를 벗어났습니다 (0 초과 30 이하).")
     if int(cfg.max_render_cars) < 1:
@@ -494,76 +511,31 @@ class SimWorker:
             raise Cancelled()
 
     # ================================================================ catalogue
-    def map_catalog(self) -> Dict[str, List[str]]:
-        """Named groups over the map catalog.
+    def map_catalog(self) -> Dict[str, object]:
+        """The base tracks the console lists, in the project's three groups.
 
-        The names say "기본 평가셋 / 기본 학습셋" rather than "미학습": these are the project's own
-        split constants, and a run may have been resumed with a different split, so the honest claim
-        is "this is the project's default split", not "this policy has never seen this map".
-        Mirrors `console.catalog.GROUP_ORDER`.
+        Three, not five, and base tracks rather than loader names: `real/korea26` is one row, and
+        the direction, obstacle family and seed that used to be baked into its name
+        (`real:korea_2026_competition+rlobs213~mir~rev`) are the picker's three controls. The
+        grouping is `f1sim.tracks`' own -- the same `SplitRule`s that generate `TRAIN_TRACKS` --
+        so the list and the training split cannot disagree about what "학습" means.
+
+        `entries` carries every track in the catalogue, not only the grouped ones, so the console's
+        search box reaches `rt/silverstone` and `gym/levine` without a group for them. What the
+        worker adds over the registry is its own filesystem: which racetrack directories and gym
+        maps are actually present here, and which scenes the user has saved.
         """
-        from ..learn import common
         from .. import maps
+        from .. import tracks as T
 
-        def uniq(seq):
-            out, seen = [], set()
-            for n in seq:
-                if n not in seen:
-                    seen.add(n)
-                    out.append(n)
-            return out
-
-        catalog = ([f"real:{k}" for k in maps.REAL]
-                   + [f"rt:{k}" for k in maps.racetrack_names()]
-                   + [f"gym:{k}" for k in maps.gym_map_names()]
-                   + [f"gen:{s}:{i}" for s in ("competition", "control", "serpentine", "circuit", "hallway")
-                      for i in range(4)])
-        # `+props<seed>` asks the loader for the same map with modelled obstacles standing on it
-        # (`Track.with_static_props`) -- boxes, crates, drums, held as finite convex sections. The
-        # simulator collides with them and the LiDAR returns them.
-        #
-        # Offered over the eval maps rather than a hand-picked three, so the obstacle group is the
-        # obstacle group rather than a demo. The suffix order matters and is the loader's, not a
-        # choice: `<base>+props<seed>~rev`, the same order `+obs101~rev` uses. Bases that already
-        # carry an obstacle suffix are skipped -- stacking two is not a thing the loader parses.
-        #
-        # None of this touches `common.EVAL_OBSTACLE_TRACKS`, and no existing `+obs` / `+rlobs`
-        # name is reinterpreted: those keep meaning exactly what they meant.
-        prop_seeds = (3, 7, 11)
-        prop_bases, seen_base = [], set()
-        for n in uniq(common.EVAL_TRACKS):
-            base, _, direction = n.partition("~")
-            if "+" in base:                      # already an obstacle variant; do not stack
-                continue
-            if not base.startswith(("real:", "rt:", "gen:")):
-                continue
-            key = (base, direction)
-            if key in seen_base:
-                continue
-            seen_base.add(key)
-            prop_bases.append((base, direction))
-        props_variants = [f"{base}+props{seed}" + (f"~{d}" if d else "")
-                          for base, d in prop_bases for seed in prop_seeds]
-        groups: Dict[str, List[str]] = {}
-        # The user's own environments (환경 page) come first when there are any: someone who just
-        # pressed 주행 in the editor is looking for the scene they built, not the eval split.
-        # Omitted entirely when empty, so the picker never shows an empty group.
-        scenes = [f"scene:{n}" for n in maps.scene_names()]
-        if scenes:
-            groups[SCENES_GROUP] = scenes
-        groups.update({
-            "기본 평가셋": uniq(common.EVAL_TRACKS),
-            # The obstacles a viewer session should normally be looking at.
-            "장애물 (상자·궤짝·드럼)": uniq(props_variants),
-            "기본 학습셋": uniq(common.TRAIN_TRACKS),
-            # Kept, and labelled for what it is: the obstacle sets earlier experiments trained and
-            # evaluated against. They are stamped into the occupancy grid, so they are rotated
-            # rectangles of one height with no top -- not the modelled props above. Reproducing an
-            # earlier result needs these; looking at obstacles does not.
-            "이전 실험 재현 (격자 장애물)": uniq(common.EVAL_OBSTACLE_TRACKS),
-            "전체 카탈로그": uniq(catalog + scenes),
-        })
-        return groups
+        scene_ids = [f"scene/{n}" for n in maps.scene_names()]
+        groups = T.groups(scene_ids=scene_ids)
+        entries = {e.id: {"id": e.id, "family": e.family, "family_label": e.family_label,
+                          "display": e.display, "legacy": e.legacy, "note": e.note,
+                          "obstacles": list(e.obstacle_options())}
+                   for e in T.catalog(extra=[t for ids in groups.values() for t in ids])}
+        summaries = {g: T.split_summary(T.GROUP_SPLIT[g]) for g in groups if g in T.GROUP_SPLIT}
+        return {"groups": groups, "entries": entries, "splits": summaries}
 
     def describe_checkpoint(self, run: str) -> dict:
         """Read a checkpoint's metadata without building anything."""
@@ -705,8 +677,17 @@ class SimWorker:
         speed_cap = float(cfg.speed_cap or checkpoint_speed_cap(extra, ckpt_path))
         self._check_cancel(gen)
 
-        self.stage(gen, "map", cfg.map_name)
-        track = self.load_track(cfg.map_name)
+        # The scenario, resolved once. `cfg.map_name` may be the short grammar with an open seed
+        # (`real/bb22-1@rev#line:*`); `scenario()` draws that seed from `cfg.seed`, and everything
+        # downstream -- the loader, the geometry stage, the facts strip -- uses the concrete one.
+        try:
+            scenario = cfg.scenario()
+        except Exception as exc:
+            raise StartConfigError(f"맵 '{cfg.map_name}': {exc}") from exc
+        map_legacy = scenario.legacy()
+        session_scenario = scenario.short()
+        self.stage(gen, "map", session_scenario)
+        track = self.load_track(map_legacy)
         self._check_cancel(gen)
 
         races = max(1, int(cfg.races))
@@ -793,6 +774,7 @@ class SimWorker:
             "act_fn": actor_runner(model, device, compile_enabled),
             "info_line": describe_checkpoint_line(extra, ckpt_path),
             "track": track, "cfg": cfg, "focus": 0, "k": 0,
+            "scenario": session_scenario, "map_legacy": map_legacy,
             "gg": deque(maxlen=90),
             "last_reload": time.time(),
             "raceline": rls[0] if rls else None,
@@ -803,7 +785,7 @@ class SimWorker:
                 self._step_once(session)
         self._check_cancel(gen)
 
-        self.stage(gen, "geometry", cfg.map_name)
+        self.stage(gen, "geometry", session_scenario)
         session["geometry"] = self.build_geometry(track, session["raceline"])
         # Last, so that nothing which can raise runs between installing the fast path's hooks and
         # handing the session over. A session abandoned after `install()` would keep the env alive
@@ -978,6 +960,15 @@ class SimWorker:
             # ("gen:competition:2" -> "competition_2"), so showing it would leave the header naming
             # a map that is not selected in the list.
             "map": str(cfg.map_name),
+            # The scenario as actually built, in the short grammar, with the obstacle seed drawn:
+            # `real/bb22-1@rev#line:4417`. This is what the facts strip shows. `map` above is what
+            # was *asked for* and may still read `#line:*`; the two differ exactly when a random
+            # seed was drawn, which is the moment a user most needs to be told the number.
+            "scenario": str(session.get("scenario") or cfg.map_name),
+            "scenario_display": tracks_display(session.get("scenario") or cfg.map_name),
+            # The loader's own name for the same thing, kept because a manifest, a benchmark file
+            # and a bug report are all written in that grammar.
+            "map_legacy": str(session.get("map_legacy") or cfg.map_name),
             "map_track_name": str(session["track"].name),
             "races": int(cfg.races), "cars_per_race": int(cfg.cars_per_race),
             "total_cars": total, "max_render_cars": shown,
@@ -1431,7 +1422,7 @@ class SimWorker:
 
         elif kind == P.CMD_LIST_MAPS:
             try:
-                self.say(P.MSG_MAPS, seq=seq, groups=self.map_catalog())
+                self.say(P.MSG_MAPS, seq=seq, **self.map_catalog())
             except Exception as exc:
                 self.say(P.MSG_MAPS, seq=seq, groups={},
                          error=f"맵 목록을 읽지 못했습니다: {type(exc).__name__}: {exc}")

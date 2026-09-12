@@ -624,7 +624,7 @@ def _repo_f1sim_dir() -> str:
 
 # ================================================================ the page
 class EnvEditorPage(QtWidgets.QWidget):
-    drive_requested = QtCore.pyqtSignal(str)        # map name, e.g. "scene:my_hall"
+    drive_requested = QtCore.pyqtSignal(str)        # track id, e.g. "scene/my_hall"
     scenes_changed = QtCore.pyqtSignal()
 
     def __init__(self, parent=None, viewport_factory=None):
@@ -1306,16 +1306,23 @@ class EnvEditorPage(QtWidgets.QWidget):
         self._set_status(f"저장했습니다: {new_dir}")
 
     def set_maps(self, cat):
-        """The worker's map catalogue, forwarded by the window; scenes are excluded (복제 covers them)."""
-        from .catalog import GROUP_ORDER, SCENES_GROUP
+        """The worker's map catalogue, forwarded by the window; scenes are excluded (복제 covers them).
+
+        Base tracks, listed by display name with the id beside them -- the same rows the driving
+        page's map card shows. 복제 hands whichever is selected to `maps.load`, which takes either
+        grammar, so an id works here exactly as a loader name did.
+        """
+        from .catalog import SCENES_GROUP
         if not getattr(cat, "ready", False):
             return
-        groups = [g for g in GROUP_ORDER if g in cat.groups] + [g for g in cat.groups if g not in GROUP_ORDER]
         items = []
-        for g in groups:
+        for tid in cat.ids():
+            g = cat.group_of(tid) or ""
             if g == SCENES_GROUP:
                 continue
-            items.extend((g, n, n, "") for n in cat.groups[g])
+            e = cat.entry(tid)
+            items.append((g, tid, e.get("display") or tid,
+                          f"{tid} · {e.get('family_label') or e.get('family', '')}"))
         self.map_picker.set_items(items)
         self.map_picker.set_status(f"{len({k for _g, k, _t, _s in items})} 개", "hint")
 
@@ -1326,11 +1333,12 @@ class EnvEditorPage(QtWidgets.QWidget):
     def import_from_catalog(self):
         name = self.catalog_choice()
         if not name:
-            self._set_status("복제할 맵을 목록에서 고르거나 이름을 입력하세요 (예: gen:competition:0).", danger=True)
+            self._set_status("복제할 맵을 목록에서 고르거나 이름을 입력하세요 (예: gen/comp-0).", danger=True)
             return
         if not self._confirm_discard():
             return
-        target = self._unique_name(name.replace(":", "_").replace("+", "_").replace("~", "_"))
+        target = self._unique_name(name.replace(":", "_").replace("/", "_").replace("+", "_")
+                                       .replace("~", "_").replace("@", "_").replace("#", "_"))
         self._run_job(["import", name, target], f"'{name}' 을 가져오는 중… (Track 로드, 몇 초)",
                       lambda code, out, err: self._imported(code, out, err, target))
 
@@ -1399,7 +1407,7 @@ class EnvEditorPage(QtWidgets.QWidget):
             if ok or QtWidgets.QMessageBox.question(
                     self, "검증 문제", "검증에서 문제가 나왔습니다. 그래도 주행 페이지로 넘길까요?",
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes:
-                self.drive_requested.emit(f"scene:{doc.name}")
+                self.drive_requested.emit(f"scene/{doc.name}")
         self.validate(then=go)
 
     def _run_job(self, args, status, cb):
