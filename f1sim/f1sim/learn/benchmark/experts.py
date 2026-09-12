@@ -175,10 +175,10 @@ class TrafficExpert:
     """
 
     def __init__(self, env, *, engage_frac: float = 0.12, engage_max_m: float = 8.0,
-                 engage_min_m: float = 2.5, desired_offset_m: float = 0.45,
-                 min_pass_offset_m: float = 0.32, follow_gap_m: float = 1.8,
+                 engage_min_m: float = 2.5, desired_offset_m: float = 0.60,
+                 min_pass_offset_m: float = 0.50, follow_gap_m: float = 1.8,
                  release_m: float = 1.2, side: int = 1, margin_m: float = 0.10,
-                 follow_decel: float = 3.0):
+                 follow_decel: float = 3.0, abreast_frac: float = 0.7):
         from f1sim.opponent_events import raceline_offset_limit
         if env.teacher is None:
             raise ValueError("TrafficExpert drives the raceline teacher; this env has none. A T "
@@ -191,6 +191,12 @@ class TrafficExpert:
         self.follow_gap = float(follow_gap_m)
         self.release = float(release_m)
         self.follow_decel = float(follow_decel)
+        # How much of the commanded offset has to have been ACHIEVED before this driver is allowed
+        # to close on the car ahead. Measured: without it the driver commits to the pass, keeps its
+        # speed while the tracker is still bringing it across, and arrives at the other car's
+        # bumper still on the line -- 4/4 contacts on korea_2025_iccas and gen:competition:0, no
+        # wall involved. A commanded offset is not a position.
+        self.abreast_frac = float(abreast_frac)
         # Engage over a distance proportional to the lap, so the manoeuvre is the same fraction of a
         # 33 m hairpin and a 68 m circuit. The fixed 7 m window of `PassExpert` is a fifth of the
         # first and a tenth of the second, which is why it spent most of a `map16x07` lap holding an
@@ -219,6 +225,18 @@ class TrafficExpert:
         v = e.sim.state[e.sim.other_idx.gather(1, j[:, None])[:, 0], 3]
         return gap, v
 
+    def _lateral(self, idx):
+        """(B,) signed metres left of the raceline each car actually IS, at its own raceline point.
+
+        The same signed cross product `RacelineTeacher` uses for its own lateral error, so "have I
+        got across yet" is measured the way the line itself is defined rather than estimated.
+        """
+        e = self.env
+        xy = e.sim.state[:, :2]
+        p0 = self.teacher.xy[e.sim.tid, idx]
+        t0 = self.teacher.tan[e.sim.tid, idx]
+        return t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0])
+
     def _room(self, idx):
         """Achievable |offset| at each car's own raceline point, capped at what it wants."""
         lim = self.limit[self.env.sim.tid, idx]
@@ -242,14 +260,16 @@ class TrafficExpert:
         an = self.teacher.plan_action(e.sim.state, e.sim.P, e.sim.tid, e.ecfg.v_max_policy,
                                       e.tracker.spec, offset=offset)
 
-        # Hold station behind a car this driver is not going round. The trigger carries the room to
-        # brake at the current closing speed, the shape the env's own `follow_cap` uses: a fixed
-        # distance is a rear-end waiting for a fast approach. Zero inside the body gap, because a
-        # car a `stop` event has parked is a wall that happens to be a car.
+        # Hold station behind a car this driver is not going round, AND behind one it has committed
+        # to but is not yet beside. The trigger carries the room to brake at the current closing
+        # speed, the shape the env's own `follow_cap` uses: a fixed distance is a rear-end waiting
+        # for a fast approach. Zero inside the body gap, because a car a `stop` event has parked is
+        # a wall that happens to be a car.
         mine = e.sim.state[:, 3]
         closing = (mine - v_other).clamp_min(0.0)
         trigger = self.follow_gap + closing * closing / (2.0 * self.follow_decel)
-        holding = (gap < trigger) & (self._w < 0.5)
+        abreast = self._lateral(idx) * self.side >= self.abreast_frac * offset.abs()
+        holding = (gap < trigger) & ((self._w < 0.5) | ~abreast)
         v_hold = torch.where(gap < self.follow_gap * 0.55, torch.zeros_like(v_other), 0.9 * v_other)
         scale = torch.where(holding,
                             (v_hold / max(float(e.ecfg.v_max_policy), 1e-6)).clamp(0.0, 1.0),
