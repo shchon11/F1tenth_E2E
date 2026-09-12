@@ -51,11 +51,17 @@ As a library, from inside `f1sim/` — the repository root holds a folder that s
 package ([getting started](docs/getting_started.md#a-directory-shadowing-trap)):
 
 ```python
-import torch; from f1sim import Track, Config, Simulator
-cfg = Config(); cfg.sim.compile = False      # torch.compile is a CUDA path; skip it on CPU
-sim = Simulator(Track.generate_random(seed=0), cfg, num_envs=4, device="cpu")
-r = sim.step(torch.zeros(4, 2))              # (steer [rad], target speed [m/s]) per env
-print(r.scan.shape, r.odom.shape, r.state.shape)     # (4, 1081) (4, 5) (4, 7)
+import torch
+from f1sim import Track, Config, Simulator
+
+cfg = Config()
+cfg.sim.compile = False                      # torch.compile is a CUDA path; skip it on CPU
+track = Track.generate_random(seed=0)        # or Track.from_ros_map("map.yaml")
+sim = Simulator(track, cfg, num_envs=4, device="cpu")
+
+r = sim.step(torch.zeros(4, 2))              # action = (steer [rad], target speed [m/s]) per env
+print(r.scan.shape, r.odom.shape, r.state.shape)     # (4, 1081) (4, 5) (4, 8)
+sim.reset(torch.nonzero(r.collision).flatten())      # partial reset re-samples the randomised parameters
 ```
 
 ### The three pages

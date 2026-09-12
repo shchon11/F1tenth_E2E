@@ -36,6 +36,7 @@ Newest first. Raw per-cell rows, rosters and manifests sit beside each note in
 | [Checkpoint benchmark v1, R10](research/benchmark-v1-r10-2026-09-12.md) | the two R10 directional-coverage checkpoints on the same v1 suite: no improvement, and a low-friction regression |
 | [Controller-arm evaluation](research/2026-09-11-controller-arm-evaluation.md) | matched-policy `fixed_low` vs `estimated` — 72 cells, 1152 trials, with outcome-only data beside it: no robust method-level completion gain |
 | [Legacy-recipe probe](research/2026-09-11-legacy-recipe-probe.md) | one-seed control asking whether the fine-tuning recipe alone explains the low-friction drop. It does not settle it either way |
+| [A wheel that can slip](research/wheel-model-2026-09-13.md) | the rear-axle rotation state, the ERPM channel's artefacts and the in-simulator traction arm, scored against the 22 real recordings by the same script that scores the car |
 
 ## Engineering notes
 

@@ -23,6 +23,7 @@ from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events
 from ..params import Config
 from . import common
+from . import grip_runtime
 from .evaluation_metrics import TrialAccumulator
 from .model import load_checkpoint
 from .obs import flatten_obs
@@ -59,7 +60,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
-             contention_range_m: float = 12.0, attack_range_m: float = 3.0) -> dict:
+             contention_range_m: float = 12.0, attack_range_m: float = 3.0,
+             controller: str = "legacy", estimator: str = "") -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -68,6 +70,10 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     simulator's generator.
     contention_range_m / attack_range_m: the two arc windows the traffic metrics measure over. The
     defaults are the env's own `overtake_range` and the benchmark's tight window.
+    controller: the arm to install between the policy and the wheels (`grip_runtime.ARMS`).
+    `legacy` installs nothing, which is what every caller before 2026-09-13 got. The arm is built
+    and installed after `sim.warmup()` for the same reason `ppo.py` builds it after the graph
+    runtime: whatever captures `mpc.solve` last owns the solver.
     """
     if protocol not in ("rolling", "trials") or steps < 1 or envs < 1 or race_size < 1 or envs % race_size:
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
@@ -105,6 +111,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     env = common.make_env(trs, envs, device, ecfg, cfg=cfg, seed=seed, rls=rls, teacher_grip=teacher_grip,
                          teacher_recover_time=teacher_recover_time)
     env.sim.warmup()
+    ctrl = grip_runtime.ControllerRuntime(env, controller, estimator or None, device=device)
+    ctrl.install()
     if teacher:
         teacher_policy = common.make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time)
         def policy(obs):
@@ -121,12 +129,13 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         # validated implementation of a different measurement, and a second caller poking at its
         # internals is how two measurements start disagreeing.
         with meter:
-            result = common.rollout_metrics(env, policy, steps, speed_cap)
+            result = common.rollout_metrics(env, policy, steps, speed_cap, controller=ctrl)
         for key, value in result.items():
             if isinstance(value, float) and not math.isfinite(value):
                 result[key] = None
     else:
         obs, _ = env.reset(seed=seed)
+        ctrl.begin(obs)
         learner = env.learner.clone()
         initial_ids = env.sim.tid[learner].cpu().numpy().copy()
         lengths = env.sim.track.length[env.sim.tid[learner]].cpu().numpy().astype(np.float64)
@@ -136,7 +145,9 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                                   time_budget_s=steps * env.sim.control_dt, speed_cap=speed_cap)
         with meter:
             for _ in range(steps):
+                ctrl.pre_action(obs)
                 obs, _, term, trunc, info = env.step(policy(obs))
+                ctrl.post_step(term, trunc)
                 meter.observe(info)
                 # Privileged transition velocity is captured before any simulator autoreset.
                 speed = torch.linalg.vector_norm(info['priv'][learner, :2], dim=1)
@@ -151,6 +162,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         result['initial_track_ids'] = initial_ids.tolist()
         result['initial_track_lengths_m'] = lengths.tolist()
     result.update(meter.report())
+    ctrl_metrics, _ = ctrl.collect_metrics()
+    ctrl.release()
     config_report = asdict(env.cfg)
     dropout = config_report['lidar']['dropout_value']
     if not math.isfinite(dropout):
@@ -179,7 +192,10 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                                    'large slip: >20 deg while speed >1 m/s' if protocol == 'trials' else None),
         'config': config_report, 'env_config': asdict(env.ecfg),
         'config_nonfinite_convention': 'nonfinite lidar dropout sentinel encoded as a string',
+        'controller_arm': controller, 'wheel_model': bool(env.sim.wheel_model),
     }
+    if ctrl_metrics:
+        result['controller'] = ctrl_metrics
     return result
 
 
@@ -221,6 +237,16 @@ def main() -> None:
                     help="[m] the tight window: close enough behind that a pass is actually on. "
                          "The wide window saturates on a 33 m lap, which is why there are two")
     ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument("--controller", default="legacy",
+                    help="controller arm to install between the policy and the wheels; one of "
+                         "grip_runtime.ARMS. 'legacy' installs nothing and is the default, so an "
+                         "unflagged run is unchanged. '+tcs' arms run the car's traction guard "
+                         "inside the loop and need --wheel-model on.")
+    ap.add_argument("--estimator", default="",
+                    help="frozen grip-estimator checkpoint; required by the estimated arms")
+    ap.add_argument("--wheel-model", choices=["on", "off", "default"], default="default",
+                    help="vehicle.wheel_model: the rear axle's rotation state, the ERPM odometry "
+                         "and the IMU shock term. 'default' leaves params.py's value alone.")
     ap.add_argument("--raceline-margin", type=float, default=None,
                     help="[m] free space the teacher's raceline keeps from the boundary (default 0.40)")
     ap.add_argument("--teacher-grip", choices=["true", "nominal", "conservative"], default="true",
@@ -254,7 +280,12 @@ def main() -> None:
                      f"named events never fire and the run is silently the unflagged one.")
     tracks = common.track_names(a.tracks)
 
+    if a.controller not in grip_runtime.ARMS:
+        ap.error(f"--controller {a.controller!r}: expected one of {', '.join(grip_runtime.ARMS)}")
+
     def run(names, config):
+        if a.wheel_model != "default":
+            config.vehicle.wheel_model = a.wheel_model == "on"
         return evaluate(a.ckpt, names, a.envs, a.steps, a.speed_cap, a.device, seed=a.seed, cfg=config,
                         teacher=a.teacher, action_mode=a.action_mode, protocol=a.protocol,
                         race_size=a.race_size, opponent=a.opponent,
@@ -263,7 +294,8 @@ def main() -> None:
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,
-                        contention_range_m=a.contention_range, attack_range_m=a.attack_range)
+                        contention_range_m=a.contention_range, attack_range_m=a.attack_range,
+                        controller=a.controller, estimator=a.estimator)
 
     nominal = Config()
     if a.eager:

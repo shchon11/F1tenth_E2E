@@ -94,6 +94,20 @@ class _FakeSim:
         return a
 
 
+def test_the_wheel_model_switch_is_guarded():
+    """`vehicle.wheel_model` is read at Python level inside `_roll_physics` -- it picks the
+    longitudinal model, the VESC's feedback speed and whether the IMU shock term runs -- so it is
+    baked into the graph at capture and a later change would be replayed away silently."""
+    from f1sim.viewer.graph_fastpath import SimGraphFastPath
+    sim = _FakeSim(wheel_model=True, tid=torch.zeros(1, dtype=torch.long), B=1,
+                   control_dt=0.025, dt=0.001, hist_len=3, substeps=25, imu_ts=0.02,
+                   track=types.SimpleNamespace())
+    g = SimGraphFastPath(sim)._guards_for(sim)
+    assert "sim.wheel_model" in g and g["sim.wheel_model"]() is True
+    sim.wheel_model = False
+    assert g["sim.wheel_model"]() is False
+
+
 def test_cpu_session_is_not_eligible_and_says_so():
     ok, why = roll_eligible(_FakeSim())
     assert ok is False and why

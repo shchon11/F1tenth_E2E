@@ -313,8 +313,14 @@ def test_an_event_never_lifts_an_opponent_over_its_follow_gap_cap():
     The event multiplier is in [0, 1] and is applied *before* the follow cap, so the command is the
     minimum of the two. This drives until cars are genuinely in each other's way and then checks the
     command the env actually produced against the cap it computed from the same state.
+
+    The spawn gap makes that condition rather than hoping for it. At (1.6, 2.2) the test depended on
+    how fast the plant happens to spread the field over 200 steps, which is not what it is about:
+    the rear-axle model (2026-09-13) lets the cars actually reach `a_max`, the field opened up
+    sooner, and the sample-size guard below fell from 50-odd following steps to 9. The property
+    under test held throughout -- the worst overshoot is exactly zero in every configuration tried.
     """
-    env = _env(events=("brake", "stop", "shift"), rate=6.0, envs=16, seed=81, spawn_gap=(1.6, 2.2))
+    env = _env(events=("brake", "stop", "shift"), rate=6.0, envs=16, seed=81, spawn_gap=(0.8, 1.2))
     env.reset(seed=81)
     a = torch.zeros(env.B, 2); a[:, 1] = 0.9
     checked = 0
@@ -433,7 +439,10 @@ def _env_cfg_for(monkeypatch, extra_argv):
     argv = ["ppo", "--device", "cpu", "--envs", "2", "--race-size", "2", "--opponent", "teacher",
             "--tracks", "dummy", "--wandb", "disabled"] + list(extra_argv)
     monkeypatch.setattr("sys.argv", argv)
-    monkeypatch.setattr(ppo.common, "track_names", lambda spec: ["dummy"])
+    # **kw: `track_names` has grown `draws` and `seed`, and a stub with the narrower
+    # signature fails as a TypeError raised inside `ppo.main` that reads like a bug in
+    # the caller rather than in the double.
+    monkeypatch.setattr(ppo.common, "track_names", lambda spec, **kw: ["dummy"])
     monkeypatch.setattr(ppo.common, "load_tracks", lambda names, **kw: ([object()], None))
 
     def capture(tracks, num_envs, device, env_cfg=None, **kw):

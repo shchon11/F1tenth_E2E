@@ -91,10 +91,14 @@ def main():
                          "positional keys Adam's state is indexed by, and silently re-keying them "
                          "would give the two arms different optimiser state.")
     ap.add_argument("--controller", default="legacy", choices=grip_rt.ARMS,
-                    help="plan-tracker controller arm. 'legacy' is the untouched path and is the "
-                         "default, so an unflagged run is unchanged. 'fixed_low' is the control arm, "
-                         "'oracle' reads the true friction (lab only), 'estimated' uses the frozen "
-                         "estimator's filtered lower quantile from causal sensors.")
+                    help="controller arm between the policy and the wheels. 'legacy' is the "
+                         "untouched path and is the default, so an unflagged run is unchanged. "
+                         "'fixed_low' is the control arm, 'oracle' reads the true friction (lab "
+                         "only), 'estimated' uses the frozen estimator's filtered lower quantile "
+                         "from causal sensors. A '+tcs' suffix (or 'tcs' alone) additionally runs "
+                         "the car's own traction guard on the speed command, fed from the simulated "
+                         "ERPM odometry and IMU; it needs vehicle.wheel_model. 'fixed_low+tcs' is "
+                         "the deployment default.")
     ap.add_argument("--estimator", default="",
                     help="frozen grip-estimator checkpoint. Required by --controller estimated, and "
                          "rejected for every other arm.")
@@ -343,7 +347,9 @@ def main():
     controller.install(graph_rt=graph_rt)
     controller_on = a.controller != "legacy"
     if controller_on:
-        if env.M > 1:
+        # The *tracker* arms are the ones validated solo; `tcs` shapes a speed command and is
+        # indifferent to how many cars share the track, so it is not caught by this.
+        if env.M > 1 and controller.base != "legacy":
             raise SystemExit(f"--controller {a.controller} is validated solo only; this env has "
                              f"M={env.M} cars per race")
         print(f"controller arm: {a.controller}"
@@ -578,7 +584,7 @@ def main():
                 # The truth handed over here is for B3's safety metrics only and is read from the
                 # privileged vector belonging to THIS observation, by this loop -- never from inside
                 # the controller, whose estimated path has to work on a car that has no `P`.
-                if controller_on:
+                if controller.base != "legacy":
                     controller.observe_truth(priv[:, env.priv_mu_index])
                 controller.pre_action(obs)
                 with ac:

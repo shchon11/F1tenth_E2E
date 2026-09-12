@@ -1160,7 +1160,10 @@ class SimWorker:
         focus = focus if 0 <= focus < n else 0        # the focus car is always one that is drawn
 
         Pk = ("mount_x", "mount_y", "mount_z", "mount_yaw", "mount_roll", "mount_pitch")
-        pack = torch.cat([r.state[sel], r.attitude[sel], r.lap[sel, None].float(),
+        # `r.state` gained an eighth column (omega_r) on 2026-09-13. The console's frame layout
+        # below indexes this pack by position, so take the seven the console draws with and leave
+        # the layout where it was; nothing in the console reads the rear-axle speed.
+        pack = torch.cat([r.state[sel, :7], r.attitude[sel], r.lap[sel, None].float(),
                           r.collision[sel, None].float(), r.s[sel, None], r.wall_dist[sel, None],
                           sim.car_rear[sel], sim.car_dims[sel, 0:1]], 1)
         nb = int(r.scan.shape[1])

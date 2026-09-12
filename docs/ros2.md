@@ -267,12 +267,12 @@ at 8 m/s.
 
 ### Why it is validated offline, and how to replay
 
-The simulator **cannot produce either failure**. `f1sim/f1sim/dynamics.py` has no wheel rotation
-state (`STATE_DIM` 7: x, y, yaw, vx, vy, yaw_rate, steer) and `f1sim/f1sim/odom.py` reports ground
-speed plus noise, so in simulation the wheel speed *is* the body speed and this residual is
-identically zero. There is nothing to detect and nothing to train against. The real car shows both,
-clearly, in all 22 recordings under `real_data/` — wheel decelerations of −40 … −143 m/s² against a
-body decel of −3 … −16 — so the rule lives on the car and is scored by replay:
+When this rule was written the simulator **could not produce either failure**:
+`f1sim/f1sim/dynamics.py` had no wheel rotation state and `f1sim/f1sim/odom.py` reported ground
+speed, so the simulated wheel speed *was* the body speed and this residual was identically zero.
+The real car shows both failures clearly in all 22 recordings under `real_data/` — wheel
+decelerations of −40 … −143 m/s² against a body decel of −3 … −16 — so the rule lives on the car and
+is scored by replay:
 
 ```bash
 source /home/shchon11/F1tenth/activate.sh            # rosbag2_py, for the reader

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Replay `TractionGuard` over the real-car bags and score it against the labelled slip events.
 
-The simulator cannot produce wheel lock or spin at all (no wheel rotation state in
-`f1sim/f1sim/dynamics.py`, ground-speed odometry in `odom.py`), so this replay *is* the validation
-for `f1sim_ros/f1sim_ros/traction.py`. It reads the bags with the same reader
+This replay is the validation for `f1sim_ros/f1sim_ros/traction.py` against the real car. Since
+2026-09-13 the simulator can also produce wheel lock and spin (`vehicle.wheel_model`), and
+`scripts/gen_sim_bags.py` writes simulated recordings in the layout `--root` reads, so the same
+scorer runs over both and `scripts/wheelslip_compare.py` puts the two distributions side by side.
+It reads the bags with the same reader
 `evidence/wheelslip_bags.py` uses (`f1sim.calib.bagread.read`) and re-derives that script's labels
 here rather than trusting a copied JSON, so labels and detections always come off the same arrays.
 

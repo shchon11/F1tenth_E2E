@@ -324,6 +324,10 @@ class SimGraphFastPath:
             "sim.imu_schedule": lambda: tuple(tuple(s) for s in sim.imu_schedule),
             "sim.imu_ts": lambda: float(sim.imu_ts),
             "cfg.imu.enabled": lambda: bool(sim.cfg.imu.enabled),
+            # `wheel_model` chooses which longitudinal model, which VESC feedback speed and whether
+            # the IMU shock term runs -- all read at Python level inside `_roll_physics`, so they
+            # are baked into the graph at capture and a later change would be replayed away.
+            "sim.wheel_model": lambda: bool(getattr(sim, "wheel_model", False)),
             "cfg.sim.terminate_on_collision": lambda: bool(sim.cfg.sim.terminate_on_collision),
             "sim.hist_len": lambda: int(sim.hist_len),
             "sim.substeps": lambda: int(sim.substeps),

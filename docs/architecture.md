@@ -35,6 +35,30 @@ Single-track body with Pacejka tyres and a friction circle on the driven axle. L
 transfer shifts grip between axles under acceleration and braking; front and rear grip differ, so the
 car understeers at the limit instead of spinning. Drag and rolling resistance are included.
 
+**State layout** — `(B, 8)`, in this order:
+
+| 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `x` | `y` | `yaw` | `vx` | `vy` | `yaw_rate` | `steer` | `omega_r` |
+
+World-frame CoG pose, body-frame velocity at the CoG, the actual front wheel angle (a servo state),
+and the rear-axle angular speed. `omega_r` was **appended** on 2026-09-13, never inserted, so every
+`state[:, :3]` and `state[:, 3]` reader means exactly what it meant; the index constants are in
+[`dynamics.py`](../f1sim/f1sim/dynamics.py) (`IX ... ISTEER, IOMEGA`) and `STATE_DIM` is the only
+thing to size against.
+
+**The rear axle can spin and lock** (`vehicle.wheel_model`). With the switch on, the longitudinal
+force is a slip-ratio magic formula sharing the friction circle with `Fy_r`, the axle carries
+`I_w * omega_dot = T_motor - r_w * Fx` with `T_motor = m * a_cmd * r_w`, the VESC speed loop closes
+on `omega_r * r_w` rather than on the true body speed, and `odom.py` reports that same wheel speed
+— so under slip the odometry is *wrong about the vehicle*, which is what makes it a slip sensor. The
+car is 4WD off one motor, so `drive_split_r` divides the drivetrain's torque between the axles while
+the load division moves under braking; that mismatch is the brake-lock mechanism. With the switch
+off the wheel rides the body (`omega_r = vx / r_w`), the longitudinal force is set straight from the
+commanded acceleration, and the simulator behaves as it did before 2026-09-13.
+[`docs/research/wheel-model-2026-09-13.md`](research/wheel-model-2026-09-13.md) has the parameters,
+what each is measured against, and the acceptance table versus the real recordings.
+
 The body is sprung: roll and brake-dive/squat respond as a damped second-order system. This is not
 cosmetic — it moves the LiDAR's scan plane, which is what the policy sees.
 
@@ -59,12 +83,21 @@ specific force with gravity leaking in through roll and pitch, the lever arm fro
 gravity, speed-proportional vibration at wheel and motor frequencies plus a broadband component, a
 sensor low-pass, bias and random walk, white noise, 16-bit quantisation and mounting misalignment.
 A Mahony-style attitude estimate stands in for the VESC's own, including the way such a filter bends
-under sustained acceleration. It is a model of that behaviour, not the firmware's algorithm.
+under sustained acceleration. It is a model of that behaviour, not the firmware's algorithm. With
+`vehicle.wheel_model` on there is also an impact term: a Pareto-tailed decaying impulse train fitted
+to the rate at which the real accelerometer exceeds the friction bound (0.29 samples per second of
+motion above mu*g, 0.02 above 50 m/s^2, peaking at 120). Without it there is nothing for a
+`a_body_max`-style clamp to clamp, and a detector trained here would have no reason to have one.
 
 **Odometry.** A model of VESC dead reckoning that follows `vesc_to_odom`'s formula — ERPM and
 commanded steering — with calibration residuals, so it drifts. It reproduces the published
 computation, not the firmware; the agreement is approximate and untested against the vehicle. It is
-deliberately not offered to the policy.
+deliberately not offered to the policy. With `vehicle.wheel_model` on it carries the two artefacts
+of the real ERPM channel as well: the speed is quantised onto the measured lattice
+(2.3794e-4 m/s, i.e. the VESC `speed_to_erpm_gain` of 4202.7), and each sample's timestamp
+(`StepResult.odom_t`) carries a publish jitter with the measured distribution. A detector trained
+against a clean 40 Hz grid would fall over on the first 0.3 ms step, which is exactly the failure
+`f1sim_ros/traction.py` had to be built around.
 
 ### What is randomised
 

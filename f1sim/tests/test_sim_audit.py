@@ -163,7 +163,10 @@ def test_wandb_config_records_track_names_when_resuming_with_optimizer_state(tra
     monkeypatch.setattr(ppo.common, "make_env", lambda *a, **k: env)
     monkeypatch.setattr(ppo.common, "run_dir", lambda name: str(tmp_path))
     monkeypatch.setattr(ppo.common, "wandb_init", fake_wandb_init)
-    monkeypatch.setattr(ppo.common, "track_names", lambda spec: ["real:alpha", "real:beta"])
+    # **kw for the same reason as `fake_load_checkpoint` above: `track_names` has grown `draws` and
+    # `seed`, and a stub with the narrower signature fails as a TypeError raised inside `ppo.main`
+    # that reads like a bug in the caller.
+    monkeypatch.setattr(ppo.common, "track_names", lambda spec, **kw: ["real:alpha", "real:beta"])
     monkeypatch.setattr(ppo, "load_checkpoint", fake_load_checkpoint)
     monkeypatch.setattr(ppo, "save_checkpoint", lambda *a, **k: None)
     monkeypatch.setattr(sys, "argv", ["ppo", "--device", "cpu", "--total", "8", "--horizon", "2",

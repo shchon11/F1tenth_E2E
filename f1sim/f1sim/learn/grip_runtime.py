@@ -1,11 +1,18 @@
-"""Controller runtime for the four experiment arms. Opt-in; `legacy` changes nothing.
+"""Controller runtime for the experiment arms. Opt-in; `legacy` changes nothing.
 
     legacy      nothing installed -- `mpc.solve` exactly as it was
     fixed_low   mu = 0.73423 everywhere (the control arm)
     oracle      mu = the episode's true friction, per env (lab only)
     estimated   mu = the frozen estimator's filtered lower quantile, from causal sensors only
 
-The actor is unchanged in all four: proprio 366 in, 8D plan out. Only the controller between the
+and, composable on top of any of them (`tcs`, `fixed_low+tcs`, ...):
+
+    +tcs        the car's own `TractionGuard` shaping the speed command between the controller and
+                the VESC, fed from the simulated ERPM odometry and IMU. See `traction_arm.py`.
+                Orthogonal to the four above: those decide what friction the *tracker* plans under,
+                this decides what happens when a wheel lets go anyway.
+
+The actor is unchanged in all of them: proprio 366 in, 8D plan out. Only the controller between the
 plan and the wheels differs, which is what makes the comparison about knowing the friction.
 
 Three things here are timing, not modelling, and all three are easy to get silently wrong:
@@ -33,8 +40,30 @@ import torch
 
 from . import grip_control as gc
 
-#: The arms. `legacy` is the untouched path and installs nothing.
-ARMS = ("legacy", "fixed_low", "oracle", "estimated")
+#: The plan-tracker arms. `legacy` is the untouched path and installs nothing.
+BASE_ARMS = ("legacy", "fixed_low", "oracle", "estimated")
+
+#: The arms, including the in-simulator traction guard. `tcs` is a *composable* arm: it shapes the
+#: speed command between the controller and the VESC, so it is orthogonal to what the tracker's
+#: friction is set from and can be worn on top of any of the four. `tcs` on its own is the legacy
+#: tracker plus the guard; `fixed_low+tcs` is the deployment default (the control arm the benchmark
+#: roster runs, with the guard the car ships). Spelling them out rather than parsing on the fly is
+#: what lets `benchmark/roster.py` keep validating `controller_arm in ARMS` unchanged, and what
+#: makes `--controller` reject `tcs+fixed_low` or `legacy+tcs` instead of quietly accepting a second
+#: name for something that already has one.
+ARMS = BASE_ARMS + ("tcs", "fixed_low+tcs", "oracle+tcs", "estimated+tcs")
+
+
+def split_arm(arm: str) -> tuple:
+    """`"fixed_low+tcs"` -> `("fixed_low", True)`; `"tcs"` -> `("legacy", True)`."""
+    if arm not in ARMS:
+        raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
+    if arm == "tcs":
+        return "legacy", True
+    if arm.endswith("+tcs"):
+        return arm[:-4], True
+    return arm, False
+
 
 #: B3's predeclared flag thresholds. Fixed before any evaluation; a flag never retunes anything.
 DEGENERACY_FALLBACK_FRAC = 0.50      # warm-only fallback fraction
@@ -60,8 +89,10 @@ def arm_to_grip_mode(arm: str) -> str:
 class IssuedCommandSpy:
     """Snapshots `env.last_cmd` on entry to `_reset_envs`, before auto-reset overwrites it.
 
-    Non-invasive by design: `gym_env.py` is not mine to edit and carries other lanes' changes, so
-    this wraps the bound method and restores it on `release()`. The snapshot is of the whole batch,
+    Non-invasive by design: it wraps the bound method and restores it on `release()`, rather than
+    asking `gym_env.py` for a hook it does not otherwise need. (`cmd_shaper`, which the `tcs` arm
+    uses, is a hook -- a command shaper has to run *between* two statements inside `step`, which is
+    not something a wrapper can reach.) The snapshot is of the whole batch,
     not just the resetting ids: between the command being issued and the reset running, no other env
     has been touched, so the clone is the correct pre-reset command for every env.
     """
@@ -239,14 +270,22 @@ class ControllerRuntime:
     """
 
     def __init__(self, env, arm: str, estimator_path: Optional[str] = None,
-                 gspec: Optional[gc.GripSpec] = None, device=None):
-        if arm not in ARMS:
-            raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
-        if arm == "estimated" and not estimator_path:
+                 gspec: Optional[gc.GripSpec] = None, device=None,
+                 traction_params=None):
+        base, tcs = split_arm(arm)
+        if base == "estimated" and not estimator_path:
             raise ValueError("the estimated arm needs --estimator PATH; it has no default")
-        if arm != "estimated" and estimator_path:
+        if base != "estimated" and estimator_path:
             raise ValueError(f"--estimator is only meaningful for the estimated arm, not {arm!r}")
+        if traction_params is not None and not tcs:
+            raise ValueError(f"traction parameters are only meaningful for a +tcs arm, not {arm!r}")
         self.env, self.arm = env, arm
+        #: The tracker arm underneath, and whether the traction guard rides on top. Every branch
+        #: below keys off `base`, so `fixed_low+tcs` is `fixed_low` plus a shaper and nothing else
+        #: about the tracker changes.
+        self.base, self.tcs = base, tcs
+        self.traction = None
+        self.traction_params = traction_params
         self.device = torch.device(device or env.device)
         self.B = int(env.B)
         self.estimator_path = estimator_path
@@ -262,7 +301,7 @@ class ControllerRuntime:
         self.acc = Accumulator(self.device)
         self.flags = FlagTracker()
         self._pending_truth = None
-        mode = "legacy" if arm == "legacy" else arm_to_grip_mode(arm)
+        mode = "legacy" if base == "legacy" else arm_to_grip_mode(base)
         self.gspec = (gspec or gc.GripSpec(mode=mode)).validate()
         if self.gspec.mode != mode:
             raise ValueError(f"arm {arm!r} needs GripSpec(mode={mode!r}), got {self.gspec.mode!r}")
@@ -283,13 +322,18 @@ class ControllerRuntime:
         """
         if self._installed:
             raise RuntimeError("already installed")
-        if self.arm == "legacy":
-            self._installed = True                 # nothing to install, by definition
+        if self.tcs:
+            # Independent of the tracker: the guard sits on the speed command, not on the plan, so
+            # it works in `--action-mode direct` as well and needs nothing captured first.
+            from .traction_arm import TractionArm
+            self.traction = TractionArm(self.env, self.traction_params, device=self.device).install()
+        if self.base == "legacy":
+            self._installed = True                 # nothing more to install, by definition
             return self
         tracker = self.env.tracker
         if tracker is None:
             raise RuntimeError("the controller arms need the plan tracker (--action-mode plan)")
-        if self.arm == "estimated":
+        if self.base == "estimated":
             self._load_estimator()
         self.grip = gc.GripMPC(tracker, self.gspec, self.B, self.device,
                                tracker.wb, tracker.s_max, tracker.v_max)
@@ -336,7 +380,9 @@ class ControllerRuntime:
             self.grip.release()
         if self.spy is not None:
             self.spy.release()
-        self.grip = self.spy = None
+        if self.traction is not None:
+            self.traction.release()
+        self.grip = self.spy = self.traction = None
         self._installed = False
 
     def begin(self, obs: dict) -> None:
@@ -359,14 +405,20 @@ class ControllerRuntime:
     @torch.no_grad()
     def pre_action(self, obs: dict) -> Optional[torch.Tensor]:
         """Advance the history, infer the friction, and hand it to the MPC. Before the action."""
-        if self.arm == "legacy":
+        if self.traction is not None:
+            # A finished episode is a sensor gap: a new car, on a new surface, possibly at a
+            # different speed. Carrying a latched release across it would release the brake of a
+            # car that no longer exists. Done here rather than in `post_step` because `_reset_mask`
+            # is only written there, and because this runs before the command it would shape.
+            self.traction.reset(self._reset_mask)
+        if self.base == "legacy":
             return None
-        if self.arm == "fixed_low":
+        if self.base == "fixed_low":
             # Constant friction: nothing to update, but it is still one of the two main PPO arms and
             # its used friction and realised brake bound belong in the same log as the other's.
             self._record_constant(self.grip.mu)
             return None
-        if self.arm == "oracle":
+        if self.base == "oracle":
             mu = self._truth()
             self.grip.update(mu)
             self._record_constant(mu)
@@ -394,11 +446,11 @@ class ControllerRuntime:
         The realised control bound is read here rather than in `pre_action` because the solver has
         now run: at `pre_action` time `last_bounds` still holds the previous step's limits.
         """
-        if self.arm == "legacy":
+        if self.base == "legacy":
             self._reset_mask = terminated | truncated
             return
         self._record_realised_bounds()
-        if self.arm == "estimated":
+        if self.base == "estimated":
             self._prev_cmd = self.spy.take()
         self._reset_mask = terminated | truncated
 
@@ -409,7 +461,7 @@ class ControllerRuntime:
         `randomization.py` writes `P` in place and its entries are views, so an un-cloned read is a
         live alias that a later reset rewrites.
         """
-        if self.arm != "oracle":
+        if self.base != "oracle":
             raise RuntimeError(f"the {self.arm!r} arm must not read P; truth arrives through "
                                f"observe_truth(), supplied by the caller")
         return self.env.sim.P["mu"].detach().clone().reshape(-1)
@@ -469,14 +521,16 @@ class ControllerRuntime:
 
     def collect_metrics(self) -> tuple[dict, list[str]]:
         """Drain the update's sums and evaluate B3's flags. One host synchronise, once per update."""
+        tcs_d = self.traction.metrics() if self.traction is not None else {}
         if self.acc.steps == 0:
-            return {}, []
+            return tcs_d, []
         raw = self.acc.read()
         self.acc = Accumulator(self.device)
         fired = self.flags.update(raw)
-        d = metrics_dict(raw, estimator=self.arm == "estimated")
+        d = metrics_dict(raw, estimator=self.base == "estimated")
         d["controller/flag_degeneracy_run"] = self.flags.degeneracy_run
         d["controller/flag_overestimate_run"] = self.flags.overestimate_run
+        d.update(tcs_d)
         return d, fired
 
     # -- provenance --------------------------------------------------------------
@@ -485,6 +539,11 @@ class ControllerRuntime:
         meta = {"arm": self.arm, "grip_spec": self.gspec.to_meta(),
                 "estimator_path": self.estimator_path,
                 "flags_fired": list(self.flags.fired)}
+        if self.traction is not None:
+            # Every threshold the guard ran under. A `tcs` policy learned to drive with a specific
+            # release authority and a specific lock gate; a consumer that installs different ones is
+            # not running the controller this checkpoint was trained against.
+            meta["traction"] = self.traction.meta()
         if self.estimator is not None:
             e = self.estimator
             meta["estimator"] = {

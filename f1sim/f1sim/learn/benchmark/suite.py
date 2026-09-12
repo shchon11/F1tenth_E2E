@@ -426,7 +426,12 @@ RUNTIME_MODULES = ("sim.py", "gym_env.py", "mpc.py", "params.py", "track.py", "d
                    "lidar.py", "imu.py", "odom.py", "teacher.py",
                    "learn/model.py", "learn/obs.py", "learn/common.py", "learn/evaluate.py",
                    "learn/graph_runtime.py", "learn/grip_runtime.py", "learn/grip_control.py",
-                   "learn/grip_estimator.py", "learn/evaluation_metrics.py")
+                   "learn/grip_estimator.py", "learn/evaluation_metrics.py",
+                   # The `tcs` arm sits in the command path and its thresholds decide what the car
+                   # is allowed to do; a changed guard changes a measurement as surely as a changed
+                   # tyre model. `actuators.py` joins for the same reason -- it is the one line that
+                   # decides whether the VESC loop closes on the wheel or on the body.
+                   "learn/traction_arm.py", "actuators.py")
 
 
 def source_digest() -> dict:
