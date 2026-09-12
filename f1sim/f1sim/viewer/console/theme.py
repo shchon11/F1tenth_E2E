@@ -196,6 +196,18 @@ QListWidget::item:selected, QTreeWidget::item:selected {{
 }}
 QListWidget::item:hover:!selected, QTreeWidget::item:hover:!selected {{ background: {c['bg.raised']}; }}
 QTreeWidget::branch {{ background: transparent; }}
+/* Tabs. Without a rule the platform style paints an unselected tab's label in a colour meant for a
+   light palette, and on this graphite it is invisible -- which is how a three-tab picker reads as
+   one tab and two blank slabs. */
+QTabWidget::pane {{ border: 1px solid {c['line']}; border-radius: {RADIUS_CTL}px; top: -1px; }}
+QTabBar::tab {{
+    background: {c['bg.window']}; color: {c['text.1']};
+    border: 1px solid {c['line']}; border-bottom: none;
+    border-top-left-radius: {RADIUS_CTL}px; border-top-right-radius: {RADIUS_CTL}px;
+    padding: 5px 12px; margin-right: 2px;
+}}
+QTabBar::tab:selected {{ background: {c['bg.card']}; color: {c['text.0']}; border-color: {c['line.strong']}; }}
+QTabBar::tab:hover:!selected {{ background: {c['bg.raised']}; color: {c['text.0']}; }}
 QHeaderView::section {{
     background: {c['bg.panel']}; color: {c['text.1']};
     border: none; border-bottom: 1px solid {c['line']}; padding: 4px 6px;
