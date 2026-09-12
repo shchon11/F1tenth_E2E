@@ -524,3 +524,71 @@ def test_event_ids_are_stable():
     """A logged id keeps its meaning: the mapping is part of the interface, not an implementation detail."""
     assert EVENT_NAMES == ("brake", "stop", "shift", "weave")
     assert EVENT_ID == {"brake": 1, "stop": 2, "shift": 3, "weave": 4}
+
+
+# ------------------------------------------------------- the schedule two benchmarked systems meet
+#
+# Suite v2.1's `event` traffic cell scores two systems against "the same opponent". That is only
+# true to the extent the *behaviour* schedule is the same for both, and the schedule is drawn from
+# the simulator's generator every step -- so what it does and does not depend on is a property the
+# benchmark rests on rather than an implementation detail.
+
+def _run_schedule(tape_seed, steps=120, env_seed=5):
+    env = _env(events=("brake", "stop", "shift"), rate=6.0, envs=8, seed=env_seed)
+    env.reset(seed=env_seed)
+    kinds, resets = [], []
+    for a in _actions(steps, env.B, tape_seed):
+        entry = env.sim.steps.clone()
+        env.step(a)
+        kinds.append(env.events.kind.clone().tolist())
+        resets.append(bool((env.sim.steps < entry).any()) or bool((env.sim.steps == 0).any()))
+    return kinds, resets
+
+
+def test_the_event_machine_itself_never_reads_the_learner():
+    """Two different learner action tapes, one seed: the same events at the same steps, for as long
+    as nothing respawns.
+
+    Every draw in `OpponentEvents.step` is full-batch and unconditional, so the generator advances
+    by the same amount whatever the cars are doing, and the machine's own inputs are the gate and
+    the clock. If this failed, the opponent's behaviour would be a function of the policy under
+    test and a benchmark cell would not be one scenario.
+    """
+    a_k, a_r = _run_schedule(11)
+    b_k, b_r = _run_schedule(22)
+    first_reset = min([i for i, r in enumerate(a_r + b_r[:0]) if r] + [len(a_k)])
+    for i, r in enumerate(b_r):
+        if r:
+            first_reset = min(first_reset, i)
+    assert first_reset > 0, "no comparable steps: the fixture respawned immediately"
+    assert a_k[:first_reset] == b_k[:first_reset], (
+        "the opponent's event schedule moved with the learner's actions before anything respawned; "
+        "the machine is reading the policy under test")
+
+
+def test_a_respawn_reshuffles_the_shared_stream_and_that_is_declared():
+    """The limit of the property above, asserted rather than assumed.
+
+    `_reset_envs` draws spawn arc, gap, speed scale and tracker calibration from the SAME generator
+    the event machine draws from, and how many cars reset depends on who crashed. So after the first
+    respawn two systems on one cell can meet different event *realizations* -- the same distribution,
+    a different draw. This is not new with events: `opp_speed_range` has been drawn at reset since
+    the O family existed, and the start fingerprint pairs the start, not the whole episode. It is
+    recorded here so nobody reads "the same opponent" as a stronger claim than it is.
+    """
+    a_k, a_r = _run_schedule(11, steps=400)
+    b_k, b_r = _run_schedule(22, steps=400)
+    assert any(a_r) or any(b_r), "the fixture never respawned; this test proves nothing"
+    assert a_k != b_k, (
+        "if this ever passes, the schedule became reset-independent and the docstring above -- and "
+        "docs/benchmark.md's note on it -- are now understating the guarantee")
+
+
+def test_the_same_seed_and_the_same_actions_give_two_envs_the_same_schedule():
+    """The reproducibility a frozen cell needs: one seed, one tape, one schedule."""
+    a = _env(events=("brake", "shift"), rate=6.0, envs=8, seed=3)
+    b = _env(events=("brake", "shift"), rate=6.0, envs=8, seed=3)
+    a.reset(seed=3); b.reset(seed=3)
+    for act in _actions(120, a.B, 7):
+        a.step(act); b.step(act)
+        assert a.events.kind.tolist() == b.events.kind.tolist()

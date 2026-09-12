@@ -1,4 +1,12 @@
-"""Evaluate deterministic policies with rolling or first-attempt trial protocols."""
+"""Evaluate deterministic policies with rolling or first-attempt trial protocols.
+
+Races here can carry the scripted opponent behaviours of `f1sim.opponent_events` -- a car that
+brakes, a car that has stopped, a car that moves across the lane -- and every run with an opponent
+reports the traffic metrics the benchmark's T family reports, from the same implementation
+(`learn.benchmark.overtake.TrafficMeter`). This is the quick check *outside* the frozen suite: it
+loads no roster, freezes nothing, and its numbers are not benchmark scores. What it is for is
+answering "did that change do anything in traffic" without booking a GPU and a lease.
+"""
 from __future__ import annotations
 
 import argparse
@@ -11,6 +19,8 @@ import numpy as np
 import torch
 
 from ..gym_env import EnvConfig
+from .. import opponent_events as opp_ev
+from ..opponent_events import describe as describe_events, parse_events
 from ..params import Config
 from . import common
 from .evaluation_metrics import TrialAccumulator
@@ -47,10 +57,17 @@ def resolve_steps(protocol: str, steps: int, budget_laps: float | None, tracks, 
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
-             teacher_grip: str = "true", teacher_recover_time: float = 0.0) -> dict:
+             teacher_grip: str = "true", teacher_recover_time: float = 0.0,
+             opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
+             contention_range_m: float = 12.0, attack_range_m: float = 3.0) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
+    opp_events / opp_event_rate: scripted opponent behaviour, as in training. Empty is off, and off
+    is the run this function has always done -- nothing is stepped and nothing is drawn from the
+    simulator's generator.
+    contention_range_m / attack_range_m: the two arc windows the traffic metrics measure over. The
+    defaults are the env's own `overtake_range` and the benchmark's tight window.
     """
     if protocol not in ("rolling", "trials") or steps < 1 or envs < 1 or race_size < 1 or envs % race_size:
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
@@ -65,10 +82,22 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         model.eval()
     mode = "plan" if (model is not None and model.meta.get("act_dim", 2) >= 5) or (teacher and action_mode == "plan") else "direct"
     spec = metadata.get("spec", {})
+    events = parse_events(opp_events)
+    if events and not (race_size > 1 and opponent in ("teacher", "mixed")):
+        raise ValueError(f"opponent events {list(events)} need race_size > 1 and a teacher-driven "
+                         f"opponent; got race_size {race_size}, opponent {opponent!r}. Without them "
+                         f"there is no car for the events to script and the run is silently the "
+                         f"unflagged one.")
+    if events and not opp_event_rate > 0:
+        raise ValueError(f"opponent events {list(events)} at rate {opp_event_rate}: the rate is "
+                         f"events per opponent per 10 s, so at 0 nothing ever fires.")
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
                      race_size=race_size, opponent=opponent,
+                     opp_events=events, opp_event_rate=float(opp_event_rate),
                      scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
                      hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2))
+    if opp_speed_range is not None:
+        ecfg.opp_speed_range = tuple(float(x) for x in opp_speed_range)
     step_dt = 1.0 / (cfg or Config()).sim.control_rate
     steps = resolve_steps(protocol, steps, budget_laps, trs, speed_cap, step_dt, max_steps)
     if protocol == "trials":
@@ -83,8 +112,16 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     else:
         def policy(obs):
             return model.act(*flatten_obs(obs), deterministic=True)[0]
+    from .benchmark.overtake import TrafficMeter
+    meter = TrafficMeter(env, contention_range_m=contention_range_m,
+                         attack_range_m=attack_range_m, vehicle_length=(cfg or Config()).vehicle.length)
     if protocol == "rolling":
-        result = common.rollout_metrics(env, policy, steps, speed_cap)
+        # The meter wraps `sim.step` so every quantity is read BEFORE the auto-reset, the same
+        # discipline the benchmark's own loop keeps. `rollout_metrics` is left untouched: it is a
+        # validated implementation of a different measurement, and a second caller poking at its
+        # internals is how two measurements start disagreeing.
+        with meter:
+            result = common.rollout_metrics(env, policy, steps, speed_cap)
         for key, value in result.items():
             if isinstance(value, float) and not math.isfinite(value):
                 result[key] = None
@@ -97,20 +134,23 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
             raise ValueError("Trial evaluation requires positive centerline lengths")
         trials = TrialAccumulator(lengths, env.sim.control_dt,
                                   time_budget_s=steps * env.sim.control_dt, speed_cap=speed_cap)
-        for _ in range(steps):
-            obs, _, term, trunc, info = env.step(policy(obs))
-            # Privileged transition velocity is captured before any simulator autoreset.
-            speed = torch.linalg.vector_norm(info['priv'][learner, :2], dim=1)
-            dynamics = info['priv'][learner, :5].cpu().numpy()
-            trials.update(info['progress'][learner].cpu().numpy(), speed.cpu().numpy(),
-                          term[learner].cpu().numpy(), trunc[learner].cpu().numpy(), yaw_rate=dynamics[:, 2],
-                          heading_error=dynamics[:, 4], longitudinal_speed=dynamics[:, 0], lateral_speed=dynamics[:, 1])
-            if not trials.active.any():
-                break
+        with meter:
+            for _ in range(steps):
+                obs, _, term, trunc, info = env.step(policy(obs))
+                meter.observe(info)
+                # Privileged transition velocity is captured before any simulator autoreset.
+                speed = torch.linalg.vector_norm(info['priv'][learner, :2], dim=1)
+                dynamics = info['priv'][learner, :5].cpu().numpy()
+                trials.update(info['progress'][learner].cpu().numpy(), speed.cpu().numpy(),
+                              term[learner].cpu().numpy(), trunc[learner].cpu().numpy(), yaw_rate=dynamics[:, 2],
+                              heading_error=dynamics[:, 4], longitudinal_speed=dynamics[:, 0], lateral_speed=dynamics[:, 1])
+                if not trials.active.any():
+                    break
         trials.finish()
         result = trials.report()
         result['initial_track_ids'] = initial_ids.tolist()
         result['initial_track_lengths_m'] = lengths.tolist()
+    result.update(meter.report())
     config_report = asdict(env.cfg)
     dropout = config_report['lidar']['dropout_value']
     if not math.isfinite(dropout):
@@ -122,6 +162,14 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'action_mode': mode, 'device': str(device), 'steps': steps, 'step_dt': env.sim.control_dt,
         'time_budget_s': steps * env.sim.control_dt, 'envs': envs,
         'race_size': race_size, 'opponent': opponent, 'learners': int(env.learner.sum()),
+        'opp_speed_range': list(env.ecfg.opp_speed_range),
+        'opp_events': list(events), 'opp_event_rate': float(opp_event_rate),
+        'opp_event_note': describe_events(events, float(opp_event_rate)),
+        'traffic_convention': (
+            'contention/following/attacking are fractions of measured learner-seconds, not of wall '
+            'time; pace_vs_opponent pools arc over the learners rather than averaging per-learner '
+            'ratios; passes are held passes counted over the rollout, and an auto-reset re-seeds a '
+            'pair rather than voiding what it already counted'),
         'race_convention': 'respawning traffic; not strict no-respawn competition',
         'spawn_convention': 'slot 0 starts ahead of following opponents; completion does not establish overtaking',
         'trial_success': 'signed cumulative progress >= initial track length; collision takes precedence' if protocol == 'trials' else None,
@@ -155,6 +203,23 @@ def main() -> None:
     ap.add_argument("--protocol", choices=["rolling", "trials"], default="rolling")
     ap.add_argument("--race-size", type=int, default=1)
     ap.add_argument("--opponent", choices=["policy", "teacher"], default="policy")
+    ap.add_argument("--opp-speed-range", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+                    help="fraction of its raceline profile each teacher opponent drives at "
+                         "(default: the EnvConfig 0.6 0.8). The benchmark's traffic family uses "
+                         "0.5 0.7 for a clearly slower car and 0.8 0.95 for one at pace")
+    ap.add_argument("--opp-events", default="", metavar="A,B",
+                    help=f"comma-separated scripted behaviours for the teacher-driven opponents "
+                         f"({','.join(opp_ev.EVENT_NAMES)}); empty = off, and off is bit-identical "
+                         f"to a run without them. Needs --race-size > 1 and --opponent teacher")
+    ap.add_argument("--opp-event-rate", type=float, default=0.0, metavar="PER10S",
+                    help="expected events per teacher opponent per 10 s (events do not overlap, so "
+                         "the realized rate is a little below this)")
+    ap.add_argument("--contention-range", type=float, default=12.0, metavar="M",
+                    help="[m] arc within which a car counts as being in traffic (default: the "
+                         "env's own overtake_range)")
+    ap.add_argument("--attack-range", type=float, default=3.0, metavar="M",
+                    help="[m] the tight window: close enough behind that a pass is actually on. "
+                         "The wide window saturates on a 33 m lap, which is why there are two")
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--raceline-margin", type=float, default=None,
                     help="[m] free space the teacher's raceline keeps from the boundary (default 0.40)")
@@ -172,6 +237,21 @@ def main() -> None:
         ap.error("steps/envs/race-size must be positive and envs divisible by race-size")
     if not a.teacher and not a.ckpt:
         ap.error("provide a checkpoint or --teacher")
+    # Refused here rather than silently ignored, the same way training refuses it: a run that names
+    # events and then runs without them looks like evidence that the events change nothing.
+    try:
+        a.opp_events = parse_events(a.opp_events)
+    except ValueError as exc:
+        ap.error(f"--opp-events: {exc}")
+    if a.opp_events:
+        if a.race_size < 2 or a.opponent != "teacher":
+            ap.error(f"--opp-events {','.join(a.opp_events)} needs --race-size > 1 and --opponent "
+                     f"teacher: the events script the teacher-driven cars of a race, and there are "
+                     f"none here (--race-size {a.race_size}, --opponent {a.opponent}).")
+        if not a.opp_event_rate > 0:
+            ap.error(f"--opp-events {','.join(a.opp_events)} with --opp-event-rate "
+                     f"{a.opp_event_rate}: the rate is events per opponent per 10 s, so at 0 the "
+                     f"named events never fire and the run is silently the unflagged one.")
     tracks = common.track_names(a.tracks)
 
     def run(names, config):
@@ -180,7 +260,10 @@ def main() -> None:
                         race_size=a.race_size, opponent=a.opponent,
                         budget_laps=a.budget_laps if a.budget_laps > 0 else None, max_steps=a.max_steps,
                         raceline_margin=a.raceline_margin, teacher_grip=a.teacher_grip,
-                        teacher_recover_time=a.teacher_recover_time)
+                        teacher_recover_time=a.teacher_recover_time,
+                        opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
+                        opp_event_rate=a.opp_event_rate,
+                        contention_range_m=a.contention_range, attack_range_m=a.attack_range)
 
     nominal = Config()
     if a.eager:
