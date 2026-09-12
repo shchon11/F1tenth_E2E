@@ -58,27 +58,29 @@ DIRECTION_LABEL = {"": "정방향", "rev": "역방향", "mir": "거울", "mir+re
 #: Obstacle families. The key is what goes after `#`; `""` is a clean lap.
 #: The names are what the obstacles *do*, which is the thing a user is choosing between --
 #: `+obs` vs `+rlobs` said which function stamped them.
-OBSTACLES: Tuple[str, ...] = ("", "edge", "line", "pinch", "props")
-OBSTACLE_LABEL = {"": "없음", "edge": "가장자리", "line": "주행선 위", "pinch": "좁아짐", "props": "입체"}
+OBSTACLES: Tuple[str, ...] = ("", "edge", "line", "pinch", "props", "hard")
+OBSTACLE_LABEL = {"": "없음", "edge": "가장자리", "line": "주행선 위", "pinch": "좁아짐", "props": "입체",
+                  "hard": "극단 (직접 만든 맵처럼)"}
 OBSTACLE_HINT = {
     "": "장애물 없이 빈 트랙을 그대로 달립니다.",
     "edge": "차선 가장자리에 상자를 세웁니다. 주행선은 비어 있습니다 (옛 이름 +obs).",
     "line": "주행선 위에 상자를 세웁니다. 피해서 계획해야 합니다 (옛 이름 +rlobs).",
     "pinch": "몇 군데에서 차선 폭을 좁힙니다 (옛 이름 +pinch).",
     "props": "상자·궤짝·드럼을 입체로 세웁니다. 점유 격자가 아니라 유한한 볼록 단면입니다 (옛 이름 +props).",
+    "hard": "직접 만든 맵처럼: 상자 줄·사선 장벽·시케인·코너 정점·덩어리·작은 물체. 차선의 55~75 %는 남깁니다 (옛 이름 +hard).",
 }
 #: new name -> the loader's suffix. The loader is not renamed: every checkpoint, manifest and
 #: frozen benchmark file in this repository names its tracks in the old grammar.
-LEGACY_OBSTACLE = {"edge": "obs", "line": "rlobs", "pinch": "pinch", "props": "props"}
+LEGACY_OBSTACLE = {"edge": "obs", "line": "rlobs", "pinch": "pinch", "props": "props", "hard": "hard"}
 OBSTACLE_FROM_LEGACY = {v: k for k, v in LEGACY_OBSTACLE.items()}
 
 #: Which obstacle families a family of tracks can actually carry, from `maps._load_base`:
 #: racetracks and editor scenes only understand `+props`.
 OBSTACLES_BY_FAMILY = {
-    "real": ("", "edge", "line", "pinch", "props"),
-    "gen": ("", "edge", "line", "pinch", "props"),
-    "rt": ("", "props"),
-    "scene": ("", "props"),
+    "real": ("", "edge", "line", "pinch", "props", "hard"),
+    "gen": ("", "edge", "line", "pinch", "props", "hard"),
+    "rt": ("", "props", "hard"),
+    "scene": ("", "props", "hard"),
     "gym": ("",),
 }
 
@@ -474,7 +476,7 @@ def _parse_legacy(s: str) -> Scenario:
         elif name.endswith("~mir"):
             mirror, name = True, name[:-4]
     obstacle, seed = "", None
-    for tag in ("+rlobs", "+obs", "+pinch", "+props"):      # `+rlobs` first: see maps._split_obstacle_suffix
+    for tag in ("+rlobs", "+obs", "+pinch", "+props", "+hard"):   # `+rlobs` first: see maps._split_obstacle_suffix
         if tag in name:
             base, _, spec = name.partition(tag)
             obstacle = OBSTACLE_FROM_LEGACY[tag[1:]]

@@ -163,11 +163,11 @@ def test_an_obstacle_family_this_version_does_not_know_still_names_its_map():
     """Another branch is training with `+hard<seed>`. The string is not ours to rebuild -- it comes
     back verbatim -- but the map under it is `real:icra2022`, and a list of such entries has to
     group and count as that map rather than as one new map per entry."""
-    sc = tracks.parse("real:icra2022+hard1~rev")
+    sc = tracks.parse("real:icra2022+weird1~rev")
     assert sc.track == "real/icra22"
-    assert sc.raw == sc.legacy() == sc.short() == "real:icra2022+hard1~rev"
-    assert sc.display() == "ICRA 2022 · hard1~rev"
-    assert tracks.resolve("real:icra2022+hard1~rev") == "real:icra2022+hard1~rev"
+    assert sc.raw == sc.legacy() == sc.short() == "real:icra2022+weird1~rev"
+    assert sc.display() == "ICRA 2022 · weird1~rev"
+    assert tracks.resolve("real:icra2022+weird1~rev") == "real:icra2022+weird1~rev"
     # and it must not have been mistaken for one of the families we do know
     assert sc.obstacle == "" and not sc.reverse
 
@@ -177,8 +177,8 @@ def test_a_track_is_not_offered_an_obstacle_it_cannot_carry():
     with pytest.raises(tracks.TrackError) as exc:
         tracks.parse("rt/monza#edge:3")
     assert "Monza" in str(exc.value)
-    assert tracks.get("rt/monza").obstacle_options() == ("", "props")
-    assert tracks.get("real/korea26").obstacle_options() == ("", "edge", "line", "pinch", "props")
+    assert tracks.get("rt/monza").obstacle_options() == ("", "props", "hard")
+    assert tracks.get("real/korea26").obstacle_options() == ("", "edge", "line", "pinch", "props", "hard")
 
 
 @pytest.mark.parametrize("bad", ["real/bb22-1@sideways", "real/bb22-1#nope:3", "real/bb22-1@rev#line",
