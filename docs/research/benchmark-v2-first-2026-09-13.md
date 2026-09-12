@@ -29,7 +29,8 @@ rt:Monza                                    23/48                 18/48         
 Reading (four complete systems):
 
 * **The A recipe generalises.** `cl_origrecipe_legacy_s701@fixed_low` beats the frozen original on
-  every held-out map: solo 287 vs 228 (legacy) / 265 (estimated), low-μ 77 vs 27 / 71, avoidance
+  every aggregate column (per map it loses only `gen:competition:0`, 33/48 against 36/48 for
+  `frozen_original@estimated`): solo 287 vs 228 (legacy) / 265 (estimated), low-μ 77 vs 27 / 71, avoidance
   55 vs 21 / 43, overtaking 25 vs 23 / 22, 3.74 collisions/km vs 6.85 / 5.04. Its second seed
   (`cl_oppdiv_control_s801`, same recipe, seed 801) lands within noise: 285 / 75 / 60 / 25 / 3.74.
 * **`real:blackbox2022_3`** is near zero for every system (1–13 / 48). The user ruled it an unfair map
