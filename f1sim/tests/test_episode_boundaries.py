@@ -166,13 +166,14 @@ def test_speed_cap_gate_keeps_history_across_logging(tracks, monkeypatch, tmp_pa
     conditioning = []
     original_sample = ppo.sample_rollout_action
 
-    def capture_conditioning(model, scan, proprio, cond=None):
-        # `cond` is forwarded rather than dropped: the spy stands in for the real sampler, so its
-        # signature has to track `ppo.sample_rollout_action(model, scan, proprio, cond=None)`.
-        # Swallowing the argument would make this test pass while the conditioning vector silently
-        # stopped reaching the policy.
+    def capture_conditioning(model, scan, proprio, cond=None, hidden=None):
+        # `cond` and `hidden` are forwarded rather than dropped: the spy stands in for the real
+        # sampler, so its signature has to track
+        # `ppo.sample_rollout_action(model, scan, proprio, cond=None, hidden=None)`. Swallowing
+        # either would make this test pass while the conditioning vector -- or, with `--memory`,
+        # the recurrent state the action depends on -- silently stopped reaching the policy.
         conditioning.append((proprio[:, 5].clone(), env.speed_cap.clone() / env.ecfg.v_max_policy))
-        return original_sample(model, scan, proprio, cond)
+        return original_sample(model, scan, proprio, cond, hidden)
 
     monkeypatch.setattr(ppo, "sample_rollout_action", capture_conditioning)
     original_cap = env.set_speed_cap

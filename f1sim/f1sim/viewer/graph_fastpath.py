@@ -13,6 +13,12 @@ Scope, deliberately narrow:
   props. Both loop over the placed props in `prop_math`, so their launch cost grows with the prop
   count: with the first two boundaries graphed, Monza's eight props held the viewer at 0.76x while
   Korea's three reached 0.98x.
+* `Actor.step` -- one control step of the policy, hidden state included -- through the standalone
+  `graph_actor_step`. Opt-in and built by the caller during a session build (`learn.graph_runtime.
+  prepare_actor_graph`), never lazily mid-step: a failed capture is fatal to the process, and the
+  only place the worker is prepared for that is the build. A recurrent actor's hidden state is an
+  ordinary tensor argument here, so it lands in a static buffer that each replay is copied into --
+  the caller keeps one tensor and the graph updates it in place.
 
 Nothing else. `Simulator.step` is never captured: it advances `self.t` and `_imu_phase`, rolls
 `cmd_hist`, ORs `collided`, zeroes `prop_touched` and draws randomness -- Python effects that would
@@ -279,6 +285,68 @@ def mpc_eligible(sim, tracker) -> Tuple[bool, str]:
     if tracker.u_prev.dtype != torch.float32:
         return False, f"float32 tracker 가 아님 ({tracker.u_prev.dtype})"
     return True, ""
+
+
+# ---------------------------------------------------------------- the actor's own step
+def actor_eligible(actor, example_args: Sequence[Any]) -> Tuple[bool, str]:
+    """Can this actor's control step be captured? Decided before anything is attempted.
+
+    Separate from the simulator's gate because an actor has none of a simulator's Python-level
+    effects: `Actor.step` is a pure function of (scan, proprio, hidden) plus its parameters, and a
+    recurrent one returns its next hidden state rather than mutating anything. What it does need is
+    a CUDA float32 session with training mode off and no torch.compile in the way.
+    """
+    if not example_args or not torch.is_tensor(example_args[0]):
+        return False, "예시 입력이 텐서가 아님"
+    dev = example_args[0].device
+    if dev.type != "cuda":
+        return False, "CPU 세션"
+    if getattr(actor, "training", False):
+        return False, "actor 가 train 모드임 (eval 로 두세요)"
+    for i, t in enumerate(example_args):
+        if t is None:
+            continue
+        if not torch.is_tensor(t):
+            return False, f"인자 {i} 가 텐서가 아님"
+        if t.dtype != torch.float32:
+            return False, f"인자 {i} 가 float32 가 아님 ({t.dtype})"
+        if t.device != dev:
+            return False, f"인자 {i} 의 장치가 다름 ({t.device} vs {dev})"
+    return True, ""
+
+
+def graph_actor_step(actor, example_args: Sequence[Any], name: str = "actor.step") -> GraphedCallable:
+    """Capture one control step of the actor, hidden state included.
+
+    The hidden state is an ordinary tensor argument, which is exactly what makes this work: every
+    argument becomes a STATIC buffer that each replay is copied into (`GraphedCallable.__call__`),
+    so the caller keeps one hidden-state tensor for the life of the session and the graph updates
+    it in place. Allocating a fresh hidden state per step -- or holding on to the tensor a replay
+    produced -- is the way to get a graph that silently replays yesterday's state.
+
+    Guarded on the actor's whole parameter list by address and shape, so a checkpoint reloaded into
+    the same module object is caught rather than replayed against freed weights.
+
+    Raises `NotCapturable` when the configuration is not eligible (the caller runs eager) and
+    `CaptureFailed` if a capture is attempted and fails -- which, as everywhere in this module, is
+    fatal to the process rather than something to retry.
+    """
+    ok, why = actor_eligible(actor, example_args)
+    if not ok:
+        raise NotCapturable(why)
+    # Read LIVE, like every other guard in this module: closing over a captured `list(parameters())`
+    # would compare that list against itself, and a checkpoint reloaded into the same module object
+    # -- a rebound `Parameter`, the same names, new storage -- would replay against freed weights.
+    guards = {
+        "actor.parameters": lambda: tuple(_sig(t) for t in actor.parameters()),
+        "actor.buffers": lambda: tuple(_sig(t) for t in actor.buffers()),
+        "actor.training": lambda: bool(actor.training),
+    }
+
+    def step(scan, proprio, hidden):
+        return actor.step(scan, proprio, None, hidden)
+
+    return GraphedCallable(step, tuple(example_args), guards=guards, name=name)
 
 
 class SimGraphFastPath:

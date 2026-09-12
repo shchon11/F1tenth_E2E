@@ -308,3 +308,73 @@ def test_mpc_solve_still_defaults_to_building_its_constants_inline():
     assert "consts" in optional, "the opt-in `consts` argument is gone; this test is out of date"
     assert all(v is None for v in optional.values()), optional
     assert mpc.ilqr.__defaults__[-1] is None
+
+
+# --------------------------------------------------------------------- the actor's own step
+def _memory_actor(device="cpu", beams=64, batch=1):
+    """A small recurrent actor plus one real example of each of its three arguments."""
+    from f1sim.learn.memory import memory_spec
+    from f1sim.learn.model import ActorCritic
+    with torch.random.fork_rng():
+        torch.manual_seed(77)
+        m = ActorCritic(n_stack=2, n_beams=beams, proprio_dim=8, priv_dim=4, act_dim=2,
+                        scan_stem="plain", memory=memory_spec(hidden_size=16)).to(device).eval()
+    scan = torch.rand(batch, 2, beams, device=device)
+    pro = torch.rand(batch, 8, device=device)
+    h = m.actor.initial_hidden(batch, device=scan.device, dtype=scan.dtype)
+    return m.actor, (scan, pro, h)
+
+
+def test_actor_eligibility_is_decided_before_capture():
+    """A CPU session, a train-mode actor or a non-float32 argument select eager and say so, rather
+    than reaching a capture that would be fatal."""
+    from f1sim.viewer.graph_fastpath import actor_eligible, graph_actor_step
+    actor, args = _memory_actor()
+    ok, why = actor_eligible(actor, args)
+    assert not ok and "CPU" in why
+    with pytest.raises(NotCapturable):
+        graph_actor_step(actor, args)
+
+
+def test_prepare_actor_graph_runs_eager_rather_than_capturing_on_the_cpu():
+    """`learn.graph_runtime.prepare_actor_graph` is the entry point a session build calls; on an
+    ineligible configuration it returns None and logs why, so the caller simply runs eager."""
+    from f1sim.learn.graph_runtime import prepare_actor_graph
+    actor, (scan, pro, h) = _memory_actor()
+    said = []
+    assert prepare_actor_graph(actor, scan, pro, h, log=said.append) is None
+    assert any("not eligible" in t for t in said), said
+    # A feedforward actor has nothing to carry and is not captured here either.
+    said.clear()
+    from f1sim.learn.model import ActorCritic
+    ff = ActorCritic(n_stack=2, n_beams=64, proprio_dim=8, priv_dim=4, act_dim=2,
+                     scan_stem="plain").eval()
+    assert prepare_actor_graph(ff.actor, scan, pro, None, log=said.append) is None
+    assert any("feedforward" in t for t in said), said
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="capturing a graph needs CUDA")
+def test_captured_actor_step_matches_eager_and_keeps_the_hidden_state_static():
+    """The replayed graph agrees with eager, and the hidden state lives in a static buffer: the
+    caller passes its one tensor in and the graph copies it there, so nothing a previous replay
+    produced is still being read."""
+    from f1sim.learn.graph_runtime import prepare_actor_graph
+    actor, (scan, pro, h) = _memory_actor(device="cuda", batch=2)
+    g = prepare_actor_graph(actor, scan, pro, h, log=lambda _t: None)
+    assert g is not None
+    with torch.no_grad():
+        want_mu, want_h = actor.step(scan, pro, None, h)
+        got_mu, got_h = g(scan, pro, h)
+    torch.testing.assert_close(got_mu, want_mu, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(got_h, want_h, atol=1e-5, rtol=1e-5)
+    # Two steps of carrying: the graph is replayed against whatever the caller hands it.
+    with torch.no_grad():
+        mu2, h2 = g(scan, pro, got_h)
+        want2, wh2 = actor.step(scan, pro, None, want_h)
+    torch.testing.assert_close(mu2, want2, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(h2, wh2, atol=1e-5, rtol=1e-5)
+    # And the guard on the actor's own weights fires when they are replaced under it.
+    with torch.no_grad():
+        actor.mu.weight = torch.nn.Parameter(actor.mu.weight.clone())
+    with pytest.raises(GuardViolation):
+        g(scan, pro, got_h)

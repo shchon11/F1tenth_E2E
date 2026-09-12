@@ -36,9 +36,11 @@ def test_obs_builder_matches_env_encoding():
 def test_model_shapes_and_checkpoint_roundtrip(tmp_path):
     m = ActorCritic(3, 1080, 14, 17)
     scan, pro, priv = torch.rand(4, 3, 1080), torch.rand(4, 14), torch.rand(4, 17)
-    a, logp = m.act(scan, pro)
+    a, logp, h = m.act(scan, pro)
     assert a.shape == (4, 2) and a.abs().max() <= 1.0 and logp.shape == (4,)
-    lp, ent, v, d = m.evaluate(scan, pro, priv, a)
+    assert h is None                       # a feedforward checkpoint carries no hidden state
+    lp, ent, v, d, h2 = m.evaluate(scan, pro, priv, a)
+    assert h2 is None
     assert v.shape == (4,) and lp.shape == (4,)
     n_actor = sum(p.numel() for p in m.actor.parameters())
     assert 0.3e6 < n_actor < 3e6, n_actor

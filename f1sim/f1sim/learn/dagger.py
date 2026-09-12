@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from ..gym_env import EnvConfig
 from . import common
+from .memory import policy_fn as memory_policy_fn
 from .model import ActorCritic, save_checkpoint
 from .obs import PROPRIO_KEYS, flatten_obs
 
@@ -89,7 +90,7 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
                 buf.add(scan[:, 0], pro, label, new_ep, gap)
                 a = label
             else:
-                a_student, _ = model.act(scan, pro, deterministic=True)
+                a_student, _, _ = model.act(scan, pro, deterministic=True)
                 buf.add(scan[:, 0], pro, label, new_ep, (a_student - label).abs().mean(1))
                 if noise > 0:
                     a_student = (a_student + noise * torch.randn_like(a_student)).clamp(-1, 1)
@@ -186,7 +187,7 @@ def main():
                       noise=0.05 if it else 0.0, need_gap=a.hard_frac > 0).finalize()
         bufs.append(buf); bufs = bufs[-a.keep_iters:]; t_col = tm.lap()        # host RAM: keep the last few iterations (14 GB laptop)
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log, a.hard_frac, a.hard_power, a.log_every); t_tr = tm.lap()
-        m = common.rollout_metrics(env, lambda o: model.act(*flatten_obs(o), deterministic=True)[0], a.eval_steps, a.speed_cap,
+        m = common.rollout_metrics(env, memory_policy_fn(model, env.B, device=device, deterministic=True), a.eval_steps, a.speed_cap,
                                    per_track=True); t_ev = tm.lap()
         if teacher_metrics is None:
             teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps, a.speed_cap,

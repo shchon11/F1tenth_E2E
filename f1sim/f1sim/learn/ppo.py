@@ -9,6 +9,9 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Optional
 
 import argparse
 import copy
@@ -25,8 +28,10 @@ from ..params import Config
 from . import common
 from . import conditioning as cond_mod
 from . import grip_runtime as grip_rt
-from .model import ActorCritic, load_checkpoint, load_for_conditioning, save_checkpoint
-from .obs import flatten_obs
+from .memory import Hidden, memory_spec, reset_hidden
+from .model import (ActorCritic, load_checkpoint, load_for_conditioning, load_for_memory,
+                    save_checkpoint)
+from .obs import SCAN_CHANNELS, ScanAugment, flatten_obs
 from .returns import compute_gae
 
 #: How close an opponent has to be for the auxiliary head to be scored on it [m]. This is a
@@ -39,16 +44,111 @@ AUX_OPP_RANGE_M = 6.0
 
 def sample_rollout_action(
     model: ActorCritic, scan: torch.Tensor, proprio: torch.Tensor, cond: torch.Tensor = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the sampled action and its matching log probability for PPO storage.
+    hidden: torch.Tensor = None,
+):
+    """The sampled action, its matching log probability, and the actor's next hidden state.
 
     `cond` is the frozen conditioning for this step. It is passed explicitly, never defaulted: the
     log probability stored here is the one the update ratio is measured against, so the recomputed
-    log probability has to come from the identical input.
+    log probability has to come from the identical input. `hidden` is the same contract one step
+    further: with `--memory`, the action depends on it, so the update has to replay from the state
+    the rollout was actually in. It is `None`, in and out, for a feedforward actor -- and then
+    `step_dist` is `dist`, so an unflagged run draws exactly the action it drew before.
     """
-    distribution = model.actor.dist(scan, proprio, cond)
+    distribution, hidden = model.actor.step_dist(scan, proprio, cond, hidden)
     action = distribution.sample()
-    return action, distribution.log_prob(action).sum(1)
+    return action, distribution.log_prob(action).sum(1), hidden
+
+
+@dataclass
+class PPOHyper:
+    """The scalars `minibatch_losses` needs, so the loss is a function of stated numbers."""
+    clip: float
+    vf: float
+    ent: float
+    kl_coef: float
+    aux_grip: float = 0.0
+    aux_opp: float = 0.0
+    priv_mu_index: int = 16
+    aux_opp_range_m: float = AUX_OPP_RANGE_M
+    m_gt_1: bool = False
+
+
+def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old, adv, ret,
+                     val_old, w, cond=None, hyper: PPOHyper, autocast=None,
+                     freeze_actor: bool = False, sequence=None) -> dict:
+    """One PPO minibatch's loss terms, feedforward or recurrent.
+
+    Lifted out of `main`'s inner loop unchanged so that (a) the recurrent path and the feedforward
+    path cannot drift apart -- there is one copy of the arithmetic and only the model call differs
+    -- and (b) `tests/test_ppo_memory.py` can hold it to `tests/data/ppo_loss_oracle.json`, which
+    was recorded from the inlined version before any of this existed. `--memory off` has to be the
+    run it was yesterday, and "the loss on a fixed batch is unchanged" is how that is checked.
+
+    Feedforward: every tensor is (batch, ...) and `sequence` is None.
+    Recurrent: `sequence` is `(h0, keep)`, `scan`/`pro`/`priv`/`act`/`cond` are (T, m, ...) blocks
+    of whole env chunks, and the flat tensors (`logp_old`, `adv`, `ret`, `val_old`, `w`) are the
+    matching (T * m,) rows in row-major (step, env) order. `keep` is 0 where the episode ended on
+    the step before, which is where the hidden state is masked back to zero.
+    """
+    ac = autocast if autocast is not None else nullcontext()
+    with ac:
+        if sequence is None:
+            logp, ent, val, d, grip, opp_pred, h_next = model.evaluate_aux(scan, pro, priv, act, cond)
+            ref_scan, ref_pro, ref_cond = scan, pro, cond
+        else:
+            h0, keep = sequence
+            logp, ent, val, d, grip, opp_pred, h_next = model.evaluate_sequence(
+                scan, pro, priv, act, cond, h0, keep)
+            T, m = scan.shape[0], scan.shape[1]
+            flat = lambda t: None if t is None else t.reshape(T * m, *t.shape[2:])
+            ref_scan, ref_pro, ref_cond, priv = flat(scan), flat(pro), flat(cond), flat(priv)
+    logp, ent, val = logp.float(), ent.float(), val.float()
+
+    def wmean(x, w):
+        return (x * w).sum() / w.sum().clamp_min(1.0)
+
+    aux = torch.zeros((), device=logp.device)
+    if hyper.aux_grip > 0:
+        mu_true = priv[:, hyper.priv_mu_index] - 1.0
+        aux = wmean((grip - mu_true) ** 2, w)
+    aux_o = torch.zeros((), device=logp.device)
+    if hyper.aux_opp > 0 and hyper.m_gt_1:
+        # priv[8:11] = nearest opponent (ahead offset, side offset, longitudinal speed
+        # difference), scaled to O(1). NOTE the third channel is other.vx - ego.vx, a
+        # difference of two body-frame longitudinal speeds -- NOT the line-of-sight
+        # closing speed (d/dt of the distance) that car_proximity_penalty computes. The
+        # name is kept honest here; changing what the channel *means* would silently
+        # reinterpret every checkpoint trained against it, so that is a separate change.
+        o_true = priv[:, 8:11] / torch.tensor([3.0, 1.0, 2.0], device=priv.device)
+        # priv[:, 11] is dist/PRIV_OPP_DIST_SCALE (gym_env owns that scale), so the comparison
+        # has to be made in metres. Comparing the scaled column against 6.0 directly
+        # selected 30 m -- three times the LiDAR's range, i.e. a mask that removed
+        # nothing and trained the head on an empty road.
+        near = (priv[:, 11] * PRIV_OPP_DIST_SCALE < hyper.aux_opp_range_m).to(w.dtype) * w
+        aux_o = wmean(((opp_pred - o_true) ** 2).mean(1), near)
+    ratio = (logp - logp_old).exp()
+    pg = -wmean(torch.min(ratio * adv, ratio.clamp(1 - hyper.clip, 1 + hyper.clip) * adv), w)
+    v_clipped = val_old + (val - val_old).clamp(-hyper.clip, hyper.clip)
+    vf = 0.5 * wmean(torch.max((val - ret) ** 2, (v_clipped - ret) ** 2), w)
+    with torch.no_grad(), ac:
+        # The reference is fed the same condition, and its projection is still zero,
+        # so it evaluates as the frozen unconditional baseline. Passing `c` keeps the
+        # call valid for a conditional actor without letting the leash move with it.
+        # `feedforward_dist` is the same call for a feedforward reference and, for a reference
+        # copied from a memory actor, states what it is: the leash is the ORIGINAL policy, so
+        # the recurrence is not run and its (zero) projection is not applied.
+        d_ref = ref.feedforward_dist(ref_scan, ref_pro, ref_cond)
+    d_ref = torch.distributions.Normal(d_ref.mean.float(), d_ref.stddev.float())
+    d = torch.distributions.Normal(d.mean.float(), d.stddev.float())
+    kl_ref = wmean(torch.distributions.kl_divergence(d_ref, d).sum(1), w)
+    ent_w = wmean(ent, w)
+    loss = (hyper.vf * vf + (0.0 if freeze_actor else 1.0) * (pg - hyper.ent * ent_w
+            + hyper.kl_coef * kl_ref) + hyper.aux_grip * aux + hyper.aux_opp * aux_o)
+    return {"pg": pg, "vf": vf, "ent": ent_w, "entropy_mean": ent.mean(), "kl_ref": kl_ref,
+            "aux_grip": aux, "aux_opp": aux_o, "loss": loss, "hidden": h_next,
+            "approx_kl": ((ratio - 1) - (logp - logp_old)).mean(),
+            "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
 
 
 def main():
@@ -236,6 +336,33 @@ def main():
                          "opponent off the raceline; the offset is clamped per raceline point "
                          "against the track's distance field, so it can never reach a wall")
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the policy outputs a local trajectory (f1sim.mpc)")
+    ap.add_argument("--memory", default="off", choices=("off", "gru"),
+                    help="give the actor (and by default the critic) a recurrent memory over the "
+                         "per-step trunk embedding, warm-started from --init so that step 0 is "
+                         "bit-identical to it. 'off' is the untouched run in every respect: same "
+                         "network, same rollout, same minibatching, same loss. The six-frame stack "
+                         "stays the input; this extends the window past the 150 ms it covers, which "
+                         "is what a box that has left the scan cannot otherwise survive")
+    ap.add_argument("--memory-hidden", type=int, default=128,
+                    help="GRU width (<= 256, the contract's ceiling). 128 over the 384-wide trunk "
+                         "embedding measures at 1.07x the frozen actor's CPU forward time against "
+                         "a 1.5x budget; see `python -m f1sim.learn.budget`")
+    ap.add_argument("--memory-critic", default="own", choices=("own", "none"),
+                    help="'own' gives the critic its own GRU (it already has its own stem, and it "
+                         "reads the privileged vector the actor must never see, so sharing the "
+                         "recurrence would be the one place a value gradient reached the actor's "
+                         "trunk). 'none' leaves the critic feedforward")
+    ap.add_argument("--scan-channels", default="",
+                    help=f"comma separated extra scan channels, off by default "
+                         f"({','.join(SCAN_CHANNELS)}). 'memory': the closest return seen at each "
+                         f"bearing in the last --scan-memory-tau seconds, decayed -- explicit cheap "
+                         f"memory the GRU does not have to learn. 'edges': |r[i]-r[i-1]| per beam, "
+                         f"so the crack between two boxes in a row reads as two discontinuities "
+                         f"rather than an opening. Both are pure arithmetic on the scan the env "
+                         f"already emits (0.03 ms of a 25 ms step, measured) and both start as "
+                         f"zeroed input columns, so a warm start is still bit-identical")
+    ap.add_argument("--scan-memory-tau", type=float, default=2.0,
+                    help="[s] time constant of the decayed scan-occupancy channel")
     ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--scan-stem", choices=["plain", "resnet"], default="resnet",
@@ -270,6 +397,24 @@ def main():
                              f"{a.opp_event_rate}: the rate is how many events an opponent gets per "
                              f"10 s, so at 0 the named events never fire and the run is silently the "
                              f"unflagged one. Pass a positive rate or drop --opp-events.")
+    a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
+    unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
+    if unknown:
+        raise SystemExit(f"--scan-channels {unknown}: known channels are {', '.join(SCAN_CHANNELS)}")
+    if a.memory != "off" and a.cond != "none":
+        raise SystemExit("--memory with --cond is not a supported combination: both migrate the "
+                         "same checkpoint through a different loader, and nothing has measured the "
+                         "two zero-initialised projections together.")
+    if (a.memory != "off" or a.scan_channels) and a.controller != "legacy":
+        raise SystemExit(
+            f"--memory/--scan-channels with --controller {a.controller} is not a validated "
+            f"combination: the memory work is measured against the legacy tracker only, and a "
+            f"policy that learns to lean on a friction-limited controller *and* on memory would "
+            f"have two untested changes in one result. Run --controller legacy.")
+    if a.memory != "off" and a.minibatch < a.horizon:
+        raise SystemExit(f"--memory {a.memory} needs --minibatch >= --horizon ({a.minibatch} < "
+                         f"{a.horizon}): a recurrent update's minibatches are whole env chunks of "
+                         f"the horizon, so a minibatch smaller than one chunk cannot be formed.")
     if a.kl_decay is None:
         a.kl_decay = a.total
     device = torch.device(a.device); torch.manual_seed(a.seed)
@@ -367,7 +512,27 @@ def main():
         critic_priv_dim = 21
         print(f"critic privileged adapter: {priv_adapter} (env {priv_dim} -> critic {critic_priv_dim}, "
               f"opponent slots zeroed); raw privileged storage and priv_mu_index={env.priv_mu_index} unchanged")
-    if a.init and cond_dim:
+    #: The memory / extra-channel configuration this run builds, in the form the model records.
+    mem_cfg = memory_spec(kind=a.memory, hidden_size=a.memory_hidden,
+                          critic=a.memory_critic) if a.memory != "off" else None
+    chan_cfg = ({"channels": list(a.scan_channels), "memory_tau_s": float(a.scan_memory_tau)}
+                if a.scan_channels else None)
+    if a.init and (mem_cfg or chan_cfg):
+        # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
+        # the GRU's output projection is zero and any new scan-channel input column is zero, so the
+        # actor's first action of this run is bit-identical to the one the original would have
+        # produced. `tests/test_memory_model.py` is the check.
+        model, extra, fresh = load_for_memory(
+            a.init, device, mem_cfg, scan_channels=chan_cfg, priv_adapter=priv_adapter,
+            override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
+                      "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
+                      "act_dim": env.act_dim})
+        print(f"init from {a.init} with memory {mem_cfg} channels {chan_cfg} | "
+              f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
+        a.scan_deltas = bool(model.meta.get("scan_deltas", False))
+        a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
+        a.scan_stem = str(model.meta.get("scan_stem", "plain"))
+    elif a.init and cond_dim:
         # By name, and nothing may be left fresh except the conditioning projection itself.
         model, extra, fresh = load_for_conditioning(
             a.init, device, cond_dim, cond_spec.to_meta(), priv_adapter=priv_adapter,
@@ -393,7 +558,19 @@ def main():
                             scan_deltas=a.scan_deltas, temporal_encoder=a.temporal_encoder,
                             scan_stem=a.scan_stem, cond_dim=cond_dim,
                             cond=cond_spec.to_meta() if cond_dim else None,
-                            priv_adapter=priv_adapter).to(device)
+                            priv_adapter=priv_adapter, memory=mem_cfg,
+                            scan_channels=chan_cfg).to(device)
+    #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
+    #: memory keeps its own, and the rollout below has to agree with what was built.
+    memory_on = bool(model.meta.get("memory"))
+    scan_channels = list((model.meta.get("scan_channels") or {}).get("channels") or ())
+    n_extra = len(scan_channels)
+    roll_aug = (ScanAugment(scan_channels, spec.n_beams, env.B, device=device,
+                            tau_s=float(model.meta["scan_channels"]["memory_tau_s"]))
+                if n_extra else None)
+    if memory_on or n_extra:
+        from .memory import describe as _describe_memory
+        print(f"policy memory: {_describe_memory(model.meta)}")
     # the plan default applies to a fresh actor only. Applied on every --init it silently undoes the
     # annealing each resume, and a resume that more than doubles the exploration noise crashes every
     # episode for the next ~40 updates before it claws back to where the checkpoint already was
@@ -409,6 +586,13 @@ def main():
     # different policies and the comparison would be between leashes, not conditioning.
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters(): p_.requires_grad_(False)
+    if memory_on and ref.memory is not None and float(ref.memory.out.weight.detach().abs().max()) != 0.0:
+        # Same argument as the conditioning check below, one projection further: the leash's
+        # reference is the FEEDFORWARD original, and `minibatch_losses` evaluates it with the
+        # recurrence switched off. That is only the original if the projection was still zero when
+        # this copy was taken -- i.e. before any update.
+        raise RuntimeError("the KL reference actor was captured after the memory projection had "
+                           "trained; it must be the frozen feedforward baseline")
     if cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
@@ -422,6 +606,8 @@ def main():
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
         "fresh_optimizer": bool(a.fresh_opt), "aux_grip": float(a.aux_grip), "aux_opp": float(a.aux_opp),
         "lab_oracle": bool(cond_spec.lab_oracle), "init": a.init, "seed": int(a.seed),
+        "memory": dict(model.meta.get("memory") or {}) or None,
+        "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
         "wandb_group": a.wandb_group,
         # The controller this policy was trained against, with the estimator's feature spec,
         # calibration and content hash. A consumer that cannot reproduce this refuses the checkpoint
@@ -503,7 +689,12 @@ def main():
 
     T, B = a.horizon, int(lid.numel())
     k, N, P = spec.scan_stack, spec.n_beams, spec.proprio_dim
-    buf_scan = torch.zeros(T, B, k, N, device=device, dtype=torch.float16)
+    #: What the POLICY sees on the channel axis: the stacked frames plus any extra channel. The
+    #: channels are stored rather than recomputed during the update, because the occupancy one is
+    #: itself a recurrence over the episode and a chunk replayed from a cleared memory would train
+    #: the policy on an input it never saw.
+    k_in = k + n_extra
+    buf_scan = torch.zeros(T, B, k_in, N, device=device, dtype=torch.float16)
     buf_pro = torch.zeros(T, B, P, device=device); buf_priv = torch.zeros(T, B, priv_dim, device=device)
     buf_act = torch.zeros(T, B, env.act_dim, device=device); buf_logp = torch.zeros(T, B, device=device)
     buf_rew = torch.zeros(T, B, device=device); buf_done = torch.zeros(T, B, device=device); buf_trunc = torch.zeros(T, B, device=device)
@@ -518,6 +709,22 @@ def main():
     # to see the identical input. Reading `P["mu"]` again during SGD would silently use whatever the
     # env has been reset to since -- a different friction for the same transition.
     buf_cond = torch.zeros(T, B, max(1, cond_dim), device=device)
+    # ---- recurrent state. `h_*` are the live states, full env width (the policy acts for every
+    # car, including the self-play opponents); the buffers hold the learners' slice, which is what
+    # the update replays. `buf_keep[t] = 0` marks a step whose predecessor ended an episode, so
+    # truncated BPTT masks the hidden state back to zero exactly where the rollout did.
+    h_actor = model.actor.initial_hidden(env.B, device=device) if memory_on else None
+    h_critic = model.critic.initial_hidden(env.B, device=device) if memory_on else None
+    buf_h0_actor = None if h_actor is None else torch.zeros(h_actor.shape[0], B, h_actor.shape[2], device=device)
+    buf_h0_critic = None if h_critic is None else torch.zeros(h_critic.shape[0], B, h_critic.shape[2], device=device)
+    buf_keep = torch.ones(T, B, device=device) if memory_on else None
+    #: Envs per recurrent minibatch. `--minibatch` stays a sample count so that the two modes are
+    #: comparable; a recurrent minibatch is whole env chunks, so it is that count divided by the
+    #: horizon, and the number of samples per step is unchanged.
+    env_chunk = max(1, a.minibatch // T) if memory_on else 0
+    if memory_on:
+        print(f"recurrent PPO: truncated BPTT over {T} steps, minibatches of {env_chunk} env "
+              f"chunk(s) = {env_chunk * T} samples, hidden reset on term|trunc per env")
 
     steps_done = 0; update = 0; t_start = time.time(); last_log = {}; last_ctrl = {}; cap = a.cap0
     t_loop = 0.0; t_loop0 = time.time()        # wall time of the last whole update, for --yield-to-viewer
@@ -565,10 +772,19 @@ def main():
         tm = common.Timer()
         # ---------------- rollout
         model.eval()
+        if memory_on:
+            # The state each env carries INTO this chunk, detached: truncated BPTT starts here and
+            # the gradient does not run back into the last update's graph.
+            buf_h0_actor.copy_(h_actor.detach()[:, lid])
+            if buf_h0_critic is not None:
+                buf_h0_critic.copy_(h_critic.detach()[:, lid])
+            buf_keep.fill_(1.0)
         ac = torch.autocast("cuda", dtype=torch.bfloat16, enabled=a.amp and device.type == "cuda")
         with torch.no_grad():
             for t in range(T):
                 scan, pro = flatten_obs(obs)
+                if roll_aug is not None:
+                    scan = roll_aug(scan)                  # the extra channels, advanced one step
                 # Frozen here, from the privileged vector belonging to THIS observation, before the
                 # step advances the env or a reset re-draws `mu`.
                 cond_t = (cond_mod.make_condition(a.cond, cond_spec, priv, env.priv_mu_index)
@@ -582,13 +798,27 @@ def main():
                     controller.observe_truth(priv[:, env.priv_mu_index])
                 controller.pre_action(obs)
                 with ac:
-                    act, logp = sample_rollout_action(model, scan, pro, cond_t)
-                    val = model.critic(scan[lid], pro[lid], priv[lid]).float()
+                    act, logp, h_actor_next = sample_rollout_action(model, scan, pro, cond_t, h_actor)
+                    val, h_critic_next = model.critic.step(scan[lid], pro[lid], priv[lid],
+                                                           None if h_critic is None else h_critic[:, lid])
+                    val = val.float()
                 act, logp = act.float(), logp.float()
                 buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
                 if cond_dim:
                     buf_cond[t] = cond_t[lid].float()
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
+                # Advanced but NOT yet reset: the truncation bootstrap below reads the value of the
+                # terminal observation, which belongs to the episode that just ended.
+                if memory_on:
+                    # Kept in float32 whatever `--amp` is doing. The hidden state is carried for a
+                    # whole episode -- a thousand steps -- so accumulating it in bf16 would compound
+                    # the rounding of every step into the one tensor the policy reads back; the
+                    # GRU's own arithmetic is still autocast, because that is one step deep.
+                    h_actor = h_actor_next.float()
+                    if h_critic is not None:
+                        # Only the learners' rows advanced (the critic is never run on the
+                        # teacher-driven cars), so only those are written back.
+                        h_critic = h_critic.index_copy(1, lid, h_critic_next.float())
                 # Immediately: the issued command has to be taken from the spy's pre-reset snapshot,
                 # and the episode boundaries recorded, before anything else advances the env.
                 controller.post_step(term, trunc)
@@ -602,8 +832,15 @@ def main():
                 if "final" in info:
                     f = info["final"]; m = env.learner[f["ids"]]
                     final_scan, final_pro = flatten_obs(info["final_obs"])
+                    if roll_aug is not None:
+                        # `preview`, not `__call__`: a terminal observation is scored and never
+                        # acted on, so advancing the occupancy memory for it would leave the next
+                        # episode carrying a step it did not take.
+                        final_scan = roll_aug.preview(final_scan, f["ids"])
                     with ac:
-                        final_val = model.critic(final_scan, final_pro, info["final_priv"]).float()
+                        final_val = model.critic.step(
+                            final_scan, final_pro, info["final_priv"],
+                            None if h_critic is None else h_critic[:, f["ids"]])[0].float()
                     all_final_val = torch.zeros(env.B, device=device)
                     all_final_val[f["ids"]] = final_val
                     buf_final_val[t] = all_final_val[lid]
@@ -617,16 +854,33 @@ def main():
                         track_hist[tid_].append((crashed, dist))
                     ep_stats["return"] += f["return"][m].tolist(); ep_stats["progress"] += f["progress"][m].tolist()
                     ep_stats["collided"] += f["collided"][m].float().tolist(); ep_stats["steps"] += f["steps"][m].tolist()
+                if memory_on:
+                    # The episode boundary, applied to everything that remembers: the two hidden
+                    # states and the decayed scan-occupancy channel. `obs` is already the fresh
+                    # episode's first observation (the env auto-resets inside `step`), so the state
+                    # entering step t+1 has to be the state of a car that has just spawned.
+                    done_now = term | trunc
+                    h_actor = reset_hidden(h_actor, done_now)
+                    h_critic = reset_hidden(h_critic, done_now)
+                    if roll_aug is not None:
+                        roll_aug.reset(done_now)
+                    if t + 1 < T:
+                        buf_keep[t + 1] = (~done_now[lid]).float()
             scan, pro = flatten_obs(obs)
+            if roll_aug is not None:
+                # The bootstrap value of the state the next chunk starts from: previewed, because
+                # the next chunk's first step advances the channels itself.
+                scan = roll_aug.preview(scan)
             with ac:
-                buf_val[T] = model.critic(scan[lid], pro[lid], priv[lid]).float()
+                buf_val[T] = model.critic.step(scan[lid], pro[lid], priv[lid],
+                                               None if h_critic is None else h_critic[:, lid])[0].float()
             adv = compute_gae(buf_rew, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, a.lam)
             ret = adv + buf_val[:T]
         t_roll = tm.lap()
         # ---------------- update
         model.train()
         n = T * B
-        f_scan = buf_scan.reshape(n, k, N); f_pro = buf_pro.reshape(n, P); f_priv = buf_priv.reshape(n, priv_dim)
+        f_scan = buf_scan.reshape(n, k_in, N); f_pro = buf_pro.reshape(n, P); f_priv = buf_priv.reshape(n, priv_dim)
         f_act = buf_act.reshape(n, env.act_dim); f_logp = buf_logp.reshape(n); f_adv = adv.reshape(n); f_ret = ret.reshape(n); f_val = buf_val[:T].reshape(n)
         f_mask = buf_mask.reshape(n)
         f_cond = buf_cond.reshape(n, buf_cond.shape[-1]) if cond_dim else None
@@ -635,73 +889,71 @@ def main():
         w_all = f_mask / f_mask.sum().clamp_min(1.0)
         adv_mean = (f_adv * w_all).sum(); adv_std = ((f_adv - adv_mean) ** 2 * w_all).sum().sqrt()
         f_adv = (f_adv - adv_mean) / (adv_std + 1e-8)
-        def wmean(x, w):
-            return (x * w).sum() / w.sum().clamp_min(1.0)
         stats = {"pg": [], "vf": [], "ent": [], "kl_ref": [], "approx_kl": [], "clipfrac": []}
         freeze_actor = update < a.critic_warmup
+        hyper = PPOHyper(clip=a.clip, vf=a.vf, ent=a.ent, kl_coef=kl_coef, aux_grip=a.aux_grip,
+                         aux_opp=a.aux_opp, priv_mu_index=int(env.priv_mu_index),
+                         m_gt_1=bool(env.M > 1))
+        # Feedforward: minibatches are random SAMPLES, as they always were. Recurrent: minibatches
+        # are whole env chunks of the horizon, because the update has to replay each env's chunk in
+        # order from the hidden state the rollout was in -- a shuffled sample has no predecessor to
+        # carry state from. `arange(T) * B + col` is the same flattening `(T, B).reshape(n)` uses,
+        # so the flat buffers are indexed by exactly the rows the sequence block contains.
+        units = B if memory_on else n
+        step_units = env_chunk if memory_on else a.minibatch
         for ep in range(a.epochs):
-            perm = torch.randperm(n, device=device)
-            for i in range(0, n, a.minibatch):
-                idx = perm[i:i + a.minibatch]
-                scan = f_scan[idx].float(); pro = f_pro[idx]
-                c_mb = f_cond[idx] if cond_dim else None       # the stored one, never recomputed
-                with ac:
-                    logp, ent, val, d, grip, opp_pred = model.evaluate_aux(scan, pro, f_priv[idx], f_act[idx], c_mb)
-                logp, ent, val = logp.float(), ent.float(), val.float()
-                w = f_mask[idx]
-                aux = torch.zeros((), device=device)
-                if a.aux_grip > 0:
-                    mu_true = f_priv[idx][:, env.priv_mu_index] - 1.0
-                    aux = wmean((grip - mu_true) ** 2, w)
-                aux_o = torch.zeros((), device=device)
-                if a.aux_opp > 0 and env.M > 1:
-                    # priv[8:11] = nearest opponent (ahead offset, side offset, longitudinal speed
-                    # difference), scaled to O(1). NOTE the third channel is other.vx - ego.vx, a
-                    # difference of two body-frame longitudinal speeds -- NOT the line-of-sight
-                    # closing speed (d/dt of the distance) that car_proximity_penalty computes. The
-                    # name is kept honest here; changing what the channel *means* would silently
-                    # reinterpret every checkpoint trained against it, so that is a separate change.
-                    o_true = f_priv[idx][:, 8:11] / torch.tensor([3.0, 1.0, 2.0], device=device)
-                    # priv[:, 11] is dist/PRIV_OPP_DIST_SCALE (gym_env owns that scale), so the comparison
-                    # has to be made in metres. Comparing the scaled column against 6.0 directly
-                    # selected 30 m -- three times the LiDAR's range, i.e. a mask that removed
-                    # nothing and trained the head on an empty road.
-                    near = (f_priv[idx][:, 11] * PRIV_OPP_DIST_SCALE < AUX_OPP_RANGE_M).to(w.dtype) * w
-                    aux_o = wmean(((opp_pred - o_true) ** 2).mean(1), near)
-                ratio = (logp - f_logp[idx]).exp()
-                pg = -wmean(torch.min(ratio * f_adv[idx], ratio.clamp(1 - a.clip, 1 + a.clip) * f_adv[idx]), w)
-                v_clipped = f_val[idx] + (val - f_val[idx]).clamp(-a.clip, a.clip)
-                vf = 0.5 * wmean(torch.max((val - f_ret[idx]) ** 2, (v_clipped - f_ret[idx]) ** 2), w)
-                with torch.no_grad(), ac:
-                    # The reference is fed the same condition, and its projection is still zero,
-                    # so it evaluates as the frozen unconditional baseline. Passing `c` keeps the
-                    # call valid for a conditional actor without letting the leash move with it.
-                    d_ref = ref.dist(scan, pro, c_mb)
-                d_ref = torch.distributions.Normal(d_ref.mean.float(), d_ref.stddev.float())
-                d = torch.distributions.Normal(d.mean.float(), d.stddev.float())
-                kl_ref = wmean(torch.distributions.kl_divergence(d_ref, d).sum(1), w)
-                loss = a.vf * vf + (0.0 if freeze_actor else 1.0) * (pg - a.ent * wmean(ent, w) + kl_coef * kl_ref) + a.aux_grip * aux + a.aux_opp * aux_o
+            perm = torch.randperm(units, device=device)
+            for i in range(0, units, step_units):
+                sel = perm[i:i + step_units]
+                seq = None
+                if memory_on:
+                    cols = sel
+                    idx = (torch.arange(T, device=device)[:, None] * B + cols[None, :]).reshape(-1)
+                    scan = buf_scan[:, cols].float(); pro = buf_pro[:, cols]
+                    priv_mb = buf_priv[:, cols]; act_mb = buf_act[:, cols]
+                    c_mb = buf_cond[:, cols] if cond_dim else None
+                    seq = (Hidden(buf_h0_actor[:, cols],
+                                  None if buf_h0_critic is None else buf_h0_critic[:, cols]),
+                           buf_keep[:, cols])
+                else:
+                    idx = sel
+                    scan = f_scan[idx].float(); pro = f_pro[idx]
+                    priv_mb = f_priv[idx]; act_mb = f_act[idx]
+                    c_mb = f_cond[idx] if cond_dim else None   # the stored one, never recomputed
+                # NOT `out`: that is the run directory, twenty lines below, and shadowing it makes
+                # a run that trains perfectly and then cannot write its checkpoint.
+                terms = minibatch_losses(model, ref, scan=scan, pro=pro, priv=priv_mb, act=act_mb,
+                                         logp_old=f_logp[idx], adv=f_adv[idx], ret=f_ret[idx],
+                                         val_old=f_val[idx], w=f_mask[idx], cond=c_mb, hyper=hyper,
+                                         autocast=ac, freeze_actor=freeze_actor, sequence=seq)
+                pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
+                                              terms["aux_grip"], terms["aux_opp"])
+                loss = terms["loss"]
                 opt.zero_grad()
-                if cond_dim or controller_on:
-                    # Scoped to the conditioning and controller arms so the legacy path keeps its
-                    # exact behaviour.
+                if cond_dim or controller_on or memory_on:
+                    # Scoped to the conditioning, controller and memory arms so the legacy path
+                    # keeps its exact behaviour.
                     # Without these, "the run finished" says nothing about whether a loss or a
                     # gradient ever went non-finite -- clip_grad_norm_ silently propagates a NaN, and
                     # a vacuously-empty loss dict looked like a passing finiteness check in the first
                     # smoke. With them, a completed run IS the evidence: every step's loss and total
-                    # gradient norm were finite, or it stopped here.
+                    # gradient norm were finite, or it stopped here. A recurrent update is exactly
+                    # where an exploding gradient through time would first show.
                     if not torch.isfinite(loss):
                         raise RuntimeError(f"non-finite loss at update {update} "
                                            f"(pg={float(pg):.4g} vf={float(vf):.4g} "
                                            f"kl_ref={float(kl_ref):.4g})")
                 loss.backward()
                 gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.max_grad,
-                                                    error_if_nonfinite=bool(cond_dim or controller_on))
+                                                    error_if_nonfinite=bool(cond_dim or controller_on or memory_on))
                 opt.step()
                 with torch.no_grad():
-                    stats["pg"].append(pg.item()); stats["vf"].append(vf.item()); stats["ent"].append(ent.mean().item())
-                    stats["kl_ref"].append(kl_ref.item()); stats["approx_kl"].append(((ratio - 1) - (logp - f_logp[idx])).mean().item())
-                    stats["clipfrac"].append(((ratio - 1).abs() > a.clip).float().mean().item())
+                    stats["pg"].append(pg.item()); stats["vf"].append(vf.item())
+                    stats["ent"].append(terms["entropy_mean"].item())
+                    stats["kl_ref"].append(kl_ref.item())
+                    stats["approx_kl"].append(terms["approx_kl"].item())
+                    stats["clipfrac"].append(terms["clipfrac"].item())
+                    if memory_on: stats.setdefault("grad_norm", []).append(float(gn))
                     if a.aux_grip > 0: stats.setdefault("aux_grip", []).append(aux.item())
                     if a.aux_opp > 0 and env.M > 1: stats.setdefault("aux_opp", []).append(aux_o.item())
         t_upd = tm.lap()
@@ -731,6 +983,7 @@ def main():
                    "rollout/value_mean": buf_val[:T].mean().item(), "rollout/adv_std": adv.std().item(),
                    "loss/pg": np.mean(stats["pg"]), "loss/vf": np.mean(stats["vf"]), "loss/entropy": np.mean(stats["ent"]),
                    "loss/kl_ref": np.mean(stats["kl_ref"]), "loss/approx_kl": np.mean(stats["approx_kl"]), "loss/clipfrac": np.mean(stats["clipfrac"]),
+                   **({"loss/grad_norm": float(np.mean(stats["grad_norm"]))} if stats.get("grad_norm") else {}),
                    **({"loss/aux_grip_mse": float(np.mean(stats["aux_grip"]))} if stats.get("aux_grip") else {}),
                    **({"loss/aux_opp_mse": float(np.mean(stats["aux_opp"]))} if stats.get("aux_opp") else {}),
                    "policy/log_std_steer": model.actor.log_std[0].item(), "policy/log_std_speed": model.actor.log_std[1].item(),

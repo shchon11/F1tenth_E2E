@@ -36,6 +36,7 @@ torch = pytest.importorskip("torch")
 from builtin_interfaces.msg import Time                       # noqa: E402
 
 import f1sim_ros.policy_node as pn                            # noqa: E402
+from f1sim.learn.memory import PolicyRuntime                   # noqa: E402
 from f1sim.learn.obs import ObsBuilder, ObsSpec               # noqa: E402
 from f1sim_ros.traction import LOCK, OK, SPIN, TractionGuard, TractionParams  # noqa: E402
 
@@ -60,10 +61,12 @@ class FixedModel:
         self.speed_frac = speed_frac
         self.act_dim = act_dim
 
-    def act(self, scan, pro, deterministic=True):
+    def act(self, scan, pro, deterministic=True, c=None, h=None):
+        # Same shape as `ActorCritic.act`: action, log probability, next hidden state. A stub
+        # without memory returns None for the state, which is what a legacy checkpoint does.
         a = torch.zeros(1, self.act_dim)
         a[0, 1] = self.speed_frac           # maps to (frac + 1) / 2 * v_max
-        return a, None
+        return a, None, None
 
 
 class RecordingGuard:
@@ -118,6 +121,7 @@ def make_node(traction="on", overrides="", speed_frac=-1.0, cal=(0.0, 1.0, 1.0),
     n.spec = spec
     n.obs = ObsBuilder(spec, "cpu")
     n.model = FixedModel(speed_frac, spec.act_dim)
+    n.policy_state = PolicyRuntime()        # inert: this stub actor has no memory to carry
     n.pub = RecordingPub()
     n.speed_cap = 8.0
     n.steer_max = 0.4189
@@ -389,7 +393,7 @@ def test_a_sensor_gap_resets_the_guard_with_the_observation_history():
     st = n.traction.state
     assert st.locks == 0 and st.spins == 0 and st.state == OK
     assert st == n.traction.state and st.t == 0.0
-    assert "observation and tracker history cleared" in n._log.text()
+    assert "observation, policy memory and tracker history cleared" in n._log.text()
 
 
 def test_the_guard_is_reset_not_recreated_so_its_parameters_survive_a_gap():

@@ -110,21 +110,25 @@ def load_actor(entry: Dict[str, Any], device):
     return model, extra
 
 
-def policy_for(model) -> Callable:
+def policy_for(model, batch: int = None) -> Callable:
     """`obs -> action`, deterministic, with no conditioning and no privileged input invented.
 
     The benchmark scores what the policy does from its own sensors. If a checkpoint needs a
     conditioning vector, `load_checkpoint` has already refused it; nothing here fabricates one.
+
+    A recurrent checkpoint carries its hidden state (and any extra scan channel) between calls, so
+    the returned callable is stateful and has `.reset(done=None)`. `runner.run_cell` clears it at
+    the cell's single seeded reset and at every episode boundary within the cell -- i.e. per trial,
+    which is the unit the suite scores. The width is taken from the first observation unless
+    `batch` says otherwise, and a cell of a different width rebuilds (and so clears) the state,
+    because a hidden state is per row and cannot be carried from one cell's rows to another's.
+
+    For a feedforward checkpoint this is `model.act` and `.reset` does nothing, so the scores of
+    every system already on the roster are untouched.
     """
-    import torch
-    from f1sim.learn.obs import flatten_obs
+    from f1sim.learn.memory import policy_fn
 
-    def policy(obs):
-        scan, proprio = flatten_obs(obs)
-        with torch.no_grad():
-            return model.act(scan, proprio, deterministic=True)[0]
-
-    return policy
+    return policy_fn(model, batch, device=next(model.parameters()).device, deterministic=True)
 
 
 # ------------------------------------------------------------------ environment

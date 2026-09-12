@@ -30,6 +30,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool, Float64
+from std_msgs.msg import Empty as EmptyMsg
 from std_srvs.srv import Empty
 from tf2_ros import TransformBroadcaster
 
@@ -133,6 +134,12 @@ class VescSimNode(Node):
         self.pub_map = self.create_publisher(OccupancyGrid, "/map", latched)
         self.tf = TransformBroadcaster(self)
         self.create_service(Empty, "/f1sim/reset", self.on_reset_srv)
+        # Announced, not just performed: a policy node driving this simulator keeps an
+        # observation history and, with --memory, a hidden state, and neither survives the
+        # car being picked up and put back on the line. A std_msgs/Empty TOPIC of the same
+        # name as the service -- the two are separate in the ROS graph -- so any listener
+        # can hear it without a second server for the service.
+        self.pub_reset = self.create_publisher(EmptyMsg, "/f1sim/reset", 1)
         if not HAVE_VESC_MSGS:
             self.get_logger().warn("vesc_msgs not found: sensors/core and sensors/imu are not published (build the workspace)")
 
@@ -209,6 +216,8 @@ class VescSimNode(Node):
             s = None if self.start_s < 0 else torch.tensor([self.start_s])
             pose = self.sim.sample_spawn(1, lateral_std=0.0, yaw_std=0.0, s=s)
         self.sim.reset(poses=pose)
+        if getattr(self, 'pub_reset', None) is not None:
+            self.pub_reset.publish(EmptyMsg())
         self.erpm_cmd = 0.0; self.servo_cmd = self.servo_off; self.tacho = 0.0
         self.get_logger().info("reset at %s" % self.sim.state[0, :3].cpu().numpy().round(2))
 

@@ -104,6 +104,34 @@ def prepare_graph_runtime(env, warmup_steps: int = 2, log=print):
     return fp
 
 
+def prepare_actor_graph(actor, scan, proprio, hidden=None, log=print):
+    """Capture the actor's control step as a CUDA graph, or return None and say why.
+
+    `scan`, `proprio` and `hidden` are one real example of each argument -- real, because the graph
+    binds their addresses, dtypes and shapes and a guessed signature is how a graph gets captured
+    against the wrong thing. `hidden` is None for a feedforward actor.
+
+    The returned callable is `(scan, proprio, hidden) -> (mu, next hidden)` and holds the hidden
+    state in a static buffer that every replay copies into, which is the only shape of this that is
+    safe: a tensor a replay produced is overwritten by the next one.
+
+    Call it where a `CaptureFailed` can be handled -- during a session build, not inside the step
+    loop. `NotCapturable` is not an error: the caller runs eager, and this says so.
+    """
+    from ..viewer.graph_fastpath import NotCapturable, graph_actor_step
+    args = (scan, proprio) + ((hidden,) if hidden is not None else ())
+    if hidden is None:
+        log("actor graph: feedforward actor, nothing to carry; running eager")
+        return None
+    try:
+        g = graph_actor_step(actor, args)
+    except NotCapturable as exc:
+        log(f"actor graph: not eligible ({exc}); running eager")
+        return None
+    log("actor graph: captured (hidden state in a static buffer, updated in place)")
+    return g
+
+
 def release_graph_runtime(rt) -> None:
     """Put `sim._roll` and the tracker's solver back. Safe to call with `None`.
 
