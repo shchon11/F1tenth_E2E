@@ -41,7 +41,7 @@ track = Track.generate_random(seed=0)        # or Track.from_ros_map("map.yaml")
 sim = Simulator(track, cfg, num_envs=4, device="cpu")
 
 r = sim.step(torch.zeros(4, 2))              # action = (steer [rad], target speed [m/s]) per env
-print(r.scan.shape, r.odom.shape, r.state.shape)     # (4, 1081) (4, 5) (4, 7)
+print(r.scan.shape, r.odom.shape, r.state.shape)     # (4, 1081) (4, 5) (4, 8)
 sim.reset(torch.nonzero(r.collision).flatten())      # partial reset re-samples the randomised parameters
 ```
 

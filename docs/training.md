@@ -287,15 +287,52 @@ deployed input is constructed by the same code path — see [ROS 2](ros2.md).
 | `legacy` | none — no explicit friction limit is applied. **The default.** |
 | `fixed_low` | one conservative constant, identical in every environment |
 | `oracle` | the environment's true friction, per environment. Simulation only: it reads privileged state. |
+| `estimated` | an estimate from causal onboard signals only |
+
+Any of them may additionally carry the traction guard, written as a `+tcs` suffix — see below.
 
 `oracle` is a **privileged reference for this controller** — what perfect friction knowledge buys
 *given this speed-envelope and bound derivation*. It is not a mathematical upper bound on achievable
 performance: a different controller could use the same knowledge better, and nothing here proves the
 derivation optimal.
-| `estimated` | an estimate from causal onboard signals only |
 
 `legacy` and `fixed_low` are different things: the first applies no explicit limit at all, the second
 applies a constant one. `oracle` cannot run on a car.
+
+### `+tcs` — the car's traction guard, inside the loop
+
+`tcs` is a **composable** arm: it does not change what the tracker plans under, it shapes the speed
+command between the controller and the VESC. So it is written as a suffix and can be worn on top of
+any of the four above — `--controller tcs` is the legacy tracker plus the guard, and
+**`--controller fixed_low+tcs` is the deployment default**, because `fixed_low` is the control arm
+the benchmark roster runs and the guard is what the car ships.
+
+What runs is `f1sim_ros/f1sim_ros/traction.py` — the same class, unmodified, that
+[`docs/ros2.md`'s traction guard](ros2.md) describes and that `scripts/replay_traction.py` validated
+over the 22 real recordings. It is fed the simulated sensors and nothing else: the ERPM-quantised,
+jitter-stamped wheel speed from `StepResult.odom` / `odom_t`, the last IMU sample's longitudinal
+acceleration, and the emulated `/sensors/core` motor current. Its thresholds are the ones it uses on
+the car, and they travel inside the checkpoint (`experiment.controller.traction.params`) so a
+consumer can refuse a mismatched pair.
+
+```
+python3 -m f1sim.learn.ppo --controller fixed_low+tcs --action-mode plan ...
+python3 -m f1sim.learn.evaluate CKPT --controller fixed_low+tcs --wheel-model on ...
+```
+
+**It needs `vehicle.wheel_model`.** With the switch off the simulated wheel speed *is* the body
+speed, the residual the detector keys on is identically zero, and the arm would be a `legacy` run
+wearing another arm's name — so it refuses to construct rather than run silently inert.
+
+**Cost.** The guard is host Python over scalars: one `update` + `shape` pair per car per control
+step, plus one device→host transfer to fetch its four inputs and one back to return the shaped
+speed. Nothing about it is inside `sim._roll`, so it is outside the CUDA-graph fastpath by
+construction; the two transfers are a synchronise per step, which on the `graphs` backend is the
+cost that matters rather than the Python. Measured numbers are in
+[the wheel-model note](research/wheel-model-2026-09-13.md).
+
+`controller/tcs_*` metrics (active fraction, lock and spin counts, the largest release and cap) are
+logged alongside the tracker arm's.
 
 The `estimated` arm works from:
 

@@ -5,14 +5,18 @@ ROS-free and dependency-free on purpose (`math` only). Inside `policy_node` it i
 the same class is replayed over the recorded bags offline by `scripts/replay_traction.py` -- one
 implementation, two callers, so what is validated is what drives.
 
-Why it cannot be validated in the simulator
--------------------------------------------
-`f1sim/f1sim/dynamics.py` carries no wheel rotation state (STATE_DIM 7: x, y, yaw, vx, vy,
-yaw_rate, steer) and `odom.py` reports ground speed plus noise, so in simulation the wheel speed IS
-the body speed and the residual this detector keys on is identically zero. The real car shows both
-failures clearly: in the 22 recordings under `real_data/`, VESC-ERPM wheel speed decelerates at
--40 ... -143 m/s^2 while the IMU body decel stays inside -3 ... -16 m/s^2. So the rule lives on the
-car and is validated by replay. See `docs/ros2.md` and `evidence/wheelslip_bags.py`.
+Where it is validated
+---------------------
+On the car, by replay over the 22 recordings under `real_data/`, where VESC-ERPM wheel speed
+decelerates at -40 ... -143 m/s^2 while the IMU body decel stays inside -3 ... -16 m/s^2. See
+`docs/ros2.md` and `evidence/wheelslip_bags.py`.
+
+When this module was written the simulator could not produce either failure -- `dynamics.py` carried
+no wheel rotation state and `odom.py` reported ground speed, so the simulated wheel speed WAS the
+body speed and this residual was identically zero. Since 2026-09-13 it can (`vehicle.wheel_model`),
+and this same class runs inside the simulator loop as the `tcs` controller arm
+(`f1sim/f1sim/learn/traction_arm.py`). One implementation, three callers: the car, the bag replay,
+and the simulator. See `docs/research/wheel-model-2026-09-13.md`.
 
 The measurement
 ---------------

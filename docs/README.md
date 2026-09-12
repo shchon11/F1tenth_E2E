@@ -26,6 +26,7 @@ Dated experiment reports: protocol, data, and an explicit statement of what each
 | [Legacy-recipe probe](research/2026-09-11-legacy-recipe-probe.md) | one-seed control asking whether the fine-tuning recipe alone explains the low-friction drop |
 | [Checkpoint benchmark v1 (3-system subset)](research/benchmark-v1-2026-09-12.md) | three systems on the frozen v1 suite — 102 cells, 816 trials, with raw and derived rows; **not** the 17-system benchmark |
 | [Static-grip retention](research/static-grip-retention-2026-09-12.md) | four training recipes × two seeds against a frozen reference — 30 cells, 240 trials per checkpoint; no eligible recipe, with per-trial data and the independent eligibility audit |
+| [A wheel that can slip](research/wheel-model-2026-09-13.md) | the rear-axle rotation state, the ERPM channel's artefacts and the in-simulator traction arm, scored against the 22 real recordings by the same script that scores the car |
 
 ## Engineering notes
 
