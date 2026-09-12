@@ -60,11 +60,15 @@ TRAIN_DIRECTIONS = ("", "~rev", "~mir", "~mir~rev")
 # one variant per real map. `+obs` sits boxes against a lane edge; `+rlobs` puts them ON the racing
 # line, which is the case that actually has to be avoided -- the teacher itself goes from 0.22 to
 # 1.67 collisions/km on those, and there were none in any track set.
-# The venue this car actually raced at, with obstacles. Its clean laps stay held out, and the
-# obstacle seeds here are disjoint from the ones in EVAL_OBSTACLE_TRACKS, so the eval asks the
-# question worth asking about a known circuit: the layout is familiar, the obstacles are not.
-# Every situation axis is covered on it -- boxes at the lane edge, boxes on the racing line drawn
-# across sight-distance bands, and the lane closing down -- in both directions and mirrored.
+# The venue this car actually raced at, with obstacles. Every situation axis is covered on it --
+# boxes at the lane edge, boxes on the racing line drawn across sight-distance bands, and the lane
+# closing down -- in both directions and mirrored.
+# This venue is TRAINING ONLY. It used to appear in the eval lists as well, on the argument that
+# the obstacle seeds there were disjoint from these; that argument does not survive contact with
+# what an eval number is for. Twenty variants of this floor are trained on, so its geometry, its
+# folds and its sight lines are all in the weights, and a score on it -- with or without a box it
+# has not seen -- says how well a known circuit was learned. `HELDOUT_TRACKS` below holds the
+# floors that answer the other question.
 KOREA26 = "real:korea_2026_competition"
 KOREA26_TRAIN = ([f"{KOREA26}+obs{s}{d}" for s in (201, 202, 203) for d in ("", "~rev", "~mir")]
                  + [f"{KOREA26}+rlobs{s}{d}" for s in (211, 212, 213, 214) for d in ("", "~rev", "~mir")]
@@ -83,39 +87,88 @@ TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in TRAIN_DIRECTIONS]
 
 # Held out entirely. Grouped by the axis each one probes, so a failure says which kind of novelty
 # broke it rather than only that something did.
-EVAL_TRACKS = [
+#
+# `real:korea_2026_competition` is NOT here, and must not come back. Its geometry is trained through
+# the twenty obstacle variants in `KOREA26_TRAIN`, so a clean lap on it measures how well a known
+# circuit was memorised, not whether anything generalises. It stays a training venue; what replaced
+# it are two floors this car drove on that the simulator had never held at all:
+#
+#   real:map16x07   15.5 x 7.0 m, the pre-competition hairpin loop (median half-width 0.70 m --
+#                   narrower than anything in training, where the tightest real venue is 0.85 m)
+#   real:map12x16   12.3 x 16.4 m loop
+#
+# Both come from `real_data/02_pre-competition` via `scripts/extract_bag_map.py`; see
+# `docs/benchmark.md` for the boundary evidence. They are the only entries in any list here whose
+# geometry has never been seen in any form, which is what makes a generalisation number possible.
+HELDOUT_BASE_MAPS = ("real:map16x07", "real:map12x16")
+
+HELDOUT_TRACKS = [
     "real:korea_2025_iccas", "real:korea_2025_iccas~rev",   # folded real venue, never seen
     "real:blackbox2022_3", "real:blackbox2022_3~rev",       # pinched real venue
     "rt:Monza",                                             # long, fast, smooth
     "gen:competition:0",                                    # the familiar family, unseen seed
-    "real:korea_2026_competition", "real:korea_2026_competition~rev",   # folded real venue
     "gen:control:9100",                                     # hairpins and chicanes
     "gen:competition:9200+pinch9200",                       # sudden narrowing
+    "real:map16x07", "real:map16x07~rev",                   # unseen real floor, tight hairpin loop
+    "real:map12x16", "real:map12x16~rev",                   # unseen real floor
 ]
-EVAL_OBSTACLE_TRACKS = (
+#: Kept as the name every caller already uses. It is the same list, not a copy: `track_names("eval")`
+#: and the viewer's "held-out" group must not be able to drift away from the held-out definition.
+EVAL_TRACKS = HELDOUT_TRACKS
+
+HELDOUT_OBSTACLE_TRACKS = (
     [f"{n}+obs{s}{d}" for n, s in (("real:korea_2025_iccas", 101), ("real:blackbox2022_3", 102),
                                    ("gen:competition:0", 103))
      for d in ("", "~rev")]
     + [f"{n}+rlobs{s}{d}" for n, s in (("real:korea_2025_iccas", 111), ("real:blackbox2022_3", 112),
                                        ("gen:control:9102", 113))
        for d in ("", "~rev")]
-    # the competition venue, obstacle seeds it has never trained on
-    + [f"{KOREA26}+obs{s}{d}" for s in (901, 902) for d in ("", "~rev")]
-    + [f"{KOREA26}+rlobs{s}{d}" for s in (911, 912, 913) for d in ("", "~rev")]
-    + [f"{KOREA26}+pinch921", f"{KOREA26}+pinch921~rev"]
 )
+EVAL_OBSTACLE_TRACKS = HELDOUT_OBSTACLE_TRACKS
+
+
+def base_map(name: str) -> str:
+    """Catalog name with every variant suffix stripped: `real:x+rlobs7~mir~rev` -> `real:x`.
+
+    The suffix lists come from `maps` rather than being restated here, so a modifier or obstacle
+    family added to the catalog is covered without a second list to keep in sync. The loop runs to
+    a fixed point because the two kinds of suffix can be written in either order.
+    """
+    prev = None
+    while prev != name:
+        prev = name
+        for m in maps.MODIFIERS:
+            if name.endswith(m):
+                name = name[:-len(m)]
+        stripped, kind, _ = maps._split_obstacle_suffix(name)
+        if kind is not None:
+            name = stripped
+    return name
+
+
+def heldout_leakage(train_names, heldout_names) -> List[str]:
+    """Training entries that touch a held-out base map. Empty means the split is clean.
+
+    Comparing base maps rather than full names is the whole point: `real:map16x07+obs5~mir` is a
+    different string from `real:map16x07` but the same floor, and a held-out number measured on a
+    floor the policy trained on -- in any direction, with any obstacles stamped into it -- is not a
+    generalisation number. Returned in the order given so the caller can name the offenders.
+    """
+    held = {base_map(n) for n in heldout_names}
+    return [n for n in train_names if base_map(n) in held]
 
 
 def track_names(spec: str = "train") -> List[str]:
-    """'train' -> TRAIN_TRACKS, 'eval' -> EVAL_TRACKS, otherwise a comma separated catalog list."""
+    """'train' -> TRAIN_TRACKS, 'eval'/'heldout' -> HELDOUT_TRACKS, otherwise a comma separated
+    catalog list."""
     if spec == "train":
         return list(TRAIN_TRACKS)
-    if spec == "eval":
-        return list(EVAL_TRACKS)
-    if spec == "eval_obstacles":
-        return list(EVAL_OBSTACLE_TRACKS)
-    if spec == "eval_all":
-        return list(EVAL_TRACKS) + list(EVAL_OBSTACLE_TRACKS)
+    if spec in ("eval", "heldout"):
+        return list(HELDOUT_TRACKS)
+    if spec in ("eval_obstacles", "heldout_obstacles"):
+        return list(HELDOUT_OBSTACLE_TRACKS)
+    if spec in ("eval_all", "heldout_all"):
+        return list(HELDOUT_TRACKS) + list(HELDOUT_OBSTACLE_TRACKS)
     return [n.strip() for n in spec.split(",") if n.strip()]
 
 
