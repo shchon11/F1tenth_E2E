@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from .. import maps
+from .. import tracks
 from ..params import Config
 from ..gym_env import EnvConfig, F1VecEnv
 from ..raceline import Raceline
@@ -21,110 +22,38 @@ WANDB_ENTITY = os.environ.get("WANDB_ENTITY")     # None -> the account's defaul
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "f1sim-e2e")
 
 
-REAL_TRAIN = ["icra2022", "blackbox2021_1", "blackbox2021_2", "blackbox2021_3", "blackbox2022_1",
-              "blackbox2022_2"]
-RT_TRAIN = ["Spielberg", "Oschersleben"]
-
-# The procedural mix is chosen from what was measured to be missing, not from how many seeds a
-# generator can produce. Against the real venues the old set had three holes:
+# ---------------------------------------------------------------- track sets
+# These used to be literal lists of loader strings, a hundred and forty-nine of them, and the only
+# way to see what the split *was* was to read the list comprehensions that built it. They are now
+# generated from `f1sim.tracks`: a registry of base tracks with short ids, and one `SplitRule` per
+# track saying which directions and which obstacle seeds that track contributes. The rules and the
+# reasoning behind them live in `tracks.py` (torch-free, so the console can read them too); what is
+# here is the same strings, in the same order, under the names every caller already uses.
 #
-#   fold-back   how close the lap comes to itself while being far away along it: every generator
-#               stayed 5.8-7.0 m away, every real venue folds to 2.4-3.3 m behind a single hose.
-#               `serpentine` was written for this and lands at 1.3-2.5 m.
-#   pinch       local width over the narrowest spot near it: 1.04-1.05 procedurally against 1.35-1.98
-#               on the blackbox maps. `+pinch` closes the lane down at a few places on any style.
-#   width var   0.07-0.15 against 0.26. `control` (hairpins, chicanes, varying width) was in the
-#               code and in no track set at all.
-#
-# `competition` is cut back rather than grown: its own docstring says more seeds add little new
-# geometry, and it was 32 of 112 tracks. `hallway` is cut hardest -- its scans are so self-similar
-# (aliasing 0.087 against 0.28-0.58 everywhere else) that far-apart places are indistinguishable to
-# a LiDAR-only policy, which is teaching one observation two answers.
-# `serpentine` is written and measured but held back from training for now: it delivers the fold-back
-# (1.3-2.5 m against 5.8-7.0 for every other generator) and with the loop seam rounded the teacher's
-# episode failures dropped tenfold, but it still runs at 18 collisions/km against 0.2-1.4 elsewhere.
-# The residual cause is not the generator: two lanes 3 m apart make the centerline projection
-# ambiguous, and progress, lap counting and the wrong-way check all read that projection. Windowing
-# the search around the previous index fixed the *real* folded venues (korea_2026 went to 0.35
-# collisions/km, s no longer jumping) but not a track that folds this often. Fold-back exposure comes
-# from those real maps until the projection is solid enough to carry procedural folds too.
-GEN_TRAIN = ([f"gen:control:{seed}" for seed in range(1400, 1408)]         # hairpins, chicanes, width
-             + [f"gen:competition:{seed}" for seed in range(1000, 1008)]
-             + [f"gen:circuit:{seed}" for seed in range(1200, 1204)]
-             + [f"gen:hallway:{seed}" for seed in range(1100, 1104)])
-GEN_PINCH = ([f"gen:control:{s}+pinch{s}" for s in range(1408, 1414)]
-             + [f"gen:competition:{s}+pinch{s}" for s in range(1008, 1012)])
+# `tests/test_tracks.py` holds the previous literals as a frozen oracle and compares string for
+# string. Nothing downstream may change meaning: a checkpoint's manifest, a frozen benchmark suite
+# and a W&B config all name their tracks in the loader's grammar.
+REAL_TRAIN = [tracks.get(t).legacy.split(":", 1)[1] for t in tracks.REAL_TRAIN_IDS]
+RT_TRAIN = [tracks.get(t).legacy.split(":", 1)[1] for t in tracks.RT_TRAIN_IDS]
+GEN_TRAIN = [tracks.get(t).legacy for t in tracks.GEN_TRAIN_IDS]
 TRAIN_DIRECTIONS = ("", "~rev", "~mir", "~mir~rev")
 
-# Obstacles are half the point of the exercise, so they get their own share of the set rather than
-# one variant per real map. `+obs` sits boxes against a lane edge; `+rlobs` puts them ON the racing
-# line, which is the case that actually has to be avoided -- the teacher itself goes from 0.22 to
-# 1.67 collisions/km on those, and there were none in any track set.
-# The venue this car actually raced at, with obstacles. Every situation axis is covered on it --
-# boxes at the lane edge, boxes on the racing line drawn across sight-distance bands, and the lane
-# closing down -- in both directions and mirrored.
-# This venue is TRAINING ONLY. It used to appear in the eval lists as well, on the argument that
-# the obstacle seeds there were disjoint from these; that argument does not survive contact with
-# what an eval number is for. Twenty variants of this floor are trained on, so its geometry, its
-# folds and its sight lines are all in the weights, and a score on it -- with or without a box it
-# has not seen -- says how well a known circuit was learned. `HELDOUT_TRACKS` below holds the
-# floors that answer the other question.
-KOREA26 = "real:korea_2026_competition"
-KOREA26_TRAIN = ([f"{KOREA26}+obs{s}{d}" for s in (201, 202, 203) for d in ("", "~rev", "~mir")]
-                 + [f"{KOREA26}+rlobs{s}{d}" for s in (211, 212, 213, 214) for d in ("", "~rev", "~mir")]
-                 + [f"{KOREA26}+pinch{s}{d}" for s in (221, 222) for d in ("", "~rev")])
+#: The venue this car actually raced at, and a training venue only -- see `tracks.KOREA26_ID`.
+KOREA26 = tracks.get(tracks.KOREA26_ID).legacy
+KOREA26_TRAIN = [n for r in tracks.TRAIN_RULES if r.track == tracks.KOREA26_ID for n in r.legacy_names()]
 
-TRAIN_OBSTACLES = (list(KOREA26_TRAIN)
-                   + [f"real:{n}+obs{i}{d}" for i, n in enumerate(REAL_TRAIN) for d in ("", "~rev")]
-                   + [f"real:{n}+rlobs{i + 40}{d}" for i, n in enumerate(REAL_TRAIN) for d in ("", "~rev")]
-                   + [f"gen:control:{s}+rlobs{s}" for s in range(1414, 1420)]
-                   + [f"gen:competition:{s}+rlobs{s}" for s in range(1012, 1016)])
+TRAIN_TRACKS = tracks.split_names("train")
 
-TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in TRAIN_DIRECTIONS]
-                + [f"rt:{n}{d}" for n in RT_TRAIN for d in TRAIN_DIRECTIONS]
-                + [f"{n}{d}" for n in GEN_TRAIN for d in ("", "~rev")]
-                + list(GEN_PINCH) + list(TRAIN_OBSTACLES))
+#: The floors that have never been seen in any form, which is what makes a generalisation number
+#: possible. See `tracks.HELDOUT_BASE_IDS` for the measurements behind the choice.
+HELDOUT_BASE_MAPS = tuple(tracks.get(t).legacy for t in tracks.HELDOUT_BASE_IDS)
 
-# Held out entirely. Grouped by the axis each one probes, so a failure says which kind of novelty
-# broke it rather than only that something did.
-#
-# `real:korea_2026_competition` is NOT here, and must not come back. Its geometry is trained through
-# the twenty obstacle variants in `KOREA26_TRAIN`, so a clean lap on it measures how well a known
-# circuit was memorised, not whether anything generalises. It stays a training venue; what replaced
-# it are two floors this car drove on that the simulator had never held at all:
-#
-#   real:map16x07   15.5 x 7.0 m, the pre-competition hairpin loop. Median half-width 0.702 m,
-#                   the narrowest median lane in the catalog: the tightest training venue by that
-#                   measure is real:icra2022 at 0.873 m, and the raced floor is 0.960 m.
-#   real:map12x16   12.3 x 16.4 m loop, median half-width 0.939 m
-#
-# Both come from `real_data/02_pre-competition` via `scripts/extract_bag_map.py`; see
-# `docs/benchmark.md` for the boundary evidence. They are the only entries in any list here whose
-# geometry has never been seen in any form, which is what makes a generalisation number possible.
-HELDOUT_BASE_MAPS = ("real:map16x07", "real:map12x16")
-
-HELDOUT_TRACKS = [
-    "real:korea_2025_iccas", "real:korea_2025_iccas~rev",   # folded real venue, never seen
-    "real:blackbox2022_3", "real:blackbox2022_3~rev",       # pinched real venue
-    "rt:Monza",                                             # long, fast, smooth
-    "gen:competition:0",                                    # the familiar family, unseen seed
-    "gen:control:9100",                                     # hairpins and chicanes
-    "gen:competition:9200+pinch9200",                       # sudden narrowing
-    "real:map16x07", "real:map16x07~rev",                   # unseen real floor, tight hairpin loop
-    "real:map12x16", "real:map12x16~rev",                   # unseen real floor
-]
+HELDOUT_TRACKS = tracks.split_names("heldout")
 #: Kept as the name every caller already uses. It is the same list, not a copy: `track_names("eval")`
-#: and the viewer's "held-out" group must not be able to drift away from the held-out definition.
+#: and the viewer's "검증" group must not be able to drift away from the held-out definition.
 EVAL_TRACKS = HELDOUT_TRACKS
 
-HELDOUT_OBSTACLE_TRACKS = (
-    [f"{n}+obs{s}{d}" for n, s in (("real:korea_2025_iccas", 101), ("real:blackbox2022_3", 102),
-                                   ("gen:competition:0", 103))
-     for d in ("", "~rev")]
-    + [f"{n}+rlobs{s}{d}" for n, s in (("real:korea_2025_iccas", 111), ("real:blackbox2022_3", 112),
-                                       ("gen:control:9102", 113))
-       for d in ("", "~rev")]
-)
+HELDOUT_OBSTACLE_TRACKS = tracks.split_names("heldout_obstacles")
 EVAL_OBSTACLE_TRACKS = HELDOUT_OBSTACLE_TRACKS
 
 
@@ -159,9 +88,23 @@ def heldout_leakage(train_names, heldout_names) -> List[str]:
     return [n for n in train_names if base_map(n) in held]
 
 
-def track_names(spec: str = "train") -> List[str]:
-    """'train' -> TRAIN_TRACKS, 'eval'/'heldout' -> HELDOUT_TRACKS, otherwise a comma separated
-    catalog list."""
+SPLIT_SPECS = ("train", "eval", "heldout", "eval_obstacles", "heldout_obstacles",
+               "eval_all", "heldout_all")
+
+
+def track_names(spec: str = "train", draws: int = 8, seed: int = 0) -> List[str]:
+    """A split name or a comma separated list -> loader names.
+
+    Both grammars are accepted in the list, and the new one may leave the obstacle seed open:
+
+        --tracks 'real/bb22-1@rev#line:*'      one map, `draws` random box placements
+        --tracks 'real/bb22-1+rlobs44~rev'     the old spelling of one of them
+
+    `draws` only applies to an entry whose seed is `*`; anything else is one track however large it
+    is. The draw comes from `random.Random(seed)` shared across the whole list, so the same
+    `--seed` gives the same set and the manifest can record the concrete names.
+    """
+    spec = (spec or "").strip()
     if spec == "train":
         return list(TRAIN_TRACKS)
     if spec in ("eval", "heldout"):
@@ -170,7 +113,7 @@ def track_names(spec: str = "train") -> List[str]:
         return list(HELDOUT_OBSTACLE_TRACKS)
     if spec in ("eval_all", "heldout_all"):
         return list(HELDOUT_TRACKS) + list(HELDOUT_OBSTACLE_TRACKS)
-    return [n.strip() for n in spec.split(",") if n.strip()]
+    return tracks.expand_all([n.strip() for n in spec.split(",") if n.strip()], draws, seed)
 
 
 # A viewer and a training job share one GPU, and the trainer will happily take all of it: measured,
