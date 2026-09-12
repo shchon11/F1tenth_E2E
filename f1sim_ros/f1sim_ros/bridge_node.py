@@ -28,6 +28,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool
+from std_msgs.msg import Empty as EmptyMsg
 from std_srvs.srv import Empty
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
@@ -105,6 +106,12 @@ class BridgeNode(Node):
         self.tf = TransformBroadcaster(self)
         self.tf_static = StaticTransformBroadcaster(self)
         self.create_service(Empty, "/f1sim/reset", self.on_reset_srv)
+        # Announced, not just performed: a policy node driving this simulator keeps an
+        # observation history and, with --memory, a hidden state, and neither survives the
+        # car being picked up and put back on the line. A std_msgs/Empty TOPIC of the same
+        # name as the service -- the two are separate in the ROS graph -- so any listener
+        # can hear it without a second server for the service.
+        self.pub_reset = self.create_publisher(EmptyMsg, "/f1sim/reset", 1)
 
         self.publish_map()
         self.publish_static_tf()
@@ -130,6 +137,8 @@ class BridgeNode(Node):
             s = None if self.start_s < 0 else torch.tensor([self.start_s])
             pose = self.sim.sample_spawn(1, lateral_std=0.0, yaw_std=0.0, s=s)
         self.sim.reset(poses=pose)
+        if getattr(self, 'pub_reset', None) is not None:
+            self.pub_reset.publish(EmptyMsg())
         self.cmd = torch.zeros(1, 2)
         self.get_logger().info("reset at %s" % self.sim.state[0, :3].cpu().numpy().round(2))
 

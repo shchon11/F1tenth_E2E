@@ -25,8 +25,8 @@ from ..params import Config
 from . import common
 from . import grip_runtime
 from .evaluation_metrics import TrialAccumulator
+from .memory import policy_fn as memory_policy_fn
 from .model import load_checkpoint
-from .obs import flatten_obs
 
 
 def budget_steps(tracks, speed_cap: float, step_dt: float, budget_laps: float, max_steps: int) -> int:
@@ -118,8 +118,10 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         def policy(obs):
             return env.teacher_label(teacher_policy)
     else:
-        def policy(obs):
-            return model.act(*flatten_obs(obs), deterministic=True)[0]
+        # Carries the hidden state and any extra scan channel between steps, and exposes `.reset`
+        # so both protocols below can clear them at an episode boundary. For a feedforward
+        # checkpoint it is `model.act` with nothing else happening.
+        policy = memory_policy_fn(model, env.B, device=device, deterministic=True)
     from .benchmark.overtake import TrafficMeter
     meter = TrafficMeter(env, contention_range_m=contention_range_m,
                          attack_range_m=attack_range_m, vehicle_length=(cfg or Config()).vehicle.length)
@@ -136,6 +138,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     else:
         obs, _ = env.reset(seed=seed)
         ctrl.begin(obs)
+        if hasattr(policy, "reset"):
+            policy.reset()                      # the trial starts with no memory of anything
         learner = env.learner.clone()
         initial_ids = env.sim.tid[learner].cpu().numpy().copy()
         lengths = env.sim.track.length[env.sim.tid[learner]].cpu().numpy().astype(np.float64)
@@ -148,6 +152,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                 ctrl.pre_action(obs)
                 obs, _, term, trunc, info = env.step(policy(obs))
                 ctrl.post_step(term, trunc)
+                if hasattr(policy, "reset"):
+                    policy.reset(term | trunc)
                 meter.observe(info)
                 # Privileged transition velocity is captured before any simulator autoreset.
                 speed = torch.linalg.vector_norm(info['priv'][learner, :2], dim=1)

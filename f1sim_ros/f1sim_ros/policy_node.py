@@ -11,7 +11,9 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
+from std_msgs.msg import Empty as EmptyMsg
 
+from f1sim.learn.memory import describe as describe_memory, runtime_for
 from f1sim.learn.model import load_checkpoint
 
 
@@ -148,6 +150,13 @@ class PolicyNode(Node):
         self.model, extra = load_checkpoint(p("checkpoint"), self.device); self.model.eval()
         self.spec = ObsSpec(**extra["spec"]) if extra.get("spec") else ObsSpec()
         self.obs = ObsBuilder(self.spec, self.device)
+        #: The policy's episode state: the recurrent hidden state and the decayed scan-occupancy
+        #: channel, for this one car. Empty (and `stateful` False) for a feedforward checkpoint, so
+        #: nothing below changes for one. It is cleared in exactly two places, both of which mean
+        #: "the run you remember is over": `_resume`, when the scan stream comes back after a gap,
+        #: and `on_reset`, when something resets the car. Carrying it across either would drive a
+        #: car that has been picked up and put down with the memory of where it used to be.
+        self.policy_state = runtime_for(self.model, batch=1, device=self.device)
         self.speed_cap = float(p("speed_cap")); self.steer_max = float(p("steer_max"))
         self.v = 0.0; self.imu_buf = []; self.att = (0.0, 0.0); self.yaw_rate = 0.0
         # Freshness. Every input the actor reads carries the time it was last valid, and inference
@@ -223,6 +232,13 @@ class PolicyNode(Node):
         if VescImuStamped is not None:
             self.create_subscription(VescImuStamped, "sensors/imu", self.on_vesc_imu, 1)
         self.create_subscription(LaserScan, "scan", self.on_scan, 1)
+        # `/f1sim/reset` as a std_msgs/Empty TOPIC, announced by the simulator nodes after they
+        # reset (`bridge_node`, `vesc_sim_node`). It is deliberately not the std_srvs/Empty SERVICE
+        # of the same name: topic and service names are separate in the ROS graph, and offering a
+        # second server for that service would make which node answers a reset ambiguous. On the
+        # real car nothing publishes it and the node behaves exactly as it did.
+        self.declare_parameter("reset_topic", "/f1sim/reset")
+        self.create_subscription(EmptyMsg, str(p("reset_topic")), self.on_reset, 1)
         # The scan callback cannot notice its own absence; this can.
         self.create_timer(max(0.02, self.timeout / 4.0), self.on_watchdog)
         self.pub = self.create_publisher(AckermannDriveStamped, p("drive_topic"), 1)
@@ -230,11 +246,17 @@ class PolicyNode(Node):
         # warm up
         s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
         with torch.no_grad():
-            a0, _ = self.model.act(s, pr, deterministic=True)
+            a0, _, _ = self.model.act(self.policy_state.observe(s), pr, deterministic=True,
+                                      h=self.policy_state.hidden)
         if self.tracker is not None:                                 # warm up the tracker's compiled solver too
             self.tracker(a0, torch.zeros(1, device=self.device), torch.tensor([self.speed_cap], device=self.device), None, delay=self.delay)
             self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
         self.obs.reset()
+        self.policy_state.reset()                # the warm-up is not part of any episode
+        if self.policy_state.stateful:
+            self.get_logger().info(f"policy memory: {describe_memory(self.model.meta)}; hidden state "
+                                   f"carried across scan callbacks, cleared on "
+                                   f"{p('reset_topic')} and when the scan stream restarts")
         self.get_logger().info(f"policy {p('checkpoint')} on {self.device}, speed cap {self.speed_cap} m/s, "
                                f"controller {self.controller_arm}"
                                + (f" (mu {float(self.grip.mu[0]):.3f})" if self.grip is not None else "")
@@ -418,13 +440,26 @@ class PolicyNode(Node):
         stitching the new one onto them feeds the policy an action history that never happened."""
         self._inhibited = False
         self.obs.reset()
+        # Same argument as the observation history, one step further in: a recurrent policy's
+        # hidden state and the decayed scan-occupancy channel both describe a segment that is over.
+        self.policy_state.reset()
         if self.traction is not None:
             # Same argument as the observation history: the wheel-speed derivative, the body-speed
             # estimate and any latched release describe a segment that is over.
             self.traction.reset()
         if self.tracker is not None:
             self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
-        self.get_logger().info("sensors recovered: observation and tracker history cleared")
+        self.get_logger().info("sensors recovered: observation, policy memory and tracker history cleared")
+
+    def on_reset(self, _msg: EmptyMsg):
+        """The car was reset. Everything that describes the run it was in is now wrong."""
+        self.obs.reset()
+        self.policy_state.reset()
+        if self.traction is not None:
+            self.traction.reset()
+        if self.tracker is not None:
+            self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
+        self.get_logger().info("reset: observation, policy memory and tracker history cleared")
 
     def on_scan(self, m: LaserScan):
         t0 = time.perf_counter()
@@ -458,7 +493,11 @@ class PolicyNode(Node):
         imu_mean = self.imu_mean
         scan, pro = self.obs.build(r, self.v, imu_mean, self.att, self.speed_cap)
         with torch.no_grad():
-            a, _ = self.model.act(scan, pro, deterministic=True)
+            # The hidden state goes in and the next one comes out: the policy's memory of this run
+            # lives here, between callbacks, and nowhere else.
+            a, _, self.policy_state.hidden = self.model.act(
+                self.policy_state.observe(scan), pro, deterministic=True,
+                h=self.policy_state.hidden)
         self.obs.push_action(a[0])
         msg = AckermannDriveStamped(); msg.header.stamp = m.header.stamp
         if self.tracker is not None:                                 # local plan -> tracker -> command

@@ -1,0 +1,38 @@
+{
+ "config": {
+  "n_stack": 4,
+  "n_beams": 256,
+  "proprio_dim": 32,
+  "priv_dim": 21,
+  "act_dim": 8,
+  "scan_deltas": true,
+  "temporal_encoder": "cnn",
+  "scan_stem": "resnet"
+ },
+ "batch": 24,
+ "seed": 20260913,
+ "hyper": {
+  "clip": 0.2,
+  "vf": 0.5,
+  "ent": 0.01,
+  "kl_coef": 0.3,
+  "aux_grip": 0.5,
+  "aux_opp": 0.25,
+  "priv_mu_index": 16,
+  "aux_opp_range_m": 6.0,
+  "m_gt_1": true
+ },
+ "torch": "2.10.0+cu130",
+ "values": {
+  "pg": 0.06678909063339233,
+  "vf": 0.38874706625938416,
+  "ent": 5.751507759094238,
+  "kl_ref": 0.020683646202087402,
+  "aux_grip": 1.4348061084747314,
+  "aux_opp": 0.12106561660766602,
+  "loss": 0.9575220942497253,
+  "approx_kl": 0.014986355789005756,
+  "clipfrac": 0.3333333432674408
+ },
+ "grad_norm": 1.3437596559524536
+}

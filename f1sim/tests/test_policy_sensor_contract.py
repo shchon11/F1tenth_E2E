@@ -40,6 +40,7 @@ torch = pytest.importorskip("torch")
 from builtin_interfaces.msg import Time                   # noqa: E402
 
 import f1sim_ros.policy_node as pn                       # noqa: E402
+from f1sim.learn.memory import PolicyRuntime                   # noqa: E402
 from f1sim.learn.obs import ObsBuilder, ObsSpec          # noqa: E402
 
 
@@ -86,9 +87,11 @@ class RecordingModel:
         self.calls = []
         self.act_dim = act_dim
 
-    def act(self, scan, pro, deterministic=True):
+    def act(self, scan, pro, deterministic=True, c=None, h=None):
+        # Same shape as `ActorCritic.act`: action, log probability, next hidden state. A stub
+        # without memory returns None for the state, which is what a legacy checkpoint does.
         self.calls.append((scan.clone(), pro.clone()))
-        return torch.zeros(1, self.act_dim), None
+        return torch.zeros(1, self.act_dim), None, None
 
 
 class Logger:
@@ -117,6 +120,7 @@ def make_node(spec=None, enabled=True, timeout=0.25, traction=None):
     n.spec = spec
     n.obs = ObsBuilder(spec, "cpu")
     n.model = RecordingModel(spec.act_dim)
+    n.policy_state = PolicyRuntime()        # inert: this stub actor has no memory to carry
     n.pub = RecordingPub()
     n.speed_cap = 4.0
     n.steer_max = 0.4189

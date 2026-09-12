@@ -311,7 +311,7 @@ def test_stored_condition_reproduces_the_sampled_logprob_across_a_reset():
     c_t = C.make_condition("true_mu", spec, priv_t, 8)             # frozen BEFORE the step
 
     torch.manual_seed(7)
-    act, logp_stored = sample_rollout_action(model, scan, pro, c_t)
+    act, logp_stored, _h = sample_rollout_action(model, scan, pro, c_t)
 
     # an episode ends and `mu` is re-drawn; the env's privileged vector now says something else
     priv_after_reset = torch.zeros(b, 17)

@@ -94,12 +94,12 @@ def main():
     state["obs"] = env.reset(seed=5)[0]
     for _ in range(150):
         scan, pro = flatten_obs(state["obs"])
-        with torch.no_grad(): act, _ = mf.act(scan, pro, deterministic=True)
+        with torch.no_grad(): act, _, _ = mf.act(scan, pro, deterministic=True)
         state["obs"] = env.step(act)[0]
     focus = int(torch.argmax(env.ep_progress).item()); hold = {}
     def act_chase():
         scan, pro = flatten_obs(state["obs"])
-        with torch.no_grad(): act, _ = mf.act(scan, pro, deterministic=True)
+        with torch.no_grad(): act, _, _ = mf.act(scan, pro, deterministic=True)
         sal, mu = intro.saliency(scan, pro, focus); hold["cols"] = sal_colors(sal)
         hold["panel"] = bev_image(scan[focus].float().cpu().numpy(), float(env.range_max), sal=sal)
         state["obs"] = env.step(act)[0]
@@ -121,7 +121,7 @@ def main():
     state["obs"] = env.reset(seed=3)[0]
     def act_swarm():
         scan, pro = flatten_obs(state["obs"])
-        with torch.no_grad(): act, _ = m4.act(scan, pro, deterministic=False)
+        with torch.no_grad(): act, _, _ = m4.act(scan, pro, deterministic=False)
         state["obs"] = env.step(act)[0]
     def cam_top(fr):
         xs, ys = fr["x"], fr["y"]; cx, cy = float(np.median(xs)), float(np.median(ys))
@@ -135,7 +135,7 @@ def main():
     state["obs"] = env.reset(seed=11)[0]; env.learner[:] = False; env.learner[2] = True
     def act_race():
         scan, pro = flatten_obs(state["obs"])
-        with torch.no_grad(): act, _ = mf.act(scan, pro, deterministic=True)
+        with torch.no_grad(): act, _, _ = mf.act(scan, pro, deterministic=True)
         state["obs"] = env.step(act)[0]
     cut(sink, env, act_race, 6.0, lambda fr: chase(fr, back=2.4, up=1.0, ahead=2.5), "race: ppo_v3 (car 2) vs two teacher cars at 0.5x  | yellow points: other cars", focus=2, cars=3)
 
@@ -145,12 +145,12 @@ def main():
     state["obs"] = env.reset(seed=5)[0]
     for _ in range(150):
         scan, pro = flatten_obs(state["obs"])
-        with torch.no_grad(): act, _ = mf.act(scan, pro, deterministic=True)
+        with torch.no_grad(): act, _, _ = mf.act(scan, pro, deterministic=True)
         state["obs"] = env.step(act)[0]
     focus = int(torch.argmax(env.ep_progress).item()); t_ = {"t": 0.0}
     def act_orbit():
         scan, pro = flatten_obs(state["obs"])
-        with torch.no_grad(): act, _ = mf.act(scan, pro, deterministic=True)
+        with torch.no_grad(): act, _, _ = mf.act(scan, pro, deterministic=True)
         state["obs"] = env.step(act)[0]; t_["t"] += 1.0 / FPS
     def cam_orbit(fr):
         f = fr["focus"]; x, y = fr["x"][f], fr["y"][f]; az = fr["yaw"][f] + math.pi + 0.8 * math.sin(0.5 * t_["t"])

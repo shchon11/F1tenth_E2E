@@ -115,7 +115,8 @@ distinct tracks held on the GPU, and `--scan-stack`. Measure before committing t
 
 Relevant flags: `--envs`, `--horizon`, `--epochs`, `--minibatch`, `--total`, `--amp`, `--cap0` /
 `--cap1` / `--cap-steps` (speed-cap curriculum), `--kl-coef` / `--kl-decay`, `--critic-warmup`,
-`--fresh-opt`, `--tracks`, `--obstacle-draws`, `--sim-backend`.
+`--fresh-opt`, `--tracks`, `--obstacle-draws`, `--sim-backend`, `--memory` /
+`--memory-hidden` / `--memory-critic`, `--scan-channels` / `--scan-memory-tau`.
 
 `--tracks` takes a split name or a list of scenarios ([Tracks](tracks.md)):
 
@@ -139,6 +140,105 @@ only and depends on the machine and the configuration.
 Multi-car fine-tuning: `--race-size M` with `--opponent teacher` puts the learner in a field of
 teacher-driven cars (only car 0's transitions train), and `--opponent policy` makes every car the
 learner for self-play.
+
+### Policy memory (`--memory gru`)
+
+Off by default. An unflagged run is byte-for-byte the run it was: the same network, the same
+rollout, the same minibatching, the same loss (`tests/test_ppo_memory.py` holds it to a loss oracle
+frozen from the code before this existed).
+
+**Why.** The actor's observation is six LiDAR frames — 150 ms at 40 Hz — and a 20-row proprio
+history. A box that has left the 270° scan window is gone from the observation entirely. Three
+finetunes with more obstacles, a looser leash, a higher learning rate and a plan-clearance penalty
+all scored the same on the held-out proxies, and 11 of 16 crashes on the user's held-out scene were
+on one row of boxes. What was left to change is the observation and the architecture.
+
+**What it is.** A GRU over the actor's per-step trunk embedding (the scan stem's 256 features
+concatenated with the proprio embedding), whose output enters the first MLP layer's *preactivation*
+through a bias-free projection initialised to zero — the same construction `--cond` uses. Two
+properties follow and the warm start needs both: at step 0 the actor's output is bit-identical to
+the checkpoint it was warm-started from, so nothing the original could do is lost; and the
+projection's gradient is nonzero from the first update, so the path trains immediately.
+
+GRU rather than LSTM: one state tensor rather than two — which is what the ROS node's callback
+state, the viewer's static capture tensor and every scoring path have to carry — about a quarter
+fewer parameters at the same width, and nothing to gain from the extra gate over a 32-step
+truncated-BPTT horizon (0.8 s at 40 Hz).
+
+The critic gets its **own** GRU by default (`--memory-critic own`; `none` leaves it feedforward).
+It already carries its own stem and reads the privileged vector the actor must never see, so
+sharing the recurrence would be the one place a value gradient reached the actor's trunk — and the
+actor's forward is what the deployment budget measures, so a critic that is never exported costs
+the car nothing.
+
+```bash
+python3 -m f1sim.learn.ppo --name ppo_mem --init "$FROZEN_ORIGINAL" \
+  --memory gru --memory-hidden 128 --scan-channels memory,edges \
+  --action-mode plan --scan-stack 6 --hist-len 20 --envs 256 --horizon 32 --total 4_194_304
+```
+
+**Warm start.** `--init` plus `--memory gru` goes through `model.load_for_memory`, not
+`load_checkpoint`: every tensor the checkpoint holds is copied *by name*, and the only tensors
+allowed to be new are the memory modules (whose output projections are zero) and, when extra scan
+channels are on, the zeroed new input columns of the stem's first convolution. Anything else left
+fresh raises rather than training a half-initialised network. Adam's moments are re-keyed by
+parameter name and the new tensors start fresh, so the optimiser state carries over too.
+
+**How the update works.** The rollout stores each env's hidden state at the start of every horizon
+chunk; the update replays whole env chunks through the network (truncated BPTT over the 32-step
+horizon) and masks the hidden state back to zero at every episode boundary, exactly where the
+rollout reset it. Minibatches are therefore whole env chunks: `--minibatch` stays a sample count,
+and a recurrent minibatch is that count divided by `--horizon` envs. The KL leash's reference stays
+the **feedforward** original — the frozen copy is evaluated with the recurrence switched off, and
+the run refuses to start if that copy's projection is not still exactly zero.
+
+**Where the hidden state goes afterwards.** Every inference path carries it: `rollout_metrics`,
+`evaluate.py`, the benchmark adapter (cleared per trial), the viewer worker's actor runner (a
+static tensor updated in place) and the ROS policy node (across scan callbacks, cleared on
+`/f1sim/reset` and when the scan stream restarts). A recurrent checkpoint refuses the feedforward
+entry points (`Actor.forward`, `.dist`, `.forward_all`) rather than silently running from zeros
+every step, so an unconverted caller is an error and not a quietly worse policy.
+
+### Extra scan channels (`--scan-channels`)
+
+Off by default, and independent of `--memory`. Both are pure arithmetic on the scan the env already
+emits, added on the policy side of the observation boundary, so the env, a checkpoint's recorded
+`extra["spec"]` and every consumer of that spec are untouched. Each enabled channel is one more row
+on the scan's channel axis, appended after every column the original had and zero-initialised, so a
+warm start stays bit-identical.
+
+| channel | what it is | why |
+|---|---|---|
+| `memory` | the closest return seen at each bearing recently, relaxing back toward "no return" with time constant `--scan-memory-tau` (default 2 s) | explicit cheap memory the GRU does not have to learn. Bearings are the car's own and are **not** motion-compensated: a LiDAR-only policy has no pose, so a box that leaves the window leaves a fading trace at the bearing it left by, not a transformed position |
+| `edges` | `abs(r[i] - r[i-1])` per beam | the crack between two boxes in a row is two range discontinuities a few beams apart; the gap the lane actually leaves is one. The stem's first layer is a stride-2 7-tap convolution, so a two-beam crack lands inside one tap — as its own channel it survives at full beam resolution |
+
+Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for both.
+
+### The deployment budget
+
+The car runs the policy at the LiDAR's 40 Hz, so one control step has 25 ms for scan preprocessing,
+the policy forward, the iLQR tracker and publishing. The Jetson is not on the training machine, so
+the rule this work is held to is a **ratio on this machine, measured the same way for both
+networks** — a proxy, and quoted as one:
+
+> CPU, single thread, batch 1, fp32, the fastest of several blocks of 200 iterations after
+> warm-up (`torch.utils.benchmark`; the table records how many). The new actor's forward must
+> stay within **1.5×** the frozen original's and its parameter count within **2×**.
+
+The fastest block, not one block: on a machine that is also training, a single 200-iteration block
+measures the contention rather than the work.
+
+```bash
+python3 -m f1sim.learn.budget                      # the table, against the frozen original
+python3 -m f1sim.learn.budget --hidden 256 --variants baseline,gru   # what the ceiling costs
+```
+
+Measured on this machine: the 128-wide default is 1.07× the frozen actor's forward and 1.20× its
+parameters; the 256 ceiling is 1.14× and 1.48×. Both fit, and 128 is the default because it leaves
+headroom for the Jetson to be slower than this CPU in ways a ratio on one machine cannot see.
+
+`tests/test_memory_model.py::test_jetson_budget_ratio` asserts the rule. The measured table is in
+[the research note](research/memory-policy-2026-09-13.md).
 
 ### Opponent behaviour events
 

@@ -66,7 +66,7 @@ def test_both_stems_run_under_both_temporal_encoders():
             model = ActorCritic(STACK, BEAMS, 322, 17, act_dim=6, scan_deltas=deltas,
                                 temporal_encoder=encoder, scan_stem=stem)
             scan, proprio, priv = torch.rand(3, STACK, BEAMS), torch.rand(3, 322), torch.rand(3, 17)
-            action, logp = model.act(scan, proprio)
+            action, logp, _h = model.act(scan, proprio)
             assert action.shape == (3, 6) and logp.shape == (3,)
             assert model.critic(scan, proprio, priv).shape == (3,)
 

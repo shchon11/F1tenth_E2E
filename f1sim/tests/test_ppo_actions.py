@@ -23,11 +23,14 @@ def test_unchanged_policy_ratio_is_one_when_actions_saturate(amp: bool, device: 
 
     # When PPO samples and reevaluates a rollout without an optimizer update.
     with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=amp):
-        actions, old_logp = sample_rollout_action(model, scan, proprio)
-        new_logp, _, _, _ = model.evaluate(scan, proprio, privileged, actions)
+        actions, old_logp, hidden = sample_rollout_action(model, scan, proprio)
+        new_logp, _, _, _, hidden_again = model.evaluate(scan, proprio, privileged, actions)
     ratio = (new_logp - old_logp).exp()
 
     # Then the probability ratio is one even for samples outside the bounds.
     torch.testing.assert_close(ratio, torch.ones_like(ratio), atol=1e-6, rtol=1e-6)
     assert actions.abs().max() > 1
     assert old_logp.dtype == torch.float32
+    # A feedforward actor reports no hidden state, in both directions, so a caller that
+    # threads one cannot be fooled into thinking this checkpoint has memory.
+    assert hidden is None and hidden_again is None

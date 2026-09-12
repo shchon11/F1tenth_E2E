@@ -45,6 +45,7 @@ stamps and QoS -- so a node written against one runs against the other and again
 | `/scan`, `/odom`, `/ego_racecar/odom`, `/sensors/imu`, `/sensors/imu/raw`, `/map`, `/f1sim/collision`, TF | as the bridge | `/odom` drifts; `/ego_racecar/odom` is ground truth |
 | `/drive` | `AckermannDriveStamped` (in) | steering [rad], speed [m/s]; silent for 0.5 s → speed 0 |
 | `/f1sim/reset` | `std_srvs/Empty` (in) | resets every car, like the console's button |
+| `/f1sim/reset` | `std_msgs/Empty` (out, topic) | announced after a reset, so a policy node clears its observation and memory. A topic of the same name as the service above; the two are separate in the ROS graph |
 | `/f1sim/raceline`, `/f1sim/raceline_speed` | `Path`, `Float32MultiArray` (latched) | the map's racing line and its target speed per pose |
 | `/f1sim/centerline` | `Path` (latched) | |
 | `/f1sim/viz/cars` | `MarkerArray` (20 Hz) | every car as a box: green = ROS car, orange = its rivals, grey = the rest |
@@ -180,6 +181,33 @@ ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:2 \
 its observation with the same [`learn/obs.py`](../f1sim/f1sim/learn/obs.py) used in training. Because
 it consumes only topics the real car also publishes, the node runs unchanged against real hardware —
 though nothing in this repository has been tested on a physical vehicle.
+
+### Policy memory on the car
+
+A checkpoint trained with `--memory gru` (see
+[training.md](training.md#policy-memory---memory-gru)) carries a recurrent hidden state between
+control steps, and one trained with `--scan-channels memory` carries a decayed per-bearing
+occupancy map. The node keeps both — one car, one row — in `self.policy_state`, threads the hidden
+state through every `/scan` callback, and **clears both in exactly two places**:
+
+* `_resume()`, when the scan stream comes back after a gap. The observation history is cleared
+  there for the same reason: it describes a segment that is over, and stitching the new one onto it
+  feeds the policy a history that never happened.
+* `on_reset()`, a `std_msgs/Empty` message on the `/f1sim/reset` **topic** (parameter
+  `reset_topic`). This is deliberately *not* a second server for the `std_srvs/Empty` service of
+  the same name: topic and service names are separate in the ROS graph, and offering a second
+  server would make which node answers a reset ambiguous. The simulator nodes (`bridge_node`,
+  `vesc_sim_node`) publish on that topic straight after they reset a car, so a policy driving the
+  simulator hears its own reset. On the real car nothing publishes it and the node behaves exactly
+  as it did before.
+
+Known gap: the console's own ROS link (`f1sim/viewer/ros_link.py`) offers the `/f1sim/reset`
+service but does not announce on the topic, so a policy node driving a *console* session is cleared
+by a scan gap and not by the console's reset button.
+
+A legacy (feedforward) checkpoint reaches none of this: `policy_state` is inert, holds nothing and
+the published command is what it always was. The startup log names the memory when there is one.
+Unit tests: `f1sim/tests/test_policy_node_memory.py`.
 
 ## Plan controller on the car
 

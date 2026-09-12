@@ -218,12 +218,43 @@ def load_tracks(names, racelines: bool = False, drop_infeasible: bool = True, ha
     return tracks, rls
 
 
+def announce_episode_boundaries(env):
+    """Wrap `env.step` / `env.reset` so a registered recurrent policy is cleared where episodes end.
+
+    Only for callers that cannot thread the hidden state through by hand. Training, evaluation and
+    the benchmark all do thread it and register nothing, so the listener list is empty and this
+    costs one `if` per step. The one caller that cannot is the viewer worker
+    (`f1sim/viewer/sim_worker.py`), which builds its env here and its actor callable in
+    `learn.watch.actor_runner` -- two places that never meet, in a file this branch does not own.
+    So the env side announces and the policy side listens; see `learn.memory`.
+    """
+    from . import memory as memory_mod
+    step, reset = env.step, env.reset
+
+    def step_announcing(action):
+        out = step(action)
+        if memory_mod._LISTENERS:
+            _obs, _rew, term, trunc, _info = out
+            memory_mod.broadcast_boundary(term | trunc, batch=int(env.B))
+        return out
+
+    def reset_announcing(*a, **kw):
+        out = reset(*a, **kw)
+        if memory_mod._LISTENERS:
+            memory_mod.broadcast_boundary(None, batch=int(env.B))
+        return out
+
+    env.step, env.reset = step_announcing, reset_announcing
+    return env
+
+
 def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg: Optional[Config] = None, seed: int = 0,
              rls=None, teacher_grip: str = "true", teacher_recover_time: float = 0.0):
     """rls: racelines (one per track) -- required when env_cfg.opponent == "teacher" (opponents follow them)."""
     cfg = cfg or Config()
     cfg.sim.seed = seed
     env = F1VecEnv(tracks, cfg, env_cfg or EnvConfig(), num_envs=num_envs, device=device)
+    announce_episode_boundaries(env)
     if rls is not None and getattr(env.ecfg, "reward_lap_time", 0.0) > 0:
         env.set_ideal_lap(rls)                       # reference for the seconds-saved reward
     if env.M > 1 and env.ecfg.opponent in ("teacher", "mixed"):
@@ -298,12 +329,22 @@ def rollout_metrics(env: F1VecEnv, policy_fn, steps: int, speed_cap: Optional[fl
     it -- `begin` once after the reset, `pre_action` before the policy is asked for anything,
     `post_step` immediately after the step. Getting that order wrong is how an arm becomes a legacy
     run wearing another arm's name, so there is one loop that knows it rather than two.
+    `policy_fn` may be stateful: if it has a `reset(done=None)` (as `learn.memory.policy_fn` does),
+    it is cleared at the seeded reset and at every episode boundary. A recurrent policy scored
+    without that carries the last episode's memory into the next one and is not the policy that
+    would drive the car.
     """
     if speed_cap is not None:
         env.set_speed_cap(speed_cap)
+    # A recurrent policy carries state between calls, so it has to be told where the episodes end.
+    # `learn.memory.policy_fn` provides `.reset`; a plain callable has none and nothing happens,
+    # which is what every caller that predates memory does.
+    policy_reset = getattr(policy_fn, "reset", None)
     obs, info = env.reset()
     if controller is not None:
         controller.begin(obs)
+    if callable(policy_reset):
+        policy_reset()
     lm = env.learner; nL = int(lm.sum())                     # races with teacher opponents: learners only
     n_coll = 0; n_ended = 0; prog = 0.0; lap_times = []; speeds = []
     T = env.sim.track.T
@@ -317,6 +358,8 @@ def rollout_metrics(env: F1VecEnv, policy_fn, steps: int, speed_cap: Optional[fl
         obs, rew, term, trunc, info = env.step(a)
         if controller is not None:
             controller.post_step(term, trunc)
+        if callable(policy_reset):
+            policy_reset(term | trunc)
         prog += info["progress"][lm].sum().item()
         speeds.append(env.sim.state[lm, 3].mean().item())
         lap_times += info["lap_times"][lm[info["lap_ids"]]].tolist()

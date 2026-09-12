@@ -485,6 +485,11 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
     before every policy call and `post_step(term, trunc)` after every env step. Skipping
     `pre_action` would leave the estimator's history un-fed, so the arm would run on a stale
     friction belief while still being reported under its name.
+
+    A stateful policy (one with `reset(done=None)`, as `model_adapter.policy_for` returns for a
+    recurrent checkpoint) gets the same treatment: cleared at the seeded reset, and per row at
+    every episode boundary. A trial is scored from its own start, so it is driven from a policy
+    that remembers nothing before it.
     """
     import torch
 
@@ -519,6 +524,9 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
         acc = None
 
     obs = _reset_obs(env, seed)                     # the single FINAL seeded reset
+    policy_reset = getattr(policy, "reset", None)
+    if callable(policy_reset):
+        policy_reset()                              # per trial: no memory of anything before it
     # Captured HERE: after the seeded reset, before `begin` and before any action. `begin` pushes a
     # history row, so a fingerprint taken after it records part of the run rather than its start.
     from .fingerprint import start_fingerprint
@@ -548,6 +556,8 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
             obs, reward, term, trunc, info = _step(env, action)
             if controller is not None:
                 controller.post_step(term, trunc)
+            if callable(policy_reset):
+                policy_reset(term | trunc)
             pend = trace.pending
             fresh = trace.fresh()
             rec.check_mu(pend["mu"].tolist(), fresh)   # every car

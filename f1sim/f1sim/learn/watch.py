@@ -47,17 +47,46 @@ from .obs import flatten_obs
 
 
 class Introspector:
-    """Forward hooks on the actor: hidden activations + saliency of the mean action w.r.t. the scan."""
+    """Forward hooks on the actor: hidden activations + saliency of the mean action w.r.t. the scan.
+
+    For a recurrent checkpoint this keeps a SHADOW memory of its own -- one row, the focused car --
+    advanced by each saliency call and cleared when the focus moves or the env resets. It is a
+    diagnostic, not the driving state: the panel is drawn once per frame from the focused car's
+    current observation, which is the same sequence the driving policy sees, so the shadow tracks
+    it, but nothing downstream depends on the two being identical.
+    """
 
     def __init__(self, model):
         self.model = model; self.h = {}
         model.actor.mlp.register_forward_hook(lambda m, i, o: self.h.__setitem__("hidden", o.detach()))
         model.actor.stem.fc.register_forward_hook(lambda m, i, o: self.h.__setitem__("stem", o.detach()))
+        from .memory import add_boundary_listener, runtime_for
+        self._rt = runtime_for(model)
+        self._focus = None
+        #: `None`, so every announcement reaches it whatever the env's width is. The shadow holds
+        #: one row whose identity is the focused car, not an env row, so a row-wise mask means
+        #: nothing to it and `reset` forgets outright.
+        self.batch = None
+        self._unlisten = add_boundary_listener(self) if self._rt.stateful else None
+
+    def reset(self, done=None):
+        """Episode boundary, from `common.announce_episode_boundaries`. Row-wise `done` is ignored
+        on purpose: the shadow holds one row whose identity (the focused car) is not the env's, so
+        the only honest response to any boundary in the session is to forget."""
+        self._rt.reset()
 
     def saliency(self, scan, pro, i):
+        if i != self._focus:
+            self._rt.reset()                       # a different car's memory is not this one's
+            self._focus = i
         s = scan[i:i + 1].clone().requires_grad_(True); p = pro[i:i + 1]
-        mu = self.model.actor(s, p)
+        s_in = self._rt.observe(s)
+        h_in = self._rt.hidden.actor if self._rt.hidden is not None else None
+        mu, h = self.model.actor.step(s_in, p, None, h_in)
         g = torch.autograd.grad(mu.abs().sum(), s)[0][0]              # (k, N)
+        if self._rt.hidden is not None:
+            from .memory import Hidden
+            self._rt.hidden = Hidden(None if h is None else h.detach(), None)
         sal = g.abs().sum(0)                                          # per beam
         return (sal / (sal.max() + 1e-9)).cpu().numpy(), mu[0].detach().cpu().numpy()
 
@@ -334,13 +363,16 @@ class EpisodeRecorder:
 
 
 def run_episode(env, model, steps, stochastic, rec=None):
+    from .memory import policy_fn
     obs, info = env.reset()
     rec = rec or EpisodeRecorder(env)
+    policy = policy_fn(model, env.B, device=env.device, deterministic=not stochastic)
+    policy.reset()
     with torch.no_grad():
         for t in range(steps):
-            scan, pro = flatten_obs(obs)
-            act, _ = model.act(scan, pro, deterministic=not stochastic)
+            act = policy(obs)
             obs, rew, term, trunc, info = env.step(act)
+            policy.reset(term | trunc)
             rec.add(env.last_result, obs, info, t)
     return rec.finalize()
 
@@ -417,6 +449,18 @@ def describe_checkpoint_line(extra: dict, path: str) -> str:
         it, n = extra.get("iter"), extra.get("iters")
         core = (f"DAgger {run}" + (f"  iteration {it + 1}" + (f" of {n}" if n else "") if it is not None else "")
                 + (f"  {extra['samples'] / 1e6:.1f}M samples" if "samples" in extra else ""))
+    # A recurrent checkpoint drives differently from a feedforward one and is loaded the same way,
+    # so the one line that describes a checkpoint says which it is. From `extra["experiment"]`,
+    # which the trainer records, because this function is not given `meta`.
+    exp = extra.get("experiment") or {}
+    mem, chans = exp.get("memory") or {}, (exp.get("scan_channels") or {}).get("channels") or ()
+    if mem or chans:
+        bits = []
+        if mem:
+            bits.append(f"{mem.get('kind', '?')} h={mem.get('hidden_size')}")
+        if chans:
+            bits.append("scan " + ",".join(chans))
+        core += "   |  memory: " + " + ".join(bits)
     if m:
         core += (f"   |  at save: collision {m.get('collision_rate', float('nan')):.2f}"
                  + (f", {m['progress_rate_mps']:.1f} m/s" if "progress_rate_mps" in m else "")
@@ -562,11 +606,102 @@ def viewer_config(compile_enabled: bool, randomize: bool = True) -> Config:
     return config
 
 
-def actor_runner(model, device: torch.device, compile_enabled: bool):
+class MemoryActorRunner:
+    """`(scan, proprio) -> mu` for a recurrent / scan-augmented checkpoint, in the viewer worker.
+
+    What makes it worth a class rather than a closure:
+
+    * **The hidden state is a static tensor, updated in place.** `torch.compile(mode=
+      "reduce-overhead")` reaches CUDA graph trees, and a tensor a replay produced is overwritten
+      by the next replay. So the state this runner keeps is its own buffer: the compiled region is
+      handed that buffer and its result is copied back into it, outside the region. Allocating a
+      fresh hidden state per step instead would either be silently clobbered or force a recapture
+      every frame.
+    * **It is a boundary listener.** The worker builds its env and its actor callable in two places
+      that never meet, in files this branch does not own, so the env announces episode boundaries
+      (`common.announce_episode_boundaries`) and this clears the rows that ended. Without it the
+      policy would drive a fresh spawn with the memory of the lap it just crashed out of.
+    * **It falls back to eager and says so.** If capture cannot be made to work for this model, the
+      session keeps running and `fell_back_to_eager` is True -- which the worker already reports as
+      `actor_fell_back`, so "compiled" never gets quoted for a run that is not.
+    """
+
+    def __init__(self, model, actor, device, compile_enabled: bool, graph_step=None):
+        from .memory import add_boundary_listener, runtime_for
+        self.actor, self.device = actor, device
+        self.rt = runtime_for(model)
+        self.batch = None
+        self.h = None                      # the static hidden state; allocated on the first call
+        self.compiled = bool(compile_enabled)
+        self.fell_back_to_eager = False
+        #: "graphed" | "compiled" | "eager", and it is reported rather than assumed. `graph_step` is
+        #: a CUDA graph captured by the caller during a session build
+        #: (`learn.graph_runtime.prepare_actor_graph`); it is never captured here, because a failed
+        #: capture is fatal to the process and the step loop is not a place that can handle that.
+        self.mode = "graphed" if graph_step is not None else ("compiled" if compile_enabled else "eager")
+        self._graph = graph_step
+        self._call = (graph_step if graph_step is not None else
+                      (torch.compile(self._step, dynamic=False, mode="reduce-overhead")
+                       if compile_enabled else self._step))
+        self._unlisten = add_boundary_listener(self)
+
+    def _step(self, scan, proprio, h):
+        return self.actor.step(scan, proprio, None, h)
+
+    def reset(self, done=None):
+        self.rt.reset(done)
+        if self.h is None:
+            return
+        if done is None:
+            self.h.zero_(); return
+        d = done if torch.is_tensor(done) else torch.as_tensor(done, device=self.h.device)
+        keep = (~d).to(self.h.dtype) if d.dtype == torch.bool else (1.0 - d.to(self.h.dtype)).clamp(0, 1)
+        if keep.shape[0] == self.h.shape[1]:
+            self.h.mul_(keep[None, :, None])
+        else:                              # a different env's announcement; not ours to act on
+            pass
+
+    def __call__(self, scan, proprio):
+        # The width first, and whether or not there is a hidden state: a scan-channel-only
+        # checkpoint still holds per-row state, and a listener with no width declared would be sent
+        # every env's boundary mask, including ones of the wrong shape.
+        self.batch = int(scan.shape[0])
+        scan = self.rt.observe(scan)
+        if self.h is None and self.actor.has_memory:
+            self.h = self.actor.initial_hidden(scan.shape[0], device=scan.device, dtype=scan.dtype)
+        try:
+            mu, h = self._call(scan, proprio, self.h)
+        except RuntimeError:
+            # Falling back keeps the session alive, which is right -- but silently, a session that
+            # reports `compile: true` would go on running eager and its timings would be quoted as
+            # compiled ones. The behaviour is unchanged; only the fact is now recorded.
+            self._call = self._step
+            self.fell_back_to_eager = True
+            self.mode = "eager"
+            mu, h = self._step(scan, proprio, self.h)
+        if self.h is not None:
+            self.h.copy_(h.detach())       # out of the graph's buffers and into ours, in place
+        return mu
+
+
+def actor_runner(model, device: torch.device, compile_enabled: bool, graph_step=None):
+    """The viewer worker's actor callable: `(scan, proprio) -> mu`.
+
+    A feedforward checkpoint gets exactly what it always got. A recurrent (or scan-augmented) one
+    gets a `MemoryActorRunner`, which keeps the hidden state and the decayed occupancy channel
+    between calls and clears them at episode boundaries. `graph_step` is an optional CUDA graph of
+    one actor step, captured by the caller during a session build; without one the runner compiles
+    (when the session compiles) or runs eager, and says which in `mode` / `fell_back_to_eager`.
+    """
     import copy as _copy
     actor = _copy.deepcopy(model.actor).eval()
     for module in actor.modules():
         module._forward_hooks.clear(); module._forward_pre_hooks.clear()
+    meta = getattr(model, "meta", {}) or {}
+    if meta.get("memory") or (meta.get("scan_channels") or {}).get("channels"):
+        return MemoryActorRunner(model, actor, device,
+                                 compile_enabled and device.type == "cuda",
+                                 graph_step=graph_step)
     if not compile_enabled or device.type != "cuda":
         return actor.forward
     compiled = torch.compile(actor.forward, dynamic=False, mode="reduce-overhead")
