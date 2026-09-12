@@ -135,7 +135,9 @@ def table(real, sim, edges, kind, factor, markdown):
     rb, rs, rn = buckets(real, edges, kind)
     sb, ss, sn = buckets(sim, edges, kind)
     lines = []
-    head = (f"| peak |a_wheel| ({kind}) | real runs | real /100 s | sim runs | sim /100 s | "
+    # The pipes inside |a_wheel| have to be escaped, or markdown reads them as cell separators and
+    # the header comes out two columns wider than the table under it.
+    head = (f"| peak \\|a_wheel\\| ({kind}) | real runs | real /100 s | sim runs | sim /100 s | "
             f"ratio | within {factor:g}x |")
     if markdown:
         lines += [head, "| --- | --- | --- | --- | --- | --- | --- |"]
