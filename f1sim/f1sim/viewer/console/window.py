@@ -363,6 +363,14 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.edit_estimator.setText(SessionConfig.default_estimator())
         adv.add(FieldRow("노면 추정기", self.edit_estimator,
                          "비워 두면 $F1SIM_GRIP_ESTIMATOR 또는 ~/f1sim_runs/_estimators/estimator_seed401.pt 를 씁니다."))
+        self.combo_ros = QtWidgets.QComboBox()
+        self.combo_ros.addItem("끄기", "off")
+        self.combo_ros.addItem("센서 토픽 발행 (정책이 주행)", "publish")
+        self.combo_ros.addItem("센서 발행 + /drive 로 외부 제어", "drive")
+        adv.add(FieldRow("ROS2 연동", self.combo_ros,
+                         "차량 0 의 /scan /odom /sensors/imu 와 장면 전체(/f1sim/viz/*)를 ROS2 토픽으로 냅니다. "
+                         "'외부 제어'는 차량 0 을 /drive 구독으로 움직입니다 (예: ros2 launch f1sim_ros "
+                         "pure_pursuit.launch.py). ROS 워크스페이스를 소싱한 셸에서 콘솔을 열어야 합니다."))
         v.addWidget(adv)
 
         v.addStretch(1)
@@ -896,7 +904,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
                   self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.combo_opponent,
-                  self.combo_device, self.combo_controller, self.edit_estimator):
+                  self.combo_device, self.combo_controller, self.edit_estimator, self.combo_ros):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
 
         self.progress.setVisible(preparing or state == STATE_STOPPING)
@@ -988,6 +996,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if shown < cars:
             summary += f" (화면 {shown}대)"
         summary += f"  ·  {device}  ·  세션 #{self.generation}"
+        ros = facts.get("ros2")
+        if ros:
+            summary += "  ·  ROS2 " + ("/drive 제어" if ros.get("mode") == "drive" else "발행")
         self.header_summary.setText(summary)
         self.combo_focus.blockSignals(True)
         self.combo_focus.clear()
@@ -1355,6 +1366,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             estimator=self.edit_estimator.text().strip(),
             mu_mode=str(self.combo_mu.currentData() or "random"),
             mu=float(self.spin_mu.value()),
+            ros2=str(self.combo_ros.currentData() or "off"),
             saliency=self.chk_saliency.isChecked(),
             internals=self.chk_internals.isChecked(),
             max_render_cars=MAX_RENDER_CARS,

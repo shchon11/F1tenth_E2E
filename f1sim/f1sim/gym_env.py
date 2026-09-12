@@ -280,6 +280,13 @@ class F1VecEnv:
         self.prev_action = torch.zeros(self.B, self.act_dim, device=self.device)
         self.act_hist = torch.zeros(self.B, self.ecfg.action_history, self.act_dim, device=self.device)
         self.tracker = None; self.prev_steer_norm = torch.zeros(self.B, device=self.device); self.last_cmd = torch.zeros(self.B, 2, device=self.device)
+        # External command override (ROS 2 `/drive`, an outside controller): per-car (steer [rad],
+        # speed [m/s]) that replaces whatever the policy / tracker produced for the cars whose mask
+        # is set. Applied after the action mapping and before the physics, so both action modes,
+        # the opponents, the observation history and `last_cmd` see the command that was driven.
+        self.ext_cmd = torch.zeros(self.B, 2, device=self.device)
+        self.ext_mask = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self._ext_ids: set = set()               # host-side copy of the mask: no device sync per command
         self.row_dim = 1 + 6 + 2 + self.act_dim
         self.hist = torch.zeros(self.B, (e.hist_len - 1) * e.hist_stride + 1, self.row_dim, device=self.device) if e.hist_len > 0 else None
         self._last_feat = torch.zeros(self.B, 9, device=self.device)
@@ -591,6 +598,8 @@ class F1VecEnv:
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)
+        if self._ext_ids:
+            cmd = torch.where(self.ext_mask[:, None], self.ext_cmd, cmd)
         steer_norm = cmd[:, 0] / self.s_max
         r = self.sim.step(cmd)
         self.last_cmd = cmd
@@ -808,6 +817,25 @@ class F1VecEnv:
         pv = self._priv(r)
         params = torch.stack([self.sim.P[k] for k in self.PRIV_PARAMS], 1)
         return torch.cat([pv, params, (self.speed_cap / self.ecfg.v_max_policy)[:, None]], 1)
+
+    def set_external_command(self, idx: int, steer: float, speed: float) -> None:
+        """Drive car `idx` with an outside (steer [rad], speed [m/s]) from the next step on, in place
+        of the policy's action. Steering is clamped to the vehicle's lock; speed is passed through
+        as an external controller commanded it (the bridge does the same), so a speed the actuator
+        model cannot reach is the actuator model's problem, not silently capped here."""
+        s_max = float(self.s_max)
+        steer = max(-s_max, min(s_max, float(steer)))
+        self.ext_cmd[idx] = torch.tensor([steer, float(speed)], device=self.device)
+        if idx not in self._ext_ids:
+            self.ext_mask[idx] = True
+            self._ext_ids.add(int(idx))
+
+    def clear_external_command(self, idx: Optional[int] = None) -> None:
+        """Hand car `idx` (or every car) back to the policy."""
+        if idx is None:
+            self.ext_mask.zero_(); self._ext_ids.clear()
+        else:
+            self.ext_mask[idx] = False; self._ext_ids.discard(int(idx))
 
     def set_speed_cap(self, v: float):
         self.cap_base = float(min(v, self.ecfg.v_max_policy))

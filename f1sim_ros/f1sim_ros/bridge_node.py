@@ -9,7 +9,7 @@ Publishes   /scan             sensor_msgs/LaserScan   (frame: laser)   noisy Hok
             /f1sim/collision  std_msgs/Bool
             /sensors/imu      sensor_msgs/Imu   VESC IMU (vesc_driver topic): orientation = VESC attitude
                               estimate, rates/accels = latest sample; every raw sample also goes to
-                              /sensors/imu/raw with its own stamp (imu.imu_rate, default 100 Hz)
+                              /sensors/imu/raw with its own stamp (imu.imu_rate, default 50 Hz)
 TF          map -> odom (so that map -> base_link is ground truth; disable with publish_gt_tf:=false),
             odom -> base_link (from /odom), base_link -> laser (static)
 Service     /f1sim/reset      std_srvs/Empty
@@ -230,7 +230,8 @@ class BridgeNode(Node):
             # map -> odom such that (map -> odom) * (odom -> base) == ground truth
             dyaw = float(st[2] - od[2])
             c, s = math.cos(dyaw), math.sin(dyaw)
-            mx = float(st[0]) - (c * od[0] - s * od[1]); my = float(st[1]) - (s * od[0] + c * od[1])
+            ox, oy = float(od[0]), float(od[1])
+            mx = float(st[0]) - (c * ox - s * oy); my = float(st[1]) - (s * ox + c * oy)
             mo = TransformStamped(); mo.header.stamp = stamp; mo.header.frame_id = self.map_frame; mo.child_frame_id = self.odom_frame
             mo.transform.translation.x, mo.transform.translation.y = mx, my
             mo.transform.rotation = yaw_to_quat(dyaw)

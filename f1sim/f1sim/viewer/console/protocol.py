@@ -120,6 +120,11 @@ class SessionConfig:
     #: each reset, and can be changed live with CMD_SET_MU.
     mu_mode: str = "random"
     mu: float = 1.0489
+    #: ROS 2 link (`viewer/ros_link.py`). "off": nothing. "publish": car 0's sensors go out as the
+    #: real car's topics and the whole scene as visualisation topics while the policy drives.
+    #: "drive": the same, and car 0 is driven by `/drive` instead of the policy. Needs rclpy on the
+    #: worker's path (open the console from a shell that sourced the ROS workspace).
+    ros2: str = "off"
     episode_s: float = 3600.0
     saliency: bool = False
     internals: bool = False

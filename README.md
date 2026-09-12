@@ -58,7 +58,7 @@ sim.reset(torch.nonzero(r.collision).flatten())      # partial reset re-samples 
 | [Environment editor](docs/environment_editor.md) | the console's 환경 page — paint walls and ducts, place props, import mesh assets, save a `scene:<name>` and drive on it |
 | [Benchmark](docs/benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metrics |
 | [Leaderboard](docs/leaderboard/README.md) | the rendered checkpoint leaderboard — per-cohort tables, exact counts, evidence and method |
-| [ROS 2](docs/ros2.md) | launch files, topic contracts, teleoperation |
+| [ROS 2](docs/ros2.md) | the console on ROS 2 (topics out, `/drive` in, rviz), launch files, topic contracts, teleoperation |
 | [Research notes](docs/research/) | dated experiment reports with protocol, data and scope |
 | [Engineering notes](docs/README.md#engineering-notes) | algorithm assessment, simulator audit, real-data calibration |
 | [로컬 실행 안내](docs/local_pc.md) | 이 워크스테이션의 실행 명령 (Korean) |
@@ -133,8 +133,9 @@ load. See [Environment editor](docs/environment_editor.md).
 
 [![the environment editor](docs/media/f1tenth-environment-editor.png)](docs/media/f1tenth-environment-editor.png)
 
-<sub>The 환경 page on a scene drawn in it: duct-hose loop, a pillar, built-in props and an imported
-tyre-stack mesh (selected, with the gizmo). Software GL; [manifest](docs/media/environment-editor-manifest-2026-09-12.json).</sub>
+<sub>The 환경 page on a scene drawn in it: a lane drawn as one track path with straight and curved
+vertices (selected, with its handles), its two hoses, a duct-path chicane, built-in props and an
+imported tyre-stack mesh. Software GL; [manifest](docs/media/environment-editor-manifest-2026-09-12.json).</sub>
 
 ## Demonstrations
 

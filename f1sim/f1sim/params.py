@@ -58,23 +58,22 @@ class VehicleParams:
     # Rolling resistance + aero drag (decel = c_roll + c_drag * v^2)
     c_roll: float = 0.1        # [m/s^2]
     c_drag: float = 0.01       # [1/m]
-    # Sprung-mass attitude (what tilts the LiDAR plane): 2nd-order response to body accelerations
-    roll_per_g: float = 0.10   # [rad/g] steady-state roll per lateral g (RC truck on oil shocks ~5-6 deg/g)
-                               # NOT measured: the accelerometer route needs an independent a_y, and
-                               # both v*omega and a differentiated particle-filter pose are too noisy
-                               # -- regressing (measured - true) on true then collapses toward the
-                               # errors-in-variables limit and returns -9 deg/g. Left at the guess.
-    pitch_per_g: float = 0.09  # [rad/g] brake dive / squat. Bracketed from the LiDAR, which needs no
-                               # independent acceleration: tilt the scan plane and beams reach the
-                               # floor at z / sin(theta) instead of the wall. Casting the beams
-                               # against the recorded map, the fraction stopping short of the
-                               # predicted wall goes brake > cruise > push in all six recordings
-                               # checked (20.5 / 15.9 / 9.8 % at the top), and so does the no-return
-                               # rate -- a grazing floor hit either reads short or does not come back.
-                               # The range they stop at implies 2.5-5.3 deg at a median -4.4 m/s^2,
-                               # i.e. 5.5-11.8 deg/g against the 5.2 here. A bracket, not a fit: the
-                               # cruise baseline shows map and pose error and cars the map does not
-                               # contain, so the short-beam population is not purely floor strikes.
+    # Sprung-mass attitude (what tilts the LiDAR plane): 2nd-order response to body accelerations,
+    # plus a random tilt the floor and tyres put in. MEASURED 2026-09-13 from the competition bags
+    # by the gyro route (docs/real_data_calibration.md §6.1): integrate the roll / pitch rate,
+    # band-pass 0.3-1.5 Hz, bin against the accelerometer's own lateral / longitudinal force; the
+    # estimator recovers ~0.9x (roll) / ~0.65x (pitch) of a known gain on the simulator, and the
+    # numbers below are corrected by that. Five clean recordings agree within +-20 %.
+    roll_per_g: float = 0.03   # [rad/g] 1.7 deg/g; measured 1.5-2.1. Was 0.10 (a guess): 3x too much roll
+    pitch_per_g: float = 0.03  # [rad/g] SQUAT under throttle (ax > 0), ~1.7 deg/g; measured 1.5-2.5
+    dive_per_g: float = 0.008  # [rad/g] brake DIVE (ax < 0), ~0.5 deg/g: the recordings show almost none
+                               # (0-0.7 deg/g) at the -0.45 g the regen limit allows. The earlier LiDAR
+                               # floor-strike bracket (5.5-11.8 deg/g) was confounded, as it said.
+    road_tilt: float = 0.017   # [rad] rms random roll / pitch driving straight at steady speed (0.8-1.2 /
+                               # 0.6-1.8 deg measured, 0.15-3 Hz): a stationary OU process fed into the
+                               # suspension, so the LiDAR plane wobbles as much as the real one without
+                               # cornering. 0 = flat floor (the model before 2026-09-13).
+    road_tau: float = 0.4      # [s] its correlation time (the roll-rate spectrum is flat above ~0.4 Hz)
     susp_wn: float = 17.6      # [rad/s] suspension natural frequency (~2.8 Hz)
     susp_zeta: float = 0.35    # [-] damping ratio (underdamped: visible overshoot after braking)
 
@@ -294,9 +293,10 @@ class RandomizationConfig:
         "actuator.motor_tau": (0.10, 0.30),
         "actuator.speed_gain": (0.92, 1.08),
         "actuator.cmd_delay": (0.005, 0.03),
-        "vehicle.roll_per_g": (0.7, 1.5),
-        "vehicle.pitch_per_g": (0.7, 1.8),      # 3.6-9.3 deg/g: the LiDAR bracket sits above
-                                                # the nominal, so the range reaches up to it
+        "vehicle.roll_per_g": (0.6, 1.6),       # 1.0-2.75 deg/g around the measured 1.7
+        "vehicle.pitch_per_g": (0.6, 1.4),      # 1.0-2.4 deg/g squat; 2x draws sat 2-4x above the recordings
+        "vehicle.dive_per_g": (0.5, 2.0),       # 0.2-0.9 deg/g dive: measured ~0, kept open upward
+        "vehicle.road_tilt": (0.5, 1.5),        # 0.5-1.5 deg rms floor wobble
         "vehicle.susp_wn": (0.75, 1.3),
         "vehicle.susp_zeta": (0.25, 0.55),
         "lidar.mount_yaw": (-0.015, 0.015),
@@ -315,8 +315,8 @@ class RandomizationConfig:
         "odom.speed_scale_err": (-0.08, 0.08),
         "odom.steer_offset": (-0.01, 0.01),
         "odom.steer_gain_err": (-0.04, 0.04),
-        "imu.imu_roll": (-0.02, 0.02),
-        "imu.imu_pitch": (-0.02, 0.02),
+        "imu.imu_roll": (-0.07, 0.07),         # +-4 deg: the real VESC IMU leaks 3-5 deg worth of yaw
+        "imu.imu_pitch": (-0.07, 0.07),        # rate into its roll axis (measured 2026-09-13)
         "imu.imu_yaw": (-0.02, 0.02),
         "imu.gyro_noise": (0.7, 2.0),
         "imu.accel_noise": (0.7, 2.0),
@@ -338,7 +338,7 @@ class RandomizationConfig:
     })
     scale_fields: Tuple[str, ...] = (
         "vehicle.mu", "vehicle.m", "vehicle.Iz", "vehicle.B_f", "vehicle.B_r",
-        "vehicle.a_max", "vehicle.a_brake", "vehicle.c_roll", "vehicle.roll_per_g", "vehicle.pitch_per_g", "vehicle.susp_wn",
+        "vehicle.a_max", "vehicle.a_brake", "vehicle.c_roll", "vehicle.roll_per_g", "vehicle.pitch_per_g", "vehicle.dive_per_g", "vehicle.road_tilt", "vehicle.susp_wn",
         "actuator.steer_gain", "actuator.speed_gain", "lidar.duct_scale",
         "imu.gyro_noise", "imu.accel_noise", "imu.vib_accel", "imu.vib_gyro",
         "imu.vib_accel_floor", "imu.vib_gyro_floor", "imu.bandwidth", "imu.ahrs_tau",

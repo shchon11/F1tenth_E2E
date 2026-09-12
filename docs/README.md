@@ -12,7 +12,7 @@ Entry point: the [repository README](../README.md).
 | [Environment editor](environment_editor.md) | the console's 환경 page: building and editing scenes in 3D, importing mesh assets, the `scene:` map prefix, validation |
 | [Benchmark](benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metric definitions, adding a checkpoint later |
 | [Leaderboard](leaderboard/README.md) | the rendered leaderboard: six metrics per cohort with exact counts, paired pace, evidence links and limitations. `leaderboard/index.html` is the same report as a self-contained offline page |
-| [ROS 2](ros2.md) | launch files, topic contracts, teleoperation |
+| [ROS 2](ros2.md) | the console on ROS 2 (topics out, `/drive` in, rviz), launch files, topic contracts, teleoperation |
 | [로컬 실행 안내](local_pc.md) | 이 워크스테이션 전용 실행 명령 (Korean) |
 
 ## Research notes

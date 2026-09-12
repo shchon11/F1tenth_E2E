@@ -196,6 +196,16 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
         raise StartConfigError(f"화면 표시 차량 수는 1 이상이어야 합니다 (받은 값 {cfg.max_render_cars}).")
     if str(cfg.device) not in ("auto", "cpu", "cuda") and not str(cfg.device).startswith("cuda:"):
         raise StartConfigError(f"장치 이름을 알 수 없습니다: {cfg.device!r} (auto / cpu / cuda).")
+    ros2 = str(getattr(cfg, "ros2", "off") or "off")
+    if ros2 not in ("off", "publish", "drive"):
+        raise StartConfigError(f"ROS2 연동 모드를 알 수 없습니다: {ros2!r} (off / publish / drive).")
+    if ros2 != "off":
+        from .ros_link import ros2_available
+        why = ros2_available()
+        if why is not None:
+            raise StartConfigError(
+                "ROS2 연동에는 rclpy 와 메시지 패키지가 필요합니다. ROS 워크스페이스를 소싱한 셸"
+                "(예: source activate.sh)에서 콘솔을 열어 주세요. 가져오기 실패: " + why)
 
 
 def resolve_checkpoint(run: str, runs_dir: str, latest: str = "") -> str:
@@ -702,6 +712,14 @@ class SimWorker:
                 f"{os.path.basename(ckpt_path)}: 행동 차원 {act_dim} 은 예전 플랜 표현입니다 "
                 f"(현재는 {PLAN_DIM}). 더 최신 런을 고르세요.")
         mode = "plan" if act_dim == PLAN_DIM else "direct"
+        if mode == "direct" and arm != "legacy":
+            # The grip arms bound the *plan tracker*; a direct-action checkpoint has none. Refusing
+            # the session for a setting that cannot apply (the deployment default is fixed_low)
+            # made every direct checkpoint unopenable; say what happened and run it as it is.
+            self.say(P.MSG_LOG, gen=gen,
+                     text=f"플랜 제어기 '{arm}' 은 직접 행동(direct) 체크포인트에 적용되지 않아 legacy 로 실행합니다")
+            arm = "legacy"
+            estimator_path = ""
         speed_cap = float(cfg.speed_cap or checkpoint_speed_cap(extra, ckpt_path))
         self._check_cancel(gen)
 
@@ -826,6 +844,17 @@ class SimWorker:
             session["controller"] = rt
             session["controller_arm"] = arm
             session["estimator_path"] = estimator_path
+        ros2 = str(getattr(cfg, "ros2", "off") or "off")
+        if ros2 != "off":
+            # After everything that can refuse the session: a node that came up for a session
+            # which then failed would leave topics on the graph with nobody behind them.
+            self.stage(gen, "ros2", ros2)
+            from .ros_link import RosLink
+            link = RosLink(env.sim, track, session["raceline"], mode=ros2, car=0)
+            session["ros"] = link
+            self.say(P.MSG_LOG, gen=gen,
+                     text=f"ROS2 연동 ({ros2}): 노드 {link.node.get_name()}, 차량 0 의 센서를 발행"
+                          + (f", {link.drive_topic} 로 제어" if ros2 == "drive" else ""))
         return session
 
     # ------------------------------------------------------------- graph capture
@@ -1011,6 +1040,7 @@ class SimWorker:
             "v_max_policy": float(env.ecfg.v_max_policy),
             "action_mode": session["mode"],
             "info_line": session["info_line"],
+            "ros2": session["ros"].facts() if session.get("ros") is not None else None,
             "randomize": bool(cfg.randomize),
             "mu_mode": str(getattr(cfg, "mu_mode", "random")),
             "mu": float(getattr(cfg, "mu", 1.0489)),
@@ -1033,6 +1063,16 @@ class SimWorker:
         env = session["env"]
         model = session["model"]
         rt = session.get("controller")
+        link = session.get("ros")
+        if link is not None and link.take_reset():
+            # `/f1sim/reset` from the ROS side: the same reset as the console's button, on the
+            # thread that owns the session. No ack: nothing on the console asked for it.
+            session["obs"], _ = env.reset()
+            if rt is not None:
+                rt.begin(session["obs"])
+            session["gg"].clear()
+            self._sal_cache = None
+            self.say(P.MSG_LOG, gen=self.gen, text="ROS2 /f1sim/reset: 전 차량을 리셋했습니다")
         if rt is not None:
             rt.pre_action(session["obs"])          # history, friction estimate, MPC limits: before the action
         scan, pro = flatten_obs(session["obs"])
@@ -1042,10 +1082,27 @@ class SimWorker:
                 act = (mu + model.actor.log_std.exp() * torch.randn_like(mu)).clamp(-1, 1)
             else:
                 act = mu
+        if link is not None and link.mode == "drive":
+            # The policy still produces an action (its observation history has to stay real),
+            # but car 0 drives what `/drive` said; silence past the timeout is speed 0.
+            steer, speed, _fresh = link.command()
+            env.set_external_command(link.car, steer, speed)
         session["obs"], _rew, _term, _trunc, _info = env.step(act)
         if rt is not None:
             rt.post_step(_term, _trunc)             # issued command + episode boundaries
         session["k"] += 1
+        if link is not None:
+            plan_ref = None
+            if session["mode"] == "plan" and env.tracker is not None and env.tracker.last_ref is not None \
+                    and link.mode != "drive":
+                plan_ref = env.tracker.last_ref[link.car]
+            try:
+                link.publish(env.last_result, env, plan_ref)
+            except Exception as exc:
+                # A ROS-side failure must not stop the simulation on screen; say it once.
+                if not session.get("ros_failed"):
+                    session["ros_failed"] = True
+                    self.say(P.MSG_LOG, gen=self.gen, text=f"ROS2 발행 실패(이후 반복 생략): {exc}")
 
     def _reload_if_changed(self, session) -> None:
         """Pick up a newer checkpoint of the same run without restarting the session.
@@ -1742,6 +1799,12 @@ class SimWorker:
             # this env alive past the `gc.collect()` below.
             # The controller first: it wraps the solver the fast path installed, and restoring
             # them in the wrong order would leave the grip solver hooked to a released graph.
+            link = session.pop("ros", None)
+            if link is not None:
+                try:
+                    link.close()               # stops publishing before the tensors it reads go away
+                except Exception:
+                    pass
             ctrl = session.pop("controller", None)
             if ctrl is not None:
                 try:

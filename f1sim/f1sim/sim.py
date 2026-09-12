@@ -98,7 +98,7 @@ class Simulator:
         self.ax = torch.zeros(num_envs, device=self.device)
         self.ay = torch.zeros(num_envs, device=self.device)
         self.pose_prev = torch.zeros(num_envs, 3, device=self.device)
-        self.att = torch.zeros(num_envs, 4, device=self.device)          # roll, roll_rate, pitch, pitch_rate
+        self.att = torch.zeros(num_envs, 6, device=self.device)          # roll, roll_rate, pitch, pitch_rate, road roll, road pitch (OU)
         self.att_prev = torch.zeros(num_envs, 2, device=self.device)
         self.imu_state = imu_model.imu_state_init(num_envs, self.device)
         # The IMU runs on its own clock. 50 Hz against a 40 Hz control loop does not divide, so the
@@ -469,8 +469,14 @@ class Simulator:
     def _roll_physics(self, state, ax, att, imu_state, cmd_hist, delay_s, P):
         """All substeps of one control period (compiled on CUDA)."""
         ay = torch.zeros_like(ax)
-        roll, roll_rate, pitch, pitch_rate = att[:, 0], att[:, 1], att[:, 2], att[:, 3]
+        roll, roll_rate, pitch, pitch_rate, w_roll, w_pitch = (att[:, i] for i in range(6))
         wn, zeta = P["susp_wn"], P["susp_zeta"]
+        # floor / tyre tilt: a stationary Ornstein-Uhlenbeck target (rms road_tilt, correlation
+        # road_tau) added to the suspension's set point. Exact discretisation, so the rms is
+        # road_tilt whatever the substep.
+        ou_a = (self.dt / P["road_tau"]).clamp(0.0, 1.0)
+        ou_k = 1.0 - ou_a
+        ou_s = P["road_tilt"] * torch.sqrt(1.0 - ou_k * ou_k)
         imu_on = self.cfg.imu.enabled
         r_vec = torch.stack([P["imu_x"] - P["lr"], P["imu_y"], P["imu_z"] - P["h"]], 1)
         samples = []
@@ -485,8 +491,11 @@ class Simulator:
             r_old = state[:, dyn.IR]
             state, ax, ay = dyn.step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt)
             # sprung mass: roll to the outside of the corner, dive under braking, squat under throttle
-            roll_ss = P["roll_per_g"] * ay / dyn.G
-            pitch_ss = -P["pitch_per_g"] * ax / dyn.G
+            w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s
+            w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s
+            roll_ss = P["roll_per_g"] * ay / dyn.G + w_roll
+            # asymmetric: the car squats under throttle far more than it dives under (regen-limited) braking
+            pitch_ss = -torch.where(ax > 0, P["pitch_per_g"], P["dive_per_g"]) * ax / dyn.G + w_pitch
             roll_acc = wn * wn * (roll_ss - roll) - 2 * zeta * wn * roll_rate
             pitch_acc = wn * wn * (pitch_ss - pitch) - 2 * zeta * wn * pitch_rate
             roll_rate = roll_rate + roll_acc * self.dt
@@ -503,7 +512,7 @@ class Simulator:
             if soft_wall:
                 state = self._resolve_wall_contact(state)
         imu_samples = torch.stack(samples, 1) if samples else torch.zeros(state.shape[0], 0, 6, device=state.device)
-        return state, ax, ay, torch.stack([roll, roll_rate, pitch, pitch_rate], 1), imu_state, imu_samples
+        return state, ax, ay, torch.stack([roll, roll_rate, pitch, pitch_rate, w_roll, w_pitch], 1), imu_state, imu_samples
 
     # ------------------------------------------------------------------ helpers
     def _footprint_corners(self, state: torch.Tensor) -> torch.Tensor:
