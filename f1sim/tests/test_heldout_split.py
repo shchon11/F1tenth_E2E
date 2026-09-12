@@ -87,3 +87,41 @@ def test_eval_tracks_is_the_held_out_list_itself():
 def test_base_map_leaves_a_plain_catalog_name_alone():
     for n in ("real:map16x07", "rt:Monza", "gen:competition:0", "gym:levine"):
         assert common.base_map(n) == n
+
+
+# --------------------------------------------------------------------- suite v2.1's traffic family
+#
+# The leakage guard the traffic family needs, from outside the module that declares it. T exists to
+# put a real-floor traffic number in the benchmark; a real-floor number measured on a floor
+# something trained on is not one, and the T maps are a second list that can drift away from the
+# held-out definition exactly the way `EVAL_TRACKS` could.
+
+def test_every_traffic_map_is_a_held_out_base_map():
+    from f1sim.learn.benchmark import suite as su
+    held = {common.base_map(n) for n in common.HELDOUT_TRACKS}
+    for m in su.V21_TRAFFIC_MAPS:
+        assert common.base_map(m) in held, f"{m} is not a held-out base map"
+    assert common.heldout_leakage(common.TRAIN_TRACKS, list(su.V21_TRAFFIC_MAPS)) == []
+
+
+def test_the_frozen_v2_1_suite_declares_only_held_out_traffic_maps():
+    """The FROZEN file, not the code that built it. A suite is shipped as a file and reproduced from
+    one, so the guard has to hold against what is on disk."""
+    from importlib import resources
+    from f1sim.learn.benchmark import suite as su
+    path = resources.files("f1sim.learn.benchmark").joinpath("suite-v2.1.example.json")
+    s, _ = su.load(str(path))
+    held = {common.base_map(n) for n in common.HELDOUT_TRACKS}
+    assert s.traffic["maps"], "the packaged v2.1 declares no traffic maps"
+    for m in s.traffic["maps"]:
+        assert common.base_map(m) in held, f"frozen v2.1 races traffic on {m}, which is not held out"
+
+
+def test_the_traffic_guard_refuses_a_training_map():
+    from f1sim.learn.benchmark import suite as su
+    with pytest.raises(ValueError, match="not held-out base maps"):
+        su.assert_heldout_maps(["gen:control:1400"])
+    with pytest.raises(ValueError, match="not held-out base maps"):
+        su.assert_heldout_maps([common.KOREA26])
+    # and a variant of a held-out floor is fine, because the comparison is by base map
+    su.assert_heldout_maps(["real:map16x07~rev", "gen:control:9100"])

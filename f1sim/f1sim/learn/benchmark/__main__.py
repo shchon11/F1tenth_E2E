@@ -43,12 +43,23 @@ def cmd_plan(a) -> int:
     print(f"suite {s.version}  freeze {frozen[:16] if frozen else '(not frozen)'}")
     print(f"cells {len(cells)}   trials/system {sum(exp.values())}   " +
           "  ".join(f"{k}={v}" for k, v in exp.items()))
+    if s.traffic_scenarios():
+        for sc in s.traffic_scenarios():
+            n = sum(1 for c in cells if c.suite == "T" and c.variant == sc["id"])
+            ev = (f"events {','.join(sc['opp_events'])} @ {sc['opp_event_rate']:g}/10 s"
+                  if sc.get("opp_events") else "no events")
+            print(f"  T:{str(sc['id']):6s} {n:3d} cells  opponents {int(sc['race_size']) - 1}  "
+                  f"speed {tuple(sc['opp_speed_range'])}  {ev}")
 
     total = 0.0
     for c in cells:
         L = lengths.get(c.map_id)
         scale = (L / REF_MEAN_LENGTH_M) if L else 1.0
-        total += REF_SECONDS_PER_CELL * scale * (RACE_MULTIPLIER if c.suite == "O" else 1.0)
+        # A race costs roughly its car count: the simulator steps every car, so a 3-car T cell is
+        # half again a 2-car one. The old constant assumed every race was two cars, which the
+        # traffic family's `pair` scenario is not.
+        cars = suite_mod.declared_race_size(c, s)
+        total += REF_SECONDS_PER_CELL * scale * (RACE_MULTIPLIER * cars / 2.0 if cars > 1 else 1.0)
     if lengths:
         print(f"projected {total/60:.1f} min/system   (rough: measured rate x length scaling, "
               f"race multiplier inferred)")
@@ -81,10 +92,22 @@ def cmd_geometry(a) -> int:
     # definition frozen into a file named v2 would carry a valid hash and the wrong maps.
     s = suite_mod.of(a.version)
     print(f"suite {s.version}  solo {len(s.solo_maps)}  obstacle {len(s.obstacle_maps)}  "
-          f"race {len(s.race_maps)}  cells {len(s.cells())}")
+          f"race {len(s.race_maps)}  traffic {len(s.traffic.get('maps', ()))}x"
+          f"{len(s.traffic_scenarios())}  cells {len(s.cells())}")
+
+    inherited = None
+    if a.inherit_placements:
+        inherited = _inherit_placements(s, a.inherit_placements)
 
     ok = True
     for map_id in s.obstacle_maps:
+        if inherited is not None:
+            rec = inherited[map_id]
+            s.placements[map_id] = rec
+            pl = rec["placement"]
+            print(f"  {map_id:32s} INHERITED at s={pl['s_obs_m']:.1f} m  from "
+                  f"{os.path.basename(a.inherit_placements)}")
+            continue
         try:
             trs, _ = common.load_tracks([map_id], racelines=False, drop_infeasible=False)
             track = trs[0]
@@ -137,6 +160,33 @@ def cmd_geometry(a) -> int:
     else:
         print("dry run; pass --freeze to write the suite file")
     return 0
+
+
+def _inherit_placements(s, path: str) -> dict:
+    """Take an existing frozen suite's obstacle placements, verbatim, instead of re-deriving them.
+
+    A successor suite that only ADDS a family has to carry the predecessor's avoidance cells
+    unchanged, and re-running the search would not do that: the placement depends on `--s-obs`, and
+    v2 was frozen at 10 while the flag defaults to 20. Re-deriving would produce a different box on
+    every map and a v2.1 A row would silently not be a v2 A row. Loading them is also a *proof*
+    rather than a hope -- `suite.load` refuses a file edited after its freeze, so what is copied is
+    what was scored.
+
+    Refuses a source that does not cover exactly the same obstacle maps: a partial inheritance would
+    leave some cells inherited and some re-derived, which is the worst of both.
+    """
+    base, base_hash = suite_mod.load(path)
+    if not base.placements:
+        raise SystemExit(f"{path} carries no frozen placements to inherit")
+    missing = [m for m in s.obstacle_maps if m not in base.placements]
+    extra = [m for m in base.placements if m not in s.obstacle_maps]
+    if missing or extra:
+        raise SystemExit(
+            f"{path} (suite {base.version}, freeze {base_hash[:12]}) places obstacles on "
+            f"{sorted(base.placements)}, this suite declares {sorted(s.obstacle_maps)}. Inheriting "
+            f"part of a set would leave the rest re-derived under different defaults; refusing.")
+    print(f"  placements inherited from suite {base.version} freeze {base_hash[:16]}")
+    return {m: base.placements[m] for m in s.obstacle_maps}
 
 
 def cmd_gate(a) -> int:
@@ -204,7 +254,7 @@ def cmd_feasibility(a) -> int:
     """
     import json as _json
     import tempfile
-    from .experts import AvoidanceExpert, PassExpert
+    from .experts import AvoidanceExpert, PassExpert, TrafficExpert
 
     s, frozen = suite_mod.load(a.suite)
     if not s.placements:
@@ -214,11 +264,21 @@ def cmd_feasibility(a) -> int:
 
     rows, ok = [], True
     mus = [("low", s.solo_mus[0]), ("mid", s.solo_mus[1])]
-    plan = [("A", m, mu_name, mu) for m in s.obstacle_maps for mu_name, mu in mus]
-    plan += [("O", m, mu_name, mu) for m in s.race_maps for mu_name, mu in mus]
+    plan = [("A", m, "", mu_name, mu) for m in s.obstacle_maps for mu_name, mu in mus]
+    plan += [("O", m, "", mu_name, mu) for m in s.race_maps for mu_name, mu in mus]
+    plan += [("T", m, str(sc["id"]), mu_name, mu)
+             for sc in s.traffic_scenarios()
+             for m in s.traffic.get("maps", ())
+             for mu_name, mu in mus]
+    if a.only:
+        want = set(a.only.split(","))
+        plan = [row for row in plan if row[0] in want or f"{row[0]}:{row[2]}" in want]
 
-    for kind, map_id, mu_name, mu in plan:
-        cell = suite_mod.Cell(kind, map_id, mu, s.seeds[0], a.envs)
+    for kind, map_id, variant, mu_name, mu in plan:
+        race_size = (int(s.traffic_scenario(variant)["race_size"]) if kind == "T"
+                     else (s.race_size if kind == "O" else 1))
+        cell = suite_mod.Cell(kind, map_id, mu, s.seeds[0], a.envs, variant=variant,
+                              race_size=race_size)
         prepared, s_obs, router = _prepare(entry, extra, cell, s, a.device)
         try:
             env = prepared.env
@@ -228,6 +288,8 @@ def cmd_feasibility(a) -> int:
                 driver = AvoidanceExpert(env, s_obs_m=s_obs, free_side=side,
                                          corridor_offset_m=abs(rec.get(
                                              "corridor_centre_offset_m", 0.45)))
+            elif kind == "T":
+                driver = TrafficExpert(env)
             else:
                 driver = PassExpert(env)
             from .runner import run_cell
@@ -239,22 +301,28 @@ def cmd_feasibility(a) -> int:
                            vehicle_length=vp.length, vehicle_width=vp.width, frozen=False,
                            controller=prepared, seed=cell.seed,
                     # the adapter reports the effective layout under "spec"
-                    obs_spec=(prepared.protocol or {}).get("spec"))
+                    obs_spec=(prepared.protocol or {}).get("spec"),
+                    **_traffic_windows(s))
         finally:
             if router is not None:
                 router.uninstall()
             prepared.close()
 
         t = res["tally"]
-        feasible = t["successes"] > 0
+        if kind == "T":
+            feasible, detail = _traffic_feasible(res, prepared.protocol)
+        else:
+            feasible, detail = t["successes"] > 0, ""
         ok &= feasible
-        rows.append({"kind": kind, "map": map_id, "mu_label": mu_name, "mu": mu,
+        rows.append({"kind": kind, "map": map_id, "variant": variant,
+                     "mu_label": mu_name, "mu": mu,
                      "feasible": feasible, "successes": t["successes"],
                      "denominator": t["denominator"], "reasons": t["failures"],
                      "effective": prepared.protocol, "result": res})
         mark = "FEASIBLE" if feasible else "NOT SHOWN"
-        print(f"  {kind} {map_id:24s} mu={mu_name:3s} {t['successes']}/{t['denominator']}  "
-              f"{mark}  {t['failures']}")
+        label = f"{kind}:{variant}" if variant else kind
+        print(f"  {label:8s} {map_id:24s} mu={mu_name:3s} {t['successes']}/{t['denominator']}  "
+              f"{mark}  {t['failures']} {detail}")
 
     if a.out:
         with open(a.out, "w") as fh:
@@ -319,12 +387,12 @@ def cmd_run(a) -> int:
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, f"{a.system.replace('/', '_')}.cells.jsonl")
     ident0 = suite_mod.protocol_identity(s, entry)
-    by_id = {f"{c.suite}:{c.map_id}:{c.mu}:{c.seed}": c for c in s.cells()}
+    by_id = {c.cell_id(): c for c in s.cells()}
     done = _resume(path, ident0, by_id, entry, suite_obj=s)
     written = 0
     with open(path, "a") as fh:
         for cell in s.cells():
-            key = f"{cell.suite}:{cell.map_id}:{cell.mu}:{cell.seed}"
+            key = cell.cell_id()
             if key in done:
                 continue
             t0 = time.perf_counter()
@@ -339,8 +407,8 @@ def cmd_run(a) -> int:
             # `n_envs` from the DECLARED cell, never from `res["n"]`: the reporter checks the
             # recorded count against the declared one, and sourcing it from the result would make
             # that check compare the result against itself.
-            row.update({"suite": cell.suite, "map_id": cell.map_id, "mu": cell.mu,
-                        "seed": cell.seed, "n_envs": cell.envs,
+            row.update({"suite": cell.suite, "variant": cell.variant, "map_id": cell.map_id,
+                        "mu": cell.mu, "seed": cell.seed, "n_envs": cell.envs,
                         "runtime": entry.controller_arm, "cell_id": key,
                         "wall_seconds": round(time.perf_counter() - t0, 2), "result": res})
             fh.write(_json.dumps(row) + "\n")
@@ -475,7 +543,8 @@ def _prepare(entry, extra, cell, suite_obj, device):
     from . import model_adapter as ma
     tracks = rls = None
     spawn = None
-    race_size = suite_obj.race_size if cell.suite == "O" else 1
+    adapter = suite_obj.adapter_suite(cell)
+    race_size = int(adapter["race_size"]) if cell.suite in ("O", "T") else 1
     # INTERFACE (adapter-contract.md): `envs` is the number of measured LEARNERS. The adapter
     # multiplies by race_size to size the simulator. Core must not multiply as well -- doing both
     # gives 32 cars for an 8-learner 2-car race.
@@ -485,7 +554,7 @@ def _prepare(entry, extra, cell, suite_obj, device):
     if cell.suite == "A":
         tracks, rls, s_obs = _obstacle_track_for(cell, suite_obj)
         spawn = s_obs + suite_obj.s_start_offset_m
-    prepared = ma.prepare_cell(_entry_dict(entry), extra, cell_d, suite_obj.adapter_suite(),
+    prepared = ma.prepare_cell(_entry_dict(entry), extra, cell_d, adapter,
                                device, tracks_override=tracks, racelines=rls, spawn_s_m=spawn)
     router = None
     if race_size > 1:
@@ -520,7 +589,62 @@ def _run_one(prepared, policy, cell, s_obs, suite):
                     vehicle_length=vp.length, vehicle_width=vp.width, frozen=True,
                     controller=prepared, seed=cell.seed,
                     # the adapter reports the effective layout under "spec"
-                    obs_spec=(prepared.protocol or {}).get("spec"))
+                    obs_spec=(prepared.protocol or {}).get("spec"),
+                    **_traffic_windows(suite))
+
+
+def _traffic_feasible(res: dict, protocol: dict | None) -> tuple:
+    """Is a T cell a scenario somebody has driven, and does it contain the thing it claims to?
+
+    Three conditions, and deliberately NOT "a pass was completed". A completed pass is the O
+    family's gate, it could not be shown on either real floor by any reference driver anybody has
+    written, and making it the gate here would drop the same four scenarios again and leave the
+    traffic number a generated-map number. What T needs demonstrated is that the stint is
+    *survivable* and that it actually contains traffic:
+
+      1. the reference driver came through at least one trial clean -- no wall, no contact;
+      2. at least one trial met an opponent inside the contention window, so the cell measures
+         traffic rather than a lonely lap;
+      3. on an event scenario, an event landed inside that window -- the contract's "measure it,
+         don't assume". A brake that fires while the learner is half a lap away is a schedule entry
+         and not something the learner had to react to, and a cell whose defining feature only
+         shows up sometimes is two cells sharing a name.
+
+    Passes are reported alongside as evidence about headroom, and never gate anything.
+    """
+    t = res["tally"]
+    clean = int(t["successes"])
+    contended = int(res.get("contended", 0))
+    passes = sum(res.get("passes", []) or [])
+    ev_trials = int(res.get("event_in_window_trials", 0))
+    n = int(res.get("n", 0)) or 1
+    wants_events = bool((protocol or {}).get("opp_events"))
+    ok = clean > 0 and contended > 0 and (ev_trials > 0 or not wants_events)
+    why = []
+    if clean == 0:
+        why.append("no clean run")
+    if contended == 0:
+        why.append("never met traffic")
+    if wants_events and ev_trials == 0:
+        why.append("no event inside the contention window")
+    detail = (f"clean {clean}/{n} contended {contended}/{n} passes {passes}"
+              + (f" event-in-window {ev_trials}/{n}" if wants_events else "")
+              + (("  << " + "; ".join(why)) if why else ""))
+    return ok, detail
+
+
+def _traffic_windows(suite) -> dict:
+    """The two arc windows the T trace measures over, from the FROZEN suite.
+
+    Read from the suite rather than defaulted at the call site: they decide what "in contention" and
+    "close enough to attack" mean, so a run that picked them up from a function default would be
+    measuring something the frozen definition does not describe.
+    """
+    t = getattr(suite, "traffic", None) or {}
+    if not t:
+        return {}
+    return {"contention_range_m": float(t["contention_range_m"]),
+            "attack_range_m": float(t["attack_range_m"])}
 
 
 def _read_results(path: str) -> dict:
@@ -590,6 +714,11 @@ def main(argv=None) -> int:
                    choices=sorted(suite_mod.VERSIONS),
                    help="which scenario set to prove and freeze (v1 in-distribution, v2 held out)")
     q.add_argument("--s-obs", type=float, default=20.0)
+    q.add_argument("--inherit-placements", metavar="SUITE.json",
+                   help="take the obstacle placements from an already frozen suite instead of "
+                        "re-deriving them. Required to freeze a successor suite whose avoidance "
+                        "cells must be the predecessor's: the search depends on --s-obs, and a "
+                        "re-derived placement is a different scenario wearing the same name")
     q.add_argument("--measure", action="store_true", help="time a teacher-driven cell per map")
     q.add_argument("--measure-steps", type=int, default=600)
     q.add_argument("--freeze", action="store_true")
@@ -608,6 +737,8 @@ def main(argv=None) -> int:
     q.add_argument("--device", default="cpu")
     q.add_argument("--tmpdir")
     q.add_argument("--out")
+    q.add_argument("--only", help="comma-separated families or family:variant to run "
+                                  "(e.g. 'T', 'T:event', 'A,O'); default is every declared cell")
 
     q = sub.add_parser("run"); q.set_defaults(fn=cmd_run)
     q.add_argument("--suite", default="suite-v1.json")
