@@ -256,6 +256,9 @@ def main(argv=None) -> int:
     if a.driver:
         print("\nthe simulated driver against the recordings':")
         print(driver_check(a.driver, a.markdown))
+        print("(the steering rows pool straight and cornering bags. Half the generated set steers "
+              "at zero by construction -- the contract asks for both -- so the pooled |steer| is "
+              "about half the cornering half's, which runs at the measured sd.)")
     # The exit status is about the bands and about the firings the contract forbids. A must-catch
     # miss is NOT one of them here: in the simulator that population is dominated by timestamp
     # artefacts, which the guard rejects on purpose and which it also misses on the car
