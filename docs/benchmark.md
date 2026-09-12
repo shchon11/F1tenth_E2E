@@ -205,6 +205,10 @@ python3 -m f1sim.learn.benchmark geometry --version v2.1 \
     --inherit-placements f1sim/learn/benchmark/suite-v2.example.json --freeze
 ```
 
+The frozen definition ships as `f1sim/learn/benchmark/suite-v2.1.example.json`, freeze hash
+`ec7a5bbfdd81d646eabd8bdc1a8de1af2ef757e4351048e3655ca210ae9b7a41`. **144 cells, 1152 trials per
+system**, against v2's 64 and 512.
+
 ### Why T is not more O
 
 O asks **"was a pass completed and held?"** and answers with a binary. That is the right question
@@ -316,6 +320,35 @@ over 2 % of it. `TrafficExpert` differs in three things:
 python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.1.json --envs 4 --device cpu
 python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.1.json --envs 4 --only T:event
 ```
+
+Measured before the freeze, CPU, seed 4401, 4 trials per cell — **40/40 cells feasible, none
+dropped**:
+
+| scenario | clean | contended | passes | pace vs opponent | event landed in window |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `slow` | 39/40 | 40/40 | 10 | 1.16 | — |
+| `pace` | 37/40 | 40/40 | 0 | 1.00 | — |
+| `event` | 27/40 | 40/40 | 6 | 1.17 | **40/40** (99 % of event seconds) |
+| `pair` | 35/40 | 40/40 | 0 | 1.03 | — |
+
+The panel separates the scenarios the way the design predicts, which is the first evidence that it
+measures anything: `pace` is where ground cannot be gained (1.00, zero passes, by construction) and
+is also nearly the easiest to survive — the pair of numbers that "clean alone is gameable"
+describes; `event` is the hardest to survive *and* one of the two where ground is gained, because a
+car that brakes is both a hazard and an opportunity; `slow` is where the passes are and `pair` is
+not, because a second car removes the opening the same speed advantage would otherwise give.
+
+**The event rate is measured, not assumed.** At 3.0 events per opponent per 10 s an event lands
+inside the learner's contention window in 40 of 40 event-scenario trials, and 99 % of all opponent
+event seconds are spent inside it. A scenario whose defining feature only showed up sometimes would
+be two scenarios sharing a name.
+
+**Zero passes on `real:map16x07` in every scenario is the finding, not a gap.** The room on the side
+the reference driver uses, taken as the minimum over the next 3 m of arc, is a median 0.25 m there
+against 0.80 m on `real:korea_2025_iccas`, so a driver that will not commit below 0.70 m never
+pulls out — and stays clean 15/16 times instead. This is the same geometry that took the O family
+off that floor; the difference is that it is now a number the cell reports rather than a reason the
+cell cannot exist.
 
 ### Checking traffic without the suite
 
@@ -601,8 +634,9 @@ by observation spec and reports the groups separately rather than pooling them.
 
 **Start from the packaged suite, not from `geometry`.** Re-running `geometry` regenerates placements
 from the current defaults (`--s-obs 20.0`), which produces a *different* suite with a different
-freeze hash — scenarios that were never the ones scored. Both suites ship inside the package
-(`suite-v1.example.json`, `suite-v2.example.json`; v2 was frozen with `--s-obs 10`):
+freeze hash — scenarios that were never the ones scored. All three suites ship inside the package (`suite-v1.example.json`, `suite-v2.example.json`,
+`suite-v2.1.example.json`; v2 was frozen with `--s-obs 10`, and v2.1 inherits those placements
+rather than re-deriving them):
 
 ```bash
 python3 -c "
@@ -641,6 +675,7 @@ which is precisely why the suite is copied rather than regenerated.
 ```bash
 python3 -m f1sim.learn.benchmark feasibility --suite suite-v1.json --envs 4 --device cpu
 python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.json --envs 4 --device cpu
+python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.1.json --envs 4 --device cpu
 ```
 
 This drives the scenarios with a scripted expert on synthetic metadata to confirm each one is
