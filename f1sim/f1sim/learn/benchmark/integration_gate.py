@@ -187,7 +187,7 @@ def probe_at_fixed_state(map_id: str, *, snapshots, actor_kind: str, arm: str,
 
 
 def reference_snapshots(map_id: str, *, steps: int, envs: int, race_size: int, seed: int,
-                        device: str = "cpu"):
+                        device: str = "cpu", retries: int = 8):
     """Probe points from a rollout that keeps every learner alive.
 
     The reference must be long enough for an estimator history to fill WITHOUT a learner reset. A
@@ -199,23 +199,36 @@ def reference_snapshots(map_id: str, *, steps: int, envs: int, race_size: int, s
     learner reset rather than continuing past one. Refuses rather than returning a short trajectory:
     a gate that silently probes 20 cold steps proves nothing about a warm estimator.
     """
-    torch.manual_seed(seed)
-    env = _build(map_id, envs=envs, race_size=race_size, seed=seed, device=device,
-                 force_teacher=True)
-    obs = _reset(env, seed)
-    learner = env.on_policy
-    snaps = []
-    for _k in range(steps):
-        snaps.append(_snapshot(env))
-        a = env.teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid,
-                                    env.ecfg.v_max_policy, env.tracker.spec)
-        obs, _r, term, trunc, _i = _step_any(env, a)
-        if bool((term | trunc)[learner].any()):
-            raise RuntimeError(
-                f"a learner ended after {len(snaps)} of {steps} reference steps on {map_id}; the "
-                f"probe needs an uninterrupted trajectory, because a reset empties the estimator "
-                f"history the gate is trying to warm")
-    return snaps
+    # One seed is one draw of spawn slots and opponent pace, and whether the two teacher-driven cars
+    # touch inside `steps` is a property of that draw, not of the plant: the same seed that ran
+    # 60 clean steps before 2026-09-13 ended at 57 once the attitude model's floor-wobble noise
+    # shifted the random stream. So the reference tries `seed`, then the next seeds, and still
+    # refuses if none gives an uninterrupted trajectory -- a short probe is never returned.
+    ended = []
+    for attempt in range(retries + 1):
+        s = seed + attempt
+        torch.manual_seed(s)
+        env = _build(map_id, envs=envs, race_size=race_size, seed=s, device=device,
+                     force_teacher=True)
+        obs = _reset(env, s)
+        learner = env.on_policy
+        snaps = []
+        for _k in range(steps):
+            snaps.append(_snapshot(env))
+            a = env.teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid,
+                                        env.ecfg.v_max_policy, env.tracker.spec)
+            obs, _r, term, trunc, _i = _step_any(env, a)
+            if bool((term | trunc)[learner].any()):
+                ended.append((s, len(snaps)))
+                break
+        else:
+            if attempt:
+                print(f"gate reference: seed {seed} ended early ({ended}); using seed {s}", flush=True)
+            return snaps
+    raise RuntimeError(
+        f"a learner ended before {steps} reference steps on {map_id} for every seed tried "
+        f"{ended}; the probe needs an uninterrupted trajectory, because a reset empties the "
+        f"estimator history the gate is trying to warm")
 
 
 def _step_any(env, a):
