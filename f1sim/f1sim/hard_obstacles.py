@@ -5,14 +5,16 @@ racing line and each leaving 1.0-1.2 m open. Watching the policy drive hand-buil
 (`~/f1sim_scenes/scene_0912_*`, 2026-09-12) showed what it actually fails at, and none of it is a
 single box with a metre of room:
 
-  gate      two or three boxes side by side across the lane, one gap of 0.6-0.85 m left at a wall
+  gate      two or three boxes side by side across the lane, 55-75 % of the lane left open at a wall
   diagonal  three to five boxes stepping diagonally across the lane, the gap at the far end
   chicane   a block from one wall, then 2-3.5 m later a block from the other -- an S the car has
             to thread, not a box it can ignore
   apex      a block on the inside of a corner, where the line wants to be
   cluster   two or three boxes touching, wedged into one side of the lane
 
-Every pattern is built with an explicit gap and then *proved* passable: the free space is eroded by
+The open share is what the user's scenes leave (1.5-1.85 m of a 2.25-2.5 m lane; first cut of this
+file left 0.6-0.85 m and the user rightly called it impassable). Every pattern is built with an
+explicit gap and then *proved* passable: the free space is eroded by
 0.25 m (car half-width 0.14 m plus margin) and the lane before the pattern must still connect to
 the lane after it. A pattern that closes the lap is undone and redrawn. Boxes go into both
 `occupancy` and `tall`, so the LiDAR sees them at every beam height and the car collides with them.
@@ -32,7 +34,9 @@ from .track import Track
 
 CAR_HALF_W = 0.14
 ERODE_M = 0.25            # proof margin: a 0.6 m gap survives erosion with 0.1 m to spare
-GAP_RANGE = (0.60, 0.85)  # what the hand-built scenes leave open, measured
+GAP_FRAC = (0.55, 0.75)   # open share of the lane beside a pattern: the hand-built scenes leave
+                          # 1.50-1.85 m of a 2.25-2.50 m lane (measured, scene_0912_2344/2355)
+GAP_MIN = 1.20            # never less than this, whatever the lane width
 BOX_W, BOX_D = 0.36, 0.30 # cardboard box: across the lane, along it
 PATTERNS = ("gate", "diagonal", "chicane", "apex", "cluster")
 
@@ -80,7 +84,7 @@ def _block(v_lo: float, v_hi: float) -> List[Tuple[float, float]]:
 
 
 def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
-                        gap: Tuple[float, float] = GAP_RANGE, min_spacing: float = 6.0,
+                        gap_frac: Tuple[float, float] = GAP_FRAC, min_spacing: float = 6.0,
                         patterns=PATTERNS) -> Track:
     """Copy of `track` with `n` hand-built-style obstacle patterns stamped into its grids."""
     if track.centerline is None:
@@ -140,8 +144,8 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
             continue
         wl, wr = _lane_halves(occ0, res, origin, cl[i], nrm[i])
         width = wl + wr
-        g = float(rng.uniform(*gap))
-        if width < g + 0.45:                                       # no room for a real pattern here
+        g = max(GAP_MIN, width * float(rng.uniform(*gap_frac)))
+        if width - g < 0.30:                                       # nothing fits beside the gap
             continue
         boxes = []                                                   # (index offset [m], v_centre, sx, sy)
         side = 1.0 if kind == "apex" and curv[i] > 0 else (-1.0 if kind == "apex" else float(rng.choice([-1.0, 1.0])))
@@ -156,7 +160,7 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
                 v = (wl - (j + 0.5) * step_v) if side > 0 else (-wr + (j + 0.5) * step_v)
                 boxes.append((j * 0.5, v, BOX_D, min(BOX_W, step_v)))
         elif kind == "chicane":
-            g2 = float(rng.uniform(*gap)); span2 = width - g2
+            g2 = max(GAP_MIN, width * float(rng.uniform(*gap_frac))); span2 = width - g2
             lo, hi = (wl - span, wl) if side > 0 else (-wr, -wr + span)
             boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi)]
             lo2, hi2 = (-wr, -wr + span2) if side > 0 else (wl - span2, wl)
@@ -175,6 +179,8 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
             # a cluster must still leave the gap on the other side
             if width - (2 * BOX_W + 0.1) < g:
                 boxes = boxes[:1]
+                if width - (BOX_W + 0.1) < g:
+                    continue
         if not boxes:
             continue
         occ_try = occ.copy(); tall_try = tall.copy()
