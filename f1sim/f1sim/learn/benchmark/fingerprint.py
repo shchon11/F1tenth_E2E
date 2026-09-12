@@ -181,8 +181,11 @@ def validate_fingerprint(fp, *, where: str = "fingerprint", expected_cell=None,
     # cars and a race of 4 is well formed on its own terms and still describes a different
     # experiment from the 8-learner solo cell it claims to be.
     if expected_cell is not None:
-        want_race = int(getattr(suite, "race_size", 1)) if (
-            suite is not None and getattr(expected_cell, "suite", None) == "O") else 1
+        # From the CELL, which states it, with the suite as the fallback for a hand-built one. The
+        # previous form derived it from `suite == "O"`, which silently gave every T cell a race size
+        # of 1 and would have refused every traffic fingerprint ever taken.
+        from .suite import declared_race_size
+        want_race = declared_race_size(expected_cell, suite)
         if fp["race_size"] != want_race:
             raise ValueError(f"{where}: race_size {fp['race_size']} but the declared cell is "
                              f"race_size {want_race}")

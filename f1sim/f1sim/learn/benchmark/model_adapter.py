@@ -273,6 +273,21 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
     # declare the teacher path and its speed range explicitly.
     opponent = str(suite.get("opponent", "teacher")) if race_size > 1 else "policy"
     opp_speed_range = tuple(suite.get("opp_speed_range", (0.6, 0.8)))
+    # Scripted opponent behaviour (f1sim.opponent_events). Part of the scenario, so it arrives with
+    # the suite dict and is recorded in `protocol`; a run whose opponent brakes and one whose
+    # opponent does not are different cells, and a row has to be able to say which it was.
+    from f1sim.opponent_events import parse_events
+    opp_events = parse_events(suite.get("opp_events") or ())
+    opp_event_rate = float(suite.get("opp_event_rate", 0.0) or 0.0)
+    if opp_events and not (race_size > 1 and opponent in ("teacher", "mixed")):
+        raise AdapterError(
+            f"opponent events {list(opp_events)} were declared for a cell with race_size "
+            f"{race_size} and opponent {opponent!r}: the events script the teacher-driven cars of a "
+            f"race, and there are none here, so the cell would silently be the unflagged one.")
+    if opp_events and opp_event_rate <= 0.0:
+        raise AdapterError(
+            f"opponent events {list(opp_events)} at rate {opp_event_rate}: at a non-positive rate "
+            f"nothing ever fires and the cell is silently the unflagged one.")
 
     cfg = eval_config(float(cell["true_mu"]), spec, sensor_noise=sensor_noise)
     # `tracks_override` carries already-built `Track` objects when core has placed an obstacle on
@@ -294,6 +309,7 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode="plan",
                      race_size=race_size, max_steps=steps,
                      opponent=opponent, opp_speed_range=opp_speed_range,
+                     opp_events=opp_events, opp_event_rate=opp_event_rate,
                      selfplay_front_cap=False,
                      scan_stack=int(spec["scan_stack"]), scan_stride=int(spec["scan_stride"]),
                      hist_len=int(spec["hist_len"]), hist_stride=int(spec["hist_stride"]),
@@ -365,6 +381,7 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
         "map": cell["map"], "true_mu": float(cell["true_mu"]), "seed": int(cell["seed"]),
         "learners": learners, "envs": envs, "race_size": race_size,
         "opponent": opponent, "opp_speed_range": list(opp_speed_range),
+        "opp_events": list(opp_events), "opp_event_rate": opp_event_rate,
         "speed_cap": speed_cap,
         "sensor_noise": sensor_noise,
         "sensor_noise_fields": {f"{g}_{f}": float(getattr(getattr(cfg, g), f))

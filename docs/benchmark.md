@@ -17,13 +17,16 @@ each row. `python3 -m f1sim.learn.leaderboard` builds it from existing result fi
 cohort through `report.validate_results` first; it scores nothing and needs no weights or GPU.
 `leaderboard/index.html` is the same report as a self-contained offline page.
 
-**Two suites, two questions.** **v1 is in-distribution**: its three maps are reused development
+**Three suites, three questions.** **v1 is in-distribution**: its three maps are reused development
 tracks -- `gen:control:1400` is an SGR training map and `real:korea_2026_competition` is trained
 through twenty obstacle variants -- so a v1 number says how well the training distribution was
 fitted and is not evidence of generalisation to an unseen venue. **v2 is held out**: every map in
 it is outside `common.TRAIN_TRACKS` in every variant, including two real floors this car drove on
-that the simulator did not previously contain. **Adoption decisions use v2** (see
-[Held-out suite v2](#held-out-suite-v2)). Neither suite is an on-car claim. Scope is restated in
+that the simulator did not previously contain. **v2.1 is v2 plus traffic**: the same 64 cells,
+unchanged, plus an 80-cell **T** family that measures what a policy does with other cars around it
+on those same held-out floors -- including the two where a completed pass could not be demonstrated
+and O was therefore dropped. **Adoption decisions use v2.1** (see
+[Suite v2.1](#suite-v21-the-t-traffic-family)). No suite is an on-car claim. Scope is restated in
 every generated report, which reads it from the suite's own provenance field.
 
 Map names on this page are written in the **loader** grammar (`real:korea_2026_competition`,
@@ -37,7 +40,7 @@ table that converts between the two.
 | stage | loads a checkpoint? | needs a GPU? | what it does |
 | --- | --- | --- | --- |
 | `plan` | no | no | matrix, trial counts, cost projection, roster **file-pin** verification |
-| `geometry` | no | no | proves obstacle placements, optionally times a smoke run, then **freezes** the suite |
+| `geometry` | no | no | proves obstacle placements (or **inherits** a predecessor's), optionally times a smoke run, then **freezes** the suite |
 | `gate` | no | **no — runs on CPU** | proves the opponent does not react to the candidate's controller |
 | `feasibility` | no | no | scripted-expert check that each scenario is achievable at all |
 | `run` | **yes** | yes, with `--lease` | scores one pinned system against the frozen suite |
@@ -187,11 +190,186 @@ The obstacle proofs, at `--s-obs 10`:
 | --- | --- |
 | did this checkpoint learn the training distribution at all | v1 |
 | does it hold up on geometry it has never seen | **v2** |
-| should we adopt it | **v2** |
+| does it handle traffic on that geometry | **v2.1** |
+| should we adopt it | **v2.1** |
 
 A v1 improvement with no v2 improvement is a fit to the training maps, and the two suites are
 reported separately for that reason. Rows are never pooled across suites: the freeze hash differs,
 and `report.validate_results` refuses a file that mixes them.
+
+## Suite v2.1: the T (traffic) family
+
+v2.1 is **v2 plus one family**. Every S, A and O cell in it is v2's cell — same map, same friction,
+same seed, same obstacle box, byte for byte — so a v2 avoidance row and a v2.1 avoidance row are
+the same measurement, and only T is new. The obstacle placements are *inherited* from v2's frozen
+file rather than re-derived, because the placement search depends on `--s-obs` and v2 was frozen at
+10 while the flag defaults to 20; a re-derived box is a different scenario wearing the same name.
+
+```bash
+python3 -m f1sim.learn.benchmark geometry --version v2.1 \
+    --suite suite-v2.1.json \
+    --inherit-placements f1sim/learn/benchmark/suite-v2.example.json --freeze
+```
+
+The frozen definition ships as `f1sim/learn/benchmark/suite-v2.1.example.json`, freeze hash
+`ec7a5bbfdd81d646eabd8bdc1a8de1af2ef757e4351048e3655ca210ae9b7a41`. **144 cells, 1152 trials per
+system**, against v2's 64 and 512.
+
+### Why T is not more O
+
+O asks **"was a pass completed and held?"** and answers with a binary. That is the right question
+where a pass is something a driver has been shown to do — and on the two unseen real floors it is
+not. The held-out worker declared O there, measured **0/4 at both friction levels on each**, tried
+the other side and a smaller offset, recovered nothing, and dropped the cells rather than admit them
+undemonstrated. v2's overtaking number is therefore one generated map and 32 trials, which cannot
+tell whether a recipe improved overtaking.
+
+The narrowness is real: `real:map16x07` has a 0.702 m median half-width against 0.620 m of two cars
+abreast. So the fix is not a bigger denominator on the same binary. It is a metric whose floor is
+not zero.
+
+**T's trial outcome is a clean contested run**: the learner came through the traffic stint with no
+wall collision and no contact with another car. That is achievable on a 0.70 m half-lane — it is
+what a car in traffic has to do before anything else counts — and it is what the feasibility check
+demonstrates. A completed pass is reported *next to* it as a count that is allowed to be zero, never
+as the gate.
+
+| column | direction | what it is |
+| --- | --- | --- |
+| **clean** | ↑ | the trial outcome: finished the stint, no wall, no car contact |
+| **passes/race** | ↑ | completed, held passes — counted over the stint, not latched at one |
+| **pace vs opponent** | ↑ | the learner's arc ÷ the opponents' arc over the same steps |
+| **attacking s/race** | ↑ | seconds spent within `attack_range_m` (3 m) behind a car |
+| **following s/race** | — | seconds spent within `contention_range_m` (12 m) behind a car |
+| **car contact** | ↓ | trials that ended by touching another car |
+| **wall collisions** | ↓ | trials that ended in the track |
+| **leads lost** | ↓ | a clear lead taken and then given back |
+
+**No composite**, as everywhere else here. The panel is the metric, and the columns are designed to
+refuse each other's blind spots: "clean" on its own is gameable — a car that hangs back and never
+tries never crashes — and **pace vs opponent** is the column that catches it, scoring that car well
+under 1.0 while a car that actually races scores at or above it. Neither is worth reading alone.
+
+**Two windows, because one saturates.** `contention_range_m` is the env's own `overtake_range`,
+12 m, which is the distance beyond which the reward already stops treating two cars as racing. On a
+33.2 m lap — `map16x07` — a gap of 12 m or less is three quarters of every gap the two cars can be
+at, so the wide window reads ~1.0 for everybody and separates nobody. `attack_range_m` is 3.0 m,
+about five car lengths, close enough that a pass is actually on, and it does not saturate on any map
+in the family. Both are frozen in the suite and both are reported.
+
+### The scenarios
+
+Scenarios, not counts. Four of them, each varying one axis against a comparable baseline:
+
+| variant | opponent | cars | events | what it isolates |
+| --- | --- | ---: | --- | --- |
+| `slow` | 0.5–0.7× profile | 2 | — | a clearly slower car: the pass is available, the question is whether it is taken and taken cleanly |
+| `pace` | 0.8–0.95× profile | 2 | — | a car at nearly the learner's own pace: passes are rare by construction, so the cell is carried by pace and by staying clean through a whole stint in close company |
+| `event` | 0.6–0.8× profile | 2 | `brake,stop,shift` @ 3.0 /10 s | the scripted behaviours of `f1sim.opponent_events`. Nothing else in the benchmark evaluates against them |
+| `pair` | 0.6–0.8× profile | 3 | — | two opponents: the lane beside the car ahead is no longer assumed empty |
+
+`event` and `pair` hold the speed range at v2's own `(0.6, 0.8)`, so each differs from a comparable
+baseline in exactly one thing. `weave` is deliberately absent: it is a small continuous oscillation
+rather than a decision to react to.
+
+**Maps, friction, seeds.** The five held-out maps `real:map16x07`, `real:map12x16`,
+`gen:control:9100`, `real:korea_2025_iccas`, `gen:competition:0`, at µ 0.73423 and 0.94401, seeds
+4401 and 4402. **4 × 5 × 2 × 2 = 80 cells, 640 trials per system**, on top of v2's 64 cells and 512
+trials: **144 cells, 1152 trials** for v2.1 as a whole.
+
+A T cell id carries its scenario — `T:slow:real:map16x07:0.94401:4401` — because four T cells share a
+map, a friction and a seed and differ only in what the opponent is doing, which is the point of them.
+Without the variant in the identity every duplicate check in the report would read them as one cell
+measured four times.
+
+### The leakage guard
+
+Every T map is a base map of `common.HELDOUT_TRACKS`, checked by `suite.assert_heldout_maps` before
+the suite is built and again from outside by `tests/test_heldout_split.py` — once against the code
+that declares the maps and once against the **frozen file**, because a suite is shipped as a file and
+reproduced from one. The comparison is by base map through `common.base_map`, so a `~rev`, `~mir`,
+`+obs`, `+rlobs`, `+pinch` or `+props` variant of a training venue cannot enter under a different
+string. The guard raises rather than warns, and raises if it cannot import the split at all: a
+leakage guard that quietly does not run is worse than none, because the suite then carries a claim
+nobody checked.
+
+### Feasibility: what has to be shown, and what deliberately does not
+
+A T cell is admitted when the scripted, checkpoint-free reference driver shows three things, on the
+scoring path:
+
+1. **at least one clean trial** — the stint is survivable;
+2. **at least one trial that met traffic** inside the contention window — the cell measures traffic
+   rather than a lonely lap;
+3. on `event`, **an event that landed inside that window** — measured, not assumed. An opponent that
+   brakes half a lap away is a schedule entry, not something the learner had to react to, and a cell
+   whose defining feature only shows up sometimes is two cells sharing a name.
+
+**A completed pass is not one of the conditions.** Making it one would drop the same four scenarios
+O lost and leave the traffic number a generated-map number again. Passes by the reference driver are
+reported alongside as evidence about headroom, and gate nothing.
+
+The reference driver is `experts.TrafficExpert`, and it is the answer to the follow-up the held-out
+worker left. `PassExpert` takes a fixed 0.40 m off the centreline whenever a car is within a fixed
+7 m — on a 33 m lap that is a fifth of the way round held at an offset that already exceeds the lane
+over 2 % of it. `TrafficExpert` differs in three things:
+
+* the offset is bounded per centreline point by the track's own distance field (clearance − the
+  car's half-width − a margin), the same construction `opponent_events.raceline_offset_limit` uses
+  for a scripted lane change;
+* **a pass that does not fit is not attempted** — where the bound falls below what a car needs to get
+  past another, it holds station behind instead. "The reference driver crashed" is not evidence about
+  the scenario;
+* it can actually stop, because a 0.5 m/s creep into a car a `stop` event has parked is a contact.
+
+```bash
+python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.1.json --envs 4 --device cpu
+python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.1.json --envs 4 --only T:event
+```
+
+Measured before the freeze, CPU, seed 4401, 4 trials per cell — **40/40 cells feasible, none
+dropped**:
+
+| scenario | clean | contended | passes | pace vs opponent | event landed in window |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `slow` | 39/40 | 40/40 | 10 | 1.16 | — |
+| `pace` | 37/40 | 40/40 | 0 | 1.00 | — |
+| `event` | 27/40 | 40/40 | 6 | 1.17 | **40/40** (99 % of event seconds) |
+| `pair` | 35/40 | 40/40 | 0 | 1.03 | — |
+
+The panel separates the scenarios the way the design predicts, which is the first evidence that it
+measures anything: `pace` is where ground cannot be gained (1.00, zero passes, by construction) and
+is also nearly the easiest to survive — the pair of numbers that "clean alone is gameable"
+describes; `event` is the hardest to survive *and* one of the two where ground is gained, because a
+car that brakes is both a hazard and an opportunity; `slow` is where the passes are and `pair` is
+not, because a second car removes the opening the same speed advantage would otherwise give.
+
+**The event rate is measured, not assumed.** At 3.0 events per opponent per 10 s an event lands
+inside the learner's contention window in 40 of 40 event-scenario trials, and 99 % of all opponent
+event seconds are spent inside it. A scenario whose defining feature only showed up sometimes would
+be two scenarios sharing a name.
+
+**Zero passes on `real:map16x07` in every scenario is the finding, not a gap.** The room on the side
+the reference driver uses, taken as the minimum over the next 3 m of arc, is a median 0.25 m there
+against 0.80 m on `real:korea_2025_iccas`, so a driver that will not commit below 0.70 m never
+pulls out — and stays clean 15/16 times instead. This is the same geometry that took the O family
+off that floor; the difference is that it is now a number the cell reports rather than a reason the
+cell cannot exist.
+
+### Checking traffic without the suite
+
+`evaluate` takes the same opponent flags as training and reports the same metrics, from the same
+implementation (`benchmark.overtake.TrafficMeter` wraps `TrafficTrace` and the same pass detector):
+
+```bash
+python3 -m f1sim.learn.evaluate "$CKPT" --per-track --envs 64 \
+    --race-size 2 --opponent teacher --opp-events brake,stop,shift --opp-event-rate 3
+```
+
+It loads no roster, freezes nothing, and **its numbers are not benchmark scores**. It also runs a
+different protocol — auto-resetting envs, where there is no such thing as a trial — so it reports
+rates over the rollout rather than per-trial outcomes, and a `traffic` block from it is not
+comparable with a T table.
 
 ## The roster
 
@@ -384,6 +562,7 @@ their own report; they are separate benchmarks, not two rows of one table.
 | **Surface** | completion ↑, progress mean ↑, completion vs midpoint ↑, progress vs midpoint ↑, large-slip s/km ↓, centreline offset RMS | fraction, fraction, pp, fraction, s/km, metres |
 | **Avoidance** | cleared/pre-validated ↑, encountered, approach failures ↓ | fraction, count, count |
 | **Overtaking** | passes held/race ↑, hold interruptions, contact ↓ | per race, count, count |
+| **Traffic** | clean ↑, passes/race ↑, pace vs opponent ↑, attacking s/race ↑, following s/race, car contact ↓, wall collisions ↓, leads lost ↓, event-in-window trials | fraction, per race, ratio, seconds, seconds, count, count, count, count |
 
 - **Progress** is a *signed* route fraction, so driving backwards does not accumulate credit.
 - **Lap time** is over the system's **own completions only**, and is therefore not comparable across
@@ -404,6 +583,12 @@ their own report; they are separate benchmarks, not two rows of one table.
 - **Overtaking** requires a pass to be *held*, not merely achieved: a pass counts once the candidate
   is clear ahead and stays clear for `hold_seconds`. Clearance comes from the declared vehicle
   footprint rather than a hand-tuned distance.
+- **Traffic** is the v2.1-only family and is a different question from Overtaking, not a bigger
+  version of it — see [Why T is not more O](#why-t-is-not-more-o). Its `clean` rate is the trial
+  outcome and its `passes/race` is a count that may legitimately be 0; **read them together with
+  `pace vs opponent`**, which is what separates a car that came through traffic by racing from one
+  that came through it by hanging back. One T row is printed per scenario, plus a pooled
+  `all scenarios` row, because the four scenarios are four different questions.
 
 ### N/A is not zero
 
@@ -455,8 +640,9 @@ by observation spec and reports the groups separately rather than pooling them.
 
 **Start from the packaged suite, not from `geometry`.** Re-running `geometry` regenerates placements
 from the current defaults (`--s-obs 20.0`), which produces a *different* suite with a different
-freeze hash — scenarios that were never the ones scored. Both suites ship inside the package
-(`suite-v1.example.json`, `suite-v2.example.json`; v2 was frozen with `--s-obs 10`):
+freeze hash — scenarios that were never the ones scored. All three suites ship inside the package (`suite-v1.example.json`, `suite-v2.example.json`,
+`suite-v2.1.example.json`; v2 was frozen with `--s-obs 10`, and v2.1 inherits those placements
+rather than re-deriving them):
 
 ```bash
 python3 -c "
@@ -495,6 +681,7 @@ which is precisely why the suite is copied rather than regenerated.
 ```bash
 python3 -m f1sim.learn.benchmark feasibility --suite suite-v1.json --envs 4 --device cpu
 python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.json --envs 4 --device cpu
+python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.1.json --envs 4 --device cpu
 ```
 
 This drives the scenarios with a scripted expert on synthetic metadata to confirm each one is
