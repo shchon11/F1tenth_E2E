@@ -40,3 +40,17 @@ def test_seed_is_the_layout_and_the_catalog_name_works():
     assert not np.array_equal(a.occupancy, c.occupancy)
     r = maps.load("gen:control:1401+hard3~rev")
     assert r.occupancy.sum() == a.occupancy.sum()
+
+
+def test_small_objects_are_part_of_the_mix():
+    """The user's point: avoiding only big boxes is not avoiding. Over a few seeds, some added
+    obstacle components must be small (under 0.25 m across) and scatter patterns must occur."""
+    t0 = maps.load("real:blackbox2022_1")
+    small = 0; kinds = set()
+    for seed in range(1, 5):
+        t = with_hard_obstacles(t0, seed=seed)
+        kinds |= {k for _, k in t.hard_patterns}
+        lab, n = ndimage.label(t.occupancy & ~t0.occupancy)
+        sizes = ndimage.sum(np.ones_like(lab), lab, index=range(1, n + 1))
+        small += int(np.sum(np.asarray(sizes) <= (0.25 / t.resolution) ** 2))
+    assert "scatter" in kinds and small >= 4, (kinds, small)

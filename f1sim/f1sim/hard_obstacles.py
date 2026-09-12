@@ -11,6 +11,10 @@ single box with a metre of room:
             to thread, not a box it can ignore
   apex      a block on the inside of a corner, where the line wants to be
   cluster   two or three boxes touching, wedged into one side of the lane
+  scatter   one to three SMALL objects (0.10-0.22 m: a cone, a small box) at random places across the
+            lane, mid-lane included -- the user's point that avoiding only big boxes is not avoiding
+
+Apex and cluster boxes are drawn small (0.15-0.25 m) about a third of the time for the same reason.
 
 The open share is what the user's scenes leave (1.5-1.85 m of a 2.25-2.5 m lane; first cut of this
 file left 0.6-0.85 m and the user rightly called it impassable). Every pattern is built with an
@@ -38,7 +42,9 @@ GAP_FRAC = (0.55, 0.75)   # open share of the lane beside a pattern: the hand-bu
                           # 1.50-1.85 m of a 2.25-2.50 m lane (measured, scene_0912_2344/2355)
 GAP_MIN = 1.20            # never less than this, whatever the lane width
 BOX_W, BOX_D = 0.36, 0.30 # cardboard box: across the lane, along it
-PATTERNS = ("gate", "diagonal", "chicane", "apex", "cluster")
+SMALL = (0.10, 0.22)      # cone / small box footprint
+SMALL_SHARE = 0.35        # share of apex and cluster boxes drawn at 0.15-0.25 m
+PATTERNS = ("gate", "diagonal", "chicane", "apex", "cluster", "scatter")
 
 
 def _lane_halves(occ: np.ndarray, res: float, origin, p: np.ndarray, nrm: np.ndarray, limit: float = 4.0):
@@ -169,18 +175,37 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
         elif kind == "apex":
             lo, hi = (wl - span, wl) if side > 0 else (-wr, -wr + span)
             boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi)]
+            if rng.random() < SMALL_SHARE:                           # a small thing at the apex instead
+                sz = float(rng.uniform(0.15, 0.25))
+                v = (wl - sz / 2 - 0.05) if side > 0 else (-wr + sz / 2 + 0.05)
+                boxes = [(0.0, v, sz, sz)]
         elif kind == "cluster":
             k = int(rng.integers(2, 4))
             edge = wl if side > 0 else -wr
             for j in range(k):
                 across = (j % 2) * (BOX_W + 0.02) + BOX_W / 2 + 0.03
                 v = edge - side * across
-                boxes.append(((j // 2) * (BOX_D + 0.03), v, BOX_D, BOX_W))
+                if rng.random() < SMALL_SHARE:
+                    sz = float(rng.uniform(0.15, 0.25)); v = edge - side * (across - BOX_W / 2 + sz / 2)
+                    boxes.append(((j // 2) * (BOX_D + 0.03), v, sz, sz))
+                else:
+                    boxes.append(((j // 2) * (BOX_D + 0.03), v, BOX_D, BOX_W))
             # a cluster must still leave the gap on the other side
             if width - (2 * BOX_W + 0.1) < g:
                 boxes = boxes[:1]
                 if width - (BOX_W + 0.1) < g:
                     continue
+        elif kind == "scatter":
+            k = int(rng.integers(1, 4)); vs = []
+            for _ in range(20):
+                if len(vs) >= k:
+                    break
+                v = float(rng.uniform(-wr + 0.25, wl - 0.25))
+                if all(abs(v - u) >= 0.6 for u, _a in vs):
+                    vs.append((v, float(rng.uniform(0.0, 3.0))))
+            for v, along in vs:
+                sz = float(rng.uniform(*SMALL))
+                boxes.append((along, v, sz, sz))
         if not boxes:
             continue
         occ_try = occ.copy(); tall_try = tall.copy()
