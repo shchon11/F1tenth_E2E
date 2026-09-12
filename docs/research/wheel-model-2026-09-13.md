@@ -171,8 +171,18 @@ turn sampling noise into a result:
 ### 4.3 The guard on the simulated events
 
 Same class, same default thresholds, no retuning: **38 firings, 37 hits, 0 stationary and 1
-cruising firing** over 1028 s. The contract's two forbidden failure modes are (almost) absent — one
-cruising firing in 1028 s against zero in the car's 1088 s.
+cruising firing** over 1028 s, against 46 / 43 / 0 / 0 over the car's 1088 s.
+
+`scripts/wheelslip_compare.py` **exits 1** on this set because of that one firing, and it should:
+the bar is zero. Inspected, it is not the failure mode the bar is about. At
+`sim-racepace-02_mu0.73_straight` t=7.85 the wheel is at 3.79 m/s against a body estimate of 4.31 —
+a real 0.52 m/s of slip on the lowest-grip floor — and the guard's *causal, windowed* wheel
+deceleration reaches −18.5 m/s², just past its 18.0 gate, while the label rule's *non-causal centred
+difference* over the same samples reads −9.9 and stays under its own 12 m/s² trigger. So there is no
+label to match and the replay's taxonomy files it as "cruising". It is two estimators of the same
+quantity disagreeing at the margin, not the guard acting on a gripping wheel, and the command moved
+by +0.76 m/s. The same single firing appears in the randomised set; the `limit` set has six, which
+is what a profile made entirely of limit manoeuvres should be expected to produce.
 
 It catches **5 of the 32** runs the label rule calls must-catch, where on the car it catches 20 of
 22. That gap is real and it is the honest limitation of this model, so here is what it is:
