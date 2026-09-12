@@ -180,7 +180,7 @@ class PolicyInputPanel(QtWidgets.QWidget):
 
     def _draw_car(self, p, cx, cy):
         p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(C["accent"]))
+        p.setBrush(QtGui.QColor(C["ego"]))
         p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(cx, cy - 8), QtCore.QPointF(cx - 6, cy + 7),
                                        QtCore.QPointF(cx + 6, cy + 7)]))
 
@@ -269,6 +269,10 @@ class DashPanel(QtWidgets.QWidget):
         for i in range(3):
             r_, c_ = divmod(i, cols)
             cells.append(QtCore.QRectF(pad + c_ * (cw + pad), pad + r_ * (ch + pad), cw, ch))
+        p.setPen(QtGui.QPen(QtGui.QColor(C["line"]), 1))
+        for i in range(1, cols):
+            x = pad + i * (cw + pad) - pad / 2
+            p.drawLine(QtCore.QPointF(x, pad + 4), QtCore.QPointF(x, h - pad - 4))
         self._speedo(p, cells[0])
         self._wheel(p, cells[1])
         self._gg_plot(p, cells[2])
@@ -303,9 +307,10 @@ class DashPanel(QtWidgets.QWidget):
                    m.elidedText(text, QtCore.Qt.ElideRight, int(rect.width())))
 
     def _speedo(self, p, cell):
+        """Flat ring gauge: a thin track arc, the measured speed swept in the accent colour, the
+        cap zone in red, the commanded speed as a marker inside the ring, the number in the band
+        below. No dial face, no rim, no needle -- an instrument cluster, not a dashboard prop."""
         cap_r, (cx, cy), r, val_r, name_r = self._bands(cell)
-        # Qt angles are degrees x 16, counter-clockwise from 3 o'clock. The dial sweeps clockwise
-        # from 210 deg (bottom-left) to -30 deg (bottom-right), so every span here is negative.
         a0, a1 = 210.0, -30.0
 
         def deg(val):
@@ -315,19 +320,13 @@ class DashPanel(QtWidgets.QWidget):
             return math.radians(deg(val))
 
         rect = QtCore.QRectF(cx - r, cy - r, 2 * r, 2 * r)
-        p.setBrush(QtCore.Qt.NoBrush)          # arcs are strokes; a stale brush would fill them
-
-        # -- dial face: a shallow well, so the ring reads as sitting in something
-        face = QtGui.QRadialGradient(QtCore.QPointF(cx, cy - r * 0.25), r * 1.35)
-        face.setColorAt(0.0, QtGui.QColor(C["bg.dial.hi"]))
-        face.setColorAt(1.0, QtGui.QColor(C["bg.dial.lo"]))
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(face)
-        p.drawEllipse(QtCore.QPointF(cx, cy), r + 5, r + 5)
-
-        # -- graduations. The dial is worth reading off, so it gets numbers, not just a sweep.
-        step = 1.0 if self.v_max <= 12 else 2.0
-        label_every = 2.0 if self.v_max <= 12 else 4.0
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.setPen(QtGui.QPen(QtGui.QColor(C["line.strong"]), 5, QtCore.Qt.SolidLine, QtCore.Qt.FlatCap))
+        p.drawArc(rect, int(a0 * 16), int((a1 - a0) * 16))
+        if self._have and self.v_cap < self.v_max:   # beyond the cap in force
+            p.setPen(QtGui.QPen(QtGui.QColor(C["danger"]), 5, QtCore.Qt.SolidLine, QtCore.Qt.FlatCap))
+            p.drawArc(rect, int(deg(self.v_cap) * 16), int((a1 - deg(self.v_cap)) * 16))
+        step = 2.0 if self.v_max <= 12 else 4.0
         fm_font = QtGui.QFont(theme.MONO_FONT)
         fm_font.setPointSizeF(6.0)
         p.setFont(fm_font)
@@ -336,180 +335,83 @@ class DashPanel(QtWidgets.QWidget):
         while v_t <= self.v_max + 1e-6:
             t = ang(v_t)
             ct, st = math.cos(t), math.sin(t)
-            major = abs(v_t / label_every - round(v_t / label_every)) < 1e-6
-            r_in = r - (11 if major else 8)
-            # No session, no cap: the caption reads "상한 —", so the dial must not colour a
-            # limit it does not have.
-            over = self._have and v_t > self.v_cap + 1e-6
-            col = QtGui.QColor(C["danger"] if over else C["line.strong"])
-            p.setPen(QtGui.QPen(col, 1.6 if major else 1.0))
-            p.drawLine(QtCore.QPointF(cx + r_in * ct, cy - r_in * st),
-                       QtCore.QPointF(cx + (r - 4.5) * ct, cy - (r - 4.5) * st))
-            if major and r >= 34:
-                s = f"{v_t:g}"
-                lr = r - 20
+            p.setPen(QtGui.QPen(QtGui.QColor(C["line.strong"]), 1.0))
+            p.drawLine(QtCore.QPointF(cx + (r + 4) * ct, cy - (r + 4) * st),
+                       QtCore.QPointF(cx + (r + 8) * ct, cy - (r + 8) * st))
+            if r >= 34:
+                lr = r + 15
                 p.setPen(QtGui.QColor(C["text.2"]))
-                p.drawText(QtCore.QRectF(cx + lr * ct - 11, cy - lr * st - fm.height() / 2,
-                                         22, fm.height()),
-                           QtCore.Qt.AlignCenter, s)
+                p.drawText(QtCore.QRectF(cx + lr * ct - 11, cy - lr * st - fm.height() / 2, 22, fm.height()),
+                           QtCore.Qt.AlignCenter, f"{v_t:g}")
             v_t += step
-
-        p.setBrush(QtCore.Qt.NoBrush)
-        p.setPen(QtGui.QPen(QtGui.QColor(C["line.strong"]), 6, QtCore.Qt.SolidLine, QtCore.Qt.FlatCap))
-        p.drawArc(rect, int(a0 * 16), int((a1 - a0) * 16))
-        if self._have and self.v_cap < self.v_max:   # beyond the cap in force, in red
-            p.setPen(QtGui.QPen(QtGui.QColor(C["danger"]), 6, QtCore.Qt.SolidLine, QtCore.Qt.FlatCap))
-            p.drawArc(rect, int(deg(self.v_cap) * 16), int((a1 - deg(self.v_cap)) * 16))
         if self._have:
-            # the swept arc, brightening towards the current reading
             g = QtGui.QConicalGradient(QtCore.QPointF(cx, cy), a0)
             span = abs(a1 - a0)
             frac = max(1e-3, abs(deg(self.v) - a0) / span)
             g.setColorAt(0.0, QtGui.QColor(C["accent.deep"]))
             g.setColorAt(max(0.0, min(1.0, frac * 0.999)), QtGui.QColor(C["accent"]))
-            pen = QtGui.QPen(QtGui.QBrush(g), 6)
+            pen = QtGui.QPen(QtGui.QBrush(g), 5)
             pen.setCapStyle(QtCore.Qt.FlatCap)
             p.setPen(pen)
             p.drawArc(rect, int(a0 * 16), int((deg(self.v) - a0) * 16))
-
-            t = ang(self.v_cmd)                # commanded speed: a marker outside the ring
+            t = ang(self.v_cmd)                # commanded speed: a marker just inside the ring
             ct, st = math.cos(t), math.sin(t)
             tri = QtGui.QPolygonF([
-                QtCore.QPointF(cx + (r + 2) * ct, cy - (r + 2) * st),
-                QtCore.QPointF(cx + (r + 9) * ct - 3.4 * st, cy - (r + 9) * st - 3.4 * ct),
-                QtCore.QPointF(cx + (r + 9) * ct + 3.4 * st, cy - (r + 9) * st + 3.4 * ct)])
+                QtCore.QPointF(cx + (r - 4) * ct, cy - (r - 4) * st),
+                QtCore.QPointF(cx + (r - 11) * ct - 3.2 * st, cy - (r - 11) * st - 3.2 * ct),
+                QtCore.QPointF(cx + (r - 11) * ct + 3.2 * st, cy - (r - 11) * st + 3.2 * ct)])
             p.setPen(QtCore.Qt.NoPen)
             p.setBrush(QtGui.QColor(C["rival"]))
             p.drawPolygon(tri)
-
-            t = ang(self.v)                    # measured speed: a tapered needle with a tail
-            ct, st = math.cos(t), math.sin(t)
-            tip, tail, half = r - 9, 9.0, 2.6
-            needle = QtGui.QPolygonF([
-                QtCore.QPointF(cx + tip * ct, cy - tip * st),
-                QtCore.QPointF(cx - tail * ct - half * st, cy + tail * st - half * ct),
-                QtCore.QPointF(cx - tail * ct + half * st, cy + tail * st + half * ct)])
-            p.setBrush(QtGui.QColor(0, 0, 0, 90))
-            p.drawPolygon(needle.translated(1.0, 1.5))
-            p.setBrush(QtGui.QColor(C["needle"]))
-            p.drawPolygon(needle)
-
-        # hub: a ring around a filled centre, so the needle looks pinned rather than glued
-        p.setPen(QtGui.QPen(QtGui.QColor(C["line.strong"]), 1.5))
-        p.setBrush(QtGui.QColor(C["bg.dial.lo"]))
-        p.drawEllipse(QtCore.QPointF(cx, cy), 5.2, 5.2)
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(C["text.0"] if self._have else C["text.2"]))
-        p.drawEllipse(QtCore.QPointF(cx, cy), 2.4, 2.4)
+        # the reading sits inside the ring, its unit under it
+        self._line(p, QtCore.QRectF(cx - r, cy - r * 0.46, 2 * r, r * 0.62),
+                   f"{self.v:4.2f}" if self._have else "—",
+                   C["text.0"] if self._have else C["text.2"], size=max(9.0, r * 0.30), mono=True, bold=True)
+        self._line(p, QtCore.QRectF(cx - r, cy + r * 0.14, 2 * r, r * 0.34), "m/s", C["text.2"], size=6.5)
         self._line(p, cap_r,
                    f"명령 {self.v_cmd:.1f} · 상한 {self.v_cap:.1f}" if self._have else "명령 — · 상한 —",
                    C["rival"])
-        self._line(p, val_r, f"{self.v:4.2f}" if self._have else "—",
-                   C["text.0"] if self._have else C["text.2"], size=12.5, mono=True, bold=True)
-        self._line(p, name_r, "속도 m/s", C["text.2"])
+        self._line(p, val_r, "", C["text.2"])
+        self._line(p, name_r, "속도", C["text.2"])
 
     def _wheel(self, p, cell):
+        """Steering as a centred bar: fill from the centre to the measured angle, a marker for the
+        commanded angle. Left steer fills to the left. The drawn wheel it replaces looked like a
+        wheel and read like nothing -- a bar reads in a glance from across the room."""
         cap_r, (cx, cy), r, val_r, name_r = self._bands(cell)
-        r *= 0.88
         live = self._have
-
-        # -- fixed reference behind the wheel: the arc the rim turns through, and centre
-        p.setBrush(QtCore.Qt.NoBrush)
-        p.setPen(QtGui.QPen(QtGui.QColor(C["line"]), 1))
-        arc_r = r + 7
-        p.drawArc(QtCore.QRectF(cx - arc_r, cy - arc_r, 2 * arc_r, 2 * arc_r), int(40 * 16), int(100 * 16))
-        p.setPen(QtGui.QPen(QtGui.QColor(C["line.strong"]), 1.4))
-        p.drawLine(QtCore.QPointF(cx, cy - arc_r - 3), QtCore.QPointF(cx, cy - arc_r + 3))
-        if live:                                           # travelled angle, centre to now
-            sweep = -math.degrees(self.steer) * 3.0
-            p.setPen(QtGui.QPen(QtGui.QColor(C["accent"]), 2.5, QtCore.Qt.SolidLine, QtCore.Qt.FlatCap))
-            p.drawArc(QtCore.QRectF(cx - arc_r, cy - arc_r, 2 * arc_r, 2 * arc_r),
-                      int(90 * 16), int(sweep * 16))
-
-        p.save()
-        p.translate(cx, cy)
-        p.rotate(-math.degrees(self.steer) * 3.0)          # x3 so a 5-degree input is visible
-
-        # -- rim: a flat-bottom wheel drawn as a filled ring, not a stroked circle
-        rim_w = max(3.5, r * 0.17)
-        outer = QtGui.QPainterPath()
-        outer.addEllipse(QtCore.QPointF(0, 0), r, r)
-        inner = QtGui.QPainterPath()
-        inner.addEllipse(QtCore.QPointF(0, 0), r - rim_w, r - rim_w)
-        ring = outer.subtracted(inner)
-        # A shallow flat bottom, F1 style. Shallow on purpose: cut deep and the rim stops reading
-        # as a wheel and starts reading as a broken ring, which is worse than no flat at all.
-        flat = QtGui.QPainterPath()
-        flat.addRect(QtCore.QRectF(-r - 2, r * 0.86, 2 * r + 4, r))
-        ring = ring.subtracted(flat)
-        grad = QtGui.QLinearGradient(0, -r, 0, r)
-        grad.setColorAt(0.0, QtGui.QColor(C["rim.hi"] if live else C["text.2"]))
-        grad.setColorAt(1.0, QtGui.QColor(C["rim.lo"] if live else C["line.strong"]))
+        max_deg = 25.0
+        bw, bh = min(cell.width() * 0.74, 2 * r * 1.7), max(7.0, r * 0.17)
+        x0, y0 = cx - bw / 2, cy - bh / 2
         p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(grad)
-        p.drawPath(ring)
-        p.setPen(QtGui.QPen(QtGui.QColor(C["rim.edge"]), 1))
-        p.setBrush(QtCore.Qt.NoBrush)
-        p.drawPath(ring)
+        p.setBrush(QtGui.QColor(C["line.strong"]))
+        p.drawRoundedRect(QtCore.QRectF(x0, y0, bw, bh), bh / 2, bh / 2)
+        p.setPen(QtGui.QPen(QtGui.QColor(C["text.2"]), 1.2))
+        p.drawLine(QtCore.QPointF(cx, y0 - 6), QtCore.QPointF(cx, y0 + bh + 6))
+        f = QtGui.QFont(theme.MONO_FONT)
+        f.setPointSizeF(6.0)
+        p.setFont(f)
+        p.setPen(QtGui.QColor(C["text.2"]))
+        p.drawText(QtCore.QRectF(x0 - 4, y0 + bh + 8, 48, 12), QtCore.Qt.AlignLeft, f"L {max_deg:.0f}°")
+        p.drawText(QtCore.QRectF(x0 + bw - 44, y0 + bh + 8, 48, 12), QtCore.Qt.AlignRight, f"R {max_deg:.0f}°")
+        if live:
+            def px(rad):
+                return cx - (bw / 2) * max(-1.0, min(1.0, math.degrees(rad) / max_deg))
 
-        # -- grips: the thickened sections a driver's hands sit on, at 10 and 2 o'clock. Clipped to
-        # the rim band so they read as part of it rather than as blobs stuck on top.
-        band = outer.subtracted(inner)
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(C["rim.grip"] if live else C["line.strong"]))
-        for a_ in (150.0, 30.0):
-            t = math.radians(a_)
-            g = QtGui.QPainterPath()
-            g.addEllipse(QtCore.QPointF((r - rim_w * 0.5) * math.cos(t),
-                                        -(r - rim_w * 0.5) * math.sin(t)),
-                         r * 0.30, r * 0.30)
-            p.drawPath(g.intersected(band))
-
-        # -- spokes: tapered, so they read as structure rather than three lines from a point. The
-        # lower spoke stops at the flat, which is where the rim it would meet has been cut away.
-        p.setBrush(QtGui.QColor(C["spoke"] if live else C["text.2"]))
-        for a_, wid, reach in ((180.0, 0.15, 1.0), (0.0, 0.15, 1.0), (270.0, 0.12, 0.86)):
-            t = math.radians(a_)
-            ct, st = math.cos(t), math.sin(t)
-            hw = max(2.0, r * wid)
-            end = (r - rim_w * 0.4) * reach
-            sp = QtGui.QPolygonF([
-                QtCore.QPointF(-hw * 0.55 * st, -hw * 0.55 * ct),
-                QtCore.QPointF(hw * 0.55 * st, hw * 0.55 * ct),
-                QtCore.QPointF(end * ct + hw * 0.32 * st, -end * st + hw * 0.32 * ct),
-                QtCore.QPointF(end * ct - hw * 0.32 * st, -end * st - hw * 0.32 * ct)])
-            p.drawPolygon(sp)
-
-        # -- hub
-        p.setBrush(QtGui.QColor(C["bg.dial.lo"]))
-        p.setPen(QtGui.QPen(QtGui.QColor(C["rim.edge"]), 1))
-        p.drawEllipse(QtCore.QPointF(0, 0), r * 0.26, r * 0.26)
-
-        # -- top-centre marker: which way the wheel is actually pointing
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(C["accent"] if live else C["text.2"]))
-        mk = QtGui.QPainterPath()
-        mk.moveTo(0, -r + rim_w * 0.15)
-        mk.lineTo(-rim_w * 0.42, -r + rim_w * 0.95)
-        mk.lineTo(rim_w * 0.42, -r + rim_w * 0.95)
-        mk.closeSubpath()
-        p.drawPath(mk)
-        p.restore()
-
-        if live:                                           # ghost tick: the commanded angle
-            t = math.radians(90 + math.degrees(self.steer_cmd) * 3.0)
-            ct, st = math.cos(t), math.sin(t)
+            xm = px(self.steer)
             p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor(C["accent"]))
+            lft, rgt = min(cx, xm), max(cx, xm)
+            p.drawRoundedRect(QtCore.QRectF(lft, y0, max(2.0, rgt - lft), bh), bh / 2, bh / 2)
+            xc = px(self.steer_cmd)
             p.setBrush(QtGui.QColor(C["rival"]))
-            p.drawPolygon(QtGui.QPolygonF([
-                QtCore.QPointF(cx + (r + 4) * ct, cy - (r + 4) * st),
-                QtCore.QPointF(cx + (r + 11) * ct - 3.0 * st, cy - (r + 11) * st - 3.0 * ct),
-                QtCore.QPointF(cx + (r + 11) * ct + 3.0 * st, cy - (r + 11) * st + 3.0 * ct)]))
+            p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(xc, y0 - 3), QtCore.QPointF(xc - 4, y0 - 10),
+                                           QtCore.QPointF(xc + 4, y0 - 10)]))
         self._line(p, cap_r,
-                   f"명령 {math.degrees(self.steer_cmd):+.1f}°" if self._have else "명령 —", C["rival"])
-        self._line(p, val_r, f"{math.degrees(self.steer):+5.1f}°" if self._have else "—",
-                   C["text.0"] if self._have else C["text.2"], size=12.5, mono=True, bold=True)
-        self._line(p, name_r, "조향 (휠 x3 과장)", C["text.2"])
+                   f"명령 {math.degrees(self.steer_cmd):+.1f}°" if live else "명령 —", C["rival"])
+        self._line(p, val_r, f"{math.degrees(self.steer):+5.1f}°" if live else "—",
+                   C["text.0"] if live else C["text.2"], size=12.5, mono=True, bold=True)
+        self._line(p, name_r, "조향", C["text.2"])
 
     def _gg_plot(self, p, cell):
         cap_r, (cx, cy), r, val_r, name_r = self._bands(cell)
@@ -532,7 +434,7 @@ class DashPanel(QtWidgets.QWidget):
                 p.setBrush(QtGui.QColor("#ffffff"))
                 p.drawEllipse(QtCore.QPointF(x, y), 2.8, 2.8)
             else:
-                p.setBrush(QtGui.QColor(110, 190, 255, int(30 + 150 * (k / max(1, n - 1)))))
+                p.setBrush(QtGui.QColor(90, 169, 255, int(30 + 150 * (k / max(1, n - 1)))))
                 p.drawEllipse(QtCore.QPointF(x, y), 1.5, 1.5)
         cur = self._gg[-1] if self._gg else (0.0, 0.0)
         g_now = float(np.hypot(*cur)) / 9.81

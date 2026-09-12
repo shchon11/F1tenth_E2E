@@ -125,10 +125,13 @@ def test_hello_reports_this_process(worker):
 
 
 def test_map_catalog_uses_the_group_names_the_console_expects(worker):
-    from f1sim.viewer.console.catalog import GROUP_ORDER
+    from f1sim.viewer.console.catalog import GROUP_ORDER, SCENES_GROUP
     groups = worker.wait_for(P.MSG_MAPS, seq=worker.send(P.CMD_LIST_MAPS))
     assert not groups.get("error")
-    assert list(groups["groups"]) == list(GROUP_ORDER)
+    # The editor's own group (`scene:<name>`) is first in GROUP_ORDER but only sent when the user
+    # has saved at least one scene; every other group is always there, in the console's order.
+    assert list(groups["groups"]) == [g for g in GROUP_ORDER if g in groups["groups"]]
+    assert set(GROUP_ORDER) - {SCENES_GROUP} <= set(groups["groups"])
     assert all(len(v) > 0 for v in groups["groups"].values())
 
 

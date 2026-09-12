@@ -40,6 +40,7 @@ widths -- never for anything that changes the envelope. Same spec and seed, byte
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -641,14 +642,26 @@ def cross_section(prop: "Prop", z: float) -> np.ndarray:
     return np.concatenate(pts) if pts else np.zeros((0, 2))
 
 
-def sections(prop: "Prop", n_bands: int = 8, samples_per_band: int = 12) -> List[dict]:
+def sections(prop: "Prop", n_bands: int = 8, samples_per_band: int = 12,
+             max_verts: Optional[int] = None) -> List[dict]:
     """Piecewise convex sections: a tighter physical bound than the single prism.
 
     Each band is the convex hull of the prop's cross-sections sampled across that band, so it
     contains the surface everywhere in the band while hugging a taper far more closely than the
     full-height prism does. Offered for the case where core wants accurate tracing; the single
     prism stays available for the cheap case.
+
+    `max_verts` caps a band polygon's vertex count: a hull with more vertices is replaced by its
+    `support_polygon`, which still contains it. `None` reads the cap off `prop.spec
+    ["max_section_verts"]`, which only `mesh_asset` sets -- an imported mesh's cross-section can
+    hull to hundreds of vertices and every one of them widens the LiDAR's padded slot for every
+    prop on the track. The six built-ins never set it and their output is byte-identical to what
+    it was before the cap existed (a test pins that). They are *not* all under 24: a steel drum's
+    ribbed bands hull to 32 or 60, and quietly re-cutting the drum for an editor feature is not
+    something this function should do on its own.
     """
+    if max_verts is None:
+        max_verts = prop.spec.get("max_section_verts") if prop.spec else None
     h = prop.envelope.height
     edges = np.linspace(0.0, h, n_bands + 1)
     out = []
@@ -660,9 +673,54 @@ def sections(prop: "Prop", n_bands: int = 8, samples_per_band: int = 12) -> List
         if not pts:
             continue
         hull = _hull2d(np.concatenate(pts))
+        if max_verts is not None and len(hull) > int(max_verts):
+            hull = support_polygon(hull, int(max_verts))
         if len(hull) >= 3:
             out.append({"z0": z0, "z1": z1, "polygon": _ensure_ccw(hull)})
     return out
+
+
+def _clip_halfplane(poly: np.ndarray, n: np.ndarray, d: float, eps: float = 1e-12) -> np.ndarray:
+    """Sutherland-Hodgman: keep the part of convex CCW `poly` where `n . p <= d`."""
+    out = []
+    k = len(poly)
+    for i in range(k):
+        a, b = poly[i], poly[(i + 1) % k]
+        fa, fb = float(n @ a) - d, float(n @ b) - d
+        if fa <= eps:
+            out.append(a)
+        if (fa <= eps) != (fb <= eps):
+            t = fa / (fa - fb)
+            out.append(a + t * (b - a))
+    return np.asarray(out, float).reshape(-1, 2)
+
+
+def support_polygon(hull: np.ndarray, k: int = MAX_FOOTPRINT_VERTS) -> np.ndarray:
+    """The k-direction support polygon of a convex set: the intersection of `k` half-planes, one
+    tangent to the hull per equally spaced outward direction.
+
+    It contains the hull (each half-plane does), has at most `k` vertices, and over-approximates a
+    smooth outline by no more than `r (1/cos(pi/k) - 1)` -- 1.2 mm on a 0.145 m drum at k = 24 --
+    which is what lets an arbitrary imported outline meet the footprint budget without ever
+    under-approximating it. CCW, numpy only.
+    """
+    hull = np.asarray(hull, float).reshape(-1, 2)
+    k = max(3, int(k))
+    ang = np.arange(k) * (2.0 * math.pi / k)
+    normals = np.stack([np.cos(ang), np.sin(ang)], 1)
+    d = (hull @ normals.T).max(0)
+    r = float(np.abs(hull).max()) * 4.0 + 1.0
+    poly = np.array([[-r, -r], [r, -r], [r, r], [-r, r]], float)
+    for j in range(k):
+        poly = _clip_halfplane(poly, normals[j], float(d[j]))
+        if len(poly) < 3:
+            break
+    if len(poly) >= 2:
+        keep = np.linalg.norm(poly - np.roll(poly, 1, 0), axis=1) > 1e-9
+        poly = poly[keep]
+    if len(poly) < 3:
+        return hull
+    return _ensure_ccw(poly)
 
 
 # ==================================================================== registry
@@ -677,7 +735,9 @@ REGISTRY: Dict[str, Callable[..., Prop]] = {
     "marker_post": marker_post,
 }
 
-#: The style names, in a stable order.
+#: The style names of the *procedural* props, in a stable order. `mesh` (an imported asset) is
+#: deliberately not in here: everything that iterates STYLES -- `build_all`, `Track.with_static_props`
+#: picking a random style -- needs a prop that builds from a seed alone, and a mesh needs a file.
 STYLES: Tuple[str, ...] = tuple(REGISTRY)
 
 #: Which dimension keywords each style accepts. `height` is universal; rectangular plans take
@@ -689,7 +749,12 @@ DIMS: Dict[str, Tuple[str, ...]] = {
     "crate_stack_low": ("width", "depth", "height"),
     "barrier_block": ("width", "depth", "height", "taper"),
     "marker_post": ("radius", "height"),
+    "mesh": ("path", "scale", "up"),
 }
+
+#: Dimension keys whose values are strings rather than positive numbers. Everything else `build`
+#: receives must still be finite and positive.
+STRING_DIMS = {"path", "up"}
 
 #: Older name for `REGISTRY`, kept so existing scripts here keep working. Same object.
 PRESETS = REGISTRY
@@ -702,13 +767,19 @@ def build(style: str, seed: int = 0, **dims) -> Prop:
     in map metadata put a different object on the track and never say so, which is the one failure
     mode that survives all the way to a rendered frame looking plausible.
     """
-    if style not in REGISTRY:
-        raise ValueError(f"unknown prop style {style!r}; known: {', '.join(STYLES)}")
+    if style not in REGISTRY and style != "mesh":
+        raise ValueError(f"unknown prop style {style!r}; known: {', '.join(STYLES)}, mesh")
     allowed = DIMS[style]
     unknown = sorted(set(dims) - set(allowed))
     if unknown:
         raise TypeError(f"{style} does not take {', '.join(unknown)}; it takes {', '.join(allowed)}")
     for key, value in dims.items():
+        if key in STRING_DIMS:
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{style}: {key} must be a non-empty string, got {value!r}")
+            if key == "up" and value not in ("y", "z"):
+                raise ValueError(f"{style}: up must be 'y' or 'z', got {value!r}")
+            continue
         if key == "facets":
             if int(value) != value or int(value) < 6:
                 raise ValueError(f"{style}: facets must be an integer >= 6, got {value!r}")
@@ -716,6 +787,8 @@ def build(style: str, seed: int = 0, **dims) -> Prop:
         v = float(value)
         if not math.isfinite(v) or v <= 0.0:
             raise ValueError(f"{style}: {key} must be finite and positive, got {value!r}")
+    if style == "mesh":
+        return mesh_asset(seed=int(seed), **dims)
     return REGISTRY[style](seed=int(seed), **dims)
 
 
@@ -741,3 +814,147 @@ def prop_stats(prop: Prop) -> dict:
                              for p in prop.parts)),
         "spec": prop.spec,
     }
+
+
+# ==================================================================== imported meshes
+#: Triangle budget for an imported asset. Above it the mesh is decimated (`fast_simplification`)
+#: before it becomes a prop: the static batch is uploaded once, but `cross_section` walks every
+#: triangle per sampled height and a 400k-triangle scan would make `sections()` take seconds.
+MAX_MESH_TRIS = 20000
+#: Colour of an asset that carries none of its own.
+MESH_GREY = (0.62, 0.63, 0.66)
+#: Loaded assets by `(abspath, mtime, scale, up)`: every placement of the same file shares a build.
+_MESH_CACHE: Dict[tuple, Prop] = {}
+
+
+def _mesh_material(path: str) -> str:
+    stem = os.path.basename(path).lower()
+    if any(w in stem for w in ("metal", "steel", "drum")):
+        return "metal"
+    if any(w in stem for w in ("rubber", "tire", "tyre")):
+        return "rubber"
+    return "plastic"
+
+
+def _mesh_colours(mesh, n_verts: int, n_faces: int):
+    """Per-vertex or per-face RGBA in [0, 1] from a trimesh visual, or (None, None)."""
+    try:
+        if not getattr(mesh.visual, "defined", False):
+            return None, None
+        kind = mesh.visual.kind
+        if kind == "texture":
+            vc = np.asarray(mesh.visual.to_color().vertex_colors, float)
+            kind = "vertex"
+        elif kind == "vertex":
+            vc = np.asarray(mesh.visual.vertex_colors, float)
+        elif kind == "face":
+            fc = np.asarray(mesh.visual.face_colors, float)
+            if fc.shape == (n_faces, 4):
+                return None, fc / 255.0
+            return None, None
+        else:
+            return None, None
+        if vc.shape == (n_verts, 4):
+            return vc / 255.0, None
+    except Exception:
+        pass
+    return None, None
+
+
+def mesh_asset(path: str, scale: float = 1.0, up: str = "z", seed: int = 0) -> Prop:
+    """An imported mesh (GLB / glTF / OBJ / STL / PLY) as a prop.
+
+    Loaded with `trimesh.load(path, force="mesh")`; `up="y"` rotates the file's +Y to the prop's
+    +Z; `scale` is applied after that. The result is translated so the XY centroid of its footprint
+    hull sits at the origin and `min z = 0`, the convention every other prop follows. Over
+    `MAX_MESH_TRIS` triangles the mesh is decimated first. Vertex (or face) colours are kept when
+    the file has them, otherwise `MESH_GREY`; shading is flat, one vertex triple per face.
+
+    The envelope is the convex hull of every XY vertex -- height `max z`, `bevel_tolerance` 0 --
+    reduced to the `support_polygon` when it has more than `MAX_FOOTPRINT_VERTS` vertices, so it
+    stays an over-approximation. `spec["max_section_verts"]` makes `sections()` apply the same
+    cap to each band. Builds are cached by `(path, mtime, scale, up)`.
+
+    A missing file raises `FileNotFoundError` naming the path.
+    """
+    path = os.fspath(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"mesh asset not found: {path}")
+    scale = float(scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"mesh: scale must be finite and positive, got {scale!r}")
+    if up not in ("y", "z"):
+        raise ValueError(f"mesh: up must be 'y' or 'z', got {up!r}")
+    key = (os.path.abspath(path), os.path.getmtime(path), scale, up)
+    cached = _MESH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    import trimesh
+    mesh = trimesh.load(path, force="mesh")
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+        raise ValueError(f"mesh asset has no triangles: {path}")
+    V = np.asarray(mesh.vertices, np.float64).copy()
+    F = np.asarray(mesh.faces, np.int64).copy()
+    vcol, fcol = _mesh_colours(mesh, len(V), len(F))
+    if up == "y":                                    # +Y up -> +Z up: (x, y, z) -> (x, -z, y)
+        V = np.stack([V[:, 0], -V[:, 2], V[:, 1]], 1)
+    V *= scale
+
+    n_source = int(len(F))
+    if len(F) > MAX_MESH_TRIS:
+        import fast_simplification
+        V0, F0 = V, F
+        V2, F2 = fast_simplification.simplify(V0.astype(np.float64), F0.astype(np.int64),
+                                              target_reduction=1.0 - MAX_MESH_TRIS / len(F0))
+        V, F = np.asarray(V2, np.float64), np.asarray(F2, np.int64)
+        if vcol is not None or fcol is not None:
+            from scipy.spatial import cKDTree
+            if vcol is not None:
+                vcol = vcol[cKDTree(V0).query(V)[1]]
+            else:
+                c0 = V0[F0].mean(1)
+                fcol = fcol[cKDTree(c0).query(V[F].mean(1))[1]]
+
+    hull = _hull2d(V[:, :2])
+    if len(hull) < 3:
+        raise ValueError(f"mesh asset is degenerate in XY (no footprint): {path}")
+    centre = _centroid(_ensure_ccw(hull))
+    V[:, :2] -= centre
+    V[:, 2] -= V[:, 2].min()
+    hull = _ensure_ccw(hull - centre)
+    if len(hull) > MAX_FOOTPRINT_VERTS:
+        hull = support_polygon(hull, MAX_FOOTPRINT_VERTS)
+    height = float(V[:, 2].max())
+    if height <= 0.0:
+        raise ValueError(f"mesh asset has no height: {path}")
+
+    tri = V[F]                                       # (M,3,3)
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    ln = np.linalg.norm(n, axis=1)
+    ok = ln > 1e-12
+    tri, n, ln = tri[ok], n[ok], ln[ok]
+    F_ok = F[ok]
+    if len(tri) == 0:
+        raise ValueError(f"mesh asset has only degenerate triangles: {path}")
+    nrm = np.repeat(n / ln[:, None], 3, axis=0)
+    pos = tri.reshape(-1, 3)
+    if vcol is not None:
+        col = vcol[F_ok].reshape(-1, 4)
+    elif fcol is not None:
+        col = np.repeat(fcol[ok], 3, axis=0)
+    else:
+        col = np.tile(np.array([*MESH_GREY, 1.0]), (len(pos), 1))
+    col = np.clip(col, 0.0, 1.0)
+    col[:, 3] = 1.0                                  # alpha is the stripe parameter, never opacity
+    part = MeshPart(name="mesh", material=_mesh_material(path),
+                    pos=pos.astype(F32), nrm=nrm.astype(F32), col=col.astype(F32),
+                    idx=np.arange(len(pos), dtype=I32))
+    env = Envelope(hull, height, 0.0)
+    spec = _spec(env, seed, scale=scale, tris=len(tri), source_tris=n_source)
+    spec["max_section_verts"] = MAX_FOOTPRINT_VERTS
+    spec["path"] = os.path.abspath(path)
+    spec["up"] = up
+    prop = Prop("mesh", (part,), env, spec)
+    _MESH_CACHE[key] = prop
+    return prop

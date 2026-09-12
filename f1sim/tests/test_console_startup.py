@@ -170,9 +170,13 @@ def test_worker_and_console_agree_on_the_group_names():
     from f1sim.viewer.console.catalog import GROUP_ORDER
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "f1sim", "viewer", "sim_worker.py")).read()
-    block = src[src.index('        return {\n            "기본 평가셋"'):]
+    block = src[src.index('        groups.update({\n            "기본 평가셋"'):]
     worker = re.findall(r'"([^"]+)": uniq\(', block[:1200])
-    assert worker == GROUP_ORDER, f"worker {worker} vs console {GROUP_ORDER}"
+    # The editor's scene group is sent first, and only when the scenes folder holds something
+    # (`groups[SCENES_GROUP] = scenes` above the literal); the fixed groups must match in order.
+    from f1sim.viewer.console.catalog import SCENES_GROUP
+    assert 'groups[SCENES_GROUP] = scenes' in src and GROUP_ORDER[0] == SCENES_GROUP
+    assert worker == GROUP_ORDER[1:], f"worker {worker} vs console {GROUP_ORDER[1:]}"
 
 
 def test_props_names_use_the_loader_s_suffix_order():

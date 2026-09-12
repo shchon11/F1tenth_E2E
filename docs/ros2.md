@@ -113,3 +113,13 @@ ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:2 \
 its observation with the same [`learn/obs.py`](../f1sim/f1sim/learn/obs.py) used in training. Because
 it consumes only topics the real car also publishes, the node runs unchanged against real hardware —
 though nothing in this repository has been tested on a physical vehicle.
+
+## Plan controller on the car
+
+`policy_node` installs a grip-aware limit on the plan tracker by default (`controller:=fixed_low`):
+corner speed and the acceleration/brake budgets are bounded for a constant conservative friction
+(0.73423, the low end of the training range; override with `grip_mu`). It needs no estimator and reads
+no sensor, and on suite v1 (2026-09-12) it was the safest arm on every stability column for the same
+policy at a ~2 % lap-time cost. `controller:=legacy` is the untouched tracker. The `estimated` and
+`reactive` arms are simulator research arms and are refused here. The startup log line names the arm
+and the friction in force. Unit tests: `f1sim/tests/test_policy_node_grip.py`.

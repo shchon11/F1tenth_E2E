@@ -45,7 +45,32 @@ def rot_z(a):
 def _u(M):
     return np.ascontiguousarray(M.T.astype(np.float32)).tobytes()
 
+# ---------------------------------------------------------------- palette
+# One background system: the clear colour is the ground haze, the fog fades to the horizon tone, and
+# the sky above is a directional gradient from that horizon to a darker zenith. Nothing in the frame
+# ends in a hard edge against black, which is what made the previous viewport read as a void.
+CLEAR_RGB = (0.071, 0.075, 0.086)
+HORIZON_RGB = (0.165, 0.180, 0.205)
+ZENITH_RGB = (0.040, 0.046, 0.060)
+
 # ---------------------------------------------------------------- shaders
+SKY_VS = """
+#version 330
+in vec2 in_uv; out vec2 v_ndc;
+void main() { v_ndc = in_uv * 2.0 - 1.0; gl_Position = vec4(v_ndc, 0.9999, 1.0); }
+"""
+SKY_FS = """
+#version 330
+uniform mat4 u_inv_vp; uniform vec3 u_eye; uniform vec3 u_zenith; uniform vec3 u_horizon; uniform vec3 u_ground;
+in vec2 v_ndc; out vec4 f_col;
+void main() {
+    vec4 p = u_inv_vp * vec4(v_ndc, 1.0, 1.0);
+    vec3 dir = normalize(p.xyz / p.w - u_eye);
+    vec3 c = dir.z >= 0.0 ? mix(u_horizon, u_zenith, smoothstep(0.0, 0.42, dir.z))
+                          : mix(u_horizon, u_ground, smoothstep(0.0, 0.22, -dir.z));
+    f_col = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
+}
+"""
 SCENE_VS = """
 #version 330
 in vec3 in_pos; in vec3 in_nrm; in vec4 in_col;
@@ -64,7 +89,7 @@ SCENE_FS = """
 #version 330
 uniform vec3 u_eye; uniform vec3 u_light_dir; uniform sampler2DShadow u_shadow;
 uniform float u_shininess; uniform float u_spec; uniform float u_stripes; uniform float u_shadow_on; uniform float u_grid;
-uniform float u_fog0; uniform float u_fog1;
+uniform float u_fog0; uniform float u_fog1; uniform vec3 u_fog_col;
 uniform float u_texel; uniform float u_alpha;
 in vec3 v_wpos; in vec3 v_nrm; in vec4 v_col; in vec4 v_lpos; in vec3 v_tint;
 out vec4 f_col;
@@ -87,8 +112,8 @@ void main() {
         // which is the mean of the stripe over a period -- so a pixel too small to resolve the
         // banding gets exactly the average it should have had, rather than a stripe of its own.
         float sw = fwidth(v_col.a);
-        float amp = 0.26 * (1.0 - smoothstep(0.25 * 0.024, 0.9 * 0.024, sw));
-        base *= 0.74 + amp * sin(v_col.a * 6.2831853 / 0.024);
+        float amp = 0.11 * (1.0 - smoothstep(0.25 * 0.024, 0.9 * 0.024, sw));
+        base *= 0.89 + amp * sin(v_col.a * 6.2831853 / 0.024);
     }
     if (u_grid > 0.5) {
         // Screen-space width, not a fixed 0.03 m one. The ground plate is now sized to the track,
@@ -97,26 +122,36 @@ void main() {
         // as a field of white dots. `fwidth` gives the metres this pixel spans, so the line can be
         // kept at least a pixel wide and faded out entirely once a whole cell is down to a few
         // pixels -- there is no grid left to show at that point, only aliasing.
+        // Two lattices, the way a DCC / Omniverse ground grid is drawn: a faint 1 m lattice that
+        // fades out first, and a 5 m lattice that survives the pull-back a little longer. Both are
+        // lighter than the ground by a small, fixed amount rather than a multiple, so they never
+        // turn the apron into a chequerboard.
         float px = max(fwidth(v_wpos.x), fwidth(v_wpos.y));
-        float w = clamp(px, 0.02, 0.35);
-        float fade = 1.0 - smoothstep(0.12, 0.45, px);
-        vec2 g = abs(fract(v_wpos.xy) - 0.5);
-        float l = smoothstep(0.5 - w, 0.5, max(g.x, g.y));
-        base = mix(base, base * 1.5, l * 0.5 * fade);
+        float w1 = clamp(px, 0.015, 0.30);
+        vec2 g1 = abs(fract(v_wpos.xy) - 0.5);
+        float l1 = smoothstep(0.5 - w1, 0.5, max(g1.x, g1.y)) * (1.0 - smoothstep(0.10, 0.40, px));
+        float w5 = clamp(px, 0.02, 1.2) / 5.0;
+        vec2 g5 = abs(fract(v_wpos.xy / 5.0) - 0.5);
+        float l5 = smoothstep(0.5 - w5, 0.5, max(g5.x, g5.y)) * (1.0 - smoothstep(0.6, 2.4, px));
+        base += vec3(0.055) * l1 + vec3(0.11) * l5;
     }
     vec3 l = normalize(u_light_dir);
     float nl = max(dot(n, l), 0.0);
     float sh = u_shadow_on > 0.5 ? shadow() : 1.0;
-    vec3 hemi = mix(vec3(0.20, 0.21, 0.24), vec3(0.85, 0.9, 1.0), n.z * 0.5 + 0.5);
+    // Sky-dome ambient (cool from above, warm bounce from the ground), a warm key light, and a
+    // faint fresnel rim so silhouettes separate from the ground the way they do under an HDRI.
+    vec3 hemi = mix(vec3(0.17, 0.155, 0.14), vec3(0.70, 0.76, 0.88), n.z * 0.5 + 0.5);
     vec3 v = normalize(u_eye - v_wpos); vec3 h = normalize(l + v);
     float spec = pow(max(dot(n, h), 0.0), u_shininess) * u_spec;
-    vec3 c = base * (hemi * 0.5 + vec3(1.0, 0.97, 0.92) * 1.25 * nl * sh) + vec3(1.0) * spec * nl * sh;
+    float fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
+    vec3 c = base * (hemi * 0.55 + vec3(1.0, 0.96, 0.90) * 1.20 * nl * sh) + vec3(1.0) * spec * nl * sh
+           + vec3(0.36, 0.42, 0.52) * fres * 0.16;
     float d = length(u_eye - v_wpos);
     // Fog range is a uniform, not a constant. Fixed 50-200 m is only right for a camera a few
     // metres from its subject: pull back far enough to frame a whole circuit and every surface in
     // the scene sits past the far end, so the entire map flattens to the fog colour and the walls
     // vanish. The viewer scales this with the camera's own distance.
-    c = mix(c, vec3(0.055, 0.065, 0.085), clamp((d - u_fog0) / max(1.0, u_fog1 - u_fog0), 0.0, 1.0));
+    c = mix(c, u_fog_col, clamp((d - u_fog0) / max(1.0, u_fog1 - u_fog0), 0.0, 1.0));
     c = c / (1.0 + c * 0.35);
     f_col = vec4(pow(c, vec3(1.0 / 2.2)), u_alpha);
 }
@@ -142,7 +177,7 @@ void main() { v_col = in_col; gl_Position = u_vp * vec4(in_pos, 1.0); gl_PointSi
 POINT_FS = """
 #version 330
 in vec4 v_col; out vec4 f_col;
-void main() { vec2 d = gl_PointCoord - 0.5; if (dot(d, d) > 0.25) discard; f_col = v_col; }
+void main() { vec2 d = gl_PointCoord - 0.5; float r2 = dot(d, d); if (r2 > 0.25) discard; f_col = vec4(v_col.rgb, v_col.a * (1.0 - smoothstep(0.14, 0.25, r2))); }
 """
 HUD_VS = """
 #version 330
@@ -165,7 +200,7 @@ void main() {
 LABEL_FS = "#version 330\nuniform sampler2D u_tex; in vec2 v_uv; out vec4 f_col; void main() { f_col = texture(u_tex, v_uv); if (f_col.a < 0.05) discard; }\n"
 
 MATERIALS = {   # name suffix -> (shininess, specular strength)
-    "rubber": (8.0, 0.03), "plastic": (24.0, 0.18), "metal": (60.0, 0.9), "blue": (70.0, 0.9),
+    "rubber": (8.0, 0.03), "plastic": (24.0, 0.18), "metal": (48.0, 0.55), "blue": (70.0, 0.9),
     "glass": (90.0, 0.7), "paint": (40.0, 0.35), "pcb": (30.0, 0.2),
 }
 IDENT_INST = np.concatenate([np.eye(4, dtype=np.float32).T.reshape(-1), np.ones(4, np.float32)])
@@ -239,6 +274,11 @@ class Scene:
         self.point_prog = ctx.program(vertex_shader=POINT_VS, fragment_shader=POINT_FS)
         self.hud_prog = ctx.program(vertex_shader=HUD_VS, fragment_shader=HUD_FS)
         self.label_prog = ctx.program(vertex_shader=LABEL_VS, fragment_shader=LABEL_FS)
+        self.sky_prog = ctx.program(vertex_shader=SKY_VS, fragment_shader=SKY_FS)
+        self.sky_prog["u_zenith"].value = ZENITH_RGB
+        self.sky_prog["u_horizon"].value = HORIZON_RGB
+        self.sky_prog["u_ground"].value = CLEAR_RGB
+        self.prog["u_fog_col"].value = HORIZON_RGB
         self.shadows = shadows
         if shadows:
             self.shadow_tex = ctx.depth_texture((shadow_size, shadow_size))
@@ -255,6 +295,8 @@ class Scene:
         self.lines: Dict[str, tuple] = {}
         self._quad = ctx.buffer(np.array([0, 0, 1, 0, 0, 1, 1, 1], np.float32).tobytes())
         self.hud_vao = ctx.vertex_array(self.hud_prog, [(self._quad, "2f", "in_uv")])
+        self.sky_vao = ctx.vertex_array(self.sky_prog, [(self._quad, "2f", "in_uv")])
+        self.ring_vbo = self.ring_vao = None; self.ring_n = 0
         self.hud_tex = None; self.hud_size = (0, 0)
         self._build_label_atlas()
         self._make_targets()
@@ -294,7 +336,7 @@ class Scene:
             self.ctx.viewport = (0, 0, w, h)
 
     def clear(self):
-        self.target.use(); self.ctx.clear(0.055, 0.065, 0.085)
+        self.target.use(); self.ctx.clear(*CLEAR_RGB)
 
     def screenshot(self, path):
         from PIL import Image
@@ -343,14 +385,15 @@ class Scene:
         self.car_meshes = []
         for attr in ("shadow_fbo", "shadow_tex", "hud_tex", "hud_vao", "_quad", "label_tex",
                      "label_pos", "label_vao", "pts_vao", "pts_vbo", "trail_vao", "trail_vbo",
-                     "plan0_vao", "plan0_vbo", "plan1_vao", "plan1_vbo"):
+                     "plan0_vao", "plan0_vbo", "plan0c_vao", "plan0c_vbo", "plan1_vao", "plan1_vbo",
+                     "ring_vao", "ring_vbo", "sky_vao"):
             drop(getattr(self, attr, None))
             if hasattr(self, attr):
                 setattr(self, attr, None)
         for tex, _size in list(getattr(self, "panels", {}).values()):
             drop(tex)
         self.panels = {}
-        for prog in ("prog", "shadow_prog", "line_prog", "point_prog", "hud_prog", "label_prog"):
+        for prog in ("prog", "shadow_prog", "line_prog", "point_prog", "hud_prog", "label_prog", "sky_prog"):
             drop(getattr(self, prog, None))
             setattr(self, prog, None)
         self.target = None
@@ -442,6 +485,10 @@ class Scene:
             nrm /= np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-9
             col = np.asarray(geom.visual.vertex_colors, np.float32)[:, :4] / 255.0
             col[:, 3] = 0.0
+            if gname == "chassis_paint":
+                # Neutral body panels: the per-instance tint is what says whose car it is (ego,
+                # rival, collided), and a tint over a blue-grey paint made every car the same teal.
+                col[:, :3] = (0.86, 0.87, 0.90)
             mat = next((k for k in MATERIALS if gname.endswith(k)), "plastic")
             m = Mesh(self.ctx, self.prog, self.shadow_prog, v, nrm, col, np.asarray(geom.faces).reshape(-1), max_cars, material=mat)
             self.car_meshes.append((slots[group], m))
@@ -476,24 +523,57 @@ class Scene:
     def alloc_trails(self, max_cars, length):
         self.trail_len = length
         self.trails = np.zeros((max_cars, length, 3), np.float32); self.trail_fill = 0
-        self.trail_col = np.tile(np.array([0.45, 0.55, 0.7, 0.55], np.float32), (length, 1))
+        self.trail_col = np.tile(np.array([0.55, 0.66, 0.82, 0.0], np.float32), (length, 1))
+        self.trail_col[:, 3] = np.linspace(0.0, 0.62, length, dtype=np.float32) ** 1.5   # fades out behind
         self.trail_vbo = self.ctx.buffer(reserve=max_cars * length * 7 * 4, dynamic=True)
         self.trail_vao = self.ctx.vertex_array(self.line_prog, [(self.trail_vbo, "3f 4f", "in_pos", "in_col")])
 
-    def set_plan(self, pts, cols=None, col=(0.2, 1.0, 0.4, 0.95), slot=0):
-        """Polyline (K,3) world coordinates with per-vertex colours (K,4) or one colour; slot 0 = the
-        plan (drawn thick), slot 1 = the tracker's predicted motion (thin). None clears the slot."""
+    def _upload_dyn(self, key, data):
+        """(Re)upload a dynamic polyline / strip buffer under `key`; grows the buffer as needed."""
+        vbo = getattr(self, f"{key}_vbo", None)
+        if vbo is None or vbo.size < data.nbytes:
+            vbo = self.ctx.buffer(reserve=max(data.nbytes, 64 * 7 * 4), dynamic=True)
+            setattr(self, f"{key}_vbo", vbo)
+            setattr(self, f"{key}_vao", self.ctx.vertex_array(self.line_prog, [(vbo, "3f 4f", "in_pos", "in_col")]))
+        vbo.write(np.ascontiguousarray(data).tobytes())
+
+    def set_plan(self, pts, cols=None, col=(0.2, 1.0, 0.4, 0.95), slot=0, width=0.11):
+        """Polyline (K,3) world coordinates with per-vertex colours (K,4) or one colour.
+
+        Slot 0 is the plan, drawn as a translucent flat ribbon `width` metres wide lying on the
+        ground with a bright centre line -- the way a planner's trajectory is shown in a driving
+        stack's viewer, so it reads as a path with extent rather than as a wire. Slot 1 is the
+        tracker's predicted motion, a thin line. None clears the slot."""
         n_attr = f"plan{slot}_n"
         if pts is None or len(pts) < 2:
             setattr(self, n_attr, 0); return
+        pts = np.asarray(pts, np.float32)
         cols = np.tile(np.asarray(col, np.float32), (len(pts), 1)) if cols is None else np.asarray(cols, np.float32)
-        data = np.concatenate([np.asarray(pts, np.float32), cols], 1)
-        vbo = getattr(self, f"plan{slot}_vbo", None)
-        if vbo is None or vbo.size < data.nbytes:
-            vbo = self.ctx.buffer(reserve=max(data.nbytes, 64 * 7 * 4), dynamic=True)
-            setattr(self, f"plan{slot}_vbo", vbo)
-            setattr(self, f"plan{slot}_vao", self.ctx.vertex_array(self.line_prog, [(vbo, "3f 4f", "in_pos", "in_col")]))
-        vbo.write(np.ascontiguousarray(data).tobytes()); setattr(self, n_attr, len(pts))
+        if slot == 0:
+            d = np.gradient(pts[:, :2], axis=0)
+            d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-6
+            nrm = np.stack([-d[:, 1], d[:, 0]], 1) * (0.5 * width)
+            left = pts.copy(); right = pts.copy()
+            left[:, :2] += nrm; right[:, :2] -= nrm
+            rib_col = cols.copy(); rib_col[:, 3] = cols[:, 3] * 0.42
+            strip = np.empty((2 * len(pts), 7), np.float32)
+            strip[0::2, :3] = left; strip[1::2, :3] = right
+            strip[0::2, 3:] = rib_col; strip[1::2, 3:] = rib_col
+            self._upload_dyn("plan0", strip)
+            centre = pts.copy(); centre[:, 2] += 0.004
+            self._upload_dyn("plan0c", np.concatenate([centre, cols], 1))
+            setattr(self, n_attr, len(pts))
+            return
+        self._upload_dyn(f"plan{slot}", np.concatenate([pts, cols], 1)); setattr(self, n_attr, len(pts))
+
+    def set_focus_ring(self, x, y, radius=0.34, colour=(0.35, 0.9, 1.0, 0.85), on=True):
+        """A thin ring on the ground under the watched car -- the ego marker. None/off clears it."""
+        if not on:
+            self.ring_n = 0; return
+        a = np.linspace(0.0, 2 * np.pi, 49, dtype=np.float32)
+        pts = np.stack([x + radius * np.cos(a), y + radius * np.sin(a), np.full_like(a, 0.016)], 1)
+        cols = np.tile(np.asarray(colour, np.float32), (len(a), 1))
+        self._upload_dyn("ring", np.concatenate([pts, cols], 1)); self.ring_n = len(a)
 
     def push_trail_points(self, x, y):
         n = min(len(x), self.trails.shape[0]); x, y = x[:n], y[:n]
@@ -546,7 +626,7 @@ class Scene:
         img = Image.new("RGBA", (512, 512), (0, 0, 0, 0)); d = ImageDraw.Draw(img)
         for i in range(64):
             cx, cy = (i % 8) * 64, (i // 8) * 64
-            d.rounded_rectangle((cx + 6, cy + 10, cx + 58, cy + 54), 8, fill=(0, 0, 0, 150))
+            d.rounded_rectangle((cx + 6, cy + 10, cx + 58, cy + 54), 6, fill=(16, 18, 22, 210), outline=(255, 255, 255, 40))
             d.text((cx + 32, cy + 32), str(i), font=font, fill=(255, 255, 255, 255), anchor="mm")
         self.label_tex = self.ctx.texture((512, 512), 4, img.tobytes()); self.n_labels = 0
 
@@ -578,9 +658,14 @@ class Scene:
             for _, m in self.car_meshes: m.draw(self.shadow_prog, shadow=True)
             ctx.cull_face = "back"
             self.prog["u_light_vp"].write(_u(light_vp)); self.shadow_tex.use(1); self.prog["u_shadow"].value = 1
-        # main pass
+        # main pass: sky first (no depth), then the lit scene
         self.target.use(); ctx.viewport = (0, 0, self.width, self.height)
-        ctx.clear(0.055, 0.065, 0.085)
+        ctx.clear(*CLEAR_RGB)
+        ctx.disable(moderngl.DEPTH_TEST)
+        self.sky_prog["u_inv_vp"].write(_u(np.linalg.inv(np.asarray(proj, np.float64) @ np.asarray(view, np.float64))))
+        self.sky_prog["u_eye"].value = tuple(float(v) for v in eye)
+        self.sky_vao.render(moderngl.TRIANGLE_STRIP)
+        ctx.enable(moderngl.DEPTH_TEST)
         self.prog["u_view"].write(_u(view)); self.prog["u_proj"].write(_u(proj))
         self.prog["u_eye"].value = tuple(float(v) for v in eye); self.prog["u_light_dir"].value = tuple(float(v) for v in self.light_dir)
         self.prog["u_shadow_on"].value = 1.0 if self.shadows else 0.0
@@ -597,15 +682,25 @@ class Scene:
         if show_trails and self.trail_fill > 1:
             for i in range(min(n_cars, self.trails.shape[0])):
                 self.trail_vao.render(moderngl.LINE_STRIP, vertices=self.trail_fill, first=i * self.trail_len + self.trail_len - self.trail_fill)
-        for slot, width in ((1, 2.0), (0, 6.0)):    # this driver reports an aliased range of 1-10 px,
-                                                    # so these are honoured rather than clamped to 1
-            n_ = getattr(self, f"plan{slot}_n", 0)
-            if n_ > 1:
-                self.ctx.line_width = width
-                getattr(self, f"plan{slot}_vao").render(moderngl.LINE_STRIP, vertices=n_)
+        # the tracker's prediction: a thin line; the plan: a translucent ribbon with a bright core.
+        # Line widths: this driver reports an aliased range of 1-10 px, so these are honoured.
+        n1 = getattr(self, "plan1_n", 0)
+        if n1 > 1:
+            self.ctx.line_width = 1.5
+            self.plan1_vao.render(moderngl.LINE_STRIP, vertices=n1)
+        n0 = getattr(self, "plan0_n", 0)
+        if n0 > 1:
+            ctx.depth_mask = False
+            self.plan0_vao.render(moderngl.TRIANGLE_STRIP, vertices=2 * n0)
+            ctx.depth_mask = True
+            self.ctx.line_width = 2.5
+            self.plan0c_vao.render(moderngl.LINE_STRIP, vertices=n0)
+        if self.ring_n > 1:
+            self.ctx.line_width = 2.5
+            self.ring_vao.render(moderngl.LINE_STRIP, vertices=self.ring_n)
         self.ctx.line_width = 1.0
         if show_points:
-            self.point_prog["u_vp"].write(_u(vp)); self.point_prog["u_size"].value = 22.0
+            self.point_prog["u_vp"].write(_u(vp)); self.point_prog["u_size"].value = 12.0
             self.pts_vao.render(moderngl.POINTS, vertices=self.n_pts)
         # labels
         if self.n_labels:
@@ -613,6 +708,56 @@ class Scene:
             self.label_tex.use(0); self.label_prog["u_tex"].value = 0
             self.label_vao.render(moderngl.TRIANGLE_STRIP, instances=self.n_labels)
         ctx.disable(moderngl.BLEND)
+
+    def draw_static(self, view, proj, eye, light_center, hidden=(), show_lines=True):
+        """Sky, the static meshes and the named lines -- nothing that belongs to a session.
+
+        The environment editor's draw path. `draw_frame` also renders cars, LiDAR points, trails,
+        plans, the focus ring and labels, and every one of those reads a buffer that a running
+        session fills (`set_car_instances`, `alloc_points`, `alloc_trails`); an editor has no
+        session and must not touch them. This draws exactly the parts that describe the map.
+
+        `hidden` names layers to leave out. A static mesh may carry a `layer` attribute set by
+        whoever uploaded it (the console tags backdrop / floor / ducts / walls / props); a mesh
+        whose layer is in `hidden` is skipped in both the shadow pass and the main pass, so a
+        hidden wall neither shows nor casts. Untagged meshes are always drawn.
+
+        Returns the number of static meshes drawn, so a caller can report or test it.
+        """
+        import moderngl
+        ctx = self.ctx
+        hidden = set(hidden or ())
+        meshes = [m for m in self.static if getattr(m, "layer", None) not in hidden]
+        if self.shadows:
+            lc = np.asarray(light_center, np.float64)
+            lview = look_at(lc + self.light_dir * 30.0, lc, np.array([0, 0, 1.0]))
+            lproj = ortho(-14, 14, -14, 14, 1.0, 80.0)
+            light_vp = lproj @ lview
+            self.shadow_fbo.use(); ctx.viewport = (0, 0, self.shadow_tex.width, self.shadow_tex.height)
+            ctx.clear(depth=1.0); ctx.enable(moderngl.CULL_FACE); ctx.cull_face = "front"
+            self.shadow_prog["u_light_vp"].write(_u(light_vp))
+            for m in meshes: m.draw(self.shadow_prog, shadow=True)
+            ctx.cull_face = "back"
+            self.prog["u_light_vp"].write(_u(light_vp)); self.shadow_tex.use(1); self.prog["u_shadow"].value = 1
+        self.target.use(); ctx.viewport = (0, 0, self.width, self.height)
+        ctx.clear(*CLEAR_RGB)
+        ctx.disable(moderngl.DEPTH_TEST)
+        self.sky_prog["u_inv_vp"].write(_u(np.linalg.inv(np.asarray(proj, np.float64) @ np.asarray(view, np.float64))))
+        self.sky_prog["u_eye"].value = tuple(float(v) for v in eye)
+        self.sky_vao.render(moderngl.TRIANGLE_STRIP)
+        ctx.enable(moderngl.DEPTH_TEST)
+        self.prog["u_view"].write(_u(view)); self.prog["u_proj"].write(_u(proj))
+        self.prog["u_eye"].value = tuple(float(v) for v in eye); self.prog["u_light_dir"].value = tuple(float(v) for v in self.light_dir)
+        self.prog["u_shadow_on"].value = 1.0 if self.shadows else 0.0
+        for m in meshes: m.draw(self.prog)
+        ctx.disable(moderngl.CULL_FACE)
+        if show_lines and self.lines:
+            ctx.enable(moderngl.BLEND); ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self.line_prog["u_vp"].write(_u(proj @ view))
+            for _name, (_vbo, vao, n) in self.lines.items():
+                vao.render(moderngl.LINE_STRIP, vertices=n)
+            ctx.disable(moderngl.BLEND)
+        return len(meshes)
 
 
 # ---------------------------------------------------------------- static mesh builders (no GL)
@@ -776,7 +921,7 @@ def floor_mesh_arrays(bounds, margin=3.0):
     x0, y0, x1, y1 = bounds[0] - margin, bounds[1] - margin, bounds[2] + margin, bounds[3] + margin
     pos = np.array([[x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0]], np.float32)
     nrm = np.tile([0, 0, 1.0], (4, 1)).astype(np.float32)
-    col = np.tile([0.30, 0.31, 0.34, 0.0], (4, 1)).astype(np.float32)
+    col = np.tile([0.135, 0.140, 0.155, 0.0], (4, 1)).astype(np.float32)
     return pos, nrm, col, np.array([0, 1, 2, 0, 2, 3], np.int32)
 
 
@@ -866,7 +1011,7 @@ def _fan(poly, z, colour, centre_colour=None):
     return (pos.astype(np.float32), nrm.astype(np.float32), col.astype(np.float32), idx.astype(np.int32))
 
 
-def apron_mesh_arrays(angle, centre, extent, margin=2.5, colour=(0.235, 0.245, 0.275, 0.0)):
+def apron_mesh_arrays(angle, centre, extent, margin=2.5, colour=(0.135, 0.140, 0.155, 0.0)):
     """The ground plate, oriented with the track and sized to it rather than to the map file."""
     half = 0.5 * np.asarray(extent, np.float64) + margin
     poly = _rounded_rect(half, radius=min(2.0, 0.18 * float(min(half))))
@@ -876,7 +1021,7 @@ def apron_mesh_arrays(angle, centre, extent, margin=2.5, colour=(0.235, 0.245, 0
 
 
 def backdrop_mesh_arrays(centre, extent, margin=2.5, segments=64,
-                         inner=(0.115, 0.128, 0.152, 0.0), outer=(0.055, 0.065, 0.085, 0.0)):
+                         inner=(0.135, 0.140, 0.155, 0.0), outer=CLEAR_RGB + (0.0,)):
     """A disc under and around the apron whose rim fades to the clear colour.
 
     Without it the ground ends in a hard edge and the eye reads that edge as the extent of the world.

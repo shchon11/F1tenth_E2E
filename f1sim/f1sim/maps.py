@@ -3,6 +3,7 @@
 Names:  gen:competition:7   gen:hallway:2   gen:circuit:0
         rt:Spielberg        (any directory of f1tenth_racetracks)
         gym:levine          (levine, berlin, skirk, vegas, stata_basement)
+        scene:my_hall       (a scene saved by the environment editor, see f1sim.scene; scene:/abs/dir too)
         /abs/path/map.yaml  (any ROS map; centerline csv next to it is picked up)
     Obstacle suffixes: `+obs<seed>` = boxes hugging the lane edge (the racing line stays clear),
                        `+rlobs<seed>` = boxes standing on the racing line (the car must plan around)
@@ -63,10 +64,30 @@ def gym_map_names() -> List[str]:
     return sorted(os.path.splitext(os.path.basename(y))[0] for y in glob.glob(os.path.join(GYM_MAPS, "*.yaml")))
 
 
+def scene_names() -> List[str]:
+    """Scenes saved by the environment editor (`scene:<name>`), newest first. Torch-free."""
+    from .scene import list_scenes
+    return [s["name"] for s in list_scenes()]
+
+
 def catalog() -> List[str]:
     names = [f"gen:{s}:<seed>" for s in ("competition", "hallway", "circuit")]
     names += [f"rt:{n}" for n in racetrack_names()] + [f"gym:{n}" for n in gym_map_names()] + [f"real:{n}" for n in REAL]
+    names += [f"scene:{n}" for n in scene_names()]
     return names
+
+
+def _scene_stamp(name: str):
+    """mtimes of a scene's files, so `load`'s per-process cache notices an edited scene."""
+    from .scene import scene_dir
+    d = scene_dir(name)
+    out = []
+    for f in ("scene.json", "layers.npz"):
+        try:
+            out.append(os.path.getmtime(os.path.join(d, f)))
+        except OSError:
+            out.append(None)
+    return tuple(out)
 
 
 def _with_auto_centerline(track: Track, min_clearance: float, seed_xy=None) -> Track:
@@ -99,6 +120,8 @@ def load(name: str, **kw) -> Track:
             if name.endswith(m):
                 mods.append(m); name = name[:-len(m)]
     ck = (name, repr(sorted(kw.items())))
+    if name.startswith("scene:"):                          # edited on disk between loads: key on the files
+        ck = ck + (_scene_stamp(_split_obstacle_suffix(name[6:])[0]),)
     if ck not in _BASE_CACHE:                              # one copy per process: both directions share grids
         _BASE_CACHE[ck] = _load_base(name, **kw)
     t = _BASE_CACHE[ck]
@@ -173,6 +196,15 @@ def _load_base(name: str, **kw) -> Track:
             return _static_props(t, int(spec))
         if kind is not None:
             raise ValueError(f"racetrack names support '+props<seed>', not '+{kind}': {name!r}")
+        return t
+    if name.startswith("scene:"):                           # scene:<name> or scene:/abs/dir, +props<seed>
+        from .scene import SceneDoc
+        n, kind, spec = _split_obstacle_suffix(name[6:])
+        t = SceneDoc.load(n).to_track()
+        if kind == "props":
+            return _static_props(t, int(spec))
+        if kind is not None:
+            raise ValueError(f"scene names support '+props<seed>', not '+{kind}': {name!r}")
         return t
     if name.startswith("gym:"):
         n = name[4:]

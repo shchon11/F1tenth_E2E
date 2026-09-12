@@ -265,7 +265,7 @@ class GripMPC:
         """
         return solve_grip(*args, self.gspec, consts=self._consts, out_bounds=self.last_bounds)
 
-    def install(self, graph: bool = False, example_args=None) -> "GripMPC":
+    def install(self, graph: bool = False, example_args=None, adopt: bool = True) -> "GripMPC":
         if self.gspec.mode == "legacy":
             raise RuntimeError("the legacy arm installs nothing; do not call install()")
         if self._installed:
@@ -279,7 +279,11 @@ class GripMPC:
             a = list(example_args)
             full = a[:7] + [self.mu] + a[7:]                   # (…, warm, mu, spec, wb, s_max, v_max)
             self._graphed = GraphedCallable(self._bound, full, name="solve_grip")
-            self._graphed.adopt()
+            # Ownership transfers exactly once. Training installs and steps on one thread, so it
+            # adopts here; the viewer captures on its control thread and steps on another, and
+            # passes adopt=False to call `adopt()` from the stepping thread instead.
+            if adopt:
+                self._graphed.adopt()
             fn = lambda *args: self._graphed(*args[:7], self.mu, *args[7:])
         else:
             fn = lambda *args: self._bound(*args[:7], self.mu, *args[7:])
@@ -287,6 +291,11 @@ class GripMPC:
         self.tracker._solver = fn
         self._installed = True
         return self
+
+    def adopt(self) -> None:
+        """Hand the captured grip-solver graph to the calling (stepping) thread. No-op when eager."""
+        if self._graphed is not None:
+            self._graphed.adopt()
 
     def release(self) -> None:
         """Restore whatever solver was installed before. Safe to call twice."""

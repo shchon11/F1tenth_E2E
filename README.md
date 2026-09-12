@@ -55,6 +55,7 @@ sim.reset(torch.nonzero(r.collision).flatten())      # partial reset re-samples 
 | [Getting started](docs/getting_started.md) | installation, CPU and GPU, the ROS 2 workspace, troubleshooting |
 | [Architecture](docs/architecture.md) | simulator fidelity, maps, raceline and teacher, the viewer |
 | [Training](docs/training.md) | DAgger, PPO, evaluation, the console, observation and action detail |
+| [Environment editor](docs/environment_editor.md) | the console's 환경 page — paint walls and ducts, place props, import mesh assets, save a `scene:<name>` and drive on it |
 | [Benchmark](docs/benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metrics |
 | [Leaderboard](docs/leaderboard/README.md) | the rendered checkpoint leaderboard — per-cohort tables, exact counts, evidence and method |
 | [ROS 2](docs/ros2.md) | launch files, topic contracts, teleoperation |
@@ -124,6 +125,16 @@ drive, and read what the policy was given against what the simulator actually di
 The images were captured on software GL without a GPU, so the frame-rate figures in them are not
 performance numbers; [provenance](docs/media/PROVENANCE-visualizer.md) records the map, driver,
 checkpoint hash, renderer and source hashes.
+
+The console's third page, **환경**, is an environment editor: paint duct hoses and tall walls, draw
+wall polylines, place the built-in props, import GLB / OBJ / STL meshes as obstacles, and save the
+result as `scene:<name>` — a catalogue entry the simulator, the trainer and the driving page all
+load. See [Environment editor](docs/environment_editor.md).
+
+[![the environment editor](docs/media/f1tenth-environment-editor.png)](docs/media/f1tenth-environment-editor.png)
+
+<sub>The 환경 page on a scene drawn in it: duct-hose loop, a pillar, built-in props and an imported
+tyre-stack mesh (selected, with the gizmo). Software GL; [manifest](docs/media/environment-editor-manifest-2026-09-12.json).</sub>
 
 ## Demonstrations
 

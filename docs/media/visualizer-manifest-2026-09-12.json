@@ -1,0 +1,108 @@
+{
+  "captured_at": "2026-09-12T18:20:40+0900",
+  "app": "f1sim driving console (PyQt5)",
+  "entry_point": "f1sim.viewer.console / SessionController + f1sim.viewer.sim_worker",
+  "window_size": [
+    1920,
+    1200
+  ],
+  "map": "real:korea_2026_competition",
+  "driver": {
+    "checkpoint": "/home/shchon11/f1sim_runs/cl_origrecipe_legacy_s701/ppo_final.pt",
+    "sha256": "29e82233853868be33773ba0ea65d68268ba259b477828f019f7f106095055b6",
+    "controller_arm": "legacy",
+    "note": "frozen original policy; controller arm 'legacy'"
+  },
+  "session": {
+    "races": 1,
+    "cars_per_race": 1,
+    "device": "cpu",
+    "compile": false,
+    "settle_seconds": 18.0
+  },
+  "rendering": {
+    "LIBGL_ALWAYS_SOFTWARE": "1",
+    "CUDA_VISIBLE_DEVICES": "",
+    "QT_QPA_PLATFORM": "xcb",
+    "DISPLAY": ":99",
+    "gl": {
+      "GL_RENDERER": "llvmpipe (LLVM 15.0.7, 256 bits)",
+      "GL_VENDOR": "Mesa",
+      "GL_VERSION": "4.5 (Core Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4"
+    }
+  },
+  "source": {
+    "repo": "/home/shchon11/F1tenth/F1tenth_E2E",
+    "console_sha256": "134a4bed30c75d652a3b2462a6ea9886059256b71e5f953d484ff0500034c237",
+    "worker_sha256": "a6e645461882cb28c6c733ed8547bba8f95483b54aa5935ddedf475c16cff357"
+  },
+  "frames_received": 454,
+  "buffer_stats": {
+    "received": 454,
+    "retired_after_draw": 450,
+    "dropped_undrawn_gui": 0,
+    "dropped_worker": 0,
+    "dropped_receiver_queue": 0,
+    "malformed": 0,
+    "buffered": 4
+  },
+  "shots": [
+    {
+      "file": "f1tenth-visualizer-overview.png",
+      "note": "full application window, overview camera",
+      "crop": null,
+      "viewport_only": false,
+      "bytes": 531572,
+      "size_px": [
+        1920,
+        1200
+      ],
+      "sha256": "6ef2d4ee1683d8e868f720373c47e0d7609b0a07a00cddc4b8b073535f29f7be",
+      "sim_frames_received": 360
+    },
+    {
+      "file": "f1tenth-visualizer-chase.png",
+      "note": "application with the setup panel collapsed via its own toggle, chase camera; car-number display left at its default (on)",
+      "crop": null,
+      "viewport_only": false,
+      "bytes": 561003,
+      "size_px": [
+        1920,
+        1200
+      ],
+      "sha256": "ce62f77065a44f59f2ed447880f8cc3ff263a8c5319ebf21347470d7d7371ab8",
+      "sim_frames_received": 454
+    },
+    {
+      "file": "f1tenth-visualizer-policy-panel.png",
+      "note": "DETAIL CROP of the policy input/output and ground-truth strip, from the same frame as the chase shot; cropped to the widget geometry",
+      "crop": [
+        0,
+        914,
+        1566,
+        248
+      ],
+      "viewport_only": false,
+      "bytes": 39912,
+      "size_px": [
+        1566,
+        248
+      ],
+      "sha256": "63908970719a734b0b81fbc03a283967aa98b35ced8b74066bb759569b4d3a70",
+      "sim_frames_received": 454
+    },
+    {
+      "file": "f1tenth-visualizer-viewport.png",
+      "note": "3D viewport only, via the console's own grab_png",
+      "crop": null,
+      "viewport_only": true,
+      "bytes": 445448,
+      "size_px": [
+        1550,
+        804
+      ],
+      "sha256": "455a3aea7154b9e99dc4737798f780fbe65c00342b86a1e18c372ffb1fe2db39",
+      "sim_frames_received": 454
+    }
+  ]
+}

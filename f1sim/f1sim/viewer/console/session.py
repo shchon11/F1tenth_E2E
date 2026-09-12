@@ -288,6 +288,7 @@ class SessionController(QtCore.QObject):
         w.reset_requested.connect(self.reset)
         w.focus_requested.connect(self.set_focus)
         w.overlay_requested.connect(self.set_overlay)
+        w.mu_requested.connect(self.set_mu)
         w.describe_requested.connect(self.describe)
         w.retry_requested.connect(self.retry)
         w.viewport.frame_timed.connect(w.push_frame_time)
@@ -547,6 +548,11 @@ class SessionController(QtCore.QObject):
     def set_focus(self, env: int):
         self.send(P.CMD_FOCUS, for_gen=self._active_gen, env=int(env))
 
+    def set_mu(self, mode: str, mu: float):
+        if self._active_gen < 0:
+            return
+        self.send(P.CMD_SET_MU, for_gen=self._active_gen, mode=str(mode), mu=float(mu))
+
     def set_overlay(self, overlay: dict):
         if self._proc is None or not self._proc.is_alive():
             return
@@ -792,7 +798,7 @@ class SessionController(QtCore.QObject):
             self._ignore(f"'{command}' 확인", issued_gen if issued_gen is not None else ack_gen,
                          "worker가 더 새로운 세션으로 넘어감")
             return
-        if command in ("pause", "reset", "focus", "overlay"):
+        if command in ("pause", "reset", "focus", "overlay", "set_mu"):
             # session-scoped: only meaningful for the session that is actually on screen
             if self._active_gen < 0 or (issued_gen is not None and issued_gen != self._active_gen):
                 self._ignore(f"'{command}' 확인", issued_gen, "그 세션은 이미 끝났습니다")
@@ -816,6 +822,8 @@ class SessionController(QtCore.QObject):
             self.window.spark.clear()
         elif command == "focus":
             self.window._pending.pop("focus", None)
+        elif command == "set_mu":
+            self.window.settle_mu(str(state.get("mu_mode", "fixed")), float(state.get("mu", 0.0)))
 
     def _on_error(self, msg: dict):
         gen = int(msg.get("gen", -1))

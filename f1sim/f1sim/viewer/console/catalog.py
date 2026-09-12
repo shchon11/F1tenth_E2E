@@ -124,7 +124,13 @@ class MapCatalog:
 #: Group order and the one-line explanation shown under each. Order matters: the first group is
 #: the default selection. The names say "프로젝트 정의" rather than "미학습" on purpose -- see the
 #: MapCatalog docstring. Keep these in sync with `sim_worker.map_catalog()`.
+#: The environment editor's scenes (`scene:<name>`, see `f1sim.scene`). First, and only present in a
+#: worker's catalogue when the user has made at least one; the GUI lists them itself through
+#: `list_scenes` below without waiting for the worker.
+SCENES_GROUP = "내 환경 (에디터)"
+
 GROUP_ORDER = [
+    SCENES_GROUP,
     "기본 평가셋",
     "장애물 (상자·궤짝·드럼)",
     "기본 학습셋",
@@ -132,6 +138,8 @@ GROUP_ORDER = [
     "전체 카탈로그",
 ]
 GROUP_HINT = {
+    SCENES_GROUP: ("환경 페이지에서 직접 만들거나 고친 환경입니다 (~/f1sim_scenes, 또는 $F1SIM_SCENES). "
+                   "덕트·벽·장애물·불러온 메시가 그대로 시뮬레이터와 LiDAR 에 반영됩니다."),
     "기본 평가셋": "프로젝트 정의 평가 분할 (common.EVAL_TRACKS)",
     "장애물 (상자·궤짝·드럼)": ("평가 맵에 상자·나무궤짝·드럼 같은 입체 장애물을 놓은 변형입니다. "
                         "차가 실제로 부딪히고 LiDAR 에도 잡힙니다. 이름 뒤 숫자는 배치 seed 입니다."),
@@ -146,3 +154,10 @@ GROUP_HINT = {
 #: fact, and the UI must not let the two be confused.
 GROUP_CAVEAT = ("이 분류는 프로젝트가 정의한 기본 분할입니다. 선택한 체크포인트가 실제로 어떤 맵으로 "
                 "학습됐는지는 해당 run의 학습 manifest를 봐야 알 수 있습니다.")
+
+
+def list_scenes() -> List[dict]:
+    """The editor's saved scenes, newest first -- `f1sim.scene.list_scenes`, re-exported so the GUI
+    can fill the `내 환경 (에디터)` group itself. Pure filesystem, torch-free."""
+    from ...scene import list_scenes as _list_scenes
+    return _list_scenes()

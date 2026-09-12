@@ -1,0 +1,23 @@
+{
+ "_what": "R10 701/702 only (same frozen suite v1); rendered separately because the benchmark package digest changed (n_envs producer fix) after the published 3-system rows were scored",
+ "systems": [
+  {
+   "system_id": "cl_r10_base_s701@estimated",
+   "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/checkpoint-benchmark/scores/run-r10-20260912/pins/cl_r10_base_s701_ppo_final.pt",
+   "checkpoint_sha256": "3c5d2633f7361b2ff291873d5c36ae1e1a882c436ed62e5d68ca6bbbc8324131",
+   "controller_arm": "estimated",
+   "estimator_path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "note": "R10 directional coverage (5 maps + reversed), seed 701, trained under estimated arm with estimator 401"
+  },
+  {
+   "system_id": "cl_r10_base_s702@estimated",
+   "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/checkpoint-benchmark/scores/run-r10-20260912/pins/cl_r10_base_s702_ppo_final.pt",
+   "checkpoint_sha256": "ce8c2a1ad4538af1d0fad365c1b98c6d78dceaeaf3f801b1234d55e2ff26c8fb",
+   "controller_arm": "estimated",
+   "estimator_path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "note": "R10 directional coverage (5 maps + reversed), seed 702, trained under estimated arm with estimator 401"
+  }
+ ]
+}

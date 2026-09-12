@@ -12,6 +12,7 @@ event loop answering while a checkpoint loads or CUDA graphs are captured.
 from __future__ import annotations
 
 import math
+import os
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -62,6 +63,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     focus_requested = QtCore.pyqtSignal(int)
     overlay_requested = QtCore.pyqtSignal(dict)
     describe_requested = QtCore.pyqtSignal(str)
+    mu_requested = QtCore.pyqtSignal(str, float)          # (mode, mu) live friction control
     retry_requested = QtCore.pyqtSignal()
     close_requested = QtCore.pyqtSignal()
 
@@ -109,8 +111,31 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.left_panel = self._build_left()
         self.centre = self._build_centre()
         self.right_panel = self._build_right()
+        # Two pages in the middle: driving (the viewport) and training. Training is the console's
+        # second job, not a dialog: it launches and watches PPO runs and hands their checkpoints
+        # back to the driving page.
+        from .training import TrainingPage
+        self.training = TrainingPage()
+        self.training.view_checkpoint_requested.connect(self._view_checkpoint_from_training)
+        self.training.runs_changed.connect(self._runs_changed_from_training)
+        # The stack must not let the training page's minimum sizes govern the driving page: a
+        # QStackedWidget reports the maximum of its pages, which would squeeze the viewport at
+        # small window sizes even while the training page is hidden.
+        self.training.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+        # The third page: the environment editor. Builds and edits scenes (`f1sim.scene`) with
+        # its own GL viewport, and hands a saved scene to the driving page as `scene:<name>`.
+        from .env_editor import EnvEditorPage
+        self.editor = EnvEditorPage()
+        self.editor.drive_requested.connect(self._drive_from_editor)
+        self.editor.scenes_changed.connect(self._scenes_changed_from_editor)
+        self.editor.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+        self.centre_stack = QtWidgets.QStackedWidget()
+        self.centre_stack.setObjectName("Centre")
+        self.centre_stack.addWidget(self.centre)
+        self.centre_stack.addWidget(self.training)
+        self.centre_stack.addWidget(self.editor)
         self.splitter.addWidget(self.left_panel)
-        self.splitter.addWidget(self.centre)
+        self.splitter.addWidget(self.centre_stack)
         self.splitter.addWidget(self.right_panel)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -124,7 +149,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def _build_header(self) -> QtWidgets.QWidget:
         head = QtWidgets.QFrame()
         head.setObjectName("Header")
-        head.setFixedHeight(56)
+        head.setFixedHeight(44)
         h = QtWidgets.QHBoxLayout(head)
         h.setContentsMargins(SP[2], SP[1], SP[2], SP[1])
         h.setSpacing(SP[2])
@@ -135,6 +160,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
         self.badge = StateBadge()
         h.addWidget(self.badge)
+        self.mode_buttons = SegmentedButtons([("drive", "주행", "정책을 골라 달리는 화면"),
+                                              ("train", "학습", "PPO 학습을 설정·실행하고 현황을 보는 화면"),
+                                              ("edit", "환경", "트랙·벽·장애물을 3D 로 직접 만들고 고치는 화면")])
+        self.mode_buttons.set_current("drive")
+        self.mode_buttons.selected.connect(self.set_mode)
+        h.addWidget(self.mode_buttons)
 
         self.header_summary = QtWidgets.QLabel("—")
         self.header_summary.setObjectName("HeaderSub")
@@ -261,6 +292,33 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.spin_cap.setValue(6.0)
         self.row_cap = FieldRow("속도 상한", self.spin_cap, "체크포인트가 학습된 상한을 따릅니다.")
         cfg_card.add(self.row_cap)
+
+        # -- surface friction: random per car (what training saw) or one pinned value, changeable
+        # while the session runs. The panel's "시뮬 참값 μ" shows what the car actually has.
+        mu_row = QtWidgets.QHBoxLayout()
+        mu_row.setSpacing(SP[0])
+        self.combo_mu = QtWidgets.QComboBox()
+        self.combo_mu.addItem("랜덤 (학습과 동일)", "random")
+        self.combo_mu.addItem("고정", "fixed")
+        self.combo_mu.currentIndexChanged.connect(self._on_mu_mode)
+        mu_row.addWidget(self.combo_mu, 1)
+        self.spin_mu = QtWidgets.QDoubleSpinBox()
+        self.spin_mu.setRange(0.40, 1.40)
+        self.spin_mu.setDecimals(3)
+        self.spin_mu.setSingleStep(0.01)
+        self.spin_mu.setValue(1.049)
+        self.spin_mu.setEnabled(False)
+        mu_row.addWidget(self.spin_mu, 1)
+        self.btn_mu_apply = PendingButton("적용")
+        self.btn_mu_apply.setToolTip("주행 중인 세션의 모든 차량에 지금 적용합니다.")
+        self.btn_mu_apply.setEnabled(False)
+        self.btn_mu_apply.clicked.connect(self._on_mu_apply)
+        mu_row.addWidget(self.btn_mu_apply)
+        mu_box = QtWidgets.QWidget()
+        mu_box.setLayout(mu_row)
+        self.row_mu = FieldRow("노면 마찰 μ", mu_box,
+                               "학습 범위 0.734~1.154, 공칭 1.049. 고정값은 리셋 뒤에도 유지되고 주행 중 바꿀 수 있습니다.")
+        cfg_card.add(self.row_mu)
         v.addWidget(cfg_card)
 
         # -- advanced
@@ -294,6 +352,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.combo_device = QtWidgets.QComboBox()
         self.combo_device.addItems(["auto", "cuda", "cpu"])
         adv.add(FieldRow("연산 장치", self.combo_device, ""))
+        self.combo_controller = QtWidgets.QComboBox()
+        self.combo_controller.addItems(["fixed_low", "legacy", "estimated", "oracle"])   # fixed_low: the deployment default (suite v1, 2026-09-12)
+        adv.add(FieldRow("플랜 제어기 (노면 클램프)", self.combo_controller,
+                         "estimated / fixed_low: 곡률·마찰 기반 속도·가감속 한계를 MPC에 적용합니다 "
+                         "(벤치마크의 @estimated 구성). oracle: 시뮬의 참값 μ를 그대로 쓰는 상한 확인용 "
+                         "(실차 불가). 레이스당 차량 수 1에서만 지원합니다."))
+        self.edit_estimator = QtWidgets.QLineEdit()
+        self.edit_estimator.setPlaceholderText("estimated 전용: 노면 추정기 .pt 경로")
+        self.edit_estimator.setText(SessionConfig.default_estimator())
+        adv.add(FieldRow("노면 추정기", self.edit_estimator,
+                         "비워 두면 $F1SIM_GRIP_ESTIMATOR 또는 ~/f1sim_runs/_estimators/estimator_seed401.pt 를 씁니다."))
         v.addWidget(adv)
 
         v.addStretch(1)
@@ -486,6 +555,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def allow_close(self):
         self._closing_allowed = True
         self.viewport.teardown()      # while the context still exists
+        try:
+            self.editor.shutdown()
+            self.editor.viewport.teardown()
+        except Exception:
+            pass
         self.close()
 
     def resizeEvent(self, ev):
@@ -706,15 +780,22 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             s.activated.connect(fn)
             return s
 
-        sc("Space", lambda: self.btn_pause.click() if self.btn_pause.isEnabled() else None)
+        # The single-key shortcuts belong to the driving page. On the editor page those keys are
+        # tool keys (S would take a screenshot while the user meant nothing of the sort), so each
+        # one checks the page before acting; application context is kept so they work with focus
+        # anywhere in the window.
+        def drive_only(fn: Callable):
+            return lambda: fn() if self.current_mode() == "drive" else None
+
+        sc("Space", drive_only(lambda: self.btn_pause.click() if self.btn_pause.isEnabled() else None))
         for i, key in enumerate(CAMERA_KEYS):
-            sc(str(i + 1), lambda k=key: self._on_camera(k, from_shortcut=True))
-        sc("[", lambda: self._step_focus(-1))
-        sc("]", lambda: self._step_focus(1))
-        sc("Ctrl+R", lambda: self.btn_reset.click() if self.btn_reset.isEnabled() else None)
-        sc("Ctrl+.", lambda: self.btn_stop.click() if self.btn_stop.isEnabled() else None)
-        sc("Ctrl+F", lambda: self.map_list.search.setFocus(QtCore.Qt.ShortcutFocusReason))
-        sc("S", self._on_screenshot)
+            sc(str(i + 1), drive_only(lambda k=key: self._on_camera(k, from_shortcut=True)))
+        sc("[", drive_only(lambda: self._step_focus(-1)))
+        sc("]", drive_only(lambda: self._step_focus(1)))
+        sc("Ctrl+R", drive_only(lambda: self.btn_reset.click() if self.btn_reset.isEnabled() else None))
+        sc("Ctrl+.", drive_only(lambda: self.btn_stop.click() if self.btn_stop.isEnabled() else None))
+        sc("Ctrl+F", drive_only(lambda: self.map_list.search.setFocus(QtCore.Qt.ShortcutFocusReason)))
+        sc("S", drive_only(lambda: self._on_screenshot()))
         sc("F1", self.show_help)
 
     # ================================================================ data in
@@ -727,7 +808,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._update_start_enabled()
 
     def set_maps(self, cat: MapCatalog):
-        self.maps = cat
+        self.maps = self._with_local_scenes(cat)
+        cat = self.maps
+        self.editor.set_maps(cat)
         self.map_group.blockSignals(True)
         self.map_group.clear()
         if cat.error:
@@ -807,12 +890,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_focus_prev.setEnabled(running)
         self.btn_focus_next.setEnabled(running)
         self.btn_shot.setEnabled(running or preparing)
+        self.btn_mu_apply.setEnabled(running)
 
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
                   self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.combo_opponent,
-                  self.combo_device):
+                  self.combo_device, self.combo_controller, self.edit_estimator):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
 
         self.progress.setVisible(preparing or state == STATE_STOPPING)
@@ -1050,6 +1134,105 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         elif command == "start":
             self.btn_start.ack()
 
+    def settle_mu(self, mode: str, mu: float):
+        """The worker confirmed a friction change: settle the button and say what is in force."""
+        self.btn_mu_apply.ack()
+        self._pending.pop("set_mu", None)
+        self.status_text.setText(f"노면 마찰: {'고정 μ=' + format(mu, '.3f') if mode == 'fixed' else '랜덤 (리셋마다 다시 뽑음)'} — 모든 차량에 적용됨")
+
+    def _on_mu_mode(self, _idx):
+        fixed = self.combo_mu.currentData() == "fixed"
+        self.spin_mu.setEnabled(fixed)
+
+    def _on_mu_apply(self):
+        self.btn_mu_apply.mark_pending()
+        self._pending["set_mu"] = time.monotonic()
+        self.mu_requested.emit(str(self.combo_mu.currentData() or "random"), float(self.spin_mu.value()))
+
+    MODE_INDEX = {"drive": 0, "train": 1, "edit": 2}
+
+    def set_mode(self, key: str):
+        """Driving, training or the environment editor. The full-width pages hide the driving
+        panels; they come back with the driving page."""
+        key = key if key in self.MODE_INDEX else "drive"
+        drive = key == "drive"
+        self.mode_buttons.set_current(key)
+        self.centre_stack.setCurrentIndex(self.MODE_INDEX[key])
+        self.left_panel.setVisible(drive and self.btn_left_panel.isChecked())
+        self.right_panel.setVisible(drive and self.btn_right_panel.isChecked())
+        self.training.set_active(key == "train")
+        self.editor.set_active(key == "edit")
+
+    def current_mode(self) -> str:
+        for k, i in self.MODE_INDEX.items():
+            if i == self.centre_stack.currentIndex():
+                return k
+        return "drive"
+
+    SCENE_GROUP = "내 환경 (에디터)"
+
+    def _with_local_scenes(self, cat: MapCatalog) -> MapCatalog:
+        """The scene group, read from the scenes folder here rather than taken from the worker.
+
+        The worker lists scenes when it starts; the editor creates them while the worker is
+        already up. The folder is the truth for both, and reading it is a directory listing."""
+        if not cat.ready:
+            return cat
+        try:
+            from .catalog import list_scenes
+            names = [f"scene:{s['name']}" for s in list_scenes()]
+        except Exception:
+            return cat
+        groups = {k: v for k, v in cat.groups.items() if k != self.SCENE_GROUP}
+        if names:
+            groups = {self.SCENE_GROUP: names, **groups}
+        return MapCatalog(groups=groups, ready=cat.ready, error=cat.error)
+
+    def _scenes_changed_from_editor(self):
+        """The editor saved, duplicated or deleted a scene: refresh the map picker's scene group
+        without a round trip to the worker."""
+        if not self.maps.ready:
+            return
+        current_group = self.map_group.currentData()
+        selected = self._selected_map
+        self.set_maps(self.maps)
+        if current_group is not None:
+            i = self.map_group.findData(current_group)
+            if i >= 0:
+                self.map_group.setCurrentIndex(i)
+        if selected:
+            self.map_list.select(selected)
+
+    def _drive_from_editor(self, map_name: str):
+        """A scene saved on the editor page becomes the driving page's next map."""
+        self._scenes_changed_from_editor()
+        self.set_mode("drive")
+        i = self.map_group.findData(self.SCENE_GROUP)
+        if i >= 0:
+            self.map_group.setCurrentIndex(i)
+        if not self.map_list.select(map_name):
+            # the worker's catalogue is not in yet: keep the name as the selection anyway
+            pass
+        self._on_map_selected(map_name)
+        self.status_text.setText(f"{map_name} 을(를) 다음 시작에 사용합니다. 런을 고르고 '시작'을 누르세요.")
+
+    def _view_checkpoint_from_training(self, run_name: str, ckpt_path: str):
+        """A checkpoint picked on the training page becomes the driving page's next start."""
+        self.set_mode("drive")
+        if not self.run_list.select(run_name):
+            pass
+        self._selected_run = ckpt_path
+        self.sel_run.setText(f"런: {run_name}/{os.path.basename(ckpt_path)}")
+        self.sel_run.setToolTip(ckpt_path)
+        self._update_selection_note()
+        self._update_start_enabled()
+        self.describe_requested.emit(ckpt_path)
+        self.status_text.setText(f"{os.path.basename(ckpt_path)} 을(를) 다음 시작에 사용합니다. '시작'을 누르세요.")
+
+    def _runs_changed_from_training(self):
+        from .catalog import list_runs
+        self.set_runs(list_runs())
+
     def settle_pause(self, paused: bool):
         self.btn_pause.settle(paused)
         self.btn_pause.setText("재개" if paused else "일시정지")
@@ -1168,6 +1351,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             randomize=self.chk_dr.isChecked(),
             stochastic=self.chk_stoch.isChecked(),
             opponent=self.combo_opponent.currentText(),
+            controller=self.combo_controller.currentText(),
+            estimator=self.edit_estimator.text().strip(),
+            mu_mode=str(self.combo_mu.currentData() or "random"),
+            mu=float(self.spin_mu.value()),
             saliency=self.chk_saliency.isChecked(),
             internals=self.chk_internals.isChecked(),
             max_render_cars=MAX_RENDER_CARS,
@@ -1271,6 +1458,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 ("Ctrl+F", "맵 검색으로 이동"),
                 ("S", "3D 화면 스크린샷"),
                 ("드래그 / 휠", "궤도 카메라 회전 / 확대"),
+                ("환경 페이지", "V 선택 · B 덕트 · W 벽 · E 지우개 · L/K 선 · M 사각형 · P 다각형 · A 배치 · "
+                           "Ctrl+Z/Y 되돌리기 · F 전체 보기 · 5 위에서 · 가운데/Alt+드래그 회전 · "
+                           "오른쪽/Shift+드래그 이동 · 휠 확대"),
             ])
         QtWidgets.QMessageBox.information(
             self, "도움말",

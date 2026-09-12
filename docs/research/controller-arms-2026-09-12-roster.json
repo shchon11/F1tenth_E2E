@@ -1,0 +1,21 @@
+{
+ "_what": "frozen original under the reactive and fixed_low arms (worktree feat/reactive-grip @ fe4e3c7)",
+ "systems": [
+  {
+   "path": "/home/shchon11/f1sim_runs/_baselines/frozen_original_48cc698f.pt",
+   "checkpoint_sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef",
+   "cross_runtime": true,
+   "system_id": "frozen_original@reactive",
+   "controller_arm": "reactive",
+   "note": "reactive arm, shipped defaults (thr_abs 0.20)"
+  },
+  {
+   "path": "/home/shchon11/f1sim_runs/_baselines/frozen_original_48cc698f.pt",
+   "checkpoint_sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef",
+   "cross_runtime": true,
+   "system_id": "frozen_original@fixed_low",
+   "controller_arm": "fixed_low",
+   "note": "constant mu 0.73423"
+  }
+ ]
+}

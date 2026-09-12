@@ -39,6 +39,7 @@ CMD_PAUSE = "pause"                # {"paused": bool}
 CMD_RESET = "reset"                # re-draw the episode on the current map
 CMD_FOCUS = "focus"                # {"env": int} which car the overlays describe
 CMD_OVERLAY = "overlay"            # {"saliency": bool, "internals": bool, "plan": bool}
+CMD_SET_MU = "set_mu"              # {"mode": "random"|"fixed", "mu": float} live friction control
 CMD_CANCEL = "cancel"              # abandon an in-flight start (by generation)
 CMD_SHUTDOWN = "shutdown"
 
@@ -108,6 +109,17 @@ class SessionConfig:
     randomize: bool = True               # domain randomisation, as in training
     stochastic: bool = False
     opponent: str = "teacher"
+    #: Plan-controller arm installed at run time (`learn.grip_runtime`). "legacy" is the untouched
+    #: MPC. "estimated" / "fixed_low" apply the grip-aware curvature speed limit and mu-dependent
+    #: acceleration/brake budgets on top of the policy's plan -- the deployment configuration that
+    #: benchmarked best -- and are supported for one car per race only, as in training.
+    controller: str = "fixed_low"      # deployment default: constant conservative mu (suite v1, 2026-09-12)
+    estimator: str = ""                  # frozen grip-estimator .pt; required by "estimated"
+    #: Surface friction. "random" draws mu per car per reset from the training range (when
+    #: randomisation is on) or leaves it nominal; "fixed" pins every car to `mu`, re-applied after
+    #: each reset, and can be changed live with CMD_SET_MU.
+    mu_mode: str = "random"
+    mu: float = 1.0489
     episode_s: float = 3600.0
     saliency: bool = False
     internals: bool = False
@@ -119,6 +131,15 @@ class SessionConfig:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @staticmethod
+    def default_estimator() -> str:
+        """Where a frozen grip estimator is looked for when none is given: `$F1SIM_GRIP_ESTIMATOR`,
+        else `<runs>/_estimators/estimator_seed401.pt`. Empty when neither exists."""
+        import os
+        cand = [os.environ.get("F1SIM_GRIP_ESTIMATOR", ""),
+                os.path.join(os.path.expanduser("~"), "f1sim_runs", "_estimators", "estimator_seed401.pt")]
+        return next((c for c in cand if c and os.path.isfile(c)), "")
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "SessionConfig":

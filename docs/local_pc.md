@@ -26,6 +26,21 @@ python F1tenth_E2E/f1sim/scripts/demo_viewer.py --map gen:competition:0 --cars 2
 실측 대회 맵은 `--map real:korea_2025_iccas`로 선택한다.
 처음 사용하는 맵의 raceline 생성과 새로운 배치 크기의 CUDA 커널 컴파일에는 수 분이 걸릴 수 있다.
 
+## 환경 만들기 (에디터)
+
+콘솔(`python -m f1sim.learn.watch`) 머리글의 **환경** 버튼이 3D 환경 에디터다. 덕트·벽을 브러시와 선으로 그리고,
+상자·드럼 같은 내장 장애물이나 가져온 메쉬(GLB/OBJ/STL)를 놓고, 저장하면 `~/f1sim_scenes/<이름>/` 에
+폴더가 생긴다. 저장한 환경은 `scene:<이름>` 으로 어디서나 쓴다.
+
+```bash
+python -m f1sim.learn.watch --map scene:my_hall --cars 2          # 에디터에서 만든 환경으로 주행
+python -m f1sim.scene import real:korea_2026_competition korea_edit   # 기존 맵을 복제해 편집 시작
+python -m f1sim.scene validate korea_edit                             # 센터라인 추출 + 주행 가능 검사
+python -m f1sim.learn.ppo --tracks scene:my_hall,scene:korea_edit ... # 학습에도 그대로
+```
+
+자세한 도구 설명은 [Environment editor](environment_editor.md).
+
 ## 학습 시작점
 
 아래는 8GB GPU를 위한 보수적인 시작 설정이다. 전체 32개 학습 트랙의 장시간 수렴을 검증한 설정은 아니다.

@@ -1,5 +1,13 @@
 # Visualizer screenshots — provenance
 
+**Re-captured 2026-09-12** after the console's visual redesign ([design note](../viewer_design.md)):
+same headless path (Xvfb 2048 × 1280, llvmpipe, `CUDA_VISIBLE_DEVICES=""`, real `ConsoleWindow` +
+real `sim_worker`), driver `cl_origrecipe_legacy_s701/ppo_final.pt` (legacy-trained, run under the
+legacy arm), map `real:korea_2026_competition`; the obstacle image is
+`gen:competition:3+props7`, orbit camera. Manifests: `visualizer-manifest-2026-09-12.json`,
+`visualizer-props-manifest-2026-09-12.json`. Everything below describes the original 2026-09-11
+capture and still applies to the method.
+
 Captured 2026-09-11 from the **real** `f1sim` driving console: the actual `ConsoleWindow` wired to
 the actual `f1sim.viewer.sim_worker`, photographed the way a compositor would. Nothing is a mock-up,
 and no value in any panel was drawn for effect — if a gauge shows a number, the running session

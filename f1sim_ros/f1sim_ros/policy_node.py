@@ -13,6 +13,26 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
 
 from f1sim.learn.model import load_checkpoint
+
+
+def install_grip_arm(tracker, arm: str, device, mu: float = None):
+    """Wrap the plan tracker's solver with the grip-aware speed/acceleration limits.
+
+    `fixed_low` is the deployment default: a constant conservative friction (0.73423, the low end of
+    the training range) limits corner speed and the acceleration/brake budgets of every plan the
+    policy emits. On suite v1 (2026-09-12) it was the safest arm on every stability column against
+    the same policy, at a 2 % lap-time cost; it needs no estimator and reads no sensor. `legacy`
+    installs nothing. Returns the installed `GripMPC` (call `.release()` to undo) or None.
+    """
+    if tracker is None or arm == "legacy":
+        return None
+    if arm != "fixed_low":
+        raise ValueError(f"controller arm {arm!r} is not deployable here: only 'legacy' and 'fixed_low' "
+                         f"run without a simulator-side estimator or privileged friction")
+    from f1sim.learn import grip_control as gc
+    spec = gc.GripSpec(mode="fixed", mu_fixed=float(gc.MU_FIXED_LOW if mu is None else mu)).validate()
+    grip = gc.GripMPC(tracker, spec, 1, torch.device(device), tracker.wb, tracker.s_max, tracker.v_max)
+    return grip.install(graph=False)
 from f1sim.learn.obs import ObsBuilder, ObsSpec
 
 try:
@@ -141,6 +161,13 @@ class PolicyNode(Node):
             from f1sim.mpc import PlanTracker
             self.tracker = PlanTracker(1, self.device, float(p("wheelbase")), self.steer_max, self.spec.v_max)
             self.delay = torch.tensor([float(p("cmd_delay"))], device=self.device)
+        # Plan controller arm. "fixed_low" (default) limits corner speed and accel/brake budgets for a
+        # conservative constant friction; "legacy" is the untouched tracker. Set `grip_mu` to override
+        # the constant once the floor has been characterised.
+        self.declare_parameter("controller", "fixed_low"); self.declare_parameter("grip_mu", 0.0)
+        self.controller_arm = str(p("controller"))
+        self.grip = install_grip_arm(self.tracker, self.controller_arm, self.device,
+                                     mu=(float(p("grip_mu")) or None))
         self.create_subscription(Odometry, "odom", self.on_odom, 1)
         self.create_subscription(Imu, "sensors/imu/raw", self.on_imu, 10)
         if VescImuStamped is not None:
@@ -158,7 +185,9 @@ class PolicyNode(Node):
             self.tracker(a0, torch.zeros(1, device=self.device), torch.tensor([self.speed_cap], device=self.device), None, delay=self.delay)
             self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
         self.obs.reset()
-        self.get_logger().info(f"policy {p('checkpoint')} on {self.device}, speed cap {self.speed_cap} m/s")
+        self.get_logger().info(f"policy {p('checkpoint')} on {self.device}, speed cap {self.speed_cap} m/s, "
+                               f"controller {self.controller_arm}"
+                               + (f" (mu {float(self.grip.mu[0]):.3f})" if self.grip is not None else ""))
 
     def on_odom(self, m: Odometry):
         v = m.twist.twist.linear.x

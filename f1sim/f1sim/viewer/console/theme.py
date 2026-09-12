@@ -11,34 +11,41 @@ touches torch or a GPU.
 from __future__ import annotations
 
 # ---------------------------------------------------------------- colour
+# Graphite neutrals, the way Omniverse / Isaac Sim and Unreal's editor chrome are built: no hue in
+# the panels, so the only colour on screen is the colour the scene spends on facts. One calm blue
+# accent for selection and focus; NVIDIA-style green only for "running" and the start action.
 C = {
-    "bg.window": "#0d1117",
-    "bg.panel": "#151b24",
-    "bg.card": "#1b232e",
-    "bg.raised": "#23303e",
-    "bg.viewport": "#0e1016",
-    "line": "#2b3745",
-    "line.strong": "#3d4d5f",
-    "text.0": "#e9eef5",
-    "text.1": "#a6b4c4",
-    "text.2": "#6d7f93",
-    "accent": "#4db8ff",
-    "accent.deep": "#17496b",
-    "ok": "#3ddc97",
-    "warn": "#ffb545",
-    "danger": "#ff5f5f",
+    "bg.window": "#161616",
+    "bg.panel": "#1c1c1c",
+    "bg.card": "#222222",
+    "bg.raised": "#2c2c2c",
+    "bg.viewport": "#121316",
+    "line": "#303030",
+    "line.strong": "#454545",
+    "text.0": "#e6e6e6",
+    "text.1": "#a9a9a9",
+    "text.2": "#747474",
+    "accent": "#5aa9ff",
+    "accent.deep": "#22415f",
+    "primary": "#3d6f0b",
+    "primary.hover": "#4c8a10",
+    "primary.line": "#76b900",
+    "ego": "#59e6ff",
+    "ok": "#76b900",
+    "warn": "#f0a030",
+    "danger": "#ff5c5c",
     "rival": "#f2a044",
     # -- instrument shading. The gauges are drawn objects, not charts, so they get their own few
     # tones: a dial well that is slightly lighter at the top, a rim with a top-lit gradient, and a
     # needle that stays white against both.
-    "bg.dial.hi": "#222c39",
-    "bg.dial.lo": "#131a23",
-    "needle": "#f4f8ff",
-    "rim.hi": "#5b6b7e",
-    "rim.lo": "#2c3745",
-    "rim.edge": "#151c25",
-    "rim.grip": "#78899d",
-    "spoke": "#4a5a6c",
+    "bg.dial.hi": "#2a2a2a",
+    "bg.dial.lo": "#1a1a1a",
+    "needle": "#f2f2f2",
+    "rim.hi": "#5a5a5a",
+    "rim.lo": "#333333",
+    "rim.edge": "#171717",
+    "rim.grip": "#767676",
+    "spoke": "#4d4d4d",
 }
 
 # ---------------------------------------------------------------- type
@@ -46,14 +53,14 @@ UI_FONT = "Noto Sans CJK KR"
 MONO_FONT = "DejaVu Sans Mono"
 FONT_FALLBACK = ["Noto Sans CJK KR", "NanumGothic", "Noto Sans", "DejaVu Sans"]
 
-SIZE = {"title": 17, "section": 13, "body": 13, "label": 12, "hint": 11, "metric": 26, "metric.sm": 15}
+SIZE = {"title": 14, "section": 11, "body": 12, "label": 11, "hint": 11, "metric": 24, "metric.sm": 14}
 
 # ---------------------------------------------------------------- spacing
 SP = (4, 8, 12, 16, 24)
-RADIUS_CTL = 6
-RADIUS_CARD = 10
-MIN_CTL_H = 30
-MAIN_BTN_H = 36
+RADIUS_CTL = 3
+RADIUS_CARD = 4
+MIN_CTL_H = 26
+MAIN_BTN_H = 32
 
 
 def clear_color():
@@ -103,8 +110,8 @@ QToolTip {{
     border-radius: {RADIUS_CARD}px;
 }}
 #SectionLabel {{
-    font-size: {SIZE['section']}px; font-weight: 600; color: {c['text.1']};
-    letter-spacing: 0.4px;
+    font-size: {SIZE['section']}px; font-weight: 600; color: {c['text.2']};
+    letter-spacing: 1.1px;
 }}
 #FieldLabel {{ font-size: {SIZE['label']}px; font-weight: 500; color: {c['text.1']}; }}
 #Hint {{ font-size: {SIZE['hint']}px; color: {c['text.2']}; }}
@@ -133,15 +140,15 @@ QPushButton:disabled {{ color: {c['text.2']}; border-color: {c['line']}; backgro
 QPushButton:checked {{
     background: {c['accent.deep']}; border-color: {c['accent']}; color: {c['text.0']};
 }}
-QPushButton:focus {{ outline: none; border: 2px solid {c['accent']}; }}
+QPushButton:focus {{ outline: none; border: 1px solid {c['accent']}; }}
 QPushButton[pending="true"] {{
     border: 1px dashed {c['warn']}; color: {c['warn']}; background: {c['bg.panel']};
 }}
 #PrimaryButton {{
-    background: {c['accent.deep']}; border: 1px solid {c['accent']};
+    background: {c['primary']}; border: 1px solid {c['primary.line']};
     color: #ffffff; font-weight: 600; min-height: {MAIN_BTN_H - 14}px;
 }}
-#PrimaryButton:hover:!disabled {{ background: #1e6392; }}
+#PrimaryButton:hover:!disabled {{ background: {c['primary.hover']}; }}
 #PrimaryButton:disabled {{ background: {c['bg.panel']}; border-color: {c['line']}; color: {c['text.2']}; }}
 #DangerButton {{ border-color: #5a2a2a; color: {c['danger']}; }}
 #DangerButton:hover:!disabled {{ background: #3a1c1c; border-color: {c['danger']}; }}
@@ -155,7 +162,7 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     padding: 5px 8px; min-height: {MIN_CTL_H - 12}px;
     selection-background-color: {c['accent.deep']};
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{ border: 2px solid {c['accent']}; }}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{ border: 1px solid {c['accent']}; }}
 QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{ color: {c['text.2']}; }}
 #SearchBox {{ font-family: "{MONO_FONT}", monospace; }}
 QComboBox::drop-down {{ border: none; width: 18px; }}

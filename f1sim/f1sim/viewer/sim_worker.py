@@ -61,6 +61,7 @@ import numpy as np
 
 from .console import protocol as P
 from .console.protocol import LatestSlot
+from .console.catalog import SCENES_GROUP
 
 #: Frames the worker will let pile up before dropping the oldest. Two is enough to cover a hiccup
 #: in the console without storing latency: what the viewer wants is the newest state, not a queue.
@@ -104,19 +105,11 @@ ATT_SCALE_FIXED = 0.35
 #: action scaled differently while every dimension still matches.
 NORMALIZER_FIELDS = ("v_max", "range_max", "gyro_scale", "accel_scale", "att_scale")
 
-#: Bumped when `build_geometry` changes what it emits, so a console can branch on what it actually
-#: received rather than on which build it thinks it is talking to. 1 = canvas-shaped floor quad and
-#: the padded-border contours; 2 = content-derived framing, apron + backdrop, smoothed contours.
-#: A payload without the key is version 1 by definition, which keeps an older worker readable.
-GEOMETRY_VERSION = 2
-
-#: Gaussian blur applied to the occupancy mask before marching squares, in grid cells. Marching
-#: squares on a binary grid can only put a vertex at a cell midpoint, so a diagonal wall comes out as
-#: treads and risers; blurring lets the 0.5 crossing fall between them. Chosen at 0.5 because that is
-#: where the axis-aligned segment share stops improving much (Korea duct 13 % -> 4.5 %) while the
-#: measured deviation from the unblurred contour is still a fraction of a cell -- the tuning table is
-#: in work/claude-map-redesign/evidence/contour_tuning.json.
-SMOOTH_SIGMA = 0.5
+# `GEOMETRY_VERSION`, `SMOOTH_SIGMA`, `_bbox`, `prop_batches` and the body of `build_geometry` live
+# in `viewer/geometry.py` now (torch-free, shared with the environment editor); re-exported here so
+# every existing import keeps working.
+from .geometry import GEOMETRY_VERSION, SMOOTH_SIGMA, PropBuildError, _bbox, build_track_geometry   # noqa: E402,F401
+from .geometry import prop_batches as _prop_batches_impl                                            # noqa: E402
 
 
 def _now() -> float:
@@ -138,6 +131,43 @@ class WorkerExit(Exception):
 
 class Cancelled(Exception):
     """A start was abandoned (the user changed their mind while it was preparing)."""
+
+
+class MuPin:
+    """Hold every car's true friction at one value across resets.
+
+    `sim.P["mu"]` is a view into the parameter bank, and `ParamSet.resample` rewrites it on every
+    reset, so a one-off write would last exactly one episode. This wraps `env._reset_envs` the way
+    the grip runtime's command spy does and re-applies the value to the ids that were just reset.
+    Only mu is pinned; the other randomised parameters keep doing what the session asked.
+    """
+
+    def __init__(self, env, mu: float):
+        self.env, self.mu, self._orig = env, float(mu), None
+
+    def install(self) -> "MuPin":
+        if self._orig is not None:
+            raise RuntimeError("already installed")
+        self._orig = self.env._reset_envs
+
+        def wrapped(ids):
+            out = self._orig(ids)
+            if ids.numel():
+                self.env.sim.P["mu"][ids] = self.mu
+            return out
+
+        self.env._reset_envs = wrapped
+        return self
+
+    def set(self, mu: float) -> None:
+        """Change the pinned value and apply it to every car now, mid-episode."""
+        self.mu = float(mu)
+        self.env.sim.P["mu"].fill_(self.mu)
+
+    def release(self) -> None:
+        if self._orig is not None:
+            self.env._reset_envs = self._orig
+            self._orig = None
 
 
 class StartConfigError(ValueError):
@@ -284,69 +314,15 @@ def _copy(a) -> np.ndarray:
 
 
 def prop_batches(track) -> list:
-    """Every placed prop on `track`, transformed into world space and merged by material.
+    """`geometry.prop_batches`, with its failure reported as this module's `StartConfigError`.
 
-    Merged because the alternative is one draw call per box: a map can place a few dozen, and the
-    whole catalogue uses four materials, so this is four uploads however many props there are.
-    Built here rather than in the console because it is numpy work, and the console thread that
-    would otherwise do it is the one holding the GL context.
-
-    `StaticProp.build()` is deterministic in `(style, seed, dims)`, so identical placements share
-    one build -- a row of the same crate costs one mesh and a per-instance transform.
-
-    **A prop that will not build raises.** It must not be skipped: the placement stays in
-    `track.props`, so the simulator still collides with it and the LiDAR still returns it, and
-    dropping only its mesh produces an obstacle that is there in every way except on screen. That
-    invisible collider is the exact failure `StaticProp` exists to prevent -- see its docstring.
-    Refusing to prepare the session is the only honest outcome. A track that places nothing is a
-    different thing entirely and returns an empty list.
+    The obstacle stays in the simulation whether or not it can be drawn, so a prop that will not
+    build refuses the session rather than vanishing from the screen -- see `geometry.prop_batches`.
     """
-    placed = tuple(getattr(track, "props", ()) or ())
-    if not placed:
-        return []
-    parts: "OrderedDict[str, list]" = OrderedDict()
-    counts: Dict[str, int] = {}
-    cache: Dict[tuple, Any] = {}
-    for sp in placed:
-        key = (sp.style, int(sp.seed), tuple(sp.dims))
-        prop = cache.get(key)
-        if prop is None:
-            try:
-                prop = sp.build()
-            except Exception as exc:
-                raise StartConfigError(
-                    f"맵의 정적 장애물 '{getattr(sp, 'style', '?')}' 을 만들지 못했습니다: {exc}\n"
-                    f"이 장애물은 시뮬레이터와 LiDAR 에는 그대로 존재하므로, 그리지 못한 채로 "
-                    f"주행하면 화면에 없는 충돌체가 됩니다. 세션을 시작하지 않습니다."
-                ) from exc
-            cache[key] = prop
-        c, s_ = math.cos(float(sp.yaw)), math.sin(float(sp.yaw))
-        rot = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]], np.float32)
-        off = np.array([float(sp.x), float(sp.y), 0.0], np.float32)
-        for part in prop.parts:
-            bucket = parts.setdefault(part.material, [])
-            bucket.append((part.pos @ rot.T + off, part.nrm @ rot.T, part.col, part.idx))
-            counts[part.material] = counts.get(part.material, 0) + 1
-    out = []
-    for material, chunks in parts.items():
-        pos_l, nrm_l, col_l, idx_l, base = [], [], [], [], 0
-        for pos, nrm, col, idx in chunks:
-            pos_l.append(pos)
-            nrm_l.append(nrm)
-            col_l.append(col)
-            idx_l.append(idx.astype(np.int32) + base)
-            base += len(pos)
-        idx = np.concatenate(idx_l)
-        out.append({
-            "material": material,
-            "pos": np.concatenate(pos_l).astype(np.float32),
-            "nrm": np.concatenate(nrm_l).astype(np.float32),
-            "col": np.concatenate(col_l).astype(np.float32),
-            "idx": idx,
-            "n_props": counts.get(material, 0),
-            "n_tris": int(len(idx) // 3),
-        })
-    return out
+    try:
+        return _prop_batches_impl(track)
+    except PropBuildError as exc:
+        raise StartConfigError(str(exc)) from exc
 
 
 def _physics_fell_back(session) -> Optional[bool]:
@@ -568,7 +544,14 @@ class SimWorker:
             prop_bases.append((base, direction))
         props_variants = [f"{base}+props{seed}" + (f"~{d}" if d else "")
                           for base, d in prop_bases for seed in prop_seeds]
-        return {
+        groups: Dict[str, List[str]] = {}
+        # The user's own environments (환경 page) come first when there are any: someone who just
+        # pressed 주행 in the editor is looking for the scene they built, not the eval split.
+        # Omitted entirely when empty, so the picker never shows an empty group.
+        scenes = [f"scene:{n}" for n in maps.scene_names()]
+        if scenes:
+            groups[SCENES_GROUP] = scenes
+        groups.update({
             "기본 평가셋": uniq(common.EVAL_TRACKS),
             # The obstacles a viewer session should normally be looking at.
             "장애물 (상자·궤짝·드럼)": uniq(props_variants),
@@ -578,8 +561,9 @@ class SimWorker:
             # rectangles of one height with no top -- not the modelled props above. Reproducing an
             # earlier result needs these; looking at obstacles does not.
             "이전 실험 재현 (격자 장애물)": uniq(common.EVAL_OBSTACLE_TRACKS),
-            "전체 카탈로그": uniq(catalog),
-        }
+            "전체 카탈로그": uniq(catalog + scenes),
+        })
+        return groups
 
     def describe_checkpoint(self, run: str) -> dict:
         """Read a checkpoint's metadata without building anything."""
@@ -610,6 +594,11 @@ class SimWorker:
     # ================================================================ session build
     def load_track(self, name: str):
         from ..learn import common
+        if name.startswith("scene:"):
+            # An editor scene is edited and driven again inside one worker lifetime; a cached
+            # track would be the scene as it was the first time. `maps.load` keys its own cache
+            # on the files' mtimes, so a reload here is cheap when nothing changed.
+            self._track_cache.pop(name, None)
         if name in self._track_cache:
             self._track_cache.move_to_end(name)
             return self._track_cache[name]
@@ -677,7 +666,33 @@ class SimWorker:
         # Nothing to compile on the CPU: inductor leaves this graph of hundreds of tiny ops alone.
         compile_enabled = bool(cfg.compile) and device.type == "cuda"
 
-        model, extra = load_checkpoint(ckpt_path, device)
+        # The plan-controller arm this session installs. A checkpoint trained under a non-legacy
+        # arm may only run under that same arm; legacy-trained weights may run under any arm (the
+        # benchmark's declared cross-runtime case, and the configuration that scored best).
+        arm = str(getattr(cfg, "controller", "legacy") or "legacy")
+        if arm not in ("legacy", "estimated", "fixed_low", "oracle"):
+            raise StartConfigError(f"플랜 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 (legacy / estimated / fixed_low / oracle).")
+        if arm != "legacy" and int(cfg.cars_per_race) > 1:
+            raise StartConfigError(f"플랜 제어기 '{arm}' 은 레이스당 차량 수 1에서만 지원합니다 "
+                                   f"(학습·벤치마크와 같은 조건). 레이스당 차량 수를 1로 두거나 legacy 를 고르세요.")
+        estimator_path = ""
+        if arm == "estimated":
+            from .console.protocol import SessionConfig as _SC
+            estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
+            if not estimator_path or not os.path.isfile(estimator_path):
+                raise StartConfigError("estimated 제어기는 노면 추정기 .pt 가 필요합니다. 고급 설정의 '노면 추정기' 에 "
+                                       "경로를 넣거나 ~/f1sim_runs/_estimators/estimator_seed401.pt 를 두세요.")
+        # Peek the arm the checkpoint was trained under before loading, so a mismatch is a start
+        # message that names the setting to change rather than the loader's refusal.
+        from ..learn.model import controller_arm_of
+        try:
+            recorded = controller_arm_of(torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=True))
+        except Exception:
+            recorded = "legacy"                  # the loader below will say what is wrong with it
+        if recorded != "legacy" and recorded != arm:
+            raise StartConfigError(f"{os.path.basename(ckpt_path)}: '{recorded}' 제어기로 학습된 체크포인트입니다. "
+                                   f"고급 설정의 플랜 제어기를 '{recorded}' 로 맞추세요 (현재 '{arm}').")
+        model, extra = load_checkpoint(ckpt_path, device, allow_controller=(arm != "legacy"))
         model.eval()
         intro = Introspector(model)
         act_dim = model.meta.get("act_dim", 2)
@@ -748,6 +763,9 @@ class SimWorker:
         env = common.make_env([track], n_cars, device, env_cfg, cfg=sim_cfg,
                               rls=rls if need_rl else None)
         env.sim.tid.fill_(0)                       # every car on the map that was asked for
+        mu_pin = None
+        if str(getattr(cfg, "mu_mode", "random")) == "fixed":
+            mu_pin = MuPin(env, float(getattr(cfg, "mu", 1.0489))).install()   # before the first reset
 
         env_spec = common.obs_spec(env)
         problems = (obs_spec_problems(model.meta, env_spec, extra.get("skipped") or [], env.act_dim)
@@ -767,6 +785,7 @@ class SimWorker:
         self._check_cancel(gen)
 
         session = {
+            "mu_pin": mu_pin,
             "env": env, "model": model, "extra": extra, "intro": intro, "device": device,
             "mode": mode, "ckpt_path": ckpt_path, "mtime": os.path.getmtime(ckpt_path),
             "autoselect": autoselect,
@@ -791,6 +810,22 @@ class SimWorker:
         # through the `sim -> _roll -> fastpath -> sim` cycle.
         if not compile_enabled:
             self._prepare_fastpath(session, gen)
+        if arm != "legacy":
+            # After the graphs: `install` hooks `tracker._solver`, and the fast path's captured MPC
+            # arguments let the grip solver capture its own graph instead of running eager.
+            from ..learn.grip_runtime import ControllerRuntime
+            self.say(P.MSG_LOG, gen=gen, text=f"플랜 제어기 설치: {arm}"
+                     + (f" | 추정기 {os.path.basename(estimator_path)}" if estimator_path else ""))
+            rt = ControllerRuntime(env, arm, estimator_path or None, device=device)
+            try:
+                rt.install(graph_rt=session.get("fastpath"), adopt=False)   # adopted on the sim thread
+                rt.begin(session["obs"])
+            except BaseException:
+                rt.release()
+                raise
+            session["controller"] = rt
+            session["controller_arm"] = arm
+            session["estimator_path"] = estimator_path
         return session
 
     # ------------------------------------------------------------- graph capture
@@ -917,68 +952,13 @@ class SimWorker:
     def build_geometry(self, track, raceline=None) -> dict:
         """Static map meshes as plain arrays, ready for the console to upload.
 
-        Contours, smoothing, the duct offset and the tube/wall vertex generation all happen here.
-        The render thread's share is a buffer write.
+        The body is `geometry.build_track_geometry` (torch-free, shared with the environment
+        editor); this keeps the worker's error type for a prop that cannot be built.
         """
-        from .gl_scene import (apron_mesh_arrays, backdrop_mesh_arrays, content_frame,
-                               duct_mesh_arrays, wall_mesh_arrays)
-        from .native import track_contours_mask
-        t0 = time.perf_counter()
-        H, W = track.shape
-        res = float(track.resolution)
-        bounds = (float(track.origin[0]), float(track.origin[1]),
-                  float(track.origin[0] + W * res), float(track.origin[1] + H * res))
-
-        def occupied(xy, mask=track.duct, tr=track):
-            # floor, not truncation: `astype(int)` rounds toward zero, so a probe just outside the
-            # map on the low side lands on cell 0 and reads whatever is there. Out of bounds is
-            # unknown, not solid, and reporting it as solid biases the duct's solid-side vote.
-            j = np.floor((xy[:, 0] - tr.origin[0]) / tr.resolution).astype(np.int64)
-            i = np.floor((xy[:, 1] - tr.origin[1]) / tr.resolution).astype(np.int64)
-            ok = (i >= 0) & (i < mask.shape[0]) & (j >= 0) & (j < mask.shape[1])
-            out = np.zeros(len(xy), bool)
-            out[ok] = mask[i[ok], j[ok]]
-            return out
-
-        def is_solid(xy, tr=track):
-            col = int(round((xy[0] - tr.origin[0]) / tr.resolution))
-            row = int(round((xy[1] - tr.origin[1]) / tr.resolution))
-            return 0 <= row < H and 0 <= col < W and bool(tr.tall[row, col])
-
-        # `outside_occupied=False`: the map file's canvas perimeter is not a wall. See track_contours.
-        # `clip_canvas_edge` on the tall layer only: that is where a cropped SLAM surround lives, and
-        # its outward silhouette is the crude rectangle around the track. Ducts are the track's own
-        # walls -- clipping those would delete real boundary on a map that runs to its edge.
-        duct_c = track_contours_mask(track, track.duct, outside_occupied=False, sigma_cells=SMOOTH_SIGMA)
-        tall_c = track_contours_mask(track, track.tall, outside_occupied=False, sigma_cells=SMOOTH_SIGMA,
-                                     clip_canvas_edge=True)
-        ducts = duct_mesh_arrays(duct_c, track.duct_height, occupied=occupied, resolution=res)
-        walls = wall_mesh_arrays(tall_c, height=1.0, is_solid=is_solid, resolution=res)
-
-        centerline = np.asarray(track.centerline, np.float32) if track.centerline is not None else None
-        raceline_xy = np.asarray(raceline.xy, np.float32) if raceline is not None else None
-        # Frame on what is actually drawn, never on the canvas or on the occupancy grid: with
-        # `unknown_is_obstacle` the occupied cells can span the whole file.
-        # heading from the track itself, size from everything drawn -- see content_frame
-        orient = [centerline] if centerline is not None else duct_c
-        angle, centre, extent = content_frame(orient, duct_c + tall_c + [centerline, raceline_xy])
-        content_bounds = _bbox(duct_c + tall_c + [centerline, raceline_xy])
-        return {
-            "name": track.name, "bounds": bounds, "duct_height": float(track.duct_height),
-            "floor": apron_mesh_arrays(angle, centre, extent), "ducts": ducts, "walls": walls,
-            "backdrop": backdrop_mesh_arrays(centre, extent),
-            "content_bounds": content_bounds,
-            "presentation": {"up_angle_deg": float(math.degrees(angle)),
-                             "center": (float(centre[0]), float(centre[1])),
-                             "extent": (float(extent[0]), float(extent[1]))},
-            "geometry_version": GEOMETRY_VERSION,
-            # Optional: absent, or an empty list, on every track that places nothing.
-            "props": prop_batches(track),
-            "centerline": centerline,
-            "raceline_xy": raceline_xy,
-            "raceline_v": (np.asarray(raceline.v, np.float32) if raceline is not None else None),
-            "build_ms": (time.perf_counter() - t0) * 1e3,
-        }
+        try:
+            return build_track_geometry(track, raceline)
+        except PropBuildError as exc:
+            raise StartConfigError(str(exc)) from exc
 
     def session_facts(self, session: dict, gen: int) -> dict:
         """What was actually built. The console shows this, never what the user asked for."""
@@ -1009,6 +989,8 @@ class SimWorker:
             # the *actor* only -- the physics is compiled separately and reported below, and one
             # must not be read as evidence for the other.
             "actor_compiled": bool(getattr(session.get("act_fn"), "compiled", False)),
+            "controller": str(session.get("controller_arm") or "legacy"),
+            "estimator": os.path.basename(session.get("estimator_path") or ""),
             "physics_compile_requested": bool(env.sim.cfg.sim.compile),
             "physics_compile_mode": str(env.sim.cfg.sim.compile_mode),
             # The explicit CUDA-graph fast path, reported separately from `compile` because they are
@@ -1030,6 +1012,8 @@ class SimWorker:
             "action_mode": session["mode"],
             "info_line": session["info_line"],
             "randomize": bool(cfg.randomize),
+            "mu_mode": str(getattr(cfg, "mu_mode", "random")),
+            "mu": float(getattr(cfg, "mu", 1.0489)),
             "lidar": {"fov": float(env.cfg.lidar.fov), "range_max": float(env.range_max),
                       "n_beams": int(env.n_beams)},
             "vehicle": {"lr": float(env.cfg.vehicle.lr), "cog_z": COG_Z, "wheel_r": WHEEL_R},
@@ -1048,6 +1032,9 @@ class SimWorker:
         from ..learn.obs import flatten_obs
         env = session["env"]
         model = session["model"]
+        rt = session.get("controller")
+        if rt is not None:
+            rt.pre_action(session["obs"])          # history, friction estimate, MPC limits: before the action
         scan, pro = flatten_obs(session["obs"])
         with torch.no_grad():
             mu = session["act_fn"](scan, pro).clone()
@@ -1056,6 +1043,8 @@ class SimWorker:
             else:
                 act = mu
         session["obs"], _rew, _term, _trunc, _info = env.step(act)
+        if rt is not None:
+            rt.post_step(_term, _trunc)             # issued command + episode boundaries
         session["k"] += 1
 
     def _reload_if_changed(self, session) -> None:
@@ -1077,7 +1066,8 @@ class SimWorker:
             from ..learn import common
             from ..learn.model import load_checkpoint
             from ..learn.watch import Introspector, actor_runner, describe_checkpoint_line
-            model, extra = load_checkpoint(session["ckpt_path"], session["device"])
+            model, extra = load_checkpoint(session["ckpt_path"], session["device"],
+                                           allow_controller=session.get("controller") is not None)
             model.eval()
             env_spec = common.obs_spec(session["env"])
             # The environment is already built, so a newer checkpoint with different normalizers
@@ -1286,8 +1276,25 @@ class SimWorker:
             self.say(P.MSG_ACK, seq=seq, command="pause", gen=self.gen,
                      state={"paused": self.paused, "last_seq": self.seq - 1,
                             "t": float(session["env"].sim.t)})
+        elif kind == P.CMD_SET_MU:
+            mode = str(msg.get("mode", "fixed"))
+            mu = float(msg.get("mu", 1.0489))
+            pin = session.get("mu_pin")
+            if mode == "fixed":
+                if pin is None:
+                    pin = MuPin(session["env"], mu).install()
+                    session["mu_pin"] = pin
+                pin.set(mu)                       # every car, now; and every reset from here on
+            elif pin is not None:
+                pin.release()                     # cars keep their value until their next reset
+                session["mu_pin"] = None
+            self.say(P.MSG_ACK, seq=seq, command="set_mu", gen=self.gen,
+                     state={"mu_mode": mode, "mu": mu, "last_seq": self.seq - 1,
+                            "t": float(session["env"].sim.t)})
         elif kind == P.CMD_RESET:
             session["obs"], _ = session["env"].reset()
+            if session.get("controller") is not None:
+                session["controller"].begin(session["obs"])
             session["gg"].clear()
             self._sal_cache = None
             reanchor = True
@@ -1345,6 +1352,9 @@ class SimWorker:
                 # thread that will replay them, and the only one. Transfer before the first step,
                 # with the device synchronise that makes the handover real.
                 fastpath.adopt()
+            ctrl = session.get("controller")
+            if ctrl is not None:
+                ctrl.adopt()                       # the grip solver graph, same rule as above
             while self.alive and self.gen == gen and self.running:
                 # While a new session is being built, only `pause` is applied here: it is the one
                 # command that touches no tensor. Everything else waits, because the control
@@ -1440,7 +1450,7 @@ class SimWorker:
             self.say(P.MSG_ACK, seq=seq, command="cancel", gen=gen,
                      state={"preparing": self.prepare_gen})
 
-        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY):
+        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU):
             # These act on a live session. If one is running, its own thread applies them and acks
             # from there, so the ack means "done" rather than "heard".
             if self._sim_thread is not None and self._sim_thread.is_alive():
@@ -1571,6 +1581,12 @@ class SimWorker:
             # `_swap_in` failed, so this session was never handed over and nothing else will free
             # it. Its fast path still holds `sim._roll`, which is the reference cycle that would
             # keep the whole env resident.
+            ctrl = session.pop("controller", None)
+            if ctrl is not None:
+                try:
+                    ctrl.release()
+                except Exception:
+                    pass
             fp = session.pop("fastpath", None)
             if fp is not None:
                 try:
@@ -1724,6 +1740,21 @@ class SimWorker:
             # dispatcher installed would fail one step *after* the teardown, reading as an
             # unrelated crash, and its `sim -> _roll -> fastpath -> sim` cycle is what would keep
             # this env alive past the `gc.collect()` below.
+            # The controller first: it wraps the solver the fast path installed, and restoring
+            # them in the wrong order would leave the grip solver hooked to a released graph.
+            ctrl = session.pop("controller", None)
+            if ctrl is not None:
+                try:
+                    ctrl.release()
+                except Exception:
+                    pass
+                del ctrl
+            pin = session.pop("mu_pin", None)
+            if pin is not None:
+                try:
+                    pin.release()
+                except Exception:
+                    pass
             fastpath = session.pop("fastpath", None)
             if fastpath is not None:
                 fastpath.release()

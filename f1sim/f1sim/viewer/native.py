@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from . import gl_scene as G
-from .server import track_contours
+from .contours import track_contours, track_contours_mask   # noqa: F401
 
 MODES = ["chase", "top", "orbit", "overview", "closeup"]
 
@@ -713,12 +713,3 @@ class NativeViewer:
     def _on_resize(self, win, w, h):
         self.width, self.height = max(1, w), max(1, h)
         self.scene.resize(self.width, self.height)
-
-
-def track_contours_mask(track, mask, outside_occupied: bool = True, sigma_cells: float = 0.0,
-                        clip_canvas_edge: bool = False):
-    """Contours of an arbitrary boolean mask on the track grid (reuses server.track_contours)."""
-    class _T:  # duck-typed view with the mask as occupancy
-        occupancy = mask; resolution = track.resolution; origin = track.origin
-    return track_contours(_T, outside_occupied=outside_occupied, sigma_cells=sigma_cells,
-                          clip_canvas_edge=clip_canvas_edge)

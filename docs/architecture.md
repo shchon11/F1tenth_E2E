@@ -89,6 +89,7 @@ at 1.0 today, so the front/rear grip asymmetry varies only through the front fac
 | `gym:<name>` | `f1tenth_gym` maps, including real SLAM hallways |
 | `real:<name>` | SLAM maps of real venues from public repositories |
 | any ROS map YAML | loaded directly; a centerline is extracted automatically if absent |
+| `scene:<name>` | a scene saved by the console's [environment editor](environment_editor.md) (`~/f1sim_scenes/<name>/`): duct and tall layers kept separately, props including imported meshes, centerline |
 
 Appending `+obs<N>` rasterises static boxes into the lane, as the competitions do. `+props<N>` is
 the separate, newer spelling: modelled obstacles — `cardboard_box`, `wooden_crate`, `steel_drum`,
@@ -170,6 +171,9 @@ Two separate front ends:
 - **The legacy GL viewer** below is the older in-process moderngl window, reached through
   `demo_viewer.py` and the headless recording paths. It is still the renderer the console's worker
   drives, and the keys listed here apply to it.
+- The console's **환경 page** is an environment editor on the same renderer: a free camera, ground
+  picking and overlays over `gl_scene.Scene`, editing a `SceneDoc` that loads as `scene:<name>`.
+  See [Environment editor](environment_editor.md).
 
 ```bash
 python3 f1sim/scripts/demo_viewer.py --seed 1 --cars 8        # window, paced to real time

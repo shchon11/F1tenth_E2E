@@ -198,6 +198,33 @@ and watch it drive:
 python3 -m f1sim.learn.watch          # console; same as python3 -m f1sim.viewer.console
 ```
 
+**Plan controller.** *고급 설정 > 플랜 제어기* selects the arm the session installs: `legacy` is the
+untouched MPC; `estimated` and `fixed_low` apply the grip-aware curvature speed limit and
+mu-dependent acceleration/brake budgets (`learn/grip_control.py`, the `@estimated` rows of the
+[checkpoint benchmark](benchmark.md)). `estimated` needs a frozen estimator `.pt`; the field is
+pre-filled from `$F1SIM_GRIP_ESTIMATOR` or `~/f1sim_runs/_estimators/estimator_seed401.pt` when one
+exists. One car per race only, as in training. A checkpoint trained under a non-legacy arm opens only
+under that arm; a legacy-trained checkpoint opens under any — the "train legacy, deploy clamped"
+configuration in [recipe-restore](research/recipe-restore-2026-09-12.md). The session facts carry
+`controller` / `estimator` so the header says which was used.
+
+**Surface friction.** *구성 > 노면 마찰 μ* is `랜덤` (per car, per reset, from the training range when
+randomisation is on) or `고정`: one value pinned for every car and re-applied after each reset. The
+`적용` button pushes a new fixed value into a running session immediately (all cars, mid-episode);
+switching back to `랜덤` lets the next reset draw again. The panel's `시뮬 참값 μ` always shows what
+the watched car actually has.
+
+**Training from the console.** The header's *학습* page launches and watches PPO runs without
+leaving the window. The recipe form starts from presets (`원본 레이스 레시피` = the original policy's
+own conditions, `SGR`, `R10`, or custom), shows the exact `python -m f1sim.learn.ppo …` it will run,
+and starts it as a detached process (its own session: closing the console does not stop training).
+Records live in `~/f1sim_runs/_console_jobs/`, the job's output in `<run>/console-train.log`. The
+monitor parses the trainer's own `upd k/N …` lines -- from that log, or from a run's W&B
+`output.log`, so runs started from a shell are watchable too -- into progress, ETA, and six curves
+(reward/step, collisions/km, progress, lap time, KL to the original, throughput), lists the run's
+checkpoints, and *주행 화면에서 보기* makes one the driving page's next start. *중지* sends SIGINT
+(the last periodic checkpoint is what remains) and SIGTERM on a second press after 12 s.
+
 PyQt5 is **not** in the `[viewer]` extra (which is `moderngl`, `glfw`, `trimesh`) and nothing here
 installs it; if it is missing the console says so and points at `--legacy-launcher`, the older Tk
 picker. Importing `f1sim.learn.watch` for a headless run does not import Qt, so the recording paths

@@ -268,7 +268,7 @@ class ControllerRuntime:
             raise ValueError(f"arm {arm!r} needs GripSpec(mode={mode!r}), got {self.gspec.mode!r}")
 
     # -- lifecycle ---------------------------------------------------------------
-    def install(self, graph_rt=None) -> "ControllerRuntime":
+    def install(self, graph_rt=None, adopt: bool = True) -> "ControllerRuntime":
         """Install the MPC hook and the command spy. **After** `prepare_graph_runtime`.
 
         `prepare_graph_runtime` captures `mpc.solve` and assigns `tracker._solver`, so a hook
@@ -297,11 +297,17 @@ class ControllerRuntime:
         mpc_graph = getattr(graph_rt, "mpc", None) if graph_rt is not None else None
         if mpc_graph is not None and self.device.type == "cuda":
             example = list(mpc_graph._static)      # the eleven args, recorded from real steps
-        self.grip.install(graph=example is not None, example_args=example)
+        self.grip.install(graph=example is not None, example_args=example, adopt=adopt)
         self.graphed = example is not None
         self.spy = IssuedCommandSpy(self.env).install()
         self._installed = True
         return self
+
+    def adopt(self) -> None:
+        """Transfer the grip solver graph to the calling thread (viewer: the sim thread). See
+        `GripMPC.install(adopt=False)`. No-op for the legacy arm or an eager solver."""
+        if self.grip is not None:
+            self.grip.adopt()
 
     def _load_estimator(self) -> None:
         """Load the student, prove it is frozen, and keep the module that actually holds the weights.

@@ -305,9 +305,11 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self._badge.setAlignment(QtCore.Qt.AlignCenter)
 
         self._corner = QtWidgets.QLabel(self)
+        # Viewport chips, the way a DCC viewport labels itself: small monospace, a translucent
+        # graphite slab, a hairline border -- readable over any part of the scene, never a card.
         self._corner.setStyleSheet(
-            f"color: {C['text.1']}; background: rgba(13,17,23,190); border: 1px solid {C['line']};"
-            f"border-radius: 6px; padding: 5px 9px; font-family: '{theme.MONO_FONT}', monospace;"
+            f"color: {C['text.1']}; background: rgba(18,19,22,205); border: 1px solid rgba(255,255,255,0.10);"
+            f"border-radius: 3px; padding: 4px 8px; font-family: '{theme.MONO_FONT}', monospace;"
             f"font-size: {theme.SIZE['hint']}px;")
         self._corner.setVisible(False)
 
@@ -507,6 +509,18 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             self._clear_geometry = False
         self.update()
 
+    def _upload_static(self, layer: str, arrays, **kw):
+        """Upload one static mesh and tag it with the layer it came from.
+
+        `Scene.static` is a flat list, and once the arrays are on the GPU nothing else records
+        whether a mesh is the floor, a hose or a wall. The tag costs nothing here and is what lets
+        a draw path with layer visibility (the environment editor's) skip a layer by name --
+        `Scene.draw_static(hidden=...)`. The session viewport's `draw_frame` ignores it.
+        """
+        m = self.scene.add_static_mesh(*arrays, **kw)
+        m.layer = layer
+        return m
+
     def _apply_geometry(self):
         if self.scene is None:
             return
@@ -531,20 +545,20 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             # `fract(world.xy)`, a 1 m lattice, and the backdrop is a disc hundreds of metres
             # across -- at overview distance that lattice is pure moire. Its rim is already the
             # scene's clear colour, which is the whole point: the ground stops having a hard edge.
-            self.scene.add_static_mesh(*geom.backdrop, material="rubber",
-                                       grid=False, casts=False, cull=False)
+            self._upload_static("backdrop", geom.backdrop, material="rubber",
+                                grid=False, casts=False, cull=False)
         if geom.floor is not None:
-            self.scene.add_static_mesh(*geom.floor, material="rubber", grid=True, casts=False)
+            self._upload_static("floor", geom.floor, material="rubber", grid=True, casts=False)
         if geom.ducts is not None:
-            self.scene.add_static_mesh(*geom.ducts, material="metal", stripes=True)
+            self._upload_static("ducts", geom.ducts, material="metal", stripes=True)
         if geom.walls is not None:
-            self.scene.add_static_mesh(*geom.walls, material="plastic", cull=False)
+            self._upload_static("walls", geom.walls, material="plastic", cull=False)
         for batch in (geom.props or ()):
             # Closed solids standing on the floor, so unlike the walls they cull and cast: a
             # cardboard box with no shadow reads as a decal rather than an object. The arrays
             # arrive world-transformed and merged, so this is an upload, not a build.
             arrays = tuple(batch[k] for k in ("pos", "nrm", "col", "idx"))
-            self.scene.add_static_mesh(*arrays, material=str(batch.get("material", "plastic")))
+            self._upload_static("props", arrays, material=str(batch.get("material", "plastic")))
         if geom.centerline is not None and len(geom.centerline) > 1:
             cl = np.vstack([geom.centerline, geom.centerline[:1]])
             self.scene.add_line("centerline", cl, (0.35, 0.55, 0.9, 0.35), z=0.008)
@@ -591,8 +605,9 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         colour = colour or C["warn"]
         self._badge.setText(text)
         self._badge.setStyleSheet(
-            f"color: {colour}; background: rgba(13,17,23,215); border: 1px solid {colour};"
-            f"border-radius: 8px; padding: 6px 12px; font-weight: 600; font-size: {theme.SIZE['label']}px;")
+            f"color: {colour}; background: rgba(18,19,22,215); border: 1px solid {colour};"
+            f"border-radius: 3px; padding: 4px 10px; font-weight: 600; letter-spacing: 0.6px;"
+            f"font-size: {theme.SIZE['label']}px;")
         self._badge.adjustSize()
         self._badge.setVisible(True)
         self._place_overlays()
@@ -696,14 +711,20 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
 
         # Same colour vocabulary as the panels: cyan is the car being watched, amber a rival in its
         # race, red a collision, everything else dimmed so the watched car is findable at a glance.
-        tint = np.full((n, 4), 0.45, np.float32)
+        # The watched car is drawn in its true (neutral) colours with a cyan ring on the ground
+        # under it; the rest are dimmed, a rival tinted amber, a collided car red.
+        tint = np.full((n, 4), 0.42, np.float32)
         tint[:, 3] = 1.0
         opp = fr.get("opponent")
         if opp is not None and len(opp) == n:
             tint[np.asarray(opp, bool)] = (0.95, 0.62, 0.25, 1.0)
         tint[fr["coll"] > 0.5] = (1.0, 0.35, 0.3, 1.0)
         if 0 <= f < n:
-            tint[f] = (0.35, 0.95, 1.0, 1.0)
+            tint[f] = (0.96, 1.0, 1.0, 1.0) if fr["coll"][f] <= 0.5 else tint[f]
+            sc.set_focus_ring(float(fr["x"][f]), float(fr["y"][f]),
+                              colour=(1.0, 0.35, 0.3, 0.9) if fr["coll"][f] > 0.5 else (0.35, 0.9, 1.0, 0.85))
+        else:
+            sc.set_focus_ring(0.0, 0.0, on=False)
         sc.set_car_instances(mats, tint, labels=fr.get("ids") if self.show_labels else None)
 
         # `draw_frame(show_points=...)` renders the point VAO, and that VAO only exists once a
@@ -783,11 +804,11 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         pts[~ok] = (0, 0, -100)
         typ = np.asarray(fr.get("scan_type", np.zeros(nb, np.int32)), np.int32)
         cols = np.zeros((nb, 4), np.float32)
-        cols[typ == 1] = (1.0, 0.55, 0.15, 1.0)     # duct hose
-        cols[typ == 2] = (1.0, 0.2, 0.9, 1.0)       # tall object
-        cols[typ == 3] = (0.2, 0.9, 1.0, 1.0)       # floor
-        cols[typ == 4] = (1.0, 0.95, 0.2, 1.0)      # another car
-        cols[typ == 0] = (0.5, 0.5, 0.5, 1.0)
+        cols[typ == 1] = (0.98, 0.62, 0.22, 0.92)   # duct hose
+        cols[typ == 2] = (0.86, 0.42, 0.96, 0.92)   # tall object
+        cols[typ == 3] = (0.30, 0.86, 0.96, 0.92)   # floor
+        cols[typ == 4] = (1.0, 0.90, 0.28, 0.95)    # another car
+        cols[typ == 0] = (0.58, 0.60, 0.66, 0.85)
         if self.point_colors is not None and len(self.point_colors) == nb:
             cols = np.asarray(self.point_colors, np.float32)
         return pts.astype(np.float32), cols

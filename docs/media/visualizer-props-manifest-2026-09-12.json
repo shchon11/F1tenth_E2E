@@ -1,0 +1,77 @@
+{
+  "map": "gen:competition:3+props7",
+  "driver": {
+    "checkpoint": "/home/shchon11/f1sim_runs/cl_origrecipe_legacy_s701/ppo_final.pt",
+    "sha256": "29e82233853868be33773ba0ea65d68268ba259b477828f019f7f106095055b6",
+    "controller_arm": "legacy"
+  },
+  "session": {
+    "races": 1,
+    "cars_per_race": 1,
+    "device": "cpu",
+    "compile": false
+  },
+  "rendering": {
+    "gl": {
+      "GL_RENDERER": "llvmpipe (LLVM 15.0.7, 256 bits)",
+      "GL_VENDOR": "Mesa",
+      "GL_VERSION": "4.5 (Core Profile) Mesa 23.2.1-1ubuntu3.1~22.04.4"
+    },
+    "CUDA_VISIBLE_DEVICES": ""
+  },
+  "frames_received": 611,
+  "shots": [
+    {
+      "file": "f1tenth-visualizer-props-overview.png",
+      "note": "gen:competition:3+props7, overview camera, setup panel collapsed",
+      "crop": null,
+      "viewport_only": false,
+      "bytes": 502598,
+      "size_px": [
+        1920,
+        1200
+      ],
+      "sha256": "1752ba715370ea76482a8024eea8660ba42fffec372a96c6c31ddea63c4f394c",
+      "sim_frames_received": 387
+    },
+    {
+      "file": "f1tenth-visualizer-props-closeup.png",
+      "note": "gen:competition:3+props7, closeup camera, setup panel collapsed",
+      "crop": null,
+      "viewport_only": false,
+      "bytes": 649850,
+      "size_px": [
+        1920,
+        1200
+      ],
+      "sha256": "40e49f99a67ef448d2655e125289df04b1a389e56940c4203d0ead00f2375aca",
+      "sim_frames_received": 460
+    },
+    {
+      "file": "f1tenth-visualizer-props-orbit.png",
+      "note": "gen:competition:3+props7, orbit camera, setup panel collapsed",
+      "crop": null,
+      "viewport_only": false,
+      "bytes": 612133,
+      "size_px": [
+        1920,
+        1200
+      ],
+      "sha256": "d64881b3daaf26b633fd97a393136f7442dfc8b9111c0f9e6c59257890b13900",
+      "sim_frames_received": 535
+    },
+    {
+      "file": "f1tenth-visualizer-props-chase.png",
+      "note": "gen:competition:3+props7, chase camera, setup panel collapsed",
+      "crop": null,
+      "viewport_only": false,
+      "bytes": 598711,
+      "size_px": [
+        1920,
+        1200
+      ],
+      "sha256": "0cd55e31dc623840df5f075edeceaf82d66474d14fc6dd0f5ce5db5088b85a60",
+      "sim_frames_received": 611
+    }
+  ]
+}
