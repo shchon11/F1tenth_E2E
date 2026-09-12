@@ -212,6 +212,13 @@
       " trials at mu=" + c.suite.low_mu);
     put("Avoidance", s.counts.avoidance[0] + " / " + s.counts.avoidance[1] + " approaches");
     put("Overtaking", s.counts.overtaking[0] + " / " + s.counts.overtaking[1] + " races");
+    // Traffic exists from suite v2.1; an older cohort carries a zero denominator and says so
+    // rather than printing "0 / 0 stints" as though nothing came through clean.
+    if (s.counts.traffic && s.counts.traffic[1] > 0) {
+      put("Clean in traffic", s.counts.traffic[0] + " / " + s.counts.traffic[1] + " stints");
+    } else {
+      put("Clean in traffic", "N/A (this suite has no traffic family)");
+    }
     if (s.distance_km !== null && s.distance_km !== undefined) {
       put("Distance travelled", s.distance_km + " km");
     }

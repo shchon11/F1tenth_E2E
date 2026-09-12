@@ -47,7 +47,7 @@ class LeaderboardError(ValueError):
     """A manifest or a result set that must not be rendered."""
 
 
-#: The six rankable metrics, in table order. `better` is the meaningful direction and is shown in
+#: The rankable metrics, in table order. `better` is the meaningful direction and is shown in
 #: the header; `pct` cells also print the exact numerator and denominator they were derived from.
 #: There is deliberately no composite score: the categories have different units and different
 #: denominators, and an average of them would be an invented number.
@@ -66,6 +66,14 @@ METRICS = (
     {"key": "overtaking", "label": "Overtaking", "unit": "%", "better": "up", "kind": "pct",
      "source": "suite O",
      "description": "Passes held to the end of the race over pre-validated race trials."},
+    {"key": "traffic_clean", "label": "Clean in traffic", "unit": "%", "better": "up",
+     "kind": "pct", "source": "suite T (v2.1 and later)",
+     "description": "Traffic stints finished with no wall collision and no contact with another "
+                    "car, over pre-validated traffic trials. This is NOT a pass rate: on the two "
+                    "unseen real floors no reference driver has completed a pass, so the T family "
+                    "measures what happens in traffic rather than whether a pass happened. Passes "
+                    "per race and pace against the opponent are in the full traffic table of the "
+                    "generated report; N/A on a suite with no T family."},
     {"key": "collisions_km", "label": "Collisions/km", "unit": "/km", "better": "down",
      "kind": "rate", "source": "all suites",
      "description": "Collisions per kilometre travelled, pooled over every suite."},
@@ -79,7 +87,13 @@ METRICS = (
 #: fails loudly here instead of silently dropping a metric.
 AGG_COLUMNS = {"driving": "completion ↑", "surface": "completion ↑",
                "avoidance": "cleared/pre-validated ↑", "overtaking": "passes held/race ↑",
-               "collisions": "collisions/km ↓", "slip": "large-slip s/km ↓"}
+               "collisions": "collisions/km ↓", "slip": "large-slip s/km ↓",
+               "traffic": "clean ↑"}
+
+#: The traffic row `report.aggregate` emits per scenario AND pooled. The leaderboard's single
+#: rankable figure is the pooled one; the per-scenario rows are in the generated report, where
+#: there is room to read them next to pace and passes.
+TRAFFIC_POOLED = "all scenarios"
 
 #: Percentages are derived twice -- from the validated outcome arrays and by `report.aggregate` --
 #: and must agree to the last bit of the division. A disagreement means the two are not measuring
@@ -194,7 +208,8 @@ def exact_counts(cells: list, low_mu: float) -> dict:
     for c in cells:
         d = _derived(c)
         b = out.setdefault(c["system_id"],
-                           {"S": [0, 0], "A": [0, 0], "O": [0, 0], "low": [0, 0], "fail": {}})
+                           {"S": [0, 0], "A": [0, 0], "O": [0, 0], "T": [0, 0], "low": [0, 0],
+                            "fail": {}})
         slot = b.get(c["suite"])
         if slot is None:
             raise LeaderboardError(f"{c['system_id']}: unknown suite {c['suite']!r}")
@@ -222,6 +237,11 @@ def _agg_index(agg: dict, low_mu: float) -> dict:
         slot(r["system_id"])["avoidance"] = r["values"][AGG_COLUMNS["avoidance"]]
     for r in agg.get("overtaking", []):
         slot(r["system_id"])["overtaking"] = r["values"][AGG_COLUMNS["overtaking"]]
+    for r in agg.get("traffic", []):
+        # The pooled row only. Taking a per-scenario row would rank one scenario under a name that
+        # says "traffic", and taking them all would overwrite each other in an order nothing fixes.
+        if str(r["runtime"]).rsplit(" · ", 1)[-1] == TRAFFIC_POOLED:
+            slot(r["system_id"])["traffic_clean"] = r["values"][AGG_COLUMNS["traffic"]]
     for r in agg.get("stability", []):
         s = slot(r["system_id"])
         s["collisions_km"] = r["values"][AGG_COLUMNS["collisions"]]
@@ -387,6 +407,7 @@ def build_cohort(cohort: dict, base: str, out_dir: str | None = None) -> dict:
                                       f"{cid} {sid}"),
             "avoidance": _pct(b["A"][0], b["A"][1], a.get("avoidance"), f"{cid} {sid}"),
             "overtaking": _pct(b["O"][0], b["O"][1], a.get("overtaking"), f"{cid} {sid}"),
+            "traffic_clean": _pct(b["T"][0], b["T"][1], a.get("traffic_clean"), f"{cid} {sid}"),
             "collisions_km": _rate(a.get("collisions_km"), f"{cid} {sid}"),
             "slip_km": _rate(a.get("slip_km"), f"{cid} {sid}"),
         }
@@ -406,7 +427,7 @@ def build_cohort(cohort: dict, base: str, out_dir: str | None = None) -> dict:
             "metrics": m,
             "pace": pace.get(sid, {"value": None, "n": 0, "reason": "no paired solo cells"}),
             "counts": {"solo": b["S"], "low_mu": b["low"], "avoidance": b["A"],
-                       "overtaking": b["O"]},
+                       "overtaking": b["O"], "traffic": b["T"]},
             "distance_km": a.get("distance_km"),
             "failures": dict(sorted(b["fail"].items())),
         })

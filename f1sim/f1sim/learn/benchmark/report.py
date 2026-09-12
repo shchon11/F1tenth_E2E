@@ -14,7 +14,7 @@ import json
 REQUIRED_PINS = ("system_id", "checkpoint_sha256", "controller_arm", "suite_freeze_sha256",
                  "suite_version", "map_id", "mu", "seed", "n_envs", "source_digest")
 
-CATEGORIES = ("driving", "stability", "surface", "avoidance", "overtaking")
+CATEGORIES = ("driving", "stability", "surface", "avoidance", "overtaking", "traffic")
 
 
 class ReportError(ValueError):
@@ -41,14 +41,22 @@ def validate_row(row: dict) -> None:
 #: absent, and absent means N/A, never 0.
 REQUIRED_TRIAL_ARRAYS = ("outcomes", "progress_m", "distance_m", "route_progress_fraction",
                          "lap_time_s")
-OPTIONAL_TRIAL_ARRAYS = ("cross_track_abs_mean_m", "cross_track_rms_m", "cross_track_samples")
+#: The T family's per-trial arrays. Optional because S/A/O rows do not carry them; present, they are
+#: length-checked, finiteness-checked and sign-checked like every other array. `pace_ratio` and
+#: `closest_arc_gap_m` may be the producer's {"value": None, "reason": ...} form, which the loops
+#: below already understand.
+TRAFFIC_TRIAL_ARRAYS = ("passes", "leads_lost", "opponent_respawns", "contention_s", "following_s",
+                        "attack_s", "defending_s", "opponent_progress_m", "pace_ratio",
+                        "closest_arc_gap_m", "event_in_window_s", "event_seen_s")
+OPTIONAL_TRIAL_ARRAYS = (("cross_track_abs_mean_m", "cross_track_rms_m", "cross_track_samples")
+                         + TRAFFIC_TRIAL_ARRAYS)
 #: Scalars `runner.py` writes only when an accumulator was attached. Absent is a real state.
 OPTIONAL_SCALARS = ("spin_events", "large_slip_seconds", "wrong_way_seconds", "max_abs_yaw_rate")
 #: Quantities that cannot be negative. Route progress is deliberately NOT here: it is signed, and an
 #: abs() would silently reward driving backwards.
 NONNEGATIVE_SCALARS = ("spin_events", "large_slip_seconds", "wrong_way_seconds", "max_abs_yaw_rate")
 NONNEGATIVE_ARRAYS = ("distance_m", "lap_time_s", "cross_track_abs_mean_m", "cross_track_rms_m",
-                      "cross_track_samples")
+                      "cross_track_samples") + TRAFFIC_TRIAL_ARRAYS
 
 
 #: Continuous protocol fields survive a float32 round-trip through the plant; discrete ones do not
@@ -76,6 +84,24 @@ def _derive(res: dict) -> dict:
             "failures": failures}
 
 
+def row_cell_id(row: dict) -> str:
+    """The cell id a row's OWN metadata describes. Mirrors `suite.Cell.cell_id` exactly.
+
+    One definition, used by the identity check and the duplicate check, so a family whose cells are
+    distinguished by a variant cannot be identified one way here and another way there -- which
+    would read four different traffic scenarios on one map as the same cell measured four times.
+    """
+    head = f"{row.get('suite')}:{row['variant']}" if row.get("variant") else f"{row.get('suite')}"
+    return f"{head}:{row.get('map_id')}:{row.get('mu')}:{row.get('seed')}"
+
+
+def cell_key(row_or_cell) -> tuple:
+    """The tuple that identifies a cell within one system's results."""
+    g = (row_or_cell.get if isinstance(row_or_cell, dict)
+         else lambda k, d=None: getattr(row_or_cell, k, d))
+    return (g("suite"), g("variant", "") or "", g("map_id"), float(g("mu")), int(g("seed")))
+
+
 def validate_row_identity(row: dict, expected: dict) -> None:
     """The row is the protocol it claims, and the cell it claims.
 
@@ -87,7 +113,7 @@ def validate_row_identity(row: dict, expected: dict) -> None:
         if got != want:
             raise ReportError(f"{row.get('system_id')} {row.get('cell_id')}: {k} is {got!r}, "
                               f"expected {want!r}")
-    want_id = f"{row.get('suite')}:{row.get('map_id')}:{row.get('mu')}:{row.get('seed')}"
+    want_id = row_cell_id(row)
     if str(row.get("cell_id")) != want_id:
         raise ReportError(f"{row.get('system_id')}: cell_id {row.get('cell_id')!r} does not match "
                           f"its own metadata, which describes {want_id!r}")
@@ -161,6 +187,15 @@ def validate_cell(row: dict, expected_cell, suite=None, roster_entry=None) -> di
         if want is not None and got is not None and got != want:
             raise ReportError(f"{tag}: effective {key} {got!r} != declared {want!r}")
 
+    # -- the traffic scenario a T row ran under is the one the suite froze.
+    #
+    # For a T cell the OPPONENT is the scenario: "a car at 0.5-0.7x" and "a car that brakes and
+    # stops" are different measurements that share a map, a friction and a seed. Everything above
+    # checks the friction and the budget and would happily accept a row measured against the wrong
+    # opponent under the right cell's name, which is the one substitution this family makes possible.
+    if str(getattr(expected_cell, "suite", "")) == "T":
+        _validate_traffic_protocol(eff, row, expected_cell, suite, tag)
+
     # -- runtime is derived from the validated controller identity, never from the free-text field
     arm = row.get("controller_arm")
     if roster_entry is not None and getattr(roster_entry, "controller_arm", arm) != arm:
@@ -188,6 +223,49 @@ def validate_cell(row: dict, expected_cell, suite=None, roster_entry=None) -> di
         raise ReportError(str(exc)) from exc
     row["_derived"] = derived
     return derived
+
+
+def _validate_traffic_protocol(eff: dict, row: dict, expected_cell, suite, tag: str) -> None:
+    """A T row's effective opponent against the frozen scenario it claims to be."""
+    variant = str(getattr(expected_cell, "variant", "") or "")
+    if not variant:
+        raise ReportError(f"{tag}: a T cell with no variant. The traffic family is four scenarios "
+                          f"on one grid; an unnamed one cannot be checked against anything.")
+    if str(row.get("variant") or "") != variant:
+        raise ReportError(f"{tag}: row variant {row.get('variant')!r} != declared {variant!r}")
+    if suite is None:
+        raise ReportError(f"{tag}: no Suite to read the frozen traffic scenario from; a T row "
+                          f"cannot be validated without the scenario it claims to have run")
+    try:
+        sc = suite.traffic_scenario(variant)
+    except KeyError as exc:
+        raise ReportError(f"{tag}: {exc}") from None
+    checks = (("race_size", int(sc["race_size"])),
+              ("opp_speed_range", [float(x) for x in sc["opp_speed_range"]]),
+              ("opp_events", sorted(str(x) for x in sc.get("opp_events", ()))),
+              ("opp_event_rate", float(sc.get("opp_event_rate", 0.0))))
+    for key, want in checks:
+        got = eff.get(key)
+        if got is None:
+            raise ReportError(f"{tag}: no effective {key} recorded; the scenario the run actually "
+                              f"used cannot be checked against the frozen {variant!r}")
+        if key == "opp_events":
+            got = sorted(str(x) for x in got)
+        elif key == "opp_speed_range":
+            got = [float(x) for x in got]
+        elif key == "race_size":
+            got = int(got)
+        else:
+            got = float(got)
+        if got != want:
+            raise ReportError(f"{tag}: effective {key} {got!r} != the frozen {variant!r} "
+                              f"scenario's {want!r}; this row measured a different opponent")
+    # The learner count, and therefore the number of cars, follows from the scenario.
+    declared_cars = int(getattr(expected_cell, "envs", 0)) * int(sc["race_size"])
+    if eff.get("envs") is not None and int(eff["envs"]) != declared_cars:
+        raise ReportError(f"{tag}: {eff['envs']} cars ran but the cell declares "
+                          f"{expected_cell.envs} learners x race_size {sc['race_size']} = "
+                          f"{declared_cars}")
 
 
 def validate_raw(row: dict, expected_cell=None) -> None:
@@ -341,8 +419,8 @@ def validate_results(rows: list[dict], *, suite_freeze: str, expected_systems: s
             # Mirrors `protocol_identity`: the hash covers the constant protocol, not per-cell
             # facts. `effective` is evidence and is validated separately, not hashed.
             body = {k: v for k, v in r.items()
-                    if k not in ("identity_sha256", "suite", "map_id", "mu", "seed", "n_envs",
-                                 "runtime", "cell_id", "wall_seconds", "result", "label",
+                    if k not in ("identity_sha256", "suite", "variant", "map_id", "mu", "seed",
+                                 "n_envs", "runtime", "cell_id", "wall_seconds", "result", "label",
                                  "obstacle", "effective")}
             if identity_hash(body) != r["identity_sha256"]:
                 raise ReportError(f"{r['system_id']} {r.get('cell_id')}: identity hash does not "
@@ -365,7 +443,7 @@ def validate_results(rows: list[dict], *, suite_freeze: str, expected_systems: s
     # denominator, and both survive every other check.
     counts = {}
     for r in rows:
-        key = (r["system_id"], r["suite"], r["map_id"], float(r["mu"]), int(r["seed"]))
+        key = (r["system_id"],) + cell_key(r)
         counts[key] = counts.get(key, 0) + 1
     dupes = {k: v for k, v in counts.items() if v > 1}
     if dupes:
@@ -373,10 +451,9 @@ def validate_results(rows: list[dict], *, suite_freeze: str, expected_systems: s
     if expected_cells is not None:
         # One shared gate per row, so the report and the runner's resume admit exactly the same
         # evidence. This also stamps the derived counts aggregation consumes.
-        by_cell = {(c.suite, c.map_id, float(c.mu), int(c.seed)): c for c in expected_cells}
+        by_cell = {cell_key(c): c for c in expected_cells}
         for r in rows:
-            cell = by_cell.get((r.get("suite"), r.get("map_id"),
-                                float(r.get("mu")), int(r.get("seed"))))
+            cell = by_cell.get(cell_key(r))
             if cell is None:
                 raise ReportError(f"{r.get('system_id')} {r.get('cell_id')}: row is not on the "
                                   f"declared grid")
@@ -404,8 +481,7 @@ def validate_results(rows: list[dict], *, suite_freeze: str, expected_systems: s
                 paired[cid] = _fp.assert_paired(group, cell_id=cid)
             except ValueError as exc:
                 raise ReportError(str(exc)) from exc
-        want = {(sid, c.suite, c.map_id, float(c.mu), int(c.seed))
-                for sid in expected_systems for c in expected_cells}
+        want = {(sid,) + cell_key(c) for sid in expected_systems for c in expected_cells}
         missing = want - set(counts)
         extra = set(counts) - want
         if missing or extra:
@@ -501,8 +577,10 @@ def aggregate(cells: list[dict]) -> dict:
     Rates are pooled over cells by summing successes and denominators, never by averaging rates:
     cells can differ in size, and a mean of rates would weight a short cell like a full one.
     """
-    by, by_mu = {}, {}
+    by, by_mu, by_traffic = {}, {}, {}
     for c in cells:
+        if c["suite"] == "T":
+            _gather_traffic(by_traffic, c)
         key = (c["system_id"], c["runtime"], c["suite"])
         b = by.setdefault(key, {"succ": 0, "den": 0, "n": 0, "prog": [], "enc": 0, "interr": 0,
                                 "reasons": {}, "dist": 0.0, "coll": 0, "lap_times": [],
@@ -700,4 +778,90 @@ def aggregate(cells: list[dict]) -> dict:
                 "values": {"passes held/race ↑": rate(b),
                            "hold interruptions": b["interr"],
                            "contact ↓": b["reasons"].get("contact", 0)}})
+    for row in _traffic_rows(by_traffic):
+        out.setdefault("traffic", []).append(row)
     return out
+
+
+#: The T table. No composite: each column carries its own direction, and the two that could be
+#: gamed on their own are printed next to the one that refuses the gaming -- a car that hangs back
+#: and never tries scores 1.000 on "clean" and well under 1.0 on "pace vs opponent".
+TRAFFIC_COLUMNS = ["clean ↑", "passes/race ↑", "pace vs opponent ↑", "attacking s/race ↑",
+                   "following s/race", "car contact ↓", "wall collisions ↓", "leads lost ↓",
+                   "event-in-window trials"]
+
+
+def _gather_traffic(acc: dict, c: dict) -> None:
+    """One T cell into the per-scenario bucket, and into the pooled one.
+
+    Sums, never means of per-cell rates: cells differ in length and a crashed trial is shorter than
+    a completed one, so averaging per-cell figures would weight a two-second trial like a full stint.
+    """
+    res = c["result"]
+    d = c.get("_derived") or res.get("_derived")
+    if d is None:
+        raise ReportError(f"{c.get('system_id')} {c.get('cell_id')}: aggregated before validation; "
+                          f"call validate_cell first")
+    variant = str(c.get("variant") or "?")
+    for key in ((c["system_id"], c["runtime"], variant),
+                (c["system_id"], c["runtime"], "all scenarios")):
+        b = acc.setdefault(key, {"clean": 0, "den": 0, "n": 0, "passes": 0, "leads_lost": 0,
+                                 "ego_m": 0.0, "opp_m": 0.0, "attack_s": 0.0, "follow_s": 0.0,
+                                 "contact": 0, "wall": 0, "contended": 0, "ev_trials": 0,
+                                 "ev_cells": 0})
+        b["clean"] += d["successes"]
+        b["den"] += d["n"]
+        b["n"] += int(res["n"])
+        b["passes"] += sum(res.get("passes", []) or [])
+        b["leads_lost"] += sum(res.get("leads_lost", []) or [])
+        b["ego_m"] += sum(res.get("progress_m", []) or [])
+        b["opp_m"] += sum(res.get("opponent_progress_m", []) or [])
+        b["attack_s"] += sum(res.get("attack_s", []) or [])
+        b["follow_s"] += sum(res.get("following_s", []) or [])
+        b["contended"] += int(res.get("contended", 0))
+        b["contact"] += d["failures"].get("contact", 0)
+        b["wall"] += d["failures"].get("collision", 0)
+        # Only cells whose scenario actually schedules events contribute to the event column;
+        # pooling a no-event cell's zero into it would report the feature as firing less often than
+        # it does in the cells that have it.
+        eff = res.get("effective") or c.get("effective") or {}
+        if eff.get("opp_events"):
+            b["ev_trials"] += int(res.get("event_in_window_trials", 0))
+            b["ev_cells"] += int(res["n"])
+
+
+def _traffic_rows(acc: dict) -> list:
+    rows = []
+    for (sid, runtime, variant), b in sorted(acc.items(), key=lambda kv: (kv[0][0], kv[0][1],
+                                                                          kv[0][2] == "all scenarios",
+                                                                          kv[0][2])):
+        n = b["n"] or 1
+        rows.append({
+            "system_id": sid, "runtime": f"{runtime} · {variant}", "n": b["n"],
+            "columns": list(TRAFFIC_COLUMNS),
+            "values": {
+                # The trial outcome: came through the stint with no wall collision and no contact.
+                "clean ↑": ({"value": b["clean"] / b["den"], "reason": None} if b["den"]
+                            else na("no pre-validated trials")),
+                # Counted, not latched, and allowed to be zero: on the narrow real floors zero is a
+                # real and expected value, and a metric that only says "0/32" everywhere is the one
+                # this family exists to replace.
+                "passes/race ↑": {"value": b["passes"] / n, "reason": None},
+                # Pooled by summing arcs, not by averaging per-trial ratios: a trial that ran twice
+                # as long carries twice the evidence about pace.
+                "pace vs opponent ↑": ({"value": b["ego_m"] / b["opp_m"], "reason": None}
+                                       if b["opp_m"] > 0 else
+                                       na("the opponents covered no ground to compare against")),
+                "attacking s/race ↑": {"value": b["attack_s"] / n, "reason": None},
+                # No direction: more time behind a car is engagement on one reading and an
+                # unconverted opportunity on another, and which it is depends on the pass column.
+                "following s/race": {"value": b["follow_s"] / n, "reason": None},
+                "car contact ↓": b["contact"],
+                "wall collisions ↓": b["wall"],
+                # A lead taken through the clear margin and given back. Diagnostic.
+                "leads lost ↓": b["leads_lost"],
+                "event-in-window trials": (
+                    {"value": b["ev_trials"], "reason": None} if b["ev_cells"]
+                    else na("no scenario in this group schedules opponent events")),
+            }})
+    return rows
