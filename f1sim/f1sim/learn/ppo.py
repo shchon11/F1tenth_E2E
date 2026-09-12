@@ -55,7 +55,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default=f"ppo_{time.strftime('%m%d_%H%M')}")
     ap.add_argument("--init", default="", help="DAgger checkpoint to start from")
-    ap.add_argument("--envs", type=int, default=2048); ap.add_argument("--tracks", default="train", help="'train', 'eval' or comma separated catalog names")
+    ap.add_argument("--envs", type=int, default=2048)
+    ap.add_argument("--tracks", default="train",
+                    help="'train' / 'heldout' / 'heldout_obstacles' / 'heldout_all', or a comma "
+                         "separated list in either grammar: 'real/bb22-1@rev#line:44' (new) or "
+                         "'real:blackbox2022_1+rlobs44~rev' (loader). An open seed -- "
+                         "'real/bb22-1#line:*' -- is drawn --obstacle-draws times.")
+    ap.add_argument("--obstacle-draws", type=int, default=8,
+                    help="how many random obstacle placements a '#<kind>:*' entry becomes. The draw "
+                         "comes from --seed, so the same seed gives the same maps, and the concrete "
+                         "names are recorded in the run manifest.")
     ap.add_argument("--horizon", type=int, default=32); ap.add_argument("--total", type=float, default=100e6)
     ap.add_argument("--epochs", type=int, default=3); ap.add_argument("--minibatch", type=int, default=8192)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--lr-end", type=float, default=5e-5)
@@ -264,7 +273,7 @@ def main():
     if a.kl_decay is None:
         a.kl_decay = a.total
     device = torch.device(a.device); torch.manual_seed(a.seed)
-    names = common.track_names(a.tracks)
+    names = common.track_names(a.tracks, draws=a.obstacle_draws, seed=a.seed)
     if a.envs % a.race_size:
         raise SystemExit(f"--envs {a.envs} is not a multiple of --race-size {a.race_size}: the envs are "
                          f"dealt into races of that size, so a remainder leaves a race that is never "

@@ -54,6 +54,38 @@ dial), a centred steering bar (fill from centre to the measured angle, marker fo
 angle, left steer to the left), and the g-g trace against the friction circle. Columns are separated
 by hairlines. Everything a value stands for is unchanged from the previous drawing.
 
+## The map card (2026-09-12)
+
+The left panel's 맵 card was a group combo over five named groups and a list of **loader names** —
+every direction, obstacle family and placement seed as its own row, two hundred rows of
+`real:korea_2026_competition+rlobs213~mir~rev`. That is a list of runs, not a list of maps, and the
+same map appeared in it twenty times.
+
+| element | before | now |
+| --- | --- | --- |
+| groups | 기본 평가셋 / 장애물 (상자·궤짝·드럼) / 기본 학습셋 / 이전 실험 재현 (격자 장애물) / 전체 카탈로그 | 학습 / 검증 / 내 환경, each with a one-sentence hint saying what the split *is* |
+| rows | one per loader name | one per **base map**: display name, the id beside it in grey, family chip |
+| search | inside the selected group | the whole catalogue, so a map in neither split (another racetrack, a gym map, any generator seed) is reached by typing |
+| direction | part of the name (`~rev`, `~mir~rev`) | 방향 segmented buttons: 정방향 / 역방향 / 거울 / 거울+역방향 |
+| obstacles | part of the name (`+obs`, `+rlobs`, `+pinch`, `+props`) and a group of its own | 장애물 combo: 없음 / 가장자리 / 주행선 위 / 좁아짐 / 입체, narrowed to what the track's loader can carry |
+| obstacle seed | part of the name, fixed at catalogue time | 시드: 무작위 (default) with 다시 뽑기, or 고정 N |
+| what is selected | the loader name | the scenario in Korean (`Blackbox 2022 #1 · 역방향 · 주행선 위 (시드 44)`) with the spec under it, copyable |
+
+Defaults are 정방향 / 없음 / 무작위, so **choosing a map is enough to start**. 무작위 does not draw in
+the GUI: the worker draws one seed from the session seed when the session is built, and the facts
+strip in the header then shows the concrete scenario — `real/bb22-1@rev#line:4417` — so a placement
+worth keeping can be typed back in. 다시 뽑기 changes the session seed, which is a different map and
+therefore a restart rather than a live command.
+
+The training page's 학습할 맵 card is the same idea with checkboxes: the three groups as tabs, the
+same 방향 / 장애물 / 시드 policy applied to whatever is ticked, and 학습 셋 전체 as one button that
+emits `--tracks train` — the curated list itself, not a reconstruction of it. Above it, 지금 돌고 있는
+학습 gives every training process a summary card (recipe, tracks, race size, controller arm, init
+checkpoint and its short sha, lr → lr-end, total steps, elapsed and ETA, W&B link, log path), all
+read from the argv the process was started with and the log it already writes.
+
+See [Tracks](tracks.md) for the ids, the grammar and the splits.
+
 ## Verification
 
 Rendered headlessly with the same capture path as the README screenshots (Xvfb + llvmpipe, real

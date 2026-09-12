@@ -7,6 +7,9 @@ Names:  gen:competition:7   gen:hallway:2   gen:circuit:0
         /abs/path/map.yaml  (any ROS map; centerline csv next to it is picked up)
     Obstacle suffixes: `+obs<seed>` = boxes hugging the lane edge (the racing line stays clear),
                        `+rlobs<seed>` = boxes standing on the racing line (the car must plan around)
+
+`load` also accepts the short scenario grammar of `f1sim.tracks` (`real/bb22-1@rev#line:44`), which
+is what every user-facing list shows; it is resolved to the names above and nothing else changes.
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import os
 import numpy as np
 from typing import List, Optional
 
+from . import tracks
 from .track import Track
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # src/f1sim
@@ -113,7 +117,15 @@ _BASE_CACHE = {}
 
 def load(name: str, **kw) -> Track:
     """Catalog loader. Trailing modifiers: `~rev` = same map driven the other way round,
-    `~mir` = mirrored map (e.g. real:icra2022~rev, rt:Monza~mir~rev)."""
+    `~mir` = mirrored map (e.g. real:icra2022~rev, rt:Monza~mir~rev).
+
+    The short scenario grammar is accepted too and resolved to the name below before anything else
+    happens: `real/icra22@rev`, `rt/monza@mir+rev`, `real/bb22-1@rev#line:44`. See `f1sim.tracks`.
+    One line rather than a second loader, so there is exactly one place that knows how a map is
+    built and exactly one place that knows how a scenario is spelled.
+    """
+    if tracks.is_spec(name):
+        name = tracks.resolve(name)
     mods = []
     while name.endswith(MODIFIERS):
         for m in MODIFIERS:

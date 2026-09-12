@@ -261,16 +261,18 @@ def test_maps_load_scene_prefix_with_modifiers_and_edits(root):
         maps.load("scene:nope")
 
 
-def test_map_catalog_lists_the_editor_group_first_only_when_there_are_scenes(root, monkeypatch):
+def test_map_catalog_lists_the_editor_group_only_when_there_are_scenes(root, monkeypatch):
+    """`내 환경` is one of the three groups and is omitted rather than shown empty. The catalogue
+    the console searches carries the scene either way, so it is reachable by typing."""
     from f1sim.viewer import sim_worker as SW
     from f1sim.viewer.console.catalog import SCENES_GROUP
     w = SW.SimWorker.__new__(SW.SimWorker)
-    groups = SW.SimWorker.map_catalog(w)
-    assert SCENES_GROUP not in groups
+    cat = SW.SimWorker.map_catalog(w)
+    assert SCENES_GROUP not in cat["groups"]
     SceneDoc.new_blank("mine", 3, 3).save()
-    groups = SW.SimWorker.map_catalog(w)
-    assert list(groups)[0] == SCENES_GROUP and groups[SCENES_GROUP] == ["scene:mine"]
-    assert "scene:mine" in groups["전체 카탈로그"]
+    cat = SW.SimWorker.map_catalog(w)
+    assert cat["groups"][SCENES_GROUP] == ["scene/mine"]
+    assert cat["entries"]["scene/mine"]["display"] == "mine (에디터)"
 
 
 # ----------------------------------------------------------------- geometry for the viewport

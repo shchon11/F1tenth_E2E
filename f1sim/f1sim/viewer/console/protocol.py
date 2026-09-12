@@ -45,7 +45,7 @@ CMD_SHUTDOWN = "shutdown"
 
 # ---------------------------------------------------------------- worker -> console
 MSG_HELLO = "hello"                # {"pid", "monotonic", "torch", "cuda", "device", "runs_dir"}
-MSG_MAPS = "maps"                  # {"groups": {name: [map, ...]}}
+MSG_MAPS = "maps"                  # {"groups": {group: [track id, ...]}, "entries": {id: {...}}, "splits": {...}}
 MSG_DESCRIBED = "described"        # {"ok", "info": {...}} for one checkpoint
 MSG_STAGE = "stage"                # progress inside PREPARING
 MSG_READY = "ready"                # session is up: static geometry + session facts
@@ -95,7 +95,16 @@ class SessionConfig:
     validating it.
     """
     run: str = "latest"                  # run directory, a .pt path, or "latest"
+    #: The scenario to drive, in either grammar. The picker writes the short one
+    #: (`real/bb22-1@rev#line:*`); a script or an old config may write the loader's
+    #: (`real:blackbox2022_1+rlobs44~rev`) or an absolute map path. The worker resolves it through
+    #: `f1sim.tracks` and reports what it actually built in the session facts -- the name is kept
+    #: `map_name` because every caller, test and recorded config already uses it.
     map_name: str = ""
+    #: Draws the obstacle seed when the scenario leaves it open (`#line:*`). The console re-rolls by
+    #: changing this, which is also what makes "다시 뽑기" a new generation rather than a live
+    #: command: a different seed is a different map.
+    seed: int = 0
     races: int = 1
     cars_per_race: int = 1
     speed_cap: Optional[float] = None    # None = whatever the checkpoint was trained at
@@ -133,6 +142,27 @@ class SessionConfig:
     @property
     def total_cars(self) -> int:
         return max(1, int(self.races)) * max(1, int(self.cars_per_race))
+
+    def scenario(self):
+        """The concrete `tracks.Scenario`: the spec with its open seed actually drawn.
+
+        Drawing here rather than in the picker is what makes "무작위" honest. The console does not
+        know which seeds produce a map, and a seed invented on the GUI thread would be a different
+        number every repaint; this is one draw from `seed`, so the same config builds the same map,
+        `affects_simulation` sees a re-roll as a new generation, and the facts strip can print the
+        number that was actually used.
+        """
+        import random
+
+        from ... import tracks
+        sc = tracks.parse(self.map_name)
+        if sc.random_seed:
+            sc = sc.with_seed(tracks.draw_seed(random.Random(int(self.seed))))
+        return sc
+
+    def resolved_map(self) -> str:
+        """What `maps.load` is handed. Identity for a legacy name or an absolute path."""
+        return self.scenario().legacy()
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

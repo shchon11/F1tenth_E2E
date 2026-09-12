@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import catalog, theme
+from ... import tracks
 from .catalog import GROUP_CAVEAT, GROUP_HINT, GROUP_ORDER, MapCatalog, RunInfo, format_age
 from .frames import Freshness, INTERP_LAG_FRAMES
 from .overlays import ActivationPanel, DashPanel, PolicyInputPanel
@@ -79,6 +80,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.maps = MapCatalog()
         self._selected_run: Optional[str] = None
         self._selected_map: Optional[str] = None
+        #: Seeds the worker's draw when the scenario leaves the obstacle seed open. Re-rolled by
+        #: 다시 뽑기; part of the config, so a re-roll is a new generation and the facts strip can
+        #: print the number that was actually used.
+        self._session_seed: int = __import__("random").randrange(1, 10 ** 9)
         self._session_cars = 0
         self._session_ids: List[int] = []
         self._running_facts: Dict[str, object] = {}
@@ -197,6 +202,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- left: what to run
     def _build_left(self) -> QtWidgets.QWidget:
         area, v = _scroll_panel(340)
+        #: The scrolling part of the left panel, kept as an attribute so a caller (a screenshot
+        #: script, a test) can put a card on screen without reaching through the widget tree.
+        self.left_scroll = area
 
         # -- what is selected, always visible at the top. The lists below can be scrolled away;
         # what you are about to start cannot be. Full names, never elided: a run called
@@ -245,7 +253,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         run_card.add(self.ckpt_fold)
         v.addWidget(run_card)
 
-        # -- map
+        # -- map: the base track, then the scenario built on it
+        #
+        # The list holds *maps*, one row each. It used to hold every direction, obstacle family and
+        # placement seed as its own row -- two hundred rows, forty-character names, the same map
+        # twenty times -- which is not a list of maps and cannot be scanned. Direction, obstacle
+        # and seed are three controls under it, defaulting to 정방향 / 없음 / 무작위, so picking a
+        # map is enough to drive it.
         map_card = Card("맵")
         self.map_group = QtWidgets.QComboBox()
         self.map_group.addItem("목록 읽는 중…")
@@ -253,13 +267,67 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.map_group.setToolTip(GROUP_CAVEAT)
         self.map_group.currentIndexChanged.connect(lambda _: self._refresh_map_list())
         map_card.add(self.map_group)
-        self.map_list = FilterList("맵 이름 검색 (Ctrl+F)", rows=6)
+        self.map_list = FilterList("맵 검색 (Ctrl+F) — 세 그룹 밖의 맵도 전부", rows=6)
         self.map_list.activated.connect(self._on_map_selected)
+        self.map_list.search.textChanged.connect(lambda _t: self._refresh_map_list())
         map_card.add(self.map_list)
-        self.map_note = label("선택한 맵 하나만 로드합니다.", "hint")
+        self.map_note = label("맵을 고르면 바로 달릴 수 있습니다. 아래에서 방향·장애물만 바꾸세요.", "hint")
         self.map_note.setToolTip(GROUP_CAVEAT)
         map_card.add(self.map_note)
         self.map_list.tree.setToolTip(GROUP_CAVEAT)
+        map_card.add(hline())
+
+        scen = label("시나리오", "field")
+        map_card.add(scen)
+        self.seg_direction = SegmentedButtons(
+            [(d, tracks.DIRECTION_LABEL[d],
+              {"": "기록된 그대로 달립니다.", "rev": "같은 맵을 반대 방향으로 돕니다.",
+               "mir": "좌우를 뒤집은 맵입니다 (코너가 반대로).",
+               "mir+rev": "좌우를 뒤집고 반대 방향으로 돕니다."}[d])
+             for d in tracks.DIRECTIONS])
+        self.seg_direction.set_current("")
+        self.seg_direction.selected.connect(lambda _k: self._on_scenario_changed())
+        map_card.add(FieldRow("방향", self.seg_direction, ""))
+
+        self.combo_obstacle = QtWidgets.QComboBox()
+        for o in tracks.OBSTACLES:
+            self.combo_obstacle.addItem(tracks.OBSTACLE_LABEL[o], o)
+        self.combo_obstacle.currentIndexChanged.connect(lambda _: self._on_scenario_changed())
+        self.row_obstacle = FieldRow("장애물", self.combo_obstacle, tracks.OBSTACLE_HINT[""])
+        map_card.add(self.row_obstacle)
+
+        # Seed. "무작위" is the default because it is what the user asked for: pick a map, get
+        # boxes somewhere, drive. The number is drawn in the worker from the session seed and shown
+        # in the facts strip, so a placement worth keeping can be typed back in as 고정.
+        seed_row = QtWidgets.QHBoxLayout()
+        seed_row.setSpacing(SP[0])
+        self.combo_seed = QtWidgets.QComboBox()
+        self.combo_seed.addItem("무작위", "random")
+        self.combo_seed.addItem("고정", "fixed")
+        self.combo_seed.currentIndexChanged.connect(self._on_seed_mode)
+        seed_row.addWidget(self.combo_seed, 1)
+        self.spin_seed = QtWidgets.QSpinBox()
+        self.spin_seed.setRange(0, 999999)
+        self.spin_seed.setValue(44)
+        self.spin_seed.setEnabled(False)
+        self.spin_seed.valueChanged.connect(lambda _: self._on_scenario_changed())
+        seed_row.addWidget(self.spin_seed, 1)
+        self.btn_reroll = QtWidgets.QPushButton("다시 뽑기")
+        self.btn_reroll.setObjectName("GhostButton")
+        self.btn_reroll.setToolTip("장애물 배치를 새로 뽑습니다. 다른 맵이 되므로 세션을 다시 시작합니다.")
+        self.btn_reroll.clicked.connect(self._on_reroll)
+        seed_row.addWidget(self.btn_reroll)
+        seed_box = QtWidgets.QWidget()
+        seed_box.setLayout(seed_row)
+        self.row_seed = FieldRow("시드", seed_box, "무작위: 시작할 때 하나 뽑고 화면 상단에 그 번호를 보여줍니다.")
+        map_card.add(self.row_seed)
+
+        self.scenario_line = label("", "hint")
+        self.scenario_line.setObjectName("Mono")
+        self.scenario_line.setWordWrap(True)
+        self.scenario_line.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.scenario_line.setToolTip("시나리오 이름입니다. --tracks 에 그대로 넣을 수 있습니다.")
+        map_card.add(self.scenario_line)
         v.addWidget(map_card)
 
         # -- shape of the session
@@ -838,16 +906,38 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._refresh_map_list()
         self._update_start_enabled()
 
+    def _map_rows(self, ids: List[str], with_group: bool):
+        """(group, id, display, "id · family") rows. The display name leads because that is what a
+        person is looking for; the id stays visible because it is what goes in `--tracks`."""
+        rows = []
+        for tid in ids:
+            e = self.maps.entry(tid)
+            group = (self.maps.group_of(tid) or "") if with_group else ""
+            rows.append((group, tid, e.get("display") or tid,
+                         f"{tid} · {e.get('family_label') or e.get('family', '')}"))
+        return rows
+
     def _refresh_map_list(self):
+        """The selected group, or -- the moment anything is typed -- the whole catalogue.
+
+        Three groups is the right number of groups and the wrong number of *places to look*: the
+        maps that are in neither split (the other twenty racetracks, the gym maps, any generator
+        seed) still have to be reachable. They are reachable by typing, which is how anyone with a
+        name in mind was going to find them anyway.
+        """
         g = self.map_group.currentData()
         if not self.maps.ready or g is None:
             self.map_list.set_items([])
             self.map_list.set_status("맵 목록을 읽는 중입니다…" if not self.maps.error else "", "hint")
             return
-        names = self.maps.groups.get(g, [])
-        self.map_list.set_items([("", n, n, "") for n in names])
+        searching = bool(self.map_list.search.text().strip())
+        if searching:
+            self.map_list.set_items(self._map_rows(self.maps.ids(), with_group=True))
+            return
+        ids = self.maps.groups.get(g, [])
+        self.map_list.set_items(self._map_rows(ids, with_group=False))
         hint = GROUP_HINT.get(g, "")
-        self.map_list.set_status(f"{len(names)} 개 · {hint}" if hint else f"{len(names)} 개")
+        self.map_list.set_status(f"{len(ids)} 개 · {hint}" if hint else f"{len(ids)} 개")
 
     def set_checkpoint_info(self, info: Optional[dict], error: Optional[str] = None):
         if error:
@@ -904,8 +994,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
                   self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.combo_opponent,
-                  self.combo_device, self.combo_controller, self.edit_estimator, self.combo_ros):
+                  self.combo_device, self.combo_controller, self.edit_estimator, self.combo_ros,
+                  self.seg_direction, self.combo_obstacle):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
+        # The seed row follows the obstacle choice, not the session state: 다시 뽑기 is exactly the
+        # control you want while something is running, and it restarts the session itself.
+        self._on_scenario_changed()
 
         self.progress.setVisible(preparing or state == STATE_STOPPING)
         was_running = self.viewport._running
@@ -986,7 +1080,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._session_cars = int(facts.get("total_cars", 0))
         self._session_ids = list(facts.get("car_ids", []))
         run = facts.get("run", "—")
-        mp = facts.get("map", "—")
+        # The scenario as built, with the drawn seed in it. This is the whole point of the strip:
+        # "무작위" has to end in a number the user can see and type back in.
+        mp = facts.get("scenario") or facts.get("map", "—")
         cars = facts.get("total_cars", 0)
         races = facts.get("races", 1)
         grid = facts.get("cars_per_race", 1)
@@ -1000,6 +1096,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if ros:
             summary += "  ·  ROS2 " + ("/drive 제어" if ros.get("mode") == "drive" else "발행")
         self.header_summary.setText(summary)
+        self.header_summary.setToolTip(
+            f"{facts.get('scenario_display') or ''}\n로더 이름: {facts.get('map_legacy') or mp}".strip())
         self.combo_focus.blockSignals(True)
         self.combo_focus.clear()
         for cid in self._session_ids[:shown]:
@@ -1180,7 +1278,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 return k
         return "drive"
 
-    SCENE_GROUP = "내 환경 (에디터)"
+    SCENE_GROUP = catalog.SCENES_GROUP
 
     def _with_local_scenes(self, cat: MapCatalog) -> MapCatalog:
         """The scene group, read from the scenes folder here rather than taken from the worker.
@@ -1190,14 +1288,20 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if not cat.ready:
             return cat
         try:
-            from .catalog import list_scenes
-            names = [f"scene:{s['name']}" for s in list_scenes()]
+            ids = catalog.scene_ids()
         except Exception:
             return cat
         groups = {k: v for k, v in cat.groups.items() if k != self.SCENE_GROUP}
-        if names:
-            groups = {self.SCENE_GROUP: names, **groups}
-        return MapCatalog(groups=groups, ready=cat.ready, error=cat.error)
+        entries = dict(cat.entries)
+        if ids:
+            groups[self.SCENE_GROUP] = ids
+            for tid in ids:
+                entries.setdefault(tid, {"id": tid, "family": "scene",
+                                         "family_label": tracks.FAMILY_LABEL["scene"],
+                                         "display": f"{tid.split('/', 1)[1]} (에디터)",
+                                         "legacy": f"scene:{tid.split('/', 1)[1]}", "note": "",
+                                         "obstacles": list(tracks.OBSTACLES_BY_FAMILY["scene"])})
+        return MapCatalog(groups=groups, entries=entries, ready=cat.ready, error=cat.error)
 
     def _scenes_changed_from_editor(self):
         """The editor saved, duplicated or deleted a scene: refresh the map picker's scene group
@@ -1214,18 +1318,19 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if selected:
             self.map_list.select(selected)
 
-    def _drive_from_editor(self, map_name: str):
+    def _drive_from_editor(self, track_id: str):
         """A scene saved on the editor page becomes the driving page's next map."""
         self._scenes_changed_from_editor()
         self.set_mode("drive")
         i = self.map_group.findData(self.SCENE_GROUP)
         if i >= 0:
             self.map_group.setCurrentIndex(i)
-        if not self.map_list.select(map_name):
+        if not self.map_list.select(track_id):
             # the worker's catalogue is not in yet: keep the name as the selection anyway
             pass
-        self._on_map_selected(map_name)
-        self.status_text.setText(f"{map_name} 을(를) 다음 시작에 사용합니다. 런을 고르고 '시작'을 누르세요.")
+        self._on_map_selected(track_id)
+        self.status_text.setText(f"{self.maps.display(track_id)} 을(를) 다음 시작에 사용합니다. "
+                                 f"런을 고르고 '시작'을 누르세요.")
 
     def _view_checkpoint_from_training(self, run_name: str, ckpt_path: str):
         """A checkpoint picked on the training page becomes the driving page's next start."""
@@ -1313,13 +1418,82 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     def _on_map_selected(self, name: str):
         self._selected_map = name
-        self.sel_map.setText(f"맵: {name}")
-        self.sel_map.setToolTip(name)
-        self._update_selection_note()
+        self._sync_obstacle_options()
+        self._on_scenario_changed()
         self._update_start_enabled()
 
+    # ---------------------------------------------------------------- scenario controls
+    def _sync_obstacle_options(self):
+        """Offer only the obstacle families this track can actually carry.
+
+        `maps._load_base` raises for `rt:Monza+obs3` -- a racetrack and an editor scene understand
+        modelled props and nothing else. Offering the choice and then failing the start is the
+        version of this that wastes a checkpoint load.
+        """
+        tid = self._selected_map or ""
+        allowed = self.maps.obstacle_options(tid) if tid else list(tracks.OBSTACLES)
+        want = str(self.combo_obstacle.currentData() or "")
+        self.combo_obstacle.blockSignals(True)
+        self.combo_obstacle.clear()
+        for o in tracks.OBSTACLES:
+            if o in allowed:
+                self.combo_obstacle.addItem(tracks.OBSTACLE_LABEL[o], o)
+        i = self.combo_obstacle.findData(want)
+        self.combo_obstacle.setCurrentIndex(i if i >= 0 else 0)
+        self.combo_obstacle.blockSignals(False)
+        if len(allowed) < len(tracks.OBSTACLES):
+            self.row_obstacle.set_hint(
+                f"이 계열은 '{'/'.join(tracks.OBSTACLE_LABEL[o] for o in allowed if o)}' 만 지원합니다.",
+                "hint")
+
+    def _scenario(self) -> str:
+        """The selection and the three controls as one spec string. `#<kind>:*` when the seed is
+        random -- the worker draws it, not the GUI thread."""
+        tid = self._selected_map or ""
+        if not tid or not tracks.is_spec(tid):
+            return tid                       # a name from outside the registry: pass it through
+        spec = tid
+        d = self.seg_direction.current() or ""
+        if d:
+            spec += f"@{d}"
+        o = str(self.combo_obstacle.currentData() or "")
+        if o:
+            seed = "*" if str(self.combo_seed.currentData()) == "random" else str(self.spin_seed.value())
+            spec += f"#{o}:{seed}"
+        return spec
+
+    def _on_scenario_changed(self):
+        o = str(self.combo_obstacle.currentData() or "")
+        self.row_obstacle.set_hint(tracks.OBSTACLE_HINT.get(o, ""), "hint")
+        random_seed = str(self.combo_seed.currentData()) == "random"
+        for w in (self.combo_seed, self.btn_reroll):
+            w.setEnabled(bool(o))
+        self.spin_seed.setEnabled(bool(o) and not random_seed)
+        self.btn_reroll.setEnabled(bool(o) and random_seed)
+        spec = self._scenario()
+        self.scenario_line.setText(spec)
+        try:
+            self.sel_map.setText(f"맵: {tracks.display(spec)}" if spec else "맵: —")
+        except Exception:
+            self.sel_map.setText(f"맵: {spec}" if spec else "맵: —")
+        self.sel_map.setToolTip(spec)
+        self._update_selection_note()
+
+    def _on_seed_mode(self, _idx=0):
+        self._on_scenario_changed()
+
+    def _on_reroll(self):
+        """A new placement is a new map, so this is a new session seed and a restart -- not a live
+        command. Pressing it while nothing is running just changes what the next 시작 will build."""
+        import random as _random
+        self._session_seed = _random.randrange(1, 10 ** 9)
+        self._on_scenario_changed()
+        if self.state in (STATE_RUNNING, STATE_PAUSED):
+            self._on_start()
+
     def _update_selection_note(self):
-        g = self.maps.group_of(self._selected_map) if self._selected_map else None
+        tid = self._selected_map
+        g = self.maps.group_of(tid) if tid else None
         self.sel_note.setText(f"{g} · 학습 이력 미확인" if g else "")
         self._update_running_note()
 
@@ -1330,10 +1504,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.sel_running.setText("")
             return
         differs = (self._selected_run != running.get("run")
-                   or self._selected_map != running.get("map"))
+                   or self._scenario() != running.get("map"))
         if differs:
             self.sel_running.setText(
-                f"화면에서 도는 것은 {running.get('run', '?')} / {running.get('map', '?')} 입니다. "
+                f"화면에서 도는 것은 {running.get('run', '?')} / "
+                f"{running.get('scenario') or running.get('map', '?')} 입니다. "
                 f"위 설정은 다음 '시작'에 쓰입니다.")
         else:
             self.sel_running.setText("")
@@ -1353,7 +1528,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def current_config(self) -> SessionConfig:
         return SessionConfig(
             run=self._selected_run or "latest",
-            map_name=self._selected_map or "",
+            map_name=self._scenario(),
+            seed=int(self._session_seed),
             races=self.spin_races.value(),
             cars_per_race=self.spin_grid.value(),
             speed_cap=float(self.spin_cap.value()),

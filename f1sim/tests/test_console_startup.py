@@ -152,31 +152,48 @@ def test_preparing_never_claims_ready(window):
     assert "주행" not in window.status_text.text()
 
 
-# ----------------------------------------------------------------- the obstacle groups
-def test_the_modelled_obstacles_are_the_normal_obstacle_group():
-    from f1sim.viewer.console.catalog import GROUP_HINT, GROUP_ORDER
-    props, legacy = "장애물 (상자·궤짝·드럼)", "이전 실험 재현 (격자 장애물)"
-    assert props in GROUP_ORDER and legacy in GROUP_ORDER
-    assert GROUP_ORDER.index(props) < GROUP_ORDER.index(legacy), (
-        "the legacy raster set is listed above the modelled obstacles")
-    assert "부딪" in GROUP_HINT[props] and "LiDAR" in GROUP_HINT[props]
-    # the legacy group must say what it is, not merely be present
-    assert "격자" in GROUP_HINT[legacy] and "이전" in GROUP_HINT[legacy]
-    assert "윗면이 없" in GROUP_HINT[legacy], "the legacy set's actual limitation should be stated"
+# ----------------------------------------------------------------- the three groups
+def test_there_are_exactly_three_groups_and_each_says_what_it_means():
+    """The five groups the console used to show ("기본 평가셋", "장애물", "기본 학습셋",
+    "이전 실험 재현", "전체 카탈로그") named where a list came from, not what it means, and two of
+    them were the same maps with different obstacles stamped in. The obstacle families are an
+    option on a map now, so what is left is the one question a group can answer."""
+    from f1sim.viewer.console.catalog import GROUP_HINT, GROUP_ORDER, SCENES_GROUP
+    assert GROUP_ORDER == ["학습", "검증", "내 환경"]
+    assert SCENES_GROUP == "내 환경"
+    assert "학습한" in GROUP_HINT["학습"]
+    assert "학습에 쓰인 적 없" in GROUP_HINT["검증"] and "일반화" in GROUP_HINT["검증"]
+    assert "에디터" in GROUP_HINT["내 환경"] or "환경 페이지" in GROUP_HINT["내 환경"]
+
+
+def test_the_deleted_groups_are_gone_from_the_console_and_the_worker():
+    from f1sim.viewer.console import catalog as C
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "f1sim", "viewer", "sim_worker.py")).read()
+    for dead in ("기본 평가셋", "기본 학습셋", "이전 실험 재현", "전체 카탈로그",
+                 "장애물 (상자·궤짝·드럼)"):
+        assert dead not in C.GROUP_ORDER and dead not in C.GROUP_HINT, dead
+        assert dead not in src, f"{dead} still built by the worker"
 
 
 def test_worker_and_console_agree_on_the_group_names():
-    import re
+    """One definition, in `f1sim.tracks`, read by both sides. The worker used to build the groups
+    from its own literal dict and the console from another one, which is two lists to keep in sync
+    and a test to notice when they are not."""
     from f1sim.viewer.console.catalog import GROUP_ORDER
+    from f1sim import tracks
+    assert GROUP_ORDER == list(tracks.GROUP_ORDER)
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "f1sim", "viewer", "sim_worker.py")).read()
-    block = src[src.index('        groups.update({\n            "기본 평가셋"'):]
-    worker = re.findall(r'"([^"]+)": uniq\(', block[:1200])
-    # The editor's scene group is sent first, and only when the scenes folder holds something
-    # (`groups[SCENES_GROUP] = scenes` above the literal); the fixed groups must match in order.
-    from f1sim.viewer.console.catalog import SCENES_GROUP
-    assert 'groups[SCENES_GROUP] = scenes' in src and GROUP_ORDER[0] == SCENES_GROUP
-    assert worker == GROUP_ORDER[1:], f"worker {worker} vs console {GROUP_ORDER[1:]}"
+    assert "T.groups(scene_ids=scene_ids)" in src, "the worker must use the registry's groups"
+
+
+def test_the_groups_hold_base_tracks_not_variants():
+    """The list is a list of maps. A direction or an obstacle seed is not a row in it."""
+    from f1sim import tracks
+    for names in tracks.groups(scene_ids=["scene/x"]).values():
+        for tid in names:
+            assert "@" not in tid and "#" not in tid and "~" not in tid and "+" not in tid, tid
 
 
 def test_props_names_use_the_loader_s_suffix_order():
@@ -190,7 +207,7 @@ def test_props_names_use_the_loader_s_suffix_order():
 def test_the_training_obstacle_split_is_untouched():
     """The viewer relabels a group; it must not redefine what training evaluates against."""
     from f1sim.learn import common
-    assert len(common.EVAL_OBSTACLE_TRACKS) == 24
+    assert len(common.EVAL_OBSTACLE_TRACKS) == 12
     assert "real:korea_2025_iccas+obs101" in common.EVAL_OBSTACLE_TRACKS
     assert not any("+props" in n for n in common.EVAL_OBSTACLE_TRACKS), (
         "props must not have been quietly added to the training obstacle split")

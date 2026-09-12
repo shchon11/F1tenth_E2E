@@ -595,8 +595,9 @@ class SessionController(QtCore.QObject):
                     f"경고: worker의 런 경로({msg['runs_dir']})가 콘솔이 읽은 경로"
                     f"({catalog.RUNS_DIR})와 다릅니다.")
         elif kind == P.MSG_MAPS:
-            self._maps = MapCatalog(groups=msg.get("groups") or {}, ready=not msg.get("error"),
-                                    error=msg.get("error"))
+            self._maps = MapCatalog(groups=msg.get("groups") or {},
+                                    entries=msg.get("entries") or {},
+                                    ready=not msg.get("error"), error=msg.get("error"))
             self.window.set_maps(self._maps)
         elif kind == P.MSG_DESCRIBED:
             self._on_described(msg, seq)

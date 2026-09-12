@@ -494,7 +494,7 @@ def test_validate_extracts_centerline_and_hands_off(page, scenes_root):
     assert pg._validation is not None, pg.status_line.text()
     assert pg._validation.get("ok"), pg._validation
     assert pg.state.doc.centerline is not None and len(pg.state.doc.centerline) > 50
-    assert handed == ["scene:loop"]
+    assert handed == ["scene/loop"]
     saved = json.load(open(scenes_root / "loop" / "scene.json"))
     assert saved["centerline"] is not None
 
@@ -511,17 +511,17 @@ def test_window_has_editor_mode_and_hand_off(qapp, scenes_root, monkeypatch):
         win.set_mode("edit")
         assert win.centre_stack.currentWidget() is win.editor
         assert not win.left_panel.isVisibleTo(win)
-        win.set_maps(MapCatalog(groups={"기본 평가셋": ["gen:competition:0"]}, ready=True))
-        assert win.maps.groups.get(W.ConsoleWindow.SCENE_GROUP) == ["scene:hall_a"]
+        win.set_maps(MapCatalog(groups={"검증": ["gen/comp-0"]}, ready=True))
+        assert win.maps.groups.get(W.ConsoleWindow.SCENE_GROUP) == ["scene/hall_a"]
         # the editor's picker got the catalogue too, without the scene group
-        assert win.editor.map_picker.select("gen:competition:0")
-        assert not win.editor.map_picker.select("scene:hall_a")
-        assert win.editor.catalog_choice() == "gen:competition:0"
-        assert win.map_group.itemData(0) == W.ConsoleWindow.SCENE_GROUP
-        win._drive_from_editor("scene:hall_a")
+        assert win.editor.map_picker.select("gen/comp-0")
+        assert not win.editor.map_picker.select("scene/hall_a")
+        assert win.editor.catalog_choice() == "gen/comp-0"
+        assert win.map_group.findData(W.ConsoleWindow.SCENE_GROUP) >= 0
+        win._drive_from_editor("scene/hall_a")
         assert win.current_mode() == "drive"
-        assert win.current_config().map_name == "scene:hall_a"
-        assert win.map_list.selected() == "scene:hall_a"
+        assert win.current_config().map_name == "scene/hall_a"
+        assert win.map_list.selected() == "scene/hall_a"
     finally:
         win.editor.shutdown()
         win.deleteLater()

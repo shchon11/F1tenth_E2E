@@ -76,7 +76,11 @@ class Harness:
 
 
 @pytest.fixture
-def h(qapp):
+def h(qapp, tmp_path, monkeypatch):
+    # The window merges the *local* scene folder into the worker's catalogue (the editor can create
+    # a scene while the worker is already up), so a developer machine with saved scenes would add a
+    # group these tests did not ask for. Point it at an empty directory.
+    monkeypatch.setenv("F1SIM_SCENES", str(tmp_path / "scenes"))
     harness = Harness(qapp)
     try:
         yield harness

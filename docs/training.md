@@ -54,8 +54,10 @@ observation from *before* the step for the transition being credited.
 Environment actions are normalised to `[-1, 1]`; the `Simulator` underneath takes physical
 `(steer [rad], speed [m/s])`.
 
-Track sets are named: `common.TRAIN_TRACKS`, `common.EVAL_TRACKS`. The `--tracks` flag accepts
-`train`, `eval`, `eval_obstacles` or a comma-separated list of catalogue names.
+Track sets are named: `common.TRAIN_TRACKS`, `common.EVAL_TRACKS`. The `--tracks` flag accepts a
+split name (`train`, `heldout` / `eval`, `heldout_obstacles`, `heldout_all`) or a comma-separated
+list in either grammar — `real/bb22-1@rev#line:44` or `real:blackbox2022_1+rlobs44~rev`. See
+[Tracks](tracks.md) for the ids, the scenario grammar and what the three splits are.
 
 ## Observation and action
 
@@ -113,7 +115,21 @@ distinct tracks held on the GPU, and `--scan-stack`. Measure before committing t
 
 Relevant flags: `--envs`, `--horizon`, `--epochs`, `--minibatch`, `--total`, `--amp`, `--cap0` /
 `--cap1` / `--cap-steps` (speed-cap curriculum), `--kl-coef` / `--kl-decay`, `--critic-warmup`,
-`--fresh-opt`, `--tracks`, `--sim-backend`.
+`--fresh-opt`, `--tracks`, `--obstacle-draws`, `--sim-backend`.
+
+`--tracks` takes a split name or a list of scenarios ([Tracks](tracks.md)):
+
+```bash
+--tracks train                                       # the curated 149-variant training split
+--tracks 'real/icra22,real/icra22@rev,rt/spielberg'  # three scenarios, new grammar
+--tracks 'real:icra2022,rt:Spielberg~rev'            # the loader's grammar, still accepted
+--tracks 'real/bb22-1#line:*' --obstacle-draws 8     # one map, eight random box placements
+```
+
+`--obstacle-draws N` (default 8) is how many rasterised variants an open seed (`#<kind>:*`) becomes.
+The draw comes from `--seed`, so the same seed gives the same maps, and the concrete loader names go
+into the run's W&B config. An entry with a fixed seed, or no obstacles at all, is one track however
+large `N` is.
 
 `--sim-backend` selects the simulator runtime: `compile` (default), `eager`, or `graphs`. `graphs`
 captures explicit CUDA graphs rather than compiling; on the machine used here that capture took
@@ -176,7 +192,9 @@ python3 -m f1sim.learn.evaluate --teacher --action-mode plan --per-track --proto
 
 `--protocol trials` runs independent fixed-length attempts; `rolling` runs continuously with
 auto-reset. `--budget-laps` sets the time budget as laps of the track at the speed cap, which makes
-the budget comparable across tracks of different length. `--tracks eval` uses the held-out set.
+the budget comparable across tracks of different length. `--tracks heldout` (`eval` is the same
+list) uses the held-out set. `--per-track` keys are the **loader** names, because they are data that
+older reports are already keyed by.
 
 Report first-attempt outcomes from a frozen checkpoint on the held-out set. Numbers from a run's own
 training tracks are not evidence of generalisation.
