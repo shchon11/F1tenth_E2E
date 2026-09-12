@@ -102,8 +102,14 @@ class Logger:
         return self._add(name)
 
 
-def make_node(spec=None, enabled=True, timeout=0.25):
-    """A PolicyNode with every ROS dependency replaced, and its real methods intact."""
+def make_node(spec=None, enabled=True, timeout=0.25, traction=None):
+    """A PolicyNode with every ROS dependency replaced, and its real methods intact.
+
+    `traction` is a `TractionGuard` or None; None is the node's own default (`traction:=off`), which
+    is what every test in this file wants -- the sensor contract is about what reaches the actor and
+    what is published, and the guard must not move either while it is off. The traction guard's own
+    node-level behaviour is `test_policy_node_traction.py`.
+    """
     spec = spec or ObsSpec(n_beams=64, scan_stack=2, scan_stride=1, action_history=2,
                            act_dim=2, hist_len=0, range_max=10.0, v_max=8.0)
     n = pn.PolicyNode.__new__(pn.PolicyNode)
@@ -123,6 +129,11 @@ def make_node(spec=None, enabled=True, timeout=0.25):
     n._unit_warned = False
     n.tracker = None
     n.cal = (0.0, 1.0, 1.0)
+    n.traction = traction
+    n.ax_body = None
+    n.t_ax = None
+    n.motor_current = None
+    n.t_current = None
     n.timeout = timeout
     n.t_att = n.t_imu = n.t_odom = None
     n._inhibited = False
