@@ -1,0 +1,156 @@
+{
+  "freeze_sha256": "6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce",
+  "suite": {
+    "backend": "f1sim",
+    "budget_laps": 3.0,
+    "calibration": {
+      "measured": false,
+      "note": "non-candidate feasibility smoke; no evaluated checkpoint was loaded",
+      "timings": {}
+    },
+    "envs": 8,
+    "hold_seconds": 1.0,
+    "obstacle_maps": [
+      "gen:control:1400",
+      "gen:control:9100"
+    ],
+    "obstacle_window_m": 4.0,
+    "opp_speed_range": [
+      0.6,
+      0.8
+    ],
+    "paired_mus": [
+      0.73423,
+      0.94401
+    ],
+    "placements": {
+      "gen:control:1400": {
+        "placement": {
+          "blocked_span_m": 0.29,
+          "centre_xy": [
+            -1.7516807829133836,
+            5.861992339476102
+          ],
+          "corridor_centre_offset_m": -0.5608921349048615,
+          "corridor_width_m": 0.51,
+          "half_lane_m": 1.0198038816452026,
+          "n_cells": 130,
+          "required_corridor_m": 0.51,
+          "s_obs_m": 10.0,
+          "side": 1,
+          "size_m": [
+            0.29,
+            1.121784269809723
+          ]
+        },
+        "proofs": {
+          "blocking": {
+            "blocked_samples": 4,
+            "samples_in_window": 11,
+            "sweep_m": 0.69
+          },
+          "connectivity": {
+            "component": 1,
+            "erosion_radius_m": 0.155,
+            "lane_length_m": 50.86337493750354,
+            "local_cells": 40620,
+            "swept_length_m": 0.69,
+            "window_m": 8.0
+          },
+          "corridor": {
+            "passable_sides": [
+              "left",
+              "right"
+            ],
+            "required_m": 0.51,
+            "tolerance_m": 0.05,
+            "widths_m": {
+              "left": 0.9000000000000002,
+              "right": 1.6500000000000008
+            }
+          }
+        },
+        "s_start_m": -5.0,
+        "search": {
+          "rejected": [],
+          "s_obs_m": 10.0
+        }
+      },
+      "gen:control:9100": {
+        "placement": {
+          "blocked_span_m": 0.29,
+          "centre_xy": [
+            -7.398881831963095,
+            -5.450756597410582
+          ],
+          "corridor_centre_offset_m": -0.7048803269863129,
+          "corridor_width_m": 0.51,
+          "half_lane_m": 1.2816005945205688,
+          "n_cells": 163,
+          "required_corridor_m": 0.51,
+          "s_obs_m": 10.0,
+          "side": 1,
+          "size_m": [
+            0.29,
+            1.4097606539726257
+          ]
+        },
+        "proofs": {
+          "blocking": {
+            "blocked_samples": 3,
+            "samples_in_window": 10,
+            "sweep_m": 0.69
+          },
+          "connectivity": {
+            "component": 3,
+            "erosion_radius_m": 0.155,
+            "lane_length_m": 56.8854680896294,
+            "local_cells": 43701,
+            "swept_length_m": 0.69,
+            "window_m": 8.0
+          },
+          "corridor": {
+            "passable_sides": [
+              "left"
+            ],
+            "required_m": 0.51,
+            "tolerance_m": 0.05,
+            "widths_m": {
+              "left": 1.1500000000000004,
+              "right": 0.05
+            }
+          }
+        },
+        "s_start_m": -5.0,
+        "search": {
+          "rejected": [],
+          "s_obs_m": 10.0
+        }
+      }
+    },
+    "race_maps": [
+      "gen:control:1400",
+      "gen:control:9100"
+    ],
+    "race_size": 2,
+    "reused_maps_note": "gen:control:1400 is an SGR training map; korea_2026_competition and gen:control:9100 are existing diagnostic maps. No unseen-map or generalisation claim attaches to any result.",
+    "s_start_offset_m": -15.0,
+    "seeds": [
+      4401,
+      4402
+    ],
+    "sensor_noise": true,
+    "solo_maps": [
+      "gen:control:1400",
+      "real:korea_2026_competition",
+      "gen:control:9100"
+    ],
+    "solo_mus": [
+      0.73423,
+      0.94401,
+      1.15379
+    ],
+    "speed_cap": 9.0,
+    "version": "v1"
+  }
+}

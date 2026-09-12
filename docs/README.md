@@ -10,6 +10,7 @@ Entry point: the [repository README](../README.md).
 | [Architecture](architecture.md) | simulator fidelity, map catalogue, raceline and teacher, the viewer |
 | [Training](training.md) | DAgger, PPO, evaluation, the watch tool, observation and action detail |
 | [Benchmark](benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metric definitions, adding a checkpoint later |
+| [Leaderboard](leaderboard/README.md) | the rendered leaderboard: six metrics per cohort with exact counts, paired pace, evidence links and limitations. `leaderboard/index.html` is the same report as a self-contained offline page |
 | [ROS 2](ros2.md) | launch files, topic contracts, teleoperation |
 | [로컬 실행 안내](local_pc.md) | 이 워크스테이션 전용 실행 명령 (Korean) |
 

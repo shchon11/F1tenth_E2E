@@ -1,0 +1,84 @@
+{
+  "title": "F1TENTH checkpoint leaderboard",
+  "as_of": "2026-09-12",
+  "default_cohort": "recipe-study",
+  "cohorts": [
+    {
+      "id": "recipe-study",
+      "label": "Recipe study",
+      "description": "Seven systems with identical suite, source digests and paired starts. A recipe replication, R10 and controller-recipe ablations.",
+      "suite": "suite-v1.json",
+      "roster": "recipe-study-roster.json",
+      "results": [
+        "../../research/a702-replication-2026-09-12-raw-cells.jsonl",
+        "recipe-study-additional-cells.jsonl"
+      ],
+      "reference_system": "frozen_original@estimated",
+      "labels": {
+        "frozen_original@estimated": {
+          "name": "Original + surface controller",
+          "training": "Original legacy recipe",
+          "note": "Comparison reference; estimator 401 at evaluation."
+        },
+        "cl_origrecipe_legacy_s701@estimated": {
+          "name": "A recipe · seed 701",
+          "training": "Legacy · 149 track variants",
+          "note": "Mixed traffic; 149 track variants include routes, directions and obstacle variations. Adam restored; learning rate 5e-5 to 2e-5. Candidate, not a deployment promotion."
+        },
+        "cl_origrecipe_legacy_s702@estimated": {
+          "name": "A recipe · seed 702",
+          "training": "Legacy · 149 track variants",
+          "note": "Mixed traffic; 149 track variants include routes, directions and obstacle variations. Second seed of the A recipe; learning rate 5e-5 to 2e-5. Candidate, not a deployment promotion."
+        },
+        "cl_r10_base_s701@estimated": {
+          "name": "R10 · seed 701",
+          "training": "Estimated · 5 maps · solo",
+          "note": "Reverse-direction data added; learning rate 1e-4."
+        },
+        "cl_r10_base_s702@estimated": {
+          "name": "R10 · seed 702",
+          "training": "Estimated · 5 maps · solo",
+          "note": "Second seed of R10; learning rate 1e-4."
+        },
+        "cl_recipe_legacy_s501@estimated": {
+          "name": "Legacy recipe · seed 501",
+          "training": "Legacy · 5 maps · solo",
+          "note": "Fresh Adam; learning rate 1e-4."
+        },
+        "cl_sgr_base_restoreopt_s701@estimated": {
+          "name": "C: restored optimizer · seed 701",
+          "training": "Estimated · 5 maps · solo",
+          "note": "Adam restored; learning rate 5e-5 to 2e-5."
+        }
+      }
+    },
+    {
+      "id": "initial-study",
+      "label": "Initial study",
+      "description": "Three-system initial study. A different benchmark recorder digest prevents a shared ranking with the recipe study. The n_envs-only metadata derivation is documented in the original research note.",
+      "suite": "suite-v1.json",
+      "roster": "initial-study-roster.json",
+      "results": [
+        "../../research/benchmark-v1-2026-09-12-derived-cells.jsonl"
+      ],
+      "reference_system": "frozen_original@estimated",
+      "labels": {
+        "frozen_original@legacy": {
+          "name": "Original + legacy controller",
+          "training": "Original legacy recipe",
+          "note": "Original weights evaluated with the legacy controller."
+        },
+        "frozen_original@estimated": {
+          "name": "Original + surface controller",
+          "training": "Original legacy recipe",
+          "note": "Comparison reference; estimator 401 at evaluation."
+        },
+        "cl_main_estimated_s501@estimated": {
+          "name": "Estimated retraining · seed 501",
+          "training": "Estimated · 5 maps · solo",
+          "note": "Initial estimated-controller retraining experiment."
+        }
+      }
+    }
+  ]
+}

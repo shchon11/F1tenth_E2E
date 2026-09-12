@@ -24,4 +24,8 @@ f1sim = ["assets/*.glb", "assets/*.npz", "assets/maps/*.pgm", "assets/maps/*.yam
          "viewer/static/three/addons/*/*.js",
          # tests/benchmark/test_frozen_placement.py resolves this through the imported package,
          # not a repo path, so it has to be in the wheel for an installed benchmark to work.
-         "learn/benchmark/*.json"]
+         "learn/benchmark/*.json",
+         # The offline leaderboard renderer inlines these into index.html and resolves them
+         # through the imported package, so they have to ship in the wheel.
+         "learn/leaderboard_assets/*.html", "learn/leaderboard_assets/*.css",
+         "learn/leaderboard_assets/*.js"]

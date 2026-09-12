@@ -1,0 +1,46 @@
+{
+  "description": "Existing measured results only. No new trials. Additional JSONL is a byte-for-byte concatenation in the listed order. No raw identity fields changed. Report rosters replace machine-local weight paths with portable identifiers; rendering does not load weights.",
+  "source_repository_commit": "1a19b68c14663d20f51810f83660ca05517001be",
+  "additional_result_inputs": [
+    {
+      "file": "benchmark-v1-r10-2026-09-12-s701-cells.jsonl",
+      "sha256": "baddb2d3d8ab9468d8ca0e9eaf3edf221b68fd9d46f359a7f9ac8c0a599ac247",
+      "bytes": 272247,
+      "cells": 34
+    },
+    {
+      "file": "benchmark-v1-r10-2026-09-12-s702-cells.jsonl",
+      "sha256": "a7d3432a888c4785f5b5e51059ec40ac99b7f8d37d6d314588fa77c3a6ed1f2b",
+      "bytes": 272316,
+      "cells": 34
+    },
+    {
+      "file": "recipe-restore-2026-09-12-cl_recipe_legacy_s501-cells.jsonl",
+      "sha256": "abc8309c39b80c380f9a9bb74a0e4223f4e9157ef96507b112f1d17275e61615",
+      "bytes": 272466,
+      "cells": 34
+    },
+    {
+      "file": "recipe-restore-2026-09-12-cl_sgr_base_restoreopt_s701-cells.jsonl",
+      "sha256": "66d20d0a2a5a216f54c72a12b3b72eb6faa9c3907fec7670520274eeea75b414",
+      "bytes": 272838,
+      "cells": 34
+    }
+  ],
+  "additional_result_output": {
+    "file": "recipe-study-additional-cells.jsonl",
+    "sha256": "bfec51dd9eb9ba080c3280d082433550289cc95251af95f0703244837c40d59e"
+  },
+  "existing_result_files": [
+    {
+      "file": "../../research/a702-replication-2026-09-12-raw-cells.jsonl",
+      "sha256": "cff6b0ad4286b350091ca4c08ba2034413400b013f9859e680f703bff7410f7e"
+    },
+    {
+      "file": "../../research/benchmark-v1-2026-09-12-derived-cells.jsonl",
+      "sha256": "cb3b51060360be6937145c375ba0977122cc61f10bff35a67b1313b2b5400333"
+    }
+  ],
+  "suite_source": "opponent-diversity-stage1/scores/stage1-20260912/suite-v1.json",
+  "suite_file_sha256": "1ea2bc6eb68702d222b21a808ccb765083643fc2d174f65568e72e0c726d42c2"
+}

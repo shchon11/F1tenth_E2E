@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+{{STYLE}}
+</style>
+</head>
+<body>
+<a class="skip" href="#board">Skip to the table</a>
+<header class="masthead">
+  <div class="wrap">
+    <p class="kicker">Research engineering report · generated offline from measured results</p>
+    <h1>{{TITLE}}</h1>
+    <p class="asof">As of <span class="mono">{{AS_OF}}</span></p>
+  </div>
+</header>
+
+<main class="wrap" id="board">
+  <noscript>
+    <p class="note warn">This page needs JavaScript for search, sorting and the per-checkpoint
+    details. The same tables, exact counts and method notes are in <code>README.md</code> next to
+    this file.</p>
+  </noscript>
+
+  <form class="controls" id="controls" novalidate>
+    <fieldset class="cohort" id="cohort-field">
+      <legend>Cohort</legend>
+      <div class="cohort-options" id="cohort-options"></div>
+    </fieldset>
+    <p class="cohort-desc" id="cohort-desc"></p>
+    <ul class="strip" id="strip"></ul>
+    <div class="row">
+      <div class="field">
+        <label for="q">Search checkpoints</label>
+        <input id="q" type="search" autocomplete="off" spellcheck="false"
+               placeholder="name, system id or training recipe">
+      </div>
+      <div class="field">
+        <label for="rank-metric">Rank by</label>
+        <select id="rank-metric"></select>
+      </div>
+      <div class="field">
+        <label for="direction">Order</label>
+        <select id="direction">
+          <option value="best">Best first</option>
+          <option value="worst">Worst first</option>
+        </select>
+      </div>
+    </div>
+    <p class="note" id="filter-note"></p>
+  </form>
+
+  <div class="table-wrap" tabindex="0" role="region" aria-label="Leaderboard table (scrolls horizontally)">
+    <table id="table">
+      <caption id="table-caption"></caption>
+      <thead><tr id="head-row"></tr></thead>
+      <tbody id="body"></tbody>
+    </table>
+  </div>
+
+  <section class="method">
+    <h2>Method</h2>
+    <ol id="method"></ol>
+    <h2>Scope and limitations</h2>
+    <ul id="limits"></ul>
+    <h2>Evidence</h2>
+    <div id="evidence"></div>
+    <p class="note" id="regen"></p>
+  </section>
+</main>
+
+<script id="leaderboard-data" type="application/json">{{DATA}}</script>
+<script>
+{{SCRIPT}}
+</script>
+</body>
+</html>

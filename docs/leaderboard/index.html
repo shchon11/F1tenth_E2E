@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F1TENTH checkpoint leaderboard</title>
+<style>
+/* Restrained research-tool palette: navy structure, one blue and one teal accent, off-white page.
+   No webfont is loaded -- the stack is what the reader already has, so the file stays offline. */
+:root {
+  --page: #f6f7fa;
+  --surface: #ffffff;
+  --ink: #121a2b;
+  --ink-soft: #47526a;
+  --ink-faint: #6c7690;
+  --line: #e3e7ef;
+  --line-strong: #cdd4e2;
+  --navy: #1b2a4a;
+  --blue: #245c9c;
+  --blue-soft: #eef4fb;
+  --teal: #0f7268;
+  --teal-soft: #e9f5f2;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--page); color: var(--ink); font-family: var(--sans);
+  font-size: 15px; line-height: 1.55;
+}
+.wrap { max-width: 1220px; margin: 0 auto; padding: 0 20px; }
+.mono { font-family: var(--mono); }
+.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+a { color: var(--blue); }
+.skip {
+  position: absolute; left: -9999px; top: 0; background: var(--surface); padding: 10px 14px;
+  border: 1px solid var(--line-strong); z-index: 5;
+}
+.skip:focus { left: 12px; top: 12px; }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+.masthead { background: var(--navy); color: #f4f6fa; padding: 18px 0 16px; }
+.masthead .kicker {
+  margin: 0 0 6px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+  color: #a9b8d4;
+}
+.masthead h1 { margin: 0; font-size: 24px; line-height: 1.25; font-weight: 620; }
+.masthead .asof { margin: 5px 0 0; color: #c3cee3; font-size: 13.5px; }
+
+main { padding-bottom: 48px; }
+
+.controls {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  padding: 13px 16px 12px; margin: 16px 0 14px;
+}
+fieldset.cohort { border: 0; margin: 0 0 8px; padding: 0; }
+fieldset.cohort legend {
+  padding: 0; font-size: 12px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.cohort-options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.cohort-options label {
+  display: inline-flex; align-items: baseline; gap: 8px; padding: 7px 13px; cursor: pointer;
+  border: 1px solid var(--line-strong); border-radius: 999px; background: #fbfcfe;
+  font-size: 14px;
+}
+.cohort-options input { accent-color: var(--blue); margin: 0; }
+.cohort-options label:has(input:checked) {
+  border-color: var(--blue); background: var(--blue-soft); color: var(--navy); font-weight: 560;
+}
+.cohort-options label:has(input:focus-visible) { outline: 2px solid var(--blue); outline-offset: 2px; }
+.cohort-options .count { color: var(--ink-faint); font-size: 12.5px; font-weight: 400; }
+
+.cohort-desc { margin: 2px 0 10px; color: var(--ink-soft); max-width: 92ch; font-size: 13.5px; }
+
+ul.strip {
+  display: flex; flex-wrap: wrap; gap: 0 28px; list-style: none; margin: 0 0 12px; padding: 9px 0;
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+}
+ul.strip li { font-size: 13px; color: var(--ink-soft); }
+ul.strip .k {
+  display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-faint);
+}
+ul.strip .v { font-variant-numeric: tabular-nums; color: var(--ink); }
+ul.strip .v.mono { font-size: 12.5px; }
+
+.controls .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+.field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.field:first-child { flex: 1 1 280px; }
+.field label { font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-faint); }
+input[type="search"], select {
+  font: inherit; color: var(--ink); background: #fff; border: 1px solid var(--line-strong);
+  border-radius: 6px; padding: 8px 10px; min-height: 38px; width: 100%;
+}
+.note { margin: 12px 0 0; font-size: 13px; color: var(--ink-soft); }
+.note.warn {
+  background: var(--teal-soft); border-left: 3px solid var(--teal); padding: 10px 12px;
+  border-radius: 0 6px 6px 0;
+}
+
+.table-wrap {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  overflow-x: auto; max-width: 100%;
+}
+table { border-collapse: separate; border-spacing: 0; width: 100%; min-width: 1010px; table-layout: fixed; }
+caption { caption-side: top; text-align: left; padding: 11px 14px; color: var(--ink-soft); font-size: 13px; }
+th, td { text-align: right; padding: 12px 10px; border-bottom: 1px solid var(--line); }
+thead th {
+  position: sticky; top: 0; z-index: 2; background: #fafbfd; border-bottom: 1px solid var(--line-strong);
+  vertical-align: bottom; font-size: 12.5px; color: var(--ink-soft); font-weight: 600;
+}
+th.col-rank, td.col-rank { width: 58px; text-align: left; padding-left: 14px; }
+th.col-system, td.col-system {
+  text-align: left; position: sticky; left: 0; z-index: 1; background: var(--surface);
+  width: 250px; border-right: 1px solid var(--line);
+}
+th.metric, td.metric { width: 112px; }
+thead th.col-system { z-index: 3; background: #fafbfd; }
+th.col-more, td.col-more { text-align: right; width: 92px; padding-right: 14px; }
+
+thead th button {
+  font: inherit; font-weight: 600; color: var(--navy); background: none; border: 0; padding: 0;
+  cursor: pointer; text-align: right; display: block; width: 100%; line-height: 1.3;
+}
+thead th .arrow { color: var(--ink-faint); font-weight: 500; }
+.sr {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+thead th button:hover .label { text-decoration: underline; }
+thead th[aria-sort] button .label, thead th[aria-sort] .arrow { color: var(--blue); }
+.sortmark { font-size: 10px; color: var(--blue); }
+
+tbody td { font-size: 14.5px; }
+/* The first column is sticky, so rows scroll UNDER it. Every state of it must be opaque, and the
+   row rules are more specific than `td.col-system`, so each one names the sticky cell too. */
+tbody td.col-system { background: var(--surface); }
+tbody tr.system-row:hover td { background: #fcfdff; }
+tbody tr.system-row:hover td.col-system { background: #fcfdff; }
+td.col-system .name { font-weight: 560; color: var(--navy); }
+td.col-system .train { display: block; font-size: 12.5px; color: var(--ink-soft); }
+.badge {
+  display: inline-block; margin-left: 7px; padding: 1px 7px; border-radius: 999px;
+  background: var(--teal-soft); color: var(--teal); border: 1px solid #bfded8;
+  font-size: 11px; font-weight: 600; letter-spacing: .03em; vertical-align: 1px;
+}
+td.col-rank .rank { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--navy); }
+td.col-rank .rank.none { color: var(--ink-faint); font-weight: 400; }
+
+td.metric .v { font-variant-numeric: tabular-nums; }
+td.metric .x { display: block; font-size: 12px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+td.metric .reason { display: block; font-size: 12px; color: var(--ink-faint); max-width: 20ch; }
+td.metric.best .v { color: var(--teal); font-weight: 620; }
+td.metric.na .v { color: var(--ink-faint); }
+td.col-pace .v { font-variant-numeric: tabular-nums; }
+td.col-pace .n { display: block; font-size: 12px; color: var(--ink-faint); }
+
+button.more {
+  font: inherit; font-size: 13px; color: var(--blue); background: #fff; cursor: pointer;
+  border: 1px solid var(--line-strong); border-radius: 6px; padding: 5px 10px;
+}
+button.more[aria-expanded="true"] { background: var(--blue-soft); border-color: var(--blue); }
+
+tr.details-row td { background: #fafbfd; padding: 0; border-bottom: 1px solid var(--line-strong); }
+tr.details-row .panel { padding: 16px 18px 18px; }
+tr.details-row h3 { margin: 0 0 10px; font-size: 14px; color: var(--navy); }
+dl.kv { display: grid; grid-template-columns: minmax(170px, 220px) 1fr; gap: 6px 18px; margin: 0 0 14px; }
+dl.kv dt { font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-faint); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; word-break: break-word; }
+dl.kv dd.mono { font-family: var(--mono); font-size: 12.5px; }
+
+.empty { padding: 30px 18px; text-align: left; color: var(--ink-soft); }
+.empty strong { display: block; color: var(--ink); font-size: 15px; margin-bottom: 4px; }
+.empty button {
+  font: inherit; margin-top: 10px; padding: 6px 12px; border: 1px solid var(--line-strong);
+  border-radius: 6px; background: #fff; color: var(--blue); cursor: pointer;
+}
+
+.method { margin-top: 30px; }
+.method h2 { font-size: 16px; color: var(--navy); margin: 26px 0 8px; }
+.method ol, .method ul { margin: 0; padding-left: 22px; color: var(--ink-soft); max-width: 92ch; }
+.method li { margin-bottom: 7px; }
+.method li, .method .evmeta { overflow-wrap: anywhere; }
+.method .evfile { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.method .evmeta { font-size: 13px; }
+.method h3 { font-size: 13.5px; margin: 16px 0 6px; color: var(--ink); }
+
+@media (max-width: 760px) {
+  .masthead h1 { font-size: 22px; }
+  .controls .row { flex-direction: column; align-items: stretch; gap: 12px; }
+  .field:first-child { flex: 1 1 auto; }
+  ul.strip { gap: 10px 20px; }
+  dl.kv { grid-template-columns: 1fr; gap: 2px; }
+  dl.kv dd { margin-bottom: 8px; }
+  th.col-system, td.col-system { width: 200px; }
+}
+
+/* The evidence block reuses the details grid, so the protocol pins that left the summary strip
+   still have one obvious home. */
+#evidence dl.kv { margin: 4px 0 10px; }
+#evidence dl.kv dd { overflow-wrap: anywhere; font-size: 13.5px; }
+
+</style>
+</head>
+<body>
+<a class="skip" href="#board">Skip to the table</a>
+<header class="masthead">
+  <div class="wrap">
+    <p class="kicker">Research engineering report · generated offline from measured results</p>
+    <h1>F1TENTH checkpoint leaderboard</h1>
+    <p class="asof">As of <span class="mono">2026-09-12</span></p>
+  </div>
+</header>
+
+<main class="wrap" id="board">
+  <noscript>
+    <p class="note warn">This page needs JavaScript for search, sorting and the per-checkpoint
+    details. The same tables, exact counts and method notes are in <code>README.md</code> next to
+    this file.</p>
+  </noscript>
+
+  <form class="controls" id="controls" novalidate>
+    <fieldset class="cohort" id="cohort-field">
+      <legend>Cohort</legend>
+      <div class="cohort-options" id="cohort-options"></div>
+    </fieldset>
+    <p class="cohort-desc" id="cohort-desc"></p>
+    <ul class="strip" id="strip"></ul>
+    <div class="row">
+      <div class="field">
+        <label for="q">Search checkpoints</label>
+        <input id="q" type="search" autocomplete="off" spellcheck="false"
+               placeholder="name, system id or training recipe">
+      </div>
+      <div class="field">
+        <label for="rank-metric">Rank by</label>
+        <select id="rank-metric"></select>
+      </div>
+      <div class="field">
+        <label for="direction">Order</label>
+        <select id="direction">
+          <option value="best">Best first</option>
+          <option value="worst">Worst first</option>
+        </select>
+      </div>
+    </div>
+    <p class="note" id="filter-note"></p>
+  </form>
+
+  <div class="table-wrap" tabindex="0" role="region" aria-label="Leaderboard table (scrolls horizontally)">
+    <table id="table">
+      <caption id="table-caption"></caption>
+      <thead><tr id="head-row"></tr></thead>
+      <tbody id="body"></tbody>
+    </table>
+  </div>
+
+  <section class="method">
+    <h2>Method</h2>
+    <ol id="method"></ol>
+    <h2>Scope and limitations</h2>
+    <ul id="limits"></ul>
+    <h2>Evidence</h2>
+    <div id="evidence"></div>
+    <p class="note" id="regen"></p>
+  </section>
+</main>
+
+<script id="leaderboard-data" type="application/json">{"as_of":"2026-09-12","cohorts":[{"description":"Seven systems with identical suite, source digests and paired starts. A recipe replication, R10 and controller-recipe ablations.","evidence":[{"href":"../research/a702-replication-2026-09-12-raw-cells.jsonl","n_cells":102,"path":"../../research/a702-replication-2026-09-12-raw-cells.jsonl","sha256":"cff6b0ad4286b350091ca4c08ba2034413400b013f9859e680f703bff7410f7e"},{"href":"data/recipe-study-additional-cells.jsonl","n_cells":136,"path":"recipe-study-additional-cells.jsonl","sha256":"bfec51dd9eb9ba080c3280d082433550289cc95251af95f0703244837c40d59e"}],"expected_trials":{"A":64,"O":64,"S":144},"id":"recipe-study","label":"Recipe study","n_cells":238,"n_systems":7,"n_trials":1904,"order":{"avoidance":["cl_origrecipe_legacy_s701@estimated","cl_origrecipe_legacy_s702@estimated","cl_recipe_legacy_s501@estimated","cl_r10_base_s701@estimated","frozen_original@estimated","cl_r10_base_s702@estimated","cl_sgr_base_restoreopt_s701@estimated"],"collisions_km":["cl_origrecipe_legacy_s702@estimated","cl_recipe_legacy_s501@estimated","cl_origrecipe_legacy_s701@estimated","frozen_original@estimated","cl_r10_base_s701@estimated","cl_sgr_base_restoreopt_s701@estimated","cl_r10_base_s702@estimated"],"low_mu_completion":["cl_origrecipe_legacy_s702@estimated","cl_recipe_legacy_s501@estimated","cl_origrecipe_legacy_s701@estimated","frozen_original@estimated","cl_r10_base_s701@estimated","cl_sgr_base_restoreopt_s701@estimated","cl_r10_base_s702@estimated"],"overtaking":["cl_origrecipe_legacy_s702@estimated","cl_recipe_legacy_s501@estimated","cl_origrecipe_legacy_s701@estimated","frozen_original@estimated","cl_r10_base_s701@estimated","cl_r10_base_s702@estimated","cl_sgr_base_restoreopt_s701@estimated"],"slip_km":["cl_origrecipe_legacy_s702@estimated","cl_origrecipe_legacy_s701@estimated","frozen_original@estimated","cl_recipe_legacy_s501@estimated","cl_r10_base_s702@estimated","cl_sgr_base_restoreopt_s701@estimated","cl_r10_base_s701@estimated"],"solo_completion":["cl_origrecipe_legacy_s702@estimated","cl_origrecipe_legacy_s701@estimated","cl_recipe_legacy_s501@estimated","frozen_original@estimated","cl_r10_base_s701@estimated","cl_sgr_base_restoreopt_s701@estimated","cl_r10_base_s702@estimated"]},"reference_system":"frozen_original@estimated","scenario_cells":34,"source_digest_sha256":"30a057e563f0710c1bcbd213d4ad027632c1cffea845dad89ffc726923172b53","suite":{"backend":"f1sim","budget_laps":3.0,"envs_per_cell":8,"freeze_sha256":"6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce","low_mu":0.73423,"paired_mus":[0.73423,0.94401],"reused_maps_note":"gen:control:1400 is an SGR training map; korea_2026_competition and gen:control:9100 are existing diagnostic maps. No unseen-map or generalisation claim attaches to any result.","seeds":[4401,4402],"sensor_noise":true,"solo_maps":["gen:control:1400","real:korea_2026_competition","gen:control:9100"],"solo_mus":[0.73423,0.94401,1.15379],"speed_cap":9.0,"version":"v1"},"systems":[{"checkpoint_sha256":"29e82233853868be33773ba0ea65d68268ba259b477828f019f7f106095055b6","controller_arm":"estimated","counts":{"avoidance":[44,64],"low_mu":[41,48],"overtaking":[43,64],"solo":[134,144]},"cross_runtime":true,"distance_km":9.1137,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":21,"contact":10,"hit":20},"is_reference":false,"metrics":{"avoidance":{"counts":"44/64","den":64,"display":"68.8%","num":44,"rank":1,"reason":null,"value":0.6875},"collisions_km":{"display":"5.60","rank":3,"reason":null,"value":5.595975768292041},"low_mu_completion":{"counts":"41/48","den":48,"display":"85.4%","num":41,"rank":3,"reason":null,"value":0.8541666666666666},"overtaking":{"counts":"43/64","den":64,"display":"67.2%","num":43,"rank":3,"reason":null,"value":0.671875},"slip_km":{"display":"3.33","rank":2,"reason":null,"value":3.3328973325856976},"solo_completion":{"counts":"134/144","den":144,"display":"93.1%","num":134,"rank":2,"reason":null,"value":0.9305555555555556}},"name":"A recipe \u00b7 seed 701","note":"Mixed traffic; 149 track variants include routes, directions and obstacle variations. Adam restored; learning rate 5e-5 to 2e-5. Candidate, not a deployment promotion.","pace":{"display":"+0.103 s (n=134)","n":134,"reason":null,"value":0.10335820895522535},"roster_note":"recipe-restore 2026-09-12 (legacy_trained, Adam restored, lr 5e-5); rows reused, see reuse-audit.json","system_id":"cl_origrecipe_legacy_s701@estimated","training":"Legacy \u00b7 149 track variants"},{"checkpoint_sha256":"0d904012dd29e2de997a5ecf0e82faace8b4f4005862c3d8a2bf29e6af2348d2","controller_arm":"estimated","counts":{"avoidance":[43,64],"low_mu":[43,48],"overtaking":[45,64],"solo":[136,144]},"cross_runtime":true,"distance_km":9.1361,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":16,"contact":11,"hit":21},"is_reference":false,"metrics":{"avoidance":{"counts":"43/64","den":64,"display":"67.2%","num":43,"rank":2,"reason":null,"value":0.671875},"collisions_km":{"display":"5.25","rank":1,"reason":null,"value":5.253903756572392},"low_mu_completion":{"counts":"43/48","den":48,"display":"89.6%","num":43,"rank":1,"reason":null,"value":0.8958333333333334},"overtaking":{"counts":"45/64","den":64,"display":"70.3%","num":45,"rank":1,"reason":null,"value":0.703125},"slip_km":{"display":"2.97","rank":1,"reason":null,"value":2.9662664958981604},"solo_completion":{"counts":"136/144","den":144,"display":"94.4%","num":136,"rank":1,"reason":null,"value":0.9444444444444444}},"name":"A recipe \u00b7 seed 702","note":"Mixed traffic; 149 track variants include routes, directions and obstacle variations. Second seed of the A recipe; learning rate 5e-5 to 2e-5. Candidate, not a deployment promotion.","pace":{"display":"+0.157 s (n=134)","n":134,"reason":null,"value":0.1572761194029872},"roster_note":"A replication seed 702, same recipe as A701 apart from name/seed","system_id":"cl_origrecipe_legacy_s702@estimated","training":"Legacy \u00b7 149 track variants"},{"checkpoint_sha256":"3c5d2633f7361b2ff291873d5c36ae1e1a882c436ed62e5d68ca6bbbc8324131","controller_arm":"estimated","counts":{"avoidance":[41,64],"low_mu":[37,48],"overtaking":[41,64],"solo":[130,144]},"cross_runtime":false,"distance_km":8.9887,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":20,"contact":17,"hit":23},"is_reference":false,"metrics":{"avoidance":{"counts":"41/64","den":64,"display":"64.1%","num":41,"rank":4,"reason":null,"value":0.640625},"collisions_km":{"display":"6.68","rank":5,"reason":null,"value":6.675054325983382},"low_mu_completion":{"counts":"37/48","den":48,"display":"77.1%","num":37,"rank":5,"reason":null,"value":0.7708333333333334},"overtaking":{"counts":"41/64","den":64,"display":"64.1%","num":41,"rank":5,"reason":null,"value":0.640625},"slip_km":{"display":"5.37","rank":7,"reason":null,"value":5.367856187144967},"solo_completion":{"counts":"130/144","den":144,"display":"90.3%","num":130,"rank":5,"reason":null,"value":0.9027777777777778}},"name":"R10 \u00b7 seed 701","note":"Reverse-direction data added; learning rate 1e-4.","pace":{"display":"-0.193 s (n=130)","n":130,"reason":null,"value":-0.19288461538461815},"roster_note":"R10 directional coverage (5 maps + reversed), seed 701, trained under estimated arm with estimator 401","system_id":"cl_r10_base_s701@estimated","training":"Estimated \u00b7 5 maps \u00b7 solo"},{"checkpoint_sha256":"ce8c2a1ad4538af1d0fad365c1b98c6d78dceaeaf3f801b1234d55e2ff26c8fb","controller_arm":"estimated","counts":{"avoidance":[36,64],"low_mu":[36,48],"overtaking":[38,64],"solo":[129,144]},"cross_runtime":false,"distance_km":8.919,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":25,"contact":16,"hit":28},"is_reference":false,"metrics":{"avoidance":{"counts":"36/64","den":64,"display":"56.3%","num":36,"rank":6,"reason":null,"value":0.5625},"collisions_km":{"display":"7.74","rank":7,"reason":null,"value":7.736328468194193},"low_mu_completion":{"counts":"36/48","den":48,"display":"75.0%","num":36,"rank":7,"reason":null,"value":0.75},"overtaking":{"counts":"38/64","den":64,"display":"59.4%","num":38,"rank":6,"reason":null,"value":0.59375},"slip_km":{"display":"5.14","rank":5,"reason":null,"value":5.135128171641938},"solo_completion":{"counts":"129/144","den":144,"display":"89.6%","num":129,"rank":7,"reason":null,"value":0.8958333333333334}},"name":"R10 \u00b7 seed 702","note":"Second seed of R10; learning rate 1e-4.","pace":{"display":"-0.205 s (n=129)","n":129,"reason":null,"value":-0.20523255813953786},"roster_note":"R10 directional coverage (5 maps + reversed), seed 702, trained under estimated arm with estimator 401","system_id":"cl_r10_base_s702@estimated","training":"Estimated \u00b7 5 maps \u00b7 solo"},{"checkpoint_sha256":"7b57da56edf4834459c83b693c3dc3f3eb4dc8066c9090d707c61dbf3cffe0d4","controller_arm":"estimated","counts":{"avoidance":[43,64],"low_mu":[42,48],"overtaking":[45,64],"solo":[134,144]},"cross_runtime":true,"distance_km":9.0571,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":18,"contact":11,"hit":21},"is_reference":false,"metrics":{"avoidance":{"counts":"43/64","den":64,"display":"67.2%","num":43,"rank":2,"reason":null,"value":0.671875},"collisions_km":{"display":"5.52","rank":2,"reason":null,"value":5.520551964629964},"low_mu_completion":{"counts":"42/48","den":48,"display":"87.5%","num":42,"rank":2,"reason":null,"value":0.875},"overtaking":{"counts":"45/64","den":64,"display":"70.3%","num":45,"rank":1,"reason":null,"value":0.703125},"slip_km":{"display":"4.10","rank":4,"reason":null,"value":4.096249557755429},"solo_completion":{"counts":"134/144","den":144,"display":"93.1%","num":134,"rank":2,"reason":null,"value":0.9305555555555556}},"name":"Legacy recipe \u00b7 seed 501","note":"Fresh Adam; learning rate 1e-4.","pace":{"display":"+0.041 s (n=133)","n":133,"reason":null,"value":0.04116541353383517},"roster_note":"legacy-arm finetune (5 maps solo) evaluated under the estimated arm: tests 'train legacy, deploy clamped'","system_id":"cl_recipe_legacy_s501@estimated","training":"Legacy \u00b7 5 maps \u00b7 solo"},{"checkpoint_sha256":"40c605440e7d48f32bd22e4deed1e4d2e335666bc328d744be8f876b2b8c9bc5","controller_arm":"estimated","counts":{"avoidance":[36,64],"low_mu":[37,48],"overtaking":[37,64],"solo":[130,144]},"cross_runtime":false,"distance_km":8.9654,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":22,"contact":19,"hit":28},"is_reference":false,"metrics":{"avoidance":{"counts":"36/64","den":64,"display":"56.3%","num":36,"rank":6,"reason":null,"value":0.5625},"collisions_km":{"display":"7.70","rank":6,"reason":null,"value":7.696276343286761},"low_mu_completion":{"counts":"37/48","den":48,"display":"77.1%","num":37,"rank":5,"reason":null,"value":0.7708333333333334},"overtaking":{"counts":"37/64","den":64,"display":"57.8%","num":37,"rank":7,"reason":null,"value":0.578125},"slip_km":{"display":"5.21","rank":6,"reason":null,"value":5.2089290613259625},"solo_completion":{"counts":"130/144","den":144,"display":"90.3%","num":130,"rank":5,"reason":null,"value":0.9027777777777778}},"name":"C: restored optimizer \u00b7 seed 701","note":"Adam restored; learning rate 5e-5 to 2e-5.","pace":{"display":"-0.182 s (n=130)","n":130,"reason":null,"value":-0.18192307692307955},"roster_note":"recipe-restore 2026-09-12 (estimated, Adam restored, lr 5e-5)","system_id":"cl_sgr_base_restoreopt_s701@estimated","training":"Estimated \u00b7 5 maps \u00b7 solo"},{"checkpoint_sha256":"48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef","controller_arm":"estimated","counts":{"avoidance":[41,64],"low_mu":[41,48],"overtaking":[42,64],"solo":[134,144]},"cross_runtime":true,"distance_km":9.0656,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":17,"contact":15,"hit":23},"is_reference":true,"metrics":{"avoidance":{"counts":"41/64","den":64,"display":"64.1%","num":41,"rank":4,"reason":null,"value":0.640625},"collisions_km":{"display":"6.07","rank":4,"reason":null,"value":6.0669109476388705},"low_mu_completion":{"counts":"41/48","den":48,"display":"85.4%","num":41,"rank":3,"reason":null,"value":0.8541666666666666},"overtaking":{"counts":"42/64","den":64,"display":"65.6%","num":42,"rank":4,"reason":null,"value":0.65625},"slip_km":{"display":"3.42","rank":3,"reason":null,"value":3.4195316250328145},"solo_completion":{"counts":"134/144","den":144,"display":"93.1%","num":134,"rank":2,"reason":null,"value":0.9305555555555556}},"name":"Original + surface controller","note":"Comparison reference; estimator 401 at evaluation.","pace":{"display":"N/A (reference system)","n":null,"reason":"reference system","value":null},"roster_note":"absolute safety reference; MUST be rescored here (its published rows carry a different benchmark __main__ digest)","system_id":"frozen_original@estimated","training":"Original legacy recipe"}],"trials_per_system":272},{"description":"Three-system initial study. A different benchmark recorder digest prevents a shared ranking with the recipe study. The n_envs-only metadata derivation is documented in the original research note.","evidence":[{"href":"../research/benchmark-v1-2026-09-12-derived-cells.jsonl","n_cells":102,"path":"../../research/benchmark-v1-2026-09-12-derived-cells.jsonl","sha256":"cb3b51060360be6937145c375ba0977122cc61f10bff35a67b1313b2b5400333"}],"expected_trials":{"A":64,"O":64,"S":144},"id":"initial-study","label":"Initial study","n_cells":102,"n_systems":3,"n_trials":816,"order":{"avoidance":["frozen_original@estimated","cl_main_estimated_s501@estimated","frozen_original@legacy"],"collisions_km":["frozen_original@estimated","cl_main_estimated_s501@estimated","frozen_original@legacy"],"low_mu_completion":["cl_main_estimated_s501@estimated","frozen_original@estimated","frozen_original@legacy"],"overtaking":["frozen_original@legacy","frozen_original@estimated","cl_main_estimated_s501@estimated"],"slip_km":["frozen_original@estimated","cl_main_estimated_s501@estimated","frozen_original@legacy"],"solo_completion":["cl_main_estimated_s501@estimated","frozen_original@estimated","frozen_original@legacy"]},"reference_system":"frozen_original@estimated","scenario_cells":34,"source_digest_sha256":"979f744eb459a77d8bbf2c302b106e63c27f331e042231397a1900ffe5ee9375","suite":{"backend":"f1sim","budget_laps":3.0,"envs_per_cell":8,"freeze_sha256":"6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce","low_mu":0.73423,"paired_mus":[0.73423,0.94401],"reused_maps_note":"gen:control:1400 is an SGR training map; korea_2026_competition and gen:control:9100 are existing diagnostic maps. No unseen-map or generalisation claim attaches to any result.","seeds":[4401,4402],"sensor_noise":true,"solo_maps":["gen:control:1400","real:korea_2026_competition","gen:control:9100"],"solo_mus":[0.73423,0.94401,1.15379],"speed_cap":9.0,"version":"v1"},"systems":[{"checkpoint_sha256":"e7f01759708d541136b2165f1a05a9e5a21e63963fd35a732d6eacd75e591d87","controller_arm":"estimated","counts":{"avoidance":[38,64],"low_mu":[41,48],"overtaking":[36,64],"solo":[135,144]},"cross_runtime":false,"distance_km":9.0583,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":17,"contact":20,"hit":26},"is_reference":false,"metrics":{"avoidance":{"counts":"38/64","den":64,"display":"59.4%","num":38,"rank":2,"reason":null,"value":0.59375},"collisions_km":{"display":"6.95","rank":2,"reason":null,"value":6.954918225114427},"low_mu_completion":{"counts":"41/48","den":48,"display":"85.4%","num":41,"rank":1,"reason":null,"value":0.8541666666666666},"overtaking":{"counts":"36/64","den":64,"display":"56.3%","num":36,"rank":3,"reason":null,"value":0.5625},"slip_km":{"display":"3.99","rank":2,"reason":null,"value":3.990798314887084},"solo_completion":{"counts":"135/144","den":144,"display":"93.8%","num":135,"rank":1,"reason":null,"value":0.9375}},"name":"Estimated retraining \u00b7 seed 501","note":"Initial estimated-controller retraining experiment.","pace":{"display":"-0.152 s (n=133)","n":133,"reason":null,"value":-0.1520676691729345},"roster_note":"","system_id":"cl_main_estimated_s501@estimated","training":"Estimated \u00b7 5 maps \u00b7 solo"},{"checkpoint_sha256":"48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef","controller_arm":"estimated","counts":{"avoidance":[41,64],"low_mu":[41,48],"overtaking":[42,64],"solo":[134,144]},"cross_runtime":true,"distance_km":9.0656,"estimator_sha256":"a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf","failures":{"collision":17,"contact":15,"hit":23},"is_reference":true,"metrics":{"avoidance":{"counts":"41/64","den":64,"display":"64.1%","num":41,"rank":1,"reason":null,"value":0.640625},"collisions_km":{"display":"6.07","rank":1,"reason":null,"value":6.0669109476388705},"low_mu_completion":{"counts":"41/48","den":48,"display":"85.4%","num":41,"rank":1,"reason":null,"value":0.8541666666666666},"overtaking":{"counts":"42/64","den":64,"display":"65.6%","num":42,"rank":2,"reason":null,"value":0.65625},"slip_km":{"display":"3.42","rank":1,"reason":null,"value":3.4195316250328145},"solo_completion":{"counts":"134/144","den":144,"display":"93.1%","num":134,"rank":2,"reason":null,"value":0.9305555555555556}},"name":"Original + surface controller","note":"Comparison reference; estimator 401 at evaluation.","pace":{"display":"N/A (reference system)","n":null,"reason":"reference system","value":null},"roster_note":"legacy-trained under the estimated runtime: a declared cross-runtime reference","system_id":"frozen_original@estimated","training":"Original legacy recipe"},{"checkpoint_sha256":"48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef","controller_arm":"legacy","counts":{"avoidance":[18,64],"low_mu":[16,48],"overtaking":[44,64],"solo":[110,144]},"cross_runtime":false,"distance_km":8.2857,"estimator_sha256":null,"failures":{"collision":41,"contact":13,"hit":46},"is_reference":false,"metrics":{"avoidance":{"counts":"18/64","den":64,"display":"28.1%","num":18,"rank":3,"reason":null,"value":0.28125},"collisions_km":{"display":"12.07","rank":3,"reason":null,"value":12.06892275067982},"low_mu_completion":{"counts":"16/48","den":48,"display":"33.3%","num":16,"rank":3,"reason":null,"value":0.3333333333333333},"overtaking":{"counts":"44/64","den":64,"display":"68.8%","num":44,"rank":1,"reason":null,"value":0.6875},"slip_km":{"display":"7.16","rank":3,"reason":null,"value":7.162905652528469},"solo_completion":{"counts":"110/144","den":144,"display":"76.4%","num":110,"rank":3,"reason":null,"value":0.7638888888888888}},"name":"Original + legacy controller","note":"Original weights evaluated with the legacy controller.","pace":{"display":"-1.254 s (n=108)","n":108,"reason":null,"value":-1.2541666666666842},"roster_note":"immutable read-only copy; ppo_latest.pt is a moving pointer and is refused","system_id":"frozen_original@legacy","training":"Original legacy recipe"}],"trials_per_system":272}],"command":"cd f1sim \u0026\u0026 python -m f1sim.learn.leaderboard --manifest ../docs/leaderboard/data/manifest.json --out-dir ../docs/leaderboard","default_cohort":"recipe-study","default_rank_metric":"solo_completion","limitations":["A measured, representative development subset: three reused development maps, two seeds, eight trials per cell.","Static per-episode friction. Each episode runs at one fixed friction level; no level changes inside an episode.","No unseen-map, generalisation or on-car claim attaches to any number here. All maps were already in use during development.","Low-mu completion is completion at the minimum declared solo friction level. It is not a measurement of friction-estimation accuracy.","Paired pace is descriptive, not a rank metric: it is conditional on the trials where both systems completed, so its sample differs for every pair.","Cohorts were recorded under different benchmark source digests. They are never ranked together."],"manifest":"manifest.json","method":["Each cohort's raw per-cell records are read and pushed through f1sim.learn.benchmark.report.validate_results with the frozen suite object, the declared cell grid, the declared trial counts, the declared system set and the roster. A missing cell, a duplicate, a short denominator, an edited row, an unpinned checkpoint, a mixed source digest or an unpaired start refuses the whole cohort, and nothing partial is written.","Metrics come from report.aggregate over the validated cells. Percentages are additionally derived from the validated outcome arrays as exact counts, and the two must agree exactly or the report is refused.","Ranks are competition ranks over the exact values, per cohort and per metric: equal exact values share a rank and the next rank skips. Rounded display values are never ranked. A missing measurement is N/A with its reason, carries no rank and sorts last.","Paired pace is the mean solo lap-time difference against the cohort reference over the trials both systems completed, reported with its n. It is descriptive and never ranked.","There is no composite or overall score: the six metrics have different units and different denominators."],"metrics":[{"better":"up","description":"Trials completed over all solo cells, pooled over the three declared friction levels.","key":"solo_completion","kind":"pct","label":"Solo completion","source":"suite S, all declared friction levels","unit":"%"},{"better":"up","description":"Trials completed at the minimum declared solo friction level. This is completion at that level, not friction-estimation accuracy.","key":"low_mu_completion","kind":"pct","label":"Low-mu completion","source":"suite S, minimum declared solo mu","unit":"%"},{"better":"up","description":"Obstacle approaches cleared over pre-validated avoidance trials.","key":"avoidance","kind":"pct","label":"Avoidance","source":"suite A","unit":"%"},{"better":"up","description":"Passes held to the end of the race over pre-validated race trials.","key":"overtaking","kind":"pct","label":"Overtaking","source":"suite O","unit":"%"},{"better":"down","description":"Collisions per kilometre travelled, pooled over every suite.","key":"collisions_km","kind":"rate","label":"Collisions/km","source":"all suites","unit":"/km"},{"better":"down","description":"Seconds spent above the large-slip threshold per kilometre travelled, pooled over every suite.","key":"slip_km","kind":"rate","label":"Large-slip s/km","source":"all suites","unit":"s/km"}],"schema":"f1sim.leaderboard/1","title":"F1TENTH checkpoint leaderboard"}</script>
+<script>
+/* Leaderboard interaction: cohort switch, search, sort, per-row details.
+   All dynamic text is written with textContent -- nothing from the data ever becomes markup. */
+(function () {
+  "use strict";
+
+  var model = JSON.parse(document.getElementById("leaderboard-data").textContent);
+  var metrics = model.metrics || [];
+  var cohorts = model.cohorts || [];
+  var byId = {};
+  cohorts.forEach(function (c) { byId[c.id] = c; });
+
+  var state = {
+    cohort: byId[model.default_cohort] ? model.default_cohort : (cohorts[0] || {}).id,
+    query: "",
+    sort: model.default_rank_metric,
+    order: "best",
+    open: {}
+  };
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    if (text !== undefined && text !== null) { n.textContent = String(text); }
+    return n;
+  }
+  function metricSpec(key) {
+    for (var i = 0; i < metrics.length; i++) { if (metrics[i].key === key) { return metrics[i]; } }
+    return metrics[0];
+  }
+  function cohort() { return byId[state.cohort]; }
+  /* Display strings are built once, in Python, and reused verbatim: JavaScript's toFixed and
+     Python's format disagree on an exact half (36/64 is 56.25%), and the two views must not print
+     the same measurement differently. Nothing here re-rounds a value. */
+  function display(spec, cell) {
+    if (cell.value === null || cell.value === undefined) { return "N/A"; }
+    return cell.display;
+  }
+  function short(sha) { return sha ? String(sha).slice(0, 12) : "none"; }
+
+  /* ------------------------------------------------------------------ controls */
+
+  function buildCohortOptions() {
+    var box = document.getElementById("cohort-options");
+    box.textContent = "";
+    cohorts.forEach(function (c) {
+      var id = "cohort-" + c.id;
+      var label = el("label");
+      var radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "cohort";
+      radio.value = c.id;
+      radio.id = id;
+      radio.checked = c.id === state.cohort;
+      radio.addEventListener("change", function () {
+        if (!radio.checked) { return; }
+        state.cohort = c.id;
+        state.open = {};
+        renderCohort();
+      });
+      label.appendChild(radio);
+      label.appendChild(el("span", null, c.label));
+      label.appendChild(el("span", "count", c.n_systems + " systems"));
+      box.appendChild(label);
+    });
+  }
+
+  function buildRankSelect() {
+    var sel = document.getElementById("rank-metric");
+    sel.textContent = "";
+    metrics.forEach(function (m) {
+      var o = document.createElement("option");
+      o.value = m.key;
+      o.textContent = m.label + (m.better === "up" ? " (higher is better)" : " (lower is better)");
+      o.selected = m.key === state.sort;
+      sel.appendChild(o);
+    });
+    sel.addEventListener("change", function () { state.sort = sel.value; renderTable(); });
+    var dir = document.getElementById("direction");
+    dir.value = state.order;
+    dir.addEventListener("change", function () { state.order = dir.value; renderTable(); });
+    var q = document.getElementById("q");
+    q.addEventListener("input", function () { state.query = q.value; renderTable(); });
+    document.getElementById("controls").addEventListener("submit", function (e) {
+      e.preventDefault();
+    });
+  }
+
+  function renderStrip() {
+    var c = cohort();
+    var strip = document.getElementById("strip");
+    strip.textContent = "";
+    var trials = [];
+    Object.keys(c.expected_trials).sort().forEach(function (k) {
+      trials.push(k + " " + c.expected_trials[k]);
+    });
+    var items = [
+      ["Systems", String(c.n_systems), false],
+      ["Scenario cells", String(c.scenario_cells) + " per system", false],
+      ["Trials per system", String(c.trials_per_system) + " (" + trials.join(" · ") + ")", false],
+      ["Friction", c.suite.solo_mus.length + " levels, fixed per episode", false]
+    ];
+    items.forEach(function (it) {
+      var li = el("li");
+      li.appendChild(el("span", "k", it[0]));
+      li.appendChild(el("span", it[2] ? "v mono" : "v", it[1]));
+      strip.appendChild(li);
+    });
+    document.getElementById("cohort-desc").textContent = c.description || "";
+  }
+
+  /* ------------------------------------------------------------------ table */
+
+  function columnCount() { return 3 + metrics.length; }
+
+  function buildHead() {
+    var row = document.getElementById("head-row");
+    row.textContent = "";
+    var spec = metricSpec(state.sort);
+    var rank = el("th", "col-rank", "Rank");
+    rank.scope = "col";
+    rank.title = "Competition rank by " + spec.label;
+    row.appendChild(rank);
+
+    var sys = el("th", "col-system");
+    sys.scope = "col";
+    sys.textContent = "Checkpoint";
+    row.appendChild(sys);
+
+    metrics.forEach(function (m) {
+      var th = el("th", "metric");
+      th.scope = "col";
+      var active = m.key === state.sort;
+      if (active) {
+        var ascending = m.better === "up" ? state.order === "worst" : state.order === "best";
+        th.setAttribute("aria-sort", ascending ? "ascending" : "descending");
+      }
+      var b = document.createElement("button");
+      b.type = "button";
+      var dirWords = m.better === "up" ? "higher is better" : "lower is better";
+      b.title = m.label + " — " + dirWords + ". " + m.description + " Click to sort; click again " +
+        "to reverse.";
+      var label = el("span", "label", m.label + " ");
+      label.appendChild(el("span", "arrow", m.better === "up" ? "↑" : "↓"));
+      b.appendChild(label);
+      b.appendChild(el("span", "sr", dirWords));
+      if (active) {
+        b.appendChild(el("span", "sortmark", state.order === "best" ? " ▼" : " ▲"));
+        b.appendChild(el("span", "sr", state.order === "best" ? "best first" : "worst first"));
+      }
+      b.addEventListener("click", function () {
+        if (state.sort === m.key) {
+          state.order = state.order === "best" ? "worst" : "best";
+        } else {
+          state.sort = m.key;
+          state.order = "best";
+        }
+        document.getElementById("rank-metric").value = state.sort;
+        document.getElementById("direction").value = state.order;
+        renderTable();
+      });
+      th.appendChild(b);
+      row.appendChild(th);
+    });
+
+    var more = el("th", "col-more");
+    more.scope = "col";
+    more.textContent = "Details";
+    row.appendChild(more);
+  }
+
+  function matches(s, q) {
+    if (!q) { return true; }
+    var hay = [s.system_id, s.name, s.training, s.note, s.controller_arm].join(" ").toLowerCase();
+    return hay.indexOf(q) !== -1;
+  }
+
+  function orderedIds() {
+    var c = cohort();
+    var order = (c.order || {})[state.sort] || c.systems.map(function (s) { return s.system_id; });
+    var sys = {};
+    c.systems.forEach(function (s) { sys[s.system_id] = s; });
+    var ranked = [], missing = [];
+    order.forEach(function (sid) {
+      var cell = sys[sid].metrics[state.sort];
+      (cell && cell.value !== null && cell.value !== undefined ? ranked : missing).push(sid);
+    });
+    if (state.order === "worst") { ranked.reverse(); }
+    return ranked.concat(missing);          // unmeasured rows stay last in both directions
+  }
+
+  function detailPanel(s) {
+    var c = cohort();
+    var panel = el("div", "panel");
+    panel.appendChild(el("h3", null, s.name));
+    var dl = el("dl", "kv");
+    function put(k, v, mono) {
+      dl.appendChild(el("dt", null, k));
+      dl.appendChild(el("dd", mono ? "mono" : null, v));
+    }
+    put("System id", s.system_id, true);
+    put("Training", s.training);
+    if (s.note) { put("Note", s.note); }
+    put("Controller", s.controller_arm + (s.cross_runtime
+      ? " (declared cross-runtime: legacy-trained weights under this controller)" : ""));
+    put("Checkpoint sha256", s.checkpoint_sha256, true);
+    put("Estimator sha256", s.estimator_sha256 || "none", true);
+    if (s.roster_note) { put("Roster note", s.roster_note); }
+    put("Suite pin", c.suite.version + " · freeze " + c.suite.freeze_sha256, true);
+    put("Benchmark source digest", c.source_digest_sha256, true);
+    put("Solo completion", s.counts.solo[0] + " / " + s.counts.solo[1] + " trials");
+    put("Low-mu completion", s.counts.low_mu[0] + " / " + s.counts.low_mu[1] +
+      " trials at mu=" + c.suite.low_mu);
+    put("Avoidance", s.counts.avoidance[0] + " / " + s.counts.avoidance[1] + " approaches");
+    put("Overtaking", s.counts.overtaking[0] + " / " + s.counts.overtaking[1] + " races");
+    if (s.distance_km !== null && s.distance_km !== undefined) {
+      put("Distance travelled", s.distance_km + " km");
+    }
+    var pace = s.pace || {};
+    put("Paired pace vs reference", s.is_reference
+      ? "This is the reference system."
+      : (pace.value === null || pace.value === undefined
+        ? "N/A (" + (pace.reason || "unmeasured") + ")"
+        : pace.display + " of solo trials completed by both this system and the reference. " +
+          "Descriptive only: pace is not a rank metric and its sample differs for every pair."));
+    var fails = Object.keys(s.failures || {});
+    if (fails.length) {
+      put("Recorded failure reasons", fails.sort().map(function (k) {
+        return k + " " + s.failures[k];
+      }).join(" · "));
+    }
+    put("Evidence", (c.evidence || []).map(function (e) {
+      return e.path + " (" + e.n_cells + " cells)";
+    }).join(" · "), true);
+    panel.appendChild(dl);
+    panel.appendChild(el("p", "note", c.suite.reused_maps_note));
+    return panel;
+  }
+
+  function renderTable() {
+    buildHead();
+    var c = cohort();
+    var body = document.getElementById("body");
+    body.textContent = "";
+    var spec = metricSpec(state.sort);
+    var q = state.query.trim().toLowerCase();
+    var sys = {};
+    c.systems.forEach(function (s) { sys[s.system_id] = s; });
+    var ids = orderedIds().filter(function (sid) { return matches(sys[sid], q); });
+
+    var caption = document.getElementById("table-caption");
+    caption.textContent = c.label + " — " + ids.length + " of " + c.n_systems +
+      " checkpoints shown, ranked by " + spec.label +
+      (spec.better === "up" ? " (higher is better)" : " (lower is better)") + ".";
+    document.getElementById("filter-note").textContent =
+      "Search filters rows only: ranks are competition ranks over all " + c.n_systems +
+      " checkpoints in this cohort and never change.";
+
+    if (!ids.length) {
+      var tr = el("tr"), td = el("td");
+      td.colSpan = columnCount();
+      var box = el("div", "empty");
+      box.appendChild(el("strong", null, q
+        ? "No checkpoint in this cohort matches that search."
+        : "This cohort has no checkpoints to show."));
+      box.appendChild(el("span", null, q
+        ? "Searching matches the name, system id, training recipe and controller arm."
+        : "Nothing was validated for this cohort."));
+      if (q) {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = "Clear search";
+        btn.addEventListener("click", function () {
+          state.query = "";
+          document.getElementById("q").value = "";
+          renderTable();
+          document.getElementById("q").focus();
+        });
+        box.appendChild(btn);
+      }
+      td.appendChild(box);
+      tr.appendChild(td);
+      body.appendChild(tr);
+      return;
+    }
+
+    ids.forEach(function (sid) {
+      var s = sys[sid];
+      var tr = el("tr", "system-row");
+
+      var rankTd = el("td", "col-rank");
+      var rank = s.metrics[state.sort].rank;
+      rankTd.appendChild(el("span", rank === null || rank === undefined ? "rank none" : "rank",
+        rank === null || rank === undefined ? "—" : String(rank)));
+      tr.appendChild(rankTd);
+
+      var nameTd = el("td", "col-system");
+      var name = el("span", "name", s.name);
+      nameTd.appendChild(name);
+      if (s.is_reference) { nameTd.appendChild(el("span", "badge", "reference")); }
+      nameTd.appendChild(el("span", "train", s.training));
+      tr.appendChild(nameTd);
+
+      metrics.forEach(function (m) {
+        var cell = s.metrics[m.key];
+        var td = el("td", "metric" + (cell.rank === 1 ? " best" : "") +
+          (cell.value === null || cell.value === undefined ? " na" : ""));
+        td.appendChild(el("span", "v", display(m, cell)));
+        if (cell.value === null || cell.value === undefined) {
+          td.appendChild(el("span", "reason", cell.reason || "unmeasured"));
+        } else if (m.kind === "pct") {
+          td.appendChild(el("span", "x", cell.counts));
+        }
+        tr.appendChild(td);
+      });
+
+      var moreTd = el("td", "col-more");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "more";
+      var panelId = "details-" + c.id + "-" + sid.replace(/[^A-Za-z0-9_-]/g, "_");
+      btn.setAttribute("aria-controls", panelId);
+      btn.setAttribute("aria-expanded", state.open[sid] ? "true" : "false");
+      btn.textContent = state.open[sid] ? "Hide" : "Details";
+      moreTd.appendChild(btn);
+      tr.appendChild(moreTd);
+      body.appendChild(tr);
+
+      var dtr = el("tr", "details-row");
+      dtr.id = panelId;
+      var dtd = el("td");
+      dtd.colSpan = columnCount();
+      dtd.appendChild(detailPanel(s));
+      dtr.appendChild(dtd);
+      dtr.hidden = !state.open[sid];
+      body.appendChild(dtr);
+
+      btn.addEventListener("click", function () {
+        state.open[sid] = !state.open[sid];
+        btn.setAttribute("aria-expanded", state.open[sid] ? "true" : "false");
+        btn.textContent = state.open[sid] ? "Hide" : "Details";
+        dtr.hidden = !state.open[sid];
+      });
+    });
+  }
+
+  /* ------------------------------------------------------------------ static prose */
+
+  function renderMethod() {
+    var ol = document.getElementById("method");
+    ol.textContent = "";
+    (model.method || []).forEach(function (t) { ol.appendChild(el("li", null, t)); });
+    var ul = document.getElementById("limits");
+    ul.textContent = "";
+    (model.limitations || []).forEach(function (t) { ul.appendChild(el("li", null, t)); });
+    document.getElementById("regen").textContent = model.command || "";
+  }
+
+  function renderEvidence() {
+    var box = document.getElementById("evidence");
+    box.textContent = "";
+    cohorts.forEach(function (c) {
+      box.appendChild(el("h3", null, c.label));
+      var dl = el("dl", "kv");
+      [["Protocol", c.n_systems + " systems · " + c.scenario_cells + " scenario cells per system · "
+        + c.trials_per_system + " trials per system · " + c.n_cells + " system-cells and "
+        + c.n_trials + " trial outcomes in total"],
+       ["Solo friction levels", c.suite.solo_mus.join(" · ") + " (fixed for the whole episode; "
+        + "low-mu completion is measured at " + c.suite.low_mu + ")"],
+       ["Suite pin", c.suite.version + " · freeze " + c.suite.freeze_sha256],
+       ["Benchmark source digest", c.source_digest_sha256],
+       ["Reference system for paired pace", c.reference_system]].forEach(function (kv) {
+        dl.appendChild(el("dt", null, kv[0]));
+        dl.appendChild(el("dd", null, kv[1]));
+      });
+      box.appendChild(dl);
+      var ul = el("ul");
+      (c.evidence || []).forEach(function (e) {
+        var li = el("li");
+        var a = document.createElement("a");
+        a.className = "evfile";
+        a.href = e.href || e.path;         /* a relative path from this file, never a URL scheme */
+        a.textContent = e.path;
+        li.appendChild(a);
+        li.appendChild(el("span", "evmeta", " — " + e.n_cells + " cells, sha256 " +
+          e.sha256));
+        ul.appendChild(li);
+      });
+      box.appendChild(ul);
+    });
+  }
+
+  function renderCohort() {
+    renderStrip();
+    renderTable();
+  }
+
+  if (!cohorts.length) {
+    document.getElementById("board").appendChild(
+      el("p", "note warn", "This report contains no validated cohort."));
+    return;
+  }
+  buildCohortOptions();
+  buildRankSelect();
+  renderMethod();
+  renderEvidence();
+  renderCohort();
+})();
+
+</script>
+</body>
+</html>

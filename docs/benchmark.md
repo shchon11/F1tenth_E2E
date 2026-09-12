@@ -11,6 +11,12 @@ python3 -m f1sim.learn.benchmark --help
 A measured run of this suite is published as a research note:
 [Checkpoint benchmark v1 — three-system subset](research/benchmark-v1-2026-09-12.md) (3 systems, 102 cells, 816 trials). It is a subset chosen for time, not the 17-system benchmark.
 
+The measured runs are published as a rendered leaderboard: [Leaderboard](leaderboard/README.md) —
+six metrics per cohort with exact counts, paired pace against a reference and the evidence behind
+each row. `python3 -m f1sim.learn.leaderboard` builds it from existing result files, validating each
+cohort through `report.validate_results` first; it scores nothing and needs no weights or GPU.
+`leaderboard/index.html` is the same report as a self-contained offline page.
+
 **What this is not.** All three maps are reused development tracks, so no result here is evidence of
 generalisation to an unseen venue, and nothing here is an on-car claim. Scope is restated in every
 generated report.

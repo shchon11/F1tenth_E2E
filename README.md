@@ -56,10 +56,44 @@ sim.reset(torch.nonzero(r.collision).flatten())      # partial reset re-samples 
 | [Architecture](docs/architecture.md) | simulator fidelity, maps, raceline and teacher, the viewer |
 | [Training](docs/training.md) | DAgger, PPO, evaluation, the console, observation and action detail |
 | [Benchmark](docs/benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metrics |
+| [Leaderboard](docs/leaderboard/README.md) | the rendered checkpoint leaderboard — per-cohort tables, exact counts, evidence and method |
 | [ROS 2](docs/ros2.md) | launch files, topic contracts, teleoperation |
 | [Research notes](docs/research/) | dated experiment reports with protocol, data and scope |
 | [Engineering notes](docs/README.md#engineering-notes) | algorithm assessment, simulator audit, real-data calibration |
 | [로컬 실행 안내](docs/local_pc.md) | 이 워크스테이션의 실행 명령 (Korean) |
+
+## Checkpoint leaderboard
+
+[`docs/leaderboard/`](docs/leaderboard/README.md) renders the frozen v1 benchmark as a leaderboard:
+six metrics per cohort, every percentage with the exact counts it came from, paired pace against a
+reference, and a link to the evidence file behind each row. Top of the *recipe study* cohort as of
+the **2026-09-12** snapshot — 7 systems, each on the same 34 scenario cells (272 trials), ranked by
+solo completion. The [full leaderboard](docs/leaderboard/README.md) contains every measured system
+and all six metrics:
+
+| Rank | Checkpoint | Solo completion ↑ | Low-mu completion ↑ | Collisions/km ↓ |
+| ---: | :--- | ---: | ---: | ---: |
+| 1 | A recipe · seed 702 | 94.4% (136/144) | 89.6% (43/48) | 5.25 |
+| 2 | A recipe · seed 701 | 93.1% (134/144) | 85.4% (41/48) | 5.60 |
+| 2 | Legacy recipe · seed 501 | 93.1% (134/144) | 87.5% (42/48) | 5.52 |
+| 2 | Original + surface controller (reference) | 93.1% (134/144) | 85.4% (41/48) | 6.07 |
+
+Competition ranks inside one cohort; exactly equal values share a rank, and the two cohorts were
+recorded under different benchmark source digests, so they are never ranked together. These are
+candidates, not deployment promotions: low-mu is completion at the minimum declared friction rather
+than friction-estimation accuracy, the maps are reused development tracks, and friction is fixed for
+each episode. The [full tables](docs/leaderboard/README.md) carry all six metrics, the method and
+what none of it establishes.
+
+`docs/leaderboard/index.html` is the same report as a self-contained offline page with a cohort
+switch, search, sortable columns and per-checkpoint details — download the file and open it in a
+browser; GitHub does not run it. Regenerate both from measured results only:
+
+```bash
+cd f1sim
+python3 -m f1sim.learn.leaderboard \
+    --manifest ../docs/leaderboard/data/manifest.json --out-dir ../docs/leaderboard
+```
 
 ## Requirements
 
@@ -196,6 +230,7 @@ Each is one command here and a section in the linked page.
 | Reinforcement learning | `python3 -m f1sim.learn.ppo --help` | [Training](docs/training.md#ppo) |
 | Evaluate a checkpoint | `python3 -m f1sim.learn.evaluate --help` | [Training](docs/training.md#evaluation) |
 | Benchmark checkpoints against each other | `python3 -m f1sim.learn.benchmark plan` | [Benchmark](docs/benchmark.md), [measured subset](docs/research/benchmark-v1-2026-09-12.md) |
+| Render the leaderboard from measured results | `python3 -m f1sim.learn.leaderboard --help` | [Leaderboard](docs/leaderboard/README.md) |
 | Drive the ROS 2 stack | `ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:3` | [ROS 2](docs/ros2.md) |
 
 The training rows are `--help` on purpose. **The defaults are not a starting point**: `ppo` defaults

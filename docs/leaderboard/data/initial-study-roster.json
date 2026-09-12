@@ -1,0 +1,30 @@
+{
+  "_what": "Report-only portable identity roster. Weights are not distributed or needed to render. Historical result paths remain unchanged.",
+  "systems": [
+    {
+      "system_id": "frozen_original@legacy",
+      "path": "checkpoints/frozen_original-48cc698f8c51.pt",
+      "checkpoint_sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef",
+      "controller_arm": "legacy",
+      "note": "immutable read-only copy; ppo_latest.pt is a moving pointer and is refused"
+    },
+    {
+      "system_id": "frozen_original@estimated",
+      "path": "checkpoints/frozen_original-48cc698f8c51.pt",
+      "checkpoint_sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef",
+      "controller_arm": "estimated",
+      "estimator_path": "checkpoints/estimator401-a4e6fe02e27e.pt",
+      "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+      "cross_runtime": true,
+      "note": "legacy-trained under the estimated runtime: a declared cross-runtime reference"
+    },
+    {
+      "system_id": "cl_main_estimated_s501@estimated",
+      "path": "checkpoints/cl_main_estimated_s501-e7f01759708d.pt",
+      "checkpoint_sha256": "e7f01759708d541136b2165f1a05a9e5a21e63963fd35a732d6eacd75e591d87",
+      "controller_arm": "estimated",
+      "estimator_path": "checkpoints/estimator401-a4e6fe02e27e.pt",
+      "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf"
+    }
+  ]
+}
