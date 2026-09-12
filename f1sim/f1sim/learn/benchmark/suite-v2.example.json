@@ -1,5 +1,5 @@
 {
-  "freeze_sha256": "d0f6938bbb46765f42a3f3f870408f3f228c5c7469633fd52c64a5a6d0465038",
+  "freeze_sha256": "89805514350d932a36cbfe28eed7ca379ec92d71806ec5202736aa61805394f9",
   "suite": {
     "backend": "f1sim",
     "budget_laps": 3.0,
@@ -11,21 +11,21 @@
           "completed": 8,
           "device": "cpu",
           "envs": 8,
-          "seconds_per_cell": 84.71,
+          "seconds_per_cell": 49.59,
           "steps": 600
         },
         "real:map12x16": {
           "completed": 8,
           "device": "cpu",
           "envs": 8,
-          "seconds_per_cell": 80.69,
+          "seconds_per_cell": 43.12,
           "steps": 600
         },
         "real:map16x07": {
           "completed": 7,
           "device": "cpu",
           "envs": 8,
-          "seconds_per_cell": 99.63,
+          "seconds_per_cell": 39.51,
           "steps": 600
         }
       }
@@ -202,12 +202,10 @@
       }
     },
     "race_maps": [
-      "real:map16x07",
-      "real:map12x16",
       "gen:control:9100"
     ],
     "race_size": 2,
-    "reused_maps_note": "Held out. real:map16x07 and real:map12x16 are floors this car drove on that no training set contains, in any direction and with any obstacle suffix; the rest of the solo family is common.HELDOUT_TRACKS, guarded by tests/test_heldout_split.py. korea_2026_competition is absent by design: it is trained through twenty obstacle variants (common.KOREA26_TRAIN) and belongs to v1's in-distribution set. Adoption decisions read v2.",
+    "reused_maps_note": "Held out. real:map16x07 and real:map12x16 are floors this car drove on that no training set contains, in any direction and with any obstacle suffix; the rest of the solo family is common.HELDOUT_TRACKS, guarded by tests/test_heldout_split.py. korea_2026_competition is absent by design: it is trained through twenty obstacle variants (common.KOREA26_TRAIN) and belongs to v1's in-distribution set. The overtaking family is gen:control:9100 alone: a pass on either real floor could not be shown by the scripted reference driver (0/4 at both mu levels), so those cells were dropped rather than admitted undemonstrated. Adoption decisions read v2.",
     "s_start_offset_m": -15.0,
     "seeds": [
       4401,

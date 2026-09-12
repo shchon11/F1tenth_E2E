@@ -135,19 +135,36 @@ V2_SOLO_MAPS = ("real:korea_2025_iccas", "real:blackbox2022_3", "rt:Monza", "gen
                 "gen:control:9100", "gen:competition:9200+pinch9200",
                 "real:map16x07", "real:map12x16")
 
-#: The paired families are the two unseen real floors plus `gen:control:9100`, the one v1 map that
-#: was already outside training. Avoidance and overtaking both need a lane wide enough to host a
-#: proven blocking obstacle and a pass; the remaining held-out maps are carried by the solo family
-#: only, which is the honest way round -- a scenario is dropped from a family when the geometry
-#: refuses it, never softened until it fits.
-V2_PAIRED_MAPS = ("real:map16x07", "real:map12x16", "gen:control:9100")
+#: Avoidance: the two unseen real floors plus `gen:control:9100`, the one v1 map that was already
+#: outside training. All three host a proven blocking obstacle, and the scripted avoidance expert
+#: clears every one at both friction levels.
+V2_OBSTACLE_MAPS = ("real:map16x07", "real:map12x16", "gen:control:9100")
+
+#: Overtaking: `gen:control:9100` alone. Both real floors were declared, measured, and DROPPED --
+#: `feasibility` could not show a pass on either, 0/4 at both friction levels, the failures being
+#: collisions with the track rather than contact with the car being passed. Neither reversing the
+#: reference driver's side nor cutting its lateral offset from 0.40 m to 0.25 m recovered a single
+#: trial on either map, so this is not a side-of-the-track accident.
+#:
+#: What it is, is not settled, and the honest version matters for whether this comes back. Two cars
+#: abreast do fit everywhere on both floors (narrowest lane 1.000 m and 1.082 m against 0.620 m of
+#: car), so the floors are not provably too narrow for a pass; what could not be demonstrated is a
+#: pass by THIS reference driver, whose 0.40 m offset already exceeds the lane over 2.0 % of
+#: map16x07 and whose 7 m engage window is a fifth of that map's 33 m lap. A stronger reference
+#: driver may well restore these cells. Until one exists and shows a pass, the cells stay out: a
+#: scenario nobody has driven is not a scenario, and the alternative -- trimming the proof until
+#: the map fits -- is the thing this suite exists to refuse.
+V2_RACE_MAPS = ("gen:control:9100",)
 
 V2_MAPS_NOTE = (
     "Held out. real:map16x07 and real:map12x16 are floors this car drove on that no training set "
     "contains, in any direction and with any obstacle suffix; the rest of the solo family is "
     "common.HELDOUT_TRACKS, guarded by tests/test_heldout_split.py. korea_2026_competition is "
     "absent by design: it is trained through twenty obstacle variants (common.KOREA26_TRAIN) and "
-    "belongs to v1's in-distribution set. Adoption decisions read v2.")
+    "belongs to v1's in-distribution set. The overtaking family is gen:control:9100 alone: a pass "
+    "on either real floor could not be shown by the scripted reference driver (0/4 at both mu "
+    "levels), so those cells were dropped rather than admitted undemonstrated. Adoption decisions "
+    "read v2.")
 
 
 def v2() -> Suite:
@@ -158,8 +175,8 @@ def v2() -> Suite:
     training distribution was fitted. That is worth knowing and it is not generalisation, and while
     v1 was the only suite there was no number for the other question at all.
     """
-    return Suite(version="v2", solo_maps=V2_SOLO_MAPS, obstacle_maps=V2_PAIRED_MAPS,
-                 race_maps=V2_PAIRED_MAPS, reused_maps_note=V2_MAPS_NOTE)
+    return Suite(version="v2", solo_maps=V2_SOLO_MAPS, obstacle_maps=V2_OBSTACLE_MAPS,
+                 race_maps=V2_RACE_MAPS, reused_maps_note=V2_MAPS_NOTE)
 
 
 #: Every scenario set this CLI can freeze, by version.

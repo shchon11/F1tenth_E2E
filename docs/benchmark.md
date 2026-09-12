@@ -114,11 +114,11 @@ python3 -m f1sim.learn.benchmark geometry --version v2 \
 | --- | --- | --- | --- | ---: | ---: |
 | **S** solo | `real:map16x07`, `real:map12x16`, `real:korea_2025_iccas`, `real:blackbox2022_3`, `rt:Monza`, `gen:competition:0`, `gen:control:9100`, `gen:competition:9200+pinch9200` | 0.73423, 0.94401, 1.15379 | 4401, 4402 | 48 | 384 |
 | **A** avoidance | `real:map16x07`, `real:map12x16`, `gen:control:9100` | 0.73423, 0.94401 | 4401, 4402 | 12 | 96 |
-| **O** overtaking | `real:map16x07`, `real:map12x16`, `gen:control:9100` | 0.73423, 0.94401 | 4401, 4402 | 12 | 96 |
+| **O** overtaking | `gen:control:9100` | 0.73423, 0.94401 | 4401, 4402 | 4 | 32 |
 
-**72 cells, 576 trials per system**, against v1's 34 and 272. The frozen definition ships as
+**64 cells, 512 trials per system**, against v1's 34 and 272. The frozen definition ships as
 `f1sim/learn/benchmark/suite-v2.example.json`, freeze hash
-`d0f6938bbb46765f42a3f3f870408f3f228c5c7469633fd52c64a5a6d0465038`.
+`89805514350d932a36cbfe28eed7ca379ec92d71806ec5202736aa61805394f9`.
 
 ### What "held out" means here
 
@@ -145,13 +145,26 @@ from anything in the held-out list. `tests/test_heldout_split.py` fails if it ev
 
 ### The paired families are smaller than the solo family, deliberately
 
-A and O run on the two real floors plus `gen:control:9100`. The other five held-out maps are carried
-by S only. An avoidance cell needs a proven blocking obstacle -- one that really obstructs the
-racing line while leaving a car-wide corridor that connects to the lane either side, eroded by the
-car's own footprint -- and an overtaking cell needs room to pass. Where the geometry refuses, the
-map is dropped from that family; the placement proofs are never weakened to make a map fit.
+A paired cell has to be demonstrated before it is frozen. An avoidance cell needs a proven blocking
+obstacle — one that really obstructs the racing line while leaving a car-wide corridor connected to
+the lane either side, eroded by the car's own footprint — and an overtaking cell needs a pass a
+scripted reference driver can actually complete. Where that cannot be shown, the map leaves that
+family. The proofs are never trimmed to admit a map.
 
-The proofs that were obtained, at `--s-obs 10`:
+**A** runs on the two real floors plus `gen:control:9100`: all three placements pass on the first
+position tried, and the avoidance expert clears every one at both friction levels.
+
+**O** runs on `gen:control:9100` alone. Both real floors were declared, measured and dropped:
+`feasibility` shows **0/4 at both friction levels** on each, the failures being collisions with the
+track rather than contact with the car being passed. Reversing the reference driver's side and
+cutting its lateral offset from 0.40 m to 0.25 m recovered nothing, so this is not a
+side-of-the-track accident. It is also not proof that the floors are too narrow — two cars abreast
+fit everywhere on both (narrowest lane 1.000 m and 1.082 m against 0.620 m of car). What has not
+been shown is a pass by *this* reference driver, whose 0.40 m offset already exceeds the lane over
+2.0 % of `map16x07` and whose 7 m engage window is a fifth of that map's 33 m lap. A stronger
+reference driver may restore these cells; until one shows a pass, they stay out.
+
+The obstacle proofs, at `--s-obs 10`:
 
 | map | lane | half-lane at s | obstacle | corridor (left/right) | required |
 | --- | ---: | ---: | --- | --- | ---: |
