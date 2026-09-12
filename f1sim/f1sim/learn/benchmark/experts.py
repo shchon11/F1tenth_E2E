@@ -42,6 +42,10 @@ class _PurePursuit:
         self.tangent = t.cl_tangent                      # (T, N, 2)
         self.n_pts = self.cl.shape[1]
         self.length = env.sim.track.length               # (T,)
+        #: Slowest speed this driver will ever command. 0.5 m/s keeps a lone car rolling, which is
+        #: what the avoidance and pass references want. A driver that has to hold station behind a
+        #: STOPPED car needs to be able to reach zero, and sets this to 0.
+        self.v_floor = 0.5
 
     # -- subclasses say how far to move off the line, per env -----------------------------------
     def offset(self, s_ahead: torch.Tensor) -> torch.Tensor:
@@ -78,7 +82,7 @@ class _PurePursuit:
         spec = e.tracker.spec
         v_curve = torch.sqrt(A_LAT_REF / kappa.abs().clamp_min(0.05))
         v_tgt = torch.minimum(torch.full_like(v_curve, self.v_ref), v_curve) * self.speed_scale()
-        v_tgt = v_tgt.clamp(0.5, float(e.ecfg.v_max_policy))
+        v_tgt = v_tgt.clamp(self.v_floor, float(e.ecfg.v_max_policy))
 
         knots = kappa[:, None].expand(-1, mpc.N_KNOTS).contiguous()
         return mpc.encode(knots, v_tgt, v_tgt, float(e.ecfg.v_max_policy), spec).clamp(-1.0, 1.0)
@@ -141,3 +145,122 @@ class PassExpert(_PurePursuit):
 
     def speed_scale(self):
         return 1.0 + 0.25 * self._weight()
+
+
+class TrafficExpert:
+    """Reference driver for the T (traffic) family: come through traffic clean, pass where it fits.
+
+    Built on the **raceline teacher**, not on the centreline pure-pursuit the other two experts use,
+    and measured that is the whole difference. The pure-pursuit reference follows the centreline with
+    a curvature speed limit; on the held-out floors it drove into the track 0/4 on four of the five
+    maps before an opponent was involved at all. The teacher drives an optimised line with a speed
+    profile derived from the actual friction, and completes 16/16 clean laps on both real floors.
+    A scenario check is only evidence if the driver can drive; "the reference crashed" says nothing
+    about the scenario.
+
+    What this adds to the teacher is the two things a teacher does not have -- it is blind to other
+    cars apart from the follow-gap slowdown, which is the whole reason opponents are boring:
+
+    * **going round**, by planning through a lateral offset. `RacelineTeacher.plan_action` already
+      takes one and clamps it per raceline point against the track's own distance field, which is
+      the same mechanism a scripted `shift` event uses; so a 0.45 m move through a 1.4 m section
+      becomes as much of one as fits, and never a wall.
+    * **holding station**, by scaling the plan's commanded speeds toward the car ahead's. Where the
+      clamp falls below the width a car needs to get past another, this driver does not go: it sits
+      behind. That is the normal case on a 0.70 m half-lane and it has to be survivable, because
+      the alternative -- attempting the pass anyway -- is what took the O family off those floors.
+
+    Deterministic, checkpoint-free, and derived from the scenario's own geometry. A feasibility
+    reference, never a leaderboard entry.
+    """
+
+    def __init__(self, env, *, engage_frac: float = 0.12, engage_max_m: float = 8.0,
+                 engage_min_m: float = 2.5, desired_offset_m: float = 0.45,
+                 min_pass_offset_m: float = 0.32, follow_gap_m: float = 1.8,
+                 release_m: float = 1.2, side: int = 1, margin_m: float = 0.10,
+                 follow_decel: float = 3.0):
+        from f1sim.opponent_events import raceline_offset_limit
+        if env.teacher is None:
+            raise ValueError("TrafficExpert drives the raceline teacher; this env has none. A T "
+                             "cell always has one -- it is what drives the opponents.")
+        self.env = env
+        self.teacher = env.teacher
+        self.side = int(side)
+        self.desired = float(desired_offset_m)
+        self.min_pass = float(min_pass_offset_m)
+        self.follow_gap = float(follow_gap_m)
+        self.release = float(release_m)
+        self.follow_decel = float(follow_decel)
+        # Engage over a distance proportional to the lap, so the manoeuvre is the same fraction of a
+        # 33 m hairpin and a 68 m circuit. The fixed 7 m window of `PassExpert` is a fifth of the
+        # first and a tenth of the second, which is why it spent most of a `map16x07` lap holding an
+        # offset line rather than briefly going round a car.
+        self.engage = (env.sim.track.length * float(engage_frac)).clamp(float(engage_min_m),
+                                                                       float(engage_max_m))
+        # The clamp the teacher applies. The env only builds this when scripted events are on, so a
+        # no-event T cell would otherwise have an unclamped teacher and this driver could ask for an
+        # offset the lane does not have.
+        self.limit = raceline_offset_limit(self.teacher, env.sim.track,
+                                           0.5 * float(env.cfg.vehicle.width), float(margin_m))
+        if self.teacher.offset_limit is None:
+            self.teacher.offset_limit = self.limit
+        self._w = torch.zeros(env.B, device=env.device)
+
+    # -- what the traffic ahead is doing ---------------------------------------------------------
+    def _ahead(self):
+        """(arc to the nearest car ahead, its speed). The arc is +1e9 where nothing is ahead."""
+        e = self.env
+        if e.sim.other_idx is None:
+            return (torch.full((e.B,), 1e9, device=e.device),
+                    torch.zeros(e.B, device=e.device))
+        d = e.signed_gaps(e.sim.s, e.sim.tid)                      # (B, M-1), + = ahead of me
+        ahead = torch.where(d > 0, d, torch.full_like(d, 1e9))
+        gap, j = ahead.min(1)
+        v = e.sim.state[e.sim.other_idx.gather(1, j[:, None])[:, 0], 3]
+        return gap, v
+
+    def _room(self, idx):
+        """Achievable |offset| at each car's own raceline point, capped at what it wants."""
+        lim = self.limit[self.env.sim.tid, idx]
+        return torch.minimum(lim, torch.full_like(lim, self.desired))
+
+    # -- the manoeuvre ----------------------------------------------------------------------------
+    def __call__(self, obs=None, k=None, env=None) -> torch.Tensor:
+        e = self.env
+        idx, _ = self.teacher.project(e.sim.state[:, :2], e.sim.tid)
+        room = self._room(idx)
+        fits = room >= self.min_pass
+        gap, v_other = self._ahead()
+
+        # Hysteresis, as in `PassExpert`: once committed, hold the line out until genuinely through.
+        # The gate is the room the LANE has, so a section that cannot take the offset never engages
+        # and the driver falls through to holding station instead.
+        engaging = ((gap < self.engage[e.sim.tid]) & fits).float()
+        self._w = torch.maximum(engaging, self._w * (gap < 1e8).float() * fits.float())
+        offset = self.side * room * self._w
+
+        an = self.teacher.plan_action(e.sim.state, e.sim.P, e.sim.tid, e.ecfg.v_max_policy,
+                                      e.tracker.spec, offset=offset)
+
+        # Hold station behind a car this driver is not going round. The trigger carries the room to
+        # brake at the current closing speed, the shape the env's own `follow_cap` uses: a fixed
+        # distance is a rear-end waiting for a fast approach. Zero inside the body gap, because a
+        # car a `stop` event has parked is a wall that happens to be a car.
+        mine = e.sim.state[:, 3]
+        closing = (mine - v_other).clamp_min(0.0)
+        trigger = self.follow_gap + closing * closing / (2.0 * self.follow_decel)
+        holding = (gap < trigger) & (self._w < 0.5)
+        v_hold = torch.where(gap < self.follow_gap * 0.55, torch.zeros_like(v_other), 0.9 * v_other)
+        scale = torch.where(holding,
+                            (v_hold / max(float(e.ecfg.v_max_policy), 1e-6)).clamp(0.0, 1.0),
+                            torch.ones_like(v_other))
+        # The plan's two speed entries are normalized to [-1, 1]; scaling them the way
+        # `gym_env._opponent_actions` scales an event's speed keeps one convention for "drive this
+        # plan slower" rather than inventing a second.
+        an = an.clone()
+        target = ((an[:, -2:] + 1) * 0.5 * float(e.ecfg.v_max_policy))
+        target = torch.where(holding[:, None],
+                             torch.minimum(target, (scale * float(e.ecfg.v_max_policy))[:, None]),
+                             target)
+        an[:, -2:] = (target / max(float(e.ecfg.v_max_policy), 1e-6) * 2 - 1).clamp(-1.0, 1.0)
+        return an.clamp(-1.0, 1.0)
