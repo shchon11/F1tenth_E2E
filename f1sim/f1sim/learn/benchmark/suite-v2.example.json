@@ -1,0 +1,233 @@
+{
+  "freeze_sha256": "89805514350d932a36cbfe28eed7ca379ec92d71806ec5202736aa61805394f9",
+  "suite": {
+    "backend": "f1sim",
+    "budget_laps": 3.0,
+    "calibration": {
+      "measured": true,
+      "note": "non-candidate feasibility smoke; no evaluated checkpoint was loaded",
+      "timings": {
+        "gen:control:9100": {
+          "completed": 8,
+          "device": "cpu",
+          "envs": 8,
+          "seconds_per_cell": 49.59,
+          "steps": 600
+        },
+        "real:map12x16": {
+          "completed": 8,
+          "device": "cpu",
+          "envs": 8,
+          "seconds_per_cell": 43.12,
+          "steps": 600
+        },
+        "real:map16x07": {
+          "completed": 7,
+          "device": "cpu",
+          "envs": 8,
+          "seconds_per_cell": 39.51,
+          "steps": 600
+        }
+      }
+    },
+    "envs": 8,
+    "hold_seconds": 1.0,
+    "obstacle_maps": [
+      "real:map16x07",
+      "real:map12x16",
+      "gen:control:9100"
+    ],
+    "obstacle_window_m": 4.0,
+    "opp_speed_range": [
+      0.6,
+      0.8
+    ],
+    "paired_mus": [
+      0.73423,
+      0.94401
+    ],
+    "placements": {
+      "gen:control:9100": {
+        "placement": {
+          "blocked_span_m": 0.29,
+          "centre_xy": [
+            -7.398881831963095,
+            -5.450756597410582
+          ],
+          "corridor_centre_offset_m": -0.7048803269863129,
+          "corridor_width_m": 0.51,
+          "half_lane_m": 1.2816005945205688,
+          "n_cells": 163,
+          "required_corridor_m": 0.51,
+          "s_obs_m": 10.0,
+          "side": 1,
+          "size_m": [
+            0.29,
+            1.4097606539726257
+          ]
+        },
+        "proofs": {
+          "blocking": {
+            "blocked_samples": 3,
+            "samples_in_window": 10,
+            "sweep_m": 0.69
+          },
+          "connectivity": {
+            "component": 3,
+            "erosion_radius_m": 0.155,
+            "lane_length_m": 56.8854680896294,
+            "local_cells": 43701,
+            "swept_length_m": 0.69,
+            "window_m": 8.0
+          },
+          "corridor": {
+            "passable_sides": [
+              "left"
+            ],
+            "required_m": 0.51,
+            "tolerance_m": 0.05,
+            "widths_m": {
+              "left": 1.1500000000000004,
+              "right": 0.05
+            }
+          }
+        },
+        "s_start_m": -5.0,
+        "search": {
+          "rejected": [],
+          "s_obs_m": 10.0
+        }
+      },
+      "real:map12x16": {
+        "placement": {
+          "blocked_span_m": 0.29,
+          "centre_xy": [
+            25.567418235771054,
+            0.5280932759408049
+          ],
+          "corridor_centre_offset_m": -0.5289730727672577,
+          "corridor_width_m": 0.51,
+          "half_lane_m": 0.9617692232131958,
+          "n_cells": 123,
+          "required_corridor_m": 0.51,
+          "s_obs_m": 10.0,
+          "side": 1,
+          "size_m": [
+            0.29,
+            1.0579461455345154
+          ]
+        },
+        "proofs": {
+          "blocking": {
+            "blocked_samples": 6,
+            "samples_in_window": 16,
+            "sweep_m": 0.69
+          },
+          "connectivity": {
+            "component": 1,
+            "erosion_radius_m": 0.155,
+            "lane_length_m": 36.06412835442605,
+            "local_cells": 18642,
+            "swept_length_m": 0.69,
+            "window_m": 8.0
+          },
+          "corridor": {
+            "passable_sides": [
+              "left"
+            ],
+            "required_m": 0.51,
+            "tolerance_m": 0.05000000074505806,
+            "widths_m": {
+              "left": 0.850000012665987,
+              "right": 0.0
+            }
+          }
+        },
+        "s_start_m": -5.0,
+        "search": {
+          "rejected": [],
+          "s_obs_m": 10.0
+        }
+      },
+      "real:map16x07": {
+        "placement": {
+          "blocked_span_m": 0.29,
+          "centre_xy": [
+            2.384894110194985,
+            -0.14116066907323913
+          ],
+          "corridor_centre_offset_m": -0.36208320304751396,
+          "corridor_width_m": 0.51,
+          "half_lane_m": 0.667083203792572,
+          "n_cells": 79,
+          "required_corridor_m": 0.51,
+          "s_obs_m": 10.0,
+          "side": 1,
+          "size_m": [
+            0.29,
+            0.7241664060950279
+          ]
+        },
+        "proofs": {
+          "blocking": {
+            "blocked_samples": 8,
+            "samples_in_window": 16,
+            "sweep_m": 0.69
+          },
+          "connectivity": {
+            "component": 1,
+            "erosion_radius_m": 0.155,
+            "lane_length_m": 33.22136310026841,
+            "local_cells": 15313,
+            "swept_length_m": 0.69,
+            "window_m": 8.0
+          },
+          "corridor": {
+            "passable_sides": [
+              "left"
+            ],
+            "required_m": 0.51,
+            "tolerance_m": 0.05000000074505806,
+            "widths_m": {
+              "left": 0.6000000089406967,
+              "right": 0.05000000074505806
+            }
+          }
+        },
+        "s_start_m": -5.0,
+        "search": {
+          "rejected": [],
+          "s_obs_m": 10.0
+        }
+      }
+    },
+    "race_maps": [
+      "gen:control:9100"
+    ],
+    "race_size": 2,
+    "reused_maps_note": "Held out. real:map16x07 and real:map12x16 are floors this car drove on that no training set contains, in any direction and with any obstacle suffix; the rest of the solo family is common.HELDOUT_TRACKS, guarded by tests/test_heldout_split.py. korea_2026_competition is absent by design: it is trained through twenty obstacle variants (common.KOREA26_TRAIN) and belongs to v1's in-distribution set. The overtaking family is gen:control:9100 alone: a pass on either real floor could not be shown by the scripted reference driver (0/4 at both mu levels), so those cells were dropped rather than admitted undemonstrated. Adoption decisions read v2.",
+    "s_start_offset_m": -15.0,
+    "seeds": [
+      4401,
+      4402
+    ],
+    "sensor_noise": true,
+    "solo_maps": [
+      "real:korea_2025_iccas",
+      "real:blackbox2022_3",
+      "rt:Monza",
+      "gen:competition:0",
+      "gen:control:9100",
+      "gen:competition:9200+pinch9200",
+      "real:map16x07",
+      "real:map12x16"
+    ],
+    "solo_mus": [
+      0.73423,
+      0.94401,
+      1.15379
+    ],
+    "speed_cap": 9.0,
+    "version": "v2"
+  }
+}
