@@ -1,9 +1,9 @@
 """Traction guard for the real car: wheel-vs-body acceleration, brake lock and launch spin.
 
-ROS-free and dependency-free on purpose (`math` only). It runs inside `policy_node` at the scan
-rate, and the same class is replayed over the recorded bags offline by
-`scripts/replay_traction.py` -- one implementation, two callers, so what is validated is what
-drives.
+ROS-free and dependency-free on purpose (`math` only). Inside `policy_node` it is fed once per
+`/odom` sample (50 Hz on this car) and shapes once per published command (the 40 Hz scan rate), and
+the same class is replayed over the recorded bags offline by `scripts/replay_traction.py` -- one
+implementation, two callers, so what is validated is what drives.
 
 Why it cannot be validated in the simulator
 -------------------------------------------
@@ -23,7 +23,9 @@ The measurement
   that field in **g**; converting it is the caller's job (`policy_node` already detects and scales,
   `calib/bagread.py` multiplies by G on read).
 
-Both are differentiated/compared over a window, never sample to sample: see `_ACCEL_WINDOW`.
+The wheel speed is differentiated over a *window*, never sample to sample: 7.2 % of the `/odom`
+steps in these recordings are shorter than 15 ms, down to 0.29 ms, where one ERPM quantum reads as
+110 m/s^2 of wheel acceleration the car never saw. See `TractionParams.min_diff_dt`.
 """
 from __future__ import annotations
 
