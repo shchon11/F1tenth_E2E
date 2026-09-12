@@ -160,7 +160,7 @@ def _split_obstacle_suffix(name: str):
     """`x+rlobs7` -> (x, 'rlobs', 7); `x+obs7` -> (x, 'obs', 7); `x+pinch7` -> (x, 'pinch', 7);
     `x+props7` -> (x, 'props', 7); otherwise (name, None, None).
     `+rlobs` must be tested first: splitting on '+obs' would cut 'x+rlobs7' into 'x+rl' and '7'."""
-    for tag in ("+rlobs", "+obs", "+pinch", "+props"):
+    for tag in ("+rlobs", "+obs", "+pinch", "+props", "+hard"):
         if tag in name:
             base, _, spec = name.partition(tag)
             return base, tag[1:], spec
@@ -168,6 +168,10 @@ def _split_obstacle_suffix(name: str):
 
 
 def _load_base(name: str, **kw) -> Track:
+    if "+hard" in name:                                    # any family: hand-built-style patterns on top
+        base, _, spec = name.rpartition("+hard")
+        from .hard_obstacles import with_hard_obstacles
+        return with_hard_obstacles(_load_base(base, **kw), int(spec))
     if name.startswith("gen:"):
         _, style, seed = (name.split(":") + ["0"])[:3]
         seed, kind, spec = _split_obstacle_suffix(seed)          # gen:competition:3+obs7 / +rlobs7
