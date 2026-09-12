@@ -113,6 +113,48 @@ rays sprayed through, dropping floating specks, and treating the unseen interior
 Where a map's outline is really the outer duct hose of a track built inside a larger hall, the LiDAR
 correctly sees floor beyond it; `outer_walls=True` covers maps whose outline is a genuine wall.
 
+## The policy network
+
+`learn/model.py`. An asymmetric actor-critic: the actor sees only what the car can sense, the critic
+additionally sees privileged state and is thrown away at deployment.
+
+**Actor.** A 1-D convolutional stem over the beam axis (`scan_stem="resnet"`: GroupNorm residual
+blocks with a dilated final stage for whole-scan context, an explicit beam-angle channel, an
+explicit windowed-minimum channel, and a raw per-sector nearest-return bypass that carries absolute
+scale past the normalisation) turns the stacked scan into 256 features. A one-layer MLP turns the
+proprio vector into 128. The two are concatenated and passed through a two-layer 256-wide MLP; a
+`tanh` output head emits the 8-number plan. Two auxiliary heads hang off the same trunk — the car's
+friction from the trunk *and* the proprio embedding, and the nearest opponent's offset and closing
+speed from the trunk — and are trained only when `--aux-grip` / `--aux-opp` are on.
+
+**Memory (optional, `--memory gru`).** A GRU over the same per-step embedding the MLP sees, whose
+output is added to the first MLP layer's *preactivation* through a bias-free projection initialised
+to zero. The zero makes a warm start exact: a checkpoint loaded into a memory actor produces
+bit-identical actions until the projection has trained, so the recurrence is an addition to the
+original network rather than a new one. The critic carries its own GRU by default rather than
+sharing the actor's, for the same reason it already carries its own stem: it reads privileged
+state, and sharing the recurrence would be the one place a value gradient reached the actor's
+trunk. The six-frame stack stays the input; memory extends the window past the 150 ms it covers.
+
+The hidden state is never held inside the module. It is passed in and returned by
+`act()` / `evaluate()` / `Actor.step()`, and every caller resets it at episode boundaries — a
+hidden state carried across a reset is a policy remembering a track it is no longer on. The
+feedforward entry points (`Actor.forward`, `.dist`, `.forward_all`) refuse a recurrent actor rather
+than running it from zeros, because a recurrent policy restarted every step looks exactly like a
+working one.
+
+**Optional scan channels.** `--scan-channels memory,edges` appends one row per channel to the scan's
+channel axis, after every column the original had, computed from the scan alone
+(`learn/obs.py`): a decayed per-bearing occupancy memory, and the beam-to-beam range discontinuity.
+They are a policy-side transform, so the simulator, a checkpoint's recorded observation spec and
+every consumer of that spec are unchanged by them.
+
+**Size and cost.** The frozen original `ppo_race_0910` is 1.17 M actor parameters (2.25 M with its
+critic). A 128-wide GRU on both halves adds 460 k — 1.20× the parameters — and costs about a tenth
+of the actor's forward time. The deployment rule, the measurement protocol and the table are in
+[training.md](training.md#the-deployment-budget) and
+[the research note](research/memory-policy-2026-09-13.md).
+
 ## Raceline and teacher
 
 ```python
