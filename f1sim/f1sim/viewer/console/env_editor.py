@@ -49,12 +49,13 @@ REBUILD_DEBOUNCE_MS = 120
 
 #: Tool keys, their labels, tooltip and shortcut. Order is the toolbar order.
 TOOLS = [
-    ("select", "선택·이동", "클릭으로 선택, 드래그로 이동. Ctrl+휠 또는 R 로 회전, Delete 로 삭제  (V)", "V"),
+    ("select", "선택·이동", "클릭으로 선택, 드래그로 이동. 경로는 꼭짓점을 잡아 고칩니다  (V)", "V"),
     ("brush_duct", "덕트 브러시", "덕트 호스 칠하기. LiDAR 빔이 위로 넘어가는 낮은 벽  (B)", "B"),
     ("brush_tall", "벽 브러시", "높은 벽 칠하기. 빔을 항상 막는 벽  (W)", "W"),
-    ("erase", "지우개", "덕트와 벽을 지우기  (E)", "E"),
-    ("line_duct", "덕트 선", "클릭으로 점을 찍고 더블클릭·Enter 로 마무리. Esc 취소  (L)", "L"),
-    ("line_tall", "벽 선", "클릭으로 점을 찍고 더블클릭·Enter 로 마무리. Esc 취소  (K)", "K"),
+    ("erase", "지우개", "칠한 덕트와 벽을 지우기 (경로로 만든 것은 선택해서 삭제)  (E)", "E"),
+    ("path_track", "트랙 경로", "차선 중심을 그리면 양쪽에 덕트 호스가 서고 센터라인이 됩니다. 직선·곡선 혼용  (T)", "T"),
+    ("path_duct", "덕트 경로", "덕트 호스 한 줄을 경로로. 클릭 직선, Ctrl+클릭 곡선  (L)", "L"),
+    ("path_tall", "벽 경로", "높은 벽 한 줄을 경로로. 클릭 직선, Ctrl+클릭 곡선  (K)", "K"),
     ("rect", "사각형", "드래그로 사각 벽 채우기. Shift: 덕트  (M)", "M"),
     ("polygon", "다각형 채우기", "클릭으로 꼭짓점, 더블클릭·Enter 로 채우기  (P)", "P"),
     ("place", "배치", "라이브러리에서 고른 에셋을 클릭한 자리에 놓기. Ctrl+휠: 방향  (A)", "A"),
@@ -71,6 +72,11 @@ BUILTIN_PROPS = [
 ]
 
 MESH_FILTER = "메쉬 (*.glb *.gltf *.obj *.stl *.ply *.off);;모든 파일 (*)"
+
+
+def _rgba(hex_colour: str, alpha: float = 1.0) -> Tuple[float, float, float, float]:
+    h = hex_colour.lstrip("#")
+    return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0, float(alpha))
 
 
 def _scene_module():
@@ -90,6 +96,8 @@ class EditorState(QtCore.QObject):
         self._undo: List[tuple] = []             # (label, snapshot)
         self._redo: List[tuple] = []
         self.selection: List[str] = []
+        #: (path id, vertex index or None) -- exclusive with the prop selection
+        self.path_sel: Tuple[Optional[str], Optional[int]] = (None, None)
         self._dirty = False
 
     # -- document
@@ -98,6 +106,7 @@ class EditorState(QtCore.QObject):
         self._undo.clear()
         self._redo.clear()
         self.selection = []
+        self.path_sel = (None, None)
         self._set_dirty(dirty)
         self.changed.emit("doc")
 
@@ -182,12 +191,32 @@ class EditorState(QtCore.QObject):
     def _prune_selection(self):
         ids = {p.id for p in self.doc.props} if self.doc is not None else set()
         self.selection = [s for s in self.selection if s in ids]
+        pid, vi = self.path_sel
+        q = self.doc.get_path(pid) if (self.doc is not None and pid is not None) else None
+        if q is None:
+            self.path_sel = (None, None)
+        elif vi is not None and vi >= len(q.points):
+            self.path_sel = (pid, None)
 
     def select(self, ids: Sequence[str]):
         ids = list(ids)
-        if ids != self.selection:
+        if ids != self.selection or (ids and self.path_sel[0] is not None):
             self.selection = ids
+            if ids:
+                self.path_sel = (None, None)
             self.changed.emit("selection")
+
+    def select_path(self, pid: Optional[str], vi: Optional[int]):
+        new = (pid, vi)
+        if new != self.path_sel or (pid is not None and self.selection):
+            self.path_sel = new
+            if pid is not None:
+                self.selection = []
+            self.changed.emit("selection")
+
+    def selected_path(self):
+        pid, _vi = self.path_sel
+        return self.doc.get_path(pid) if (self.doc is not None and pid is not None) else None
 
     def selected_props(self) -> list:
         if self.doc is None:
@@ -197,10 +226,37 @@ class EditorState(QtCore.QObject):
 
 
 # ================================================================ tools
+#: Ground-decal colours per layer: what the brush is about to leave, what a path band will be.
+LAYER_COLOUR = {"duct": C["warn"], "tall": "#d9d9d9", "free": C["danger"], "track": C["ego"]}
+#: Contextual key hints per tool, shown under the toolbar (the Blender status-bar convention: the
+#: keys that matter *now*, not a manual).
+TOOL_HINTS = {
+    "select": "클릭 선택 · 드래그 이동 · Shift+클릭 추가 · 빈 곳 드래그 범위 선택 · 경로 꼭짓점 드래그 · "
+              "Alt+클릭 꼭짓점 추가 · Tab/더블클릭 직선↔곡선 · Delete 삭제 · 방향키 미세 이동 · R 회전",
+    "brush": "드래그로 칠하기 (칠하는 자리가 색으로 미리 보이고 벽은 따라서 자랍니다) · Ctrl+휠 굵기 (벽·지우개; "
+             "덕트는 항상 호스 지름 굵기) · 경로로 만든 벽은 지우개가 아니라 선택해서 고치거나 지웁니다",
+    "path": "클릭 직선 꼭짓점 · Ctrl+클릭 곡선 꼭짓점 · Tab 마지막 꼭짓점 직선↔곡선 · Shift 45° 맞춤 · "
+            "Backspace 한 점 취소 · C 닫기/열기 · Enter·더블클릭·우클릭 완료 · Esc 취소",
+    "rect": "드래그로 사각 벽 · Shift 덕트 · Esc 취소",
+    "polygon": "클릭 꼭짓점 · Enter·더블클릭 채우기 · Backspace 한 점 취소 · Esc 취소",
+    "place": "클릭 배치 · Ctrl+휠 / R 방향 · 라이브러리에서 에셋 선택",
+}
+
+
+def _snap45(x0, y0, x, y):
+    """(x, y) moved onto the nearest 45° ray from (x0, y0), keeping its distance."""
+    dx, dy = x - x0, y - y0
+    d = math.hypot(dx, dy)
+    if d < 1e-9:
+        return x, y
+    a = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+    return x0 + d * math.cos(a), y0 + d * math.sin(a)
+
+
 class Tool:
     """Base: a tool reads the page for its parameters and mutates only via `page.state`."""
     name = ""                      # the TOOLS key; not `key`, which is the key-event handler below
-    cursor_kind = "cross"
+    hint = ""
 
     def __init__(self, page: "EnvEditorPage"):
         self.page = page
@@ -218,6 +274,8 @@ class Tool:
 
     def deactivate(self):
         self.vp.set_preview(None, 0.0)
+        self.vp.set_fill("tool", [], LAYER_COLOUR["duct"])
+        self.vp.set_marquee(None)
 
     def press(self, x, y, button, mods, hit):
         pass
@@ -229,7 +287,7 @@ class Tool:
         pass
 
     def hover(self, x, y, hit):
-        self.vp.set_cursor(self.cursor_kind, x, y, self.page.brush_radius())
+        self.vp.set_cursor("cross", x, y)
 
     def double_click(self, x, y):
         pass
@@ -242,77 +300,190 @@ class Tool:
 
 
 class SelectTool(Tool):
+    """Props and paths: pick, drag, marquee, vertex handles."""
     name = "select"
-    cursor_kind = "none"
+    hint = TOOL_HINTS["select"]
 
     def __init__(self, page):
         super().__init__(page)
-        self._drag_start = None
-        self._drag_ids: List[str] = []
-        self._orig: Dict[str, Tuple[float, float]] = {}
+        self._mode = None                      # "props" | "vertex" | "path" | "marquee" | None
+        self._start = None
+        self._orig = None
         self._moved = False
+        self._hover_vertex = None              # (pid, idx)
+
+    def _tol(self):
+        return self.vp.handle_radius()
 
     def hover(self, x, y, hit):
         self.vp.set_cursor("none", x, y)
-        poly = self.page.footprint_of(hit) if hit else None
-        self.vp.set_hover(poly)
+        doc = self.state.doc
+        if hit:
+            self.vp.set_hover(self.page.footprint_of(hit))
+            self._hover_vertex = None
+            self.page.set_hover_vertex(None)
+            return
+        pid, vi, _si = doc.path_hit(x, y, self._tol(), self._tol() * 1.6)
+        if pid is not None:
+            q = doc.get_path(pid)
+            self._hover_vertex = (pid, vi) if vi is not None else None
+            self.page.set_hover_vertex(self._hover_vertex)
+            if vi is None:
+                self.vp.set_hover(q.polyline() if not q.closed else np.vstack([q.polyline(), q.polyline()[:1]]))
+            else:
+                self.vp.set_hover(None)
+        else:
+            self._hover_vertex = None
+            self.page.set_hover_vertex(None)
+            self.vp.set_hover(None)
 
     def press(self, x, y, button, mods, hit):
         if button != QtCore.Qt.LeftButton:
             return
+        doc = self.state.doc
+        self._moved = False
+        self._start = (x, y)
         if hit:
             if mods & QtCore.Qt.ShiftModifier:
                 sel = list(self.state.selection)
-                if hit in sel:
-                    sel.remove(hit)
-                else:
-                    sel.append(hit)
+                (sel.remove if hit in sel else sel.append)(hit)
                 self.state.select(sel)
             elif hit not in self.state.selection:
                 self.state.select([hit])
-            self._drag_start = (x, y)
-            self._drag_ids = list(self.state.selection)
+            self._mode = "props"
             self._orig = {p.id: (p.x, p.y) for p in self.state.selected_props()}
-            self._moved = False
             self.state.begin_stroke("이동")
-        else:
+            return
+        pid, vi, si = doc.path_hit(x, y, self._tol(), self._tol() * 1.6)
+        if pid is not None:
+            q = doc.get_path(pid)
+            if vi is None and mods & QtCore.Qt.AltModifier:
+                # insert a vertex on this segment and pick it up straight away
+                self.state.begin_stroke("꼭짓점 추가")
+                vi = doc.insert_path_vertex(pid, si, x, y, smooth=q.points[si][2] or q.points[(si + 1) % len(q.points)][2])
+                self._moved = True
+                self.state.select_path(pid, vi)
+                self._mode = "vertex"
+                self._orig = (x, y)
+                self.page.begin_live_grid()
+                return
+            self.state.select_path(pid, vi)
+            if vi is not None:
+                self._mode = "vertex"
+                self._orig = tuple(q.points[vi][:2])
+                self.state.begin_stroke("꼭짓점 이동")
+            else:
+                self._mode = "path"
+                self._orig = [tuple(p) for p in q.points]
+                self.state.begin_stroke("경로 이동")
+            self.page.begin_live_grid()
+            return
+        self._mode = "marquee"
+        if not (mods & QtCore.Qt.ShiftModifier):
             self.state.select([])
 
     def move(self, x, y, buttons, mods):
-        if self._drag_start is None or self.state.doc is None:
+        if self._mode is None or self.state.doc is None or self._start is None:
             return
-        dx, dy = x - self._drag_start[0], y - self._drag_start[1]
+        dx, dy = x - self._start[0], y - self._start[1]
         if not self._moved and math.hypot(dx, dy) < 0.01:
             return
         self._moved = True
+        doc = self.state.doc
         snap = self.page.snap_step() if not (mods & QtCore.Qt.AltModifier) else 0.0
-        for p in self.state.doc.props:
-            if p.id in self._orig:
-                ox, oy = self._orig[p.id]
-                nx, ny = ox + dx, oy + dy
-                if snap > 0:
-                    nx, ny = round(nx / snap) * snap, round(ny / snap) * snap
-                p.x, p.y = float(nx), float(ny)
-        self.page.props_moved_live()
+        if self._mode == "props":
+            for p in doc.props:
+                if p.id in self._orig:
+                    ox, oy = self._orig[p.id]
+                    nx, ny = ox + dx, oy + dy
+                    if snap > 0:
+                        nx, ny = round(nx / snap) * snap, round(ny / snap) * snap
+                    p.x, p.y = float(nx), float(ny)
+            self.page.props_moved_live()
+        elif self._mode == "vertex":
+            pid, vi = self.state.path_sel
+            q = doc.get_path(pid)
+            if q is None or vi is None:
+                return
+            nx, ny = x, y
+            if mods & QtCore.Qt.ShiftModifier and len(q.points) > 1:
+                ref = q.points[vi - 1] if vi > 0 else q.points[(vi + 1) % len(q.points)]
+                nx, ny = _snap45(ref[0], ref[1], nx, ny)
+            nx, ny = self.page.snap_point(nx, ny) if snap > 0 else (nx, ny)
+            q.points[vi] = (float(nx), float(ny), q.points[vi][2])
+            self.page.path_edited_live(q)
+        elif self._mode == "path":
+            pid, _vi = self.state.path_sel
+            q = doc.get_path(pid)
+            if q is None:
+                return
+            sx, sy = (round(dx / snap) * snap, round(dy / snap) * snap) if snap > 0 else (dx, dy)
+            q.points = [(ox + sx, oy + sy, sm) for ox, oy, sm in self._orig]
+            self.page.path_edited_live(q)
+        elif self._mode == "marquee":
+            self.vp.set_marquee((self._start[0], self._start[1], x, y))
 
     def release(self, x, y, button, mods):
-        if button != QtCore.Qt.LeftButton or self._drag_start is None:
+        if button != QtCore.Qt.LeftButton or self._mode is None:
             return
-        self._drag_start = None
-        self.state.end_stroke(self._moved, kind="props")
-        if not self._moved:
-            self.state._stroke = None
-            self.page.refresh_overlays()
+        mode, self._mode = self._mode, None
+        doc = self.state.doc
+        if mode == "props":
+            self.state.end_stroke(self._moved, kind="props")
+            if not self._moved:
+                self.state._stroke = None
+                self.page.refresh_overlays()
+        elif mode in ("vertex", "path"):
+            self.page.end_live_grid()
+            if self._moved:
+                doc.path_changed()
+            self.state.end_stroke(self._moved, kind="grid")
+            if not self._moved:
+                self.state._stroke = None
+                self.page.refresh_overlays()
+        elif mode == "marquee":
+            self.vp.set_marquee(None)
+            if self._moved and self._start is not None:
+                x0, x1 = sorted((self._start[0], x))
+                y0, y1 = sorted((self._start[1], y))
+                inside = [p.id for p in doc.props if x0 <= p.x <= x1 and y0 <= p.y <= y1]
+                sel = list(self.state.selection) if mods & QtCore.Qt.ShiftModifier else []
+                self.state.select(sel + [i for i in inside if i not in sel])
+            elif not self._moved:
+                self.state.select([])
+                self.state.select_path(None, None)
+        self._start = None
+
+    def double_click(self, x, y):
+        doc = self.state.doc
+        if doc is None:
+            return
+        pid, vi, _si = doc.path_hit(x, y, self._tol(), self._tol() * 1.6)
+        if pid is not None and vi is not None:
+            self.state.select_path(pid, vi)
+            self.page.toggle_vertex_smooth()
 
     def key(self, key, mods) -> bool:
         if key in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
             self.page.delete_selection()
             return True
-        if key == QtCore.Qt.Key_R:
+        if key == QtCore.Qt.Key_Tab:
+            self.page.toggle_vertex_smooth()
+            return True
+        if key == QtCore.Qt.Key_C and self.state.path_sel[0] is not None:
+            self.page.toggle_path_closed()
+            return True
+        if key == QtCore.Qt.Key_R and self.state.selection:
             self.page.rotate_selection(math.radians(-15 if mods & QtCore.Qt.ShiftModifier else 15))
             return True
         if key == QtCore.Qt.Key_D and mods & QtCore.Qt.ControlModifier:
             self.page.duplicate_selection()
+            return True
+        arrows = {QtCore.Qt.Key_Left: (-1, 0), QtCore.Qt.Key_Right: (1, 0),
+                  QtCore.Qt.Key_Up: (0, 1), QtCore.Qt.Key_Down: (0, -1)}
+        if key in arrows:
+            step = 0.01 if mods & QtCore.Qt.ShiftModifier else max(0.01, self.page.snap_step() or 0.05)
+            self.page.nudge_selection(arrows[key][0] * step, arrows[key][1] * step)
             return True
         return False
 
@@ -324,8 +495,12 @@ class SelectTool(Tool):
 
 
 class BrushTool(Tool):
-    """Paint discs into one layer along the mouse path; one undo step per stroke."""
-    cursor_kind = "brush"
+    """Paint discs into one layer along the mouse path; one undo step per stroke.
+
+    Feedback while the button is down is immediate and two-fold: the stroke so far is drawn as a
+    decal in the layer's colour under the cursor, and the real geometry (hose tubes, walls) is
+    rebuilt on a timer so it grows along behind the brush."""
+    hint = TOOL_HINTS["brush"]
 
     def __init__(self, page, key, layer, value):
         super().__init__(page)
@@ -333,12 +508,16 @@ class BrushTool(Tool):
         self._down = False
         self._changed = False
         self._last = None
+        self._trail: List[Tuple[float, float]] = []
+
+    @property
+    def colour(self) -> str:
+        return LAYER_COLOUR[self.layer]
 
     def _dab(self, x, y):
         doc = self.state.doc
-        r = self.page.brush_radius()
+        r = self.page.brush_radius(self.layer)
         if self._last is not None:
-            # fill the gap between two events so fast strokes stay continuous
             lx, ly = self._last
             d = math.hypot(x - lx, y - ly)
             n = int(d / max(r * 0.5, doc.resolution)) + 1
@@ -348,41 +527,183 @@ class BrushTool(Tool):
         else:
             self._changed |= bool(doc.paint_disc(self.layer, x, y, r, self.value))
         self._last = (x, y)
+        self._trail.append((x, y))
+        self.vp.set_fill("tool", [("band", np.asarray(self._trail), 2 * r, False)], self.colour)
+
+    def hover(self, x, y, hit):
+        self.vp.set_cursor("brush", x, y, self.page.brush_radius(self.layer), colour=self.colour)
 
     def press(self, x, y, button, mods, hit):
         if button != QtCore.Qt.LeftButton or self.state.doc is None:
             return
-        self._down, self._changed, self._last = True, False, None
+        self._down, self._changed, self._last, self._trail = True, False, None, []
         self.state.begin_stroke({"duct": "덕트 칠하기", "tall": "벽 칠하기", "free": "지우기"}[self.layer])
         self._dab(x, y)
-        self.page.grid_edited_live()
+        self.page.begin_live_grid()
 
     def move(self, x, y, buttons, mods):
-        self.vp.set_cursor("brush", x, y, self.page.brush_radius())
+        self.vp.set_cursor("brush", x, y, self.page.brush_radius(self.layer), colour=self.colour)
         if self._down:
             self._dab(x, y)
-            self.page.grid_edited_live()
 
     def release(self, x, y, button, mods):
         if button != QtCore.Qt.LeftButton or not self._down:
             return
         self._down = False
+        self.vp.set_fill("tool", [], self.colour)
+        self.page.end_live_grid()
         self.state.end_stroke(self._changed, kind="grid")
 
     def wheel(self, delta, mods) -> bool:
-        if mods & QtCore.Qt.ControlModifier:
+        if mods & QtCore.Qt.ControlModifier and self.layer != "duct":
             self.page.step_brush(1 if delta > 0 else -1)
             return True
         return False
 
 
-class PolylineTool(Tool):
-    """Click vertices; double-click / Enter commits. `fill=True` fills the polygon instead."""
-    cursor_kind = "cross"
+class PathTool(Tool):
+    """Draw a vector path: straight segments between corner vertices, curves through smooth ones.
 
-    def __init__(self, page, key, layer, fill=False):
+    `kind` is `duct` / `tall` (a band of the brush width) or `track` (a lane: the centreline you
+    draw, hoses along both edges, and the scene's centerline set from it)."""
+    hint = TOOL_HINTS["path"]
+
+    def __init__(self, page, key, kind):
         super().__init__(page)
-        self.name, self.layer, self.fill = key, layer, fill
+        self.name, self.kind = key, kind
+        self.pts: List[Tuple[float, float, bool]] = []
+        self.closed = kind == "track"
+        self._cursor: Optional[Tuple[float, float, bool]] = None
+
+    def deactivate(self):
+        self.pts = []
+        self.page.set_path_handles([])
+        super().deactivate()
+
+    @property
+    def colour(self) -> str:
+        return LAYER_COLOUR[self.kind]
+
+    def _width(self) -> float:
+        if self.kind == "track":
+            return self.page.lane_width()
+        if self.kind == "duct":
+            return float(self.state.doc.duct_height)
+        return self.page.line_width()
+
+    def _band(self) -> float:
+        return float(self.state.doc.duct_height)
+
+    def _shapes(self, pts, closed):
+        from f1sim.scene import offset_polyline, sample_path
+        pl = sample_path(pts, closed)
+        if len(pl) == 0:
+            return [], pl
+        if self.kind == "track":
+            half = 0.5 * self._width()
+            return ([("band", offset_polyline(pl, +half, closed), self._band(), closed),
+                     ("band", offset_polyline(pl, -half, closed), self._band(), closed)], pl)
+        return [("band", pl, self._width(), closed)], pl
+
+    def _preview(self):
+        doc = self.state.doc
+        if doc is None:
+            return
+        pts = list(self.pts)
+        if self._cursor is not None and pts:
+            pts.append(self._cursor)
+        closed = self.closed and len(pts) >= 3
+        shapes, pl = self._shapes(pts, closed) if pts else ([], np.zeros((0, 2)))
+        self.vp.set_fill("tool", shapes, self.colour)
+        if len(pl) >= 2:
+            self.vp.set_preview(pl, 0.0, closed=closed, colour=self.colour)
+        else:
+            self.vp.set_preview(None, 0.0)
+        handles = [(x, y, "smooth" if sm else "corner", "normal") for x, y, sm in self.pts]
+        if self._cursor is not None:
+            handles.append((self._cursor[0], self._cursor[1], "smooth" if self._cursor[2] else "corner", "hover"))
+        self.page.set_path_handles(handles)
+
+    def _next_point(self, x, y, mods) -> Tuple[float, float, bool]:
+        if mods & QtCore.Qt.ShiftModifier and self.pts:
+            x, y = _snap45(self.pts[-1][0], self.pts[-1][1], x, y)
+        x, y = self.page.snap_point(x, y)
+        return (float(x), float(y), bool(mods & QtCore.Qt.ControlModifier))
+
+    def hover(self, x, y, hit):
+        mods = QtWidgets.QApplication.keyboardModifiers()
+        self._cursor = self._next_point(x, y, mods)
+        self.vp.set_cursor("cross", self._cursor[0], self._cursor[1])
+        self._preview()
+
+    def press(self, x, y, button, mods, hit):
+        if button == QtCore.Qt.RightButton:
+            self.commit()
+            return
+        if button != QtCore.Qt.LeftButton:
+            return
+        p = self._next_point(x, y, mods)
+        if self.pts and math.hypot(p[0] - self.pts[-1][0], p[1] - self.pts[-1][1]) < 1e-6:
+            return
+        self.pts.append(p)
+        self._preview()
+
+    def move(self, x, y, buttons, mods):
+        self.hover(x, y, "")
+
+    def double_click(self, x, y):
+        self.commit()
+
+    def commit(self):
+        pts = list(self.pts)
+        self.pts = []
+        self._cursor = None
+        self.vp.set_preview(None, 0.0)
+        self.vp.set_fill("tool", [], self.colour)
+        self.page.set_path_handles([])
+        doc = self.state.doc
+        if len(pts) < 2 or doc is None:
+            return
+        closed = self.closed and len(pts) >= 3
+        kind, width = self.kind, self._width()
+        band = self._band() if kind == "track" else None
+        q = self.state.commit("경로" if kind != "track" else "트랙 경로",
+                              lambda: doc.add_path(kind, pts, width, closed=closed, band=band), "grid")
+        if q is not None:
+            self.state.select_path(q.id, None)
+
+    def key(self, key, mods) -> bool:
+        if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            self.commit()
+            return True
+        if key == QtCore.Qt.Key_Escape:
+            self.pts = []
+            self._preview()
+            return True
+        if key == QtCore.Qt.Key_Backspace and self.pts:
+            self.pts.pop()
+            self._preview()
+            return True
+        if key == QtCore.Qt.Key_Tab and self.pts:
+            x, y, sm = self.pts[-1]
+            self.pts[-1] = (x, y, not sm)
+            self._preview()
+            return True
+        if key == QtCore.Qt.Key_C:
+            self.closed = not self.closed
+            self.page.chk_close.setChecked(self.closed)
+            self._preview()
+            return True
+        return False
+
+
+class PolygonTool(Tool):
+    """Click vertices; commit fills the polygon with tall wall (Shift on commit: duct)."""
+    name = "polygon"
+    hint = TOOL_HINTS["polygon"]
+
+    def __init__(self, page):
+        super().__init__(page)
         self.pts: List[Tuple[float, float]] = []
         self._cursor = None
 
@@ -392,10 +713,14 @@ class PolylineTool(Tool):
 
     def _preview(self):
         pts = self.pts + ([self._cursor] if self._cursor and self.pts else [])
-        if len(pts) >= 1:
-            self.vp.set_preview(np.asarray(pts, np.float64), 0.0 if self.fill else self.page.line_width(),
-                                closed=self.fill)
+        if len(pts) >= 3:
+            self.vp.set_fill("tool", [("poly", np.asarray(pts))], LAYER_COLOUR["tall"])
+            self.vp.set_preview(np.asarray(pts, np.float64), 0.0, closed=True, colour=LAYER_COLOUR["tall"])
+        elif len(pts) >= 1:
+            self.vp.set_fill("tool", [], LAYER_COLOUR["tall"])
+            self.vp.set_preview(np.asarray(pts, np.float64), 0.0, colour=LAYER_COLOUR["tall"])
         else:
+            self.vp.set_fill("tool", [], LAYER_COLOUR["tall"])
             self.vp.set_preview(None, 0.0)
 
     def hover(self, x, y, hit):
@@ -418,24 +743,19 @@ class PolylineTool(Tool):
     def double_click(self, x, y):
         self.commit()
 
-    def commit(self):
+    def commit(self, layer: str = "tall"):
         pts = list(self.pts)
         self.pts = []
         self.vp.set_preview(None, 0.0)
-        need = 3 if self.fill else 2
-        if len(pts) < need or self.state.doc is None:
+        self.vp.set_fill("tool", [], LAYER_COLOUR["tall"])
+        if len(pts) < 3 or self.state.doc is None:
             return
         arr = np.asarray(pts, np.float64)
-        layer, width = self.layer, self.page.line_width()
-        if self.fill:
-            self.state.commit("다각형 채우기", lambda: self.state.doc.fill_polygon(layer, arr, True), "grid")
-        else:
-            closed = self.page.close_lines()
-            self.state.commit("선 벽", lambda: self.state.doc.paint_polyline(layer, arr, width, True, closed=closed), "grid")
+        self.state.commit("다각형 채우기", lambda: self.state.doc.fill_polygon(layer, arr, True), "grid")
 
     def key(self, key, mods) -> bool:
         if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
-            self.commit()
+            self.commit("duct" if mods & QtCore.Qt.ShiftModifier else "tall")
             return True
         if key == QtCore.Qt.Key_Escape:
             self.pts = []
@@ -450,7 +770,7 @@ class PolylineTool(Tool):
 
 class RectTool(Tool):
     name = "rect"
-    cursor_kind = "cross"
+    hint = TOOL_HINTS["rect"]
 
     def __init__(self, page):
         super().__init__(page)
@@ -467,9 +787,12 @@ class RectTool(Tool):
         self.vp.set_cursor("cross", x, y)
         if self._start is None:
             return
+        self._layer = "duct" if mods & QtCore.Qt.ShiftModifier else "tall"
         x1, y1 = self.page.snap_point(x, y)
         x0, y0 = self._start
-        self.vp.set_preview(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64), 0.0, closed=True)
+        rect = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)
+        self.vp.set_fill("tool", [("poly", rect)], LAYER_COLOUR[self._layer])
+        self.vp.set_preview(rect, 0.0, closed=True, colour=LAYER_COLOUR[self._layer])
 
     def release(self, x, y, button, mods):
         if button != QtCore.Qt.LeftButton or self._start is None:
@@ -478,6 +801,7 @@ class RectTool(Tool):
         x1, y1 = self.page.snap_point(x, y)
         self._start = None
         self.vp.set_preview(None, 0.0)
+        self.vp.set_fill("tool", [], LAYER_COLOUR["tall"])
         if abs(x1 - x0) < 1e-6 or abs(y1 - y0) < 1e-6 or self.state.doc is None:
             return
         layer = self._layer
@@ -487,13 +811,14 @@ class RectTool(Tool):
         if key == QtCore.Qt.Key_Escape and self._start is not None:
             self._start = None
             self.vp.set_preview(None, 0.0)
+            self.vp.set_fill("tool", [], LAYER_COLOUR["tall"])
             return True
         return False
 
 
 class PlaceTool(Tool):
     name = "place"
-    cursor_kind = "place"
+    hint = TOOL_HINTS["place"]
 
     def __init__(self, page):
         super().__init__(page)
@@ -504,6 +829,7 @@ class PlaceTool(Tool):
         poly = self.page.library_footprint(px, py, self.yaw)
         self.vp.set_cursor("place", px, py, 0.25, self.yaw)
         self.vp.set_hover(poly)
+        self.vp.set_fill("tool", [("poly", poly)] if poly is not None and len(poly) >= 3 else [], C["accent"])
 
     def press(self, x, y, button, mods, hit):
         if button != QtCore.Qt.LeftButton:
@@ -773,26 +1099,38 @@ class EnvEditorPage(QtWidgets.QWidget):
         # -- centre: toolbar + viewport + status
         centre = QtWidgets.QVBoxLayout()
         centre.setSpacing(SP[0])
-        bar = QtWidgets.QHBoxLayout()
-        bar.setSpacing(SP[1])
+        tools_row = QtWidgets.QHBoxLayout()
+        tools_row.setSpacing(SP[1])
         self.tool_buttons = SegmentedButtons([(k, t, tip) for k, t, tip, _sc in TOOLS])
         self.tool_buttons.selected.connect(self.set_tool)
-        bar.addWidget(self.tool_buttons)
-        bar.addSpacing(SP[2])
+        tools_row.addWidget(self.tool_buttons)
+        tools_row.addStretch(1)
+        centre.addLayout(tools_row)
+        bar = QtWidgets.QHBoxLayout()
+        bar.setSpacing(SP[1])
         self.spin_brush = QtWidgets.QDoubleSpinBox()
         self.spin_brush.setRange(0.05, 3.0)
         self.spin_brush.setSingleStep(0.05)
         self.spin_brush.setValue(0.25)
         self.spin_brush.setSuffix(" m")
-        self.spin_brush.setToolTip("브러시 반지름 · 선 두께의 절반  (Ctrl+휠)")
-        bar.addWidget(label("브러시", "field"))
+        self.spin_brush.setToolTip("벽 브러시·지우개 반지름, 벽 경로 두께의 절반 (Ctrl+휠). 덕트는 항상 호스 지름(환경 설정의 덕트 높이) 굵기입니다.")
+        bar.addWidget(label("벽 브러시", "field"))
         bar.addWidget(self.spin_brush)
         self.chk_snap = QtWidgets.QCheckBox("격자 스냅")
         self.chk_snap.setChecked(True)
         self.chk_snap.setToolTip("점을 0.1 m 격자에 맞춥니다. Alt 를 누르고 드래그하면 무시")
         bar.addWidget(self.chk_snap)
-        self.chk_close = QtWidgets.QCheckBox("선 닫기")
-        self.chk_close.setToolTip("선 도구가 마지막 점을 첫 점과 잇습니다")
+        self.spin_lane = QtWidgets.QDoubleSpinBox()
+        self.spin_lane.setRange(0.6, 6.0)
+        self.spin_lane.setSingleStep(0.1)
+        self.spin_lane.setValue(1.6)
+        self.spin_lane.setSuffix(" m")
+        self.spin_lane.setToolTip("트랙 경로의 차선 폭 (호스 중심 사이 거리)")
+        bar.addWidget(label("차선 폭", "field"))
+        bar.addWidget(self.spin_lane)
+        self.chk_close = QtWidgets.QCheckBox("경로 닫기")
+        self.chk_close.setToolTip("경로 도구가 마지막 점을 첫 점과 잇습니다 (C)")
+        self.chk_close.toggled.connect(self._on_close_toggled)
         bar.addWidget(self.chk_close)
         bar.addStretch(1)
         self.btn_undo = QtWidgets.QPushButton("되돌리기")
@@ -813,6 +1151,9 @@ class EnvEditorPage(QtWidgets.QWidget):
         self.btn_top.toggled.connect(lambda on: self.viewport.set_top_view(on))
         bar.addWidget(self.btn_top)
         centre.addLayout(bar)
+        self.tool_hint = label("", "hint")
+        self.tool_hint.setWordWrap(True)
+        centre.addWidget(self.tool_hint)
 
         if viewport_factory is None:
             from .editor_viewport import EditorViewport
@@ -870,9 +1211,65 @@ class EnvEditorPage(QtWidgets.QWidget):
         lib.add(self.lib_note)
         rv.addWidget(lib)
 
-        insp = Card("선택한 장애물")
-        self.insp_none = label("장애물을 클릭하면 여기서 수치로 조정합니다.", "hint")
+        insp = Card("선택")
+        self.insp_none = label("장애물이나 경로를 클릭하면 여기서 수치로 조정합니다.", "hint")
         insp.add(self.insp_none)
+        # -- a path: width, hose band (track), closed, all-smooth / all-corner, direction, delete
+        self.path_form = QtWidgets.QWidget()
+        pv = QtWidgets.QVBoxLayout(self.path_form)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(SP[1])
+        self.path_name = label("", "body")
+        self.path_name.setObjectName("Mono")
+        pv.addWidget(self.path_name)
+        pg = QtWidgets.QGridLayout()
+        pg.setHorizontalSpacing(SP[1])
+        self.spin_path_width = QtWidgets.QDoubleSpinBox()
+        self.spin_path_width.setRange(0.05, 8.0)
+        self.spin_path_width.setSingleStep(0.05)
+        self.spin_path_width.setDecimals(2)
+        self.spin_path_width.setSuffix(" m")
+        self.row_path_width = FieldRow("폭", self.spin_path_width)
+        pg.addWidget(self.row_path_width, 0, 0)
+        self.spin_path_band = QtWidgets.QDoubleSpinBox()
+        self.spin_path_band.setRange(0.05, 1.5)
+        self.spin_path_band.setSingleStep(0.01)
+        self.spin_path_band.setDecimals(2)
+        self.spin_path_band.setSuffix(" m")
+        self.row_path_band = FieldRow("호스 굵기", self.spin_path_band)
+        pg.addWidget(self.row_path_band, 0, 1)
+        pv.addLayout(pg)
+        self.chk_path_closed = QtWidgets.QCheckBox("닫힌 경로 (C)")
+        pv.addWidget(self.chk_path_closed)
+        self.path_stats = label("", "hint")
+        pv.addWidget(self.path_stats)
+        pr = QtWidgets.QHBoxLayout()
+        self.btn_all_smooth = QtWidgets.QPushButton("모두 곡선")
+        self.btn_all_smooth.setObjectName("GhostButton")
+        self.btn_all_smooth.clicked.connect(lambda: self.set_path_all_smooth(True))
+        pr.addWidget(self.btn_all_smooth)
+        self.btn_all_corner = QtWidgets.QPushButton("모두 직선")
+        self.btn_all_corner.setObjectName("GhostButton")
+        self.btn_all_corner.clicked.connect(lambda: self.set_path_all_smooth(False))
+        pr.addWidget(self.btn_all_corner)
+        pv.addLayout(pr)
+        pr = QtWidgets.QHBoxLayout()
+        self.btn_reverse = QtWidgets.QPushButton("방향 뒤집기")
+        self.btn_reverse.setObjectName("GhostButton")
+        self.btn_reverse.setToolTip("트랙 경로의 주행 방향 (센터라인은 항상 반시계 방향으로 저장됩니다)")
+        self.btn_reverse.clicked.connect(self.reverse_path)
+        pr.addWidget(self.btn_reverse)
+        self.btn_del_path = QtWidgets.QPushButton("삭제")
+        self.btn_del_path.setObjectName("DangerButton")
+        self.btn_del_path.clicked.connect(self.delete_selection)
+        pr.addWidget(self.btn_del_path)
+        pv.addLayout(pr)
+        pv.addWidget(label("꼭짓점: 드래그 이동 · 더블클릭/Tab 직선↔곡선 · Alt+클릭 선 위에 추가 · Delete 삭제", "hint"))
+        self.path_form.setVisible(False)
+        insp.add(self.path_form)
+        self.spin_path_width.valueChanged.connect(self._on_path_edit)
+        self.spin_path_band.valueChanged.connect(self._on_path_edit)
+        self.chk_path_closed.toggled.connect(self._on_path_edit)
         self.insp_form = QtWidgets.QWidget()
         fv = QtWidgets.QVBoxLayout(self.insp_form)
         fv.setContentsMargins(0, 0, 0, 0)
@@ -968,6 +1365,18 @@ class EnvEditorPage(QtWidgets.QWidget):
         self.btn_border.setObjectName("GhostButton")
         self.btn_border.clicked.connect(self.add_border)
         sr.addWidget(self.btn_border)
+        vr = QtWidgets.QHBoxLayout()
+        self.btn_vec_duct = QtWidgets.QPushButton("칠한 덕트 → 경로")
+        self.btn_vec_duct.setToolTip("브러시로 칠했거나 가져온 맵에서 온 덕트 셀을 꼭짓점이 있는 경로로 바꿉니다. "
+                                     "그 뒤로는 선택 도구로 잡아 고칠 수 있습니다.")
+        self.btn_vec_duct.clicked.connect(lambda: self.vectorize("duct"))
+        vr.addWidget(self.btn_vec_duct)
+        self.btn_vec_tall = QtWidgets.QPushButton("칠한 벽 → 경로")
+        self.btn_vec_tall.setToolTip("벽 셀을 중심선 경로로 바꿉니다 (두께는 원래 벽의 중간값). 넓은 방 윤곽 같은 큰 면은 "
+                                     "경로보다 칠한 채로 두는 편이 낫습니다.")
+        self.btn_vec_tall.clicked.connect(lambda: self.vectorize("tall"))
+        vr.addWidget(self.btn_vec_tall)
+        settings.add(vr)
         self.btn_clear_cl = QtWidgets.QPushButton("센터라인 지우기")
         self.btn_clear_cl.setObjectName("GhostButton")
         self.btn_clear_cl.setToolTip("트랙 모양을 크게 바꿨으면 지우고 검증으로 다시 뽑으세요")
@@ -1036,10 +1445,11 @@ class EnvEditorPage(QtWidgets.QWidget):
             "brush_duct": BrushTool(self, "brush_duct", "duct", True),
             "brush_tall": BrushTool(self, "brush_tall", "tall", True),
             "erase": BrushTool(self, "erase", "free", False),
-            "line_duct": PolylineTool(self, "line_duct", "duct"),
-            "line_tall": PolylineTool(self, "line_tall", "tall"),
+            "path_track": PathTool(self, "path_track", "track"),
+            "path_duct": PathTool(self, "path_duct", "duct"),
+            "path_tall": PathTool(self, "path_tall", "tall"),
             "rect": RectTool(self),
-            "polygon": PolylineTool(self, "polygon", "tall", fill=True),
+            "polygon": PolygonTool(self),
             "place": PlaceTool(self),
         }
 
@@ -1053,13 +1463,71 @@ class EnvEditorPage(QtWidgets.QWidget):
         self.tool_buttons.set_current(key)
         self.viewport.set_hover(None)
         self.viewport.set_cursor("none", 0, 0)
+        self.tool_hint.setText(self._tool.hint)
+        if isinstance(self._tool, PathTool):
+            self.chk_close.blockSignals(True)
+            self.chk_close.setChecked(self._tool.closed)
+            self.chk_close.blockSignals(False)
         self.viewport.update()
         self._update_corner()
+
+    def _on_close_toggled(self, on: bool):
+        if isinstance(self._tool, PathTool):
+            self._tool.closed = bool(on)
+            self._tool._preview()
+
+    def lane_width(self) -> float:
+        return float(self.spin_lane.value())
+
+    # -- live feedback while a stroke or a vertex drag is in progress
+    LIVE_MS = 180
+
+    def begin_live_grid(self):
+        """While the button is down: rebuild the real geometry on a fixed cadence so the hoses and
+        walls grow behind the brush, in addition to the instant decal the tool draws."""
+        if not hasattr(self, "_live_timer"):
+            self._live_timer = QtCore.QTimer(self)
+            self._live_timer.setInterval(self.LIVE_MS)
+            self._live_timer.timeout.connect(self._live_tick)
+        self._live_dirty = False
+        self._live_timer.start()
+
+    def _live_tick(self):
+        if getattr(self, "_live_path", None) is not None and self.state.doc is not None:
+            self.state.doc.path_changed()
+            self._live_path = None
+        self._rebuild_full()
+
+    def end_live_grid(self):
+        t = getattr(self, "_live_timer", None)
+        if t is not None:
+            t.stop()
+        self._live_path = None
+        self._rebuild_full()
+
+    def path_edited_live(self, q):
+        """A path's points changed under the mouse: instant decal now, raster on the next tick."""
+        self._live_path = q
+        self.refresh_overlays(live_path=q)
+
+    def set_hover_vertex(self, hv):
+        if getattr(self, "_hover_vertex", None) != hv:
+            self._hover_vertex = hv
+            self.refresh_overlays()
+
+    def set_path_handles(self, items):
+        """Handles a path tool shows while drawing (the selection's handles are drawn by
+        `refresh_overlays`; the two never show at once because drawing clears the selection)."""
+        self.viewport.set_handles(items)
 
     def current_tool(self) -> str:
         return self._tool.name if self._tool else ""
 
-    def brush_radius(self) -> float:
+    def brush_radius(self, layer: Optional[str] = None) -> float:
+        """The wall / eraser brush is the spin box; the duct brush is always half the hose
+        diameter -- a duct is a hose, and a wider band would draw (and scan) as two of them."""
+        if layer == "duct" and self.state.doc is not None:
+            return 0.5 * float(self.state.doc.duct_height)
         return float(self.spin_brush.value())
 
     def line_width(self) -> float:
@@ -1351,7 +1819,9 @@ class EnvEditorPage(QtWidgets.QWidget):
             if not self.save():
                 return
         name = self.state.doc.dir
-        self._run_job(["validate", name, "--centerline", "auto"], "검증 중… (센터라인 추출, 몇 초)",
+        # A track path *is* the centerline: keep it. Otherwise extract one from the free space.
+        mode = "keep" if self.state.doc.track_path is not None else "auto"
+        self._run_job(["validate", name, "--centerline", mode], "검증 중… (센터라인 확인, 몇 초)",
                       lambda code, out, err: self._validated(code, out, err, then))
 
     def _validated(self, code, out, err, then):
@@ -1475,13 +1945,15 @@ class EnvEditorPage(QtWidgets.QWidget):
     def footprint_of(self, pid: str) -> Optional[np.ndarray]:
         return self._footprints.get(pid)
 
-    def refresh_overlays(self):
+    def refresh_overlays(self, live_path=None):
         doc = self.state.doc
         self._footprints = {}
         if doc is None:
             self.viewport.set_pickables([])
             self.viewport.set_selection([])
             self.viewport.set_gizmo(0, 0, 0, on=False)
+            self.viewport.set_handles([])
+            self.viewport.set_lines("path", [])
             return
         try:
             items = doc.prop_footprints()
@@ -1502,7 +1974,51 @@ class EnvEditorPage(QtWidgets.QWidget):
             self.viewport.set_gizmo(p.x, p.y, p.yaw, radius=r, on=True)
         else:
             self.viewport.set_gizmo(0, 0, 0, on=False)
+        self._draw_path_selection(live_path)
         self.viewport.update()
+
+    def _draw_path_selection(self, live_path=None):
+        """Handles and the centre line of the selected path; a live decal while it is dragged."""
+        from f1sim.scene import offset_polyline
+        doc = self.state.doc
+        pid, vi = self.state.path_sel
+        q = doc.get_path(pid) if pid is not None else None
+        hv = getattr(self, "_hover_vertex", None)
+        if q is None:
+            if not isinstance(self._tool, PathTool):
+                self.viewport.set_handles([])
+            self.viewport.set_lines("path", [])
+            if live_path is None:
+                self.viewport.set_fill("pathsel", [], C["accent"])
+            return
+        handles = []
+        for i, (x, y, sm) in enumerate(q.points):
+            state = "selected" if i == vi else ("hover" if hv == (pid, i) else "normal")
+            handles.append((x, y, "smooth" if sm else "corner", state))
+        self.viewport.set_handles(handles)
+        pl = q.polyline()
+        colour = _rgba(C["accent"], 0.9)
+        lines = [(pl, colour, 1.5, q.closed)]
+        if q.kind == "track":
+            half = 0.5 * q.width
+            faint = _rgba(C["ego"], 0.5)
+            lines.append((offset_polyline(pl, +half, q.closed), faint, 1.0, q.closed))
+            lines.append((offset_polyline(pl, -half, q.closed), faint, 1.0, q.closed))
+        # the control polygon, so a curve's vertices read as its handles
+        ctrl = np.asarray([(x, y) for x, y, _ in q.points], np.float64)
+        lines.append((ctrl, _rgba(C["text.2"], 0.6), 1.0, q.closed))
+        self.viewport.set_lines("path", lines)
+        if live_path is not None:
+            band = q.band if q.band is not None else float(doc.duct_height)
+            if q.kind == "track":
+                half = 0.5 * q.width
+                shapes = [("band", offset_polyline(pl, +half, q.closed), band, q.closed),
+                          ("band", offset_polyline(pl, -half, q.closed), band, q.closed)]
+            else:
+                shapes = [("band", pl, q.width, q.closed)]
+            self.viewport.set_fill("pathsel", shapes, LAYER_COLOUR[q.kind])
+        else:
+            self.viewport.set_fill("pathsel", [], C["accent"])
 
     def library_item(self) -> Optional[tuple]:
         it = self.lib_list.currentItem()
@@ -1549,11 +2065,96 @@ class EnvEditorPage(QtWidgets.QWidget):
             pass                                   # picking in the library does not change the tool
 
     # ---------------------------------------------------------------- selection edits
+    def toggle_vertex_smooth(self):
+        doc = self.state.doc
+        pid, vi = self.state.path_sel
+        q = doc.get_path(pid) if (doc is not None and pid is not None) else None
+        if q is None or vi is None:
+            return
+
+        def do():
+            x, y, sm = q.points[vi]
+            q.points[vi] = (x, y, not sm)
+            doc.path_changed()
+            return True
+        self.state.commit("직선↔곡선", do, "grid")
+
+    def toggle_path_closed(self):
+        doc = self.state.doc
+        q = self.state.selected_path()
+        if q is None:
+            return
+
+        def do():
+            q.closed = not q.closed
+            doc.path_changed()
+            return True
+        self.state.commit("경로 닫기/열기", do, "grid")
+
+    def set_path_all_smooth(self, smooth: bool):
+        doc = self.state.doc
+        q = self.state.selected_path()
+        if q is None:
+            return
+
+        def do():
+            q.points = [(x, y, bool(smooth)) for x, y, _ in q.points]
+            doc.path_changed()
+            return True
+        self.state.commit("모두 곡선" if smooth else "모두 직선", do, "grid")
+
+    def reverse_path(self):
+        doc = self.state.doc
+        q = self.state.selected_path()
+        if q is None:
+            return
+
+        def do():
+            q.points = list(reversed(q.points))
+            doc.path_changed()
+            return True
+        self.state.commit("경로 방향 뒤집기", do, "grid")
+
+    def nudge_selection(self, dx: float, dy: float):
+        doc = self.state.doc
+        if doc is None:
+            return
+        pid, vi = self.state.path_sel
+        props = self.state.selected_props()
+        if props:
+            def do():
+                for p in props:
+                    p.x, p.y = float(p.x + dx), float(p.y + dy)
+                return True
+            self.state.commit("미세 이동", do, "props")
+        elif pid is not None:
+            q = doc.get_path(pid)
+
+            def do():
+                if vi is not None:
+                    x, y, sm = q.points[vi]
+                    q.points[vi] = (x + dx, y + dy, sm)
+                else:
+                    q.points = [(x + dx, y + dy, sm) for x, y, sm in q.points]
+                doc.path_changed()
+                return True
+            self.state.commit("미세 이동", do, "grid")
+
     def delete_selection(self):
+        doc = self.state.doc
+        pid, vi = self.state.path_sel
+        if pid is not None and doc is not None:
+            if vi is not None:
+                self.state.commit("꼭짓점 삭제", lambda: doc.remove_path_vertex(pid, vi), "grid")
+                q = doc.get_path(pid)
+                self.state.select_path(pid if q is not None else None, None)
+            else:
+                self.state.commit("경로 삭제", lambda: (doc.remove_path(pid), True)[1], "grid")
+                self.state.select_path(None, None)
+            return
         ids = list(self.state.selection)
         if not ids or self.state.doc is None:
             return
-        doc = self.state.doc
 
         def do():
             for i in ids:
@@ -1606,9 +2207,13 @@ class EnvEditorPage(QtWidgets.QWidget):
     # ---------------------------------------------------------------- inspector
     def _sync_inspector(self):
         props = self.state.selected_props()
+        q = self.state.selected_path()
         one = len(props) == 1
         self.insp_form.setVisible(bool(props))
-        self.insp_none.setVisible(not props)
+        self.path_form.setVisible(q is not None)
+        self.insp_none.setVisible(not props and q is None)
+        if q is not None:
+            self._sync_path_form(q)
         if not props:
             return
         p = props[0]
@@ -1628,6 +2233,45 @@ class EnvEditorPage(QtWidgets.QWidget):
             self._rebuild_dim_spins(p if one else None)
         finally:
             self._insp_updating = False
+
+    def _sync_path_form(self, q):
+        self._insp_updating = True
+        try:
+            kind = {"duct": "덕트 경로", "tall": "벽 경로", "track": "트랙 경로"}[q.kind]
+            pid, vi = self.state.path_sel
+            self.path_name.setText(f"{q.id} · {kind}" + (f" · 꼭짓점 {vi + 1}/{len(q.points)}" if vi is not None else ""))
+            self.row_path_width.label.setText("차선 폭" if q.kind == "track" else "폭")
+            self.spin_path_width.setValue(float(q.width) if q.kind != "duct" else float(self.state.doc.duct_height))
+            self.spin_path_width.setEnabled(q.kind != "duct")
+            self.row_path_width.set_hint("덕트 굵기 = 호스 지름 (환경 설정의 덕트 높이)" if q.kind == "duct" else "")
+            self.row_path_band.setVisible(q.kind == "track")
+            self.spin_path_band.setValue(float(q.band if q.band is not None else self.state.doc.duct_height))
+            self.chk_path_closed.setChecked(bool(q.closed))
+            n_sm = sum(1 for p in q.points if p[2])
+            self.path_stats.setText(f"꼭짓점 {len(q.points)}개 (곡선 {n_sm}) · 길이 {q.length():.1f} m")
+            self.btn_reverse.setVisible(q.kind == "track")
+        finally:
+            self._insp_updating = False
+
+    def _on_path_edit(self, _v=None):
+        if self._insp_updating:
+            return
+        doc = self.state.doc
+        q = self.state.selected_path()
+        if q is None or doc is None:
+            return
+        width = float(self.spin_path_width.value())
+        band = float(self.spin_path_band.value())
+        closed = bool(self.chk_path_closed.isChecked())
+
+        def do():
+            q.width = width
+            if q.kind == "track":
+                q.band = band
+            q.closed = closed
+            doc.path_changed()
+            return True
+        self.state.commit("경로 설정", do, "grid")
 
     def _rebuild_dim_spins(self, p):
         while self.dims_layout.count():
@@ -1760,6 +2404,29 @@ class EnvEditorPage(QtWidgets.QWidget):
             return
         self.state.commit("가장자리 벽", lambda: doc.paint_border("tall", 0.15), "grid")
 
+    def vectorize(self, layer: str):
+        """Painted cells of a layer become editable paths (see `SceneDoc.vectorize_layer`)."""
+        doc = self.state.doc
+        if doc is None:
+            return
+        made: List[str] = []
+
+        def do():
+            paths = doc.vectorize_layer(layer)
+            made.extend(q.id for q in paths)
+            return bool(paths)
+        try:
+            self.state.commit("덕트 → 경로" if layer == "duct" else "벽 → 경로", do, "grid")
+        except Exception as exc:
+            self._set_status(f"경로 변환 실패: {exc}", danger=True)
+            return
+        if made:
+            self.state.select_path(made[0], None)
+            self.set_tool("select")
+            self._set_status(f"{'덕트' if layer == 'duct' else '벽'} 경로 {len(made)}개를 만들었습니다. 선택 도구로 꼭짓점을 잡아 고치세요.")
+        else:
+            self._set_status("변환할 칠한 셀이 없습니다 (경로로 만든 것은 이미 경로입니다).")
+
     def clear_centerline(self):
         doc = self.state.doc
         if doc is None or doc.centerline is None:
@@ -1860,7 +2527,7 @@ class EnvEditorPage(QtWidgets.QWidget):
     def _update_buttons(self):
         has = self.state.doc is not None
         for b in (self.btn_save, self.btn_save_as, self.btn_validate, self.btn_drive, self.btn_import_asset,
-                  self.btn_fit, self.btn_border, self.btn_clear_cl):
+                  self.btn_fit, self.btn_border, self.btn_clear_cl, self.btn_vec_duct, self.btn_vec_tall):
             b.setEnabled(has)
         self.btn_undo.setEnabled(self.state.can_undo())
         self.btn_undo.setToolTip(f"되돌리기: {self.state.undo_label()}  (Ctrl+Z)" if self.state.can_undo() else "되돌릴 것이 없습니다")

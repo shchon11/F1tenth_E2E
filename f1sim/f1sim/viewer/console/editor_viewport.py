@@ -77,6 +77,66 @@ def point_in_polygon(x: float, y: float, poly: np.ndarray) -> bool:
     return bool(np.count_nonzero(crosses & (x < xi)) % 2 == 1)
 
 
+def _disc_tris(x: float, y: float, r: float, n: int = 16) -> np.ndarray:
+    a = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+    rim = np.stack([x + r * np.cos(a), y + r * np.sin(a)], 1)
+    c = np.array([x, y])
+    return np.stack([np.tile(c, (n, 1)), rim, np.roll(rim, -1, 0)], 1)
+
+
+def _fill_triangles(shapes) -> np.ndarray:
+    """(M,3,2) triangles for a list of decal shapes; see `EditorViewport.set_fill`."""
+    out = []
+    for sh in shapes:
+        kind = sh[0]
+        if kind == "disc":
+            _, x, y, r = sh
+            if r > 0:
+                out.append(_disc_tris(float(x), float(y), float(r)))
+        elif kind == "band":
+            _, pts, width, closed = sh
+            P = np.asarray(pts, np.float64).reshape(-1, 2)
+            h = 0.5 * float(width)
+            if len(P) == 1:
+                out.append(_disc_tris(P[0, 0], P[0, 1], h))
+                continue
+            if len(P) < 2 or h <= 0:
+                continue
+            A = P[:-1]
+            B = P[1:]
+            if closed and len(P) >= 3:
+                A = np.vstack([A, P[-1:]])
+                B = np.vstack([B, P[:1]])
+            d = B - A
+            L = np.linalg.norm(d, axis=1, keepdims=True) + 1e-12
+            n = np.stack([-d[:, 1], d[:, 0]], 1) / L * h
+            q0, q1, q2, q3 = A - n, A + n, B + n, B - n
+            out.append(np.stack([q0, q1, q2], 1))
+            out.append(np.stack([q0, q2, q3], 1))
+            joints = P if (closed and len(P) >= 3) else P[1:-1]
+            if len(joints):
+                # round joints: a coarse fan per vertex, only where a bend could leave a notch
+                for x, y in joints[:: max(1, len(joints) // 400)]:
+                    out.append(_disc_tris(float(x), float(y), h, 10))
+                out.append(_disc_tris(float(P[0, 0]), float(P[0, 1]), h, 10))
+                out.append(_disc_tris(float(P[-1, 0]), float(P[-1, 1]), h, 10))
+            elif not closed:
+                out.append(_disc_tris(float(P[0, 0]), float(P[0, 1]), h, 10))
+                out.append(_disc_tris(float(P[-1, 0]), float(P[-1, 1]), h, 10))
+        elif kind == "poly":
+            P = np.asarray(sh[1], np.float64).reshape(-1, 2)
+            if len(P) < 3:
+                continue
+            try:
+                import mapbox_earcut as earcut
+                idx = earcut.triangulate_float32(P.astype(np.float32), np.array([len(P)], np.uint32))
+                out.append(P[np.asarray(idx, np.int64).reshape(-1, 3)])
+            except Exception:
+                c = P.mean(0)
+                out.append(np.stack([np.tile(c, (len(P), 1)), P, np.roll(P, -1, 0)], 1))
+    return np.concatenate(out, 0) if out else np.zeros((0, 3, 2), np.float64)
+
+
 class EditorViewport(ViewportWidget):
     """Draws a TrackGeometry with a free camera and turns mouse input into world-space events."""
 
@@ -130,6 +190,17 @@ class EditorViewport(ViewportWidget):
         self._ov_vao = None
         self._ov_ranges: List[Tuple[float, int, int]] = []     # (line width, first, count)
         self._ov_capacity = 0
+        # ---- filled overlays (ground decals: stroke preview, path bands, handle bodies). Drawn
+        # as triangles WITH depth write at OVERLAY_Z so overlapping pieces of one decal do not
+        # blend twice, and the hoses standing on the decal still cover it.
+        self._fills: Dict[str, Tuple[np.ndarray, Tuple[float, float, float, float]]] = {}
+        self._fill_dirty = True
+        self._fill_vbo = None
+        self._fill_vao = None
+        self._fill_capacity = 0
+        self._fill_count = 0
+        self._ov.setdefault("handles", [])
+        self._ov.setdefault("marquee", [])
 
         # ---- layers
         self._hidden: set = set()
@@ -142,7 +213,7 @@ class EditorViewport(ViewportWidget):
         self._car_loaded = False
 
     def _release_overlay_gl(self):
-        for attr in ("_ov_vao", "_ov_vbo"):
+        for attr in ("_ov_vao", "_ov_vbo", "_fill_vao", "_fill_vbo"):
             obj = getattr(self, attr, None)
             if obj is not None:
                 try:
@@ -152,6 +223,8 @@ class EditorViewport(ViewportWidget):
             setattr(self, attr, None)
         self._ov_capacity = 0
         self._ov_dirty = True
+        self._fill_capacity = 0
+        self._fill_dirty = True
 
     def _on_context_destroyed(self):
         self._release_overlay_gl()
@@ -367,11 +440,13 @@ class EditorViewport(ViewportWidget):
         self._ov_dirty = True
         self.update()
 
-    def set_cursor(self, kind: str, x: float, y: float, radius: float = 0.0, yaw: float = 0.0):
+    def set_cursor(self, kind: str, x: float, y: float, radius: float = 0.0, yaw: float = 0.0,
+                   colour: Optional[str] = None):
         """kind in {"none", "brush", "cross", "place"}. brush = ring of `radius`; place = ring +
-        heading tick; cross = a small cross sized by the camera distance."""
+        heading tick; cross = a small cross sized by the camera distance. `colour` (theme hex)
+        tints the ring -- the brush shows the layer it paints."""
         items: List[tuple] = []
-        col = _rgba(C["text.0"], 0.9)
+        col = _rgba(colour or C["text.0"], 0.9)
         x, y, radius = float(x), float(y), float(radius)
         if kind == "cross" or (kind == "brush" and radius <= 0.0):
             items.append(("cross", x, y, col, 1.5))
@@ -401,12 +476,12 @@ class EditorViewport(ViewportWidget):
             items.append((np.asarray(poly, np.float64).reshape(-1, 2), _rgba(C["text.1"], 0.9), 1.0, True))
         self._set_overlay("hover", items)
 
-    def set_preview(self, pts, width: float, closed: bool = False):
+    def set_preview(self, pts, width: float, closed: bool = False, colour: Optional[str] = None):
         """In-progress polyline/polygon tool: centre line plus the two edges of the stroke band."""
         items: List[tuple] = []
         P = np.asarray(pts, np.float64).reshape(-1, 2) if pts is not None else np.zeros((0, 2))
-        col = _rgba(C["warn"], 0.95)
-        edge = _rgba(C["warn"], 0.55)
+        col = _rgba(colour or C["warn"], 0.95)
+        edge = _rgba(colour or C["warn"], 0.55)
         half = 0.5 * float(width)
         if len(P) == 1:
             a = np.linspace(0.0, 2 * math.pi, 32, endpoint=False)
@@ -424,6 +499,105 @@ class EditorViewport(ViewportWidget):
                 items.append((P + n, edge, 1.0, bool(closed)))
                 items.append((P - n, edge, 1.0, bool(closed)))
         self._set_overlay("preview", items)
+
+    # ---------------------------------------------------------------- fills + handles
+    def handle_radius(self) -> float:
+        """World radius of a vertex handle: constant on screen, so it neither vanishes at map
+        zoom nor swallows the path up close."""
+        return max(0.03, 0.011 * float(self.dist))
+
+    def set_fill(self, name: str, shapes, colour):
+        """A translucent ground decal. `shapes` is a list of
+        `("disc", x, y, r)`, `("band", pts (N,2), width, closed)` or `("poly", pts (K,2))`;
+        `colour` a theme hex or an RGBA tuple. Empty `shapes` clears the decal."""
+        tris = _fill_triangles(shapes or [])
+        rgba = tuple(colour) if not isinstance(colour, str) else _rgba(colour, 0.45)
+        if len(tris) == 0:
+            self._fills.pop(name, None)
+        else:
+            self._fills[name] = (tris, rgba)
+        self._fill_dirty = True
+        self.update()
+
+    def set_handles(self, items):
+        """Vertex handles: `[(x, y, kind, state), ...]`, kind `corner` (square) or `smooth`
+        (circle), state `normal` / `selected` / `hover`. Outline in the line overlay, a body in
+        the fill overlay so the handle reads over any ground."""
+        r = self.handle_radius()
+        lines: List[tuple] = []
+        shapes: List[tuple] = []
+        body_rgba = _rgba(C["bg.panel"], 0.85)
+        for x, y, kind, state in (items or ()):
+            x, y = float(x), float(y)
+            col = {"selected": _rgba(C["accent"], 1.0), "hover": _rgba(C["text.0"], 1.0)}.get(
+                state, _rgba(C["text.1"], 0.95))
+            if kind == "smooth":
+                a = np.linspace(0.0, 2 * math.pi, 20, endpoint=False)
+                ring = np.stack([x + r * np.cos(a), y + r * np.sin(a)], 1)
+                lines.append((ring, col, 2.0 if state == "selected" else 1.5, True))
+                shapes.append(("disc", x, y, r * 0.8))
+            else:
+                sq = np.array([[x - r, y - r], [x + r, y - r], [x + r, y + r], [x - r, y + r]])
+                lines.append((sq, col, 2.0 if state == "selected" else 1.5, True))
+                shapes.append(("poly", sq * 0.8 + np.array([x, y]) * 0.2))
+        self._set_overlay("handles", lines)
+        self._fills.pop("handles", None)
+        if shapes:
+            self._fills["handles"] = (_fill_triangles(shapes), body_rgba)
+        self._fill_dirty = True
+        self.update()
+
+    def set_lines(self, name: str, items):
+        """A named group of ground polylines: `[(pts (N,2), rgba, width_px, closed), ...]`."""
+        self._set_overlay(name, [(np.asarray(P, np.float64).reshape(-1, 2), tuple(col), float(w), bool(c))
+                                 for P, col, w, c in (items or ()) if len(P) >= 2])
+
+    def set_marquee(self, rect):
+        """Rubber-band rectangle `(x0, y0, x1, y1)` on the ground, or None."""
+        items: List[tuple] = []
+        if rect is not None:
+            x0, y0, x1, y1 = [float(v) for v in rect]
+            items.append((np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]), _rgba(C["accent"], 0.9), 1.0, True))
+        self._set_overlay("marquee", items)
+
+    def _draw_fills(self, vp):
+        import moderngl
+        sc, ctx = self.scene, self.scene.ctx
+        if self._fill_dirty:
+            self._fill_dirty = False
+            blocks = []
+            for tris, rgba in self._fills.values():
+                n = len(tris) * 3
+                data = np.empty((n, 7), np.float32)
+                data[:, :2] = tris.reshape(-1, 2)
+                data[:, 2] = OVERLAY_Z
+                data[:, 3:] = np.asarray(rgba, np.float32)
+                blocks.append(data)
+            data = np.vstack(blocks) if blocks else np.zeros((0, 7), np.float32)
+            self._fill_count = len(data)
+            if len(data):
+                nbytes = int(data.nbytes)
+                if self._fill_vbo is None or self._fill_capacity < nbytes:
+                    for attr in ("_fill_vao", "_fill_vbo"):
+                        obj = getattr(self, attr)
+                        if obj is not None:
+                            try:
+                                obj.release()
+                            except Exception:
+                                pass
+                        setattr(self, attr, None)
+                    self._fill_capacity = max(nbytes, 512 * 7 * 4)
+                    self._fill_vbo = ctx.buffer(reserve=self._fill_capacity, dynamic=True)
+                    self._fill_vao = ctx.vertex_array(sc.line_prog, [(self._fill_vbo, "3f 4f", "in_pos", "in_col")])
+                self._fill_vbo.write(np.ascontiguousarray(data).tobytes())
+        if not self._fill_count or self._fill_vao is None:
+            return
+        ctx.enable(moderngl.DEPTH_TEST)
+        ctx.enable(moderngl.BLEND)
+        ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        sc.line_prog["u_vp"].write(G._u(vp))
+        self._fill_vao.render(moderngl.TRIANGLES, vertices=self._fill_count)
+        ctx.disable(moderngl.BLEND)
 
     def set_gizmo(self, x: float, y: float, yaw: float, radius: float = 0.4, on: bool = True):
         """Move handle (cross) and rotation ring with a heading tick, at the selection."""
@@ -551,7 +725,9 @@ class EditorViewport(ViewportWidget):
         self._cpu_ms.append((t_gl - self._t_paint_start) * 1e3)
         self.last_static_drawn = sc.draw_static(view, proj, eye, light_center=np.array([target[0], target[1], 0.0]),
                                                 hidden=self._hidden)
-        self._draw_overlays(np.asarray(proj, np.float64) @ np.asarray(view, np.float64))
+        vp = np.asarray(proj, np.float64) @ np.asarray(view, np.float64)
+        self._draw_fills(vp)
+        self._draw_overlays(vp)
         self._gl_ms.append((time.perf_counter() - t_gl) * 1e3)
         for buf in (self._cpu_ms, self._gl_ms):
             if len(buf) > 240:
@@ -659,6 +835,10 @@ class EditorViewport(ViewportWidget):
     def leaveEvent(self, ev):
         super().leaveEvent(ev)
         self.left_widget.emit()
+
+    def focusNextPrevChild(self, next_child: bool) -> bool:
+        """Tab is an editing key here (corner <-> smooth), not focus navigation."""
+        return False
 
     def keyPressEvent(self, ev):
         key = ev.key()

@@ -21,6 +21,8 @@ from PyQt5 import QtCore, QtWidgets                                             
 
 LEFT = int(QtCore.Qt.LeftButton)
 NOMOD = int(QtCore.Qt.NoModifier)
+from f1sim.viewer.console.theme import C as _C                                  # noqa: E402
+C_WARN = _C["warn"]
 
 
 @pytest.fixture(scope="module")
@@ -71,6 +73,10 @@ class FakeViewport(QtWidgets.QWidget):
         self.visibility = {}
         self.corner = ""
         self.framed = 0
+        self.fills = {}
+        self.handles = []
+        self.lines = {}
+        self.marquee = None
 
     def set_geometry(self, g):
         self.geometry = g
@@ -91,14 +97,29 @@ class FakeViewport(QtWidgets.QWidget):
     def set_hover(self, poly):
         self.hover = poly
 
-    def set_cursor(self, kind, x, y, radius=0.0, yaw=0.0):
+    def set_cursor(self, kind, x, y, radius=0.0, yaw=0.0, colour=None):
         self.cursor = (kind, x, y, radius, yaw)
 
-    def set_preview(self, pts, width, closed=False):
+    def set_preview(self, pts, width, closed=False, colour=None):
         self.preview = None if pts is None else (np.asarray(pts), width, closed)
 
     def set_gizmo(self, x, y, yaw, radius=0.4, on=True):
         self.gizmo = (x, y, yaw, radius) if on else None
+
+    def set_fill(self, name, shapes, colour):
+        self.fills[name] = (list(shapes or []), colour)
+
+    def set_handles(self, items):
+        self.handles = list(items or [])
+
+    def set_lines(self, name, items):
+        self.lines[name] = list(items or [])
+
+    def set_marquee(self, rect):
+        self.marquee = rect
+
+    def handle_radius(self):
+        return 0.08
 
     def set_layer_visibility(self, **kw):
         self.visibility = kw
@@ -245,19 +266,104 @@ def test_rect_and_polygon_tools_fill_tall(page):
     assert not doc.tall[doc.world_to_cell(6.0, 3.8)]
 
 
-def test_polyline_tool_paints_a_duct_band(page):
+def test_path_tool_makes_an_editable_duct_path(page):
     pg, vp = page
     doc = _new_scene(pg, vp)
-    pg.set_tool("line_duct")
-    pg.spin_brush.setValue(0.15)                          # 0.3 m wide line
+    pg.set_tool("path_duct")
+    assert "곡선" in pg.tool_hint.text()
+    pg.spin_brush.setValue(0.15)                          # 0.3 m wide band
+    pg.chk_snap.setChecked(False)
     for x, y in [(2.0, 5.0), (6.0, 5.0)]:
         vp.hover_at(x, y)
+        assert vp.cursor[0] == "cross"
         vp.press(x, y)
         vp.release(x, y)
+    # while drawing: the band decal and the vertex handles are shown
+    vp.hover_at(7.0, 6.0)
+    assert vp.fills["tool"][0] and vp.fills["tool"][0][0][0] == "band"
+    assert len(vp.handles) == 3 and vp.handles[-1][3] == "hover"
     pg._on_key(int(QtCore.Qt.Key_Return), NOMOD)
+    assert len(doc.paths) == 1 and doc.paths[0].kind == "duct" and len(doc.paths[0].points) == 2
     assert doc.duct[doc.world_to_cell(4.0, 5.0)]
     assert not doc.duct[doc.world_to_cell(4.0, 5.6)]
     assert not doc.tall[doc.world_to_cell(4.0, 5.0)]
+    assert not doc.painted_duct[doc.world_to_cell(4.0, 5.0)], "a path is vector, not paint"
+    assert pg.state.path_sel == (doc.paths[0].id, None)
+    assert pg.path_form.isVisibleTo(pg)
+    # the eraser cannot touch it; selecting + Delete removes it
+    pg.set_tool("erase")
+    vp.press(4.0, 5.0)
+    vp.release(4.0, 5.0)
+    assert doc.duct[doc.world_to_cell(4.0, 5.0)]
+    pg.set_tool("select")
+    vp.hover_at(4.0, 5.0)
+    vp.press(4.0, 5.0)
+    vp.release(4.0, 5.0)
+    assert pg.state.path_sel[0] == doc.paths[0].id
+    pg._on_key(int(QtCore.Qt.Key_Delete), NOMOD)
+    assert doc.paths == [] and not doc.duct[doc.world_to_cell(4.0, 5.0)]
+    pg.undo()
+    assert len(pg.state.doc.paths) == 1
+
+
+def test_track_path_with_a_curve_sets_the_centerline_and_two_hoses(page):
+    pg, vp = page
+    doc = _new_scene(pg, vp, w=14.0, h=10.0)
+    pg.set_tool("path_track")
+    pg.spin_lane.setValue(2.0)
+    pg.chk_snap.setChecked(False)
+    CTRL = int(QtCore.Qt.ControlModifier)
+    for (x, y), mods in [((3.0, 3.0), NOMOD), ((11.0, 3.0), NOMOD), ((11.0, 7.0), CTRL), ((3.0, 7.0), CTRL)]:
+        vp.press(x, y, mods=mods)
+        vp.release(x, y, mods=mods)
+    vp.double_clicked.emit(3.0, 7.0)
+    assert len(doc.paths) == 1
+    q = doc.paths[0]
+    assert q.kind == "track" and q.closed and [p[2] for p in q.points] == [False, False, True, True]
+    assert doc.centerline is not None and len(doc.centerline) > 100
+    # hoses 1 m either side of the straight bottom edge, nothing on the line itself
+    assert doc.duct[doc.world_to_cell(7.0, 2.0)] and doc.duct[doc.world_to_cell(7.0, 4.0)]
+    assert not doc.duct[doc.world_to_cell(7.0, 3.0)]
+    # the smooth top edge bulges: the curve passes outside the straight chord
+    top = doc.centerline[:, 1].max()
+    assert top > 7.05, top
+    # dragging a vertex re-rasterises (on the live tick) and moves the hoses with it
+    pg.set_tool("select")
+    assert pg.state.path_sel == (q.id, None), "the path just drawn stays selected"
+    vp.hover_at(11.0, 3.0)
+    vp.press(11.0, 3.0)
+    assert pg.state.path_sel == (q.id, 1)
+    vp.move(12.0, 3.0)
+    assert vp.fills["pathsel"][0], "a live decal is shown while dragging"
+    vp.release(12.0, 3.0)
+    assert q.points[1][:2] == (12.0, 3.0)
+    assert doc.duct[doc.world_to_cell(11.5, 2.0)]
+    assert pg.state.undo_label() == "꼭짓점 이동"
+    # Tab toggles the selected vertex's smoothness; Alt+click inserts one
+    pg._on_key(int(QtCore.Qt.Key_Tab), NOMOD)
+    assert q.points[1][2] is True
+    vp.press(7.5, 3.0, mods=int(QtCore.Qt.AltModifier))
+    vp.release(7.5, 3.0, mods=int(QtCore.Qt.AltModifier))
+    assert len(q.points) == 5
+    # the validator keeps a track-path centerline rather than re-extracting it
+    assert doc.track_path is not None
+
+
+def test_brush_stroke_shows_a_live_decal_and_rebuilds_on_a_cadence(page):
+    pg, vp = page
+    doc = _new_scene(pg, vp)
+    pg.set_tool("brush_tall")
+    n0 = vp.geometries
+    vp.press(3.0, 3.0)
+    assert vp.fills["tool"][0] and vp.fills["tool"][1] != C_WARN, "wall strokes are not duct-coloured"
+    for x in np.linspace(3.0, 5.0, 8):
+        vp.move(x, 3.0)
+    assert len(vp.fills["tool"][0][0][1]) >= 8            # the band follows the trail
+    assert pg._live_timer.isActive()
+    _wait_until(lambda: vp.geometries > n0, timeout=5.0)  # geometry grew while the button was down
+    vp.release(5.0, 3.0)
+    assert not pg._live_timer.isActive()
+    assert "tool" not in vp.fills or not vp.fills["tool"][0]
 
 
 def test_place_select_move_rotate_delete(page):
@@ -440,3 +546,33 @@ def test_driving_shortcuts_are_inert_on_editor_page(qapp, scenes_root):
     finally:
         win.editor.shutdown()
         win.deleteLater()
+
+
+def test_painted_duct_becomes_an_editable_path(page):
+    pg, vp = page
+    doc = _new_scene(pg, vp, w=12.0, h=9.0)
+    pg.set_tool("brush_duct")
+    vp.press(2.0, 3.0)
+    for x in np.linspace(2.0, 9.0, 30):
+        vp.move(x, 3.0 + 0.7 * math.sin((x - 2.0) / 1.5))
+    vp.release(9.0, 3.0)
+    assert doc.paths == [] and doc.painted_duct.any()
+    cells_before = int(doc.duct.sum())
+    pg.vectorize("duct")
+    assert len(doc.paths) == 1 and doc.paths[0].kind == "duct" and not doc.paths[0].closed
+    assert not doc.painted_duct.any(), "the paint is replaced by the path"
+    assert 0.8 < doc.duct.sum() / cells_before < 1.25
+    assert any(p[2] for p in doc.paths[0].points), "a wavy stroke gets curve vertices"
+    assert pg.state.path_sel == (doc.paths[0].id, None) and pg.current_tool() == "select"
+    # and it is now editable like any path
+    q = doc.paths[0]
+    vi = len(q.points) // 2
+    x, y, _ = q.points[vi]
+    vp.hover_at(x, y)
+    vp.press(x, y)
+    vp.move(x, y + 1.0)
+    vp.release(x, y + 1.0)
+    assert abs(q.points[vi][1] - (y + 1.0)) < 0.06       # grid snap is on
+    pg.undo()                         # the drag
+    pg.undo()                         # the conversion
+    assert pg.state.doc.paths == [] and pg.state.doc.painted_duct.any()

@@ -122,11 +122,15 @@ def test_each_paint_op_touches_only_its_layer():
         assert own.sum() > (before_d if layer == "duct" else before_t).sum(), f"{name} painted nothing"
         assert getattr(doc, name)(*args) is False, f"{name} reported a change on a no-op repaint"
     # erasing one layer clears only that layer; "free" clears both
+    # `duct` / `tall` are derived from the painted layers (plus any paths): a direct edit goes
+    # to `painted_*` and is followed by `rebuild_layers()`
     r, c = doc.world_to_cell(2.5, 2.5)
-    doc.tall[r, c] = True
+    doc.painted_tall[r, c] = True
+    doc.rebuild_layers()
     assert doc.paint_disc("duct", 2.5, 2.5, 0.05, value=False)
     assert not doc.duct[r, c] and doc.tall[r, c]
-    doc.duct[r, c] = True
+    doc.painted_duct[r, c] = True
+    doc.rebuild_layers()
     assert doc.paint_disc("free", 2.5, 2.5, 0.05)
     assert not doc.duct[r, c] and not doc.tall[r, c]
 

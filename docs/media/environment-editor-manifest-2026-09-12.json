@@ -1,41 +1,41 @@
 {
-  "captured": "2026-09-12T22:52:45",
+  "captured": "2026-09-12T23:12:03",
   "scene_dir": "/tmp/claude-1000/-home-shchon11-F1tenth/1ba4bd0e-d409-4b02-9dc7-edc80cb2df59/scratchpad/cap_scenes/capture_hall",
   "props": [
     [
       "p1",
       "cardboard_box",
       null,
-      5.5,
-      3.1
+      6.0,
+      3.0
     ],
     [
       "p2",
       "steel_drum",
       null,
-      12.0,
-      3.0
+      13.4,
+      3.4
     ],
     [
       "p3",
       "barrier_block",
       null,
-      15.0,
-      5.0
+      9.5,
+      9.0
     ],
     [
       "p4",
       "mesh",
       "a1",
-      8.5,
-      3.2
+      9.8,
+      3.0
     ],
     [
       "p5",
       "mesh",
       "a1",
-      8.4,
-      8.9
+      5.0,
+      9.0
     ]
   ],
   "assets": [
@@ -60,16 +60,16 @@
   "files": {
     "window": {
       "path": "../work/env-editor/outputs/f1tenth-environment-editor.png",
-      "sha256": "e2c518b71135d5a51d1a36a19a1fdbafe0e316e124653f1876b545879090f03f"
+      "sha256": "d2c183498da75421a2bd1db7ab7c444ce28d830419d420b9358f4f22d9ebf0f7"
     },
     "viewport": {
       "path": "../work/env-editor/outputs/f1tenth-environment-editor-viewport.png",
-      "sha256": "9f5d25637fba0814b51406dcb8213927a557a6ea3d1946826372f9fa7fdd9a72"
+      "sha256": "cb8a600f0c0277771e04a280fd23e7371843db4485a7011d95c887e68d9c7d99"
     },
     "top": {
       "path": "../work/env-editor/outputs/f1tenth-environment-editor-top.png",
-      "sha256": "faad703af1ac655623589adb8f1dc20a3b38ce0eb9d8b718746bcd611ce2deb0"
+      "sha256": "fc51aaab8a5c7fea58396dec836598abb4e60aea14ec937ecccbd4e5f3b046a6"
     }
   },
-  "status_line": "x   10.60  y    5.00   바닥   ·   저장했습니다: /tmp/claude-1000/-home-shchon11-F1tenth/1ba4bd0e-d409-4b02-9dc7-edc80cb2df59/scratchpad/cap_scenes/capture_hall   ·   업로드 1 ms"
+  "status_line": "x   13.40  y    3.40   바닥   ·   저장했습니다: /tmp/claude-1000/-home-shchon11-F1tenth/1ba4bd0e-d409-4b02-9dc7-edc80cb2df59/scratchpad/cap_scenes/capture_hall   ·   업로드 3 ms"
 }

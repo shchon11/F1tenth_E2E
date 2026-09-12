@@ -240,6 +240,212 @@ def _convex_overlap(a: np.ndarray, b: np.ndarray) -> bool:
 
 
 # ==================================================================== the document
+# ==================================================================== vector paths
+#: Path kinds. `duct` / `tall` are a band of the given width rasterised into that layer; `track`
+#: is a lane centreline of the given lane `width` whose two edges are drawn as duct hoses (band
+#: `band`, default the scene's duct height), and which also *is* the scene's centerline.
+PATH_KINDS = ("duct", "tall", "track")
+#: Sampling step along a path when it is rasterised or drawn, in metres.
+PATH_STEP = 0.05
+
+
+def _hermite(p0, p1, t0, t1, n: int) -> np.ndarray:
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    t2, t3 = t * t, t * t * t
+    return ((2 * t3 - 3 * t2 + 1) * p0 + (t3 - 2 * t2 + t) * t0
+            + (-2 * t3 + 3 * t2) * p1 + (t3 - t2) * t1)
+
+
+def sample_path(points: Sequence, closed: bool, step: float = PATH_STEP) -> np.ndarray:
+    """Dense (N,2) polyline through `points` = [(x, y, smooth), ...].
+
+    Each segment is a cubic Hermite curve. A *smooth* vertex takes the Catmull-Rom tangent through
+    its neighbours; a *corner* vertex takes the chord of the segment being drawn, so a segment
+    between two corners is exactly straight and a corner between two curves is a real corner.
+    Mixing the two along one path is the point: straight along the hall, an arc into the hairpin,
+    straight again. The last sample is not repeated at the start of a closed path."""
+    P = np.asarray([(float(p[0]), float(p[1])) for p in points], np.float64).reshape(-1, 2)
+    smooth = [bool(p[2]) if len(p) > 2 else False for p in points]
+    n = len(P)
+    if n == 0:
+        return np.zeros((0, 2))
+    if n == 1:
+        return P.copy()
+    closed = bool(closed) and n >= 3
+    step = max(float(step), 1e-3)
+
+    def cr_tangent(i):
+        if closed:
+            return 0.5 * (P[(i + 1) % n] - P[(i - 1) % n])
+        if i == 0:
+            return P[1] - P[0]
+        if i == n - 1:
+            return P[n - 1] - P[n - 2]
+        return 0.5 * (P[i + 1] - P[i - 1])
+
+    segs = [(i, i + 1) for i in range(n - 1)] + ([(n - 1, 0)] if closed else [])
+    out = []
+    for k, (i, j) in enumerate(segs):
+        chord = P[j] - P[i]
+        L = float(np.linalg.norm(chord))
+        t0 = cr_tangent(i) if smooth[i] else chord
+        t1 = cr_tangent(j) if smooth[j] else chord
+        curved = smooth[i] or smooth[j]
+        m = max(2, int(math.ceil((1.5 if curved else 1.0) * L / step)) + 1)
+        seg = _hermite(P[i], P[j], t0, t1, m) if curved else np.linspace(0, 1, m)[:, None] * chord + P[i]
+        out.append(seg if k == 0 else seg[1:])
+    pts = np.vstack(out)
+    if closed and len(pts) > 1:
+        pts = pts[:-1]
+    return pts
+
+
+def path_segment_samples(points: Sequence, closed: bool, step: float = PATH_STEP) -> List[np.ndarray]:
+    """`sample_path` split per vertex segment (each piece includes both endpoints)."""
+    pts = [(float(p[0]), float(p[1]), bool(p[2]) if len(p) > 2 else False) for p in points]
+    n = len(pts)
+    if n < 2:
+        return [np.asarray([(p[0], p[1]) for p in pts], np.float64).reshape(-1, 2)]
+    whole = sample_path(pts, closed, step)
+    if closed and n >= 3:
+        whole = np.vstack([whole, whole[:1]])
+    # the segment boundaries are exactly where the vertices sit
+    verts = np.asarray([(p[0], p[1]) for p in pts], np.float64)
+    idx = [0]
+    start = 0
+    for vi in range(1, n):
+        d = np.linalg.norm(whole[start:] - verts[vi], axis=1)
+        k = start + int(np.argmin(d))
+        idx.append(k)
+        start = k
+    idx.append(len(whole) - 1)
+    pieces = []
+    for a, b in zip(idx[:-1], idx[1:]):
+        pieces.append(whole[a:b + 1])
+    if not closed:
+        pieces = pieces[:n - 1]
+    return pieces
+
+
+def offset_polyline(pts: np.ndarray, d: float, closed: bool) -> np.ndarray:
+    """`pts` shifted by `d` along its left normal (positive = left of the direction of travel)."""
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    if len(P) < 2:
+        return P.copy()
+    if closed and len(P) >= 3:
+        t = np.roll(P, -1, 0) - np.roll(P, 1, 0)
+    else:
+        t = np.gradient(P, axis=0)
+    t = t / (np.linalg.norm(t, axis=1, keepdims=True) + 1e-12)
+    nrm = np.stack([-t[:, 1], t[:, 0]], 1)
+    return P + float(d) * nrm
+
+
+def polyline_length(pts: np.ndarray, closed: bool) -> float:
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    if len(P) < 2:
+        return 0.0
+    L = float(np.linalg.norm(P[1:] - P[:-1], axis=1).sum())
+    if closed and len(P) >= 3:
+        L += float(np.linalg.norm(P[0] - P[-1]))
+    return L
+
+
+def nearest_on_polyline(pts: np.ndarray, x: float, y: float, closed: bool):
+    """(distance, segment index, t in [0,1], foot point) of the closest point on the polyline."""
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    if len(P) == 0:
+        return math.inf, -1, 0.0, None
+    if len(P) == 1:
+        return float(math.hypot(P[0, 0] - x, P[0, 1] - y)), 0, 0.0, P[0]
+    A = P[:-1]
+    B = P[1:]
+    if closed and len(P) >= 3:
+        A = np.vstack([A, P[-1:]])
+        B = np.vstack([B, P[:1]])
+    ab = B - A
+    L2 = (ab * ab).sum(1)
+    q = np.array([x, y], np.float64)
+    t = np.clip(((q - A) * ab).sum(1) / np.where(L2 < 1e-18, 1.0, L2), 0.0, 1.0)
+    foot = A + t[:, None] * ab
+    dist = np.linalg.norm(foot - q, axis=1)
+    k = int(np.argmin(dist))
+    return float(dist[k]), k, float(t[k]), foot[k]
+
+
+def _rdp(pts: np.ndarray, tol: float, closed: bool) -> np.ndarray:
+    """Ramer-Douglas-Peucker; a closed polyline is split at its farthest point from the start."""
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    if len(P) < 3:
+        return P.copy()
+    if closed:
+        far = int(np.argmax(np.linalg.norm(P - P[0], axis=1)))
+        a = _rdp(P[:far + 1], tol, False)
+        b = _rdp(np.vstack([P[far:], P[:1]]), tol, False)
+        return np.vstack([a[:-1], b[:-1]])
+    keep = np.zeros(len(P), bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(P) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        a, b = P[i], P[j]
+        ab = b - a
+        L = float(np.linalg.norm(ab))
+        seg = P[i + 1:j]
+        if L < 1e-12:
+            d = np.linalg.norm(seg - a, axis=1)
+        else:
+            d = np.abs((seg[:, 0] - a[0]) * ab[1] - (seg[:, 1] - a[1]) * ab[0]) / L
+        k = int(np.argmax(d))
+        if d[k] > tol:
+            keep[i + 1 + k] = True
+            stack.append((i, i + 1 + k))
+            stack.append((i + 1 + k, j))
+    return P[keep]
+
+
+@dataclass
+class PathSpec:
+    """A vector path the layers are rasterised from; edited by handle, never by brush."""
+    id: str
+    kind: str
+    points: List[Tuple[float, float, bool]]          # (x, y, smooth)
+    width: float                                     # band width (duct/tall) or lane width (track)
+    closed: bool = False
+    band: Optional[float] = None                     # track: hose band width; None = duct_height
+
+    def __post_init__(self):
+        if self.kind not in PATH_KINDS:
+            raise ValueError(f"path kind must be one of {PATH_KINDS}, got {self.kind!r}")
+        self.points = [(float(p[0]), float(p[1]), bool(p[2]) if len(p) > 2 else False) for p in self.points]
+        self.width = float(self.width)
+        self.closed = bool(self.closed)
+        self.band = None if self.band is None else float(self.band)
+
+    def key(self) -> tuple:
+        return (self.kind, tuple(self.points), self.width, self.closed, self.band)
+
+    def polyline(self, step: float = PATH_STEP) -> np.ndarray:
+        return sample_path(self.points, self.closed, step)
+
+    def segments(self, step: float = PATH_STEP) -> List[np.ndarray]:
+        return path_segment_samples(self.points, self.closed, step)
+
+    def length(self) -> float:
+        return polyline_length(self.polyline(), self.closed)
+
+    def to_json(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "width": self.width, "closed": self.closed,
+                "band": self.band, "points": [[x, y, bool(sm)] for x, y, sm in self.points]}
+
+    @staticmethod
+    def from_json(d: dict) -> "PathSpec":
+        return PathSpec(str(d["id"]), str(d["kind"]), [tuple(p) for p in d.get("points", [])],
+                        float(d.get("width", 0.3)), bool(d.get("closed", False)), d.get("band"))
+
+
 @dataclass(eq=False)
 class SceneDoc:
     name: str
@@ -256,12 +462,27 @@ class SceneDoc:
     source: dict = field(default_factory=dict)
     dir: Optional[str] = None
     modified: str = ""
+    #: Vector paths (`PathSpec`). `duct` / `tall` are *derived*: the painted layers below OR'd with
+    #: every path's raster. Brushes write the painted layers; paths are edited by their handles.
+    paths: List[PathSpec] = field(default_factory=list)
+    painted_duct: Optional[np.ndarray] = None
+    painted_tall: Optional[np.ndarray] = None
 
     def __post_init__(self):
         self.duct = np.ascontiguousarray(np.asarray(self.duct, bool))
         self.tall = np.ascontiguousarray(np.asarray(self.tall, bool))
         if self.duct.shape != self.tall.shape or self.duct.ndim != 2:
             raise ValueError(f"duct {self.duct.shape} and tall {self.tall.shape} must be the same (H, W)")
+        # Scenes written before paths existed carry only the derived layers: those *are* the
+        # painted layers then.
+        self.painted_duct = (self.duct.copy() if self.painted_duct is None
+                             else np.ascontiguousarray(np.asarray(self.painted_duct, bool)))
+        self.painted_tall = (self.tall.copy() if self.painted_tall is None
+                             else np.ascontiguousarray(np.asarray(self.painted_tall, bool)))
+        if self.painted_duct.shape != self.duct.shape or self.painted_tall.shape != self.duct.shape:
+            raise ValueError("painted layers must match the derived layers' shape")
+        self._raster_cache: Dict[str, tuple] = {}
+        self._cl_from_track = False
         self.origin = (float(self.origin[0]), float(self.origin[1]))
         self.resolution = float(self.resolution)
         if self.centerline is not None:
@@ -272,6 +493,8 @@ class SceneDoc:
             self.source = {"map": None, "created": _now()}
         for p in self.props:
             p.doc = self
+        if self.paths:
+            self.rebuild_layers()
 
     # ---------------------------------------------------------------- construction / persistence
     @staticmethod
@@ -297,6 +520,8 @@ class SceneDoc:
             raise ValueError(f"{jp}: schema {schema} is newer than this code ({SCENE_SCHEMA_VERSION})")
         with np.load(os.path.join(d, "layers.npz")) as z:
             duct, tall = z["duct"].astype(bool), z["tall"].astype(bool)
+            painted_duct = z["painted_duct"].astype(bool) if "painted_duct" in z.files else None
+            painted_tall = z["painted_tall"].astype(bool) if "painted_tall" in z.files else None
         shape = tuple(int(v) for v in (meta.get("shape") or duct.shape))
         if duct.shape != shape:
             raise ValueError(f"{d}: layers.npz is {duct.shape}, scene.json says {shape}")
@@ -310,7 +535,9 @@ class SceneDoc:
             props=[PropPlacement.from_json(p) for p in (meta.get("props") or [])],
             assets=[AssetInfo.from_json(a) for a in (meta.get("assets") or [])],
             notes=str(meta.get("notes") or ""), source=dict(meta.get("source") or {}),
-            dir=d, modified=str(meta.get("modified") or ""))
+            dir=d, modified=str(meta.get("modified") or ""),
+            paths=[PathSpec.from_json(q) for q in (meta.get("paths") or [])],
+            painted_duct=painted_duct, painted_tall=painted_tall)
         return doc
 
     def to_json(self) -> dict:
@@ -324,6 +551,7 @@ class SceneDoc:
                            else [[float(x), float(y)] for x, y in np.asarray(self.centerline, np.float64)]),
             "props": [p.to_json() for p in self.props],
             "assets": [a.to_json() for a in self.assets],
+            "paths": [q.to_json() for q in self.paths],
             "source": dict(self.source), "modified": self.modified,
         }
 
@@ -344,7 +572,8 @@ class SceneDoc:
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(src, dst)
         self.modified = _now()
-        np.savez_compressed(os.path.join(d, "layers.npz"), duct=self.duct, tall=self.tall)
+        np.savez_compressed(os.path.join(d, "layers.npz"), duct=self.duct, tall=self.tall,
+                            painted_duct=self.painted_duct, painted_tall=self.painted_tall)
         tmp = os.path.join(d, "scene.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.to_json(), f, ensure_ascii=False, indent=1)
@@ -361,7 +590,12 @@ class SceneDoc:
             centerline=None if self.centerline is None else self.centerline.copy(),
             props=[PropPlacement(p.id, p.style, p.x, p.y, p.yaw, p.seed, dict(p.dims), p.asset) for p in self.props],
             assets=[copy.deepcopy(a) for a in self.assets],
-            notes=self.notes, source=copy.deepcopy(self.source), dir=self.dir, modified=self.modified)
+            notes=self.notes, source=copy.deepcopy(self.source), dir=self.dir, modified=self.modified,
+            painted_duct=self.painted_duct.copy(), painted_tall=self.painted_tall.copy())
+        # paths after construction, sharing the raster cache, so a snapshot does not re-rasterise
+        doc.paths = [PathSpec(q.id, q.kind, list(q.points), q.width, q.closed, q.band) for q in self.paths]
+        doc._raster_cache = dict(self._raster_cache)
+        doc._cl_from_track = self._cl_from_track
         return doc
 
     @staticmethod
@@ -433,16 +667,340 @@ class SceneDoc:
         if not m.any():
             return False
         if layer == "free":
-            d, t = self.duct[sl], self.tall[sl]
+            d, t = self.painted_duct[sl], self.painted_tall[sl]
             changed = bool((d & m).any() or (t & m).any())
             d[m] = False
             t[m] = False
+            if changed:
+                self._refresh_layer("duct")
+                self._refresh_layer("tall")
             return changed
-        arr = self.duct if layer == "duct" else self.tall
+        arr = self.painted_duct if layer == "duct" else self.painted_tall
         sub = arr[sl]
         changed = bool((sub[m] != bool(value)).any())
         sub[m] = bool(value)
+        if changed:
+            self._refresh_layer(layer)
         return changed
+
+    # ---------------------------------------------------------------- paths -> layers
+    def _grid_key(self) -> tuple:
+        return (self.shape, self.origin, self.resolution, float(self.duct_height))
+
+    def _raster_polyline(self, pts: np.ndarray, width: float, closed: bool) -> np.ndarray:
+        """(H,W) bool mask of a band of `width` along `pts`, on this grid."""
+        H, W = self.shape
+        m = np.zeros((H, W), bool)
+        pts = np.asarray(pts, np.float64).reshape(-1, 2)
+        if len(pts) == 0:
+            return m
+        hw = max(float(width), 0.0) / 2.0
+        if len(pts) == 1:
+            r0, r1, c0, c1 = self._cell_box(pts[0, 0] - hw, pts[0, 1] - hw, pts[0, 0] + hw, pts[0, 1] + hw)
+            if r1 > r0 and c1 > c0:
+                xs, ys = self._centres(r0, r1, c0, c1)
+                m[r0:r1, c0:c1] = (xs - pts[0, 0]) ** 2 + (ys - pts[0, 1]) ** 2 <= hw * hw + 1e-12
+            return m
+        segs = list(zip(pts[:-1], pts[1:]))
+        if closed and len(pts) > 2:
+            segs.append((pts[-1], pts[0]))
+        for a, b in segs:
+            lo, hi = np.minimum(a, b) - hw, np.maximum(a, b) + hw
+            r0, r1, c0, c1 = self._cell_box(lo[0], lo[1], hi[0], hi[1])
+            if r1 <= r0 or c1 <= c0:
+                continue
+            xs, ys = self._centres(r0, r1, c0, c1)
+            ab = b - a
+            L2 = float(ab @ ab)
+            t = (np.zeros(np.broadcast(xs, ys).shape) if L2 < 1e-18
+                 else np.clip(((xs - a[0]) * ab[0] + (ys - a[1]) * ab[1]) / L2, 0.0, 1.0))
+            dx = xs - (a[0] + t * ab[0])
+            dy = ys - (a[1] + t * ab[1])
+            sub = dx * dx + dy * dy <= hw * hw + 1e-12
+            if not sub.any():
+                n = max(2, 2 * int(math.ceil(math.sqrt(L2) / self.resolution)) + 1)
+                for sv in np.linspace(0.0, 1.0, n):
+                    rr, cc = self.world_to_cell(a[0] + sv * ab[0], a[1] + sv * ab[1])
+                    if r0 <= rr < r1 and c0 <= cc < c1:
+                        sub[rr - r0, cc - c0] = True
+            m[r0:r1, c0:c1] |= sub
+        return m
+
+    def track_hoses(self, path: PathSpec) -> Tuple[np.ndarray, np.ndarray]:
+        """The two hose centrelines (left, right) of a `track` path, as sampled polylines."""
+        cl = path.polyline()
+        half = 0.5 * path.width
+        return offset_polyline(cl, +half, path.closed), offset_polyline(cl, -half, path.closed)
+
+    def _path_masks(self, path: PathSpec) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """(duct mask, tall mask) for one path, cached by its geometry and the grid."""
+        key = (path.key(), self._grid_key())
+        hit = self._raster_cache.get(path.id)
+        if hit is not None and hit[0] == key:
+            return hit[1], hit[2]
+        pl = path.polyline()
+        d = t = None
+        if path.kind == "duct":
+            # A duct *is* a hose of `duct_height` diameter: the LiDAR models it as that cylinder
+            # and the renderer stands one tube along each edge of the band, so any wider band
+            # draws as two hoses side by side. The path's own width is ignored on purpose.
+            d = self._raster_polyline(pl, float(self.duct_height), path.closed)
+        elif path.kind == "tall":
+            t = self._raster_polyline(pl, path.width, path.closed)
+        else:
+            band = path.band if path.band is not None else float(self.duct_height)
+            d = self._raster_lane_edges(pl, 0.5 * path.width, band, path.closed)
+        self._raster_cache[path.id] = (key, d, t)
+        return d, t
+
+    def _raster_lane_edges(self, cl: np.ndarray, half_lane: float, band: float, closed: bool) -> np.ndarray:
+        """Cells whose distance to the centreline lies within `band/2` of `half_lane`: the two
+        hoses of a lane, as one distance band. Offsetting the polyline and stroking the offset
+        would spike at every corner vertex (the offset curve folds over itself on the inside and
+        opens a gap on the outside); a distance band has round joins by construction."""
+        H, W = self.shape
+        cl = np.asarray(cl, np.float64).reshape(-1, 2)
+        if len(cl) < 2:
+            return np.zeros((H, W), bool)
+        reach = half_lane + 0.5 * band
+        dist = np.full((H, W), np.inf)
+        segs = list(zip(cl[:-1], cl[1:]))
+        if closed and len(cl) > 2:
+            segs.append((cl[-1], cl[0]))
+        for a, b in segs:
+            lo, hi = np.minimum(a, b) - reach, np.maximum(a, b) + reach
+            r0, r1, c0, c1 = self._cell_box(lo[0], lo[1], hi[0], hi[1])
+            if r1 <= r0 or c1 <= c0:
+                continue
+            xs, ys = self._centres(r0, r1, c0, c1)
+            ab = b - a
+            L2 = float(ab @ ab)
+            t = (np.zeros(np.broadcast(xs, ys).shape) if L2 < 1e-18
+                 else np.clip(((xs - a[0]) * ab[0] + (ys - a[1]) * ab[1]) / L2, 0.0, 1.0))
+            dx = xs - (a[0] + t * ab[0])
+            dy = ys - (a[1] + t * ab[1])
+            sub = dist[r0:r1, c0:c1]
+            np.minimum(sub, np.sqrt(dx * dx + dy * dy), out=sub)
+        return np.abs(dist - half_lane) <= 0.5 * band + 1e-12
+
+    def _refresh_layer(self, layer: str) -> None:
+        painted = self.painted_duct if layer == "duct" else self.painted_tall
+        target = self.duct if layer == "duct" else self.tall
+        np.copyto(target, painted)
+        for q in self.paths:
+            d, t = self._path_masks(q)
+            m = d if layer == "duct" else t
+            if m is not None:
+                np.logical_or(target, m, out=target)
+
+    def rebuild_layers(self) -> None:
+        """Recompute `duct` / `tall` from the painted layers and every path, and the centerline
+        from the first closed `track` path (CCW), if there is one."""
+        live = {q.id for q in self.paths}
+        for pid in list(self._raster_cache):
+            if pid not in live:
+                del self._raster_cache[pid]
+        self._refresh_layer("duct")
+        self._refresh_layer("tall")
+        track = self.track_path
+        if track is not None:
+            cl = track.polyline()
+            area = 0.5 * float(np.sum(cl[:, 0] * np.roll(cl[:, 1], -1) - np.roll(cl[:, 0], -1) * cl[:, 1]))
+            if area < 0:
+                cl = cl[::-1].copy()
+            self.centerline = cl
+            self._cl_from_track = True
+        elif self._cl_from_track:
+            self.centerline = None
+            self._cl_from_track = False
+
+    @property
+    def track_path(self) -> Optional[PathSpec]:
+        return next((q for q in self.paths if q.kind == "track" and q.closed and len(q.points) >= 3), None)
+
+    # ---------------------------------------------------------------- path editing
+    def add_path(self, kind: str, points: Sequence, width: float, closed: bool = False,
+                 band: Optional[float] = None) -> PathSpec:
+        q = PathSpec(self._fresh_id("l", [x.id for x in self.paths]), kind, list(points), width, closed, band)
+        self.paths.append(q)
+        self.rebuild_layers()
+        return q
+
+    def get_path(self, pid: str) -> Optional[PathSpec]:
+        return next((q for q in self.paths if q.id == pid), None)
+
+    def remove_path(self, pid: str) -> None:
+        self.paths = [q for q in self.paths if q.id != pid]
+        self.rebuild_layers()
+
+    def path_changed(self, pid: Optional[str] = None) -> None:
+        """Call after mutating a path's points / width / closed / band in place."""
+        self.rebuild_layers()
+
+    def path_reach(self, q: PathSpec) -> float:
+        """Half-width of what the path draws on the ground (lane edge hose included for tracks)."""
+        if q.kind == "track":
+            return 0.5 * q.width + 0.5 * (q.band if q.band is not None else float(self.duct_height))
+        if q.kind == "duct":
+            return 0.5 * float(self.duct_height)
+        return 0.5 * q.width
+
+    def path_hit(self, x: float, y: float, tol: float, handle_tol: Optional[float] = None):
+        """What is under (x, y): `(path id, vertex index or None, segment index or None)`, or
+        `(None, None, None)`. Vertices win within `handle_tol` (default `tol`); otherwise the
+        nearest path whose band the point lies in (plus `tol`)."""
+        handle_tol = tol if handle_tol is None else handle_tol
+        best = (None, None, None)
+        best_d = math.inf
+        for q in self.paths:
+            for i, (px, py, _sm) in enumerate(q.points):
+                d = math.hypot(px - x, py - y)
+                if d <= handle_tol and d < best_d:
+                    best, best_d = (q.id, i, None), d
+        if best[0] is not None:
+            return best
+        for q in self.paths:
+            reach = self.path_reach(q) + tol
+            seg_best = None
+            for si, piece in enumerate(q.segments()):
+                d, _k, _t, _foot = nearest_on_polyline(piece, x, y, False)
+                if d <= reach and d < best_d:
+                    best_d, seg_best = d, si
+            if seg_best is not None:
+                best = (q.id, None, seg_best)
+        return best
+
+    # ---------------------------------------------------------------- raster -> paths
+    def vectorize_layer(self, layer: str = "duct", tol: Optional[float] = None, min_length: float = 0.5,
+                        corner_deg: float = 60.0) -> List[PathSpec]:
+        """Turn the *painted* cells of a layer into editable paths and clear them from the paint.
+
+        The band is skeletonised, the skeleton split at junctions into simple chains, each chain
+        ordered from an end (or anywhere, for a loop), simplified to a few vertices, and turned
+        into a path: `duct` paths are one hose wide by definition; a `tall` path takes twice the
+        median distance-to-edge along its skeleton as its width. Vertices where the chain turns
+        by more than `corner_deg` stay corners, the rest are curve vertices. Cells of the paint
+        the new rasters cover are cleared, so nothing is drawn twice; short specks that made no
+        path stay as paint. Returns the paths it added."""
+        from scipy import ndimage
+        from skimage.morphology import skeletonize
+        if layer not in ("duct", "tall"):
+            raise ValueError("vectorize 'duct' or 'tall'")
+        painted = self.painted_duct if layer == "duct" else self.painted_tall
+        if not painted.any():
+            return []
+        res = self.resolution
+        tol = max(2.0 * res, 0.08) if tol is None else float(tol)
+        edt = ndimage.distance_transform_edt(painted) * res
+        sk = skeletonize(painted)
+        H, W = sk.shape
+        # 8-neighbour degree; junction pixels are removed so every remaining component is a chain
+        k = np.ones((3, 3), int)
+        k[1, 1] = 0
+        deg = ndimage.convolve(sk.astype(int), k, mode="constant") * sk
+        chains_mask = sk & (deg <= 2)
+        lab, n = ndimage.label(chains_mask, structure=np.ones((3, 3), int))
+        added: List[PathSpec] = []
+        for comp in range(1, n + 1):
+            rr, cc = np.nonzero(lab == comp)
+            if len(rr) < 3:
+                continue
+            pts = self._order_chain(rr, cc)
+            if pts is None:
+                continue
+            order, closed = pts
+            xy = np.stack([self.origin[0] + (cc[order] + 0.5) * res, self.origin[1] + (rr[order] + 0.5) * res], 1)
+            if polyline_length(xy, closed) < float(min_length):
+                continue
+            verts = _rdp(xy, tol, closed)
+            if len(verts) < 2 or (closed and len(verts) < 3):
+                continue
+            width = float(self.duct_height) if layer == "duct" else float(2.0 * np.median(edt[rr, cc]))
+            points = []
+            m = len(verts)
+            for i, (x, y) in enumerate(verts):
+                if closed:
+                    a, b = verts[(i - 1) % m], verts[(i + 1) % m]
+                elif 0 < i < m - 1:
+                    a, b = verts[i - 1], verts[i + 1]
+                else:
+                    points.append((float(x), float(y), False))
+                    continue
+                v0 = np.asarray([x, y]) - a
+                v1 = b - np.asarray([x, y])
+                cosang = float(v0 @ v1) / (float(np.linalg.norm(v0)) * float(np.linalg.norm(v1)) + 1e-12)
+                turn = math.degrees(math.acos(max(-1.0, min(1.0, cosang))))
+                points.append((float(x), float(y), turn < float(corner_deg)))
+            q = PathSpec(self._fresh_id("l", [x.id for x in self.paths] + [a.id for a in added]),
+                         layer, points, max(width, res), closed, None)
+            added.append(q)
+        if not added:
+            return []
+        self.paths.extend(added)
+        # clear the paint the new rasters explain (a little dilated, so band edges do not stay)
+        cover = np.zeros((H, W), bool)
+        for q in added:
+            d, t = self._path_masks(q)
+            m = d if layer == "duct" else t
+            if m is not None:
+                cover |= m
+        cover = ndimage.binary_dilation(cover, iterations=2)
+        painted[cover] = False
+        self.rebuild_layers()
+        return added
+
+    @staticmethod
+    def _order_chain(rr: np.ndarray, cc: np.ndarray):
+        """Order the pixels of a degree<=2 skeleton chain; returns (index order, closed) or None."""
+        n = len(rr)
+        index = {(int(r), int(c)): i for i, (r, c) in enumerate(zip(rr, cc))}
+        nbrs = [[] for _ in range(n)]
+        for i, (r, c) in enumerate(zip(rr, cc)):
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    j = index.get((int(r) + dr, int(c) + dc))
+                    if j is not None:
+                        nbrs[i].append(j)
+        ends = [i for i in range(n) if len(nbrs[i]) == 1]
+        closed = not ends
+        start = ends[0] if ends else 0
+        order = [start]
+        seen = {start}
+        cur, prev = start, -1
+        while True:
+            nxt = [j for j in nbrs[cur] if j != prev and j not in seen]
+            if not nxt:
+                break
+            # 4-connected neighbours first: keeps the walk from cutting a diagonal corner
+            nxt.sort(key=lambda j: abs(int(rr[j]) - int(rr[cur])) + abs(int(cc[j]) - int(cc[cur])))
+            prev, cur = cur, nxt[0]
+            order.append(cur)
+            seen.add(cur)
+        if len(order) < 3:
+            return None
+        return np.asarray(order), closed
+
+    def insert_path_vertex(self, pid: str, seg: int, x: float, y: float, smooth: bool = False) -> int:
+        q = self.get_path(pid)
+        if q is None:
+            return -1
+        at = min(len(q.points), seg + 1)
+        q.points.insert(at, (float(x), float(y), bool(smooth)))
+        self.rebuild_layers()
+        return at
+
+    def remove_path_vertex(self, pid: str, idx: int) -> bool:
+        q = self.get_path(pid)
+        if q is None or not (0 <= idx < len(q.points)):
+            return False
+        if len(q.points) <= 2:
+            self.remove_path(pid)
+            return True
+        del q.points[idx]
+        self.rebuild_layers()
+        return True
 
     def paint_disc(self, layer: str, x: float, y: float, radius: float, value: bool = True) -> bool:
         radius = max(float(radius), 0.0)
@@ -553,10 +1111,13 @@ class SceneDoc:
         sr0, sr1 = max(0, r_lo), min(H0, r_hi)
         sc0, sc1 = max(0, c_lo), min(W0, c_hi)
         if sr1 > sr0 and sc1 > sc0:
-            duct[sr0 - r_lo:sr1 - r_lo, sc0 - c_lo:sc1 - c_lo] = self.duct[sr0:sr1, sc0:sc1]
-            tall[sr0 - r_lo:sr1 - r_lo, sc0 - c_lo:sc1 - c_lo] = self.tall[sr0:sr1, sc0:sc1]
-        self.duct, self.tall = duct, tall
+            duct[sr0 - r_lo:sr1 - r_lo, sc0 - c_lo:sc1 - c_lo] = self.painted_duct[sr0:sr1, sc0:sc1]
+            tall[sr0 - r_lo:sr1 - r_lo, sc0 - c_lo:sc1 - c_lo] = self.painted_tall[sr0:sr1, sc0:sc1]
+        self.painted_duct, self.painted_tall = duct, tall
+        self.duct, self.tall = duct.copy(), tall.copy()
         self.origin = (ox + c_lo * res, oy + r_lo * res)
+        self._raster_cache.clear()
+        self.rebuild_layers()
 
     def content_bounds(self) -> Optional[Tuple[float, float, float, float]]:
         """World bbox of everything: occupied cells, prop footprints, centerline. None when empty."""
@@ -577,6 +1138,11 @@ class SceneDoc:
         if self.centerline is not None:
             cl = self.centerline
             boxes.append((cl[:, 0].min(), cl[:, 1].min(), cl[:, 0].max(), cl[:, 1].max()))
+        for q in self.paths:
+            pl = q.polyline()
+            if len(pl):
+                r = 0.5 * q.width + (0.5 * (q.band or self.duct_height) if q.kind == "track" else 0.0)
+                boxes.append((pl[:, 0].min() - r, pl[:, 1].min() - r, pl[:, 0].max() + r, pl[:, 1].max() + r))
         if not boxes:
             return None
         b = np.asarray(boxes, np.float64)
@@ -763,6 +1329,19 @@ class SceneDoc:
             add("error", "빈 공간이 없습니다. 차가 달릴 바닥을 남겨 두세요.")
         if self.centerline is None:
             add("warn", "중심선이 없습니다. 검증하면 빈 공간에서 자동으로 뽑습니다.")
+        else:
+            # the corridor along the centerline, from a distance transform: the same number the
+            # validator reports, cheap enough to run after every stroke
+            from scipy import ndimage
+            edt = ndimage.distance_transform_edt(~occ) * self.resolution
+            cl = np.asarray(self.centerline, np.float64)
+            r = np.clip(np.rint((cl[:, 1] - self.origin[1]) / self.resolution - 0.5).astype(int), 0, occ.shape[0] - 1)
+            c = np.clip(np.rint((cl[:, 0] - self.origin[0]) / self.resolution - 0.5).astype(int), 0, occ.shape[1] - 1)
+            half = edt[r, c]
+            k = int(np.argmin(half))
+            if 2.0 * float(half[k]) < MIN_CORRIDOR_M:
+                add("error", f"중심선 위 가장 좁은 곳이 {2.0 * float(half[k]):.2f} m 입니다 (최소 {MIN_CORRIDOR_M} m). "
+                             f"벽이나 장애물이 차선을 막고 있습니다.", cl[k, 0], cl[k, 1])
         for a in self.assets:
             p = os.path.join(self.dir, a.file) if self.dir else a.file
             if not os.path.isfile(p):

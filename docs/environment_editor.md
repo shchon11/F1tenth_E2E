@@ -13,21 +13,34 @@ python3 -m f1sim.learn.watch          # header: 주행 · 학습 · 환경
 
 [![the environment editor](media/f1tenth-environment-editor.png)](media/f1tenth-environment-editor.png)
 
-<sub>A hall drawn with the duct-line tool, a pillar from the rectangle tool, three built-in props and
-two placements of an imported STL tyre stack (the selected one carries the gizmo). Captured from the
-real console on software GL by `work/env-editor/capture_editor.py`; the scene, prop placements and
-file hashes are in [`media/environment-editor-manifest-2026-09-12.json`](media/environment-editor-manifest-2026-09-12.json).
-The [top view](media/f1tenth-environment-editor-top.png) shows the wall brush cursor.</sub>
+<sub>A lane drawn as one closed **track path** — straight sides, curved hairpins — with its hoses,
+a duct-path chicane, a pillar, three built-in props and two placements of an imported STL tyre
+stack. The track path is selected: square handles are corner vertices, round ones are curve
+vertices, the faint lines are the control polygon and the lane edges. Captured from the real console
+on software GL by `work/env-editor/capture_editor.py`; the scene, placements and file hashes are in
+[`media/environment-editor-manifest-2026-09-12.json`](media/environment-editor-manifest-2026-09-12.json).
+The [top view](media/f1tenth-environment-editor-top.png) is taken mid-stroke: the wall brush's decal
+under the cursor, and the wall already rebuilt behind it.</sub>
 
 ## What a scene is
 
 A scene is a folder under `~/f1sim_scenes/<name>/` (root overridable with `$F1SIM_SCENES`):
 
 ```
-scene.json        name, resolution, origin, duct height, centerline, props, assets, notes
-layers.npz        duct: bool (H,W), tall: bool (H,W)
+scene.json        name, resolution, origin, duct height, centerline, paths, props, assets, notes
+layers.npz        duct / tall: bool (H,W) as the simulator sees them; painted_duct / painted_tall: the brush layers
 assets/           imported meshes, copied in verbatim
 ```
+
+Two kinds of geometry feed the layers. **Paths** are vector objects — a list of vertices, each
+straight (corner) or curved (a Catmull-Rom tangent through its neighbours), a width, open or closed —
+rasterised into the grid whenever they change and editable afterwards by their handles. **Paint** is
+what the brushes, the rectangle and the polygon tool leave, cell by cell. The simulator's layers are
+the union; a path can never be erased by the brush, only selected and changed or deleted, and paint
+never moves a path. Paint can be promoted: **칠한 덕트 → 경로** / **칠한 벽 → 경로** (환경 설정)
+skeletonise the painted band, split it at junctions, simplify each chain to a few vertices (curved
+where the chain bends gently, corners where it turns sharply) and replace the paint with those paths
+— the way to make a brushed hose, or the hoses of an imported catalogue map, editable by handle.
 
 `f1sim/f1sim/scene.py` owns the format (`SceneDoc`), and `maps.py` loads it as
 **`scene:<name>`** — a first-class catalogue entry, so `~rev`, `~mir` and `+props<seed>` compose
@@ -45,12 +58,25 @@ why a scene that looks right in the editor is what the policy is trained and eva
 | key | tool | what it does |
 | --- | --- | --- |
 | `V` | 선택·이동 | click a prop to select (Shift adds), drag to move (grid snap unless Alt), `R` / Ctrl+wheel rotates, `Delete` removes, Ctrl+D duplicates |
-| `B` / `W` | 덕트 · 벽 브러시 | paint a duct hose / tall wall along the mouse path; Ctrl+wheel changes the radius; one undo step per stroke |
+| `B` / `W` | 덕트 · 벽 브러시 | paint a duct hose / tall wall along the mouse path; one undo step per stroke. The wall brush radius is the 벽 브러시 box (Ctrl+wheel); the duct brush is always one hose wide — a duct *is* a hose of `duct_height` diameter, and the renderer stands a tube along each edge of the band, so a wider band would draw (and the LiDAR would model) two hoses side by side |
 | `E` | 지우개 | clears both layers |
-| `L` / `K` | 덕트 선 · 벽 선 | click vertices, double-click / Enter / right-click commits a band of `2 × brush` width; `선 닫기` joins the last vertex to the first |
+| `T` | 트랙 경로 | draw the **lane centreline**: click for a straight vertex, Ctrl+click for a curved one, Tab flips the last, Shift snaps to 45°, `C` closes. Commit (Enter / double-click / right-click) stands a duct hose along both edges at the 차선 폭 and makes the path the scene's centerline — no extraction step |
+| `L` / `K` | 덕트 경로 · 벽 경로 | one hose (always `duct_height` wide) / one wall (`2 × brush` wide) as a path, same vertex rules |
 | `M` | 사각형 | drag a rectangle of tall wall (Shift: duct) |
-| `P` | 다각형 채우기 | click vertices, commit fills the polygon with tall wall |
+| `P` | 다각형 채우기 | click vertices, commit fills the polygon with tall wall (Shift+Enter: duct) |
 | `A` | 배치 | put the asset chosen in the library at the click; Ctrl+wheel or `R` turns it first |
+
+Every tool shows what it is about to do before it does it. A brush stroke is drawn as a decal in the
+layer's colour under the cursor from the first pixel, and the hose or wall is rebuilt on a fixed
+cadence while the button is down, so the geometry grows behind the brush. A path shows its band,
+its vertices and the curve through them while you click, and a track path both hoses. The line
+under the toolbar lists the keys that matter for the current tool.
+
+Paths stay editable. In 선택·이동 a path is picked by its band and its vertices by their handles:
+drag a vertex (the decal follows instantly, the raster on the next tick), Alt+click on the band to
+insert a vertex, Tab or a double-click to switch a vertex between straight and curved, `C` to close
+or open, Delete for a vertex or the whole path, the arrow keys to nudge. The inspector edits the
+width, the hose band of a track, all-curve / all-straight, and the lane direction.
 
 Camera: middle-drag or Alt+left orbits, right-drag or Shift+left pans on the ground, the wheel
 zooms toward the cursor, `F` frames everything, `5` toggles a top-down view. Ctrl+Z / Ctrl+Y undo
@@ -101,6 +127,9 @@ venue, or `gen:competition:3+props7` to move the props around.
 * Walls have one height class each; a mesh baked into the grid loses its top. Props stay convex
   per band. There is no per-cell height field and no arbitrary triangle collision, by design of the
   tracer (see [Architecture](architecture.md#maps)).
+* A track path's hoses are a distance band around the centreline, so a sharp corner vertex gives a
+  rounded inner hose of the hose's own radius; the preview edge lines are a plain offset and may
+  show a small tick at such a corner.
 * Scenes are local files, not catalogue code: `learn/common.py`'s named track sets do not include
   them unless you list `scene:<name>` in a `--tracks` argument.
 
@@ -108,7 +137,7 @@ venue, or `gen:competition:3+props7` to move the props around.
 
 | | |
 | --- | --- |
-| `f1sim/f1sim/scene.py` | `SceneDoc`, `PropPlacement`, `AssetInfo`; paint/fill/bake operations; asset import; `python -m f1sim.scene import / validate / export-ros` |
+| `f1sim/f1sim/scene.py` | `SceneDoc`, `PathSpec` (straight/curved vertices, `sample_path`), `PropPlacement`, `AssetInfo`; paint/fill/bake operations, path rasterisation, live corridor check; asset import; `python -m f1sim.scene import / validate / export-ros` |
 | `f1sim/f1sim/props.py` | the `mesh` prop style (`path`, `scale`, `up`) beside the six built-ins |
 | `f1sim/f1sim/maps.py` | the `scene:` prefix and `scene_names()` |
 | `f1sim/f1sim/viewer/contours.py`, `geometry.py` | torch-free marching-squares contours and the geometry build the worker and the editor share |
