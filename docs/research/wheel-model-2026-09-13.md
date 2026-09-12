@@ -1,8 +1,9 @@
 # A wheel that can slip: the rear-axle rotation state, and what the recordings say about it
 
-2026-09-13, branch `feat/wheel-dynamics`. Companion to
-[the traction guard's report](../../../real-car-tcs/REPORT.md) (§9 of which scoped this) and to
-[`docs/real_data_calibration.md` §2.12](../real_data_calibration.md), which carries the measurements.
+2026-09-13, branch `feat/wheel-dynamics`. Companion to the traction guard's own report (the
+`feat/real-car-tcs` lane's `REPORT.md`, §9 of which scoped this — it lives beside the worktree, not
+in the repository) and to [`docs/real_data_calibration.md` §2.12](../real_data_calibration.md),
+which carries the measurements. The guard itself is documented in [`docs/ros2.md`](../ros2.md).
 
 Until now the simulator could not spin or lock a wheel. `dynamics.py` carried no wheel rotation
 state, `actuators.vesc_accel` closed its loop on the true body speed, and `odom.py` reported that
