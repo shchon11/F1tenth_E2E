@@ -192,3 +192,100 @@ def test_the_traffic_expert_drives_the_scenario_it_was_given(ma, su, legacy, rn)
         prep.close()
     assert res["n"] == 2
     assert res["tally"]["denominator"] == 2
+
+
+# ------------------------------------------------------------------ the whole CLI, end to end
+
+def test_the_report_cli_renders_a_traffic_suite(tmp_path, su):
+    """A frozen T suite, synthetic rows for every declared cell, and `report` through the CLI.
+
+    The unit tests exercise `aggregate` and `validate_cell` directly; this is the path an actual
+    run takes -- `suite.load`, the roster, `validate_results` with the whole strict argument set,
+    then the renderer. It is where a T cell would be refused for a reason no unit test poses, and a
+    144-cell GPU run finding that out afterwards is the expensive way to learn it.
+    """
+    import hashlib
+    import json
+    import os
+    import subprocess
+    import sys
+
+    # A three-cell traffic suite: one map, one friction, one seed, all four scenarios.
+    s = su.Suite(version="v2.1-test", solo_maps=(), obstacle_maps=(), race_maps=(),
+                 solo_mus=(su.MU_LOW,), paired_mus=(su.MU_LOW,), seeds=(4401,), envs=4)
+    s.traffic = {"contention_range_m": 12.0, "attack_range_m": 3.0, "maps": ["m1"],
+                 "mus": [su.MU_LOW],
+                 "scenarios": [dict(sc) for sc in su.V21_TRAFFIC_SCENARIOS]}
+    s.placements = {"m1": {"placement": {}, "proofs": {}}}
+    sp = tmp_path / "suite.json"
+    freeze = s.save(str(sp))
+    assert s.expected_trials() == {"S": 0, "A": 0, "O": 0, "T": 16}
+
+    body = b"weights"
+    ck = tmp_path / "w.pt"
+    ck.write_bytes(body)
+    sha = hashlib.sha256(body).hexdigest()
+    rj = tmp_path / "roster.json"
+    rj.write_text(json.dumps({"systems": [
+        {"system_id": "sys", "path": str(ck), "checkpoint_sha256": sha,
+         "controller_arm": "legacy"}]}))
+
+    n = 4
+    cells = []
+    for cell in s.cells():
+        sc = s.traffic_scenario(cell.variant)
+        rs = int(sc["race_size"])
+        cells.append({
+            "system_id": "sys", "checkpoint_sha256": sha, "controller_arm": "legacy",
+            "suite_freeze_sha256": freeze, "suite_version": s.version,
+            "map_id": cell.map_id, "mu": cell.mu, "seed": cell.seed, "n_envs": n,
+            "suite": "T", "variant": cell.variant, "runtime": "legacy",
+            "cell_id": cell.cell_id(), "source_digest": {"sim.py": "abc"},
+            "speed_cap": s.speed_cap, "budget_laps": s.budget_laps,
+            "sensor_noise": s.sensor_noise, "backend": s.backend,
+            "result": {
+                "n": n,
+                "tally": {"successes": 3, "denominator": n, "failures": {"contact": 1}},
+                "outcomes": [{"success": True, "reason": None}] * 3 +
+                            [{"success": False, "reason": "contact"}],
+                "progress_m": [12.0] * n, "distance_m": [12.0] * n,
+                "route_progress_fraction": [0.3] * n, "lap_time_s": [None] * n,
+                "passes": [1, 0, 0, 0], "leads_lost": [0] * n, "opponent_respawns": [0] * n,
+                "contention_s": [9.0] * n, "following_s": [5.0] * n, "attack_s": [2.0] * n,
+                "defending_s": [1.0] * n, "opponent_progress_m": [10.0] * n,
+                "pace_ratio": [{"value": 1.2, "reason": None}] * n,
+                "closest_arc_gap_m": [0.8] * n,
+                "event_in_window_s": [1.0] * n, "event_seen_s": [1.5] * n,
+                "contended": n, "car_contacts": 1, "wall_collisions": 0,
+                "event_in_window_trials": n if sc["opp_events"] else 0,
+                "n_opponents": rs - 1, "contention_range_m": 12.0, "attack_range_m": 3.0,
+                "effective": {"true_mu": cell.mu, "plant_mu": cell.mu, "envs": n * rs,
+                              "race_size": rs,
+                              "opp_speed_range": list(sc["opp_speed_range"]),
+                              "opp_events": list(sc["opp_events"]),
+                              "opp_event_rate": float(sc["opp_event_rate"])},
+                "start_fingerprint": {
+                    "schema_version": 1,
+                    "physical_sha256": "a" * 64, "physical_tensors": 20,
+                    "actor_input_sha256": "b" * 64, "actor_input_tensors": 6,
+                    "calibration_sha256": "c" * 64, "calibration_tensors": 8,
+                    "obs_spec_sha256": "d" * 64, "sim_t": 0.3, "sim_imu_phase": 1,
+                    "n_envs_total": n * rs, "race_size": rs},
+            }})
+    res = tmp_path / "results.json"
+    res.write_text(json.dumps({"cells": cells}))
+
+    out = tmp_path / "lb.md"
+    env = dict(os.environ)
+    r = subprocess.run([sys.executable, "-m", "f1sim.learn.benchmark", "report",
+                        "--suite", str(sp), "--roster", str(rj), "--results", str(res),
+                        "--out", str(out)], capture_output=True, text=True, cwd=str(tmp_path),
+                       env=env)
+    assert r.returncode == 0, r.stderr
+    md = out.read_text()
+    assert "## Traffic" in md
+    for v in ("slow", "pace", "event", "pair"):
+        assert f"· {v} " in md or f"· {v} |" in md, f"{v} scenario missing from the table"
+    assert "all scenarios" in md
+    assert "0.750" in md                      # 3/4 clean, derived from the raw outcomes
+    assert "N/A (category not evaluated)" in md      # S, A and O were never run
