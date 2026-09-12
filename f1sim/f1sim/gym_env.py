@@ -287,6 +287,11 @@ class F1VecEnv:
         self.ext_cmd = torch.zeros(self.B, 2, device=self.device)
         self.ext_mask = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self._ext_ids: set = set()               # host-side copy of the mask: no device sync per command
+        #: Optional `(B, 2) -> (B, 2)` shaper for the command on its way to the simulator, installed
+        #: by a controller that sits between the policy and the VESC. `learn/traction_arm.py` is the
+        #: one that exists. None is the untouched path; there is deliberately room for exactly one,
+        #: since two shapers on one command path is not a thing to resolve by installation order.
+        self.cmd_shaper = None
         self.row_dim = 1 + 6 + 2 + self.act_dim
         self.hist = torch.zeros(self.B, (e.hist_len - 1) * e.hist_stride + 1, self.row_dim, device=self.device) if e.hist_len > 0 else None
         self._last_feat = torch.zeros(self.B, 9, device=self.device)
@@ -598,6 +603,12 @@ class F1VecEnv:
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)
+        if self.cmd_shaper is not None:
+            # A controller sitting between the policy and the VESC: `learn/traction_arm.py` is the
+            # one that exists, and it shapes the speed the way `policy_node` shapes `/drive` on the
+            # car. Before the external override on purpose -- a teleoperated or ROS-driven car is
+            # the mux output, which the node does not shape either.
+            cmd = self.cmd_shaper(cmd)
         if self._ext_ids:
             cmd = torch.where(self.ext_mask[:, None], self.ext_cmd, cmd)
         steer_norm = cmd[:, 0] / self.s_max

@@ -72,6 +72,12 @@ class AdapterError(RuntimeError):
 
 
 # ------------------------------------------------------------------ loading
+def _arm_base(arm: str) -> str:
+    """The tracker arm underneath a possibly-composed name: `"fixed_low+tcs"` -> `"fixed_low"`."""
+    from f1sim.learn.grip_runtime import split_arm
+    return split_arm(str(arm or "legacy"))[0]
+
+
 def load_actor(entry: Dict[str, Any], device):
     """One roster entry -> `(model, extra)`, strictly, with the arm declared rather than guessed.
 
@@ -337,7 +343,8 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
         try:
             controller = grip_rt.ControllerRuntime(
                 env, arm,
-                estimator_path=(entry.get("estimator_path") if arm == "estimated" else None),
+                estimator_path=(entry.get("estimator_path")
+                                if _arm_base(arm) == "estimated" else None),
                 device=device)
             controller.install(graph_rt=holder)
             if (float(env.sim.t), int(getattr(env.sim, "_imu_phase", 0))) != (t0, phase0):
@@ -377,6 +384,8 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
         "spec": spec, "spec_match": spec_match,
         "spawn_s_m": spawn_s_m,
         "graphed": bool(getattr(controller, "graphed", False)) if controller else False,
-        "estimator_path": (entry.get("estimator_path") if arm == "estimated" else None),
+        "estimator_path": (entry.get("estimator_path")
+                           if _arm_base(arm) == "estimated" else None),
+        "wheel_model": bool(getattr(env.sim, "wheel_model", False)),
     }
     return PreparedCell(env=env, controller=controller, graph_holder=holder, protocol=protocol)

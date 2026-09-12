@@ -18,7 +18,13 @@ import hashlib
 import json
 import os
 
-ARMS = ("legacy", "fixed_low", "estimated")
+#: Derived from the runtime's list rather than restated, so the roster can never pin an arm no
+#: `ControllerRuntime` will build. The `oracle` arms are dropped: their friction is privileged, so a
+#: number they produce is not a benchmark result. The `+tcs` arms are in, because
+#: `fixed_low+tcs` is what the car deploys.
+from f1sim.learn.grip_runtime import ARMS as _RUNTIME_ARMS, split_arm       # noqa: E402
+
+ARMS = tuple(a for a in _RUNTIME_ARMS if not split_arm(a)[0] == "oracle")
 
 #: Filenames training rewrites in place. A roster may never point at one of these directly.
 MOVING_POINTERS = ("ppo_latest.pt", "latest.pt", "last.pt")
@@ -70,9 +76,10 @@ class Entry:
         if actual != self.checkpoint_sha256:
             raise ValueError(f"{self.system_id}: sha mismatch\n  declared {self.checkpoint_sha256}"
                              f"\n  actual   {actual}")
-        if (self.controller_arm == "estimated") != bool(self.estimator_sha256):
+        base, _tcs = split_arm(self.controller_arm)
+        if (base == "estimated") != bool(self.estimator_sha256):
             raise ValueError(f"{self.system_id}: arm {self.controller_arm} and estimator pin disagree")
-        if self.controller_arm == "estimated":
+        if base == "estimated":
             # A declared sha with no resolvable file is not a pin. The runtime cannot load it, so
             # the entry must fail here rather than at GPU time.
             if not self.estimator_path:

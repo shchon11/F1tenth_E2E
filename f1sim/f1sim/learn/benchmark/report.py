@@ -25,7 +25,8 @@ def validate_row(row: dict) -> None:
     missing = [k for k in REQUIRED_PINS if row.get(k) in (None, "")]
     if missing:
         raise ReportError(f"row missing required pins: {', '.join(missing)}")
-    if row["controller_arm"] == "estimated" and not row.get("estimator_sha256"):
+    from f1sim.learn.grip_runtime import split_arm
+    if split_arm(str(row["controller_arm"]))[0] == "estimated" and not row.get("estimator_sha256"):
         raise ReportError(f"{row['system_id']}: estimated arm without an estimator pin")
     path = str(row.get("checkpoint_path", ""))
     # Same rule as the roster: an unresolved alias is refused, a substring is not. An immutable

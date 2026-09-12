@@ -282,7 +282,7 @@ class Timer:
 
 @torch.no_grad()
 def rollout_metrics(env: F1VecEnv, policy_fn, steps: int, speed_cap: Optional[float] = None,
-                    per_track: bool = False) -> dict:
+                    per_track: bool = False, controller=None) -> dict:
     """Run a policy (obs -> normalized action) for `steps` control steps on all envs.
 
     collisions_per_km is the metric to watch: a hazard rate per metre driven, independent of the
@@ -293,19 +293,30 @@ def rollout_metrics(env: F1VecEnv, policy_fn, steps: int, speed_cap: Optional[fl
     per_track: also return the hazard rate for each track id. The set average is dominated by the
     easy tracks -- a 2.1 coll/km average hid a 12 coll/km track in the same set -- so the maximum
     over tracks is what tells you whether anything is actually broken.
+
+    controller: a `grip_runtime.ControllerRuntime`, driven here in the same order `ppo.py` drives
+    it -- `begin` once after the reset, `pre_action` before the policy is asked for anything,
+    `post_step` immediately after the step. Getting that order wrong is how an arm becomes a legacy
+    run wearing another arm's name, so there is one loop that knows it rather than two.
     """
     if speed_cap is not None:
         env.set_speed_cap(speed_cap)
     obs, info = env.reset()
+    if controller is not None:
+        controller.begin(obs)
     lm = env.learner; nL = int(lm.sum())                     # races with teacher opponents: learners only
     n_coll = 0; n_ended = 0; prog = 0.0; lap_times = []; speeds = []
     T = env.sim.track.T
     coll_by_track = torch.zeros(T, device=env.device); dist_by_track = torch.zeros(T, device=env.device)
     dt = env.sim.control_dt
     for t in range(steps):
+        if controller is not None:
+            controller.pre_action(obs)
         a = policy_fn(obs)
         tid_before = env.sim.tid.clone()                      # the track this transition happened on
         obs, rew, term, trunc, info = env.step(a)
+        if controller is not None:
+            controller.post_step(term, trunc)
         prog += info["progress"][lm].sum().item()
         speeds.append(env.sim.state[lm, 3].mean().item())
         lap_times += info["lap_times"][lm[info["lap_ids"]]].tolist()
