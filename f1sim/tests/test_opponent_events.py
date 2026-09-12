@@ -48,10 +48,10 @@ def _env(events=(), rate=0.0, envs=8, seed=7, track=TRACK, **cfg_kw):
     return common.make_env([tr], envs, "cpu", ecfg, cfg=cfg, seed=seed, rls=[rl])
 
 
-def _actions(steps: int, B: int, seed: int) -> torch.Tensor:
+def _actions(steps: int, B: int, seed: int, act_dim: int = 2) -> torch.Tensor:
     """A fixed action tape, drawn from its own generator so no rollout can perturb another's."""
     g = torch.Generator().manual_seed(seed)
-    return torch.rand(steps, B, 2, generator=g) * 2 - 1
+    return torch.rand(steps, B, act_dim, generator=g) * 2 - 1
 
 
 def _rollout(env, tape, seed: int):
@@ -124,7 +124,7 @@ def _drive(env, steps: int, seed: int, speed: float = 0.2):
     so a constant action keeps the rollout cheap and free of action-tape coupling.
     """
     env.reset(seed=seed)
-    a = torch.zeros(env.B, 2); a[:, 1] = speed
+    a = _throttle(env, speed)
     ids, offs, opp_speed = [], [], []
     for _ in range(steps):
         _, _, _, _, info = env.step(a)
@@ -132,6 +132,13 @@ def _drive(env, steps: int, seed: int, speed: float = 0.2):
         offs.append(info["opp_event"]["offset"].clone())
         opp_speed.append(env.sim.state[:, 3].clone())
     return torch.stack(ids), torch.stack(offs), torch.stack(opp_speed)
+
+
+def _throttle(env, speed: float) -> torch.Tensor:
+    """A constant mild throttle in whichever action space this env uses (direct, or a plan's speeds)."""
+    a = torch.zeros(env.B, env.act_dim)
+    a[:, 1 if env.act_dim == 2 else slice(-2, None)] = speed
+    return a
 
 
 def _starts(ids: torch.Tensor) -> torch.Tensor:
@@ -361,6 +368,49 @@ def test_events_do_not_add_opponent_wall_contacts():
     with_events = opp_wall_hits(events=("shift", "weave"), rate=4.0)
     assert with_events <= base + 2, \
         f"opponents hit the wall {with_events} times with lane-change events against {base} without"
+
+
+# --------------------------------------------------------------------------- the plan action space
+def _plan_env(events=(), rate=0.0, envs=4, seed=101):
+    tr, rl = _track_and_raceline(TRACK)
+    cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
+    ecfg = EnvConfig(race_size=2, opponent="teacher", max_steps=4000, hist_len=0,
+                     action_mode="plan", compile_tracker=False,
+                     opp_events=events, opp_event_rate=rate)
+    return common.make_env([tr], envs, "cpu", ecfg, cfg=cfg, seed=seed, rls=[rl])
+
+
+def test_the_plan_action_space_carries_the_events_too():
+    """`--action-mode plan` drives opponents through `plan_action`, a different function.
+
+    Both halves matter: with the events off the plan path must be bit-identical (it is the path a
+    plan-space run already trains on), and with them on the plan speeds and the planned line have to
+    move, or the flags would silently do nothing for half the runs on this branch.
+    """
+    steps = 60
+    off, control = _plan_env(), _plan_env()
+    control.events = None
+    assert off.act_dim > 2, "the plan action space collapsed to the direct one; this test is vacuous"
+    tape = _actions(steps, 4, seed=103, act_dim=off.act_dim)
+    for i, (fa, fb) in enumerate(zip(_rollout(off, tape, seed=103), _rollout(control, tape, seed=103))):
+        for name, ta, tb in zip(("scan", "speed", "reward", "term", "trunc", "priv", "state", "cmd"), fa, fb):
+            assert torch.equal(ta, tb), f"plan mode, step {i}: {name} differs with events off"
+
+    on = _plan_env(events=("stop", "shift"), rate=15.0, seed=103)
+    ids, offs, speed = _drive(on, 250, seed=103)
+    opp = ~on.learner
+    assert int((ids[:, opp] != 0).sum()) > 50, "no event fired in the plan action space"
+    assert float(offs[:, opp].abs().max()) > 0.05, "no shift reached the plan"
+    parked = speed[:, opp][ids[:, opp] == EVENT_ID["stop"]]
+    free = speed[:, opp][ids[:, opp] == 0]
+    assert parked.numel() > 0, "no stop event ran in the plan action space"
+    # Not "reaches 0 m/s": in the plan action space the opponent's speed is a *reference* walked
+    # down by the tracker, which delivers about 3.4 m/s^2 against its nominal bound (the same soft
+    # speed weight `opp_follow_decel` is calibrated against), so a 1 s stop from 4 m/s ends before
+    # the car does. What has to be true is that a stop is a hard, sustained deceleration.
+    assert float(parked.min()) < 0.35 * float(free.mean()), (
+        f"a stopped opponent only reached {float(parked.min()):.2f} m/s against a free-running "
+        f"{float(free.mean()):.2f} m/s: the plan speeds are not being scaled")
 
 
 # --------------------------------------------------------------------------- 5. the flags
