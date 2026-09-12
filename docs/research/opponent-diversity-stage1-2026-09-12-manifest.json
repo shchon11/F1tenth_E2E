@@ -1,0 +1,110 @@
+{
+  "title": "Opponent diversity stage 1 pilot: matched control vs joint range expansion",
+  "date": "2026-09-12",
+  "produced_by": "opponent-diversity stage 1, isolated worktree 1a19b68",
+  "verdict": "predeclared pilot advancement gates NOT met (avoidance -3, combined A+O -1, slip ratio 1.22098); no promotion",
+  "training": {
+    "pair": {
+      "cl_oppdiv_control_s801": {
+        "final_sha256": "3fd9063e634021d81d0609dbdf23c92b88bfdb17c73324c938c1aa386f042d43",
+        "updates": 32,
+        "nominal_slots": 262144,
+        "returncode": 0,
+        "wandb_id": "wz7sk2td",
+        "tensors_changed_vs_init": "125/125",
+        "l2_delta_vs_init": 1.946205973625183,
+        "all_model_tensors_finite": true,
+        "all_adam_tensors_finite": true,
+        "fresh_optimizer": false
+      },
+      "cl_oppdiv_range_s801": {
+        "final_sha256": "1207e17f45665ab7a2fb6cbcf31be17e6fba5f2a2d5dd50fe4a0ae40484ca5ca",
+        "updates": 32,
+        "nominal_slots": 262144,
+        "returncode": 0,
+        "wandb_id": "jipyvtyh",
+        "tensors_changed_vs_init": "125/125",
+        "l2_delta_vs_init": 1.9490478038787842,
+        "all_model_tensors_finite": true,
+        "all_adam_tensors_finite": true,
+        "fresh_optimizer": false
+      }
+    },
+    "init": {
+      "path": "/home/shchon11/f1sim_runs/cl_origrecipe_legacy_s701/ppo_final.pt",
+      "sha256": "29e82233853868be33773ba0ea65d68268ba259b477828f019f7f106095055b6",
+      "unchanged_after_runs": true
+    },
+    "argv_differences": [
+      "--name",
+      "--opp-speed",
+      "--spawn-gap"
+    ],
+    "source_freeze_sha256": "42e146c5233792fea53ddf7b468915459488c36e87c4ff5dbcf7a70f630a8c19",
+    "source_files_frozen": 77,
+    "source_drift_after_each_job": [],
+    "serial": true,
+    "foreign_viewer_left_running": [
+      258757,
+      281057
+    ]
+  },
+  "evaluation": {
+    "suite_freeze_sha256": "6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce",
+    "suite_version": "v1",
+    "systems": 5,
+    "cells_per_system": 34,
+    "trials_per_system": 272,
+    "freshly_scored": [
+      "cl_oppdiv_control_s801@estimated",
+      "cl_oppdiv_range_s801@estimated"
+    ],
+    "reused_after_full_validation": [
+      "frozen_original@estimated",
+      "cl_origrecipe_legacy_s701@estimated",
+      "cl_origrecipe_legacy_s702@estimated"
+    ],
+    "five_system_audit": {
+      "all_systems_present_and_complete": true,
+      "one_source_digest_and_it_is_this_worktree": true,
+      "suite_freeze_and_version": true,
+      "rows_match_roster_pins": true,
+      "coverage": true,
+      "paired_starts_all_fields_all_systems": true
+    },
+    "estimator": {
+      "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+      "sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf"
+    },
+    "merged_cells_sha256": "905e32637ac40bcdc9dcb950ae1de7d2adb8f461ab12cb93dc680bb12d07b60a",
+    "concurrency": "two evaluation processes in parallel, measured headroom 6444 MiB free; never concurrent with training"
+  },
+  "judgment_artifact": "opponent-diversity-stage1-2026-09-12-judgment.json is the independent root audit; the executor's own reconstruction agreed on every count, ratio and the paired pace",
+  "promotion": "none; no further training authorized",
+  "files": {
+    "opponent-diversity-stage1-2026-09-12-judgment.json": {
+      "sha256": "5b67d28258eed1bfbb798d880715c5c4b93ecb5c6e859745a2e13a027faab5e3",
+      "bytes": 5725
+    },
+    "opponent-diversity-stage1-2026-09-12-leaderboard.md": {
+      "sha256": "3f2b369f018dbeb73e58b4c1f78e44859a8cdc7237cb9938b4611ff13bc41df0",
+      "bytes": 4948
+    },
+    "opponent-diversity-stage1-2026-09-12-paired-pace.json": {
+      "sha256": "8efc2b1a8bd227e1f90354203e7b15a0088718c549d06616c2e51a8bfcd0ee59",
+      "bytes": 837
+    },
+    "opponent-diversity-stage1-2026-09-12-raw-cells.jsonl": {
+      "sha256": "905e32637ac40bcdc9dcb950ae1de7d2adb8f461ab12cb93dc680bb12d07b60a",
+      "bytes": 1360245
+    },
+    "opponent-diversity-stage1-2026-09-12-roster.json": {
+      "sha256": "b5cd5662176a9a0e117069d735aae8333c012bdb86e14fd710c8a81ba0582a18",
+      "bytes": 3753
+    },
+    "opponent-diversity-stage1-2026-09-12.md": {
+      "sha256": "7998e4c5185309c0571ec34c848319cddd5a4153a86a012a2465e6b77e60046f",
+      "bytes": 5578
+    }
+  }
+}

@@ -1,0 +1,215 @@
+{
+  "cells_sha256": "905e32637ac40bcdc9dcb950ae1de7d2adb8f461ab12cb93dc680bb12d07b60a",
+  "roster_sha256": "b5cd5662176a9a0e117069d735aae8333c012bdb86e14fd710c8a81ba0582a18",
+  "audit_script_sha256": "36bcf08c0e9a7d6dcaa59f8751697121fb44886f40ae4450c4ad0a82ea5a717e",
+  "validation": {
+    "n_rows": 170,
+    "n_systems": 5,
+    "suite_freeze_sha256": "6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce"
+  },
+  "counts": {
+    "cl_oppdiv_control_s801@estimated": {
+      "solo": {
+        "successes": 136,
+        "trials": 144
+      },
+      "low": {
+        "successes": 43,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 50,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 42,
+        "trials": 64
+      },
+      "distance_km": 9.16194362661778,
+      "collision_count": 44,
+      "large_slip_seconds": 23.47499999999998,
+      "collisions_per_km": 4.802474430443862,
+      "slip_seconds_per_km": 2.562229255787945
+    },
+    "cl_oppdiv_range_s801@estimated": {
+      "solo": {
+        "successes": 136,
+        "trials": 144
+      },
+      "low": {
+        "successes": 43,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 47,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 44,
+        "trials": 64
+      },
+      "distance_km": 9.245882289725495,
+      "collision_count": 45,
+      "large_slip_seconds": 28.92499999999997,
+      "collisions_per_km": 4.867031462211707,
+      "slip_seconds_per_km": 3.128419667654966
+    },
+    "cl_origrecipe_legacy_s701@estimated": {
+      "solo": {
+        "successes": 134,
+        "trials": 144
+      },
+      "low": {
+        "successes": 41,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 44,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 43,
+        "trials": 64
+      },
+      "distance_km": 9.113692072967252,
+      "collision_count": 51,
+      "large_slip_seconds": 30.374999999999968,
+      "collisions_per_km": 5.595975768292041,
+      "slip_seconds_per_km": 3.332897332585697
+    },
+    "cl_origrecipe_legacy_s702@estimated": {
+      "solo": {
+        "successes": 136,
+        "trials": 144
+      },
+      "low": {
+        "successes": 43,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 43,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 45,
+        "trials": 64
+      },
+      "distance_km": 9.136063815397117,
+      "collision_count": 48,
+      "large_slip_seconds": 27.09999999999998,
+      "collisions_per_km": 5.253903756572391,
+      "slip_seconds_per_km": 2.96626649589816
+    },
+    "frozen_original@estimated": {
+      "solo": {
+        "successes": 134,
+        "trials": 144
+      },
+      "low": {
+        "successes": 41,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 41,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 42,
+        "trials": 64
+      },
+      "distance_km": 9.06556903087641,
+      "collision_count": 55,
+      "large_slip_seconds": 30.999999999999968,
+      "collisions_per_km": 6.0669109476388705,
+      "slip_seconds_per_km": 3.419531625032814
+    }
+  },
+  "decision": {
+    "promising_pilot": false,
+    "gates": {
+      "vs_control/solo": {
+        "passed": true,
+        "delta": 0,
+        "maximum_loss": 2
+      },
+      "vs_control/low": {
+        "passed": true,
+        "delta": 0,
+        "maximum_loss": 1
+      },
+      "vs_control/avoidance": {
+        "passed": false,
+        "delta": -3,
+        "maximum_loss": 0
+      },
+      "vs_control/overtaking": {
+        "passed": true,
+        "delta": 2,
+        "maximum_loss": 0
+      },
+      "vs_control/collisions_per_km": {
+        "passed": true,
+        "reference": 4.802474430443862,
+        "candidate": 4.867031462211707,
+        "ratio": 1.013442451949063,
+        "maximum_ratio": 1.1
+      },
+      "vs_control/slip_seconds_per_km": {
+        "passed": false,
+        "reference": 2.562229255787945,
+        "candidate": 3.128419667654966,
+        "ratio": 1.2209757033208586,
+        "maximum_ratio": 1.1
+      },
+      "vs_original/low": {
+        "passed": true,
+        "delta": 2,
+        "maximum_loss": 2
+      },
+      "vs_original/collisions_per_km": {
+        "passed": true,
+        "reference": 6.0669109476388705,
+        "candidate": 4.867031462211707,
+        "ratio": 0.8022256308386834,
+        "maximum_ratio": 1.1
+      },
+      "vs_original/slip_seconds_per_km": {
+        "passed": true,
+        "reference": 3.419531625032814,
+        "candidate": 3.128419667654966,
+        "ratio": 0.9148678856347602,
+        "maximum_ratio": 1.1
+      },
+      "vs_control/combined_avoidance_overtaking": {
+        "passed": false,
+        "gain": -1,
+        "required_gain": 4
+      }
+    },
+    "automatic_promotion": false,
+    "additional_training_authorized": false
+  },
+  "paired_pace": {
+    "cl_oppdiv_range_s801@estimated vs cl_oppdiv_control_s801@estimated": {
+      "n": 136,
+      "reference_mean_s": 11.10202205882362,
+      "candidate_mean_s": 11.085845588235385,
+      "delta_s": -0.016176470588235525,
+      "percent": -0.14570742611143397
+    },
+    "cl_oppdiv_control_s801@estimated vs frozen_original@estimated": {
+      "n": 134,
+      "reference_mean_s": 10.895522388059788,
+      "candidate_mean_s": 11.081716417910537,
+      "delta_s": 0.18619402985074893,
+      "percent": 1.7089041095890516
+    },
+    "cl_oppdiv_range_s801@estimated vs frozen_original@estimated": {
+      "n": 134,
+      "reference_mean_s": 10.895522388059788,
+      "candidate_mean_s": 11.06436567164188,
+      "delta_s": 0.16884328358209194,
+      "percent": 1.549657534246585
+    }
+  }
+}

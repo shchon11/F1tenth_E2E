@@ -1,0 +1,24 @@
+{
+  "basis": "solo trials completed by both systems of each pair",
+  "range_vs_control": {
+    "shared_successes": 136,
+    "reference_mean_seconds": 11.102022058823618,
+    "candidate_mean_seconds": 11.085845588235387,
+    "mean_delta_seconds": -0.01617647058823124,
+    "percent_mean_difference": -0.1457074261113954
+  },
+  "range_vs_original": {
+    "shared_successes": 134,
+    "reference_mean_seconds": 10.895522388059792,
+    "candidate_mean_seconds": 11.064365671641884,
+    "mean_delta_seconds": 0.16884328358209189,
+    "percent_mean_difference": 1.549657534246584
+  },
+  "control_vs_original": {
+    "shared_successes": 134,
+    "reference_mean_seconds": 10.895522388059792,
+    "candidate_mean_seconds": 11.081716417910538,
+    "mean_delta_seconds": 0.1861940298507463,
+    "percent_mean_difference": 1.7089041095890272
+  }
+}

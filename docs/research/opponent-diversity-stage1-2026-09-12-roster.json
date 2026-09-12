@@ -1,0 +1,55 @@
+{
+ "_what": "opponent-diversity stage 1 pilot: five reported systems (original reference, A701, A702, and the matched control/range pilot pair)",
+ "systems": [
+  {
+   "system_id": "frozen_original@estimated",
+   "path": "/home/shchon11/f1sim_runs/_baselines/frozen_original_48cc698f.pt",
+   "checkpoint_sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef",
+   "controller_arm": "estimated",
+   "estimator_path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "cross_runtime": true,
+   "note": "absolute safety reference; MUST be rescored here (its published rows carry a different benchmark __main__ digest)"
+  },
+  {
+   "system_id": "cl_origrecipe_legacy_s701@estimated",
+   "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/recipe-restore-20260912/pins/cl_origrecipe_legacy_s701_ppo_final.pt",
+   "checkpoint_sha256": "29e82233853868be33773ba0ea65d68268ba259b477828f019f7f106095055b6",
+   "controller_arm": "estimated",
+   "estimator_path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "cross_runtime": true,
+   "note": "recipe-restore 2026-09-12 (legacy_trained, Adam restored, lr 5e-5); rows reused, see reuse-audit.json"
+  },
+  {
+   "system_id": "cl_origrecipe_legacy_s702@estimated",
+   "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/opponent-diversity-stage1/scores/stage1-20260912/pins/cl_origrecipe_legacy_s702_ppo_final.pt",
+   "checkpoint_sha256": "0d904012dd29e2de997a5ecf0e82faace8b4f4005862c3d8a2bf29e6af2348d2",
+   "controller_arm": "estimated",
+   "estimator_path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "cross_runtime": true,
+   "note": "A replication seed 702, same recipe as A701 apart from name/seed"
+  },
+  {
+   "system_id": "cl_oppdiv_control_s801@estimated",
+   "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/opponent-diversity-stage1/scores/pilot-20260912/pins/cl_oppdiv_control_s801_ppo_final.pt",
+   "checkpoint_sha256": "3fd9063e634021d81d0609dbdf23c92b88bfdb17c73324c938c1aa386f042d43",
+   "controller_arm": "estimated",
+   "estimator_path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "cross_runtime": true,
+   "note": "opponent-diversity pilot control: A701 init, Adam retained, default opp-speed (0.5,1.0) and spawn-gap (2.5,6.0)"
+  },
+  {
+   "system_id": "cl_oppdiv_range_s801@estimated",
+   "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/opponent-diversity-stage1/scores/pilot-20260912/pins/cl_oppdiv_range_s801_ppo_final.pt",
+   "checkpoint_sha256": "1207e17f45665ab7a2fb6cbcf31be17e6fba5f2a2d5dd50fe4a0ae40484ca5ca",
+   "controller_arm": "estimated",
+   "estimator_path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+   "estimator_sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf",
+   "cross_runtime": true,
+   "note": "opponent-diversity pilot treatment: identical to the control apart from name, opp-speed (0.35,1.10) and spawn-gap (1.5,9.0)"
+  }
+ ]
+}
