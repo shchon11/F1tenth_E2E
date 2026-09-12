@@ -238,7 +238,13 @@ class CellRecorder:
             det.update(float(gaps[j]), contact=contact,
                        opponent_reset=bool(resets[j]), terminated=hit)
         tr = self.traffic[i]
-        tr.update(dt=dt, ego_progress=progress, opponent_progress=opp_prog, gaps=gaps)
+        # A car that just respawned did not DRIVE from where it was to where it is: its arc advance
+        # this step is a teleport, often most of a lap, and averaging it into the opponents'
+        # progress would put a crash-and-respawn straight into the pace ratio as ground the learner
+        # lost. The step contributes the opponents that were actually there; if none were, it
+        # contributes no opponent arc at all, which is what `TrafficTrace` does with an empty list.
+        moved = [p for j, p in enumerate(opp_prog) if not (j < len(resets) and resets[j])]
+        tr.update(dt=dt, ego_progress=progress, opponent_progress=moved, gaps=gaps)
         in_window = any(abs(float(g)) <= self.contention_range_m for g in gaps)
         if in_window:
             self.contended[i] = True

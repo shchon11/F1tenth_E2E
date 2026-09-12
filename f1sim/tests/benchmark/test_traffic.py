@@ -673,3 +673,35 @@ def test_the_rendered_table_shows_the_traffic_category(rp, su):
     md = rp.render_markdown(summary, suite=s)
     assert "## Traffic" in md
     assert "pace vs opponent" in md and "clean ↑" in md
+
+
+def test_a_respawned_opponents_teleport_never_reaches_the_pace_ratio(rn):
+    """A car that respawns did not DRIVE from where it was to where it is.
+
+    Its arc advance that step is a teleport, often most of a lap, and averaging it into the
+    opponents' progress would put a crash-and-respawn straight into the pace ratio as ground the
+    learner lost -- or gained, depending on which way the wrap fell.
+    """
+    rec = traffic_recorder(rn, n=1)
+    for k in range(40):
+        reset = (k == 20)
+        rec.update(progress=[0.10], speed=[4.0], dt=0.025, collision=[False], truncated=[False],
+                   car_contact=[False], pair_gaps=[[3.0]],
+                   pair_progress=[[-24.0 if reset else 0.10]], pair_reset=[[reset]],
+                   budget_exhausted=(k == 39))
+    out = rec.finalize()
+    # 39 real steps of 0.10 m; the teleport step contributes nothing on either side of the ratio
+    assert out["opponent_progress_m"][0] == pytest.approx(3.9)
+    assert out["pace_ratio"][0]["value"] == pytest.approx(4.0 / 3.9)
+    assert out["opponent_respawns"] == [1]
+
+
+def test_with_two_opponents_only_the_respawned_one_drops_out_of_the_step(rn):
+    rec = traffic_recorder(rn, n=1, opponents=2)
+    rec.update(progress=[0.10], speed=[4.0], dt=0.025, collision=[False], truncated=[False],
+               car_contact=[False], pair_gaps=[[3.0, -3.0]],
+               pair_progress=[[-24.0, 0.20]], pair_reset=[[True, False]],
+               budget_exhausted=True)
+    out = rec.finalize()
+    assert out["opponent_progress_m"][0] == pytest.approx(0.20), (
+        "the surviving opponent's arc, not a mean with a teleport in it")
