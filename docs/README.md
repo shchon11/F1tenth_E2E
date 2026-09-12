@@ -9,6 +9,7 @@ Entry point: the [repository README](../README.md).
 | [Getting started](getting_started.md) | installation, CPU and GPU paths, the ROS 2 workspace build, troubleshooting |
 | [Architecture](architecture.md) | simulator fidelity, map catalogue, raceline and teacher, the viewer |
 | [Training](training.md) | DAgger, PPO, evaluation, the watch tool, observation and action detail |
+| [Tracks](tracks.md) | the track ids, the scenario grammar (direction / obstacle / seed), what 무작위 시드 does, and the three splits |
 | [Environment editor](environment_editor.md) | the console's 환경 page: building and editing scenes in 3D, importing mesh assets, the `scene:` map prefix, validation |
 | [Benchmark](benchmark.md) | the checkpoint leaderboard CLI — suite, roster pinning, scoring, metric definitions, adding a checkpoint later |
 | [Leaderboard](leaderboard/README.md) | the rendered leaderboard: six metrics per cohort with exact counts, paired pace, evidence links and limitations. `leaderboard/index.html` is the same report as a self-contained offline page |

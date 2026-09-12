@@ -26,6 +26,12 @@ that the simulator did not previously contain. **Adoption decisions use v2** (se
 [Held-out suite v2](#held-out-suite-v2)). Neither suite is an on-car claim. Scope is restated in
 every generated report, which reads it from the suite's own provenance field.
 
+Map names on this page are written in the **loader** grammar (`real:korea_2026_competition`,
+`gen:competition:9200+pinch9200`), and stay that way: they are the frozen suites' own cell ids
+(`S:gen:control:1400:0.73423:4401`), so every result file already published is keyed by them.
+[Tracks](tracks.md) has the short id for each (`real/korea26`, `gen/comp-9200#pinch:9200`) and the
+table that converts between the two.
+
 ## The pipeline
 
 | stage | loads a checkpoint? | needs a GPU? | what it does |
