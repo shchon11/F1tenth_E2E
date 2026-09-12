@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .geom import assert_rear_box_within_bound, thresholds
-from .overtake import PassDetector, outcome as pass_outcome
+from .overtake import PassDetector, TrafficTrace, outcome as pass_outcome
 from .tally import Tally
 
 
@@ -39,6 +39,11 @@ class CellRecorder:
     s_obs_m: float | None = None
     obstacle_window_m: float = 4.0
     frozen: bool = True
+    #: T only: how many opponents each learner is racing, and the two arc windows the traffic trace
+    #: uses. `n_opponents` sizes the per-pair detectors; 0 leaves the traffic path inert.
+    n_opponents: int = 0
+    contention_range_m: float = 12.0
+    attack_range_m: float = 3.0
 
     active: list = field(default_factory=list)
     outcome: list = field(default_factory=list)
@@ -54,6 +59,14 @@ class CellRecorder:
     progress_m: list = field(default_factory=list)
     distance_m: list = field(default_factory=list)
     elapsed_s: list = field(default_factory=list)
+    #: T only, per trial: one `PassDetector(repeat=True)` per opponent, one `TrafficTrace`, and
+    #: whether an opponent event was running while this learner was inside the contention window.
+    traffic: list = field(default_factory=list)
+    pair_detectors: list = field(default_factory=list)
+    event_in_window: list = field(default_factory=list)
+    event_in_window_s: list = field(default_factory=list)
+    event_seen_s: list = field(default_factory=list)
+    contended: list = field(default_factory=list)
     _mu0: list = field(default_factory=list)
 
     def __post_init__(self):
@@ -71,6 +84,21 @@ class CellRecorder:
         self.elapsed_s = [0.0] * self.n
         self.detectors = [PassDetector(length=self.track_length_m, overlap=overlap, clear=clear,
                                        hold_steps=self.hold_steps) for _ in range(self.n)]
+        if self.suite == "T":
+            self.traffic = [TrafficTrace(contention_range_m=self.contention_range_m,
+                                         attack_range_m=self.attack_range_m)
+                            for _ in range(self.n)]
+            # One detector per (learner, opponent) pair. `keep_history=False`: a traffic stint runs
+            # to its full budget -- thousands of steps -- against up to two opponents, and the trace
+            # was only ever read for a flag the detector now carries itself.
+            self.pair_detectors = [
+                [PassDetector(length=self.track_length_m, overlap=overlap, clear=clear,
+                              hold_steps=self.hold_steps, repeat=True, keep_history=False)
+                 for _ in range(self.n_opponents)] for _ in range(self.n)]
+            self.event_in_window = [False] * self.n
+            self.event_in_window_s = [0.0] * self.n
+            self.event_seen_s = [0.0] * self.n
+            self.contended = [False] * self.n
 
     # -- friction ------------------------------------------------------------------------------
     def bind_mu(self, mu_all) -> None:
@@ -107,13 +135,26 @@ class CellRecorder:
         for i, g in enumerate(gap):
             self.detectors[i].start(float(g))
 
+    def seed_pair_gaps(self, gaps) -> None:
+        """T: seed every (learner, opponent) pair. `gaps[i][j]` is learner i's arc to opponent j."""
+        for i, row in enumerate(gaps):
+            for j, g in enumerate(row):
+                self.pair_detectors[i][j].start(float(g))
+
     # -- one transition, read pre-reset ----------------------------------------------------------
     def update(self, *, progress, speed, dt, collision, truncated, s=None, gap=None,
                car_contact=None, opponent_reset=None, opponent_incident=None,
-               budget_exhausted=False, lateral=None):
+               budget_exhausted=False, lateral=None, pair_gaps=None, pair_progress=None,
+               pair_reset=None, opp_event_active=None):
         """Precedence is fixed and deliberate: a collision on the same step as a success is a
         failure. A car that touches something on the exit stride did not clear the obstacle, and a
-        car that crashes as the hold completes did not complete a clean pass."""
+        car that crashes as the hold completes did not complete a clean pass.
+
+        The T arguments are per (learner, opponent): `pair_gaps[i][j]` the signed arc, positive when
+        opponent j is ahead of learner i; `pair_progress[i][j]` that opponent's wrapped arc advance
+        this step; `pair_reset[i][j]` whether it entered this step just respawned.
+        `opp_event_active[i]` is whether any of learner i's opponents is running a scripted event.
+        """
         for i in range(self.n):
             if not self.active[i]:
                 continue
@@ -129,6 +170,12 @@ class CellRecorder:
             hit = bool(collision[i])
             contact = bool(car_contact[i]) if car_contact is not None else False
 
+            if self.suite == "T":
+                self._update_traffic(i, dt=dt, progress=float(progress[i]),
+                                     pair_gaps=pair_gaps, pair_progress=pair_progress,
+                                     pair_reset=pair_reset, contact=contact, hit=hit,
+                                     opp_event_active=opp_event_active)
+
             # Detectors advance every step, with terminal flags applied, even the first.
             if self.suite == "O" and gap is not None:
                 # Same-step precedence. An opponent that crashed on THIS transition must invalidate
@@ -142,6 +189,15 @@ class CellRecorder:
 
             if hit:
                 self._finish(i, False, self._collision_reason(i, contact))
+                continue
+
+            if self.suite == "T":
+                # No task event ends a traffic trial early. A pass is a counter, not a finish line,
+                # and there is nothing to "complete": the stint runs to the budget, and the only
+                # ways out are the wall and the other car, both handled above. Reaching the end is
+                # the success, and it is the one an unpassable floor still allows.
+                if bool(truncated[i]) or budget_exhausted:
+                    self._finish(i, True, None)
                 continue
 
             if self.suite == "O":
@@ -169,6 +225,30 @@ class CellRecorder:
 
             if bool(truncated[i]) or budget_exhausted:
                 self._finish(i, False, self._timeout_reason(i))
+
+    def _update_traffic(self, i: int, *, dt, progress, pair_gaps, pair_progress, pair_reset,
+                        contact, hit, opp_event_active) -> None:
+        """One traffic transition for learner i: the pair detectors, then the continuous trace."""
+        gaps = list(pair_gaps[i]) if pair_gaps is not None else []
+        opp_prog = list(pair_progress[i]) if pair_progress is not None else []
+        resets = list(pair_reset[i]) if pair_reset is not None else [False] * len(gaps)
+        for j, det in enumerate(self.pair_detectors[i]):
+            if j >= len(gaps):
+                break
+            det.update(float(gaps[j]), contact=contact,
+                       opponent_reset=bool(resets[j]), terminated=hit)
+        tr = self.traffic[i]
+        tr.update(dt=dt, ego_progress=progress, opponent_progress=opp_prog, gaps=gaps)
+        in_window = any(abs(float(g)) <= self.contention_range_m for g in gaps)
+        if in_window:
+            self.contended[i] = True
+        if opp_event_active is not None and bool(opp_event_active[i]):
+            self.event_seen_s[i] += dt
+            if in_window:
+                # The measurement the scenario stands on: an event that fires while the learner is
+                # half a lap away is a schedule entry, not a thing the learner had to react to.
+                self.event_in_window[i] = True
+                self.event_in_window_s[i] += dt
 
     def _collision_reason(self, i: int, car_contact: bool = False) -> str:
         if car_contact:
@@ -232,6 +312,65 @@ class CellRecorder:
             out["conditional_cleared"] = t.conditional_rate(int(sum(self.encountered)))
         if self.suite == "O":
             out["hold_interruptions"] = [d.interruptions for d in self.detectors]
+        if self.suite == "T":
+            out.update(self._traffic_out())
+        return out
+
+    def _clean_among_contended(self) -> dict:
+        """Clean runs among the trials that actually met traffic. N/A, never 0, when none did."""
+        from .tally import na
+        idx = [i for i in range(self.n) if self.contended[i]]
+        if not idx:
+            return na("no trial came within the contention range of an opponent")
+        return {"value": sum(1 for i in idx if (self.outcome[i] or {}).get("success")) / len(idx),
+                "reason": None}
+
+    def _traffic_out(self) -> dict:
+        """The T block: per-trial traffic arrays plus the cell-level counts derived from them.
+
+        Everything here is per trial and in the trial's own order, so the report can pool it the
+        same way it pools every other array -- by summing numerators and denominators rather than
+        averaging per-trial rates, which would weight a trial that crashed at 2 s like one that ran
+        the whole stint.
+        """
+        pairs = self.pair_detectors
+        passes = [sum(d.passes for d in row) for row in pairs]
+        lost = [sum(d.repasses for d in row) for row in pairs]
+        reseeds = [sum(d.reseeds for d in row) for row in pairs]
+        traces = [tr.as_dict() for tr in self.traffic]
+        reasons = [(o or {}).get("reason") for o in self.outcome]
+        out = {
+            "n_opponents": self.n_opponents,
+            "contention_range_m": self.contention_range_m,
+            "attack_range_m": self.attack_range_m,
+            "passes": passes,
+            "leads_lost": lost,
+            "opponent_respawns": reseeds,
+            "contention_s": [t["contention_s"] for t in traces],
+            "following_s": [t["following_s"] for t in traces],
+            "attack_s": [t["attack_s"] for t in traces],
+            "defending_s": [t["defending_s"] for t in traces],
+            "opponent_progress_m": [t["opponent_progress_m"] for t in traces],
+            "pace_ratio": [t["pace_ratio"] for t in traces],
+            "closest_arc_gap_m": [
+                t["closest_arc_gap_m"] if t["closest_arc_gap_m"] is not None
+                else {"value": None, "reason": "no opponent sampled"} for t in traces],
+            # Cell-level, all derived from the arrays above so the two cannot disagree.
+            "contended": int(sum(self.contended)),
+            "car_contacts": sum(1 for r in reasons if r == "contact"),
+            "wall_collisions": sum(1 for r in reasons if r == "collision"),
+            # NOT `Tally.conditional_rate`: that helper enforces successes <= encountered, which is
+            # right for avoidance -- you cannot clear an obstacle you never reached -- and wrong
+            # here, because a stint whose opponent crashed on lap one is a clean run that met no
+            # traffic. Computed over the contended trials directly instead.
+            "clean_conditional": self._clean_among_contended(),
+            # The event scenario's own evidence. `trials` is the count whose contention window an
+            # event actually landed in; `seconds` splits it from event time the learner was too far
+            # away to care about. Both are 0 on a cell with no events, which is the truth there.
+            "event_in_window_trials": int(sum(self.event_in_window)),
+            "event_in_window_s": list(self.event_in_window_s),
+            "event_seen_s": list(self.event_seen_s),
+        }
         return out
 
 
@@ -328,7 +467,8 @@ class _PreResetTrace:
 
 def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps: int = 40,
              vehicle_length: float = 0.58, vehicle_width: float = 0.31, frozen: bool = True,
-             controller=None, seed: int | None = None, obs_spec: dict | None = None) -> dict:
+             controller=None, seed: int | None = None, obs_spec: dict | None = None,
+             contention_range_m: float = 12.0, attack_range_m: float = 3.0) -> dict:
     """Drive one cell to completion and return its record.
 
     `policy(obs) -> action` is any callable. The loop never inspects what produced it, which is what
@@ -346,9 +486,14 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
     on_policy = env.on_policy if env.M > 1 else torch.ones(env.B, dtype=torch.bool)
     rows = torch.nonzero(on_policy).flatten().tolist()
     n = len(rows)
+    n_opponents = (int(env.M) - 1) if (env.M > 1 and env.sim.other_idx is not None) else 0
     rec = CellRecorder(n=n, suite=suite, track_length_m=length, vehicle_length=vehicle_length,
                        vehicle_width=vehicle_width, hold_steps=hold_steps, s_obs_m=s_obs_m,
-                       frozen=frozen)
+                       frozen=frozen, n_opponents=n_opponents,
+                       contention_range_m=contention_range_m, attack_range_m=attack_range_m)
+    if suite == "T" and n_opponents == 0:
+        raise ValueError("a T cell with no opponent measures nothing: the traffic family needs "
+                         "race_size > 1 and a non-candidate opponent")
     guard_rear_box(env.sim)
 
     # Exposure counters come from the project's own validated implementation rather than a second
@@ -381,6 +526,13 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
     if suite == "O" and env.sim.other_idx is not None:
         g0 = env.signed_gaps(env.sim.s, env.sim.tid)[on_policy][:, 0]
         rec.seed_gaps(g0.tolist())                  # before the first transition
+    prev_opp_s = None
+    if suite == "T":
+        # Every opponent of every learner, seeded before the first transition for the same reason
+        # the O family seeds one: doing it inside the first `update` would eat that transition's
+        # terminal flags.
+        rec.seed_pair_gaps(env.signed_gaps(env.sim.s, env.sim.tid)[on_policy].tolist())
+        prev_opp_s = env.sim.s[env.sim.other_idx[on_policy]].clone()      # (n, M-1)
 
     with _PreResetTrace(env) as trace:
         for k in range(n_steps):
@@ -399,6 +551,7 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
             prev_s = s_now.clone()
 
             gap = opp_reset = opp_incident = None
+            pair_gaps = pair_progress = pair_reset = opp_event = None
             car_contact = pend["car_contact"]
             car_contact = ([bool(car_contact[i]) for i in rows] if car_contact is not None
                            else [False] * n)
@@ -408,6 +561,23 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
                 opp_reset = [fresh[j] for j in opp_idx]
                 # this step's own terminal flags for the paired opponent, read pre-reset
                 opp_incident = [bool(term[j]) or bool(trunc[j]) for j in opp_idx]
+            if suite == "T":
+                all_idx = env.sim.other_idx[on_policy]                    # (n, M-1)
+                pair_gaps = env.signed_gaps(pend["s"], env.sim.tid)[on_policy].tolist()
+                opp_s = pend["s"][all_idx]
+                # Wrapped, exactly like the learner's own progress: an opponent crossing the line
+                # would otherwise show one lap of negative arc in a single step and turn the pace
+                # ratio into nonsense at the one place a race is usually decided.
+                pair_progress = _wrap_delta(opp_s - prev_opp_s, length).tolist()
+                prev_opp_s = opp_s.clone()
+                pair_reset = [[fresh[j] for j in row] for row in all_idx.tolist()]
+                ev = info.get("opp_event") if isinstance(info, dict) else None
+                if ev is not None:
+                    # An event is "running" for a learner when ANY of its own opponents is in one.
+                    # Read per pair rather than per env: with two opponents the second one's brake
+                    # is as much a thing to react to as the first one's.
+                    ids = ev["id"][all_idx]
+                    opp_event = (ids != 0).any(dim=1).tolist()
 
             if acc is not None:
                 import numpy as _np
@@ -436,6 +606,8 @@ def run_cell(env, policy, *, suite: str, n_steps: int, s_obs_m=None, hold_steps:
                        collision=term[on_policy].tolist(), truncated=trunc[on_policy].tolist(),
                        s=s_now.tolist(), gap=gap, car_contact=car_contact,
                        opponent_reset=opp_reset, opponent_incident=opp_incident,
+                       pair_gaps=pair_gaps, pair_progress=pair_progress, pair_reset=pair_reset,
+                       opp_event_active=opp_event,
                        # inclusive budget: the last step of the budget may still complete
                        budget_exhausted=(k == n_steps - 1))
             if not any(rec.active):
