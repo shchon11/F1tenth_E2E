@@ -40,6 +40,14 @@ REAL = {
     # real_data/01_competition (scripts/extract_bag_map.py). 8.4 x 22.6 m, duct hose boundary.
     "korea_2026_competition": (os.path.join(ASSET_MAPS, "korea_2026_competition.yaml"), "duct", 0.35,
                                "2026 competition venue, from the team's own recordings"),
+    # Two floors the car drove on before the competition, from the same recordings
+    # (scripts/extract_bag_map.py). Duct boundary: see docs/benchmark.md and the held-out suite
+    # report -- the grids carry no thickness information, the free space is a closed band around a
+    # free-standing island, and the venue, rig and extraction are the same as korea_2026_competition.
+    "map16x07": (os.path.join(ASSET_MAPS, "map16x07.yaml"), "duct", 0.35,
+                 "pre-competition floor, 15.5 x 7.0 m hairpin loop, from the team's own recordings"),
+    "map12x16": (os.path.join(ASSET_MAPS, "map12x16.yaml"), "duct", 0.35,
+                 "pre-competition floor, 12.3 x 16.4 m loop, from the team's own recordings"),
     "korea_2025_iccas": (os.path.join(KOR, "KORA_K3", "src", "kora_k3", "maps", "real.yaml"), "duct", 0.35, "4th F1TENTH Korea Championship 2025 (ICCAS) race track, team SLAM map", (3.0, 0.0), 0.05,
                          dict(keep_region=True, unknown_floor_depth=5.0)),   # raw SLAM: spray, specks. The outline is a hose too
                                                                               # (track built from ducts in a bigger hall): floor beyond
