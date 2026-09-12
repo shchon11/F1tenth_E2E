@@ -1,0 +1,86 @@
+{
+ "progress": {
+  "per_step": 0.09814492613077164,
+  "steps_active_frac": 1.0,
+  "per_second": 3.9257969856262207
+ },
+ "collision": {
+  "per_step": -0.01894531212747097,
+  "steps_active_frac": 0.0018945311894640326,
+  "per_second": -0.7578125
+ },
+ "collision_speed": {
+  "per_step": -0.0032292352989315987,
+  "steps_active_frac": 0.0018945311894640326,
+  "per_second": -0.12916940450668335
+ },
+ "steer_rate": {
+  "per_step": -0.006156932096928358,
+  "steps_active_frac": 0.9995507597923279,
+  "per_second": -0.24627728760242462
+ },
+ "proximity": {
+  "per_step": -0.0015019082929939032,
+  "steps_active_frac": 0.11556640267372131,
+  "per_second": -0.060076333582401276
+ },
+ "plan_clearance": {
+  "per_step": 0.0,
+  "steps_active_frac": 0.0,
+  "per_second": 0.0
+ },
+ "wrong_way": {
+  "per_step": 0.0,
+  "steps_active_frac": 0.0,
+  "per_second": 0.0
+ },
+ "lap": {
+  "per_step": 0.003183870343491435,
+  "steps_active_frac": 0.0001367187505820766,
+  "per_second": 0.12735481560230255
+ },
+ "alive": {
+  "per_step": 0.0,
+  "steps_active_frac": 0.0,
+  "per_second": 0.0
+ },
+ "car_contact": {
+  "per_step": -0.003613281063735485,
+  "steps_active_frac": 0.0007226562593132257,
+  "per_second": -0.14453125
+ },
+ "overtake": {
+  "per_step": 0.0010346530470997095,
+  "steps_active_frac": 0.7223437428474426,
+  "per_second": 0.04138612002134323
+ },
+ "lap_time": {
+  "per_step": 0.003464741399511695,
+  "steps_active_frac": 0.006679687183350325,
+  "per_second": 0.13858965039253235
+ },
+ "car_proximity": {
+  "per_step": -0.0033432303462177515,
+  "steps_active_frac": 0.0754687488079071,
+  "per_second": -0.1337292194366455
+ },
+ "sideslip": {
+  "per_step": -0.000380469806259498,
+  "steps_active_frac": 0.13099609315395355,
+  "per_second": -0.015218792483210564
+ },
+ "_meta": {
+  "ckpt": "/home/shchon11/f1sim_runs/_baselines/frozen_original_48cc698f.pt",
+  "learner_steps": 51200,
+  "episodes_ended": 97,
+  "tracks": [
+   "real:blackbox2022_1",
+   "real:icra2022+rlobs0",
+   "gen:control:1400+hard3",
+   "real:korea_2026_competition+rlobs211",
+   "scene:scene_0912_2344",
+   "gen:competition:1002"
+  ],
+  "total_per_step": 0.06865782290697098
+ }
+}

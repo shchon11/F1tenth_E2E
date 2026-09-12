@@ -1,0 +1,86 @@
+{
+ "progress": {
+  "per_step": 0.10003188252449036,
+  "steps_active_frac": 1.0,
+  "per_second": 4.001275062561035
+ },
+ "collision": {
+  "per_step": -0.01972656138241291,
+  "steps_active_frac": 0.0019726562313735485,
+  "per_second": -0.7890624403953552
+ },
+ "collision_speed": {
+  "per_step": -0.0033082300797104836,
+  "steps_active_frac": 0.0019726562313735485,
+  "per_second": -0.13232919573783875
+ },
+ "steer_rate": {
+  "per_step": -0.006220047827810049,
+  "steps_active_frac": 0.9994531273841858,
+  "per_second": -0.24880191683769226
+ },
+ "proximity": {
+  "per_step": -0.0016617371002212167,
+  "steps_active_frac": 0.1213085874915123,
+  "per_second": -0.06646948307752609
+ },
+ "plan_clearance": {
+  "per_step": 0.0,
+  "steps_active_frac": 0.0,
+  "per_second": 0.0
+ },
+ "wrong_way": {
+  "per_step": 0.0,
+  "steps_active_frac": 0.0,
+  "per_second": 0.0
+ },
+ "lap": {
+  "per_step": 0.0026210781652480364,
+  "steps_active_frac": 0.00011718749738065526,
+  "per_second": 0.1048431247472763
+ },
+ "alive": {
+  "per_step": 0.0,
+  "steps_active_frac": 0.0,
+  "per_second": 0.0
+ },
+ "car_contact": {
+  "per_step": -0.003613281063735485,
+  "steps_active_frac": 0.0007226562593132257,
+  "per_second": -0.14453125
+ },
+ "overtake": {
+  "per_step": 0.0006554130814038217,
+  "steps_active_frac": 0.6987109184265137,
+  "per_second": 0.026216523721814156
+ },
+ "lap_time": {
+  "per_step": 0.0038242056034505367,
+  "steps_active_frac": 0.0073437499813735485,
+  "per_second": 0.15296822786331177
+ },
+ "car_proximity": {
+  "per_step": -0.0034916603472083807,
+  "steps_active_frac": 0.0779101550579071,
+  "per_second": -0.13966640830039978
+ },
+ "sideslip": {
+  "per_step": -0.0004126181302126497,
+  "steps_active_frac": 0.12412109225988388,
+  "per_second": -0.016504725441336632
+ },
+ "_meta": {
+  "ckpt": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/recipe-restore-20260912/pins/cl_origrecipe_legacy_s701_ppo_final.pt",
+  "learner_steps": 51200,
+  "episodes_ended": 101,
+  "tracks": [
+   "real:blackbox2022_1",
+   "real:icra2022+rlobs0",
+   "gen:control:1400+hard3",
+   "real:korea_2026_competition+rlobs211",
+   "scene:scene_0912_2344",
+   "gen:competition:1002"
+  ],
+  "total_per_step": 0.0686984434723854
+ }
+}
