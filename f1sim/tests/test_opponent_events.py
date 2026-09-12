@@ -43,8 +43,8 @@ def _env(events=(), rate=0.0, envs=8, seed=7, track=TRACK, **cfg_kw):
     """A two-car race per track instance with teacher-driven opponents, small enough for CPU."""
     tr, rl = _track_and_raceline(track)
     cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
-    ecfg = EnvConfig(race_size=2, opponent="teacher", max_steps=4000, hist_len=0,
-                     opp_events=events, opp_event_rate=rate, **cfg_kw)
+    ecfg = EnvConfig(**{"race_size": 2, "opponent": "teacher", "max_steps": 4000, "hist_len": 0,
+                        "opp_events": events, "opp_event_rate": rate, **cfg_kw})
     return common.make_env([tr], envs, "cpu", ecfg, cfg=cfg, seed=seed, rls=[rl])
 
 
@@ -173,6 +173,29 @@ def test_events_never_touch_the_learner():
     assert int(ids[:, learner].abs().sum()) == 0, "an event was scripted onto a learner-driven car"
     assert float(offs[:, learner].abs().sum()) == 0.0
     assert int(ids[:, ~learner].abs().sum()) > 0, "no opponent was scripted at all: the test proves nothing"
+
+
+def test_mixed_mode_scripts_the_teacher_races_and_only_those():
+    """With `--opponent mixed` the roles are redrawn at every race reset, so the gate has to be too.
+
+    A stale gate would script a car the policy is driving -- the PPO buffers would then contain
+    transitions whose action was not the policy's, which is the one thing the mixed-mode design is
+    built to avoid.
+    """
+    env = _env(events=("brake", "stop", "shift"), rate=6.0, envs=16, seed=37,
+               opponent="mixed", mixed_teacher_frac=0.5)
+    env.reset(seed=37)
+    a = torch.zeros(env.B, 2); a[:, 1] = 0.3
+    scripted_policy_cars, scripted_teacher_cars, saw_selfplay = 0, 0, False
+    for _ in range(300):
+        _, _, _, _, info = env.step(a)
+        on_policy, ids = info["on_policy"], info["opp_event"]["id"]
+        scripted_policy_cars += int((ids != 0)[on_policy].sum())
+        scripted_teacher_cars += int((ids != 0)[~on_policy].sum())
+        saw_selfplay |= bool((on_policy & (env.slot > 0)).any())
+    assert scripted_policy_cars == 0, f"{scripted_policy_cars} steps scripted a policy-driven car"
+    assert scripted_teacher_cars > 100, f"only {scripted_teacher_cars} scripted opponent steps"
+    assert saw_selfplay, "no self-play race was drawn: the mixed-mode half of the test proves nothing"
 
 
 # --------------------------------------------------------------------------- 3. the declared effects
