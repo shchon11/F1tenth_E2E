@@ -187,6 +187,11 @@ def main():
                          "one or the other (mixed, share set by --mixed-teacher-frac)")
     ap.add_argument("--mixed-teacher-frac", type=float, default=0.5)
     ap.add_argument("--opp-speed", type=float, nargs=2, default=(0.6, 1.0), help="teacher opponents: speed scale range per race")
+    ap.add_argument("--spawn-gap", type=float, nargs=2, default=(2.5, 6.0), metavar=("LOW", "HIGH"),
+                    help="[m] arc along the lane between the cars of a race at spawn, drawn uniformly "
+                         "per reset. The default is the range every race so far was trained at, so an "
+                         "unflagged run is unchanged. Widening it is an opponent-diversity axis: a "
+                         "fixed narrow band shows the policy one approach geometry")
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the policy outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
@@ -201,6 +206,12 @@ def main():
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
     a = ap.parse_args()
+    _gap_lo, _gap_hi = (float(x) for x in a.spawn_gap)
+    if not (math.isfinite(_gap_lo) and math.isfinite(_gap_hi)) or not (0.0 < _gap_lo <= _gap_hi):
+        raise SystemExit(f"--spawn-gap {_gap_lo} {_gap_hi}: needs finite 0 < LOW <= HIGH [m]. The gap "
+                         f"is an arc drawn uniformly from [LOW, HIGH] and subtracted per grid slot, so "
+                         f"a non-positive or inverted range spawns cars on top of each other.")
+    a.spawn_gap = (_gap_lo, _gap_hi)
     if a.kl_decay is None:
         a.kl_decay = a.total
     device = torch.device(a.device); torch.manual_seed(a.seed)
@@ -240,7 +251,8 @@ def main():
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
                                                               race_size=a.race_size, opponent=a.opponent,
                                                               mixed_teacher_frac=a.mixed_teacher_frac,
-                                                              opp_speed_range=tuple(a.opp_speed), action_mode=a.action_mode,
+                                                              opp_speed_range=tuple(a.opp_speed),
+                                                              spawn_gap=tuple(a.spawn_gap), action_mode=a.action_mode,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,

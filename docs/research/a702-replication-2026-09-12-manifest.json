@@ -1,0 +1,106 @@
+{
+  "title": "A702 replication of the original-recipe legacy run, scored on benchmark v1",
+  "date": "2026-09-12",
+  "produced_by": "opponent-diversity stage 1, isolated worktree of 629aeea",
+  "files": {
+    "a702-replication-2026-09-12-judgment.json": {
+      "sha256": "a1ef0afc2f582c4312528f9128f7a4915e22b3400e96da81be5e0884e8540523",
+      "bytes": 3307
+    },
+    "a702-replication-2026-09-12-leaderboard.md": {
+      "sha256": "75541e4280676f0d221c338bd1c7d3845755db96fa7bf7e7156ec5a5b9ef8b95",
+      "bytes": 3576
+    },
+    "a702-replication-2026-09-12-paired-pace.json": {
+      "sha256": "1264dfa1133aac816a6a158f6130536e7e5cb61fce19b3c696d7c9e2cc5b1005",
+      "bytes": 548
+    },
+    "a702-replication-2026-09-12-raw-cells.jsonl": {
+      "sha256": "cff6b0ad4286b350091ca4c08ba2034413400b013f9859e680f703bff7410f7e",
+      "bytes": 815086
+    },
+    "a702-replication-2026-09-12-roster.json": {
+      "sha256": "fff1784ebb8a3c4c0c07f2839542f45a1cf8585c9e26909810cf21bc0615bab2",
+      "bytes": 2276
+    },
+    "a702-replication-2026-09-12.md": {
+      "sha256": "bb05eb6b2783fe9e3e8bba24cbdcce402c284fc25a1f7d234abdd674c2e59273",
+      "bytes": 5645
+    }
+  },
+  "training": {
+    "run": "cl_origrecipe_legacy_s702",
+    "seed": 702,
+    "argv_sha256": "6deca4a2305e77fff54dfca4c3ee19dc2fab09924d3a155beac4a8506c0f0796",
+    "argv_differs_from_A701_by": [
+      "--name",
+      "--seed"
+    ],
+    "init": {
+      "path": "/home/shchon11/f1sim_runs/_baselines/frozen_original_48cc698f.pt",
+      "sha256": "48cc698f8c51feb53f60dc29fbc3e12eb8d002531a893b0d7bea0fd763dfbaef"
+    },
+    "final_checkpoint_sha256": "0d904012dd29e2de997a5ecf0e82faace8b4f4005862c3d8a2bf29e6af2348d2",
+    "updates": 128,
+    "nominal_rollout_slots": 1048576,
+    "slots_per_update": 8192,
+    "learner_ids": 256,
+    "horizon": 32,
+    "wall_minutes": 82.42,
+    "returncode": 0,
+    "optimizer": "Adam moments restored from the init checkpoint (125 tensors); no --fresh-opt",
+    "source_freeze_sha256": "42e146c5233792fea53ddf7b468915459488c36e87c4ff5dbcf7a70f630a8c19",
+    "source_files_frozen": 77,
+    "source_drift_after_run": []
+  },
+  "evaluation": {
+    "suite_freeze_sha256": "6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce",
+    "suite_version": "v1",
+    "cells_per_system": 34,
+    "trials_per_system": 272,
+    "systems": [
+      "frozen_original@estimated",
+      "cl_origrecipe_legacy_s701@estimated",
+      "cl_origrecipe_legacy_s702@estimated"
+    ],
+    "freshly_scored": [
+      "frozen_original@estimated",
+      "cl_origrecipe_legacy_s702@estimated"
+    ],
+    "reused": [
+      "cl_origrecipe_legacy_s701@estimated"
+    ],
+    "reuse_audit": {
+      "rows_present": true,
+      "source_digest_matches_this_worktree": true,
+      "suite_freeze_and_version": true,
+      "pinned_checkpoint_and_estimator": true,
+      "cell_coverage_and_trials": true,
+      "paired_starts_against_fresh_rows": true
+    },
+    "estimator": {
+      "path": "/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/continuous-learning/runner/estimator-out/estimator_seed401.pt",
+      "sha256": "a4e6fe02e27e764fe11457abb802deff3e3566e4da10c457c438e518fa7ffbbf"
+    },
+    "merged_cells_sha256": "cff6b0ad4286b350091ca4c08ba2034413400b013f9859e680f703bff7410f7e"
+  },
+  "not_run": [
+    "cl_oppdiv_control_s801",
+    "cl_oppdiv_range_s801"
+  ],
+  "promotion": "none; this is a replication check reported for a human decision",
+  "lap_time_paired": {
+    "basis": "134 solo trials completed by both the reference and the candidate",
+    "reference_mean_seconds": 10.895522388059788,
+    "cl_origrecipe_legacy_s701@estimated": {
+      "mean_delta_seconds": 0.10335820895522535,
+      "percent": 0.948630136986317
+    },
+    "cl_origrecipe_legacy_s702@estimated": {
+      "mean_delta_seconds": 0.1572761194029873,
+      "percent": 1.443493150684949
+    },
+    "reading": "safety and retention reproduced; pace did not -- both A seeds are slightly slower"
+  },
+  "canonical_report": "a702-replication-2026-09-12-leaderboard.md, rendered by `f1sim.learn.benchmark report` from the raw cells in this directory"
+}

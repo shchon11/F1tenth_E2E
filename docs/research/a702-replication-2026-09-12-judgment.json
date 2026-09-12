@@ -1,0 +1,122 @@
+{
+  "input_cells_sha256": "cff6b0ad4286b350091ca4c08ba2034413400b013f9859e680f703bff7410f7e",
+  "roster_sha256": "fff1784ebb8a3c4c0c07f2839542f45a1cf8585c9e26909810cf21bc0615bab2",
+  "validation": {
+    "n_rows": 102,
+    "n_systems": 3,
+    "suite_freeze_sha256": "6f710412bacf5a0936b06ba13013cc2ea6e92c269864e1f19df1a9ec3bca60ce"
+  },
+  "counts": {
+    "cl_origrecipe_legacy_s701@estimated": {
+      "solo": {
+        "successes": 134,
+        "trials": 144
+      },
+      "low_mu": {
+        "successes": 41,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 44,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 43,
+        "trials": 64
+      },
+      "distance_km": 9.11369207296725,
+      "collision_count": 51,
+      "large_slip_seconds": 30.374999999999968,
+      "collisions_per_km": 5.595975768292042,
+      "large_slip_seconds_per_km": 3.3328973325856976
+    },
+    "cl_origrecipe_legacy_s702@estimated": {
+      "solo": {
+        "successes": 136,
+        "trials": 144
+      },
+      "low_mu": {
+        "successes": 43,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 43,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 45,
+        "trials": 64
+      },
+      "distance_km": 9.136063815397113,
+      "collision_count": 48,
+      "large_slip_seconds": 27.099999999999977,
+      "collisions_per_km": 5.2539037565723925,
+      "large_slip_seconds_per_km": 2.966266495898161
+    },
+    "frozen_original@estimated": {
+      "solo": {
+        "successes": 134,
+        "trials": 144
+      },
+      "low_mu": {
+        "successes": 41,
+        "trials": 48
+      },
+      "avoidance": {
+        "successes": 41,
+        "trials": 64
+      },
+      "overtaking": {
+        "successes": 42,
+        "trials": 64
+      },
+      "distance_km": 9.065569030876409,
+      "collision_count": 55,
+      "large_slip_seconds": 30.999999999999975,
+      "collisions_per_km": 6.066910947638871,
+      "large_slip_seconds_per_km": 3.419531625032816
+    }
+  },
+  "decision": {
+    "engineering_retention_screen_passed": true,
+    "gates": {
+      "solo": {
+        "pass": true,
+        "success_delta": 2,
+        "allowed_loss_trials": 2
+      },
+      "low_mu": {
+        "pass": true,
+        "success_delta": 2,
+        "allowed_loss_trials": 2
+      },
+      "avoidance": {
+        "pass": true,
+        "success_delta": 2,
+        "allowed_loss_trials": 2
+      },
+      "overtaking": {
+        "pass": true,
+        "success_delta": 3,
+        "allowed_loss_trials": 2
+      },
+      "collisions_per_km": {
+        "pass": true,
+        "reference": 6.066910947638871,
+        "candidate": 5.2539037565723925,
+        "ratio": 0.865993221577962,
+        "rule": "candidate <= reference * 1.10; zero reference requires zero"
+      },
+      "large_slip_seconds_per_km": {
+        "pass": true,
+        "reference": 3.419531625032816,
+        "candidate": 2.966266495898161,
+        "ratio": 0.8674481833077636,
+        "rule": "candidate <= reference * 1.10; zero reference requires zero"
+      }
+    },
+    "automatic_promotion": false,
+    "next_action": "Report and stop for user baseline/pilot decision",
+    "scope": "Three reused development maps; two A seeds do not establish statistical significance"
+  }
+}

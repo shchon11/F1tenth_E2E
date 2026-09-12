@@ -1,0 +1,16 @@
+{
+  "cl_origrecipe_legacy_s701@estimated": {
+    "shared_successes": 134,
+    "reference_mean_seconds": 10.895522388059788,
+    "candidate_mean_seconds": 10.998880597015015,
+    "mean_delta_seconds": 0.10335820895522535,
+    "percent_mean_difference": 0.948630136986317
+  },
+  "cl_origrecipe_legacy_s702@estimated": {
+    "shared_successes": 134,
+    "reference_mean_seconds": 10.895522388059788,
+    "candidate_mean_seconds": 11.052798507462777,
+    "mean_delta_seconds": 0.1572761194029873,
+    "percent_mean_difference": 1.443493150684949
+  }
+}
