@@ -2,6 +2,7 @@
 
     plan      matrix, expected trials, cost projection, roster verification   (CPU, no policy)
     geometry  obstacle proofs + non-candidate feasibility smoke, then freeze  (CPU, no candidate)
+              `--version v2` freezes the held-out scenario set instead of v1
     run       one system against the frozen suite                             (GPU lease required)
     report    validate raw results and render the leaderboard                 (CPU)
 
@@ -76,7 +77,11 @@ def cmd_geometry(a) -> int:
         print(f"f1sim unavailable: {exc}", file=sys.stderr)
         return 2
     vp = VehicleParams()
-    s = suite_mod.Suite()
+    # The scenario set is chosen by version, not by which file it is about to be written to: a v1
+    # definition frozen into a file named v2 would carry a valid hash and the wrong maps.
+    s = suite_mod.of(a.version)
+    print(f"suite {s.version}  solo {len(s.solo_maps)}  obstacle {len(s.obstacle_maps)}  "
+          f"race {len(s.race_maps)}  cells {len(s.cells())}")
 
     ok = True
     for map_id in s.obstacle_maps:
@@ -581,6 +586,9 @@ def main(argv=None) -> int:
 
     q = sub.add_parser("geometry"); q.set_defaults(fn=cmd_geometry)
     q.add_argument("--suite", default="suite-v1.json")
+    q.add_argument("--version", default=suite_mod.SUITE_VERSION,
+                   choices=sorted(suite_mod.VERSIONS),
+                   help="which scenario set to prove and freeze (v1 in-distribution, v2 held out)")
     q.add_argument("--s-obs", type=float, default=20.0)
     q.add_argument("--measure", action="store_true", help="time a teacher-driven cell per map")
     q.add_argument("--measure-steps", type=int, default=600)

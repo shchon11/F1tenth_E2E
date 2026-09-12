@@ -17,9 +17,14 @@ each row. `python3 -m f1sim.learn.leaderboard` builds it from existing result fi
 cohort through `report.validate_results` first; it scores nothing and needs no weights or GPU.
 `leaderboard/index.html` is the same report as a self-contained offline page.
 
-**What this is not.** All three maps are reused development tracks, so no result here is evidence of
-generalisation to an unseen venue, and nothing here is an on-car claim. Scope is restated in every
-generated report.
+**Two suites, two questions.** **v1 is in-distribution**: its three maps are reused development
+tracks -- `gen:control:1400` is an SGR training map and `real:korea_2026_competition` is trained
+through twenty obstacle variants -- so a v1 number says how well the training distribution was
+fitted and is not evidence of generalisation to an unseen venue. **v2 is held out**: every map in
+it is outside `common.TRAIN_TRACKS` in every variant, including two real floors this car drove on
+that the simulator did not previously contain. **Adoption decisions use v2** (see
+[Held-out suite v2](#held-out-suite-v2)). Neither suite is an on-car claim. Scope is restated in
+every generated report, which reads it from the suite's own provenance field.
 
 ## The pipeline
 
@@ -36,7 +41,10 @@ generated report.
 choice cannot be influenced by how a candidate happens to score on it. `run` refuses to score against
 a suite that is not frozen.
 
-## The suite
+## The suite (v1, in-distribution)
+
+This section describes v1. The held-out set is [v2](#held-out-suite-v2); it shares every protocol
+field below and differs only in which maps they are applied to.
 
 `plan` prints the matrix without touching a checkpoint:
 
@@ -84,6 +92,87 @@ freeze hash, because re-measuring a rate is a fact about the machine rather than
 
 Run `geometry` before any system is scored, and do not re-run it to "fix" a scenario after seeing
 results.
+
+## Held-out suite v2
+
+v1 answers "how well was the training distribution fitted". That is worth measuring and it is not
+what an adoption decision needs, and while v1 was the only suite there was no number for the other
+question at all: of its three maps, `gen:control:1400` is in `TRAIN_TRACKS`, the geometry of
+`real:korea_2026_competition` is trained through twenty obstacle variants (`common.KOREA26_TRAIN`),
+and only `gen:control:9100` was unseen.
+
+**v2 changes the maps and nothing else.** Friction levels, seeds, envs, race size, speed cap, lap
+budget, sensor noise, opponent and every other protocol field are identical to v1, so a v1 row and
+a v2 row differ in the scenario and in nothing that could explain a difference away.
+
+```bash
+python3 -m f1sim.learn.benchmark geometry --version v2 \
+    --suite suite-v2.json --s-obs 10 --measure --freeze
+```
+
+| family | maps | µ | seeds | cells | trials |
+| --- | --- | --- | --- | ---: | ---: |
+| **S** solo | `real:map16x07`, `real:map12x16`, `real:korea_2025_iccas`, `real:blackbox2022_3`, `rt:Monza`, `gen:competition:0`, `gen:control:9100`, `gen:competition:9200+pinch9200` | 0.73423, 0.94401, 1.15379 | 4401, 4402 | 48 | 384 |
+| **A** avoidance | `real:map16x07`, `real:map12x16`, `gen:control:9100` | 0.73423, 0.94401 | 4401, 4402 | 12 | 96 |
+| **O** overtaking | `real:map16x07`, `real:map12x16`, `gen:control:9100` | 0.73423, 0.94401 | 4401, 4402 | 12 | 96 |
+
+**72 cells, 576 trials per system**, against v1's 34 and 272. The frozen definition ships as
+`f1sim/learn/benchmark/suite-v2.example.json`, freeze hash
+`d0f6938bbb46765f42a3f3f870408f3f228c5c7469633fd52c64a5a6d0465038`.
+
+### What "held out" means here
+
+The solo family is every base map in `common.HELDOUT_TRACKS` that has a raceline the car fits
+through -- all eight, measured. `HELDOUT_TRACKS` also carries `~rev` for each real floor; the suite
+takes the base map once, because a benchmark cell is a scenario rather than a direction.
+
+The two entries that make the claim worth anything are `real:map16x07` (15.5 × 7.0 m, the
+pre-competition hairpin loop) and `real:map12x16` (12.3 × 16.4 m), extracted from the team's own
+recordings with `scripts/extract_bag_map.py`. They are registered with a `duct` boundary; the
+evidence is in the held-out suite report, and the short version is that the extracted grids are
+binary with no unknown class and so carry no wall-thickness information at all, while both free
+regions are closed bands around free-standing islands -- a track laid out on open floor, not a
+room -- on the same rig and from the same recordings as `korea_2026_competition`.
+
+`real:korea_2026_competition` is **not** in v2. It stays in `TRAIN_TRACKS`, and a score on it, with
+or without an obstacle seed it has not seen, measures a memorised circuit. Putting it in an eval
+list was the specific defect v2 exists to fix.
+
+Leakage is a test, not a convention. `common.heldout_leakage(train, heldout)` compares *base maps*,
+with `~rev`, `~mir`, `+obs`, `+rlobs`, `+pinch` and `+props` stripped through the catalog's own
+splitters, so `real:map16x07+obs5~mir` in a training list is caught even though the string differs
+from anything in the held-out list. `tests/test_heldout_split.py` fails if it ever returns anything.
+
+### The paired families are smaller than the solo family, deliberately
+
+A and O run on the two real floors plus `gen:control:9100`. The other five held-out maps are carried
+by S only. An avoidance cell needs a proven blocking obstacle -- one that really obstructs the
+racing line while leaving a car-wide corridor that connects to the lane either side, eroded by the
+car's own footprint -- and an overtaking cell needs room to pass. Where the geometry refuses, the
+map is dropped from that family; the placement proofs are never weakened to make a map fit.
+
+The proofs that were obtained, at `--s-obs 10`:
+
+| map | lane | half-lane at s | obstacle | corridor (left/right) | required |
+| --- | ---: | ---: | --- | --- | ---: |
+| `real:map16x07` | 33.22 m | 0.667 m | 0.29 × 0.724 m, 79 cells | 0.60 / 0.05 m | 0.51 m |
+| `real:map12x16` | 36.06 m | 0.962 m | 0.29 × 1.058 m, 123 cells | 0.85 / 0.00 m | 0.51 m |
+| `gen:control:9100` | 56.89 m | 1.282 m | 0.29 × 1.410 m, 163 cells | 1.15 / 0.05 m | 0.51 m |
+
+`real:map16x07` is the tightest scenario in either suite: a 0.667 m half-lane against 1.282 m on
+`gen:control:9100`, and a 0.60 m corridor against a 0.51 m requirement. That is the point of it.
+
+### Which suite to quote
+
+| question | suite |
+| --- | --- |
+| did this checkpoint learn the training distribution at all | v1 |
+| does it hold up on geometry it has never seen | **v2** |
+| should we adopt it | **v2** |
+
+A v1 improvement with no v2 improvement is a fit to the training maps, and the two suites are
+reported separately for that reason. Rows are never pooled across suites: the freeze hash differs,
+and `report.validate_results` refuses a file that mixes them.
 
 ## The roster
 
@@ -347,7 +436,8 @@ by observation spec and reports the groups separately rather than pooling them.
 
 **Start from the packaged suite, not from `geometry`.** Re-running `geometry` regenerates placements
 from the current defaults (`--s-obs 20.0`), which produces a *different* suite with a different
-freeze hash — scenarios that were never the ones scored. The v1 suite ships inside the package:
+freeze hash — scenarios that were never the ones scored. Both suites ship inside the package
+(`suite-v1.example.json`, `suite-v2.example.json`; v2 was frozen with `--s-obs 10`):
 
 ```bash
 python3 -c "
@@ -385,6 +475,7 @@ which is precisely why the suite is copied rather than regenerated.
 
 ```bash
 python3 -m f1sim.learn.benchmark feasibility --suite suite-v1.json --envs 4 --device cpu
+python3 -m f1sim.learn.benchmark feasibility --suite suite-v2.json --envs 4 --device cpu
 ```
 
 This drives the scenarios with a scripted expert on synthetic metadata to confirm each one is

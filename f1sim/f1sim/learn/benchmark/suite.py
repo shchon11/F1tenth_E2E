@@ -6,6 +6,12 @@ every result row and refuses a mismatch.
 
 Geometry and the non-candidate feasibility smoke run *before* the freeze -- they involve no evaluated
 checkpoint, so they cannot leak an outcome into the scenario choice.
+
+Two scenario sets live here. `Suite()` is v1, unchanged; `v2()` is the held-out set. They share
+every protocol field -- friction levels, seeds, envs, race size, speed cap, lap budget, sensor
+noise, opponent -- and differ only in which maps those fields are applied to, so a v1 row and a v2
+row are comparable as measurements and differ in the one thing the version names. `of(version)`
+picks between them; the CLI's `geometry --version` is the only caller that needs to.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
@@ -64,7 +70,9 @@ class Suite:
     placements: dict = field(default_factory=dict)
     #: measured by the non-candidate feasibility smoke, before the freeze
     calibration: dict = field(default_factory=dict)
-    #: all three maps are reused development tracks; no unseen-map claim attaches to any result
+    #: Where these maps come from, and therefore what a score on them may be called. Prose, and
+    #: excluded from the freeze hash for that reason -- but it is the field that decides whether a
+    #: number can be reported as generalisation, so every suite has to fill it in.
     reused_maps_note: str = ("gen:control:1400 is an SGR training map; korea_2026_competition and "
                              "gen:control:9100 are existing diagnostic maps. No unseen-map or "
                              "generalisation claim attaches to any result.")
@@ -117,6 +125,55 @@ class Suite:
         with open(path, "w") as fh:
             json.dump({"suite": self.as_dict(), "freeze_sha256": h}, fh, indent=2, sort_keys=True)
         return h
+
+
+#: Suite v2's solo family: every held-out base map that has a raceline the car fits through
+#: (measured, see the held-out suite report). `HELDOUT_TRACKS` also carries each real floor's
+#: `~rev`, which is the same geometry driven the other way -- the solo family takes the base map
+#: once, because a benchmark cell is a scenario and not a direction.
+V2_SOLO_MAPS = ("real:korea_2025_iccas", "real:blackbox2022_3", "rt:Monza", "gen:competition:0",
+                "gen:control:9100", "gen:competition:9200+pinch9200",
+                "real:map16x07", "real:map12x16")
+
+#: The paired families are the two unseen real floors plus `gen:control:9100`, the one v1 map that
+#: was already outside training. Avoidance and overtaking both need a lane wide enough to host a
+#: proven blocking obstacle and a pass; the remaining held-out maps are carried by the solo family
+#: only, which is the honest way round -- a scenario is dropped from a family when the geometry
+#: refuses it, never softened until it fits.
+V2_PAIRED_MAPS = ("real:map16x07", "real:map12x16", "gen:control:9100")
+
+V2_MAPS_NOTE = (
+    "Held out. real:map16x07 and real:map12x16 are floors this car drove on that no training set "
+    "contains, in any direction and with any obstacle suffix; the rest of the solo family is "
+    "common.HELDOUT_TRACKS, guarded by tests/test_heldout_split.py. korea_2026_competition is "
+    "absent by design: it is trained through twenty obstacle variants (common.KOREA26_TRAIN) and "
+    "belongs to v1's in-distribution set. Adoption decisions read v2.")
+
+
+def v2() -> Suite:
+    """The held-out suite. Same protocol as v1, applied to maps no training set contains.
+
+    v1 scores `gen:control:1400` (a training map) and `real:korea_2026_competition` (whose geometry
+    is trained through twenty obstacle variants), so its headline number measures how well the
+    training distribution was fitted. That is worth knowing and it is not generalisation, and while
+    v1 was the only suite there was no number for the other question at all.
+    """
+    return Suite(version="v2", solo_maps=V2_SOLO_MAPS, obstacle_maps=V2_PAIRED_MAPS,
+                 race_maps=V2_PAIRED_MAPS, reused_maps_note=V2_MAPS_NOTE)
+
+
+#: Every scenario set this CLI can freeze, by version.
+VERSIONS = {"v1": Suite, "v2": v2}
+
+
+def of(version: str) -> Suite:
+    """The suite definition for a version name. Unknown names are refused rather than defaulted:
+    freezing v1's maps under a file called v2 is exactly the confusion the version exists to stop."""
+    try:
+        factory = VERSIONS[version]
+    except KeyError:
+        raise ValueError(f"unknown suite version {version!r}; known: {sorted(VERSIONS)}") from None
+    return factory()
 
 
 #: Runtime modules whose contents can change a measurement: physics, sensing, control, the model
