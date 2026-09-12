@@ -124,6 +124,48 @@ Multi-car fine-tuning: `--race-size M` with `--opponent teacher` puts the learne
 teacher-driven cars (only car 0's transitions train), and `--opponent policy` makes every car the
 learner for self-play.
 
+### Opponent behaviour events
+
+A teacher opponent drives the raceline at a fixed speed scale and is blind to other cars apart from
+the follow-gap slowdown, so every opponent the policy meets poses the same problem: a slightly
+slower car holding the racing line. `--opp-events` gives the **teacher-driven** cars of a race
+scripted behaviour on top of that — a car that brakes, a car that has stopped, a car that moves
+across the lane:
+
+```bash
+python3 -m f1sim.learn.ppo --race-size 2 --opponent teacher \
+    --opp-events brake,stop,shift --opp-event-rate 1.0
+```
+
+| event   | what the opponent does | drawn from |
+|---------|------------------------|------------|
+| `brake` | commands `k` × its profile speed for `d` seconds, then resumes | `--opp-brake-scale` (k), `--opp-brake-time` (d) |
+| `stop`  | commands 0 for `d` seconds — the stalled car | `--opp-stop-time` |
+| `shift` | tracks the raceline offset by `o` m: ramp in, hold, ramp out — a lane change / blocking line | `--opp-shift-offset` (\|o\|, sign drawn separately), `--opp-shift-hold`, `--opp-shift-ramp` |
+| `weave` | sinusoidal lateral offset | `--opp-weave-amp`, `--opp-weave-period`, `--opp-weave-time` |
+
+`--opp-event-rate` is the expected number of events per opponent per 10 s of driving. Events never
+overlap, so the realised rate is a little below the flag (at rate 1.0 with ~1.7 s events, about
+0.85). `--opp-event-margin` is the body-to-wall gap kept when an event moves a car off the line.
+
+Three properties the flags rely on:
+
+* **Off is off.** Without `--opp-events` nothing is stepped and nothing is drawn from the
+  simulator's generator, so an unflagged run is bit-identical to the same run before the feature
+  existed (`f1sim/tests/test_opponent_events.py`).
+* **The events only ever slow a car down**, and the multiplier is applied *before* the
+  `opp_follow_gap` cap, so an opponent already braking for the car ahead never accelerates because
+  an event told it to.
+* **The lateral offset cannot reach a wall.** It is clamped per raceline point against the track's
+  own distance field (free space − car half-width − `--opp-event-margin`), so a 0.35 m lane change
+  through a 1.6 m section becomes as much of one as fits.
+
+Events are teacher-only: with `--opponent mixed` they apply to the teacher races and never to a car
+the policy is driving, and `--opp-events` with `--race-size 1` or `--opponent policy` is refused
+rather than silently ignored. Each step, `info["opp_event"]` reports `id` (0 = none, otherwise the
+1-based index into `brake, stop, shift, weave`), `time_left` in seconds and the `offset` in metres
+each car is holding, for a viewer or a logger.
+
 ## Evaluation
 
 ```bash

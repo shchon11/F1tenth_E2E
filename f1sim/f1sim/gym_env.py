@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, encode as plan_encode, decode as plan_decode
+from .opponent_events import OpponentEvents, raceline_offset_limit
 from .params import Config
 from .sim import Simulator, StepResult
 from .track import Track
@@ -202,6 +203,28 @@ class EnvConfig:
                                       # the reference is walked from the current speed and the speed
                                       # weight in the tracking cost is soft. A fixed 3 m trigger let a
                                       # teacher at 4 m/s run straight into a parked car.
+    # Scripted opponent *behaviour* (f1sim.opponent_events). Empty = off, and off is bit-identical to
+    # the env before events existed: nothing is stepped and nothing is drawn from the generator.
+    # A teacher opponent otherwise presents one problem -- a slightly slower car on the racing line --
+    # and the two benchmark dimensions the policy is worst at (obstacle avoidance, overtaking) are the
+    # two that need the other problems: a car that brakes, a car that has stopped, a car that moves
+    # across the lane. Widening opp_speed_range / spawn_gap was measured to move neither.
+    opp_events: tuple = ()            # any of ("brake", "stop", "shift", "weave"), or a comma-separated string
+    opp_event_rate: float = 0.0       # expected events per teacher opponent per 10 s of driving
+    opp_brake_scale_range: tuple = (0.0, 0.5)     # brake: fraction of its profile speed it drops to
+    opp_brake_time_range: tuple = (0.5, 2.5)      # [s] how long it holds that
+    opp_stop_time_range: tuple = (1.0, 4.0)       # [s] how long a stopped car stays stopped
+    opp_shift_offset_range: tuple = (0.0, 0.35)   # [m] |lateral offset| of a lane change; the sign is
+                                                  # drawn separately, so the offset is U(-hi, +hi) in effect
+    opp_shift_hold_range: tuple = (0.5, 2.0)      # [s] time at the offset, between the two ramps
+    opp_shift_ramp: float = 1.0                   # [s] ramp in and ramp out of the offset
+    opp_weave_amp_range: tuple = (0.1, 0.25)      # [m] sinusoidal offset amplitude
+    opp_weave_period_range: tuple = (2.0, 4.0)    # [s]
+    opp_weave_time_range: tuple = (2.0, 6.0)      # [s] how long a weave lasts
+    opp_event_margin: float = 0.10    # [m] free space kept beyond the car's half-width when an event
+                                      # offsets it off the raceline. The offset is clamped per raceline
+                                      # point against the track's own distance field, so a 0.35 m lane
+                                      # change through a 1.6 m section becomes as much of one as fits.
 
 
 class F1VecEnv:
@@ -233,6 +256,11 @@ class F1VecEnv:
         self.on_policy = self.learner.clone()
         self.learner_ids = torch.nonzero(self.learner).flatten()
         self.teacher = None                                    # set_teacher() for opponent == "teacher"
+        # Scripted opponent behaviour. Allocated whenever there are teacher-driven cars so a viewer or
+        # logger can read `info["opp_event"]` unconditionally; inert (and drawing nothing from the
+        # generator) until `opp_events` names an event.
+        self.events = (OpponentEvents(self.B, self.device, e, self.sim.control_dt, self.sim.gen)
+                       if self.M > 1 and e.opponent in ("teacher", "mixed") else None)
         self.opp_scale = torch.ones(self.B, device=self.device)
         # signed arc to each opponent last step (+ ahead of me, - behind), and whether it is usable.
         # A flag rather than "0 means unset": 0 is a perfectly ordinary gap -- it is the pass itself.
@@ -326,6 +354,14 @@ class F1VecEnv:
     def set_teacher(self, teacher):
         """Raceline teacher that drives the opponent cars (opponent == "teacher")."""
         self.teacher = teacher
+        if self.events is not None and self.events.enabled:
+            # How far off the line each raceline point can be driven without putting a car in the
+            # wall, measured once from the track's distance field. The teacher clamps against it at
+            # the car's own raceline index, so a shift through a narrow section shrinks instead of
+            # crashing. Nothing is computed, and nothing changes, when no event moves a car sideways.
+            teacher.offset_limit = raceline_offset_limit(teacher, self.sim.track,
+                                                         0.5 * self.cfg.vehicle.width,
+                                                         self.ecfg.opp_event_margin)
 
     # ------------------------------------------------------------------ helpers
     def _norm_scan(self, scan: torch.Tensor) -> torch.Tensor:
@@ -429,6 +465,8 @@ class F1VecEnv:
             self.prev_action[ids, -2:] = (speed / e.v_max_policy * 2 - 1)[:, None]
             self.tracker.reset(ids); self._calibrate_tracker(ids)
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
+        if self.events is not None:
+            self.events.reset(ids)                                  # a respawned car starts with no event
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
@@ -474,14 +512,29 @@ class F1VecEnv:
             return action
         if self.teacher is None:
             raise RuntimeError("opponent == 'teacher' needs env.set_teacher(RacelineTeacher)")
+        ev_speed, ev_off = None, None
+        if self.events is not None:
+            # The gate is read fresh rather than cached: in "mixed" mode which cars are teacher-driven
+            # is redrawn at every race reset, and a stale gate would script a car the policy is driving.
+            self.events.set_gate(~self.on_policy)
+            self.events.step()
+            ev_speed, ev_off = self.events.speed_scale(), self.events.lateral_offset()
         follow, v_cap = self.follow_cap(self.sim.state)
         if self.act_dim == 2:
-            cmd = self.teacher(self.sim.state, self.sim.P, self.sim.tid)
-            v = torch.where(follow, torch.minimum(cmd[:, 1] * self.opp_scale, v_cap), cmd[:, 1] * self.opp_scale)
+            cmd = self.teacher(self.sim.state, self.sim.P, self.sim.tid, offset=ev_off)
+            v = cmd[:, 1] * self.opp_scale
+            # Before the follow cap, never after: an event can only slow a car (speed_scale <= 1), so
+            # taking the minimum of the two leaves an opponent that is already braking for the car
+            # ahead braking. Applied the other way round, a "resume" would drive it into that car.
+            v = v if ev_speed is None else v * ev_speed
+            v = torch.where(follow, torch.minimum(v, v_cap), v)
             an = self.teacher_action_to_normalized(torch.stack([cmd[:, 0], v], 1))
         else:
-            an = self.teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy, self.tracker.spec)
+            an = self.teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
+                                          self.tracker.spec, offset=ev_off)
             an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
+            if ev_speed is not None:                             # same scaling in the normalized plan speeds
+                an[:, -2:] = (ev_speed[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
             cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
             an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
         return torch.where(self.on_policy[:, None], action, an)
@@ -580,6 +633,10 @@ class F1VecEnv:
                 "reward_components": dict(zip(REWARD_COMPONENT_KEYS, reward_components.unbind(1)))}
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
+        if self.events is not None:
+            # What each opponent is doing right now, for a viewer or a logger: event id (0 = none,
+            # f1sim.opponent_events.EVENT_ID), seconds left, and the lateral offset it is holding.
+            info["opp_event"] = {k: v.clone() for k, v in self.events.info().items()}
         if self.tracker is not None:
             info["plan"] = self.tracker.last_ref                 # (B, N+1, 4) body-frame x, y, heading, speed
         if any_done:

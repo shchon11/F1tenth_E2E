@@ -19,6 +19,7 @@ import time
 import numpy as np
 import torch
 
+from .. import opponent_events as opp_ev
 from ..gym_env import EnvConfig, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS
 from ..params import Config
 from . import common
@@ -192,6 +193,39 @@ def main():
                          "per reset. The default is the range every race so far was trained at, so an "
                          "unflagged run is unchanged. Widening it is an opponent-diversity axis: a "
                          "fixed narrow band shows the policy one approach geometry")
+    # Scripted opponent behaviour (f1sim.opponent_events). Every flag maps 1:1 onto the EnvConfig
+    # field of the same name; the defaults are the EnvConfig defaults, so an unflagged run is the
+    # run it was before these existed.
+    ap.add_argument("--opp-events", default="", metavar="A,B",
+                    help=f"comma-separated scripted events for the teacher-driven opponents "
+                         f"({','.join(opp_ev.EVENT_NAMES)}); empty = off. A teacher opponent otherwise "
+                         f"only ever presents a slower car on the racing line, which is the one "
+                         f"overtaking and avoidance problem the policy has already been trained on")
+    ap.add_argument("--opp-event-rate", type=float, default=0.0, metavar="PER10S",
+                    help="expected events per teacher opponent per 10 s of driving (events do not "
+                         "overlap, so the realized rate is a little below this)")
+    ap.add_argument("--opp-brake-scale", type=float, nargs=2, default=(0.0, 0.5), metavar=("LOW", "HIGH"),
+                    help="brake: fraction of its profile speed the opponent drops to")
+    ap.add_argument("--opp-brake-time", type=float, nargs=2, default=(0.5, 2.5), metavar=("LOW", "HIGH"),
+                    help="[s] how long a brake event holds")
+    ap.add_argument("--opp-stop-time", type=float, nargs=2, default=(1.0, 4.0), metavar=("LOW", "HIGH"),
+                    help="[s] how long a stopped opponent stays stopped")
+    ap.add_argument("--opp-shift-offset", type=float, nargs=2, default=(0.0, 0.35), metavar=("LOW", "HIGH"),
+                    help="[m] |lateral offset| of a lane change; the sign is drawn separately")
+    ap.add_argument("--opp-shift-hold", type=float, nargs=2, default=(0.5, 2.0), metavar=("LOW", "HIGH"),
+                    help="[s] time held at the offset, between the ramp in and the ramp out")
+    ap.add_argument("--opp-shift-ramp", type=float, default=1.0, metavar="S",
+                    help="[s] ramp in / ramp out of a shift")
+    ap.add_argument("--opp-weave-amp", type=float, nargs=2, default=(0.1, 0.25), metavar=("LOW", "HIGH"),
+                    help="[m] sinusoidal lateral amplitude of a weave")
+    ap.add_argument("--opp-weave-period", type=float, nargs=2, default=(2.0, 4.0), metavar=("LOW", "HIGH"),
+                    help="[s] weave period")
+    ap.add_argument("--opp-weave-time", type=float, nargs=2, default=(2.0, 6.0), metavar=("LOW", "HIGH"),
+                    help="[s] how long a weave lasts")
+    ap.add_argument("--opp-event-margin", type=float, default=0.10, metavar="M",
+                    help="[m] free space kept beyond the car's half-width when an event moves an "
+                         "opponent off the raceline; the offset is clamped per raceline point "
+                         "against the track's distance field, so it can never reach a wall")
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the policy outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
@@ -212,6 +246,21 @@ def main():
                          f"is an arc drawn uniformly from [LOW, HIGH] and subtracted per grid slot, so "
                          f"a non-positive or inverted range spawns cars on top of each other.")
     a.spawn_gap = (_gap_lo, _gap_hi)
+    try:
+        a.opp_events = opp_ev.parse_events(a.opp_events)
+    except ValueError as exc:
+        raise SystemExit(f"--opp-events: {exc}")
+    if a.opp_events:
+        if a.race_size < 2 or a.opponent not in ("teacher", "mixed"):
+            raise SystemExit(f"--opp-events {','.join(a.opp_events)} needs --race-size > 1 and "
+                             f"--opponent teacher|mixed: the events script the *teacher-driven* cars "
+                             f"of a race, and there are none here (--race-size {a.race_size}, "
+                             f"--opponent {a.opponent}).")
+        if not a.opp_event_rate > 0:
+            raise SystemExit(f"--opp-events {','.join(a.opp_events)} with --opp-event-rate "
+                             f"{a.opp_event_rate}: the rate is how many events an opponent gets per "
+                             f"10 s, so at 0 the named events never fire and the run is silently the "
+                             f"unflagged one. Pass a positive rate or drop --opp-events.")
     if a.kl_decay is None:
         a.kl_decay = a.total
     device = torch.device(a.device); torch.manual_seed(a.seed)
@@ -253,6 +302,17 @@ def main():
                                                               mixed_teacher_frac=a.mixed_teacher_frac,
                                                               opp_speed_range=tuple(a.opp_speed),
                                                               spawn_gap=tuple(a.spawn_gap), action_mode=a.action_mode,
+                                                              opp_events=a.opp_events, opp_event_rate=a.opp_event_rate,
+                                                              opp_brake_scale_range=tuple(a.opp_brake_scale),
+                                                              opp_brake_time_range=tuple(a.opp_brake_time),
+                                                              opp_stop_time_range=tuple(a.opp_stop_time),
+                                                              opp_shift_offset_range=tuple(a.opp_shift_offset),
+                                                              opp_shift_hold_range=tuple(a.opp_shift_hold),
+                                                              opp_shift_ramp=a.opp_shift_ramp,
+                                                              opp_weave_amp_range=tuple(a.opp_weave_amp),
+                                                              opp_weave_period_range=tuple(a.opp_weave_period),
+                                                              opp_weave_time_range=tuple(a.opp_weave_time),
+                                                              opp_event_margin=a.opp_event_margin,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,

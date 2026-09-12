@@ -22,6 +22,11 @@ class RacelineTeacher:
     without latency but loses to pure pursuit under domain randomization (delays up to 80 ms):
     on the 26-track set at 6 m/s, collisions per env per 15 s: pp 0.13 vs stanley 0.39."""
 
+    #: (T, N) largest |lateral offset| each raceline point tolerates, set by the env when opponent
+    #: behaviour events are on (f1sim.opponent_events.raceline_offset_limit). None: no clamp, which
+    #: is also what every caller that never passes `offset` sees.
+    offset_limit: Optional[torch.Tensor] = None
+
     def __init__(self, raceline, wheelbase: float = 0.3302, device="cpu", mode: str = "pp",
                  lookahead_gain: float = 0.35, lookahead_min: float = 0.6, lookahead_max: float = 2.5,
                  speed_lookahead_time: float = 0.35, lateral_slowdown: float = 0.6,
@@ -86,18 +91,26 @@ class RacelineTeacher:
 
     @torch.no_grad()
     def plan_action(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None, v_max: float = 8.0,
-                    spec=None, iters: int = 6) -> torch.Tensor:
+                    spec=None, iters: int = 6, offset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The teacher as a *planner*: the raceline segment ahead of the car expressed in the plan
         action space (f1sim.mpc: curvature knots along the next L_p of arc + start/end speeds).
         Gauss-Newton fits the knots so the integrated path passes through the raceline points
         ahead (in the body frame), starting from the raceline's own curvature there; this is what
-        a plan-space student imitates."""
+        a plan-space student imitates.
+
+        offset: (B,) metres left of the raceline to plan through (opponent behaviour events), clamped
+        by `offset_limit`. None leaves this function exactly as it was."""
         from .mpc import N_KNOTS, PlanSpec, encode, path_points, plan_length
         spec = spec or PlanSpec()
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         B = xy.shape[0]; dev = xy.device
         tid = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
         idx, _ = self.project(xy, tid)
+        if offset is not None:
+            offset = self.clamp_offset(offset, tid, idx)
+        def normal(j):                                             # left-of-travel unit normal at raceline index j
+            t_ = self.tan[tid if j.dim() == 1 else tid[:, None].expand_as(j), j]
+            return torch.stack([-t_[..., 1], t_[..., 0]], -1)
         ds = self.ds[tid]
         Lp = plan_length(vx, spec)
         # raceline points at 6 arc distances between 0.4 and 1.0 L_p ahead, in the body frame (the near
@@ -106,6 +119,8 @@ class RacelineTeacher:
         fr = torch.linspace(0.4, 1.0, M, device=dev)
         pidx = (idx[:, None] + ((Lp[:, None] * fr[None]) / ds[:, None]).round().long()) % self.N        # (B,M)
         pts = self.xy[tid[:, None].expand_as(pidx), pidx] - xy[:, None, :]
+        if offset is not None:                                     # plan through the offset line, not the raceline
+            pts = pts + offset[:, None, None] * normal(pidx)
         c, s_ = torch.cos(yaw), torch.sin(yaw)
         tx = pts[..., 0] * c[:, None] + pts[..., 1] * s_[:, None]
         ty = -pts[..., 0] * s_[:, None] + pts[..., 1] * c[:, None]
@@ -117,7 +132,10 @@ class RacelineTeacher:
         # the fit below only refines this, so an off-line car neither snaps to the line at full lock
         # (over-correction crashes) nor drifts along beside it (under-correction crashes)
         ld = (self.k_ld * vx.abs()).clamp(self.ld_min, self.ld_max)
-        tgt = self.xy[tid, (idx + (ld / ds).round().long()) % self.N] - xy
+        ld_idx = (idx + (ld / ds).round().long()) % self.N
+        tgt = self.xy[tid, ld_idx] - xy
+        if offset is not None:
+            tgt = tgt + offset[:, None] * normal(ld_idx)
         alpha = torch.atan2(-tgt[:, 0] * s_ + tgt[:, 1] * c, tgt[:, 0] * c + tgt[:, 1] * s_)
         k_pp = (2.0 * torch.sin(alpha) / ld).clamp(-spec.kappa_max, spec.kappa_max)
         w = torch.clamp(1.0 - torch.linspace(0, 1, N_KNOTS, device=dev) * Lp[:, None] / ld[:, None], 0.0, 1.0)   # PP weight fades over the lookahead
@@ -143,6 +161,9 @@ class RacelineTeacher:
         v_idx0 = (idx + ((vx.abs() * spec.v_cmd_lead) / ds).round().long()) % self.N
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
         _, lat_err = self.project(xy, tid)
+        if offset is not None:                                     # error against the offset line (see __call__)
+            t0, p0 = self.tan[tid, idx], self.xy[tid, idx]
+            lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()
         slow = (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)     # off the line: slow down, like the direct teacher
         v0 = self.speed_at(tid, v_idx0, gb) * slow; v1 = self.speed_at(tid, v_idx1, gb) * slow
         cap = self.heading_speed_cap(yaw, tid, idx)
@@ -189,17 +210,28 @@ class RacelineTeacher:
             return self.v[tid, idx] * torch.sqrt(g) * self.speed_scale
         return self.v_grip[tid, gb, idx] * self.speed_scale
 
+    def clamp_offset(self, offset: torch.Tensor, tid: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """Cut a commanded lateral offset down to what the lane has room for at this raceline point."""
+        if self.offset_limit is None:
+            return offset
+        lim = self.offset_limit[tid, idx]
+        return torch.clamp(offset, -lim, lim)
+
     def project(self, xy: torch.Tensor, tid: Optional[torch.Tensor] = None):
         tid = torch.zeros(xy.shape[0], dtype=torch.long, device=xy.device) if tid is None else tid
         d2 = ((xy[:, None, :] - self.xy[tid]) ** 2).sum(-1)
         idx = d2.argmin(1)
         return idx, d2[torch.arange(len(idx)), idx].sqrt()
 
-    def __call__(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def __call__(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
+                 offset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """state (B,7) ground truth -> action (B,2) = (steer [rad], speed [m/s]).
         P: the simulator's per-env parameter dict (privileged). When given, the teacher
         compensates command latency, servo lag, actuator calibration and scales speed with grip.
-        tid: per-env track id (which raceline to follow)."""
+        tid: per-env track id (which raceline to follow).
+        offset: (B,) metres left of the raceline to track instead of the line itself, clamped by
+        `offset_limit`. None (every caller that does not script opponent behaviour) is the path this
+        function had before offsets existed, instruction for instruction."""
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         tid = torch.zeros(xy.shape[0], dtype=torch.long, device=xy.device) if tid is None else tid
         if P is not None:
@@ -210,11 +242,22 @@ class RacelineTeacher:
             xy = xy + torch.stack([vx * torch.cos(yaw_c), vx * torch.sin(yaw_c)], 1) * dt_c[:, None]
             yaw = yaw_c
         idx, lat_err = self.project(xy, tid)
+        if offset is not None:
+            # The offset line is the raceline displaced along its own normal, so the car's error
+            # against it is its signed error against the raceline minus the offset -- and the
+            # off-line speed slowdown below has to read *that*, or a car sitting perfectly on a
+            # 0.35 m offset would be told it is 0.35 m off and slowed for it every step it holds.
+            offset = self.clamp_offset(offset, tid, idx)
+            t0, p0 = self.tan[tid, idx], self.xy[tid, idx]
+            lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()
         ds = self.ds[tid]
         if self.mode == "pp":
             ld = (self.k_ld * vx.abs()).clamp(self.ld_min, self.ld_max)
             tgt_idx = (idx + (ld / ds).round().long()) % self.N
             tgt = self.xy[tid, tgt_idx]
+            if offset is not None:
+                tn = self.tan[tid, tgt_idx]
+                tgt = tgt + offset[:, None] * torch.stack([-tn[:, 1], tn[:, 0]], 1)   # normal, left +
             dx, dy = tgt[:, 0] - xy[:, 0], tgt[:, 1] - xy[:, 1]
             alpha = torch.atan2(dy, dx) - yaw
             alpha = torch.remainder(alpha + math.pi, 2 * math.pi) - math.pi
@@ -224,12 +267,14 @@ class RacelineTeacher:
             if self.k_e_pp > 0:                                                             # small lateral-error term
                 t = self.tan[tid, idx]; p = self.xy[tid, idx]
                 e = t[:, 0] * (xy[:, 1] - p[:, 1]) - t[:, 1] * (xy[:, 0] - p[:, 0])
+                e = e if offset is None else e - offset
                 steer = steer - torch.atan(self.k_e_pp * e / (vx.abs() + self.v_soft))
         else:
             front = xy + self.L * torch.stack([torch.cos(yaw), torch.sin(yaw)], 1)
             fidx, _ = self.project(front, tid)
             t = self.tan[tid, fidx]; p = self.xy[tid, fidx]
             e = t[:, 0] * (front[:, 1] - p[:, 1]) - t[:, 1] * (front[:, 0] - p[:, 0])      # left of the line +
+            e = e if offset is None else e - offset          # error against the offset line, same normal
             psi = torch.atan2(t[:, 1], t[:, 0]) - yaw
             psi = torch.remainder(psi + math.pi, 2 * math.pi) - math.pi
             k_idx = (fidx + ((vx.abs() * self.ff_time) / ds).round().long()) % self.N
