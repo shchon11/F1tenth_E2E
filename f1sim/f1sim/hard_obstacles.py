@@ -79,14 +79,30 @@ def _stamp(occ, tall, res, origin, cx, cy, tang, nrm, sx, sy):
     occ[r0:r1, c0:c1] |= m; tall[r0:r1, c0:c1] |= m
 
 
-def _block(v_lo: float, v_hi: float) -> List[Tuple[float, float]]:
-    """Split a lateral interval into box-sized pieces: [(v_centre, width), ...]."""
+ROW_GAP = (0.05, 0.25)    # daylight between adjacent boxes in a row: the hand-built rows are boxes
+                          # set down one by one, not a wall, and the LiDAR sees through the cracks
+
+
+def _block(v_lo: float, v_hi: float, rng=None) -> List[Tuple[float, float]]:
+    """Split a lateral interval into a row of boxes with small gaps between them:
+    [(v_centre, width), ...].
+
+    The first cut of this file made rows as touching pieces, i.e. a wall with one opening. On the
+    user's scene_0912_2355 the policy trained on that drove into a *gapped* row at 5-7 m/s eleven
+    times out of sixteen (crash map, 2026-09-13 04:25): between two boxes 0.1-0.2 m apart the beams
+    pass, and a policy that has only ever seen solid rows reads the cracks as a way through. So a row
+    is boxes with 0.05-0.25 m of daylight, narrower than the car; the erosion proof (0.25 m) closes
+    them, so the lap's real opening is still the one the pattern left."""
     span = v_hi - v_lo
     if span < 0.12:
         return []
-    k = max(1, int(np.ceil(span / (BOX_W + 0.02))))
-    w = span / k
-    return [(v_lo + (j + 0.5) * w, w) for j in range(k)]
+    rng = rng or np.random.default_rng(0)
+    out, v = [], v_lo
+    while v_hi - v >= 0.12:
+        w = min(BOX_W, v_hi - v)
+        out.append((v + w / 2, w))
+        v += w + float(rng.uniform(*ROW_GAP))
+    return out
 
 
 def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
@@ -158,7 +174,7 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
         span = width - g
         if kind == "gate":
             lo, hi = (wl - span, wl) if side > 0 else (-wr, -wr + span)
-            boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi)]
+            boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi, rng)]
         elif kind == "diagonal":
             k = int(rng.integers(3, 6))
             step_v = span / k
@@ -168,13 +184,13 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
         elif kind == "chicane":
             g2 = max(GAP_MIN, width * float(rng.uniform(*gap_frac))); span2 = width - g2
             lo, hi = (wl - span, wl) if side > 0 else (-wr, -wr + span)
-            boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi)]
+            boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi, rng)]
             lo2, hi2 = (-wr, -wr + span2) if side > 0 else (wl - span2, wl)
             along = float(rng.uniform(2.0, 3.5))
-            boxes += [(along, v, BOX_D, w) for v, w in _block(lo2, hi2)]
+            boxes += [(along, v, BOX_D, w) for v, w in _block(lo2, hi2, rng)]
         elif kind == "apex":
             lo, hi = (wl - span, wl) if side > 0 else (-wr, -wr + span)
-            boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi)]
+            boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi, rng)]
             if rng.random() < SMALL_SHARE:                           # a small thing at the apex instead
                 sz = float(rng.uniform(0.15, 0.25))
                 v = (wl - sz / 2 - 0.05) if side > 0 else (-wr + sz / 2 + 0.05)
