@@ -28,7 +28,7 @@ Both are differentiated/compared over a window, never sample to sample: see `_AC
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 #: Physical ceiling on this car's *body* longitudinal acceleration, m/s^2. mu ~ 1.05 on the
 #: competition floor times g; `evidence/wheelslip_bags.py` uses the same number. Every body
@@ -280,8 +280,14 @@ class TractionGuard:
             else:
                 self._ab = _lp(self._ab, a_raw, self._dt or 0.02, p.imu_fc)
 
-        if self._t is None or not (0.0 < t - self._t <= p.max_step_dt):
+        if self._t is None or t - self._t > p.max_step_dt:
             return self._seed(t, v)                 # first sample, or a gap: re-seed, do not detect
+        if t <= self._t:
+            # A repeated or out-of-order timestamp is a sample to drop, not a reason to forget
+            # everything: re-seeding here would clear a latched release mid-lock. `/odom` stamps in
+            # these bags are not guaranteed monotonic (`calib/bagread.py` sorts each topic for
+            # exactly that reason) and two records can share a nanosecond.
+            return self._last
 
         dt = t - self._t
         self._t, self._dt = t, dt
@@ -457,5 +463,4 @@ def _lp(y, x, dt, fc):
     return a * y + (1.0 - a) * x
 
 
-__all__ = ["TractionGuard", "TractionParams", "TractionState", "A_BODY_MAX", "OK", "LOCK", "SPIN",
-           "replace"]
+__all__ = ["TractionGuard", "TractionParams", "TractionState", "A_BODY_MAX", "OK", "LOCK", "SPIN"]

@@ -200,6 +200,21 @@ def test_a_single_sample_timestamp_glitch_cannot_fire_the_detector():
     assert SPIN not in states(sts2)
 
 
+def test_a_repeated_or_backwards_timestamp_is_dropped_not_treated_as_a_gap():
+    """Re-seeding on a stale stamp would clear a latched release mid-lock. `/odom` stamps are not
+    guaranteed monotonic -- `calib/bagread.py` sorts each topic for that reason."""
+    g = TractionGuard()
+    sts = run(g, cruise(6.0, 25) + lock(6.0, t0=0.5))
+    assert sts[-1].state == LOCK or LOCK in states(sts)
+    g2 = TractionGuard()
+    run(g2, cruise(6.0, 25) + lock(6.0, n=4, t0=0.5))
+    assert g2.state.state == LOCK
+    before = g2.state
+    assert g2.update(before.t, 0.0, -3.0) is before          # same stamp
+    assert g2.update(before.t - 0.05, 0.0, -3.0) is before    # older stamp
+    assert g2.state.state == LOCK
+
+
 def test_a_gap_reseeds_instead_of_detecting_across_it():
     g = TractionGuard()
     run(g, cruise(6.0, 25))
@@ -274,6 +289,23 @@ def test_a_spin_cap_never_commands_reverse():
     rolling_back = [(t, v, ax, 60.0) for (t, v, ax, _) in spin(-1.0, 25.0, 0.0, 20, t0=0.5)]
     _, out = run(g, cruise(-1.0, 25, cur=60.0) + rolling_back, cmd=1.0)
     assert min(out) >= 0.0, min(out)
+
+
+def test_the_acceleration_hint_is_accepted_and_changes_nothing():
+    """`cmd_accel_hint` is part of the interface the tracker hands down. It currently changes no
+    output -- the lock action already refuses to lower the command and the spin cap already refuses
+    to raise it -- and this pins that, so a future use of it shows up as a failure here rather than
+    as a silent change of behaviour on the car."""
+    profile = cruise(6.0, 25) + lock(6.0, t0=0.5) + cruise(1.0, 30, t0=1.3)
+    plain = TractionGuard()
+    _, a = run(plain, profile, cmd=2.0)
+    for hint in (-9.0, 0.0, +5.0):
+        g = TractionGuard()
+        out = []
+        for (t, v, ax, cur) in profile:
+            g.update(t, v, ax, cur)
+            out.append(g.shape(2.0, hint))
+        assert out == a, hint
 
 
 def test_shaping_is_neutral_while_ok():

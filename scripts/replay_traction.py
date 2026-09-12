@@ -154,6 +154,8 @@ def replay_bag(path, params, cmd_topic="/drive", tol=0.15, quiet_v=1.0):
                               cmd_out=None if np.isnan(shaped[i]) else float(shaped[i]),
                               d_cmd=(float(d[np.nanargmax(np.abs(d))])
                                      if np.any(~np.isnan(d)) else None),
+                              d_up=(float(np.nanmax(d)) if np.any(~np.isnan(d)) else None),
+                              d_dn=(float(np.nanmin(d)) if np.any(~np.isnan(d)) else None),
                               ms=int(1000 * (t[j - 1] - t[i] + dt_med)), label=None))
     fires.sort(key=lambda e: e["t0"])
 
@@ -229,6 +231,11 @@ def replay_bag(path, params, cmd_topic="/drive", tol=0.15, quiet_v=1.0):
         active_s=round(float((state != OK).sum() * dt_med), 2),
         d_cmd_max=round(float(max((abs(f["d_cmd"]) for f in fires if f["d_cmd"] is not None),
                                   default=0.0)), 2),
+        # The two actions pull opposite ways, so one signed maximum hides one of them: `d_up` is the
+        # lock release (bounded by `release_max`) and `d_dn` the spin cap (bounded by the body speed
+        # the command was capped to).
+        d_up_max=round(float(max([0.0] + [f["d_up"] for f in fires if f["d_up"] is not None])), 2),
+        d_dn_max=round(float(min([0.0] + [f["d_dn"] for f in fires if f["d_dn"] is not None])), 2),
         labels=labels, fires=fires)
 
 
@@ -258,13 +265,15 @@ def totals(rows):
     t["moving_s"] = sum(r["moving_s"] for r in ok)
     t["active_s"] = sum(r["active_s"] for r in ok)
     t["d_cmd_max"] = max((r["d_cmd_max"] for r in ok), default=0.0)
+    t["d_up_max"] = max((r["d_up_max"] for r in ok), default=0.0)
+    t["d_dn_max"] = min((r["d_dn_max"] for r in ok), default=0.0)
     return t
 
 
 def md_table(rows):
     out = ["| bag | moving s | labels (>=30) | fires | hits (>=30) | misses (>=30) "
-           "| false alarms (stationary / cruising / sub-threshold) | guard active s | max dcmd m/s |",
-           "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+           "| false alarms (stationary / cruising / sub-threshold) | guard active s | release +m/s | cap -m/s |",
+           "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for r in rows:
         if "error" in r:
             out.append(f"| `{r['bag']}` | - | - | - | - | - | ERROR {r['error']} | - | - |")
@@ -272,13 +281,13 @@ def md_table(rows):
         out.append(f"| `{r['bag']}` | {r['moving_s']:.1f} | {r['n_lab']} ({r['n_lab_must']}) | "
                    f"{r['n_fire']} | {r['hit']} ({r['hit_must']}) | {r['miss']} ({r['miss_must']}) | "
                    f"{r['fa']} ({r['fa_stationary']} / {r['fa_cruising']} / {r['fa_sub']}) | "
-                   f"{r['active_s']:.2f} | {r['d_cmd_max']:.2f} |")
+                   f"{r['active_s']:.2f} | +{r['d_up_max']:.2f} | {r['d_dn_max']:.2f} |")
     t = totals(rows)
     out.append(f"| **total, {t['bags']} bags** | **{t['moving_s']:.0f}** | **{t['n_lab']} "
                f"({t['n_lab_must']})** | **{t['n_fire']}** | **{t['hit']} ({t['hit_must']})** | "
                f"**{t['miss']} ({t['miss_must']})** | **{t['fa']} ({t['fa_stationary']} / "
                f"{t['fa_cruising']} / {t['fa_sub']})** | **{t['active_s']:.1f}** | "
-               f"**{t['d_cmd_max']:.2f}** |")
+               f"**+{t['d_up_max']:.2f}** | **{t['d_dn_max']:.2f}** |")
     return "\n".join(out)
 
 
@@ -381,7 +390,8 @@ def main(argv=None):
           f"{t['miss']} misses ({t['miss_must']} must-catch), "
           f"{t['fa']} unmatched firings ({t['fa_stationary']} stationary, {t['fa_cruising']} cruising, "
           f"{t['fa_sub']} sub-threshold), guard active {t['active_s']:.1f} s, "
-          f"max |dcmd| {t['d_cmd_max']:.2f} m/s")
+          f"command change: release up to +{t['d_up_max']:.2f} m/s, cap down to "
+          f"{t['d_dn_max']:.2f} m/s")
     if a.events:
         for r in rows:
             if "error" not in r and (r["labels"] or r["fires"]):
