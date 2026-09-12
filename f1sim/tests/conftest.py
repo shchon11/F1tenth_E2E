@@ -3,8 +3,22 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import os                                                              # noqa: E402
 import dataclasses                                                     # noqa: E402
+import sys                                                             # noqa: E402
 
 import pytest                                                          # noqa: E402
+
+# Test THIS checkout's `f1sim_ros`, not whichever copy is on PYTHONPATH.
+#
+# `activate.sh` puts the colcon build space (`F1tenth/build/f1sim_ros`) on PYTHONPATH, which is a
+# copy of the main tree -- so in a worktree, or after any edit that has not been rebuilt,
+# `import f1sim_ros.policy_node` silently tested a different file than the one under review. Worse,
+# it was order-dependent: the first test module to import the package fixed `sys.modules` for the
+# rest of the session, so a file that inserted its own path only won when it happened to be
+# collected first. Doing it here, once, before any test module is imported, removes both problems.
+_ROS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                    "f1sim_ros")
+if os.path.isdir(os.path.join(_ROS, "f1sim_ros")) and sys.path[:1] != [_ROS]:
+    sys.path.insert(0, _ROS)
 
 
 def pytest_configure(config):

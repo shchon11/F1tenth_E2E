@@ -252,6 +252,7 @@ class TractionGuard:
         self._last = TractionState()
         # shaper
         self._cmd_prev = None           # last speed this guard emitted
+        self._t_shape = None            # `t` of the update the last `shape` call was paired with
         self._cap = None                # active spin cap
         self._cap_left = 0.0            # seconds of post-spin cap ramp remaining
 
@@ -347,7 +348,7 @@ class TractionGuard:
         self._state, self._since = OK, 0.0
         self._n_lock = self._n_spin = 0
         self._v_ref = [(t, v)]
-        self._cmd_prev, self._cap, self._cap_left = None, None, 0.0
+        self._cmd_prev, self._t_shape, self._cap, self._cap_left = None, None, None, 0.0
         self._last = TractionState(state=OK, t=t, wheel_speed=v, body_accel=self._ab,
                                    body_speed=v, locks=self._locks, spins=self._spins)
         return self._last
@@ -384,7 +385,7 @@ class TractionGuard:
     # ---------------------------------------------------------------- shaper
 
     def shape(self, cmd_speed, cmd_accel_hint=None) -> float:
-        """Shape one speed command, m/s. Uses the state and step from the last `update`.
+        """Shape one speed command, m/s. Uses the state from the last `update`.
 
         * `lock` -- release towards `release_frac * body_speed` at `release_rate`, and refuse to cut
           the command faster than `brake_rate`. The guard never commands *less* than it was asked
@@ -392,17 +393,25 @@ class TractionGuard:
         * `spin` -- cap at `body_speed + spin_margin`, then hold the cap for `spin_ramp` seconds
           after the state clears, growing it at `a_body_max`.
 
-        `cmd_accel_hint` (m/s^2, the tracker's intended acceleration, or None) is advisory: a
-        command that is already accelerating gently is not clamped harder than it asks for.
+        Every rate here is per second of *command* time, measured between consecutive `shape` calls
+        off the timestamps `update` was given -- not the update step. The two differ on this car:
+        `/odom` arrives at 50 Hz and the command goes out at the 40 Hz scan rate, and using the
+        20 ms update step for a 25 ms command interval would quietly run every slew limit 20 % slow.
+
+        `cmd_accel_hint` (m/s^2, the tracker's intended acceleration, or None) is accepted for
+        symmetry with the tracker's own interface and currently unused: the lock action already
+        refuses to lower the command and the spin cap already refuses to raise it, so a hint about
+        which way the command was heading changes neither.
         """
         p = self.p
         if not math.isfinite(float(cmd_speed)):
             return cmd_speed
         cmd = float(cmd_speed)
-        dt = self._dt
-        if self._t is None or dt <= 0.0:
+        if self._t is None:
             self._cmd_prev = cmd
             return cmd
+        dt = max(0.0, self._t - (self._t if self._t_shape is None else self._t_shape))
+        self._t_shape = self._t
         prev = cmd if self._cmd_prev is None else self._cmd_prev
         out = cmd
 

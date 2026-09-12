@@ -123,3 +123,108 @@ no sensor, and on suite v1 (2026-09-12) it was the safest arm on every stability
 policy at a ~2 % lap-time cost. `controller:=legacy` is the untouched tracker. The `estimated` and
 `reactive` arms are simulator research arms and are refused here. The startup log line names the arm
 and the friction in force. Unit tests: `f1sim/tests/test_policy_node_grip.py`.
+
+## Traction guard
+
+`policy_node` can watch the wheel for lock-up and spin and shape the speed command it publishes.
+**Off by default** (`traction:=off`): it has been validated by replaying the real recordings and
+never on a moving car, and it is the one thing in this node that can raise a commanded speed the
+policy lowered. Turn it on deliberately, at walking pace, with a hand on the kill switch:
+
+```bash
+ros2 launch f1sim_ros f1tenth_stack_sim.launch.py policy:=$HOME/f1sim_runs/ppo_v1/ppo_latest.pt
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p traction:=on
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p traction:=on \
+  -p traction_params:="lock_rate=22, release_max=1.0"
+```
+
+### What it detects
+
+[`f1sim_ros/f1sim_ros/traction.py`](../f1sim_ros/f1sim_ros/traction.py) is a ROS-free class
+(`math` only; no numpy, no torch, no rclpy) that compares two measurements the car already
+publishes:
+
+| signal | topic | note |
+| --- | --- | --- |
+| wheel speed | `/odom` `twist.twist.linear.x` | `vesc_to_odom`'s **ERPM** wheel speed, not ground speed — under lock or spin it is wrong about the vehicle, which is what makes it a slip sensor |
+| body acceleration | `/sensors/imu/raw` `linear_acceleration.x` | published in **g** on this car; the node detects and scales it (`imu_accel_scale`) before the guard sees it |
+| motor current | `/sensors/core` `state.current_motor` | optional corroboration: a launch spin needs drive torque. Absent topic or no `vesc_msgs` ⇒ the check is skipped, not failed |
+
+A rolling wheel cannot change speed faster than the body, and the body cannot exceed µ·g ≈ 10.3 m/s²
+on this floor. So both states need an **absolute** gate and a **residual** against the (clamped)
+IMU:
+
+* **lock** — wheel deceleration past `lock_accel` (18 m/s², 1.75 µ·g) *and* a residual
+  (body − wheel acceleration) past `lock_rate` (18 m/s²), while the recent peak body speed is above
+  `v_lock_min` (1 m/s). Held until the wheel speed rejoins the body estimate, or `max_hold`.
+* **spin** — wheel acceleration past `spin_accel` (14 m/s²) and a residual past `spin_rate`
+  (12 m/s²) for `spin_persist` (2) consecutive samples, with motor current above
+  `spin_current_min` when it is known.
+
+The guard also carries a plausible body speed: the clamped IMU acceleration integrated, pulled back
+onto the wheel speed (slew-limited to µ·g) whenever nothing is slipping, and decayed by at least
+`lock_decay_frac`·µ·g while a lock is latched — a sliding tyre is at the friction limit, and the
+accelerometer is the one signal that cannot be trusted during the event.
+
+### The two actions
+
+* **lock → release the brake.** The command is raised towards `release_frac`·(body speed) at
+  `release_rate`, and while the lock is latched it may not be *cut* faster than `brake_rate`. The
+  guard never commands less than it was asked for, and `release_max` (2 m/s) is a hard ceiling on
+  how far above the policy's command it can go — because these two sensors cannot tell "the wheel is
+  sliding at 7 m/s of body speed" from "the car has stopped and the estimate has not caught up".
+* **spin → cap the command.** At `body speed + spin_margin`, never across zero, then the cap is held
+  for `spin_ramp` seconds after the state clears while growing at µ·g, and then dropped.
+
+State changes are logged at INFO with the numbers behind them:
+
+```
+[f1sim_policy]: traction lock: wheel +0.44 m/s at -167.9 m/s^2, body +6.62 m/s at +3.0 m/s^2
+                (residual +170.9, slip -6.18), 1 locks / 0 spins so far
+```
+
+### Parameters
+
+| parameter | default | meaning |
+| --- | --- | --- |
+| `traction` | `off` | `off` installs nothing at all; `on` installs the replay-validated guard. Anything else is refused |
+| `traction_params` | `""` | `NAME=VALUE` pairs (comma or space separated) overriding any field of `TractionParams` — every threshold above is reachable from the launch line |
+
+`TractionParams` carries the rest, each field documented where it is declared with the bag and
+timestamp that set it: `lock_accel`, `lock_rate`, `spin_accel`, `spin_rate`, `clear_frac`,
+`slip_hold`, `lock_persist`, `spin_persist`, `v_lock_min`, `v_ref_hold`, `spin_current_min`,
+`min_hold`, `max_hold`, `wheel_fc`, `imu_fc`, `v_body_tau`, `a_body_max`, `min_diff_dt`,
+`max_diff_dt`, `max_step_dt`, `lock_decay_frac`, `release_frac`, `release_rate`, `brake_rate`,
+`release_max`, `spin_margin`, `spin_ramp`. Nonsense values are refused at construction rather than
+at 8 m/s.
+
+### Why it is validated offline, and how to replay
+
+The simulator **cannot produce either failure**. `f1sim/f1sim/dynamics.py` has no wheel rotation
+state (`STATE_DIM` 7: x, y, yaw, vx, vy, yaw_rate, steer) and `f1sim/f1sim/odom.py` reports ground
+speed plus noise, so in simulation the wheel speed *is* the body speed and this residual is
+identically zero. There is nothing to detect and nothing to train against. The real car shows both,
+clearly, in all 22 recordings under `real_data/` — wheel decelerations of −40 … −143 m/s² against a
+body decel of −3 … −16 — so the rule lives on the car and is scored by replay:
+
+```bash
+source /home/shchon11/F1tenth/activate.sh            # rosbag2_py, for the reader
+python3 scripts/replay_traction.py --markdown        # the table in REPORT.md
+python3 scripts/replay_traction.py --bag 20260826-173704 --events
+python3 scripts/replay_traction.py --set lock_rate=22 --quiet        # sweep a threshold
+python3 scripts/replay_traction.py --root /path/to/other/bags       # default: ~/F1tenth/real_data
+```
+
+The script re-derives the labels of the wheel-slip survey that established these events
+(`work/real-car-tcs/evidence/wheelslip_bags.py`, outside this repository) off the same arrays it
+feeds the guard, and scores hit / miss / false alarm per bag with the
+timestamps and the commanded-speed change at every event. Exit status is 0 only when nothing in the
+must-catch set (labelled runs with |a_wheel| ≥ 30 m/s²) is missed and nothing fires while the car is
+stationary or cruising. Current result: 22 bags, 1088 s of motion, 20 of the 22 must-catch runs
+caught, no firing while stationary or cruising, largest command change 2.60 m/s. The two misses and
+the trade-off on the weaker events are in REPORT.md.
+
+Unit tests: [`f1sim/tests/test_traction_guard.py`](../f1sim/tests/test_traction_guard.py) (detector,
+shaper, reset, determinism, parameter sanity) and
+[`f1sim/tests/test_policy_node_traction.py`](../f1sim/tests/test_policy_node_traction.py) (the
+parameter, the wiring, and that `off` is inert).
