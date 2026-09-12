@@ -275,11 +275,12 @@ def test_the_same_map_three_ways_is_named_once_and_counted_as_one_map():
 
 def test_a_suffix_this_version_does_not_know_is_passed_through_rather_than_dropped():
     """Another branch is training with a `+hard<seed>` obstacle family this registry has never
-    heard of. An unknown name is data, not an error: it is counted and printed as it stands."""
+    heard of. An unknown name is data, not an error: it is counted, and the map under it is named
+    even though the suffix cannot be."""
     argv = list(RECORDED)
-    argv[argv.index("--tracks") + 1] = "real:icra2022+hard1,real:icra2022+hard1~rev"
+    argv[argv.index("--tracks") + 1] = "real:icra2022+hard1,real:icra2022+hard1~rev,weird_name"
     s = T.summarize_job(_job(argv))
-    assert s.tracks_text == "2개 맵 · real:icra2022+hard1, real:icra2022+hard1~rev"
+    assert s.tracks_text == "3개 시나리오 · 2개 맵 · ICRA 2022, weird_name"
 
 
 def test_the_old_grammar_still_matches_its_recipe():

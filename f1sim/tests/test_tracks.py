@@ -156,6 +156,20 @@ def test_a_name_outside_the_catalogue_passes_through_untouched():
     for name in ("/abs/path/map.yaml", "some_weird_name", "scene:/abs/dir"):
         sc = tracks.parse(name)
         assert sc.raw == name and sc.legacy() == name and sc.short() == name
+        assert sc.track == ""
+
+
+def test_an_obstacle_family_this_version_does_not_know_still_names_its_map():
+    """Another branch is training with `+hard<seed>`. The string is not ours to rebuild -- it comes
+    back verbatim -- but the map under it is `real:icra2022`, and a list of such entries has to
+    group and count as that map rather than as one new map per entry."""
+    sc = tracks.parse("real:icra2022+hard1~rev")
+    assert sc.track == "real/icra22"
+    assert sc.raw == sc.legacy() == sc.short() == "real:icra2022+hard1~rev"
+    assert sc.display() == "ICRA 2022 · hard1~rev"
+    assert tracks.resolve("real:icra2022+hard1~rev") == "real:icra2022+hard1~rev"
+    # and it must not have been mistaken for one of the families we do know
+    assert sc.obstacle == "" and not sc.reverse
 
 
 def test_a_track_is_not_offered_an_obstacle_it_cannot_carry():

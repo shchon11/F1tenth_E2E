@@ -321,7 +321,12 @@ class Scenario:
     mirror: bool = False
     obstacle: str = ""
     seed: Optional[int] = None
-    raw: str = ""                 # a name outside the catalogue (absolute path, unknown map)
+    #: Set when the name is not one this module can spell. `legacy()` and `short()` then return it
+    #: verbatim -- rebuilding a string we do not understand is how a name silently becomes a
+    #: different map. `track` may still be filled in: an *unknown obstacle family on a known map*
+    #: (another branch is training with `+hard<seed>`) is still that map, and a list of them should
+    #: group and count as that map rather than as one new map per entry.
+    raw: str = ""
 
     # -- the option axes
     @property
@@ -389,6 +394,9 @@ class Scenario:
     def display(self) -> str:
         """One human line: `Blackbox 2022 #1 · 역방향 · 주행선 위 (시드 44)`."""
         if self.raw:
+            # A known map with a suffix we cannot name: say the map, then the suffix as it stands.
+            if self.track:
+                return f"{self.entry.display} · {self.raw[len(self.entry.legacy):].lstrip('+')}"
             return self.raw
         parts = [self.entry.display]
         if self.direction:
@@ -452,6 +460,9 @@ def _parse_spec(s: str) -> Scenario:
 
 #: The loader's modifier suffixes, in the order `maps.load` peels them.
 _MODIFIERS = ("~rev", "~mir")
+#: `<base>+<something><digits>` where `<something>` is an obstacle family this version does not
+#: know. Deliberately permissive: the point is to recognise the *map*, not the suffix.
+_UNKNOWN_SUFFIX = re.compile(r"^(?P<base>.+?)\+(?P<kind>[a-z_]+)(?P<seed>\d*)$")
 
 
 def _parse_legacy(s: str) -> Scenario:
@@ -471,9 +482,17 @@ def _parse_legacy(s: str) -> Scenario:
             name = base
             break
     tid = id_of_legacy(name)
-    if tid is None:
-        return Scenario(raw=s)
-    return Scenario(track=tid, reverse=reverse, mirror=mirror, obstacle=obstacle, seed=seed)
+    if tid is not None:
+        return Scenario(track=tid, reverse=reverse, mirror=mirror, obstacle=obstacle, seed=seed)
+    # Not a name this module can spell. Before giving up on it entirely, see whether it is a known
+    # map carrying an obstacle family we have not heard of -- `real:icra2022+hard1~rev`. Naming the
+    # map is most of what a caller wanted; the string still comes back verbatim.
+    m = _UNKNOWN_SUFFIX.match(name)
+    if m:
+        tid = id_of_legacy(m.group("base"))
+        if tid is not None:
+            return Scenario(track=tid, raw=s)
+    return Scenario(raw=s)
 
 
 def resolve(spec: str) -> str:
