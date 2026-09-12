@@ -93,9 +93,10 @@ TRAIN_TRACKS = ([f"real:{n}{d}" for n in REAL_TRAIN for d in TRAIN_DIRECTIONS]
 # circuit was memorised, not whether anything generalises. It stays a training venue; what replaced
 # it are two floors this car drove on that the simulator had never held at all:
 #
-#   real:map16x07   15.5 x 7.0 m, the pre-competition hairpin loop (median half-width 0.70 m --
-#                   narrower than anything in training, where the tightest real venue is 0.85 m)
-#   real:map12x16   12.3 x 16.4 m loop
+#   real:map16x07   15.5 x 7.0 m, the pre-competition hairpin loop. Median half-width 0.702 m,
+#                   the narrowest median lane in the catalog: the tightest training venue by that
+#                   measure is real:icra2022 at 0.873 m, and the raced floor is 0.960 m.
+#   real:map12x16   12.3 x 16.4 m loop, median half-width 0.939 m
 #
 # Both come from `real_data/02_pre-competition` via `scripts/extract_bag_map.py`; see
 # `docs/benchmark.md` for the boundary evidence. They are the only entries in any list here whose
