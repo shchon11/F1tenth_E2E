@@ -200,7 +200,7 @@ def measure_sim(a) -> dict:
     """Drive a checkpoint solo on `--tracks` with no opponent and score every residual as error."""
     device = torch.device(a.device)
     names = common.track_names(a.tracks, draws=a.obstacle_draws, seed=a.seed)
-    tracks, rls = common.load_tracks(names, racelines=False)
+    tracks, rls = common.load_tracks(names, racelines=(a.race_size > 1 and a.opponent == "teacher"))
     cfg = Config(); cfg.sim.seed = a.seed; cfg.sim.compile = (a.sim_backend == "compile")
     model, extra = load_checkpoint(a.ckpt, device, allow_controller=True)
     model.eval()
@@ -215,7 +215,8 @@ def measure_sim(a) -> dict:
                                     hist_len=int(sp.get("hist_len", 20)),
                                     hist_stride=int(sp.get("hist_stride", 2)),
                                     procedural_obstacles=a.procedural_obstacles,
-                                    race_size=1),
+                                    race_size=a.race_size, opponent=a.opponent,
+                                    opp_speed_range=(0.6, 1.15), spawn_order="random"),
                           cfg=cfg, seed=a.seed, rls=rls)
     env.sim.warmup()
     spec = common.obs_spec(env)
@@ -260,6 +261,7 @@ def measure_sim(a) -> dict:
         for arm in arms.values():
             arm.reset(done)
     return {"mode": "sim", "tracks": names, "envs": a.envs, "steps": a.steps,
+            "race_size": a.race_size, "opponent": a.opponent if a.race_size > 1 else None,
             "ckpt": a.ckpt, "spec": s, "arms": [f.summary() for f in floors.values()]}
 
 
@@ -445,6 +447,13 @@ def main() -> None:
                     help="[sim] static obstacle layouts. They are part of the static world the warp "
                          "has to cancel, and a bare corridor would make the floor look better than "
                          "the scenes the policy trains in")
+    ap.add_argument("--race-size", type=int, default=1,
+                    help="[sim] 1 is the FLOOR -- no other car, so every residual is error. A "
+                         "larger value is not a floor: it is the same channel with something real "
+                         "to find, and the pair of numbers is the only 'signal over floor' this "
+                         "measurement can honestly produce")
+    ap.add_argument("--opponent", default="teacher", choices=("policy", "teacher"),
+                    help="[sim] who drives the other cars when --race-size > 1")
     ap.add_argument("--no-tilt-arm", action="store_true", default=True,
                     help="[sim] also measure the same channel with the roll/pitch input zeroed")
     ap.add_argument("--seed", type=int, default=123)
