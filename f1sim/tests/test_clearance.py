@@ -210,16 +210,52 @@ def test_the_tail_of_the_plan_is_left_alone_so_the_friction_envelope_is_not_move
             assert float(k1[0, j]) == pytest.approx(float(k0[0, j]), abs=1e-6), j
 
 
-def test_a_plan_that_drives_through_a_wall_scores_worse_than_one_that_grazes_it():
-    """The distance field is unsigned, so without the running minimum a plan a metre PAST a wall
-    would read as a metre of free space and beat one that only touched it."""
+def _first_contact(action, dist, cs, v=3.0, cap=4.5):
+    """Arc length at which this plan's body edge first enters something the scan saw, or its whole
+    length if it never does."""
+    k, Lp, _v0, _v1 = mpc.decode(action, torch.tensor([v]), V_MAX, torch.tensor([cap]), SPEC)
+    x, y, _psi, s = mpc.path_points(k, Lp, n=cs.n_path)
+    c = cl.sample_field(dist, x, y, cs) - cs.body_radius
+    inside = (c < 0) & (s >= cs.s_min)
+    return float(s[0, int(inside[0].float().argmax())]) if bool(inside.any()) else float(Lp[0])
+
+
+def test_a_plan_that_drives_through_a_wall_does_not_score_as_free_space_on_the_far_side():
+    """The distance field is unsigned, so a point a metre past a wall reads as a metre of free
+    space. Everything from the first contact is therefore void, and the bend the arm picks has to be
+    the one that stays clear *longer* -- not the one whose far side happens to read well."""
     cs = cl.ClearanceSpec().validate()
     d = cl.distance_field(cl.occupancy(ray_scan(half_width=0.7), ANGLES, cs, RANGE_MAX), cs)
-    through = cl.adjust(plan(curvature=0.6, v=4.5), torch.tensor([3.0]), torch.tensor([4.5]),
-                        d, SPEC, cs, V_MAX)
-    assert float(through.clear_before) < 0.0
-    assert float(through.clear_after) >= float(through.clear_before)
-    assert float(through.dk) < 0.0 or float(through.dv) < 0.0
+    a = plan(curvature=0.6, v=4.5)                       # curving hard into the left wall
+    out = cl.adjust(a, torch.tensor([3.0]), torch.tensor([4.5]), d, SPEC, cs, V_MAX)
+    assert float(out.clear_before) < 0.0, "the test case must actually go through the wall"
+    assert float(out.dk) < 0.0, "the bend has to be away from the wall it is driving into"
+    assert float(out.dv) < 0.0, "and a plan still in the wall has to lose speed"
+    assert _first_contact(out.action, d, cs) > _first_contact(a, d, cs)
+
+
+def test_the_worst_point_of_a_plan_the_bend_cannot_move_does_not_freeze_the_choice():
+    """A car already alongside a wall: the tightest point of the window is its first sample, which
+    no candidate can move. Scoring on that minimum alone ties every candidate together and the arm
+    does nothing on exactly the narrow floors it exists for -- so the score is the mean over the
+    window, and the arm still edges away."""
+    cs = cl.ClearanceSpec().validate()
+    # walls 0.29 m to the left and 1.31 m to the right: the car is hugging the left one
+    scan = ray_scan(half_width=None, circles=())
+    sa = torch.sin(ANGLES)
+    rng = torch.full((N_BEAMS,), float(RANGE_MAX))
+    for wy in (0.29, -1.31):
+        sgn = 1.0 if wy > 0 else -1.0
+        t = torch.where(sa * sgn > 1e-6, abs(wy) / (sa * sgn).clamp_min(1e-6),
+                        torch.full_like(sa, 1e9))
+        rng = torch.minimum(rng, t)
+    scan = (rng / RANGE_MAX).clamp(0.0, 1.0)[None]
+    d = cl.distance_field(cl.occupancy(scan, ANGLES, cs, RANGE_MAX), cs)
+    out = cl.adjust(plan(curvature=0.0, v=4.5), torch.tensor([3.0]), torch.tensor([4.5]),
+                    d, SPEC, cs, V_MAX)
+    assert 0.0 < float(out.clear_before) < cs.margin, float(out.clear_before)
+    assert float(out.dk) < 0.0, "away from the wall it is hugging"
+    assert float(out.clear_after) > float(out.clear_before)
 
 
 def test_the_margin_is_the_knob_and_a_bigger_one_acts_where_a_smaller_one_does_not():
@@ -396,3 +432,91 @@ def test_the_arm_reports_what_it_did_and_drains_it():
     assert m["controller/clearance_shift_mean"] > 0.0
     assert arm.metrics() == {}, "a drained accumulator reports nothing, not zeros"
     arm.release()
+
+
+# ================================================================ batched, and in a real env
+def test_each_env_is_judged_on_its_own_scan():
+    """One arm, one batch, two different worlds: the blocked row is adjusted and the clear row is
+    handed back untouched. A grid accidentally shared across the batch would move both."""
+    a = plan(curvature=0.0, v=4.5, batch=2)
+    scan = torch.cat([ray_scan(half_width=1.4),                         # room to spare
+                      ray_scan(half_width=1.0, circles=[(1.8, 0.20, 0.22)])], 0)
+    out = run(scan, a, v=3.0, cap=4.5)
+    assert torch.equal(out.action[0], a[0])
+    assert not torch.equal(out.action[1], a[1])
+    assert float(out.dk[0]) == 0.0 and float(out.dk[1]) != 0.0
+    assert float(out.clear_before[0]) > float(out.clear_before[1])
+
+
+def _plan_env(n=4):
+    from f1sim import Config, Track
+    from f1sim.gym_env import EnvConfig, F1VecEnv
+    tr = Track.generate_random(0, style="competition")
+    cfg = Config()
+    cfg.rand.enabled = False
+    return F1VecEnv(tr, cfg, EnvConfig(action_mode="plan", scan_stack=2, action_history=1,
+                                       speed_cap=4.0, compile_tracker=False),
+                    num_envs=n, device="cpu")
+
+
+def _roll(arm, steps=12, seed=11, env=None):
+    """One short rollout under `arm`, from a **fresh** environment.
+
+    Fresh because `Simulator.step` advances `self.t` and `self._imu_phase` and `env.reset()` does
+    not rewind them, so a second rollout in the same object starts on a different IMU phase and
+    draws different sensor noise. Two rollouts that are meant to be compared bit for bit have to
+    start from the same simulator, not merely from the same seed.
+    """
+    env = env if env is not None else _plan_env()
+    rt = gr.ControllerRuntime(env, arm, device="cpu")
+    rt.install()
+    obs, _ = env.reset(seed=seed)
+    rt.begin(obs)
+    torch.manual_seed(seed)
+    cmds = []
+    for _ in range(steps):
+        rt.pre_action(obs)
+        a = torch.rand(env.B, mpc.ACT_DIM) * 2 - 1
+        obs, _r, term, trunc, _i = env.step(a)
+        rt.post_step(term, trunc)
+        cmds.append(env.last_cmd.clone())
+    m, _ = rt.collect_metrics()
+    rt.release()
+    return torch.stack(cmds), m, env
+
+
+def test_the_legacy_arm_through_a_real_environment_is_bit_identical_to_no_arm_at_all():
+    """The guarantee that matters to everything already measured: with `legacy` installed, and with
+    the clearance module imported and its hook attribute present on the tracker, every command the
+    simulator receives is the one it received before any of this existed."""
+    bare, _m, env = _roll("legacy")
+    again, _m2, _e = _roll("legacy")
+    assert torch.equal(bare, again)
+    assert env.tracker._plan_hook is None and env.tracker._solver is None
+
+
+def test_the_arm_installs_through_the_runtime_and_leaves_the_env_as_it_found_it():
+    legacy, _m, _e = _roll("legacy")
+    env = _plan_env()
+    clear, metrics, _e2 = _roll("clearance", env=env)
+    assert not torch.equal(legacy, clear), "the arm must be doing something on a real track"
+    assert metrics["controller/clearance_plan_margin_after"] >= \
+           metrics["controller/clearance_plan_margin_before"]
+    assert env.tracker._plan_hook is None and env.tracker._solver is None
+    back, _m3, _e3 = _roll("legacy")
+    assert torch.equal(back, legacy), "release must leave nothing behind"
+
+
+def test_the_runtime_builds_the_arm_from_the_environment_s_own_beam_geometry():
+    env = _plan_env()
+    rt = gr.ControllerRuntime(env, "fixed_low+clearance", device="cpu")
+    rt.install()
+    try:
+        assert rt.clearance is not None and rt.grip is not None
+        assert rt.clearance.angles.numel() == env.n_beams
+        assert float(rt.clearance.range_max) == float(env.range_max)
+        assert rt.clearance.mount_x == pytest.approx(env.cfg.lidar.mount_x)
+        assert "clearance" in rt.checkpoint_meta()
+    finally:
+        rt.release()
+    assert env.tracker._plan_hook is None

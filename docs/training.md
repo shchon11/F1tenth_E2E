@@ -476,12 +476,19 @@ acts on what the sensor saw rather than braking for the 90° behind the window. 
 
 - **bend** — one curvature offset added to the knots inside the tracker's own horizon and tapered to
   zero beyond it, so the tail curvature (and with it `fixed_low`'s speed envelope over the tail) is
-  untouched. Thirteen candidate offsets are scored on the *running* minimum of their body-edge
-  clearance — running, because the distance field is unsigned and a plan a metre past a wall would
-  otherwise read as a metre of free space — and the smallest bend that meets the margin wins.
+  untouched. Thirteen candidate offsets are scored on the mean, over the window, of their body-edge
+  clearance saturated at the margin — with everything from a candidate's first *contact* counted as
+  void, because the distance field is unsigned and a plan a metre past a wall would otherwise read
+  as a metre of free space. The smallest bend that meets the margin wins.
 - **slow** — the plan's two speed targets, through a backward braking pass at 3.3 m/s², which is
   what the command chain was measured to deliver at the bottom of the friction range rather than the
-  5.0 m/s² the tracker is allowed to command.
+  5.0 m/s² the tracker is allowed to command. Under `fixed_low` the solver is clamped tighter still
+  (2.97 m/s² on a straight plan at µ 0.734, and less in a corner), so under the composite the pass
+  is optimistic about how late it may start slowing. It is left optimistic deliberately: reading the
+  other layer's bound would make the installation order matter, which is the one property that makes
+  the two composable. The cap is a target re-issued at 40 Hz and tightening as the obstacle nears,
+  and what is actually commanded is the tracker's to bound — a planning approximation, like the grip
+  envelope, and not a stopping guarantee.
 
 It never raises a speed and never straightens a plan the policy bent, and a plan that already keeps
 the margin is returned **bit-identical** — "the arm did nothing" is a fact about the action, not an
@@ -493,7 +500,8 @@ approximation of one.
 | `cell` | 0.06 m | occupancy cell; a return is binned to the cell containing it, so the position error is ≤ 0.03 m per axis and unbiased |
 | `d_clip` | 0.60 m | the distance field saturates here, which bounds the transform at 10 offsets per pass |
 | `max_shift` | 0.60 m | lateral authority at the evaluation horizon — an adjustment, not a replan |
-| `horizon_s` | 0.60 s | the arc the arm is responsible for: the tracker's own `N·dt`. Beyond it the plan is replanned before it is ever executed |
+| `horizon_s` | 0.60 s | the far end of the arc the arm is responsible for: the tracker's own `N·dt`. Beyond it the plan is replanned before it is ever executed |
+| `s_min` | 0.50 m | and the near end. `base_link` is the rear axle and the nose is ~0.48 m ahead of it, so a plan point closer than this is inside the car's own footprint — its clearance is a fact about where the car already is, which no bend can move and no speed can change |
 | `a_brake` | 3.3 m/s² | the deceleration the backward pass assumes, measured through the whole command chain at low grip |
 
 **Cost.** The grid is 5 304 cells; the distance field is Felzenszwalb's separable decomposition of

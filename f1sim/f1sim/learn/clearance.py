@@ -104,12 +104,15 @@ class ClearanceSpec:
                                       # plan is replanned before it is ever executed.
     s_eval_min: float = 1.0           # [m] evaluation window floor, so a stopped car still looks
     s_eval_max: float = 4.2           # [m] and ceiling, inside the grid
-    s_shift_min: float = 0.30         # [m] below this the path is pinned: every candidate leaves
-                                      # (0,0) heading straight ahead, so a sample there cannot
-                                      # separate them and would only saturate the score.
-    s_speed_min: float = 0.50         # [m] the speed cap is about *arriving* somewhere tight. The
-                                      # first half-metre is where the car already is, and no speed
-                                      # the plan asks for can change that.
+    s_min: float = 0.50               # [m] where the arm's responsibility starts. base_link is the
+                                      # rear axle and the car's nose is ~0.48 m ahead of it, so a
+                                      # plan point closer than this is *inside the car's own
+                                      # footprint*: its clearance is a fact about where the car
+                                      # already is, which no bend can move (every candidate leaves
+                                      # (0,0) straight ahead) and no speed can change. Counting it
+                                      # would tie every candidate's score together on a narrow
+                                      # floor and cap the speed for the wall the car is already
+                                      # safely alongside.
 
     # -- the bend ----------------------------------------------------------------
     max_shift: float = 0.60           # [m] lateral displacement at the evaluation horizon
@@ -118,8 +121,6 @@ class ClearanceSpec:
                                       # stays one and does not become a different plan
     shift_penalty: float = 0.05       # [m of clearance per m of deviation] the preference for the
                                       # smallest deviation that meets the margin
-    spread_weight: float = 0.25       # weight of the mean term that breaks ties between candidates
-                                      # whose worst sample is the same pinned one
 
     # -- the cap -----------------------------------------------------------------
     v_stop: float = 0.60              # [m/s] the speed allowed where the plan has no clearance left
@@ -131,10 +132,21 @@ class ClearanceSpec:
                                       # -4.429 m/s^2. This arm's promise is that the car can still
                                       # shed the speed by the time it arrives, so the number that
                                       # keeps the promise is the one the chain delivers on the worst
-                                      # floor -- and it is also below whatever `fixed_low`'s
-                                      # friction budget will clamp the solver to underneath, so the
-                                      # composite does not plan a deceleration its own tracker is
-                                      # then forbidden to command.
+                                      # floor.
+                                      #
+                                      # Under `fixed_low` the solver is clamped tighter than this:
+                                      # its friction budget `q g lf / (L + q h)` is 2.97 m/s^2 on a
+                                      # straight plan at mu 0.734 and less in a corner (1.72 m/s^2
+                                      # mean over a measured held-out run). So under the composite
+                                      # this backward pass is optimistic about how late it may start
+                                      # slowing. That is a limitation, not a bug to paper over by
+                                      # reading the other layer's bound -- doing so would make the
+                                      # two layers' order matter, which is the one property that
+                                      # makes them composable. The cap is a *target* re-issued at
+                                      # 40 Hz and tightening as the obstacle nears, and the
+                                      # deceleration actually commanded is the tracker's to bound;
+                                      # like the grip envelope, this is a planning approximation and
+                                      # not a stopping guarantee.
 
     def validate(self) -> "ClearanceSpec":
         if not self.margin > 0.0:
@@ -149,6 +161,9 @@ class ClearanceSpec:
             raise ValueError(
                 f"d_clip {self.d_clip} saturates below the margin it has to measure "
                 f"({self.margin} + {self.body_radius}); every clearance would read as met")
+        if not 0.0 <= self.s_min < self.s_eval_min:
+            raise ValueError(f"s_min {self.s_min} must be below the evaluation floor "
+                             f"{self.s_eval_min}, or the window is empty for a stopped car")
         if self.n_path < 3 or self.n_shift < 1:
             raise ValueError("need at least 3 path samples and 1 shift magnitude")
         if not self.a_brake > 0.0 or not self.v_stop >= 0.0:
@@ -348,38 +363,53 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
                                      Lp[:, None].expand(B, C).reshape(B * C), n=n)
     x, y = x.view(B, C, n), y.view(B, C, n)
     s = s.view(B, C, n)[:, 0]                                                  # (B, n), same for all
-    # A *running* minimum along the path, not the pointwise value. The field is unsigned, so a
-    # point a metre past a wall reads as a metre of free space -- and a plan that drives through the
-    # wall and out the other side would otherwise score better than one that only grazes it, which
-    # is precisely backwards. The car stops at the first thing it hits, so that is what every sample
-    # after it is worth.
-    clear = torch.cummin(sample_field(dist, x, y, cspec) - cspec.body_radius, dim=-1).values
-
-    in_eval = s <= s_eval[:, None]                                             # (B, n)
-    in_shift = in_eval & (s >= cspec.s_shift_min)
-    # Saturate at the margin: once a candidate has enough room, more room is not better, and the
-    # deviation penalty is then what picks the smallest bend that is enough.
-    room = clear.clamp(max=cspec.margin)
-    w = in_shift[:, None, :].to(dt_)
-    wsum = w.sum(-1).clamp_min(1.0)
-    worst = torch.where(in_shift[:, None, :], room, torch.full_like(room, cspec.margin)).amin(-1)
-    spread = (room * w).sum(-1) / wsum
-    # A sample the bend cannot move -- the pinned first 0.30 m -- gives every candidate the same
-    # `worst`, so the mean term is what separates them there. The last term is a strict tie-break so
-    # the choice does not depend on which index an argmax happens to return.
+    in_eval = (s >= cspec.s_min) & (s <= s_eval[:, None])                      # (B, n)
+    raw = sample_field(dist, x, y, cspec) - cspec.body_radius                  # (B, C, n) body edge
+    # Everything from the first point the plan's body edge is *inside* something the scan saw is
+    # void. The field is unsigned, so a point a metre past a wall reads as a metre of free space,
+    # and a plan that drives through the wall and out the other side would otherwise score better
+    # than one that only grazes it -- precisely backwards, because the car stops at the first thing
+    # it hits.
+    #
+    # Void from the first *contact*, not a running minimum of the clearance. A running minimum is
+    # pinned by the tightest point the plan has already passed, so on a narrow floor -- where the
+    # window's first sample is routinely the tightest one, and no bend can move it -- every
+    # candidate scores identically and the arm does nothing exactly where it is needed. Only an
+    # actual contact makes what comes after it meaningless.
+    hit = (raw < 0.0) & in_eval[:, None, :]
+    blocked = hit.to(dt_).cumsum(-1) > 0
+    eff = torch.where(blocked, torch.full_like(raw, -cspec.body_radius), raw)
+    # The score is the **mean** of the running clearance over the window, saturated at the margin:
+    # how much of the arc ahead the plan keeps clear, and how clear. Saturated, because once a
+    # candidate has enough room more room is not better, so the deviation penalty then picks the
+    # smallest bend that is enough -- and a candidate that keeps the margin everywhere scores
+    # exactly `margin`, which no other candidate can beat, so "meets the margin" is still identified
+    # exactly.
+    #
+    # A worst-sample score was tried first and is wrong here: once a candidate penetrates at all,
+    # the *unsigned* field pins its minimum at -body_radius plus grid quantisation, so between two
+    # plans that both end up in the wall the minimum is noise while the mean still says which one
+    # stayed clear longer. On a narrow floor that is every candidate, and the noise was choosing the
+    # bend.
+    room = eff.clamp(max=cspec.margin)
+    w = in_eval[:, None, :].to(dt_)
+    score = (room * w).sum(-1) / w.sum(-1).clamp_min(1.0)
+    # The last term is a strict tie-break, so the choice cannot depend on which index an argmax
+    # happens to return; candidates are ordered by rising deviation, so a tie goes to the smaller.
     idx = torch.arange(C, device=dev, dtype=dt_)[None]
-    score = (worst + cspec.spread_weight * spread
-             - cspec.shift_penalty * (dk.abs() * s_eval[:, None] ** 2 * 0.5)
-             - 1e-6 * idx)
+    score = score - cspec.shift_penalty * (dk.abs() * s_eval[:, None] ** 2 * 0.5) - 1e-6 * idx
     best = score.argmax(1)                                                     # (B,)
 
     take = best[:, None, None]
-    clear_b = clear.gather(1, take.expand(B, 1, n))[:, 0]                      # (B, n)
+    clear_b = eff.gather(1, take.expand(B, 1, n))[:, 0]                        # (B, n)
     y_b = y.gather(1, take.expand(B, 1, n))[:, 0]
     dk_b = dk.gather(1, best[:, None])[:, 0]
     #: Candidate 0 is the zero offset by construction, so this is the policy's own plan, scored on
-    #: the same field and the same window as the adjusted one.
-    clear_0 = clear[:, 0]
+    #: the same field and the same window as the adjusted one. The reported margin is the pointwise
+    #: minimum of the raw body-edge clearance over the window -- the same quantity, measured the
+    #: same way, as `crash_attribution.py`'s `plan_min_clear`.
+    raw_b = raw.gather(1, take.expand(B, 1, n))[:, 0]
+    raw_0 = raw[:, 0]
     y_0 = y[:, 0]
 
     # -- the cap: a speed the clearance allows, then braking anticipation --------
@@ -388,21 +418,44 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
     # for, so it binds nothing; at no clearance at all it is `v_stop`.
     v_tight = cspec.v_stop + (cap - cspec.v_stop).clamp_min(0.0) * (clear_b / cspec.margin).clamp(0.0, 1.0)
     free = torch.full_like(v_tight, float(v_max) * 4.0)
-    in_speed = in_eval & (s >= cspec.s_speed_min)
-    v_tight = torch.where(in_speed, v_tight, free)
+    v_tight = torch.where(in_eval, v_tight, free)
     ds = (Lp / (n - 1)).clamp_min(1e-3)
     cols = list(v_tight.unbind(1))
     for i in range(n - 2, -1, -1):        # backward: no faster than can still be shed by then
         cols[i] = torch.minimum(cols[i], torch.sqrt(cols[i + 1] ** 2 + 2.0 * cspec.a_brake * ds))
     v_allow = torch.stack(cols, 1)                                             # (B, n)
 
+    # -- fitting the envelope with the two numbers a plan actually has --------
+    # The plan's speed is linear in arc fraction, so the question is which line under the envelope
+    # to pick. The constraint set runs to `s_eval` and includes the samples *before* the window: the
+    # backward pass wrote the braking requirement into them, and that is exactly what makes the car
+    # start slowing before it arrives.
     frac = (s / Lp[:, None].clamp_min(1e-3)).clamp(0.0, 1.0)                   # (B, n)
-    v0_new = torch.minimum(v0, v_allow[:, 0])
-    # The plan's speed is linear in arc fraction, so the largest end speed whose whole line stays
-    # under the envelope is a min over the samples -- not the envelope at the end alone, which a
-    # straight line between two allowed points can still cross in between.
-    head = (v_allow[:, 1:] - v0_new[:, None] * (1.0 - frac[:, 1:])) / frac[:, 1:].clamp_min(1e-3)
-    v1_new = torch.minimum(v1, head.amin(1)).clamp_min(0.0)
+    rest = 1.0 - frac
+    in_prof = s <= s_eval[:, None]
+    big = torch.full_like(v_allow, float(v_max) * 4.0)
+
+    # (a) the fastest near target, with the end target taken down to whatever keeps the line legal.
+    #     `v0` also has to leave room for an end target of zero, or a line pinned at v1 = 0 would
+    #     still cross the envelope on its way down.
+    v0_cap = torch.where(in_prof & (rest > 1e-3), v_allow / rest.clamp_min(1e-3), big).amin(1)
+    v0_a = torch.minimum(torch.minimum(v0, v_allow[:, 0]), v0_cap)
+    head = torch.where(in_prof & (frac > 1e-3),
+                       (v_allow - v0_a[:, None] * rest) / frac.clamp_min(1e-3), big)
+    v1_a = torch.minimum(v1, head.amin(1)).clamp_min(0.0)
+
+    # (b) the policy's own profile, scaled. Where the envelope is flat and low -- a car driving
+    #     parallel to a wall it is already close to -- (a) spends everything on the near target and
+    #     crushes the far one to nothing, which is a hard brake the geometry never asked for; a
+    #     scaled profile keeps the shape the policy chose and simply lowers it.
+    v_lin = v0[:, None] * rest + v1[:, None] * frac
+    alpha = torch.where(in_prof, v_allow / v_lin.clamp_min(1e-3), big).amin(1).clamp(0.0, 1.0)
+    v0_b, v1_b = v0 * alpha, v1 * alpha
+
+    # Both are feasible by construction, so take the faster one. Neither can exceed what was asked.
+    take_b = (v0_b + v1_b) > (v0_a + v1_a)
+    v0_new = torch.where(take_b, v0_b, v0_a)
+    v1_new = torch.where(take_b, v1_b, v1_a)
     # A cap of a millimetre per second is float noise in the envelope, not a decision: at full
     # clearance `v_tight` *is* the caller's own cap, and the arithmetic that carries it through the
     # backward pass and the line fit lands a few ULPs below. Without this the arm would report
@@ -424,10 +477,10 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
         action[:, _mpc.N_KNOTS + 2:],
     ], 1)
 
-    last = (in_eval.to(torch.long).sum(1).clamp(1, n) - 1)[:, None]             # last sample in window
+    last = (in_eval.to(torch.long).cumsum(1).amax(1).clamp(1, n) - 1)[:, None]  # last sample in window
     guard = lambda c: torch.where(in_eval, c, torch.full_like(c, float(cspec.d_clip))).amin(1)
     return Adjustment(action=a_new, dk=dk_b, shift=(y_b - y_0).gather(1, last)[:, 0],
-                      clear_before=guard(clear_0), clear_after=guard(clear_b),
+                      clear_before=guard(raw_0), clear_after=guard(raw_b),
                       v0=v0_new, v1=v1_new, dv=(v0_new - v0) + (v1_new - v1), s_eval=s_eval)
 
 
