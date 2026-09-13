@@ -371,6 +371,18 @@ def main():
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--scan-stem", choices=["plain", "resnet"], default="resnet",
                     help="scan encoder for a new model without --init (an --init checkpoint keeps its own)")
+    ap.add_argument("--procedural-obstacles", type=float, default=0.0, metavar="FRAC",
+                    help="share of env resets that get a freshly drawn obstacle layout, placed as "
+                         "analytic props from the hard-obstacle patterns (0 = off, and off is "
+                         "byte-identical to a run without the flag)")
+    ap.add_argument("--procedural-density", type=float, default=1.0, metavar="PER10M",
+                    help="patterns per 10 m of lap when --procedural-obstacles is on")
+    ap.add_argument("--procedural-max-props", type=int, default=0, metavar="N",
+                    help="prop slots per env (0: from the density and the longest lap). Every slot "
+                         "costs the beam tracer one pass per step, so this is the cost dial")
+    ap.add_argument("--procedural-raceline-margin", type=float, default=0.25, metavar="M",
+                    help="[m] kept clear either side of the raceline, beyond the car's half-width, "
+                         "so the teacher opponents are never routed through a prop")
     ap.add_argument("--raceline-margin", type=float, default=None,
                     help="[m] free space the opponents' raceline keeps from the boundary (default 0.40)")
     ap.add_argument("--teacher-grip", choices=["true", "nominal", "conservative"], default="true",
@@ -419,6 +431,17 @@ def main():
         raise SystemExit(f"--memory {a.memory} needs --minibatch >= --horizon ({a.minibatch} < "
                          f"{a.horizon}): a recurrent update's minibatches are whole env chunks of "
                          f"the horizon, so a minibatch smaller than one chunk cannot be formed.")
+    if a.procedural_obstacles:
+        if not 0.0 < a.procedural_obstacles <= 1.0:
+            raise SystemExit(f"--procedural-obstacles {a.procedural_obstacles}: it is the share of "
+                             f"resets that get a layout, so it lives in (0, 1].")
+        if not a.procedural_density > 0:
+            raise SystemExit(f"--procedural-density {a.procedural_density}: at zero no pattern is "
+                             f"ever placed and the run is silently the unflagged one.")
+    elif a.procedural_density != 1.0 or a.procedural_max_props or a.procedural_raceline_margin != 0.25:
+        raise SystemExit("--procedural-density / --procedural-max-props / "
+                         "--procedural-raceline-margin without --procedural-obstacles: nothing "
+                         "draws a layout, so these would silently do nothing.")
     if a.kl_decay is None:
         a.kl_decay = a.total
     device = torch.device(a.device); torch.manual_seed(a.seed)
@@ -471,12 +494,18 @@ def main():
                                                               opp_weave_period_range=tuple(a.opp_weave_period),
                                                               opp_weave_time_range=tuple(a.opp_weave_time),
                                                               opp_event_margin=a.opp_event_margin,
+                                                              procedural_obstacles=a.procedural_obstacles,
+                                                              procedural_density=a.procedural_density,
+                                                              procedural_max_props=a.procedural_max_props,
+                                                              procedural_raceline_margin=a.procedural_raceline_margin,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,
                           teacher_recover_time=a.teacher_recover_time)
     print(f"sim backend: {a.sim_backend} (cfg.sim.compile={sim_cfg.sim.compile}, "
           f"compile_tracker={_env_compile_tracker})")
+    if env.procedural is not None:
+        print(env.procedural.describe())
     graph_rt = None
     if a.sim_backend == "graphs":
         from .graph_runtime import prepare_graph_runtime

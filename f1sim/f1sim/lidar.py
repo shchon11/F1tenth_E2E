@@ -14,6 +14,7 @@ import torch
 
 from .track import TrackTensors
 from .lidar_triton import HAVE_TRITON, trace3d_triton
+from .prop_math import ray_prisms_hits
 
 HIT_NONE, HIT_DUCT, HIT_TALL, HIT_GROUND, HIT_CAR = 0, 1, 2, 3, 4
 
@@ -141,11 +142,23 @@ class Lidar:
         # beam i is emitted at fraction time_frac[i] of the scan period before the scan timestamp
         self.time_frac = (fov / (2 * math.pi)) * (1.0 - torch.arange(n_beams, device=self.device) / (n_beams - 1))
         self._rays = self.rays
+        # `ray_prisms_hits` walks its prop slots in a Python loop of ~20 elementwise ops over
+        # `(B, N, k_pad)`, and eagerly that is a kernel launch and a full round trip to memory for
+        # every one of them: measured on an RTX 4060 Ti at B=256 x 1081 beams, 82.4 ms per call at
+        # 52 slots, against 17.7 ms for the whole rest of the step. Inductor fuses the chain into
+        # one kernel per slot and the same call takes 2.70 ms -- 30x, with bit-identical ranges and
+        # hit masks. The per-track `+props` catalogue never made this worth doing (three props, four
+        # slots); a procedural layout redrawn per env is thirteen times that.
+        self._prisms = ray_prisms_hits
         if compile and self.device.type == "cuda":
             try:
                 self._rays = torch.compile(self.rays, dynamic=False)
             except Exception:
                 self._rays = self.rays
+            try:
+                self._prisms = torch.compile(ray_prisms_hits, dynamic=False)
+            except Exception:
+                self._prisms = ray_prisms_hits
 
     @property
     def angle_increment(self) -> float:
@@ -153,9 +166,11 @@ class Lidar:
 
     # ------------------------------------------------------------------ ray casting
     def trace(self, origin: torch.Tensor, direction_h: torch.Tensor, k: torch.Tensor, range_max: torch.Tensor,
-              tid: Optional[torch.Tensor] = None, duct_scale: Optional[torch.Tensor] = None):
+              tid: Optional[torch.Tensor] = None, duct_scale: Optional[torch.Tensor] = None,
+              eid: Optional[torch.Tensor] = None):
         """origin (B,N,3), direction_h (B,N,2) unit horizontal, k (B,N) dz/ds, range_max (B,), tid (B,),
-        duct_scale (B,) per-env multiplier on the hose diameter -> (ranges, types)."""
+        duct_scale (B,) per-env multiplier on the hose diameter -> (ranges, types).
+        eid (B,): env rows, for the per-env prop layouts (`TrackTensors.props_for`)."""
         tr = self.track
         if tid is None:
             tid = torch.zeros(origin.shape[0], dtype=torch.long, device=origin.device)
@@ -167,20 +182,19 @@ class Lidar:
         # goes straight to the Triton kernel and never reaches it, so merging there would have given
         # the two backends different worlds.
         if getattr(tr, "has_props", False):
-            r, typ = self._merge_props(origin, direction_h, k, range_max, tid, r, typ)
+            r, typ = self._merge_props(origin, direction_h, k, range_max, tid, r, typ, eid)
         return r, typ
 
-    def _merge_props(self, origin, direction_h, k, range_max, tid, r, typ):
+    def _merge_props(self, origin, direction_h, k, range_max, tid, r, typ, eid=None):
         """Nearest-hit merge of the finite prop sections, the way cars are merged below.
 
         Props report as HIT_TALL rather than a type of their own. A box in the lane is a static solid
         obstacle, which is exactly what that type already means, and adding a sixth value would
         change what every consumer of `typ` sees -- observation encodings included -- for a rebuild
         of how obstacles are *drawn*. The prop's finiteness is in its geometry, not in its label."""
-        from .prop_math import ray_prisms_hits
         tr = self.track
-        poses, pn, pd, z_lo, z_hi = tr.props_for(tid)
-        r_p, hit_p = ray_prisms_hits(origin, direction_h, k, poses, pn, pd, z_lo, z_hi)
+        poses, pn, pd, z_lo, z_hi = tr.props_for(tid, eid)
+        r_p, hit_p = self._prisms(origin, direction_h, k, poses, pn, pd, z_lo, z_hi)
         closer = hit_p & (r_p < r) & (r_p <= range_max[:, None])
         return (torch.where(closer, r_p.to(r.dtype), r),
                 torch.where(closer, torch.full_like(typ, HIT_TALL), typ))
@@ -261,7 +275,8 @@ class Lidar:
     def scan(self, pose: torch.Tensor, pose_prev: Optional[torch.Tensor], P: Dict[str, torch.Tensor],
              motion_distortion: bool = True, noisy: bool = True, att: Optional[torch.Tensor] = None,
              att_prev: Optional[torch.Tensor] = None, tid: Optional[torch.Tensor] = None,
-             compiled: bool = True, cars=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+             compiled: bool = True, cars=None,
+             eid: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """pose (B,3) base_link (x, y, yaw) at scan end time; pose_prev one scan period earlier;
         att (B,2) body roll/pitch (rad) at scan end, att_prev earlier. Returns
         cars: optional list of box sets [(boxes (B,C,3), dims (B,C,3), zrange (B,C,2), porosity (B,)), ...]
@@ -283,7 +298,7 @@ class Lidar:
             # partial resets call this with varying batch sizes: use the eager path (no recompiles)
             origin, dh, k = (self._rays if compiled else self.rays)(pose, att, P, per_beam=False)
         rmax = P["range_max"]
-        r_true, typ = self.trace(origin, dh, k, rmax, tid, P.get("duct_scale"))
+        r_true, typ = self.trace(origin, dh, k, rmax, tid, P.get("duct_scale"), eid)
         car_poro = None
         if cars is not None:
             car_poro = torch.zeros_like(r_true)                   # per-beam porosity of whatever car part was hit
