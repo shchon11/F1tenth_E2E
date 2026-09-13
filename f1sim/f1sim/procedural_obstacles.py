@@ -132,7 +132,8 @@ CURVE_INSET = 0.08        # [m] the blocked band is inset by this before anythin
                           # moves its corner up to 0.09 m across the lane relative to the frame the
                           # gap was measured in. Without the inset that came out of the gap:
                           # measured over 1000 layouts on the catalogue maps, 99.5 % kept 1.20 m and
-                          # the worst was 1.076 m. With it, 100 % and 1.20 m.
+                          # the worst was 1.076 m. With it, and with the scatter side drawn per
+                          # pattern, 100 % and a worst of 1.31 m.
 
 #: Row pieces: what a row across the lane is built from, any size `hard_obstacles` would draw.
 #: Sorted by across-lane extent at build time; a row takes the largest that still fits.
@@ -145,18 +146,15 @@ ROW_SHAPES: Tuple[Tuple[str, dict], ...] = tuple(
 )
 
 #: Small pieces: 0.10-0.25 m, the user's point that avoiding only big boxes is not avoiding.
+#: Both lists build their drums with 8 facets rather than the default 16: a prop costs the beam
+#: tracer one `(B, N, k_pad)` pass per slot and `k_pad` is the widest footprint in the catalogue, so
+#: a 16-sided drum would make *every* piece on every track cost twice what a box costs. Eight facets
+#: is still a drum and keeps `k_pad` at 8.
 SMALL_SHAPES: Tuple[Tuple[str, dict], ...] = tuple(
     [("cardboard_box", dict(width=s, depth=s, height=round(s * 0.9, 3))) for s in (0.15, 0.18, 0.21, 0.25)]
     + [("marker_post", dict(radius=r, height=0.34)) for r in (0.05, 0.07, 0.09, 0.11)]
     + [("steel_drum", dict(radius=0.11, height=0.30, facets=8))]
 )
-
-#: The facet count the drums are built with. A prop costs the beam tracer one `(B, N, k_pad)` pass
-#: per slot and `k_pad` is the widest footprint in the catalogue, so the default 16-sided drum would
-#: make *every* piece on every track cost twice what a box costs. Eight facets is still a drum and
-#: keeps `k_pad` at 8. It is in the shape lists above rather than here; this note is why.
-_DRUM_FACETS = 8
-
 
 @dataclass(frozen=True)
 class Shape:
