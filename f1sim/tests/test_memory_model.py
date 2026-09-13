@@ -42,17 +42,23 @@ def _inputs(meta, batch=4, seed=0):
 
 
 @pytest.mark.parametrize("channels", [None, ["memory"], ["edges"], ["memory", "edges"]])
-def test_warm_start_is_bit_identical(tmp_path, channels):
-    """Every weight copied, the memory's projection zero, the new scan columns zero: at step 0 the
-    warm-started actor's action, aux heads and value are the original's, bit for bit."""
+@pytest.mark.parametrize("future", [None, {"k": 20, "width": 64}])
+def test_warm_start_is_bit_identical(tmp_path, channels, future):
+    """Every weight copied, the memory's projection zero, the new scan columns zero, the future
+    head's output layer zero: at step 0 the warm-started actor's action, aux heads and value are the
+    original's, bit for bit -- and adding the future head changes none of them, because its output
+    feeds nothing else and starts at exactly zero anyway."""
     torch.set_num_threads(1)
     path, base, meta = _baseline(tmp_path)
     base.eval()
     mem, _extra, fresh = load_for_memory(
         path, "cpu", memory_spec(hidden_size=128),
-        scan_channels=({"channels": channels} if channels else None))
+        scan_channels=({"channels": channels} if channels else None),
+        future_head=future)
     mem.eval()
-    assert fresh and all(".memory." in f for f in fresh), fresh
+    allowed = lambda f: ".memory." in f or (future is not None and f.startswith("actor.future."))
+    assert fresh and all(allowed(f) for f in fresh), fresh
+    assert (future is not None) == any(f.startswith("actor.future.") for f in fresh)
     scan, pro, priv = _inputs(meta)
     aug = ScanAugment(channels, meta["n_beams"], scan.shape[0]) if channels else None
     scan_in = scan if aug is None else aug(scan)
@@ -62,12 +68,16 @@ def test_warm_start_is_bit_identical(tmp_path, channels):
         v0 = base.critic(scan, pro, priv)
         v1, _hc = mem.critic.step(scan_in, pro, priv, None)
         g0, o0 = base.actor.forward_all(scan, pro)[1:]
-        g1, o1 = mem.actor.step_all(scan_in, pro, None, None)[1:3]
+        g1, o1, f1 = mem.actor.step_all(scan_in, pro, None, None)[1:4]
     assert h0 is None and h1.actor.shape == (1, scan.shape[0], 128)
     assert torch.equal(a0, a1), (a0 - a1).abs().max()
     assert torch.equal(lp0, lp1)
     assert torch.equal(v0, v1), (v0 - v1).abs().max()
     assert torch.equal(g0, g1) and torch.equal(o0, o1)
+    if future is None:
+        assert f1 is None and not mem.has_future
+    else:
+        assert f1.shape == (scan.shape[0], 7) and float(f1.abs().max()) == 0.0
     # ... and it stays identical for as long as the projection is zero, whatever the hidden state.
     with torch.no_grad():
         a2, _lp, _h = mem.act(scan_in, pro, deterministic=True, h=h1)

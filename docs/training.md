@@ -116,7 +116,8 @@ distinct tracks held on the GPU, and `--scan-stack`. Measure before committing t
 Relevant flags: `--envs`, `--horizon`, `--epochs`, `--minibatch`, `--total`, `--amp`, `--cap0` /
 `--cap1` / `--cap-steps` (speed-cap curriculum), `--kl-coef` / `--kl-decay`, `--critic-warmup`,
 `--fresh-opt`, `--tracks`, `--obstacle-draws`, `--sim-backend`, `--memory` /
-`--memory-hidden` / `--memory-critic`, `--scan-channels` / `--scan-memory-tau`.
+`--memory-hidden` / `--memory-critic`, `--scan-channels` / `--scan-memory-tau`,
+`--aux-grip` / `--aux-opp` / `--aux-future` (auxiliary heads), `--metrics-jsonl`.
 
 `--tracks` takes a split name or a list of scenarios ([Tracks](tracks.md)):
 
@@ -214,6 +215,139 @@ warm start stays bit-identical.
 
 Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for both.
 
+### Predicting the near future (`--aux-future`)
+
+Off by default, and off the head is not built at all: same parameters, same state dict, same loss
+(`tests/test_ppo_memory.py` holds `--aux-future 0` to the same frozen oracle `--memory off` is held
+to, and `tests/test_future_head.py` checks that a checkpoint which *carries* a trained head still
+scores a batch identically while the coefficient is 0).
+
+**Why.** `--memory gru` gives the actor a hidden state; nothing so far asks it to *represent*
+anything. PPO rewards driving, the grip head asks for a friction, and the opponent head asks where
+the nearest car is **now** — which six stacked LiDAR frames already nearly determine. A recurrent
+state that is never asked for something the present observation does not contain is free to settle
+into a smoothed copy of it. The claim the work is aiming at is "a latent race state you plan
+through", and that needs (a) a loss that forces the state to carry the near future and (b) a
+measurement that says whether it does. This is (a); `python -m f1sim.learn.probe_hidden` is (b).
+
+**What it predicts.** From the actor's **recurrent state** after the step (`h_t`; the trunk features
+when `--memory off`), K = 20 control steps — 0.5 s at 40 Hz — ahead:
+
+| target | what it is | scale |
+|---|---|---|
+| `opp_lon`, `opp_lat` | the nearest opponent's position in the ego body frame at t + K | `PRIV_OPP_DIST_SCALE` (5 m), the scale `privileged()` already puts the present offsets on |
+| `opp_vlon`, `opp_vlat` | that opponent's velocity **relative to the ego**, rotated into the ego frame at t + K | the same 5 |
+| `ego_speed`, `ego_yaw_rate` | the ego's own longitudinal speed and yaw rate at t + K | `v_max_policy` (10 m/s), `imu_gyro_scale` (5 rad/s) |
+| `opp_present` | 1 where the nearest opponent is inside `overtake_range` (12 m) at t + K — a **logit**, trained with cross-entropy | — |
+
+The labels are privileged (`F1VecEnv.future_labels`) and nothing the policy sees is built from them.
+`opp_vlon` is deliberately *not* `privileged()[10]`: that column is `other.vx - ego.vx`, a difference
+of two body-frame longitudinal speeds taken in two different frames, which is a serviceable
+present-tense cue and a poor prediction target. Here both velocities go to the world frame and the
+difference is rotated into one frame, so `opp_lon + dt * opp_vlon` is, to first order, where the car
+will be. "Nearest" is recomputed at t + K, exactly as `privileged()` recomputes it at t — so in a
+three-car field the target can change which car it refers to, and that is a floor on the achievable
+MSE rather than something the head can learn away. The probe scores the identical target, which is
+what makes the two numbers comparable.
+
+**Why the recurrent state and not the trunk features.** Because the probe measures `h_t`, and the
+thing being trained and the thing being measured have to be the same tensor or the evidence is about
+something else. The head's input is `h_t` (the GRU's last layer after the step), never the action
+features, so the gradient reaches the recurrence directly. With `--memory off` there is no such
+tensor and it reads the trunk features instead, which keeps the feedforward ablation available.
+
+**Zero init.** The head's output layer — weight *and* bias — starts at exactly zero, the same
+construction `--cond` and the GRU projection use. The output feeds nothing else, so forward parity
+is free; what the zero buys is that the output layer trains from the first update while everything
+below it is starved for exactly one, so a warm start is bit-identical and the path still starts
+moving immediately.
+
+**Masking — say what is dropped.** A label exists for step `t` only if the state at `t + K` is
+available and belongs to the same situation:
+
+* the **last K steps of each `--horizon` chunk** carry no label. The label for step t is the state
+  at t + K, and the chunk does not reach that far; the next chunk's states are not available during
+  this update (the update runs between rollouts) and no second rollout and no extra simulator step
+  is paid for them, so those steps are dropped rather than approximated. The chunk's own final state
+  — the one the value bootstrap already visits — is recorded as the (T+1)-th label row, so `t = T−K`
+  is the last labelled step: at the default `--horizon 32` and K = 20 that is **13 of 32 steps,
+  41 %**. A longer `--horizon` raises it; the trainer prints the fraction at startup.
+* a label is **never read across an episode boundary**, and in a race the boundary is any car of that
+  race resetting, not just this one. An opponent that crashes is respawned behind the field in place
+  without ending the learner's episode, so its pose half a second later is not the continuation of
+  the motion the head was asked to extrapolate.
+* where **no opponent is inside `overtake_range` at t + K**, the four opponent columns are masked
+  (and the stored label is zeroed). `opp_present` always trains — it is the column that says whether
+  the others mean anything, and a presence logit trained only on frames with a car in them could
+  never say "no car".
+
+A teacher-driven car's transitions carry no weight here either: the same `on_policy` weight the rest
+of the PPO loss uses multiplies the mask.
+
+**Logged.** `loss/aux_future_mse` is the scalar the coefficient multiplies (the mean of the six
+mean-squared errors plus the presence cross-entropy) and `loss/aux_future/<target>` is each
+component, plus `labelled_frac` (share of the minibatch that carried a label at all) and
+`present_frac`. A total that falls because one easy column collapsed is not a head that learned the
+opponent, and only the split says which happened. `--metrics-jsonl PATH` appends every logged dict
+to a file, which is how a `--wandb disabled` run leaves a curve behind.
+
+```bash
+python3 -m f1sim.learn.ppo --name ppo_future --init "$FROZEN_ORIGINAL" \
+  --memory gru --memory-hidden 128 --scan-channels memory,edges \
+  --race-size 3 --opponent pool --opp-pool "$POOL" \
+  --aux-grip 1.0 --aux-opp 1.0 --aux-future 1.0 \
+  --action-mode plan --scan-stack 6 --hist-len 20 --envs 63 --horizon 32 --total 4_194_304
+```
+
+`--aux-future-k` (default 20) changes the lookahead and `--aux-future-width` (default 128) the
+head's one hidden layer. A `k` at or past `--horizon` leaves not one labelled step and the run
+refuses to start.
+
+**Not deployed.** The head is training-only. `export.py` exports `(scan, proprio, hidden) ->
+(action, hidden_next)` and nothing reaches the head from there, which
+`tests/test_future_head.py::test_export_does_not_carry_the_future_head` asserts against the exported
+ONNX graph. It costs the car nothing and it is not counted in the budget below.
+
+**Measuring what it did.** [`probe_hidden`](#probing-the-hidden-state-probe_hidden) below.
+
+### Probing the hidden state (`probe_hidden`)
+
+That the auxiliary loss falls is evidence the *head* learned something. Whether the *state* carries
+it — legibly enough for anything else to use — is a separate question, and it is the one the word
+"belief" rests on. `probe_hidden` rolls a checkpoint out with traffic and opponent events on, freezes
+the hidden states it produced, and fits a **linear** ridge read-out from `h_t` to the same privileged
+targets at `t + k`, with a held-out split. Linear on purpose: a nonlinear probe measures the probe.
+
+```bash
+python3 -m f1sim.learn.probe_hidden \
+  frozen="$FROZEN_ORIGINAL" no_head=ppo_a_final.pt with_head=ppo_b_final.pt \
+  --tracks real:blackbox2022_1 --steps 400 --envs 48 \
+  --scan-channels memory,edges --memory-hidden 128 \
+  --k 0,20 --out probe.json --md probe.md
+```
+
+* Each checkpoint gets its **own** rollout from the same seed: a different policy visits different
+  situations, and replaying one policy's states through another's trajectory would measure neither.
+* A checkpoint with **no memory** (the frozen original is feedforward) is warm-started into the GRU
+  named by `--memory-hidden` / `--scan-channels`, so it has a state to probe. That is not a distortion
+  of the baseline: the projection is zero, so the policy it drives with is bit-identical to the
+  original's, and what the probe then reads is a *random recurrent feature map* fed by the original's
+  own embedding — the honest "before any of this trained" row.
+* `--k 0` is the second baseline: what the state knows about the **present**, which six LiDAR frames
+  nearly determine anyway. A `k = 20` R² near the `k = 0` one is the interesting result; a `k = 20`
+  R² near zero while `k = 0` is high says the state carries the present and not the future.
+* The split holds out whole **env columns** — whole cars — never rows inside one trajectory. Two
+  consecutive steps of one car are the same situation 25 ms apart, and a random row split reports how
+  well the read-out interpolates inside a trajectory it has already seen, which is near 1 for almost
+  any feature map. The ridge penalty is chosen on a slice of the training columns and never on the
+  held-out ones.
+* The opponent targets are scored only on rows where a car is inside `overtake_range` at `t + k` —
+  the same rows the auxiliary loss weights. A negative R² means the read-out does worse on held-out
+  cars than predicting their mean.
+
+The table for the two smoke arms is in
+[the research note](research/future-head-2026-09-14.md).
+
 ### The deployment budget
 
 The car runs the policy at the LiDAR's 40 Hz, so one control step has 25 ms for scan preprocessing,
@@ -224,6 +358,10 @@ networks** — a proxy, and quoted as one:
 > CPU, single thread, batch 1, fp32, the fastest of several blocks of 200 iterations after
 > warm-up (`torch.utils.benchmark`; the table records how many). The new actor's forward must
 > stay within **1.5×** the frozen original's and its parameter count within **2×**.
+
+The auxiliary heads are not in that measurement and are not meant to be: `--aux-grip`, `--aux-opp`
+and `--aux-future` are training-only, the exported graph does not contain them, and the car never
+runs them.
 
 The fastest block, not one block: on a machine that is also training, a single 200-iteration block
 measures the contention rather than the work.

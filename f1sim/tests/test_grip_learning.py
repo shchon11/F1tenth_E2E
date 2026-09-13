@@ -10,8 +10,9 @@ from f1sim.learn.model import ActorCritic
 def test_grip_head_shares_the_trunk_and_trains() -> None:
     m = ActorCritic(3, 36, 12, 5, act_dim=2)
     scan, pro, priv, act = torch.rand(4, 3, 36), torch.rand(4, 12), torch.rand(4, 5), torch.rand(4, 2)
-    logp, ent, val, d, grip, opp, _h = m.evaluate_aux(scan, pro, priv, act)
+    logp, ent, val, d, grip, opp, fut, _h = m.evaluate_aux(scan, pro, priv, act)
     assert grip.shape == (4,) and opp.shape == (4, 3)
+    assert fut is None, "a model with no future head must report no future prediction"
     mu_only = m.actor(scan, pro)
     torch.testing.assert_close(d.mean, mu_only)                    # same action mean as the plain path
     (grip ** 2).mean().backward()

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .future import FutureHead, future_spec
 from .memory import GRUMemory, Hidden, memory_spec
 
 
@@ -175,7 +176,7 @@ class Actor(nn.Module):
     def __init__(self, n_stack: int, n_beams: int, proprio_dim: int, hidden: int = 256, log_std_init: float = -0.7,
                  act_dim: int = 2, scan_deltas: bool = False, temporal_encoder: str = "cnn",
                  scan_stem: str = "plain", cond_dim: int = 0, memory: Optional[dict] = None,
-                 extra_scan_channels: int = 0):
+                 extra_scan_channels: int = 0, future: Optional[dict] = None):
         super().__init__()
         #: Conditioning enters as an additive term on the first MLP layer's *preactivation*, through
         #: one bias-free projection initialised to zero. Two properties follow, and the experiment
@@ -234,6 +235,43 @@ class Actor(nn.Module):
         # speed); this makes it a target so the representation is asked to know it rather than
         # allowed to.
         self.opp = nn.Sequential(nn.Linear(hidden, 128), nn.GELU(), nn.Linear(128, 3))
+        #: Future head: the nearest opponent's relative state and the ego's own motion, K control
+        #: steps ahead, from the state that carries the past -- the GRU's hidden state when there is
+        #: one, the trunk features when there is not. See `f1sim.learn.future` for what it predicts
+        #: and why it reads the recurrent state rather than the action features.
+        #:
+        #: Built LAST and only when asked for. Both halves matter: absent, the module list, the
+        #: state dict and the RNG draw are what they were before this existed (which is what
+        #: `tests/data/ppo_loss_oracle.json` pins); present, every weight above it was still drawn
+        #: from the same generator in the same order, so adding the head to a fresh model does not
+        #: move the rest of it.
+        self.hidden_width = int(hidden)
+        self.future = None
+        self.future_spec: Optional[dict] = None
+        if future:
+            self.attach_future(future)
+
+    def attach_future(self, future: dict) -> None:
+        """Build the future head. Separate from `__init__` so `ActorCritic` can call it LAST.
+
+        The order matters for a controlled experiment, not for correctness: every module here draws
+        from the ambient generator, so building the head between the actor and the critic would give
+        the `--aux-future 0` arm and the `--aux-future 1.0` arm differently-initialised critic GRUs
+        from the same `--seed`. Built after both, the head is the only thing the flag adds.
+        """
+        spec = future_spec(**future)
+        want = "memory" if self.memory is not None else "trunk"
+        if spec["source"] is not None and spec["source"] != want:
+            raise ValueError(
+                f"future head source {spec['source']!r} does not match this actor: it "
+                f"{'has' if self.memory is not None else 'has no'} memory, so the head reads the "
+                f"{want} state. A head trained on one cannot be rebuilt on the other -- its input "
+                f"is a different tensor of a different width.")
+        spec["source"] = want
+        in_dim = self.memory.hidden_size if self.memory is not None else self.hidden_width
+        self.future = FutureHead(in_dim, spec["width"])
+        #: The RESOLVED spec, so `ActorCritic` records what was built rather than what was asked for.
+        self.future_spec = dict(spec)
 
     def _require_cond(self, c, batch):
         """A conditional actor is never run on an implied zero.
@@ -257,6 +295,40 @@ class Actor(nn.Module):
     @property
     def has_memory(self) -> bool:
         return self.memory is not None
+
+    @property
+    def has_future(self) -> bool:
+        return self.future is not None
+
+    def future_input(self, feat, h_next):
+        """The tensor the future head reads: the recurrent state AFTER this step (`h_next[-1]`, the
+        last GRU layer) when there is memory, the trunk features when there is not.
+
+        Public and used by `learn.probe_hidden` as well as by `future_from`, so that the state the
+        probe regresses from cannot drift away from the state the loss trains -- the whole claim
+        rests on them being one tensor. `h_next` is None when the recurrence was deliberately
+        switched off (`use_memory=False`, the KL reference's path), and then there is no state.
+        """
+        if self.memory is None:
+            return feat
+        return None if h_next is None else h_next[-1]
+
+    def future_from(self, feat, h_next):
+        """The future head's prediction, or None if this actor carries no head (or no state)."""
+        if self.future is None:
+            return None
+        x = self.future_input(feat, h_next)
+        return None if x is None else self.future(x)
+
+    def probe_state(self, scan, proprio, c=None, h=None):
+        """(deterministic action, the state the future head reads, next hidden) from one forward.
+
+        One call, so a probe cannot accidentally read a different tensor -- a differently-timed
+        hidden state, or the trunk features of a recurrent actor -- from the one the head is
+        trained on.
+        """
+        feat, _p, h_next = self._parts(scan, proprio, c, h)
+        return torch.tanh(self.mu(feat)), self.future_input(feat, h_next), h_next
 
     def initial_hidden(self, batch: int, device=None, dtype=None):
         return None if self.memory is None else self.memory.initial(batch, device, dtype)
@@ -335,9 +407,14 @@ class Actor(nn.Module):
         return torch.tanh(self.mu(feat)), h_next
 
     def step_all(self, scan, proprio, c=None, h=None, use_memory: bool = True):
+        """(action mean, grip, opponent motion, future prediction or None, next hidden).
+
+        The future prediction is appended BEFORE the hidden state, so `[:3]` -- which is what
+        `forward_all` and the warm-start parity test take -- still means (action, grip, opponent).
+        """
         feat, p, h_next = self._parts(scan, proprio, c, h, use_memory)
         return (torch.tanh(self.mu(feat)), self.grip(torch.cat([feat, p], 1))[:, 0],
-                self.opp(feat), h_next)
+                self.opp(feat), self.future_from(feat, h_next), h_next)
 
     def step_dist(self, scan, proprio, c=None, h=None, use_memory: bool = True):
         mu, h_next = self.step(scan, proprio, c, h, use_memory)
@@ -453,11 +530,16 @@ class ActorCritic(nn.Module):
     def __init__(self, n_stack: int, n_beams: int, proprio_dim: int, priv_dim: int, act_dim: int = 2,
                  scan_deltas: bool = False, temporal_encoder: str = "cnn", scan_stem: str = "plain",
                  cond_dim: int = 0, cond: Optional[dict] = None, priv_adapter: Optional[str] = None,
-                 memory: Optional[dict] = None, scan_channels: Optional[dict] = None):
+                 memory: Optional[dict] = None, scan_channels: Optional[dict] = None,
+                 future_head: Optional[dict] = None):
         super().__init__()
         mem = memory_spec(**memory) if memory else None
         chan = scan_channel_spec(scan_channels)
         extra = len(chan.get("channels", ()))
+        # The head's input is the recurrent state when there is one, so which it is follows from
+        # `memory` rather than being a second thing the caller can get wrong. A checkpoint that
+        # recorded one source cannot be rebuilt with the other: `Actor` raises instead.
+        fut = future_spec(**future_head) if future_head else None
         self.actor = Actor(n_stack, n_beams, proprio_dim, act_dim=act_dim, scan_deltas=scan_deltas,
                            temporal_encoder=temporal_encoder, scan_stem=scan_stem, cond_dim=cond_dim,
                            memory=mem, extra_scan_channels=extra)
@@ -466,6 +548,10 @@ class ActorCritic(nn.Module):
                              priv_adapter=priv_adapter,
                              memory=(mem if mem and mem["critic"] == "own" else None),
                              extra_scan_channels=extra)
+        if fut:
+            # LAST, so that `--aux-future 1.0` adds a head and changes nothing else: every weight
+            # above it was drawn from the same generator in the same order as in the arm without it.
+            self.actor.attach_future(fut)
         self.meta = dict(n_stack=n_stack, n_beams=n_beams, proprio_dim=proprio_dim, priv_dim=priv_dim,
                          act_dim=act_dim, scan_deltas=scan_deltas, temporal_encoder=temporal_encoder,
                          scan_stem=scan_stem)
@@ -479,10 +565,16 @@ class ActorCritic(nn.Module):
             self.meta["memory"] = dict(mem)
         if chan:
             self.meta["scan_channels"] = dict(chan)
+        if fut:
+            self.meta["future_head"] = dict(self.actor.future_spec)
 
     @property
     def has_memory(self) -> bool:
         return self.actor.has_memory or self.critic.has_memory
+
+    @property
+    def has_future(self) -> bool:
+        return self.actor.has_future
 
     def initial_hidden(self, batch: int, device=None, dtype=None) -> Optional[Hidden]:
         """An all-zero `Hidden` for `batch` rows, or None for a feedforward checkpoint.
@@ -519,13 +611,19 @@ class ActorCritic(nn.Module):
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
     def evaluate_aux(self, scan, proprio, priv, actions, c=None, h=None):
-        """evaluate() plus the grip prediction, from the same trunk pass."""
+        """evaluate() plus the auxiliary predictions, from the same trunk pass.
+
+        Returns (log prob, entropy, value, distribution, grip, opponent motion, future, hidden).
+        `future` is None for a checkpoint that carries no future head, which is every checkpoint
+        written before it existed.
+        """
         ha, hc = self._split(h)
-        mu, grip, opp, ha = self.actor.step_all(scan, proprio, c, ha)
+        mu, grip, opp, fut, ha = self.actor.step_all(scan, proprio, c, ha)
         mu = mu.float()
         d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
         v, hc = self.critic.step(scan, proprio, priv, hc)
         return (d.log_prob(actions).sum(1), d.entropy().sum(1), v, d, grip.float(), opp.float(),
+                None if fut is None else fut.float(),
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
     def evaluate_sequence(self, scan, proprio, priv, actions, c=None, h=None, keep=None):
@@ -553,7 +651,7 @@ class ActorCritic(nn.Module):
             raise ValueError(f"this actor is conditional (cond_dim={self.actor.cond_dim}) and "
                              f"evaluate_sequence was given no condition; pass the stored (T, m, D) "
                              f"block the actions were sampled under")
-        feats, values = [], []
+        feats, values, states = [], [], []
         for t in range(T):
             if keep is not None:
                 k = keep[t].to(xa.dtype)[None, :, None]
@@ -564,14 +662,21 @@ class ActorCritic(nn.Module):
             f, ha = self.actor.head(xa[t], None if cs is None else cs[t], ha)
             v, hc = self.critic.head(xv[t], hc)
             feats.append(f); values.append(v)
+            if ha is not None:
+                # the state AFTER step t, which is what the future head reads and what
+                # `probe_hidden` regresses from -- collected here so the head sees, step for step,
+                # the tensor the rollout carried.
+                states.append(ha[-1])
         feat = torch.cat(feats, 0)                       # (T * m, hidden), row-major (step, env)
         val = torch.cat(values, 0)
         mu = torch.tanh(self.actor.mu(feat)).float()
         d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
         grip = self.actor.grip(torch.cat([feat, pa], 1))[:, 0]
         opp = self.actor.opp(feat)
+        fut = self.actor.future_from(feat, None if not states else torch.cat(states, 0)[None])
         acts = flat(actions)
         return (d.log_prob(acts).sum(1), d.entropy().sum(1), val, d, grip.float(), opp.float(),
+                None if fut is None else fut.float(),
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
 
@@ -721,7 +826,8 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                     scan_channels: Optional[dict] = None,
                     priv_adapter: Optional[str] = None, override: Optional[dict] = None,
                     allow_controller: bool = False,
-                    allow_conditional: bool = False) -> Tuple[ActorCritic, dict, list]:
+                    allow_conditional: bool = False,
+                    future_head: Optional[dict] = None) -> Tuple[ActorCritic, dict, list]:
     """Load a feedforward checkpoint into a recurrent actor-critic, by name, preserving every weight.
 
     Warm start, not re-initialisation. The memory is an addition to the original network, so at
@@ -740,8 +846,14 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     `tests/test_memory_model.py::test_warm_start_is_bit_identical` is the check, run against the
     real frozen baseline when it is present and against a small stand-in otherwise.
 
+    `future_head` adds the auxiliary future head (`learn.future`) on the same terms: its output
+    layer is zero, so it changes no action, no value and no other aux head, and `actor.future.*` is
+    the third family of tensors allowed to be new. It reads the recurrent state when `memory` is
+    given and the trunk features otherwise, so which it is follows from this call rather than being
+    a second thing to keep in step.
+
     `memory` may be None: extra scan channels alone are a legitimate arm, and they need the same
-    by-name transfer and the same zeroed new columns. At least one of the two must be asked for,
+    by-name transfer and the same zeroed new columns. At least one of the three must be asked for,
     or this is `load_checkpoint` with extra steps.
 
     Returns (model, extra, fresh tensor names). `allow_controller` and `allow_conditional` are the
@@ -753,6 +865,14 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")
     _refuse_controller(ck, path, allow_controller)
+    if meta.get("future_head"):
+        # Same argument as memory, plus a concrete trap: the head's input width is the GRU's hidden
+        # size or the trunk's, so adding memory underneath a trained head silently changes what its
+        # first layer reads. Resuming keeps both.
+        raise ValueError(f"{os.path.basename(str(path))} already carries a future head "
+                         f"({meta['future_head']}); warm-starting one from it would re-initialise a "
+                         f"path that is already trained, and adding memory underneath it would "
+                         f"change the width of its input. Resume it with load_checkpoint instead.")
     if meta.get("memory"):
         raise ValueError(f"{os.path.basename(str(path))} already carries memory "
                          f"({meta['memory']}); warm-starting memory from it would be a second "
@@ -769,15 +889,17 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         meta["memory"] = memory_spec(**memory)
     if chan:
         meta["scan_channels"] = chan
-    if not memory and not chan:
-        raise ValueError("load_for_memory with neither memory nor a scan channel would be "
-                         "load_checkpoint with extra steps; call that instead.")
+    if future_head:
+        meta["future_head"] = future_spec(**future_head)
+    if not memory and not chan and not future_head:
+        raise ValueError("load_for_memory with neither memory, a scan channel nor a future head "
+                         "would be load_checkpoint with extra steps; call that instead.")
     m = ActorCritic(**meta).to(device)
     sd = m.state_dict()
     src = ck["state_dict"]
 
     #: The only tensors allowed to be new. Everything else must arrive from the checkpoint.
-    allowed_fresh = {k for k in sd if ".memory." in k}
+    allowed_fresh = {k for k in sd if ".memory." in k or k.startswith("actor.future.")}
     grown = {}                                      # name -> (checkpoint columns, model columns)
     unused, mismatched = [], []
     for k, v in src.items():
@@ -806,8 +928,8 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
             f"memory warm start is not clean: unused checkpoint tensors {sorted(unused)[:6]}, "
             f"shape mismatches {mismatched[:4]}, unexpected fresh tensors "
             f"{sorted(set(fresh) - allowed_fresh)[:6]}. Every original weight must transfer "
-            f"unchanged; only the memory modules (and the zeroed new scan-channel columns) may be "
-            f"new.{hint}")
+            f"unchanged; only the memory modules, the future head (and the zeroed new scan-channel "
+            f"columns) may be new.{hint}")
     if chan and len(grown) != 2:
         raise ValueError(f"expected the actor's and the critic's first convolution to grow by "
                          f"{len(chan['channels'])} input channel(s); {len(grown)} did: {sorted(grown)}")
@@ -826,5 +948,10 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         if mod.memory is not None and float(mod.memory.out.weight.detach().abs().max()) != 0.0:
             raise RuntimeError(f"the {who}'s memory projection is not zero at init; a warm start "
                                f"from it would not reproduce the original")
+    if m.actor.future is not None:
+        out = m.actor.future.net[2]
+        if float(out.weight.detach().abs().max()) != 0.0 or float(out.bias.detach().abs().max()) != 0.0:
+            raise RuntimeError("the future head's output layer is not zero at init; the head would "
+                               "start by asserting a future nobody trained it to predict")
     extra = dict(ck.get("extra", {})); extra["skipped"] = []
     return m, extra, sorted(fresh)

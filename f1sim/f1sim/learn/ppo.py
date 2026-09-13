@@ -15,6 +15,7 @@ from typing import Optional
 
 import argparse
 import copy
+import json
 import math
 import os
 import time
@@ -22,12 +23,15 @@ import time
 import numpy as np
 import torch
 
-from ..gym_env import EnvConfig, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS
+from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_LABEL_KEYS, PRIV_OPP_DIST_SCALE,
+                       REWARD_COMPONENT_KEYS)
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
 from . import grip_runtime as grip_rt
 from . import opponent_config as opp_cfg
+from .future import (FUTURE_K, align_future_targets, future_labelled_fraction, future_loss,
+                     future_spec)
 from .memory import Hidden, memory_spec, reset_hidden
 from .model import (ActorCritic, load_checkpoint, load_for_conditioning, load_for_memory,
                     save_checkpoint)
@@ -69,6 +73,7 @@ class PPOHyper:
     kl_coef: float
     aux_grip: float = 0.0
     aux_opp: float = 0.0
+    aux_future: float = 0.0
     priv_mu_index: int = 16
     aux_opp_range_m: float = AUX_OPP_RANGE_M
     m_gt_1: bool = False
@@ -76,7 +81,8 @@ class PPOHyper:
 
 def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old, adv, ret,
                      val_old, w, cond=None, hyper: PPOHyper, autocast=None,
-                     freeze_actor: bool = False, sequence=None) -> dict:
+                     freeze_actor: bool = False, sequence=None,
+                     future=None, future_valid=None) -> dict:
     """One PPO minibatch's loss terms, feedforward or recurrent.
 
     Lifted out of `main`'s inner loop unchanged so that (a) the recurrent path and the feedforward
@@ -90,19 +96,26 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     of whole env chunks, and the flat tensors (`logp_old`, `adv`, `ret`, `val_old`, `w`) are the
     matching (T * m,) rows in row-major (step, env) order. `keep` is 0 where the episode ended on
     the step before, which is where the hidden state is masked back to zero.
+
+    `future` / `future_valid` are the auxiliary future head's aligned labels and their mask, shaped
+    like `priv` and `w` respectively (so (T, m, D) and (T, m) in the recurrent path). They are
+    optional and default to None, which -- together with `hyper.aux_future = 0` -- is what makes an
+    unflagged run's loss the number the frozen oracle recorded.
     """
     ac = autocast if autocast is not None else nullcontext()
     with ac:
         if sequence is None:
-            logp, ent, val, d, grip, opp_pred, h_next = model.evaluate_aux(scan, pro, priv, act, cond)
+            logp, ent, val, d, grip, opp_pred, fut_pred, h_next = model.evaluate_aux(
+                scan, pro, priv, act, cond)
             ref_scan, ref_pro, ref_cond = scan, pro, cond
         else:
             h0, keep = sequence
-            logp, ent, val, d, grip, opp_pred, h_next = model.evaluate_sequence(
+            logp, ent, val, d, grip, opp_pred, fut_pred, h_next = model.evaluate_sequence(
                 scan, pro, priv, act, cond, h0, keep)
             T, m = scan.shape[0], scan.shape[1]
             flat = lambda t: None if t is None else t.reshape(T * m, *t.shape[2:])
             ref_scan, ref_pro, ref_cond, priv = flat(scan), flat(pro), flat(cond), flat(priv)
+            future, future_valid = flat(future), flat(future_valid)
     logp, ent, val = logp.float(), ent.float(), val.float()
 
     def wmean(x, w):
@@ -127,6 +140,16 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
         # nothing and trained the head on an empty road.
         near = (priv[:, 11] * PRIV_OPP_DIST_SCALE < hyper.aux_opp_range_m).to(w.dtype) * w
         aux_o = wmean(((opp_pred - o_true) ** 2).mean(1), near)
+    aux_f = torch.zeros((), device=logp.device)
+    aux_f_parts: dict = {}
+    if hyper.aux_future > 0:
+        if fut_pred is None or future is None or future_valid is None:
+            raise ValueError(
+                "--aux-future is on but this minibatch carries no future head / labels: the head "
+                "is built from meta['future_head'] and the labels come from the rollout buffer, so "
+                "a missing one means the run was assembled wrong rather than that the term is off.")
+        aux_f, aux_f_parts = future_loss(fut_pred.float(), future.float(),
+                                         future_valid.float(), w.float())
     ratio = (logp - logp_old).exp()
     pg = -wmean(torch.min(ratio * adv, ratio.clamp(1 - hyper.clip, 1 + hyper.clip) * adv), w)
     v_clipped = val_old + (val - val_old).clamp(-hyper.clip, hyper.clip)
@@ -144,9 +167,11 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, d).sum(1), w)
     ent_w = wmean(ent, w)
     loss = (hyper.vf * vf + (0.0 if freeze_actor else 1.0) * (pg - hyper.ent * ent_w
-            + hyper.kl_coef * kl_ref) + hyper.aux_grip * aux + hyper.aux_opp * aux_o)
+            + hyper.kl_coef * kl_ref) + hyper.aux_grip * aux + hyper.aux_opp * aux_o
+            + hyper.aux_future * aux_f)
     return {"pg": pg, "vf": vf, "ent": ent_w, "entropy_mean": ent.mean(), "kl_ref": kl_ref,
-            "aux_grip": aux, "aux_opp": aux_o, "loss": loss, "hidden": h_next,
+            "aux_grip": aux, "aux_opp": aux_o, "aux_future": aux_f,
+            "aux_future_parts": aux_f_parts, "loss": loss, "hidden": h_next,
             "approx_kl": ((ratio - 1) - (logp - logp_old)).mean(),
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
 
@@ -256,6 +281,11 @@ def main():
     ap.add_argument("--wandb-id", default=None, help="append to this W&B run id (default: the one the "
                                                      "--init checkpoint came from)")
     ap.add_argument("--wandb-new", action="store_true", help="start a fresh W&B run even when resuming")
+    ap.add_argument("--metrics-jsonl", default="",
+                    help="also append every logged metric dict to this file, one JSON object per "
+                         "logged update. Opt-in and orthogonal to --wandb: a `--wandb disabled` run "
+                         "otherwise leaves no machine-readable curve behind, which is exactly what a "
+                         "smoke has to report")
     ap.add_argument("--steps-base", type=float, default=None,
                     help="x-axis offset for the resumed W&B run; defaults to the checkpoint's own count")
     ap.add_argument("--yield-to-viewer", type=float, default=1.0,
@@ -278,6 +308,21 @@ def main():
     ap.add_argument("--aux-grip", type=float, default=0.0,
                     help="weight of an auxiliary loss making the actor's trunk predict the car's true "
                          "friction from what it observes (IMU history). 0 = off")
+    ap.add_argument("--aux-future", type=float, default=0.0,
+                    help=f"weight of an auxiliary loss making the actor's RECURRENT STATE (the trunk "
+                         f"features with --memory off) predict, {FUTURE_K} control steps "
+                         f"({FUTURE_K * 0.025:.2f} s) ahead: the nearest opponent's relative position "
+                         f"and velocity in the ego frame, a presence logit, and the ego's own speed "
+                         f"and yaw rate. Privileged labels from the simulator, masked across episode "
+                         f"boundaries and where no opponent is in range. 0 = off, and off the head is "
+                         f"not built at all: same parameters, same state dict, same loss. Measure "
+                         f"what it did with `python -m f1sim.learn.probe_hidden`")
+    ap.add_argument("--aux-future-k", type=int, default=FUTURE_K,
+                    help=f"lookahead of --aux-future in control steps (40 Hz). Default {FUTURE_K} "
+                         f"= 0.5 s. Only the last k steps of each --horizon chunk go unlabelled, so "
+                         f"a k near the horizon leaves almost nothing to train on")
+    ap.add_argument("--aux-future-width", type=int, default=128,
+                    help="hidden width of the future head's one layer")
     ap.add_argument("--car-proximity-penalty", type=float, default=0.0,
                     help="per metre driven with another car's body inside car_safe_gap (0.6 m), scaled "
                          "by closing speed. Without it the only gradient near a car is the overtake "
@@ -482,17 +527,29 @@ def main():
                           critic=a.memory_critic) if a.memory != "off" else None
     chan_cfg = ({"channels": list(a.scan_channels), "memory_tau_s": float(a.scan_memory_tau)}
                 if a.scan_channels else None)
-    if a.init and (mem_cfg or chan_cfg):
+    #: The future head is built when the term is on, and only then: `--aux-future 0` is the run it
+    #: was, down to the state dict. A checkpoint that already carries one keeps it (the loaders read
+    #: `meta`), so a resume does not have to repeat the flag to keep the head -- but it does have to
+    #: repeat it to keep TRAINING the head, which is what the coefficient is.
+    fut_cfg = (future_spec(k=a.aux_future_k, width=a.aux_future_width,
+                           source=("memory" if mem_cfg else "trunk"))
+               if a.aux_future > 0 else None)
+    if fut_cfg and future_labelled_fraction(a.horizon, a.aux_future_k) <= 0.0:
+        raise SystemExit(f"--aux-future-k {a.aux_future_k} needs --horizon > {a.aux_future_k - 1} "
+                         f"(got {a.horizon}): the label for step t is the state at t + k, and a "
+                         f"chunk shorter than the lookahead contains not one labelled step.")
+    if a.init and (mem_cfg or chan_cfg or fut_cfg):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
         # actor's first action of this run is bit-identical to the one the original would have
         # produced. `tests/test_memory_model.py` is the check.
         model, extra, fresh = load_for_memory(
             a.init, device, mem_cfg, scan_channels=chan_cfg, priv_adapter=priv_adapter,
+            future_head=fut_cfg,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
-        print(f"init from {a.init} with memory {mem_cfg} channels {chan_cfg} | "
+        print(f"init from {a.init} with memory {mem_cfg} channels {chan_cfg} future {fut_cfg} | "
               f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
@@ -524,7 +581,7 @@ def main():
                             scan_stem=a.scan_stem, cond_dim=cond_dim,
                             cond=cond_spec.to_meta() if cond_dim else None,
                             priv_adapter=priv_adapter, memory=mem_cfg,
-                            scan_channels=chan_cfg).to(device)
+                            scan_channels=chan_cfg, future_head=fut_cfg).to(device)
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
@@ -536,6 +593,21 @@ def main():
     if memory_on or n_extra:
         from .memory import describe as _describe_memory
         print(f"policy memory: {_describe_memory(model.meta)}")
+    #: Read back from the model for the same reason `memory_on` is: a resumed checkpoint carries its
+    #: own head, and the rollout has to collect labels exactly when there is something to score.
+    future_cfg = dict(model.meta.get("future_head") or {})
+    future_on = bool(future_cfg) and a.aux_future > 0
+    future_k = int(future_cfg.get("k", a.aux_future_k))
+    if future_cfg:
+        from .future import describe as _describe_future
+        frac = future_labelled_fraction(a.horizon, future_k)
+        print(f"{_describe_future(model.meta)} | coefficient {a.aux_future} "
+              f"({'training' if future_on else 'PRESENT BUT NOT TRAINED: --aux-future is 0'}) | "
+              f"{frac:.0%} of each {a.horizon}-step chunk can carry a label")
+        if future_on and env.M < 2:
+            print("--aux-future on a solo env: the four opponent columns have no label and are "
+                  "masked everywhere; only the ego speed / yaw-rate targets and a constant "
+                  "presence logit train. This is an ablation, not the configuration the head is for.")
     # the plan default applies to a fresh actor only. Applied on every --init it silently undoes the
     # annealing each resume, and a resume that more than doubles the exploration noise crashes every
     # episode for the next ~40 updates before it claws back to where the checkpoint already was
@@ -570,6 +642,7 @@ def main():
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
         "fresh_optimizer": bool(a.fresh_opt), "aux_grip": float(a.aux_grip), "aux_opp": float(a.aux_opp),
+        "aux_future": float(a.aux_future), "future_head": dict(future_cfg) or None,
         "lab_oracle": bool(cond_spec.lab_oracle), "init": a.init, "seed": int(a.seed),
         "memory": dict(model.meta.get("memory") or {}) or None,
         "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
@@ -674,6 +747,16 @@ def main():
     # to see the identical input. Reading `P["mu"]` again during SGD would silently use whatever the
     # env has been reset to since -- a different friction for the same transition.
     buf_cond = torch.zeros(T, B, max(1, cond_dim), device=device)
+    # ---- the auxiliary future head's labels. `buf_fut_lab[t]` is the privileged label row for the
+    # state at time t, for t = 0 .. T -- T + 1 rows, because the label for step t is the row at
+    # t + k and the chunk's last state is the one the value bootstrap already visits. No extra
+    # simulator step and no second rollout: the label is a read of the state the rollout is standing
+    # in. `buf_fut_break[t]` marks the transition t -> t+1 as crossing an episode boundary for
+    # SOMEBODY IN THE RACE, which is the condition under which the label at t + k belongs to a
+    # different situation (`F1VecEnv.race_boundary`). `future.align_future_targets` turns the pair
+    # into (target, valid) after the rollout.
+    buf_fut_lab = torch.zeros(T + 1, B, FUTURE_LABEL_DIM, device=device) if future_cfg else None
+    buf_fut_break = torch.zeros(T, B, device=device) if future_cfg else None
     # ---- recurrent state. `h_*` are the live states, full env width (the policy acts for every
     # car, including the self-play opponents); the buffers hold the learners' slice, which is what
     # the update replays. `buf_keep[t] = 0` marks a step whose predecessor ended an episode, so
@@ -769,6 +852,10 @@ def main():
                     val = val.float()
                 act, logp = act.float(), logp.float()
                 buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
+                if buf_fut_lab is not None:
+                    # Before the step: `last_result` is still the state this action is taken from,
+                    # which is the state `priv` above was read from.
+                    buf_fut_lab[t] = env.future_labels()[lid]
                 if cond_dim:
                     buf_cond[t] = cond_t[lid].float()
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
@@ -789,6 +876,11 @@ def main():
                 controller.post_step(term, trunc)
                 priv = env.privileged(env.last_result)
                 buf_rew[t] = rew[lid]; buf_done[t] = term[lid].float(); buf_trunc[t] = trunc[lid].float()
+                if buf_fut_break is not None:
+                    # Any car of the race, not just this one: an opponent that crashed was respawned
+                    # behind the field inside this same step, so its pose half a second from now is
+                    # not the continuation of the motion the head is being asked to extrapolate.
+                    buf_fut_break[t] = env.race_boundary(term | trunc)[lid].float()
                 if "on_policy" in info:
                     buf_mask[t] = info["on_policy"][lid].float()
                 buf_reward_components[t] = torch.stack([info["reward_components"][key][lid] for key in REWARD_COMPONENT_KEYS], 1)
@@ -836,6 +928,11 @@ def main():
                 # The bootstrap value of the state the next chunk starts from: previewed, because
                 # the next chunk's first step advances the channels itself.
                 scan = roll_aug.preview(scan)
+            if buf_fut_lab is not None:
+                # The (T + 1)-th label row: the state the chunk ends in, the same one the bootstrap
+                # value below is taken from. This is what makes step T - k the last labelled step
+                # rather than T - k - 1.
+                buf_fut_lab[T] = env.future_labels()[lid]
             with ac:
                 buf_val[T] = model.critic.step(scan[lid], pro[lid], priv[lid],
                                                None if h_critic is None else h_critic[:, lid])[0].float()
@@ -849,6 +946,13 @@ def main():
         f_act = buf_act.reshape(n, env.act_dim); f_logp = buf_logp.reshape(n); f_adv = adv.reshape(n); f_ret = ret.reshape(n); f_val = buf_val[:T].reshape(n)
         f_mask = buf_mask.reshape(n)
         f_cond = buf_cond.reshape(n, buf_cond.shape[-1]) if cond_dim else None
+        # The label for step t is the row recorded at t + k, dropped where that row is outside this
+        # chunk or on the far side of a reset. Done once per update, here, so the minibatch loop
+        # slices an aligned (T, B, D) block exactly as it slices `priv`.
+        fut_tgt, fut_valid = (align_future_targets(buf_fut_lab, buf_fut_break, future_k)
+                              if buf_fut_lab is not None else (None, None))
+        f_fut = fut_tgt.reshape(n, FUTURE_LABEL_DIM) if fut_tgt is not None else None
+        f_fut_valid = fut_valid.reshape(n) if fut_valid is not None else None
         # advantage statistics over the policy's own samples only; a teacher-driven car's advantages
         # are not the policy's and would otherwise set the scale everything else is normalised by
         w_all = f_mask / f_mask.sum().clamp_min(1.0)
@@ -857,8 +961,8 @@ def main():
         stats = {"pg": [], "vf": [], "ent": [], "kl_ref": [], "approx_kl": [], "clipfrac": []}
         freeze_actor = update < a.critic_warmup
         hyper = PPOHyper(clip=a.clip, vf=a.vf, ent=a.ent, kl_coef=kl_coef, aux_grip=a.aux_grip,
-                         aux_opp=a.aux_opp, priv_mu_index=int(env.priv_mu_index),
-                         m_gt_1=bool(env.M > 1))
+                         aux_opp=a.aux_opp, aux_future=(a.aux_future if future_on else 0.0),
+                         priv_mu_index=int(env.priv_mu_index), m_gt_1=bool(env.M > 1))
         # Feedforward: minibatches are random SAMPLES, as they always were. Recurrent: minibatches
         # are whole env chunks of the horizon, because the update has to replay each env's chunk in
         # order from the hidden state the rollout was in -- a shuffled sample has no predecessor to
@@ -880,17 +984,22 @@ def main():
                     seq = (Hidden(buf_h0_actor[:, cols],
                                   None if buf_h0_critic is None else buf_h0_critic[:, cols]),
                            buf_keep[:, cols])
+                    fut_mb = fut_tgt[:, cols] if fut_tgt is not None else None
+                    fut_valid_mb = fut_valid[:, cols] if fut_valid is not None else None
                 else:
                     idx = sel
                     scan = f_scan[idx].float(); pro = f_pro[idx]
                     priv_mb = f_priv[idx]; act_mb = f_act[idx]
                     c_mb = f_cond[idx] if cond_dim else None   # the stored one, never recomputed
+                    fut_mb = f_fut[idx] if f_fut is not None else None
+                    fut_valid_mb = f_fut_valid[idx] if f_fut_valid is not None else None
                 # NOT `out`: that is the run directory, twenty lines below, and shadowing it makes
                 # a run that trains perfectly and then cannot write its checkpoint.
                 terms = minibatch_losses(model, ref, scan=scan, pro=pro, priv=priv_mb, act=act_mb,
                                          logp_old=f_logp[idx], adv=f_adv[idx], ret=f_ret[idx],
                                          val_old=f_val[idx], w=f_mask[idx], cond=c_mb, hyper=hyper,
-                                         autocast=ac, freeze_actor=freeze_actor, sequence=seq)
+                                         autocast=ac, freeze_actor=freeze_actor, sequence=seq,
+                                         future=fut_mb, future_valid=fut_valid_mb)
                 pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
                                               terms["aux_grip"], terms["aux_opp"])
                 loss = terms["loss"]
@@ -921,6 +1030,10 @@ def main():
                     if memory_on: stats.setdefault("grad_norm", []).append(float(gn))
                     if a.aux_grip > 0: stats.setdefault("aux_grip", []).append(aux.item())
                     if a.aux_opp > 0 and env.M > 1: stats.setdefault("aux_opp", []).append(aux_o.item())
+                    if future_on:
+                        stats.setdefault("aux_future", []).append(terms["aux_future"].item())
+                        for key, value in terms["aux_future_parts"].items():
+                            stats.setdefault(f"aux_future/{key}", []).append(float(value))
         t_upd = tm.lap()
         steps_done += n; update += 1
         # B3, drained EVERY update, before the logging branch. "Five consecutive updates" is a
@@ -951,6 +1064,12 @@ def main():
                    **({"loss/grad_norm": float(np.mean(stats["grad_norm"]))} if stats.get("grad_norm") else {}),
                    **({"loss/aux_grip_mse": float(np.mean(stats["aux_grip"]))} if stats.get("aux_grip") else {}),
                    **({"loss/aux_opp_mse": float(np.mean(stats["aux_opp"]))} if stats.get("aux_opp") else {}),
+                   # the total the coefficient multiplies, then every component of it: a head whose
+                   # total falls because one easy column collapsed is not a head that learned the
+                   # opponent, and only the split says which happened
+                   **({"loss/aux_future_mse": float(np.mean(stats["aux_future"]))} if stats.get("aux_future") else {}),
+                   **{f"loss/aux_future/{key.split('/', 1)[1]}": float(np.mean(v))
+                      for key, v in stats.items() if key.startswith("aux_future/")},
                    "policy/log_std_steer": model.actor.log_std[0].item(), "policy/log_std_speed": model.actor.log_std[1].item(),
                    "time/rollout_s": t_roll, "time/update_s": t_upd, "time/env_steps_per_s": n / (t_roll + t_upd),
                    "time/elapsed_min": (time.time() - t_start) / 60}
@@ -999,10 +1118,16 @@ def main():
             # the W&B step must be the cumulative count, not this leg's: a resume that logs from 0 again
             # has every point silently dropped ("step less than current step"), so the leg vanishes
             run.log(log, step=steps_base + steps_done)
+            if a.metrics_jsonl:
+                with open(a.metrics_jsonl, "a") as f_:
+                    f_.write(json.dumps({k_: (float(v_) if isinstance(v_, (int, float, np.floating))
+                                              else v_) for k_, v_ in log.items()}) + "\n")
             print(f"upd {update}/{n_updates} steps {(steps_base + steps_done)/1e6:.1f}M cap {cap:.1f} | rew/step {log['rollout/reward_per_step']:.3f} "
                   f"coll {log.get('episode/collisions_per_km', float('nan')):.1f}/km prog {log.get('episode/progress_m', float('nan')):.0f} m "
                   f"lap {log.get('episode/lap_time_s', float('nan')):.1f} s | gate {log.get('curriculum/gate_coll_per_km', float('nan')):.1f} "
-                  f"({log.get('curriculum/tracks_scored', 0):.0f} tk) | kl_ref {log['loss/kl_ref']:.3f} | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
+                  f"({log.get('curriculum/tracks_scored', 0):.0f} tk) | kl_ref {log['loss/kl_ref']:.3f}"
+                  + (f" | fut {log['loss/aux_future_mse']:.3f}" if 'loss/aux_future_mse' in log else "")
+                  + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         t_loop = time.time() - t_loop0
         if update % a.save_every == 0:
             meta = {"spec": spec.__dict__, "phase": "ppo", "run": a.name, "update": update, "updates": n_updates,

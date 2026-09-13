@@ -39,6 +39,15 @@ REWARD_COMPONENT_KEYS = ("progress", "collision", "collision_speed", "steer_rate
 #: keep them O(1) for the critic. Anything comparing them against a real distance must multiply.
 PRIV_OPP_DIST_SCALE = 5.0
 
+#: The columns of `F1VecEnv.future_labels`, in order. The first six are regression targets for the
+#: auxiliary future head (`f1sim.learn.future`); the last is the target of a presence *logit*, 1
+#: where a car is inside `overtake_range`. The names are what the trainer and the probe log, so
+#: changing one renames a metric in every table that has ever been produced.
+FUTURE_LABEL_KEYS = ("opp_lon", "opp_lat", "opp_vlon", "opp_vlat",
+                     "ego_speed", "ego_yaw_rate", "opp_present")
+FUTURE_LABEL_DIM = len(FUTURE_LABEL_KEYS)
+FUTURE_PRESENT_INDEX = FUTURE_LABEL_KEYS.index("opp_present")
+
 #: Who drives each car, per row, in `opponent == "pool"`. The learner's slot is always
 #: `OPP_DRIVER_POLICY`; an opponent's is drawn per race from `opp_pool`.
 OPP_DRIVER_POLICY = 0      # the caller's own action: the learner, or a `self` entry (self-play)
@@ -1278,6 +1287,79 @@ class F1VecEnv:
         pv = self._priv(r)
         params = torch.stack([self.sim.P[k] for k in self.PRIV_PARAMS], 1)
         return torch.cat([pv, params, (self.speed_cap / self.ecfg.v_max_policy)[:, None]], 1)
+
+    def future_labels(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, FUTURE_LABEL_DIM) privileged snapshot of THIS instant, in `FUTURE_LABEL_KEYS` order.
+
+        This is a *label*, not an observation: nothing the policy sees is built from it. The
+        auxiliary future head is scored against the row belonging to the state K control steps
+        later (`f1sim.learn.future.align_future_targets` does the alignment), and
+        `f1sim.learn.probe_hidden` regresses the same row out of frozen hidden states, so the head
+        and the probe measure the same quantity by construction.
+
+        Columns, all O(1):
+
+        * `opp_lon`, `opp_lat` -- the nearest opponent's position in the ego body frame, divided by
+          PRIV_OPP_DIST_SCALE, the same scale `privileged()` puts its present-opponent offsets on.
+        * `opp_vlon`, `opp_vlat` -- that opponent's velocity *relative to the ego*, rotated into the
+          ego body frame, on the same scale. NOTE this is not `privileged()[10]`: that column is
+          `other.vx - ego.vx`, a difference of two body-frame longitudinal speeds taken in two
+          different frames, which is a fine present-tense cue and a poor prediction target. Here
+          both velocities are taken to the world and the difference is rotated into one frame, so
+          `opp_lon + dt * opp_vlon` is (to first order) where the car will be.
+        * `ego_speed`, `ego_yaw_rate` -- the ego's own longitudinal speed and yaw rate, on the
+          observation's own normalisers (`v_max_policy`, `imu_gyro_scale`).
+        * `opp_present` -- 1 where the nearest opponent is inside `overtake_range`, else 0. The four
+          opponent columns are ZEROED where it is 0: there is no relative position to a car that is
+          not there, and a far-away car's offsets leaking through an unmasked path is exactly the
+          "trained on an empty road" failure `AUX_OPP_RANGE_M` was written to stop.
+
+        Solo (`race_size 1`) is legal and gives `opp_present = 0` everywhere: the two ego columns are
+        still real targets and the presence logit still has a (constant) label.
+
+        `r` defaults to `last_result`, which is the state the next action will be taken from -- the
+        same convention `privileged(env.last_result)` is read under in the trainer's rollout.
+        """
+        res = self.last_result if r is None else r
+        if res is None:
+            raise RuntimeError("future_labels needs a stepped env: call reset() first")
+        st = res.state
+        e = self.ecfg
+        out = torch.zeros(self.B, FUTURE_LABEL_DIM, device=self.device, dtype=st.dtype)
+        c, sn = torch.cos(st[:, 2]), torch.sin(st[:, 2])
+        if self.M > 1:
+            o = self.sim.other_idx                                  # (B, C)
+            d = st[o][:, :, :2] - st[:, None, :2]
+            dist = d.norm(dim=2)
+            j = dist.argmin(1); ar = torch.arange(self.B, device=self.device)
+            dn = d[ar, j]; kj = o[ar, j]
+            co, so = torch.cos(st[kj, 2]), torch.sin(st[kj, 2])
+            # world velocity of each car, then their difference back in the ego frame
+            vwx = (st[kj, 3] * co - st[kj, 4] * so) - (st[:, 3] * c - st[:, 4] * sn)
+            vwy = (st[kj, 3] * so + st[kj, 4] * co) - (st[:, 3] * sn + st[:, 4] * c)
+            s_ = PRIV_OPP_DIST_SCALE
+            present = (dist[ar, j] < e.overtake_range).to(st.dtype)
+            out[:, 0] = present * (dn[:, 0] * c + dn[:, 1] * sn) / s_
+            out[:, 1] = present * (-dn[:, 0] * sn + dn[:, 1] * c) / s_
+            out[:, 2] = present * (vwx * c + vwy * sn) / s_
+            out[:, 3] = present * (-vwx * sn + vwy * c) / s_
+            out[:, FUTURE_PRESENT_INDEX] = present
+        out[:, 4] = st[:, 3] / e.v_max_policy
+        out[:, 5] = st[:, 5] / e.imu_gyro_scale
+        return out
+
+    def race_boundary(self, done: torch.Tensor) -> torch.Tensor:
+        """(B,) bool: did ANY car sharing this row's race end its episode on this step?
+
+        A future label read across a reset is a label from a different situation, and in a race the
+        reset does not have to be this car's. An opponent that crashes is respawned behind the field
+        *in place*, without ending the learner's episode, so its position half a second later is not
+        the continuation of the motion the head was asked to extrapolate. The rows are dealt into
+        races of M contiguous slots (`self.race = arange(B) // M`), which is what makes this a view
+        and a reduction rather than a scatter.
+        """
+        d = done.to(torch.bool).reshape(-1, self.M)
+        return d.any(1, keepdim=True).expand_as(d).reshape(-1)
 
     def set_external_command(self, idx: int, steer: float, speed: float) -> None:
         """Drive car `idx` with an outside (steer [rad], speed [m/s]) from the next step on, in place

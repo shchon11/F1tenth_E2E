@@ -156,7 +156,7 @@ blocks with a dilated final stage for whole-scan context, an explicit beam-angle
 explicit windowed-minimum channel, and a raw per-sector nearest-return bypass that carries absolute
 scale past the normalisation) turns the stacked scan into 256 features. A one-layer MLP turns the
 proprio vector into 128. The two are concatenated and passed through a two-layer 256-wide MLP; a
-`tanh` output head emits the 8-number plan. Two auxiliary heads hang off the same trunk — the car's
+`tanh` output head emits the 8-number plan. Auxiliary heads hang off the same trunk — the car's
 friction from the trunk *and* the proprio embedding, and the nearest opponent's offset and closing
 speed from the trunk — and are trained only when `--aux-grip` / `--aux-opp` are on.
 
@@ -176,6 +176,21 @@ feedforward entry points (`Actor.forward`, `.dist`, `.forward_all`) refuse a rec
 than running it from zeros, because a recurrent policy restarted every step looks exactly like a
 working one.
 
+**Future head (optional, `--aux-future`).** A third auxiliary head, and the only one that does not
+read the action trunk: its input is the actor's **recurrent state** after the step (the GRU's hidden
+state; the trunk features when `--memory off`), and its output is the nearest opponent's relative
+position and velocity, a presence logit, and the ego's own speed and yaw rate, **20 control steps
+(0.5 s) ahead**. The labels are privileged and come from the simulator; nothing the policy sees is
+built from them, and the head is not exported.
+
+It reads the recurrent state on purpose. The other two heads ask for things the present observation
+largely determines, so a hidden state can stay a smoothed copy of that observation and pay nothing.
+This one asks for what the present observation cannot contain, and it asks the *state* — which is
+also the tensor `learn/probe_hidden.py` regresses the same targets out of, so the loss that trains
+it and the measurement that scores it are about one tensor rather than two. Its output layer starts
+at exactly zero (weight and bias), so a warm start is bit-identical and the head still trains from
+the first update; with `--aux-future 0` the module is not built at all.
+
 **Optional scan channels.** `--scan-channels memory,edges` appends one row per channel to the scan's
 channel axis, after every column the original had, computed from the scan alone
 (`learn/obs.py`): a decayed per-bearing occupancy memory, and the beam-to-beam range discontinuity.
@@ -184,9 +199,12 @@ every consumer of that spec are unchanged by them.
 
 **Size and cost.** The frozen original `ppo_race_0910` is 1.17 M actor parameters (2.25 M with its
 critic). A 128-wide GRU on both halves adds 460 k — 1.20× the parameters — and costs about a tenth
-of the actor's forward time. The deployment rule, the measurement protocol and the table are in
-[training.md](training.md#the-deployment-budget) and
-[the research note](research/memory-policy-2026-09-13.md).
+of the actor's forward time. The future head adds another 17 k parameters to a training job and
+nothing at all to the exported graph. The deployment rule, the measurement protocol and the table
+are in [training.md](training.md#the-deployment-budget) and
+[the research note](research/memory-policy-2026-09-13.md); what the future head is for, and the
+probe that measures it, are in [training.md](training.md#predicting-the-near-future---aux-future)
+and [its own note](research/future-head-2026-09-14.md).
 
 ## Raceline and teacher
 
