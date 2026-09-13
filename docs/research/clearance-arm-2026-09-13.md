@@ -22,6 +22,14 @@ does not produce it. What moved in the plan-margin distribution is its **lower t
 scan could see; the survivors still have almost no margin, and 169 of 256 trials still end in one.
 These tracks are hard.
 
+**In traffic**, on the same three clean held-out maps with a teacher-driven opponent and scripted
+brake / stop / shift events, 48 learner trials per arm: **car contacts 29 → 15 → 11** and **wall
+collisions 22 → 22 → 17** (`legacy` → `fixed_low` → `fixed_low+clearance`), completions **21 → 26 →
+30 of 48**, and **passes 37 → 40 → 42** with no lead ever lost. The arm does **not** buy that by
+backing off: the mean following gap changes by −0.06 m when the layer is added to `fixed_low`
+(3.95 → 3.89 m) and the mean gap inside the attacking window is flat across all three arms
+(1.77 / 1.76 / 1.80 m).
+
 ## The evidence it answers
 
 Root measured this on 2026-09-13 (`evidence_attr3_frozen.json`, frozen original
@@ -214,6 +222,84 @@ batched across environments and costs a fraction of this per car.
 
 <!-- /RESULTS -->
 
+## In traffic
+
+The table above is a solo measurement, and it is not the interesting half for a racing car. The arm
+sees opponents: other cars are traced into the LiDAR as porous meshes (`sim._car_boxes`,
+`lidar.HIT_CAR`), so an opponent's returns land in the same local occupancy a wall's do — sparser,
+because a porous hit can be dropped, but there. The same three clean held-out maps, `--race-size 2
+--opponent teacher --opp-events brake,stop,shift --opp-event-rate 3.0 --envs 32 --protocol trials
+--budget-laps 3 --seed 4401`, run through `evaluate.evaluate` itself:
+
+### all three
+
+| arm | completed | collided | car / wall | passes | lost | contention | following | attacking | pace | follow med m | follow p10 m | attack <1 m | speed m/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `legacy` | 7 / 16 | 9 | 6 / 10 | 13 | 0 | 80% | 51% | 26% | 1.86 | 2.99 | 1.21 | 16% | 4.55 |
+| `fixed_low` | 5 / 16 | 11 | 10 / 7 | 10 | 0 | 86% | 66% | 26% | 1.55 | 3.64 | 1.22 | 16% | 3.89 |
+| `fixed_low+clearance` | 9 / 16 | 7 | 6 / 4 | 12 | 0 | 80% | 57% | 24% | 1.83 | 3.38 | 1.18 | 18% | 3.95 |
+
+### map16x07
+
+| arm | completed | collided | car / wall | passes | lost | contention | following | attacking | pace | follow med m | follow p10 m | attack <1 m | speed m/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `legacy` | 4 / 16 | 12 | 18 / 9 | 4 | 0 | 96% | 85% | 42% | 1.49 | 3.02 | 1.22 | 14% | 3.67 |
+| `fixed_low` | 7 / 16 | 9 | 8 / 7 | 8 | 0 | 98% | 75% | 27% | 1.33 | 3.84 | 1.24 | 15% | 3.36 |
+| `fixed_low+clearance` | 7 / 16 | 9 | 9 / 8 | 10 | 0 | 98% | 69% | 26% | 1.43 | 3.59 | 1.34 | 16% | 3.18 |
+
+### control:9100
+
+| arm | completed | collided | car / wall | passes | lost | contention | following | attacking | pace | follow med m | follow p10 m | attack <1 m | speed m/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `legacy` | 10 / 16 | 6 | 3 / 8 | 18 | 0 | 80% | 45% | 22% | 1.78 | 3.02 | 0.92 | 23% | 4.97 |
+| `fixed_low` | 11 / 16 | 5 | 2 / 4 | 15 | 0 | 79% | 38% | 12% | 1.52 | 4.00 | 1.41 | 22% | 4.14 |
+| `fixed_low+clearance` | 13 / 16 | 3 | 1 / 2 | 15 | 0 | 76% | 38% | 14% | 1.64 | 3.64 | 1.36 | 17% | 4.05 |
+
+### iccas25
+
+| arm | completed | collided | car / wall | passes | lost | contention | following | attacking | pace | follow med m | follow p10 m | attack <1 m | speed m/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `legacy` | 7 / 16 | 9 | 8 / 5 | 15 | 0 | 90% | 50% | 26% | 1.48 | 2.94 | 0.82 | 23% | 4.71 |
+| `fixed_low` | 8 / 16 | 8 | 5 / 11 | 17 | 0 | 90% | 51% | 19% | 1.58 | 3.68 | 1.19 | 22% | 4.01 |
+| `fixed_low+clearance` | 10 / 16 | 6 | 1 / 7 | 17 | 0 | 87% | 47% | 17% | 1.53 | 3.74 | 1.22 | 20% | 3.92 |
+
+### The three maps pooled — 48 learner trials per arm
+
+| arm | completed / 48 | collided | car contacts | wall collisions | passes | leads lost | follow mean m | attack mean m | mean speed m/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `legacy` | 21 | 27 | 29 | 22 | 37 | 0 | 3.04 | 1.77 | 4.58 |
+| `fixed_low` | 26 | 22 | 15 | 22 | 40 | 0 | 3.95 | 1.76 | 3.89 |
+| `fixed_low+clearance` | 30 | 18 | 11 | 17 | 42 | 0 | 3.89 | 1.80 | 3.80 |
+
+`completed` / `collided` are first attempts and sum to the trial count; `car contacts` and `wall
+collisions` are `TrafficMeter`'s count over the whole rollout, including after an auto-reset, so
+they split what was hit rather than partitioning the trials. The `follow` columns are an addition:
+the arc gap to the nearest car ahead at every step the learner is following one, recorded by
+wrapping `TrafficTrace.update` inside the measuring process only.
+
+### What it does to following, and to a pass
+
+**The contacts fall and the passes do not.** Over 48 learner trials, car contacts go 29 → 15 → 11
+and wall collisions 22 → 22 → 17 — the friction clamp does nothing at all to the walls, and the
+geometry layer takes a fifth of them. Passes go 37 → 40 → 42, and `leads_lost` is 0 for every arm.
+
+**And it does not buy that by backing off.** The +0.9 m of following distance between `legacy` and
+`fixed_low` is the friction clamp driving a slower car. Adding this layer on top moves it −0.06 m,
+and inside the attacking window — where a pass is actually on — the mean gap is flat at
+1.77 / 1.76 / 1.80 m. The car is not sitting further back; it is arriving with a plan that no longer
+points at the other car.
+
+That is what the design predicts, and it is worth stating because a naive margin layer would do the
+opposite. The arm judges only the arc the tracker's own reference covers — 0.6 s, about 2.4 m at
+this pace — and acts only where a plan point comes within 0.34 m of a return. A car three to four
+metres ahead is outside the window entirely, so following it costs nothing; the arm engages at the
+moment the plan turns into the opponent, which is the moment the contact would have happened.
+
+**Sample size.** The `all three` row is one 32-env run over the three maps — 16 learner trials — and
+at that size the arms disagree with the 48-trial pooling (`fixed_low` reads 5/16 there against
+`legacy`'s 7/16, and 26/48 against 21/48 per map). The per-map runs are the same flags on each map
+alone; they are what the paragraphs above are read from.
+
 ## How to read the pace
 
 `mean speed` is over every active step of every first attempt, so it is not distorted by which
@@ -248,5 +334,11 @@ not record.
   it never saw.
 * **One lateral parameter.** The bend is a single curvature offset, so it can move the plan over but
   not reshape it. A gap that needs an S is out of reach, and what happens there is the speed cap.
+* **Traffic is 48 learner trials per arm on three maps.** Enough to see a factor-of-two change in
+  car contacts; not enough to separate a 40-from-42 change in passes from noise. The pass column
+  supports "nothing was given back", not "passing improved".
+* **An opponent is a porous target.** A car's returns can be dropped beam by beam, so its footprint
+  in the grid is sparser and more ragged than a wall's — the arm defends the same margin against a
+  noisier estimate of where the other car is.
 * **Not trained under.** Deliberately: the grip clamp's lesson was that a policy trained under a
   clamp learns to lean on it. Train legacy, deploy clamped.

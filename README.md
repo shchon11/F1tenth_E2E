@@ -160,7 +160,11 @@ On the eight held-out tracks with the policy frozen, `+clearance` takes collisio
 of 256 and completions from 79 to 110 on the `legacy` tracker, and from 182 to 169 and 105 to 130 on
 `fixed_low`, for 2–3 % of mean speed. The share of collisions whose plan had passed *through* an
 occupied cell falls from 26 % to 11 % (8 % on the composite) while the friction clamp alone barely
-moves it — the improvement is geometric
+moves it — the improvement is geometric. **In traffic** — the same maps with a teacher opponent and
+scripted brake / stop / shift events, 48 learner trials per arm — contacts with the other car go
+29 → 15 → 11 across `legacy` / `fixed_low` / `fixed_low+clearance` and wall collisions 22 → 22 → 17,
+while **passes go 37 → 40 → 42** with no lead lost: it is not bought by backing off, and the mean
+gap inside the attacking window is flat at 1.77 / 1.76 / 1.80 m
 ([clearance arm](docs/research/clearance-arm-2026-09-13.md)).
 
 On suite v1 with the policy frozen, `fixed_low` scored S 136/144, low-µ 43/48, A 43/64, O 42/64 at
