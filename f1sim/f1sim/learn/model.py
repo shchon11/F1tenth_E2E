@@ -297,15 +297,19 @@ class Actor(nn.Module):
         from the same `--seed`. Built after both, the head is the only thing the flag adds.
         """
         spec = future_spec(**future)
-        want = "memory" if self.memory is not None else "trunk"
+        # Which tensor the head reads follows from what this actor HAS, and it is the same tensor
+        # `future_input` returns -- including the case the addendum adds, where a motion branch
+        # exists and every auxiliary reads `h_dyn` alone rather than the main state.
+        want = ("motion" if self.has_motion else
+                ("memory" if self.memory is not None else "trunk"))
         if spec["source"] is not None and spec["source"] != want:
             raise ValueError(
-                f"future head source {spec['source']!r} does not match this actor: it "
-                f"{'has' if self.memory is not None else 'has no'} memory, so the head reads the "
+                f"future head source {spec['source']!r} does not match this actor, which reads the "
                 f"{want} state. A head trained on one cannot be rebuilt on the other -- its input "
                 f"is a different tensor of a different width.")
         spec["source"] = want
-        in_dim = self.memory.hidden_size if self.memory is not None else self.hidden_width
+        in_dim = (self.memory.motion.hidden_size if self.has_motion else
+                  (self.memory.hidden_size if self.memory is not None else self.hidden_width))
         self.future = FutureHead(in_dim, spec["width"])
         #: The RESOLVED spec, so `ActorCritic` records what was built rather than what was asked for.
         self.future_spec = dict(spec)

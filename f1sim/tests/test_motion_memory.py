@@ -168,6 +168,45 @@ def test_the_encoder_reads_the_recorded_rows_and_not_the_trailing_ones():
     assert one.actor.motion_input(scan).shape[1] == 1
 
 
+def test_the_future_head_moves_to_h_dyn_when_there_is_a_motion_branch():
+    """The addendum puts every auxiliary on `h_dyn`, the future head included.
+
+    Its input width follows, and the checkpoint records which tensor it was built over, so a head
+    trained on one cannot be silently rebuilt on the other.
+    """
+    torch.manual_seed(0)
+    m = ActorCritic(**SMALL, memory=memory_spec(hidden_size=32), scan_channels=CHAN,
+                    motion=motion_spec(hidden_size=16, channels=8),
+                    future_head={"k": 20, "width": 32}).eval()
+    assert m.meta["future_head"]["source"] == "motion"
+    assert m.actor.future.net[0].in_features == 16
+    scan, pro, _priv = inputs()
+    _mu, _g, _o, fut, _mot, h = m.actor.step_all(scan, pro, None, None)
+    assert fut.shape == (scan.shape[0], 7) and float(fut.abs().max()) == 0.0
+    assert torch.equal(m.actor.future_input(None, h), h[-1][:, 32:])
+    # and a head that recorded a different source is refused rather than reshaped
+    torch.manual_seed(0)
+    with pytest.raises(ValueError, match="does not match this actor"):
+        ActorCritic(**SMALL, memory=memory_spec(hidden_size=32), scan_channels=CHAN,
+                    motion=motion_spec(hidden_size=16, channels=8),
+                    future_head={"k": 20, "width": 32, "source": "memory"})
+
+
+def test_the_future_head_gradient_also_stops_at_the_motion_branch():
+    torch.manual_seed(0)
+    m = ActorCritic(**SMALL, memory=memory_spec(hidden_size=32), scan_channels=CHAN,
+                    motion=motion_spec(hidden_size=16, channels=8),
+                    future_head={"k": 20, "width": 32}).eval()
+    with torch.no_grad():
+        m.actor.future.net[2].weight.normal_(0.0, 0.1)
+    scan, pro, _priv = inputs()
+    _mu, _g, _o, fut, _mot, _h = m.actor.step_all(scan, pro, None, None)
+    fut.pow(2).mean().backward()
+    got = {n for n, p in m.named_parameters() if p.grad is not None and float(p.grad.abs().max()) > 0}
+    stray = {n for n in got if not (".memory.motion." in n or n.startswith("actor.future."))}
+    assert not stray, sorted(stray)
+
+
 # ------------------------------------------------------------------ off is off
 def test_the_flags_off_build_nothing():
     torch.manual_seed(0)
