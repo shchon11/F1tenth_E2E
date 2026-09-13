@@ -32,21 +32,23 @@ ANGLES = cl.beam_angles(N_BEAMS, FOV)
 MOUNT_X = 0.297
 
 
-def ray_scan(half_width=None, circles=(), batch=1, mount_x=MOUNT_X):
+def ray_scan(half_width=None, circles=(), batch=1, mount_x=MOUNT_X, walls=None):
     """A synthetic LiDAR frame, normalized the way `gym_env._norm_scan` normalizes a real one.
 
     Geometry is given in **base_link**, the frame the plan lives in -- `half_width` puts two
-    infinite walls at y = +-half_width and each circle is (x, y, r) -- and the rays are cast from
-    where the scanner actually is, `mount_x` ahead of it. Beams that reach nothing read 1.0, which
-    is "no return": the value the arm has to treat as unknown rather than as a wall at 10 m.
+    infinite walls at y = +-half_width, `walls` places them at signed offsets so a car can be off
+    centre between them, and each circle is (x, y, r) -- and the rays are cast from where the
+    scanner actually is, `mount_x` ahead of it. Beams that reach nothing read 1.0, which is "no
+    return": the value the arm has to treat as unknown rather than as a wall at 10 m.
     """
     sa, ca = torch.sin(ANGLES), torch.cos(ANGLES)
     r = torch.full((N_BEAMS,), float(RANGE_MAX))
-    if half_width is not None:
-        for sgn in (1.0, -1.0):
-            t = torch.where(sa * sgn > 1e-6, half_width / (sa * sgn).clamp_min(1e-6),
-                            torch.full_like(sa, 1e9))
-            r = torch.minimum(r, t)
+    for wy in (walls if walls is not None else
+               (() if half_width is None else (half_width, -half_width))):
+        sgn = 1.0 if wy > 0 else -1.0
+        t = torch.where(sa * sgn > 1e-6, abs(wy) / (sa * sgn).clamp_min(1e-6),
+                        torch.full_like(sa, 1e9))
+        r = torch.minimum(r, t)
     for bx, by, br in circles:
         cx, cy = bx - mount_x, by                       # the circle seen from the scanner
         b = ca * (-cx) + sa * (-cy)
@@ -240,16 +242,8 @@ def test_the_worst_point_of_a_plan_the_bend_cannot_move_does_not_freeze_the_choi
     does nothing on exactly the narrow floors it exists for -- so the score is the mean over the
     window, and the arm still edges away."""
     cs = cl.ClearanceSpec().validate()
-    # walls 0.29 m to the left and 1.31 m to the right: the car is hugging the left one
-    scan = ray_scan(half_width=None, circles=())
-    sa = torch.sin(ANGLES)
-    rng = torch.full((N_BEAMS,), float(RANGE_MAX))
-    for wy in (0.29, -1.31):
-        sgn = 1.0 if wy > 0 else -1.0
-        t = torch.where(sa * sgn > 1e-6, abs(wy) / (sa * sgn).clamp_min(1e-6),
-                        torch.full_like(sa, 1e9))
-        rng = torch.minimum(rng, t)
-    scan = (rng / RANGE_MAX).clamp(0.0, 1.0)[None]
+    # a 1.6 m corridor with the car 0.51 m off centre: 0.29 m to the left wall, 1.31 m to the right
+    scan = ray_scan(walls=(0.29, -1.31))
     d = cl.distance_field(cl.occupancy(scan, ANGLES, cs, RANGE_MAX), cs)
     out = cl.adjust(plan(curvature=0.0, v=4.5), torch.tensor([3.0]), torch.tensor([4.5]),
                     d, SPEC, cs, V_MAX)
