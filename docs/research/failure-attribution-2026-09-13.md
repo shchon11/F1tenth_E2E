@@ -85,9 +85,13 @@ Reading:
   while alongside or just behind the opponent — the pass squeezes the learner into the wall side
   it already keeps no margin from (§2).
 * **Contacts are side-by-side, closing at +1.5 m/s**: the learner is faster, draws level and
-  touches. Rear-ending a braking or stopped car essentially does not happen, and **no contact
-  follows an opponent event within a second**. The scripted behaviours built yesterday
-  (brake / stop / shift / weave) address a failure mode the data does not contain.
+  touches. Rear-ending a braking or stopped car essentially does not happen.
+* **Correction (opponent-diversity worker, 14:10):** the script's event detector read the wrong
+  `info["opp_event"]` key and never fired, so the "0 contacts within 1 s of an event" column above
+  is a bug, not a measurement. Re-run with the detector fixed: 4 of 10 contacts (40 %) fall within
+  1 s of an opponent event, against a **51 % base rate** of learner-steps spent inside an event at
+  rate 3.0. Events are therefore not enriched at contacts — the conclusion stands, the number was
+  wrong. Corrected table in `opponent-diversity-2026-09-13.md`.
 * The memory checkpoint passes more aggressively: fewer walls, more side contacts.
 
 So the opponent problem is the same margin problem seen from the side: lateral room during a pass.
