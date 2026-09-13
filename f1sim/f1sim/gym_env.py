@@ -869,11 +869,14 @@ class F1VecEnv:
             ev_speed, ev_off = self.events.speed_scale(), self.events.lateral_offset()
         out = action
         if self.pool is not None:
-            # No gradient, and on the observation the policy itself last saw: a pool opponent is a
-            # checkpoint driving the same car in the same race, not a privileged controller.
-            with torch.no_grad():
-                out = torch.where(self.pool_driven[:, None],
-                                  self.pool.act(self._last_obs, self.opp_driver), out)
+            obs = self._opponent_obs()
+            if obs is not None:
+                # No gradient, and on the observation the policy itself last saw: a pool opponent
+                # is a checkpoint driving the same car in the same race, not a privileged
+                # controller.
+                with torch.no_grad():
+                    out = torch.where(self.pool_driven[:, None],
+                                      self.pool.act(obs, self.opp_driver), out)
         if not self.teacher_any:
             return out
         if self.teacher is None:
@@ -905,6 +908,21 @@ class F1VecEnv:
             cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
             an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
         return torch.where(self.teacher_driven[:, None], an, out)
+
+    def _opponent_obs(self):
+        """The observation a pool opponent acts on, or None before one exists.
+
+        After `reset()` this is always the observation the caller was last handed, which is the one
+        the learner's own policy saw -- the pool is asked for its action at the top of `step()`,
+        before any new observation exists. None happens on exactly two kinds of step, both thrown
+        away by construction: `sim.warmup()`'s throw-away steps, and the one
+        `learn.graph_runtime.prepare_graph_runtime` takes to record the solver's arguments, neither
+        of which has run a reset yet. The pool sits those out rather than being handed a zeroed
+        observation, which would be a policy driving on a scan that says "no returns anywhere".
+        """
+        if self._last_obs is not None:
+            return self._last_obs
+        return None if self.last_result is None else self._obs(self.last_result)
 
     def follow_cap(self, state: torch.Tensor):
         """(is there a car within opp_follow_gap ahead of each car, the speed to hold behind it)."""
