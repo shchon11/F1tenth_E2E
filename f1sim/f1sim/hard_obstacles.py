@@ -40,7 +40,8 @@ CAR_HALF_W = 0.14
 ERODE_M = 0.25            # proof margin: a 0.6 m gap survives erosion with 0.1 m to spare
 GAP_FRAC = (0.55, 0.75)   # open share of the lane beside a pattern: the hand-built scenes leave
                           # 1.50-1.85 m of a 2.25-2.50 m lane (measured, scene_0912_2344/2355)
-GAP_MIN = 1.20            # never less than this, whatever the lane width
+GAP_MIN = 1.20            # floor where the lane is wide enough (>= 1.65 m)
+GAP_NARROW = 0.70         # floor on narrower lanes: 2.5 car widths
 BOX_W, BOX_D = 0.36, 0.30 # cardboard box: across the lane, along it
 SMALL = (0.10, 0.22)      # cone / small box footprint
 SMALL_SHARE = 0.35        # share of apex and cluster boxes drawn at 0.15-0.25 m
@@ -166,7 +167,11 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
             continue
         wl, wr = _lane_halves(occ0, res, origin, cl[i], nrm[i])
         width = wl + wr
-        g = max(GAP_MIN, width * float(rng.uniform(*gap_frac)))
+        # The open share is the rule; the 1.2 m floor only where the lane can afford it. On a
+        # 1.2-1.4 m lane (generated recipes with hoses, real:map16x07) that floor left no room for
+        # any box at all, so narrow lanes fall back to a 0.70 m floor -- 2.5 car widths.
+        g = width * float(rng.uniform(*gap_frac))
+        g = max(GAP_MIN, g) if width >= GAP_MIN + 0.45 else max(GAP_NARROW, g)
         if width - g < 0.30:                                       # nothing fits beside the gap
             continue
         boxes = []                                                   # (index offset [m], v_centre, sx, sy)
@@ -182,7 +187,8 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
                 v = (wl - (j + 0.5) * step_v) if side > 0 else (-wr + (j + 0.5) * step_v)
                 boxes.append((j * 0.5, v, BOX_D, min(BOX_W, step_v)))
         elif kind == "chicane":
-            g2 = max(GAP_MIN, width * float(rng.uniform(*gap_frac))); span2 = width - g2
+            g2 = width * float(rng.uniform(*gap_frac))
+            g2 = max(GAP_MIN, g2) if width >= GAP_MIN + 0.45 else max(GAP_NARROW, g2); span2 = width - g2
             lo, hi = (wl - span, wl) if side > 0 else (-wr, -wr + span)
             boxes += [(0.0, v, BOX_D, w) for v, w in _block(lo, hi, rng)]
             lo2, hi2 = (-wr, -wr + span2) if side > 0 else (wl - span2, wl)
