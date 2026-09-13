@@ -240,18 +240,135 @@ headroom for the Jetson to be slower than this CPU in ways a ratio on one machin
 `tests/test_memory_model.py::test_jetson_budget_ratio` asserts the rule. The measured table is in
 [the research note](research/memory-policy-2026-09-13.md).
 
-### Opponent behaviour events
+### Opponents: the situations, not the events
 
-A teacher opponent drives the raceline at a fixed speed scale and is blind to other cars apart from
-the follow-gap slowdown, so every opponent the policy meets poses the same problem: a slightly
-slower car holding the racing line. `--opp-events` gives the **teacher-driven** cars of a race
-scripted behaviour on top of that — a car that brakes, a car that has stopped, a car that moves
-across the lane:
+A race puts another car on the track. What the policy learns from it is not the car, it is the
+*situations* the car puts it in — and until 2026-09-13 there was one. `--opponent teacher` gave a
+raceline teacher at 0.6–1.0× that never looks at the learner; `--opponent policy` gave a copy of the
+learner; the learner always spawned at the **back**. So the training distribution contained "a
+slightly slower car ahead of me on the racing line", and nothing else. The measured failures in
+traffic are the other situations: side-by-side contacts closing at +1.5 m/s and walls hit while
+alongside or just behind the car being passed, with no contact ever following a scripted event
+([failure attribution §5](research/failure-attribution-2026-09-13.md)).
+
+Three flags widen it, and one tool says whether they worked.
+
+#### `--opp-pool` — a population instead of an opponent
 
 ```bash
-python3 -m f1sim.learn.ppo --race-size 2 --opponent teacher \
-    --opp-events brake,stop,shift --opp-event-rate 1.0
+python3 -m f1sim.learn.ppo --race-size 2 --opponent pool \
+    --opp-pool teacher,self,~/f1sim_runs/cl_origrecipe_legacy_s701/ppo_final.pt
 ```
+
+One entry is drawn per race from the simulator's own generator, so a seed reproduces which opponent
+the learner met in which race. An entry is a **checkpoint path**, `self` (the learner's own current
+weights — that race is self-play) or `teacher` (the raceline teacher, carrying whatever
+`--opp-events` are configured). Empty is off, and `--opponent pool` with an empty pool is refused
+rather than silently run as something else.
+
+A checkpoint is the one opponent that cannot be written down as a rule: it takes its own line
+through a corner because its own network decided to, it defends its position because being passed
+costs it reward, and it makes its own mistakes. Properties:
+
+* Loaded once, `eval()`, gradients off — a pool is not a second training job. It costs one extra
+  policy forward per entry per step over the whole env width (no `nonzero` compaction: selecting
+  rows would be a device sync every step, and a recurrent entry has to advance anyway).
+* An entry must already fit this env's observation and action space (`--scan-stack`,
+  `--scan-stride`, `--hist-len`, `--action-mode`); a mismatch is refused by name rather than
+  reshaped, because reshaping would put a half-reinitialised driver in the other car.
+* `--opp-speed` can only *slow* a pool car, through its speed cap. Being overtaken by one is a
+  question of the grid, not of a cap.
+* A pool without `self` can never put a policy-driven car in an opponent slot, so the PPO buffers
+  stay narrow there instead of being half masked out of every update.
+
+#### Reactive behaviour — `defend`, `yield`, `line`, `oblivious`
+
+The four names below join `brake, stop, shift, weave` in the same `--opp-events` list, and are a
+different kind of thing: not timed events a car falls into, but **dispositions** drawn per
+teacher-driven car per race, each with its own probability, each reading the learner's position
+relative to that car every step.
+
+| behaviour | what the opponent does | flags |
+|---|---|---|
+| `defend` | while a learner is within `--opp-defend-range` (0 = the env's 12 m `overtake_range`) **behind**, moves its line toward the side that learner is coming down — full amplitude inside `--opp-defend-full`, ramping to nothing at the far edge | `--opp-defend-prob`, `--opp-defend-offset`, `--opp-defend-range`, `--opp-defend-full` |
+| `yield` | with a learner **alongside**, moves away from it | `--opp-yield-prob`, `--opp-yield-offset` |
+| `line` | drives an out-in or in-out offset sweep through each corner, mode and amplitude drawn **per corner** — so the opponent is simply not on the line the learner's model of it assumes | `--opp-line-prob`, `--opp-line-offset`, `--opp-corner-kappa/-min-arc/-smooth` |
+| `oblivious` | the `opp_follow_gap` slowdown is switched off: it does not brake for a car ahead or beside it. **This is the car that rams** | `--opp-oblivious-prob` |
+
+"Alongside" is `--opp-alongside-lon` (0.8 m of body-frame longitudinal offset; the bodies are 0.58 m
+long) and `--opp-alongside-lat`. The same definition is what `learn.opponent_census` counts, from
+the same code (`gym_env.learner_view`) — a behaviour that reacts to one "alongside" and a census
+that reports another is exactly the failure the census exists to rule out.
+
+The three offset behaviours share one output, summed, then capped at `--opp-react-max` (0.45 m) and
+rate-limited to `--opp-react-slew` (0.6 m/s), and then clamped by the lane's own free space — the
+same budget the scripted offsets use, so a reactive offset can no more reach a wall than a `shift`
+can. `oblivious` produces no offset; it removes the follow cap rather than raising a command through
+it, so the invariant "an event never lifts an opponent over its follow-gap cap" is untouched.
+
+Each is off at probability 0, and `--opp-events defend` without `--opp-defend-prob` is refused: a
+named behaviour at probability 0 is the unflagged run wearing another run's name.
+
+#### `--spawn-order` — where the learner starts
+
+`behind` (the default, and every race trained before this), `ahead`, `alongside`, or `random` drawn
+per race. It applies to a race whose other cars are not the learner itself; in a self-play race
+every car is the learner, so only `alongside` is a different grid there.
+
+* `ahead` is the only way the learner is ever the car **being overtaken**, and it needs a faster
+  opponent to be one: `--opp-speed` above 1.0 is allowed and means a teacher driving above its own
+  raceline profile. Measured, 1.0–1.3× costs no opponent wall collisions on these tracks; the
+  profile already plans at the grip limit, so much above that is a car leaving the road, and the
+  census reports opponent wall contacts so the ceiling is measured rather than assumed.
+* `alongside` puts the cars abreast, which is where the contacts measured in traffic actually
+  happen. The lateral separation is what the track's own distance field has room for at each car's
+  spawn point, sized against the **rotated** footprint (the spawn yaw jitter is cut to
+  `spawn_alongside_yaw` for an abreast row, since cars on a grid are lined up with the track); where
+  two bodies do not fit, that race spawns staggered instead. Two cars spawned in contact terminate
+  on step 1, so this is decided per race, not per car.
+* `--race-size 3` works with all of it. The spawn arc is cumulative — each car sits its own
+  `--spawn-gap` behind the car in front of it — rather than `rank × gap`, which scrambled a grid of
+  three whenever the draws differed.
+
+#### Measuring it: `python -m f1sim.learn.opponent_census`
+
+Training against a behaviour and never measuring it is how a recipe gets adopted on a number that
+does not cover the thing it changed. The events work before this one was accepted on "it fires":
+37 events in 32 races. That is the wrong bar — an event that fires while the learner is 40 m away is
+not a lesson. The census runs N races with a given configuration and reports, per situation, **how
+many learner-seconds were spent in it**:
+
+```bash
+python3 -m f1sim.learn.opponent_census "$CKPT" --races 32 --steps 1200 --device cuda \
+    --tracks 'real:blackbox2022_1,gen:control:1400' \
+    --race-size 2 --opponent pool --opp-pool teacher,self,A.pt \
+    --opp-events defend,yield,line,oblivious \
+    --opp-defend-prob 0.5 --opp-yield-prob 0.35 --opp-line-prob 0.5 --opp-oblivious-prob 0.3 \
+    --spawn-order random --opp-speed 0.6 1.2 --out census.json
+```
+
+It takes **the same flags as the trainer**, out of one shared parser group
+(`learn/opponent_config.py`), so the configuration it measures is a configuration `ppo` can build.
+The seven rows are behind a slower car, alongside, being overtaken, defended against, yielded to, an
+oblivious car closing from behind, and two opponents in range; context rows below them name which
+kind of opponent was nearest and which grids were drawn. Each row carries seconds, the share of
+learner-seconds, and how many of the learner's cars ever saw it — a situation that happens a lot in
+one race and never in the other thirty-one is not a distribution either.
+
+"Learner-seconds" are seconds driven by a car the policy drives *and* whose transitions the update
+would use, which is slot 0 in `teacher` mode and every self-play car in `mixed` and pool-with-`self`.
+
+The same rollouts carry a second report, which is analysis and not a reward change: the distribution
+of the `car_proximity` reward per step and of the body-to-body lateral gap while alongside. Recipe A
+charges `--car-proximity-penalty 0.8` below `--car-safe-gap 0.9`, and the question is whether that
+term produces any signal in the situations that matter. See
+[the research note](research/opponent-diversity-2026-09-13.md) for the measured table.
+
+#### Timed events (`brake`, `stop`, `shift`, `weave`)
+
+Unchanged, and still what `--opp-event-rate` drives: the expected number of events per teacher
+opponent per 10 s. Events never overlap, so the realised rate is a little below the flag (at rate
+1.0 with ~1.7 s events, about 0.85).
 
 | event   | what the opponent does | drawn from |
 |---------|------------------------|------------|
@@ -260,40 +377,36 @@ python3 -m f1sim.learn.ppo --race-size 2 --opponent teacher \
 | `shift` | tracks the raceline offset by `o` m: ramp in, hold, ramp out — a lane change / blocking line | `--opp-shift-offset` (\|o\|, sign drawn separately), `--opp-shift-hold`, `--opp-shift-ramp` |
 | `weave` | sinusoidal lateral offset | `--opp-weave-amp`, `--opp-weave-period`, `--opp-weave-time` |
 
-`--opp-event-rate` is the expected number of events per opponent per 10 s of driving. Events never
-overlap, so the realised rate is a little below the flag (at rate 1.0 with ~1.7 s events, about
-0.85). `--opp-event-margin` is the body-to-wall gap kept when an event moves a car off the line.
+`--opp-event-margin` is the body-to-wall gap kept when any offset — scripted or reactive — moves a
+car off the line.
 
-Three properties the flags rely on:
+#### The properties all of it rests on
 
-* **Off is off.** Without `--opp-events` nothing is stepped and nothing is drawn from the
-  simulator's generator, so an unflagged run is bit-identical to the same run before the feature
-  existed (`f1sim/tests/test_opponent_events.py`).
-* **The events only ever slow a car down**, and the multiplier is applied *before* the
-  `opp_follow_gap` cap, so an opponent already braking for the car ahead never accelerates because
-  an event told it to.
-* **The lateral offset cannot reach a wall.** It is clamped per raceline point against the track's
-  own distance field (free space − car half-width − `--opp-event-margin`), so a 0.35 m lane change
-  through a 1.6 m section becomes as much of one as fits.
+* **Off is off.** With no `--opp-events`, no `--opp-pool` and `--spawn-order behind`, nothing here
+  is stepped and nothing is drawn from the simulator's generator: a rollout is bit-identical to the
+  same rollout on the code before any of it existed, for `--opponent policy`, `teacher` and `mixed`
+  alike, and so is a rollout with the timed events on (`tests/test_opponent_events.py`,
+  `tests/test_opponent_diversity.py`). Every checkpoint, benchmark number and report on this branch
+  was measured on that path.
+* **Behaviour is teacher-only.** A pool checkpoint drives itself; the scripted and reactive layers
+  act on teacher-driven cars, never on a car the policy is driving, so no PPO transition ever
+  carries an action the policy did not produce. `--opp-events` with no teacher-driven car anywhere
+  (solo, `--opponent policy`, or a pool with no `teacher` entry) is refused.
+* **No offset can reach a wall.** Scripted plus reactive are summed and clamped per raceline point
+  against the track's distance field (free space − car half-width − `--opp-event-margin`).
+* **Nobody spawns in contact.** Measured over 512–528 spawns per grid per track at
+  `--race-size 2` and `3`: zero.
+* **Each step, `info["opp_event"]`** reports `id` (0 = none, otherwise the 1-based index into
+  `brake, stop, shift, weave, defend, yield, line, oblivious`), `time_left`, the `offset` in metres,
+  and two bitmasks — `react` (which reactive behaviours are acting right now) and `disposition`
+  (which this car was given for the race) — for a viewer, a logger or the census.
 
-Events are teacher-only: with `--opponent mixed` they apply to the teacher races and never to a car
-the policy is driving, and `--opp-events` with `--race-size 1` or `--opponent policy` is refused
-rather than silently ignored. Each step, `info["opp_event"]` reports `id` (0 = none, otherwise the
-1-based index into `brake, stop, shift, weave`), `time_left` in seconds and the `offset` in metres
-each car is holding, for a viewer or a logger.
-
-**Evaluating against them.** Training against a behaviour and never measuring it is how a recipe
-gets adopted on a number that does not cover the thing it changed. Two places measure it now:
-
-* `python3 -m f1sim.learn.evaluate --race-size 2 --opponent teacher --opp-events brake,stop,shift
-  --opp-event-rate 3` takes the same flags and reports the traffic metrics — passes, pace against
-  the opponent, engagement time, contacts — under `traffic` in every result, `--per-track`
-  included. Quick check, no roster, no freeze, not a benchmark score.
-* The benchmark's **T (traffic) family**, frozen as suite v2.1, is the scored version: brake / stop
-  / shift at 3.0 per opponent per 10 s is one of its four scenarios, on five held-out maps at two
-  friction levels. See [the benchmark's traffic family](benchmark.md#the-t-traffic-family). The
-  scenario's event rate is chosen so that an event actually lands while the learner is in
-  contention, which is measured rather than assumed.
+**Evaluating against them.** `python3 -m f1sim.learn.evaluate --race-size 2 --opponent teacher
+--opp-events brake,stop,shift --opp-event-rate 3` reports the traffic metrics (passes, pace against
+the opponent, engagement time, contacts) under `traffic` in every result. The benchmark's **T
+(traffic) family**, frozen as suite v2.1, is the scored version: brake / stop / shift at 3.0 per
+opponent per 10 s is one of its four scenarios, on five held-out maps at two friction levels — see
+[the benchmark's traffic family](benchmark.md#the-t-traffic-family).
 
 ## Evaluation
 
