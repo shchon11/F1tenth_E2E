@@ -349,6 +349,35 @@ and the two arms do not even share their GRU initialisation (below).
 **The channel costs nothing measurable in training.** 335 median env steps/s either way at 63 envs;
 its cost is in the per-step inference budget, where it is 0.57 ms (see Budget), not in the rollout.
 
+### What the channel did to the probe
+
+The two smoke checkpoints go back through the E1 table as two more columns, same protocol, same
+seeds, same splits (`work/e1/e1.md`). Median R² over the 16 draws, with the earlier arms for scale:
+
+| median R² | `gru_warm` (random GRU) | `gru_trained` (8 upd) | **`e2_raw`** (131 upd) | **`e2_aligned`** (131 upd) |
+|---|---|---|---|---|
+| **Δv_x** | +0.185 | +0.112 | **+0.188** | **+0.230** |
+| **Δv_y** | +0.132 | +0.178 | **+0.139** | **+0.150** |
+| Δx | +0.235 | +0.241 | +0.217 | +0.152 |
+| Δy | +0.190 | +0.202 | +0.185 | +0.271 |
+
+**Alignment alone did not move Δv.** The gap is +0.042 on Δv_x and +0.011 on Δv_y — inside the ±0.07
+that separates `gru_warm` from `gru_trained`, two arms this table already calls indistinguishable.
+On the mean rather than the median it is +0.005. The threshold was written down before these columns
+existed (`work/e3/decide.md`), so this is the rule firing and not a line drawn afterwards.
+
+Two things belong beside that, and neither of them rescues it:
+
+* **The channel arrives as zero-initialised input columns.** At update 1 the network ignores them by
+  construction — that is what makes the warm start bit-identical — and it has 131 updates to learn
+  to use three new rows. A null here is strong evidence about the *budget* and weak evidence about
+  the idea. It is also precisely the argument for E3: a loss that asks a branch for the opponent's
+  motion does not wait for PPO to discover that an input is worth reading.
+* **`e2_raw` lands on top of `gru_warm`** (+0.188 against +0.185). A hundred and thirty-one updates
+  of PPO left Δv_x exactly where an untrained recurrence already had it — the same finding the E1
+  ladder gave, now with training rather than by construction, and the premise the whole contract is
+  testing.
+
 ### The second table: the racing proxy
 
 The addendum asks for this separately from the representation, so that *"Δv R² up but racing flat"*
