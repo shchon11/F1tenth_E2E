@@ -395,3 +395,68 @@ def test_the_beam_mask_is_all_zero_when_there_is_no_other_car():
     env.reset(seed=3)
     env.step(torch.zeros(4, env.act_dim))
     assert float(env.opponent_beam_mask().abs().max()) == 0.0
+
+
+# ------------------------------------------------------------------ end to end
+CLI_REFUSALS = [
+    (["--motion-memory"], "needs --memory gru"),
+    (["--memory", "gru", "--motion-memory"], "reads the aligned rows"),
+    (["--memory", "gru", "--scan-channels", "aligned", "--aux-opp-mask", "1.0"],
+     "no branch without --motion-memory"),
+    (["--memory", "gru", "--scan-channels", "memory,edges", "--motion-memory"],
+     "reads the aligned rows"),
+]
+
+
+@pytest.mark.parametrize("argv,message", CLI_REFUSALS)
+def test_the_cli_refuses_a_motion_branch_with_nothing_to_read(monkeypatch, argv, message):
+    """Each of these would produce a run that looks like the one it is named after and is not."""
+    import sys
+    from f1sim.learn import ppo
+    monkeypatch.setattr(sys, "argv", ["ppo", "--name", "t", "--device", "cpu"] + argv)
+    with pytest.raises(SystemExit) as e:
+        ppo.main()
+    assert message in str(e.value), e.value
+
+
+def test_a_whole_update_runs_with_every_flag_on(monkeypatch, tmp_path):
+    """Two PPO updates through `main()` with the channel and both auxiliaries on.
+
+    Not a result -- two updates on six cars is nothing. What it catches is the class of mistake the
+    unit tests above cannot see, because it lives in the trainer's own plumbing rather than in a
+    module: a buffer that is not filled, a label that is not aligned, a minibatch that is sliced
+    wrong, or a local name that shadows another. One did exactly that -- the beam-mask label's flat
+    view was called `f_mask`, which is the on-policy sample weight twenty lines above it, so every
+    arm WITHOUT the mask lost its weights to a None. Nothing short of running the loop would have
+    found it.
+    """
+    import sys
+    from f1sim.learn import ppo
+    monkeypatch.setenv("F1SIM_RUNS", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", [
+        "ppo", "--name", "motion_smoke", "--device", "cpu", "--sim-backend", "eager",
+        "--tracks", "gen:competition:0", "--envs", "6", "--race-size", "3", "--opponent", "policy",
+        "--action-mode", "plan", "--horizon", "4", "--minibatch", "12", "--epochs", "1",
+        "--total", "48", "--critic-warmup", "0", "--episode-s", "5.0",
+        "--scan-stack", "6", "--hist-len", "20", "--wandb", "disabled", "--save-every", "1000",
+        "--memory", "gru", "--memory-hidden", "16",
+        "--scan-channels", "memory,edges,aligned,aligned_prev,aligned_valid",
+        "--motion-memory", "--motion-hidden", "8", "--motion-channels", "8",
+        "--aux-opp-mask", "1.0", "--aux-motion", "1.0",
+        # k = 2 rather than the default 20: the label for step t is the state at t + k, and a
+        # four-step chunk cannot reach twenty. The trainer refuses the combination, which is
+        # its own test above; here the point is to run the term, not to argue with it.
+        "--aux-future", "1.0", "--aux-future-k", "2",
+        "--aux-grip", "1.0", "--aux-opp", "1.0",
+        "--metrics-jsonl", str(tmp_path / "m.jsonl"),
+    ])
+    ppo.main()
+    import json
+    rows = [json.loads(l) for l in open(tmp_path / "m.jsonl")]
+    assert rows, "the run logged nothing"
+    last = rows[-1]
+    for key in ("loss/aux_opp_mask", "loss/aux_motion_mse", "loss/aux_future_mse"):
+        assert key in last and np.isfinite(last[key]), (key, last.get(key))
+    # the mask head is scored on a real label, so its own diagnostics have to be there and sane
+    assert 0.0 <= last["loss/aux_opp_mask/mask_pos_rate"] <= 1.0
+    assert 0.0 <= last["loss/aux_opp_mask/mask_recall"] <= 1.0

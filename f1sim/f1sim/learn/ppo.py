@@ -23,7 +23,8 @@ import time
 import numpy as np
 import torch
 
-from ..gym_env import EnvConfig, FUTURE_LABEL_DIM, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS
+from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX,
+                       PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS)
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
@@ -653,8 +654,11 @@ def main():
     #: was, down to the state dict. A checkpoint that already carries one keeps it (the loaders read
     #: `meta`), so a resume does not have to repeat the flag to keep the head -- but it does have to
     #: repeat it to keep TRAINING the head, which is what the coefficient is.
-    fut_cfg = (future_spec(k=a.aux_future_k, width=a.aux_future_width,
-                           source=("memory" if mem_cfg else "trunk"))
+    #: `source=None`: which tensor the head reads follows from what the actor HAS, and the actor
+    #: fills it in (`Actor.attach_future`). Naming it here was right while there were two
+    #: possibilities and wrong as soon as there were three -- with a motion branch the head reads
+    #: `h_dyn`, and a spec that said "memory" would be refused by the actor it was built for.
+    fut_cfg = (future_spec(k=a.aux_future_k, width=a.aux_future_width)
                if a.aux_future > 0 else None)
     if fut_cfg and future_labelled_fraction(a.horizon, a.aux_future_k) <= 0.0:
         raise SystemExit(f"--aux-future-k {a.aux_future_k} needs --horizon > {a.aux_future_k - 1} "
@@ -1141,7 +1145,9 @@ def main():
         # No alignment and no boundary mask, because k = 0 crosses nothing.
         dv_tgt = (buf_fut_lab[:T][..., [2, 3, FUTURE_PRESENT_INDEX]] if dv_on else None)
         f_dv = dv_tgt.reshape(n, 3) if dv_tgt is not None else None
-        f_mask = buf_mask_lab.reshape(n, spec.n_beams) if buf_mask_lab is not None else None
+        # NOT `f_mask`: that is the on-policy sample weight, twenty lines up, and shadowing it
+        # replaces every minibatch's weights with None the moment this label is absent.
+        f_beam = buf_mask_lab.reshape(n, spec.n_beams) if buf_mask_lab is not None else None
         # advantage statistics over the policy's own samples only; a teacher-driven car's advantages
         # are not the policy's and would otherwise set the scale everything else is normalised by
         w_all = f_mask / f_mask.sum().clamp_min(1.0)
@@ -1186,7 +1192,7 @@ def main():
                     c_mb = f_cond[idx] if cond_dim else None   # the stored one, never recomputed
                     fut_mb = f_fut[idx] if f_fut is not None else None
                     fut_valid_mb = f_fut_valid[idx] if f_fut_valid is not None else None
-                    mask_mb = f_mask[idx] if f_mask is not None else None
+                    mask_mb = f_beam[idx] if f_beam is not None else None
                     dv_mb = f_dv[idx] if f_dv is not None else None
                 # NOT `out`: that is the run directory, twenty lines below, and shadowing it makes
                 # a run that trains perfectly and then cannot write its checkpoint.
