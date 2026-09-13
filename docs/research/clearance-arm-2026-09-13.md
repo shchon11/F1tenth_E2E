@@ -136,6 +136,65 @@ batched across environments and costs a fraction of this per car.
 
 <!-- RESULTS -->
 
+### Per track — collisions / completions of 32
+
+| track | `legacy` | `clearance` |
+| --- | --- | --- |
+| `scene:scene_0912_2355` | 32 / 2 | 29 / 11 |
+| `scene:scene_0912_2355+hard1` | 32 / 0 | 30 / 4 |
+| `real:map16x07+hard2` | 31 / 5 | 28 / 10 |
+| `real:map12x16+hard3` | 32 / 4 | 32 / 1 |
+| `gen:control:9100+hard4` | 18 / 22 | 19 / 24 |
+| `real:korea_2025_iccas+hard5` | 28 / 10 | 27 / 20 |
+| `real:map16x07` | 25 / 19 | 21 / 20 |
+| `real:map12x16` | 25 / 17 | 17 / 20 |
+
+### Per track — the plan's margin at the collisions it did have [m], median
+
+| track | `legacy` | `clearance` |
+| --- | --- | --- |
+| `scene:scene_0912_2355` | 0.085 | 0.410 |
+| `scene:scene_0912_2355+hard1` | 0.014 | 0.235 |
+| `real:map16x07+hard2` | 0.040 | 0.040 |
+| `real:map12x16+hard3` | -0.140 | -0.040 |
+| `gen:control:9100+hard4` | 0.018 | 0.040 |
+| `real:korea_2025_iccas+hard5` | 0.001 | -0.040 |
+| `real:map16x07` | 0.010 | 0.060 |
+| `real:map12x16` | -0.090 | 0.010 |
+
+### Per track — pace: mean speed [m/s] over first attempts, and median lap time [s] of the trials that completed
+
+| track | `legacy` speed | `legacy` lap (n) | `clearance` speed | `clearance` lap (n) |
+| --- | --- | --- | --- | --- |
+| `scene:scene_0912_2355` | 4.37 | 14.48 (2) | 4.18 | 15.55 (11) |
+| `scene:scene_0912_2355+hard1` | 4.39 | — (0) | 4.15 | 15.73 (4) |
+| `real:map16x07+hard2` | 3.81 | 7.90 (5) | 3.73 | 8.23 (10) |
+| `real:map12x16+hard3` | 3.87 | 8.48 (4) | 3.80 | 8.50 (1) |
+| `gen:control:9100+hard4` | 4.92 | 10.83 (22) | 4.72 | 11.15 (24) |
+| `real:korea_2025_iccas+hard5` | 4.74 | 8.40 (10) | 4.58 | 8.70 (20) |
+| `real:map16x07` | 3.90 | 7.90 (19) | 3.83 | 7.88 (20) |
+| `real:map12x16` | 4.01 | 7.75 (17) | 3.93 | 7.78 (20) |
+
+### Pooled over the eight tracks
+
+| arm | collisions / 256 | completed | plan margin median | p25 | share < 0.10 m | share through occupied | mean speed m/s | median lap s (n) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `legacy` | 223 / 256 | 79 | 0.001 | -0.140 | 85% | 26% | 4.25 | 8.94 (79) |
+| `clearance` | 203 / 256 | 110 | 0.010 | -0.040 | 78% | 11% | 4.12 | 9.81 (110) |
+
+### What the arm did (mean over the eight tracks)
+
+| metric | clearance |
+| --- | --- |
+| `controller/clearance_bent_frac` | 0.191 |
+| `controller/clearance_plan_margin_after` | 0.164 |
+| `controller/clearance_plan_margin_before` | 0.142 |
+| `controller/clearance_shift_mean` | 0.043 |
+| `controller/clearance_slowed_frac` | 0.134 |
+| `controller/clearance_speed_cut_mean` | 0.805 |
+
+<!-- /RESULTS -->
+
 ## Limitations, stated
 
 * **The backward pass is optimistic under `fixed_low`.** It assumes 3.3 m/s², the deceleration the
