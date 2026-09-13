@@ -11,6 +11,17 @@ part of the simulator.
 Module: [`f1sim/learn/clearance.py`](../../f1sim/f1sim/learn/clearance.py). Arm names:
 `clearance`, `fixed_low+clearance`, and the same two with `+tcs`.
 
+**Headline.** On the frozen original over 256 held-out trials, with the policy untouched:
+`legacy` → `clearance` is **223 → 203 collisions and 79 → 110 completions** for 3.1 % of mean speed;
+`fixed_low` → `fixed_low+clearance` is **182 → 169 and 105 → 130** for 2.5 %. The share of
+collisions whose plan had passed *through* an occupied cell falls **26 % → 11 %** and **24 % → 8 %**,
+while `fixed_low` alone moves it 26 % → 24 % — the improvement is geometric, and a friction clamp
+does not produce it. What moved in the plan-margin distribution is its **lower tail**: p25 goes from
+−0.140 m, a plan a full body radius inside an obstacle, to −0.028 m. The **median** barely moves,
+0.001 → 0.018 m. The arm removed the class of collision where the plan was aimed into something the
+scan could see; the survivors still have almost no margin, and 169 of 256 trials still end in one.
+These tracks are hard.
+
 ## The evidence it answers
 
 Root measured this on 2026-09-13 (`evidence_attr3_frozen.json`, frozen original
@@ -138,42 +149,42 @@ batched across environments and costs a fraction of this per car.
 
 ### Per track — collisions / completions of 32
 
-| track | `legacy` | `clearance` |
-| --- | --- | --- |
-| `scene:scene_0912_2355` | 32 / 2 | 29 / 11 |
-| `scene:scene_0912_2355+hard1` | 32 / 0 | 30 / 4 |
-| `real:map16x07+hard2` | 31 / 5 | 28 / 10 |
-| `real:map12x16+hard3` | 32 / 4 | 32 / 1 |
-| `gen:control:9100+hard4` | 18 / 22 | 19 / 24 |
-| `real:korea_2025_iccas+hard5` | 28 / 10 | 27 / 20 |
-| `real:map16x07` | 25 / 19 | 21 / 20 |
-| `real:map12x16` | 25 / 17 | 17 / 20 |
+| track | `legacy` | `clearance` | `fixed_low` | `fixed_low+clearance` |
+| --- | --- | --- | --- | --- |
+| `scene:scene_0912_2355` | 32 / 2 | 29 / 11 | 30 / 6 | 23 / 12 |
+| `scene:scene_0912_2355+hard1` | 32 / 0 | 30 / 4 | 29 / 6 | 28 / 7 |
+| `real:map16x07+hard2` | 31 / 5 | 28 / 10 | 30 / 6 | 27 / 9 |
+| `real:map12x16+hard3` | 32 / 4 | 32 / 1 | 32 / 0 | 32 / 3 |
+| `gen:control:9100+hard4` | 18 / 22 | 19 / 24 | 13 / 21 | 14 / 22 |
+| `real:korea_2025_iccas+hard5` | 28 / 10 | 27 / 20 | 23 / 21 | 19 / 26 |
+| `real:map16x07` | 25 / 19 | 21 / 20 | 16 / 21 | 12 / 26 |
+| `real:map12x16` | 25 / 17 | 17 / 20 | 9 / 24 | 14 / 25 |
 
 ### Per track — the plan's margin at the collisions it did have [m], median
 
-| track | `legacy` | `clearance` |
-| --- | --- | --- |
-| `scene:scene_0912_2355` | 0.085 | 0.410 |
-| `scene:scene_0912_2355+hard1` | 0.014 | 0.235 |
-| `real:map16x07+hard2` | 0.040 | 0.040 |
-| `real:map12x16+hard3` | -0.140 | -0.040 |
-| `gen:control:9100+hard4` | 0.018 | 0.040 |
-| `real:korea_2025_iccas+hard5` | 0.001 | -0.040 |
-| `real:map16x07` | 0.010 | 0.060 |
-| `real:map12x16` | -0.090 | 0.010 |
+| track | `legacy` | `clearance` | `fixed_low` | `fixed_low+clearance` |
+| --- | --- | --- | --- | --- |
+| `scene:scene_0912_2355` | 0.085 | 0.410 | 0.160 | 0.410 |
+| `scene:scene_0912_2355+hard1` | 0.014 | 0.235 | 0.160 | 0.110 |
+| `real:map16x07+hard2` | 0.040 | 0.040 | 0.025 | 0.010 |
+| `real:map12x16+hard3` | -0.140 | -0.040 | -0.115 | -0.028 |
+| `gen:control:9100+hard4` | 0.018 | 0.040 | 0.040 | 0.042 |
+| `real:korea_2025_iccas+hard5` | 0.001 | -0.040 | -0.028 | -0.028 |
+| `real:map16x07` | 0.010 | 0.060 | 0.060 | 0.050 |
+| `real:map12x16` | -0.090 | 0.010 | -0.040 | 0.014 |
 
 ### Per track — pace: mean speed [m/s] over first attempts, and median lap time [s] of the trials that completed
 
-| track | `legacy` speed | `legacy` lap (n) | `clearance` speed | `clearance` lap (n) |
-| --- | --- | --- | --- | --- |
-| `scene:scene_0912_2355` | 4.37 | 14.48 (2) | 4.18 | 15.55 (11) |
-| `scene:scene_0912_2355+hard1` | 4.39 | — (0) | 4.15 | 15.73 (4) |
-| `real:map16x07+hard2` | 3.81 | 7.90 (5) | 3.73 | 8.23 (10) |
-| `real:map12x16+hard3` | 3.87 | 8.48 (4) | 3.80 | 8.50 (1) |
-| `gen:control:9100+hard4` | 4.92 | 10.83 (22) | 4.72 | 11.15 (24) |
-| `real:korea_2025_iccas+hard5` | 4.74 | 8.40 (10) | 4.58 | 8.70 (20) |
-| `real:map16x07` | 3.90 | 7.90 (19) | 3.83 | 7.88 (20) |
-| `real:map12x16` | 4.01 | 7.75 (17) | 3.93 | 7.78 (20) |
+| track | `legacy` speed | `legacy` lap (n) | `clearance` speed | `clearance` lap (n) | `fixed_low` speed | `fixed_low` lap (n) | `fixed_low+clearance` speed | `fixed_low+clearance` lap (n) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `scene:scene_0912_2355` | 4.37 | 14.48 (2) | 4.18 | 15.55 (11) | 3.72 | 18.65 (6) | 3.65 | 17.80 (12) |
+| `scene:scene_0912_2355+hard1` | 4.39 | — (0) | 4.15 | 15.73 (4) | 3.67 | 19.77 (6) | 3.57 | 18.23 (7) |
+| `real:map16x07+hard2` | 3.81 | 7.90 (5) | 3.73 | 8.23 (10) | 3.29 | 10.43 (6) | 3.25 | 9.63 (9) |
+| `real:map12x16+hard3` | 3.87 | 8.48 (4) | 3.80 | 8.50 (1) | 3.22 | — (0) | 3.19 | 10.43 (3) |
+| `gen:control:9100+hard4` | 4.92 | 10.83 (22) | 4.72 | 11.15 (24) | 4.18 | 12.58 (21) | 4.08 | 12.48 (22) |
+| `real:korea_2025_iccas+hard5` | 4.74 | 8.40 (10) | 4.58 | 8.70 (20) | 4.03 | 9.85 (21) | 3.87 | 9.88 (26) |
+| `real:map16x07` | 3.90 | 7.90 (19) | 3.83 | 7.88 (20) | 3.37 | 9.20 (21) | 3.29 | 9.10 (26) |
+| `real:map12x16` | 4.01 | 7.75 (17) | 3.93 | 7.78 (20) | 3.44 | 9.13 (24) | 3.37 | 9.28 (25) |
 
 ### Pooled over the eight tracks
 
@@ -181,26 +192,50 @@ batched across environments and costs a fraction of this per car.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `legacy` | 223 / 256 | 79 | 0.001 | -0.140 | 85% | 26% | 4.25 | 8.94 (79) |
 | `clearance` | 203 / 256 | 110 | 0.010 | -0.040 | 78% | 11% | 4.12 | 9.81 (110) |
+| `fixed_low` | 182 / 256 | 105 | 0.010 | -0.090 | 74% | 24% | 3.62 | 11.20 (105) |
+| `fixed_low+clearance` | 169 / 256 | 130 | 0.018 | -0.028 | 71% | 8% | 3.53 | 11.22 (130) |
 
 ### What the arm did (mean over the eight tracks)
 
-| metric | clearance |
-| --- | --- |
-| `controller/clearance_bent_frac` | 0.191 |
-| `controller/clearance_plan_margin_after` | 0.164 |
-| `controller/clearance_plan_margin_before` | 0.142 |
-| `controller/clearance_shift_mean` | 0.043 |
-| `controller/clearance_slowed_frac` | 0.134 |
-| `controller/clearance_speed_cut_mean` | 0.805 |
+| metric | clearance | fixed_low | fixed_low+clearance |
+| --- | --- | --- | --- |
+| `controller/a_brake_realised_mean` | — | 1.808 | 1.900 |
+| `controller/a_brake_realised_spread` | — | 1.287 | 1.295 |
+| `controller/clearance_bent_frac` | 0.191 | — | 0.195 |
+| `controller/clearance_plan_margin_after` | 0.164 | — | 0.166 |
+| `controller/clearance_plan_margin_before` | 0.142 | — | 0.143 |
+| `controller/clearance_shift_mean` | 0.043 | — | 0.043 |
+| `controller/clearance_slowed_frac` | 0.134 | — | 0.119 |
+| `controller/clearance_speed_cut_mean` | 0.805 | — | 0.690 |
+| `controller/flag_degeneracy_run` | — | 0.000 | 0.000 |
+| `controller/flag_overestimate_run` | — | 0.000 | 0.000 |
+| `controller/mu_used_mean` | — | 0.734 | 0.734 |
+| `controller/mu_used_std` | — | 0.000 | 0.000 |
 
 <!-- /RESULTS -->
+
+## How to read the pace
+
+`mean speed` is over every active step of every first attempt, so it is not distorted by which
+trials finished; it is the honest pace number and it falls 3.1 % (`legacy` base) and 2.5 %
+(`fixed_low` base).
+
+The pooled **lap time** rises — 8.94 → 9.81 s on the `legacy` base — and that is composition, not
+the car going slower. The completed sets are not the same trials: 31 more finish, and the tracks
+that gain most of them are the slow ones (`scene:scene_0912_2355` goes 2 → 11 completions at ~15.5 s
+a lap). On the two tracks whose completion count barely moves it is 7.90 → 7.88 s and 7.75 → 7.78 s.
+On the `fixed_low` base, where 25 more trials complete, the pooled median moves 11.20 → 11.22 s. The
+per-track table above is there so this can be read rather than taken on trust; a properly paired
+comparison over the trials both arms completed would need per-trial identity, which this script does
+not record.
 
 ## Limitations, stated
 
 * **The backward pass is optimistic under `fixed_low`.** It assumes 3.3 m/s², the deceleration the
   whole command chain was measured to deliver at the bottom of the friction range. `fixed_low`
   clamps the solver tighter than that — 2.97 m/s² on a straight plan at µ 0.734, and less in a
-  corner. It is left optimistic on purpose: reading the other layer's bound would make the
+  corner; the composite run above logged a realised bound of **1.90 m/s²** on average
+  (`controller/a_brake_realised_mean`), so the gap is real and measured rather than hypothetical. It is left optimistic on purpose: reading the other layer's bound would make the
   installation order matter, which is the one property that makes the two composable. The cap is a
   target re-issued at 40 Hz and tightening as the obstacle nears, not a stopping guarantee.
 * **Quantisation.** Binning a return to the cell containing it puts it within half a cell of where it

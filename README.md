@@ -148,6 +148,21 @@ clean with the policy frozen.
 | `estimated` | inferred from causal onboard signals by a frozen quantile model | yes, with an estimator |
 | `oracle` | the environment's true friction | no: privileged |
 
+Either of two **composable layers** can be worn on top of any of them, written as a suffix in the
+order the car meets them — `fixed_low+clearance+tcs` is the fullest composite:
+
+| layer | what it does | on the car? |
+| --- | --- | --- |
+| `+clearance` | builds a local occupancy from the current LiDAR frame alone — no map, no pose — and bends or slows the plan until every point of it keeps a stated body-edge margin (0.20 m) from anything the scan saw | yes |
+| `+tcs` | the car's own traction guard shaping the speed command between the tracker and the VESC | yes, off by default |
+
+On the eight held-out tracks with the policy frozen, `+clearance` takes collisions from 223 to 203
+of 256 and completions from 79 to 110 on the `legacy` tracker, and from 182 to 169 and 105 to 130 on
+`fixed_low`, for 2–3 % of mean speed. The share of collisions whose plan had passed *through* an
+occupied cell falls from 26 % to 11 % (8 % on the composite) while the friction clamp alone barely
+moves it — the improvement is geometric
+([clearance arm](docs/research/clearance-arm-2026-09-13.md)).
+
 On suite v1 with the policy frozen, `fixed_low` scored S 136/144, low-µ 43/48, A 43/64, O 42/64 at
 5.58 collisions/km — the safest arm on every stability column, for 0.22 s per lap (~2 %) against
 `estimated` and needing no estimator. A `reactive` slip-triggered arm was built and **rejected**: it
@@ -225,8 +240,9 @@ latter will not transfer.
 **The real-car policy node.** `policy_node.py` subscribes to `/scan`, `/odom` and `/sensors/imu` and
 publishes `/drive`, building its observation with the same [`learn/obs.py`](f1sim/f1sim/learn/obs.py)
 used in training, so it runs unchanged against real hardware — though nothing here has been tested on a
-physical vehicle. It installs the grip-aware limit by default (`controller:=fixed_low`, µ 0.73423);
-`estimated` and `reactive` are simulator research arms, refused here.
+physical vehicle. It installs the grip-aware limit by default (`controller:=fixed_low`, µ 0.73423)
+and will install the geometry layer with it (`controller:=fixed_low+clearance`), which reads `/scan`
+and nothing else; `estimated` and `reactive` are simulator research arms, refused here.
 
 **Traction guard — pending merge** (branch `feat/real-car-tcs`). The simulator cannot lock or spin a
 wheel: `dynamics.py` has no wheel rotation state and the VESC loop closes on the true body speed, so
