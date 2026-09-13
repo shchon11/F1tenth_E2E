@@ -318,26 +318,6 @@ correctly scaled (1.0 is the optimum) and the ERPM speed reads about 5 % high, w
 with `speed_gain` in `docs/real_data_calibration.md`; neither is corrected here — a 5 % speed error
 is 9 mm over the warp's 0.9 m of travel and the measurement says so.
 
-## Budget
-
-`python -m f1sim.learn.budget`, the same proxy the memory work is held to: CPU, one thread, batch 1,
-fp32, the fastest of several blocks of 200 iterations. The rule is the actor's **forward** within
-1.5× the frozen original's and its parameters within 2×.
-
-| variant | actor forward [ms] | channels [ms] | step [ms] | forward ratio | actor params | ratio |
-|---|---|---|---|---|---|---|
-| frozen original | 1.80 | 0.000 | 1.80 | 1.00× | 1 168 164 | 1.00× |
-| + GRU 128 | 2.00 | 0.000 | 2.00 | 1.11× | 1 398 308 | 1.20× |
-| + GRU 128, `memory,edges` | 1.90 | 0.026 | 1.93 | 1.06× | 1 398 980 | 1.20× |
-| + GRU 128, `memory,edges,aligned*` (3 rows) | 1.99 | **0.57** | 2.56 | **1.16×** | 1 399 988 | 1.20× |
-
-Both rules pass with room. The honest caveat is the channel's 0.57 ms: at batch 1 it is
-operator-launch bound rather than arithmetic bound (the warp is ~2 M multiply-accumulates), so it is
-0.57 ms of this desktop's Python/dispatch overhead and would not scale down on a slower core the way
-the convolutions do. It is 2.3 % of the car's 25 ms step as measured; if the Jetson proves tight the
-remedy is fusing the channel, not shrinking it.
-
-
 ### The two-arm smoke: PPO health
 
 The same smoke the future-head worker ran, with one flag between the arms: 262144 env steps, 63 envs
@@ -389,6 +369,26 @@ The fix, if an arm ever has to carry a result: seed a warm start's fresh tensors
 NAMES rather than from the ambient generator, so that a module of the same shape is initialised the
 same way whatever was built before it. Not done here — changing the initialisation discipline
 between one arm and the next would replace this confound with a worse one.
+
+## Budget
+
+`python -m f1sim.learn.budget`, the same proxy the memory work is held to: CPU, one thread, batch 1,
+fp32, the fastest of several blocks of 200 iterations. The rule is the actor's **forward** within
+1.5× the frozen original's and its parameters within 2×.
+
+| variant | actor forward [ms] | channels [ms] | step [ms] | forward ratio | actor params | ratio |
+|---|---|---|---|---|---|---|
+| frozen original | 1.80 | 0.000 | 1.80 | 1.00× | 1 168 164 | 1.00× |
+| + GRU 128 | 2.00 | 0.000 | 2.00 | 1.11× | 1 398 308 | 1.20× |
+| + GRU 128, `memory,edges` | 1.90 | 0.026 | 1.93 | 1.06× | 1 398 980 | 1.20× |
+| + GRU 128, `memory,edges,aligned*` (3 rows) | 1.99 | **0.57** | 2.56 | **1.16×** | 1 399 988 | 1.20× |
+
+Both rules pass with room. The honest caveat is the channel's 0.57 ms: at batch 1 it is
+operator-launch bound rather than arithmetic bound (the warp is ~2 M multiply-accumulates), so it is
+0.57 ms of this desktop's Python/dispatch overhead and would not scale down on a slower core the way
+the convolutions do. It is 2.3 % of the car's 25 ms step as measured; if the Jetson proves tight the
+remedy is fusing the channel, not shrinking it.
+
 
 ## E3 — a second state, and the auxiliaries that are allowed to shape it
 
