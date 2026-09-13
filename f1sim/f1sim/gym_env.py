@@ -332,6 +332,18 @@ class EnvConfig:
     # and lets one of them be a *policy* -- a car that takes its own line, defends its own position
     # and makes its own mistakes, which no scripted behaviour reproduces.
     opp_pool: tuple = ()
+    # Obstacle layouts redrawn per env at every reset (f1sim.procedural_obstacles). 0 = off, and off
+    # is byte-identical to the env before they existed: nothing is allocated, nothing is drawn from
+    # the generator and `props_for` returns exactly what it returned. The training set's obstacle
+    # layouts are otherwise fixed -- `+rlobs`, `+obs`, `+hard<seed>` are rasterised once at load --
+    # so speed through a layout can be learned by knowing the layout, which is what the held-out
+    # proxy says is happening (`docs/research/procedural-obstacles-2026-09-13.md`).
+    procedural_obstacles: float = 0.0   # share of resets that get a freshly drawn layout
+    procedural_density: float = 1.0     # patterns per 10 m of lap
+    procedural_max_props: int = 0       # prop slots per env; 0 = from the density and the longest lap
+    procedural_raceline_margin: float = 0.25   # [m] kept clear either side of the raceline, beyond the
+                                      # car's half-width, wherever a pattern reaches -- so the line the
+                                      # teacher opponents drive is never the thing that is blocked
 
 
 class F1VecEnv:
@@ -418,6 +430,21 @@ class F1VecEnv:
         #: The observation the policy last saw, which is the one a pool opponent acts on: the pool
         #: is asked for its action at the top of `step()`, before any new observation exists.
         self._last_obs = None
+        # Obstacle layouts redrawn per env at every reset. Built here so the prop tensors exist
+        # before anything compiles against them; the raceline corridor arrives later, with the
+        # teacher (`set_teacher`), because that is when the line the opponents drive is known.
+        self.procedural = None
+        if e.procedural_obstacles > 0:
+            from .procedural_obstacles import ProceduralObstacles
+            self.procedural = ProceduralObstacles(
+                self.sim.track, self.B, self.sim.gen, density=e.procedural_density,
+                fraction=e.procedural_obstacles, max_props=e.procedural_max_props,
+                raceline_margin=e.procedural_raceline_margin,
+                car_half_width=0.5 * self.cfg.vehicle.width)
+            self.sim.track.attach_env_props(self.procedural)
+            # how far a prop centre can be from the car's and still touch it: the contact tests cull
+            # to the slots inside this, and count anything they dropped that was not
+            self.sim.prop_reach = float(self.sim.corners.norm(dim=1).max()) + self.procedural.max_radius
         self.opp_scale = torch.ones(self.B, device=self.device)
         # signed arc to each opponent last step (+ ahead of me, - behind), and whether it is usable.
         # A flag rather than "0 means unset": 0 is a perfectly ordinary gap -- it is the pass itself.
@@ -523,6 +550,14 @@ class F1VecEnv:
     def set_teacher(self, teacher):
         """Raceline teacher that drives the opponent cars (opponent == "teacher")."""
         self.teacher = teacher
+        if self.procedural is not None:
+            # The teacher is pure pursuit on a raceline built from the occupancy grid, and the
+            # procedural props are not in the grid: it cannot see them and will not steer round
+            # them. So the layouts are laid *outside* the band the raceline occupies, which is the
+            # contract's first option ("place patterns only where the raceline is not"). The other
+            # option -- teaching `clamp_offset` about props -- bounds an offset away from the line
+            # and does nothing about a crate standing on it.
+            self.procedural.set_raceline(teacher)
         if self.events is not None and self.events.enabled:
             # How far off the line each raceline point can be driven without putting a car in the
             # wall, measured once from the track's distance field. The teacher clamps against it at
@@ -637,6 +672,7 @@ class F1VecEnv:
         if self.M == 1:
             if e.resample_track_on_reset and self.sim.track.T > 1:
                 self.sim.tid[ids] = torch.randint(self.sim.track.T, (n,), device=self.device, generator=gen)
+            self._redraw_layouts(ids, n)
             s = None
         else:
             # a race resets as a whole (new track, cars staggered along the lane) when all its cars are in
@@ -647,6 +683,7 @@ class F1VecEnv:
             if e.resample_track_on_reset and self.sim.track.T > 1:
                 new_tid = torch.randint(self.sim.track.T, (full.shape[0],), device=self.device, generator=gen)
                 self.sim.tid[ids] = torch.where(is_full, new_tid[race], self.sim.tid[ids])
+            self._redraw_layouts(ids, n, full=full)
             L = self.sim.track.length[self.sim.tid[ids]]
             gap = e.spawn_gap[0] + (e.spawn_gap[1] - e.spawn_gap[0]) * torch.rand(n, device=self.device, generator=gen)
             base = torch.rand(full.shape[0], device=self.device, generator=gen)   # leader position, fraction of a lap
@@ -732,13 +769,26 @@ class F1VecEnv:
                 # over that distance that "0.56 m apart along the normal" stops meaning 0.56 m
                 # apart. Inside 0.2 m the frames agree to a couple of centimetres.
                 s_slot = torch.remainder(base[race] * L - al, L)
-                xy0, _ = self.sim.track.pose_at_s(s_slot, self.sim.tid[ids])
+                xy0, yaw0 = self.sim.track.pose_at_s(s_slot, self.sim.tid[ids])
                 room = self.sim.track.sample_edt(xy0, self.sim.tid[ids]) - 0.5 * extent - e.opp_event_margin
                 # Per *race*, not per car: a race with one car abreast and another staggered is
                 # exactly the grid that collides, because the stagger puts the last slot back on the
                 # leader's own arc position -- where the abreast car already is. Measured with the
                 # decision taken per car: 232 of 528 three-car spawns in contact.
                 headroom = room - want.abs() - 0.03
+                if getattr(self.sim.track, "has_props", False):
+                    # Props are not in the distance field, so `room` cannot see them. A crate
+                    # standing where the grid wants to be would send the abreast cars into
+                    # `sample_spawn`'s prop rejection, which replaces a blocked pose with a
+                    # *centerline* one -- and two cars pulled onto one line are two cars in contact.
+                    # So the grid is tested against the layout as well (drawn already, see
+                    # `_redraw_layouts`), and a race the crates block starts staggered instead: that
+                    # path goes through the rejection safely, because it has no lateral offset to
+                    # lose. `-inf` rather than a flag so the per-race reduction below covers it.
+                    nrm = torch.stack([-torch.sin(yaw0), torch.cos(yaw0)], 1)
+                    pose_ab = torch.cat([xy0 + nrm * want[:, None], yaw0[:, None]], 1)
+                    blocked = self.sim._spawn_in_prop(pose_ab, self.sim.tid[ids], ids)
+                    headroom = torch.where(blocked, torch.full_like(headroom, -math.inf), headroom)
                 worst = torch.full((self.B // self.M,), math.inf, device=self.device)
                 worst.scatter_reduce_(0, race, headroom, reduce="amin", include_self=False)
                 abreast = (order == SPAWN_ORDER_ID["alongside"]) & is_full & (worst[race] >= 0.0)
@@ -777,7 +827,7 @@ class F1VecEnv:
                                                   torch.ones_like(self.opp_scale[ids]))
                 self.speed_cap[ids] = self.cap_base * self.cap_scale[ids]
         poses = self.sim.sample_spawn(n, e.spawn_lateral_std, yaw_std, s=s, tid=self.sim.tid[ids],
-                                      min_clearance=min_clear, lat=lat)
+                                      min_clearance=min_clear, lat=lat, eid=ids)
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
         self.sim.reset(ids, poses, speed)
         self.sim.odom.state[ids, 3] = speed
@@ -808,13 +858,38 @@ class F1VecEnv:
         # fill the scan history with a fresh scan from the new pose. Scanned for the whole batch on the
         # compiled path (fixed shapes -> one CUDA graph); a per-reset partial batch would run eager kernels
         cars = self.sim._car_boxes(self.sim.state) if self.M > 1 else None
-        scan, scan_true, scan_type = self.sim.lidar.scan(self.sim.state[:, :3], None, self.sim.P, motion_distortion=False, tid=self.sim.tid, cars=cars, compiled=True)
+        scan, scan_true, scan_type = self.sim.lidar.scan(self.sim.state[:, :3], None, self.sim.P, motion_distortion=False, tid=self.sim.tid, cars=cars, compiled=True, eid=self.sim.eid)
         self.scan_hist[ids] = self._norm_scan(scan[ids])[:, None, :]
         if self.hist is not None:
             feat = torch.zeros(ids.numel(), 9, device=self.device); feat[:, 0] = speed / e.v_max_policy
             self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.act_dim, device=self.device)], 1)[:, None, :]
 
         return scan, scan_true, scan_type
+
+    def _redraw_layouts(self, ids: torch.Tensor, n: int, full: Optional[torch.Tensor] = None) -> None:
+        """Draw a fresh obstacle layout for the envs that are resetting. No-op when off.
+
+        Called *before* the grid is laid out rather than just before the spawn, for two reasons.
+        `sample_spawn` rejects a pose that lands inside a prop and walks the lap until one is clear,
+        so it has to test the layout the car is about to drive rather than the one it just crashed
+        out of. And an abreast grid (`spawn_order`) has to be tested against those same crates,
+        which the lane's own distance field cannot see -- so the layout has to exist by the time
+        `_reset_envs` decides whether the grid fits.
+        """
+        if self.procedural is None:
+            return
+        if self.M == 1:
+            self.procedural.redraw(self.sim.tid[ids], ids, torch.arange(n, device=self.device))
+            return
+        # One layout per race, not per car. The cars of a race share a track and see each other;
+        # giving them different crates would have car 0 collide with a box car 1 cannot see. A race
+        # redraws only when it resets as a whole -- a single car respawning behind its mates keeps
+        # the layout the race is running, exactly as it keeps the race's track.
+        races = torch.nonzero(full).flatten()
+        if races.numel():
+            rows = (races[:, None] * self.M + torch.arange(self.M, device=self.device)[None]).reshape(-1)
+            src = torch.arange(races.numel(), device=self.device).repeat_interleave(self.M)
+            self.procedural.redraw(self.sim.tid[races * self.M], rows, src)
 
     def _spawn_order(self, ids: torch.Tensor, race: torch.Tensor, is_full: torch.Tensor,
                      n_races: int, gen: torch.Generator) -> torch.Tensor:

@@ -18,6 +18,7 @@ from . import dynamics as dyn
 from .actuators import servo_target, vesc_accel
 from . import imu as imu_model
 from .lidar import Lidar
+from .prop_math import prism_contacts as prop_contacts
 from .odom import VescOdom
 from .params import Config
 from .randomization import ParamSet
@@ -105,7 +106,14 @@ class Simulator:
         self.hist_len = int(math.ceil(max_delay / self.control_dt)) + 2
         self.cmd_hist = torch.zeros(num_envs, self.hist_len, 2, device=self.device)
         self._roll = self._roll_physics; self._post = self._post_roll
+        # The same reason `lidar.py` compiles `ray_prisms_hits`: `prism_contacts` walks its slots in
+        # a Python loop, and one procedural layout is fifty of them. The *eager* function stays the
+        # one `_resolve_wall_contact` uses, because that runs inside the already-compiled
+        # `_roll_physics`, and the one `_spawn_in_prop` uses, because a reset passes a partial batch
+        # whose size changes and `dynamic=False` would recompile for each.
+        self._prism = prop_contacts
         if self.device.type == "cuda" and self.cfg.sim.compile:
+            self._prism = self._guarded(torch.compile(prop_contacts, dynamic=False), "_prism", prop_contacts)
             self._roll = self._guarded(torch.compile(self._roll_physics, dynamic=False, mode=self.cfg.sim.compile_mode), "_roll", self._roll_physics)
             if self.cfg.sim.compile_mode == "reduce-overhead":
                 self._post = self._guarded(torch.compile(self._post_roll, dynamic=False, mode="reduce-overhead"), "_post", self._post_roll)
@@ -146,6 +154,14 @@ class Simulator:
         #: and pushed back out between two control steps, and a collision that the physics resolved
         #: but nothing reported is a collision the caller never learns about.
         self.prop_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: Env rows in their own order, for `TrackTensors.props_for` when a per-env prop layout is
+        #: attached. Held rather than built per call: `arange` inside a compiled region is host data
+        #: and a host-to-device copy invalidates a CUDA graph capture.
+        self.eid = torch.arange(num_envs, device=self.device)
+        #: [m] how far from the car centre a prop centre can be and still touch the footprint: the
+        #: car's own circumradius plus the widest prop's. Only the per-env layouts use it, to cull
+        #: the contact SAT to the slots that can matter; 0 keeps every slot.
+        self.prop_reach = 0.0
         self.steps = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.t = 0.0
         # footprint corner offsets in body frame relative to CoG
@@ -247,7 +263,8 @@ class Simulator:
     # ------------------------------------------------------------------ reset
     def sample_spawn(self, n: int, lateral_std: float = 0.3, yaw_std=0.2,
                      s: Optional[torch.Tensor] = None, tid: Optional[torch.Tensor] = None,
-                     min_clearance=None, lat: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     min_clearance=None, lat: Optional[torch.Tensor] = None,
+                     eid: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Random poses along the centerline of each env's track (tid (n,), default track 0). Returns (n, 3).
 
         min_clearance: scalar, or an (n,) tensor when the rows want different bounds -- an alongside
@@ -259,6 +276,16 @@ class Simulator:
         anyway, so that caller lowers the jitter for those rows rather than giving up the grid.
         lat: (n,) explicit lateral offsets instead of a `lateral_std` draw. Given one, this function
         draws nothing for the lateral, which is what lets a caller place a grid abreast.
+        eid (n,): which env row each pose belongs to. Only per-env prop layouts need it -- the
+        rejection below has to test the pose against *that env's* crates, and a track id does not
+        say which env is being reset.
+
+        One interaction between the last two worth stating, because it is the reason
+        `gym_env._reset_envs` tests an abreast grid against the props itself: the prop rejection
+        below replaces a blocked pose with a *centerline* pose, which throws away whatever `lat`
+        asked for. For a grid laid abreast that would put both cars on one line, i.e. in contact. So
+        an abreast row is only ever handed to this function once its caller has established that the
+        pose is clear of both the walls and the props, and the rejection never fires on it.
         """
         tid = torch.zeros(n, dtype=torch.long, device=self.device) if tid is None else tid.to(self.device)
         no_cl = ~self.track.cl_ok[tid] if self.track.cl is not None else torch.ones(n, dtype=torch.bool, device=self.device)
@@ -275,11 +302,12 @@ class Simulator:
             poses[:, 2] = torch.rand(n, device=self.device, generator=self.gen) * 2 * math.pi * (any_yaw > 0)
             if bool(no_cl.all()):
                 return poses
-            rest = self.sample_spawn(int((~no_cl).sum()), lateral_std,
-                                     yaw_std if not torch.is_tensor(yaw_std) else yaw_std[~no_cl],
+            sel = lambda t: t if not torch.is_tensor(t) else t[~no_cl]
+            rest = self.sample_spawn(int((~no_cl).sum()), lateral_std, sel(yaw_std),
                                      None if s is None else s[~no_cl], tid[~no_cl],
-                                     min_clearance=min_clearance if not torch.is_tensor(min_clearance) else min_clearance[~no_cl],
-                                     lat=None if lat is None else lat[~no_cl])
+                                     min_clearance=sel(min_clearance),
+                                     lat=None if lat is None else lat[~no_cl],
+                                     eid=None if eid is None else eid[~no_cl])
             poses[~no_cl] = rest
             return poses
         if s is None:
@@ -299,25 +327,35 @@ class Simulator:
             # Props are not in the EDT, so the wall test above cannot see them and a car would spawn
             # standing inside a crate. Reject on the same geometry the contact test uses; if the
             # centerline fallback is itself blocked, nudge along the lane until it is not.
-            bad = bad | self._spawn_in_prop(pose, tid)
+            bad = bad | self._spawn_in_prop(pose, tid, eid)
             if bad.any():
                 xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
                 pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
-                still = bad & self._spawn_in_prop(pose, tid)   # the centerline point may be blocked too
-                # Walk a full lap in even steps rather than a few short nudges. Stopping early and
-                # returning the pose anyway would spawn the car inside a crate and call it a spawn;
-                # if a whole lap has nowhere to stand, that is a broken map and it says so.
+                still = bad & self._spawn_in_prop(pose, tid, eid)   # the centerline point may be blocked too
+                # Walk a full lap in even stations rather than a few short nudges. Stopping early
+                # and returning the pose anyway would spawn the car inside a crate and call it a
+                # spawn; if a whole lap has nowhere to stand, that is a broken map and it says so.
+                # All 32 stations are tested in one call rather than one call each. Same answer --
+                # the pose taken is still the first station in order that is clear -- but with a
+                # per-env obstacle layout the loop was thirty-two Python-looped SAT passes over the
+                # slot dimension per reset, measured at 46 ms of a 116 ms step at `--envs 256`.
                 L = self.track.length[tid].clamp_min(1e-6)
-                for j in range(1, 33):
-                    idx = torch.nonzero(still, as_tuple=True)[0]
-                    if not idx.numel():
-                        break
-                    s_alt = (s[idx] + L[idx] * (j / 33.0)) % L[idx]
-                    xy_a, yaw_a = self.track.pose_at_s(s_alt, tid[idx])
+                idx = torch.nonzero(still, as_tuple=True)[0]
+                if idx.numel():
+                    J = 32
+                    ar_j = torch.arange(1, J + 1, device=self.device, dtype=L.dtype)
+                    s_alt = (s[idx][:, None] + L[idx][:, None] * (ar_j[None] / 33.0)) % L[idx][:, None]
+                    tid_j = tid[idx].repeat_interleave(J)
+                    xy_a, yaw_a = self.track.pose_at_s(s_alt.reshape(-1), tid_j)
                     p_alt = torch.cat([xy_a, yaw_a[:, None]], 1)
-                    ok = ~self._spawn_in_prop(p_alt, tid[idx])
-                    pose[idx[ok]] = p_alt[ok]
-                    still[idx[ok]] = False
+                    ok = (~self._spawn_in_prop(p_alt, tid_j,
+                                               None if eid is None else eid[idx].repeat_interleave(J))
+                          ).reshape(-1, J)
+                    first = ok.to(torch.uint8).argmax(1)
+                    any_ok = ok.any(1)
+                    chosen = p_alt.reshape(-1, J, 3)[torch.arange(idx.numel(), device=self.device), first]
+                    pose[idx[any_ok]] = chosen[any_ok]
+                    still[idx[any_ok]] = False
                 if bool(still.any()):
                     raise RuntimeError(
                         f"{int(still.sum())} env(s) have no spawn pose clear of the placed props "
@@ -328,13 +366,17 @@ class Simulator:
             pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
         return pose
 
-    def _spawn_in_prop(self, pose: torch.Tensor, tid: torch.Tensor) -> torch.Tensor:
-        """Whether each candidate spawn pose has its footprint overlapping a prop."""
+    def _spawn_in_prop(self, pose: torch.Tensor, tid: torch.Tensor,
+                       eid: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Whether each candidate spawn pose has its footprint overlapping a prop.
+
+        The eager `prism_contacts`, deliberately: this runs at reset on whatever partial batch is
+        resetting, so a `dynamic=False` compile would recompile for every distinct size."""
         from .prop_math import prism_contacts
         c, s_ = torch.cos(pose[:, 2]), torch.sin(pose[:, 2])
         R = torch.stack([torch.stack([c, -s_], -1), torch.stack([s_, c], -1)], -2)
         pts = torch.einsum("bij,kj->bki", R, self.corners) + pose[:, None, :2]
-        poses, pn, pd, z_lo, z_hi = self.track.props_for(tid)
+        poses, pn, pd, z_lo, z_hi = self.track.props_near(tid, pose[:, :2], eid, self.prop_reach)
         h = self.car_dims[:pose.shape[0], 2] if self.car_dims.shape[0] >= pose.shape[0] else 0.25
         depth, _, _ = prism_contacts(pts[:, [0, 1, 3, 2]], poses, pn, pd, z_lo, z_hi, h)
         return depth > 0
@@ -478,7 +520,8 @@ class Simulator:
         # --- sensors ---
         pose = state[:, :3]
         scan, scan_true, scan_type = self.lidar.scan(pose, self.pose_prev, P, self.cfg.lidar.motion_distortion,
-                                                     att=att[:, [0, 2]], att_prev=self.att_prev, tid=self.tid, cars=cars)
+                                                     att=att[:, [0, 2]], att_prev=self.att_prev, tid=self.tid, cars=cars,
+                                                     eid=self.eid)
         imu = imu_samples if self.cfg.imu.enabled else None
         imu_att = imu_state[:, 18:21].clone() if self.cfg.imu.enabled else None
         # The /odom stamp is drawn here, outside `_post`: it is one cheap draw per step and keeping
@@ -600,7 +643,7 @@ class Simulator:
         # sample_edt is distance to wall cell center; subtract half a cell for the surface
         return d.min(1).values - 0.5 * self.track.t_res[self.tid]
 
-    def _prop_contact(self, state: torch.Tensor):
+    def _prop_contact(self, state: torch.Tensor, fn=None):
         """Penetration depth and outward normal against the placed props: (pen (B,), n (B,2)).
 
         Deliberately not routed through `_footprint_clearance`. That test samples the EDT at the
@@ -611,9 +654,8 @@ class Simulator:
         The normal has to come from the contacted prop as well. `edt_gradient` reads the occupancy
         grid, and props are not in the grid -- it would return the direction away from the nearest
         *wall*, which is unrelated to the box the car is actually touching."""
-        from .prop_math import prism_contacts
         tr = self.track
-        poses, pn, pd, z_lo, z_hi = tr.props_for(self.tid)
+        poses, pn, pd, z_lo, z_hi = tr.props_near(self.tid, state[:, :2], self.eid, self.prop_reach)
         # `self.corners` is [front-left, front-right, rear-left, rear-right] -- a bow tie, not a
         # perimeter. SAT takes edge normals from consecutive pairs, so feeding it that order hands it
         # the rectangle's two diagonals as separating axes and misses the axes that matter. [0,1,3,2]
@@ -627,7 +669,7 @@ class Simulator:
         corners = torch.stack((fl, fr, rr, rl), 1)
         # Body height, not CoG height: `vehicle.h` is where the mass sits (0.074 m) and doubling it
         # is not a silhouette. `car_dims[:, 2]` is the height the LiDAR already uses for this car.
-        depth, normal, _ = prism_contacts(corners, poses, pn, pd, z_lo, z_hi, self.car_dims[:, 2])
+        depth, normal, _ = (fn or self._prism)(corners, poses, pn, pd, z_lo, z_hi, self.car_dims[:, 2])
         return depth.clamp_min(0.0), normal
 
     def _resolve_wall_contact(self, state: torch.Tensor) -> torch.Tensor:
@@ -639,7 +681,7 @@ class Simulator:
         if getattr(self.track, "has_props", False):
             # Whichever of wall or prop is deeper owns this step's normal. Blending two normals
             # would push the car somewhere neither contact asks for.
-            pen_p, n_p = self._prop_contact(state)
+            pen_p, n_p = self._prop_contact(state, fn=prop_contacts)   # already inside _roll_physics
             self.prop_touched = self.prop_touched | (pen_p > 0)   # substeps, read once per step
             prop_deeper = pen_p > pen
             pen = torch.where(prop_deeper, pen_p, pen)

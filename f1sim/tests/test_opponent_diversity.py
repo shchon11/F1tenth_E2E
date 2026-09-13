@@ -513,6 +513,57 @@ def test_an_opponent_faster_than_its_profile_is_allowed_and_arrives():
         f"only {int(caught[env.learner].sum())} of {n} learners were passed by a 1.2-1.4x opponent")
 
 
+# ------------------------------------------------- 4b. the grid against a redrawn obstacle layout
+#
+# `--procedural-obstacles` draws a fresh prop layout per env at every reset, and the props are not
+# in the distance field the grid's room test reads. So an abreast grid has to be tested against the
+# layout separately: `sample_spawn`'s prop rejection replaces a blocked pose with a *centerline*
+# one, and two cars pulled onto one line are two cars in contact for the rest of the run.
+
+def _procedural_env(envs, track=WIDE, teacher=True, **cfg_kw):
+    tr, rl = _track_and_raceline(track)
+    cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
+    ecfg = EnvConfig(**{"race_size": 2, "max_steps": 4000, "hist_len": 0,
+                        "opponent": "teacher" if teacher else "policy",
+                        "procedural_obstacles": 1.0, **cfg_kw})
+    return common.make_env([tr], envs, "cpu", ecfg, cfg=cfg, seed=7,
+                           rls=[rl] if teacher else None)
+
+
+@pytest.mark.parametrize("M,order", [(2, "alongside"), (2, "random"), (3, "alongside")])
+def test_a_grid_never_spawns_in_contact_with_a_redrawn_layout(M, order):
+    env = _procedural_env(12 * M, race_size=M, spawn_order=order)
+    assert env.procedural is not None and env.sim.track.has_props
+    contacts, live = 0, 0
+    for k in range(4):
+        env.reset(seed=311 + k)
+        live += int((env.procedural.p_zhi > env.procedural.p_zlo).sum())
+        _, _, _, _, info = env.step(torch.zeros(env.B, env.act_dim))
+        contacts += int(info["car_collision"].sum())
+    assert live > 0, "no prop was placed: the test would pass with the feature off"
+    assert contacts == 0, f"{contacts} cars spawned in contact with a layout drawn"
+
+
+def test_a_layout_standing_on_the_grid_makes_that_race_start_staggered():
+    """The demotion path, forced: a dense layout and no raceline corridor (no teacher drives one),
+    so patterns may stand where an abreast grid wants to be."""
+    env = _procedural_env(64, track=TRACK, teacher=False, spawn_order="alongside",
+                          procedural_density=6.0, procedural_raceline_margin=0.0)
+    abreast = cars = contacts = 0
+    for k in range(6):
+        env.reset(seed=317 + k)
+        lon = env.learner_view().lon[:, 0]
+        abreast += int((lon[env.learner].abs() < 0.9).sum()); cars += int(env.learner.sum())
+        _, _, _, _, info = env.step(torch.zeros(env.B, env.act_dim))
+        contacts += int(info["car_collision"].sum())
+    assert contacts == 0, f"{contacts} cars spawned in contact"
+    assert abreast < cars, ("no race was demoted over {cars} cars at 6 patterns per 10 m with no "
+                            "raceline corridor: the prop test is not reachable, so the branch that "
+                            "keeps the two features from colliding is untested").format(cars=cars)
+    assert abreast > 0.5 * cars, (f"only {abreast} of {cars} started abreast: the prop test is "
+                                  f"rejecting grids it should accept")
+
+
 # --------------------------------------------------------------------------- 5. the census
 def test_the_census_is_reproducible_and_counts_the_situations_it_is_given(tmp_path):
     from f1sim.learn import opponent_census as oce
