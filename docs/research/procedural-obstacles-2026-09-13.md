@@ -203,8 +203,17 @@ this whole design exists to avoid.
 
 ## 3. Cost
 
-All on an RTX 4060 Ti shared with other jobs, `--envs 256`, density 1 per 10 m, on
-`real:blackbox2022_1` (149.6 m, 15 patterns, **52 prop slots**) + `gen:control:1400`.
+All on an RTX 4060 Ti **shared with other people's training runs**, `--envs 256`,
+`--action-mode plan`, density 1 per 10 m, on `real:blackbox2022_1` (149.6 m, 15 patterns,
+**52 prop slots**) + `gen:control:1400` + `scene:scene_0912_2344` — the smoke's own three tracks, so
+these are the numbers the smoke pays.
+
+That the card is shared is not a footnote here, it is the reason this section is laid out the way it
+is. A measurement taken while somebody else's trainer comes and goes is not a measurement, and the
+first attempt at these tables proved it: see the end of this section for what it produced and why it
+was thrown away. Every table below is either taken inside a single process, so its rows are
+comparable to each other by construction, or run twice in opposite orders so that the drift is
+visible instead of silently baked into the answer.
 
 ### What it cost before it was made to cost less
 
@@ -226,7 +235,7 @@ contact tests every slot.
 
 (`--envs 256`, `--action-mode plan`, density 1 per 10 m, 52 prop slots, ~20.5 pieces a layout; card
 idle at 1.4 GB and never above 2.4 GB for the whole run.) **A full-density layout redrawn at every
-reset costs 22 % of the environment step.** Without the two changes below it costs 540 %.
+reset costs 22 % of the environment step.** Without the two changes in the last two rows it costs 540 %.
 
 `ray_prisms_hits` on its own, ranges and hit masks compared elementwise:
 
