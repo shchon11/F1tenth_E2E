@@ -34,7 +34,9 @@ from .future import (FUTURE_K, align_future_targets, future_labelled_fraction, f
 from .memory import Hidden, memory_spec, reset_hidden
 from .model import (ActorCritic, load_checkpoint, load_for_conditioning, load_for_memory,
                     save_checkpoint)
-from .obs import SCAN_CHANNELS, ScanAugment, flatten_obs
+from .aligned import (ALIGNED_CONSIST_BEAMS, ALIGNED_GAP_FILL, ALIGNED_K, ALIGNED_TAU,
+                      ALIGNED_TAU_REL, ALIGNED_TOL_BEAMS, ALIGNED_Z_TOL, aligned_spec)
+from .obs import ALIGNED_CHANNELS, SCAN_CHANNELS, ScanAugment, flatten_obs, motion_index_spec
 from .returns import compute_gae
 
 #: How close an opponent has to be for the auxiliary head to be scored on it [m]. This is a
@@ -382,7 +384,30 @@ def main():
                          f"so the crack between two boxes in a row reads as two discontinuities "
                          f"rather than an opening. Both are pure arithmetic on the scan the env "
                          f"already emits (0.03 ms of a 25 ms step, measured) and both start as "
-                         f"zeroed input columns, so a warm start is still bit-identical")
+                         f"zeroed input columns, so a warm start is still bit-identical. "
+                         f"'aligned': the signed residual between this scan and the one from "
+                         f"--aligned-k steps ago warped into the current ego frame with the car's "
+                         f"OWN measured speed, yaw rate and roll/pitch -- static geometry cancels "
+                         f"and what moved by itself is what is left (learn.aligned). It is the one "
+                         f"channel with a gate, because the tilt is measured rather than known")
+    ap.add_argument("--aligned-k", type=int, default=ALIGNED_K, metavar="STEPS",
+                    help="[aligned] control steps of lag the residual is taken over (4 = 100 ms)")
+    ap.add_argument("--aligned-tau", type=float, default=ALIGNED_TAU, metavar="M",
+                    help="[aligned] soft threshold: sign(R) * max(|R| - tau, 0). Fixed BEFORE "
+                         "training at 2-3 sigma of the static-world floor measured on the real bags "
+                         "(python -m f1sim.learn.aligned_floor), never tuned on a result")
+    ap.add_argument("--aligned-tau-rel", type=float, default=ALIGNED_TAU_REL, metavar="PER_M",
+                    help="[aligned] range-proportional addition to tau (0 by default: the contract "
+                         "asks for one number)")
+    ap.add_argument("--aligned-tol-beams", type=int, default=ALIGNED_TOL_BEAMS, metavar="N",
+                    help="[aligned] bearing uncertainty of the warp, in beams")
+    ap.add_argument("--aligned-consist-beams", type=int, default=ALIGNED_CONSIST_BEAMS, metavar="N",
+                    help="[aligned] bearing tolerance of the two-frame consistency test, in beams")
+    ap.add_argument("--aligned-z-tol", type=float, default=ALIGNED_Z_TOL, metavar="M",
+                    help="[aligned] a warped point further than this out of the current scan plane "
+                         "is dropped as not comparable")
+    ap.add_argument("--aligned-gap-fill", type=int, default=ALIGNED_GAP_FILL, metavar="N",
+                    help="[aligned] beams a hole left by the warp's resampling may be filled from")
     ap.add_argument("--scan-memory-tau", type=float, default=2.0,
                     help="[s] time constant of the decayed scan-occupancy channel")
     ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
@@ -541,6 +566,16 @@ def main():
                           critic=a.memory_critic) if a.memory != "off" else None
     chan_cfg = ({"channels": list(a.scan_channels), "memory_tau_s": float(a.scan_memory_tau)}
                 if a.scan_channels else None)
+    if chan_cfg and any(c in ALIGNED_CHANNELS for c in a.scan_channels):
+        # The proprio index block travels with the checkpoint: the warp reads speed, yaw rate and
+        # roll/pitch out of the observation BY INDEX, so a checkpoint that did not record the layout
+        # it was built against could be run later on a different one and warp with a prev-action.
+        chan_cfg["aligned"] = {**aligned_spec(k=a.aligned_k, tau=a.aligned_tau,
+                                              tau_rel=a.aligned_tau_rel,
+                                              consist_beams=a.aligned_consist_beams,
+                                              z_tol=a.aligned_z_tol, gap_fill=a.aligned_gap_fill,
+                                              tol_beams=a.aligned_tol_beams),
+                               "proprio": motion_index_spec(spec)}
     #: The future head is built when the term is on, and only then: `--aux-future 0` is the run it
     #: was, down to the state dict. A checkpoint that already carries one keeps it (the loaders read
     #: `meta`), so a resume does not have to repeat the flag to keep the head -- but it does have to
@@ -608,9 +643,26 @@ def main():
     memory_on = bool(model.meta.get("memory"))
     scan_channels = list((model.meta.get("scan_channels") or {}).get("channels") or ())
     n_extra = len(scan_channels)
+    chan_meta = dict(model.meta.get("scan_channels") or {})
     roll_aug = (ScanAugment(scan_channels, spec.n_beams, env.B, device=device,
-                            tau_s=float(model.meta["scan_channels"]["memory_tau_s"]))
+                            tau_s=float(chan_meta["memory_tau_s"]),
+                            aligned=chan_meta.get("aligned"))
                 if n_extra else None)
+    if chan_meta.get("aligned"):
+        # Read back from the model, like `memory_on`: a resumed checkpoint carries the gate it was
+        # trained with, and a flag that silently retuned it would make leg two a different channel.
+        from .aligned import describe as _describe_aligned
+        al = chan_meta["aligned"]
+        print(f"{_describe_aligned({k_: v_ for k_, v_ in al.items() if k_ != 'proprio'})} | "
+              f"proprio {al['proprio']['proprio_dim']}-wide, speed/yaw/roll/pitch at "
+              f"{al['proprio']['speed']}/{al['proprio']['yaw_rate']}/{al['proprio']['roll']}/"
+              f"{al['proprio']['pitch']}")
+        if int(al["proprio"]["proprio_dim"]) != int(spec.proprio_dim):
+            raise SystemExit(
+                f"this checkpoint's aligned channel was built for a "
+                f"{al['proprio']['proprio_dim']}-wide proprio vector and this env produces "
+                f"{spec.proprio_dim}. Its warp reads columns by index, so it would be fed the wrong "
+                f"ones. Match --scan-stack / --hist-len / --action-mode to the checkpoint.")
     if memory_on or n_extra:
         from .memory import describe as _describe_memory
         print(f"policy memory: {_describe_memory(model.meta)}")
@@ -853,7 +905,7 @@ def main():
             for t in range(T):
                 scan, pro = flatten_obs(obs)
                 if roll_aug is not None:
-                    scan = roll_aug(scan)                  # the extra channels, advanced one step
+                    scan = roll_aug(scan, pro)             # the extra channels, advanced one step
                 # Frozen here, from the privileged vector belonging to THIS observation, before the
                 # step advances the env or a reset re-draws `mu`.
                 cond_t = (cond_mod.make_condition(a.cond, cond_spec, priv, env.priv_mu_index)
@@ -914,7 +966,7 @@ def main():
                         # `preview`, not `__call__`: a terminal observation is scored and never
                         # acted on, so advancing the occupancy memory for it would leave the next
                         # episode carrying a step it did not take.
-                        final_scan = roll_aug.preview(final_scan, f["ids"])
+                        final_scan = roll_aug.preview(final_scan, f["ids"], final_pro)
                     with ac:
                         final_val = model.critic.step(
                             final_scan, final_pro, info["final_priv"],
@@ -932,23 +984,29 @@ def main():
                         track_hist[tid_].append((crashed, dist))
                     ep_stats["return"] += f["return"][m].tolist(); ep_stats["progress"] += f["progress"][m].tolist()
                     ep_stats["collided"] += f["collided"][m].float().tolist(); ep_stats["steps"] += f["steps"][m].tolist()
+                # The episode boundary, applied to everything that remembers: the two hidden
+                # states and the stateful scan channels. `obs` is already the fresh episode's first
+                # observation (the env auto-resets inside `step`), so the state entering step t+1
+                # has to be the state of a car that has just spawned.
+                #
+                # The channels are cleared whether or not there is a GRU. They used to be cleared
+                # only under `--memory gru`, which left a `--scan-channels`-only arm carrying the
+                # previous episode's occupancy -- and would leave the aligned channel warping a
+                # scan from before a respawn, which is a residual made entirely of teleportation.
+                # No recorded run used that combination, so no result moves.
+                done_now = term | trunc
+                if roll_aug is not None:
+                    roll_aug.reset(done_now)
                 if memory_on:
-                    # The episode boundary, applied to everything that remembers: the two hidden
-                    # states and the decayed scan-occupancy channel. `obs` is already the fresh
-                    # episode's first observation (the env auto-resets inside `step`), so the state
-                    # entering step t+1 has to be the state of a car that has just spawned.
-                    done_now = term | trunc
                     h_actor = reset_hidden(h_actor, done_now)
                     h_critic = reset_hidden(h_critic, done_now)
-                    if roll_aug is not None:
-                        roll_aug.reset(done_now)
                     if t + 1 < T:
                         buf_keep[t + 1] = (~done_now[lid]).float()
             scan, pro = flatten_obs(obs)
             if roll_aug is not None:
                 # The bootstrap value of the state the next chunk starts from: previewed, because
                 # the next chunk's first step advances the channels itself.
-                scan = roll_aug.preview(scan)
+                scan = roll_aug.preview(scan, None, pro)
             if buf_fut_lab is not None:
                 # The (T + 1)-th label row: the state the chunk ends in, the same one the bootstrap
                 # value below is taken from. This is what makes step T - k the last labelled step

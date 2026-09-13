@@ -80,7 +80,7 @@ class Introspector:
             self._rt.reset()                       # a different car's memory is not this one's
             self._focus = i
         s = scan[i:i + 1].clone().requires_grad_(True); p = pro[i:i + 1]
-        s_in = self._rt.observe(s)
+        s_in = self._rt.observe(s, p)
         h_in = self._rt.hidden.actor if self._rt.hidden is not None else None
         mu, h = self.model.actor.step(s_in, p, None, h_in)
         g = torch.autograd.grad(mu.abs().sum(), s)[0][0]              # (k, N)
@@ -666,7 +666,7 @@ class MemoryActorRunner:
         # checkpoint still holds per-row state, and a listener with no width declared would be sent
         # every env's boundary mask, including ones of the wrong shape.
         self.batch = int(scan.shape[0])
-        scan = self.rt.observe(scan)
+        scan = self.rt.observe(scan, proprio)
         if self.h is None and self.actor.has_memory:
             self.h = self.actor.initial_hidden(scan.shape[0], device=scan.device, dtype=scan.dtype)
         try:

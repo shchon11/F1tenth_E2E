@@ -310,7 +310,7 @@ class PolicyNode(Node):
         # warm up
         s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
         with torch.no_grad():
-            a0, _, _ = self.model.act(self.policy_state.observe(s), pr, deterministic=True,
+            a0, _, _ = self.model.act(self.policy_state.observe(s, pr), pr, deterministic=True,
                                       h=self.policy_state.hidden)
         if self.tracker is not None:                                 # warm up the tracker's compiled solver too
             self.tracker(a0, torch.zeros(1, device=self.device), torch.tensor([self.speed_cap], device=self.device), None, delay=self.delay)
@@ -603,8 +603,11 @@ class PolicyNode(Node):
         with torch.no_grad():
             # The hidden state goes in and the next one comes out: the policy's memory of this run
             # lives here, between callbacks, and nowhere else.
+            # The `aligned` channel warps this scan against the one from k steps ago with the
+            # speed, yaw rate and roll/pitch that are already in `pro` -- the same three sensors
+            # this node already reads, and the reason the channel is deployable at all.
             a, _, self.policy_state.hidden = self.model.act(
-                self.policy_state.observe(scan), pro, deterministic=True,
+                self.policy_state.observe(scan, pro), pro, deterministic=True,
                 h=self.policy_state.hidden)
         self.obs.push_action(a[0])
         msg = AckermannDriveStamped(); msg.header.stamp = m.header.stamp

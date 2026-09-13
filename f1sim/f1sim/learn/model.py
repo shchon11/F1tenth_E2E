@@ -523,7 +523,33 @@ def scan_channel_spec(scan_channels: Optional[dict]) -> dict:
     tau = float(scan_channels.get("memory_tau_s", 2.0))
     if not tau > 0:
         raise ValueError(f"scan memory tau {tau} s must be positive")
-    return {"channels": [n for n in SCAN_CHANNELS if n in names], "memory_tau_s": tau}
+    out = {"channels": [n for n in SCAN_CHANNELS if n in names], "memory_tau_s": tau}
+    from .obs import ALIGNED_CHANNELS
+    if any(n in ALIGNED_CHANNELS for n in names):
+        # The `aligned` block travels with the checkpoint because the channel is not a pure function
+        # of the scan: it warps with the car's measured motion, read out of the proprio vector by
+        # index, and gated by thresholds that were measured rather than chosen. A checkpoint that
+        # did not record them could be rebuilt with a different gate and would look the same.
+        from .aligned import aligned_spec
+        from .obs import MOTION_KEYS
+        cfg = dict(scan_channels.get("aligned") or {})
+        pro = dict(cfg.pop("proprio", {}) or {})
+        if not pro:
+            raise ValueError(
+                "the 'aligned' scan channel needs its `proprio` index block "
+                "(`learn.obs.motion_index_spec(spec)`): its warp reads "
+                + ", ".join(MOTION_KEYS) + " out of the proprio vector by index.")
+        missing = [k for k in ("proprio_dim", "speed", "yaw_rate", "roll", "pitch", "v_max",
+                               "gyro_scale", "att_scale", "range_max") if k not in pro]
+        if missing:
+            raise ValueError(f"the aligned channel's proprio block is missing {missing}; build it "
+                             f"with learn.obs.motion_index_spec(spec) rather than by hand")
+        out["aligned"] = {**aligned_spec(**cfg), "proprio": pro}
+    elif scan_channels.get("aligned"):  # noqa: SIM114 - the message is the point
+        raise ValueError("scan_channels carries an 'aligned' block but not the 'aligned' channel: "
+                         "one of the two is a typo, and guessing which would either build a channel "
+                         "nobody asked for or drop a gate somebody measured.")
+    return out
 
 
 class ActorCritic(nn.Module):

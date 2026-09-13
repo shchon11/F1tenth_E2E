@@ -24,7 +24,24 @@ PROPRIO_KEYS = ("speed", "prev_action", "speed_cap", "imu", "imu_att", "hist")  
 #: and not by the caller's spelling: it is the order the first convolution's input columns are laid
 #: out in, so a checkpoint written with ("edges", "memory") and loaded as ("memory", "edges") would
 #: read two channels that mean the wrong thing while every shape still matched.
-SCAN_CHANNELS = ("memory", "edges")
+#:
+#: `aligned` is appended LAST for the same reason the channels are appended after the frames: every
+#: column an existing checkpoint had keeps its index, so `("memory", "edges")` means the same two
+#: columns before and after this channel existed, and a warm start into `("memory", "edges",
+#: "aligned")` is a copy plus one zeroed column.
+SCAN_CHANNELS = ("memory", "edges", "aligned", "aligned_prev", "aligned_valid")
+
+#: The rows the aligned warp contributes, in `SCAN_CHANNELS` order. Asking for any of them builds
+#: one `learn.aligned.AlignedScan`; asking for `aligned` alone is the addendum's one-channel
+#: ablation, and all three are its research-clean set (the fourth channel it names, the current
+#: range, is already the newest frame of the stack).
+ALIGNED_CHANNELS = ("aligned", "aligned_prev", "aligned_valid")
+
+#: The SI quantities the `aligned` channel warps with, in the order `motion_from_proprio` returns
+#: them: forward speed [m/s], yaw rate [rad/s], body roll [rad], body pitch [rad]. Every one of them
+#: is measured on the car -- wheel speed from the VESC, the other three from the IMU -- which is
+#: what makes this channel deployable at all.
+MOTION_KEYS = ("speed", "yaw_rate", "roll", "pitch")
 
 #: Control period the decay is quoted in [s]. The policy runs at the LiDAR's 40 Hz (`params.py`
 #: `control_rate`), on the car and in the simulator alike.
@@ -43,6 +60,50 @@ def scan_edges(scan_now: torch.Tensor) -> torch.Tensor:
     """
     d = (scan_now[:, 1:] - scan_now[:, :-1]).abs()
     return F.pad(d, (1, 0))
+
+
+def motion_index_spec(spec: "ObsSpec") -> dict:
+    """Where the four `MOTION_KEYS` live in the flattened proprio vector, and their normalisers.
+
+    Recorded into a checkpoint's `meta["scan_channels"]["aligned"]["proprio"]` block and read back
+    by `ScanAugment`, rather than re-derived from whatever `ObsSpec` the reader happens to hold.
+    The reason is the one this module already gives for fixing the channel order: the proprio layout
+    is a contract between the observation encoding and everything that reads a column out of it, and
+    a checkpoint whose channel was built against one layout must not silently read a different one.
+    `proprio_dim` travels with the indices so the mismatch is an error at the first forward instead
+    of a plausible number.
+
+    The layout is `flatten_obs`' concatenation of `PROPRIO_KEYS`: speed, prev actions, speed cap,
+    imu (gyro xyz then accel xyz), imu roll/pitch, and the optional history. `ObsBuilder.build`
+    assembles the same order on the car.
+    """
+    i_imu = 1 + spec.act_dim * spec.action_history + 1
+    return {"proprio_dim": int(spec.proprio_dim), "speed": 0, "yaw_rate": int(i_imu + 2),
+            "roll": int(i_imu + 6), "pitch": int(i_imu + 7), "v_max": float(spec.v_max),
+            "gyro_scale": float(spec.gyro_scale), "att_scale": float(spec.att_scale),
+            "range_max": float(spec.range_max)}
+
+
+def motion_from_proprio(proprio: torch.Tensor, idx: dict) -> torch.Tensor:
+    """(B, 4) speed [m/s], yaw rate [rad/s], roll [rad], pitch [rad] out of the proprio vector.
+
+    The observation carries these divided by their normalisers; the warp is geometry and needs
+    metres, radians and seconds, so they are multiplied back here -- in one place, so the simulator
+    and the car cannot disagree about which column is which or what it is divided by.
+    """
+    if proprio.dim() != 2:
+        raise ValueError(f"proprio must be (B, P), got {tuple(proprio.shape)}")
+    want = int(idx["proprio_dim"])
+    if proprio.shape[1] != want:
+        raise ValueError(
+            f"the aligned channel was built for a {want}-wide proprio vector and this one is "
+            f"{proprio.shape[1]} wide. Its columns are read by index, so a different layout would "
+            f"hand the warp a prev-action where it expects a yaw rate. Rebuild the channel for this "
+            f"observation, or feed the observation it was built for.")
+    return torch.stack([proprio[:, int(idx["speed"])] * float(idx["v_max"]),
+                        proprio[:, int(idx["yaw_rate"])] * float(idx["gyro_scale"]),
+                        proprio[:, int(idx["roll"])] * float(idx["att_scale"]),
+                        proprio[:, int(idx["pitch"])] * float(idx["att_scale"])], 1)
 
 
 def decayed_occupancy(prev: torch.Tensor, scan_now: torch.Tensor, decay: float) -> torch.Tensor:
@@ -65,19 +126,26 @@ def decayed_occupancy(prev: torch.Tensor, scan_now: torch.Tensor, decay: float) 
 
 
 class ScanAugment:
-    """The extra scan channels for one inference path, with the occupancy memory's state.
+    """The extra scan channels for one inference path, with the state the stateful ones carry.
 
     `__call__` takes the stacked scan the env (or `ObsBuilder`) produced, (B, k, N), and returns
     (B, k + len(channels), N): the frames unchanged, then one row per enabled channel in
     `SCAN_CHANNELS` order. The model knows how many extra rows to expect and splits them off before
     it forms temporal deltas, so the frames keep meaning frames.
 
-    The occupancy memory is episode state and is cleared exactly where the recurrent hidden state
-    is -- see `learn.memory.PolicyRuntime`.
+    Two of the three channels carry episode state -- the occupancy memory and, when it is on, the
+    `aligned` channel's ring of scans and motion increments. Both are cleared exactly where the
+    recurrent hidden state is (`learn.memory.PolicyRuntime`), because they are the same claim about
+    what this car has seen.
+
+    `aligned` additionally needs the car's own measured motion, so `__call__` takes the proprio
+    vector beside the scan. It is optional and ignored unless that channel is on, which is what
+    keeps every existing call site -- and the byte-identical `("memory", "edges")` arms -- unchanged.
     """
 
     def __init__(self, channels: Sequence[str], n_beams: int, batch: int, device="cpu",
-                 tau_s: float = 2.0, dt: float = CONTROL_DT, dtype=torch.float32):
+                 tau_s: float = 2.0, dt: float = CONTROL_DT, dtype=torch.float32,
+                 aligned: Optional[dict] = None):
         unknown = [c for c in channels if c not in SCAN_CHANNELS]
         if unknown:
             raise ValueError(f"unknown scan channel(s) {unknown}; known: {list(SCAN_CHANNELS)}")
@@ -94,9 +162,27 @@ class ScanAugment:
         self.mem = None
         if "memory" in self.channels:
             self.mem = torch.ones(self.batch, self.n_beams, device=self.device, dtype=self.dtype)
+        self.aligned_cfg = None
+        self.aligned = None
+        if any(c in ALIGNED_CHANNELS for c in self.channels):
+            from .aligned import AlignedScan
+            if not aligned or "proprio" not in aligned:
+                raise ValueError(
+                    "the 'aligned' channel needs its spec, including the `proprio` index block "
+                    "`obs.motion_index_spec` builds: its warp reads speed, yaw rate, roll and pitch "
+                    "out of the proprio vector by index, and guessing the layout is how a channel "
+                    "silently warps with a prev-action. Pass meta['scan_channels']['aligned'].")
+            self.aligned_cfg = dict(aligned)
+            self.aligned = AlignedScan(self.n_beams, self.batch,
+                                       {k: v for k, v in aligned.items() if k != "proprio"},
+                                       device=self.device, dt=self.dt,
+                                       range_max=float(aligned["proprio"]["range_max"]),
+                                       dtype=self.dtype)
 
     def reset(self, done=None) -> None:
-        """Clear the occupancy memory: every row (`done=None`) or the rows whose episode ended."""
+        """Clear the stateful channels: every row (`done=None`) or the rows whose episode ended."""
+        if self.aligned is not None:
+            self.aligned.reset(done)
         if self.mem is None:
             return
         if done is None:
@@ -109,16 +195,37 @@ class ScanAugment:
             raise ValueError(f"episode-boundary mask must be ({self.mem.shape[0]},), got {tuple(keep.shape)}")
         self.mem = self.mem * keep[:, None] + (1.0 - keep[:, None])
 
-    def _channels(self, scan: torch.Tensor, mem: Optional[torch.Tensor]):
-        """(stacked channels, the occupancy memory this step, or None)."""
+    def _motion(self, proprio: Optional[torch.Tensor]) -> torch.Tensor:
+        if proprio is None:
+            raise ValueError(
+                "the 'aligned' channel is on and this call passed no proprio vector. The warp runs "
+                "on the car's own measured speed, yaw rate and roll/pitch, which live in the "
+                "proprio the policy is already being given -- pass it: aug(scan, proprio).")
+        return motion_from_proprio(proprio.to(self.dtype), self.aligned_cfg["proprio"])
+
+    def _channels(self, scan: torch.Tensor, mem: Optional[torch.Tensor],
+                  proprio: Optional[torch.Tensor] = None, advance: bool = True,
+                  index=None):
+        """(stacked channels, the occupancy memory this step, or None).
+
+        The aligned rows are computed ONCE however many of them are enabled: the warp is the cost
+        and asking for the mask beside the residual must not pay for it twice -- nor advance the
+        ring buffers twice, which would warp against the wrong scan.
+        """
         now = scan[:, 0].detach()
-        extra, new_mem = [], None
+        extra, new_mem, rows = [], None, None
         for name in self.channels:
             if name == "memory":
                 new_mem = decayed_occupancy(mem.to(now.dtype), now, self.decay)
                 extra.append(new_mem)
-            else:                                       # "edges"
+            elif name == "edges":
                 extra.append(scan_edges(now))
+            else:                                       # one of ALIGNED_CHANNELS
+                if rows is None:
+                    motion = self._motion(proprio)
+                    rows = (self.aligned(now, motion) if advance
+                            else self.aligned.preview(now, motion, index))
+                extra.append(rows[name])
         return torch.cat([scan, torch.stack(extra, 1).to(scan.dtype)], 1), new_mem
 
     def _check(self, scan: torch.Tensor, rows: int):
@@ -128,16 +235,17 @@ class ScanAugment:
             raise ValueError(f"scan batch {scan.shape[0]} is not the {rows} rows this call is for; "
                              f"build one augmenter per inference path")
 
-    def __call__(self, scan: torch.Tensor) -> torch.Tensor:
-        """The augmented scan for this control step; advances the occupancy memory."""
+    def __call__(self, scan: torch.Tensor, proprio: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """The augmented scan for this control step; advances every stateful channel."""
         self._check(scan, self.batch)
-        out, mem = self._channels(scan, self.mem)
+        out, mem = self._channels(scan, self.mem, proprio)
         if mem is not None:
             self.mem = mem
         return out
 
-    def preview(self, scan: torch.Tensor, index=None) -> torch.Tensor:
-        """The augmented scan this augmenter WOULD produce, without advancing its memory.
+    def preview(self, scan: torch.Tensor, index=None,
+                proprio: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """The augmented scan this augmenter WOULD produce, without advancing any of its state.
 
         For a terminal observation: it is scored (the truncation bootstrap reads its value) but
         never acted on, and advancing the memory for it would leave the next real step carrying a
@@ -148,7 +256,7 @@ class ScanAugment:
         if mem is not None and index is not None:
             mem = mem[index]
         self._check(scan, self.batch if index is None else int(len(index)))
-        return self._channels(scan, mem)[0]
+        return self._channels(scan, mem, proprio, advance=False, index=index)[0]
 
 
 @dataclass

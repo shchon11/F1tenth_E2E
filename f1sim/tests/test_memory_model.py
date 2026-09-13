@@ -153,7 +153,10 @@ def test_scan_augment_refuses_a_batch_it_holds_no_memory_for():
         aug(torch.ones(3, 1, 8))
     with pytest.raises(ValueError):
         ScanAugment(["nope"], 8, 1)
-    assert list(SCAN_CHANNELS) == ["memory", "edges"]        # the order the conv columns are in
+    # The order the conv columns are in. `aligned*` are appended after the two that existed, so a
+    # checkpoint written with ("memory", "edges") keeps both its column indices.
+    assert list(SCAN_CHANNELS) == ["memory", "edges", "aligned", "aligned_prev", "aligned_valid"]
+    assert list(SCAN_CHANNELS[:2]) == ["memory", "edges"]
 
 
 def test_feedforward_entry_points_refuse_a_memory_actor(tmp_path):
