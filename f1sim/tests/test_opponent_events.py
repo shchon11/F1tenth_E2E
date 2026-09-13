@@ -530,9 +530,16 @@ def test_the_state_machine_runs_one_event_at_a_time_for_its_declared_duration():
 
 
 def test_event_ids_are_stable():
-    """A logged id keeps its meaning: the mapping is part of the interface, not an implementation detail."""
+    """A logged id keeps its meaning: the mapping is part of the interface, not an implementation detail.
+
+    Reactive behaviours were added after these four (2026-09-13) and had to be *appended*, not
+    interleaved: every id in a log, a report or a saved JSON from before then still names the event
+    it named. So the assertion is the four originals at 1-4 and nothing shuffled, rather than an
+    exhaustive dict that has to be rewritten every time the feature grows.
+    """
     assert EVENT_NAMES == ("brake", "stop", "shift", "weave")
-    assert EVENT_ID == {"brake": 1, "stop": 2, "shift": 3, "weave": 4}
+    assert [EVENT_ID[n] for n in EVENT_NAMES] == [1, 2, 3, 4]
+    assert EVENT_ID["defend"] > 4 and len(set(EVENT_ID.values())) == len(EVENT_ID)
 
 
 # ------------------------------------------------------- the schedule two benchmarked systems meet
