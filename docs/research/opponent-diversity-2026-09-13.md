@@ -1,10 +1,19 @@
 # Opponents that behave like opponents (2026-09-13)
 
 Follow-up to [the failure attribution](failure-attribution-2026-09-13.md) §5, which found that
-traffic races end on walls during a pass and on side-by-side contacts closing at +1.5 m/s, that no
-contact ever follows a scripted opponent event, and that rear-ends essentially do not happen. The
-user's reading, which the data supports: the policy has never seen an opponent that takes a
-different line, defends, yields, contests the same gap, or simply does not see it.
+traffic races end on walls during a pass and on side-by-side contacts closing at +1.5 m/s, and that
+rear-ends essentially do not happen. The user's reading, which the data supports: the policy has
+never seen an opponent that takes a different line, defends, yields, contests the same gap, or
+simply does not see it.
+
+One column of that table has to be withdrawn and re-measured before anything else, because it is
+quoted as part of the diagnosis. §5 reports **0** contacts within 1 s of an opponent event; the
+analysis script's event detector probed for a key the env does not use and returned "no event" on
+every step, so the column was structurally zero rather than measured. Re-measured here with the
+detector fixed (section 5 of this note; REPORT.md carries the defect): 4 of the frozen original's 10 contacts
+fall within that window, against a 51 % base rate — so contacts are *under*-represented around
+events rather than absent from them, and §5's conclusion holds on a measurement instead of on an
+artefact. Everything else in §5 is untouched.
 
 This note is what the training distribution contained, what it contains now, and how much of that
 the learner actually experiences — in seconds.
@@ -19,8 +28,9 @@ back**, because an overtake is a car behind catching a car ahead.
 
 The scripted behaviours built the day before (`brake`, `stop`, `shift`, `weave`) fire on a Poisson
 timer and never look at the learner. They were accepted on "37 events in 32 races" — that they
-fire. §5 then measured that not one contact followed an event within a second, which is the same
-statement from the other side: an event that fires while the learner is 40 m away is not a lesson.
+fire. With the detector repaired, the contacts that follow one within a second are fewer than
+chance would give (section 5), which is the same statement from the other side: an event that fires
+while the learner is 40 m away is not a lesson.
 
 ## 2. What is there now
 
@@ -71,11 +81,23 @@ transitions a PPO update would use.
 
 * **before** = today's opponent: `--race-size 2 --opponent mixed --mixed-teacher-frac 0.5
   --opp-speed 0.5 1.0` (recipe A's own setting), `--spawn-order behind`.
-* **after** = `--opponent pool --opp-pool teacher,self,A701,frozen --opp-events
-  defend,yield,line,oblivious --opp-defend-prob 0.5 --opp-yield-prob 0.35 --opp-line-prob 0.5
-  --opp-oblivious-prob 0.3 --spawn-order random --opp-speed 0.6 1.2`.
+* **after** = `--opponent pool --opp-pool teacher,teacher,self,A701 --opp-events
+  defend,yield,line,oblivious --opp-defend-prob 0.8 --opp-yield-prob 0.6 --opp-line-prob 0.8
+  --opp-oblivious-prob 0.4 --spawn-order random --opp-speed 0.6 1.2`, where `A701` is
+  `cl_origrecipe_legacy_s701/ppo_final.pt`, the best system on suite v1. `teacher` is listed twice
+  because the draw is uniform over entries, so repetition is how a population is weighted: half the
+  races get a scripted car carrying the reactive behaviours, a quarter are self-play, a quarter face
+  a stronger trained policy.
 * **after, three cars** = the same with `--race-size 3` (21 races × 3 cars), which is the only
   configuration in which "two opponents in range" can happen at all.
+
+The first version of the after arm was **four distinct pool entries at probabilities
+0.5 / 0.35 / 0.5 / 0.3**, and the census rejected it: defended against 1.3 % of learner-seconds seen
+by 4 of 64 cars, yielded to 0.1 % by 2, oblivious 0.5 % by 4, own-line 2.5 % by 6. Present, but too
+thin to be a training distribution — one teacher entry in four means the reactive behaviours are
+available in a quarter of races before their own probability is applied. It is kept in
+`out/config.sh` as `ARM_B0`, because "the census rejected this configuration" is the evidence that
+the census is load-bearing rather than decorative.
 
 ### Situation census: learner-seconds, and how many of the learner's cars ever saw it
 
@@ -98,10 +120,10 @@ transitions a PPO update would use.
 * **before** — `race 2 | teacher / self-play per race | speed x0.5-1 | spawn behind gap 2.5-6 m | opponent events off`
   * 32 races x 1200 steps, 64 learner cars, 1486 learner-seconds, 96 episodes ended, seed 4401, 165 s wall on CUDA
   * grids drawn (cars that saw each): behind 56, ahead 0, alongside 0
-* **after** — `race 2 | pool cl_origrecipe_legacy_s701/ppo_final.pt | speed x0.6-1.2 | spawn random gap 2.5-6 m | reactive defend p=0.8, yield p=0.6, line p=0.8, oblivious p=0.4`
+* **after** — `race 2 | pool teacher,teacher,self,cl_origrecipe_legacy_s701/ppo_final.pt | speed x0.6-1.2 | spawn random gap 2.5-6 m | reactive defend p=0.8, yield p=0.6, line p=0.8, oblivious p=0.4`
   * 32 races x 1200 steps, 64 learner cars, 1213 learner-seconds, 108 episodes ended, seed 4401, 101 s wall on CUDA
   * grids drawn (cars that saw each): behind 29, ahead 23, alongside 21; pool loaded: 2:ppo_final.pt
-* **after, 3 cars** — `race 3 | pool cl_origrecipe_legacy_s701/ppo_final.pt | speed x0.6-1.2 | spawn random gap 2.5-6 m | reactive defend p=0.8, yield p=0.6, line p=0.8, oblivious p=0.4`
+* **after, 3 cars** — `race 3 | pool teacher,teacher,self,cl_origrecipe_legacy_s701/ppo_final.pt | speed x0.6-1.2 | spawn random gap 2.5-6 m | reactive defend p=0.8, yield p=0.6, line p=0.8, oblivious p=0.4`
   * 21 races x 1200 steps, 63 learner cars, 930 learner-seconds, 102 episodes ended, seed 4401, 209 s wall on CUDA
   * grids drawn (cars that saw each): behind 16, ahead 8, alongside 10; pool loaded: 2:ppo_final.pt
 
@@ -202,18 +224,27 @@ and a p99 of 0.20 per step. Over the ~1.2 s a pass takes, that is about 3 units 
 collision worth −10 and a per-lap progress reward of order 30 — so where it fires, it is a real
 term, not a rounding error.
 
-The reading is therefore not "the term is too small" but "**the term is off 93 % of the time and the
-gradient only exists inside the last 0.9 m**". Two consequences root may want to weigh, neither of
-which this branch acts on:
+**And inside that window it grades the gap properly.** The lateral body gap while alongside has a
+median of 0.25–0.32 m and a p90 of 0.48–0.59 m, which against the 0.9 m `car_safe_gap` puts the term
+at 0.72, 0.47 and 0.14 of full strength at the p50, p90 and p99 of the gaps the learner actually
+passes at. It is not saturated and it is not in the noise: over the range a pass happens in, it is a
+term that can tell a rub from a clean pass.
 
-* The quantity a pass is decided by is the lateral gap, and while alongside its median is 0.25–0.32 m
-  with a p90 of 0.48–0.59 m — the learner does pass within a body width. A term that starts at 0.9 m
-  of *Euclidean body gap* is already saturated over most of that range, so what it mostly grades is
-  "how alongside", not "how much room did you leave".
-* A signal that exists for 6 % of steps is a signal with a 6 % duty cycle against a reward that is
-  dense everywhere else. If the intent is "leave room during a pass", the same 0.8 charged over a
-  wider gap, or a term on the lateral component alone, would have a duty cycle that matches how often
-  the situation occurs. That is a reward change and out of scope here; the number is the input to it.
+So the finding is narrow and specific: **the term is well-shaped where it applies and applies to
+6–7 % of steps.** Two things follow, neither of which this branch acts on:
+
+* **Opponent diversity does not fix the duty cycle.** The share of steps on which the term is
+  nonzero went 6.6 % → 6.9 % → 7.0 % across the three arms, and the alongside share 3.2 % → 4.0 % →
+  3.9 %. What decides it is how much of a race is spent within 0.9 m of another body, and a richer
+  opponent population barely moves that. If the duty cycle is the problem, it has to be fixed in the
+  reward, not in the distribution.
+* **Whether a 6 % duty cycle is a problem is a question about the optimiser, not about the term.**
+  Charged at 0.8 it pays about 3 units over a 1.2 s pass, against a −10 collision that fires once
+  per several hundred passes — so per *pass* the dense term is already the larger signal. The case
+  for widening the gap or reading only the lateral component is that it would grade the approach as
+  well as the overlap; the case against is that the number above says the term is doing its job
+  where it fires. That is a reward decision and it belongs to root; what was missing was the
+  measurement, and it is above.
 
 ## 5. Smoke: does a recipe-A finetune still run, and does the attribution move?
 
