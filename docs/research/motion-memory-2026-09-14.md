@@ -253,6 +253,53 @@ magnitude — which is what a convolutional stem is in a position to use. And it
 on the floor: these recordings have people beside the track and, in some, another car, so an unknown
 part of those 3.9 % is real motion that the channel is right to report.
 
+### The noise floor, in simulation
+
+`python -m f1sim.learn.aligned_floor sim`. Solo races — no other car anywhere — with the procedural
+obstacle layouts on and the attitude randomisation on, driven by the frozen original so the ego
+motion is a policy's and not a fixture's. **Every residual there is error by construction**, which is
+the thing the real recordings cannot say. The simulated attitude estimate is harsher than the usable
+recordings' — |roll, pitch| rms 11.0 deg against 6.2 — because the plant models the VESC estimate's
+drift, which is exactly the defect the five refused recordings exhibit.
+
+Ungated, literal residual (`--tol-beams 0`), by lag:
+
+| k | bins predicted | σ (p68 of \|R\|) | \|R\| p50 | p90 | p99 |
+|---|---|---|---|---|---|
+| 2 | 80.5 % | 0.030 m | 0.020 | 0.065 | 0.635 |
+| **4** | **68.0 %** | **0.045 m** | **0.030** | **0.100** | **1.245** |
+| 8 | 48.2 % | 0.075 m | 0.050 | 0.170 | 2.320 |
+
+σ in simulation is about twice the real recordings' 0.025 m, so the declared **τ = 0.075 m is 3 σ on
+the bags and 1.7 σ here** — which is the right direction for a threshold that was fixed on the data
+the car will actually see, and the reason the sim floor below is the more pessimistic of the two.
+
+The declared configuration (k = 4, τ = 0.075 m, consistency ±8 beams), with the same channel told
+the car is level as the control:
+
+| | attitude change used | attitude ignored |
+|---|---|---|
+| bins predicted | 72.5 % | 91.7 % |
+| over τ | 7.9 % | 8.8 % |
+| **surviving the consistency test** | **4.9 %** | 6.8 % |
+| the survivors' \|R\| | p50 0.055 m, p99 **5.34 m** | p50 0.085 m, p99 **6.83 m** |
+| run lengths | p50 2, p90 8 beams | p50 2, p90 8 |
+| share of flagged beams in runs ≥ 20 | **20 %** | 23 % |
+
+Two readings worth separating:
+
+* **the tilt handling trades coverage for the tail.** Ignoring the attitude predicts a fifth more
+  bins and pays for it in the p99 of the residual (2.38 m vs 1.15 m ungated, 6.83 m vs 5.34 m among
+  the survivors) and in a false-positive rate a third higher. The out-of-plane test is discarding
+  points the two scan planes genuinely do not share, which is what it is for.
+* **the survivors look different from an object.** In simulation, where every one of them is error,
+  they come in runs of median 2 and p90 8 beams, and only 20 % of flagged beams sit in a run of 20 or
+  more. On the real recordings the same configuration gives runs of median 5 and p90 27, with 57 % in
+  runs of ≥ 20 — and those recordings contain people beside the track and, in some, another car. The
+  difference in *extent*, not only in magnitude, is what a convolutional stem is in a position to
+  use, and it is also the strongest evidence available here that a good part of the 3.8 % on the bags
+  is real motion the channel is right to report.
+
 **The warp is doing the work it claims.** On a clean recording, with everything else fixed, the share
 of beams surviving the gate moves as:
 
@@ -289,3 +336,77 @@ operator-launch bound rather than arithmetic bound (the warp is ~2 M multiply-ac
 0.57 ms of this desktop's Python/dispatch overhead and would not scale down on a slower core the way
 the convolutions do. It is 2.3 % of the car's 25 ms step as measured; if the Jetson proves tight the
 remedy is fusing the channel, not shrinking it.
+
+
+## E3 — a second state, and the auxiliaries that are allowed to shape it
+
+### Why the state is split rather than asked for more
+
+The E1 table says the recurrent state carries the ego's own motion at R² 0.9 and the opponent's
+relative velocity at 0.1–0.2. Handing that same GRU an extra input and an extra loss would not
+change the incentive that produced the asymmetry: whatever the loss, ego dynamics are the cheapest
+way to reduce it, and the state would go on spending itself on them. So the recurrence is split.
+
+```
+current LiDAR ------ scan stem --------------> main GRU (128) ---+
+aligned rows ------- motion encoder --------> motion GRU (h_dyn <= 64) ---+---> plan head
+                          |                        |
+                          +-- per-beam mask        +-- current Dv, and the 0.5 s future head
+```
+
+Both enter the plan head's first preactivation through their own bias-free, zero-initialised
+projection, which is the construction the conditioning and the memory already use and buys the same
+two things: at step 0 the actor is bit-identical to the checkpoint it was warm-started from, and the
+new path's gradient is nonzero from the first update.
+
+`h_dyn` is carried **inside the same hidden tensor** as the main state, `[h_main | h_dyn]`. That is
+not a detail: the hidden state is written into the rollout buffers, masked by the truncation
+boundary, carried across the ROS node's scan callbacks, copied into the viewer's static CUDA-graph
+buffer and exported as ONNX's `hidden` input. Every one of those is written against a width and none
+of them has to learn that there are now two states.
+
+### The auxiliaries attach to the motion branch and to nothing else
+
+This is the addendum's requirement and it is the property the whole split exists for, so it is
+tested as a fact about the autograd graph rather than asserted in a comment: back-propagate from the
+two auxiliary losses and from the future head, and the set of parameters that received a gradient
+must be exactly the motion encoder, the motion GRU and the heads themselves — not the scan stem, not
+the main GRU, not the MLP, not the action head, not the critic.
+
+| stage | flag | loss | label |
+|---|---|---|---|
+| E3-a | `--aux-opp-mask` | weighted BCE on a per-beam "is this beam on another car" logit read from the motion **encoder**'s features | the LiDAR's own `scan_type == HIT_CAR`, which the simulator has classified since cars were cast as meshes — privileged, train-time, and already there |
+| E3-b | `--aux-motion` | MSE on the nearest opponent's **current** relative velocity, read from `h_dyn` | the k = 0 row of the same privileged snapshot the future head uses, presence-masked |
+| E3-c | `--aux-future` | the existing 0.5 s head, now reading `h_dyn` | unchanged |
+
+Two details that would otherwise be invisible. The mask's positive weight is the reciprocal of the
+batch's own positive rate, **clamped at 50**: a car covers a few percent of the beams when it is
+there at all and none when it is not, so an unclamped weight would let one frame with a single
+car-hit beam dominate an update; the loss reports the rate it saw and the weight it used, plus recall
+and precision, because a BCE that falls while the head answers "no car" everywhere is the failure
+this label invites. And the mask logits are **train-time only**: neither head is called by the
+actor's forward, so the traced ONNX graph cannot contain them, while the motion branch itself is
+exported because it is part of the policy.
+
+## E4 — scope only
+
+The question E4 asks is whether this representation can be built **without privileged labels**. The
+candidate is a per-beam, self-supervised target with a label on every step:
+
+    y_t(θ) = L_{t+k}(θ) − static_render(pose_{t+k}, att_{t+k})(θ)
+
+— the scan k steps from now, minus what the static world alone would have returned from the same
+pose and the same roll/pitch with the other cars removed. What is left is everything that moved by
+itself, at full beam resolution, and unlike the beam mask it needs no `scan_type` and no privileged
+vector: it is a difference of two range images the simulator can produce for any scene.
+
+What it needs at train time is **one extra LiDAR cast per env step** — the same `Lidar.scan` the step
+already runs, with `cars=None`, at the pose and attitude the step just produced, kept in a k-deep
+ring so that step t's label is available at step t + k. `work/e4/cost.py` measures exactly that and
+nothing else.
+
+It is not free of assumptions: on the car the same label would need a map and a pose, so it is a
+training-time target either way. What it buys over the E3 auxiliaries is scale — every beam of every
+step is labelled, against the ~20 % of steps the future head can label after its boundary masking —
+and independence from the simulator's privileged state, which is what makes it the honest answer to
+"could this have been learned from data a real car could collect". Not implemented.
