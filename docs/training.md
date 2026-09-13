@@ -249,6 +249,10 @@ Three details are not decoration:
 * **a no-return warps as a lower bound, not a point.** "Nothing out to `range_max`, that way" stays
   a bound after the car moves, so only something appearing *closer* than it counts. Treated as a
   point, every far beam of every straight would report the ego's own 0.9 m of travel as motion.
+* **only the attitude's CHANGE is used**, both tilts taken relative to their own midpoint. The VESC
+  attitude estimate is biased and drifts — 11° rms in simulation, past 40° in five of the thirteen
+  competition recordings — and the absolute value tilts the frame the ego's arcs are integrated in.
+  Measured on a clean recording: coverage 70 % → 82 % of beams, false positives 2.89 % → 2.67 %.
 * **`aligned_valid` is a real channel.** A bin no warped point reached, or one where the current
   beam did not return, is *unknown*; the residual there is exactly 0 and the mask says so. "I cannot
   tell" and "nothing moved" must not be the same number.
