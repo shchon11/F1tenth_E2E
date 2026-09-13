@@ -105,13 +105,18 @@ class Logger:
         return self._add(name)
 
 
-def make_node(spec=None, enabled=True, timeout=0.25, traction=None):
+def make_node(spec=None, enabled=True, timeout=0.25, traction=None, clearance=None):
     """A PolicyNode with every ROS dependency replaced, and its real methods intact.
 
     `traction` is a `TractionGuard` or None; None is the node's own default (`traction:=off`), which
     is what every test in this file wants -- the sensor contract is about what reaches the actor and
     what is published, and the guard must not move either while it is off. The traction guard's own
     node-level behaviour is `test_policy_node_traction.py`.
+
+    `clearance` is the same story for the plan-geometry layer, and None is likewise off. Its own
+    node-level behaviour is `test_policy_node_clearance.py`. Both are listed explicitly rather than
+    read with `getattr`: this stub builds the node by hand, so a field the real `__init__` sets and
+    this does not is a hole in the stub, and the right place to notice it is here.
     """
     spec = spec or ObsSpec(n_beams=64, scan_stack=2, scan_stride=1, action_history=2,
                            act_dim=2, hist_len=0, range_max=10.0, v_max=8.0)
@@ -134,6 +139,8 @@ def make_node(spec=None, enabled=True, timeout=0.25, traction=None):
     n.tracker = None
     n.cal = (0.0, 1.0, 1.0)
     n.traction = traction
+    n.clearance = clearance
+    n._scan_geometry_checked = clearance is None      # nothing to re-declare when nothing is installed
     n.ax_body = None
     n.t_ax = None
     n.motor_current = None

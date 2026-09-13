@@ -141,6 +141,9 @@ def make_node(traction="on", overrides="", speed_frac=-1.0, cal=(0.0, 1.0, 1.0),
     n._now = 100.0
     n.traction_arm = traction
     n.traction = pn.build_traction_guard(traction, overrides)
+    # The guard is what this file is about; the plan-geometry layer stays off so the only
+    # thing shaping the published speed is the one under test.
+    n.clearance = None; n._scan_geometry_checked = True
     n.ax_body = None; n.t_ax = None
     n.motor_current = None; n.t_current = None
     n.get_logger = lambda: n._log
