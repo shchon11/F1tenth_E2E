@@ -114,15 +114,27 @@ class GRUMemory(nn.Module):
         return self.hidden_size + self.motion_size
 
     def split(self, h: Optional[torch.Tensor]):
-        """(main state, motion state or None) out of the carried tensor."""
+        """(main state, motion state or None) out of the carried tensor, **contiguous**.
+
+        The `.contiguous()` is not defensive tidiness: a slice on the feature axis is a strided
+        view, and cuDNN's GRU refuses a non-contiguous `hx` with `rnn: hx is not contiguous`. It
+        does not refuse it under `--amp`, because autocast casts the state on the way in and the
+        cast makes a contiguous copy -- so without this, TRAINING works and every path that runs the
+        policy without autocast (the probe, `evaluate`, the ROS node, the ONNX export) fails on
+        CUDA. That asymmetry is exactly how a bug reaches deployment past a green training run, and
+        it cost this branch two probe slots before it was found.
+
+        Two small copies per control step, (layers, batch, hidden) each.
+        """
         if h is None:
             return None, None
         if self.motion is None:
-            return h, None
+            return h.contiguous(), None
         if h.shape[-1] != self.total_size:
             raise ValueError(f"hidden state is {h.shape[-1]} wide and this memory carries "
                              f"{self.hidden_size} + {self.motion_size} = {self.total_size}")
-        return h[..., :self.hidden_size], h[..., self.hidden_size:]
+        return (h[..., :self.hidden_size].contiguous(),
+                h[..., self.hidden_size:].contiguous())
 
     def initial(self, batch: int, device=None, dtype=None) -> torch.Tensor:
         ref = self.out.weight

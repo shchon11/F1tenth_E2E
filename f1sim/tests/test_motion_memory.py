@@ -129,6 +129,31 @@ def test_h_dyn_rides_inside_the_one_hidden_tensor():
     assert h1.shape == h.shape
 
 
+def test_the_split_states_are_contiguous():
+    """cuDNN's GRU refuses a non-contiguous `hx`, and autocast hides it.
+
+    A slice on the feature axis is a strided view. Under `--amp` the autocast cast makes a
+    contiguous copy on the way in, so training passes and every path that runs the policy WITHOUT
+    autocast -- the probe, `evaluate`, the ROS node, the ONNX export -- fails on CUDA. The property
+    is asserted on the tensors rather than on a backend, so it holds wherever the test runs.
+    """
+    m = build()
+    mem = m.actor.memory
+    h = m.actor.initial_hidden(5)
+    main, dyn = mem.split(h)
+    assert main.is_contiguous() and dyn.is_contiguous()
+    # and after a step, where the state is the GRU's own output concatenated back together
+    scan, pro, _priv = inputs(batch=5)
+    with torch.no_grad():
+        _mu, h1 = m.actor.step(scan, pro, None, h)
+    m1, d1 = mem.split(h1)
+    assert m1.is_contiguous() and d1.is_contiguous()
+    # a memory with no motion branch hands back a contiguous state too
+    torch.manual_seed(0)
+    plain = ActorCritic(**SMALL, memory=memory_spec(hidden_size=32))
+    assert plain.actor.memory.split(plain.actor.initial_hidden(3))[0].is_contiguous()
+
+
 def test_the_probe_reads_the_whole_state_and_the_heads_read_h_dyn():
     """One function apart, and the difference is the addendum's requirement, not an accident."""
     m = build()
