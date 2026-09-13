@@ -219,6 +219,39 @@ policy at a ~2 % lap-time cost. `controller:=legacy` is the untouched tracker. T
 `reactive` arms are simulator research arms and are refused here. The startup log line names the arm
 and the friction in force. Unit tests: `f1sim/tests/test_policy_node_grip.py`.
 
+### `+clearance` — the plan kept off what `/scan` can see
+
+`controller:=fixed_low+clearance` (or `clearance` on its own) adds the geometry layer described in
+[training.md](training.md#clearance--the-plan-kept-off-what-the-lidar-can-see). Every scan callback
+it turns **that scan and nothing else** into a coarse occupancy grid in the car's own frame, builds
+a distance field on it, and bends or slows the plan until every point of it keeps
+`clearance_margin` (default 0.20 m body edge, 0.34 m from a plan point to the nearest return) from
+anything the scanner saw. There is no map on this path, no pose, and no state carried between
+scans — which is the reason the simulator and the car can run the same module unmodified.
+
+```bash
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p controller:=fixed_low+clearance
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p controller:=fixed_low+clearance \
+  -p clearance_margin:=0.25
+```
+
+Three things worth knowing before it drives:
+
+* It binds `PlanTracker._plan_hook` while `fixed_low` binds `._solver`, so the two are installed
+  independently and the order cannot change what is published.
+* The grid is built from the beam *bearings*, so the node checks the first `LaserScan`'s own
+  `angle_min` / `angle_max` against the nominal 270° window and re-declares them if the driver
+  publishes something else, logging that it did. A window taken on trust would put every return at
+  a bearing it does not have, and nothing downstream would look wrong.
+* `base_link → laser` is taken as (0.297, 0, 0.110), the value `/tf_static` carries in all 22
+  recordings. The plan is in `base_link` and the returns are in the sensor's frame; 0.297 m is one
+  and a half of the margin being defended, so a node on a car with a different mount needs this
+  changed in `policy_node.LIDAR_MOUNT_X` before the arm means anything.
+
+Cost on this desk's CPU, single thread, batch 1: **1.25 ms** of the 25 ms a 40 Hz scan allows
+(`python3 -m f1sim.learn.budget --clearance`). It never raises a commanded speed. Unit tests:
+`f1sim/tests/test_policy_node_clearance.py`.
+
 ## Traction guard
 
 `policy_node` can watch the wheel for lock-up and spin and shape the speed command it publishes.
@@ -282,6 +315,8 @@ State changes are logged at INFO with the numbers behind them:
 
 | parameter | default | meaning |
 | --- | --- | --- |
+| `controller` | `fixed_low` | `legacy`, `fixed_low`, `clearance`, `fixed_low+clearance`. Anything else — the simulator's `oracle` / `estimated` / `+tcs` arms — is refused rather than silently downgraded |
+| `clearance_margin` | `0.0` | body-edge margin for a `+clearance` arm, in metres; `0.0` means the module default (0.20 m) |
 | `traction` | `off` | `off` installs nothing at all; `on` installs the replay-validated guard. Anything else is refused |
 | `traction_params` | `""` | `NAME=VALUE` pairs (comma or space separated) overriding any field of `TractionParams` — every threshold above is reachable from the launch line |
 

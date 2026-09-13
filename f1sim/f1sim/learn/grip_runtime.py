@@ -5,12 +5,23 @@
     oracle      mu = the episode's true friction, per env (lab only)
     estimated   mu = the frozen estimator's filtered lower quantile, from causal sensors only
 
-and, composable on top of any of them (`tcs`, `fixed_low+tcs`, ...):
+and, composable on top of any of them and on each other (`tcs`, `fixed_low+clearance`,
+`fixed_low+clearance+tcs`, ...):
 
+    +clearance  a local occupancy built from the current LiDAR frame alone, and the policy's plan
+                bent and slowed until every point of it keeps a stated body-edge margin from
+                anything the scan saw. See `clearance.py`. Orthogonal to the four above: those
+                decide what friction the tracker plans under, this decides what geometry it is
+                handed. It sits on `tracker._plan_hook` while they sit on `tracker._solver`, so
+                the two cannot overwrite each other and the installation order cannot change the
+                command.
     +tcs        the car's own `TractionGuard` shaping the speed command between the controller and
                 the VESC, fed from the simulated ERPM odometry and IMU. See `traction_arm.py`.
                 Orthogonal to the four above: those decide what friction the *tracker* plans under,
                 this decides what happens when a wheel lets go anyway.
+
+The suffixes are written in the order the car meets them -- plan, tracker, wheels -- so the
+deployment composite reads `fixed_low+clearance+tcs`.
 
 The actor is unchanged in all of them: proprio 366 in, 8D plan out. Only the controller between the
 plan and the wheels differs, which is what makes the comparison about knowing the friction.
@@ -34,7 +45,7 @@ backend's. **This module never smooths twice**: it calls `lower_mu` and uses wha
 from __future__ import annotations
 
 from collections import deque
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -43,26 +54,45 @@ from . import grip_control as gc
 #: The plan-tracker arms. `legacy` is the untouched path and installs nothing.
 BASE_ARMS = ("legacy", "fixed_low", "oracle", "estimated")
 
-#: The arms, including the in-simulator traction guard. `tcs` is a *composable* arm: it shapes the
-#: speed command between the controller and the VESC, so it is orthogonal to what the tracker's
-#: friction is set from and can be worn on top of any of the four. `tcs` on its own is the legacy
-#: tracker plus the guard; `fixed_low+tcs` is the deployment default (the control arm the benchmark
-#: roster runs, with the guard the car ships). Spelling them out rather than parsing on the fly is
-#: what lets `benchmark/roster.py` keep validating `controller_arm in ARMS` unchanged, and what
-#: makes `--controller` reject `tcs+fixed_low` or `legacy+tcs` instead of quietly accepting a second
-#: name for something that already has one.
-ARMS = BASE_ARMS + ("tcs", "fixed_low+tcs", "oracle+tcs", "estimated+tcs")
+#: The composable layers, in the order the car meets them: the plan reaches the tracker, the
+#: tracker's command reaches the wheels. A name lists the tracker base first (omitted when it is
+#: `legacy`, which installs nothing) and then the layers it wears, in this order.
+LAYERS = ("clearance", "tcs")
 
 
-def split_arm(arm: str) -> tuple:
-    """`"fixed_low+tcs"` -> `("fixed_low", True)`; `"tcs"` -> `("legacy", True)`."""
+def _compose(base: str, layers: tuple) -> str:
+    parts = ([] if base == "legacy" else [base]) + list(layers)
+    return "+".join(parts) or "legacy"
+
+
+#: Every arm, spelled out. Two layers are *composable*: `clearance` adjusts the plan before the
+#: tracker decodes it and `tcs` shapes the speed command between the tracker and the VESC, so
+#: neither changes what the tracker's friction is set from and either can be worn on top of any of
+#: the four bases and of each other. `tcs` on its own is the legacy tracker plus the guard;
+#: `fixed_low+tcs` is the deployment default today. Spelling them out rather than parsing on the fly
+#: is what lets `benchmark/roster.py` keep validating `controller_arm in ARMS` unchanged, and what
+#: makes `--controller` reject `tcs+fixed_low` or `legacy+clearance` instead of quietly accepting a
+#: second name for something that already has one.
+ARMS = tuple(_compose(base, layers)
+             for base in BASE_ARMS
+             for layers in ((), ("clearance",), ("tcs",), ("clearance", "tcs")))
+
+
+class ArmParts(NamedTuple):
+    """`split_arm`'s answer. A tuple, so `[0]` is still the tracker base and `[1]` still `tcs`."""
+    base: str
+    tcs: bool
+    clearance: bool
+
+
+def split_arm(arm: str) -> ArmParts:
+    """`"fixed_low+clearance"` -> `("fixed_low", False, True)`; `"tcs"` -> `("legacy", True, False)`."""
     if arm not in ARMS:
         raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
-    if arm == "tcs":
-        return "legacy", True
-    if arm.endswith("+tcs"):
-        return arm[:-4], True
-    return arm, False
+    parts = arm.split("+")
+    base = "legacy" if parts[0] in LAYERS else parts[0]
+    worn = parts if parts[0] in LAYERS else parts[1:]
+    return ArmParts(base, "tcs" in worn, "clearance" in worn)
 
 
 #: B3's predeclared flag thresholds. Fixed before any evaluation; a flag never retunes anything.
@@ -271,21 +301,25 @@ class ControllerRuntime:
 
     def __init__(self, env, arm: str, estimator_path: Optional[str] = None,
                  gspec: Optional[gc.GripSpec] = None, device=None,
-                 traction_params=None):
-        base, tcs = split_arm(arm)
+                 traction_params=None, clearance_spec=None):
+        base, tcs, clear = split_arm(arm)
         if base == "estimated" and not estimator_path:
             raise ValueError("the estimated arm needs --estimator PATH; it has no default")
         if base != "estimated" and estimator_path:
             raise ValueError(f"--estimator is only meaningful for the estimated arm, not {arm!r}")
         if traction_params is not None and not tcs:
             raise ValueError(f"traction parameters are only meaningful for a +tcs arm, not {arm!r}")
+        if clearance_spec is not None and not clear:
+            raise ValueError(f"a clearance spec is only meaningful for a +clearance arm, not {arm!r}")
         self.env, self.arm = env, arm
-        #: The tracker arm underneath, and whether the traction guard rides on top. Every branch
-        #: below keys off `base`, so `fixed_low+tcs` is `fixed_low` plus a shaper and nothing else
-        #: about the tracker changes.
-        self.base, self.tcs = base, tcs
+        #: The tracker arm underneath, and which composable layers ride on top. Every branch below
+        #: keys off `base`, so `fixed_low+clearance` is `fixed_low` plus a plan shaper and nothing
+        #: else about the tracker changes.
+        self.base, self.tcs, self.clear = base, tcs, clear
         self.traction = None
         self.traction_params = traction_params
+        self.clearance = None
+        self.clearance_spec = clearance_spec
         self.device = torch.device(device or env.device)
         self.B = int(env.B)
         self.estimator_path = estimator_path
@@ -322,13 +356,19 @@ class ControllerRuntime:
         """
         if self._installed:
             raise RuntimeError("already installed")
+        if self.clear:
+            # Independent of the tracker's friction, and installed before or after the grip solver
+            # indifferently: this binds `tracker._plan_hook`, that binds `tracker._solver`. It has
+            # to come before the first step, not before the graph capture, because the plan hook is
+            # not part of anything captured -- it produces the action the captured solver is fed.
+            self.clearance = self._build_clearance().install()
         if self.tcs:
             # Independent of the tracker: the guard sits on the speed command, not on the plan, so
             # it works in `--action-mode direct` as well and needs nothing captured first.
             from .traction_arm import TractionArm
             self.traction = TractionArm(self.env, self.traction_params, device=self.device).install()
         if self.base == "legacy":
-            self._installed = True                 # nothing more to install, by definition
+            self._installed = True                 # no tracker friction to install, by definition
             return self
         tracker = self.env.tracker
         if tracker is None:
@@ -346,6 +386,30 @@ class ControllerRuntime:
         self.spy = IssuedCommandSpy(self.env).install()
         self._installed = True
         return self
+
+    def _build_clearance(self):
+        """The `clearance` layer, built from this environment's own sensor geometry.
+
+        Nominal, not per-env: `mount_x` and the beam bearings come from the configuration, not from
+        the randomized `sim.P`. The car does not know its own mounting error either, and an arm that
+        read the draw would be using a number that does not exist onboard -- the same rule the
+        estimated arm keeps about friction.
+        """
+        from . import clearance as cl
+        tracker = self.env.tracker
+        if tracker is None:
+            raise RuntimeError("the clearance arm needs the plan tracker (--action-mode plan)")
+        lidar = self.env.cfg.lidar
+        sub = max(1, int(getattr(self.env.ecfg, "scan_subsample", 1)))
+        angles = cl.beam_angles(lidar.n_beams, lidar.fov, device=self.device)[::sub]
+        if angles.numel() != int(self.env.n_beams):
+            raise RuntimeError(f"{angles.numel()} bearings for the {self.env.n_beams} beams this "
+                               f"env reports: the grid would be built from bearings the returns do "
+                               f"not have")
+        return cl.ClearanceArm(tracker, self.clearance_spec or cl.ClearanceSpec(), self.B,
+                               self.device, float(self.env.ecfg.v_max_policy), angles,
+                               float(self.env.range_max), float(lidar.mount_x),
+                               float(lidar.mount_y))
 
     def adopt(self) -> None:
         """Transfer the grip solver graph to the calling thread (viewer: the sim thread). See
@@ -382,7 +446,9 @@ class ControllerRuntime:
             self.spy.release()
         if self.traction is not None:
             self.traction.release()
-        self.grip = self.spy = self.traction = None
+        if self.clearance is not None:
+            self.clearance.release()
+        self.grip = self.spy = self.traction = self.clearance = None
         self._installed = False
 
     def begin(self, obs: dict) -> None:
@@ -405,6 +471,12 @@ class ControllerRuntime:
     @torch.no_grad()
     def pre_action(self, obs: dict) -> Optional[torch.Tensor]:
         """Advance the history, infer the friction, and hand it to the MPC. Before the action."""
+        if self.clearance is not None:
+            # This step's own LiDAR frame, before the action it will shape is asked for. There is no
+            # episode state to clear: the arm holds one frame and nothing carried across a boundary,
+            # and the observation `step()` returned for a just-reset env is already the new
+            # episode's scan.
+            self.clearance.update_scan(obs["scan"])
         if self.traction is not None:
             # A finished episode is a sensor gap: a new car, on a new surface, possibly at a
             # different speed. Carrying a latched release across it would release the brake of a
@@ -522,6 +594,8 @@ class ControllerRuntime:
     def collect_metrics(self) -> tuple[dict, list[str]]:
         """Drain the update's sums and evaluate B3's flags. One host synchronise, once per update."""
         tcs_d = self.traction.metrics() if self.traction is not None else {}
+        if self.clearance is not None:
+            tcs_d.update(self.clearance.metrics())
         if self.acc.steps == 0:
             return tcs_d, []
         raw = self.acc.read()
@@ -544,6 +618,10 @@ class ControllerRuntime:
             # release authority and a specific lock gate; a consumer that installs different ones is
             # not running the controller this checkpoint was trained against.
             meta["traction"] = self.traction.meta()
+        if self.clearance is not None:
+            # The margin, the grid and the beam geometry the plan was judged against. A result
+            # produced at 0.20 m through a 0.06 m grid is not the same system as one at 0.10 m.
+            meta["clearance"] = self.clearance.meta()
         if self.estimator is not None:
             e = self.estimator
             meta["estimator"] = {

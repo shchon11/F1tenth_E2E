@@ -99,6 +99,67 @@ def actor_step_ms(model, device="cpu", batch: int = 1, iters: int = 200, threads
     return {"forward_ms": fwd, "channels_ms": ch, "step_ms": fwd + ch}
 
 
+def clearance_step_ms(device="cpu", batch: int = 1, iters: int = 200, threads: int = 1,
+                      repeats: int = 5, cspec=None, n_beams: int = 1081,
+                      fov: float = 4.71238898, range_max: float = 10.0) -> dict:
+    """Milliseconds per control step for the `clearance` arm, under the same `PROTOCOL`.
+
+    Returns {"grid_ms", "adjust_ms", "step_ms"}: building the local occupancy and its distance
+    field, choosing and applying the adjustment, and their sum -- which is what the arm adds to the
+    25 ms the car has. It is a different kind of cost from the actor's forward (a few thousand
+    elementwise passes over a small grid rather than a convolution stack), so it is reported beside
+    the network rather than folded into its ratio.
+
+    The scan is a synthetic corridor with an obstacle, not zeros: an empty scan leaves the
+    occupancy empty, the distance field saturated and the candidate search unanimous, which times
+    the cheapest path the arm has rather than the one it runs.
+    """
+    import math
+
+    from torch.utils import benchmark
+
+    from . import clearance as cl
+    from .. import mpc as _mpc
+
+    spec = (cspec or cl.ClearanceSpec()).validate()
+    ang = cl.beam_angles(n_beams, fov, device=device)
+    sa, ca = torch.sin(ang), torch.cos(ang)
+    r = torch.full((batch, n_beams), range_max, device=device)
+    for sgn in (1.0, -1.0):                       # a 1.6 m corridor
+        t = torch.where(sa * sgn > 1e-6, 0.8 / (sa * sgn).clamp_min(1e-6), torch.full_like(sa, 1e9))
+        r = torch.minimum(r, t[None])
+    b = ca * -2.0                                 # and a 0.2 m post 2 m ahead, slightly to one side
+    c = 2.0 ** 2 + 0.15 ** 2 - 0.20 ** 2
+    disc = b * b - c + 2.0 * 0.15 * sa * 0.0
+    t = torch.where(disc > 0, -b - torch.sqrt(disc.clamp_min(0)), torch.full_like(b, 1e9))
+    r = torch.minimum(r, torch.where(t > 0, t, torch.full_like(t, 1e9))[None])
+    scan = (r / range_max).clamp(0.0, 1.0)
+    action = torch.zeros(batch, _mpc.ACT_DIM, device=device)
+    v = torch.full((batch,), 3.0, device=device)
+    cap = torch.full((batch,), 4.5, device=device)
+    pspec = _mpc.PlanSpec()
+
+    def grid():
+        with torch.no_grad():
+            cl.distance_field(cl.occupancy(scan, ang, spec, range_max), spec)
+
+    dist = cl.distance_field(cl.occupancy(scan, ang, spec, range_max), spec)
+
+    def adjust():
+        with torch.no_grad():
+            cl.adjust(action, v, cap, dist, pspec, spec, 10.0)
+
+    def best(fn):
+        t_ = benchmark.Timer(stmt="f()", globals={"f": fn}, num_threads=threads)
+        return min(t_.timeit(iters).median for _ in range(max(1, repeats))) * 1e3
+
+    g, a = best(grid), best(adjust)
+    return {"grid_ms": g, "adjust_ms": a, "step_ms": g + a,
+            "cells": spec.ny * spec.nx, "candidates": 2 * spec.n_shift + 1,
+            "passes": 2 * spec.radius_cells, "batch": batch, "n_beams": n_beams,
+            "protocol": protocol(iters, repeats, threads)}
+
+
 def measure(model, device="cpu", iters: int = 200, threads: int = 1, repeats: int = 5) -> dict:
     torch.set_num_threads(threads)
     out = dict(actor_step_ms(model, device=device, iters=iters, threads=threads, repeats=repeats))
@@ -132,6 +193,8 @@ def main(argv=None):
     ap.add_argument("--variants", default="baseline,gru,gru+memory,gru+edges,gru+memory+edges",
                     help="comma separated: 'baseline', then 'gru' with any of '+memory' / '+edges'")
     ap.add_argument("--json", default="", help="also write the table here")
+    ap.add_argument("--clearance", action="store_true",
+                    help="also time the `clearance` controller arm's per-step cost (batch 1)")
     a = ap.parse_args(argv)
 
     from .model import load_checkpoint, load_for_memory
@@ -165,10 +228,18 @@ def main(argv=None):
         print(f"{r['variant']:22s} {r['forward_ms']:8.3f} {r['channels_ms']:8.3f} {r['step_ms']:8.3f} "
               f"{r['forward_ratio']:7.3f} {r['step_ratio']:7.3f} {r['actor']:10d} "
               f"{r['param_ratio_actor']:6.3f} {r['total']:10d} {r['param_ratio_total']:6.3f}")
+    clear = None
+    if a.clearance:
+        clear = clearance_step_ms(iters=a.iters, repeats=a.repeats)
+        print(f"\nclearance arm (batch 1): occupancy + distance field {clear['grid_ms']:.3f} ms, "
+              f"bend + cap {clear['adjust_ms']:.3f} ms, total {clear['step_ms']:.3f} ms of the "
+              f"25 ms step\n  {clear['cells']} cells, {clear['passes']} transform passes, "
+              f"{clear['candidates']} candidate plans, {clear['n_beams']} beams")
     if a.json:
         import json
         with open(a.json, "w") as f:
-            json.dump({"protocol": proto, "baseline": a.baseline, "rows": rows}, f, indent=1)
+            json.dump({"protocol": proto, "baseline": a.baseline, "rows": rows,
+                       "clearance": clear}, f, indent=1)
         print("wrote", a.json)
     return 0
 

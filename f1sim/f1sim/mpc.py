@@ -313,6 +313,13 @@ class PlanTracker:
         # every existing caller gets. The viewer's CUDA-graph fast path binds one here for its own
         # tracker only; nothing global is replaced, so other trackers in the process are unaffected.
         self._solver = None
+        # Per-instance hook on the *plan*, run before anything is decoded. `None` is the untouched
+        # path: no branch is taken and nothing is allocated, so a legacy tracker is what it was.
+        # It exists because a runtime layer that adjusts the plan -- `learn/clearance.py` -- has to
+        # act before `solve` builds `last_ref` from the action, which is both what the tracker
+        # follows and what `crash_attribution.py` measures. Deliberately a different attribute from
+        # `_solver`: the two layers then compose in either installation order.
+        self._plan_hook = None
         self.u_prev = torch.zeros(num_envs, 2, device=self.device)                 # last applied steer, accel
         self.u_seq = torch.zeros(num_envs, self.spec.N, 2, device=self.device)     # warm start
         self.last_ref = None                                                       # (B,N+1,4) body frame plan, for viewers
@@ -328,6 +335,10 @@ class PlanTracker:
         optional), delay: calibrated command latency [s] (float or (B,), default spec.delay)
         -> (steer [rad], speed cmd [m/s]) (B,2)"""
         sp = self.spec
+        if self._plan_hook is not None:
+            # Before the decode, so every consumer below -- the reference, the solver, `last_ref`,
+            # `last_pred` and the command -- sees one plan, the adjusted one.
+            action = self._plan_hook(action, v_meas, speed_cap)
         v = v_meas.abs()
         if yaw_rate is None:                                       # no IMU: assume the last command took
             yaw_rate = v * torch.tan(self.u_prev[:, 0]) / (self.wb + sp.k_us * v * v)

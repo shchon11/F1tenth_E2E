@@ -76,7 +76,7 @@ class Entry:
         if actual != self.checkpoint_sha256:
             raise ValueError(f"{self.system_id}: sha mismatch\n  declared {self.checkpoint_sha256}"
                              f"\n  actual   {actual}")
-        base, _tcs = split_arm(self.controller_arm)
+        base = split_arm(self.controller_arm).base
         if (base == "estimated") != bool(self.estimator_sha256):
             raise ValueError(f"{self.system_id}: arm {self.controller_arm} and estimator pin disagree")
         if base == "estimated":

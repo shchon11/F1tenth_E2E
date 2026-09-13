@@ -17,6 +17,32 @@ from f1sim.learn.memory import describe as describe_memory, runtime_for
 from f1sim.learn.model import load_checkpoint
 
 
+#: The scanner's nominal window and where it sits. 270 deg for the Hokuyo UST-10LX, and
+#: base_link -> laser = (0.297, 0, 0.110) from `/tf_static` in all 22 recordings. The offset matters
+#: for the clearance grid: the plan is in base_link and the returns are in the sensor's frame, and
+#: 0.297 m is one and a half of the margin being defended.
+LIDAR_FOV = 4.71238898
+LIDAR_MOUNT_X = 0.297
+
+
+#: The arms this node will install. Both layers of each run on the car's own sensors: `fixed_low`
+#: reads nothing at all, `clearance` reads `/scan` and nothing else. `oracle` and `estimated` are
+#: simulator research arms -- the first is privileged, the second needs a frozen estimator
+#: checkpoint -- and are refused rather than silently downgraded.
+DEPLOYABLE_ARMS = ("legacy", "fixed_low", "clearance", "fixed_low+clearance")
+
+
+def split_deployable(arm: str):
+    """`"fixed_low+clearance"` -> `("fixed_low", True)`. Refuses anything this node cannot run."""
+    if arm not in DEPLOYABLE_ARMS:
+        raise ValueError(f"controller arm {arm!r} is not deployable here: only "
+                         f"{', '.join(DEPLOYABLE_ARMS)} run without a simulator-side estimator or "
+                         f"privileged friction")
+    from f1sim.learn.grip_runtime import split_arm
+    parts = split_arm(arm)
+    return parts.base, parts.clearance
+
+
 def install_grip_arm(tracker, arm: str, device, mu: float = None):
     """Wrap the plan tracker's solver with the grip-aware speed/acceleration limits.
 
@@ -25,16 +51,44 @@ def install_grip_arm(tracker, arm: str, device, mu: float = None):
     policy emits. On suite v1 (2026-09-12) it was the safest arm on every stability column against
     the same policy, at a 2 % lap-time cost; it needs no estimator and reads no sensor. `legacy`
     installs nothing. Returns the installed `GripMPC` (call `.release()` to undo) or None.
+
+    A `+clearance` suffix is not this function's business: that layer binds `tracker._plan_hook`
+    while this binds `tracker._solver`, so `install_clearance_arm` puts it on separately and the
+    order the two are installed in cannot change the command.
     """
     if tracker is None or arm == "legacy":
         return None
-    if arm != "fixed_low":
-        raise ValueError(f"controller arm {arm!r} is not deployable here: only 'legacy' and 'fixed_low' "
-                         f"run without a simulator-side estimator or privileged friction")
+    base, _clear = split_deployable(arm)
+    if base == "legacy":
+        return None
     from f1sim.learn import grip_control as gc
     spec = gc.GripSpec(mode="fixed", mu_fixed=float(gc.MU_FIXED_LOW if mu is None else mu)).validate()
     grip = gc.GripMPC(tracker, spec, 1, torch.device(device), tracker.wb, tracker.s_max, tracker.v_max)
     return grip.install(graph=False)
+
+
+def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None):
+    """Install the `clearance` layer: the plan bent and slowed off what `/scan` can see.
+
+    Built from the observation's own beam geometry (`ObsSpec.n_beams`, `range_max`) and the nominal
+    270 deg window; `PolicyNode` re-declares the bearings from the first `LaserScan`'s own
+    `angle_min` / `angle_max` if the driver publishes a different window, because a grid built from
+    bearings the returns do not have is a silently rotated obstacle rather than an error.
+
+    Returns the installed `ClearanceArm` (call `.release()` to undo) or None.
+    """
+    if tracker is None or arm == "legacy":
+        return None
+    _base, clear = split_deployable(arm)
+    if not clear:
+        return None
+    from f1sim.learn import clearance as cl
+    cspec = cl.ClearanceSpec() if margin is None else cl.ClearanceSpec(margin=float(margin))
+    angles = cl.beam_angles(int(spec.n_beams), LIDAR_FOV, device=torch.device(device))
+    arm_obj = cl.ClearanceArm(tracker, cspec.validate(), 1, torch.device(device),
+                              float(spec.v_max), angles, float(spec.range_max),
+                              mount_x=LIDAR_MOUNT_X)
+    return arm_obj.install()
 from f1sim.learn.obs import ObsBuilder, ObsSpec
 
 from f1sim_ros.traction import TractionGuard, TractionParams
@@ -78,6 +132,7 @@ def build_traction_guard(arm: str, overrides: str = ""):
 
 
 G = 9.80665
+
 
 #: IMU samples kept between scans. At 50 Hz against a 40 Hz scan that is one or two per scan; a
 #: buffer allowed to grow without bound averages in samples from before the consumer stalled.
@@ -206,11 +261,20 @@ class PolicyNode(Node):
             self.delay = torch.tensor([float(p("cmd_delay"))], device=self.device)
         # Plan controller arm. "fixed_low" (default) limits corner speed and accel/brake budgets for a
         # conservative constant friction; "legacy" is the untouched tracker. Set `grip_mu` to override
-        # the constant once the floor has been characterised.
+        # the constant once the floor has been characterised. A "+clearance" suffix adds the geometry
+        # layer: a local occupancy built from this scan alone (no map), and the plan bent and slowed
+        # until it keeps `clearance_margin` from anything the scanner saw.
         self.declare_parameter("controller", "fixed_low"); self.declare_parameter("grip_mu", 0.0)
+        self.declare_parameter("clearance_margin", 0.0)
         self.controller_arm = str(p("controller"))
         self.grip = install_grip_arm(self.tracker, self.controller_arm, self.device,
                                      mu=(float(p("grip_mu")) or None))
+        self.clearance = install_clearance_arm(self.tracker, self.controller_arm, self.device,
+                                               self.spec,
+                                               margin=(float(p("clearance_margin")) or None))
+        #: Whether the beam bearings the clearance grid is built from have been checked against a
+        #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
+        self._scan_geometry_checked = False
         # Traction guard: wheel lock / launch spin from `/odom` wheel speed against the IMU, with
         # the speed command shaped when either fires. OFF by default -- it has been validated only
         # by replaying the recordings (`scripts/replay_traction.py`), never on the moving car, and
@@ -260,6 +324,10 @@ class PolicyNode(Node):
         self.get_logger().info(f"policy {p('checkpoint')} on {self.device}, speed cap {self.speed_cap} m/s, "
                                f"controller {self.controller_arm}"
                                + (f" (mu {float(self.grip.mu[0]):.3f})" if self.grip is not None else "")
+                               + ("" if self.clearance is None else
+                                  f", clearance margin {self.clearance.cspec.margin:.2f} m body edge "
+                                  f"({self.clearance.cspec.margin + self.clearance.cspec.body_radius:.2f} m "
+                                  f"centre) on a {self.clearance.cspec.cell * 100:.0f} cm grid from /scan alone")
                                + f", traction {self.traction_arm}"
                                + ("" if self.traction is None else
                                   f" (lock past {self.traction.p.lock_accel:.1f} m/s^2 wheel decel "
@@ -461,6 +529,35 @@ class PolicyNode(Node):
             self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
         self.get_logger().info("reset: observation, policy memory and tracker history cleared")
 
+    def _check_scan_geometry(self, m: LaserScan):
+        """Re-declare the clearance grid's bearings from the driver's own window, once.
+
+        The nominal 270 deg is what this car's `urg_node` publishes, but the grid is built by
+        turning each return into a point at its bearing: a window that is actually 240 deg, or one
+        published backwards, would place every obstacle somewhere it is not, and nothing downstream
+        would look wrong. `ObsBuilder` resamples the ranges linearly over the message's own index
+        range, so the resampled beam bearings are `linspace(angle_min, angle_max, n_beams)`.
+        """
+        if self._scan_geometry_checked:
+            return
+        self._scan_geometry_checked = True
+        lo, hi = float(m.angle_min), float(m.angle_max)
+        if not (math.isfinite(lo) and math.isfinite(hi) and hi > lo):
+            self.get_logger().warning(
+                f"scan angle_min/angle_max = {lo}/{hi} is not a usable window; the clearance grid "
+                f"keeps the nominal {math.degrees(LIDAR_FOV):.0f} deg")
+            return
+        nominal = self.clearance.angles
+        if abs(lo - float(nominal[0])) < 1e-3 and abs(hi - float(nominal[-1])) < 1e-3:
+            return
+        self.clearance.set_angles(torch.linspace(lo, hi, int(self.spec.n_beams),
+                                                 device=self.device))
+        self.get_logger().info(
+            f"clearance grid rebuilt for this scanner's window: {math.degrees(lo):.1f} to "
+            f"{math.degrees(hi):.1f} deg over {self.spec.n_beams} beams "
+            f"(nominal was {math.degrees(float(nominal[0])):.1f} to "
+            f"{math.degrees(float(nominal[-1])):.1f})")
+
     def on_scan(self, m: LaserScan):
         t0 = time.perf_counter()
         r = np.asarray(m.ranges, dtype=np.float32)
@@ -492,6 +589,11 @@ class PolicyNode(Node):
             self._resume()
         imu_mean = self.imu_mean
         scan, pro = self.obs.build(r, self.v, imu_mean, self.att, self.speed_cap)
+        if self.clearance is not None:
+            self._check_scan_geometry(m)
+            # This scan, in the observation's own units, before the tracker is asked for anything.
+            # The arm holds one frame and nothing else: no map, no pose, no memory across scans.
+            self.clearance.update_scan(scan)
         with torch.no_grad():
             # The hidden state goes in and the next one comes out: the policy's memory of this run
             # lives here, between callbacks, and nowhere else.

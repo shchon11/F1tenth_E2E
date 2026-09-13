@@ -407,7 +407,7 @@ The roster is a JSON object with a `systems` list pinning exactly which weights 
 | `system_id` | unique label; duplicates are refused |
 | `path` | the real file. Not a symlink, and no `latest` path segment |
 | `checkpoint_sha256` | re-hashed at verification; a mismatch refuses |
-| `controller_arm` | `legacy`, `fixed_low` or `estimated` |
+| `controller_arm` | a `grip_runtime.ARMS` name: a tracker base (`legacy`, `fixed_low`, `estimated`; `oracle` is privileged and not pinnable) optionally wearing the composable layers `+clearance` and `+tcs`, in that order — e.g. `fixed_low+clearance` |
 | `estimator_path` / `estimator_sha256` | required **iff** the arm is `estimated`; both, not one |
 | `cross_runtime` | declares a checkpoint evaluated under an arm it was not trained under |
 | `note` | free text, carried into the report |
