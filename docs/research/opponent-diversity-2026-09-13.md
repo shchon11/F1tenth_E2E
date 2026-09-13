@@ -269,8 +269,20 @@ distribution, and arm B's distribution has faster opponents, blocking opponents 
 sometimes starts the learner abreast. A lower number there means the arm's own rollout was cleaner,
 not that its policy is better, and the only fair comparison of the two checkpoints is the
 attribution below (same opponent, same maps, same seed for both). What the columns do say is that
-both arms trained: 128 of 128 updates, the KL against the reference holding near the 0.05 leash's
-working range at ~0.10, no divergence, and ~500 steps/s.
+both arms trained: 128 of 128 updates, the KL against the reference checkpoint sitting at ~0.10
+with the penalty coefficient at its recipe value of 0.05, no divergence, and ~500 steps/s.
+
+### Provenance of every checkpoint named here
+
+| role | path | sha256 (first 16) |
+|---|---|---|
+| frozen original — the init of both arms and of every census | `~/f1sim_runs/_baselines/frozen_original_48cc698f.pt` | `48cc698f8c51feb5` |
+| A701 — the pool's checkpoint entry (best system on suite v1) | `~/f1sim_runs/cl_origrecipe_legacy_s701/ppo_final.pt` | `29e82233853868be` |
+| smoke A final | `~/f1sim_runs/smoke_oppdiv_A_s801/ppo_final.pt` | `0b1574d304aec928` |
+| smoke B final | `~/f1sim_runs/smoke_oppdiv_B_s801/ppo_final.pt` | `533b9a63b6fd6d31` |
+
+Neither smoke checkpoint should be scored or put in a roster: 262 144 steps is 0.19 % of the frozen
+original's 138.8 M.
 
 Then `traffic_attribution.py` on each final checkpoint, plus the frozen original as the reference
 row: 2-car races on the three held-out traffic maps (`real:map16x07`, `gen:control:9100`,
