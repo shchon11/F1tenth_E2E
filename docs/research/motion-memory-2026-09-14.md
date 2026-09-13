@@ -541,7 +541,17 @@ vector: it is a difference of two range images the simulator can produce for any
 What it needs at train time is **one extra LiDAR cast per env step** — the same `Lidar.scan` the step
 already runs, with `cars=None`, at the pose and attitude the step just produced, kept in a k-deep
 ring so that step t's label is available at step t + k. `work/e4/cost.py` measures exactly that and
-nothing else.
+nothing else, in the configuration a run would use:
+
+| 63 cars, race size 3, compiled backend, CUDA | env steps/s |
+|---|---|
+| the simulator as it is | 382 |
+| + one static LiDAR cast per step | 375 |
+
+**1.02× the simulator's time**, 3.06 ms per batched step. That is the whole cost, and it is the
+number that makes E4 worth putting in front of the other two: a label on **every beam of every step**
+for two percent of the rollout, against the auxiliary future head's ~20 % of steps after its
+boundary masking, and against a beam mask that needs the simulator's privileged `scan_type`.
 
 It is not free of assumptions: on the car the same label would need a map and a pose, so it is a
 training-time target either way. What it buys over the E3 auxiliaries is scale — every beam of every
