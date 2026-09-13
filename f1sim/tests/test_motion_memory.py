@@ -397,6 +397,28 @@ def test_the_beam_mask_is_all_zero_when_there_is_no_other_car():
     assert float(env.opponent_beam_mask().abs().max()) == 0.0
 
 
+def test_the_probe_loads_a_motion_checkpoint_and_reads_the_whole_state(tmp_path):
+    """The E1 column for an E3 arm goes through the loader, not through a hand-built model.
+
+    `probe_hidden.load_probed` takes a checkpoint that already carries memory down the
+    `load_checkpoint` path, which rebuilds it from `meta` -- so `motion` and `motion_heads` have to
+    survive the round trip, and what `probe_state` then returns has to be the composite state and
+    not one half of it.
+    """
+    from f1sim.learn.probe_hidden import load_probed, peek
+    m = build()
+    path = str(tmp_path / "motion.pt")
+    save_checkpoint(path, m, {"spec": SPEC.__dict__})
+    meta, _spec = peek(path)
+    assert meta["motion"]["hidden_size"] == 16 and meta["motion_heads"] == ["mask", "dv"]
+    mod, _extra, note = load_probed(path, "cpu", 128, [])
+    assert note == "as trained" and mod.actor.has_motion
+    scan, pro, _priv = inputs(batch=2)
+    with torch.no_grad():
+        _act, state, _h = mod.actor.probe_state(scan, pro, None, None)
+    assert state.shape[-1] == mod.actor.memory.hidden_size + mod.actor.memory.motion.hidden_size
+
+
 # ------------------------------------------------------------------ end to end
 CLI_REFUSALS = [
     (["--motion-memory"], "needs --memory gru"),
