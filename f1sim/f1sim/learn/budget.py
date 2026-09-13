@@ -213,9 +213,15 @@ def main(argv=None):
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--variants",
                     default="baseline,gru,gru+memory+edges,gru+memory+edges+aligned,"
-                            "gru+memory+edges+aligned+aligned_prev+aligned_valid",
+                            "gru+memory+edges+aligned+aligned_prev+aligned_valid,"
+                            "gru+memory+edges+aligned+aligned_prev+aligned_valid+motion",
                     help="comma separated: 'baseline', then 'gru' with any scan channel appended "
-                         "as '+name' (memory, edges, aligned, aligned_prev, aligned_valid)")
+                         "as '+name' (memory, edges, aligned, aligned_prev, aligned_valid) and "
+                         "'+motion' for the motion branch (learn.motion), which needs at least one "
+                         "aligned row to read. The branch's two train-time heads are NOT built: "
+                         "they are never called by the actor's forward and never exported, so "
+                         "timing them would be timing something the car does not run")
+    ap.add_argument("--motion-hidden", type=int, default=64)
     ap.add_argument("--json", default="", help="also write the table here")
     ap.add_argument("--clearance", action="store_true",
                     help="also time the `clearance` controller arm's per-step cost (batch 1)")
@@ -233,8 +239,9 @@ def main(argv=None):
         else:
             parts = name.split("+")
             if parts[0] != "gru":
-                raise SystemExit(f"variant {name!r}: expected 'baseline' or 'gru[+memory][+edges]'")
-            chans = [p for p in parts[1:]]
+                raise SystemExit(f"variant {name!r}: expected 'baseline' or 'gru[+channel...]'")
+            want_motion = "motion" in parts[1:]
+            chans = [p for p in parts[1:] if p != "motion"]
             cfg = None
             if chans:
                 cfg = {"channels": chans}
@@ -249,8 +256,16 @@ def main(argv=None):
                             f"columns by index, so timing it against a guessed layout would time "
                             f"the wrong thing.")
                     cfg["aligned"] = {"proprio": motion_index_spec(sp)}
+            mot = None
+            if want_motion:
+                from .motion import motion_spec
+                rows = [c for c in chans if c.startswith("aligned")]
+                if not rows:
+                    raise SystemExit(f"variant {name!r}: the motion branch reads the aligned rows "
+                                     f"and none are enabled")
+                mot = motion_spec(hidden_size=a.motion_hidden, rows=rows)
             model, _e, _f = load_for_memory(a.baseline, "cpu", memory_spec(hidden_size=a.hidden),
-                                            scan_channels=cfg)
+                                            scan_channels=cfg, motion=mot)
             m = measure(model, iters=a.iters, repeats=a.repeats)
         rows.append({"variant": name, **m,
                      "forward_ratio": m["forward_ms"] / b["forward_ms"],
