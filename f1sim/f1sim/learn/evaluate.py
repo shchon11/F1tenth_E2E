@@ -246,7 +246,9 @@ def main() -> None:
     ap.add_argument("--controller", default="legacy",
                     help="controller arm to install between the policy and the wheels; one of "
                          "grip_runtime.ARMS. 'legacy' installs nothing and is the default, so an "
-                         "unflagged run is unchanged. '+tcs' arms run the car's traction guard "
+                         "unflagged run is unchanged. '+clearance' arms keep the plan a stated "
+                         "margin off the local occupancy built from the scan alone. '+tcs' arms "
+                         "run the car's traction guard "
                          "inside the loop and need --wheel-model on.")
     ap.add_argument("--estimator", default="",
                     help="frozen grip-estimator checkpoint; required by the estimated arms")

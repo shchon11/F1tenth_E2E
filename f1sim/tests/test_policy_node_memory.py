@@ -97,6 +97,9 @@ def make_node(model):
     n.imu_mean = None; n.t_imu_mean = None; n.att_stamp = None
     n._inhibited = False; n._last_inhibit_log = -1e9; n.last_t = None
     n.traction_arm = "off"; n.traction = None
+    # No plan-geometry layer either: this stub is about the recurrent state, and an arm that
+    # was installed would put a second thing between the policy and the command.
+    n.clearance = None; n._scan_geometry_checked = True
     n.ax_body = None; n.t_ax = None; n.motor_current = None; n.t_current = None
     n._log = Logger(); n._now = 100.0
     n.get_logger = lambda: n._log

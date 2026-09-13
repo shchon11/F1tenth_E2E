@@ -37,9 +37,9 @@ def make_env(wheel=True, mu=0.73, n=B, **over):
 # ------------------------------------------------------------------ arm selection
 
 def test_the_composed_arm_names_are_the_ones_the_roster_and_the_flag_accept():
-    assert gr.split_arm("tcs") == ("legacy", True)
-    assert gr.split_arm("fixed_low+tcs") == ("fixed_low", True)
-    assert gr.split_arm("fixed_low") == ("fixed_low", False)
+    assert gr.split_arm("tcs") == ("legacy", True, False)
+    assert gr.split_arm("fixed_low+tcs") == ("fixed_low", True, False)
+    assert gr.split_arm("fixed_low") == ("fixed_low", False, False)
     for bad in ("legacy+tcs", "tcs+fixed_low", "TCS", "tcs+tcs", "+tcs"):
         with pytest.raises(ValueError):
             gr.split_arm(bad)

@@ -48,6 +48,7 @@ Honesty rules this file is responsible for
 from __future__ import annotations
 
 import faulthandler
+import functools
 import math
 import os
 import sys
@@ -171,6 +172,24 @@ class MuPin:
 
 class StartConfigError(ValueError):
     """A start request that cannot be satisfied, with a message meant for a person."""
+
+
+@functools.lru_cache(maxsize=1)
+def viewer_arms() -> tuple:
+    """The plan-controller arms a viewer session can install.
+
+    Derived from the runtime's own list rather than restated, so a name this worker accepts is
+    always one `ControllerRuntime` will build. The `+tcs` arms are left out: the traction guard is
+    host Python over `env.cmd_shaper`, a device round trip per car per step, which is a different
+    thing to validate inside a real-time loop and is not what the viewer is for. `+clearance` is in
+    -- it is tensor work on the session's own device, and it is the layer a person watching the car
+    most wants to see switched on and off.
+
+    Imported lazily: everything above this point is torch-free so the console-side tests can reach
+    it without loading torch, and `grip_runtime` is not.
+    """
+    from ..learn.grip_runtime import ARMS, split_arm
+    return tuple(a for a in ARMS if not split_arm(a).tcs)
 
 
 # ==================================================================== pure helpers
@@ -652,13 +671,14 @@ class SimWorker:
         # arm may only run under that same arm; legacy-trained weights may run under any arm (the
         # benchmark's declared cross-runtime case, and the configuration that scored best).
         arm = str(getattr(cfg, "controller", "legacy") or "legacy")
-        if arm not in ("legacy", "estimated", "fixed_low", "oracle"):
-            raise StartConfigError(f"플랜 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 (legacy / estimated / fixed_low / oracle).")
+        if arm not in viewer_arms():
+            raise StartConfigError(f"플랜 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 "
+                                   f"({' / '.join(viewer_arms())}).")
         if arm != "legacy" and int(cfg.cars_per_race) > 1:
             raise StartConfigError(f"플랜 제어기 '{arm}' 은 레이스당 차량 수 1에서만 지원합니다 "
                                    f"(학습·벤치마크와 같은 조건). 레이스당 차량 수를 1로 두거나 legacy 를 고르세요.")
         estimator_path = ""
-        if arm == "estimated":
+        if arm.startswith("estimated"):
             from .console.protocol import SessionConfig as _SC
             estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
             if not estimator_path or not os.path.isfile(estimator_path):
