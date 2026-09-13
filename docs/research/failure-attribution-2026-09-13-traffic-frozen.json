@@ -1,0 +1,45 @@
+{
+ "ckpt": "/home/shchon11/f1sim_runs/_baselines/frozen_original_48cc698f.pt",
+ "tag": "frozen",
+ "tracks": {
+  "real:map16x07": {
+   "learner_trials": 16,
+   "terminations": 16,
+   "contacts": 4,
+   "walls": 12,
+   "contact_ahead": 1,
+   "contact_alongside": 3,
+   "contact_behind": 0,
+   "contact_after_event_1s": 0,
+   "contact_plan_through_opp": 1,
+   "mean_closing_at_contact": 1.919828176498413,
+   "wall_alongside_or_ahead": 1
+  },
+  "gen:control:9100": {
+   "learner_trials": 16,
+   "terminations": 11,
+   "contacts": 1,
+   "walls": 10,
+   "contact_ahead": 0,
+   "contact_alongside": 1,
+   "contact_behind": 0,
+   "contact_after_event_1s": 0,
+   "contact_plan_through_opp": 0,
+   "mean_closing_at_contact": 1.5826263427734375,
+   "wall_alongside_or_ahead": 6
+  },
+  "real:korea_2025_iccas": {
+   "learner_trials": 16,
+   "terminations": 15,
+   "contacts": 5,
+   "walls": 10,
+   "contact_ahead": 0,
+   "contact_alongside": 5,
+   "contact_behind": 0,
+   "contact_after_event_1s": 0,
+   "contact_plan_through_opp": 0,
+   "mean_closing_at_contact": 1.9016894340515136,
+   "wall_alongside_or_ahead": 8
+  }
+ }
+}

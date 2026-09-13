@@ -67,3 +67,31 @@ tracks the plan runs through boxes (`map12x16+hard3`: 17 of 32 collisions into b
    `fixed_low`, proven with the same script before/after.
 3. Per-reset procedural obstacle layouts (worker, `feat/procedural-obstacles`) so that a
    zero-margin line stops being free during training.
+
+## 5. Traffic: why races end (added 12:05)
+
+Same three held-out maps, race size 2, teacher opponent at 0.6–0.8× with brake/stop/shift events at
+3 per 10 s, 16 learner trials per map. Every learner termination classified
+(`failure-attribution-2026-09-13-traffic_attribution.py`, JSON beside it).
+
+| checkpoint | terminations /48 | car contacts | of which alongside | ahead (rear-end) | within 1 s of an opponent event | plan through the opponent | closing speed at contact | wall collisions | of which during a pass (alongside/behind) |
+|---|---|---|---|---|---|---|---|---|---|
+| frozen original | 42 | 10 | 9 | 1 | **0** | 1 | +1.2…+1.9 m/s | 32 | 15 |
+| memory u8 | 36 | 17 | 14 | 3 | **0** | 2 | +1.2…+1.7 | 19 | 4 |
+
+Reading:
+
+* **Races end on walls, not on the other car** (frozen: 32 of 42). Half of those walls are hit
+  while alongside or just behind the opponent — the pass squeezes the learner into the wall side
+  it already keeps no margin from (§2).
+* **Contacts are side-by-side, closing at +1.5 m/s**: the learner is faster, draws level and
+  touches. Rear-ending a braking or stopped car essentially does not happen, and **no contact
+  follows an opponent event within a second**. The scripted behaviours built yesterday
+  (brake / stop / shift / weave) address a failure mode the data does not contain.
+* The memory checkpoint passes more aggressively: fewer walls, more side contacts.
+
+So the opponent problem is the same margin problem seen from the side: lateral room during a pass.
+That is what a runtime clearance layer sees directly (the opponent's returns are in the local
+grid), and what a training signal on lateral gap (`car_safe_gap` 0.9 m in recipe A, charged per
+metre) has not produced. Events, opponent diversity and rear-end scenarios are not where the
+failures are.
