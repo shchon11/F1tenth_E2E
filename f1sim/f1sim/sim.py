@@ -245,9 +245,21 @@ class Simulator:
         return hit
 
     # ------------------------------------------------------------------ reset
-    def sample_spawn(self, n: int, lateral_std: float = 0.3, yaw_std: float = 0.2,
-                     s: Optional[torch.Tensor] = None, tid: Optional[torch.Tensor] = None, min_clearance: Optional[float] = None) -> torch.Tensor:
-        """Random poses along the centerline of each env's track (tid (n,), default track 0). Returns (n, 3)."""
+    def sample_spawn(self, n: int, lateral_std: float = 0.3, yaw_std=0.2,
+                     s: Optional[torch.Tensor] = None, tid: Optional[torch.Tensor] = None,
+                     min_clearance=None, lat: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Random poses along the centerline of each env's track (tid (n,), default track 0). Returns (n, 3).
+
+        min_clearance: scalar, or an (n,) tensor when the rows want different bounds -- an alongside
+        grid (`gym_env` `spawn_order`) puts cars deliberately off the centerline, and the default
+        0.5 m pull-back would drag the whole grid back onto one line.
+        yaw_std: scalar, or an (n,) tensor. Two cars spawned side by side need the *rotated*
+        footprint to fit between the walls, and at the usual 0.2 rad jitter a 0.58 m car sweeps more
+        sideways than a 1.4 m lane has to spare; cars lined up on a grid are aligned with the track
+        anyway, so that caller lowers the jitter for those rows rather than giving up the grid.
+        lat: (n,) explicit lateral offsets instead of a `lateral_std` draw. Given one, this function
+        draws nothing for the lateral, which is what lets a caller place a grid abreast.
+        """
         tid = torch.zeros(n, dtype=torch.long, device=self.device) if tid is None else tid.to(self.device)
         no_cl = ~self.track.cl_ok[tid] if self.track.cl is not None else torch.ones(n, dtype=torch.bool, device=self.device)
         if bool(no_cl.any()):
@@ -259,20 +271,27 @@ class Simulator:
                 tr = self.tracks[t]
                 idx = int(tr.edt.argmax()); row, col = idx // tr.occupancy.shape[1], idx % tr.occupancy.shape[1]
                 poses[i, 0] = tr.origin[0] + col * tr.resolution; poses[i, 1] = tr.origin[1] + row * tr.resolution
-            poses[:, 2] = torch.rand(n, device=self.device, generator=self.gen) * 2 * math.pi * (yaw_std > 0)
+            any_yaw = float(yaw_std.max()) if torch.is_tensor(yaw_std) else float(yaw_std)
+            poses[:, 2] = torch.rand(n, device=self.device, generator=self.gen) * 2 * math.pi * (any_yaw > 0)
             if bool(no_cl.all()):
                 return poses
-            rest = self.sample_spawn(int((~no_cl).sum()), lateral_std, yaw_std, None if s is None else s[~no_cl], tid[~no_cl])
+            rest = self.sample_spawn(int((~no_cl).sum()), lateral_std,
+                                     yaw_std if not torch.is_tensor(yaw_std) else yaw_std[~no_cl],
+                                     None if s is None else s[~no_cl], tid[~no_cl],
+                                     min_clearance=min_clearance if not torch.is_tensor(min_clearance) else min_clearance[~no_cl],
+                                     lat=None if lat is None else lat[~no_cl])
             poses[~no_cl] = rest
             return poses
         if s is None:
             s = torch.rand(n, device=self.device, generator=self.gen) * self.track.length[tid]
         s = s.to(self.device)
         xy, yaw = self.track.pose_at_s(s, tid)
-        lat = torch.randn(n, device=self.device, generator=self.gen) * lateral_std
+        lat = (torch.randn(n, device=self.device, generator=self.gen) * lateral_std if lat is None
+               else lat.to(self.device))
         nrm = torch.stack([-torch.sin(yaw), torch.cos(yaw)], 1)
         xy = xy + nrm * lat[:, None]
-        yaw = yaw + torch.randn(n, device=self.device, generator=self.gen) * yaw_std
+        yaw = yaw + torch.randn(n, device=self.device, generator=self.gen) * (
+            yaw_std.to(self.device) if torch.is_tensor(yaw_std) else yaw_std)
         pose = torch.cat([xy, yaw[:, None]], 1)
         # reject poses too close to walls by pulling them back to the centerline
         bad = self.track.sample_edt(xy, tid) < (self.cfg.vehicle.width if min_clearance is None else min_clearance)

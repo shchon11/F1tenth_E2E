@@ -249,18 +249,27 @@ def announce_episode_boundaries(env):
 
 
 def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg: Optional[Config] = None, seed: int = 0,
-             rls=None, teacher_grip: str = "true", teacher_recover_time: float = 0.0):
-    """rls: racelines (one per track) -- required when env_cfg.opponent == "teacher" (opponents follow them)."""
+             rls=None, teacher_grip: str = "true", teacher_recover_time: float = 0.0,
+             opponent_pool: bool = True):
+    """rls: racelines (one per track) -- required when env_cfg.opponent == "teacher" (opponents follow them).
+
+    opponent_pool: load and install the checkpoint population `env_cfg.opp_pool` names when the mode
+    is "pool". On by default because an env in that mode refuses to step without one; a caller that
+    wants to install its own (a test with stub drivers) passes False.
+    """
     cfg = cfg or Config()
     cfg.sim.seed = seed
     env = F1VecEnv(tracks, cfg, env_cfg or EnvConfig(), num_envs=num_envs, device=device)
     announce_episode_boundaries(env)
     if rls is not None and getattr(env.ecfg, "reward_lap_time", 0.0) > 0:
         env.set_ideal_lap(rls)                       # reference for the seconds-saved reward
-    if env.M > 1 and env.ecfg.opponent in ("teacher", "mixed"):
+    if env.M > 1 and env.teacher_any:
         if rls is None:
             rls = [Raceline.build_cached(t) for t in tracks]
         env.set_teacher(make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time))
+    if opponent_pool and env.ecfg.opponent == "pool":
+        from .opponent_pool import attach     # local: that module imports this one for the obs spec
+        attach(env, device=env.device)
     return env
 
 
