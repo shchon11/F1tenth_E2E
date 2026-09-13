@@ -389,6 +389,22 @@ def test_a_head_from_a_different_build_is_refused():
     assert ActorCritic(**SMALL, future_head={"k": 4}).meta["future_head"]["source"] == "trunk"
 
 
+def test_a_resume_keeps_what_the_checkpoint_has_instead_of_warm_starting_it_again():
+    """Leg two of a run passes leg one's command line with `--init` moved. The flag that BUILDS a
+    piece is also the flag that keeps training it, so the routing has to ask the checkpoint."""
+    from f1sim.learn.ppo import warm_start_additions
+    mem, chan, fut = memory_spec(hidden_size=32), {"channels": ["edges"]}, future_spec()
+    # nothing there yet: all three are a warm start
+    assert warm_start_additions({}, mem, chan, fut) == (mem, chan, fut)
+    # everything there: none of them is, and `load_checkpoint` takes it back whole
+    have = {"memory": mem, "scan_channels": chan, "future_head": fut}
+    assert warm_start_additions(have, mem, chan, fut) == (None, None, None)
+    # a run that adds the head to an existing recurrent checkpoint adds only the head
+    assert warm_start_additions({"memory": mem, "scan_channels": chan}, mem, chan, fut) == (None, None, fut)
+    # and a flag not passed stays not passed
+    assert warm_start_additions({}, None, None, fut) == (None, None, fut)
+
+
 # ------------------------------------------------------------------ the probe
 def test_the_probe_finds_what_the_state_determines_and_not_what_it_does_not():
     """Synthetic states, a target that is a known linear function of the state k steps earlier, and

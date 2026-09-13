@@ -23,8 +23,7 @@ import time
 import numpy as np
 import torch
 
-from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_LABEL_KEYS, PRIV_OPP_DIST_SCALE,
-                       REWARD_COMPONENT_KEYS)
+from ..gym_env import EnvConfig, FUTURE_LABEL_DIM, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
@@ -174,6 +173,21 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
             "aux_future_parts": aux_f_parts, "loss": loss, "hidden": h_next,
             "approx_kl": ((ratio - 1) - (logp - logp_old)).mean(),
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
+
+
+def warm_start_additions(init_meta: dict, memory, scan_channels, future_head):
+    """The architecture pieces `--init` does NOT already carry, i.e. what a warm start would add.
+
+    A resume is not a warm start. `load_for_memory` refuses a checkpoint that already has the thing
+    being asked for, and it is right to -- adding a second GRU or a second head to a trained path
+    would re-initialise it. But the flag that *builds* a piece is also the flag that *keeps training*
+    it (`--aux-future` is a coefficient), so leg two of a run passes the same command line as leg
+    one and must not be sent down the warm-start path for it. This is the one place that decides:
+    whatever the checkpoint already has, it keeps, and only the rest is new.
+    """
+    return (None if init_meta.get("memory") else memory,
+            None if init_meta.get("scan_channels") else scan_channels,
+            None if init_meta.get("future_head") else future_head)
 
 
 def main():
@@ -538,18 +552,23 @@ def main():
         raise SystemExit(f"--aux-future-k {a.aux_future_k} needs --horizon > {a.aux_future_k - 1} "
                          f"(got {a.horizon}): the label for step t is the state at t + k, and a "
                          f"chunk shorter than the lookahead contains not one labelled step.")
-    if a.init and (mem_cfg or chan_cfg or fut_cfg):
+    #: Only what the checkpoint does not already have is a warm start; the rest it keeps. Without
+    #: this, leg two of a recurrent run -- same command line, `--init` now pointing at leg one's
+    #: output -- goes down the warm-start path and is refused.
+    init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
+    add_mem, add_chan, add_fut = warm_start_additions(init_meta, mem_cfg, chan_cfg, fut_cfg)
+    if a.init and (add_mem or add_chan or add_fut):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
         # actor's first action of this run is bit-identical to the one the original would have
         # produced. `tests/test_memory_model.py` is the check.
         model, extra, fresh = load_for_memory(
-            a.init, device, mem_cfg, scan_channels=chan_cfg, priv_adapter=priv_adapter,
-            future_head=fut_cfg,
+            a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
+            future_head=add_fut,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
-        print(f"init from {a.init} with memory {mem_cfg} channels {chan_cfg} future {fut_cfg} | "
+        print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} | "
               f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
@@ -571,7 +590,9 @@ def main():
         model, extra = load_checkpoint(a.init, device, override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                                                                   "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim, "act_dim": env.act_dim},
                                        allow_conditional=False, priv_adapter=priv_adapter)
-        print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing")
+        print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing",
+              "| resumed architecture:", {k_: v_ for k_, v_ in model.meta.items()
+                                          if k_ in ("memory", "scan_channels", "future_head")} or "plain")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))

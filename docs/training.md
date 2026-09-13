@@ -180,10 +180,18 @@ python3 -m f1sim.learn.ppo --name ppo_mem --init "$FROZEN_ORIGINAL" \
 
 **Warm start.** `--init` plus `--memory gru` goes through `model.load_for_memory`, not
 `load_checkpoint`: every tensor the checkpoint holds is copied *by name*, and the only tensors
-allowed to be new are the memory modules (whose output projections are zero) and, when extra scan
-channels are on, the zeroed new input columns of the stem's first convolution. Anything else left
-fresh raises rather than training a half-initialised network. Adam's moments are re-keyed by
-parameter name and the new tensors start fresh, so the optimiser state carries over too.
+allowed to be new are the memory modules (whose output projections are zero), the future head
+(whose output layer is zero) and, when extra scan channels are on, the zeroed new input columns of
+the stem's first convolution. Anything else left fresh raises rather than training a
+half-initialised network. Adam's moments are re-keyed by parameter name and the new tensors start
+fresh, so the optimiser state carries over too.
+
+**Resuming is not warm-starting.** Whatever the `--init` checkpoint already records — its memory,
+its scan channels, its future head — it keeps, and only the pieces it does not have are added
+(`ppo.warm_start_additions`). This matters because the flag that *builds* a piece is also the flag
+that keeps training it: `--aux-future 1.0` is a coefficient, so leg two of a run passes the same
+command line as leg one with `--init` moved, and must not be sent down the warm-start path for
+something that is already trained. The run prints which architecture it resumed.
 
 **How the update works.** The rollout stores each env's hidden state at the start of every horizon
 chunk; the update replays whole env chunks through the network (truncated BPTT over the 32-step

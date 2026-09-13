@@ -39,13 +39,13 @@ from typing import Optional
 import numpy as np
 import torch
 
-from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_LABEL_KEYS, FUTURE_PRESENT_INDEX)
+from ..gym_env import EnvConfig, FUTURE_LABEL_KEYS, FUTURE_PRESENT_INDEX
 from ..params import Config
 from . import common
 from . import grip_runtime
 from . import opponent_config as opp_cfg
 from .future import FUTURE_K, FUTURE_OPPONENT_KEYS, align_future_targets
-from .memory import Hidden, memory_spec, reset_hidden
+from .memory import memory_spec, reset_hidden
 from .model import load_checkpoint, load_for_memory
 from .obs import ScanAugment, flatten_obs
 
