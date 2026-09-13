@@ -419,7 +419,18 @@ def test_the_cli_refuses_a_motion_branch_with_nothing_to_read(monkeypatch, argv,
     assert message in str(e.value), e.value
 
 
-def test_a_whole_update_runs_with_every_flag_on(monkeypatch, tmp_path):
+@pytest.mark.parametrize("stage,extra,want", [
+    ("a", ["--aux-opp-mask", "1.0"], ["loss/aux_opp_mask"]),
+    ("b", ["--aux-opp-mask", "1.0", "--aux-motion", "1.0"],
+     ["loss/aux_opp_mask", "loss/aux_motion_mse"]),
+    ("c", ["--aux-opp-mask", "1.0", "--aux-motion", "1.0", "--aux-future", "1.0",
+           # k = 2 rather than the default 20: the label for step t is the state at t + k, and a
+           # four-step chunk cannot reach twenty. The trainer refuses the combination, which is its
+           # own test above; here the point is to run the term, not to argue with it.
+           "--aux-future-k", "2"],
+     ["loss/aux_opp_mask", "loss/aux_motion_mse", "loss/aux_future_mse"]),
+])
+def test_a_whole_update_runs_at_every_stage(monkeypatch, tmp_path, stage, extra, want):
     """Two PPO updates through `main()` with the channel and both auxiliaries on.
 
     Not a result -- two updates on six cars is nothing. What it catches is the class of mistake the
@@ -434,7 +445,7 @@ def test_a_whole_update_runs_with_every_flag_on(monkeypatch, tmp_path):
     from f1sim.learn import ppo
     monkeypatch.setenv("F1SIM_RUNS", str(tmp_path))
     monkeypatch.setattr(sys, "argv", [
-        "ppo", "--name", "motion_smoke", "--device", "cpu", "--sim-backend", "eager",
+        "ppo", "--name", f"motion_smoke_{stage}", "--device", "cpu", "--sim-backend", "eager",
         "--tracks", "gen:competition:0", "--envs", "6", "--race-size", "3", "--opponent", "policy",
         "--action-mode", "plan", "--horizon", "4", "--minibatch", "12", "--epochs", "1",
         "--total", "48", "--critic-warmup", "0", "--episode-s", "5.0",
@@ -442,21 +453,19 @@ def test_a_whole_update_runs_with_every_flag_on(monkeypatch, tmp_path):
         "--memory", "gru", "--memory-hidden", "16",
         "--scan-channels", "memory,edges,aligned,aligned_prev,aligned_valid",
         "--motion-memory", "--motion-hidden", "8", "--motion-channels", "8",
-        "--aux-opp-mask", "1.0", "--aux-motion", "1.0",
-        # k = 2 rather than the default 20: the label for step t is the state at t + k, and a
-        # four-step chunk cannot reach twenty. The trainer refuses the combination, which is
-        # its own test above; here the point is to run the term, not to argue with it.
-        "--aux-future", "1.0", "--aux-future-k", "2",
         "--aux-grip", "1.0", "--aux-opp", "1.0",
         "--metrics-jsonl", str(tmp_path / "m.jsonl"),
-    ])
+    ] + extra)
     ppo.main()
     import json
     rows = [json.loads(l) for l in open(tmp_path / "m.jsonl")]
     assert rows, "the run logged nothing"
     last = rows[-1]
-    for key in ("loss/aux_opp_mask", "loss/aux_motion_mse", "loss/aux_future_mse"):
+    for key in want:
         assert key in last and np.isfinite(last[key]), (key, last.get(key))
+    # a stage that is off leaves no trace: a coefficient of zero is not a term multiplied by zero
+    absent = {"loss/aux_opp_mask", "loss/aux_motion_mse", "loss/aux_future_mse"} - set(want)
+    assert not (absent & set(last)), sorted(absent & set(last))
     # the mask head is scored on a real label, so its own diagnostics have to be there and sane
     assert 0.0 <= last["loss/aux_opp_mask/mask_pos_rate"] <= 1.0
     assert 0.0 <= last["loss/aux_opp_mask/mask_recall"] <= 1.0

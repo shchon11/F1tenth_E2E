@@ -1137,8 +1137,12 @@ def main():
         # The label for step t is the row recorded at t + k, dropped where that row is outside this
         # chunk or on the far side of a reset. Done once per update, here, so the minibatch loop
         # slices an aligned (T, B, D) block exactly as it slices `priv`.
+        # On `future_cfg`, NOT on `buf_fut_lab`: that buffer is also allocated for E3-b's current
+        # relative velocity, whose target is the k = 0 row and needs no boundary mask -- and
+        # `buf_fut_break` is not allocated for it, so aligning against it would be aligning against
+        # a None.
         fut_tgt, fut_valid = (align_future_targets(buf_fut_lab, buf_fut_break, future_k)
-                              if buf_fut_lab is not None else (None, None))
+                              if future_cfg else (None, None))
         f_fut = fut_tgt.reshape(n, FUTURE_LABEL_DIM) if fut_tgt is not None else None
         f_fut_valid = fut_valid.reshape(n) if fut_valid is not None else None
         # E3-b's target: (Dv_x, Dv_y, present) at THIS instant, straight out of the same label rows.
