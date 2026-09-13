@@ -338,6 +338,37 @@ the convolutions do. It is 2.3 % of the car's 25 ms step as measured; if the Jet
 remedy is fusing the channel, not shrinking it.
 
 
+### The two-arm smoke: PPO health
+
+The same smoke the future-head worker ran, with one flag between the arms: 262144 env steps, 63 envs
+(not 64 — the trainer refuses an env count that is not a multiple of `--race-size 3`), three tracks,
+seed 701, warm-started from `frozen_original_48cc698f`, the opponent-diversity flags of
+`work/learning-next/future-20260914/launch.sh`. **Not a performance result**: 131 updates is about a
+thirtieth of the shortest finetune that has ever moved a held-out number. What it is evidence for is
+that the new input does not destabilise the update.
+
+| | A: `memory,edges` first 20 / last 20 | B: + the three aligned rows |
+|---|---|---|
+| `kl_ref` | 0.061 / 0.125 | 0.052 / 0.132 |
+| `clipfrac` | 0.0003 / 0.0002 | 0.0005 / 0.0001 |
+| `grad_norm` | 12.3 / 18.1 | 13.9 / 22.6 |
+| `loss/vf` | 3.55 / 3.91 | 3.65 / 4.21 |
+| `aux_grip` | 0.0174 / 0.0141 | 0.0167 / 0.0109 |
+| collisions / km | 141 / 23.6 | 118 / 18.5 |
+| progress [m] | 30.0 / 72.7 | 29.2 / 99.3 |
+| median env steps/s | 335 | 335 |
+| wall clock | 16.5 min | 13.8 min |
+
+Both arms ran all 131 updates with no non-finite loss and no non-finite gradient norm — with
+`--memory` the trainer raises on either, so a finished run *is* that evidence. Both recover from the
+warm start the same way. The gradient norm and the value loss end marginally larger in B, which is
+what three more input columns look like. The driving columns favour B (18.5 against 23.6
+collisions/km, 99 m against 73 m of progress) and **that is not a result**: one seed, 131 updates,
+and the two arms do not even share their GRU initialisation (below).
+
+**The channel costs nothing measurable in training.** 335 median env steps/s either way at 63 envs;
+its cost is in the per-step inference budget, where it is 0.57 ms (see Budget), not in the rollout.
+
 ### A confound in the smoke arms, measured rather than assumed
 
 The two E2 smoke arms differ by one flag, and by one thing nobody asked for: **their fresh GRUs are
