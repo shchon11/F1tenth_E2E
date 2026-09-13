@@ -51,8 +51,14 @@ Each control step, from the 1081 returns and nothing else:
    **tapered to zero one knot past the horizon**, so the tail curvature is untouched and
    `fixed_low`'s speed envelope over the tail is not moved along with it. The score is described
    below; it is where the two interesting mistakes are.
-4. **A cap.** Where no bend reaches the margin, a speed the remaining clearance allows —
-   `v_stop` at no clearance, rising linearly to the caller's own cap at the margin — put through a
+4. **A cap.** Where no bend reaches the margin, the arm takes away the fraction of the available
+   speed range that the margin is short by: `v_stop` at no clearance, rising linearly to the
+   caller's own cap at the margin. Anchoring the top on that cap rather than on a constant is what
+   makes the rule exactly non-binding at the margin — a constant below the cap would slow a car that
+   was keeping the margin perfectly well. The cost is that the speed action scales with the
+   environment's cap: at the 9 m/s cap these runs use, a plan at half the margin is still allowed
+   4.8 m/s, which is above the pace these policies hold, so the cap bites only where the margin is
+   nearly gone. By the evidence, that is where the collisions are. The result is then put through a
    backward braking pass so the car may still be fast now if it can shed the speed by the time it
    arrives. A plan carries two speed numbers and its profile is linear between them, so the
    envelope has to be fitted with a line: the arm computes the two lines that matter — the one that

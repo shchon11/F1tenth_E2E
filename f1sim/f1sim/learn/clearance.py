@@ -414,8 +414,15 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
 
     # -- the cap: a speed the clearance allows, then braking anticipation --------
     cap = speed_cap.reshape(-1, 1)
-    # Continuous and one-sided: at or above the margin this is the cap the caller already asked
-    # for, so it binds nothing; at no clearance at all it is `v_stop`.
+    # The rule: take away the fraction of the available speed range that the margin is short by.
+    # At or above the margin nothing is taken and this *is* the cap the caller already asked for, so
+    # it binds nothing; at no clearance at all it is `v_stop`. Anchoring the top on the caller's own
+    # cap rather than on a constant is what makes it exactly non-binding at the margin -- a constant
+    # below the cap would slow every car that was keeping the margin perfectly well. The cost is
+    # that the arm's speed action scales with the environment's cap: at a 9 m/s cap a plan at half
+    # the margin is still allowed 4.8 m/s, which is above the pace these policies actually hold, so
+    # on a high-cap run the cap only bites where the margin is nearly gone -- which is, by the
+    # evidence, where the collisions are.
     v_tight = cspec.v_stop + (cap - cspec.v_stop).clamp_min(0.0) * (clear_b / cspec.margin).clamp(0.0, 1.0)
     free = torch.full_like(v_tight, float(v_max) * 4.0)
     v_tight = torch.where(in_eval, v_tight, free)
