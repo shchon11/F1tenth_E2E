@@ -525,6 +525,12 @@ class PolicyNode(Node):
         self.policy_state.reset()
         if self.traction is not None:
             self.traction.reset()
+        if self.clearance is not None:
+            # Belt and braces: `on_scan` writes this buffer before the tracker is ever asked for a
+            # command, so a stale frame cannot reach a plan. Clearing it anyway means that if that
+            # ever stops being true, a car that has been picked up and put down is shaped by
+            # nothing rather than by the room it used to be in.
+            self.clearance.scan.fill_(1.0)
         if self.tracker is not None:
             self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
         self.get_logger().info("reset: observation, policy memory and tracker history cleared")

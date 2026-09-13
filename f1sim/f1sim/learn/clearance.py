@@ -379,7 +379,7 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
     hit = (raw < 0.0) & in_eval[:, None, :]
     blocked = hit.to(dt_).cumsum(-1) > 0
     eff = torch.where(blocked, torch.full_like(raw, -cspec.body_radius), raw)
-    # The score is the **mean** of the running clearance over the window, saturated at the margin:
+    # The score is the **mean** over the window of that clearance, saturated at the margin:
     # how much of the arc ahead the plan keeps clear, and how clear. Saturated, because once a
     # candidate has enough room more room is not better, so the deviation penalty then picks the
     # smallest bend that is enough -- and a candidate that keeps the margin everywhere scores
@@ -477,7 +477,10 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
         action[:, _mpc.N_KNOTS + 2:],
     ], 1)
 
-    last = (in_eval.to(torch.long).cumsum(1).amax(1).clamp(1, n) - 1)[:, None]  # last sample in window
+    # The largest *index* inside the window, not the count: the window is an interval that
+    # starts at `s_min`, so counting its samples would point one short of where it ends.
+    ar = torch.arange(n, device=dev)[None]
+    last = torch.where(in_eval, ar, torch.zeros_like(ar)).amax(1, keepdim=True)
     guard = lambda c: torch.where(in_eval, c, torch.full_like(c, float(cspec.d_clip))).amin(1)
     return Adjustment(action=a_new, dk=dk_b, shift=(y_b - y_0).gather(1, last)[:, 0],
                       clear_before=guard(raw_0), clear_after=guard(raw_b),
