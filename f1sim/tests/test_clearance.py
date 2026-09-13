@@ -520,3 +520,32 @@ def test_the_runtime_builds_the_arm_from_the_environment_s_own_beam_geometry():
     finally:
         rt.release()
     assert env.tracker._plan_hook is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_arm_is_the_same_arm_on_the_gpu():
+    """Batched on the device the training and evaluation loops run on, and not a different answer.
+
+    Everything here is elementwise or a gather, so CPU and CUDA should agree to float precision --
+    but the two places that could disagree materially are the `scatter_` that bins the returns and
+    the `argmax` that picks the candidate, and a disagreement in either would make a GPU result a
+    different system from the one the rest of this file pins.
+    """
+    cs = cl.ClearanceSpec().validate()
+    torch.manual_seed(4401)
+    n = 48
+    scan = torch.rand(n, N_BEAMS).clamp(0.05, 1.0)
+    a = torch.rand(n, mpc.ACT_DIM) * 2 - 1
+    v = torch.rand(n) * 5 + 1
+    cap = torch.full((n,), 9.0)
+
+    def run_on(dev):
+        ang = ANGLES.to(dev)
+        d = cl.distance_field(cl.occupancy(scan.to(dev), ang, cs, RANGE_MAX), cs)
+        return cl.adjust(a.to(dev), v.to(dev), cap.to(dev), d, SPEC, cs, V_MAX)
+
+    host, gpu = run_on("cpu"), run_on("cuda")
+    assert torch.equal(gpu.dk.cpu(), host.dk), "a different candidate was chosen on the GPU"
+    assert float((gpu.action.cpu() - host.action).abs().max()) < 1e-5
+    assert float((gpu.v0.cpu() - host.v0).abs().max()) < 1e-4
+    assert float((gpu.v1.cpu() - host.v1).abs().max()) < 1e-4

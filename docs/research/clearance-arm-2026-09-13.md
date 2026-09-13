@@ -3,8 +3,10 @@
 **2026-09-13.** A runtime controller layer that adjusts the policy's plan — bending it, and where it
 cannot bend, slowing it — until every point of it keeps a stated body-edge margin from the local
 occupancy built out of the current LiDAR frame. No map, no pose, no training. Measured before and
-after with [`crash_attribution.py`](../../../crash_attribution.py) on the eight held-out proxy
-tracks, under `legacy` and under `fixed_low`.
+after with `crash_attribution.py` on the eight held-out proxy tracks, under `legacy` and under
+`fixed_low`. That script and its results live in the worker directory beside this checkout
+(`work/clearance-arm/`), not in the repository: it reads checkpoints and writes JSON that is not
+part of the simulator.
 
 Module: [`f1sim/learn/clearance.py`](../../f1sim/f1sim/learn/clearance.py). Arm names:
 `clearance`, `fixed_low+clearance`, and the same two with `+tcs`.
