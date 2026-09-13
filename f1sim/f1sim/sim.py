@@ -29,7 +29,8 @@ from .track import Track, TrackTensors
 class StepResult:
     scan: torch.Tensor          # (B, N) noisy ranges (inf for no return)
     scan_true: torch.Tensor     # (B, N) noise-free ranges (privileged)
-    scan_type: torch.Tensor     # (B, N) int32 what each beam hit: 0 none, 1 duct, 2 tall object, 3 floor
+    scan_type: torch.Tensor     # (B, N) int32 what each beam hit, `lidar.HIT_*`: 0 none,
+                                # 1 duct, 2 tall object (props included), 3 floor, 4 another car
     attitude: torch.Tensor      # (B, 2) body roll, pitch [rad] (sprung mass)
     odom: torch.Tensor          # (B, 5) VESC odom: x, y, yaw, v, yaw_rate (drifting)
     state: torch.Tensor         # (B, 8) ground truth: x, y, yaw, vx, vy, yaw_rate, steer, omega_r

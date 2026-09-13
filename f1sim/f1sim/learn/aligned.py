@@ -100,10 +100,14 @@ import torch.nn.functional as F
 #: short enough that the composed ego motion is a small extrapolation of two measured rates.
 ALIGNED_K = 4
 
-#: Soft threshold on the residual, metres: `sign(R) * max(|R| - tau, 0)`. Fixed BEFORE training at
-#: 2-3 sigma of the static-world floor measured on the real bags (`learn.aligned_floor`, and the
-#: number is stated in the research note). Not tuned on a result.
-ALIGNED_TAU = 0.10
+#: Soft threshold on the residual, metres: `sign(R) * max(|R| - tau, 0)`.
+#:
+#: **Fixed before any training**, from the static-world floor measured on the real recordings:
+#: `python -m f1sim.learn.aligned_floor bags --aligned-k 4 --tau 0 --tol-beams 0` over the ten
+#: recordings whose gyro and attitude pass the plausibility checks reads
+#: **sigma_static = 0.025 m** (p68 of |R|; the median-based estimate agrees at 0.022 m), and
+#: `tau = 3 sigma_static = 0.075 m`. It is not tuned on any result; the note states the run.
+ALIGNED_TAU = 0.075
 
 #: Range-proportional addition to tau. 0 by default: the addendum asks for one number. The knob
 #: exists because a bearing error of e radians costs `r * e` of range on an oblique surface, and the
@@ -201,6 +205,31 @@ def step_increment(v0: torch.Tensor, w0: torch.Tensor, v1: torch.Tensor, w1: tor
     return torch.stack([dx, dy], -1), dyaw
 
 
+def compose_stack(p: torch.Tensor, dyaw: torch.Tensor):
+    """(A (B,2,2), b (B,2)) from the k increments as stacked tensors, `p` (k,B,2), `dyaw` (k,B).
+
+    The closed form of `compose_increments`' recursion, so that the cost does not grow with k and,
+    more to the point on a car, does not spend k * 10 operator launches on four scalars:
+
+        A  = R(-sum_j dyaw_j)
+        b  = -sum_j R(-(sum_{i>=j} dyaw_i)) p_j
+
+    -- rotations compose by adding their angles, and each step's translation is carried to the
+    present by every rotation that came after it. `compose_increments` keeps the recursion as it
+    reads, and `tests/test_aligned_scan.py` holds the two to each other.
+    """
+    if p.dim() != 3 or dyaw.dim() != 2 or p.shape[:2] != dyaw.shape:
+        raise ValueError(f"p must be (k, B, 2) and dyaw (k, B), got {tuple(p.shape)} and "
+                         f"{tuple(dyaw.shape)}")
+    after = dyaw.flip(0).cumsum(0).flip(0)                      # sum_{i>=j} dyaw_i
+    c, s = torch.cos(after), torch.sin(after)
+    bx = -(c * p[..., 0] + s * p[..., 1]).sum(0)
+    by = -(-s * p[..., 0] + c * p[..., 1]).sum(0)
+    ct, st = torch.cos(dyaw.sum(0)), torch.sin(dyaw.sum(0))
+    a = torch.stack([torch.stack([ct, st], -1), torch.stack([-st, ct], -1)], -2)
+    return a, torch.stack([bx, by], -1)
+
+
 def compose_increments(increments: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
     """(A (B,2,2), b (B,2)) mapping a point's coordinates in the OLDEST frame to the newest.
 
@@ -211,16 +240,21 @@ def compose_increments(increments: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
     if not increments:
         raise ValueError("compose_increments needs at least one step")
     p0 = increments[0][0]
-    B = p0.shape[0]
-    a = torch.eye(2, device=p0.device, dtype=p0.dtype).expand(B, 2, 2).contiguous()
-    b = torch.zeros(B, 2, device=p0.device, dtype=p0.dtype)
+    # The rotations compose by adding their angles, so the 2x2 is built once from the total rather
+    # than multiplied k times; only the translation has to walk the steps, and it walks them as four
+    # scalars. This runs once per control step on the car, where the cost of a small tensor
+    # operation is the launch and not the arithmetic.
+    bx = torch.zeros_like(p0[:, 0])
+    by = torch.zeros_like(p0[:, 0])
+    theta = torch.zeros_like(p0[:, 0])
     for p, dyaw in increments:
         c, s = torch.cos(dyaw), torch.sin(dyaw)
-        # R(-dyaw)
-        r = torch.stack([torch.stack([c, s], -1), torch.stack([-s, c], -1)], -2)   # (B,2,2)
-        a = r @ a
-        b = (r @ (b - p).unsqueeze(-1)).squeeze(-1)
-    return a, b
+        qx, qy = bx - p[:, 0], by - p[:, 1]
+        bx, by = qx * c + qy * s, -qx * s + qy * c
+        theta = theta + dyaw
+    ct, st = torch.cos(theta), torch.sin(theta)
+    a = torch.stack([torch.stack([ct, st], -1), torch.stack([-st, ct], -1)], -2)   # R(-theta)
+    return a, torch.stack([bx, by], -1)
 
 
 def tilt_matrix(roll: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
@@ -232,14 +266,11 @@ def tilt_matrix(roll: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
     """
     cr, sr = torch.cos(roll), torch.sin(roll)
     cp, sp = torch.cos(pitch), torch.sin(pitch)
-    z, o = torch.zeros_like(cr), torch.ones_like(cr)
-    rx = torch.stack([torch.stack([o, z, z], -1),
-                      torch.stack([z, cr, -sr], -1),
-                      torch.stack([z, sr, cr], -1)], -2)
-    ry = torch.stack([torch.stack([cp, z, sp], -1),
-                      torch.stack([z, o, z], -1),
-                      torch.stack([-sp, z, cp], -1)], -2)
-    return ry @ rx
+    m = torch.zeros(roll.shape[0], 3, 3, device=roll.device, dtype=roll.dtype)
+    m[:, 0, 0] = cp;  m[:, 0, 1] = sp * sr;  m[:, 0, 2] = sp * cr
+    m[:, 1, 1] = cr;  m[:, 1, 2] = -sr
+    m[:, 2, 0] = -sp; m[:, 2, 1] = cp * sr;  m[:, 2, 2] = cp * cr
+    return m
 
 
 def beam_angles(n_beams: int, fov: float, device=None, dtype=torch.float32) -> torch.Tensor:
@@ -250,11 +281,14 @@ def beam_angles(n_beams: int, fov: float, device=None, dtype=torch.float32) -> t
 # ------------------------------------------------------------------ the warp
 def warp_scan(old_r: torch.Tensor, old_att: torch.Tensor, new_att: torch.Tensor,
               a: torch.Tensor, b: torch.Tensor, angles: torch.Tensor, range_max: float,
-              z_tol: float = ALIGNED_Z_TOL, gap_fill: int = ALIGNED_GAP_FILL):
+              z_tol: float = ALIGNED_Z_TOL, gap_fill: int = ALIGNED_GAP_FILL,
+              unit: Optional[torch.Tensor] = None):
     """(warped range (B,N) [m], known (B,N) bool, bound (B,N) bool): the old scan from here.
 
     `old_r` is in metres, `old_att` / `new_att` are (B,2) roll/pitch in radians, `(a, b)` is the
-    planar transform `compose_increments` returned, `angles` (N,) are the beam bearings.
+    planar transform `compose_increments` returned, `angles` (N,) are the beam bearings, and `unit`
+    is the (3, N) level direction of every beam -- `stack([cos, sin, 0])` -- precomputed by a caller
+    that runs this every control step.
 
     Three outputs because a range image carries two kinds of statement and they must not be warped
     into one:
@@ -278,21 +312,36 @@ def warp_scan(old_r: torch.Tensor, old_att: torch.Tensor, new_att: torch.Tensor,
     if angles.shape[0] != n:
         raise ValueError(f"angles must be ({n},), got {tuple(angles.shape)}")
     dtype = old_r.dtype
-    ca, sa = torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
     r = old_r.clamp(0.0, range_max)
     far = old_r >= range_max - 1e-4
-    q = torch.stack([r * ca[None], r * sa[None], torch.zeros_like(r)], -1)          # (B,N,3)
+    # The whole chain -- lift by the old tilt, carry by the planar motion, express in the current
+    # sensor plane -- is one affine map, so it is built once as a 3x3 and a 3-vector instead of
+    # three passes over the (B, N, 3) cloud. On the car this runs at batch 1, where the cost of the
+    # warp is the number of operator launches and not the arithmetic in them.
+    #
+    #   p = R_new^T ( A3 ( R_old (r u(a)) ) + b3 ) = M (r u(a)) + c,
+    #   M = R_new^T A3 R_old,   c = R_new^T b3,   A3 = [[A, 0], [0, 1]]
+    #
+    # and `u(a)`, the level unit direction of every beam, is constant and precomputed by the caller.
     r_old = tilt_matrix(old_att[:, 0], old_att[:, 1]).to(dtype)                     # (B,3,3)
-    p = torch.einsum("bij,bnj->bni", r_old, q)                                      # level frame, t-k
-    xy = torch.einsum("bij,bnj->bni", a.to(dtype), p[..., :2]) + b.to(dtype)[:, None, :]
-    p = torch.cat([xy, p[..., 2:]], -1)                                             # level frame, t
     r_new = tilt_matrix(new_att[:, 0], new_att[:, 1]).to(dtype)
-    p = torch.einsum("bji,bnj->bni", r_new, p)                                      # transpose = inverse
-    rho = torch.sqrt(p[..., 0] ** 2 + p[..., 1] ** 2).clamp(1e-6, range_max)
-    phi = torch.atan2(p[..., 1], p[..., 0])
+    a3 = torch.zeros(old_r.shape[0], 3, 3, device=old_r.device, dtype=dtype)
+    a3[:, :2, :2] = a.to(dtype)
+    a3[:, 2, 2] = 1.0
+    b3 = torch.zeros(old_r.shape[0], 3, device=old_r.device, dtype=dtype)
+    b3[:, :2] = b.to(dtype)
+    rn_t = r_new.transpose(1, 2)
+    m = rn_t @ a3 @ r_old                                                           # (B,3,3)
+    c = (rn_t @ b3.unsqueeze(-1)).squeeze(-1)                                       # (B,3)
+    u = unit if unit is not None else torch.stack(
+        [torch.cos(angles), torch.sin(angles), torch.zeros_like(angles)], 0).to(dtype)   # (3,N)
+    d = m @ u                                                                       # (B,3,N)
+    p = d * r.unsqueeze(1) + c.unsqueeze(-1)                                        # (B,3,N)
+    rho = torch.sqrt(p[:, 0] ** 2 + p[:, 1] ** 2).clamp(1e-6, range_max)
+    phi = torch.atan2(p[:, 1], p[:, 0])
     step = float(angles[1] - angles[0])
     idx = torch.round((phi - angles[0]) / step).long()
-    ok = (idx >= 0) & (idx < n) & (p[..., 2].abs() <= z_tol)
+    ok = (idx >= 0) & (idx < n) & (p[:, 2].abs() <= z_tol)
     # A large FINITE sentinel, not an infinity: `max_pool1d` is the gap fill below and pooling over
     # infinities comes back as the dtype's largest finite value on some backends, which then reads
     # as a known bin holding an absurd range. `miss` is well clear of any range the scanner can
@@ -456,6 +505,10 @@ class AlignedScan:
         self.device, self.dtype = torch.device(device), dtype
         self.dt, self.range_max = float(dt), float(range_max)
         self.angles = beam_angles(self.n_beams, self.fov, device=self.device, dtype=dtype)
+        #: The level unit direction of every beam, constant for the life of the channel. Built once
+        #: because the warp is a per-control-step cost on a car with a 25 ms budget.
+        self.unit = torch.stack([torch.cos(self.angles), torch.sin(self.angles),
+                                 torch.zeros_like(self.angles)], 0)
         self.reset()
 
     def reset(self, done=None) -> None:
@@ -475,9 +528,12 @@ class AlignedScan:
             self.prev_pos = torch.zeros(*shape, device=self.device, dtype=torch.bool)
             self.prev_neg = torch.zeros(*shape, device=self.device, dtype=torch.bool)
             self.seen = torch.zeros(self.batch, device=self.device, dtype=torch.long)
-            self.have_prev = torch.zeros(self.batch, device=self.device, dtype=torch.bool)
             self._raw = torch.zeros(*shape, device=self.device, dtype=self.dtype)
             self._known = torch.zeros(*shape, device=self.device, dtype=torch.bool)
+            #: Where the newest entry sits in each ring. Advanced before the write, so after a full
+            #: reset the first `_advance` writes index 0 and the rings fill in order.
+            self._head = self.k - 1
+            self._scan_head = self.k
             return
         d = done if torch.is_tensor(done) else torch.as_tensor(done, device=self.device)
         d = d.to(self.device)
@@ -493,18 +549,35 @@ class AlignedScan:
         self.prev_pos = self.prev_pos & ~d[:, None]
         self.prev_neg = self.prev_neg & ~d[:, None]
         self.seen = torch.where(d, torch.zeros_like(self.seen), self.seen)
-        self.have_prev = self.have_prev & ~d
+
+    @property
+    def _order(self):
+        """The k motion increments oldest-first, as the ring currently holds them."""
+        h = self._head
+        return [(h + 1 + i) % self.k for i in range(self.k)] if self.k > 1 else [h]
+
+    @property
+    def _oldest(self) -> int:
+        """Where the scan from k steps ago sits in the (k + 1)-deep scan ring."""
+        return (self._scan_head + 1) % (self.k + 1)
 
     def _advance(self, scan_now: torch.Tensor, motion: torch.Tensor, dt: Optional[float] = None):
-        """Push this step's scan, attitude and motion increment into the ring buffers."""
+        """Push this step's scan, attitude and motion increment into the ring buffers.
+
+        A head index rather than `torch.roll`: rolling four buffers is four allocations and eight
+        operator launches per control step, for a shift that a modular index does for free. On the
+        car this is 25 ms of budget and the arithmetic here is not where the time goes.
+        """
         v, w = motion[:, 0], motion[:, 1]
         p, dyaw = step_increment(self.vw[:, 0], self.vw[:, 1], v, w,
                                  self.dt if dt is None else float(dt))
         self.vw = torch.stack([v, w], -1)
-        self.inc_p = torch.roll(self.inc_p, -1, 0); self.inc_p[-1] = p
-        self.inc_yaw = torch.roll(self.inc_yaw, -1, 0); self.inc_yaw[-1] = dyaw
-        self.scans = torch.roll(self.scans, -1, 0); self.scans[-1] = scan_now
-        self.att = torch.roll(self.att, -1, 0); self.att[-1] = motion[:, 2:4]
+        self._head = (self._head + 1) % self.k
+        self.inc_p[self._head] = p
+        self.inc_yaw[self._head] = dyaw
+        self._scan_head = (self._scan_head + 1) % (self.k + 1)
+        self.scans[self._scan_head] = scan_now
+        self.att[self._scan_head] = motion[:, 2:4]
         self.seen = self.seen + 1
 
     def __call__(self, scan_now: torch.Tensor, motion: torch.Tensor,
@@ -523,18 +596,22 @@ class AlignedScan:
         scan_now = scan_now.to(self.dtype)
         motion = motion.to(self.dtype)
         self._advance(scan_now, motion, dt)
-        a, b = compose_increments([(self.inc_p[i], self.inc_yaw[i]) for i in range(self.k)])
-        warped, known, bound = warp_scan(self.scans[0] * self.range_max, self.att[0], self.att[-1],
-                                         a, b, self.angles, self.range_max, self.z_tol,
-                                         self.gap_fill)
+        a, b = compose_stack(self.inc_p[self._order], self.inc_yaw[self._order])
+        old = self._oldest
+        warped, known, bound = warp_scan(self.scans[old] * self.range_max, self.att[old],
+                                         self.att[self._scan_head], a, b, self.angles,
+                                         self.range_max, self.z_tol, self.gap_fill, self.unit)
         now_m = scan_now * self.range_max
         raw, known = residual(now_m, warped, known, bound, self.tol_beams,
                               now_known=now_m < self.range_max - 1e-4)
         #: The layers `parts` reports, kept from the last call rather than recomputed: a second
         #: implementation of the same arithmetic is a second thing that can be wrong.
         self._raw, self._known = raw / self.range_max, known
-        out, pos, neg = gate(raw, now_m, self.prev_pos if self.have_prev.any() else None,
-                             self.prev_neg if self.have_prev.any() else None,
+        # The masks are passed unconditionally, never a `None` chosen by reading a flag off the
+        # device: `have_prev.any()` is a host synchronisation, and this runs once per env step of
+        # every rollout. It costs nothing to pass them -- after a reset they are all False, so the
+        # consistency test rejects everything, which is exactly what the first step should do.
+        out, pos, neg = gate(raw, now_m, self.prev_pos, self.prev_neg,
                              self.tau, self.tau_rel, self.consist_beams)
         # Rows whose buffers are not yet full have warped a scan that belongs to a previous episode
         # (or to the ones() the reset wrote), so their residual is meaningless and is zeroed. The
@@ -543,7 +620,6 @@ class AlignedScan:
         valid = known & ready
         out = torch.where(valid, out, torch.zeros_like(out))
         self.prev_pos, self.prev_neg = pos & ready, neg & ready
-        self.have_prev = self.have_prev | ready[:, 0]
         self._raw = torch.where(ready, self._raw, torch.zeros_like(self._raw))
         self._known = valid
         return {"aligned": out / self.range_max,
@@ -575,8 +651,9 @@ class AlignedScan:
         never acted on. Implemented by saving and restoring the buffers rather than by a second copy
         of the arithmetic, so the previewed value cannot drift from the acted one.
         """
-        keep = (self.scans, self.att, self.vw, self.inc_p, self.inc_yaw, self.prev_pos,
-                self.prev_neg, self.seen, self.have_prev, self.batch)
+        keep = (self.scans.clone(), self.att.clone(), self.vw, self.inc_p.clone(),
+                self.inc_yaw.clone(), self.prev_pos, self.prev_neg, self.seen,
+                self.batch, self._head, self._scan_head)
         try:
             if index is not None:
                 idx = index if torch.is_tensor(index) else torch.as_tensor(index, device=self.device)
@@ -584,12 +661,13 @@ class AlignedScan:
                 self.vw = self.vw[idx]; self.inc_p = self.inc_p[:, idx]
                 self.inc_yaw = self.inc_yaw[:, idx]
                 self.prev_pos = self.prev_pos[idx]; self.prev_neg = self.prev_neg[idx]
-                self.seen = self.seen[idx]; self.have_prev = self.have_prev[idx]
+                self.seen = self.seen[idx]
                 self.batch = int(self.scans.shape[1])
             return self(scan_now, motion, dt)
         finally:
             (self.scans, self.att, self.vw, self.inc_p, self.inc_yaw, self.prev_pos,
-             self.prev_neg, self.seen, self.have_prev, self.batch) = keep
+             self.prev_neg, self.seen, self.batch, self._head,
+             self._scan_head) = keep
 
 
 def describe(spec: Optional[dict]) -> str:

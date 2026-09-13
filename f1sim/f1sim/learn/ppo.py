@@ -32,6 +32,7 @@ from . import opponent_config as opp_cfg
 from .future import (FUTURE_K, align_future_targets, future_labelled_fraction, future_loss,
                      future_spec)
 from .memory import Hidden, memory_spec, reset_hidden
+from .motion import MOTION_HIDDEN, dv_loss, mask_loss, motion_spec
 from .model import (ActorCritic, load_checkpoint, load_for_conditioning, load_for_memory,
                     save_checkpoint)
 from .aligned import (ALIGNED_CONSIST_BEAMS, ALIGNED_GAP_FILL, ALIGNED_K, ALIGNED_TAU,
@@ -75,6 +76,8 @@ class PPOHyper:
     aux_grip: float = 0.0
     aux_opp: float = 0.0
     aux_future: float = 0.0
+    aux_opp_mask: float = 0.0
+    aux_motion: float = 0.0
     priv_mu_index: int = 16
     aux_opp_range_m: float = AUX_OPP_RANGE_M
     m_gt_1: bool = False
@@ -83,7 +86,7 @@ class PPOHyper:
 def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old, adv, ret,
                      val_old, w, cond=None, hyper: PPOHyper, autocast=None,
                      freeze_actor: bool = False, sequence=None,
-                     future=None, future_valid=None) -> dict:
+                     future=None, future_valid=None, beam_mask=None, dv=None) -> dict:
     """One PPO minibatch's loss terms, feedforward or recurrent.
 
     Lifted out of `main`'s inner loop unchanged so that (a) the recurrent path and the feedforward
@@ -102,21 +105,26 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     like `priv` and `w` respectively (so (T, m, D) and (T, m) in the recurrent path). They are
     optional and default to None, which -- together with `hyper.aux_future = 0` -- is what makes an
     unflagged run's loss the number the frozen oracle recorded.
+
+    `beam_mask` is the per-beam opponent label for the motion branch's mask head, shaped like `scan`
+    minus its channel axis, and `dv` is the nearest opponent's CURRENT relative velocity (the k = 0
+    row of the same privileged label the future head uses). Both are optional on the same terms.
     """
     ac = autocast if autocast is not None else nullcontext()
     with ac:
         if sequence is None:
-            logp, ent, val, d, grip, opp_pred, fut_pred, h_next = model.evaluate_aux(
+            logp, ent, val, d, grip, opp_pred, fut_pred, mot_pred, h_next = model.evaluate_aux(
                 scan, pro, priv, act, cond)
             ref_scan, ref_pro, ref_cond = scan, pro, cond
         else:
             h0, keep = sequence
-            logp, ent, val, d, grip, opp_pred, fut_pred, h_next = model.evaluate_sequence(
+            logp, ent, val, d, grip, opp_pred, fut_pred, mot_pred, h_next = model.evaluate_sequence(
                 scan, pro, priv, act, cond, h0, keep)
             T, m = scan.shape[0], scan.shape[1]
             flat = lambda t: None if t is None else t.reshape(T * m, *t.shape[2:])
             ref_scan, ref_pro, ref_cond, priv = flat(scan), flat(pro), flat(cond), flat(priv)
             future, future_valid = flat(future), flat(future_valid)
+            beam_mask, dv = flat(beam_mask), flat(dv)
     logp, ent, val = logp.float(), ent.float(), val.float()
 
     def wmean(x, w):
@@ -151,6 +159,25 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
                 "a missing one means the run was assembled wrong rather than that the term is off.")
         aux_f, aux_f_parts = future_loss(fut_pred.float(), future.float(),
                                          future_valid.float(), w.float())
+    mask_pred, dv_pred = mot_pred if mot_pred is not None else (None, None)
+    aux_m = torch.zeros((), device=logp.device)
+    aux_m_parts: dict = {}
+    if hyper.aux_opp_mask > 0:
+        if mask_pred is None or beam_mask is None:
+            raise ValueError(
+                "--aux-opp-mask is on but this minibatch carries no mask head / labels: the head is "
+                "built from meta['motion_heads'] and the label comes from the rollout buffer, so a "
+                "missing one means the run was assembled wrong rather than that the term is off.")
+        aux_m, aux_m_parts = mask_loss(mask_pred.float(), beam_mask.float(), w.float())
+    aux_dv = torch.zeros((), device=logp.device)
+    aux_dv_parts: dict = {}
+    if hyper.aux_motion > 0:
+        if dv_pred is None or dv is None:
+            raise ValueError(
+                "--aux-motion is on but this minibatch carries no Dv head / labels; see the message "
+                "for --aux-opp-mask, which this is the sibling of.")
+        aux_dv, aux_dv_parts = dv_loss(dv_pred.float(), dv[:, :2].float(), dv[:, 2].float(),
+                                       w.float())
     ratio = (logp - logp_old).exp()
     pg = -wmean(torch.min(ratio * adv, ratio.clamp(1 - hyper.clip, 1 + hyper.clip) * adv), w)
     v_clipped = val_old + (val - val_old).clamp(-hyper.clip, hyper.clip)
@@ -169,10 +196,12 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     ent_w = wmean(ent, w)
     loss = (hyper.vf * vf + (0.0 if freeze_actor else 1.0) * (pg - hyper.ent * ent_w
             + hyper.kl_coef * kl_ref) + hyper.aux_grip * aux + hyper.aux_opp * aux_o
-            + hyper.aux_future * aux_f)
+            + hyper.aux_future * aux_f + hyper.aux_opp_mask * aux_m + hyper.aux_motion * aux_dv)
     return {"pg": pg, "vf": vf, "ent": ent_w, "entropy_mean": ent.mean(), "kl_ref": kl_ref,
             "aux_grip": aux, "aux_opp": aux_o, "aux_future": aux_f,
-            "aux_future_parts": aux_f_parts, "loss": loss, "hidden": h_next,
+            "aux_future_parts": aux_f_parts, "aux_opp_mask": aux_m,
+            "aux_opp_mask_parts": aux_m_parts, "aux_motion": aux_dv,
+            "aux_motion_parts": aux_dv_parts, "loss": loss, "hidden": h_next,
             "approx_kl": ((ratio - 1) - (logp - logp_old)).mean(),
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
 
@@ -408,6 +437,28 @@ def main():
                          "is dropped as not comparable")
     ap.add_argument("--aligned-gap-fill", type=int, default=ALIGNED_GAP_FILL, metavar="N",
                     help="[aligned] beams a hole left by the warp's resampling may be filled from")
+    ap.add_argument("--motion-memory", action="store_true",
+                    help="split the recurrent state: add a small GRU (--motion-hidden, <= 64) fed "
+                         "by an encoder of the ALIGNED rows only, whose output enters the actor's "
+                         "and critic's first MLP preactivation through its own zero-initialised "
+                         "projection. h_dyn is carried inside the same hidden tensor as the main "
+                         "state, so every path that carries one carries this too. Off = no module, "
+                         "no meta, no RNG draw")
+    ap.add_argument("--motion-hidden", type=int, default=MOTION_HIDDEN, metavar="H",
+                    help="width of h_dyn. The contract caps it at 64: the claim under test is that "
+                         "the remedy is inductive bias rather than capacity")
+    ap.add_argument("--motion-channels", type=int, default=32, metavar="C",
+                    help="output channels of the motion encoder's last convolution")
+    ap.add_argument("--motion-critic", default="own", choices=("own", "none"),
+                    help="'own' gives the critic its own motion branch, as --memory-critic does")
+    ap.add_argument("--aux-opp-mask", type=float, default=0.0, metavar="COEF",
+                    help="E3-a. Weighted BCE on a per-beam 'is this beam on another car' logit read "
+                         "from the MOTION ENCODER's features. The label is the LiDAR's own "
+                         "scan_type == HIT_CAR -- privileged, train-time, and already cast. The "
+                         "logits are never fed to the planner and never exported")
+    ap.add_argument("--aux-motion", type=float, default=0.0, metavar="COEF",
+                    help="E3-b. MSE on the nearest opponent's CURRENT relative velocity, read from "
+                         "h_dyn alone. Masked by presence, like the future head's opponent columns")
     ap.add_argument("--scan-memory-tau", type=float, default=2.0,
                     help="[s] time constant of the decayed scan-occupancy channel")
     ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
@@ -450,6 +501,19 @@ def main():
             f"combination: the memory work is measured against the legacy tracker only, and a "
             f"policy that learns to lean on a friction-limited controller *and* on memory would "
             f"have two untested changes in one result. Run --controller legacy.")
+    if a.motion_memory or a.aux_opp_mask > 0 or a.aux_motion > 0:
+        if a.memory == "off":
+            raise SystemExit("--motion-memory needs --memory gru: h_dyn is carried inside the main "
+                             "hidden tensor and the split that separates them is the main GRU's.")
+        if not any(c in ALIGNED_CHANNELS for c in a.scan_channels):
+            raise SystemExit(
+                f"--motion-memory reads the aligned rows and --scan-channels is "
+                f"{a.scan_channels or 'empty'}: enable at least one of "
+                f"{', '.join(ALIGNED_CHANNELS)}. The branch has no other input by design -- giving "
+                f"it the raw scan would make it a second corridor encoder.")
+        if not a.motion_memory:
+            raise SystemExit("--aux-opp-mask / --aux-motion are losses on the motion branch and "
+                             "there is no branch without --motion-memory.")
     if a.memory != "off" and a.minibatch < a.horizon:
         raise SystemExit(f"--memory {a.memory} needs --minibatch >= --horizon ({a.minibatch} < "
                          f"{a.horizon}): a recurrent update's minibatches are whole env chunks of "
@@ -576,6 +640,15 @@ def main():
                                               z_tol=a.aligned_z_tol, gap_fill=a.aligned_gap_fill,
                                               tol_beams=a.aligned_tol_beams),
                                "proprio": motion_index_spec(spec)}
+    #: The motion branch, and which of its two train-time heads to build. Like the future head,
+    #: the head exists only when its coefficient is on -- a head that is built and not trained is a
+    #: state-dict difference between two arms that are meant to differ by a loss term.
+    mot_cfg = (motion_spec(hidden_size=a.motion_hidden, channels=a.motion_channels,
+                           critic=a.motion_critic,
+                           rows=[c for c in a.scan_channels if c in ALIGNED_CHANNELS])
+               if a.motion_memory else None)
+    mot_heads = ([h for h, on in (("mask", a.aux_opp_mask > 0), ("dv", a.aux_motion > 0)) if on]
+                 if mot_cfg else [])
     #: The future head is built when the term is on, and only then: `--aux-future 0` is the run it
     #: was, down to the state dict. A checkpoint that already carries one keeps it (the loaders read
     #: `meta`), so a resume does not have to repeat the flag to keep the head -- but it does have to
@@ -592,19 +665,20 @@ def main():
     #: output -- goes down the warm-start path and is refused.
     init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
     add_mem, add_chan, add_fut = warm_start_additions(init_meta, mem_cfg, chan_cfg, fut_cfg)
-    if a.init and (add_mem or add_chan or add_fut):
+    add_mot = None if init_meta.get("motion") else mot_cfg
+    if a.init and (add_mem or add_chan or add_fut or add_mot):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
         # actor's first action of this run is bit-identical to the one the original would have
         # produced. `tests/test_memory_model.py` is the check.
         model, extra, fresh = load_for_memory(
             a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
-            future_head=add_fut,
+            future_head=add_fut, motion=add_mot, motion_heads=mot_heads,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
-        print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} | "
-              f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
+        print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} "
+              f"motion {add_mot} | {len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
@@ -637,7 +711,8 @@ def main():
                             scan_stem=a.scan_stem, cond_dim=cond_dim,
                             cond=cond_spec.to_meta() if cond_dim else None,
                             priv_adapter=priv_adapter, memory=mem_cfg,
-                            scan_channels=chan_cfg, future_head=fut_cfg).to(device)
+                            scan_channels=chan_cfg, future_head=fut_cfg, motion=mot_cfg,
+                            motion_heads=mot_heads).to(device)
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
@@ -668,6 +743,22 @@ def main():
         print(f"policy memory: {_describe_memory(model.meta)}")
     #: Read back from the model for the same reason `memory_on` is: a resumed checkpoint carries its
     #: own head, and the rollout has to collect labels exactly when there is something to score.
+    motion_cfg = dict(model.meta.get("motion") or {})
+    motion_heads = list(model.meta.get("motion_heads") or ())
+    mask_on = bool(motion_cfg) and "mask" in motion_heads and a.aux_opp_mask > 0
+    dv_on = bool(motion_cfg) and "dv" in motion_heads and a.aux_motion > 0
+    if motion_cfg:
+        from .motion import describe as _describe_motion
+        print(f"{_describe_motion(model.meta)} | heads {motion_heads or 'none'} | "
+              f"mask {a.aux_opp_mask} ({'training' if mask_on else 'off'}), "
+              f"dv {a.aux_motion} ({'training' if dv_on else 'off'}) | "
+              f"h_dyn is carried inside the {model.actor.memory.total_size}-wide hidden state")
+        if (a.aux_opp_mask > 0) != ("mask" in motion_heads) or (a.aux_motion > 0) != ("dv" in motion_heads):
+            raise SystemExit(
+                f"this checkpoint carries motion heads {motion_heads} and the run asks for "
+                f"mask={a.aux_opp_mask}, dv={a.aux_motion}. A head that exists and is not trained "
+                f"is a state-dict difference between arms that are meant to differ by a loss term; "
+                f"a coefficient with no head is a run assembled wrong. Match them.")
     future_cfg = dict(model.meta.get("future_head") or {})
     future_on = bool(future_cfg) and a.aux_future > 0
     future_k = int(future_cfg.get("k", a.aux_future_k))
@@ -716,6 +807,8 @@ def main():
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
         "fresh_optimizer": bool(a.fresh_opt), "aux_grip": float(a.aux_grip), "aux_opp": float(a.aux_opp),
         "aux_future": float(a.aux_future), "future_head": dict(future_cfg) or None,
+        "aux_opp_mask": float(a.aux_opp_mask), "aux_motion": float(a.aux_motion),
+        "motion": dict(motion_cfg) or None, "motion_heads": list(motion_heads),
         "lab_oracle": bool(cond_spec.lab_oracle), "init": a.init, "seed": int(a.seed),
         "memory": dict(model.meta.get("memory") or {}) or None,
         "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
@@ -828,8 +921,16 @@ def main():
     # SOMEBODY IN THE RACE, which is the condition under which the label at t + k belongs to a
     # different situation (`F1VecEnv.race_boundary`). `future.align_future_targets` turns the pair
     # into (target, valid) after the rollout.
-    buf_fut_lab = torch.zeros(T + 1, B, FUTURE_LABEL_DIM, device=device) if future_cfg else None
+    #: The future head's labels are also where E3-b's CURRENT relative velocity comes from: its
+    #: target is the k = 0 row of the same privileged snapshot, so the two cannot disagree about
+    #: what "the nearest opponent" means. The buffer is therefore allocated for either.
+    want_lab = bool(future_cfg) or dv_on
+    buf_fut_lab = torch.zeros(T + 1, B, FUTURE_LABEL_DIM, device=device) if want_lab else None
     buf_fut_break = torch.zeros(T, B, device=device) if future_cfg else None
+    #: The per-beam opponent mask, as uint8: (32, 63, 1081) is 2.2 MB stored this way and 8.7 MB as
+    #: float32, and it is a 0/1 label.
+    buf_mask_lab = (torch.zeros(T, B, spec.n_beams, device=device, dtype=torch.uint8)
+                    if mask_on else None)
     # ---- recurrent state. `h_*` are the live states, full env width (the policy acts for every
     # car, including the self-play opponents); the buffers hold the learners' slice, which is what
     # the update replays. `buf_keep[t] = 0` marks a step whose predecessor ended an episode, so
@@ -929,6 +1030,10 @@ def main():
                     # Before the step: `last_result` is still the state this action is taken from,
                     # which is the state `priv` above was read from.
                     buf_fut_lab[t] = env.future_labels()[lid]
+                if buf_mask_lab is not None:
+                    # Same instant, same reason: the mask belongs to the newest scan of THIS
+                    # observation, which is the frame the aligned residual was computed against.
+                    buf_mask_lab[t] = env.opponent_beam_mask()[lid].to(torch.uint8)
                 if cond_dim:
                     buf_cond[t] = cond_t[lid].float()
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
@@ -1032,6 +1137,11 @@ def main():
                               if buf_fut_lab is not None else (None, None))
         f_fut = fut_tgt.reshape(n, FUTURE_LABEL_DIM) if fut_tgt is not None else None
         f_fut_valid = fut_valid.reshape(n) if fut_valid is not None else None
+        # E3-b's target: (Dv_x, Dv_y, present) at THIS instant, straight out of the same label rows.
+        # No alignment and no boundary mask, because k = 0 crosses nothing.
+        dv_tgt = (buf_fut_lab[:T][..., [2, 3, FUTURE_PRESENT_INDEX]] if dv_on else None)
+        f_dv = dv_tgt.reshape(n, 3) if dv_tgt is not None else None
+        f_mask = buf_mask_lab.reshape(n, spec.n_beams) if buf_mask_lab is not None else None
         # advantage statistics over the policy's own samples only; a teacher-driven car's advantages
         # are not the policy's and would otherwise set the scale everything else is normalised by
         w_all = f_mask / f_mask.sum().clamp_min(1.0)
@@ -1041,6 +1151,8 @@ def main():
         freeze_actor = update < a.critic_warmup
         hyper = PPOHyper(clip=a.clip, vf=a.vf, ent=a.ent, kl_coef=kl_coef, aux_grip=a.aux_grip,
                          aux_opp=a.aux_opp, aux_future=(a.aux_future if future_on else 0.0),
+                         aux_opp_mask=(a.aux_opp_mask if mask_on else 0.0),
+                         aux_motion=(a.aux_motion if dv_on else 0.0),
                          priv_mu_index=int(env.priv_mu_index), m_gt_1=bool(env.M > 1))
         # Feedforward: minibatches are random SAMPLES, as they always were. Recurrent: minibatches
         # are whole env chunks of the horizon, because the update has to replay each env's chunk in
@@ -1065,6 +1177,8 @@ def main():
                            buf_keep[:, cols])
                     fut_mb = fut_tgt[:, cols] if fut_tgt is not None else None
                     fut_valid_mb = fut_valid[:, cols] if fut_valid is not None else None
+                    mask_mb = buf_mask_lab[:, cols] if buf_mask_lab is not None else None
+                    dv_mb = dv_tgt[:, cols] if dv_tgt is not None else None
                 else:
                     idx = sel
                     scan = f_scan[idx].float(); pro = f_pro[idx]
@@ -1072,13 +1186,16 @@ def main():
                     c_mb = f_cond[idx] if cond_dim else None   # the stored one, never recomputed
                     fut_mb = f_fut[idx] if f_fut is not None else None
                     fut_valid_mb = f_fut_valid[idx] if f_fut_valid is not None else None
+                    mask_mb = f_mask[idx] if f_mask is not None else None
+                    dv_mb = f_dv[idx] if f_dv is not None else None
                 # NOT `out`: that is the run directory, twenty lines below, and shadowing it makes
                 # a run that trains perfectly and then cannot write its checkpoint.
                 terms = minibatch_losses(model, ref, scan=scan, pro=pro, priv=priv_mb, act=act_mb,
                                          logp_old=f_logp[idx], adv=f_adv[idx], ret=f_ret[idx],
                                          val_old=f_val[idx], w=f_mask[idx], cond=c_mb, hyper=hyper,
                                          autocast=ac, freeze_actor=freeze_actor, sequence=seq,
-                                         future=fut_mb, future_valid=fut_valid_mb)
+                                         future=fut_mb, future_valid=fut_valid_mb,
+                                         beam_mask=mask_mb, dv=dv_mb)
                 pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
                                               terms["aux_grip"], terms["aux_opp"])
                 loss = terms["loss"]
@@ -1113,6 +1230,12 @@ def main():
                         stats.setdefault("aux_future", []).append(terms["aux_future"].item())
                         for key, value in terms["aux_future_parts"].items():
                             stats.setdefault(f"aux_future/{key}", []).append(float(value))
+                    for on, name in ((mask_on, "aux_opp_mask"), (dv_on, "aux_motion")):
+                        if not on:
+                            continue
+                        stats.setdefault(name, []).append(terms[name].item())
+                        for key, value in terms[name + "_parts"].items():
+                            stats.setdefault(f"{name}/{key}", []).append(float(value))
         t_upd = tm.lap()
         steps_done += n; update += 1
         # B3, drained EVERY update, before the logging branch. "Five consecutive updates" is a
@@ -1149,6 +1272,12 @@ def main():
                    **({"loss/aux_future_mse": float(np.mean(stats["aux_future"]))} if stats.get("aux_future") else {}),
                    **{f"loss/aux_future/{key.split('/', 1)[1]}": float(np.mean(v))
                       for key, v in stats.items() if key.startswith("aux_future/")},
+                   **({"loss/aux_opp_mask": float(np.mean(stats["aux_opp_mask"]))}
+                      if stats.get("aux_opp_mask") else {}),
+                   **({"loss/aux_motion_mse": float(np.mean(stats["aux_motion"]))}
+                      if stats.get("aux_motion") else {}),
+                   **{f"loss/{key}": float(np.mean(v)) for key, v in stats.items()
+                      if key.startswith("aux_opp_mask/") or key.startswith("aux_motion/")},
                    "policy/log_std_steer": model.actor.log_std[0].item(), "policy/log_std_speed": model.actor.log_std[1].item(),
                    "time/rollout_s": t_roll, "time/update_s": t_upd, "time/env_steps_per_s": n / (t_roll + t_upd),
                    "time/elapsed_min": (time.time() - t_start) / 60}
@@ -1206,6 +1335,9 @@ def main():
                   f"lap {log.get('episode/lap_time_s', float('nan')):.1f} s | gate {log.get('curriculum/gate_coll_per_km', float('nan')):.1f} "
                   f"({log.get('curriculum/tracks_scored', 0):.0f} tk) | kl_ref {log['loss/kl_ref']:.3f}"
                   + (f" | fut {log['loss/aux_future_mse']:.3f}" if 'loss/aux_future_mse' in log else "")
+                  + (f" | mask {log['loss/aux_opp_mask']:.3f} r{log.get('loss/aux_opp_mask/mask_recall', float('nan')):.2f}"
+                     if 'loss/aux_opp_mask' in log else "")
+                  + (f" | dv {log['loss/aux_motion_mse']:.4f}" if 'loss/aux_motion_mse' in log else "")
                   + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         t_loop = time.time() - t_loop0
         if update % a.save_every == 0:

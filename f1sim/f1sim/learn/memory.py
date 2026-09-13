@@ -66,28 +66,88 @@ def memory_spec(kind: str = "gru", hidden_size: int = DEFAULT_HIDDEN, layers: in
 class GRUMemory(nn.Module):
     """GRU over a per-step embedding, added to a preactivation through a zero-initialised projection.
 
-    `step` advances one control step. `h` is `(layers, batch, hidden_size)`, the layout `nn.GRU`
+    `step` advances one control step. `h` is `(layers, batch, total_size)`, the layout `nn.GRU`
     uses, so nothing has to be transposed on the way in or out.
+
+    **The optional motion branch** (`attach_motion`, `learn.motion`) is a SECOND, small GRU fed by
+    the aligned residual rather than by the trunk embedding, whose output is added to the same
+    preactivation through its own zero-initialised projection. Its state lives in the same tensor,
+    concatenated on the feature axis:
+
+        h = [ h_main (hidden_size) | h_dyn (motion hidden_size) ]
+
+    One tensor rather than two, because the hidden state is carried by the rollout buffers, the
+    truncation mask, the ROS node's callback state, the viewer's static CUDA-graph buffer and the
+    ONNX export's `hidden` input -- every one of which is written against a width and none of which
+    has to learn about a second state this way. `split` is the only place that knows the layout.
     """
 
     def __init__(self, in_dim: int, hidden_size: int, out_dim: int, layers: int = 1):
         super().__init__()
         self.hidden_size, self.layers = int(hidden_size), int(layers)
+        self.out_dim = int(out_dim)
         self.gru = nn.GRU(int(in_dim), self.hidden_size, num_layers=self.layers, batch_first=True)
         self.out = nn.Linear(self.hidden_size, int(out_dim), bias=False)
         nn.init.zeros_(self.out.weight)
+        #: Built LAST and only when asked for, like the future head: absent, the module list, the
+        #: state dict and the RNG draw are what they were before any of this existed.
+        self.motion = None
+
+    def attach_motion(self, in_rows: int, spec: dict) -> None:
+        """Build the motion branch. Separate from `__init__` so the caller can build it after every
+        other module and leave the arms that do not use it drawing from the same generator."""
+        from .motion import MotionMemory
+        if self.layers != 1:
+            raise ValueError(
+                f"the motion state is concatenated onto the main one on the feature axis, which "
+                f"needs one GRU layer; this memory has {self.layers}. A multi-layer main GRU would "
+                f"need the motion state broadcast across layers, which is not a thing it is.")
+        self.motion = MotionMemory(int(in_rows), int(spec["hidden_size"]), self.out_dim,
+                                   int(spec["channels"]))
+
+    @property
+    def motion_size(self) -> int:
+        return 0 if self.motion is None else self.motion.hidden_size
+
+    @property
+    def total_size(self) -> int:
+        return self.hidden_size + self.motion_size
+
+    def split(self, h: Optional[torch.Tensor]):
+        """(main state, motion state or None) out of the carried tensor."""
+        if h is None:
+            return None, None
+        if self.motion is None:
+            return h, None
+        if h.shape[-1] != self.total_size:
+            raise ValueError(f"hidden state is {h.shape[-1]} wide and this memory carries "
+                             f"{self.hidden_size} + {self.motion_size} = {self.total_size}")
+        return h[..., :self.hidden_size], h[..., self.hidden_size:]
 
     def initial(self, batch: int, device=None, dtype=None) -> torch.Tensor:
         ref = self.out.weight
-        return torch.zeros(self.layers, int(batch), self.hidden_size,
+        return torch.zeros(self.layers, int(batch), self.total_size,
                            device=device or ref.device, dtype=dtype or ref.dtype)
 
-    def step(self, x: torch.Tensor, h: Optional[torch.Tensor]):
-        """(delta on the preactivation, next hidden). `x` is (batch, in_dim)."""
+    def step(self, x: torch.Tensor, h: Optional[torch.Tensor], rows: Optional[torch.Tensor] = None):
+        """(delta on the preactivation, next hidden, motion encoder features or None).
+
+        `x` is (batch, in_dim); `rows` is (batch, R, n_beams), the aligned rows the motion branch
+        reads, and is required exactly when that branch exists.
+        """
         if h is None:
             h = self.initial(x.shape[0], x.device, x.dtype)
-        y, h_next = self.gru(x.unsqueeze(1), h)
-        return self.out(y[:, 0]), h_next
+        h_main, h_dyn = self.split(h)
+        y, h_main_next = self.gru(x.unsqueeze(1), h_main)
+        delta = self.out(y[:, 0])
+        if self.motion is None:
+            return delta, h_main_next, None
+        if rows is None:
+            raise ValueError("this memory carries a motion branch and was given no aligned rows; "
+                             "the branch reads the observation's aligned channels and there is no "
+                             "sensible default for them")
+        d_dyn, h_dyn_next, feat = self.motion.step(rows.to(x.dtype), h_dyn)
+        return delta + d_dyn, torch.cat([h_main_next, h_dyn_next], -1), feat
 
 
 class Hidden(NamedTuple):

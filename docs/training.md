@@ -220,8 +220,86 @@ warm start stays bit-identical.
 |---|---|---|
 | `memory` | the closest return seen at each bearing recently, relaxing back toward "no return" with time constant `--scan-memory-tau` (default 2 s) | explicit cheap memory the GRU does not have to learn. Bearings are the car's own and are **not** motion-compensated: a LiDAR-only policy has no pose, so a box that leaves the window leaves a fading trace at the bearing it left by, not a transformed position |
 | `edges` | `abs(r[i] - r[i-1])` per beam | the crack between two boxes in a row is two range discontinuities a few beams apart; the gap the lane actually leaves is one. The stem's first layer is a stride-2 7-tap convolution, so a two-beam crack lands inside one tap — as its own channel it survives at full beam resolution |
+| `aligned` | the signed residual `r_t - warp(r_{t-k})`, soft-thresholded | see below |
+| `aligned_prev` | the warped previous range itself | |
+| `aligned_valid` | 1 where the warp had a prediction AND the current beam returned | |
 
-Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for both.
+Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for `memory` +
+`edges`; 0.57 ms for the three aligned rows together (they share one warp).
+
+#### The ego-motion-aligned residual (`aligned`, `aligned_prev`, `aligned_valid`)
+
+**Why.** Between two LiDAR frames almost everything that moves is the *ego*: a corridor sweeping past
+at 9 m/s, against which another car is a handful of beams whose apparent motion is the sum of its own
+and the ego's. Nothing in PPO's objective rewards separating the two, and `probe_hidden --current`
+measures what that costs — the recurrent state carries the ego's own motion (R² 0.9) and the
+opponent's relative velocity hardly at all. This channel subtracts the ego's motion from the
+observation *before* the network sees it, so what still changes is what moved by itself. It is
+inductive bias rather than capacity: the GRU is not widened.
+
+**What it is.** Not `r_t − r_{t−k}`. The scan from k control steps ago becomes a point cloud in the
+old sensor's own frame (the simulator's beam geometry, `Ry(pitch) Rx(roll)` on the level bearing),
+is carried forward by k composed constant-(v, ω) arcs, and is **re-rasterised onto the current
+angular bins**; the residual is the current range minus that. Everything the warp uses is measured
+on the car — VESC wheel speed, IMU gyro z, IMU roll/pitch — so the channel is deployable, and
+`f1sim_ros/policy_node.py` feeds it from the three sensors it already reads.
+
+Three details are not decoration:
+
+* **a no-return warps as a lower bound, not a point.** "Nothing out to `range_max`, that way" stays
+  a bound after the car moves, so only something appearing *closer* than it counts. Treated as a
+  point, every far beam of every straight would report the ego's own 0.9 m of travel as motion.
+* **`aligned_valid` is a real channel.** A bin no warped point reached, or one where the current
+  beam did not return, is *unknown*; the residual there is exactly 0 and the mask says so. "I cannot
+  tell" and "nothing moved" must not be the same number.
+* **the threshold is `sign(R)·max(|R| − τ, 0)`, and τ was fixed before training** from the
+  static-world floor on the real recordings: σ_static = 0.025 m, τ = 3σ = **0.075 m**
+  (`python -m f1sim.learn.aligned_floor bags --aligned-k 4 --tau 0 --tol-beams 0`). Soft rather than
+  hard, so a real residual keeps its size instead of arriving as a step function. On top of it, a
+  two-frame consistency test: a residual survives only if the previous step had one of the same sign
+  above τ within `--aligned-consist-beams` of the same bearing.
+
+```bash
+python -m f1sim.learn.ppo ... --memory gru --memory-hidden 128 \
+  --scan-channels memory,edges,aligned,aligned_prev,aligned_valid --aligned-k 4
+python -m f1sim.learn.aligned_floor sim    # the floor with attitude randomisation on
+python -m f1sim.learn.aligned_floor bags   # and on the real recordings
+```
+
+`--aligned-k` is declared a priori at 4 (100 ms); `docs/research/motion-memory-2026-09-14.md` reports
+the sensitivity over {2, 4, 8} rather than picking one from a result.
+
+#### A separate motion state (`--motion-memory`, `--aux-opp-mask`, `--aux-motion`)
+
+Off by default: no module, no meta, no RNG draw, and `tests/test_ppo_memory.py` holds the loss to the
+same frozen oracle. On, the recurrence is **split**:
+
+```
+current LiDAR ----- scan stem ------------> main GRU  ---+
+aligned rows ------ motion encoder ------> motion GRU ---+--> plan head
+                         |                     |
+                         +-- beam mask         +-- current Δv, and --aux-future
+```
+
+`h_dyn` (≤ 64, `--motion-hidden`) is carried *inside the same hidden tensor* as the main state, so
+every path that already carries one — the rollout buffers, `reset_hidden`, the ROS node's callback
+state, the viewer's CUDA-graph buffer, the ONNX `hidden` input — carries this too, unchanged.
+
+The two auxiliaries attach to `h_dyn` and the motion encoder **only**, never to the main hidden
+state, and `--aux-future` moves to `h_dyn` as well when the branch exists. The reason is mechanical:
+ego dynamics are the cheap way to drive any of these losses down, so a main representation that is
+allowed to absorb them will.
+`tests/test_motion_memory.py::test_the_auxiliaries_reach_the_motion_branch_and_nothing_else` is that
+claim as a statement about the autograd graph.
+
+| flag | loss | label |
+|---|---|---|
+| `--aux-opp-mask COEF` | weighted BCE on a per-beam "is this beam on another car" logit, read from the motion **encoder**'s features | the LiDAR's own `scan_type == HIT_CAR` — privileged, train-time, already cast |
+| `--aux-motion COEF` | MSE on the nearest opponent's **current** relative velocity, read from `h_dyn` | the k = 0 row of the same privileged snapshot the future head uses, presence-masked |
+
+Staging is strict and in this order: **E3-a** mask, **E3-b** + Δv, **E3-c** + `--aux-future`. The
+mask logits are train-time only: they are never fed to the planner and never exported (the heads are
+not called by `Actor.forward` / `.step`, so the traced graph cannot contain them — checked).
 
 ### Predicting the near future (`--aux-future`)
 
@@ -325,6 +403,26 @@ it — legibly enough for anything else to use — is a separate question, and i
 "belief" rests on. `probe_hidden` rolls a checkpoint out with traffic and opponent events on, freezes
 the hidden states it produced, and fits a **linear** ridge read-out from `h_t` to the same privileged
 targets at `t + k`, with a held-out split. Linear on purpose: a nonlinear probe measures the probe.
+
+**`--current` is the narrower question, and the one to ask first.** It scores the nearest opponent's
+*present* relative state — Δx, Δy, Δv_x, Δv_y in the ego frame — with R² **and** MAE,
+presence-conditioned (rows with no car in range are excluded and the excluded share is reported) and
+split near / mid / far so a few close cars cannot carry a pooled number. Δx and Δy measure *object
+observability* and are readable from one scan; **Δv is the headline**, because a single range image
+contains no velocity, so recovering it is exactly the test of whether anything in the network relates
+two instants. Two flags make a ladder of representations comparable on it:
+
+* `--stack-mode repeat` puts the newest frame in every slot of the stack — same weights, same
+  proprio, 150 ms of temporal information removed and nothing else. The memory-off floor.
+* `--probe-state trunk` probes a feedforward checkpoint as it is, reading the trunk features the
+  action comes from, instead of warm-starting it into a GRU. The frame-stack row.
+
+With a motion branch the probe reads the **whole** recurrent state, `[h_main | h_dyn]`, while the
+auxiliary heads read only the `h_dyn` slice of it — one function apart, by design, and pinned by a
+test.
+
+The table this produces is fixed once and each arm adds a column:
+`work/motion-memory/work/e1/table.py`, and `docs/research/motion-memory-2026-09-14.md` reports it.
 
 ```bash
 python3 -m f1sim.learn.probe_hidden \

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from .future import FutureHead, future_spec
 from .memory import GRUMemory, Hidden, memory_spec
+from .motion import MotionDvHead, OppMaskHead, motion_spec
 
 
 class ResBlock1d(nn.Module):
@@ -246,10 +247,46 @@ class Actor(nn.Module):
         #: from the same generator in the same order, so adding the head to a fresh model does not
         #: move the rest of it.
         self.hidden_width = int(hidden)
+        #: The motion branch and its two train-time heads (`learn.motion`). Absent unless asked for,
+        #: and attached LAST by `ActorCritic` for the same reason the future head is: every weight
+        #: above it is then drawn from the same generator in the same order as in the arm without it.
+        self.motion_spec: Optional[dict] = None
+        self.motion_rows: Tuple[int, ...] = ()
+        self.opp_mask = None
+        self.dv = None
         self.future = None
         self.future_spec: Optional[dict] = None
         if future:
             self.attach_future(future)
+
+    def attach_motion(self, motion: dict, rows: Sequence[int], n_beams: int,
+                      heads: Sequence[str] = ()) -> None:
+        """Build the motion GRU over the scan's aligned rows, and any train-time head on it.
+
+        `rows` are the indices of the aligned channels within the stem's EXTRA channel block, so the
+        encoder reads the same columns the checkpoint recorded rather than whichever rows happen to
+        be trailing. `heads` is any of ("mask", "dv"); each is train-time only and is never called
+        by `forward` or `step`, which is what keeps it out of the exported graph.
+        """
+        if self.memory is None:
+            raise ValueError(
+                "motion memory needs the main recurrent memory: h_dyn is carried inside the same "
+                "hidden tensor, and the split that separates them is the main GRU's. Run "
+                "--memory gru, which is the arm this is an addition to anyway.")
+        spec = motion_spec(**motion)
+        rows = tuple(int(r) for r in rows)
+        if not rows:
+            raise ValueError("the motion encoder was given no aligned rows to read")
+        self.memory.attach_motion(len(rows), spec)
+        self.motion_spec, self.motion_rows = dict(spec), rows
+        unknown = [h for h in heads if h not in ("mask", "dv")]
+        if unknown:
+            raise ValueError(f"unknown motion head(s) {unknown}; known: mask, dv")
+        if "mask" in heads:
+            self.opp_mask = OppMaskHead(spec["channels"], int(n_beams),
+                                        self.memory.motion.encoder.stride, spec["width"])
+        if "dv" in heads:
+            self.dv = MotionDvHead(self.memory.motion.hidden_size, spec["width"])
 
     def attach_future(self, future: dict) -> None:
         """Build the future head. Separate from `__init__` so `ActorCritic` can call it LAST.
@@ -300,6 +337,41 @@ class Actor(nn.Module):
     def has_future(self) -> bool:
         return self.future is not None
 
+    @property
+    def has_motion(self) -> bool:
+        return self.memory is not None and self.memory.motion is not None
+
+    def motion_input(self, scan):
+        """The aligned rows the motion encoder reads, sliced out of the observation.
+
+        By recorded index within the stem's extra-channel block, never by "the last few rows": a
+        checkpoint whose encoder was built over (aligned, aligned_prev, aligned_valid) must keep
+        reading those three, in that order, whatever else a later run enables beside them.
+        """
+        if not self.has_motion:
+            return None
+        extra = self.stem.split_channels(scan)[1]
+        if extra is None:
+            raise ValueError("this actor carries a motion branch but the scan has no extra "
+                             "channels; the aligned rows are where the branch's input comes from")
+        idx = torch.as_tensor(self.motion_rows, device=scan.device)
+        return extra.index_select(1, idx)
+
+    def recurrent_state(self, feat, h_next):
+        """The WHOLE recurrent state after this step -- `[h_main | h_dyn]` when there is a motion
+        branch -- which is what `learn.probe_hidden` regresses from.
+
+        Deliberately not the same tensor as `future_input` once the motion branch exists: the
+        contract's addendum puts every auxiliary on `h_dyn` only, so that the main representation
+        cannot absorb the auxiliary loss through the ego-dynamics shortcut, while the question the
+        probe asks -- what does the policy's state carry -- is about all of it. The two are one
+        function apart (`future_input` returns a slice of what this returns), and
+        `tests/test_future_head.py` pins them to each other.
+        """
+        if self.memory is None:
+            return feat
+        return None if h_next is None else h_next[-1]
+
     def future_input(self, feat, h_next):
         """The tensor the future head reads: the recurrent state AFTER this step (`h_next[-1]`, the
         last GRU layer) when there is memory, the trunk features when there is not.
@@ -311,7 +383,14 @@ class Actor(nn.Module):
         """
         if self.memory is None:
             return feat
-        return None if h_next is None else h_next[-1]
+        if h_next is None:
+            return None
+        if self.has_motion:
+            # h_dyn only. The auxiliary losses must not reach the main GRU: ego dynamics are the
+            # cheap way to drive any of them down, and a main state that takes that route is the
+            # failure this whole split exists to avoid.
+            return h_next[-1][:, self.memory.hidden_size:]
+        return h_next[-1]
 
     def future_from(self, feat, h_next):
         """The future head's prediction, or None if this actor carries no head (or no state)."""
@@ -321,17 +400,31 @@ class Actor(nn.Module):
         return None if x is None else self.future(x)
 
     def probe_state(self, scan, proprio, c=None, h=None):
-        """(deterministic action, the state the future head reads, next hidden) from one forward.
+        """(deterministic action, the recurrent state, next hidden) from one forward.
 
         One call, so a probe cannot accidentally read a different tensor -- a differently-timed
-        hidden state, or the trunk features of a recurrent actor -- from the one the head is
-        trained on.
+        hidden state, or the trunk features of a recurrent actor -- from the one the policy carried.
+        What it returns is `recurrent_state`: the whole state, including `h_dyn` where there is one,
+        because "what does the policy's state carry" is a question about all of it.
         """
-        feat, _p, h_next = self._parts(scan, proprio, c, h)
-        return torch.tanh(self.mu(feat)), self.future_input(feat, h_next), h_next
+        feat, _p, h_next, _enc = self._parts(scan, proprio, c, h)
+        return torch.tanh(self.mu(feat)), self.recurrent_state(feat, h_next), h_next
 
     def initial_hidden(self, batch: int, device=None, dtype=None):
         return None if self.memory is None else self.memory.initial(batch, device, dtype)
+
+    def motion_aux(self, enc, h_next):
+        """(per-beam mask logits or None, current-Dv prediction or None) from the motion branch.
+
+        Train-time only and called by `step_all`, never by `forward` / `step`, so neither head is in
+        the graph `learn.export` traces. Both read the motion branch and nothing else: the mask
+        head reads the encoder's features, the Dv head reads `h_dyn`.
+        """
+        if not self.has_motion or h_next is None:
+            return None, None
+        mask = None if self.opp_mask is None or enc is None else self.opp_mask(enc)
+        dv = None if self.dv is None else self.dv(h_next[-1][:, self.memory.hidden_size:])
+        return mask, dv
 
     def _feedforward_only(self, who: str):
         """Refuse the memoryless entry points on a recurrent actor.
@@ -357,11 +450,15 @@ class Actor(nn.Module):
         p = self.pro(proprio)
         return torch.cat([self.stem(scan), p], 1), p
 
-    def head(self, x, c=None, h=None, use_memory: bool = True):
-        """(actor features, next hidden) from a per-step embedding."""
+    def head(self, x, c=None, h=None, use_memory: bool = True, rows=None):
+        """(actor features, next hidden, motion encoder features or None) from a per-step embedding.
+
+        `rows` are the aligned scan rows the motion branch reads (`motion_input`), and are required
+        exactly when that branch exists.
+        """
         mem = self.memory if use_memory else None
         if self.cond is None and mem is None:
-            return self.mlp(x), None                 # legacy path, byte-for-byte what it always was
+            return self.mlp(x), None, None           # legacy path, byte-for-byte what it always was
         # Conditional / recurrent: the same three layers, with the extra terms added to the first
         # preactivation. Written out rather than sliced, because `self.mlp[1:]` builds a new
         # Sequential on every forward and this runs once per env step.
@@ -369,17 +466,17 @@ class Actor(nn.Module):
         pre = lin0(x)
         if self.cond is not None:
             pre = pre + self.cond(c.to(x.dtype))
-        h_next = None
+        h_next, enc = None, None
         if mem is not None:
-            delta, h_next = mem.step(x, h)
+            delta, h_next, enc = mem.step(x, h, rows)
             pre = pre + delta
-        return act1(lin1(act0(pre))), h_next
+        return act1(lin1(act0(pre))), h_next, enc
 
     def _parts(self, scan, proprio, c=None, h=None, use_memory: bool = True):
         c = self._require_cond(c, proprio.shape[0])
         x, p = self.embed(scan, proprio)
-        feat, h_next = self.head(x, c, h, use_memory)
-        return feat, p, h_next
+        feat, h_next, enc = self.head(x, c, h, use_memory, self.motion_input(scan))
+        return feat, p, h_next, enc
 
     # ---------------------------------------------------------- feedforward entry points
     def features(self, scan, proprio, c=None):
@@ -403,18 +500,20 @@ class Actor(nn.Module):
     #: All three work on a feedforward actor too and return `None` for the next hidden state, so a
     #: converted call site is written once and does not branch on the checkpoint.
     def step(self, scan, proprio, c=None, h=None, use_memory: bool = True):
-        feat, _p, h_next = self._parts(scan, proprio, c, h, use_memory)
+        feat, _p, h_next, _enc = self._parts(scan, proprio, c, h, use_memory)
         return torch.tanh(self.mu(feat)), h_next
 
     def step_all(self, scan, proprio, c=None, h=None, use_memory: bool = True):
-        """(action mean, grip, opponent motion, future prediction or None, next hidden).
+        """(action mean, grip, opponent motion, future or None, motion aux, next hidden).
 
-        The future prediction is appended BEFORE the hidden state, so `[:3]` -- which is what
-        `forward_all` and the warm-start parity test take -- still means (action, grip, opponent).
+        Everything new is appended BEFORE the hidden state, so `[:3]` -- which is what `forward_all`
+        and the warm-start parity test take -- still means (action, grip, opponent). `motion aux` is
+        the pair (per-beam mask logits, current Dv), both None unless the head exists.
         """
-        feat, p, h_next = self._parts(scan, proprio, c, h, use_memory)
+        feat, p, h_next, enc = self._parts(scan, proprio, c, h, use_memory)
         return (torch.tanh(self.mu(feat)), self.grip(torch.cat([feat, p], 1))[:, 0],
-                self.opp(feat), self.future_from(feat, h_next), h_next)
+                self.opp(feat), self.future_from(feat, h_next),
+                self.motion_aux(enc, h_next), h_next)
 
     def step_dist(self, scan, proprio, c=None, h=None, use_memory: bool = True):
         mu, h_next = self.step(scan, proprio, c, h, use_memory)
@@ -451,6 +550,7 @@ class Critic(nn.Module):
         #: critic that is never exported keeps its own state and costs the car nothing. The price
         #: is a second hidden state to carry, which training carries and no deployment path does.
         self.memory = None
+        self.motion_rows: Tuple[int, ...] = ()
         if memory:
             spec = memory_spec(**memory)
             self.memory = GRUMemory(256 + 128, spec["hidden_size"], hidden, spec["layers"])
@@ -482,14 +582,35 @@ class Critic(nn.Module):
             priv = self._adapt(priv)
         return torch.cat([self.stem(scan), self.pro(torch.cat([proprio, priv], 1))], 1)
 
-    def head(self, x, h=None, use_memory: bool = True):
+    def head(self, x, h=None, use_memory: bool = True, rows=None):
         """(value, next hidden) from a per-step embedding."""
         mem = self.memory if use_memory else None
         if mem is None:
             return self.mlp(x).squeeze(1), None       # legacy path, byte-for-byte what it always was
         lin0, act0, lin1, act1, lin2 = self.mlp[0], self.mlp[1], self.mlp[2], self.mlp[3], self.mlp[4]
-        delta, h_next = mem.step(x, h)
+        delta, h_next, _enc = mem.step(x, h, rows)
         return lin2(act1(lin1(act0(lin0(x) + delta)))).squeeze(1), h_next
+
+    @property
+    def has_motion(self) -> bool:
+        return self.memory is not None and self.memory.motion is not None
+
+    def motion_input(self, scan):
+        """The aligned rows this critic's motion branch reads. See `Actor.motion_input`."""
+        if not self.has_motion:
+            return None
+        extra = self.stem.split_channels(scan)[1]
+        if extra is None:
+            raise ValueError("this critic carries a motion branch but the scan has no extra channels")
+        return extra.index_select(1, torch.as_tensor(self.motion_rows, device=scan.device))
+
+    def attach_motion(self, motion: dict, rows: Sequence[int]) -> None:
+        """The critic's own motion branch, on the same terms the actor's is built on."""
+        if self.memory is None:
+            raise ValueError("the critic's motion memory needs its main memory (--memory-critic own)")
+        spec = motion_spec(**motion)
+        self.motion_rows = tuple(int(r) for r in rows)
+        self.memory.attach_motion(len(self.motion_rows), spec)
 
     def forward(self, scan, proprio, priv):
         if self.memory is not None:
@@ -498,7 +619,18 @@ class Critic(nn.Module):
         return self.head(self.embed(scan, proprio, priv))[0]
 
     def step(self, scan, proprio, priv, h=None, use_memory: bool = True):
-        return self.head(self.embed(scan, proprio, priv), h, use_memory)
+        return self.head(self.embed(scan, proprio, priv), h, use_memory, self.motion_input(scan))
+
+
+def _float_pair(mot):
+    """The motion aux pair in float32, `(None, None)` passed through unchanged.
+
+    Cast here rather than at the four call sites for the same reason every other head is: under
+    `--amp` these come out of an autocast region in bf16, and a loss computed in bf16 against a
+    float32 label is a silently different loss.
+    """
+    a, b = mot if mot is not None else (None, None)
+    return (None if a is None else a.float(), None if b is None else b.float())
 
 
 def scan_channel_spec(scan_channels: Optional[dict]) -> dict:
@@ -557,7 +689,8 @@ class ActorCritic(nn.Module):
                  scan_deltas: bool = False, temporal_encoder: str = "cnn", scan_stem: str = "plain",
                  cond_dim: int = 0, cond: Optional[dict] = None, priv_adapter: Optional[str] = None,
                  memory: Optional[dict] = None, scan_channels: Optional[dict] = None,
-                 future_head: Optional[dict] = None):
+                 future_head: Optional[dict] = None, motion: Optional[dict] = None,
+                 motion_heads: Optional[Sequence[str]] = None):
         super().__init__()
         mem = memory_spec(**memory) if memory else None
         chan = scan_channel_spec(scan_channels)
@@ -566,6 +699,21 @@ class ActorCritic(nn.Module):
         # `memory` rather than being a second thing the caller can get wrong. A checkpoint that
         # recorded one source cannot be rebuilt with the other: `Actor` raises instead.
         fut = future_spec(**future_head) if future_head else None
+        mot = motion_spec(**motion) if motion else None
+        mot_rows = ()
+        if mot:
+            if not chan:
+                raise ValueError("motion memory reads the observation's aligned rows and this model "
+                                 "has no scan channels at all; enable them with --scan-channels")
+            names = list(chan["channels"])
+            missing = [r for r in mot["rows"] if r not in names]
+            if missing:
+                raise ValueError(f"motion memory was asked to read {missing}, which this model's "
+                                 f"scan channels {names} do not include")
+            # Indices within the stem's EXTRA channel block, which is how `Actor.motion_input`
+            # slices them: recorded, so a later arm that enables another channel beside these does
+            # not silently shift which rows the encoder reads.
+            mot_rows = tuple(names.index(r) for r in mot["rows"])
         self.actor = Actor(n_stack, n_beams, proprio_dim, act_dim=act_dim, scan_deltas=scan_deltas,
                            temporal_encoder=temporal_encoder, scan_stem=scan_stem, cond_dim=cond_dim,
                            memory=mem, extra_scan_channels=extra)
@@ -574,6 +722,12 @@ class ActorCritic(nn.Module):
                              priv_adapter=priv_adapter,
                              memory=(mem if mem and mem["critic"] == "own" else None),
                              extra_scan_channels=extra)
+        if mot:
+            # After both halves and before the future head: the motion branch changes the width of
+            # the recurrent state, which is what the future head's first layer reads.
+            self.actor.attach_motion(mot, mot_rows, n_beams, motion_heads or ())
+            if mot["critic"] == "own" and self.critic.memory is not None:
+                self.critic.attach_motion(mot, mot_rows)
         if fut:
             # LAST, so that `--aux-future 1.0` adds a head and changes nothing else: every weight
             # above it was drawn from the same generator in the same order as in the arm without it.
@@ -591,6 +745,10 @@ class ActorCritic(nn.Module):
             self.meta["memory"] = dict(mem)
         if chan:
             self.meta["scan_channels"] = dict(chan)
+        if mot:
+            self.meta["motion"] = dict(self.actor.motion_spec)
+            if motion_heads:
+                self.meta["motion_heads"] = [h for h in ("mask", "dv") if h in motion_heads]
         if fut:
             self.meta["future_head"] = dict(self.actor.future_spec)
 
@@ -601,6 +759,10 @@ class ActorCritic(nn.Module):
     @property
     def has_future(self) -> bool:
         return self.actor.has_future
+
+    @property
+    def has_motion(self) -> bool:
+        return self.actor.has_motion
 
     def initial_hidden(self, batch: int, device=None, dtype=None) -> Optional[Hidden]:
         """An all-zero `Hidden` for `batch` rows, or None for a feedforward checkpoint.
@@ -639,17 +801,18 @@ class ActorCritic(nn.Module):
     def evaluate_aux(self, scan, proprio, priv, actions, c=None, h=None):
         """evaluate() plus the auxiliary predictions, from the same trunk pass.
 
-        Returns (log prob, entropy, value, distribution, grip, opponent motion, future, hidden).
-        `future` is None for a checkpoint that carries no future head, which is every checkpoint
-        written before it existed.
+        Returns (log prob, entropy, value, distribution, grip, opponent motion, future, motion,
+        hidden). `future` is None for a checkpoint that carries no future head and `motion` is
+        (None, None) for one that carries no motion branch -- which is every checkpoint written
+        before either existed.
         """
         ha, hc = self._split(h)
-        mu, grip, opp, fut, ha = self.actor.step_all(scan, proprio, c, ha)
+        mu, grip, opp, fut, mot, ha = self.actor.step_all(scan, proprio, c, ha)
         mu = mu.float()
         d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
         v, hc = self.critic.step(scan, proprio, priv, hc)
         return (d.log_prob(actions).sum(1), d.entropy().sum(1), v, d, grip.float(), opp.float(),
-                None if fut is None else fut.float(),
+                None if fut is None else fut.float(), _float_pair(mot),
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
     def evaluate_sequence(self, scan, proprio, priv, actions, c=None, h=None, keep=None):
@@ -677,7 +840,11 @@ class ActorCritic(nn.Module):
             raise ValueError(f"this actor is conditional (cond_dim={self.actor.cond_dim}) and "
                              f"evaluate_sequence was given no condition; pass the stored (T, m, D) "
                              f"block the actions were sampled under")
-        feats, values, states = [], [], []
+        rows_a = self.actor.motion_input(flat(scan))
+        rows_c = self.critic.motion_input(flat(scan))
+        view = lambda r: None if r is None else r.view(T, m, *r.shape[1:])
+        rows_a, rows_c = view(rows_a), view(rows_c)
+        feats, values, states, encs = [], [], [], []
         for t in range(T):
             if keep is not None:
                 k = keep[t].to(xa.dtype)[None, :, None]
@@ -685,9 +852,12 @@ class ActorCritic(nn.Module):
                     ha = ha * k
                 if hc is not None:
                     hc = hc * k
-            f, ha = self.actor.head(xa[t], None if cs is None else cs[t], ha)
-            v, hc = self.critic.head(xv[t], hc)
+            f, ha, enc = self.actor.head(xa[t], None if cs is None else cs[t], ha,
+                                         rows=None if rows_a is None else rows_a[t])
+            v, hc = self.critic.head(xv[t], hc, rows=None if rows_c is None else rows_c[t])
             feats.append(f); values.append(v)
+            if enc is not None:
+                encs.append(enc)
             if ha is not None:
                 # the state AFTER step t, which is what the future head reads and what
                 # `probe_hidden` regresses from -- collected here so the head sees, step for step,
@@ -699,10 +869,12 @@ class ActorCritic(nn.Module):
         d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
         grip = self.actor.grip(torch.cat([feat, pa], 1))[:, 0]
         opp = self.actor.opp(feat)
-        fut = self.actor.future_from(feat, None if not states else torch.cat(states, 0)[None])
+        h_seq = None if not states else torch.cat(states, 0)[None]
+        fut = self.actor.future_from(feat, h_seq)
+        mot = self.actor.motion_aux(None if not encs else torch.cat(encs, 0), h_seq)
         acts = flat(actions)
         return (d.log_prob(acts).sum(1), d.entropy().sum(1), val, d, grip.float(), opp.float(),
-                None if fut is None else fut.float(),
+                None if fut is None else fut.float(), _float_pair(mot),
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
 
@@ -853,7 +1025,9 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                     priv_adapter: Optional[str] = None, override: Optional[dict] = None,
                     allow_controller: bool = False,
                     allow_conditional: bool = False,
-                    future_head: Optional[dict] = None) -> Tuple[ActorCritic, dict, list]:
+                    future_head: Optional[dict] = None,
+                    motion: Optional[dict] = None,
+                    motion_heads: Optional[Sequence[str]] = None) -> Tuple[ActorCritic, dict, list]:
     """Load a feedforward checkpoint into a recurrent actor-critic, by name, preserving every weight.
 
     Warm start, not re-initialisation. The memory is an addition to the original network, so at
@@ -899,6 +1073,10 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                          f"({meta['future_head']}); warm-starting one from it would re-initialise a "
                          f"path that is already trained, and adding memory underneath it would "
                          f"change the width of its input. Resume it with load_checkpoint instead.")
+    if meta.get("motion") and motion:
+        raise ValueError(f"{os.path.basename(str(path))} already carries a motion branch "
+                         f"({meta['motion']}); warm-starting one from it would re-initialise a path "
+                         f"that is already trained. Resume it with load_checkpoint instead.")
     if meta.get("memory"):
         raise ValueError(f"{os.path.basename(str(path))} already carries memory "
                          f"({meta['memory']}); warm-starting memory from it would be a second "
@@ -917,15 +1095,22 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         meta["scan_channels"] = chan
     if future_head:
         meta["future_head"] = future_spec(**future_head)
-    if not memory and not chan and not future_head:
-        raise ValueError("load_for_memory with neither memory, a scan channel nor a future head "
-                         "would be load_checkpoint with extra steps; call that instead.")
+    if motion:
+        meta["motion"] = motion_spec(**motion)
+        if motion_heads:
+            meta["motion_heads"] = [h for h in ("mask", "dv") if h in motion_heads]
+    if not memory and not chan and not future_head and not motion:
+        raise ValueError("load_for_memory with neither memory, a scan channel, a future head nor a "
+                         "motion branch would be load_checkpoint with extra steps; call that instead.")
     m = ActorCritic(**meta).to(device)
     sd = m.state_dict()
     src = ck["state_dict"]
 
     #: The only tensors allowed to be new. Everything else must arrive from the checkpoint.
-    allowed_fresh = {k for k in sd if ".memory." in k or k.startswith("actor.future.")}
+    #: `.memory.` covers the motion branch too -- it lives inside `GRUMemory` -- and the two
+    #: train-time heads are named separately because they hang off the actor.
+    allowed_fresh = {k for k in sd if ".memory." in k or k.startswith("actor.future.")
+                     or k.startswith("actor.opp_mask.") or k.startswith("actor.dv.")}
     grown = {}                                      # name -> (checkpoint columns, model columns)
     unused, mismatched = [], []
     for k, v in src.items():
@@ -974,6 +1159,19 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         if mod.memory is not None and float(mod.memory.out.weight.detach().abs().max()) != 0.0:
             raise RuntimeError(f"the {who}'s memory projection is not zero at init; a warm start "
                                f"from it would not reproduce the original")
+    for who, mod in (("actor", m.actor), ("critic", m.critic)):
+        mm = getattr(mod, "memory", None)
+        if mm is not None and mm.motion is not None and float(mm.motion.out.weight.detach().abs().max()) != 0.0:
+            raise RuntimeError(f"the {who}'s motion projection is not zero at init; a warm start "
+                               f"from it would not reproduce the original")
+    if m.actor.opp_mask is not None:
+        out = m.actor.opp_mask.net[2]
+        if float(out.weight.detach().abs().max()) != 0.0 or float(out.bias.detach().abs().max()) != 0.0:
+            raise RuntimeError("the beam-mask head's output layer is not zero at init")
+    if m.actor.dv is not None:
+        out = m.actor.dv.net[2]
+        if float(out.weight.detach().abs().max()) != 0.0 or float(out.bias.detach().abs().max()) != 0.0:
+            raise RuntimeError("the current-Dv head's output layer is not zero at init")
     if m.actor.future is not None:
         out = m.actor.future.net[2]
         if float(out.weight.detach().abs().max()) != 0.0 or float(out.bias.detach().abs().max()) != 0.0:

@@ -19,7 +19,8 @@ import pytest
 import torch
 
 from f1sim.learn.aligned import (ALIGNED_ROWS, AlignedScan, aligned_spec, beam_angles,
-                                 compose_increments, gate, soft_threshold, step_increment,
+                                 compose_increments, compose_stack, gate, soft_threshold,
+                                 step_increment,
                                  tilt_matrix, warp_scan)
 from f1sim.learn.obs import (ALIGNED_CHANNELS, SCAN_CHANNELS, ObsSpec, ScanAugment,
                              motion_from_proprio, motion_index_spec)
@@ -155,6 +156,18 @@ def test_the_warp_uses_the_measured_motion_and_not_a_guess():
     # 1 / range_max here.
     assert float(right["aligned"].abs().max()) == 0.0
     assert float(wrong["aligned"].abs().max()) * RANGE_MAX > 0.4, "0.6 m of ego motion, minus tau"
+
+
+def test_the_closed_form_composition_is_the_recursion():
+    """`compose_stack` is what the channel runs; `compose_increments` is what it reads like."""
+    g = torch.Generator().manual_seed(7)
+    for k in (1, 2, 4, 8):
+        p = torch.randn(k, 3, 2, generator=g) * 0.2
+        dy = torch.randn(k, 3, generator=g) * 0.05
+        a0, b0 = compose_increments([(p[i], dy[i]) for i in range(k)])
+        a1, b1 = compose_stack(p, dy)
+        assert torch.allclose(a0, a1, atol=1e-6), (k, a0, a1)
+        assert torch.allclose(b0, b1, atol=1e-6), (k, b0, b1)
 
 
 def test_step_increment_and_composition_are_the_arc_they_claim():
