@@ -1267,9 +1267,53 @@ class TrackTensors:
         self.p_zlo = torch.from_numpy(zlo).to(dev)
         self.p_zhi = torch.from_numpy(zhi).to(dev)
 
-    def props_for(self, tid: torch.Tensor):
-        """Gather each env's own track's prop slots: (poses, pn, pd, z_lo, z_hi), all leading (B,)."""
-        return (self.p_poses[tid], self.p_n[tid], self.p_d[tid], self.p_zlo[tid], self.p_zhi[tid])
+    #: Per-*env* prop slots drawn at reset (`f1sim.procedural_obstacles.ProceduralObstacles`), or
+    #: None. Props on a `Track` belong to the map and are shared by every env driving it; these
+    #: belong to the env, so they can be redrawn without touching the map. `props_for` concatenates
+    #: the two, which is why every consumer -- the beam merge, the contact SAT, the spawn rejection
+    #: -- sees a procedural layout with no change of its own.
+    env_props = None
+
+    def attach_env_props(self, env_props):
+        """Install a per-env prop source. Raises rather than silently narrowing the half-planes."""
+        if env_props.k_pad != self.k_pad:
+            raise ValueError(f"per-env props are padded to {env_props.k_pad} half-planes and the "
+                             f"track slots to {self.k_pad}; they are concatenated, so they must match")
+        self.env_props = env_props
+        self.has_props = True
+
+    def props_for(self, tid: torch.Tensor, eid: Optional[torch.Tensor] = None):
+        """Gather each env's own prop slots: (poses, pn, pd, z_lo, z_hi), all leading (B,).
+
+        `eid` names the env rows when a per-env layout is attached. It is required there and not
+        merely helpful: `tid` is a track id, several envs share one, and the caller that passes a
+        *subset* of envs (the spawn rejection walks one lap for the envs whose pose landed in a
+        crate) would otherwise be handed the wrong envs' crates. Omitting it is allowed only for the
+        full batch, in the row order the layout was written in.
+        """
+        base = (self.p_poses[tid], self.p_n[tid], self.p_d[tid], self.p_zlo[tid], self.p_zhi[tid])
+        ep = self.env_props
+        if ep is None:
+            return base
+        if eid is None and tid.shape[:1] != (ep.B,):
+            raise ValueError(f"props_for got {tuple(tid.shape)} track ids with a per-env layout of "
+                             f"{ep.B} envs and no eid: pass the env rows explicitly")
+        return tuple(torch.cat([b, e], 1) for b, e in zip(base, ep.slots(eid)))
+
+    def props_near(self, tid: torch.Tensor, xy: torch.Tensor, eid: Optional[torch.Tensor] = None,
+                   reach: float = 0.0):
+        """`props_for`, but keeping only the per-env layout slots that can reach `xy` (n, 2).
+
+        For the two tests that ask about the car's own footprint -- the contact SAT and the spawn
+        rejection -- where a prop matters only if it is within the two circumradii. The beams get
+        `props_for` and see every slot; `ProceduralObstacles.near` says why, and counts the slots it
+        dropped that were inside `reach` so the cull is measured rather than assumed.
+        """
+        base = (self.p_poses[tid], self.p_n[tid], self.p_d[tid], self.p_zlo[tid], self.p_zhi[tid])
+        ep = self.env_props
+        if ep is None:
+            return base
+        return tuple(torch.cat([b, e], 1) for b, e in zip(base, ep.near(xy, eid, reach=reach)))
 
     # ------------------------------------------------------------------ grids
     def sample_edt(self, xy: torch.Tensor, tid: torch.Tensor, field: Optional[torch.Tensor] = None,

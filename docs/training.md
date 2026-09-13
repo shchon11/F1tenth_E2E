@@ -295,6 +295,88 @@ gets adopted on a number that does not cover the thing it changed. Two places me
   scenario's event rate is chosen so that an event actually lands while the learner is in
   contention, which is measured rather than assumed.
 
+### Obstacle layouts redrawn at every reset
+
+Every training track's obstacle layout is fixed. `+rlobs`, `+obs`, `+pinch` and `+hard<seed>` are
+rasterised into the occupancy grid once, at load, and shared by every environment driving that map
+for the whole run. A layout that never changes can be learned, and the progress reward pays for
+learning it: speed through a *known* layout is worth exactly what speed through a *seen* one is
+worth. On an unseen layout the same speed is a collision, and that is the mechanism the held-out proxy
+shows: right after a warm start the policy drives slightly slower on unseen maps and completes more
+of them; as training goes on its speed returns to the original's and its completions fall back
+(`docs/research/procedural-obstacles-2026-09-13.md`).
+
+`--procedural-obstacles` draws a new layout for each environment at every reset:
+
+```bash
+python3 -m f1sim.learn.ppo --procedural-obstacles 1.0 --procedural-density 1.0
+```
+
+| flag | what it does |
+|---|---|
+| `--procedural-obstacles FRAC` | share of resets that get a layout. `0` (the default) is off, and off is bit-identical to a run before the feature existed |
+| `--procedural-density PER10M` | patterns per 10 m of lap (default 1.0) |
+| `--procedural-max-props N` | prop slots per environment; `0` sizes it from the density and the longest lap. Every slot costs the beam tracer one pass per step, so this is the cost dial |
+| `--procedural-raceline-margin M` | free space kept either side of the raceline, beyond the car's half-width (default 0.25 m) |
+
+The obstacles are the same six patterns `#hard:*` draws — gate, diagonal, chicane, apex, cluster,
+scatter — at the same sizes, including the small objects. They are placed as **props**
+(`f1sim.props`: boxes, crates, a drum, a post), which the LiDAR and the collision test handle
+analytically, so nothing is rasterised and a redraw is a batched write of a few dozen numbers per
+environment.
+
+**Passable by construction.** `#hard:*` proves a layout passable after the fact: it erodes the free
+space by 0.25 m and checks that the lane still connects across the pattern, redrawing when it does
+not. That loop cannot be batched onto a GPU. Here the gap is guaranteed before anything is placed —
+every piece of a row sits inside a band of width `span` measured from one wall, `span` is at most
+`width − g` with `g ≥ max(1.2 m, 0.55 × width)`, and `width` is the narrowest the lane gets anywhere
+the pattern reaches. Measured over 1000 draws on the catalogue maps, the realised free space is
+**≥ 1.20 m in 100 % of layouts** (worst 1.288 m, median 2.453 m).
+
+**The teacher opponents are never routed through one.** The raceline teacher is pure pursuit on a
+line built from the occupancy grid; props are not in the grid, so it cannot see one and will not
+steer round one. When a teacher is installed, the gap is additionally required to contain the band
+the raceline occupies, widened by the car's half-width and `--procedural-raceline-margin`. The cost
+is worth stating plainly: **with opponents, the gap is always where the racing line is.** The layout
+still moves at every reset — where the patterns are, which they are, which wall is blocked, what
+size the pieces are — but a policy that could already find the racing line would find the gap. With
+`--race-size 1` there is no teacher and no corridor, and the gap can be anywhere across the lane.
+
+**What does not see these props.** Everything that reads the occupancy grid or its distance field:
+
+* `--proximity-penalty` (wall gap from the EDT) and `--plan-clearance-penalty` (plan points against
+  the EDT) do not price a prop; a car alongside a crate is charged as if the lane were empty;
+* `StepResult.wall_dist`, and so the `wall_dist` column of the privileged vector, is the distance to
+  the nearest grid wall only;
+* the raceline and the teacher's speed profile were built before the layout existed.
+
+The collision test, the LiDAR, and the spawn rejection *do* see them. That is the set that makes the
+layout something the policy has to look at rather than something it can be told about.
+
+**Races share one layout.** The cars of a race drive the same track and see each other; giving them
+different crates would have one collide with a box another cannot see. A race redraws when it resets
+as a whole, and a single car respawning behind its mates keeps the layout the race is running —
+exactly as it keeps the race's track.
+
+**Cost.** Measured on an RTX 4060 Ti at `--envs 256` on `blackbox2022_1` (149.6 m, 15 patterns,
+52 prop slots), `gen:control:1400` and `scene:scene_0912_2344` — see the research note for the
+table. The dominant term is the beam merge against the prop prisms, which is why both
+`prop_math.ray_prisms_hits` and `prism_contacts` are `torch.compile`d on CUDA: eagerly the merge is
+a kernel launch per elementwise op per slot (84.4 ms a call at 52 slots), fused it is 3.34 ms. The
+fused result is **not** bit-for-bit: which beams hit is identical (zero disagreements over 276 736
+beams), but reassociated float32 moves a range by up to 1.9 um. This also applies to the `+props`
+catalogue path, which now goes through the same compiled primitives.
+
+**The console does not draw them.** The environment page renders a track's `props`, and these
+belong to the environment rather than to the map, so a procedural layout is invisible there; nothing
+under `f1sim/viewer/` was touched. To *see* one of these layouts, draw the same patterns into a map
+with `#hard:<seed>` and open that.
+
+**Evaluation is untouched.** `f1sim.learn.evaluate` and the frozen benchmark suites have no
+procedural option and never draw one; `EnvConfig.procedural_obstacles` defaults to 0 and every
+evaluation path takes the default. A layout redrawn per reset is not a thing a frozen suite can
+contain, and adding the flag there would make the score depend on it.
+
 ## Evaluation
 
 ```bash

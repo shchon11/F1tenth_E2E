@@ -75,10 +75,27 @@ What `*` does depends on who is reading it:
   variants of that map, drawn from `random.Random(--seed)`. The same `--seed` gives the same eight,
   and the run's manifest records the concrete loader names.
 
-This is the procedural obstacle story for training *for now*: many seeds per map, baked once at
-load. Re-baking the obstacles on every episode reset inside the simulator is a different piece of
-work and is not implemented — the grids are rasterised once and shared by every environment on that
-track, which is what makes several hundred environments fit on one GPU.
+This is the **rasterised** obstacle story: many seeds per map, baked once at load. The grids stay
+rasterised once and shared by every environment on that track, which is what makes several hundred
+environments fit on one GPU, and re-baking them per reset is still not a thing that happens.
+
+What *is* implemented, since 2026-09-13, is the other way round: `--procedural-obstacles` draws a
+fresh layout for each environment at every reset as **props**, which need no grid at all. It uses
+the same six patterns as `#hard:*` and the same sizes, and it is a training flag only — it places
+nothing on a catalogue track and changes no loader name, so `real/bb22-1#hard:44` means exactly what
+it meant. The two are complementary rather than alternatives:
+
+| | `#hard:<seed>` / `+hard<seed>` | `--procedural-obstacles` |
+| --- | --- | --- |
+| what an obstacle is | cells in `occupancy` and `tall` | a convex prism (`f1sim.props`) |
+| when it is drawn | once, at load | at every reset, per environment |
+| how many layouts a map has | one per seed | a new one every episode |
+| passability | proved by eroding the free space and checking the lane still connects | guaranteed by construction, so no proof is needed per draw |
+| seen by the grid rewards (proximity, plan clearance) | yes | **no** — see [training.md](training.md#obstacle-layouts-redrawn-at-every-reset) |
+| evaluation and the frozen suites | yes | never |
+
+Use `#hard:*` when the layout should be part of the map -- a scenario to score, a picture to show,
+a benchmark cell. Use `--procedural-obstacles` when the point is that the layout is *not* learnable.
 
 ## The catalogue
 
