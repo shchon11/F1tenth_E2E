@@ -179,6 +179,10 @@ def future_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor, w
       whether the others mean anything, so training it only on the frames where a car is present
       would leave it unable to say "no car".
 
+    The per-component dict additionally carries `<key>_var` (the target's variance under the same
+    weights) and `opp_present_bce_base` (the cross-entropy of predicting the base rate), so a
+    reader can normalise both halves instead of reading a raw error against a moving distribution.
+
     The returned scalar is the mean of the six mean-squared errors plus the presence
     cross-entropy. Both are O(0.1-1) at the zero init (the logit starts at 0, i.e. p = 0.5, so the
     cross-entropy starts at log 2), so one coefficient in front of the sum is honest weighting
@@ -195,12 +199,24 @@ def future_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor, w
         wi = base * present if key in FUTURE_OPPONENT_KEYS else base
         term = _wmean((pred[:, i] - target[:, i]) ** 2, wi)
         per[key] = term
+        # ... and the variance of the target under the SAME weights. A raw MSE against a target
+        # whose distribution is still moving -- which it is, for the whole early part of a finetune,
+        # because the policy is learning to go faster and further -- is not a learning curve. With
+        # the variance beside it, `1 - mse / var` is the head's own explained variance, which is
+        # both interpretable and directly comparable to what `probe_hidden` reports.
+        mean_i = _wmean(target[:, i], wi)
+        per[key + "_var"] = _wmean((target[:, i] - mean_i) ** 2, wi)
         total = total + term
         n_reg += 1
     total = total / max(1, n_reg)
     bce = _wmean(nn.functional.binary_cross_entropy_with_logits(
         pred[:, FUTURE_PRESENT_INDEX], present, reduction="none"), base)
     per[str(keys[FUTURE_PRESENT_INDEX]) + "_bce"] = bce
+    # the cross-entropy a constant predictor of the base rate would pay: the floor the logit has to
+    # beat. In a tight three-car field the presence label is nearly always 1 and this is near zero,
+    # which is worth knowing before reading anything into a falling BCE.
+    p_ = _wmean(present, base).clamp(1e-6, 1 - 1e-6)
+    per[str(keys[FUTURE_PRESENT_INDEX]) + "_bce_base"] = -(p_ * p_.log() + (1 - p_) * (1 - p_).log())
     per["labelled_frac"] = base.gt(0).to(pred.dtype).mean()
     per["present_frac"] = _wmean(present, base)
     return total + bce, per

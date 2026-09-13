@@ -188,6 +188,14 @@ def test_the_loss_masks_the_opponent_columns_and_never_the_presence_one():
     assert float(parts["ego_speed"]) == pytest.approx(float((target[:, i] ** 2).mean()), rel=1e-5)
     assert float(parts["opp_present_bce"]) == pytest.approx(np.log(2.0), rel=1e-5)
     assert float(parts["present_frac"]) == pytest.approx(0.5)
+    # a 50/50 base rate is the hardest presence label there is, so the floor IS log 2 here; in a
+    # tight field it is near zero and a falling BCE means much less than it looks
+    assert float(parts["opp_present_bce_base"]) == pytest.approx(np.log(2.0), rel=1e-5)
+    # the variance is taken under the same weights as the error, so `1 - mse / var` is meaningful
+    for key in FUTURE_OPPONENT_KEYS:
+        i = FUTURE_LABEL_KEYS.index(key)
+        want = float(target[1::2, i].var(unbiased=False))
+        assert float(parts[key + "_var"]) == pytest.approx(want, rel=1e-4)
     # a row the alignment dropped, or a teacher-driven car's row, contributes nothing at all
     total_all, _ = future_loss(pred, target, valid, w)
     total_half, parts_half = future_loss(pred, target, valid * 0.0, w)
@@ -420,6 +428,26 @@ def test_the_probe_reads_the_tensor_the_head_is_trained_on():
         assert torch.equal(from_state, from_head)
         assert state.shape == (3, 32 if memory else 256)
         assert torch.equal(act, m.actor.step(scan, pro, None, h)[0])
+
+
+def test_repeated_splits_report_the_spread_the_single_split_hides():
+    """Eight draws of which cars are held out, not one: on this task the spread between draws is
+    larger than the difference between checkpoints, and a single number hides that."""
+    torch.manual_seed(29)
+    T, L, H, k = 80, 16, 6, 4
+    states = torch.randn(T, L, H)
+    labels = torch.zeros(T + 1, L, FUTURE_LABEL_DIM)
+    labels[:, :, FUTURE_PRESENT_INDEX] = 1.0
+    labels[k:, :, FUTURE_LABEL_KEYS.index("ego_speed")] = (states[:, :, 0] * 3.0)[:T + 1 - k]
+    labels[:, :, FUTURE_LABEL_KEYS.index("ego_yaw_rate")] = torch.randn(T + 1, L)
+    one = probe_hidden.probe(states, labels, torch.zeros(T, L), k, splits=1)
+    many = probe_hidden.probe(states, labels, torch.zeros(T, L), k, splits=8)
+    assert one["ego_speed"]["splits"] == 1 and many["ego_speed"]["splits"] == 8
+    assert np.isnan(one["ego_speed"]["r2_std"]) or one["ego_speed"]["r2_std"] == 0.0
+    assert many["ego_speed"]["r2"] > 0.99
+    # the noise target is where the draws disagree, and the spread has to be reported, not averaged away
+    assert many["ego_yaw_rate"]["r2_max"] > many["ego_yaw_rate"]["r2_min"]
+    assert many["ego_yaw_rate"]["r2_std"] > 0.0
 
 
 def test_the_probe_holds_out_whole_cars():

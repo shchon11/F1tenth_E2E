@@ -25,6 +25,7 @@ Newest first. Raw per-cell rows, rosters and manifests sit beside each note in
 
 | page | contents |
 | --- | --- |
+| [A future head, and a probe for it](research/future-head-2026-09-14.md) | 2026-09-14: an auxiliary head that predicts the nearest opponent 0.5 s ahead from the actor's GRU state, and a ridge probe that measures whether the state carries it. Two 262144-step arms: the term costs PPO nothing visible and its loss falls, but the probe reads +0.82 for the ego's own future and 0.0–0.36 (spread ±0.1–0.4, no arm separable) for the opponent's. The instrument, not the experiment |
 | [Consolidated run `cl_hard_events_s701`](research/run-recipe-2026-09-13.md) | 2026-09-13: what went into the single training run after the preparation was merged — recipe A plus opponent events, hard obstacles, the new attitude model, the user's scenes — and how it will be judged. No result yet |
 | [First held-out scoring, suite v2](research/benchmark-v2-first-2026-09-13.md) | four systems on the frozen held-out suite — 64 cells, 512 trials each; the A recipe generalises at two seeds, plus an obstacle-seed memorisation probe |
 | [A clearance arm](research/clearance-arm-2026-09-13.md) | the plan kept a stated margin off a local occupancy built from the LiDAR alone: on the eight held-out tracks, 223 → 203 collisions and 79 → 110 completions under `legacy`, 182 → 169 and 105 → 130 under `fixed_low`, for 2–3 % of mean speed; in traffic, car contacts 29 → 11 and wall collisions 22 → 17 with passes 37 → 42 |

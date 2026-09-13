@@ -164,13 +164,19 @@ def split_columns(n_cols: int, test_frac: float = 0.25, seed: int = 0):
 
 
 def probe(states: torch.Tensor, labels: torch.Tensor, boundary: torch.Tensor, k: int,
-          test_frac: float = 0.25, seed: int = 0) -> dict:
+          test_frac: float = 0.25, seed: int = 0, splits: int = 1) -> dict:
     """R^2 per target for one lookahead, from one rollout's frozen states.
 
     The alignment and the masks are `future.align_future_targets` -- the same function the trainer
     uses -- so the probe scores the head's target and not a near relative of it. On top of the
     alignment mask, the four opponent columns keep only the rows whose presence label at t + k is 1,
     exactly as `future.future_loss` weights them.
+
+    `splits` repeats the whole fit over that many different draws of which cars are held out, and
+    reports the mean and the spread. One split is one number with an unknown error bar, and measured
+    on this task the error bar is the story: on a 400-step, 32-car rollout the opponent columns move
+    by more between two draws of the held-out cars than between two checkpoints. `r2` stays the
+    headline (the mean), with `r2_std`, `r2_min`, `r2_max` beside it.
     """
     target, valid = align_future_targets(labels, boundary, k)
     T, L, _ = target.shape
@@ -178,12 +184,21 @@ def probe(states: torch.Tensor, labels: torch.Tensor, boundary: torch.Tensor, k:
     y = target.reshape(T * L, -1).numpy().astype(np.float64)
     ok = valid.reshape(T * L).numpy() > 0
     col = np.tile(np.arange(L), T)                        # row-major (step, env), like the trainer
-    tr_cols, te_cols = split_columns(L, test_frac, seed)
     present = y[:, FUTURE_PRESENT_INDEX] > 0.5
     out = {}
     for i, key in enumerate(FUTURE_LABEL_KEYS):
         rows = ok & present if key in FUTURE_OPPONENT_KEYS else ok
-        out[key] = fit_probe(x, y[:, i], rows & tr_cols[col], rows & te_cols[col])
+        runs = []
+        for j in range(max(1, int(splits))):
+            tr_cols, te_cols = split_columns(L, test_frac, seed + j)
+            runs.append(fit_probe(x, y[:, i], rows & tr_cols[col], rows & te_cols[col]))
+        r2 = np.array([r["r2"] for r in runs], dtype=float)
+        finite = r2[np.isfinite(r2)]
+        out[key] = {**runs[0], "splits": len(runs),
+                    "r2": float(finite.mean()) if finite.size else float("nan"),
+                    "r2_std": float(finite.std()) if finite.size else float("nan"),
+                    "r2_min": float(finite.min()) if finite.size else float("nan"),
+                    "r2_max": float(finite.max()) if finite.size else float("nan")}
     return out
 
 
@@ -253,7 +268,8 @@ def markdown(rows, meta) -> str:
     out.append(f"Rollout: {meta['steps']} steps x {meta['learners']} learner cars on "
                f"{meta['tracks']}, race size {meta['race_size']}, opponents {meta['opponent']}, "
                f"events {','.join(meta['events']) or 'off'}. Held out: {meta['test_frac']:.0%} of the env "
-               f"columns (whole cars, never rows inside one trajectory).")
+               f"columns (whole cars, never rows inside one trajectory), averaged over "
+               f"{meta['splits']} draws of which cars those are (± is the spread over the draws).")
     out.append("")
     for k in ks:
         out.append(f"## k = {k} steps ({k * 0.025:.2f} s)")
@@ -264,7 +280,9 @@ def markdown(rows, meta) -> str:
             cells, n_te = [], 0
             for t in FUTURE_LABEL_KEYS:
                 r = by.get((label, k, t))
-                cells.append("-" if r is None else f"{r['r2']:+.3f}")
+                cells.append("-" if r is None else
+                             (f"{r['r2']:+.3f}" + (f" ±{r['r2_std']:.3f}"
+                                                   if r.get("splits", 1) > 1 else "")))
                 n_te = max(n_te, 0 if r is None else r["n_test"])
             out.append(f"| {label} | " + " | ".join(cells) + f" | {n_te} |")
         out.append("")
@@ -289,6 +307,13 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=400, help="10 s per env at 40 Hz")
     ap.add_argument("--speed-cap", type=float, default=9.0)
     ap.add_argument("--episode-s", type=float, default=40.0)
+    ap.add_argument("--splits", type=int, default=8,
+                    help="how many different draws of the held-out cars to average the R^2 over. "
+                         "One draw is one number with an unknown error bar, and on this task the "
+                         "error bar is larger than the difference between checkpoints")
+    ap.add_argument("--save-states", default="",
+                    help="write each rollout's frozen states, labels and boundary flags here as a "
+                         ".pt, so the fit can be redone without paying for the rollout again")
     ap.add_argument("--test-frac", type=float, default=0.25,
                     help="share of ENV COLUMNS held out. Columns, not rows: two consecutive steps "
                          "of one car are the same situation and a row split measures nothing")
@@ -359,19 +384,28 @@ def main() -> None:
         print(f"[{label}] {note}; rolling out {a.steps} steps x {int(env.learner_ids.numel())} "
               f"learner cars ...", flush=True)
         states, labels, boundary = collect(env, model, a.steps, device, controller=ctrl, seed=a.seed)
+        if a.save_states:
+            os.makedirs(a.save_states, exist_ok=True)
+            torch.save({"states": states, "labels": labels, "boundary": boundary, "ckpt": path,
+                        "label": label, "note": note},
+                       os.path.join(a.save_states, f"{label}.pt"))
         for k in ks:
-            for target, res in probe(states, labels, boundary, k, a.test_frac, a.seed).items():
+            for target, res in probe(states, labels, boundary, k, a.test_frac, a.seed,
+                                     splits=a.splits).items():
                 rows.append({"label": label, "ckpt": path, "k": k, "target": target,
                              "source": "memory" if model.actor.has_memory else "trunk",
                              "has_future_head": bool(model.meta.get("future_head")), **res})
-            got = {r["target"]: r["r2"] for r in rows if r["label"] == label and r["k"] == k}
-            print(f"  k={k:3d}: " + "  ".join(f"{t} {v:+.3f}" for t, v in got.items()), flush=True)
+            got = {r["target"]: (r["r2"], r["r2_std"]) for r in rows
+                   if r["label"] == label and r["k"] == k}
+            print(f"  k={k:3d}: " + "  ".join(f"{t} {v:+.3f}+-{sd:.3f}" for t, (v, sd) in got.items()),
+                  flush=True)
         del model, states, labels, boundary
         if device.type == "cuda":
             torch.cuda.empty_cache()
     meta = {"steps": a.steps, "envs": a.envs, "learners": learners,
             "tracks": a.tracks, "race_size": a.race_size, "opponent": a.opponent,
-            "events": list(a.opp_events), "test_frac": a.test_frac, "seed": a.seed, "k": ks,
+            "events": list(a.opp_events), "test_frac": a.test_frac, "splits": a.splits,
+            "seed": a.seed, "k": ks,
             "checkpoints": notes, "targets": list(FUTURE_LABEL_KEYS)}
     text = markdown(rows, meta)
     print()
