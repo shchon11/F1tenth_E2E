@@ -259,11 +259,13 @@ def main(argv=None):
             mot = None
             if want_motion:
                 from .motion import motion_spec
-                rows = [c for c in chans if c.startswith("aligned")]
-                if not rows:
+                # NOT `rows`: that is the table being built, thirty lines up, and shadowing it makes
+                # the printer iterate a list of channel names one character at a time.
+                mot_rows = [c for c in chans if c.startswith("aligned")]
+                if not mot_rows:
                     raise SystemExit(f"variant {name!r}: the motion branch reads the aligned rows "
                                      f"and none are enabled")
-                mot = motion_spec(hidden_size=a.motion_hidden, rows=rows)
+                mot = motion_spec(hidden_size=a.motion_hidden, rows=mot_rows)
             model, _e, _f = load_for_memory(a.baseline, "cpu", memory_spec(hidden_size=a.hidden),
                                             scan_channels=cfg, motion=mot)
             m = measure(model, iters=a.iters, repeats=a.repeats)
