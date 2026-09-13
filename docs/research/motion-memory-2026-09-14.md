@@ -135,6 +135,25 @@ the two endpoint measurements; the expression in the current sensor plane by the
 current tilt, dropping any point whose out-of-plane offset exceeds `z_tol`; and a nearest-bin
 scatter keeping the closest point, which is the rule the sensor itself applies.
 
+**Only the attitude's *change* enters.** Both tilts are taken relative to their own midpoint, which
+preserves the difference exactly and removes whatever bias they share. That is not a nicety: the
+VESC attitude estimate is biased and drifts — in simulation its |roll, pitch| rms over a rollout is
+about 11 deg, and five of the thirteen competition recordings swing past 40 deg (one to 178) with
+the quaternion unit-norm throughout. Fed the absolute value, the warp integrates the ego's arcs in a
+frame tilted by that bias and the out-of-plane test then discards points the current scan can see.
+Measured on one clean recording, everything else fixed:
+
+| what the warp is told about the attitude | beams with a prediction | static-scene survivors |
+|---|---|---|
+| the absolute estimate | 70.3 % | 2.89 % |
+| **only how it changed** | **82.1 %** | **2.67 %** |
+| nothing (told the car is level) | 91.3 % | 3.06 % |
+
+It is also the more honest frame: the ego motion is measured in the car's own axes, so the plane the
+arcs are integrated in is the car's own mean attitude over the interval and not a level plane nobody
+measured. Dropping the attitude altogether buys the most coverage and the worst false-positive rate,
+which is the out-of-plane test doing real work.
+
 **Everything the warp uses is measured on the car** — VESC wheel speed, IMU gyro z, IMU roll/pitch.
 No pose, no map, no odometry beyond those k steps. `f1sim_ros/policy_node.py` already reads all
 three and now hands them to the channel.
@@ -199,9 +218,9 @@ with **k = 4 declared a priori and not chosen from these numbers**:
 
 | k | bins the warp could predict | \|R\| p50 | p90 | p99 | share over 0.05 m | over 0.10 m |
 |---|---|---|---|---|---|---|
-| 2 | 87.9 % | 0.000 | 0.020 | 0.915 | 4.6 % | 2.9 % |
-| **4** | **72.2 %** | **0.000** | **0.040** | **1.955** | **7.9 %** | **4.6 %** |
-| 8 | 49.4 % | 0.015 | 0.080 | 2.585 | 21.2 % | 8.0 % |
+| 2 | 93.4 % | 0.000 | 0.020 | 0.875 | 4.6 % | 2.9 % |
+| **4** | **87.0 %** | **0.000** | **0.040** | **1.760** | **7.8 %** | **4.5 %** |
+| 8 | 71.9 % | 0.015 | 0.075 | 2.255 | 20.0 % | 7.6 % |
 
 The trade is legible: a longer lag gives a moving car more displacement to show, and costs coverage
 and accuracy because more of the world has rotated out of the window, more points fail the
@@ -209,7 +228,9 @@ out-of-plane test, and the composed ego motion has further to extrapolate.
 
 **τ, fixed before any training.** σ_static is read off the *literal* residual (`--tol-beams 0`, no
 envelope, so the distribution has no atom at zero) at k = 4 over the same ten recordings:
-**σ_static = 0.025 m** by the p68 of |R|, and 0.022 m by the median-based estimate — the two agree.
+**σ_static = 0.025 m** by the p68 of |R|, and 0.022 m by the median-based estimate — the two agree,
+and they are the same numbers before and after the attitude change above, so nothing about τ was
+chosen after seeing a result.
 The contract's rule is 2–3 σ, and the declared value is
 
 > **τ = 3 σ_static = 0.075 m**, with `sign(R)·max(|R| − τ, 0)`.
@@ -220,11 +241,11 @@ consistency test at ±8 beams — the real-bag floor is:
 
 | | value |
 |---|---|
-| bins with a prediction | 72.2 % |
-| over τ | 5.6 % of those |
-| surviving the consistency test | **3.9 %** |
-| the survivors' \|R\| | p50 0.265 m, p99 6.21 m |
-| their run lengths along the beam axis | p50 5 beams, p90 28 |
+| bins with a prediction | 87.0 % |
+| over τ | 5.4 % of those |
+| surviving the consistency test | **3.8 %** |
+| the survivors' \|R\| | p50 0.235 m, p99 6.15 m |
+| their run lengths along the beam axis | p50 5 beams, p90 27 |
 
 That is about 30 flagged beams in a 1081-beam scan, in runs whose median is 5 beams. An opponent at
 3–5 m covers 30–80 contiguous beams, so the signal and the floor differ in extent as well as in
@@ -241,16 +262,14 @@ of beams surviving the gate moves as:
 | speed scaled ×0.95 | 1.9 % |
 | speed scaled ×1.10 | 2.6 % |
 | yaw rate ×0.8 / ×1.2 | 4.1 % / 3.6 % |
-| the attitude input zeroed | 2.2 % |
 | the yaw rate zeroed | 26.2 % |
 | the yaw rate sign flipped | 40.2 % |
 | the speed zeroed | 45.2 % |
 
 Removing the ego compensation multiplies the false-positive rate by 13–22×. The gyro is already
 correctly scaled (1.0 is the optimum) and the ERPM speed reads about 5 % high, which is consistent
-with `speed_gain` in `docs/real_data_calibration.md`; neither is corrected here. The attitude input
-buys about 7 % relative on this bag — small, and worth keeping because it costs nothing and the sim's
-attitude randomisation is larger than this recording's.
+with `speed_gain` in `docs/real_data_calibration.md`; neither is corrected here — a 5 % speed error
+is 9 mm over the warp's 0.9 m of travel and the measurement says so.
 
 ## Budget
 
