@@ -22,12 +22,12 @@ import time
 import numpy as np
 import torch
 
-from .. import opponent_events as opp_ev
 from ..gym_env import EnvConfig, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
 from . import grip_runtime as grip_rt
+from . import opponent_config as opp_cfg
 from .memory import Hidden, memory_spec, reset_hidden
 from .model import (ActorCritic, load_checkpoint, load_for_conditioning, load_for_memory,
                     save_checkpoint)
@@ -295,50 +295,9 @@ def main():
     ap.add_argument("--episode-s", type=float, default=40.0)
     ap.add_argument("--scan-stack", type=int, default=3); ap.add_argument("--scan-stride", type=int, default=1, help="control steps between stacked scans")
     ap.add_argument("--hist-len", type=int, default=0, help="proprio history rows in the observation (20 = the last second at stride 2)")
-    ap.add_argument("--race-size", type=int, default=1, help="cars per track instance (>1: opponents in the LiDAR, car-car collisions)")
-    ap.add_argument("--opponent", default="policy", choices=["policy", "teacher", "mixed"],
-                    help="who drives cars 1..M-1: the policy (self-play), the raceline teacher, or per race "
-                         "one or the other (mixed, share set by --mixed-teacher-frac)")
-    ap.add_argument("--mixed-teacher-frac", type=float, default=0.5)
-    ap.add_argument("--opp-speed", type=float, nargs=2, default=(0.6, 1.0), help="teacher opponents: speed scale range per race")
-    ap.add_argument("--spawn-gap", type=float, nargs=2, default=(2.5, 6.0), metavar=("LOW", "HIGH"),
-                    help="[m] arc along the lane between the cars of a race at spawn, drawn uniformly "
-                         "per reset. The default is the range every race so far was trained at, so an "
-                         "unflagged run is unchanged. Widening it is an opponent-diversity axis: a "
-                         "fixed narrow band shows the policy one approach geometry")
-    # Scripted opponent behaviour (f1sim.opponent_events). Every flag maps 1:1 onto the EnvConfig
-    # field of the same name; the defaults are the EnvConfig defaults, so an unflagged run is the
-    # run it was before these existed.
-    ap.add_argument("--opp-events", default="", metavar="A,B",
-                    help=f"comma-separated scripted events for the teacher-driven opponents "
-                         f"({','.join(opp_ev.EVENT_NAMES)}); empty = off. A teacher opponent otherwise "
-                         f"only ever presents a slower car on the racing line, which is the one "
-                         f"overtaking and avoidance problem the policy has already been trained on")
-    ap.add_argument("--opp-event-rate", type=float, default=0.0, metavar="PER10S",
-                    help="expected events per teacher opponent per 10 s of driving (events do not "
-                         "overlap, so the realized rate is a little below this)")
-    ap.add_argument("--opp-brake-scale", type=float, nargs=2, default=(0.0, 0.5), metavar=("LOW", "HIGH"),
-                    help="brake: fraction of its profile speed the opponent drops to")
-    ap.add_argument("--opp-brake-time", type=float, nargs=2, default=(0.5, 2.5), metavar=("LOW", "HIGH"),
-                    help="[s] how long a brake event holds")
-    ap.add_argument("--opp-stop-time", type=float, nargs=2, default=(1.0, 4.0), metavar=("LOW", "HIGH"),
-                    help="[s] how long a stopped opponent stays stopped")
-    ap.add_argument("--opp-shift-offset", type=float, nargs=2, default=(0.0, 0.35), metavar=("LOW", "HIGH"),
-                    help="[m] |lateral offset| of a lane change; the sign is drawn separately")
-    ap.add_argument("--opp-shift-hold", type=float, nargs=2, default=(0.5, 2.0), metavar=("LOW", "HIGH"),
-                    help="[s] time held at the offset, between the ramp in and the ramp out")
-    ap.add_argument("--opp-shift-ramp", type=float, default=1.0, metavar="S",
-                    help="[s] ramp in / ramp out of a shift")
-    ap.add_argument("--opp-weave-amp", type=float, nargs=2, default=(0.1, 0.25), metavar=("LOW", "HIGH"),
-                    help="[m] sinusoidal lateral amplitude of a weave")
-    ap.add_argument("--opp-weave-period", type=float, nargs=2, default=(2.0, 4.0), metavar=("LOW", "HIGH"),
-                    help="[s] weave period")
-    ap.add_argument("--opp-weave-time", type=float, nargs=2, default=(2.0, 6.0), metavar=("LOW", "HIGH"),
-                    help="[s] how long a weave lasts")
-    ap.add_argument("--opp-event-margin", type=float, default=0.10, metavar="M",
-                    help="[m] free space kept beyond the car's half-width when an event moves an "
-                         "opponent off the raceline; the offset is clamped per raceline point "
-                         "against the track's distance field, so it can never reach a wall")
+    # The race / opponent / behaviour / spawn flags. Shared with `learn.opponent_census`, which has
+    # to be able to build exactly the configuration a run trains against -- see that module.
+    opp_cfg.add_arguments(ap)
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the policy outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--memory", default="off", choices=("off", "gru"),
                     help="give the actor (and by default the critic) a recurrent memory over the "
@@ -392,27 +351,7 @@ def main():
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
     a = ap.parse_args()
-    _gap_lo, _gap_hi = (float(x) for x in a.spawn_gap)
-    if not (math.isfinite(_gap_lo) and math.isfinite(_gap_hi)) or not (0.0 < _gap_lo <= _gap_hi):
-        raise SystemExit(f"--spawn-gap {_gap_lo} {_gap_hi}: needs finite 0 < LOW <= HIGH [m]. The gap "
-                         f"is an arc drawn uniformly from [LOW, HIGH] and subtracted per grid slot, so "
-                         f"a non-positive or inverted range spawns cars on top of each other.")
-    a.spawn_gap = (_gap_lo, _gap_hi)
-    try:
-        a.opp_events = opp_ev.parse_events(a.opp_events)
-    except ValueError as exc:
-        raise SystemExit(f"--opp-events: {exc}")
-    if a.opp_events:
-        if a.race_size < 2 or a.opponent not in ("teacher", "mixed"):
-            raise SystemExit(f"--opp-events {','.join(a.opp_events)} needs --race-size > 1 and "
-                             f"--opponent teacher|mixed: the events script the *teacher-driven* cars "
-                             f"of a race, and there are none here (--race-size {a.race_size}, "
-                             f"--opponent {a.opponent}).")
-        if not a.opp_event_rate > 0:
-            raise SystemExit(f"--opp-events {','.join(a.opp_events)} with --opp-event-rate "
-                             f"{a.opp_event_rate}: the rate is how many events an opponent gets per "
-                             f"10 s, so at 0 the named events never fire and the run is silently the "
-                             f"unflagged one. Pass a positive rate or drop --opp-events.")
+    opp_cfg.validate(a)
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
@@ -452,7 +391,7 @@ def main():
                          f"complete. Use {a.envs - a.envs % a.race_size} or {a.envs + a.race_size - a.envs % a.race_size}.")
     if a.overtake_bonus > 0 and a.race_size < 2:
         raise SystemExit("--overtake-bonus needs --race-size > 1: with no opponent there is nothing to pass.")
-    need_rl = (a.race_size > 1 and a.opponent in ("teacher", "mixed")) or a.lap_time_bonus > 0
+    need_rl = opp_cfg.needs_racelines(a) or a.lap_time_bonus > 0
     print(f"loading {len(names)} tracks{' + racelines' if need_rl else ''} ...", flush=True)
     tracks, rls = common.load_tracks(names, racelines=need_rl,
                                      **({} if a.raceline_margin is None else {"margin": a.raceline_margin}))
@@ -479,21 +418,11 @@ def main():
                                                               car_safe_gap=a.car_safe_gap,
                                                               max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
-                                                              race_size=a.race_size, opponent=a.opponent,
-                                                              mixed_teacher_frac=a.mixed_teacher_frac,
-                                                              opp_speed_range=tuple(a.opp_speed),
-                                                              spawn_gap=tuple(a.spawn_gap), action_mode=a.action_mode,
-                                                              opp_events=a.opp_events, opp_event_rate=a.opp_event_rate,
-                                                              opp_brake_scale_range=tuple(a.opp_brake_scale),
-                                                              opp_brake_time_range=tuple(a.opp_brake_time),
-                                                              opp_stop_time_range=tuple(a.opp_stop_time),
-                                                              opp_shift_offset_range=tuple(a.opp_shift_offset),
-                                                              opp_shift_hold_range=tuple(a.opp_shift_hold),
-                                                              opp_shift_ramp=a.opp_shift_ramp,
-                                                              opp_weave_amp_range=tuple(a.opp_weave_amp),
-                                                              opp_weave_period_range=tuple(a.opp_weave_period),
-                                                              opp_weave_time_range=tuple(a.opp_weave_time),
-                                                              opp_event_margin=a.opp_event_margin,
+                                                              action_mode=a.action_mode,
+                                                              # every race / opponent / behaviour /
+                                                              # spawn field, from the group the
+                                                              # census shares (learn.opponent_config)
+                                                              **opp_cfg.env_kwargs(a),
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
@@ -504,6 +433,7 @@ def main():
                           teacher_recover_time=a.teacher_recover_time)
     print(f"sim backend: {a.sim_backend} (cfg.sim.compile={sim_cfg.sim.compile}, "
           f"compile_tracker={_env_compile_tracker})")
+    print(f"opponents: {opp_cfg.describe(a)}", flush=True)
     if env.procedural is not None:
         print(env.procedural.describe())
     graph_rt = None

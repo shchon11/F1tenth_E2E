@@ -25,7 +25,8 @@ import numpy as np
 import torch
 
 from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, encode as plan_encode, decode as plan_decode
-from .opponent_events import OpponentEvents, raceline_offset_limit
+from .opponent_events import (LearnerView, OpponentEvents, raceline_corners,
+                               raceline_offset_limit, split_events)
 from .params import Config
 from .sim import Simulator, StepResult
 from .track import Track
@@ -37,6 +38,32 @@ REWARD_COMPONENT_KEYS = ("progress", "collision", "collision_speed", "steer_rate
 #: The nearest-opponent columns of privileged() are stored as metres (or m/s) divided by this, to
 #: keep them O(1) for the critic. Anything comparing them against a real distance must multiply.
 PRIV_OPP_DIST_SCALE = 5.0
+
+#: Who drives each car, per row, in `opponent == "pool"`. The learner's slot is always
+#: `OPP_DRIVER_POLICY`; an opponent's is drawn per race from `opp_pool`.
+OPP_DRIVER_POLICY = 0      # the caller's own action: the learner, or a `self` entry (self-play)
+OPP_DRIVER_TEACHER = 1     # the raceline teacher, carrying whatever `opp_events` are configured
+OPP_DRIVER_POOL = 2        # 2 + j: checkpoint j of the pool (f1sim.learn.opponent_pool)
+
+#: The two `--opp-pool` entries that are not files. `self` is the learner's own current weights,
+#: which makes that race self-play; `teacher` is the raceline teacher.
+POOL_SELF, POOL_TEACHER = "self", "teacher"
+
+#: `--spawn-order`: where the learner starts relative to the rest of its race.
+SPAWN_ORDERS = ("behind", "ahead", "alongside", "random")
+SPAWN_ORDER_ID = {name: i for i, name in enumerate(SPAWN_ORDERS[:3])}
+
+#: Who may drive the other cars of a race.
+OPPONENT_MODES = ("policy", "teacher", "mixed", "pool")
+
+
+def pool_entries(pool) -> tuple:
+    """Normalize an `opp_pool` value (tuple/list, or a comma-separated string) of entry names."""
+    if pool is None:
+        return ()
+    if isinstance(pool, str):
+        pool = [p for p in pool.replace(" ", "").split(",") if p]
+    return tuple(str(p) for p in pool)
 
 
 @dataclass
@@ -174,8 +201,18 @@ class EnvConfig:
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
-                                     # "teacher": cars 1..M-1 follow the raceline teacher at a random speed scale
-    opp_speed_range: tuple = (0.6, 1.0)   # teacher opponents: speed-profile scale per race per reset
+                                     # "teacher": cars 1..M-1 follow the raceline teacher at a random speed scale;
+                                     # "mixed": per race, teacher or self-play (mixed_teacher_frac);
+                                     # "pool": per race, one entry drawn from `opp_pool` -- a
+                                     # population rather than a single kind of opponent.
+    opp_speed_range: tuple = (0.6, 1.0)   # teacher opponents: speed-profile scale per race per reset.
+                                     # Above 1.0 is allowed and means a *faster* car: the learner is
+                                     # the one being overtaken, which is the situation the training
+                                     # distribution has never contained (the learner always spawned
+                                     # behind a car doing 0.6-1.0x). The teacher's profile already
+                                     # plans at the grip limit, so a scale much above ~1.2 is a car
+                                     # that leaves the road; `learn.opponent_census` reports opponent
+                                     # wall contacts so the ceiling is measured rather than assumed.
     mixed_teacher_frac: float = 0.5   # opponent == "mixed": the share of races whose other cars are
                                       # teacher-driven (the rest are self-play). Measured, each alone
                                       # forgets the other: 6.6M steps of self-play took contact
@@ -184,6 +221,31 @@ class EnvConfig:
                                       # *behaviour* is a diversity axis like track shape is; a batch
                                       # with one kind of opponent is a training set with one map.
     spawn_gap: tuple = (2.5, 6.0)    # [m] along the lane between cars of a race at spawn
+    spawn_order: str = "behind"      # where the learner (slot 0) starts on the grid of a race whose
+                                     # other cars are not the learner itself: "behind" (every race so
+                                     # far: the learner at the back, with a pass to make), "ahead"
+                                     # (the learner leading, so a faster opponent has to be dealt
+                                     # with rather than chased), "alongside" (side by side, which is
+                                     # where the contacts actually happen) or "random" (drawn per
+                                     # race from the three). In a self-play race every car is the
+                                     # learner, so only "alongside" is a different grid there.
+    spawn_alongside_sep: float = 0.15  # [m] body-to-body lateral gap asked for on an alongside grid.
+                                     # What the lane has room for wins: where two bodies plus this
+                                     # gap do not fit, the race spawns staggered instead, because
+                                     # two cars spawned in contact terminate on step 1 for ever.
+    spawn_alongside_gap: tuple = (0.0, 0.2)   # [m] arc stagger inside an alongside grid, drawn
+                                     # independently per car. Small on purpose: the lateral offsets
+                                     # of a grid are measured along the centerline normal at each
+                                     # car's own arc position, and on a tight corner those normals
+                                     # stop agreeing a few tens of centimetres apart. The bodies are
+                                     # 0.58 m long, so they overlap across the whole range anyway.
+    spawn_alongside_yaw: float = 0.06  # [rad] heading jitter of an abreast row, if that is tighter
+                                     # than `spawn_yaw_std`. Two cars side by side need their
+                                     # *rotated* footprints to fit between the walls, and at the
+                                     # usual 0.2 rad a 0.58 m car sweeps 0.33 m sideways at 3 sigma
+                                     # -- more than a 1.4 m lane has to spare. Cars on a grid are
+                                     # lined up with the track, so this is what a grid looks like
+                                     # anyway; the lateral spread, which is the point, is kept.
     selfplay_front_cap: bool = True   # cap the front car of a self-play race (training). The viewer
                                       # turns it off: what is being watched there is the policy
                                       # against an equal, and a silently slowed opponent reads as a
@@ -225,6 +287,51 @@ class EnvConfig:
                                       # offsets it off the raceline. The offset is clamped per raceline
                                       # point against the track's own distance field, so a 0.35 m lane
                                       # change through a 1.6 m section becomes as much of one as fits.
+    # Reactive behaviour (the `defend` / `yield` / `line` / `oblivious` entries of `opp_events`).
+    # These are not timed: they read the learner's position relative to the opponent every step, so
+    # each is a *disposition* drawn per teacher-driven car per race at its own probability rather
+    # than an event at a rate. All four probabilities are 0, i.e. off, by default.
+    opp_defend_prob: float = 0.0      # P(this opponent defends the inside line when caught)
+    opp_yield_prob: float = 0.0       # P(this opponent moves away from a car alongside)
+    opp_line_prob: float = 0.0        # P(this opponent drives its own out-in / in-out corner line)
+    opp_oblivious_prob: float = 0.0   # P(this opponent's follow-gap slowdown is switched off)
+    opp_defend_offset_range: tuple = (0.15, 0.35)   # [m] how far a defending car moves across
+    opp_yield_offset_range: tuple = (0.15, 0.35)    # [m] ... a yielding one
+    opp_line_offset_range: tuple = (0.15, 0.35)     # [m] ... a corner line, at each end of the sweep
+    opp_defend_range: float = 0.0     # [m] how far behind a learner starts being defended against.
+                                      # 0 = `overtake_range`, the same window the overtake reward
+                                      # calls "being raced".
+    opp_defend_full: float = 3.0      # [m] inside this the block is at full amplitude; it ramps to
+                                      # zero at `opp_defend_range`. A car that swings off the racing
+                                      # line because something is 12 m behind it is not defending.
+    opp_alongside_lon: float = 0.8    # [m] |body-frame longitudinal offset| within which two cars
+                                      # count as alongside (the bodies are 0.58 m long). Read by
+                                      # `yield` and by `learn.opponent_census`, which must measure
+                                      # the same situation the behaviour reacts to.
+    opp_alongside_lat: float = 1.2    # [m] ... and the lateral bound, so a car on the far side of a
+                                      # hairpin is not "alongside" anyone.
+    opp_react_max: float = 0.45       # [m] cap on the reactive offset before the lane's own clamp.
+                                      # Half a car width of line change is a racing move; a metre is
+                                      # a car leaving the road in a way no clamp should have to save.
+    opp_react_slew: float = 0.6       # [m/s] rate limit on it. The scripted `shift` ramps 0.35 m
+                                      # over 1 s for the same reason: pure pursuit on a target that
+                                      # jumps sideways asks for a step steer input.
+    opp_corner_kappa: float = 0.15    # [1/m] smoothed raceline curvature above which a point is
+                                      # "in a corner" (a 6.7 m radius), for the `line` behaviour
+    opp_corner_min_arc: float = 1.0   # [m] shortest run of such points that counts as one corner
+    opp_corner_smooth: float = 0.6    # [m] window the curvature is averaged over first. Without it
+                                      # a single corner comes apart into a dozen one-point corners
+                                      # whose phase sweep is a few centimetres long.
+    # Opponent population. `opponent == "pool"`: each entry is a checkpoint path, `self` (the
+    # learner's own current weights, which makes that race self-play) or `teacher` (the raceline
+    # teacher, carrying whatever `opp_events` are configured). One entry is drawn per race from
+    # `sim.gen`. Empty is off and refused by `opponent == "pool"` rather than silently ignored.
+    #
+    # Why a population at all: measured, a single kind of opponent is a training set with one map.
+    # `opponent == "mixed"` already interleaves two kinds; this makes the number of kinds a flag,
+    # and lets one of them be a *policy* -- a car that takes its own line, defends its own position
+    # and makes its own mistakes, which no scripted behaviour reproduces.
+    opp_pool: tuple = ()
     # Obstacle layouts redrawn per env at every reset (f1sim.procedural_obstacles). 0 = off, and off
     # is byte-identical to the env before they existed: nothing is allocated, nothing is drawn from
     # the generator and `props_for` returns exactly what it returned. The training set's obstacle
@@ -259,20 +366,70 @@ class F1VecEnv:
         self.M = e.race_size
         ar = torch.arange(self.B, device=self.device)
         self.race, self.slot = ar // self.M, ar % self.M
+        if e.opponent not in OPPONENT_MODES:
+            raise ValueError(f"opponent {e.opponent!r} is not one of {list(OPPONENT_MODES)}")
+        if e.spawn_order not in SPAWN_ORDERS:
+            raise ValueError(f"spawn_order {e.spawn_order!r} is not one of {list(SPAWN_ORDERS)}")
+        self.pool_names = pool_entries(e.opp_pool)
+        if e.opponent == "pool":
+            if self.M < 2:
+                raise ValueError("opponent 'pool' needs race_size > 1: with one car per race there "
+                                 "is no other car for the population to drive")
+            if not self.pool_names:
+                raise ValueError("opponent 'pool' with an empty opp_pool: the population is what "
+                                 "drives the other car, so an empty one is not 'the default "
+                                 "opponent', it is no opponent at all. Name entries (a checkpoint "
+                                 f"path, {POOL_SELF!r} or {POOL_TEACHER!r}) or use another mode.")
+        # Which cars the *policy* drives. Never the opponents in "teacher" mode; in "mixed" and
+        # "pool" mode it changes at every race reset, so the PPO buffers (whose width is fixed by
+        # `learner`) hold every car and the loss weights each sample by `on_policy` instead. A pool
+        # without a `self` entry can never put a policy-driven car in an opponent slot, so there the
+        # buffers stay narrow -- half of them would otherwise be masked out of every update.
+        self.pool_can_self = e.opponent == "pool" and POOL_SELF in self.pool_names
         self.learner = torch.ones(self.B, dtype=torch.bool, device=self.device)
-        if self.M > 1 and e.opponent == "teacher":
+        if self.M > 1 and (e.opponent == "teacher" or (e.opponent == "pool" and not self.pool_can_self)):
             self.learner[self.slot > 0] = False
-        # Which cars the *policy* drives this episode. Static in "teacher" and "policy" mode; in
-        # "mixed" mode it changes at every race reset, so the PPO buffers (whose width is fixed by
-        # `learner`) hold every car and the loss weights each sample by this mask instead.
         self.on_policy = self.learner.clone()
         self.learner_ids = torch.nonzero(self.learner).flatten()
         self.teacher = None                                    # set_teacher() for opponent == "teacher"
-        # Scripted opponent behaviour. Allocated whenever there are teacher-driven cars so a viewer or
+        #: Whether any car of this configuration can be teacher-driven, and so whether a teacher is
+        #: required at all. A pool of checkpoints alone needs none.
+        self.teacher_any = (e.opponent in ("teacher", "mixed")
+                            or (e.opponent == "pool" and POOL_TEACHER in self.pool_names))
+        # Opponent behaviour. Allocated whenever there are teacher-driven cars so a viewer or
         # logger can read `info["opp_event"]` unconditionally; inert (and drawing nothing from the
-        # generator) until `opp_events` names an event.
+        # generator) until `opp_events` names an event with a positive rate or probability.
         self.events = (OpponentEvents(self.B, self.device, e, self.sim.control_dt, self.sim.gen)
-                       if self.M > 1 and e.opponent in ("teacher", "mixed") else None)
+                       if self.M > 1 and self.teacher_any else None)
+        #: Per-car driver code (`OPP_DRIVER_*`), only meaningful in pool mode. Slot 0 is always the
+        #: policy; an opponent's is redrawn at every full race reset.
+        self.opp_driver = torch.zeros(self.B, dtype=torch.long, device=self.device)
+        #: Entry index -> driver code. The checkpoint entries take 2, 3, ... in the order named, so
+        #: `learn.opponent_pool` loads them in that order and indexes by `driver - OPP_DRIVER_POOL`.
+        lut, ck = [], 0
+        for name in self.pool_names:
+            if name == POOL_SELF:
+                lut.append(OPP_DRIVER_POLICY)
+            elif name == POOL_TEACHER:
+                lut.append(OPP_DRIVER_TEACHER)
+            else:
+                lut.append(OPP_DRIVER_POOL + ck); ck += 1
+        self.pool_driver_lut = torch.tensor(lut or [OPP_DRIVER_POLICY], dtype=torch.long, device=self.device)
+        #: The checkpoint paths of the pool, in driver-code order.
+        self.pool_paths = tuple(n for n in self.pool_names if n not in (POOL_SELF, POOL_TEACHER))
+        self.pool = None                                       # set_opponent_pool()
+        #: Car-level masks the behaviour gate and the pool action both read. `teacher_race` below is
+        #: a *race* flag; these are per car, and slot 0 is in neither.
+        self.teacher_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self.pool_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        if self.M > 1 and e.opponent == "teacher":
+            self.teacher_driven[self.slot > 0] = True
+        #: Which grid each race drew (`SPAWN_ORDER_ID`), so a single car respawning mid-race does
+        #: not re-draw its race's order.
+        self.spawn_order_race = torch.zeros(self.B, dtype=torch.long, device=self.device)
+        #: The observation the policy last saw, which is the one a pool opponent acts on: the pool
+        #: is asked for its action at the top of `step()`, before any new observation exists.
+        self._last_obs = None
         # Obstacle layouts redrawn per env at every reset. Built here so the prop tensors exist
         # before anything compiles against them; the raceline corridor arrives later, with the
         # teacher (`set_teacher`), because that is when the line the opponents drive is known.
@@ -409,6 +566,59 @@ class F1VecEnv:
             teacher.offset_limit = raceline_offset_limit(teacher, self.sim.track,
                                                          0.5 * self.cfg.vehicle.width,
                                                          self.ecfg.opp_event_margin)
+        if self.events is not None and self.events.needs_corners:
+            # Where the corners are on each raceline, for the `line` behaviour. Built once here for
+            # the same reason the offset budget is: it is a function of the track set, not of a step.
+            self.events.corners = raceline_corners(teacher, self.ecfg.opp_corner_kappa,
+                                                   self.ecfg.opp_corner_min_arc,
+                                                   self.ecfg.opp_corner_smooth)
+
+    def set_opponent_pool(self, pool):
+        """Population that drives the opponent cars (opponent == "pool").
+
+        `pool` is a `learn.opponent_pool.OpponentPool` -- injected rather than built here for the
+        same reason the teacher is: loading a checkpoint means `learn.model`, and the env is below
+        `learn` in the import order. The env owns which car each entry drives; the pool owns how an
+        entry is asked for an action.
+        """
+        if self.ecfg.opponent != "pool":
+            raise RuntimeError(f"set_opponent_pool on an env with opponent={self.ecfg.opponent!r}: "
+                               f"the pool only drives cars in 'pool' mode")
+        if len(pool) != len(self.pool_paths):
+            raise ValueError(f"the pool holds {len(pool)} checkpoint(s) but opp_pool names "
+                             f"{len(self.pool_paths)}: {list(self.pool_paths)}")
+        self.pool = pool
+
+    def learner_view(self, state: Optional[torch.Tensor] = None) -> LearnerView:
+        """Where the policy-driven cars are, from every car's own frame, right now.
+
+        The reactive behaviours react to this and `learn.opponent_census` counts situations out of
+        it, deliberately from one implementation: "alongside" meaning one thing to the opponent
+        that yields and another to the census that reports how long the learner spent there is
+        exactly the failure the census exists to rule out.
+        """
+        st = self.sim.state if state is None else state
+        o = self.sim.other_idx
+        if o is None:
+            raise RuntimeError("learner_view needs a race (race_size > 1)")
+        d = st[o][:, :, :2] - st[:, None, :2]                              # (B,C,2) me -> them
+        c, sn = torch.cos(st[:, 2]), torch.sin(st[:, 2])
+        lon = d[..., 0] * c[:, None] + d[..., 1] * sn[:, None]
+        lat = -d[..., 0] * sn[:, None] + d[..., 1] * c[:, None]
+        dist = d.norm(dim=2).clamp_min(1e-6)
+        vme = torch.stack([st[:, 3] * c - st[:, 4] * sn, st[:, 3] * sn + st[:, 4] * c], 1)
+        co, so = torch.cos(st[o][:, :, 2]), torch.sin(st[o][:, :, 2])
+        vth = torch.stack([st[o][:, :, 3] * co - st[o][:, :, 4] * so,
+                           st[o][:, :, 3] * so + st[o][:, :, 4] * co], 2)
+        closing = -((vth - vme[:, None, :]) * d).sum(2) / dist
+        rl_idx = None
+        if self.events is not None and self.events.needs_corners and self.teacher is not None:
+            # One extra raceline projection per step, paid only by the `line` behaviour: the
+            # teacher's own projection is of the latency-compensated pose and is not returned.
+            rl_idx, _ = self.teacher.project(st[:, :2], self.sim.tid)
+        return LearnerView(gap=self.signed_gaps(self.sim.s, self.sim.tid), lon=lon, lat=lat,
+                           closing=closing, learner=self.on_policy[o], rl_idx=rl_idx,
+                           tid=self.sim.tid)
 
     # ------------------------------------------------------------------ helpers
     def _norm_scan(self, scan: torch.Tensor) -> torch.Tensor:
@@ -458,9 +668,11 @@ class F1VecEnv:
         e = self.ecfg
         gen = self.sim.gen
         n = ids.numel()
+        lat, min_clear, yaw_std = None, e.spawn_min_clearance, e.spawn_yaw_std
         if self.M == 1:
             if e.resample_track_on_reset and self.sim.track.T > 1:
                 self.sim.tid[ids] = torch.randint(self.sim.track.T, (n,), device=self.device, generator=gen)
+            self._redraw_layouts(ids, n)
             s = None
         else:
             # a race resets as a whole (new track, cars staggered along the lane) when all its cars are in
@@ -471,6 +683,7 @@ class F1VecEnv:
             if e.resample_track_on_reset and self.sim.track.T > 1:
                 new_tid = torch.randint(self.sim.track.T, (full.shape[0],), device=self.device, generator=gen)
                 self.sim.tid[ids] = torch.where(is_full, new_tid[race], self.sim.tid[ids])
+            self._redraw_layouts(ids, n, full=full)
             L = self.sim.track.length[self.sim.tid[ids]]
             gap = e.spawn_gap[0] + (e.spawn_gap[1] - e.spawn_gap[0]) * torch.rand(n, device=self.device, generator=gen)
             base = torch.rand(full.shape[0], device=self.device, generator=gen)   # leader position, fraction of a lap
@@ -483,43 +696,138 @@ class F1VecEnv:
                 teach_race = torch.rand(full.shape[0], device=self.device, generator=gen) < e.mixed_teacher_frac
                 self.teacher_race[ids] = torch.where(is_full, teach_race[race], self.teacher_race[ids])
                 self.on_policy[ids] = ~(self.teacher_race[ids] & (slot > 0))
-            teacher_driven = self.teacher_race[ids] if e.opponent == "mixed" else torch.full_like(slot, e.opponent == "teacher", dtype=torch.bool)
-            behind = torch.where(teacher_driven, (self.M - 1 - slot).float(), slot.float())
-            s_full = base[race] * L - behind * gap                            # front car at base, the rest behind
+            elif e.opponent == "pool":
+                # One entry per race, drawn from the simulator's own generator so a seed reproduces
+                # which opponent the learner met in which race. Only a *full* race reset re-draws:
+                # a single car respawning after a crash rejoins the race it was already in, against
+                # the same opponent, which is what "per race" has to mean for a partial reset.
+                pick = torch.randint(len(self.pool_names), (full.shape[0],), device=self.device, generator=gen)
+                drv = self.pool_driver_lut[pick]                              # (G,)
+                self.opp_driver[ids] = torch.where(is_full & (slot > 0), drv[race], self.opp_driver[ids])
+                self.opp_driver[ids] = torch.where(slot == 0, torch.zeros_like(slot), self.opp_driver[ids])
+                self.teacher_race[ids] = torch.where(is_full, drv[race] == OPP_DRIVER_TEACHER,
+                                                     self.teacher_race[ids])
+                self.on_policy[ids] = self.opp_driver[ids] == OPP_DRIVER_POLICY
+            teacher_race_row = (self.teacher_race[ids] if e.opponent in ("mixed", "pool")
+                                else torch.full_like(slot, e.opponent == "teacher", dtype=torch.bool))
+            self.teacher_driven[ids] = teacher_race_row & (slot > 0)
+            self.pool_driven[ids] = self.opp_driver[ids] >= OPP_DRIVER_POOL
+            # Whether this race's *other* cars are something other than the policy under training.
+            # It decides both halves of the grid: only such a race has a "the learner" to place
+            # ahead of or behind the rest, and only a self-play race gets the front-car cap.
+            if e.opponent == "pool":
+                scripted_row = self.opp_driver.view(-1, self.M)[:, 1:].ne(OPP_DRIVER_POLICY).any(1)[race]
+            elif e.opponent == "mixed":
+                scripted_row = teacher_race_row
+            else:
+                scripted_row = torch.full_like(slot, e.opponent == "teacher", dtype=torch.bool)
+            order = self._spawn_order(ids, race, is_full, full.shape[0], gen)
+            # Grid position, 0 = leader. The learner is slot 0, and in a race it does not drive both
+            # sides of, where it starts is the whole difference between "a pass to make" and "a
+            # place to defend": `behind` (every race trained so far) puts it last, `ahead` first,
+            # `alongside` level with the field. A self-play race keeps the leader-first stagger it
+            # has always had -- relabelling which learner leads changes nothing about the race.
+            rank = torch.where(scripted_row,
+                               torch.where(order == SPAWN_ORDER_ID["ahead"], slot.float(),
+                                           (self.M - 1 - slot).float()),
+                               slot.float())
+            rank = torch.where(order == SPAWN_ORDER_ID["alongside"], torch.zeros_like(rank), rank)
+            # Cumulative, not `rank * gap`: the gap is drawn per car, so multiplying it by the rank
+            # scrambles a grid of three or more (rank 1 drawing 6 m and rank 2 drawing 2.5 m puts
+            # the third car a metre *ahead* of the second, and close draws put them in contact --
+            # measured, 14 of 528 three-car spawns). Each car sits its own gap behind the car in
+            # front of it, which is what the flag says it does. For two cars the two expressions are
+            # the same number, so nothing about a trained race changes.
+            gmat = torch.zeros(self.B // self.M, self.M, device=self.device)
+            rk = rank.long()
+            gmat[race, rk] = torch.where(rk > 0, gap, torch.zeros_like(gap))
+            s_full = base[race] * L - gmat.cumsum(1)[race, rk]                # front car at base, the rest behind
+            if e.spawn_order != "behind":
+                # An alongside grid is the one spawn that has to consult the lane: two cars put side
+                # by side where there is no room for two cars are in contact on step 1. So the
+                # lateral offset is a fixed half-separation and the *lane* decides whether that car
+                # takes it: `room` is measured at the car's own spawn point (not the leader's -- the
+                # grid spans up to half a metre of arc and the lane narrows inside that), and where
+                # it is short that car falls back to a stagger. A car abreast and a car staggered is
+                # a perfectly good grid; what is not is two cars sharing a pose.
+                #
+                # Because the distance field is 1-Lipschitz, `edt(centre) - |lat|` is a true lower
+                # bound on the clearance at the offset point, so `room >= |lat|` is exactly the
+                # condition under which the offset survives the pull-back below.
+                #
+                # Cars lined up on a grid are aligned with the track, so an abreast row spawns with
+                # the jitter cut to `spawn_alongside_yaw`: keeping the full 0.2 rad would need 0.73 m
+                # of centre separation at 3 sigma and no lane here has it to spare.
+                psi = 3.0 * min(e.spawn_yaw_std, e.spawn_alongside_yaw)
+                extent = (self.cfg.vehicle.width * math.cos(psi)
+                          + self.cfg.vehicle.length * math.sin(psi))
+                al = e.spawn_alongside_gap[0] + (e.spawn_alongside_gap[1] - e.spawn_alongside_gap[0]) \
+                    * torch.rand(n, device=self.device, generator=gen)
+                want = (slot.float() - (self.M - 1) / 2.0) * (extent + e.spawn_alongside_sep)
+                # Independent per car, not `slot * al`: an accumulating stagger spreads a three-car
+                # grid over a metre of arc, and on a 2 m radius the centerline normal turns enough
+                # over that distance that "0.56 m apart along the normal" stops meaning 0.56 m
+                # apart. Inside 0.2 m the frames agree to a couple of centimetres.
+                s_slot = torch.remainder(base[race] * L - al, L)
+                xy0, yaw0 = self.sim.track.pose_at_s(s_slot, self.sim.tid[ids])
+                room = self.sim.track.sample_edt(xy0, self.sim.tid[ids]) - 0.5 * extent - e.opp_event_margin
+                # Per *race*, not per car: a race with one car abreast and another staggered is
+                # exactly the grid that collides, because the stagger puts the last slot back on the
+                # leader's own arc position -- where the abreast car already is. Measured with the
+                # decision taken per car: 232 of 528 three-car spawns in contact.
+                headroom = room - want.abs() - 0.03
+                if getattr(self.sim.track, "has_props", False):
+                    # Props are not in the distance field, so `room` cannot see them. A crate
+                    # standing where the grid wants to be would send the abreast cars into
+                    # `sample_spawn`'s prop rejection, which replaces a blocked pose with a
+                    # *centerline* one -- and two cars pulled onto one line are two cars in contact.
+                    # So the grid is tested against the layout as well (drawn already, see
+                    # `_redraw_layouts`), and a race the crates block starts staggered instead: that
+                    # path goes through the rejection safely, because it has no lateral offset to
+                    # lose. `-inf` rather than a flag so the per-race reduction below covers it.
+                    nrm = torch.stack([-torch.sin(yaw0), torch.cos(yaw0)], 1)
+                    pose_ab = torch.cat([xy0 + nrm * want[:, None], yaw0[:, None]], 1)
+                    blocked = self.sim._spawn_in_prop(pose_ab, self.sim.tid[ids], ids)
+                    headroom = torch.where(blocked, torch.full_like(headroom, -math.inf), headroom)
+                worst = torch.full((self.B // self.M,), math.inf, device=self.device)
+                worst.scatter_reduce_(0, race, headroom, reduce="amin", include_self=False)
+                abreast = (order == SPAWN_ORDER_ID["alongside"]) & is_full & (worst[race] >= 0.0)
+                rank = torch.where((order == SPAWN_ORDER_ID["alongside"]) & ~abreast,
+                                   (self.M - 1 - slot).float(), rank)
+                rk = rank.long()
+                gmat = torch.zeros(self.B // self.M, self.M, device=self.device)
+                gmat[race, rk] = torch.where(rk > 0, gap, torch.zeros_like(gap))
+                s_full = torch.where(abreast, s_slot, base[race] * L - gmat.cumsum(1)[race, rk])
+                lat = torch.where(abreast, want,
+                                  torch.randn(n, device=self.device, generator=gen) * e.spawn_lateral_std)
+                min_clear = torch.where(abreast, torch.full_like(lat, 0.5 * extent + e.opp_event_margin),
+                                        torch.full_like(lat, e.spawn_min_clearance))
+                yaw_std = torch.where(abreast, torch.full_like(lat, min(e.spawn_yaw_std, e.spawn_alongside_yaw)),
+                                      torch.full_like(lat, e.spawn_yaw_std))
             other = self.sim.other_idx[ids, 0]
             s_part = self.sim.s[other] - gap                                  # behind the next car of the race
             s = torch.remainder(torch.where(is_full, s_full, s_part), L)
             scale = e.opp_speed_range[0] + (e.opp_speed_range[1] - e.opp_speed_range[0]) * torch.rand(full.shape[0], device=self.device, generator=gen)
             self.opp_scale[ids] = torch.where(is_full, scale[race], self.opp_scale[ids])
-            if e.opponent in ("policy", "mixed") and e.selfplay_front_cap:    # heterogeneous self-play
+            if e.opponent in ("policy", "mixed", "pool") and e.selfplay_front_cap:   # heterogeneous self-play
                 # scaled against the pace the policy actually drives (selfplay_pace_ref), not the
                 # curriculum cap: at cap 9.0 the policy runs corner-limited at ~4.5 m/s, so 0.5-1.0x
                 # of 9.0 bound almost nothing and the races stayed processions (contact and
                 # proximity terms ~0, same as with identical cars). Teacher opponents were scaled
                 # against their raceline profile (~4.8 m/s), which is the analogue.
                 front_cap = (self.opp_scale[ids] * e.selfplay_pace_ref).clamp(max=self.cap_base)
-                self.cap_scale[ids] = torch.where((slot == 0) & ~teacher_driven, front_cap / max(self.cap_base, 1e-6),
+                capped = (rank == 0) & ~scripted_row & (order != SPAWN_ORDER_ID["alongside"])
+                if e.opponent == "pool":
+                    # A checkpoint drives at its own pace, and the only handle `--opp-speed` has on
+                    # it is the cap -- the same handle self-play uses on its front car. A scale
+                    # above 1.0 clamps to the curriculum cap, i.e. leaves it alone: being overtaken
+                    # by a pool car is a question of the grid, not of a cap.
+                    capped = capped | self.pool_driven[ids]
+                self.cap_scale[ids] = torch.where(capped, front_cap / max(self.cap_base, 1e-6),
                                                   torch.ones_like(self.opp_scale[ids]))
                 self.speed_cap[ids] = self.cap_base * self.cap_scale[ids]
-        if self.procedural is not None:
-            # Before the spawn, not after: `sample_spawn` rejects poses that land inside a prop and
-            # walks the lap until one is clear, and it has to test against the layout the car is
-            # about to drive rather than the one it just crashed out of.
-            if self.M == 1:
-                self.procedural.redraw(self.sim.tid[ids], ids, torch.arange(n, device=self.device))
-            else:
-                # One layout per race, not per car. The cars of a race share a track and see each
-                # other; giving them different crates would have car 0 collide with a box car 1
-                # cannot see. A race redraws only when it resets as a whole -- a single car
-                # respawning behind its mates keeps the layout the race is running, exactly as it
-                # keeps the race's track.
-                races = torch.nonzero(full).flatten()
-                if races.numel():
-                    rows = (races[:, None] * self.M + torch.arange(self.M, device=self.device)[None]).reshape(-1)
-                    src = torch.arange(races.numel(), device=self.device).repeat_interleave(self.M)
-                    self.procedural.redraw(self.sim.tid[races * self.M], rows, src)
-        poses = self.sim.sample_spawn(n, e.spawn_lateral_std, e.spawn_yaw_std, s=s, tid=self.sim.tid[ids], min_clearance=e.spawn_min_clearance,
-                                      eid=ids)
+        poses = self.sim.sample_spawn(n, e.spawn_lateral_std, yaw_std, s=s, tid=self.sim.tid[ids],
+                                      min_clearance=min_clear, lat=lat, eid=ids)
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
         self.sim.reset(ids, poses, speed)
         self.sim.odom.state[ids, 3] = speed
@@ -532,6 +840,10 @@ class F1VecEnv:
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         if self.events is not None:
             self.events.reset(ids)                                  # a respawned car starts with no event
+        if self.pool is not None:
+            # A pool checkpoint may carry memory: a hidden state kept across a respawn is a policy
+            # remembering a track its car is no longer on.
+            self.pool.reset(ids)
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
@@ -554,6 +866,49 @@ class F1VecEnv:
 
         return scan, scan_true, scan_type
 
+    def _redraw_layouts(self, ids: torch.Tensor, n: int, full: Optional[torch.Tensor] = None) -> None:
+        """Draw a fresh obstacle layout for the envs that are resetting. No-op when off.
+
+        Called *before* the grid is laid out rather than just before the spawn, for two reasons.
+        `sample_spawn` rejects a pose that lands inside a prop and walks the lap until one is clear,
+        so it has to test the layout the car is about to drive rather than the one it just crashed
+        out of. And an abreast grid (`spawn_order`) has to be tested against those same crates,
+        which the lane's own distance field cannot see -- so the layout has to exist by the time
+        `_reset_envs` decides whether the grid fits.
+        """
+        if self.procedural is None:
+            return
+        if self.M == 1:
+            self.procedural.redraw(self.sim.tid[ids], ids, torch.arange(n, device=self.device))
+            return
+        # One layout per race, not per car. The cars of a race share a track and see each other;
+        # giving them different crates would have car 0 collide with a box car 1 cannot see. A race
+        # redraws only when it resets as a whole -- a single car respawning behind its mates keeps
+        # the layout the race is running, exactly as it keeps the race's track.
+        races = torch.nonzero(full).flatten()
+        if races.numel():
+            rows = (races[:, None] * self.M + torch.arange(self.M, device=self.device)[None]).reshape(-1)
+            src = torch.arange(races.numel(), device=self.device).repeat_interleave(self.M)
+            self.procedural.redraw(self.sim.tid[races * self.M], rows, src)
+
+    def _spawn_order(self, ids: torch.Tensor, race: torch.Tensor, is_full: torch.Tensor,
+                     n_races: int, gen: torch.Generator) -> torch.Tensor:
+        """(n,) grid each resetting car's race is on, from `SPAWN_ORDER_ID`.
+
+        Drawn per race and remembered, so a car respawning mid-race rejoins the grid its race was
+        started on. `behind` -- every race trained before this -- draws nothing and returns zeros,
+        which is what keeps an unflagged run bit-identical.
+        """
+        if self.ecfg.spawn_order == "behind":
+            return torch.zeros(ids.numel(), dtype=torch.long, device=self.device)
+        if self.ecfg.spawn_order == "random":
+            pick = torch.randint(3, (n_races,), device=self.device, generator=gen)
+        else:
+            pick = torch.full((n_races,), SPAWN_ORDER_ID[self.ecfg.spawn_order],
+                              dtype=torch.long, device=self.device)
+        self.spawn_order_race[ids] = torch.where(is_full, pick[race], self.spawn_order_race[ids])
+        return self.spawn_order_race[ids]
+
     def _reset_result(self, r: StepResult, ids: torch.Tensor, scans: tuple[torch.Tensor, ...]) -> StepResult:
         """Refresh reset rows without advancing any car or mutating transition info."""
         current = replace(r, **{f.name: value.clone() for f in fields(r)
@@ -573,18 +928,43 @@ class F1VecEnv:
         return current
 
     def _opponent_actions(self, action: torch.Tensor) -> torch.Tensor:
-        if self.M == 1 or self.ecfg.opponent not in ("teacher", "mixed"):
+        if self.M == 1 or self.ecfg.opponent not in ("teacher", "mixed", "pool"):
             return action
-        if self.teacher is None:
-            raise RuntimeError("opponent == 'teacher' needs env.set_teacher(RacelineTeacher)")
         ev_speed, ev_off = None, None
         if self.events is not None:
-            # The gate is read fresh rather than cached: in "mixed" mode which cars are teacher-driven
-            # is redrawn at every race reset, and a stale gate would script a car the policy is driving.
-            self.events.set_gate(~self.on_policy)
+            # The gate is read fresh rather than cached: in "mixed" and "pool" mode which cars are
+            # teacher-driven is redrawn at every race reset, and a stale gate would script a car the
+            # policy is driving.
+            self.events.set_gate(self.teacher_driven)
             self.events.step()
+            if self.events.react_on:
+                # The reactive half, after the timed one and before either is read: what it needs is
+                # where the learner is *now*, which is the state this step's command will act on.
+                self.events.step_reactive(self.learner_view())
             ev_speed, ev_off = self.events.speed_scale(), self.events.lateral_offset()
+        out = action
+        if self.pool is not None:
+            obs = self._opponent_obs()
+            if obs is not None:
+                # No gradient, and on the observation the policy itself last saw: a pool opponent
+                # is a checkpoint driving the same car in the same race, not a privileged
+                # controller.
+                with torch.no_grad():
+                    out = torch.where(self.pool_driven[:, None],
+                                      self.pool.act(obs, self.opp_driver), out)
+        if not self.teacher_any:
+            return out
+        if self.teacher is None:
+            raise RuntimeError(f"opponent == {self.ecfg.opponent!r} needs env.set_teacher(RacelineTeacher)")
         follow, v_cap = self.follow_cap(self.sim.state)
+        if self.events is not None:
+            blind = self.events.oblivious_mask()
+            if blind is not None:
+                # The one behaviour that makes an opponent *more* dangerous rather than less. It is
+                # subtracted from the follow mask rather than added to the command, so the "an event
+                # never lifts an opponent over its follow cap" invariant is untouched: this car
+                # never had a cap to be lifted over.
+                follow = follow & ~blind
         if self.act_dim == 2:
             cmd = self.teacher(self.sim.state, self.sim.P, self.sim.tid, offset=ev_off)
             v = cmd[:, 1] * self.opp_scale
@@ -602,7 +982,22 @@ class F1VecEnv:
                 an[:, -2:] = (ev_speed[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
             cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
             an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
-        return torch.where(self.on_policy[:, None], action, an)
+        return torch.where(self.teacher_driven[:, None], an, out)
+
+    def _opponent_obs(self):
+        """The observation a pool opponent acts on, or None before one exists.
+
+        After `reset()` this is always the observation the caller was last handed, which is the one
+        the learner's own policy saw -- the pool is asked for its action at the top of `step()`,
+        before any new observation exists. None happens on exactly two kinds of step, both thrown
+        away by construction: `sim.warmup()`'s throw-away steps, and the one
+        `learn.graph_runtime.prepare_graph_runtime` takes to record the solver's arguments, neither
+        of which has run a reset yet. The pool sits those out rather than being handed a zeroed
+        observation, which would be a policy driving on a scan that says "no returns anywhere".
+        """
+        if self._last_obs is not None:
+            return self._last_obs
+        return None if self.last_result is None else self._obs(self.last_result)
 
     def follow_cap(self, state: torch.Tensor):
         """(is there a car within opp_follow_gap ahead of each car, the speed to hold behind it)."""
@@ -641,6 +1036,7 @@ class F1VecEnv:
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
             self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.act_dim, device=self.device)], 1)[:, None, :]
             obs = self._obs(r)
+        self._last_obs = obs
         return obs, {"priv": self._priv(r)}
 
     def step(self, action: torch.Tensor):
@@ -724,6 +1120,7 @@ class F1VecEnv:
             r = self._reset_result(r, ids, scans)
             obs = self._obs(r)
         self.last_result = r
+        self._last_obs = obs
         return obs, reward, terminated, truncated, info
 
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
