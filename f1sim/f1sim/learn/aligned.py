@@ -32,6 +32,10 @@ car, and `f1sim_ros/policy_node.py` feeds it from the same three sensors it alre
 3. It is expressed in the *current* sensor plane by the inverse of the current tilt. A point whose
    out-of-plane offset then exceeds `z_tol` is dropped: the current scan cannot see it, so there is
    nothing to compare it against and pretending otherwise is how tilt turns into a false detection.
+   Both tilts are taken **relative to their own midpoint**, so only the CHANGE in attitude enters and
+   a constant bias in the estimate cannot rotate the ego's motion out of the plane it happened in --
+   which matters, because that estimate is biased and drifts (`AlignedScan.__call__` has the
+   numbers).
 4. The surviving points are scattered into the current beam grid by bearing, nearest beam, keeping
    the closest -- the same "nearest return wins" the sensor itself applies.
 
@@ -598,8 +602,22 @@ class AlignedScan:
         self._advance(scan_now, motion, dt)
         a, b = compose_stack(self.inc_p[self._order], self.inc_yaw[self._order])
         old = self._oldest
-        warped, known, bound = warp_scan(self.scans[old] * self.range_max, self.att[old],
-                                         self.att[self._scan_head], a, b, self.angles,
+        # Only how the attitude CHANGED, never its absolute value: the two attitudes are taken
+        # relative to their own midpoint, which preserves the difference exactly and removes
+        # whatever bias they share. The measured reason is that the attitude channel is biased and
+        # drifts -- in simulation its |roll, pitch| rms over a rollout is about 11 deg, and five of
+        # the thirteen competition recordings swing past 40 deg (one to 178) while their quaternion
+        # stays unit-norm. Fed the absolute value, the warp applies the ego's planar motion in a
+        # frame tilted by that bias, and the out-of-plane test then throws away points the current
+        # scan can see perfectly well. Measured on a clean recording: coverage 70.3 % -> 82.1 % of
+        # beams and the static-scene false-positive rate 2.89 % -> 2.67 %.
+        #
+        # It is also the more honest frame. The ego motion is measured in the car's OWN axes -- the
+        # wheel speed along body x, the yaw rate about body z -- so the plane the arcs are integrated
+        # in is the car's own mean attitude over the interval, not a level plane nobody measured.
+        mid = 0.5 * (self.att[old] + self.att[self._scan_head])
+        warped, known, bound = warp_scan(self.scans[old] * self.range_max, self.att[old] - mid,
+                                         self.att[self._scan_head] - mid, a, b, self.angles,
                                          self.range_max, self.z_tol, self.gap_fill, self.unit)
         now_m = scan_now * self.range_max
         raw, known = residual(now_m, warped, known, bound, self.tol_beams,

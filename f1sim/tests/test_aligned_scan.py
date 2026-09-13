@@ -66,15 +66,20 @@ def ring_scan(pose, att=(0.0, 0.0), discs=(), radius: float = 8.0, height: float
 
 
 def drive(steps: int, v: float = 6.0, w: float = 0.0, att=lambda i: (0.0, 0.0), discs=lambda i: (),
-          spec=None, use_tilt: bool = True, radius: float = 8.0):
-    """Run the channel along a trajectory and return the rows of every step."""
+          spec=None, use_tilt: bool = True, radius: float = 8.0, att_bias=(0.0, 0.0)):
+    """Run the channel along a trajectory and return the rows of every step.
+
+    `att_bias` is added to the attitude the CHANNEL is told about and not to the one the scan is
+    generated from: that is a bias in the estimate, which is the thing the warp has to be immune to.
+    """
     arm = AlignedScan(N_BEAMS, 1, spec or {}, dt=DT, range_max=RANGE_MAX)
     x = y = th = 0.0
     out = []
     for i in range(steps):
         a = att(i)
         r = ring_scan((x, y, th), a, discs(i), radius)
-        m = torch.tensor([[v, w, a[0] if use_tilt else 0.0, a[1] if use_tilt else 0.0]])
+        told = ((a[0] + att_bias[0], a[1] + att_bias[1]) if use_tilt else (0.0, 0.0))
+        m = torch.tensor([[v, w, told[0], told[1]]])
         out.append({k: t[0] * RANGE_MAX for k, t in arm((r / RANGE_MAX)[None], m).items()})
         th += w * DT
         x += v * DT * math.cos(th)
@@ -140,6 +145,24 @@ def test_tilt_compensation_beats_ignoring_it():
     off = drive(14, v=6.0, att=att, use_tilt=False)
     err = lambda rows: float(torch.stack([r["aligned"].abs() for r in rows[6:]]).mean())
     assert err(on) < err(off), (err(on), err(off))
+
+
+def test_a_constant_attitude_bias_changes_nothing():
+    """The warp uses how the tilt CHANGED, so a constant offset on the estimate is invisible to it.
+
+    Not a nicety: the VESC attitude estimate carries a bias and drifts (11 deg rms in simulation,
+    past 40 deg in five of thirteen competition recordings). A warp that used the absolute value
+    would apply the ego's planar motion in a frame tilted by that bias and throw away, as
+    out-of-plane, points the current scan can see.
+    """
+    wobble = lambda i: (math.radians(1.0) * math.sin(i * 0.8), math.radians(1.0) * math.cos(i * 0.6))
+    # Same world, same scans, same trajectory; only what the channel is TOLD about the attitude
+    # differs, by a constant. Every row must come out identical.
+    a = drive(14, v=6.0, w=0.8, att=wobble)
+    b = drive(14, v=6.0, w=0.8, att=wobble, att_bias=(math.radians(9.0), math.radians(-6.0)))
+    for i in range(6, 14):
+        for row in ("aligned", "aligned_prev", "aligned_valid"):
+            assert torch.allclose(a[i][row], b[i][row], atol=1e-5), (i, row)
 
 
 def test_the_warp_uses_the_measured_motion_and_not_a_guess():
