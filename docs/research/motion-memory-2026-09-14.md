@@ -300,6 +300,33 @@ Two readings worth separating:
   use, and it is also the strongest evidence available here that a good part of the 3.8 % on the bags
   is real motion the channel is right to report.
 
+### The floor beside something to find
+
+A false-positive rate on a scene where the right answer is zero everywhere is half a number. The
+other half is the same channel, the same tracks, the same policy, the same threshold, with two
+teacher opponents in the race (`work/e2/signal.sh`):
+
+| | solo (the floor) | race size 3 |
+|---|---|---|
+| bins with a prediction | 72.4 % | 74.5 % |
+| over τ | 7.8 % | 8.3 % |
+| surviving the consistency test | 5.00 % | 5.49 % |
+| flagged beams per scan | 10.0 | 10.9 |
+| **median \|residual\| of the survivors** | **0.050 m** | **0.270 m** |
+| their p68 / p90 | 0.145 / 1.015 m | 0.730 / 2.430 m |
+| run lengths | p50 2, p90 8 | p50 2, p90 9 |
+
+**The discrimination is in magnitude, not in count.** Putting two cars in the scene barely changes
+how many beams the channel flags (5.00 % → 5.49 %) or how they are shaped, but it moves the median
+survivor from 5 cm to 27 cm and the p90 from 1.0 m to 2.4 m. That is the right shape for a signal
+fed to a convolutional stem: the floor is small-magnitude noise scattered in short runs, and a car is
+a *large* residual in the same places a small one could have been. It also says the consistency test
+and τ are not what separate signal from floor — the value is.
+
+A corollary worth naming: **counting flagged beams is the wrong summary of this channel**, and the
+3.8 % / 4.9 % floors above should be read with that in mind. They bound how often the channel says
+*something*; they do not bound how often it says something a policy would act on.
+
 **The warp is doing the work it claims.** On a clean recording, with everything else fixed, the share
 of beams surviving the gate moves as:
 
