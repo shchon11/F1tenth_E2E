@@ -144,11 +144,18 @@ class Lidar:
         self._rays = self.rays
         # `ray_prisms_hits` walks its prop slots in a Python loop of ~20 elementwise ops over
         # `(B, N, k_pad)`, and eagerly that is a kernel launch and a full round trip to memory for
-        # every one of them: measured on an RTX 4060 Ti at B=256 x 1081 beams, 82.4 ms per call at
-        # 52 slots, against 17.7 ms for the whole rest of the step. Inductor fuses the chain into
-        # one kernel per slot and the same call takes 2.70 ms -- 30x, with bit-identical ranges and
-        # hit masks. The per-track `+props` catalogue never made this worth doing (three props, four
-        # slots); a procedural layout redrawn per env is thirteen times that.
+        # every one of them: measured on an RTX 4060 Ti at B=256 x 1081 beams, 84.4 ms per call at
+        # 52 slots, against a 53 ms step with no props at all. Inductor fuses the chain into one
+        # kernel per slot and the same call takes 3.34 ms -- 25x. The per-track `+props` catalogue
+        # never made this worth doing (three props, four slots); a procedural layout redrawn per env
+        # is thirteen times that.
+        #
+        # Fused is not bit-for-bit: reassociated float32 arithmetic moves a range by up to 1.9 um
+        # (mean 0.15 um) over 276 736 beams. Which beams *hit* is identical -- zero disagreements in
+        # the hit mask at 16 and at 52 slots -- so no beam changes what it struck, only the last
+        # digits of how far. That is four orders of magnitude below the 1 cm range noise the sensor
+        # model adds anyway, but it is a change to the existing `+props` path and is written down
+        # rather than called identical.
         self._prisms = ray_prisms_hits
         if compile and self.device.type == "cuda":
             try:
