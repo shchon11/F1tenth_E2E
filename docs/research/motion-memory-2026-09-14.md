@@ -349,6 +349,36 @@ and the two arms do not even share their GRU initialisation (below).
 **The channel costs nothing measurable in training.** 335 median env steps/s either way at 63 envs;
 its cost is in the per-step inference budget, where it is 0.57 ms (see Budget), not in the rollout.
 
+### The second table: the racing proxy
+
+The addendum asks for this separately from the representation, so that *"Δv R² up but racing flat"*
+is a reportable outcome rather than an unasked question. `evaluate --protocol rolling` in traffic on
+the smoke's own three tracks, one fixed seed, 2400 steps × 96 cars, teacher opponents with all seven
+behaviours — and note that `--per-track` is one full evaluation **per track**, so each arm is three
+runs pooled by the learner-minutes behind them (`work/e2/proxy.md`).
+
+| | A: `memory,edges` | B: + the three aligned rows |
+|---|---|---|
+| collisions / km ↓ | **16.6** | 19.5 |
+| wall collisions ↓ | **116** | 186 |
+| car contacts / learner-min ↓ | **3.15** | 3.33 |
+| passes / learner-min ↑ | 2.48 | **2.70** |
+| mean speed [m/s] ↑ | 4.77 | **4.86** |
+| lap time [s] ↓ | 14.5 | **14.0** |
+| pace vs the opponents ↑ | 1.361 | **1.377** |
+| share of time in contention | 73.9 % | 72.7 % |
+
+**The two halves of this table disagree, and so does it with the training log.** Arm B is the faster
+policy — quicker laps, higher mean speed, more passes held — and it crashes more, mostly into walls
+(186 against 116). That is the ordinary speed-for-safety trade and not a statement about
+representations. And during training the ordering was the other way round: arm B ended the smoke at
+18.5 collisions/km against A's 23.6.
+
+The honest reading is that **at 262144 env steps the racing numbers are noise**, which is what the
+smoke was said in advance not to be able to answer. The table is here because the addendum asks for
+it to exist before anyone is tempted to infer racing from a probe, and what it shows is exactly why:
+one seed, one protocol, and a direction that flips between the training log and the evaluation.
+
 ### A confound in the smoke arms, measured rather than assumed
 
 The two E2 smoke arms differ by one flag, and by one thing nobody asked for: **their fresh GRUs are
