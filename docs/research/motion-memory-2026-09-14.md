@@ -338,6 +338,27 @@ the convolutions do. It is 2.3 % of the car's 25 ms step as measured; if the Jet
 remedy is fusing the channel, not shrinking it.
 
 
+### A confound in the smoke arms, measured rather than assumed
+
+The two E2 smoke arms differ by one flag, and by one thing nobody asked for: **their fresh GRUs are
+differently initialised**. Adding three input columns widens the scan stem's first convolution, which
+consumes a different number of draws from the ambient generator, so every module built after it —
+including the actor's and the critic's GRU, the only tensors a warm start leaves fresh — gets
+different random numbers from the same `--seed`. Checked directly rather than reasoned about: with
+`--seed 701` the two arms' `actor.memory.gru.weight_ih_l0` differ by up to 0.176, while every weight
+copied from the frozen original is bit-identical.
+
+It does not touch the probe — each arm is probed as itself, and the E1 table's `gru_warm` column
+already says what a *random* recurrence is worth on these targets — and at 131 updates it is far
+below the noise on any of the health metrics. It does mean the smoke cannot be read as "one flag,
+everything else held". The same applies to the memory-policy and future-head smokes' channel arms,
+which were built the same way.
+
+The fix, if an arm ever has to carry a result: seed a warm start's fresh tensors from their own
+NAMES rather than from the ambient generator, so that a module of the same shape is initialised the
+same way whatever was built before it. Not done here — changing the initialisation discipline
+between one arm and the next would replace this confound with a worse one.
+
 ## E3 — a second state, and the auxiliaries that are allowed to shape it
 
 ### Why the state is split rather than asked for more
