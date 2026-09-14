@@ -176,6 +176,38 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
 
 
+def kl_reference_is_baseline(ref, memory_on: bool, kl_coef: float, init: str = "") -> bool:
+    """Is the KL reference actor the frozen FEEDFORWARD baseline the leash needs? Raises if it has
+    to be and is not.
+
+    `minibatch_losses` evaluates the reference with the recurrence switched off, so the copy taken
+    at the top of a run is the original only if the memory projection was still zero when it was
+    taken -- i.e. before any update. A checkpoint whose memory is already trained cannot supply
+    one: a DAgger student distilled into a recurrent actor, or leg two of a recurrent run.
+
+    Which is fatal only if something is actually leashed to it. At `--kl-coef 0` nothing is:
+    `kl_ref` is multiplied by zero and survives as a logged diagnostic, and a diagnostic measured
+    against the policy this leg started from is a meaningful quantity. It is just not a distance
+    from the frozen original, so the run says so out loud and records which it is
+    (`experiment["kl_reference"]`) rather than letting a chart imply the wrong one.
+    """
+    trained = bool(memory_on and ref.memory is not None
+                   and float(ref.memory.out.weight.detach().abs().max()) != 0.0)
+    if not trained:
+        return True
+    if kl_coef > 0:
+        raise RuntimeError(
+            f"--kl-coef {kl_coef} leashes this run to a reference actor, and that reference has to "
+            f"be the frozen FEEDFORWARD baseline -- but {os.path.basename(str(init)) or 'this init'} "
+            f"already carries a trained memory projection, so the copy taken here is not one. "
+            f"Resume a recurrent checkpoint with --kl-coef 0, or leash a run that starts from the "
+            f"feedforward original.")
+    print("NOTE: this run resumes a trained memory projection, so the KL reference is NOT the "
+          "frozen original. --kl-coef is 0, so nothing is leashed to it; the logged `kl_ref` is "
+          "the distance from the memoryless evaluation of the policy THIS LEG STARTED FROM.")
+    return False
+
+
 def warm_start_additions(init_meta: dict, memory, scan_channels, future_head):
     """The architecture pieces `--init` does NOT already carry, i.e. what a warm start would add.
 
@@ -678,13 +710,7 @@ def main():
     # different policies and the comparison would be between leashes, not conditioning.
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters(): p_.requires_grad_(False)
-    if memory_on and ref.memory is not None and float(ref.memory.out.weight.detach().abs().max()) != 0.0:
-        # Same argument as the conditioning check below, one projection further: the leash's
-        # reference is the FEEDFORWARD original, and `minibatch_losses` evaluates it with the
-        # recurrence switched off. That is only the original if the projection was still zero when
-        # this copy was taken -- i.e. before any update.
-        raise RuntimeError("the KL reference actor was captured after the memory projection had "
-                           "trained; it must be the frozen feedforward baseline")
+    ref_is_baseline = kl_reference_is_baseline(ref, memory_on, a.kl_coef, a.init)
     if cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
@@ -693,6 +719,9 @@ def main():
     #: What this run was, recorded in every checkpoint it writes so a result traces back to its arm,
     #: its normalization and its adapter without consulting a shell history.
     experiment_meta = {
+        # What `kl_ref` in this run's logs is measured against, so a chart is never read as a
+        # distance from the frozen original when it is not one.
+        "kl_reference": "frozen_feedforward_baseline" if ref_is_baseline else "leg_start_memoryless",
         "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),

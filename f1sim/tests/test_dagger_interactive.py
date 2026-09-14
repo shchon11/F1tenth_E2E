@@ -170,3 +170,22 @@ def test_the_interactive_teacher_fits_its_three_times_budget(envs):
     ratios = sorted(block(lambda: env.teacher_label(it)) / block(lambda: env.teacher_label(rt))
                     for _ in range(3))
     assert ratios[1] < 3.0, f"interactive / raceline = {ratios[1]:.2f}x (median of {ratios})"
+
+
+def test_a_resumed_memory_projection_is_only_fatal_when_something_is_leashed_to_it():
+    """PPO's KL reference is evaluated with the recurrence off, so it is the frozen original only
+    while the memory projection is still zero. A DAgger student distilled into a recurrent actor
+    cannot supply one -- and that matters exactly when `--kl-coef` is positive."""
+    from f1sim.learn.ppo import kl_reference_is_baseline
+    fresh = ActorCritic(n_stack=2, n_beams=64, proprio_dim=5, priv_dim=9, act_dim=8,
+                        scan_stem="plain", memory=memory_spec(hidden_size=8)).actor
+    assert float(fresh.memory.out.weight.abs().max()) == 0.0
+    assert kl_reference_is_baseline(fresh, True, 0.3) is True
+    torch.nn.init.normal_(fresh.memory.out.weight, std=0.1)
+    assert kl_reference_is_baseline(fresh, True, 0.0) is False        # logged, not leashed
+    with pytest.raises(RuntimeError, match="frozen FEEDFORWARD baseline"):
+        kl_reference_is_baseline(fresh, True, 0.05)
+    # and a feedforward run is untouched either way
+    ff = ActorCritic(n_stack=2, n_beams=64, proprio_dim=5, priv_dim=9, act_dim=8,
+                     scan_stem="plain").actor
+    assert kl_reference_is_baseline(ff, False, 0.3) is True
