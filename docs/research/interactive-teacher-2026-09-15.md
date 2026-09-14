@@ -299,7 +299,68 @@ is going to be.
 licenses the distillation, and it says nothing about whether a LiDAR-only policy can reproduce any
 of it.
 
-PENDING-D2-T
+### Suite v2.1, family T — 60 of the 80 frozen cells
+
+Driven on the scoring path: the frozen suite's own cells, the adapter's env, the routed tracker, the
+declared friction and seeds, the derived 3-lap budget, and `benchmark.runner.run_cell` — the same
+function a leaderboard row comes from. The driver is a privileged teacher, so nothing here is a
+leaderboard row and nothing was written to `results/`.
+
+**Both arms ran the same 60 cells in the same order and both died at cell 61** with the same CUDA
+illegal memory access, so this is a paired and equal comparison over 60 cells — and the `pair`
+scenario (cells 61–80, race size 3) is entirely missing. See the section below.
+
+| clean traffic runs | raceline | interactive |
+|---|---|---|
+| `slow` (20 cells) | 0 / 160 | **142 / 160** |
+| `pace` (20 cells) | 14 / 160 | **156 / 160** |
+| `event` (20 cells) | 7 / 160 | **57 / 160** |
+| **total** | **21 / 480** | **355 / 480** |
+| passes | 5 | **34** |
+
+A clean run is a trial with no wall contact and no car contact. The raceline teacher manages 21 of
+480 against reactive-free frozen opponents on held-out maps; the interactive teacher manages 355.
+`slow` — a clearly slower car on the racing line, the cell where a pass is most plainly available —
+goes from **zero** clean runs in 160 to 142.
+
+### The gate
+
+`work/gate.md`, as amended on 2026-09-15 at 00:05, before either measurement existed:
+
+> pass if, with both seeds agreeing in sign, **at least one of** {passes held per learner-minute up
+> by more than 0.1; clean traffic runs up} moves in the interactive teacher's favour, **and neither**
+> car contacts per learner-minute (resolution 0.35) **nor** wall collisions per learner-minute (0.1)
+> is worse beyond its resolution, **and** family-T clean runs are not lower.
+
+Every clause is satisfied, and the two that carry the decision — the OR branch and both guards —
+come from the proxy, which ran in full. **The gate passes.** The distillation is licensed.
+
+The amendment earned its place. Written to make completions count as out-racing and not only passes,
+it is what covers the result that actually turned out largest: a teacher whose contacts fall by more
+than half would have failed a passes-only rule while plainly out-racing the thing it was compared
+against.
+
+### The 20 cells that did not run
+
+Cells 61–80 are the `pair` scenario — race size 3 in the benchmark's env. Both teacher arms crashed
+there with `CUDA error: an illegal memory access was encountered`, surfacing at `sim.py:483`, which
+for an asynchronous CUDA fault is where it was noticed and not where it happened.
+
+What is known:
+
+* it is **deterministic** — the same cell, for both arms, on independent runs;
+* the **raceline** arm crashed too, and that arm's label path touches none of this branch's new code;
+* the same cells run **clean on CPU** (`pair` on `real:map16x07`, both frictions, 2 learners);
+* race size 3 on CUDA is **not** broken in general: the proxy ran it for 2.2 h at 96 envs without
+  incident. The difference is the benchmark's own env configuration — randomisation off, sensor
+  noise off, no simulator compile, a `RoutedTracker` installed — at race size 3;
+* the T family's feasibility was proven on `--device cpu` (`overtake-suite`'s report, §8), and that
+  report notes the first v2.1 numbers would be a GPU job. This path has plausibly never been run on
+  the card before.
+
+That is a bug report, not a diagnosis. The decisive test — one `pair` cell on CUDA at base main,
+with `CUDA_LAUNCH_BLOCKING=1` — needs the card, and the card went to worker 16 the moment D2
+finished.
 
 ## Distilling it
 
