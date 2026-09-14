@@ -48,6 +48,18 @@ def main():
     a = ap.parse_args()
     model, extra = load_checkpoint(a.ckpt, "cpu"); model.eval()
     spec = extra.get("spec", {})
+    if spec.get("opp_token"):
+        # An oracle is not a deployment target. The block is the other cars' exact position,
+        # velocity and future, read out of the simulator; nothing on the car produces it, so an
+        # exported graph would either be fed zeros -- a policy driving on an input that is always
+        # "no car" -- or fed something invented. Refused here rather than at the ROS node alone,
+        # because an .onnx outlives the checkpoint it came from.
+        raise SystemExit(
+            f"{os.path.basename(a.ckpt)} was trained with the privileged opponent block "
+            f"(opp_token={spec['opp_token']!r}, future model "
+            f"{spec.get('opp_future_model', 'plan')!r}). It is an oracle: the simulator's own "
+            f"ground truth about the other cars, which no sensor on the car can measure. This "
+            f"checkpoint is a measurement, not a deployable policy, and will not be exported.")
     k, N, P = model.meta["n_stack"], model.meta["n_beams"], model.meta["proprio_dim"]
     out = a.out or os.path.splitext(a.ckpt)[0] + ".onnx"
     channels = list((model.meta.get("scan_channels") or {}).get("channels") or ())
