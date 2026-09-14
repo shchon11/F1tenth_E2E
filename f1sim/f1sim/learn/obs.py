@@ -167,7 +167,7 @@ class ObsSpec:
     opp_token: str = ""           # privileged opponent block (`gym_env.OPP_TOKEN_MODES`): "" off,
                                   # else "pos" / "posvel" / "future". An ORACLE input: `learn.export`
                                   # and `f1sim_ros.policy_node` refuse a checkpoint that declares one.
-    opp_future_model: str = "plan"  # which prediction its "future" columns came from
+    opp_future_model: str = "hybrid"  # which prediction its "future" columns came from
                                   # (`gym_env.OPP_FUTURE_MODELS`) -- recorded because the same
                                   # columns under two models are two different inputs
     range_max: float = 10.0

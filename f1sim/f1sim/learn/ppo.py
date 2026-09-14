@@ -431,7 +431,7 @@ def main():
                          "and a score obtained with it is not comparable with any that was not. The "
                          "columns are zero-initialised on a warm start, so the run starts as the "
                          "checkpoint it came from and learns to use them")
-    ap.add_argument("--opp-future-model", default="plan", choices=list(OPP_FUTURE_MODELS),
+    ap.add_argument("--opp-future-model", default=EnvConfig.opp_future_model, choices=list(OPP_FUTURE_MODELS),
                     help="which prediction the block's 'future' columns carry "
                          "(f1sim.gym_env.OPP_FUTURE_MODELS); recorded in the spec, because the same "
                          "columns under two models are two different inputs")

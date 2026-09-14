@@ -344,7 +344,10 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
                      # Only ever non-empty under `allow_oracle`, and then the caller has already
                      # accepted that what it is about to measure is not a suite row.
                      opp_token=(str(spec.get("opp_token") or "") if allow_oracle else ""),
-                     opp_future_model=str(spec.get("opp_future_model") or "plan"),
+                     # Whatever the checkpoint recorded; the env's own default otherwise, so a
+                     # cell never silently measures a prediction nothing in the tree still uses.
+                     **({"opp_future_model": str(spec["opp_future_model"])}
+                        if spec.get("opp_future_model") else {}),
                      compile_tracker=bool(suite.get("compile_tracker", False)))
     if race_size > 1 and opponent == "teacher" and rls is None:
         raise AdapterError("a teacher-opponent race needs racelines; pass racelines= or names")

@@ -135,6 +135,10 @@ def main() -> None:
     ap.add_argument("--opp-speed", type=float, nargs=2, default=(0.6, 1.15))
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--times", default="",
+                    help="comma-separated horizons [s]; default is gym_env.OPP_FUTURE_TIMES. Each "
+                         "has to be a whole number of control steps")
+    ap.add_argument("--models", default=",".join(OPP_FUTURE_MODELS))
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     from ..params import Config
@@ -153,7 +157,9 @@ def main() -> None:
     env.sim.warmup()
     teacher = common.make_teacher(rls, env)
     policy = lambda obs: env.teacher_label(teacher)
-    res = measure(env, policy, a.steps)
+    times = tuple(float(x) for x in a.times.split(",") if x) or OPP_FUTURE_TIMES
+    models = tuple(m for m in a.models.split(",") if m)
+    res = measure(env, policy, a.steps, models=models, times=times)
     res["config"] = {"tracks": names, "envs": a.envs, "race_size": a.race_size,
                      "opponent": a.opponent, "opp_events": list(ev), "opp_event_rate": a.opp_event_rate}
     print(render(res))

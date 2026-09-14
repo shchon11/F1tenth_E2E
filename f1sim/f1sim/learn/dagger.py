@@ -290,7 +290,7 @@ def main():
                          "position ('pos'), velocity ('posvel') and future ('future'), from the simulator. "
                          "Refused by the exporter and by the ROS node; a checkpoint trained with it is a "
                          "measurement, not a policy")
-    ap.add_argument("--opp-future-model", default="plan", choices=list(OPP_FUTURE_MODELS),
+    ap.add_argument("--opp-future-model", default=EnvConfig.opp_future_model, choices=list(OPP_FUTURE_MODELS),
                     help="which prediction the 'future' columns and the interactive teacher read "
                          "(f1sim.gym_env.OPP_FUTURE_MODELS)")
     ap.add_argument("--memory", default="off", choices=("off", "gru"),

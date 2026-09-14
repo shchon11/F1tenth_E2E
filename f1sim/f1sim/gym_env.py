@@ -83,9 +83,15 @@ OPP_FUTURE_REJOIN_M = 2.0
 #:               given, so it knows the plan's braking and its lane change without being told, and
 #:               it is what worker 16's `--opp-token future` uses. What it cannot know is that a
 #:               scheduled event will EXPIRE, or anything at all beyond 0.6 s.
+#:   "hybrid" -- the tracker's rollout inside its own horizon and the raceline walk's increments
+#:               beyond it, anchored so the two meet. THE DEFAULT, and the measurement is in
+#:               `docs/research/interactive-teacher-2026-09-15.md`: the tracker's rollout is three
+#:               times more accurate than the walk wherever it reaches, because it is the plan the
+#:               car was actually given rather than a reconstruction of it, and past 0.6 s it is a
+#:               straight line on a curving track while the walk still follows the road.
 #:   "constv" -- world-frame constant velocity from the current state. The floor every other model
 #:               has to beat, and what a caller with no teacher gets.
-OPP_FUTURE_MODELS = ("plan", "pred", "constv")
+OPP_FUTURE_MODELS = ("hybrid", "plan", "pred", "constv")
 
 #: The privileged opponent block (`EnvConfig.opp_token`), an *oracle input*: it is refused by the
 #: exporter and by `f1sim_ros.policy_node`, because no car can measure it.
@@ -421,7 +427,7 @@ class EnvConfig:
     # Which prediction `car_future` (and so the "future" columns of the block) uses -- see
     # `OPP_FUTURE_MODELS`. Recorded in the spec next to the mode, because "the opponent's future"
     # under two different models is two different labels.
-    opp_future_model: str = "plan"
+    opp_future_model: str = "hybrid"
     # Obstacle layouts redrawn per env at every reset (f1sim.procedural_obstacles). 0 = off, and off
     # is byte-identical to the env before they existed: nothing is allocated, nothing is drawn from
     # the generator and `props_for` returns exactly what it returned. The training set's obstacle
@@ -1511,12 +1517,35 @@ class F1VecEnv:
         pred = self._tracker_future(st, t)
         if mode == "pred":
             return out if pred is None else pred
+        if mode == "hybrid":
+            seam = self._tracker_seam()
+            if pred is None or seam is None or self.teacher is None:
+                return out if pred is None else pred
+            # Both models evaluated at the requested times AND at the seam, so the tail can be
+            # attached to the tracker's own endpoint rather than to the walk's -- otherwise the
+            # prediction would jump by the walk's error at the join, which is the error the tracker
+            # was brought in to avoid.
+            tt = torch.cat([t, t.new_full((1,), seam)])
+            pa, wa = self._tracker_future(st, tt), self._raceline_future(st, tt)
+            late = (t > seam)[None, :, None]
+            return torch.where(late, pa[:, -1:] + (wa[:, :-1] - wa[:, -1:]), pa[:, :-1])
         if self.teacher is not None and bool(self.teacher_driven.any()):
             walk = self._raceline_future(st, t)
             out = torch.where(self.teacher_driven[:, None, None], walk, out)
         if pred is not None:
             out = torch.where((~self.teacher_driven)[:, None, None], pred, out)
         return out
+
+    def _tracker_seam(self) -> Optional[float]:
+        """[s from now] the last instant the plan tracker's own rollout reaches, or None without one.
+
+        Past this the rollout is a straight line at its final heading and speed, which on a curving
+        track is where the raceline walk starts being the better answer.
+        """
+        if self.tracker is None or self.tracker.last_pred is None:
+            return None
+        dly = float(self.tracker.spec.delay) if self.tracker_delay is None else float(self.tracker_delay.mean())
+        return dly - self.sim.control_dt + (self.tracker.last_pred.shape[1] - 1) * self.tracker.spec.dt
 
     def _raceline_future(self, st: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """The teacher-driven walk of `car_future`, for every row (the caller selects)."""

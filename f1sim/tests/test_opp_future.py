@@ -92,7 +92,11 @@ def test_a_stopped_opponent_is_predicted_stopped():
     ev = env.events
     opp = torch.nonzero(env.teacher_driven).flatten()
     assert opp.numel(), "no teacher-driven opponent in this race"
-    travel = lambda: (env.car_future([0.75])[:, 0] - env.sim.state[:, :2]).norm(dim=1)
+    # `model="plan"` on purpose: this is a claim about the RACELINE WALK, which is the half of the
+    # default `hybrid` that knows an event has a duration. The tracker's rollout -- the other half,
+    # and everything inside its 0.6 s horizon -- is the plan the car was given on the PREVIOUS step,
+    # so an event set by hand after that step is legitimately not in it yet.
+    travel = lambda: (env.car_future([0.75], model="plan")[:, 0] - env.sim.state[:, :2]).norm(dim=1)
     free = travel()
     ev.kind[opp] = EVENT_ID["stop"]                 # a stop that has just begun and lasts 3 s
     ev.t[opp] = 0.0; ev.dur[opp] = 3.0; ev.p0[opp] = 0.0
@@ -129,9 +133,9 @@ def test_a_lane_change_is_predicted_off_the_line():
         tn = env.teacher.tan[env.sim.tid, idx]
         return -d[:, 0] * tn[:, 1] + d[:, 1] * tn[:, 0]
 
-    shifted = signed_off(env.car_future([0.75])[:, 0])
+    shifted = signed_off(env.car_future([0.75], model="plan")[:, 0])
     ev.kind[opp] = 0
-    plain = signed_off(env.car_future([0.75])[:, 0])
+    plain = signed_off(env.car_future([0.75], model="plan")[:, 0])
     moved = (shifted - plain)[opp]
     assert float(moved.min()) > 0.15, (
         f"a +0.35 m lane change moved the prediction by {moved.tolist()} m to the left")
@@ -315,3 +319,24 @@ def test_the_benchmark_adapter_refuses_an_oracle_checkpoint_by_default():
     plain = _env(token="")
     with pytest.raises(ma.AdapterError, match="observation spec"):
         ma.assert_env_matches_spec(plain, spec, allow_oracle=True)
+
+
+def test_the_hybrid_is_the_tracker_inside_its_horizon_and_the_road_beyond():
+    """The default model. Inside the plan tracker's own 0.6 s rollout it IS that rollout -- the plan
+    the car was actually given, which is three times more accurate than reconstructing it. Past the
+    seam the rollout is a straight line at its final heading, so the tail follows the raceline walk's
+    increments instead, attached to the tracker's endpoint rather than to the walk's."""
+    env = _env()
+    _drive(env, 10)
+    seam = env._tracker_seam()
+    assert seam is not None and 0.5 < seam < 0.7, seam
+    inside = [0.0, 0.1, 0.25, seam - 0.02]
+    hyb = env.car_future(inside, model="hybrid")
+    pred = env.car_future(inside, model="pred")
+    assert torch.allclose(hyb, pred, atol=1e-6), float((hyb - pred).abs().max())
+    # continuous across the seam, and past it the two models part company
+    eps = 1e-3
+    a = env.car_future([seam - eps, seam + eps], model="hybrid")
+    assert float((a[:, 0] - a[:, 1]).norm(dim=1).max()) < 0.05
+    far = [1.0]
+    assert float((env.car_future(far, model="hybrid") - env.car_future(far, model="pred")).norm(dim=2).max()) > 1e-4

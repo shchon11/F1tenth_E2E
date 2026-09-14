@@ -64,7 +64,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              controller: str = "legacy", estimator: str = "",
              teacher_kind: str = "raceline", teacher_horizon: float = 1.0,
              teacher_cand_iters: int = 2, teacher_cost: str = "",
-             opp_future_model: str = "plan", opp_extra: dict | None = None) -> dict:
+             opp_future_model: str = EnvConfig.opp_future_model, opp_extra: dict | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -302,7 +302,7 @@ def main() -> None:
                     help="Gauss-Newton iterations per candidate plan")
     ap.add_argument("--teacher-cost", default="", metavar="PROG,WALL,OPP,CLEAR,SMOOTH",
                     help="the five interactive-teacher cost weights; empty = its defaults")
-    ap.add_argument("--opp-future-model", default="plan", choices=list(OPP_FUTURE_MODELS),
+    ap.add_argument("--opp-future-model", default=EnvConfig.opp_future_model, choices=list(OPP_FUTURE_MODELS),
                     help="which prediction the interactive teacher reads the opponents with")
     ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
                     help="build the privileged opponent block in the observation. Needed to score a "
