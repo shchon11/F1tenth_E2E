@@ -176,7 +176,29 @@ Sized before the arms ran, by measuring both at coefficient 1.0 on the checkpoin
 from (`work/oracle-planner/work/reward_audit.py`, the 2026-09-13 method), so the coefficient is
 arithmetic rather than a preference.
 
-TABLE_REWARD_SIZING
+Measured at coefficient 1.0 on the frozen original, 5250 learner-steps, 24 episodes ended, progress
++4.156 /s on the same rows:
+
+| term | at coefficient 1.0 | steps active | target share | coefficient | as trained |
+|---|---|---|---|---|---|
+| `ttc` | −3.4555 /s | 19.0 % | 6 % | **0.072** | −0.249 /s |
+| `overtake_hold` | +0.0610 /s | 0.2 % | 8 % | **5.5** | +0.335 /s |
+
+The two targets are not independent, and the constraint between them is the design:
+
+> a **dense** cost on the approach must not exceed the **sparse** payment for the completed pass, or
+> the optimal policy is to not approach.
+
+TTC is charged on ~19 % of steps; the lead is paid once per pass. A penalty larger than the bonus
+would make hanging back worth more per second than passing — the opposite of what these terms were
+added for, and it would make all four arms measure the same uninteresting thing. 6 % puts TTC above
+`car_proximity` (3.5 %) and `car_contact` (3.7 %), well below the collision penalty (20 %) — an
+imminent contact priced below an actual one — and below the bonus. Both are far from the 0.8 % the
+old overtake bonus measured at coefficient 1.0, which is the number the audit called effectively
+absent.
+
+The `overtake_hold` figure rests on about eight events in 5250 learner-steps, so its coefficient is
+good to a factor rather than to a decimal.
 
 and re-measured on a trained arm afterwards, because a term's share of the return is a property of
 the policy as much as of the coefficient:
@@ -238,7 +260,29 @@ differently rather than by using the opponent's state.
 
 ## Results
 
-RESULTS_SECTION
+RESULTS_TABLE
+
+### Which cell the numbers land in
+
+`work/oracle-planner/work/decide.md` carries two things, deliberately separate. The **frozen rule**,
+written before the arms ran, decides the one binary question the contract asks. The **reading
+guide** appended afterwards (the user's, via root) says what the *shape* of the four arms means once
+that is settled:
+
+RESULTS_CELLS
+
+### Does the planner read the block at all?
+
+The all-equal cell cannot tell its own two causes apart, and they call for opposite next steps. So
+each oracle arm is scored once more with its own block **zeroed** (`--opp-token-ablate`), width
+kept. A large drop means the planner used the information and it did not pay; no drop means it never
+read it, and a flat table then says nothing about whether the information is useful.
+
+RESULTS_ABLATION
+
+### The training curve, which is not a score
+
+RESULTS_TRAIN
 
 ## The verdict
 
