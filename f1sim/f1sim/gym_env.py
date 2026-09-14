@@ -77,9 +77,15 @@ OPP_FUTURE_REJOIN_M = 2.0
 #:               offset it is holding), and a policy-driven one is read off its plan tracker's
 #:               predicted trajectory. Neither is a peek at the future: both are the controller's
 #:               own intention, which the simulator already knows this step.
+#:   "pred"   -- the plan tracker's own predicted trajectory for EVERY car, whoever drives it,
+#:               continued straight past its 0.6 s horizon. The raceline walk's competitor inside
+#:               that horizon: it is the iLQR's own forward rollout of the plan the car was actually
+#:               given, so it knows the plan's braking and its lane change without being told, and
+#:               it is what worker 16's `--opp-token future` uses. What it cannot know is that a
+#:               scheduled event will EXPIRE, or anything at all beyond 0.6 s.
 #:   "constv" -- world-frame constant velocity from the current state. The floor every other model
 #:               has to beat, and what a caller with no teacher gets.
-OPP_FUTURE_MODELS = ("plan", "constv")
+OPP_FUTURE_MODELS = ("plan", "pred", "constv")
 
 #: The privileged opponent block (`EnvConfig.opp_token`), an *oracle input*: it is refused by the
 #: exporter and by `f1sim_ros.policy_node`, because no car can measure it.
@@ -1502,10 +1508,12 @@ class F1VecEnv:
         out = st[:, None, :2] + vw[:, None, :] * t[None, :, None]          # constant velocity
         if mode == "constv" or self.M == 1:
             return out
+        pred = self._tracker_future(st, t)
+        if mode == "pred":
+            return out if pred is None else pred
         if self.teacher is not None and bool(self.teacher_driven.any()):
             walk = self._raceline_future(st, t)
             out = torch.where(self.teacher_driven[:, None, None], walk, out)
-        pred = self._tracker_future(st, t)
         if pred is not None:
             out = torch.where((~self.teacher_driven)[:, None, None], pred, out)
         return out
