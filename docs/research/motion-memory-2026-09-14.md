@@ -345,95 +345,46 @@ correctly scaled (1.0 is the optimum) and the ERPM speed reads about 5 % high, w
 with `speed_gain` in `docs/real_data_calibration.md`; neither is corrected here — a 5 % speed error
 is 9 mm over the warp's 0.9 m of travel and the measurement says so.
 
-### The two-arm smoke: PPO health
+### The smoke arms: PPO health
 
-The same smoke the future-head worker ran, with one flag between the arms: 262144 env steps, 63 envs
-(not 64 — the trainer refuses an env count that is not a multiple of `--race-size 3`), three tracks,
-seed 701, warm-started from `frozen_original_48cc698f`, the opponent-diversity flags of
+The same smoke the future-head worker ran, one flag apart: 262144 env steps, 63 envs (not 64 — the
+trainer refuses an env count that is not a multiple of `--race-size 3`), three tracks, seed 701,
+warm-started from `frozen_original_48cc698f`, the opponent-diversity flags of
 `work/learning-next/future-20260914/launch.sh`. **Not a performance result**: 131 updates is about a
 thirtieth of the shortest finetune that has ever moved a held-out number. What it is evidence for is
-that the new input does not destabilise the update.
+that the new inputs and the new losses do not destabilise the update.
 
-| | A: `memory,edges` first 20 / last 20 | B: + the three aligned rows |
-|---|---|---|
-| `kl_ref` | 0.061 / 0.125 | 0.052 / 0.132 |
-| `clipfrac` | 0.0003 / 0.0002 | 0.0005 / 0.0001 |
-| `grad_norm` | 12.3 / 18.1 | 13.9 / 22.6 |
-| `loss/vf` | 3.55 / 3.91 | 3.65 / 4.21 |
-| `aux_grip` | 0.0174 / 0.0141 | 0.0167 / 0.0109 |
-| collisions / km | 141 / 23.6 | 118 / 18.5 |
-| progress [m] | 30.0 / 72.7 | 29.2 / 99.3 |
-| median env steps/s | 335 | 335 |
-| wall clock | 16.5 min | 13.8 min |
+Loss columns are means over the window; **the episode columns and the gradient norm are medians**,
+because a single update's collisions/km is a ratio over the handful of episodes that ended in it —
+reading them as means made one arm look like it had collapsed to 131 collisions/km when its
+per-quarter medians never left 15–26. (`work/e2/health.md`.)
 
-Both arms ran all 131 updates with no non-finite loss and no non-finite gradient norm — with
-`--memory` the trainer raises on either, so a finished run *is* that evidence. Both recover from the
-warm start the same way. The gradient norm and the value loss end marginally larger in B, which is
-what three more input columns look like. The driving columns favour B (18.5 against 23.6
-collisions/km, 99 m against 73 m of progress) and **that is not a result**: one seed, 131 updates,
-and the two arms do not even share their GRU initialisation (below).
-
-**The channel costs nothing measurable in training.** 335 median env steps/s either way at 63 envs;
-its cost is in the per-step inference budget, where it is 0.57 ms (see Budget), not in the rollout.
-
-### What the channel did to the probe
-
-The two smoke checkpoints go back through the E1 table as two more columns, same protocol, same
-seeds, same splits (`work/e1/e1.md`). Median R² over the 16 draws, with the earlier arms for scale:
-
-| median R² | `gru_warm` (random GRU) | `gru_trained` (8 upd) | **`e2_raw`** (131 upd) | **`e2_aligned`** (131 upd) |
+| first 20 / last 20 | A: `memory,edges` | B: + aligned rows | E3-a: + motion GRU + mask | E3-b: + current Δv |
 |---|---|---|---|---|
-| **Δv_x** | +0.185 | +0.112 | **+0.188** | **+0.230** |
-| **Δv_y** | +0.132 | +0.178 | **+0.139** | **+0.150** |
-| Δx | +0.235 | +0.241 | +0.217 | +0.152 |
-| Δy | +0.190 | +0.202 | +0.185 | +0.271 |
+| `kl_ref` | 0.061 / 0.125 | 0.052 / 0.132 | 0.057 / 0.131 | 0.062 / 0.121 |
+| `clipfrac` | 0.0003 / 0.0002 | 0.0005 / 0.0001 | 0.0006 / 0.0000 | 0.0006 / 0.0001 |
+| `grad_norm` (median) | 12.1 / 16.4 | 12.5 / 20.7 | 13.7 / 16.3 | 12.5 / **22.9** |
+| `loss/vf` | 3.55 / 3.91 | 3.65 / 4.21 | 3.49 / 3.34 | 3.80 / **4.37** |
+| collisions / km (median) | 36.9 / 16.1 | 32.7 / 11.2 | 32.8 / 11.0 | 38.7 / 17.9 |
+| progress [m] (median) | 27.2 / 61.9 | 30.6 / 83.9 | 30.5 / 91.2 | 25.9 / 52.2 |
+| median env steps/s | 343 | 340 | 310 | 306 |
+| wall clock | 16.5 min | 13.8 min | 15.0 min | 14.9 min |
 
-**Alignment alone did not move Δv.** The gap is +0.042 on Δv_x and +0.011 on Δv_y — inside the ±0.07
-that separates `gru_warm` from `gru_trained`, two arms this table already calls indistinguishable.
-On the mean rather than the median it is +0.005. The threshold was written down before these columns
-existed (`work/e3/decide.md`), so this is the rule firing and not a line drawn afterwards.
+Every arm ran all 131 updates with no non-finite loss and no non-finite gradient norm — with
+`--memory` the trainer raises on either, so a finished run *is* that evidence — and every arm
+recovers from the warm start the same way. Two things are worth taking:
 
-Two things belong beside that, and neither of them rescues it:
+* **the motion branch costs about 10 % of training throughput** (343 → 306 env steps/s) and the
+  aligned channel costs nothing measurable (343 → 340). The channel's cost is in the per-step
+  inference budget, not in the rollout; the branch's is in both.
+* **E3-b ends with the largest gradient norm and value loss of the four** (22.9 and 4.37 against
+  16.4 and 3.91 for the control). That is what two extra loss terms look like and it is not
+  instability — the clip fraction and the approximate KL are identical across the arms — but it is
+  the only column where the arms are visibly ordered, and the ordering is by how many terms the loss
+  has rather than by anything about representations.
 
-* **The channel arrives as zero-initialised input columns.** At update 1 the network ignores them by
-  construction — that is what makes the warm start bit-identical — and it has 131 updates to learn
-  to use three new rows. A null here is strong evidence about the *budget* and weak evidence about
-  the idea. It is also precisely the argument for E3: a loss that asks a branch for the opponent's
-  motion does not wait for PPO to discover that an input is worth reading.
-* **`e2_raw` lands on top of `gru_warm`** (+0.188 against +0.185). A hundred and thirty-one updates
-  of PPO left Δv_x exactly where an untrained recurrence already had it — the same finding the E1
-  ladder gave, now with training rather than by construction, and the premise the whole contract is
-  testing.
-
-### The second table: the racing proxy
-
-The addendum asks for this separately from the representation, so that *"Δv R² up but racing flat"*
-is a reportable outcome rather than an unasked question. `evaluate --protocol rolling` in traffic on
-the smoke's own three tracks, one fixed seed, 2400 steps × 96 cars, teacher opponents with all seven
-behaviours — and note that `--per-track` is one full evaluation **per track**, so each arm is three
-runs pooled by the learner-minutes behind them (`work/e2/proxy.md`).
-
-| | A: `memory,edges` | B: + the three aligned rows |
-|---|---|---|
-| collisions / km ↓ | **16.6** | 19.5 |
-| wall collisions ↓ | **116** | 186 |
-| car contacts / learner-min ↓ | **3.15** | 3.33 |
-| passes / learner-min ↑ | 2.48 | **2.70** |
-| mean speed [m/s] ↑ | 4.77 | **4.86** |
-| lap time [s] ↓ | 14.5 | **14.0** |
-| pace vs the opponents ↑ | 1.361 | **1.377** |
-| share of time in contention | 73.9 % | 72.7 % |
-
-**The two halves of this table disagree, and so does it with the training log.** Arm B is the faster
-policy — quicker laps, higher mean speed, more passes held — and it crashes more, mostly into walls
-(186 against 116). That is the ordinary speed-for-safety trade and not a statement about
-representations. And during training the ordering was the other way round: arm B ended the smoke at
-18.5 collisions/km against A's 23.6.
-
-The honest reading is that **at 262144 env steps the racing numbers are noise**, which is what the
-smoke was said in advance not to be able to answer. The table is here because the addendum asks for
-it to exist before anyone is tempted to infer racing from a probe, and what it shows is exactly why:
-one seed, one protocol, and a direction that flips between the training log and the evaluation.
+Nothing else here distinguishes the arms, which is what 131 updates on one seed was said in advance
+to be unable to do.
 
 ### A confound in the smoke arms, measured rather than assumed
 
