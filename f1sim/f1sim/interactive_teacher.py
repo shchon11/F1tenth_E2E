@@ -129,7 +129,7 @@ class InteractiveTeacher:
                  offsets: Sequence[float] = DEFAULT_OFFSETS,
                  speeds: Sequence[float] = DEFAULT_SPEEDS,
                  horizon_s: float = 1.0, cost: Optional[TeacherCost] = None,
-                 cand_iters: int = 2, samples: int = 21,
+                 cand_iters: int = 2,
                  wall_margin: float = 0.25, future_model: Optional[str] = None,
                  lane_clamp: bool = False):
         if not isinstance(base, RacelineTeacher):
@@ -150,7 +150,6 @@ class InteractiveTeacher:
         self.horizon_s = float(horizon_s)
         self.cost = cost or TeacherCost()
         self.cand_iters = int(cand_iters)
-        self.samples = int(samples)
         self.wall_margin = float(wall_margin)
         self.future_model = future_model
         #: Whether the candidate offsets go through `RacelineTeacher.offset_limit`, the isotropic
@@ -245,9 +244,14 @@ class InteractiveTeacher:
                     offset: Optional[torch.Tensor] = None,
                     idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(B, ACT_DIM) the argmin candidate, in the same normalized plan space `RacelineTeacher`
-        returns -- `iters` is the reference plan's Gauss-Newton budget and every other argument
-        means what it means there. `offset` shifts the whole candidate family (a scripted lane
-        change the caller wants held), which is what keeps this signature-compatible.
+        returns. Every argument means what it means there, and `offset` shifts the whole candidate
+        family (a scripted lane change the caller wants held) -- which is what keeps this
+        signature-compatible with the teacher it replaces.
+
+        `iters` is accepted and **not used**: the family is generated at `cand_iters`, and the
+        reference plan this search is relative to is the offset-0 candidate OF that family. Fitting
+        it to a different budget would make the thing `C_smooth` is measured against a plan that is
+        not in the family, and the argmin's default would stop being a candidate.
         """
         spec = spec or PlanSpec()
         B = state.shape[0]
@@ -351,14 +355,12 @@ class InteractiveTeacher:
         idx = self.base.project(state[:, :2], tid)[0] if idx is None else idx
         world, psi, _v = self.rollout(cand, state, v_max, spec)
         w = self.cost
-        terms = {
-            "progress": w.progress * self._progress_cost(world, tid, idx, v_max),
-            "wall": None, "clear": None,
-            "opp": w.opp * self._opp_cost(world, psi, state, spec),
-            "smooth": w.smooth * self._smooth_cost(world, psi),
-        }
         wall, clear = self._wall_costs(world, tid)
-        terms["wall"], terms["clear"] = w.wall * wall, w.clear * clear
+        terms = {"progress": w.progress * self._progress_cost(world, tid, idx, v_max),
+                 "wall": w.wall * wall,
+                 "opp": w.opp * self._opp_cost(world, psi, state, spec),
+                 "clear": w.clear * clear,
+                 "smooth": w.smooth * self._smooth_cost(world, psi)}
         total = sum(terms.values())
         return (total, terms) if parts else total
 
