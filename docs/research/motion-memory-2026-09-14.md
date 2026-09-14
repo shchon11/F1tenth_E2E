@@ -558,6 +558,74 @@ this label invites. And the mask logits are **train-time only**: neither head is
 actor's forward, so the traced ONNX graph cannot contain them, while the motion branch itself is
 exported because it is part of the policy.
 
+### What the two staged arms did
+
+Both ran the full smoke and both are in the health table above: 131 updates, no non-finite loss or
+gradient norm, and the motion branch costing about 10 % of training throughput. What their
+auxiliaries did is the result.
+
+**The beam mask collapsed to "no car", identically in both arms.**
+
+| | updates 1–20 | 40–60 | last 20 |
+|---|---|---|---|
+| BCE (E3-a) | 1.192 | 1.127 | 1.072 |
+| **recall (E3-a)** | 0.189 | **0.000** | **0.000** |
+| **recall (E3-b)** | 0.184 | **0.000** | **0.000** |
+| positive rate | 1.7 % | 1.4 % | 1.2 % |
+| positive weight | 47.3 | 48.2 | 49.4 |
+
+The BCE falls 10 % while the head stops predicting a positive anywhere. That is exactly the failure
+this label invites and exactly why `mask_loss` reports recall and precision beside the loss: read as
+a loss curve alone, this looks like learning.
+
+**The current-Δv head is worse than predicting the mean throughout.** Explained variance,
+`1 − mse/var` under the same weights, so that a target whose own variance is moving does not read as
+progress:
+
+| | updates 1–20 | mid | last 20 |
+|---|---|---|---|
+| Δv_x | −0.78 | −0.62 | −0.24 |
+| Δv_y | −0.05 | −0.04 | −0.09 |
+
+**Both are budget statements.** 131 updates × 6 minibatch steps is **786 Adam steps** at `--lr 5e-5`
+from an output layer initialised at exactly zero — the same budget the future-head note measured
+leaving *its* head's output weights at an rms of 0.0067, a few percent into their own curve. Nothing
+here says these auxiliaries do not work; it says they have not been given the chance to.
+
+One lever worth naming because it is mine and it was binding: the mask's positive weight is the
+reciprocal of the batch's positive rate **clamped at 50**, and at a 1.2 % positive rate the
+unclamped value is ~83, so the clamp held throughout and positives were still outweighed about
+1.6 : 1. A run that wants this head to fire should raise the clamp or use a focal loss. It was not
+retuned here, because at 786 Adam steps neither choice would have changed the outcome and changing
+it mid-experiment would have cost the comparison.
+
+### And what they did to the probe
+
+| median R² | `e2_raw` | `e2_aligned` | `e3a_mask` | `e3b_dv` |
+|---|---|---|---|---|
+| **Δv_x** | +0.188 | +0.230 | **+0.280** | +0.181 |
+| **Δv_y** | +0.139 | +0.150 | +0.090 | **+0.201** |
+| Δx | +0.217 | +0.152 | +0.178 | +0.192 |
+| ego speed | +0.927 ±0.013 | +0.916 ±0.013 | +0.932 ±0.013 | +0.937 ±0.009 |
+
+**The table's own resolution is what this measures.** E3-a and E3-b differ by one loss term and by
+**0.099** of median Δv_x R² — more than the 0.07 that `work/e3/decide.md` declared to be the width
+of "the same", and more than any between-arm difference anywhere in the table. Two arms sharing an
+architecture, a seed, a recipe and a mask are further apart than the arms the experiment was built to
+compare. So the honest reading of every Δv column here is:
+
+> at 131 updates, **no arm is distinguishable from any other on Δv**, `e2_aligned` against `e2_raw`
+> included, and the ±0.07 threshold set from `gru_warm` against `gru_trained` was generous.
+
+The addendum's condition for E3-c — "only after E3-b raises Δv R²" — is therefore not met: E3-b is
+0.099 *below* E3-a. **E3-c was not run**, and the number that stopped it is recorded in
+`work/e3/decide.md` beside the rule that was written before any of these columns existed.
+
+The one thing that does separate cleanly, in every column and on both halves of the table, is the
+control: the ego's own speed reads +0.92 … +0.94 with a spread of ±0.01 on every trained arm. That is
+the probe working, and it is what makes the 0.1–0.3 on the opponent worth believing as a small number
+rather than as a broken measurement.
+
 ## E4 — scope only
 
 The question E4 asks is whether this representation can be built **without privileged labels**. The
