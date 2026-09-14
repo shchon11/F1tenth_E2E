@@ -54,14 +54,21 @@ FUTURE_PRESENT_INDEX = FUTURE_LABEL_KEYS.index("opp_present")
 OPP_FUTURE_TIMES = (0.1, 0.25, 0.5, 0.75)
 OPP_FUTURE_WALK_DT = 0.05
 
-#: [s] over which a predicted path is allowed to still carry the car's present tracking error.
-#: Every prediction is anchored at where the car actually is at t = 0 -- a raceline walk otherwise
-#: starts at the nearest point of the LINE, which is up to a car width from the car, and that
-#: offset shows up in the label as a lateral velocity the opponent does not have. The raceline walk
-#: then closes that error linearly, because a pure-pursuit tracker does close it; the plan tracker's
-#: own prediction keeps it, because there the mismatch is an alignment artefact (the trajectory was
-#: solved one control step ago, from the latency-compensated pose) and not a tracking error.
-OPP_FUTURE_REJOIN_S = 0.5
+#: [m] of TRAVEL over which a raceline walk is allowed to still carry the car's present tracking
+#: error. Every prediction is anchored at where the car actually is at t = 0 -- a walk otherwise
+#: starts at the nearest point of the LINE, up to half a metre from the car, and that offset shows
+#: up in the label as a lateral velocity the opponent does not have.
+#:
+#: Metres and not seconds, which is what this was first written as. A pure-pursuit tracker closes a
+#: lateral error over its lookahead, which is a DISTANCE; on a clock, a car that has just been told
+#: to stop is predicted to slide half a metre sideways onto the line while standing still, and the
+#: braking event this label exists to report is then swamped by it. 2 m is the tracker's own
+#: lookahead range (`RacelineTeacher.ld_min` .. `ld_max` is 0.6 .. 2.5 m).
+#:
+#: The plan tracker's own prediction keeps its offset instead of closing it: there the mismatch is
+#: an alignment artefact (the trajectory was solved one control step ago, from the
+#: latency-compensated pose) rather than a tracking error.
+OPP_FUTURE_REJOIN_M = 2.0
 
 #: How `car_future` predicts where a car will be.
 #:   "plan"   -- each car's OWN controller carried forward: a teacher-driven opponent is walked
@@ -76,11 +83,12 @@ OPP_FUTURE_MODELS = ("plan", "constv")
 
 #: The privileged opponent block (`EnvConfig.opp_token`), an *oracle input*: it is refused by the
 #: exporter and by `f1sim_ros.policy_node`, because no car can measure it.
-#:   ""        off, and off is the observation the env has always produced
+#:   ""        off, and off is the observation the env has always produced ("off" is accepted as a
+#:             spelling of it, because that is what worker 16's `--opp-token` flag takes)
 #:   "pos"     the nearest cars' relative position and a presence flag
 #:   "posvel"  + their relative velocity
 #:   "future"  + where each of them will be at `OPP_FUTURE_TIMES`
-OPP_TOKEN_MODES = ("", "pos", "posvel", "future")
+OPP_TOKEN_MODES = ("", "off", "pos", "posvel", "future")
 
 #: How many opponents the block describes, nearest first. Two rather than one because the situation
 #: the whole line of work is about -- picking the gap a car is leaving -- stops being well posed the
@@ -90,14 +98,19 @@ OPP_TOKEN_CARS = 2
 #: Columns per car, in order: the `pos` triple, then the `posvel` pair, then the `future` pairs.
 #: The order is the layout, so a checkpoint written under one mode and read under another would see
 #: columns that mean the wrong thing; `ObsSpec.opp_token` records which mode produced it.
-OPP_TOKEN_COLS = {"": 0, "pos": 3, "posvel": 5, "future": 5 + 2 * len(OPP_FUTURE_TIMES)}
+OPP_TOKEN_COLS = {"": 0, "off": 0, "pos": 3, "posvel": 5, "future": 5 + 2 * len(OPP_FUTURE_TIMES)}
+
+
+def opp_token_mode(mode: str) -> str:
+    """The canonical spelling of an `opp_token` value; "off" and "" are the same thing."""
+    if mode not in OPP_TOKEN_MODES:
+        raise ValueError(f"opp_token {mode!r} is not one of {list(OPP_TOKEN_MODES)}")
+    return "" if mode == "off" else mode
 
 
 def opp_token_dim(mode: str) -> int:
     """Width of the privileged opponent block for a mode name."""
-    if mode not in OPP_TOKEN_MODES:
-        raise ValueError(f"opp_token {mode!r} is not one of {list(OPP_TOKEN_MODES)}")
-    return OPP_TOKEN_CARS * OPP_TOKEN_COLS[mode]
+    return OPP_TOKEN_CARS * OPP_TOKEN_COLS[opp_token_mode(mode)]
 
 
 #: Who drives each car, per row, in `opponent == "pool"`. The learner's slot is always
@@ -454,12 +467,13 @@ class F1VecEnv:
             raise ValueError(f"opponent {e.opponent!r} is not one of {list(OPPONENT_MODES)}")
         if e.spawn_order not in SPAWN_ORDERS:
             raise ValueError(f"spawn_order {e.spawn_order!r} is not one of {list(SPAWN_ORDERS)}")
-        if e.opp_token not in OPP_TOKEN_MODES:
-            raise ValueError(f"opp_token {e.opp_token!r} is not one of {list(OPP_TOKEN_MODES)}")
+        #: The canonical spelling of `EnvConfig.opp_token` -- "" when it is off, whichever way the
+        #: caller spelled that. Read everywhere below instead of the config field.
+        self.opp_token_mode = opp_token_mode(e.opp_token)
         if e.opp_future_model not in OPP_FUTURE_MODELS:
             raise ValueError(f"opp_future_model {e.opp_future_model!r} is not one of "
                              f"{list(OPP_FUTURE_MODELS)}")
-        if e.opp_token and self.M < 2:
+        if self.opp_token_mode and self.M < 2:
             raise ValueError(f"opp_token {e.opp_token!r} with race_size {self.M}: the block "
                              f"describes the other cars of a race, and with one car per race it "
                              f"would be a constant zero input that still widens every checkpoint.")
@@ -736,7 +750,7 @@ class F1VecEnv:
         if self.hist is not None:
             self._last_feat = torch.cat([speed, obs.get("imu", torch.zeros(self.B, 6, device=self.device)), obs.get("imu_att", torch.zeros(self.B, 2, device=self.device))], 1)
             obs["hist"] = self.hist[:, ::self.ecfg.hist_stride].reshape(self.B, -1)
-        if self.ecfg.opp_token:
+        if self.opp_token_mode:
             # LAST, after every key the observation already had, so that the columns a checkpoint
             # was trained without keep their index and a warm start is a copy plus zeros.
             obs["opp_token"] = self.opp_token(r.state)
@@ -1530,12 +1544,13 @@ class F1VecEnv:
         a_acc = float(self.tracker.spec.a_max if self.tracker is not None else PlanSpec().a_max)
         v = st[:, 3].clamp_min(0.0)
         s_w = torch.zeros(self.B, device=self.device)
-        pts = []
+        pts, arc = [], []
         for k in range(n):
             j = (idx0 + (s_w / ds).round().long()) % T.N
             tn = T.tan[tid, j]
             o_k = T.clamp_offset(off, tid, j)
             pts.append(T.xy[tid, j] + o_k[:, None] * torch.stack([-tn[:, 1], tn[:, 0]], 1))
+            arc.append(s_w)
             if k == n - 1:
                 break
             on = torch.full_like(left, k * dtw) < left
@@ -1545,18 +1560,15 @@ class F1VecEnv:
             s_w = s_w + 0.5 * (v + v_n) * dtw
             v = v_n
         walk = torch.stack(pts, 1)                                          # (B, n, 2)
-        grid = torch.arange(n, device=self.device, dtype=t.dtype) * dtw
-        out = _interp_path(walk, grid, t)
         # Anchored at the car, not at the line: the walk's first point is the nearest RACELINE
-        # point, and a car tracking the line at 0.2 m of error is not there.
-        err = (st[:, :2] - walk[:, 0])[:, None, :]
-        # Smoothstep and not a ramp: a linear decay starts removing the error at t = 0 at
-        # err / REJOIN m/s, which at a 0.2 m tracking error is 0.4 m/s of lateral velocity the car
-        # does not have -- and over the 0.1 s horizon that is larger than the whole real lateral
-        # displacement. Measured, it was the one horizon where this label lost to constant velocity.
-        x = (t / OPP_FUTURE_REJOIN_S).clamp(0.0, 1.0)
+        # point, and a car tracking the line at 0.2 m of error is not there. The error is carried
+        # and then closed over `OPP_FUTURE_REJOIN_M` of travel -- smoothstep, not a ramp, so the
+        # label does not open with a lateral velocity the car does not have.
+        x = (torch.stack(arc, 1) / OPP_FUTURE_REJOIN_M).clamp(0.0, 1.0)      # (B, n)
         keep = 1.0 - x * x * (3.0 - 2.0 * x)
-        return out + err * keep[None, :, None]
+        walk = walk + (st[:, :2] - walk[:, 0])[:, None, :] * keep[..., None]
+        grid = torch.arange(n, device=self.device, dtype=t.dtype) * dtw
+        return _interp_path(walk, grid, t)
 
     def _tracker_future(self, st: torch.Tensor, t: torch.Tensor) -> Optional[torch.Tensor]:
         """`PlanTracker.last_pred` in the world, sampled at `t`, or None before a plan-mode step."""
@@ -1615,7 +1627,7 @@ class F1VecEnv:
         `overtake_range` -- is exactly 0, including its presence flag. That gating is the whole
         reason presence is a column: "no car" and "a car at the origin" must not be the same input.
         """
-        mode = self.ecfg.opp_token
+        mode = self.opp_token_mode
         cols = OPP_TOKEN_COLS[mode]
         if not cols:
             return torch.zeros(self.B, 0, device=self.device)
