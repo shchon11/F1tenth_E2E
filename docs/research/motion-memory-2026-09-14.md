@@ -658,3 +658,61 @@ training-time target either way. What it buys over the E3 auxiliaries is scale �
 step is labelled, against the ~20 % of steps the future head can label after its boundary masking —
 and independence from the simulator's privileged state, which is what makes it the honest answer to
 "could this have been learned from data a real car could collect". Not implemented.
+
+
+## What this licenses, and what it does not
+
+**Licensed.**
+
+* *From the representation the policy has, the nearest opponent's present relative state is barely
+  linearly decodable — its velocity at R² 0.09 … 0.28 and its position at 0.11 … 0.27 — while the
+  ego's own speed reads 0.79 … 0.94 on the same rows with the same read-out.* Two seeds, eight
+  held-out-car draws each, presence-conditioned, R² and MAE, split by distance.
+* *A representation with no temporal information at all reads −0.06 on Δv_x, and a recurrence is
+  what lifts it.* The six-frame stack gets +0.12, a **random** GRU over the same embedding +0.19.
+* *PPO, at these budgets, does not shape the state toward the opponent.* Eight updates
+  (`gru_trained`) and 131 (`e2_raw`) both land where the untrained recurrence already was.
+* *The aligned residual is geometrically correct and its floor is measured on both sides of the
+  sim-to-real line.* Exactly zero on analytic static scenes under translation and yaw; σ_static
+  0.025 m on the real recordings and 0.045 m in simulation; τ = 3σ = 0.075 m fixed before training;
+  false positives 3.8 % of predicted bins on the bags and 4.9 % in simulation, where every one of
+  them is error.
+* *What the channel reports about a car differs from its floor in magnitude, not in count* — the
+  median survivor moves 0.050 m → 0.270 m when two opponents enter the scene while the flagged
+  fraction moves 5.00 % → 5.49 %.
+* *Everything it needs runs on the car*, and the ROS node feeds it from three sensors it already
+  reads. The motion branch is exported; neither of its training heads can be, and that is checked
+  against a real ONNX graph.
+* *Every flag off is byte-identical*, held to the frozen loss oracle.
+* *Both experiments fit the deployment budget* — forward 1.11× and 1.29× against a 1.5× rule, 3.0 ms
+  of a 25 ms step.
+
+**Not licensed.**
+
+* **Any statement that the aligned channel raises Δv R², or that it does not.** The arms are not
+  separable: two arms differing by one loss term and sharing everything else are 0.099 apart on the
+  headline column, which is wider than every difference the table was built to resolve.
+* **Any statement about the staged auxiliaries as ideas.** Neither head learned — the mask predicts
+  no positive anywhere after update 40, the Δv head stays below the mean — at 786 Adam steps from a
+  zero initialisation. That is a measurement of the budget.
+* **Any racing claim.** The proxy's three arms disagree with the training log and with each other,
+  and the third lands between the first two.
+* **Anything about the real car.** The floors are real; no policy in this branch has driven one.
+
+## What to do with it
+
+1. **Give the arms a real budget before comparing them again.** Everything unresolved here is
+   unresolved for the same reason: 786 Adam steps. The E1 table is cheap (three minutes per column)
+   and its definition is fixed, so the next run's checkpoints drop straight into it.
+2. **Fix the comparison before running it.** Two arms that differ by an input width do not share the
+   initialisation of the modules a warm start leaves fresh, because the wider convolution consumes
+   different draws. Seeding fresh tensors from their own names would cost nothing and would remove
+   the confound named above — it is the one change that makes a two-arm smoke mean what it says.
+3. **E4 first, if only one thing is run.** A per-beam label on every step for 2 % of the rollout,
+   needing no privileged state, against auxiliaries that label ~20 % of steps and need the
+   simulator's own `scan_type`. The cost is measured; the head is not written.
+4. **Raise the mask's positive-weight clamp or use focal loss** before concluding anything about
+   that auxiliary. It was pinned at its bound for the whole run.
+5. **Look at the five recordings whose attitude estimate is unusable** before the policy drives.
+   `policy_node` reads that quaternion into the observation today, and this branch only measured the
+   problem.
