@@ -121,16 +121,20 @@ def test_a_lane_change_is_predicted_off_the_line():
     ev.t[opp] = 1.0; ev.dur[opp] = 4.0; ev.p0[opp] = 0.35; ev.p1[opp] = 1.0     # ramped fully in
     off = env.events.lateral_offset()
     assert float(off[opp].min()) > 0.3
-    fut = env.car_future([0.75])[:, 0]
-    # distance from the predicted point to the raceline, against the same for the un-shifted car
-    idx, _ = env.teacher.project(fut, env.sim.tid)
-    d_shift = (fut - env.teacher.xy[env.sim.tid, idx]).norm(dim=1)
+    def signed_off(xy):
+        """Metres LEFT of the raceline the predicted point lies -- signed, because the claim is
+        that the prediction moves the way the event asked and not merely that it moved."""
+        idx, _ = env.teacher.project(xy, env.sim.tid)
+        d = xy - env.teacher.xy[env.sim.tid, idx]
+        tn = env.teacher.tan[env.sim.tid, idx]
+        return -d[:, 0] * tn[:, 1] + d[:, 1] * tn[:, 0]
+
+    shifted = signed_off(env.car_future([0.75])[:, 0])
     ev.kind[opp] = 0
-    fut0 = env.car_future([0.75])[:, 0]
-    idx0, _ = env.teacher.project(fut0, env.sim.tid)
-    d_plain = (fut0 - env.teacher.xy[env.sim.tid, idx0]).norm(dim=1)
-    assert float((d_shift - d_plain)[opp].mean()) > 0.15, (
-        f"the lane change moved the prediction by {float((d_shift - d_plain)[opp].mean()):.3f} m")
+    plain = signed_off(env.car_future([0.75])[:, 0])
+    moved = (shifted - plain)[opp]
+    assert float(moved.min()) > 0.15, (
+        f"a +0.35 m lane change moved the prediction by {moved.tolist()} m to the left")
 
 
 def test_the_prediction_is_not_a_straight_line():

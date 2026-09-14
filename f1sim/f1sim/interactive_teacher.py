@@ -34,6 +34,7 @@ produces is an observation; it produces labels.
 """
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, replace
 from typing import Optional, Sequence
@@ -164,6 +165,12 @@ class InteractiveTeacher:
         #: candidate's OWN trajectory, on the side it actually goes. The clamp exists for the
         #: opponents because nothing else was watching their line; here something is.
         self.lane_clamp = bool(lane_clamp)
+        #: The teacher object the candidate family is generated through. A shallow copy of `base`:
+        #: every tensor is shared, so it costs nothing, and the two differ only in `offset_limit`.
+        #: A copy rather than a save-and-restore on `base` itself, because in a race `base` is very
+        #: often the object driving the OPPONENTS (`env.teacher`), and briefly clearing its lane
+        #: clamp is a hazard that would only ever show up as an opponent in a wall.
+        self._gen = copy.copy(base)
         self.env = None
         self.track = None
         self.half_width = 0.155
@@ -277,14 +284,11 @@ class InteractiveTeacher:
             off = off + rep(offset)
         Pt = None if P is None else {k: rep(v) if torch.is_tensor(v) and v.shape[:1] == (B,) else v
                                      for k, v in P.items()}
-        keep = self.base.offset_limit
-        if not self.lane_clamp:
-            self.base.offset_limit = None                  # see `lane_clamp`
-        try:
-            a = self.base.plan_action(rep(state), Pt, rep(tid), v_max, spec,
-                                      iters=self.cand_iters, offset=off, idx=rep(idx))
-        finally:
-            self.base.offset_limit = keep
+        g = self._gen                                      # the base teacher's settings, live
+        g.speed_scale, g.label_grip = self.base.speed_scale, self.base.label_grip
+        g.offset_limit = self.base.offset_limit if self.lane_clamp else None
+        a = g.plan_action(rep(state), Pt, rep(tid), v_max, spec,
+                          iters=self.cand_iters, offset=off, idx=rep(idx))
         a = a.view(n_off, B, -1)
         # The two axes have to be independent, and `plan_action` does not leave them so: it reads
         # the car's lateral error against the line it is asked to plan through, and a car sitting on

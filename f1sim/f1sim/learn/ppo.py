@@ -23,7 +23,8 @@ import time
 import numpy as np
 import torch
 
-from ..gym_env import EnvConfig, FUTURE_LABEL_DIM, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS
+from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, OPP_FUTURE_MODELS, OPP_TOKEN_MODES,
+                       PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS, opp_token_dim, opp_token_mode)
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
@@ -389,6 +390,19 @@ def main():
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--scan-stem", choices=["plain", "resnet"], default="resnet",
                     help="scan encoder for a new model without --init (an --init checkpoint keeps its own)")
+    ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
+                    help="privileged opponent block in the observation (f1sim.gym_env): the nearest "
+                         "two cars' true relative position ('pos'), velocity ('posvel') and future "
+                         "('future'), appended after every proprio key the policy already had. An "
+                         "ORACLE -- the exporter, the ROS node and the benchmark adapter all refuse "
+                         "a checkpoint that declares one, because no sensor on the car produces it "
+                         "and a score obtained with it is not comparable with any that was not. The "
+                         "columns are zero-initialised on a warm start, so the run starts as the "
+                         "checkpoint it came from and learns to use them")
+    ap.add_argument("--opp-future-model", default="plan", choices=list(OPP_FUTURE_MODELS),
+                    help="which prediction the block's 'future' columns carry "
+                         "(f1sim.gym_env.OPP_FUTURE_MODELS); recorded in the spec, because the same "
+                         "columns under two models are two different inputs")
     ap.add_argument("--procedural-obstacles", type=float, default=0.0, metavar="FRAC",
                     help="share of env resets that get a freshly drawn obstacle layout, placed as "
                          "analytic props from the hard-obstacle patterns (0 = off, and off is "
@@ -411,6 +425,11 @@ def main():
                          "backwards on the line is told to carry full racing speed")
     a = ap.parse_args()
     opp_cfg.validate(a)
+    a.opp_token = opp_token_mode(a.opp_token)
+    if a.opp_token and a.race_size < 2:
+        raise SystemExit(f"--opp-token {a.opp_token} with --race-size {a.race_size}: the block "
+                         f"describes the other cars of a race and there are none. It would be a "
+                         f"constant zero input that still widens every checkpoint this run writes.")
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
@@ -482,6 +501,8 @@ def main():
                                                               # spawn field, from the group the
                                                               # census shares (learn.opponent_config)
                                                               **opp_cfg.env_kwargs(a),
+                                                              opp_token=a.opp_token,
+                                                              opp_future_model=a.opp_future_model,
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
@@ -557,18 +578,31 @@ def main():
     #: output -- goes down the warm-start path and is refused.
     init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
     add_mem, add_chan, add_fut = warm_start_additions(init_meta, mem_cfg, chan_cfg, fut_cfg)
-    if a.init and (add_mem or add_chan or add_fut):
+    #: The privileged opponent block a warm start would ADD, on the same rule: a checkpoint already
+    #: as wide as this env's observation already has it, and a resume must not widen it twice.
+    add_tok = 0
+    if a.init and a.opp_token:
+        g = opp_token_dim(a.opp_token)
+        p_ck = int(init_meta.get("proprio_dim", 0))
+        if p_ck == spec.proprio_dim - g:
+            add_tok = g
+        elif p_ck != spec.proprio_dim:
+            raise SystemExit(f"--init's proprio width is {p_ck}; this env produces "
+                             f"{spec.proprio_dim} and the {g}-column opponent block would make it "
+                             f"{p_ck + g}. Neither matches: --hist-len / --scan-stack differ too.")
+    if a.init and (add_mem or add_chan or add_fut or add_tok):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
         # actor's first action of this run is bit-identical to the one the original would have
         # produced. `tests/test_memory_model.py` is the check.
         model, extra, fresh = load_for_memory(
             a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
-            future_head=add_fut,
+            future_head=add_fut, opp_token_dim=add_tok,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
-        print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} | "
+        print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} "
+              f"opp_token {a.opp_token if add_tok else 'kept'} | "
               f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))

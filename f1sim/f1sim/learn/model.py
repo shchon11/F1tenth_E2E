@@ -903,7 +903,16 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     if g_tok < 0:
         raise ValueError(f"opp_token_dim must be >= 0, got {opp_token_dim}")
     if g_tok:
-        meta["proprio_dim"] = int(meta["proprio_dim"]) + g_tok
+        # The target width is the CHECKPOINT's plus the block, whether or not the caller also
+        # overrode `proprio_dim` with the env's (which is the same number). Adding to an already
+        # widened override would build a network wider than either.
+        p_base = int(ck["meta"]["proprio_dim"])
+        want = p_base + g_tok
+        if int(meta["proprio_dim"]) not in (p_base, want):
+            raise ValueError(f"proprio_dim override {meta['proprio_dim']} is neither the "
+                             f"checkpoint's {p_base} nor that plus the {g_tok}-column privileged "
+                             f"opponent block ({want}).")
+        meta["proprio_dim"] = want
     if not memory and not chan and not future_head and not g_tok:
         raise ValueError("load_for_memory with neither memory, a scan channel, a future head nor a "
                          "privileged opponent block would be load_checkpoint with extra steps; call "

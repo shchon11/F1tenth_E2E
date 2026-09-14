@@ -1560,13 +1560,32 @@ class F1VecEnv:
             s_w = s_w + 0.5 * (v + v_n) * dtw
             v = v_n
         walk = torch.stack(pts, 1)                                          # (B, n, 2)
-        # Anchored at the car, not at the line: the walk's first point is the nearest RACELINE
-        # point, and a car tracking the line at 0.2 m of error is not there. The error is carried
-        # and then closed over `OPP_FUTURE_REJOIN_M` of travel -- smoothstep, not a ramp, so the
-        # label does not open with a lateral velocity the car does not have.
+        # ---- anchored at the car, in position AND heading.
+        #
+        # The walk is where the raceline goes; the car is not on it and is not pointing along it.
+        # Both mismatches have to be carried and then closed, because a pure-pursuit tracker closes
+        # both -- over its lookahead, which is a DISTANCE (`OPP_FUTURE_REJOIN_M`), not a time: a car
+        # that has just been told to stop does not slide sideways onto the line while standing
+        # still. Smoothstep rather than a ramp, so the label does not open with a lateral velocity
+        # the car does not have.
+        #
+        #     p_k = x_now + sum_i R(dpsi * keep_i) (walk_i - walk_{i-1})  -  e_0 (1 - keep_k)
+        #
+        # which is exactly x_now at k = 0 (whatever the errors) and exactly the walk once keep
+        # reaches 0 (whatever the car was doing). Heading matters more than it looks: at 0.1 s a
+        # car has travelled 0.38 m, and 0.2 rad of heading error is 7.6 cm of it -- the size of the
+        # whole error at that horizon, and larger than the lateral motion being predicted.
         x = (torch.stack(arc, 1) / OPP_FUTURE_REJOIN_M).clamp(0.0, 1.0)      # (B, n)
         keep = 1.0 - x * x * (3.0 - 2.0 * x)
-        walk = walk + (st[:, :2] - walk[:, 0])[:, None, :] * keep[..., None]
+        tan0 = T.tan[tid, idx0]
+        dpsi = torch.remainder(st[:, 2] - torch.atan2(tan0[:, 1], tan0[:, 0]) + math.pi,
+                               2 * math.pi) - math.pi
+        ang = dpsi[:, None] * keep[:, :-1]                                   # (B, n-1)
+        c_, s_ = torch.cos(ang), torch.sin(ang)
+        d = walk[:, 1:] - walk[:, :-1]
+        rot = torch.stack([d[..., 0] * c_ - d[..., 1] * s_, d[..., 0] * s_ + d[..., 1] * c_], 2)
+        walk = (st[:, None, :2] + torch.cat([torch.zeros_like(rot[:, :1]), rot.cumsum(1)], 1)
+                - (st[:, :2] - walk[:, 0])[:, None, :] * (1.0 - keep)[..., None])
         grid = torch.arange(n, device=self.device, dtype=t.dtype) * dtw
         return _interp_path(walk, grid, t)
 

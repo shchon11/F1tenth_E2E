@@ -44,6 +44,12 @@ SPEC_ROUTING = {
     "gyro_scale": "EnvConfig.imu_gyro_scale", "accel_scale": "EnvConfig.imu_accel_scale",
     "act_dim": "checked against the model, not applied to the env",
     "att_scale": "fixed contract constant, asserted equal",
+    # The privileged opponent block (`gym_env.OPP_TOKEN_MODES`). Listed so that a checkpoint
+    # carrying it reaches a refusal with a reason rather than the generic "cannot honour" -- and
+    # NOT routed to anything: a benchmark env never builds an oracle input, because a number
+    # produced with the other cars' true future in the observation is not a benchmark result.
+    "opp_token": "REFUSED: a simulator oracle is never a benchmark observation",
+    "opp_future_model": "records which prediction the oracle block used; not an env setting here",
 }
 
 
@@ -172,6 +178,12 @@ def assert_env_matches_spec(env, spec: dict) -> dict:
     if unsupported:
         raise AdapterError(f"checkpoint records observation scalars this adapter cannot honour: "
                            f"{unsupported}")
+    if spec.get("opp_token"):
+        raise AdapterError(
+            f"checkpoint was trained with the privileged opponent block "
+            f"(opp_token={spec['opp_token']!r}): the other cars' true relative position, velocity "
+            f"and future, read out of the simulator. A benchmark env does not build one, and a "
+            f"score obtained with it would not be comparable with any row in the suite.")
     want = ObsSpec(**{k: v for k, v in spec.items() if k in ObsSpec.__dataclass_fields__})
     got = common.obs_spec(env)
     diffs = {}

@@ -371,7 +371,10 @@ def main():
         if mem_spec or chan or token:
             model, _extra, fresh = load_for_memory(a.init, device, memory=mem_spec, scan_channels=chan,
                                                    opp_token_dim=opp_token_dim(token),
-                                                   override={"priv_dim": priv_dim, "act_dim": env.act_dim})
+                                                   override={"n_stack": spec.scan_stack,
+                                                             "n_beams": spec.n_beams,
+                                                             "priv_dim": priv_dim,
+                                                             "act_dim": env.act_dim})
             print(f"warm start from {os.path.basename(a.init)}: {len(fresh)} fresh tensor(s)", flush=True)
         else:
             model, _extra = load_checkpoint(a.init, device, override={"priv_dim": priv_dim, "act_dim": env.act_dim})
