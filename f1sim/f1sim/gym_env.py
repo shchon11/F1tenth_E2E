@@ -77,21 +77,23 @@ OPP_FUTURE_REJOIN_M = 2.0
 #:               offset it is holding), and a policy-driven one is read off its plan tracker's
 #:               predicted trajectory. Neither is a peek at the future: both are the controller's
 #:               own intention, which the simulator already knows this step.
-#:   "pred"   -- the plan tracker's own predicted trajectory for EVERY car, whoever drives it,
-#:               continued straight past its 0.6 s horizon. The raceline walk's competitor inside
-#:               that horizon: it is the iLQR's own forward rollout of the plan the car was actually
-#:               given, so it knows the plan's braking and its lane change without being told, and
-#:               it is what worker 16's `--opp-token future` uses. What it cannot know is that a
-#:               scheduled event will EXPIRE, or anything at all beyond 0.6 s.
+#:   "pred"   -- THE DEFAULT. The plan tracker's own predicted trajectory for every car, whoever
+#:               drives it, continued straight at its final heading and speed past its 0.6 s
+#:               horizon. It is the iLQR's forward rollout of the plan the car was actually given,
+#:               so the plan's braking, its lane change, its heading and its acceleration bounds
+#:               are already in it rather than reconstructed -- and measured, that is worth 3x the
+#:               walk's accuracy on the very cars the walk models explicitly. It is also what
+#:               worker 16's `--opp-token future` uses.
 #:   "hybrid" -- the tracker's rollout inside its own horizon and the raceline walk's increments
-#:               beyond it, anchored so the two meet. THE DEFAULT, and the measurement is in
-#:               `docs/research/interactive-teacher-2026-09-15.md`: the tracker's rollout is three
-#:               times more accurate than the walk wherever it reaches, because it is the plan the
-#:               car was actually given rather than a reconstruction of it, and past 0.6 s it is a
-#:               straight line on a curving track while the walk still follows the road.
+#:               beyond it, anchored so the two meet. A hypothesis that the measurement REJECTED and
+#:               that is kept because the rejection is the useful part: past 0.6 s the rollout is a
+#:               straight line on a curving track, so continuing along the road ought to beat it --
+#:               and it does not. At 0.75 / 1.0 s, MAE 0.232 / 0.449 m against "pred"'s 0.214 /
+#:               0.410. The walk's increments carry the walk's own error, and inheriting that is
+#:               worse over 0.4 s than simply going straight.
 #:   "constv" -- world-frame constant velocity from the current state. The floor every other model
 #:               has to beat, and what a caller with no teacher gets.
-OPP_FUTURE_MODELS = ("hybrid", "plan", "pred", "constv")
+OPP_FUTURE_MODELS = ("pred", "hybrid", "plan", "constv")
 
 #: The privileged opponent block (`EnvConfig.opp_token`), an *oracle input*: it is refused by the
 #: exporter and by `f1sim_ros.policy_node`, because no car can measure it.
@@ -427,7 +429,7 @@ class EnvConfig:
     # Which prediction `car_future` (and so the "future" columns of the block) uses -- see
     # `OPP_FUTURE_MODELS`. Recorded in the spec next to the mode, because "the opponent's future"
     # under two different models is two different labels.
-    opp_future_model: str = "hybrid"
+    opp_future_model: str = "pred"
     # Obstacle layouts redrawn per env at every reset (f1sim.procedural_obstacles). 0 = off, and off
     # is byte-identical to the env before they existed: nothing is allocated, nothing is drawn from
     # the generator and `props_for` returns exactly what it returned. The training set's obstacle
