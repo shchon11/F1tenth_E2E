@@ -250,7 +250,56 @@ brakes and swerves for cars that are already going away.
 
 ## The teacher's own ceiling
 
-PENDING-D2
+The contract's gate: *if the interactive teacher does not out-race the raceline teacher against
+reactive opponents, stop and report — a teacher that cannot use the future cannot teach it.* The
+rule and its resolutions were fixed in `work/gate.md` before either measurement existed.
+
+### The traffic proxy, full protocol
+
+`evaluate --protocol rolling`, 2400 steps × 96 cars (32 learners) on each of `real:blackbox2022_1`,
+`gen:control:1400` and `real:korea_2026_competition+rlobs211` separately, race size 3, teacher
+opponents at 0.6–1.15× with **all seven behaviours** (brake, stop, shift, defend, yield, line,
+oblivious) at 1.0 per 10 s, cap 9.0. Two seeds. 96 learner-minutes per cell — 384 in all.
+
+| per learner-minute | raceline 4242 | raceline 909 | interactive 4242 | interactive 909 | resolution |
+|---|---|---|---|---|---|
+| **passes held** ↑ | 0.15 | 0.15 | **0.39** | **0.35** | ±0.1 |
+| **car contacts** ↓ | 5.86 | 7.17 | **2.62** | **2.94** | ±0.35 |
+| **wall collisions** ↓ | 0.05 | 0.05 | **0.02** | **0.01** | ±0.1 |
+| pace vs the opponents ↑ | 1.103 | 1.146 | 1.097 | 1.123 | ±0.07 |
+
+| | raceline 4242 | raceline 909 | interactive 4242 | interactive 909 |
+|---|---|---|---|---|
+| collisions / km ↓ | 24.3 | 29.9 | **11.0** | **12.4** |
+| episodes ending in a collision ↓ | 0.802 | 0.857 | **0.635** | **0.676** |
+| progress rate [m/s] | 4.16 | 4.14 | 4.00 | 3.96 |
+| share of time **attacking** | 19.3 % | 24.4 % | **39.1 %** | **42.2 %** |
+| share of time in contention | 85.1 % | 84.8 % | 87.3 % | 87.1 % |
+
+**It passes 2.4× as often while more than halving contacts**, on both seeds, every difference
+outside its resolution and both seeds agreeing in sign. Collisions per kilometre fall by more than
+half; episodes ending in a collision fall from four in five to two in three.
+
+Three things are worth reading carefully.
+
+**It is not simply driving faster.** Pace against the opponents is *unchanged to slightly lower*
+(1.097 vs 1.103, 1.123 vs 1.146) and progress rate is 4 % lower. The extra passes are not bought
+with speed; they are bought with position. The share of time spent *attacking* — inside the tight
+3 m window, ahead-of-abeam — roughly doubles, from 19–24 % to 39–42 %, on the same amount of total
+contention. The teacher is in the right place more often, not going quicker.
+
+**The contacts result is the larger one, and it is not what the gate was written around.** 5.9–7.2
+contacts per learner-minute is what a blind teacher in traffic actually looks like: it is kept off
+the other cars by one mechanism, a follow-gap cap that can only slow it down, and the rest of the
+time it drives into them. Halving that is the same fact as §"how often the tense matters" seen from
+the outside — a teacher that scores against where the other car *will be* stops arriving where it
+is going to be.
+
+**Nothing here is a student.** This is the teacher's own ceiling, which is what the gate is for: it
+licenses the distillation, and it says nothing about whether a LiDAR-only policy can reproduce any
+of it.
+
+PENDING-D2-T
 
 ## Distilling it
 
