@@ -46,6 +46,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt"); ap.add_argument("--out", default=""); ap.add_argument("--trt", action="store_true")
     a = ap.parse_args()
+    # No `allow_oracle`: a checkpoint trained with privileged opponent tokens
+    # (`f1sim.opp_token`) has input columns the car cannot fill, and an ONNX graph that takes them
+    # as part of `proprio` is a graph nobody can feed. `load_checkpoint` refuses it here by
+    # default, with the reason; there is deliberately no flag on this tool to override that.
     model, extra = load_checkpoint(a.ckpt, "cpu"); model.eval()
     spec = extra.get("spec", {})
     k, N, P = model.meta["n_stack"], model.meta["n_beams"], model.meta["proprio_dim"]

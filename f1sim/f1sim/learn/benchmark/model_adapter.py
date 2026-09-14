@@ -44,6 +44,7 @@ SPEC_ROUTING = {
     "gyro_scale": "EnvConfig.imu_gyro_scale", "accel_scale": "EnvConfig.imu_accel_scale",
     "act_dim": "checked against the model, not applied to the env",
     "att_scale": "fixed contract constant, asserted equal",
+    "opp_token": "EnvConfig.opp_token (an ORACLE; only a traffic cell can supply it)",
 }
 
 
@@ -107,8 +108,11 @@ def load_actor(entry: Dict[str, Any], device):
             f"{os.path.basename(path)} is legacy-trained and would run under {eval_arm!r}. That is "
             f"a cross-runtime reference and has to say so: set cross_runtime=true on the entry.")
 
+    # allow_oracle: the benchmark builds the simulator, so a privileged-token checkpoint CAN be
+    # scored here -- and only here. `build_cell` below refuses any cell that cannot produce the
+    # block, so it is scored on the traffic family or not at all, and `report.py` labels it.
     model, extra = load_checkpoint(path, device, allow_controller=(trained_arm != "legacy"),
-                                   strict_names=True)
+                                   allow_oracle=True, strict_names=True)
     model.eval()
     if not (extra or {}).get("spec"):
         raise AdapterError(f"{os.path.basename(path)} carries no extra['spec']; the observation "
@@ -327,7 +331,15 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
                      imu_gyro_scale=float(spec["gyro_scale"]),
                      imu_accel_scale=float(spec["accel_scale"]),
                      v_max_policy=float(spec["v_max"]),
+                     opp_token=str(spec.get("opp_token") or "off"),
                      compile_tracker=bool(suite.get("compile_tracker", False)))
+    if ecfg.opp_token != "off" and race_size < 2:
+        raise AdapterError(
+            f"this checkpoint was trained with privileged opponent tokens "
+            f"(opp_token={ecfg.opp_token!r}) and cell {cell.get('id', cell.get('map'))!r} is solo "
+            f"(race_size {race_size}). The "
+            f"block does not exist without another car, and scoring the policy on zeros it was "
+            f"trained to believe would be a number about nothing. Score it on the traffic family.")
     if race_size > 1 and opponent == "teacher" and rls is None:
         raise AdapterError("a teacher-opponent race needs racelines; pass racelines= or names")
     env = common.make_env(trs, envs, device, ecfg, cfg=cfg, seed=int(cell["seed"]),

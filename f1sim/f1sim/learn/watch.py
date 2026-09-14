@@ -489,7 +489,8 @@ def default_consumer_refusal(path: str) -> Optional[str]:
 
       * a checkpoint-shaped file at all -- a mapping carrying `meta` and `state_dict`;
       * `residual_plan` (`model.py:372-374`);
-      * `_refuse_controller` (`model.py:324-341`) -- a non-`legacy` recorded controller arm;
+      * `_refuse_controller` -- a non-`legacy` recorded controller arm;
+      * `_refuse_oracle` -- privileged opponent tokens (`f1sim.opp_token`) in the observation;
       * the conditional gate (`model.py:384`) -- `cond_dim > 0` or a lab-oracle source, including the
         `CondSpec.from_meta` parse and its dim-consistency check;
       * an `act_dim` this viewer cannot drive (`2` or the current plan width).
@@ -540,6 +541,9 @@ def default_consumer_refusal(path: str) -> Optional[str]:
         arm = str(((exp.get("controller") or {}).get("arm")) or "legacy")
         if arm != "legacy":
             return f"controller arm {arm!r}"
+        token = str(meta.get("opp_token") or ((ck.get("extra") or {}).get("spec") or {}).get("opp_token") or "off")
+        if token != "off":
+            return f"privileged opponent tokens (opp_token={token!r}; an oracle, not a policy)"
         from .conditioning import CondSpec
         cond_meta = CondSpec.from_meta(meta.get("cond")).to_meta()   # raises on an inconsistent spec
         cond_dim = meta.get("cond_dim", 0)

@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from ..gym_env import EnvConfig, FUTURE_LABEL_DIM, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS
+from ..opp_token import OPP_TOKEN_MODES, describe as describe_opp_token
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
@@ -175,7 +176,7 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
 
 
-def warm_start_additions(init_meta: dict, memory, scan_channels, future_head):
+def warm_start_additions(init_meta: dict, memory, scan_channels, future_head, opp_token=None):
     """The architecture pieces `--init` does NOT already carry, i.e. what a warm start would add.
 
     A resume is not a warm start. `load_for_memory` refuses a checkpoint that already has the thing
@@ -187,7 +188,8 @@ def warm_start_additions(init_meta: dict, memory, scan_channels, future_head):
     """
     return (None if init_meta.get("memory") else memory,
             None if init_meta.get("scan_channels") else scan_channels,
-            None if init_meta.get("future_head") else future_head)
+            None if init_meta.get("future_head") else future_head,
+            None if init_meta.get("opp_token") else opp_token)
 
 
 def main():
@@ -337,6 +339,37 @@ def main():
                          f"a k near the horizon leaves almost nothing to train on")
     ap.add_argument("--aux-future-width", type=int, default=128,
                     help="hidden width of the future head's one layer")
+    ap.add_argument("--ttc-penalty", type=float, default=0.0, metavar="LAMBDA",
+                    help="per-step penalty at zero time to contact with the nearest car, ramping "
+                         "linearly from 0 at --ttc-safe. The reward audit "
+                         "(docs/research/reward-audit-2026-09-13.md) found nothing prices the "
+                         "*approach* to another car: car_proximity is charged per metre driven and "
+                         "only inside --car-safe-gap, so closing at 3 m/s from 2 m away -- 0.7 s "
+                         "from a contact -- costs zero. 0 = off.")
+    ap.add_argument("--ttc-safe", type=float, default=1.0, metavar="SECONDS",
+                    help="[s] time to contact above which --ttc-penalty is 0")
+    ap.add_argument("--overtake-sustained", type=float, nargs=3, default=None,
+                    metavar=("DIST_M", "TIME_S", "BONUS"),
+                    help="pay BONUS once when the learner has led an opponent by DIST_M metres "
+                         "along the lane for TIME_S seconds continuously (1.5 1.0 <bonus> is the "
+                         "contract's default). Unlike --overtake-bonus, which pays dense arc gained "
+                         "and so pays the approach and the crossing instant, this pays only a pass "
+                         "that stuck.")
+    ap.add_argument("--opp-token", default="off", choices=OPP_TOKEN_MODES,
+                    help="ORACLE. Append the simulator's own description of the nearest two "
+                         "opponents to the observation (f1sim/opp_token.py): 'pos' = relative "
+                         "position + presence, 'posvel' = + relative velocity, 'future' = + where "
+                         "each opponent's own controller intends to be at 0.10/0.25/0.50/0.75 s. "
+                         "The checkpoint records it and is refused by the exporter and the ROS "
+                         "node. Its purpose is to answer whether the planner, handed the "
+                         "opponent's state, races better than it does with LiDAR alone -- not to "
+                         "produce a policy.")
+    ap.add_argument("--name-seed-fresh", action="store_true",
+                    help="re-initialise every tensor a warm start leaves fresh from its own module "
+                         "name rather than from the ambient generator (learn.model."
+                         "reinit_fresh_by_name, from branch feat/motion-memory). Two arms that "
+                         "differ by an input width otherwise differ in every module built after "
+                         "the layer that widened, because it consumes different draws.")
     ap.add_argument("--car-proximity-penalty", type=float, default=0.0,
                     help="per metre driven with another car's body inside car_safe_gap (0.6 m), scaled "
                          "by closing speed. Without it the only gradient near a car is the overtake "
@@ -440,6 +473,32 @@ def main():
         raise SystemExit("--procedural-density / --procedural-max-props / "
                          "--procedural-raceline-margin without --procedural-obstacles: nothing "
                          "draws a layout, so these would silently do nothing.")
+    if a.opp_token != "off":
+        if a.race_size < 2:
+            raise SystemExit(f"--opp-token {a.opp_token} needs --race-size > 1: with one car per "
+                             f"race the block is the zeros an absent opponent already produces.")
+        if a.action_mode != "plan":
+            raise SystemExit(f"--opp-token {a.opp_token} needs --action-mode plan: the future "
+                             f"columns are the opponent's own plan-tracker reference, and in "
+                             f"'direct' mode there is no plan to read.")
+    if a.overtake_sustained is not None:
+        d_, t_, b_ = a.overtake_sustained
+        if not (d_ > 0 and t_ > 0):
+            raise SystemExit(f"--overtake-sustained {a.overtake_sustained}: the distance and the "
+                             f"hold time are what make it 'sustained'; both must be positive.")
+        if b_ > 0 and a.race_size < 2:
+            raise SystemExit("--overtake-sustained needs --race-size > 1: with no opponent there is "
+                             "nothing to lead.")
+    if a.ttc_penalty > 0:
+        if a.race_size < 2:
+            raise SystemExit("--ttc-penalty needs --race-size > 1: time to contact is time to "
+                             "contact with another car.")
+        if not a.ttc_safe > 0:
+            raise SystemExit(f"--ttc-safe {a.ttc_safe}: it is the horizon the penalty ramps over, "
+                             f"so at 0 the term is either off or a step function at contact.")
+    elif a.ttc_safe != 1.0:
+        raise SystemExit("--ttc-safe without --ttc-penalty: nothing reads it, so it would silently "
+                         "do nothing.")
     if a.kl_decay is None:
         a.kl_decay = a.total
     device = torch.device(a.device); torch.manual_seed(a.seed)
@@ -475,6 +534,12 @@ def main():
                                                               reward_car_proximity=a.car_proximity_penalty,
                                                               reward_sideslip=a.sideslip_penalty,
                                                               car_safe_gap=a.car_safe_gap,
+                                                              reward_ttc=a.ttc_penalty, ttc_safe=a.ttc_safe,
+                                                              **({} if a.overtake_sustained is None else
+                                                                 {"overtake_hold_dist": a.overtake_sustained[0],
+                                                                  "overtake_hold_time": a.overtake_sustained[1],
+                                                                  "reward_overtake_hold": a.overtake_sustained[2]}),
+                                                              opp_token=a.opp_token,
                                                               max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
                                                               action_mode=a.action_mode,
@@ -556,20 +621,27 @@ def main():
     #: this, leg two of a recurrent run -- same command line, `--init` now pointing at leg one's
     #: output -- goes down the warm-start path and is refused.
     init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
-    add_mem, add_chan, add_fut = warm_start_additions(init_meta, mem_cfg, chan_cfg, fut_cfg)
-    if a.init and (add_mem or add_chan or add_fut):
+    tok_cfg = a.opp_token if a.opp_token != "off" else None
+    add_mem, add_chan, add_fut, add_tok = warm_start_additions(init_meta, mem_cfg, chan_cfg, fut_cfg, tok_cfg)
+    if a.name_seed_fresh and not a.init:
+        raise SystemExit("--name-seed-fresh without --init: with no warm start nothing is 'fresh' "
+                         "and the whole model is drawn from --seed already.")
+    if a.init and (add_mem or add_chan or add_fut or add_tok):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
         # actor's first action of this run is bit-identical to the one the original would have
         # produced. `tests/test_memory_model.py` is the check.
         model, extra, fresh = load_for_memory(
             a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
-            future_head=add_fut,
+            future_head=add_fut, opp_token=add_tok,
+            init_seed=(a.seed if a.name_seed_fresh else None),
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
-        print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} | "
-              f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
+        print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} "
+              f"opp_token {add_tok} | {len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}"
+              + (f" | fresh tensors re-seeded from their own names (seed {a.seed})"
+                 if a.name_seed_fresh else ""))
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
@@ -587,9 +659,12 @@ def main():
         # 17-wide privileged vector. Both conditioning arms already pass it; the unconditional path
         # omitted it, which made `--controller X --critic-priv-adapter ...` (no `--cond`) the one
         # combination that widened the critic without teaching it where the columns went.
+        # allow_oracle: the trainer IS the simulator that produces the block, and this is the leg-two
+        # path of an oracle run. Every other consumer still refuses it.
         model, extra = load_checkpoint(a.init, device, override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                                                                   "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim, "act_dim": env.act_dim},
-                                       allow_conditional=False, priv_adapter=priv_adapter)
+                                       allow_conditional=False, priv_adapter=priv_adapter,
+                                       allow_oracle=True)
         print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing",
               "| resumed architecture:", {k_: v_ for k_, v_ in model.meta.items()
                                           if k_ in ("memory", "scan_channels", "future_head")} or "plain")
@@ -602,7 +677,8 @@ def main():
                             scan_stem=a.scan_stem, cond_dim=cond_dim,
                             cond=cond_spec.to_meta() if cond_dim else None,
                             priv_adapter=priv_adapter, memory=mem_cfg,
-                            scan_channels=chan_cfg, future_head=fut_cfg).to(device)
+                            scan_channels=chan_cfg, future_head=fut_cfg,
+                            opp_token=tok_cfg).to(device)
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
@@ -614,6 +690,18 @@ def main():
     if memory_on or n_extra:
         from .memory import describe as _describe_memory
         print(f"policy memory: {_describe_memory(model.meta)}")
+    #: Read back from the model for the same reason: a resumed checkpoint carries its own block, and
+    #: the env has to be producing exactly the one the first layer's columns were laid out for.
+    token_on = str(model.meta.get("opp_token") or "off")
+    if token_on != env.opp_token:
+        raise SystemExit(f"this checkpoint expects opponent tokens {token_on!r} and the env is "
+                         f"producing {env.opp_token!r}: the proprio columns would mean different "
+                         f"things on the two sides. Pass --opp-token {token_on}.")
+    if token_on != "off":
+        print(f"ORACLE: {describe_opp_token(token_on)}")
+    if a.ttc_penalty > 0 or (a.overtake_sustained and a.overtake_sustained[2] > 0):
+        print(f"reward additions: ttc {a.ttc_penalty} @ {a.ttc_safe} s | "
+              f"sustained lead {a.overtake_sustained}")
     #: Read back from the model for the same reason `memory_on` is: a resumed checkpoint carries its
     #: own head, and the rollout has to collect labels exactly when there is something to score.
     future_cfg = dict(model.meta.get("future_head") or {})

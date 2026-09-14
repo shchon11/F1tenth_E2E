@@ -117,7 +117,9 @@ Relevant flags: `--envs`, `--horizon`, `--epochs`, `--minibatch`, `--total`, `--
 `--cap1` / `--cap-steps` (speed-cap curriculum), `--kl-coef` / `--kl-decay`, `--critic-warmup`,
 `--fresh-opt`, `--tracks`, `--obstacle-draws`, `--sim-backend`, `--memory` /
 `--memory-hidden` / `--memory-critic`, `--scan-channels` / `--scan-memory-tau`,
-`--aux-grip` / `--aux-opp` / `--aux-future` (auxiliary heads), `--metrics-jsonl`.
+`--aux-grip` / `--aux-opp` / `--aux-future` (auxiliary heads), `--metrics-jsonl`,
+`--ttc-penalty` / `--ttc-safe` and `--overtake-sustained` (traffic reward terms),
+`--opp-token` (an oracle -- see below), `--name-seed-fresh`.
 
 `--tracks` takes a split name or a list of scenarios ([Tracks](tracks.md)):
 
@@ -317,6 +319,77 @@ refuses to start.
 ONNX graph. It costs the car nothing and it is not counted in the budget below.
 
 **Measuring what it did.** [`probe_hidden`](#probing-the-hidden-state-probe_hidden) below.
+
+### Time to contact and a lead that stuck (`--ttc-penalty`, `--overtake-sustained`)
+
+Two reward terms aimed at what the traffic attribution actually found
+([failure-attribution-2026-09-13](research/failure-attribution-2026-09-13.md) §5): contacts are
+side-by-side, closing at +1.5 m/s, and half the wall collisions happen while alongside or just
+behind the car being passed. The reward audit
+([reward-audit-2026-09-13](research/reward-audit-2026-09-13.md)) says why neither existing term
+prices that: `--car-proximity-penalty` is charged per metre *driven* and only inside
+`--car-safe-gap`, so closing at 3 m/s from two metres away costs nothing; the collision penalty
+fires once, on 0.2 % of steps, after it is too late.
+
+```bash
+--ttc-penalty 0.05 --ttc-safe 1.0            # per step, ramping from 0 at 1.0 s to 0.05 at contact
+--overtake-sustained 1.5 1.0 5.0             # 5.0, once, for leading a car by 1.5 m for 1.0 s
+```
+
+* **`--ttc-penalty LAMBDA --ttc-safe T`** charges `LAMBDA * max(0, (T - TTC) / T)` every step. TTC is
+  the **body-to-body** gap over the **line-of-sight closing speed** to the most threatening car
+  (`gym_env.car_ttc`), so it is small exactly when geometry and closing speed together say a contact
+  is coming, at any gap; a pair that is not closing has no time to contact and pays nothing. Per
+  step rather than per metre driven, unlike the two proximity terms: what is priced is the time
+  left, and standing still beside a car closing on you is as close to a contact as driving past it.
+* **`--overtake-sustained D T BONUS`** pays `BONUS` **once**, when the learner has been `D` metres
+  ahead of an opponent along the lane, continuously, for `T` seconds. Not on the crossing instant:
+  `--overtake-bonus` already pays dense arc gained, which pays the approach, and at 1.0 it measured
+  +0.03/s against +4.00/s of progress. A lead that is lost resets the clock, so being re-passed and
+  passing again pays again; any car of the race resetting also resets it, so a crashed opponent
+  respawning behind the field does not hand the learner a bonus.
+
+Both default to 0 and both appear in `REWARD_COMPONENT_KEYS` (`ttc`, `overtake_hold`), so
+`learn.ppo`'s per-component logging and the reward audit report them like every other term. Size
+them by measuring: a term at 1 % of the objective is not a term.
+
+### Privileged opponent tokens (`--opp-token`) — an ORACLE, never a policy
+
+**A checkpoint trained with this flag is not deployable and the loaders refuse to hand it to the
+exporter, the ROS node or the viewer.** It exists to answer one question
+([oracle-planner-2026-09-15](research/oracle-planner-2026-09-15.md)): every attempt to make the
+recurrent state carry the opponent's velocity failed to move a linear read-out above R² 0.3, so
+before more perception work, does the planner race any better when the simulator simply *hands* it
+the opponent's state?
+
+```bash
+--opp-token off        # the control (default): LiDAR only
+--opp-token pos        # +6 proprio columns:  nearest two cars, dx, dy, present
+--opp-token posvel     # +10:                 ... and their relative velocity
+--opp-token future     # +26:                 ... and where their own controllers intend to be
+                       #                      at 0.10 / 0.25 / 0.50 / 0.75 s
+```
+
+The block is appended after every existing proprio key, so a warm start from a checkpoint without it
+is a column append: the new input columns are **zero**, and the block starts as an input the network
+ignores and can learn to use, exactly like an extra scan channel. `f1sim/opp_token.py` documents the
+layout; `--race-size` must be > 1 and `--action-mode plan` is required, because the future columns
+are read from the opponent's own plan tracker.
+
+The `future` columns are not ground truth — a batched simulator cannot peek ahead. They are the
+**iLQR rollout of the opponent's own tracked plan** (`PlanTracker.last_pred`), which for a
+teacher-driven car already carries its scheduled event (brake / stop / shift / defend / yield /
+line), its speed scale and its follow cap, and for a pool opponent is that checkpoint's own plan.
+Measured against where the car actually went
+(`work/oracle-planner/work/label_validation.py`): RMSE 0.024 / 0.054 / 0.198 / 0.406 m at the four
+horizons, against 1.046 m at 0.75 s for what a `posvel` policy can extrapolate for itself.
+
+`--name-seed-fresh` belongs with it. The four arms differ by the *width of the proprio vector*, so
+the wider first layer consumes different draws from the ambient generator and every module built
+after it — including the GRU a warm start leaves fresh — would differ too. The flag re-initialises
+each fresh module from `(--seed, its own qualified name)` instead
+(`learn.model.reinit_fresh_by_name`, from branch `feat/motion-memory`), so arms that differ by an
+input width differ by that and nothing else.
 
 ### Probing the hidden state (`probe_hidden`)
 

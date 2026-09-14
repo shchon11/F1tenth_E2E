@@ -84,7 +84,11 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     model = None
     metadata = {}
     if not teacher:
-        model, metadata = load_checkpoint(ckpt, device)
+        # allow_oracle: this function builds the simulator, which is the one thing that can produce
+        # the privileged opponent block, and the env below is configured from the checkpoint's own
+        # spec so it produces exactly the one the policy was trained on. Every consumer that cannot
+        # -- the exporter, the ROS node -- still refuses it.
+        model, metadata = load_checkpoint(ckpt, device, allow_oracle=True)
         model.eval()
     mode = "plan" if (model is not None and model.meta.get("act_dim", 2) >= 5) or (teacher and action_mode == "plan") else "direct"
     spec = metadata.get("spec", {})
@@ -101,7 +105,14 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      race_size=race_size, opponent=opponent,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
                      scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
-                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2))
+                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+                     opp_token=str(spec.get("opp_token") or (model.meta.get("opp_token") if model else None) or "off"))
+    if ecfg.opp_token != "off" and not (race_size > 1 and mode == "plan"):
+        raise ValueError(f"this checkpoint was trained with privileged opponent tokens "
+                         f"(opp_token={ecfg.opp_token!r}); evaluating it needs race_size > 1 and "
+                         f"the plan action space, so that the block exists at all. Got race_size "
+                         f"{race_size}, action mode {mode!r}. Feeding it zeros instead would "
+                         f"measure a policy driving on an input it was trained to believe.")
     if opp_speed_range is not None:
         ecfg.opp_speed_range = tuple(float(x) for x in opp_speed_range)
     step_dt = 1.0 / (cfg or Config()).sim.control_rate

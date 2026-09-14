@@ -202,6 +202,13 @@ class PolicyNode(Node):
         self.declare_parameter("imu_accel_scale", 0.0)
         p = lambda n: self.get_parameter(n).value
         self.device = torch.device(p("device"))
+        # No `allow_oracle` and no parameter to set one. A checkpoint trained with privileged
+        # opponent tokens (`f1sim.opp_token`) reads the simulator's exact description of the other
+        # cars -- position, velocity and their own intended trajectory up to 0.75 s ahead. The car
+        # has no source for any of it, and feeding zeros would run a policy that was trained to
+        # believe those columns on a lie, at speed, next to a wall. `load_checkpoint` refuses it
+        # here, and `ObsBuilder` below refuses the same spec independently, so neither a checkpoint
+        # with the metadata nor one with only the spec can reach the wheels.
         self.model, extra = load_checkpoint(p("checkpoint"), self.device); self.model.eval()
         self.spec = ObsSpec(**extra["spec"]) if extra.get("spec") else ObsSpec()
         self.obs = ObsBuilder(self.spec, self.device)
