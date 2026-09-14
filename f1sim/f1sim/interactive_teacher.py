@@ -314,7 +314,8 @@ class InteractiveTeacher:
         return torch.arange(n, device=self.device, dtype=torch.float32) * spec.dt
 
     def rollout(self, cand: torch.Tensor, state: torch.Tensor, v_max: float, spec: PlanSpec):
-        """(world xy (K, B, H, 2), world heading (K, B, H), speed (K, B, H)) of each candidate.
+        """(world xy, world heading, speed) of each candidate, each (K, B, H+1) over the
+        `horizon_times` samples -- the xy with a trailing 2.
 
         `mpc.reference` and nothing else: it is the function the plan tracker walks its own
         reference with, so the trajectory scored here is the trajectory that would be tracked --

@@ -159,4 +159,32 @@ PENDING-D3
 
 ## What this licenses, and what it does not
 
-PENDING-LICENCE
+**Licensed.**
+
+* *A teacher that scores candidate plans against the opponents' predicted positions makes the racing
+  choice on the three situations a present-tense cost cannot see*, and the controlled comparison
+  isolates the time-indexing: the same candidates, the same walls, the same progress and smoothness,
+  with only the opponents' assumed motion changed.
+* *Its prediction of where a car will be is better than constant velocity from a quarter of a second
+  out, and on the lateral axis it is better in kind rather than in degree* — measured against the
+  realised future on logged rollouts, with every sample that crossed a race boundary dropped.
+* *It fits inside a DAgger collection loop.* 2.14x `RacelineTeacher` per label against a 3x budget.
+* *Every flag off is the run it was.* `--teacher raceline` is the previous DAgger loop;
+  `--opp-token off` produces the same observation dict, key for key; `plan_action` with no `idx` is
+  what it was, one deduplicated projection aside (the same call, made once instead of twice).
+* *The oracle cannot leave the simulator by accident.* Four independent refusals, each with its own
+  reason: the exporter (an .onnx outlives its checkpoint), the ROS node (before it builds an
+  observation), `ObsBuilder` (the deployment-side builder cannot build those columns at all), and
+  the benchmark adapter (a suite score taken with it is not comparable with one taken without it).
+
+**Not licensed.**
+
+* **Any racing claim, in either direction, until Deliverable 2 has run.** Nothing above says the
+  interactive teacher completes more races, passes more, or touches fewer cars than the raceline
+  teacher; `work/gate.md` fixes what would settle that, and the measurement is GPU work.
+* **Any claim that the five weights are right.** They were set from the measured scale of each term
+  -- the corner-cut bonus the smoothness term has to price back, the lane width the opponent kernel
+  has to fit a pass through -- and not tuned against a racing outcome. Nobody has swept them.
+* **Anything about a student.** No policy in this branch has been distilled from this teacher.
+* **Anything about the real car.** The teacher is privileged by construction: it reads the other
+  cars' state out of the simulator, and so does every input it hands a student.
