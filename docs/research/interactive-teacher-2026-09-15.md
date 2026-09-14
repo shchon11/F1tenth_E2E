@@ -124,10 +124,28 @@ PENDING-LABEL-TABLE
 ## Is it affordable?
 
 The contract's budget is 3× `RacelineTeacher` per label, because the label is produced for every env
-on every collection step. `work/bench/bench_teacher.py`, both teachers timed on the same env, the
-same states, interleaved, with the opponent futures inside the interactive teacher's time:
+on every collection step. `work/bench/bench_teacher.py` times both teachers on the same env, the
+same states, the same batch, interleaved so a scheduling drift hits both, with the opponent futures
+inside the interactive teacher's time because they are part of producing its label.
 
-PENDING-BENCH-TABLE
+| CPU, 96 envs, race size 3, two tracks, 20 candidates at 2 GN iterations, 1.0 s horizon | per label |
+|---|---|
+| `RacelineTeacher.plan_action` | 10.03 ms |
+| `InteractiveTeacher.plan_action` | **21.44 ms** |
+| of which `opponent_future` | 3.56 ms |
+| **ratio** | **2.14×**, against a 3× budget |
+
+Where the 2.14 comes from is worth stating, because it is not obvious that 20 candidates can cost
+2×. Five *offset* tiles go through one `plan_action` call at 2 Gauss-Newton iterations instead of 6,
+which is 5 × 2/6 = 1.67 reference-plan equivalents; the four *speed* candidates are free, because
+scaling the plan's two normalized speed targets leaves the path alone. `plan_action` also lost a
+duplicated raceline projection along the way — it used to project the same pose twice, and on a long
+raceline that argmin is the single most expensive thing it does — which the interactive teacher
+reuses across all five tiles. Everything else is one batched scoring pass.
+
+Everything is batched over B envs *and* over candidates. The one Python loop left is the opponent
+walk, which is a recursion in time (each step's speed depends on the last) and cannot be vectorised
+over its own axis; it is 16–21 iterations of cheap (B,) arithmetic and it is the 3.56 ms above.
 
 ## Does the time-indexing decide anything?
 
