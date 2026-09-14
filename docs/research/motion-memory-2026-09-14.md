@@ -386,6 +386,74 @@ recovers from the warm start the same way. Two things are worth taking:
 Nothing else here distinguishes the arms, which is what 131 updates on one seed was said in advance
 to be unable to do.
 
+### What the channel did to the probe
+
+The two smoke checkpoints go back through the E1 table as two more columns, same protocol, same
+seeds, same splits (`work/e1/e1.md`). Median R² over the 16 draws, with the earlier arms for scale:
+
+| median R² | `gru_warm` (random GRU) | `gru_trained` (8 upd) | **`e2_raw`** (131 upd) | **`e2_aligned`** (131 upd) |
+|---|---|---|---|---|
+| **Δv_x** | +0.185 | +0.112 | **+0.188** | **+0.230** |
+| **Δv_y** | +0.132 | +0.178 | **+0.139** | **+0.150** |
+| Δx | +0.235 | +0.241 | +0.217 | +0.152 |
+| Δy | +0.190 | +0.202 | +0.185 | +0.271 |
+
+**Alignment alone did not move Δv.** The gap is +0.042 on Δv_x and +0.011 on Δv_y — inside the ±0.07
+that separates `gru_warm` from `gru_trained`, two arms this table already calls indistinguishable.
+On the mean rather than the median it is +0.005. The threshold was written down before these columns
+existed (`work/e3/decide.md`), so this is the rule firing and not a line drawn afterwards.
+
+Two things belong beside that, and neither of them rescues it:
+
+* **The channel arrives as zero-initialised input columns.** At update 1 the network ignores them by
+  construction — that is what makes the warm start bit-identical — and it has 131 updates to learn
+  to use three new rows. A null here is strong evidence about the *budget* and weak evidence about
+  the idea. It is also precisely the argument for E3: a loss that asks a branch for the opponent's
+  motion does not wait for PPO to discover that an input is worth reading.
+* **`e2_raw` lands on top of `gru_warm`** (+0.188 against +0.185). A hundred and thirty-one updates
+  of PPO left Δv_x exactly where an untrained recurrence already had it — the same finding the E1
+  ladder gave, now with training rather than by construction, and the premise the whole contract is
+  testing.
+
+### The second table: the racing proxy
+
+The addendum asks for this separately from the representation, so that *"Δv R² up but racing flat"*
+is a reportable outcome rather than an unasked question. `evaluate --protocol rolling` in traffic on
+the smoke's own three tracks, one fixed seed, 2400 steps × 96 cars, teacher opponents with all seven
+behaviours — and note that `--per-track` is one full evaluation **per track**, so each arm is three
+runs pooled by the learner-minutes behind them (`work/e2/proxy.md`).
+
+| | A: `memory,edges` | B: + aligned rows | E3-b: + motion GRU, mask, Δv |
+|---|---|---|---|
+| collisions / km ↓ | **16.6** | 19.5 | 17.1 |
+| wall collisions ↓ | **116** | 186 | 145 |
+| car contacts / learner-min ↓ | **3.15** | 3.33 | **3.15** |
+| passes / learner-min ↑ | 2.48 | 2.70 | **2.73** |
+| mean speed [m/s] ↑ | 4.77 | **4.86** | 4.81 |
+| lap time [s] ↓ | 14.5 | **14.0** | 14.3 |
+| pace vs the opponents ↑ | 1.361 | **1.377** | 1.336 |
+| share of time in contention | 73.9 % | 72.7 % | 74.5 % |
+
+**The two halves of this table disagree, and so does it with the training log.** Arm B is the faster
+policy — quicker laps, higher mean speed, more passes held — and it crashes more, mostly into walls
+(186 against 116). That is the ordinary speed-for-safety trade and not a statement about
+representations. And during training the ordering was the other way round: arm B ended the smoke at
+18.5 collisions/km against A's 23.6.
+
+E3-b sits between the two E2 arms on nearly every row, which is what a third draw from the same
+distribution looks like.
+
+The honest reading is that **at 262144 env steps the racing numbers are noise**, which is what the
+smoke was said in advance not to be able to answer. The table is here because the addendum asks for
+it to exist before anyone is tempted to infer racing from a probe, and what it shows is exactly why:
+one seed, one protocol, a third arm landing in between, and a direction that flips between the
+training log and the evaluation.
+
+E3-a was not proxied. The three rows above already establish what this table can say at this budget,
+and a fourth half-hour evaluation would have bought a fourth row of the same; its own smoke's
+collisions/km — 11.0 median over the last twenty updates, the best of the four arms — is the evidence
+that the motion branch does not break driving.
+
 ### A confound in the smoke arms, measured rather than assumed
 
 The two E2 smoke arms differ by one flag, and by one thing nobody asked for: **their fresh GRUs are
