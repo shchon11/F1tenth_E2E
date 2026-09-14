@@ -53,12 +53,21 @@ MOTION_CHANNELS = 32
 #: Width of the two auxiliary heads' hidden layer.
 MOTION_HEAD_WIDTH = 64
 
-#: The upper bound on the positive-class weight the beam-mask BCE uses. A car covers a few percent
-#: of the beams at best and none at all on an empty road, so the reciprocal of the batch's own
-#: positive rate can be thousands; unclamped, one frame with a single car-hit beam would dominate an
-#: update. 50 is two orders of magnitude of re-weighting, which is the imbalance worth correcting,
-#: and the loss reports the rate it saw so the clamp is visible rather than implicit.
-MASK_POS_WEIGHT_MAX = 50.0
+#: The upper bound on the positive-class weight the beam-mask BCE uses.
+#:
+#: **Raised from 50 to 1000 for phase 2**, and the reason is mechanical rather than aesthetic. With
+#: weight `w`, a positive at logit 0 pulls with `w/2` and a negative with `1/2`, so the two classes'
+#: total gradient mass is balanced exactly when `w = (1 - rate) / rate`, i.e. at the reciprocal. At
+#: the measured 1.2 % positive rate that is about 83; clamped at 50 the negatives kept about
+#: 1.6 times the pull, and in phase 1 both arms' heads collapsed to predicting no positive anywhere
+#: by update 40 (`docs/research/motion-memory-2026-09-14.md`). The clamp was the binding constraint
+#: and it bound in the direction of the collapse.
+#:
+#: What is left is a numerical bound, not a design choice: a minibatch is ~1.1 M scored beams, so a
+#: single positive would ask for a weight of a million. 1000 catches that and nothing a real scene
+#: produces. The loss reports the rate and the weight it used, so a clamp that binds again is
+#: visible in the log rather than implicit.
+MASK_POS_WEIGHT_MAX = 1000.0
 
 
 def motion_spec(hidden_size: int = MOTION_HIDDEN, channels: int = MOTION_CHANNELS,
@@ -212,17 +221,21 @@ def mask_loss(logit: torch.Tensor, label: torch.Tensor, w: torch.Tensor,
     """(scalar, parts) for the per-beam opponent mask. Weighted BCE, because the classes are not
     remotely balanced: a car covers a few percent of the beams when it is there at all.
 
-    The positive weight is the reciprocal of the batch's own positive rate, clamped -- see
-    `MASK_POS_WEIGHT_MAX`. Reported beside the loss are the rate it saw, the clamp it hit, and the
-    recall and precision at a 0.5 threshold, because a BCE that falls while the head answers "no
-    car" everywhere is exactly the failure this label is prone to.
+    The positive weight balances the two classes' total gradient mass: at logit 0 a positive pulls
+    with `w/2` and a negative with `1/2`, so `w = (1 - rate) / rate` equalises them. That is the
+    reciprocal of the positive rate, bounded only numerically (`MASK_POS_WEIGHT_MAX`). Reported
+    beside the loss are the rate it saw, the weight it used, and the recall and precision at a 0.5
+    threshold -- because a BCE that falls while the head answers "no car" everywhere is exactly the
+    failure this label is prone to, and phase 1 watched it happen in both arms.
     """
     if logit.shape != label.shape:
         raise ValueError(f"mask logits {tuple(logit.shape)} and labels {tuple(label.shape)} differ")
     ww = w.to(logit.dtype)[:, None].expand_as(logit)
     denom = ww.sum().clamp_min(1.0)
     rate = (label.to(logit.dtype) * ww).sum() / denom
-    pw = (1.0 / rate.clamp_min(1e-6)).clamp(max=float(pos_weight_max))
+    # (1 - rate) / rate, not 1 / rate: the negatives' share is what the positives have to balance,
+    # and the two differ by a percent at these rates but by everything as rate approaches 1.
+    pw = ((1.0 - rate) / rate.clamp_min(1e-6)).clamp(max=float(pos_weight_max))
     per = F.binary_cross_entropy_with_logits(logit, label.to(logit.dtype), reduction="none",
                                              pos_weight=pw)
     loss = (per * ww).sum() / denom

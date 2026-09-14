@@ -319,10 +319,20 @@ def test_the_mask_loss_weights_the_rare_class_and_reports_what_it_did():
     w = torch.ones(4)
     loss, parts = mask_loss(logit, label, w)
     assert float(parts["mask_pos_rate"]) == pytest.approx(0.03)
-    assert float(parts["mask_pos_weight"]) == pytest.approx(1 / 0.03, rel=1e-4)
+    # (1 - rate) / rate: the weight that equalises the two classes' total gradient mass at logit 0,
+    # where a positive pulls with w/2 and a negative with 1/2. Phase 1 clamped this below its own
+    # value and both arms' heads collapsed to predicting no positive anywhere.
+    assert float(parts["mask_pos_weight"]) == pytest.approx(0.97 / 0.03, rel=1e-4)
+    balanced = float(parts["mask_pos_weight"]) * 0.03
+    assert balanced == pytest.approx(1 - 0.03, rel=1e-4), "positives and negatives must pull alike"
     # an empty road cannot send the weight to infinity
     _l2, p2 = mask_loss(logit, torch.zeros(4, 100), w)
-    assert float(p2["mask_pos_weight"]) == pytest.approx(50.0)
+    assert float(p2["mask_pos_weight"]) == pytest.approx(1000.0)
+    # and at the rate the real runs see, the clamp does not bind at all
+    rare = torch.zeros(4, 1000); rare[:, :12] = 1.0                  # 1.2 %, the measured rate
+    _l3, p3 = mask_loss(torch.zeros(4, 1000), rare, w)
+    assert float(p3["mask_pos_weight"]) < 1000.0
+    assert float(p3["mask_pos_weight"]) == pytest.approx(0.988 / 0.012, rel=1e-3)
     # a head that answers "no car" everywhere is visible as zero recall, whatever the BCE says
     confident_no = torch.full((4, 100), -5.0)
     assert float(mask_loss(confident_no, label, w)[1]["mask_recall"]) == 0.0
@@ -442,6 +452,79 @@ def test_the_probe_loads_a_motion_checkpoint_and_reads_the_whole_state(tmp_path)
     with torch.no_grad():
         _act, state, _h = mod.actor.probe_state(scan, pro, None, None)
     assert state.shape[-1] == mod.actor.memory.hidden_size + mod.actor.memory.motion.hidden_size
+
+
+def test_fresh_modules_are_seeded_from_their_own_names(tmp_path):
+    """Two arms that differ in an input width must still share every weight a warm start leaves new.
+
+    Without this they do not: the wider first convolution has more parameters, draws more numbers
+    from the ambient generator, and every module built after it -- the GRUs included -- gets
+    different weights from the same `--seed`. Measured on the phase-1 arms, the two GRUs differed by
+    up to 0.176 in a comparison built to isolate one flag.
+    """
+    torch.manual_seed(5)
+    base = ActorCritic(**SMALL).eval()
+    path = str(tmp_path / "base.pt")
+    save_checkpoint(path, base, {"spec": {}})
+    narrow = {"channels": ["memory", "edges"]}
+    wide = dict(CHAN)
+
+    def build(chan, seed):
+        torch.manual_seed(seed)                       # the ambient generator, deliberately shared
+        m, _e, _f = load_for_memory(path, "cpu", memory_spec(hidden_size=32), scan_channels=chan,
+                                    init_seed=seed)
+        return dict(m.named_parameters()), m
+
+    a, ma = build(narrow, 701)
+    b, mb = build(wide, 701)
+    for n in ("actor.memory.gru.weight_ih_l0", "actor.memory.gru.weight_hh_l0",
+              "actor.memory.gru.bias_ih_l0", "critic.memory.gru.weight_ih_l0"):
+        assert torch.equal(a[n], b[n]), (n, float((a[n] - b[n]).abs().max()))
+    # the zero projections survive the re-initialisation, or the warm start is not bit-identical
+    for m in (ma, mb):
+        assert float(m.actor.memory.out.weight.abs().max()) == 0.0
+        assert float(m.critic.memory.out.weight.abs().max()) == 0.0
+    # a different --seed still gives different weights: this fixes the confound, not the seed
+    c, _mc = build(narrow, 702)
+    assert not torch.equal(a["actor.memory.gru.weight_ih_l0"],
+                           c["actor.memory.gru.weight_ih_l0"])
+    # and a module that is NOT fresh is left exactly as the checkpoint wrote it
+    base_w = dict(base.named_parameters())["actor.stem.trunk.3.conv1.weight"]
+    assert torch.equal(a["actor.stem.trunk.3.conv1.weight"], base_w)
+
+
+def test_the_motion_branch_is_seeded_by_name_too(tmp_path):
+    """The same guarantee has to reach the branch, or arm C is confounded against arm B instead."""
+    torch.manual_seed(5)
+    base = ActorCritic(**SMALL).eval()
+    path = str(tmp_path / "base.pt")
+    save_checkpoint(path, base, {"spec": {}})
+
+    def build(heads, seed=701):
+        torch.manual_seed(seed)
+        m, _e, _f = load_for_memory(path, "cpu", memory_spec(hidden_size=32), scan_channels=CHAN,
+                                    motion=motion_spec(hidden_size=16, channels=8),
+                                    motion_heads=list(heads), init_seed=seed)
+        return dict(m.named_parameters())
+
+    only_mask, both = build(["mask"]), build(["mask", "dv"])
+    for n in ("actor.memory.motion.gru.weight_ih_l0",
+              "actor.memory.motion.encoder.net.0.weight",
+              "actor.opp_mask.net.0.weight"):
+        assert torch.equal(only_mask[n], both[n]), n
+
+
+def test_init_seed_refuses_a_load_with_nothing_fresh(tmp_path):
+    """A silent no-op here would leave two arms differently initialised while claiming otherwise."""
+    torch.manual_seed(5)
+    base = ActorCritic(**SMALL).eval()
+    path = str(tmp_path / "base.pt")
+    save_checkpoint(path, base, {"spec": {}})
+    spec = ObsSpec(n_beams=SMALL["n_beams"], scan_stack=6, act_dim=8, action_history=2, hist_len=0)
+    chan = {"channels": ["aligned"], "aligned": {"proprio": motion_index_spec(spec)}}
+    with pytest.raises(RuntimeError, match="no fresh module"):
+        # extra channels alone add no parameter at all, so there is nothing to seed
+        load_for_memory(path, "cpu", None, scan_channels=chan, init_seed=701)
 
 
 # ------------------------------------------------------------------ end to end

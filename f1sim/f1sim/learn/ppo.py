@@ -678,6 +678,11 @@ def main():
         model, extra, fresh = load_for_memory(
             a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
             future_head=add_fut, motion=add_mot, motion_heads=mot_heads,
+            # Fresh modules are seeded from their own NAMES, so two arms that differ only in how many
+            # scan channels they enable share every weight a warm start leaves fresh. Without it the
+            # wider first convolution shifts the ambient generator and the arms differ by a second
+            # thing nobody asked for (`learn.model.reinit_fresh_by_name`).
+            init_seed=a.seed,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
