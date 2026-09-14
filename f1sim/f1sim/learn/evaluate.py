@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..gym_env import OPP_FUTURE_MODELS, EnvConfig
+from ..gym_env import OPP_FUTURE_MODELS, OPP_TOKEN_MODES, EnvConfig, opp_token_mode
 from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events, split_events
 from ..params import Config
@@ -202,6 +202,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'protocol': protocol, 'tracks': list(tracks), 'seed': seed,
         'seeds': {'numpy': seed, 'torch': seed, 'simulator': seed, 'reset': seed if protocol == 'trials' else None},
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
+        'opp_token': str(env.opp_token_mode or "") or None,
+        'opp_future_model': opp_future_model if env.opp_token_mode else None,
         'deterministic_policy': True,
         'action_mode': mode, 'device': str(device), 'steps': steps, 'step_dt': env.sim.control_dt,
         'time_budget_s': steps * env.sim.control_dt, 'envs': envs,
@@ -302,6 +304,12 @@ def main() -> None:
                     help="the five interactive-teacher cost weights; empty = its defaults")
     ap.add_argument("--opp-future-model", default="plan", choices=list(OPP_FUTURE_MODELS),
                     help="which prediction the interactive teacher reads the opponents with")
+    ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
+                    help="build the privileged opponent block in the observation. Needed to score a "
+                         "checkpoint that was TRAINED with one -- its proprio vector is wider than "
+                         "this env's without it. An ORACLE either way: a number obtained with it is "
+                         "not comparable with one obtained without it, and the metadata says which "
+                         "this run was")
     ap.add_argument("--opp-defend-prob", type=float, default=0.0)
     ap.add_argument("--opp-yield-prob", type=float, default=0.0)
     ap.add_argument("--opp-line-prob", type=float, default=0.0)
@@ -358,7 +366,8 @@ def main() -> None:
                         teacher_kind=a.teacher_kind, teacher_horizon=a.teacher_horizon,
                         teacher_cand_iters=a.teacher_cand_iters, teacher_cost=a.teacher_cost,
                         opp_future_model=a.opp_future_model,
-                        opp_extra={"opp_defend_prob": a.opp_defend_prob,
+                        opp_extra={"opp_token": opp_token_mode(a.opp_token),
+                                   "opp_defend_prob": a.opp_defend_prob,
                                    "opp_yield_prob": a.opp_yield_prob,
                                    "opp_line_prob": a.opp_line_prob,
                                    "opp_oblivious_prob": a.opp_oblivious_prob},

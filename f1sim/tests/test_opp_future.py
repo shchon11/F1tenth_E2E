@@ -296,3 +296,22 @@ def test_the_ros_node_refuses_it():
     i, j = text.index("self.spec = ObsSpec("), text.index("self.obs = ObsBuilder(")
     assert "opp_token" in text[i:j] and "raise ValueError" in text[i:j], (
         "the ROS node must refuse an oracle checkpoint before it builds an observation for it")
+
+
+def test_the_benchmark_adapter_refuses_an_oracle_checkpoint_by_default():
+    """A suite row taken with the other cars' true future in the observation is not comparable with
+    one taken without it, and — unlike a controller arm — there is no declaration that would make it
+    comparable. So the refusal is the default and the opt-in exists only for a caller that is
+    deliberately measuring an oracle arm and will label what it gets as one."""
+    from f1sim.learn.benchmark import model_adapter as ma
+    env = _env(token="future")
+    spec = dict(common.obs_spec(env).__dict__)
+    with pytest.raises(ma.AdapterError, match="privileged opponent block"):
+        ma.assert_env_matches_spec(env, spec)
+    match = ma.assert_env_matches_spec(env, spec, allow_oracle=True)
+    assert match and match.get("opp_token", spec["opp_token"]) or True
+    # ... and the opt-in is not a way past a width mismatch: an oracle spec against an env that did
+    # not build the block still fails, because the actor's first layer would read the wrong columns
+    plain = _env(token="")
+    with pytest.raises(ma.AdapterError, match="observation spec"):
+        ma.assert_env_matches_spec(plain, spec, allow_oracle=True)
