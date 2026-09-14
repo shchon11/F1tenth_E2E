@@ -384,12 +384,20 @@ Measured against where the car actually went
 (`work/oracle-planner/work/label_validation.py`): RMSE 0.024 / 0.054 / 0.198 / 0.406 m at the four
 horizons, against 1.046 m at 0.75 s for what a `posvel` policy can extrapolate for itself.
 
-`--name-seed-fresh` belongs with it. The four arms differ by the *width of the proprio vector*, so
-the wider first layer consumes different draws from the ambient generator and every module built
-after it — including the GRU a warm start leaves fresh — would differ too. The flag re-initialises
-each fresh module from `(--seed, its own qualified name)` instead
-(`learn.model.reinit_fresh_by_name`, from branch `feat/motion-memory`), so arms that differ by an
-input width differ by that and nothing else.
+`--name-seed-fresh` belongs with it. The four arms differ by the *width of the proprio vector*, and
+that width leaks twice. The wider first layer consumes different draws from the ambient generator,
+so every module built after it — including the GRU a warm start leaves fresh — would differ too;
+and the generator is left in a different state, so the arms' **first sampled action** differs and
+the rollouts diverge for a reason that has nothing to do with the input. The flag closes both: each
+fresh module is initialised from `(--seed, its own qualified name)`
+(`learn.model.reinit_fresh_by_name`, from branch `feat/motion-memory`), and the generator is
+re-seeded once the model is built. The simulator's own generator was never affected — it is a
+separate `torch.Generator` seeded by `env.reset(seed=...)`.
+
+The widened layers' **optimiser moments** travel with them (`learn.model.grow_proprio_moment`):
+Adam's `exp_avg` / `exp_avg_sq` are element-wise, so the block's own columns start at 0 and every
+original column keeps its moment. Dropping them instead would leave the control arm restoring state
+the oracle arms had thrown away.
 
 ### Probing the hidden state (`probe_hidden`)
 

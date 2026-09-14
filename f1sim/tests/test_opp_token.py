@@ -210,9 +210,10 @@ def test_the_sustained_bonus_fires_once_and_only_after_the_hold_time() -> None:
                overtake_hold_time=1.0)
     steps = int(round(1.0 / env.sim.control_dt))
     lead = torch.full((env.B, env.M - 1), -2.0)                  # 2 m ahead of the other car
+    behind0 = torch.full((env.B, env.M - 1), +2.0)
     valid = torch.ones(env.B, dtype=torch.bool)
     none = torch.zeros(env.B, dtype=torch.bool)
-    ls = torch.zeros(env.B, env.M - 1); lp = torch.zeros_like(ls)
+    ls = torch.zeros(env.B, env.M - 1); lp = torch.ones_like(ls)
     def run(gap, n):
         nonlocal ls, lp
         out = []
@@ -220,6 +221,7 @@ def test_the_sustained_bonus_fires_once_and_only_after_the_hold_time() -> None:
             b, ls, lp = env.overtake_hold(gap, valid, none, ls, lp)
             out.append(float(b[0]))
         return out
+    assert sum(run(behind0, 1)) == 0.0            # one step behind: the lead below is now earned
     fired = run(lead, steps + 5)
     assert sum(fired) == 1.0, fired
     assert fired.index(1.0) == steps - 1, (fired.index(1.0), steps)
@@ -409,3 +411,48 @@ def test_fresh_modules_are_seeded_from_their_names_so_the_arms_only_differ_by_wi
 
     assert not torch.equal(gru_unseeded("off"), gru_unseeded("future")), \
         "the confound this flag exists for did not reproduce; the test no longer tests anything"
+
+
+def test_a_lead_that_was_never_taken_is_never_paid() -> None:
+    """The trap `--spawn-order random` sets: one race in three starts with the learner ahead. A
+    bonus for holding a lead you were handed on the grid is a bonus for a grid position, and a
+    crashed opponent respawning behind the field is the same thing arriving mid-race."""
+    env = _env("off", m=2, n=2, reward_overtake_hold=3.0, overtake_hold_dist=1.5,
+               overtake_hold_time=1.0)
+    steps = int(round(1.0 / env.sim.control_dt))
+    lead = torch.full((env.B, env.M - 1), -2.0)
+    valid = torch.ones(env.B, dtype=torch.bool)
+    none = torch.zeros(env.B, dtype=torch.bool)
+    ls = torch.zeros(env.B, env.M - 1); lp = torch.ones_like(ls)       # the state a reset leaves
+    total = 0.0
+    for _ in range(4 * steps):
+        b, ls, lp = env.overtake_hold(lead, valid, none, ls, lp)
+        total += float(b[0])
+    assert total == 0.0, "a lead held from the spawn was paid"
+    # let the other car draw level, then take it back: now it is a pass, and it pays once
+    level = torch.zeros(env.B, env.M - 1)
+    for _ in range(3):
+        _b, ls, lp = env.overtake_hold(level, valid, none, ls, lp)
+    got = []
+    for _ in range(steps + 3):
+        b, ls, lp = env.overtake_hold(lead, valid, none, ls, lp)
+        got.append(float(b[0]))
+    assert sum(got) == 1.0, got
+
+
+def test_the_step_after_a_reset_does_not_arm_the_bonus() -> None:
+    """The gap is invalid for one step after a reset. Reading "no valid gap" as "not leading" would
+    arm the payment on exactly the spawn it is meant to exclude."""
+    env = _env("off", m=2, n=2, reward_overtake_hold=3.0, overtake_hold_dist=1.5,
+               overtake_hold_time=1.0)
+    steps = int(round(1.0 / env.sim.control_dt))
+    lead = torch.full((env.B, env.M - 1), -2.0)
+    none = torch.zeros(env.B, dtype=torch.bool)
+    ls = torch.zeros(env.B, env.M - 1); lp = torch.ones_like(ls)
+    invalid = torch.zeros(env.B, dtype=torch.bool)
+    _b, ls, lp = env.overtake_hold(lead, invalid, none, ls, lp)        # the step after the reset
+    total = 0.0
+    for _ in range(2 * steps):
+        b, ls, lp = env.overtake_hold(lead, torch.ones(env.B, dtype=torch.bool), none, ls, lp)
+        total += float(b[0])
+    assert total == 0.0

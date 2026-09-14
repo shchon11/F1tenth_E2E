@@ -365,11 +365,13 @@ def main():
                          "opponent's state, races better than it does with LiDAR alone -- not to "
                          "produce a policy.")
     ap.add_argument("--name-seed-fresh", action="store_true",
-                    help="re-initialise every tensor a warm start leaves fresh from its own module "
+                    help="make two arms that differ by an input width differ by that alone. "
+                         "Re-initialises every tensor a warm start leaves fresh from its own module "
                          "name rather than from the ambient generator (learn.model."
-                         "reinit_fresh_by_name, from branch feat/motion-memory). Two arms that "
-                         "differ by an input width otherwise differ in every module built after "
-                         "the layer that widened, because it consumes different draws.")
+                         "reinit_fresh_by_name, from branch feat/motion-memory) -- otherwise the "
+                         "wider layer consumes different draws and every module built after it "
+                         "differs too -- and re-seeds the generator once the model is built, so the "
+                         "arms' exploration streams start identical as well.")
     ap.add_argument("--car-proximity-penalty", type=float, default=0.0,
                     help="per metre driven with another car's body inside car_safe_gap (0.6 m), scaled "
                          "by closing speed. Without it the only gradient near a car is the overtake "
@@ -679,6 +681,15 @@ def main():
                             priv_adapter=priv_adapter, memory=mem_cfg,
                             scan_channels=chan_cfg, future_head=fut_cfg,
                             opp_token=tok_cfg).to(device)
+    if a.name_seed_fresh:
+        # The other half of "these arms differ by one thing". Building the model consumes draws from
+        # the ambient generator in proportion to its parameter count, so an arm with a wider proprio
+        # layer leaves the generator in a different state and its FIRST SAMPLED ACTION differs -- the
+        # two rollouts then diverge for a reason that has nothing to do with the input. Re-seeding
+        # here puts every arm's exploration stream back on the same footing; the simulator's own
+        # generator (`sim.gen`) was never affected, since it is a separate Generator seeded by
+        # `env.reset(seed=...)`.
+        torch.manual_seed(a.seed)
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
@@ -802,6 +813,29 @@ def main():
             by_name = {saved_names[i]: entry for i, entry in st.items() if isinstance(i, int) and i < len(saved_names)}
             st = {i: by_name[n_] for i, n_ in enumerate(param_names) if n_ in by_name}
             sd["param_groups"] = [dict(g, params=list(range(len(params)))) for g in sd["param_groups"][:1]]
+        # The opponent-token block widens the two proprio input layers. Their Adam moments are
+        # element-wise, so they can be carried across the same column insert the weights were --
+        # and they have to be, or the control arm would restore state the oracle arms dropped.
+        k_tok = int(spec.proprio_dim) - int(init_meta.get("proprio_dim", spec.proprio_dim))
+        if k_tok > 0 and str(model.meta.get("opp_token") or "off") != "off":
+            from .model import grow_proprio_moment
+            p_old = int(init_meta["proprio_dim"])
+            for i, entry in list(st.items()):
+                if not (isinstance(i, int) and i < len(params)):
+                    continue
+                name_i = param_names[i]
+                grown_entry = {}
+                for key, v in entry.items():
+                    if not (torch.is_tensor(v) and v.dim() > 0) or v.shape == params[i].shape:
+                        grown_entry[key] = v
+                        continue
+                    g = grow_proprio_moment(name_i, v, params[i], p_old, k_tok)
+                    if g is None:
+                        grown_entry = None
+                        break
+                    grown_entry[key] = g
+                if grown_entry is not None:
+                    st[i] = grown_entry
         dropped = [i for i, entry in st.items()
                    if not (isinstance(i, int) and i < len(params)
                            and all(v.shape == params[i].shape

@@ -501,7 +501,9 @@ class F1VecEnv:
         # run of them has already been paid. Both live outside `_step_math` and are passed through
         # it, because that function is compiled and has to stay a pure map from tensors to tensors.
         self.lead_steps = torch.zeros(self.B, max(1, self.M - 1), device=self.device)
-        self.lead_paid = torch.zeros(self.B, max(1, self.M - 1), device=self.device)
+        #: 1 = "this lead may not be paid" (see `overtake_hold`). Starts blocked, so a learner that
+        #: spawned ahead is not paid for its grid position.
+        self.lead_paid = torch.ones(self.B, max(1, self.M - 1), device=self.device)
         T_, S_ = self.sim.track.T, int(e.reward_time_sectors)
         self.ideal_lap = torch.zeros(T_, device=self.device)                 # per track, seconds
         self.sector_lim = torch.zeros(T_, S_, device=self.device)            # raceline time per sector
@@ -1092,10 +1094,21 @@ class F1VecEnv:
         `learn.graph_runtime.prepare_graph_runtime` takes to record the solver's arguments, neither
         of which has run a reset yet. The pool sits those out rather than being handed a zeroed
         observation, which would be a policy driving on a scan that says "no returns anywhere".
+
+        The privileged opponent block is REMOVED. A pool entry is a deployable LiDAR-only
+        checkpoint driving the other car -- that is the whole point of the population -- and it was
+        trained on the proprio vector without the block. Handing it those columns would not just be
+        a shape error: it would make every opponent in the race an oracle too, and the arm would no
+        longer be "the learner is told where the other cars are", it would be "everyone is". The
+        learner's own rows are unaffected; a `self` entry is the learner's own weights driving off
+        the caller's action, which is computed from the full observation for every row.
         """
-        if self._last_obs is not None:
-            return self._last_obs
-        return None if self.last_result is None else self._obs(self.last_result)
+        obs = self._last_obs
+        if obs is None:
+            obs = None if self.last_result is None else self._obs(self.last_result)
+        if obs is None or self.opp_token == "off":
+            return obs
+        return {k: v for k, v in obs.items() if k != "opp_token"}
 
     def follow_cap(self, state: torch.Tensor):
         """(is there a car within opp_follow_gap ahead of each car, the speed to hold behind it)."""
@@ -1131,7 +1144,7 @@ class F1VecEnv:
         self.scan_hist = torch.roll(self.scan_hist, 1, 1); self.scan_hist[:, 0] = self._norm_scan(r.scan)
         self.last_result = r
         self._plan_fallback(torch.arange(self.B, device=self.device), r.state)
-        self.lead_steps.zero_(); self.lead_paid.zero_()
+        self.lead_steps.zero_(); self.lead_paid.fill_(1.0)
         obs = self._obs(r)
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
             self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.act_dim, device=self.device)], 1)[:, None, :]
@@ -1418,24 +1431,37 @@ class F1VecEnv:
         is still inside `overtake_range` -- a car half a lap away is not being led, it is being
         lapped or lapping, and the signed arc flips sign out there by construction.
 
-        The counter is consecutive steps of such a lead; the bonus is paid on the step the counter
-        first reaches `overtake_hold_time`, once, and `lead_paid` holds it until the lead is lost.
-        Losing it (falling inside the distance, or the opponent leaving the window) resets both, so
-        being re-passed and passing again pays again -- which is the behaviour the term is for.
+        `lead_paid` carries two things at once, which is why it starts at **1** and not at 0:
 
-        `boundary` is `race_boundary(done)`: any car of this race resetting clears the counters.
-        Without it a crashed opponent, which respawns behind the field in place, hands the learner a
-        free lead it did not earn, and the bonus would pay for the opponent's mistakes.
+        * 1 = this lead may not be paid. It is 1 at the start of every race and after every reset in
+          it, so a learner that **spawned** ahead -- one race in three under `--spawn-order random`
+          -- is not paid for a grid position, and a crashed opponent respawning behind the field
+          does not hand the learner a bonus for the other car's mistake. It is also 1 immediately
+          after a lead has been paid.
+        * 0 = armed. It is cleared on the first step where the gap is valid and this car is **not**
+          leading by the distance, which is the only evidence available that the lead, when it
+          comes, was taken rather than given.
+
+        The counter is consecutive steps of such a lead; the bonus is paid on the step the counter
+        first reaches `overtake_hold_time`, once. Being re-passed disarms and re-arms, so passing
+        again pays again -- which is the behaviour the term is for.
+
+        `boundary` is `race_boundary(done)`: any car of this race resetting clears the counter and
+        re-blocks the payment.
         """
         e = self.ecfg
         lead = (-gap_now >= e.overtake_hold_dist) & (gap_now.abs() < e.overtake_range) & gap_valid[:, None]
         steps = torch.where(lead, lead_steps + 1.0, torch.zeros_like(lead_steps))
         need = max(1.0, round(e.overtake_hold_time / self.sim.control_dt))
         fires = (steps >= need) & (lead_paid <= 0.0)
-        paid = torch.where(lead, torch.maximum(lead_paid, fires.to(lead_paid.dtype)),
+        # Armed only by a valid gap in which this car is not leading. Gated on `gap_valid` because
+        # the step after a reset has no gap to read, and reading its absence as "not leading" would
+        # arm the very spawn this flag exists to exclude.
+        blocked = lead | ~gap_valid[:, None]
+        paid = torch.where(blocked, torch.maximum(lead_paid, fires.to(lead_paid.dtype)),
                            torch.zeros_like(lead_paid))
         keep = (~boundary).to(steps.dtype)[:, None]
-        return fires.to(steps.dtype).sum(1), steps * keep, paid * keep
+        return fires.to(steps.dtype).sum(1), steps * keep, paid * keep + (1.0 - keep)
 
     def overtake_gain(self, s: torch.Tensor, tid: torch.Tensor, gap_prev: torch.Tensor,
                       gap_valid: torch.Tensor):

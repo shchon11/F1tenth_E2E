@@ -950,6 +950,31 @@ def _proprio_growth(name: str, src: torch.Tensor, dst: torch.Tensor, p_old: int,
     return None
 
 
+def grow_proprio_moment(name: str, saved: torch.Tensor, target: torch.Tensor,
+                        p_old: int, k: int) -> Optional[torch.Tensor]:
+    """A saved optimiser moment for a proprio input layer, widened to the token block's layout.
+
+    Adam's `exp_avg` and `exp_avg_sq` are element-wise, so they move with the weight: the block's
+    own columns get 0, which is what Adam holds for a coefficient that has not had a gradient yet,
+    and every original column keeps its moment. Without this the two widened layers' moments would
+    be *dropped* in the oracle arms and *restored* in the control, which is a second difference
+    between arms that are supposed to differ by their input width alone.
+
+    Returns None when this tensor is not one of the two, or does not line up.
+    """
+    if saved.shape == target.shape:
+        return saved
+    split = _proprio_growth(name, saved, target, p_old, k)
+    if split is None:
+        return None
+    before, after = split
+    out = torch.zeros_like(target)
+    out[:, :before] = saved[:, :before].to(out.dtype)
+    if after:
+        out[:, before + k:] = saved[:, before:].to(out.dtype)
+    return out
+
+
 def load_for_memory(path, device, memory: Optional[dict] = None,
                     scan_channels: Optional[dict] = None,
                     priv_adapter: Optional[str] = None, override: Optional[dict] = None,
