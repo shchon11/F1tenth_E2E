@@ -478,22 +478,35 @@ between one arm and the next would replace this confound with a worse one.
 ## Budget
 
 `python -m f1sim.learn.budget`, the same proxy the memory work is held to: CPU, one thread, batch 1,
-fp32, the fastest of several blocks of 200 iterations. The rule is the actor's **forward** within
-1.5× the frozen original's and its parameters within 2×.
+fp32, the fastest of five blocks of 200 iterations, measured with nothing else on the machine. The
+rule is the actor's **forward** within 1.5× the frozen original's and its parameters within 2×; the
+step ratio (forward plus the channels the car builds once per scan) is reported beside it.
 
-| variant | actor forward [ms] | channels [ms] | step [ms] | forward ratio | actor params | ratio |
-|---|---|---|---|---|---|---|
-| frozen original | 1.80 | 0.000 | 1.80 | 1.00× | 1 168 164 | 1.00× |
-| + GRU 128 | 2.00 | 0.000 | 2.00 | 1.11× | 1 398 308 | 1.20× |
-| + GRU 128, `memory,edges` | 1.90 | 0.026 | 1.93 | 1.06× | 1 398 980 | 1.20× |
-| + GRU 128, `memory,edges,aligned*` (3 rows) | 1.99 | **0.57** | 2.56 | **1.16×** | 1 399 988 | 1.20× |
+| variant | actor forward [ms] | channels [ms] | step [ms] | **forward ratio** | step ratio | actor params | **ratio** |
+|---|---|---|---|---|---|---|---|
+| frozen original | 1.820 | 0.000 | 1.820 | **1.00×** | 1.00× | 1 168 164 | **1.00×** |
+| + GRU 128 | 2.011 | 0.000 | 2.011 | 1.10× | 1.10× | 1 398 308 | 1.20× |
+| + `memory,edges` | 2.062 | 0.028 | 2.091 | 1.13× | 1.15× | 1 398 980 | 1.20× |
+| **E2** + the three aligned rows | 2.025 | 0.658 | 2.683 | **1.11×** | 1.47× | 1 399 988 | **1.20×** |
+| **E3** + the motion branch | 2.351 | 0.669 | 3.020 | **1.29×** | 1.66× | 1 447 500 | **1.24×** |
 
-Both rules pass with room. The honest caveat is the channel's 0.57 ms: at batch 1 it is
-operator-launch bound rather than arithmetic bound (the warp is ~2 M multiply-accumulates), so it is
-0.57 ms of this desktop's Python/dispatch overhead and would not scale down on a slower core the way
-the convolutions do. It is 2.3 % of the car's 25 ms step as measured; if the Jetson proves tight the
-remedy is fusing the channel, not shrinking it.
+Both rules pass for both experiments, with room. In absolute terms the whole network part of a
+control step is **3.0 ms of the 25 ms the car has** even with the motion branch, and the three
+aligned rows are 0.66 ms of that.
 
+Two honest qualifications:
+
+* **the channel is operator-launch bound at batch 1.** Its arithmetic is about 2 M multiply-accumulates
+  — the warp is one 3×3 matrix applied to 1081 beams, two scatters and a handful of pools — so
+  0.66 ms is this desktop's Python and dispatch overhead rather than work that will shrink on a
+  faster core or grow on a slower one in proportion. If the Jetson proves tight the remedy is fusing
+  the channel, not shrinking it, and that is a measurement nobody here has made.
+* **the step ratio, not the forward ratio, is what the channel moves** (1.15× → 1.47×). The rule is
+  stated on the forward and the forward barely moves, which is true and slightly flattering; the
+  number a deployment should plan against is the 3.0 ms.
+
+In training the picture is the other way round: the aligned channel costs nothing measurable
+(343 → 340 env steps/s at 63 envs) and the motion branch costs about 10 % (343 → 306).
 
 ## E3 — a second state, and the auxiliaries that are allowed to shape it
 
