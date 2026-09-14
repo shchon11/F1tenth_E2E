@@ -456,3 +456,22 @@ def test_the_step_after_a_reset_does_not_arm_the_bonus() -> None:
         b, ls, lp = env.overtake_hold(lead, torch.ones(env.B, dtype=torch.bool), none, ls, lp)
         total += float(b[0])
     assert total == 0.0
+
+
+# ---------------------------------------------------------------- the ablation diagnostic
+def test_the_ablation_zeroes_the_block_and_keeps_its_width() -> None:
+    """`A3 ~ A0` has two causes that call for opposite next steps -- the planner ignored the block,
+    or it used it and the block did not pay. Zeroing the block on a trained arm separates them."""
+    env = _env("future", m=2, n=2, opp_token_ablate=True)
+    tok, _ = _tokens(env, [(0.0, 0.0, 0.0, 3.0), (2.0, 0.0, 0.0, 5.0)])
+    assert tok.shape[1] == opp_token_dim("future")      # the actor's first layer still fits
+    assert float(tok.abs().max()) == 0.0
+    live = _env("future", m=2, n=2)
+    tok2, _ = _tokens(live, [(0.0, 0.0, 0.0, 3.0), (2.0, 0.0, 0.0, 5.0)])
+    assert float(tok2.abs().max()) > 0.0, "the un-ablated env must actually report something"
+
+
+def test_ablating_a_block_that_does_not_exist_is_refused() -> None:
+    """It would silently be the control arm wearing another arm's name."""
+    with pytest.raises(ValueError, match="control arm"):
+        _env("off", m=2, n=2, opp_token_ablate=True)

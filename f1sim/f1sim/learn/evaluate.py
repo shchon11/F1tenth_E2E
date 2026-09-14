@@ -61,7 +61,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
-             controller: str = "legacy", estimator: str = "") -> dict:
+             controller: str = "legacy", estimator: str = "",
+             opp_token_ablate: bool = False) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -106,7 +107,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
                      scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
                      hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
-                     opp_token=str(spec.get("opp_token") or (model.meta.get("opp_token") if model else None) or "off"))
+                     opp_token=str(spec.get("opp_token") or (model.meta.get("opp_token") if model else None) or "off"),
+                     opp_token_ablate=bool(opp_token_ablate))
     if ecfg.opp_token != "off" and not (race_size > 1 and mode == "plan"):
         raise ValueError(f"this checkpoint was trained with privileged opponent tokens "
                          f"(opp_token={ecfg.opp_token!r}); evaluating it needs race_size > 1 and "
@@ -233,6 +235,13 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--sweep", action="store_true", help="robustness: mu, latency, lidar height")
     ap.add_argument("--per-track", action="store_true")
+    ap.add_argument("--opp-token-ablate", action="store_true",
+                    help="DIAGNOSTIC: run a checkpoint trained with privileged opponent tokens with "
+                         "its block zeroed, keeping the width. It measures how much the policy's "
+                         "driving depends on the oracle -- a large drop means the planner used the "
+                         "information, none means it never read it. Not a deployment path: the "
+                         "checkpoint is still refused by the exporter and the ROS node, and the "
+                         "result is a diagnostic, never a score.")
     ap.add_argument("--protocol", choices=["rolling", "trials"], default="rolling")
     ap.add_argument("--race-size", type=int, default=1)
     ap.add_argument("--opponent", choices=["policy", "teacher"], default="policy")
@@ -307,6 +316,7 @@ def main() -> None:
             config.vehicle.wheel_model = a.wheel_model == "on"
         return evaluate(a.ckpt, names, a.envs, a.steps, a.speed_cap, a.device, seed=a.seed, cfg=config,
                         teacher=a.teacher, action_mode=a.action_mode, protocol=a.protocol,
+                        opp_token_ablate=a.opp_token_ablate,
                         race_size=a.race_size, opponent=a.opponent,
                         budget_laps=a.budget_laps if a.budget_laps > 0 else None, max_steps=a.max_steps,
                         raceline_margin=a.raceline_margin, teacher_grip=a.teacher_grip,

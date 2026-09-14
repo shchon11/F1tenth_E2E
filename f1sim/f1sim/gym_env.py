@@ -234,6 +234,14 @@ class EnvConfig:
     # node. Its whole purpose is to answer whether the planner, *handed* the opponent's state, races
     # any better than it does with LiDAR alone.
     opp_token: str = "off"
+    opp_token_ablate: bool = False    # emit the block as ZEROS while keeping its width. A diagnostic
+                                      # and never a deployment path: it measures how much a policy
+                                      # trained on the block actually depends on it, which is the
+                                      # difference between "the planner ignored the oracle" and "the
+                                      # planner used it and it did not pay" -- two readings of the
+                                      # same flat result that call for opposite next steps. Refused
+                                      # unless `opp_token` is on, because zeroing a block that does
+                                      # not exist is not an ablation, it is the control arm.
     spawn_lateral_std: float = 0.3
     spawn_yaw_std: float = 0.2
     spawn_min_clearance: float = 0.5  # [m] spawn poses closer to a wall are pulled back to the centerline
@@ -570,6 +578,10 @@ class F1VecEnv:
         # ---- privileged opponent tokens (f1sim.opp_token). An oracle; "off" allocates nothing.
         self.opp_token = validate_opp_token(e.opp_token)
         self.opp_token_dim = opp_token_dim(self.opp_token)
+        self.opp_token_ablate = bool(e.opp_token_ablate)
+        if self.opp_token_ablate and self.opp_token == "off":
+            raise ValueError("opp_token_ablate with opp_token 'off': zeroing a block that does not "
+                             "exist is not an ablation, it is the control arm. Score A0 instead.")
         if self.opp_token != "off":
             if self.M < 2:
                 raise ValueError(
@@ -1703,6 +1715,11 @@ class F1VecEnv:
         e = self.ecfg
         per = opp_token_car_dim(self.opp_token)
         out = torch.zeros(self.B, self.opp_token_dim, device=self.device, dtype=st.dtype)
+        if self.opp_token_ablate:
+            # The width the actor's first layer expects, carrying nothing. Zeros and not noise: the
+            # columns were zero at initialisation, so zero is the one value this policy has
+            # certainly seen and the one that cannot be mistaken for an opponent somewhere.
+            return out
         rows, present_all = self.opp_token_slots(st)
         n = rows.shape[1]
         fut = self.opp_future_columns(st, rows) if self.opp_token == "future" else None
