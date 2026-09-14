@@ -394,15 +394,16 @@ def test_a_resume_keeps_what_the_checkpoint_has_instead_of_warm_starting_it_agai
     piece is also the flag that keeps training it, so the routing has to ask the checkpoint."""
     from f1sim.learn.ppo import warm_start_additions
     mem, chan, fut = memory_spec(hidden_size=32), {"channels": ["edges"]}, future_spec()
-    # nothing there yet: all three are a warm start
-    assert warm_start_additions({}, mem, chan, fut) == (mem, chan, fut)
+    tok = "posvel"                                  # the privileged opponent block, routed the same way
+    # nothing there yet: all four are a warm start
+    assert warm_start_additions({}, mem, chan, fut, tok) == (mem, chan, fut, tok)
     # everything there: none of them is, and `load_checkpoint` takes it back whole
-    have = {"memory": mem, "scan_channels": chan, "future_head": fut}
-    assert warm_start_additions(have, mem, chan, fut) == (None, None, None)
+    have = {"memory": mem, "scan_channels": chan, "future_head": fut, "opp_token": tok}
+    assert warm_start_additions(have, mem, chan, fut, tok) == (None, None, None, None)
     # a run that adds the head to an existing recurrent checkpoint adds only the head
-    assert warm_start_additions({"memory": mem, "scan_channels": chan}, mem, chan, fut) == (None, None, fut)
+    assert warm_start_additions({"memory": mem, "scan_channels": chan}, mem, chan, fut) == (None, None, fut, None)
     # and a flag not passed stays not passed
-    assert warm_start_additions({}, None, None, fut) == (None, None, fut)
+    assert warm_start_additions({}, None, None, fut) == (None, None, fut, None)
 
 
 # ------------------------------------------------------------------ the probe
