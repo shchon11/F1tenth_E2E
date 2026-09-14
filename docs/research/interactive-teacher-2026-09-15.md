@@ -254,7 +254,26 @@ PENDING-D2
 
 ## Distilling it
 
-PENDING-D3
+The question, set by root on 2026-09-15 and taken verbatim:
+
+> **can a LiDAR student that never sees the future imitate the privileged interactive expert from
+> observation history alone?**
+
+The primary arm is therefore **GRU + the raw scan stack and nothing else** — no privileged opponent
+block, and no derived scan channels either. Warm-started from A701, the best driving checkpoint on
+the held-out suite. The loss is the existing one: the teacher's deterministic argmin candidate as a
+label and plain Huber regression in the plan space, no candidate classification. The oracle-token
+student is a secondary **ceiling** arm, run after the primary, answering "how much of whatever gap
+remains is perception at all?".
+
+Two input augmentations are deliberately held back and run later, one at a time, on top of that
+baseline (`work/ablations.md`): the decayed occupancy / edge channels, because `memory` is a
+hand-built memory and this question is about what the *recurrent state* accumulates; and the
+ego-motion-compensated residual of [motion-memory](motion-memory-2026-09-14.md), because it makes
+what moved explicit from geometry and would make "the student learned to use the opponent's motion"
+indistinguishable from "the input was handed it".
+
+PENDING-D3-RESULT
 
 ## What this licenses, and what it does not
 
