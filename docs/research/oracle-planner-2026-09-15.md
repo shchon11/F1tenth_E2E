@@ -290,10 +290,45 @@ VERDICT_SECTION
 
 ## What this licenses, and what it does not
 
-LICENSE_LICENSED
+**Licensed.**
 
-LICENSE_NOT
+* *The `future` token's label is a good description of where the opponent actually went.* RMSE
+  0.029 / 0.066 / 0.193 / 0.415 m at 0.10 / 0.25 / 0.50 / 0.75 s, two rollout seeds agreeing to a few
+  per cent, ~16 000 scored rows per horizon per seed, presence-conditioned and masked across resets.
+* *The tracker's iLQR rollout is a better label than the reference it chases*, at every horizon on
+  both seeds, by 1.3x to 1.7x. Both were defensible as "its own plan"; one was measured.
+* *A `posvel` policy cannot derive the `future` columns for itself beyond about 0.2 s.* A straight
+  line through the opponent's velocity is BETTER than its plan at 0.10 s (0.019 m vs 0.029) and 2x to
+  2.5x worse from 0.50 s on, because the plan knows about the corner, the scheduled event and the
+  follow cap. The horizon at which A3 is told something new is between 0.10 and 0.25 s.
+* *The four arms differ by their input width and nothing else.* Fresh modules seeded from their own
+  names, the ambient generator re-seeded after the model is built, and the widened layers' Adam
+  moments carried across the same column insert as the weights -- with all three, **A0 and A3 log
+  identical rollouts for their first two updates**.
+* *`--opp-token off` is the run it was.* No module, no RNG draw, no proprio column; the frozen loss
+  oracle (`tests/data/ppo_loss_oracle.json`) is bit-identical.
+* *An oracle checkpoint cannot reach a car.* Six independent refusals, two of which are tested
+  against a checkpoint carrying only half the metadata.
+* *The two new reward terms are not the 1 % the audit called absent.* Sized by measurement to 6 %
+  and 8 % of progress on the checkpoint every arm starts from.
+
+LICENSE_ARMS
+
+**Not licensed.**
+
+* **Anything about the real car.** Nothing in this branch is deployable, and that is the point
+  rather than a limitation.
+* **Any claim that `--ttc-penalty` or `--overtake-sustained` is the right reward.** They were sized
+  to be *felt*, which is the bar the audit set; whether they help is a different experiment, and
+  every arm here carries both, so this branch cannot separate them from the tokens.
+* **Any claim about the 0.75 s horizon specifically.** The four horizons enter as one block; no arm
+  isolates them, and the label's own error grows fastest there.
+* **Any statement about `--aux-opp`.** Its target is an input column in three of the four arms, so
+  the term does not mean the same thing across them. `work/decide.md` names the asymmetry in
+  advance, and the direction of the bias -- against finding a token effect -- is stated there.
+
+LICENSE_NOT_ARMS
 
 ## What to do with it
 
-LICENSE_NEXT
+LICENSE_NEXT_TEXT
