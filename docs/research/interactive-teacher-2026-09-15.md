@@ -167,6 +167,42 @@ smoothness, so every term but one is identical — the opponent cost of the ±0.
 pass costs 2.02 and the line costs 0.22: the car that is *leaving* has stopped being a reason to
 move, and the side it is leaving *towards* has become one. A present-tense cost has neither number.
 
+## What it chooses on a real lap, and how often the tense matters
+
+Three constructed scenes say the teacher *can* make the racing choice. Whether it *does*, and how
+often, is a question about the distribution of real traffic. `work/teacher_choices.py`: 8 learners
+on two tracks for 300 steps against the reactive opponent set — 2400 learner-steps, every one of
+which had an opponent inside `overtake_range`.
+
+| | |
+|---|---|
+| chose the raceline teacher's own plan (offset 0, speed 1.0) | **67.3 %** |
+| offsets chosen: −0.6 / −0.3 / 0 / +0.3 / +0.6 | 2.6 / 10.8 / **75.4** / 9.5 / 1.7 % |
+| when it left the reference plan, the term that moved it | **opponent 93.1 %**, progress 6.4 %, clearance 0.5 % |
+| chosen offset changed between consecutive steps of an episode | 8.6 %, about once every 0.3 s |
+| mean \|label − the raceline teacher's label\| | 0.023 of the normalized plan range |
+
+Two things follow. It is **not** a raceline teacher with an expensive search attached — it leaves
+the reference plan on a third of steps — and it is **not** a swerving one: the side it picks is
+stable and the offset histogram is symmetric, so nothing in the cost has a handedness. When it does
+leave the line, the opponent term is what moved it in 93 % of cases, and that is the term the
+raceline teacher does not have.
+
+Every step was then scored a second time with the opponents **held frozen where they are now** —
+same candidates, same walls, same progress, same smoothness, so the only difference in the whole
+objective is what the other car is assumed to do:
+
+| a present-tense cost would have chosen | |
+|---|---|
+| a different candidate | **62.0 %** of learner-steps |
+| a different **side** | **55.9 %** |
+
+The direction of that disagreement is the point, and it is not the one that would be guessed. The
+time-indexed cost *holds the racing line* on three quarters of contended steps; the present-tense
+one leaves it far more often, because a car that is really clearing out looks — frozen — exactly
+like a car parked in the path. A teacher built on the present tense does not only miss passes. It
+brakes and swerves for cars that are already going away.
+
 ## The teacher's own ceiling
 
 PENDING-D2
