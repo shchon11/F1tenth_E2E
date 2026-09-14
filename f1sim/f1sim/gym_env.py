@@ -1626,7 +1626,6 @@ class F1VecEnv:
         dist = d.norm(dim=2)
         n = min(OPP_TOKEN_CARS, o.shape[1])
         order = dist.argsort(dim=1)[:, :n]
-        ar = torch.arange(self.B, device=self.device)[:, None]
         rows = torch.gather(o, 1, order)
         present = (torch.gather(dist, 1, order) < self.ecfg.overtake_range).to(st.dtype)
         return rows, present
