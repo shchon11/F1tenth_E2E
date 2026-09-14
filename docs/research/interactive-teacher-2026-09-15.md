@@ -119,7 +119,52 @@ not the continuation of the motion anybody extrapolated. R² is on the **displac
 own body frame**, which is the quantity the label encodes; against raw world position every model
 scores ~1.0 because the track is large.
 
-PENDING-LABEL-TABLE
+Four models, measured on the **same cars** (two tracks, 48 envs, 300 steps, reactive opponents).
+The split by driver in an earlier version of this table was not a fair comparison — teacher-driven
+cars carry brake/stop/shift events and a random speed scale, and are harder to predict whoever is
+predicting them.
+
+| MAE [m] | 0.25 s | 0.50 s | 0.75 s | 1.00 s |
+|---|---|---|---|---|
+| **`pred`** — the plan tracker's own rollout, straight past 0.6 s | **0.054** | **0.109** | **0.214** | **0.410** |
+| `hybrid` — that rollout, then the raceline walk's increments | 0.054 | 0.109 | 0.232 | 0.449 |
+| `plan` — the raceline walk throughout | 0.105 | 0.263 | 0.426 | 0.632 |
+| `constv` — world-frame constant velocity | 0.089 | 0.349 | 0.761 | 1.309 |
+
+| R² on the body-frame **lateral** displacement | 0.25 s | 0.50 s | 0.75 s | 1.00 s |
+|---|---|---|---|---|
+| **`pred`** | **+0.707** | **+0.889** | **+0.931** | **+0.936** |
+| `plan` | +0.318 | +0.735 | +0.876 | +0.882 |
+| `constv` | −0.100 | −0.114 | −0.128 | −0.136 |
+
+Three things are worth taking from this, and two of them were surprises.
+
+**Constant velocity has no lateral information at all.** Its lateral R² is *negative at every
+horizon* — worse than predicting the mean displacement — while its longitudinal R² stays above
++0.74. That is the whole reason a velocity extrapolation cannot answer "which side of that car is
+the gap on": it knows how far the car will get and nothing about where.
+
+**The tracker's rollout beats reconstructing it, by three to one.** The raceline walk applies the
+scheduled event explicitly — the brake multiplier for exactly as long as the event has left, the
+lateral offset being held — and still loses 0.426 to 0.214 at 0.75 s. `PlanTracker.last_pred` is not
+a *model* of what the car will do; it is the iLQR's forward rollout of the plan the car was actually
+given this step, with its speed, its heading, its lane change and its acceleration bounds already
+in it. Everything the walk had to reconstruct, it already knows. (Worker 16 chose the same label
+independently for `--opp-token future`, from its own validation.)
+
+**Continuing along the road past the rollout's horizon does not help, which it should have.** Past
+0.6 s `pred` runs straight at its final heading while the road curves, so `hybrid` — the rollout,
+then the walk's increments, attached to the rollout's endpoint — ought to win the last 0.4 s. It
+loses: 0.232 against 0.214 at 0.75 s and 0.449 against 0.410 at 1.0 s. The walk's increments carry
+the walk's own error, and inheriting it over 0.4 s is worse than going straight. `hybrid` is kept in
+the tree because the rejection is the useful part.
+
+So the default is `pred`, and the interactive teacher reads its 1.0 s horizon through it.
+
+One horizon is not won: at 0.10 s constant velocity reads 0.014 m against `pred`'s 0.059, because
+over 38 cm of travel the rollout's own one-step staleness is larger than the motion being predicted.
+It is a centimetre-scale difference on the samples where the two cars are closest to where they
+already are, and it is reported rather than smoothed over.
 
 ## Is it affordable?
 
