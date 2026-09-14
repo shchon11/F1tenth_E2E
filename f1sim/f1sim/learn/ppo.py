@@ -898,6 +898,14 @@ def main():
     if steps_base:
         print(f"continuing W&B run {wandb_id} from {steps_base/1e6:.1f}M steps", flush=True)
     out = common.run_dir(a.name)
+    # Re-seed before the first rollout, so the ACTION-SAMPLING stream does not depend on how many
+    # modules were built. Two arms that differ by a scan channel or by the motion branch consume
+    # different amounts of the ambient generator while constructing the network, and without this
+    # they then draw different exploration noise from the same `--seed` -- a second difference in a
+    # comparison meant to isolate one, of the same kind as the fresh-weight confound that
+    # `load_for_memory(init_seed=...)` removes, and visible in the log as a different first update
+    # for arms whose policies are bit-identical. With it, every arm's first rollout is the same one.
+    torch.manual_seed(a.seed)
     env.sim.warmup()
 
     T, B = a.horizon, int(lid.numel())
