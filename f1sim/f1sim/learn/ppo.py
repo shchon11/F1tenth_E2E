@@ -413,6 +413,10 @@ def main():
                          f"start as zeroed input columns, so a warm start is still bit-identical")
     ap.add_argument("--scan-memory-tau", type=float, default=2.0,
                     help="[s] time constant of the decayed scan-occupancy channel")
+    ap.add_argument("--frontend", default="", metavar="CKPT",
+                    help="trained sensor front-end (`work/frontend/train.py`) for the `fe_floor` / "
+                         "`fe_range` scan channels. Frozen: it is a sensor model, not part of the "
+                         "policy, and PPO never sees a gradient through it")
     ap.add_argument("--floor-att", default="ego", choices=("ego", "tracker", "vesc"),
                     help="attitude source of the `floor` scan channel. 'ego' is "
                          "`floor.EgoStateAttitude` -- the suspension's calibrated response to the "
@@ -590,6 +594,20 @@ def main():
                               mount_z=float(sim_cfg.lidar.mount_z)).validate().to_meta(),
             "att_source": a.floor_att, "fov": float(sim_cfg.lidar.fov),
             "range_eps": 0.02}
+    if chan_cfg and any(c.startswith("fe_") for c in a.scan_channels):
+        if not a.frontend:
+            raise SystemExit("--scan-channels fe_* needs --frontend CKPT: those channels are a "
+                             "trained network's outputs and there is nothing to output without it")
+        if "floor" not in chan_cfg:
+            from .obs import att_index_spec as _ais
+            from .floor import FloorSpec as _FS
+            chan_cfg["floor"] = {
+                "proprio": _ais(spec),
+                "spec": _FS(mount_x=float(sim_cfg.lidar.mount_x),
+                            mount_y=float(sim_cfg.lidar.mount_y),
+                            mount_z=float(sim_cfg.lidar.mount_z)).validate().to_meta(),
+                "att_source": a.floor_att, "fov": float(sim_cfg.lidar.fov), "range_eps": 0.02}
+        chan_cfg["floor"]["frontend"] = {"path": os.path.abspath(a.frontend)}
     #: The future head is built when the term is on, and only then: `--aux-future 0` is the run it
     #: was, down to the state dict. A checkpoint that already carries one keeps it (the loaders read
     #: `meta`), so a resume does not have to repeat the flag to keep the head -- but it does have to
