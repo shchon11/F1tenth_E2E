@@ -502,6 +502,24 @@ It loads through the same `BaselineDriver` the ROS node uses: backend `torch`, 2
 labels. On the 100 recorded bag scans it asks for −0.253…+0.468 rad and up to 4.40 m/s, i.e. it
 behaves like a driver and not like a saturated network.
 
+**The retrained arm's parity is ≤1e-5, not bit-identical, and that is a backend property.** The
+published TinyLidarNet runs through ONNX on a single-threaded CPU execution provider and is
+bit-identical whatever the batch width. A DAgger student has to go back into the car after every
+iteration, so it runs through torch (deviation 4), and torch selects different convolution kernels
+per batch width. Measured on this checkpoint, one row's command against the same row inside batches
+of 1, 2, 4, 8 and 16:
+
+| width | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| max \|Δ\| vs width 8 | 7.2e-7 | 4.8e-7 | 0 | 0 | 1.5e-8 |
+
+Two consequences, and only the first is a caveat. The node↔adapter parity bar for a torch-backed
+system is the contract's **≤1e-5** branch rather than its "bit-identical" one — comfortably met, at
+7e-7, but it should be claimed as what it is. It does **not** weaken the exact-reproducibility
+result: the suite runs a cell at one fixed batch width, and at a fixed width this backend is
+bit-identical run to run (verified, max \|Δ\| exactly 0.0). Reproducing a row means re-running the
+same cells, not re-running them at a different width.
+
 **It has not been scored yet, so there is no row here.** Scoring it needs one benchmark lane and all
 three are committed to the v2.1 traffic rows; the End2Race arm has not been started at all. Both
 commands are recorded in `work/baselines/STATUS.md` under "Blocked, needs root". Until those run,
