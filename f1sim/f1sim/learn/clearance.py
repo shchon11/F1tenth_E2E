@@ -573,6 +573,13 @@ class ClearanceArm:
         #: gates nothing.
         self.att_rp = torch.zeros(self.B, 2, device=self.device)
         self.att_ok = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: A floor likelihood computed somewhere else -- the learned front-end's floor class. When
+        #: it is set it REPLACES the geometric one for this step, because it answers the same
+        #: question better: measured, at 3-5 degrees of tilt the network reads precision 0.79 /
+        #: recall 0.97 where the geometry reads 0.15 / 0.01, and it needs no attitude to do it.
+        #: Cleared after every use, so a caller that stops supplying it falls back rather than
+        #: gating on a stale frame.
+        self._p_ext: Optional[torch.Tensor] = None
         self.last: Optional[Adjustment] = None
         self._prev_hook = None
         self._installed = False
@@ -626,6 +633,14 @@ class ClearanceArm:
         self.att_ok = (torch.ones(self.B, dtype=torch.bool, device=self.device) if ok is None
                        else torch.as_tensor(ok, device=self.device).reshape(-1).bool())
 
+    def set_floor(self, p_floor: torch.Tensor) -> None:
+        """Supply this step's per-beam floor likelihood from outside (`learn/frontend.py`)."""
+        p = p_floor.detach().to(self.device)
+        if p.shape != self.scan.shape:
+            raise ValueError(f"floor likelihood {tuple(p.shape)} is not this arm's "
+                             f"{tuple(self.scan.shape)}")
+        self._p_ext = p
+
     @torch.no_grad()
     def floor_likelihood(self) -> torch.Tensor:
         """(B, N) the per-beam floor likelihood for the frame currently held."""
@@ -652,7 +667,10 @@ class ClearanceArm:
     @torch.no_grad()
     def field(self) -> torch.Tensor:
         """The distance field for the frame currently held. (B, ny, nx) in metres."""
-        p = self.floor_likelihood() if self.cspec.floor_gate else None
+        p = None
+        if self.cspec.floor_gate:
+            p, self._p_ext = (self._p_ext if self._p_ext is not None
+                              else self.floor_likelihood()), None
         occ = occupancy(self.scan, self.angles, self.cspec, self.range_max,
                         self.mount_x, self.mount_y, p_floor=p, fspec=self.fspec)
         if p is not None:
