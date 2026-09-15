@@ -203,7 +203,46 @@ good to a factor rather than to a decimal.
 and re-measured on a trained arm afterwards, because a term's share of the return is a property of
 the policy as much as of the coefficient:
 
-TABLE_REWARD_AUDIT
+Measured on trained A3 (`work/oracle-planner/work/audit_a3.json`), 63 envs x 800 steps, under the
+reward the arms actually trained (`--overtake-bonus 0`):
+
+| term | /s | steps active | share of progress |
+|---|---|---|---|
+| progress | +3.919 | 100 % | 100 % |
+| **collision** | −0.810 | 0.2 % | **20.7 %** |
+| **plan clearance** | −0.802 | 28.9 % | **20.5 %** |
+| lap | +0.365 | 0.0 % | 9.3 % |
+| steer rate | −0.272 | 99.9 % | 6.9 % |
+| lap time | +0.241 | 1.1 % | 6.1 % |
+| car contact | −0.190 | 0.1 % | 4.9 % |
+| **sustained lead** | +0.170 | 0.1 % | **4.3 %** |
+| **ttc** | −0.115 | 9.4 % | **2.9 %** |
+| collision speed | −0.107 | 0.2 % | 2.7 % |
+| car proximity | −0.061 | 5.6 % | 1.6 % |
+| wall proximity | −0.042 | 11.6 % | 1.1 % |
+| sideslip / wrong way / alive | −0.023 | — | 0.6 % |
+| overtake (removed) | +0.000 | 0 % | 0 % |
+
+Both new terms came in at **about half** their sized share — 2.9 % against 6 %, 4.3 % against 8 % —
+and neither is the ~1 % the 2026-09-13 audit called effectively absent. They were sized on the
+frozen original, which spends 19 % of its steps inside the TTC band against trained A3's 9.4 %: a
+penalty successfully avoided reads small, which is the term working rather than failing.
+
+Grouped, which is what matters for the result:
+
+| group | per second | share of progress |
+|---|---|---|
+| **opponent** (ttc, sustained lead, car contact, car proximity) | 0.537 | **13.7 %** |
+| **geometric safety** (plan clearance, collision, collision speed, wall proximity) | 1.760 | **44.9 %** |
+
+The objective is **more than three times as much about staying off walls as about the other cars**,
+and `plan_clearance` alone is larger than every opponent term combined.
+
+A note on the audit's convention, because it is easy to misread: its `/s` figures are at the
+**trained coefficients**, not at unit coefficient — the script builds the `EnvConfig` with them and
+reads the reward as paid. The 2026-09-13 audit's +0.03 /s for the dense overtake term was at
+coefficient 1.0; the same term measured here at unit coefficient is +0.765 /s, 25x that, which is
+the configuration (race size 3, opponent pool, random spawn) and not the coefficient.
 
 ## The arms
 
@@ -274,7 +313,24 @@ differently rather than by using the opponent's state.
 
 ## Results
 
-RESULTS_TABLE
+1000 updates each, warm-started from the frozen original, `--seed 701`, evaluated at u1000 on two
+proxy seeds and all 80 suite-T cells. Full table: `work/oracle-planner/work/arm_table.md`.
+
+| row | res | A0 `off` | A1 `pos` | A2 `posvel` | A3 `future` |
+|---|---|---|---|---|---|
+| collisions / km ↓ | 2.2 | 10.8 | 9.9 | 6.8 | 8.0 |
+| wall collisions / learner-min ↓ | 0.11 | 0.92 | 0.97 | 0.33 | 0.59 |
+| car contacts / learner-min ↓ | 0.45 | 1.56 | 1.42 | 1.34 | 1.34 |
+| passes held / learner-min ↑ | 0.25 | 1.87 [1.79/1.96] | 2.31 [2.30/2.31] | 2.22 [2.16/2.29] | 2.11 [2.11/2.10] |
+| pace vs the opponents ↑ | 0.073 | 1.263 | 1.313 | 1.286 | 1.304 |
+| sustained leads / learner-min ↑ | 0.61 | 2.43 ±0.26 | 2.90 ±0.30 | 2.63 ±0.27 | 2.85 ±0.27 |
+| suite v2.1 family T ↑ | 0.056 | 328/640 (51.2 %) | 261/640 (40.8 %) | 349/640 (54.5 %) | 356/640 (55.6 %) |
+
+**No row of this table attributes anything to the tokens**, for the reason the next two sections
+give. Reported because the contract asks for it, and because the spread across it is itself the
+evidence for how large single-run variance is here: A1 is the best arm on passes and the worst of
+all four on the held-out suite, 10.4 pp below the *control* against a 5.6 pp bar. One training run
+cannot be both "position helps most" and "position hurts most".
 
 ### Which cell the numbers land in
 
@@ -283,7 +339,19 @@ written before the arms ran, decides the one binary question the contract asks. 
 guide** appended afterwards (the user's, via root) says what the *shape* of the four arms means once
 that is settled:
 
-RESULTS_CELLS
+**(b) — the planner / objective does not use the information.** Reached not by the arms being
+numerically equal, which they are not, but by the ablation below, which is the stronger route: the
+arms that differ do not differ *because of the tokens*.
+
+Not the other cells. `A1 < A2` and `A2 < A3` cannot be claimed, because the differences are not
+caused by the treatment. `A1 ≈ A3` is true numerically and says nothing about geometry versus
+future. The privileged-shortcut cell does not hold — no arm shows training up with held-out down;
+A3 has the best training reward *and* the best family T. The joint interaction+geometry cell does
+not hold — A3 has the fewest car contacts and is not worst on walls.
+
+`posvel ≈ future >> pos`, the outcome the user hoped for, is **not** what happened: A2 ≈ A3, but A1
+is worse than the control, and none of it is attributable. That outcome would have required the
+tokens to be consumed.
 
 ### Does the planner read the block at all?
 
@@ -292,11 +360,47 @@ each oracle arm is scored once more with its own block **zeroed** (`--opp-token-
 kept. A large drop means the planner used the information and it did not pay; no drop means it never
 read it, and a flat table then says nothing about whether the information is useful.
 
-RESULTS_ABLATION
+| row | res | A1 `pos` | A2 `posvel` | A3 `future` |
+|---|---|---|---|---|
+| car contacts / learner-min | 0.45 | 1.35 → 1.27 (−0.08) | 1.21 → 1.38 (+0.18) | 1.20 → 1.21 (+0.01) |
+| passes held / learner-min | 0.25 | 2.30 → 2.29 (−0.01) | 2.16 → 2.06 (−0.09) | 2.11 → 2.36 (+0.25) |
+| pace vs the opponents | 0.073 | 1.270 → 1.285 | 1.275 → 1.297 | 1.287 → 1.245 |
+| collisions / km | 2.2 | 10.0 → 9.2 | 6.3 → 7.3 | 6.9 → 7.3 |
+
+Every shift is inside its row's resolution and several are *improvements* — noise, not a policy
+losing something it depended on. A3's passes row is the sharpest: +0.25 with the block removed, at
+the resolution, in the wrong direction for "the future columns are load-bearing".
+
+**Zero is an in-distribution input**, so this is a fair question rather than an off-manifold probe.
+Presence gating makes an absent slot exactly zero, i.e. the encoding for "no car within 12 m", and
+that occurs on 1.0 % of steps in a three-car race and 4.4 % in a two-car one, with the second slot
+absent on 6.6 % and 100 % respectively (`work/oracle-planner/work/token_zero_fraction.json`). A
+policy that used the block would drive differently when told the road is clear. These do not.
+
+The limitation worth naming: this answers *does it respond to this input at all*, not *does it use
+the information correctly*. A stronger probe would feed a plausible-but-wrong block — a shuffled or
+delayed opponent. The weaker question suffices here only because the answer is no response at all.
 
 ### The training curve, which is not a score
 
-RESULTS_TRAIN
+Median (`collisions / km`) and mean (the rest) over each arm's final 100 updates. In-distribution,
+and here for one row of the reading guide only.
+
+| row | A0 `off` | A1 `pos` | A2 `posvel` | A3 `future` |
+|---|---|---|---|---|
+| reward / step ↑ | 0.0716 | 0.0650 | 0.0735 | 0.0796 |
+| collisions / km ↓ | 16.6 | 26.3 | 19.7 | 19.1 |
+| episode progress [m] ↑ | 58 | 45 | 54 | 52 |
+| reward: ttc / step | −0.00155 | −0.00207 | −0.00159 | −0.00115 |
+| reward: sustained lead / step | +0.00343 | +0.00412 | +0.00524 | +0.00310 |
+| reward: overtake / step | 0.00000 | 0.00000 | 0.00000 | 0.00000 |
+| loss: aux opponent MSE ↓ | 0.0498 | 0.0441 | 0.0569 | 0.0462 |
+
+Two things. **No privileged shortcut**: A3 has the best training reward and the best family T, so
+the "training up, held-out down" cell does not hold. And **the `aux_opp` asymmetry named in advance
+did not materialise** — `work/decide.md` predicted the auxiliary opponent head would collapse in the
+oracle arms, since its target is an input column there; the MSE is 0.044-0.057 across all four, with
+no ordering. Worth recording as a prediction that did not come true.
 
 ## The verdict
 
@@ -328,7 +432,14 @@ VERDICT_SECTION
 * *The two new reward terms are not the 1 % the audit called absent.* Sized by measurement to 6 %
   and 8 % of progress on the checkpoint every arm starts from.
 
-LICENSE_ARMS
+* *The planner does not consume the opponent's state it is handed, at any of three levels of
+  detail.* Zeroing an arm's own block moves nothing beyond the proxy's own resolution, on a block
+  whose zero value is in-distribution (1.0-4.4 % of steps outright, 6.6-100 % for the second slot).
+* *The objective the arms optimised is more than three times as much about geometry as about the
+  other cars* — 44.9 % of progress against 13.7 %, with `plan_clearance` alone larger than every
+  opponent term combined.
+* *The two reward terms this branch added are not negligible* — 2.9 % and 4.3 % of progress, about
+  half their sized targets, against the ~1 % the 2026-09-13 audit called effectively absent.
 
 **Not licensed.**
 
@@ -343,8 +454,34 @@ LICENSE_ARMS
   the term does not mean the same thing across them. `work/decide.md` names the asymmetry in
   advance, and the direction of the bias -- against finding a token effect -- is stated there.
 
-LICENSE_NOT_ARMS
+* **Any attribution of any arm-table difference to the tokens.** Each arm is ONE training run and
+  the ablation says the tokens are unused, so every between-arm difference is training-run variance
+  until a second seed bounds it. That includes A2's five-times-resolution wall-collision advantage
+  and A1's 10.4 pp family-T deficit, which are the two largest numbers in the table.
+* **Any claim that opponent state is useless to a planner.** What is shown is that *this* planner,
+  under *this* objective, does not read it. An objective that priced traffic comparably to geometry
+  might.
+* **Any claim about which horizon matters.** The four `future` horizons enter as one block and no
+  arm isolates them; with the block unread, they are untested rather than tested and rejected.
+* **Anything from the ablation about correct USE of the information.** It shows no response to the
+  input at all; it does not test whether a policy that responded would respond correctly.
 
 ## What to do with it
 
-LICENSE_NEXT_TEXT
+1. **Do not build a motion encoder yet.** That was the decision this branch existed to inform, and
+   the answer is that the consumer does not exist: a planner that ignores ground truth will ignore
+   an estimate of it. `motion-memory-2026-09-14` and `future-head-2026-09-14` asked whether the
+   representation *can* carry the opponent; this asks whether the planner *would use it*, and the
+   two together say the perception work is premature.
+2. **Make the objective about the other cars, then re-run one arm.** The opponent terms are 13.7 %
+   of progress against geometry's 44.9 %. The cheapest decisive experiment is A2 (`posvel`, the
+   arm that needs no future predictor) under a reward where those two groups are comparable, with
+   the same ablation as the test of whether it is read. One arm, ~3.5 h.
+3. **Two seeds per arm, or no arm-to-arm attribution.** This branch's single-seed design cannot
+   separate a treatment effect from a training run, and the spread it produced is large — the same
+   arm best on one instrument and worst on another. Any successor comparing arms needs a within-arm
+   spread first; the ablation is what saved this one from over-claiming, and it should be standard
+   rather than an afterthought.
+4. **Keep the ablation, and strengthen it.** Zeroing answers "is this read at all". A shuffled or
+   time-shifted opponent would answer "is it read *correctly*", which is the question once something
+   does read it.

@@ -764,9 +764,21 @@ def main():
         # standing between the two arms and a KL leash that moved with the conditioning.
         raise RuntimeError("the KL reference actor was captured after the conditioning projection "
                            "had trained; it must be the frozen baseline")
+    #: The reward the run was trained under, recorded in the checkpoint. Without it an audit of
+    #: "the reward" has to be TOLD which reward, and a stale default measures a policy against an
+    #: objective it never saw -- which is exactly what happened to this branch's first audit of A3:
+    #: it was scored with `--overtake-bonus 5.0` after the arms had trained with 0, and the only
+    #: reason it was caught is that the audit records what it thought it was measuring.
+    reward_meta = {k: getattr(env.ecfg, k) for k in (
+        "reward_progress", "reward_collision", "reward_collision_speed", "reward_steer_rate",
+        "reward_proximity", "safe_dist", "reward_plan_clearance", "plan_margin", "reward_wrong_way",
+        "reward_lap", "reward_lap_time", "reward_alive", "reward_car_contact", "reward_overtake",
+        "reward_car_proximity", "car_safe_gap", "reward_sideslip", "reward_ttc", "ttc_safe",
+        "reward_overtake_hold", "overtake_hold_dist", "overtake_hold_time")}
     #: What this run was, recorded in every checkpoint it writes so a result traces back to its arm,
     #: its normalization and its adapter without consulting a shell history.
     experiment_meta = {
+        "reward": reward_meta,
         "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
