@@ -907,3 +907,62 @@ def test_ego_attitude_peek_serves_a_row_subset_without_advancing():
     # inputs must match `index`'s length: the convention `AttitudeTracker.peek` already takes
     with pytest.raises(ValueError, match="already that subset"):
         ego.peek(speed, yaw, acc, idx)
+
+
+def test_attitude_tracker_peek_narrows_every_per_env_field():
+    """The same bug as `EgoStateAttitude`'s, in the path beside it (found by worker 23).
+
+    `peek` narrowed `att`, `ref` and `seen_rest` for a row subset and left `szz`/`sxz` at full
+    width. `_step` has no side effects but it *reads* `self.leak()`, so a 3-row gyro met an 8-row
+    leak and `ScanAugment.preview`'s terminal path raised for `att_source` `tracker` and `vesc`.
+
+    The assertion that matters is not "it does not crash": a subset peek must equal the
+    corresponding rows of a full-batch peek. Mis-narrow any field and the rows stop lining up.
+    """
+    B = 8
+    tr = fl.AttitudeTracker(B)
+    torch.manual_seed(0)
+    g = torch.randn(B, 3) * 0.2
+    a = torch.zeros(B, 3); a[:, 2] = 9.81
+    sp = torch.full((B,), 2.0)
+    for _ in range(20):
+        tr.update(g, a, sp)
+    # a genuinely per-env leak, so a field left at full width changes the ANSWER and not just shapes
+    tr.sxz = torch.linspace(-0.12, 0.12, B)[:, None].repeat(1, 2).contiguous()
+    tr.szz = torch.full((B, 1), 1.0)
+    before = {n: getattr(tr, n).clone() for n in fl.AttitudeTracker._STATE}
+
+    idx = torch.tensor([1, 4, 6])
+    att, ok = tr.peek(g[idx], a[idx], sp[idx], idx)
+    assert att.shape == (len(idx), 2) and ok.shape == (len(idx),)
+    for n, was in before.items():
+        assert torch.equal(was, getattr(tr, n)), f"peek advanced {n}"
+
+    full, _ = tr.peek(g, a, sp)
+    for k, i in enumerate(idx.tolist()):
+        assert torch.allclose(full[i], att[k], atol=1e-6), f"row {k} is not env {i}"
+        one, _ = tr.peek(g[i:i + 1], a[i:i + 1], sp[i:i + 1], torch.tensor([i]))
+        assert torch.allclose(one[0], att[k], atol=1e-6)
+
+    # the leak really is what distinguishes the envs here -- otherwise the check above is vacuous
+    assert not torch.allclose(full[idx[0]], full[idx[-1]], atol=1e-6)
+
+
+def test_every_attitude_source_survives_a_terminal_observation():
+    """End to end, the shape worker 23's repro takes: `preview` on a row subset with the floor
+    channel on, for all three attitude sources. `ego` was fixed in da32150; `tracker` and `vesc`
+    went through `AttitudeTracker.peek` and did not."""
+    from f1sim.learn.obs import ObsSpec, ScanAugment, att_index_spec
+    B, N = 8, 64
+    idx = torch.tensor([1, 4, 6])
+    for source in ("ego", "tracker", "vesc"):
+        spec = ObsSpec(n_beams=N, scan_stack=3, act_dim=8, action_history=2, hist_len=0,
+                       range_max=10.0, v_max=8.0)
+        blk = {"proprio": att_index_spec(spec), "spec": fl.FloorSpec().validate().to_meta(),
+               "att_source": source, "fov": 1.5 * math.pi, "range_eps": 0.02}
+        aug = ScanAugment(["memory", "edges", "floor"], N, B, device="cpu", floor=blk)
+        scan = torch.rand(B, 3, N)
+        pro = torch.rand(B, aug.floor_idx["proprio_dim"])
+        assert aug(scan, pro).shape == (B, 6, N)
+        out = aug.preview(scan[idx], index=idx, proprio=pro[idx])
+        assert out.shape == (len(idx), 6, N), f"{source}: {tuple(out.shape)}"

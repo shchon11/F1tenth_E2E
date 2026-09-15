@@ -530,7 +530,11 @@ class AttitudeTracker:
 
     def _step(self, state, gyro: torch.Tensor, accel: torch.Tensor, speed: torch.Tensor):
         """`(att, ref, seen_rest)` after one control step, as values. No side effects, so `update`
-        and `peek` cannot drift apart: there is one copy of the filter."""
+        and `peek` cannot drift apart: there is one copy of the filter.
+
+        It does READ `self.leak()`, though, so a caller working on a row subset has to narrow
+        `szz`/`sxz` along with the state it passes in -- see `peek` and `_STATE`.
+        """
         att0, ref0, seen0 = state
         dt = self.dt
         g = gyro.to(self.dtype)
@@ -582,10 +586,18 @@ class AttitudeTracker:
         self._fit_leak(gyro)
         return self.att - self.ref
 
+    #: Every per-env field of the filter. Named once so `peek` cannot drift from `reset` and
+    #: `update` by forgetting one -- which is exactly what happened: `peek` narrowed `att`, `ref`
+    #: and `seen_rest` for a row subset and left `szz` and `sxz` at full width, so `_step`'s
+    #: `self.leak()` handed an 8-row leak to a 3-row gyro. `_step` is free of side effects, but it
+    #: READS the leak off `self`, and that implicit dependency is what the three-field version
+    #: missed. The same shape of bug as `EgoStateAttitude`'s, in the path beside it.
+    _STATE = ("att", "ref", "seen_rest", "szz", "sxz")
+
     @torch.no_grad()
     def peek(self, gyro: torch.Tensor, accel: torch.Tensor, speed: torch.Tensor, index=None):
         """`(attitude, usable)` for one step **without advancing the filter**, optionally for a row
-        subset.
+        subset. When `index` is given the INPUTS are already that subset.
 
         For a terminal observation: it is scored (the truncation bootstrap reads its value) and
         never acted on, so advancing the tracker for it would leave the next real step carrying a
@@ -594,11 +606,19 @@ class AttitudeTracker:
         """
         rows = self.batch if index is None else int(len(index))
         self._check(gyro, accel, rows)
-        st = (self.att, self.ref, self.seen_rest)
-        if index is not None:
-            st = tuple(t[index] for t in st)
-        att, ref, seen = self._step(st, gyro, accel, speed)
-        return att - ref, seen
+        saved = {n: getattr(self, n) for n in self._STATE}
+        batch = self.batch
+        try:
+            if index is not None:
+                for n in self._STATE:
+                    setattr(self, n, saved[n][index])
+                self.batch = rows
+            att, ref, seen = self._step((self.att, self.ref, self.seen_rest), gyro, accel, speed)
+            return att - ref, seen
+        finally:
+            for n in self._STATE:
+                setattr(self, n, saved[n])
+            self.batch = batch
 
 
 #: Calibrated suspension gains, `real_data_calibration.md` §6.1a, and the simulator's own defaults
