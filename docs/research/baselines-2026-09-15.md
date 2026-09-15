@@ -219,12 +219,29 @@ re-measured" below for why the published numbers of our own checkpoints are not 
 | system | | S/384 | S−bb3/336 | low µ | mid µ | high µ | A/96 | O/32 | coll/km |
 |---|---|---|---|---|---|---|---|---|---|
 | A701 `@fixed_low` | ours, current best | **275** | 260 | 72/128 | 96/128 | 107/128 | **57** | **25** | **4.12** |
-| frozen original `@legacy` | ours, the reference | 196 | 194 | 22/128 | 73/128 | 101/128 | 29 | 17 | 8.47 |
 | frozen original `@fixed_low` | ours, the deployment arm | 242 | 237 | 59/128 | 89/128 | 94/128 | 48 | 24 | 5.84 |
+| A701 `@legacy` | ours, **policy only** | 217 | 211 | 22/128 | 81/128 | 114/128 | 30 | 17 | 7.03 |
+| frozen original `@legacy` | ours, the reference | 196 | 194 | 22/128 | 73/128 | 101/128 | 29 | 17 | 8.47 |
+| **End2Race**, rear filled 0 m | published, zero-shot | 53 | 53 | 15/128 | 16/128 | 22/128 | 32 | 3 | 12.94 |
 | **TinyLidarNet-L**, speed map 1-8 | published, zero-shot | 47 | 45 | 11/128 | 18/128 | 18/128 | **1** | 9 | 18.02 |
 | TinyLidarNet-L, speed map -0.5-7.0 | published, zero-shot | 31 | 31 | 13/128 | 9/128 | 9/128 | 0 | 0 | 18.90 |
 | **End2Race**, rear filled 30 m | published, zero-shot | 3 | 3 | 0/128 | 0/128 | 3/128 | **0** | 3 | 40.13 |
-| **End2Race**, rear filled 0 m | published, zero-shot | **53** | 53 | 15/128 | 16/128 | 22/128 | **32** | 3 | 12.94 |
+
+Rendered and validated by the benchmark's own reporter, which checks every pin, every cell against
+the frozen grid, and the paired start of every row before it will render:
+`work/baselines/out/leaderboard-v2.md`, 8 systems, 512 cells, one source digest, `device: cpu`.
+
+**A701 `@legacy` is the "policy only" row CONTRACT.md asks for**, and it is worth reading beside
+A701 `@fixed_low`: the same weights, with the plan tracker untouched instead of clamped, lose
+**58 solo completions, 27 avoidance clears and 8 passes**. That is the size of the runtime layer,
+measured on the same cells as the baselines — and it is larger than the entire gap between the two
+published baselines.
+
+**When TinyLidarNet finishes, it finishes fastest.** Its mean lap time over its own completions is
+**10.79 s** against the frozen original's 16.21 s and A701 `@fixed_low`'s 18.00 s. It is not a slow
+cautious driver that runs out of budget; it is a fast one that crashes. The overtaking block says
+the same thing from the other side: 9 passes held with only **4 contacts**, fewer than the frozen
+original's 11 at the same arm.
 
 Per map, which is where the two failures stop looking alike:
 
