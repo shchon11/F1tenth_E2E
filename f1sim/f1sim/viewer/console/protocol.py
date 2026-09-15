@@ -117,7 +117,15 @@ class SessionConfig:
     compile: bool = False
     randomize: bool = True               # domain randomisation, as in training
     stochastic: bool = False
+    #: Who drives the other cars when there is no slot table. Kept for the sessions and recorded
+    #: configs written before `opponent_slots` existed, and for `cars_per_race == 1`, where there is
+    #: no other car for a table to describe.
     opponent: str = "teacher"
+    #: The per-car table (`f1sim.opponent_slots`), as plain JSON objects -- `cars_per_race - 1` of
+    #: them, one per grid slot. This is the same shape `--opp-slots` takes, deliberately: the
+    #: driving page and the training page share one widget, and a session saved here can be pasted
+    #: into a training command. None = no table, and `opponent` above decides instead.
+    opponent_slots: Optional[List[Dict[str, Any]]] = None
     #: Plan-controller arm installed at run time (`learn.grip_runtime`). "legacy" is the untouched
     #: MPC. "estimated" / "fixed_low" apply the grip-aware curvature speed limit and mu-dependent
     #: acceleration/brake budgets on top of the policy's plan -- the deployment configuration that
@@ -138,6 +146,22 @@ class SessionConfig:
     saliency: bool = False
     internals: bool = False
     max_render_cars: int = 64
+
+    def slots(self):
+        """The table as `OpponentSlot`s, or None. Raises ValueError with the parser's own reason."""
+        from ... import opponent_slots as osl
+        return osl.parse_slots(self.opponent_slots) if self.opponent_slots else None
+
+    def opponent_summary(self) -> str:
+        """One short line naming who the other cars are, for a header. "" for a solo session."""
+        if int(self.cars_per_race) < 2:
+            return ""
+        try:
+            slots = self.slots()
+        except ValueError:
+            slots = None
+        from ... import opponent_slots as osl
+        return osl.mix_summary(slots) if slots else str(self.opponent)
 
     @property
     def total_cars(self) -> int:

@@ -22,6 +22,7 @@ from . import catalog, theme
 from ... import tracks
 from .catalog import GROUP_CAVEAT, GROUP_HINT, GROUP_ORDER, MapCatalog, RunInfo, format_age
 from .frames import Freshness, INTERP_LAG_FRAMES
+from .opponent_table import OpponentSlotTable
 from .overlays import ActivationPanel, DashPanel, PolicyInputPanel
 from .protocol import (SessionConfig, STAGE_TEXT, STATE_FAILED, STATE_IDLE, STATE_PAUSED,
                        STATE_PREPARING, STATE_RUNNING, STATE_STOPPING)
@@ -202,6 +203,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- left: what to run
     def _build_left(self) -> QtWidgets.QWidget:
         area, v = _scroll_panel(340)
+        self._left_scroll = area
+        self._panel_nudged_for = 0
         #: The scrolling part of the left panel, kept as an attribute so a caller (a screenshot
         #: script, a test) can put a card on screen without reaching through the widget tree.
         self.left_scroll = area
@@ -413,10 +416,14 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         adv.add(self.chk_dr)
         self.chk_stoch = QtWidgets.QCheckBox("학습처럼 행동을 샘플링")
         adv.add(self.chk_stoch)
-        self.combo_opponent = QtWidgets.QComboBox()
-        self.combo_opponent.addItems(["teacher", "policy"])
-        adv.add(FieldRow("상대차 주행 방식", self.combo_opponent,
-                         "레이스당 차량 수가 2 이상일 때만 의미가 있습니다."))
+        # The per-car table, in place of the one combo that used to say the same thing about every
+        # other car at once. Same widget as the training page's, so a session and a training command
+        # cannot describe an opponent differently.
+        self.opp_table = OpponentSlotTable()
+        self.opp_table.changed.connect(self._on_slots_changed)
+        self.row_opp = FieldRow("상대차 (차량별 설정)", self.opp_table,
+                                "레이스당 차량 수 - 1 줄. 줄마다 종류·체크포인트·속도·이벤트·스폰을 따로 정합니다.")
+        adv.add(self.row_opp)
         self.combo_device = QtWidgets.QComboBox()
         self.combo_device.addItems(["auto", "cuda", "cpu"])
         adv.add(FieldRow("연산 장치", self.combo_device, ""))
@@ -464,7 +471,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_cancel.clicked.connect(self._on_cancel)
         bh.addWidget(self.btn_cancel, 1)
         wv.addWidget(bar)
-        wrap.setMaximumWidth(420)
+        wrap.setMaximumWidth(self.PANEL_W)
+        self._left_wrap = wrap
         return wrap
 
     # ---------------------------------------------------------------- centre: the picture
@@ -607,6 +615,15 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.viewport.setMinimumHeight(240)
         return centre
 
+    #: The setup sidebar's width. `PANEL_W_SLOTS` is what it grows to while the 상대차 table has
+    #: rows: ten fixed-width columns do not fit 420 px, and a table one column wide is a table
+    #: nobody can read. It only grows when there is a table, and only while the window has the room
+    #: (`_panel_width`), so a narrow screen keeps the picture.
+    PANEL_W = 420
+    PANEL_W_SLOTS = 640
+    #: What the 3D view keeps when the sidebar grows for the table.
+    CENTRE_MIN_W = 600
+
     #: Below this width the two sidebars leave the 3D view too small to drive by, so the setup
     #: sidebar -- which is only needed between sessions -- folds away once a session is running.
     NARROW_W = 1400
@@ -679,6 +696,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         def run():
             self._cap_queued = False
             self._cap_policy_panel()
+            # Widths are only real after the layout pass, and the sidebar's width depends on the
+            # splitter's: asking for it inside `resizeEvent` reads zeros on the first show.
+            self._apply_panel_width()
 
         QtCore.QTimer.singleShot(0, run)
 
@@ -696,6 +716,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.policy_fold.toggle.setChecked(False)
             self._policy_autofold_done = True
         self._cap_policy_panel()
+        self._apply_panel_width()
         driving = self.state in (STATE_RUNNING, STATE_PAUSED)
         if (not self._sidebar_autofold_done and driving and self.width() < self.NARROW_W
                 and self.btn_left_panel.isChecked()):
@@ -703,6 +724,35 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self._sidebar_autofold_done = True
             self.status_text.setText(
                 "창이 좁아 설정 패널을 접었습니다. 위의 '설정 패널' 버튼으로 다시 펼 수 있습니다.")
+
+    def _apply_panel_width(self):
+        """Widen the setup sidebar while the 상대차 table has rows, if the window can spare it.
+
+        The table is ten fixed-width columns; at the sidebar's usual 330 px three of them are
+        visible and the rest is a horizontal scrollbar, which is not a table anyone can read. So the
+        sidebar grows when there is a table to show and shrinks back when there is not -- and only
+        while the window is wide enough that the 3D view keeps 900 px, because the picture is what
+        the page is for. A splitter the user has dragged wider than this is left alone.
+        """
+        if not hasattr(self, "_left_wrap") or not hasattr(self, "opp_table"):
+            return
+        want = self.PANEL_W
+        if self.opp_table.count() and self.width() >= self.NARROW_W:
+            want = min(self.PANEL_W_SLOTS, max(self.PANEL_W, self.width() - 900))
+        self._left_wrap.setMaximumWidth(want)
+        self._left_scroll.setMaximumWidth(want)
+        if self._panel_nudged_for == want or not self.isVisible():
+            # Already offered this width once (a later drag is the user's), or the window has not
+            # been laid out yet -- a splitter re-distributes on first show, so a nudge before that
+            # is simply discarded.
+            return
+        sizes = self.splitter.sizes()
+        if len(sizes) != 3 or not sizes[0] or sizes[1] <= 0:
+            return
+        self._panel_nudged_for = want
+        delta = min(want - sizes[0], max(0, sizes[1] - self.CENTRE_MIN_W))
+        if delta > 0:
+            self.splitter.setSizes([sizes[0] + delta, sizes[1] - delta, sizes[2]])
 
     # ---------------------------------------------------------------- right: is this real
     def _build_right(self) -> QtWidgets.QWidget:
@@ -993,7 +1043,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
-                  self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.combo_opponent,
+                  self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.opp_table,
                   self.combo_device, self.combo_controller, self.edit_estimator, self.combo_ros,
                   self.seg_direction, self.combo_obstacle):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
@@ -1091,13 +1141,18 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         summary = f"{run}  ·  {mp}  ·  {races}레이스 × {grid}대 = {cars}대"
         if shown < cars:
             summary += f" (화면 {shown}대)"
+        mix = facts.get("opponent_mix") or ""
+        if grid > 1 and mix:
+            summary += f"  ·  상대차 {mix}"
         summary += f"  ·  {device}  ·  세션 #{self.generation}"
         ros = facts.get("ros2")
         if ros:
             summary += "  ·  ROS2 " + ("/drive 제어" if ros.get("mode") == "drive" else "발행")
         self.header_summary.setText(summary)
         self.header_summary.setToolTip(
-            f"{facts.get('scenario_display') or ''}\n로더 이름: {facts.get('map_legacy') or mp}".strip())
+            "\n".join([f"{facts.get('scenario_display') or ''}",
+                        f"로더 이름: {facts.get('map_legacy') or mp}"]
+                       + list(facts.get("opponent_slot_lines") or [])).strip())
         self.combo_focus.blockSignals(True)
         self.combo_focus.clear()
         for cid in self._session_ids[:shown]:
@@ -1402,7 +1457,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     # ================================================================ user actions
     def _can_start(self) -> bool:
-        return bool(self._selected_run and self._selected_map)
+        if not (self._selected_run and self._selected_map):
+            return False
+        # A slot table that names a checkpoint the loader will refuse is a start that fails after a
+        # minute of loading. The table already knows; the button asks it.
+        if hasattr(self, "opp_table") and self.spin_grid.value() > 1:
+            return not self.opp_table.problem(self.spin_grid.value())
+        return True
 
     def _update_start_enabled(self):
         if self.state in (STATE_IDLE, STATE_FAILED):
@@ -1524,6 +1585,25 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.row_grid.set_hint(f"같은 트랙에서 {grid}대가 겨룹니다. 상대차는 스캔에도 잡힙니다.", "hint")
         else:
             self.row_grid.reset_hint()
+        # The table is the other cars, so its height is the grid minus the learner. Rows already
+        # filled in survive a change: raising the count from 2 to 3 adds a row, it does not reset
+        # the two that were configured.
+        if hasattr(self, "opp_table"):
+            self.opp_table.set_count(max(0, grid - 1))
+            self.row_opp.setVisible(grid > 1)
+            self._queue_panel_cap()
+            self._on_slots_changed()
+
+    def _on_slots_changed(self):
+        """Show the table's own objection on the field row, and keep 시작 honest about it."""
+        if not hasattr(self, "opp_table"):
+            return
+        problem = self.opp_table.problem(self.spin_grid.value()) if self.spin_grid.value() > 1 else ""
+        if problem:
+            self.row_opp.set_hint(problem, "warn")
+        else:
+            self.row_opp.reset_hint()
+        self._update_start_enabled()
 
     def current_config(self) -> SessionConfig:
         return SessionConfig(
@@ -1537,7 +1617,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             compile=self.chk_compile.isChecked(),
             randomize=self.chk_dr.isChecked(),
             stochastic=self.chk_stoch.isChecked(),
-            opponent=self.combo_opponent.currentText(),
+            opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
+            opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),
             controller=self.combo_controller.currentText(),
             estimator=self.edit_estimator.text().strip(),
             mu_mode=str(self.combo_mu.currentData() or "random"),

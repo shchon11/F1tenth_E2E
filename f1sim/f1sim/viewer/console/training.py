@@ -34,7 +34,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import catalog, theme
+from ... import opponent_slots as osl
 from ... import tracks
+from .opponent_table import OpponentSlotTable
 from .theme import C, SP
 from .widgets import Card, Collapsible, FieldRow, KeyValueList, MetricTile, hline, label
 
@@ -364,6 +366,28 @@ _SHA_IN_NAME = re.compile(r"([0-9a-f]{8,40})")
 _CKPT_SHA_CACHE: Dict[Tuple[str, float, int], str] = {}
 
 
+#: The recipe `race_flags` a slot table supersedes -- the same list `learn.opponent_config` refuses
+#: alongside `--opp-slots`, which is why the form has to drop them rather than let the trainer exit.
+SLOT_SUPERSEDED_FLAGS = ("--opp-speed", "--mixed-teacher-frac", "--opp-events", "--opp-event-rate",
+                         "--opp-pool", "--spawn-order", "--opp-defend-prob", "--opp-yield-prob",
+                         "--opp-line-prob", "--opp-oblivious-prob")
+
+
+def _strip_slot_flags(parts: List[str], slots_on: bool) -> List[str]:
+    """Drop the whole-race opponent flags from a recipe's extras when a slot table is in charge."""
+    if not slots_on:
+        return list(parts)
+    out, i = [], 0
+    while i < len(parts):
+        if parts[i] in SLOT_SUPERSEDED_FLAGS:
+            i += 1
+            while i < len(parts) and not parts[i].startswith("--"):
+                i += 1
+            continue
+        out.append(parts[i]); i += 1
+    return out
+
+
 def argv_flags(argv: Sequence[str]) -> Dict[str, str]:
     """`--flag value` pairs, plus `--flag` -> "" for switches. Repeats keep the last, which is what
     the trainer's own argparse does."""
@@ -551,6 +575,10 @@ class JobSummary:
     tracks_text: str = ""
     race_text: str = ""
     events_text: str = ""
+    #: One line per opponent slot when the run was started with `--opp-slots`. The jobs card lists
+    #: them under 레이스, because "3대 · 상대차 slots" answers nothing: a slot table's whole point is
+    #: that the other cars are not alike.
+    slot_lines: List[str] = field(default_factory=list)
     controller: str = ""
     lr_text: str = ""
     total_text: str = ""
@@ -561,6 +589,8 @@ class JobSummary:
     def lines(self) -> List[Tuple[str, str]]:
         """(label, value) rows, in the order they answer "what is this?"."""
         rows = [("레시피", self.recipe), ("트랙", self.tracks_text), ("레이스", self.race_text)]
+        for i, line in enumerate(self.slot_lines):
+            rows.append(("상대차" if i == 0 else "", line))
         if self.events_text:
             rows.append(("이벤트", self.events_text))
         rows += [("제어기", self.controller), ("시작 체크포인트", self.init),
@@ -602,7 +632,17 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
     init = f.get("init", "")
     sha = checkpoint_sha(init) if init else ""
     race = int(f.get("race-size", 1) or 1)
-    race_text = f"{race}대" + (f" · 상대차 {f.get('opponent', 'teacher')}" if race > 1 else " (단독)")
+    slots, slot_lines = None, []
+    if f.get("opp-slots"):
+        try:
+            slots = osl.parse_slots(f["opp-slots"])
+        except ValueError as exc:
+            slot_lines = [f"(--opp-slots 를 읽을 수 없습니다: {exc})"]
+    if slots:
+        slot_lines = [f"차량 {i}: {sl.describe()}" for i, sl in enumerate(slots, start=1)]
+        race_text = f"{race}대 · 차량별 설정 ({osl.mix_summary(slots)})"
+    else:
+        race_text = f"{race}대" + (f" · 상대차 {f.get('opponent', 'teacher')}" if race > 1 else " (단독)")
     events = f.get("opp-events", "")
     events_text = f"{events} (10초당 {f.get('opp-event-rate', '?')}회)" if events else ""
     wb = _WANDB.search(log_text or "")
@@ -615,7 +655,7 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
         recipe=(recipe.title if recipe else ("외부 실행" if job.external else "사용자 정의")),
         init=(f"{os.path.basename(init)}" + (f" · {sha}" if sha else "")) if init else "",
         tracks_text=describe_tracks(f.get("tracks", "train"), f.get("obstacle-draws", "")),
-        race_text=race_text, events_text=events_text,
+        race_text=race_text, events_text=events_text, slot_lines=slot_lines,
         controller=f.get("controller", "legacy"),
         lr_text=(f"{lr} → {lr_end}" if lr and lr_end else lr or ""),
         total_text=_fmt_steps(f.get("total", "")),
@@ -1099,6 +1139,22 @@ class RecipeForm(QtWidgets.QWidget):
         g3.addWidget(FieldRow("레이스당 차량", self.spin_race, ""), 0, 0)
         g3.addWidget(FieldRow("상대차", self.combo_opp, ""), 0, 1)
         adv.add(g3)
+        # The per-car table, off by default. On, it replaces `--opponent` (and the recipe's
+        # `--opp-speed` / `--mixed-teacher-frac`) with one `--opp-slots` JSON, which is the same
+        # table the driving page edits: a run started here can be watched there without retyping it.
+        self.chk_slots = QtWidgets.QCheckBox("차량별 상대차 설정 (--opp-slots)")
+        self.chk_slots.setToolTip(
+            "켜면 위의 '상대차' 한 줄 대신 차량마다 종류·체크포인트·속도 프로파일·그립 라벨·이벤트·\n"
+            "반응형 확률·스폰을 따로 정합니다. 레시피의 --opponent / --opp-speed /\n"
+            "--mixed-teacher-frac 는 표가 대신하므로 명령에서 빠집니다.")
+        self.chk_slots.toggled.connect(self._on_slots_toggled)
+        adv.add(self.chk_slots)
+        self.opp_table = OpponentSlotTable()
+        self.opp_table.changed.connect(self._refresh_preview)
+        self.row_slots = FieldRow("상대차 표", self.opp_table,
+                                  "레이스당 차량 수 - 1 줄. 주행 페이지와 같은 위젯입니다.")
+        self.row_slots.setVisible(False)
+        adv.add(self.row_slots)
         self.edit_aux_grip = QtWidgets.QLineEdit("1.0"); self.edit_aux_opp = QtWidgets.QLineEdit("1.0")
         g4 = QtWidgets.QGridLayout(); g4.setHorizontalSpacing(SP[1])
         g4.addWidget(FieldRow("aux grip", self.edit_aux_grip, "마찰 보조 head 가중치"), 0, 0)
@@ -1145,6 +1201,8 @@ class RecipeForm(QtWidgets.QWidget):
             w.textChanged.connect(self._refresh_preview)
         for w in (self.spin_seed, self.spin_total, self.spin_envs, self.spin_race, self.spin_save):
             w.valueChanged.connect(self._refresh_preview)
+        self.spin_race.valueChanged.connect(lambda v: self.opp_table.set_count(max(0, int(v) - 1)))
+        self.opp_table.set_count(max(0, self.spin_race.value() - 1))
         for w in (self.combo_opp, self.combo_controller, self.combo_wandb, self.combo_device, self.combo_init):
             w.currentTextChanged.connect(self._refresh_preview)
         self.chk_restore_opt.toggled.connect(self._refresh_preview)
@@ -1185,6 +1243,11 @@ class RecipeForm(QtWidgets.QWidget):
         self.edit_name.setText(f"cl_{r.key}_legacy_s{self.spin_seed.value()}_{time.strftime('%m%d%H%M')}")
         self._refresh_preview()
 
+    def _on_slots_toggled(self, on: bool):
+        self.row_slots.setVisible(on)
+        self.combo_opp.setEnabled(not on)
+        self._refresh_preview()
+
     def _controller_hint(self, arm: str):
         if arm == "legacy":
             self.ctrl_hint.setText("")
@@ -1200,19 +1263,27 @@ class RecipeForm(QtWidgets.QWidget):
         race = self.spin_race.value()
         arm = self.combo_controller.currentText()
         parts = [sys.executable, "-m", "f1sim.learn.ppo"] + shlex.split(COMMON_FLAGS)
+        slots_on = self.chk_slots.isChecked() and race > 1
         parts += ["--tracks", self.tracks.spec() or "train",
                   "--obstacle-draws", str(self.tracks.draws()),
                   "--envs", str(self.spin_envs.value()), "--total", str(float(self.spin_total.value())),
                   "--lr", self.edit_lr.text().strip() or "5e-5", "--lr-end", self.edit_lr_end.text().strip() or "2e-5",
                   "--kl-coef", self.edit_kl.text().strip() or "0.05",
                   "--init", self._init_path(), "--seed", str(self.spin_seed.value()),
-                  "--race-size", str(race), "--opponent", self.combo_opp.currentText(),
-                  "--aux-grip", self.edit_aux_grip.text().strip() or "0", "--aux-opp", self.edit_aux_opp.text().strip() or "0",
+                  "--race-size", str(race)]
+        if slots_on:
+            # `--opponent` and the recipe's opponent flags are what the table replaces; emitting
+            # both would leave two answers on the command line, and the trainer refuses that rather
+            # than picking one.
+            parts += ["--opp-slots", self.opp_table.json()]
+        else:
+            parts += ["--opponent", self.combo_opp.currentText()]
+        parts += ["--aux-grip", self.edit_aux_grip.text().strip() or "0", "--aux-opp", self.edit_aux_opp.text().strip() or "0",
                   "--device", self.combo_device.currentText(), "--wandb", self.combo_wandb.currentText(),
                   "--wandb-group", f"console-{r.key}", "--save-every", str(self.spin_save.value()),
                   "--name", name, "--controller", arm]
         if race > 1 and r.race_flags:
-            parts += shlex.split(r.race_flags)
+            parts += [f for f in _strip_slot_flags(shlex.split(r.race_flags), slots_on)]
         if race == 1:
             parts += ["--cond", "none", "--critic-priv-adapter", "absent_opponent_17_to_21"]
         if arm == "estimated":
@@ -1245,6 +1316,11 @@ class RecipeForm(QtWidgets.QWidget):
         if arm != "legacy" and self.spin_race.value() > 1:
             self.launch_note.setText(f"'{arm}' 제어기는 레이스당 차량 1에서만 학습됩니다.")
             return
+        if self.chk_slots.isChecked() and self.spin_race.value() > 1:
+            problem = self.opp_table.problem(self.spin_race.value())
+            if problem:
+                self.launch_note.setText(problem)
+                return
         self.launch_requested.emit(name, parts, device)
 
 

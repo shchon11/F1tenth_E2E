@@ -230,6 +230,15 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
         raise StartConfigError(f"속도 상한 {cfg.speed_cap} m/s 는 범위를 벗어났습니다 (0 초과 30 이하).")
     if int(cfg.max_render_cars) < 1:
         raise StartConfigError(f"화면 표시 차량 수는 1 이상이어야 합니다 (받은 값 {cfg.max_render_cars}).")
+    # The slot table, before the checkpoint is read: a table with the wrong number of rows, or a
+    # kind this tree does not have, is the user's typing and is said here rather than after a
+    # minute of loading.
+    if cfg.opponent_slots and int(cfg.cars_per_race) > 1:
+        from ..opponent_slots import validate_slots
+        try:
+            validate_slots(cfg.slots(), int(cfg.cars_per_race))
+        except ValueError as exc:
+            raise StartConfigError(f"상대차 표: {exc}") from exc
     if str(cfg.device) not in ("auto", "cpu", "cuda") and not str(cfg.device).startswith("cuda:"):
         raise StartConfigError(f"장치 이름을 알 수 없습니다: {cfg.device!r} (auto / cpu / cuda).")
     ros2 = str(getattr(cfg, "ros2", "off") or "off")
@@ -242,6 +251,30 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
             raise StartConfigError(
                 "ROS2 연동에는 rclpy 와 메시지 패키지가 필요합니다. ROS 워크스페이스를 소싱한 셸"
                 "(예: source activate.sh)에서 콘솔을 열어 주세요. 가져오기 실패: " + why)
+
+
+def _slot_dicts(env) -> Optional[list]:
+    """The env's slot table as JSON objects, or None when it is not running one."""
+    slots = getattr(env, "slots", None)
+    return None if slots is None else [s.to_dict() for s in slots]
+
+
+def _slot_lines(env) -> Optional[list]:
+    """One readable line per slot, for the facts panel."""
+    slots = getattr(env, "slots", None)
+    return None if slots is None else [f"차량 {i}: {s.describe()}"
+                                       for i, s in enumerate(slots, start=1)]
+
+
+def _opponent_mix(env) -> str:
+    """The short "who are the other cars" line the session header shows."""
+    if env.M < 2:
+        return ""
+    slots = getattr(env, "slots", None)
+    if slots is None:
+        return str(env.ecfg.opponent)
+    from ..opponent_slots import mix_summary
+    return mix_summary(slots)
 
 
 def resolve_checkpoint(run: str, runs_dir: str, latest: str = "") -> str:
@@ -731,7 +764,17 @@ class SimWorker:
         races = max(1, int(cfg.races))
         grid = max(1, int(cfg.cars_per_race))
         n_cars = races * grid                      # a product: nothing to truncate
-        need_rl = grid > 1 and cfg.opponent == "teacher"
+        try:
+            slots = cfg.slots()
+            if slots is not None:
+                from ..opponent_slots import validate_slots
+                validate_slots(slots, grid)
+        except ValueError as exc:
+            raise StartConfigError(f"상대차 표: {exc}") from exc
+        if slots is not None and grid < 2:
+            slots = None                       # a solo session has no other car to configure
+        need_rl = grid > 1 and (any(sl.teacher_driven for sl in slots) if slots is not None
+                                else cfg.opponent == "teacher")
 
         self.stage(gen, "raceline")
         rls = None
@@ -749,9 +792,14 @@ class SimWorker:
         self.stage(gen, "env")
         spec = extra.get("spec") or {}
         env_cfg = EnvConfig(
-            speed_cap=speed_cap, action_mode=mode, race_size=grid, opponent=cfg.opponent,
+            speed_cap=speed_cap, action_mode=mode, race_size=grid,
+            opponent=("slots" if slots is not None else cfg.opponent),
+            opponent_slots=slots,
             max_steps=int(cfg.episode_s * 40),
-            # opponents at the policy's own cap and the teacher at full raceline pace
+            # opponents at the policy's own cap and the teacher at full raceline pace. With a slot
+            # table each car carries its own scale and its own cap instead, and `selfplay_front_cap`
+            # off is what keeps a `self` slot racing the learner as an equal: what is being watched
+            # here is the policy against itself, and a silently slowed opponent reads as a bug.
             selfplay_front_cap=False, opp_speed_range=(1.0, 1.0),
             scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
             hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
@@ -779,8 +827,16 @@ class SimWorker:
         sim_cfg = viewer_config(compile_enabled, randomize=cfg.randomize)
         if "range_max" in spec:
             sim_cfg.lidar.range_max = float(spec["range_max"])
-        env = common.make_env([track], n_cars, device, env_cfg, cfg=sim_cfg,
-                              rls=rls if need_rl else None)
+        try:
+            env = common.make_env([track], n_cars, device, env_cfg, cfg=sim_cfg,
+                                  rls=rls if need_rl else None)
+        except (ValueError, RuntimeError) as exc:
+            # A slot's checkpoint is loaded here (`learn.opponent_pool`), which is where an oracle
+            # checkpoint, a mismatched observation and a wrong controller arm are all refused. Those
+            # are configuration mistakes, not crashes: the console shows them on the settings panel.
+            if slots is None:
+                raise
+            raise StartConfigError(f"상대차 표: {exc}") from exc
         env.sim.tid.fill_(0)                       # every car on the map that was asked for
         mu_pin = None
         if str(getattr(cfg, "mu_mode", "random")) == "fixed":
@@ -1030,6 +1086,13 @@ class SimWorker:
             # must not be read as evidence for the other.
             "actor_compiled": bool(getattr(session.get("act_fn"), "compiled", False)),
             "controller": str(session.get("controller_arm") or "legacy"),
+            # Who the other cars are. `opponent_mix` is the short form the header line shows
+            # ("2x raceline, 1x policy"); `opponent_slots` is the table itself, so a session can be
+            # reproduced -- and pasted into `--opp-slots` -- from what was actually built.
+            "opponent": str(env.ecfg.opponent),
+            "opponent_mix": _opponent_mix(env),
+            "opponent_slots": _slot_dicts(env),
+            "opponent_slot_lines": _slot_lines(env),
             "estimator": os.path.basename(session.get("estimator_path") or ""),
             "physics_compile_requested": bool(env.sim.cfg.sim.compile),
             "physics_compile_mode": str(env.sim.cfg.sim.compile_mode),
