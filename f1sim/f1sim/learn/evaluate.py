@@ -62,7 +62,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
              controller: str = "legacy", estimator: str = "",
-             teacher_kind: str = "raceline", teacher_horizon: float = 1.0,
+             teacher_kind: str = "raceline", teacher_speed: float = 1.0,
+             mu: float | None = None, teacher_horizon: float = 1.0,
              teacher_cand_iters: int = 2, teacher_cost: str = "",
              opp_future_model: str = EnvConfig.opp_future_model, opp_extra: dict | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
@@ -73,6 +74,14 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     simulator's generator.
     contention_range_m / attack_range_m: the two arc windows the traffic metrics measure over. The
     defaults are the env's own `overtake_range` and the benchmark's tight window.
+    teacher_speed: scale on the teacher's own speed profile. The teacher plans at the grip limit,
+    so 1.0 is the limit and collection has historically used less (`RacelineTeacher.grip_bin`:
+    "which is why collection uses speed_scale < 1"). What the right value is has never been
+    measured; `--teacher-speed` with `--mu` is how it gets measured.
+    mu: pin the plant's friction instead of randomising it, so a number is *about* that friction.
+    Randomisation is switched off with it, because with it on `vehicle.mu` is a scale applied to a
+    draw and the episode's friction is not the number asked for -- the same argument
+    `benchmark.model_adapter.eval_config` makes.
     teacher_kind: which privileged teacher `--teacher` drives. "raceline" is the one this function
     has always driven. "interactive" is `f1sim.interactive_teacher`, which scores a family of plans
     against the opponents' predicted motion -- the only one of the two that can demonstrate a pass,
@@ -88,6 +97,10 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
     torch.manual_seed(seed)
     np.random.seed(seed)
+    cfg = cfg or Config()
+    if mu is not None:
+        cfg.rand.enabled = False
+        cfg.vehicle.mu = float(mu)
     rl_kw = {} if raceline_margin is None else {"margin": raceline_margin}
     trs, rls = common.load_tracks(tracks, racelines=teacher or (race_size > 1 and opponent == "teacher"), **rl_kw)
     model = None
@@ -121,7 +134,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                          "plans.")
     if opp_speed_range is not None:
         ecfg.opp_speed_range = tuple(float(x) for x in opp_speed_range)
-    step_dt = 1.0 / (cfg or Config()).sim.control_rate
+    step_dt = 1.0 / cfg.sim.control_rate
     steps = resolve_steps(protocol, steps, budget_laps, trs, speed_cap, step_dt, max_steps)
     if protocol == "trials":
         ecfg.max_steps = steps
@@ -132,6 +145,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     ctrl.install()
     if teacher:
         teacher_policy = common.make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time)
+        teacher_policy.speed_scale = float(teacher_speed)
         if teacher_kind == "interactive":
             from ..interactive_teacher import InteractiveTeacher, TeacherCost
             w = [float(x) for x in teacher_cost.split(",")] if teacher_cost else None
@@ -202,6 +216,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'protocol': protocol, 'tracks': list(tracks), 'seed': seed,
         'seeds': {'numpy': seed, 'torch': seed, 'simulator': seed, 'reset': seed if protocol == 'trials' else None},
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
+        'teacher_speed': float(teacher_speed) if teacher else None,
+        'pinned_mu': float(mu) if mu is not None else None,
         'opp_token': str(env.opp_token_mode or "") or None,
         'opp_future_model': opp_future_model if env.opp_token_mode else None,
         'deterministic_policy': True,
@@ -296,6 +312,12 @@ def main() -> None:
                          "precomputed line, blind to the other cars. interactive: "
                          "f1sim.interactive_teacher, which scores a family of plans against the "
                          "opponents' predicted motion -- the only one of the two that can pass")
+    ap.add_argument("--teacher-speed", type=float, default=1.0, metavar="SCALE",
+                    help="scale on the teacher's own speed profile. The profile already plans at the "
+                         "grip limit, so 1.0 IS the limit; collection has historically used less")
+    ap.add_argument("--mu", type=float, default=None,
+                    help="pin the plant's friction (and switch randomisation off) so the result is "
+                         "about that friction. The suite's levels are 0.73423 / 0.94401 / 1.15379")
     ap.add_argument("--teacher-horizon", type=float, default=1.0, metavar="S",
                     help="[s] how far the interactive teacher rolls each candidate out")
     ap.add_argument("--teacher-cand-iters", type=int, default=2, metavar="N",
@@ -363,7 +385,8 @@ def main() -> None:
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,
-                        teacher_kind=a.teacher_kind, teacher_horizon=a.teacher_horizon,
+                        teacher_kind=a.teacher_kind, teacher_speed=a.teacher_speed, mu=a.mu,
+                        teacher_horizon=a.teacher_horizon,
                         teacher_cand_iters=a.teacher_cand_iters, teacher_cost=a.teacher_cost,
                         opp_future_model=a.opp_future_model,
                         opp_extra={"opp_token": opp_token_mode(a.opp_token),

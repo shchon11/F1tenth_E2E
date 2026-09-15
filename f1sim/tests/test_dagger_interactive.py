@@ -189,3 +189,57 @@ def test_a_resumed_memory_projection_is_only_fatal_when_something_is_leashed_to_
     ff = ActorCritic(n_stack=2, n_beams=64, proprio_dim=5, priv_dim=9, act_dim=8,
                      scan_stem="plain").actor
     assert kl_reference_is_baseline(ff, False, 0.3) is True
+
+
+def test_the_symmetric_speed_loss_is_the_loss_it_always_was():
+    """`--speed-loss symmetric` has to be byte-identical to the single Huber every DAgger run used
+    before the flag existed, or every earlier number becomes incomparable."""
+    import torch.nn.functional as F
+    from f1sim.learn.dagger import plan_loss
+    g = torch.Generator().manual_seed(4)
+    mu = torch.rand(64, 8, generator=g) * 2 - 1
+    lab = torch.rand(64, 8, generator=g) * 2 - 1
+    assert torch.equal(plan_loss(mu, lab, "symmetric", 10.0), F.smooth_l1_loss(mu, lab, beta=0.1))
+
+
+def test_the_asymmetric_speed_loss_punishes_over_speed_far_harder():
+    """Zero at the teacher's speed, steep above it, gentle below -- and the curvature knots
+    untouched, because the asymmetry is a statement about speed and nothing else."""
+    import torch.nn.functional as F
+    from f1sim.learn.dagger import plan_loss, W_OVER, W_UNDER, KNOT_COLS, SPEED_COLS
+    v_max = 10.0
+    lab = torch.zeros(1, 8)
+    same = plan_loss(lab.clone(), lab, "asym", v_max)
+    assert float(same) == 0.0, "a student that matches the teacher exactly must pay nothing"
+
+    def speed_only(delta_norm):
+        mu = lab.clone(); mu[0, SPEED_COLS] = delta_norm
+        return float(plan_loss(mu, lab, "asym", v_max, parts=True)[1]["speed"])
+
+    # +-0.5 m/s, i.e. +-0.1 in normalized units at v_max 10
+    d = 0.5 / (0.5 * v_max)
+    over, under = speed_only(d), speed_only(-d)
+    assert over > under, f"over-speed {over} must cost more than the same under-speed {under}"
+    assert over == pytest.approx(W_OVER * 0.5 ** 2, rel=1e-5)
+    assert under == pytest.approx(W_UNDER * 0.5, rel=1e-5)
+    assert over / under == pytest.approx(8.0, rel=1e-5)          # and 16x in gradient
+
+    # the knot half is the old loss, exactly
+    mu = lab.clone(); mu[0, KNOT_COLS] = 0.3
+    got = plan_loss(mu, lab, "asym", v_max, parts=True)[1]["knot"]
+    assert torch.equal(got, F.smooth_l1_loss(mu[..., KNOT_COLS], lab[..., KNOT_COLS], beta=0.1))
+
+
+def test_over_speed_cost_grows_faster_than_under_speed_cost():
+    """The shape matters as much as the ratio: quadratic above, linear below, so the further a
+    student is over the limit the worse the trade gets."""
+    from f1sim.learn.dagger import plan_loss, SPEED_COLS
+    lab = torch.zeros(1, 8)
+    f = lambda dn: float(plan_loss(_set(lab, dn), lab, "asym", 10.0, parts=True)[1]["speed"])
+
+    def _set(base, dn):
+        m = base.clone(); m[0, SPEED_COLS] = dn; return m
+
+    small, big = 0.25 / 5.0, 1.0 / 5.0                 # 0.25 and 1.0 m/s
+    assert f(big) / f(small) == pytest.approx(16.0, rel=1e-4)      # quadratic
+    assert f(-big) / f(-small) == pytest.approx(4.0, rel=1e-4)     # linear

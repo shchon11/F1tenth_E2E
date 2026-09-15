@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from ..gym_env import EnvConfig, OPP_FUTURE_MODELS, OPP_TOKEN_MODES, opp_token_dim, opp_token_mode
+from ..mpc import ACT_DIM, N_KNOTS
 from ..interactive_teacher import DEFAULT_OFFSETS, DEFAULT_SPEEDS, InteractiveTeacher, TeacherCost
 from ..params import Config
 from . import common
@@ -135,6 +136,57 @@ class StepBuffer:
         return shape(scan), shape(pro), shape(lab), keep
 
 
+#: `--speed-loss asym` constants, declared here and recorded in every checkpoint the run writes.
+#: The loss is in **m/s**, on `e = v_student - v_teacher`, and it is zero at the teacher's speed:
+#:
+#:     e > 0 (too fast)   W_OVER  * e^2
+#:     e < 0 (too slow)   W_UNDER * |e|^UNDER_POW
+#:
+#: Why asymmetric at all. With a mu-dependent label (`--teacher-grip true`) two identical
+#: observations can carry speed labels 2.2x apart, and a symmetric regression can only fit their
+#: conditional MEAN -- which is too fast on the low-grip draws, exactly where being too fast ends
+#: the episode. An asymmetric loss moves the optimum of that same ambiguity to a low quantile
+#: instead: a student that cannot resolve mu from its history backs off to the safe side, and a
+#: student that CAN resolve it still reaches the limit at zero loss. The asymmetry is therefore not
+#: a safety margin bolted on; it is what makes "I do not know the grip" and "the grip is low" have
+#: the same answer, which is the only honest thing a student in that position can do.
+#:
+#: The ratio, not the absolute size, is the design: the gradient at |e| is 2*W_OVER*|e| above and
+#: W_UNDER below, so at the 0.5 m/s error these labels actually carry it is 16x steeper to be fast
+#: than to be slow.
+W_OVER, W_UNDER, UNDER_POW = 4.0, 0.25, 1.0
+
+#: Both halves of the plan action, so the split cannot drift from `mpc.ACT_DIM`.
+SPEED_COLS = slice(N_KNOTS, ACT_DIM)
+KNOT_COLS = slice(0, N_KNOTS)
+
+
+def plan_loss(mu: torch.Tensor, lab: torch.Tensor, speed_loss: str, v_max: float,
+              parts: bool = False):
+    """Huber on the whole plan (`symmetric`), or Huber on the knots plus an asymmetric speed term.
+
+    `symmetric` is `F.smooth_l1_loss(mu, lab, beta=0.1)` and nothing else, so `--speed-loss
+    symmetric` is byte-identical to every DAgger run before this flag existed.
+
+    `asym` keeps the curvature knots on that same loss and replaces only the two speed targets. The
+    two halves are recombined in the proportion the single mean had them -- 6 knots to 2 speeds --
+    so the knot term keeps its old magnitude and only the speed term is a new thing.
+    """
+    if speed_loss == "symmetric":
+        total = F.smooth_l1_loss(mu, lab, beta=0.1)
+        return (total, {"knot": total, "speed": total}) if parts else total
+    knot = F.smooth_l1_loss(mu[..., KNOT_COLS], lab[..., KNOT_COLS], beta=0.1)
+    # normalized plan speed a -> m/s is (a + 1)/2 * v_max, so an error in a is (v_max / 2) times
+    # the error in m/s. The loss is defined in m/s because that is the unit the asymmetry is about.
+    e = (mu[..., SPEED_COLS] - lab[..., SPEED_COLS]) * (0.5 * v_max)
+    over = e.clamp_min(0.0)
+    under = (-e).clamp_min(0.0)
+    speed = (W_OVER * over ** 2 + W_UNDER * under ** UNDER_POW).mean()
+    n_k, n_s = N_KNOTS, ACT_DIM - N_KNOTS
+    total = (n_k * knot + n_s * speed) / ACT_DIM
+    return (total, {"knot": knot, "speed": speed}) if parts else total
+
+
 def actor_sequence(actor, scan, proprio, keep) -> torch.Tensor:
     """(L*n, act_dim) deterministic actions over a chunk, the recurrence walked step by step.
 
@@ -195,12 +247,13 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
 
 
 def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float = 0.0, hard_power: float = 1.0,
-                 log_every: int = 25, chunk: int = 0):
+                 log_every: int = 25, chunk: int = 0, speed_loss: str = "symmetric",
+                 v_max: float = 10.0):
     n_total = sum(len(b) for b in bufs)
     steps = max(1, int(epochs * n_total / batch))
     buffer_weights = torch.tensor([len(b) for b in bufs], dtype=torch.float)
     recurrent = model.actor.has_memory
-    losses = []
+    losses, knots, speeds = [], [], []
     for i in range(steps):
         b = bufs[torch.multinomial(buffer_weights, 1).item()]
         if recurrent:
@@ -211,11 +264,16 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
         else:
             scan, pro, lab = b.sample(batch, device, hard_frac, hard_power)
             mu = model.actor(scan, pro)
-        loss = F.smooth_l1_loss(mu, lab, beta=0.1)
+        loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True)
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 1.0); opt.step()
-        losses.append(loss.item())
+        losses.append(loss.item()); knots.append(part["knot"].item()); speeds.append(part["speed"].item())
         if i % log_every == 0:
-            log({"dagger/loss": float(np.mean(losses[-log_every:])), "dagger/train_step": i, "dagger/lr": opt.param_groups[0]["lr"]})
+            # the two halves separately, because the whole point of `asym` is that they are not the
+            # same quantity and a single number would hide which one moved
+            log({"dagger/loss": float(np.mean(losses[-log_every:])),
+                 "dagger/knot_loss": float(np.mean(knots[-log_every:])),
+                 "dagger/speed_loss": float(np.mean(speeds[-log_every:])),
+                 "dagger/train_step": i, "dagger/lr": opt.param_groups[0]["lr"]})
     return float(np.mean(losses[-500:]))
 
 
@@ -299,6 +357,17 @@ def main():
     ap.add_argument("--scan-channels", default="", metavar="A,B",
                     help=f"extra scan channels ({','.join(SCAN_CHANNELS)}), as in ppo.py")
     ap.add_argument("--scan-memory-tau", type=float, default=2.0, metavar="S")
+    ap.add_argument("--speed-loss", default="symmetric", choices=["symmetric", "asym"],
+                    help="loss on the plan's two SPEED targets (the curvature knots keep the Huber "
+                         "either way). 'symmetric' is the loss every DAgger run before this flag "
+                         "used and is byte-identical to it. 'asym' is quadratic above the teacher's "
+                         "speed and linear below it, in m/s: with a mu-dependent label a symmetric "
+                         "regression fits the conditional MEAN of speed labels that are 2.2x apart, "
+                         "which is too fast on exactly the low-grip draws where too fast ends the "
+                         "episode. The asymmetry moves that optimum to a low quantile, so a student "
+                         "that cannot resolve grip backs off and one that can still reaches the "
+                         f"limit at zero loss. Constants: w_over {W_OVER:g}, w_under {W_UNDER:g}, "
+                         f"under power {UNDER_POW:g}")
     ap.add_argument("--chunk-length", type=int, default=16, metavar="N",
                     help="truncated-BPTT length for a recurrent student. The buffer is (steps, envs), so a chunk "
                          "is a slice of it; a recurrent policy trained one isolated step at a time is not the "
@@ -403,7 +472,8 @@ def main():
                       noise=0.05 if it else 0.0, need_gap=a.hard_frac > 0).finalize()
         bufs.append(buf); bufs = bufs[-a.keep_iters:]; t_col = tm.lap()        # host RAM: keep the last few iterations (14 GB laptop)
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log, a.hard_frac, a.hard_power,
-                            a.log_every, chunk=a.chunk_length); t_tr = tm.lap()
+                            a.log_every, chunk=a.chunk_length, speed_loss=a.speed_loss,
+                            v_max=env.ecfg.v_max_policy); t_tr = tm.lap()
         m = common.rollout_metrics(env, memory_policy_fn(model, env.B, device=device, deterministic=True), a.eval_steps, a.speed_cap,
                                    per_track=True); t_ev = tm.lap()
         if teacher_metrics is None:
@@ -422,7 +492,13 @@ def main():
                 "cap": a.speed_cap,          # the viewer defaults to the cap the policy was trained at
                 "samples": sum(len(b) for b in bufs), "metrics": m, "teacher": teacher_metrics,
                 "action_mode": a.action_mode, "teacher_kind": a.teacher_kind, "teacher_desc": teacher_desc,
-                "opp_token": token, "opp_future_model": a.opp_future_model}
+                "opp_token": token, "opp_future_model": a.opp_future_model,
+                # declared before training and carried by every checkpoint, so an arm's loss is
+                # never something that has to be reconstructed from a shell history
+                "speed_loss": a.speed_loss,
+                "speed_loss_constants": ({"w_over": W_OVER, "w_under": W_UNDER, "under_pow": UNDER_POW}
+                                         if a.speed_loss == "asym" else None),
+                "teacher_grip": a.teacher_grip, "teacher_speed": a.teacher_speed}
         save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, meta)
         save_checkpoint(os.path.join(out, "student_latest.pt"), model, meta)
     run.finish()
