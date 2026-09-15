@@ -112,6 +112,17 @@ def test_a_topic_at_a_third_of_its_rate_is_slow(profile):
     assert c.rate_hz == pytest.approx(12.0, rel=0.05)
 
 
+def test_a_topic_well_above_its_nominal_rate_is_flagged_too(profile):
+    """`/drive` at 55 Hz against a 40 Hz nominal is the controller's watchdog braking between
+    plans. It looks like a healthy command stream, and it is the opposite."""
+    st = _healthy(profile)
+    st["/drive"] = np.arange(0.0, 5.0, 1.0 / 90.0)
+    rep = sc.check_timeline(st, profile, duration_s=5.0)
+    c = by_name(rep)["/drive"]
+    assert c.status == sc.WARN and "fast" in c.note
+    assert not rep.ok, "/drive is required, so an unhealthy /drive is an unhealthy graph"
+
+
 def test_a_latched_topic_is_not_judged_on_its_rate_or_its_age(profile):
     """`/tf_static` and `/f1sim/reset` fire once and then never again. Silence is their normal
     state, and a "rate" over two latched messages a microsecond apart is a number with no meaning."""

@@ -140,6 +140,81 @@ def test_graph_yaml_carries_every_parameter_both_nodes_declare(checkpoint, graph
             rclpy.shutdown()
 
 
+def _declared_types(checkpoint):
+    """`{parameter: python type}` for every parameter the two nodes declare, read off real nodes."""
+    import rclpy
+    from f1sim_ros.controller_node import ControllerNode
+    from f1sim_ros.policy_node import PolicyNode
+    if rclpy.ok():
+        rclpy.shutdown()
+    rclpy.init(args=["--ros-args", "--params-file", GRAPH_YAML,
+                     "-p", f"checkpoint:={checkpoint}", "-p", "device:=cpu"])
+    out = {}
+    try:
+        for cls in (PolicyNode, ControllerNode):
+            node = cls()
+            for name, p in node._parameters.items():
+                out[name] = type(p.value)
+            node.destroy_node()
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+    return out
+
+
+@pytest.mark.parametrize("target", TARGETS + ("graph_eval",))
+def test_every_launch_argument_reaches_its_node_as_the_type_it_declares(target, checkpoint):
+    """A `LaunchConfiguration` is a string, and `launch_ros` guesses a type from it with YAML rules.
+
+    YAML 1.1 reads `off` as the boolean false, so `traction:=off` -- the deployment default, the
+    value that means "install nothing" -- arrived at the controller as `False` against a STRING
+    parameter and killed the node on startup. Every argument that reaches a node is therefore
+    wrapped in a `ParameterValue` with an explicit type, and this evaluates the launch description
+    to check it, rather than trusting that somebody remembered.
+    """
+    from launch import LaunchContext
+    from launch.actions import DeclareLaunchArgument
+    from launch_ros.actions import Node
+    from launch_ros.utilities import evaluate_parameters
+
+    want = _declared_types(checkpoint)
+    ld = load_launch(target)
+    ctx = LaunchContext()
+    for e in ld.entities:
+        if isinstance(e, DeclareLaunchArgument):
+            e.execute(ctx)
+    checked = 0
+    for node in nodes_of(ld):
+        for d in evaluate_parameters(ctx, node._Node__parameters):
+            if not isinstance(d, dict):
+                continue                       # a params FILE; its types are the file's
+            for name, value in d.items():
+                if name not in want:
+                    continue
+                checked += 1
+                assert isinstance(value, want[name]), (
+                    f"{target}: {name} reaches the node as {type(value).__name__} "
+                    f"{value!r}, declared {want[name].__name__}")
+    assert checked, f"{target}: no parameters were checked, so nothing was"
+
+
+def test_the_traction_default_survives_the_launch_files_yaml_guess():
+    """The specific value that broke: `off`. Named, because it is the deployment default and
+    because the failure was a node that would not start rather than one that drove wrong."""
+    from launch import LaunchContext
+    from launch.actions import DeclareLaunchArgument
+    from launch_ros.utilities import evaluate_parameters
+    ld = load_launch("graph_car")
+    ctx = LaunchContext()
+    for e in ld.entities:
+        if isinstance(e, DeclareLaunchArgument):
+            e.execute(ctx)
+    got = [d["traction"] for n in nodes_of(ld)
+           for d in evaluate_parameters(ctx, n._Node__parameters)
+           if isinstance(d, dict) and "traction" in d]
+    assert got == ["off"], got
+
+
 def test_the_system_check_section_is_the_checkers_own_parameters(graph_yaml, checkpoint):
     """And not a second copy of the topic list: `config/record.yaml` owns which topics the graph
     needs, so the checker and the recorder cannot disagree about it."""

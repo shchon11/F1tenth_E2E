@@ -35,6 +35,7 @@ class SystemCheckNode(Node):
         self.declare_parameter("period", 1.0)
         self.declare_parameter("window_s", 5.0)
         self.declare_parameter("rate_tolerance", 0.5)
+        self.declare_parameter("rate_ceiling", 1.5)
         self.declare_parameter("stale_after", 0.5)
         self.declare_parameter("once", False)
         self.declare_parameter("car", False)
@@ -44,6 +45,7 @@ class SystemCheckNode(Node):
             self.profile = self.profile.on_car()
         self.window_s = float(p("window_s"))
         self.rate_tolerance = float(p("rate_tolerance"))
+        self.rate_ceiling = float(p("rate_ceiling"))
         self.stale_after = float(p("stale_after"))
         self.once = bool(p("once"))
         self.stamps = {t.name: [] for t in self.profile.topics}
@@ -99,7 +101,8 @@ class SystemCheckNode(Node):
         window = {k: [t for t in v if t >= lo] for k, v in self.stamps.items()}
         rep = check_timeline(window, self.profile, duration_s=min(self.window_s, now - self.t0),
                              now=now, rate_tolerance=self.rate_tolerance,
-                             stale_after=self.stale_after, versions=self.versions, source="live")
+                             rate_ceiling=self.rate_ceiling, stale_after=self.stale_after,
+                             versions=self.versions, source="live")
         (self.get_logger().info if rep.ok else self.get_logger().warning)("\n" + rep.text())
         arr = DiagnosticArray(); arr.header.stamp = self.get_clock().now().to_msg()
         st = DiagnosticStatus()

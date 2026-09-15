@@ -14,7 +14,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-from f1sim_ros.launch_graph import common_arguments, graph_nodes, share
+from f1sim_ros.launch_graph import arg, common_arguments, graph_nodes, share
 
 
 def generate_launch_description():
@@ -30,13 +30,13 @@ def generate_launch_description():
         DeclareLaunchArgument("rviz", default_value="true"),
     ]
     bridge = Node(package="f1sim_ros", executable="bridge", name="f1sim_bridge", output="screen",
-                  parameters=[{"map_yaml": LaunchConfiguration("map_yaml"),
-                               "random_track_seed": LaunchConfiguration("random_track_seed"),
-                               "config_yaml": LaunchConfiguration("sim_config_yaml"),
-                               "device": LaunchConfiguration("sim_device"),
-                               "record": LaunchConfiguration("record"),
+                  parameters=[{"map_yaml": arg("map_yaml"),
+                               "random_track_seed": arg("random_track_seed", int),
+                               "config_yaml": arg("sim_config_yaml"),
+                               "device": arg("sim_device"),
+                               "record": arg("record"),
                                "record_profile": os.path.join(share(), "config", "record.yaml"),
-                               "randomize": LaunchConfiguration("randomize")}])
+                               "randomize": arg("randomize", bool)}])
     rviz = Node(package="rviz2", executable="rviz2",
                 arguments=["-d", os.path.join(share(), "config", "graph.rviz")],
                 condition=IfCondition(LaunchConfiguration("rviz")))

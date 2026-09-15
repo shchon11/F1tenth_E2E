@@ -11,6 +11,7 @@ itself, which reach it through the middleware like anyone else's. A type that is
 """
 from __future__ import annotations
 
+import atexit
 import os
 import time
 
@@ -60,6 +61,10 @@ class BagRecorder:
                 qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
             self._subs.append(node.create_subscription(
                 cls, t.name, self._writer_for(t.name), qos))
+        # A bag whose `metadata.yaml` was never written cannot be opened by anything -- not
+        # `ros2 bag info`, not `learn/bagdata.py`, not `system_check`. `main()` closes the recorder
+        # on a clean shutdown; this covers the run that was killed, which is most of them.
+        atexit.register(self.close)
         node.get_logger().info(
             f"recording {len(self.counts)} topics of {self.profile.path} to {out_dir}"
             + (f" (skipped: {', '.join(n for n, _ in self.skipped)})" if self.skipped else ""))
@@ -79,7 +84,10 @@ class BagRecorder:
         that was killed without reaching here has recorded nothing usable.
         """
         for s in self._subs:
-            self.node.destroy_subscription(s)
+            try:
+                self.node.destroy_subscription(s)
+            except Exception:            # at exit the context may already be gone
+                pass
         self._subs = []
         if self.writer is not None:
             self.writer.close()

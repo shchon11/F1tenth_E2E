@@ -13,7 +13,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-from f1sim_ros.launch_graph import common_arguments, graph_nodes
+from f1sim_ros.launch_graph import arg, common_arguments, graph_nodes
 
 
 def generate_launch_description():
@@ -34,16 +34,11 @@ def generate_launch_description():
     ]
     ev = Node(package="f1sim_ros", executable="eval", name="f1sim_eval", output="screen",
               parameters=[LaunchConfiguration("config_yaml"),
-                          {"suite": LaunchConfiguration("suite"),
-                           "cell": LaunchConfiguration("cell"),
-                           "out": LaunchConfiguration("out"),
-                           "envs": LaunchConfiguration("envs"),
-                           "sync": LaunchConfiguration("sync"),
-                           "arm": LaunchConfiguration("controller"),
-                           "checkpoint": LaunchConfiguration("checkpoint"),
-                           "device": LaunchConfiguration("device")}])
-    timeouts = {"sensor_timeout": LaunchConfiguration("sensor_timeout"),
-                "plan_timeout": LaunchConfiguration("plan_timeout")}
+                          {"suite": arg("suite"), "cell": arg("cell"), "out": arg("out"),
+                           "envs": arg("envs", int), "sync": arg("sync", bool),
+                           "arm": arg("controller"), "checkpoint": arg("checkpoint"),
+                           "device": arg("device")}])
     return LaunchDescription(args + [ev] + graph_nodes(
-        policy_kw={"sensor_timeout": LaunchConfiguration("sensor_timeout")},
-        controller_kw=timeouts))
+        policy_kw={"sensor_timeout": arg("sensor_timeout", float)},
+        controller_kw={"sensor_timeout": arg("sensor_timeout", float),
+                       "plan_timeout": arg("plan_timeout", float)}))

@@ -80,6 +80,8 @@
     period: 1.0               # s between reports
     window_s: 5.0             # s of arrivals each rate is measured over
     rate_tolerance: 0.5       # fraction of the profile's rate below which a topic is "slow"
+    rate_ceiling: 1.5         # multiple of it above which a topic is "fast" -- /drive above its
+                              # nominal rate is the controller braking between plans
     stale_after: 0.5          # s without a message before a topic is "stale"
     once: false               # true: report once and exit non-zero if anything required is missing
     car: false                # true: drop the simulator-only topics before checking

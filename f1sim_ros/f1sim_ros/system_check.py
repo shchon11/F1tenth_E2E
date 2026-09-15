@@ -79,8 +79,8 @@ class SystemReport:
 
 def check_timeline(stamps: Dict[str, "np.ndarray | list"], profile, *, duration_s: float = 0.0,
                    now: Optional[float] = None, rate_tolerance: float = 0.5,
-                   stale_after: float = 0.5, versions: Optional[dict] = None,
-                   source: str = "") -> SystemReport:
+                   rate_ceiling: float = 1.5, stale_after: float = 0.5,
+                   versions: Optional[dict] = None, source: str = "") -> SystemReport:
     """`{topic: arrival times [s]}` against a `RecordProfile`.
 
     `duration_s` is the window the counts were taken over; the rate is counted over the span the
@@ -123,11 +123,41 @@ def check_timeline(stamps: Dict[str, "np.ndarray | list"], profile, *, duration_
         elif t.size > 1 and c.rate_hz < spec.rate_hz * rate_tolerance:
             c.status = WARN
             c.note = f"slow: {c.rate_hz:.1f} Hz against {spec.rate_hz:.0f} Hz"
+        elif t.size > 1 and c.rate_hz > spec.rate_hz * rate_ceiling:
+            # Too fast is a symptom too, and it was not being reported. `/drive` at 55 Hz against a
+            # 40 Hz nominal is the controller's watchdog braking between plans, which looks like a
+            # healthy command stream until you read the diagnostics.
+            c.status = WARN
+            c.note = f"fast: {c.rate_hz:.1f} Hz against {spec.rate_hz:.0f} Hz"
         elif t.size == 1:
             c.status = WARN
             c.note = "one message only"
         rep.topics.append(c)
     return rep
+
+
+def _check_readable(path: str) -> None:
+    """Say what is wrong with a bag directory before rosbag2's "No storage could be initialized".
+
+    The common case by far is a recording whose process was killed before `metadata.yaml` was
+    written: the `.db3` is full of data and nothing can open it. That is worth naming, because the
+    obvious reading of the rosbag2 message is "this is not a bag".
+    """
+    import os as _os
+    if not _os.path.isdir(path):
+        if _os.path.exists(path):
+            return                       # a single file: let rosbag2 decide
+        raise FileNotFoundError(f"{path} does not exist")
+    files = _os.listdir(path)
+    if any(f == "metadata.yaml" for f in files):
+        return
+    dbs = [f for f in files if f.endswith(".db3")]
+    if dbs:
+        raise RuntimeError(
+            f"{path} has {', '.join(sorted(dbs))} but no metadata.yaml, so rosbag2 cannot open it. "
+            f"The recorder was killed before it finalised the bag -- give it time to shut down, or "
+            f"reconstruct the metadata with `ros2 bag reindex {path}`.")
+    raise FileNotFoundError(f"{path} contains no rosbag2 files ({', '.join(sorted(files)) or 'empty'})")
 
 
 def check_bag(path: str, profile=None, **kw) -> SystemReport:
@@ -137,6 +167,7 @@ def check_bag(path: str, profile=None, **kw) -> SystemReport:
     from f1sim_ros.record_profile import load as load_profile
 
     profile = profile or load_profile()
+    _check_readable(path)
     reader = rosbag2_py.SequentialReader()
     reader.open(rosbag2_py.StorageOptions(uri=path, storage_id="sqlite3"),
                 rosbag2_py.ConverterOptions("", ""))

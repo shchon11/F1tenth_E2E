@@ -17,6 +17,19 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+
+def arg(name, value_type=str):
+    """A launch argument as a parameter of the RIGHT TYPE.
+
+    `LaunchConfiguration` is a string, and `launch_ros` infers a type from it with YAML rules. That
+    is not a cosmetic problem: YAML 1.1 reads `off` as the boolean false, so
+    `traction:=off` -- the deployment default, the value that means "install nothing" -- arrived at
+    the controller as `False` against a STRING parameter and killed the node on startup. Every
+    argument that reaches a node therefore says what it is.
+    """
+    return ParameterValue(LaunchConfiguration(name), value_type=value_type)
 
 
 def share():
@@ -51,9 +64,8 @@ def _overrides():
     observation channel and the tracker reads it as a ceiling, and two different values is a policy
     driving to a cap the car will not honour.
     """
-    return {"checkpoint": LaunchConfiguration("checkpoint"),
-            "device": LaunchConfiguration("device"),
-            "speed_cap": LaunchConfiguration("speed_cap")}
+    return {"checkpoint": arg("checkpoint"), "device": arg("device"),
+            "speed_cap": arg("speed_cap", float)}
 
 
 def policy_node(**kw):
@@ -65,9 +77,8 @@ def policy_node(**kw):
 
 def controller_node(**kw):
     params = dict(_overrides())
-    params.update({"controller": LaunchConfiguration("controller"),
-                   "traction": LaunchConfiguration("traction"),
-                   "viz": LaunchConfiguration("viz")})
+    params.update({"controller": arg("controller"), "traction": arg("traction"),
+                   "viz": arg("viz", bool)})
     params.update(kw)
     return Node(package="f1sim_ros", executable="controller", name="f1sim_controller",
                 output="screen", parameters=[LaunchConfiguration("config_yaml"), params])

@@ -16,6 +16,7 @@ Service     /f1sim/reset      std_srvs/Empty
 """
 import math
 import os
+import signal
 import time
 
 import numpy as np
@@ -233,6 +234,16 @@ class BridgeNode(Node):
 def main():
     rclpy.init()
     node = BridgeNode()
+    # SIGTERM as well as SIGINT. `ros2 launch` sends SIGINT, waits, then escalates; Python's
+    # default SIGTERM action exits without running `atexit`, so a bag being recorded here would be
+    # left with no `metadata.yaml` and would need `ros2 bag reindex` before anything could open it.
+    # Raising KeyboardInterrupt instead takes the same path a Ctrl-C does.
+    def _stop(_sig, _frame):
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _stop)
+    except ValueError:                      # not the main thread; the default handler stands
+        pass
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
