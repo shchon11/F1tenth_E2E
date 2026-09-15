@@ -459,6 +459,37 @@ one device, in these tables, there is no run-to-run noise to appeal to.
 (Only the 64 shared cells can be compared this way; the 80-cell traffic family exists in v2.1 alone.
 The rows above are counted from the two independent cell files on disk, not from a summary.)
 
+## Every causal claim in this note, checked per trial
+
+The two corrections above were found the same way — an aggregate suggested a mechanism and the
+per-trial split disagreed — so rather than wait for a third, every sentence in this note and in
+REPORT.md that asserts a *why* was checked against the per-trial records. Verdicts, with the
+evidence that settles each:
+
+| claim | verdict | what the per-trial data says |
+| --- | --- | --- |
+| TinyLidarNet "is not a cautious driver running out of budget" | **verified** | **0 timeouts in 512 trials.** Every failure is a collision. The −0.5–7.0 mapping times out 84 times in the same cells, so the metric does fire when a system is genuinely too slow |
+| TinyLidarNet "finishes fastest when it finishes" | **REVERSED** | confounded by subset: 37 of its 47 completions are on one 43 m floor. Paired on cells both finished, it is **1.88 s slower** than frozen `@legacy` (14 cells) and **0.83 s slower** than A701 `@fixed_low` (15 cells) |
+| "9 passes with only 4 contacts" shows it passes cleanly | **REWORDED** | its O-suite failures are **19 wall collisions against frozen's 4**. Fewer contacts because it crashes before reaching the car |
+| "covers 218 m a trial on Monza" | **REWORDED** | 218 m is a mean over **3.9–426.9 m**; only 9 of 48 trials lie within 10 % of it. One trial came within 20 m of finishing |
+| 37/48 on a held-out 43 m floor; a third of a lap on the tight floors | **verified** | 37/48 on `real:korea_2025_iccas` (43.4 m); 10.7 m of 33.3 m and 11.3 m of 36.1 m = 32 % and 31 % |
+| End2Race's row is "dominated by a substitution, not the architecture" | **verified, refined** | true of the row, not of the cells: paired, the 0 m fill is better in **18 of 64**, worse in 1, **identical in 45**. `approach_collision` is unchanged (64 both), and the 0 m variant adds **21 timeouts** of its own |
+| "End2Race's three successes are all on Monza" | **REWORDED** | true of the **solo** family only; it has 3 more in **O** on `gen:control:9100`, which the per-map table already showed |
+| "mean progress 5 m on the small maps" | **REWORDED** | 5.1 m on the two tightest floors, **10.3 m pooled** over all non-Monza maps, 18.1 m on `gen:control:9100` |
+| the runtime layer costs 58 solo / 27 avoidance / 8 passes | **verified, refined** | S 217→275, A 30→57, O 17→25. Per cell it is a net not a uniform effect: the clamp **helps 24 solo cells and hurts 14**, helps 8 avoidance and hurts 3 |
+| "every one of the 640 traffic trials met traffic" | **verified** | `contended` = 640/640 |
+| the 144 car contacts are the price of the 165 passes | **REVERSED** (above) | 142 of 144 are in trials with **no pass at all**; passing trials end in car contact **2** times in 144 |
+| the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
+
+Design rationales — why the port is in PyTorch, why the ONNX session is single-threaded, why the
+label is `last_cmd_raw` — are not in this table. They are claims about code and are settled by the
+code and the tests, not by trial records.
+
+One pattern runs through every reversal: a number that was true became an explanation that was not,
+because the aggregate was compared across different subsets, or read as a rate when it was a spread,
+or paired with a second number that had a different denominator. The aggregates in the tables above
+are unchanged and remain correct; what changed is the sentences that claimed to know why.
+
 ## The fair comparison: what is held fixed, and what is deliberately not
 
 The zero-shot rows above measure four differences at once — expert, data, track set, sensor — and
