@@ -839,3 +839,29 @@ def test_an_external_gate_with_nothing_supplied_gates_nothing():
         if mode == "brake":
             # a brake-only arm's BEND field is never gated, whatever is supplied
             assert torch.equal(on2.field()[0], bend_off)
+
+
+def test_frontend_channels_carry_the_floor_block_without_the_floor_channel():
+    """`--scan-channels fe_floor,fe_range` (no `floor`) must build.
+
+    The `floor` block holds the proprio column map and the front-end's checkpoint path, and
+    `obs.ScanAugment` requires it for `fe_*` channels exactly as it does for `floor`
+    (`if "floor" in self.channels or self.fe_channels`). `scan_channel_spec` used to reject that
+    combination -- it killed `fl_a3_frontend_s701` at load, one minute into a GPU slot.
+    """
+    from f1sim.learn.model import scan_channel_spec
+    blk = {"proprio": {"gyro": [0, 1, 2], "accel": [3, 4, 5], "speed": 6, "yaw_rate": 7},
+           "spec": {"mount_x": 0.297, "mount_z": 0.110},
+           "frontend": {"path": "/tmp/frontend.pt"}}
+    got = scan_channel_spec({"channels": ["fe_floor", "fe_range"], "memory_tau_s": 2.0,
+                             "floor": blk})
+    assert got["channels"] == ["fe_floor", "fe_range"]
+    assert got["floor"]["frontend"]["path"] == "/tmp/frontend.pt"
+
+    # the guard still fires when NOTHING reads the block
+    with pytest.raises(ValueError, match="no channel that reads it"):
+        scan_channel_spec({"channels": ["memory"], "memory_tau_s": 2.0, "floor": blk})
+    # and an fe_* channel with no front-end path is refused at build, not at the first batch
+    with pytest.raises(ValueError, match="frontend.path"):
+        scan_channel_spec({"channels": ["fe_floor"], "memory_tau_s": 2.0,
+                           "floor": {k: v for k, v in blk.items() if k != "frontend"}})

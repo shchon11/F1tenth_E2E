@@ -852,24 +852,37 @@ def scan_channel_spec(scan_channels: Optional[dict]) -> dict:
         raise ValueError("scan_channels carries an 'aligned' block but not the 'aligned' channel: "
                          "one of the two is a typo, and guessing which would either build a channel "
                          "nobody asked for or drop a gate somebody measured.")
-    if "floor" in names:
-        # The floor channel's own block: which proprio columns it reads, the geometry and tolerance
-        # band it was built with, and which attitude it uses. Recorded so a checkpoint carries the
-        # channel it was trained with rather than whatever the reader's defaults happen to be.
+    # The `floor` block belongs to the GEOMETRIC floor channel and to the `fe_*` channels alike:
+    # both read the gyro / accelerometer / ego columns out of the proprio vector by index, and the
+    # front-end's own checkpoint path lives in the same block. `obs.ScanAugment` requires it for
+    # either (`if "floor" in self.channels or self.fe_channels`), and this function used to reject
+    # exactly that combination -- `--scan-channels fe_floor,fe_range` with no `floor` raised "a
+    # `floor` block was given but the floor channel is not enabled" and killed the run at load.
+    fe_names = [n for n in names if n.startswith("fe_")]
+    if "floor" in names or fe_names:
+        # Recorded so a checkpoint carries the channel it was trained with rather than whatever the
+        # reader's defaults happen to be: which proprio columns it reads, the geometry and tolerance
+        # band it was built with, and which attitude it uses.
         from .floor import FloorSpec
         blk = dict(scan_channels.get("floor") or {})
         if not blk.get("proprio"):
             raise ValueError(
-                "the floor channel needs its `floor.proprio` block (`obs.att_index_spec`): it "
-                "reads the gyro and accelerometer out of the proprio vector by index, and a "
-                "checkpoint that did not record the layout cannot be rebuilt against it")
+                "the floor and `fe_*` channels need the `floor.proprio` block "
+                "(`obs.att_index_spec`): they read the gyro and accelerometer out of the proprio "
+                "vector by index, and a checkpoint that did not record the layout cannot be "
+                "rebuilt against it")
+        if fe_names and not (blk.get("frontend") or {}).get("path"):
+            raise ValueError(
+                f"channel(s) {fe_names} are a trained front-end's outputs, so the block needs "
+                f"`floor.frontend.path`; there is nothing to output without it")
         blk["spec"] = FloorSpec(**(blk.get("spec") or {})).validate().to_meta()
         blk.setdefault("att_source", "tracker")
         blk.setdefault("fov", 1.5 * math.pi)
         blk.setdefault("range_eps", 0.02)
         out["floor"] = blk
     elif scan_channels.get("floor"):
-        raise ValueError("a `floor` block was given but the floor channel is not enabled")
+        raise ValueError("a `floor` block was given but no channel that reads it is enabled: "
+                         "enable `floor`, or an `fe_*` channel, or drop the block")
     return out
 
 
