@@ -288,6 +288,14 @@ occupancy grid the same way a beam with no return is. Three things to know befor
 
 `controller/clearance_floor_gated_frac` in the metrics says what share of returns it removed.
 
+**If the checkpoint carries a front-end channel, the gate reads the front-end instead of the
+geometry, automatically.** That is the configuration worth running: measured against the
+simulator's own labels, at 3–5° of tilt the network reads precision 0.79 / recall 0.97 where the
+geometry reads 0.15 / 0.01, and on the real recordings its floor claims are 3.9× enriched in
+beams that end short of the map against the geometry's 1.9×. It needs no attitude to do it, which
+is the whole reason the geometric path is stuck. The front-end runs once per scan for the policy's
+own channels, so the gate costs nothing extra.
+
 ### `attitude_source` — the quaternion is not the only option any more
 
 The policy reads two observation columns of body roll and pitch, and on this car they come from the

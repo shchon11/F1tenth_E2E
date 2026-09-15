@@ -712,6 +712,15 @@ class PolicyNode(Node):
             a, _, self.policy_state.hidden = self.model.act(
                 self.policy_state.observe(scan, pro), pro, deterministic=True,
                 h=self.policy_state.hidden)
+        if self.clearance is not None and self.clearance.cspec.floor_gate:
+            # The gate reads the front-end's floor class when the checkpoint carries one, and the
+            # geometry otherwise. This sits between the actor and the tracker on purpose: the
+            # front-end ran inside `policy_state.observe` just above, and the plan hook that reads
+            # this runs inside `self.tracker` just below, so the gate uses THIS scan's answer.
+            fe = getattr(getattr(self.policy_state, "scan", None), "fe", None)
+            if fe is not None and fe.last_probs is not None:
+                from f1sim.learn.frontend import FLOOR
+                self.clearance.set_floor(fe.last_probs[:, FLOOR])
         self.obs.push_action(a[0])
         msg = AckermannDriveStamped(); msg.header.stamp = m.header.stamp
         if self.tracker is not None:                                 # local plan -> tracker -> command
