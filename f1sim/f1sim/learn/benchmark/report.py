@@ -475,19 +475,32 @@ def validate_results(rows: list[dict], *, suite_freeze: str, expected_systems: s
         by_id = {}
         for r in rows:
             by_id.setdefault(str(r.get("cell_id")), []).append(r)
-        paired = {}
+        paired, layouts, sys_layout = {}, {}, {}
         for cid, group in sorted(by_id.items()):
             try:
-                # Refuses a mixed layout by name rather than pooling it. Two systems can agree on
-                # every observation tensor and still expect different stacking, which is a real way
-                # to be unpaired while looking paired.
-                _fp.assert_single_obs_spec(group, cell_id=cid)
-            except ValueError as exc:
-                raise ReportError(str(exc)) from exc
-            if len(group) < 2:
-                continue                      # one system on a cell: nothing to pair against
-            try:
-                paired[cid] = _fp.assert_paired(group, cell_id=cid)
+                # The world first, across EVERY row of the cell: same track, same friction, same
+                # seeded reset, whatever each actor expects to be handed.
+                _fp.assert_physically_paired(group, cell_id=cid)
+                # Then the layout. Systems built on different ObsSpecs are not pooled -- two of them
+                # can agree on every observation tensor and still expect different stacking, which
+                # is a real way to be unpaired while looking paired -- but they are also not a
+                # fault. A published baseline emits (steer, speed), so its `act_dim` is 2 and its
+                # previous-action channel is two wide where a plan policy's is eight; the two can
+                # never hash equal, and refusing the table outright would mean the comparison this
+                # benchmark exists for could not be rendered at all. They are grouped instead, and
+                # every cross-system number is computed WITHIN a group.
+                by_spec = _fp.group_by_obs_spec(group)
+                for spec_key, sids in by_spec.items():
+                    layouts.setdefault(spec_key, set()).update(sids)
+                    for sid in sids:
+                        prev = sys_layout.setdefault(sid, spec_key)
+                        if prev != spec_key:
+                            raise ValueError(
+                                f"{cid}: {sid} recorded observation layout {spec_key[:12]} here and "
+                                f"{prev[:12]} on another cell; one system is one layout")
+                    sub = [r for r in group if r.get("system_id") in set(sids)]
+                    if len(sub) >= 2:
+                        paired[f"{cid}/{spec_key[:12]}"] = _fp.assert_paired(sub, cell_id=cid)
             except ValueError as exc:
                 raise ReportError(str(exc)) from exc
         want = {(sid,) + cell_key(c) for sid in expected_systems for c in expected_cells}
@@ -518,7 +531,10 @@ def validate_results(rows: list[dict], *, suite_freeze: str, expected_systems: s
                 raise ReportError(
                     f"{sid}: suite {suite} has {got.get(suite, 0)} of {want} declared trials; a "
                     f"short denominator is a different measurement, not a lower score")
-    return {"n_rows": len(rows), "n_systems": len(seen), "suite_freeze_sha256": suite_freeze}
+    out = {"n_rows": len(rows), "n_systems": len(seen), "suite_freeze_sha256": suite_freeze}
+    if expected_cells is not None:
+        out["obs_spec_groups"] = {k: sorted(v) for k, v in sorted(layouts.items())}
+    return out
 
 
 #: Labels by value, so a suite declaring any subset of levels still renders correctly. Indexing
@@ -556,6 +572,21 @@ def render_markdown(summary: dict, *, suite, roster_note: str = "") -> str:
            "",
            "**No composite score.** Categories are reported separately with their own units and "
            "directions; rows are not ranked across suites.", ""]
+    groups = summary.get("obs_spec_groups") or {}
+    if len(groups) > 1:
+        out += ["**Two observation layouts in one table.** The systems below do not all read the "
+                "same observation, and that is declared rather than averaged over. A published "
+                "end-to-end baseline emits (steer, speed), so its `act_dim` is 2 and its "
+                "previous-action channel is two wide where a plan policy's is eight; the two "
+                "layouts can never hash equal. Every row of every cell was checked to have started "
+                "in the **same physical world** -- same track, same friction, same seeded reset, "
+                "same car count -- and the stricter start-pairing check (which also covers the "
+                "actor's own input tensors and the command path) was applied *within* each layout. "
+                "Comparisons across the groups are between systems that saw the same world through "
+                "different windows.", ""]
+        for i, (key, sids) in enumerate(sorted(groups.items()), 1):
+            out.append(f"{i}. `{key[:12]}` — " + ", ".join(f"`{s}`" for s in sids))
+        out.append("")
     if roster_note:
         out += [roster_note, ""]
 

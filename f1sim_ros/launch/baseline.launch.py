@@ -29,7 +29,7 @@ def generate_launch_description():
         DeclareLaunchArgument("model", description="tinylidarnet | end2race"),
         DeclareLaunchArgument("weights", description="absolute path to the .onnx / .pth"),
         DeclareLaunchArgument("drive_topic", default_value="drive"),
-        DeclareLaunchArgument("speed_cap", default_value="9.0"),
+        DeclareLaunchArgument("speed_cap", default_value="4.0"),
         DeclareLaunchArgument("steer_max", default_value="0.4189"),
         DeclareLaunchArgument("sensor_timeout", default_value="0.25"),
         DeclareLaunchArgument("enabled", default_value="true"),

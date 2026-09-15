@@ -175,11 +175,18 @@ def drive_external(env, rows, cmd) -> None:
 
 
 def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v_max: float,
-            range_max: float, log=None) -> DemoBuffer:
+            range_max: float, log=None, rng=None) -> DemoBuffer:
     """One DAgger iteration. `beta = 1` drives the teacher; below that the student drives.
 
     `driver` is a `BaselineDriver` already bound to this car's scanner, or None at `beta = 1`.
+
+    `rng` draws the per-row expert/student coin. It is deliberately **not** `env.sim.gen`: that
+    generator also draws spawn poses, friction, sensor noise and the opponents' events, so taking
+    numbers out of it would make the simulator itself roll differently depending on how many cars
+    the student happened to be driving. With a separate stream the physical run is the same one
+    worker 17's collection sees, and only who is steering differs.
     """
+    rng = rng or np.random.default_rng(0)
     rows = torch.nonzero(env.on_policy).flatten()
     r = env.reset()
     obs = r[0] if isinstance(r, tuple) else r
@@ -199,7 +206,7 @@ def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v
             cmd = driver.command(driver.adapt(scan_m), speed if driver.needs_speed else None)
             # Per row, per iteration: which car the student drives is redrawn every step in DAgger's
             # original formulation, and `beta` is the probability the EXPERT drives.
-            use_t = torch.rand(rows.numel(), generator=env.sim.gen, device=env.device) < beta
+            use_t = torch.as_tensor(rng.random(rows.numel()) < beta, device=env.device)
             teacher_rows = use_t
             driven = rows[~use_t]
             if driven.numel():
@@ -210,9 +217,20 @@ def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v
                 env._ext_ids.difference_update(int(i) for i in held.tolist())
         obs, _rew, _term, _trunc, info = env.step(plan)
         # Read AFTER the step and BEFORE anything else: `last_cmd_raw` is what the tracker asked for
-        # from the pre-step state, i.e. the label for the observation captured above. It is the raw
-        # tracker output, not `last_cmd`, which has this particular car's randomised steering and
-        # speed calibration divided out of it -- a property of the vehicle, not of the decision.
+        # from the pre-step state, i.e. the label for the observation captured above.
+        #
+        # `last_cmd_raw` and not `last_cmd`, and the difference is worth being explicit about.
+        # `last_cmd` is `last_cmd_raw` with THIS car's randomised servo offset and speed gain
+        # divided out (`gym_env.py:1063`), so that the plant delivers what the tracker intended. Two
+        # cars looking at the same scan therefore have different `last_cmd` and the same
+        # `last_cmd_raw`; a LiDAR-only network cannot see which car it is in, so a `last_cmd` label
+        # asks it to predict an unobservable per-vehicle constant and it can only fit the mean.
+        # `last_cmd_raw` is also what this project's own direct-mode labels have always been:
+        # `gym_env.teacher_label` at `act_dim == 2` normalises the teacher's own (steer, speed)
+        # with no calibration applied (`:1398-1399`). The consequence is stated rather than hidden:
+        # a direct-output policy commands the intended angle and the actuator delivers it through
+        # its own gain, while a plan policy gets that gain cancelled by the tracker. That is one of
+        # the runtime layers the comparison is about, not an accident of the label.
         label = env.last_cmd_raw[rows].cpu().numpy().astype(np.float32)
         buf.add(scan_m, speed, label, new_ep)
         new_ep = np.zeros(rows.numel(), dtype=bool)
@@ -375,11 +393,16 @@ def train_end2race(model, bufs, *, epochs: float, device, log, driver_beams_idx,
                           for k, t0, j in wins])                         # (B, T, F)
         lab = np.stack([np.asarray(bufs[k].L[t0:t0 + seq_len, j], np.float32) for k, t0, j in wins])
         # the PREVIOUS step's measured speed, and for the first step of a window the step's own --
-        # the same one-step allowance `end2race.End2Race._forward` makes at the start of an episode
-        spd = np.stack([np.asarray(bufs[k].V[max(0, t0 - 1):t0 + seq_len - 1, j], np.float32)
-                        if t0 > 0 else
-                        np.concatenate([bufs[k].V[t0:t0 + 1, j], bufs[k].V[t0:t0 + seq_len - 1, j]])
-                        for k, t0, j in wins]).astype(np.float32)
+        # the same one-step allowance `end2race.End2Race._forward` makes at the start of an episode.
+        # A window that BEGINS at a respawn takes the allowance too: `V[t0 - 1]` there belongs to the
+        # episode that just ended, and a speed from before a teleport is not a previous speed.
+        def _prev(k, t0, j):
+            b = bufs[k]
+            if t0 == 0 or bool(b.N[t0, j]):
+                return np.concatenate([b.V[t0:t0 + 1, j], b.V[t0:t0 + seq_len - 1, j]])
+            return np.asarray(b.V[t0 - 1:t0 + seq_len - 1, j], np.float32)
+
+        spd = np.stack([_prev(k, t0, j) for k, t0, j in wins]).astype(np.float32)
         x = torch.as_tensor(lidar, device=device)
         v = torch.as_tensor(spd, device=device).unsqueeze(-1)
         y = torch.as_tensor(lab, device=device)

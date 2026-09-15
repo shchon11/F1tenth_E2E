@@ -200,3 +200,37 @@ def test_two_cells_of_each_baseline_drive_on_cpu(kind, weights_of, bench):
         assert t["denominator"] == 2
         assert len(res["outcomes"]) == 2
         assert sum(res["distance_m"]) > 0.0, "the car never moved"
+
+
+@pytest.mark.slow
+def test_evaluate_drives_a_published_baseline_through_the_traffic_proxy(bench):
+    """`learn.evaluate --external-kind` is how the fair comparison gets "the same evaluation".
+
+    The traffic proxy (worker 17's D2/D3 protocol) is `evaluate`'s rolling path with a race and the
+    event set; running a baseline through it must reuse that code rather than a second copy, so what
+    is checked here is that the same function accepts the driver, runs in `direct` mode with no arm,
+    and reports the same `TrafficMeter` block every other arm reports.
+    """
+    from f1sim.learn.evaluate import evaluate
+    from f1sim.params import Config
+
+    cfg = Config()
+    cfg.sim.compile = False
+    res = evaluate("", ["gen:control:9100"], envs=6, steps=60, speed_cap=9.0, device="cpu",
+                   seed=4242, cfg=cfg, protocol="rolling", race_size=3, opponent="teacher",
+                   opp_speed_range=(0.6, 1.15),
+                   opp_events=("brake", "stop", "shift", "defend", "yield", "line", "oblivious"),
+                   opp_event_rate=1.0, budget_laps=None,
+                   external={"kind": "tinylidarnet", "weights": need(TLN_ONNX, "the ONNX")})
+    md = res["metadata"]
+    assert md["action_mode"] == "direct"
+    assert md["controller_arm"] == "legacy"           # i.e. nothing installed
+    assert md["external"]["kind"] == "tinylidarnet"
+    assert md["external"]["backend"]["backend"] == "onnxruntime"
+    t = res["traffic"]
+    assert t["learners"] == 2 and t["opponents_per_learner"] == 2
+    assert t["learner_minutes"] > 0 and t["ego_progress_m"] > 0
+    with pytest.raises(ValueError, match="no plan tracker"):
+        evaluate("", ["gen:control:9100"], envs=2, steps=5, speed_cap=9.0, device="cpu", cfg=cfg,
+                 controller="fixed_low",
+                 external={"kind": "tinylidarnet", "weights": TLN_ONNX})

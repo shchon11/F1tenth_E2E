@@ -117,12 +117,23 @@ def cmd_distill(a) -> int:
         log(f"  iter {it}: beta {beta:.3f}, collecting {a.steps} steps")
         buf = distill.collect(env, teacher, driver, a.steps, beta,
                               distill.DemoBuffer(range_max=a.range_max),
-                              v_max=a.v_max, range_max=a.range_max, log=log).finalize()
+                              v_max=a.v_max, range_max=a.range_max, log=log,
+                              rng=np.random.default_rng(a.seed * 1000 + it)).finalize()
         bufs.append(buf); bufs = bufs[-a.keep_iters:]
-        if it == 0:
-            speed_range = buf.speed_range()
+        # `TinyLidarNet/train.py:135` scales the speed label by the DATA's own min and max
+        # (`min_speed` is hard-coded 0 at `:66`). Their dataset is fixed; a DAgger aggregate grows
+        # and old iterations are dropped, so the max is carried as a running maximum rather than
+        # recomputed -- otherwise dropping the iteration that contained the fastest label would
+        # silently rescale every target, and a label above the current max would be asked of a tanh
+        # that cannot reach it. The alternative, pinning the scale to the suite's 9.0 m/s cap, is
+        # not taken: their rule is data-derived and this is their rule.
+        prev_hi = speed_range[1] if it else 0.0
+        hi = max(prev_hi, buf.speed_range()[1])
+        speed_range = (0.0, hi)
+        if hi > prev_hi + 1e-9:
             log(f"    label speed range {speed_range[0]:.2f}..{speed_range[1]:.2f} m/s "
-                f"(TinyLidarNet's min/max scaling, train.py:135)")
+                f"(TinyLidarNet's min/max scaling, train.py:135, running max over the aggregate)")
+        if it == 0:
             if a.dump_iter0:
                 p = os.path.join(a.out, f"{a.name}_iter0.npz")
                 buf.save(p); log(f"    iteration 0 saved to {p} "

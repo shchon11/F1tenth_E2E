@@ -60,20 +60,32 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
+             opp_reactive_probs: dict | None = None,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
-             controller: str = "legacy", estimator: str = "") -> dict:
+             controller: str = "legacy", estimator: str = "", external: dict | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
     opp_events / opp_event_rate: scripted opponent behaviour, as in training. Empty is off, and off
     is the run this function has always done -- nothing is stepped and nothing is drawn from the
     simulator's generator.
+    opp_reactive_probs: the per-race probability of each REACTIVE disposition
+    (`defend`, `yield`, `line`, `oblivious`). These four are not timed events: `opp_event_rate` does
+    nothing for them, and their `EnvConfig.opp_<name>_prob` defaults are 0.0 -- so naming one in
+    `opp_events` without a probability is a run that lists a behaviour and never produces it, which
+    is refused below for exactly the reason a zero rate is.
     contention_range_m / attack_range_m: the two arc windows the traffic metrics measure over. The
     defaults are the env's own `overtake_range` and the benchmark's tight window.
     controller: the arm to install between the policy and the wheels (`grip_runtime.ARMS`).
     `legacy` installs nothing, which is what every caller before 2026-09-13 got. The arm is built
     and installed after `sim.warmup()` for the same reason `ppo.py` builds it after the graph
     runtime: whatever captures `mpc.solve` last owns the solver.
+
+    external: a published baseline (`{"kind", "weights", "options"}`) in place of `ckpt`. It runs in
+    `direct` action mode with **no controller arm** -- it publishes a command, so there is no plan
+    for a tracker to follow -- and it is the same driver object `f1sim_ros.baseline_node` and the
+    benchmark's `external` roster kind use, so "the same evaluation" means the same code and not a
+    second implementation of it. `controller` must be `legacy` (i.e. nothing installed) with it.
     """
     if protocol not in ("rolling", "trials") or steps < 1 or envs < 1 or race_size < 1 or envs % race_size:
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
@@ -83,10 +95,24 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     trs, rls = common.load_tracks(tracks, racelines=teacher or (race_size > 1 and opponent == "teacher"), **rl_kw)
     model = None
     metadata = {}
-    if not teacher:
+    driver = None
+    if external:
+        if teacher or ckpt:
+            raise ValueError("external is exclusive with a checkpoint and with --teacher")
+        if controller != "legacy":
+            raise ValueError(f"a published baseline has no plan tracker, so it cannot wear the "
+                             f"{controller!r} arm; leave the controller at 'legacy' (nothing "
+                             f"installed) and say so in the report")
+        from .benchmark import model_adapter as _ma
+        entry = {"kind": external["kind"], "weights": external["weights"], "arm": "none",
+                 "options": dict(external.get("options") or {})}
+        driver, metadata = _ma.load_external(entry, device)
+    elif not teacher:
         model, metadata = load_checkpoint(ckpt, device)
         model.eval()
-    mode = "plan" if (model is not None and model.meta.get("act_dim", 2) >= 5) or (teacher and action_mode == "plan") else "direct"
+    mode = ("direct" if external else
+            ("plan" if (model is not None and model.meta.get("act_dim", 2) >= 5)
+             or (teacher and action_mode == "plan") else "direct"))
     spec = metadata.get("spec", {})
     events = parse_events(opp_events)
     if events and not (race_size > 1 and opponent in ("teacher", "mixed")):
@@ -94,14 +120,30 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                          f"opponent; got race_size {race_size}, opponent {opponent!r}. Without them "
                          f"there is no car for the events to script and the run is silently the "
                          f"unflagged one.")
-    if events and not opp_event_rate > 0:
-        raise ValueError(f"opponent events {list(events)} at rate {opp_event_rate}: the rate is "
+    from ..opponent_events import REACTIVE_NAMES, split_events
+    timed, reactive = split_events(events)
+    if timed and not opp_event_rate > 0:
+        raise ValueError(f"opponent events {list(timed)} at rate {opp_event_rate}: the rate is "
                          f"events per opponent per 10 s, so at 0 nothing ever fires.")
+    probs = {k: float((opp_reactive_probs or {}).get(k, 0.0)) for k in REACTIVE_NAMES}
+    missing = [k for k in reactive if probs[k] <= 0.0]
+    if missing:
+        raise ValueError(
+            f"reactive opponent behaviour(s) {missing} were named with probability 0. They are not "
+            f"timed events -- opp_event_rate does nothing for them -- so the run would list them "
+            f"and never produce one. Pass opp_reactive_probs.")
+    extra_probs = [k for k, v in probs.items() if v > 0 and k not in reactive]
+    if extra_probs:
+        raise ValueError(f"probabilities given for {extra_probs}, which are not in opp_events; the "
+                         f"run would produce a behaviour the report does not name")
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
                      race_size=race_size, opponent=opponent,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
+                     **{f"opp_{k}_prob": v for k, v in probs.items()},
                      scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
-                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2))
+                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+                     **({"action_history": spec["action_history"], "v_max_policy": spec["v_max"]}
+                        if external else {}))
     if opp_speed_range is not None:
         ecfg.opp_speed_range = tuple(float(x) for x in opp_speed_range)
     step_dt = 1.0 / (cfg or Config()).sim.control_rate
@@ -113,7 +155,11 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     env.sim.warmup()
     ctrl = grip_runtime.ControllerRuntime(env, controller, estimator or None, device=device)
     ctrl.install()
-    if teacher:
+    if external:
+        from .benchmark import model_adapter as _ma
+        from ..params import VehicleParams
+        policy = _ma.external_policy(driver, spec, float(VehicleParams().s_max))
+    elif teacher:
         teacher_policy = common.make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time)
         def policy(obs):
             return env.teacher_label(teacher_policy)
@@ -178,11 +224,13 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'protocol': protocol, 'tracks': list(tracks), 'seed': seed,
         'seeds': {'numpy': seed, 'torch': seed, 'simulator': seed, 'reset': seed if protocol == 'trials' else None},
         'checkpoint': str(ckpt), 'teacher': teacher, 'deterministic_policy': True,
+        'external': (metadata.get("external") if external else None),
         'action_mode': mode, 'device': str(device), 'steps': steps, 'step_dt': env.sim.control_dt,
         'time_budget_s': steps * env.sim.control_dt, 'envs': envs,
         'race_size': race_size, 'opponent': opponent, 'learners': int(env.learner.sum()),
         'opp_speed_range': list(env.ecfg.opp_speed_range),
         'opp_events': list(events), 'opp_event_rate': float(opp_event_rate),
+        'opp_reactive_probs': probs,
         'opp_event_note': describe_events(events, float(opp_event_rate)),
         'traffic_convention': (
             'contention/following/attacking are fractions of measured learner-seconds, not of wall '
@@ -266,11 +314,39 @@ def main() -> None:
                          "backwards on the line is told to carry full racing speed")
     ap.add_argument("--output", type=Path, help="write the complete strict JSON report")
     ap.add_argument("--eager", action="store_true", help="disable simulator compilation (CPU smoke tests)")
+    ap.add_argument("--opp-defend-prob", type=float, default=0.0,
+                    help="P(a teacher opponent defends the inside line when caught). The four "
+                         "reactive behaviours are dispositions, not timed events: --opp-event-rate "
+                         "does nothing for them, so naming one without its probability is refused")
+    ap.add_argument("--opp-yield-prob", type=float, default=0.0)
+    ap.add_argument("--opp-line-prob", type=float, default=0.0)
+    ap.add_argument("--opp-oblivious-prob", type=float, default=0.0)
+    ap.add_argument("--external-kind", default="", choices=["", "tinylidarnet", "end2race"],
+                    help="evaluate a published baseline (f1sim.learn.baselines) instead of a "
+                         "checkpoint: it drives (steer, speed) directly and wears no controller arm")
+    ap.add_argument("--external-weights", default="")
+    ap.add_argument("--external-options", default="",
+                    help="JSON object of driver options, e.g. '{\"scan_fill\": 0.0}'")
     a = ap.parse_args()
     if a.steps < 1 or a.envs < 1 or a.race_size < 1 or a.envs % a.race_size:
         ap.error("steps/envs/race-size must be positive and envs divisible by race-size")
-    if not a.teacher and not a.ckpt:
-        ap.error("provide a checkpoint or --teacher")
+    if a.external_kind and not a.external_weights:
+        ap.error("--external-kind needs --external-weights")
+    if a.external_weights and not a.external_kind:
+        ap.error("--external-weights needs --external-kind")
+    external = None
+    if a.external_kind:
+        if a.teacher or a.ckpt:
+            ap.error("--external-kind is exclusive with a checkpoint and with --teacher")
+        try:
+            opts = json.loads(a.external_options) if a.external_options else {}
+        except ValueError as exc:
+            ap.error(f"--external-options is not JSON: {exc}")
+        if not isinstance(opts, dict):
+            ap.error("--external-options must be a JSON object")
+        external = {"kind": a.external_kind, "weights": a.external_weights, "options": opts}
+    if not a.teacher and not a.ckpt and not external:
+        ap.error("provide a checkpoint, --teacher, or --external-kind")
     # Refused here rather than silently ignored, the same way training refuses it: a run that names
     # events and then runs without them looks like evidence that the events change nothing.
     try:
@@ -282,7 +358,8 @@ def main() -> None:
             ap.error(f"--opp-events {','.join(a.opp_events)} needs --race-size > 1 and --opponent "
                      f"teacher: the events script the teacher-driven cars of a race, and there are "
                      f"none here (--race-size {a.race_size}, --opponent {a.opponent}).")
-        if not a.opp_event_rate > 0:
+        from ..opponent_events import split_events as _split
+        if _split(a.opp_events)[0] and not a.opp_event_rate > 0:
             ap.error(f"--opp-events {','.join(a.opp_events)} with --opp-event-rate "
                      f"{a.opp_event_rate}: the rate is events per opponent per 10 s, so at 0 the "
                      f"named events never fire and the run is silently the unflagged one.")
@@ -302,8 +379,11 @@ def main() -> None:
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,
+                        opp_reactive_probs={"defend": a.opp_defend_prob, "yield": a.opp_yield_prob,
+                                            "line": a.opp_line_prob,
+                                            "oblivious": a.opp_oblivious_prob},
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
-                        controller=a.controller, estimator=a.estimator)
+                        controller=a.controller, estimator=a.estimator, external=external)
 
     nominal = Config()
     if a.eager:

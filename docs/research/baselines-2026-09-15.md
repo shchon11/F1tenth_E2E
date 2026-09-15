@@ -212,3 +212,67 @@ CONTRACT.md asks to be stated plainly, and this is it, measured.
 
 <!-- TABLES: filled when the suite finishes -->
 
+## The fair comparison: what is held fixed, and what is deliberately not
+
+The zero-shot rows above measure four differences at once — expert, data, track set, sensor — and
+none of them is the architecture. End2Race is an imitation framework and so is ours, so the
+comparison the paper needs is the one where everything except the network is the same.
+
+**Held fixed**
+
+| | |
+| --- | --- |
+| the expert | worker 17's `InteractiveTeacher` (or `RacelineTeacher`, declared, until that branch merges) |
+| the demonstrations | one collection loop, in the environment worker 17's D3 collects in: the training track set, race size 3, teacher opponents at 0.6–1.15×, all seven scripted and reactive behaviours at 1.0 per 10 s, procedural obstacles from the track list |
+| the label | the teacher's **tracked command** — its plan through the same iLQR tracker the car runs, read back as `env.last_cmd_raw` |
+| the DAgger schedule | 8 iterations × 250 steps, β₀ 0.6 halving, 3 epochs over the aggregate, last 4 iterations kept, seed 701, cap 9.0 m/s |
+| the sensor | this car's 1081-beam 270° 10 m scan, for every architecture |
+| the evaluation | suite v2, v2.1 family T, and the traffic proxy at two seeds — the same cells, the same seeds |
+
+**Deliberately not held fixed: the loss and the optimiser.** Each architecture trains with its own
+repository's, at its defaults — `Adam(5e-5)` and Keras `huber` at batch 64 for TinyLidarNet
+(`train.py:58-61,187`); `Adam(1e-3)`, MSE weighted `steer + 0.05·speed`, batch 16 sequences,
+`ReduceLROnPlateau(0.5, patience 10)`, gradient clip 1.0, `mask_prob 0.1`, `hidden_scale 4` for
+End2Race (`train.py:28-30,132-135,183-185`). "Their architecture under our recipe" would be a third
+system that is neither theirs nor ours. `distill.HYPERPARAMETERS` records which side every number
+came from and is written into every checkpoint.
+
+**Iteration 0 is literally the same data for every architecture.** The teacher drives at β = 1, so
+at one seed the scans and the labels are bit-identical whichever network is being trained — a test
+asserts it. Later iterations are each student's own on-policy states, which is what DAgger is and
+what ours does too.
+
+### The four declared deviations
+
+1. **End2Race reads 270 beams, not 360.** Root's decision: one per degree over this car's own 270°
+   window, so each learned per-beam `k` still indexes a bearing. It is one line of their `model.py`
+   (`num_features = 360` → `270`), rewritten only after checking that line occurs exactly once, and
+   the diff is recorded on the checkpoint.
+2. **End2Race's speed input is the previous step's *measured* speed.** Their evaluation feeds that
+   (`eval_singleagent.py:126`) and their training feeds the previous step's *commanded* speed
+   instead (`train.py:87`). The two disagree in their own repository; training on the one their
+   driver never sees would fit a network to an input that does not exist at test time.
+3. **TinyLidarNet's speed scaling uses this data's own min and max**, which is their rule
+   (`train.py:135`, `min_speed` hard-coded 0) applied to our labels — not their published constants
+   (1, 8) or (−0.5, 7.0), which are what *their* data's range was replaced by. Carried as a running
+   maximum, because a DAgger aggregate grows and drops old iterations while their dataset is fixed.
+4. **TinyLidarNet trains in PyTorch**, because the DAgger loop has to put the student back in the
+   car after every iteration. It is their architecture layer for layer, and it is checked against
+   the published Keras weights before it is trained on anything: **max |Δ| 3.6e-7** on the 100 real
+   scans.
+
+### The label, and why it is the *raw* tracker output
+
+`last_cmd_raw` and not `last_cmd`. `last_cmd` is the same command with **this** car's randomised
+servo offset and speed gain divided out, so that the plant delivers what the tracker intended
+(`gym_env.py:1063`). Two cars looking at the same scan therefore have different `last_cmd` and the
+same `last_cmd_raw`, and a LiDAR-only network cannot see which car it is in — a `last_cmd` label
+asks it to predict an unobservable per-vehicle constant, and it can only fit the mean. It is also
+what this project's own direct-mode labels have always been (`gym_env.teacher_label` at
+`act_dim == 2` applies no calibration). The consequence is stated rather than hidden: a
+direct-output policy commands the intended angle and the actuator delivers it through its own gain,
+while a plan policy has that gain cancelled by the tracker. That is one of the runtime layers this
+comparison is about, not an accident of the label.
+
+<!-- D3 TABLE: filled when the runs finish -->
+

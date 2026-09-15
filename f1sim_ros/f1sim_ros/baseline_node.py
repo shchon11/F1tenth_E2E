@@ -79,7 +79,11 @@ class BaselineNode(Node):
         # publish the same number: `gym_env.step` clamps the normalised action to [-1, 1], which is
         # exactly `|steer| <= s_max` and `0 <= speed <= speed_cap` (gym_env.py:1052-1055).
         self.declare_parameter("steer_max", 0.4189)
-        self.declare_parameter("speed_cap", 9.0)
+        # 4.0 m/s, the same default `policy_node` uses, and deliberately not the benchmark suite's
+        # 9.0: this node can be pointed at a real car, and a default that is safe there is worth
+        # more than one that happens to match a simulation protocol. The batched adapter takes its
+        # cap from the frozen suite and never reads this.
+        self.declare_parameter("speed_cap", 4.0)
         # TinyLidarNet's two upstream output mappings, `sim` (1..8 m/s) and `car` (-0.5..7.0).
         self.declare_parameter("speed_map", "sim")
         self.declare_parameter("skip_n", 0)                  # 0 = infer from the model's width
@@ -239,7 +243,16 @@ class BaselineNode(Node):
         ones this car cannot see.
         """
         if self._geometry is not None:
-            return self._geometry
+            if len(msg.ranges) == self._geometry["n_beams"]:
+                return self._geometry
+            # A scanner that changes its beam count mid-run is a fault, not a configuration: the
+            # mapping decided from the first message would now place every return at the wrong
+            # bearing. Re-decide and say so, rather than either crashing or carrying on.
+            self.get_logger().error(
+                f"scan beam count changed from {self._geometry['n_beams']} to {len(msg.ranges)}; "
+                f"re-deriving the scan mapping. Everything published before this line was mapped "
+                f"with the old geometry.")
+            self._geometry = None
         sc = self.driver.scan
         fov, from_header = scan_window(msg, sc.fov)
         n = len(msg.ranges)

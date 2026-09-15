@@ -431,7 +431,17 @@ RUNTIME_MODULES = ("sim.py", "gym_env.py", "mpc.py", "params.py", "track.py", "d
                    # is allowed to do; a changed guard changes a measurement as surely as a changed
                    # tyre model. `actuators.py` joins for the same reason -- it is the one line that
                    # decides whether the VESC loop closes on the wheel or on the body.
-                   "learn/traction_arm.py", "actuators.py")
+                   "learn/traction_arm.py", "actuators.py",
+                   # The published baselines' evaluation path. These files decide what an `external`
+                   # roster entry actually does with a scan -- which beams it reads, what fills the
+                   # bearings this car cannot see, how the output becomes a command -- so a change
+                   # to one of them changes a measurement exactly as a changed tyre model does.
+                   # `learn/baselines/distill.py` and `__main__.py` are deliberately NOT here: they
+                   # train a model and never run inside a scored cell, and listing a file whose
+                   # edits cannot move a number would invalidate every existing result for nothing.
+                   "learn/baselines/__init__.py", "learn/baselines/common.py",
+                   "learn/baselines/backends.py", "learn/baselines/tinylidarnet.py",
+                   "learn/baselines/tinylidarnet_torch.py", "learn/baselines/end2race.py")
 
 
 def source_digest() -> dict:
