@@ -493,6 +493,41 @@ python3 -m f1sim.learn.benchmark run --suite suite-v2.1.json --roster roster.jso
 float arithmetic are not bit-identical and a rollout is chaotic enough for that to change an
 outcome.
 
+#### The same kind also pins *our* models, not only published ones
+
+The heading says "the published baselines" because that is what the kind was added for, but nothing
+in it is specific to a released weight file. A model of ours that emits a steering angle and a speed
+directly — a student trained on one of these architectures — is external by the same definition, and
+is pinned the same way. The fair-comparison arm is exactly this:
+
+```json
+{
+  "system_id": "tinylidarnet_raceline_dry_s701@none",
+  "kind": "tinylidarnet",
+  "weights": "/abs/path/d3/tinylidarnet_raceline_dry_s701_it7.pt",
+  "checkpoint_sha256": "…64 hex…",
+  "controller_arm": "none",
+  "options": {},
+  "note": "tinylidarnet architecture retrained on OUR demonstrations; their loss and optimiser at repo defaults"
+}
+```
+
+Three things differ in practice, none of them in the schema:
+
+- **The backend is torch, not ONNX**, chosen from the file, because a DAgger loop has to put the
+  student back in the car after every iteration. That changes the parity guarantee: a
+  single-threaded ONNX session is bit-identical across batch widths, and torch picks different
+  convolution kernels per width — measured at **7.2e-7** between width 1 and width 8. So a retrained
+  system meets the node↔adapter bar at **≤1e-5** rather than "bit-identical". At a *fixed* width it
+  is bit-identical run to run, which is what a cell needs, since a cell is always scored at one
+  width.
+- **Pin the immutable file.** Training writes `…_it7.pt` per iteration and rewrites `…_final.pt`; a
+  roster pinned to the latter changes meaning under a re-run even though the sha check passes at the
+  moment it is written. Pin the numbered file.
+- **`options: {}` is normal here.** The published entries carry a `speed_map` because their two
+  published mappings are both theirs and both had to be scored; a retrained model's mapping is
+  fitted from its own training labels and recorded on the checkpoint, so there is nothing to choose.
+
 ### Cross-runtime entries
 
 A checkpoint records the arm it trained under, and `cross_runtime` covers exactly one case:
