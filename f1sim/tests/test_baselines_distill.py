@@ -185,3 +185,61 @@ def test_the_retrained_end2race_reads_this_cars_window_and_the_published_one_doe
     if os.path.exists(pub):
         q = baselines.load("end2race", pub)
         assert q.scan.n_beams == 1440 and q.n_features == 360
+
+
+# ------------------------------------------------------------------ the second (plan) label
+def _filled(plan=True, steps=3, rows=2, beams=8):
+    b = distill.DemoBuffer(range_max=10.0)
+    rng = np.random.default_rng(0)
+    for _t in range(steps):
+        b.add(rng.random((rows, beams)), rng.random(rows), rng.random((rows, 2)),
+              np.zeros(rows, bool), rng.random((rows, 8)) if plan else None)
+    return b
+
+
+def test_the_buffer_round_trips_the_plan_label(tmp_path):
+    b = _filled().finalize()
+    assert b.P is not None and b.P.shape == (3, 2, 8)
+    p = tmp_path / "b.npz"
+    b.save(p)
+    back = distill.DemoBuffer.load(p)
+    assert np.array_equal(back.P, b.P)
+    assert np.array_equal(back.S, b.S) and np.array_equal(back.L, b.L)
+
+
+def test_a_buffer_written_before_the_plan_label_still_loads(tmp_path):
+    """The iteration-0 dumps already on disk have no `plan` key; they must not become unreadable."""
+    b = _filled(plan=False).finalize()
+    assert b.P is None
+    p = tmp_path / "old.npz"
+    b.save(p)
+    assert "plan" not in np.load(p).files
+    assert distill.DemoBuffer.load(p).P is None
+
+
+def test_a_half_filled_plan_label_is_refused_rather_than_misaligned():
+    """Dropping it on some steps would shift P against S/V/L by however many were missed."""
+    b = _filled(plan=False, steps=2)
+    b.add(np.zeros((2, 8)), np.zeros(2), np.zeros((2, 2)), np.zeros(2, bool), np.zeros((2, 8)))
+    with pytest.raises(ValueError, match="1 of 3"):
+        b.finalize()
+
+
+@pytest.mark.slow
+def test_the_plan_label_is_the_teachers_plan_for_the_same_state():
+    """P[t] must be the action that produced L[t], not the next step's."""
+    env, teacher, _t, _c = build()
+    rows = torch.nonzero(env.on_policy).flatten()
+    seen = []
+    real = teacher.plan_action
+
+    def spy(*a, **k):
+        out = real(*a, **k)
+        seen.append(out[rows].clone().cpu().numpy())
+        return out
+
+    teacher.plan_action = spy
+    buf = distill.collect(env, teacher, None, 6, 1.0, distill.DemoBuffer(range_max=10.0),
+                          v_max=10.0, range_max=10.0).finalize()
+    assert buf.P is not None and buf.P.shape[:2] == buf.L.shape[:2]
+    assert np.allclose(buf.P, np.stack(seen), atol=0, rtol=0), "plan label is off by a step"

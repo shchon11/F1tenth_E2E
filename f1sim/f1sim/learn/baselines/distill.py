@@ -69,26 +69,43 @@ class DemoBuffer:
 
     `new_episode[t, i]` marks a row whose episode began at `t`, so a sequence sampler can refuse to
     run a GRU across a respawn.
+
+    `P` is the SECOND label: the teacher's **plan** action for the same state, beside the tracked
+    command the direct-output architectures train on. Nothing in this file reads it. It is here so
+    that the "ours" row of the fair comparison can be a plan-space student trained on *this* buffer
+    rather than on a re-collection -- without it, "same demonstrations" means the same protocol and
+    the same seed, and with it, it means the same samples. It is 8 more fp32 per sample against
+    1081 fp16, i.e. about 1.5% of the buffer, which is not a reason to make the comparison weaker.
+    Buffers written before it existed load with `P = None`.
     """
     range_max: float
     scan: list = field(default_factory=list)
     speed: list = field(default_factory=list)
     label: list = field(default_factory=list)
     newep: list = field(default_factory=list)
+    plan: list = field(default_factory=list)
 
-    def add(self, scan_m, speed_mps, label, new_episode):
+    def add(self, scan_m, speed_mps, label, new_episode, plan=None):
         self.scan.append(np.asarray(scan_m, dtype=np.float16))
         self.speed.append(np.asarray(speed_mps, dtype=np.float32))
         self.label.append(np.asarray(label, dtype=np.float32))
         self.newep.append(np.asarray(new_episode, dtype=bool))
+        if plan is not None:
+            self.plan.append(np.asarray(plan, dtype=np.float32))
 
     def finalize(self):
         self.S = np.stack(self.scan)                    # (T, B, n_beams) fp16 metres
         self.V = np.stack(self.speed)                   # (T, B)
         self.L = np.stack(self.label)                   # (T, B, 2) steer rad, speed m/s
         self.N = np.stack(self.newep)                   # (T, B)
+        # All-or-nothing: a buffer with the plan label on some steps and not others would silently
+        # misalign against S/V/L, so refuse rather than stack a ragged list.
+        if self.plan and len(self.plan) != len(self.scan):
+            raise ValueError(f"plan label on {len(self.plan)} of {len(self.scan)} steps; "
+                             "pass it on every step or on none")
+        self.P = np.stack(self.plan) if self.plan else None   # (T, B, act_dim) teacher plan
         self.T, self.B = self.S.shape[:2]
-        self.scan = self.speed = self.label = self.newep = []
+        self.scan = self.speed = self.label = self.newep = self.plan = []
         return self
 
     def __len__(self):
@@ -101,14 +118,16 @@ class DemoBuffer:
         return (0.0, float(self.L[:, :, 1].max()))
 
     def save(self, path):
+        extra = {} if self.P is None else {"plan": self.P}
         np.savez_compressed(path, scan=self.S, speed=self.V, label=self.L, newep=self.N,
-                            range_max=np.float32(self.range_max))
+                            range_max=np.float32(self.range_max), **extra)
 
     @classmethod
     def load(cls, path):
         d = np.load(path)
         b = cls(range_max=float(d["range_max"]))
         b.S, b.V, b.L, b.N = d["scan"], d["speed"], d["label"], d["newep"]
+        b.P = d["plan"] if "plan" in d.files else None
         b.T, b.B = b.S.shape[:2]
         return b
 
@@ -232,7 +251,12 @@ def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v
         # its own gain, while a plan policy gets that gain cancelled by the tracker. That is one of
         # the runtime layers the comparison is about, not an accident of the label.
         label = env.last_cmd_raw[rows].cpu().numpy().astype(np.float32)
-        buf.add(scan_m, speed, label, new_ep)
+        # The plan that produced that command, kept beside it -- see `DemoBuffer`. `plan` is the
+        # teacher's action for every car and was computed from the same pre-step state as `scan_m`.
+        plan_label = plan[rows]
+        if hasattr(plan_label, "cpu"):
+            plan_label = plan_label.cpu().numpy()
+        buf.add(scan_m, speed, label, new_ep, np.asarray(plan_label, dtype=np.float32))
         new_ep = np.zeros(rows.numel(), dtype=bool)
         done_rows = None
         if "final" in info:
