@@ -457,39 +457,40 @@ checks across them, and `claim_check.py` now pins it independently.
 |---|---|---|---|---|---|---|---|---|---|---|
 | **TinyLidarNet-L** | 47 | 1 | 9 | **78/640** | 24/160 | 19/160 | 19/160 | 16/160 | **165** | 144 |
 | **End2Race** (rear 30 m) | 3 | 0 | 3 | **0/640** | 0/160 | 0/160 | 0/160 | 0/160 | 40 | 136 |
-| frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | — | — | — | — | 289 | 251 |
+| frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | 22/160 | 27/160 | 30/160 | 16/160 | 289 | 251 |
+| A701 `@fixed_low` (ours, current best) | 275 | 57 | 25 | **233/640** | 71/160 | 52/160 | 59/160 | 51/160 | 319 | 246 |
 
-### Traffic costs our reference policy far more than it costs the baseline
+### How much of a system's solo ability survives traffic — and it is not "ours" that predicts it
 
-`frozen_original@legacy` takes 95 of 640 traffic trials against TinyLidarNet's 78 — a gap of 1.2×,
-where the solo gap is 4.2×. That invites the obvious sentence, so it gets the check the rest of this
-note has had to learn: the T family runs five floors and the solo family eight, so the comparison
-must be restricted to the maps they share.
+On the five maps the T family shares with the solo family (the restriction matters — the solo family
+runs eight):
 
-| on the five T-family maps | frozen `@legacy` | TinyLidarNet-L | ratio |
+| on the five T-family maps | solo | traffic | keeps |
 | --- | ---: | ---: | ---: |
-| solo | 134/240 (55.8 %) | 43/240 (17.9 %) | **3.12×** |
-| traffic | 95/640 (14.8 %) | 78/640 (12.2 %) | **1.22×** |
+| A701 `@fixed_low` (ours, best) | 186/240 (77.5 %) | 233/640 (36.4 %) | **47.0 %** |
+| frozen original `@legacy` (ours, reference) | 134/240 (55.8 %) | 95/640 (14.8 %) | **26.6 %** |
+| TinyLidarNet-L (published) | 43/240 (17.9 %) | 78/640 (12.2 %) | **68.0 %** |
 
-It survives. On identical maps, adding other cars costs our reference policy **73 % of its solo
-success rate** and the published baseline only **32 % of its** — and the gap between the two closes
-from 3.1× to 1.2×.
+**I wrote the reference row up an hour ago as "traffic costs our policy far more than it costs the
+baseline", and the current-best row shows that was too broad.** It is true of
+`frozen_original@legacy` (26.6 %) and false as a statement about ours in general: A701 `@fixed_low`
+keeps 47 %, nearly double the reference. The ordering is not ours-versus-theirs.
 
-**What that does not establish is why**, and there are at least two live readings. One is that
-traffic genuinely punishes a policy that commits to a racing line more than it punishes one already
-failing most of the time. The other is a floor effect: a system succeeding 17.9 % of the time has
-less to lose than one succeeding 55.8 %, and any additional hazard compresses the two toward each
-other. Nothing measured here separates them, and the shapes of their failures differ enough
-(TinyLidarNet's traffic failures are 353 wall collisions in 496 no-pass trials) that I would not
-guess. Distinguishing them wants a traffic family at graded opponent density, which this suite does
-not have.
+The tempting reading now is that the *runtime arm* drives it — `@fixed_low` clamps the plan tracker
+where `@legacy` leaves it alone, and finding 4 already shows that layer is worth more than the whole
+gap between the two published baselines. **But these two rows differ in weights as well as arm**, so
+nothing here separates them, and that is exactly the control lane **L6** is running:
+`cl_origrecipe_legacy_s701@legacy` is A701's weights under the *other* arm. When it lands, arm and
+weights come apart. Until then this is an observation with two candidate causes and no verdict — and
+the floor effect is still live for TinyLidarNet's 68 %, since a system succeeding 17.9 % of the time
+has less to lose than one at 77.5 %.
 
-**The contact structure holds across all three systems, including ours.** Of the reference policy's
-251 car contacts, **239 are in trials where it never completed a pass** — 95 %, against
-TinyLidarNet's 99 % and End2Race's 100 %. A CNN, a GRU and a plan-space PPO policy, three different
-failure profiles, and in every one a contact is what happens *instead* of an overtake rather than
-the price of one. That is the 02:28 correction confirmed on a third system, and on the one that
-actually passes well.
+**The contact structure holds across all four systems.** Contacts occurring in trials with no pass
+at all: A701 `@fixed_low` **229/246 (93 %)**, frozen `@legacy` 239/251 (95 %), TinyLidarNet
+142/144 (99 %), End2Race 136/136 (100 %). A CNN, a GRU and two plan-space PPO policies under two
+different arms — four failure profiles, one structure. A contact is what happens *instead* of an
+overtake, not the price of one. That is the 02:28 correction confirmed on every system in the
+table, including the one that passes best (223 clean pass-trials out of 274).
 
 **End2Race does not complete a single lap in traffic — 0 of 640, every scenario, every floor.** It
 finished 3 solo trials, so this is not merely the solo row repeated. All 640 trials met traffic, so
