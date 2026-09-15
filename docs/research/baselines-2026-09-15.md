@@ -458,5 +458,47 @@ tracked command, so a plan-space student can be trained from the very same buffe
 re-collection. It is eight more floats per sample and it is deliberately not being added while the
 dry runs are in flight.
 
+### The TinyLidarNet arm is trained (2026-09-16 01:37)
+
+`tinylidarnet_raceline_dry_s701` completed all 8 DAgger iterations on CPU at `nice 19`, one thread.
+
+| iter | β | aggregate | loss | elapsed |
+| --- | --- | --- | --- | --- |
+| 0 | 1.000 | 6 000 | 0.00753 | 48.7 min |
+| 1 | 0.600 | 12 000 | 0.00419 | 200.5 min |
+| 2 | 0.300 | 18 000 | 0.00322 | 224.8 min |
+| 3 | 0.150 | 24 000 | 0.00267 | 248.6 min |
+| 4 | 0.075 | 24 000 | 0.00212 | 271.9 min |
+| 5 | 0.037 | 24 000 | 0.00189 | 295.0 min |
+| 6 | 0.019 | 24 000 | 0.00193 | 319.6 min |
+| 7 | 0.009 | 24 000 | **0.00183** | 347.3 min |
+
+Three things in that table are worth reading rather than skipping. The aggregate stops growing at
+24 000 because `keep_iters 4` drops the oldest iteration's 6 000 samples — the sliding window is
+worker 17's setting, not a limit hit by accident. The loss flattens from iteration 5 and ticks *up*
+at 6, which is what DAgger looks like once the student's own states stop being new: the last three
+iterations are fitting essentially one distribution. And **iteration 1 took 152 minutes against
+~24 for every later one** — that iteration spans the 20:41–22:42 full stop, when every job of mine
+was SIGSTOPped by the user's order. It is wall-clock, not compute, and it changes nothing about the
+weights.
+
+The checkpoint carries what the row is allowed to claim: teacher `raceline` with the note *"blind to
+the other cars, so a student distilled from it can at best learn 'pass the car you see'"*, 264
+tracks, 72 cars, 24 learners, race size 3, seed 701, cap 9.0, and `matches:
+work/interactive-teacher/work/d3_dagger.sh`. It is pinned immutably at iteration 7 —
+`tinylidarnet_raceline_dry_s701@none`, sha `35ace2554b6b`, the `_it7.pt` file rather than the
+rewritten `_final.pt`.
+
+It loads through the same `BaselineDriver` the ROS node uses: backend `torch`, 220 686 parameters,
+`speed_map: fitted [0.00, 7.61]` — deviation 3 above, their `train.py:135` rule applied to our
+labels. On the 100 recorded bag scans it asks for −0.253…+0.468 rad and up to 4.40 m/s, i.e. it
+behaves like a driver and not like a saturated network.
+
+**It has not been scored yet, so there is no row here.** Scoring it needs one benchmark lane and all
+three are committed to the v2.1 traffic rows; the End2Race arm has not been started at all. Both
+commands are recorded in `work/baselines/STATUS.md` under "Blocked, needs root". Until those run,
+the honest statement of this section is that the pipeline is demonstrated end to end for one of the
+two architectures and the comparison itself is unmeasured.
+
 <!-- D3 TABLE: filled when the runs finish -->
 
