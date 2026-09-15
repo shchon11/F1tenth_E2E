@@ -174,14 +174,16 @@ def test_reroll_changes_the_map_and_therefore_the_generation(win):
 
 
 def test_a_track_is_only_offered_the_obstacles_its_loader_can_carry(win):
+    """The *families* are the loader's limit. 기본 and 없음 are not families and are on every map:
+    neither adds anything, so neither can be unsupported."""
     win.map_group.setCurrentIndex(win.map_group.findData("검증"))
     assert win.map_list.select("rt/monza")
     offered = [win.combo_obstacle.itemData(i) for i in range(win.combo_obstacle.count())]
-    assert offered == ["", "props"], "racetracks understand +props and nothing else"
+    assert offered == ["", "bare", "props", "hard"], "racetracks take +props / +hard and no other family"
     win.map_group.setCurrentIndex(win.map_group.findData("학습"))
     assert win.map_list.select("real/korea26")
     offered = [win.combo_obstacle.itemData(i) for i in range(win.combo_obstacle.count())]
-    assert offered == ["", "edge", "line", "pinch", "props"]
+    assert offered == ["", "bare", "edge", "line", "pinch", "props", "hard"]
 
 
 def test_the_selection_card_names_the_map_in_korean(win):

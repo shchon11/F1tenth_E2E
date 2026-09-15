@@ -956,8 +956,11 @@ def main():
     wandb_id = (extra.get("wandb_id") if a.init else None) or (a.wandb_id or None)
     if a.wandb_new:
         steps_base, wandb_id = 0, None
-    run = common.wandb_init(a.name, vars(a) | {"phase": "ppo", "tracks": names}, group=a.wandb_group, mode=a.wandb,
-                            resume_id=wandb_id)
+    # The slot table is a tuple of dataclasses after `validate`; W&B's config wants JSON, and the
+    # JSON is also the thing someone reading the run wants to copy back into `--opp-slots`.
+    run = common.wandb_init(a.name, vars(a) | {"phase": "ppo", "tracks": names,
+                                               "opp_slots": opp_cfg.slots_config(a)},
+                            group=a.wandb_group, mode=a.wandb, resume_id=wandb_id)
     wandb_id = getattr(run, "id", None) or wandb_id
     if steps_base:
         print(f"continuing W&B run {wandb_id} from {steps_base/1e6:.1f}M steps", flush=True)

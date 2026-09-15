@@ -352,10 +352,19 @@ class Track:
         open, keep `min_spacing` between props -- but the clearance test uses the prop's own
         circumradius from its declared footprint rather than a drawn box size, and nothing is
         stamped into `occupancy`/`tall`. A prop that will not fit is skipped and counted; it is never
-        placed and silently left without physics."""
+        placed and silently left without physics.
+
+        Props already on the track are **kept**, and the new ones are placed clear of them. An
+        obstacle family adds to what the map has; it does not replace it. This used to replace, and
+        the only tracks that can arrive here carrying props are editor scenes -- so `scene:x+props3`
+        silently threw away the boxes the author had placed, which is the same lie the 없음 label
+        told (`f1sim.tracks`, 2026-09-15). Where there are no existing props -- every other map --
+        the extra test never fires and nothing about the placement changes."""
         from . import props as _props
         if styles is None:
             styles = _props.STYLES
+        existing = tuple(self.props)
+        keep_out = [(p_.x, p_.y, float(p_.build().envelope.radius)) for p_ in existing]
         rng = np.random.default_rng(seed)
         cl = self.centerline if line is None else np.asarray(line, float)
         if cl is None:
@@ -393,6 +402,9 @@ class Track:
             if self.occupancy[rr, cc] or float(self.edt[rr, cc]) < r:
                 skipped += 1
                 continue
+            if any((cx - px) ** 2 + (cy - py) ** 2 < (r + pr + 0.1) ** 2 for px, py, pr in keep_out):
+                skipped += 1                                  # would stand inside a prop already there
+                continue
             yaw = float(math.atan2(tang[i, 1], tang[i, 0]) + rng.uniform(-0.35, 0.35))
             out.append(StaticProp(style, float(cx), float(cy), yaw, seed=sp.seed))
             placed.append(i)
@@ -400,7 +412,7 @@ class Track:
                                  f"{self.name}_props{seed}", duct=self.duct, tall=self.tall,
                                  duct_height=self.duct_height)
         t.edt_duct, t.edt_tall = self.edt_duct, self.edt_tall
-        t.props = tuple(out)
+        t.props = existing + tuple(out)
         if skipped:
             t.props_skipped = skipped
         return t
@@ -582,6 +594,23 @@ class Track:
         h.update(np.packbits(self.duct).tobytes())
         h.update(np.packbits(self.tall).tobytes())
         return (self.occupancy.shape, round(self.resolution, 6), tuple(np.round(self.origin, 4)), float(self.duct_height), h.hexdigest())
+
+    def bare(self) -> "Track":
+        """Copy with the props the map's author placed dropped. The grids are untouched.
+
+        This is the `+bare` suffix (`f1sim.tracks`, obstacle choice 없음). "Untouched" is the whole
+        definition: a painted wall and a painted box are the same cells in the same layer, and
+        guessing which is which is not something a loader may do. What an author *placed* is
+        `props` -- a list of poses -- so that is exactly what this removes.
+
+        Returns `self` when there is nothing to remove, so every map that carries no placements is
+        the object it already was.
+        """
+        if not self.props:
+            return self
+        return Track(self.occupancy, self.resolution, self.origin, self.edt, self.centerline,
+                     self.name + "_bare", duct=self.duct, tall=self.tall, edt_duct=self.edt_duct,
+                     edt_tall=self.edt_tall, duct_height=self.duct_height, props=())
 
     def reversed(self) -> "Track":
         """Same map, lap driven the other way round (centerline reversed). Grids are shared, not

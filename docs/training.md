@@ -583,7 +583,64 @@ traffic are the other situations: side-by-side contacts closing at +1.5 m/s and 
 alongside or just behind the car being passed, with no contact ever following a scripted event
 ([failure attribution §5](research/failure-attribution-2026-09-13.md)).
 
-Three flags widen it, and one tool says whether they worked.
+Three flags widen it, a fourth makes the widening **per car**, and one tool says whether they worked.
+
+#### `--opp-slots` — one configuration per opponent car (2026-09-15)
+
+Every flag in this section says one thing about *every* opponent at once. With two cars that is the
+same as configuring the opponent. With three it stops being: "a slow car ahead and a defending car
+alongside" is not a configuration this vocabulary can express, and it is what a race is. The user
+asked for exactly that — *"각 대상차에서 적용할 속도 프로파일링 및 체크포인트 등의 설정"*.
+
+```bash
+python3 -m f1sim.learn.ppo --race-size 3 --opp-slots '[
+  {"kind": "raceline", "speed_scale": [0.6, 1.15], "label_grip": "nominal",
+   "events": ["brake", "stop"], "event_rate": 1.0,
+   "reactive": {"defend": 0.4, "oblivious": 0.1}, "spawn": "ahead"},
+  {"kind": "policy", "checkpoint": "~/f1sim_runs/cl_origrecipe_legacy_s701/ppo_final.pt",
+   "speed_scale": 0.9, "spawn": "alongside"}
+]'
+# or: --opp-slots @work/slots/mixed_field.json
+```
+
+The table has `race_size - 1` rows, one per grid slot, and **slot i of every race in the batch is
+built from spec i**. What a spec fixes is deterministic per slot; what it leaves as a range is still
+drawn per reset from the simulator's own generator, so a seed still reproduces the race.
+
+| field | values | meaning |
+| --- | --- | --- |
+| `kind` | `raceline`, `interactive`, `policy`, `self` | who drives this car. `raceline` is the privileged teacher; `policy` is a saved checkpoint; `self` is the learner's own current weights (self-play). `interactive` is worker 17's opponent-aware teacher — **listed and refused with a message** until `feat/interactive-teacher` merges, never silently mapped onto `raceline`. The registry entry already names the class to build (`teacher_factory`), and the env asks each non-raceline teacher kind for the rows it owns, so the merge is the whole change |
+| `checkpoint` | path | required by `policy`, refused on every other kind |
+| `controller` | `legacy`, `fixed_low`, … | the plan-controller arm the checkpoint records. Checked against the file, not installed: the env has one plan tracker shared by every car, so what a slot can honestly do is refuse a checkpoint whose plans were fitted to a tracker this run is not using |
+| `speed_scale` | `0.8` or `[0.6, 1.15]` | a multiplier, drawn per reset from the range. On a teacher it scales the **raceline speed profile** (the braking points move with it). On a `policy` / `self` car there is no profile to scale, so it scales that car's **cap** against `selfplay_pace_ref`, exactly as `--opp-speed` did to a pool car |
+| `label_grip` | `true`, `nominal`, `conservative` | which friction this teacher's profile assumes. Teacher kinds only |
+| `speed_cap` | m/s | this car's own cap, replacing the session's. The one handle that means the same thing for every kind |
+| `events` | any of `brake`, `stop`, `shift`, `weave` | the timed events **this car** may be dropped into. Teacher kinds only |
+| `event_rate` | per 10 s | its own rate. Events with rate 0 are refused rather than silently never fired |
+| `reactive` | `{"defend": 0.4, "yield": 0.3, "line": 0.5, "oblivious": 0.1}` | the per-race probability **this car** is given each disposition. Teacher kinds only |
+| `spawn` | `ahead`, `behind`, `alongside`, `random` | where this car starts **relative to the learner** — the mirror of `--spawn-order`, which says where the learner starts relative to everyone. `ahead` is the default and reproduces `--spawn-order behind` (the learner at the back, with a pass to make) |
+| `seed` | int | give this slot its own draw stream, so re-writing slot 2's band leaves slot 1 replaying the numbers it replayed before |
+
+The table replaces the flags that speak for the whole field — `--opponent`, `--opp-speed`,
+`--opp-pool`, `--opp-events`, `--opp-event-rate`, `--opp-*-prob`, `--spawn-order`,
+`--mixed-teacher-frac` — and passing one of them alongside is **refused**, because a run carrying two
+answers to "who is the opponent" would use one of them and report the other. Everything else stays:
+the `--opp-brake-*`, `--opp-shift-*`, `--opp-weave-*`, `--opp-*-offset`, `--opp-react-*`,
+`--opp-corner-*`, `--spawn-gap` and `--spawn-alongside-*` flags are the **shared ranges** an event or
+a grid draws from, and they are shared by construction.
+
+Notes:
+
+* `race_size` must equal `1 + len(slots)`; a mismatch is refused at the flag, at the env and in the
+  console, with the same sentence.
+* Two slots may name the same checkpoint. It is loaded once and drives both cars.
+* Leaving the flag out is the whole feature off, and off is byte-identical to the env before it
+  existed — see [the research note](research/opponent-slots-2026-09-15.md).
+* `python -m f1sim.learn.opponent_census --opp-slots …` reports a row **per slot**: what each car was
+  asked to be, the mean scale it drew, the learner-seconds spent in contention with it, the events it
+  fired, the seconds each of its dispositions acted, and its own wall / contact terminations.
+* The console's 주행 and 학습 pages edit this same table with one shared widget and emit this same
+  JSON, so a session can be pasted into a training command and back.
 
 #### `--opp-pool` — a population instead of an opponent
 
@@ -915,6 +972,11 @@ monitor parses the trainer's own `upd k/N …` lines -- from that log, or from a
 (reward/step, collisions/km, progress, lap time, KL to the original, throughput), lists the run's
 checkpoints, and *주행 화면에서 보기* makes one the driving page's next start. *중지* sends SIGINT
 (the last periodic checkpoint is what remains) and SIGTERM on a second press after 12 s.
+
+From there, *녹화* on the driving page writes an mp4 of that checkpoint driving — the whole path from
+a run in this list to a clip of it is 주행 화면에서 보기 → 시작 → 녹화, with no script and no headless
+render. It is the same encoder `--record` uses; see [viewer design](viewer_design.md) for the form and
+`f1sim/viewer/recorder.py` for the pipe.
 
 PyQt5 is **not** in the `[viewer]` extra (which is `moderngl`, `glfw`, `trimesh`) and nothing here
 installs it; if it is missing the console says so and points at `--legacy-launcher`, the older Tk

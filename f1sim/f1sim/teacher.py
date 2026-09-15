@@ -13,6 +13,11 @@ import numpy as np
 from .raceline import Raceline, curvature
 from .track import resample_closed
 
+#: `label_grip` as an integer, for the per-car form. The order is the one `f1sim.opponent_slots`
+#: lists, and it is frozen: a recorded code keeps its meaning.
+LABEL_GRIP_NAMES = ("true", "nominal", "conservative")
+LABEL_GRIP_CODE = {name: i for i, name in enumerate(LABEL_GRIP_NAMES)}
+
 
 class RacelineTeacher:
     """mode "pp" (default): pure pursuit on the raceline with understeer compensation
@@ -182,6 +187,13 @@ class RacelineTeacher:
 
     label_grip = "true"          # "true": per-env grip (privileged); "nominal"/"conservative": constant
 
+    #: (B,) per-car override of `label_grip`, as `LABEL_GRIP_CODE` values, or None for the scalar
+    #: above. A race whose opponents were configured one by one (`f1sim.opponent_slots`) can put a
+    #: teacher planning on the true friction next to one planning on the nominal profile, which is a
+    #: fast car beside a repeatable one -- so the label the profile is chosen by became a property of
+    #: the *car* rather than of the teacher. None leaves `grip_bin` the function it was.
+    label_grip_codes: Optional[torch.Tensor] = None
+
     def heading_speed_cap(self, yaw: torch.Tensor, tid: torch.Tensor, idx: torch.Tensor) -> Optional[torch.Tensor]:
         """Speed from which the car can still turn back onto the lane within `recover_time`.
 
@@ -204,12 +216,31 @@ class RacelineTeacher:
         the label is a function of the observation alone (the price is a slower target, and a teacher
         that can over-drive a low-grip car, which is why collection uses `speed_scale` < 1).
         """
+        if self.label_grip_codes is not None:
+            return self._grip_bin_per_car(P, B, device)
         if self.label_grip == "nominal" or P is None:
             return torch.full((B,), len(self.grip_levels) - 1, dtype=torch.long, device=device)
         if self.label_grip == "conservative":
             return torch.zeros(B, dtype=torch.long, device=device)
         g = ((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(max=1.0)
         return (g[:, None] - self.grip_levels_t[None]).abs().argmin(1)
+
+    def _grip_bin_per_car(self, P, B: int, device) -> torch.Tensor:
+        """`grip_bin` when each car carries its own label. All three answers, then select.
+
+        Computed rather than branched because the rows are mixed: there is no "the" mode to test.
+        Without `P` the privileged answer does not exist for anybody, which is exactly the case the
+        scalar path already turns into `nominal`, so it does the same here."""
+        top = len(self.grip_levels) - 1
+        codes = self.label_grip_codes
+        nominal = torch.full((B,), top, dtype=torch.long, device=device)
+        if P is None:
+            return nominal
+        g = ((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(max=1.0)
+        true_bin = (g[:, None] - self.grip_levels_t[None]).abs().argmin(1)
+        out = torch.where(codes == LABEL_GRIP_CODE["nominal"], nominal, true_bin)
+        return torch.where(codes == LABEL_GRIP_CODE["conservative"],
+                           torch.zeros_like(out), out)
 
     speed_mode = "grip"          # "grip": per-grip profiles (braking points move too); "sqrt": nominal profile x sqrt(grip)
 
