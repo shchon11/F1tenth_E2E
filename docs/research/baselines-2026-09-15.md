@@ -420,12 +420,32 @@ neither is a fix.
 ## Table 2 — suite v2.1, the traffic family (in progress)
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
-opponents and an `event` scenario where they brake, stop and change line. TinyLidarNet's row is the
-first complete one.
+opponents and an `event` scenario where they brake, stop and change line. **Both published baselines
+are complete**; our two reference rows are still running and are deliberately absent rather than
+shown partial.
 
 | | S/384 | A/96 | O/32 | T/640 | T:slow | T:pace | T:event | T:pair | passes held | car contacts |
 |---|---|---|---|---|---|---|---|---|---|---|
 | **TinyLidarNet-L** | 47 | 1 | 9 | **78/640** | 24/160 | 19/160 | 19/160 | 16/160 | **165** | 144 |
+| **End2Race** (rear 30 m) | 3 | 0 | 3 | **0/640** | 0/160 | 0/160 | 0/160 | 0/160 | 40 | 136 |
+
+**End2Race does not complete a single lap in traffic — 0 of 640, every scenario, every floor.** It
+finished 3 solo trials, so this is not merely the solo row repeated. All 640 trials met traffic, so
+the family measured what it is for.
+
+Its 40 passes divide exactly as TinyLidarNet's did, which is the useful part: **all 40 pass-trials
+end against a wall, and all 136 car contacts are in the 600 trials that never passed.** Two
+independent systems, two very different architectures, and the same structure — a contact is what
+happens instead of an overtake, not what one costs. The corrected reading in Table 2 above is not a
+one-system artefact.
+
+One comparison worth *not* making, since it is the trap this note has already fallen into four
+times: End2Race's mean progress is 8.6 m in traffic against 24.7 m solo, which looks like traffic
+costing it two thirds of its lap. It is not. The T family runs five floors and the solo family eight,
+and the three it does not share include Monza, where End2Race travels furthest by an order of
+magnitude. **Like for like on the five shared maps it is 11.2 m solo against 8.6 m in traffic** — a
+23 % reduction, not a collapse. It was already failing on these floors alone; the other cars are not
+what stops it.
 
 Every one of the **640/640** trials met traffic inside the contention window, so the family measured
 what it is for. **165 held passes from a network that has never seen another car** is the headline.
