@@ -25,7 +25,7 @@ sensor source                     policy                    controller
 | node | in | out |
 | --- | --- | --- |
 | [`policy_node`](../f1sim_ros/f1sim_ros/policy_node.py) | `/scan`, `/odom`, `/sensors/imu`, `/sensors/imu/raw`, `/f1sim/reset` | `/f1sim/plan`, `/f1sim/policy_state` |
-| [`controller_node`](../f1sim_ros/f1sim_ros/controller_node.py) | `/f1sim/plan`, `/scan`, `/odom`, `/sensors/imu/raw`, `/sensors/core`, `/f1sim/reset` | `/drive`, `/f1sim/controller/diag`, `/f1sim/viz/plan`, `/f1sim/viz/clearance` |
+| [`controller_node`](../f1sim_ros/f1sim_ros/controller_node.py) | `/f1sim/plan`, `/scan`, `/odom`, `/sensors/imu/raw`, `/sensors/core`, `/f1sim/reset` | `/drive`, `/f1sim/controller/diag`, `/f1sim/viz/{plan,clearance,diag}` |
 | [`system_check`](../f1sim_ros/f1sim_ros/system_check_node.py) | everything in `config/record.yaml` | `/f1sim/system_check` |
 | [`eval`](../f1sim_ros/f1sim_ros/eval_node.py) | `/drive`, `/f1sim/controller/diag` | the sensor topics, and a benchmark row |
 
@@ -435,8 +435,9 @@ variation of the graph against itself alongside it, so the two can be told apart
 `graph_sim.launch.py viz:=true rviz:=true` opens `config/graph.rviz`: the plan the tracker is
 following (`/f1sim/viz/plan`, in `base_link`, *after* the clearance bend and the grip speed limit —
 the thing the car is actually driving), the clearance grid built from the current scan
-(`/f1sim/viz/clearance`), both odometries, the scan and the map. The markers cost the controller
-one `Marker` and one `CUBE_LIST` per command and are off by default (`viz:=false`).
+(`/f1sim/viz/clearance`), the arm / friction / traction state / command as text beside the car
+(`/f1sim/viz/diag`), both odometries, the scan and the map. The markers cost the controller three
+small messages per command and are off by default (`viz:=false`).
 
 ## Recording, datasets and `system_check`
 

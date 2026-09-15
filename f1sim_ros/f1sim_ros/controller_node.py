@@ -180,6 +180,12 @@ class ControllerNode(Node):
                         if bool(p("viz")) else None)
         self.pub_viz_clear = (self.create_publisher(Marker, "/f1sim/viz/clearance", 1)
                               if bool(p("viz")) and self.clearance is not None else None)
+        #: The diagnostics as something an rviz window can show: which arm, at what friction, with
+        #: the guard in what state, and the command going out. The `DiagnosticArray` has all of it
+        #: and more, but reading it means a second tool -- and the question "what is this car
+        #: running" is the one you ask while watching it drive.
+        self.pub_viz_diag = (self.create_publisher(Marker, "/f1sim/viz/diag", 1)
+                             if bool(p("viz")) else None)
         # The plan callback cannot notice its own absence, and neither can the scan callback.
         self.create_timer(max(0.002, float(p("watchdog_period"))), self.on_watchdog)
 
@@ -575,6 +581,28 @@ class ControllerNode(Node):
         self.pub_viz.publish(mk)
         if self.pub_viz_clear is not None:
             self._publish_clearance_viz(snap)
+        if self.pub_viz_diag is not None:
+            self._publish_diag_viz(snap)
+
+    def _publish_diag_viz(self, snap: ScanSnapshot):
+        """`/f1sim/viz/diag`: the arm, the friction, the guard and the command, as text."""
+        mk = Marker()
+        mk.header.stamp = snap.stamp; mk.header.frame_id = "base_link"
+        mk.ns = "f1sim_diag"; mk.id = 0
+        mk.type = Marker.TEXT_VIEW_FACING; mk.action = Marker.ADD
+        mk.scale.z = 0.22
+        mk.color.r = mk.color.g = mk.color.b = 0.95; mk.color.a = 0.95
+        mk.pose.orientation.w = 1.0
+        mk.pose.position.x, mk.pose.position.z = -0.6, 0.5
+        mu = f" mu {float(self.grip.mu[0]):.3f}" if self.grip is not None else ""
+        clear = ("" if self.clearance is None else
+                 f" clearance {self.clearance.cspec.margin:.2f} m")
+        mk.text = (f"{self.controller_arm}{mu}{clear}\n"
+                   f"traction {self.traction_arm}"
+                   + ("" if self.traction is None else f" ({self.traction_state})")
+                   + f"\n{self.last_cmd[0]:+.3f} rad  {self.last_cmd[1]:.2f} m/s"
+                   + f"  cap {self.speed_cap:.1f}\nplan #{self.plan_seq}")
+        self.pub_viz_diag.publish(mk)
 
     def _publish_clearance_viz(self, snap: ScanSnapshot):
         """`/f1sim/viz/clearance`: the cells of this scan's occupancy grid, in `base_link`."""

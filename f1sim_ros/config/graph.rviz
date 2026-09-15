@@ -4,7 +4,8 @@
 # `sim.rviz` plus the three things the split made visible -- the tracker's reference in base_link
 # (AFTER the clearance bend and the grip speed limit, so it is the plan the car is actually
 # driving), the occupancy the clearance arm built from this scan alone, and the controller's
-# diagnostics. Launch with `graph_sim.launch.py viz:=true`.
+# diagnostics as text beside the car: which arm, at what friction, with the guard in what state,
+# and the command going out. Launch with `graph_sim.launch.py viz:=true`.
 Panels:
   - Class: rviz_common/Displays
     Name: Displays
@@ -58,6 +59,11 @@ Visualization Manager:
       Name: Clearance occupancy
       Topic:
         Value: /f1sim/viz/clearance
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Name: Arm, friction, traction, command
+      Topic:
+        Value: /f1sim/viz/diag
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Name: Cars

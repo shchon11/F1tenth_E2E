@@ -231,10 +231,10 @@ def test_the_rviz_layout_shows_what_the_graph_publishes():
         t = d.get("Topic")
         if isinstance(t, dict) and "Value" in t:
             topics.add(t["Value"])
-    assert {"/f1sim/viz/plan", "/f1sim/viz/clearance"} <= topics, sorted(topics)
+    assert {"/f1sim/viz/plan", "/f1sim/viz/clearance", "/f1sim/viz/diag"} <= topics, sorted(topics)
     assert {"/scan", "/odom", "/ego_racecar/odom", "/map"} <= topics, sorted(topics)
     published = open(os.path.join(ROS, "f1sim_ros", "controller_node.py")).read()
-    for t in ("/f1sim/viz/plan", "/f1sim/viz/clearance"):
+    for t in ("/f1sim/viz/plan", "/f1sim/viz/clearance", "/f1sim/viz/diag"):
         assert f'"{t}"' in published, f"{t} is in the rviz layout and nothing publishes it"
 
 
