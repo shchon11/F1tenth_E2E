@@ -238,3 +238,38 @@ def test_evaluate_drives_a_published_baseline_through_the_traffic_proxy(bench):
         evaluate("", ["gen:control:9100"], envs=2, steps=5, speed_cap=9.0, device="cpu", cfg=cfg,
                  controller="fixed_low",
                  external={"kind": "tinylidarnet", "weights": TLN_ONNX})
+
+
+def test_the_torch_backend_is_deterministic_at_a_width_and_within_1e_5_across_widths():
+    """The parity bar a retrained (torch) system is claimed under, pinned.
+
+    The published TinyLidarNet runs through a single-threaded ONNX CPU provider and is bit-identical
+    whatever the batch width. A DAgger student has to go back into the car after every iteration, so
+    it runs through torch -- which picks different convolution kernels per batch width. Both halves
+    of the claim in the research note are asserted here, because only one of them is a caveat:
+
+    * across widths it is <= 1e-5 and NOT bit-identical, so the node/adapter parity claim for a
+      retrained system is the contract's 1e-5 branch and must be written as that;
+    * at a FIXED width it is bit-identical, which is what the suite's exact-reproducibility result
+      actually rests on -- a cell is always scored at one width.
+
+    Random weights on purpose: this is a property of the backend, not of any checkpoint, so the test
+    must not skip itself when a weights file happens to be absent.
+    """
+    import numpy as np
+    import torch as _torch
+    from f1sim.learn.baselines.tinylidarnet_torch import TinyLidarNetTorch, TorchBackendForDriver
+
+    _torch.manual_seed(0)
+    back = TorchBackendForDriver(TinyLidarNetTorch(n_beams=1081))
+    rng = np.random.default_rng(0)
+    x = np.clip(rng.random((8, 1081, 1)) * 10.0, 0.05, 10.0).astype(np.float32)
+
+    a, b = back(x), back(x)
+    assert np.array_equal(a, b), f"same width twice differs by {np.abs(a - b).max():.3e}"
+
+    row = x[3:4]
+    for w in (1, 2, 4, 16):
+        got = back(np.repeat(row, w, axis=0))
+        d = float(np.abs(got[0] - a[3]).max())
+        assert d <= 1e-5, f"width {w} vs width 8 differs by {d:.3e}, over the 1e-5 parity bar"
