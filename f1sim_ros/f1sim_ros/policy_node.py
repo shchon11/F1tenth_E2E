@@ -201,8 +201,10 @@ class PolicyNode(Node):
         if now - self._last_inhibit_log > 1.0:
             self._last_inhibit_log = now
             self.get_logger().warning(
-                f"no plan: {', '.join(stale)} older than {self.timeout:.2f} s. "
-                f"Publishing nothing until the sensors come back; the controller brakes.")
+                f"no actor command: {', '.join(stale)} older than {self.timeout:.2f} s. "
+                + ("Publishing zero speed until the sensors come back."
+                   if self.direct else
+                   "Publishing no plan until the sensors come back; the controller brakes."))
 
     def _clear_memory(self, reason: str):
         """The observation history and the policy's episode memory, cleared and accounted for."""

@@ -1,9 +1,9 @@
-"""The ROS policy node's `clearance` layer: it must bind the same `PlanTracker` the car drives
+"""The controller node's `clearance` layer: it must bind the same `PlanTracker` the car drives
 through, build its grid from `/scan` and nothing else, compose with `fixed_low` in either order, and
 put the tracker back exactly as it was on `release()`.
 
-Sibling of `test_policy_node_grip.py`, and deliberately the same shape: the node is where a wrong
-answer reaches a real car.
+Sibling of `test_controller_arms.py`, and deliberately the same shape: the controller is where a
+wrong answer reaches a real car. The installers live in `f1sim_ros/deploy.py` since the split.
 """
 import math
 
@@ -12,7 +12,7 @@ import pytest
 pytest.importorskip("rclpy")
 torch = pytest.importorskip("torch")
 
-import f1sim_ros.policy_node as pn                       # noqa: E402
+import f1sim_ros.deploy as pn                            # noqa: E402
 from f1sim.learn import clearance as cl                  # noqa: E402
 from f1sim.learn.obs import ObsSpec                      # noqa: E402
 from f1sim.mpc import PlanTracker                        # noqa: E402

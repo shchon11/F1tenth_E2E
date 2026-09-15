@@ -105,62 +105,55 @@ class Logger:
         return self._add(name)
 
 
-def make_node(spec=None, enabled=True, timeout=0.25, traction=None, clearance=None):
+def make_node(spec=None, enabled=True, timeout=0.25):
     """A PolicyNode with every ROS dependency replaced, and its real methods intact.
 
-    `traction` is a `TractionGuard` or None; None is the node's own default (`traction:=off`), which
-    is what every test in this file wants -- the sensor contract is about what reaches the actor and
-    what is published, and the guard must not move either while it is off. The traction guard's own
-    node-level behaviour is `test_policy_node_traction.py`.
+    The spec is a **direct-action** one (`act_dim=2`), which is the checkpoint kind that still
+    publishes `/drive` from this node and bypasses the controller -- so the zero-speed inhibit path
+    below is this node's own, and is checked here. A plan checkpoint's command path is
+    `controller_node`'s, and is `test_controller_node.py` and `test_graph_parity.py`.
 
-    `clearance` is the same story for the plan-geometry layer, and None is likewise off. Its own
-    node-level behaviour is `test_policy_node_clearance.py`. Both are listed explicitly rather than
-    read with `getattr`: this stub builds the node by hand, so a field the real `__init__` sets and
-    this does not is a hole in the stub, and the right place to notice it is here.
+    The traction guard and the clearance layer used to be arguments here; both are the controller's
+    now, and neither exists on this node at all.
     """
+    from f1sim_ros.deploy import SensorIntake
     spec = spec or ObsSpec(n_beams=64, scan_stack=2, scan_stride=1, action_history=2,
                            act_dim=2, hist_len=0, range_max=10.0, v_max=8.0)
     n = pn.PolicyNode.__new__(pn.PolicyNode)
     n.device = torch.device("cpu")
     n.spec = spec
+    n.direct = int(spec.act_dim) == 2
     n.obs = ObsBuilder(spec, "cpu")
     n.model = RecordingModel(spec.act_dim)
     n.policy_state = PolicyRuntime()        # inert: this stub actor has no memory to carry
     n.pub = RecordingPub()
+    n.pub_drive = n.pub                     # what a direct-action checkpoint publishes
+    n.pub_plan = RecordingPub()
+    n.pub_state = RecordingPub()
     n.speed_cap = 4.0
     n.steer_max = 0.4189
-    n.v = 0.0
-    n.imu_buf = []
-    n.imu_stamps = []
-    n.att = (0.0, 0.0)
-    n.yaw_rate = 0.0
-    n.accel_scale = G                      # bags publish g; fix it so the test is about attitude
-    n._unit_warned = False
-    n.tracker = None
-    n.cal = (0.0, 1.0, 1.0)
-    n.traction = traction
-    n.clearance = clearance
-    n._scan_geometry_checked = clearance is None      # nothing to re-declare when nothing is installed
-    n.ax_body = None
-    n.t_ax = None
-    n.motor_current = None
-    n.t_current = None
     n.timeout = timeout
-    n.t_att = n.t_imu = n.t_odom = None
     n._inhibited = False
     n._last_inhibit_log = -1e9
     n.last_t = None
+    n.seq = 0
+    n.checkpoint_id = "test/stub.pt@000000000000"
+    n.memory_clears = 0
+    n.memory_cleared_at = -1.0
+    n.memory_cleared_reason = ""
     n._log = Logger()
     n._enabled = enabled
     n._now = 100.0
-    n.imu_mean = None
-    n.t_imu_mean = None
-    n.t_scan = None
-    n.att_stamp = None
     n.get_logger = lambda: n._log
     n.get_parameter = lambda name: SimpleNamespace(value=n._enabled)
     n.clock = lambda: n._now
     n.stamp_now = lambda: ros_time(n._now)
+    # The sensor intake is a real one, built the way `__init__` builds it. Everything the node
+    # knows about `/odom` and `/sensors/imu` lives in it now, and it is shared with
+    # `controller_node` -- which is what makes "both nodes saw the same number" structural rather
+    # than a coincidence two stubs agree on.
+    n.sensors = SensorIntake(n.clock, n._log, timeout)
+    n.sensors.accel_scale = G               # bags publish g; fix it so the test is about attitude
     return n
 
 
@@ -356,7 +349,7 @@ def test_imu_buffer_is_bounded_and_excludes_stale_samples():
     n.on_odom(odom_msg(1.0))
     for _ in range(pn.IMU_BUF_MAX + 20):
         n.on_imu(imu_msg(gyro=(0.0, 0.0, 1.0)))
-    assert len(n.imu_buf) == pn.IMU_BUF_MAX, "unbounded IMU buffer"
+    assert len(n.sensors.imu_buf) == pn.IMU_BUF_MAX, "unbounded IMU buffer"
 
     n._now += 0.30                                   # those samples are now stale
     n.on_imu(imu_msg(gyro=(0.0, 0.0, 0.5)))          # one fresh sample
@@ -467,12 +460,12 @@ def test_non_finite_inputs_are_refused_and_do_not_count_as_fresh():
     n = make_node(timeout=0.25)
     feed_ready(n)
     n.on_scan(scan_msg())
-    good_v = n.v
+    good_v = n.sensors.v
 
     n.on_odom(odom_msg(float("nan")))
-    assert n.v == good_v, "a NaN speed was accepted"
+    assert n.sensors.v == good_v, "a NaN speed was accepted"
     n.on_imu(imu_msg(gyro=(float("nan"), 0.0, 0.0)))
-    assert all(all(math.isfinite(c) for c in row) for row in n.imu_buf), "a NaN IMU row was buffered"
+    assert all(all(math.isfinite(c) for c in row) for row in n.sensors.imu_buf), "a NaN IMU row was buffered"
 
     n._now += 1.0                                    # only the NaN messages arrived since
     n.on_odom(odom_msg(float("inf")))
@@ -574,13 +567,13 @@ def test_a_nan_first_sample_does_not_poison_the_accel_unit_detection():
     """`_accel_to_si` picks g vs SI from the first magnitude it sees, and `nan < 3.0` is False, so
     a NaN reaching it latches scale = 1.0 and divides every later reading by 9.81 forever."""
     n = make_node()
-    n.accel_scale = None                                  # undetected, as at startup
+    n.sensors.accel_scale = None                                  # undetected, as at startup
     n.on_imu(_real_imu(accel_g=(float("nan"), 0.0, 1.0)))
-    assert n.accel_scale is None, "a NaN sample latched the accelerometer scale"
-    assert n.imu_buf == []
+    assert n.sensors.accel_scale is None, "a NaN sample latched the accelerometer scale"
+    assert n.sensors.imu_buf == []
 
     n.on_imu(_real_imu(accel_g=(0.0, 0.0, 1.0)))          # normal gravity in g
-    assert n.accel_scale == pytest.approx(G), "g was not detected after a NaN sample"
+    assert n.sensors.accel_scale == pytest.approx(G), "g was not detected after a NaN sample"
     n.on_odom(_real_odom(1.0))
     n.on_scan(_real_scan())
     az_idx = 1 + n.spec.act_dim * n.spec.action_history + 1 + 5
