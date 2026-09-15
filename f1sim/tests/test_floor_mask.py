@@ -421,8 +421,12 @@ def test_the_shipped_band_is_the_measured_one_and_it_is_too_wide(device):
     If a future attitude source makes this test fail, that is the good failure: re-measure
     `SIGMA_*`, and this test becomes the one that says the gate is ready.
     """
-    assert (fl.SIGMA_ROLL, fl.SIGMA_PITCH) == (0.027, 0.024), \
+    assert (fl.SIGMA_ROLL, fl.SIGMA_PITCH) == (0.022, 0.022), \
         "the shipped band is a measurement; changing it means re-running work/measure/tune_attitude.py"
+    # And it is at the floor two unobservable terms set: the road-tilt process and the LiDAR's own
+    # mounting offset. If this stops holding, the band was not re-derived from the measurement.
+    floor_rms = math.hypot(fl.ROAD_TILT_RMS, 0.02 / math.sqrt(3.0))
+    assert abs(fl.SIGMA_ROLL - floor_rms) < 0.004, (fl.SIGMA_ROLL, floor_rms)
     sim = make(flat_track(wall_x=2.0, wall_half_y=1.0), device, range_max=10.0)
     roll, pitch = 0.0, math.radians(2.0)
     r_true, typ = scan_at(sim, roll, pitch)

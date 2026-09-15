@@ -124,15 +124,29 @@ import torch.nn.functional as F
 #: "floor" (1), and the gate's threshold is above it, so an unknown attitude gates nothing.
 UNKNOWN = 0.5
 
-#: [rad] 1-sigma error of the scan plane's tilt as `AttitudeTracker` estimates it, per axis.
-#: MEASURED -- `work/measure/out/attitude_tune.json`, `docs/research/floor-mask-2026-09-15.md` --
-#: over three tracks, 600 control steps, 16 cars, with the recalibrated attitude model, the +-4 deg
-#: IMU misalignment and the +-0.02 rad LiDAR mount randomisation on. For scale: assuming the plane
-#: is LEVEL reads 0.024 / 0.023 on the same rows, and the VESC quaternion reads 0.136 / 0.086. What
-#: the geometry needs to localise the floor out to 3 m is ~0.015, and nothing here reaches it; see
-#: the research note, and `learn/frontend.py` for the estimate that can.
-SIGMA_ROLL = 0.027
-SIGMA_PITCH = 0.024
+#: [rad] 1-sigma error of the scan plane's tilt as the car's BEST estimator gets it, per axis --
+#: `EgoStateAttitude`, the default source. MEASURED (`work/measure/out/attitude_tune.json`,
+#: `docs/research/floor-mask-2026-09-15.md`): three tracks, 600 control steps, 16 cars, with the
+#: recalibrated attitude model, the +-4 deg IMU misalignment and the +-0.02 rad LiDAR mount
+#: randomisation on. The whole table, roll / pitch rms:
+#:
+#:     EgoStateAttitude          0.022 / 0.022      <- this
+#:     assume the plane is level 0.024 / 0.023
+#:     AttitudeTracker (gyro)    0.026 / 0.024   at its best time constant
+#:     the VESC quaternion       0.144 / 0.091
+#:
+#: and it is **at its floor**. Two terms are invisible to any estimator built from the ego state or
+#: from the IMU: `vehicle.road_tilt`, an OU process of 0.017 rad rms that is a property of the floor
+#: and not of the car, and `lidar.mount_roll/pitch`, +-0.02 rad uniform = 0.0115 rms, which sits
+#: between the sensor and the body. Their quadrature sum is **0.0205 rad**, and the measurement is
+#: within 10 % of it. Halving the gain uncertainty or removing the suspension's lag moves nothing
+#: (both were swept), which is what being at a floor looks like.
+#:
+#: What the geometry needs to separate a solid return from the floor out to 3 m is ~0.015. So this
+#: is close and not close enough, and the remaining distance cannot be closed from the IMU or the
+#: ego state at all -- only from the scan, which is what `learn/frontend.py` is for.
+SIGMA_ROLL = 0.022
+SIGMA_PITCH = 0.022
 
 #: [m] the range-independent part of the height band (3). It is NOT the LiDAR's range noise: at
 #: 3 m a grazing beam's vertical direction cosine is 0.03, so the calibrated 7.4 mm + 1 mm/m of
