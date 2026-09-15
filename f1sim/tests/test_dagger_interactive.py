@@ -243,3 +243,29 @@ def test_over_speed_cost_grows_faster_than_under_speed_cost():
     small, big = 0.25 / 5.0, 1.0 / 5.0                 # 0.25 and 1.0 m/s
     assert f(big) / f(small) == pytest.approx(16.0, rel=1e-4)      # quadratic
     assert f(-big) / f(-small) == pytest.approx(4.0, rel=1e-4)     # linear
+
+
+def test_the_grip_probe_scores_episodes_not_steps():
+    """Friction is drawn once per episode and held, so a step-level split lets the probe see a
+    target in training and be tested on the same value milliseconds later. The episode figure is
+    the one that means anything, and the two are reported side by side precisely so the gap is
+    visible."""
+    from f1sim.learn.grip_hidden import probe
+    torch.manual_seed(0)
+    T, L, H = 60, 16, 12
+    # a hidden state that carries mu perfectly, plus noise: the episode R2 should be high
+    ep = torch.zeros(T, L, dtype=torch.long)
+    ep[T // 2:] = 1
+    mu = torch.rand(2, L) * 0.5 + 0.5
+    mus = torch.stack([mu[0].expand(T // 2, L), mu[1].expand(T - T // 2, L)]).reshape(T, L) \
+        if False else torch.cat([mu[0].expand(T // 2, L), mu[1].expand(T - T // 2, L)], 0)
+    states = torch.randn(T, L, H) * 0.01
+    states[..., 0] += mus                       # one informative direction
+    res = probe(states, mus, ep, seed=1)
+    assert res["r2_episode"] > 0.8, res
+    assert res["n_episodes_test"] >= 2, res
+
+    # ... and a state that carries nothing about mu scores near zero on episodes
+    blind = torch.randn(T, L, H)
+    res0 = probe(blind, mus, ep, seed=1)
+    assert res0["r2_episode"] < 0.5, res0
