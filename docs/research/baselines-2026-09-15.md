@@ -437,9 +437,11 @@ neither is a fix.
 ## Table 2 — suite v2.1, the traffic family (in progress)
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
-opponents and an `event` scenario where they brake, stop and change line. **Both published baselines
-are complete**; our reference rows are still running and are deliberately absent rather than shown
-partial.
+opponents and an `event` scenario where they brake, stop and change line. **Both published baselines are complete, and so is
+our reference row** (`frozen_original@legacy`). A701 `@fixed_low` and A701 `@legacy` are still
+running and are **left out rather than shown partial** — `note_tables.py` marks a partial row
+`*(partial n/144)*` precisely so a half-finished row cannot be mistaken for a whole one, but a table
+in a research note should not carry them at all.
 
 One property of this table is worth stating before its rows arrive, because it is what lets them sit
 together at all. The published baselines drive in `direct` mode (`act_dim` 2) and ours in `plan`
@@ -455,39 +457,40 @@ checks across them, and `claim_check.py` now pins it independently.
 |---|---|---|---|---|---|---|---|---|---|---|
 | **TinyLidarNet-L** | 47 | 1 | 9 | **78/640** | 24/160 | 19/160 | 19/160 | 16/160 | **165** | 144 |
 | **End2Race** (rear 30 m) | 3 | 0 | 3 | **0/640** | 0/160 | 0/160 | 0/160 | 0/160 | 40 | 136 |
-| frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | — | — | — | — | 289 | 251 |
+| frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | 22/160 | 27/160 | 30/160 | 16/160 | 289 | 251 |
+| A701 `@fixed_low` (ours, current best) | 275 | 57 | 25 | **233/640** | 71/160 | 52/160 | 59/160 | 51/160 | 319 | 246 |
 
-### Traffic costs our reference policy far more than it costs the baseline
+### How much of a system's solo ability survives traffic — and it is not "ours" that predicts it
 
-`frozen_original@legacy` takes 95 of 640 traffic trials against TinyLidarNet's 78 — a gap of 1.2×,
-where the solo gap is 4.2×. That invites the obvious sentence, so it gets the check the rest of this
-note has had to learn: the T family runs five floors and the solo family eight, so the comparison
-must be restricted to the maps they share.
+On the five maps the T family shares with the solo family (the restriction matters — the solo family
+runs eight):
 
-| on the five T-family maps | frozen `@legacy` | TinyLidarNet-L | ratio |
+| on the five T-family maps | solo | traffic | keeps |
 | --- | ---: | ---: | ---: |
-| solo | 134/240 (55.8 %) | 43/240 (17.9 %) | **3.12×** |
-| traffic | 95/640 (14.8 %) | 78/640 (12.2 %) | **1.22×** |
+| A701 `@fixed_low` (ours, best) | 186/240 (77.5 %) | 233/640 (36.4 %) | **47.0 %** |
+| frozen original `@legacy` (ours, reference) | 134/240 (55.8 %) | 95/640 (14.8 %) | **26.6 %** |
+| TinyLidarNet-L (published) | 43/240 (17.9 %) | 78/640 (12.2 %) | **68.0 %** |
 
-It survives. On identical maps, adding other cars costs our reference policy **73 % of its solo
-success rate** and the published baseline only **32 % of its** — and the gap between the two closes
-from 3.1× to 1.2×.
+**I wrote the reference row up an hour ago as "traffic costs our policy far more than it costs the
+baseline", and the current-best row shows that was too broad.** It is true of
+`frozen_original@legacy` (26.6 %) and false as a statement about ours in general: A701 `@fixed_low`
+keeps 47 %, nearly double the reference. The ordering is not ours-versus-theirs.
 
-**What that does not establish is why**, and there are at least two live readings. One is that
-traffic genuinely punishes a policy that commits to a racing line more than it punishes one already
-failing most of the time. The other is a floor effect: a system succeeding 17.9 % of the time has
-less to lose than one succeeding 55.8 %, and any additional hazard compresses the two toward each
-other. Nothing measured here separates them, and the shapes of their failures differ enough
-(TinyLidarNet's traffic failures are 353 wall collisions in 496 no-pass trials) that I would not
-guess. Distinguishing them wants a traffic family at graded opponent density, which this suite does
-not have.
+The tempting reading now is that the *runtime arm* drives it — `@fixed_low` clamps the plan tracker
+where `@legacy` leaves it alone, and finding 4 already shows that layer is worth more than the whole
+gap between the two published baselines. **But these two rows differ in weights as well as arm**, so
+nothing here separates them, and that is exactly the control lane **L6** is running:
+`cl_origrecipe_legacy_s701@legacy` is A701's weights under the *other* arm. When it lands, arm and
+weights come apart. Until then this is an observation with two candidate causes and no verdict — and
+the floor effect is still live for TinyLidarNet's 68 %, since a system succeeding 17.9 % of the time
+has less to lose than one at 77.5 %.
 
-**The contact structure holds across all three systems, including ours.** Of the reference policy's
-251 car contacts, **239 are in trials where it never completed a pass** — 95 %, against
-TinyLidarNet's 99 % and End2Race's 100 %. A CNN, a GRU and a plan-space PPO policy, three different
-failure profiles, and in every one a contact is what happens *instead* of an overtake rather than
-the price of one. That is the 02:28 correction confirmed on a third system, and on the one that
-actually passes well.
+**The contact structure holds across all four systems.** Contacts occurring in trials with no pass
+at all: A701 `@fixed_low` **229/246 (93 %)**, frozen `@legacy` 239/251 (95 %), TinyLidarNet
+142/144 (99 %), End2Race 136/136 (100 %). A CNN, a GRU and two plan-space PPO policies under two
+different arms — four failure profiles, one structure. A contact is what happens *instead* of an
+overtake, not the price of one. That is the 02:28 correction confirmed on every system in the
+table, including the one that passes best (223 clean pass-trials out of 274).
 
 **End2Race does not complete a single lap in traffic — 0 of 640, every scenario, every floor.** It
 finished 3 solo trials, so this is not merely the solo row repeated. All 640 trials met traffic, so
@@ -530,19 +533,28 @@ this suite.
 The 0.02 m median gap during a pass is also not evidence of recklessness, which is the other thing I
 would have read into it. On the traffic cells all four systems have finished, the median gap at the
 moment of a pass is **0.02 m for every one of them, ours included** — it is what the metric means,
-not a property of this driver. The number that does separate them runs the other way: median closest
-gap over *all* trials is **~1.2 m for TinyLidarNet and ~1.6 m for End2Race against ~0.1 m for both
-of ours** — an order of magnitude. The published baselines keep *further* from other cars than our
-policies do. They are not aggressive; they are oblivious, and obliviousness looks like distance
+not a property of this driver. The number that does separate them runs the other way. Over the **complete** traffic family, 80
+cells paired across all four systems:
+
+| median closest gap over all trials | |
+| --- | ---: |
+| End2Race | **1.40 m** |
+| TinyLidarNet-L | **0.86 m** |
+| frozen original `@legacy` | 0.07 m |
+| A701 `@fixed_low` | 0.06 m |
+
+The published baselines keep *further* from other cars than our policies do — by more than an order
+of magnitude. They are not aggressive; they are oblivious, and obliviousness looks like distance
 until the gap closes on its own.
 
-Those decimals are deliberately soft, and why is a small object lesson in the same failure this
-section is about. The figure is paired over the traffic cells all four systems have finished, and
-**that set grows while the v2.1 lanes run**: frozen `@legacy`'s median moved 0.11 → 0.10 in the
-twenty minutes between my writing this paragraph and first running `claim_check.py` over it, and the
-paired set went from 26 cells to 39. The order-of-magnitude separation is stable under the set
-changing; the second decimal is not. So the script pins the separation and a 5× ratio, and refuses
-to pin decimals that are not settled until the rows are complete.
+Getting those four numbers right took a guard rather than care. When I first wrote this paragraph I
+had **~1.2 m and ~1.6 m against ~0.1 m** from a *partial* set, because the figure is paired over the
+cells all four systems have finished and that set grows while the lanes run — 26 cells, then 39,
+then 80. TinyLidarNet's median read 1.19 and settles at **0.86**; frozen `@legacy`'s moved 0.11 →
+0.10 → **0.07**. `claim_check.py` refused to pin the decimals while they were moving, pinned only
+the separation, and then **failed** the moment the last row landed and the value settled outside the
+bound it had been given. That failure is the whole point of it: a number that drifts silently in a
+research note is exactly what this section is about.
 
 The four scenarios separate the way you would expect if the opponent is being treated as scenery —
 best against a `slow` car (24/160), worst when there are two of them (`pair`, 16/160):
@@ -609,7 +621,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **95
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **120
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
