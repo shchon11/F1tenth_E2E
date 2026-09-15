@@ -714,7 +714,44 @@ result: the suite runs a cell at one fixed batch width, and at a fixed width thi
 bit-identical run to run (verified, max \|Δ\| exactly 0.0). Reproducing a row means re-running the
 same cells, not re-running them at a different width.
 
-**It has not been scored yet, so there is no row here.** Scoring it needs one benchmark lane and all
+### Preliminary: the first D3 cells say the limit is the demonstrations, not the architecture
+
+Root started the scoring lane at 03:26. **These are 13 of 64 cells and are not a row** — the numbers
+below will move. They are recorded now because what they point at is checkable *without* the rest of
+the suite, and it has been checked.
+
+On the 13 cells both have scored, paired:
+
+| | clean | mean route fraction | achieved speed |
+| --- | --- | --- | --- |
+| D3 student (TinyLidarNet architecture, **our** demonstrations) | 0/104 | **0.662** | 2.41 m/s |
+| published TinyLidarNet weights | 39/96 | 0.637 | 4.22 m/s |
+
+The student gets **further round the track** than the published weights and scores nothing, because
+**66 of its failures are timeouts** where the published model has not timed out once in 512 trials.
+Those timeout trials reach **78 % of the lap on 100 % of the clock**. It is not crashing; it runs
+out of time.
+
+**Why, and this is the part that does not need the other 51 cells.** On the same 100 recorded bag
+scans, the student commands a median **2.41 m/s** against the published model's **4.23 m/s**. That
+is not the speed-map normalisation: the teacher's own iteration-0 labels have median **2.90 m/s**,
+mean 3.07, with 20 % of samples below 2 m/s and a maximum of 7.61. The student is reproducing the
+speed distribution it was shown. Faithful imitation of a slow expert looks exactly like this.
+
+**A caveat that is mine, not the data's.** The obvious reading is that demonstrations collected in a
+*race* — three cars, reactive opponents, events, procedural obstacles — carry traffic-limited
+speeds, and the solo S family then converts those into timeouts. That is a hypothesis, and this
+buffer cannot settle it: `DemoBuffer` records no contention flag, so the teacher's speed with and
+without a car in range cannot be separated after the fact. The alternative — that this raceline
+teacher is simply conservative everywhere — fits the same numbers. Distinguishing them needs one
+more field recorded at collection time, which is the same lesson as the plan label and is now
+written down as such.
+
+What this does *not* say is anything yet about the architecture, which is what D3 exists to isolate.
+The network is TinyLidarNet's, layer for layer, verified against the published weights to 3.6e-7
+before training. On this evidence the binding constraint is the data.
+
+**The full row, and the End2Race arm, are still to come.** Scoring it needs one benchmark lane and all
 three are committed to the v2.1 traffic rows; the End2Race arm has not been started at all. Both
 commands are recorded in `work/baselines/STATUS.md` under "Blocked, needs root". Until those run,
 the honest statement of this section is that the pipeline is demonstrated end to end for one of the
