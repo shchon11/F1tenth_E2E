@@ -175,6 +175,12 @@ class SlotRow(QtCore.QObject):
         self.hi = _spin(0.05, 3.0, 1.0, 0.05, 2, 58)
         self.lo.setToolTip("속도 배율 하한. 상한과 같으면 고정값입니다.")
         self.hi.setToolTip("속도 배율 상한. 리셋마다 [하한, 상한]에서 하나 뽑습니다.")
+        # An inverted range is not a state the table can be left in: the spec refuses lo > hi, and a
+        # cell that can hold a value `slots()` then raises on would make every reader of this widget
+        # handle an exception for a typing mistake. Raising the upper spin's floor makes it
+        # unreachable instead.
+        self.lo.valueChanged.connect(self.hi.setMinimum)
+        self.hi.setMinimum(self.lo.value())
 
         self.grip = QtWidgets.QComboBox()
         for g in osl.GRIP_LABELS:

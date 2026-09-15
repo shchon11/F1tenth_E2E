@@ -132,6 +132,18 @@ def test_a_policy_row_without_a_checkpoint_is_an_objection_not_a_start(table):
     assert "체크포인트" in table.problem(2)
 
 
+def test_an_inverted_speed_band_cannot_be_typed(table):
+    """`slots()` is called on every keystroke by the page's preview, so a cell must not be able to
+    hold a value the spec refuses -- the upper spin's floor follows the lower one instead."""
+    table.set_count(1)
+    row = table._rows[0]
+    row.lo.setValue(1.2)
+    assert row.hi.value() >= 1.2
+    row.hi.setValue(0.5)
+    assert row.hi.value() >= row.lo.value()
+    assert table.slots()[0].speed_scale[0] <= table.slots()[0].speed_scale[1]
+
+
 def test_a_race_size_the_table_does_not_fit_is_an_objection(table):
     table.set_slots(FULL)
     assert "race_size" in table.problem(2)
