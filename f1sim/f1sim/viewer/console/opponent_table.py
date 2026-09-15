@@ -73,49 +73,66 @@ EVENT_LONG = {"brake": "제동 (brake)", "stop": "정지 (stop)",
               "shift": "차선 변경 (shift)", "weave": "지그재그 (weave)"}
 
 
-def describe_checkpoint(path: str) -> str:
-    """One line about a checkpoint file, or the loader's own reason it cannot drive a car here.
+#: `(path, mtime, size) -> (note, arm)`. The table asks about a checkpoint on every keystroke -- the
+#: page rebuilds its preview from `slots()` -- and reading a 400 MB file's header each time is a GUI
+#: thread doing file I/O while someone types. Keyed on the stat, so a file replaced under the picker
+#: is read again, the same rule `training.checkpoint_sha` follows.
+_CK_CACHE: dict = {}
+
+
+def _checkpoint_facts(path: str):
+    """`(note, arm)` for a checkpoint file. Cached; never instantiates the model.
 
     Read with `weights_only=True` and never instantiated: this runs on the GUI thread while someone
     is still typing, and building an actor to find out its name would freeze the window.
     """
     if not path:
-        return ""
+        return "", "legacy"
+    try:
+        st = os.stat(path)
+    except OSError:
+        return f"파일이 없습니다: {path}", "legacy"
+    key = (path, st.st_mtime, st.st_size)
+    if key not in _CK_CACHE:
+        if len(_CK_CACHE) > 64:
+            _CK_CACHE.clear()
+        _CK_CACHE[key] = _read_checkpoint_facts(path)
+    return _CK_CACHE[key]
+
+
+def describe_checkpoint(path: str) -> str:
+    """One line about a checkpoint file, or the loader's own reason it cannot drive a car here."""
+    return _checkpoint_facts(path)[0]
+
+
+def checkpoint_arm(path: str) -> str:
+    """The controller arm a checkpoint records, `legacy` when it records none or cannot be read."""
+    return _checkpoint_facts(path)[1]
+
+
+def _read_checkpoint_facts(path: str):
     if not os.path.isfile(path):
-        return f"파일이 없습니다: {path}"
+        return f"파일이 없습니다: {path}", "legacy"
     try:
         import torch
 
         from ...learn.model import controller_arm_of
         ck = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
     except Exception as exc:                                  # unreadable, or torch missing
-        return f"읽을 수 없습니다: {exc}"
+        return f"읽을 수 없습니다: {exc}", "legacy"
     meta = dict(ck.get("meta") or {})
+    arm = controller_arm_of(ck)
     if "opp_token" in meta:
         # The oracle-planner arm: its actor takes the simulator's true opponent state as an input,
         # which the console cannot produce. `learn.model.load_checkpoint` says exactly this at start;
         # saying it here means it is said before the session is built rather than after.
         return ("특권 상대차(oracle) 체크포인트입니다 — 시뮬의 참 상대차 상태를 입력으로 받으므로 "
-                "콘솔·내보내기·ROS 노드에서 주행할 수 없습니다. A0 대조군(opp_token 없음)을 쓰세요.")
+                "콘솔·내보내기·ROS 노드에서 주행할 수 없습니다. A0 대조군(opp_token 없음)을 쓰세요.", arm)
     if int(meta.get("cond_dim", 0)):
-        return "조건부(conditional) 체크포인트입니다 — 조건 입력 없이는 주행할 수 없습니다."
-    arm = controller_arm_of(ck)
+        return ("조건부(conditional) 체크포인트입니다 — 조건 입력 없이는 주행할 수 없습니다.", arm)
     mem = "메모리" if meta.get("memory") else (
         "스캔 채널" if (meta.get("scan_channels") or {}).get("channels") else "피드포워드")
-    return f"제어기 {arm} · {mem} · act_dim {int(meta.get('act_dim', 2))}"
-
-
-def checkpoint_arm(path: str) -> str:
-    """The controller arm a checkpoint records, `legacy` when it records none or cannot be read."""
-    if not path or not os.path.isfile(path):
-        return "legacy"
-    try:
-        import torch
-
-        from ...learn.model import controller_arm_of
-        return controller_arm_of(torch.load(path, map_location="cpu", mmap=True, weights_only=True))
-    except Exception:
-        return "legacy"
+    return f"제어기 {arm} · {mem} · act_dim {int(meta.get('act_dim', 2))}", arm
 
 
 def _spin(lo: float, hi: float, value: float, step: float, decimals: int, width: int,
