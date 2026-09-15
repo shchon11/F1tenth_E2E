@@ -244,15 +244,35 @@ this one was run at suite scale too.
 
 **A701 `@legacy` is the "policy only" row CONTRACT.md asks for**, and it is worth reading beside
 A701 `@fixed_low`: the same weights, with the plan tracker untouched instead of clamped, lose
-**58 solo completions, 27 avoidance clears and 8 passes**. That is the size of the runtime layer,
-measured on the same cells as the baselines — and it is larger than the entire gap between the two
-published baselines.
+**58 solo completions, 27 avoidance clears and 8 passes** (S 217→275, A 30→57, O 17→25). That is the
+size of the runtime layer, measured on the same cells as the baselines — and it is larger than the
+entire gap between the two published baselines.
 
-**When TinyLidarNet finishes, it finishes fastest.** Its mean lap time over its own completions is
-**10.79 s** against the frozen original's 16.21 s and A701 `@fixed_low`'s 18.00 s. It is not a slow
-cautious driver that runs out of budget; it is a fast one that crashes. The overtaking block says
-the same thing from the other side: 9 passes held with only **4 contacts**, fewer than the frozen
-original's 11 at the same arm.
+Checked per cell rather than on the totals, because a net figure can hide a trade: the clamp helps
+**24 solo cells and hurts 14** (net +58), helps 8 avoidance cells and hurts 3, helps 3 overtaking
+cells and hurts 1. So it is a real and large net effect, not a uniform one — there are cells the
+unclamped tracker does better on, and the aggregate does not say otherwise.
+
+**TinyLidarNet is not a slow cautious driver that runs out of budget** — it is a driver that
+crashes. That half is as clean as this suite gets: across all **512 trials it times out exactly
+zero times**. Every failure is a collision. (The −0.5–7.0 mapping, which halves its commanded speed,
+times out 84 times in the same 512 — so the metric does fire when a system is actually too slow.)
+
+**It is not, however, "the fastest when it finishes", which is what I wrote first.** Unpaired, its
+mean lap over its own completions is 10.79 s against the frozen original's 16.21 s and A701
+`@fixed_low`'s 18.00 s. That comparison is confounded: **37 of its 47 completions are on one short
+43 m floor**, while the others complete on Monza's 446 m too, which drags their means up. Restricted
+to cells where *both* systems completed a lap, it comes out **slower**:
+
+| paired on cells both finished | cells | TinyLidarNet | the other | |
+| --- | --- | --- | --- | --- |
+| vs frozen original `@legacy` | 14 | 13.73 s | 11.85 s | **1.88 s slower** |
+| vs A701 `@fixed_low` | 15 | 14.42 s | 13.59 s | **0.83 s slower** |
+
+The overtaking block was read the same wrong way. It holds 9 of 32 with only **4** contacts against
+the frozen original's 11, which looks like cleanliness — but its O-suite failures are **19 wall
+collisions against frozen's 4**. It makes fewer contacts because it crashes before reaching the car,
+not because it passes more carefully.
 
 Per map, which is where the two failures stop looking alike:
 
@@ -270,7 +290,10 @@ Per map, which is where the two failures stop looking alike:
 **TinyLidarNet does not fail uniformly — it fails by track.** 37 of 48 on a held-out 43 m floor is
 a real transfer result for a 220 k network trained on real-car bags from one 2023 competition, and
 0/80 on the two *tighter* real floors (33 and 36 m) is a different thing from the 0/48 on the 446 m
-Monza, where it covers 218 m a trial and never finishes. Its **1/96 on avoidance** is the number to
+Monza. On the tight floors it stops at about a third of a lap every time (10.7 m of 33.3 m, 11.3 m
+of 36.1 m). Monza is not a consistent failure and should not be quoted as one: its 218 m mean spans
+**3.9 m to 426.9 m**, median 236.9, with only 9 of 48 trials within 10 % of that mean — it once got
+to within 20 m of finishing. The mean is a summary of a wide spread, not a description of a trial. Its **1/96 on avoidance** is the number to
 sit with: its training set contained no obstacles at all.
 
 **The single biggest effect on End2Race is not its architecture — it is which constant fills the 90
@@ -285,11 +308,25 @@ difference between finishing and not. Root asked for the second variant to be ru
 is the more informative of the two, and a paper reporting only the no-return convention would have
 reported a number dominated by a substitution rather than by the model.
 
-**End2Race's three successes under the 30 m fill are all on Monza**, the one long wide circuit in the suite and the only
-map resembling the f1tenth_racetracks circuits its lattice-planner demonstrations came from. Its
-mean progress is 5 m of a 34–68 m lap on the small maps and 124 m of Monza's 446. The diagnosis in
-the probe above — a speed calibrated for several-hundred-metre circuits — is what the per-map
-breakdown says too.
+**"Dominated" is the right word for the row and the wrong word for the cells, so both belong here.**
+Paired cell by cell, the 0 m fill is better in **18 of 64**, worse in 1, and *identical in 45*; mean
+route progress rises in 47 of 64 (+0.142 overall). It moves the row because the row was near zero
+and eighteen cells is a large fraction of what there was to move — it does not lift the system
+broadly. Two details say the same thing: the fill changes no cell's **approach_collision** count
+(64 in both rows, a failure that happens before the policy has much say), and the 0 m variant
+introduces **21 timeouts** the 30 m variant never has, which is the commanded-speed drop showing up
+as its own failure mode.
+
+**All three of End2Race's *solo* successes under the 30 m fill are on Monza**, the one long wide
+circuit in the suite and the only map resembling the f1tenth_racetracks circuits its lattice-planner
+demonstrations came from. The scoping matters: it has three more successes in the **O** family on
+`gen:control:9100`, which the per-map table above shows and an unqualified "its three successes"
+would contradict.
+
+Its mean progress is 124.1 m of Monza's 446 against 10.3 m pooled over every other map — though that
+too is a spread rather than a level: 5.1 m on the two tightest floors, 18.1 m on `gen:control:9100`.
+The diagnosis in the probe above — a speed calibrated for several-hundred-metre circuits — is what
+the per-map breakdown says too.
 
 ### Why these rows are re-measured rather than quoted
 
