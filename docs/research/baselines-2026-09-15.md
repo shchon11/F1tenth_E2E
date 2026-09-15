@@ -452,11 +452,19 @@ data. It is labelled that way in every table and it is not called a controlled c
 
 What closes the gap, in order: (1) `feat/interactive-teacher` merges, (2) re-run the collection with
 `--teacher interactive` — one flag, nothing else changes — and (3) put worker 17's own D3 student in
-the "ours" row. One further change is wanted for (3) to be an *identical-data* comparison rather
-than an identical-protocol one: `DemoBuffer` should carry the teacher's **plan** action beside its
-tracked command, so a plan-space student can be trained from the very same buffer instead of a
-re-collection. It is eight more floats per sample and it is deliberately not being added while the
-dry runs are in flight.
+the "ours" row.
+
+**(3) is now an *identical-data* comparison and not merely an identical-protocol one.**
+`DemoBuffer` carries the teacher's **plan** action beside its tracked command, so a plan-space
+student can be trained from the very same buffer instead of from a re-collection at the same seed.
+Nothing in `distill.py` reads it; it costs 8 fp32 against 1081 fp16, about 1.5% of the buffer, and
+it was added the moment no collection was in flight to be disturbed. Two things about it are worth
+stating because they are the ways it could go wrong quietly: `finalize()` **refuses** a plan label
+present on some steps and absent on others rather than stacking a ragged list — that would shift
+`P` against `S`/`V`/`L` by however many steps were missed, and nothing downstream would notice —
+and the npz key is optional on load, so the iteration-0 dumps already written stay readable. Both
+are asserted. `distill.py` is deliberately outside `RUNTIME_MODULES`, so this change cannot alter
+`source_digest` or split a scoring protocol.
 
 ### The TinyLidarNet arm is trained (2026-09-16 01:37)
 
