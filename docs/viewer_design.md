@@ -100,7 +100,7 @@ It is now a **table**: `레이스당 차량 수 - 1` rows, one per grid slot.
 | column | control | notes |
 | --- | --- | --- |
 | 차량 | the slot number | 1 … `race_size - 1`; the learner is car 0 and is not in the table |
-| 종류 | raceline 티처 / interactive 티처 / 정책 체크포인트 / 자기 자신 | `interactive` is worker 17's opponent-aware teacher: **listed and greyed**, with the reason in its tooltip. Dropping it would make "no such kind" and "not merged yet" look the same |
+| 종류 | raceline 티처 / interactive 티처 / 정책 체크포인트 / 자기 자신 | `interactive` is worker 17's opponent-aware teacher: **listed and greyed, labelled `[병합 후 활성]`**, with the whole reason in its tooltip. Dropping it would make "no such kind" and "not merged yet" look the same, and greying alone reads as "not applicable to this row" |
 | 체크포인트 | file picker | the button shows the basename; its tooltip is the path plus the file's **controller arm** and **memory kind**. An oracle (`opp_token`) or conditional checkpoint is refused here, in red, with the loader's own sentence — before the session is built rather than a minute into it |
 | 속도 배율 | two spins, 하한–상한 | equal = a fixed multiplier; different = a band drawn per reset |
 | 그립 라벨 | 참값 / 공칭 / 보수적 | the friction this teacher's speed profile assumes |

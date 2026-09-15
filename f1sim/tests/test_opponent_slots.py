@@ -286,6 +286,65 @@ def test_reactive_probabilities_are_per_slot():
     assert torch.all(disp[:, 0] == 0), "the learner was given a disposition"
 
 
+class _StubTeacher:
+    """A teacher kind that is not the raceline teacher: it commands a constant, so which rows it
+    drove is visible in the action itself.
+
+    It takes the raceline teacher as its reference the way `InteractiveTeacher` does, which is the
+    contract the registry's `teacher_factory` states.
+    """
+    LAST = None
+
+    def __init__(self, base, env=None):
+        self.base, self.env = base, env
+        _StubTeacher.LAST = self
+
+    def __call__(self, state, P=None, tid=None, offset=None):
+        out = torch.zeros(state.shape[0], 2)
+        out[:, 1] = 3.5                                # a speed nothing else would command
+        return out
+
+    def plan_action(self, state, P=None, tid=None, v_max=8.0, spec=None, offset=None):
+        an = self.base.plan_action(state, P, tid, v_max, spec, offset=offset)
+        return torch.full_like(an, 0.25)
+
+
+def test_a_teacher_kind_that_is_not_the_raceline_teacher_drives_its_own_rows(monkeypatch):
+    """The registry's whole point: a teacher kind the tree *has* must be driven by its own driver.
+
+    Without this, `interactive` turning available the day worker 17's branch merges would silently be
+    the raceline teacher wearing another name -- the failure the `available` machinery exists to
+    prevent, arriving by the back door. Exercised here with a stub kind, because the real one is not
+    on this branch.
+    """
+    kind = osl.DriverKind("stubteacher", "stub", "a test kind", teacher=True,
+                          teacher_factory=f"{__name__}:_StubTeacher")
+    monkeypatch.setitem(osl.KIND_BY_NAME, kind.name, kind)
+    env = _slot_env([{"kind": "stubteacher"}, {"kind": "raceline"}], envs=12)
+    env.reset(seed=61)
+    assert env.alt_teacher_kinds == ("stubteacher",)
+    assert isinstance(env.alt_teachers[0], _StubTeacher)
+    assert env.alt_teachers[0].base is env.teacher, "the stub was not built from the raceline teacher"
+    assert env.alt_teacher_mask["stubteacher"].view(-1, 3)[0].tolist() == [False, True, False]
+    an = env._opponent_actions(torch.zeros(env.B, env.act_dim))
+    a = an.view(-1, 3, env.act_dim)
+    # the stub commands 3.5 m/s, which is `2 v / v_max - 1` once normalized and is a speed the
+    # raceline teacher's own profile never lands on exactly
+    want = 3.5 / env.ecfg.v_max_policy * 2 - 1
+    assert torch.allclose(a[:, 1, 1], torch.full_like(a[:, 1, 1], want), atol=1e-5), \
+        f"slot 1 was not driven by its own kind: {a[:, 1, 1].tolist()}"
+    assert not torch.allclose(a[:, 2, 1], torch.full_like(a[:, 2, 1], want), atol=1e-5), \
+        "slot 2 was driven by the stub"
+    assert torch.allclose(a[:, 0], torch.zeros_like(a[:, 0])), "the learner was driven by a teacher"
+
+
+def test_the_interactive_kind_names_a_factory_so_it_plugs_in_with_one_entry():
+    """What "one entry when it merges" has to mean: the registry already knows what to build."""
+    kind = osl.kind_of("interactive")
+    assert kind.teacher and kind.teacher_factory.startswith(kind.module + ":")
+    assert not kind.available                       # still worker 17's branch
+
+
 def test_a_checkpoint_slot_is_driven_by_its_checkpoint(tmp_path):
     """The command of a checkpoint-driven car comes from the pool, not from the caller's action."""
     probe = _env(envs=8)

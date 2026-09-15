@@ -78,6 +78,15 @@ class DriverKind:
     policy: bool = False             # driven by the learner's own current weights
     module: str = ""                 # import that has to exist; "" = always available
     pending: str = ""                # why it is not here yet, when `module` is missing
+    #: `"module:Class"` for a teacher kind that is *not* the raceline teacher. The env builds it as
+    #: `Class(raceline_teacher, env=env)` and asks it for the rows this kind drives, next to the
+    #: raceline teacher's own. Empty means "this kind IS the raceline teacher".
+    #:
+    #: This field is what makes the registry a registry rather than a list of names. Without it a
+    #: teacher kind the tree happens to have would be driven by the raceline teacher -- which is the
+    #: silent substitution the whole `available` machinery exists to prevent, arriving by the back
+    #: door the moment the branch merges.
+    teacher_factory: str = ""
 
     @property
     def available(self) -> bool:
@@ -103,6 +112,7 @@ KINDS: Tuple[DriverKind, ...] = (
     DriverKind("interactive", "interactive 티처",
                "상대 차의 미래 위치까지 보고 계획을 고르는 티처 (worker 17).",
                teacher=True, module="f1sim.interactive_teacher",
+               teacher_factory="f1sim.interactive_teacher:InteractiveTeacher",
                pending="worker 17 의 `feat/interactive-teacher` 가 main 에 병합되면 활성화됩니다 "
                        "(레지스트리에 이미 자리가 있어 병합 외에 할 일이 없습니다)."),
     DriverKind("policy", "정책 체크포인트",
@@ -114,6 +124,21 @@ KINDS: Tuple[DriverKind, ...] = (
 
 KIND_NAMES = tuple(k.name for k in KINDS)
 KIND_BY_NAME = {k.name: k for k in KINDS}
+
+
+def build_teacher(kind: DriverKind, base, env):
+    """The driver object a non-raceline teacher kind needs, built from the raceline teacher.
+
+    One factory call, named by the registry entry: the per-car tensors (`speed_scale`,
+    `label_grip_codes`) stay on `base`, which every such teacher keeps as its reference, so a slot's
+    speed profile and grip label reach it without this function knowing what it is.
+    """
+    import importlib
+    mod_name, _, cls_name = kind.teacher_factory.partition(":")
+    if not mod_name or not cls_name:
+        raise ValueError(f"opponent kind {kind.name!r} has no teacher factory to build")
+    cls = getattr(importlib.import_module(mod_name), cls_name)
+    return cls(base, env=env)
 
 
 def kind_of(name: str) -> DriverKind:

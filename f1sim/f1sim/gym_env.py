@@ -454,6 +454,12 @@ class F1VecEnv:
         self.on_policy = self.learner.clone()
         self.learner_ids = torch.nonzero(self.learner).flatten()
         self.teacher = None                                    # set_teacher() for opponent == "teacher"
+        #: Teacher kinds a slot table named that are not the raceline teacher, their per-car masks
+        #: and (after `set_teacher`) the objects themselves. Empty everywhere else, which is what
+        #: keeps `_opponent_actions` one teacher call on every path that existed before slots.
+        self.alt_teacher_kinds: tuple = ()
+        self.alt_teacher_mask: Dict[str, torch.Tensor] = {}
+        self.alt_teachers: list = []
         #: Whether any car of this configuration can be teacher-driven, and so whether a teacher is
         #: required at all. A pool of checkpoints alone needs none.
         self.teacher_any = (e.opponent in ("teacher", "mixed")
@@ -666,6 +672,19 @@ class F1VecEnv:
         self.slot_gens = [None] + [
             (torch.Generator(device=self.device).manual_seed(int(sl.seed))
              if sl.seed is not None else None) for sl in self.slots]
+        # Teacher kinds that are not the raceline teacher, and the rows each one drives. `set_teacher`
+        # builds the objects; the masks are fixed here because a slot's kind never changes.
+        alt, masks = [], {}
+        for i, sl in enumerate(self.slots, start=1):
+            kind = sl.driver
+            if not (kind.teacher and kind.teacher_factory):
+                continue
+            if kind.name not in masks:
+                alt.append(kind.name)
+                masks[kind.name] = torch.zeros(self.B, dtype=torch.bool, device=dev)
+            masks[kind.name] |= self.slot == i
+        self.alt_teacher_kinds = tuple(alt)
+        self.alt_teacher_mask = masks
 
     def _slot_spawn_codes(self, is_full_race: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
         """(G, M) spawn code per car of every race, re-drawing the `random` slots of a full reset.
@@ -818,6 +837,11 @@ class F1VecEnv:
             # `label_grip_codes` never changes, because the label is the slot's, not the race's.
             teacher.speed_scale = torch.ones(self.B, device=self.device)
             teacher.label_grip_codes = self.slot_grip_code
+            # ... and one object per non-raceline teacher kind the table named, each built *from*
+            # this teacher, so the per-car tensors above are the ones it plans with.
+            from .opponent_slots import build_teacher, kind_of
+            self.alt_teachers = [build_teacher(kind_of(name), teacher, self)
+                                 for name in self.alt_teacher_kinds]
         if self.procedural is not None:
             # The teacher is pure pursuit on a raceline built from the occupancy grid, and the
             # procedural props are not in the grid: it cannot see them and will not steer round
@@ -1249,24 +1273,41 @@ class F1VecEnv:
                 # never lifts an opponent over its follow cap" invariant is untouched: this car
                 # never had a cap to be lifted over.
                 follow = follow & ~blind
+        an = self._teacher_normalized(self.teacher, ev_off, ev_speed, follow, v_cap)
+        for kind, alt in zip(self.alt_teacher_kinds, self.alt_teachers):
+            # A teacher kind that is not the raceline teacher drives its own slots. Asked for the
+            # whole batch and selected, like the pool is, for the same reason: compacting to the
+            # rows it owns would be a device-to-host sync every step. The mask is fixed for the life
+            # of the env, so this loop is empty unless a slot actually named such a kind -- and it
+            # is what stops a kind the tree has from being silently driven by the raceline teacher
+            # the moment its module appears.
+            an = torch.where(self.alt_teacher_mask[kind][:, None],
+                             self._teacher_normalized(alt, ev_off, ev_speed, follow, v_cap), an)
+        return torch.where(self.teacher_driven[:, None], an, out)
+
+    def _teacher_normalized(self, teacher, ev_off, ev_speed, follow, v_cap):
+        """One teacher's command for the whole batch, as a normalized action.
+
+        Split out of `_opponent_actions` so that a second teacher kind is a second call rather than
+        a second copy; the instructions are the ones that were inline, in order.
+        """
         if self.act_dim == 2:
-            cmd = self.teacher(self.sim.state, self.sim.P, self.sim.tid, offset=ev_off)
+            cmd = teacher(self.sim.state, self.sim.P, self.sim.tid, offset=ev_off)
             v = cmd[:, 1] * self.opp_scale
             # Before the follow cap, never after: an event can only slow a car (speed_scale <= 1), so
             # taking the minimum of the two leaves an opponent that is already braking for the car
             # ahead braking. Applied the other way round, a "resume" would drive it into that car.
             v = v if ev_speed is None else v * ev_speed
             v = torch.where(follow, torch.minimum(v, v_cap), v)
-            an = self.teacher_action_to_normalized(torch.stack([cmd[:, 0], v], 1))
-        else:
-            an = self.teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
-                                          self.tracker.spec, offset=ev_off)
-            an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
-            if ev_speed is not None:                             # same scaling in the normalized plan speeds
-                an[:, -2:] = (ev_speed[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
-            cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
-            an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
-        return torch.where(self.teacher_driven[:, None], an, out)
+            return self.teacher_action_to_normalized(torch.stack([cmd[:, 0], v], 1))
+        an = teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
+                                 self.tracker.spec, offset=ev_off)
+        an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
+        if ev_speed is not None:                             # same scaling in the normalized plan speeds
+            an[:, -2:] = (ev_speed[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
+        cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
+        an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
+        return an
 
     def _opponent_obs(self):
         """The observation a pool opponent acts on, or None before one exists.

@@ -40,11 +40,19 @@ simulator's own generator, so a seed still reproduces the race.
 
 **A registry, not an if-chain.** `KINDS` is a table; adding a kind is one entry in it. Worker 17's
 `InteractiveTeacher` is not on main, so `interactive` sits in the registry with `available = False`
-and a sentence saying why. The console lists it greyed with that sentence in its tooltip; the flag
-refuses it with the same one. It is never silently mapped onto the raceline teacher — a run whose
-config says `interactive` and whose cars drive a raceline is a result nobody can read. When the
-branch merges, the entry's `module` import starts resolving and the kind turns on; nothing else has
-to change.
+and a sentence saying why. The console lists it greyed (`interactive 티처 [병합 후 활성]`) with that
+sentence in its tooltip; the flag refuses it with the same one.
+
+The entry also carries `teacher_factory = "f1sim.interactive_teacher:InteractiveTeacher"`, and that
+field is what makes this a registry rather than a list of names. Without it, the day the branch
+merges the kind would become *available* and be driven by the raceline teacher — the silent
+substitution the `available` machinery exists to prevent, arriving by the back door. With it, the env
+builds one object per non-raceline teacher kind a table named (`Class(raceline_teacher, env=env)`,
+which is `InteractiveTeacher`'s own constructor), asks it for the whole batch and selects the rows it
+owns, exactly as the checkpoint pool is asked. The per-car tensors stay on the raceline teacher,
+which every such teacher keeps as its reference, so a slot's speed band and grip label reach it
+without the env knowing what it is. `tests/test_opponent_slots.py` exercises that path with a stub
+kind, because the real one is not on this branch.
 
 **`spawn` is the mirror of `--spawn-order`, and says so.** `--spawn-order` names where the *learner*
 starts relative to everyone; a per-car table reads "this car starts ahead of me", so that is what the
