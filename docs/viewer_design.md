@@ -86,6 +86,55 @@ read from the argv the process was started with and the log it already writes.
 
 See [Tracks](tracks.md) for the ids, the grammar and the splits.
 
+## The 상대차 table (2026-09-15)
+
+The 주행 page's 고급 설정 had one control for the other cars: a combo, `상대차 주행 방식`, with two
+entries (`teacher`, `policy`). That is the right control for a two-car race and the wrong one for any
+other — it says the same thing about every other car at once, and a race of three is interesting
+precisely when the two other cars are *not* the same car. The user asked for the other way round:
+*"대상차를 티쳐/정책 선택여부 뿐만 아니라 각 대상차에서 적용할 속도 프로파일링 및 체크포인트 등의
+설정이 가능했으면 해."*
+
+It is now a **table**: `레이스당 차량 수 - 1` rows, one per grid slot.
+
+| column | control | notes |
+| --- | --- | --- |
+| 차량 | the slot number | 1 … `race_size - 1`; the learner is car 0 and is not in the table |
+| 종류 | raceline 티처 / interactive 티처 / 정책 체크포인트 / 자기 자신 | `interactive` is worker 17's opponent-aware teacher: **listed and greyed**, with the reason in its tooltip. Dropping it would make "no such kind" and "not merged yet" look the same |
+| 체크포인트 | file picker | the button shows the basename; its tooltip is the path plus the file's **controller arm** and **memory kind**. An oracle (`opp_token`) or conditional checkpoint is refused here, in red, with the loader's own sentence — before the session is built rather than a minute into it |
+| 속도 배율 | two spins, 하한–상한 | equal = a fixed multiplier; different = a band drawn per reset |
+| 그립 라벨 | 참값 / 공칭 / 보수적 | the friction this teacher's speed profile assumes |
+| 속도 cap | spin, `없음` at 0 | this car's own cap in m/s |
+| 이벤트 | 제동 / 정지 / 차선 / 지그 | the timed events this car may be dropped into |
+| 빈도 | spin | per 10 s, for this car |
+| 반응형 확률 | four spins | defend / yield / line / oblivious, per race, for this car |
+| 스폰 | 앞 / 뒤 / 나란히 / 무작위 | where this car starts **relative to the learner** |
+
+Above the table: a 프리셋 combo — 기본 (티처 1.0), 학습 레시피 (0.6–1.15, 전체 이벤트, teacher + self
++ checkpoints), 느린 선두 (0.6), 막는 상대 (defend 1.0) — and 동일하게, which copies row 1 into every
+other row. Under it, one line describing the whole table, which turns into the objection when the
+table has one; 시작 is disabled while it does, because a checkpoint the loader will refuse is a start
+that fails after a minute of loading.
+
+Cells a kind cannot carry are disabled rather than accepted and ignored: a `자기 자신` row has no
+speed profile to label and no teacher to script, so its 그립 라벨, 이벤트, 빈도 and 반응형 cells grey
+out. The columns are fixed-width and the table scrolls horizontally in the 420 px panel; that is the
+price of being a table rather than four identical forms, and it is what lets someone see at a glance
+that row 2 is the only one with events.
+
+The **same widget** (`viewer/console/opponent_table.py`) is the 학습 page's, behind a
+`차량별 상대차 설정` switch in the 레이스·제어기 section. On, it emits one `--opp-slots` JSON and drops
+the flags that table replaces; off, the recipes emit exactly the command they always did. One widget
+and not two because the two pages must not be able to disagree about what a slot is — the driving
+page builds a `SessionConfig` out of it, the training page builds a command line out of it, and a
+table that produced something the trainer could not parse would be a second configuration language
+with no way to diff it against the first.
+
+The session header names the mix (`상대차 2x raceline, 1x policy`) and its tooltip lists one line per
+slot; `SessionConfig.opponent_slots` carries the table, so 세션 저장/불러오기 round-trips it. The
+viewport's rival colouring and the 정책 입·출력 panel are untouched — they read `sim.other_idx` and the
+focus car, neither of which a slot table moves — and the ROS 2 link still drives car 0 only.
+
 ## Verification
 
 Rendered headlessly with the same capture path as the README screenshots (Xvfb + llvmpipe, real
