@@ -181,6 +181,16 @@ def _versions_from_bag(raw_last: dict, types: dict) -> dict:
             out["memory_clears"] = str(int(m.memory_clears))
         except Exception:
             pass
+    raw = raw_last.get("/f1sim/plan")
+    if raw is not None and "checkpoint" not in out:
+        # The plan carries the checkpoint on every message, which is the whole reason it is on
+        # there: a bag with no `/f1sim/policy_state` -- one recorded with a narrower profile, or by
+        # a `ros2 bag record` line somebody typed -- still says which weights drove the car.
+        try:
+            m = deserialize_message(raw, get_message(types["/f1sim/plan"]))
+            out["checkpoint"] = str(m.checkpoint)
+        except Exception:
+            pass
     raw = raw_last.get("/f1sim/controller/diag")
     if raw is not None:
         try:

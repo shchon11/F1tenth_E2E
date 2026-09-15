@@ -309,12 +309,19 @@ class SensorIntake:
         return True
 
     def _accel_to_si(self, ax, ay, az):
-        """Scale linear_acceleration to m/s^2, detecting g vs SI from the gravity vector once."""
+        """Scale linear_acceleration to m/s^2, detecting g vs SI from the gravity vector once.
+
+        The rule is `calib.bagread.accel_scale_for`, shared with the bag reader: a recording read
+        on one convention and driven on the other is a silent factor of 9.81, and the place that
+        would be found is a car that does not brake.
+        """
+        from f1sim.calib.bagread import accel_scale_for
         mag = math.sqrt(ax * ax + ay * ay + az * az)
         if self.accel_scale is None:
-            if mag < 0.2:                                        # no gravity yet: cannot tell
+            detected = accel_scale_for(mag)
+            if detected is None:                                 # no gravity yet: cannot tell
                 return ax, ay, az
-            self.accel_scale = G if mag < 3.0 else 1.0
+            self.accel_scale = detected
             self.log.warning(
                 f"IMU linear_acceleration |a|={mag:.2f} on the first sample -> treating it as "
                 f"{'g' if self.accel_scale != 1.0 else 'm/s^2'} (scale {self.accel_scale:.5f}). "

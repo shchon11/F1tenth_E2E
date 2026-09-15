@@ -74,11 +74,12 @@
 
 /**/f1sim_system_check:
   ros__parameters:
+    # WHICH topics and at what rate is `config/record.yaml`, not this file: the checker and the
+    # recorder have to agree about what the graph needs, and two lists would not.
+    profile: ""               # "" = config/record.yaml
     period: 1.0               # s between reports
-    # Topics that must be present and their expected rates [Hz]; 0 = "present is enough".
-    # These are the graph's own inputs and outputs -- the same list config/record.yaml records.
-    expect_rates: [40.0, 50.0, 50.0, 40.0, 40.0, 40.0]
-    topics: ["/scan", "/sensors/imu/raw", "/odom", "/f1sim/plan", "/drive",
-             "/f1sim/policy_state"]
-    rate_tolerance: 0.5       # fraction of the expected rate below which a topic is "slow"
+    window_s: 5.0             # s of arrivals each rate is measured over
+    rate_tolerance: 0.5       # fraction of the profile's rate below which a topic is "slow"
     stale_after: 0.5          # s without a message before a topic is "stale"
+    once: false               # true: report once and exit non-zero if anything required is missing
+    car: false                # true: drop the simulator-only topics before checking

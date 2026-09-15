@@ -51,15 +51,23 @@ class RecordProfile:
 
 
 def default_path() -> str:
+    """`config/record.yaml` beside this module if there is one, else the installed share copy.
+
+    That order and not the other one: when `f1sim_ros` is imported from a source checkout -- which
+    is how every test and every worktree runs it -- the profile next to the code is the profile
+    being edited, and reading the installed copy instead silently tests the last `colcon build`.
+    Installed, this module is in site-packages, there is no `../config`, and the share directory is
+    the only answer.
+    """
+    local = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config",
+                         "record.yaml")
+    if os.path.exists(local):
+        return local
     try:
         from ament_index_python.packages import get_package_share_directory
-        p = os.path.join(get_package_share_directory("f1sim_ros"), "config", "record.yaml")
-        if os.path.exists(p):
-            return p
+        return os.path.join(get_package_share_directory("f1sim_ros"), "config", "record.yaml")
     except Exception:
-        pass
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config",
-                        "record.yaml")
+        return local
 
 
 def load(path: str = "") -> RecordProfile:

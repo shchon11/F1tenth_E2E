@@ -1,7 +1,11 @@
 """Read an F1TENTH rosbag2 (sqlite3) into plain numpy arrays.
 
 Conventions the recordings impose, taken from the dataset README and re-checked here:
-  * `/sensors/imu/raw` linear_acceleration is in **g**, not m/s^2 (az ~ 1.00 at rest).
+  * `/sensors/imu/raw` linear_acceleration is in **g** on the car, not the m/s^2 the `Imu` message
+    specifies (az ~ 1.00 at rest). It is detected rather than assumed -- see `accel_scale_for` --
+    because the SIMULATOR's bridges publish SI on the same topic, and a simulator bag read as if it
+    were g comes out 9.81x too large with nothing looking wrong. The scale chosen per topic is on
+    `BagData.accel_scale`.
   * `/odom` twist is VESC ERPM wheel speed, not ground speed: it lies under wheel spin or lock-up,
     and differentiating it produces physically impossible spikes.
   * Some recordings carry a raw gyro whose |gz| p99 is 49-255 rad/s against a normal 3-4. Do NOT
@@ -30,6 +34,21 @@ import numpy as np
 G = 9.80665
 
 
+def accel_scale_for(magnitude: float) -> Optional[float]:
+    """g or m/s^2, from the magnitude of one accelerometer sample. None when it cannot be told.
+
+    The two candidates are an order of magnitude apart (1 g against 9.81 m/s^2), so one sample of
+    gravity settles it. Below 0.2 there is no gravity in the sample -- free fall, or a dead sensor
+    -- and guessing would latch the wrong scale for the rest of the run.
+
+    The same rule the deployment nodes use (`f1sim_ros/deploy.py`, `SensorIntake._accel_to_si`), in
+    one place, because a bag read on one convention and driven on the other is a silent 9.81x.
+    """
+    if not (magnitude == magnitude) or magnitude < 0.2:      # NaN or no gravity: cannot tell
+        return None
+    return G if magnitude < 3.0 else 1.0
+
+
 @dataclass
 class BagData:
     name: str
@@ -39,6 +58,9 @@ class BagData:
     #: independent of which topics were asked for. Provenance, so two reads can be shown to share a
     #: clock. None for a bag with no records.
     origin_record_ns: Optional[int] = None
+    #: Per IMU topic, the factor its `linear_acceleration` was multiplied by to reach m/s^2:
+    #: 9.80665 for a car recording, 1.0 for a simulator one. See `accel_scale_for`.
+    accel_scale: Dict[str, float] = field(default_factory=dict)
 
     def has(self, *topics) -> bool:
         return all(k in self.t and len(self.t[k]) for k in topics)
@@ -51,10 +73,18 @@ class BagData:
         return np.stack([np.interp(times, tt, vv[:, i]) for i in range(vv.shape[1])], 1)
 
 
+#: Suffix of the extra series `want_orientation` adds next to an IMU topic: (qw, qx, qy, qz,
+#: orientation_covariance[0]) as the driver published them. Separate from the six-column `imu`
+#: series rather than widening it, because every existing consumer indexes those six by position.
+ORIENTATION_SUFFIX = "/orientation"
+
 WANTED = {
     "/drive": "ackermann", "/ackermann_cmd": "ackermann", "/teleop": "ackermann",
     "/odom": "odom", "/pf/pose/odom": "odom", "/car_state/odom": "odom",
+    "/ego_racecar/odom": "odom",
     "/sensors/imu/raw": "imu",
+    "/f1sim/plan": "plan",
+    "/f1sim/reset": "event",
     "/sensors/core": "vesc",
     "/sensors/servo_position_command": "float",
     "/imu/filtered_angular_velocity": "float",
@@ -65,8 +95,15 @@ WANTED = {
 }
 
 
-def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False) -> BagData:
-    """Decode the topics we identify vehicle parameters from. `want_scan` also keeps LiDAR ranges."""
+def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False,
+         want_orientation: bool = False) -> BagData:
+    """Decode the topics we identify vehicle parameters from. `want_scan` also keeps LiDAR ranges.
+
+    `want_orientation` additionally stores each IMU topic's quaternion and its
+    `orientation_covariance[0]` under `<topic>/orientation`, which is what `learn/bagdata.py` needs
+    to rebuild the observation's roll/pitch channel exactly as the node does. Off by default: it is
+    five more columns per sample and no existing consumer reads them.
+    """
     import rosbag2_py
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
@@ -95,7 +132,18 @@ def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False)
         if topic not in keep:
             continue
         if topic not in cls:
-            cls[topic] = get_message(types[topic])
+            try:
+                cls[topic] = get_message(types[topic])
+            except Exception:
+                # A message package that is not installed here -- `f1sim_interfaces` in a shell
+                # that has not sourced the workspace, `vesc_msgs` on a desk machine. The topic is
+                # dropped rather than failing the read: a bag is usually wanted for the topics that
+                # DO decode, and `has()` is how a caller finds out which those were.
+                keep.discard(topic)
+                acc.pop(topic, None); stamps.pop(topic, None)
+                cls[topic] = None
+        if cls[topic] is None:
+            continue
         m = deserialize_message(raw, cls[topic])
         kind = WANTED.get(topic, "float")
         if kind == "ackermann":
@@ -108,8 +156,22 @@ def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False)
             val = [p.x, p.y, yaw, tw.linear.x, tw.linear.y, tw.angular.z]
         elif kind == "imu":
             a, w = m.linear_acceleration, m.angular_velocity
-            # stored in g; converted here so every consumer sees m/s^2
-            val = [w.x, w.y, w.z, a.x * G, a.y * G, a.z * G]
+            # Raw here; scaled to m/s^2 once the unit has been decided from the first usable
+            # gravity vector, below. Deciding per message would need the decision anyway, and
+            # deciding it once is what makes a whole topic self-consistent.
+            val = [w.x, w.y, w.z, a.x, a.y, a.z]
+            if want_orientation:
+                q, cov = m.orientation, getattr(m, "orientation_covariance", ())
+                ori = topic + ORIENTATION_SUFFIX
+                acc.setdefault(ori, []).append([q.w, q.x, q.y, q.z,
+                                                float(cov[0]) if len(cov) else 0.0])
+                stamps.setdefault(ori, []).append(stamp)
+        elif kind == "plan":
+            val = list(m.plan) + [float(m.seq)]
+        elif kind == "event":
+            # A message with no payload (`std_msgs/Empty`). What matters is that it happened and
+            # when, so one column of zeros carries the timestamp series `t` alongside it.
+            val = [0.0]
         elif kind == "vesc":
             s = m.state
             val = [s.current_motor, s.current_input, s.duty_cycle, s.speed, s.voltage_input]
@@ -128,8 +190,8 @@ def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False)
     # very alignment every lag estimate depends on: in these recordings /sensors/imu/raw starts
     # 194 ms after /odom and /drive starts 1.96 s after it, so per-topic zeroing injects an offset
     # the same size as the command delay being measured.
-    for k in keep:
-        if not stamps[k]:
+    for k in list(acc):                       # `keep` plus any derived series (`/orientation`)
+        if not stamps.get(k):
             continue
         # Subtract in integer nanoseconds, then convert. Going to float seconds first loses the low
         # bits to the epoch: float64 spacing at a 2025 timestamp in ns is 256 ns, so differences
@@ -152,6 +214,13 @@ def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False)
         except ValueError:                                  # ragged (joy layouts differ per driver)
             n = min(len(x) for x in acc[k])
             arr = np.asarray([x[:n] for x in acc[k]], dtype=np.float32)
+        if WANTED.get(k) == "imu" and arr.ndim == 2 and arr.shape[1] == 6:
+            mags = np.linalg.norm(arr[:, 3:], axis=1)
+            scale = next((s for s in (accel_scale_for(float(x)) for x in mags) if s is not None),
+                         G)
+            arr = arr.copy()
+            arr[:, 3:] *= np.float32(scale)
+            out.accel_scale[k] = float(scale)
         out.t[k] = t
         out.v[k] = arr[:, 0] if arr.ndim == 2 and arr.shape[1] == 1 else arr
     return out
