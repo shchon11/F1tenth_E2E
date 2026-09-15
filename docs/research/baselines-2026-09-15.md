@@ -549,8 +549,10 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **63
-checks, all passing**: Table 1's nine rows, Table 2's, and every number in the audit above. The corrections above replaced claims that drifted from their evidence with
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **74
+checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
+underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
+group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
 claims that are themselves numeric, and a number only a reader re-checks is a number that drifts the
 same way. If a row there ever fails, it is this note that is wrong, not the script.
 
