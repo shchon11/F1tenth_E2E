@@ -523,8 +523,8 @@ def describe_tracks(spec: str, draws: str = "") -> str:
             display = tracks.get(sc.track).display if sc.track else (sc.raw or n)
             if sc.direction not in dirs:
                 dirs.append(sc.direction)
-            if sc.obstacle not in obs:
-                obs.append(sc.obstacle)
+            if sc.choice not in obs:
+                obs.append(sc.choice)
         except Exception:
             key, display = n, n
         if key not in bases:
@@ -540,7 +540,9 @@ def describe_tracks(spec: str, draws: str = "") -> str:
     if [d for d in dirs if d]:
         policy += " · 방향 " + "/".join(tracks.DIRECTION_LABEL[d] for d in tracks.DIRECTIONS if d in dirs)
     if [o for o in obs if o]:
-        policy += " · 장애물 " + "/".join(tracks.OBSTACLE_LABEL[o] for o in tracks.OBSTACLES if o in obs)
+        # `obs` holds *choice* keys, which may be compound (`bare+hard`), so the order comes from
+        # the choices seen rather than from `OBSTACLES`.
+        policy += " · 장애물 " + "/".join(tracks.choice_label(o) for o in obs if o)
     # An open seed is not one track: it is `--obstacle-draws` rasterised placements of it, and the
     # difference is the difference between eight maps and one.
     n_draws = 0
@@ -806,7 +808,10 @@ class TrackPicker(QtWidgets.QWidget):
             cb.toggled.connect(self._on_policy_changed)
             self.obs_boxes[o] = cb
             orow.add(cb)
-        v.addWidget(FieldRow("장애물", orow, "여러 개를 고르면 맵마다 각각 만들어 넣습니다."))
+        v.addWidget(FieldRow("장애물", orow,
+                             "여러 개를 고르면 맵마다 각각 만들어 넣습니다. '기본'은 맵을 만들어진 "
+                             "그대로 (에디터 장면이면 배치한 장애물 포함), '없음'은 배치 장애물을 "
+                             "걷어낸 것입니다. " + tracks.OBSTACLE_ADDS_HINT))
 
         seed_row = QtWidgets.QHBoxLayout()
         seed_row.setSpacing(SP[0])
@@ -940,7 +945,7 @@ class TrackPicker(QtWidgets.QWidget):
             scenarios.append(sc)
         want_tracks = list(dict.fromkeys(sc.track for sc in scenarios))
         want_dirs = {sc.direction for sc in scenarios}
-        want_obs = {sc.obstacle for sc in scenarios}
+        want_obs = {sc.choice for sc in scenarios}
         self._quiet = True
         for lw in self._lists.values():
             for i in range(lw.count()):
@@ -1029,7 +1034,9 @@ class TrackPicker(QtWidgets.QWidget):
                 for d in self.directions():
                     s = tid + (f"@{d}" if d else "")
                     if o:
-                        s += f"#{o}:{self.spin_fixed.value() if fixed else '*'}"
+                        s += f"#{o}"
+                        if o != tracks.BARE:      # 없음 places nothing, so it has no seed
+                            s += f":{self.spin_fixed.value() if fixed else '*'}"
                     out.append(s)
         return ",".join(dict.fromkeys(out))
 

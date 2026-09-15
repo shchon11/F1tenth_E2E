@@ -130,13 +130,26 @@ class MapCatalog:
         if e:
             return e
         return {"id": track_id, "family": track_id.split("/", 1)[0], "display": track_id,
-                "legacy": track_id, "note": "", "obstacles": list(tracks.OBSTACLES)}
+                "legacy": track_id, "note": "", "obstacles": list(tracks.OBSTACLES), "props": 0}
 
     def display(self, track_id: str) -> str:
         return self.entry(track_id).get("display") or track_id
 
     def obstacle_options(self, track_id: str) -> List[str]:
         return list(self.entry(track_id).get("obstacles") or ("",))
+
+    def authored_props(self, track_id: str) -> int:
+        """How many obstacles this map's author placed. 0 for every map that is not a scene.
+
+        A scene is read live rather than from the entry: the editor is in the same process, and a
+        count that lagged a save would put the wrong number on the 장애물 labels -- which are
+        exactly the labels this number exists to make honest.
+        """
+        if str(track_id).startswith("scene/"):
+            n = tracks.scene_props(track_id)
+            if n is not None:
+                return int(n)
+        return int(self.entry(track_id).get("props") or 0)
 
     def group_of(self, track_id: str) -> Optional[str]:
         for g, names in self.groups.items():

@@ -292,11 +292,29 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.seg_direction.selected.connect(lambda _k: self._on_scenario_changed())
         map_card.add(FieldRow("방향", self.seg_direction, ""))
 
+        # 기본 / 없음 / the families. `기본` is the map as authored -- an editor scene keeps the
+        # obstacles its author placed -- and `없음` removes them. Those used to be one entry
+        # labelled 없음, which is what the user caught: a custom scene picked with "없음" came up
+        # full of boxes.
+        obs_row = QtWidgets.QHBoxLayout()
+        obs_row.setSpacing(SP[0])
         self.combo_obstacle = QtWidgets.QComboBox()
         for o in tracks.OBSTACLES:
             self.combo_obstacle.addItem(tracks.OBSTACLE_LABEL[o], o)
         self.combo_obstacle.currentIndexChanged.connect(lambda _: self._on_scenario_changed())
-        self.row_obstacle = FieldRow("장애물", self.combo_obstacle, tracks.OBSTACLE_HINT[""])
+        obs_row.addWidget(self.combo_obstacle, 1)
+        # A family ADDS to what the map has. This is how a custom scene is used as a bare track for
+        # one: `scene:x+bare+hard3`. Enabled only where it means something -- a map with placed
+        # obstacles and a family selected.
+        self.chk_bare_first = QtWidgets.QCheckBox("배치 장애물 먼저 제거")
+        self.chk_bare_first.setToolTip(
+            "장애물 종류는 맵이 이미 가진 것 위에 더합니다.\n"
+            "켜면 작성자가 배치한 장애물을 먼저 걷어내고 그 위에 올립니다 (id 로는 +bare).")
+        self.chk_bare_first.toggled.connect(lambda _: self._on_scenario_changed())
+        obs_row.addWidget(self.chk_bare_first)
+        obs_box = QtWidgets.QWidget()
+        obs_box.setLayout(obs_row)
+        self.row_obstacle = FieldRow("장애물", obs_box, tracks.OBSTACLE_HINT[""])
         map_card.add(self.row_obstacle)
 
         # Seed. "무작위" is the default because it is what the user asked for: pick a map, get
@@ -1045,7 +1063,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
                   self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.opp_table,
                   self.combo_device, self.combo_controller, self.edit_estimator, self.combo_ros,
-                  self.seg_direction, self.combo_obstacle):
+                  self.seg_direction, self.combo_obstacle, self.chk_bare_first):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
         # The seed row follows the obstacle choice, not the session state: 다시 뽑기 is exactly the
         # control you want while something is running, and it restarts the session itself.
@@ -1141,6 +1159,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         summary = f"{run}  ·  {mp}  ·  {races}레이스 × {grid}대 = {cars}대"
         if shown < cars:
             summary += f" (화면 {shown}대)"
+        obs = facts.get("obstacle_text") or ""
+        if obs:
+            n_props = int(facts.get("authored_props") or 0)
+            summary += f"  ·  장애물 {obs}" + (f" ({n_props}개)" if n_props else "")
         mix = facts.get("opponent_mix") or ""
         if grid > 1 and mix:
             summary += f"  ·  상대차 {mix}"
@@ -1355,7 +1377,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                          "family_label": tracks.FAMILY_LABEL["scene"],
                                          "display": f"{tid.split('/', 1)[1]} (에디터)",
                                          "legacy": f"scene:{tid.split('/', 1)[1]}", "note": "",
-                                         "obstacles": list(tracks.OBSTACLES_BY_FAMILY["scene"])})
+                                         "obstacles": list(tracks.OBSTACLES_BY_FAMILY["scene"]),
+                                         "props": tracks.scene_props(tid) or 0})
         return MapCatalog(groups=groups, entries=entries, ready=cat.ready, error=cat.error)
 
     def _scenes_changed_from_editor(self):
@@ -1493,19 +1516,44 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         """
         tid = self._selected_map or ""
         allowed = self.maps.obstacle_options(tid) if tid else list(tracks.OBSTACLES)
+        n_props = self.maps.authored_props(tid) if tid else 0
         want = str(self.combo_obstacle.currentData() or "")
         self.combo_obstacle.blockSignals(True)
         self.combo_obstacle.clear()
         for o in tracks.OBSTACLES:
-            if o in allowed:
-                self.combo_obstacle.addItem(tracks.OBSTACLE_LABEL[o], o)
+            if o not in allowed:
+                continue
+            self.combo_obstacle.addItem(self._obstacle_label(o, n_props), o)
+            i = self.combo_obstacle.count() - 1
+            self.combo_obstacle.setItemData(i, tracks.OBSTACLE_HINT[o], QtCore.Qt.ToolTipRole)
+            if o == tracks.BARE and not n_props:
+                # Listed and greyed rather than hidden: "this map has nothing placed on it" is an
+                # answer, and hiding the entry would make 기본 look like the only thing there is.
+                self.combo_obstacle.setItemData(i, 0, QtCore.Qt.UserRole - 1)
+                self.combo_obstacle.setItemData(i, "이 맵은 배치 장애물이 없음 — '기본'과 같습니다.",
+                                                QtCore.Qt.ToolTipRole)
         i = self.combo_obstacle.findData(want)
+        if i >= 0 and want == tracks.BARE and not n_props:
+            i = self.combo_obstacle.findData("")        # the map changed under a now-meaningless 없음
         self.combo_obstacle.setCurrentIndex(i if i >= 0 else 0)
         self.combo_obstacle.blockSignals(False)
+        self._n_props = int(n_props)
         if len(allowed) < len(tracks.OBSTACLES):
             self.row_obstacle.set_hint(
                 f"이 계열은 '{'/'.join(tracks.OBSTACLE_LABEL[o] for o in allowed if o)}' 만 지원합니다.",
                 "hint")
+
+    @staticmethod
+    def _obstacle_label(kind: str, n_props: int) -> str:
+        """The combo's text. The counts are the whole point: 기본 on a scene with three boxes has to
+        say so, or it is the same silent claim 없음 used to make."""
+        if not n_props:
+            return tracks.OBSTACLE_LABEL[kind]
+        if kind == "":
+            return f"{tracks.OBSTACLE_LABEL['']} (배치된 장애물 {n_props}개)"
+        if kind == tracks.BARE:
+            return f"{tracks.OBSTACLE_LABEL[tracks.BARE]} (배치 장애물 제거)"
+        return tracks.OBSTACLE_LABEL[kind]
 
     def _scenario(self) -> str:
         """The selection and the three controls as one spec string. `#<kind>:*` when the seed is
@@ -1518,19 +1566,36 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if d:
             spec += f"@{d}"
         o = str(self.combo_obstacle.currentData() or "")
-        if o:
-            seed = "*" if str(self.combo_seed.currentData()) == "random" else str(self.spin_seed.value())
-            spec += f"#{o}:{seed}"
+        bare = o == tracks.BARE or (o and self.chk_bare_first.isChecked())
+        family = "" if o == tracks.BARE else o
+        choice = tracks.obstacle_choice(bool(bare), family)
+        if choice:
+            spec += f"#{choice}"
+            if family:                        # `bare` alone places nothing, so it takes no seed
+                seed = "*" if str(self.combo_seed.currentData()) == "random" else str(self.spin_seed.value())
+                spec += f":{seed}"
         return spec
 
     def _on_scenario_changed(self):
         o = str(self.combo_obstacle.currentData() or "")
-        self.row_obstacle.set_hint(tracks.OBSTACLE_HINT.get(o, ""), "hint")
+        family = o and o != tracks.BARE
+        n_props = int(getattr(self, "_n_props", 0))
+        hint = tracks.OBSTACLE_HINT.get(o, "")
+        if family:
+            hint = f"{hint} {tracks.OBSTACLE_ADDS_HINT}"
+        self.row_obstacle.set_hint(hint, "hint")
+        # The composition control only means something where there is something to remove and
+        # something being added on top of it.
+        self.chk_bare_first.setEnabled(bool(family) and n_props > 0)
+        if not family:
+            self.chk_bare_first.blockSignals(True)
+            self.chk_bare_first.setChecked(o == tracks.BARE)
+            self.chk_bare_first.blockSignals(False)
         random_seed = str(self.combo_seed.currentData()) == "random"
         for w in (self.combo_seed, self.btn_reroll):
-            w.setEnabled(bool(o))
-        self.spin_seed.setEnabled(bool(o) and not random_seed)
-        self.btn_reroll.setEnabled(bool(o) and random_seed)
+            w.setEnabled(bool(family))
+        self.spin_seed.setEnabled(bool(family) and not random_seed)
+        self.btn_reroll.setEnabled(bool(family) and random_seed)
         spec = self._scenario()
         self.scenario_line.setText(spec)
         try:

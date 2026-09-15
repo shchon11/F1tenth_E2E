@@ -253,6 +253,19 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
                 "(예: source activate.sh)에서 콘솔을 열어 주세요. 가져오기 실패: " + why)
 
 
+def _obstacle_facts(spec: str, track) -> dict:
+    """`obstacle_choice` / `obstacle_text` / `authored_props` for the facts strip."""
+    from .. import tracks as T
+    try:
+        sc = T.parse(str(spec))
+        choice = sc.choice
+        text = T.choice_label(choice)
+    except Exception:
+        choice, text = "", T.OBSTACLE_LABEL[""]
+    return {"obstacle_choice": choice, "obstacle_text": text,
+            "authored_props": int(len(getattr(track, "props", ()) or ()))}
+
+
 def _slot_dicts(env) -> Optional[list]:
     """The env's slot table as JSON objects, or None when it is not running one."""
     slots = getattr(env, "slots", None)
@@ -594,7 +607,11 @@ class SimWorker:
         groups = T.groups(scene_ids=scene_ids)
         entries = {e.id: {"id": e.id, "family": e.family, "family_label": e.family_label,
                           "display": e.display, "legacy": e.legacy, "note": e.note,
-                          "obstacles": list(e.obstacle_options())}
+                          "obstacles": list(e.obstacle_options()),
+                          # How many obstacles the map's author placed. Only an editor scene can
+                          # have any; it is what the 장애물 labels count, so the console knows it
+                          # without opening a map.
+                          "props": T.scene_props(e.id) or 0}
                    for e in T.catalog(extra=[t for ids in groups.values() for t in ids])}
         summaries = {g: T.split_summary(T.GROUP_SPLIT[g]) for g in groups if g in T.GROUP_SPLIT}
         return {"groups": groups, "entries": entries, "splits": summaries}
@@ -1071,6 +1088,10 @@ class SimWorker:
             # seed was drawn, which is the moment a user most needs to be told the number.
             "scenario": str(session.get("scenario") or cfg.map_name),
             "scenario_display": tracks_display(session.get("scenario") or cfg.map_name),
+            # Which 장애물 choice was actually built, and how many obstacles the map's author had
+            # placed. `기본` and `없음` differ only by that number, and the id alone does not carry
+            # it -- `scene/hall` is the map as authored whether that is three boxes or none.
+            **_obstacle_facts(session.get("scenario") or cfg.map_name, session["track"]),
             # The loader's own name for the same thing, kept because a manifest, a benchmark file
             # and a bug report are all written in that grammar.
             "map_legacy": str(session.get("map_legacy") or cfg.map_name),
