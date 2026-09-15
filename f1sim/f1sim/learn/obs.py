@@ -155,6 +155,7 @@ class ScanAugment:
         #: the raw frames -- never in place of them, so a hallucinated clean range cannot hide a
         #: real wall.
         self.fe = None
+        self._ego_cache = None
         self.fe_channels = tuple(c for c in self.channels if c.startswith("fe_"))
         if self.fe_channels:
             from .frontend import FrontEndRuntime
@@ -221,18 +222,7 @@ class ScanAugment:
                 "`proprio` -- `PolicyRuntime.observe(scan, proprio)` does.")
         speed, gyro, accel, vesc = floor_inputs(proprio.to(now.dtype), self.floor_idx)
         if self.att_source == "ego":
-            # Quasi-static, so there is nothing to un-advance for a terminal observation: the
-            # estimator's own filters move, but the value it returns is a function of this step.
-            if advance:
-                att = self.ego.update(speed, gyro[:, 2])
-            else:
-                saved = (self.ego.v_lp.clone(), self.ego.w_lp.clone(), self.ego.ax.clone(),
-                         self.ego.att.clone(), self.ego.rate.clone(), self.ego.started.clone())
-                att = self.ego.update(speed, gyro[:, 2])
-                if index is not None:
-                    att = att[index]
-                (self.ego.v_lp, self.ego.w_lp, self.ego.ax, self.ego.att, self.ego.rate,
-                 self.ego.started) = saved
+            att = self._ego_block(proprio, advance, index)[:, 4:]
             return _floor.floor_likelihood_norm(
                 now, att[:, 0], att[:, 1], float(self.floor_idx["range_max"]), self.floor_spec,
                 angles=self.angles,
@@ -250,19 +240,68 @@ class ScanAugment:
             now, att[:, 0], att[:, 1], float(self.floor_idx["range_max"]), self.floor_spec,
             angles=self.angles, range_eps=float(self.floor_cfg.get("range_eps", 0.02)), att_ok=ok)
 
+    def _frontend_rows(self, scan: torch.Tensor, proprio: Optional[torch.Tensor], advance: bool,
+                       index=None) -> dict:
+        """`{"fe_floor": (B, N), "fe_range": (B, N)}` from ONE front-end pass.
+
+        The ego-state block the network reads is this augmenter's own estimator, so a path that
+        enables both the geometric channel and the front-end advances one estimator rather than two
+        that could drift apart. `fe_floor` is the softmax probability of the FLOOR class, which is
+        the same quantity the geometric channel reports and is directly comparable with it;
+        `fe_range` is the denoised range, in the scan's own units, **beside** the raw frames and
+        never in place of them.
+        """
+        if proprio is None:
+            raise ValueError("the front-end channels need this step's proprio vector")
+        ego = self._ego_block(proprio, advance, index)
+        probs, rng, _att = self.fe(scan, proprio, ego)
+        from .frontend import FLOOR
+        return {"fe_floor": probs[:, FLOOR], "fe_range": rng}
+
+    def _ego_block(self, proprio: torch.Tensor, advance: bool, index=None) -> torch.Tensor:
+        """(B, 6) `EgoStateAttitude`'s state vector and attitude for this step.
+
+        Cached per call of `_channels`, so the estimator is advanced once however many channels
+        read it. `advance=False` restores the filters afterwards, the same rule `preview` keeps for
+        the occupancy memory.
+        """
+        if self._ego_cache is not None:
+            return self._ego_cache
+        speed, gyro, accel, _vesc = floor_inputs(proprio.to(self.dtype), self.floor_idx)
+        saved = None
+        if not advance:
+            saved = (self.ego.v_lp.clone(), self.ego.w_lp.clone(), self.ego.ax.clone(),
+                     self.ego.f_lp.clone(), self.ego.att.clone(), self.ego.rate.clone(),
+                     self.ego.started.clone())
+        att = self.ego.update(speed, gyro[:, 2], accel)
+        block = torch.cat([self.ego.state_vector(), att], 1)
+        if saved is not None:
+            (self.ego.v_lp, self.ego.w_lp, self.ego.ax, self.ego.f_lp, self.ego.att,
+             self.ego.rate, self.ego.started) = saved
+        if index is not None:
+            block = block[index]
+        self._ego_cache = block
+        return block
+
     def _channels(self, scan: torch.Tensor, mem: Optional[torch.Tensor],
                   proprio: Optional[torch.Tensor] = None, advance: bool = True, index=None):
         """(stacked channels, the occupancy memory this step, or None)."""
         now = scan[:, 0].detach()
         extra, new_mem = [], None
+        self._ego_cache = None
+        fe_rows = (self._frontend_rows(scan, proprio, advance, index)
+                   if self.fe is not None else {})
         for name in self.channels:
             if name == "memory":
                 new_mem = decayed_occupancy(mem.to(now.dtype), now, self.decay)
                 extra.append(new_mem)
             elif name == "floor":
                 extra.append(self._floor_row(now, proprio, advance, index))
+            elif name in fe_rows:
+                extra.append(fe_rows[name].to(now.dtype))
             else:                                       # "edges"
                 extra.append(scan_edges(now))
+        self._ego_cache = None
         return torch.cat([scan, torch.stack(extra, 1).to(scan.dtype)], 1), new_mem
 
     def _check(self, scan: torch.Tensor, rows: int):

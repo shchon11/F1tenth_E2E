@@ -210,6 +210,12 @@ def attitude_from_orientation(q, cov0=0.0):
 
 
 class PolicyNode(Node):
+    #: Class defaults, so a node the tests build with `__new__` -- several fixtures hand-assemble a
+    #: minimal node to exercise one callback -- starts from the shipped behaviour instead of an
+    #: AttributeError. `__init__` overwrites both from the parameters.
+    att_source = "vesc"
+    ego_att = None
+
     def __init__(self):
         super().__init__("f1sim_policy")
         self.declare_parameter("checkpoint", ""); self.declare_parameter("device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -291,6 +297,23 @@ class PolicyNode(Node):
         # shipped: `clearance.occupancy` does not look at the likelihood at all. See
         # `install_clearance_arm` and `docs/ros2.md`.
         self.declare_parameter("clearance_floor_gate", False)
+        # Where the policy's roll/pitch observation columns come from. `vesc` is the orientation
+        # quaternion this node has always read; `ego` is `f1sim.learn.floor.EgoStateAttitude`, the
+        # suspension's calibrated response to the accelerations the car itself produces, computed
+        # from the wheel speed, the gyro's yaw and the accelerometer. Two reasons to have the
+        # choice, both measured and both in `docs/research/floor-mask-2026-09-15.md`:
+        #
+        #   * the quaternion is wrong by 0.14 rad rms in roll and 0.09 in pitch while driving,
+        #     against 0.022 / 0.022 for the ego-state path -- and those columns are a POLICY INPUT,
+        #     not only the floor channel's;
+        #   * five of the thirteen competition recordings carry a quaternion that swings the
+        #     extracted roll past 40 deg, and on those this node refuses to drive at all today.
+        #     The ego-state path does not use the quaternion, so it survives them.
+        #
+        # `vesc` stays the default: every trained checkpoint saw `imu_att` in training, and
+        # swapping the meaning of two observation columns under a policy is a change to make
+        # deliberately with a finetune behind it, not a default.
+        self.declare_parameter("attitude_source", "vesc")
         self.controller_arm = str(p("controller"))
         self.grip = install_grip_arm(self.tracker, self.controller_arm, self.device,
                                      mu=(float(p("grip_mu")) or None))
@@ -301,6 +324,21 @@ class PolicyNode(Node):
         #: Whether the beam bearings the clearance grid is built from have been checked against a
         #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
         self._scan_geometry_checked = False
+        #: The ego-state attitude estimator. Built whenever anything could read it -- the policy's
+        #: own observation (`attitude_source:=ego`) or a front-end channel the checkpoint declares
+        #: -- and advanced every scan so those two cannot see different attitudes.
+        self.att_source = str(p("attitude_source"))
+        if self.att_source not in ("vesc", "ego"):
+            raise ValueError(f"attitude_source must be 'vesc' or 'ego', got {self.att_source!r}")
+        from f1sim.learn import floor as _floor
+        self.ego_att = _floor.EgoStateAttitude(1, device=self.device, dt=1.0 / float(CONTROL_RATE),
+                                               source="wheel")
+        if self.att_source == "ego":
+            self.get_logger().warning(
+                "attitude_source:=ego -- the policy's roll/pitch observation columns now come from "
+                "f1sim.learn.floor.EgoStateAttitude, not from the orientation quaternion. The "
+                "checkpoint was trained against the quaternion unless it says otherwise; see "
+                "docs/research/floor-mask-2026-09-15.md for what each is worth.")
         # Traction guard: wheel lock / launch spin from `/odom` wheel speed against the IMU, with
         # the speed command shaped when either fires. OFF by default -- it has been validated only
         # by replaying the recordings (`scripts/replay_traction.py`), never on the moving car, and
@@ -489,7 +527,10 @@ class PolicyNode(Node):
         out = []
         if self.t_imu_mean is None or now - self.t_imu_mean > self.timeout:
             out.append("imu")
-        if self.t_att is None or now - self.t_att > self.timeout:
+        if self.att_source != "ego" and (self.t_att is None or now - self.t_att > self.timeout):
+            # With `attitude_source:=ego` there is no quaternion in the loop at all, so its absence
+            # is not a reason to stop driving. The signals the ego path needs -- the wheel speed
+            # and the IMU -- are already checked by the `odom` and `imu` clauses above.
             out.append("attitude")
         if self.t_odom is None or now - self.t_odom > self.timeout:
             out.append("odom")
@@ -620,7 +661,18 @@ class PolicyNode(Node):
         if self._inhibited:                     # coming back from a gap
             self._resume()
         imu_mean = self.imu_mean
-        scan, pro = self.obs.build(r, self.v, imu_mean, self.att, self.speed_cap)
+        att = self.att
+        if self.ego_att is not None:
+            # The ego-state estimator runs every scan whatever the source is, because the clearance
+            # gate and any front-end read it; only whether the POLICY sees it depends on the
+            # parameter.
+            rp = self.ego_att.update(
+                torch.tensor([float(self.v)], device=self.device),
+                torch.tensor([float(imu_mean[2])], device=self.device),
+                torch.as_tensor(imu_mean[3:], dtype=torch.float32, device=self.device)[None])
+            if self.att_source == "ego":
+                att = (float(rp[0, 0]), float(rp[0, 1]))
+        scan, pro = self.obs.build(r, self.v, imu_mean, att, self.speed_cap)
         if self.clearance is not None:
             self._check_scan_geometry(m)
             # This scan, in the observation's own units, before the tracker is asked for anything.
