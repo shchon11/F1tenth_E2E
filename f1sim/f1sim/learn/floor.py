@@ -766,6 +766,45 @@ class EgoStateAttitude:
         self.att = self.att + self.rate * dt
         return self.att
 
+    #: The per-env filter state. Named once here so `peek` cannot drift from `reset` and `update`
+    #: by forgetting a field: a field left out would silently keep the ROLLOUT's value during a
+    #: subset call and quietly corrupt the estimate.
+    _STATE = ("v_lp", "w_lp", "ax", "f_lp", "att", "rate", "started")
+
+    @torch.no_grad()
+    def peek(self, speed: torch.Tensor, yaw_rate: torch.Tensor,
+             accel: Optional[torch.Tensor] = None, index=None) -> torch.Tensor:
+        """`(rows, 6)` state vector and attitude for one step **without advancing the filter**,
+        optionally for a row subset. Mirrors `AttitudeTracker.peek`, and takes the same convention:
+        when `index` is given the INPUTS are already that subset, and this narrows its own state to
+        match.
+
+        A terminal observation is scored (the truncation bootstrap reads its value) and never acted
+        on, and it carries only the envs that ended. `update` is written against `self.batch` and
+        mutates in place, so it cannot serve that call directly -- it raised
+        `speed must be (128,), got (1,)` and killed a finetune arm. Narrowing the estimator around
+        the existing `update` keeps ONE implementation of the filter rather than a second one that
+        could drift from it.
+        """
+        rows = self.batch if index is None else int(len(index))
+        for n, t in (("speed", speed), ("yaw_rate", yaw_rate)):
+            if t.dim() != 1 or t.shape[0] != rows:
+                raise ValueError(f"{n} must be ({rows},), got {tuple(t.shape)}; when `index` is "
+                                 f"given the inputs are already that subset")
+        saved = {n: getattr(self, n) for n in self._STATE}
+        batch = self.batch
+        try:
+            if index is not None:
+                for n in self._STATE:
+                    setattr(self, n, saved[n][index].clone())
+                self.batch = rows
+            att = self.update(speed, yaw_rate, accel)
+            return torch.cat([self.state_vector(), att], 1)
+        finally:
+            for n in self._STATE:
+                setattr(self, n, saved[n])
+            self.batch = batch
+
     def state_vector(self) -> torch.Tensor:
         """(B, 4) the physically meaningful quantities this estimator forms: filtered speed, filtered
         yaw rate, longitudinal acceleration, lateral acceleration.

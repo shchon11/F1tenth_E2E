@@ -858,3 +858,45 @@ def test_frontend_channels_carry_the_floor_block_without_the_floor_channel():
     with pytest.raises(ValueError, match="frontend.path"):
         scan_channel_spec({"channels": ["fe_floor"], "memory_tau_s": 2.0,
                            "floor": {k: v for k, v in blk.items() if k != "frontend"}})
+
+
+def test_ego_attitude_peek_serves_a_row_subset_without_advancing():
+    """The failure that killed `fl_a1_channel_s701` at 07:34.
+
+    A terminal observation carries only the envs that ended, and `EgoStateAttitude.update` is sized
+    for the rollout batch and mutates in place — so `preview` on one env against a 128-env
+    estimator raised `speed must be (128,), got (1,)`. Worse than the raise: the call site then
+    indexed the full-batch result, so had the shapes ever matched it would have returned the wrong
+    envs' rows silently.
+    """
+    B = 8
+    ego = fl.EgoStateAttitude(B)
+    speed = torch.arange(1.0, B + 1.0)                 # distinct per env, so rows are telling
+    yaw = torch.linspace(-0.6, 0.6, B)
+    acc = torch.zeros(B, 3)
+    for _ in range(5):
+        ego.update(speed, yaw, acc)
+    before = ego.att.clone()
+
+    # the call the arm actually made: full-batch estimator, one env's input
+    with pytest.raises(ValueError, match=r"must be \(8,\)"):
+        ego.update(speed[:1], yaw[:1], acc[:1])
+
+    idx = torch.tensor([2, 5])
+    blk = ego.peek(speed[idx], yaw[idx], acc[idx], idx)
+    assert blk.shape == (2, 6)
+    assert torch.equal(ego.att, before), "peek must not advance the rollout's filter"
+
+    # the rows are the RIGHT envs: peeked one at a time, each matches its place in the pair
+    for k, i in enumerate(idx.tolist()):
+        one = ego.peek(speed[i:i + 1], yaw[i:i + 1], acc[i:i + 1], torch.tensor([i]))
+        assert torch.allclose(one[0], blk[k], atol=1e-6), f"row {k} is not env {i}"
+
+    # and a subset row differs from the row a naive full-batch call would have handed back for it,
+    # which is what makes the silent version of this bug a wrong number rather than a crash
+    full = ego.peek(speed, yaw, acc)
+    assert not torch.allclose(full[0], blk[0], atol=1e-6)
+
+    # inputs must match `index`'s length: the convention `AttitudeTracker.peek` already takes
+    with pytest.raises(ValueError, match="already that subset"):
+        ego.peek(speed, yaw, acc, idx)
