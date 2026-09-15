@@ -44,6 +44,12 @@ SPEC_ROUTING = {
     "gyro_scale": "EnvConfig.imu_gyro_scale", "accel_scale": "EnvConfig.imu_accel_scale",
     "act_dim": "checked against the model, not applied to the env",
     "att_scale": "fixed contract constant, asserted equal",
+    # The privileged opponent block (`gym_env.OPP_TOKEN_MODES`). Listed so that a checkpoint
+    # carrying it reaches a refusal with a reason rather than the generic "cannot honour" -- and
+    # NOT routed to anything: a benchmark env never builds an oracle input, because a number
+    # produced with the other cars' true future in the observation is not a benchmark result.
+    "opp_token": "REFUSED: a simulator oracle is never a benchmark observation",
+    "opp_future_model": "records which prediction the oracle block used; not an env setting here",
 }
 
 
@@ -159,7 +165,7 @@ def eval_config(true_mu: float, spec: dict, *, sensor_noise: bool, compile_sim: 
     return cfg
 
 
-def assert_env_matches_spec(env, spec: dict) -> dict:
+def assert_env_matches_spec(env, spec: dict, allow_oracle: bool = False) -> dict:
     """What the env WILL emit, read back after construction, against what the actor expects.
 
     Read back rather than assumed: the EnvConfig fields are an intention and `common.obs_spec(env)`
@@ -172,6 +178,14 @@ def assert_env_matches_spec(env, spec: dict) -> dict:
     if unsupported:
         raise AdapterError(f"checkpoint records observation scalars this adapter cannot honour: "
                            f"{unsupported}")
+    if spec.get("opp_token") and not allow_oracle:
+        raise AdapterError(
+            f"checkpoint was trained with the privileged opponent block "
+            f"(opp_token={spec['opp_token']!r}): the other cars' true relative position, velocity "
+            f"and future, read out of the simulator. A benchmark env does not build one, and a "
+            f"score obtained with it would not be comparable with any row in the suite. A caller "
+            f"that is deliberately measuring an oracle arm -- and that will label what it gets as "
+            f"one -- passes allow_oracle=True; `benchmark run` never does.")
     want = ObsSpec(**{k: v for k, v in spec.items() if k in ObsSpec.__dataclass_fields__})
     got = common.obs_spec(env)
     diffs = {}
@@ -248,7 +262,7 @@ class PreparedCell:
 
 def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, Any],
                  suite: Dict[str, Any], device, *, tracks_override=None, racelines=None,
-                 spawn_s_m: Optional[float] = None) -> PreparedCell:
+                 spawn_s_m: Optional[float] = None, allow_oracle: bool = False) -> PreparedCell:
     """Build the env this checkpoint expects, capture graphs, install the arm. Nothing steps after.
 
     Order is the contract, not a preference:
@@ -327,12 +341,19 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
                      imu_gyro_scale=float(spec["gyro_scale"]),
                      imu_accel_scale=float(spec["accel_scale"]),
                      v_max_policy=float(spec["v_max"]),
+                     # Only ever non-empty under `allow_oracle`, and then the caller has already
+                     # accepted that what it is about to measure is not a suite row.
+                     opp_token=(str(spec.get("opp_token") or "") if allow_oracle else ""),
+                     # Whatever the checkpoint recorded; the env's own default otherwise, so a
+                     # cell never silently measures a prediction nothing in the tree still uses.
+                     **({"opp_future_model": str(spec["opp_future_model"])}
+                        if spec.get("opp_future_model") else {}),
                      compile_tracker=bool(suite.get("compile_tracker", False)))
     if race_size > 1 and opponent == "teacher" and rls is None:
         raise AdapterError("a teacher-opponent race needs racelines; pass racelines= or names")
     env = common.make_env(trs, envs, device, ecfg, cfg=cfg, seed=int(cell["seed"]),
                           rls=rls if (race_size > 1 and opponent in ("teacher", "mixed")) else None)
-    spec_match = assert_env_matches_spec(env, spec)
+    spec_match = assert_env_matches_spec(env, spec, allow_oracle=allow_oracle)
 
     if spawn_s_m is not None:
         # The avoidance scenario's fixed start arc.
@@ -402,6 +423,9 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
         "cfg_vehicle_mu": float(cfg.vehicle.mu),
         "plant_mu": float(env.sim.P["mu"].min()), "plant_mu_max": float(env.sim.P["mu"].max()),
         "sim_compile": bool(cfg.sim.compile), "compile_tracker": bool(ecfg.compile_tracker),
+        # Present and true only for a deliberate oracle measurement; a row carrying it is not a
+        # suite row and can never be pooled with one.
+        "oracle_opp_token": str(ecfg.opp_token or "") or None,
         "spec": spec, "spec_match": spec_match,
         "spawn_s_m": spawn_s_m,
         "graphed": bool(getattr(controller, "graphed", False)) if controller else False,

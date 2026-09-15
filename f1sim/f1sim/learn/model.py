@@ -1091,7 +1091,8 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                     future_head: Optional[dict] = None,
                     motion: Optional[dict] = None,
                     motion_heads: Optional[Sequence[str]] = None,
-                    init_seed: Optional[int] = None) -> Tuple[ActorCritic, dict, list]:
+                    init_seed: Optional[int] = None,
+                    opp_token_dim: int = 0) -> Tuple[ActorCritic, dict, list]:
     """Load a feedforward checkpoint into a recurrent actor-critic, by name, preserving every weight.
 
     Warm start, not re-initialisation. The memory is an addition to the original network, so at
@@ -1116,8 +1117,15 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     given and the trunk features otherwise, so which it is follows from this call rather than being
     a second thing to keep in step.
 
+    `opp_token_dim` widens the *proprio* input by that many columns on the same terms
+    (`gym_env.OPP_TOKEN_MODES`). The block is appended after every proprio key the observation
+    already had, so in the actor the new columns go on the end; in the critic the input is
+    `cat([proprio, priv])`, so they are INSERTED at the old proprio width and the privileged columns
+    keep their meaning. Zeroed either way, so forward is bit-identical and the oracle starts as an
+    input the network ignores.
+
     `memory` may be None: extra scan channels alone are a legitimate arm, and they need the same
-    by-name transfer and the same zeroed new columns. At least one of the three must be asked for,
+    by-name transfer and the same zeroed new columns. At least one of the four must be asked for,
     or this is `load_checkpoint` with extra steps.
 
     Returns (model, extra, fresh tensor names). `allow_controller` and `allow_conditional` are the
@@ -1163,9 +1171,24 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         meta["motion"] = motion_spec(**motion)
         if motion_heads:
             meta["motion_heads"] = [h for h in ("mask", "dv") if h in motion_heads]
-    if not memory and not chan and not future_head and not motion:
-        raise ValueError("load_for_memory with neither memory, a scan channel, a future head nor a "
-                         "motion branch would be load_checkpoint with extra steps; call that instead.")
+    g_tok = int(opp_token_dim)
+    if g_tok < 0:
+        raise ValueError(f"opp_token_dim must be >= 0, got {opp_token_dim}")
+    if g_tok:
+        # The target width is the CHECKPOINT's plus the block, whether or not the caller also
+        # overrode `proprio_dim` with the env's (which is the same number). Adding to an already
+        # widened override would build a network wider than either.
+        p_base = int(ck["meta"]["proprio_dim"])
+        want = p_base + g_tok
+        if int(meta["proprio_dim"]) not in (p_base, want):
+            raise ValueError(f"proprio_dim override {meta['proprio_dim']} is neither the "
+                             f"checkpoint's {p_base} nor that plus the {g_tok}-column privileged "
+                             f"opponent block ({want}).")
+        meta["proprio_dim"] = want
+    if not memory and not chan and not future_head and not motion and not g_tok:
+        raise ValueError("load_for_memory with neither memory, a scan channel, a future head, a "
+                         "motion branch nor a privileged opponent block would be load_checkpoint "
+                         "with extra steps; call that instead.")
     m = ActorCritic(**meta).to(device)
     sd = m.state_dict()
     src = ck["state_dict"]
@@ -1175,19 +1198,28 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     #: train-time heads are named separately because they hang off the actor.
     allowed_fresh = {k for k in sd if ".memory." in k or k.startswith("actor.future.")
                      or k.startswith("actor.opp_mask.") or k.startswith("actor.dv.")}
-    grown = {}                                      # name -> (checkpoint columns, model columns)
+    #: name -> (column the zeros are inserted at, how many). Everything left of it keeps its index
+    #: and everything right of it is shifted, which is what makes the forward bit-identical.
+    grown = {}
+    p0 = int(ck["meta"]["proprio_dim"])              # the checkpoint's own proprio width
     unused, mismatched = [], []
     for k, v in src.items():
         if k not in sd:
             unused.append(k); continue
         if sd[k].shape == v.shape:
             continue
-        # An input-channel extension of the stem's first convolution is the one legal reshape: same
+        # An input-channel extension of the stem's first convolution is one legal reshape: same
         # rank, same everything but the input-channel axis, and only growth.
         if (chan and k.endswith(".weight") and v.dim() == 3 and sd[k].dim() == 3
                 and sd[k].shape[0] == v.shape[0] and sd[k].shape[2] == v.shape[2]
                 and sd[k].shape[1] == v.shape[1] + len(chan["channels"])):
-            grown[k] = (v.shape[1], sd[k].shape[1])
+            grown[k] = (v.shape[1], len(chan["channels"]))
+        # The other is the proprio embedding gaining the privileged opponent block. The actor's
+        # input is the proprio vector, so the columns go on the end; the critic's is
+        # cat([proprio, priv]), so they go in at the old proprio width.
+        elif (g_tok and k in ("actor.pro.0.weight", "critic.pro.0.weight") and v.dim() == 2
+              and sd[k].shape[0] == v.shape[0] and sd[k].shape[1] == v.shape[1] + g_tok):
+            grown[k] = (v.shape[1] if k.startswith("actor.") else p0, g_tok)
         else:
             mismatched.append((k, tuple(v.shape), tuple(sd[k].shape)))
     fresh = [k for k in sd if k not in src]
@@ -1205,14 +1237,24 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
             f"{sorted(set(fresh) - allowed_fresh)[:6]}. Every original weight must transfer "
             f"unchanged; only the memory modules, the future head (and the zeroed new scan-channel "
             f"columns) may be new.{hint}")
-    if chan and len(grown) != 2:
+    n_conv = sum(1 for k in grown if src[k].dim() == 3)
+    if chan and n_conv != 2:
         raise ValueError(f"expected the actor's and the critic's first convolution to grow by "
-                         f"{len(chan['channels'])} input channel(s); {len(grown)} did: {sorted(grown)}")
+                         f"{len(chan['channels'])} input channel(s); {n_conv} did: {sorted(grown)}")
+    if g_tok and not {"actor.pro.0.weight", "critic.pro.0.weight"} <= set(grown):
+        raise ValueError(f"expected the actor's and the critic's proprio embedding to grow by "
+                         f"{g_tok} input column(s) for the privileged opponent block; grown: "
+                         f"{sorted(grown)}. A proprio width that changes the embedding's *output* "
+                         f"width too (the 32-column threshold in `Actor.__init__`) cannot be warm "
+                         f"started this way.")
     with torch.no_grad():
         for k, v in src.items():
             if k in grown:
+                at, n = grown[k]
                 w = torch.zeros_like(sd[k])
-                w[:, :grown[k][0]] = v.to(sd[k].dtype)       # originals keep their columns; new ones are 0
+                v = v.to(sd[k].dtype)
+                w[:, :at] = v[:, :at]                        # originals keep their index ...
+                w[:, at + n:] = v[:, at:]                    # ... and the new columns are 0
                 sd[k] = w
             else:
                 sd[k] = v

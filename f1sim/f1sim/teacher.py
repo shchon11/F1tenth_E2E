@@ -91,7 +91,8 @@ class RacelineTeacher:
 
     @torch.no_grad()
     def plan_action(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None, v_max: float = 8.0,
-                    spec=None, iters: int = 6, offset: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    spec=None, iters: int = 6, offset: Optional[torch.Tensor] = None,
+                    idx: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The teacher as a *planner*: the raceline segment ahead of the car expressed in the plan
         action space (f1sim.mpc: curvature knots along the next L_p of arc + start/end speeds).
         Gauss-Newton fits the knots so the integrated path passes through the raceline points
@@ -99,13 +100,22 @@ class RacelineTeacher:
         a plan-space student imitates.
 
         offset: (B,) metres left of the raceline to plan through (opponent behaviour events), clamped
-        by `offset_limit`. None leaves this function exactly as it was."""
+        by `offset_limit`. None leaves this function exactly as it was.
+
+        idx: the caller's own raceline projection of `state[:, :2]`, when it already has one. Purely
+        a saving -- `project` is an argmin over every raceline point, and a caller that evaluates
+        several plans from ONE pose (`f1sim.interactive_teacher`) would otherwise pay for the same
+        projection once per candidate. None computes it here, as before."""
         from .mpc import N_KNOTS, PlanSpec, encode, path_points, plan_length
         spec = spec or PlanSpec()
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         B = xy.shape[0]; dev = xy.device
         tid = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
-        idx, _ = self.project(xy, tid)
+        # One projection, used twice below (the lateral error the off-line slowdown reads is the
+        # same call's second return). It used to be made twice, which on a long raceline is the
+        # single most expensive thing this function does.
+        idx, lat_err = (self.project(xy, tid) if idx is None
+                        else (idx, (xy - self.xy[tid, idx]).norm(dim=1)))
         if offset is not None:
             offset = self.clamp_offset(offset, tid, idx)
         def normal(j):                                             # left-of-travel unit normal at raceline index j
@@ -160,7 +170,6 @@ class RacelineTeacher:
         # speeds from the profile: 0.15 s ahead and at the end of the plan
         v_idx0 = (idx + ((vx.abs() * spec.v_cmd_lead) / ds).round().long()) % self.N
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
-        _, lat_err = self.project(xy, tid)
         if offset is not None:                                     # error against the offset line (see __call__)
             t0, p0 = self.tan[tid, idx], self.xy[tid, idx]
             lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()

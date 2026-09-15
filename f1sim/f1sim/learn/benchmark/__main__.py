@@ -538,8 +538,14 @@ def _obstacle_track_for(cell, suite_obj):
     return [trk], rls, s_obs
 
 
-def _prepare(entry, extra, cell, suite_obj, device):
-    """One prepared cell via the adapter, with the frozen placement and declared spawn applied."""
+def _prepare(entry, extra, cell, suite_obj, device, allow_oracle: bool = False):
+    """One prepared cell via the adapter, with the frozen placement and declared spawn applied.
+
+    `allow_oracle` is forwarded and nothing in this module ever sets it: `run` scores the suite, and
+    a checkpoint that reads the other cars' true state out of the simulator does not produce a suite
+    row. It exists for a caller that is deliberately measuring an oracle arm on the same cells and
+    will label what it gets as one.
+    """
     from . import model_adapter as ma
     tracks = rls = None
     spawn = None
@@ -555,7 +561,8 @@ def _prepare(entry, extra, cell, suite_obj, device):
         tracks, rls, s_obs = _obstacle_track_for(cell, suite_obj)
         spawn = s_obs + suite_obj.s_start_offset_m
     prepared = ma.prepare_cell(_entry_dict(entry), extra, cell_d, adapter,
-                               device, tracks_override=tracks, racelines=rls, spawn_s_m=spawn)
+                               device, tracks_override=tracks, racelines=rls, spawn_s_m=spawn,
+                               allow_oracle=allow_oracle)
     router = None
     if race_size > 1:
         # AFTER the adapter: it installs the arm on the original tracker, and wrapping earlier would

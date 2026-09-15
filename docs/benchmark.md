@@ -426,6 +426,12 @@ The roster is a JSON object with a `systems` list pinning exactly which weights 
 - **An arm that contradicts the checkpoint's own record** — see below.
 - **Duplicate identity** — two entries with the same (weights, arm, estimator) triple, even under
   different `system_id`s.
+- **An oracle checkpoint.** A checkpoint whose observation spec declares the privileged opponent
+  block (`--opp-token`, see [training](training.md#--opp-token--the-privileged-opponent-block-an-oracle))
+  was trained with the other cars' true relative position, velocity and future read out of the
+  simulator. `model_adapter.assert_env_matches_spec` refuses it by name: a benchmark env does not
+  build that input, so the score would not be comparable with any row that was taken without it —
+  and unlike a controller arm there is no declaration that could make it comparable.
 
 ### Cross-runtime entries
 

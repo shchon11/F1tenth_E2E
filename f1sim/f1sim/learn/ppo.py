@@ -23,8 +23,9 @@ import time
 import numpy as np
 import torch
 
-from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX,
-                       PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS)
+from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX, OPP_FUTURE_MODELS,
+                       OPP_TOKEN_MODES, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS,
+                       opp_token_dim, opp_token_mode)
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
@@ -205,6 +206,38 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
             "aux_motion_parts": aux_dv_parts, "loss": loss, "hidden": h_next,
             "approx_kl": ((ratio - 1) - (logp - logp_old)).mean(),
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
+
+
+def kl_reference_is_baseline(ref, memory_on: bool, kl_coef: float, init: str = "") -> bool:
+    """Is the KL reference actor the frozen FEEDFORWARD baseline the leash needs? Raises if it has
+    to be and is not.
+
+    `minibatch_losses` evaluates the reference with the recurrence switched off, so the copy taken
+    at the top of a run is the original only if the memory projection was still zero when it was
+    taken -- i.e. before any update. A checkpoint whose memory is already trained cannot supply
+    one: a DAgger student distilled into a recurrent actor, or leg two of a recurrent run.
+
+    Which is fatal only if something is actually leashed to it. At `--kl-coef 0` nothing is:
+    `kl_ref` is multiplied by zero and survives as a logged diagnostic, and a diagnostic measured
+    against the policy this leg started from is a meaningful quantity. It is just not a distance
+    from the frozen original, so the run says so out loud and records which it is
+    (`experiment["kl_reference"]`) rather than letting a chart imply the wrong one.
+    """
+    trained = bool(memory_on and ref.memory is not None
+                   and float(ref.memory.out.weight.detach().abs().max()) != 0.0)
+    if not trained:
+        return True
+    if kl_coef > 0:
+        raise RuntimeError(
+            f"--kl-coef {kl_coef} leashes this run to a reference actor, and that reference has to "
+            f"be the frozen FEEDFORWARD baseline -- but {os.path.basename(str(init)) or 'this init'} "
+            f"already carries a trained memory projection, so the copy taken here is not one. "
+            f"Resume a recurrent checkpoint with --kl-coef 0, or leash a run that starts from the "
+            f"feedforward original.")
+    print("NOTE: this run resumes a trained memory projection, so the KL reference is NOT the "
+          "frozen original. --kl-coef is 0, so nothing is leashed to it; the logged `kl_ref` is "
+          "the distance from the memoryless evaluation of the policy THIS LEG STARTED FROM.")
+    return False
 
 
 def warm_start_additions(init_meta: dict, memory, scan_channels, future_head):
@@ -466,6 +499,19 @@ def main():
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--scan-stem", choices=["plain", "resnet"], default="resnet",
                     help="scan encoder for a new model without --init (an --init checkpoint keeps its own)")
+    ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
+                    help="privileged opponent block in the observation (f1sim.gym_env): the nearest "
+                         "two cars' true relative position ('pos'), velocity ('posvel') and future "
+                         "('future'), appended after every proprio key the policy already had. An "
+                         "ORACLE -- the exporter, the ROS node and the benchmark adapter all refuse "
+                         "a checkpoint that declares one, because no sensor on the car produces it "
+                         "and a score obtained with it is not comparable with any that was not. The "
+                         "columns are zero-initialised on a warm start, so the run starts as the "
+                         "checkpoint it came from and learns to use them")
+    ap.add_argument("--opp-future-model", default=EnvConfig.opp_future_model, choices=list(OPP_FUTURE_MODELS),
+                    help="which prediction the block's 'future' columns carry "
+                         "(f1sim.gym_env.OPP_FUTURE_MODELS); recorded in the spec, because the same "
+                         "columns under two models are two different inputs")
     ap.add_argument("--procedural-obstacles", type=float, default=0.0, metavar="FRAC",
                     help="share of env resets that get a freshly drawn obstacle layout, placed as "
                          "analytic props from the hard-obstacle patterns (0 = off, and off is "
@@ -488,6 +534,11 @@ def main():
                          "backwards on the line is told to carry full racing speed")
     a = ap.parse_args()
     opp_cfg.validate(a)
+    a.opp_token = opp_token_mode(a.opp_token)
+    if a.opp_token and a.race_size < 2:
+        raise SystemExit(f"--opp-token {a.opp_token} with --race-size {a.race_size}: the block "
+                         f"describes the other cars of a race and there are none. It would be a "
+                         f"constant zero input that still widens every checkpoint this run writes.")
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
@@ -572,6 +623,8 @@ def main():
                                                               # spawn field, from the group the
                                                               # census shares (learn.opponent_config)
                                                               **opp_cfg.env_kwargs(a),
+                                                              opp_token=a.opp_token,
+                                                              opp_future_model=a.opp_future_model,
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
@@ -670,7 +723,19 @@ def main():
     init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
     add_mem, add_chan, add_fut = warm_start_additions(init_meta, mem_cfg, chan_cfg, fut_cfg)
     add_mot = None if init_meta.get("motion") else mot_cfg
-    if a.init and (add_mem or add_chan or add_fut or add_mot):
+    #: The privileged opponent block a warm start would ADD, on the same rule: a checkpoint already
+    #: as wide as this env's observation already has it, and a resume must not widen it twice.
+    add_tok = 0
+    if a.init and a.opp_token:
+        g = opp_token_dim(a.opp_token)
+        p_ck = int(init_meta.get("proprio_dim", 0))
+        if p_ck == spec.proprio_dim - g:
+            add_tok = g
+        elif p_ck != spec.proprio_dim:
+            raise SystemExit(f"--init's proprio width is {p_ck}; this env produces "
+                             f"{spec.proprio_dim} and the {g}-column opponent block would make it "
+                             f"{p_ck + g}. Neither matches: --hist-len / --scan-stack differ too.")
+    if a.init and (add_mem or add_chan or add_fut or add_mot or add_tok):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
         # actor's first action of this run is bit-identical to the one the original would have
@@ -678,6 +743,7 @@ def main():
         model, extra, fresh = load_for_memory(
             a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
             future_head=add_fut, motion=add_mot, motion_heads=mot_heads,
+            opp_token_dim=add_tok,
             # Fresh modules are seeded from their own NAMES, so two arms that differ only in how many
             # scan channels they enable share every weight a warm start leaves fresh. Without it the
             # wider first convolution shifts the ambient generator and the arms differ by a second
@@ -687,7 +753,8 @@ def main():
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
         print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} "
-              f"motion {add_mot} | {len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
+              f"motion {add_mot} opp_token {a.opp_token if add_tok else 'kept'} | "
+              f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
@@ -796,13 +863,7 @@ def main():
     # different policies and the comparison would be between leashes, not conditioning.
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters(): p_.requires_grad_(False)
-    if memory_on and ref.memory is not None and float(ref.memory.out.weight.detach().abs().max()) != 0.0:
-        # Same argument as the conditioning check below, one projection further: the leash's
-        # reference is the FEEDFORWARD original, and `minibatch_losses` evaluates it with the
-        # recurrence switched off. That is only the original if the projection was still zero when
-        # this copy was taken -- i.e. before any update.
-        raise RuntimeError("the KL reference actor was captured after the memory projection had "
-                           "trained; it must be the frozen feedforward baseline")
+    ref_is_baseline = kl_reference_is_baseline(ref, memory_on, a.kl_coef, a.init)
     if cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
@@ -811,6 +872,9 @@ def main():
     #: What this run was, recorded in every checkpoint it writes so a result traces back to its arm,
     #: its normalization and its adapter without consulting a shell history.
     experiment_meta = {
+        # What `kl_ref` in this run's logs is measured against, so a chart is never read as a
+        # distance from the frozen original when it is not one.
+        "kl_reference": "frozen_feedforward_baseline" if ref_is_baseline else "leg_start_memoryless",
         "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),

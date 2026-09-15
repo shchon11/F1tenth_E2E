@@ -204,6 +204,16 @@ class PolicyNode(Node):
         self.device = torch.device(p("device"))
         self.model, extra = load_checkpoint(p("checkpoint"), self.device); self.model.eval()
         self.spec = ObsSpec(**extra["spec"]) if extra.get("spec") else ObsSpec()
+        if self.spec.opp_token:
+            # The privileged opponent block (`gym_env.OPP_TOKEN_MODES`) is the simulator's ground
+            # truth about the other cars -- where they are, how fast, and where they will be. No
+            # sensor on this car produces it. A checkpoint trained on it is an oracle arm and an
+            # experimental result; driving a real car with zeros in those columns would run a
+            # policy on an input that permanently says "no car is anywhere near".
+            raise ValueError(
+                f"checkpoint declares the privileged opponent block opp_token="
+                f"{self.spec.opp_token!r} (future model "
+                f"{self.spec.opp_future_model!r}). It is a simulator oracle and is not deployable.")
         self.obs = ObsBuilder(self.spec, self.device)
         #: The policy's episode state: the recurrent hidden state and the decayed scan-occupancy
         #: channel, for this one car. Empty (and `stateful` False) for a feedforward checkpoint, so

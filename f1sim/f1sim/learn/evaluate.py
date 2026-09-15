@@ -18,9 +18,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..gym_env import EnvConfig
+from ..gym_env import OPP_FUTURE_MODELS, OPP_TOKEN_MODES, EnvConfig, opp_token_mode
 from .. import opponent_events as opp_ev
-from ..opponent_events import describe as describe_events, parse_events
+from ..opponent_events import describe as describe_events, parse_events, split_events
 from ..params import Config
 from . import common
 from . import grip_runtime
@@ -61,7 +61,11 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
-             controller: str = "legacy", estimator: str = "") -> dict:
+             controller: str = "legacy", estimator: str = "",
+             teacher_kind: str = "raceline", teacher_speed: float = 1.0,
+             mu: float | None = None, teacher_horizon: float = 1.0,
+             teacher_cand_iters: int = 2, teacher_cost: str = "",
+             opp_future_model: str = EnvConfig.opp_future_model, opp_extra: dict | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -70,6 +74,20 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     simulator's generator.
     contention_range_m / attack_range_m: the two arc windows the traffic metrics measure over. The
     defaults are the env's own `overtake_range` and the benchmark's tight window.
+    teacher_speed: scale on the teacher's own speed profile. The teacher plans at the grip limit,
+    so 1.0 is the limit and collection has historically used less (`RacelineTeacher.grip_bin`:
+    "which is why collection uses speed_scale < 1"). What the right value is has never been
+    measured; `--teacher-speed` with `--mu` is how it gets measured.
+    mu: pin the plant's friction instead of randomising it, so a number is *about* that friction.
+    Randomisation is switched off with it, because with it on `vehicle.mu` is a scale applied to a
+    draw and the episode's friction is not the number asked for -- the same argument
+    `benchmark.model_adapter.eval_config` makes.
+    teacher_kind: which privileged teacher `--teacher` drives. "raceline" is the one this function
+    has always driven. "interactive" is `f1sim.interactive_teacher`, which scores a family of plans
+    against the opponents' predicted motion -- the only one of the two that can demonstrate a pass,
+    and the thing `docs/research/interactive-teacher-2026-09-15.md` measures against the other.
+    opp_extra: extra EnvConfig fields (the privileged opponent block, the reactive behaviour
+    probabilities) that this function does not have a parameter of its own for.
     controller: the arm to install between the policy and the wheels (`grip_runtime.ARMS`).
     `legacy` installs nothing, which is what every caller before 2026-09-13 got. The arm is built
     and installed after `sim.warmup()` for the same reason `ppo.py` builds it after the graph
@@ -79,6 +97,10 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
     torch.manual_seed(seed)
     np.random.seed(seed)
+    cfg = cfg or Config()
+    if mu is not None:
+        cfg.rand.enabled = False
+        cfg.vehicle.mu = float(mu)
     rl_kw = {} if raceline_margin is None else {"margin": raceline_margin}
     trs, rls = common.load_tracks(tracks, racelines=teacher or (race_size > 1 and opponent == "teacher"), **rl_kw)
     model = None
@@ -101,10 +123,18 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      race_size=race_size, opponent=opponent,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
                      scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
-                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2))
+                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+                     opp_future_model=opp_future_model, **(opp_extra or {}))
+    if teacher and teacher_kind == "interactive" and not (race_size > 1 and opponent == "teacher"):
+        raise ValueError(f"--teacher-kind interactive with race_size {race_size} and opponent "
+                         f"{opponent!r}: its opponent term is identically zero without another car, "
+                         f"so the run would be a raceline run under a different name.")
+    if teacher and teacher_kind == "interactive" and mode != "plan":
+        raise ValueError("--teacher-kind interactive needs --action-mode plan: its candidates are "
+                         "plans.")
     if opp_speed_range is not None:
         ecfg.opp_speed_range = tuple(float(x) for x in opp_speed_range)
-    step_dt = 1.0 / (cfg or Config()).sim.control_rate
+    step_dt = 1.0 / cfg.sim.control_rate
     steps = resolve_steps(protocol, steps, budget_laps, trs, speed_cap, step_dt, max_steps)
     if protocol == "trials":
         ecfg.max_steps = steps
@@ -115,6 +145,14 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     ctrl.install()
     if teacher:
         teacher_policy = common.make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time)
+        teacher_policy.speed_scale = float(teacher_speed)
+        if teacher_kind == "interactive":
+            from ..interactive_teacher import InteractiveTeacher, TeacherCost
+            w = [float(x) for x in teacher_cost.split(",")] if teacher_cost else None
+            teacher_policy = InteractiveTeacher(teacher_policy, env, horizon_s=teacher_horizon,
+                                                cost=TeacherCost(*w) if w else TeacherCost(),
+                                                cand_iters=teacher_cand_iters,
+                                                future_model=opp_future_model)
         def policy(obs):
             return env.teacher_label(teacher_policy)
     else:
@@ -177,7 +215,12 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     result['metadata'] = {
         'protocol': protocol, 'tracks': list(tracks), 'seed': seed,
         'seeds': {'numpy': seed, 'torch': seed, 'simulator': seed, 'reset': seed if protocol == 'trials' else None},
-        'checkpoint': str(ckpt), 'teacher': teacher, 'deterministic_policy': True,
+        'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
+        'teacher_speed': float(teacher_speed) if teacher else None,
+        'pinned_mu': float(mu) if mu is not None else None,
+        'opp_token': str(env.opp_token_mode or "") or None,
+        'opp_future_model': opp_future_model if env.opp_token_mode else None,
+        'deterministic_policy': True,
         'action_mode': mode, 'device': str(device), 'steps': steps, 'step_dt': env.sim.control_dt,
         'time_budget_s': steps * env.sim.control_dt, 'envs': envs,
         'race_size': race_size, 'opponent': opponent, 'learners': int(env.learner.sum()),
@@ -264,6 +307,38 @@ def main() -> None:
                     help="[s] >0: cap the teacher's commanded speed at what can still be steered back onto the lane "
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
+    ap.add_argument("--teacher-kind", default="raceline", choices=["raceline", "interactive"],
+                    help="which privileged teacher --teacher drives. raceline: pure pursuit on the "
+                         "precomputed line, blind to the other cars. interactive: "
+                         "f1sim.interactive_teacher, which scores a family of plans against the "
+                         "opponents' predicted motion -- the only one of the two that can pass")
+    ap.add_argument("--teacher-speed", type=float, default=1.0, metavar="SCALE",
+                    help="scale on the teacher's own speed profile. The profile already plans at the "
+                         "grip limit, so 1.0 IS the limit; collection has historically used less")
+    ap.add_argument("--mu", type=float, default=None,
+                    help="pin the plant's friction (and switch randomisation off) so the result is "
+                         "about that friction. The suite's levels are 0.73423 / 0.94401 / 1.15379")
+    ap.add_argument("--teacher-horizon", type=float, default=1.0, metavar="S",
+                    help="[s] how far the interactive teacher rolls each candidate out")
+    ap.add_argument("--teacher-cand-iters", type=int, default=2, metavar="N",
+                    help="Gauss-Newton iterations per candidate plan")
+    ap.add_argument("--teacher-cost", default="", metavar="PROG,WALL,OPP,CLEAR,SMOOTH",
+                    help="the five interactive-teacher cost weights; empty = its defaults")
+    ap.add_argument("--opp-future-model", default=EnvConfig.opp_future_model, choices=list(OPP_FUTURE_MODELS),
+                    help="which prediction the interactive teacher reads the opponents with")
+    ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
+                    help="build the privileged opponent block in the observation. Needed to score a "
+                         "checkpoint that was TRAINED with one -- its proprio vector is wider than "
+                         "this env's without it. An ORACLE either way: a number obtained with it is "
+                         "not comparable with one obtained without it, and the metadata says which "
+                         "this run was")
+    ap.add_argument("--opp-defend-prob", type=float, default=0.0)
+    ap.add_argument("--opp-yield-prob", type=float, default=0.0)
+    ap.add_argument("--opp-line-prob", type=float, default=0.0)
+    ap.add_argument("--opp-oblivious-prob", type=float, default=0.0,
+                    help="the four reactive behaviours' per-race probabilities, as in training. A "
+                         "named reactive behaviour at probability 0 is never given to anybody, so "
+                         "the run would silently be the unflagged one")
     ap.add_argument("--output", type=Path, help="write the complete strict JSON report")
     ap.add_argument("--eager", action="store_true", help="disable simulator compilation (CPU smoke tests)")
     a = ap.parse_args()
@@ -282,10 +357,18 @@ def main() -> None:
             ap.error(f"--opp-events {','.join(a.opp_events)} needs --race-size > 1 and --opponent "
                      f"teacher: the events script the teacher-driven cars of a race, and there are "
                      f"none here (--race-size {a.race_size}, --opponent {a.opponent}).")
-        if not a.opp_event_rate > 0:
-            ap.error(f"--opp-events {','.join(a.opp_events)} with --opp-event-rate "
+        timed, react = split_events(a.opp_events)
+        if timed and not a.opp_event_rate > 0:
+            ap.error(f"--opp-events {','.join(timed)} with --opp-event-rate "
                      f"{a.opp_event_rate}: the rate is events per opponent per 10 s, so at 0 the "
                      f"named events never fire and the run is silently the unflagged one.")
+        for name in react:
+            flag = f"--opp-{name}-prob"
+            if not 0.0 < float(getattr(a, f"opp_{name}_prob")) <= 1.0:
+                ap.error(f"--opp-events {name} with {flag} "
+                         f"{getattr(a, f'opp_{name}_prob')}: the probability is how often a "
+                         f"teacher-driven car is given that behaviour for a race, so at 0 it is "
+                         f"never given and the run is silently the unflagged one.")
     tracks = common.track_names(a.tracks)
 
     if a.controller not in grip_runtime.ARMS:
@@ -302,6 +385,15 @@ def main() -> None:
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,
+                        teacher_kind=a.teacher_kind, teacher_speed=a.teacher_speed, mu=a.mu,
+                        teacher_horizon=a.teacher_horizon,
+                        teacher_cand_iters=a.teacher_cand_iters, teacher_cost=a.teacher_cost,
+                        opp_future_model=a.opp_future_model,
+                        opp_extra={"opp_token": opp_token_mode(a.opp_token),
+                                   "opp_defend_prob": a.opp_defend_prob,
+                                   "opp_yield_prob": a.opp_yield_prob,
+                                   "opp_line_prob": a.opp_line_prob,
+                                   "opp_oblivious_prob": a.opp_oblivious_prob},
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
                         controller=a.controller, estimator=a.estimator)
 

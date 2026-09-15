@@ -18,7 +18,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PROPRIO_KEYS = ("speed", "prev_action", "speed_cap", "imu", "imu_att", "hist")   # "hist" only when the spec asks for it
+PROPRIO_KEYS = ("speed", "prev_action", "speed_cap", "imu", "imu_att", "hist", "opp_token")
+#: "hist" and "opp_token" appear only when the spec asks for them, and "opp_token" is LAST:
+#: it is an oracle block appended after every column a deployable observation has, so a
+#: checkpoint trained without it keeps every input index it had (`model.load_for_memory`
+#: grows the first proprio Linear by zeroed columns on exactly that promise).
 
 #: Extra scan channels, in the order they are appended to the channel axis. The order is fixed here
 #: and not by the caller's spelling: it is the order the first convolution's input columns are laid
@@ -268,6 +272,12 @@ class ObsSpec:
     act_dim: int = 2              # 2 = (steer, speed); 6 = local plan (f1sim.mpc), tracked by the MPC on both sides
     hist_len: int = 0             # >0: history of (speed, imu, roll/pitch, action) rows, hist_len rows hist_stride steps apart
     hist_stride: int = 2          # (1 s of history = 20 rows x 2 steps at 40 Hz): the actor can infer grip / lag from its own responses
+    opp_token: str = ""           # privileged opponent block (`gym_env.OPP_TOKEN_MODES`): "" off,
+                                  # else "pos" / "posvel" / "future". An ORACLE input: `learn.export`
+                                  # and `f1sim_ros.policy_node` refuse a checkpoint that declares one.
+    opp_future_model: str = "pred"  # which prediction its "future" columns came from
+                                  # (`gym_env.OPP_FUTURE_MODELS`) -- recorded because the same
+                                  # columns under two models are two different inputs
     range_max: float = 10.0
     v_max: float = 10.0           # = EnvConfig.v_max_policy
     gyro_scale: float = 5.0
@@ -279,8 +289,14 @@ class ObsSpec:
         return 1 + 6 + 2 + self.act_dim
 
     @property
+    def opp_token_dim(self) -> int:
+        from ..gym_env import opp_token_dim
+        return opp_token_dim(self.opp_token)
+
+    @property
     def proprio_dim(self) -> int:
-        return 1 + self.act_dim * self.action_history + 1 + 6 + 2 + self.hist_len * self.row_dim
+        return (1 + self.act_dim * self.action_history + 1 + 6 + 2 + self.hist_len * self.row_dim
+                + self.opp_token_dim)
 
 
 def flatten_obs(obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -292,6 +308,12 @@ class ObsBuilder:
     """Deployment-side builder: feed raw sensor values each control step, get the same tensors."""
 
     def __init__(self, spec: ObsSpec, device="cpu"):
+        if spec.opp_token:
+            raise ValueError(
+                f"this observation spec declares the privileged opponent block "
+                f"(opp_token={spec.opp_token!r}). It is ground truth from the simulator -- the"
+                f" other cars' exact position, velocity and future -- and no sensor on the car"
+                f" produces it, so a deployment-side builder cannot build this observation.")
         self.spec, self.device = spec, torch.device(device)
         self.reset()
 
