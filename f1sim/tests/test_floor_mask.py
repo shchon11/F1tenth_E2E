@@ -765,3 +765,56 @@ def test_brake_only_mode_is_validated_and_defaults_to_both():
     cl.ClearanceSpec(floor_gate_mode="brake").validate()
     with pytest.raises(ValueError, match="floor_gate_mode"):
         cl.ClearanceSpec(floor_gate_mode="bend").validate()
+
+
+# ------------------------------------------------------------ where the likelihood comes from
+
+
+def test_gate_threshold_bound_follows_the_likelihood_source():
+    """0.5 is `UNKNOWN`, the geometric channel's "no attitude" value, so a geometric gate must
+    stay strictly above it. The front-end's 0.5 is a split vote and carries no such sentinel, so
+    the same threshold is legal there -- and the report's sweep needs it."""
+    import dataclasses
+    assert fl.FloorSpec().gate_source == "geometric"
+    with pytest.raises(ValueError, match="UNKNOWN"):
+        dataclasses.replace(fl.FloorSpec(), gate_threshold=fl.UNKNOWN).validate()
+    ext = dataclasses.replace(fl.FloorSpec(), gate_source="external",
+                              gate_threshold=fl.UNKNOWN).validate()
+    assert ext.gate_threshold == fl.UNKNOWN
+    with pytest.raises(ValueError, match=r"\(0, 1\]"):
+        dataclasses.replace(fl.FloorSpec(), gate_source="external", gate_threshold=0.0).validate()
+    with pytest.raises(ValueError, match="gate_source"):
+        dataclasses.replace(fl.FloorSpec(), gate_source="frontend").validate()
+
+
+def test_an_external_gate_with_nothing_supplied_gates_nothing():
+    """The failure this guards: an external gate may sit at 0.5, and the geometric likelihood's
+    unknown value IS 0.5, so falling back to it on a step the front-end did not run would gate
+    every beam -- the arm would forget the walls exactly when it had least reason to."""
+    import dataclasses
+    from f1sim import mpc as _mpc
+    ang = fl.beam_angles(361, 1.5 * math.pi)
+    scan = torch.full((1, 361), 0.9)
+    scan[:, 150:210] = 0.20                          # a wall the arm must not forget
+    ext = dataclasses.replace(fl.FloorSpec(), gate_source="external",
+                              gate_threshold=fl.UNKNOWN).validate()
+
+    def build(cspec, fspec):
+        tr = _mpc.PlanTracker(1, "cpu", 0.32, 0.4, 10.0, compile_solver=False)
+        arm = cl.ClearanceArm(tr, cspec, 1, "cpu", 10.0, ang, 10.0, fspec=fspec)
+        arm.update_scan(scan)
+        return arm
+
+    on = build(cl.ClearanceSpec(floor_gate=True).validate(), ext)     # gate on, nothing supplied
+    off = build(cl.ClearanceSpec().validate(), None)                  # the arm as it ships
+    bend_on, speed_on = on.field()
+    bend_off, _ = off.field()
+    assert speed_on is None
+    assert torch.equal(bend_on, bend_off), "with no likelihood supplied the gate must be a no-op"
+
+    # and when one IS supplied at that threshold it still acts, so the no-op above is the
+    # fallback and not the gate being dead.
+    on2 = build(cl.ClearanceSpec(floor_gate=True).validate(), ext)
+    on2.set_floor(torch.full((1, 361), 0.9))
+    bend2, _ = on2.field()
+    assert not torch.equal(bend2, bend_off)

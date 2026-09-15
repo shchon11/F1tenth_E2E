@@ -180,6 +180,16 @@ class FloorSpec:
     #: Reported by `gate_weight`: a return is removed from the occupancy grid above this. 0.5 is
     #: `UNKNOWN`, so the threshold is strictly above it and an unknown attitude gates nothing.
     gate_threshold: float = 0.60
+    #: Where the gate's per-beam likelihood comes from, which is what makes the bound above legal:
+    #:
+    #:   `geometric`  this module's `floor_likelihood`, whose "I do not know" value IS `UNKNOWN`
+    #:                (0.5). A threshold at or below it would gate every beam of every scan the
+    #:                moment the attitude went unavailable, so it is refused.
+    #:   `external`   a likelihood supplied per step from outside (`learn/frontend.py`'s floor
+    #:                class), which carries no such sentinel -- 0.5 there means "the classifier is
+    #:                evenly split", not "no attitude". Any threshold in (0, 1] is then meaningful,
+    #:                and the arm gates NOTHING on a step where no likelihood was supplied.
+    gate_source: str = "geometric"
 
     def validate(self) -> "FloorSpec":
         if not (self.sigma_roll > 0.0 and self.sigma_pitch > 0.0):
@@ -197,10 +207,16 @@ class FloorSpec:
             raise ValueError(f"smooth_weight must be in [0, 1], got {self.smooth_weight}")
         if not 0.0 < self.p_min < 1.0:
             raise ValueError(f"p_min must be in (0, 1), got {self.p_min}")
-        if not UNKNOWN < self.gate_threshold <= 1.0:
-            raise ValueError(f"gate_threshold {self.gate_threshold} must be above UNKNOWN "
-                             f"({UNKNOWN}) and at most 1: at or below it an unknown attitude would "
-                             f"gate every beam of every scan")
+        if self.gate_source not in ("geometric", "external"):
+            raise ValueError(f"gate_source must be 'geometric' or 'external', got "
+                             f"{self.gate_source!r}")
+        if self.gate_source == "geometric":
+            if not UNKNOWN < self.gate_threshold <= 1.0:
+                raise ValueError(f"gate_threshold {self.gate_threshold} must be above UNKNOWN "
+                                 f"({UNKNOWN}) and at most 1: at or below it an unknown attitude "
+                                 f"would gate every beam of every scan")
+        elif not 0.0 < self.gate_threshold <= 1.0:
+            raise ValueError(f"gate_threshold {self.gate_threshold} must be in (0, 1]")
         return self
 
     def to_meta(self) -> dict:

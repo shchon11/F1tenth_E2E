@@ -701,8 +701,15 @@ class ClearanceArm:
         """
         p = None
         if self.cspec.floor_gate:
-            p, self._p_ext = (self._p_ext if self._p_ext is not None
-                              else self.floor_likelihood()), None
+            if self.fspec.gate_source == "external":
+                # The threshold is not bounded below by UNKNOWN on this path, so falling back to
+                # the geometric likelihood -- whose unknown value IS UNKNOWN -- could gate every
+                # beam. A step with nothing supplied gates nothing.
+                p, self._p_ext = (self._p_ext if self._p_ext is not None
+                                  else torch.zeros_like(self.scan)), None
+            else:
+                p, self._p_ext = (self._p_ext if self._p_ext is not None
+                                  else self.floor_likelihood()), None
         brake_only = p is not None and self.cspec.floor_gate_mode == "brake"
         # In brake-only mode the BEND's occupancy is built with the gate switched off in the spec
         # too, not merely with no likelihood passed: `occupancy` refuses a spec that says "gate"
