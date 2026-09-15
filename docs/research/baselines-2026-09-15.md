@@ -455,6 +455,39 @@ checks across them, and `claim_check.py` now pins it independently.
 |---|---|---|---|---|---|---|---|---|---|---|
 | **TinyLidarNet-L** | 47 | 1 | 9 | **78/640** | 24/160 | 19/160 | 19/160 | 16/160 | **165** | 144 |
 | **End2Race** (rear 30 m) | 3 | 0 | 3 | **0/640** | 0/160 | 0/160 | 0/160 | 0/160 | 40 | 136 |
+| frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | — | — | — | — | 289 | 251 |
+
+### Traffic costs our reference policy far more than it costs the baseline
+
+`frozen_original@legacy` takes 95 of 640 traffic trials against TinyLidarNet's 78 — a gap of 1.2×,
+where the solo gap is 4.2×. That invites the obvious sentence, so it gets the check the rest of this
+note has had to learn: the T family runs five floors and the solo family eight, so the comparison
+must be restricted to the maps they share.
+
+| on the five T-family maps | frozen `@legacy` | TinyLidarNet-L | ratio |
+| --- | ---: | ---: | ---: |
+| solo | 134/240 (55.8 %) | 43/240 (17.9 %) | **3.12×** |
+| traffic | 95/640 (14.8 %) | 78/640 (12.2 %) | **1.22×** |
+
+It survives. On identical maps, adding other cars costs our reference policy **73 % of its solo
+success rate** and the published baseline only **32 % of its** — and the gap between the two closes
+from 3.1× to 1.2×.
+
+**What that does not establish is why**, and there are at least two live readings. One is that
+traffic genuinely punishes a policy that commits to a racing line more than it punishes one already
+failing most of the time. The other is a floor effect: a system succeeding 17.9 % of the time has
+less to lose than one succeeding 55.8 %, and any additional hazard compresses the two toward each
+other. Nothing measured here separates them, and the shapes of their failures differ enough
+(TinyLidarNet's traffic failures are 353 wall collisions in 496 no-pass trials) that I would not
+guess. Distinguishing them wants a traffic family at graded opponent density, which this suite does
+not have.
+
+**The contact structure holds across all three systems, including ours.** Of the reference policy's
+251 car contacts, **239 are in trials where it never completed a pass** — 95 %, against
+TinyLidarNet's 99 % and End2Race's 100 %. A CNN, a GRU and a plan-space PPO policy, three different
+failure profiles, and in every one a contact is what happens *instead* of an overtake rather than
+the price of one. That is the 02:28 correction confirmed on a third system, and on the one that
+actually passes well.
 
 **End2Race does not complete a single lap in traffic — 0 of 640, every scenario, every floor.** It
 finished 3 solo trials, so this is not merely the solo row repeated. All 640 trials met traffic, so
