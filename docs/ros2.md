@@ -298,13 +298,34 @@ beams that end short of the map against the geometry's 1.9×. It needs no attitu
 is the whole reason the geometric path is stuck. The front-end runs once per scan for the policy's
 own channels, so the gate costs nothing extra.
 
-**Measured, in simulation, with no training** (`docs/research/floor-mask-2026-09-15.md` §6): the
-front-end-driven gate removes 3.59 % of returns, gives back two thirds of the speed the floor was
-costing (0.345 → 0.114 m/s per step, the phantom brake rate more than halved) and is **faster on 8
-of 8 proxy tracks** — 12.89 → 12.38 s mean first-lap time, 4.0 %. The cost is a 0.51 pp rise in
-decisions the solid world asked for and the gate suppressed, a 0.9 mm fall in the true plan margin,
-and completions and collisions/km moving the wrong way by less than their sample noise. That is one
-checkpoint, one seed set and 128 trials, and it has never run on the real car.
+**Measured, in simulation, with no training** (`docs/research/floor-mask-2026-09-15.md` §6), on
+eight held-out proxy tracks, 128 cars, against the arm's own decision on the solid returns only:
+
+| | gate off | gate: front-end | **gate: front-end, brake-only** |
+|---|---:|---:|---:|
+| the arm's phantom decisions | 3.46 % | 0.36 % | 2.09 % |
+| … phantom **brakes** | 3.02 % | 0.19 % | **0.56 %** |
+| speed removed for no solid reason | 0.246 m/s | 0.011 | 0.035 |
+| `lost` — a solid decision the gate suppressed | 0.15 % | 0.62 % | **0.28 %** |
+| plans below zero margin on the solid grid | 7.92 % | 8.19 % | 8.27 % |
+| collisions / km | 36.53 | 37.26 | **35.06** |
+| mean first-lap time | 12.89 s | 12.38 s | **12.11 s** |
+| tracks faster than gate-off | — | 8 of 8 | **8 of 8** |
+
+`clearance_floor_gate_mode` picks which decision the gate may touch, and **`brake` is the default**:
+it may remove floor returns from the speed cap, and the bend still sees every return. That is the
+asymmetry the measurement found — floor returns are what makes the car brake for nothing, and the
+bend is where suppressing a real return costs. Brake-only is the fastest arm tried, has the lowest
+collisions/km of any including gate-off, and suppresses a third as many wanted decisions as gating
+both, while still removing 81 % of the phantom brakes. `clearance_floor_gate_mode:=both` is the
+documented alternative.
+
+The cost line, stated rather than rounded off: the share of plans whose clearance on the **solid**
+grid is below zero rises from 7.92 % to about 8.2 %, and it rises by the same amount for every
+gated variant tried, including one that gates only 1.6 % of returns. Mean speed is within 0.3 %
+across all of them, so that is not a faster car keeping less room. Completions were 46 / 43 / 43 of
+128, which is inside the proxy's own seed-to-seed spread. One checkpoint, one seed set, 128 trials,
+and it has never run on the real car.
 
 ### `attitude_source` — the quaternion is not the only option any more
 
@@ -408,6 +429,7 @@ State changes are logged at INFO with the numbers behind them:
 | `controller` | `fixed_low` | `legacy`, `fixed_low`, `clearance`, `fixed_low+clearance`. Anything else — the simulator's `oracle` / `estimated` / `+tcs` arms — is refused rather than silently downgraded |
 | `clearance_margin` | `0.0` | body-edge margin for a `+clearance` arm, in metres; `0.0` means the module default (0.20 m) |
 | `clearance_floor_gate` | `false` | leave likely-floor returns out of the clearance grid (see above). Off is byte-identical to the arm without it |
+| `clearance_floor_gate_mode` | `brake` | which decision the gate may touch: `brake` the speed cap only (measured better on every axis), `both` the whole arm |
 | `attitude_source` | `vesc` | where the policy's roll/pitch observation columns come from: `vesc` (the orientation quaternion this node has always read), `ego` (`f1sim.learn.floor.EgoStateAttitude`) or `frontend` (the learned front-end's own estimate) — see below |
 | `traction` | `off` | `off` installs nothing at all; `on` installs the replay-validated guard. Anything else is refused |
 | `traction_params` | `""` | `NAME=VALUE` pairs (comma or space separated) overriding any field of `TractionParams` — every threshold above is reachable from the launch line |

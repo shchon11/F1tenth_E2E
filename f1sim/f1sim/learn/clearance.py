@@ -100,9 +100,18 @@ class ClearanceSpec:
     range_eps: float = 0.02           # a normalized range within this of 1.0 is "no return"
 
     # -- the floor gate ----------------------------------------------------------
-    #: `both` gates the occupancy the whole arm reads; `brake` gates only the occupancy the SPEED
-    #: decision reads, leaving the bend to see every return. See `adjust`'s `dist_speed`.
-    floor_gate_mode: str = "both"
+    #: `brake` gates only the occupancy the SPEED decision reads, leaving the bend to see every
+    #: return; `both` gates the occupancy the whole arm reads. See `adjust`'s `dist_speed`.
+    #:
+    #: `brake` is the default because it measured better on every axis than gating both decisions
+    #: (`work/floor-mask/REPORT.md` §3.7, eight held-out proxy tracks, 128 cars): it is the fastest
+    #: arm of the seven tried (12.11 s mean first lap against gate-off's 12.89, faster on 8 of 8
+    #: tracks), it has the LOWEST collisions/km of any arm including gate-off (35.06 vs 36.53), and
+    #: its `lost` rate -- a decision the solid world asked for and the gate suppressed -- is a third
+    #: of the full gate's (0.28 % vs 0.62 %). It still removes 81 % of the phantom brakes, which is
+    #: what the gate is for. The asymmetry is the point: floor returns are what makes the car brake
+    #: for nothing, and the bend is where suppressing a real return costs.
+    floor_gate_mode: str = "brake"
     floor_gate: bool = False          # OFF by default. On, a return whose floor likelihood
                                       # (`learn.floor`) reaches `FloorSpec.gate_threshold` is left
                                       # out of the occupancy grid. Off, `occupancy` never looks at

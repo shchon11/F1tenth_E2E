@@ -760,9 +760,12 @@ def test_brake_only_gate_splits_the_two_decisions(device):
     assert float(split2.dv.min()) < -cl.V_EPS
 
 
-def test_brake_only_mode_is_validated_and_defaults_to_both():
-    assert cl.ClearanceSpec().floor_gate_mode == "both"
-    cl.ClearanceSpec(floor_gate_mode="brake").validate()
+def test_brake_only_is_the_default_mode_and_the_gate_is_still_off():
+    """Brake-only ships as the gate's shape (it measured better than gating both decisions on every
+    axis, §3.7), but the gate itself is still OFF -- so nothing about the default arm changed."""
+    assert cl.ClearanceSpec().floor_gate_mode == "brake"
+    assert cl.ClearanceSpec().floor_gate is False
+    cl.ClearanceSpec(floor_gate_mode="both").validate()
     with pytest.raises(ValueError, match="floor_gate_mode"):
         cl.ClearanceSpec(floor_gate_mode="bend").validate()
 
@@ -790,7 +793,8 @@ def test_gate_threshold_bound_follows_the_likelihood_source():
 def test_an_external_gate_with_nothing_supplied_gates_nothing():
     """The failure this guards: an external gate may sit at 0.5, and the geometric likelihood's
     unknown value IS 0.5, so falling back to it on a step the front-end did not run would gate
-    every beam -- the arm would forget the walls exactly when it had least reason to."""
+    every beam -- the arm would forget the walls exactly when it had least reason to. Checked in
+    both gate modes, because the shipped one gates only the speed field."""
     import dataclasses
     from f1sim import mpc as _mpc
     ang = fl.beam_angles(361, 1.5 * math.pi)
@@ -805,16 +809,26 @@ def test_an_external_gate_with_nothing_supplied_gates_nothing():
         arm.update_scan(scan)
         return arm
 
-    on = build(cl.ClearanceSpec(floor_gate=True).validate(), ext)     # gate on, nothing supplied
     off = build(cl.ClearanceSpec().validate(), None)                  # the arm as it ships
-    bend_on, speed_on = on.field()
-    bend_off, _ = off.field()
-    assert speed_on is None
-    assert torch.equal(bend_on, bend_off), "with no likelihood supplied the gate must be a no-op"
+    bend_off, speed_off = off.field()
+    assert speed_off is None, "gate off must not build a second field"
+
+    for mode in ("both", "brake"):
+        on = build(cl.ClearanceSpec(floor_gate=True, floor_gate_mode=mode).validate(), ext)
+        bend_on, speed_on = on.field()
+        assert torch.equal(bend_on, bend_off), f"{mode}: the bend must be untouched"
+        if mode == "brake":
+            assert torch.equal(speed_on, bend_off), "brake: the speed field must be untouched too"
+        else:
+            assert speed_on is None
 
     # and when one IS supplied at that threshold it still acts, so the no-op above is the
-    # fallback and not the gate being dead.
-    on2 = build(cl.ClearanceSpec(floor_gate=True).validate(), ext)
-    on2.set_floor(torch.full((1, 361), 0.9))
-    bend2, _ = on2.field()
-    assert not torch.equal(bend2, bend_off)
+    # fallback and not the gate being dead -- in each mode, on the field that mode gates.
+    for mode, idx in (("both", 0), ("brake", 1)):
+        on2 = build(cl.ClearanceSpec(floor_gate=True, floor_gate_mode=mode).validate(), ext)
+        on2.set_floor(torch.full((1, 361), 0.9))
+        gated = on2.field()[idx]
+        assert not torch.equal(gated, bend_off), f"{mode}: a supplied likelihood must act"
+        if mode == "brake":
+            # a brake-only arm's BEND field is never gated, whatever is supplied
+            assert torch.equal(on2.field()[0], bend_off)

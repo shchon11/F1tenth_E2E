@@ -74,7 +74,7 @@ def install_grip_arm(tracker, arm: str, device, mu: float = None):
 
 
 def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None,
-                          floor_gate: bool = False):
+                          floor_gate: bool = False, gate_mode: str = ""):
     """Install the `clearance` layer: the plan bent and slowed off what `/scan` can see.
 
     Built from the observation's own beam geometry (`ObsSpec.n_beams`, `range_max`) and the nominal
@@ -101,6 +101,8 @@ def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None,
     kw = {"floor_gate": bool(floor_gate)}
     if margin is not None:
         kw["margin"] = float(margin)
+    if gate_mode:
+        kw["floor_gate_mode"] = str(gate_mode)
     cspec = cl.ClearanceSpec(**kw)
     angles = cl.beam_angles(int(spec.n_beams), LIDAR_FOV, device=torch.device(device))
     from f1sim.learn import floor as fl
@@ -297,6 +299,13 @@ class PolicyNode(Node):
         # shipped: `clearance.occupancy` does not look at the likelihood at all. See
         # `install_clearance_arm` and `docs/ros2.md`.
         self.declare_parameter("clearance_floor_gate", False)
+        # WHICH decision the gate is allowed to touch, when it is on. `brake` (the default, and
+        # `ClearanceSpec`'s) lets it remove floor returns from the speed cap only, leaving the bend
+        # to see every return; `both` gates the whole arm. Brake-only measured better on every axis
+        # on eight held-out tracks -- fastest arm tried, the lowest collisions/km of any including
+        # gate-off, and a third of the full gate's rate of suppressing a decision the solid world
+        # asked for -- while still removing 81 % of the phantom brakes. See REPORT.md 3.7.
+        self.declare_parameter("clearance_floor_gate_mode", "brake")
         # Where the policy's roll/pitch observation columns come from. `vesc` is the orientation
         # quaternion this node has always read; `ego` is `f1sim.learn.floor.EgoStateAttitude`, the
         # suspension's calibrated response to the accelerations the car itself produces, computed
@@ -320,7 +329,8 @@ class PolicyNode(Node):
         self.clearance = install_clearance_arm(self.tracker, self.controller_arm, self.device,
                                                self.spec,
                                                margin=(float(p("clearance_margin")) or None),
-                                               floor_gate=bool(p("clearance_floor_gate")))
+                                               floor_gate=bool(p("clearance_floor_gate")),
+                                               gate_mode=str(p("clearance_floor_gate_mode")))
         #: Whether the beam bearings the clearance grid is built from have been checked against a
         #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
         self._scan_geometry_checked = False
