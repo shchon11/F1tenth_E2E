@@ -716,15 +716,22 @@ result: the suite runs a cell at one fixed batch width, and at a fixed width thi
 bit-identical run to run (verified, max \|Δ\| exactly 0.0). Reproducing a row means re-running the
 same cells, not re-running them at a different width.
 
-### The D3 row, complete (64/64, 2026-09-16 05:08)
+## Table 3 — the fair comparison: same architecture, our demonstrations (64/64, 2026-09-16 05:08)
 
 The TinyLidarNet architecture trained on **our** demonstrations, scored on the same 64 cells, same
 digest, same device as everything in Table 1. Beside the published weights of the same network:
 
-| | S/384 | A/96 | O/32 | mean route fraction | timeouts | collisions |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **TinyLidarNet arch, our demonstrations** | **48** | **35** | **0** | **0.665** | 242 | 94 |
-| TinyLidarNet, published weights | 47 | 1 | 9 | 0.416 | **0** | 356 |
+| system | | S/384 | A/96 | O/32 | route fraction | timeouts | collisions |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **TinyLidarNet arch, our demonstrations** | D3, raceline teacher | **48** | **35** | **0** | **0.665** | 242 | 94 |
+| TinyLidarNet, published weights | zero-shot reference | 47 | 1 | 9 | 0.416 | **0** | 356 |
+| *End2Race arch, our demonstrations* | *not started — permission gate* | — | — | — | — | — | — |
+| *ours, policy only (A701 `@legacy`)* | on suite v2 | 217 | 30 | 17 | — | — | — |
+
+The last two rows are what CONTRACT.md asks for and this table does not yet have: the End2Race arm
+has never been trained, and the "ours" row is a PPO policy rather than a student distilled from the
+same expert, so it shares the evaluation and the sensor but not the data. Both are labelled
+everywhere they appear and neither is called a controlled comparison.
 
 Two networks with identical architecture, differing only in what they were shown. The solo totals
 are a coincidence and the per-map numbers say so:
