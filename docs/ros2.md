@@ -288,6 +288,31 @@ occupancy grid the same way a beam with no return is. Three things to know befor
 
 `controller/clearance_floor_gated_frac` in the metrics says what share of returns it removed.
 
+### `attitude_source` — the quaternion is not the only option any more
+
+The policy reads two observation columns of body roll and pitch, and on this car they come from the
+`/sensors/imu/raw` orientation quaternion. Measured against the truth in simulation, that quaternion
+is wrong by **0.144 rad rms in roll and 0.091 in pitch while driving** — the IMU's own mounting
+misalignment enters as a constant offset, and the filter follows the accelerometer, which a 0.45 g
+brake tilts by `atan2(4.4, 9.81)` = 24°. And **five of the thirteen competition recordings** carry a
+quaternion that swings the extracted roll past 40°, on which this node refuses to drive at all.
+
+`attitude_source:=ego` replaces it with `f1sim.learn.floor.EgoStateAttitude` — the suspension's
+calibrated response to the accelerations the car itself produces, from the wheel speed, the gyro's
+yaw and the accelerometer, with the wheel-lock windows held rather than believed. Measured, 0.022 /
+0.022. It uses no quaternion, so those five recordings stop being a reason to stop driving, and
+`_stale_inputs` no longer requires an attitude when it is selected.
+
+```bash
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p attitude_source:=ego
+```
+
+**`vesc` stays the default and should**, until a checkpoint has been finetuned against the other
+columns: every trained policy saw the quaternion in training, and swapping what two of its
+observation inputs mean is a change to make deliberately. The estimator runs either way — the
+clearance gate and any front-end channel read it — so selecting `ego` changes what the *policy*
+sees and nothing else. See `docs/research/floor-mask-2026-09-15.md`.
+
 ## Traction guard
 
 `policy_node` can watch the wheel for lock-up and spin and shape the speed command it publishes.
@@ -354,6 +379,7 @@ State changes are logged at INFO with the numbers behind them:
 | `controller` | `fixed_low` | `legacy`, `fixed_low`, `clearance`, `fixed_low+clearance`. Anything else — the simulator's `oracle` / `estimated` / `+tcs` arms — is refused rather than silently downgraded |
 | `clearance_margin` | `0.0` | body-edge margin for a `+clearance` arm, in metres; `0.0` means the module default (0.20 m) |
 | `clearance_floor_gate` | `false` | leave likely-floor returns out of the clearance grid (see above). Off is byte-identical to the arm without it |
+| `attitude_source` | `vesc` | where the policy's roll/pitch observation columns come from. `vesc` is the orientation quaternion this node has always read; `ego` is `f1sim.learn.floor.EgoStateAttitude` — see below |
 | `traction` | `off` | `off` installs nothing at all; `on` installs the replay-validated guard. Anything else is refused |
 | `traction_params` | `""` | `NAME=VALUE` pairs (comma or space separated) overriding any field of `TractionParams` — every threshold above is reachable from the launch line |
 
