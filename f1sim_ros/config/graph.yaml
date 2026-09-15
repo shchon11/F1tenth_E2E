@@ -1,0 +1,84 @@
+# Every parameter of the policy/controller graph, in one file.
+#
+# The three launch files -- graph_sim, graph_console, graph_car -- differ ONLY in where the sensor
+# topics come from. Everything that can change what the car does is here, so "which arm was in
+# force, at what friction, with what calibration" is one file to read and one file to diff, and a
+# sim run and a car run are the same run with a different sensor source.
+#
+# Override from the launch line:  ros2 launch f1sim_ros graph_sim.launch.py \
+#     checkpoint:=$HOME/f1sim_runs/ppo_race_0910/ppo_latest.pt controller:=fixed_low+clearance
+# or point `config_yaml:=` at a copy of this file.
+
+/**/f1sim_policy:
+  ros__parameters:
+    # --- what drives ---------------------------------------------------------
+    checkpoint: ""            # absolute path to the exported actor; required
+    device: "cpu"             # "cuda" on a machine with one; the car has none
+    # The speed ceiling the POLICY is told about: it is an observation channel, so it changes what
+    # the network emits, not just what the tracker allows. It has to match the controller's
+    # `speed_cap` below -- `system_check` reports both and says so when they differ.
+    speed_cap: 4.0
+
+    # --- topics --------------------------------------------------------------
+    plan_topic: "/f1sim/plan"
+    state_topic: "/f1sim/policy_state"
+    reset_topic: "/f1sim/reset"
+    drive_topic: "drive"      # used ONLY by a direct-action checkpoint, which has no plan
+    enabled: true
+
+    # --- sensors -------------------------------------------------------------
+    sensor_timeout: 0.25      # s; older than this on any actor input and the policy stops planning
+    imu_accel_scale: 0.0      # 0 = detect g vs m/s^2 from the first gravity vector
+    steer_max: 0.4189         # direct-action checkpoints only
+
+/**/f1sim_controller:
+  ros__parameters:
+    # --- the arm -------------------------------------------------------------
+    # legacy | fixed_low | clearance | fixed_low+clearance. Anything else -- the simulator's
+    # oracle / estimated / +tcs arms -- is refused rather than silently downgraded.
+    controller: "fixed_low"
+    grip_mu: 0.0              # 0 = the module default, MU_FIXED_LOW = 0.73423
+    clearance_margin: 0.0     # 0 = the module default, 0.20 m body edge
+    traction: "off"           # "on" installs the replay-validated guard; see docs/ros2.md
+    traction_params: ""       # NAME=VALUE pairs overriding any TractionParams field
+
+    # --- the tracker ---------------------------------------------------------
+    device: "cpu"
+    speed_cap: 4.0            # must equal the policy's
+    steer_max: 0.4189
+    wheelbase: 0.3302
+    cmd_delay: 0.035          # s, the measured command latency this car's tracker predicts over
+    steer_bias: 0.0           # rad; published angle = (cmd - steer_bias) / steer_gain
+    steer_gain: 1.0           # LEAVE AT 1.0 until the servo configuration is confirmed: the two
+    speed_gain: 1.0           # recorded configurations have OPPOSITE polarity (docs/ros2.md)
+
+    # --- the observation geometry the clearance grid is built on -------------
+    # Read from the checkpoint when it is given, which is the only way it is guaranteed to be the
+    # policy's. n_beams / range_max / v_max are for a controller with no checkpoint on this disk
+    # (a baseline node, a replay); giving both and disagreeing is refused.
+    checkpoint: ""
+    n_beams: 0
+    range_max: 0.0
+    v_max: 0.0
+
+    # --- topics and timeouts -------------------------------------------------
+    plan_topic: "/f1sim/plan"
+    drive_topic: "drive"
+    diag_topic: "/f1sim/controller/diag"
+    reset_topic: "/f1sim/reset"
+    enabled: true
+    sensor_timeout: 0.25      # the monolithic node's rule, unchanged: stale sensors -> zero speed
+    plan_timeout: 0.25        # s without a plan before the car is braked to zero
+    watchdog_period: 0.01     # s; how often the two timeouts above are checked
+    viz: false                # /f1sim/viz/plan and /f1sim/viz/clearance markers for rviz
+
+/**/f1sim_system_check:
+  ros__parameters:
+    period: 1.0               # s between reports
+    # Topics that must be present and their expected rates [Hz]; 0 = "present is enough".
+    # These are the graph's own inputs and outputs -- the same list config/record.yaml records.
+    expect_rates: [40.0, 50.0, 50.0, 40.0, 40.0, 40.0]
+    topics: ["/scan", "/sensors/imu/raw", "/odom", "/f1sim/plan", "/drive",
+             "/f1sim/policy_state"]
+    rate_tolerance: 0.5       # fraction of the expected rate below which a topic is "slow"
+    stale_after: 0.5          # s without a message before a topic is "stale"

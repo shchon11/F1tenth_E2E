@@ -1,0 +1,87 @@
+# The record profile: exactly the topics the graph needs, and nothing else.
+#
+# One list, three consumers, which is the point of writing it down:
+#   * `ros2 bag record` on the car   -- `python3 -m f1sim_ros.recorder --args` prints the topic list;
+#   * `bridge_node record:=<dir>`    -- the simulator writes the same profile, so a sim run and a car
+#                                       run produce interchangeable bags;
+#   * `system_check`                 -- live, or over a finished bag, reports what is missing.
+#
+# `required: true` means a bag without it cannot produce a dataset (`learn/bagdata.py`) and a live
+# graph without it is not driving. `rate_hz` is the nominal rate on this car; `system_check` calls a
+# topic slow below `rate_tolerance` of it and stale after `stale_after` seconds of silence.
+version: 1
+topics:
+  - name: /scan
+    type: sensor_msgs/msg/LaserScan
+    rate_hz: 40.0
+    required: true
+    why: the policy's only exteroceptive input, and the clearance arm's only input
+
+  - name: /sensors/imu/raw
+    type: sensor_msgs/msg/Imu
+    rate_hz: 50.0
+    required: true
+    why: >
+      the observation's gyro/accelerometer channels and its roll/pitch, and the traction guard's
+      body acceleration. linear_acceleration is in g on this car and is scaled on the way in
+
+  - name: /odom
+    type: nav_msgs/msg/Odometry
+    rate_hz: 50.0
+    required: true
+    why: >
+      twist.linear.x is the VESC ERPM wheel speed -- the observation's speed channel and the
+      traction guard's slip sensor. The pose drifts and nothing reads it
+
+  - name: /drive
+    type: ackermann_msgs/msg/AckermannDriveStamped
+    rate_hz: 40.0
+    required: true
+    why: what the car was told to do; the label for a dataset and the output under test
+
+  - name: /f1sim/plan
+    type: f1sim_interfaces/msg/Plan
+    rate_hz: 40.0
+    required: false
+    why: >
+      the boundary itself. Absent for a baseline node or a direct-action checkpoint, which publish
+      /drive without a plan -- so it is recorded but not required
+
+  - name: /f1sim/policy_state
+    type: f1sim_interfaces/msg/PolicyState
+    rate_hz: 40.0
+    required: false
+    why: which checkpoint drove, and every clear of the policy's episode memory
+
+  - name: /f1sim/controller/diag
+    type: diagnostic_msgs/msg/DiagnosticArray
+    rate_hz: 40.0
+    required: false
+    why: which arm, which friction, which clearance margin and what the traction guard did
+
+  - name: /f1sim/reset
+    type: std_msgs/msg/Empty
+    rate_hz: 0.0
+    required: false
+    why: episode boundaries; a dataset must not stitch two segments together across one
+
+  - name: /sensors/core
+    type: vesc_msgs/msg/VescStateStamped
+    rate_hz: 50.0
+    required: false
+    why: motor current, the drive-torque corroboration for a launch spin. Absent in one recording
+
+  - name: /tf_static
+    type: tf2_msgs/msg/TFMessage
+    rate_hz: 0.0
+    required: false
+    why: base_link -> laser, which the clearance grid assumes is (0.297, 0, 0.110)
+
+  - name: /ego_racecar/odom
+    type: nav_msgs/msg/Odometry
+    rate_hz: 40.0
+    required: false
+    sim_only: true
+    why: >
+      ground truth. Simulator only -- it does not exist on the car, and a dataset that uses it for
+      anything but scoring has stopped being a real-car dataset

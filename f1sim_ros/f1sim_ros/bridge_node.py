@@ -72,6 +72,12 @@ class BridgeNode(Node):
         self.declare_parameter("cmd_timeout", 0.5)
         self.declare_parameter("auto_reset_on_collision", False)
         self.declare_parameter("start_s", -1.0)
+        # Recording. One flag, and this simulator run writes exactly the topics `config/record.yaml`
+        # says the graph needs -- the same list a car run records -- so the two are interchangeable
+        # inputs to `learn/bagdata.py` and to `system_check`. Empty means no recording at all and
+        # no subscription for one.
+        self.declare_parameter("record", "")
+        self.declare_parameter("record_profile", "")
 
         p = lambda n: self.get_parameter(n).value
         cfg = Config.from_yaml(p("config_yaml")) if p("config_yaml") else Config()
@@ -112,6 +118,17 @@ class BridgeNode(Node):
         # name as the service -- the two are separate in the ROS graph -- so any listener
         # can hear it without a second server for the service.
         self.pub_reset = self.create_publisher(EmptyMsg, "/f1sim/reset", 1)
+
+        self.recorder = None
+        if str(p("record")):
+            from f1sim_ros.record_profile import load as load_profile
+            from f1sim_ros.recorder import BagRecorder, timestamped_dir
+            out = str(p("record"))
+            # A directory that already holds a bag is not appended to: rosbag2 refuses, and a run
+            # whose recording silently went somewhere else is worse than one that did not start.
+            if os.path.isdir(out):
+                out = timestamped_dir(out, "f1sim_sim")
+            self.recorder = BagRecorder(self, out, load_profile(str(p("record_profile"))))
 
         self.publish_map()
         self.publish_static_tf()
@@ -275,6 +292,8 @@ def main():
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    if getattr(node, "recorder", None) is not None:
+        node.recorder.close()
     node.destroy_node()
     rclpy.shutdown()
 
