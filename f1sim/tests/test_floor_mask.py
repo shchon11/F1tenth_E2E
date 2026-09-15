@@ -644,3 +644,51 @@ def test_frontend_channels_are_zero_init_parity_and_refuse_without_one(tmp_path)
     assert torch.allclose(out, aug.preview(scan, None, pro), atol=1e-6)
     with pytest.raises(ValueError, match="trained front-end"):
         ScanAugment(("fe_floor",), 256, 2, floor={**cfg, "frontend": None})
+
+
+# ------------------------------------------------------------------ what reaches the car
+def test_the_aux_head_cannot_reach_the_exported_graph():
+    """`--aux-floor` is train-time only. The export traces `Actor.step`, which takes the
+    `floor=False` branch, so the head is not merely absent from the output -- it is never called.
+
+    Asserted by poisoning it: give the head weights that would dominate anything they touched and
+    check the exported path's action is **bit-identical**. That is a stronger statement than
+    "the ONNX file has no such node", and it needs no exporter.
+    """
+    from f1sim.learn.export import ActorOnly
+    m = _ac(floor_head={"width": 16})
+    m.eval()
+    scan, pro = torch.rand(3, 6, 128), torch.rand(3, 16)
+    with torch.no_grad():
+        before = ActorOnly(m.actor)(scan, pro)
+        for p in m.actor.floor.parameters():
+            p.mul_(0.0).add_(7.0)
+        after = ActorOnly(m.actor)(scan, pro)
+        assert torch.equal(before, after)
+        # ... and the head still produces something, so the test is not vacuous
+        assert float(m.evaluate_aux(scan, pro, torch.rand(3, 8), torch.rand(3, 8),
+                                    floor=True)[7].abs().max()) > 0.0
+
+
+def test_the_floor_channel_warm_start_is_bit_identical(tmp_path):
+    """The channel is one more input column, appended after every column the original had and
+    zeroed, so the first action of a run that turns it on is the action the original would have
+    produced -- for any value in the new column."""
+    from f1sim.learn.model import load_for_memory, save_checkpoint
+    from f1sim.learn.obs import ObsSpec, att_index_spec
+    torch.manual_seed(5)
+    base = _ac()
+    base.eval()
+    path = str(tmp_path / "base.pt")
+    save_checkpoint(path, base, {"spec": {}})
+    sp = ObsSpec(n_beams=128, scan_stack=6, act_dim=8, hist_len=0)
+    chan = {"channels": ["floor"], "floor": {"proprio": att_index_spec(sp)}}
+    m, _extra, fresh = load_for_memory(path, "cpu", None, scan_channels=chan)
+    m.eval()
+    assert fresh == [], "a channel adds no tensors, only columns"
+    scan, pro = torch.rand(4, 6, 128), torch.rand(4, 16)
+    with torch.no_grad():
+        a0 = base.act(scan, pro, deterministic=True)[0]
+        for fill in (0.0, 0.5, 1.0, 7.3):
+            aug = torch.cat([scan, torch.full((4, 1, 128), fill)], 1)
+            assert torch.equal(a0, m.act(aug, pro, deterministic=True)[0]), fill
