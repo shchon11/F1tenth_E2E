@@ -243,3 +243,63 @@ def test_the_plan_label_is_the_teachers_plan_for_the_same_state():
                           v_max=10.0, range_max=10.0).finalize()
     assert buf.P is not None and buf.P.shape[:2] == buf.L.shape[:2]
     assert np.allclose(buf.P, np.stack(seen), atol=0, rtol=0), "plan label is off by a step"
+
+
+# ------------------------------------------------------------------ the contention (gap) label
+def test_the_gap_label_round_trips_and_old_buffers_still_load(tmp_path):
+    b = distill.DemoBuffer(range_max=10.0)
+    rng = np.random.default_rng(0)
+    for _t in range(3):
+        b.add(rng.random((2, 8)), rng.random(2), rng.random((2, 2)), np.zeros(2, bool),
+              rng.random((2, 8)), rng.random(2) * 20 - 10)
+    b.finalize()
+    assert b.G is not None and b.G.shape == (3, 2)
+    p = tmp_path / "g.npz"
+    b.save(p)
+    assert np.array_equal(distill.DemoBuffer.load(p).G, b.G)
+
+    old = _filled(plan=False, steps=2).finalize()
+    assert old.G is None
+    q = tmp_path / "old.npz"
+    old.save(q)
+    assert "gap" not in np.load(q).files
+    assert distill.DemoBuffer.load(q).G is None
+
+
+def test_a_half_filled_gap_label_is_refused():
+    b = distill.DemoBuffer(range_max=10.0)
+    for t in range(3):
+        b.add(np.zeros((2, 8)), np.zeros(2), np.zeros((2, 2)), np.zeros(2, bool),
+              None, np.zeros(2) if t == 0 else None)
+    with pytest.raises(ValueError, match="gap label on 1 of 3"):
+        b.finalize()
+
+
+def test_speed_by_contention_splits_on_the_suites_own_range():
+    """The split that the first D3 buffer could not do, because it recorded no gap."""
+    b = distill.DemoBuffer(range_max=10.0)
+    # step 0: a car 5 m ahead (in contention); step 1: nothing within 40 m (clear)
+    b.add(np.zeros((1, 8)), np.zeros(1), np.array([[0.0, 2.0]]), np.zeros(1, bool),
+          None, np.array([5.0]))
+    b.add(np.zeros((1, 8)), np.zeros(1), np.array([[0.0, 6.0]]), np.zeros(1, bool),
+          None, np.array([40.0]))
+    b.finalize()
+    near, clear = b.speed_by_contention(within_m=12.0)
+    assert near.tolist() == [2.0] and clear.tolist() == [6.0]
+    # and a buffer with no gap label says so rather than returning an empty split
+    assert _filled(plan=False, steps=1).finalize().speed_by_contention() is None
+
+
+@pytest.mark.slow
+def test_the_gap_label_matches_the_suites_own_helper():
+    """Our per-step gap must mean what `overtake._wrapped_gaps` means, not a second convention."""
+    from f1sim.learn.benchmark.overtake import _wrapped_gaps
+    env, teacher, _t, _c = build()
+    env.reset()
+    rows = torch.nonzero(env.on_policy).flatten()
+    got = distill.nearest_gap(env, rows)
+    length = float(env.sim.track.length[env.sim.tid].max())
+    want = [min(r, key=abs) for r in
+            _wrapped_gaps(env.sim.s, env.sim.other_idx[rows], rows, length)]
+    assert np.allclose(got, np.asarray(want, dtype=np.float32), atol=0, rtol=0)
+    assert np.isfinite(got).all(), "race size > 1 should never give inf"

@@ -77,6 +77,16 @@ class DemoBuffer:
     the same seed, and with it, it means the same samples. It is 8 more fp32 per sample against
     1081 fp16, i.e. about 1.5% of the buffer, which is not a reason to make the comparison weaker.
     Buffers written before it existed load with `P = None`.
+
+    `G` is the THIRD label and exists for a question the first scored D3 cells raised: the student
+    reproduces the teacher's speed distribution faithfully (median 2.4 m/s against the published
+    weights' 4.2), and the solo suite turns that into timeouts. The obvious reading is that
+    demonstrations collected in a *race* carry traffic-limited speeds -- but the buffer that would
+    settle it recorded no opponent distance, so "the teacher was slowed by cars" and "this teacher is
+    simply conservative" fit the same numbers and cannot be separated after the fact. `G` is the
+    signed arc gap to the nearest opponent at the moment the label was produced (+ when it is ahead,
+    `inf` when the car is alone), so that split is available next time without a re-collection.
+    Buffers written before it existed load with `G = None`.
     """
     range_max: float
     scan: list = field(default_factory=list)
@@ -84,14 +94,17 @@ class DemoBuffer:
     label: list = field(default_factory=list)
     newep: list = field(default_factory=list)
     plan: list = field(default_factory=list)
+    gap: list = field(default_factory=list)
 
-    def add(self, scan_m, speed_mps, label, new_episode, plan=None):
+    def add(self, scan_m, speed_mps, label, new_episode, plan=None, gap=None):
         self.scan.append(np.asarray(scan_m, dtype=np.float16))
         self.speed.append(np.asarray(speed_mps, dtype=np.float32))
         self.label.append(np.asarray(label, dtype=np.float32))
         self.newep.append(np.asarray(new_episode, dtype=bool))
         if plan is not None:
             self.plan.append(np.asarray(plan, dtype=np.float32))
+        if gap is not None:
+            self.gap.append(np.asarray(gap, dtype=np.float32))
 
     def finalize(self):
         self.S = np.stack(self.scan)                    # (T, B, n_beams) fp16 metres
@@ -103,9 +116,13 @@ class DemoBuffer:
         if self.plan and len(self.plan) != len(self.scan):
             raise ValueError(f"plan label on {len(self.plan)} of {len(self.scan)} steps; "
                              "pass it on every step or on none")
+        if self.gap and len(self.gap) != len(self.scan):
+            raise ValueError(f"gap label on {len(self.gap)} of {len(self.scan)} steps; "
+                             "pass it on every step or on none")
         self.P = np.stack(self.plan) if self.plan else None   # (T, B, act_dim) teacher plan
+        self.G = np.stack(self.gap) if self.gap else None     # (T, B) signed arc gap, nearest opp
         self.T, self.B = self.S.shape[:2]
-        self.scan = self.speed = self.label = self.newep = self.plan = []
+        self.scan = self.speed = self.label = self.newep = self.plan = self.gap = []
         return self
 
     def __len__(self):
@@ -119,6 +136,8 @@ class DemoBuffer:
 
     def save(self, path):
         extra = {} if self.P is None else {"plan": self.P}
+        if self.G is not None:
+            extra["gap"] = self.G
         np.savez_compressed(path, scan=self.S, speed=self.V, label=self.L, newep=self.N,
                             range_max=np.float32(self.range_max), **extra)
 
@@ -128,8 +147,22 @@ class DemoBuffer:
         b = cls(range_max=float(d["range_max"]))
         b.S, b.V, b.L, b.N = d["scan"], d["speed"], d["label"], d["newep"]
         b.P = d["plan"] if "plan" in d.files else None
+        b.G = d["gap"] if "gap" in d.files else None
         b.T, b.B = b.S.shape[:2]
         return b
+
+    def speed_by_contention(self, within_m: float = 12.0):
+        """Label speed split by whether a car was within `within_m` of arc when it was produced.
+
+        `within_m` defaults to the suite's own `contention_range_m` (`benchmark/overtake.py:298`,
+        the env's `overtake_range`). Returns `(in_traffic, clear)` as two flat arrays, or None when
+        the buffer carries no gap label.
+        """
+        if self.G is None:
+            return None
+        sp = self.L[:, :, 1]
+        near = np.abs(self.G) <= float(within_m)
+        return sp[near], sp[~near]
 
 
 # --------------------------------------------------------------------------- collection
@@ -193,6 +226,25 @@ def drive_external(env, rows, cmd) -> None:
     env._ext_ids.update(int(i) for i in rows.tolist())
 
 
+def nearest_gap(env, rows):
+    """Signed arc gap from each learner row to its NEAREST opponent, + when the opponent is ahead.
+
+    `inf` where the car has no opponent (race size 1, or no `other_idx`), so "alone" is representable
+    rather than confusable with "a car exactly alongside". Read from the pre-step state, at the same
+    point the scan is captured, so it describes the situation the teacher's command answers.
+
+    Semantics are the suite's, reusing its own helper rather than a second wrapping convention:
+    `benchmark/overtake.py:_wrapped_gaps` = `wrap(s[other] - s[idx], length)`.
+    """
+    other = getattr(env.sim, "other_idx", None)
+    if other is None or int(getattr(env, "M", 1)) <= 1:
+        return np.full(rows.numel(), np.inf, dtype=np.float32)
+    from ..benchmark.overtake import _wrapped_gaps
+    length = float(env.sim.track.length[env.sim.tid].max())
+    g = _wrapped_gaps(env.sim.s, other[rows], rows, length)
+    return np.asarray([min(row, key=abs) if row else np.inf for row in g], dtype=np.float32)
+
+
 def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v_max: float,
             range_max: float, log=None, rng=None) -> DemoBuffer:
     """One DAgger iteration. `beta = 1` drives the teacher; below that the student drives.
@@ -217,6 +269,8 @@ def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v
     for t in range(steps):
         scan_m = (obs["scan"][rows, 0] * range_max).cpu().numpy().astype(np.float32)
         speed = (obs["speed"][rows, 0] * v_max).cpu().numpy().astype(np.float32)
+        # Pre-step, so it describes the situation the teacher's command below is answering.
+        gap = nearest_gap(env, rows)
         # The teacher's plan for every car. The opponents' own actions are overwritten inside
         # `step` by `_opponent_actions`; this only has to be right for the learner rows.
         plan = teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid, env.ecfg.v_max_policy,
@@ -256,7 +310,7 @@ def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v
         plan_label = plan[rows]
         if hasattr(plan_label, "cpu"):
             plan_label = plan_label.cpu().numpy()
-        buf.add(scan_m, speed, label, new_ep, np.asarray(plan_label, dtype=np.float32))
+        buf.add(scan_m, speed, label, new_ep, np.asarray(plan_label, dtype=np.float32), gap)
         new_ep = np.zeros(rows.numel(), dtype=bool)
         done_rows = None
         if "final" in info:
