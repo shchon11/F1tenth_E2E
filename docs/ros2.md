@@ -281,10 +281,12 @@ occupancy grid the same way a beam with no return is. Three things to know befor
   the reading it takes at rest — the sensor's own mounting misalignment, which no IMU can see from
   the inside — and without it the likelihood reads `floor.UNKNOWN` (0.5), which is below the
   threshold. "I cannot tell" must not be spelled the same way as "solid".
-* **it is not yet recommended on the car.** The gate's precision is bounded by the attitude error,
-  and measured (`docs/research/floor-mask-2026-09-15.md`) the best estimate a car can have is 3×
-  wider than the geometry needs. The flag exists so the comparison can be run, and the research note
-  says what it buys today, which is nothing.
+* **driven by the geometry, it is not recommended on the car and buys nothing.** The gate's
+  precision is bounded by the attitude error, and measured
+  (`docs/research/floor-mask-2026-09-15.md`) the best estimate a car can have is 3× wider than the
+  geometry needs. On the eight held-out proxy tracks it removes 0.32 % of returns and produces a lap
+  time identical to leaving the gate off on six of seven tracks. **Driven by the front-end it is a
+  different flag** — see below.
 
 `controller/clearance_floor_gated_frac` in the metrics says what share of returns it removed.
 
@@ -295,6 +297,14 @@ geometry reads 0.15 / 0.01, and on the real recordings its floor claims are 3.9�
 beams that end short of the map against the geometry's 1.9×. It needs no attitude to do it, which
 is the whole reason the geometric path is stuck. The front-end runs once per scan for the policy's
 own channels, so the gate costs nothing extra.
+
+**Measured, in simulation, with no training** (`docs/research/floor-mask-2026-09-15.md` §6): the
+front-end-driven gate removes 3.59 % of returns, gives back two thirds of the speed the floor was
+costing (0.345 → 0.114 m/s per step, the phantom brake rate more than halved) and is **faster on 8
+of 8 proxy tracks** — 12.89 → 12.38 s mean first-lap time, 4.0 %. The cost is a 0.51 pp rise in
+decisions the solid world asked for and the gate suppressed, a 0.9 mm fall in the true plan margin,
+and completions and collisions/km moving the wrong way by less than their sample noise. That is one
+checkpoint, one seed set and 128 trials, and it has never run on the real car.
 
 ### `attitude_source` — the quaternion is not the only option any more
 
