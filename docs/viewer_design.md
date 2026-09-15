@@ -86,6 +86,49 @@ read from the argv the process was started with and the log it already writes.
 
 See [Tracks](tracks.md) for the ids, the grammar and the splits.
 
+## 기본 vs 없음 in the 장애물 selector (2026-09-15)
+
+The 맵 card's 장애물 combo had one entry for "nothing added": `없음`. That is true of a measured
+floor or a generated layout, which carry no obstacles of their own. It is false of an editor scene,
+which carries whatever its author placed — so picking 없음 on a custom map produced a map full of
+boxes. The user said so:
+
+> 맵 고르고 장애물 정도 여부 선택할 때 없음을 선택하면 기본 맵이 되는데, 내가 커스텀해서 장애물을
+> 놨으면 그 맵 자체가 기본으로 나와서 장애물 없음이라는 말과 안맞아.
+
+One word was doing two jobs, so it is two entries now.
+
+| entry | id | what it builds | label on a scene with 3 placed obstacles |
+| --- | --- | --- | --- |
+| 기본 | *(none)* | the map as authored | `기본 (배치된 장애물 3개)` |
+| 없음 | `#bare` | the placed obstacles removed, walls only | `없음 (배치 장애물 제거)` |
+| the families | `#edge:*` … | added **on top** of whatever the map has | unchanged |
+
+On a map with nothing placed the two are the same track, so 기본 carries no count and 없음 is listed
+**greyed** with `이 맵은 배치 장애물이 없음 — '기본'과 같습니다.` in its tooltip. Greyed rather than
+hidden: "this map has nothing on it" is an answer, and removing the entry would leave 기본 looking
+like the only thing there is. Switching to such a map while 없음 is selected falls back to 기본
+rather than leaving a selection that means nothing.
+
+Beside the combo is **배치 장애물 먼저 제거**, enabled only when both halves of it are true — the map
+has placed obstacles, and a family is selected. It is the `+bare` composition: `scene:hall+bare+hard3`
+is "the author's boxes taken off, then the hard patterns put on", which is how a custom scene is used
+as a bare track for a family. With 기본 or 없음 selected the box is disabled and simply shows the
+state (unchecked / checked), because there it *is* the selection.
+
+The hint under the row changes with the choice: 기본 says the map is used as authored, 없음 says what
+it removes, and a family adds the one sentence the old label contradicted — *장애물 종류는 맵이 이미
+가진 것 위에 더합니다.* The session header names what was actually built (`장애물 없음`, or
+`장애물 기본 (3개)`), from the worker's facts rather than from the control's selection.
+
+The 학습 page's track picker is the same vocabulary as checkboxes — 기본 and 없음 are two boxes, and
+ticking both makes two variants of every selected map, which is what that row has always meant.
+
+One loader change came with it: `+props` used to *replace* a track's props, so `scene:hall+props3`
+quietly threw away the author's boxes as well. It adds now, and places the new ones clear of the old.
+Only an editor scene can arrive there carrying props, so that is the only kind of id whose meaning
+moved.
+
 ## The 상대차 table (2026-09-15)
 
 The 주행 page's 고급 설정 had one control for the other cars: a combo, `상대차 주행 방식`, with two
