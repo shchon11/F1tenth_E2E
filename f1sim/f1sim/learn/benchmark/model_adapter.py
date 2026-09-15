@@ -26,6 +26,14 @@ Four things this exists to get right, each of which has burned someone already:
 * **A cross-arm reference is declared, never inferred.** The frozen legacy original evaluated under
   the estimated controller is a deliberate reference; the same mismatch arising by accident is a
   defect. The entry says which it is.
+
+**External systems.** A roster entry may carry `kind: "tinylidarnet" | "end2race"` and `weights:`
+instead of an f1sim checkpoint. Those are the published baselines (`f1sim.learn.baselines`): they
+emit a steering angle and a speed and nothing else, so they run in `direct` action mode with **no
+plan tracker and no controller arm at all** -- `arm` must be the string `"none"`, and an external
+entry that names any real arm is refused rather than quietly given one. Their preprocessing is the
+driver's, which is the same object `f1sim_ros.baseline_node` drives on the car; the parity test
+between the two is therefore about the plumbing, not about two transcriptions of a paper.
 """
 from __future__ import annotations
 
@@ -79,9 +87,16 @@ class AdapterError(RuntimeError):
 
 # ------------------------------------------------------------------ loading
 def _arm_base(arm: str) -> str:
-    """The tracker arm underneath a possibly-composed name: `"fixed_low+tcs"` -> `"fixed_low"`."""
+    """The tracker arm underneath a possibly-composed name: `"fixed_low+tcs"` -> `"fixed_low"`.
+
+    `"none"` -- an external published baseline -- returns itself: it names the absence of a plan
+    tracker, so there is no base arm to find and `split_arm` would (correctly) refuse it.
+    """
     from f1sim.learn.grip_runtime import split_arm
-    return split_arm(str(arm or "legacy"))[0]
+    a = str(arm or "legacy")
+    if a == EXTERNAL_ARM:
+        return EXTERNAL_ARM
+    return split_arm(a)[0]
 
 
 def load_actor(entry: Dict[str, Any], device):
@@ -93,6 +108,9 @@ def load_actor(entry: Dict[str, Any], device):
     Strict loading is the point: the tolerant default lets a checkpoint migrate silently, and
     "the migration reinitialised a head" and "the arms differ" produce the same-looking results.
     """
+    if is_external(entry):
+        return load_external(entry, device)
+
     from f1sim.learn.model import controller_arm_of, load_checkpoint
     import torch
 
@@ -122,6 +140,119 @@ def load_actor(entry: Dict[str, Any], device):
     return model, extra
 
 
+#: The arm an external baseline runs under. Not a `grip_runtime` arm and deliberately not spelled
+#: `legacy` either: `legacy` means "our plan tracker with nothing installed on it", and these models
+#: never reach a plan tracker at all.
+EXTERNAL_ARM = "none"
+
+
+def is_external(entry: Dict[str, Any]) -> bool:
+    return bool((entry or {}).get("kind"))
+
+
+def external_spec(driver, *, v_max: float = 10.0) -> Dict[str, Any]:
+    """The ObsSpec an external baseline's cell is built on.
+
+    Minimal on purpose. These models read one scan (and, for End2Race, the measured speed), so the
+    stack is 1 deep, there is no action history worth keeping and no proprio history at all: every
+    extra channel is simulator work that nothing reads. What is NOT free to choose:
+
+    * `n_beams` and `range_max` are **this car's scanner**, not the driver's. Root's decision
+      (2026-09-15): the zero-shot rows feed End2Race our 270 deg scan mapped onto the 270 of its 360
+      bearings that a 270 deg scanner covers, with the other 90 filled -- they do not rebuild the
+      simulator's LiDAR as a 360 deg one. `driver.bind_scanner` is what performs that mapping, and
+      it is the same call `baseline_node` makes from a `LaserScan` header.
+    * `v_max` decides the action encoding. `gym_env.step` maps a normalised action to
+      `(a + 1) / 2 * v_max_policy`, so `v_max` has to be at least as large as any speed the model
+      commands or the encoding would saturate before the suite's own cap did. 10 m/s covers both
+      baselines' output ranges (TinyLidarNet tops out at 8 m/s by construction).
+    """
+    from f1sim.params import Config
+
+    lid = Config().lidar
+    return {"n_beams": int(lid.n_beams), "scan_stack": 1, "scan_stride": 1, "action_history": 1,
+            "act_dim": 2, "hist_len": 0, "hist_stride": 2, "range_max": float(lid.range_max),
+            "v_max": float(v_max), "gyro_scale": 5.0, "accel_scale": 10.0, "att_scale": 0.35}
+
+
+def load_external(entry: Dict[str, Any], device=None):
+    """One external roster entry -> `(driver, extra)`, in the shape the rest of this module expects.
+
+    `device` is accepted and ignored for ONNX (CPU execution provider, single thread -- see
+    `baselines/backends.py`) and passed through for torch. The simulator still runs wherever the
+    caller put it; a 220 k CNN and an 11 M GRU at batch 8 are noise next to one simulator step, and
+    a CPU session is deterministic across batch widths, which is what makes the node/adapter parity
+    claim exact rather than approximate.
+    """
+    from f1sim.learn import baselines
+
+    arm = str(entry.get("arm") or EXTERNAL_ARM)
+    if arm != EXTERNAL_ARM:
+        raise AdapterError(
+            f"external system {entry.get('system_id') or entry.get('kind')} declares arm {arm!r}. "
+            f"These models publish a steering angle and a speed directly; there is no plan for a "
+            f"tracker to follow and no solver for an arm to wrap, so the only honest declaration is "
+            f"arm={EXTERNAL_ARM!r}.")
+    weights = entry.get("weights") or entry.get("path")
+    if not weights:
+        raise AdapterError("an external entry needs `weights` (or `path`)")
+    opts = dict(entry.get("options") or {})
+    if str(entry["kind"]).lower() == "end2race":
+        opts.setdefault("device", str(device or "cpu"))
+    driver = baselines.load(entry["kind"], weights, **opts)
+    spec = external_spec(driver, v_max=float(opts.get("v_max", 10.0)))
+    driver.bind_scanner(n_beams=spec["n_beams"], fov=_lidar_fov(), range_max=spec["range_max"])
+    extra = {"spec": spec, "cap": None, "external": driver.describe(),
+             "experiment": {"controller": {"arm": EXTERNAL_ARM}}}
+    return driver, extra
+
+
+def _lidar_fov() -> float:
+    from f1sim.params import Config
+    return float(Config().lidar.fov)
+
+
+def external_policy(driver, spec: Dict[str, Any], s_max: float) -> Callable:
+    """`obs -> normalised action`, wrapping the same driver `baseline_node` runs.
+
+    Three conversions, and each is the inverse of something the environment does:
+
+    * `obs["scan"][:, 0]` is `range / range_max` clamped to [0, 1] (`gym_env._norm_scan`), so metres
+      come back by multiplying. Index 0 is the newest frame (`_step_math` prepends).
+    * `obs["speed"]` is `odom speed / v_max_policy` (`gym_env._obs`), the same VESC-modelled wheel
+      speed `/odom` carries on the car -- not a privileged ground-truth speed.
+    * the command goes back through `gym_env.step`'s `direct` mapping: `steer = a0 * s_max` and
+      `speed = min((a1 + 1) / 2 * v_max, speed_cap)`, so `a0 = steer / s_max` and
+      `a1 = 2 * speed / v_max - 1`. `step` clamps the action to [-1, 1] itself, which is exactly the
+      plant refusing a steering angle past its stop and refusing to drive backwards -- the same two
+      clips `baseline_node` applies before publishing, for the same reason.
+
+    The returned callable carries `.reset(done=None)`, so `runner.run_cell` clears the driver's
+    memory at the cell's seeded reset and per row at every episode boundary, exactly as it does for
+    one of our own recurrent checkpoints.
+    """
+    import numpy as np
+    import torch
+
+    range_max = float(spec["range_max"])
+    v_max = float(spec["v_max"])
+    s_max = float(s_max)
+
+    def policy(obs):
+        scan = obs["scan"]
+        ranges = (scan[:, 0] * range_max).detach().cpu().numpy().astype(np.float32)
+        speed = None
+        if driver.needs_speed:
+            speed = (obs["speed"][:, 0] * v_max).detach().cpu().numpy().astype(np.float32)
+        cmd = driver.command(driver.adapt(ranges), speed)
+        a = np.stack([cmd[:, 0] / s_max, 2.0 * cmd[:, 1] / v_max - 1.0], 1)
+        return torch.as_tensor(a, dtype=scan.dtype, device=scan.device)
+
+    policy.reset = driver.reset
+    policy.driver = driver
+    return policy
+
+
 def policy_for(model, batch: int = None) -> Callable:
     """`obs -> action`, deterministic, with no conditioning and no privileged input invented.
 
@@ -138,8 +269,14 @@ def policy_for(model, batch: int = None) -> Callable:
     For a feedforward checkpoint this is `model.act` and `.reset` does nothing, so the scores of
     every system already on the roster are untouched.
     """
+    from f1sim.learn.baselines import BaselineDriver
     from f1sim.learn.memory import policy_fn
 
+    if isinstance(model, BaselineDriver):
+        raise AdapterError(
+            "an external baseline needs `external_policy(driver, spec, s_max)`: its action encoding "
+            "depends on the cell's own v_max and the vehicle's steering limit, which a bare "
+            "`policy_for(model)` does not know.")
     return policy_fn(model, batch, device=next(model.parameters()).device, deterministic=True)
 
 
@@ -282,12 +419,19 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
     from f1sim.learn.graph_runtime import prepare_graph_runtime
 
     spec = dict(extra["spec"])
-    arm = str(entry.get("arm") or "legacy")
+    external = is_external(entry)
+    arm = str(entry.get("arm") or (EXTERNAL_ARM if external else "legacy"))
+    if external and arm != EXTERNAL_ARM:
+        raise AdapterError(f"external system declares arm {arm!r}; only {EXTERNAL_ARM!r} is possible "
+                           f"for a model that publishes a command instead of a plan")
+    if not external and arm == EXTERNAL_ARM:
+        raise AdapterError(f"arm {EXTERNAL_ARM!r} names the absence of a plan tracker, which only an "
+                           f"external baseline can declare; this entry has no `kind`")
     # `envs` in a cell is the number of LEARNERS. A race of M cars needs learners x M simulator
     # envs, because `race_size` slots every car into the same batch: passing 8 for a race of 2 gives
     # 4 scored cars, not 8, and the row's denominator would be half what the suite declared.
     learners = int(cell.get("envs", suite.get("envs", 8)))
-    speed_cap = float(suite.get("speed_cap", extra.get("cap", 9.0)))
+    speed_cap = float(suite.get("speed_cap") or extra.get("cap") or 9.0)
     sensor_noise = bool(suite.get("sensor_noise", True))
     race_size = int(cell.get("race_size", suite.get("race_size", 1)))
     envs = learners * race_size
@@ -330,7 +474,10 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
     step_dt = 1.0 / cfg.sim.control_rate
     steps = int(budget_steps(trs, speed_cap, step_dt, float(suite.get("budget_laps", 3)), 24000))
 
-    ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode="plan",
+    # `direct` for an external baseline: (steer, speed) straight into the plant, no PlanTracker
+    # built at all. `plan` for one of ours.
+    ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True,
+                     action_mode=("direct" if external else "plan"),
                      race_size=race_size, max_steps=steps,
                      opponent=opponent, opp_speed_range=opp_speed_range,
                      opp_events=opp_events, opp_event_rate=opp_event_rate,
@@ -378,7 +525,7 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
     holder = prepare_graph_runtime(env, log=lambda _t: None)
 
     controller = None
-    if arm != "legacy":
+    if arm not in ("legacy", EXTERNAL_ARM):
         from f1sim.learn import grip_runtime as grip_rt
         t0, phase0 = float(env.sim.t), int(getattr(env.sim, "_imu_phase", 0))
         try:
@@ -409,6 +556,12 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
     protocol = {
         "arm": arm, "trained_arm": str((extra.get("experiment") or {}).get("controller", {})
                                        .get("arm") or "legacy"),
+        "external": extra.get("external"),
+        "action_mode": str(ecfg.action_mode),
+        # Where it ran. CPU and CUDA do not produce bit-identical float arithmetic, and a rollout is
+        # chaotic enough for that to change an outcome, so two rows are only comparable when this
+        # agrees -- the same reason `source_digest` is on every row.
+        "device": str(getattr(env.sim, "device", device)),
         "cross_runtime": bool(entry.get("cross_runtime")),
         "map": cell["map"], "true_mu": float(cell["true_mu"]), "seed": int(cell["seed"]),
         "learners": learners, "envs": envs, "race_size": race_size,

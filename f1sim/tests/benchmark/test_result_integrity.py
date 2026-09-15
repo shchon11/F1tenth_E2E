@@ -455,11 +455,45 @@ def test_unpaired_start_is_refused_and_names_the_layer(rp, layer):
         _validate_pair(rp, _two_systems(bad))
 
 
-def test_mixed_obs_spec_is_refused_not_pooled(rp):
-    """Two systems can agree on every observation tensor and still expect different stacking."""
+def test_mixed_obs_spec_is_grouped_not_pooled(rp):
+    """Two systems can agree on every observation tensor and still expect different stacking.
+
+    Pooling them is the failure; refusing the whole table used to be the response, and it made the
+    comparison this benchmark now exists for impossible to render at all — a published end-to-end
+    baseline emits (steer, speed), so its `act_dim` is 2 and its previous-action channel is two wide
+    where a plan policy's is eight, and the two can never hash equal. They are reported as separate
+    layout groups instead, and the cross-system checks run within a group.
+    """
     bad = fingerprint(obs_spec_sha256="9" * 64)
-    with pytest.raises(rp.ReportError):
+    info = _validate_pair(rp, _two_systems(bad))
+    groups = info["obs_spec_groups"]
+    assert len(groups) == 2, groups
+    assert sorted(sum(groups.values(), [])) == ["sys", "sys2"]
+    assert all(len(v) == 1 for v in groups.values()), "the two layouts were pooled"
+
+
+def test_a_mixed_layout_still_has_to_have_started_in_the_same_world(rp):
+    """Grouping by layout must not smuggle in a different physical start."""
+    bad = fingerprint(obs_spec_sha256="9" * 64, physical_sha256="e" * 64)
+    with pytest.raises(rp.ReportError, match="physical_sha256"):
         _validate_pair(rp, _two_systems(bad))
+
+
+def test_one_system_may_not_change_layout_between_cells(rp):
+    """A system whose ObsSpec differs from cell to cell is a fault, not a second group."""
+    import copy as _copy
+    first = _two_systems()
+    second = _copy.deepcopy(first)
+    for r in second:                                   # a second declared cell, same two systems
+        r["seed"] = 4402
+        r["cell_id"] = "S:m:0.94401:4402"
+    # ... on which ONE of them suddenly expects a different observation layout
+    second[0]["result"]["start_fingerprint"] = fingerprint(obs_spec_sha256="9" * 64)
+    with pytest.raises(rp.ReportError, match="one system is one layout"):
+        rp.validate_results(first + second, suite_freeze="f" * 64,
+                            expected_systems={"sys", "sys2"},
+                            expected_trials={"S": 16},
+                            expected_cells=[Cell(), Cell(seed=4402)], roster=None, suite=Suite())
 
 
 # ---- a structurally empty or malformed fingerprint must never reach compare()

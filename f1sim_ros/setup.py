@@ -28,6 +28,7 @@ setup(
         "controller = f1sim_ros.controller_node:main",
         "eval = f1sim_ros.eval_node:main",
         "system_check = f1sim_ros.system_check_node:main",
+        "baseline = f1sim_ros.baseline_node:main",
         "pure_pursuit = f1sim_ros.pure_pursuit_node:main",
     ]},
 )

@@ -181,6 +181,59 @@ def clearance_step_ms(device="cpu", batch: int = 1, iters: int = 200, threads: i
             "protocol": protocol(iters, repeats, threads)}
 
 
+def baseline_step_ms(driver, iters: int = 200, threads: int = 1, repeats: int = 5) -> dict:
+    """Milliseconds per control step for a published baseline (`learn.baselines`), same PROTOCOL.
+
+    What is timed is a whole deployment control step of that model: the scan-window mapping
+    (`driver.adapt`, a no-op for TinyLidarNet on this car and a 1081 -> 1440 bearing interpolation
+    for End2Race) and then `driver.command`, which is its own beam selection, clipping/pressure
+    token, network forward and output mapping, with any recurrent state carried in and out. That is
+    the fair comparison with `actor_step_ms`, which times the extra scan channels plus
+    `Actor.step`; in both cases it is everything between the scan arriving and the command leaving,
+    and in both cases the critic is never timed because it does not run on the car.
+
+    The scan is a synthetic corridor rather than zeros or noise, for the same reason
+    `clearance_step_ms` uses one: an all-saturated scan is the cheapest input a branchy preprocessor
+    can be given, and neither of these models branches on content -- but the number is quoted
+    against the clearance arm's, which does.
+    """
+    import math
+
+    import numpy as np
+    from torch.utils import benchmark
+
+    torch.set_num_threads(threads)
+    src = driver.source or driver.bind_scanner(n_beams=1081, fov=4.71238898, range_max=10.0)
+    n = int(src["n_beams"])
+    ang = np.linspace(-0.5 * float(src["fov"]), 0.5 * float(src["fov"]), n)
+    r = np.full((1, n), float(src["range_max"]), dtype=np.float32)
+    for sgn in (1.0, -1.0):                                          # a 1.6 m corridor
+        sa = np.sin(ang) * sgn
+        t = np.where(sa > 1e-6, 0.8 / np.maximum(sa, 1e-6), 1e9)
+        r = np.minimum(r, t[None].astype(np.float32))
+    speed = np.array([3.0], dtype=np.float32) if driver.needs_speed else None
+
+    def adapt():
+        driver.adapt(r)
+
+    adapted = driver.adapt(r)
+
+    def command():
+        driver.command(adapted, speed)
+
+    def best(fn):
+        t_ = benchmark.Timer(stmt="f()", globals={"f": fn}, num_threads=threads)
+        return min(t_.timeit(iters).median for _ in range(max(1, repeats))) * 1e3
+
+    a_ms, c_ms = best(adapt), best(command)
+    d = driver.describe()
+    n_params = d["backend"].get("n_params") or (d["backend"].get("conversion") or {}).get("n_params")
+    return {"kind": d["kind"], "adapt_ms": a_ms, "command_ms": c_ms, "step_ms": a_ms + c_ms,
+            "n_params": n_params, "backend": d["backend"]["backend"],
+            "model_beams": d.get("model_beams"), "note": d["note"],
+            "protocol": protocol(iters, repeats, threads)}
+
+
 def measure(model, device="cpu", iters: int = 200, threads: int = 1, repeats: int = 5) -> dict:
     torch.set_num_threads(threads)
     out = dict(actor_step_ms(model, device=device, iters=iters, threads=threads, repeats=repeats))
@@ -225,6 +278,9 @@ def main(argv=None):
     ap.add_argument("--json", default="", help="also write the table here")
     ap.add_argument("--clearance", action="store_true",
                     help="also time the `clearance` controller arm's per-step cost (batch 1)")
+    ap.add_argument("--baselines", default="",
+                    help="also time published baselines: comma separated kind=weights pairs, e.g. "
+                         "tinylidarnet=/abs/tln.onnx,end2race=/abs/end2race.pth")
     a = ap.parse_args(argv)
 
     from .model import load_checkpoint, load_for_memory
@@ -290,11 +346,29 @@ def main(argv=None):
               f"bend + cap {clear['adjust_ms']:.3f} ms, total {clear['step_ms']:.3f} ms of the "
               f"25 ms step\n  {clear['cells']} cells, {clear['passes']} transform passes, "
               f"{clear['candidates']} candidate plans, {clear['n_beams']} beams")
+    ext = []
+    if a.baselines:
+        from . import baselines as bl
+        for item in [x.strip() for x in a.baselines.split(",") if x.strip()]:
+            kind, _sep, weights = item.partition("=")
+            if not _sep:
+                raise SystemExit(f"--baselines entry {item!r} is not kind=weights")
+            drv = bl.load(kind.strip(), weights.strip())
+            drv.bind_scanner(n_beams=1081, fov=4.71238898, range_max=10.0)
+            ext.append(baseline_step_ms(drv, iters=a.iters, repeats=a.repeats))
+        print(f"\npublished baselines (batch 1, the whole scan -> command path):")
+        print(f"{'model':16s} {'adapt ms':>9s} {'cmd ms':>9s} {'step ms':>9s} {'params':>10s} "
+              f"{'of 25 ms':>9s}  backend")
+        for r in ext:
+            npar = "?" if r["n_params"] is None else f"{r['n_params']:d}"
+            print(f"{r['kind']:16s} {r['adapt_ms']:9.3f} {r['command_ms']:9.3f} "
+                  f"{r['step_ms']:9.3f} {npar:>10s} {100 * r['step_ms'] / 25.0:8.1f}%  "
+                  f"{r['backend']}")
     if a.json:
         import json
         with open(a.json, "w") as f:
             json.dump({"protocol": proto, "baseline": a.baseline, "rows": rows,
-                       "clearance": clear}, f, indent=1)
+                       "clearance": clear, "baselines": ext}, f, indent=1)
         print("wrote", a.json)
     return 0
 

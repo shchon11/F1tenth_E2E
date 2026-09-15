@@ -433,6 +433,107 @@ The roster is a JSON object with a `systems` list pinning exactly which weights 
   build that input, so the score would not be comparable with any row that was taken without it —
   and unlike a controller arm there is no declaration that could make it comparable.
 
+### External systems: the published baselines
+
+A roster entry may pin a **published baseline** instead of one of our checkpoints. Those models
+(`f1sim.learn.baselines`) emit a steering angle and a speed and nothing else, so they run in the
+`direct` action mode with no plan tracker at all — which means they have no controller arm, and the
+entry has to say so:
+
+```json
+{
+  "system_id": "end2race@none",
+  "kind": "end2race",
+  "weights": "/abs/path/pretrained/end2race.pth",
+  "checkpoint_sha256": "…64 hex…",
+  "controller_arm": "none",
+  "options": {"scan_fill": 30.0},
+  "note": "arXiv 2509.16894, pretrained"
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `kind` | `tinylidarnet` or `end2race`. Its presence is what makes the entry external |
+| `weights` | the model file. An accepted spelling of `path`; every pin check (symlink, moving pointer, unresolved `latest`, sha) applies to it unchanged |
+| `controller_arm` | must be **`"none"`**. Not `legacy` — that means "our plan tracker, with nothing installed on it", which is a different system |
+| `options` | the driver's own options, and **part of the row identity** |
+
+`options` being part of the identity is the same rule as "the same weights under two arms are two
+systems": End2Race with the quarter of its scan this car cannot see filled at 30 m, and the same
+weights filled at 0 m, are two evaluated systems, and a roster that declared them with one
+`system_id` each but the same options is refused as a duplicate identity.
+
+What is refused, and why each one is a category error rather than a typo:
+
+- an external entry naming **any** real arm — there is no plan for a tracker to follow and no solver
+  for an arm to wrap;
+- `controller_arm: "none"` on an entry with no `kind` — only a baseline can declare the absence of a
+  plan tracker;
+- an **estimator pin** on an external entry — no arm, so no friction estimator either;
+- `cross_runtime` on an external entry — it declares a checkpoint evaluated under an arm it did not
+  train under, and there is no arm;
+- an unknown `kind`, and any roster field this loader would otherwise drop (a dropped field is a pin
+  nobody is checking).
+
+The cell such an entry builds differs from a checkpoint's in exactly three ways, all recorded in the
+row's `effective` block: `action_mode` is `direct`, there is no controller and no
+[routed tracker](#independence-of-the-opponent), and `external` carries what the driver actually was
+— its backend, beam count, clipping, speed mapping and, for End2Race, what filled the bearings this
+car cannot see.
+
+The routed tracker's absence is not a gap in the protocol. It exists because the plan path pushes
+every car's plan through one tracker object, so the candidate's arm would otherwise move the
+opponent. In `direct` mode there is no such object: the teacher opponents' commands are built from
+the raceline in `gym_env._opponent_actions:977-985` and touch nothing the candidate owns, so an
+external baseline cannot move its opponent even in principle.
+
+Scoring one is the ordinary command; nothing about the CLI changes:
+
+```bash
+python3 -m f1sim.learn.benchmark run --suite suite-v2.1.json --roster roster.json \
+    --system end2race@none --out cells --device cpu --lease --estimator /abs/estimator.pt
+```
+
+`effective.device` is on every row, and two rows are only comparable when it agrees: CPU and CUDA
+float arithmetic are not bit-identical and a rollout is chaotic enough for that to change an
+outcome.
+
+#### The same kind also pins *our* models, not only published ones
+
+The heading says "the published baselines" because that is what the kind was added for, but nothing
+in it is specific to a released weight file. A model of ours that emits a steering angle and a speed
+directly — a student trained on one of these architectures — is external by the same definition, and
+is pinned the same way. The fair-comparison arm is exactly this:
+
+```json
+{
+  "system_id": "tinylidarnet_raceline_dry_s701@none",
+  "kind": "tinylidarnet",
+  "weights": "/abs/path/d3/tinylidarnet_raceline_dry_s701_it7.pt",
+  "checkpoint_sha256": "…64 hex…",
+  "controller_arm": "none",
+  "options": {},
+  "note": "tinylidarnet architecture retrained on OUR demonstrations; their loss and optimiser at repo defaults"
+}
+```
+
+Three things differ in practice, none of them in the schema:
+
+- **The backend is torch, not ONNX**, chosen from the file, because a DAgger loop has to put the
+  student back in the car after every iteration. That changes the parity guarantee: a
+  single-threaded ONNX session is bit-identical across batch widths, and torch picks different
+  convolution kernels per width — measured at **7.2e-7** between width 1 and width 8. So a retrained
+  system meets the node↔adapter bar at **≤1e-5** rather than "bit-identical". At a *fixed* width it
+  is bit-identical run to run, which is what a cell needs, since a cell is always scored at one
+  width.
+- **Pin the immutable file.** Training writes `…_it7.pt` per iteration and rewrites `…_final.pt`; a
+  roster pinned to the latter changes meaning under a re-run even though the sha check passes at the
+  moment it is written. Pin the numbered file.
+- **`options: {}` is normal here.** The published entries carry a `speed_map` because their two
+  published mappings are both theirs and both had to be scored; a retrained model's mapping is
+  fitted from its own training labels and recorded on the checkpoint, so there is nothing to choose.
+
 ### Cross-runtime entries
 
 A checkpoint records the arm it trained under, and `cross_runtime` covers exactly one case:
