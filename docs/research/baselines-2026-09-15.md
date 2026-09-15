@@ -519,6 +519,12 @@ evidence that settles each:
 | the 144 car contacts are the price of the 165 passes | **REVERSED** (above) | 142 of 144 are in trials with **no pass at all**; passing trials end in car contact **2** times in 144 |
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
+**Every number in this table is recomputed from the raw per-cell records by
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — 29
+checks, all passing.** The corrections above replaced claims that drifted from their evidence with
+claims that are themselves numeric, and a number only a reader re-checks is a number that drifts the
+same way. If a row there ever fails, it is this note that is wrong, not the script.
+
 Design rationales — why the port is in PyTorch, why the ONNX session is single-threaded, why the
 label is `last_cmd_raw` — are not in this table. They are claims about code and are settled by the
 code and the tests, not by trial records.
