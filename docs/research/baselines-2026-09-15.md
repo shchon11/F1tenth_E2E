@@ -549,8 +549,8 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **43
-checks, all passing.** The corrections above replaced claims that drifted from their evidence with
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **54
+checks, all passing**, Table 2's rows included. The corrections above replaced claims that drifted from their evidence with
 claims that are themselves numeric, and a number only a reader re-checks is a number that drifts the
 same way. If a row there ever fails, it is this note that is wrong, not the script.
 
