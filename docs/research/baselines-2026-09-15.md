@@ -533,19 +533,28 @@ this suite.
 The 0.02 m median gap during a pass is also not evidence of recklessness, which is the other thing I
 would have read into it. On the traffic cells all four systems have finished, the median gap at the
 moment of a pass is **0.02 m for every one of them, ours included** — it is what the metric means,
-not a property of this driver. The number that does separate them runs the other way: median closest
-gap over *all* trials is **~1.2 m for TinyLidarNet and ~1.6 m for End2Race against ~0.1 m for both
-of ours** — an order of magnitude. The published baselines keep *further* from other cars than our
-policies do. They are not aggressive; they are oblivious, and obliviousness looks like distance
+not a property of this driver. The number that does separate them runs the other way. Over the **complete** traffic family, 80
+cells paired across all four systems:
+
+| median closest gap over all trials | |
+| --- | ---: |
+| End2Race | **1.40 m** |
+| TinyLidarNet-L | **0.86 m** |
+| frozen original `@legacy` | 0.07 m |
+| A701 `@fixed_low` | 0.06 m |
+
+The published baselines keep *further* from other cars than our policies do — by more than an order
+of magnitude. They are not aggressive; they are oblivious, and obliviousness looks like distance
 until the gap closes on its own.
 
-Those decimals are deliberately soft, and why is a small object lesson in the same failure this
-section is about. The figure is paired over the traffic cells all four systems have finished, and
-**that set grows while the v2.1 lanes run**: frozen `@legacy`'s median moved 0.11 → 0.10 in the
-twenty minutes between my writing this paragraph and first running `claim_check.py` over it, and the
-paired set went from 26 cells to 39. The order-of-magnitude separation is stable under the set
-changing; the second decimal is not. So the script pins the separation and a 5× ratio, and refuses
-to pin decimals that are not settled until the rows are complete.
+Getting those four numbers right took a guard rather than care. When I first wrote this paragraph I
+had **~1.2 m and ~1.6 m against ~0.1 m** from a *partial* set, because the figure is paired over the
+cells all four systems have finished and that set grows while the lanes run — 26 cells, then 39,
+then 80. TinyLidarNet's median read 1.19 and settles at **0.86**; frozen `@legacy`'s moved 0.11 →
+0.10 → **0.07**. `claim_check.py` refused to pin the decimals while they were moving, pinned only
+the separation, and then **failed** the moment the last row landed and the value settled outside the
+bound it had been given. That failure is the whole point of it: a number that drifts silently in a
+research note is exactly what this section is about.
 
 The four scenarios separate the way you would expect if the opponent is being treated as scenery —
 best against a `slow` car (24/160), worst when there are two of them (`pair`, 16/160):
@@ -612,7 +621,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **95
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **120
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
