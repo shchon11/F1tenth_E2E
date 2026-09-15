@@ -230,10 +230,24 @@ its own four-arm comparison, which makes the two branches' proxy numbers commens
 ### Making "one difference" true
 
 An arm that differs by an input width does not differ only by an input width, and three separate
-things had to be fixed before this comparison meant what it says. All three are under
-`--name-seed-fresh`, and the check that they worked is that **A0 and A3 log identical rollouts for
-their first two updates** — which is what "the block's input columns are zero at init" has to mean,
-and which no amount of reading the code proves.
+things had to be fixed before this comparison meant what it says. All three are under `--name-seed-fresh`.
+
+What that buys, stated exactly, because the loose version is tempting and wrong:
+
+* **The block cannot change the action at initialisation, bit-for-bit.** Feed an arm two completely
+  different token blocks and `torch.equal` holds on the action
+  (`tests/test_opp_token.py::test_the_new_proprio_columns_are_zero_and_cannot_move_the_action`).
+  That is exact, because `0 * x = 0` exactly for finite `x`.
+* **The arms' training trajectories are NOT identical, and cannot be.** A wider proprio layer is a
+  wider GEMM and a GEMM reassociates its sum, so the *original* columns come out ~1e-9 different --
+  the block contributes mathematically nothing and numerically a different rounding. Measured at
+  warm start: |Δaction| ≤ 1e-7 on a [−1, 1] action, |Δvalue| ≤ 1e-6. PPO is chaotic, so 1e-9 is
+  enough. A0 and A1 agree on **every logged rollout metric at update 1**, their *losses* already
+  differ there, and by update 2 the rollouts have diverged.
+
+So the arms are one experiment with one difference; they are not one trajectory. That is the usual
+situation for any two seeds of one recipe, and it is why the comparison is read against a measured
+resolution (`work/decide.md`) rather than against trajectories matching.
 
 1. **The modules a warm start leaves fresh.** A wider first layer has more parameters, so it draws
    more numbers from the ambient generator, so the GRU built after it differs. Each fresh module is
@@ -303,8 +317,10 @@ VERDICT_SECTION
   follow cap. The horizon at which A3 is told something new is between 0.10 and 0.25 s.
 * *The four arms differ by their input width and nothing else.* Fresh modules seeded from their own
   names, the ambient generator re-seeded after the model is built, and the widened layers' Adam
-  moments carried across the same column insert as the weights -- with all three, **A0 and A3 log
-  identical rollouts for their first two updates**.
+  moments carried across the same column insert as the weights. The block's contribution to the
+  action at init is **exactly** zero (bit-exact, tested); the arms' *trajectories* diverge from the
+  first update regardless, because a wider GEMM reassociates its sum at ~1e-9 and PPO is chaotic.
+  Not fixable, and the reason the comparison is read against a measured resolution.
 * *`--opp-token off` is the run it was.* No module, no RNG draw, no proprio column; the frozen loss
   oracle (`tests/data/ppo_loss_oracle.json`) is bit-identical.
 * *An oracle checkpoint cannot reach a car.* Six independent refusals, two of which are tested
