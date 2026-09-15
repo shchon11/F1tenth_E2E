@@ -274,5 +274,32 @@ direct-output policy commands the intended angle and the actuator delivers it th
 while a plan policy has that gain cancelled by the tracker. That is one of the runtime layers this
 comparison is about, not an accident of the label.
 
+### What this table can and cannot settle, with the tree as it is today
+
+`feat/interactive-teacher` has not merged, so two of the four rows the contract asks for are not the
+rows it asks for, and saying which is which matters more than the numbers:
+
+| contract's row | here |
+| --- | --- |
+| End2Race architecture, our teacher's demonstrations | **as asked**, with the teacher named on the checkpoint |
+| TinyLidarNet architecture, same demonstrations | **as asked**, same |
+| ours: worker 17's D3 LiDAR-only student | **not available** — it is on the unmerged branch and had not started training. A701 stands in |
+| "ours, policy only" (legacy arm, no clamp) | A701 `@legacy` — the same weights with the plan tracker untouched |
+
+So the comparison this table *does* settle cleanly is **architecture against architecture**:
+TinyLidarNet's 1-D CNN and End2Race's pressure-token GRU, on bit-identical iteration-0
+demonstrations from one expert, through one sensor, under one evaluation, each with its own loss.
+The comparison against *ours* is weaker than the contract intends, because A701 is a PPO policy and
+not a student distilled from the same expert — it shares the evaluation and the sensor but not the
+data. It is labelled that way in every table and it is not called a controlled comparison.
+
+What closes the gap, in order: (1) `feat/interactive-teacher` merges, (2) re-run the collection with
+`--teacher interactive` — one flag, nothing else changes — and (3) put worker 17's own D3 student in
+the "ours" row. One further change is wanted for (3) to be an *identical-data* comparison rather
+than an identical-protocol one: `DemoBuffer` should carry the teacher's **plan** action beside its
+tracked command, so a plan-space student can be trained from the very same buffer instead of a
+re-collection. It is eight more floats per sample and it is deliberately not being added while the
+dry runs are in flight.
+
 <!-- D3 TABLE: filled when the runs finish -->
 
