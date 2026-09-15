@@ -761,6 +761,19 @@ def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
             f"lab_oracle={bool(cond_meta.get('lab_oracle'))}). It cannot be run without an explicit "
             f"conditioning input, and a lab-oracle arm's input is privileged and does not exist on "
             f"the car. Pass allow_conditional=True only from a caller that supplies it.")
+    import inspect
+    known = set(inspect.signature(ActorCritic.__init__).parameters) - {"self"}
+    unknown = sorted(k for k in meta if k not in known)
+    if unknown:
+        hint = ""
+        if "opp_token" in unknown:
+            hint = (" 'opp_token' marks a privileged-opponent (oracle) checkpoint from the oracle-planner "
+                    "experiment: it needs the simulator's true opponent state as an input and cannot be "
+                    "driven by the console, the exporter or the ROS node; the A0 control arm (opp_token off) "
+                    "has no such key and loads normally.")
+        raise ValueError(
+            f"{os.path.basename(str(path))} was saved by a newer or different branch: its meta has "
+            f"field(s) this tree's ActorCritic does not know {unknown}.{hint}")
     m = ActorCritic(**meta).to(device)
     sd = m.state_dict(); skipped = []
     for k_, v in ck["state_dict"].items():
