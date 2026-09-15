@@ -177,5 +177,38 @@ controller arm are on top, and they are exactly the runtime the fair comparison 
 this is a desktop CPU, not the Jetson — the ratio is the transferable part, the absolute number is
 not.
 
+## Before the table: is End2Race's failure an integration mistake?
+
+The zero-shot End2Race rows read 0 successes, and a number like that has to be separated from a
+wiring error before it is reported. Two conventions were checked first and agree between the two
+simulators, so neither can be it: beam 0 is the **rightmost** beam in both
+(`f1sim/lidar.py:141` against `f1tenth_gym/.../laser_models.py:165-175`), and a positive steering
+angle is a **left** turn in both (`psi_dot = v/lwb · tan(delta)`, `dynamic_models.py:120`; measured
+on ours as +1.01 rad of yaw over 20 steps of +0.8 normalised steer).
+
+Then the same cell was driven five ways (`work/baselines/scripts/e2r_probe.py`, `gen:control:9100`,
+µ = 0.944, 8 cars, a **57 m** lap, 600 steps):
+
+| | per-car progress [m] | survived | mean commanded speed |
+| --- | --- | ---: | ---: |
+| **A** our 270° scanner, unseen 90° filled at 30 m (the reference row) | 27 38 15 34 34 28 0 29 | 0/8 | 5.88 m/s |
+| **B** our 270° scanner, unseen 90° filled at 0 m (their masking value) | **53 50 54 58 52** 6 1 **54** | 0/8 | **3.65 m/s** |
+| **C** *their own* scanner: 1440 beams, 360°, 30 m — nothing filled | 26 7 16 34 12 6 0 29 | 0/8 | 5.35 m/s |
+| **D** C with sensor noise off, as their gym has it | 26 7 16 34 12 28 0 29 | 0/8 | 5.32 m/s |
+| **E** C at their 100 Hz recurrence against our 40 Hz plant | 26 8 16 34 12 6 0 29 | 0/8 | 5.44 m/s |
+
+**C is the answer to the question.** Handing End2Race the exact scanner its repository builds —
+1440 beams over a full circle out to 30 m, with no substituted bearings anywhere — does not help;
+it is slightly *worse* than the filled 270° version. So the missing quarter of the scan is not what
+is wrong, and neither is our sensor noise (D) nor the recurrence rate (E, which moves nothing).
+
+What does move is **B**: told that the bearings behind it are a wall rather than open space, the
+model slows from 5.9 m/s to 3.7 m/s and five of eight cars get within a few metres of completing a
+57 m lap. The network is not broken and the integration is not wrong — it is commanding a speed
+calibrated for the tracks it learned on. Its demonstrations came from a lattice planner on
+f1tenth_racetracks circuits (Austin, Hockenheim, MoscowRaceway, Nürburgring), which are several
+hundred metres round; six metres per second into a corner of a 57 m lap is the sim-to-sim gap
+CONTRACT.md asks to be stated plainly, and this is it, measured.
+
 <!-- TABLES: filled when the suite finishes -->
 

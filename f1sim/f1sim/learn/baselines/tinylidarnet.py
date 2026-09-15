@@ -189,6 +189,12 @@ def load(weights: str, *, skip_n: int | None = None, speed_map: str = "sim", thr
             speed_map = "fitted"
         if skip_n is None and meta.get("skip_n"):
             skip_n = int(meta["skip_n"])
+    elif str(weights).endswith((".h5", ".keras", ".tflite")):
+        # CONTRACT.md's first branch, implemented rather than assumed absent. In this venv the
+        # import fails and the message points at the conversion; the ONNX it produces is checked
+        # against TensorFlow's own outputs on 100 real bag scans.
+        from .backends import KerasBackend
+        backend = KerasBackend(weights, threads=threads)
     else:
         backend = OnnxBackend(weights, threads=threads)
     if skip_n is None:

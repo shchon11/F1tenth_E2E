@@ -92,6 +92,73 @@ class OnnxBackend:
                        "with tf2onnx and is run through onnxruntime"}
 
 
+class KerasBackend:
+    """TinyLidarNet's `.h5` (or `.tflite`) through TensorFlow, when TensorFlow is importable.
+
+    CONTRACT.md's first branch: *"load in TF if available, otherwise convert to ONNX once"*. It is
+    implemented rather than assumed absent, so `describe()["backend"]` is a fact about what ran and
+    not about what was installed on one machine. In this project's venv the import fails and
+    `tinylidarnet.load` takes the ONNX branch; `work/baselines/scripts/tln_to_onnx.py` is the
+    "once", and the conversion is checked against TensorFlow's own outputs on 100 real bag scans.
+
+    Not used for training: the fair-comparison arm rebuilds the same architecture in PyTorch
+    (`tinylidarnet_torch.py`) and proves it reproduces these weights first.
+    """
+
+    def __init__(self, path: str, threads: int = 1):
+        import os as _os
+
+        _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+        try:
+            import tensorflow as tf
+        except ImportError as exc:                                     # pragma: no cover
+            raise BaselineError(
+                f"{path} is a TensorFlow model and TensorFlow is not importable here. Convert it "
+                f"once with work/baselines/scripts/tln_to_onnx.py and pass the .onnx instead -- "
+                f"installing TensorFlow into this venv would repin protobuf and numpy under other "
+                f"jobs sharing it.") from exc
+        if not _os.path.exists(path):
+            raise BaselineError(f"model does not exist: {path}")
+        self.path = _os.path.abspath(path)
+        self.sha256 = sha256_file(self.path)
+        self.version = tf.__version__
+        self.threads = int(threads)
+        self.provenance = None
+        self.tflite = self.path.endswith(".tflite")
+        if self.tflite:
+            self._interp = tf.lite.Interpreter(model_path=self.path)
+            self._interp.allocate_tensors()
+            self._in = self._interp.get_input_details()[0]
+            self._out = self._interp.get_output_details()[0]
+            self.input_shape = [int(d) for d in self._in["shape"]]
+            self._model = None
+        else:
+            self._model = tf.keras.models.load_model(self.path, compile=False)
+            self.input_shape = [None if d is None else int(d) for d in self._model.input_shape]
+            self._interp = None
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        if self._model is not None:
+            return np.asarray(self._model(x, training=False))
+        # TFLite freezes the batch at 1 unless resized; resize rather than loop, and only when the
+        # width actually changes, because `allocate_tensors` is not free.
+        if int(self._in["shape"][0]) != x.shape[0]:
+            self._interp.resize_tensor_input(self._in["index"], list(x.shape))
+            self._interp.allocate_tensors()
+            self._in = self._interp.get_input_details()[0]
+            self._out = self._interp.get_output_details()[0]
+        self._interp.set_tensor(self._in["index"], x)
+        self._interp.invoke()
+        return self._interp.get_tensor(self._out["index"])
+
+    def describe(self) -> dict:
+        return {"backend": "tensorflow" + ("/tflite" if self.tflite else "/keras"),
+                "version": self.version, "providers": ["CPU"], "threads": self.threads,
+                "path": self.path, "sha256": self.sha256, "input_shape": self.input_shape,
+                "conversion": None,
+                "why": "TensorFlow was importable, so the Keras model is loaded natively"}
+
+
 class TorchBackend:
     """A `torch.nn.Module` from the vendored repo, with the published `state_dict` loaded strictly.
 

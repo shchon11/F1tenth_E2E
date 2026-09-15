@@ -34,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 EXTERNAL = os.path.join(os.path.expanduser("~"), "F1tenth", "F1tenth_E2E", "external", "baselines")
 TLN_REPO = os.path.join(EXTERNAL, "TinyLidarNet")
+TLN_H5 = os.path.join(TLN_REPO, "Models", "f1_tenth_model.h5")
 E2R_REPO = os.path.join(EXTERNAL, "End2Race")
 #: Converted once by `work/baselines/scripts/tln_to_onnx.py`; see `baselines/backends.py` for why.
 MODELS = os.path.join(os.path.expanduser("~"), "Documents", "Codex", "2026-09-10", "new-chat",
@@ -167,6 +168,30 @@ def test_tinylidarnet_output_mapping_matches_vendored_plan():
         mine_speed = tln_mod.linear_map(np.float32(raw[0][1]), 0.0, 1.0, *tln_mod.SPEED_MAPS["sim"][:2])
         assert theirs[0] == pytest.approx(raw[0][0], abs=1e-7)          # steer is radians, unmapped
         assert theirs[1] == pytest.approx(float(mine_speed), abs=1e-5)
+
+
+def test_the_tensorflow_branch_exists_and_says_which_one_ran():
+    """CONTRACT.md: "load in TF if available, otherwise convert to ONNX once ... record which".
+
+    Both halves are pinned here. In this venv TensorFlow is not importable, so a `.h5` is refused
+    with the conversion in the message rather than silently falling back, and the ONNX driver's
+    `describe()` names onnxruntime and carries the conversion's provenance. (The TF branch itself is
+    exercised where TF exists -- `work/baselines/venv-tf` -- and reproduces the same commands; that
+    is what `tests/data/tln_tf_reference.json` is.)
+    """
+    if not os.path.exists(TLN_H5):
+        pytest.skip("TinyLidarNet is not vendored")
+    try:
+        import tensorflow                                              # noqa: F401
+    except ImportError:
+        with pytest.raises(baselines.BaselineError, match="tln_to_onnx"):
+            baselines.load("tinylidarnet", TLN_H5)
+    d = baselines.load("tinylidarnet", TLN_ONNX)
+    b = d.describe()["backend"]
+    assert b["backend"] == "onnxruntime"
+    assert b["conversion"]["source"].endswith("f1_tenth_model.h5")
+    assert b["conversion"]["n_params"] == 220686
+    assert b["threads"] == 1, "a multi-threaded session reorders reductions; parity is checked to 1e-5"
 
 
 def test_tinylidarnet_speed_maps_are_the_two_upstream_ones():
