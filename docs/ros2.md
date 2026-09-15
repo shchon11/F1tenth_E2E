@@ -305,7 +305,18 @@ yaw and the accelerometer, with the wheel-lock windows held rather than believed
 
 ```bash
 ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p attitude_source:=ego
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p attitude_source:=frontend
 ```
+
+`frontend` is the most accurate of the three where it is available — measured 0.017 / 0.016 rad
+against the ego path's 0.019 / 0.022 and the quaternion's 0.144 / 0.091, and **below the 0.0205 rad
+floor that bounds every estimate built from the IMU or the drivetrain**, because the two terms that
+set that floor (the road-tilt process and the LiDAR's own mounting offset) are invisible to an IMU
+and visible in the scan. It needs a checkpoint that declares a front-end channel, and it carries one
+control step of lag: the network reads the scan stack that `ObsBuilder.build` is about to produce,
+so the estimate available when the observation is assembled is the one made 25 ms ago — on a
+quantity whose own process has a 0.4 s time constant. Until the first scan has been through it, the
+ego-state estimate stands in.
 
 **`vesc` stays the default and should**, until a checkpoint has been finetuned against the other
 columns: every trained policy saw the quaternion in training, and swapping what two of its
@@ -379,7 +390,7 @@ State changes are logged at INFO with the numbers behind them:
 | `controller` | `fixed_low` | `legacy`, `fixed_low`, `clearance`, `fixed_low+clearance`. Anything else — the simulator's `oracle` / `estimated` / `+tcs` arms — is refused rather than silently downgraded |
 | `clearance_margin` | `0.0` | body-edge margin for a `+clearance` arm, in metres; `0.0` means the module default (0.20 m) |
 | `clearance_floor_gate` | `false` | leave likely-floor returns out of the clearance grid (see above). Off is byte-identical to the arm without it |
-| `attitude_source` | `vesc` | where the policy's roll/pitch observation columns come from. `vesc` is the orientation quaternion this node has always read; `ego` is `f1sim.learn.floor.EgoStateAttitude` — see below |
+| `attitude_source` | `vesc` | where the policy's roll/pitch observation columns come from: `vesc` (the orientation quaternion this node has always read), `ego` (`f1sim.learn.floor.EgoStateAttitude`) or `frontend` (the learned front-end's own estimate) — see below |
 | `traction` | `off` | `off` installs nothing at all; `on` installs the replay-validated guard. Anything else is refused |
 | `traction_params` | `""` | `NAME=VALUE` pairs (comma or space separated) overriding any field of `TractionParams` — every threshold above is reachable from the launch line |
 

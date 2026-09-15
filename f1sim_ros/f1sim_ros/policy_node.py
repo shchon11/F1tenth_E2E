@@ -328,8 +328,14 @@ class PolicyNode(Node):
         #: own observation (`attitude_source:=ego`) or a front-end channel the checkpoint declares
         #: -- and advanced every scan so those two cannot see different attitudes.
         self.att_source = str(p("attitude_source"))
-        if self.att_source not in ("vesc", "ego"):
-            raise ValueError(f"attitude_source must be 'vesc' or 'ego', got {self.att_source!r}")
+        if self.att_source not in ("vesc", "ego", "frontend"):
+            raise ValueError(f"attitude_source must be 'vesc', 'ego' or 'frontend', got "
+                             f"{self.att_source!r}")
+        if self.att_source == "frontend" and getattr(self.policy_state, "scan", None) is None:
+            raise ValueError(
+                "attitude_source:=frontend needs a checkpoint that declares a front-end channel "
+                "(meta['scan_channels'] with fe_floor / fe_range): the estimate is one of that "
+                "network's outputs and there is nothing to read without it.")
         from f1sim.learn import floor as _floor
         self.ego_att = _floor.EgoStateAttitude(1, device=self.device, dt=1.0 / float(CONTROL_RATE),
                                                source="wheel")
@@ -527,10 +533,11 @@ class PolicyNode(Node):
         out = []
         if self.t_imu_mean is None or now - self.t_imu_mean > self.timeout:
             out.append("imu")
-        if self.att_source != "ego" and (self.t_att is None or now - self.t_att > self.timeout):
-            # With `attitude_source:=ego` there is no quaternion in the loop at all, so its absence
-            # is not a reason to stop driving. The signals the ego path needs -- the wheel speed
-            # and the IMU -- are already checked by the `odom` and `imu` clauses above.
+        if self.att_source == "vesc" and (self.t_att is None or now - self.t_att > self.timeout):
+            # With `attitude_source:=ego` or `:=frontend` there is no quaternion in the loop at
+            # all, so its absence is not a reason to stop driving. The signals those paths need --
+            # the wheel speed, the IMU and the scan -- are already checked above and by the
+            # watchdog.
             out.append("attitude")
         if self.t_odom is None or now - self.t_odom > self.timeout:
             out.append("odom")
@@ -672,6 +679,17 @@ class PolicyNode(Node):
                 torch.as_tensor(imu_mean[3:], dtype=torch.float32, device=self.device)[None])
             if self.att_source == "ego":
                 att = (float(rp[0, 0]), float(rp[0, 1]))
+            elif self.att_source == "frontend":
+                # The front-end reads the scan stack, and the stack is what `obs.build` below
+                # produces -- so its estimate for THIS scan does not exist yet. What is available is
+                # the one it made for the previous scan, 25 ms ago, and that is what is used: one
+                # control step of lag on a quantity whose own process has a 0.4 s time constant.
+                # Until the first scan has been through the network there is none, and the
+                # ego-state estimate stands in.
+                fe = getattr(getattr(self.policy_state, "scan", None), "fe", None)
+                last = None if fe is None else fe.last_att
+                att = ((float(last[0, 0]), float(last[0, 1])) if last is not None
+                       else (float(rp[0, 0]), float(rp[0, 1])))
         scan, pro = self.obs.build(r, self.v, imu_mean, att, self.speed_cap)
         if self.clearance is not None:
             self._check_scan_geometry(m)
