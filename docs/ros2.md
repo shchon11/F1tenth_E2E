@@ -307,10 +307,16 @@ eight held-out proxy tracks, 128 cars, against the arm's own decision on the sol
 | … phantom **brakes** | 3.02 % | 0.19 % | **0.56 %** |
 | speed removed for no solid reason | 0.246 m/s | 0.011 | 0.035 |
 | `lost` — a solid decision the gate suppressed | 0.15 % | 0.62 % | **0.28 %** |
-| plans below zero margin on the solid grid | 7.92 % | 8.19 % | 8.27 % |
-| collisions / km | 36.53 | 37.26 | **35.06** |
+| collisions / km | 36.53 | 37.26 | 35.06 |
 | mean first-lap time | 12.89 s | 12.38 s | **12.11 s** |
 | tracks faster than gate-off | — | 8 of 8 | **8 of 8** |
+
+**Read those columns against the proxy's own resolution**, which is the row that matters most here:
+the *same* gate-off arm run again on a second seed moves by **25 completions of 128**, 1.38
+collisions/km and 0.40 pp of below-zero solid margin, while its mean first-lap time moves **0.06 s**.
+So the lap-time win is 13× the noise and is further supported by being paired (same tracks, same
+seeds, 8 of 8 faster, sign test p = 0.004) — and the completion and collision columns above are
+beneath the noise and should not be read as either a cost or a benefit.
 
 `clearance_floor_gate_mode` picks which decision the gate may touch, and **`brake` is the default**:
 it may remove floor returns from the speed cap, and the bend still sees every return. That is the
@@ -320,12 +326,11 @@ collisions/km of any including gate-off, and suppresses a third as many wanted d
 both, while still removing 81 % of the phantom brakes. `clearance_floor_gate_mode:=both` is the
 documented alternative.
 
-The cost line, stated rather than rounded off: the share of plans whose clearance on the **solid**
-grid is below zero rises from 7.92 % to about 8.2 %, and it rises by the same amount for every
-gated variant tried, including one that gates only 1.6 % of returns. Mean speed is within 0.3 %
-across all of them, so that is not a faster car keeping less room. Completions were 46 / 43 / 43 of
-128, which is inside the proxy's own seed-to-seed spread. One checkpoint, one seed set, 128 trials,
-and it has never run on the real car.
+The cost line, stated rather than rounded off: the only cost this proxy can resolve is `lost` —
+decisions the solid world asked for and the gate suppressed — which is why brake-only ships and
+gating both decisions does not. **At 128 trials the proxy cannot see a safety cost from the gate,
+and that is not the same as there being none.** One checkpoint, one seed set, and it has never run
+on the real car.
 
 ### `attitude_source` — the quaternion is not the only option any more
 
