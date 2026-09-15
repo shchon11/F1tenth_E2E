@@ -781,6 +781,11 @@ monitor parses the trainer's own `upd k/N …` lines -- from that log, or from a
 checkpoints, and *주행 화면에서 보기* makes one the driving page's next start. *중지* sends SIGINT
 (the last periodic checkpoint is what remains) and SIGTERM on a second press after 12 s.
 
+From there, *녹화* on the driving page writes an mp4 of that checkpoint driving — the whole path from
+a run in this list to a clip of it is 주행 화면에서 보기 → 시작 → 녹화, with no script and no headless
+render. It is the same encoder `--record` uses; see [viewer design](viewer_design.md) for the form and
+`f1sim/viewer/recorder.py` for the pipe.
+
 PyQt5 is **not** in the `[viewer]` extra (which is `moderngl`, `glfw`, `trimesh`) and nothing here
 installs it; if it is missing the console says so and points at `--legacy-launcher`, the older Tk
 picker. Importing `f1sim.learn.watch` for a headless run does not import Qt, so the recording paths

@@ -178,6 +178,69 @@ slot; `SessionConfig.opponent_slots` carries the table, so 세션 저장/불러�
 viewport's rival colouring and the 정책 입·출력 panel are untouched — they read `sim.other_idx` and the
 focus car, neither of which a slot table moves — and the ROS 2 link still drives car 0 only.
 
+## 녹화 and 스크린샷 (2026-09-15)
+
+Recording existed only headless — `python -m f1sim.learn.watch --record out.mp4 --seconds N`, three
+copies of the same ffmpeg pipe inside `watch.main`. The user asked for it where the driving is:
+
+> 비디오 렌더러 스크립트같은거 있는것 같은데 이거 좀 비쥬얼라이져 기본 기능에 넣어놔라.
+
+There is one implementation now (`viewer/recorder.py`) and the 주행 page is a caller of it.
+
+### The 녹화 card
+
+| control | what it does |
+| --- | --- |
+| 저장 폴더 | default `~/f1sim_videos`; the file is named `<map>_<time>.mp4` |
+| 해상도 | 720p / 1080p / 현재 창 크기 — **an offscreen render, so the window's size is not the clip's** |
+| 프레임 | 24 / 30 / 60 fps; 30 is what the headless recorder has always used |
+| 카메라 | 현재 카메라, or one of the five — the clip only, the window is left alone |
+| 길이 | seconds, or 수동 정지 |
+| 오버레이 포함 | LiDAR dots, the raceline, car labels — the clip only |
+| 인코더 | 자동 (GPU 우선) / h264_nvenc / libx264 |
+
+`● 녹화 시작` is in the card and again in the control bar under the picture (and on **R**), because
+starting a recording is something you do while watching rather than while setting up. **스크린샷**
+(**S**) writes a PNG through the same offscreen render at the same resolution, so a still and a frame
+of the clip are the same picture.
+
+While a clip is being written the header shows `● REC` — a file is appearing on someone's disk, and a
+UI that does that silently is a UI that fills a disk silently. When it stops, the card shows the file
+with its length, resolution, size, **which encoder wrote it**, any dropped frames, and an 열기 link.
+
+### How a frame gets out
+
+The console process is the one that renders; the worker only sends state. So the thread that must not
+stall is the one painting the window, and it is protected twice:
+
+1. **The capture is a second draw of the frame just drawn**, into an offscreen FBO at the recording's
+   resolution, from inside `paintGL` where the GL context is current. `Scene` draws into
+   `scene.target`; the capture points that at its own framebuffer, sets `scene.width/height`, redraws
+   and puts everything back. `_draw` takes its size from the scene rather than from the widget, which
+   is what makes a 1080p clip 1080p out of a 1200 px window.
+2. **Everything `_draw` advances is snapshotted and restored** — wheel rotation, the trail sequence,
+   the eased chase camera. That is what lets the clip use a different camera and different overlays
+   without the window moving, and what stops the window running at double speed while recording.
+3. **Encoding is a thread behind a bounded queue.** A frame the encoder cannot take is dropped and
+   counted, never waited for. The count is shown beside the clip: a recording with a number of
+   dropped frames next to it is one you can trust.
+
+Capture is paced by the clock at the chosen frame rate, not by the paint rate — the window repaints
+at whatever the display and the keepalive produce, and a clip has to come out at the rate it claims.
+
+### Which encoder
+
+`자동` prefers the GPU's `h264_nvenc` and falls back to `libx264`, and the finished-file line says
+which one ran. "Can the GPU do it" is answered by **encoding two frames with the real command**, not
+by grepping `ffmpeg -encoders`: nvenc is listed on machines with no device, with a driver the runtime
+does not match, and with every session slot taken, and each of those fails at the first frame. The
+probe is lazy, cached per process, skipped entirely when an encoder is named, and overridable with
+`$F1SIM_VIDEO_ENCODER`. If the card passes the probe and still refuses the real stream, the encoder
+falls back to the CPU before a single frame has reached a file rather than handing back an empty mp4.
+
+Rendering is untouched by any of this: the frames come from whatever GL context the session already
+has — the GPU on a desktop, llvmpipe under Xvfb.
+
 ## Verification
 
 Rendered headlessly with the same capture path as the README screenshots (Xvfb + llvmpipe, real
