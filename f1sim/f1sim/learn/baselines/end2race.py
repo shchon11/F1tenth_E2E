@@ -260,7 +260,7 @@ def _to_numpy(x):
 
 
 def load(weights: str, *, repo: str = "", hidden_scale: int = 4, device: str = "cpu",
-         raw_beams: int = RAW_BEAMS, raw_fov: float = RAW_FOV, range_max: float = RAW_RANGE_MAX,
+         raw_beams: int = None, raw_fov: float = None, range_max: float = None,
          n_features: int = N_FEATURES, scan_fill=None, tick_hz=None,
          caller_rate_hz: float = 40.0, **_unused) -> End2Race:
     """`weights` is their `pretrained/end2race.pth` (or one retrained on our demonstrations).
@@ -279,6 +279,27 @@ def load(weights: str, *, repo: str = "", hidden_scale: int = 4, device: str = "
     `tick_hz` restores their 100 Hz recurrence against this project's 40 Hz control loop.
     """
     repo = repo or DEFAULT_REPO
+    meta = None
+    if os.path.exists(weights):
+        # A model retrained here records the scanner it was trained on and its own width. An entry
+        # does not have to restate either, and a disagreement is a refusal rather than a silent
+        # reshape: the fair-comparison arm reads 270 evenly spaced beams of THIS car's 270 deg
+        # window (one per degree, so each learned `k` still indexes a bearing), while the published
+        # weights read 360 of a 1440-beam full circle, and the two are not interchangeable.
+        import torch as _t
+        blob = _t.load(weights, map_location="cpu", weights_only=True)
+        meta = blob.get("meta") if isinstance(blob, dict) and "state_dict" in blob else None
+        if meta and meta.get("n_features"):
+            if int(n_features) != N_FEATURES and int(n_features) != int(meta["n_features"]):
+                raise BaselineError(f"{weights} was trained with {meta['n_features']} features and "
+                                    f"the entry asks for {n_features}")
+            n_features = int(meta["n_features"])
+        if meta and meta.get("hidden_scale"):
+            hidden_scale = int(meta["hidden_scale"])
+    m = meta or {}
+    raw_beams = int(raw_beams if raw_beams is not None else m.get("n_beams", RAW_BEAMS))
+    raw_fov = float(raw_fov if raw_fov is not None else m.get("fov", RAW_FOV))
+    range_max = float(range_max if range_max is not None else m.get("range_max", RAW_RANGE_MAX))
     up = import_upstream(repo, num_features=(None if int(n_features) == N_FEATURES
                                              else int(n_features)))
     module = up.End2Race(mask_prob=0.0, hidden_scale=int(hidden_scale))

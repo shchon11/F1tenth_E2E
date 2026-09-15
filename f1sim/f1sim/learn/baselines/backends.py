@@ -109,7 +109,11 @@ class TorchBackend:
         sd = torch.load(self.path, map_location="cpu", weights_only=True)
         if not isinstance(sd, dict):
             raise BaselineError(f"{path}: expected a state_dict, got {type(sd).__name__}")
-        module.load_state_dict(sd, strict=True)
+        # A file this project wrote wraps the weights with the provenance that makes the row
+        # readable (`baselines/__main__.py:_save`); a file the upstream repo wrote is the bare
+        # state_dict (`End2Race/train.py:148`). Both are accepted, and the wrapped metadata is kept.
+        self.meta = sd.get("meta") if "state_dict" in sd else None
+        module.load_state_dict(sd.get("state_dict", sd), strict=True)
         self.device = torch.device(device)
         self.module = module.to(self.device).eval()
         self.version = torch.__version__
@@ -119,4 +123,4 @@ class TorchBackend:
     def describe(self) -> dict:
         return {"backend": "torch", "version": self.version, "device": str(self.device),
                 "threads": self.threads, "path": self.path, "sha256": self.sha256,
-                "n_params": self.n_params}
+                "n_params": self.n_params, "trained_here": self.meta}

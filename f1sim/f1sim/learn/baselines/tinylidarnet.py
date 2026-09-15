@@ -65,9 +65,19 @@ RAW_BEAMS = 1081
 RAW_FOV = 4.71238898
 
 #: The two output speed mappings that exist in the upstream repo, by the file each is in.
+#:
+#: A third, `fitted`, exists only for a model retrained here and is not a third opinion of theirs:
+#: `train.py:135` scales the speed LABELS by `linear_map(speed, min_speed, max_speed, 0, 1)` with
+#: `min_speed = 0` and `max_speed` taken from the data, and `inference.py:88` is the same function
+#: run backwards. The published constants (1, 8) and (-0.5, 7.0) are what *their* data's min and max
+#: happened to be replaced by, and neither describes ours. Using one of them on a model trained on
+#: our demonstrations would scale every speed it commands by the ratio of two unrelated datasets,
+#: which is not a property of the architecture and is exactly what the fair comparison is trying to
+#: hold still. So a retrained model carries its own `(min_speed, max_speed)` and says so.
 SPEED_MAPS = {
     "sim": (1.0, 8.0, "zarrar/tiny_lidarnet.py:77-79 (their f1tenth_benchmarks evaluation)"),
     "car": (-0.5, 7.0, "inference.py:126 (their real-car node)"),
+    "fitted": (None, None, "train.py:135 run backwards on this model's own training data"),
 }
 
 
@@ -83,11 +93,22 @@ class TinyLidarNet(BaselineDriver):
     needs_speed = False
 
     def __init__(self, backend, *, skip_n: int, speed_map: str = "sim",
-                 raw_beams: int = RAW_BEAMS, raw_fov: float = RAW_FOV, clip_m: float = CLIP_M):
+                 raw_beams: int = RAW_BEAMS, raw_fov: float = RAW_FOV, clip_m: float = CLIP_M,
+                 speed_range=None):
         if speed_map not in SPEED_MAPS:
             raise BaselineError(f"speed_map must be one of {sorted(SPEED_MAPS)}, got {speed_map!r}; "
                                 f"the two mappings are both in the upstream repo and disagree, so "
                                 f"one has to be named")
+        if speed_map == "fitted":
+            if speed_range is None or len(tuple(speed_range)) != 2:
+                raise BaselineError("speed_map='fitted' needs the (min_speed, max_speed) the labels "
+                                    "were scaled by; without it the output has no units")
+            self._speed_range = (float(speed_range[0]), float(speed_range[1]))
+        elif speed_range is not None:
+            raise BaselineError(f"speed_range was given with speed_map={speed_map!r}, which already "
+                                f"fixes it at {SPEED_MAPS[speed_map][:2]}")
+        else:
+            self._speed_range = SPEED_MAPS[speed_map][:2]
         self.skip_n = int(skip_n)
         if self.skip_n < 1:
             raise BaselineError(f"skip_n must be >= 1, got {skip_n}")
@@ -104,7 +125,7 @@ class TinyLidarNet(BaselineDriver):
                                       range_max=self.clip_m, control_rate=CONTROL_RATE_HZ),
                          backend,
                          note=f"skip_n={self.skip_n}, speed_map={speed_map} "
-                              f"({SPEED_MAPS[speed_map][2]})")
+                              f"{self._speed_range} ({SPEED_MAPS[speed_map][2]})")
 
     @staticmethod
     def _model_beams(backend) -> int:
@@ -122,31 +143,54 @@ class TinyLidarNet(BaselineDriver):
     def _forward(self, ranges_m, speed_mps):
         out = np.asarray(self.backend(self._prepare(ranges_m)), dtype=np.float32)
         steer = out[:, 0]                              # `inference.py:120`: radians, as published
-        lo, hi, _src = SPEED_MAPS[self.speed_map]
+        lo, hi = self._speed_range
         speed = linear_map(out[:, 1], 0.0, 1.0, lo, hi)
         return np.stack([steer, speed], 1)
 
     def describe(self) -> dict:
         d = super().describe()
-        lo, hi, src = SPEED_MAPS[self.speed_map]
+        lo, hi = self._speed_range
         d.update({"skip_n": self.skip_n, "model_beams": int(self._idx.size),
                   "clip_m": self.clip_m, "speed_map": self.speed_map,
-                  "speed_range_mps": [lo, hi], "speed_map_source": src,
+                  "speed_range_mps": [lo, hi], "speed_map_source": SPEED_MAPS[self.speed_map][2],
                   "input_normalisation": "none (metres, as trained)",
                   "upstream_noise_applied": False})
         return d
 
 
 def load(weights: str, *, skip_n: int | None = None, speed_map: str = "sim", threads: int = 1,
+         speed_range=None, device: str = "cpu", n_beams: int | None = None,
          **_unused) -> TinyLidarNet:
-    """`weights` is the converted `.onnx` (see `work/baselines/scripts/tln_to_onnx.py`).
+    """`weights` is the converted `.onnx`, or a `.pt` retrained here.
+
+    `.onnx` is how the PUBLISHED weights run: they are Keras and TensorFlow is not in this venv (see
+    `backends.py`). `.pt` is how a model retrained for the fair-comparison arm runs: the same
+    architecture in PyTorch (`tinylidarnet_torch.py`), which is checked against the published Keras
+    weights to 3.6e-7 on 100 real scans before it is ever trained on anything.
 
     `skip_n` defaults to the value implied by the model's own input width over a 1081-beam scan, so
     an entry that pins `tinylidarnet_L_1081.onnx` does not have to restate it -- but a model whose
     width is not one of 1081/541/271 has to say what it wants, because guessing at that is guessing
     at which beams the network was trained on.
     """
-    backend = OnnxBackend(weights, threads=threads)
+    if str(weights).endswith((".pt", ".pth")):
+        import torch
+
+        from .tinylidarnet_torch import TinyLidarNetTorch, TorchBackendForDriver
+        blob = torch.load(weights, map_location="cpu", weights_only=False)
+        sd = blob["state_dict"] if isinstance(blob, dict) and "state_dict" in blob else blob
+        meta = blob.get("meta", {}) if isinstance(blob, dict) else {}
+        n = int(n_beams or meta.get("n_beams") or RAW_BEAMS)
+        model = TinyLidarNetTorch(n)
+        model.load_state_dict(sd, strict=True)
+        backend = TorchBackendForDriver(model, path=weights, device=device, threads=threads)
+        if speed_range is None and meta.get("speed_range"):
+            speed_range = tuple(meta["speed_range"])
+            speed_map = "fitted"
+        if skip_n is None and meta.get("skip_n"):
+            skip_n = int(meta["skip_n"])
+    else:
+        backend = OnnxBackend(weights, threads=threads)
     if skip_n is None:
         n_in = TinyLidarNet._model_beams(backend)
         implied = {RAW_BEAMS: 1, 541: 2, 271: 4}.get(n_in)
@@ -154,4 +198,4 @@ def load(weights: str, *, skip_n: int | None = None, speed_map: str = "sim", thr
             raise BaselineError(
                 f"{weights} takes {n_in} beams, which is not 1081/541/271; pass skip_n explicitly")
         skip_n = implied
-    return TinyLidarNet(backend, skip_n=skip_n, speed_map=speed_map)
+    return TinyLidarNet(backend, skip_n=skip_n, speed_map=speed_map, speed_range=speed_range)
