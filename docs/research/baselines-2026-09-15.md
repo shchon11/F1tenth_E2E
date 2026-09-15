@@ -741,11 +741,20 @@ speed distribution it was shown. Faithful imitation of a slow expert looks exact
 **A caveat that is mine, not the data's.** The obvious reading is that demonstrations collected in a
 *race* — three cars, reactive opponents, events, procedural obstacles — carry traffic-limited
 speeds, and the solo S family then converts those into timeouts. That is a hypothesis, and this
-buffer cannot settle it: `DemoBuffer` records no contention flag, so the teacher's speed with and
-without a car in range cannot be separated after the fact. The alternative — that this raceline
-teacher is simply conservative everywhere — fits the same numbers. Distinguishing them needs one
-more field recorded at collection time, which is the same lesson as the plan label and is now
-written down as such.
+buffer cannot settle it: the buffer that produced this student recorded no opponent distance, so the
+teacher's speed with and without a car in range cannot be separated after the fact. The alternative
+— that this raceline teacher is simply conservative everywhere — fits the same numbers, and the two
+have different consequences: one says the *demonstrations* must be collected differently, the other
+says the *teacher* must change.
+
+**That field now exists**, for the same reason and on the same terms as the plan label.
+`DemoBuffer.G` is the signed arc gap to the nearest opponent at the moment each label was produced —
+read pre-step, so it describes the situation the command is answering, and `inf` when the car is
+alone — and `speed_by_contention()` splits the label speeds at the suite's own 12 m contention
+range. It reuses `benchmark/overtake._wrapped_gaps` rather than inventing a second wrapping
+convention, and a test asserts the two agree exactly. It does not rescue this checkpoint, whose
+buffer is already written; it means the next collection answers the question instead of raising it
+again.
 
 What this does *not* say is anything yet about the architecture, which is what D3 exists to isolate.
 The network is TinyLidarNet's, layer for layer, verified against the published weights to 3.6e-7
