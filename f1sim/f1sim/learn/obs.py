@@ -435,18 +435,27 @@ class ScanAugment:
         if self._ego_cache is not None:
             return self._ego_cache
         speed, gyro, accel, _vesc = floor_inputs(proprio.to(self.dtype), self.floor_idx)
-        saved = None
-        if not advance:
-            saved = (self.ego.v_lp.clone(), self.ego.w_lp.clone(), self.ego.ax.clone(),
-                     self.ego.f_lp.clone(), self.ego.att.clone(), self.ego.rate.clone(),
-                     self.ego.started.clone())
-        att = self.ego.update(speed, gyro[:, 2], accel)
-        block = torch.cat([self.ego.state_vector(), att], 1)
-        if saved is not None:
-            (self.ego.v_lp, self.ego.w_lp, self.ego.ax, self.ego.f_lp, self.ego.att,
-             self.ego.rate, self.ego.started) = saved
-        if index is not None:
-            block = block[index]
+        rows = int(speed.shape[0])
+        # `index` means the caller handed us a SUBSET -- the envs that ended, for a terminal
+        # observation -- and the scan and proprio are already that subset, the same convention
+        # `AttitudeTracker.peek` and the occupancy memory (`mem[index]`) take. The version this
+        # replaces ran the FULL-batch estimator on the subset's proprio and then indexed the
+        # result, which raised `speed must be (128,), got (1,)`; had the shapes happened to match
+        # it would have returned the wrong envs' rows instead, which is the worse failure.
+        if index is not None and rows != int(len(index)):
+            raise ValueError(
+                f"proprio has {rows} rows but `index` selects {int(len(index))}: when a subset is "
+                f"previewed the observation carries only those envs")
+        if index is None and rows != self.batch:
+            raise ValueError(f"proprio must be ({self.batch}, ...) or come with an `index` saying "
+                             f"which envs its {rows} rows are")
+        if advance and index is None:
+            att = self.ego.update(speed, gyro[:, 2], accel)
+            block = torch.cat([self.ego.state_vector(), att], 1)
+        else:
+            # Never advances: a terminal observation is scored and not acted on, so advancing for
+            # it would leave the next episode carrying a step it did not take.
+            block = self.ego.peek(speed, gyro[:, 2], accel, index)
         self._ego_cache = block
         return block
 
