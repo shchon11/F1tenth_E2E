@@ -55,7 +55,7 @@ import numpy as np
 import torch
 
 from ..gym_env import EnvConfig, SPAWN_ORDERS
-from ..opponent_events import REACTIVE_BIT
+from ..opponent_events import REACTIVE_BIT, REACTIVE_NAMES
 from ..params import Config
 from . import common
 from . import opponent_config as oc
@@ -126,6 +126,20 @@ class Census:
         # most of its time waiting rather than driving.
         self._samples: Dict[str, List[torch.Tensor]] = {k: [] for k in (
             "rows", "along", "prox_reward", "prox_closeness", "lat_gap", "body_gap")}
+        # ---- per slot, when the opponents were configured one at a time (f1sim.opponent_slots).
+        self.slots = getattr(env, "slots", None)
+        self.M = env.M
+        if self.slots is not None:
+            z = lambda *sh: torch.zeros(*sh, device=dev)
+            self.slot_seconds = z(self.M)          # learner-seconds in contention with this slot
+            self.slot_attack = z(self.M)           # ... inside the attack window of it
+            self.slot_events = z(self.M)           # timed events started by its cars
+            self.slot_react = z(self.M, len(REACTIVE_NAMES))   # car-seconds each behaviour acted
+            self.slot_walls = z(self.M)
+            self.slot_contacts = z(self.M)
+            self.slot_scale_sum = z(self.M)
+            self.slot_scale_n = z(self.M)
+            self._prev_event = torch.zeros(env.B, dtype=torch.long, device=dev)
 
     # ------------------------------------------------------------------ per step
     def observe(self, view, info, state: torch.Tensor, term: torch.Tensor, trunc: torch.Tensor) -> None:
@@ -192,6 +206,8 @@ class Census:
         opp_rows = ~self.env.on_policy
         self.opp_contacts += (term & car & opp_rows).sum()
         self.opp_walls += (term & ~car & opp_rows).sum()
+        if self.slots is not None:
+            self._observe_slots(near, ahead, gap, react, info, term, car, o)
         travelled = state[:, 3].abs() * self.dt
         self.learner_distance += torch.where(rows, travelled, torch.zeros_like(travelled)).sum()
         self.opp_distance += torch.where(opp_rows, travelled, torch.zeros_like(travelled)).sum()
@@ -215,6 +231,57 @@ class Census:
         add["body_gap"].append(body.min(1).values)
         add["lat_gap"].append((lat.abs().gather(1, pick)[:, 0] - e.car_wid).clamp_min(0.0))
         self._have_reward = prox is not None
+
+    def _observe_slots(self, near, ahead, gap, react, info, term, car, o) -> None:
+        """Fold this step into the per-slot rows. Everything is (B,) or (B, C); nothing syncs."""
+        env = self.env
+        dt = self.dt
+        rows = self.rows & env.on_policy
+        slot_of_other = env.slot[o]                                     # (B, C) their grid slot
+        contend = (near & rows[:, None]).float()
+        attack = (ahead & (gap <= self.attack) & rows[:, None]).float()
+        self.slot_seconds.scatter_add_(0, slot_of_other.reshape(-1), (contend * dt).reshape(-1))
+        self.slot_attack.scatter_add_(0, slot_of_other.reshape(-1), (attack * dt).reshape(-1))
+        ev = info.get("opp_event") or {}
+        kind = ev.get("id")
+        if kind is not None:
+            started = ((kind != 0) & (self._prev_event == 0)).float()
+            self.slot_events.scatter_add_(0, env.slot, started)
+            self._prev_event = kind.clone()
+        if react is not None:
+            for k, name in enumerate(REACTIVE_NAMES):
+                acting = ((react & REACTIVE_BIT[name]) != 0).float() * dt
+                self.slot_react[:, k].scatter_add_(0, env.slot, acting)
+        opp = ~env.on_policy
+        self.slot_walls.scatter_add_(0, env.slot, (term & ~car & opp).float())
+        self.slot_contacts.scatter_add_(0, env.slot, (term & car & opp).float())
+        self.slot_scale_sum.scatter_add_(0, env.slot, env.slot_scale)
+        self.slot_scale_n.scatter_add_(0, env.slot, torch.ones_like(env.slot_scale))
+
+    def slot_report(self) -> Optional[list]:
+        """One row per configured slot: what it was asked to be, and what it did.
+
+        A slot table's whole point is that the other cars are not alike, so one column of numbers
+        for "the opponents" is exactly the summary that cannot say whether it worked.
+        """
+        if self.slots is None:
+            return None
+        scale = (self.slot_scale_sum / self.slot_scale_n.clamp_min(1.0)).tolist()
+        out = []
+        for i, sl in enumerate(self.slots, start=1):
+            out.append({
+                "slot": i, "spec": sl.describe(), "kind": sl.kind,
+                "checkpoint": sl.checkpoint,
+                "mean_speed_scale": float(scale[i]),
+                "learner_seconds_in_contention": float(self.slot_seconds[i]),
+                "learner_seconds_in_attack_window": float(self.slot_attack[i]),
+                "timed_events_started": int(self.slot_events[i]),
+                "reactive_car_seconds": {n: float(self.slot_react[i, k])
+                                         for k, n in enumerate(REACTIVE_NAMES)},
+                "wall_terminations": int(self.slot_walls[i]),
+                "contact_terminations": int(self.slot_contacts[i]),
+            })
+        return out
 
     # ------------------------------------------------------------------ the report
     @staticmethod
@@ -247,6 +314,7 @@ class Census:
                                "rows_ever": int(n), "rows": self.n_rows, "definition": d}
                            for (k, d), s, n in zip(SITUATIONS, secs, ever)},
             "grids": {name: int(self.grid_seen[i].sum()) for i, name in enumerate(SPAWN_ORDERS[:3])},
+            "slots": self.slot_report(),
             "terminations": {
                 "learner_car_contacts": int(self.learner_contacts),
                 "learner_wall_collisions": int(self.learner_walls),
@@ -297,6 +365,22 @@ def format_report(rep: dict) -> str:
               ", ".join(f"{k} {v}" for k, v in rep["grids"].items()), ""]
     ls = rep["lateral_signal"]
     c = ls["coefficients"]
+    slots = rep.get("slots")
+    if slots:
+        lines.append("")
+        lines.append("per slot (f1sim.opponent_slots): what each car was asked to be, and what it did")
+        lines.append(f"{'car':>3} {'spec':58} {'x':>5} {'contend s':>10} {'attack s':>9} "
+                     f"{'events':>7} {'walls':>6} {'hits':>5}")
+        for r in slots:
+            react = ", ".join(f"{n} {v:.0f}s" for n, v in r["reactive_car_seconds"].items() if v > 0)
+            lines.append(f"{r['slot']:>3} {r['spec'][:58]:58} {r['mean_speed_scale']:5.2f} "
+                         f"{r['learner_seconds_in_contention']:10.1f} "
+                         f"{r['learner_seconds_in_attack_window']:9.1f} "
+                         f"{r['timed_events_started']:7d} {r['wall_terminations']:6d} "
+                         f"{r['contact_terminations']:5d}")
+            if react:
+                lines.append(f"{'':3}   reactive: {react}")
+        lines.append("")
     lines.append(f"dense lateral signal (car-proximity penalty {c['reward_car_proximity']:g} below "
                  f"{c['car_safe_gap']:g} m):")
     lines.append(f"{'quantity':44} {'n':>8} {'zero':>7} {'p50':>9} {'p90':>9} {'p99':>9} {'max':>9}")

@@ -24,7 +24,25 @@ import os
 from typing import Optional, Sequence
 
 from .. import opponent_events as opp_ev
+from .. import opponent_slots as opp_sl
 from ..gym_env import OPPONENT_MODES, POOL_SELF, POOL_TEACHER, SPAWN_ORDERS, pool_entries
+
+#: The flags a slot table replaces. Each one answers, for every opponent at once, a question the
+#: table answers per car; passing both would leave two answers in the configuration and only one of
+#: them in the run. Listed as (flag, attribute, default) so `validate` can say which one was set.
+SLOT_SUPERSEDED = (
+    ("--opponent", "opponent", "policy"),
+    ("--opp-speed", "opp_speed", (0.6, 1.0)),
+    ("--opp-pool", "opp_pool", ""),
+    ("--opp-events", "opp_events", ""),
+    ("--opp-event-rate", "opp_event_rate", 0.0),
+    ("--spawn-order", "spawn_order", "behind"),
+    ("--mixed-teacher-frac", "mixed_teacher_frac", 0.5),
+    ("--opp-defend-prob", "opp_defend_prob", 0.0),
+    ("--opp-yield-prob", "opp_yield_prob", 0.0),
+    ("--opp-line-prob", "opp_line_prob", 0.0),
+    ("--opp-oblivious-prob", "opp_oblivious_prob", 0.0),
+)
 
 
 def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -144,7 +162,40 @@ def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="[m] shortest run of such points that counts as one corner")
     ap.add_argument("--opp-corner-smooth", type=float, default=0.6, metavar="M",
                     help="[m] window the curvature is averaged over first")
+    ap.add_argument("--opp-slots", default="", metavar="JSON|@FILE",
+                    help="per-opponent configuration: a JSON array with one object per car of a "
+                         "race (race_size - 1 of them), or @path/to/slots.json. Each object may "
+                         f"carry kind ({'|'.join(opp_sl.KIND_NAMES)}), checkpoint, controller, "
+                         f"speed_scale (a number or [lo, hi]), label_grip "
+                         f"({'|'.join(opp_sl.GRIP_LABELS)}), speed_cap [m/s], events "
+                         f"({','.join(opp_ev.EVENT_NAMES)}), event_rate, reactive "
+                         f"({{{','.join(n + ': p' for n in opp_ev.REACTIVE_NAMES)}}}), spawn "
+                         f"({'|'.join(opp_sl.SLOT_SPAWNS)}, where that car starts relative to the "
+                         f"learner) and seed. Slot i of every race in the batch is built from spec "
+                         f"i, so 'a slow car ahead and a defending car alongside' is one run rather "
+                         f"than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events "
+                         f"/ --spawn-order, which say one thing about every opponent at once; the "
+                         f"remaining --opp-* flags are the shared *ranges* an event draws from and "
+                         f"still apply. Empty = off, and off is the env this flag was added to")
     return ap
+
+
+def _differs(value, default) -> bool:
+    """Whether a flag was moved off its default. Tuples compare elementwise, floats exactly."""
+    if isinstance(default, tuple):
+        return tuple(float(x) for x in value) != tuple(float(x) for x in default)
+    return value != default
+
+
+def opp_slots_of(a):
+    """The parsed `--opp-slots` table, or None. Raises SystemExit with the parser's own reason."""
+    raw = getattr(a, "opp_slots", "")
+    if raw is None or isinstance(raw, tuple):
+        return raw
+    try:
+        return opp_sl.parse_slots(raw)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
 
 def validate(a) -> None:
@@ -153,6 +204,21 @@ def validate(a) -> None:
     Every check here exists because the alternative is a run that looks like the one that was asked
     for and is silently the unflagged one.
     """
+    a.opp_slots = opp_slots_of(a)
+    if a.opp_slots is not None:
+        set_flags = [flag for flag, attr, default in SLOT_SUPERSEDED
+                     if _differs(getattr(a, attr, default), default)]
+        if set_flags:
+            raise SystemExit(
+                f"--opp-slots with {' '.join(set_flags)}: the slot table already says who drives "
+                f"each car, how fast it is, what it does and where it starts, one car at a time. "
+                f"Those flags say it for every opponent at once, so the run would carry two answers "
+                f"and use one. Put the value in the table, or drop the table.")
+        a.opponent = "slots"
+        try:
+            opp_sl.validate_slots(a.opp_slots, a.race_size)
+        except ValueError as exc:
+            raise SystemExit(f"--opp-slots: {exc}")
     lo, hi = (float(x) for x in a.spawn_gap)
     if not (math.isfinite(lo) and math.isfinite(hi)) or not (0.0 < lo <= hi):
         raise SystemExit(f"--spawn-gap {lo} {hi}: needs finite 0 < LOW <= HIGH [m]. The gap "
@@ -224,6 +290,7 @@ def validate(a) -> None:
 def env_kwargs(a) -> dict:
     """The EnvConfig fields these flags set. One dict, so no caller can set a subset by accident."""
     return dict(race_size=a.race_size, opponent=a.opponent,
+                opponent_slots=getattr(a, "opp_slots", None) or None,
                 mixed_teacher_frac=a.mixed_teacher_frac,
                 opp_speed_range=tuple(a.opp_speed),
                 opp_pool=tuple(a.opp_pool),
@@ -254,8 +321,21 @@ def env_kwargs(a) -> dict:
                 opp_corner_smooth=a.opp_corner_smooth)
 
 
+def slots_config(a) -> str:
+    """The slot table as the JSON string a config record should carry, or "" when there is none.
+
+    A tuple of dataclasses is not what a W&B config or a recorded argv wants: what someone reading
+    the run needs is the text they can paste back into `--opp-slots`.
+    """
+    slots = getattr(a, "opp_slots", None)
+    return opp_sl.slots_json(slots) if slots else ""
+
+
 def needs_racelines(a) -> bool:
     """Whether the track set has to be loaded with racelines: something drives one."""
+    slots = getattr(a, "opp_slots", None)
+    if slots:
+        return a.race_size > 1 and any(s.teacher_driven for s in slots)
     return a.race_size > 1 and (a.opponent in ("teacher", "mixed")
                                 or (a.opponent == "pool" and POOL_TEACHER in pool_entries(a.opp_pool)))
 
@@ -264,6 +344,11 @@ def describe(a) -> str:
     """One line naming the opponent configuration, for a log header and a report."""
     if a.race_size < 2:
         return "solo (race_size 1): no opponent"
+    slots = getattr(a, "opp_slots", None)
+    if slots:
+        return (f"race {a.race_size} | per-slot ({opp_sl.mix_summary(slots)}) | "
+                f"spawn gap {a.spawn_gap[0]:g}-{a.spawn_gap[1]:g} m\n  "
+                + "\n  ".join(f"car {i}: {s.describe()}" for i, s in enumerate(slots, start=1)))
     who = {"policy": "self-play", "teacher": "raceline teacher", "mixed": "teacher / self-play per race",
            "pool": "pool " + ",".join(a.opp_pool)}[a.opponent]
     probs = {n: float(getattr(a, opp_ev.REACTIVE_PROB_FIELD[n]))
