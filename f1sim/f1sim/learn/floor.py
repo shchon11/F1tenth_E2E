@@ -646,18 +646,35 @@ class EgoStateAttitude:
     WN = 20.0
     ZETA = 0.7
 
+    #: Where the two accelerations come from. `"wheel"` is the wheel speed and the gyro's yaw --
+    #: `a_x` from the speed derivative, `a_y = v omega_z`. `"accel"` is the accelerometer, with the
+    #: gravity leak solved in closed form: the specific force already contains `g sin(tilt)` and the
+    #: tilt is what is being estimated, so `f = a (1 + k)` and `a = f / (1 + k)` -- the same closure
+    #: `real_data_calibration.md` §6.1a uses. `"blend"` takes `a_y` from the accelerometer and
+    #: `a_x` from the wheel, which is the pairing each signal is best at: `v omega_z` misses the
+    #: `v_dot_y` term the README §5 warns about, and the wheel's longitudinal derivative is clean
+    #: once the lock windows are held while the accelerometer's x is full of impact shocks (§2.12).
+    SOURCES = ("wheel", "accel", "blend")
+    #: [s] low-pass on the accelerometer before it is used as an acceleration. Longer than the
+    #: others because this is the noisy channel: 2.37 m/s^2 rms of vibration at 4 m/s (§2.6).
+    TAU_A = 0.12
+
     def __init__(self, batch: int, device="cpu", dt: float = 0.025, dtype=torch.float32,
                  roll_per_g: float = ROLL_PER_G, squat_per_g: float = SQUAT_PER_G,
-                 dive_per_g: float = DIVE_PER_G, lag: bool = True):
+                 dive_per_g: float = DIVE_PER_G, lag: bool = True, source: str = "wheel"):
         self.batch, self.dt = int(batch), float(dt)
         self.device, self.dtype = torch.device(device), dtype
         self.roll_per_g, self.squat_per_g, self.dive_per_g = (float(roll_per_g), float(squat_per_g),
                                                               float(dive_per_g))
         self.lag = bool(lag)
+        if source not in self.SOURCES:
+            raise ValueError(f"EgoStateAttitude source must be one of {self.SOURCES}, got {source!r}")
+        self.source = str(source)
         z = lambda n=1: torch.zeros(self.batch, n, device=self.device, dtype=dtype)
         self.v_lp = z()[:, 0]
         self.w_lp = z()[:, 0]
         self.ax = z()[:, 0]
+        self.f_lp = z(2)                      # low-passed specific force, x and y
         self.att = z(2)
         self.rate = z(2)
         self.started = torch.zeros(self.batch, dtype=torch.bool, device=self.device)
@@ -667,17 +684,21 @@ class EgoStateAttitude:
         if done is None:
             for t in ("v_lp", "w_lp", "ax"):
                 getattr(self, t).zero_()
-            self.att.zero_(); self.rate.zero_(); self.started.zero_()
+            self.f_lp.zero_(); self.att.zero_(); self.rate.zero_(); self.started.zero_()
             return
         d = done if torch.is_tensor(done) else torch.as_tensor(done, device=self.device)
         keep = (~d.bool()).to(self.dtype)
         self.v_lp = self.v_lp * keep; self.w_lp = self.w_lp * keep; self.ax = self.ax * keep
         self.att = self.att * keep[:, None]; self.rate = self.rate * keep[:, None]
+        self.f_lp = self.f_lp * keep[:, None]
         self.started = self.started & ~d.bool()
 
     @torch.no_grad()
-    def update(self, speed: torch.Tensor, yaw_rate: torch.Tensor) -> torch.Tensor:
-        """One control step. `speed` (B,) the VESC wheel speed [m/s], `yaw_rate` (B,) [rad/s].
+    def update(self, speed: torch.Tensor, yaw_rate: torch.Tensor,
+               accel: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """One control step. `speed` (B,) the VESC wheel speed [m/s], `yaw_rate` (B,) [rad/s],
+        `accel` (B, 3) the IMU's specific force [m/s^2] -- required for the `accel` and `blend`
+        sources and ignored by `wheel`.
 
         Returns (B, 2) roll and pitch [rad].
         """
@@ -698,10 +719,27 @@ class EgoStateAttitude:
         self.ax = torch.where(usable, ax_raw, self.ax)
         self.started = torch.ones_like(self.started)
         ay = self.v_lp * self.w_lp
+        ax = self.ax
+        if self.source != "wheel":
+            if accel is None or accel.shape != (self.batch, 3):
+                raise ValueError(f"source {self.source!r} needs accel ({self.batch}, 3)")
+            f = accel.to(self.dtype)[:, :2]
+            ka = min(1.0, dt / self.TAU_A)
+            self.f_lp = torch.where(first[:, None], f, self.f_lp + ka * (f - self.f_lp))
+            # f = a (1 + k): the gravity leak is proportional to the very tilt being estimated, so
+            # it divides out. `k` is the gain that produced the tilt, and it is the asymmetric one
+            # in pitch, so the sign of the longitudinal force picks it.
+            k_p = torch.where(self.f_lp[:, 0] > 0, self.squat_per_g, self.dive_per_g)
+            ay_a = self.f_lp[:, 1] / (1.0 + self.roll_per_g)
+            ax_a = self.f_lp[:, 0] / (1.0 + k_p)
+            ay = ay_a
+            if self.source == "accel":
+                ax = ax_a
         roll_ss = self.roll_per_g * ay / G_ACC
-        gain = torch.where(self.ax > 0, torch.full_like(self.ax, self.squat_per_g),
-                           torch.full_like(self.ax, self.dive_per_g))
-        pitch_ss = -gain * self.ax / G_ACC
+        gain = torch.where(ax > 0, torch.full_like(ax, self.squat_per_g),
+                           torch.full_like(ax, self.dive_per_g))
+        pitch_ss = -gain * ax / G_ACC
+        self.ay = ay
         ss = torch.stack([roll_ss, pitch_ss], 1)
         if not self.lag:
             self.att = ss
@@ -718,4 +756,6 @@ class EgoStateAttitude:
         Deliverable 5 feeds these to the front-end alongside the raw IMU rows, because they are what
         the attitude is a function of and the network should not have to rediscover the map.
         """
-        return torch.stack([self.v_lp, self.w_lp, self.ax, self.v_lp * self.w_lp], 1)
+        ay = getattr(self, "ay", None)
+        return torch.stack([self.v_lp, self.w_lp, self.ax,
+                            self.v_lp * self.w_lp if ay is None else ay], 1)

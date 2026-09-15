@@ -24,7 +24,7 @@ PROPRIO_KEYS = ("speed", "prev_action", "speed_cap", "imu", "imu_att", "hist")  
 #: and not by the caller's spelling: it is the order the first convolution's input columns are laid
 #: out in, so a checkpoint written with ("edges", "memory") and loaded as ("memory", "edges") would
 #: read two channels that mean the wrong thing while every shape still matched.
-SCAN_CHANNELS = ("memory", "edges", "floor")
+SCAN_CHANNELS = ("memory", "edges", "floor", "fe_floor", "fe_range")
 
 #: Control period the decay is quoted in [s]. The policy runs at the LiDAR's 40 Hz (`params.py`
 #: `control_rate`), on the car and in the simulator alike.
@@ -148,8 +148,24 @@ class ScanAugment:
         self.floor_idx = None
         self.floor_spec = None
         self.att = None
+        self.ego = None
         self.angles = None
-        if "floor" in self.channels:
+        #: The learned front-end (`learn/frontend.py`), when a `fe_*` channel asks for it. It runs
+        #: ONCE per step however many of its rows are enabled, and its outputs are appended BESIDE
+        #: the raw frames -- never in place of them, so a hallucinated clean range cannot hide a
+        #: real wall.
+        self.fe = None
+        self.fe_channels = tuple(c for c in self.channels if c.startswith("fe_"))
+        if self.fe_channels:
+            from .frontend import FrontEndRuntime
+            fe = (floor or {}).get("frontend") if floor else None
+            if not fe or not fe.get("path"):
+                raise ValueError(
+                    f"channel(s) {list(self.fe_channels)} need a trained front-end: pass "
+                    f"meta['scan_channels']['floor']['frontend'] = {{'path': ...}}. The channel is "
+                    f"the network's output and there is nothing to output without it.")
+            self.fe = FrontEndRuntime(fe["path"], device=self.device)
+        if "floor" in self.channels or self.fe_channels:
             from . import floor as _floor
             if not floor or "proprio" not in floor:
                 raise ValueError(
@@ -178,6 +194,7 @@ class ScanAugment:
         """Clear the episode state: the occupancy memory and the attitude tracker's integrator."""
         if self.att is not None:
             self.att.reset(done)
+        if self.ego is not None:
             self.ego.reset(done)
         if self.mem is None:
             return

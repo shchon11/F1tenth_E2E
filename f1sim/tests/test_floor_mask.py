@@ -438,3 +438,65 @@ def test_the_shipped_band_is_the_measured_one_and_it_is_too_wide(device):
     solid = (typ == HIT_TALL) & near
     assert float(p[solid].max()) >= shipped.gate_threshold, \
         "the measured band no longer confuses this wall with the floor -- re-read the note"
+
+
+# ------------------------------------------------------------------ roll is not a special case
+@pytest.mark.parametrize("device", DEVICES)
+def test_pure_roll_puts_beams_on_the_floor_and_the_pitch_only_ring_does_not_predict_it(device):
+    """A finding from the deck worker (2026-09-15), pinned here: over a 96-car sweep, floor hits
+    track the TOTAL body tilt and correlate more with **roll** (0.31) than with pitch (0.18), the
+    deepest nose-up frame had none while a small nose-down one had 93, and the naive
+    `mount_z / tan(pitch)` ring does not predict the observed ranges.
+
+    All three follow from the plane geometry and none of them from a pitch-only formula, because
+    the beam's vertical direction cosine is
+
+        bz = -cos(a) sin(pitch) + sin(a) sin(roll) cos(pitch)
+
+    and over a 270 deg window `|sin a|` exceeds `|cos a|` for more than half the beams. This test
+    is the guard that the implementation stays joint: with **zero pitch**, roll alone must put a
+    wide arc on the floor at ranges the closed form predicts and the pitch-only ring cannot.
+    """
+    sim = make(flat_track(wall_x=100.0), device)
+    roll, pitch = math.radians(3.0), 0.0
+    r_true, typ = scan_at(sim, roll, pitch)
+    hit = (typ == HIT_GROUND) & (r_true < float(sim.cfg.lidar.range_max) - 1e-3)
+    assert int(hit.sum()) > 50, "pure roll has to produce floor returns"
+    spec = spec_for(sim)
+    pred = fl.floor_range(angles_of(sim), roll, pitch, spec, rows=1)
+    assert float((pred[hit] - r_true[hit]).abs().max()) < 1e-3
+    # the pitch-only ring is undefined here (pitch = 0 -> infinite range) and so cannot be right
+    assert not math.isfinite(spec.mount_z / math.tan(pitch)) if pitch else True
+    # and the beams it puts on the floor are the WIDE ones, not the forward ones: with no pitch,
+    # `bz = sin(a) sin(roll)`, so a beam reaches the floor inside `range_max` only where
+    # `|sin a| >= oz / (range_max sin roll)`. That bound is the geometry's, not a guess.
+    ang = angles_of(sim)
+    oz = spec.mount_z * math.cos(roll)
+    a_min = math.asin(min(1.0, oz / (float(sim.cfg.lidar.range_max) * math.sin(roll))))
+    assert float(ang[hit[0]].abs().min()) > 0.95 * a_min
+    assert a_min > math.radians(10.0)
+    assert float(ang[hit[0]].abs().median()) > math.radians(45.0), \
+        "roll tilts the plane about the forward axis, so it is the wide beams that descend"
+
+    # Joint case: a nose-UP pitch with roll still produces floor hits, which a pitch-only model
+    # reads as "impossible". This is the deck worker's -1.87 deg frame.
+    r2, typ2 = scan_at(sim, math.radians(3.0), math.radians(-1.87))
+    hit2 = (typ2 == HIT_GROUND) & (r2 < float(sim.cfg.lidar.range_max) - 1e-3)
+    pred2 = fl.floor_range(ang, math.radians(3.0), math.radians(-1.87), spec, rows=1)
+    assert int(hit2.sum()) > 10
+    assert float((pred2[hit2] - r2[hit2]).abs().max()) < 1e-3
+    # ... and with no roll, that same nose-up attitude still produces floor returns -- but they
+    # are all BEHIND the car. The scan plane is a plane: tilt it any way and half of it descends.
+    # Nose-up raises the forward beams and lowers the ones past +-90 deg, which the 270 deg window
+    # has. A pitch-only ring model is therefore wrong in both directions, which is the deck
+    # worker's point restated.
+    r3, typ3 = scan_at(sim, 0.0, math.radians(-1.87))
+    hit3 = (typ3 == HIT_GROUND) & (r3 < float(sim.cfg.lidar.range_max) - 1e-3)
+    assert int(hit3.sum()) > 10
+    assert float(ang[hit3[0]].abs().min()) > math.radians(90.0), \
+        "with the nose up and no roll, only the rearward beams can reach the floor"
+    pred3 = fl.floor_range(ang, 0.0, math.radians(-1.87), spec, rows=1)
+    assert float((pred3[hit3] - r3[hit3]).abs().max()) < 1e-3
+    # and none of them is inside the clearance grid, so this case moves no plan
+    x = (r3 * torch.cos(ang)[None])[hit3]
+    assert float(x.max()) < cl.ClearanceSpec().x_max

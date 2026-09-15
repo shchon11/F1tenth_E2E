@@ -266,3 +266,66 @@ def describe(spec: Optional[dict]) -> str:
         return "no front-end"
     return (f"front-end: width {spec['width']}/{spec['depth_width']}, imu {spec['imu_dim']} -> "
             f"{spec['imu_width']}, {spec['n_beams']} beams")
+
+
+# ====================================================================== deployment
+def save_frontend(path, model: FrontEnd, spec: dict, imu_index: dict, k_stack: int,
+                  extra: Optional[dict] = None) -> None:
+    """One file with everything a consumer needs: the weights, the architecture, and the proprio
+    column map its IMU input was sliced with."""
+    torch.save({"state_dict": model.state_dict(), "spec": dict(spec),
+                "imu_index": dict(imu_index), "k_stack": int(k_stack), "extra": extra or {}}, path)
+
+
+def load_frontend(path, device="cpu"):
+    """`(model in eval mode, spec, imu_index, k_stack)`.
+
+    The column map travels with the weights and is not re-derived: a front-end whose IMU input was
+    sliced from one proprio layout must not be fed another, and `imu_vector` raises rather than
+    reading a prev-action where it expects a gyro.
+    """
+    ck = torch.load(path, map_location=device, weights_only=False)
+    spec, idx, k = dict(ck["spec"]), dict(ck["imu_index"]), int(ck["k_stack"])
+    m = FrontEnd(k, spec).to(device)
+    m.load_state_dict(ck["state_dict"])
+    m.eval()
+    for prm in m.parameters():
+        prm.requires_grad_(False)
+    return m, spec, idx, k
+
+
+class FrontEndRuntime:
+    """The front-end on one inference path: the scan stack and the ego state in, the three
+    per-beam outputs and the attitude out, once per control step.
+
+    Holds no state of its own -- `EgoStateAttitude` is owned by the caller (`obs.ScanAugment`), so
+    a path that uses both the geometric channel and the front-end advances one estimator, not two
+    that can disagree.
+    """
+
+    def __init__(self, path, device="cpu"):
+        self.model, self.spec, self.idx, self.k_stack = load_frontend(path, device)
+        self.device = torch.device(device)
+        self.path = str(path)
+        #: The last step's outputs, so a consumer that wants only the attitude (the ROS node's
+        #: fallback) does not have to run the network a second time.
+        self.last_att: Optional[torch.Tensor] = None
+        self.last_probs: Optional[torch.Tensor] = None
+        self.last_range: Optional[torch.Tensor] = None
+
+    @torch.no_grad()
+    def __call__(self, scan_stack: torch.Tensor, proprio: torch.Tensor,
+                 ego: Optional[torch.Tensor] = None):
+        """`(class probabilities (B, 3, N), denoised range (B, N), attitude (B, 2))`."""
+        k = self.k_stack
+        if scan_stack.shape[1] < k:
+            raise ValueError(f"this front-end reads {k} stacked frames and the observation has "
+                             f"{scan_stack.shape[1]}")
+        logits, rng, att = self.model(scan_stack[:, :k].to(self.device),
+                                      imu_vector(proprio.to(self.device), self.idx, ego))
+        probs = torch.softmax(logits, 1)
+        self.last_probs, self.last_range, self.last_att = probs, rng, att
+        return probs, rng, att
+
+    def describe(self) -> str:
+        return f"{describe(self.spec)} from {self.path}"
