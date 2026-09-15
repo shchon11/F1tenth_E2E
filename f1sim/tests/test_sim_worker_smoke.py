@@ -350,6 +350,44 @@ def test_shutdown_leaves_no_process_behind(tmp_path):
         w.close()
 
 
+# ==================================================================== per-opponent slots
+def test_a_slot_table_builds_a_session_and_the_facts_name_the_mix(worker, tmp_legacy_run):
+    """A three-car race whose two other cars are configured separately (`f1sim.opponent_slots`).
+
+    The worker is the only place where the table meets a real checkpoint, a real raceline and a real
+    env, so this is where "the console can actually start one" is answered. The facts it reports are
+    what the header line and the tooltip read, and they have to come from what was *built*.
+    """
+    slots = [{"kind": "raceline", "speed_scale": [0.6, 1.0], "label_grip": "nominal",
+              "events": ["brake"], "event_rate": 2.0, "reactive": {"defend": 0.5}},
+             {"kind": "self", "speed_scale": 0.8, "spawn": "behind"}]
+    cfg = P.SessionConfig(run=tmp_legacy_run, map_name=SMOKE_MAP, races=1, cars_per_race=3,
+                          opponent="slots", opponent_slots=slots, device="cpu", compile=False,
+                          controller="legacy")
+    worker.send(P.CMD_START, gen=400, config=cfg.to_dict())
+    facts = worker.wait_for(P.MSG_READY, timeout=READY_TIMEOUT, gen=400)["facts"]
+    assert facts["opponent"] == "slots"
+    assert facts["opponent_mix"] == "1x raceline, 1x self"
+    assert facts["opponent_slots"] == slots
+    assert len(facts["opponent_slot_lines"]) == 2
+    assert facts["total_cars"] == 3
+    frames = worker.collect_frames(3.0)
+    assert len(frames) >= 3
+    assert np.isfinite(frames[-1]["x"]).all() and np.isfinite(frames[-1]["scan"]).all()
+    # the rival colouring still knows which cars are the focus car's race mates
+    assert "opponent" in frames[-1] and int(frames[-1]["opponent"].sum()) == 2
+
+
+def test_a_slot_table_the_env_cannot_build_is_refused_before_the_session(worker, tmp_legacy_run):
+    """Two rows for a two-car race is the user's typing, and it is answered rather than crashed on."""
+    cfg = P.SessionConfig(run=tmp_legacy_run, map_name=SMOKE_MAP, races=1, cars_per_race=2,
+                          opponent="slots", device="cpu", compile=False,
+                          opponent_slots=[{"kind": "raceline"}, {"kind": "raceline"}])
+    worker.send(P.CMD_START, gen=401, config=cfg.to_dict())
+    err = worker.wait_for(P.MSG_ERROR, timeout=READY_TIMEOUT, gen=401)
+    assert "상대차 표" in err["message"] and "race_size" in err["message"]
+
+
 @pytest.mark.skipif(not os.environ.get("F1SIM_WORKER_CUDA"),
                     reason="CUDA smoke runs only under a GPU lease (set F1SIM_WORKER_CUDA=1)")
 def test_cuda_session_reports_the_device_it_actually_used(tmp_path, tmp_legacy_run):
