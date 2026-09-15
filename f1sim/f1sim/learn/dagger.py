@@ -228,7 +228,9 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
     with torch.no_grad():
         for t in range(steps):
             scan, pro = flatten_obs(obs)
-            seen = rt.observe(scan)                     # advances the occupancy channel, always
+            #: proprio too: the `aligned` channel warps with the car's own measured motion and
+            #: refuses a call that does not carry it. Every other channel ignores it.
+            seen = rt.observe(scan, pro)                # advances the occupancy channel, always
             mem = None if rt.scan is None or rt.scan.mem is None else rt.scan.mem.clone()
             label = env.teacher_label(teacher)
             student = None

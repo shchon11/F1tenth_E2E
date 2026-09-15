@@ -20,5 +20,14 @@ setup(
     maintainer_email="shchon724@gmail.com",
     description="ROS 2 bridge for the f1sim simulator",
     license="MIT",
-    entry_points={"console_scripts": ["bridge = f1sim_ros.bridge_node:main", "vesc_sim = f1sim_ros.vesc_sim_node:main", "teleop = f1sim_ros.teleop_node:main", "policy = f1sim_ros.policy_node:main", "pure_pursuit = f1sim_ros.pure_pursuit_node:main"]},
+    entry_points={"console_scripts": [
+        "bridge = f1sim_ros.bridge_node:main",
+        "vesc_sim = f1sim_ros.vesc_sim_node:main",
+        "teleop = f1sim_ros.teleop_node:main",
+        "policy = f1sim_ros.policy_node:main",
+        "controller = f1sim_ros.controller_node:main",
+        "eval = f1sim_ros.eval_node:main",
+        "system_check = f1sim_ros.system_check_node:main",
+        "pure_pursuit = f1sim_ros.pure_pursuit_node:main",
+    ]},
 )

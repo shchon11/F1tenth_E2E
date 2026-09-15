@@ -1,6 +1,6 @@
 """The ROS policy node carries a recurrent policy's hidden state across scan callbacks.
 
-Same shape as `test_policy_node_traction.py`: no ROS graph, no device, no vehicle. The node's real
+Same shape as `test_controller_traction.py`: no ROS graph, no device, no vehicle. The node's real
 `on_odom` / `on_imu` / `on_scan` / `_resume` / `on_reset` run against stub messages and a fake
 clock, and the assertions are about the state the node keeps between them.
 
@@ -90,33 +90,44 @@ def memory_model(tmp_path, channels=("memory", "edges"), motion=False):
     return m.eval()
 
 
-def make_node(model):
+def make_node(model, spec=SPEC):
+    """The node with every ROS dependency replaced and its real methods intact.
+
+    `SPEC` is a direct-action checkpoint (`act_dim=2`), which publishes `/drive` from this node and
+    bypasses the controller, so the counts below are commands. `plan_node` below is the same stub
+    for a plan checkpoint, where the published thing is a `Plan` -- the memory rules are the same
+    either way, and that is the point of checking both.
+    """
+    from f1sim_ros.deploy import SensorIntake
     n = pn.PolicyNode.__new__(pn.PolicyNode)
     n.device = torch.device("cpu")
-    n.spec = SPEC
-    n.obs = ObsBuilder(SPEC, "cpu")
+    n.spec = spec
+    n.direct = int(spec.act_dim) == 2
+    n.obs = ObsBuilder(spec, "cpu")
     n.model = model
     n.policy_state = runtime_for(model, batch=1, device="cpu")
     n.pub = RecordingPub()
-    n.speed_cap = 8.0; n.steer_max = 0.4189; n.v = 0.0
-    n.imu_buf = []; n.imu_stamps = []
-    n.att = (0.0, 0.0); n.yaw_rate = 0.0
-    n.accel_scale = None; n._unit_warned = False
-    n.tracker = None; n.cal = (0.0, 1.0, 1.0); n.timeout = 0.25
-    n.t_att = n.t_imu = n.t_odom = n.t_scan = None
-    n.imu_mean = None; n.t_imu_mean = None; n.att_stamp = None
+    n.pub_drive = n.pub
+    n.pub_plan = RecordingPub()
+    n.pub_state = RecordingPub()
+    n.speed_cap = 8.0; n.steer_max = 0.4189
+    n.timeout = 0.25
     n._inhibited = False; n._last_inhibit_log = -1e9; n.last_t = None
-    n.traction_arm = "off"; n.traction = None
-    # No plan-geometry layer either: this stub is about the recurrent state, and an arm that
-    # was installed would put a second thing between the policy and the command.
-    n.clearance = None; n._scan_geometry_checked = True
-    n.ax_body = None; n.t_ax = None; n.motor_current = None; n.t_current = None
+    n.seq = 0; n.checkpoint_id = "test/stub.pt@000000000000"
+    n.memory_clears = 0; n.memory_cleared_at = -1.0; n.memory_cleared_reason = ""
     n._log = Logger(); n._now = 100.0
     n.get_logger = lambda: n._log
     n.get_parameter = lambda name: SimpleNamespace(value=True)
     n.clock = lambda: n._now
     n.stamp_now = lambda: ros_time(n._now)
+    n.sensors = SensorIntake(n.clock, n._log, n.timeout)
     return n
+
+
+def published(node):
+    """What this node put on the wire this run: commands for a direct checkpoint, plans for a plan
+    one. The memory assertions are about how many steps were taken, not about which topic."""
+    return node.pub_plan.msgs if not node.direct else node.pub.msgs
 
 
 def imu_msg():
@@ -161,7 +172,7 @@ def test_hidden_state_is_carried_between_scan_callbacks(tmp_path):
     feed(node, 1)
     h2 = hidden(node)
     assert not torch.allclose(h1, h2), "the second scan must act on the carried state"
-    assert len(node.pub.msgs) == 2
+    assert len(published(node)) == 2
 
 
 def test_a_sensor_gap_clears_the_memory_with_the_observation_history(tmp_path):
@@ -232,7 +243,7 @@ def test_a_legacy_checkpoint_keeps_the_node_exactly_as_it_was(tmp_path):
     assert not node.policy_state.stateful
     feed(node, 3)
     assert hidden(node) is None and node.policy_state.scan is None
-    assert len(node.pub.msgs) == 3
+    assert len(published(node)) == 3
     node.on_reset(object())                           # still a legal, inert call
     assert hidden(node) is None
 

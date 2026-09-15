@@ -1,0 +1,87 @@
+# The graph, seen from outside: what the car senses, what the policy planned, what the controller
+# is following, and what the clearance layer thinks is in the way.
+#
+# `sim.rviz` plus the three things the split made visible -- the tracker's reference in base_link
+# (AFTER the clearance bend and the grip speed limit, so it is the plan the car is actually
+# driving), the occupancy the clearance arm built from this scan alone, and the controller's
+# diagnostics as text beside the car: which arm, at what friction, with the guard in what state,
+# and the command going out. Launch with `graph_sim.launch.py viz:=true`.
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Time
+    Name: Time
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Value: true
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Topic:
+        Durability Policy: Transient Local
+        Value: /map
+      Value: true
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Size (m): 0.05
+      Style: Points
+      Topic:
+        Value: /scan
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Name: VESC odom (drifts)
+      Topic:
+        Value: /odom
+      Keep: 200
+      Shape:
+        Color: 255; 170; 0
+        Shaft Length: 0.2
+        Head Length: 0.1
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Name: Ground truth (sim only)
+      Topic:
+        Value: /ego_racecar/odom
+      Keep: 200
+      Shape:
+        Color: 255; 0; 0
+        Shaft Length: 0.2
+        Head Length: 0.1
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Name: Plan the car is following
+      Topic:
+        Value: /f1sim/viz/plan
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Name: Clearance occupancy
+      Topic:
+        Value: /f1sim/viz/clearance
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Name: Arm, friction, traction, command
+      Topic:
+        Value: /f1sim/viz/diag
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Cars
+      Topic:
+        Value: /f1sim/viz/cars
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Value: true
+  Global Options:
+    Fixed Frame: map
+  Tools:
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Scale: 30
+    Saved: ~

@@ -4,6 +4,15 @@ scan    (B, k, N)  last k scans, range / range_max, no return -> 1.0
 proprio (B, P)     [speed / v_max, prev actions (2 * h), speed_cap / v_max, imu (6), imu roll/pitch (2)]
 Both sides must call the same functions; a mismatch here is a sim-to-real gap by construction.
 
+"The same functions" is meant literally. Every arithmetic step between a sensor value and an
+observation element is a module-level function here -- `resample_ranges`, `norm_scan`, `norm_imu`,
+`norm_att`, `norm_speed` -- and both `ObsBuilder` (the node) and `gym_env` (the batched env) call
+them rather than writing the arithmetic out. What each side still owns is its own rolling history
+buffers, because the env's are fused into a compiled step; `MessageInputs` and
+`ObsBuilder.build_message` close that gap from the other end, by letting the env state a control
+step as the messages the graph would have carried and driving the node's builder from them.
+`tests/test_obs_identity.py` is the check: identical message-equivalent inputs, identical tensors.
+
 `ScanAugment` adds the optional extra scan channels (`SCAN_CHANNELS`) on the policy side of that
 boundary: they are functions of the scan the env already emits, so the env, the observation spec
 recorded in a checkpoint's `extra["spec"]` and every consumer of that spec are untouched by them.
@@ -50,6 +59,54 @@ MOTION_KEYS = ("speed", "yaw_rate", "roll", "pitch")
 #: Control period the decay is quoted in [s]. The policy runs at the LiDAR's 40 Hz (`params.py`
 #: `control_rate`), on the car and in the simulator alike.
 CONTROL_DT = 0.025
+
+#: Roll/pitch scale for the attitude channel. One constant, because it used to be `ObsSpec`'s
+#: default on the node's side and a literal `0.35` in `gym_env._obs` on the env's -- two numbers
+#: that had to stay equal with nothing making them.
+ATT_SCALE = 0.35
+
+#: A LiDAR miss reads 65.533 m (the 0xFFFF mm sentinel) on this car's `urg_node`. It is finite, so
+#: it survives every "is this a number" check and has to be caught by value.
+MISS_SENTINEL_M = 65.0
+
+
+def resample_ranges(ranges, range_max: float, n_beams: int) -> np.ndarray:
+    """A `LaserScan.ranges` field as the `n_beams` metres the observation is built from.
+
+    Saturate first, then resample. A miss is finite, so interpolating across it invents ranges: one
+    missed beam next to a 1 m wall becomes a 33 m "return" halfway between them.
+
+    On the deployment side this is the first thing that happens to a scan, in both nodes -- the
+    policy hands the result to `ObsBuilder`, the controller normalises it for the clearance grid --
+    and it is here rather than in `f1sim_ros` because it is part of the observation contract: a
+    scan resampled differently is a different observation.
+    """
+    r = np.asarray(ranges, dtype=np.float32)
+    r = np.where(np.isfinite(r) & (r > 0) & (r < MISS_SENTINEL_M), r, np.float32(range_max))
+    if len(r) != n_beams:                       # e.g. 1081 beams from urg_node: resample
+        r = np.interp(np.linspace(0, len(r) - 1, n_beams), np.arange(len(r)), r)
+    return r
+
+
+def norm_scan(ranges_m: torch.Tensor, range_max: float) -> torch.Tensor:
+    """Ranges in metres -> the observation's scan units. Non-finite (no return) -> 1.0."""
+    r = torch.where(torch.isfinite(ranges_m), ranges_m, torch.full_like(ranges_m, range_max))
+    return (r / range_max).clamp(0.0, 1.0)
+
+
+def norm_imu(imu: torch.Tensor, gyro_scale: float, accel_scale: float) -> torch.Tensor:
+    """(..., 6) gyro xyz [rad/s] + accel xyz [m/s^2] -> the observation's IMU channels."""
+    return torch.cat([imu[..., :3] / gyro_scale, imu[..., 3:] / accel_scale], -1)
+
+
+def norm_att(att: torch.Tensor, att_scale: float = ATT_SCALE) -> torch.Tensor:
+    """(..., 2) roll/pitch [rad] -> the observation's attitude channels."""
+    return att / att_scale
+
+
+def norm_speed(speed: torch.Tensor, v_max: float) -> torch.Tensor:
+    """[m/s] -> the observation's speed channel. Used for the measured speed and the cap alike."""
+    return speed / v_max
 
 
 def scan_edges(scan_now: torch.Tensor) -> torch.Tensor:
@@ -264,6 +321,32 @@ class ScanAugment:
 
 
 @dataclass
+class MessageInputs:
+    """One control step for one car, as the graph's topics carry it.
+
+    The point of the type is that it has no simulator in it and no node in it: it is `LaserScan`,
+    `Imu` and `Odometry` fields in their message units, which is the only vocabulary the batched
+    env and the ROS policy node have in common. Both sides can produce one
+    (`gym_env.F1VecEnv.message_inputs`, and the node's own callbacks), and `ObsBuilder.build_message`
+    turns one into an observation -- so "the env and the node build the same observation" becomes a
+    statement that can be executed rather than reviewed.
+    """
+    #: `LaserScan.ranges` [m], at the scanner's own beam count, and its `range_max`.
+    ranges: np.ndarray
+    range_max: float
+    #: `Odometry.twist.twist.linear.x` [m/s] -- the VESC's wheel speed, not ground truth.
+    speed: float
+    #: The `Imu` samples that belong to this control step, (K, 6): gyro xyz [rad/s] then
+    #: linear acceleration xyz [m/s^2], SI, as the node has them after its unit detection.
+    imu: np.ndarray
+    #: (roll, pitch) [rad] from `Imu.orientation`.
+    att: Tuple[float, float]
+    #: The speed cap in force [m/s]. Not a message; it is configuration on both sides, and it is in
+    #: the observation, so it has to be stated with the rest of the step.
+    speed_cap: float
+
+
+@dataclass
 class ObsSpec:
     n_beams: int = 1080
     scan_stack: int = 3
@@ -282,7 +365,7 @@ class ObsSpec:
     v_max: float = 10.0           # = EnvConfig.v_max_policy
     gyro_scale: float = 5.0
     accel_scale: float = 10.0
-    att_scale: float = 0.35
+    att_scale: float = ATT_SCALE
 
     @property
     def row_dim(self) -> int:
@@ -337,18 +420,20 @@ class ObsBuilder:
         imu_att (2,) roll, pitch [rad] from the VESC attitude estimate; speed_cap [m/s]."""
         s = self.spec
         r = torch.as_tensor(np.asarray(ranges, dtype=np.float32), device=self.device)
-        r = torch.where(torch.isfinite(r), r, torch.full_like(r, s.range_max))
-        scan = (r / s.range_max).clamp(0.0, 1.0)[None]
+        scan = norm_scan(r, s.range_max)[None]
         first = self._first
         if first:
             self.scan_hist[:] = scan[:, None, :]
         else:
             self.scan_hist = torch.roll(self.scan_hist, 1, 1); self.scan_hist[:, 0] = scan
         imu = torch.as_tensor(np.asarray(imu_mean, dtype=np.float32), device=self.device).reshape(1, 6)
-        imu = torch.cat([imu[:, :3] / s.gyro_scale, imu[:, 3:] / s.accel_scale], 1)
-        att = torch.as_tensor(np.asarray(imu_att, dtype=np.float32), device=self.device).reshape(1, 2) / s.att_scale
-        feat = torch.cat([torch.tensor([[speed / s.v_max]], device=self.device), imu, att], 1)     # (1, 9)
-        parts = [feat[:, :1], self.act_hist.reshape(1, -1), torch.tensor([[speed_cap / s.v_max]], device=self.device), imu, att]
+        imu = norm_imu(imu, s.gyro_scale, s.accel_scale)
+        att = norm_att(torch.as_tensor(np.asarray(imu_att, dtype=np.float32),
+                                       device=self.device).reshape(1, 2), s.att_scale)
+        v = norm_speed(torch.tensor([[float(speed)]], device=self.device), s.v_max)
+        cap = norm_speed(torch.tensor([[float(speed_cap)]], device=self.device), s.v_max)
+        feat = torch.cat([v, imu, att], 1)     # (1, 9)
+        parts = [feat[:, :1], self.act_hist.reshape(1, -1), cap, imu, att]
         if self.hist is not None:
             if first:
                 self.hist[:] = torch.cat([feat, torch.zeros(1, s.act_dim, device=self.device)], 1)[:, None, :]
@@ -356,3 +441,19 @@ class ObsBuilder:
         self._pending = feat; self._first = False
         proprio = torch.cat(parts, 1)
         return self.scan_hist[:, ::s.scan_stride].clone(), proprio
+
+    def build_message(self, mi: "MessageInputs"):
+        """One control step stated as the topics the graph carries, through the same `build`.
+
+        This is the node's own path written down once: `resample_ranges` on the `LaserScan`, the
+        mean of the `Imu` samples that belong to this scan, the `Odometry` twist as the measured
+        speed, the `Imu` orientation as roll/pitch. `gym_env.F1VecEnv.message_inputs` produces the
+        same object from a simulator step, which is what `tests/test_obs_identity.py` compares.
+        """
+        r = resample_ranges(mi.ranges, mi.range_max, self.spec.n_beams)
+        imu = np.asarray(mi.imu, dtype=np.float32).reshape(-1, 6)
+        if imu.shape[0] == 0:
+            raise ValueError("a control step with no IMU sample has no observation to build: the "
+                             "node inhibits instead, and so should the caller")
+        return self.build(r, float(mi.speed), imu.mean(0), np.asarray(mi.att, dtype=np.float32),
+                          float(mi.speed_cap))

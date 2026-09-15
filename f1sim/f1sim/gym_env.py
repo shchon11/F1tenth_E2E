@@ -27,6 +27,7 @@ import torch
 from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, encode as plan_encode, decode as plan_decode
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit, split_events)
+from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
 from .params import Config
 from .sim import Simulator, StepResult
 from .track import Track
@@ -749,18 +750,19 @@ class F1VecEnv:
 
     # ------------------------------------------------------------------ helpers
     def _norm_scan(self, scan: torch.Tensor) -> torch.Tensor:
-        s = scan[:, :: self.ecfg.scan_subsample]
-        s = torch.where(torch.isfinite(s), s, torch.full_like(s, self.range_max))
-        return (s / self.range_max).clamp(0.0, 1.0)
+        # `learn.obs.norm_scan`, not a second copy of it: the ROS policy node runs the same
+        # function on the same numbers, and this is the boundary a divergence would hide behind.
+        return norm_scan(scan[:, :: self.ecfg.scan_subsample], self.range_max)
 
     def _obs(self, r: StepResult) -> Dict[str, torch.Tensor]:
-        speed = (r.odom[:, 3] / self.ecfg.v_max_policy)[:, None]
+        speed = norm_speed(r.odom[:, 3], self.ecfg.v_max_policy)[:, None]
         obs = {"scan": self.scan_hist[:, ::self.ecfg.scan_stride].clone(), "speed": speed, "prev_action": self.act_hist.reshape(self.B, -1).clone(),
-               "speed_cap": (self.speed_cap / self.ecfg.v_max_policy)[:, None]}
+               "speed_cap": norm_speed(self.speed_cap, self.ecfg.v_max_policy)[:, None]}
         if self.ecfg.obs_imu and r.imu is not None and r.imu.shape[1] > 0:
             m = r.imu.mean(1)
-            obs["imu"] = torch.cat([m[:, :3] / self.ecfg.imu_gyro_scale, m[:, 3:] / self.ecfg.imu_accel_scale], 1)
-            obs["imu_att"] = r.imu_att[:, :2] / 0.35          # VESC roll/pitch estimate (yaw drifts: excluded)
+            obs["imu"] = norm_imu(m, self.ecfg.imu_gyro_scale, self.ecfg.imu_accel_scale)
+            # VESC roll/pitch estimate (yaw drifts: excluded)
+            obs["imu_att"] = norm_att(r.imu_att[:, :2], ATT_SCALE)
         if self.hist is not None:
             self._last_feat = torch.cat([speed, obs.get("imu", torch.zeros(self.B, 6, device=self.device)), obs.get("imu_att", torch.zeros(self.B, 2, device=self.device))], 1)
             obs["hist"] = self.hist[:, ::self.ecfg.hist_stride].reshape(self.B, -1)
@@ -769,6 +771,34 @@ class F1VecEnv:
             # was trained without keep their index and a warm start is a copy plus zeros.
             obs["opp_token"] = self.opp_token(r.state)
         return obs
+
+    def message_inputs(self, i: int, r: Optional[StepResult] = None) -> MessageInputs:
+        """One car's control step, stated as the topics the ROS graph would have carried.
+
+        The simulator's bridges (`f1sim_ros/bridge_node.py`, `viewer/ros_link.py`) publish exactly
+        these numbers: `r.scan[i]` as `LaserScan.ranges` with `cfg.lidar.range_max`, `r.odom[i, 3]`
+        as `Odometry.twist.twist.linear.x`, `r.imu[i]` as the `Imu` samples of this step in SI, and
+        `r.imu_att[i, :2]` as the roll and pitch of `Imu.orientation`. Nothing privileged is in it:
+        no pose, no ground-truth speed, no friction.
+
+        It exists so the claim "the batched env and the node build the same observation" can be
+        run: `ObsBuilder.build_message` takes this object, and `tests/test_obs_identity.py`
+        compares the result against `_obs`'s row `i`. A field that this method has to invent is a
+        field the node could not have -- which is the sim-to-real gap the observation contract is
+        supposed to make impossible.
+        """
+        r = self.last_result if r is None else r
+        if r is None:
+            raise RuntimeError("no step to describe: reset the env first")
+        if r.imu is None or r.imu.shape[1] == 0:
+            raise RuntimeError("this env publishes no IMU (EnvConfig.obs_imu / cfg.imu.enabled), so "
+                               "there is no message-equivalent step to state")
+        return MessageInputs(ranges=r.scan[i].detach().cpu().numpy().astype(np.float32),
+                             range_max=float(self.range_max),
+                             speed=float(r.odom[i, 3]),
+                             imu=r.imu[i].detach().cpu().numpy().astype(np.float32),
+                             att=(float(r.imu_att[i, 0]), float(r.imu_att[i, 1])),
+                             speed_cap=float(self.speed_cap[i]))
 
     def _priv(self, r: StepResult) -> torch.Tensor:
         st = r.state

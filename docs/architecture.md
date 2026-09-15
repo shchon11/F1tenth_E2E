@@ -218,6 +218,37 @@ are in [training.md](training.md#the-deployment-budget) and
 probe that measures it, are in [training.md](training.md#predicting-the-near-future---aux-future)
 and [its own note](research/future-head-2026-09-14.md).
 
+### Deployment: where the network stops and the graph starts
+
+Everything above is the actor. On the car it is one node, and the boundary around it is the ROS 2
+topic graph:
+
+```
+/scan /odom /sensors/imu/raw  ──►  policy_node  ──/f1sim/plan──►  controller_node  ──►  /drive
+                                   ObsBuilder                     PlanTracker
+                                   + actor                        + arm + traction guard
+```
+
+The split is not cosmetic. It makes three things true that were not:
+
+* **the arms are not a property of the network's process.** `fixed_low`, `+clearance` and the
+  traction guard live in `controller_node`, so the plan on the wire is arm-agnostic and one
+  recorded plan stream can be replayed through any of them. A published baseline that emits
+  steering and speed directly skips the whole thing, which is what makes the comparison a
+  comparison of systems.
+* **the tracker is reachable without a checkpoint.** `controller_node` reads eight floats off a
+  topic; anything that can produce them can drive the car through the same runtime.
+* **the observation is a message, not an internal.** `learn/obs.py` owns every arithmetic step from
+  sensor value to observation element, `gym_env` calls those same functions, and
+  `F1VecEnv.message_inputs` states a simulator step as the fields the topics carry so the two can
+  be compared by execution rather than by reading. `tests/test_obs_identity.py` does exactly that.
+
+The split is bit-exact against the monolithic node it replaced: 1920 commands over four arms, the
+traction guard on and off, a simulator bag and a real car bag, worst difference 0.000e+00 on
+steering and speed (`tests/test_graph_parity.py`). What the graph can and cannot carry — and why
+batched PPO is not one of the things it can — is [ros2.md](ros2.md); the numbers and the failure
+modes are in [the research note](research/ros-graph-2026-09-15.md).
+
 ## Raceline and teacher
 
 ```python
@@ -260,7 +291,9 @@ Curvature rather than `y(x)`: a hairpin is just a large curvature, whereas a pol
 bend back on itself.
 
 The teacher becomes a planner too (`RacelineTeacher.plan_action`), so imitation learns plans and PPO
-refines them, and the same tracker code runs on the vehicle.
+refines them, and the same tracker code runs on the vehicle — literally the same code, in
+`controller_node`, checked command for command against the in-process path the benchmark scores
+(`tests/test_graph_parity.py`).
 
 An experimental, opt-in extension adjusts the tracker's speed and acceleration limits from an
 estimate of the current friction; see [Training](training.md#experimental-friction-aware-control).
