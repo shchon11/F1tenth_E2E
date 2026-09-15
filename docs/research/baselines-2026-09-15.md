@@ -359,15 +359,35 @@ is for. **165 held passes from a network that has never seen another car** is th
 it. The four scenarios separate the way you would expect if the opponent is being treated as scenery
 — best against a `slow` car (24/160), worst when there are two of them (16/160).
 
-### The two suite runs reproduce each other exactly
+### The two suite runs reproduce each other exactly — four systems, 256 cells
 
-v2.1 contains v2's 64 cells unchanged, and this system was scored on both, in two independent runs
-days apart in wall-clock terms and under two different suite freezes. Across all 64 shared cells:
-**0 cells differ in success count, 0 in per-trial outcomes, and 0 in the physical start digest.**
-S 47/384, A 1/96 and O 9/32 are identical in both. That is the determinism the whole paired design
-rests on, demonstrated rather than assumed — and it is also why the earlier `frozen_original@legacy`
-disagreement with its *2026-09-12* row cannot be dismissed as run-to-run noise: under one digest on
-one device there is no run-to-run noise.
+v2.1 contains v2's 64 cells unchanged, and every system here is scored on both, in two independent
+runs hours apart under two different suite freezes. Across all **256 shared cells**:
+
+| system | what it is | cells | success Δ | per-trial outcome Δ | physical start Δ | max \|Δ progress\| | max \|Δ lap\| |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TinyLidarNet-L | ONNX CNN, direct action | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| End2Race | torch **GRU**, direct action | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| frozen original `@legacy` | ours, plan + iLQR | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| A701 `@fixed_low` | ours, plan + iLQR + clamp | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+
+Not "agree to within a tolerance" — **bit-identical**, down to every trial's distance along the
+route and every completed lap time.
+
+The spread matters more than the zeroes. This is not one lucky system: it is a 220 k-parameter CNN
+through an ONNX runtime, an 11 M-parameter **recurrent** network through torch carrying hidden state
+across every step of every trial, and two plan-space PPO policies under two different controller
+arms. The recurrent one is the case that could plausibly have drifted — a GRU accumulates state, so
+a single differing float in the first step of a 444-step trial has 443 steps to grow — and it did
+not, in 64 cells.
+
+That is the determinism the whole paired design rests on, demonstrated rather than assumed across
+the full variety of systems in these tables. It is also why the earlier `frozen_original@legacy`
+disagreement with its *2026-09-12* row cannot be waved away as run-to-run noise: under one digest on
+one device, in these tables, there is no run-to-run noise to appeal to.
+
+(Only the 64 shared cells can be compared this way; the 80-cell traffic family exists in v2.1 alone.
+The rows above are counted from the two independent cell files on disk, not from a summary.)
 
 ## The fair comparison: what is held fixed, and what is deliberately not
 
