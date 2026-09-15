@@ -79,7 +79,7 @@ beam gets `z >= oz = 0.11 m`, which is 2-4 sigma, so it falls out without a spec
     sharp = oz / sqrt(oz^2 + sigma_z_att^2)          (sigma_z_att = (3) without sigma_static) (4a)
 
 The predicted floor range is `oz / |bz|`, so its own uncertainty is `r sigma_z_att / oz` **relative**
-to itself -- 30 % at 2 m and 140 % at 10 m. Past `oz/sigma_att` = 7 m the geometry no longer
+to itself -- 30 % at 2 m and 140 % at 10 m. Past `oz / sigma` = 5 m the geometry no longer
 localises the floor at all: a beam that is level to within a quarter of
 a degree meets the floor *somewhere* beyond 10 m, and "this 9 m return might be the floor" is true
 and useless. Without (4a) a level sensor reads 0.78 on its most distant returns -- measured, and the
@@ -447,7 +447,8 @@ class AttitudeTracker:
 
     What it cannot do: the **LiDAR's** mounting misalignment (`lidar.mount_roll/mount_pitch`,
     +-0.02 rad) is between the sensor and the body and no IMU sees it. It is the floor of this
-    estimate, and it is what `SIGMA_ATT` is mostly made of.
+    estimate, and it is half of what `SIGMA_ROLL` / `SIGMA_PITCH` are made of -- the other half
+    is `vehicle.road_tilt`, which is a property of the floor rather than of the car.
 
     Batched: one row per env, state carried across steps, cleared per row at an episode boundary
     exactly as `obs.ScanAugment`'s occupancy memory is.
