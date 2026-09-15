@@ -500,3 +500,147 @@ def test_pure_roll_puts_beams_on_the_floor_and_the_pitch_only_ring_does_not_pred
     # and none of them is inside the clearance grid, so this case moves no plan
     x = (r3 * torch.cos(ang)[None])[hit3]
     assert float(x.max()) < cl.ClearanceSpec().x_max
+
+
+# ------------------------------------------------------------------ attitude from the ego state
+def test_ego_state_attitude_reproduces_the_calibrated_gains():
+    """Steady state: the estimator must return exactly what §6.1a's gains say, and the pitch map
+    must be the asymmetric one -- squat 1.7 deg/g under throttle, dive 0.46 under braking."""
+    e = fl.EgoStateAttitude(3, dt=0.025)
+    v = torch.tensor([8.0, 8.0, 8.0])
+    for _ in range(80):
+        v = v + torch.tensor([-0.1, +0.1, 0.0])              # -4, +4, 0 m/s^2
+        att = e.update(v, torch.tensor([0.0, 0.0, 1.0]))
+    assert abs(float(att[0, 1]) - fl.DIVE_PER_G * 4.0 / fl.G_ACC) < 1e-4     # braking: dive
+    assert abs(float(att[1, 1]) + fl.SQUAT_PER_G * 4.0 / fl.G_ACC) < 1e-4    # throttle: squat
+    assert abs(float(att[0, 1])) < abs(float(att[1, 1])), "the map is asymmetric"
+    # cornering: a_y = v * omega_z, and the roll is to the OUTSIDE (the simulator's sign)
+    assert abs(float(att[2, 0]) - fl.ROLL_PER_G * float(v[2]) * 1.0 / fl.G_ACC) < 1e-3
+    assert float(att[2, 1]) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_ego_state_attitude_holds_through_a_wheel_lock():
+    """This car locks its wheels: §2.12 measures -40 to -143 m/s^2 of WHEEL deceleration against
+    -3 to -16 of body. Differentiating that raw is 25 degrees of phantom dive."""
+    e = fl.EgoStateAttitude(1, dt=0.025)
+    v = torch.tensor([8.0])
+    for _ in range(60):
+        v = v - torch.tensor([0.1])
+        e.update(v, torch.zeros(1))
+    steady = float(e.ax)
+    assert abs(steady + 4.0) < 0.05
+    seen = []
+    for _ in range(6):                                        # 100 m/s^2 of wheel deceleration
+        v = (v - torch.tensor([2.5])).clamp_min(0.0)
+        att = e.update(v, torch.zeros(1))
+        seen.append(float(e.ax))
+    # The guard holds through the spike and resumes when the derivative is plausible again -- which
+    # it should, because by then the wheel speed really has settled. What must never happen is the
+    # estimator adopting a wheel deceleration the body cannot produce.
+    assert max(abs(x) for x in seen) <= e.A_BODY_MAX
+    assert abs(math.degrees(float(att[0, 1]))) < 1.0, "no phantom dive from a lock"
+    # and without the guard it would: the same spike, believed, is tens of g
+    raw = 2.5 / 0.025
+    assert raw > 5 * e.A_BODY_MAX
+
+
+def test_ego_state_accel_source_inverts_the_gravity_leak():
+    """The specific force already contains `g sin(tilt)` and the tilt is what is being estimated,
+    so `f = a (1 + k)` closes -- the same closure `real_data_calibration.md` §6.1a uses."""
+    for src in ("accel", "blend"):
+        e = fl.EgoStateAttitude(1, dt=0.025, source=src)
+        a_true = 6.0
+        f_y = a_true * (1.0 + fl.ROLL_PER_G)                  # what the sensor would read
+        for _ in range(120):
+            att = e.update(torch.tensor([6.0]), torch.tensor([1.0]),
+                           torch.tensor([[0.0, f_y, fl.G_ACC]]))
+        assert abs(float(att[0, 0]) - fl.ROLL_PER_G * a_true / fl.G_ACC) < 2e-4, src
+    with pytest.raises(ValueError, match="needs accel"):
+        fl.EgoStateAttitude(1, source="accel").update(torch.zeros(1), torch.zeros(1))
+
+
+def test_ego_state_attitude_clears_per_episode():
+    e = fl.EgoStateAttitude(2, dt=0.025)
+    for _ in range(40):
+        e.update(torch.tensor([6.0, 6.0]), torch.tensor([1.5, 1.5]))
+    assert float(e.att[0, 0]) > 0.01 and float(e.att[1, 0]) > 0.01
+    e.reset(torch.tensor([True, False]))
+    assert float(e.att[0, 0]) == 0.0 and float(e.att[1, 0]) > 0.01
+
+
+# ------------------------------------------------------------------ the learned front-end
+def _frontend(tmp_path, width=20):
+    from f1sim.learn.frontend import (FrontEnd, frontend_spec, imu_index_spec, save_frontend)
+    from f1sim.learn.obs import ObsSpec
+    sp = ObsSpec(n_beams=256, scan_stack=6, act_dim=8, hist_len=20)
+    idx = imu_index_spec(sp)
+    spec = frontend_spec(width=width, n_beams=256, imu_dim=idx["dim"])
+    m = FrontEnd(6, spec)
+    path = str(tmp_path / "fe.pt")
+    save_frontend(path, m, spec, idx, 6)
+    return path, m, spec, idx, sp
+
+
+def test_frontend_at_init_is_the_uniform_prior_and_the_identity(tmp_path):
+    """Zero output layers, the same discipline every other addition here keeps: an untrained
+    front-end classifies at 1/3 and denoises to exactly the input."""
+    from f1sim.learn.frontend import imu_vector, n_params
+    _p, m, spec, idx, _sp = _frontend(tmp_path)
+    m.eval()
+    scan = torch.rand(3, 6, 256)
+    pro = torch.zeros(3, int(idx["proprio_dim"]))
+    ego = torch.zeros(3, int(idx["ego_dim"]))
+    with torch.no_grad():
+        logits, rng, att = m(scan, imu_vector(pro, idx, ego))
+    assert float(logits.abs().max()) == 0.0
+    assert torch.allclose(torch.softmax(logits, 1), torch.full_like(logits, 1.0 / 3.0))
+    assert torch.equal(rng, scan[:, 0])
+    assert float(att.abs().max()) == 0.0
+    assert n_params(m) <= 150_000, "the contract's parameter budget"
+
+
+def test_frontend_cannot_move_a_return_further_than_its_span(tmp_path):
+    """The denoiser is a bounded residual on the newest frame: a wall cannot be denoised into open
+    space however confident the network is."""
+    from f1sim.learn.frontend import imu_vector
+    _p, m, _spec, idx, _sp = _frontend(tmp_path)
+    with torch.no_grad():
+        m.head.bias.fill_(50.0)                              # maximally confident, in both signs
+        scan = torch.full((2, 6, 256), 0.2)
+        rng = m(scan, imu_vector(torch.zeros(2, int(idx["proprio_dim"])), idx,
+                                 torch.zeros(2, int(idx["ego_dim"]))))[1]
+    assert float((rng - scan[:, 0]).abs().max()) <= m.RANGE_SPAN + 1e-6
+
+
+def test_frontend_round_trips_with_its_column_map(tmp_path):
+    from f1sim.learn.frontend import load_frontend, imu_vector
+    path, m, spec, idx, _sp = _frontend(tmp_path)
+    m2, spec2, idx2, k2 = load_frontend(path)
+    assert spec2 == spec and idx2 == idx and k2 == 6
+    assert all(torch.equal(a, b) for a, b in zip(m.state_dict().values(), m2.state_dict().values()))
+    assert not any(p.requires_grad for p in m2.parameters())
+    # a proprio vector of the wrong width is an error at the first forward, not a plausible number
+    with pytest.raises(ValueError, match="was built for"):
+        imu_vector(torch.zeros(1, 7), idx, torch.zeros(1, int(idx["ego_dim"])))
+    with pytest.raises(ValueError, match="ego-state columns"):
+        imu_vector(torch.zeros(1, int(idx["proprio_dim"])), idx)
+
+
+def test_frontend_channels_are_zero_init_parity_and_refuse_without_one(tmp_path):
+    """`fe_floor` / `fe_range` as scan channels: at init the class row is exactly 1/3 and the range
+    row is bit-identical to the raw frame, so the columns a warm start zeroes carry nothing."""
+    from f1sim.learn.obs import ScanAugment, att_index_spec
+    path, _m, _spec, _idx, sp = _frontend(tmp_path)
+    cfg = {"proprio": att_index_spec(sp), "spec": {}, "fov": 1.5 * math.pi,
+           "att_source": "ego", "frontend": {"path": path}}
+    aug = ScanAugment(("fe_floor", "fe_range"), 256, 2, floor=cfg)
+    scan = torch.rand(2, 6, 256) * 0.5
+    pro = torch.zeros(2, sp.proprio_dim)
+    pro[:, att_index_spec(sp)["accel"] + 2] = 9.81 / 10.0
+    out = aug(scan, pro)
+    assert out.shape == (2, 8, 256)
+    assert torch.allclose(out[:, -2], torch.full_like(out[:, -2], 1.0 / 3.0), atol=1e-6)
+    assert torch.allclose(out[:, -1], scan[:, 0], atol=1e-6)
+    assert torch.allclose(out, aug.preview(scan, None, pro), atol=1e-6)
+    with pytest.raises(ValueError, match="trained front-end"):
+        ScanAugment(("fe_floor",), 256, 2, floor={**cfg, "frontend": None})
