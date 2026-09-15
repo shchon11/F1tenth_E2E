@@ -24,7 +24,7 @@ reports how many, so a backlog is a number on screen instead of a mystery.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace as dataclasses_replace
 from typing import Any, Dict, List, Optional
 
 PROTOCOL_VERSION = 1
@@ -146,6 +146,37 @@ class SessionConfig:
     saliency: bool = False
     internals: bool = False
     max_render_cars: int = 64
+    #: Recording settings (`viewer/recorder.py`). Carried here so a session remembers them and a
+    #: saved config reproduces the clip, and excluded from `affects_simulation` below: changing the
+    #: frame rate is not a different simulation, and restarting the session to change it would throw
+    #: away the run you were about to film.
+    record_dir: str = ""                 # "" = ~/f1sim_videos
+    record_width: int = 1280             # 0 x 0 = whatever the window is
+    record_height: int = 720
+    record_fps: int = 30
+    record_camera: str = ""              # "" = whatever the viewport is showing
+    record_overlays: bool = True
+    record_seconds: float = 0.0          # 0 = until stopped
+    record_encoder: str = "auto"         # auto prefers the GPU's h264_nvenc where it works
+
+    def record_spec(self, scenario: str = "", window=(1280, 720)):
+        """These settings as a `viewer.recorder.RecordSpec`, with the output path filled in.
+
+        Built here rather than in the window so the console, a test and any later caller ask the
+        same object for it; `resolved` turns "현재 창 크기" into numbers and makes both sides even
+        for the encoder.
+        """
+        import os
+
+        from .. import recorder as R
+        spec = R.RecordSpec(path="", width=int(self.record_width), height=int(self.record_height),
+                            fps=int(self.record_fps), camera=str(self.record_camera),
+                            overlays=bool(self.record_overlays),
+                            seconds=float(self.record_seconds),
+                            encoder=str(self.record_encoder or "auto"))
+        spec = spec.resolved(window)
+        name = os.path.basename(R.default_video_path(scenario or self.map_name))
+        return dataclasses_replace(spec, path=os.path.join(self.record_dir or R.VIDEO_DIR, name))
 
     def slots(self):
         """The table as `OpponentSlot`s, or None. Raises ValueError with the parser's own reason."""
@@ -215,6 +246,10 @@ class SessionConfig:
         for k in ("saliency", "internals", "max_render_cars"):
             a.pop(k, None)
             b.pop(k, None)
+        for k in list(a):
+            if k.startswith("record_"):    # recording settings describe the film, not the race
+                a.pop(k, None)
+                b.pop(k, None)
         return a != b
 
 

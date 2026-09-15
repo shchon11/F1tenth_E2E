@@ -26,6 +26,7 @@ from .opponent_table import OpponentSlotTable
 from .overlays import ActivationPanel, DashPanel, PolicyInputPanel
 from .protocol import (SessionConfig, STAGE_TEXT, STATE_FAILED, STATE_IDLE, STATE_PAUSED,
                        STATE_PREPARING, STATE_RUNNING, STATE_STOPPING)
+from .. import recorder as REC
 from .theme import C, SP
 from .viewport import CAMERA_KEYS, CAMERA_MODES, MAX_RENDER_CARS, ViewportWidget
 from .widgets import (Card, Collapsible, FieldRow, FilterList, FlowLayout, KeyValueList,
@@ -177,6 +178,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.header_summary.setObjectName("HeaderSub")
         self.header_summary.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         h.addWidget(self.header_summary, 1)
+        self.header_rec = QtWidgets.QLabel("● REC")
+        self.header_rec.setStyleSheet(f"color: {C['danger']}; font-weight: 600;")
+        self.header_rec.setToolTip("3D 화면을 mp4 로 쓰는 중입니다.")
+        self.header_rec.setVisible(False)
+        h.addWidget(self.header_rec)
 
         self.btn_left_panel = QtWidgets.QPushButton("설정 패널")
         self.btn_left_panel.setObjectName("GhostButton")
@@ -410,6 +416,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         cfg_card.add(self.row_mu)
         v.addWidget(cfg_card)
 
+        # -- recording. Its own card rather than a line in 고급 설정: it is a thing a person comes
+        # to the page to do, not a setting they tune once.
+        v.addWidget(self._build_record_card())
+
         # -- advanced
         adv = Collapsible("고급 설정", expanded=False)
         # Not "CUDA 가속": the label said that and the box was ticked, so opening the viewer looked
@@ -493,6 +503,190 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._left_wrap = wrap
         return wrap
 
+    def _build_record_card(self) -> QtWidgets.QWidget:
+        """The 녹화 form: where the clip goes, how big, how fast, and what is in it.
+
+        Recording renders the same frames the session is showing into an offscreen buffer at the
+        size chosen here, so the window can be any size and the clip is still 1080p. Encoding runs
+        on its own thread behind a bounded queue: a frame the encoder cannot take is dropped and
+        counted rather than made to wait, because the thread being protected is the one painting the
+        window.
+        """
+        card = Card("녹화")
+        self.edit_record = QtWidgets.QLineEdit()
+        self.edit_record.setPlaceholderText(REC.VIDEO_DIR)
+        self.edit_record.setToolTip("저장 폴더. 파일 이름은 맵과 시각으로 자동으로 붙습니다.")
+        browse = QtWidgets.QPushButton("…")
+        browse.setObjectName("GhostButton")
+        browse.setFixedWidth(32)
+        browse.clicked.connect(self._on_record_dir)
+        dir_row = QtWidgets.QHBoxLayout(); dir_row.setSpacing(SP[0])
+        dir_row.addWidget(self.edit_record, 1); dir_row.addWidget(browse)
+        dir_box = QtWidgets.QWidget(); dir_box.setLayout(dir_row)
+        card.add(FieldRow("저장 폴더", dir_box, f"비우면 {REC.VIDEO_DIR}"))
+
+        self.combo_res = QtWidgets.QComboBox()
+        for label_, w_, h_ in REC.RESOLUTIONS:
+            self.combo_res.addItem(label_, (w_, h_))
+        self.combo_res.setToolTip("녹화 해상도. 창 크기와 무관하게 이 크기로 따로 렌더링합니다.")
+        self.combo_fps = QtWidgets.QComboBox()
+        for f_ in REC.FPS_CHOICES:
+            self.combo_fps.addItem(f"{f_} fps", f_)
+        self.combo_fps.setCurrentIndex(list(REC.FPS_CHOICES).index(30))
+        g = QtWidgets.QGridLayout(); g.setHorizontalSpacing(SP[1]); g.setVerticalSpacing(SP[0])
+        g.addWidget(FieldRow("해상도", self.combo_res, ""), 0, 0)
+        g.addWidget(FieldRow("프레임", self.combo_fps, ""), 0, 1)
+        card.add(g)
+
+        self.combo_rec_cam = QtWidgets.QComboBox()
+        self.combo_rec_cam.addItem("현재 카메라", "")
+        for key, text, tip in CAMERA_MODES:
+            self.combo_rec_cam.addItem(text, key)
+            self.combo_rec_cam.setItemData(self.combo_rec_cam.count() - 1, tip, QtCore.Qt.ToolTipRole)
+        self.combo_rec_cam.setToolTip("녹화만 이 카메라로 찍습니다. 화면은 그대로 둡니다.")
+        self.spin_rec_secs = QtWidgets.QDoubleSpinBox()
+        self.spin_rec_secs.setRange(0.0, 3600.0); self.spin_rec_secs.setDecimals(0)
+        self.spin_rec_secs.setSingleStep(5.0); self.spin_rec_secs.setSuffix(" 초")
+        self.spin_rec_secs.setSpecialValueText("수동 정지")
+        self.spin_rec_secs.setToolTip("0 이면 다시 누를 때까지 계속 녹화합니다.")
+        g2 = QtWidgets.QGridLayout(); g2.setHorizontalSpacing(SP[1])
+        g2.addWidget(FieldRow("카메라", self.combo_rec_cam, ""), 0, 0)
+        g2.addWidget(FieldRow("길이", self.spin_rec_secs, ""), 0, 1)
+        card.add(g2)
+
+        self.chk_rec_overlay = QtWidgets.QCheckBox("오버레이 포함 (LiDAR 점·레이싱 라인·차량 라벨)")
+        self.chk_rec_overlay.setChecked(True)
+        self.chk_rec_overlay.setToolTip("끄면 주행만 담긴 깨끗한 영상이 됩니다. 화면 표시는 그대로입니다.")
+        card.add(self.chk_rec_overlay)
+
+        self.combo_rec_enc = QtWidgets.QComboBox()
+        for key in REC.ENCODERS:
+            self.combo_rec_enc.addItem(REC.ENCODER_LABEL[key], key)
+        self.combo_rec_enc.setToolTip(
+            "자동: GPU 인코더(h264_nvenc)가 실제로 되는 기계면 그걸 쓰고, 안 되면 libx264 로 돌아갑니다.\n"
+            "어느 쪽이 쓰였는지는 끝난 파일 줄에 적힙니다. 렌더링은 세션이 쓰는 GL 그대로입니다.")
+        card.add(FieldRow("인코더", self.combo_rec_enc, ""))
+
+        self.btn_record = PendingToggle("● 녹화 시작")
+        self.btn_record.setToolTip("3D 화면을 mp4 로 저장합니다.  (R)")
+        self.btn_record.requested.connect(lambda _want: self._on_record_toggle())
+        card.add(self.btn_record)
+        self.record_note = label("", "hint")
+        self.record_note.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+        self.record_note.setOpenExternalLinks(False)
+        self.record_note.linkActivated.connect(self._on_open_video)
+        card.add(self.record_note)
+        if not REC.ffmpeg_available():
+            self.btn_record.setEnabled(False)
+            self.record_note.setText("ffmpeg 이 없어 녹화할 수 없습니다 (apt install ffmpeg).")
+        #: The recording in progress, and a 4 Hz timer that shows how it is going and stops it when
+        #: the requested length is reached. The recorder itself is driven by the viewport's paint.
+        self._recorder = None
+        self._rec_timer = QtCore.QTimer(self)
+        self._rec_timer.setInterval(250)
+        self._rec_timer.timeout.connect(self._record_tick)
+        self._last_video = ""
+        return card
+
+    # ---------------------------------------------------------------- recording
+    def record_settings(self) -> "REC.RecordSpec":
+        """The form as a spec, with the path filled in from the map and the clock."""
+        w, h = self.combo_res.currentData() or (1280, 720)
+        spec = REC.RecordSpec(path="", width=int(w), height=int(h),
+                              fps=int(self.combo_fps.currentData() or 30),
+                              camera=str(self.combo_rec_cam.currentData() or ""),
+                              overlays=self.chk_rec_overlay.isChecked(),
+                              seconds=float(self.spin_rec_secs.value()),
+                              encoder=str(self.combo_rec_enc.currentData() or "auto"))
+        spec = spec.resolved(self.viewport.fb_size())
+        import dataclasses
+        import os
+        name = os.path.basename(REC.default_video_path(self._running_scenario()))
+        folder = self.edit_record.text().strip() or REC.VIDEO_DIR
+        return dataclasses.replace(spec, path=os.path.join(os.path.expanduser(folder), name))
+
+    def _running_scenario(self) -> str:
+        f = self._running_facts or {}
+        return str(f.get("scenario") or f.get("map") or self._scenario() or "f1sim")
+
+    @property
+    def recording(self) -> bool:
+        return self._recorder is not None
+
+    def _on_record_dir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "녹화 저장 폴더", self.edit_record.text().strip() or REC.VIDEO_DIR)
+        if d:
+            self.edit_record.setText(d)
+
+    def _on_record_toggle(self):
+        if self._recorder is not None:
+            self._stop_recording("수동 정지")
+            return
+        if self.state not in (STATE_RUNNING, STATE_PAUSED):
+            self.record_note.setText("세션이 돌고 있을 때만 녹화할 수 있습니다.")
+            self.btn_record.settle(False)
+            return
+        spec = self.record_settings()
+        rec = REC.VideoRecorder(spec)
+        if not rec.ok:
+            self.record_note.setObjectName("HintWarn")
+            self.record_note.setText(rec.error or "녹화를 시작할 수 없습니다.")
+            self.btn_record.settle(False)
+            return
+        self._recorder = rec
+        self.viewport.start_recording(rec)
+        self._rec_timer.start()
+        self.btn_record.setText("■ 녹화 중지")
+        self.btn_record.settle(True)
+        self.record_note.setObjectName("Hint")
+        self.record_note.setText(f"녹화 중 — {os.path.basename(spec.path)}")
+        self._update_rec_badge()
+
+    def _stop_recording(self, why: str = ""):
+        rec, self._recorder = self._recorder, None
+        self.viewport.stop_recording()
+        self._rec_timer.stop()
+        self.btn_record.setText("● 녹화 시작")
+        self.btn_record.settle(False)
+        self._update_rec_badge()
+        if rec is None:
+            return
+        rec.stop()
+        self._last_video = rec.spec.path
+        kind = "HintWarn" if rec.error else "Hint"
+        self.record_note.setObjectName(kind)
+        if rec.error:
+            self.record_note.setText(rec.summary())
+        else:
+            self.record_note.setText(f"{rec.summary()}   <a href='#open'>열기</a>")
+        self.record_note.style().unpolish(self.record_note)
+        self.record_note.style().polish(self.record_note)
+        self.status_text.setText(f"녹화 저장: {rec.spec.path}" + (f" ({why})" if why else ""))
+
+    def _record_tick(self):
+        rec = self._recorder
+        if rec is None:
+            return
+        if rec.error:
+            self._stop_recording("오류")
+            return
+        drops = f" · 버린 프레임 {rec.dropped}" if rec.dropped else ""
+        self.record_note.setText(f"녹화 중 {rec.duration:.1f}초 · {rec.written}프레임{drops}")
+        if rec.spec.seconds and rec.duration >= rec.spec.seconds:
+            self._stop_recording(f"{rec.spec.seconds:.0f}초 도달")
+
+    def _on_open_video(self, _href: str = ""):
+        if not self._last_video or not os.path.isfile(self._last_video):
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_video))
+
+    def _update_rec_badge(self):
+        """The header says so while a clip is being written. It is a file being created on someone's
+        disk; a UI that does that silently is a UI that fills a disk silently."""
+        if hasattr(self, "header_rec"):
+            self.header_rec.setVisible(self.recording)
+
     # ---------------------------------------------------------------- centre: the picture
     def _build_centre(self) -> QtWidgets.QWidget:
         centre = QtWidgets.QWidget()
@@ -563,9 +757,15 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         _, h = group()
         self.btn_shot = QtWidgets.QPushButton("스크린샷")
         self.btn_shot.setObjectName("GhostButton")
-        self.btn_shot.setToolTip("현재 3D 화면을 PNG로 저장합니다.  (S)")
+        self.btn_shot.setToolTip("3D 화면을 PNG로 저장합니다. 왼쪽 '녹화' 카드의 해상도로 찍습니다.  (S)")
         self.btn_shot.clicked.connect(self._on_screenshot)
         h.addWidget(self.btn_shot)
+        # The same action as the card's button, within reach of the picture it films.
+        self.btn_record_bar = QtWidgets.QPushButton("● 녹화")
+        self.btn_record_bar.setObjectName("GhostButton")
+        self.btn_record_bar.setToolTip("녹화 시작 / 중지. 설정은 왼쪽 '녹화' 카드에 있습니다.  (R)")
+        self.btn_record_bar.clicked.connect(self._on_record_toggle)
+        h.addWidget(self.btn_record_bar)
         v.addWidget(bar)
 
         # -- policy panels, foldable so they never crowd the picture
@@ -940,6 +1140,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         sc("Ctrl+.", drive_only(lambda: self.btn_stop.click() if self.btn_stop.isEnabled() else None))
         sc("Ctrl+F", drive_only(lambda: self.map_list.search.setFocus(QtCore.Qt.ShortcutFocusReason)))
         sc("S", drive_only(lambda: self._on_screenshot()))
+        sc("R", drive_only(lambda: self._on_record_toggle()))
         sc("F1", self.show_help)
 
     # ================================================================ data in
@@ -1056,6 +1257,14 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_focus_prev.setEnabled(running)
         self.btn_focus_next.setEnabled(running)
         self.btn_shot.setEnabled(running or preparing)
+        if hasattr(self, "btn_record"):
+            can_record = running and REC.ffmpeg_available()
+            self.btn_record.setEnabled(can_record or self.recording)
+            self.btn_record_bar.setEnabled(can_record or self.recording)
+            if self.recording and not running:
+                # The session is gone; nothing will paint another frame into the clip. Close it
+                # rather than leave a file that silently stopped growing.
+                self._stop_recording("세션 종료")
         self.btn_mu_apply.setEnabled(running)
 
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
@@ -1692,6 +1901,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             saliency=self.chk_saliency.isChecked(),
             internals=self.chk_internals.isChecked(),
             max_render_cars=MAX_RENDER_CARS,
+            # The recording settings travel with the session so a saved config reproduces the clip.
+            # They are excluded from `affects_simulation`, so changing one never restarts a run.
+            record_dir=self.edit_record.text().strip(),
+            record_width=int((self.combo_res.currentData() or (1280, 720))[0]),
+            record_height=int((self.combo_res.currentData() or (1280, 720))[1]),
+            record_fps=int(self.combo_fps.currentData() or 30),
+            record_camera=str(self.combo_rec_cam.currentData() or ""),
+            record_overlays=self.chk_rec_overlay.isChecked(),
+            record_seconds=float(self.spin_rec_secs.value()),
+            record_encoder=str(self.combo_rec_enc.currentData() or "auto"),
         )
 
     def _on_start(self):
@@ -1765,10 +1984,18 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                      "plan": self.chk_plan.isChecked()})
 
     def _on_screenshot(self):
-        import os
-        path = os.path.join(os.path.expanduser("~"), f"f1sim_{int(time.time())}.png")
-        ok = self.viewport.grab_png(path)
-        self.status_text.setText(f"스크린샷 저장: {path}" if ok else "스크린샷 실패 (GL 화면 없음)")
+        """A PNG of the 3D view, at the resolution the 녹화 card is set to.
+
+        The same offscreen render a recording uses, so a still and a frame of the clip are the same
+        picture -- and so a 1080p screenshot does not depend on how big the window happens to be.
+        """
+        spec = self.record_settings()
+        path = os.path.splitext(spec.path)[0] + ".png"
+        ok = self.viewport.grab_png(path, spec.width, spec.height)
+        self.status_text.setText(
+            f"스크린샷 저장: {path} ({spec.width}×{spec.height})" if ok else "스크린샷 실패 (GL 화면 없음)")
+        if ok:
+            self._last_video = path
 
     def _show_error_detail(self):
         if not self._last_error:
@@ -1791,6 +2018,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 ("Ctrl+.", "정지"),
                 ("Ctrl+F", "맵 검색으로 이동"),
                 ("S", "3D 화면 스크린샷"),
+                ("R", "녹화 시작 / 중지"),
                 ("드래그 / 휠", "궤도 카메라 회전 / 확대"),
                 ("환경 페이지", "V 선택 · B 덕트 · W 벽 · E 지우개 · L/K 선 · M 사각형 · P 다각형 · A 배치 · "
                            "Ctrl+Z/Y 되돌리기 · F 전체 보기 · 5 위에서 · 가운데/Alt+드래그 회전 · "
