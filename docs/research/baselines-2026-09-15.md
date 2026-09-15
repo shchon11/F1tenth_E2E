@@ -172,6 +172,23 @@ forward, and output mapping, with any recurrent state carried in and out.
 | TinyLidarNet-M (541 beams) | ~114 k | 0.047 | 0.2 % |
 | **End2Race** | 11 301 482 | **1.853** | 7.4 % |
 
+The Table 3 student is the same architecture as the second row and costs **2.5× more per step**,
+because a DAgger loop has to put the student back in the car every iteration and so it runs through
+torch rather than ONNX:
+
+| | params | backend | ms/step |
+| --- | ---: | --- | ---: |
+| TinyLidarNet-L, published weights | 220 686 | onnxruntime | **0.090** |
+| TinyLidarNet-L, our demonstrations (Table 3) | 220 686 | torch | **0.223** |
+
+Identical parameter count, identical layers, 2.5× the cost — the gap is entirely the runtime, and it
+is the price of a student that has to be re-entered into the simulator between iterations. Both sit
+far inside a 25 ms step, so it changes nothing about deployability; it is recorded because a reader
+comparing "the same network" across two rows of this note would otherwise find two different
+numbers and no reason for them. (Re-measuring the published model at the same moment gave 0.090
+against the 0.083 in the table above — 7 % of measurement noise under three running lanes, which is
+also worth knowing before anyone reads a 5 % difference anywhere in this section as real.)
+
 Two things this table does *not* say. Ours is only the actor: the iLQR plan tracker and any
 controller arm are on top, and they are exactly the runtime the fair comparison exists to price. And
 this is a desktop CPU, not the Jetson — the ratio is the transferable part, the absolute number is
