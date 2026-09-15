@@ -382,8 +382,11 @@ def cmd_run(a) -> int:
         return 4
 
     from . import model_adapter as ma
-    model, extra = ma.load_actor(_entry_dict(entry), a.device)
-    policy = ma.policy_for(model)
+    from f1sim.params import VehicleParams
+    ed = _entry_dict(entry)
+    model, extra = ma.load_actor(ed, a.device)
+    policy = (ma.external_policy(model, extra["spec"], VehicleParams().s_max)
+              if ma.is_external(ed) else ma.policy_for(model))
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, f"{a.system.replace('/', '_')}.cells.jsonl")
     ident0 = suite_mod.protocol_identity(s, entry)
@@ -479,10 +482,16 @@ def _entry_dict(entry) -> dict:
     """
     if isinstance(entry, dict):
         return entry
-    return {"path": entry.resolved(), "arm": entry.controller_arm,
-            "cross_runtime": bool(entry.cross_runtime),
-            "system_id": entry.system_id, "checkpoint_sha256": entry.checkpoint_sha256,
-            "estimator_path": entry.estimator_path, "estimator_sha256": entry.estimator_sha256}
+    d = {"path": entry.resolved(), "arm": entry.controller_arm,
+         "cross_runtime": bool(entry.cross_runtime),
+         "system_id": entry.system_id, "checkpoint_sha256": entry.checkpoint_sha256,
+         "estimator_path": entry.estimator_path, "estimator_sha256": entry.estimator_sha256}
+    if getattr(entry, "kind", None):
+        # An external published baseline. `weights` is the same resolved file as `path`; both are
+        # supplied so the adapter can be handed either spelling.
+        d.update({"kind": entry.kind, "weights": entry.resolved(),
+                  "options": dict(entry.options or {})})
+    return d
 
 
 def _obstacle_track_for(cell, suite_obj):
@@ -557,7 +566,7 @@ def _prepare(entry, extra, cell, suite_obj, device):
     prepared = ma.prepare_cell(_entry_dict(entry), extra, cell_d, adapter,
                                device, tracks_override=tracks, racelines=rls, spawn_s_m=spawn)
     router = None
-    if race_size > 1:
+    if race_size > 1 and prepared.env.tracker is not None:
         # AFTER the adapter: it installs the arm on the original tracker, and wrapping earlier would
         # hook the wrapper instead. Restored before `close()` so the adapter uninstalls the arm from
         # the object it installed it on.
@@ -568,6 +577,14 @@ def _prepare(entry, extra, cell, suite_obj, device):
         reference = PlanTracker(env.B, env.device, original.wb, original.s_max, original.v_max)
         router = RoutedTracker(candidate=original, reference=reference, env=env)
         env.tracker = router
+    elif race_size > 1:
+        # `direct` action mode: there is no tracker to route. That is not a gap in the protocol, it
+        # is the protocol being satisfied structurally -- `gym_env._opponent_actions` builds the
+        # teacher's command from the raceline and `teacher_action_to_normalized` (`:977-985`),
+        # touching nothing the candidate owns, so an external baseline cannot move its opponent even
+        # in principle. `RoutedTracker` exists only because the plan path pushes every car's plan
+        # through one tracker object; here there is none.
+        pass
     return prepared, s_obs, router
 
 

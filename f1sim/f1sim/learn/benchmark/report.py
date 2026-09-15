@@ -25,9 +25,17 @@ def validate_row(row: dict) -> None:
     missing = [k for k in REQUIRED_PINS if row.get(k) in (None, "")]
     if missing:
         raise ReportError(f"row missing required pins: {', '.join(missing)}")
+    from f1sim.learn.benchmark.roster import EXTERNAL_ARM
     from f1sim.learn.grip_runtime import split_arm
-    if split_arm(str(row["controller_arm"]))[0] == "estimated" and not row.get("estimator_sha256"):
-        raise ReportError(f"{row['system_id']}: estimated arm without an estimator pin")
+    arm = str(row["controller_arm"])
+    # `none` is an external published baseline: no plan tracker, so no tracker arm to split and no
+    # friction estimator to pin. `split_arm` would raise on it, which would refuse a valid row.
+    if arm != EXTERNAL_ARM:
+        if split_arm(arm)[0] == "estimated" and not row.get("estimator_sha256"):
+            raise ReportError(f"{row['system_id']}: estimated arm without an estimator pin")
+    elif row.get("estimator_sha256"):
+        raise ReportError(f"{row['system_id']}: arm {EXTERNAL_ARM!r} has no controller, so it "
+                          f"cannot carry an estimator pin")
     path = str(row.get("checkpoint_path", ""))
     # Same rule as the roster: an unresolved alias is refused, a substring is not. An immutable
     # `ppo_latest_frozen.pt` is a real pinned file.

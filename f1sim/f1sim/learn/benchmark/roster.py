@@ -24,6 +24,16 @@ import os
 #: `fixed_low+tcs` is what the car deploys.
 from f1sim.learn.grip_runtime import ARMS as _RUNTIME_ARMS, split_arm       # noqa: E402
 
+#: The arm an **external** baseline declares. It is not a `grip_runtime` arm and cannot be one:
+#: those name what is installed on the plan tracker, and a published baseline that emits (steer,
+#: speed) never reaches a plan tracker. Spelled `none` rather than `legacy` because `legacy` means
+#: "the tracker, with nothing on it", which is a different system.
+EXTERNAL_ARM = "none"
+
+#: Baselines `f1sim.learn.baselines.load` knows. Restated rather than imported so that verifying a
+#: roster does not drag in onnxruntime/torch backends; `load_actor` is where the real load happens.
+EXTERNAL_KINDS = ("tinylidarnet", "end2race")
+
 ARMS = tuple(a for a in _RUNTIME_ARMS if not split_arm(a)[0] == "oracle")
 
 #: Filenames training rewrites in place. A roster may never point at one of these directly.
@@ -46,13 +56,27 @@ class Entry:
     controller_arm: str
     estimator_path: str | None = None
     estimator_sha256: str | None = None
+    #: An **external** published baseline instead of an f1sim checkpoint: `"tinylidarnet"` or
+    #: `"end2race"`. `path` is then the weights file (the JSON may spell it `weights`, which `load`
+    #: maps onto `path` so every pin check below -- symlink, moving pointer, `latest` segment, sha
+    #: -- applies unchanged). `controller_arm` must be `"none"`.
+    kind: str | None = None
+    #: Driver options for an external entry: `speed_map`, `skip_n`, `scan_fill`, `tick_hz`,
+    #: `n_features`, `hidden_scale`, `repo`. They change what the system IS -- End2Race with the
+    #: unseen quarter of its scan filled at 30 m and the same weights filled at 0 m are two systems
+    #: -- so they are part of `key()`.
+    options: dict = None
     #: A legacy-trained checkpoint evaluated under a non-legacy arm. The frozen original under
     #: `estimated` is the deliberate case; it has to be declared so it cannot happen by accident.
     cross_runtime: bool = False
     note: str = ""
 
     def key(self) -> tuple:
-        return (self.checkpoint_sha256, self.controller_arm, self.estimator_sha256)
+        """Row identity. For an external entry the driver options are part of it: the same weights
+        under two preprocessing choices are two evaluated systems, exactly as the same checkpoint
+        under two controller arms is."""
+        return (self.checkpoint_sha256, self.controller_arm, self.estimator_sha256,
+                self.kind, json.dumps(self.options or {}, sort_keys=True))
 
     def resolved(self) -> str:
         """Canonical absolute path. A relative path is a fine way to name a real file."""
@@ -60,8 +84,31 @@ class Entry:
 
     def verify(self) -> None:
         """Fail closed on anything unpinned, missing, drifted, or arm-inconsistent."""
-        if self.controller_arm not in ARMS:
+        if self.kind is not None:
+            if self.kind not in EXTERNAL_KINDS:
+                raise ValueError(f"{self.system_id}: unknown external kind {self.kind!r}; known: "
+                                 f"{', '.join(EXTERNAL_KINDS)}")
+            if self.controller_arm != EXTERNAL_ARM:
+                raise ValueError(
+                    f"{self.system_id}: an external baseline declares arm "
+                    f"{self.controller_arm!r}. These models publish (steer, speed) directly -- "
+                    f"there is no plan for a tracker to follow and no solver for an arm to wrap -- "
+                    f"so the only honest declaration is {EXTERNAL_ARM!r}.")
+            if self.estimator_path or self.estimator_sha256:
+                raise ValueError(f"{self.system_id}: an external baseline has no controller arm, so "
+                                 f"it cannot have a friction estimator either")
+            if self.cross_runtime:
+                raise ValueError(f"{self.system_id}: cross_runtime declares a checkpoint evaluated "
+                                 f"under an arm it did not train under; an external baseline has no "
+                                 f"arm at all")
+        elif self.controller_arm == EXTERNAL_ARM:
+            raise ValueError(f"{self.system_id}: arm {EXTERNAL_ARM!r} names the absence of a plan "
+                             f"tracker and only an external baseline (`kind`) can declare it")
+        elif self.controller_arm not in ARMS:
             raise ValueError(f"{self.system_id}: unknown arm {self.controller_arm!r}")
+        if self.kind is not None and self.options is not None and not isinstance(self.options, dict):
+            raise ValueError(f"{self.system_id}: options must be an object, got "
+                             f"{type(self.options).__name__}")
         if os.path.basename(self.path) in MOVING_POINTERS:
             raise ValueError(
                 f"{self.system_id}: {os.path.basename(self.path)} is rewritten in place by training; "
@@ -76,6 +123,8 @@ class Entry:
         if actual != self.checkpoint_sha256:
             raise ValueError(f"{self.system_id}: sha mismatch\n  declared {self.checkpoint_sha256}"
                              f"\n  actual   {actual}")
+        if self.kind is not None:
+            return                       # everything below is about tracker arms; there is none
         base = split_arm(self.controller_arm).base
         if (base == "estimated") != bool(self.estimator_sha256):
             raise ValueError(f"{self.system_id}: arm {self.controller_arm} and estimator pin disagree")
@@ -133,6 +182,19 @@ def probe(path: str) -> dict:
             "top_keys": sorted(d.keys())}
 
 
+def probe_external(entry: "Entry") -> dict:
+    """What an external entry pins, without executing the weights.
+
+    Deliberately shallow: the file is hashed by `verify`, and what it *is* -- beam count, parameter
+    count, backend -- is reported by the driver itself at load time and lands in the row's protocol
+    block. Opening an ONNX graph or a torch `state_dict` here to restate that would be a second,
+    divergeable description of the same file.
+    """
+    return {"recorded_arm": EXTERNAL_ARM, "recorded_estimator_path": None,
+            "kind": entry.kind, "options": dict(entry.options or {}),
+            "weights": entry.resolved(), "external": True}
+
+
 def check_arm_matches_record(entry: "Entry") -> dict:
     """Declared arm vs the arm the checkpoint records. Same rule as `model_adapter.load_actor`.
 
@@ -141,6 +203,8 @@ def check_arm_matches_record(entry: "Entry") -> dict:
     legitimate cross-runtime reference -- the frozen original under `estimated` is exactly that --
     but it must be declared, so it cannot arise from a typo.
     """
+    if entry.kind is not None:
+        return probe_external(entry)
     info = probe(entry.resolved())
     rec = info["recorded_arm"]
     if rec is None:
@@ -155,10 +219,27 @@ def check_arm_matches_record(entry: "Entry") -> dict:
     return info
 
 
+def _from_json(e: dict) -> Entry:
+    """One roster record -> `Entry`. `weights` is an accepted spelling of `path` for an external
+    entry, because that is what CONTRACT.md writes and because "the weights" is what it is; mapping
+    it onto `path` here means every pin check downstream applies to it unchanged."""
+    e = dict(e)
+    if "weights" in e:
+        if e.get("path") and e["path"] != e["weights"]:
+            raise ValueError(f"{e.get('system_id')}: both `path` and `weights` are set and differ; "
+                             f"they name the same file")
+        e["path"] = e.pop("weights")
+    unknown = sorted(set(e) - set(Entry.__dataclass_fields__))
+    if unknown:
+        raise ValueError(f"{e.get('system_id')}: unknown roster field(s) {unknown}. A field this "
+                         f"loader drops is a pin nobody is checking.")
+    return Entry(**e)
+
+
 def load(path: str) -> list[Entry]:
     with open(path) as fh:
         raw = json.load(fh)
-    entries = [Entry(**e) for e in raw["systems"]]
+    entries = [_from_json(e) for e in raw["systems"]]
     # Unique system_id BEFORE any lookup dict is built. Callers construct {e.system_id: e}, so a
     # repeat silently replaces the earlier entry and the expected-system set collapses -- one
     # declared system would vanish from the roster and from the results without an error.
