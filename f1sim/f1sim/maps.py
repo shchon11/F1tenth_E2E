@@ -6,7 +6,11 @@ Names:  gen:competition:7   gen:hallway:2   gen:circuit:0
         scene:my_hall       (a scene saved by the environment editor, see f1sim.scene; scene:/abs/dir too)
         /abs/path/map.yaml  (any ROS map; centerline csv next to it is picked up)
     Obstacle suffixes: `+obs<seed>` = boxes hugging the lane edge (the racing line stays clear),
-                       `+rlobs<seed>` = boxes standing on the racing line (the car must plan around)
+                       `+rlobs<seed>` = boxes standing on the racing line (the car must plan around),
+                       `+bare` = the props the map's author placed are dropped (walls only). No
+                       seed; composes with the others and is applied first, so
+                       `scene:hall+bare+hard3` is "the author's boxes removed, then the hard
+                       patterns added". On a map with no placed props it changes nothing.
 
 `load` also accepts the short scenario grammar of `f1sim.tracks` (`real/bb22-1@rev#line:44`), which
 is what every user-facing list shows; it is resolved to the names above and nothing else changes.
@@ -133,7 +137,7 @@ def load(name: str, **kw) -> Track:
                 mods.append(m); name = name[:-len(m)]
     ck = (name, repr(sorted(kw.items())))
     if name.startswith("scene:"):                          # edited on disk between loads: key on the files
-        ck = ck + (_scene_stamp(_split_obstacle_suffix(name[6:])[0]),)
+        ck = ck + (_scene_stamp(_split_bare(_split_obstacle_suffix(name[6:])[0])[0]),)
     if ck not in _BASE_CACHE:                              # one copy per process: both directions share grids
         _BASE_CACHE[ck] = _load_base(name, **kw)
     t = _BASE_CACHE[ck]
@@ -168,6 +172,15 @@ def _static_props(track: Track, seed: int, n: Optional[int] = None) -> Track:
     return track.with_static_props(seed=seed, n=n)
 
 
+def _split_bare(name: str):
+    """`x+bare+hard3` -> (`x+hard3`, True). The suffix carries no digits, so it can be peeled from
+    anywhere in the name without being confused for a placement family."""
+    if "+bare" not in name:
+        return name, False
+    head, _, tail = name.partition("+bare")
+    return head + tail, True
+
+
 def _split_obstacle_suffix(name: str):
     """`x+rlobs7` -> (x, 'rlobs', 7); `x+obs7` -> (x, 'obs', 7); `x+pinch7` -> (x, 'pinch', 7);
     `x+props7` -> (x, 'props', 7); otherwise (name, None, None).
@@ -179,11 +192,21 @@ def _split_obstacle_suffix(name: str):
     return name, None, None
 
 
-def _load_base(name: str, **kw) -> Track:
+def _load_base(name: str, bare: bool = False, **kw) -> Track:
+    """`bare`: drop the props the map's author placed, before any obstacle family is added.
+
+    Peeled off the name here and applied to each *base* track below rather than to the result,
+    because the families ADD: `scene:x+bare+props3` is "the author's boxes removed, then three
+    modelled props placed", and applying it the other way round would remove the props that were
+    just placed and quietly be `scene:x+bare`.
+    """
+    name, b = _split_bare(name)
+    bare = bare or b
+    _b = (lambda t: t.bare()) if bare else (lambda t: t)
     if "+hard" in name:                                    # any family: hand-built-style patterns on top
         base, _, spec = name.rpartition("+hard")
         from .hard_obstacles import with_hard_obstacles
-        return with_hard_obstacles(_load_base(base, **kw), int(spec))
+        return with_hard_obstacles(_load_base(base, bare=bare, **kw), int(spec))
     if name.startswith("gen:recipe:"):
         # gen:recipe:<seed>: the environment editor's random track generator with its default
         # recipe (straights, chicanes, fast slaloms; corners, sweepers, hairpins), 20 m, 1.6 m lane
@@ -191,6 +214,7 @@ def _load_base(name: str, **kw) -> Track:
         seed, kind, spec = _split_obstacle_suffix(name[len("gen:recipe:"):])
         t = generate(TrackRecipe(), int(seed)).to_scene(f"recipe_{seed}").to_track()
         t.name = f"gen:recipe:{seed}"
+        t = _b(t)
         if kind == "props":
             return _static_props(t, int(spec))
         if kind:
@@ -200,18 +224,18 @@ def _load_base(name: str, **kw) -> Track:
         _, style, seed = (name.split(":") + ["0"])[:3]
         seed, kind, spec = _split_obstacle_suffix(seed)          # gen:competition:3+obs7 / +rlobs7
         if kind == "rlobs":
-            return _raceline_obstacles(Track.generate_random(int(seed), style=style, **kw), int(spec))
+            return _raceline_obstacles(_b(Track.generate_random(int(seed), style=style, **kw)), int(spec))
         if kind == "obs":
             obstacle_seed = int(spec)
-            t = Track.generate_random(int(seed), style=style, **kw)
+            t = _b(Track.generate_random(int(seed), style=style, **kw))
             n_obs = int(np.random.default_rng(obstacle_seed + 7).integers(1, 5))
             return t.with_lane_obstacles(seed=obstacle_seed, n=n_obs)
         if kind == "pinch":                                      # gen:x:3+pinch7: the lane closes down
-            t = Track.generate_random(int(seed), style=style, **kw)
+            t = _b(Track.generate_random(int(seed), style=style, **kw))
             return t.with_pinches(seed=int(spec), n=int(np.random.default_rng(int(spec) + 5).integers(2, 5)))
         if kind == "props":                                      # gen:x:3+props7: modelled props
-            return _static_props(Track.generate_random(int(seed), style=style, **kw), int(spec))
-        return Track.generate_random(int(seed), style=style, **kw)
+            return _static_props(_b(Track.generate_random(int(seed), style=style, **kw)), int(spec))
+        return _b(Track.generate_random(int(seed), style=style, **kw))
     if name.startswith("rt:"):
         n, kind, spec = _split_obstacle_suffix(name[3:])        # rt:Monza+props3
         d = os.path.join(RACETRACKS, n)
@@ -219,7 +243,7 @@ def _load_base(name: str, **kw) -> Track:
         if not ys:
             raise FileNotFoundError(f"racetrack {n} not found under {RACETRACKS}")
         cl = glob.glob(os.path.join(d, "*_centerline.csv"))
-        t = Track.from_ros_map(ys[0], centerline_csv=cl[0] if cl else None, name=n, **kw)
+        t = _b(Track.from_ros_map(ys[0], centerline_csv=cl[0] if cl else None, name=n, **kw))
         if kind == "props":                                     # rt:x+props<seed>: modelled props
             return _static_props(t, int(spec))
         if kind is not None:
@@ -228,7 +252,9 @@ def _load_base(name: str, **kw) -> Track:
     if name.startswith("scene:"):                           # scene:<name> or scene:/abs/dir, +props<seed>
         from .scene import SceneDoc
         n, kind, spec = _split_obstacle_suffix(name[6:])
-        t = SceneDoc.load(n).to_track()
+        # The only loader that can produce a track with placed props, and therefore the only one
+        # where `+bare` removes anything.
+        t = _b(SceneDoc.load(n).to_track())
         if kind == "props":
             return _static_props(t, int(spec))
         if kind is not None:
@@ -238,7 +264,7 @@ def _load_base(name: str, **kw) -> Track:
         n = name[4:]
         kw.setdefault("boundary", GYM_BOUNDARY.get(n, "duct"))
         clearance = kw.pop("min_clearance", 0.45)
-        return _with_auto_centerline(Track.from_ros_map(os.path.join(GYM_MAPS, n + ".yaml"), name=n, **kw), clearance)
+        return _b(_with_auto_centerline(Track.from_ros_map(os.path.join(GYM_MAPS, n + ".yaml"), name=n, **kw), clearance))
     if name.startswith("real:"):
         n, kind, spec = _split_obstacle_suffix(name[5:])        # real:icra2022+obs3 / +rlobs3
         entry = REAL[n]; yaml_path, boundary, clearance = entry[:3]; seed_xy = entry[4] if len(entry) > 4 else None
@@ -251,7 +277,7 @@ def _load_base(name: str, **kw) -> Track:
             if kw.get("keep_region"):
                 kw.setdefault("seed_xy", seed_xy)
         clearance = kw.pop("min_clearance", clearance)
-        t = _with_auto_centerline(Track.from_ros_map(yaml_path, name=n, **kw), clearance, seed_xy)
+        t = _b(_with_auto_centerline(Track.from_ros_map(yaml_path, name=n, **kw), clearance, seed_xy))
         if kind == "pinch":                                     # real:x+pinch<seed>: the lane closes down
             return t.with_pinches(seed=int(spec), n=int(np.random.default_rng(int(spec) + 5).integers(2, 5)))
         if kind == "rlobs":                                     # real:x+rlobs<seed>: boxes ON the raceline
@@ -263,7 +289,7 @@ def _load_base(name: str, **kw) -> Track:
             t = _static_props(t, int(spec))
         return t
     clearance = kw.pop("min_clearance", None)
-    t = Track.from_ros_map(name, **kw)
+    t = _b(Track.from_ros_map(name, **kw))
     return _with_auto_centerline(t, clearance) if clearance else t
 
 
