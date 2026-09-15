@@ -57,6 +57,7 @@ comparison of the same quantity.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -65,6 +66,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mpc as _mpc
+from . import floor as _floor
 
 #: Centre -> body edge [m]. The convention `crash_attribution.py` measures in (`edt - 0.14`), kept
 #: here so "the plan margin is no longer at zero" is a statement about one quantity.
@@ -96,6 +98,26 @@ class ClearanceSpec:
                                       # body_radius` = 0.34 m, so a 0.60 m ceiling loses nothing and
                                       # bounds the transform's cost at R = 10 offsets per pass.
     range_eps: float = 0.02           # a normalized range within this of 1.0 is "no return"
+
+    # -- the floor gate ----------------------------------------------------------
+    #: `brake` gates only the occupancy the SPEED decision reads, leaving the bend to see every
+    #: return; `both` gates the occupancy the whole arm reads. See `adjust`'s `dist_speed`.
+    #:
+    #: `brake` is the default because it measured better on every axis than gating both decisions
+    #: (`work/floor-mask/REPORT.md` §3.7, eight held-out proxy tracks, 128 cars): it is the fastest
+    #: arm of the seven tried (12.11 s mean first lap against gate-off's 12.89, faster on 8 of 8
+    #: tracks), it has the LOWEST collisions/km of any arm including gate-off (35.06 vs 36.53), and
+    #: its `lost` rate -- a decision the solid world asked for and the gate suppressed -- is a third
+    #: of the full gate's (0.28 % vs 0.62 %). It still removes 81 % of the phantom brakes, which is
+    #: what the gate is for. The asymmetry is the point: floor returns are what makes the car brake
+    #: for nothing, and the bend is where suppressing a real return costs.
+    floor_gate_mode: str = "brake"
+    floor_gate: bool = False          # OFF by default. On, a return whose floor likelihood
+                                      # (`learn.floor`) reaches `FloorSpec.gate_threshold` is left
+                                      # out of the occupancy grid. Off, `occupancy` never looks at
+                                      # the likelihood at all and the grid is bit-identical to what
+                                      # it was before this existed -- asserted in
+                                      # `tests/test_floor_mask.py`.
 
     # -- the plan ----------------------------------------------------------------
     n_path: int = 25                  # dense samples of the plan, as `grip_control.speed_envelope`
@@ -168,6 +190,9 @@ class ClearanceSpec:
             raise ValueError("need at least 3 path samples and 1 shift magnitude")
         if not self.a_brake > 0.0 or not self.v_stop >= 0.0:
             raise ValueError("a_brake must be positive and v_stop non-negative")
+        if self.floor_gate_mode not in ("both", "brake"):
+            raise ValueError(f"floor_gate_mode must be 'both' or 'brake', got "
+                             f"{self.floor_gate_mode!r}")
         return self
 
     @property
@@ -200,7 +225,9 @@ def beam_angles(n_beams: int, fov: float, device=None, dtype=None) -> torch.Tens
 
 
 def occupancy(scan_norm: torch.Tensor, angles: torch.Tensor, spec: ClearanceSpec,
-              range_max: float, mount_x: float = 0.297, mount_y: float = 0.0) -> torch.Tensor:
+              range_max: float, mount_x: float = 0.297, mount_y: float = 0.0, *,
+              p_floor: Optional[torch.Tensor] = None,
+              fspec: Optional["_floor.FloorSpec"] = None) -> torch.Tensor:
     """Coarse occupancy in the car's frame from one LiDAR frame. (B, N) -> (B, ny, nx) in {0, 1}.
 
     `scan_norm` is the observation's own units: range / range_max, clamped to [0, 1], no return =
@@ -210,6 +237,17 @@ def occupancy(scan_norm: torch.Tensor, angles: torch.Tensor, spec: ClearanceSpec
 
     Beams with no return are dropped rather than placed at `range_max`: an unobserved bearing is
     unknown, and the cell the beam would have ended in is not occupied by anything that was seen.
+
+    `p_floor` (B, N) is the per-beam floor likelihood (`learn.floor.floor_likelihood_norm`), and it
+    is used **only when `spec.floor_gate` is on**. Then a beam whose likelihood reaches
+    `fspec.gate_threshold` is dropped the same way a beam with no return is: the arm keeps the plan
+    off what the sensor saw, and a return the geometry says is the floor is not something the car
+    can hit. The threshold sits strictly above `floor.UNKNOWN`, so a car whose attitude estimate is
+    not usable gates nothing and the arm is exactly the arm it is today.
+
+    Dropping, not down-weighting: the grid is binary and its distance transform has no
+    representation for a cell that is 70 % occupied. The softness is in the likelihood; the decision
+    is one stated threshold.
     """
     if scan_norm.dim() != 2:
         raise ValueError(f"scan must be (B, N), got {tuple(scan_norm.shape)}")
@@ -221,6 +259,17 @@ def occupancy(scan_norm: torch.Tensor, angles: torch.Tensor, spec: ClearanceSpec
     ang = angles.to(scan_norm.device, scan_norm.dtype)[None]                  # (1, N)
     r = scan_norm * float(range_max)
     seen = scan_norm < (1.0 - spec.range_eps)
+    if spec.floor_gate:
+        if p_floor is None:
+            raise ValueError(
+                "clearance_floor_gate is on but no floor likelihood was passed: the gate is a "
+                "decision about each return and there is nothing to decide with. `ClearanceArm` "
+                "computes it from the attitude it was handed; a direct caller passes `p_floor`.")
+        if p_floor.shape != scan_norm.shape:
+            raise ValueError(f"floor likelihood {tuple(p_floor.shape)} does not match the scan "
+                             f"{tuple(scan_norm.shape)}")
+        from . import floor as _fl
+        seen = seen & (p_floor < (fspec or _fl.FloorSpec()).validate().gate_threshold)
     px = mount_x + r * torch.cos(ang)
     py = mount_y + r * torch.sin(ang)
     ix = ((px - spec.x_min) / spec.cell).floor().long()
@@ -338,12 +387,21 @@ class Adjustment:
 
 def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
            dist: torch.Tensor, spec: _mpc.PlanSpec, cspec: ClearanceSpec,
-           v_max: float) -> Adjustment:
+           v_max: float, dist_speed: Optional[torch.Tensor] = None) -> Adjustment:
     """The whole arm, given a distance field: bend the plan, then cap its speed.
 
     `action` is the policy's normalized plan. The returned action is **bit-identical** wherever the
     arm left something alone: the bend is applied in normalized curvature units (adding 0 is exact)
     and each speed is replaced through a `where` rather than a round trip through `decode`/`encode`.
+
+    `dist_speed` splits the arm's two decisions across two occupancies: the **bend** is chosen on
+    `dist` and the **speed cap** is computed on `dist_speed`, along the path the bend chose. It
+    exists for one configuration and the measurement that motivates it (root, 2026-09-15): the floor
+    gate fixes phantom *brakes* -- the front-end gate more than halves them -- while the decisions
+    it wrongly suppresses are mostly bends, and a bend that is not needed costs a little deviation
+    where a brake that is not needed costs speed on every step it lasts. So a gate may be allowed to
+    remove floor returns from the speed decision while the bend still sees every return. `None`
+    keeps one field for both, which is what the arm has always done.
     """
     n = cspec.n_path
     B = action.shape[0]
@@ -411,6 +469,18 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
     raw_b = raw.gather(1, take.expand(B, 1, n))[:, 0]
     raw_0 = raw[:, 0]
     y_0 = y[:, 0]
+
+    if dist_speed is not None:
+        # The speed decision, re-scored on the other occupancy along the path already chosen. The
+        # same "void from the first contact" rule applies: an unsigned field reads a metre past a
+        # wall as a metre of free space, and the car stops at the first thing it hits whichever
+        # decision is being made.
+        x_b = x.gather(1, take.expand(B, 1, n))[:, 0]
+        y_bp = y.gather(1, take.expand(B, 1, n))[:, 0]
+        raw_s = sample_field(dist_speed, x_b[:, None], y_bp[:, None], cspec)[:, 0] - cspec.body_radius
+        hit_s = (raw_s < 0.0) & in_eval
+        clear_b = torch.where(hit_s.to(dt_).cumsum(-1) > 0,
+                              torch.full_like(raw_s, -cspec.body_radius), raw_s)
 
     # -- the cap: a speed the clearance allows, then braking anticipation --------
     cap = speed_cap.reshape(-1, 1)
@@ -509,7 +579,8 @@ class ClearanceArm:
 
     def __init__(self, tracker, cspec: ClearanceSpec, batch: int, device, v_max: float,
                  angles: torch.Tensor, range_max: float, mount_x: float = 0.297,
-                 mount_y: float = 0.0):
+                 mount_y: float = 0.0, fspec: Optional[_floor.FloorSpec] = None,
+                 dt: float = 0.025):
         self.cspec = (cspec or ClearanceSpec()).validate()
         self.tracker = tracker
         self.B = int(batch)
@@ -522,12 +593,38 @@ class ClearanceArm:
         #: 1.0). All ones until the first `update_scan`, which is "nothing seen" -- the arm does
         #: nothing before it has been fed, rather than braking for a grid it has not been given.
         self.scan = torch.ones(self.B, self.angles.numel(), device=self.device)
+        #: The floor gate's geometry and its attitude. Built whether or not the gate is on, because
+        #: the arm reports the likelihood either way (`floor_share` in `metrics`) -- what
+        #: `cspec.floor_gate` decides is whether the occupancy acts on it. The tracker integrates
+        #: the same IMU the observation already carries; see `learn/floor.py`.
+        self.fspec = (fspec or _floor.FloorSpec(mount_x=self.mount_x, mount_y=self.mount_y)).validate()
+        self.att = _floor.AttitudeTracker(self.B, device=self.device, dt=float(dt))
+        #: The ego-state estimator, and which of the two the gate reads. `ego` is the default
+        #: because it is the more accurate of the two, measured (`docs/research/floor-mask-
+        #: 2026-09-15.md`): the body attitude is the suspension's response to accelerations the car
+        #: produces, so it can be computed rather than integrated.
+        self.ego = _floor.EgoStateAttitude(self.B, device=self.device, dt=float(dt))
+        self.att_source = "ego"
+        #: The attitude this step, and whether it is usable. Written by `update_attitude`; until it
+        #: is, the tracker has no rest reference and the likelihood reads `floor.UNKNOWN`, which
+        #: gates nothing.
+        self.att_rp = torch.zeros(self.B, 2, device=self.device)
+        self.att_ok = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: A floor likelihood computed somewhere else -- the learned front-end's floor class. When
+        #: it is set it REPLACES the geometric one for this step, because it answers the same
+        #: question better: measured, at 3-5 degrees of tilt the network reads precision 0.79 /
+        #: recall 0.97 where the geometry reads 0.15 / 0.01, and it needs no attitude to do it.
+        #: Cleared after every use, so a caller that stops supplying it falls back rather than
+        #: gating on a stale frame.
+        self._p_ext: Optional[torch.Tensor] = None
         self.last: Optional[Adjustment] = None
         self._prev_hook = None
         self._installed = False
         #: Device-side sums, drained once per update by `metrics()`. A `float(t)` per step here is a
         #: host synchronise, and this arm runs inside the step.
         self._acc = torch.zeros(7, device=self.device, dtype=torch.float64)
+        #: (returns seen, returns the floor gate removed), same discipline.
+        self._gated = torch.zeros(2, device=self.device, dtype=torch.float64)
         self._steps = 0
 
     # -- geometry ----------------------------------------------------------------
@@ -544,6 +641,56 @@ class ClearanceArm:
         self.angles = a
 
     # -- per step ----------------------------------------------------------------
+    def update_attitude(self, gyro: torch.Tensor, accel: torch.Tensor,
+                        speed: torch.Tensor) -> None:
+        """Advance the gate's attitude tracker with this step's IMU. (B, 3), (B, 3), (B,), SI.
+
+        Called by the caller that owns the sensors -- `grip_runtime.ControllerRuntime.pre_action`
+        in simulation, `policy_node.on_scan` on the car -- so the arm reads the same three signals
+        the policy's own observation is built from and no new topic appears on the car.
+        """
+        if self.att_source == "ego":
+            self.att_rp = self.ego.update(speed, gyro[:, 2])
+            # Nothing to wait for: the estimator is a map from this step's motion, not an
+            # integrator that needs a reference. It is usable from the first sample.
+            self.att_ok = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        else:
+            self.att_rp = self.att.update(gyro, accel, speed)
+            self.att_ok = self.att.seen_rest
+
+    def set_attitude(self, roll_pitch: torch.Tensor, ok=None) -> None:
+        """Use an attitude computed elsewhere (the VESC quaternion, or a front-end's estimate).
+
+        `ok` is the per-row trust flag; rows that are False read `floor.UNKNOWN` and gate nothing.
+        """
+        rp = roll_pitch.detach().to(self.device).reshape(-1, 2)
+        if rp.shape[0] != self.B:
+            raise ValueError(f"attitude {tuple(rp.shape)} is not this arm's {self.B} rows")
+        self.att_rp = rp
+        self.att_ok = (torch.ones(self.B, dtype=torch.bool, device=self.device) if ok is None
+                       else torch.as_tensor(ok, device=self.device).reshape(-1).bool())
+
+    def set_floor(self, p_floor: torch.Tensor) -> None:
+        """Supply this step's per-beam floor likelihood from outside (`learn/frontend.py`)."""
+        p = p_floor.detach().to(self.device)
+        if p.shape != self.scan.shape:
+            raise ValueError(f"floor likelihood {tuple(p.shape)} is not this arm's "
+                             f"{tuple(self.scan.shape)}")
+        self._p_ext = p
+
+    @torch.no_grad()
+    def floor_likelihood(self) -> torch.Tensor:
+        """(B, N) the per-beam floor likelihood for the frame currently held."""
+        return _floor.floor_likelihood_norm(
+            self.scan, self.att_rp[:, 0], self.att_rp[:, 1], self.range_max, self.fspec,
+            angles=self.angles, range_eps=self.cspec.range_eps, att_ok=self.att_ok)
+
+    def reset(self, done=None) -> None:
+        """An episode boundary: clear the attitude integrator for those rows (the rest reference is
+        a property of the mounting and is kept -- see `floor.AttitudeTracker.reset`)."""
+        self.att.reset(done)
+        self.ego.reset(done)
+
     def update_scan(self, scan_norm: torch.Tensor) -> None:
         """Hand the arm this control step's newest LiDAR frame, (B, N) normalized."""
         s = scan_norm.detach()
@@ -555,18 +702,50 @@ class ClearanceArm:
         self.scan.copy_(s)
 
     @torch.no_grad()
-    def field(self) -> torch.Tensor:
-        """The distance field for the frame currently held. (B, ny, nx) in metres."""
-        occ = occupancy(self.scan, self.angles, self.cspec, self.range_max,
-                        self.mount_x, self.mount_y)
-        return distance_field(occ, self.cspec)
+    def field(self):
+        """`(bend field, speed field or None)` for the frame currently held, (B, ny, nx) in metres.
+
+        The second is None unless `floor_gate_mode` is `brake`, in which case the first is the
+        ungated occupancy (the bend sees everything) and the second is the gated one.
+        """
+        p = None
+        if self.cspec.floor_gate:
+            if self.fspec.gate_source == "external":
+                # The threshold is not bounded below by UNKNOWN on this path, so falling back to
+                # the geometric likelihood -- whose unknown value IS UNKNOWN -- could gate every
+                # beam. A step with nothing supplied gates nothing.
+                p, self._p_ext = (self._p_ext if self._p_ext is not None
+                                  else torch.zeros_like(self.scan)), None
+            else:
+                p, self._p_ext = (self._p_ext if self._p_ext is not None
+                                  else self.floor_likelihood()), None
+        brake_only = p is not None and self.cspec.floor_gate_mode == "brake"
+        # In brake-only mode the BEND's occupancy is built with the gate switched off in the spec
+        # too, not merely with no likelihood passed: `occupancy` refuses a spec that says "gate"
+        # and hands it nothing to gate with, and it is right to.
+        bend_spec = (dataclasses.replace(self.cspec, floor_gate=False) if brake_only
+                     else self.cspec)
+        occ = occupancy(self.scan, self.angles, bend_spec, self.range_max,
+                        self.mount_x, self.mount_y,
+                        p_floor=(None if brake_only else p),
+                        fspec=(None if brake_only else self.fspec))
+        if p is not None:
+            seen = self.scan < (1.0 - self.cspec.range_eps)
+            self._gated += torch.stack([
+                seen.double().sum(), ((p >= self.fspec.gate_threshold) & seen).double().sum()])
+        if not brake_only:
+            return distance_field(occ, self.cspec), None
+        occ_s = occupancy(self.scan, self.angles, self.cspec, self.range_max,
+                          self.mount_x, self.mount_y, p_floor=p, fspec=self.fspec)
+        return distance_field(occ, self.cspec), distance_field(occ_s, self.cspec)
 
     @torch.no_grad()
     def shape(self, action: torch.Tensor, v_meas: torch.Tensor,
               speed_cap: torch.Tensor) -> torch.Tensor:
         """The plan hook: the policy's action in, the adjusted action out."""
-        adj = adjust(action, v_meas, speed_cap, self.field(), self.tracker.spec, self.cspec,
-                     self.v_max)
+        f_bend, f_speed = self.field()
+        adj = adjust(action, v_meas, speed_cap, f_bend, self.tracker.spec, self.cspec,
+                     self.v_max, dist_speed=f_speed)
         self.last = adj
         self._record(adj)
         return adj.action
@@ -596,6 +775,10 @@ class ClearanceArm:
              f"{prefix}clearance_speed_cut_mean": v[4] / n,
              f"{prefix}clearance_plan_margin_before": v[5] / n,
              f"{prefix}clearance_plan_margin_after": v[6] / n}
+        if self.cspec.floor_gate:
+            g = self._gated.tolist()
+            d[f"{prefix}clearance_floor_gated_frac"] = g[1] / max(g[0], 1.0)
+            self._gated = torch.zeros_like(self._gated)
         self._acc = torch.zeros_like(self._acc)
         self._steps = 0
         return d
@@ -623,7 +806,9 @@ class ClearanceArm:
 
     def meta(self) -> dict:
         """What a result has to carry to be reproducible: the spec and the beam geometry."""
-        return {"spec": self.cspec.to_meta(), "n_beams": int(self.angles.numel()),
+        return {"spec": self.cspec.to_meta(), "floor": self.fspec.to_meta(),
+                "att_source": self.att_source,
+                "n_beams": int(self.angles.numel()),
                 "fov_deg": float((self.angles[-1] - self.angles[0]).abs() * 180.0 / math.pi)
                 if self.angles.numel() > 1 else 0.0,
                 "range_max": self.range_max, "mount_x": self.mount_x, "mount_y": self.mount_y}

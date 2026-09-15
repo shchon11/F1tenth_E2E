@@ -22,6 +22,10 @@
     # --- topics --------------------------------------------------------------
     plan_topic: "/f1sim/plan"
     state_topic: "/f1sim/policy_state"
+    # What this node worked out about the scan it planned from -- the front-end's per-beam floor
+    # class and the attitude the observation was built with. Diagnostic unless the controller's
+    # clearance arm has its floor gate on, and optional even then.
+    perception_topic: "/f1sim/policy/perception"
     reset_topic: "/f1sim/reset"
     drive_topic: "drive"      # used ONLY by a direct-action checkpoint, which has no plan
     enabled: true
@@ -30,6 +34,11 @@
     sensor_timeout: 0.25      # s; older than this on any actor input and the policy stops planning
     imu_accel_scale: 0.0      # 0 = detect g vs m/s^2 from the first gravity vector
     steer_max: 0.4189         # direct-action checkpoints only
+    # Where the POLICY's roll/pitch observation columns come from: "vesc" (the orientation
+    # quaternion, which every trained checkpoint saw), "ego" (floor.EgoStateAttitude, measured
+    # 6x better while driving) or "frontend" (a checkpoint that declares one). Changing it
+    # changes two of the policy's inputs -- see docs/research/floor-mask-2026-09-15.md.
+    attitude_source: "vesc"
 
 /**/f1sim_controller:
   ros__parameters:
@@ -39,6 +48,12 @@
     controller: "fixed_low"
     grip_mu: 0.0              # 0 = the module default, MU_FIXED_LOW = 0.73423
     clearance_margin: 0.0     # 0 = the module default, 0.20 m body edge
+    # The floor-aware occupancy: a return the geometry (or the policy's front-end) says is the
+    # FLOOR is left out of the grid. OFF by default, and off the grid is bit-identical to the arm
+    # that shipped. `_mode` is which decision it may touch when it is on -- "brake" (the measured
+    # default: the speed cap only) or "both".
+    clearance_floor_gate: false
+    clearance_floor_gate_mode: "brake"
     traction: "off"           # "on" installs the replay-validated guard; see docs/ros2.md
     traction_params: ""       # NAME=VALUE pairs overriding any TractionParams field
 
@@ -63,6 +78,7 @@
 
     # --- topics and timeouts -------------------------------------------------
     plan_topic: "/f1sim/plan"
+    perception_topic: "/f1sim/policy/perception"
     drive_topic: "drive"
     diag_topic: "/f1sim/controller/diag"
     reset_topic: "/f1sim/reset"

@@ -30,6 +30,12 @@ from f1sim_ros.traction import TractionGuard, TractionParams
 #: 0.297 m is one and a half of the margin being defended.
 LIDAR_FOV = 4.71238898
 LIDAR_MOUNT_X = 0.297
+#: The scan plane's height above the floor at rest, the same 0.110 m of that `/tf_static` line. It
+#: is what makes a two-degree tilt a wall at 3.2 m, and it is the floor gate's whole geometry.
+LIDAR_MOUNT_Z = 0.110
+#: [Hz] the policy / LiDAR rate (`f1sim.params.SimParams.control_rate`), for the attitude
+#: estimators' integration step.
+CONTROL_RATE = 40.0
 
 G = 9.80665
 
@@ -80,13 +86,22 @@ def install_grip_arm(tracker, arm: str, device, mu: float = None):
     return grip.install(graph=False)
 
 
-def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None):
+def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None,
+                          floor_gate: bool = False, gate_mode: str = ""):
     """Install the `clearance` layer: the plan bent and slowed off what `/scan` can see.
 
     Built from the observation's own beam geometry (`ObsSpec.n_beams`, `range_max`) and the nominal
     270 deg window; `ControllerNode` re-declares the bearings from the first `LaserScan`'s own
     `angle_min` / `angle_max` if the driver publishes a different window, because a grid built from
     bearings the returns do not have is a silently rotated obstacle rather than an error.
+
+    `floor_gate` turns on the floor-aware occupancy (`learn/floor.py`): a return the geometry says
+    is the FLOOR, given the scan plane's tilt, is left out of the grid instead of bending the plan
+    around it. The tilt comes from `ClearanceArm`'s own estimator, fed by `ControllerNode.on_scan`
+    from the IMU mean it already computes -- **not** from the orientation quaternion, which five of
+    the thirteen competition recordings swing past 40 deg and which in simulation is wrong by
+    8 deg rms while driving. `gate_mode` is WHICH decision the gate may touch: `brake` (the
+    default) the speed cap only, `both` the bend as well.
 
     Returns the installed `ClearanceArm` (call `.release()` to undo) or None.
     """
@@ -96,11 +111,19 @@ def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None)
     if not clear:
         return None
     from f1sim.learn import clearance as cl
-    cspec = cl.ClearanceSpec() if margin is None else cl.ClearanceSpec(margin=float(margin))
+    from f1sim.learn import floor as fl
+    kw = {"floor_gate": bool(floor_gate)}
+    if margin is not None:
+        kw["margin"] = float(margin)
+    if gate_mode:
+        kw["floor_gate_mode"] = str(gate_mode)
+    cspec = cl.ClearanceSpec(**kw)
     angles = cl.beam_angles(int(spec.n_beams), LIDAR_FOV, device=torch.device(device))
     arm_obj = cl.ClearanceArm(tracker, cspec.validate(), 1, torch.device(device),
                               float(spec.v_max), angles, float(spec.range_max),
-                              mount_x=LIDAR_MOUNT_X)
+                              mount_x=LIDAR_MOUNT_X,
+                              fspec=fl.FloorSpec(mount_x=LIDAR_MOUNT_X, mount_z=LIDAR_MOUNT_Z),
+                              dt=1.0 / float(CONTROL_RATE))
     return arm_obj.install()
 
 

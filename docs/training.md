@@ -307,9 +307,14 @@ warm start stays bit-identical.
 | `aligned` | the signed residual `r_t - warp(r_{t-k})`, soft-thresholded | see below |
 | `aligned_prev` | the warped previous range itself | |
 | `aligned_valid` | 1 where the warp had a prediction AND the current beam returned | |
+| `fe_floor` | the learned front-end's probability that a return is the floor (`learn/frontend.py`) | the same question the `floor` row answers with geometry, asked of a network that does **not** need the attitude to be right — which matters, because measured, the attitude is what the geometric channel is short of |
+| `fe_range` | the front-end's denoised range, in the scan's own units | the calibrated sensor model is a known, invertible corruption: 7.4 mm + 1 mm/m of noise (§2.4), a spike process, structured dropouts and the grazing fade (§2.8). The clean render is free in the simulator, so the denoiser has a label. It is a channel **beside** the raw stack, never a replacement — a hallucinated clean range must not be able to hide a real wall |
+| `floor` | the per-beam likelihood that a return is the **floor** rather than a solid object, from the beam geometry and the scan plane's tilt (`learn/floor.py`). 0 = solid (and a beam with no return), 1 = floor, 0.5 = the attitude estimate is not usable | the scan plane is 0.110 m above the floor and follows the sprung body, so 2° of tilt puts the floor across the beam at 3.2 m and 5° at 1.3 m — a phantom wall exactly where a braking car looks. Measured on the held-out proxy tracks, floor returns are 4.4 % of all beams under braking against 1.7 % cruising, and the clearance arm bends or brakes for them on 3.5 % of all control steps |
 
-Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for `memory` +
-`edges`; 0.57 ms for the three aligned rows together (they share one warp).
+Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for
+`memory` + `edges`; 0.57 ms for the three aligned rows together (they share one warp);
+0.15 ms for `floor`; 0.97 ms at batch 1 for the front-end the two `fe_*` rows come from,
+which runs once however many of them are enabled.
 
 #### The ego-motion-aligned residual (`aligned`, `aligned_prev`, `aligned_valid`)
 
@@ -388,6 +393,46 @@ claim as a statement about the autograd graph.
 Staging is strict and in this order: **E3-a** mask, **E3-b** + Δv, **E3-c** + `--aux-future`. The
 mask logits are train-time only: they are never fed to the planner and never exported (the heads are
 not called by `Actor.forward` / `.step`, so the traced graph cannot contain them — checked).
+
+**Read `docs/research/floor-mask-2026-09-15.md` before turning `floor` on.** The geometry is exact
+and the channel is tested against the simulator's own `scan_type`, but its usefulness is bounded by
+how well the car knows its own tilt, and that is measured: with the *true* attitude the channel
+reaches precision 0.81 at recall 0.23; with the best estimate a car can actually have it reaches
+0.04. `--floor-att` picks the source — `tracker` (`floor.AttitudeTracker`, gyro-integrated with the
+accelerometer gated on quiescence, a zero reference learnt at rest and the yaw rate regressed out of
+the roll and pitch axes) or `vesc` (the orientation quaternion the ROS node reads today, which is
+wrong by 0.14 rad rms in roll while driving). Neither is good enough yet. The channel is in the tree
+because it is correct, cheap and becomes useful the moment a better attitude exists — which is what
+the front-end of `learn/frontend.py` is for.
+
+### A per-beam floor/solid head (`--aux-floor`)
+
+Off by default, and off the head is not built at all — same parameters, same state dict, same loss
+(`tests/test_floor_mask.py::test_aux_head_off_is_byte_identical`, and the frozen loss oracle stays
+green). On, `learn/floor_head.py` puts a small 1-D decoder on the **scan stem's own feature map**
+plus its input rows at full beam resolution, and asks it, per beam, whether the return is the floor
+or a solid object. The label is free in the simulator (`scan_type == HIT_GROUND`,
+`F1VecEnv.floor_labels`); beams with no return are excluded, because there is nothing there to
+classify and `lidar.floor_dropout` removes grazing floor returns preferentially, so calling a
+dropout "solid" would train the head against the truth.
+
+This is the *implicit* half of the same question the `floor` channel answers explicitly, and unlike
+the channel it needs no attitude at all — it reads the scan.
+
+Needs `--scan-stem resnet`: the plain stack's receptive field is ~79 beams, and a head shown one
+20° window at a time cannot see that an arc of returns lies on one line, which is the whole signal.
+
+Every update logs `loss/aux_floor/{recall, precision, rate, pos_weight, pos_weight_clamped}` and the
+run line carries them. That is not decoration. The equivalent head in `feat/motion-memory` collapsed
+to "never" — recall 0.19 → 0.00 by update 40, precision 0 — while its BCE fell 10 %, and a loss
+curve alone read as learning. The positive weight is the batch's own `negatives / positives`, and
+its clamp (1000) is reported so a run where it bound is a number in the log rather than a discovery
+afterwards.
+
+```bash
+python -m f1sim.learn.ppo <the base flags> \
+  --scan-channels floor --aux-floor 1.0 --aux-floor-width 32
+```
 
 ### Predicting the near future (`--aux-future`)
 

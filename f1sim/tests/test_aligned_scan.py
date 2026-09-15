@@ -329,8 +329,17 @@ def test_the_rows_are_computed_once_however_many_are_asked_for():
 
 
 def test_the_channel_order_is_the_column_order():
+    """The three aligned rows are contiguous and in `ALIGNED_ROWS` order, wherever they sit.
+
+    They were the whole tail of `SCAN_CHANNELS` on this branch; `feat/floor-mask` appended three
+    more after them. What has to hold is what the warm start depends on -- ("memory", "edges")
+    keeps indices 0 and 1, and the aligned rows keep their order relative to each other -- not that
+    nothing was ever added after them. Only the ENABLED channels are laid out, so an arm with these
+    three and nothing else gets exactly the columns it always did.
+    """
     assert SCAN_CHANNELS[:2] == ("memory", "edges"), "existing checkpoints keep their columns"
-    assert tuple(ALIGNED_CHANNELS) == SCAN_CHANNELS[2:]
+    i = SCAN_CHANNELS.index(ALIGNED_CHANNELS[0])
+    assert tuple(ALIGNED_CHANNELS) == SCAN_CHANNELS[i:i + len(ALIGNED_CHANNELS)]
     assert tuple(ALIGNED_ROWS) == tuple(ALIGNED_CHANNELS)
 
 

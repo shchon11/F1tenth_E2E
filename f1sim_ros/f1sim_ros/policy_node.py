@@ -34,9 +34,9 @@ from std_msgs.msg import Empty as EmptyMsg
 from f1sim.learn.memory import describe as describe_memory, runtime_for
 from f1sim.learn.model import load_checkpoint
 from f1sim.learn.obs import ObsBuilder, ObsSpec
-from f1sim_interfaces.msg import Plan, PolicyState
+from f1sim_interfaces.msg import Perception, Plan, PolicyState
 
-from f1sim_ros.deploy import (G, IMU_BUF_MAX, LIDAR_FOV, LIDAR_MOUNT_X, SensorIntake,
+from f1sim_ros.deploy import (CONTROL_RATE, G, IMU_BUF_MAX, LIDAR_FOV, LIDAR_MOUNT_X, SensorIntake,
                               attitude_from_orientation, covariance0, header_seconds,
                               quat_to_rp, resample_ranges)
 
@@ -69,6 +69,13 @@ def checkpoint_id(path: str) -> str:
 
 
 class PolicyNode(Node):
+    #: Class defaults, so a node the tests build with `__new__` -- several fixtures hand-assemble a
+    #: minimal node to exercise one callback -- starts from the shipped behaviour instead of an
+    #: AttributeError. `__init__` overwrites both from the parameters.
+    att_source = "vesc"
+    ego_att = None
+    pub_perception = None
+
     def __init__(self):
         super().__init__("f1sim_policy")
         self.declare_parameter("checkpoint", ""); self.declare_parameter("device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -89,6 +96,29 @@ class PolicyNode(Node):
         # is inhibited when any of them goes stale. Holding the last value through a dropped sample
         # is fine; driving on a value from a second ago is not.
         self.declare_parameter("sensor_timeout", 0.25)
+        # Where the policy's roll/pitch observation columns come from. `vesc` is the orientation
+        # quaternion this node has always read; `ego` is `f1sim.learn.floor.EgoStateAttitude`, the
+        # suspension's calibrated response to the accelerations the car itself produces, computed
+        # from the wheel speed, the gyro's yaw and the accelerometer; `frontend` is the estimate a
+        # checkpoint's own sensor front-end makes. Two reasons to have the choice, both measured
+        # and both in `docs/research/floor-mask-2026-09-15.md`:
+        #
+        #   * the quaternion is wrong by 0.14 rad rms in roll and 0.09 in pitch while driving,
+        #     against 0.022 / 0.022 for the ego-state path -- and those columns are a POLICY INPUT,
+        #     not only a gate's;
+        #   * five of the thirteen competition recordings carry a quaternion that swings the
+        #     extracted roll past 40 deg, and on those this node refuses to drive at all today.
+        #     The ego-state path does not use the quaternion, so it survives them.
+        #
+        # `vesc` stays the default: every trained checkpoint saw `imu_att` in training, and
+        # swapping the meaning of two observation columns under a policy is a change to make
+        # deliberately with a finetune behind it, not a default.
+        self.declare_parameter("attitude_source", "vesc")
+        # What this node tells the controller about the scan it just planned from -- the front-end's
+        # per-beam floor class and the attitude the observation was built with. Diagnostic unless
+        # the controller's clearance arm has its floor gate on, and OPTIONAL either way: a
+        # controller that never receives it falls back to its own geometry.
+        self.declare_parameter("perception_topic", "/f1sim/policy/perception")
         p = lambda n: self.get_parameter(n).value
         self.device = torch.device(p("device"))
         ckpt = str(p("checkpoint"))
@@ -118,6 +148,27 @@ class PolicyNode(Node):
         self.sensors = SensorIntake(self.clock, self.get_logger(), self.timeout,
                                     accel_scale=float(p("imu_accel_scale")))
         self._inhibited = False; self._last_inhibit_log = 0.0
+        #: The ego-state attitude estimator. Built whenever anything could read it -- the policy's
+        #: own observation (`attitude_source:=ego`) or a front-end channel the checkpoint declares
+        #: -- and advanced every scan so those two cannot see different attitudes.
+        self.att_source = str(p("attitude_source"))
+        if self.att_source not in ("vesc", "ego", "frontend"):
+            raise ValueError(f"attitude_source must be 'vesc', 'ego' or 'frontend', got "
+                             f"{self.att_source!r}")
+        if self.att_source == "frontend" and getattr(self.policy_state, "scan", None) is None:
+            raise ValueError(
+                "attitude_source:=frontend needs a checkpoint that declares a front-end channel "
+                "(meta['scan_channels'] with fe_floor / fe_range): the estimate is one of that "
+                "network's outputs and there is nothing to read without it.")
+        from f1sim.learn import floor as _floor
+        self.ego_att = _floor.EgoStateAttitude(1, device=self.device,
+                                               dt=1.0 / float(CONTROL_RATE), source="wheel")
+        if self.att_source == "ego":
+            self.get_logger().warning(
+                "attitude_source:=ego -- the policy's roll/pitch observation columns now come from "
+                "f1sim.learn.floor.EgoStateAttitude, not from the orientation quaternion. The "
+                "checkpoint was trained against the quaternion unless it says otherwise; see "
+                "docs/research/floor-mask-2026-09-15.md for what each is worth.")
         #: Plan sequence number, and what the state message reports about the memory.
         self.seq = 0
         self.memory_clears = 0; self.memory_cleared_at = -1.0; self.memory_cleared_reason = ""
@@ -139,6 +190,7 @@ class PolicyNode(Node):
         self.create_timer(max(0.02, self.timeout / 4.0), self.on_watchdog)
         self.pub_plan = self.create_publisher(Plan, str(p("plan_topic")), 1)
         self.pub_state = self.create_publisher(PolicyState, str(p("state_topic")), 1)
+        self.pub_perception = self.create_publisher(Perception, str(p("perception_topic")), 1)
         self.pub_drive = self.create_publisher(AckermannDriveStamped, p("drive_topic"), 1) if self.direct else None
         self.last_t = None
         # warm up
@@ -249,7 +301,32 @@ class PolicyNode(Node):
             return
         if self._inhibited:                     # coming back from a gap
             self._resume()
-        scan, pro = self.obs.build(r, self.sensors.v, imu_mean, self.sensors.att, self.speed_cap)
+        att = self.sensors.att
+        # The ego-state estimator runs every scan whatever the source is, because the perception
+        # message carries it for the controller's gate; only whether the POLICY sees it depends on
+        # the parameter. `None` is a hand-assembled node (the class default above) -- then the
+        # quaternion is the only source there is, which is what this node always did.
+        rp = None
+        if self.ego_att is not None:
+            rp = self.ego_att.update(
+                torch.tensor([float(self.sensors.v)], device=self.device),
+                torch.tensor([float(imu_mean[2])], device=self.device),
+                torch.as_tensor(imu_mean[3:], dtype=torch.float32, device=self.device)[None])
+        if self.att_source == "ego" and rp is not None:
+            att = (float(rp[0, 0]), float(rp[0, 1]))
+        elif self.att_source == "frontend":
+            # The front-end reads the scan stack, and the stack is what `obs.build` below produces
+            # -- so its estimate for THIS scan does not exist yet. What is available is the one it
+            # made for the previous scan, 25 ms ago, and that is what is used: one control step of
+            # lag on a quantity whose own process has a 0.4 s time constant. Until the first scan
+            # has been through the network there is none, and the ego-state estimate stands in.
+            fe = getattr(getattr(self.policy_state, "scan", None), "fe", None)
+            last = None if fe is None else fe.last_att
+            if last is not None:
+                att = (float(last[0, 0]), float(last[0, 1]))
+            elif rp is not None:
+                att = (float(rp[0, 0]), float(rp[0, 1]))
+        scan, pro = self.obs.build(r, self.sensors.v, imu_mean, att, self.speed_cap)
         with torch.no_grad():
             # The hidden state goes in and the next one comes out: the policy's memory of this run
             # lives here, between callbacks, and nowhere else.
@@ -283,12 +360,37 @@ class PolicyNode(Node):
             if enabled:
                 self.pub_plan.publish(plan)
             shown = "plan=[" + " ".join(f"{x:+.2f}" for x in plan.plan) + "]"
+        self._publish_perception(m.header.stamp, att)
         self._publish_state([], m.header.stamp)
         self.seq = (self.seq + 1) % (1 << 32)
         dt = (time.perf_counter() - t0) * 1000
         if self.last_t is None or time.perf_counter() - self.last_t > 5:
             self.get_logger().info(f"inference {dt:.1f} ms  v={self.sensors.v:.2f} {shown}")
             self.last_t = time.perf_counter()
+
+    def _publish_perception(self, stamp, att):
+        """`/f1sim/policy/perception`: what this node worked out about the scan it just planned from.
+
+        The front-end's per-beam floor class, when the checkpoint carries one, and the attitude the
+        observation was actually built with. The monolithic node handed the first of these straight
+        to the clearance arm in the same process; the arm is `controller_node`'s now, so it goes on
+        a topic stamped with the same scan the plan is stamped with and the controller pairs the
+        two the same way. A controller that never receives it uses its own geometry, which is what
+        `clearance_floor_gate` did before a front-end existed.
+        """
+        msg = Perception()
+        msg.header.stamp = stamp
+        msg.header.frame_id = "laser"
+        msg.source = self.att_source
+        msg.attitude = [float(att[0]), float(att[1])]
+        msg.attitude_ok = True
+        fe = getattr(getattr(self.policy_state, "scan", None), "fe", None)
+        probs = None if fe is None else fe.last_probs
+        if probs is not None:
+            from f1sim.learn.frontend import FLOOR
+            msg.floor = [float(x) for x in probs[0, FLOOR].detach().cpu().numpy()]
+        if self.pub_perception is not None and bool(self.get_parameter("enabled").value):
+            self.pub_perception.publish(msg)
 
     def _publish_state(self, stale, stamp):
         """`/f1sim/policy_state`: what this node knows about itself. Diagnostic only."""

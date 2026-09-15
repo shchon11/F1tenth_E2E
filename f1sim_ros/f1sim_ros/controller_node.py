@@ -36,7 +36,7 @@ from std_msgs.msg import Empty as EmptyMsg
 from visualization_msgs.msg import Marker
 
 from f1sim.learn.obs import ObsSpec, norm_scan
-from f1sim_interfaces.msg import Plan
+from f1sim_interfaces.msg import Perception, Plan
 
 from f1sim_ros.deploy import (LIDAR_FOV, LIDAR_MOUNT_X, SensorIntake, build_traction_guard,
                               install_clearance_arm, install_grip_arm, resample_ranges,
@@ -108,6 +108,23 @@ class ControllerNode(Node):
         # against something that is not a checkpoint on this disk (a baseline node, a replay).
         d("checkpoint", ""); d("n_beams", 0); d("range_max", 0.0); d("v_max", 0.0)
         d("controller", "fixed_low"); d("grip_mu", 0.0); d("clearance_margin", 0.0)
+        # The floor-aware occupancy. Off by default, and off it is byte-identical to the arm that
+        # shipped: `clearance.occupancy` does not look at the likelihood at all. See
+        # `deploy.install_clearance_arm` and `docs/ros2.md`.
+        d("clearance_floor_gate", False)
+        # WHICH decision the gate is allowed to touch, when it is on. `brake` (the default, and
+        # `ClearanceSpec`'s) lets it remove floor returns from the speed cap only, leaving the bend
+        # to see every return; `both` gates the whole arm. Brake-only measured better on every axis
+        # on eight held-out tracks -- fastest arm tried, the lowest collisions/km of any including
+        # gate-off, and a third of the full gate's rate of suppressing a decision the solid world
+        # asked for -- while still removing 81 % of the phantom brakes. See
+        # `work/floor-mask/REPORT.md` 3.7.
+        d("clearance_floor_gate_mode", "brake")
+        # What the policy node says about the scan it planned from -- the front-end's per-beam floor
+        # class and the attitude it used (`f1sim_interfaces/Perception`). OPTIONAL: with the gate on
+        # and nothing publishing this, the arm falls back to its own geometric estimate, which is
+        # what the gate did before a front-end existed.
+        d("perception_topic", "/f1sim/policy/perception")
         d("traction", "off"); d("traction_params", "")
         d("sensor_timeout", 0.25); d("plan_timeout", 0.25); d("watchdog_period", 0.01)
         d("viz", False)
@@ -137,7 +154,9 @@ class ControllerNode(Node):
                                      mu=(float(p("grip_mu")) or None))
         self.clearance = install_clearance_arm(self.tracker, self.controller_arm, self.device,
                                                self.spec,
-                                               margin=(float(p("clearance_margin")) or None))
+                                               margin=(float(p("clearance_margin")) or None),
+                                               floor_gate=bool(p("clearance_floor_gate")),
+                                               gate_mode=str(p("clearance_floor_gate_mode")))
         #: Whether the beam bearings the clearance grid is built from have been checked against a
         #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
         self._scan_geometry_checked = False
@@ -150,6 +169,13 @@ class ControllerNode(Node):
         self.traction_state = "off" if self.traction is None else "OK"
 
         self._snapshots = []                      # newest last
+        #: `/f1sim/policy/perception` by scan stamp, same bound as the snapshots. Empty on a graph
+        #: whose policy node does not publish it, and on one whose checkpoint has no front-end.
+        self._perception = {}
+        #: How many gated scans used the front-end's floor class rather than the geometry. Reported
+        #: on the diag so a run says which source was actually in force.
+        self._floor_from_frontend = 0
+        self._warned = set()
         #: A plan whose own scan this node has not processed yet. Held for one scan rather than
         #: tracked against the wrong measurement: in a live graph the two nodes receive `/scan`
         #: independently, and the policy's plan overtakes the controller's own scan callback a few
@@ -173,6 +199,7 @@ class ControllerNode(Node):
             self.create_subscription(VescImuStamped, "sensors/imu", self.on_vesc_imu, 1)
         self.create_subscription(LaserScan, "scan", self.on_scan, 1)
         self.create_subscription(Plan, str(p("plan_topic")), self.on_plan, 1)
+        self.create_subscription(Perception, str(p("perception_topic")), self.on_perception, 1)
         self.create_subscription(EmptyMsg, str(p("reset_topic")), self.on_reset, 1)
         self.pub = self.create_publisher(AckermannDriveStamped, p("drive_topic"), 1)
         self.pub_diag = self.create_publisher(DiagnosticArray, str(p("diag_topic")), 1)
@@ -275,6 +302,27 @@ class ControllerNode(Node):
                     f"{st.body_accel:+.1f} m/s^2 (residual {st.residual:+.1f}, slip {st.slip:+.2f}), "
                     f"{st.locks} locks / {st.spins} spins so far")
 
+    def _warn_once(self, key: str, message: str) -> None:
+        """Log `message` the first time `key` happens. A per-scan warning is a log nobody reads."""
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        self.get_logger().warning(message)
+
+    def on_perception(self, m: Perception):
+        """The policy's own answer about this scan, kept by the scan's stamp.
+
+        Stored, never acted on here: `_track_and_publish` reads the entry whose stamp matches the
+        snapshot it is tracking, so a perception message that arrives late, early or not at all
+        cannot move a command onto a different scan than the plan it came with.
+        """
+        key = stamp_key(m.header.stamp)
+        if key is None:
+            return
+        self._perception[key] = m
+        while len(self._perception) > SNAPSHOT_MAX:
+            self._perception.pop(next(iter(self._perception)))
+
     def on_core(self, m):
         self.sensors.on_core(m)
 
@@ -374,6 +422,37 @@ class ControllerNode(Node):
             # This scan, in the observation's own units, before the tracker is asked for anything.
             # The arm holds one frame and nothing else: no map, no pose, no memory across scans.
             self.clearance.update_scan(snap.scan_norm)
+            if self.clearance.cspec.floor_gate:
+                # The gate's own attitude, from the IMU mean this node already computed for the
+                # snapshot -- the same three signals the policy's observation is built from, no new
+                # sensor. Gyro first three, accelerometer last three, both SI by here. Advanced on
+                # every gated scan whether or not a perception message arrives, so the estimator
+                # never integrates across a gap in that topic.
+                g = torch.as_tensor(snap.imu_mean[:3], dtype=torch.float32,
+                                    device=self.device)[None]
+                acc = torch.as_tensor(snap.imu_mean[3:], dtype=torch.float32,
+                                      device=self.device)[None]
+                self.clearance.update_attitude(
+                    g, acc, torch.tensor([float(snap.v)], device=self.device))
+                # ... and, when the policy node published one FOR THIS SCAN, the front-end's own
+                # per-beam floor class instead of the geometry. This is the one thing the split
+                # cost the monolithic node, which had the network and the arm in one process; it is
+                # paired by the scan stamp exactly as the plan is, so it can never be this scan's
+                # plan gated by another scan's perception.
+                per = self._perception.get(snap.key) if snap.key is not None else None
+                n_floor = 0 if per is None else len(per.floor)
+                if n_floor == int(self.spec.n_beams):
+                    self.clearance.set_floor(
+                        torch.as_tensor(per.floor, dtype=torch.float32,
+                                        device=self.device)[None])
+                    self._floor_from_frontend += 1
+                elif n_floor:
+                    self._warn_once(
+                        "perception_floor_width",
+                        f"/f1sim/policy/perception carries {n_floor} floor values and the "
+                        f"clearance grid has {int(self.spec.n_beams)} beams; ignoring it and "
+                        f"using the geometry. The two are built from the same ObsSpec, so this "
+                        f"means the policy and the controller disagree about the observation.")
         cmd = self.tracker(a, torch.tensor([snap.v], device=self.device),
                            torch.tensor([self.speed_cap], device=self.device),
                            torch.tensor([float(snap.imu_mean[2])], device=self.device),
@@ -520,6 +599,13 @@ class ControllerNode(Node):
              ("mu", f"{float(self.grip.mu[0]):.5f}" if self.grip is not None else ""),
              ("clearance_margin_m",
               f"{self.clearance.cspec.margin:.3f}" if self.clearance is not None else ""),
+             ("clearance_floor_gate",
+              ("" if self.clearance is None else
+               (self.clearance.cspec.floor_gate_mode if self.clearance.cspec.floor_gate
+                else "off"))),
+             ("clearance_floor_source",
+              ("" if self.clearance is None or not self.clearance.cspec.floor_gate else
+               ("frontend" if self._floor_from_frontend else "geometry"))),
              ("traction", self.traction_arm), ("traction_state", self.traction_state),
              ("plan_seq", "" if self.plan_seq is None else str(self.plan_seq)),
              ("plan_checkpoint", self.plan_checkpoint),

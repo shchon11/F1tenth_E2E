@@ -47,6 +47,15 @@ topics:
       the boundary itself. Absent for a baseline node or a direct-action checkpoint, which publish
       /drive without a plan -- so it is recorded but not required
 
+  - name: /f1sim/policy/perception
+    type: f1sim_interfaces/msg/Perception
+    rate_hz: 40.0
+    required: false
+    why: >
+      what the policy worked out about each scan -- the front-end's per-beam floor class and the
+      attitude its observation was built with. Absent for every checkpoint without a front-end,
+      which is every published one, so it is recorded but never required
+
   - name: /f1sim/policy_state
     type: f1sim_interfaces/msg/PolicyState
     rate_hz: 40.0

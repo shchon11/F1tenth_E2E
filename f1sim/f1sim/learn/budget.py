@@ -88,14 +88,20 @@ def actor_step_ms(model, device="cpu", batch: int = 1, iters: int = 200, threads
         chan = meta["scan_channels"]
         aug = ScanAugment((chan["channels"]), int(meta["n_beams"]), batch,
                           device=device, tau_s=float(chan["memory_tau_s"]),
-                          aligned=chan.get("aligned"))
+                          aligned=chan.get("aligned"), floor=chan.get("floor"))
+        # The floor channel and the front-end read the real proprio vector (attitude from the gyro
+        # and the accelerometer), so that is the default.
+        pro_for_channels = proprio
         if chan.get("aligned"):
             # The aligned channel warps with the car's own measured motion, so it is timed on a car
             # that is moving: at 9 m/s and 1 rad/s the warp is a real transform rather than the
-            # identity, and the scatter fans the beams out the way it does on track.
-            pro_for_channels = torch.zeros(batch, int(chan["aligned"]["proprio"]["proprio_dim"]),
-                                           device=device)
+            # identity, and the scatter fans the beams out the way it does on track. Written over a
+            # copy of the real vector rather than over zeros, so a run that also has the floor
+            # channel on still hands it the accelerometer columns it reads.
             idx = chan["aligned"]["proprio"]
+            want = int(idx["proprio_dim"])
+            pro_for_channels = (proprio.clone() if proprio.shape[1] == want
+                                else torch.zeros(batch, want, device=device))
             pro_for_channels[:, int(idx["speed"])] = 9.0 / float(idx["v_max"])
             pro_for_channels[:, int(idx["yaw_rate"])] = 1.0 / float(idx["gyro_scale"])
             for _ in range(int(chan["aligned"]["k"]) + 2):        # fill the ring before timing it
@@ -241,6 +247,39 @@ def measure(model, device="cpu", iters: int = 200, threads: int = 1, repeats: in
     return out
 
 
+def frontend_step_ms(path: str = "", device="cpu", batch: int = 1, iters: int = 200,
+                     threads: int = 1, repeats: int = 5, n_beams: int = 1081,
+                     k_stack: int = 6, width: int = 20) -> dict:
+    """Milliseconds per control step for the learned sensor front-end, under the same `PROTOCOL`.
+
+    `path` times a trained one; without it an untrained network of the shipped shape is built, which
+    costs exactly the same (the weights differ, the arithmetic does not). Returns
+    {"frontend_ms", "params"} against the contract's <= 1 ms / <= 150 k budget.
+    """
+    from torch.utils import benchmark
+    from .frontend import FrontEnd, frontend_spec, imu_index_spec, imu_vector, load_frontend, n_params
+    from .obs import ObsSpec
+    if path:
+        model, spec, idx, k_stack = load_frontend(path, device)
+    else:
+        sp = ObsSpec(n_beams=n_beams, scan_stack=k_stack, act_dim=8, hist_len=20)
+        idx = imu_index_spec(sp)
+        spec = frontend_spec(width=width, n_beams=n_beams, imu_dim=idx["dim"])
+        model = FrontEnd(k_stack, spec).to(device).eval()
+    scan = torch.rand(batch, k_stack, n_beams, device=device)
+    pro = torch.zeros(batch, int(idx["proprio_dim"]), device=device)
+    ego = torch.zeros(batch, int(idx["ego_dim"]), device=device) if idx.get("ego") else None
+
+    def run():
+        with torch.no_grad():
+            model(scan, imu_vector(pro, idx, ego))
+
+    t = benchmark.Timer(stmt="f()", globals={"f": run}, num_threads=threads)
+    ms = min(t.timeit(iters).median for _ in range(max(1, repeats))) * 1e3
+    return {"frontend_ms": ms, "params": n_params(model), "spec": dict(spec),
+            "imu_dim": int(idx["dim"]), "n_beams": int(n_beams), "k_stack": int(k_stack)}
+
+
 def against_baseline(model, baseline=None, device="cpu", iters: int = 200, threads: int = 1,
                      repeats: int = 5) -> dict:
     """`measure(model)` plus the ratios the contract's rule is stated in."""
@@ -281,6 +320,10 @@ def main(argv=None):
     ap.add_argument("--baselines", default="",
                     help="also time published baselines: comma separated kind=weights pairs, e.g. "
                          "tinylidarnet=/abs/tln.onnx,end2race=/abs/end2race.pth")
+    ap.add_argument("--frontend", nargs="?", const="", default=None, metavar="CKPT",
+                    help="also time the learned sensor front-end (batch 1). With a path, that "
+                         "checkpoint; without one, an untrained network of the shipped shape, "
+                         "which costs the same")
     a = ap.parse_args(argv)
 
     from .model import load_checkpoint, load_for_memory
@@ -339,6 +382,13 @@ def main(argv=None):
         print(f"{r['variant']:22s} {r['forward_ms']:8.3f} {r['channels_ms']:8.3f} {r['step_ms']:8.3f} "
               f"{r['forward_ratio']:7.3f} {r['step_ratio']:7.3f} {r['actor']:10d} "
               f"{r['param_ratio_actor']:6.3f} {r['total']:10d} {r['param_ratio_total']:6.3f}")
+    fe = None
+    if a.frontend is not None:
+        fe = frontend_step_ms(a.frontend, iters=a.iters, repeats=a.repeats)
+        print(f"\nfront-end (batch 1): {fe['frontend_ms']:.3f} ms of the 25 ms step, "
+              f"{fe['params']} parameters (budget: 1 ms, 150 000)\n  "
+              f"{fe['k_stack']} frames x {fe['n_beams']} beams + {fe['imu_dim']} IMU/ego columns, "
+              f"width {fe['spec']['width']}/{fe['spec']['depth_width']}")
     clear = None
     if a.clearance:
         clear = clearance_step_ms(iters=a.iters, repeats=a.repeats)
@@ -368,7 +418,7 @@ def main(argv=None):
         import json
         with open(a.json, "w") as f:
             json.dump({"protocol": proto, "baseline": a.baseline, "rows": rows,
-                       "clearance": clear, "baselines": ext}, f, indent=1)
+                       "clearance": clear, "baselines": ext, "frontend": fe}, f, indent=1)
         print("wrote", a.json)
     return 0
 

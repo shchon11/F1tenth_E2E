@@ -65,7 +65,7 @@ def test_the_auxiliaries_reach_the_motion_branch_and_nothing_else():
         m.actor.opp_mask.net[2].weight.normal_(0.0, 0.1)
         m.actor.dv.net[2].weight.normal_(0.0, 0.1)
     scan, pro, priv = inputs()
-    mu, grip, opp, fut, (mask, dv), h = m.actor.step_all(scan, pro, None, None)
+    mu, grip, opp, fut, (mask, dv), _fl, h = m.actor.step_all(scan, pro, None, None)
     label = torch.zeros_like(mask); label[:, 40:60] = 1.0
     w = torch.ones(scan.shape[0])
     loss = mask_loss(mask, label, w)[0] + dv_loss(dv, torch.randn(scan.shape[0], 2),
@@ -88,7 +88,7 @@ def test_at_init_the_heads_starve_their_input_for_exactly_one_update():
     """The zero output layer's documented consequence, checked rather than asserted in a comment."""
     m = build()
     scan, pro, _priv = inputs()
-    _mu, _g, _o, _f, (mask, dv), _h = m.actor.step_all(scan, pro, None, None)
+    _mu, _g, _o, _f, (mask, dv), _fl, _h = m.actor.step_all(scan, pro, None, None)
     (mask.sum() + dv.sum()).backward()
     enc = dict(m.named_parameters())["actor.memory.motion.encoder.net.0.weight"]
     assert enc.grad is None or float(enc.grad.abs().max()) == 0.0
@@ -105,7 +105,7 @@ def test_the_motion_projection_does_not_leak_into_the_heads():
     """
     m = build()
     scan, pro, _priv = inputs()
-    _mu, _g, _o, _f, (mask, dv), _h = m.actor.step_all(scan, pro, None, None)
+    _mu, _g, _o, _f, (mask, dv), _fl, _h = m.actor.step_all(scan, pro, None, None)
     (mask.sum() + dv.sum()).backward()
     out = m.actor.memory.motion.out.weight
     assert out.grad is None or float(out.grad.abs().max()) == 0.0
@@ -206,7 +206,7 @@ def test_the_future_head_moves_to_h_dyn_when_there_is_a_motion_branch():
     assert m.meta["future_head"]["source"] == "motion"
     assert m.actor.future.net[0].in_features == 16
     scan, pro, _priv = inputs()
-    _mu, _g, _o, fut, _mot, h = m.actor.step_all(scan, pro, None, None)
+    _mu, _g, _o, fut, _mot, _fl, h = m.actor.step_all(scan, pro, None, None)
     assert fut.shape == (scan.shape[0], 7) and float(fut.abs().max()) == 0.0
     assert torch.equal(m.actor.future_input(None, h), h[-1][:, 32:])
     # and a head that recorded a different source is refused rather than reshaped
@@ -225,7 +225,7 @@ def test_the_future_head_gradient_also_stops_at_the_motion_branch():
     with torch.no_grad():
         m.actor.future.net[2].weight.normal_(0.0, 0.1)
     scan, pro, _priv = inputs()
-    _mu, _g, _o, fut, _mot, _h = m.actor.step_all(scan, pro, None, None)
+    _mu, _g, _o, fut, _mot, _fl, _h = m.actor.step_all(scan, pro, None, None)
     fut.pow(2).mean().backward()
     got = {n for n, p in m.named_parameters() if p.grad is not None and float(p.grad.abs().max()) > 0}
     stray = {n for n in got if not (".memory.motion." in n or n.startswith("actor.future."))}

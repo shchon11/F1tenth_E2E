@@ -127,7 +127,8 @@ def collect(env, model, steps: int, device, controller=None, seed: int = 0,
     cfg = dict(model.meta.get("scan_channels") or {})
     chan = list(cfg.get("channels") or ())
     aug = (ScanAugment(chan, env.n_beams, env.B, device=device,
-                       tau_s=float(cfg["memory_tau_s"]), aligned=cfg.get("aligned"))
+                       tau_s=float(cfg["memory_tau_s"]), aligned=cfg.get("aligned"),
+                       floor=cfg.get("floor"))
            if chan else None)
     obs, _ = env.reset(seed=seed)
     if controller is not None:

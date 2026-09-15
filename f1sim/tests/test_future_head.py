@@ -392,17 +392,22 @@ def test_a_head_from_a_different_build_is_refused():
 def test_a_resume_keeps_what_the_checkpoint_has_instead_of_warm_starting_it_again():
     """Leg two of a run passes leg one's command line with `--init` moved. The flag that BUILDS a
     piece is also the flag that keeps training it, so the routing has to ask the checkpoint."""
+    from f1sim.learn.floor_head import floor_head_spec
     from f1sim.learn.ppo import warm_start_additions
     mem, chan, fut = memory_spec(hidden_size=32), {"channels": ["edges"]}, future_spec()
-    # nothing there yet: all three are a warm start
-    assert warm_start_additions({}, mem, chan, fut) == (mem, chan, fut)
+    flh = floor_head_spec()
+    # nothing there yet: all four are a warm start
+    assert warm_start_additions({}, mem, chan, fut, flh) == (mem, chan, fut, flh)
     # everything there: none of them is, and `load_checkpoint` takes it back whole
-    have = {"memory": mem, "scan_channels": chan, "future_head": fut}
-    assert warm_start_additions(have, mem, chan, fut) == (None, None, None)
+    have = {"memory": mem, "scan_channels": chan, "future_head": fut, "floor_head": flh}
+    assert warm_start_additions(have, mem, chan, fut, flh) == (None, None, None, None)
     # a run that adds the head to an existing recurrent checkpoint adds only the head
-    assert warm_start_additions({"memory": mem, "scan_channels": chan}, mem, chan, fut) == (None, None, fut)
+    assert warm_start_additions({"memory": mem, "scan_channels": chan}, mem, chan, fut) == (None, None, fut, None)
     # and a flag not passed stays not passed
-    assert warm_start_additions({}, None, None, fut) == (None, None, fut)
+    assert warm_start_additions({}, None, None, fut) == (None, None, fut, None)
+    # the per-beam floor head routes the same way, and independently of the future head
+    assert warm_start_additions({"future_head": fut}, None, None, fut, flh) == (None, None, None, flh)
+    assert warm_start_additions({"floor_head": flh}, None, None, fut, flh) == (None, None, fut, None)
 
 
 # ------------------------------------------------------------------ the probe

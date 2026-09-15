@@ -147,10 +147,39 @@ class ScanStem(nn.Module):
         descriptor (min range per sector) that the conv stack would otherwise have to rediscover."""
         return -F.adaptive_max_pool1d(-x[:, :1], self.SECTORS).flatten(1)
 
-    def _resnet_features(self, x: torch.Tensor, extra: Optional[torch.Tensor] = None) -> torch.Tensor:
-        h = self.trunk(self._augment(x, extra))
+    def _resnet_features(self, x: torch.Tensor, extra: Optional[torch.Tensor] = None,
+                         beams: bool = False):
+        rows = self._augment(x, extra)
+        h = self.trunk(rows)
         pooled = torch.cat([-F.adaptive_max_pool1d(-h, 1).flatten(1), h.mean(2)], 1)
-        return torch.cat([self.neck(h).flatten(1), pooled, self._sector_profile(x)], 1)
+        out = torch.cat([self.neck(h).flatten(1), pooled, self._sector_profile(x)], 1)
+        return (out, h, rows) if beams else out
+
+    #: Channels the per-beam auxiliary head reads: the trunk's map and the stem's own input rows.
+    #: Only the resnet stem exposes them; the plain stem's five-conv stack has no whole-scan context
+    #: to upsample and `--aux-floor` refuses it rather than training a head on a 20-degree window.
+    def beam_channels(self) -> tuple:
+        if self.scan_stem != "resnet" or self.temporal_encoder == "gru":
+            raise ValueError(
+                f"the per-beam floor head needs the resnet stem's feature map and this stem is "
+                f"{self.scan_stem!r}/{self.temporal_encoder!r}. The plain stack's receptive field "
+                f"is ~79 beams, so a head on it would be shown one 20-degree window at a time and "
+                f"could not see that an arc of returns lies on one line -- which is the whole "
+                f"signal. Train the head on a resnet-stem checkpoint.")
+        cin = self.trunk[0].in_channels
+        return int(self.trunk[-1].conv2.out_channels if hasattr(self.trunk[-1], "conv2")
+                   else self.neck[0].in_channels), int(cin)
+
+    def forward_beams(self, scan):
+        """`(pooled features, trunk map (B, C, L), stem input rows (B, C_in, N))`.
+
+        `forward` is this without the last two, and is written as a call into the same helper, so
+        the two cannot compute different things. The arithmetic and its order are unchanged, which
+        is what keeps a run without the head bit-identical.
+        """
+        scan, extra = self.split_channels(scan)
+        out, h, rows = self._resnet_features(self.scan_features(scan), extra, beams=True)
+        return self.fc(out), h, rows
 
     def forward(self, scan):
         scan, extra = self.split_channels(scan)
@@ -258,6 +287,14 @@ class Actor(nn.Module):
         self.future_spec: Optional[dict] = None
         if future:
             self.attach_future(future)
+        #: Per-beam floor/solid head (`learn/floor_head.py`). Built by `ActorCritic` AFTER both
+        #: networks and after the future head, for the reason that one gives: every module here
+        #: draws from the ambient generator, so a head built in the middle would give the
+        #: `--aux-floor 0` arm and the `--aux-floor 1` arm differently-initialised weights above it.
+        #: Absent, the module list, the state dict and the RNG draw are what they were before this
+        #: existed -- which is what `tests/data/ppo_loss_oracle.json` pins.
+        self.floor = None
+        self.floor_spec: Optional[dict] = None
 
     def attach_motion(self, motion: dict, rows: Sequence[int], n_beams: int,
                       heads: Sequence[str] = ()) -> None:
@@ -313,6 +350,19 @@ class Actor(nn.Module):
         self.future = FutureHead(in_dim, spec["width"])
         #: The RESOLVED spec, so `ActorCritic` records what was built rather than what was asked for.
         self.future_spec = dict(spec)
+
+    def attach_floor_head(self, spec: dict) -> None:
+        """Build the per-beam floor head. Separate from `__init__` so `ActorCritic` can call it
+        LAST; see `attach_future` for why the order is part of the experiment."""
+        from .floor_head import FloorHead, floor_head_spec
+        cfg = floor_head_spec(**spec)
+        c_ctx, c_in = self.stem.beam_channels()
+        self.floor = FloorHead(c_ctx, c_in, cfg["width"], cfg["kernel"])
+        self.floor_spec = dict(cfg)
+
+    @property
+    def has_floor_head(self) -> bool:
+        return self.floor is not None
 
     def _require_cond(self, c, batch):
         """A conditional actor is never run on an implied zero.
@@ -411,7 +461,7 @@ class Actor(nn.Module):
         What it returns is `recurrent_state`: the whole state, including `h_dyn` where there is one,
         because "what does the policy's state carry" is a question about all of it.
         """
-        feat, _p, h_next, _enc = self._parts(scan, proprio, c, h)
+        feat, _p, h_next, _enc, _fl = self._parts(scan, proprio, c, h)
         return torch.tanh(self.mu(feat)), self.recurrent_state(feat, h_next), h_next
 
     def initial_hidden(self, batch: int, device=None, dtype=None):
@@ -476,11 +526,26 @@ class Actor(nn.Module):
             pre = pre + delta
         return act1(lin1(act0(pre))), h_next, enc
 
-    def _parts(self, scan, proprio, c=None, h=None, use_memory: bool = True):
+    def embed_floor(self, scan, proprio):
+        """`(embedding, proprio embedding, per-beam floor logits)` from ONE stem pass.
+
+        The head reads the stem's own feature map and its input rows, so running it needs the same
+        forward the action needs -- not a second one. `forward_beams` is `forward` plus two tensors
+        it already had.
+        """
+        f, ctx, rows = self.stem.forward_beams(scan)
+        p = self.pro(proprio)
+        return torch.cat([f, p], 1), p, self.floor(ctx, rows)
+
+    def _parts(self, scan, proprio, c=None, h=None, use_memory: bool = True, floor: bool = False):
         c = self._require_cond(c, proprio.shape[0])
-        x, p = self.embed(scan, proprio)
+        if floor and self.floor is not None:
+            x, p, fl = self.embed_floor(scan, proprio)
+        else:
+            x, p = self.embed(scan, proprio)
+            fl = None
         feat, h_next, enc = self.head(x, c, h, use_memory, self.motion_input(scan))
-        return feat, p, h_next, enc
+        return feat, p, h_next, enc, fl
 
     # ---------------------------------------------------------- feedforward entry points
     def features(self, scan, proprio, c=None):
@@ -504,20 +569,24 @@ class Actor(nn.Module):
     #: All three work on a feedforward actor too and return `None` for the next hidden state, so a
     #: converted call site is written once and does not branch on the checkpoint.
     def step(self, scan, proprio, c=None, h=None, use_memory: bool = True):
-        feat, _p, h_next, _enc = self._parts(scan, proprio, c, h, use_memory)
+        feat, _p, h_next, _enc, _fl = self._parts(scan, proprio, c, h, use_memory)
         return torch.tanh(self.mu(feat)), h_next
 
-    def step_all(self, scan, proprio, c=None, h=None, use_memory: bool = True):
-        """(action mean, grip, opponent motion, future or None, motion aux, next hidden).
+    def step_all(self, scan, proprio, c=None, h=None, use_memory: bool = True,
+                 floor: bool = False):
+        """(action mean, grip, opponent motion, future or None, motion aux, per-beam floor logits
+        or None, next hidden).
 
-        Everything new is appended BEFORE the hidden state, so `[:3]` -- which is what `forward_all`
-        and the warm-start parity test take -- still means (action, grip, opponent). `motion aux` is
-        the pair (per-beam mask logits, current Dv), both None unless the head exists.
+        Every auxiliary prediction is appended BEFORE the hidden state, so `[:3]` -- which is what
+        `forward_all` and the warm-start parity test take -- still means (action, grip, opponent),
+        and `[3]` still means the future head. `motion aux` is the pair (per-beam mask logits,
+        current Dv), both None unless that head exists. `floor` is False unless a caller asks, so
+        the extra tensors `forward_beams` returns are not even formed on the rollout path.
         """
-        feat, p, h_next, enc = self._parts(scan, proprio, c, h, use_memory)
+        feat, p, h_next, enc, fl = self._parts(scan, proprio, c, h, use_memory, floor)
         return (torch.tanh(self.mu(feat)), self.grip(torch.cat([feat, p], 1))[:, 0],
                 self.opp(feat), self.future_from(feat, h_next),
-                self.motion_aux(enc, h_next), h_next)
+                self.motion_aux(enc, h_next), fl, h_next)
 
     def step_dist(self, scan, proprio, c=None, h=None, use_memory: bool = True):
         mu, h_next = self.step(scan, proprio, c, h, use_memory)
@@ -731,6 +800,24 @@ def scan_channel_spec(scan_channels: Optional[dict]) -> dict:
         raise ValueError("scan_channels carries an 'aligned' block but not the 'aligned' channel: "
                          "one of the two is a typo, and guessing which would either build a channel "
                          "nobody asked for or drop a gate somebody measured.")
+    if "floor" in names:
+        # The floor channel's own block: which proprio columns it reads, the geometry and tolerance
+        # band it was built with, and which attitude it uses. Recorded so a checkpoint carries the
+        # channel it was trained with rather than whatever the reader's defaults happen to be.
+        from .floor import FloorSpec
+        blk = dict(scan_channels.get("floor") or {})
+        if not blk.get("proprio"):
+            raise ValueError(
+                "the floor channel needs its `floor.proprio` block (`obs.att_index_spec`): it "
+                "reads the gyro and accelerometer out of the proprio vector by index, and a "
+                "checkpoint that did not record the layout cannot be rebuilt against it")
+        blk["spec"] = FloorSpec(**(blk.get("spec") or {})).validate().to_meta()
+        blk.setdefault("att_source", "tracker")
+        blk.setdefault("fov", 1.5 * math.pi)
+        blk.setdefault("range_eps", 0.02)
+        out["floor"] = blk
+    elif scan_channels.get("floor"):
+        raise ValueError("a `floor` block was given but the floor channel is not enabled")
     return out
 
 
@@ -740,7 +827,8 @@ class ActorCritic(nn.Module):
                  cond_dim: int = 0, cond: Optional[dict] = None, priv_adapter: Optional[str] = None,
                  memory: Optional[dict] = None, scan_channels: Optional[dict] = None,
                  future_head: Optional[dict] = None, motion: Optional[dict] = None,
-                 motion_heads: Optional[Sequence[str]] = None):
+                 motion_heads: Optional[Sequence[str]] = None,
+                 floor_head: Optional[dict] = None):
         super().__init__()
         mem = memory_spec(**memory) if memory else None
         chan = scan_channel_spec(scan_channels)
@@ -782,6 +870,14 @@ class ActorCritic(nn.Module):
             # LAST, so that `--aux-future 1.0` adds a head and changes nothing else: every weight
             # above it was drawn from the same generator in the same order as in the arm without it.
             self.actor.attach_future(fut)
+        #: And the per-beam floor head after THAT, for the same reason one level down: with this
+        #: order, `--aux-floor` on top of an `--aux-future` arm leaves that arm's every weight where
+        #: it was, and `--aux-floor` alone leaves the plain arm's.
+        fl_head = None
+        if floor_head:
+            from .floor_head import floor_head_spec
+            fl_head = floor_head_spec(**floor_head)
+            self.actor.attach_floor_head(fl_head)
         self.meta = dict(n_stack=n_stack, n_beams=n_beams, proprio_dim=proprio_dim, priv_dim=priv_dim,
                          act_dim=act_dim, scan_deltas=scan_deltas, temporal_encoder=temporal_encoder,
                          scan_stem=scan_stem)
@@ -801,6 +897,8 @@ class ActorCritic(nn.Module):
                 self.meta["motion_heads"] = [h for h in ("mask", "dv") if h in motion_heads]
         if fut:
             self.meta["future_head"] = dict(self.actor.future_spec)
+        if fl_head:
+            self.meta["floor_head"] = dict(self.actor.floor_spec)
 
     @property
     def has_memory(self) -> bool:
@@ -813,6 +911,10 @@ class ActorCritic(nn.Module):
     @property
     def has_motion(self) -> bool:
         return self.actor.has_motion
+
+    @property
+    def has_floor_head(self) -> bool:
+        return self.actor.has_floor_head
 
     def initial_hidden(self, batch: int, device=None, dtype=None) -> Optional[Hidden]:
         """An all-zero `Hidden` for `batch` rows, or None for a feedforward checkpoint.
@@ -848,24 +950,27 @@ class ActorCritic(nn.Module):
         return (d.log_prob(actions).sum(1), d.entropy().sum(1), v, d,
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
-    def evaluate_aux(self, scan, proprio, priv, actions, c=None, h=None):
+    def evaluate_aux(self, scan, proprio, priv, actions, c=None, h=None, floor: bool = False):
         """evaluate() plus the auxiliary predictions, from the same trunk pass.
 
         Returns (log prob, entropy, value, distribution, grip, opponent motion, future, motion,
-        hidden). `future` is None for a checkpoint that carries no future head and `motion` is
-        (None, None) for one that carries no motion branch -- which is every checkpoint written
-        before either existed.
+        per-beam floor logits, hidden). `future`, `motion` and the floor logits are None -- `motion`
+        is the pair (None, None) -- for a checkpoint that carries no such head, which is every
+        checkpoint written before each existed; the floor logits are also None unless `floor` asks
+        for them, so that head costs nothing where it is not scored.
         """
         ha, hc = self._split(h)
-        mu, grip, opp, fut, mot, ha = self.actor.step_all(scan, proprio, c, ha)
+        mu, grip, opp, fut, mot, fl, ha = self.actor.step_all(scan, proprio, c, ha, floor=floor)
         mu = mu.float()
         d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
         v, hc = self.critic.step(scan, proprio, priv, hc)
         return (d.log_prob(actions).sum(1), d.entropy().sum(1), v, d, grip.float(), opp.float(),
                 None if fut is None else fut.float(), _float_pair(mot),
+                None if fl is None else fl.float(),
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
-    def evaluate_sequence(self, scan, proprio, priv, actions, c=None, h=None, keep=None):
+    def evaluate_sequence(self, scan, proprio, priv, actions, c=None, h=None, keep=None,
+                          floor: bool = False):
         """`evaluate_aux` over a (steps, envs) block, with the recurrence walked step by step.
 
         Shapes: `scan` (T, m, C, N), `proprio` (T, m, P), `priv` (T, m, V), `actions` (T, m, A),
@@ -882,7 +987,11 @@ class ActorCritic(nn.Module):
         T, m = scan.shape[0], scan.shape[1]
         flat = lambda t: t.reshape(T * m, *t.shape[2:])
         ha, hc = self._split(h)
-        xa, pa = self.actor.embed(flat(scan), flat(proprio))
+        fl = None
+        if floor and self.actor.floor is not None:
+            xa, pa, fl = self.actor.embed_floor(flat(scan), flat(proprio))
+        else:
+            xa, pa = self.actor.embed(flat(scan), flat(proprio))
         xv = self.critic.embed(flat(scan), flat(proprio), flat(priv))
         xa = xa.view(T, m, -1); xv = xv.view(T, m, -1)
         cs = None if c is None else c
@@ -925,6 +1034,7 @@ class ActorCritic(nn.Module):
         acts = flat(actions)
         return (d.log_prob(acts).sum(1), d.entropy().sum(1), val, d, grip.float(), opp.float(),
                 None if fut is None else fut.float(), _float_pair(mot),
+                None if fl is None else fl.float(),
                 (None if ha is None and hc is None else Hidden(ha, hc)))
 
 
@@ -1092,7 +1202,8 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                     motion: Optional[dict] = None,
                     motion_heads: Optional[Sequence[str]] = None,
                     init_seed: Optional[int] = None,
-                    opp_token_dim: int = 0) -> Tuple[ActorCritic, dict, list]:
+                    opp_token_dim: int = 0,
+                    floor_head: Optional[dict] = None) -> Tuple[ActorCritic, dict, list]:
     """Load a feedforward checkpoint into a recurrent actor-critic, by name, preserving every weight.
 
     Warm start, not re-initialisation. The memory is an addition to the original network, so at
@@ -1124,6 +1235,11 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     keep their meaning. Zeroed either way, so forward is bit-identical and the oracle starts as an
     input the network ignores.
 
+    `floor_head` adds the per-beam floor head (`learn.floor_head`) on the identical terms, and it
+    is the fourth family of tensors allowed to be new. Its output convolution is zero, so at step 0
+    it predicts 0.5 for every beam and changes nothing else; it is never exported and the actor's
+    forward never calls it.
+
     `memory` may be None: extra scan channels alone are a legitimate arm, and they need the same
     by-name transfer and the same zeroed new columns. At least one of the four must be asked for,
     or this is `load_checkpoint` with extra steps.
@@ -1149,6 +1265,10 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         raise ValueError(f"{os.path.basename(str(path))} already carries a motion branch "
                          f"({meta['motion']}); warm-starting one from it would re-initialise a path "
                          f"that is already trained. Resume it with load_checkpoint instead.")
+    if meta.get("floor_head") and floor_head:
+        raise ValueError(f"{os.path.basename(str(path))} already carries a floor head "
+                         f"({meta['floor_head']}); warm-starting one from it would re-initialise a "
+                         f"path that is already trained. Resume it with load_checkpoint instead.")
     if meta.get("memory"):
         raise ValueError(f"{os.path.basename(str(path))} already carries memory "
                          f"({meta['memory']}); warm-starting memory from it would be a second "
@@ -1185,19 +1305,28 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                              f"checkpoint's {p_base} nor that plus the {g_tok}-column privileged "
                              f"opponent block ({want}).")
         meta["proprio_dim"] = want
-    if not memory and not chan and not future_head and not motion and not g_tok:
+    if floor_head:
+        from .floor_head import floor_head_spec as _fhs
+        if str(meta.get("scan_stem")) != "resnet":
+            raise ValueError(
+                f"the per-beam floor head needs the resnet scan stem and "
+                f"{os.path.basename(str(path))} has {meta.get('scan_stem')!r}. See "
+                f"`ScanStem.beam_channels`: the plain stack has no whole-scan context to read.")
+        meta["floor_head"] = _fhs(**floor_head)
+    if not (memory or chan or future_head or motion or g_tok or floor_head):
         raise ValueError("load_for_memory with neither memory, a scan channel, a future head, a "
-                         "motion branch nor a privileged opponent block would be load_checkpoint "
-                         "with extra steps; call that instead.")
+                         "motion branch, a floor head nor a privileged opponent block would be "
+                         "load_checkpoint with extra steps; call that instead.")
     m = ActorCritic(**meta).to(device)
     sd = m.state_dict()
     src = ck["state_dict"]
 
     #: The only tensors allowed to be new. Everything else must arrive from the checkpoint.
-    #: `.memory.` covers the motion branch too -- it lives inside `GRUMemory` -- and the two
-    #: train-time heads are named separately because they hang off the actor.
+    #: `.memory.` covers the motion branch too -- it lives inside `GRUMemory` -- and the train-time
+    #: heads are named separately because they hang off the actor.
     allowed_fresh = {k for k in sd if ".memory." in k or k.startswith("actor.future.")
-                     or k.startswith("actor.opp_mask.") or k.startswith("actor.dv.")}
+                     or k.startswith("actor.opp_mask.") or k.startswith("actor.dv.")
+                     or k.startswith("actor.floor.")}
     #: name -> (column the zeros are inserted at, how many). Everything left of it keeps its index
     #: and everything right of it is shifted, which is what makes the forward bit-identical.
     grown = {}

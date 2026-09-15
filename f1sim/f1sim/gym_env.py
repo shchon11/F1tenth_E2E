@@ -1759,6 +1759,27 @@ class F1VecEnv:
         params = torch.stack([self.sim.P[k] for k in self.PRIV_PARAMS], 1)
         return torch.cat([pv, params, (self.speed_cap / self.ecfg.v_max_policy)[:, None]], 1)
 
+    def floor_labels(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, N) int8 per-beam label for the auxiliary floor head: 1 floor, 0 solid, -1 no return.
+
+        A *label*, not an observation: it is `scan_type` (`f1sim.lidar.HIT_*`), which only the
+        simulator has, and nothing the policy sees is built from it. The beams that carry no return
+        are marked -1 rather than 0 because there is nothing there to be solid -- classifying a
+        dropout as "not floor" would train the head to call the sensor's own gaps obstacles, and a
+        grazing floor beam is exactly what `lidar.floor_dropout` removes, so those gaps are *more*
+        likely floor than average.
+
+        Beam resolution is the observation's, not the sensor's: `scan_subsample` is applied here as
+        `_norm_scan` applies it, so label and scan column mean the same beam.
+        """
+        r = r if r is not None else self.last_result
+        typ = r.scan_type[:, ::self.ecfg.scan_subsample]
+        scan = self.scan_hist[:, 0]
+        lab = torch.where(typ == 3, torch.ones_like(typ, dtype=torch.int8),
+                          torch.zeros_like(typ, dtype=torch.int8))
+        gap = (typ == 0) | (scan >= 1.0 - 1e-4)
+        return torch.where(gap, torch.full_like(lab, -1), lab)
+
     def future_labels(self, r: Optional[StepResult] = None) -> torch.Tensor:
         """(B, FUTURE_LABEL_DIM) privileged snapshot of THIS instant, in `FUTURE_LABEL_KEYS` order.
 

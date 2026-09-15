@@ -24,8 +24,8 @@ sensor source                     policy                    controller
 
 | node | in | out |
 | --- | --- | --- |
-| [`policy_node`](../f1sim_ros/f1sim_ros/policy_node.py) | `/scan`, `/odom`, `/sensors/imu`, `/sensors/imu/raw`, `/f1sim/reset` | `/f1sim/plan`, `/f1sim/policy_state` |
-| [`controller_node`](../f1sim_ros/f1sim_ros/controller_node.py) | `/f1sim/plan`, `/scan`, `/odom`, `/sensors/imu/raw`, `/sensors/core`, `/f1sim/reset` | `/drive`, `/f1sim/controller/diag`, `/f1sim/viz/{plan,clearance,diag}` |
+| [`policy_node`](../f1sim_ros/f1sim_ros/policy_node.py) | `/scan`, `/odom`, `/sensors/imu`, `/sensors/imu/raw`, `/f1sim/reset` | `/f1sim/plan`, `/f1sim/policy_state`, `/f1sim/policy/perception` |
+| [`controller_node`](../f1sim_ros/f1sim_ros/controller_node.py) | `/f1sim/plan`, `/f1sim/policy/perception`, `/scan`, `/odom`, `/sensors/imu/raw`, `/sensors/core`, `/f1sim/reset` | `/drive`, `/f1sim/controller/diag`, `/f1sim/viz/{plan,clearance,diag}` |
 | [`system_check`](../f1sim_ros/f1sim_ros/system_check_node.py) | everything in `config/record.yaml` | `/f1sim/system_check` |
 | [`eval`](../f1sim_ros/f1sim_ros/eval_node.py) | `/drive`, `/f1sim/controller/diag` | the sensor topics, and a benchmark row |
 
@@ -87,6 +87,14 @@ be paired with the next scan's measured speed. A plan that arrives *before* its 
 cent of the time in a live graph, because the two nodes receive `/scan` independently) is held for
 one scan rather than mispaired; one whose scan never arrives is tracked against the newest and
 counted in `plan_unmatched` on the diagnostics.
+
+[`f1sim_interfaces/Perception`](../f1sim_interfaces/msg/Perception.msg) is the second thing the
+policy publishes about a scan, and it is deliberately **not** part of `Plan`: the plan is
+arm-agnostic and this exists so that one arm can read what one network computed. It carries the
+front-end's per-beam floor class (`float32[] floor`, empty when the checkpoint has no front-end)
+and the `(roll, pitch)` the observation was built with, under the same scan stamp, so the
+controller pairs it with the same snapshot it pairs the plan with. Optional in both directions —
+see the clearance floor gate below.
 
 [`f1sim_interfaces/PolicyState`](../f1sim_interfaces/msg/PolicyState.msg) carries what the policy
 knows about itself: whether the checkpoint has episode memory, how many times it has been cleared
@@ -302,6 +310,143 @@ Cost on this desk's CPU, single thread, batch 1: **1.25 ms** of the 25 ms a 40 H
 (`python3 -m f1sim.learn.budget --clearance`). It never raises a commanded speed. Unit tests:
 `f1sim/tests/test_controller_clearance.py`.
 
+#### `clearance_floor_gate` — leaving the floor out of the grid
+
+**Off by default, and off the arm is byte-identical to the one above**: `clearance.occupancy` does
+not look at the floor likelihood at all unless the flag is on.
+
+The scan plane sits 0.110 m above the floor and follows the sprung body, so 2° of tilt puts the
+floor across the beam at 3.2 m and 5° at 1.3 m. The arm treats every return as solid, so those
+returns bend and brake the executed plan. On the held-out proxy tracks, measured against the arm's
+own decision on the *solid* returns only, that is **3.5 % of all control steps** and **0.25 m/s per
+step** of speed the geometry never asked for.
+
+The arm is `controller_node`'s, so the gate is too:
+
+```bash
+ros2 launch f1sim_ros graph_sim.launch.py checkpoint:=... \
+  controller:=fixed_low+clearance clearance_floor_gate:=true
+# or on the node directly
+ros2 run f1sim_ros controller --ros-args -p checkpoint:=... \
+  -p controller:=fixed_low+clearance -p clearance_floor_gate:=true
+```
+
+On, a return whose floor likelihood (`f1sim.learn.floor`) reaches the threshold is dropped from the
+occupancy grid the same way a beam with no return is. Three things to know before using it:
+
+* **the tilt comes from the IMU the controller already reads**, integrated by
+  `floor.AttitudeTracker` off `/sensors/imu/raw`'s gyro and accelerometer — **not** from the orientation quaternion. Five
+  of the thirteen competition recordings swing that quaternion's roll past 40°, and in simulation
+  it is wrong by 0.14 rad rms while driving, because the filter follows the accelerometer and a
+  0.45 g brake tilts it by `atan2(4.4, 9.81)` = 24°. No new topic and no new message type: the
+  tracker reads the same IMU mean the observation is built from.
+* **until the car has stood still once, the gate removes nothing.** The tracker's zero reference is
+  the reading it takes at rest — the sensor's own mounting misalignment, which no IMU can see from
+  the inside — and without it the likelihood reads `floor.UNKNOWN` (0.5), which is below the
+  threshold. "I cannot tell" must not be spelled the same way as "solid".
+* **driven by the geometry, it is not recommended on the car and buys nothing.** The gate's
+  precision is bounded by the attitude error, and measured
+  (`docs/research/floor-mask-2026-09-15.md`) the best estimate a car can have is 3× wider than the
+  geometry needs. On the eight held-out proxy tracks it removes 0.32 % of returns and produces a lap
+  time identical to leaving the gate off on six of seven tracks. **Driven by the front-end it is a
+  different flag** — see below.
+
+`controller/clearance_floor_gated_frac` in the metrics says what share of returns it removed.
+
+**If the checkpoint carries a front-end channel, the gate reads the front-end instead of the
+geometry.** That is the configuration worth running: measured against the simulator's own labels,
+at 3–5° of tilt the network reads precision 0.79 / recall 0.97 where the geometry reads 0.15 /
+0.01, and on the real recordings its floor claims are 3.9× enriched in beams that end short of the
+map against the geometry's 1.9×. It needs no attitude to do it, which is the whole reason the
+geometric path is stuck. The front-end runs once per scan for the policy's own channels, so the
+gate costs nothing extra.
+
+**Across the node split it arrives on a topic.** The network is the policy's and the arm is the
+controller's, so `policy_node` publishes what it computed about each scan on
+`/f1sim/policy/perception` (`f1sim_interfaces/Perception`: the per-beam floor class and the
+attitude the observation was built with), stamped with that scan exactly as `Plan` is, and the
+controller pairs the two the same way — so this scan's plan can never be gated by another scan's
+perception. The topic is **optional in both directions**: a policy whose checkpoint has no
+front-end publishes an empty `floor` field, and a controller that never receives the topic uses its
+own geometry, which is what the gate did before a front-end existed. `/f1sim/policy/perception` is
+`required: false` in `config/record.yaml` for the same reason. Which source was actually in force is
+on `/f1sim/controller/diag` as `clearance_floor_source` (`frontend` / `geometry`).
+
+**Measured, in simulation, with no training** (`docs/research/floor-mask-2026-09-15.md` §6), on
+eight held-out proxy tracks, 128 cars, against the arm's own decision on the solid returns only:
+
+| | gate off | gate: front-end | **gate: front-end, brake-only** |
+|---|---:|---:|---:|
+| the arm's phantom decisions | 3.46 % | 0.36 % | 2.09 % |
+| … phantom **brakes** | 3.02 % | 0.19 % | **0.56 %** |
+| speed removed for no solid reason | 0.246 m/s | 0.011 | 0.035 |
+| `lost` — a solid decision the gate suppressed | 0.15 % | 0.62 % | **0.28 %** |
+| collisions / km | 36.53 | 37.26 | 35.06 |
+| mean first-lap time | 12.89 s | 12.38 s | **12.11 s** |
+| tracks faster than gate-off | — | 8 of 8 | **8 of 8** |
+
+**Read those columns against the proxy's own resolution**, which is the row that matters most here:
+the *same* gate-off arm run again on a second seed moves by **25 completions of 128**, 1.38
+collisions/km and 0.40 pp of below-zero solid margin, while its mean first-lap time moves **0.06 s**.
+So the lap-time win is 13× the noise and is further supported by being paired (same tracks, same
+seeds, 8 of 8 faster, sign test p = 0.004) — and the completion and collision columns above are
+beneath the noise and should not be read as either a cost or a benefit.
+
+`clearance_floor_gate_mode` picks which decision the gate may touch, and **`brake` is the default**:
+it may remove floor returns from the speed cap, and the bend still sees every return. That is the
+asymmetry the measurement found — floor returns are what makes the car brake for nothing, and the
+bend is where suppressing a real return costs. Brake-only is the fastest arm tried, has the lowest
+collisions/km of any including gate-off, and suppresses a third as many wanted decisions as gating
+both, while still removing 81 % of the phantom brakes. `clearance_floor_gate_mode:=both` is the
+documented alternative.
+
+The cost line, stated rather than rounded off: the only cost this proxy can resolve is `lost` —
+decisions the solid world asked for and the gate suppressed — which is why brake-only ships and
+gating both decisions does not. **At 128 trials the proxy cannot see a safety cost from the gate,
+and that is not the same as there being none.** One checkpoint, one seed set, and it has never run
+on the real car.
+
+### `attitude_source` — the quaternion is not the only option any more
+
+**This one is `policy_node`'s parameter, not the controller's**: it changes two columns of the
+POLICY's observation, so it belongs to the node that builds the observation. The controller reads
+the attitude it needs for the gate from its own IMU mean, and the policy's choice reaches it (for
+the record, and for a `frontend` estimate) on `/f1sim/policy/perception`.
+
+The policy reads two observation columns of body roll and pitch, and on this car they come from the
+`/sensors/imu/raw` orientation quaternion. Measured against the truth in simulation, that quaternion
+is wrong by **0.144 rad rms in roll and 0.091 in pitch while driving** — the IMU's own mounting
+misalignment enters as a constant offset, and the filter follows the accelerometer, which a 0.45 g
+brake tilts by `atan2(4.4, 9.81)` = 24°. And **five of the thirteen competition recordings** carry a
+quaternion that swings the extracted roll past 40°, on which this node refuses to drive at all.
+
+`attitude_source:=ego` replaces it with `f1sim.learn.floor.EgoStateAttitude` — the suspension's
+calibrated response to the accelerations the car itself produces, from the wheel speed, the gyro's
+yaw and the accelerometer, with the wheel-lock windows held rather than believed. Measured, 0.022 /
+0.022. It uses no quaternion, so those five recordings stop being a reason to stop driving, and
+`_stale_inputs` no longer requires an attitude when it is selected.
+
+```bash
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p attitude_source:=ego
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... -p attitude_source:=frontend
+```
+
+`frontend` is the most accurate of the three where it is available — measured 0.017 / 0.016 rad
+against the ego path's 0.019 / 0.022 and the quaternion's 0.144 / 0.091, and **below the 0.0205 rad
+floor that bounds every estimate built from the IMU or the drivetrain**, because the two terms that
+set that floor (the road-tilt process and the LiDAR's own mounting offset) are invisible to an IMU
+and visible in the scan. It needs a checkpoint that declares a front-end channel, and it carries one
+control step of lag: the network reads the scan stack that `ObsBuilder.build` is about to produce,
+so the estimate available when the observation is assembled is the one made 25 ms ago — on a
+quantity whose own process has a 0.4 s time constant. Until the first scan has been through it, the
+ego-state estimate stands in.
+
+**`vesc` stays the default and should**, until a checkpoint has been finetuned against the other
+columns: every trained policy saw the quaternion in training, and swapping what two of its
+observation inputs mean is a change to make deliberately. The estimator runs either way — the
+clearance gate and any front-end channel read it — so selecting `ego` changes what the *policy*
+sees and nothing else. See `docs/research/floor-mask-2026-09-15.md`.
+
 ## Traction guard
 
 `controller_node` can watch the wheel for lock-up and spin and shape the speed command it
@@ -369,6 +514,9 @@ the numbers behind them, and the current state is on `/f1sim/controller/diag`:
 | --- | --- | --- |
 | `controller` | `fixed_low` | `legacy`, `fixed_low`, `clearance`, `fixed_low+clearance`. Anything else — the simulator's `oracle` / `estimated` / `+tcs` arms — is refused rather than silently downgraded |
 | `clearance_margin` | `0.0` | body-edge margin for a `+clearance` arm, in metres; `0.0` means the module default (0.20 m) |
+| `clearance_floor_gate` | `false` | leave likely-floor returns out of the clearance grid (see above). Off is byte-identical to the arm without it |
+| `clearance_floor_gate_mode` | `brake` | which decision the gate may touch: `brake` the speed cap only (measured better on every axis), `both` the whole arm |
+| `perception_topic` | `/f1sim/policy/perception` | where the policy publishes the front-end's floor class for the gate. Optional: without it the gate uses its own geometry |
 | `traction` | `off` | `off` installs nothing at all; `on` installs the replay-validated guard. Anything else is refused |
 | `traction_params` | `""` | `NAME=VALUE` pairs (comma or space separated) overriding any field of `TractionParams` — every threshold is reachable from the launch line |
 

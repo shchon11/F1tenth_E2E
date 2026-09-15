@@ -232,12 +232,14 @@ class PolicyRuntime:
     """
 
     def __init__(self, memory: bool = False, channels=(), n_beams: int = 0, tau_s: float = 2.0,
-                 aligned: Optional[dict] = None):
+                 aligned: Optional[dict] = None, floor: Optional[dict] = None):
         self.memory, self.channels = bool(memory), tuple(channels)
         self.n_beams, self.tau_s = int(n_beams), float(tau_s)
         #: The `aligned` channel's spec, including the proprio index block it warps with. Carried
         #: rather than rebuilt so that a runtime is a faithful copy of what the checkpoint recorded.
         self.aligned = dict(aligned) if aligned else None
+        #: The floor channel's block out of `meta["scan_channels"]["floor"]`, or None. Same rule.
+        self.floor = dict(floor) if floor else None
         self.hidden: Optional[Hidden] = Hidden() if self.memory else None
         self.scan = None
         self.batch: Optional[int] = None
@@ -263,7 +265,7 @@ class PolicyRuntime:
         self.batch, self._device = int(batch), device
         self.hidden = Hidden() if self.memory else None
         self.scan = (ScanAugment(self.channels, self.n_beams, self.batch, device=device or "cpu",
-                                 tau_s=self.tau_s, aligned=self.aligned)
+                                 tau_s=self.tau_s, aligned=self.aligned, floor=self.floor)
                      if self.channels else None)
 
     def reset(self, done=None) -> None:
@@ -275,11 +277,13 @@ class PolicyRuntime:
     def observe(self, scan: torch.Tensor, proprio: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The scan the policy actually sees: the stacked frames plus any enabled extra channels.
 
-        `proprio` is needed only by the `aligned` channel, which warps with the car's own measured
-        motion; every other channel ignores it and a path that enables none is unchanged. It is not
-        defaulted to zeros inside the augmenter: a warp told the car is standing still would return
-        a residual made of the ego's motion, which is exactly the thing this channel exists to
-        remove, and it would look like a working channel.
+        `proprio` is needed by the `aligned` channel, which warps with the car's own measured
+        motion, and by the `floor` / front-end channels, whose attitude comes from the same
+        vector; every other channel ignores it and a path that enables none is unchanged. It is
+        not defaulted to zeros inside the augmenter: a warp told the car is standing still would
+        return a residual made of the ego's motion -- exactly the thing that channel exists to
+        remove -- and it would look like a working channel, and zeros would hand the floor geometry
+        a level scan plane on a braking car.
         """
         self.ensure(scan.shape[0], scan.device)
         return scan if self.scan is None else self.scan(scan, proprio)
@@ -295,7 +299,7 @@ def runtime_for(model, batch: Optional[int] = None, device=None) -> PolicyRuntim
     rt = PolicyRuntime(memory=bool(meta.get("memory")), channels=chan.get("channels") or (),
                        n_beams=int(meta.get("n_beams", 0)),
                        tau_s=float(chan.get("memory_tau_s", 2.0)),
-                       aligned=chan.get("aligned"))
+                       aligned=chan.get("aligned"), floor=chan.get("floor"))
     if batch is not None:
         rt.ensure(int(batch), device or next(model.parameters()).device)
     return rt

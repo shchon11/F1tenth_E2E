@@ -33,7 +33,7 @@ from builtin_interfaces.msg import Time                       # noqa: E402
 import f1sim_ros.controller_node as cn                        # noqa: E402
 import f1sim_ros.deploy as deploy                             # noqa: E402
 from f1sim.learn.obs import ObsSpec                           # noqa: E402
-from f1sim_interfaces.msg import Plan, PolicyState            # noqa: E402
+from f1sim_interfaces.msg import Perception, Plan, PolicyState            # noqa: E402
 
 G = deploy.G
 DT = 0.025
@@ -106,6 +106,7 @@ def make_node(plan_timeout=0.25, timeout=0.25, speed=2.0):
     n.grip = None; n.clearance = None; n._scan_geometry_checked = True
     n.controller_arm = "legacy"
     n._snapshots = []; n._pending = None
+    n._perception = {}; n._floor_from_frontend = 0; n._warned = set()
     n.plan = None; n.t_plan = None; n.plan_seq = None; n.plan_checkpoint = ""
     n._inhibited = False; n._last_inhibit_log = -1e9; n._braking = False
     n._plan_unmatched = 0; n._last_unmatched_log = -1e9; n._commands = 0
@@ -145,6 +146,36 @@ def plan_msg(stamp, seq=0, values=None):
     m.seq = int(seq)
     m.checkpoint = "run/ppo_latest.pt@abcdef012345"
     return m
+
+
+def perception_msg(stamp, floor=None, source="frontend"):
+    m = Perception()
+    m.header.stamp = stamp
+    m.floor = [] if floor is None else [float(x) for x in floor]
+    m.attitude = [0.0, 0.0]
+    m.attitude_ok = True
+    m.source = source
+    return m
+
+
+class FloorSpyArm:
+    """A clearance arm that records what the controller handed it, and for which scan."""
+
+    def __init__(self, gate=True, mode="brake"):
+        self.cspec = SimpleNamespace(margin=0.2, floor_gate=gate, floor_gate_mode=mode)
+        self.last = None
+        self.scans = []
+        self.floors = []
+        self.attitudes = []
+
+    def update_scan(self, s):
+        self.scans.append(s)
+
+    def update_attitude(self, g, a, v):
+        self.attitudes.append((g, a, v))
+
+    def set_floor(self, p):
+        self.floors.append(p)
 
 
 def sensors_at(n, v, stamp):
@@ -317,8 +348,11 @@ def test_the_diag_says_which_arm_which_friction_and_what_the_guard_is_doing():
     n = make_node()
     n.controller_arm = "fixed_low+clearance"
     n.grip = SimpleNamespace(mu=[0.73423])
-    n.clearance = SimpleNamespace(cspec=SimpleNamespace(margin=0.2), last=None,
-                                  update_scan=lambda _s: None)
+    # `floor_gate` off, which is `ClearanceSpec`'s default and the arm that ships: the diag has to
+    # say so, and no attitude or front-end path may run.
+    n.clearance = SimpleNamespace(cspec=SimpleNamespace(margin=0.2, floor_gate=False,
+                                                        floor_gate_mode="brake"),
+                                  last=None, update_scan=lambda _s: None)
     n.traction_arm = "on"; n.traction_state = "LOCK"
     sensors_at(n, 3.0, ros_time(1.0))
     n.on_plan(plan_msg(ros_time(1.0), seq=11))
@@ -326,6 +360,7 @@ def test_the_diag_says_which_arm_which_friction_and_what_the_guard_is_doing():
     assert kv["arm"] == "fixed_low+clearance"
     assert kv["mu"] == "0.73423"
     assert kv["clearance_margin_m"] == "0.200"
+    assert kv["clearance_floor_gate"] == "off" and kv["clearance_floor_source"] == ""
     assert kv["traction"] == "on" and kv["traction_state"] == "LOCK"
     assert kv["plan_seq"] == "11" and kv["plan_checkpoint"].endswith("abcdef012345")
     assert kv["speed_cmd_mps"] == "2.0000"
@@ -354,3 +389,90 @@ def test_the_observation_spec_is_read_from_the_checkpoint(tmp_path):
     bare = n._observation_spec("", 0, 0.0, 0.0)
     assert bare.n_beams == ObsSpec().n_beams
     assert "right only by accident" in n._log.text("warning")
+
+
+# ============================================ the policy's perception, across the node split
+#
+# The monolithic node had the sensor front-end and the clearance arm in one process, so the gate
+# could read `frontend.last_probs` directly (`feat/floor-mask`). The split put the network in
+# `policy_node` and the arm here, so it arrives on `/f1sim/policy/perception`, stamped with the
+# scan it belongs to and paired the way the plan is. These tests are about that pairing: nothing
+# below is on unless `floor_gate` is, which is off by default.
+def test_the_floor_gate_reads_the_policys_front_end_for_the_scan_it_is_tracking():
+    n = make_node()
+    n.controller_arm = "fixed_low+clearance"
+    n.clearance = FloorSpyArm()
+    want = [0.25] * 64
+    n.on_perception(perception_msg(ros_time(1.0), floor=want))
+    sensors_at(n, 3.0, ros_time(1.0))
+    n.on_plan(plan_msg(ros_time(1.0)))
+    assert len(n.clearance.floors) == 1
+    assert n.clearance.floors[0].shape == (1, 64)
+    assert float(n.clearance.floors[0][0, 0]) == pytest.approx(0.25)
+    # the geometric estimator is advanced anyway, so it never integrates across a gap in the topic
+    assert len(n.clearance.attitudes) == 1
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["clearance_floor_gate"] == "brake" and kv["clearance_floor_source"] == "frontend"
+
+
+def test_a_perception_for_another_scan_never_gates_this_one():
+    """The whole reason it is stamped. A message for a scan this command is not tracking is not
+    'the newest answer', it is an answer about a different picture."""
+    n = make_node()
+    n.controller_arm = "fixed_low+clearance"
+    n.clearance = FloorSpyArm()
+    n.on_perception(perception_msg(ros_time(9.0), floor=[0.9] * 64))
+    sensors_at(n, 3.0, ros_time(1.0))
+    n.on_plan(plan_msg(ros_time(1.0)))
+    assert n.clearance.floors == [], "a perception from another scan reached this command"
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["clearance_floor_source"] == "geometry"
+
+
+def test_no_perception_at_all_is_the_geometric_gate():
+    """A policy node that publishes nothing -- every published checkpoint, none of which carries a
+    front-end -- leaves the gate exactly as `feat/floor-mask` shipped it."""
+    n = make_node()
+    n.controller_arm = "fixed_low+clearance"
+    n.clearance = FloorSpyArm()
+    sensors_at(n, 3.0, ros_time(1.0))
+    n.on_plan(plan_msg(ros_time(1.0)))
+    assert n.clearance.floors == [] and len(n.clearance.attitudes) == 1
+    assert {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}[
+        "clearance_floor_source"] == "geometry"
+
+
+def test_the_gate_off_touches_neither_the_attitude_nor_the_front_end():
+    n = make_node()
+    n.controller_arm = "fixed_low+clearance"
+    n.clearance = FloorSpyArm(gate=False)
+    n.on_perception(perception_msg(ros_time(1.0), floor=[0.9] * 64))
+    sensors_at(n, 3.0, ros_time(1.0))
+    n.on_plan(plan_msg(ros_time(1.0)))
+    assert n.clearance.floors == [] and n.clearance.attitudes == []
+    assert len(n.clearance.scans) == 1, "the scan still reaches the arm"
+
+
+def test_a_perception_of_the_wrong_width_is_named_and_ignored():
+    """Same beam count or nothing: the two are built from one `ObsSpec`, so a disagreement means
+    the policy and the controller are not reading the same observation, and gating on it would be
+    a silently rotated floor."""
+    n = make_node()
+    n.controller_arm = "fixed_low+clearance"
+    n.clearance = FloorSpyArm()
+    n.on_perception(perception_msg(ros_time(1.0), floor=[0.4] * 32))
+    sensors_at(n, 3.0, ros_time(1.0))
+    n.on_plan(plan_msg(ros_time(1.0)))
+    assert n.clearance.floors == []
+    assert "32 floor values" in n._log.text("warning")
+    n.on_perception(perception_msg(ros_time(2.0), floor=[0.4] * 32))
+    sensors_at(n, 3.0, ros_time(2.0))
+    n.on_plan(plan_msg(ros_time(2.0), seq=1))
+    assert n._log.text("warning").count("32 floor values") == 1, "warned once, not per scan"
+
+
+def test_the_perception_store_is_bounded():
+    n = make_node()
+    for i in range(cn.SNAPSHOT_MAX * 3):
+        n.on_perception(perception_msg(ros_time(1.0 + i), floor=[0.1] * 64))
+    assert len(n._perception) <= cn.SNAPSHOT_MAX

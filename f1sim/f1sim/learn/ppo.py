@@ -39,6 +39,7 @@ from .model import (ActorCritic, load_checkpoint, load_for_conditioning, load_fo
                     save_checkpoint)
 from .aligned import (ALIGNED_CONSIST_BEAMS, ALIGNED_GAP_FILL, ALIGNED_K, ALIGNED_TAU,
                       ALIGNED_TAU_REL, ALIGNED_TOL_BEAMS, ALIGNED_Z_TOL, aligned_spec)
+from .floor_head import floor_head_spec, floor_loss
 from .obs import ALIGNED_CHANNELS, SCAN_CHANNELS, ScanAugment, flatten_obs, motion_index_spec
 from .returns import compute_gae
 
@@ -80,6 +81,7 @@ class PPOHyper:
     aux_future: float = 0.0
     aux_opp_mask: float = 0.0
     aux_motion: float = 0.0
+    aux_floor: float = 0.0
     priv_mu_index: int = 16
     aux_opp_range_m: float = AUX_OPP_RANGE_M
     m_gt_1: bool = False
@@ -88,7 +90,8 @@ class PPOHyper:
 def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old, adv, ret,
                      val_old, w, cond=None, hyper: PPOHyper, autocast=None,
                      freeze_actor: bool = False, sequence=None,
-                     future=None, future_valid=None, beam_mask=None, dv=None) -> dict:
+                     future=None, future_valid=None, beam_mask=None, dv=None,
+                     floor_label=None) -> dict:
     """One PPO minibatch's loss terms, feedforward or recurrent.
 
     Lifted out of `main`'s inner loop unchanged so that (a) the recurrent path and the feedforward
@@ -115,18 +118,21 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     ac = autocast if autocast is not None else nullcontext()
     with ac:
         if sequence is None:
-            logp, ent, val, d, grip, opp_pred, fut_pred, mot_pred, h_next = model.evaluate_aux(
-                scan, pro, priv, act, cond)
+            (logp, ent, val, d, grip, opp_pred, fut_pred, mot_pred, floor_pred,
+             h_next) = model.evaluate_aux(scan, pro, priv, act, cond,
+                                          floor=hyper.aux_floor > 0)
             ref_scan, ref_pro, ref_cond = scan, pro, cond
         else:
             h0, keep = sequence
-            logp, ent, val, d, grip, opp_pred, fut_pred, mot_pred, h_next = model.evaluate_sequence(
-                scan, pro, priv, act, cond, h0, keep)
+            (logp, ent, val, d, grip, opp_pred, fut_pred, mot_pred, floor_pred,
+             h_next) = model.evaluate_sequence(scan, pro, priv, act, cond, h0, keep,
+                                               floor=hyper.aux_floor > 0)
             T, m = scan.shape[0], scan.shape[1]
             flat = lambda t: None if t is None else t.reshape(T * m, *t.shape[2:])
             ref_scan, ref_pro, ref_cond, priv = flat(scan), flat(pro), flat(cond), flat(priv)
             future, future_valid = flat(future), flat(future_valid)
             beam_mask, dv = flat(beam_mask), flat(dv)
+            floor_label = flat(floor_label)
     logp, ent, val = logp.float(), ent.float(), val.float()
 
     def wmean(x, w):
@@ -151,6 +157,17 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
         # nothing and trained the head on an empty road.
         near = (priv[:, 11] * PRIV_OPP_DIST_SCALE < hyper.aux_opp_range_m).to(w.dtype) * w
         aux_o = wmean(((opp_pred - o_true) ** 2).mean(1), near)
+    aux_fl = torch.zeros((), device=logp.device)
+    aux_fl_parts: dict = {}
+    if hyper.aux_floor > 0:
+        if floor_pred is None or floor_label is None:
+            raise ValueError(
+                "--aux-floor is on but this minibatch carries no floor head / labels: the head is "
+                "built from meta['floor_head'] and the labels come from the rollout buffer, so a "
+                "missing one means the run was assembled wrong rather than that the term is off.")
+        lab = floor_label
+        aux_fl, aux_fl_parts = floor_loss(floor_pred, (lab > 0).float(), (lab >= 0).float(),
+                                          w.float())
     aux_f = torch.zeros((), device=logp.device)
     aux_f_parts: dict = {}
     if hyper.aux_future > 0:
@@ -198,12 +215,14 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     ent_w = wmean(ent, w)
     loss = (hyper.vf * vf + (0.0 if freeze_actor else 1.0) * (pg - hyper.ent * ent_w
             + hyper.kl_coef * kl_ref) + hyper.aux_grip * aux + hyper.aux_opp * aux_o
-            + hyper.aux_future * aux_f + hyper.aux_opp_mask * aux_m + hyper.aux_motion * aux_dv)
+            + hyper.aux_future * aux_f + hyper.aux_opp_mask * aux_m + hyper.aux_motion * aux_dv
+            + hyper.aux_floor * aux_fl)
     return {"pg": pg, "vf": vf, "ent": ent_w, "entropy_mean": ent.mean(), "kl_ref": kl_ref,
             "aux_grip": aux, "aux_opp": aux_o, "aux_future": aux_f,
             "aux_future_parts": aux_f_parts, "aux_opp_mask": aux_m,
             "aux_opp_mask_parts": aux_m_parts, "aux_motion": aux_dv,
-            "aux_motion_parts": aux_dv_parts, "loss": loss, "hidden": h_next,
+            "aux_motion_parts": aux_dv_parts, "aux_floor": aux_fl,
+            "aux_floor_parts": aux_fl_parts, "loss": loss, "hidden": h_next,
             "approx_kl": ((ratio - 1) - (logp - logp_old)).mean(),
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
 
@@ -240,7 +259,7 @@ def kl_reference_is_baseline(ref, memory_on: bool, kl_coef: float, init: str = "
     return False
 
 
-def warm_start_additions(init_meta: dict, memory, scan_channels, future_head):
+def warm_start_additions(init_meta: dict, memory, scan_channels, future_head, floor_head=None):
     """The architecture pieces `--init` does NOT already carry, i.e. what a warm start would add.
 
     A resume is not a warm start. `load_for_memory` refuses a checkpoint that already has the thing
@@ -252,7 +271,8 @@ def warm_start_additions(init_meta: dict, memory, scan_channels, future_head):
     """
     return (None if init_meta.get("memory") else memory,
             None if init_meta.get("scan_channels") else scan_channels,
-            None if init_meta.get("future_head") else future_head)
+            None if init_meta.get("future_head") else future_head,
+            None if init_meta.get("floor_head") else floor_head)
 
 
 def main():
@@ -400,6 +420,15 @@ def main():
                     help=f"lookahead of --aux-future in control steps (40 Hz). Default {FUTURE_K} "
                          f"= 0.5 s. Only the last k steps of each --horizon chunk go unlabelled, so "
                          f"a k near the horizon leaves almost nothing to train on")
+    ap.add_argument("--aux-floor", type=float, default=0.0,
+                    help="weight of an auxiliary loss making the actor's SCAN STEM predict, per "
+                         "beam, whether a return is the floor or a solid object. The label is free "
+                         "in the simulator (`scan_type == HIT_GROUND`); beams with no return are "
+                         "excluded. Weighted BCE, positive weight from the batch rate, recall AND "
+                         "precision reported every update. Never exported, off by default and "
+                         "byte-identical off. Needs --scan-stem resnet")
+    ap.add_argument("--aux-floor-width", type=int, default=32,
+                    help="channels in the per-beam floor head (--aux-floor)")
     ap.add_argument("--aux-future-width", type=int, default=128,
                     help="hidden width of the future head's one layer")
     ap.add_argument("--car-proximity-penalty", type=float, default=0.0,
@@ -445,14 +474,19 @@ def main():
                          f"bearing in the last --scan-memory-tau seconds, decayed -- explicit cheap "
                          f"memory the GRU does not have to learn. 'edges': |r[i]-r[i-1]| per beam, "
                          f"so the crack between two boxes in a row reads as two discontinuities "
-                         f"rather than an opening. Both are pure arithmetic on the scan the env "
-                         f"already emits (0.03 ms of a 25 ms step, measured) and both start as "
-                         f"zeroed input columns, so a warm start is still bit-identical. "
+                         f"rather than an opening. 'floor': the per-beam likelihood that a return "
+                         f"is the FLOOR rather than a solid object, from the beam geometry and an "
+                         f"attitude tracked off the IMU the observation already carries "
+                         f"(`learn/floor.py`); 0 = solid, 1 = floor, 0.5 = the attitude is not "
+                         f"usable. 'fe_floor' / 'fe_range': the same two quantities read off the "
+                         f"trained sensor front-end (--frontend) instead of the geometry. "
                          f"'aligned': the signed residual between this scan and the one from "
                          f"--aligned-k steps ago warped into the current ego frame with the car's "
                          f"OWN measured speed, yaw rate and roll/pitch -- static geometry cancels "
                          f"and what moved by itself is what is left (learn.aligned). It is the one "
-                         f"channel with a gate, because the tilt is measured rather than known")
+                         f"channel with a gate, because the tilt is measured rather than known. "
+                         f"All of them are arithmetic on what the env already emits and all start "
+                         f"as zeroed input columns, so a warm start is still bit-identical")
     ap.add_argument("--aligned-k", type=int, default=ALIGNED_K, metavar="STEPS",
                     help="[aligned] control steps of lag the residual is taken over (4 = 100 ms)")
     ap.add_argument("--aligned-tau", type=float, default=ALIGNED_TAU, metavar="M",
@@ -495,6 +529,19 @@ def main():
                          "h_dyn alone. Masked by presence, like the future head's opponent columns")
     ap.add_argument("--scan-memory-tau", type=float, default=2.0,
                     help="[s] time constant of the decayed scan-occupancy channel")
+    ap.add_argument("--frontend", default="", metavar="CKPT",
+                    help="trained sensor front-end (`work/frontend/train.py`) for the `fe_floor` / "
+                         "`fe_range` scan channels. Frozen: it is a sensor model, not part of the "
+                         "policy, and PPO never sees a gradient through it")
+    ap.add_argument("--floor-att", default="ego", choices=("ego", "tracker", "vesc"),
+                    help="attitude source of the `floor` scan channel. 'ego' is "
+                         "`floor.EgoStateAttitude` -- the suspension's calibrated response to the "
+                         "accelerations the car itself produces, read off the wheel speed and the "
+                         "gyro's yaw, which is the most accurate of the three (measured). "
+                         "'tracker' is `floor.AttitudeTracker`, gyro integration with the "
+                         "accelerometer gated on quiescence. 'vesc' is the orientation quaternion "
+                         "the ROS node reads today, which is wrong by 8 deg rms while driving and "
+                         "is here only so the comparison can be run")
     ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--scan-stem", choices=["plain", "resnet"], default="resnet",
@@ -703,12 +750,41 @@ def main():
                if a.motion_memory else None)
     mot_heads = ([h for h, on in (("mask", a.aux_opp_mask > 0), ("dv", a.aux_motion > 0)) if on]
                  if mot_cfg else [])
+    if chan_cfg and "floor" in a.scan_channels:
+        # The floor channel's proprio column map, taken from the spec this run's observation
+        # actually has, plus the sensor geometry the env is built with. Recorded into the
+        # checkpoint, so the channel a checkpoint carries is the one it was trained with.
+        from .obs import att_index_spec
+        from .floor import FloorSpec
+        chan_cfg["floor"] = {
+            "proprio": att_index_spec(spec),
+            "spec": FloorSpec(mount_x=float(sim_cfg.lidar.mount_x), mount_y=float(sim_cfg.lidar.mount_y),
+                              mount_z=float(sim_cfg.lidar.mount_z)).validate().to_meta(),
+            "att_source": a.floor_att, "fov": float(sim_cfg.lidar.fov),
+            "range_eps": 0.02}
+    if chan_cfg and any(c.startswith("fe_") for c in a.scan_channels):
+        if not a.frontend:
+            raise SystemExit("--scan-channels fe_* needs --frontend CKPT: those channels are a "
+                             "trained network's outputs and there is nothing to output without it")
+        if "floor" not in chan_cfg:
+            from .obs import att_index_spec as _ais
+            from .floor import FloorSpec as _FS
+            chan_cfg["floor"] = {
+                "proprio": _ais(spec),
+                "spec": _FS(mount_x=float(sim_cfg.lidar.mount_x),
+                            mount_y=float(sim_cfg.lidar.mount_y),
+                            mount_z=float(sim_cfg.lidar.mount_z)).validate().to_meta(),
+                "att_source": a.floor_att, "fov": float(sim_cfg.lidar.fov), "range_eps": 0.02}
+        chan_cfg["floor"]["frontend"] = {"path": os.path.abspath(a.frontend)}
     #: The future head is built when the term is on, and only then: `--aux-future 0` is the run it
     #: was, down to the state dict. A checkpoint that already carries one keeps it (the loaders read
     #: `meta`), so a resume does not have to repeat the flag to keep the head -- but it does have to
     #: repeat it to keep TRAINING the head, which is what the coefficient is.
-    #: `source=None`: which tensor the head reads follows from what the actor HAS, and the actor
-    #: fills it in (`Actor.attach_future`). Naming it here was right while there were two
+    #: The floor head is built when the term is on, and only then, on the same terms the future
+    #: head is: `--aux-floor 0` is the run it was, down to the state dict.
+    floor_cfg = floor_head_spec(width=a.aux_floor_width) if a.aux_floor > 0 else None
+    #: `source=None`: which tensor the future head reads follows from what the actor HAS, and the
+    #: actor fills it in (`Actor.attach_future`). Naming it here was right while there were two
     #: possibilities and wrong as soon as there were three -- with a motion branch the head reads
     #: `h_dyn`, and a spec that said "memory" would be refused by the actor it was built for.
     fut_cfg = (future_spec(k=a.aux_future_k, width=a.aux_future_width)
@@ -721,7 +797,8 @@ def main():
     #: this, leg two of a recurrent run -- same command line, `--init` now pointing at leg one's
     #: output -- goes down the warm-start path and is refused.
     init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
-    add_mem, add_chan, add_fut = warm_start_additions(init_meta, mem_cfg, chan_cfg, fut_cfg)
+    add_mem, add_chan, add_fut, add_floor = warm_start_additions(init_meta, mem_cfg, chan_cfg,
+                                                                 fut_cfg, floor_cfg)
     add_mot = None if init_meta.get("motion") else mot_cfg
     #: The privileged opponent block a warm start would ADD, on the same rule: a checkpoint already
     #: as wide as this env's observation already has it, and a resume must not widen it twice.
@@ -735,7 +812,7 @@ def main():
             raise SystemExit(f"--init's proprio width is {p_ck}; this env produces "
                              f"{spec.proprio_dim} and the {g}-column opponent block would make it "
                              f"{p_ck + g}. Neither matches: --hist-len / --scan-stack differ too.")
-    if a.init and (add_mem or add_chan or add_fut or add_mot or add_tok):
+    if a.init and (add_mem or add_chan or add_fut or add_mot or add_tok or add_floor):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
         # actor's first action of this run is bit-identical to the one the original would have
@@ -743,7 +820,7 @@ def main():
         model, extra, fresh = load_for_memory(
             a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
             future_head=add_fut, motion=add_mot, motion_heads=mot_heads,
-            opp_token_dim=add_tok,
+            opp_token_dim=add_tok, floor_head=add_floor,
             # Fresh modules are seeded from their own NAMES, so two arms that differ only in how many
             # scan channels they enable share every weight a warm start leaves fresh. Without it the
             # wider first convolution shifts the ambient generator and the arms differ by a second
@@ -753,8 +830,9 @@ def main():
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
         print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} "
-              f"motion {add_mot} opp_token {a.opp_token if add_tok else 'kept'} | "
-              f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
+              f"motion {add_mot} opp_token {a.opp_token if add_tok else 'kept'} "
+              f"floor-head {add_floor} | {len(fresh)} fresh tensor(s), all zero-projected: "
+              f"{fresh[:4]}")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
@@ -777,7 +855,8 @@ def main():
                                        allow_conditional=False, priv_adapter=priv_adapter)
         print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing",
               "| resumed architecture:", {k_: v_ for k_, v_ in model.meta.items()
-                                          if k_ in ("memory", "scan_channels", "future_head")} or "plain")
+                                          if k_ in ("memory", "scan_channels", "future_head",
+                                                    "floor_head")} or "plain")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
@@ -788,7 +867,7 @@ def main():
                             cond=cond_spec.to_meta() if cond_dim else None,
                             priv_adapter=priv_adapter, memory=mem_cfg,
                             scan_channels=chan_cfg, future_head=fut_cfg, motion=mot_cfg,
-                            motion_heads=mot_heads).to(device)
+                            motion_heads=mot_heads, floor_head=floor_cfg).to(device)
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
@@ -797,7 +876,7 @@ def main():
     chan_meta = dict(model.meta.get("scan_channels") or {})
     roll_aug = (ScanAugment(scan_channels, spec.n_beams, env.B, device=device,
                             tau_s=float(chan_meta["memory_tau_s"]),
-                            aligned=chan_meta.get("aligned"))
+                            aligned=chan_meta.get("aligned"), floor=chan_meta.get("floor"))
                 if n_extra else None)
     if chan_meta.get("aligned"):
         # Read back from the model, like `memory_on`: a resumed checkpoint carries the gate it was
@@ -835,6 +914,14 @@ def main():
                 f"mask={a.aux_opp_mask}, dv={a.aux_motion}. A head that exists and is not trained "
                 f"is a state-dict difference between arms that are meant to differ by a loss term; "
                 f"a coefficient with no head is a run assembled wrong. Match them.")
+    #: Read back from the model for the same reason `memory_on` is: a resumed checkpoint carries
+    #: its own head.
+    floor_head_cfg = dict(model.meta.get("floor_head") or {})
+    floor_on = bool(floor_head_cfg) and a.aux_floor > 0
+    if floor_head_cfg:
+        from .floor_head import describe as _describe_floor
+        print(f"{_describe_floor(floor_head_cfg)} | coefficient {a.aux_floor} "
+              f"({'training' if floor_on else 'PRESENT BUT NOT TRAINED: --aux-floor is 0'})")
     future_cfg = dict(model.meta.get("future_head") or {})
     future_on = bool(future_cfg) and a.aux_future > 0
     future_k = int(future_cfg.get("k", a.aux_future_k))
@@ -882,6 +969,7 @@ def main():
         "aux_future": float(a.aux_future), "future_head": dict(future_cfg) or None,
         "aux_opp_mask": float(a.aux_opp_mask), "aux_motion": float(a.aux_motion),
         "motion": dict(motion_cfg) or None, "motion_heads": list(motion_heads),
+        "aux_floor": float(a.aux_floor), "floor_head": dict(floor_head_cfg) or None,
         "lab_oracle": bool(cond_spec.lab_oracle), "init": a.init, "seed": int(a.seed),
         "memory": dict(model.meta.get("memory") or {}) or None,
         "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
@@ -1005,6 +1093,10 @@ def main():
     # SOMEBODY IN THE RACE, which is the condition under which the label at t + k belongs to a
     # different situation (`F1VecEnv.race_boundary`). `future.align_future_targets` turns the pair
     # into (target, valid) after the rollout.
+    # ---- the auxiliary floor head's labels: one int8 per beam per step, 1 floor / 0 solid /
+    # -1 no return (`F1VecEnv.floor_labels`). Stored rather than recomputed for the same reason the
+    # scan channels are: the update replays a chunk the simulator has long since moved past.
+    buf_floor_lab = torch.zeros(T, B, N, device=device, dtype=torch.int8) if floor_on else None
     #: The future head's labels are also where E3-b's CURRENT relative velocity comes from: its
     #: target is the k = 0 row of the same privileged snapshot, so the two cannot disagree about
     #: what "the nearest opponent" means. The buffer is therefore allocated for either.
@@ -1090,7 +1182,10 @@ def main():
             for t in range(T):
                 scan, pro = flatten_obs(obs)
                 if roll_aug is not None:
-                    scan = roll_aug(scan, pro)             # the extra channels, advanced one step
+                    # the extra channels, advanced one step. `pro` is what the aligned channel
+                    # warps with and what the floor channel's attitude tracker reads; the other
+                    # channels ignore it.
+                    scan = roll_aug(scan, pro)
                 # Frozen here, from the privileged vector belonging to THIS observation, before the
                 # step advances the env or a reset re-draws `mu`.
                 cond_t = (cond_mod.make_condition(a.cond, cond_spec, priv, env.priv_mu_index)
@@ -1110,6 +1205,10 @@ def main():
                     val = val.float()
                 act, logp = act.float(), logp.float()
                 buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
+                if buf_floor_lab is not None:
+                    # Before the step, for the same reason: `scan_hist[:, 0]` is still the frame
+                    # `buf_scan[t]` was built from, so the label names that scan's beams.
+                    buf_floor_lab[t] = env.floor_labels()[lid]
                 if buf_fut_lab is not None:
                     # Before the step: `last_result` is still the state this action is taken from,
                     # which is the state `priv` above was read from.
@@ -1174,15 +1273,19 @@ def main():
                     ep_stats["return"] += f["return"][m].tolist(); ep_stats["progress"] += f["progress"][m].tolist()
                     ep_stats["collided"] += f["collided"][m].float().tolist(); ep_stats["steps"] += f["steps"][m].tolist()
                 # The episode boundary, applied to everything that remembers: the two hidden
-                # states and the stateful scan channels. `obs` is already the fresh episode's first
-                # observation (the env auto-resets inside `step`), so the state entering step t+1
-                # has to be the state of a car that has just spawned.
+                # states and the stateful scan channels -- the decayed occupancy, the aligned
+                # channel's ring buffers and the floor channel's attitude tracker. `obs` is already
+                # the fresh episode's first observation (the env auto-resets inside `step`), so the
+                # state entering step t+1 has to be the state of a car that has just spawned.
                 #
                 # The channels are cleared whether or not there is a GRU. They used to be cleared
                 # only under `--memory gru`, which left a `--scan-channels`-only arm carrying the
-                # previous episode's occupancy -- and would leave the aligned channel warping a
-                # scan from before a respawn, which is a residual made entirely of teleportation.
-                # No recorded run used that combination, so no result moves.
+                # previous episode's occupancy -- would leave the aligned channel warping a scan
+                # from before a respawn, which is a residual made entirely of teleportation, and
+                # would leave the floor channel integrating an attitude across a spawn. No
+                # published checkpoint was trained that way (every channel run so far also carried
+                # memory), so no result moves; the behaviour change is for
+                # `--scan-channels ... --memory off`, which is why it is written down.
                 done_now = term | trunc
                 if roll_aug is not None:
                     roll_aug.reset(done_now)
@@ -1232,6 +1335,7 @@ def main():
         # NOT `f_mask`: that is the on-policy sample weight, twenty lines up, and shadowing it
         # replaces every minibatch's weights with None the moment this label is absent.
         f_beam = buf_mask_lab.reshape(n, spec.n_beams) if buf_mask_lab is not None else None
+        f_floor = buf_floor_lab.reshape(n, N) if buf_floor_lab is not None else None
         # advantage statistics over the policy's own samples only; a teacher-driven car's advantages
         # are not the policy's and would otherwise set the scale everything else is normalised by
         w_all = f_mask / f_mask.sum().clamp_min(1.0)
@@ -1243,6 +1347,7 @@ def main():
                          aux_opp=a.aux_opp, aux_future=(a.aux_future if future_on else 0.0),
                          aux_opp_mask=(a.aux_opp_mask if mask_on else 0.0),
                          aux_motion=(a.aux_motion if dv_on else 0.0),
+                         aux_floor=(a.aux_floor if floor_on else 0.0),
                          priv_mu_index=int(env.priv_mu_index), m_gt_1=bool(env.M > 1))
         # Feedforward: minibatches are random SAMPLES, as they always were. Recurrent: minibatches
         # are whole env chunks of the horizon, because the update has to replay each env's chunk in
@@ -1269,6 +1374,7 @@ def main():
                     fut_valid_mb = fut_valid[:, cols] if fut_valid is not None else None
                     mask_mb = buf_mask_lab[:, cols] if buf_mask_lab is not None else None
                     dv_mb = dv_tgt[:, cols] if dv_tgt is not None else None
+                    floor_mb = buf_floor_lab[:, cols] if buf_floor_lab is not None else None
                 else:
                     idx = sel
                     scan = f_scan[idx].float(); pro = f_pro[idx]
@@ -1278,6 +1384,7 @@ def main():
                     fut_valid_mb = f_fut_valid[idx] if f_fut_valid is not None else None
                     mask_mb = f_beam[idx] if f_beam is not None else None
                     dv_mb = f_dv[idx] if f_dv is not None else None
+                    floor_mb = f_floor[idx] if f_floor is not None else None
                 # NOT `out`: that is the run directory, twenty lines below, and shadowing it makes
                 # a run that trains perfectly and then cannot write its checkpoint.
                 terms = minibatch_losses(model, ref, scan=scan, pro=pro, priv=priv_mb, act=act_mb,
@@ -1285,7 +1392,7 @@ def main():
                                          val_old=f_val[idx], w=f_mask[idx], cond=c_mb, hyper=hyper,
                                          autocast=ac, freeze_actor=freeze_actor, sequence=seq,
                                          future=fut_mb, future_valid=fut_valid_mb,
-                                         beam_mask=mask_mb, dv=dv_mb)
+                                         beam_mask=mask_mb, dv=dv_mb, floor_label=floor_mb)
                 pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
                                               terms["aux_grip"], terms["aux_opp"])
                 loss = terms["loss"]
@@ -1314,6 +1421,10 @@ def main():
                     stats["approx_kl"].append(terms["approx_kl"].item())
                     stats["clipfrac"].append(terms["clipfrac"].item())
                     if memory_on: stats.setdefault("grad_norm", []).append(float(gn))
+                    if floor_on:
+                        stats.setdefault("aux_floor", []).append(terms["aux_floor"].item())
+                        for key, value in terms["aux_floor_parts"].items():
+                            stats.setdefault(f"aux_floor/{key}", []).append(float(value))
                     if a.aux_grip > 0: stats.setdefault("aux_grip", []).append(aux.item())
                     if a.aux_opp > 0 and env.M > 1: stats.setdefault("aux_opp", []).append(aux_o.item())
                     if future_on:
@@ -1359,6 +1470,9 @@ def main():
                    # the total the coefficient multiplies, then every component of it: a head whose
                    # total falls because one easy column collapsed is not a head that learned the
                    # opponent, and only the split says which happened
+                   **({"loss/aux_floor_bce": float(np.mean(stats["aux_floor"]))} if stats.get("aux_floor") else {}),
+                   **{f"loss/aux_floor/{key.split('/', 1)[1]}": float(np.mean(v))
+                      for key, v in stats.items() if key.startswith("aux_floor/")},
                    **({"loss/aux_future_mse": float(np.mean(stats["aux_future"]))} if stats.get("aux_future") else {}),
                    **{f"loss/aux_future/{key.split('/', 1)[1]}": float(np.mean(v))
                       for key, v in stats.items() if key.startswith("aux_future/")},
@@ -1428,6 +1542,12 @@ def main():
                   + (f" | mask {log['loss/aux_opp_mask']:.3f} r{log.get('loss/aux_opp_mask/mask_recall', float('nan')):.2f}"
                      if 'loss/aux_opp_mask' in log else "")
                   + (f" | dv {log['loss/aux_motion_mse']:.4f}" if 'loss/aux_motion_mse' in log else "")
+                  + (f" | floor bce {log['loss/aux_floor_bce']:.3f} "
+                     f"P {log.get('loss/aux_floor/precision', float('nan')):.2f} "
+                     f"R {log.get('loss/aux_floor/recall', float('nan')):.2f} "
+                     f"rate {log.get('loss/aux_floor/rate', float('nan')):.3f} "
+                     f"pw {log.get('loss/aux_floor/pos_weight', float('nan')):.0f}"
+                     if 'loss/aux_floor_bce' in log else "")
                   + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         t_loop = time.time() - t_loop0
         if update % a.save_every == 0:
