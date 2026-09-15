@@ -152,13 +152,14 @@ class SlotRow(QtCore.QObject):
 
         self.kind = QtWidgets.QComboBox()
         for k in osl.KINDS:
-            self.kind.addItem(k.label, k.name)
+            # An unavailable kind says so in the row itself, not only in a tooltip: greyed text
+            # alone reads as "not applicable here", which is a different thing from "not merged
+            # yet". Dropping it entirely would make "no such kind" and "not here yet" identical.
+            self.kind.addItem(k.label if k.available else f"{k.label} [병합 후 활성]", k.name)
             i = self.kind.count() - 1
             if k.available:
                 self.kind.setItemData(i, k.note, QtCore.Qt.ToolTipRole)
             else:
-                # Listed and disabled, with the reason. Dropping it would make "no such kind" and
-                # "not merged yet" indistinguishable from the UI.
                 self.kind.setItemData(i, 0, QtCore.Qt.UserRole - 1)      # not selectable
                 self.kind.setItemData(i, k.unavailable_message(), QtCore.Qt.ToolTipRole)
         self.kind.currentIndexChanged.connect(self._on_kind)

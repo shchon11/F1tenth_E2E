@@ -109,6 +109,8 @@ def test_a_kind_this_tree_does_not_have_is_listed_disabled_with_its_reason(table
     model = combo.model()
     assert not (model.item(i).flags() & QtCore.Qt.ItemIsEnabled)
     assert "worker 17" in combo.itemData(i, QtCore.Qt.ToolTipRole)
+    # and the row says it in its own text: greyed alone reads as "not applicable here"
+    assert "병합 후 활성" in combo.itemText(i)
 
 
 def test_the_cells_a_kind_cannot_carry_are_switched_off(table):
