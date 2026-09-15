@@ -221,7 +221,8 @@ re-measured" below for why the published numbers of our own checkpoints are not 
 | A701 `@fixed_low` | ours, current best | **275** | 260 | 72/128 | 96/128 | 107/128 | **57** | **25** | **4.12** |
 | frozen original `@legacy` | ours, the reference | 196 | 194 | 22/128 | 73/128 | 101/128 | 29 | 17 | 8.47 |
 | frozen original `@fixed_low` | ours, the deployment arm | 242 | 237 | 59/128 | 89/128 | 94/128 | 48 | 24 | 5.84 |
-| **TinyLidarNet-L** | published, zero-shot | 47 | 45 | 11/128 | 18/128 | 18/128 | **1** | 9 | 18.02 |
+| **TinyLidarNet-L**, speed map 1-8 | published, zero-shot | 47 | 45 | 11/128 | 18/128 | 18/128 | **1** | 9 | 18.02 |
+| TinyLidarNet-L, speed map -0.5-7.0 | published, zero-shot | 31 | 31 | 13/128 | 9/128 | 9/128 | 0 | 0 | 18.90 |
 | **End2Race**, rear filled 30 m | published, zero-shot | 3 | 3 | 0/128 | 0/128 | 3/128 | **0** | 3 | 40.13 |
 | **End2Race**, rear filled 0 m | published, zero-shot | **53** | 53 | 15/128 | 16/128 | 22/128 | **32** | 3 | 12.94 |
 
@@ -279,24 +280,40 @@ precisely what `source_digest` and `effective.device` exist to make visible. Put
 next to a number from another digest would have produced a difference that belongs to the simulator
 and reported it as a difference between policies.
 
-### TinyLidarNet's tight-floor collapse is largely its output mapping
+### The output mapping does NOT explain TinyLidarNet's tight-floor collapse — a correction
 
-`zarrar/tiny_lidarnet.py:77-79` maps the second output to 1–8 m/s, so **output 0 is still 1 m/s** and
-the network has to go negative to ask for less than walking pace. Their real-car node maps the same
-weights to −0.5–7.0 (`inference.py:126`) and reaches a stop at output 1/15. Both are theirs. On the
-same cells (8 cars, µ 0.944, seed 4401):
+An earlier version of this note claimed it did, on the strength of `scripts/tln_probe.py`. **That
+claim was wrong, and the probe was the reason.**
 
-| map | lap | `sim` map (1–8) | `car` map (−0.5–7.0) | median speed asked |
-|---|---|---|---|---|
-| `real:map16x07` | 33 m | 0/8 | **4/8** | 3.01 → 1.59 m/s |
-| `real:map12x16` | 36 m | 0/8 | 1/8 | 3.11 → 1.61 m/s |
-| `real:korea_2025_iccas` | 43 m | **8/8** | 6/8 | 4.98 → 3.86 m/s |
+The hypothesis was reasonable: `zarrar/tiny_lidarnet.py:77-79` maps the second output to 1-8 m/s, so
+**output 0 is still 1 m/s** and the network has to go negative to ask for less than walking pace,
+while their real-car node maps the same weights to -0.5-7.0 (`inference.py:126`) and reaches a stop
+at output 1/15. The probe appeared to confirm it: on `real:map16x07` the car mapping took a cell
+from 0/8 to 4/8 and halved the commanded speed from 3.01 to 1.59 m/s.
 
-The two mappings trade against each other: theirs-for-simulation is right for the roomier floor and
-too fast for the tight ones, theirs-for-the-car is the reverse. `tinylidarnet_L_car@none` is
-therefore its own row on the suite rather than a footnote — same weights, same sha, different
-declared option, and row identity already covers driver options.
+Scored properly as its own system on the whole suite, it does not hold:
 
+| | S/384 | S−bb3 | low µ | mid µ | high µ | A/96 | O/32 | coll/km |
+|---|---|---|---|---|---|---|---|---|
+| speed map 1-8 (their simulator) | **47** | 45 | 11 | 18 | 18 | **1** | **9** | 18.02 |
+| speed map -0.5-7.0 (their car) | 31 | 31 | 13 | 9 | 9 | 0 | 0 | 18.90 |
+
+The car mapping is **worse overall** — it keeps 31 of the 37 completions on `real:korea_2025_iccas`
+and scores **zero on every other map**, including the 0/80 on `real:map16x07` it was supposed to
+rescue.
+
+**Why the probe was wrong: it gave the model twice the suite's time budget.** The suite derives the
+budget from the track and the speed cap — 444 steps for that 33.3 m lap — and `tln_probe.py` ran
+900. A mapping that halves the commanded speed needs roughly twice as long to get round, so under a
+doubled budget it looks like a fix and under the real one it does not. Read back at the suite's own
+444 steps, the same cell shows exactly that: the car mapping's cars reach a consistent 19-21 m of
+the 33.3 m lap and time out, where the simulator mapping's spread is 2-32 m. It travels *further on
+average* and still completes nothing.
+
+So the honest statement is the narrow one: the two mappings change how fast it drives and where it
+gets to, and neither turns the tight floors into completions. What causes the tight-floor failure is
+not established here. Both rows are reported because both are theirs and the difference is real;
+neither is a fix.
 
 ## The fair comparison: what is held fixed, and what is deliberately not
 
