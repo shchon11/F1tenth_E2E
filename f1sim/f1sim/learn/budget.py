@@ -78,8 +78,9 @@ def actor_step_ms(model, device="cpu", batch: int = 1, iters: int = 200, threads
     aug = None
     if extra:
         aug = ScanAugment((meta["scan_channels"]["channels"]), int(meta["n_beams"]), batch,
-                          device=device, tau_s=float(meta["scan_channels"]["memory_tau_s"]))
-    scan_in = scan if aug is None else aug(scan)
+                          device=device, tau_s=float(meta["scan_channels"]["memory_tau_s"]),
+                          floor=meta["scan_channels"].get("floor"))
+    scan_in = scan if aug is None else aug(scan, proprio)
     h = model.actor.initial_hidden(batch, device=scan.device, dtype=scan.dtype)
 
     def forward():
@@ -88,7 +89,7 @@ def actor_step_ms(model, device="cpu", batch: int = 1, iters: int = 200, threads
 
     def channels():
         with torch.no_grad():
-            aug(scan)
+            aug(scan, proprio)
 
     def best(fn):
         t = benchmark.Timer(stmt="f()", globals={"f": fn}, num_threads=threads)

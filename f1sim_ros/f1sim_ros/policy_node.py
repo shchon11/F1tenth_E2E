@@ -23,6 +23,12 @@ from f1sim.learn.model import load_checkpoint
 #: 0.297 m is one and a half of the margin being defended.
 LIDAR_FOV = 4.71238898
 LIDAR_MOUNT_X = 0.297
+#: The scan plane's height above the floor at rest, the same 0.110 m of that `/tf_static` line. It
+#: is what makes a two-degree tilt a wall at 3.2 m, and it is the floor gate's whole geometry.
+LIDAR_MOUNT_Z = 0.110
+#: [Hz] the policy / LiDAR rate (`f1sim.params.SimParams.control_rate`), for the attitude tracker's
+#: integration step.
+CONTROL_RATE = 40.0
 
 
 #: The arms this node will install. Both layers of each run on the car's own sensors: `fixed_low`
@@ -67,13 +73,22 @@ def install_grip_arm(tracker, arm: str, device, mu: float = None):
     return grip.install(graph=False)
 
 
-def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None):
+def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None,
+                          floor_gate: bool = False):
     """Install the `clearance` layer: the plan bent and slowed off what `/scan` can see.
 
     Built from the observation's own beam geometry (`ObsSpec.n_beams`, `range_max`) and the nominal
     270 deg window; `PolicyNode` re-declares the bearings from the first `LaserScan`'s own
     `angle_min` / `angle_max` if the driver publishes a different window, because a grid built from
     bearings the returns do not have is a silently rotated obstacle rather than an error.
+
+    `floor_gate` turns on the floor-aware occupancy (`learn/floor.py`): a return the geometry says
+    is the FLOOR, given the scan plane's tilt, is left out of the grid instead of bending the plan
+    around it. The tilt comes from `ClearanceArm`'s own `AttitudeTracker`, fed from `/sensors/imu/raw`
+    by `on_scan` -- **not** from the orientation quaternion, which five of the thirteen competition
+    recordings swing past 40 deg and which in simulation is wrong by 8 deg rms while driving. Until
+    the car has stood still once the tracker has no zero reference, the likelihood reads
+    `floor.UNKNOWN` and the gate removes nothing.
 
     Returns the installed `ClearanceArm` (call `.release()` to undo) or None.
     """
@@ -83,11 +98,17 @@ def install_clearance_arm(tracker, arm: str, device, spec, margin: float = None)
     if not clear:
         return None
     from f1sim.learn import clearance as cl
-    cspec = cl.ClearanceSpec() if margin is None else cl.ClearanceSpec(margin=float(margin))
+    kw = {"floor_gate": bool(floor_gate)}
+    if margin is not None:
+        kw["margin"] = float(margin)
+    cspec = cl.ClearanceSpec(**kw)
     angles = cl.beam_angles(int(spec.n_beams), LIDAR_FOV, device=torch.device(device))
+    from f1sim.learn import floor as fl
     arm_obj = cl.ClearanceArm(tracker, cspec.validate(), 1, torch.device(device),
                               float(spec.v_max), angles, float(spec.range_max),
-                              mount_x=LIDAR_MOUNT_X)
+                              mount_x=LIDAR_MOUNT_X,
+                              fspec=fl.FloorSpec(mount_x=LIDAR_MOUNT_X, mount_z=LIDAR_MOUNT_Z),
+                              dt=1.0 / float(CONTROL_RATE))
     return arm_obj.install()
 from f1sim.learn.obs import ObsBuilder, ObsSpec
 
@@ -266,12 +287,17 @@ class PolicyNode(Node):
         # until it keeps `clearance_margin` from anything the scanner saw.
         self.declare_parameter("controller", "fixed_low"); self.declare_parameter("grip_mu", 0.0)
         self.declare_parameter("clearance_margin", 0.0)
+        # The floor-aware occupancy. Off by default, and off it is byte-identical to the arm that
+        # shipped: `clearance.occupancy` does not look at the likelihood at all. See
+        # `install_clearance_arm` and `docs/ros2.md`.
+        self.declare_parameter("clearance_floor_gate", False)
         self.controller_arm = str(p("controller"))
         self.grip = install_grip_arm(self.tracker, self.controller_arm, self.device,
                                      mu=(float(p("grip_mu")) or None))
         self.clearance = install_clearance_arm(self.tracker, self.controller_arm, self.device,
                                                self.spec,
-                                               margin=(float(p("clearance_margin")) or None))
+                                               margin=(float(p("clearance_margin")) or None),
+                                               floor_gate=bool(p("clearance_floor_gate")))
         #: Whether the beam bearings the clearance grid is built from have been checked against a
         #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
         self._scan_geometry_checked = False
@@ -310,7 +336,7 @@ class PolicyNode(Node):
         # warm up
         s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
         with torch.no_grad():
-            a0, _, _ = self.model.act(self.policy_state.observe(s), pr, deterministic=True,
+            a0, _, _ = self.model.act(self.policy_state.observe(s, pr), pr, deterministic=True,
                                       h=self.policy_state.hidden)
         if self.tracker is not None:                                 # warm up the tracker's compiled solver too
             self.tracker(a0, torch.zeros(1, device=self.device), torch.tensor([self.speed_cap], device=self.device), None, delay=self.delay)
@@ -600,11 +626,21 @@ class PolicyNode(Node):
             # This scan, in the observation's own units, before the tracker is asked for anything.
             # The arm holds one frame and nothing else: no map, no pose, no memory across scans.
             self.clearance.update_scan(scan)
+            if self.clearance.cspec.floor_gate:
+                # The gate's own attitude, integrated from the IMU mean this node already computed
+                # for the observation -- the same three signals, no new topic and no new message
+                # type. Gyro first three, accelerometer last three, both SI by here.
+                g = torch.as_tensor(imu_mean[:3], dtype=torch.float32,
+                                    device=self.device)[None]
+                acc = torch.as_tensor(imu_mean[3:], dtype=torch.float32,
+                                      device=self.device)[None]
+                self.clearance.update_attitude(
+                    g, acc, torch.tensor([float(self.v)], device=self.device))
         with torch.no_grad():
             # The hidden state goes in and the next one comes out: the policy's memory of this run
             # lives here, between callbacks, and nowhere else.
             a, _, self.policy_state.hidden = self.model.act(
-                self.policy_state.observe(scan), pro, deterministic=True,
+                self.policy_state.observe(scan, pro), pro, deterministic=True,
                 h=self.policy_state.hidden)
         self.obs.push_action(a[0])
         msg = AckermannDriveStamped(); msg.header.stamp = m.header.stamp

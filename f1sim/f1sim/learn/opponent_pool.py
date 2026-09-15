@@ -126,7 +126,7 @@ class OpponentPool:
         scan, proprio = flatten_obs(obs)
         out = torch.zeros(scan.shape[0], self.act_dim, device=scan.device, dtype=scan.dtype)
         for j, ent in enumerate(self.entries):
-            action, _logp, ent.hidden = ent.model.act(ent.runtime.observe(scan), proprio,
+            action, _logp, ent.hidden = ent.model.act(ent.runtime.observe(scan, proprio), proprio,
                                                       deterministic=True, h=ent.hidden)
             out = torch.where((driver == OPP_DRIVER_POOL + j)[:, None], action.to(out.dtype), out)
         return out

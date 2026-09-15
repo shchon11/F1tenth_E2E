@@ -24,11 +24,58 @@ PROPRIO_KEYS = ("speed", "prev_action", "speed_cap", "imu", "imu_att", "hist")  
 #: and not by the caller's spelling: it is the order the first convolution's input columns are laid
 #: out in, so a checkpoint written with ("edges", "memory") and loaded as ("memory", "edges") would
 #: read two channels that mean the wrong thing while every shape still matched.
-SCAN_CHANNELS = ("memory", "edges")
+SCAN_CHANNELS = ("memory", "edges", "floor")
 
 #: Control period the decay is quoted in [s]. The policy runs at the LiDAR's 40 Hz (`params.py`
 #: `control_rate`), on the car and in the simulator alike.
 CONTROL_DT = 0.025
+
+
+def att_index_spec(spec: "ObsSpec") -> dict:
+    """Where the floor channel's inputs live in the flattened proprio vector, and their normalisers.
+
+    Recorded into a checkpoint's `meta["scan_channels"]["floor"]["proprio"]` and read back by
+    `ScanAugment`, never re-derived from whatever `ObsSpec` a reader happens to hold. The proprio
+    layout is a contract between the observation encoding and everything that reads a column out of
+    it; a checkpoint whose channel was built against one layout must not silently read another.
+    `proprio_dim` travels with the indices so a mismatch is an error at the first forward rather
+    than a plausible number. (The same construction `learn.aligned` uses on `feat/motion-memory`.)
+
+    The layout is `flatten_obs`' concatenation of `PROPRIO_KEYS`: speed, prev actions, speed cap,
+    imu (gyro xyz then accel xyz), imu roll/pitch, and the optional history. `ObsBuilder.build`
+    assembles the same order on the car, so the channel is built from three things the ROS node
+    already reads -- VESC wheel speed, the IMU's gyro and its accelerometer.
+    """
+    i_imu = 1 + spec.act_dim * spec.action_history + 1
+    return {"proprio_dim": int(spec.proprio_dim), "speed": 0, "gyro": int(i_imu),
+            "accel": int(i_imu + 3), "roll": int(i_imu + 6), "pitch": int(i_imu + 7),
+            "v_max": float(spec.v_max), "gyro_scale": float(spec.gyro_scale),
+            "accel_scale": float(spec.accel_scale), "att_scale": float(spec.att_scale),
+            "range_max": float(spec.range_max)}
+
+
+def floor_inputs(proprio: torch.Tensor, idx: dict):
+    """`(speed (B,), gyro (B,3), accel (B,3), vesc roll/pitch (B,2))` out of the proprio vector.
+
+    The observation carries these divided by their normalisers; the geometry needs metres, radians
+    and seconds, so they are multiplied back here -- in one place, so the simulator and the car
+    cannot disagree about which column is which or what it is divided by.
+    """
+    if proprio.dim() != 2:
+        raise ValueError(f"proprio must be (B, P), got {tuple(proprio.shape)}")
+    want = int(idx["proprio_dim"])
+    if proprio.shape[1] != want:
+        raise ValueError(
+            f"the floor channel was built for a {want}-wide proprio vector and this one is "
+            f"{proprio.shape[1]} wide. Its columns are read by index, so a different layout would "
+            f"hand the attitude tracker a prev-action where it expects a gyro. Rebuild the channel "
+            f"for this observation, or feed the observation it was built for.")
+    g, a = int(idx["gyro"]), int(idx["accel"])
+    return (proprio[:, int(idx["speed"])] * float(idx["v_max"]),
+            proprio[:, g:g + 3] * float(idx["gyro_scale"]),
+            proprio[:, a:a + 3] * float(idx["accel_scale"]),
+            torch.stack([proprio[:, int(idx["roll"])], proprio[:, int(idx["pitch"])]], 1)
+            * float(idx["att_scale"]))
 
 
 def scan_edges(scan_now: torch.Tensor) -> torch.Tensor:
@@ -72,12 +119,13 @@ class ScanAugment:
     `SCAN_CHANNELS` order. The model knows how many extra rows to expect and splits them off before
     it forms temporal deltas, so the frames keep meaning frames.
 
-    The occupancy memory is episode state and is cleared exactly where the recurrent hidden state
-    is -- see `learn.memory.PolicyRuntime`.
+    The occupancy memory and the floor channel's attitude tracker are episode state and are cleared
+    exactly where the recurrent hidden state is -- see `learn.memory.PolicyRuntime`.
     """
 
     def __init__(self, channels: Sequence[str], n_beams: int, batch: int, device="cpu",
-                 tau_s: float = 2.0, dt: float = CONTROL_DT, dtype=torch.float32):
+                 tau_s: float = 2.0, dt: float = CONTROL_DT, dtype=torch.float32,
+                 floor: Optional[dict] = None):
         unknown = [c for c in channels if c not in SCAN_CHANNELS]
         if unknown:
             raise ValueError(f"unknown scan channel(s) {unknown}; known: {list(SCAN_CHANNELS)}")
@@ -94,9 +142,37 @@ class ScanAugment:
         self.mem = None
         if "memory" in self.channels:
             self.mem = torch.ones(self.batch, self.n_beams, device=self.device, dtype=self.dtype)
+        #: The floor channel's geometry, its proprio column map and its attitude tracker. Built only
+        #: when the channel is on, so nothing about an unflagged run changes.
+        self.floor_cfg = None
+        self.floor_idx = None
+        self.floor_spec = None
+        self.att = None
+        self.angles = None
+        if "floor" in self.channels:
+            from . import floor as _floor
+            if not floor or "proprio" not in floor:
+                raise ValueError(
+                    "the floor channel needs the `floor` block `obs.att_index_spec` builds: it "
+                    "reads speed, the gyro and the accelerometer out of the proprio vector by "
+                    "index, and guessing the layout is how a channel silently tracks a "
+                    "prev-action. Pass meta['scan_channels']['floor'].")
+            self.floor_cfg = dict(floor)
+            self.floor_idx = dict(floor["proprio"])
+            self.floor_spec = _floor.FloorSpec(**(floor.get("spec") or {})).validate()
+            self.att_source = str(floor.get("att_source", "tracker"))
+            if self.att_source not in ("tracker", "vesc"):
+                raise ValueError(f"floor att_source must be 'tracker' or 'vesc', got "
+                                 f"{self.att_source!r}")
+            self.att = _floor.AttitudeTracker(self.batch, device=self.device, dt=self.dt,
+                                              dtype=self.dtype)
+            self.angles = _floor.beam_angles(self.n_beams, float(floor.get("fov", 1.5 * np.pi)),
+                                             device=self.device, dtype=self.dtype)
 
     def reset(self, done=None) -> None:
-        """Clear the occupancy memory: every row (`done=None`) or the rows whose episode ended."""
+        """Clear the episode state: the occupancy memory and the attitude tracker's integrator."""
+        if self.att is not None:
+            self.att.reset(done)
         if self.mem is None:
             return
         if done is None:
@@ -109,7 +185,33 @@ class ScanAugment:
             raise ValueError(f"episode-boundary mask must be ({self.mem.shape[0]},), got {tuple(keep.shape)}")
         self.mem = self.mem * keep[:, None] + (1.0 - keep[:, None])
 
-    def _channels(self, scan: torch.Tensor, mem: Optional[torch.Tensor]):
+    def _floor_row(self, now: torch.Tensor, proprio: Optional[torch.Tensor],
+                   advance: bool, index=None) -> torch.Tensor:
+        """The floor likelihood for this step. Advances the attitude tracker unless `advance` is
+        False (a terminal observation, which is scored but never acted on)."""
+        from . import floor as _floor
+        if proprio is None:
+            raise ValueError(
+                "the floor channel needs this step's proprio vector: its attitude comes from the "
+                "gyro and the accelerometer the observation already carries, and substituting "
+                "zeros would hand the geometry a level scan plane on a braking car. Pass "
+                "`proprio` -- `PolicyRuntime.observe(scan, proprio)` does.")
+        speed, gyro, accel, vesc = floor_inputs(proprio.to(now.dtype), self.floor_idx)
+        if advance:
+            att, ok = self.att.update(gyro, accel, speed), self.att.seen_rest
+        else:
+            att, ok = self.att.peek(gyro, accel, speed, index)
+        if self.att_source == "vesc":
+            #: The VESC quaternion instead of the tracker. Kept because it is what the node reads
+            #: today and the research note has to be able to run the arm both ways; it is NOT the
+            #: default, because measured it is wrong by 8 degrees while driving.
+            att, ok = vesc, None
+        return _floor.floor_likelihood_norm(
+            now, att[:, 0], att[:, 1], float(self.floor_idx["range_max"]), self.floor_spec,
+            angles=self.angles, range_eps=float(self.floor_cfg.get("range_eps", 0.02)), att_ok=ok)
+
+    def _channels(self, scan: torch.Tensor, mem: Optional[torch.Tensor],
+                  proprio: Optional[torch.Tensor] = None, advance: bool = True, index=None):
         """(stacked channels, the occupancy memory this step, or None)."""
         now = scan[:, 0].detach()
         extra, new_mem = [], None
@@ -117,6 +219,8 @@ class ScanAugment:
             if name == "memory":
                 new_mem = decayed_occupancy(mem.to(now.dtype), now, self.decay)
                 extra.append(new_mem)
+            elif name == "floor":
+                extra.append(self._floor_row(now, proprio, advance, index))
             else:                                       # "edges"
                 extra.append(scan_edges(now))
         return torch.cat([scan, torch.stack(extra, 1).to(scan.dtype)], 1), new_mem
@@ -128,15 +232,19 @@ class ScanAugment:
             raise ValueError(f"scan batch {scan.shape[0]} is not the {rows} rows this call is for; "
                              f"build one augmenter per inference path")
 
-    def __call__(self, scan: torch.Tensor) -> torch.Tensor:
-        """The augmented scan for this control step; advances the occupancy memory."""
+    def __call__(self, scan: torch.Tensor, proprio: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """The augmented scan for this control step; advances the occupancy memory.
+
+        `proprio` is required when the floor channel is on and ignored otherwise, so a caller that
+        does not use that channel is unchanged.
+        """
         self._check(scan, self.batch)
-        out, mem = self._channels(scan, self.mem)
+        out, mem = self._channels(scan, self.mem, proprio)
         if mem is not None:
             self.mem = mem
         return out
 
-    def preview(self, scan: torch.Tensor, index=None) -> torch.Tensor:
+    def preview(self, scan: torch.Tensor, index=None, proprio=None) -> torch.Tensor:
         """The augmented scan this augmenter WOULD produce, without advancing its memory.
 
         For a terminal observation: it is scored (the truncation bootstrap reads its value) but
@@ -148,7 +256,7 @@ class ScanAugment:
         if mem is not None and index is not None:
             mem = mem[index]
         self._check(scan, self.batch if index is None else int(len(index)))
-        return self._channels(scan, mem)[0]
+        return self._channels(scan, mem, proprio, advance=False, index=index)[0]
 
 
 @dataclass

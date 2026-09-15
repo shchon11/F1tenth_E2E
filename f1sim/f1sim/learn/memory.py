@@ -159,9 +159,12 @@ class PolicyRuntime:
     suite or, worse, a broadcast.
     """
 
-    def __init__(self, memory: bool = False, channels=(), n_beams: int = 0, tau_s: float = 2.0):
+    def __init__(self, memory: bool = False, channels=(), n_beams: int = 0, tau_s: float = 2.0,
+                 floor: Optional[dict] = None):
         self.memory, self.channels = bool(memory), tuple(channels)
         self.n_beams, self.tau_s = int(n_beams), float(tau_s)
+        #: The floor channel's block out of `meta["scan_channels"]["floor"]`, or None.
+        self.floor = dict(floor) if floor else None
         self.hidden: Optional[Hidden] = Hidden() if self.memory else None
         self.scan = None
         self.batch: Optional[int] = None
@@ -187,7 +190,7 @@ class PolicyRuntime:
         self.batch, self._device = int(batch), device
         self.hidden = Hidden() if self.memory else None
         self.scan = (ScanAugment(self.channels, self.n_beams, self.batch, device=device or "cpu",
-                                 tau_s=self.tau_s) if self.channels else None)
+                                 tau_s=self.tau_s, floor=self.floor) if self.channels else None)
 
     def reset(self, done=None) -> None:
         if self.hidden is not None:
@@ -195,10 +198,14 @@ class PolicyRuntime:
         if self.scan is not None:
             self.scan.reset(done)
 
-    def observe(self, scan: torch.Tensor) -> torch.Tensor:
-        """The scan the policy actually sees: the stacked frames plus any enabled extra channels."""
+    def observe(self, scan: torch.Tensor, proprio: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """The scan the policy actually sees: the stacked frames plus any enabled extra channels.
+
+        `proprio` is what the floor channel's attitude tracker reads; it is ignored by every other
+        channel, so a call site that does not use it is unchanged.
+        """
         self.ensure(scan.shape[0], scan.device)
-        return scan if self.scan is None else self.scan(scan)
+        return scan if self.scan is None else self.scan(scan, proprio)
 
 
 def runtime_for(model, batch: Optional[int] = None, device=None) -> PolicyRuntime:
@@ -210,7 +217,7 @@ def runtime_for(model, batch: Optional[int] = None, device=None) -> PolicyRuntim
     chan = meta.get("scan_channels") or {}
     rt = PolicyRuntime(memory=bool(meta.get("memory")), channels=chan.get("channels") or (),
                        n_beams=int(meta.get("n_beams", 0)),
-                       tau_s=float(chan.get("memory_tau_s", 2.0)))
+                       tau_s=float(chan.get("memory_tau_s", 2.0)), floor=chan.get("floor"))
     if batch is not None:
         rt.ensure(int(batch), device or next(model.parameters()).device)
     return rt
@@ -230,7 +237,7 @@ def policy_fn(model, batch: Optional[int] = None, device=None, deterministic: bo
     @torch.no_grad()
     def run(obs):
         scan, proprio = flatten_obs(obs)
-        action, _logp, rt.hidden = model.act(rt.observe(scan), proprio,
+        action, _logp, rt.hidden = model.act(rt.observe(scan, proprio), proprio,
                                              deterministic=deterministic, c=cond, h=rt.hidden)
         return action
 

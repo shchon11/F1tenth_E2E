@@ -406,10 +406,16 @@ class ControllerRuntime:
             raise RuntimeError(f"{angles.numel()} bearings for the {self.env.n_beams} beams this "
                                f"env reports: the grid would be built from bearings the returns do "
                                f"not have")
+        from . import floor as fl
+        # Nominal mounting again, for the same reason the bearings are: the floor gate's geometry is
+        # what the car believes about its sensor, not the draw the simulator made.
+        fspec = fl.FloorSpec(mount_x=float(lidar.mount_x), mount_y=float(lidar.mount_y),
+                             mount_z=float(lidar.mount_z))
         return cl.ClearanceArm(tracker, self.clearance_spec or cl.ClearanceSpec(), self.B,
                                self.device, float(self.env.ecfg.v_max_policy), angles,
                                float(self.env.range_max), float(lidar.mount_x),
-                               float(lidar.mount_y))
+                               float(lidar.mount_y), fspec=fspec,
+                               dt=float(self.env.sim.control_dt))
 
     def adopt(self) -> None:
         """Transfer the grip solver graph to the calling thread (viewer: the sim thread). See
@@ -472,11 +478,20 @@ class ControllerRuntime:
     def pre_action(self, obs: dict) -> Optional[torch.Tensor]:
         """Advance the history, infer the friction, and hand it to the MPC. Before the action."""
         if self.clearance is not None:
-            # This step's own LiDAR frame, before the action it will shape is asked for. There is no
-            # episode state to clear: the arm holds one frame and nothing carried across a boundary,
-            # and the observation `step()` returned for a just-reset env is already the new
-            # episode's scan.
+            # This step's own LiDAR frame, before the action it will shape is asked for. The arm
+            # holds one frame and nothing carried across a boundary, so nothing here needs
+            # clearing; its floor gate's attitude tracker does, and `post_step` does that.
             self.clearance.update_scan(obs["scan"])
+            if self.clearance.cspec.floor_gate:
+                # The gate's attitude, from the same IMU columns the policy's own observation
+                # carries -- read out of the observation rather than off `sim.P`, so this is code
+                # the car can run. `imu` is the mean of this step's samples, already normalised.
+                from .obs import floor_inputs
+                idx = self._floor_idx()
+                _speed, gyro, accel, _vesc = floor_inputs(
+                    torch.cat([obs[k] for k in ("speed", "prev_action", "speed_cap", "imu",
+                                                "imu_att")], 1), idx)
+                self.clearance.update_attitude(gyro, accel, obs["speed"][:, 0] * idx["v_max"])
         if self.traction is not None:
             # A finished episode is a sensor gap: a new car, on a new surface, possibly at a
             # different speed. Carrying a latched release across it would release the brake of a
@@ -512,19 +527,42 @@ class ControllerRuntime:
         self._record(used_mu, diag)
         return used_mu
 
+    def _floor_idx(self) -> dict:
+        """The proprio column map of the observation this env emits, built once.
+
+        Deliberately the *short* proprio (no history block): `pre_action` assembles the prefix it
+        needs from `obs` rather than taking the flattened vector, because the flattened width
+        depends on `hist_len` and the columns the gate reads are all in the prefix.
+        """
+        if getattr(self, "_fidx", None) is None:
+            from .obs import ObsSpec, att_index_spec
+            e = self.env.ecfg
+            sp = ObsSpec(n_beams=int(self.env.n_beams), act_dim=int(self.env.act_dim),
+                         action_history=int(e.action_history), hist_len=0,
+                         range_max=float(self.env.range_max), v_max=float(e.v_max_policy),
+                         gyro_scale=float(e.imu_gyro_scale), accel_scale=float(e.imu_accel_scale))
+            self._fidx = att_index_spec(sp)
+        return self._fidx
+
     def post_step(self, terminated: torch.Tensor, truncated: torch.Tensor) -> None:
         """Capture the issued command before auto-reset can overwrite it, and mark the boundaries.
 
         The realised control bound is read here rather than in `pre_action` because the solver has
         now run: at `pre_action` time `last_bounds` still holds the previous step's limits.
         """
+        done = terminated | truncated
+        if self.clearance is not None:
+            # The floor gate's attitude integrator is episode state: a new car on a new floor does
+            # not inherit the last one's tilt. Its at-rest reference is NOT cleared -- that is the
+            # sensor's mounting, which the same car keeps across episodes.
+            self.clearance.reset(done)
         if self.base == "legacy":
-            self._reset_mask = terminated | truncated
+            self._reset_mask = done
             return
         self._record_realised_bounds()
         if self.base == "estimated":
             self._prev_cmd = self.spy.take()
-        self._reset_mask = terminated | truncated
+        self._reset_mask = done
 
     # -- truth, only where it is allowed -----------------------------------------
     def _truth(self) -> torch.Tensor:

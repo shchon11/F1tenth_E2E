@@ -71,7 +71,8 @@ def collect(env, model, steps: int, device, controller=None, seed: int = 0):
     lid = env.learner_ids
     chan = list((model.meta.get("scan_channels") or {}).get("channels") or ())
     aug = (ScanAugment(chan, env.n_beams, env.B, device=device,
-                       tau_s=float(model.meta["scan_channels"]["memory_tau_s"])) if chan else None)
+                       tau_s=float(model.meta["scan_channels"]["memory_tau_s"]),
+                       floor=model.meta["scan_channels"].get("floor")) if chan else None)
     obs, _ = env.reset(seed=seed)
     if controller is not None:
         controller.begin(obs)
@@ -82,7 +83,7 @@ def collect(env, model, steps: int, device, controller=None, seed: int = 0):
     for _ in range(steps):
         scan, pro = flatten_obs(obs)
         if aug is not None:
-            scan = aug(scan)
+            scan = aug(scan, pro)
         if controller is not None:
             controller.pre_action(obs)
         act, state, h_next = model.actor.probe_state(scan, pro, None, h)
