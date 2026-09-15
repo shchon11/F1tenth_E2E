@@ -27,11 +27,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..opp_token import opp_token_dim, validate_opp_token
+
 PROPRIO_KEYS = ("speed", "prev_action", "speed_cap", "imu", "imu_att", "hist", "opp_token")
-#: "hist" and "opp_token" appear only when the spec asks for them, and "opp_token" is LAST:
-#: it is an oracle block appended after every column a deployable observation has, so a
-#: checkpoint trained without it keeps every input index it had (`model.load_for_memory`
-#: grows the first proprio Linear by zeroed columns on exactly that promise).
+#: "hist" only when the spec asks for it; "opp_token" only when `ObsSpec.opp_token` is not "off",
+#: and then only from the simulator -- it is privileged (`f1sim.opp_token`), so `ObsBuilder`, which
+#: is the deployment side of this boundary, refuses a spec that asks for it. It is also LAST:
+#: appended after every column a deployable observation has, so a checkpoint trained without it
+#: keeps every input index it had (`model.load_for_memory` grows the first proprio Linear by zeroed
+#: columns on exactly that promise).
 
 #: Extra scan channels, in the order they are appended to the channel axis. The order is fixed here
 #: and not by the caller's spelling: it is the order the first convolution's input columns are laid
@@ -560,6 +564,10 @@ class ObsSpec:
     gyro_scale: float = 5.0
     accel_scale: float = 10.0
     att_scale: float = ATT_SCALE
+    opp_token: str = "off"        # privileged opponent block (f1sim.opp_token): "off" / "pos" / "posvel" / "future".
+                                  # An ORACLE. Appended after every other proprio key, so a spec with
+                                  # it is a strict extension of the same spec without it; the car
+                                  # cannot build it, and `ObsBuilder` says so rather than guessing.
 
     @property
     def row_dim(self) -> int:
@@ -573,7 +581,7 @@ class ObsSpec:
     @property
     def proprio_dim(self) -> int:
         return (1 + self.act_dim * self.action_history + 1 + 6 + 2 + self.hist_len * self.row_dim
-                + self.opp_token_dim)
+                + opp_token_dim(self.opp_token))
 
 
 def flatten_obs(obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -585,12 +593,17 @@ class ObsBuilder:
     """Deployment-side builder: feed raw sensor values each control step, get the same tensors."""
 
     def __init__(self, spec: ObsSpec, device="cpu"):
-        if spec.opp_token:
+        if validate_opp_token(spec.opp_token) != "off":
+            # The one observation column this class cannot produce. The block is the simulator's
+            # ground truth about another car -- its exact relative position, its exact velocity, and
+            # where its controller intends to be three quarters of a second from now. There is no
+            # degraded version of it to fall back on: a LiDAR return is not a car identity, and a
+            # wrong answer here is worse than no answer, because the policy was trained to believe it.
             raise ValueError(
-                f"this observation spec declares the privileged opponent block "
-                f"(opp_token={spec.opp_token!r}). It is ground truth from the simulator -- the"
-                f" other cars' exact position, velocity and future -- and no sensor on the car"
-                f" produces it, so a deployment-side builder cannot build this observation.")
+                f"this checkpoint's observation spec asks for the privileged opponent block "
+                f"(opp_token={spec.opp_token!r}). It is an oracle produced by the simulator and the "
+                f"car cannot build it, so a policy trained with it is not deployable. "
+                f"See f1sim/opp_token.py and docs/research/oracle-planner-2026-09-15.md.")
         self.spec, self.device = spec, torch.device(device)
         self.reset()
 

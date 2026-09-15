@@ -83,8 +83,18 @@ class PoolEntry:
 
 
 def _spec_of(env):
+    """The observation spec a POOL ENTRY has to fit, which is not always the learner's.
+
+    Privileged opponent tokens (`f1sim.opp_token`) are the learner's oracle and are stripped from
+    the observation the pool acts on (`F1VecEnv._opponent_obs`), so an entry is checked against the
+    proprio vector without them: a deployable LiDAR-only checkpoint is exactly what belongs in the
+    population, and requiring it to be an oracle too would make the whole race privileged.
+    """
+    from dataclasses import replace
+
     from .common import obs_spec                       # local: common imports the env, we import common
-    return obs_spec(env)
+    spec = obs_spec(env)
+    return replace(spec, opp_token="off") if spec.opp_token != "off" else spec
 
 
 def _check_compatible(path: str, meta: dict, env, spec) -> None:
@@ -148,6 +158,9 @@ class OpponentPool:
                     f"'{recorded}' but the slot says '{want}'. Its actor emits plans for the "
                     f"tracker it was trained against; replayed through another one they mean "
                     f"something else. Set the slot's controller to '{recorded}'.")
+            # No `allow_oracle`, and no slot field that could ask for one: an entry trained on
+            # privileged tokens cannot drive off the observation the pool is handed, and an
+            # opponent that needs an oracle is not an opponent a deployable policy would ever meet.
             model, extra = load_checkpoint(path, device, allow_controller=(want != "legacy"))
             _check_compatible(path, dict(model.meta), env, spec)
             entries.append(PoolEntry(path=str(path), model=model,

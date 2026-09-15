@@ -24,8 +24,8 @@ import numpy as np
 import torch
 
 from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX, OPP_FUTURE_MODELS,
-                       OPP_TOKEN_MODES, PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS,
-                       opp_token_dim, opp_token_mode)
+                       PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS)
+from ..opp_token import OPP_TOKEN_MODES, describe as describe_opp_token
 from ..params import Config
 from . import common
 from . import conditioning as cond_mod
@@ -259,7 +259,8 @@ def kl_reference_is_baseline(ref, memory_on: bool, kl_coef: float, init: str = "
     return False
 
 
-def warm_start_additions(init_meta: dict, memory, scan_channels, future_head, floor_head=None):
+def warm_start_additions(init_meta: dict, memory, scan_channels, future_head, floor_head=None,
+                         opp_token=None):
     """The architecture pieces `--init` does NOT already carry, i.e. what a warm start would add.
 
     A resume is not a warm start. `load_for_memory` refuses a checkpoint that already has the thing
@@ -272,7 +273,8 @@ def warm_start_additions(init_meta: dict, memory, scan_channels, future_head, fl
     return (None if init_meta.get("memory") else memory,
             None if init_meta.get("scan_channels") else scan_channels,
             None if init_meta.get("future_head") else future_head,
-            None if init_meta.get("floor_head") else floor_head)
+            None if init_meta.get("floor_head") else floor_head,
+            None if init_meta.get("opp_token") else opp_token)
 
 
 def main():
@@ -431,6 +433,39 @@ def main():
                     help="channels in the per-beam floor head (--aux-floor)")
     ap.add_argument("--aux-future-width", type=int, default=128,
                     help="hidden width of the future head's one layer")
+    ap.add_argument("--ttc-penalty", type=float, default=0.0, metavar="LAMBDA",
+                    help="per-step penalty at zero time to contact with the nearest car, ramping "
+                         "linearly from 0 at --ttc-safe. The reward audit "
+                         "(docs/research/reward-audit-2026-09-13.md) found nothing prices the "
+                         "*approach* to another car: car_proximity is charged per metre driven and "
+                         "only inside --car-safe-gap, so closing at 3 m/s from 2 m away -- 0.7 s "
+                         "from a contact -- costs zero. 0 = off.")
+    ap.add_argument("--ttc-safe", type=float, default=1.0, metavar="SECONDS",
+                    help="[s] time to contact above which --ttc-penalty is 0")
+    ap.add_argument("--overtake-sustained", type=float, nargs=3, default=None,
+                    metavar=("DIST_M", "TIME_S", "BONUS"),
+                    help="pay BONUS once when the learner has led an opponent by DIST_M metres "
+                         "along the lane for TIME_S seconds continuously (1.5 1.0 <bonus> is the "
+                         "contract's default). Unlike --overtake-bonus, which pays dense arc gained "
+                         "and so pays the approach and the crossing instant, this pays only a pass "
+                         "that stuck.")
+    ap.add_argument("--opp-token", default="off", choices=OPP_TOKEN_MODES,
+                    help="ORACLE. Append the simulator's own description of the nearest two "
+                         "opponents to the observation (f1sim/opp_token.py): 'pos' = relative "
+                         "position + presence, 'posvel' = + relative velocity, 'future' = + where "
+                         "each opponent's own controller intends to be at 0.10/0.25/0.50/0.75 s. "
+                         "The checkpoint records it and is refused by the exporter and the ROS "
+                         "node. Its purpose is to answer whether the planner, handed the "
+                         "opponent's state, races better than it does with LiDAR alone -- not to "
+                         "produce a policy.")
+    ap.add_argument("--name-seed-fresh", action="store_true",
+                    help="make two arms that differ by an input width differ by that alone. "
+                         "Re-initialises every tensor a warm start leaves fresh from its own module "
+                         "name rather than from the ambient generator (learn.model."
+                         "reinit_fresh_by_name, from branch feat/motion-memory) -- otherwise the "
+                         "wider layer consumes different draws and every module built after it "
+                         "differs too -- and re-seeds the generator once the model is built, so the "
+                         "arms' exploration streams start identical as well.")
     ap.add_argument("--car-proximity-penalty", type=float, default=0.0,
                     help="per metre driven with another car's body inside car_safe_gap (0.6 m), scaled "
                          "by closing speed. Without it the only gradient near a car is the overtake "
@@ -546,15 +581,6 @@ def main():
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--scan-stem", choices=["plain", "resnet"], default="resnet",
                     help="scan encoder for a new model without --init (an --init checkpoint keeps its own)")
-    ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
-                    help="privileged opponent block in the observation (f1sim.gym_env): the nearest "
-                         "two cars' true relative position ('pos'), velocity ('posvel') and future "
-                         "('future'), appended after every proprio key the policy already had. An "
-                         "ORACLE -- the exporter, the ROS node and the benchmark adapter all refuse "
-                         "a checkpoint that declares one, because no sensor on the car produces it "
-                         "and a score obtained with it is not comparable with any that was not. The "
-                         "columns are zero-initialised on a warm start, so the run starts as the "
-                         "checkpoint it came from and learns to use them")
     ap.add_argument("--opp-future-model", default=EnvConfig.opp_future_model, choices=list(OPP_FUTURE_MODELS),
                     help="which prediction the block's 'future' columns carry "
                          "(f1sim.gym_env.OPP_FUTURE_MODELS); recorded in the spec, because the same "
@@ -581,11 +607,6 @@ def main():
                          "backwards on the line is told to carry full racing speed")
     a = ap.parse_args()
     opp_cfg.validate(a)
-    a.opp_token = opp_token_mode(a.opp_token)
-    if a.opp_token and a.race_size < 2:
-        raise SystemExit(f"--opp-token {a.opp_token} with --race-size {a.race_size}: the block "
-                         f"describes the other cars of a race and there are none. It would be a "
-                         f"constant zero input that still widens every checkpoint this run writes.")
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
@@ -628,6 +649,32 @@ def main():
         raise SystemExit("--procedural-density / --procedural-max-props / "
                          "--procedural-raceline-margin without --procedural-obstacles: nothing "
                          "draws a layout, so these would silently do nothing.")
+    if a.opp_token != "off":
+        if a.race_size < 2:
+            raise SystemExit(f"--opp-token {a.opp_token} needs --race-size > 1: with one car per "
+                             f"race the block is the zeros an absent opponent already produces.")
+        if a.action_mode != "plan":
+            raise SystemExit(f"--opp-token {a.opp_token} needs --action-mode plan: the future "
+                             f"columns are the opponent's own plan-tracker reference, and in "
+                             f"'direct' mode there is no plan to read.")
+    if a.overtake_sustained is not None:
+        d_, t_, b_ = a.overtake_sustained
+        if not (d_ > 0 and t_ > 0):
+            raise SystemExit(f"--overtake-sustained {a.overtake_sustained}: the distance and the "
+                             f"hold time are what make it 'sustained'; both must be positive.")
+        if b_ > 0 and a.race_size < 2:
+            raise SystemExit("--overtake-sustained needs --race-size > 1: with no opponent there is "
+                             "nothing to lead.")
+    if a.ttc_penalty > 0:
+        if a.race_size < 2:
+            raise SystemExit("--ttc-penalty needs --race-size > 1: time to contact is time to "
+                             "contact with another car.")
+        if not a.ttc_safe > 0:
+            raise SystemExit(f"--ttc-safe {a.ttc_safe}: it is the horizon the penalty ramps over, "
+                             f"so at 0 the term is either off or a step function at contact.")
+    elif a.ttc_safe != 1.0:
+        raise SystemExit("--ttc-safe without --ttc-penalty: nothing reads it, so it would silently "
+                         "do nothing.")
     if a.kl_decay is None:
         a.kl_decay = a.total
     device = torch.device(a.device); torch.manual_seed(a.seed)
@@ -663,6 +710,12 @@ def main():
                                                               reward_car_proximity=a.car_proximity_penalty,
                                                               reward_sideslip=a.sideslip_penalty,
                                                               car_safe_gap=a.car_safe_gap,
+                                                              reward_ttc=a.ttc_penalty, ttc_safe=a.ttc_safe,
+                                                              **({} if a.overtake_sustained is None else
+                                                                 {"overtake_hold_dist": a.overtake_sustained[0],
+                                                                  "overtake_hold_time": a.overtake_sustained[1],
+                                                                  "reward_overtake_hold": a.overtake_sustained[2]}),
+                                                              opp_token=a.opp_token,
                                                               max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
                                                               action_mode=a.action_mode,
@@ -670,7 +723,6 @@ def main():
                                                               # spawn field, from the group the
                                                               # census shares (learn.opponent_config)
                                                               **opp_cfg.env_kwargs(a),
-                                                              opp_token=a.opp_token,
                                                               opp_future_model=a.opp_future_model,
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
@@ -797,21 +849,13 @@ def main():
     #: this, leg two of a recurrent run -- same command line, `--init` now pointing at leg one's
     #: output -- goes down the warm-start path and is refused.
     init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
-    add_mem, add_chan, add_fut, add_floor = warm_start_additions(init_meta, mem_cfg, chan_cfg,
-                                                                 fut_cfg, floor_cfg)
+    tok_cfg = a.opp_token if a.opp_token != "off" else None
+    add_mem, add_chan, add_fut, add_floor, add_tok = warm_start_additions(
+        init_meta, mem_cfg, chan_cfg, fut_cfg, floor_cfg, tok_cfg)
     add_mot = None if init_meta.get("motion") else mot_cfg
-    #: The privileged opponent block a warm start would ADD, on the same rule: a checkpoint already
-    #: as wide as this env's observation already has it, and a resume must not widen it twice.
-    add_tok = 0
-    if a.init and a.opp_token:
-        g = opp_token_dim(a.opp_token)
-        p_ck = int(init_meta.get("proprio_dim", 0))
-        if p_ck == spec.proprio_dim - g:
-            add_tok = g
-        elif p_ck != spec.proprio_dim:
-            raise SystemExit(f"--init's proprio width is {p_ck}; this env produces "
-                             f"{spec.proprio_dim} and the {g}-column opponent block would make it "
-                             f"{p_ck + g}. Neither matches: --hist-len / --scan-stack differ too.")
+    if a.name_seed_fresh and not a.init:
+        raise SystemExit("--name-seed-fresh without --init: with no warm start nothing is 'fresh' "
+                         "and the whole model is drawn from --seed already.")
     if a.init and (add_mem or add_chan or add_fut or add_mot or add_tok or add_floor):
         # Warm start, not re-initialisation: every weight the checkpoint holds is copied by name,
         # the GRU's output projection is zero and any new scan-channel input column is zero, so the
@@ -820,19 +864,22 @@ def main():
         model, extra, fresh = load_for_memory(
             a.init, device, add_mem, scan_channels=add_chan, priv_adapter=priv_adapter,
             future_head=add_fut, motion=add_mot, motion_heads=mot_heads,
-            opp_token_dim=add_tok, floor_head=add_floor,
-            # Fresh modules are seeded from their own NAMES, so two arms that differ only in how many
-            # scan channels they enable share every weight a warm start leaves fresh. Without it the
-            # wider first convolution shifts the ambient generator and the arms differ by a second
-            # thing nobody asked for (`learn.model.reinit_fresh_by_name`).
-            init_seed=a.seed,
+            floor_head=add_floor, opp_token=add_tok,
+            # Fresh modules are seeded from their own NAMES, so two arms that differ only in how
+            # many scan channels or proprio columns they enable share every weight a warm start
+            # leaves fresh. Without it the wider first layer shifts the ambient generator and the
+            # arms differ by a second thing nobody asked for
+            # (`learn.model.reinit_fresh_by_name`). Behind `--name-seed-fresh`, because it changes
+            # what a warm start produces and main's behaviour is the unseeded one.
+            init_seed=(a.seed if a.name_seed_fresh else None),
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
         print(f"init from {a.init} with memory {add_mem} channels {add_chan} future {add_fut} "
-              f"motion {add_mot} opp_token {a.opp_token if add_tok else 'kept'} "
-              f"floor-head {add_floor} | {len(fresh)} fresh tensor(s), all zero-projected: "
-              f"{fresh[:4]}")
+              f"motion {add_mot} floor-head {add_floor} opp_token {add_tok} | "
+              f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}"
+              + (f" | fresh tensors re-seeded from their own names (seed {a.seed})"
+                 if a.name_seed_fresh else ""))
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
@@ -850,9 +897,12 @@ def main():
         # 17-wide privileged vector. Both conditioning arms already pass it; the unconditional path
         # omitted it, which made `--controller X --critic-priv-adapter ...` (no `--cond`) the one
         # combination that widened the critic without teaching it where the columns went.
+        # allow_oracle: the trainer IS the simulator that produces the block, and this is the leg-two
+        # path of an oracle run. Every other consumer still refuses it.
         model, extra = load_checkpoint(a.init, device, override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                                                                   "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim, "act_dim": env.act_dim},
-                                       allow_conditional=False, priv_adapter=priv_adapter)
+                                       allow_conditional=False, priv_adapter=priv_adapter,
+                                       allow_oracle=True)
         print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing",
               "| resumed architecture:", {k_: v_ for k_, v_ in model.meta.items()
                                           if k_ in ("memory", "scan_channels", "future_head",
@@ -867,7 +917,17 @@ def main():
                             cond=cond_spec.to_meta() if cond_dim else None,
                             priv_adapter=priv_adapter, memory=mem_cfg,
                             scan_channels=chan_cfg, future_head=fut_cfg, motion=mot_cfg,
-                            motion_heads=mot_heads, floor_head=floor_cfg).to(device)
+                            motion_heads=mot_heads, floor_head=floor_cfg,
+                            opp_token=tok_cfg).to(device)
+    if a.name_seed_fresh:
+        # The other half of "these arms differ by one thing". Building the model consumes draws from
+        # the ambient generator in proportion to its parameter count, so an arm with a wider proprio
+        # layer leaves the generator in a different state and its FIRST SAMPLED ACTION differs -- the
+        # two rollouts then diverge for a reason that has nothing to do with the input. Re-seeding
+        # here puts every arm's exploration stream back on the same footing; the simulator's own
+        # generator (`sim.gen`) was never affected, since it is a separate Generator seeded by
+        # `env.reset(seed=...)`.
+        torch.manual_seed(a.seed)
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
@@ -896,6 +956,18 @@ def main():
     if memory_on or n_extra:
         from .memory import describe as _describe_memory
         print(f"policy memory: {_describe_memory(model.meta)}")
+    #: Read back from the model for the same reason: a resumed checkpoint carries its own block, and
+    #: the env has to be producing exactly the one the first layer's columns were laid out for.
+    token_on = str(model.meta.get("opp_token") or "off")
+    if token_on != env.opp_token:
+        raise SystemExit(f"this checkpoint expects opponent tokens {token_on!r} and the env is "
+                         f"producing {env.opp_token!r}: the proprio columns would mean different "
+                         f"things on the two sides. Pass --opp-token {token_on}.")
+    if token_on != "off":
+        print(f"ORACLE: {describe_opp_token(token_on)}")
+    if a.ttc_penalty > 0 or (a.overtake_sustained and a.overtake_sustained[2] > 0):
+        print(f"reward additions: ttc {a.ttc_penalty} @ {a.ttc_safe} s | "
+              f"sustained lead {a.overtake_sustained}")
     #: Read back from the model for the same reason `memory_on` is: a resumed checkpoint carries its
     #: own head, and the rollout has to collect labels exactly when there is something to score.
     motion_cfg = dict(model.meta.get("motion") or {})
@@ -950,18 +1022,41 @@ def main():
     # different policies and the comparison would be between leashes, not conditioning.
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters(): p_.requires_grad_(False)
+    #: Both purity checks here are about the LEASH, so they apply when there is one. At
+    #: `--kl-coef 0` the reference is multiplied by zero in `minibatch_losses` and never reaches the
+    #: gradient, so "the reference is not the frozen baseline" is not a statement about anything --
+    #: and refusing on it makes a leash-free run impossible to RESUME, because the checkpoint being
+    #: resumed necessarily has a trained projection. That is how this was found: A3 had to restart
+    #: from its own `ppo_u400.pt` after a pause, with `--kl-coef 0.0`, and was refused for the state
+    #: of a tensor nothing would read. A resume of a leashed run is still refused, which is the case
+    #: the check was written for. `kl_reference_is_baseline` applies that rule to the memory
+    #: projection and additionally RECORDS which reference this run has, so a `kl_ref` chart can
+    #: never be read as a distance from the frozen original when it is not one.
+    leashed = a.kl_coef > 0
     ref_is_baseline = kl_reference_is_baseline(ref, memory_on, a.kl_coef, a.init)
-    if cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
+    if leashed and cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
         raise RuntimeError("the KL reference actor was captured after the conditioning projection "
                            "had trained; it must be the frozen baseline")
+    #: The reward the run was trained under, recorded in the checkpoint. Without it an audit of
+    #: "the reward" has to be TOLD which reward, and a stale default measures a policy against an
+    #: objective it never saw -- which is exactly what happened to this branch's first audit of A3:
+    #: it was scored with `--overtake-bonus 5.0` after the arms had trained with 0, and the only
+    #: reason it was caught is that the audit records what it thought it was measuring.
+    reward_meta = {k: getattr(env.ecfg, k) for k in (
+        "reward_progress", "reward_collision", "reward_collision_speed", "reward_steer_rate",
+        "reward_proximity", "safe_dist", "reward_plan_clearance", "plan_margin", "reward_wrong_way",
+        "reward_lap", "reward_lap_time", "reward_alive", "reward_car_contact", "reward_overtake",
+        "reward_car_proximity", "car_safe_gap", "reward_sideslip", "reward_ttc", "ttc_safe",
+        "reward_overtake_hold", "overtake_hold_dist", "overtake_hold_time")}
     #: What this run was, recorded in every checkpoint it writes so a result traces back to its arm,
     #: its normalization and its adapter without consulting a shell history.
     experiment_meta = {
         # What `kl_ref` in this run's logs is measured against, so a chart is never read as a
         # distance from the frozen original when it is not one.
         "kl_reference": "frozen_feedforward_baseline" if ref_is_baseline else "leg_start_memoryless",
+        "reward": reward_meta,
         "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
@@ -1020,6 +1115,29 @@ def main():
             by_name = {saved_names[i]: entry for i, entry in st.items() if isinstance(i, int) and i < len(saved_names)}
             st = {i: by_name[n_] for i, n_ in enumerate(param_names) if n_ in by_name}
             sd["param_groups"] = [dict(g, params=list(range(len(params)))) for g in sd["param_groups"][:1]]
+        # The opponent-token block widens the two proprio input layers. Their Adam moments are
+        # element-wise, so they can be carried across the same column insert the weights were --
+        # and they have to be, or the control arm would restore state the oracle arms dropped.
+        k_tok = int(spec.proprio_dim) - int(init_meta.get("proprio_dim", spec.proprio_dim))
+        if k_tok > 0 and str(model.meta.get("opp_token") or "off") != "off":
+            from .model import grow_proprio_moment
+            p_old = int(init_meta["proprio_dim"])
+            for i, entry in list(st.items()):
+                if not (isinstance(i, int) and i < len(params)):
+                    continue
+                name_i = param_names[i]
+                grown_entry = {}
+                for key, v in entry.items():
+                    if not (torch.is_tensor(v) and v.dim() > 0) or v.shape == params[i].shape:
+                        grown_entry[key] = v
+                        continue
+                    g = grow_proprio_moment(name_i, v, params[i], p_old, k_tok)
+                    if g is None:
+                        grown_entry = None
+                        break
+                    grown_entry[key] = g
+                if grown_entry is not None:
+                    st[i] = grown_entry
         dropped = [i for i, entry in st.items()
                    if not (isinstance(i, int) and i < len(params)
                            and all(v.shape == params[i].shape

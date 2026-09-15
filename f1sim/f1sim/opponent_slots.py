@@ -451,6 +451,22 @@ def preset_basic(n: int) -> Tuple[OpponentSlot, ...]:
     return _repeat({"kind": "raceline", "speed_scale": 1.0}, n)
 
 
+def preset_interactive(n: int) -> Tuple[OpponentSlot, ...]:
+    """`preset_basic` with the UPGRADED teacher: `f1sim.interactive_teacher.InteractiveTeacher`.
+
+    The user asked whether the visualiser's teacher is the upgraded one
+    (*"비쥬얼라이저의 티쳐는 그 업그레이드된 티쳐로 동작하는거지?"*). It is, when this is chosen --
+    and `기본` above is still the raceline teacher, so it is a selection and not a substitution.
+    Everything else is deliberately identical to `preset_basic`, so the two differ by the teacher
+    and by nothing else: same speed profile, same grip label, no events, no dispositions.
+
+    Refused with the registry's own sentence on a tree that does not carry the module
+    (`validate_slots` -> `DriverKind.unavailable_message`), never quietly mapped onto the raceline
+    teacher.
+    """
+    return _repeat({"kind": "interactive", "speed_scale": 1.0}, n)
+
+
 #: What the training recipe's population is made of, in the order `--opp-pool` named them. Used by
 #: `preset_recipe` when the caller has not picked checkpoints of its own; entries that are not on
 #: this machine are skipped rather than written into a table that cannot start.
@@ -508,7 +524,8 @@ def preset_blocker(n: int) -> Tuple[OpponentSlot, ...]:
 
 
 PRESETS = (
-    ("basic", "기본 (티처 1.0)", preset_basic),
+    ("basic", "기본 (raceline 티처 1.0)", preset_basic),
+    ("interactive", "업그레이드 티처 (interactive 1.0)", preset_interactive),
     ("recipe", "학습 레시피 (0.6–1.15 · 전체 이벤트)", preset_recipe),
     ("slow", "느린 선두 (0.6)", preset_slow_leader),
     ("blocker", "막는 상대 (defend 1.0)", preset_blocker),

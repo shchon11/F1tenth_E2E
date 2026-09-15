@@ -28,13 +28,21 @@ from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, encode as plan_enco
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
+from .opp_token import (OPP_TOKEN_CARS, OPP_TOKEN_HORIZONS_S, OPP_TOKEN_PLAN_SOURCE,
+                        OPP_TOKEN_SCALE, opp_token_car_dim, opp_token_dim, sample_body_traj,
+                        straight_traj, to_ego, to_world, validate_opp_token)
 from .params import Config
 from .sim import Simulator, StepResult
 from .track import Track
 
 REWARD_COMPONENT_KEYS = ("progress", "collision", "collision_speed", "steer_rate", "proximity",
                          "plan_clearance", "wrong_way", "lap", "alive", "car_contact", "overtake",
-                         "lap_time", "car_proximity", "sideslip")
+                         "lap_time", "car_proximity", "sideslip", "ttc", "overtake_hold")
+
+#: [s] the time to contact reported for a pair of cars that is not closing. Finite rather than an
+#: infinity so the penalty stays NaN-free under `torch.compile`; far past any `ttc_safe` anyone
+#: would set, so it is the same thing as "no contact coming".
+TTC_FAR = 1e3
 
 #: The nearest-opponent columns of privileged() are stored as metres (or m/s) divided by this, to
 #: keep them O(1) for the critic. Anything comparing them against a real distance must multiply.
@@ -95,38 +103,6 @@ OPP_FUTURE_REJOIN_M = 2.0
 #:   "constv" -- world-frame constant velocity from the current state. The floor every other model
 #:               has to beat, and what a caller with no teacher gets.
 OPP_FUTURE_MODELS = ("pred", "hybrid", "plan", "constv")
-
-#: The privileged opponent block (`EnvConfig.opp_token`), an *oracle input*: it is refused by the
-#: exporter and by `f1sim_ros.policy_node`, because no car can measure it.
-#:   ""        off, and off is the observation the env has always produced ("off" is accepted as a
-#:             spelling of it, because that is what worker 16's `--opp-token` flag takes)
-#:   "pos"     the nearest cars' relative position and a presence flag
-#:   "posvel"  + their relative velocity
-#:   "future"  + where each of them will be at `OPP_FUTURE_TIMES`
-OPP_TOKEN_MODES = ("", "off", "pos", "posvel", "future")
-
-#: How many opponents the block describes, nearest first. Two rather than one because the situation
-#: the whole line of work is about -- picking the gap a car is leaving -- stops being well posed the
-#: moment a second car owns the gap.
-OPP_TOKEN_CARS = 2
-
-#: Columns per car, in order: the `pos` triple, then the `posvel` pair, then the `future` pairs.
-#: The order is the layout, so a checkpoint written under one mode and read under another would see
-#: columns that mean the wrong thing; `ObsSpec.opp_token` records which mode produced it.
-OPP_TOKEN_COLS = {"": 0, "off": 0, "pos": 3, "posvel": 5, "future": 5 + 2 * len(OPP_FUTURE_TIMES)}
-
-
-def opp_token_mode(mode: str) -> str:
-    """The canonical spelling of an `opp_token` value; "off" and "" are the same thing."""
-    if mode not in OPP_TOKEN_MODES:
-        raise ValueError(f"opp_token {mode!r} is not one of {list(OPP_TOKEN_MODES)}")
-    return "" if mode == "off" else mode
-
-
-def opp_token_dim(mode: str) -> int:
-    """Width of the privileged opponent block for a mode name."""
-    return OPP_TOKEN_CARS * OPP_TOKEN_COLS[opp_token_mode(mode)]
-
 
 #: Who drives each car, per row, in `opponent == "pool"`. The learner's slot is always
 #: `OPP_DRIVER_POLICY`; an opponent's is drawn per race from `opp_pool`.
@@ -284,6 +260,43 @@ class EnvConfig:
                                       # it uses on a grippy one and finds out at the wall.
     sideslip_free: float = 0.06       # [rad] ~3.5 deg: the drift angle a clean fast corner has anyway
     reward_alive: float = 0.0
+    # Time to contact with the nearest car, per step. The reward audit
+    # (`docs/research/reward-audit-2026-09-13.md`) found that nothing prices a *margin* to another
+    # car until the margin becomes a contact: `car_proximity` is charged per metre driven and scaled
+    # by closing speed, so a car standing still next to another pays nothing, and a car closing at
+    # 3 m/s from 2 m away -- 0.7 s from contact -- pays nothing either, because at 2 m the gap is
+    # outside `car_safe_gap`. TTC is the quantity that sees both: it is small exactly when the
+    # geometry and the closing speed together say a contact is imminent, whatever the current gap.
+    # The attribution note measured the failure this is aimed at: contacts are side-by-side at
+    # +1.5 m/s of closing speed, i.e. the learner drives level with a car and keeps closing.
+    reward_ttc: float = 0.0           # per step, at zero time to contact
+    ttc_safe: float = 1.0             # [s] time to contact above which the term is 0; it ramps
+                                      # linearly to `reward_ttc` at TTC = 0
+    # Paid once, when a lead has been *held*. `reward_overtake` pays for arc taken out of the field
+    # every step, which pays the approach and pays the crossing instant; measured at +0.03/s at
+    # coefficient 1.0 it is 1 % of progress, and what it buys at 5.0 is a faster approach rather
+    # than a completed pass. This term pays nothing for closing and nothing at the crossing: it
+    # fires when the learner has been `overtake_hold_dist` metres ahead of an opponent along the
+    # lane, continuously, for `overtake_hold_time` seconds -- which is a pass that stuck.
+    reward_overtake_hold: float = 0.0 # paid once per held lead, per opponent
+    overtake_hold_dist: float = 1.5   # [m] signed arc the learner must be ahead by. Two car lengths
+                                      # and a bit: inside that the cars are still side by side and
+                                      # the "pass" can be undone by the other car simply continuing.
+    overtake_hold_time: float = 1.0   # [s] how long it must hold, continuously
+    # Privileged opponent tokens in the observation (`f1sim.opp_token`). An ORACLE: "off" allocates
+    # nothing and is bit-identical to the env without it; anything else appends a proprio block the
+    # real car cannot produce, and the checkpoint it trains is refused by the exporter and the ROS
+    # node. Its whole purpose is to answer whether the planner, *handed* the opponent's state, races
+    # any better than it does with LiDAR alone.
+    opp_token: str = "off"
+    opp_token_ablate: bool = False    # emit the block as ZEROS while keeping its width. A diagnostic
+                                      # and never a deployment path: it measures how much a policy
+                                      # trained on the block actually depends on it, which is the
+                                      # difference between "the planner ignored the oracle" and "the
+                                      # planner used it and it did not pay" -- two readings of the
+                                      # same flat result that call for opposite next steps. Refused
+                                      # unless `opp_token` is on, because zeroing a block that does
+                                      # not exist is not an ablation, it is the control arm.
     spawn_lateral_std: float = 0.3
     spawn_yaw_std: float = 0.2
     spawn_min_clearance: float = 0.5  # [m] spawn poses closer to a wall are pulled back to the centerline
@@ -428,12 +441,6 @@ class EnvConfig:
     # and lets one of them be a *policy* -- a car that takes its own line, defends its own position
     # and makes its own mistakes, which no scripted behaviour reproduces.
     opp_pool: tuple = ()
-    # Privileged opponent block in the observation (`OPP_TOKEN_MODES`). "" is off and off is the
-    # observation this env has always produced. Anything else is an ORACLE: it is ground truth from
-    # the simulator, appended after every proprio key the policy already had, and it is refused by
-    # `learn.export` and by `f1sim_ros.policy_node` so that a checkpoint trained on it can never be
-    # mistaken for one that could drive a car.
-    opp_token: str = ""
     # Which prediction `car_future` (and so the "future" columns of the block) uses -- see
     # `OPP_FUTURE_MODELS`. Recorded in the spec next to the mode, because "the opponent's future"
     # under two different models is two different labels.
@@ -500,18 +507,9 @@ class F1VecEnv:
             raise ValueError(f"opponent {e.opponent!r} is not one of {list(OPPONENT_MODES)}")
         if e.spawn_order not in SPAWN_ORDERS:
             raise ValueError(f"spawn_order {e.spawn_order!r} is not one of {list(SPAWN_ORDERS)}")
-        #: The canonical spelling of `EnvConfig.opp_token` -- "" when it is off, whichever way the
-        #: caller spelled that. Read everywhere below instead of the config field.
-        self.opp_token_mode = opp_token_mode(e.opp_token)
         if e.opp_future_model not in OPP_FUTURE_MODELS:
             raise ValueError(f"opp_future_model {e.opp_future_model!r} is not one of "
                              f"{list(OPP_FUTURE_MODELS)}")
-        if self.opp_token_mode and self.M < 2:
-            raise ValueError(f"opp_token {e.opp_token!r} with race_size {self.M}: the block "
-                             f"describes the other cars of a race, and with one car per race it "
-                             f"would be a constant zero input that still widens every checkpoint.")
-        #: Width of the privileged opponent block, 0 when it is off.
-        self.opp_token_dim = opp_token_dim(e.opp_token)
         #: The per-car table, parsed and checked, or None when this env is not in slots mode.
         self.slots = None
         if e.opponent_slots is not None:
@@ -647,6 +645,14 @@ class F1VecEnv:
         # A flag rather than "0 means unset": 0 is a perfectly ordinary gap -- it is the pass itself.
         self.gap_prev = torch.zeros(self.B, max(1, self.M - 1), device=self.device)
         self.gap_valid = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        # Sustained-lead bookkeeping, per (car, opponent): how many consecutive steps this row has
+        # been `overtake_hold_dist` ahead of that opponent, and whether the bonus for the current
+        # run of them has already been paid. Both live outside `_step_math` and are passed through
+        # it, because that function is compiled and has to stay a pure map from tensors to tensors.
+        self.lead_steps = torch.zeros(self.B, max(1, self.M - 1), device=self.device)
+        #: 1 = "this lead may not be paid" (see `overtake_hold`). Starts blocked, so a learner that
+        #: spawned ahead is not paid for its grid position.
+        self.lead_paid = torch.ones(self.B, max(1, self.M - 1), device=self.device)
         T_, S_ = self.sim.track.T, int(e.reward_time_sectors)
         self.ideal_lap = torch.zeros(T_, device=self.device)                 # per track, seconds
         self.sector_lim = torch.zeros(T_, S_, device=self.device)            # raceline time per sector
@@ -710,6 +716,49 @@ class F1VecEnv:
         self.last_result: Optional[StepResult] = None
         self._empty_long = torch.zeros(0, dtype=torch.long, device=self.device); self._empty_float = torch.zeros(0, device=self.device)
         self._no_plan = torch.zeros(self.B, 1, 4, device=self.device)
+        # ---- privileged opponent tokens (f1sim.opp_token). An oracle; "off" allocates nothing.
+        self.opp_token = validate_opp_token(e.opp_token)
+        self.opp_token_dim = opp_token_dim(self.opp_token)
+        self.opp_token_ablate = bool(e.opp_token_ablate)
+        if self.opp_token_ablate and self.opp_token == "off":
+            raise ValueError("opp_token_ablate with opp_token 'off': zeroing a block that does not "
+                             "exist is not an ablation, it is the control arm. Score A0 instead.")
+        if self.opp_token != "off":
+            if self.M < 2:
+                raise ValueError(
+                    f"opp_token {self.opp_token!r} needs race_size > 1: with one car per race the "
+                    f"whole block is the zeros an absent opponent already produces, so the arm "
+                    f"would differ from the control by {self.opp_token_dim} dead input columns and "
+                    f"nothing else.")
+            if e.action_mode != "plan":
+                # The `future` columns are the opponent's own tracked plan, and `direct` mode has no
+                # tracker to read one from. Refused for every mode, not just `future`, so that the
+                # three arms of a comparison are the same object in every respect but their width.
+                raise ValueError(
+                    f"opp_token {self.opp_token!r} needs action_mode 'plan': the future columns are "
+                    f"the opponent's own plan-tracker reference, and in 'direct' mode no plan "
+                    f"exists to read.")
+            #: This step's plan for every car, in that car's own body frame, on the tracker's
+            #: uniform time grid. `OPP_TOKEN_PLAN_SOURCE` says which of the tracker's two
+            #: trajectories it is; `_plan_shift` is the offset of its clock from the anchor pose
+            #: (zero for `ref`, the car's calibrated command latency for `pred`, whose rollout
+            #: starts at the latency-compensated pose).
+            self._plan_traj = torch.zeros(self.B, self.tracker.spec.N + 1, 4, device=self.device)
+            #: Pose (x, y, yaw) the row of `_plan_traj` above is anchored at -- the pose the tracker
+            #: was called with, i.e. the state one control step BEFORE the observation the token
+            #: goes into. `_opp_token_times` carries that offset.
+            self._plan_pose = torch.zeros(self.B, 3, device=self.device)
+            #: Per row, whether `_plan_traj` is this episode's own plan rather than the
+            #: constant-velocity stand-in a just-respawned car gets. Reported, not used: it is how
+            #: often the label is a fallback, which a reader of the validation table needs.
+            self._plan_real = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+            self._token_horizons = torch.tensor(OPP_TOKEN_HORIZONS_S, device=self.device)
+            #: Off in training: keeping the tracker's OTHER trajectory beside the one the label uses
+            #: costs a second (B, N+1, 4) copy per step and nothing reads it.
+            #: `work/oracle-planner/work/label_validation.py` turns it on to score both against the
+            #: realised future, which is the evidence `OPP_TOKEN_PLAN_SOURCE` was chosen on.
+            self.opp_token_keep_alt = False
+            self._plan_alt = torch.zeros(self.B, self.tracker.spec.N + 1, 4, device=self.device)
         self.single_observation_space, self.single_action_space = self._spaces()
 
     def _spaces(self):
@@ -720,7 +769,9 @@ class F1VecEnv:
                 "speed": gym.spaces.Box(-1.0, 2.0, (1,), np.float32),
                 "prev_action": gym.spaces.Box(-1.0, 1.0, (self.act_dim * self.ecfg.action_history,), np.float32),
                 **({"hist": gym.spaces.Box(-5.0, 5.0, (self.ecfg.hist_len * self.row_dim,), np.float32)} if self.ecfg.hist_len > 0 else {}),
-                "speed_cap": gym.spaces.Box(0.0, 1.0, (1,), np.float32)}
+                "speed_cap": gym.spaces.Box(0.0, 1.0, (1,), np.float32),
+                **({"opp_token": gym.spaces.Box(-np.inf, np.inf, (opp_token_dim(self.ecfg.opp_token),), np.float32)}
+                   if validate_opp_token(self.ecfg.opp_token) != "off" else {})}
             if self.ecfg.obs_imu and self.cfg.imu.enabled:
                 spaces["imu"] = gym.spaces.Box(-5.0, 5.0, (6,), np.float32)
                 spaces["imu_att"] = gym.spaces.Box(-2.0, 2.0, (2,), np.float32)
@@ -1050,10 +1101,11 @@ class F1VecEnv:
         if self.hist is not None:
             self._last_feat = torch.cat([speed, obs.get("imu", torch.zeros(self.B, 6, device=self.device)), obs.get("imu_att", torch.zeros(self.B, 2, device=self.device))], 1)
             obs["hist"] = self.hist[:, ::self.ecfg.hist_stride].reshape(self.B, -1)
-        if self.opp_token_mode:
-            # LAST, after every key the observation already had, so that the columns a checkpoint
-            # was trained without keep their index and a warm start is a copy plus zeros.
-            obs["opp_token"] = self.opp_token(r.state)
+        if self.opp_token != "off":
+            # Last, so the block is appended after every key the policy has ever had -- which is
+            # what makes the extra input columns of an oracle arm the trailing ones, and a warm
+            # start from a checkpoint without it a column-append rather than a re-layout.
+            obs["opp_token"] = self.opp_tokens(r)
         return obs
 
     def message_inputs(self, i: int, r: Optional[StepResult] = None) -> MessageInputs:
@@ -1471,10 +1523,21 @@ class F1VecEnv:
         `learn.graph_runtime.prepare_graph_runtime` takes to record the solver's arguments, neither
         of which has run a reset yet. The pool sits those out rather than being handed a zeroed
         observation, which would be a policy driving on a scan that says "no returns anywhere".
+
+        The privileged opponent block is REMOVED. A pool entry is a deployable LiDAR-only
+        checkpoint driving the other car -- that is the whole point of the population -- and it was
+        trained on the proprio vector without the block. Handing it those columns would not just be
+        a shape error: it would make every opponent in the race an oracle too, and the arm would no
+        longer be "the learner is told where the other cars are", it would be "everyone is". The
+        learner's own rows are unaffected; a `self` entry is the learner's own weights driving off
+        the caller's action, which is computed from the full observation for every row.
         """
-        if self._last_obs is not None:
-            return self._last_obs
-        return None if self.last_result is None else self._obs(self.last_result)
+        obs = self._last_obs
+        if obs is None:
+            obs = None if self.last_result is None else self._obs(self.last_result)
+        if obs is None or self.opp_token == "off":
+            return obs
+        return {k: v for k, v in obs.items() if k != "opp_token"}
 
     def follow_cap(self, state: torch.Tensor):
         """(is there a car within opp_follow_gap ahead of each car, the speed to hold behind it)."""
@@ -1509,6 +1572,8 @@ class F1VecEnv:
         r = self.sim.step(torch.stack([torch.zeros(self.B, device=self.device), self.sim.state[:, 3]], 1))
         self.scan_hist = torch.roll(self.scan_hist, 1, 1); self.scan_hist[:, 0] = self._norm_scan(r.scan)
         self.last_result = r
+        self._plan_fallback(torch.arange(self.B, device=self.device), r.state)
+        self.lead_steps.zero_(); self.lead_paid.fill_(1.0)
         obs = self._obs(r)
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
             self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.act_dim, device=self.device)], 1)[:, None, :]
@@ -1529,6 +1594,9 @@ class F1VecEnv:
             # pose and `car_future` has to put it back in the world.
             self._plan_pose = self.sim.state[:, :3].clone()
             raw = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
+            # Before the physics: `sim.state` is still the pose the plan was issued from, which is
+            # the frame `last_ref` lives in.
+            self._capture_plan(self.sim.state)
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)
@@ -1550,10 +1618,11 @@ class F1VecEnv:
                    else torch.zeros_like(self.ep_return))
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap,
-                         plan_ref, self.lap_start_step, car_hit, self.gap_prev, self.gap_valid)
+                         plan_ref, self.lap_start_step, car_hit, self.gap_prev, self.gap_valid,
+                         self.lead_steps, self.lead_paid)
         (self.scan_hist, steer_rate, reward, reward_components, self.act_hist, terminated, truncated,
          crossed, done, self.ep_return, self.ep_progress, flags, self.gap_prev,
-         self.gap_valid) = (t.clone() for t in out)
+         self.gap_valid, self.lead_steps, self.lead_paid) = (t.clone() for t in out)
         self.prev_steer_norm = steer_norm; self.prev_action = a
         if self.hist is not None:
             self.hist = torch.cat([torch.cat([self._last_feat, a], 1)[:, None, :], self.hist[:, :-1]], 1)
@@ -1598,13 +1667,15 @@ class F1VecEnv:
             info["final_priv"] = self.privileged(r)[ids].clone()
             scans = self._reset_envs(ids)
             r = self._reset_result(r, ids, scans)
+            self._plan_fallback(ids, r.state)
             obs = self._obs(r)
         self.last_result = r
         self._last_obs = obs
         return obs, reward, terminated, truncated, info
 
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
-                   ep_return, ep_progress, prev_lap, plan_ref, lap_start_step, car_hit, gap_prev, gap_valid):
+                   ep_return, ep_progress, prev_lap, plan_ref, lap_start_step, car_hit, gap_prev, gap_valid,
+                   lead_steps, lead_paid):
         """Reward, histories and episode flags as pure tensor math (compiled into one CUDA graph when
         the sim runs in reduce-overhead mode: next to a training job every small kernel waits its turn)."""
         e = self.ecfg
@@ -1665,6 +1736,13 @@ class F1VecEnv:
             gap_gain, _ = self.overtake_gain(s, tid, gap_prev, gap_valid)
         car_prox = self.car_proximity(state) if (e.reward_car_proximity > 0 and self.sim.other_idx is not None) \
             else torch.zeros_like(progress)
+        # Time to contact: a per-step toll that rises linearly from 0 at `ttc_safe` to `reward_ttc`
+        # at the contact itself. Per step and not per metre driven, unlike the two proximity terms:
+        # what is being priced is the time left, and standing still beside a car that is closing on
+        # you is exactly as close to a contact as driving past it is.
+        ttc_pen = torch.zeros_like(progress)
+        if e.reward_ttc > 0 and self.sim.other_idx is not None:
+            ttc_pen = ((e.ttc_safe - self.car_ttc(state)) / max(e.ttc_safe, 1e-6)).clamp(0.0, 1.0)
         reward_components = torch.stack([
             e.reward_progress * progress,
             e.reward_collision * crash,
@@ -1680,8 +1758,10 @@ class F1VecEnv:
             torch.zeros_like(progress),          # lap_time: filled in on the crossing, in step()
             -e.reward_car_proximity * car_prox * travelled,
             -e.reward_sideslip * (torch.atan2(state[:, 4].abs(), state[:, 3].abs().clamp_min(0.5)) - e.sideslip_free).clamp_min(0.0) * travelled,
+            -e.reward_ttc * ttc_pen,
+            torch.zeros_like(progress),          # overtake_hold: filled in below, once the new gaps
+                                                 # and the episode boundaries of this step are known
         ], 1)
-        reward = reward_components.sum(1)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         terminated = collision.clone()
         truncated = (~terminated) & ((ep_step >= e.max_steps) | (lap >= e.laps))
@@ -1694,9 +1774,16 @@ class F1VecEnv:
         gap_now = torch.zeros_like(gap_prev)
         if self.sim.other_idx is not None:
             gap_now = self.signed_gaps(s, tid)
+        # Sustained lead. It needs the gaps AFTER this step and the episode boundaries OF this step,
+        # so it is the one reward term that cannot be filled in with the others above.
+        if e.reward_overtake_hold > 0 and self.sim.other_idx is not None:
+            hold, lead_steps, lead_paid = self.overtake_hold(gap_now, gap_valid,
+                                                            self.race_boundary(done), lead_steps, lead_paid)
+            reward_components[:, REWARD_COMPONENT_KEYS.index("overtake_hold")] = e.reward_overtake_hold * hold
+        reward = reward_components.sum(1)
         return (scan_hist, steer_rate, reward, reward_components, act_hist, terminated, truncated, crossed,
                 done, ep_return + reward, ep_progress + progress, flags, gap_now,
-                torch.ones_like(gap_valid))
+                torch.ones_like(gap_valid), lead_steps, lead_paid)
 
     def signed_gaps(self, s: torch.Tensor, tid: torch.Tensor) -> torch.Tensor:
         """Arc to each opponent, signed and wrapped to (-L/2, L/2]: + is ahead of me, - is behind.
@@ -1707,11 +1794,21 @@ class F1VecEnv:
         L_ = self.sim.track.length[tid][:, None]
         return (s[self.sim.other_idx] - s[:, None] + L_ / 2) % L_ - L_ / 2
 
-    def car_proximity(self, state: torch.Tensor) -> torch.Tensor:
-        """(B,) closeness to the most threatening opponent: 0 outside car_safe_gap of its body, 1 at
-        contact, scaled up by the speed the gap is closing at. Euclidean, not arc: the overtake term
-        reads arc so a pass can go through zero arc gap, and this reads the body distance so the pass
-        has to go *around* the other car rather than through it."""
+    def car_gap_closing(self, state: torch.Tensor):
+        """(body-to-body gap [m], line-of-sight closing speed [m/s]) to every opponent, (B, C) each.
+
+        Body-to-body clearance from an oriented box, not centre distance minus a constant. Cars are
+        0.5 long and 0.3 wide: alongside, the bodies touch at 0.3 m between centres, so a
+        centre-distance term with a 0.45 m "body" was already saturated at full penalty with 0.3 m
+        of daylight between the cars, and could not tell a rub from a clean pass. Measured on the
+        race leg: 100 % of the learner's contacts were side contacts, and 4M steps of training
+        against that saturated term moved the contact count by nothing.
+
+        `closing` is the rate the *line of sight* is shortening: the relative world velocity
+        projected onto the unit vector from this car to that one, positive while the gap shrinks.
+        Both the proximity penalty and the time-to-contact penalty are functions of exactly this
+        pair, so they are computed once here rather than twice with two chances to drift apart.
+        """
         e = self.ecfg
         o = self.sim.other_idx                                             # (B,C)
         d = state[o][:, :, :2] - state[:, None, :2]                        # (B,C,2) me -> them
@@ -1722,18 +1819,81 @@ class F1VecEnv:
         vth = torch.stack([state[o][:, :, 3] * co - state[o][:, :, 4] * so,
                            state[o][:, :, 3] * so + state[o][:, :, 4] * co], 2)
         closing = -((vth - vme[:, None, :]) * d).sum(2) / dist             # >0 when the gap is shrinking
-        # Body-to-body clearance from an oriented box, not centre distance minus a constant. Cars are
-        # 0.5 long and 0.3 wide: alongside, the bodies touch at 0.3 m between centres, so a
-        # centre-distance term with a 0.45 m "body" was already saturated at full penalty with 0.3 m
-        # of daylight between the cars, and could not tell a rub from a clean pass. Measured on the
-        # race leg: 100 % of the learner's contacts were side contacts, and 4M steps of training
-        # against that saturated term moved the contact count by nothing.
         lon = (d[..., 0] * c[:, None] + d[..., 1] * sn[:, None]).abs()
         lat = (-d[..., 0] * sn[:, None] + d[..., 1] * c[:, None]).abs()
         gap = torch.sqrt((lon - e.car_len).clamp_min(0.0) ** 2 + (lat - e.car_wid).clamp_min(0.0) ** 2)
+        return gap, closing
+
+    def car_proximity(self, state: torch.Tensor) -> torch.Tensor:
+        """(B,) closeness to the most threatening opponent: 0 outside car_safe_gap of its body, 1 at
+        contact, scaled up by the speed the gap is closing at. Euclidean, not arc: the overtake term
+        reads arc so a pass can go through zero arc gap, and this reads the body distance so the pass
+        has to go *around* the other car rather than through it."""
+        e = self.ecfg
+        gap, closing = self.car_gap_closing(state)
         closeness = (1.0 - gap / e.car_safe_gap).clamp(0.0, 1.0)
         scale = 1.0 + closing.clamp_min(0.0) / e.car_prox_speed_ref
         return (closeness * scale).max(1).values
+
+    def car_ttc(self, state: torch.Tensor) -> torch.Tensor:
+        """(B,) seconds until the bodies touch at the current closing speed; `TTC_FAR` if nothing closes.
+
+        The quantity the reward audit says is missing. `car_proximity` prices a gap that is already
+        small and charges it per metre driven; a collision prices the contact itself, once, at 0.2 %
+        of steps. Neither sees the situation the traffic attribution actually found -- side by side
+        at +1.5 m/s of closing speed with half a metre of daylight, which is 0.3 s from a contact and
+        costs nothing until it happens. TTC is gap over closing speed, so it is small exactly when
+        geometry and closing speed together say the contact is coming, at any gap.
+
+        Divergent and parallel pairs (`closing <= 0`) get `TTC_FAR`, not a negative or an infinity: a
+        car moving away has no time to contact, and a finite stand-in keeps the term differentiable-
+        free of NaN under `torch.compile`.
+        """
+        gap, closing = self.car_gap_closing(state)
+        ttc = torch.where(closing > 1e-3, gap / closing.clamp_min(1e-3),
+                          torch.full_like(gap, TTC_FAR))
+        return ttc.min(1).values
+
+    def overtake_hold(self, gap_now: torch.Tensor, gap_valid: torch.Tensor, boundary: torch.Tensor,
+                      lead_steps: torch.Tensor, lead_paid: torch.Tensor):
+        """(bonus this step (B,), new lead_steps, new lead_paid) for the sustained-lead term.
+
+        `gap_now` is `signed_gaps`: + is that opponent ahead of me, so this car leads it by
+        `-gap_now`. A lead counts while it is at least `overtake_hold_dist` metres and the opponent
+        is still inside `overtake_range` -- a car half a lap away is not being led, it is being
+        lapped or lapping, and the signed arc flips sign out there by construction.
+
+        `lead_paid` carries two things at once, which is why it starts at **1** and not at 0:
+
+        * 1 = this lead may not be paid. It is 1 at the start of every race and after every reset in
+          it, so a learner that **spawned** ahead -- one race in three under `--spawn-order random`
+          -- is not paid for a grid position, and a crashed opponent respawning behind the field
+          does not hand the learner a bonus for the other car's mistake. It is also 1 immediately
+          after a lead has been paid.
+        * 0 = armed. It is cleared on the first step where the gap is valid and this car is **not**
+          leading by the distance, which is the only evidence available that the lead, when it
+          comes, was taken rather than given.
+
+        The counter is consecutive steps of such a lead; the bonus is paid on the step the counter
+        first reaches `overtake_hold_time`, once. Being re-passed disarms and re-arms, so passing
+        again pays again -- which is the behaviour the term is for.
+
+        `boundary` is `race_boundary(done)`: any car of this race resetting clears the counter and
+        re-blocks the payment.
+        """
+        e = self.ecfg
+        lead = (-gap_now >= e.overtake_hold_dist) & (gap_now.abs() < e.overtake_range) & gap_valid[:, None]
+        steps = torch.where(lead, lead_steps + 1.0, torch.zeros_like(lead_steps))
+        need = max(1.0, round(e.overtake_hold_time / self.sim.control_dt))
+        fires = (steps >= need) & (lead_paid <= 0.0)
+        # Armed only by a valid gap in which this car is not leading. Gated on `gap_valid` because
+        # the step after a reset has no gap to read, and reading its absence as "not leading" would
+        # arm the very spawn this flag exists to exclude.
+        blocked = lead | ~gap_valid[:, None]
+        paid = torch.where(blocked, torch.maximum(lead_paid, fires.to(lead_paid.dtype)),
+                           torch.zeros_like(lead_paid))
+        keep = (~boundary).to(steps.dtype)[:, None]
+        return fires.to(steps.dtype).sum(1), steps * keep, paid * keep + (1.0 - keep)
 
     def overtake_gain(self, s: torch.Tensor, tid: torch.Tensor, gap_prev: torch.Tensor,
                       gap_valid: torch.Tensor):
@@ -2056,67 +2216,192 @@ class F1VecEnv:
         d = (st[o][:, :, :2] - st[:, None, :2]).norm(dim=2)                 # (B, C)
         return fut[o], d < self.ecfg.overtake_range
 
-    @torch.no_grad()
-    def opp_token(self, state: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """(B, OPP_TOKEN_CARS * OPP_TOKEN_COLS[mode]) privileged opponent block, or (B, 0) when off.
+    # ------------------------------------------------------------------ privileged opponent tokens
+    def _capture_plan(self, pose_before: torch.Tensor) -> None:
+        """Keep this step's plan and the pose it is anchored at, for `opp_tokens`.
 
-        An oracle input, not an observation the car could build. Per opponent, nearest first, in the
-        ego body frame and on `PRIV_OPP_DIST_SCALE` (the scale `privileged()` and `future_labels`
-        already put opponent offsets on):
-
-            Dx, Dy, presence                 ("pos")
-            + Dv_x, Dv_y                     ("posvel")
-            + the opponent's position at each of OPP_FUTURE_TIMES, relative to the ego's pose NOW
-                                             ("future")
-
-        Every column of an absent slot -- fewer than `OPP_TOKEN_CARS` other cars, or one outside
-        `overtake_range` -- is exactly 0, including its presence flag. That gating is the whole
-        reason presence is a column: "no car" and "a car at the origin" must not be the same input.
+        Called from `step()` immediately after the tracker has run, with the state the tracker was
+        called on. `tracker.last_ref` is (B, N+1, 4) x/y/heading/speed in that pose's body frame on
+        the grid 0, dt, ... -- one row per car, opponents included, because every car of a race is
+        driven through the same tracker. For a teacher-driven opponent that row is its raceline
+        target with its scheduled event (brake / stop / shift / defend / yield / line) and its
+        follow cap already applied, since all of those act on the action before the tracker sees it;
+        for a pool opponent it is that checkpoint's own plan. This is what makes "the opponent's own
+        tracked plan" one object rather than one per kind of opponent.
         """
-        mode = self.opp_token_mode
-        cols = OPP_TOKEN_COLS[mode]
-        if not cols:
-            return torch.zeros(self.B, 0, device=self.device)
-        st = self.sim.state if state is None else state
-        o = self.sim.other_idx
-        C = o.shape[1]
-        n = OPP_TOKEN_CARS
-        c, sn = torch.cos(st[:, 2]), torch.sin(st[:, 2])
-        d = st[o][:, :, :2] - st[:, None, :2]                               # (B, C, 2) me -> them
+        if self.opp_token == "off":
+            return
+        main, alt = ((self.tracker.last_pred, self.tracker.last_ref)
+                     if OPP_TOKEN_PLAN_SOURCE == "pred" else
+                     (self.tracker.last_ref, self.tracker.last_pred))
+        self._plan_traj.copy_(main)
+        self._plan_pose.copy_(pose_before[:, :3])
+        self._plan_real.fill_(True)
+        if self.opp_token_keep_alt:
+            self._plan_alt.copy_(alt)
+
+    def _plan_fallback(self, ids: torch.Tensor, state: torch.Tensor) -> None:
+        """Give `ids` a constant-velocity stand-in plan anchored at their current pose.
+
+        Two rows need it: every row at `reset()`, where no action has been taken yet, and a row that
+        respawned inside `step()`, whose stored plan belongs to the episode that just ended and to a
+        pose on the other side of the track. Predicting "it keeps going the way it is going" is the
+        only thing available without a plan, and it is marked so the validation can report how often
+        the label is one (a respawn is ~0.2 % of steps).
+        """
+        if self.opp_token == "off" or ids.numel() == 0:
+            return
+        n = self.tracker.spec.N
+        dt = self.tracker.spec.dt
+        self._plan_traj[ids] = straight_traj(state[ids], n, dt, self._plan_clock_shift("main", ids))
+        self._plan_pose[ids] = state[ids, :3]
+        self._plan_real[ids] = False
+        if self.opp_token_keep_alt:
+            self._plan_alt[ids] = straight_traj(state[ids], n, dt, self._plan_clock_shift("alt", ids))
+
+    def _plan_clock_shift(self, which: str, ids: Optional[torch.Tensor] = None):
+        """How far ahead of the anchor pose a stored trajectory's t = 0 sits, per row.
+
+        `ref` starts at the car (0). `pred` starts at the pose the tracker predicts over its own
+        command latency, so its clock is `tracker_delay` ahead and the sampler subtracts that.
+        """
+        src = OPP_TOKEN_PLAN_SOURCE if which == "main" else ("ref" if OPP_TOKEN_PLAN_SOURCE == "pred" else "pred")
+        if src != "pred":
+            return 0.0
+        d = self.tracker_delay
+        return d if ids is None else d[ids]
+
+    def _opp_token_times(self) -> torch.Tensor:
+        """(B, H) the times on each row's plan clock that the token's horizons land on.
+
+        The plan's t = 0 is the instant the tracker was called, which is one control step before the
+        state the observation describes (the action is issued, then the simulator advances by
+        `control_dt`, then the observation is built). So the horizon h after the observation is
+        h + control_dt on the plan's own clock. Getting this wrong is a systematic along-track bias
+        of one step -- about 0.1 m at 4 m/s -- in the same direction at every horizon, which is
+        exactly the kind of error a validation R^2 hides and a residual plot does not.
+        """
+        return (self._token_horizons + self.sim.control_dt)[None].expand(self.B, -1)
+
+    def opp_token_slots(self, st: torch.Tensor):
+        """(rows (B, n), present (B, n)) -- which car fills each token slot, and whether it counts.
+
+        `rows` are global env rows, ordered by body-centre distance, nearest first; `present` is 1
+        only inside `overtake_range`. One definition, read by `opp_tokens`, by the future columns
+        and by the label validation, so all three are talking about the same car.
+        """
+        o = self.sim.other_idx                                   # (B, C)
+        d = st[o][:, :, :2] - st[:, None, :2]
         dist = d.norm(dim=2)
-        # nearest first, and a slot that does not exist is pushed past every real one
-        big = torch.full_like(dist, float("inf"))
-        order = torch.where(dist < self.ecfg.overtake_range, dist, big).argsort(1)[:, :n]
-        pad = max(0, n - C)
-        if pad:
-            order = torch.cat([order, torch.zeros(self.B, pad, dtype=order.dtype, device=self.device)], 1)
-        ar = torch.arange(self.B, device=self.device)[:, None]
-        kj = o.gather(1, order.clamp(max=C - 1))                            # (B, n) global row of each slot
-        sel = dist.gather(1, order.clamp(max=C - 1))
-        present = (sel < self.ecfg.overtake_range).to(st.dtype)
-        if pad:
-            present[:, C:] = 0.0
-        s_ = PRIV_OPP_DIST_SCALE
-        dn = d[ar, order.clamp(max=C - 1)]                                  # (B, n, 2)
-        lon = (dn[..., 0] * c[:, None] + dn[..., 1] * sn[:, None]) / s_
-        lat = (-dn[..., 0] * sn[:, None] + dn[..., 1] * c[:, None]) / s_
-        parts = [lon, lat, present]
-        if cols > 3:
-            co, so = torch.cos(st[kj, 2]), torch.sin(st[kj, 2])
-            vwx = (st[kj, 3] * co - st[kj, 4] * so) - (st[:, 3] * c - st[:, 4] * sn)[:, None]
-            vwy = (st[kj, 3] * so + st[kj, 4] * co) - (st[:, 3] * sn + st[:, 4] * c)[:, None]
-            parts += [(vwx * c[:, None] + vwy * sn[:, None]) / s_,
-                      (-vwx * sn[:, None] + vwy * c[:, None]) / s_]
-        if cols > 5:
-            fut = self.car_future(OPP_FUTURE_TIMES, state=st)[kj]           # (B, n, K, 2)
-            fd = fut - st[:, None, None, :2]
-            fl = (fd[..., 0] * c[:, None, None] + fd[..., 1] * sn[:, None, None]) / s_
-            ft = (-fd[..., 0] * sn[:, None, None] + fd[..., 1] * c[:, None, None]) / s_
-            for i in range(len(OPP_FUTURE_TIMES)):
-                parts += [fl[:, :, i], ft[:, :, i]]
-        block = torch.stack(parts, 2) * present[:, :, None]                 # (B, n, cols), gated
-        block[:, :, 2] = present                                            # ... except the flag itself
-        return block.reshape(self.B, n * cols)
+        n = min(OPP_TOKEN_CARS, o.shape[1])
+        order = dist.argsort(dim=1)[:, :n]
+        rows = torch.gather(o, 1, order)
+        present = (torch.gather(dist, 1, order) < self.ecfg.overtake_range).to(st.dtype)
+        return rows, present
+
+    def opp_future_columns(self, st: torch.Tensor, rows: torch.Tensor, source: Optional[str] = None):
+        """(B, n, H, 2) where each slot's car intends to be, in the ego's current body frame.
+
+        `source` picks which of the tracker's two trajectories is read. `ref` is the reference the
+        plan asks for -- the raceline target with the opponent's scheduled event applied, or a pool
+        policy's own emitted plan. `pred` is the iLQR's forward rollout of its own kinematic model
+        under the commands it chose. `OPP_TOKEN_PLAN_SOURCE` names the one the token uses (`pred`,
+        on the measurement in `f1sim/opp_token.py`); the other is available only when
+        `opp_token_keep_alt` is set, which is what
+        `work/oracle-planner/work/label_validation.py` does to score both against the realised
+        future.
+
+        `pred` starts at the delay-compensated pose rather than at the car, because that is where
+        the tracker's model starts its rollout, so its clock is shifted by that car's calibrated
+        command latency and the shift is undone here.
+        """
+        t = self._opp_token_times()                              # (B, H)
+        source = OPP_TOKEN_PLAN_SOURCE if source is None else source
+        if source not in ("ref", "pred"):
+            raise ValueError(f"plan source must be 'ref' or 'pred', got {source!r}")
+        if source == OPP_TOKEN_PLAN_SOURCE:
+            traj, which = self._plan_traj, "main"
+        else:
+            if not self.opp_token_keep_alt:
+                raise RuntimeError(f"opp_future_columns(source={source!r}) is not this build's "
+                                   f"label ({OPP_TOKEN_PLAN_SOURCE}); set env.opp_token_keep_alt")
+            traj, which = self._plan_alt, "alt"
+        shift = self._plan_clock_shift(which)
+        shift = None if not torch.is_tensor(shift) else shift
+        outs = []
+        for slot in range(rows.shape[1]):
+            kj = rows[:, slot]
+            ts = t if shift is None else (t - shift[kj][:, None]).clamp_min(0.0)
+            body = sample_body_traj(traj[kj], self.tracker.spec.dt, ts)
+            outs.append(to_ego(to_world(body[:, :, :2], self._plan_pose[kj]), st[:, :3]))
+        return torch.stack(outs, 1)
+
+    def opp_tokens(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, opp_token_dim) the privileged opponent block, in `opp_token.opp_token_keys` order.
+
+        **An oracle.** The columns are the simulator's ground truth about the other cars, in the
+        ego's current body frame, normalised by `OPP_TOKEN_SCALE` -- the same scale `future_labels`
+        and the critic's privileged opponent columns use. `f1sim/opp_token.py` documents the layout;
+        the short version is `OPP_TOKEN_CARS` slots ordered by body distance, each
+
+            dx, dy [, dvx, dvy [, (fx, fy) at each of OPP_TOKEN_HORIZONS_S ]], present
+
+        with `present` = 1 only where that slot holds a car inside `overtake_range`, and every other
+        column of the slot multiplied by it, so an absent, out-of-range or not-yet-existing opponent
+        contributes exactly zeros rather than a stale position.
+
+        `dvx, dvy` is the opponent's velocity relative to the ego, taken to the world and rotated
+        into the ego frame -- the same convention `future_labels` uses and deliberately NOT
+        `privileged()`'s `other.vx - ego.vx`, which is a difference of two body-frame speeds in two
+        different frames.
+
+        `fx, fy` is where the opponent's own controller intends to be at that horizon: its plan
+        tracker's reference trajectory, sampled at the horizon plus one control step (see
+        `_opp_token_times`), mapped to the world through the pose the plan was anchored at, and then
+        into the ego's *current* frame. The ego's own future is its own choice and is not subtracted:
+        the column answers "where will that car be", not "where will it be relative to where I will
+        be". The label is validated against the realised future per horizon in
+        `work/oracle-planner/work/label_validation.py`.
+        """
+        if self.opp_token == "off":
+            raise RuntimeError("opp_tokens() on an env built with opp_token 'off'")
+        res = self.last_result if r is None else r
+        if res is None:
+            raise RuntimeError("opp_tokens needs a stepped env: call reset() first")
+        st = res.state
+        e = self.ecfg
+        per = opp_token_car_dim(self.opp_token)
+        out = torch.zeros(self.B, self.opp_token_dim, device=self.device, dtype=st.dtype)
+        if self.opp_token_ablate:
+            # The width the actor's first layer expects, carrying nothing. Zeros and not noise: the
+            # columns were zero at initialisation, so zero is the one value this policy has
+            # certainly seen and the one that cannot be mistaken for an opponent somewhere.
+            return out
+        rows, present_all = self.opp_token_slots(st)
+        n = rows.shape[1]
+        fut = self.opp_future_columns(st, rows) if self.opp_token == "future" else None
+        c, sn = torch.cos(st[:, 2]), torch.sin(st[:, 2])
+        for slot in range(n):
+            kj = rows[:, slot]                                   # (B,) global row of that opponent
+            dn = st[kj, :2] - st[:, :2]
+            present = present_all[:, slot]
+            col = slot * per
+            out[:, col + 0] = present * (dn[:, 0] * c + dn[:, 1] * sn) / OPP_TOKEN_SCALE
+            out[:, col + 1] = present * (-dn[:, 0] * sn + dn[:, 1] * c) / OPP_TOKEN_SCALE
+            k = col + 2
+            if self.opp_token in ("posvel", "future"):
+                co, so = torch.cos(st[kj, 2]), torch.sin(st[kj, 2])
+                vwx = (st[kj, 3] * co - st[kj, 4] * so) - (st[:, 3] * c - st[:, 4] * sn)
+                vwy = (st[kj, 3] * so + st[kj, 4] * co) - (st[:, 3] * sn + st[:, 4] * c)
+                out[:, k + 0] = present * (vwx * c + vwy * sn) / OPP_TOKEN_SCALE
+                out[:, k + 1] = present * (-vwx * sn + vwy * c) / OPP_TOKEN_SCALE
+                k += 2
+            if fut is not None:
+                rel = fut[:, slot] * present[:, None, None] / OPP_TOKEN_SCALE
+                out[:, k:k + 2 * rel.shape[1]] = rel.reshape(self.B, -1)
+                k += 2 * rel.shape[1]
+            out[:, col + per - 1] = present
+        return out
 
     def race_boundary(self, done: torch.Tensor) -> torch.Tensor:
         """(B,) bool: did ANY car sharing this row's race end its episode on this step?

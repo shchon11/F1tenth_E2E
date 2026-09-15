@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..gym_env import OPP_FUTURE_MODELS, OPP_TOKEN_MODES, EnvConfig, opp_token_mode
+from ..gym_env import OPP_FUTURE_MODELS, EnvConfig
 from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events, split_events
 from ..params import Config
@@ -67,6 +67,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              mu: float | None = None, teacher_horizon: float = 1.0,
              teacher_cand_iters: int = 2, teacher_cost: str = "",
              opp_future_model: str = EnvConfig.opp_future_model, opp_extra: dict | None = None,
+             opp_token_ablate: bool = False,
              external: dict | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
@@ -93,10 +94,12 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     has always driven. "interactive" is `f1sim.interactive_teacher`, which scores a family of plans
     against the opponents' predicted motion -- the only one of the two that can demonstrate a pass,
     and the thing `docs/research/interactive-teacher-2026-09-15.md` measures against the other.
-    opp_extra: extra EnvConfig fields (the privileged opponent block) that this function does not
-    have a parameter of its own for. The reactive behaviour probabilities are NOT among them --
-    they travel as `opp_reactive_probs`, which checks them against the events actually named;
-    passing them both ways would reach `EnvConfig` twice under the same keyword.
+    opp_extra: extra `EnvConfig` fields this function has no parameter of its own for. Two things
+    are deliberately NOT among them: the privileged opponent block, which is read off the
+    checkpoint's own spec so that a policy trained with it cannot be scored without it by accident
+    (`f1sim.opp_token`), and the reactive behaviour probabilities, which travel as
+    `opp_reactive_probs` because that route checks them against the events actually named. Either
+    passed twice would reach `EnvConfig` twice under one keyword.
     controller: the arm to install between the policy and the wheels (`grip_runtime.ARMS`).
     `legacy` installs nothing, which is what every caller before 2026-09-13 got. The arm is built
     and installed after `sim.warmup()` for the same reason `ppo.py` builds it after the graph
@@ -133,7 +136,11 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                  "options": dict(external.get("options") or {})}
         driver, metadata = _ma.load_external(entry, device)
     elif not teacher:
-        model, metadata = load_checkpoint(ckpt, device)
+        # allow_oracle: this function builds the simulator, which is the one thing that can produce
+        # the privileged opponent block, and the env below is configured from the checkpoint's own
+        # spec so it produces exactly the one the policy was trained on. Every consumer that cannot
+        # -- the exporter, the ROS node -- still refuses it.
+        model, metadata = load_checkpoint(ckpt, device, allow_oracle=True)
         model.eval()
     mode = ("direct" if external else
             ("plan" if (model is not None and model.meta.get("act_dim", 2) >= 5)
@@ -170,7 +177,16 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      opp_future_model=opp_future_model,
                      **({"action_history": spec["action_history"], "v_max_policy": spec["v_max"]}
                         if external else {}),
+                     opp_token=str(spec.get("opp_token")
+                                   or (model.meta.get("opp_token") if model else None) or "off"),
+                     opp_token_ablate=bool(opp_token_ablate),
                      **(opp_extra or {}))
+    if ecfg.opp_token != "off" and not (race_size > 1 and mode == "plan"):
+        raise ValueError(f"this checkpoint was trained with privileged opponent tokens "
+                         f"(opp_token={ecfg.opp_token!r}); evaluating it needs race_size > 1 and "
+                         f"the plan action space, so that the block exists at all. Got race_size "
+                         f"{race_size}, action mode {mode!r}. Feeding it zeros instead would "
+                         f"measure a policy driving on an input it was trained to believe.")
     if teacher and teacher_kind == "interactive" and not (race_size > 1 and opponent == "teacher"):
         raise ValueError(f"--teacher-kind interactive with race_size {race_size} and opponent "
                          f"{opponent!r}: its opponent term is identically zero without another car, "
@@ -268,8 +284,9 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
         'teacher_speed': float(teacher_speed) if teacher else None,
         'pinned_mu': float(mu) if mu is not None else None,
-        'opp_token': str(env.opp_token_mode or "") or None,
-        'opp_future_model': opp_future_model if env.opp_token_mode else None,
+        'opp_token': (env.opp_token if env.opp_token != "off" else None),
+        'opp_token_ablate': (bool(opp_token_ablate) if env.opp_token != "off" else None),
+        'opp_future_model': opp_future_model if env.opp_token != "off" else None,
         'external': (metadata.get("external") if external else None),
         'deterministic_policy': True,
         'action_mode': mode, 'device': str(device), 'steps': steps, 'step_dt': env.sim.control_dt,
@@ -317,6 +334,13 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--sweep", action="store_true", help="robustness: mu, latency, lidar height")
     ap.add_argument("--per-track", action="store_true")
+    ap.add_argument("--opp-token-ablate", action="store_true",
+                    help="DIAGNOSTIC: run a checkpoint trained with privileged opponent tokens with "
+                         "its block zeroed, keeping the width. It measures how much the policy's "
+                         "driving depends on the oracle -- a large drop means the planner used the "
+                         "information, none means it never read it. Not a deployment path: the "
+                         "checkpoint is still refused by the exporter and the ROS node, and the "
+                         "result is a diagnostic, never a score.")
     ap.add_argument("--protocol", choices=["rolling", "trials"], default="rolling")
     ap.add_argument("--race-size", type=int, default=1)
     ap.add_argument("--opponent", choices=["policy", "teacher"], default="policy")
@@ -378,12 +402,6 @@ def main() -> None:
                     help="the five interactive-teacher cost weights; empty = its defaults")
     ap.add_argument("--opp-future-model", default=EnvConfig.opp_future_model, choices=list(OPP_FUTURE_MODELS),
                     help="which prediction the interactive teacher reads the opponents with")
-    ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
-                    help="build the privileged opponent block in the observation. Needed to score a "
-                         "checkpoint that was TRAINED with one -- its proprio vector is wider than "
-                         "this env's without it. An ORACLE either way: a number obtained with it is "
-                         "not comparable with one obtained without it, and the metadata says which "
-                         "this run was")
     ap.add_argument("--opp-defend-prob", type=float, default=0.0,
                     help="P(a teacher opponent defends the inside line when caught)")
     ap.add_argument("--opp-yield-prob", type=float, default=0.0)
@@ -454,6 +472,7 @@ def main() -> None:
             config.vehicle.wheel_model = a.wheel_model == "on"
         return evaluate(a.ckpt, names, a.envs, a.steps, a.speed_cap, a.device, seed=a.seed, cfg=config,
                         teacher=a.teacher, action_mode=a.action_mode, protocol=a.protocol,
+                        opp_token_ablate=a.opp_token_ablate,
                         race_size=a.race_size, opponent=a.opponent,
                         budget_laps=a.budget_laps if a.budget_laps > 0 else None, max_steps=a.max_steps,
                         raceline_margin=a.raceline_margin, teacher_grip=a.teacher_grip,
@@ -464,7 +483,6 @@ def main() -> None:
                         teacher_horizon=a.teacher_horizon,
                         teacher_cand_iters=a.teacher_cand_iters, teacher_cost=a.teacher_cost,
                         opp_future_model=a.opp_future_model,
-                        opp_extra={"opp_token": opp_token_mode(a.opp_token)},
                         opp_reactive_probs={"defend": a.opp_defend_prob, "yield": a.opp_yield_prob,
                                             "line": a.opp_line_prob,
                                             "oblivious": a.opp_oblivious_prob},

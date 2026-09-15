@@ -30,7 +30,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..gym_env import EnvConfig, OPP_FUTURE_MODELS, OPP_TOKEN_MODES, opp_token_dim, opp_token_mode
+from ..gym_env import EnvConfig, OPP_FUTURE_MODELS
+from ..opp_token import OPP_TOKEN_MODES, validate_opp_token
 from ..mpc import ACT_DIM, N_KNOTS
 from ..interactive_teacher import DEFAULT_OFFSETS, DEFAULT_SPEEDS, InteractiveTeacher, TeacherCost
 from ..params import Config
@@ -351,7 +352,7 @@ def main():
     ap.add_argument("--teacher-cost", default="", metavar="PROG,WALL,OPP,CLEAR,SMOOTH",
                     help="the five cost weights (f1sim.interactive_teacher.TeacherCost); empty = its defaults")
     # ---- the student's inputs and architecture
-    ap.add_argument("--opp-token", default="off", choices=[m for m in OPP_TOKEN_MODES if m != ""],
+    ap.add_argument("--opp-token", default="off", choices=OPP_TOKEN_MODES,
                     help="privileged opponent block in the observation. An ORACLE: the other cars' true relative "
                          "position ('pos'), velocity ('posvel') and future ('future'), from the simulator. "
                          "Refused by the exporter and by the ROS node; a checkpoint trained with it is a "
@@ -398,7 +399,7 @@ def main():
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
     opp_cfg.validate(a)
-    token = opp_token_mode(a.opp_token)
+    token = validate_opp_token(a.opp_token)
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
@@ -416,7 +417,7 @@ def main():
                          "single steps, so a per-step weighting has no sample to apply to. Drop one.")
     if a.envs % a.race_size:
         raise SystemExit(f"--envs {a.envs} is not a multiple of --race-size {a.race_size}.")
-    if token and a.race_size < 2:
+    if token != "off" and a.race_size < 2:
         raise SystemExit(f"--opp-token {a.opp_token} with --race-size {a.race_size}: the block describes the "
                          f"other cars of a race and there are none.")
     device = torch.device(a.device)
@@ -445,9 +446,9 @@ def main():
     chan = scan_channel_spec({"channels": a.scan_channels, "memory_tau_s": a.scan_memory_tau}) if a.scan_channels else None
     mem_spec = memory_spec(hidden_size=a.memory_hidden) if a.memory != "off" else None
     if a.init:
-        if mem_spec or chan or token:
+        if mem_spec or chan or token != "off":
             model, _extra, fresh = load_for_memory(a.init, device, memory=mem_spec, scan_channels=chan,
-                                                   opp_token_dim=opp_token_dim(token),
+                                                   opp_token=(token if token != "off" else None),
                                                    override={"n_stack": spec.scan_stack,
                                                              "n_beams": spec.n_beams,
                                                              "priv_dim": priv_dim,

@@ -17,8 +17,12 @@ Three details worth stating, because each was a choice:
 * **Columns, not a form per car.** A table is the thing that lets someone see at a glance that row 2
   is the only one with events; a stack of identical forms hides exactly that. The table scrolls
   horizontally in the narrow driving panel, which is the price.
-* **A kind the tree does not have is listed and disabled.** `interactive` (worker 17's teacher) is in
-  the combo, greyed, with the reason in its tooltip. Leaving it out would make "there is no such
+* **The teacher is a selection, and a kind the tree does not have is listed and disabled.** The
+  combo offers `raceline` (the teacher this viewer has always run) and `interactive`
+  (`f1sim.interactive_teacher`, which scores its plans against where the other cars are predicted to
+  be) side by side, with 기본 and 업그레이드 티처 as the two presets, so choosing the upgraded
+  teacher is one click and choosing it is what it takes. A kind whose module is missing is still in
+  the combo, greyed, with the reason in its tooltip: leaving it out would make "there is no such
   thing" and "it has not merged yet" look the same.
 * **The checkpoint cell says what the file is.** Its controller arm and whether it carries memory
   decide whether it can drive at all, and the loader's refusal is shown here rather than at start.

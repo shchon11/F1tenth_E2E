@@ -121,19 +121,19 @@ class PolicyNode(Node):
         self.declare_parameter("perception_topic", "/f1sim/policy/perception")
         p = lambda n: self.get_parameter(n).value
         self.device = torch.device(p("device"))
+        # No `allow_oracle` and no parameter to set one. A checkpoint trained with privileged
+        # opponent tokens (`f1sim.opp_token`) reads the simulator's exact description of the other
+        # cars -- position, velocity and their own intended trajectory up to 0.75 s ahead. The car
+        # has no source for any of it, and feeding zeros would run a policy that was trained to
+        # believe those columns on a lie, at speed, next to a wall. `load_checkpoint` refuses it
+        # here, and `ObsBuilder` below refuses the same spec independently, so neither a checkpoint
+        # with the metadata nor one with only the spec can reach the wheels.
         ckpt = str(p("checkpoint"))
         self.model, extra = load_checkpoint(ckpt, self.device); self.model.eval()
         self.spec = ObsSpec(**extra["spec"]) if extra.get("spec") else ObsSpec()
-        if self.spec.opp_token:
-            # The privileged opponent block (`gym_env.OPP_TOKEN_MODES`) is the simulator's ground
-            # truth about the other cars -- where they are, how fast, and where they will be. No
-            # sensor on this car produces it. A checkpoint trained on it is an oracle arm and an
-            # experimental result; driving a real car with zeros in those columns would run a
-            # policy on an input that permanently says "no car is anywhere near".
-            raise ValueError(
-                f"checkpoint declares the privileged opponent block opp_token="
-                f"{self.spec.opp_token!r} (future model "
-                f"{self.spec.opp_future_model!r}). It is a simulator oracle and is not deployable.")
+        # `ObsSpec.opp_token` is "off" when there is none -- a STRING, so `if self.spec.opp_token`
+        # is true for every checkpoint. The refusal is `ObsBuilder`'s, on the next line, and it is
+        # the right place for it: the builder is what would have to produce the block on the car.
         self.obs = ObsBuilder(self.spec, self.device)
         self.checkpoint_id = checkpoint_id(ckpt)
         #: The policy's episode state: the recurrent hidden state and the decayed scan-occupancy

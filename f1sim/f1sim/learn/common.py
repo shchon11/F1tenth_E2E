@@ -278,7 +278,7 @@ def obs_spec(env: F1VecEnv) -> ObsSpec:
     return ObsSpec(n_beams=env.n_beams, scan_stack=e.scan_stack, scan_stride=e.scan_stride, action_history=e.action_history,
                    act_dim=env.act_dim, hist_len=e.hist_len, hist_stride=e.hist_stride, range_max=env.range_max, v_max=e.v_max_policy,
                    gyro_scale=e.imu_gyro_scale, accel_scale=e.imu_accel_scale,
-                   opp_token=env.opp_token_mode, opp_future_model=e.opp_future_model)
+                   opp_token=env.opp_token)
 
 
 def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0.0):

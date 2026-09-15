@@ -392,9 +392,27 @@ def cmd_run(a) -> int:
     ident0 = suite_mod.protocol_identity(s, entry)
     by_id = {c.cell_id(): c for c in s.cells()}
     done = _resume(path, ident0, by_id, entry, suite_obj=s)
+    # `--only` selects which of the frozen suite's cells are executed and nothing else: the rows
+    # written are the rows an unfiltered run would write, cell for cell, and `protocol_identity` is
+    # untouched, so a filtered file resumes into a full one and vice versa. What it does NOT do is
+    # make a partial file a leaderboard row -- `report` still requires the suite's cells to be
+    # present, and a filtered run is a family table, not a score.
+    #
+    # It exists because a system may be *unscoreable* on part of the suite rather than merely
+    # expensive there: a policy trained with privileged opponent tokens (`f1sim.opp_token`) has no
+    # observation at all in a solo cell, and `model_adapter.build_cell` refuses to invent one.
+    want = set((a.only or "").split(",")) if a.only else None
+    cells = [c for c in s.cells()
+             if want is None or c.suite in want or f"{c.suite}:{c.variant}" in want]
+    if want is not None:
+        print(f"--only {a.only}: {len(cells)} of {len(s.cells())} cells; this file is a family "
+              f"table and not a leaderboard row", file=sys.stderr)
+        if not cells:
+            print(f"--only {a.only} selected no cell of this suite", file=sys.stderr)
+            return 2
     written = 0
     with open(path, "a") as fh:
-        for cell in s.cells():
+        for cell in cells:
             key = cell.cell_id()
             if key in done:
                 continue
@@ -773,6 +791,10 @@ def main(argv=None) -> int:
     q.add_argument("--lease", action="store_true",
                    help="exclusive GPU access granted; without it `run` verifies and refuses")
     q.add_argument("--estimator", help="pinned frozen student for the independence gate")
+    q.add_argument("--only", help="comma-separated families or family:variant to run "
+                                  "(e.g. 'T' or 'T:pace'). Selects cells of the frozen suite and "
+                                  "changes nothing about how any of them is measured; the result "
+                                  "is a family table, not a leaderboard row.")
     q.add_argument("--gate-steps", type=int, default=60,
                    help="must exceed the estimator's warm_frames or the gate cannot cover warm")
 

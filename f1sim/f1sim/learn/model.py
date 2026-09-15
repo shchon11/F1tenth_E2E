@@ -752,6 +752,58 @@ def _float_pair(mot):
     return (None if a is None else a.float(), None if b is None else b.float())
 
 
+def name_seed(seed: int, name: str) -> int:
+    """A stable per-module seed from `(run seed, module path)`.
+
+    Copied from branch `feat/motion-memory` (`learn/model.py`, worker 15) rather than rewritten: the
+    problem and the fix are identical here, and two implementations of the same discipline is how
+    two branches stop being comparable.
+
+    `hash()` is salted per process for strings, so two runs of the same command would disagree; a
+    digest is stable across processes, machines and Python versions, which is what "reproducible
+    from a seed" has to mean.
+    """
+    import hashlib
+    d = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
+    return (int(seed) ^ int.from_bytes(d, "big")) % (2 ** 31 - 1)
+
+
+def reinit_fresh_by_name(model, fresh, seed: int) -> list:
+    """Re-initialise every module whose parameters are all new, from its own NAME. Returns the list.
+
+    Also from `feat/motion-memory`, and needed here for the same reason and a second one. Theirs:
+    two arms that differ only in how many scan channels they enable do not differ only in that --
+    the wider first convolution has more parameters, so it draws more numbers from the ambient
+    generator, so every module built after it (the GRUs a warm start leaves fresh) gets different
+    weights from the same `--seed`; measured, `actor.memory.gru.weight_ih_l0` differed by up to
+    0.176 between two arms meant to differ by one flag. Ours: the four arms of this branch differ by
+    the WIDTH OF THE PROPRIO VECTOR (0 / 6 / 10 / 26 extra columns), which moves `actor.pro.0` and
+    `critic.pro.0` by exactly the same mechanism. Without this, "A3 beats A0" could be four
+    different GRU initialisations.
+
+    Seeding each fresh module from `(seed, its own qualified name)` removes it: a module of the same
+    shape and the same name is initialised identically whatever was built before it. Modules are
+    re-initialised through their own `reset_parameters`, so each keeps the distribution PyTorch
+    gives it rather than one invented here.
+
+    Only modules ALL of whose direct parameters are fresh are touched -- a module holding a single
+    copied weight is left exactly as the checkpoint wrote it.
+    """
+    done = []
+    fresh = set(fresh)
+    for name, mod in model.named_modules():
+        own = [f"{name}.{p}" if name else p for p, _ in mod.named_parameters(recurse=False)]
+        if not own or not all(o in fresh for o in own):
+            continue
+        if not hasattr(mod, "reset_parameters"):
+            continue
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(name_seed(seed, name))
+            mod.reset_parameters()
+        done.append(name)
+    return done
+
+
 def scan_channel_spec(scan_channels: Optional[dict]) -> dict:
     """The validated `meta["scan_channels"]` block, or `{}` when no channel is enabled.
 
@@ -828,7 +880,7 @@ class ActorCritic(nn.Module):
                  memory: Optional[dict] = None, scan_channels: Optional[dict] = None,
                  future_head: Optional[dict] = None, motion: Optional[dict] = None,
                  motion_heads: Optional[Sequence[str]] = None,
-                 floor_head: Optional[dict] = None):
+                 floor_head: Optional[dict] = None, opp_token: Optional[str] = None):
         super().__init__()
         mem = memory_spec(**memory) if memory else None
         chan = scan_channel_spec(scan_channels)
@@ -899,6 +951,18 @@ class ActorCritic(nn.Module):
             self.meta["future_head"] = dict(self.actor.future_spec)
         if fl_head:
             self.meta["floor_head"] = dict(self.actor.floor_spec)
+        # Declarative only: the block is part of `proprio_dim` above, so nothing here builds a
+        # module. What it buys is that the *loader* can refuse the checkpoint (`load_checkpoint`'s
+        # `allow_oracle`), which is the one place every consumer -- exporter, ROS node, viewer,
+        # benchmark -- goes through. `extra["spec"]` records the same fact for a reader; `meta` is
+        # what travels with the weights.
+        if opp_token and str(opp_token) != "off":
+            from ..opp_token import opp_token_dim, validate_opp_token
+            mode = validate_opp_token(opp_token)
+            self.meta["opp_token"] = mode
+            if proprio_dim <= opp_token_dim(mode):
+                raise ValueError(f"proprio_dim {proprio_dim} cannot hold the opponent token block "
+                                 f"({opp_token_dim(mode)} columns) and an observation as well")
 
     @property
     def has_memory(self) -> bool:
@@ -1073,10 +1137,45 @@ def _refuse_controller(ck: dict, path, allow_controller: bool) -> str:
     return arm
 
 
+def oracle_inputs_of(ck: dict) -> str:
+    """The privileged observation block a checkpoint was trained with, or "off".
+
+    Read from `meta` (where `ActorCritic` records it) and, failing that, from `extra["spec"]`
+    (where the trainer records the whole `ObsSpec`). Both, because the two are written by different
+    code paths and a checkpoint that has only one of them is still an oracle.
+    """
+    meta = ck.get("meta") or {}
+    mode = meta.get("opp_token") or ((ck.get("extra") or {}).get("spec") or {}).get("opp_token")
+    return str(mode or "off")
+
+
+def _refuse_oracle(ck: dict, path, allow_oracle: bool) -> str:
+    """A policy trained on privileged opponent tokens cannot be deployed, exported or benchmarked
+    as a LiDAR-only policy.
+
+    `f1sim.opp_token` is the simulator's ground truth about the other cars -- exact relative
+    position, exact velocity, and the opponent's own intended trajectory up to 0.75 s ahead. The
+    real car has none of it and there is no degraded substitute: a policy that was trained to
+    believe those columns and is then fed zeros is a policy driving on a lie. So the default is
+    refusal, and a caller that runs the simulator (which can produce the block) opts in -- the same
+    posture `allow_conditional` and `allow_controller` take, for the same reason.
+    """
+    mode = oracle_inputs_of(ck)
+    if mode != "off" and not allow_oracle:
+        raise ValueError(
+            f"{os.path.basename(str(path))} was trained with privileged opponent tokens "
+            f"(opp_token='{mode}'). They are an ORACLE produced by the simulator: the car cannot "
+            f"build them, so this checkpoint is not deployable and must not be exported. It can "
+            f"only be run inside a simulator that supplies the same block -- pass allow_oracle=True "
+            f"from such a caller. See docs/research/oracle-planner-2026-09-15.md.")
+    return mode
+
+
 def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
                     allow_conditional: bool = False, strict_names: bool = False,
                     priv_adapter: Optional[str] = None,
-                    allow_controller: bool = False) -> Tuple[ActorCritic, dict]:
+                    allow_controller: bool = False,
+                    allow_oracle: bool = False) -> Tuple[ActorCritic, dict]:
     """override: meta fields to change (e.g. priv_dim for a multi-car critic, scan_stack); tensors whose
     shape no longer matches are left at their fresh initialization and listed in extra["skipped"].
 
@@ -1086,7 +1185,9 @@ def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
     `None` (the default) leaves whatever the checkpoint recorded.
 
     `allow_controller` gates a checkpoint trained against a non-legacy plan controller -- see
-    `_refuse_controller`.
+    `_refuse_controller`. `allow_oracle` gates one trained on privileged opponent tokens -- see
+    `_refuse_oracle`; it is off by default, so the exporter and the ROS node refuse such a
+    checkpoint without having to know it exists.
 
     `allow_conditional` gates checkpoints that need an input the caller may not be able to produce.
     A conditional actor requires an explicit `c` at every forward, and a lab-oracle arm's `c` is the
@@ -1104,6 +1205,7 @@ def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")
     _refuse_controller(ck, path, allow_controller)
+    _refuse_oracle(ck, path, allow_oracle)
     if priv_adapter is not None:
         meta["priv_adapter"] = priv_adapter
     from .conditioning import CondSpec
@@ -1193,6 +1295,57 @@ def load_for_conditioning(path, device, cond_dim: int, cond_meta: dict,
     return m, extra, sorted(fresh)
 
 
+def _proprio_growth(name: str, src: torch.Tensor, dst: torch.Tensor, p_old: int, k: int):
+    """Where the `k` new proprio columns sit in a first-layer weight, or None if this is not one.
+
+    The actor's proprio MLP takes the proprio vector alone, so the new columns are the trailing
+    ones. The critic's takes `cat([proprio, priv])`, so they are INSERTED at `p_old` and every
+    privileged column shifts right. Getting that wrong is silent: the shapes match either way, and
+    the critic would simply read the wrong number for every privileged input it has.
+
+    Returns `(before, after)`: how many of the destination's columns come from the source's head and
+    from its tail, with `k` zeros between them.
+    """
+    if src.dim() != 2 or dst.dim() != 2 or src.shape[0] != dst.shape[0]:
+        return None
+    if dst.shape[1] != src.shape[1] + k:
+        return None
+    if name.startswith("actor."):
+        if src.shape[1] != p_old:
+            return None
+        return (p_old, 0)
+    if name.startswith("critic."):
+        if src.shape[1] < p_old:
+            return None
+        return (p_old, src.shape[1] - p_old)
+    return None
+
+
+def grow_proprio_moment(name: str, saved: torch.Tensor, target: torch.Tensor,
+                        p_old: int, k: int) -> Optional[torch.Tensor]:
+    """A saved optimiser moment for a proprio input layer, widened to the token block's layout.
+
+    Adam's `exp_avg` and `exp_avg_sq` are element-wise, so they move with the weight: the block's
+    own columns get 0, which is what Adam holds for a coefficient that has not had a gradient yet,
+    and every original column keeps its moment. Without this the two widened layers' moments would
+    be *dropped* in the oracle arms and *restored* in the control, which is a second difference
+    between arms that are supposed to differ by their input width alone.
+
+    Returns None when this tensor is not one of the two, or does not line up.
+    """
+    if saved.shape == target.shape:
+        return saved
+    split = _proprio_growth(name, saved, target, p_old, k)
+    if split is None:
+        return None
+    before, after = split
+    out = torch.zeros_like(target)
+    out[:, :before] = saved[:, :before].to(out.dtype)
+    if after:
+        out[:, before + k:] = saved[:, before:].to(out.dtype)
+    return out
+
+
 def load_for_memory(path, device, memory: Optional[dict] = None,
                     scan_channels: Optional[dict] = None,
                     priv_adapter: Optional[str] = None, override: Optional[dict] = None,
@@ -1201,9 +1354,9 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                     future_head: Optional[dict] = None,
                     motion: Optional[dict] = None,
                     motion_heads: Optional[Sequence[str]] = None,
-                    init_seed: Optional[int] = None,
-                    opp_token_dim: int = 0,
-                    floor_head: Optional[dict] = None) -> Tuple[ActorCritic, dict, list]:
+                    floor_head: Optional[dict] = None,
+                    opp_token: Optional[str] = None,
+                    init_seed: Optional[int] = None) -> Tuple[ActorCritic, dict, list]:
     """Load a feedforward checkpoint into a recurrent actor-critic, by name, preserving every weight.
 
     Warm start, not re-initialisation. The memory is an addition to the original network, so at
@@ -1228,17 +1381,24 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     given and the trunk features otherwise, so which it is follows from this call rather than being
     a second thing to keep in step.
 
-    `opp_token_dim` widens the *proprio* input by that many columns on the same terms
-    (`gym_env.OPP_TOKEN_MODES`). The block is appended after every proprio key the observation
-    already had, so in the actor the new columns go on the end; in the critic the input is
-    `cat([proprio, priv])`, so they are INSERTED at the old proprio width and the privileged columns
-    keep their meaning. Zeroed either way, so forward is bit-identical and the oracle starts as an
-    input the network ignores.
-
     `floor_head` adds the per-beam floor head (`learn.floor_head`) on the identical terms, and it
     is the fourth family of tensors allowed to be new. Its output convolution is zero, so at step 0
     it predicts 0.5 for every beam and changes nothing else; it is never exported and the actor's
     forward never calls it.
+
+    `opp_token` adds the privileged opponent block (`f1sim.opp_token`) to the observation, which
+    widens the proprio vector. The two first linear layers that read it gain input columns, and the
+    new ones are **zero**, so the warm start is bit-identical in the same sense the scan channels
+    are: the block starts as an input the network ignores and can learn to use. The actor's new
+    columns are appended; the critic's are inserted before its privileged columns, because its
+    proprio MLP reads `cat([proprio, priv])` -- see `_proprio_growth`. This is an ORACLE and the
+    checkpoint records it, so every loader that is not a simulator refuses to open the result.
+
+    `init_seed` re-initialises every module a warm start leaves entirely fresh from its own name
+    (`reinit_fresh_by_name`), then re-zeroes the projections. It is what makes arms that differ by
+    an input width comparable: without it the wider first layer consumes different draws from the
+    ambient generator and every module built after it differs too. `None` is the previous
+    behaviour exactly.
 
     `memory` may be None: extra scan channels alone are a legitimate arm, and they need the same
     by-name transfer and the same zeroed new columns. At least one of the four must be asked for,
@@ -1291,20 +1451,6 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         meta["motion"] = motion_spec(**motion)
         if motion_heads:
             meta["motion_heads"] = [h for h in ("mask", "dv") if h in motion_heads]
-    g_tok = int(opp_token_dim)
-    if g_tok < 0:
-        raise ValueError(f"opp_token_dim must be >= 0, got {opp_token_dim}")
-    if g_tok:
-        # The target width is the CHECKPOINT's plus the block, whether or not the caller also
-        # overrode `proprio_dim` with the env's (which is the same number). Adding to an already
-        # widened override would build a network wider than either.
-        p_base = int(ck["meta"]["proprio_dim"])
-        want = p_base + g_tok
-        if int(meta["proprio_dim"]) not in (p_base, want):
-            raise ValueError(f"proprio_dim override {meta['proprio_dim']} is neither the "
-                             f"checkpoint's {p_base} nor that plus the {g_tok}-column privileged "
-                             f"opponent block ({want}).")
-        meta["proprio_dim"] = want
     if floor_head:
         from .floor_head import floor_head_spec as _fhs
         if str(meta.get("scan_stem")) != "resnet":
@@ -1313,10 +1459,27 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                 f"{os.path.basename(str(path))} has {meta.get('scan_stem')!r}. See "
                 f"`ScanStem.beam_channels`: the plain stack has no whole-scan context to read.")
         meta["floor_head"] = _fhs(**floor_head)
-    if not (memory or chan or future_head or motion or g_tok or floor_head):
+    token = "off" if opp_token is None else str(opp_token)
+    if token != "off":
+        from ..opp_token import opp_token_dim, validate_opp_token
+        token = validate_opp_token(token)
+        if oracle_inputs_of(ck) != "off":
+            raise ValueError(f"{os.path.basename(str(path))} already carries opponent tokens "
+                             f"({oracle_inputs_of(ck)}); warm-starting them from it would zero "
+                             f"input columns that are already trained. Resume it with "
+                             f"load_checkpoint(allow_oracle=True) instead.")
+        meta["opp_token"] = token
+    if not (memory or chan or future_head or motion or floor_head) and token == "off":
         raise ValueError("load_for_memory with neither memory, a scan channel, a future head, a "
-                         "motion branch, a floor head nor a privileged opponent block would be "
+                         "motion branch, a floor head nor an opponent token would be "
                          "load_checkpoint with extra steps; call that instead.")
+    p_old = int(ck["meta"].get("proprio_dim", 0))
+    k_tok = opp_token_dim(token) if token != "off" else 0
+    if k_tok and int(meta.get("proprio_dim", 0)) != p_old + k_tok:
+        raise ValueError(f"opp_token {token!r} adds {k_tok} proprio columns to the checkpoint's "
+                         f"{p_old}, i.e. {p_old + k_tok}, but this run's observation spec says "
+                         f"{meta.get('proprio_dim')}. The block is appended after every existing "
+                         f"key, so anything else means the two sides disagree about the layout.")
     m = ActorCritic(**meta).to(device)
     sd = m.state_dict()
     src = ck["state_dict"]
@@ -1330,7 +1493,7 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     #: name -> (column the zeros are inserted at, how many). Everything left of it keeps its index
     #: and everything right of it is shifted, which is what makes the forward bit-identical.
     grown = {}
-    p0 = int(ck["meta"]["proprio_dim"])              # the checkpoint's own proprio width
+    widened = {}                                    # name -> (columns before the block, columns after)
     unused, mismatched = [], []
     for k, v in src.items():
         if k not in sd:
@@ -1343,12 +1506,13 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                 and sd[k].shape[0] == v.shape[0] and sd[k].shape[2] == v.shape[2]
                 and sd[k].shape[1] == v.shape[1] + len(chan["channels"])):
             grown[k] = (v.shape[1], len(chan["channels"]))
+            continue
         # The other is the proprio embedding gaining the privileged opponent block. The actor's
         # input is the proprio vector, so the columns go on the end; the critic's is
-        # cat([proprio, priv]), so they go in at the old proprio width.
-        elif (g_tok and k in ("actor.pro.0.weight", "critic.pro.0.weight") and v.dim() == 2
-              and sd[k].shape[0] == v.shape[0] and sd[k].shape[1] == v.shape[1] + g_tok):
-            grown[k] = (v.shape[1] if k.startswith("actor.") else p0, g_tok)
+        # cat([proprio, priv]), so they go in at the old proprio width -- `_proprio_growth`.
+        split = _proprio_growth(k, v, sd[k], p_old, k_tok) if k_tok else None
+        if split is not None:
+            widened[k] = split
         else:
             mismatched.append((k, tuple(v.shape), tuple(sd[k].shape)))
     fresh = [k for k in sd if k not in src]
@@ -1370,12 +1534,11 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     if chan and n_conv != 2:
         raise ValueError(f"expected the actor's and the critic's first convolution to grow by "
                          f"{len(chan['channels'])} input channel(s); {n_conv} did: {sorted(grown)}")
-    if g_tok and not {"actor.pro.0.weight", "critic.pro.0.weight"} <= set(grown):
-        raise ValueError(f"expected the actor's and the critic's proprio embedding to grow by "
-                         f"{g_tok} input column(s) for the privileged opponent block; grown: "
-                         f"{sorted(grown)}. A proprio width that changes the embedding's *output* "
-                         f"width too (the 32-column threshold in `Actor.__init__`) cannot be warm "
-                         f"started this way.")
+    if k_tok and sorted(widened) != ["actor.pro.0.weight", "critic.pro.0.weight"]:
+        raise ValueError(f"expected exactly the actor's and the critic's proprio input layer to "
+                         f"gain {k_tok} column(s); {sorted(widened)} did. A proprio MLP whose width "
+                         f"did not change is one that is not reading the block, and one that "
+                         f"changed elsewhere is a re-layout rather than an append.")
     with torch.no_grad():
         for k, v in src.items():
             if k in grown:
@@ -1385,6 +1548,13 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                 w[:, :at] = v[:, :at]                        # originals keep their index ...
                 w[:, at + n:] = v[:, at:]                    # ... and the new columns are 0
                 sd[k] = w
+            elif k in widened:
+                before, after = widened[k]
+                w = torch.zeros_like(sd[k])
+                w[:, :before] = v[:, :before].to(sd[k].dtype)
+                if after:
+                    w[:, before + k_tok:] = v[:, before:].to(sd[k].dtype)
+                sd[k] = w                                    # the block's own columns stay 0
             else:
                 sd[k] = v
     m.load_state_dict(sd)
@@ -1402,12 +1572,16 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
             for head in (m.actor.future, m.actor.opp_mask, m.actor.dv):
                 if head is not None:
                     head.net[2].weight.zero_(); head.net[2].bias.zero_()
-        if not renamed:
+        #: `and fresh`: an arm whose only addition is the opponent block has NO fresh tensor at all
+        #: (the block is zeroed columns of an existing layer), and `--name-seed-fresh` on it is a
+        #: no-op rather than a mistake. Without the guard the control arm of the oracle experiment
+        #: could not be launched with the same flags as the arms it controls for.
+        if not renamed and fresh:
             raise RuntimeError(
                 f"init_seed={init_seed} was given and no fresh module was re-initialised from its "
-                f"name. Either there is nothing fresh (use load_checkpoint) or the fresh names no "
-                f"longer match the modules, which would leave the arms differently initialised "
-                f"while claiming they are not.")
+                f"name, although {len(fresh)} tensor(s) are fresh. The fresh names no longer match "
+                f"the modules, which would leave the arms differently initialised while claiming "
+                f"they are not.")
     # The claim the whole warm start rests on, checked rather than assumed. RuntimeError, not
     # assert: `python -O` strips asserts and this is what makes the result the original at step 0.
     for who, mod in (("actor", m.actor), ("critic", m.critic)):

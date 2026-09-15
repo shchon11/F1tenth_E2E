@@ -23,6 +23,20 @@ from typing import Dict, List, Optional
 
 from ... import tracks
 
+#: Where the teacher / opponent KINDS live, and why they are not here. The console's 상대차 table
+#: offers `raceline` (the teacher this viewer has always run) and `interactive`
+#: (`f1sim.interactive_teacher`, which scores its candidate plans against where the other cars are
+#: predicted to be) as a SELECTION, plus `policy` and `self`. That list is
+#: `f1sim.opponent_slots.KINDS` -- one registry, read by the widget, by `--opp-slots` and by the
+#: env, because a second copy here would be a second answer to "which teachers are there" and the
+#: whole point of the registry is that a kind the tree does not carry is *listed and refused*
+#: rather than silently mapped onto the raceline teacher.
+#:
+#: It is not re-exported from this module on purpose: `f1sim.opponent_slots` reaches
+#: `f1sim.opponent_events`, which imports torch, and this module is the one the first paint needs.
+#: `viewer/console/opponent_table.py` imports it directly and pays that cost once, in the widget.
+TEACHER_KINDS_MODULE = "f1sim.opponent_slots"
+
 RUNS_DIR = os.path.join(os.path.expanduser("~"), "f1sim_runs")
 CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt")
 

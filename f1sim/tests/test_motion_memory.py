@@ -514,17 +514,30 @@ def test_the_motion_branch_is_seeded_by_name_too(tmp_path):
         assert torch.equal(only_mask[n], both[n]), n
 
 
-def test_init_seed_refuses_a_load_with_nothing_fresh(tmp_path):
-    """A silent no-op here would leave two arms differently initialised while claiming otherwise."""
+def test_init_seed_with_nothing_fresh_is_a_no_op_and_not_a_refusal(tmp_path):
+    """`init_seed` and nothing fresh: the load is unchanged, and that is deliberate.
+
+    This branch originally refused it -- a silent no-op would leave two arms differently
+    initialised while claiming otherwise. `feat/oracle-planner` needs the opposite, for a reason
+    that is stronger: its A0 CONTROL arm adds only zeroed proprio columns to an existing layer, so
+    it has no fresh tensor at all, and it has to be launchable with the same command line as the
+    three arms it controls for. The merged rule is worker 16's -- raise only when something IS
+    fresh and no name matched it, which is the case the guard was written for -- so what is pinned
+    here is that the no-op really is one, byte for byte.
+    """
     torch.manual_seed(5)
     base = ActorCritic(**SMALL).eval()
     path = str(tmp_path / "base.pt")
     save_checkpoint(path, base, {"spec": {}})
     spec = ObsSpec(n_beams=SMALL["n_beams"], scan_stack=6, act_dim=8, action_history=2, hist_len=0)
     chan = {"channels": ["aligned"], "aligned": {"proprio": motion_index_spec(spec)}}
-    with pytest.raises(RuntimeError, match="no fresh module"):
-        # extra channels alone add no parameter at all, so there is nothing to seed
-        load_for_memory(path, "cpu", None, scan_channels=chan, init_seed=701)
+    # extra channels alone add no parameter at all, so there is nothing to seed
+    seeded, _e1, fresh = load_for_memory(path, "cpu", None, scan_channels=chan, init_seed=701)
+    plain, _e2, fresh2 = load_for_memory(path, "cpu", None, scan_channels=chan)
+    assert fresh == [] and fresh2 == []
+    a, b = seeded.state_dict(), plain.state_dict()
+    assert set(a) == set(b)
+    assert all(torch.equal(a[k], b[k]) for k in a), "init_seed moved a weight with nothing fresh"
 
 
 # ------------------------------------------------------------------ end to end

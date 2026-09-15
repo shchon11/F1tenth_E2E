@@ -396,18 +396,25 @@ def test_a_resume_keeps_what_the_checkpoint_has_instead_of_warm_starting_it_agai
     from f1sim.learn.ppo import warm_start_additions
     mem, chan, fut = memory_spec(hidden_size=32), {"channels": ["edges"]}, future_spec()
     flh = floor_head_spec()
-    # nothing there yet: all four are a warm start
-    assert warm_start_additions({}, mem, chan, fut, flh) == (mem, chan, fut, flh)
+    tok = "posvel"                                  # the privileged opponent block, routed the same
+    # nothing there yet: all five are a warm start
+    assert warm_start_additions({}, mem, chan, fut, flh, tok) == (mem, chan, fut, flh, tok)
     # everything there: none of them is, and `load_checkpoint` takes it back whole
-    have = {"memory": mem, "scan_channels": chan, "future_head": fut, "floor_head": flh}
-    assert warm_start_additions(have, mem, chan, fut, flh) == (None, None, None, None)
+    have = {"memory": mem, "scan_channels": chan, "future_head": fut, "floor_head": flh,
+            "opp_token": tok}
+    assert warm_start_additions(have, mem, chan, fut, flh, tok) == (None,) * 5
     # a run that adds the head to an existing recurrent checkpoint adds only the head
-    assert warm_start_additions({"memory": mem, "scan_channels": chan}, mem, chan, fut) == (None, None, fut, None)
+    assert warm_start_additions({"memory": mem, "scan_channels": chan}, mem, chan, fut) == (
+        None, None, fut, None, None)
     # and a flag not passed stays not passed
-    assert warm_start_additions({}, None, None, fut) == (None, None, fut, None)
-    # the per-beam floor head routes the same way, and independently of the future head
-    assert warm_start_additions({"future_head": fut}, None, None, fut, flh) == (None, None, None, flh)
-    assert warm_start_additions({"floor_head": flh}, None, None, fut, flh) == (None, None, fut, None)
+    assert warm_start_additions({}, None, None, fut) == (None, None, fut, None, None)
+    # the per-beam floor head and the opponent block route the same way, each independently
+    assert warm_start_additions({"future_head": fut}, None, None, fut, flh, tok) == (
+        None, None, None, flh, tok)
+    assert warm_start_additions({"floor_head": flh}, None, None, fut, flh, tok) == (
+        None, None, fut, None, tok)
+    assert warm_start_additions({"opp_token": tok}, None, None, fut, flh, tok) == (
+        None, None, fut, flh, None)
 
 
 # ------------------------------------------------------------------ the probe

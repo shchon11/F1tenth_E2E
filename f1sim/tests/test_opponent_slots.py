@@ -638,3 +638,42 @@ def test_the_census_reports_one_row_per_slot():
     assert rows[0]["reactive_car_seconds"]["defend"] >= 0.0
     from f1sim.learn.opponent_census import format_report
     assert "per slot" in format_report(census.report())
+
+
+# ============================================ the teacher is a SELECTION, both presets reachable
+#
+# The user's question, as tests: "비쥬얼라이저의 티쳐는 그 업그레이드된 티쳐로 동작하는거지?"
+# It does when it is chosen, and the raceline teacher is still there when it is not.
+def test_the_two_teacher_presets_differ_by_the_teacher_and_nothing_else():
+    basic = osl.preset("basic", 2)
+    upgraded = osl.preset("interactive", 2)
+    assert [s.kind for s in basic] == ["raceline", "raceline"]
+    assert [s.kind for s in upgraded] == ["interactive", "interactive"]
+    # every other field identical, so choosing the upgrade changes the teacher and not the race
+    import dataclasses
+    for a, b in zip(basic, upgraded):
+        da, db = dataclasses.asdict(a), dataclasses.asdict(b)
+        da.pop("kind"); db.pop("kind")
+        assert da == db, "the two presets differ by more than the teacher"
+    osl.validate_slots(upgraded, 3, require_files=False)
+
+
+def test_the_upgraded_preset_actually_builds_the_interactive_teacher():
+    from f1sim.interactive_teacher import InteractiveTeacher
+    env = _slot_env([d.to_dict() for d in osl.preset("interactive", 2)], envs=12)
+    env.reset(seed=13)
+    assert env.alt_teacher_kinds == ("interactive",)
+    assert isinstance(env.alt_teachers[0], InteractiveTeacher)
+    # both opponent rows, and not the learner
+    assert env.alt_teacher_mask["interactive"].view(-1, 3)[0].tolist() == [False, True, True]
+
+
+def test_the_upgraded_preset_is_refused_by_name_on_a_tree_without_the_module(monkeypatch):
+    """Not silently mapped onto the raceline teacher, which would be a session whose label lies."""
+    kind = osl.kind_of("interactive")
+    import dataclasses
+    absent = dataclasses.replace(kind, module="f1sim.not_merged_yet")
+    monkeypatch.setitem(osl.KIND_BY_NAME, "interactive", absent)
+    with pytest.raises(ValueError) as exc:
+        osl.validate_slots(osl.preset("interactive", 2), 3, require_files=False)
+    assert "interactive" in str(exc.value)

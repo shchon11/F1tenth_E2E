@@ -143,7 +143,7 @@ It is now a **table**: `레이스당 차량 수 - 1` rows, one per grid slot.
 | column | control | notes |
 | --- | --- | --- |
 | 차량 | the slot number | 1 … `race_size - 1`; the learner is car 0 and is not in the table |
-| 종류 | raceline 티처 / interactive 티처 / 정책 체크포인트 / 자기 자신 | `interactive` is worker 17's opponent-aware teacher: **listed and greyed, labelled `[병합 후 활성]`**, with the whole reason in its tooltip. Dropping it would make "no such kind" and "not merged yet" look the same, and greying alone reads as "not applicable to this row" |
+| 종류 | raceline 티처 / interactive 티처 / 정책 체크포인트 / 자기 자신 | **the teacher is a selection.** `raceline` is the teacher this viewer has always run; `interactive` (`f1sim.interactive_teacher`) scores its candidate plans against where the other cars are *predicted* to be, and since `integrate/20260916` it is here and selectable. A kind whose module this tree does not carry is still **listed and greyed, labelled `[병합 후 활성]`**, with the reason in its tooltip — dropping it would make "no such kind" and "not merged yet" look the same, and greying alone reads as "not applicable to this row" |
 | 체크포인트 | file picker | the button shows the basename; its tooltip is the path plus the file's **controller arm** and **memory kind**. An oracle (`opp_token`) or conditional checkpoint is refused here, in red, with the loader's own sentence — before the session is built rather than a minute into it |
 | 속도 배율 | two spins, 하한–상한 | equal = a fixed multiplier; different = a band drawn per reset |
 | 그립 라벨 | 참값 / 공칭 / 보수적 | the friction this teacher's speed profile assumes |
@@ -153,9 +153,12 @@ It is now a **table**: `레이스당 차량 수 - 1` rows, one per grid slot.
 | 반응형 확률 | four spins | defend / yield / line / oblivious, per race, for this car |
 | 스폰 | 앞 / 뒤 / 나란히 / 무작위 | where this car starts **relative to the learner** |
 
-Above the table: a 프리셋 combo — 기본 (티처 1.0), 학습 레시피 (0.6–1.15, 전체 이벤트, teacher + self
-+ checkpoints), 느린 선두 (0.6), 막는 상대 (defend 1.0) — and 동일하게, which copies row 1 into every
-other row. Under it, one line describing the whole table, which turns into the objection when the
+Above the table: a 프리셋 combo — 기본 (raceline 티처 1.0), 업그레이드 티처 (interactive 1.0),
+학습 레시피 (0.6–1.15, 전체 이벤트, teacher + self + checkpoints), 느린 선두 (0.6), 막는 상대
+(defend 1.0) — and 동일하게, which copies row 1 into every other row. The first two presets differ
+by the driver kind and by **nothing else** (same speed profile, same grip label, no events, no
+dispositions), which is what makes "is the visualiser's teacher the upgraded one?" a question with a
+one-click answer rather than a substitution: 기본 stays the raceline teacher. Under it, one line describing the whole table, which turns into the objection when the
 table has one; 시작 is disabled while it does, because a checkpoint the loader will refuse is a start
 that fails after a minute of loading.
 
