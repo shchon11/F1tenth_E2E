@@ -642,6 +642,10 @@ def test_frontend_channels_are_zero_init_parity_and_refuse_without_one(tmp_path)
     pro[:, att_index_spec(sp)["accel"] + 2] = 9.81 / 10.0
     out = aug(scan, pro)
     assert out.shape == (2, 8, 256)
+    # The contract's rule, asserted: the front-end's rows are appended BESIDE the raw stack and
+    # never in place of it, so a hallucinated clean range cannot hide a real wall. The six frames
+    # the actor reads are bit-identical to the six it was given.
+    assert torch.equal(out[:, :6], scan)
     from f1sim.learn.frontend import CLASSES
     assert torch.allclose(out[:, -2], torch.full_like(out[:, -2], 1.0 / len(CLASSES)), atol=1e-6)
     assert torch.allclose(out[:, -1], scan[:, 0], atol=1e-6)
