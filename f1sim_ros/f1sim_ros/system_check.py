@@ -136,38 +136,17 @@ def check_timeline(stamps: Dict[str, "np.ndarray | list"], profile, *, duration_
     return rep
 
 
-def _check_readable(path: str) -> None:
-    """Say what is wrong with a bag directory before rosbag2's "No storage could be initialized".
-
-    The common case by far is a recording whose process was killed before `metadata.yaml` was
-    written: the `.db3` is full of data and nothing can open it. That is worth naming, because the
-    obvious reading of the rosbag2 message is "this is not a bag".
-    """
-    import os as _os
-    if not _os.path.isdir(path):
-        if _os.path.exists(path):
-            return                       # a single file: let rosbag2 decide
-        raise FileNotFoundError(f"{path} does not exist")
-    files = _os.listdir(path)
-    if any(f == "metadata.yaml" for f in files):
-        return
-    dbs = [f for f in files if f.endswith(".db3")]
-    if dbs:
-        raise RuntimeError(
-            f"{path} has {', '.join(sorted(dbs))} but no metadata.yaml, so rosbag2 cannot open it. "
-            f"The recorder was killed before it finalised the bag -- give it time to shut down, or "
-            f"reconstruct the metadata with `ros2 bag reindex {path}`.")
-    raise FileNotFoundError(f"{path} contains no rosbag2 files ({', '.join(sorted(files)) or 'empty'})")
-
-
 def check_bag(path: str, profile=None, **kw) -> SystemReport:
     """The same check over a finished rosbag2. Reads timestamps only -- no message is deserialised
     except the two that say what was driving."""
     import rosbag2_py
+    from f1sim.calib.bagread import check_readable
     from f1sim_ros.record_profile import load as load_profile
 
     profile = profile or load_profile()
-    _check_readable(path)
+    # The same diagnosis `learn/bagdata.py` gets, from the same function: a bag with no
+    # `metadata.yaml` is the failure people actually hit, and rosbag2's message does not say so.
+    check_readable(path)
     reader = rosbag2_py.SequentialReader()
     reader.open(rosbag2_py.StorageOptions(uri=path, storage_id="sqlite3"),
                 rosbag2_py.ConverterOptions("", ""))

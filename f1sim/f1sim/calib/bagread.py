@@ -95,28 +95,27 @@ WANTED = {
 }
 
 
-def _check_readable(path: str) -> None:
-    """Say what is wrong with a bag directory before rosbag2's "No storage could be initialized".
+def check_readable(path: str) -> None:
+    """Name what is wrong with a bag directory before rosbag2's "No storage could be initialized".
 
-    The common case by far is a recording whose process was killed before `metadata.yaml` was
-    written: the `.db3` is full of data and nothing can open it. That is worth naming, because the
-    obvious reading of the rosbag2 message is "this is not a bag".
+    One case, and only one, because it is the one that happens: a recording whose process was
+    killed before `metadata.yaml` was written. The `.db3` is full of data and nothing can open it,
+    and the rosbag2 message reads as "this is not a bag". Anything else -- a missing path, a
+    directory of something else, a stubbed reader in a test -- is left to the reader to report,
+    because guessing at those would be replacing one wrong diagnosis with another.
     """
     import os as _os
     if not _os.path.isdir(path):
-        if _os.path.exists(path):
-            return                       # a single file: let rosbag2 decide
-        raise FileNotFoundError(f"{path} does not exist")
+        return
     files = _os.listdir(path)
     if any(f == "metadata.yaml" for f in files):
         return
-    dbs = [f for f in files if f.endswith(".db3")]
+    dbs = sorted(f for f in files if f.endswith(".db3"))
     if dbs:
         raise RuntimeError(
-            f"{path} has {', '.join(sorted(dbs))} but no metadata.yaml, so rosbag2 cannot open it. "
-            f"The recorder was killed before it finalised the bag -- give it time to shut down, or "
+            f"{path} has {', '.join(dbs)} but no metadata.yaml, so rosbag2 cannot open it. The "
+            f"recorder was killed before it finalised the bag -- give it time to shut down, or "
             f"reconstruct the metadata with `ros2 bag reindex {path}`.")
-    raise FileNotFoundError(f"{path} contains no rosbag2 files ({', '.join(sorted(files)) or 'empty'})")
 
 
 def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False,
@@ -132,7 +131,7 @@ def read(path: str, topics: Optional[List[str]] = None, want_scan: bool = False,
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
 
-    _check_readable(path)
+    check_readable(path)
     reader = rosbag2_py.SequentialReader()
     reader.open(rosbag2_py.StorageOptions(uri=path, storage_id="sqlite3"),
                 rosbag2_py.ConverterOptions("", ""))

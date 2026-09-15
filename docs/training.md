@@ -818,7 +818,7 @@ the adjusted geometry whichever was installed first.
 privileged distance field is what the *evaluation* measures with and is not on the runtime path. A
 bearing with no return contributes nothing and everything outside the grid reads as free: the arm
 acts on what the sensor saw rather than braking for the 90° behind the window. That is what lets
-`f1sim_ros/policy_node.py` run this identical code off `/scan`.
+`f1sim_ros/controller_node.py` run this identical code off `/scan`.
 
 **What it may do**, and only these two, both one-sided:
 
@@ -869,7 +869,7 @@ cut, and the plan margin before and after) are logged alongside the tracker arm'
 **Not trained under.** Training with the arm in the loop is deliberately not done — the grip clamp's
 lesson was that a policy trained under a clamp learns to lean on it (faster laps, worse avoidance),
 so the recipe is train legacy, deploy clamped. Modules: `learn/clearance.py`,
-`tests/test_clearance.py`, `tests/test_policy_node_clearance.py`.
+`tests/test_clearance.py`, `tests/test_controller_clearance.py`.
 
 ### `+tcs` — the car's traction guard, inside the loop
 

@@ -67,9 +67,16 @@ def ros_time(sec):
 
 
 class SpyTracker:
-    """Records the (plan, v, cap, yaw) it was asked for and returns a fixed command."""
+    """Records the (plan, v, cap, yaw) it was asked for and returns a fixed command.
+
+    `wb` and `s_max` because the controller publishes the tracker's own model of the car on its
+    diagnostics -- which is the point of that message, and which a stub has to carry too.
+    """
 
     last_ref = None
+    wb = 0.3302
+    s_max = 0.4189
+    v_max = 8.0
 
     def __init__(self, speed=2.0, steer=0.1):
         self.calls = []

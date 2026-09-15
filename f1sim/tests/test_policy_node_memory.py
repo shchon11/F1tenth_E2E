@@ -1,6 +1,6 @@
 """The ROS policy node carries a recurrent policy's hidden state across scan callbacks.
 
-Same shape as `test_policy_node_traction.py`: no ROS graph, no device, no vehicle. The node's real
+Same shape as `test_controller_traction.py`: no ROS graph, no device, no vehicle. The node's real
 `on_odom` / `on_imu` / `on_scan` / `_resume` / `on_reset` run against stub messages and a fake
 clock, and the assertions are about the state the node keeps between them.
 

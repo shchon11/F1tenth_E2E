@@ -107,6 +107,24 @@ def test_a_bag_missing_a_required_topic_is_refused_with_the_reason(tmp_path):
         bagdata.from_bag(path, SPEC)
 
 
+def test_a_bag_that_was_never_finalised_is_diagnosed_rather_than_reported_as_not_a_bag(tmp_path):
+    """The failure people hit: a recorder killed before `metadata.yaml` was written. The `.db3` is
+    full of data and nothing can open it, and rosbag2's "No storage could be initialized" reads as
+    "this is not a bag"."""
+    from f1sim.calib.bagread import check_readable
+    path = bf.graph_run(str(tmp_path / "run"), frames=4, dt=DT)
+    check_readable(path)                                   # a finished bag: nothing to say
+    os.remove(os.path.join(path, "metadata.yaml"))
+    with pytest.raises(RuntimeError, match="ros2 bag reindex"):
+        check_readable(path)
+    with pytest.raises(RuntimeError, match="no metadata.yaml"):
+        bagdata.from_bag(path, SPEC)
+    # Anything else is left to the reader: guessing would replace one wrong diagnosis with another.
+    check_readable(str(tmp_path / "does-not-exist"))
+    (tmp_path / "empty").mkdir()
+    check_readable(str(tmp_path / "empty"))
+
+
 def test_round_trip_through_npz(tmp_path):
     path = bf.graph_run(str(tmp_path / "run"), frames=12, dt=DT)
     d = bagdata.from_bag(path, SPEC, speed_cap=4.0)

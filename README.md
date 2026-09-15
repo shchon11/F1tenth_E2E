@@ -225,10 +225,12 @@ events, **0 opponent wall contacts**, learner contacts 64 → 74 (`work/opponent
 Three ways in ([ros2.md](docs/ros2.md)); Humble, built as in [getting started](docs/getting_started.md#ros-2-workspace).
 
 ```bash
-python -m f1sim.viewer.console                                            # ROS2 연동 on, then 시작
-ros2 launch f1sim_ros pure_pursuit.launch.py                              # an external controller + rviz
+ros2 launch f1sim_ros graph_sim.launch.py checkpoint:=...                 # the graph on the simulator
+ros2 launch f1sim_ros graph_console.launch.py checkpoint:=...             # the graph on a console session
+ros2 launch f1sim_ros graph_car.launch.py checkpoint:=...                 # the graph on the real car
 ros2 launch f1sim_ros f1tenth_stack_sim.launch.py map:=gen:competition:3  # the real car's stack, unmodified
 ros2 launch f1sim_ros sim.launch.py                                       # standalone bridge, one env, real time
+ros2 run f1sim_ros system_check                                           # is everything there?
 ```
 
 **The console on ROS 2.** *고급 설정 → ROS2 연동* puts the console's session on the ROS graph:
@@ -241,12 +243,21 @@ real car. The distinction that matters throughout: `/odom` is the drifting dead-
 car actually has, `/ego_racecar/odom` is simulation-only ground truth, and a planner consuming the
 latter will not transfer.
 
-**The real-car policy node.** `policy_node.py` subscribes to `/scan`, `/odom` and `/sensors/imu` and
-publishes `/drive`, building its observation with the same [`learn/obs.py`](f1sim/f1sim/learn/obs.py)
-used in training, so it runs unchanged against real hardware — though nothing here has been tested on a
-physical vehicle. It installs the grip-aware limit by default (`controller:=fixed_low`, µ 0.73423)
-and will install the geometry layer with it (`controller:=fixed_low+clearance`), which reads `/scan`
-and nothing else; `estimated` and `reactive` are simulator research arms, refused here.
+**The graph is the system boundary.** `policy_node` turns the sensor topics into a plan
+(`/f1sim/plan`: eight normalized floats, the checkpoint that produced them, and the stamp of the
+scan they came from) with the same [`learn/obs.py`](f1sim/f1sim/learn/obs.py) the training side
+uses; `controller_node` turns the plan into `/drive` with the iLQR tracker, the runtime arm
+(`fixed_low` by default, µ 0.73423; `fixed_low+clearance` adds the geometry layer that reads
+`/scan` and nothing else; `estimated` and `reactive` are simulator research arms, refused here) and
+the traction guard. One `config/graph.yaml` carries every parameter and the three launch files
+differ only in where the sensors come from, so a simulator run and a car run are the same run.
+Nothing here has been tested on a physical vehicle.
+
+The split is bit-exact against the monolithic node it replaced: 1920 commands over four arms, the
+guard on and off, a simulator bag and a real car bag, worst difference 0.000e+00 on steering and
+speed. A checkpoint that emits steering and speed directly, and a published-baseline node, bypass
+the controller and publish `/drive` themselves. `ros2 run f1sim_ros eval` scores one benchmark cell
+through the graph with the benchmark's own metric code; suites are still scored batched.
 
 **Traction guard — pending merge** (branch `feat/real-car-tcs`). The simulator cannot lock or spin a
 wheel: `dynamics.py` has no wheel rotation state and the VESC loop closes on the true body speed, so
@@ -295,7 +306,8 @@ target-period steering gain, latency separated from `k_us`, motion distortion, f
 | `f1sim/f1sim/` | `sim.py`, `dynamics.py`, `lidar.py`, `imu.py`, `odom.py`, `actuators.py`, `randomization.py`, `track.py`, `maps.py`, `tracks.py`, `mpc.py`, `raceline.py`, `teacher.py`, `gym_env.py`, `params.py`, `hard_obstacles.py`, `opponent_events.py`, `scene.py`, `trackgen.py`, `props.py` |
 | `f1sim/f1sim/learn/` · `f1sim/f1sim/viewer/` | observation encoding, model, DAgger, PPO, evaluation, export, the grip arms (`grip_*.py`), `benchmark/`, `leaderboard.py`, `watch.py`; and `console/` (the three-page PyQt5 console and the editor), the moderngl renderer (`native.py`, `gl_scene.py`), `ros_link.py`, `sim_worker.py` |
 | `f1sim/f1sim/calib/` · [`f1sim/tests/`](f1sim/tests/) · [`f1sim/scripts/`](f1sim/scripts/) | the bag-reading and fitting tools behind [calibration](docs/real_data_calibration.md); the test suite; viewer demo, map and car-model generation, galleries, throughput benchmark, bag-map extraction |
-| [`f1sim_ros/`](f1sim_ros/) | ROS 2 bridge: launch files, `vesc_sim`, `policy_node`, `pure_pursuit`, `teleop`, config, sample maps |
+| [`f1sim_ros/`](f1sim_ros/) | the ROS 2 graph: `policy_node`, `controller_node`, `eval`, `system_check`, the `vesc_sim` and standalone bridges, `pure_pursuit`, `teleop`, launch files, config, sample maps |
+| [`f1sim_interfaces/`](f1sim_interfaces/) | `Plan` and `PolicyState`: the two messages on the boundary between the policy and the controller |
 | [`external/`](external/) · [`docs/`](docs/) | pinned third-party submodules (see [below](#requirements-testing-third-party)); documentation, figures and [research notes](docs/research/) |
 
 **[docs/README.md](docs/README.md) is the documentation index**: the guides

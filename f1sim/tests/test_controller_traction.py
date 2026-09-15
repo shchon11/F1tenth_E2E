@@ -124,6 +124,9 @@ def _fixed_tracker(speed, steer=0.0):
     """The tracker, stubbed to a fixed (steer, speed). What the guard is given to shape."""
     class T:
         last_ref = None
+        wb = 0.3302                  # the controller publishes the tracker's model of the car
+        s_max = 0.4189
+        v_max = 8.0
 
         def __call__(self, a, v, cap, yaw_rate, delay=None):
             return torch.tensor([[steer, speed]])

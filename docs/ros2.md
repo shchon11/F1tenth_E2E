@@ -432,11 +432,11 @@ variation of the graph against itself alongside it, so the two can be told apart
 
 ### rviz
 
-`graph_sim.launch.py viz:=true rviz:=true` shows the plan the tracker is following
-(`/f1sim/viz/plan`, in `base_link`, *after* the clearance bend and the grip speed limit — the thing
-the car is actually driving), the clearance grid built from the current scan
-(`/f1sim/viz/clearance`), the cars and the raceline from the bridge, and the controller's
-diagnostics.
+`graph_sim.launch.py viz:=true rviz:=true` opens `config/graph.rviz`: the plan the tracker is
+following (`/f1sim/viz/plan`, in `base_link`, *after* the clearance bend and the grip speed limit —
+the thing the car is actually driving), the clearance grid built from the current scan
+(`/f1sim/viz/clearance`), both odometries, the scan and the map. The markers cost the controller
+one `Marker` and one `CUBE_LIST` per command and are off by default (`viz:=false`).
 
 ## Recording, datasets and `system_check`
 

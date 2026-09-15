@@ -215,6 +215,29 @@ def test_the_traction_default_survives_the_launch_files_yaml_guess():
     assert got == ["off"], got
 
 
+def test_the_rviz_layout_shows_what_the_graph_publishes():
+    """`config/graph.rviz` has to name the topics the controller actually publishes.
+
+    A layout that referenced `/f1sim/viz/plan_ref` would open, show nothing, and look like a
+    controller that was not publishing. rviz itself is not opened here -- that is a GUI process and
+    this suite does not start one -- so what is checked is that the file parses and that every
+    topic it displays is one something in this package publishes.
+    """
+    path = os.path.join(ROS, "config", "graph.rviz")
+    with open(path) as fh:
+        cfg = yaml.safe_load(fh)
+    topics = set()
+    for d in cfg["Visualization Manager"]["Displays"]:
+        t = d.get("Topic")
+        if isinstance(t, dict) and "Value" in t:
+            topics.add(t["Value"])
+    assert {"/f1sim/viz/plan", "/f1sim/viz/clearance"} <= topics, sorted(topics)
+    assert {"/scan", "/odom", "/ego_racecar/odom", "/map"} <= topics, sorted(topics)
+    published = open(os.path.join(ROS, "f1sim_ros", "controller_node.py")).read()
+    for t in ("/f1sim/viz/plan", "/f1sim/viz/clearance"):
+        assert f'"{t}"' in published, f"{t} is in the rviz layout and nothing publishes it"
+
+
 def test_the_system_check_section_is_the_checkers_own_parameters(graph_yaml, checkpoint):
     """And not a second copy of the topic list: `config/record.yaml` owns which topics the graph
     needs, so the checker and the recorder cannot disagree about it."""
