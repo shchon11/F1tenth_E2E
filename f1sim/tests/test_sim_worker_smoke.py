@@ -350,6 +350,44 @@ def test_shutdown_leaves_no_process_behind(tmp_path):
         w.close()
 
 
+# ==================================================================== 기본 vs 없음 (+bare)
+def _scene_with_props(tmp_path, n: int = 2) -> str:
+    """A saved scene carrying `n` placed obstacles, at an absolute path.
+
+    Absolute rather than a name under `F1SIM_SCENES`: the worker is a spawned process and would
+    need the variable set before it started. `scene:/abs/dir` is a name the loader already takes.
+    """
+    from f1sim import maps as _maps
+    from f1sim.scene import SceneDoc
+    base = _maps.load(SMOKE_MAP)
+    placed = base.with_static_props(seed=3, n=n)
+    doc = SceneDoc.from_track(placed, "bare_smoke", source_map=SMOKE_MAP)
+    return doc.save(str(tmp_path / "bare_smoke"))
+
+
+def test_a_scene_keeps_its_authored_obstacles_and_bare_removes_them(worker, tmp_legacy_run, tmp_path):
+    """`기본` and `없음` end in two different tracks, in a real worker, from one scene.
+
+    This is the claim the label used to get wrong: picking "없음" on a scene the user had put boxes
+    on produced the boxes. The facts the worker reports are what the header says, so they are what
+    is checked -- `authored_props` is the number the 장애물 labels promise.
+    """
+    d = _scene_with_props(tmp_path, n=2)
+    # Generations must climb across this module's shared worker, so these sit between the numbers
+    # the tests above and below use.
+    for gen, name, want in ((200, f"scene:{d}", 2), (201, f"scene:{d}+bare", 0)):
+        cfg = P.SessionConfig(run=tmp_legacy_run, map_name=name, races=1, cars_per_race=1,
+                              device="cpu", compile=False, controller="legacy")
+        worker.send(P.CMD_START, gen=gen, config=cfg.to_dict())
+        facts = worker.wait_for(P.MSG_READY, timeout=READY_TIMEOUT, gen=gen)["facts"]
+        assert facts["authored_props"] == want, f"{name} reported {facts['authored_props']} props"
+        # and the geometry the console draws agrees: `기본` sends prop meshes, `없음` sends none
+        geom = worker.wait_for(P.MSG_GEOMETRY, gen=gen)["geometry"]
+        assert (sum(b["n_props"] for b in (geom.get("props") or [])) == want), geom.get("props")
+        frames = worker.collect_frames(2.0)
+        assert frames and np.isfinite(frames[-1]["x"]).all()
+
+
 # ==================================================================== per-opponent slots
 def test_a_slot_table_builds_a_session_and_the_facts_name_the_mix(worker, tmp_legacy_run):
     """A three-car race whose two other cars are configured separately (`f1sim.opponent_slots`).
