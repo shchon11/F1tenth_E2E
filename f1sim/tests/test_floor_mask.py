@@ -696,3 +696,22 @@ def test_the_floor_channel_warm_start_is_bit_identical(tmp_path):
         for fill in (0.0, 0.5, 1.0, 7.3):
             aug = torch.cat([scan, torch.full((4, 1, 128), fill)], 1)
             assert torch.equal(a0, m.act(aug, pro, deterministic=True)[0]), fill
+
+
+def test_beam_labels_separate_the_two_kinds_of_no_return():
+    """Root's point, as a label: a floor hit that dropped out is not the same thing as a beam that
+    saw nothing, and only the first says the bearing is clear out to the floor."""
+    from f1sim.learn.frontend import (CLASSES, FLOOR, NONE_FLOOR, NONE_OTHER, SOLID, beam_labels)
+    typ = torch.tensor([[3, 3, 2, 2, 0, 4]])            # ground, ground, tall, tall, none, car
+    ret = torch.tensor([[True, False, True, False, False, True]])
+    lab = beam_labels(typ, ret)
+    assert lab.tolist() == [[FLOOR, NONE_FLOOR, SOLID, NONE_OTHER, NONE_OTHER, SOLID]]
+    assert len(CLASSES) == 4 and CLASSES[NONE_FLOOR] == "none_floor"
+    # and the two no-return classes are the ones the range loss must skip
+    from f1sim.learn.frontend import frontend_losses
+    logits = torch.zeros(1, 4, 6)
+    rng = torch.full((1, 6), 0.9)
+    clean = torch.zeros(1, 6)                            # a huge range error, on every beam
+    loss, parts = frontend_losses(logits, rng, torch.zeros(1, 2), lab, clean, torch.zeros(1, 2))
+    # only the three beams that returned are scored, so the L1 is 0.9 and not something smaller
+    assert abs(float(parts["range_l1"]) - 0.9) < 1e-5

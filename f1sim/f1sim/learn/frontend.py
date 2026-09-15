@@ -70,6 +70,31 @@ SOLID, FLOOR, NONE_FLOOR, NONE_OTHER = 0, 1, 2, 3
 NONE = NONE_FLOOR
 
 
+def beam_labels(scan_type, returned):
+    """`(B, N)` class indices into `CLASSES`, from the simulator's per-beam hit type and whether the
+    beam returned anything.
+
+    Here rather than in the training script because the class list is here: a label derived
+    somewhere else can drift from the order the logits are laid out in, and nothing would notice.
+
+        scan_type == HIT_GROUND (3) and returned -> floor
+        scan_type == HIT_GROUND     and not      -> none_floor    (the dropout the floor caused)
+        anything else and returned               -> solid
+        anything else and not                    -> none_other
+
+    `returned` is the observation's own test (`scan < 1 - range_eps`), not `scan_type != HIT_NONE`:
+    a beam can have reached something and still be removed by the noise model's dropout, and which
+    of the two happened is exactly what the last two classes separate.
+    """
+    import torch as _t
+    st = _t.as_tensor(scan_type)
+    ret = _t.as_tensor(returned).to(_t.bool)
+    ground = st == 3
+    return _t.where(ret, _t.where(ground, _t.full_like(st, FLOOR), _t.full_like(st, SOLID)),
+                    _t.where(ground, _t.full_like(st, NONE_FLOOR),
+                             _t.full_like(st, NONE_OTHER))).long()
+
+
 def frontend_spec(width: int = 20, depth_width: int = 56, imu_width: int = 48,
                   n_beams: int = 1081, imu_dim: int = 0) -> dict:
     """The validated configuration, recorded with any checkpoint this produces."""
