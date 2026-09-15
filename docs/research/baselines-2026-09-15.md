@@ -343,6 +343,32 @@ gets to, and neither turns the tight floors into completions. What causes the ti
 not established here. Both rows are reported because both are theirs and the difference is real;
 neither is a fix.
 
+## Table 2 — suite v2.1, the traffic family (in progress)
+
+The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
+opponents and an `event` scenario where they brake, stop and change line. TinyLidarNet's row is the
+first complete one.
+
+| | S/384 | A/96 | O/32 | T/640 | T:slow | T:pace | T:event | T:pair | passes held | car contacts |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **TinyLidarNet-L** | 47 | 1 | 9 | **78/640** | 24/160 | 19/160 | 19/160 | 16/160 | **165** | 144 |
+
+Every one of the 640 trials met traffic inside the contention window, so the family measured what it
+is for. **165 held passes from a network that has never seen another car** is the headline, and the
+144 car contacts beside it is the price: it passes by driving through the space rather than around
+it. The four scenarios separate the way you would expect if the opponent is being treated as scenery
+— best against a `slow` car (24/160), worst when there are two of them (16/160).
+
+### The two suite runs reproduce each other exactly
+
+v2.1 contains v2's 64 cells unchanged, and this system was scored on both, in two independent runs
+days apart in wall-clock terms and under two different suite freezes. Across all 64 shared cells:
+**0 cells differ in success count, 0 in per-trial outcomes, and 0 in the physical start digest.**
+S 47/384, A 1/96 and O 9/32 are identical in both. That is the determinism the whole paired design
+rests on, demonstrated rather than assumed — and it is also why the earlier `frozen_original@legacy`
+disagreement with its *2026-09-12* row cannot be dismissed as run-to-run noise: under one digest on
+one device there is no run-to-run noise.
+
 ## The fair comparison: what is held fixed, and what is deliberately not
 
 The zero-shot rows above measure four differences at once — expert, data, track set, sensor — and
