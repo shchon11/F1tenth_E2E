@@ -743,14 +743,23 @@ def main():
     # different policies and the comparison would be between leashes, not conditioning.
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters(): p_.requires_grad_(False)
-    if memory_on and ref.memory is not None and float(ref.memory.out.weight.detach().abs().max()) != 0.0:
+    #: Both purity checks below are about the LEASH, so they apply when there is one. At
+    #: `--kl-coef 0` the reference is multiplied by zero in `minibatch_losses` and never reaches the
+    #: gradient, so "the reference is not the frozen baseline" is not a statement about anything --
+    #: and refusing on it makes a leash-free run impossible to RESUME, because the checkpoint being
+    #: resumed necessarily has a trained projection. That is how this was found: A3 had to restart
+    #: from its own `ppo_u400.pt` after a pause, with `--kl-coef 0.0`, and was refused for the state
+    #: of a tensor nothing would read. A resume of a leashed run is still refused, which is the case
+    #: the check was written for.
+    leashed = a.kl_coef > 0
+    if leashed and memory_on and ref.memory is not None and float(ref.memory.out.weight.detach().abs().max()) != 0.0:
         # Same argument as the conditioning check below, one projection further: the leash's
         # reference is the FEEDFORWARD original, and `minibatch_losses` evaluates it with the
         # recurrence switched off. That is only the original if the projection was still zero when
         # this copy was taken -- i.e. before any update.
         raise RuntimeError("the KL reference actor was captured after the memory projection had "
                            "trained; it must be the frozen feedforward baseline")
-    if cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
+    if leashed and cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
         raise RuntimeError("the KL reference actor was captured after the conditioning projection "
