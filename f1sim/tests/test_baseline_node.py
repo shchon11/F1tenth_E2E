@@ -286,3 +286,42 @@ def test_parity_would_fail_if_the_two_sides_disagreed():
     bent = scans.copy()
     bent[:, 400:600] = 0.4                        # a wall that is not there
     assert np.abs(node_cmd - adapter_commands(other, bent)).max() > 1e-3
+
+
+# --------------------------------------------------------------------------- launch file
+def test_the_launch_file_builds_and_touches_no_gui_by_default():
+    """`baseline.launch.py` is a normal Python module; building its description needs no ROS graph.
+
+    `rviz` defaults to false, so the default path opens nothing -- which is why this test needs no
+    xvfb and no software-GL contract. The assertion that matters is that every parameter the node
+    declares is actually passed through: a launch argument that exists and is never forwarded is the
+    kind of thing that looks like it works until the one run where it mattered.
+    """
+    pytest.importorskip("launch")
+    pytest.importorskip("launch_ros")
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "f1sim_ros", "launch", "baseline.launch.py")
+    spec = importlib.util.spec_from_file_location("_baseline_launch", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ld = mod.generate_launch_description()
+    entities = ld.entities
+    from launch.actions import DeclareLaunchArgument
+    declared = {e.name for e in entities if isinstance(e, DeclareLaunchArgument)}
+    assert {"model", "weights", "drive_topic", "speed_cap", "steer_max", "sensor_timeout",
+            "enabled", "speed_map", "skip_n", "hidden_scale", "n_features", "scan_fill",
+            "tick_hz", "caller_rate", "repo", "rviz"} <= declared
+    nodes = [e for e in entities if type(e).__name__ == "Node"]
+    assert len(nodes) == 2                                   # the baseline, and rviz behind a flag
+    baseline = [n for n in nodes if "baseline" in str(n._Node__node_executable)][0]
+    # `Node.__parameters` is a tuple of dicts whose keys are substitution tuples, not strings, so
+    # the names have to be resolved rather than read off.
+    forwarded = set()
+    for group in baseline._Node__parameters:
+        for key in group:
+            forwarded.add("".join(getattr(k, "text", "") for k in key))
+    assert declared - forwarded == {"rviz"}, declared - forwarded
+    rviz = [n for n in nodes if n is not baseline][0]
+    assert "rviz2" in str(rviz._Node__node_executable) and rviz.condition is not None
