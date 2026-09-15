@@ -159,7 +159,7 @@ def _up(x: torch.Tensor, size: int) -> torch.Tensor:
     return F.interpolate(x, size=size, mode="linear", align_corners=False)
 
 
-def imu_index_spec(spec) -> dict:
+def imu_index_spec(spec, ego: bool = True) -> dict:
     """Which proprio columns the front-end's IMU input is made of, and how wide that makes it.
 
     **Sensors only.** The proprio vector also carries the previous actions and the speed cap; those
@@ -171,6 +171,12 @@ def imu_index_spec(spec) -> dict:
     The layout is `flatten_obs`' concatenation of `PROPRIO_KEYS` (see `obs.att_index_spec`); a
     history row is `[speed, imu (6), att (2), action (act_dim)]` and only its first nine columns
     are taken.
+
+    `ego` says whether `floor.EgoStateAttitude`'s six columns -- filtered wheel speed, filtered yaw
+    rate, longitudinal and lateral acceleration, and the roll/pitch those imply -- are appended.
+    They are the physically meaningful form of what the raw rows already contain, and the point of
+    handing them over is that the network should not have to rediscover the suspension's calibrated
+    map from a history of wheel speeds.
     """
     i_imu = 1 + spec.act_dim * spec.action_history + 1
     head = [0] + list(range(i_imu, i_imu + 8))            # speed, gyro xyz, accel xyz, roll, pitch
@@ -180,12 +186,13 @@ def imu_index_spec(spec) -> dict:
     for r in range(spec.hist_len):
         start = base + r * row
         cols += list(range(start, start + 9))
-    return {"proprio_dim": int(spec.proprio_dim), "cols": cols,
+    return {"proprio_dim": int(spec.proprio_dim), "cols": cols, "ego": bool(ego),
+            "ego_dim": 6 if ego else 0, "dim": len(cols) + (6 if ego else 0),
             "v_max": float(spec.v_max), "gyro_scale": float(spec.gyro_scale),
             "accel_scale": float(spec.accel_scale), "att_scale": float(spec.att_scale)}
 
 
-def imu_vector(proprio: torch.Tensor, idx: dict) -> torch.Tensor:
+def imu_vector(proprio: torch.Tensor, idx: dict, ego: Optional[torch.Tensor] = None) -> torch.Tensor:
     """(B, D) the front-end's IMU input, sliced out of the proprio vector by the index spec.
 
     Left in the observation's own normalisation: these are network inputs, not geometry, and the
@@ -200,7 +207,23 @@ def imu_vector(proprio: torch.Tensor, idx: dict) -> torch.Tensor:
             f"is {proprio.shape[1]} wide; its columns are read by index. Rebuild it for this "
             f"observation, or feed the observation it was built for.")
     cols = torch.as_tensor(idx["cols"], device=proprio.device, dtype=torch.long)
-    return proprio.index_select(1, cols)
+    out = proprio.index_select(1, cols)
+    if not idx.get("ego"):
+        return out
+    if ego is None:
+        raise ValueError(
+            "this front-end was built with the ego-state columns and none were passed. They come "
+            "from `floor.EgoStateAttitude` -- `state_vector()` and the attitude it returns -- and "
+            "substituting zeros would hand the network a parked car.")
+    if ego.shape[1] != int(idx["ego_dim"]):
+        raise ValueError(f"ego block must be (B, {idx['ego_dim']}), got {tuple(ego.shape)}")
+    # The six are SI (m/s, rad/s, m/s^2, rad) and the rest of the vector is O(1)-normalised, so
+    # they are put on the same scale here rather than left to the first Linear to discover.
+    scale = torch.tensor([1.0 / float(idx["v_max"]), 1.0 / float(idx["gyro_scale"]),
+                          1.0 / float(idx["accel_scale"]), 1.0 / float(idx["accel_scale"]),
+                          1.0 / float(idx["att_scale"]), 1.0 / float(idx["att_scale"])],
+                         device=ego.device, dtype=ego.dtype)
+    return torch.cat([out, ego * scale], 1)
 
 
 def frontend_losses(logits, rng, att, label, clean, att_true, weights=(1.0, 1.0, 1.0),

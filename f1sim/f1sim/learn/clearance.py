@@ -562,6 +562,12 @@ class ClearanceArm:
         #: the same IMU the observation already carries; see `learn/floor.py`.
         self.fspec = (fspec or _floor.FloorSpec(mount_x=self.mount_x, mount_y=self.mount_y)).validate()
         self.att = _floor.AttitudeTracker(self.B, device=self.device, dt=float(dt))
+        #: The ego-state estimator, and which of the two the gate reads. `ego` is the default
+        #: because it is the more accurate of the two, measured (`docs/research/floor-mask-
+        #: 2026-09-15.md`): the body attitude is the suspension's response to accelerations the car
+        #: produces, so it can be computed rather than integrated.
+        self.ego = _floor.EgoStateAttitude(self.B, device=self.device, dt=float(dt))
+        self.att_source = "ego"
         #: The attitude this step, and whether it is usable. Written by `update_attitude`; until it
         #: is, the tracker has no rest reference and the likelihood reads `floor.UNKNOWN`, which
         #: gates nothing.
@@ -599,8 +605,14 @@ class ClearanceArm:
         in simulation, `policy_node.on_scan` on the car -- so the arm reads the same three signals
         the policy's own observation is built from and no new topic appears on the car.
         """
-        self.att_rp = self.att.update(gyro, accel, speed)
-        self.att_ok = self.att.seen_rest
+        if self.att_source == "ego":
+            self.att_rp = self.ego.update(speed, gyro[:, 2])
+            # Nothing to wait for: the estimator is a map from this step's motion, not an
+            # integrator that needs a reference. It is usable from the first sample.
+            self.att_ok = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        else:
+            self.att_rp = self.att.update(gyro, accel, speed)
+            self.att_ok = self.att.seen_rest
 
     def set_attitude(self, roll_pitch: torch.Tensor, ok=None) -> None:
         """Use an attitude computed elsewhere (the VESC quaternion, or a front-end's estimate).
@@ -625,6 +637,7 @@ class ClearanceArm:
         """An episode boundary: clear the attitude integrator for those rows (the rest reference is
         a property of the mounting and is kept -- see `floor.AttitudeTracker.reset`)."""
         self.att.reset(done)
+        self.ego.reset(done)
 
     def update_scan(self, scan_norm: torch.Tensor) -> None:
         """Hand the arm this control step's newest LiDAR frame, (B, N) normalized."""
@@ -715,6 +728,7 @@ class ClearanceArm:
     def meta(self) -> dict:
         """What a result has to carry to be reproducible: the spec and the beam geometry."""
         return {"spec": self.cspec.to_meta(), "floor": self.fspec.to_meta(),
+                "att_source": self.att_source,
                 "n_beams": int(self.angles.numel()),
                 "fov_deg": float((self.angles[-1] - self.angles[0]).abs() * 180.0 / math.pi)
                 if self.angles.numel() > 1 else 0.0,

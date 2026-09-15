@@ -413,12 +413,15 @@ def main():
                          f"start as zeroed input columns, so a warm start is still bit-identical")
     ap.add_argument("--scan-memory-tau", type=float, default=2.0,
                     help="[s] time constant of the decayed scan-occupancy channel")
-    ap.add_argument("--floor-att", default="tracker", choices=("tracker", "vesc"),
-                    help="attitude source of the `floor` scan channel. 'tracker' is "
-                         "`floor.AttitudeTracker` -- gyro integration with the accelerometer gated "
-                         "on quiescence and a zero reference learnt at rest. 'vesc' is the VESC "
-                         "quaternion the ROS node reads today, which is wrong by 8 deg rms while "
-                         "driving (measured) and is here only so the comparison can be run")
+    ap.add_argument("--floor-att", default="ego", choices=("ego", "tracker", "vesc"),
+                    help="attitude source of the `floor` scan channel. 'ego' is "
+                         "`floor.EgoStateAttitude` -- the suspension's calibrated response to the "
+                         "accelerations the car itself produces, read off the wheel speed and the "
+                         "gyro's yaw, which is the most accurate of the three (measured). "
+                         "'tracker' is `floor.AttitudeTracker`, gyro integration with the "
+                         "accelerometer gated on quiescence. 'vesc' is the orientation quaternion "
+                         "the ROS node reads today, which is wrong by 8 deg rms while driving and "
+                         "is here only so the comparison can be run")
     ap.add_argument("--scan-deltas", action="store_true", help="append temporal scan differences for a new model without --init")
     ap.add_argument("--temporal-encoder", choices=["cnn", "gru"], default="cnn")
     ap.add_argument("--scan-stem", choices=["plain", "resnet"], default="resnet",

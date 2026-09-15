@@ -568,3 +568,140 @@ class AttitudeTracker:
             st = tuple(t[index] for t in st)
         att, ref, seen = self._step(st, gyro, accel, speed)
         return att - ref, seen
+
+
+#: Calibrated suspension gains, `real_data_calibration.md` §6.1a, and the simulator's own defaults
+#: (`params.VehicleParams`). Asymmetric in pitch on purpose: this car squats under throttle far more
+#: than it dives under its regen-limited braking.
+ROLL_PER_G = 0.03      # [rad/g] 1.7 deg/g; measured 1.5-2.1
+SQUAT_PER_G = 0.03     # [rad/g] 1.7 deg/g under throttle; measured 1.5-2.5
+DIVE_PER_G = 0.008     # [rad/g] 0.46 deg/g under braking; the recordings show almost none
+G_ACC = 9.81
+
+#: [rad] rms of `vehicle.road_tilt`, the floor-and-tyre wobble the suspension setpoint carries on
+#: top of the cornering and braking terms. It is **not a function of the ego state**, so it is the
+#: floor of any estimator built from the ego state -- including a perfect one.
+ROAD_TILT_RMS = 0.017
+
+
+class EgoStateAttitude:
+    """Roll and pitch from what the car is DOING, not from what its IMU tilt says.
+
+    The user's proposal (2026-09-15): *"wouldn't it be easier for the model to get this from the
+    rate of change of the ego state than from the IMU?"* The body attitude is quasi-static -- the
+    suspension is a second-order system driven by the accelerations the car itself produces -- so it
+    can be *computed* from those accelerations instead of *integrated* from a gyro. That removes the
+    one term `AttitudeTracker` cannot beat: a gyro whose noise on this car is vibration
+    (0.278 rad/s rms at 4 m/s, `real_data_calibration.md` §2.6) accumulates
+    `sigma * sqrt(tau * dt / 2)` of angle error, and a static map accumulates nothing.
+
+        a_y = v * omega_z                                    (v from the VESC wheel speed)
+        a_x = d/dt of the low-passed wheel speed             (held where the wheel is lying)
+        roll_ss  =  roll_per_g  * a_y / g
+        pitch_ss = -(squat_per_g if a_x > 0 else dive_per_g) * a_x / g
+
+    then, optionally, the suspension's own second-order response to that setpoint, which is what the
+    simulator integrates (`sim.py`: `roll_acc = wn^2 (roll_ss - roll) - 2 zeta wn roll_rate`). The
+    static setpoint is right in steady state and early by the suspension's rise time in a transient;
+    the filtered version costs two states and gets the transient too.
+
+    **Where the wheel lies.** `/odom` speed is the *wheel* speed and this car locks its wheels:
+    §2.12 measures -40 to -143 m/s^2 of wheel deceleration against -3 to -16 of body. Differentiating
+    that raw reads a brake lock as 10 g of deceleration and produces 25 degrees of phantom dive. So
+    the derivative is low-passed first and then **held** wherever it exceeds what the body can
+    actually do -- the same quantity `f1sim_ros.traction.TractionGuard` detects and for the same
+    reason.
+
+    **Its floor, and it is not small.** `vehicle.road_tilt` is an OU process of 1 degree rms
+    (`ROAD_TILT_RMS`) added to the suspension setpoint, and it is not a function of the ego state.
+    No estimator of this family can beat it. Measured against the truth this one lands at roughly
+    that floor, which is better than every IMU path and still wider than the geometric channel wants
+    -- see `docs/research/floor-mask-2026-09-15.md`.
+    """
+
+    #: [m/s^2] the largest body longitudinal acceleration this car produces
+    #: (`params.VehicleParams.a_max` 7.0 on the drive side). A wheel-speed derivative past this is
+    #: the wheel slipping, not the car accelerating.
+    A_BODY_MAX = 12.0
+    #: [s] low-pass on the wheel speed before differentiating, and on the yaw rate. 0.08 s keeps the
+    #: suspension's own band (a few Hz) and removes the ERPM quantisation and the timestamp jitter
+    #: `odom.VescOdom` models.
+    TAU_V = 0.08
+    TAU_W = 0.04
+    #: The suspension, from `params.VehicleParams`. `lag=False` uses the setpoint directly.
+    WN = 20.0
+    ZETA = 0.7
+
+    def __init__(self, batch: int, device="cpu", dt: float = 0.025, dtype=torch.float32,
+                 roll_per_g: float = ROLL_PER_G, squat_per_g: float = SQUAT_PER_G,
+                 dive_per_g: float = DIVE_PER_G, lag: bool = True):
+        self.batch, self.dt = int(batch), float(dt)
+        self.device, self.dtype = torch.device(device), dtype
+        self.roll_per_g, self.squat_per_g, self.dive_per_g = (float(roll_per_g), float(squat_per_g),
+                                                              float(dive_per_g))
+        self.lag = bool(lag)
+        z = lambda n=1: torch.zeros(self.batch, n, device=self.device, dtype=dtype)
+        self.v_lp = z()[:, 0]
+        self.w_lp = z()[:, 0]
+        self.ax = z()[:, 0]
+        self.att = z(2)
+        self.rate = z(2)
+        self.started = torch.zeros(self.batch, dtype=torch.bool, device=self.device)
+
+    def reset(self, done=None) -> None:
+        """An episode boundary: a new car at a new speed, so the filters start again."""
+        if done is None:
+            for t in ("v_lp", "w_lp", "ax"):
+                getattr(self, t).zero_()
+            self.att.zero_(); self.rate.zero_(); self.started.zero_()
+            return
+        d = done if torch.is_tensor(done) else torch.as_tensor(done, device=self.device)
+        keep = (~d.bool()).to(self.dtype)
+        self.v_lp = self.v_lp * keep; self.w_lp = self.w_lp * keep; self.ax = self.ax * keep
+        self.att = self.att * keep[:, None]; self.rate = self.rate * keep[:, None]
+        self.started = self.started & ~d.bool()
+
+    @torch.no_grad()
+    def update(self, speed: torch.Tensor, yaw_rate: torch.Tensor) -> torch.Tensor:
+        """One control step. `speed` (B,) the VESC wheel speed [m/s], `yaw_rate` (B,) [rad/s].
+
+        Returns (B, 2) roll and pitch [rad].
+        """
+        for t, n in ((speed, "speed"), (yaw_rate, "yaw_rate")):
+            if t.dim() != 1 or t.shape[0] != self.batch:
+                raise ValueError(f"{n} must be ({self.batch},), got {tuple(t.shape)}")
+        dt = self.dt
+        v, w = speed.to(self.dtype), yaw_rate.to(self.dtype)
+        kv, kw = min(1.0, dt / self.TAU_V), min(1.0, dt / self.TAU_W)
+        # First sample: adopt, do not filter toward it from a zero that means "parked".
+        first = ~self.started
+        v_new = torch.where(first, v, self.v_lp + kv * (v - self.v_lp))
+        self.w_lp = torch.where(first, w, self.w_lp + kw * (w - self.w_lp))
+        ax_raw = (v_new - self.v_lp) / dt
+        self.v_lp = v_new
+        # Held where the wheel is lying, and zero before there is a derivative to take.
+        usable = (~first) & (ax_raw.abs() <= self.A_BODY_MAX)
+        self.ax = torch.where(usable, ax_raw, self.ax)
+        self.started = torch.ones_like(self.started)
+        ay = self.v_lp * self.w_lp
+        roll_ss = self.roll_per_g * ay / G_ACC
+        gain = torch.where(self.ax > 0, torch.full_like(self.ax, self.squat_per_g),
+                           torch.full_like(self.ax, self.dive_per_g))
+        pitch_ss = -gain * self.ax / G_ACC
+        ss = torch.stack([roll_ss, pitch_ss], 1)
+        if not self.lag:
+            self.att = ss
+            return self.att
+        acc = self.WN * self.WN * (ss - self.att) - 2.0 * self.ZETA * self.WN * self.rate
+        self.rate = self.rate + acc * dt
+        self.att = self.att + self.rate * dt
+        return self.att
+
+    def state_vector(self) -> torch.Tensor:
+        """(B, 4) the physically meaningful quantities this estimator forms: filtered speed, filtered
+        yaw rate, longitudinal acceleration, lateral acceleration.
+
+        Deliverable 5 feeds these to the front-end alongside the raw IMU rows, because they are what
+        the attitude is a function of and the network should not have to rediscover the map.
+        """
+        return torch.stack([self.v_lp, self.w_lp, self.ax, self.v_lp * self.w_lp], 1)

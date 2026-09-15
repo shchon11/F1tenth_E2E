@@ -160,12 +160,17 @@ class ScanAugment:
             self.floor_cfg = dict(floor)
             self.floor_idx = dict(floor["proprio"])
             self.floor_spec = _floor.FloorSpec(**(floor.get("spec") or {})).validate()
-            self.att_source = str(floor.get("att_source", "tracker"))
-            if self.att_source not in ("tracker", "vesc"):
-                raise ValueError(f"floor att_source must be 'tracker' or 'vesc', got "
+            self.att_source = str(floor.get("att_source", "ego"))
+            if self.att_source not in ("tracker", "vesc", "ego"):
+                raise ValueError(f"floor att_source must be 'tracker', 'ego' or 'vesc', got "
                                  f"{self.att_source!r}")
             self.att = _floor.AttitudeTracker(self.batch, device=self.device, dt=self.dt,
                                               dtype=self.dtype)
+            #: The ego-state path. Built whether or not it is the source, because it is also what
+            #: the front-end reads (`learn/frontend.py`) and one estimator per inference path is
+            #: cheaper than two that have to be kept in step.
+            self.ego = _floor.EgoStateAttitude(self.batch, device=self.device, dt=self.dt,
+                                               dtype=self.dtype)
             self.angles = _floor.beam_angles(self.n_beams, float(floor.get("fov", 1.5 * np.pi)),
                                              device=self.device, dtype=self.dtype)
 
@@ -173,6 +178,7 @@ class ScanAugment:
         """Clear the episode state: the occupancy memory and the attitude tracker's integrator."""
         if self.att is not None:
             self.att.reset(done)
+            self.ego.reset(done)
         if self.mem is None:
             return
         if done is None:
@@ -197,6 +203,23 @@ class ScanAugment:
                 "zeros would hand the geometry a level scan plane on a braking car. Pass "
                 "`proprio` -- `PolicyRuntime.observe(scan, proprio)` does.")
         speed, gyro, accel, vesc = floor_inputs(proprio.to(now.dtype), self.floor_idx)
+        if self.att_source == "ego":
+            # Quasi-static, so there is nothing to un-advance for a terminal observation: the
+            # estimator's own filters move, but the value it returns is a function of this step.
+            if advance:
+                att = self.ego.update(speed, gyro[:, 2])
+            else:
+                saved = (self.ego.v_lp.clone(), self.ego.w_lp.clone(), self.ego.ax.clone(),
+                         self.ego.att.clone(), self.ego.rate.clone(), self.ego.started.clone())
+                att = self.ego.update(speed, gyro[:, 2])
+                if index is not None:
+                    att = att[index]
+                (self.ego.v_lp, self.ego.w_lp, self.ego.ax, self.ego.att, self.ego.rate,
+                 self.ego.started) = saved
+            return _floor.floor_likelihood_norm(
+                now, att[:, 0], att[:, 1], float(self.floor_idx["range_max"]), self.floor_spec,
+                angles=self.angles,
+                range_eps=float(self.floor_cfg.get("range_eps", 0.02)))
         if advance:
             att, ok = self.att.update(gyro, accel, speed), self.att.seen_rest
         else:
