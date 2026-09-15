@@ -221,6 +221,10 @@ def test_evaluate_drives_a_published_baseline_through_the_traffic_proxy(bench):
                    opp_speed_range=(0.6, 1.15),
                    opp_events=("brake", "stop", "shift", "defend", "yield", "line", "oblivious"),
                    opp_event_rate=1.0, budget_laps=None,
+                   # The four reactive behaviours are dispositions, not timed events: the rate does
+                   # nothing for them, so `evaluate` now refuses a run that names one without its
+                   # probability. These are worker 17's proxy values.
+                   opp_reactive_probs={"defend": 0.3, "yield": 0.2, "line": 0.3, "oblivious": 0.1},
                    external={"kind": "tinylidarnet", "weights": need(TLN_ONNX, "the ONNX")})
     md = res["metadata"]
     assert md["action_mode"] == "direct"

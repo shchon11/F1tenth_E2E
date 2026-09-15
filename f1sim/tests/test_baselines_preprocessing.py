@@ -62,6 +62,25 @@ def saturated(r, range_max=10.0):
 
 
 # --------------------------------------------------------------------------- TinyLidarNet
+class _NoNoiseNumpy:
+    """numpy, with `random.normal` returning zeros — and **only inside their module**.
+
+    Their `plan()` adds `N(0, 0.5)` metres to every beam (`tiny_lidarnet.py:46-47`), which is a
+    sensor model rather than preprocessing (this project's suites declare their own noise per cell)
+    and has to be neutralised for a bit-exact comparison. The obvious way to do that —
+    `mod.np.random = SimpleNamespace(normal=...)` — reaches through the module's `np` binding to the
+    real numpy module object and clobbers `numpy.random` **for the whole process**: 60 tests in
+    other files then failed with `'SimpleNamespace' object has no attribute 'default_rng'`, which is
+    how this shim came to exist. Rebinding `mod.np` instead touches one name in one module.
+    """
+
+    random = types.SimpleNamespace(
+        normal=lambda loc=0.0, scale=1.0, size=None: np.zeros(size if size is not None else ()))
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+
 class _RecordingInterpreter:
     """Stands in for `tf.lite.Interpreter` inside their `plan()`. Records, returns a fixed output."""
 
@@ -138,8 +157,7 @@ def test_tinylidarnet_input_tensor_matches_vendored_plan(skip_n):
     it is neutralised here and declared in `TinyLidarNet.describe()['upstream_noise_applied']`.
     """
     mod = load_vendored_tinylidarnet()
-    mod.np.random = types.SimpleNamespace(normal=lambda *a, **k: np.zeros(a[2] if len(a) > 2
-                                                                         else k["size"]))
+    mod.np = _NoNoiseNumpy()
     planner = mod.TinyLidarNet("parity", skip_n, 0, "stub.tflite")
     scans = saturated(real_scans())
 
@@ -159,8 +177,7 @@ def test_tinylidarnet_input_tensor_matches_vendored_plan(skip_n):
 def test_tinylidarnet_output_mapping_matches_vendored_plan():
     """steer straight through in radians, speed through their `linear_map` into 1..8 m/s."""
     mod = load_vendored_tinylidarnet()
-    mod.np.random = types.SimpleNamespace(normal=lambda *a, **k: np.zeros(a[2] if len(a) > 2
-                                                                         else k["size"]))
+    mod.np = _NoNoiseNumpy()
     planner = mod.TinyLidarNet("parity", 1, 0, "stub.tflite")
     for raw in ([[0.25, 0.6]], [[-0.4, 0.05]], [[0.0, 1.0]], [[0.31, -0.2]]):
         planner.interpreter.output = np.array(raw, dtype=np.float32)
@@ -296,6 +313,18 @@ def test_end2race_num_features_deviation_is_one_line_and_declared():
 
 
 # --------------------------------------------------------------------------- scan mapping
+def test_neutralising_their_noise_does_not_reach_the_real_numpy():
+    """The shim above exists because the obvious monkeypatch was process-global. Pin that."""
+    before = np.random.default_rng
+    mod = load_vendored_tinylidarnet()
+    mod.np = _NoNoiseNumpy()
+    planner = mod.TinyLidarNet("parity", 1, 0, "stub.tflite")
+    planner.plan({"scan": np.full(1081, 5.0)})
+    assert np.random.default_rng is before
+    assert float(np.asarray(mod.np.random.normal(0, 0.5, (4,))).sum()) == 0.0
+    assert np.random.normal(0.0, 1.0, 4).shape == (4,)      # the real one still works
+
+
 def test_map_scan_is_identity_when_the_windows_agree():
     r = saturated(real_scans())
     out = baselines.map_scan(r, src_fov=baselines.OUR_FOV, src_range_max=10.0,
