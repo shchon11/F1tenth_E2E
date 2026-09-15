@@ -209,6 +209,68 @@ A legacy (feedforward) checkpoint reaches none of this: `policy_state` is inert,
 the published command is what it always was. The startup log names the memory when there is one.
 Unit tests: `f1sim/tests/test_policy_node_memory.py`.
 
+## Published baselines on the same link
+
+The two published F1TENTH end-to-end baselines run here as ROS 2 nodes, on the topics this car
+already publishes, so they can be driven by the console's ROS 2 mode, the standalone bridge,
+`f1tenth_stack_sim.launch.py` or the real car without changing anything about them.
+
+```bash
+# TinyLidarNet (IROS 2024) -- LiDAR only
+ros2 launch f1sim_ros baseline.launch.py model:=tinylidarnet \
+  weights:=$HOME/.../models/tinylidarnet_L_1081.onnx
+
+# End2Race (arXiv 2509.16894) -- LiDAR + measured speed, GRU
+ros2 launch f1sim_ros baseline.launch.py model:=end2race \
+  weights:=$HOME/.../End2Race/pretrained/end2race.pth
+```
+
+`baseline_node.py` subscribes to `/scan` (and `/odom` only when the model reads speed) and
+publishes `/drive`. **It publishes `/drive` directly**: these networks emit a steering angle and a
+speed, so there is no plan to track and this path has no `PlanTracker`, no controller arm, no
+clearance layer and no traction guard. In the split graph (`policy_node` → `/f1sim/plan` →
+`controller_node` → `/drive`) the baseline node therefore stands in for **both** halves at once, and
+must not be run alongside a `controller_node` that is also publishing `/drive` unless a mux is
+arbitrating. Everything else is the same contract as `policy_node`: the same topic names, the same
+`/f1sim/reset` **topic** (`std_msgs/Empty`, parameter `reset_topic`), the same watchdog.
+
+The preprocessing is **not re-derived from the papers**. Each model's beam selection, clipping or
+pressure-token normalisation, speed scaling and output range is transcribed from its own repository
+with the file and line quoted in `f1sim/f1sim/learn/baselines/`, and the node and the batched
+benchmark adapter call the *same object*, so the parity test between them is about the message
+plumbing rather than about two transcriptions.
+
+| | TinyLidarNet | End2Race |
+| --- | --- | --- |
+| weights | `Models/f1_tenth_model.h5` → ONNX, 220 686 params | `pretrained/end2race.pth`, 11 301 482 params |
+| scan it wants | 1081 beams over 270°, clipped at 10 m | 360 of a **1440-beam 360°** scan, metres |
+| reads speed | no | yes (the previous step's `/odom`) |
+| output | steer [rad] straight through; speed `linear_map(out, 0,1, 1,8)` | steer clipped to ±0.52 rad; speed unclipped |
+| its own rate | 40 Hz | 100 Hz at their eval, 10 Hz in their training data |
+| step cost here | **0.083 ms** (CPU, 1 thread, batch 1) | **1.853 ms** |
+
+TinyLidarNet's scan is exactly this car's, so nothing is resampled. End2Race's is not: a Hokuyo
+UST-10LX spans 270°, so **90 of its 360 features have no measurement behind them**. The node maps
+the scan by *bearing* (never by index — an index map on a different window silently rotates the
+world) and fills the unseen quarter with the model's own no-return value, logging that once, loudly,
+at startup. The `scan_fill` parameter chooses the fill; both conventions their code uses are scored
+separately (`docs/research/baselines-2026-09-15.md`).
+
+**Staleness is per model.** `policy_node` inhibits when the IMU, the attitude or the odometry go
+stale because its policy reads all three. These do not. `/scan` always counts — through a watchdog
+timer, because the scan callback is exactly the thing that stops running when the LiDAR goes away —
+and `/odom` counts when and only when `driver.needs_speed`. Stopping a LiDAR-only network because an
+IMU it never reads went quiet is not safety.
+
+The published command is clipped to what the plant can execute: `|steer| ≤ steer_max` and
+`0 ≤ speed ≤ speed_cap`. The floor at zero is not a safety choice but a parity one — the batched
+action space these nodes are checked against cannot express a reverse command either
+(`gym_env.py:1054`), and a parity claim has to be about the same command.
+
+Tests: `f1sim/tests/test_baseline_node.py` (reset, staleness, the window mapping, and node ↔ adapter
+parity on 100 recorded scans), `f1sim/tests/test_baselines_preprocessing.py` (our preprocessing
+against the vendored code, executed).
+
 ## Plan controller on the car
 
 `policy_node` installs a grip-aware limit on the plan tracker by default (`controller:=fixed_low`):

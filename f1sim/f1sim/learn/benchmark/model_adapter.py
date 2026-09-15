@@ -537,6 +537,10 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
                                        .get("arm") or "legacy"),
         "external": extra.get("external"),
         "action_mode": str(ecfg.action_mode),
+        # Where it ran. CPU and CUDA do not produce bit-identical float arithmetic, and a rollout is
+        # chaotic enough for that to change an outcome, so two rows are only comparable when this
+        # agrees -- the same reason `source_digest` is on every row.
+        "device": str(getattr(env.sim, "device", device)),
         "cross_runtime": bool(entry.get("cross_runtime")),
         "map": cell["map"], "true_mu": float(cell["true_mu"]), "seed": int(cell["seed"]),
         "learners": learners, "envs": envs, "race_size": race_size,
