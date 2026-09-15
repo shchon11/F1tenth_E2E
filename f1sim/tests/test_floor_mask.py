@@ -719,3 +719,49 @@ def test_beam_labels_separate_the_two_kinds_of_no_return():
     loss, parts = frontend_losses(logits, rng, torch.zeros(1, 2), lab, clean, torch.zeros(1, 2))
     # only the three beams that returned are scored, so the L1 is 0.9 and not something smaller
     assert abs(float(parts["range_l1"]) - 0.9) < 1e-5
+
+
+# ------------------------------------------------------------------ the brake-only gate
+def _adjust_inputs(device="cpu", B=3):
+    """A plan and two occupancies: one with an obstacle, one without."""
+    from f1sim import mpc as _mpc
+    cspec = cl.ClearanceSpec().validate()
+    ang = fl.beam_angles(361, 1.5 * math.pi, device=device)
+    scan_all = torch.full((B, 361), 0.9, device=device)
+    scan_all[:, 150:210] = 0.20                     # something 2 m ahead, across the path
+    scan_none = torch.full((B, 361), 0.9, device=device)
+    f = lambda sc: cl.distance_field(
+        cl.occupancy(sc, ang, cspec, 10.0, 0.297, 0.0), cspec)
+    action = torch.zeros(B, 8, device=device)
+    action[:, 6] = action[:, 7] = 0.2               # ask for ~6 m/s at both knots
+    v = torch.full((B,), 5.0, device=device)
+    cap = torch.full((B,), 9.0, device=device)
+    return action, v, cap, f(scan_all), f(scan_none), _mpc.PlanSpec(), cspec
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_brake_only_gate_splits_the_two_decisions(device):
+    """`dist_speed` lets the speed cap read a gated occupancy while the bend still reads every
+    return. The test is that each decision follows its own field and neither follows the other's."""
+    action, v, cap, d_all, d_none, spec, cspec = _adjust_inputs(device)
+    both_on = cl.adjust(action, v, cap, d_all, spec, cspec, 10.0)          # one field, obstacle
+    both_off = cl.adjust(action, v, cap, d_none, spec, cspec, 10.0)        # one field, clear
+    assert float(both_on.dv.min()) < -cl.V_EPS, "the obstacle has to slow the plan"
+    assert float(both_off.dv.min()) >= -cl.V_EPS, "an empty world must not"
+
+    # bend on the full occupancy, speed on the gated (empty) one: the bend is the obstacle's, the
+    # speed is the empty world's.
+    split = cl.adjust(action, v, cap, d_all, spec, cspec, 10.0, dist_speed=d_none)
+    assert torch.equal(split.dk, both_on.dk), "the bend must still see the obstacle"
+    assert float(split.dv.min()) >= -cl.V_EPS, "the speed must not"
+    # and the mirror image, to show neither decision is silently taking the other's field
+    split2 = cl.adjust(action, v, cap, d_none, spec, cspec, 10.0, dist_speed=d_all)
+    assert torch.equal(split2.dk, both_off.dk)
+    assert float(split2.dv.min()) < -cl.V_EPS
+
+
+def test_brake_only_mode_is_validated_and_defaults_to_both():
+    assert cl.ClearanceSpec().floor_gate_mode == "both"
+    cl.ClearanceSpec(floor_gate_mode="brake").validate()
+    with pytest.raises(ValueError, match="floor_gate_mode"):
+        cl.ClearanceSpec(floor_gate_mode="bend").validate()

@@ -57,6 +57,7 @@ comparison of the same quantity.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -99,6 +100,9 @@ class ClearanceSpec:
     range_eps: float = 0.02           # a normalized range within this of 1.0 is "no return"
 
     # -- the floor gate ----------------------------------------------------------
+    #: `both` gates the occupancy the whole arm reads; `brake` gates only the occupancy the SPEED
+    #: decision reads, leaving the bend to see every return. See `adjust`'s `dist_speed`.
+    floor_gate_mode: str = "both"
     floor_gate: bool = False          # OFF by default. On, a return whose floor likelihood
                                       # (`learn.floor`) reaches `FloorSpec.gate_threshold` is left
                                       # out of the occupancy grid. Off, `occupancy` never looks at
@@ -177,6 +181,9 @@ class ClearanceSpec:
             raise ValueError("need at least 3 path samples and 1 shift magnitude")
         if not self.a_brake > 0.0 or not self.v_stop >= 0.0:
             raise ValueError("a_brake must be positive and v_stop non-negative")
+        if self.floor_gate_mode not in ("both", "brake"):
+            raise ValueError(f"floor_gate_mode must be 'both' or 'brake', got "
+                             f"{self.floor_gate_mode!r}")
         return self
 
     @property
@@ -371,12 +378,21 @@ class Adjustment:
 
 def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
            dist: torch.Tensor, spec: _mpc.PlanSpec, cspec: ClearanceSpec,
-           v_max: float) -> Adjustment:
+           v_max: float, dist_speed: Optional[torch.Tensor] = None) -> Adjustment:
     """The whole arm, given a distance field: bend the plan, then cap its speed.
 
     `action` is the policy's normalized plan. The returned action is **bit-identical** wherever the
     arm left something alone: the bend is applied in normalized curvature units (adding 0 is exact)
     and each speed is replaced through a `where` rather than a round trip through `decode`/`encode`.
+
+    `dist_speed` splits the arm's two decisions across two occupancies: the **bend** is chosen on
+    `dist` and the **speed cap** is computed on `dist_speed`, along the path the bend chose. It
+    exists for one configuration and the measurement that motivates it (root, 2026-09-15): the floor
+    gate fixes phantom *brakes* -- the front-end gate more than halves them -- while the decisions
+    it wrongly suppresses are mostly bends, and a bend that is not needed costs a little deviation
+    where a brake that is not needed costs speed on every step it lasts. So a gate may be allowed to
+    remove floor returns from the speed decision while the bend still sees every return. `None`
+    keeps one field for both, which is what the arm has always done.
     """
     n = cspec.n_path
     B = action.shape[0]
@@ -444,6 +460,18 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
     raw_b = raw.gather(1, take.expand(B, 1, n))[:, 0]
     raw_0 = raw[:, 0]
     y_0 = y[:, 0]
+
+    if dist_speed is not None:
+        # The speed decision, re-scored on the other occupancy along the path already chosen. The
+        # same "void from the first contact" rule applies: an unsigned field reads a metre past a
+        # wall as a metre of free space, and the car stops at the first thing it hits whichever
+        # decision is being made.
+        x_b = x.gather(1, take.expand(B, 1, n))[:, 0]
+        y_bp = y.gather(1, take.expand(B, 1, n))[:, 0]
+        raw_s = sample_field(dist_speed, x_b[:, None], y_bp[:, None], cspec)[:, 0] - cspec.body_radius
+        hit_s = (raw_s < 0.0) & in_eval
+        clear_b = torch.where(hit_s.to(dt_).cumsum(-1) > 0,
+                              torch.full_like(raw_s, -cspec.body_radius), raw_s)
 
     # -- the cap: a speed the clearance allows, then braking anticipation --------
     cap = speed_cap.reshape(-1, 1)
@@ -665,26 +693,43 @@ class ClearanceArm:
         self.scan.copy_(s)
 
     @torch.no_grad()
-    def field(self) -> torch.Tensor:
-        """The distance field for the frame currently held. (B, ny, nx) in metres."""
+    def field(self):
+        """`(bend field, speed field or None)` for the frame currently held, (B, ny, nx) in metres.
+
+        The second is None unless `floor_gate_mode` is `brake`, in which case the first is the
+        ungated occupancy (the bend sees everything) and the second is the gated one.
+        """
         p = None
         if self.cspec.floor_gate:
             p, self._p_ext = (self._p_ext if self._p_ext is not None
                               else self.floor_likelihood()), None
-        occ = occupancy(self.scan, self.angles, self.cspec, self.range_max,
-                        self.mount_x, self.mount_y, p_floor=p, fspec=self.fspec)
+        brake_only = p is not None and self.cspec.floor_gate_mode == "brake"
+        # In brake-only mode the BEND's occupancy is built with the gate switched off in the spec
+        # too, not merely with no likelihood passed: `occupancy` refuses a spec that says "gate"
+        # and hands it nothing to gate with, and it is right to.
+        bend_spec = (dataclasses.replace(self.cspec, floor_gate=False) if brake_only
+                     else self.cspec)
+        occ = occupancy(self.scan, self.angles, bend_spec, self.range_max,
+                        self.mount_x, self.mount_y,
+                        p_floor=(None if brake_only else p),
+                        fspec=(None if brake_only else self.fspec))
         if p is not None:
             seen = self.scan < (1.0 - self.cspec.range_eps)
             self._gated += torch.stack([
                 seen.double().sum(), ((p >= self.fspec.gate_threshold) & seen).double().sum()])
-        return distance_field(occ, self.cspec)
+        if not brake_only:
+            return distance_field(occ, self.cspec), None
+        occ_s = occupancy(self.scan, self.angles, self.cspec, self.range_max,
+                          self.mount_x, self.mount_y, p_floor=p, fspec=self.fspec)
+        return distance_field(occ, self.cspec), distance_field(occ_s, self.cspec)
 
     @torch.no_grad()
     def shape(self, action: torch.Tensor, v_meas: torch.Tensor,
               speed_cap: torch.Tensor) -> torch.Tensor:
         """The plan hook: the policy's action in, the adjusted action out."""
-        adj = adjust(action, v_meas, speed_cap, self.field(), self.tracker.spec, self.cspec,
-                     self.v_max)
+        f_bend, f_speed = self.field()
+        adj = adjust(action, v_meas, speed_cap, f_bend, self.tracker.spec, self.cspec,
+                     self.v_max, dist_speed=f_speed)
         self.last = adj
         self._record(adj)
         return adj.action
