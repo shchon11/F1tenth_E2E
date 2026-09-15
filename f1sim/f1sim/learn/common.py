@@ -267,7 +267,7 @@ def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg:
         if rls is None:
             rls = [Raceline.build_cached(t) for t in tracks]
         env.set_teacher(make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time))
-    if opponent_pool and env.ecfg.opponent == "pool":
+    if opponent_pool and env.pool_paths:
         from .opponent_pool import attach     # local: that module imports this one for the obs spec
         attach(env, device=env.device)
     return env

@@ -228,17 +228,36 @@ class OpponentEvents:
     never the learner); the learner's rows are advanced never and read never.
     """
 
-    def __init__(self, B: int, device, ecfg, control_dt: float, gen: torch.Generator):
+    def __init__(self, B: int, device, ecfg, control_dt: float, gen: torch.Generator,
+                 slots=None, slot_of: Optional[torch.Tensor] = None):
+        """`slots` / `slot_of`: a per-car configuration (`f1sim.opponent_slots`) instead of one for
+        every opponent at once. `slots[i]` is the spec of grid slot i + 1 and `slot_of` (B,) says
+        which slot each row is; slot 0 is the learner and is configured by nobody. With `slots=None`
+        -- everything before this existed, and every run that does not use a slot table -- the
+        instructions below are the ones this class has always run, and the scalars stay scalars.
+        """
         self.B, self.device, self.dt, self.gen = B, torch.device(device), float(control_dt), gen
-        self.names = parse_events(ecfg.opp_events)
-        self.timed, self.react = split_events(self.names)
-        self.rate = float(ecfg.opp_event_rate)
-        self.probs = {n: float(getattr(ecfg, REACTIVE_PROB_FIELD[n])) for n in self.react}
-        #: Only behaviours with a positive probability are on: a named one at probability 0 would
-        #: silently be the unflagged run, which is what `learn.opponent_config` refuses at the flag.
-        self.react = tuple(n for n in self.react if self.probs[n] > 0.0)
-        self.timed_on = bool(self.timed) and self.rate > 0.0
-        self.react_on = bool(self.react)
+        #: (B, len(REACTIVE_NAMES)) per-car probabilities, or None when one set covers every car.
+        self.probs_t: Optional[torch.Tensor] = None
+        #: (B, len(self.timed)) per-car table of which timed ids that car may draw, and (B,) how
+        #: many it has. None when every car draws from the same list.
+        self.kind_lut_car: Optional[torch.Tensor] = None
+        self.n_timed_car: Optional[torch.Tensor] = None
+        #: (B,) per-car event rate, or None for the one `opp_event_rate` everybody shares.
+        self.rate_car: Optional[torch.Tensor] = None
+        self.slots = tuple(slots) if slots is not None else None
+        if slots is None:
+            self.names = parse_events(ecfg.opp_events)
+            self.timed, self.react = split_events(self.names)
+            self.rate = float(ecfg.opp_event_rate)
+            self.probs = {n: float(getattr(ecfg, REACTIVE_PROB_FIELD[n])) for n in self.react}
+            #: Only behaviours with a positive probability are on: a named one at probability 0 would
+            #: silently be the unflagged run, which is what `learn.opponent_config` refuses at the flag.
+            self.react = tuple(n for n in self.react if self.probs[n] > 0.0)
+            self.timed_on = bool(self.timed) and self.rate > 0.0
+            self.react_on = bool(self.react)
+        else:
+            self._configure_per_car(B, slots, slot_of)
         self.enabled = self.timed_on or self.react_on
         self.ecfg = ecfg
         z = lambda: torch.zeros(B, device=self.device)
@@ -265,7 +284,60 @@ class OpponentEvents:
         # P(an idle opponent starts an event this step). `opp_event_rate` is events per 10 s, so the
         # per-step probability is rate * dt / 10. Events do not overlap, so the realized rate is
         # this times the idle fraction -- at rate 1.0 with ~1.5 s events that is ~0.87 per 10 s.
-        self.p_start = min(1.0, self.rate * self.dt / 10.0)
+        # A slot table gives each car its own rate, so this is a (B,) tensor there; `u < p_start`
+        # reads the same either way.
+        if self.rate_car is None:
+            self.p_start = min(1.0, self.rate * self.dt / 10.0)
+        else:
+            self.p_start = (self.rate_car * self.dt / 10.0).clamp(max=1.0)
+
+    # ------------------------------------------------------------------ per-car configuration
+    def _configure_per_car(self, B: int, slots, slot_of: Optional[torch.Tensor]) -> None:
+        """Build the per-car tables a slot spec implies. One row per env row, slot 0 included.
+
+        The union of every slot's timed events is the id space the machine works in, and each car
+        gets a lookup row into it holding only the ids that car may draw. The draw itself is still
+        one full-batch uniform per step, for the same reason it always was: the schedule a seed
+        produces must not depend on which cars happen to be idle.
+        """
+        if slot_of is None:
+            raise ValueError("OpponentEvents(slots=...) needs slot_of: which grid slot each row is")
+        dev = self.device
+        timed, react = [], []
+        for s in slots:
+            for n in s.events:
+                if n in EVENT_NAMES and n not in timed:
+                    timed.append(n)
+            for n, p in (s.reactive or {}).items():
+                if float(p) > 0.0 and n not in react:
+                    react.append(n)
+        self.timed = tuple(n for n in EVENT_NAMES if n in timed)
+        self.react = tuple(n for n in REACTIVE_NAMES if n in react)
+        self.names = self.timed + self.react
+        self.rate = max([float(s.event_rate) for s in slots] + [0.0])
+        self.probs = {}
+        T = len(self.timed)
+        lut = torch.zeros(len(slots) + 1, max(T, 1), dtype=torch.long, device=dev)
+        n_timed = torch.zeros(len(slots) + 1, dtype=torch.long, device=dev)
+        rate = torch.zeros(len(slots) + 1, device=dev)
+        probs = torch.zeros(len(slots) + 1, len(REACTIVE_NAMES), device=dev)
+        for i, s in enumerate(slots, start=1):
+            own = [n for n in self.timed if n in s.events]
+            for j, n in enumerate(own):
+                lut[i, j] = EVENT_ID[n]
+            n_timed[i] = len(own)
+            rate[i] = float(s.event_rate) if own else 0.0
+            for k, n in enumerate(REACTIVE_NAMES):
+                probs[i, k] = float((s.reactive or {}).get(n, 0.0))
+        sl = slot_of.to(dev).long()
+        self.kind_lut_car = lut[sl]                                     # (B, T)
+        self.n_timed_car = n_timed[sl]                                  # (B,)
+        self.rate_car = rate[sl]                                        # (B,)
+        self.probs_t = probs[sl]                                        # (B, R)
+        self.kind_lut = torch.tensor([EVENT_ID[n] for n in self.timed] or [0],
+                                     dtype=torch.long, device=dev)
+        self.timed_on = bool(self.timed) and bool((self.rate_car > 0).any())
+        self.react_on = bool(self.react)
 
     # ------------------------------------------------------------------ lifecycle
     @property
@@ -298,7 +370,8 @@ class OpponentEvents:
         for i, name in enumerate(REACTIVE_NAMES):
             if name not in self.react:
                 continue
-            disp = disp | (u[i] < self.probs[name]).long() * REACTIVE_BIT[name]
+            thr = self.probs[name] if self.probs_t is None else self.probs_t[ids, i]
+            disp = disp | (u[i] < thr).long() * REACTIVE_BIT[name]
         self.disp[ids] = disp
         lerp = lambda rng, r: rng[0] + (rng[1] - rng[0]) * r
         self.amp_defend[ids] = lerp(e.opp_defend_offset_range, u[len(REACTIVE_NAMES)])
@@ -324,8 +397,20 @@ class OpponentEvents:
         # depend on the order envs finish their events in.
         u = torch.rand(6, self.B, device=self.device, generator=self.gen)
         start = g & (self.kind == NO_EVENT) & (u[0] < self.p_start)
-        slot = (u[1] * len(self.timed)).long().clamp_(0, len(self.timed) - 1)
-        kind = self.kind_lut[slot]
+        if self.kind_lut_car is None:
+            slot = (u[1] * len(self.timed)).long().clamp_(0, len(self.timed) - 1)
+            kind = self.kind_lut[slot]
+        else:
+            # Each car draws from its own list of timed events, whose length differs per car. The
+            # draw is still one full-batch uniform: a car with nothing configured consumes its
+            # number and is held out of `start` instead of being skipped, so the stream a seed
+            # produces does not depend on which slots happen to carry events.
+            n = self.n_timed_car
+            slot = (u[1] * n.clamp_min(1)).long().clamp_(0, max(len(self.timed) - 1, 0))
+            kind = self.kind_lut_car.gather(1, slot[:, None].clamp_max(
+                max(self.kind_lut_car.shape[1] - 1, 0)))[:, 0]
+            kind = torch.where(n > 0, kind, torch.zeros_like(kind))
+            start = start & (n > 0)
         dur, p0, p1 = self._sample(kind, u)
         self.kind = torch.where(start, kind, self.kind)
         self.t = torch.where(start, torch.zeros_like(self.t), self.t)
@@ -514,6 +599,13 @@ class OpponentEvents:
                 "disposition": torch.where(self.gate, self.disp, torch.zeros_like(self.disp))}
 
     # ------------------------------------------------------------------ diagnostics
+    def describe(self) -> str:
+        """One line naming what is configured, whether it came from flags or from a slot table."""
+        if self.slots is None:
+            return describe(self.names, self.rate, self.probs)
+        return (f"per-slot: timed {list(self.timed) or 'none'} (rates up to {self.rate:g}/10 s) | "
+                f"reactive {list(self.react) or 'none'}")
+
     def counts(self) -> Dict[str, int]:
         """How many cars are currently running each configured behaviour (host sync: demos and tests)."""
         out = {n: int((self.gate & (self.kind == EVENT_ID[n])).sum()) for n in self.timed}
