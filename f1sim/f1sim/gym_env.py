@@ -1348,6 +1348,27 @@ class F1VecEnv:
         out[:, 5] = st[:, 5] / e.imu_gyro_scale
         return out
 
+    def opponent_beam_mask(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, N) 1 where this beam of the NEWEST scan came back off another car, else 0.
+
+        Privileged and train-time only: the label for the beam-mask auxiliary (`learn.motion`). It
+        is not a new quantity -- `lidar.Lidar.scan` has classified every beam since cars were cast
+        as meshes (`HIT_CAR`), and `StepResult.scan_type` has carried it -- so nothing in the
+        simulator changes to produce it.
+
+        Read from the newest scan, which is frame 0 of the observation's stack and the frame the
+        aligned residual is computed against; a mask from any other frame would be a label for a
+        different picture. `r` defaults to `last_result`, the state the next action is taken from,
+        the same convention `privileged()` and `future_labels()` are read under.
+
+        Solo (`race_size 1`) gives all zeros, honestly: there is no other car to hit.
+        """
+        from .lidar import HIT_CAR
+        res = self.last_result if r is None else r
+        if res is None:
+            raise RuntimeError("opponent_beam_mask needs a stepped env: call reset() first")
+        return (res.scan_type == HIT_CAR).to(res.scan.dtype)
+
     def race_boundary(self, done: torch.Tensor) -> torch.Tensor:
         """(B,) bool: did ANY car sharing this row's race end its episode on this step?
 

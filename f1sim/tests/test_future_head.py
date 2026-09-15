@@ -426,6 +426,55 @@ def test_the_probe_finds_what_the_state_determines_and_not_what_it_does_not():
     assert out["ego_speed"]["n_test"] > 0 and out["ego_speed"]["n_train"] > 0
 
 
+def test_the_probe_s_mae_bins_and_presence_mask_on_a_known_answer():
+    """The addendum's three additions, on data whose answer is arithmetic.
+
+    A state that determines `opp_vlon` exactly must give R^2 ~ 1 and MAE ~ 0 **in m/s** -- the label
+    is carried divided by `PRIV_OPP_DIST_SCALE`, so a MAE reported in label units would be five
+    times too small and would look like a better read-out than it is. The distance bins must count
+    the rows the geometry puts in them. And presence has to remove rows rather than score them as
+    zeros: half the rows here have no car, and a read-out scored on those would be measuring how
+    well it predicts an empty road.
+    """
+    from f1sim.gym_env import PRIV_OPP_DIST_SCALE as S
+    torch.manual_seed(23)
+    T, L, H, k = 120, 24, 6, 0
+    states = torch.randn(T, L, H)
+    labels = torch.zeros(T + 1, L, FUTURE_LABEL_DIM)
+    present = torch.zeros(T + 1, L)
+    present[:, ::2] = 1.0                                   # every other car is there at all
+    labels[:, :, FUTURE_PRESENT_INDEX] = present
+    w = torch.randn(H)
+    labels[:T, :, FUTURE_LABEL_KEYS.index("opp_vlon")] = states @ w
+    labels[:, :, FUTURE_LABEL_KEYS.index("opp_vlat")] = torch.randn(T + 1, L)   # pure noise
+    # put each env column at a known distance: 1 m, 3.5 m or 8 m ahead
+    dist = torch.tensor([1.0, 3.5, 8.0])[torch.arange(L) % 3]
+    labels[:, :, FUTURE_LABEL_KEYS.index("opp_lon")] = (dist / S)[None, :].expand(T + 1, L)
+    # One draw, so `n_test` and the bin counts describe the same split and the partition below is
+    # exact rather than an average of four different ones.
+    out = probe_hidden.probe(states, labels, torch.zeros(T, L), k, test_frac=0.25, seed=0, splits=1)
+
+    v = out["opp_vlon"]
+    assert v["r2"] > 0.99, v["r2"]
+    assert v["mae"] < 0.05 * S, "a near-exact read-out cannot have a MAE of metres per second"
+    assert v["unit"] == "m/s" and v["presence_conditioned"]
+    assert v["excluded_frac"] == pytest.approx(0.5, abs=0.02), v["excluded_frac"]
+    # the ego columns are not presence-conditioned: they mean something on an empty road
+    assert not out["ego_speed"]["presence_conditioned"]
+    assert out["ego_speed"]["excluded_frac"] == 0.0
+
+    # the bins hold the rows the geometry put in them, and only the present cars are scored
+    n = {b: v["bins"][b]["n"] for b in ("near", "mid", "far")}
+    assert sum(n.values()) == pytest.approx(v["n_test"], rel=1e-6), (n, v["n_test"])
+    assert all(x > 0 for x in n.values()), n
+    # the bins are a partition of the scored rows, not a filter with a hole in it
+    # MAE in a bin is the same quantity in the same unit, so an exact read-out is exact everywhere
+    for b in ("near", "mid", "far"):
+        assert v["bins"][b]["mae"] < 0.05 * S, (b, v["bins"][b])
+    # and a column the state does not determine is not rescued by the binning
+    assert out["opp_vlat"]["r2"] < 0.2
+
+
 def test_the_probe_reads_the_tensor_the_head_is_trained_on():
     """One function returns it, so the two cannot drift apart: whatever `probe_state` hands the
     probe is what `future_from` would have fed the head on the same forward."""

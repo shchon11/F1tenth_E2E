@@ -51,7 +51,14 @@ def _inputs(model, device="cpu", batch: int = 1):
     meta = model.meta
     extra = len((meta.get("scan_channels") or {}).get("channels") or ())
     g = torch.Generator().manual_seed(0)
-    scan = torch.rand(batch, int(meta["n_stack"]), int(meta["n_beams"]), generator=g).to(device)
+    # A corridor, not noise. The aligned channel's warp is a scatter over the beams that returned,
+    # so a scan of uniform noise -- every beam a different range, none of them at the clamp -- times
+    # a different amount of work from the one the car sees. Half a corridor plus a far field is the
+    # cheap approximation of a real scan's structure that keeps the no-return branch alive.
+    n = int(meta["n_beams"])
+    ramp = torch.linspace(0.2, 1.0, n)
+    scan = (ramp[None, None, :].expand(batch, int(meta["n_stack"]), n).contiguous()
+            + 0.01 * torch.rand(batch, int(meta["n_stack"]), n, generator=g)).clamp(0, 1).to(device)
     proprio = torch.rand(batch, int(meta["proprio_dim"]), generator=g).to(device)
     return scan, proprio, extra
 
@@ -76,10 +83,24 @@ def actor_step_ms(model, device="cpu", batch: int = 1, iters: int = 200, threads
     scan, proprio, extra = _inputs(model, device, batch)
     meta = model.meta
     aug = None
+    pro_for_channels = None
     if extra:
-        aug = ScanAugment((meta["scan_channels"]["channels"]), int(meta["n_beams"]), batch,
-                          device=device, tau_s=float(meta["scan_channels"]["memory_tau_s"]))
-    scan_in = scan if aug is None else aug(scan)
+        chan = meta["scan_channels"]
+        aug = ScanAugment((chan["channels"]), int(meta["n_beams"]), batch,
+                          device=device, tau_s=float(chan["memory_tau_s"]),
+                          aligned=chan.get("aligned"))
+        if chan.get("aligned"):
+            # The aligned channel warps with the car's own measured motion, so it is timed on a car
+            # that is moving: at 9 m/s and 1 rad/s the warp is a real transform rather than the
+            # identity, and the scatter fans the beams out the way it does on track.
+            pro_for_channels = torch.zeros(batch, int(chan["aligned"]["proprio"]["proprio_dim"]),
+                                           device=device)
+            idx = chan["aligned"]["proprio"]
+            pro_for_channels[:, int(idx["speed"])] = 9.0 / float(idx["v_max"])
+            pro_for_channels[:, int(idx["yaw_rate"])] = 1.0 / float(idx["gyro_scale"])
+            for _ in range(int(chan["aligned"]["k"]) + 2):        # fill the ring before timing it
+                aug(scan, pro_for_channels)
+    scan_in = scan if aug is None else aug(scan, pro_for_channels)
     h = model.actor.initial_hidden(batch, device=scan.device, dtype=scan.dtype)
 
     def forward():
@@ -88,7 +109,7 @@ def actor_step_ms(model, device="cpu", batch: int = 1, iters: int = 200, threads
 
     def channels():
         with torch.no_grad():
-            aug(scan)
+            aug(scan, pro_for_channels)
 
     def best(fn):
         t = benchmark.Timer(stmt="f()", globals={"f": fn}, num_threads=threads)
@@ -190,8 +211,17 @@ def main(argv=None):
     ap.add_argument("--repeats", type=int, default=5,
                     help="measurement blocks; the fastest is reported (see actor_step_ms)")
     ap.add_argument("--hidden", type=int, default=128)
-    ap.add_argument("--variants", default="baseline,gru,gru+memory,gru+edges,gru+memory+edges",
-                    help="comma separated: 'baseline', then 'gru' with any of '+memory' / '+edges'")
+    ap.add_argument("--variants",
+                    default="baseline,gru,gru+memory+edges,gru+memory+edges+aligned,"
+                            "gru+memory+edges+aligned+aligned_prev+aligned_valid,"
+                            "gru+memory+edges+aligned+aligned_prev+aligned_valid+motion",
+                    help="comma separated: 'baseline', then 'gru' with any scan channel appended "
+                         "as '+name' (memory, edges, aligned, aligned_prev, aligned_valid) and "
+                         "'+motion' for the motion branch (learn.motion), which needs at least one "
+                         "aligned row to read. The branch's two train-time heads are NOT built: "
+                         "they are never called by the actor's forward and never exported, so "
+                         "timing them would be timing something the car does not run")
+    ap.add_argument("--motion-hidden", type=int, default=64)
     ap.add_argument("--json", default="", help="also write the table here")
     ap.add_argument("--clearance", action="store_true",
                     help="also time the `clearance` controller arm's per-step cost (batch 1)")
@@ -209,10 +239,35 @@ def main(argv=None):
         else:
             parts = name.split("+")
             if parts[0] != "gru":
-                raise SystemExit(f"variant {name!r}: expected 'baseline' or 'gru[+memory][+edges]'")
-            chans = [p for p in parts[1:]]
+                raise SystemExit(f"variant {name!r}: expected 'baseline' or 'gru[+channel...]'")
+            want_motion = "motion" in parts[1:]
+            chans = [p for p in parts[1:] if p != "motion"]
+            cfg = None
+            if chans:
+                cfg = {"channels": chans}
+                if any(c.startswith("aligned") for c in chans):
+                    from .obs import ObsSpec, motion_index_spec
+                    sp = ObsSpec(n_beams=int(base.meta["n_beams"]), scan_stack=int(base.meta["n_stack"]),
+                                 act_dim=int(base.meta["act_dim"]), hist_len=20, action_history=2)
+                    if sp.proprio_dim != int(base.meta["proprio_dim"]):
+                        raise SystemExit(
+                            f"the baseline's proprio is {base.meta['proprio_dim']} wide and the "
+                            f"spec this reconstructs is {sp.proprio_dim}: the aligned channel reads "
+                            f"columns by index, so timing it against a guessed layout would time "
+                            f"the wrong thing.")
+                    cfg["aligned"] = {"proprio": motion_index_spec(sp)}
+            mot = None
+            if want_motion:
+                from .motion import motion_spec
+                # NOT `rows`: that is the table being built, thirty lines up, and shadowing it makes
+                # the printer iterate a list of channel names one character at a time.
+                mot_rows = [c for c in chans if c.startswith("aligned")]
+                if not mot_rows:
+                    raise SystemExit(f"variant {name!r}: the motion branch reads the aligned rows "
+                                     f"and none are enabled")
+                mot = motion_spec(hidden_size=a.motion_hidden, rows=mot_rows)
             model, _e, _f = load_for_memory(a.baseline, "cpu", memory_spec(hidden_size=a.hidden),
-                                            scan_channels={"channels": chans} if chans else None)
+                                            scan_channels=cfg, motion=mot)
             m = measure(model, iters=a.iters, repeats=a.repeats)
         rows.append({"variant": name, **m,
                      "forward_ratio": m["forward_ms"] / b["forward_ms"],

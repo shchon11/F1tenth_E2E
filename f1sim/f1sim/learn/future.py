@@ -71,16 +71,18 @@ def future_spec(k: int = FUTURE_K, width: int = FUTURE_WIDTH, source: Optional[s
     target list is not this head, and silently re-using its weights would compare two things.
 
     `source` may be None, meaning "whatever the actor this is attached to has" -- `Actor.
-    attach_future` fills it in and refuses a spec that names the other one, so a checkpoint that
-    recorded `memory` cannot be rebuilt on a feedforward actor without saying so.
+    attach_future` fills it in and refuses a spec that names another, so a checkpoint that recorded
+    `memory` cannot be rebuilt on a feedforward actor without saying so. `motion` is the third
+    value: with a motion branch the head reads `h_dyn` alone, because the contract's addendum puts
+    every auxiliary there and not on the main state.
     """
     k, width = int(k), int(width)
     if k < 0:
         raise ValueError(f"future head k {k} must be >= 0 control steps")
     if width <= 0:
         raise ValueError(f"future head width {width} must be positive")
-    if source is not None and source not in ("memory", "trunk"):
-        raise ValueError(f"future head source must be 'memory' or 'trunk', got {source!r}")
+    if source is not None and source not in ("memory", "trunk", "motion"):
+        raise ValueError(f"future head source must be 'memory', 'motion' or 'trunk', got {source!r}")
     if targets is not None and tuple(targets) != FUTURE_LABEL_KEYS:
         raise ValueError(f"this checkpoint's future head was trained on targets {list(targets)}, "
                          f"which are not this build's {list(FUTURE_LABEL_KEYS)}")

@@ -169,6 +169,18 @@ sharing the actor's, for the same reason it already carries its own stem: it rea
 state, and sharing the recurrence would be the one place a value gradient reached the actor's
 trunk. The six-frame stack stays the input; memory extends the window past the 150 ms it covers.
 
+**A second, small state (optional, `--motion-memory`).** The recurrence can be *split*: a separate
+GRU of at most 64 units, fed not by the trunk embedding but by a small convolutional encoder of the
+**aligned residual rows** alone (`learn/aligned.py` — the current scan minus the previous one warped
+into the current frame with the car's measured speed, yaw rate and roll/pitch). Its output enters the
+same first-layer preactivation through its own zero-initialised projection, and its state rides
+inside the same hidden tensor as the main one, `[h_main | h_dyn]`, so no inference path learns about
+a second state. Train-time auxiliaries — a per-beam "is this beam on another car" mask on the
+encoder's features, the nearest opponent's current relative velocity from `h_dyn`, and the existing
+future head — attach to that branch and **only** to it, so that the main representation cannot absorb
+them through the ego-dynamics shortcut. The heads are never called by the forward and are therefore
+absent from the exported graph; deployment uses only what `h_dyn` projects into the plan head.
+
 The hidden state is never held inside the module. It is passed in and returned by
 `act()` / `evaluate()` / `Actor.step()`, and every caller resets it at episode boundaries — a
 hidden state carried across a reset is a policy remembering a track it is no longer on. The
