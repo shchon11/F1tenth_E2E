@@ -716,53 +716,79 @@ result: the suite runs a cell at one fixed batch width, and at a fixed width thi
 bit-identical run to run (verified, max \|Δ\| exactly 0.0). Reproducing a row means re-running the
 same cells, not re-running them at a different width.
 
-### Preliminary: the first D3 cells say the limit is the demonstrations, not the architecture
+### The D3 row, complete (64/64, 2026-09-16 05:08)
 
-Root started the scoring lane at 03:26. **These are 13 of 64 cells and are not a row** — the numbers
-below will move. They are recorded now because what they point at is checkable *without* the rest of
-the suite, and it has been checked.
+The TinyLidarNet architecture trained on **our** demonstrations, scored on the same 64 cells, same
+digest, same device as everything in Table 1. Beside the published weights of the same network:
 
-On the 13 cells both have scored, paired:
+| | S/384 | A/96 | O/32 | mean route fraction | timeouts | collisions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **TinyLidarNet arch, our demonstrations** | **48** | **35** | **0** | **0.665** | 242 | 94 |
+| TinyLidarNet, published weights | 47 | 1 | 9 | 0.416 | **0** | 356 |
 
-| | clean | mean route fraction | achieved speed |
-| --- | --- | --- | --- |
-| D3 student (TinyLidarNet architecture, **our** demonstrations) | 0/104 | **0.662** | 2.41 m/s |
-| published TinyLidarNet weights | 39/96 | 0.637 | 4.22 m/s |
+Two networks with identical architecture, differing only in what they were shown. The solo totals
+are a coincidence and the per-map numbers say so:
 
-The student gets **further round the track** than the published weights and scores nothing, because
-**66 of its failures are timeouts** where the published model has not timed out once in 512 trials.
-Those timeout trials reach **78 % of the lap on 100 % of the clock**. It is not crashing; it runs
-out of time.
+| map | lap | ours | published |
+| --- | ---: | ---: | ---: |
+| `rt:Monza` | 446 m | **48/48** | 0/48 |
+| `gen:control:9100` | 57 m | 32/112 | 10/112 |
+| `real:map12x16` | 36 m | 3/80 | 1/80 |
+| `real:korea_2025_iccas` | 43 m | **0/48** | **37/48** |
+| `real:blackbox2022_3` | 106 m | 0/48 | 2/48 |
+| `gen:competition:0` | 68 m | 0/48 | 5/48 |
+| `gen:competition:9200+pinch9200` | 60 m | 0/48 | 2/48 |
+| `real:map16x07` | 33 m | 0/80 | 0/80 |
 
-**Why, and this is the part that does not need the other 51 cells.** On the same 100 recorded bag
-scans, the student commands a median **2.41 m/s** against the published model's **4.23 m/s**. That
-is not the speed-map normalisation: the teacher's own iteration-0 labels have median **2.90 m/s**,
-mean 3.07, with 20 % of samples below 2 m/s and a maximum of 7.61. The student is reproducing the
-speed distribution it was shown. Faithful imitation of a slow expert looks exactly like this.
+**48 against 47 solo is two systems that share a total and almost nothing else.** Ours takes Monza
+48/48 where theirs never finishes; theirs takes the 43 m real floor 37/48 where ours never finishes.
 
-**A caveat that is mine, not the data's.** The obvious reading is that demonstrations collected in a
-*race* — three cars, reactive opponents, events, procedural obstacles — carry traffic-limited
-speeds, and the solo S family then converts those into timeouts. That is a hypothesis, and this
-buffer cannot settle it: the buffer that produced this student recorded no opponent distance, so the
-teacher's speed with and without a car in range cannot be separated after the fact. The alternative
-— that this raceline teacher is simply conservative everywhere — fits the same numbers, and the two
-have different consequences: one says the *demonstrations* must be collected differently, the other
-says the *teacher* must change.
+**Avoidance, 1/96 → 35/96, is the result the contract was built to get.** TinyLidarNet's training
+set — real-car bags from one 2023 competition — contained no obstacles; ours contains procedural
+ones. Same 220 686 parameters, same layers, 35× the clears.
 
-**That field now exists**, for the same reason and on the same terms as the plan label.
-`DemoBuffer.G` is the signed arc gap to the nearest opponent at the moment each label was produced —
-read pre-step, so it describes the situation the command is answering, and `inf` when the car is
-alone — and `speed_by_contention()` splits the label speeds at the suite's own 12 m contention
-range. It reuses `benchmark/overtake._wrapped_gaps` rather than inventing a second wrapping
-convention, and a test asserts the two agree exactly. It does not rescue this checkpoint, whose
-buffer is already written; it means the next collection answers the question instead of raising it
-again.
+The obvious objection is that ours simply drives slower and so has longer to react, and the suite
+already contains the control: the published network under its *own* slower `−0.5–7.0` mapping.
 
-What this does *not* say is anything yet about the architecture, which is what D3 exists to isolate.
-The network is TinyLidarNet's, layer for layer, verified against the published weights to 3.6e-7
-before training. On this evidence the binding constraint is the data.
+| on the A cells | clears | achieved speed |
+| --- | ---: | ---: |
+| ours (our demonstrations) | **35/96** | 2.32 m/s |
+| published, `1–8` mapping | 1/96 | 2.34 m/s |
+| published, `−0.5–7.0` mapping | 0/96 | 1.14 m/s |
 
-**The full row, and the End2Race arm, are still to come.** Scoring it needs one benchmark lane and all
+Ours clears 35 at **the same speed** the published network manages 1 at, and halving that network's
+speed makes avoidance *worse*, not better. Slowness is not the mechanism; the demonstrations are.
+
+**Overtaking, 9/32 → 0/32, is the dry run's declared limitation arriving on schedule.** The
+checkpoint has carried this sentence since before it was scored: *"RacelineTeacher (grip 'true'):
+the DRY RUN. It is blind to the other cars, so a student distilled from it can at best learn 'pass
+the car you see'."* A teacher that does not react to traffic cannot demonstrate holding a pass, and
+its student does not hold one. This row is evidence about **the teacher**, not about the
+architecture, and it is the single strongest argument for re-running on `InteractiveTeacher`.
+
+**And the 242 timeouts have an exact arithmetic cause.** The suite's budget is `track_length / 3.0`
+on every cell — measured, `track_length ÷ time_budget` = 2.9955…2.9990 across all 64 — so a cell
+buys **one lap at 3.00 m/s**. Against that bar:
+
+* the teacher's own demonstrated speeds have median **2.90 m/s**, with **52.9 % of its labels below
+  3.00**. The expert sits on the threshold.
+* the student, imitating it faithfully, achieves **2.41 m/s** off Monza, and clears 3.00 m/s in
+  **3 of 464** trials.
+* on Monza it achieves **4.15 m/s** — and takes all 48.
+
+It is not failing to drive. It travels **0.665** of a route against the published model's 0.416 and
+runs out of clock at 78 % of a lap. It is imitating an expert whose speeds do not clear the
+evaluation's own bar, and it inherits that exactly.
+
+**What this row settles and what it does not.** It settles that on identical architecture the
+demonstrations decide obstacle competence (1 → 35) and traffic competence (9 → 0, in the direction
+the teacher's own recorded limitation predicts). It does **not** settle why the raceline teacher
+drove at 2.90 m/s — whether traffic held it there or it is conservative everywhere — because the
+buffer behind this checkpoint recorded no opponent distance. `DemoBuffer.G` now records it, so the
+next collection answers that instead of raising it again.
+
+**The End2Race arm is still to come**, and the `InteractiveTeacher` re-run needs the merge and one
+flag. Scoring it needs one benchmark lane and all
 three are committed to the v2.1 traffic rows; the End2Race arm has not been started at all. Both
 commands are recorded in `work/baselines/STATUS.md` under "Blocked, needs root". Until those run,
 the honest statement of this section is that the pipeline is demonstrated end to end for one of the
