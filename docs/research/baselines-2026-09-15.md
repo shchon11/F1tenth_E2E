@@ -438,8 +438,18 @@ neither is a fix.
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
 opponents and an `event` scenario where they brake, stop and change line. **Both published baselines
-are complete**; our two reference rows are still running and are deliberately absent rather than
-shown partial.
+are complete**; our reference rows are still running and are deliberately absent rather than shown
+partial.
+
+One property of this table is worth stating before its rows arrive, because it is what lets them sit
+together at all. The published baselines drive in `direct` mode (`act_dim` 2) and ours in `plan`
+mode (`act_dim` 8), so their observation layouts hash to **different** `obs_spec_sha256` and can
+never be pooled naively. What makes the comparison legitimate is that the *physical* start is
+identical anyway: across every cell the two kinds share — 144 for End2Race, 143 for
+`frozen_original@legacy`, and counting up as the rest land — **the `physical_sha256` differs in
+zero**. Same track, same spawn, same friction, same opponents; only the observation encoding
+differs. `validate_results` groups by layout and pairs within groups, `assert_physically_paired`
+checks across them, and `claim_check.py` now pins it independently.
 
 | | S/384 | A/96 | O/32 | T/640 | T:slow | T:pace | T:event | T:pair | passes held | car contacts |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -566,7 +576,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **90
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **95
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
