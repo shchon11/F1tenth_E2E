@@ -525,7 +525,18 @@ class ControllerNode(Node):
              ("speed_cap_mps", f"{self.speed_cap:.3f}"),
              ("n_beams", str(int(self.spec.n_beams))),
              ("range_max_m", f"{float(self.spec.range_max):.3f}"),
-             ("v_max_mps", f"{float(self.spec.v_max):.3f}")]
+             ("v_max_mps", f"{float(self.spec.v_max):.3f}"),
+             # The tracker's model of this car. Published because it is the difference between the
+             # command this node sends and the one an in-process tracker with the simulator's own
+             # per-car draw would send -- see docs/research/ros-graph-2026-09-15.md.
+             ("sensor_timeout_s", f"{self.timeout:.3f}"),
+             ("plan_timeout_s", f"{self.plan_timeout:.3f}"),
+             ("cmd_delay_s", f"{float(self.delay[0]):.5f}"),
+             ("wheelbase_m", f"{float(self.tracker.wb):.5f}"),
+             ("steer_max_rad", f"{self.steer_max:.5f}"),
+             ("steer_bias_rad", f"{self.cal[0]:.5f}"),
+             ("steer_gain", f"{self.cal[1]:.5f}"),
+             ("speed_gain", f"{self.cal[2]:.5f}")]
         if self.clearance is not None and self.clearance.last is not None:
             v.append(("clearance_after_m", f"{float(self.clearance.last.clear_after[0]):.3f}"))
         return v

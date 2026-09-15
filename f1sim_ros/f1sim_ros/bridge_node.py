@@ -34,22 +34,13 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from f1sim import Config, Simulator, Track
 
-
-def yaw_to_quat(yaw: float) -> Quaternion:
-    q = Quaternion(); q.z = math.sin(yaw / 2); q.w = math.cos(yaw / 2); return q
-
-
-def rpy_to_quat(r: float, p: float, y: float) -> Quaternion:
-    cr, sr, cp, sp, cy, sy = (math.cos(r / 2), math.sin(r / 2), math.cos(p / 2),
-                              math.sin(p / 2), math.cos(y / 2), math.sin(y / 2))
-    q = Quaternion()
-    q.w = cr * cp * cy + sr * sp * sy; q.x = sr * cp * cy - cr * sp * sy
-    q.y = cr * sp * cy + sr * cp * sy; q.z = cr * cp * sy - sr * sp * cy
-    return q
-
-
-def quat_to_yaw(q) -> float:
-    return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+# The sensor messages themselves are `f1sim_ros/sim_messages.py`, shared with `eval_node`: two
+# simulator-side publishers that disagreed about a field -- a scan stamp, an IMU sample's
+# orientation covariance -- would make "the node cannot tell which simulator it is attached to"
+# false, and that is the claim the whole split rests on.
+from f1sim_ros.sim_messages import (gt_odom_message, imu_messages, odom_message,  # noqa: F401
+                                    quat_to_yaw, rpy_to_quat, scan_message,
+                                    scan_sweep_seconds, yaw_to_quat)
 
 
 class BridgeNode(Node):
@@ -181,77 +172,31 @@ class BridgeNode(Node):
     def publish_imu(self, samples: np.ndarray, att: np.ndarray, now, offsets: np.ndarray):
         """samples (K, 6): gyro xyz, accel xyz. offsets (K,): seconds before `now` each was taken.
 
-        The IMU runs on its own clock, so the last sample of a control step is generally NOT at the
-        step boundary and the samples are not a fixed count apart -- a 50 Hz sensor on a 40 Hz loop
-        emits 1, 1, 1, 2 per step. Deriving the stamps from an assumed spacing ending at `now` put
-        every sample but the occasional last one at a time it was not taken; the simulator now
-        reports the real offsets and they are used verbatim.
+        The messages themselves are `sim_messages.imu_messages`; what is this node's own business
+        is the clock the offsets are measured from.
         """
         from rclpy.duration import Duration
-        K = samples.shape[0]
-        for k in range(K):
-            m = Imu(); m.header.frame_id = "imu"
-            m.header.stamp = (now - Duration(seconds=float(offsets[k]))).to_msg()
-            g, a = samples[k, :3], samples[k, 3:]
-            m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z = float(g[0]), float(g[1]), float(g[2])
-            m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z = float(a[0]), float(a[1]), float(a[2])
-            # `r.imu_att` is one attitude estimate for the whole control step, measured at its end,
-            # so only the LAST sample has an orientation that belongs to it. Publishing it on the
-            # earlier samples would copy a future attitude backwards; publishing it on none would
-            # leave a consumer subscribing only to this topic without any quaternion at all.
-            if k == K - 1:
-                m.orientation = rpy_to_quat(float(att[0]), float(att[1]), float(att[2]))
-            else:
-                m.orientation_covariance[0] = -1.0                  # not measured at this sample
+        raw, summary = imu_messages(samples, att, offsets,
+                                    lambda dt: (now - Duration(seconds=dt)).to_msg())
+        for m in raw:
             self.pub_imu_raw.publish(m)
-        # the summary message carries the LATEST sample, so it is stamped at that sample's time
-        m = Imu(); m.header.frame_id = "imu"
-        m.header.stamp = (now - Duration(seconds=float(offsets[-1]))).to_msg()
-        g, a = samples[-1, :3], samples[-1, 3:]
-        m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z = float(g[0]), float(g[1]), float(g[2])
-        m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z = float(a[0]), float(a[1]), float(a[2])
-        m.orientation = rpy_to_quat(float(att[0]), float(att[1]), float(att[2]))
-        self.pub_imu.publish(m)
+        self.pub_imu.publish(summary)
 
     def publish_scan(self, ranges: np.ndarray, now):
-        """LaserScan.header.stamp is the acquisition time of the FIRST ray, per the ROS 2
-        message definition, not of the scan's completion. `now` is the end of the control step,
-        which is when the LAST ray was traced (Lidar.scan anchors time_frac at 0 for the final
-        beam), so the header goes back by one full sweep.
-
-        The convention a particular driver actually used when the raw bags were recorded is a
-        separate, unvalidated question -- this only makes what we publish self-consistent with the
-        metadata we publish beside it.
-        """
-        m = self.sim.scan_meta()
+        """`now` is the end of the control step; the header stamp goes back one full sweep, because
+        `LaserScan.header.stamp` is the acquisition time of the FIRST ray."""
         from rclpy.duration import Duration
-        sweep = m["time_increment"] * (len(ranges) - 1)
-        stamp = (now - Duration(seconds=sweep)).to_msg()
-        msg = LaserScan()
-        msg.header.stamp = stamp; msg.header.frame_id = self.laser_frame
-        msg.angle_min, msg.angle_max, msg.angle_increment = m["angle_min"], m["angle_max"], m["angle_increment"]
-        msg.time_increment, msg.scan_time = m["time_increment"], m["scan_time"]
-        msg.range_min, msg.range_max = m["range_min"], m["range_max"]
-        msg.ranges = ranges.astype(np.float32).tolist()
-        self.pub_scan.publish(msg)
+        meta = self.sim.scan_meta()
+        stamp = (now - Duration(seconds=scan_sweep_seconds(meta, len(ranges)))).to_msg()
+        self.pub_scan.publish(scan_message(meta, ranges, stamp, self.laser_frame))
 
     def publish_odom(self, od, st, stamp):
-        # VESC odom (drifting), odom -> base_link
-        o = Odometry(); o.header.stamp = stamp; o.header.frame_id = self.odom_frame; o.child_frame_id = self.base_frame
-        o.pose.pose.position.x, o.pose.pose.position.y = float(od[0]), float(od[1])
-        o.pose.pose.orientation = yaw_to_quat(float(od[2]))
-        o.twist.twist.linear.x, o.twist.twist.angular.z = float(od[3]), float(od[4])
-        self.pub_odom.publish(o)
+        self.pub_odom.publish(odom_message(od, stamp, self.odom_frame, self.base_frame))
         t = TransformStamped(); t.header.stamp = stamp; t.header.frame_id = self.odom_frame; t.child_frame_id = self.base_frame
         t.transform.translation.x, t.transform.translation.y = float(od[0]), float(od[1])
         t.transform.rotation = yaw_to_quat(float(od[2]))
         tfs = [t]
-        # ground truth in map frame
-        g = Odometry(); g.header.stamp = stamp; g.header.frame_id = self.map_frame; g.child_frame_id = self.base_frame
-        g.pose.pose.position.x, g.pose.pose.position.y = float(st[0]), float(st[1])
-        g.pose.pose.orientation = yaw_to_quat(float(st[2]))
-        g.twist.twist.linear.x, g.twist.twist.linear.y, g.twist.twist.angular.z = float(st[3]), float(st[4]), float(st[5])
-        self.pub_gt.publish(g)
+        self.pub_gt.publish(gt_odom_message(st, stamp, self.map_frame, self.base_frame))
         if self.publish_gt_tf:
             # map -> odom such that (map -> odom) * (odom -> base) == ground truth
             dyaw = float(st[2] - od[2])

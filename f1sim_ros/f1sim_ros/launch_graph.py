@@ -73,5 +73,7 @@ def controller_node(**kw):
                 output="screen", parameters=[LaunchConfiguration("config_yaml"), params])
 
 
-def graph_nodes(**kw):
-    return [policy_node(**kw.pop("policy_kw", {})), controller_node(**kw.pop("controller_kw", {}))]
+def graph_nodes(policy_kw=None, controller_kw=None):
+    """The two nodes, with per-target parameter overrides. `graph_eval` uses them to raise the
+    staleness timeouts, because its "sensor stream" is a CPU simulator and not a LiDAR."""
+    return [policy_node(**(policy_kw or {})), controller_node(**(controller_kw or {}))]
