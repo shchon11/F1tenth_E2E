@@ -448,13 +448,21 @@ those trials fail is by hitting a **wall** (65), which is the same way it fails 
 this suite.
 
 The 0.02 m median gap during a pass is also not evidence of recklessness, which is the other thing I
-would have read into it. On the 26 traffic cells all four systems have finished, the median gap at
-the moment of a pass is **0.02 m for every one of them, ours included** — it is what the metric
-means, not a property of this driver. The number that does separate them runs the other way: median
-closest gap over *all* trials is 1.19 m for TinyLidarNet and 1.58 m for End2Race against **0.11 m
-for both of ours**. The published baselines keep *further* from other cars than our policies do.
-They are not aggressive; they are oblivious, and obliviousness looks like distance until the gap
-closes on its own.
+would have read into it. On the traffic cells all four systems have finished, the median gap at the
+moment of a pass is **0.02 m for every one of them, ours included** — it is what the metric means,
+not a property of this driver. The number that does separate them runs the other way: median closest
+gap over *all* trials is **~1.2 m for TinyLidarNet and ~1.6 m for End2Race against ~0.1 m for both
+of ours** — an order of magnitude. The published baselines keep *further* from other cars than our
+policies do. They are not aggressive; they are oblivious, and obliviousness looks like distance
+until the gap closes on its own.
+
+Those decimals are deliberately soft, and why is a small object lesson in the same failure this
+section is about. The figure is paired over the traffic cells all four systems have finished, and
+**that set grows while the v2.1 lanes run**: frozen `@legacy`'s median moved 0.11 → 0.10 in the
+twenty minutes between my writing this paragraph and first running `claim_check.py` over it, and the
+paired set went from 26 cells to 39. The order-of-magnitude separation is stable under the set
+changing; the second decimal is not. So the script pins the separation and a 5× ratio, and refuses
+to pin decimals that are not settled until the rows are complete.
 
 The four scenarios separate the way you would expect if the opponent is being treated as scenery —
 best against a `slow` car (24/160), worst when there are two of them (`pair`, 16/160):
@@ -514,6 +522,7 @@ evidence that settles each:
 | End2Race "is commanding a speed calibrated for the tracks it learned on" | **REVERSED** | that predicts the slower 0 m fill helps most on short tracks and least on Monza. Both fail: Monza (446 m) gains **+23**, the two tightest floors gain **0**, and the whole +82 is in **2 of 8 maps**. The probe's own cell is 72 % of the effect |
 | "End2Race's three successes are all on Monza" | **REWORDED** | true of the **solo** family only; it has 3 more in **O** on `gen:control:9100`, which the per-map table already showed |
 | "mean progress 5 m on the small maps" | **REWORDED** | 5.1 m on the two tightest floors, **10.3 m pooled** over all non-Monza maps, 18.1 m on `gen:control:9100` |
+| the baselines drive closer to other cars than ours do | **REWORDED** | backwards: median closest gap over all trials is ~1.2 m and ~1.6 m for the baselines against ~0.1 m for both of ours. Not aggressive — oblivious |
 | the runtime layer costs 58 solo / 27 avoidance / 8 passes | **verified, refined** | S 217→275, A 30→57, O 17→25. Per cell it is a net not a uniform effect: the clamp **helps 24 solo cells and hurts 14**, helps 8 avoidance and hurts 3 |
 | "every one of the 640 traffic trials met traffic" | **verified** | `contended` = 640/640 |
 | the 144 car contacts are the price of the 165 passes | **REVERSED** (above) | 142 of 144 are in trials with **no pass at all**; passing trials end in car contact **2** times in 144 |
