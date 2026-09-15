@@ -226,10 +226,21 @@ re-measured" below for why the published numbers of our own checkpoints are not 
 | **TinyLidarNet-L**, speed map 1-8 | published, zero-shot | 47 | 45 | 11/128 | 18/128 | 18/128 | **1** | 9 | 18.02 |
 | TinyLidarNet-L, speed map -0.5-7.0 | published, zero-shot | 31 | 31 | 13/128 | 9/128 | 9/128 | 0 | 0 | 18.90 |
 | **End2Race**, rear filled 30 m | published, zero-shot | 3 | 3 | 0/128 | 0/128 | 3/128 | **0** | 3 | 40.13 |
+| End2Race, 100 Hz recurrence | published, zero-shot | 1 | 1 | 0/128 | 0/128 | 1/128 | 0 | 0 | 45.73 |
 
 Rendered and validated by the benchmark's own reporter, which checks every pin, every cell against
 the frozen grid, and the paired start of every row before it will render:
-`work/baselines/out/leaderboard-v2.md`, 8 systems, 512 cells, one source digest, `device: cpu`.
+`work/baselines/out/leaderboard-v2.md`, **9 systems, 576 cells**, one source digest, `device: cpu`.
+
+**Their 100 Hz evaluation rate is not what is holding End2Race back.** CONTRACT.md and root both
+asked for the rate inconsistency to be measured rather than argued about: their evaluation steps the
+GRU every 10 ms (`eval_singleagent.py:38`) while the CSVs it learned from were sampled at 10 Hz
+(`demonstration.py:213`), and this project's loop is 40 Hz between the two. Ticking the GRU 2.5
+times per control step on the held scan — exactly 100 Hz in the long run, with the plant still at
+40 Hz — gives **1/384 against 3/384, and 45.7 collisions per km against 40.1**: marginally worse,
+and nowhere near the eighteen-fold swing the fill convention produces. Here the one-cell probe and
+the 64-cell row agree; that they did *not* agree for TinyLidarNet's speed mapping is exactly why
+this one was run at suite scale too.
 
 **A701 `@legacy` is the "policy only" row CONTRACT.md asks for**, and it is worth reading beside
 A701 `@fixed_low`: the same weights, with the plan tracker untouched instead of clamped, lose
