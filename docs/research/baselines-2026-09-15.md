@@ -353,11 +353,44 @@ first complete one.
 |---|---|---|---|---|---|---|---|---|---|---|
 | **TinyLidarNet-L** | 47 | 1 | 9 | **78/640** | 24/160 | 19/160 | 19/160 | 16/160 | **165** | 144 |
 
-Every one of the 640 trials met traffic inside the contention window, so the family measured what it
-is for. **165 held passes from a network that has never seen another car** is the headline, and the
-144 car contacts beside it is the price: it passes by driving through the space rather than around
-it. The four scenarios separate the way you would expect if the opponent is being treated as scenery
-— best against a `slow` car (24/160), worst when there are two of them (16/160).
+Every one of the **640/640** trials met traffic inside the contention window, so the family measured
+what it is for. **165 held passes from a network that has never seen another car** is the headline.
+The 144 car contacts sit beside it, and what they are is worth getting right — my first reading of
+them was wrong.
+
+**Correction: the contacts are not the price of the passes.** I wrote that this row showed a car
+"passing by driving through the space rather than around it", from the two totals alone. Split by
+trial, that does not survive:
+
+| | trials | clean | wall collision | **car contact** | median closest gap |
+| --- | --- | --- | --- | --- | --- |
+| trials with ≥1 pass | 144 | 77 | 65 | **2** | 0.02 m |
+| trials with no pass | 496 | 1 | 353 | **142** | 1.56 m |
+
+**142 of the 144 contacts are in trials where it never completed a pass at all.** A contact is not
+what its overtakes cost; it is what happens instead of one — it closes on the car ahead and drives
+into it. When it does get by, it gets by cleanly of the other car in 142 of 144 trials, and the way
+those trials fail is by hitting a **wall** (65), which is the same way it fails everywhere else in
+this suite.
+
+The 0.02 m median gap during a pass is also not evidence of recklessness, which is the other thing I
+would have read into it. On the 26 traffic cells all four systems have finished, the median gap at
+the moment of a pass is **0.02 m for every one of them, ours included** — it is what the metric
+means, not a property of this driver. The number that does separate them runs the other way: median
+closest gap over *all* trials is 1.19 m for TinyLidarNet and 1.58 m for End2Race against **0.11 m
+for both of ours**. The published baselines keep *further* from other cars than our policies do.
+They are not aggressive; they are oblivious, and obliviousness looks like distance until the gap
+closes on its own.
+
+The four scenarios separate the way you would expect if the opponent is being treated as scenery —
+best against a `slow` car (24/160), worst when there are two of them (`pair`, 16/160):
+
+| variant | success | passes | contacts |
+| --- | --- | --- | --- |
+| `slow` | 24/160 | 42 | 36 |
+| `event` | 19/160 | 48 | 42 |
+| `pace` | 19/160 | 25 | 22 |
+| `pair` | 16/160 | 50 | 44 |
 
 ### The two suite runs reproduce each other exactly — four systems, 256 cells
 
