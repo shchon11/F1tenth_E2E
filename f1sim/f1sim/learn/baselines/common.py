@@ -110,11 +110,22 @@ class BaselineDriver:
         return self.source
 
     def adapt(self, ranges_m) -> np.ndarray:
-        """The bound scanner's returns, in the shape and units the model was trained on."""
+        """The bound scanner's returns, in the shape and units the model was trained on.
+
+        The first thing done is a clamp at the SOURCE scanner's own `range_max`, and it is
+        load-bearing rather than tidy. A Hokuyo UST-10LX is usable to 10 m but still emits returns
+        out to ~30 m, and the bags contain them; the simulator, meanwhile, saturates its scan at
+        `cfg.lidar.range_max` before the observation is built (`gym_env._norm_scan`). Without the
+        clamp the node would hand End2Race a 14 m return where the batched adapter hands it 10, and
+        the two would not be comparing the same measurement -- which is exactly what the parity test
+        caught: a 4.4 m disagreement on single beams, amplified by the GRU into 8 mm/s of speed.
+        Beyond a scanner's declared range there is no measurement to preserve.
+        """
         if self.source is None:
             raise BaselineError(f"{self.KIND}: bind_scanner() has not been called; the driver does "
                                 f"not know what scanner it is reading")
-        r = np.asarray(ranges_m, dtype=np.float32)
+        r = np.minimum(np.asarray(ranges_m, dtype=np.float32),
+                       np.float32(self.source["range_max"]))
         if self.source["identity"]:
             return np.minimum(r, np.float32(self.scan.range_max))
         return map_scan(r, src_fov=self.source["fov"], src_range_max=self.source["range_max"],
