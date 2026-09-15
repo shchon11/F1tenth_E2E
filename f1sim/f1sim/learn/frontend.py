@@ -52,9 +52,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#: The three per-beam classes, in the order the logits are laid out.
-CLASSES = ("solid", "floor", "none")
-SOLID, FLOOR, NONE = 0, 1, 2
+#: The per-beam classes, in the order the logits are laid out.
+#:
+#: **Four, not three,** and the fourth is the point. A floor hit at grazing incidence usually does
+#: not come back: `lidar.floor_dropout` removes 41-46 % of them in simulation (measured), and root's
+#: reading of `real_data_calibration.md` §2.9 is that on a real floor the share is higher still. A
+#: three-class label calls every one of those `none`, so the network is told nothing about the
+#: commonest thing the floor does -- and the distinction matters to whoever reads the channel,
+#: because "no return because the beam went to the floor" means the bearing is CLEAR out to at
+#: least the floor range, while "no return" on its own means nothing at all.
+#:
+#: Both labels are free: `scan_type == HIT_GROUND` says the beam reached the floor whether or not
+#: the return survived the dropout model.
+CLASSES = ("solid", "floor", "none_floor", "none_other")
+SOLID, FLOOR, NONE_FLOOR, NONE_OTHER = 0, 1, 2, 3
+#: Beams with no return at all, either way -- what the range loss must not be scored on.
+NONE = NONE_FLOOR
 
 
 def frontend_spec(width: int = 20, depth_width: int = 56, imu_width: int = 48,
@@ -122,7 +135,16 @@ class FrontEnd(nn.Module):
         # 2.8 MFLOP and the whole budget is ~2, while the receptive field it would add is two beams
         # that the encoder has already seen. Measured, not assumed -- see `budget.py`'s row.
         self.u1 = nn.Sequential(nn.Conv1d(w * 2 + w, w, 1), nn.GELU())
-        self.head = nn.Conv1d(w, 4, 1)              # 3 class logits + 1 range residual
+        #: A local, full-resolution branch on the raw frames, and the reason it exists is measured.
+        #: Without it the head's only full-resolution operator is a 1x1 convolution on a **linearly
+        #: upsampled** feature map, so the residual it can express is smooth across beams -- and a
+        #: smooth residual cannot cancel per-beam white noise. Trained that way the denoiser sat at
+        #: 0.82 cm MAE against the identity's 0.821 for six epochs, and weighting the term ten times
+        #: harder did not move it: it was not an optimisation problem. Three taps over the six raw
+        #: frames is 117 k multiply-accumulates of a ~1.5 M network and gives the head the
+        #: neighbours an average needs.
+        self.local = nn.Sequential(nn.Conv1d(self.k_stack, 6, 3, padding=1), nn.GELU())
+        self.head = nn.Conv1d(w + 6, len(CLASSES) + 1, 1)   # class logits + 1 range residual
         #: Zero, so an untrained front-end classifies everything at the uniform prior and denoises
         #: to the identity -- the same discipline every other addition in this project keeps.
         nn.init.zeros_(self.head.weight)
@@ -150,9 +172,10 @@ class FrontEnd(nn.Module):
         u = self.u3(torch.cat([_up(b, e3.shape[-1]), e3], 1))
         u = self.u2(torch.cat([_up(u, e2.shape[-1]), e2], 1))
         u = self.u1(torch.cat([_up(u, e1.shape[-1]), e1], 1))
-        out = self.head(_up(u, n))
-        rng = (scan[:, 0] + self.RANGE_SPAN * torch.tanh(out[:, 3])).clamp(0.0, 1.0)
-        return out[:, :3], rng, att
+        out = self.head(torch.cat([_up(u, n), self.local(scan)], 1))
+        c = len(CLASSES)
+        rng = (scan[:, 0] + self.RANGE_SPAN * torch.tanh(out[:, c])).clamp(0.0, 1.0)
+        return out[:, :c], rng, att
 
 
 def _up(x: torch.Tensor, size: int) -> torch.Tensor:
@@ -230,7 +253,7 @@ def frontend_losses(logits, rng, att, label, clean, att_true, weights=(1.0, 1.0,
                     class_weight: Optional[torch.Tensor] = None):
     """`(total, parts)` -- cross-entropy on the class, L1 on the range, L2 on the attitude.
 
-    `label` (B, N) int in {0, 1, 2}; `clean` (B, N) the noise-free normalised range; `att_true`
+    `label` (B, N) int indexing `CLASSES`; `clean` (B, N) the noise-free normalised range; `att_true`
     (B, 2) rad. The range term is scored only where the beam **returned something** -- a no-return
     beam has no range to denoise and its clean value is `range_max`, which would train the head to
     reach for the ceiling.
@@ -240,7 +263,7 @@ def frontend_losses(logits, rng, att, label, clean, att_true, weights=(1.0, 1.0,
     head's capacity on them.
     """
     ce = F.cross_entropy(logits.float(), label.long(), weight=class_weight, reduction="mean")
-    ret = (label != NONE).float()
+    ret = (label < NONE_FLOOR).float()                   # solid or floor: the beams that returned
     l1 = ((rng.float() - clean.float()).abs() * ret).sum() / ret.sum().clamp_min(1.0)
     la = ((att.float() - att_true.float()) ** 2).mean()
     total = weights[0] * ce + weights[1] * l1 + weights[2] * la
@@ -252,6 +275,12 @@ def frontend_losses(logits, rng, att, label, clean, att_true, weights=(1.0, 1.0,
             p = pred == i
             parts[f"recall_{name}"] = (p & t).sum() / t.sum().clamp_min(1)
             parts[f"precision_{name}"] = (p & t).sum() / p.sum().clamp_min(1)
+        # The two no-return classes, scored together as well: telling them apart is the new ask,
+        # and "did it at least know there was no return" is the older, easier one.
+        none_t = label >= NONE_FLOOR
+        none_p = pred >= NONE_FLOOR
+        parts["recall_none_any"] = (none_p & none_t).sum() / none_t.sum().clamp_min(1)
+        parts["precision_none_any"] = (none_p & none_t).sum() / none_p.sum().clamp_min(1)
         parts["att_rmse_roll"] = ((att[:, 0] - att_true[:, 0]) ** 2).mean().sqrt()
         parts["att_rmse_pitch"] = ((att[:, 1] - att_true[:, 1]) ** 2).mean().sqrt()
     return total, parts

@@ -592,8 +592,11 @@ def test_frontend_at_init_is_the_uniform_prior_and_the_identity(tmp_path):
     ego = torch.zeros(3, int(idx["ego_dim"]))
     with torch.no_grad():
         logits, rng, att = m(scan, imu_vector(pro, idx, ego))
+    from f1sim.learn.frontend import CLASSES
     assert float(logits.abs().max()) == 0.0
-    assert torch.allclose(torch.softmax(logits, 1), torch.full_like(logits, 1.0 / 3.0))
+    assert logits.shape[1] == len(CLASSES)
+    assert torch.allclose(torch.softmax(logits, 1),
+                          torch.full_like(logits, 1.0 / len(CLASSES)))
     assert torch.equal(rng, scan[:, 0])
     assert float(att.abs().max()) == 0.0
     assert n_params(m) <= 150_000, "the contract's parameter budget"
@@ -639,7 +642,8 @@ def test_frontend_channels_are_zero_init_parity_and_refuse_without_one(tmp_path)
     pro[:, att_index_spec(sp)["accel"] + 2] = 9.81 / 10.0
     out = aug(scan, pro)
     assert out.shape == (2, 8, 256)
-    assert torch.allclose(out[:, -2], torch.full_like(out[:, -2], 1.0 / 3.0), atol=1e-6)
+    from f1sim.learn.frontend import CLASSES
+    assert torch.allclose(out[:, -2], torch.full_like(out[:, -2], 1.0 / len(CLASSES)), atol=1e-6)
     assert torch.allclose(out[:, -1], scan[:, 0], atol=1e-6)
     assert torch.allclose(out, aug.preview(scan, None, pro), atol=1e-6)
     with pytest.raises(ValueError, match="trained front-end"):
