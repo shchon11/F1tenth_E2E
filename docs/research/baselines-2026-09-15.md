@@ -437,9 +437,11 @@ neither is a fix.
 ## Table 2 — suite v2.1, the traffic family (in progress)
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
-opponents and an `event` scenario where they brake, stop and change line. **Both published baselines
-are complete**; our reference rows are still running and are deliberately absent rather than shown
-partial.
+opponents and an `event` scenario where they brake, stop and change line. **Both published baselines are complete, and so is
+our reference row** (`frozen_original@legacy`). A701 `@fixed_low` and A701 `@legacy` are still
+running and are **left out rather than shown partial** — `note_tables.py` marks a partial row
+`*(partial n/144)*` precisely so a half-finished row cannot be mistaken for a whole one, but a table
+in a research note should not carry them at all.
 
 One property of this table is worth stating before its rows arrive, because it is what lets them sit
 together at all. The published baselines drive in `direct` mode (`act_dim` 2) and ours in `plan`
