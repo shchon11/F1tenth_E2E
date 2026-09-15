@@ -204,11 +204,45 @@ is wrong, and neither is our sensor noise (D) nor the recurrence rate (E, which 
 
 What does move is **B**: told that the bearings behind it are a wall rather than open space, the
 model slows from 5.9 m/s to 3.7 m/s and five of eight cars get within a few metres of completing a
-57 m lap. The network is not broken and the integration is not wrong — it is commanding a speed
-calibrated for the tracks it learned on. Its demonstrations came from a lattice planner on
-f1tenth_racetracks circuits (Austin, Hockenheim, MoscowRaceway, Nürburgring), which are several
-hundred metres round; six metres per second into a corner of a 57 m lap is the sim-to-sim gap
-CONTRACT.md asks to be stated plainly, and this is it, measured.
+57 m lap. So the network is not broken and the integration is not wrong — that much the probe does
+establish, and it is what the probe was for.
+
+> **Correction — the probe's explanation does not survive the full suite, and the probe's own cell
+> was the worst possible one to draw it from.** I wrote that End2Race "is commanding a speed
+> calibrated for the tracks it learned on", its demonstrations coming from several-hundred-metre
+> f1tenth_racetracks circuits, so 6 m/s into the corner of a 57 m lap is the gap. That story predicts
+> the 0 m fill (which slows it) helps most on the *short* tracks and least on Monza, the one circuit
+> resembling its training. Scored over all 64 cells, both halves are wrong:
+>
+> | map | lap | 30 m fill | 0 m fill | Δ |
+> | --- | ---: | ---: | ---: | ---: |
+> | `real:map16x07` | 33 m | 0/80 | 0/80 | **0** |
+> | `real:map12x16` | 36 m | 0/80 | 0/80 | **0** |
+> | `real:korea_2025_iccas` | 43 m | 0/48 | 0/48 | **0** |
+> | `gen:control:9100` | 57 m | 3/112 | 62/112 | **+59** |
+> | `gen:competition:9200+pinch9200` | 60 m | 0/48 | 0/48 | **0** |
+> | `gen:competition:0` | 68 m | 0/48 | 0/48 | **0** |
+> | `real:blackbox2022_3` | 106 m | 0/48 | 0/48 | **0** |
+> | `rt:Monza` | **446 m** | 3/48 | 26/48 | **+23** |
+>
+> Slowing it down helps most on the **longest** circuit — Monza goes 3/48 → 26/48 — and does nothing
+> whatever on the two tightest floors, where mean progress barely moves (5.1 → 7.0 m, and 5.1 → 4.4 m,
+> which is *worse*). The whole +82 lives in **2 of 8 maps**.
+>
+> And the probe was run on `gen:control:9100`, which alone accounts for **+59 of the +82 — 72 % of
+> the entire effect**. I picked that cell before the rows existed, and it happens to be the single
+> map where the substitution does the most work. That is the same mistake as the TinyLidarNet
+> output-mapping probe in a new place: a one-cell diagnostic generalised to a suite, when the cell
+> was not representative of it.
+>
+> What stands: the integration is not broken (A vs C settles that), and the fill substitution moves
+> the row by a lot. **Why it moves those two maps and no others is not established.** The commanded
+> speed does drop, and the drop does coincide with the improvement in the probe's cell — but a
+> track-length mechanism is contradicted at both ends, so the speed story is a hypothesis this suite
+> does not support. Isolating it needs the experiment nobody has run: cap the commanded speed
+> externally at a fixed 30 m fill, and see whether the improvement reappears without touching the
+> scan. That separates "it drives too fast" from "the rear bearings change what it sees"; the two are
+> confounded in every row here, because one knob changes both.
 
 ## Table 1 — the published weights on held-out suite v2, zero-shot
 
@@ -302,11 +336,14 @@ beam that hits nothing (`laser_models.py:143-144`), 0.0 is what their evaluation
 it masks out (`eval_singleagent.py:114`). Swapping one for the other moves the row from **3/384 to
 53/384 solo, from 0/96 to 32/96 on avoidance, and from 40.1 to 12.9 collisions per km** — an
 eighteen-fold change in completions and thirty-two avoidance clears out of nothing, on identical
-weights and identical cells. The reason is in the probe above: told the space behind it is a wall
-rather than open road, the network commands 3.7 m/s instead of 5.9, and on a 33-68 m lap that is the
-difference between finishing and not. Root asked for the second variant to be run; on the evidence it
-is the more informative of the two, and a paper reporting only the no-return convention would have
-reported a number dominated by a substitution rather than by the model.
+weights and identical cells. Root asked for the second variant to be run; on the evidence it is the
+more informative of the two, and a paper reporting only the no-return convention would have reported
+a number dominated by a substitution rather than by the model.
+
+The *mechanism* is open, and the correction under the probe above says why: the commanded speed does
+fall from 5.9 to 3.7 m/s, but slowing it helps most on the **longest** circuit and not at all on the
+tightest floors, so "it was simply driving too fast for these tracks" is contradicted at both ends.
+One knob changes both the speed and what the rear bearings say, and no run here separates them.
 
 **"Dominated" is the right word for the row and the wrong word for the cells, so both belong here.**
 Paired cell by cell, the 0 m fill is better in **18 of 64**, worse in 1, and *identical in 45*; mean
@@ -474,6 +511,7 @@ evidence that settles each:
 | "covers 218 m a trial on Monza" | **REWORDED** | 218 m is a mean over **3.9–426.9 m**; only 9 of 48 trials lie within 10 % of it. One trial came within 20 m of finishing |
 | 37/48 on a held-out 43 m floor; a third of a lap on the tight floors | **verified** | 37/48 on `real:korea_2025_iccas` (43.4 m); 10.7 m of 33.3 m and 11.3 m of 36.1 m = 32 % and 31 % |
 | End2Race's row is "dominated by a substitution, not the architecture" | **verified, refined** | true of the row, not of the cells: paired, the 0 m fill is better in **18 of 64**, worse in 1, **identical in 45**. `approach_collision` is unchanged (64 both), and the 0 m variant adds **21 timeouts** of its own |
+| End2Race "is commanding a speed calibrated for the tracks it learned on" | **REVERSED** | that predicts the slower 0 m fill helps most on short tracks and least on Monza. Both fail: Monza (446 m) gains **+23**, the two tightest floors gain **0**, and the whole +82 is in **2 of 8 maps**. The probe's own cell is 72 % of the effect |
 | "End2Race's three successes are all on Monza" | **REWORDED** | true of the **solo** family only; it has 3 more in **O** on `gen:control:9100`, which the per-map table already showed |
 | "mean progress 5 m on the small maps" | **REWORDED** | 5.1 m on the two tightest floors, **10.3 m pooled** over all non-Monza maps, 18.1 m on `gen:control:9100` |
 | the runtime layer costs 58 solo / 27 avoidance / 8 passes | **verified, refined** | S 217→275, A 30→57, O 17→25. Per cell it is a net not a uniform effect: the clamp **helps 24 solo cells and hurts 14**, helps 8 avoidance and hurts 3 |
