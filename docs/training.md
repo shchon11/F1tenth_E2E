@@ -220,8 +220,50 @@ warm start stays bit-identical.
 |---|---|---|
 | `memory` | the closest return seen at each bearing recently, relaxing back toward "no return" with time constant `--scan-memory-tau` (default 2 s) | explicit cheap memory the GRU does not have to learn. Bearings are the car's own and are **not** motion-compensated: a LiDAR-only policy has no pose, so a box that leaves the window leaves a fading trace at the bearing it left by, not a transformed position |
 | `edges` | `abs(r[i] - r[i-1])` per beam | the crack between two boxes in a row is two range discontinuities a few beams apart; the gap the lane actually leaves is one. The stem's first layer is a stride-2 7-tap convolution, so a two-beam crack lands inside one tap — as its own channel it survives at full beam resolution |
+| `floor` | the per-beam likelihood that a return is the **floor** rather than a solid object, from the beam geometry and the scan plane's tilt (`learn/floor.py`). 0 = solid (and a beam with no return), 1 = floor, 0.5 = the attitude estimate is not usable | the scan plane is 0.110 m above the floor and follows the sprung body, so 2° of tilt puts the floor across the beam at 3.2 m and 5° at 1.3 m — a phantom wall exactly where a braking car looks. Measured on the held-out proxy tracks, floor returns are 4.4 % of all beams under braking against 1.7 % cruising, and the clearance arm bends or brakes for them on 3.5 % of all control steps |
 
-Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for both.
+Cost, measured with the rest of the budget below: 0.03 ms of a 25 ms control step for `memory` and
+`edges` together; the `floor` channel adds 0.15 ms.
+
+**Read `docs/research/floor-mask-2026-09-15.md` before turning `floor` on.** The geometry is exact
+and the channel is tested against the simulator's own `scan_type`, but its usefulness is bounded by
+how well the car knows its own tilt, and that is measured: with the *true* attitude the channel
+reaches precision 0.81 at recall 0.23; with the best estimate a car can actually have it reaches
+0.04. `--floor-att` picks the source — `tracker` (`floor.AttitudeTracker`, gyro-integrated with the
+accelerometer gated on quiescence, a zero reference learnt at rest and the yaw rate regressed out of
+the roll and pitch axes) or `vesc` (the orientation quaternion the ROS node reads today, which is
+wrong by 0.14 rad rms in roll while driving). Neither is good enough yet. The channel is in the tree
+because it is correct, cheap and becomes useful the moment a better attitude exists — which is what
+the front-end of `learn/frontend.py` is for.
+
+### A per-beam floor/solid head (`--aux-floor`)
+
+Off by default, and off the head is not built at all — same parameters, same state dict, same loss
+(`tests/test_floor_mask.py::test_aux_head_off_is_byte_identical`, and the frozen loss oracle stays
+green). On, `learn/floor_head.py` puts a small 1-D decoder on the **scan stem's own feature map**
+plus its input rows at full beam resolution, and asks it, per beam, whether the return is the floor
+or a solid object. The label is free in the simulator (`scan_type == HIT_GROUND`,
+`F1VecEnv.floor_labels`); beams with no return are excluded, because there is nothing there to
+classify and `lidar.floor_dropout` removes grazing floor returns preferentially, so calling a
+dropout "solid" would train the head against the truth.
+
+This is the *implicit* half of the same question the `floor` channel answers explicitly, and unlike
+the channel it needs no attitude at all — it reads the scan.
+
+Needs `--scan-stem resnet`: the plain stack's receptive field is ~79 beams, and a head shown one
+20° window at a time cannot see that an arc of returns lies on one line, which is the whole signal.
+
+Every update logs `loss/aux_floor/{recall, precision, rate, pos_weight, pos_weight_clamped}` and the
+run line carries them. That is not decoration. The equivalent head in `feat/motion-memory` collapsed
+to "never" — recall 0.19 → 0.00 by update 40, precision 0 — while its BCE fell 10 %, and a loss
+curve alone read as learning. The positive weight is the batch's own `negatives / positives`, and
+its clamp (1000) is reported so a run where it bound is a number in the log rather than a discovery
+afterwards.
+
+```bash
+python -m f1sim.learn.ppo <the base flags> \
+  --scan-channels floor --aux-floor 1.0 --aux-floor-width 32
+```
 
 ### Predicting the near future (`--aux-future`)
 

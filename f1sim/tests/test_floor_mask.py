@@ -58,8 +58,16 @@ def scan_at(sim, roll, pitch):
     return r_true, typ
 
 
+#: The band the MECHANISM tests are written against. Explicit, not `FloorSpec()`'s default: these
+#: tests check that the likelihood does what the geometry says for a given tolerance, and they must
+#: not move when the measured attitude error does. `test_the_shipped_band_is_the_measured_one`
+#: below is the test that is about the default.
+TIGHT = dict(sigma_roll=0.008, sigma_pitch=0.008)
+
+
 def spec_for(sim, **kw):
     lidar = sim.cfg.lidar
+    kw = {**TIGHT, **kw}
     return fl.FloorSpec(mount_x=float(lidar.mount_x), mount_z=float(lidar.mount_z),
                         mount_y=float(lidar.mount_y), **kw).validate()
 
@@ -137,7 +145,11 @@ def test_floor_returns_flagged_and_wall_is_not(device):
     # HARD case for the separation and it is the reason the threshold is what it is: a wall whose
     # return sits 4 cm above the floor at 1.7 m is 1.5 deg of tilt away from the floor line, which
     # is inside the attitude band, and only the `sharp` term and the threshold keep them apart.
-    assert float(p[floor].min()) > spec.gate_threshold
+    # A quantile, not the minimum: the neighbourhood term mixes the block's beams into the floor
+    # arc's outermost ones, so the two or three beams at the boundary sit between the populations.
+    # That is the term working, not failing -- it is what stops a narrow object being called floor.
+    assert float(torch.quantile(p[floor], 0.10)) > spec.gate_threshold
+    assert float((p[floor] >= spec.gate_threshold).float().mean()) > 0.90
     assert float(p[floor].mean()) > 0.80
     assert float(p[solid].max()) < spec.gate_threshold
     assert float(p[floor].mean()) - float(p[solid].mean()) > 0.25
@@ -160,7 +172,7 @@ def test_wall_in_front_of_a_level_sensor_is_not_flagged(device):
 def test_tolerance_band_follows_the_attitude_error():
     """A floor arc stays flagged while the attitude the channel is given is wrong by ~sigma_att,
     and stops being flagged several sigma out -- and the band is the one `sigma_att` names."""
-    spec = fl.FloorSpec().validate()
+    spec = fl.FloorSpec(**TIGHT).validate()
     ang = fl.beam_angles(1081, 1.5 * math.pi)
     truth = math.radians(3.0)
     r = fl.floor_range(ang, 0.0, truth, spec)
@@ -200,7 +212,7 @@ def test_no_return_beams_read_zero():
 
 def test_neighbourhood_term_discounts_a_lone_coincidence():
     """One beam that happens to sit on the floor plane scores below a whole arc that does."""
-    spec = fl.FloorSpec().validate()
+    spec = fl.FloorSpec(**TIGHT).validate()
     ang = fl.beam_angles(1081, 1.5 * math.pi)
     pitch = math.radians(3.0)
     rf = fl.floor_range(ang, 0.0, pitch, spec)
@@ -213,7 +225,7 @@ def test_neighbourhood_term_discounts_a_lone_coincidence():
     assert float(p_arc[0, 540]) > 0.9
     assert float(p_lone[0, 540]) < 0.5
     # and with the neighbourhood term switched off the two are the same number
-    flat = fl.FloorSpec(smooth_weight=0.0).validate()
+    flat = fl.FloorSpec(smooth_weight=0.0, **TIGHT).validate()
     a0 = fl.floor_likelihood(arc, 0.0, pitch, flat, angles=ang, valid=torch.ones_like(valid))
     l0 = fl.floor_likelihood(lone, 0.0, pitch, flat, angles=ang, valid=torch.ones_like(valid))
     assert abs(float(a0[0, 540]) - float(l0[0, 540])) < 1e-6
@@ -394,3 +406,31 @@ def test_aux_head_can_learn_the_label_it_is_given():
         opt.zero_grad(); loss.backward(); opt.step()
     assert float(loss) < 0.5 * first
     assert float(parts["recall"]) > 0.8 and float(parts["precision"]) > 0.8
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_the_shipped_band_is_the_measured_one_and_it_is_too_wide(device):
+    """The claim the research note rests on, as executable code.
+
+    `SIGMA_ROLL` / `SIGMA_PITCH` are what `floor.AttitudeTracker` measured on the proxy tracks, and
+    at that band the same scene the tight-band test separates cleanly is **not** separated: the
+    wall's returns reach the gate threshold. That is why `ClearanceSpec.floor_gate` is off by
+    default and why `docs/research/floor-mask-2026-09-15.md` says the geometry is waiting on a
+    better attitude rather than on a better decision rule.
+
+    If a future attitude source makes this test fail, that is the good failure: re-measure
+    `SIGMA_*`, and this test becomes the one that says the gate is ready.
+    """
+    assert (fl.SIGMA_ROLL, fl.SIGMA_PITCH) == (0.027, 0.024), \
+        "the shipped band is a measurement; changing it means re-running work/measure/tune_attitude.py"
+    sim = make(flat_track(wall_x=2.0, wall_half_y=1.0), device, range_max=10.0)
+    roll, pitch = 0.0, math.radians(2.0)
+    r_true, typ = scan_at(sim, roll, pitch)
+    lidar = sim.cfg.lidar
+    shipped = fl.FloorSpec(mount_x=float(lidar.mount_x), mount_z=float(lidar.mount_z)).validate()
+    p = fl.floor_likelihood(r_true, roll, pitch, shipped, angles=angles_of(sim),
+                            valid=(typ != HIT_NONE))
+    near = r_true < cl.ClearanceSpec().x_max
+    solid = (typ == HIT_TALL) & near
+    assert float(p[solid].max()) >= shipped.gate_threshold, \
+        "the measured band no longer confuses this wall with the floor -- re-read the note"

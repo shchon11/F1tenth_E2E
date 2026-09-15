@@ -252,6 +252,42 @@ Cost on this desk's CPU, single thread, batch 1: **1.25 ms** of the 25 ms a 40 H
 (`python3 -m f1sim.learn.budget --clearance`). It never raises a commanded speed. Unit tests:
 `f1sim/tests/test_policy_node_clearance.py`.
 
+#### `clearance_floor_gate` — leaving the floor out of the grid
+
+**Off by default, and off the arm is byte-identical to the one above**: `clearance.occupancy` does
+not look at the floor likelihood at all unless the flag is on.
+
+The scan plane sits 0.110 m above the floor and follows the sprung body, so 2° of tilt puts the
+floor across the beam at 3.2 m and 5° at 1.3 m. The arm treats every return as solid, so those
+returns bend and brake the executed plan. On the held-out proxy tracks, measured against the arm's
+own decision on the *solid* returns only, that is **3.5 % of all control steps** and **0.25 m/s per
+step** of speed the geometry never asked for.
+
+```bash
+ros2 run f1sim_ros policy --ros-args -p checkpoint:=... \
+  -p controller:=fixed_low+clearance -p clearance_floor_gate:=true
+```
+
+On, a return whose floor likelihood (`f1sim.learn.floor`) reaches the threshold is dropped from the
+occupancy grid the same way a beam with no return is. Three things to know before using it:
+
+* **the tilt comes from the IMU this node already reads**, integrated by `floor.AttitudeTracker`
+  off `/sensors/imu/raw`'s gyro and accelerometer — **not** from the orientation quaternion. Five
+  of the thirteen competition recordings swing that quaternion's roll past 40°, and in simulation
+  it is wrong by 0.14 rad rms while driving, because the filter follows the accelerometer and a
+  0.45 g brake tilts it by `atan2(4.4, 9.81)` = 24°. No new topic and no new message type: the
+  tracker reads the same IMU mean the observation is built from.
+* **until the car has stood still once, the gate removes nothing.** The tracker's zero reference is
+  the reading it takes at rest — the sensor's own mounting misalignment, which no IMU can see from
+  the inside — and without it the likelihood reads `floor.UNKNOWN` (0.5), which is below the
+  threshold. "I cannot tell" must not be spelled the same way as "solid".
+* **it is not yet recommended on the car.** The gate's precision is bounded by the attitude error,
+  and measured (`docs/research/floor-mask-2026-09-15.md`) the best estimate a car can have is 3×
+  wider than the geometry needs. The flag exists so the comparison can be run, and the research note
+  says what it buys today, which is nothing.
+
+`controller/clearance_floor_gated_frac` in the metrics says what share of returns it removed.
+
 ## Traction guard
 
 `policy_node` can watch the wheel for lock-up and spin and shape the speed command it publishes.
@@ -317,6 +353,7 @@ State changes are logged at INFO with the numbers behind them:
 | --- | --- | --- |
 | `controller` | `fixed_low` | `legacy`, `fixed_low`, `clearance`, `fixed_low+clearance`. Anything else — the simulator's `oracle` / `estimated` / `+tcs` arms — is refused rather than silently downgraded |
 | `clearance_margin` | `0.0` | body-edge margin for a `+clearance` arm, in metres; `0.0` means the module default (0.20 m) |
+| `clearance_floor_gate` | `false` | leave likely-floor returns out of the clearance grid (see above). Off is byte-identical to the arm without it |
 | `traction` | `off` | `off` installs nothing at all; `on` installs the replay-validated guard. Anything else is refused |
 | `traction_params` | `""` | `NAME=VALUE` pairs (comma or space separated) overriding any field of `TractionParams` — every threshold above is reachable from the launch line |
 

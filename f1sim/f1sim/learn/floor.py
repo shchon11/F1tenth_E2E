@@ -125,12 +125,14 @@ import torch.nn.functional as F
 UNKNOWN = 0.5
 
 #: [rad] 1-sigma error of the scan plane's tilt as `AttitudeTracker` estimates it, per axis.
-#: MEASURED -- `work/measure/analysis/attitude.json`, `docs/research/floor-mask-2026-09-15.md` --
-#: over the eight held-out proxy tracks with the recalibrated attitude model, the +-4 deg IMU
-#: misalignment and the +-0.02 rad LiDAR mount randomisation on. The LiDAR mount is the floor of it:
-#: it sits between the sensor and the body and no IMU can see it.
-SIGMA_ROLL = 0.0155
-SIGMA_PITCH = 0.0155
+#: MEASURED -- `work/measure/out/attitude_tune.json`, `docs/research/floor-mask-2026-09-15.md` --
+#: over three tracks, 600 control steps, 16 cars, with the recalibrated attitude model, the +-4 deg
+#: IMU misalignment and the +-0.02 rad LiDAR mount randomisation on. For scale: assuming the plane
+#: is LEVEL reads 0.024 / 0.023 on the same rows, and the VESC quaternion reads 0.136 / 0.086. What
+#: the geometry needs to localise the floor out to 3 m is ~0.015, and nothing here reaches it; see
+#: the research note, and `learn/frontend.py` for the estimate that can.
+SIGMA_ROLL = 0.027
+SIGMA_PITCH = 0.024
 
 #: [m] the range-independent part of the height band (3). It is NOT the LiDAR's range noise: at
 #: 3 m a grazing beam's vertical direction cosine is 0.03, so the calibrated 7.4 mm + 1 mm/m of
@@ -443,11 +445,21 @@ class AttitudeTracker:
     GYRO_GATE = 0.25
     #: [s] how fast the gated correction pulls, and how fast the output leaks back to the reference.
     TAU_ACC = 0.5
-    #: The leak bounds the drift a gyro bias can integrate into: at the randomised +-0.004 rad/s the
-    #: steady-state error is `bias * TAU_LEAK`, so 1.5 s costs 0.006 rad. It is a first-order
-    #: high-pass at 0.67 rad/s and the tilt it must pass is an OU process at 2.5 rad/s, which comes
-    #: through at 0.97 -- the signal survives and the bias does not.
-    TAU_LEAK = 1.5
+    #: [s] The leak is the estimator's whole bandwidth decision, and it was swept rather than
+    #: reasoned about. Integrating the gyro accumulates its noise as a random walk -- and on this
+    #: car the gyro's noise is *vibration*, 0.278 rad/s rms at 4 m/s, measured on the real recordings
+    #: (`real_data_calibration.md` §2.6) -- so the error grows as `sigma_gyro * sqrt(tau * dt / 2)`,
+    #: 0.022 rad at 1 s. Shorter is therefore better right down to the point where the leak stops
+    #: passing the tilt itself, and the sweep is monotone over 0.1 ... 3.0 s with no interior
+    #: optimum: roll/pitch rms 0.026/0.024 at 0.1 s, 0.031/0.026 at 0.3, 0.049/0.035 at 1.0.
+    #:
+    #: **And every one of them loses to assuming the plane is level, which reads 0.024/0.023.** The
+    #: tilt is a zero-mean process with an rms of 0.028 rad; integrating a gyro whose vibration is
+    #: ten times the signal's own rate does not beat it. 0.15 s is the default because it is within
+    #: 10 % of that bound and, unlike a constant zero, it still carries the transients -- but the
+    #: honest reading is that an IMU-only attitude on this car is not worth much, and the research
+    #: note says so at length.
+    TAU_LEAK = 0.15
     #: [s] forgetting time of the yaw-leak regression. Long, because the coefficient is a property
     #: of how the sensor is bolted down and does not change within a run.
     TAU_LEAK_FIT = 20.0

@@ -46,10 +46,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#: Ceiling on the positive weight. High on purpose: the floor's share of *returning* beams is a few
-#: per cent, so the honest reciprocal is 20-100, and the motion-memory head was crippled by a clamp
-#: of 50 against a rate that asked for 83. `floor_loss` reports whether it bound.
-POS_WEIGHT_MAX = 300.0
+#: Ceiling on the positive weight. High on purpose. The floor's share of *returning* beams is a few
+#: per cent while driving, so the honest reciprocal is 20-100 and the clamp does not bind; but a
+#: rollout that starts at the line sees 0.1 %, which asks for 1000, and a clamp of 300 there would
+#: leave positives outweighed 3.3 : 1. That is worse than the 1.6 : 1 the motion-memory mask head
+#: collapsed under. So the ceiling is only a guard against a batch with a handful of positives,
+#: and `floor_loss` reports `pos_weight_clamped` so a run where it bound is visible rather than
+#: discovered afterwards.
+POS_WEIGHT_MAX = 1000.0
 
 
 def floor_head_spec(width: int = 32, kernel: int = 5) -> dict:
