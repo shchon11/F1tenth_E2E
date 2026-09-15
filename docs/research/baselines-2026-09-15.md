@@ -220,8 +220,10 @@ re-measured" below for why the published numbers of our own checkpoints are not 
 |---|---|---|---|---|---|---|---|---|---|
 | A701 `@fixed_low` | ours, current best | **275** | 260 | 72/128 | 96/128 | 107/128 | **57** | **25** | **4.12** |
 | frozen original `@legacy` | ours, the reference | 196 | 194 | 22/128 | 73/128 | 101/128 | 29 | 17 | 8.47 |
+| frozen original `@fixed_low` | ours, the deployment arm | 242 | 237 | 59/128 | 89/128 | 94/128 | 48 | 24 | 5.84 |
 | **TinyLidarNet-L** | published, zero-shot | 47 | 45 | 11/128 | 18/128 | 18/128 | **1** | 9 | 18.02 |
-| **End2Race** | published, zero-shot | 3 | 3 | 0/128 | 0/128 | 3/128 | **0** | 3 | 40.13 |
+| **End2Race**, rear filled 30 m | published, zero-shot | 3 | 3 | 0/128 | 0/128 | 3/128 | **0** | 3 | 40.13 |
+| **End2Race**, rear filled 0 m | published, zero-shot | **53** | 53 | 15/128 | 16/128 | 22/128 | **32** | 3 | 12.94 |
 
 Per map, which is where the two failures stop looking alike:
 
@@ -242,7 +244,19 @@ a real transfer result for a 220 k network trained on real-car bags from one 202
 Monza, where it covers 218 m a trial and never finishes. Its **1/96 on avoidance** is the number to
 sit with: its training set contained no obstacles at all.
 
-**End2Race's three successes are all on Monza**, the one long wide circuit in the suite and the only
+**The single biggest effect on End2Race is not its architecture — it is which constant fills the 90
+bearings this car cannot see.** Both values are theirs: 30 m is what their ray tracer returns for a
+beam that hits nothing (`laser_models.py:143-144`), 0.0 is what their evaluation writes into beams
+it masks out (`eval_singleagent.py:114`). Swapping one for the other moves the row from **3/384 to
+53/384 solo, from 0/96 to 32/96 on avoidance, and from 40.1 to 12.9 collisions per km** — an
+eighteen-fold change in completions and thirty-two avoidance clears out of nothing, on identical
+weights and identical cells. The reason is in the probe above: told the space behind it is a wall
+rather than open road, the network commands 3.7 m/s instead of 5.9, and on a 33-68 m lap that is the
+difference between finishing and not. Root asked for the second variant to be run; on the evidence it
+is the more informative of the two, and a paper reporting only the no-return convention would have
+reported a number dominated by a substitution rather than by the model.
+
+**End2Race's three successes under the 30 m fill are all on Monza**, the one long wide circuit in the suite and the only
 map resembling the f1tenth_racetracks circuits its lattice-planner demonstrations came from. Its
 mean progress is 5 m of a 34–68 m lap on the small maps and 124 m of Monza's 446. The diagnosis in
 the probe above — a speed calibrated for several-hundred-metre circuits — is what the per-map
