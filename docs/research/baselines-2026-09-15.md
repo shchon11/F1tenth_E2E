@@ -210,7 +210,79 @@ f1tenth_racetracks circuits (Austin, Hockenheim, MoscowRaceway, Nürburgring), w
 hundred metres round; six metres per second into a corner of a 57 m lap is the sim-to-sim gap
 CONTRACT.md asks to be stated plainly, and this is it, measured.
 
-<!-- TABLES: filled when the suite finishes -->
+## Table 1 — the published weights on held-out suite v2, zero-shot
+
+**64 cells, 512 trials a system. CPU, `arm: none`, `direct` action mode, one `source_digest`.**
+Every row here was measured today under the same code on the same device; see "Why these rows are
+re-measured" below for why the published numbers of our own checkpoints are not reused.
+
+| system | | S/384 | S−bb3/336 | low µ | mid µ | high µ | A/96 | O/32 | coll/km |
+|---|---|---|---|---|---|---|---|---|---|
+| A701 `@fixed_low` | ours, current best | **275** | 260 | 72/128 | 96/128 | 107/128 | **57** | **25** | **4.12** |
+| frozen original `@legacy` | ours, the reference | 196 | 194 | 22/128 | 73/128 | 101/128 | 29 | 17 | 8.47 |
+| **TinyLidarNet-L** | published, zero-shot | 47 | 45 | 11/128 | 18/128 | 18/128 | **1** | 9 | 18.02 |
+| **End2Race** | published, zero-shot | 3 | 3 | 0/128 | 0/128 | 3/128 | **0** | 3 | 40.13 |
+
+Per map, which is where the two failures stop looking alike:
+
+| map | lap | frozen `@legacy` | A701 `@fixed_low` | TinyLidarNet-L | End2Race |
+|---|---|---|---|---|---|
+| `real:korea_2025_iccas` | 43 m | 26/48 | 43/48 | **37/48** | 0/48 |
+| `real:map12x16` | 36 m | 37/80 | 53/80 | 1/80 | 0/80 |
+| `real:map16x07` | 33 m | 29/80 | 51/80 | 0/80 | 0/80 |
+| `gen:control:9100` | 57 m | 55/112 | 88/112 | 10/112 | 3/112 |
+| `gen:competition:0` | 68 m | 33/48 | 33/48 | 5/48 | 0/48 |
+| `gen:competition:9200+pinch9200` | 60 m | 41/48 | 46/48 | 2/48 | 0/48 |
+| `real:blackbox2022_3` | 106 m | 2/48 | 15/48 | 2/48 | 0/48 |
+| `rt:Monza` | 446 m | 19/48 | 28/48 | 0/48 | **3/48** |
+
+**TinyLidarNet does not fail uniformly — it fails by track.** 37 of 48 on a held-out 43 m floor is
+a real transfer result for a 220 k network trained on real-car bags from one 2023 competition, and
+0/80 on the two *tighter* real floors (33 and 36 m) is a different thing from the 0/48 on the 446 m
+Monza, where it covers 218 m a trial and never finishes. Its **1/96 on avoidance** is the number to
+sit with: its training set contained no obstacles at all.
+
+**End2Race's three successes are all on Monza**, the one long wide circuit in the suite and the only
+map resembling the f1tenth_racetracks circuits its lattice-planner demonstrations came from. Its
+mean progress is 5 m of a 34–68 m lap on the small maps and 124 m of Monza's 446. The diagnosis in
+the probe above — a speed calibrated for several-hundred-metre circuits — is what the per-map
+breakdown says too.
+
+### Why these rows are re-measured rather than quoted
+
+`frozen_original@legacy` has a published suite v2 row from 2026-09-12. Same weights, same sha, same
+frozen suite, same arm — and it does not reproduce:
+
+| | S/384 | low | mid | high | A/96 | O/32 | coll/km |
+|---|---|---|---|---|---|---|---|
+| published 2026-09-12, CUDA | 228 | 27 | 91 | 110 | 21 | 23 | 6.85 |
+| here 2026-09-15, CPU | 196 | 22 | 73 | 101 | **29** | 17 | 8.47 |
+
+Between the two the simulator gained the recalibrated attitude model, the hard-obstacle patterns and
+the opponent-event machinery, and the device changed. 32 fewer solo completions and 8 *more*
+avoidance clears is not noise and it is not a regression; it is a different measurement, which is
+precisely what `source_digest` and `effective.device` exist to make visible. Putting a baseline row
+next to a number from another digest would have produced a difference that belongs to the simulator
+and reported it as a difference between policies.
+
+### TinyLidarNet's tight-floor collapse is largely its output mapping
+
+`zarrar/tiny_lidarnet.py:77-79` maps the second output to 1–8 m/s, so **output 0 is still 1 m/s** and
+the network has to go negative to ask for less than walking pace. Their real-car node maps the same
+weights to −0.5–7.0 (`inference.py:126`) and reaches a stop at output 1/15. Both are theirs. On the
+same cells (8 cars, µ 0.944, seed 4401):
+
+| map | lap | `sim` map (1–8) | `car` map (−0.5–7.0) | median speed asked |
+|---|---|---|---|---|
+| `real:map16x07` | 33 m | 0/8 | **4/8** | 3.01 → 1.59 m/s |
+| `real:map12x16` | 36 m | 0/8 | 1/8 | 3.11 → 1.61 m/s |
+| `real:korea_2025_iccas` | 43 m | **8/8** | 6/8 | 4.98 → 3.86 m/s |
+
+The two mappings trade against each other: theirs-for-simulation is right for the roomier floor and
+too fast for the tight ones, theirs-for-the-car is the reverse. `tinylidarnet_L_car@none` is
+therefore its own row on the suite rather than a footnote — same weights, same sha, different
+declared option, and row identity already covers driver options.
+
 
 ## The fair comparison: what is held fixed, and what is deliberately not
 
