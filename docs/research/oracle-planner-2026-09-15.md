@@ -307,7 +307,7 @@ resolution (`work/decide.md`) rather than against trajectories matching.
 `work/oracle-planner/work/decide.md`, written before any arm ran and not edited since, fixes the
 resolution of every row and the rule that turns the table into a verdict. In short: an arm counts as
 beating the control only on **car contacts per learner-minute, passes per learner-minute or family-T
-completions**, by more than that row's resolution, with the two evaluation seeds agreeing on the
+clean rate**, by more than that row's resolution, with the two evaluation seeds agreeing on the
 sign. Pace and wall collisions alone do not count — both are things a policy can buy by racing
 differently rather than by using the opponent's state.
 
@@ -324,7 +324,9 @@ proxy seeds and all 80 suite-T cells. Full table: `work/oracle-planner/work/arm_
 | passes held / learner-min ↑ | 0.25 | 1.87 [1.79/1.96] | 2.31 [2.30/2.31] | 2.22 [2.16/2.29] | 2.11 [2.11/2.10] |
 | pace vs the opponents ↑ | 0.073 | 1.263 | 1.313 | 1.286 | 1.304 |
 | sustained leads / learner-min ↑ | 0.61 | 2.43 ±0.26 | 2.90 ±0.30 | 2.63 ±0.27 | 2.85 ±0.27 |
-| suite v2.1 family T ↑ | 0.056 | 328/640 (51.2 %) | 261/640 (40.8 %) | 349/640 (54.5 %) | 356/640 (55.6 %) |
+| suite v2.1 family T clean rate ↑ | 0.056 | 328/640 (51.2 %) | 261/640 (40.8 %) | 349/640 (54.5 %) | 356/640 (55.6 %) |
+
+> **What the family-T row measures.** A family-T "success" is a **clean run** — a trial that met traffic and finished with no wall collision and no car contact — and **not a completed lap**: no system completes a lap in family T, and T has no timeout outcome, so a slow car reads clean (worker 18, 2026-09-16).
 
 **No row of this table attributes anything to the tokens**, for the reason the next two sections
 give. Reported because the contract asks for it, and because the spread across it is itself the
@@ -346,7 +348,7 @@ arms that differ do not differ *because of the tokens*.
 Not the other cells. `A1 < A2` and `A2 < A3` cannot be claimed, because the differences are not
 caused by the treatment. `A1 ≈ A3` is true numerically and says nothing about geometry versus
 future. The privileged-shortcut cell does not hold — no arm shows training up with held-out down;
-A3 has the best training reward *and* the best family T. The joint interaction+geometry cell does
+A3 has the best training reward *and* the best family-T clean rate. The joint interaction+geometry cell does
 not hold — A3 has the fewest car contacts and is not worst on walls.
 
 `posvel ≈ future >> pos`, the outcome the user hoped for, is **not** what happened: A2 ≈ A3, but A1
