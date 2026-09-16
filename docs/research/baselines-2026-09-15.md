@@ -434,7 +434,7 @@ gets to, and neither turns the tight floors into completions. What causes the ti
 not established here. Both rows are reported because both are theirs and the difference is real;
 neither is a fix.
 
-## Table 2 — suite v2.1, the traffic family (complete, 5 systems × 144 cells)
+## Table 2 — suite v2.1, the traffic family (complete, 7 systems × 144 cells)
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
 opponents and an `event` scenario where they brake, stop and change line.
@@ -452,7 +452,7 @@ opponents and an `event` scenario where they brake, stop and change line.
 > This matters for how the column is read. A driver that is slow, hangs back and declines to attack
 > scores well on it; one that races and occasionally touches a car scores worse. The column measures
 > *staying clean among traffic*, which is worth measuring and is not the same as racing well. Read
-> it beside the **passes** column, which is where engagement shows up. **All five rows are complete** as of 2026-09-16 10:18.
+> it beside the **passes** column, which is where engagement shows up. **All seven rows are complete** as of 2026-09-17 01:26 — five reference systems plus both D3 students.
 
 One property of this table is worth stating before its rows arrive, because it is what lets them sit
 together at all. The published baselines drive in `direct` mode (`act_dim` 2) and ours in `plan`
@@ -471,6 +471,51 @@ checks across them, and `claim_check.py` now pins it independently.
 | frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | 22/160 | 27/160 | 30/160 | 16/160 | 289 | 251 |
 | A701 `@fixed_low` (ours, current best) | 275 | 57 | 25 | **233/640** | 71/160 | 52/160 | 59/160 | 51/160 | 319 | 246 |
 | A701 `@legacy` (ours, **policy only**) | 217 | 30 | 17 | **118/640** | 35/160 | 26/160 | 33/160 | 24/160 | 309 | 249 |
+| **TinyLidarNet arch, our demos** (D3) | 48 | 37 | void | **349/640** | 73/160 | 110/160 | 57/160 | 109/160 | **24** | 115 |
+| **End2Race arch, our demos** (D3) | 0 | 26 | void | **8/640** | 1/160 | 2/160 | 0/160 | 5/160 | 10 | 42 |
+
+### The cleanest row in the table is the one that does not race
+
+The D3 TinyLidarNet student has the **highest clean rate in Table 2 — 349/640, 55 %** — against
+A701 `@fixed_low`'s 233 and the published weights' 78. Read alone that says a student trained on our
+demonstrations beats our best PPO policy in traffic. Read beside the column that measures
+engagement, it says something else:
+
+| T family, complete | clean | **passes** | contacts | route | achieved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **TinyLidarNet, our demos** | **349/640** | **24** | 115 | 0.567 | 2.21 m/s |
+| A701 `@fixed_low` | 233/640 | **319** | 246 | 0.785 | 3.60 m/s |
+| A701 `@legacy` | 118/640 | 309 | 249 | 0.670 | 3.99 m/s |
+| frozen original `@legacy` | 95/640 | 289 | 251 | 0.617 | 3.96 m/s |
+| TinyLidarNet, published | 78/640 | 165 | 144 | 0.468 | 3.21 m/s |
+| End2Race, our demos | 8/640 | 10 | 42 | 0.286 | 2.29 m/s |
+
+**It completes the fewest passes of any system that moves — 24, against A701's 319** — at 2.21 m/s
+against 3.60, reaching 0.567 of a route against 0.785. It is the safest non-participant in the
+table. Since a T success is a clean run and not a completed lap, and since nothing here completes a
+lap, the metric pays for exactly what this student does: stay out of trouble.
+
+The per-scenario split shows it precisely. Against a **`pace`** car — an opponent at its own speed,
+the scenario where overtaking is hardest and declining costs nothing — it scores **110/160 against
+A701's 52**. Against **`pair`**, two opponents, **109/160 against 51**. But on **`event`**, where
+the cars ahead brake and change line and something must be done about them, it scores **57/160
+against A701's 59** — the one scenario where it has no advantage is the one that requires reacting.
+
+So the answer to whether its low speed is what keeps it alive is **yes, and the metric rewards it**.
+The same 2.2 m/s that makes it time out on 264 solo trials — never reaching the 3.00 m/s a lap needs
+— is what keeps it clean here, because staying clean has no clock. This is not a criticism of the
+suite: clean-running among traffic is worth measuring, and family T measures it honestly. It is a
+warning about reading one column of it as racing ability.
+
+**End2Race's D3 row stays at 8/640** for the reason established on suite v2: it steers worse than a
+constant (R² −0.557) because their `MSE(steer) + 0.05·MSE(speed)` weighting, on labels whose speed
+spread is ten times their steer spread, spends the network on speed. In traffic that shows up as
+**10 passes and 42 contacts** — fewer of both than its own published weights (40 and 136), because
+it crashes before reaching a car.
+
+**And the contact structure now holds across seven systems**, every one of them: 99 %, 93 %, 93 %,
+95 %, 99 %, 100 %, 100 % of car contacts occur in trials with **no pass at all**. Two CNNs, two
+GRUs, three plan-space policies across two arms. A contact is what happens *instead* of an overtake.
 
 ### What survives traffic is the runtime arm, not the weights — settled
 
@@ -512,9 +557,10 @@ not whose policy it was. TinyLidarNet's 68 % is still unexplained and the floor 
 live candidate there — a system succeeding 17.9 % of the time has less to lose than one at 77.5 % —
 and nothing in this suite separates that from genuine robustness.
 
-**The contact structure holds across all five systems.** Contacts occurring in trials with no pass
-at all: A701 `@fixed_low` **229/246 (93 %)**, A701 `@legacy` 231/249 (93 %), frozen `@legacy`
-239/251 (95 %), TinyLidarNet 142/144 (99 %), End2Race 136/136 (100 %). A CNN, a GRU and two plan-space PPO policies under two
+**The contact structure holds across all seven systems.** Contacts occurring in trials with no pass
+at all: D3 TinyLidarNet **114/115 (99 %)**, A701 `@fixed_low` 229/246 (93 %), A701 `@legacy`
+231/249 (93 %), frozen `@legacy` 239/251 (95 %), TinyLidarNet 142/144 (99 %), End2Race 136/136
+(100 %), D3 End2Race 42/42 (100 %). A CNN, a GRU and two plan-space PPO policies under two
 different arms — four failure profiles, one structure. A contact is what happens *instead* of an
 overtake, not the price of one. That is the 02:28 correction confirmed on every system in the
 table, including the one that passes best (223 clean pass-trials out of 274).
@@ -648,7 +694,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **177
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **186
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
