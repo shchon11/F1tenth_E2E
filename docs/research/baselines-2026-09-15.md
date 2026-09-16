@@ -807,10 +807,65 @@ digest, same device as everything in Table 1. Beside the published weights of th
 
 | system | | S/384 | A/96 | O/32 | route fraction | timeouts | collisions |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **TinyLidarNet arch, our demonstrations** | D3, raceline teacher | **48** | **35** | **0** | **0.665** | 242 | 94 |
+| **TinyLidarNet arch, our demonstrations** | D3, **interactive** teacher | **48** | **37** | 0† | 0.644 | 264 | 72 |
+| TinyLidarNet arch, our demonstrations | D3, raceline teacher (the dry run) | **48** | **35** | 0† | 0.665 | 242 | 94 |
 | TinyLidarNet, published weights | zero-shot reference | 47 | 1 | 9 | 0.416 | **0** | 356 |
-| *End2Race arch, our demonstrations* | *not started — permission gate* | — | — | — | — | — | — |
+| *End2Race arch, our demonstrations* | *training, interactive teacher* | — | — | — | — | — | — |
 | *ours, policy only (A701 `@legacy`)* | on suite v2 | 217 | 30 | 17 | — | — | — |
+
+† **not an overtaking measurement** — see below.
+
+### Changing the teacher changed almost nothing, which is the result
+
+The interactive-teacher row was the one this table was waiting for, and it lands on top of the dry
+run. Solo **48 against 48**, identical. Avoidance 37 against 35, two clears in 96. Per map the two
+rows differ in exactly one place, `real:map12x16`, 5 against 3:
+
+| map | lap | interactive | raceline dry run | published |
+| --- | ---: | ---: | ---: | ---: |
+| `rt:Monza` | 446 m | 48/48 | 48/48 | 0/48 |
+| `gen:control:9100` | 57 m | 32/112 | 32/112 | 10/112 |
+| `real:map12x16` | 36 m | **5/80** | **3/80** | 1/80 |
+| every other map | | identical | identical | |
+
+This is the prediction recorded at 15:32 from the iteration-0 buffers, and it holds: the two
+teachers' label speeds were within **0.013 m/s** of each other, so the students inherit the same
+speed and fail the same way. The interactive student achieves **2.34 m/s** against the dry run's
+2.57 and times out **264** times against 242 — slightly slower and slightly worse, in the direction
+its commanded speeds predicted (median 2.10 against 2.41 m/s on the recorded scans).
+
+### The overtaking row was never an overtaking measurement, and I said it was
+
+This is the claim I got wrong, and it was a prominent one. Of the dry run's 0/32 I wrote: *"the dry
+run's declared limitation arriving on schedule … a teacher that does not react to traffic cannot
+demonstrate holding a pass, and its student does not hold one. This row is evidence about **the
+teacher**, not about the architecture, and it is the single strongest argument for re-running on
+`InteractiveTeacher`."*
+
+The re-run happened. **The interactive teacher — which does react to other cars — scores the same
+0/32.** So the attribution was wrong.
+
+It is worse than wrong, because the outcomes say the row measures nothing at all. Every one of the
+interactive student's 32 overtaking trials ends in `opponent_respawn`, and 31 of 32 for the dry run:
+
+| on the O cells | outcomes | mean elapsed | of budget |
+| --- | --- | ---: | ---: |
+| D3 interactive | **32 × `opponent_respawn`** | 19.0 s | **100 %** |
+| D3 raceline dry run | 31 × `opponent_respawn`, 1 contact | 18.6 s | 98 % |
+| published weights | 19 collision, 4 contact, **9 clean** | 4.7 s | 25 % |
+
+`opponent_respawn` is not a failed pass. It fires when *the car ahead* crashes and respawns, which
+voids the race because the one pass being measured can no longer be attributed
+(`benchmark/overtake.py:150-157`). The D3 students survive the **entire** budget; over 19 s of
+driving the opponent eventually crashes, and the trial is thrown away. The published weights are
+gone in 4.7 s — they crash long before the opponent does, so their races stay valid and can be
+scored.
+
+So both D3 rows' `O` column is **void, not zero**: a slow-but-surviving driver keeps the scenario
+alive long enough for the voiding condition to fire every time. Nothing about either student's
+ability to overtake has been measured here, and no argument about the teacher can rest on it. What
+would measure it is an overtaking family whose trials do not void on an opponent crash, or students
+fast enough to finish before one happens — and the second of those is the same speed problem again.
 
 The last two rows are what CONTRACT.md asks for and this table does not yet have: the End2Race arm
 has never been trained, and the "ours" row is a PPO policy rather than a student distilled from the
