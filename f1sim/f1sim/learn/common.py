@@ -1,6 +1,7 @@
 """Shared training utilities: track sets, env construction, run dirs, W&B."""
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import List, Optional
@@ -296,6 +297,75 @@ def run_dir(name: str) -> str:
     d = os.path.join(RUNS_DIR, name)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+#: The file both trainers write their curve to, next to the checkpoints.
+PROGRESS_FILENAME = "progress.jsonl"
+
+
+def _jsonable(v):
+    """A plain Python number/str/bool/list, or None for anything else.
+
+    numpy scalars and 0-d tensors are what a metric dict is actually full of, and `json.dumps`
+    refuses both. NaN and +/-inf are kept (`json.dumps` writes them as `NaN`/`Infinity`): a metric
+    that is not defined this update is data -- "no lap was completed" -- and dropping the key
+    instead would silently shorten one series against the others.
+    """
+    if isinstance(v, bool) or v is None or isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, (np.floating, np.integer)):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if torch.is_tensor(v):
+        return v.item() if v.numel() == 1 else v.detach().cpu().tolist()
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return None
+
+
+class ProgressLog:
+    """`<run_dir>/progress.jsonl`: one JSON object per logged step, flushed on every write.
+
+    The console's training dashboard used to read the progress line out of W&B's `output.log` and
+    parse it with one regex. Both of those are side effects of somebody else's code: wandb 0.29 no
+    longer writes `output.log` at all, a run started with stdout redirected elsewhere leaves nothing
+    in its run directory, and every term added to the human line (`gate`, `kl_ref`, `fut`, `floor
+    bce`) broke the regex. This file is the trainer's own record, in the run directory, in a format
+    that cannot drift: unknown keys are extra series, not a parse failure.
+
+    Never raises. A full disk, a read-only mount or a run directory somebody moved must not take a
+    training run with it -- the file is a side output, not a result.
+    """
+
+    def __init__(self, run_dir: str, filename: str = PROGRESS_FILENAME):
+        self.path = os.path.join(run_dir, filename)
+        self._fh = None
+        self.error: Optional[str] = None
+        try:
+            self._fh = open(self.path, "a", buffering=1)
+        except OSError as exc:                      # pragma: no cover - disk-level failure
+            self.error = str(exc)
+
+    def write(self, record: dict) -> None:
+        if self._fh is None:
+            return
+        try:
+            clean = {k: _jsonable(v) for k, v in record.items()}
+            self._fh.write(json.dumps({k: v for k, v in clean.items() if v is not None}) + "\n")
+            self._fh.flush()
+        except (OSError, ValueError, TypeError) as exc:   # pragma: no cover - disk-level failure
+            self.error = str(exc)
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:                          # pragma: no cover
+                pass
+            self._fh = None
 
 
 def wandb_init(name: str, config: dict, group: Optional[str] = None, mode: Optional[str] = None,

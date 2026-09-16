@@ -1091,11 +1091,78 @@ leaving the window. The recipe form starts from presets (`원본 레이스 레�
 own conditions, `SGR`, `R10`, or custom), shows the exact `python -m f1sim.learn.ppo …` it will run,
 and starts it as a detached process (its own session: closing the console does not stop training).
 Records live in `~/f1sim_runs/_console_jobs/`, the job's output in `<run>/console-train.log`. The
-monitor parses the trainer's own `upd k/N …` lines -- from that log, or from a run's W&B
-`output.log`, so runs started from a shell are watchable too -- into progress, ETA, and six curves
-(reward/step, collisions/km, progress, lap time, KL to the original, throughput), lists the run's
-checkpoints, and *주행 화면에서 보기* makes one the driving page's next start. *중지* sends SIGINT
-(the last periodic checkpoint is what remains) and SIGTERM on a second press after 12 s.
+monitor reads [`<run>/progress.jsonl`](#progressjsonl--what-a-run-records-about-itself) — which both
+trainers write, whoever started them and whatever `--wandb` is set to — into progress, ETA and one
+chart per metric, lists the run's checkpoints, and *주행 화면에서 보기* makes one the driving page's
+next start. *중지* sends SIGINT (the last periodic checkpoint is what remains) and SIGTERM on a
+second press after 12 s.
+
+The charts are the run's, in the order the run is judged in. A PPO run gets **collisions/km**, **lap
+time**, **episode progress** and **reward/step** first; then, when the run measures them, the
+traffic the opponents create (**passes held/min**, **car contacts/min**, **wall collisions/min**,
+**time-to-contact share**); then `kl_ref`, the curriculum gate and throughput. A DAgger run gets its
+own set, with the teacher drawn beside the student on the same axis — **collisions/km (student vs
+teacher)**, **distillation loss**, **lap time (student vs teacher)**, **progress**, `beta`. A run
+with no record does not draw empty axes: it says which files were missing
+(`progress.jsonl 없음 · console-train.log 없음 · wandb output.log 없음`), on the charts and in the
+run list, and the run list tags every run with the source its curve came from.
+
+### progress.jsonl — what a run records about itself
+
+Every run writes `<run_dir>/progress.jsonl` next to its checkpoints: one JSON object per logged
+step, flushed on every write, from `f1sim.learn.common.ProgressLog`. It is written **whatever
+`--wandb` is set to and wherever stdout went**, and it is a side output — a directory it cannot
+write to is recorded on the object and never raised, so a full disk does not end a twelve-hour run.
+Training is byte-identical with or without it.
+
+It exists because the two things the console used to read are not the run's own: wandb 0.29 stopped
+writing `wandb/run-*/files/output.log`, and a run launched with stdout redirected somewhere else
+left nothing in its run directory at all. The format also has to survive its own growth: the single
+regex that used to parse the `upd k/N …` line read zero points the moment an arm inserted
+`| fut 0.802 |` or a curriculum gate printed `gate inf`.
+
+PPO writes one object per logged update (`--log-every`):
+
+```json
+{"kind": "ppo", "update": 6, "total": 1016, "steps": 196608, "cap": 9.0,
+ "rew_per_step": 0.063, "coll_per_km": 46.1, "prog_m": 22.0, "lap_s": NaN,
+ "gate": 102.6, "tk": 0.0, "kl_ref": 0.015, "sps": 220.0, "wall_s": 341.2,
+ "reward/progress_per_step": 0.051, "reward/collision_per_step": -0.21, "...": "every component",
+ "traffic/passes_held_per_min": 0.4, "traffic/car_contacts_per_min": 1.2,
+ "traffic/wall_collisions_per_min": 3.1, "traffic/crashes_per_min": 4.3, "traffic/ttc_share": 0.08,
+ "episode/lap_time_best_s": 13.9, "loss/pg": -0.004, "...": "every key the run logs to W&B"}
+```
+
+DAgger writes one per iteration:
+
+```json
+{"kind": "dagger", "iter": 0, "total": 6, "beta": 1.0, "samples": 64500, "loss": 0.0676,
+ "student_coll_per_km": 52.6, "student_prog_mps": 3.09, "student_lap_s": 14.8,
+ "teacher_coll_per_km": 7.2, "teacher_prog_mps": 3.6, "teacher_lap_s": 13.6,
+ "wall_s": 1165.0, "worst_track": "gen:control:1402+hard3720",
+ "collect_s": 271.0, "train_s": 21.0, "eval_s": 873.0,
+ "student/collisions_per_km_worst": 202.6, "...": "every scalar the iteration measured"}
+```
+
+**The keys above are the stable schema** and are always present (`NaN` where a run has no value for
+one — no lap was completed, no curriculum gate is configured). Everything after them is whatever
+the run logs to W&B, under its W&B name, so a term added to the trainer becomes a new series the day
+it appears rather than a parse failure. Keys are never renamed or removed.
+
+The `traffic/*` rates are counted from the reward components already in the rollout buffer — a
+component is non-zero exactly on the step its event happened — and each is written only when its
+coefficient is on, because a flat zero line reads as "no contacts happened" rather than "this run
+does not measure contacts". `wall_collisions_per_min` is a crash on a step that carried no contact
+charge; under `--car-contact-penalty 0` nothing is ever charged and it coincides with
+`crashes_per_min`, which is the truth about what that run can distinguish.
+
+`--metrics-jsonl PATH` is unchanged and unrelated: it is a caller-chosen path for a smoke's report.
+`progress.jsonl` is always in the run directory and needs no flag.
+
+The console falls back, in order, to `console-train.log`, then `wandb/*/files/output.log`, then any
+log the launcher recorded, and parses the trainers' human lines term by term — so the hundred older
+runs in `~/f1sim_runs`, including every `dagger_*` run whose `iter k:` line nothing ever read, are
+watchable too.
 
 From there, *녹화* on the driving page writes an mp4 of that checkpoint driving — the whole path from
 a run in this list to a clip of it is 주행 화면에서 보기 → 시작 → 녹화, with no script and no headless

@@ -7,9 +7,12 @@ reads files:
   does not kill a run), keeps one JSON record per job under `<runs>/_console_jobs/`, and stops a job
   with SIGINT first and SIGTERM after a grace period. The trainer does not save on interrupt: what
   survives is the last periodic checkpoint (`--save-every`).
-* `parse_progress` reads the trainer's own progress lines (`upd k/N steps … | rew/step … coll …/km
-  prog … m lap … s | … kl_ref … | … steps/s`), from the job log or from the run's W&B
-  `output.log`, so runs started outside the console are just as watchable.
+* `read_progress` reads the run's curve from the best source it has: `progress.jsonl`, which both
+  trainers now write next to the checkpoints, then `console-train.log`, then W&B's `output.log`,
+  then whatever log the launcher recorded. `parse_progress` reads all of those shapes -- the JSON
+  objects, PPO's `upd k/N …` line and DAgger's `iter k: …` line -- term by term rather than as one
+  fixed sentence, so a term added to the log is a new series and not a blank page. When there is
+  nothing to draw, `blank_reason` says which files were missing, on the charts and in the run list.
 * `TrainingPage` is the widget: a recipe form with presets on the left, live charts and the
   checkpoint list in the middle, jobs on the right. "주행 화면에서 보기" hands a checkpoint to the
   driving page.
@@ -44,12 +47,6 @@ JOBS_DIRNAME = "_console_jobs"
 REPO_F1SIM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 FROZEN_ORIGINAL = os.path.join(catalog.RUNS_DIR, "_baselines", "frozen_original_48cc698f.pt")
 DEFAULT_ESTIMATOR = os.path.join(catalog.RUNS_DIR, "_estimators", "estimator_seed401.pt")
-
-_UPD = re.compile(
-    r"upd (?P<k>\d+)/(?P<n>\d+) steps (?P<steps>[\d.]+)M cap (?P<cap>[\d.]+) \| rew/step (?P<rew>[-\d.]+|nan) "
-    r"coll (?P<coll>[-\d.]+|nan)/km prog (?P<prog>[-\d.]+|nan) m lap (?P<lap>[-\d.]+|nan) s \| gate (?P<gate>[-\d.]+|nan) "
-    r"\((?P<tk>[-\d.]+) tk\) \| kl_ref (?P<kl>[-\d.]+|nan) \| (?P<sps>\d+) steps/s")
-
 
 # ================================================================ recipes
 COMMON_FLAGS = (
@@ -270,74 +267,438 @@ def list_run_dirs(runs_dir: str = catalog.RUNS_DIR) -> List[Tuple[str, str, str,
         if log:
             mt = os.path.getmtime(log)
             seen[e.name] = (e.name, e.path, f"기록만 · {catalog.format_age(time.time() - mt)} 전 (체크포인트 아직 없음)", mt)
-    return sorted(seen.values(), key=lambda t: t[3], reverse=True)
+    # Every row says whether this run has a curve at all and which file it is in. Picking a run and
+    # being shown six empty charts, with nothing anywhere saying the run left no record, is the
+    # complaint this page was reported for.
+    rows = [(name, path, f"{subtitle} · {source_tag(path, runs_dir)}", mt)
+            for name, path, subtitle, mt in seen.values()]
+    return sorted(rows, key=lambda t: t[3], reverse=True)
 
 
 # ================================================================ progress parsing
+#: The trainers' own record of a run, written next to the checkpoints by
+#: `f1sim.learn.common.ProgressLog`. Everything below prefers it to any log.
+PROGRESS_FILENAME = "progress.jsonl"
+
+#: Where a run's curve can come from, best first, and what the page calls each one.
+SOURCE_LABELS = {
+    "progress": "progress.jsonl",
+    "console": "console-train.log",
+    "wandb": "wandb output.log",
+    "stdout": "실행 로그",
+}
+
+#: One number as a trainer prints it. `nan` and `inf` are values a metric really takes -- `gate inf`
+#: is what an unscored curriculum gate prints -- and an alternation that only knows digits and dots
+#: silently drops the whole line they appear on.
+_NUM = r"(?:[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|[-+]?nan|[-+]?inf)"
+
+#: PPO's line, as a handful of independent facts rather than one shape. Worker 16 inserted `gate`
+#: and `kl_ref`, an `--aux-future` arm inserts `| fut 0.8 |`, a floor-head arm `| floor bce ... |`:
+#: any of those turned the single anchored regex into zero points, which is how the dashboard went
+#: blank while the log it was reading was perfectly healthy. Each pattern here finds its own term
+#: wherever it sits, and a term nobody here knows about is simply not read.
+_PPO_LINE = re.compile(r"\bupd\s+(\d+)\s*/\s*(\d+)\b")
+_PPO_STEPS = re.compile(rf"\bsteps\s+({_NUM})M")
+_PPO_SPS = re.compile(rf"({_NUM})\s+steps/s")
+_PPO_TK = re.compile(rf"\(({_NUM})\s+tk\)")
+_DAGGER_LINE = re.compile(r"^\s*iter\s+(\d+)\s*:")
+
+#: `key value` anywhere in a line. The lookbehind keeps `gen:control:1402` from reading `control`
+#: as a key, and the lookahead keeps `upd 12/64` from reading `12` as the value of `upd`.
+_KV = re.compile(rf"(?<![\w/:])([A-Za-z][A-Za-z0-9_]*(?:/[A-Za-z][A-Za-z0-9_]*)*)\s+({_NUM})(?![\w.])")
+
+#: What the text line calls a metric -> the name `progress.jsonl` gives it. One vocabulary for both
+#: sources, so a chart does not care which one it is being fed from.
+_PPO_ALIASES = {"rew/step": "rew_per_step", "coll": "coll_per_km", "prog": "prog_m",
+                "lap": "lap_s", "kl_ref": "kl_ref", "gate": "gate", "cap": "cap"}
+#: Read by an explicit pattern above, or not a metric at all.
+_PPO_SKIP = {"upd", "steps", "tk", "on"}
+_DAGGER_ALIASES = {"beta": "beta", "samples": "samples", "loss": "loss"}
+
+
+def _f(s) -> float:
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+class _SeriesBuilder:
+    """Series that stay aligned: every point is one x, and a key missing from it becomes a NaN.
+
+    Without the padding, a run whose `lap` is `nan` until the first completed lap would produce a
+    `lap` series shorter than `coll`, and the two would be drawn against different x.
+    """
+
+    def __init__(self):
+        self.data: Dict[str, List[float]] = {}
+        self.n = 0
+
+    def point(self) -> None:
+        self.n += 1
+
+    def set(self, key: str, value) -> None:
+        if not self.n:
+            self.point()
+        s = self.data.setdefault(key, [])
+        v = _f(value)
+        if len(s) == self.n:
+            s[-1] = v
+            return
+        s.extend([float("nan")] * (self.n - 1 - len(s)))
+        s.append(v)
+
+    def last(self, key: str, default: float) -> float:
+        s = self.data.get(key)
+        return s[-1] if s else default
+
+    def finish(self) -> Dict[str, List[float]]:
+        for s in self.data.values():
+            s.extend([float("nan")] * (self.n - len(s)))
+        return self.data
+
+
 @dataclass
 class Progress:
+    """What one run has logged so far, whatever wrote it and in whichever of the two shapes."""
+
+    kind: str = ""                                  # "ppo" | "dagger" | ""
     update: int = 0
     n_updates: int = 0
     steps_m: float = 0.0
     cap: float = 0.0
-    rew: List[float] = field(default_factory=list)
-    coll: List[float] = field(default_factory=list)
-    prog: List[float] = field(default_factory=list)
-    lap: List[float] = field(default_factory=list)
-    kl: List[float] = field(default_factory=list)
-    sps: List[float] = field(default_factory=list)
+    series: Dict[str, List[float]] = field(default_factory=dict)
     lines: List[str] = field(default_factory=list)      # the tail, for the log box
     finished: bool = False
     error: Optional[str] = None
+    source: str = ""                                # the file the points came from
+    source_kind: str = ""                           # a key of SOURCE_LABELS
+    reason: str = ""                                # why there is nothing to draw
 
     @property
     def fraction(self) -> float:
         return (self.update / self.n_updates) if self.n_updates else 0.0
 
+    @property
+    def n_points(self) -> int:
+        return max((len(v) for v in self.series.values()), default=0)
 
-def _f(s: str) -> float:
-    try:
-        return float(s)
-    except ValueError:
-        return float("nan")
+    @property
+    def source_label(self) -> str:
+        return SOURCE_LABELS.get(self.source_kind, self.source_kind)
+
+    def get(self, key: str) -> List[float]:
+        return self.series.get(key, [])
+
+    def has(self, key: str) -> bool:
+        """A series with at least one real number in it. An all-NaN column is a metric this run
+        does not measure, and an empty chart for it says less than no chart at all."""
+        return any(v == v for v in self.series.get(key, ()))
+
+    # the names the job card and the page have always used
+    @property
+    def rew(self) -> List[float]:
+        return self.get("rew_per_step")
+
+    @property
+    def coll(self) -> List[float]:
+        return self.get("coll_per_km")
+
+    @property
+    def prog(self) -> List[float]:
+        return self.get("prog_m")
+
+    @property
+    def lap(self) -> List[float]:
+        return self.get("lap_s")
+
+    @property
+    def kl(self) -> List[float]:
+        return self.get("kl_ref")
+
+    @property
+    def sps(self) -> List[float]:
+        return self.get("sps")
+
+
+def _kv_pairs(chunk: str, aliases: Dict[str, str], skip=()):
+    """Every `key value` token of a chunk, under the canonical name when there is one.
+
+    Tolerant on purpose: a term added to the line later becomes a new series rather than a parse
+    failure, and a term removed becomes a missing series rather than a blank page.
+    """
+    for m in _KV.finditer(chunk):
+        key, value = m.group(1), m.group(2)
+        if key in skip:
+            continue
+        yield aliases.get(key, key), value
+
+
+def _parse_ppo_line(ln: str, b: _SeriesBuilder, p: "Progress") -> None:
+    m = _PPO_LINE.search(ln)
+    if not m:
+        return
+    b.point()
+    p.kind = p.kind or "ppo"
+    p.update, p.n_updates = int(m.group(1)), int(m.group(2))
+    ms = _PPO_STEPS.search(ln)
+    if ms:
+        p.steps_m = _f(ms.group(1))
+    for key, value in _kv_pairs(ln, _PPO_ALIASES, _PPO_SKIP):
+        b.set(key, value)
+    mt = _PPO_TK.search(ln)
+    if mt:
+        b.set("tk", mt.group(1))
+    sps = _PPO_SPS.findall(ln)
+    if sps:
+        b.set("sps", sps[-1])
+    p.cap = b.last("cap", p.cap)
+
+
+def _parse_dagger_line(ln: str, b: _SeriesBuilder, p: "Progress") -> None:
+    """`iter k: beta ... loss ... | student ... coll/km ... prog ... m/s lap ... s | teacher ... |`.
+
+    Split on the bars first: `lap 14.8 s` appears once for the student and once for the teacher, and
+    only the segment it sits in says which. Nothing read this line before -- a DAgger run's charts
+    were blank by construction, not by drift.
+    """
+    m = _DAGGER_LINE.match(ln)
+    if not m:
+        return
+    b.point()
+    p.kind = p.kind or "dagger"
+    p.update = int(m.group(1)) + 1                  # the line counts from 0; the tile counts runs
+    b.set("iter", m.group(1))
+    for seg in ln.split("|"):
+        seg = seg.strip()
+        who = "student" if seg.startswith("student") else "teacher" if seg.startswith("teacher") else ""
+        if not who:
+            for key, value in _kv_pairs(seg.split(":", 1)[-1], _DAGGER_ALIASES, {"iter"}):
+                b.set(key, value)
+            continue
+        head = re.match(rf"{who}\s+({_NUM})\s*coll/km", seg)
+        if head:
+            b.set(f"{who}_coll_per_km", head.group(1))
+        for pat, key in ((rf"worst\s+({_NUM})", f"{who}_coll_per_km_worst"),
+                         (rf"prog\s+({_NUM})\s*m/s", f"{who}_prog_mps"),
+                         (rf"lap\s+({_NUM})\s*s", f"{who}_lap_s")):
+            hit = re.search(pat, seg)
+            if hit:
+                b.set(key, hit.group(1))
+
+
+def _parse_record(rec: dict, b: _SeriesBuilder, p: "Progress") -> None:
+    """One `progress.jsonl` object. Every number in it becomes a series under its own key, so a
+    metric the trainer starts writing tomorrow is already here the day it appears."""
+    b.point()
+    p.kind = str(rec.get("kind") or p.kind or "")
+    if p.kind == "dagger":
+        p.update = int(rec.get("iter", p.update - 1)) + 1
+    else:
+        p.update = int(rec.get("update", p.update))
+        p.steps_m = _f(rec.get("steps", p.steps_m * 1e6)) / 1e6
+    p.n_updates = int(rec.get("total", p.n_updates) or 0)
+    for key, value in rec.items():
+        if key in ("kind", "update", "total") or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            b.set(key, value)
+    p.cap = b.last("cap", p.cap)
 
 
 def parse_progress(text: str, tail: int = 60) -> Progress:
+    """The curve out of whatever the run left behind: `progress.jsonl`, a log full of the trainers'
+    own progress lines, or a file with both in it."""
     p = Progress()
+    b = _SeriesBuilder()
     lines = text.splitlines()
     for ln in lines:
-        m = _UPD.search(ln)
-        if m:
-            p.update, p.n_updates = int(m["k"]), int(m["n"])
-            p.steps_m, p.cap = _f(m["steps"]), _f(m["cap"])
-            p.rew.append(_f(m["rew"])); p.coll.append(_f(m["coll"])); p.prog.append(_f(m["prog"]))
-            p.lap.append(_f(m["lap"])); p.kl.append(_f(m["kl"])); p.sps.append(_f(m["sps"]))
+        s = ln.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                rec = json.loads(s)
+            except ValueError:
+                rec = None
+            if isinstance(rec, dict) and rec.get("kind") in ("ppo", "dagger"):
+                _parse_record(rec, b, p)
+                continue
+        if _PPO_LINE.search(ln):
+            _parse_ppo_line(ln, b, p)
+        elif _DAGGER_LINE.match(ln):
+            _parse_dagger_line(ln, b, p)
         elif "Traceback" in ln or ln.startswith("SystemExit") or "Error:" in ln and "wandb" not in ln:
             p.error = ln.strip()[:200]
+    p.series = b.finish()
     if p.n_updates and p.update >= p.n_updates:
         p.finished = True
     p.lines = [ln for ln in lines if not ln.startswith("wandb:")][-tail:]
     return p
 
 
-def run_log_path(run_dir: str) -> Optional[str]:
-    """The newest progress log for a run: the console's own if the console launched it, else the
-    W&B `output.log` the trainer writes for every run."""
-    cands = []
-    own = os.path.join(run_dir, "console-train.log")
-    if os.path.isfile(own):
-        cands.append(own)
+# ================================================================ where the curve comes from
+def wandb_output_logs(run_dir: str) -> List[str]:
+    """Every W&B console capture under a run, for whichever layout wrote it.
+
+    wandb 0.29 does not write `files/output.log` any more -- `cl_it_lidar_s701`'s run directory
+    holds `requirements.txt` and `wandb-metadata.json` and nothing else -- so this is a fallback for
+    the hundred older runs rather than a source for new ones. `latest-run` is a symlink to one of
+    the `run-*` directories and is skipped so the same file is not read twice under two names.
+    """
+    out = []
     wb = os.path.join(run_dir, "wandb")
     try:
-        for d in os.listdir(wb):
-            p = os.path.join(wb, d, "files", "output.log")
-            if d.startswith("run-") and os.path.isfile(p):
-                cands.append(p)
+        names = sorted(os.listdir(wb))
     except OSError:
-        pass
-    if not cands:
+        return out
+    for d in names:
+        if not (d.startswith("run-") or d.startswith("offline-run-")):
+            continue
+        for rel in (("files", "output.log"), ("logs", "output.log")):
+            path = os.path.join(wb, d, *rel)
+            if os.path.isfile(path):
+                out.append(path)
+    return out
+
+
+def job_stdout_log(run_dir: str, runs_dir: str = "") -> Optional[str]:
+    """The log the console recorded for this run when it launched it, wherever that was."""
+    runs_dir = runs_dir or catalog.RUNS_DIR
+    rec = os.path.join(runs_dir, JOBS_DIRNAME, f"{os.path.basename(run_dir.rstrip(os.sep))}.json")
+    try:
+        with open(rec) as f:
+            path = json.load(f).get("log") or ""
+    except (OSError, ValueError):
         return None
-    return max(cands, key=lambda p: os.path.getmtime(p))
+    return path if path and os.path.isfile(path) else None
+
+
+def progress_candidates(run_dir: str, runs_dir: str = "") -> List[Tuple[str, str]]:
+    """(path, source kind) for every file this run's curve could be read from, best first.
+
+    The order is the point: the trainer's own record, then the console's capture of its own job,
+    then W&B's side effect, then whatever else the launcher left in the directory. Every rung is
+    here because the one below it failed for some run in `~/f1sim_runs` this week.
+    """
+    out: List[Tuple[str, str]] = []
+    own = os.path.join(run_dir, PROGRESS_FILENAME)
+    if os.path.isfile(own):
+        out.append((own, "progress"))
+    console = os.path.join(run_dir, "console-train.log")
+    if os.path.isfile(console):
+        out.append((console, "console"))
+    for path in sorted(wandb_output_logs(run_dir), key=os.path.getmtime, reverse=True):
+        out.append((path, "wandb"))
+    seen = {p for p, _ in out}
+    stdout_log = job_stdout_log(run_dir, runs_dir)
+    if stdout_log and stdout_log not in seen:
+        out.append((stdout_log, "stdout"))
+        seen.add(stdout_log)
+    try:
+        entries = sorted(os.listdir(run_dir))
+    except OSError:
+        entries = []
+    for fn in entries:
+        path = os.path.join(run_dir, fn)
+        if fn.endswith(".log") and path not in seen and os.path.isfile(path):
+            out.append((path, "stdout"))
+    return out
+
+
+def run_log_path(run_dir: str) -> Optional[str]:
+    """The best progress source for a run: its own `progress.jsonl` if it has one, else the newest
+    log anything left behind. Kept under its old name -- a run is watchable iff this is not None."""
+    cands = progress_candidates(run_dir)
+    return cands[0][0] if cands else None
+
+
+def _read_tail(path: str, max_bytes: int) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def blank_reason(run_dir: str, runs_dir: str = "") -> str:
+    """Why the charts are empty, named after the files that are missing.
+
+    A chart that draws nothing and says nothing is the bug this page was reported for: the screen
+    looked broken while the run was fine, and nothing on it said which.
+    """
+    found = {kind for _, kind in progress_candidates(run_dir, runs_dir)}
+    if found:
+        return ""
+    missing = " · ".join(f"{SOURCE_LABELS[k]} 없음" for k in ("progress", "console", "wandb"))
+    return (f"{missing} — 이 런은 진행 기록을 남기지 않았습니다. 지금 버전으로 다시 시작하면 "
+            f"학습이 {PROGRESS_FILENAME} 을 직접 씁니다.")
+
+
+def _tail_records(path: str, tail: int) -> List[dict]:
+    out = []
+    for ln in _read_tail(path, 400_000).splitlines()[-tail:]:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def describe_record(rec: dict) -> str:
+    """A `progress.jsonl` object as the line the trainer would have printed for it."""
+    g = lambda k: _f(rec.get(k, float("nan")))
+    if rec.get("kind") == "dagger":
+        return (f"iter {rec.get('iter', '?')}/{rec.get('total', '?')} beta {g('beta'):.2f} "
+                f"loss {g('loss'):.4f} | student {g('student_coll_per_km'):.1f} coll/km "
+                f"prog {g('student_prog_mps'):.2f} m/s lap {g('student_lap_s'):.1f} s | "
+                f"teacher {g('teacher_coll_per_km'):.1f} coll/km lap {g('teacher_lap_s'):.1f} s")
+    return (f"upd {rec.get('update', '?')}/{rec.get('total', '?')} steps {g('steps') / 1e6:.2f}M | "
+            f"rew/step {g('rew_per_step'):.3f} coll {g('coll_per_km'):.1f}/km "
+            f"prog {g('prog_m'):.0f} m lap {g('lap_s'):.1f} s | kl_ref {g('kl_ref'):.3f} | "
+            f"{g('sps'):.0f} steps/s")
+
+
+def read_progress(run_dir: str, tail: int = 60, max_bytes: int = 4_000_000,
+                  runs_dir: str = "") -> Progress:
+    """The run's curve, from the best source that actually has points in it.
+
+    A `progress.jsonl` with nothing in it yet (a run in its first minute) must not hide a
+    `console-train.log` with thirty updates in it, so the ladder is walked until something has
+    points rather than stopping at the first file that exists.
+    """
+    cands = progress_candidates(run_dir, runs_dir)
+    first: Optional[Progress] = None
+    chosen: Optional[Progress] = None
+    for path, kind in cands:
+        p = parse_progress(_read_tail(path, max_bytes), tail=tail)
+        p.source, p.source_kind = path, kind
+        if p.n_points:
+            chosen = p
+            break
+        first = first or p
+    p = chosen or first or Progress()
+    if p.source_kind == "progress":
+        # The JSON is the curve; the log box wants sentences. A text log beside it also carries the
+        # traceback of a run that died, which `progress.jsonl` by its nature never will.
+        for path, kind in cands:
+            if kind == "progress":
+                continue
+            text = _read_tail(path, 200_000)
+            if text:
+                side = parse_progress(text, tail=tail)
+                p.lines, p.error = side.lines, p.error or side.error
+                break
+        else:
+            p.lines = [describe_record(r) for r in _tail_records(p.source, tail)]
+    if not p.n_points:
+        p.reason = blank_reason(run_dir, runs_dir) or \
+            f"{p.source_label} 은 있으나 아직 진행 줄이 없습니다 (시작 준비 중)."
+    return p
 
 
 def list_checkpoints(run_dir: str) -> List[Tuple[str, str, float]]:
@@ -617,7 +978,7 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
         state = "오류"
     elif alive and job.stop_requested:
         state = "중지 요청됨"
-    elif alive and p is not None and not p.n_updates:
+    elif alive and p is not None and not p.n_points:
         state = "준비 중 (컴파일)"
     eta = None
     if p is not None and p.n_updates and p.update < p.n_updates and p.sps and alive:
@@ -630,6 +991,10 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
             per_update = (p.steps_m * 1e6 / max(1, p.update)) if p.update else 0.0
         rate = sum(p.sps[-5:]) / len(p.sps[-5:])
         eta = (p.n_updates - p.update) * per_update / max(1.0, rate)
+    elif p is not None and alive:
+        # A DAgger job has no steps/s and no `--envs x --horizon`; its own wall clock is the only
+        # thing that knows how long an iteration takes.
+        eta = _eta_seconds(p) or None
     recipe = match_recipe(f)
     init = f.get("init", "")
     sha = checkpoint_sha(init) if init else ""
@@ -652,8 +1017,7 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
     return JobSummary(
         name=job.name, state=state, alive=alive, external=job.external, started=job.started,
         elapsed_s=max(0.0, now - job.started), eta_s=eta,
-        progress=(f"{p.update}/{p.n_updates} 업데이트 · {p.steps_m:.2f}M 스텝"
-                  if p is not None and p.n_updates else ""),
+        progress=_progress_text(p),
         recipe=(recipe.title if recipe else ("외부 실행" if job.external else "사용자 정의")),
         init=(f"{os.path.basename(init)}" + (f" · {sha}" if sha else "")) if init else "",
         tracks_text=describe_tracks(f.get("tracks", "train"), f.get("obstacle-draws", "")),
@@ -665,22 +1029,127 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
         log=job.log, pid=job.pid)
 
 
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _eta_seconds(p: Progress) -> float:
+    """Seconds left, from whatever the run records about its own pace.
+
+    `wall_s` first, because it is the only one that is right for a resumed run: the progress line's
+    cumulative step count includes the steps of the previous legs, so steps-per-update read off it
+    is inflated by exactly the resume, and DAgger has no step count at all.
+    """
+    left = p.n_updates - p.update
+    if left <= 0 or not p.n_updates or not p.update:
+        return 0.0
+    wall = [v for v in p.get("wall_s") if v == v]
+    if wall and wall[-1] > 0:
+        return left * wall[-1] / p.update
+    rate = [v for v in p.sps[-5:] if v == v]
+    if p.kind == "dagger" or not rate:
+        return 0.0
+    return left * (p.steps_m * 1e6 / p.update) / max(1.0, sum(rate) / len(rate))
+
+
+def _fmt_eta(seconds: float) -> str:
+    if not seconds or seconds <= 0:
+        return "—"
+    return f"{seconds / 60:.0f}분" if seconds < 5400 else f"{seconds / 3600:.1f}시간"
+
+
+def _progress_text(p: Optional[Progress]) -> str:
+    if p is None or not p.n_points:
+        return ""
+    if p.kind == "dagger":
+        return f"{p.update}/{p.n_updates} 반복" if p.n_updates else f"{p.update}번째 반복"
+    if not p.n_updates:
+        return f"{p.update} 업데이트"
+    return f"{p.update}/{p.n_updates} 업데이트 · {p.steps_m:.2f}M 스텝"
+
+
+def describe_source(p: Progress, run_dir: str = "", runs_dir: str = "") -> str:
+    """The line under the progress bar: which file the charts are drawn from, or why there is none."""
+    if not p.n_points:
+        return p.reason or blank_reason(run_dir, runs_dir) or "진행 기록 없음"
+    where = p.source
+    if run_dir and where.startswith(run_dir.rstrip(os.sep) + os.sep):
+        where = os.path.relpath(where, run_dir)
+    kind = {"ppo": "PPO", "dagger": "DAgger"}.get(p.kind, "")
+    return (f"진행 기록: {p.source_label} · {p.n_points}개 지점"
+            + (f" · {kind}" if kind else "") + f"  ({where})")
+
+
+def source_tag(run_dir: str, runs_dir: str = "") -> str:
+    """The short "where does this run's curve come from" the run list shows per run."""
+    cands = progress_candidates(run_dir, runs_dir)
+    return f"기록 {SOURCE_LABELS[cands[0][1]]}" if cands else "기록 없음"
+
 # ================================================================ chart widget
 class LineChart(QtWidgets.QWidget):
-    """One series against update index. Draws the range and the last value; nothing is smoothed."""
+    """One or two series against the update (or iteration) index. Nothing is smoothed.
 
-    def __init__(self, title: str, unit: str = "", colour: str = "", lower_is_better: bool = False, parent=None):
+    Two series on one chart is not decoration: a DAgger student's collision rate means nothing
+    without its teacher's on the same axis -- "52 coll/km" is a disaster against a teacher at 7 and
+    ordinary against a teacher at 48.
+    """
+
+    def __init__(self, title: str, unit: str = "", colour: str = "", lower_is_better: bool = False,
+                 parent=None, colours: Sequence[str] = (), labels: Sequence[str] = (),
+                 x_label: str = "update →"):
         super().__init__(parent)
         self.setMinimumHeight(120)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.title, self.unit = title, unit
-        self.colour = colour or C["accent"]
+        self.setMouseTracking(True)                 # for the read-out under the cursor
+        self.title, self.unit, self.x_label = title, unit, x_label
+        self.colours = [c for c in (colours or ()) if c] or [colour or C["accent"], C["text.1"]]
+        self.labels = list(labels or ())
         self.lower_is_better = lower_is_better
-        self._y: List[float] = []
+        self.placeholder = "데이터 없음"
+        self._series: List[List[float]] = []
+        self._hover: Optional[int] = None
 
-    def set_series(self, y: Sequence[float]):
-        self._y = [float(v) for v in y]
+    # -- data
+    def set_series(self, *series: Sequence[float]):
+        self._series = [[float(v) for v in s] for s in series]
         self.update()
+
+    def set_placeholder(self, text: str):
+        """What an empty chart says instead of nothing. The reason a run has no curve is the one
+        thing the blank page never told anybody."""
+        self.placeholder = text or "데이터 없음"
+        self.update()
+
+    # -- hover
+    def mouseMoveEvent(self, ev):
+        n = max((len(s) for s in self._series), default=0)
+        if n < 1:
+            return
+        x0, x1 = self._plot_x()
+        frac = (ev.x() - x0) / max(1.0, x1 - x0)
+        self._hover = min(n - 1, max(0, int(round(frac * (n - 1)))))
+        self.update()
+
+    def leaveEvent(self, _ev):
+        self._hover = None
+        self.update()
+
+    def _plot_x(self) -> Tuple[float, float]:
+        return 48.0, self.width() - 10.0
+
+    def _readout(self, index: int) -> str:
+        """The values at one x, in series order, as the top-right read-out draws them."""
+        parts = []
+        for i, s in enumerate(self._series):
+            v = s[index] if index < len(s) else float("nan")
+            if v != v:
+                continue
+            name = self.labels[i] if i < len(self.labels) else ""
+            parts.append(f"{name} {v:.3g}".strip() if name else f"{v:.3g}")
+        return " / ".join(parts)
 
     def paintEvent(self, _ev):
         p = QtGui.QPainter(self)
@@ -690,17 +1159,19 @@ class LineChart(QtWidgets.QWidget):
         f = p.font(); f.setPointSizeF(8.0); p.setFont(f)
         p.setPen(QtGui.QColor(C["text.1"]))
         p.drawText(QtCore.QRectF(8, 4, w - 16, 16), QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, self.title)
-        ys = [v for v in self._y if v == v]                     # drop nan
-        if len(ys) < 2:
+        finite = [v for s in self._series for v in s if v == v]
+        if not finite:
             p.setPen(QtGui.QColor(C["text.2"]))
-            p.drawText(self.rect(), QtCore.Qt.AlignCenter, "데이터 없음")
+            box = QtCore.QRectF(8, 20, w - 16, h - 28)
+            p.drawText(box, QtCore.Qt.AlignCenter | QtCore.Qt.TextWordWrap, self.placeholder)
             return
-        lo, hi = min(ys), max(ys)
+        lo, hi = min(finite), max(finite)
         if hi - lo < 1e-9:
             lo, hi = lo - 1.0, hi + 1.0
         pad = (hi - lo) * 0.08
         lo, hi = lo - pad, hi + pad
-        x0, x1, y0, y1 = 48, w - 10, 30, h - 18
+        x0, x1 = self._plot_x()
+        y0, y1 = 30.0, h - 18.0
         p.setPen(QtGui.QPen(QtGui.QColor(C["line"]), 1))
         for k in range(4):
             yy = y0 + (y1 - y0) * k / 3
@@ -709,28 +1180,103 @@ class LineChart(QtWidgets.QWidget):
         p.setPen(QtGui.QColor(C["text.2"]))
         p.drawText(QtCore.QRectF(0, y0 - 7, x0 - 4, 14), QtCore.Qt.AlignRight, f"{hi:.3g}")
         p.drawText(QtCore.QRectF(0, y1 - 7, x0 - 4, 14), QtCore.Qt.AlignRight, f"{lo:.3g}")
-        n = len(self._y)
-        pts = []
-        for i, v in enumerate(self._y):
-            if v != v:
+        n = max(len(s) for s in self._series)
+        at = lambda i: x0 + (x1 - x0) * (i / max(1, n - 1))
+        if self._hover is not None and self._hover < n:
+            p.setPen(QtGui.QPen(QtGui.QColor(C["line.strong"]), 1, QtCore.Qt.DashLine))
+            p.drawLine(QtCore.QPointF(at(self._hover), y0), QtCore.QPointF(at(self._hover), y1))
+        for si, s in enumerate(self._series):
+            colour = QtGui.QColor(self.colours[si % len(self.colours)])
+            pts = [QtCore.QPointF(at(i), y1 - (y1 - y0) * ((v - lo) / (hi - lo)))
+                   for i, v in enumerate(s) if v == v]
+            if not pts:
                 continue
-            x = x0 + (x1 - x0) * (i / max(1, n - 1))
-            y = y1 - (y1 - y0) * ((v - lo) / (hi - lo))
-            pts.append(QtCore.QPointF(x, y))
-        p.setPen(QtGui.QPen(QtGui.QColor(self.colour), 1.6))
-        p.drawPolyline(QtGui.QPolygonF(pts))
-        last = pts[-1]
-        p.setBrush(QtGui.QColor(self.colour)); p.setPen(QtCore.Qt.NoPen)
-        p.drawEllipse(last, 3, 3)
+            p.setPen(QtGui.QPen(colour, 1.6 if si == 0 else 1.2,
+                                QtCore.Qt.SolidLine if si == 0 else QtCore.Qt.DashLine))
+            if len(pts) > 1:
+                p.drawPolyline(QtGui.QPolygonF(pts))
+            p.setBrush(colour); p.setPen(QtCore.Qt.NoPen)
+            p.drawEllipse(pts[-1], 3, 3)
+        # the read-out: the last value, or whatever the cursor is over
+        index = self._hover if self._hover is not None and self._hover < n else n - 1
+        text = self._readout(index) or self._readout(n - 1)
         p.setPen(QtGui.QColor(C["text.0"]))
         mono.setPointSizeF(9.0); mono.setBold(True); p.setFont(mono)
         p.drawText(QtCore.QRectF(x0, 4, x1 - x0, 16), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
-                   f"{ys[-1]:.3g} {self.unit}".strip())
+                   f"{text} {self.unit}".strip())
         p.setPen(QtGui.QColor(C["text.2"]))
         f.setPointSizeF(7.0); p.setFont(f)
-        p.drawText(QtCore.QRectF(x0, y1 + 2, x1 - x0, 14), QtCore.Qt.AlignLeft, "update →")
+        foot = self.x_label if self._hover is None else f"{self.x_label.rstrip(' →')} {index + 1}"
+        p.drawText(QtCore.QRectF(x0, y1 + 2, x1 - x0, 14), QtCore.Qt.AlignLeft, foot)
         if self.lower_is_better:
             p.drawText(QtCore.QRectF(x0, y1 + 2, x1 - x0, 14), QtCore.Qt.AlignRight, "낮을수록 좋음")
+        if len(self._series) > 1 and self.labels:
+            mono.setPointSizeF(7.0); mono.setBold(False); p.setFont(mono)
+            slot = 0
+            for si, name in enumerate(self.labels[:len(self._series)]):
+                if not any(v == v for v in self._series[si]):
+                    continue                    # naming a line this run never drew
+                p.setPen(QtGui.QColor(self.colours[si % len(self.colours)]))
+                p.drawText(QtCore.QRectF(x0 + 4 + slot * 62, y0 + 2, 60, 12), QtCore.Qt.AlignLeft, name)
+                slot += 1
+
+
+@dataclass(frozen=True)
+class ChartSpec:
+    """One chart: which series it draws, what it is called, and whether it is drawn at all.
+
+    The order of the lists below is the answer to "중요한 메트릭들 위주로 plot하게 해줘": what the
+    policy is judged on comes first (collisions, lap time, progress, reward), the traffic the
+    opponents create next, and the optimiser's own diagnostics last.
+    """
+
+    keys: Tuple[str, ...]
+    title: str
+    unit: str = ""
+    colours: Tuple[str, ...] = ("accent",)
+    labels: Tuple[str, ...] = ()
+    lower_is_better: bool = False
+    optional: bool = False              # drawn only when the run actually measured it
+
+    def wanted(self, p: "Progress") -> bool:
+        return (not self.optional) or any(p.has(k) for k in self.keys)
+
+
+PPO_CHARTS: Tuple[ChartSpec, ...] = (
+    ChartSpec(("coll_per_km",), "충돌 / km", "/km", ("danger",), lower_is_better=True),
+    ChartSpec(("lap_s",), "랩 타임", "s", ("warn",), lower_is_better=True),
+    ChartSpec(("prog_m",), "에피소드 진행", "m", ("ok",)),
+    ChartSpec(("rew_per_step",), "보상 / 스텝", "", ("accent",)),
+    ChartSpec(("traffic/passes_held_per_min",), "추월 성공 / 분", "/분", ("ok",), optional=True),
+    ChartSpec(("traffic/car_contacts_per_min",), "차량 접촉 / 분", "/분", ("danger",),
+              lower_is_better=True, optional=True),
+    ChartSpec(("traffic/wall_collisions_per_min",), "벽 충돌 / 분", "/분", ("danger",),
+              lower_is_better=True, optional=True),
+    ChartSpec(("traffic/ttc_share",), "접촉 위험 시간 비율", "", ("warn",),
+              lower_is_better=True, optional=True),
+    ChartSpec(("kl_ref",), "KL (원본 대비)", "", ("text.1",)),
+    ChartSpec(("gate",), "커리큘럼 게이트 (충돌/km)", "/km", ("warn",), lower_is_better=True),
+    ChartSpec(("tk",), "채점된 트랙 수", "개", ("text.2",), optional=True),
+    ChartSpec(("sps",), "처리량", "steps/s", ("text.1",)),
+)
+
+DAGGER_CHARTS: Tuple[ChartSpec, ...] = (
+    ChartSpec(("student_coll_per_km", "teacher_coll_per_km"), "충돌 / km · 학생 vs 교사", "/km",
+              ("danger", "text.1"), labels=("학생", "교사"), lower_is_better=True),
+    ChartSpec(("loss",), "증류 손실", "", ("accent",), lower_is_better=True),
+    ChartSpec(("student_lap_s", "teacher_lap_s"), "랩 타임 · 학생 vs 교사", "s",
+              ("warn", "text.1"), labels=("학생", "교사"), lower_is_better=True),
+    ChartSpec(("student_prog_mps", "teacher_prog_mps"), "진행 속도 · 학생 vs 교사", "m/s",
+              ("ok", "text.1"), labels=("학생", "교사")),
+    ChartSpec(("beta",), "beta (교사 주행 비율)", "", ("text.1",)),
+)
+
+
+def charts_for(p: "Progress") -> Tuple[ChartSpec, ...]:
+    """The chart set a run gets. A DAgger run and a PPO run do not share a single metric name, so
+    the page draws one or the other rather than six charts of which four are always empty."""
+    specs = DAGGER_CHARTS if p.kind == "dagger" else PPO_CHARTS
+    return tuple(s for s in specs if s.wanted(p))
 
 
 # ================================================================ the track picker
@@ -1418,7 +1964,9 @@ class TrainingPage(QtWidgets.QWidget):
         self._runs: List[catalog.RunInfo] = []
         self._run_names: List[str] = []
         self._current_run: Optional[str] = None
-        self._log_mtime: Tuple[Optional[str], float] = (None, 0.0)
+        #: run dir -> ((source path, mtime), Progress). The page ticks every two seconds and a run
+        #: log is megabytes; nothing is re-read while its source file has not moved.
+        self._progress_cache: Dict[str, Tuple[Tuple, Progress]] = {}
         self._job_log_cache: Dict[str, Tuple[Tuple[str, float], str]] = {}
 
         root = QtWidgets.QHBoxLayout(self)
@@ -1457,6 +2005,12 @@ class TrainingPage(QtWidgets.QWidget):
         head.add(row)
         self.progress = QtWidgets.QProgressBar(); self.progress.setRange(0, 1000); self.progress.setValue(0)
         head.add(self.progress)
+        # Where the numbers on this page come from, always visible. The charts were blank for every
+        # current run and the page said nothing at all about why.
+        self.source_note = label("", "hint")
+        self.source_note.setWordWrap(True)
+        self.source_note.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        head.add(self.source_note)
         grid = QtWidgets.QGridLayout(); grid.setHorizontalSpacing(SP[2]); grid.setVerticalSpacing(SP[0])
         self.m_upd = MetricTile("업데이트", "", small=True)
         self.m_steps = MetricTile("누적 스텝", "M", small=True)
@@ -1469,16 +2023,12 @@ class TrainingPage(QtWidgets.QWidget):
         head.add(grid)
         centre.addWidget(head)
 
-        charts = QtWidgets.QGridLayout(); charts.setHorizontalSpacing(SP[1]); charts.setVerticalSpacing(SP[1])
-        self.ch_rew = LineChart("보상 / 스텝", "", C["accent"])
-        self.ch_coll = LineChart("충돌 / km", "/km", C["danger"], lower_is_better=True)
-        self.ch_prog = LineChart("에피소드 진행", "m", C["ok"])
-        self.ch_lap = LineChart("랩 타임", "s", C["warn"], lower_is_better=True)
-        self.ch_kl = LineChart("KL (원본 대비)", "", C["text.1"])
-        self.ch_sps = LineChart("처리량", "steps/s", C["text.1"])
-        for i, ch in enumerate((self.ch_rew, self.ch_coll, self.ch_prog, self.ch_lap, self.ch_kl, self.ch_sps)):
-            charts.addWidget(ch, i // 3, i % 3)
-        centre.addLayout(charts, 1)
+        # The chart set belongs to the run, not to the page: PPO and DAgger share no metric name.
+        self.charts_grid = QtWidgets.QGridLayout()
+        self.charts_grid.setHorizontalSpacing(SP[1]); self.charts_grid.setVerticalSpacing(SP[1])
+        self._charts: Dict[Tuple[str, ...], LineChart] = {}
+        self._chart_specs: Tuple[ChartSpec, ...] = ()
+        centre.addLayout(self.charts_grid, 1)
         self.log_box = QtWidgets.QPlainTextEdit(); self.log_box.setReadOnly(True); self.log_box.setMaximumHeight(150)
         self.log_box.setStyleSheet(f"font-family: '{theme.MONO_FONT}', monospace; font-size: 10px; background: {C['bg.window']};")
         fold = Collapsible("학습 로그 (끝부분)", expanded=True); fold.add(self.log_box)
@@ -1561,29 +2111,29 @@ class TrainingPage(QtWidgets.QWidget):
                                   "f1sim.learn.ppo 도 '외부 실행'으로 잡혀 같이 보이고 중지할 수 있습니다.")
 
     def job_summary(self, job: Job) -> JobSummary:
-        """The card's content. Reads the tail of the run's log for the progress line and the W&B
-        url; cached by (path, mtime) so a two-second refresh is not a two-second file read."""
-        log = job.log or run_log_path(job.run_dir) or ""
-        text = ""
-        if log:
-            try:
-                mt = os.path.getmtime(log)
-            except OSError:
-                mt = 0.0
-            cached = self._job_log_cache.get(job.name)
-            if cached and cached[0] == (log, mt):
-                text = cached[1]
-            else:
-                try:
-                    with open(log, "rb") as f:
-                        f.seek(0, 2)
-                        size = f.tell()
-                        f.seek(max(0, size - 400_000))
-                        text = f.read().decode("utf-8", "replace")
-                except OSError:
-                    text = ""
-                self._job_log_cache[job.name] = ((log, mt), text)
-        return summarize_job(job, log_text=text, progress=parse_progress(text) if text else None)
+        """The card's content: the curve from the best progress source, and the W&B url from a text
+        log (`progress.jsonl` carries numbers, and the url is printed once, in prose).
+
+        Both are cached by (path, mtime) so a two-second refresh is not a two-second file read."""
+        p = self._progress_for(job.run_dir)
+        text = self._job_text(job)
+        return summarize_job(job, log_text=text, progress=p if p.n_points or p.source else None)
+
+    def _job_text(self, job: Job) -> str:
+        """The tail of whatever text log this job has, for the W&B url."""
+        log = job.log if job.log and os.path.isfile(job.log) else ""
+        if not log:
+            log = next((path for path, kind in progress_candidates(job.run_dir, self.jobs.runs_dir)
+                        if kind != "progress"), "")
+        if not log:
+            return ""
+        mt = _mtime(log)
+        cached = self._job_log_cache.get(job.name)
+        if cached and cached[0] == (log, mt):
+            return cached[1]
+        text = _read_tail(log, 400_000)
+        self._job_log_cache[job.name] = ((log, mt), text)
+        return text
 
     def _open_job(self, name: str):
         i = self.combo_run.findData(os.path.join(catalog.RUNS_DIR, name))
@@ -1619,60 +2169,102 @@ class TrainingPage(QtWidgets.QWidget):
         self._refresh_jobs()
 
     # -- monitor
+    #: What the six tiles above the charts are called, per run kind. A DAgger iteration has no
+    #: "누적 스텝" and no steps/s, and showing 0 for both was the old page's way of saying so.
+    TILE_NAMES = {"ppo": ("업데이트", "누적 스텝", "처리량"), "dagger": ("반복", "샘플", "손실")}
+
+    def _apply_charts(self, p: Progress):
+        """Draw the chart set this run's kind and metrics call for, important first.
+
+        The widgets are kept and refilled while the set is unchanged: a chart rebuilt every two
+        seconds cannot be hovered, which is exactly what the read-out is for.
+        """
+        specs = charts_for(p)
+        if specs != self._chart_specs:
+            self._chart_specs = specs
+            while self.charts_grid.count():
+                item = self.charts_grid.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+            self._charts = {}
+            x_label = "iter →" if p.kind == "dagger" else "update →"
+            for i, spec in enumerate(specs):
+                ch = LineChart(spec.title, spec.unit, lower_is_better=spec.lower_is_better,
+                               colours=[C.get(c, c) for c in spec.colours], labels=spec.labels,
+                               x_label=x_label)
+                self._charts[spec.keys] = ch
+                self.charts_grid.addWidget(ch, i // 3, i % 3)
+        # The short half of the reason on the chart itself (a third of the width), the whole of it
+        # under the progress bar.
+        blank = p.reason.split(" — ")[0] if p.reason else ("데이터 없음" if p.n_points else "기록 없음")
+        for spec in specs:
+            ch = self._charts[spec.keys]
+            ch.set_series(*[p.get(k) for k in spec.keys])
+            ch.set_placeholder(blank)
+
+    def _progress_for(self, run_dir: str) -> Progress:
+        """The run's curve, re-read only when its source file has changed."""
+        cands = progress_candidates(run_dir, self.jobs.runs_dir)
+        stamp = tuple((path, _mtime(path)) for path, _k in cands[:1])
+        cached = self._progress_cache.get(run_dir)
+        if cached and cached[0] == stamp:
+            return cached[1]
+        p = read_progress(run_dir, runs_dir=self.jobs.runs_dir)
+        self._progress_cache[run_dir] = (stamp, p)
+        return p
+
     def _select_run(self, _idx):
         run_dir = self.combo_run.currentData()
         if not run_dir:
             self._current_run = None; return
         if run_dir != self._current_run:
             self._current_run = run_dir
-            self._log_mtime = (None, 0.0)
+            self._progress_cache.pop(run_dir, None)
         self._tick(force=True)
 
     def _tick(self, force: bool = False):
         run_dir = self._current_run
         if not run_dir:
             return
-        log = run_log_path(run_dir)
-        mtime = os.path.getmtime(log) if log else 0.0
-        if not force and (log, mtime) == self._log_mtime:
-            self._refresh_jobs(); return
-        self._log_mtime = (log, mtime)
-        text = ""
-        if log:
-            try:
-                with open(log, "rb") as f:
-                    f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 4_000_000))
-                    text = f.read().decode("utf-8", "replace")
-            except OSError:
-                text = ""
-        p = parse_progress(text)
+        if force:
+            self._progress_cache.pop(run_dir, None)
+        p = self._progress_for(run_dir)
+        mtime = _mtime(p.source) if p.source else 0.0
+        is_dagger = p.kind == "dagger"
+        names = self.TILE_NAMES["dagger" if is_dagger else "ppo"]
+        for tile, name in zip((self.m_upd, self.m_steps, self.m_sps), names):
+            tile.name_label.setText(name)
         self.progress.setValue(int(1000 * p.fraction))
-        self.m_upd.set_value(f"{p.update}/{p.n_updates}" if p.n_updates else "—")
-        self.m_steps.set_value(f"{p.steps_m:.2f}" if p.n_updates else "—")
-        self.m_sps.set_value(f"{p.sps[-1]:.0f}" if p.sps else "—")
+        self.m_upd.set_value(f"{p.update}/{p.n_updates}" if p.n_updates else (str(p.update) if p.update else "—"))
+        if is_dagger:
+            samples = p.get("samples")
+            loss = p.get("loss")
+            self.m_steps.set_value(f"{samples[-1] / 1e3:.0f}k" if samples else "—")
+            self.m_sps.set_value(f"{loss[-1]:.4f}" if loss else "—")
+        else:
+            self.m_steps.set_value(f"{p.steps_m:.2f}" if p.n_points else "—")
+            self.m_sps.set_value(f"{p.sps[-1]:.0f}" if p.sps else "—")
+        self.m_steps.unit.setText("" if is_dagger else "M")
+        self.m_sps.unit.setText("" if is_dagger else "steps/s")
         job = next((j for j in self.jobs.list_jobs() if j.run_dir == run_dir), None)
         alive = bool(job and job.alive)
         if p.error and not p.finished:
             self.m_state.set_value("오류", C["danger"])
         elif p.finished:
             self.m_state.set_value("완료", C["ok"])
-        elif alive and not p.n_updates:
+        elif alive and not p.n_points:
             self.m_state.set_value("준비 중 (컴파일)", C["warn"])
         elif alive:
             self.m_state.set_value("실행 중", C["ok"])
-        elif log and time.time() - mtime < 120:
+        elif p.source and time.time() - mtime < 120:
             self.m_state.set_value("실행 중?", C["warn"])
         else:
-            self.m_state.set_value("중단됨" if p.n_updates else "기록 없음", C["text.2"])
-        if p.n_updates and p.update < p.n_updates and (alive or time.time() - mtime < 120) and p.sps:
-            per_update = (p.steps_m * 1e6 / max(1, p.update)) if p.update else 0
-            rate = sum(p.sps[-5:]) / len(p.sps[-5:])
-            eta = (p.n_updates - p.update) * per_update / max(1.0, rate)
-            self.m_eta.set_value(f"{eta / 60:.0f}분" if eta < 5400 else f"{eta / 3600:.1f}시간")
-        else:
-            self.m_eta.set_value("—")
-        self.ch_rew.set_series(p.rew); self.ch_coll.set_series(p.coll); self.ch_prog.set_series(p.prog)
-        self.ch_lap.set_series(p.lap); self.ch_kl.set_series(p.kl); self.ch_sps.set_series(p.sps)
+            self.m_state.set_value("중단됨" if p.n_points else "기록 없음", C["text.2"])
+        self.m_eta.set_value(_fmt_eta(_eta_seconds(p)) if (alive or time.time() - mtime < 120) else "—")
+        self._apply_charts(p)
+        self.source_note.setText(describe_source(p, run_dir, self.jobs.runs_dir))
         self.log_box.setPlainText("\n".join(p.lines))
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
         self._refresh_ckpts(run_dir)

@@ -468,6 +468,9 @@ def main():
     run = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "tracks": names,
                                                "teacher_desc": teacher_desc}, group="dagger", mode=a.wandb)
     out = common.run_dir(a.name)
+    # The run's own curve, next to the students. Written whatever `--wandb` is set to: the console's
+    # dashboard reads this file, and a DAgger run's `iter` line was never parsed by anything.
+    progress_log = common.ProgressLog(out)
     log = lambda d: run.log(d)
     env.sim.warmup()
     bufs = []
@@ -493,6 +496,20 @@ def main():
              **{f"student/{k}": v for k, v in scalar(m).items()}, **{f"teacher/{k}": v for k, v in scalar(teacher_metrics).items()},
              "time/collect_s": t_col, "time/train_s": t_tr, "time/eval_s": t_ev, "time/elapsed_min": (time.time() - t0) / 60})
         worst = names[m["worst_track_index"]] if m.get("worst_track_index", -1) >= 0 else "n/a"
+        # The stable schema the console plots, then every other scalar the iteration measured. Same
+        # shape as PPO's record and told apart by "kind", so one reader serves both.
+        record = {"kind": "dagger", "iter": it, "total": a.iters, "beta": beta,
+                  "samples": sum(len(b) for b in bufs), "loss": loss,
+                  "student_coll_per_km": m["collisions_per_km"],
+                  "student_prog_mps": m["progress_rate_mps"], "student_lap_s": m["lap_time_s"],
+                  "teacher_coll_per_km": teacher_metrics["collisions_per_km"],
+                  "teacher_prog_mps": teacher_metrics["progress_rate_mps"],
+                  "teacher_lap_s": teacher_metrics["lap_time_s"],
+                  "wall_s": time.time() - t0, "worst_track": worst,
+                  "collect_s": t_col, "train_s": t_tr, "eval_s": t_ev}
+        record.update({f"student/{k}": v for k, v in scalar(m).items()})
+        record.update({f"teacher/{k}": v for k, v in scalar(teacher_metrics).items()})
+        progress_log.write(record)
         print(f"iter {it}: beta {beta:.2f} samples {sum(len(b) for b in bufs)} loss {loss:.4f} | student {m['collisions_per_km']:.1f} coll/km "
               f"(worst {m['collisions_per_km_worst']:.1f} on {worst}) prog {m['progress_rate_mps']:.2f} m/s lap {m['lap_time_s']:.1f} s | "
               f"teacher {teacher_metrics['collisions_per_km']:.1f} coll/km (worst {teacher_metrics['collisions_per_km_worst']:.1f}) "
@@ -510,6 +527,7 @@ def main():
                 "teacher_grip": a.teacher_grip, "teacher_speed": a.teacher_speed}
         save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, meta)
         save_checkpoint(os.path.join(out, "student_latest.pt"), model, meta)
+    progress_log.close()
     run.finish()
 
 

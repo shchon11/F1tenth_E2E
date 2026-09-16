@@ -277,6 +277,19 @@ def warm_start_additions(init_meta: dict, memory, scan_channels, future_head, fl
             None if init_meta.get("opp_token") else opp_token)
 
 
+#: The reward components whose non-zero entries count an event rather than measure a quantity, and
+#: what that event is called on the dashboard. `overtake_hold` is paid once per held lead,
+#: `car_contact` once per charged contact, `collision` on the crash that ends the episode -- so the
+#: number of non-zero entries over the learners' own steps IS the event count, and no counter has to
+#: be carried through the rollout to produce it.
+TRAFFIC_EVENTS = {"overtake_hold": "passes_held", "car_contact": "car_contacts"}
+
+
+def event_rate(comp: torch.Tensor, mask: torch.Tensor, denom) -> float:
+    """How often `comp` is non-zero over the masked steps, per `denom`."""
+    return float(((comp != 0).float() * mask).sum() / denom)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default=f"ppo_{time.strftime('%m%d_%H%M')}")
@@ -1171,6 +1184,10 @@ def main():
     if steps_base:
         print(f"continuing W&B run {wandb_id} from {steps_base/1e6:.1f}M steps", flush=True)
     out = common.run_dir(a.name)
+    # The run's own machine-readable curve, next to its checkpoints and independent of `--wandb`.
+    # `--metrics-jsonl` stays what it was (a caller-chosen path for a smoke's report); this one is
+    # always written, always in the run directory, and is what the console's dashboard reads.
+    progress_log = common.ProgressLog(out)
     # Re-seed before the first rollout, so the ACTION-SAMPLING stream does not depend on how many
     # modules were built. Two arms that differ by a scan channel or by the motion branch consume
     # different amounts of the ambient generator while constructing the network, and without this
@@ -1610,6 +1627,28 @@ def main():
             log.update({f"reward/{key}_per_step": ((buf_reward_components[:, :, index:index + 1] * m_).sum()
                                                    / m_.sum().clamp_min(1.0)).item()
                         for index, key in enumerate(REWARD_COMPONENT_KEYS)})
+            # ---- traffic, read off the same buffer. Only for terms whose coefficient is on:
+            # `-0.0 * car_hit` is a column of zeros, and a flat zero line on the dashboard reads as
+            # "no contacts happened", not as "this run does not measure contacts".
+            ci = {key: index for index, key in enumerate(REWARD_COMPONENT_KEYS)}
+            car_min = (buf_mask.sum() * env.sim.control_dt / 60.0).clamp_min(1e-9)
+            for comp_key, metric in TRAFFIC_EVENTS.items():
+                if getattr(env.ecfg, f"reward_{comp_key}", 0.0):
+                    log[f"traffic/{metric}_per_min"] = event_rate(buf_reward_components[:, :, ci[comp_key]],
+                                                                  buf_mask, car_min)
+            if env.ecfg.reward_collision:
+                crash_ev = buf_reward_components[:, :, ci["collision"]] != 0
+                contact_ev = buf_reward_components[:, :, ci["car_contact"]] != 0
+                log["traffic/crashes_per_min"] = float((crash_ev.float() * buf_mask).sum() / car_min)
+                # The wall half of it: a crash on a step that carried no contact charge. Under
+                # `--car-contact-penalty 0` nothing is ever charged, so the two lines coincide --
+                # which is the truth about what that run can distinguish.
+                log["traffic/wall_collisions_per_min"] = float(((crash_ev & ~contact_ev).float() * buf_mask).sum() / car_min)
+            if env.ecfg.reward_ttc:
+                # a share of steps, not a rate: the toll is per step and what it says is how much of
+                # the time the policy spent inside somebody's braking distance
+                log["traffic/ttc_share"] = event_rate(buf_reward_components[:, :, ci["ttc"]],
+                                                      buf_mask, buf_mask.sum().clamp_min(1.0))
             if a.cap_gate > 0:
                 # logged every time, including while it is still reading the whole set: a gate that
                 # logs nothing until it has per-track data looks identical to a gate that is not
@@ -1652,6 +1691,22 @@ def main():
                 with open(a.metrics_jsonl, "a") as f_:
                     f_.write(json.dumps({k_: (float(v_) if isinstance(v_, (int, float, np.floating))
                                               else v_) for k_, v_ in log.items()}) + "\n")
+            # `<run>/progress.jsonl`: the run's own curve, whatever `--wandb` is set to and wherever
+            # stdout went. The keys named here are the stable schema the console plots; everything
+            # else in `log` -- every reward component, every traffic rate, every auxiliary loss --
+            # follows under its W&B name, so a term added later is a new chart and not a parse error.
+            record = {"kind": "ppo", "update": update, "total": n_updates,
+                      "steps": steps_base + steps_done, "cap": cap,
+                      "rew_per_step": log["rollout/reward_per_step"],
+                      "coll_per_km": log.get("episode/collisions_per_km", float("nan")),
+                      "prog_m": log.get("episode/progress_m", float("nan")),
+                      "lap_s": log.get("episode/lap_time_s", float("nan")),
+                      "gate": log.get("curriculum/gate_coll_per_km", float("nan")),
+                      "tk": log.get("curriculum/tracks_scored", float("nan")),
+                      "kl_ref": log["loss/kl_ref"], "sps": log["time/env_steps_per_s"],
+                      "wall_s": time.time() - t_start}
+            record.update({k_: v_ for k_, v_ in log.items() if k_ not in record})
+            progress_log.write(record)
             print(f"upd {update}/{n_updates} steps {(steps_base + steps_done)/1e6:.1f}M cap {cap:.1f} | rew/step {log['rollout/reward_per_step']:.3f} "
                   f"coll {log.get('episode/collisions_per_km', float('nan')):.1f}/km prog {log.get('episode/progress_m', float('nan')):.0f} m "
                   f"lap {log.get('episode/lap_time_s', float('nan')):.1f} s | gate {log.get('curriculum/gate_coll_per_km', float('nan')):.1f} "
@@ -1686,6 +1741,7 @@ def main():
     # wrapper around `env._reset_envs` whatever the sim backend is, so releasing it only when graphs
     # were captured leaves both in place on the default `compile` backend.
     controller.release()
+    progress_log.close()
     if graph_rt is not None:
         from .graph_runtime import release_graph_runtime
         release_graph_runtime(graph_rt)         # puts sim._roll and the tracker's solver back

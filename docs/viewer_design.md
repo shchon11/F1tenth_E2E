@@ -244,6 +244,33 @@ falls back to the CPU before a single frame has reached a file rather than handi
 Rendering is untouched by any of this: the frames come from whatever GL context the session already
 has — the GPU on a desktop, llvmpipe under Xvfb.
 
+## The 현황판 charts (2026-09-16)
+
+The dashboard was empty for every current run. It read the progress line out of W&B's `output.log`
+— which wandb 0.29 no longer writes — and parsed it with one anchored regex that any added term
+broke, and it drew a fixed set of six PPO curves whose names a DAgger run does not have.
+
+Three rules now:
+
+* **The data is the run's own.** Both trainers write `<run>/progress.jsonl`
+  ([schema](training.md#progressjsonl--what-a-run-records-about-itself)). The page falls back to
+  `console-train.log`, then W&B's capture, then the launcher's log, and parses the human lines term
+  by term rather than as one sentence.
+* **The chart set belongs to the run**, not to the page. PPO and DAgger share no metric name, so the
+  grid is rebuilt from the run's `kind`, and a chart whose metric a run never measured (traffic in a
+  solo run) is not drawn as a flat zero line. Order is what the run is judged on first: collisions,
+  lap time, progress, reward; then traffic; then the optimiser's own diagnostics, throughput last.
+  Each chart is one metric, at the size the old six were, with the lower-is-better mark the rest of
+  the console uses and a read-out of the value under the cursor.
+* **An empty chart says why.** `progress.jsonl 없음 · console-train.log 없음 · wandb output.log 없음`
+  on the chart, the whole sentence under the progress bar, and a `기록 …` tag on every row of the run
+  list — the page's previous answer to "there is no data" was to draw axes and nothing else, which
+  is indistinguishable from a broken page.
+
+The two-series charts (student vs teacher) exist because a DAgger student's 52 coll/km is a disaster
+against a teacher at 7 and ordinary against a teacher at 48, and the student's own curve does not
+say which.
+
 ## Verification
 
 Rendered headlessly with the same capture path as the README screenshots (Xvfb + llvmpipe, real
