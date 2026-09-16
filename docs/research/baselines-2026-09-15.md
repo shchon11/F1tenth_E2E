@@ -633,7 +633,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **170
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **177
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
@@ -919,6 +919,37 @@ nothing else that failed — the published End2Race rows used 360 features and a
 retrained model's steering is broken on the data it trained on, before any sensor-geometry question
 arises. The **GRU at 40 Hz** likewise: its recurrence was measured at 100 Hz in Table 1 and moved
 the row by one trial in 384.
+
+### End2Race in traffic: it crashes before it reaches a car
+
+The traffic family is where an opponent's crash reseeds instead of voiding (`PassDetector(repeat=
+True)`), so unlike the O column it does measure passing. End2Race's retrained row, beside its own
+published weights:
+
+| T family, 640 trials | completions | passes | car contacts |
+| --- | ---: | ---: | ---: |
+| End2Race, **our demonstrations** | **8/640** | **10** | 42 |
+| End2Race, published (rear 30 m) | 0/640 | 40 | 136 |
+| TinyLidarNet, published | 78/640 | 165 | 144 |
+| A701 `@fixed_low` (ours) | 233/640 | 319 | 246 |
+
+All 640 trials met traffic, so the family measured what it is for.
+
+**Ten passes against the published weights' forty, with a third of the contacts.** That reads like
+caution and is the opposite: it completes fewer passes *and* touches fewer cars because it rarely
+survives long enough to reach one. Its solo route fraction is 0.281 — a quarter of a lap — and the
+traffic row is that same failure with opponents present. The 42 contacts are not restraint; they are
+the few occasions it got near a car at all.
+
+The pass/no-pass split says it exactly: of 640 trials, **10 completed a pass and every one of those
+10 then hit a wall**; of the 630 that passed nobody, 580 hit a wall, 42 touched a car and 8 finished
+clean — and those 8 completions were achieved *without overtaking anyone*, on trials where the
+traffic was never in front of it.
+
+That is the sixth system in which **every car contact falls in a trial with no pass**: 100 % here,
+against 93 %, 93 %, 95 %, 99 % and 100 % for the others. Across a CNN, a GRU, two plan-space
+policies under two arms and now two retrained students, a contact is what happens *instead* of an
+overtake, never the price of one.
 
 ### The overtaking row was never an overtaking measurement, and I said it was
 
