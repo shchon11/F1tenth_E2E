@@ -633,7 +633,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **158
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **170
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
@@ -840,7 +840,7 @@ digest, same device as everything in Table 1. Beside the published weights of th
 | **TinyLidarNet arch, our demonstrations** | D3, **interactive** teacher | **48** | **37** | 0† | 0.644 | 264 | 72 |
 | TinyLidarNet arch, our demonstrations | D3, raceline teacher (the dry run) | **48** | **35** | 0† | 0.665 | 242 | 94 |
 | TinyLidarNet, published weights | zero-shot reference | 47 | 1 | 9 | 0.416 | **0** | 356 |
-| **End2Race arch, our demonstrations** | D3, interactive teacher | **0** | **26** | 0† | 0.277 | 11 | **397** |
+| **End2Race arch, our demonstrations** | D3, interactive teacher | **0** | **26** | 0† | 0.281 | 11 | **405** |
 | *ours, policy only (A701 `@legacy`)* | on suite v2 | 217 | 30 | 17 | — | — | — |
 
 † **not an overtaking measurement** — see below.
@@ -873,13 +873,13 @@ port. It is neither of the first and specifically the second, and the two studen
 
 | paired, same cells | S/384 | A/96 | timeouts | collisions | route reached | achieved |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| TinyLidarNet, our demos | **48** | 37 | **264** | 72 | **0.641** | 2.34 m/s |
-| End2Race, our demos | **0** | 26 | 11 | **397** | **0.277** | 2.33 m/s |
+| TinyLidarNet, our demos | **48** | 37 | **264** | 72 | **0.644** | 2.34 m/s |
+| End2Race, our demos | **0** | 26 | 11 | **405** | **0.281** | 2.34 m/s |
 | End2Race, published `fill0` | 53 | 32 | 21 | 325 | 0.344 | 2.80 m/s |
 
 **Identical achieved speed, opposite failure.** Both students drive at 2.33–2.34 m/s, but
 TinyLidarNet runs out of clock two-thirds of the way round while End2Race hits a wall at just over a
-quarter. Its failures are **397 collisions to 11 timeouts** — the reverse of TinyLidarNet's 264 to
+quarter. Its failures are **405 collisions to 11 timeouts** — the reverse of TinyLidarNet's 264 to
 72. Whatever is wrong is not the budget.
 
 It is also not a slow network. On the recorded scans End2Race's student commands a **median 2.96
