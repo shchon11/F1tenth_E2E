@@ -434,14 +434,25 @@ gets to, and neither turns the tight floors into completions. What causes the ti
 not established here. Both rows are reported because both are theirs and the difference is real;
 neither is a fix.
 
-## Table 2 — suite v2.1, the traffic family (in progress)
+## Table 2 — suite v2.1, the traffic family (complete, 7 systems × 144 cells)
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
-opponents and an `event` scenario where they brake, stop and change line. **Both published baselines are complete, and so is
-our reference row** (`frozen_original@legacy`). A701 `@fixed_low` and A701 `@legacy` are still
-running and are **left out rather than shown partial** — `note_tables.py` marks a partial row
-`*(partial n/144)*` precisely so a half-finished row cannot be mistaken for a whole one, but a table
-in a research note should not carry them at all.
+opponents and an `event` scenario where they brake, stop and change line.
+
+> **What a T success is, and what it is not.** Every number in the `T` columns below is a **clean
+> run** — the suite's own helper is `_clean_among_contended`, *"clean runs among the trials that
+> actually met traffic"* (`benchmark/runner.py:325-333`). It is **not** a completed lap. Checked
+> against the records rather than the name: of one system's 326 traffic successes, **0 have the
+> `completed` flag set and none has a lap time**, reaching 0.777 of a route on average; of its 48
+> *solo* successes, **48 of 48 completed the lap** at route fraction 1.000. The T family has no
+> `timeout` outcome at all, which is why the 3.00 m/s budget bar that produces hundreds of solo
+> timeouts costs nothing here. **No system in this table completes a lap in traffic** — not the
+> baselines, not our policies, not the retrained students.
+>
+> This matters for how the column is read. A driver that is slow, hangs back and declines to attack
+> scores well on it; one that races and occasionally touches a car scores worse. The column measures
+> *staying clean among traffic*, which is worth measuring and is not the same as racing well. Read
+> it beside the **passes** column, which is where engagement shows up. **All seven rows are complete** as of 2026-09-17 01:26 — five reference systems plus both D3 students.
 
 One property of this table is worth stating before its rows arrive, because it is what lets them sit
 together at all. The published baselines drive in `direct` mode (`act_dim` 2) and ours in `plan`
@@ -459,35 +470,97 @@ checks across them, and `claim_check.py` now pins it independently.
 | **End2Race** (rear 30 m) | 3 | 0 | 3 | **0/640** | 0/160 | 0/160 | 0/160 | 0/160 | 40 | 136 |
 | frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | 22/160 | 27/160 | 30/160 | 16/160 | 289 | 251 |
 | A701 `@fixed_low` (ours, current best) | 275 | 57 | 25 | **233/640** | 71/160 | 52/160 | 59/160 | 51/160 | 319 | 246 |
+| A701 `@legacy` (ours, **policy only**) | 217 | 30 | 17 | **118/640** | 35/160 | 26/160 | 33/160 | 24/160 | 309 | 249 |
+| **TinyLidarNet arch, our demos** (D3) | 48 | 37 | void | **349/640** | 73/160 | 110/160 | 57/160 | 109/160 | **24** | 115 |
+| **End2Race arch, our demos** (D3) | 0 | 26 | void | **8/640** | 1/160 | 2/160 | 0/160 | 5/160 | 10 | 42 |
 
-### How much of a system's solo ability survives traffic — and it is not "ours" that predicts it
+### The cleanest row in the table is the one that does not race
+
+The D3 TinyLidarNet student has the **highest clean rate in Table 2 — 349/640, 55 %** — against
+A701 `@fixed_low`'s 233 and the published weights' 78. Read alone that says a student trained on our
+demonstrations beats our best PPO policy in traffic. Read beside the column that measures
+engagement, it says something else:
+
+| T family, complete | clean | **passes** | contacts | route | achieved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **TinyLidarNet, our demos** | **349/640** | **24** | 115 | 0.567 | 2.21 m/s |
+| A701 `@fixed_low` | 233/640 | **319** | 246 | 0.785 | 3.60 m/s |
+| A701 `@legacy` | 118/640 | 309 | 249 | 0.670 | 3.99 m/s |
+| frozen original `@legacy` | 95/640 | 289 | 251 | 0.617 | 3.96 m/s |
+| TinyLidarNet, published | 78/640 | 165 | 144 | 0.468 | 3.21 m/s |
+| End2Race, our demos | 8/640 | 10 | 42 | 0.286 | 2.29 m/s |
+
+**It completes the fewest passes of any system that moves — 24, against A701's 319** — at 2.21 m/s
+against 3.60, reaching 0.567 of a route against 0.785. It is the safest non-participant in the
+table. Since a T success is a clean run and not a completed lap, and since nothing here completes a
+lap, the metric pays for exactly what this student does: stay out of trouble.
+
+The per-scenario split shows it precisely. Against a **`pace`** car — an opponent at its own speed,
+the scenario where overtaking is hardest and declining costs nothing — it scores **110/160 against
+A701's 52**. Against **`pair`**, two opponents, **109/160 against 51**. But on **`event`**, where
+the cars ahead brake and change line and something must be done about them, it scores **57/160
+against A701's 59** — the one scenario where it has no advantage is the one that requires reacting.
+
+So the answer to whether its low speed is what keeps it alive is **yes, and the metric rewards it**.
+The same 2.2 m/s that makes it time out on 264 solo trials — never reaching the 3.00 m/s a lap needs
+— is what keeps it clean here, because staying clean has no clock. This is not a criticism of the
+suite: clean-running among traffic is worth measuring, and family T measures it honestly. It is a
+warning about reading one column of it as racing ability.
+
+**End2Race's D3 row stays at 8/640** for the reason established on suite v2: it steers worse than a
+constant (R² −0.557) because their `MSE(steer) + 0.05·MSE(speed)` weighting, on labels whose speed
+spread is ten times their steer spread, spends the network on speed. In traffic that shows up as
+**10 passes and 42 contacts** — fewer of both than its own published weights (40 and 136), because
+it crashes before reaching a car.
+
+**And the contact structure now holds across seven systems**, every one of them: 99 %, 93 %, 93 %,
+95 %, 99 %, 100 %, 100 % of car contacts occur in trials with **no pass at all**. Two CNNs, two
+GRUs, three plan-space policies across two arms. A contact is what happens *instead* of an overtake.
+
+### What survives traffic is the runtime arm, not the weights — settled
 
 On the five maps the T family shares with the solo family (the restriction matters — the solo family
-runs eight):
+runs eight, and End2Race's three solo successes are all on Monza, which T does not run, so it has no
+ratio to take):
 
 | on the five T-family maps | solo | traffic | keeps |
 | --- | ---: | ---: | ---: |
 | A701 `@fixed_low` (ours, best) | 186/240 (77.5 %) | 233/640 (36.4 %) | **47.0 %** |
+| A701 `@legacy` (ours, **policy only**) | 144/240 (60.0 %) | 118/640 (18.4 %) | **30.7 %** |
 | frozen original `@legacy` (ours, reference) | 134/240 (55.8 %) | 95/640 (14.8 %) | **26.6 %** |
 | TinyLidarNet-L (published) | 43/240 (17.9 %) | 78/640 (12.2 %) | **68.0 %** |
+| End2Race (published) | 0/240 | 0/640 | — |
 
-**I wrote the reference row up an hour ago as "traffic costs our policy far more than it costs the
-baseline", and the current-best row shows that was too broad.** It is true of
-`frozen_original@legacy` (26.6 %) and false as a statement about ours in general: A701 `@fixed_low`
-keeps 47 %, nearly double the reference. The ordering is not ours-versus-theirs.
+The middle row is the control, and it decides the question the first three rows could not. A701
+`@legacy` is **A701's own weights under the other arm**:
 
-The tempting reading now is that the *runtime arm* drives it — `@fixed_low` clamps the plan tracker
-where `@legacy` leaves it alone, and finding 4 already shows that layer is worth more than the whole
-gap between the two published baselines. **But these two rows differ in weights as well as arm**, so
-nothing here separates them, and that is exactly the control lane **L6** is running:
-`cl_origrecipe_legacy_s701@legacy` is A701's weights under the *other* arm. When it lands, arm and
-weights come apart. Until then this is an observation with two candidate causes and no verdict — and
-the floor effect is still live for TinyLidarNet's 68 %, since a system succeeding 17.9 % of the time
-has less to lose than one at 77.5 %.
+| holding this fixed | changing this | keeps moves |
+| --- | --- | ---: |
+| the **weights** (A701) | `@fixed_low` → `@legacy` | 46.98 → 30.73 = **16.25 points** |
+| the **arm** (`@legacy`) | A701 → frozen original | 30.73 → 26.59 = **4.14 points** |
 
-**The contact structure holds across all four systems.** Contacts occurring in trials with no pass
-at all: A701 `@fixed_low` **229/246 (93 %)**, frozen `@legacy` 239/251 (95 %), TinyLidarNet
-142/144 (99 %), End2Race 136/136 (100 %). A CNN, a GRU and two plan-space PPO policies under two
+**The arm accounts for 3.9× what the weights do.** (Those are computed from the unrounded rates.
+Taking them off the rounded column above gives 16.3 and 4.1 — which is what I did first, and
+`claim_check.py` failed it: a difference of rounded numbers is not the rounded difference.) A701 `@legacy` lands next to the
+frozen original it shares an arm with, not next to the A701 it shares weights with — so what
+survives traffic is a property of the runtime layer, not of the network.
+
+Two things follow that are worth stating separately. First, this is finding 4 again in a harder
+setting: the clamp was already worth more than the entire gap between the two published baselines
+solo, and in traffic its *relative* benefit is larger still — **1.97× on traffic success (36.4 % vs
+18.4 %) against 1.29× solo (77.5 % vs 60.0 %)**. The runtime layer matters roughly twice as much
+when there is another car to get around.
+
+Second, the earlier sentence "traffic costs our policy far more than it costs the baseline" is now
+properly dead. It was true only of the two `@legacy` rows, and what it was picking up was the arm,
+not whose policy it was. TinyLidarNet's 68 % is still unexplained and the floor effect remains the
+live candidate there — a system succeeding 17.9 % of the time has less to lose than one at 77.5 % —
+and nothing in this suite separates that from genuine robustness.
+
+**The contact structure holds across all seven systems.** Contacts occurring in trials with no pass
+at all: D3 TinyLidarNet **114/115 (99 %)**, A701 `@fixed_low` 229/246 (93 %), A701 `@legacy`
+231/249 (93 %), frozen `@legacy` 239/251 (95 %), TinyLidarNet 142/144 (99 %), End2Race 136/136
+(100 %), D3 End2Race 42/42 (100 %). A CNN, a GRU and two plan-space PPO policies under two
 different arms — four failure profiles, one structure. A contact is what happens *instead* of an
 overtake, not the price of one. That is the 02:28 correction confirmed on every system in the
 table, including the one that passes best (223 clean pass-trials out of 274).
@@ -566,10 +639,10 @@ best against a `slow` car (24/160), worst when there are two of them (`pair`, 16
 | `pace` | 19/160 | 25 | 22 |
 | `pair` | 16/160 | 50 | 44 |
 
-### The two suite runs reproduce each other exactly — four systems, 256 cells
+### The two suite runs reproduce each other exactly — seven systems, 448 cells
 
 v2.1 contains v2's 64 cells unchanged, and every system here is scored on both, in two independent
-runs hours apart under two different suite freezes. Across all **256 shared cells**:
+runs hours apart under two different suite freezes. Across all **448 shared cells**:
 
 | system | what it is | cells | success Δ | per-trial outcome Δ | physical start Δ | max \|Δ progress\| | max \|Δ lap\| |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -577,14 +650,17 @@ runs hours apart under two different suite freezes. Across all **256 shared cell
 | End2Race | torch **GRU**, direct action | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
 | frozen original `@legacy` | ours, plan + iLQR | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
 | A701 `@fixed_low` | ours, plan + iLQR + clamp | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| A701 `@legacy` | ours, plan + iLQR | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| **D3 TinyLidarNet** | ours, retrained CNN | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| **D3 End2Race** | ours, retrained GRU | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
 
 Not "agree to within a tolerance" — **bit-identical**, down to every trial's distance along the
 route and every completed lap time.
 
 The spread matters more than the zeroes. This is not one lucky system: it is a 220 k-parameter CNN
 through an ONNX runtime, an 11 M-parameter **recurrent** network through torch carrying hidden state
-across every step of every trial, and two plan-space PPO policies under two different controller
-arms. The recurrent one is the case that could plausibly have drifted — a GRU accumulates state, so
+across every step of every trial, three plan-space PPO policies under two different controller arms,
+and both retrained students — seven systems, every architecture and runtime in this note. The recurrent one is the case that could plausibly have drifted — a GRU accumulates state, so
 a single differing float in the first step of a 444-step trial has 443 steps to grow — and it did
 not, in 64 cells.
 
@@ -621,7 +697,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **120
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **186
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
@@ -662,10 +738,40 @@ End2Race (`train.py:28-30,132-135,183-185`). "Their architecture under our recip
 system that is neither theirs nor ours. `distill.HYPERPARAMETERS` records which side every number
 came from and is written into every checkpoint.
 
-**Iteration 0 is literally the same data for every architecture.** The teacher drives at β = 1, so
-at one seed the scans and the labels are bit-identical whichever network is being trained — a test
-asserts it. Later iterations are each student's own on-policy states, which is what DAgger is and
-what ours does too.
+**Iteration 0 is the same demonstrations for every architecture in distribution, and — correcting
+what this section said until 2026-09-16 — *not* bit-identical.** The claim here was that "at one
+seed the scans and the labels are bit-identical whichever network is being trained — a test asserts
+it". Both halves were wrong.
+
+The two interactive runs share a teacher, a seed and an environment, and their iteration-0 buffers
+differ in **97.7 % of scan elements and 100 % of labels**, from the first step. The mechanism, which
+a test now pins:
+
+* `sim.py:80` seeds the **global** torch RNG when the environment is built;
+* `lidar.py:338` draws sensor noise with `torch.randn_like`, i.e. from that global RNG, not from the
+  simulator's own `self.gen` which everything else uses;
+* `cmd_distill` builds the student **after** the environment and **before** collecting, so a
+  220 686-parameter CNN and a 6 359 312-parameter GRU leave the global stream in different places.
+
+Verified directly: two collections at one seed with no model built are identical; build a model in
+between and the first scan moves by up to **9.5 m**.
+
+And the test that was cited as evidence never checked it. `test_iteration_zero_is_the_same_
+demonstrations_whatever_the_architecture` built the same environment twice and collected with
+`driver=None` both times — it varied nothing. It is renamed to what it tests (collection determinism
+at one seed), and a second test now asserts the real behaviour, so the false claim cannot return.
+
+**What this does and does not cost the comparison.** It is sensor noise, identical in distribution,
+from the same teacher in the same environment on the same tracks — so the architectures are still
+being compared on the same demonstrations in every sense that matters, and neither is favoured. What
+is lost is the stronger statement, that they saw the *same samples*. Making that true again is a
+one-line change (seed the global RNG immediately before `collect`, or have the lidar draw from
+`sim.gen`), but it would alter every future collection's data and must not be done inside a running
+experiment series — the four rows being scored tonight were collected under the present behaviour.
+It is a decision for root, between series.
+
+Later iterations are each student's own on-policy states, which is what DAgger is and what ours does
+too.
 
 ### The four declared deviations
 
@@ -795,10 +901,152 @@ digest, same device as everything in Table 1. Beside the published weights of th
 
 | system | | S/384 | A/96 | O/32 | route fraction | timeouts | collisions |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **TinyLidarNet arch, our demonstrations** | D3, raceline teacher | **48** | **35** | **0** | **0.665** | 242 | 94 |
+| **TinyLidarNet arch, our demonstrations** | D3, **interactive** teacher | **48** | **37** | 0† | 0.644 | 264 | 72 |
+| TinyLidarNet arch, our demonstrations | D3, raceline teacher (the dry run) | **48** | **35** | 0† | 0.665 | 242 | 94 |
 | TinyLidarNet, published weights | zero-shot reference | 47 | 1 | 9 | 0.416 | **0** | 356 |
-| *End2Race arch, our demonstrations* | *not started — permission gate* | — | — | — | — | — | — |
+| **End2Race arch, our demonstrations** | D3, interactive teacher | **0** | **26** | 0† | 0.281 | 11 | **405** |
 | *ours, policy only (A701 `@legacy`)* | on suite v2 | 217 | 30 | 17 | — | — | — |
+
+† **not an overtaking measurement** — see below.
+
+### Changing the teacher changed almost nothing, which is the result
+
+The interactive-teacher row was the one this table was waiting for, and it lands on top of the dry
+run. Solo **48 against 48**, identical. Avoidance 37 against 35, two clears in 96. Per map the two
+rows differ in exactly one place, `real:map12x16`, 5 against 3:
+
+| map | lap | interactive | raceline dry run | published |
+| --- | ---: | ---: | ---: | ---: |
+| `rt:Monza` | 446 m | 48/48 | 48/48 | 0/48 |
+| `gen:control:9100` | 57 m | 32/112 | 32/112 | 10/112 |
+| `real:map12x16` | 36 m | **5/80** | **3/80** | 1/80 |
+| every other map | | identical | identical | |
+
+This is the prediction recorded at 15:32 from the iteration-0 buffers, and it holds: the two
+teachers' label speeds were within **0.013 m/s** of each other, so the students inherit the same
+speed and fail the same way. The interactive student achieves **2.34 m/s** against the dry run's
+2.57 and times out **264** times against 242 — slightly slower and slightly worse, in the direction
+its commanded speeds predicted (median 2.10 against 2.41 m/s on the recorded scans).
+
+### End2Race scores 0/384 solo, and it is NOT the timeout mechanism
+
+The End2Race arm is the one the contract was missing, and it comes back at **zero** — against 48 for
+the TinyLidarNet student on the same demonstrations, and 53 for End2Race's own published weights
+under the better fill. Root asked whether this is the slow-label story again or something in the
+port. It is neither of the first and specifically the second, and the two students separate cleanly:
+
+| paired, same cells | S/384 | A/96 | timeouts | collisions | route reached | achieved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TinyLidarNet, our demos | **48** | 37 | **264** | 72 | **0.644** | 2.34 m/s |
+| End2Race, our demos | **0** | 26 | 11 | **405** | **0.281** | 2.34 m/s |
+| End2Race, published `fill0` | 53 | 32 | 21 | 325 | 0.344 | 2.80 m/s |
+
+**Identical achieved speed, opposite failure.** Both students drive at 2.33–2.34 m/s, but
+TinyLidarNet runs out of clock two-thirds of the way round while End2Race hits a wall at just over a
+quarter. Its failures are **405 collisions to 11 timeouts** — the reverse of TinyLidarNet's 264 to
+72. Whatever is wrong is not the budget.
+
+It is also not a slow network. On the recorded scans End2Race's student commands a **median 2.96
+m/s and clears the suite's 3.00 m/s bar on 48 %** of them, against the TinyLidarNet student's 2.10
+and 16 %. The arm that scores 48 is the *slower* one. Any explanation resting on demonstration speed
+predicts the opposite of what happened.
+
+**What it is: the student learned speed and never learned to steer.** Run each student over its own
+iteration-0 buffer — the teacher-driven data it trained on — and compare its outputs to the labels:
+
+| student | steer RMSE | steer R² | speed RMSE | speed R² |
+| --- | ---: | ---: | ---: | ---: |
+| TinyLidarNet, our demos | 0.094 rad | **+0.438** | 0.93 m/s | +0.503 |
+| End2Race, our demos | 0.157 rad | **−0.557** | 0.65 m/s | **+0.738** |
+
+A negative R² means worse than predicting the constant mean: its steering RMSE, **0.157 rad**, is
+larger than the labels' own spread of 0.126 rad. It fits speed better than TinyLidarNet does and
+steers worse than a constant. A car that tracks the expert's speed and not its steering drives into
+a wall at a quarter distance, which is exactly the row.
+
+**The mechanism is their loss weighting meeting our label distribution**, and it is a consequence of
+the contract, not a bug. `End2Race/train.py:130-132` optimises `MSE(steer) + 0.05·MSE(speed)` on
+**unscaled** units, and the 0.05 is there precisely because the units are unscaled. On our labels
+steer has sd **0.126 rad** and speed sd **1.27 m/s**, so the speed term enters at 0.05 × 1.6 ≈ 0.08
+against steer's ≈ 0.016 — **five to one in speed's favour even after the 0.05**. Early in training,
+when speed error is still metres per second, the ratio is nearer thirty to one. The network spends
+its capacity where the gradient is.
+
+This is what "keep every hyperparameter of theirs at its repo default and say so" is for. The
+weighting is theirs, the result is a faithful reproduction, and the finding is that **their loss
+does not transfer to a label distribution whose speed spread is ten times its steering spread**. It
+is a property of the pairing, not of the architecture: the same network under a weighting that
+balanced the two terms is untested here and is the obvious next experiment.
+
+Two candidates root raised and the data does not support. The **270-beam deviation** is shared with
+nothing else that failed — the published End2Race rows used 360 features and also crashed, and the
+retrained model's steering is broken on the data it trained on, before any sensor-geometry question
+arises. The **GRU at 40 Hz** likewise: its recurrence was measured at 100 Hz in Table 1 and moved
+the row by one trial in 384.
+
+### End2Race in traffic: it crashes before it reaches a car
+
+The traffic family is where an opponent's crash reseeds instead of voiding (`PassDetector(repeat=
+True)`), so unlike the O column it does measure passing. End2Race's retrained row, beside its own
+published weights:
+
+| T family, 640 trials | completions | passes | car contacts |
+| --- | ---: | ---: | ---: |
+| End2Race, **our demonstrations** | **8/640** | **10** | 42 |
+| End2Race, published (rear 30 m) | 0/640 | 40 | 136 |
+| TinyLidarNet, published | 78/640 | 165 | 144 |
+| A701 `@fixed_low` (ours) | 233/640 | 319 | 246 |
+
+All 640 trials met traffic, so the family measured what it is for.
+
+**Ten passes against the published weights' forty, with a third of the contacts.** That reads like
+caution and is the opposite: it completes fewer passes *and* touches fewer cars because it rarely
+survives long enough to reach one. Its solo route fraction is 0.281 — a quarter of a lap — and the
+traffic row is that same failure with opponents present. The 42 contacts are not restraint; they are
+the few occasions it got near a car at all.
+
+The pass/no-pass split says it exactly: of 640 trials, **10 completed a pass and every one of those
+10 then hit a wall**; of the 630 that passed nobody, 580 hit a wall, 42 touched a car and 8 finished
+clean — and those 8 completions were achieved *without overtaking anyone*, on trials where the
+traffic was never in front of it.
+
+That is the sixth system in which **every car contact falls in a trial with no pass**: 100 % here,
+against 93 %, 93 %, 95 %, 99 % and 100 % for the others. Across a CNN, a GRU, two plan-space
+policies under two arms and now two retrained students, a contact is what happens *instead* of an
+overtake, never the price of one.
+
+### The overtaking row was never an overtaking measurement, and I said it was
+
+This is the claim I got wrong, and it was a prominent one. Of the dry run's 0/32 I wrote: *"the dry
+run's declared limitation arriving on schedule … a teacher that does not react to traffic cannot
+demonstrate holding a pass, and its student does not hold one. This row is evidence about **the
+teacher**, not about the architecture, and it is the single strongest argument for re-running on
+`InteractiveTeacher`."*
+
+The re-run happened. **The interactive teacher — which does react to other cars — scores the same
+0/32.** So the attribution was wrong.
+
+It is worse than wrong, because the outcomes say the row measures nothing at all. Every one of the
+interactive student's 32 overtaking trials ends in `opponent_respawn`, and 31 of 32 for the dry run:
+
+| on the O cells | outcomes | mean elapsed | of budget |
+| --- | --- | ---: | ---: |
+| D3 interactive | **32 × `opponent_respawn`** | 19.0 s | **100 %** |
+| D3 raceline dry run | 31 × `opponent_respawn`, 1 contact | 18.6 s | 98 % |
+| published weights | 19 collision, 4 contact, **9 clean** | 4.7 s | 25 % |
+
+`opponent_respawn` is not a failed pass. It fires when *the car ahead* crashes and respawns, which
+voids the race because the one pass being measured can no longer be attributed
+(`benchmark/overtake.py:150-157`). The D3 students survive the **entire** budget; over 19 s of
+driving the opponent eventually crashes, and the trial is thrown away. The published weights are
+gone in 4.7 s — they crash long before the opponent does, so their races stay valid and can be
+scored.
+
+So both D3 rows' `O` column is **void, not zero**: a slow-but-surviving driver keeps the scenario
+alive long enough for the voiding condition to fire every time. Nothing about either student's
+ability to overtake has been measured here, and no argument about the teacher can rest on it. What
+would measure it is an overtaking family whose trials do not void on an opponent crash, or students
+fast enough to finish before one happens — and the second of those is the same speed problem again.
 
 The last two rows are what CONTRACT.md asks for and this table does not yet have: the End2Race arm
 has never been trained, and the "ours" row is a PPO policy rather than a student distilled from the
@@ -863,15 +1111,50 @@ evaluation's own bar, and it inherits that exactly.
 demonstrations decide obstacle competence (1 → 35) and traffic competence (9 → 0, in the direction
 the teacher's own recorded limitation predicts). It does **not** settle why the raceline teacher
 drove at 2.90 m/s — whether traffic held it there or it is conservative everywhere — because the
-buffer behind this checkpoint recorded no opponent distance. `DemoBuffer.G` now records it, so the
-next collection answers that instead of raising it again.
+buffer behind this checkpoint recorded no opponent distance. `DemoBuffer.G` now records it, and the
+first buffer carrying it arrived the same day.
 
-**The End2Race arm is still to come**, and the `InteractiveTeacher` re-run needs the merge and one
-flag. Scoring it needs one benchmark lane and all
-three are committed to the v2.1 traffic rows; the End2Race arm has not been started at all. Both
-commands are recorded in `work/baselines/STATUS.md` under "Blocked, needs root". Until those run,
-the honest statement of this section is that the pipeline is demonstrated end to end for one of the
-two architectures and the comparison itself is unmeasured.
+### What the first buffer with the gap label says (2026-09-16 15:32)
+
+The user launched the interactive-teacher re-run after the merge; its iteration-0 buffer is the
+first written with `G`. The answer is not the one the question expected, and the honest version is
+smaller than the first version I computed.
+
+**The two teachers' demonstrated speeds are practically identical.** Interactive: median **2.89**
+m/s, **52.8 %** of labels below the suite's 3.00 m/s bar. Raceline dry run: median **2.90**,
+**52.9 %** below. A KS test separates them (p = 5e-17 at n = 6000) but the statistic is 0.08 and the
+medians differ by 0.013 m/s — distinguishable, not different. **Swapping the teacher does not change
+the speed distribution the student learns**, so Table 3's 242 timeouts should be expected to survive
+into the interactive row. That is a prediction, recorded before the row is scored.
+
+**The traffic split does not settle why, and my first reading of it was an artifact of one
+threshold.** `speed_by_contention()` at the suite's own 12 m range gave clear-road median 2.83
+against in-traffic 2.90 — clear road *slower*, which reads as "conservative everywhere". Sweeping
+the threshold destroys that:
+
+| gap threshold | in-traffic median | clear-road median | difference |
+| ---: | ---: | ---: | ---: |
+| 8 m | 2.73 (n=5332) | **3.68** (n=668) | **+0.95** |
+| **12 m** | 2.90 (n=5734) | 2.83 (n=266) | **−0.07** |
+| 20 m | 2.84 (n=5859) | **3.97** (n=141) | **+1.13** |
+| 30 m | 2.84 (n=5859) | **3.97** (n=141) | **+1.13** |
+
+Every threshold except the one I picked says clear road is about a metre per second faster. And the
+12 m clear-road side is 266 samples from **5 of 24 learner rows, 230 of them from two** — not an
+independent sample and not something to read a verdict off. `teacher_speed_split.py` now sweeps
+thresholds and prints the row clustering, because one threshold produced a confident sentence that
+was an artifact of the threshold.
+
+**What the buffer does say cleanly is more useful than what it was asked.** **95.6 % of the
+demonstrations are within 12 m of another car, the median gap is 3.6 m, and not one sample has no
+opponent at all.** Race size 3 on these tracks keeps the cars packed. So the demonstrations are
+almost entirely in-traffic driving; a student trained on them has barely seen an open track, and the
+solo family *is* an open track. That is a property of the collection design, identical for both
+teachers, and a better account of the timeouts than anything about either teacher's temperament.
+
+**Still to come**: the interactive TinyLidarNet row (running), the End2Race interactive arm (queued
+behind it by the one-distill cap), and the End2Race dry run (never started). The L5 dry-run row
+stays in this table as the contrast — the two differ in the teacher and nothing else.
 
 <!-- D3 TABLE: filled when the runs finish -->
 
