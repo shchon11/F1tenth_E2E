@@ -434,14 +434,10 @@ gets to, and neither turns the tight floors into completions. What causes the ti
 not established here. Both rows are reported because both are theirs and the difference is real;
 neither is a fix.
 
-## Table 2 — suite v2.1, the traffic family (in progress)
+## Table 2 — suite v2.1, the traffic family (complete, 5 systems × 144 cells)
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
-opponents and an `event` scenario where they brake, stop and change line. **Both published baselines are complete, and so is
-our reference row** (`frozen_original@legacy`). A701 `@fixed_low` and A701 `@legacy` are still
-running and are **left out rather than shown partial** — `note_tables.py` marks a partial row
-`*(partial n/144)*` precisely so a half-finished row cannot be mistaken for a whole one, but a table
-in a research note should not carry them at all.
+opponents and an `event` scenario where they brake, stop and change line. **All five rows are complete** as of 2026-09-16 10:18.
 
 One property of this table is worth stating before its rows arrive, because it is what lets them sit
 together at all. The published baselines drive in `direct` mode (`act_dim` 2) and ours in `plan`
@@ -459,35 +455,51 @@ checks across them, and `claim_check.py` now pins it independently.
 | **End2Race** (rear 30 m) | 3 | 0 | 3 | **0/640** | 0/160 | 0/160 | 0/160 | 0/160 | 40 | 136 |
 | frozen original `@legacy` (ours, the reference) | 196 | 29 | 17 | **95/640** | 22/160 | 27/160 | 30/160 | 16/160 | 289 | 251 |
 | A701 `@fixed_low` (ours, current best) | 275 | 57 | 25 | **233/640** | 71/160 | 52/160 | 59/160 | 51/160 | 319 | 246 |
+| A701 `@legacy` (ours, **policy only**) | 217 | 30 | 17 | **118/640** | 35/160 | 26/160 | 33/160 | 24/160 | 309 | 249 |
 
-### How much of a system's solo ability survives traffic — and it is not "ours" that predicts it
+### What survives traffic is the runtime arm, not the weights — settled
 
 On the five maps the T family shares with the solo family (the restriction matters — the solo family
-runs eight):
+runs eight, and End2Race's three solo successes are all on Monza, which T does not run, so it has no
+ratio to take):
 
 | on the five T-family maps | solo | traffic | keeps |
 | --- | ---: | ---: | ---: |
 | A701 `@fixed_low` (ours, best) | 186/240 (77.5 %) | 233/640 (36.4 %) | **47.0 %** |
+| A701 `@legacy` (ours, **policy only**) | 144/240 (60.0 %) | 118/640 (18.4 %) | **30.7 %** |
 | frozen original `@legacy` (ours, reference) | 134/240 (55.8 %) | 95/640 (14.8 %) | **26.6 %** |
 | TinyLidarNet-L (published) | 43/240 (17.9 %) | 78/640 (12.2 %) | **68.0 %** |
+| End2Race (published) | 0/240 | 0/640 | — |
 
-**I wrote the reference row up an hour ago as "traffic costs our policy far more than it costs the
-baseline", and the current-best row shows that was too broad.** It is true of
-`frozen_original@legacy` (26.6 %) and false as a statement about ours in general: A701 `@fixed_low`
-keeps 47 %, nearly double the reference. The ordering is not ours-versus-theirs.
+The middle row is the control, and it decides the question the first three rows could not. A701
+`@legacy` is **A701's own weights under the other arm**:
 
-The tempting reading now is that the *runtime arm* drives it — `@fixed_low` clamps the plan tracker
-where `@legacy` leaves it alone, and finding 4 already shows that layer is worth more than the whole
-gap between the two published baselines. **But these two rows differ in weights as well as arm**, so
-nothing here separates them, and that is exactly the control lane **L6** is running:
-`cl_origrecipe_legacy_s701@legacy` is A701's weights under the *other* arm. When it lands, arm and
-weights come apart. Until then this is an observation with two candidate causes and no verdict — and
-the floor effect is still live for TinyLidarNet's 68 %, since a system succeeding 17.9 % of the time
-has less to lose than one at 77.5 %.
+| holding this fixed | changing this | keeps moves |
+| --- | --- | ---: |
+| the **weights** (A701) | `@fixed_low` → `@legacy` | 46.98 → 30.73 = **16.25 points** |
+| the **arm** (`@legacy`) | A701 → frozen original | 30.73 → 26.59 = **4.14 points** |
 
-**The contact structure holds across all four systems.** Contacts occurring in trials with no pass
-at all: A701 `@fixed_low` **229/246 (93 %)**, frozen `@legacy` 239/251 (95 %), TinyLidarNet
-142/144 (99 %), End2Race 136/136 (100 %). A CNN, a GRU and two plan-space PPO policies under two
+**The arm accounts for 3.9× what the weights do.** (Those are computed from the unrounded rates.
+Taking them off the rounded column above gives 16.3 and 4.1 — which is what I did first, and
+`claim_check.py` failed it: a difference of rounded numbers is not the rounded difference.) A701 `@legacy` lands next to the
+frozen original it shares an arm with, not next to the A701 it shares weights with — so what
+survives traffic is a property of the runtime layer, not of the network.
+
+Two things follow that are worth stating separately. First, this is finding 4 again in a harder
+setting: the clamp was already worth more than the entire gap between the two published baselines
+solo, and in traffic its *relative* benefit is larger still — **1.97× on traffic success (36.4 % vs
+18.4 %) against 1.29× solo (77.5 % vs 60.0 %)**. The runtime layer matters roughly twice as much
+when there is another car to get around.
+
+Second, the earlier sentence "traffic costs our policy far more than it costs the baseline" is now
+properly dead. It was true only of the two `@legacy` rows, and what it was picking up was the arm,
+not whose policy it was. TinyLidarNet's 68 % is still unexplained and the floor effect remains the
+live candidate there — a system succeeding 17.9 % of the time has less to lose than one at 77.5 % —
+and nothing in this suite separates that from genuine robustness.
+
+**The contact structure holds across all five systems.** Contacts occurring in trials with no pass
+at all: A701 `@fixed_low` **229/246 (93 %)**, A701 `@legacy` 231/249 (93 %), frozen `@legacy`
+239/251 (95 %), TinyLidarNet 142/144 (99 %), End2Race 136/136 (100 %). A CNN, a GRU and two plan-space PPO policies under two
 different arms — four failure profiles, one structure. A contact is what happens *instead* of an
 overtake, not the price of one. That is the 02:28 correction confirmed on every system in the
 table, including the one that passes best (223 clean pass-trials out of 274).
@@ -621,7 +633,7 @@ evidence that settles each:
 | the output mapping explains the tight-floor collapse | **REVERSED** (above) | the car mapping is worse overall, 31/384 against 47, and still 0/80 on that floor |
 
 **Every number in this table is recomputed from the raw per-cell records by
-`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **120
+`work/baselines/scripts/claim_check.py`, which exits non-zero if any of them stops holding — **134
 checks, all passing**: Table 1's rows, Table 2's, every number in the audit above, and the invariant
 underneath all of them — that all ten v2 rows share one `(source_digest, suite freeze, device)`
 group, and that no row straddles two digests internally. The corrections above replaced claims that drifted from their evidence with
