@@ -23,7 +23,9 @@ Two things this loop can now do that it could not:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
+import random
 import time
 
 import numpy as np
@@ -215,6 +217,38 @@ def actor_sequence(actor, scan, proprio, keep) -> torch.Tensor:
     return torch.tanh(actor.mu(torch.cat(feats, 0)))
 
 
+@contextlib.contextmanager
+def rng_island(env):
+    """Run a block without letting it move any random stream the rest of the loop draws from.
+
+    The per-iteration evaluation is a diagnostic: it adds nothing to the buffer and touches no
+    parameter. But `rollout_metrics` calls `env.reset()` and then drives the env for `eval_steps`,
+    and every one of those steps spends randomness -- autoresets resample tracks and spawns,
+    opponent events fire, friction is redrawn -- out of `env.sim.gen` and the global generators,
+    which is exactly where the NEXT iteration's `collect()` continues from. So the length of a
+    measurement silently decided the training data, and two arms that differed only in how often
+    they were measured were not comparable runs.
+
+    Saving and restoring the streams makes the diagnostic free of consequence: collection sees the
+    identical draw whether the eval before it ran 800 steps, 200, or none at all. That is what lets
+    `--eval-steps` and `--eval-every` be tuned for cost without touching the experiment.
+    """
+    saved = {"cpu": torch.get_rng_state(),
+             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+             "sim": env.sim.gen.get_state(),
+             "py": random.getstate(),
+             "np": np.random.get_state()}
+    try:
+        yield
+    finally:
+        torch.set_rng_state(saved["cpu"])
+        if saved["cuda"] is not None:
+            torch.cuda.set_rng_state_all(saved["cuda"])
+        env.sim.gen.set_state(saved["sim"])
+        random.setstate(saved["py"])
+        np.random.set_state(saved["np"])
+
+
 def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0, need_gap=False):
     """Roll the env for `steps`, labelling every state with the teacher and storing it.
 
@@ -392,8 +426,22 @@ def main():
                          "off in the second before a collision, and a uniform loss barely sees those states")
     ap.add_argument("--hard-power", type=float, default=1.0, help="exponent on the gap when weighting")
     ap.add_argument("--keep-iters", type=int, default=5, help="aggregate the data of at most this many recent iterations (host RAM)")
+    ap.add_argument("--start-iter", type=int, default=0,
+                    help="index of the first iteration to run. For RESUMING a killed run from its last "
+                         "checkpoint: beta, the exploration noise and the checkpoint names all key off the "
+                         "true iteration index, so restarting a run that died after iteration 6 needs "
+                         "--start-iter 7, not --iters 1 (which is iteration 0, where beta is 1.0 and the "
+                         "TEACHER drives). What it cannot restore is the aggregated buffer: DAgger trains on "
+                         "the last --keep-iters collections and those live in host RAM only, so a resumed "
+                         "iteration trains on its own data alone. Declare that wherever the run is reported.")
     ap.add_argument("--log-every", type=int, default=25, help="training steps between W&B loss rows (was 200)")
-    ap.add_argument("--eval-steps", type=int, default=800); ap.add_argument("--wandb", default="online")
+    ap.add_argument("--eval-steps", type=int, default=800)
+    ap.add_argument("--eval-every", type=int, default=1,
+                    help="evaluate every Nth iteration (the last one always). 1 = every "
+                         "iteration, the old behaviour. The evaluation is a diagnostic and "
+                         "cannot reach the training data (see rng_island), so this trades "
+                         "diagnostic resolution for wall-clock and nothing else.")
+    ap.add_argument("--wandb", default="online")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eager", action="store_true", help="disable simulator / tracker compilation (CPU smoke tests)")
     opp_cfg.add_arguments(ap)
@@ -446,7 +494,29 @@ def main():
     chan = scan_channel_spec({"channels": a.scan_channels, "memory_tau_s": a.scan_memory_tau}) if a.scan_channels else None
     mem_spec = memory_spec(hidden_size=a.memory_hidden) if a.memory != "off" else None
     if a.init:
-        if mem_spec or chan or token != "off":
+        # RESUME vs WARM START. `load_for_memory` adds a GRU / extra channels / an opponent token to
+        # a checkpoint that has none, and it refuses -- correctly -- to touch one that already has
+        # them, because that would re-initialise a trained path. A resumed arm (--start-iter > 0)
+        # hands it exactly such a checkpoint, so the request has to go to the plain loader instead.
+        prior = {}
+        try:
+            prior = (torch.load(a.init, map_location="cpu", weights_only=False) or {}).get("meta") or {}
+        except Exception:
+            prior = {}
+        have_mem, have_chan = bool(prior.get("memory")), tuple(prior.get("scan_channels") or ())
+        have_tok = prior.get("opp_token") or "off"
+        resuming = have_mem and bool(mem_spec)
+        if resuming and (tuple(chan or ()) != have_chan or (token != "off" and token != have_tok)):
+            raise SystemExit(
+                f"{os.path.basename(a.init)} already carries memory (so this is a resume) but the flags ask for "
+                f"channels {tuple(chan or ())}/token {token} against its {have_chan}/{have_tok}. Adding a path to "
+                f"a trained checkpoint and continuing its schedule are different operations; do one or the other.")
+        if resuming:
+            model, _extra = load_checkpoint(a.init, device, override={"priv_dim": priv_dim, "act_dim": env.act_dim})
+            print(f"resume from {os.path.basename(a.init)} (iteration {_extra.get('iter') if isinstance(_extra, dict) else '?'} "
+                  f"of {_extra.get('iters') if isinstance(_extra, dict) else '?'}); continuing at --start-iter {a.start_iter}",
+                  flush=True)
+        elif mem_spec or chan or token != "off":
             model, _extra, fresh = load_for_memory(a.init, device, memory=mem_spec, scan_channels=chan,
                                                    opp_token=(token if token != "off" else None),
                                                    override={"n_stack": spec.scan_stack,
@@ -475,8 +545,9 @@ def main():
     env.sim.warmup()
     bufs = []
     teacher_metrics = None
+    m = None; m_iter = -1; t_teach = 0.0
     t0 = time.time()
-    for it in range(a.iters):
+    for it in range(a.start_iter, a.start_iter + a.iters):
         beta = 1.0 if it == 0 else a.beta0 * (0.5 ** (it - 1))
         tm = common.Timer()
         buf = collect(env, model, teacher, a.steps, beta, device,
@@ -486,37 +557,66 @@ def main():
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log, a.hard_frac, a.hard_power,
                             a.log_every, chunk=a.chunk_length, speed_loss=a.speed_loss,
                             v_max=env.ecfg.v_max_policy); t_tr = tm.lap()
-        m = common.rollout_metrics(env, memory_policy_fn(model, env.B, device=device, deterministic=True), a.eval_steps, a.speed_cap,
-                                   per_track=True); t_ev = tm.lap()
+        # Diagnostics only, and fenced off from the training stream. `eval_every` skips the
+        # measurement, never the collection or the training: 75 % of a calibrated iteration was
+        # this rollout (873 s of 1165), and eight iterations of it is two hours of measuring a
+        # student that gets scored properly after the arm finishes anyway.
+        do_eval = (it % max(1, a.eval_every) == 0) or (it == a.start_iter + a.iters - 1)
+        if do_eval:
+            with rng_island(env):
+                m = common.rollout_metrics(env, memory_policy_fn(model, env.B, device=device, deterministic=True),
+                                           a.eval_steps, a.speed_cap, per_track=True)
+            m_iter = it
+        t_ev = tm.lap()
         if teacher_metrics is None:
-            teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps, a.speed_cap,
-                                                     per_track=True)
+            with rng_island(env):
+                teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps,
+                                                         a.speed_cap, per_track=True)
+        t_teach = tm.lap()
         scalar = lambda d: {k: v for k, v in d.items() if not isinstance(v, list)}      # per-track arrays stay out of W&B
         log({"dagger/iter": it, "dagger/beta": beta, "dagger/samples": sum(len(b) for b in bufs), "dagger/final_loss": loss,
-             **{f"student/{k}": v for k, v in scalar(m).items()}, **{f"teacher/{k}": v for k, v in scalar(teacher_metrics).items()},
-             "time/collect_s": t_col, "time/train_s": t_tr, "time/eval_s": t_ev, "time/elapsed_min": (time.time() - t0) / 60})
-        worst = names[m["worst_track_index"]] if m.get("worst_track_index", -1) >= 0 else "n/a"
+             **({f"student/{k}": v for k, v in scalar(m).items()} if do_eval else {}),
+             **{f"teacher/{k}": v for k, v in scalar(teacher_metrics).items()},
+             "time/collect_s": t_col, "time/train_s": t_tr, "time/eval_s": t_ev,
+             # separately, because it is paid once for the whole run and folding it into eval_s is
+             # what made iteration 0 look like a 1165 s iteration when it is nothing of the kind
+             "time/teacher_eval_s": t_teach, "time/elapsed_min": (time.time() - t0) / 60})
+        # `m` is None until the first evaluation, and --eval-every can skip one, so this cannot
+        # dereference it unconditionally the way it could when every iteration measured.
+        worst = names[m["worst_track_index"]] if (m and m.get("worst_track_index", -1) >= 0) else "n/a"
         # The stable schema the console plots, then every other scalar the iteration measured. Same
         # shape as PPO's record and told apart by "kind", so one reader serves both.
-        record = {"kind": "dagger", "iter": it, "total": a.iters, "beta": beta,
+        record = {"kind": "dagger", "iter": it, "total": a.start_iter + a.iters, "beta": beta,
                   "samples": sum(len(b) for b in bufs), "loss": loss,
-                  "student_coll_per_km": m["collisions_per_km"],
-                  "student_prog_mps": m["progress_rate_mps"], "student_lap_s": m["lap_time_s"],
                   "teacher_coll_per_km": teacher_metrics["collisions_per_km"],
                   "teacher_prog_mps": teacher_metrics["progress_rate_mps"],
                   "teacher_lap_s": teacher_metrics["lap_time_s"],
                   "wall_s": time.time() - t0, "worst_track": worst,
-                  "collect_s": t_col, "train_s": t_tr, "eval_s": t_ev}
-        record.update({f"student/{k}": v for k, v in scalar(m).items()})
+                  "collect_s": t_col, "train_s": t_tr, "eval_s": t_ev, "teacher_eval_s": t_teach}
+        # Student rows ONLY on an iteration that measured. --eval-every can skip the evaluation, and
+        # writing the previous iteration's numbers under this iteration's index would draw the
+        # console a flat segment the run never produced. `metrics_from_iter` says which one it was.
+        if do_eval:
+            record.update({"student_coll_per_km": m["collisions_per_km"],
+                           "student_prog_mps": m["progress_rate_mps"],
+                           "student_lap_s": m["lap_time_s"]})
+            record.update({f"student/{k}": v for k, v in scalar(m).items()})
+        record["metrics_from_iter"] = m_iter
         record.update({f"teacher/{k}": v for k, v in scalar(teacher_metrics).items()})
         progress_log.write(record)
-        print(f"iter {it}: beta {beta:.2f} samples {sum(len(b) for b in bufs)} loss {loss:.4f} | student {m['collisions_per_km']:.1f} coll/km "
-              f"(worst {m['collisions_per_km_worst']:.1f} on {worst}) prog {m['progress_rate_mps']:.2f} m/s lap {m['lap_time_s']:.1f} s | "
+        stud = (f"student {m['collisions_per_km']:.1f} coll/km (worst {m['collisions_per_km_worst']:.1f} on {worst}) "
+                f"prog {m['progress_rate_mps']:.2f} m/s lap {m['lap_time_s']:.1f} s"
+                if do_eval else f"student not measured this iter (last at {m_iter})")
+        print(f"iter {it}: beta {beta:.2f} samples {sum(len(b) for b in bufs)} loss {loss:.4f} | {stud} | "
               f"teacher {teacher_metrics['collisions_per_km']:.1f} coll/km (worst {teacher_metrics['collisions_per_km_worst']:.1f}) "
-              f"lap {teacher_metrics['lap_time_s']:.1f} s | {t_col:.0f}+{t_tr:.0f}+{t_ev:.0f} s", flush=True)
-        meta = {"spec": spec.__dict__, "phase": "dagger", "run": a.name, "iter": it, "iters": a.iters,
+              f"lap {teacher_metrics['lap_time_s']:.1f} s | {t_col:.0f}+{t_tr:.0f}+{t_ev:.0f}"
+              f"{f'+{t_teach:.0f} teach' if t_teach > 1 else ''} s", flush=True)
+        meta = {"spec": spec.__dict__, "phase": "dagger", "run": a.name, "iter": it, "iters": a.start_iter + a.iters,
+                "start_iter": a.start_iter,          # >0 means this checkpoint came from a resume
+                "resumed_from": a.init if a.start_iter else None,
                 "cap": a.speed_cap,          # the viewer defaults to the cap the policy was trained at
-                "samples": sum(len(b) for b in bufs), "metrics": m, "teacher": teacher_metrics,
+                "samples": sum(len(b) for b in bufs), "metrics": m, "metrics_from_iter": m_iter,
+                "teacher": teacher_metrics,
                 "action_mode": a.action_mode, "teacher_kind": a.teacher_kind, "teacher_desc": teacher_desc,
                 "opp_token": token, "opp_future_model": a.opp_future_model,
                 # declared before training and carried by every checkpoint, so an arm's loss is
