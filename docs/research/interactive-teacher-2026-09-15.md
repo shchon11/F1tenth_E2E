@@ -383,36 +383,213 @@ ego-motion-compensated residual of [motion-memory](motion-memory-2026-09-14.md),
 what moved explicit from geometry and would make "the student learned to use the opponent's motion"
 indistinguishable from "the input was handed it".
 
-PENDING-D3-RESULT
+## D3 — the result
+
+**The question, root's words:** *can a LiDAR student that never sees the future imitate the
+privileged interactive expert from observation history alone?*
+
+**The answer: yes for safety, no for racing — until PPO, which recovers the racing and keeps the
+safety.** The distilled student is markedly safer than the teacher it copied and much slower; 500
+updates of PPO on top of it pass six times more often than the teacher while staying as clean.
+
+### The proxy, both controller arms
+
+Resolutions are worker 16's (`work/oracle-planner/work/decide.md`), measured on the same protocol —
+a gap smaller than `res` is not a gap. Two seeds where shown as `a / b`.
+
+| row | res | interactive teacher | student it6 @legacy | student it6 @deployed | finetune @deployed | finetune @legacy |
+|---|---|---|---|---|---|---|
+| collisions / km ↓ | 2.2 | 11.0 / 12.4 | 14.3 / 14.3 | 6.6 | **3.6 / 4.2** | 10.0 |
+| wall collisions / learner-min ↓ | 0.11 | 0.02 | 1.07 | 0.32 | **0.05 / 0.10** | 0.86 |
+| car contacts / learner-min ↓ | 0.45 | 2.62 / 2.94 | 1.21 / 1.28 | 0.72 | **0.59 / 0.70** | 1.17 |
+| passes held / learner-min ↑ | 0.25 | 0.39 / 0.35 | 0.11 / 0.10 | 0.32 | **1.16 / 1.31** | 1.12 |
+| pace vs the opponents ↑ | 0.073 | 1.097 / 1.123 | 0.831 / 0.885 | 0.900 | **1.115 / 1.108** | 1.126 |
+| progress rate m/s ↑ | 0.04 | 4.00 / 3.96 | 2.77 / 2.79 | 2.69 | **3.37 / 3.45** | 4.03 |
+
+The deployed arm is `fixed_low+clearance`, what every policy row on our suites wears; `legacy` is the
+raw plan tracker, which is `evaluate`'s default and what the first day of scoring silently used.
+Teachers wear no arm — they plan.
+
+**The distilled student traded racing for safety.** Against the teacher it copied, it3-quarters the
+car contacts (0.72 vs 2.62 deployed) and takes a third of the passes (0.32 vs 0.39 — and 0.11 under
+the raw tracker). It paces at 0.900 where the teacher paces at 1.097: it is slower than the traffic,
+and the teacher is faster than it. A student that never overtakes has not learned the thing the
+interactive teacher was built to demonstrate.
+
+**The finetune recovers it.** 1.16–1.31 passes per learner-minute is 3× the teacher's and 10× the
+distilled student's, at 1.11 pace — with the *lowest* collision rate on the table. And the passes are
+not bought with contact:
+
+| arm | passes | car contacts | contacts per pass | share attacking | share in contention |
+|---|---|---|---|---|---|
+| interactive teacher | 37 | 252 | 6.81 | 39.1 % | 87.3 % |
+| student it6 @deployed | 31 | 69 | 2.23 | 11.4 % | 80.7 % |
+| **finetune @deployed** | **111** | **57** | **0.51** | 15.6 % | 84.6 % |
+
+13× fewer contacts per pass than the teacher, while *attacking* on 15.6 % of its time against the
+teacher's 39.1 %. It is not spending more time in the fight; it converts far more of the fight.
+
+### Family T — clean rate, not completion
+
+A family-T success is a clean run among the trials that met traffic, **not a completed lap**. Worker
+18 established this and our own files confirm it: `result.completed` is **0** for all four arms,
+480 trials each, and T has no timeout outcome, so a slow car never fails and slow reads as clean.
+The clean rate therefore travels with passes and speed, always.
+
+All four arms scored the same 60 cells (verified identical `(map, variant, mu, seed)` sets).
+
+| arm | clean | rate | 95 % Wilson | passes | speed | completed |
+|---|---|---|---|---|---|---|
+| **finetune ppo_u500** | **364 / 480** | **75.8 %** | [71.8, 79.4] | **203** | 3.46 m/s | 0 |
+| interactive teacher | 355 / 480 | 74.0 % | [69.9, 77.7] | 34 | 3.07 m/s | 0 |
+| student it6 | 320 / 480 | 66.7 % | [62.3, 70.7] | 33 | 2.59 m/s | 0 |
+| raceline teacher | 21 / 480 | 4.4 % | [2.9, 6.6] | 5 | 3.59 m/s | 0 |
+
+The finetune is **indistinguishable from the teacher on clean rate** (z = +0.67, p = 0.50) while
+making **six times its passes at a higher speed**; it is cleaner than the distilled student it came
+from (z = +3.14, p = 0.002). The student is 7.3 points under the teacher (z = 2.47, p = 0.013).
+
+Note the speed column: teacher, student and raceline teacher rank by clean rate in the *reverse*
+order of their speed — the artefact worker 18 warned about, visible in our own table. The finetune is
+the one row that breaks it, being faster *and* cleaner *and* passing more.
+
+**60 of 80 cells, not 80.** All four runs die entering their first `pair` cell — the finetune at
+31/40, the other three at 61/80; the variant order is `slow → pace → event → pair`, so those are the
+same boundary. Crash site is identical every time:
+`f1sim/sim.py:484  self.att_prev = self.att[:, [0, 2]].clone()` →
+`CUDA error: an illegal memory access was encountered`. Zero pair cells have ever been produced,
+across four arms and two suite sizes. That is consistent with pair being the cause and also with
+pair merely being last, i.e. the block with the most simulator history behind it; the decisive test
+is one pair cell run FIRST with `CUDA_LAUNCH_BLOCKING=1`, and it is still outstanding.
+
+### Against PPO-from-scratch, arm-matched
+
+Worker 16's arms are `@legacy`, so the honest comparison is the finetune's own `@legacy` row.
+
+| row | res | finetune @legacy | A0 `off` | A2 `posvel` | vs A0 | vs A2 |
+|---|---|---|---|---|---|---|
+| collisions / km ↓ | 2.2 | 10.0 | 10.8 | 6.8 | tie | A2 |
+| wall collisions / learner-min ↓ | 0.11 | 0.86 | 0.92 | 0.33 | tie | A2 |
+| car contacts / learner-min ↓ | 0.45 | 1.17 | 1.56 | 1.34 | tie | tie |
+| passes held / learner-min ↑ | 0.25 | 1.12 | 1.87 | 2.22 | A0 | A2 |
+| pace vs the opponents ↑ | 0.073 | 1.126 | 1.263 | 1.286 | A0 | A2 |
+| progress rate m/s ↑ | 0.04 | 4.03 | 4.49 | 4.61 | A0 | A2 |
+
+**Under the raw tracker this does not beat PPO-from-scratch.** It ties A0 on collisions and walls,
+is clearly slower and passes clearly less, and A2 beats it on four rows. The contacts row favours the
+finetune by 0.39 against a resolution of 0.45 — a point estimate the proxy cannot resolve, so it is a
+tie, not a win.
+
+Two budget differences bound that, and neither rescues it: **500 PPO updates against their 1000**
+(and the 500 was itself cut short of the 1500 the command line asked for), and **different starting
+points** — A0 finetunes a converged PPO policy, this arm finetunes a distilled student that had never
+taken a gradient step against a reward.
+
+The advantage is real but it is elsewhere: under the **deployed** arm the finetune runs 3.6–4.2
+collisions/km and 0.05–0.10 walls per learner-minute against its own legacy 10.0 and 0.86. The
+clearance layer is worth more to this student than half its PPO budget was. Read the two rows
+together or not at all.
+
+### The recipe as RUN, and where it differs from the plan
+
+A comment block inside a backslash-continued `exec` truncated the DAgger command line after
+`--lr 3e-4`; because it was `exec`, the orphaned flag lines never ran and never errored. Everything
+that defines the experiment is before the cut and held — `--teacher interactive`, `--teacher-grip
+true`, `--teacher-speed 1.00`, `--memory gru`, no `--opp-token`, no `--scan-channels`, the 264-track
+set, `--envs 258 --race-size 3`, the opponent flags, `--init A701`. What fell through to argparse
+defaults:
+
+| flag | intended | as run |
+|---|---|---|
+| `--seed` | 701 | **0** |
+| `--keep-iters` | 4 | **5** (more aggregation, not less) |
+| `--eval-steps` / `--eval-every` | 200 / 4 | **800 / 1** (as ordered anyway) |
+
+Three further deviations: the arm ran **7 of 8 DAgger iterations** (the card was handed back to the
+user mid-iteration 7 and its aggregated buffer died with the process); the PPO finetune was stopped
+at the budgeted **500 updates** although its `--total` asked for 1500 (a race-size units error —
+`ppo.py` counts learner envs, 86, where the script assumed 258); and the speed scale 1.00 was chosen
+by a sweep that could only separate arms differing by ~3.7× in hazard, so "no ceiling in
+[0.90, 1.00]" is a statement about the exposure, not about 1.00 being safe.
+
+### What the secondary arms will add
+
+Three arms, each one flag from this one: **nominal-teacher** (`label_grip=nominal`) isolates whether
+the μ-dependent label is what the GRU exploits; **asym speed loss** tests whether penalising
+over-speed steeply and under-speed gently pushes a student that cannot resolve μ to the safe
+quantile; **oracle token** (`--opp-token future`) is the ceiling — what the student could do if it
+saw what the teacher sees. Reported beside these rows with the same resolutions, the μ-from-hidden-
+state probe and over-speed-by-μ.
 
 ## What this licenses, and what it does not
 
+Each claim with the protocol that earns it. Every proxy comparison is read at worker 16's
+resolutions (`work/oracle-planner/work/decide.md`), measured on this same protocol: a gap smaller
+than `res` is not a gap.
+
 **Licensed.**
 
-* *A teacher that scores candidate plans against the opponents' predicted positions makes the racing
-  choice on the three situations a present-tense cost cannot see*, and the controlled comparison
-  isolates the time-indexing: the same candidates, the same walls, the same progress and smoothness,
-  with only the opponents' assumed motion changed.
-* *Its prediction of where a car will be is better than constant velocity from a quarter of a second
-  out, and on the lateral axis it is better in kind rather than in degree* — measured against the
-  realised future on logged rollouts, with every sample that crossed a race boundary dropped.
-* *It fits inside a DAgger collection loop.* 2.14x `RacelineTeacher` per label against a 3x budget.
-* *Every flag off is the run it was.* `--teacher raceline` is the previous DAgger loop;
-  `--opp-token off` produces the same observation dict, key for key; `plan_action` with no `idx` is
-  what it was, one deduplicated projection aside (the same call, made once instead of twice).
-* *The oracle cannot leave the simulator by accident.* Four independent refusals, each with its own
-  reason: the exporter (an .onnx outlives its checkpoint), the ROS node (before it builds an
-  observation), `ObsBuilder` (the deployment-side builder cannot build those columns at all), and
-  the benchmark adapter (a suite score taken with it is not comparable with one taken without it).
+* **The teacher design.** Scoring candidate plans against the opponents' *time-indexed* future makes
+  a different choice from a present-tense cost on 55.9 % of steps, and its prediction beats constant
+  velocity from 0.25 s out — lateral R² +0.71…+0.94 against *negative* at every horizon. It costs
+  2.14x a `RacelineTeacher` label, inside the 3x budget. *Protocol:* four future models labelled on
+  the same cars against their realised positions; per-label wall clock on the same tracks.
+* **The D2 gate: the interactive teacher out-races the raceline teacher against reactive opponents.**
+  **2.4x the passes at half the car contacts, on both seeds** (0.39 / 0.35 against 0.15 / 0.15 passes
+  per learner-minute; 2.62 / 2.94 against 5.86 / 7.17 contacts), and **355/480 clean against 21/480**
+  on family T. *Protocol:* traffic proxy, 2400 steps x 96 cars x 3 tracks, race size 3, seven
+  reactive behaviours, 96 learner-minutes per seed, two seeds per arm; suite v2.1 family T on
+  identical 60-cell sets.
+* **The D3 student is much safer than the teacher it copied, and does not race.** Deployed arm:
+  0.72 car contacts per learner-minute against the teacher's 2.62, 0.32 passes against 0.39, pace
+  0.900 against 1.097. Under the raw tracker, 0.11 passes. *Protocol:* traffic proxy, both controller
+  arms, two seeds on the deployed arm.
+* **500 PPO updates on that student recover the racing without giving back the safety.** 1.16–1.31
+  passes per learner-minute at 1.11 pace, the lowest collisions/km on the table (3.6 / 4.2), and
+  **0.51 car contacts per pass against the teacher's 6.81**. On family T its **clean rate is
+  indistinguishable from the teacher's — 364/480 (75.8 %) against 355/480 (74.0 %), z = +0.67,
+  p = 0.50 — at six times its passes (203 against 34) and a higher speed (3.46 against 3.07 m/s)**.
+  *Protocol:* as above, plus family T on the same 60 cells. Reported as a clean rate, never a
+  completion rate: nothing completes a lap in T (`result.completed` is 0 for all four arms, 480
+  trials each) and T has no timeout outcome, so a slow car reads as clean — which is why every clean
+  rate here travels with passes and speed.
+* **Arm-matched, this does NOT beat PPO-from-scratch.** Under the raw tracker the finetune ties
+  worker 16's A0 on collisions (10.0 vs 10.8, res 2.2), walls (0.86 vs 0.92, res 0.11) and contacts
+  (1.17 vs 1.56, res 0.45), and is clearly slower (4.03 vs 4.49 m/s, res 0.04) and passes clearly
+  less (1.12 vs 1.87, res 0.25); A2 beats it on four rows. *Protocol:* both `@legacy`, same proxy,
+  same resolutions. Two differences bound it without reversing it: **500 updates against their 1000**,
+  and A0 finetunes a converged PPO policy where this finetunes a distilled student that had never
+  taken a gradient step against a reward.
+* **Every flag off is the run it was.** `--teacher raceline` is the previous DAgger loop;
+  `--opp-token off` produces the same observation dict, key for key; `--eval-every 1` and
+  `--start-iter 0` are the old behaviour exactly.
+* **The oracle cannot leave the simulator by accident.** Four independent refusals: the exporter, the
+  ROS node, `ObsBuilder`, and the benchmark adapter.
 
 **Not licensed.**
 
-* **Any racing claim, in either direction, until Deliverable 2 has run.** Nothing above says the
-  interactive teacher completes more races, passes more, or touches fewer cars than the raceline
-  teacher; `work/gate.md` fixes what would settle that, and the measurement is GPU work.
-* **Any claim that the five weights are right.** They were set from the measured scale of each term
-  -- the corner-cut bonus the smoothness term has to price back, the lane width the opponent kernel
-  has to fit a pass through -- and not tuned against a racing outcome. Nobody has swept them.
-* **Anything about a student.** No policy in this branch has been distilled from this teacher.
-* **Anything about the real car.** The teacher is privileged by construction: it reads the other
+* **Anything about the real car.** The teacher is privileged by construction — it reads the other
   cars' state out of the simulator, and so does every input it hands a student.
+* **Anything about the 20 unrun `pair` cells**, in any arm. Zero have ever been produced: all four
+  runs die entering their first pair cell (`sim.py:484`, CUDA illegal memory access). Every family-T
+  number here is 60 of 80 cells, and the three scenarios that ran are not a random sample of the four.
+* **Anything about the secondary arms until they run.** The nominal-teacher contrast, the asymmetric
+  speed loss and the oracle-token ceiling are specified and queued, and nothing above anticipates
+  them. In particular, nothing here separates *the teacher's grip-dependent label* from *the teacher
+  seeing the opponents*.
+* **Any claim that rests on one training seed.** Every D3 arm is a single run at **seed 0** (as run,
+  not as planned), so every between-arm difference is training-run variance until a second seed
+  bounds it. The proxy resolutions above are the resolution of the MEASUREMENT, not of the run.
+* **That speed scale 1.00 is safe.** The sweep could only separate arms differing by ~3.7x in hazard
+  on 5.6 km per scale; the point estimates differed by 1.9x (1.07 against 2.00 collisions/km) and it
+  could not resolve them. "No ceiling in [0.90, 1.00] at this exposure" is a statement about the
+  exposure.
+* **That the teacher's advantage comes from the *future* rather than from seeing the opponents at
+  all.** No present-tense-cost arm was ever run. The side-flip measurement says the tense changes the
+  decision; it does not say the decision is better.
+* **That a family-T clean rate is a racing measure.** Racing lives in the proxy's passes per
+  learner-minute and pace.
+* **That the D3 student is the arm the plan describes.** 7 of 8 iterations, seed 0, `keep-iters 5`;
+  see the recipe-as-run above.
+* **Any claim that the five cost weights are right.** Set from the measured scale of each term, never
+  swept against a racing outcome.
