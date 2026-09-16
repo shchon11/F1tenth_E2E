@@ -437,7 +437,22 @@ neither is a fix.
 ## Table 2 — suite v2.1, the traffic family (complete, 5 systems × 144 cells)
 
 The 80-cell **T** family adds other cars on five held-out floors: `slow`, `pace` and `pair`
-opponents and an `event` scenario where they brake, stop and change line. **All five rows are complete** as of 2026-09-16 10:18.
+opponents and an `event` scenario where they brake, stop and change line.
+
+> **What a T success is, and what it is not.** Every number in the `T` columns below is a **clean
+> run** — the suite's own helper is `_clean_among_contended`, *"clean runs among the trials that
+> actually met traffic"* (`benchmark/runner.py:325-333`). It is **not** a completed lap. Checked
+> against the records rather than the name: of one system's 326 traffic successes, **0 have the
+> `completed` flag set and none has a lap time**, reaching 0.777 of a route on average; of its 48
+> *solo* successes, **48 of 48 completed the lap** at route fraction 1.000. The T family has no
+> `timeout` outcome at all, which is why the 3.00 m/s budget bar that produces hundreds of solo
+> timeouts costs nothing here. **No system in this table completes a lap in traffic** — not the
+> baselines, not our policies, not the retrained students.
+>
+> This matters for how the column is read. A driver that is slow, hangs back and declines to attack
+> scores well on it; one that races and occasionally touches a car scores worse. The column measures
+> *staying clean among traffic*, which is worth measuring and is not the same as racing well. Read
+> it beside the **passes** column, which is where engagement shows up. **All five rows are complete** as of 2026-09-16 10:18.
 
 One property of this table is worth stating before its rows arrive, because it is what lets them sit
 together at all. The published baselines drive in `direct` mode (`act_dim` 2) and ours in `plan`
