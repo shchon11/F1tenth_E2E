@@ -875,15 +875,50 @@ evaluation's own bar, and it inherits that exactly.
 demonstrations decide obstacle competence (1 → 35) and traffic competence (9 → 0, in the direction
 the teacher's own recorded limitation predicts). It does **not** settle why the raceline teacher
 drove at 2.90 m/s — whether traffic held it there or it is conservative everywhere — because the
-buffer behind this checkpoint recorded no opponent distance. `DemoBuffer.G` now records it, so the
-next collection answers that instead of raising it again.
+buffer behind this checkpoint recorded no opponent distance. `DemoBuffer.G` now records it, and the
+first buffer carrying it arrived the same day.
 
-**The End2Race arm is still to come**, and the `InteractiveTeacher` re-run needs the merge and one
-flag. Scoring it needs one benchmark lane and all
-three are committed to the v2.1 traffic rows; the End2Race arm has not been started at all. Both
-commands are recorded in `work/baselines/STATUS.md` under "Blocked, needs root". Until those run,
-the honest statement of this section is that the pipeline is demonstrated end to end for one of the
-two architectures and the comparison itself is unmeasured.
+### What the first buffer with the gap label says (2026-09-16 15:32)
+
+The user launched the interactive-teacher re-run after the merge; its iteration-0 buffer is the
+first written with `G`. The answer is not the one the question expected, and the honest version is
+smaller than the first version I computed.
+
+**The two teachers' demonstrated speeds are practically identical.** Interactive: median **2.89**
+m/s, **52.8 %** of labels below the suite's 3.00 m/s bar. Raceline dry run: median **2.90**,
+**52.9 %** below. A KS test separates them (p = 5e-17 at n = 6000) but the statistic is 0.08 and the
+medians differ by 0.013 m/s — distinguishable, not different. **Swapping the teacher does not change
+the speed distribution the student learns**, so Table 3's 242 timeouts should be expected to survive
+into the interactive row. That is a prediction, recorded before the row is scored.
+
+**The traffic split does not settle why, and my first reading of it was an artifact of one
+threshold.** `speed_by_contention()` at the suite's own 12 m range gave clear-road median 2.83
+against in-traffic 2.90 — clear road *slower*, which reads as "conservative everywhere". Sweeping
+the threshold destroys that:
+
+| gap threshold | in-traffic median | clear-road median | difference |
+| ---: | ---: | ---: | ---: |
+| 8 m | 2.73 (n=5332) | **3.68** (n=668) | **+0.95** |
+| **12 m** | 2.90 (n=5734) | 2.83 (n=266) | **−0.07** |
+| 20 m | 2.84 (n=5859) | **3.97** (n=141) | **+1.13** |
+| 30 m | 2.84 (n=5859) | **3.97** (n=141) | **+1.13** |
+
+Every threshold except the one I picked says clear road is about a metre per second faster. And the
+12 m clear-road side is 266 samples from **5 of 24 learner rows, 230 of them from two** — not an
+independent sample and not something to read a verdict off. `teacher_speed_split.py` now sweeps
+thresholds and prints the row clustering, because one threshold produced a confident sentence that
+was an artifact of the threshold.
+
+**What the buffer does say cleanly is more useful than what it was asked.** **95.6 % of the
+demonstrations are within 12 m of another car, the median gap is 3.6 m, and not one sample has no
+opponent at all.** Race size 3 on these tracks keeps the cars packed. So the demonstrations are
+almost entirely in-traffic driving; a student trained on them has barely seen an open track, and the
+solo family *is* an open track. That is a property of the collection design, identical for both
+teachers, and a better account of the timeouts than anything about either teacher's temperament.
+
+**Still to come**: the interactive TinyLidarNet row (running), the End2Race interactive arm (queued
+behind it by the one-distill cap), and the End2Race dry run (never started). The L5 dry-run row
+stays in this table as the contrast — the two differ in the teacher and nothing else.
 
 <!-- D3 TABLE: filled when the runs finish -->
 
