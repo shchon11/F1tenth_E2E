@@ -523,36 +523,73 @@ state probe and over-speed-by-μ.
 
 ## What this licenses, and what it does not
 
+Each claim with the protocol that earns it. Every proxy comparison is read at worker 16's
+resolutions (`work/oracle-planner/work/decide.md`), measured on this same protocol: a gap smaller
+than `res` is not a gap.
+
 **Licensed.**
 
-* *A teacher that scores candidate plans against the opponents' predicted positions makes the racing
-  choice on the three situations a present-tense cost cannot see*, and the controlled comparison
-  isolates the time-indexing: the same candidates, the same walls, the same progress and smoothness,
-  with only the opponents' assumed motion changed.
-* *Its prediction of where a car will be is better than constant velocity from a quarter of a second
-  out, and on the lateral axis it is better in kind rather than in degree* — measured against the
-  realised future on logged rollouts, with every sample that crossed a race boundary dropped.
-* *It fits inside a DAgger collection loop.* 2.14x `RacelineTeacher` per label against a 3x budget.
-* *Every flag off is the run it was.* `--teacher raceline` is the previous DAgger loop;
-  `--opp-token off` produces the same observation dict, key for key; `plan_action` with no `idx` is
-  what it was, one deduplicated projection aside (the same call, made once instead of twice).
-* *The oracle cannot leave the simulator by accident.* Four independent refusals, each with its own
-  reason: the exporter (an .onnx outlives its checkpoint), the ROS node (before it builds an
-  observation), `ObsBuilder` (the deployment-side builder cannot build those columns at all), and
-  the benchmark adapter (a suite score taken with it is not comparable with one taken without it).
+* **The teacher design.** Scoring candidate plans against the opponents' *time-indexed* future makes
+  a different choice from a present-tense cost on 55.9 % of steps, and its prediction beats constant
+  velocity from 0.25 s out — lateral R² +0.71…+0.94 against *negative* at every horizon. It costs
+  2.14x a `RacelineTeacher` label, inside the 3x budget. *Protocol:* four future models labelled on
+  the same cars against their realised positions; per-label wall clock on the same tracks.
+* **The D2 gate: the interactive teacher out-races the raceline teacher against reactive opponents.**
+  **2.4x the passes at half the car contacts, on both seeds** (0.39 / 0.35 against 0.15 / 0.15 passes
+  per learner-minute; 2.62 / 2.94 against 5.86 / 7.17 contacts), and **355/480 clean against 21/480**
+  on family T. *Protocol:* traffic proxy, 2400 steps x 96 cars x 3 tracks, race size 3, seven
+  reactive behaviours, 96 learner-minutes per seed, two seeds per arm; suite v2.1 family T on
+  identical 60-cell sets.
+* **The D3 student is much safer than the teacher it copied, and does not race.** Deployed arm:
+  0.72 car contacts per learner-minute against the teacher's 2.62, 0.32 passes against 0.39, pace
+  0.900 against 1.097. Under the raw tracker, 0.11 passes. *Protocol:* traffic proxy, both controller
+  arms, two seeds on the deployed arm.
+* **500 PPO updates on that student recover the racing without giving back the safety.** 1.16–1.31
+  passes per learner-minute at 1.11 pace, the lowest collisions/km on the table (3.6 / 4.2), and
+  **0.51 car contacts per pass against the teacher's 6.81**. On family T its **clean rate is
+  indistinguishable from the teacher's — 364/480 (75.8 %) against 355/480 (74.0 %), z = +0.67,
+  p = 0.50 — at six times its passes (203 against 34) and a higher speed (3.46 against 3.07 m/s)**.
+  *Protocol:* as above, plus family T on the same 60 cells. Reported as a clean rate, never a
+  completion rate: nothing completes a lap in T (`result.completed` is 0 for all four arms, 480
+  trials each) and T has no timeout outcome, so a slow car reads as clean — which is why every clean
+  rate here travels with passes and speed.
+* **Arm-matched, this does NOT beat PPO-from-scratch.** Under the raw tracker the finetune ties
+  worker 16's A0 on collisions (10.0 vs 10.8, res 2.2), walls (0.86 vs 0.92, res 0.11) and contacts
+  (1.17 vs 1.56, res 0.45), and is clearly slower (4.03 vs 4.49 m/s, res 0.04) and passes clearly
+  less (1.12 vs 1.87, res 0.25); A2 beats it on four rows. *Protocol:* both `@legacy`, same proxy,
+  same resolutions. Two differences bound it without reversing it: **500 updates against their 1000**,
+  and A0 finetunes a converged PPO policy where this finetunes a distilled student that had never
+  taken a gradient step against a reward.
+* **Every flag off is the run it was.** `--teacher raceline` is the previous DAgger loop;
+  `--opp-token off` produces the same observation dict, key for key; `--eval-every 1` and
+  `--start-iter 0` are the old behaviour exactly.
+* **The oracle cannot leave the simulator by accident.** Four independent refusals: the exporter, the
+  ROS node, `ObsBuilder`, and the benchmark adapter.
 
 **Not licensed.**
 
-* ~~Any racing claim until Deliverable 2 has run.~~ **D2 has run and the claim is now licensed**:
-  2.4x the passes at half the car contacts on both seeds, and 74.0 % against 4.4 % clean on 60
-  family-T cells. See "D2 -- the gate" above.
-* **Any claim that the five weights are right.** They were set from the measured scale of each term
-  -- the corner-cut bonus the smoothness term has to price back, the lane width the opponent kernel
-  has to fit a pass through -- and not tuned against a racing outcome. Nobody has swept them.
-* ~~Anything about a student.~~ **D3 has run**; see "D3 -- the result". What remains unlicensed
-  there: that this beats PPO-from-scratch (arm-matched it does not), that speed scale 1.00 is safe
-  (the sweep could only resolve a ~3.7x hazard difference), that the advantage comes from the
-  *future* rather than from seeing the opponents at all (no present-tense-cost arm was run), and
-  that family-T clean rate is a racing measure (nothing completes a lap in T).
-* **Anything about the real car.** The teacher is privileged by construction: it reads the other
+* **Anything about the real car.** The teacher is privileged by construction — it reads the other
   cars' state out of the simulator, and so does every input it hands a student.
+* **Anything about the 20 unrun `pair` cells**, in any arm. Zero have ever been produced: all four
+  runs die entering their first pair cell (`sim.py:484`, CUDA illegal memory access). Every family-T
+  number here is 60 of 80 cells, and the three scenarios that ran are not a random sample of the four.
+* **Anything about the secondary arms until they run.** The nominal-teacher contrast, the asymmetric
+  speed loss and the oracle-token ceiling are specified and queued, and nothing above anticipates
+  them. In particular, nothing here separates *the teacher's grip-dependent label* from *the teacher
+  seeing the opponents*.
+* **Any claim that rests on one training seed.** Every D3 arm is a single run at **seed 0** (as run,
+  not as planned), so every between-arm difference is training-run variance until a second seed
+  bounds it. The proxy resolutions above are the resolution of the MEASUREMENT, not of the run.
+* **That speed scale 1.00 is safe.** The sweep could only separate arms differing by ~3.7x in hazard
+  on 5.6 km per scale; the point estimates differed by 1.9x (1.07 against 2.00 collisions/km) and it
+  could not resolve them. "No ceiling in [0.90, 1.00] at this exposure" is a statement about the
+  exposure.
+* **That the teacher's advantage comes from the *future* rather than from seeing the opponents at
+  all.** No present-tense-cost arm was ever run. The side-flip measurement says the tense changes the
+  decision; it does not say the decision is better.
+* **That a family-T clean rate is a racing measure.** Racing lives in the proxy's passes per
+  learner-minute and pace.
+* **That the D3 student is the arm the plan describes.** 7 of 8 iterations, seed 0, `keep-iters 5`;
+  see the recipe-as-run above.
+* **Any claim that the five cost weights are right.** Set from the measured scale of each term, never
+  swept against a racing outcome.
