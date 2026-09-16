@@ -543,12 +543,16 @@ state probe and over-speed-by-μ.
 
 **Not licensed.**
 
-* **Any racing claim, in either direction, until Deliverable 2 has run.** Nothing above says the
-  interactive teacher completes more races, passes more, or touches fewer cars than the raceline
-  teacher; `work/gate.md` fixes what would settle that, and the measurement is GPU work.
+* ~~Any racing claim until Deliverable 2 has run.~~ **D2 has run and the claim is now licensed**:
+  2.4x the passes at half the car contacts on both seeds, and 74.0 % against 4.4 % clean on 60
+  family-T cells. See "D2 -- the gate" above.
 * **Any claim that the five weights are right.** They were set from the measured scale of each term
   -- the corner-cut bonus the smoothness term has to price back, the lane width the opponent kernel
   has to fit a pass through -- and not tuned against a racing outcome. Nobody has swept them.
-* **Anything about a student.** No policy in this branch has been distilled from this teacher.
+* ~~Anything about a student.~~ **D3 has run**; see "D3 -- the result". What remains unlicensed
+  there: that this beats PPO-from-scratch (arm-matched it does not), that speed scale 1.00 is safe
+  (the sweep could only resolve a ~3.7x hazard difference), that the advantage comes from the
+  *future* rather than from seeing the opponents at all (no present-tense-cost arm was run), and
+  that family-T clean rate is a racing measure (nothing completes a lap in T).
 * **Anything about the real car.** The teacher is privileged by construction: it reads the other
   cars' state out of the simulator, and so does every input it hands a student.
