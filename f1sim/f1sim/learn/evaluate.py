@@ -54,6 +54,14 @@ def resolve_steps(protocol: str, steps: int, budget_laps: float | None, tracks, 
     return budget_steps(tracks, speed_cap, step_dt, budget_laps, max_steps)
 
 
+def _oracle_token(spec: dict, model) -> str:
+    """The opponent-token mode a checkpoint was actually built with, or "off"."""
+    def _m(d):
+        v = str((d or {}).get("opp_token") or "off").strip()
+        return "" if v in ("", "off") else v
+    return _m(getattr(model, "meta", None) if model is not None else None) or _m(spec) or "off"
+
+
 @torch.no_grad()
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
@@ -177,8 +185,15 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      opp_future_model=opp_future_model,
                      **({"action_history": spec["action_history"], "v_max_policy": spec["v_max"]}
                         if external else {}),
-                     opp_token=str(spec.get("opp_token")
-                                   or (model.meta.get("opp_token") if model else None) or "off"),
+                     # meta FIRST, and 'off'/'' read as absent. `extra["spec"]` records 'off' as a
+                     # literal string, and 'off' is truthy, so `spec.get(...) or meta.get(...)`
+                     # short-circuits on it and never consults meta -- which is the only place
+                     # ActorCritic records the token the network was actually built with (both
+                     # writers, model.py:975 and :1484, are guarded by != "off", so meta is either
+                     # absent or a real mode). If those two ever disagree, the old order silently
+                     # built a NON-oracle env for an oracle checkpoint, and the guard below could
+                     # not fire either, because it tests the value this line just produced.
+                     opp_token=_oracle_token(spec, model),
                      opp_token_ablate=bool(opp_token_ablate),
                      **(opp_extra or {}))
     if ecfg.opp_token != "off" and not (race_size > 1 and mode == "plan"):
