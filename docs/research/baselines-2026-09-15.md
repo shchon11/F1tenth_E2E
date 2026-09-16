@@ -674,10 +674,40 @@ End2Race (`train.py:28-30,132-135,183-185`). "Their architecture under our recip
 system that is neither theirs nor ours. `distill.HYPERPARAMETERS` records which side every number
 came from and is written into every checkpoint.
 
-**Iteration 0 is literally the same data for every architecture.** The teacher drives at β = 1, so
-at one seed the scans and the labels are bit-identical whichever network is being trained — a test
-asserts it. Later iterations are each student's own on-policy states, which is what DAgger is and
-what ours does too.
+**Iteration 0 is the same demonstrations for every architecture in distribution, and — correcting
+what this section said until 2026-09-16 — *not* bit-identical.** The claim here was that "at one
+seed the scans and the labels are bit-identical whichever network is being trained — a test asserts
+it". Both halves were wrong.
+
+The two interactive runs share a teacher, a seed and an environment, and their iteration-0 buffers
+differ in **97.7 % of scan elements and 100 % of labels**, from the first step. The mechanism, which
+a test now pins:
+
+* `sim.py:80` seeds the **global** torch RNG when the environment is built;
+* `lidar.py:338` draws sensor noise with `torch.randn_like`, i.e. from that global RNG, not from the
+  simulator's own `self.gen` which everything else uses;
+* `cmd_distill` builds the student **after** the environment and **before** collecting, so a
+  220 686-parameter CNN and a 6 359 312-parameter GRU leave the global stream in different places.
+
+Verified directly: two collections at one seed with no model built are identical; build a model in
+between and the first scan moves by up to **9.5 m**.
+
+And the test that was cited as evidence never checked it. `test_iteration_zero_is_the_same_
+demonstrations_whatever_the_architecture` built the same environment twice and collected with
+`driver=None` both times — it varied nothing. It is renamed to what it tests (collection determinism
+at one seed), and a second test now asserts the real behaviour, so the false claim cannot return.
+
+**What this does and does not cost the comparison.** It is sensor noise, identical in distribution,
+from the same teacher in the same environment on the same tracks — so the architectures are still
+being compared on the same demonstrations in every sense that matters, and neither is favoured. What
+is lost is the stronger statement, that they saw the *same samples*. Making that true again is a
+one-line change (seed the global RNG immediately before `collect`, or have the lidar draw from
+`sim.gen`), but it would alter every future collection's data and must not be done inside a running
+experiment series — the four rows being scored tonight were collected under the present behaviour.
+It is a decision for root, between series.
+
+Later iterations are each student's own on-policy states, which is what DAgger is and what ours does
+too.
 
 ### The four declared deviations
 

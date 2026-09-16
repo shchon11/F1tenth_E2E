@@ -48,8 +48,16 @@ def build(seed=701, learners=2, n_beams=1081):
 
 
 @pytest.mark.slow
-def test_iteration_zero_is_the_same_demonstrations_whatever_the_architecture():
-    """The teacher drives at beta = 1, so the architecture cannot affect a single sample."""
+def test_iteration_zero_collection_is_deterministic_at_one_seed():
+    """Two collections at one seed agree exactly -- the simulator's own generator is deterministic.
+
+    This test used to be called `..._is_the_same_demonstrations_whatever_the_architecture`, and its
+    docstring claimed "the architecture cannot affect a single sample". It never varied the
+    architecture: it builds the same environment twice and collects with `driver=None` both times.
+    So it tested collection determinism, which is true, and asserted architecture-invariance, which
+    is NOT -- see the test below, and `docs/research/baselines-2026-09-15.md`. A test whose name
+    claims more than its body checks is worse than no test, because it is cited as evidence.
+    """
     out = []
     for _ in range(2):
         env, teacher, _t, _c = build()
@@ -303,3 +311,38 @@ def test_the_gap_label_matches_the_suites_own_helper():
             _wrapped_gaps(env.sim.s, env.sim.other_idx[rows], rows, length)]
     assert np.allclose(got, np.asarray(want, dtype=np.float32), atol=0, rtol=0)
     assert np.isfinite(got).all(), "race size > 1 should never give inf"
+
+
+@pytest.mark.slow
+def test_building_a_model_between_env_and_collection_changes_the_scans():
+    """Iteration 0 is NOT bit-identical across architectures, and this pins why.
+
+    `sim.py:80` seeds the GLOBAL torch rng at env construction, and `lidar.py:338` draws sensor
+    noise with `torch.randn_like`, which uses that global rng rather than the simulator's own
+    `self.gen`. `cmd_distill` builds the student AFTER the environment and BEFORE collecting, so a
+    220 686-parameter CNN and a 6 359 312-parameter GRU leave the global stream in different places
+    and see different noise.
+
+    Measured on the real iteration-0 buffers: 97.7 % of scan elements and 100 % of labels differ
+    between the TinyLidarNet and End2Race interactive runs, which share a teacher, a seed and an
+    environment. The comparison stays fair -- same distribution, same teacher, noise only -- but it
+    is not the bit-identity that was claimed, and this asserts the mechanism so the claim cannot
+    come back.
+    """
+    from f1sim.learn.baselines.tinylidarnet_torch import TinyLidarNetTorch
+
+    def first_scan(build_model):
+        env, _teacher, _t, _c = build()
+        if build_model:
+            TinyLidarNetTorch(1081)          # weight init draws from the global rng
+        env.sim.warmup()
+        r = env.reset()
+        obs = r[0] if isinstance(r, tuple) else r
+        return (obs["scan"][:, 0] * 10.0).cpu().numpy().copy()
+
+    a, b, c = first_scan(False), first_scan(False), first_scan(True)
+    assert np.array_equal(a, b), "collection is not deterministic at one seed"
+    assert not np.array_equal(a, c), (
+        "a model built between env and collection no longer perturbs the scans -- if the simulator "
+        "has been changed to draw lidar noise from its own generator, this test should be deleted "
+        "and the note's claim of cross-architecture bit-identity restored")
