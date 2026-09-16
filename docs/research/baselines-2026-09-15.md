@@ -840,7 +840,7 @@ digest, same device as everything in Table 1. Beside the published weights of th
 | **TinyLidarNet arch, our demonstrations** | D3, **interactive** teacher | **48** | **37** | 0† | 0.644 | 264 | 72 |
 | TinyLidarNet arch, our demonstrations | D3, raceline teacher (the dry run) | **48** | **35** | 0† | 0.665 | 242 | 94 |
 | TinyLidarNet, published weights | zero-shot reference | 47 | 1 | 9 | 0.416 | **0** | 356 |
-| *End2Race arch, our demonstrations* | *training, interactive teacher* | — | — | — | — | — | — |
+| **End2Race arch, our demonstrations** | D3, interactive teacher | **0** | **26** | 0† | 0.277 | 11 | **397** |
 | *ours, policy only (A701 `@legacy`)* | on suite v2 | 217 | 30 | 17 | — | — | — |
 
 † **not an overtaking measurement** — see below.
@@ -863,6 +863,62 @@ teachers' label speeds were within **0.013 m/s** of each other, so the students 
 speed and fail the same way. The interactive student achieves **2.34 m/s** against the dry run's
 2.57 and times out **264** times against 242 — slightly slower and slightly worse, in the direction
 its commanded speeds predicted (median 2.10 against 2.41 m/s on the recorded scans).
+
+### End2Race scores 0/384 solo, and it is NOT the timeout mechanism
+
+The End2Race arm is the one the contract was missing, and it comes back at **zero** — against 48 for
+the TinyLidarNet student on the same demonstrations, and 53 for End2Race's own published weights
+under the better fill. Root asked whether this is the slow-label story again or something in the
+port. It is neither of the first and specifically the second, and the two students separate cleanly:
+
+| paired, same cells | S/384 | A/96 | timeouts | collisions | route reached | achieved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TinyLidarNet, our demos | **48** | 37 | **264** | 72 | **0.641** | 2.34 m/s |
+| End2Race, our demos | **0** | 26 | 11 | **397** | **0.277** | 2.33 m/s |
+| End2Race, published `fill0` | 53 | 32 | 21 | 325 | 0.344 | 2.80 m/s |
+
+**Identical achieved speed, opposite failure.** Both students drive at 2.33–2.34 m/s, but
+TinyLidarNet runs out of clock two-thirds of the way round while End2Race hits a wall at just over a
+quarter. Its failures are **397 collisions to 11 timeouts** — the reverse of TinyLidarNet's 264 to
+72. Whatever is wrong is not the budget.
+
+It is also not a slow network. On the recorded scans End2Race's student commands a **median 2.96
+m/s and clears the suite's 3.00 m/s bar on 48 %** of them, against the TinyLidarNet student's 2.10
+and 16 %. The arm that scores 48 is the *slower* one. Any explanation resting on demonstration speed
+predicts the opposite of what happened.
+
+**What it is: the student learned speed and never learned to steer.** Run each student over its own
+iteration-0 buffer — the teacher-driven data it trained on — and compare its outputs to the labels:
+
+| student | steer RMSE | steer R² | speed RMSE | speed R² |
+| --- | ---: | ---: | ---: | ---: |
+| TinyLidarNet, our demos | 0.094 rad | **+0.438** | 0.93 m/s | +0.503 |
+| End2Race, our demos | 0.157 rad | **−0.557** | 0.65 m/s | **+0.738** |
+
+A negative R² means worse than predicting the constant mean: its steering RMSE, **0.157 rad**, is
+larger than the labels' own spread of 0.126 rad. It fits speed better than TinyLidarNet does and
+steers worse than a constant. A car that tracks the expert's speed and not its steering drives into
+a wall at a quarter distance, which is exactly the row.
+
+**The mechanism is their loss weighting meeting our label distribution**, and it is a consequence of
+the contract, not a bug. `End2Race/train.py:130-132` optimises `MSE(steer) + 0.05·MSE(speed)` on
+**unscaled** units, and the 0.05 is there precisely because the units are unscaled. On our labels
+steer has sd **0.126 rad** and speed sd **1.27 m/s**, so the speed term enters at 0.05 × 1.6 ≈ 0.08
+against steer's ≈ 0.016 — **five to one in speed's favour even after the 0.05**. Early in training,
+when speed error is still metres per second, the ratio is nearer thirty to one. The network spends
+its capacity where the gradient is.
+
+This is what "keep every hyperparameter of theirs at its repo default and say so" is for. The
+weighting is theirs, the result is a faithful reproduction, and the finding is that **their loss
+does not transfer to a label distribution whose speed spread is ten times its steering spread**. It
+is a property of the pairing, not of the architecture: the same network under a weighting that
+balanced the two terms is untested here and is the obvious next experiment.
+
+Two candidates root raised and the data does not support. The **270-beam deviation** is shared with
+nothing else that failed — the published End2Race rows used 360 features and also crashed, and the
+retrained model's steering is broken on the data it trained on, before any sensor-geometry question
+arises. The **GRU at 40 Hz** likewise: its recurrence was measured at 100 Hz in Table 1 and moved
+the row by one trial in 384.
 
 ### The overtaking row was never an overtaking measurement, and I said it was
 
