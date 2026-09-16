@@ -639,10 +639,10 @@ best against a `slow` car (24/160), worst when there are two of them (`pair`, 16
 | `pace` | 19/160 | 25 | 22 |
 | `pair` | 16/160 | 50 | 44 |
 
-### The two suite runs reproduce each other exactly — four systems, 256 cells
+### The two suite runs reproduce each other exactly — seven systems, 448 cells
 
 v2.1 contains v2's 64 cells unchanged, and every system here is scored on both, in two independent
-runs hours apart under two different suite freezes. Across all **256 shared cells**:
+runs hours apart under two different suite freezes. Across all **448 shared cells**:
 
 | system | what it is | cells | success Δ | per-trial outcome Δ | physical start Δ | max \|Δ progress\| | max \|Δ lap\| |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -650,14 +650,17 @@ runs hours apart under two different suite freezes. Across all **256 shared cell
 | End2Race | torch **GRU**, direct action | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
 | frozen original `@legacy` | ours, plan + iLQR | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
 | A701 `@fixed_low` | ours, plan + iLQR + clamp | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| A701 `@legacy` | ours, plan + iLQR | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| **D3 TinyLidarNet** | ours, retrained CNN | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
+| **D3 End2Race** | ours, retrained GRU | 64 | 0 | 0 | 0 | 0.00e+00 | 0.00e+00 |
 
 Not "agree to within a tolerance" — **bit-identical**, down to every trial's distance along the
 route and every completed lap time.
 
 The spread matters more than the zeroes. This is not one lucky system: it is a 220 k-parameter CNN
 through an ONNX runtime, an 11 M-parameter **recurrent** network through torch carrying hidden state
-across every step of every trial, and two plan-space PPO policies under two different controller
-arms. The recurrent one is the case that could plausibly have drifted — a GRU accumulates state, so
+across every step of every trial, three plan-space PPO policies under two different controller arms,
+and both retrained students — seven systems, every architecture and runtime in this note. The recurrent one is the case that could plausibly have drifted — a GRU accumulates state, so
 a single differing float in the first step of a 444-step trial has 443 steps to grow — and it did
 not, in 64 cells.
 
