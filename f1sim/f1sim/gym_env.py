@@ -1477,7 +1477,11 @@ class F1VecEnv:
                 # never lifts an opponent over its follow cap" invariant is untouched: this car
                 # never had a cap to be lifted over.
                 follow = follow & ~blind
-        an = self._teacher_normalized(self.teacher, ev_off, ev_speed, follow, v_cap)
+        # The raceline teacher's command, unless every teacher-driven car is driven by another kind:
+        # then each of its rows is overwritten below and it would be computed only to be thrown away
+        # (with the console's interactive preset that is half of every step).
+        an = (self._teacher_normalized(self.teacher, ev_off, ev_speed, follow, v_cap)
+              if self._raceline_teacher_needed() else out)
         for kind, alt in zip(self.alt_teacher_kinds, self.alt_teachers):
             # A teacher kind that is not the raceline teacher drives its own slots. Asked for the
             # whole batch and selected, like the pool is, for the same reason: compacting to the
@@ -1488,6 +1492,24 @@ class F1VecEnv:
             an = torch.where(self.alt_teacher_mask[kind][:, None],
                              self._teacher_normalized(alt, ev_off, ev_speed, follow, v_cap), an)
         return torch.where(self.teacher_driven[:, None], an, out)
+
+    def _raceline_teacher_needed(self) -> bool:
+        """Does any teacher-driven car take the raceline teacher's command?
+
+        Only a slot table can say no, and there both masks are fixed for the life of the env
+        (`teacher_driven` is redrawn at resets only without a table, `alt_teacher_mask` never), so
+        the answer is read back once and kept -- per step it would be a host sync.
+        """
+        if self.slots is None or not self.alt_teacher_kinds:
+            return True
+        key = (id(self.teacher_driven), tuple(id(self.alt_teacher_mask[k]) for k in self.alt_teacher_kinds))
+        cached = getattr(self, "_raceline_needed_cache", None)
+        if cached is None or cached[0] != key:
+            covered = torch.zeros_like(self.teacher_driven)
+            for k in self.alt_teacher_kinds:
+                covered |= self.alt_teacher_mask[k]
+            cached = self._raceline_needed_cache = (key, bool((self.teacher_driven & ~covered).any()))
+        return cached[1]
 
     def _teacher_normalized(self, teacher, ev_off, ev_speed, follow, v_cap):
         """One teacher's command for the whole batch, as a normalized action.

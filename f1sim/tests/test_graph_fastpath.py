@@ -453,10 +453,13 @@ def test_input_recorder_notices_a_write_into_an_input():
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="capturing a graph needs CUDA")
-def test_teacher_graph_matches_eager_bit_for_bit_and_restores_the_env():
+@pytest.mark.parametrize("slots", [None, [{"kind": "interactive"}, {"kind": "interactive"}]],
+                         ids=["raceline-teacher", "interactive-slots"])
+def test_teacher_graph_matches_eager_bit_for_bit_and_restores_the_env(slots):
     """Three cars on a procedural map: every replayed teacher call equals the eager call on the
     same state, over steps that include a race reset, and releasing the graph puts the env's own
-    method back."""
+    method back. The slot table is how the console builds any race with opponents, and naming the
+    interactive kind makes the env call a second teacher object every step."""
     from f1sim.viewer.console import protocol as P
 
     class _Null:
@@ -470,8 +473,9 @@ def test_teacher_graph_matches_eager_bit_for_bit_and_restores_the_env():
     w.say = lambda *a, **k: None
     w.stage = lambda *a, **k: None
     w._hold_parked_ok = True
+    extra = {"opponent": "slots", "opponent_slots": slots} if slots else {}
     s = w.build_session(P.SessionConfig(map_name="gen:competition:2", cars_per_race=3,
-                                        stochastic=True), 0)
+                                        stochastic=True, **extra), 0)
     try:
         tg = s.get("teacher_graph")
         assert tg is not None, "the auto-controller race should capture its teacher"
@@ -479,14 +483,19 @@ def test_teacher_graph_matches_eager_bit_for_bit_and_restores_the_env():
             if gc_ is not None:
                 gc_.adopt()
         env = s["env"]
+        # Only the teachers the env actually calls: an all-interactive table never asks the
+        # raceline teacher, whose rows would all be overwritten.
+        teachers = ([env.teacher] if env._raceline_teacher_needed() else []) + list(env.alt_teachers)
+        assert teachers and len(tg._captures) == len(teachers)
         for _ in range(120):
             follow, v_cap = env.follow_cap(env.sim.state)
-            with torch.no_grad():
-                want = tg._eager(env.teacher, None, None, follow, v_cap)
-                got = tg(env.teacher, None, None, follow, v_cap)
-            assert torch.equal(want, got)
+            for t in teachers:
+                with torch.no_grad():
+                    want = tg._eager(t, None, None, follow, v_cap)
+                    got = tg(t, None, None, follow, v_cap)
+                assert torch.equal(want, got)
             w._step_once(s)
-        assert tg.fell_back is None and tg.replays > 100
+        assert not tg.fell_back and tg.replays > 100 * len(teachers)
     finally:
         w._release_session(s)
     assert "_teacher_normalized" not in env.__dict__

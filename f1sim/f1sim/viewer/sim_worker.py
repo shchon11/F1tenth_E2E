@@ -1085,12 +1085,11 @@ class SimWorker:
             return
         # The call's own arguments, from a real step -- the follow mask and cap are tensors or not
         # depending on the race, and guessing would capture against the wrong signature.
-        rec: dict = {}
+        rec: dict = {}                      # teacher object -> its call's arguments
         eager = env._teacher_normalized
 
         def spy(teacher, *a):
-            if teacher is env.teacher:
-                rec["args"] = a
+            rec[teacher] = a
             return eager(teacher, *a)
 
         env._teacher_normalized = spy
@@ -1098,13 +1097,13 @@ class SimWorker:
             self._step_once(session)
         finally:
             env.__dict__.pop("_teacher_normalized", None)
-        if "args" not in rec:
+        if not rec:
             self.say(P.MSG_LOG, gen=gen, text="상대차 teacher 호출을 관측하지 못해 eager 로 둡니다.")
             return
         self.stage(gen, "graph", "상대차 teacher")
         t0 = time.perf_counter()
         try:
-            tg = TeacherGraph(env, rec["args"], log=lambda t: self.say(P.MSG_LOG, gen=gen, text=t))
+            tg = TeacherGraph(env, rec, log=lambda t: self.say(P.MSG_LOG, gen=gen, text=t))
         except NotCapturable as exc:
             self.say(P.MSG_LOG, gen=gen, text=f"상대차 teacher 는 eager 로 둡니다: {exc}")
             return

@@ -733,8 +733,6 @@ def teacher_eligible(env) -> Tuple[bool, str]:
         return False, "teacher 상대차 없음"
     if not bool(getattr(env, "teacher_any", False)):
         return False, "teacher 가 모는 차가 없음"
-    if getattr(env, "pool", None) is not None or getattr(env, "alt_teachers", None):
-        return False, "정책 풀 / 다른 teacher 종류가 섞인 레이스"
     tracker = getattr(env, "tracker", None)
     solver = getattr(tracker, "_solver", None)
     if isinstance(solver, GraphedCallable) and all(
@@ -745,49 +743,24 @@ def teacher_eligible(env) -> Tuple[bool, str]:
     return True, ""
 
 
-class TeacherGraph:
-    """`env._teacher_normalized` for the race's teacher-driven cars, as one CUDA graph.
+def _setting(v):
+    """A teacher setting as a guard value. A tensor-valued one (a per-car speed scale in a slot
+    table, redrawn at every race reset) is an input the capture already follows by path, so only
+    its layout is guarded; a Python value is baked into the graph and is guarded by value."""
+    if torch.is_tensor(v):
+        return ("tensor", tuple(v.shape), v.dtype, v.device.type)
+    return v
 
-    Beside a single viewed car, the teacher is most of a step: a candidate family, a Gauss-Newton
-    fit per candidate, a speed certification and a collision preview, each a few hundred tiny
-    kernels. At the viewer's batch sizes launching them costs far more than running them -- 37 ms of
-    a 58 ms step with three cars, against ~20 ms for the whole step without opponents.
 
-    The call is a pure function of tensors the environment holds, but several of those are rebound
-    every step (`sim.state`, `last_result.odom`, `tracker.last_pred`, `_plan_pose`), so a graph that
-    read them at their captured addresses would replay the capture step for ever. So:
+class _TeacherCapture:
+    """One teacher object's call, captured against private clones of everything it reads."""
 
-    * **Every tensor the call reads is found, not listed.** Capture runs under `_InputRecorder`, and
-      each input is traced back to its attribute paths from the environment. An input with no path,
-      or a write into one, makes the configuration `NotCapturable` and the teacher stays eager.
-    * **The graph reads private copies.** Each input is cloned and the environment's paths point at
-      the clone for the duration of the capture only, then go back. Before every replay each live
-      input is copied into its clone. Nothing the environment owns is ever written by the graph --
-      so an old tensor someone kept (a previous pose, a view of the last state) is never touched.
-    * **Anything it cannot follow sends it back to eager, for good.** A live input whose shape or
-      dtype changed, paths that disagree about which tensor they hold, a guard -- the teacher's
-      speed scale, grip mode, lane clamp, the tracker's spec and hooks, the call's non-tensor
-      arguments -- that no longer matches.
-    """
-
-    def __init__(self, env, example_args: Sequence[Any], log=None):
-        ok, why = teacher_eligible(env)
-        if not ok:
-            raise NotCapturable(why)
-        self.env = env
-        self.teacher = env.teacher
-        self._log = log or (lambda _t: None)
-        self._eager = env._teacher_normalized         # the bound method, not a previous shadow
-        self.fell_back: Optional[str] = None
-        self.replays = 0
-        self.eager_steps = 0
-        self._installed = False
-        teacher = self.teacher
+    def __init__(self, env, eager, teacher, example_args: Sequence[Any]):
+        self.teacher = teacher
         guards = {
-            "teacher": lambda: id(env.teacher),
-            "teacher.speed_scale": lambda: teacher.speed_scale,
-            "teacher.label_grip": lambda: teacher.label_grip,
-            "teacher.offset_limit": lambda: teacher.offset_limit,
+            "teacher.speed_scale": lambda: _setting(getattr(teacher, "speed_scale", None)),
+            "teacher.label_grip": lambda: _setting(getattr(teacher, "label_grip", None)),
+            "teacher.offset_limit": lambda: _setting(getattr(teacher, "offset_limit", None)),
             "tracker": lambda: (id(env.tracker), type(env.tracker).__name__),
             "tracker.spec": lambda: env.tracker.spec,
             "tracker.hooks": lambda: tuple(id(getattr(env.tracker, h, None))
@@ -801,7 +774,7 @@ class TeacherGraph:
         # 1. Which tensors does the call read, and where do they live?
         rec = _InputRecorder([a for a in example_args if torch.is_tensor(a)])
         with torch.no_grad(), rec:
-            self._eager(teacher, *example_args)
+            eager(teacher, *example_args)
         if rec.written:
             raise NotCapturable(f"teacher 가 외부 텐서에 씁니다 ({', '.join(sorted(set(rec.written)))})")
         paths = _tensor_paths(env)
@@ -810,33 +783,77 @@ class TeacherGraph:
             ps = paths.get(key)
             if not ps:
                 raise NotCapturable(f"출처를 찾을 수 없는 teacher 입력 {tuple(t.shape)}/{t.dtype}")
-            live = [_resolve(env, p) for p in ps]
-            refs.append((ps, live))
+            refs.append((ps, [_resolve(env, p) for p in ps]))
 
         # 2. Point every path at a private clone, capture, and put the environment back.
-        self._inputs = []                              # (paths, private clone)
-        for ps, live in refs:
-            clone = live[0].detach().clone()
-            self._inputs.append((ps, clone))
+        self.inputs = [(ps, live[0].detach().clone()) for ps, live in refs]
         try:
-            for (ps, clone), (_, live) in zip(self._inputs, refs):
+            for (ps, clone) in self.inputs:
                 for p in ps:
                     _assign(env, p, clone)
 
             def body(*args):
                 with torch.no_grad():
-                    return self._eager(teacher, *args)
+                    return eager(teacher, *args)
 
-            self._gc = GraphedCallable(body, example_args, guards=guards, name="opponent teacher")
+            self.gc = GraphedCallable(body, example_args, guards=guards,
+                                      name=f"opponent teacher ({type(teacher).__name__})")
         finally:
-            for (ps, _clone), (_, live) in zip(self._inputs, refs):
+            for (ps, _clone), (_, live) in zip(self.inputs, refs):
                 for p, orig in zip(ps, live):
                     _assign(env, p, orig)
-        self._log(f"상대차 teacher 그래프 캡처 (입력 {len(self._inputs)}개)")
+
+
+class TeacherGraph:
+    """`env._teacher_normalized` for the race's teacher-driven cars, one CUDA graph per teacher.
+
+    Beside a single viewed car, the teacher is most of a step: a candidate family, a Gauss-Newton
+    fit per candidate, a speed certification and a collision preview, each a few hundred tiny
+    kernels. At the viewer's batch sizes launching them costs far more than running them -- 37 ms of
+    a 58 ms step with three cars, against ~20 ms for the whole step without opponents. A slot table
+    naming another teacher kind (the console's `interactive` preset) calls it once per kind, every
+    step, so each teacher object the env calls gets its own graph.
+
+    The call is a pure function of tensors the environment holds, but several of those are rebound
+    every step (`sim.state`, `last_result.odom`, `tracker.last_pred`, `_plan_pose`), so a graph that
+    read them at their captured addresses would replay the capture step for ever. So:
+
+    * **Every tensor the call reads is found, not listed.** Capture runs under `_InputRecorder`, and
+      each input is traced back to its attribute paths from the environment. An input with no path,
+      or a write into one, makes the configuration `NotCapturable` and the teacher stays eager.
+    * **The graph reads private copies.** Each input is cloned and the environment's paths point at
+      the clone for the duration of the capture only, then go back. Before every replay each live
+      input is copied into its clone. Nothing the environment owns is ever written by the graph --
+      so an old tensor someone kept (a previous pose, a view of the last state) is never touched.
+    * **Anything it cannot follow sends that teacher back to eager, for good.** A live input whose
+      shape or dtype changed, a guard -- the teacher's speed scale, grip mode, lane clamp, the
+      tracker's spec and hooks, the call's non-tensor arguments -- that no longer matches. Paths
+      that disagree about which tensor they hold send one step to eager.
+    """
+
+    def __init__(self, env, calls: Dict[Any, Sequence[Any]], log=None):
+        ok, why = teacher_eligible(env)
+        if not ok:
+            raise NotCapturable(why)
+        if not calls:
+            raise NotCapturable("teacher 호출을 관측하지 못함")
+        self.env = env
+        self._log = log or (lambda _t: None)
+        self._eager = env._teacher_normalized         # the bound method, not a previous shadow
+        self._captures: Dict[int, _TeacherCapture] = {}
+        self.fell_back: Dict[str, str] = {}           # teacher class -> why it went eager
+        self.replays = 0
+        self.eager_steps = 0
+        self._installed = False
+        for teacher, args in calls.items():
+            self._captures[id(teacher)] = _TeacherCapture(env, self._eager, teacher, args)
+        n = sum(len(c.inputs) for c in self._captures.values())
+        self._log(f"상대차 teacher 그래프 {len(self._captures)}개 캡처 (입력 {n}개)")
 
     # -- ownership / hooks -----------------------------------------------------------
     def adopt(self) -> None:
-        self._gc.adopt()
+        for c in self._captures.values():
+            c.gc.adopt()
 
     def install(self) -> None:
         if self._installed:
@@ -848,21 +865,22 @@ class TeacherGraph:
         if self._installed and self.env is not None:
             self.env.__dict__.pop("_teacher_normalized", None)
             self._installed = False
-        self._inputs = []
-        self._gc = None
+        self._captures = {}
         self.env = None
 
     # -- dispatch ---------------------------------------------------------------------
-    def _give_up(self, why: str) -> None:
-        self.fell_back = why
-        self._log(f"상대차 teacher 는 이제 eager 로 돕니다: {why}")
+    def _give_up(self, cap: _TeacherCapture, why: str) -> None:
+        self._captures.pop(id(cap.teacher), None)
+        self.fell_back[type(cap.teacher).__name__] = why
+        self._log(f"상대차 teacher ({type(cap.teacher).__name__}) 는 이제 eager 로 돕니다: {why}")
 
     def __call__(self, teacher, *args):
-        if self.fell_back is not None or teacher is not self.teacher:
+        cap = self._captures.get(id(teacher))
+        if cap is None or cap.teacher is not teacher:
             return self._eager(teacher, *args)
         env = self.env
         live_of = []
-        for ps, clone in self._inputs:
+        for ps, clone in cap.inputs:
             live = _resolve(env, ps[0])
             for p in ps[1:]:
                 other = _resolve(env, p)
@@ -872,21 +890,21 @@ class TeacherGraph:
                     self.eager_steps += 1
                     return self._eager(teacher, *args)
             if live.shape != clone.shape or live.dtype != clone.dtype:
-                self._give_up(f"입력 {tuple(clone.shape)} 이 {tuple(live.shape)} 로 바뀜")
+                self._give_up(cap, f"입력 {tuple(clone.shape)} 이 {tuple(live.shape)} 로 바뀜")
                 return self._eager(teacher, *args)
             live_of.append(live)
         try:
-            self._gc.check_guards()
+            cap.gc.check_guards()
         except GuardViolation as exc:
-            self._give_up(str(exc))
+            self._give_up(cap, str(exc))
             return self._eager(teacher, *args)
-        for (_ps, clone), live in zip(self._inputs, live_of):
+        for (_ps, clone), live in zip(cap.inputs, live_of):
             if live is not clone:
                 clone.copy_(live)
         try:
-            out = self._gc(*args)
+            out = cap.gc(*args)
         except GuardViolation as exc:
-            self._give_up(str(exc))
+            self._give_up(cap, str(exc))
             return self._eager(teacher, *args)
         self.replays += 1
         return out
