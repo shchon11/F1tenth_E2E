@@ -392,3 +392,101 @@ def test_captured_actor_step_matches_eager_and_keeps_the_hidden_state_static():
         actor.mu.weight = torch.nn.Parameter(actor.mu.weight.clone())
     with pytest.raises(GuardViolation):
         g(scan, pro, got_h)
+
+
+# ------------------------------------------------------------------ the opponent teacher
+def _fake_race_env(solver, **tracker_hooks):
+    tracker = types.SimpleNamespace(_solver=solver, _input_hook=None, _plan_hook=None,
+                                    _command_hook=None)
+    tracker.__dict__.update(tracker_hooks)
+    return types.SimpleNamespace(sim=_FakeSim(device=torch.device("cuda")), M=3, teacher=object(),
+                                 teacher_any=True, pool=None, alt_teachers=[], tracker=tracker)
+
+
+def test_teacher_graph_refuses_a_preview_that_would_replay_the_solver_graph():
+    """With the legacy controller the interactive teacher previews the installed MPC, which is the
+    solver's own graph: replaying it inside the teacher's capture is fatal, so it is refused up
+    front. With the auto controller's hooks installed the preview is the reference rollout."""
+    from f1sim.viewer.graph_fastpath import GraphedCallable, teacher_eligible
+    graphed = GraphedCallable.__new__(GraphedCallable)
+    ok, why = teacher_eligible(_fake_race_env(graphed))
+    assert not ok and "legacy" in why
+    ok, _ = teacher_eligible(_fake_race_env(graphed, _plan_hook=lambda *a: None))
+    assert ok
+    ok, why = teacher_eligible(types.SimpleNamespace(sim=_FakeSim(), M=3, teacher=object()))
+    assert not ok and why == "CPU 세션"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the recorder follows CUDA tensors")
+def test_input_recorder_keeps_views_it_made_out_of_the_inputs():
+    """`P["lf"][:, None, None]` shares the parameter buffer's storage but is the call's own view:
+    it must not be reported as an input nobody holds (which would refuse every capture), while the
+    entry it came from must be."""
+    from f1sim.viewer.graph_fastpath import _InputRecorder, _tensor_paths, _view_key
+    buf = torch.arange(6.0, device="cuda")
+    root = types.SimpleNamespace(P={"lf": buf[0:3], "lr": buf[3:6]})
+    with _InputRecorder() as rec:
+        x = root.P["lf"][:, None, None] * 2.0
+        x + 1.0
+    paths = _tensor_paths(_Root(root.P))
+    assert set(rec.inputs) == {_view_key(root.P["lf"])}
+    assert all(k in paths for k in rec.inputs)
+    assert not rec.written
+
+
+class _Root:
+    """`_tensor_paths` walks f1sim objects only; this stands in for the environment."""
+    __module__ = "f1sim.tests"
+
+    def __init__(self, P):
+        self.P = P
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the recorder follows CUDA tensors")
+def test_input_recorder_notices_a_write_into_an_input():
+    from f1sim.viewer.graph_fastpath import _InputRecorder
+    held = torch.zeros(4, device="cuda")
+    with _InputRecorder() as rec:
+        held[1:3].add_(1.0)                # through a view: still the input's memory
+    assert rec.written
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="capturing a graph needs CUDA")
+def test_teacher_graph_matches_eager_bit_for_bit_and_restores_the_env():
+    """Three cars on a procedural map: every replayed teacher call equals the eager call on the
+    same state, over steps that include a race reset, and releasing the graph puts the env's own
+    method back."""
+    from f1sim.viewer.console import protocol as P
+
+    class _Null:
+        def send(self, *a):
+            pass
+
+        def poll(self, *a):
+            return False
+
+    w = sim_worker.SimWorker(_Null(), _Null())
+    w.say = lambda *a, **k: None
+    w.stage = lambda *a, **k: None
+    w._hold_parked_ok = True
+    s = w.build_session(P.SessionConfig(map_name="gen:competition:2", cars_per_race=3,
+                                        stochastic=True), 0)
+    try:
+        tg = s.get("teacher_graph")
+        assert tg is not None, "the auto-controller race should capture its teacher"
+        for gc_ in (s["fastpath"], s.get("controller"), tg):
+            if gc_ is not None:
+                gc_.adopt()
+        env = s["env"]
+        for _ in range(120):
+            follow, v_cap = env.follow_cap(env.sim.state)
+            with torch.no_grad():
+                want = tg._eager(env.teacher, None, None, follow, v_cap)
+                got = tg(env.teacher, None, None, follow, v_cap)
+            assert torch.equal(want, got)
+            w._step_once(s)
+        assert tg.fell_back is None and tg.replays > 100
+    finally:
+        w._release_session(s)
+    assert "_teacher_normalized" not in env.__dict__

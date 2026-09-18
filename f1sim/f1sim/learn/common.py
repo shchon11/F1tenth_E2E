@@ -23,6 +23,25 @@ WANDB_ENTITY = os.environ.get("WANDB_ENTITY")     # None -> the account's defaul
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "f1sim-e2e")
 
 
+def validate_policy_observation(saved: dict, env) -> None:
+    """Reject shape-compatible but numerically different policy observations."""
+    import math
+    if not isinstance(saved, dict) or not saved:
+        raise ValueError("policy checkpoint has no observation specification")
+    expected = ObsSpec(**{key: value for key, value in saved.items()
+                          if key in ObsSpec.__dataclass_fields__})
+    actual = obs_spec(env)
+    for key in ObsSpec.__dataclass_fields__:
+        want, got = getattr(expected, key), getattr(actual, key)
+        if isinstance(want, float) or isinstance(got, float):
+            same = math.isfinite(float(want)) and math.isfinite(float(got)) \
+                and math.isclose(float(want), float(got), rel_tol=0., abs_tol=1e-9)
+        else:
+            same = want == got
+        if not same:
+            raise ValueError(f"policy observation {key}: checkpoint {want!r}, environment {got!r}")
+
+
 # ---------------------------------------------------------------- track sets
 # These used to be literal lists of loader strings, a hundred and forty-nine of them, and the only
 # way to see what the split *was* was to read the list comprehensions that built it. They are now
@@ -65,12 +84,16 @@ def base_map(name: str) -> str:
     family added to the catalog is covered without a second list to keep in sync. The loop runs to
     a fixed point because the two kinds of suffix can be written in either order.
     """
+    if "!assets=" in name:
+        name = name.rsplit("!assets=", 1)[0]
+    name = tracks.parse(name).legacy()
     prev = None
     while prev != name:
         prev = name
         for m in maps.MODIFIERS:
             if name.endswith(m):
                 name = name[:-len(m)]
+        name, _ = maps._split_bare(name)
         stripped, kind, _ = maps._split_obstacle_suffix(name)
         if kind is not None:
             name = stripped
@@ -183,6 +206,7 @@ def viewer_active(max_age: float = 5.0) -> bool:
 def raceline_clearance(track, rl) -> float:
     """Smallest gap between the raceline and anything solid [m]."""
     from scipy import ndimage
+    track = track.for_planning()
     edt = ndimage.distance_transform_edt(~track.occupancy).astype(np.float32) * track.resolution
     j = np.clip(((rl.xy[:, 0] - track.origin[0]) / track.resolution).astype(int), 0, edt.shape[1] - 1)
     i = np.clip(((rl.xy[:, 1] - track.origin[1]) / track.resolution).astype(int), 0, edt.shape[0] - 1)
@@ -288,7 +312,9 @@ def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0
     apart and the regression learns their conditional mean. "nominal"/"conservative" are constant and
     therefore imitable. Run `python -m f1sim.learn.grip_probe` to measure whether the proprio history recovers mu at all."""
     t = RacelineTeacher(rls, wheelbase=env.cfg.vehicle.lf + env.cfg.vehicle.lr, device=env.device,
-                        recover_time=recover_time)
+                        recover_time=recover_time, vehicle=env.cfg.vehicle,
+                        mu_nominal=env.cfg.vehicle.mu,
+                        mu_f_scale_nominal=env.cfg.vehicle.mu_f_scale)
     t.label_grip = grip
     return t
 

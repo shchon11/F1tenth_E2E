@@ -481,7 +481,9 @@ class Simulator:
         self.cmd_hist = torch.cat([self.cmd[:, None, :], self.cmd_hist[:, :-1]], 1)
 
         self.pose_prev = self.state[:, :3].clone()
-        self.att_prev = self.att[:, [0, 2]].clone()
+        # Roll/pitch are alternate columns. A strided view avoids constructing a
+        # CUDA index tensor from a Python list (and synchronizing) every step.
+        self.att_prev = self.att[:, :3:2].clone()
         # the sample layout belongs to this step's phase; capture it before the phase advances
         imu_offsets = self._imu_offsets[self._imu_phase]
         state, ax, ay, att, imu_state, imu_samples, i_motor = self._roll(
@@ -521,7 +523,7 @@ class Simulator:
         # --- sensors ---
         pose = state[:, :3]
         scan, scan_true, scan_type = self.lidar.scan(pose, self.pose_prev, P, self.cfg.lidar.motion_distortion,
-                                                     att=att[:, [0, 2]], att_prev=self.att_prev, tid=self.tid, cars=cars,
+                                                     att=att[:, :3:2], att_prev=self.att_prev, tid=self.tid, cars=cars,
                                                      eid=self.eid)
         imu = imu_samples if self.cfg.imu.enabled else None
         imu_att = imu_state[:, 18:21].clone() if self.cfg.imu.enabled else None
@@ -533,7 +535,7 @@ class Simulator:
             self._odom_t_prev = odom_t
         else:
             odom_t = None
-        return StepResult(scan, scan_true, scan_type, att[:, [0, 2]].clone(), odom, state, imu, imu_att,
+        return StepResult(scan, scan_true, scan_type, att[:, 0:3:2].clone(), odom, state, imu, imu_att,
                           self.collided.clone(), ds, s, lateral, self.lap.clone(), wall_dist, self.t,
                           self.car_collision.clone() if self.M > 1 else None,
                           imu_offsets if self.cfg.imu.enabled else None,

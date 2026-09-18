@@ -47,6 +47,16 @@ Pick a map in the left column and press **시작**. That is the whole first run:
 ([viewer design](docs/viewer_design.md#the-map-card-2026-09-12)). The console is the one thing that
 needs PyQt5, which is in no extra on purpose — provide it in your environment yourself.
 
+Optional, if you have the parent workspace's `~/F1tenth/activate.sh`, add this shortcut to
+`~/.bashrc` or `~/.zshrc`:
+
+```bash
+alias f1sim='source "$HOME/F1tenth/activate.sh" && python -m f1sim.learn.watch'
+```
+
+Reload your shell configuration (for example, `source ~/.zshrc` or `source ~/.bashrc`), then run
+`f1sim`. The `activate.sh` helper belongs to the parent workspace and is not part of this clone.
+
 As a library, from inside `f1sim/` — the repository root holds a folder that shadows the installed
 package ([getting started](docs/getting_started.md#a-directory-shadowing-trap)):
 

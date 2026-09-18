@@ -82,6 +82,20 @@ class AdapterError(RuntimeError):
 
 
 # ------------------------------------------------------------------ loading
+def _runtime_options(entry: dict) -> dict:
+    """Explicit, fingerprinted research options for our policy/runtime pairs."""
+    if entry.get("kind"):
+        return {}
+    options = entry.get("options") or {}
+    if not isinstance(options, dict) or set(options) - {"research_estimator", "research_profile"}:
+        raise AdapterError("policy runtime options must name only research_estimator/research_profile")
+    if "research_estimator" in options and not isinstance(options["research_estimator"], bool):
+        raise AdapterError("research_estimator must be an explicit boolean")
+    if options.get("research_profile") is not None and not options.get("research_estimator"):
+        raise AdapterError("historical profile comparison requires explicit research_estimator")
+    return dict(options)
+
+
 def _arm_base(arm: str) -> str:
     """The tracker arm underneath a possibly-composed name: `"fixed_low+tcs"` -> `"fixed_low"`.
 
@@ -113,9 +127,15 @@ def load_actor(entry: Dict[str, Any], device):
     path = entry["path"]
     if not os.path.exists(path):
         raise AdapterError(f"checkpoint does not exist: {path}")
-    trained_arm = controller_arm_of(torch.load(path, map_location="cpu", weights_only=False))
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    trained_arm = controller_arm_of(ck)
     eval_arm = str(entry.get("arm") or "legacy")
     cross = bool(entry.get("cross_runtime"))
+    runtime_options = _runtime_options(entry)
+    if trained_arm == "auto":
+        from f1sim.learn.grip_runtime import validate_runtime_checkpoint
+        validate_runtime_checkpoint(ck, eval_arm,
+                                    research_estimator=runtime_options.get("research_estimator", False))
 
     if trained_arm != "legacy" and trained_arm != eval_arm:
         raise AdapterError(
@@ -533,12 +553,19 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
         from f1sim.learn import grip_runtime as grip_rt
         t0, phase0 = float(env.sim.t), int(getattr(env.sim, "_imu_phase", 0))
         try:
+            runtime_options = _runtime_options(entry)
+            saved_controller = ((extra.get("experiment") or {}).get("controller") or {})
+            if saved_controller.get("arm") == "auto":
+                runtime_options["checkpoint_meta"] = saved_controller
             controller = grip_rt.ControllerRuntime(
                 env, arm,
                 estimator_path=(entry.get("estimator_path")
                                 if _arm_base(arm) == "estimated" else None),
-                device=device)
+                device=device, **runtime_options)
             controller.install(graph_rt=holder)
+            if saved_controller.get("arm") == "auto":
+                grip_rt.validate_runtime_checkpoint({"extra": extra}, controller,
+                    research_estimator=bool(runtime_options.get("research_estimator")))
             if (float(env.sim.t), int(getattr(env.sim, "_imu_phase", 0))) != (t0, phase0):
                 raise AdapterError("installing the controller stepped the simulator; cells would "
                                    "start from different sensor phases")
@@ -558,6 +585,7 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
             raise
 
     protocol = {
+        "runtime_options": _runtime_options(entry),
         "arm": arm, "trained_arm": str((extra.get("experiment") or {}).get("controller", {})
                                        .get("arm") or "legacy"),
         "external": extra.get("external"),
@@ -590,4 +618,8 @@ def prepare_cell(entry: Dict[str, Any], extra: Dict[str, Any], cell: Dict[str, A
                            if _arm_base(arm) == "estimated" else None),
         "wheel_model": bool(getattr(env.sim, "wheel_model", False)),
     }
+    if controller is not None and arm == "auto":
+        contract = controller.checkpoint_meta()
+        protocol["controller_contract"] = {key: contract[key] for key in
+            ("runtime_version", "grip_spec", "estimator_content_sha256", "research_estimator")}
     return PreparedCell(env=env, controller=controller, graph_holder=holder, protocol=protocol)

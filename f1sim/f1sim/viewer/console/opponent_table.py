@@ -34,7 +34,7 @@ from typing import List, Optional, Sequence
 
 from PyQt5 import QtCore, QtWidgets
 
-from ... import opponent_events as opp_ev
+from ... import opponent_event_contract as opp_ev
 from ... import opponent_slots as osl
 from .theme import C, SP
 from .widgets import label

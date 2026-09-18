@@ -43,7 +43,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple
 
-from . import opponent_events as opp_ev
+from . import opponent_event_contract as opp_ev
 
 #: Where a slot's car starts **relative to the learner**. This is the mirror of `--spawn-order`,
 #: which says where the *learner* starts relative to everyone: a per-car table reads "this car
@@ -57,7 +57,7 @@ GRIP_LABELS = ("true", "nominal", "conservative")
 
 #: Korean labels for the console, one place, so the table and the header line agree.
 GRIP_LABEL_TEXT = {"true": "참값 (privileged: 이 차의 실제 마찰로 계획)",
-                   "nominal": "공칭 (항상 최고 그립 프로파일)",
+                   "nominal": "공칭 (고정된 차량 공칭 마찰로 계획)",
                    "conservative": "보수적 (항상 최저 그립 프로파일)"}
 #: The same three, short enough for a table cell.
 GRIP_LABEL_SHORT = {"true": "참값", "nominal": "공칭", "conservative": "보수적"}

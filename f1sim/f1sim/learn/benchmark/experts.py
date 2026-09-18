@@ -387,8 +387,7 @@ class TrafficExpert:
         was = self.teacher.offset_limit
         self.teacher.offset_limit = self.limit
         try:
-            an = self.teacher.plan_action(e.sim.state, e.sim.P, e.sim.tid, e.ecfg.v_max_policy,
-                                          e.tracker.spec, offset=offset)
+            an = e.teacher_label(self.teacher, offset=offset)
         finally:
             self.teacher.offset_limit = was
         # Off the line, off the profile's speed -- ramped with the same weight the offset is, so

@@ -305,8 +305,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         obs_row = QtWidgets.QHBoxLayout()
         obs_row.setSpacing(SP[0])
         self.combo_obstacle = QtWidgets.QComboBox()
-        for o in tracks.OBSTACLES:
-            self.combo_obstacle.addItem(tracks.OBSTACLE_LABEL[o], o)
+        for o in tracks.ASSET_OBSTACLES:
+            self.combo_obstacle.addItem(tracks.ASSET_PLACEMENT_LABEL[o], o)
+        self.combo_obstacle.setCurrentIndex(self.combo_obstacle.findData(""))
         self.combo_obstacle.currentIndexChanged.connect(lambda _: self._on_scenario_changed())
         obs_row.addWidget(self.combo_obstacle, 1)
         # A family ADDS to what the map has. This is how a custom scene is used as a bare track for
@@ -317,7 +318,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "장애물 종류는 맵이 이미 가진 것 위에 더합니다.\n"
             "켜면 작성자가 배치한 장애물을 먼저 걷어내고 그 위에 올립니다 (id 로는 +bare).")
         self.chk_bare_first.toggled.connect(lambda _: self._on_scenario_changed())
-        obs_row.addWidget(self.chk_bare_first)
+        self.chk_bare_first.hide()
         obs_box = QtWidgets.QWidget()
         obs_box.setLayout(obs_row)
         self.row_obstacle = FieldRow("장애물", obs_box, tracks.OBSTACLE_HINT[""])
@@ -422,21 +423,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
         # -- advanced
         adv = Collapsible("고급 설정", expanded=False)
-        # Not "CUDA 가속": the label said that and the box was ticked, so opening the viewer looked
-        # like a choice about whether to use the GPU. It is not -- 연산 장치 decides that, and the
-        # session runs on CUDA with this off. What this buys is `torch.compile`, which is a startup
-        # cost paid before anything appears.
-        self.chk_compile = QtWidgets.QCheckBox("torch.compile 사전 컴파일 (시작이 몇 분 느려짐)")
-        self.chk_compile.setChecked(False)
-        self.chk_compile.setToolTip(
-            "GPU 사용 여부와는 무관합니다 — 그건 아래 '연산 장치' 가 정하고, 이 항목을 꺼도\n"
-            "CUDA 로 돌아갑니다.\n\n"
-            "켜면 torch 가 정책과 물리를 컴파일해 step 하나가 빨라집니다. 대신 세션을 시작할 때\n"
-            "그 컴파일을 먼저 끝내야 하므로 화면이 나오기까지 몇 분이 걸릴 수 있습니다.\n"
-            "차 한 대를 보는 용도라면 켜지 않는 편이 빠릅니다. 차가 많거나 오래 돌릴 때 이득입니다.\n\n"
-            "준비 시간은 고정값이 아니라 torch 컴파일 캐시 상태에 좌우됩니다.\n"
-            "준비 중에도 창은 계속 반응하며 [취소] 를 누를 수 있습니다.")
-        adv.add(self.chk_compile)
         self.chk_dr = QtWidgets.QCheckBox("차량마다 마찰/지연 무작위화 (학습과 동일)")
         self.chk_dr.setChecked(True)
         self.chk_dr.setToolTip("끄면 모든 차가 공칭 파라미터로 달립니다. 미끄러짐이 정책 탓인지 "
@@ -459,17 +445,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.combo_device = QtWidgets.QComboBox()
         self.combo_device.addItems(["auto", "cuda", "cpu"])
         adv.add(FieldRow("연산 장치", self.combo_device, ""))
-        self.combo_controller = QtWidgets.QComboBox()
-        self.combo_controller.addItems(["fixed_low", "legacy", "estimated", "oracle"])   # fixed_low: the deployment default (suite v1, 2026-09-12)
-        adv.add(FieldRow("플랜 제어기 (노면 클램프)", self.combo_controller,
-                         "estimated / fixed_low: 곡률·마찰 기반 속도·가감속 한계를 MPC에 적용합니다 "
-                         "(벤치마크의 @estimated 구성). oracle: 시뮬의 참값 μ를 그대로 쓰는 상한 확인용 "
-                         "(실차 불가). 레이스당 차량 수 1에서만 지원합니다."))
-        self.edit_estimator = QtWidgets.QLineEdit()
-        self.edit_estimator.setPlaceholderText("estimated 전용: 노면 추정기 .pt 경로")
-        self.edit_estimator.setText(SessionConfig.default_estimator())
-        adv.add(FieldRow("노면 추정기", self.edit_estimator,
-                         "비워 두면 $F1SIM_GRIP_ESTIMATOR 또는 ~/f1sim_runs/_estimators/estimator_seed401.pt 를 씁니다."))
+        self.grip_note = label("노면 한계 자동 추정", "hint")
+        self.grip_note.setWordWrap(True)
+        self.grip_note.setToolTip("일반 주행은 센서 기반 자동 런타임을 사용합니다. 실험용 제어기와 추정기 경로는 "
+                                  "명시적인 벤치마크·디버그 호출에서만 지정합니다.")
+        adv.add(self.grip_note)
         self.combo_ros = QtWidgets.QComboBox()
         self.combo_ros.addItem("끄기", "off")
         self.combo_ros.addItem("센서 토픽 발행 (정책이 주행)", "publish")
@@ -1001,6 +981,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.drive_info.set("시뮬 참값 μ", "—",
                             tooltip="시뮬레이터가 이 차에 실제로 적용한 마찰계수입니다. 정책이 "
                                     "관측할 수 없는 값이며, 추정치가 아니라 참값입니다.")
+        self.drive_info.set("추정 μ", "추정 대기",
+                            tooltip="센서 기반 추정의 q50(중앙값)과 컨트롤러에 적용한 보수적 상한 "
+                                    "used_mu입니다. 시뮬 참값 μ와 다를 수 있습니다.")
         drive.add(self.drive_info)
         v.addWidget(drive)
 
@@ -1274,8 +1257,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
-                  self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.opp_table,
-                  self.combo_device, self.combo_controller, self.edit_estimator, self.combo_ros,
+                  self.spin_cap, self.chk_dr, self.chk_stoch, self.opp_table, self.combo_device,
+                  self.combo_ros,
                   self.seg_direction, self.combo_obstacle, self.chk_bare_first):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
         # The seed row follows the obstacle choice, not the session state: 다시 뽑기 is exactly the
@@ -1399,6 +1382,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.policy_panel.fov = float((facts.get("lidar") or {}).get("fov", 4.71238898))
         self.policy_panel.range_max = float((facts.get("lidar") or {}).get("range_max", 10.0))
         self.dash_panel.v_max = float(facts.get("v_max_policy", 8.0) or 8.0)
+        self.dash_panel.clear_grip_estimate()
+        self.drive_info.set("추정 μ", "추정 대기")
         self.viewport.set_corner_text(f"{mp}\n{run}")
         self._update_running_note()
 
@@ -1414,6 +1399,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 tile.set_unknown()
         else:
             f = int(frame.get("focus", 0))
+            self.dash_panel.set_focus(f)
+            self.dash_panel.set_grip_estimate(frame.get("grip_estimate"))
             n = int(frame.get("n", 0))
             if 0 <= f < n:
                 self.m_speed.set_value(f"{float(frame['vx'][f]):5.2f}")
@@ -1427,6 +1414,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 self.drive_info.set("랩 진행", f"{float(frame['s'][f]):.1f} m")
                 mu = frame.get("mu")
                 self.drive_info.set("시뮬 참값 μ", f"{float(mu):.3f}" if mu is not None else "—")
+                self.drive_info.set("추정 μ", self.dash_panel.grip_status)
             crashed = int((frame["coll"] > 0.5).sum()) if frame.get("coll") is not None else 0
             self.m_coll.set_value(f"{crashed} / {n}", C["danger"] if crashed else None)
 
@@ -1683,13 +1671,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         text = STAGE_TEXT.get(self._stage, self._stage) if self._stage else "시작 준비 중"
         here = f" · 이 단계 {time.monotonic() - self._stage_since:.0f}초" if self._stage_since else ""
         note = f" · {self._stage_note}" if self._stage_note else ""
-        hint = ""
-        if self._stage == "compile" and total > 20:
-            # the one stage that legitimately takes minutes, and the only one worth explaining
-            hint = ("  torch.compile 사전 컴파일은 몇 분이 걸릴 수 있습니다. "
-                    "'고급 설정 > torch.compile 사전 컴파일' 을 끄면 즉시 시작합니다 — "
-                    "끈 상태에서도 CUDA 그래프는 1초 남짓에 캡처되어 그대로 쓰입니다.")
-        self.status_text.setText(f"준비 중 {total:.0f}초 — {text}{note}{here}.  취소할 수 있습니다.{hint}")
+        self.status_text.setText(f"준비 중 {total:.0f}초 — {text}{note}{here}.  취소할 수 있습니다.")
 
     # ================================================================ user actions
     def _can_start(self) -> bool:
@@ -1728,17 +1710,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         version of this that wastes a checkpoint load.
         """
         tid = self._selected_map or ""
-        allowed = self.maps.obstacle_options(tid) if tid else list(tracks.OBSTACLES)
+        allowed = tracks.asset_obstacle_options(tid) if tid and tracks.is_spec(tid) else list(tracks.ASSET_OBSTACLES)
         n_props = self.maps.authored_props(tid) if tid else 0
         want = str(self.combo_obstacle.currentData() or "")
         self.combo_obstacle.blockSignals(True)
         self.combo_obstacle.clear()
-        for o in tracks.OBSTACLES:
+        for o in tracks.ASSET_OBSTACLES:
             if o not in allowed:
                 continue
             self.combo_obstacle.addItem(self._obstacle_label(o, n_props), o)
             i = self.combo_obstacle.count() - 1
-            self.combo_obstacle.setItemData(i, tracks.OBSTACLE_HINT[o], QtCore.Qt.ToolTipRole)
+            self.combo_obstacle.setItemData(i, tracks.ASSET_PLACEMENT_HINT[o], QtCore.Qt.ToolTipRole)
             if o == tracks.BARE and not n_props:
                 # Listed and greyed rather than hidden: "this map has nothing placed on it" is an
                 # answer, and hiding the entry would make 기본 look like the only thing there is.
@@ -1761,12 +1743,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         """The combo's text. The counts are the whole point: 기본 on a scene with three boxes has to
         say so, or it is the same silent claim 없음 used to make."""
         if not n_props:
-            return tracks.OBSTACLE_LABEL[kind]
+            return tracks.ASSET_PLACEMENT_LABEL[kind]
         if kind == "":
             return f"{tracks.OBSTACLE_LABEL['']} (배치된 장애물 {n_props}개)"
         if kind == tracks.BARE:
             return f"{tracks.OBSTACLE_LABEL[tracks.BARE]} (배치 장애물 제거)"
-        return tracks.OBSTACLE_LABEL[kind]
+        return tracks.ASSET_PLACEMENT_LABEL[kind]
 
     def _scenario(self) -> str:
         """The selection and the three controls as one spec string. `#<kind>:*` when the seed is
@@ -1787,13 +1769,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             if family:                        # `bare` alone places nothing, so it takes no seed
                 seed = "*" if str(self.combo_seed.currentData()) == "random" else str(self.spin_seed.value())
                 spec += f":{seed}"
-        return spec
+        return tracks.asset_scenario(spec)
 
     def _on_scenario_changed(self):
         o = str(self.combo_obstacle.currentData() or "")
         family = o and o != tracks.BARE
         n_props = int(getattr(self, "_n_props", 0))
-        hint = tracks.OBSTACLE_HINT.get(o, "")
+        hint = tracks.ASSET_PLACEMENT_HINT.get(o, "")
         if family:
             hint = f"{hint} {tracks.OBSTACLE_ADDS_HINT}"
         self.row_obstacle.set_hint(hint, "hint")
@@ -1892,13 +1874,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             cars_per_race=self.spin_grid.value(),
             speed_cap=float(self.spin_cap.value()),
             device=self.combo_device.currentText(),
-            compile=self.chk_compile.isChecked(),
+            compile=False,
             randomize=self.chk_dr.isChecked(),
             stochastic=self.chk_stoch.isChecked(),
             opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
             opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),
-            controller=self.combo_controller.currentText(),
-            estimator=self.edit_estimator.text().strip(),
+            controller="auto",
+            estimator="",
             mu_mode=str(self.combo_mu.currentData() or "random"),
             mu=float(self.spin_mu.value()),
             ros2=str(self.combo_ros.currentData() or "off"),

@@ -259,6 +259,7 @@ def test_the_training_page_emits_a_flag_the_trainer_parses(qapp, tmp_path, monke
     form = T.RecipeForm()
     try:
         form.spin_race.setValue(3)
+        form.spin_envs.setValue(255)  # validation now refuses fractional races before launching
         form.chk_slots.setChecked(True)
         form.opp_table.set_slots(FULL)
         _name, argv, _dev = form.argv()

@@ -1504,13 +1504,19 @@ class F1VecEnv:
             v = v if ev_speed is None else v * ev_speed
             v = torch.where(follow, torch.minimum(v, v_cap), v)
             return self.teacher_action_to_normalized(torch.stack([cmd[:, 0], v], 1))
-        an = teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
-                                 self.tracker.spec, offset=ev_off)
+        an = self.teacher_label(teacher, offset=ev_off)
         an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
         if ev_speed is not None:                             # same scaling in the normalized plan speeds
             an[:, -2:] = (ev_speed[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
         cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
         an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
+        # Scripted pace/events can replace the certified endpoints (including
+        # speed multipliers above one). Certify the final teacher plan again;
+        # policy-driven rows and their controller are unchanged.
+        projector = getattr(getattr(teacher, 'base', teacher), 'project_plan_action', None)
+        if projector is not None:
+            an = projector(an, self.sim.state, self.sim.P, self.ecfg.v_max_policy,
+                           self.tracker.spec, plan_speed=self._tracker_plan_speed())
         return an
 
     def _opponent_obs(self):
@@ -1588,7 +1594,7 @@ class F1VecEnv:
             cmd = torch.stack([a[:, 0] * self.s_max, v_cmd], 1)
         else:                                                  # plan -> (steer, speed) through the tracker
             lr = self.last_result
-            v_meas = lr.odom[:, 3] if lr is not None else self.sim.state[:, 3]
+            v_meas = self._tracker_plan_speed()
             yaw_rate = lr.imu[:, :, 2].mean(1) if (lr is not None and lr.imu is not None and lr.imu.shape[1] > 0) else None
             # Before the solve, because `last_pred` comes back in the body frame of exactly this
             # pose and `car_future` has to put it back in the world.
@@ -2057,7 +2063,10 @@ class F1VecEnv:
         t = torch.as_tensor(times, dtype=st.dtype, device=self.device).reshape(-1)
         if t.numel() == 0:
             raise ValueError("car_future needs at least one horizon")
-        if float(t.min()) < 0:
+        # Checked on the host copy when there is one. A device tensor is left unchecked: reading it
+        # back is a sync per call, and the one caller that passes one (the interactive teacher,
+        # every step) builds it from `arange * dt`.
+        if not (torch.is_tensor(times) and times.device.type != "cpu") and float(t.min()) < 0:
             raise ValueError(f"car_future horizons must be >= 0, got {t.tolist()}")
         c, sn = torch.cos(st[:, 2]), torch.sin(st[:, 2])
         vw = torch.stack([st[:, 3] * c - st[:, 4] * sn, st[:, 3] * sn + st[:, 4] * c], 1)
@@ -2176,6 +2185,18 @@ class F1VecEnv:
         grid = torch.arange(n, device=self.device, dtype=t.dtype) * dtw
         return _interp_path(walk, grid, t)
 
+    def _pred_grid_start(self):
+        """`delay - control_dt`, the time of `last_pred[:, 0]` relative to now.
+
+        With per-car delays this stays on the device: it used to be `float(tracker_delay.mean())`,
+        a host sync on every call, and the teacher calls it twice a step. The double subtraction
+        and the single cast to float32 are what the Python-float version did implicitly, so the
+        grid is bit-identical.
+        """
+        if self.tracker_delay is None:
+            return float(self.tracker.spec.delay) - self.sim.control_dt
+        return (self.tracker_delay.mean().double() - self.sim.control_dt).float()
+
     def _tracker_future(self, st: torch.Tensor, t: torch.Tensor) -> Optional[torch.Tensor]:
         """`PlanTracker.last_pred` in the world, sampled at `t`, or None before a plan-mode step."""
         if self.tracker is None or self.tracker.last_pred is None or self._plan_pose is None:
@@ -2188,8 +2209,7 @@ class F1VecEnv:
         xy = torch.stack([x, y], 2)                                         # (B, N+1, 2)
         # When the samples are, relative to now: the solve predicted forward over the command
         # latency, and one control step has been driven since it was taken.
-        dly = float(self.tracker.spec.delay) if self.tracker_delay is None else float(self.tracker_delay.mean())
-        grid = dly - self.sim.control_dt + torch.arange(z.shape[1], device=self.device, dtype=t.dtype) * self.tracker.spec.dt
+        grid = self._pred_grid_start() + torch.arange(z.shape[1], device=self.device, dtype=t.dtype) * self.tracker.spec.dt
         psi_e = pp[:, 2] + z[:, -1, 2]
         v_e = z[:, -1, 3]
         over = (t[None, :] - grid[-1]).clamp_min(0.0)                       # (1, K) past the horizon
@@ -2201,7 +2221,7 @@ class F1VecEnv:
 
     @torch.no_grad()
     def opponent_future(self, times, model: Optional[str] = None,
-                        state: Optional[torch.Tensor] = None):
+                        state: Optional[torch.Tensor] = None, *, return_yaw: bool = False):
         """(positions (B, C, K, 2), present (B, C)) for the C other cars of each race.
 
         `present` is the same rule `future_labels` uses: the car is inside `overtake_range` right
@@ -2213,8 +2233,55 @@ class F1VecEnv:
             raise RuntimeError("opponent_future needs a race (race_size > 1)")
         st = self.sim.state if state is None else state
         fut = self.car_future(times, model=model, state=st)                 # (B, K, 2)
+        # tracker.reset clears controls but last_pred can still belong to the
+        # previous episode (especially with opponent tokens disabled). Until a
+        # new control step has produced a prediction, use the measured velocity.
+        steps = getattr(self, "ep_step", None)
+        fresh = torch.zeros(st.shape[0], dtype=torch.bool, device=st.device) if steps is None else steps == 0
+        t = torch.as_tensor(times, dtype=st.dtype, device=self.device).reshape(-1)
+        c, sn = st[:, 2].cos(), st[:, 2].sin()
+        velocity = torch.stack((st[:, 3] * c - st[:, 4] * sn, st[:, 3] * sn + st[:, 4] * c), -1)
+        fallback = st[:, None, :2] + velocity[:, None] * t[None, :, None]
+        fut = torch.where(fresh[:, None, None], fallback, fut)
         d = (st[o][:, :, :2] - st[:, None, :2]).norm(dim=2)                 # (B, C)
-        return fut[o], d < self.ecfg.overtake_range
+        present = d < self.ecfg.overtake_range
+        if not return_yaw:
+            return fut[o], present
+        # Body orientation, not atan2(0, 0) for a stopped car. The raceline walk has
+        # position only: estimate its moving tangent and retain the measured slip
+        # angle while rejoining. Tracker branches use their actual yaw samples on
+        # the same latency clock as _tracker_future.
+        t = torch.as_tensor(times, dtype=st.dtype, device=self.device).reshape(-1)
+        mode = self.ecfg.opp_future_model if model is None else model
+        yaw = st[:, 2:3].expand(-1, t.numel()).clone()
+        if mode != "constv" and t.numel() > 1:
+            step = fut[:, 1:] - fut[:, :-1]
+            step = torch.cat((step[:, :1], step), 1)
+            slip = torch.atan2(st[:, 4], st[:, 3].clamp_min(1e-6))
+            tangent = torch.atan2(step[..., 1], step[..., 0]) - slip[:, None]
+            moving = (step.norm(dim=-1) > 1e-5) & (t > 0)[None]
+            # A car that stops later retains its last predicted body heading,
+            # rather than snapping back to its heading at the query origin.
+            samples = torch.cat((st[:, 2:3], tangent), 1)
+            indices = torch.arange(1, t.numel() + 1, device=self.device)[None].expand_as(yaw)
+            last_moving = torch.where(moving, indices, torch.zeros_like(indices)).cummax(1).values
+            yaw = samples.gather(1, last_moving)
+        if mode != "constv" and self.tracker is not None and self.tracker.last_pred is not None and self._plan_pose is not None:
+            z = self.tracker.last_pred
+            # Interpolate sin/cos to avoid wrapping across +/- pi.
+            angle = self._plan_pose[:, 2:3] + z[:, :, 2]
+            grid = self._pred_grid_start() + torch.arange(z.shape[1], device=self.device, dtype=t.dtype) * self.tracker.spec.dt
+            unit = _interp_path(torch.stack((angle.cos(), angle.sin()), -1), grid, t)
+            predicted = torch.atan2(unit[..., 1], unit[..., 0])
+            use = (~self.teacher_driven)[:, None].expand_as(yaw)
+            if mode == "pred":
+                use = torch.ones_like(use)
+            elif mode == "hybrid":
+                use = (torch.ones_like(use) if self.teacher is None else
+                       (t <= grid[-1])[None].expand_as(yaw))
+            yaw = torch.where(use, predicted, yaw)
+        yaw = torch.where((t == 0)[None] | fresh[:, None], st[:, 2:3], yaw)
+        return fut[o], present, yaw[o]
 
     # ------------------------------------------------------------------ privileged opponent tokens
     def _capture_plan(self, pose_before: torch.Tensor) -> None:
@@ -2448,11 +2515,33 @@ class F1VecEnv:
         """(steer [rad], speed [m/s]) -> policy action in [-1, 1] (direct action space)."""
         return torch.stack([cmd[:, 0] / self.s_max, cmd[:, 1] / self.ecfg.v_max_policy * 2 - 1], 1).clamp(-1, 1)
 
-    def teacher_label(self, teacher) -> torch.Tensor:
+    def _tracker_plan_speed(self) -> torch.Tensor:
+        """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""
+        return self.last_result.odom[:, 3] if self.last_result is not None else self.sim.state[:, 3]
+
+    def teacher_label(self, teacher, offset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The teacher's action in this env's action space: (steer, speed) or its local plan."""
         if self.act_dim == 2:
-            return self.teacher_action_to_normalized(teacher(self.sim.state, self.sim.P, self.sim.tid))
-        return teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy, self.tracker.spec)
+            kwargs = {} if offset is None else {"offset": offset}
+            return self.teacher_action_to_normalized(teacher(self.sim.state, self.sim.P, self.sim.tid, **kwargs))
+        from .teacher import RacelineTeacher
+        if isinstance(teacher, RacelineTeacher):
+            # A global raceline alone does not certify what this tracker will
+            # execute. Keep its line, but check achievable pace/braking choices
+            # through the same preview and geometry as the interactive teacher.
+            from .interactive_teacher import InteractiveTeacher
+            guards = getattr(self, '_raceline_teacher_guards', None)
+            if guards is None:
+                guards = self._raceline_teacher_guards = {}
+            guard = guards.get(teacher)
+            if guard is None:
+                guard = guards[teacher] = InteractiveTeacher(teacher, self, offsets=(0.0,), cand_iters=6, lane_clamp=True)
+            action = guard.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
+                                       self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
+            teacher.last_label_valid = guard.last_label_valid
+            return action
+        return teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
+                                   self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
 
     def set_ideal_lap(self, racelines) -> None:
         """Fastest plausible time per track and per sector, from the raceline speed profile: sum(ds / v).
@@ -2469,7 +2558,7 @@ class F1VecEnv:
         S = self.sector_lim.shape[1]
         for i, rl in enumerate(racelines[:self.sim.track.T]):
             ds = np.linalg.norm(np.roll(rl.xy, -1, 0) - rl.xy, axis=1)
-            dt = ds / np.maximum(rl.v, 0.3)
+            dt = 2.0 * ds / np.maximum(rl.v + np.roll(rl.v, -1), 1e-9)
             sec = np.minimum((np.arange(len(dt)) * S) // len(dt), S - 1)
             self.ideal_lap[i] = float(dt.sum())
             self.sector_lim[i] = torch.as_tensor(np.bincount(sec, weights=dt, minlength=S)[:S],

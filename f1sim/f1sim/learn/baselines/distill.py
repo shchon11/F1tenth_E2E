@@ -273,8 +273,7 @@ def collect(env, teacher, driver, steps: int, beta: float, buf: DemoBuffer, *, v
         gap = nearest_gap(env, rows)
         # The teacher's plan for every car. The opponents' own actions are overwritten inside
         # `step` by `_opponent_actions`; this only has to be right for the learner rows.
-        plan = teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid, env.ecfg.v_max_policy,
-                                   env.tracker.spec)
+        plan = env.teacher_label(teacher)
         if driver is not None and beta < 1.0:
             cmd = driver.command(driver.adapt(scan_m), speed if driver.needs_speed else None)
             # Per row, per iteration: which car the student drives is redrawn every step in DAgger's

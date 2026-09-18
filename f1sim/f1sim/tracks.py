@@ -30,6 +30,7 @@ that discovers racetracks, gym maps and editor scenes.
 from __future__ import annotations
 
 import glob
+import math
 import os
 import random
 import re
@@ -71,6 +72,33 @@ BARE = "bare"
 
 #: What the 장애물 control offers, in list order: 기본, 없음, then the families.
 OBSTACLES: Tuple[str, ...] = ("", BARE) + OBSTACLE_FAMILIES
+# Fresh controls choose placement, never a separate rendering/physics category.
+ASSET_OBSTACLES = (BARE, "", "edge", "line", "hard")
+ASSET_PLACEMENT_LABEL = {BARE: "없음", "": "기본", "edge": "랜덤 · 낮음",
+                         "line": "랜덤 · 중간", "hard": "랜덤 · 높음"}
+ASSET_PLACEMENT_HINT = {BARE: "배치 장애물을 모두 제거합니다.",
+    "": "맵에 작성자가 배치한 장애물을 그대로 사용합니다.",
+    "edge": "기존 에셋의 종류와 크기를 무작위로 골라 드물게 배치합니다.",
+    "line": "기존 에셋의 종류와 크기를 무작위로 골라 가장자리와 주행선에 배치합니다.",
+    "hard": "기존 극단 배치처럼 줄·사선·시케인·정점·군집·작은 물체를 조밀하게 배치합니다."}
+
+def asset_scenario(spec):
+    sc = _parse_spec(spec) if is_spec(spec) and "!assets=" not in spec else parse(spec)
+    return replace(sc, obstacle={"props": "edge", "pinch": "line"}.get(sc.obstacle, sc.obstacle),
+                   asset="mixed", scale=1.0).short() if sc.obstacle else spec
+
+ASSET_LABELS = {"mixed": "모든 에셋 혼합", "cardboard_box": "골판지 상자",
+                "wooden_crate": "나무 상자", "steel_drum": "드럼통",
+                "crate_stack_low": "낮은 상자 더미", "barrier_block": "방호 블록",
+                "marker_post": "표지 기둥"}
+
+def asset_options():
+    from .props import STYLES
+    return ("mixed",) + tuple(STYLES)
+
+def asset_obstacle_options(track_id):
+    return ("", BARE) if get(track_id).family == "gym" else ASSET_OBSTACLES
+
 OBSTACLE_LABEL = {"": "기본", BARE: "없음", "edge": "가장자리", "line": "주행선 위", "pinch": "좁아짐",
                   "props": "입체", "hard": "극단 (직접 만든 맵처럼)"}
 OBSTACLE_HINT = {
@@ -407,6 +435,8 @@ class Scenario:
     #: (another branch is training with `+hard<seed>`) is still that map, and a list of them should
     #: group and count as that map rather than as one new map per entry.
     raw: str = ""
+    asset: str = ""  # empty preserves historical raster scenario interpretation
+    scale: float = 1.0
 
     # -- the option axes
     @property
@@ -460,7 +490,10 @@ class Scenario:
             s += "#" + self.choice
             if self.obstacle:                      # `bare` alone has nothing to place, so no seed
                 s += f":{'*' if self.seed is None else self.seed}"
-        return s
+        return s + self.asset_suffix()
+
+    def asset_suffix(self):
+        return f"!assets={self.asset}:{self.scale:g}" if self.asset else ""
 
     def legacy(self) -> str:
         """The loader's grammar: `real:blackbox2022_1+rlobs44~mir~rev`. Suffix order is the
@@ -482,7 +515,7 @@ class Scenario:
             s += "~mir"
         if self.reverse:
             s += "~rev"
-        return s
+        return s + self.asset_suffix()
 
     def display(self) -> str:
         """One human line: `Blackbox 2022 #1 · 역방향 · 주행선 위 (시드 44)`."""
@@ -498,14 +531,22 @@ class Scenario:
             parts.append(OBSTACLE_LABEL[BARE])
         if self.obstacle:
             seed = "무작위" if self.seed is None else f"시드 {self.seed}"
-            parts.append(f"{OBSTACLE_LABEL[self.obstacle]} ({seed})")
+            label = ASSET_PLACEMENT_LABEL.get(self.obstacle, OBSTACLE_LABEL[self.obstacle]) if self.asset else OBSTACLE_LABEL[self.obstacle]
+            parts.append(f"{label} ({seed})")
+        if self.asset:
+            parts.append("에셋·크기 자동 무작위" if self.asset == "mixed" and self.scale == 1 else
+                         f"{ASSET_LABELS.get(self.asset, self.asset)} · 크기 배율 {self.scale:g}×")
         return " · ".join(parts)
 
     def validate(self) -> "Scenario":
         """Raise when the track cannot carry the obstacle family asked for."""
         if self.raw or not self.obstacle:
             return self
-        allowed = self.entry.obstacle_options()
+        if self.asset and self.asset not in asset_options():
+            raise TrackError(f"알 수 없는 장애물 에셋: {self.asset}")
+        if not math.isfinite(self.scale) or self.scale <= 0:
+            raise TrackError("장애물 크기는 양수여야 합니다")
+        allowed = asset_obstacle_options(self.track) + ("props", "pinch") if self.asset else self.entry.obstacle_options()
         if self.obstacle not in allowed:
             raise TrackError(
                 f"{self.entry.display} ({self.track}) 은 '{OBSTACLE_LABEL[self.obstacle]}' 장애물을 "
@@ -527,6 +568,19 @@ def parse(spec: str) -> Scenario:
     s = (spec or "").strip()
     if not s:
         raise TrackError("빈 트랙 이름입니다.")
+    if "!assets=" in s:
+        base, config = s.rsplit("!assets=", 1)
+        try:
+            asset, scale = config.split(":")
+            scale = float(scale)
+        except (ValueError, TypeError) as exc:
+            raise TrackError("에셋 설정 형식은 !assets=<에셋>:<크기> 입니다") from exc
+        if asset not in asset_options() or not math.isfinite(scale) or scale <= 0:
+            raise TrackError("등록된 에셋과 양수 크기를 지정하세요")
+        sc = _parse_spec(base) if is_spec(base) else _parse_legacy(base)
+        if sc.raw:
+            raise TrackError("에셋 설정에는 등록된 트랙이 필요합니다")
+        return replace(sc, asset=asset, scale=scale).validate()
     if is_spec(s):
         return _parse_spec(s).validate()
     return _parse_legacy(s)

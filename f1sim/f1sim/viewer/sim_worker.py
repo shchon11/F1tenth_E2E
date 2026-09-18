@@ -622,7 +622,7 @@ class SimWorker:
         from ..learn import common
         from ..learn.watch import checkpoint_speed_cap, describe_checkpoint_line, latest_run
         ckpt = resolve_checkpoint(run, common.RUNS_DIR, latest_run())
-        extra = (torch.load(ckpt, map_location="cpu", weights_only=False) or {}).get("extra", {})
+        extra = (torch.load(ckpt, map_location="cpu", weights_only=True) or {}).get("extra", {})
         metrics = extra.get("metrics") or {}
         bits = []
         if "collision_rate" in metrics:
@@ -645,7 +645,7 @@ class SimWorker:
     # ================================================================ session build
     def load_track(self, name: str):
         from ..learn import common
-        if name.startswith("scene:"):
+        if name.startswith(("scene:", "scene/")):
             # An editor scene is edited and driven again inside one worker lifetime; a cached
             # track would be the scene as it was the first time. `maps.load` keys its own cache
             # on the files' mtimes, so a reload here is cheap when nothing changed.
@@ -688,7 +688,7 @@ class SimWorker:
             # user is least surprised by. `latest_run()` keeps meaning "newest" for `describe` and
             # for the training side. Every skipped run is reported, so this is a visible choice
             # rather than a silent substitution.
-            chosen, skipped = latest_compatible_run()
+            chosen, skipped = latest_compatible_run(allowed_controller=cfg.controller)
             for name, why in skipped:
                 self.say(P.MSG_LOG, gen=gen,
                          text=f"'{name}' 건너뜀: {why} — 이 뷰어는 기본 컨트롤러로 실행합니다")
@@ -720,31 +720,32 @@ class SimWorker:
         # The plan-controller arm this session installs. A checkpoint trained under a non-legacy
         # arm may only run under that same arm; legacy-trained weights may run under any arm (the
         # benchmark's declared cross-runtime case, and the configuration that scored best).
-        arm = str(getattr(cfg, "controller", "legacy") or "legacy")
+        arm = str(getattr(cfg, "controller", "auto") or "auto")
         if arm not in viewer_arms():
             raise StartConfigError(f"플랜 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 "
                                    f"({' / '.join(viewer_arms())}).")
-        if arm != "legacy" and int(cfg.cars_per_race) > 1:
+        if arm not in ("legacy", "auto") and int(cfg.cars_per_race) > 1:
             raise StartConfigError(f"플랜 제어기 '{arm}' 은 레이스당 차량 수 1에서만 지원합니다 "
                                    f"(학습·벤치마크와 같은 조건). 레이스당 차량 수를 1로 두거나 legacy 를 고르세요.")
         estimator_path = ""
-        if arm.startswith("estimated"):
-            from .console.protocol import SessionConfig as _SC
-            estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
-            if not estimator_path or not os.path.isfile(estimator_path):
-                raise StartConfigError("estimated 제어기는 노면 추정기 .pt 가 필요합니다. 고급 설정의 '노면 추정기' 에 "
-                                       "경로를 넣거나 ~/f1sim_runs/_estimators/estimator_seed401.pt 를 두세요.")
         # Peek the arm the checkpoint was trained under before loading, so a mismatch is a start
         # message that names the setting to change rather than the loader's refusal.
         from ..learn.model import controller_arm_of
-        try:
-            recorded = controller_arm_of(torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=True))
-        except Exception:
-            recorded = "legacy"                  # the loader below will say what is wrong with it
+        from ..learn.grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
+        policy_checkpoint = torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=True)
+        recorded = controller_arm_of(policy_checkpoint)
         if recorded != "legacy" and recorded != arm:
             raise StartConfigError(f"{os.path.basename(ckpt_path)}: '{recorded}' 제어기로 학습된 체크포인트입니다. "
-                                   f"고급 설정의 플랜 제어기를 '{recorded}' 로 맞추세요 (현재 '{arm}').")
+                                   "자동 주행에는 기본 정책 또는 자동 제어로 학습된 체크포인트를 선택하세요.")
+        controller_record = validate_runtime_checkpoint(policy_checkpoint, arm)
+        if autoselect:
+            refusal = automatic_selection_refusal(controller_record)
+            if refusal is not None:
+                raise StartConfigError(refusal)
         model, extra = load_checkpoint(ckpt_path, device, allow_controller=(arm != "legacy"))
+        if recorded == "auto":
+            from ..learn.policy_adaptation import require_exact_actor
+            require_exact_actor(model, policy_checkpoint)
         model.eval()
         intro = Introspector(model)
         act_dim = model.meta.get("act_dim", 2)
@@ -762,6 +763,14 @@ class SimWorker:
                      text=f"플랜 제어기 '{arm}' 은 직접 행동(direct) 체크포인트에 적용되지 않아 legacy 로 실행합니다")
             arm = "legacy"
             estimator_path = ""
+        embedded = controller_record if recorded == "auto" else None
+        if (arm == "auto" or arm.startswith("estimated")) and embedded is None:
+            from .console.protocol import SessionConfig as _SC
+            estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
+            if not estimator_path or not os.path.isfile(estimator_path):
+                raise StartConfigError("자동 노면 추정 모델을 찾지 못했습니다. "
+                                       "F1SIM_GRIP_ESTIMATOR 또는 "
+                                       "~/f1sim_runs/_estimators/estimator_seed401.pt 를 확인하세요.")
         speed_cap = float(cfg.speed_cap or checkpoint_speed_cap(extra, ckpt_path))
         self._check_cancel(gen)
 
@@ -909,9 +918,12 @@ class SimWorker:
             from ..learn.grip_runtime import ControllerRuntime
             self.say(P.MSG_LOG, gen=gen, text=f"플랜 제어기 설치: {arm}"
                      + (f" | 추정기 {os.path.basename(estimator_path)}" if estimator_path else ""))
-            rt = ControllerRuntime(env, arm, estimator_path or None, device=device)
+            self.stage(gen, "controller", "자동 제어 준비")
+            rt = ControllerRuntime(env, arm, estimator_path or None, device=device,
+                                   checkpoint_meta=embedded)
             try:
                 rt.install(graph_rt=session.get("fastpath"), adopt=False)   # adopted on the sim thread
+                validate_runtime_checkpoint(policy_checkpoint, rt)
                 rt.begin(session["obs"])
             except BaseException:
                 rt.release()
@@ -919,6 +931,10 @@ class SimWorker:
             session["controller"] = rt
             session["controller_arm"] = arm
             session["estimator_path"] = estimator_path
+        if session.get("fastpath") is not None:
+            # After the controller: the teacher's collision preview reads whether the tracker has
+            # hooks installed, and a graph captured before them would bake in the other branch.
+            self._prepare_teacher_graph(session, gen)
         ros2 = str(getattr(cfg, "ros2", "off") or "off")
         if ros2 != "off":
             # After everything that can refuse the session: a node that came up for a session
@@ -1051,6 +1067,50 @@ class SimWorker:
             raise
         session["fastpath"] = fp
         session["fastpath_ms"] = round((time.perf_counter() - t0) * 1e3, 1)
+
+    def _prepare_teacher_graph(self, session: dict, gen: int) -> None:
+        """Capture the teacher-driven opponents' call as one CUDA graph (`TeacherGraph`).
+
+        Same rules as `_prepare_fastpath`: control thread, during the build, eligibility first. Not
+        eligible or not capturable leaves the teacher eager and says why; with three cars it is
+        most of the step, so a silent eager teacher would read as "the viewer is slow again".
+        """
+        from .graph_fastpath import NotCapturable, TeacherGraph, teacher_eligible
+        env = session["env"]
+        if int(getattr(env, "M", 1)) <= 1:
+            return
+        ok, why = teacher_eligible(env)
+        if not ok:
+            self.say(P.MSG_LOG, gen=gen, text=f"상대차 teacher 는 eager 로 둡니다: {why}")
+            return
+        # The call's own arguments, from a real step -- the follow mask and cap are tensors or not
+        # depending on the race, and guessing would capture against the wrong signature.
+        rec: dict = {}
+        eager = env._teacher_normalized
+
+        def spy(teacher, *a):
+            if teacher is env.teacher:
+                rec["args"] = a
+            return eager(teacher, *a)
+
+        env._teacher_normalized = spy
+        try:
+            self._step_once(session)
+        finally:
+            env.__dict__.pop("_teacher_normalized", None)
+        if "args" not in rec:
+            self.say(P.MSG_LOG, gen=gen, text="상대차 teacher 호출을 관측하지 못해 eager 로 둡니다.")
+            return
+        self.stage(gen, "graph", "상대차 teacher")
+        t0 = time.perf_counter()
+        try:
+            tg = TeacherGraph(env, rec["args"], log=lambda t: self.say(P.MSG_LOG, gen=gen, text=t))
+        except NotCapturable as exc:
+            self.say(P.MSG_LOG, gen=gen, text=f"상대차 teacher 는 eager 로 둡니다: {exc}")
+            return
+        tg.install()
+        session["teacher_graph"] = tg
+        session["teacher_graph_ms"] = round((time.perf_counter() - t0) * 1e3, 1)
 
     # ---------------------------------------------------------------- geometry
     def build_geometry(self, track, raceline=None) -> dict:
@@ -1215,11 +1275,22 @@ class SimWorker:
         if mt == session["mtime"]:
             return
         try:
+            import torch
             from ..learn import common
             from ..learn.model import load_checkpoint
             from ..learn.watch import Introspector, actor_runner, describe_checkpoint_line
             model, extra = load_checkpoint(session["ckpt_path"], session["device"],
                                            allow_controller=session.get("controller") is not None)
+            from ..learn.grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
+            reload_checkpoint = torch.load(session["ckpt_path"], map_location="cpu", weights_only=True)
+            reload_record = validate_runtime_checkpoint(reload_checkpoint, session.get("controller") or "legacy")
+            if session.get("autoselect"):
+                refusal = automatic_selection_refusal(reload_record)
+                if refusal is not None:
+                    raise ValueError(refusal)
+            if reload_record.get("arm") == "auto":
+                from ..learn.policy_adaptation import require_exact_actor
+                require_exact_actor(model, reload_checkpoint)
             model.eval()
             env_spec = common.obs_spec(session["env"])
             # The environment is already built, so a newer checkpoint with different normalizers
@@ -1294,6 +1365,13 @@ class SimWorker:
             if env.tracker.last_pred is not None:
                 plan_pred = env.tracker.last_pred[focus]
                 pieces.append(plan_pred.reshape(-1))
+        estimate = getattr(session.get("controller"), "last_estimate", None)
+        estimate_keys = ("used_mu", "q10", "q50", "q90", "warm", "finite")
+        if estimate:
+            estimate_keys += tuple(key for key in ("confidence", "has_evidence", "informative", "fault")
+                                   if key in estimate)
+            pieces.append(torch.stack([estimate[key].reshape(-1)[focus].float()
+                                       for key in estimate_keys]))
         flat = torch.cat(pieces).cpu().numpy()
 
         i = 0
@@ -1357,6 +1435,9 @@ class SimWorker:
         if imu_mean is not None:
             fr["imu"] = imu_mean.astype(np.float32)     # (6,) gyro xyz, accel xyz, mean of k_imu
             fr["imu_samples"] = k_imu
+        if estimate:
+            fr["grip_estimate"] = {key: float(value)
+                                   for key, value in zip(estimate_keys, flat[-len(estimate_keys):])}
         if sim.other_idx is not None:
             rivals = set(sim.other_idx[focus].tolist())
             fr["opponent"] = np.array([int(e) in rivals for e in ids], bool)
@@ -1510,6 +1591,9 @@ class SimWorker:
             ctrl = session.get("controller")
             if ctrl is not None:
                 ctrl.adopt()                       # the grip solver graph, same rule as above
+            tgraph = session.get("teacher_graph")
+            if tgraph is not None:
+                tgraph.adopt()                     # the opponent teacher's graph, same rule
             while self.alive and self.gen == gen and self.running:
                 # While a new session is being built, only `pause` is applied here: it is the one
                 # command that touches no tensor. Everything else waits, because the control
@@ -1916,6 +2000,10 @@ class SimWorker:
                     pin.release()
                 except Exception:
                     pass
+            tgraph = session.pop("teacher_graph", None)
+            if tgraph is not None:
+                tgraph.release()
+                del tgraph
             fastpath = session.pop("fastpath", None)
             if fastpath is not None:
                 fastpath.release()

@@ -134,6 +134,7 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
     erode_it = int(round(ERODE_M / res))
     placed: List[int] = []
     kinds: List[str] = []
+    accepted_boxes = []  # geometric recipe for asset-only consumers; does not alter legacy RNG/grids
     order = [patterns[j % len(patterns)] for j in range(n)]
     rng.shuffle(order)
 
@@ -242,8 +243,14 @@ def with_hard_obstacles(track: Track, seed: int = 0, n: Optional[int] = None,
             continue
         occ, tall = occ_try, tall_try
         placed.append(i); kinds.append(kind)
+        for along, v, sx, sy in boxes:
+            k_ = (i + int(round(along / ds))) % N
+            c = cl[k_] + nrm[k_] * v
+            accepted_boxes.append((float(c[0]), float(c[1]),
+                                   float(np.arctan2(tang[k_, 1], tang[k_, 0])), float(sx), float(sy)))
     t = Track.from_occupancy(occ, res, origin, cl, f"{track.name}_hard{seed}", duct=track.duct, tall=tall,
                              duct_height=track.duct_height)
     t.props = track.props
+    t.hard_boxes = tuple(accepted_boxes)
     t.hard_patterns = list(zip(placed, kinds))            # for tests and pictures
     return t

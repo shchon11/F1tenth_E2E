@@ -117,6 +117,7 @@ def _with_auto_centerline(track: Track, min_clearance: float, seed_xy=None) -> T
 
 MODIFIERS = ("~rev", "~mir")
 _BASE_CACHE = {}
+_ASSET_CACHE = {}
 
 
 def load(name: str, **kw) -> Track:
@@ -128,6 +129,22 @@ def load(name: str, **kw) -> Track:
     One line rather than a second loader, so there is exactly one place that knows how a map is
     built and exactly one place that knows how a scenario is spelled.
     """
+    if "!assets=" in name:
+        from dataclasses import replace
+        from .asset_obstacles import with_asset_obstacles
+        sc = tracks.parse(name)
+        if sc.obstacle and sc.seed is None:
+            raise ValueError("asset obstacle seed must be resolved before loading")
+        base = replace(sc, obstacle="", seed=None, asset="", scale=1.0, reverse=False, mirror=False)
+        base_track = load(base.legacy(), **kw)
+        key = (id(base_track), sc.obstacle, sc.seed, sc.asset, sc.scale)
+        if key not in _ASSET_CACHE:
+            _ASSET_CACHE[key] = (base_track, with_asset_obstacles(base_track, sc.obstacle, sc.seed or 0,
+                                                               asset=sc.asset, scale=sc.scale))
+        t = _ASSET_CACHE[key][1]
+        if sc.mirror:
+            t = t.mirrored()
+        return t.reversed() if sc.reverse else t
     if tracks.is_spec(name):
         name = tracks.resolve(name)
     mods = []

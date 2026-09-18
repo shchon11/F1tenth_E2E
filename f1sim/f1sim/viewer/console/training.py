@@ -17,19 +17,18 @@ reads files:
   checkpoint list in the middle, jobs on the right. "주행 화면에서 보기" hands a checkpoint to the
   driving page.
 
-The presets encode what the 2026-09-12 experiments established: finetune from the frozen original,
-restore Adam, keep the learning rate low, and **train under the legacy controller** -- a policy
-trained with the grip clamp in the loop learned to lean on it and lost avoidance and overtaking.
+Training setup is schema-backed for PPO, DAgger and observer workflows. Historical recipes are
+reproduction starting points; automatic-control adaptation has its own explicit stage contract.
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
 import signal
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -39,14 +38,12 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from . import catalog, theme
 from ... import opponent_slots as osl
 from ... import tracks
-from .opponent_table import OpponentSlotTable
 from .theme import C, SP
-from .widgets import Card, Collapsible, FieldRow, KeyValueList, MetricTile, hline, label
+from .widgets import Card, Collapsible, FieldRow, KeyValueList, MetricTile, label
 
 JOBS_DIRNAME = "_console_jobs"
 REPO_F1SIM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 FROZEN_ORIGINAL = os.path.join(catalog.RUNS_DIR, "_baselines", "frozen_original_48cc698f.pt")
-DEFAULT_ESTIMATOR = os.path.join(catalog.RUNS_DIR, "_estimators", "estimator_seed401.pt")
 
 # ================================================================ recipes
 COMMON_FLAGS = (
@@ -84,10 +81,10 @@ class Recipe:
 
 
 RECIPES: List[Recipe] = [
-    Recipe("origrecipe", "원본 레이스 레시피 (권장)",
-           "원본 정책이 학습된 조건 그대로: 149개 맵 변형(역방향·거울·장애물 포함), 2대 레이스, 혼합 상대차, "
-           "보조 head. legacy 제어기로 학습해 배포 때만 클램프를 붙입니다. 2026-09-12 벤치마크에서 "
-           "원본+추정 제어기와 동급 이상이었던 유일한 재학습 레시피입니다.",
+    Recipe("origrecipe", "기본 레이스 레시피",
+           "149개 맵 변형(역방향·거울·에셋 장애물 포함), 2대 레이스, 혼합 상대차, "
+           "보조 head와 legacy 제어기를 사용합니다. 장애물은 기존 에셋의 종류와 크기를 자동으로 뽑습니다. "
+           "자동 제어기 학습에는 별도 작업 모드를 선택하세요.",
            tracks="train", race_size=2, opponent="mixed", aux_grip=1.0, aux_opp=1.0,
            race_flags="--mixed-teacher-frac 0.5 --opp-speed 0.5 1.0 --overtake-bonus 1.0 "
                       "--car-proximity-penalty 0.8 --car-safe-gap 0.9 --car-contact-penalty 5.0"),
@@ -111,6 +108,7 @@ class Job:
     run_dir: str
     stop_requested: float = 0.0
     external: bool = False          # found in the process table, not started by this console
+    report_path: str = ""           # exact --out for observer FINAL, never just its parent
 
     @property
     def alive(self) -> bool:
@@ -131,26 +129,47 @@ class JobManager:
         self._procs: Dict[str, subprocess.Popen] = {}
 
     def _record(self, name: str) -> str:
-        return os.path.join(self.jobs_dir, f"{name}.json")
+        return os.path.join(self.jobs_dir, f"{self._record_name(name)}.json")
+
+    @staticmethod
+    def _record_name(name: str) -> str:
+        if os.path.basename(name) == name:
+            return name
+        return os.path.basename(name.rstrip(os.sep)) + "_" + hashlib.sha256(name.encode()).hexdigest()[:12]
 
     def launch(self, name: str, argv: List[str], device: str = "cuda") -> Job:
         os.makedirs(self.jobs_dir, exist_ok=True)
-        run_dir = os.path.join(self.runs_dir, name)
-        os.makedirs(run_dir, exist_ok=True)
-        log = os.path.join(run_dir, "console-train.log")
+        name = job_identity(argv, name)
+        if not name or name in (".", "..") or (os.path.basename(name) != name and not os.path.isabs(name)):
+            raise ValueError("작업 이름 또는 절대 출력 경로를 지정하세요.")
+        run_dir = job_output_dir(argv, self.runs_dir, name)
+        if any(j.alive and (j.name == name or os.path.realpath(j.run_dir) == os.path.realpath(run_dir))
+               for j in self.list_jobs()):
+            raise ValueError("같은 이름 또는 출력 폴더에서 실행 중인 작업이 있습니다.")
+        # Observer fit/pilot require an empty output directory. A launcher log inside it would
+        # make a valid job fail before its first epoch; logs live alongside the job records.
+        observer = any(m in argv for m in ("f1sim.learn.policy_grip_data", "f1sim.learn.adaptive_grip_train"))
+        if observer:
+            log = os.path.join(self.jobs_dir, f"{self._record_name(name)}.log")
+        else:
+            os.makedirs(run_dir, exist_ok=True)
+            log = os.path.join(run_dir, "console-train.log")
         env = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
                    PYTHONUNBUFFERED="1")
-        env.pop("CUDA_VISIBLE_DEVICES", None) if device == "cuda" else env.update(CUDA_VISIBLE_DEVICES="")
+        env.pop("CUDA_VISIBLE_DEVICES", None) if device.startswith("cuda") else env.update(CUDA_VISIBLE_DEVICES="")
         fh = open(log, "ab")
         fh.write(("$ " + " ".join(shlex.quote(a) for a in argv) + "\n").encode())
-        proc = subprocess.Popen(argv, cwd=REPO_F1SIM, env=env, stdout=fh, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-        fh.close()
-        job = Job(name=name, pid=proc.pid, argv=list(argv), log=log, started=time.time(), run_dir=run_dir)
+        try:
+            proc = subprocess.Popen(argv, cwd=REPO_F1SIM, env=env, stdout=fh, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+        finally:
+            fh.close()
+        job = Job(name=name, pid=proc.pid, argv=list(argv), log=log, started=time.time(), run_dir=run_dir,
+                  report_path=final_report_path(argv))
         self._procs[name] = proc
         with open(self._record(name), "w") as f:
             json.dump({"name": name, "pid": job.pid, "argv": job.argv, "log": log, "started": job.started,
-                       "run_dir": run_dir}, f, indent=1)
+                       "run_dir": run_dir, "report_path": job.report_path}, f, indent=1)
         return job
 
     def list_jobs(self) -> List[Job]:
@@ -158,7 +177,7 @@ class JobManager:
         try:
             names = sorted(os.listdir(self.jobs_dir))
         except OSError:
-            return out
+            names = []
         for fn in names:
             if not fn.endswith(".json"):
                 continue
@@ -166,7 +185,9 @@ class JobManager:
                 d = json.load(open(os.path.join(self.jobs_dir, fn)))
                 out.append(Job(name=d["name"], pid=int(d["pid"]), argv=list(d.get("argv") or []),
                                log=d.get("log", ""), started=float(d.get("started", 0.0)),
-                               run_dir=d.get("run_dir", ""), stop_requested=float(d.get("stop_requested", 0.0))))
+                               run_dir=final_report_path(d.get("argv") or []) or d.get("run_dir", ""),
+                               stop_requested=float(d.get("stop_requested", 0.0)),
+                               report_path=d.get("report_path") or final_report_path(d.get("argv") or [])))
             except Exception:
                 continue
         # reap children we started so `alive` reflects the truth for them
@@ -221,8 +242,37 @@ class JobManager:
             pass
 
 
+def final_report_path(argv: Sequence[str]) -> str:
+    if "f1sim.learn.policy_grip_data" in argv and "final" in argv:
+        path = argv_flags(argv).get("out", "")
+        return os.path.abspath(os.path.expanduser(path)) if path else ""
+    return ""
+
+
+def job_identity(argv: Sequence[str], fallback: str) -> str:
+    if any(module in argv for module in ("f1sim.learn.policy_grip_data", "f1sim.learn.adaptive_grip_train")):
+        path = argv_flags(argv).get("out", "")
+        if path:
+            return os.path.abspath(os.path.expanduser(path))
+    return fallback
+
+
+def job_display_name(name: str) -> str:
+    return (f"{os.path.basename(name)} · {os.path.basename(os.path.dirname(name))}"
+            if os.path.isabs(name) else name)
+
+
+def job_output_dir(argv: Sequence[str], runs_dir: str, name: str) -> str:
+    """Monitor identity: a run directory, or the exact path of a standalone FINAL report."""
+    flags = argv_flags(argv)
+    if "--out" in argv:
+        path = os.path.abspath(os.path.expanduser(flags.get("out", "")))
+        return path
+    return os.path.join(runs_dir, name)
+
+
 def discover_external_jobs(runs_dir: str = catalog.RUNS_DIR) -> List[Job]:
-    """PPO trainers in the process table, whoever started them. Linux /proc only; empty elsewhere."""
+    """Supported trainers in the process table. Linux /proc only; empty elsewhere."""
     out: List[Job] = []
     try:
         pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
@@ -237,16 +287,20 @@ def discover_external_jobs(runs_dir: str = catalog.RUNS_DIR) -> List[Job]:
                 argv = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
         except OSError:
             continue
-        if not argv or "f1sim.learn.ppo" not in argv or not os.path.basename(argv[0]).startswith("python"):
+        modules = ("f1sim.learn.ppo", "f1sim.learn.dagger", "f1sim.learn.policy_grip_data", "f1sim.learn.adaptive_grip_train")
+        if not argv or not any(m in argv for m in modules) or not os.path.basename(argv[0]).startswith("python"):
             continue
         name = argv[argv.index("--name") + 1] if "--name" in argv and argv.index("--name") + 1 < len(argv) else f"pid{pid}"
-        run_dir = os.path.join(runs_dir, name)
+        if name.startswith("pid") and "--out" in argv:
+            name = os.path.splitext(os.path.basename(argv_flags(argv).get("out", "")))[0] or name
+        name = job_identity(argv, name)
+        run_dir = job_output_dir(argv, runs_dir, name)
         try:
             started = os.stat(f"/proc/{pid}").st_ctime
         except OSError:
             started = time.time()
         out.append(Job(name=name, pid=pid, argv=argv, log=run_log_path(run_dir) or "", started=started,
-                       run_dir=run_dir, external=True))
+                       run_dir=run_dir, external=True, report_path=final_report_path(argv)))
     return out
 
 
@@ -286,6 +340,8 @@ SOURCE_LABELS = {
     "console": "console-train.log",
     "wandb": "wandb output.log",
     "stdout": "실행 로그",
+    "manifest": "수집 manifest.json",
+    "report": "최종 평가 보고서",
 }
 
 #: One number as a trainer prints it. `nan` and `inf` are values a metric really takes -- `gate inf`
@@ -303,6 +359,7 @@ _PPO_STEPS = re.compile(rf"\bsteps\s+({_NUM})M")
 _PPO_SPS = re.compile(rf"({_NUM})\s+steps/s")
 _PPO_TK = re.compile(rf"\(({_NUM})\s+tk\)")
 _DAGGER_LINE = re.compile(r"^\s*iter\s+(\d+)\s*:")
+_GRIP_EPOCH = re.compile(rf"\bepoch\s+(\d+)\s*/\s*(\d+)\s*:?\s*loss\s*=\s*({_NUM})")
 
 #: `key value` anywhere in a line. The lookbehind keeps `gen:control:1402` from reading `control`
 #: as a key, and the lookahead keeps `upd 12/64` from reading `12` as the value of `upd`.
@@ -527,10 +584,16 @@ def parse_progress(text: str, tail: int = 60) -> Progress:
             _parse_ppo_line(ln, b, p)
         elif _DAGGER_LINE.match(ln):
             _parse_dagger_line(ln, b, p)
+        elif _GRIP_EPOCH.search(ln):
+            match = _GRIP_EPOCH.search(ln)
+            b.point()
+            p.kind = "grip"
+            p.update, p.n_updates = int(match.group(1)), int(match.group(2))
+            b.set("loss", match.group(3))
         elif "Traceback" in ln or ln.startswith("SystemExit") or "Error:" in ln and "wandb" not in ln:
             p.error = ln.strip()[:200]
     p.series = b.finish()
-    if p.n_updates and p.update >= p.n_updates:
+    if p.n_updates and p.update >= p.n_updates and p.kind != "grip":
         p.finished = True
     p.lines = [ln for ln in lines if not ln.startswith("wandb:")][-tail:]
     return p
@@ -569,7 +632,24 @@ def job_stdout_log(run_dir: str, runs_dir: str = "") -> Optional[str]:
         with open(rec) as f:
             path = json.load(f).get("log") or ""
     except (OSError, ValueError):
-        return None
+        path = ""
+    if not path:
+        # Observer output paths may be outside the runs root and need not match the job name.
+        try:
+            entries = os.scandir(os.path.join(runs_dir, JOBS_DIRNAME))
+            with entries:
+                for entry in entries:
+                    if entry.name.endswith(".json"):
+                        try:
+                            with open(entry.path) as source:
+                                record = json.load(source)
+                            if os.path.realpath(record.get("run_dir", "")) == os.path.realpath(run_dir):
+                                path = record.get("log", "")
+                                break
+                        except (OSError, ValueError):
+                            continue
+        except OSError:
+            pass
     return path if path and os.path.isfile(path) else None
 
 
@@ -671,6 +751,10 @@ def read_progress(run_dir: str, tail: int = 60, max_bytes: int = 4_000_000,
     `console-train.log` with thirty updates in it, so the ladder is walked until something has
     points rather than stopping at the first file that exists.
     """
+    if os.path.isfile(run_dir) and run_dir.endswith(".json"):
+        report = read_final_report(run_dir)
+        if report:
+            return report
     cands = progress_candidates(run_dir, runs_dir)
     first: Optional[Progress] = None
     chosen: Optional[Progress] = None
@@ -682,6 +766,20 @@ def read_progress(run_dir: str, tail: int = 60, max_bytes: int = 4_000_000,
             break
         first = first or p
     p = chosen or first or Progress()
+    if p.kind == "grip" and os.path.isfile(os.path.join(run_dir, "report.json")):
+        p.finished = True
+    if not p.n_points:
+        try:
+            with open(os.path.join(run_dir, "manifest.json")) as stream:
+                manifest = json.load(stream)
+            jobs = manifest["specification"]["jobs"]
+            completed = len(manifest["completed_jobs"])
+            p.kind, p.update, p.n_updates = "grip_collect", completed, len(jobs)
+            p.series = {"jobs": list(range(1, completed + 1))}
+            p.finished = bool(jobs) and completed == len(jobs)
+            p.source, p.source_kind = os.path.join(run_dir, "manifest.json"), "manifest"
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     if p.source_kind == "progress":
         # The JSON is the curve; the log box wants sentences. A text log beside it also carries the
         # traceback of a run that died, which `progress.jsonl` by its nature never will.
@@ -701,12 +799,26 @@ def read_progress(run_dir: str, tail: int = 60, max_bytes: int = 4_000_000,
     return p
 
 
+def read_final_report(path: str) -> Optional[Progress]:
+    try:
+        with open(path, encoding="utf-8") as source:
+            result = json.load(source)
+        if not isinstance(result, dict) or not isinstance(result.get("metrics"), dict):
+            return None
+        series = {key: [float(value)] for key, value in result["metrics"].items()
+                  if isinstance(value, (float, int)) and not isinstance(value, bool)}
+        return Progress(kind="grip_final", update=1, n_updates=1, finished=True, series=series,
+                        source=path, source_kind="report", lines=json.dumps(result, indent=2, ensure_ascii=False).splitlines())
+    except (OSError, ValueError):
+        return None
+
+
 def list_checkpoints(run_dir: str) -> List[Tuple[str, str, float]]:
     """(label, path, mtime) for every checkpoint in a run, newest last, update-sorted."""
     out = []
     try:
         for fn in os.listdir(run_dir):
-            if fn.startswith("ppo_") and fn.endswith(".pt"):
+            if (fn.startswith(("ppo_", "student_")) or fn == "candidate.pt") and fn.endswith(".pt"):
                 p = os.path.join(run_dir, fn)
                 out.append((fn, p, os.path.getmtime(p)))
     except OSError:
@@ -714,6 +826,8 @@ def list_checkpoints(run_dir: str) -> List[Tuple[str, str, float]]:
 
     def key(t):
         m = re.match(r"ppo_u(\d+)\.pt", t[0])
+        if not m:
+            m = re.match(r"student_it(\d+)\.pt", t[0])
         return (0, int(m.group(1))) if m else (1, {"ppo_latest.pt": 0, "ppo_final.pt": 1}.get(t[0], 2))
     return sorted(out, key=key)
 
@@ -1014,7 +1128,7 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
     events_text = f"{events} (10초당 {f.get('opp-event-rate', '?')}회)" if events else ""
     wb = _WANDB.search(log_text or "")
     lr, lr_end = f.get("lr", ""), f.get("lr-end", "")
-    return JobSummary(
+    summary = JobSummary(
         name=job.name, state=state, alive=alive, external=job.external, started=job.started,
         elapsed_s=max(0.0, now - job.started), eta_s=eta,
         progress=_progress_text(p),
@@ -1027,6 +1141,17 @@ def summarize_job(job: "Job", log_text: str = "", progress: Optional[Progress] =
         total_text=_fmt_steps(f.get("total", "")),
         wandb_url=wb.group(0) if wb else "",
         log=job.log, pid=job.pid)
+    if "f1sim.learn.policy_grip_data" in job.argv or "f1sim.learn.adaptive_grip_train" in job.argv:
+        task = next((v for v in ("collect", "fit", "final") if v in job.argv), "pilot")
+        summary.recipe = {"collect": "마찰 추정 · 주행 데이터 수집", "fit": "마찰 추정 · 데이터로 학습",
+                          "final": "마찰 추정 · 최종 평가", "pilot": "마찰 추정 · 제한된 파일럿"}[task]
+        summary.tracks_text = describe_tracks(f["tracks"]) if f.get("tracks") else ""
+        summary.race_text = ""
+        summary.controller = f.get("controller", "")
+        summary.lr_text = f.get("learning-rate", "")
+        summary.total_text = ""
+        summary.init = f.get("policy") or f.get("candidate") or f.get("init-estimator", "")
+    return summary
 
 
 def _mtime(path: str) -> float:
@@ -1062,10 +1187,14 @@ def _fmt_eta(seconds: float) -> str:
 
 
 def _progress_text(p: Optional[Progress]) -> str:
+    if p is not None and p.kind == "grip_final" and p.finished:
+        return "최종 평가 완료"
     if p is None or not p.n_points:
         return ""
     if p.kind == "dagger":
         return f"{p.update}/{p.n_updates} 반복" if p.n_updates else f"{p.update}번째 반복"
+    if p.kind in ("grip", "grip_collect"):
+        return f"{p.update}/{p.n_updates} " + ("epoch" if p.kind == "grip" else "수집 작업")
     if not p.n_updates:
         return f"{p.update} 업데이트"
     return f"{p.update}/{p.n_updates} 업데이트 · {p.steps_m:.2f}M 스텝"
@@ -1271,11 +1400,15 @@ DAGGER_CHARTS: Tuple[ChartSpec, ...] = (
     ChartSpec(("beta",), "beta (교사 주행 비율)", "", ("text.1",)),
 )
 
+GRIP_CHARTS = (ChartSpec(("loss",), "마찰 추정 학습 손실", "", ("accent",), lower_is_better=True),)
+COLLECT_CHARTS = (ChartSpec(("jobs",), "완료된 수집 작업", "개", ("ok",)),)
+
 
 def charts_for(p: "Progress") -> Tuple[ChartSpec, ...]:
     """The chart set a run gets. A DAgger run and a PPO run do not share a single metric name, so
     the page draws one or the other rather than six charts of which four are always empty."""
-    specs = DAGGER_CHARTS if p.kind == "dagger" else PPO_CHARTS
+    specs = {"dagger": DAGGER_CHARTS, "grip": GRIP_CHARTS, "grip_collect": COLLECT_CHARTS,
+             "grip_final": ()}.get(p.kind, PPO_CHARTS)
     return tuple(s for s in specs if s.wanted(p))
 
 
@@ -1347,17 +1480,17 @@ class TrackPicker(QtWidgets.QWidget):
 
         self.obs_boxes: Dict[str, QtWidgets.QCheckBox] = {}
         orow = FlowRow()
-        for o in tracks.OBSTACLES:
-            cb = QtWidgets.QCheckBox(tracks.OBSTACLE_LABEL[o])
+        for o in tracks.ASSET_OBSTACLES:
+            cb = QtWidgets.QCheckBox(tracks.ASSET_PLACEMENT_LABEL[o])
             cb.setChecked(o == "")
-            cb.setToolTip(tracks.OBSTACLE_HINT[o])
+            cb.setToolTip(tracks.ASSET_PLACEMENT_HINT[o])
             cb.toggled.connect(self._on_policy_changed)
             self.obs_boxes[o] = cb
             orow.add(cb)
         v.addWidget(FieldRow("장애물", orow,
                              "여러 개를 고르면 맵마다 각각 만들어 넣습니다. '기본'은 맵을 만들어진 "
                              "그대로 (에디터 장면이면 배치한 장애물 포함), '없음'은 배치 장애물을 "
-                             "걷어낸 것입니다. " + tracks.OBSTACLE_ADDS_HINT))
+                             "걷어낸 것입니다. 랜덤은 기존 에셋의 종류·크기를 배치 시드로 뽑아 추가합니다."))
 
         seed_row = QtWidgets.QHBoxLayout()
         seed_row.setSpacing(SP[0])
@@ -1437,7 +1570,7 @@ class TrackPicker(QtWidgets.QWidget):
         return [d for d in tracks.DIRECTIONS if self.dir_boxes[d].isChecked()] or [""]
 
     def obstacles(self) -> List[str]:
-        return [o for o in tracks.OBSTACLES if self.obs_boxes[o].isChecked()] or [""]
+        return [o for o in tracks.ASSET_OBSTACLES if self.obs_boxes[o].isChecked()] or [""]
 
     def draws(self) -> int:
         return int(self.spin_draws.value())
@@ -1454,8 +1587,9 @@ class TrackPicker(QtWidgets.QWidget):
                                  if it.data(QtCore.Qt.UserRole) in want else QtCore.Qt.Unchecked)
         for d, cb in self.dir_boxes.items():
             cb.setChecked(True)
+        families = {tracks.parse(tracks.asset_scenario(tracks.short(n))).choice for n in tracks.split_names(split)}
         for o, cb in self.obs_boxes.items():
-            cb.setChecked(o == "")
+            cb.setChecked(o in families)
         self.combo_seed.setCurrentIndex(0)
         self._quiet = False
         self._preset = split
@@ -1473,7 +1607,13 @@ class TrackPicker(QtWidgets.QWidget):
         spec = (spec or "").strip()
         self._raw = ""
         if spec in ("train", "eval", "heldout"):
+            blocked = self.blockSignals(True)
             self.select_split("train" if spec == "train" else "heldout")
+            self._preset = None
+            self._raw = spec  # explicit restored split is historical; never rewrite a saved run
+            self._refresh_summary()
+            self.blockSignals(blocked)
+            self.changed.emit()
             return
         names = [n.strip() for n in spec.split(",") if n.strip()]
         scenarios = []
@@ -1525,6 +1665,8 @@ class TrackPicker(QtWidgets.QWidget):
         for lw in self._lists.values():
             for i in range(lw.count()):
                 lw.item(i).setCheckState(QtCore.Qt.Unchecked)
+        for o, cb in self.obs_boxes.items():
+            cb.setChecked(o == "")
         self._quiet = False
         self._preset = None
         self._raw = ""
@@ -1561,10 +1703,9 @@ class TrackPicker(QtWidgets.QWidget):
         per-track policy (its obstacle seeds differ per map and per family, by design), and a run
         launched from the default has to be the run the recipes were measured with.
         """
-        if self._preset == "train":
-            return "train"
-        if self._preset == "heldout":
-            return "heldout"
+        if self._preset in ("train", "heldout"):
+            return ",".join(tracks.asset_scenario(tracks.short(name))
+                            for name in tracks.split_names(self._preset))
         if self._raw:
             return self._raw
         ids = self.selected_tracks()
@@ -1573,7 +1714,7 @@ class TrackPicker(QtWidgets.QWidget):
         fixed = str(self.combo_seed.currentData()) == "fixed"
         out = []
         for tid in ids:
-            allowed = tracks.get(tid).obstacle_options()
+            allowed = tracks.asset_obstacle_options(tid)
             for o in self.obstacles():
                 if o not in allowed:
                     continue
@@ -1583,7 +1724,7 @@ class TrackPicker(QtWidgets.QWidget):
                         s += f"#{o}"
                         if o != tracks.BARE:      # 없음 places nothing, so it has no seed
                             s += f":{self.spin_fixed.value() if fixed else '*'}"
-                    out.append(s)
+                    out.append(tracks.asset_scenario(s))
         return ",".join(dict.fromkeys(out))
 
     def count(self) -> int:
@@ -1604,6 +1745,9 @@ class TrackPicker(QtWidgets.QWidget):
             s = tracks.split_summary(spec)
             self.summary.setText(f"--tracks {spec}   →   {s['n_variants']}개 변형 / "
                                  f"{s['n_tracks']}개 맵 ({s['group']} 분할 그대로)")
+            return
+        if self._preset in ("train", "heldout"):
+            self.summary.setText(f"{len(spec.split(chr(44)))}개 변형 / {len(self.selected_tracks())}개 맵 · 기존 에셋 장애물")
             return
         if self._raw:
             self.summary.setText(f"직접 지정한 목록 그대로 씁니다 ({len(spec.split(','))}개). "
@@ -1628,253 +1772,8 @@ class FlowRow(QtWidgets.QWidget):
         return w
 
 
-# ================================================================ recipe form
-class RecipeForm(QtWidgets.QWidget):
-    launch_requested = QtCore.pyqtSignal(str, list, str)     # name, argv, device
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(SP[1])
-        card = Card("학습 설정")
-        self.combo_recipe = QtWidgets.QComboBox()
-        for r in RECIPES:
-            self.combo_recipe.addItem(r.title, r.key)
-        self.combo_recipe.currentIndexChanged.connect(self._apply_recipe)
-        card.add(FieldRow("레시피", self.combo_recipe, ""))
-        self.recipe_note = label("", "hint")
-        card.add(self.recipe_note)
-
-        self.edit_name = QtWidgets.QLineEdit()
-        self.edit_name.setObjectName("SearchBox")
-        card.add(FieldRow("런 이름", self.edit_name, "~/f1sim_runs/<이름>/ 에 저장됩니다."))
-        self.combo_init = QtWidgets.QComboBox()
-        self.combo_init.setEditable(True)
-        card.add(FieldRow("시작 체크포인트", self.combo_init,
-                          "기본은 동결된 원본 정책입니다. 다른 런의 ppo_final.pt 를 고르거나 경로를 직접 적을 수 있습니다."))
-        self.spin_seed = QtWidgets.QSpinBox(); self.spin_seed.setRange(0, 99999); self.spin_seed.setValue(701)
-        self.spin_total = QtWidgets.QSpinBox(); self.spin_total.setRange(8192, 200_000_000); self.spin_total.setSingleStep(65536)
-        self.spin_total.setValue(1_048_576); self.spin_total.setGroupSeparatorShown(True)
-        self.spin_envs = QtWidgets.QSpinBox(); self.spin_envs.setRange(8, 4096); self.spin_envs.setValue(256)
-        grid = QtWidgets.QGridLayout(); grid.setHorizontalSpacing(SP[1]); grid.setVerticalSpacing(SP[0])
-        grid.addWidget(FieldRow("시드", self.spin_seed, ""), 0, 0)
-        grid.addWidget(FieldRow("총 스텝", self.spin_total, ""), 0, 1)
-        grid.addWidget(FieldRow("병렬 환경 수", self.spin_envs, ""), 0, 2)
-        card.add(grid)
-
-        self.edit_lr = QtWidgets.QLineEdit("5e-5"); self.edit_lr_end = QtWidgets.QLineEdit("2e-5")
-        self.edit_kl = QtWidgets.QLineEdit("0.05")
-        g2 = QtWidgets.QGridLayout(); g2.setHorizontalSpacing(SP[1]); g2.setVerticalSpacing(SP[0])
-        g2.addWidget(FieldRow("학습률", self.edit_lr, ""), 0, 0)
-        g2.addWidget(FieldRow("학습률 (끝)", self.edit_lr_end, ""), 0, 1)
-        g2.addWidget(FieldRow("KL 계수", self.edit_kl, "원본 정책에서 벗어나는 것을 억제합니다."), 0, 2)
-        card.add(g2)
-
-        self.chk_restore_opt = QtWidgets.QCheckBox("Adam 상태 복원 (권장)")
-        self.chk_restore_opt.setChecked(True)
-        self.chk_restore_opt.setToolTip("끄면 --fresh-opt: 새 옵티마이저로 시작합니다. 이전 실험들은 전부 이 상태로 돌았습니다.")
-        card.add(self.chk_restore_opt)
-        v.addWidget(card)
-
-        # The maps get their own card, above the fold. They are the first thing a run is about and
-        # they were a one-line text box saying `train`.
-        track_card = Card("학습할 맵")
-        self.tracks = TrackPicker()
-        self.tracks.changed.connect(self._refresh_preview)
-        track_card.add(self.tracks)
-        v.addWidget(track_card)
-
-        adv = Collapsible("레이스·제어기", expanded=False)
-        self.spin_race = QtWidgets.QSpinBox(); self.spin_race.setRange(1, 4); self.spin_race.setValue(2)
-        self.combo_opp = QtWidgets.QComboBox(); self.combo_opp.addItems(["mixed", "teacher", "policy"])
-        g3 = QtWidgets.QGridLayout(); g3.setHorizontalSpacing(SP[1])
-        g3.addWidget(FieldRow("레이스당 차량", self.spin_race, ""), 0, 0)
-        g3.addWidget(FieldRow("상대차", self.combo_opp, ""), 0, 1)
-        adv.add(g3)
-        # The per-car table, off by default. On, it replaces `--opponent` (and the recipe's
-        # `--opp-speed` / `--mixed-teacher-frac`) with one `--opp-slots` JSON, which is the same
-        # table the driving page edits: a run started here can be watched there without retyping it.
-        self.chk_slots = QtWidgets.QCheckBox("차량별 상대차 설정 (--opp-slots)")
-        self.chk_slots.setToolTip(
-            "켜면 위의 '상대차' 한 줄 대신 차량마다 종류·체크포인트·속도 프로파일·그립 라벨·이벤트·\n"
-            "반응형 확률·스폰을 따로 정합니다. 레시피의 --opponent / --opp-speed /\n"
-            "--mixed-teacher-frac 는 표가 대신하므로 명령에서 빠집니다.")
-        self.chk_slots.toggled.connect(self._on_slots_toggled)
-        adv.add(self.chk_slots)
-        self.opp_table = OpponentSlotTable()
-        self.opp_table.changed.connect(self._refresh_preview)
-        self.row_slots = FieldRow("상대차 표", self.opp_table,
-                                  "레이스당 차량 수 - 1 줄. 주행 페이지와 같은 위젯입니다.")
-        self.row_slots.setVisible(False)
-        adv.add(self.row_slots)
-        self.edit_aux_grip = QtWidgets.QLineEdit("1.0"); self.edit_aux_opp = QtWidgets.QLineEdit("1.0")
-        g4 = QtWidgets.QGridLayout(); g4.setHorizontalSpacing(SP[1])
-        g4.addWidget(FieldRow("aux grip", self.edit_aux_grip, "마찰 보조 head 가중치"), 0, 0)
-        g4.addWidget(FieldRow("aux opp", self.edit_aux_opp, "상대차 보조 head 가중치"), 0, 1)
-        adv.add(g4)
-        self.combo_controller = QtWidgets.QComboBox(); self.combo_controller.addItems(["legacy", "fixed_low", "estimated"])
-        self.combo_controller.currentTextChanged.connect(self._controller_hint)
-        adv.add(FieldRow("학습 중 제어기", self.combo_controller, ""))
-        self.ctrl_hint = label("", "hint.warn")
-        adv.add(self.ctrl_hint)
-        self.edit_estimator = QtWidgets.QLineEdit(DEFAULT_ESTIMATOR if os.path.isfile(DEFAULT_ESTIMATOR) else "")
-        adv.add(FieldRow("노면 추정기", self.edit_estimator, "estimated 전용"))
-        self.combo_wandb = QtWidgets.QComboBox(); self.combo_wandb.addItems(["online", "offline", "disabled"])
-        self.combo_device = QtWidgets.QComboBox(); self.combo_device.addItems(["cuda", "cpu"])
-        self.spin_save = QtWidgets.QSpinBox(); self.spin_save.setRange(1, 200); self.spin_save.setValue(10)
-        g5 = QtWidgets.QGridLayout(); g5.setHorizontalSpacing(SP[1])
-        g5.addWidget(FieldRow("W&B", self.combo_wandb, ""), 0, 0)
-        g5.addWidget(FieldRow("장치", self.combo_device, ""), 0, 1)
-        g5.addWidget(FieldRow("저장 주기 (업데이트)", self.spin_save, ""), 0, 2)
-        adv.add(g5)
-        self.edit_extra = QtWidgets.QLineEdit()
-        self.edit_extra.setObjectName("SearchBox")
-        adv.add(FieldRow("추가 인자", self.edit_extra, "그대로 명령 끝에 붙습니다."))
-        v.addWidget(adv)
-
-        prev = Collapsible("명령 미리보기", expanded=False)
-        self.preview = QtWidgets.QPlainTextEdit()
-        self.preview.setReadOnly(True)
-        self.preview.setMaximumHeight(120)
-        self.preview.setStyleSheet(f"font-family: '{theme.MONO_FONT}', monospace; font-size: 10px; background: {C['bg.window']};")
-        prev.add(self.preview)
-        v.addWidget(prev)
-
-        self.btn_launch = QtWidgets.QPushButton("학습 시작")
-        self.btn_launch.setObjectName("PrimaryButton")
-        self.btn_launch.clicked.connect(self._launch)
-        v.addWidget(self.btn_launch)
-        self.launch_note = label("", "hint")
-        v.addWidget(self.launch_note)
-        v.addStretch(1)
-
-        for w in (self.edit_name, self.edit_lr, self.edit_lr_end, self.edit_kl, self.edit_aux_grip,
-                  self.edit_aux_opp, self.edit_estimator, self.edit_extra):
-            w.textChanged.connect(self._refresh_preview)
-        for w in (self.spin_seed, self.spin_total, self.spin_envs, self.spin_race, self.spin_save):
-            w.valueChanged.connect(self._refresh_preview)
-        self.spin_race.valueChanged.connect(lambda v: self.opp_table.set_count(max(0, int(v) - 1)))
-        self.opp_table.set_count(max(0, self.spin_race.value() - 1))
-        for w in (self.combo_opp, self.combo_controller, self.combo_wandb, self.combo_device, self.combo_init):
-            w.currentTextChanged.connect(self._refresh_preview)
-        self.chk_restore_opt.toggled.connect(self._refresh_preview)
-        self.set_runs([])
-        self._apply_recipe(0)
-
-    # -- state
-    def set_runs(self, runs: List[catalog.RunInfo]):
-        cur = self.combo_init.currentText()
-        self.combo_init.blockSignals(True)
-        self.combo_init.clear()
-        self.combo_init.addItem("동결 원본 (frozen_original_48cc698f.pt)", FROZEN_ORIGINAL)
-        for r in runs:
-            fin = os.path.join(r.path, "ppo_final.pt")
-            if os.path.isfile(fin):
-                self.combo_init.addItem(f"{r.name}/ppo_final.pt", fin)
-        self.combo_init.blockSignals(False)
-        if cur:
-            i = self.combo_init.findText(cur)
-            self.combo_init.setCurrentIndex(max(0, i))
-        self._refresh_preview()
-
-    def _init_path(self) -> str:
-        i = self.combo_init.currentIndex()
-        data = self.combo_init.itemData(i) if i >= 0 and self.combo_init.itemText(i) == self.combo_init.currentText() else None
-        return str(data) if data else self.combo_init.currentText().strip()
-
-    def _apply_recipe(self, _idx):
-        r = next(x for x in RECIPES if x.key == self.combo_recipe.currentData())
-        self.recipe_note.setText(r.note)
-        self.tracks.set_spec(r.tracks)
-        self.spin_race.setValue(r.race_size)
-        self.combo_opp.setCurrentText(r.opponent)
-        self.edit_aux_grip.setText(f"{r.aux_grip:g}"); self.edit_aux_opp.setText(f"{r.aux_opp:g}")
-        self.edit_lr.setText(f"{r.lr:g}"); self.edit_lr_end.setText(f"{r.lr_end:g}"); self.edit_kl.setText(f"{r.kl:g}")
-        self.spin_envs.setValue(r.envs); self.spin_total.setValue(r.total)
-        self.combo_controller.setCurrentText("legacy")
-        self.edit_name.setText(f"cl_{r.key}_legacy_s{self.spin_seed.value()}_{time.strftime('%m%d%H%M')}")
-        self._refresh_preview()
-
-    def _on_slots_toggled(self, on: bool):
-        self.row_slots.setVisible(on)
-        self.combo_opp.setEnabled(not on)
-        self._refresh_preview()
-
-    def _controller_hint(self, arm: str):
-        if arm == "legacy":
-            self.ctrl_hint.setText("")
-        else:
-            self.ctrl_hint.setText("주의: 클램프를 켠 채 학습한 정책은 클램프에 기대는 계획을 배워 저마찰·회피·추월이 "
-                                   "나빠졌습니다 (2026-09-12, 4개 실행 모두). legacy로 학습하고 배포 때만 켜세요. "
-                                   "또한 estimated/fixed_low 는 레이스당 차량 1에서만 학습됩니다.")
-        self._refresh_preview()
-
-    def argv(self) -> Tuple[str, List[str], str]:
-        r = next(x for x in RECIPES if x.key == self.combo_recipe.currentData())
-        name = self.edit_name.text().strip() or f"cl_run_{time.strftime('%m%d%H%M')}"
-        race = self.spin_race.value()
-        arm = self.combo_controller.currentText()
-        parts = [sys.executable, "-m", "f1sim.learn.ppo"] + shlex.split(COMMON_FLAGS)
-        slots_on = self.chk_slots.isChecked() and race > 1
-        parts += ["--tracks", self.tracks.spec() or "train",
-                  "--obstacle-draws", str(self.tracks.draws()),
-                  "--envs", str(self.spin_envs.value()), "--total", str(float(self.spin_total.value())),
-                  "--lr", self.edit_lr.text().strip() or "5e-5", "--lr-end", self.edit_lr_end.text().strip() or "2e-5",
-                  "--kl-coef", self.edit_kl.text().strip() or "0.05",
-                  "--init", self._init_path(), "--seed", str(self.spin_seed.value()),
-                  "--race-size", str(race)]
-        if slots_on:
-            # `--opponent` and the recipe's opponent flags are what the table replaces; emitting
-            # both would leave two answers on the command line, and the trainer refuses that rather
-            # than picking one.
-            parts += ["--opp-slots", self.opp_table.json()]
-        else:
-            parts += ["--opponent", self.combo_opp.currentText()]
-        parts += ["--aux-grip", self.edit_aux_grip.text().strip() or "0", "--aux-opp", self.edit_aux_opp.text().strip() or "0",
-                  "--device", self.combo_device.currentText(), "--wandb", self.combo_wandb.currentText(),
-                  "--wandb-group", f"console-{r.key}", "--save-every", str(self.spin_save.value()),
-                  "--name", name, "--controller", arm]
-        if race > 1 and r.race_flags:
-            parts += [f for f in _strip_slot_flags(shlex.split(r.race_flags), slots_on)]
-        if race == 1:
-            parts += ["--cond", "none", "--critic-priv-adapter", "absent_opponent_17_to_21"]
-        if arm == "estimated":
-            parts += ["--estimator", self.edit_estimator.text().strip()]
-        if not self.chk_restore_opt.isChecked():
-            parts.append("--fresh-opt")
-        extra = self.edit_extra.text().strip()
-        if extra:
-            parts += shlex.split(extra)
-        return name, parts, self.combo_device.currentText()
-
-    def _refresh_preview(self, *_a):
-        try:
-            _, parts, _ = self.argv()
-            self.preview.setPlainText(" ".join(shlex.quote(a) for a in parts))
-        except Exception as exc:
-            self.preview.setPlainText(f"(인자 구성 실패: {exc})")
-
-    def _launch(self):
-        name, parts, device = self.argv()
-        run_dir = os.path.join(catalog.RUNS_DIR, name)
-        if os.path.isdir(run_dir) and any(f.endswith(".pt") for f in os.listdir(run_dir)):
-            self.launch_note.setText(f"'{name}' 은 이미 체크포인트가 있는 런입니다. 이름을 바꾸세요.")
-            return
-        init = self._init_path()
-        if not os.path.isfile(init):
-            self.launch_note.setText(f"시작 체크포인트가 없습니다: {init}")
-            return
-        arm = self.combo_controller.currentText()
-        if arm != "legacy" and self.spin_race.value() > 1:
-            self.launch_note.setText(f"'{arm}' 제어기는 레이스당 차량 1에서만 학습됩니다.")
-            return
-        if self.chk_slots.isChecked() and self.spin_race.value() > 1:
-            problem = self.opp_table.problem(self.spin_race.value())
-            if problem:
-                self.launch_note.setText(problem)
-                return
-        self.launch_requested.emit(name, parts, device)
+# Schema-backed setup keeps the monitor module free of trainer/Torch imports.
+from .training_setup import TrainingSetupForm as RecipeForm
 
 
 class JobCard(QtWidgets.QFrame):
@@ -1936,7 +1835,8 @@ class JobCard(QtWidgets.QFrame):
             colour = C["warn"]
         self.dot.setText("●" if s.alive else "○")
         self.dot.setStyleSheet(f"color: {colour};")
-        self.title.setText(s.name)
+        self.title.setText(job_display_name(s.name))
+        self.title.setToolTip(s.name)
         self.state.setText(s.state + (" · 외부 실행" if s.external else "") + f" · pid {s.pid}")
         self.state.setStyleSheet(f"color: {colour};")
         clock = (f"{time.strftime('%m-%d %H:%M', time.localtime(s.started))} 시작 · "
@@ -1962,24 +1862,30 @@ class TrainingPage(QtWidgets.QWidget):
         super().__init__(parent)
         self.jobs = JobManager()
         self._runs: List[catalog.RunInfo] = []
-        self._run_names: List[str] = []
+        self._run_names: List[Tuple[str, str]] = []
         self._current_run: Optional[str] = None
         #: run dir -> ((source path, mtime), Progress). The page ticks every two seconds and a run
         #: log is megabytes; nothing is re-read while its source file has not moved.
         self._progress_cache: Dict[str, Tuple[Tuple, Progress]] = {}
         self._job_log_cache: Dict[str, Tuple[Tuple[str, float], str]] = {}
 
-        root = QtWidgets.QHBoxLayout(self)
-        root.setContentsMargins(SP[1], SP[1], SP[1], SP[1])
-        root.setSpacing(SP[1])
-
-        # -- left: the form
-        left = QtWidgets.QScrollArea(); left.setObjectName("PanelScroll"); left.setWidgetResizable(True)
-        left.setFrameShape(QtWidgets.QFrame.NoFrame); left.setMinimumWidth(360); left.setMaximumWidth(460)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(SP[1], SP[1], SP[1], SP[1])
+        self.page_tabs = QtWidgets.QTabWidget()
+        outer.addWidget(self.page_tabs)
         self.form = RecipeForm()
         self.form.launch_requested.connect(self._launch)
-        left.setWidget(self.form)
-        root.addWidget(left, 0)
+        self.page_tabs.addTab(self.form, "학습 설정")
+        monitor = QtWidgets.QWidget()
+        monitor_scroll = QtWidgets.QScrollArea()
+        monitor_scroll.setObjectName("PanelScroll")
+        monitor_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        monitor_scroll.setWidgetResizable(True)
+        monitor_scroll.setWidget(monitor)
+        self.page_tabs.addTab(monitor_scroll, "진행 · 체크포인트")
+        root = QtWidgets.QHBoxLayout(monitor)
+        root.setContentsMargins(SP[1], SP[1], SP[1], SP[1])
+        root.setSpacing(SP[1])
 
         # -- centre: what is running, then the monitor for whichever run is selected
         centre = QtWidgets.QVBoxLayout(); centre.setSpacing(SP[1])
@@ -1988,8 +1894,9 @@ class TrainingPage(QtWidgets.QWidget):
         self.jobs_box.setSpacing(SP[1])
         self.jobs_box.setContentsMargins(0, 0, 0, 0)
         jobs.add(self.jobs_box)
-        self.job_note = label("콘솔에서 시작한 학습은 콘솔을 닫아도 계속 돕니다. 셸 등에서 띄운 "
-                              "f1sim.learn.ppo 도 '외부 실행'으로 잡혀 같이 보이고 중지할 수 있습니다.", "hint")
+        self.job_note = label("PPO·DAgger·마찰 추정 작업의 실행 상태와 로그를 함께 표시합니다. "
+                              "콘솔을 닫아도 시작한 작업은 계속 실행됩니다.", "hint")
+        self.job_note.setWordWrap(True)
         jobs.add(self.job_note)
         centre.addWidget(jobs)
         self._job_cards: Dict[str, JobCard] = {}
@@ -2038,12 +1945,22 @@ class TrainingPage(QtWidgets.QWidget):
         # -- right: checkpoints
         right = QtWidgets.QVBoxLayout(); right.setSpacing(SP[1])
         ck = Card("체크포인트")
-        self.ckpt_list = QtWidgets.QListWidget(); self.ckpt_list.setMinimumWidth(300)
+        self.ckpt_list = QtWidgets.QListWidget(); self.ckpt_list.setMinimumWidth(220)
         ck.add(self.ckpt_list)
         self.btn_view = QtWidgets.QPushButton("주행 화면에서 보기")
         self.btn_view.setObjectName("PrimaryButton")
         self.btn_view.clicked.connect(self._view_checkpoint)
         ck.add(self.btn_view)
+        self.btn_resume = QtWidgets.QPushButton("선택한 체크포인트에서 이어서")
+        self.btn_resume.clicked.connect(self._resume_selected)
+        ck.add(self.btn_resume)
+        self.btn_reuse = QtWidgets.QPushButton("이 작업 설정 불러오기")
+        self.btn_reuse.clicked.connect(self._reuse_selected)
+        ck.add(self.btn_reuse)
+        self.btn_report = QtWidgets.QPushButton("최종 평가 보고서 열기")
+        self.btn_report.clicked.connect(self._open_report)
+        self.btn_report.setEnabled(False)
+        ck.add(self.btn_report)
         ck.add(label("선택한 체크포인트로 주행 화면의 런을 바꿉니다. 시작을 누르면 그 가중치로 세션이 뜹니다.", "hint"))
         right.addWidget(ck, 1)
         root.addLayout(right, 0)
@@ -2062,7 +1979,13 @@ class TrainingPage(QtWidgets.QWidget):
     def refresh_all(self):
         runs = catalog.list_runs()
         dirs = list_run_dirs()
-        names = [d[0] for d in dirs]
+        known = {os.path.realpath(row[1]) for row in dirs}
+        for job in self.jobs.list_jobs():
+            if os.path.realpath(job.run_dir) not in known:
+                dirs.append((job_display_name(job.name),
+                             job.run_dir, "최종 평가 보고서" if job.report_path else "학습 작업 출력", job.started))
+                known.add(os.path.realpath(job.run_dir))
+        names = [(d[0], d[1]) for d in dirs]
         if names != self._run_names:
             self._runs, self._run_names = runs, names
             self.form.set_runs(runs)
@@ -2105,10 +2028,10 @@ class TrainingPage(QtWidgets.QWidget):
                 self._job_cards.pop(name, None)
         self.job_note.setVisible(True)
         if not jobs:
-            self.job_note.setText("지금 돌고 있는 학습이 없습니다. 왼쪽에서 레시피를 고르고 '학습 시작'을 누르세요.")
+            self.job_note.setText("지금 돌고 있는 학습이 없습니다. '학습 설정' 탭에서 조건을 고르고 '학습 시작'을 누르세요.")
         else:
-            self.job_note.setText("콘솔에서 시작한 학습은 콘솔을 닫아도 계속 돕니다. 셸 등에서 띄운 "
-                                  "f1sim.learn.ppo 도 '외부 실행'으로 잡혀 같이 보이고 중지할 수 있습니다.")
+            self.job_note.setText("콘솔에서 시작한 학습은 콘솔을 닫아도 계속 실행됩니다. "
+                                  "PPO·DAgger·마찰 추정 외부 작업도 함께 표시합니다.")
 
     def job_summary(self, job: Job) -> JobSummary:
         """The card's content: the curve from the best progress source, and the W&B url from a text
@@ -2136,7 +2059,8 @@ class TrainingPage(QtWidgets.QWidget):
         return text
 
     def _open_job(self, name: str):
-        i = self.combo_run.findData(os.path.join(catalog.RUNS_DIR, name))
+        job = next((j for j in self.jobs.list_jobs() if j.name == name), None)
+        i = self.combo_run.findData(job.run_dir if job else os.path.join(catalog.RUNS_DIR, name))
         if i >= 0:
             self.combo_run.setCurrentIndex(i)
 
@@ -2152,6 +2076,31 @@ class TrainingPage(QtWidgets.QWidget):
         if i < 0:
             self.combo_run.addItem(f"{name}  ·  방금 시작", job.run_dir); i = self.combo_run.count() - 1
         self.combo_run.setCurrentIndex(i)
+        self.page_tabs.setCurrentIndex(1)
+
+    def _reuse_selected(self):
+        self._restore_selected(False)
+
+    def _resume_selected(self):
+        self._restore_selected(True)
+
+    def _restore_selected(self, resume):
+        job = next((j for j in self.jobs.list_jobs() if j.run_dir == self._current_run), None)
+        item = self.ckpt_list.currentItem()
+        checkpoint = item.data(QtCore.Qt.UserRole) if item and resume else ""
+        try:
+            if job:
+                if resume and job.alive:
+                    raise ValueError("실행 중인 작업입니다. 중지된 뒤 체크포인트에서 이어서 시작할 수 있습니다.")
+                self.form.load_job(job.argv, checkpoint)
+            elif checkpoint:
+                self.form.set_mode("dagger" if os.path.basename(checkpoint).startswith("student_") else "ppo")
+                self.form.resume_checkpoint(checkpoint)
+            else:
+                raise ValueError("저장된 실행 설정을 찾을 수 없습니다. 설정 파일을 열거나 새 작업을 구성하세요.")
+        except (ValueError, OSError) as exc:
+            self.form.launch_note.setText(str(exc))
+        self.page_tabs.setCurrentIndex(0)
 
     def _stop_job(self, name: str):
         job = next((j for j in self.jobs.list_jobs() if j.name == name), None)
@@ -2171,7 +2120,9 @@ class TrainingPage(QtWidgets.QWidget):
     # -- monitor
     #: What the six tiles above the charts are called, per run kind. A DAgger iteration has no
     #: "누적 스텝" and no steps/s, and showing 0 for both was the old page's way of saying so.
-    TILE_NAMES = {"ppo": ("업데이트", "누적 스텝", "처리량"), "dagger": ("반복", "샘플", "손실")}
+    TILE_NAMES = {"ppo": ("업데이트", "누적 스텝", "처리량"), "dagger": ("반복", "샘플", "손실"),
+                  "grip": ("Epoch", "학습 지점", "손실"), "grip_collect": ("수집 작업", "완료", "진행률"),
+                  "grip_final": ("평가", "산출물", "상태")}
 
     def _apply_charts(self, p: Progress):
         """Draw the chart set this run's kind and metrics call for, important first.
@@ -2189,7 +2140,7 @@ class TrainingPage(QtWidgets.QWidget):
                     w.setParent(None)
                     w.deleteLater()
             self._charts = {}
-            x_label = "iter →" if p.kind == "dagger" else "update →"
+            x_label = {"dagger": "iter →", "grip": "epoch →", "grip_collect": "job →"}.get(p.kind, "update →")
             for i, spec in enumerate(specs):
                 ch = LineChart(spec.title, spec.unit, lower_is_better=spec.lower_is_better,
                                colours=[C.get(c, c) for c in spec.colours], labels=spec.labels,
@@ -2206,8 +2157,18 @@ class TrainingPage(QtWidgets.QWidget):
 
     def _progress_for(self, run_dir: str) -> Progress:
         """The run's curve, re-read only when its source file has changed."""
+        job = next((j for j in self.jobs.list_jobs() if j.run_dir == run_dir
+                    and "f1sim.learn.policy_grip_data" in j.argv and "final" in j.argv), None)
+        if job:
+            report = job.report_path or final_report_path(job.argv)
+            final = read_final_report(report)
+            if final:
+                return final
         cands = progress_candidates(run_dir, self.jobs.runs_dir)
         stamp = tuple((path, _mtime(path)) for path, _k in cands[:1])
+        manifest = os.path.join(run_dir, "manifest.json")
+        if os.path.isfile(manifest):
+            stamp += ((manifest, _mtime(manifest)),)
         cached = self._progress_cache.get(run_dir)
         if cached and cached[0] == stamp:
             return cached[1]
@@ -2233,12 +2194,22 @@ class TrainingPage(QtWidgets.QWidget):
         p = self._progress_for(run_dir)
         mtime = _mtime(p.source) if p.source else 0.0
         is_dagger = p.kind == "dagger"
-        names = self.TILE_NAMES["dagger" if is_dagger else "ppo"]
+        names = self.TILE_NAMES.get(p.kind, self.TILE_NAMES["ppo"])
         for tile, name in zip((self.m_upd, self.m_steps, self.m_sps), names):
             tile.name_label.setText(name)
         self.progress.setValue(int(1000 * p.fraction))
         self.m_upd.set_value(f"{p.update}/{p.n_updates}" if p.n_updates else (str(p.update) if p.update else "—"))
-        if is_dagger:
+        if p.kind == "grip_final":
+            self.m_steps.set_value("보고서 1개")
+            self.m_sps.set_value("보고서 저장됨")
+        elif p.kind == "grip":
+            self.m_steps.set_value(str(p.n_points))
+            loss = p.get("loss")
+            self.m_sps.set_value(f"{loss[-1]:.5f}" if loss else "—")
+        elif p.kind == "grip_collect":
+            self.m_steps.set_value(str(p.update))
+            self.m_sps.set_value(f"{p.fraction:.0%}")
+        elif is_dagger:
             samples = p.get("samples")
             loss = p.get("loss")
             self.m_steps.set_value(f"{samples[-1] / 1e3:.0f}k" if samples else "—")
@@ -2246,8 +2217,8 @@ class TrainingPage(QtWidgets.QWidget):
         else:
             self.m_steps.set_value(f"{p.steps_m:.2f}" if p.n_points else "—")
             self.m_sps.set_value(f"{p.sps[-1]:.0f}" if p.sps else "—")
-        self.m_steps.unit.setText("" if is_dagger else "M")
-        self.m_sps.unit.setText("" if is_dagger else "steps/s")
+        self.m_steps.unit.setText("M" if p.kind in ("ppo", "") else "")
+        self.m_sps.unit.setText("steps/s" if p.kind in ("ppo", "") else "")
         job = next((j for j in self.jobs.list_jobs() if j.run_dir == run_dir), None)
         alive = bool(job and job.alive)
         if p.error and not p.finished:
@@ -2255,7 +2226,7 @@ class TrainingPage(QtWidgets.QWidget):
         elif p.finished:
             self.m_state.set_value("완료", C["ok"])
         elif alive and not p.n_points:
-            self.m_state.set_value("준비 중 (컴파일)", C["warn"])
+            self.m_state.set_value("준비 / 수집 중", C["warn"])
         elif alive:
             self.m_state.set_value("실행 중", C["ok"])
         elif p.source and time.time() - mtime < 120:
@@ -2265,6 +2236,8 @@ class TrainingPage(QtWidgets.QWidget):
         self.m_eta.set_value(_fmt_eta(_eta_seconds(p)) if (alive or time.time() - mtime < 120) else "—")
         self._apply_charts(p)
         self.source_note.setText(describe_source(p, run_dir, self.jobs.runs_dir))
+        self.btn_report.setEnabled(p.kind == "grip_final" and os.path.isfile(p.source))
+        self.btn_report.setProperty("report_path", p.source if p.kind == "grip_final" else "")
         self.log_box.setPlainText("\n".join(p.lines))
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
         self._refresh_ckpts(run_dir)
@@ -2282,12 +2255,21 @@ class TrainingPage(QtWidgets.QWidget):
                 self.ckpt_list.setCurrentItem(it)
         if self.ckpt_list.currentItem() is None and self.ckpt_list.count():
             self.ckpt_list.setCurrentRow(self.ckpt_list.count() - 1)
+        item = self.ckpt_list.currentItem()
+        candidate = bool(item and os.path.basename(item.data(QtCore.Qt.UserRole)) == "candidate.pt")
+        self.btn_view.setEnabled(bool(item) and not candidate)
+        self.btn_resume.setEnabled(bool(item) and not candidate)
 
     def _view_checkpoint(self):
         it = self.ckpt_list.currentItem()
         if it is None or not self._current_run:
             return
         self.view_checkpoint_requested.emit(os.path.basename(self._current_run), it.data(QtCore.Qt.UserRole))
+
+    def _open_report(self):
+        path = self.btn_report.property("report_path")
+        if path and os.path.isfile(path):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.abspath(path)))
 
     def _poll_gpu(self):
         try:

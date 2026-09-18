@@ -169,6 +169,8 @@ def test_wandb_config_records_track_names_when_resuming_with_optimizer_state(tra
     monkeypatch.setattr(ppo.common, "track_names", lambda spec, **kw: ["real:alpha", "real:beta"])
     monkeypatch.setattr(ppo, "load_checkpoint", fake_load_checkpoint)
     monkeypatch.setattr(ppo, "save_checkpoint", lambda *a, **k: None)
+    # PPO reads architecture metadata before delegating weight loading to the stub.
+    torch.save({"meta": {}}, tmp_path / "x.pt")
     monkeypatch.setattr(sys, "argv", ["ppo", "--device", "cpu", "--total", "8", "--horizon", "2",
                                       "--epochs", "1", "--minibatch", "4", "--init", str(tmp_path / "x.pt"),
                                       "--wandb", "disabled"])

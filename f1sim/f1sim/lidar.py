@@ -20,6 +20,7 @@ HIT_NONE, HIT_DUCT, HIT_TALL, HIT_GROUND, HIT_CAR = 0, 1, 2, 3, 4
 
 
 _CAR_SLICES = {}
+_GATHERED_RAY_LIMIT = 4096
 
 
 def car_slices(device):
@@ -40,6 +41,93 @@ def car_slices(device):
 
 def ray_slices_hits(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor, poses: torch.Tensor,
                     scale: torch.Tensor, chunk: int = 32):
+    """Intersect car outlines, using bounded gathered CUDA tiles when available.
+
+    The exact gathered helper is efficient for a few thousand rays, but its per-ray segment
+    gather must stay bounded. CUDA batches are therefore tiled over beams (and over batch rows
+    when a batch itself is larger than the limit); CPU keeps the streamed implementation.
+    """
+    if k.is_cuda and k.numel() <= _GATHERED_RAY_LIMIT:
+        return _ray_slices_hits_gathered(origin, dh, k, poses, scale)
+    if k.is_cuda:
+        return _ray_slices_hits_tiled(origin, dh, k, poses, scale)
+    return _ray_slices_hits_streamed(origin, dh, k, poses, scale, chunk)
+
+
+def _ray_slices_hits_gathered(origin, dh, k, poses, scale):
+    # Height spacing is immutable asset metadata. Reading it on the CPU avoids
+    # synchronizing CUDA for two Python scalars on every scan.
+    z_cpu, _, _ = car_slices("cpu")
+    _, segs, valid = car_slices(k.device)
+    dz, z0 = float(z_cpu[1] - z_cpu[0]), float(z_cpu[0])
+    levels = segs.shape[0]
+    best = torch.full_like(k, float("inf"))
+    slen = torch.sqrt(1.0 + k * k)
+    for c in range(poses.shape[1]):
+        px, py, pyaw = poses[:, c, 0:1], poses[:, c, 1:2], poses[:, c, 2:3]
+        cy, sy = torch.cos(pyaw), torch.sin(pyaw)
+        ox, oy = origin[..., 0] - px, origin[..., 1] - py
+        lx, ly = ox * cy + oy * sy, -ox * sy + oy * cy
+        dx, dy = dh[..., 0] * cy + dh[..., 1] * sy, -dh[..., 0] * sy + dh[..., 1] * cy
+        t_c = (-lx * dx - ly * dy).clamp_min(0.0)
+        lvl = ((origin[..., 2] + k * t_c - z0) / dz).round().long()
+        in_band = (lvl >= 0) & (lvl < levels)
+        safe_lvl = lvl.clamp(0, levels - 1)
+        sg = segs[safe_lvl]
+        sc = scale[:, c, None, None]
+        ax, ay = sg[..., 0] * sc, sg[..., 1] * sc
+        bx, by = sg[..., 2] * sc, sg[..., 3] * sc
+        ex, ey = bx - ax, by - ay
+        den = dx[..., None] * ey - dy[..., None] * ex
+        den = torch.where(den.abs() < 1e-9, torch.full_like(den, 1e-9), den)
+        wx, wy = ax - lx[..., None], ay - ly[..., None]
+        t = (wx * ey - wy * ex) / den
+        u = (wx * dy[..., None] - wy * dx[..., None]) / den
+        ok = (t > 0.0) & (u >= 0.0) & (u <= 1.0) & in_band[..., None] & valid[safe_lvl]
+        t_best = torch.where(ok, t, torch.full_like(t, float("inf"))).min(-1).values
+        best = torch.minimum(best, t_best * slen)
+    return best, torch.isfinite(best)
+
+
+def _ray_slices_hits_tiled(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor,
+                            poses: torch.Tensor, scale: torch.Tensor):
+    """Run the exact gathered implementation in bounded CUDA tiles.
+
+    For normal training batches (``B <= 4096``), only beams are tiled so every environment
+    remains in one helper call. If ``B`` is larger, batch rows are tiled too; each helper call
+    still contains at most ``_GATHERED_RAY_LIMIT`` rays and receives matching car rows.
+    """
+    B, N = k.shape
+    if B == 0 or N == 0:
+        return torch.full_like(k, float("inf")), torch.zeros_like(k, dtype=torch.bool)
+
+    if B <= _GATHERED_RAY_LIMIT:
+        b_tile = B
+        n_tile = max(1, _GATHERED_RAY_LIMIT // B)
+    else:
+        b_tile = max(1, _GATHERED_RAY_LIMIT // min(N, _GATHERED_RAY_LIMIT))
+        n_tile = max(1, min(N, _GATHERED_RAY_LIMIT // b_tile))
+
+    ranges_by_batch = []
+    hits_by_batch = []
+    for b0 in range(0, B, b_tile):
+        b1 = min(B, b0 + b_tile)
+        ranges_by_beam = []
+        hits_by_beam = []
+        for n0 in range(0, N, n_tile):
+            n1 = min(N, n0 + n_tile)
+            r, h = _ray_slices_hits_gathered(
+                origin[b0:b1, n0:n1], dh[b0:b1, n0:n1], k[b0:b1, n0:n1],
+                poses[b0:b1], scale[b0:b1])
+            ranges_by_beam.append(r)
+            hits_by_beam.append(h)
+        ranges_by_batch.append(torch.cat(ranges_by_beam, dim=1))
+        hits_by_batch.append(torch.cat(hits_by_beam, dim=1))
+    return torch.cat(ranges_by_batch, dim=0), torch.cat(hits_by_batch, dim=0)
+
+
+def _ray_slices_hits_original_streamed(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor,
+                             poses: torch.Tensor, scale: torch.Tensor, chunk: int = 32):
     """Beams against the car mesh outlines. origin (B,N,3), dh (B,N,2), k (B,N); poses (B,C,3) x, y,
     yaw of each car in view; scale (B,C) build size. Returns (3D range (B,N), hit (B,N)).
 
@@ -88,6 +176,12 @@ def ray_slices_hits(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor, pos
         closer = torch.isfinite(t_best) & (r < best)
         best = torch.where(closer, r, best); hit = hit | torch.isfinite(t_best)
     return best, hit
+
+
+def _ray_slices_hits_streamed(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor,
+                              poses: torch.Tensor, scale: torch.Tensor, chunk: int = 32):
+    """Compatibility entry point for the unchanged streamed mesh oracle."""
+    return _ray_slices_hits_original_streamed(origin, dh, k, poses, scale, chunk)
 
 
 def ray_box_hits(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor, boxes: torch.Tensor, dims: torch.Tensor,

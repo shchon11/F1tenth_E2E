@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
+import math
 import os
 import random
 import time
@@ -36,6 +38,7 @@ from ..gym_env import EnvConfig, OPP_FUTURE_MODELS
 from ..opp_token import OPP_TOKEN_MODES, validate_opp_token
 from ..mpc import ACT_DIM, N_KNOTS
 from ..interactive_teacher import DEFAULT_OFFSETS, DEFAULT_SPEEDS, InteractiveTeacher, TeacherCost
+from .. import tracks as track_catalog
 from ..params import Config
 from . import common
 from . import opponent_config as opp_cfg
@@ -56,8 +59,14 @@ class StepBuffer:
         self.channels = tuple(c for c in SCAN_CHANNELS if c in channels)
         self.keep_mem = "memory" in self.channels
         self.scan, self.pro, self.lab, self.newep, self.gap, self.mem = [], [], [], [], [], []
+        self.valid = []
 
-    def add(self, scan_now, proprio, label, new_episode, gap=None, mem=None):
+    def add(self, scan_now, proprio, label, new_episode, gap=None, mem=None, valid=None):
+        valid = (torch.ones(label.shape[0], dtype=torch.bool) if valid is None
+                 else valid.detach().to(device="cpu", dtype=torch.bool).clone())
+        if valid.shape != label.shape[:1]:
+            raise ValueError("label validity must have one entry per environment")
+        self.valid.append(valid)
         self.scan.append(scan_now.to(torch.float16).cpu()); self.pro.append(proprio.to(torch.float16).cpu())   # a 1 s proprio history is 322 floats/sample
         self.lab.append(label.cpu()); self.newep.append(new_episode.cpu())
         self.gap.append((torch.zeros(label.shape[0]) if gap is None else gap.detach().float().cpu()))
@@ -69,9 +78,13 @@ class StepBuffer:
     def finalize(self):
         self.S = torch.stack(self.scan); self.P = torch.stack(self.pro); self.L = torch.stack(self.lab); self.N = torch.stack(self.newep)
         self.G = torch.stack(self.gap)                     # |student - teacher| at collection time
+        self.V = torch.stack(self.valid)
+        self.valid_indices = self.V.reshape(-1).nonzero(as_tuple=True)[0]
+        self.valid_count = self.valid_indices.numel()
         self.M = torch.stack(self.mem) if self.keep_mem else None
         self.T, self.B = self.S.shape[:2]
         self.scan, self.pro, self.lab, self.newep, self.gap, self.mem = [], [], [], [], [], []
+        self.valid = []
         return self
 
     def __len__(self):
@@ -105,19 +118,22 @@ class StepBuffer:
         within 2 %, but in the second before a collision the error is 4-10x that. A uniform loss over
         the buffer therefore optimises the on-line majority and leaves the recovery states -- the
         ones that actually end episodes -- effectively unweighted."""
+        if not self.valid_count:
+            raise ValueError("cannot sample a buffer with no valid teacher labels")
         n_hard = int(n * hard_frac)
-        t = torch.randint(self.T, (n - n_hard,)); b = torch.randint(self.B, (n - n_hard,))
+        idx = self.valid_indices[torch.randint(self.valid_count, (n - n_hard,))]
         if n_hard:
-            w = self.G.reshape(-1).double().clamp_min(0.0) ** power
+            # Index first: invalid gaps may themselves be non-finite.
+            w = self.G.reshape(-1)[self.valid_indices].double().clamp_min(0.0) ** power
             if float(w.sum()) <= 0:
-                th = torch.randint(self.T, (n_hard,)); bh = torch.randint(self.B, (n_hard,))
+                picked = torch.randint(self.valid_count, (n_hard,))
             else:
-                idx = torch.multinomial(w, n_hard, replacement=True)
-                th, bh = idx // self.B, idx % self.B
-            t = torch.cat([t, th]); b = torch.cat([b, bh])
+                picked = torch.multinomial(w, n_hard, replacement=True)
+            idx = torch.cat([idx, self.valid_indices[picked]])
+        t, b = idx // self.B, idx % self.B
         return self.samples_at(t, b, device)
 
-    def sample_chunks(self, n: int, length: int, device):
+    def sample_chunks(self, n: int, length: int, device, *, return_valid: bool = False):
         """`n` contiguous chunks of `length` steps: (scan (L,n,C,N), proprio (L,n,P), label (L,n,A),
         keep (L,n)).
 
@@ -136,7 +152,9 @@ class StepBuffer:
         scan, pro, lab = self.samples_at(ts.reshape(-1), bs.reshape(-1), device)
         keep = (~self.N[ts, bs]).to(device)
         shape = lambda x: x.view(length, n, *x.shape[1:])
-        return shape(scan), shape(pro), shape(lab), keep
+        result = (shape(scan), shape(pro), shape(lab), keep)
+        # Validity is supervision-only; it must never reset recurrence or remove frames.
+        return result + (self.V[ts, bs].to(device),) if return_valid else result
 
 
 #: `--speed-loss asym` constants, declared here and recorded in every checkpoint the run writes.
@@ -249,6 +267,31 @@ def rng_island(env):
         np.random.set_state(saved["np"])
 
 
+def collection_steps(steps: int, solo_fraction: float):
+    """Split a fixed learner-step budget; both cohorts have one learner per race."""
+    if steps < 1 or not math.isfinite(solo_fraction) or not 0 <= solo_fraction < 1:
+        raise ValueError("--steps must be positive and --solo-fraction must be finite in [0, 1)")
+    solo = int(math.floor(steps * solo_fraction + 0.5))
+    if solo_fraction and (solo < 1 or solo >= steps):
+        raise ValueError("--steps is too small to collect both solo and traffic at this --solo-fraction")
+    return solo, steps - solo
+
+
+def bare_track_names(names):
+    """Remove authored and procedural obstacles, retaining base map and travel direction."""
+    result = []
+    for name in names:
+        sc = track_catalog.parse(name)
+        if sc.raw:
+            raise ValueError(f"cannot derive a guaranteed empty track from {name!r}; use --solo-tracks")
+        bare = replace(sc.with_options(obstacle="bare"), asset="", scale=1.0).legacy()
+        if bare not in result:
+            result.append(bare)
+    if not result:
+        raise ValueError("solo collection needs at least one track")
+    return result
+
+
 def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0, need_gap=False):
     """Roll the env for `steps`, labelling every state with the teacher and storing it.
 
@@ -258,6 +301,9 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
     channels the runtime is inert and this is the loop it always was.
     """
     obs, info = env.reset()
+    # Only the primary learner is labelled. Opponent rows are driven by their configured
+    # scripted/policy population and are not the trajectory this DAgger intervention visited.
+    ids = torch.arange(0, env.B, env.M, device=device)
     rt = runtime_for(model, env.B, device)
     new_ep = torch.ones(env.B, dtype=torch.bool, device=device)
     with torch.no_grad():
@@ -268,11 +314,14 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
             seen = rt.observe(scan, pro)                # advances the occupancy channel, always
             mem = None if rt.scan is None or rt.scan.mem is None else rt.scan.mem.clone()
             label = env.teacher_label(teacher)
+            valid = getattr(teacher, "last_label_valid", None)
             student = None
             if beta < 1.0 or need_gap:
                 student, _lp, rt.hidden = model.act(seen, pro, deterministic=True, h=rt.hidden)
             gap = None if student is None else (student - label).abs().mean(1)
-            buf.add(scan[:, 0], pro, label, new_ep, gap, mem)
+            buf.add(scan[ids, 0], pro[ids], label[ids], new_ep[ids],
+                    None if gap is None else gap[ids], None if mem is None else mem[ids],
+                    valid=None if valid is None else valid[ids])
             if beta >= 1.0:
                 a = label                               # iteration 0 drives the teacher
             else:
@@ -292,18 +341,30 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
 def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float = 0.0, hard_power: float = 1.0,
                  log_every: int = 25, chunk: int = 0, speed_loss: str = "symmetric",
                  v_max: float = 10.0):
-    n_total = sum(len(b) for b in bufs)
+    n_stored = sum(len(b) for b in bufs)
+    n_total = sum(b.valid_count for b in bufs)
+    log({"dagger/valid_labels": n_total, "dagger/invalid_labels": n_stored - n_total})
+    if not n_total:
+        log({"dagger/skipped_no_valid_labels": 1, "dagger/optimizer_updates": 0})
+        return 0.0  # Explicitly skipped, not an observed zero training loss.
     steps = max(1, int(epochs * n_total / batch))
-    buffer_weights = torch.tensor([len(b) for b in bufs], dtype=torch.float)
+    buffer_weights = torch.tensor([b.valid_count for b in bufs], dtype=torch.float)
     recurrent = model.actor.has_memory
     losses, knots, speeds = [], [], []
     for i in range(steps):
         b = bufs[torch.multinomial(buffer_weights, 1).item()]
         if recurrent:
             L = max(1, int(chunk))
-            scan, pro, lab, keep = b.sample_chunks(max(1, batch // L), L, device)
+            scan, pro, lab, keep, valid = b.sample_chunks(max(1, batch // L), L, device,
+                                                        return_valid=True)
+            if not valid.any():
+                continue
             mu = actor_sequence(model.actor, scan, pro, keep)
-            lab = lab.reshape(-1, lab.shape[-1])
+            # Process every frame, then select targets before loss arithmetic (NaN invalid
+            # labels must not contaminate either loss or gradients).
+            valid = valid.reshape(-1)
+            mu = mu[valid]
+            lab = lab.reshape(-1, lab.shape[-1])[valid]
         else:
             scan, pro, lab = b.sample(batch, device, hard_frac, hard_power)
             mu = model.actor(scan, pro)
@@ -317,7 +378,9 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
                  "dagger/knot_loss": float(np.mean(knots[-log_every:])),
                  "dagger/speed_loss": float(np.mean(speeds[-log_every:])),
                  "dagger/train_step": i, "dagger/lr": opt.param_groups[0]["lr"]})
-    return float(np.mean(losses[-500:]))
+    log({"dagger/optimizer_updates": len(losses),
+         "dagger/skipped_empty_batches": steps - len(losses)})
+    return float(np.mean(losses[-500:])) if losses else 0.0
 
 
 def build_teacher(kind: str, rls, env, a):
@@ -335,7 +398,7 @@ def build_teacher(kind: str, rls, env, a):
                             cand_iters=a.teacher_cand_iters,
                             future_model=a.opp_future_model)
     return it, (f"interactive teacher: {it.n_candidates} candidates "
-                f"({len(it.offsets)} offsets x {len(it.speeds)} speeds), {it.horizon_s:g} s horizon, "
+                f"({len(it.offsets)} offsets x {len(it.speeds)} speeds + braking/evasion), {it.horizon_s:g} s horizon, "
                 f"futures '{a.opp_future_model}', cost {cost}")
 
 
@@ -343,7 +406,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default=f"dagger_{time.strftime('%m%d_%H%M')}")
     ap.add_argument("--envs", type=int, default=1024); ap.add_argument("--tracks", default="train", help="'train', 'eval' or comma separated catalog names")
-    ap.add_argument("--iters", type=int, default=8); ap.add_argument("--steps", type=int, default=250, help="env steps per iteration (x envs samples)")
+    ap.add_argument("--iters", type=int, default=8); ap.add_argument("--steps", type=int, default=250, help="learner steps per iteration (x envs/race-size labels), split across solo/traffic when enabled")
+    ap.add_argument("--solo-fraction", type=float, default=0.0,
+                    help="fraction of learner-labelled samples collected on genuinely empty tracks; [0,1)")
+    ap.add_argument("--solo-tracks", default="",
+                    help="optional solo map set; defaults to selected traffic bases; always removes obstacles")
     ap.add_argument("--epochs", type=float, default=3.0); ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--beta0", type=float, default=0.6)
     ap.add_argument("--speed-cap", type=float, default=8.0); ap.add_argument("--device", default="cuda")
@@ -447,7 +514,18 @@ def main():
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
     opp_cfg.validate(a)
+    if a.keep_iters < 1:
+        raise SystemExit("--keep-iters must be positive")
     token = validate_opp_token(a.opp_token)
+    try:
+        solo_steps, traffic_steps = collection_steps(a.steps, a.solo_fraction)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if a.solo_tracks and not solo_steps:
+        raise SystemExit("--solo-tracks needs a positive --solo-fraction")
+    if solo_steps and (a.race_size < 2 or a.teacher_kind != "interactive" or token != "off"):
+        raise SystemExit("--solo-fraction needs --race-size >= 2, --teacher interactive and --opp-token off "
+                         "so empty and traffic observations share the same actor contract")
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
@@ -490,6 +568,35 @@ def main():
     teacher, teacher_desc = build_teacher(a.teacher_kind, rls, env, a)
     print(f"teacher: {teacher_desc}", flush=True)
     spec = common.obs_spec(env)
+    solo_env = solo_teacher = None
+    solo_names = []
+    if solo_steps:
+        solo_names = bare_track_names(common.track_names(a.solo_tracks, seed=a.seed) if a.solo_tracks else names)
+        solo_tracks, solo_rls = common.load_tracks(solo_names, racelines=True,
+            **({} if a.raceline_margin is None else {"margin": a.raceline_margin}))
+        if not solo_tracks or any(t.props for t in solo_tracks):
+            raise SystemExit("solo tracks must be nonempty and contain no placed obstacles")
+        # A separate simulator with M=1: no hidden/distant cars or invisible obstacle geometry.
+        solo_env = common.make_env(solo_tracks, env.B // env.M, device,
+            EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
+                      scan_stack=a.scan_stack, scan_stride=a.scan_stride, opp_token="off",
+                      race_size=1, compile_tracker=not a.eager),
+            cfg=replace(cfg, sim=replace(cfg.sim)), seed=a.seed + 1, rls=solo_rls,
+            teacher_grip=a.teacher_grip, teacher_recover_time=a.teacher_recover_time)
+        if common.obs_spec(solo_env) != spec:
+            raise SystemExit("solo and traffic observation contracts differ")
+        solo_teacher, _solo_desc = build_teacher("raceline", solo_rls, solo_env, a)
+    mix = {"requested_solo_fraction": a.solo_fraction, "solo_fraction": solo_steps / a.steps,
+           "solo_steps": solo_steps, "traffic_steps": traffic_steps,
+           "learners_per_step": env.B // env.M, "solo_tracks": solo_names,
+           "traffic_tracks": names,
+           "traffic_loaded_tracks": [t.name for t in tracks],
+           "solo_loaded_tracks": [t.name for t in solo_tracks] if solo_steps else [],
+           "solo_teacher": "raceline" if solo_steps else None,
+           "traffic_teacher": a.teacher_kind, "opponents": opp_cfg.describe(a),
+           "opponent_slots": opp_cfg.slots_config(a)}
+    print(f"collection: solo {solo_steps} / traffic {traffic_steps} steps x {env.B // env.M} learner(s) "
+          f"(solo {mix['solo_fraction']:.1%}); opponent rows excluded", flush=True)
     priv_dim = env.privileged(env.reset()[1] and env.last_result).shape[1]
     chan = scan_channel_spec({"channels": a.scan_channels, "memory_tau_s": a.scan_memory_tau}) if a.scan_channels else None
     mem_spec = memory_spec(hidden_size=a.memory_hidden) if a.memory != "off" else None
@@ -536,13 +643,17 @@ def main():
                          f"{spec.proprio_dim}: --opp-token / --hist-len do not match the checkpoint.")
     opt = torch.optim.Adam(model.actor.parameters(), lr=a.lr)
     run = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "tracks": names,
-                                               "teacher_desc": teacher_desc}, group="dagger", mode=a.wandb)
+                                               "teacher_desc": teacher_desc, "collection_mix": mix,
+                                               "opp_slots": opp_cfg.slots_config(a)}, group="dagger", mode=a.wandb)
     out = common.run_dir(a.name)
     # The run's own curve, next to the students. Written whatever `--wandb` is set to: the console's
     # dashboard reads this file, and a DAgger run's `iter` line was never parsed by anything.
     progress_log = common.ProgressLog(out)
     log = lambda d: run.log(d)
     env.sim.warmup()
+    if solo_env is not None:
+        solo_env.sim.warmup()
+    buffer_iters = []
     bufs = []
     teacher_metrics = None
     m = None; m_iter = -1; t_teach = 0.0
@@ -550,10 +661,23 @@ def main():
     for it in range(a.start_iter, a.start_iter + a.iters):
         beta = 1.0 if it == 0 else a.beta0 * (0.5 ** (it - 1))
         tm = common.Timer()
-        buf = collect(env, model, teacher, a.steps, beta, device,
-                      StepBuffer(spec.scan_stack, spec.scan_stride, a.scan_channels),
-                      noise=0.05 if it else 0.0, need_gap=a.hard_frac > 0).finalize()
-        bufs.append(buf); bufs = bufs[-a.keep_iters:]; t_col = tm.lap()        # host RAM: keep the last few iterations (14 GB laptop)
+        current = []
+        counts = {}
+        for cohort, active_env, active_teacher, n_steps in (
+                ("traffic", env, teacher, traffic_steps),
+                ("solo", solo_env, solo_teacher, solo_steps)):
+            counts[cohort] = 0
+            if not n_steps:
+                continue
+            buf = collect(active_env, model, active_teacher, n_steps, beta, device,
+                          StepBuffer(spec.scan_stack, spec.scan_stride, a.scan_channels),
+                          noise=0.05 if it else 0.0, need_gap=a.hard_frac > 0).finalize()
+            counts[cohort] = len(buf)
+            current.append(buf)
+        buffer_iters.append(current)
+        buffer_iters = buffer_iters[-a.keep_iters:]
+        bufs = [b for iteration in buffer_iters for b in iteration]
+        t_col = tm.lap()        # host RAM: keep the last few iterations (14 GB laptop)
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log, a.hard_frac, a.hard_power,
                             a.log_every, chunk=a.chunk_length, speed_loss=a.speed_loss,
                             v_max=env.ecfg.v_max_policy); t_tr = tm.lap()
@@ -575,6 +699,7 @@ def main():
         t_teach = tm.lap()
         scalar = lambda d: {k: v for k, v in d.items() if not isinstance(v, list)}      # per-track arrays stay out of W&B
         log({"dagger/iter": it, "dagger/beta": beta, "dagger/samples": sum(len(b) for b in bufs), "dagger/final_loss": loss,
+             "dagger/solo_samples": counts["solo"], "dagger/traffic_samples": counts["traffic"],
              **({f"student/{k}": v for k, v in scalar(m).items()} if do_eval else {}),
              **{f"teacher/{k}": v for k, v in scalar(teacher_metrics).items()},
              "time/collect_s": t_col, "time/train_s": t_tr, "time/eval_s": t_ev,
@@ -588,6 +713,8 @@ def main():
         # shape as PPO's record and told apart by "kind", so one reader serves both.
         record = {"kind": "dagger", "iter": it, "total": a.start_iter + a.iters, "beta": beta,
                   "samples": sum(len(b) for b in bufs), "loss": loss,
+                  "solo_samples": counts["solo"], "traffic_samples": counts["traffic"],
+                  "collection_mix": mix,
                   "teacher_coll_per_km": teacher_metrics["collisions_per_km"],
                   "teacher_prog_mps": teacher_metrics["progress_rate_mps"],
                   "teacher_lap_s": teacher_metrics["lap_time_s"],
@@ -618,6 +745,7 @@ def main():
                 "samples": sum(len(b) for b in bufs), "metrics": m, "metrics_from_iter": m_iter,
                 "teacher": teacher_metrics,
                 "action_mode": a.action_mode, "teacher_kind": a.teacher_kind, "teacher_desc": teacher_desc,
+                "collection_mix": mix, "solo_samples": counts["solo"], "traffic_samples": counts["traffic"],
                 "opp_token": token, "opp_future_model": a.opp_future_model,
                 # declared before training and carried by every checkpoint, so an arm's loss is
                 # never something that has to be reconstructed from a shell history

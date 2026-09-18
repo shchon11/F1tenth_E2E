@@ -315,7 +315,21 @@ class SessionController(QtCore.QObject):
             self._proc = ctx.Process(target=target, args=(ctl_theirs, frames_theirs),
                                      kwargs={"log_path": os.path.join(self.runtime_dir, "worker.log")},
                                      name="f1sim-sim-worker", daemon=False)
-            self._proc.start()
+            # These small raceline/solver matrices get slower when each worker
+            # launches a full BLAS thread pool. Spawn must inherit this before
+            # importing NumPy; setting it inside sim_worker.main is too late.
+            thread_keys = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                           "NUMEXPR_NUM_THREADS")
+            previous = {key: os.environ.get(key) for key in thread_keys}
+            try:
+                os.environ.update({key: "1" for key in thread_keys})
+                self._proc.start()
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
             ctl_theirs.close()
             frames_theirs.close()
         except Exception as exc:

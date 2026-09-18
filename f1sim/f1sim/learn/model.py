@@ -1213,7 +1213,7 @@ def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
     the opposite, because "the migration silently reinitialised something" and "the arms differ" look
     identical in the results.
     """
-    ck = torch.load(path, map_location=device)
+    ck = torch.load(path, map_location=device, weights_only=True)
     meta = dict(ck["meta"]); meta.update(override or {})
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")
@@ -1279,7 +1279,7 @@ def load_for_conditioning(path, device, cond_dim: int, cond_meta: dict,
     `allow_controller` is the same gate as in `load_checkpoint`: this is the other loader path into
     a training job, so leaving it open would let a controller-trained checkpoint in through the side.
     """
-    ck = torch.load(path, map_location=device)
+    ck = torch.load(path, map_location=device, weights_only=True)
     meta = dict(ck["meta"]); meta.update(override or {})
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")
@@ -1421,7 +1421,7 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     same gates `load_checkpoint` documents; this is another loader path into a training job, so
     leaving them open would let a refused checkpoint in through the side.
     """
-    ck = torch.load(path, map_location=device)
+    ck = torch.load(path, map_location=device, weights_only=True)
     meta = dict(ck["meta"]); meta.update(override or {})
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")

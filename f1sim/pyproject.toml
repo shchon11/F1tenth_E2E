@@ -20,6 +20,7 @@ include = ["f1sim*"]
 
 [tool.setuptools.package-data]
 f1sim = ["assets/*.glb", "assets/*.npz", "assets/maps/*.pgm", "assets/maps/*.yaml",
+         "viewer/console/training_schema.json",
          "viewer/static/*.html", "viewer/static/*.js", "viewer/static/three/*.js",
          "viewer/static/three/addons/*/*.js",
          # tests/benchmark/test_frozen_placement.py resolves this through the imported package,

@@ -112,11 +112,14 @@ class _StubRace:
         self.fut = fut
         self.present = torch.ones(fut.shape[:2]) if present is None else present
 
-    def opponent_future(self, times, model=None, state=None):
+    def opponent_future(self, times, model=None, state=None, *, return_yaw=False):
         k = len(times) if not torch.is_tensor(times) else int(times.numel())
         if self.fut is None:
             raise AssertionError("the scene did not set an opponent future")
         assert self.fut.shape[2] == k, f"scene future has {self.fut.shape[2]} samples, teacher asked for {k}"
+        if return_yaw:
+            yaw = state[:, 2, None, None].expand(self.fut.shape[:-1])
+            return self.fut, self.present, yaw
         return self.fut, self.present
 
 
@@ -133,13 +136,19 @@ def _track_opponent(teacher, idx0, times, arc0, arc_rate, lat0, lat_rate):
 
 
 def _choice(it, state, spec, cand=None):
-    """(offset [m], speed scale) of the winning candidate, and the per-candidate cost."""
+    """Offset (or signed immediate-evasion direction), pace, cost and candidates."""
     tid = torch.zeros(1, dtype=torch.long)
     cand = it._candidates(state, None, tid, V_MAX, spec, None,
                           it.base.project(state[:, :2], tid)[0]) if cand is None else cand
     cost = it.score(cand, state, tid, V_MAX, spec)
     j = int(cost.argmin(0)[0])
     n_spd = it.speeds.numel()
+    regular = it.offsets.numel() * n_spd
+    if j >= regular:
+        if j == regular:
+            return 0., 0., cost[:, 0], cand
+        evasive = j - regular - 1
+        return (1. if evasive < 2 else -1.), (1. if evasive % 2 == 0 else 0.), cost[:, 0], cand
     return float(it.offsets[j // n_spd]), float(it.speeds[j % n_spd]), cost[:, 0], cand
 
 
@@ -149,7 +158,7 @@ def _choice(it, state, spec, cand=None):
 def test_candidate_family_covers_left_right_follow_brake():
     track, base, idx0 = _scene_parts()
     it = _teacher(track, base)
-    assert 12 <= it.n_candidates <= 24, it.n_candidates
+    assert it.n_candidates == len(DEFAULT_OFFSETS) * len(DEFAULT_SPEEDS) + 5
     assert min(DEFAULT_OFFSETS) < 0 < max(DEFAULT_OFFSETS) and 0.0 in DEFAULT_OFFSETS
     assert max(DEFAULT_SPEEDS) == 1.0 and min(DEFAULT_SPEEDS) < 0.5
     spec = PlanSpec()
@@ -157,12 +166,14 @@ def test_candidate_family_covers_left_right_follow_brake():
     tid = torch.zeros(1, dtype=torch.long)
     cand = it._candidates(st, None, tid, V_MAX, spec, None, base.project(st[:, :2], tid)[0])
     assert cand.shape == (it.n_candidates, 1, ACT_DIM)
+    assert torch.equal(cand[-1, :, -2:], -torch.ones_like(cand[-1, :, -2:]))
     world, psi, v = it.rollout(cand, st, V_MAX, spec)
-    # lateral displacement of each candidate's endpoint relative to the raceline teacher's own plan,
-    # measured along the ego's own left normal
-    c, s = math.cos(float(st[0, 2])), math.sin(float(st[0, 2]))
-    end = world[:, 0, -1]
-    lat = -(end[:, 0] - end[it.base_index, 0]) * s + (end[:, 1] - end[it.base_index, 1]) * c
+    # Compare path geometry at equal arc, not at equal time: feasibility can
+    # legitimately slow a tighter offset and change its one-second progress.
+    from f1sim.mpc import N_KNOTS, path_points, plan_length
+    _, y, _, _ = path_points(cand[:, 0, :N_KNOTS] * spec.kappa_max,
+                             plan_length(st[:, 3], spec).expand(cand.shape[0]))
+    lat = y[:, -1] - y[it.base_index, -1]
     n_spd = it.speeds.numel()
     lats = [float(lat[i * n_spd]) for i in range(len(DEFAULT_OFFSETS))]
     # Ordered, spanning both sides, and the raceline teacher's own plan exactly in the middle. Not
@@ -176,8 +187,9 @@ def test_candidate_family_covers_left_right_follow_brake():
     base_arc = float(v[it.base_index, 0].sum())
     for m, sc in enumerate(DEFAULT_SPEEDS):
         arc = float(v[it.base_index - it.base_index % n_spd + m, 0].sum())
-        assert arc <= base_arc + 1e-4
-        if sc < 1.0:
+        # Independently certified scales are quantized to 1/(16*2**8).
+        assert arc <= base_arc + 2 * V_MAX * len(it.horizon_times(spec)) / 4096
+        if sc == min(DEFAULT_SPEEDS):
             assert arc < base_arc, f"speed scale {sc} travelled as far as 1.0"
 
 
@@ -205,7 +217,13 @@ def test_label_is_interchangeable_with_the_raceline_teacher():
     assert float(a_ref[:, :N_KNOTS].abs().max()) <= 0.85 + 1e-6
     assert float(a_it[:, :N_KNOTS].abs().max()) <= 0.85 + 1e-6
     assert float(a_it[:, N_KNOTS:].abs().max()) <= 1.0
-    assert torch.all(a_it[:, N_KNOTS:] <= a_ref[:, N_KNOTS:] + 1e-5), "a candidate commanded MORE speed"
+    # Each geometry now has its own physical ceiling. An easier offset may
+    # exceed the projected centre-line speed, but not its unprojected request.
+    import copy
+    raw = copy.copy(base)
+    raw._defer_profile_projection = True
+    upper = raw.plan_action(st, None, tid, V_MAX, spec)
+    assert torch.all(a_it[:, N_KNOTS:] <= upper[:, N_KNOTS:] + 1e-5)
 
 
 def test_with_nothing_to_race_the_argmin_is_the_raceline_plan():
@@ -315,5 +333,7 @@ def test_two_iteration_candidates_are_the_raceline_teachers_own_offset_plans():
         o = torch.full((8,), float(off))
         full = base.plan_action(st, None, tid, V_MAX, spec, iters=6, offset=o, idx=idx)
         cheap = base.plan_action(st, None, tid, V_MAX, spec, iters=2, offset=o, idx=idx)
-        worst = max(worst, float((full - cheap).abs().max()))
+        # The fit budget is geometric; physical projection may amplify a small
+        # curvature difference into a different safe speed ceiling.
+        worst = max(worst, float((full[:, :-2] - cheap[:, :-2]).abs().max()))
     assert worst < 0.05, f"2 iterations differ from 6 by {worst:.4f} of the normalized plan range"

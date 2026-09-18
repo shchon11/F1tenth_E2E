@@ -33,6 +33,7 @@ import math
 import os
 import sys
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -483,7 +484,8 @@ def latest_run() -> str:
     return best
 
 
-def default_consumer_refusal(path: str) -> Optional[str]:
+def default_consumer_refusal(path: str, *, allowed_controller: Optional[str] = None,
+                            automatic_selection: bool = False) -> Optional[str]:
     """Why `load_checkpoint(path, ...)` with no opt-in flag would refuse, or None if the **metadata**
     is supported.
 
@@ -502,6 +504,10 @@ def default_consumer_refusal(path: str) -> Optional[str]:
     strictness are the loader's business and it still decides; nothing here relaxes any guard, and a
     caller that ignores this and loads directly gets exactly the same refusal. This exists so that
     "open the newest run" can mean "the newest run this viewer can open".
+
+    ``automatic_selection`` additionally quarantines local-v2 research controllers
+    without an explicit controller-level qualification. Named/manual research loads
+    retain the ordinary contract and estimator checks.
 
     `mmap=True, weights_only=True` keeps it cheap and safe: tensor storages are never faulted in, so
     probing every run reads metadata rather than hundreds of megabytes, and nothing in the file is
@@ -543,7 +549,14 @@ def default_consumer_refusal(path: str) -> Optional[str]:
         exp = ((ck.get("extra") or {}).get("experiment") or {})
         arm = str(((exp.get("controller") or {}).get("arm")) or "legacy")
         if arm != "legacy":
-            return f"controller arm {arm!r}"
+            if arm != allowed_controller:
+                return f"controller arm {arm!r}"
+            from .grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
+            record = validate_runtime_checkpoint(ck, arm)
+            if automatic_selection:
+                refusal = automatic_selection_refusal(record)
+                if refusal is not None:
+                    return refusal
         token = str(meta.get("opp_token") or ((ck.get("extra") or {}).get("spec") or {}).get("opp_token") or "off")
         if token != "off":
             return f"privileged opponent tokens (opp_token={token!r}; an oracle, not a policy)"
@@ -570,7 +583,7 @@ def default_consumer_refusal(path: str) -> Optional[str]:
     return None
 
 
-def latest_compatible_run() -> tuple:
+def latest_compatible_run(*, allowed_controller: Optional[str] = None) -> tuple:
     """(newest run dir the default consumer can open, [(run, why skipped), ...] newest first).
 
     **Ordering note.** `latest_run()` ranks runs by the newest of `ppo_latest.pt` and
@@ -595,7 +608,7 @@ def latest_compatible_run() -> tuple:
             cands.append((os.path.getmtime(files[0]), d, files[0]))
     skipped = []
     for _, d, p in sorted(cands, key=lambda c: c[0], reverse=True):
-        why = default_consumer_refusal(p)
+        why = default_consumer_refusal(p, allowed_controller=allowed_controller, automatic_selection=True)
         if why is None:
             return d, skipped
         skipped.append((os.path.basename(d), why))

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 import argparse
@@ -37,6 +37,9 @@ from .memory import Hidden, memory_spec, reset_hidden
 from .motion import MOTION_HIDDEN, dv_loss, mask_loss, motion_spec
 from .model import (ActorCritic, load_checkpoint, load_for_conditioning, load_for_memory,
                     save_checkpoint)
+from .policy_adaptation import (RecurrentReference, SpeedRowFreeze, require_exact_actor,
+                                resolve_reference, stage_lr_kl, stage_schedule,
+                                verified_reference_stream)
 from .aligned import (ALIGNED_CONSIST_BEAMS, ALIGNED_GAP_FILL, ALIGNED_K, ALIGNED_TAU,
                       ALIGNED_TAU_REL, ALIGNED_TOL_BEAMS, ALIGNED_Z_TOL, aligned_spec)
 from .floor_head import floor_head_spec, floor_loss
@@ -91,7 +94,7 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
                      val_old, w, cond=None, hyper: PPOHyper, autocast=None,
                      freeze_actor: bool = False, sequence=None,
                      future=None, future_valid=None, beam_mask=None, dv=None,
-                     floor_label=None) -> dict:
+                     floor_label=None, reference_params=None, kl_scope="all") -> dict:
     """One PPO minibatch's loss terms, feedforward or recurrent.
 
     Lifted out of `main`'s inner loop unchanged so that (a) the recurrent path and the feedforward
@@ -201,15 +204,25 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     pg = -wmean(torch.min(ratio * adv, ratio.clamp(1 - hyper.clip, 1 + hyper.clip) * adv), w)
     v_clipped = val_old + (val - val_old).clamp(-hyper.clip, hyper.clip)
     vf = 0.5 * wmean(torch.max((val - ret) ** 2, (v_clipped - ret) ** 2), w)
-    with torch.no_grad(), ac:
-        # The reference is fed the same condition, and its projection is still zero,
-        # so it evaluates as the frozen unconditional baseline. Passing `c` keeps the
-        # call valid for a conditional actor without letting the leash move with it.
-        # `feedforward_dist` is the same call for a feedforward reference and, for a reference
-        # copied from a memory actor, states what it is: the leash is the ORIGINAL policy, so
-        # the recurrence is not run and its (zero) projection is not applied.
-        d_ref = ref.feedforward_dist(ref_scan, ref_pro, ref_cond)
-    d_ref = torch.distributions.Normal(d_ref.mean.float(), d_ref.stddev.float())
+    if reference_params is None:
+        with torch.no_grad(), ac:
+            # Preserve the historical memoryless baseline for ordinary PPO.
+            d_ref = ref.feedforward_dist(ref_scan, ref_pro, ref_cond)
+        ref_mean, ref_std = d_ref.mean.float(), d_ref.stddev.float()
+    else:
+        ref_mean, ref_std = reference_params
+        if sequence is not None:
+            ref_mean = ref_mean.reshape(T * m, -1)
+            ref_std = ref_std.reshape(T * m, -1)
+        ref_mean, ref_std = ref_mean.float(), ref_std.float()
+        if ref_mean.shape != d.mean.shape or ref_std.shape != d.stddev.shape:
+            raise ValueError("stored recurrent reference does not align with the PPO minibatch")
+    if kl_scope == "curvature":
+        ref_mean, ref_std = ref_mean[:, :6], ref_std[:, :6]
+        d = torch.distributions.Normal(d.mean.float()[:, :6], d.stddev.float()[:, :6])
+    elif kl_scope != "all":
+        raise ValueError(f"unknown KL scope {kl_scope!r}")
+    d_ref = torch.distributions.Normal(ref_mean, ref_std)
     d = torch.distributions.Normal(d.mean.float(), d.stddev.float())
     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, d).sum(1), w)
     ent_w = wmean(ent, w)
@@ -329,6 +342,14 @@ def main():
                          "Required for the conditioning arms: adding a parameter shifts the "
                          "positional keys Adam's state is indexed by, and silently re-keying them "
                          "would give the two arms different optimiser state.")
+    ap.add_argument("--adaptation", choices=("off", "speed", "full"), default="off",
+                    help="D3 recurrent auto-controller adaptation stage; off preserves ordinary PPO")
+    ap.add_argument("--reference", default="",
+                    help="immutable original D3 checkpoint for recurrent KL; inherited on resume")
+    ap.add_argument("--kl-scope", choices=("all", "curvature"), default=None,
+                    help="reference KL dimensions (adaptive default: curvature only)")
+    ap.add_argument("--research-estimator", action="store_true",
+                    help="explicitly train with an unapproved estimator candidate")
     ap.add_argument("--controller", default="legacy", choices=grip_rt.ARMS,
                     help="controller arm between the policy and the wheels. 'legacy' is the "
                          "untouched path and is the default, so an unflagged run is unchanged. "
@@ -359,6 +380,8 @@ def main():
     ap.add_argument("--log-every", type=int, default=1, help="updates between W&B rows (1 = every update)")
     ap.add_argument("--save-every", type=int, default=25); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--amp", action="store_true", help="bf16 autocast for network forward/backward (~2x faster)")
+    ap.add_argument("--progress-reward", type=float, default=EnvConfig.reward_progress, help="reward per metre of signed forward progress")
+    ap.add_argument("--alive-reward", type=float, default=EnvConfig.reward_alive, help="constant reward per control step")
     ap.add_argument("--collision-penalty", type=float, default=10.0); ap.add_argument("--steer-penalty", type=float, default=0.05)
     ap.add_argument("--proximity-penalty", type=float, default=0.5, help="per-metre penalty at zero wall gap (0 = off)")
     ap.add_argument("--safe-dist", type=float, default=0.30, help="[m] body-to-wall gap where the proximity penalty starts")
@@ -619,6 +642,20 @@ def main():
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
     a = ap.parse_args()
+    adaptive = a.adaptation != "off"
+    if adaptive:
+        if a.controller != "auto" or not a.init or a.memory != "gru":
+            raise SystemExit("--adaptation needs --controller auto, --init D3/resume, --memory gru")
+        if a.cond != "none" or a.action_mode != "plan" or a.opp_token != "off":
+            raise SystemExit("adaptive training requires ordinary 8D plan observations without oracle inputs")
+        if a.init_log_std is not None:
+            raise SystemExit("adaptive training preserves D3 action noise; --init-log-std is unsupported")
+        if a.kl_scope is None:
+            a.kl_scope = "curvature"
+    else:
+        if a.reference or a.research_estimator or a.kl_scope is not None:
+            raise SystemExit("--reference/--research-estimator/--kl-scope require --adaptation")
+        a.kl_scope = "all"
     opp_cfg.validate(a)
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
@@ -628,7 +665,7 @@ def main():
         raise SystemExit("--memory with --cond is not a supported combination: both migrate the "
                          "same checkpoint through a different loader, and nothing has measured the "
                          "two zero-initialised projections together.")
-    if (a.memory != "off" or a.scan_channels) and a.controller != "legacy":
+    if (a.memory != "off" or a.scan_channels) and a.controller != "legacy" and not adaptive:
         raise SystemExit(
             f"--memory/--scan-channels with --controller {a.controller} is not a validated "
             f"combination: the memory work is measured against the legacy tracker only, and a "
@@ -712,6 +749,7 @@ def main():
         print(f"--sim-backend {a.sim_backend} on {device.type}: physics/solver compile is off "
               f"(it is CUDA-only anyway)")
     env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.cap0, reward_collision=-abs(a.collision_penalty),
+                                                              reward_progress=a.progress_reward, reward_alive=a.alive_reward,
                                                               reward_steer_rate=a.steer_penalty, reward_proximity=a.proximity_penalty,
                                                               safe_dist=a.safe_dist, reward_wrong_way=a.wrong_way_penalty,
                                                               reward_collision_speed=a.collision_speed_penalty, proximity_speed_ref=a.proximity_speed_ref,
@@ -758,16 +796,68 @@ def main():
     # After `prepare_graph_runtime`, never before: that captures `mpc.solve` and assigns
     # `tracker._solver`, so a controller installed earlier is silently overwritten and the run
     # becomes a legacy run wearing another arm's name.
-    controller = grip_rt.ControllerRuntime(env, a.controller, a.estimator or None, device=device)
+    init_ck = torch.load(a.init, map_location="cpu", weights_only=True) if a.init else {}
+    init_extra = init_ck.get("extra") or {}
+    if adaptive:
+        common.validate_policy_observation(init_extra.get("spec"), env)
+    init_experiment = init_extra.get("experiment") or {}
+    same_stage_resume = bool(adaptive and init_experiment.get("adaptation") == a.adaptation)
+    adaptive_schedule = None
+    stage_completed = 0
+    if adaptive:
+        if a.steps_base is not None:
+            raise SystemExit("--steps-base cannot override an adaptive stage's recorded global steps")
+        if same_stage_resume and a.fresh_opt:
+            raise SystemExit("same-stage adaptive resume restores Adam; omit --fresh-opt")
+        if same_stage_resume and not init_extra.get("stage_schedule"):
+            raise SystemExit("adaptive resume checkpoint has no immutable stage_schedule")
+        stage_fields = ("lr", "lr_end", "kl_coef", "kl_decay", "cap0", "cap1", "cap_steps",
+                        "cap_gate", "cap_gate_quantile", "cap_gate_min_km", "critic_warmup",
+                        "gamma", "lam", "clip", "ent", "vf", "max_grad", "epochs", "minibatch",
+                        "aux_grip", "aux_opp", "aux_future", "aux_opp_mask", "aux_motion",
+                        "aux_floor", "seed", "race_size", "opponent", "action_mode", "memory",
+                        "scan_stack", "scan_stride", "hist_len", "controller", "kl_scope",
+                        "research_estimator", "amp", "horizon", "envs")
+        stage_hparams = {key: getattr(a, key) for key in stage_fields}
+        stage_hparams.update(tracks=list(names), opponent_slots=opp_cfg.slots_config(a),
+                             environment={key: value for key, value in asdict(env.ecfg).items()
+                                          if key != "speed_cap"})
+        stage_origin = (int(init_extra["stage_schedule"]["origin_total_steps"])
+                        if same_stage_resume else
+                        int(init_extra.get("total_steps", init_extra.get("steps", 0)) or 0))
+        try:
+            adaptive_schedule, stage_completed = stage_schedule(
+                a.adaptation, a.total, a.horizon * int(env.learner_ids.numel()),
+                stage_origin, stage_hparams,
+                previous=init_extra.get("stage_schedule") if same_stage_resume else None,
+                checkpoint_total_steps=init_extra.get("total_steps") if same_stage_resume else None,
+                checkpoint_stage_steps=init_extra.get("stage_steps") if same_stage_resume else None)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if stage_completed == adaptive_schedule["total_steps"]:
+            print(f"adaptive {a.adaptation} stage already complete "
+                  f"({stage_completed // adaptive_schedule['step_size']} updates); no training started")
+            return
+    init_controller_meta = (((init_ck.get("extra") or {}).get("experiment") or {})
+                            .get("controller"))
+    controller = grip_rt.ControllerRuntime(
+        env, a.controller, a.estimator or None, device=device,
+        research_estimator=a.research_estimator,
+        auto_profile=grip_rt.LOCAL_AUTO_PROFILE if adaptive else None,
+        checkpoint_meta=init_controller_meta if init_controller_meta and
+        init_controller_meta.get("arm") == "auto" else None)
     # `graph_rt` carries the eleven real solver arguments recorded during capture; handing them over
     # lets the controller capture its own graph instead of installing an eager solver on top of a
     # run that just paid to capture a graphed one.
     controller.install(graph_rt=graph_rt)
+    if init_controller_meta and init_controller_meta.get("arm", "legacy") != "legacy":
+        grip_rt.validate_runtime_checkpoint(init_ck, controller,
+                                            research_estimator=a.research_estimator)
     controller_on = a.controller != "legacy"
     if controller_on:
         # The *tracker* arms are the ones validated solo; `tcs` shapes a speed command and is
         # indifferent to how many cars share the track, so it is not caught by this.
-        if env.M > 1 and controller.base != "legacy":
+        if env.M > 1 and controller.base != "legacy" and not adaptive:
             raise SystemExit(f"--controller {a.controller} is validated solo only; this env has "
                              f"M={env.M} cars per race")
         print(f"controller arm: {a.controller}"
@@ -861,11 +951,30 @@ def main():
     #: Only what the checkpoint does not already have is a warm start; the rest it keeps. Without
     #: this, leg two of a recurrent run -- same command line, `--init` now pointing at leg one's
     #: output -- goes down the warm-start path and is refused.
-    init_meta = dict((torch.load(a.init, map_location="cpu").get("meta") or {})) if a.init else {}
+    init_meta = dict(init_ck.get("meta") or {})
+    init_exp = (init_ck.get("extra") or {}).get("experiment") or {}
+    if adaptive and init_exp.get("adaptation") != a.adaptation and not a.fresh_opt:
+        raise SystemExit("entering an adaptation stage requires --fresh-opt; resumed same-stage "
+                         "training may restore its optimizer")
+    previous_ref = init_exp.get("original_reference")
+    reference_id = resolve_reference(a.reference, previous_ref) if adaptive else None
+    if adaptive and previous_ref and a.adaptation == "speed" and init_exp.get("adaptation") == "full":
+        raise SystemExit("cannot resume a full-policy checkpoint into the speed-only stage")
+    if adaptive and a.adaptation == "full" and init_exp.get("adaptation") not in ("speed", "full"):
+        raise SystemExit("full-policy adaptation starts only from the validated speed stage")
+    if adaptive and (init_meta.get("opp_token") or "off") != "off":
+        raise SystemExit("adaptive training refuses privileged opponent-token checkpoints")
+    # A controller checkpoint is loadable only after the installed runtime pair is checked.
+    allow_controller_init = False
+    if a.init and (init_exp.get("controller") or {}).get("arm", "legacy") != "legacy":
+        allow_controller_init = True
     tok_cfg = a.opp_token if a.opp_token != "off" else None
     add_mem, add_chan, add_fut, add_floor, add_tok = warm_start_additions(
         init_meta, mem_cfg, chan_cfg, fut_cfg, floor_cfg, tok_cfg)
     add_mot = None if init_meta.get("motion") else mot_cfg
+    if adaptive and any((add_mem, add_chan, add_fut, add_floor, add_tok, add_mot)):
+        raise SystemExit("adaptive training requires an exact D3 actor architecture; "
+                         "do not add memory, channels, auxiliary heads or opponent tokens")
     if a.name_seed_fresh and not a.init:
         raise SystemExit("--name-seed-fresh without --init: with no warm start nothing is 'fresh' "
                          "and the whole model is drawn from --seed already.")
@@ -885,6 +994,7 @@ def main():
             # (`learn.model.reinit_fresh_by_name`). Behind `--name-seed-fresh`, because it changes
             # what a warm start produces and main's behaviour is the unseeded one.
             init_seed=(a.seed if a.name_seed_fresh else None),
+            allow_controller=allow_controller_init,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
@@ -900,6 +1010,7 @@ def main():
         # By name, and nothing may be left fresh except the conditioning projection itself.
         model, extra, fresh = load_for_conditioning(
             a.init, device, cond_dim, cond_spec.to_meta(), priv_adapter=priv_adapter,
+            allow_controller=allow_controller_init,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim, "act_dim": env.act_dim})
         print(f"init from {a.init} as arm '{a.cond}' | {cond_spec.describe()} | fresh: {fresh}")
@@ -915,7 +1026,9 @@ def main():
         model, extra = load_checkpoint(a.init, device, override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                                                                   "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim, "act_dim": env.act_dim},
                                        allow_conditional=False, priv_adapter=priv_adapter,
-                                       allow_oracle=True)
+                                       allow_oracle=True, allow_controller=allow_controller_init)
+        if adaptive and any(k_.startswith("actor.") for k_ in extra.get("skipped", [])):
+            raise RuntimeError("adaptive initialization skipped actor tensors")
         print("init from", a.init, extra.get("metrics"), "| re-initialized:", extra.get("skipped") or "nothing",
               "| resumed architecture:", {k_: v_ for k_, v_ in model.meta.items()
                                           if k_ in ("memory", "scan_channels", "future_head",
@@ -944,6 +1057,10 @@ def main():
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
+    if adaptive and (not memory_on or model.actor.mu.out_features != 8):
+        raise SystemExit("adaptive training requires the trained recurrent 8D D3 actor")
+    if adaptive:
+        require_exact_actor(model, init_ck)
     scan_channels = list((model.meta.get("scan_channels") or {}).get("channels") or ())
     n_extra = len(scan_channels)
     chan_meta = dict(model.meta.get("scan_channels") or {})
@@ -1033,7 +1150,22 @@ def main():
     # *unconditional* policy the checkpoint arrived as, whatever the trained arm later learns to do
     # with `c`. If the reference moved with the conditioning, the two arms would be leashed to
     # different policies and the comparison would be between leashes, not conditioning.
-    ref = copy.deepcopy(model.actor).eval()
+    if adaptive:
+        original, _ = load_checkpoint(verified_reference_stream(reference_id), device,
+                                      strict_names=True)
+        if not previous_ref:
+            # The first speed leg must leash the exact actor it starts from. A same-shaped
+            # unrelated reference would silently bless a changed opponent/geometry policy.
+            require_exact_actor(original, init_ck)
+        ref = original.actor.eval()
+        for name, tensor in model.actor.state_dict().items():
+            if name not in ref.state_dict() or tensor.shape != ref.state_dict()[name].shape:
+                raise RuntimeError(f"original D3 reference actor mismatch: {name}")
+        del original
+        ref_is_baseline = True
+    else:
+        ref = copy.deepcopy(model.actor).eval()
+        ref_is_baseline = kl_reference_is_baseline(ref, memory_on, a.kl_coef, a.init)
     for p_ in ref.parameters(): p_.requires_grad_(False)
     #: Both purity checks here are about the LEASH, so they apply when there is one. At
     #: `--kl-coef 0` the reference is multiplied by zero in `minibatch_losses` and never reaches the
@@ -1046,7 +1178,6 @@ def main():
     #: projection and additionally RECORDS which reference this run has, so a `kl_ref` chart can
     #: never be read as a distance from the frozen original when it is not one.
     leashed = a.kl_coef > 0
-    ref_is_baseline = kl_reference_is_baseline(ref, memory_on, a.kl_coef, a.init)
     if leashed and cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
@@ -1068,7 +1199,10 @@ def main():
     experiment_meta = {
         # What `kl_ref` in this run's logs is measured against, so a chart is never read as a
         # distance from the frozen original when it is not one.
-        "kl_reference": "frozen_feedforward_baseline" if ref_is_baseline else "leg_start_memoryless",
+        "kl_reference": ("original_recurrent_D3" if adaptive else
+                         "frozen_feedforward_baseline" if ref_is_baseline else "leg_start_memoryless"),
+        **({"adaptation": a.adaptation, "original_reference": reference_id,
+            "kl_scope": a.kl_scope, "research_estimator": bool(a.research_estimator)} if adaptive else {}),
         "reward": reward_meta,
         "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
@@ -1097,6 +1231,8 @@ def main():
         """
         return {**experiment_meta, "controller": controller.checkpoint_meta()}
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
+    speed_freeze = SpeedRowFreeze(model) if a.adaptation == "speed" else None
+    optimizer_restored = False
     # Adam's moments are part of where training got to. Dropping them on every resume restarts the
     # step-size estimate from nothing, which is the other half of why a resume costs updates before
     # it is back where it was.
@@ -1121,7 +1257,11 @@ def main():
         # NOT `names`: that holds the track manifest, and the run config below still needs it
         param_names = [n_ for n_, _ in model.named_parameters()]
         saved_names = extra.get("opt_param_names")
+        if same_stage_resume and saved_names is None:
+            raise RuntimeError("adaptive same-stage resume needs optimizer parameter names")
         if saved_names and saved_names != param_names:
+            if same_stage_resume:
+                raise RuntimeError("adaptive same-stage resume changed optimizer parameter names")
             # a layer was added (the grip head): Adam's state is indexed by position, so re-key the
             # saved moments by parameter *name* and leave the new tensors fresh -- a positional load
             # would either refuse (group size) or hand a critic layer the actor's moments
@@ -1157,24 +1297,35 @@ def main():
                                    for v in entry.values() if torch.is_tensor(v) and v.dim() > 0))]
         for i in dropped:
             st.pop(i, None)
+        if same_stage_resume and dropped:
+            raise RuntimeError("adaptive same-stage resume cannot drop optimizer moment tensors")
         sd["state"] = st
         try:
             opt.load_state_dict(sd)
+            optimizer_restored = True
             print(f"optimizer state restored" + (f" ({len(dropped)} reshaped tensor(s) left fresh)" if dropped else ""))
         except (ValueError, KeyError, RuntimeError) as exc:
+            if same_stage_resume:
+                raise RuntimeError("adaptive same-stage resume requires the saved Adam state") from exc
             print(f"optimizer state not restored ({exc}); starting Adam fresh")
+    if same_stage_resume and not optimizer_restored:
+        raise RuntimeError("adaptive same-stage resume requires the saved Adam state")
     # Resume the same W&B run across legs. Every --init here carries the whole network over, so the
     # curves belong to one training history: a fresh run per leg restarts the x axis at zero and the
     # only question worth asking of the charts -- is this better than before the change? -- stops
     # being answerable without stitching tabs together by eye.
     steps_base = int(extra.get("total_steps", extra.get("steps", 0)) or 0) if a.init else 0
-    if a.steps_base is not None:
+    if adaptive:
+        steps_base = adaptive_schedule["origin_total_steps"]
+    elif a.steps_base is not None:
         steps_base = int(a.steps_base)          # checkpoints written before total_steps existed only
                                                 # carry their own leg's count, so the offset has to be
                                                 # given by hand when stitching those onto a run
     wandb_id = (extra.get("wandb_id") if a.init else None) or (a.wandb_id or None)
     if a.wandb_new:
-        steps_base, wandb_id = 0, None
+        if not adaptive:
+            steps_base = 0
+        wandb_id = None
     # The slot table is a tuple of dataclasses after `validate`; W&B's config wants JSON, and the
     # JSON is also the thing someone reading the run wants to copy back into `--opp-slots`.
     run = common.wandb_init(a.name, vars(a) | {"phase": "ppo", "tracks": names,
@@ -1247,6 +1398,9 @@ def main():
     # the update replays. `buf_keep[t] = 0` marks a step whose predecessor ended an episode, so
     # truncated BPTT masks the hidden state back to zero exactly where the rollout did.
     h_actor = model.actor.initial_hidden(env.B, device=device) if memory_on else None
+    ref_roll = RecurrentReference(ref, env.B, device) if adaptive else None
+    buf_ref_mean = torch.zeros(T, B, env.act_dim, device=device) if adaptive else None
+    buf_ref_std = torch.zeros(T, B, env.act_dim, device=device) if adaptive else None
     h_critic = model.critic.initial_hidden(env.B, device=device) if memory_on else None
     buf_h0_actor = None if h_actor is None else torch.zeros(h_actor.shape[0], B, h_actor.shape[2], device=device)
     buf_h0_critic = None if h_critic is None else torch.zeros(h_critic.shape[0], B, h_critic.shape[2], device=device)
@@ -1259,7 +1413,10 @@ def main():
         print(f"recurrent PPO: truncated BPTT over {T} steps, minibatches of {env_chunk} env "
               f"chunk(s) = {env_chunk * T} samples, hidden reset on term|trunc per env")
 
-    steps_done = 0; update = 0; t_start = time.time(); last_log = {}; last_ctrl = {}; cap = a.cap0
+    steps_done = stage_completed if adaptive else 0
+    update = (stage_completed // (T * B)) if adaptive else 0
+    t_start = time.time(); last_log = {}; last_ctrl = {}
+    cap = float(init_extra.get("cap", a.cap0)) if same_stage_resume and a.cap_gate > 0 else a.cap0
     t_loop = 0.0; t_loop0 = time.time()        # wall time of the last whole update, for --yield-to-viewer
                                                # (t_upd below is the optimiser's own timing, for the log)
     ep_stats = {"return": [], "progress": [], "collided": [], "lap_time": [], "steps": []}
@@ -1268,6 +1425,13 @@ def main():
     # hid a 12 coll/km track behind a 2.1 coll/km mean once already; a speed curriculum keyed on the
     # mean would raise the cap exactly where the policy is least ready for it.
     track_hist = [deque(maxlen=64) for _ in range(env.sim.track.T)]
+    if same_stage_resume and a.cap_gate > 0:
+        cap_state = init_extra.get("stage_cap_state")
+        if not cap_state or len(cap_state.get("track_history", ())) != len(track_hist):
+            raise RuntimeError("adaptive gated-cap resume needs its saved per-track history")
+        collision_history.extend(tuple(pair) for pair in cap_state["collision_history"])
+        for history, saved in zip(track_hist, cap_state["track_history"]):
+            history.extend(tuple(pair) for pair in saved)
 
     def coll_per_km(h) -> float:
         m = sum(d for _, d in h)
@@ -1280,6 +1444,15 @@ def main():
         if scored:
             return float(np.quantile(scored, a.cap_gate_quantile)), len(scored)
         return (coll_per_km(collision_history) if collision_history else float("inf")), 0
+
+    def adaptation_progress_meta():
+        if not adaptive:
+            return {}
+        return {"stage_schedule": adaptive_schedule, "stage_steps": steps_done,
+                "stage_cap_state": {
+                    "collision_history": list(collision_history),
+                    "track_history": [list(history) for history in track_hist]}}
+
     n_updates = int(a.total // (T * B))
     while steps_done < a.total:
         frac = steps_done / a.total
@@ -1292,8 +1465,11 @@ def main():
         env.set_speed_cap(cap)
         obs["speed_cap"] = (env.speed_cap / env.ecfg.v_max_policy)[:, None]
         priv = env.privileged(env.last_result)
-        kl_coef = a.kl_coef * max(0.0, 1.0 - steps_done / a.kl_decay)
-        lr = a.lr + (a.lr_end - a.lr) * frac
+        if adaptive:
+            lr, kl_coef = stage_lr_kl(adaptive_schedule, steps_done)
+        else:
+            kl_coef = a.kl_coef * max(0.0, 1.0 - steps_done / a.kl_decay)
+            lr = a.lr + (a.lr_end - a.lr) * frac
         for g in opt.param_groups: g["lr"] = lr
         # Hand the GPU back while someone is watching. A viewer next to a full-rate run measured
         # 1-2 fps and 125 ms per sim step no matter how few cars it drew: the cost was queueing
@@ -1338,6 +1514,12 @@ def main():
                     val, h_critic_next = model.critic.step(scan[lid], pro[lid], priv[lid],
                                                            None if h_critic is None else h_critic[:, lid])
                     val = val.float()
+                if ref_roll is not None:
+                    # The reference sees the same chronological observations, with its OWN state.
+                    # Capture before env.step and reset exactly on that step's term|trunc.
+                    ref_mean, ref_std = ref_roll.step(scan, pro, cond_t)
+                    buf_ref_mean[t] = ref_mean[lid]
+                    buf_ref_std[t] = ref_std[lid]
                 act, logp = act.float(), logp.float()
                 buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
                 if buf_floor_lab is not None:
@@ -1422,6 +1604,8 @@ def main():
                 # memory), so no result moves; the behaviour change is for
                 # `--scan-channels ... --memory off`, which is why it is written down.
                 done_now = term | trunc
+                if ref_roll is not None:
+                    ref_roll.reset(done_now)
                 if roll_aug is not None:
                     roll_aug.reset(done_now)
                 if memory_on:
@@ -1510,6 +1694,8 @@ def main():
                     mask_mb = buf_mask_lab[:, cols] if buf_mask_lab is not None else None
                     dv_mb = dv_tgt[:, cols] if dv_tgt is not None else None
                     floor_mb = buf_floor_lab[:, cols] if buf_floor_lab is not None else None
+                    ref_mb = ((buf_ref_mean[:, cols], buf_ref_std[:, cols])
+                              if ref_roll is not None else None)
                 else:
                     idx = sel
                     scan = f_scan[idx].float(); pro = f_pro[idx]
@@ -1520,6 +1706,8 @@ def main():
                     mask_mb = f_beam[idx] if f_beam is not None else None
                     dv_mb = f_dv[idx] if f_dv is not None else None
                     floor_mb = f_floor[idx] if f_floor is not None else None
+                    ref_mb = ((buf_ref_mean.reshape(n, -1)[idx], buf_ref_std.reshape(n, -1)[idx])
+                              if ref_roll is not None else None)
                 # NOT `out`: that is the run directory, twenty lines below, and shadowing it makes
                 # a run that trains perfectly and then cannot write its checkpoint.
                 terms = minibatch_losses(model, ref, scan=scan, pro=pro, priv=priv_mb, act=act_mb,
@@ -1527,7 +1715,8 @@ def main():
                                          val_old=f_val[idx], w=f_mask[idx], cond=c_mb, hyper=hyper,
                                          autocast=ac, freeze_actor=freeze_actor, sequence=seq,
                                          future=fut_mb, future_valid=fut_valid_mb,
-                                         beam_mask=mask_mb, dv=dv_mb, floor_label=floor_mb)
+                                         beam_mask=mask_mb, dv=dv_mb, floor_label=floor_mb,
+                                         reference_params=ref_mb, kl_scope=a.kl_scope)
                 pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
                                               terms["aux_grip"], terms["aux_opp"])
                 loss = terms["loss"]
@@ -1546,9 +1735,13 @@ def main():
                                            f"(pg={float(pg):.4g} vf={float(vf):.4g} "
                                            f"kl_ref={float(kl_ref):.4g})")
                 loss.backward()
+                if speed_freeze is not None:
+                    speed_freeze.before_step()
                 gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.max_grad,
                                                     error_if_nonfinite=bool(cond_dim or controller_on or memory_on))
                 opt.step()
+                if speed_freeze is not None:
+                    speed_freeze.after_step()
                 with torch.no_grad():
                     stats["pg"].append(pg.item()); stats["vf"].append(vf.item())
                     stats["ent"].append(terms["entropy_mean"].item())
@@ -1617,7 +1810,10 @@ def main():
                       if stats.get("aux_motion") else {}),
                    **{f"loss/{key}": float(np.mean(v)) for key, v in stats.items()
                       if key.startswith("aux_opp_mask/") or key.startswith("aux_motion/")},
-                   "policy/log_std_steer": model.actor.log_std[0].item(), "policy/log_std_speed": model.actor.log_std[1].item(),
+                   "policy/log_std_steer": (model.actor.log_std[:-2].mean() if a.action_mode == "plan"
+                                             else model.actor.log_std[0]).item(),
+                   "policy/log_std_speed": (model.actor.log_std[-2:].mean() if a.action_mode == "plan"
+                                             else model.actor.log_std[1]).item(),
                    "time/rollout_s": t_roll, "time/update_s": t_upd, "time/env_steps_per_s": n / (t_roll + t_upd),
                    "time/elapsed_min": (time.time() - t_start) / 60}
             # over the policy's own cars only. With mixed opponents the teacher-driven car of a race
@@ -1728,7 +1924,7 @@ def main():
                     "steps": steps_done, "total_steps": steps_base + steps_done, "wandb_id": wandb_id,
                     "cap": cap, "action_mode": a.action_mode, "metrics": {**last_log, **last_ctrl},
                     "opt": opt.state_dict(), "opt_param_names": [n_ for n_, _ in model.named_parameters()],
-                    "experiment": experiment_meta_now()}
+                    "experiment": experiment_meta_now(), **adaptation_progress_meta()}
             save_checkpoint(os.path.join(out, f"ppo_u{update}.pt"), model, meta)
             save_checkpoint(os.path.join(out, "ppo_latest.pt"), model, meta)
     save_checkpoint(os.path.join(out, "ppo_final.pt"), model,
@@ -1736,7 +1932,7 @@ def main():
                      "steps": steps_done, "total_steps": steps_base + steps_done, "wandb_id": wandb_id,
                      "cap": cap, "action_mode": a.action_mode, "metrics": {**last_log, **last_ctrl},
                      "opt": opt.state_dict(), "opt_param_names": [n_ for n_, _ in model.named_parameters()],
-                     "experiment": experiment_meta_now()})
+                     "experiment": experiment_meta_now(), **adaptation_progress_meta()})
     # Unconditionally, and before the graph runtime: the controller installs a solver hook and a
     # wrapper around `env._reset_envs` whatever the sim backend is, so releasing it only when graphs
     # were captured leaves both in place on the default `compile` backend.

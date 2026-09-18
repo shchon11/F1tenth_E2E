@@ -74,10 +74,11 @@ def test_the_track_that_produced_an_unfollowable_line_is_now_followable():
 
 
 def test_repaired_line_still_clears_the_body_and_matches_the_forward_direction():
-    reverse = Raceline.build(maps.load("gen:hallway:1100~rev"))
-    forward = Raceline.build(maps.load("gen:hallway:1100"))
+    reverse = Raceline.build(maps.load("gen:hallway:1100~rev"), optimize_lap_time=False)
+    forward = Raceline.build(maps.load("gen:hallway:1100"), optimize_lap_time=False)
 
-    # Reversing the travel direction flips the sign of curvature; it must not change the curve.
+    # This is the minimum-curvature seed's geometric symmetry contract. Minimum-time
+    # refinement can choose different apexes in reverse because motor/brake limits differ.
     assert reverse.length == pytest.approx(forward.length, rel=0.05)   # was 39.8 vs 35.0 (+14 %)
 
     track = maps.load("gen:hallway:1100~rev")

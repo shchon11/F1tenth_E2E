@@ -1,0 +1,5935 @@
+{
+  "format": 1,
+  "schemas": {
+    "ppo": {
+      "key": "ppo",
+      "module": "f1sim.learn.ppo",
+      "subcommand": null,
+      "fields": [
+        {
+          "flag": "--name",
+          "flags": [
+            "--name"
+          ],
+          "dest": "name",
+          "label": "실험 이름",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "ppo_{timestamp}",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "default_factory": "timestamp"
+        },
+        {
+          "flag": "--init",
+          "flags": [
+            "--init"
+          ],
+          "dest": "init",
+          "label": "시작 / 재개 체크포인트",
+          "kind": "path",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "DAgger checkpoint to start from",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--envs",
+          "flags": [
+            "--envs"
+          ],
+          "dest": "envs",
+          "label": "병렬 차량 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 2048,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--tracks",
+          "flags": [
+            "--tracks"
+          ],
+          "dest": "tracks",
+          "label": "맵 / 장애물 배치",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "train",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "'train' / 'heldout' / 'heldout_obstacles' / 'heldout_all', or a comma separated list in either grammar: 'real/bb22-1@rev#line:44' (new) or 'real:blackbox2022_1+rlobs44~rev' (loader). An open seed -- 'real/bb22-1#line:*' -- is drawn --obstacle-draws times.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--obstacle-draws",
+          "flags": [
+            "--obstacle-draws"
+          ],
+          "dest": "obstacle_draws",
+          "label": "맵별 장애물 배치 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 8,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "how many random obstacle placements a '#<kind>:*' entry becomes. The draw comes from --seed, so the same seed gives the same maps, and the concrete names are recorded in the run manifest.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--horizon",
+          "flags": [
+            "--horizon"
+          ],
+          "dest": "horizon",
+          "label": "롤아웃 길이",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 32,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--total",
+          "flags": [
+            "--total"
+          ],
+          "dest": "total",
+          "label": "전체 학습 환경 스텝",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 100000000.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "dest": "epochs",
+          "label": "학습 에포크",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--minibatch",
+          "flags": [
+            "--minibatch"
+          ],
+          "dest": "minibatch",
+          "label": "PPO 미니배치 크기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 8192,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lr",
+          "flags": [
+            "--lr"
+          ],
+          "dest": "lr",
+          "label": "시작 학습률",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0003,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lr-end",
+          "flags": [
+            "--lr-end"
+          ],
+          "dest": "lr_end",
+          "label": "최종 학습률",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 5e-05,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--gamma",
+          "flags": [
+            "--gamma"
+          ],
+          "dest": "gamma",
+          "label": "보상 할인율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.99,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lam",
+          "flags": [
+            "--lam"
+          ],
+          "dest": "lam",
+          "label": "GAE 계수",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.95,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--clip",
+          "flags": [
+            "--clip"
+          ],
+          "dest": "clip",
+          "label": "PPO 클리핑 폭",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.2,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--ent",
+          "flags": [
+            "--ent"
+          ],
+          "dest": "ent",
+          "label": "엔트로피 계수",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--vf",
+          "flags": [
+            "--vf"
+          ],
+          "dest": "vf",
+          "label": "가치 손실 계수",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--max-grad",
+          "flags": [
+            "--max-grad"
+          ],
+          "dest": "max_grad",
+          "label": "기울기 최대 노름",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sim-backend",
+          "flags": [
+            "--sim-backend"
+          ],
+          "dest": "sim_backend",
+          "label": "시뮬레이션 실행 방식",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "compile",
+          "nargs": null,
+          "choices": [
+            "compile",
+            "eager",
+            "graphs"
+          ],
+          "required": false,
+          "group": "출력/실행",
+          "help": "simulator runtime. 'compile' is the current default and what every run so far used (torch.compile on the physics substep loop and the plan solver). 'eager' turns both off. 'graphs' turns both off and captures explicit CUDA graphs instead, which starts in about a second rather than minutes. Opt in only; nothing about the default changes.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--wandb-group",
+          "flags": [
+            "--wandb-group"
+          ],
+          "dest": "wandb_group",
+          "label": "W&B 그룹",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "ppo",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "W&B group. The pilot's arms share one so they can be read together.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cond",
+          "flags": [
+            "--cond"
+          ],
+          "dest": "cond",
+          "label": "마찰 조건 입력",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "none",
+          "nargs": null,
+          "choices": [
+            "none",
+            "zero",
+            "true_mu"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "Stage-1 friction conditioning arm. 'none' is the unmodified policy; 'zero' (A0) and 'true_mu' (A1) both add the zero-initialised conditioning projection and differ only in what is fed to it. 'true_mu' is a LAB ORACLE: its input is privileged and its checkpoint refuses to load in the viewer, export, watch, evaluate or the ROS node.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--fresh-opt",
+          "flags": [
+            "--fresh-opt"
+          ],
+          "dest": "fresh_opt",
+          "label": "새 최적화 상태로 시작",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "start Adam from scratch instead of restoring the checkpoint's moments. Required for the conditioning arms: adding a parameter shifts the positional keys Adam's state is indexed by, and silently re-keying them would give the two arms different optimiser state.",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--adaptation",
+          "flags": [
+            "--adaptation"
+          ],
+          "dest": "adaptation",
+          "label": "제어기 적응 학습",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "off",
+          "nargs": null,
+          "choices": [
+            "off",
+            "speed",
+            "full"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "D3 recurrent auto-controller adaptation stage; off preserves ordinary PPO",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--reference",
+          "flags": [
+            "--reference"
+          ],
+          "dest": "reference",
+          "label": "원본 D3 기준 정책",
+          "kind": "path",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "immutable original D3 checkpoint for recurrent KL; inherited on resume",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--kl-scope",
+          "flags": [
+            "--kl-scope"
+          ],
+          "dest": "kl_scope",
+          "label": "기준 정책 KL 적용 범위",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "all",
+            "curvature"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "reference KL dimensions (adaptive default: curvature only)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--research-estimator",
+          "flags": [
+            "--research-estimator"
+          ],
+          "dest": "research_estimator",
+          "label": "연구용 미승인 추정기 허용",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "explicitly train with an unapproved estimator candidate",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--controller",
+          "flags": [
+            "--controller"
+          ],
+          "dest": "controller",
+          "label": "학습 제어기",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "legacy",
+          "nargs": null,
+          "choices": [
+            "legacy",
+            "clearance",
+            "tcs",
+            "clearance+tcs",
+            "fixed_low",
+            "fixed_low+clearance",
+            "fixed_low+tcs",
+            "fixed_low+clearance+tcs",
+            "oracle",
+            "oracle+clearance",
+            "oracle+tcs",
+            "oracle+clearance+tcs",
+            "estimated",
+            "estimated+clearance",
+            "estimated+tcs",
+            "estimated+clearance+tcs",
+            "auto"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "controller arm between the policy and the wheels. 'legacy' is the untouched path and is the default, so an unflagged run is unchanged. 'fixed_low' is the control arm, 'oracle' reads the true friction (lab only), 'estimated' uses the frozen estimator's filtered lower quantile from causal sensors. A '+tcs' suffix (or 'tcs' alone) additionally runs the car's own traction guard on the speed command, fed from the simulated ERPM odometry and IMU; it needs vehicle.wheel_model. 'fixed_low+tcs' is the deployment default.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--estimator",
+          "flags": [
+            "--estimator"
+          ],
+          "dest": "estimator",
+          "label": "마찰 추정기",
+          "kind": "path",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "frozen grip-estimator checkpoint. Required by --controller estimated, and rejected for every other arm.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--critic-priv-adapter",
+          "flags": [
+            "--critic-priv-adapter"
+          ],
+          "dest": "critic_priv_adapter",
+          "label": "critic priv adapter",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "declared privileged-input adapter for the critic, e.g. 'absent_opponent_17_to_21' to run a race-trained critic in a solo env. Empty is strict legacy.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--kl-coef",
+          "flags": [
+            "--kl-coef"
+          ],
+          "dest": "kl_coef",
+          "label": "기준 정책 KL 계수",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--kl-decay",
+          "flags": [
+            "--kl-decay"
+          ],
+          "dest": "kl_decay",
+          "label": "KL 감소 스텝",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "env steps over which the imitation-KL leash decays to zero (default: --total, so it decays across the whole run). Shortening it to 20 %% was tried and reverted: on a 20M run the policy was clean while the leash held (collision rate 0.00, lap 17.4 s) and then traded safety for speed the moment it reached zero at 4M (0.33-0.47, lap 12.5 s), with KL to the imitation policy rising 0.26 -> 6.8. The leash was holding a speed/safety balance the reward alone does not",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--cap0",
+          "flags": [
+            "--cap0"
+          ],
+          "dest": "cap0",
+          "label": "초기 속도 제한 (m/s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 4.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cap1",
+          "flags": [
+            "--cap1"
+          ],
+          "dest": "cap1",
+          "label": "최종 속도 제한 (m/s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 8.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cap-steps",
+          "flags": [
+            "--cap-steps"
+          ],
+          "dest": "cap_steps",
+          "label": "속도 제한 증가 스텝",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 40000000.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--critic-warmup",
+          "flags": [
+            "--critic-warmup"
+          ],
+          "dest": "critic_warmup",
+          "label": "가치함수 단독 학습 업데이트",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 10,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "updates with the actor frozen",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--device",
+          "flags": [
+            "--device"
+          ],
+          "dest": "device",
+          "label": "학습 장치",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "cuda",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--wandb",
+          "flags": [
+            "--wandb"
+          ],
+          "dest": "wandb",
+          "label": "W&B 기록 모드",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "online",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--log-every",
+          "flags": [
+            "--log-every"
+          ],
+          "dest": "log_every",
+          "label": "로그 주기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "updates between W&B rows (1 = every update)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--save-every",
+          "flags": [
+            "--save-every"
+          ],
+          "dest": "save_every",
+          "label": "체크포인트 저장 주기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 25,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--seed",
+          "flags": [
+            "--seed"
+          ],
+          "dest": "seed",
+          "label": "난수 시드",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--amp",
+          "flags": [
+            "--amp"
+          ],
+          "dest": "amp",
+          "label": "혼합 정밀도 (bf16)",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "bf16 autocast for network forward/backward (~2x faster)",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--progress-reward",
+          "flags": [
+            "--progress-reward"
+          ],
+          "dest": "progress_reward",
+          "label": "진행 보상 (m당)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "reward per metre of signed forward progress",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--alive-reward",
+          "flags": [
+            "--alive-reward"
+          ],
+          "dest": "alive_reward",
+          "label": "생존 보상 (제어 스텝당)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "constant reward per control step",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--collision-penalty",
+          "flags": [
+            "--collision-penalty"
+          ],
+          "dest": "collision_penalty",
+          "label": "벽 충돌 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 10.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--steer-penalty",
+          "flags": [
+            "--steer-penalty"
+          ],
+          "dest": "steer_penalty",
+          "label": "조향 변화 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.05,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--proximity-penalty",
+          "flags": [
+            "--proximity-penalty"
+          ],
+          "dest": "proximity_penalty",
+          "label": "벽 근접 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "per-metre penalty at zero wall gap (0 = off)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--safe-dist",
+          "flags": [
+            "--safe-dist"
+          ],
+          "dest": "safe_dist",
+          "label": "벽 안전 거리 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "[m] body-to-wall gap where the proximity penalty starts",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--wrong-way-penalty",
+          "flags": [
+            "--wrong-way-penalty"
+          ],
+          "dest": "wrong_way_penalty",
+          "label": "역주행 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.2,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "per-step penalty while facing backwards along the lane",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--collision-speed-penalty",
+          "flags": [
+            "--collision-speed-penalty"
+          ],
+          "dest": "collision_speed_penalty",
+          "label": "충돌 속도 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "extra collision penalty per m/s of impact speed",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cap-gate",
+          "flags": [
+            "--cap-gate"
+          ],
+          "dest": "cap_gate",
+          "label": "속도 증가 충돌 기준",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": ">0: [collisions/km] the speed cap only rises while the recent crash rate is below this (safety before speed). Per km, not per episode: the fraction of episodes that end in a crash saturates at 1.0 as soon as episodes are long enough to almost always contain one, and a gate reading a saturated number can never open again no matter how much the policy improves",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cap-gate-quantile",
+          "flags": [
+            "--cap-gate-quantile"
+          ],
+          "dest": "cap_gate_quantile",
+          "label": "속도 증가 평가 분위수",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.9,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "which track holds the gate shut: 1.0 the worst, 0.9 the 90th percentile, 0.5 the median. The set average is what let a 12 coll/km map hide behind a 2.1 coll/km mean; the outright worst lets one pathological map freeze the curriculum for the other 148",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cap-gate-min-km",
+          "flags": [
+            "--cap-gate-min-km"
+          ],
+          "dest": "cap_gate_min_km",
+          "label": "속도 증가 최소 평가 거리 (km)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "a track needs this many km driven before it can hold the gate shut. Distance, not episodes: it is what a rate per km is estimated from, and with 149 tracks sharing 1024 envs an episode count large enough to be meaningful takes longer to reach than the whole curriculum",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--proximity-speed-ref",
+          "flags": [
+            "--proximity-speed-ref"
+          ],
+          "dest": "proximity_speed_ref",
+          "label": "근접 패널티 속도 기준 (m/s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "[m/s] scale the proximity penalty by (1 + v/ref)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--plan-clearance-penalty",
+          "flags": [
+            "--plan-clearance-penalty"
+          ],
+          "dest": "plan_clearance_penalty",
+          "label": "계획 경로 여유 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "per-second penalty for a plan inside the wall margin",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--plan-margin",
+          "flags": [
+            "--plan-margin"
+          ],
+          "dest": "plan_margin",
+          "label": "계획 경로 벽 여유 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.15,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lap-time-bonus",
+          "flags": [
+            "--lap-time-bonus"
+          ],
+          "dest": "lap_time_bonus",
+          "label": "랩타임 보너스",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "scale of the per-sector time reward. Progress already points at lap time, but shaving 0.1 s off a 13.5 s lap moves the return by under 1 %% -- and less the longer the track -- so the thing being optimised is nearly invisible to the optimiser. This term scores each sector against the track's own recent pace, in fractions of the headroom left to the raceline, so a hundredth found near the limit outweighs a tenth found far from it. At 2.0, and 1.5 s off the pace, 0.1 s of lap is worth about 0.8 against 80 for a collision; at 0.1 s off the pace a hundredth is worth 1.3",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--wandb-id",
+          "flags": [
+            "--wandb-id"
+          ],
+          "dest": "wandb_id",
+          "label": "W&B 재개 ID",
+          "kind": "str",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "append to this W&B run id (default: the one the --init checkpoint came from)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--wandb-new",
+          "flags": [
+            "--wandb-new"
+          ],
+          "dest": "wandb_new",
+          "label": "새 W&B 실행 생성",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "start a fresh W&B run even when resuming",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--metrics-jsonl",
+          "flags": [
+            "--metrics-jsonl"
+          ],
+          "dest": "metrics_jsonl",
+          "label": "지표 JSONL 출력 파일",
+          "kind": "path",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "also append every logged metric dict to this file, one JSON object per logged update. Opt-in and orthogonal to --wandb: a `--wandb disabled` run otherwise leaves no machine-readable curve behind, which is exactly what a smoke has to report",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "path_mode": "output_file"
+        },
+        {
+          "flag": "--steps-base",
+          "flags": [
+            "--steps-base"
+          ],
+          "dest": "steps_base",
+          "label": "재개 누적 스텝 기준",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "x-axis offset for the resumed W&B run; defaults to the checkpoint's own count",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--yield-to-viewer",
+          "flags": [
+            "--yield-to-viewer"
+          ],
+          "dest": "yield_to_viewer",
+          "label": "시각화 실행 중 GPU 양보 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "while a viewer is on screen, sleep this multiple of each update's duration so it can reach the GPU. 1.0 halves the training rate and gives the viewer a usable frame rate; 0 disables it",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--overtake-bonus",
+          "flags": [
+            "--overtake-bonus"
+          ],
+          "dest": "overtake_bonus",
+          "label": "추월 보너스",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "reward per metre of arc taken out of the nearest opponent ahead. Needs --race-size > 1. Without it a collision penalty teaches avoidance and only avoidance: sitting behind costs nothing, so there is never a reason to pass",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--car-safe-gap",
+          "flags": [
+            "--car-safe-gap"
+          ],
+          "dest": "car_safe_gap",
+          "label": "상대차 안전 간격 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.6,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "[m] body gap below which the car proximity penalty starts. Larger = the policy is asked to react earlier when a door is closing",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sideslip-penalty",
+          "flags": [
+            "--sideslip-penalty"
+          ],
+          "dest": "sideslip_penalty",
+          "label": "슬립 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "per metre driven, per radian of sideslip beyond ~3.5 deg: prices the grip limit itself instead of only the wall it ends at",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-opp",
+          "flags": [
+            "--aux-opp"
+          ],
+          "dest": "aux_opp",
+          "label": "aux opp",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "weight of an auxiliary loss making the actor's trunk predict the nearest opponent's offset and closing speed from the scan stack (races only). 0 = off",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-grip",
+          "flags": [
+            "--aux-grip"
+          ],
+          "dest": "aux_grip",
+          "label": "aux grip",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "weight of an auxiliary loss making the actor's trunk predict the car's true friction from what it observes (IMU history). 0 = off",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-future",
+          "flags": [
+            "--aux-future"
+          ],
+          "dest": "aux_future",
+          "label": "aux future",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "weight of an auxiliary loss making the actor's RECURRENT STATE (the trunk features with --memory off) predict, 20 control steps (0.50 s) ahead: the nearest opponent's relative position and velocity in the ego frame, a presence logit, and the ego's own speed and yaw rate. Privileged labels from the simulator, masked across episode boundaries and where no opponent is in range. 0 = off, and off the head is not built at all: same parameters, same state dict, same loss. Measure what it did with `python -m f1sim.learn.probe_hidden`",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-future-k",
+          "flags": [
+            "--aux-future-k"
+          ],
+          "dest": "aux_future_k",
+          "label": "aux future k",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 20,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "lookahead of --aux-future in control steps (40 Hz). Default 20 = 0.5 s. Only the last k steps of each --horizon chunk go unlabelled, so a k near the horizon leaves almost nothing to train on",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-floor",
+          "flags": [
+            "--aux-floor"
+          ],
+          "dest": "aux_floor",
+          "label": "aux floor",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "weight of an auxiliary loss making the actor's SCAN STEM predict, per beam, whether a return is the floor or a solid object. The label is free in the simulator (`scan_type == HIT_GROUND`); beams with no return are excluded. Weighted BCE, positive weight from the batch rate, recall AND precision reported every update. Never exported, off by default and byte-identical off. Needs --scan-stem resnet",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-floor-width",
+          "flags": [
+            "--aux-floor-width"
+          ],
+          "dest": "aux_floor_width",
+          "label": "aux floor width",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 32,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "channels in the per-beam floor head (--aux-floor)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-future-width",
+          "flags": [
+            "--aux-future-width"
+          ],
+          "dest": "aux_future_width",
+          "label": "aux future width",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 128,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "hidden width of the future head's one layer",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--ttc-penalty",
+          "flags": [
+            "--ttc-penalty"
+          ],
+          "dest": "ttc_penalty",
+          "label": "충돌 예상 시간 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "per-step penalty at zero time to contact with the nearest car, ramping linearly from 0 at --ttc-safe. The reward audit (docs/research/reward-audit-2026-09-13.md) found nothing prices the *approach* to another car: car_proximity is charged per metre driven and only inside --car-safe-gap, so closing at 3 m/s from 2 m away -- 0.7 s from a contact -- costs zero. 0 = off.",
+          "action": "store",
+          "nullable": false,
+          "metavar": "LAMBDA"
+        },
+        {
+          "flag": "--ttc-safe",
+          "flags": [
+            "--ttc-safe"
+          ],
+          "dest": "ttc_safe",
+          "label": "충돌 예상 시간 기준 (s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "[s] time to contact above which --ttc-penalty is 0",
+          "action": "store",
+          "nullable": false,
+          "metavar": "SECONDS"
+        },
+        {
+          "flag": "--overtake-sustained",
+          "flags": [
+            "--overtake-sustained"
+          ],
+          "dest": "overtake_sustained",
+          "label": "선두 유지 거리 · 시간 · 보너스",
+          "kind": "list",
+          "item_kind": "float",
+          "default": null,
+          "nargs": 3,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "pay BONUS once when the learner has led an opponent by DIST_M metres along the lane for TIME_S seconds continuously (1.5 1.0 <bonus> is the contract's default). Unlike --overtake-bonus, which pays dense arc gained and so pays the approach and the crossing instant, this pays only a pass that stuck.",
+          "action": "store",
+          "nullable": true,
+          "metavar": [
+            "DIST_M",
+            "TIME_S",
+            "BONUS"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-token",
+          "flags": [
+            "--opp-token"
+          ],
+          "dest": "opp_token",
+          "label": "상대차 상태 입력",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "off",
+          "nargs": null,
+          "choices": [
+            "off",
+            "pos",
+            "posvel",
+            "future"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "ORACLE. Append the simulator's own description of the nearest two opponents to the observation (f1sim/opp_token.py): 'pos' = relative position + presence, 'posvel' = + relative velocity, 'future' = + where each opponent's own controller intends to be at 0.10/0.25/0.50/0.75 s. The checkpoint records it and is refused by the exporter and the ROS node. Its purpose is to answer whether the planner, handed the opponent's state, races better than it does with LiDAR alone -- not to produce a policy.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--name-seed-fresh",
+          "flags": [
+            "--name-seed-fresh"
+          ],
+          "dest": "name_seed_fresh",
+          "label": "name seed fresh",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "make two arms that differ by an input width differ by that alone. Re-initialises every tensor a warm start leaves fresh from its own module name rather than from the ambient generator (learn.model.reinit_fresh_by_name, from branch feat/motion-memory) -- otherwise the wider layer consumes different draws and every module built after it differs too -- and re-seeds the generator once the model is built, so the arms' exploration streams start identical as well.",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--car-proximity-penalty",
+          "flags": [
+            "--car-proximity-penalty"
+          ],
+          "dest": "car_proximity_penalty",
+          "label": "상대차 근접 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "per metre driven with another car's body inside car_safe_gap (0.6 m), scaled by closing speed. Without it the only gradient near a car is the overtake term paying for closing, right down to contact",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--car-contact-penalty",
+          "flags": [
+            "--car-contact-penalty"
+          ],
+          "dest": "car_contact_penalty",
+          "label": "상대차 접촉 패널티",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "extra penalty for touching another car, on top of ending the episode. Contact and a wall otherwise score the same, so nothing tells the policy that a car is something to negotiate with rather than more scenery",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lap-bonus",
+          "flags": [
+            "--lap-bonus"
+          ],
+          "dest": "lap_bonus",
+          "label": "완주 보너스",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "reward per completed lap, multiplied by that lap's average speed (track length / lap time). Dense progress reward already stands in for lap time, but it saturates where the speed cap and not the corner sets the speed -- at a 4 m/s cap that is ~80 %% of these tracks, and there every path scores the same. This term keeps paying for a faster lap",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--init-log-std",
+          "flags": [
+            "--init-log-std"
+          ],
+          "dest": "init_log_std",
+          "label": "init log std",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "reset the actor's exploration log-std at start (default: -1.8 in the plan space, whose curvature knots tolerate far less noise than steer/speed; unchanged otherwise)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--episode-s",
+          "flags": [
+            "--episode-s"
+          ],
+          "dest": "episode_s",
+          "label": "에피소드 길이 (s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 40.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-stack",
+          "flags": [
+            "--scan-stack"
+          ],
+          "dest": "scan_stack",
+          "label": "LiDAR 누적 프레임",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-stride",
+          "flags": [
+            "--scan-stride"
+          ],
+          "dest": "scan_stride",
+          "label": "LiDAR 프레임 간격",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "control steps between stacked scans",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--hist-len",
+          "flags": [
+            "--hist-len"
+          ],
+          "dest": "hist_len",
+          "label": "차량 상태 이력 길이",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "proprio history rows in the observation (20 = the last second at stride 2)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--race-size",
+          "flags": [
+            "--race-size"
+          ],
+          "dest": "race_size",
+          "label": "레이스당 차량 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "cars per track instance (>1: opponents in the LiDAR, car-car collisions)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--opponent",
+          "flags": [
+            "--opponent"
+          ],
+          "dest": "opponent",
+          "label": "상대차 기본 종류",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "policy",
+          "nargs": null,
+          "choices": [
+            "policy",
+            "teacher",
+            "mixed",
+            "pool",
+            "slots"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "who drives cars 1..M-1: the policy (self-play), the raceline teacher, per race one or the other (mixed, share set by --mixed-teacher-frac), or per race one entry drawn from --opp-pool (pool)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--mixed-teacher-frac",
+          "flags": [
+            "--mixed-teacher-frac"
+          ],
+          "dest": "mixed_teacher_frac",
+          "label": "혼합 상대차 Teacher 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--opp-speed",
+          "flags": [
+            "--opp-speed"
+          ],
+          "dest": "opp_speed",
+          "label": "상대차 속도 배율 범위",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.6,
+            1.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "teacher opponents: speed scale range per race",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-pool",
+          "flags": [
+            "--opp-pool"
+          ],
+          "dest": "opp_pool",
+          "label": "상대 정책 풀",
+          "kind": "list",
+          "item_kind": "path",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "comma-separated opponent population for --opponent pool: checkpoint paths, 'self' (the learner's own current weights, i.e. self-play) and 'teacher' (the raceline teacher, carrying --opp-events). One entry is drawn per race from the simulator's generator. Empty = off. A checkpoint is the only opponent that takes its own line, defends its own position and makes its own mistakes; every scripted behaviour is still the same tracker on the same line being told what to do",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A.pt,B.pt",
+          "separator": "comma"
+        },
+        {
+          "flag": "--spawn-gap",
+          "flags": [
+            "--spawn-gap"
+          ],
+          "dest": "spawn_gap",
+          "label": "출발 종방향 간격 (m)",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            2.5,
+            6.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] arc along the lane between the cars of a race at spawn, drawn uniformly per reset. The default is the range every race so far was trained at, so an unflagged run is unchanged. Widening it is an opponent-diversity axis: a fixed narrow band shows the policy one approach geometry",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--spawn-order",
+          "flags": [
+            "--spawn-order"
+          ],
+          "dest": "spawn_order",
+          "label": "학습 차량 출발 위치",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "behind",
+          "nargs": null,
+          "choices": [
+            "behind",
+            "ahead",
+            "alongside",
+            "random"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "where the learner starts on the grid of a race whose other cars are not itself: behind (every race trained so far -- a pass to make), ahead (a place to defend, and the only way to be overtaken), alongside (side by side, which is where the contacts measured in traffic actually happen) or random (drawn per race)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--spawn-alongside-sep",
+          "flags": [
+            "--spawn-alongside-sep"
+          ],
+          "dest": "spawn_alongside_sep",
+          "label": "나란한 차량 횡간격 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.15,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] body-to-body lateral gap asked for on an alongside grid; what the lane has room for wins, and a lane with room for one car spawns a stagger",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--spawn-alongside-gap",
+          "flags": [
+            "--spawn-alongside-gap"
+          ],
+          "dest": "spawn_alongside_gap",
+          "label": "나란한 차량 종간격 (m)",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.0,
+            0.2
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] arc stagger inside an alongside grid, drawn independently per car. Small on purpose: a grid's lateral offsets are taken along the centerline normal at each car's own arc position, and those normals stop agreeing a few tens of centimetres apart on a tight corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-events",
+          "flags": [
+            "--opp-events"
+          ],
+          "dest": "opp_events",
+          "label": "상대차 행동 이벤트",
+          "kind": "list",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "comma-separated behaviour for the teacher-driven opponents. Timed events (brake,stop,shift,weave) fire at --opp-event-rate; reactive behaviours (defend,yield,line,oblivious) read the learner's position every step and each takes its own --opp-<name>-prob. Empty = off. A teacher opponent otherwise only ever presents a slower car on the racing line, which is the one overtaking and avoidance problem the policy has already been trained on",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A,B",
+          "separator": "comma"
+        },
+        {
+          "flag": "--opp-event-rate",
+          "flags": [
+            "--opp-event-rate"
+          ],
+          "dest": "opp_event_rate",
+          "label": "상대차 이벤트 빈도 (10s당)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "expected timed events per teacher opponent per 10 s of driving (events do not overlap, so the realized rate is a little below this)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "PER10S"
+        },
+        {
+          "flag": "--opp-brake-scale",
+          "flags": [
+            "--opp-brake-scale"
+          ],
+          "dest": "opp_brake_scale",
+          "label": "opp brake scale",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.0,
+            0.5
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "brake: fraction of its profile speed the opponent drops to",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-brake-time",
+          "flags": [
+            "--opp-brake-time"
+          ],
+          "dest": "opp_brake_time",
+          "label": "opp brake time",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.5,
+            2.5
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] how long a brake event holds",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-stop-time",
+          "flags": [
+            "--opp-stop-time"
+          ],
+          "dest": "opp_stop_time",
+          "label": "opp stop time",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            1.0,
+            4.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] how long a stopped opponent stays stopped",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-shift-offset",
+          "flags": [
+            "--opp-shift-offset"
+          ],
+          "dest": "opp_shift_offset",
+          "label": "opp shift offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.0,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] |lateral offset| of a lane change; the sign is drawn separately",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-shift-hold",
+          "flags": [
+            "--opp-shift-hold"
+          ],
+          "dest": "opp_shift_hold",
+          "label": "opp shift hold",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.5,
+            2.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] time held at the offset, between the ramp in and the ramp out",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-shift-ramp",
+          "flags": [
+            "--opp-shift-ramp"
+          ],
+          "dest": "opp_shift_ramp",
+          "label": "opp shift ramp",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] ramp in / ramp out of a shift",
+          "action": "store",
+          "nullable": false,
+          "metavar": "S"
+        },
+        {
+          "flag": "--opp-weave-amp",
+          "flags": [
+            "--opp-weave-amp"
+          ],
+          "dest": "opp_weave_amp",
+          "label": "opp weave amp",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.1,
+            0.25
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] sinusoidal lateral amplitude of a weave",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-weave-period",
+          "flags": [
+            "--opp-weave-period"
+          ],
+          "dest": "opp_weave_period",
+          "label": "opp weave period",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            2.0,
+            4.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] weave period",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-weave-time",
+          "flags": [
+            "--opp-weave-time"
+          ],
+          "dest": "opp_weave_time",
+          "label": "opp weave time",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            2.0,
+            6.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] how long a weave lasts",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-event-margin",
+          "flags": [
+            "--opp-event-margin"
+          ],
+          "dest": "opp_event_margin",
+          "label": "opp event margin",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] free space kept beyond the car's half-width when an event moves an opponent off the raceline; the offset is clamped per raceline point against the track's distance field, so it can never reach a wall",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-defend-prob",
+          "flags": [
+            "--opp-defend-prob"
+          ],
+          "dest": "opp_defend_prob",
+          "label": "opp defend prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent defends): while a learner is within --opp-defend-range behind, it moves its line toward the side that learner is coming down, at full amplitude inside --opp-defend-full",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-yield-prob",
+          "flags": [
+            "--opp-yield-prob"
+          ],
+          "dest": "opp_yield_prob",
+          "label": "opp yield prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent yields): with a learner alongside it moves away",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-line-prob",
+          "flags": [
+            "--opp-line-prob"
+          ],
+          "dest": "opp_line_prob",
+          "label": "opp line prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent drives its own corner line): an out-in or in-out offset sweep, drawn per corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-oblivious-prob",
+          "flags": [
+            "--opp-oblivious-prob"
+          ],
+          "dest": "opp_oblivious_prob",
+          "label": "opp oblivious prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent's follow-gap slowdown is off): it does not brake for a car ahead or beside it. This is the car that rams -- the situation the training distribution has never contained on purpose",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-defend-offset",
+          "flags": [
+            "--opp-defend-offset"
+          ],
+          "dest": "opp_defend_offset",
+          "label": "opp defend offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.15,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] how far across a defending opponent moves, drawn per race",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-yield-offset",
+          "flags": [
+            "--opp-yield-offset"
+          ],
+          "dest": "opp_yield_offset",
+          "label": "opp yield offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.15,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] ... a yielding one",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-line-offset",
+          "flags": [
+            "--opp-line-offset"
+          ],
+          "dest": "opp_line_offset",
+          "label": "opp line offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.15,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] ... each end of a corner-line sweep, drawn per corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-defend-range",
+          "flags": [
+            "--opp-defend-range"
+          ],
+          "dest": "opp_defend_range",
+          "label": "opp defend range",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] how far behind a learner starts being defended against; 0 = the env's own overtake_range (12 m), the window the overtake reward calls a race",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-defend-full",
+          "flags": [
+            "--opp-defend-full"
+          ],
+          "dest": "opp_defend_full",
+          "label": "opp defend full",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 3.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] inside this the block is at full amplitude, ramping to zero at --opp-defend-range",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-alongside-lon",
+          "flags": [
+            "--opp-alongside-lon"
+          ],
+          "dest": "opp_alongside_lon",
+          "label": "opp alongside lon",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.8,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] |longitudinal offset| within which two cars count as alongside (bodies are 0.58 m long). Read by `yield` and by the census, which must measure the situation the behaviour reacts to",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-alongside-lat",
+          "flags": [
+            "--opp-alongside-lat"
+          ],
+          "dest": "opp_alongside_lat",
+          "label": "opp alongside lat",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.2,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] ... and the lateral bound, so a car across a hairpin is not alongside",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-react-max",
+          "flags": [
+            "--opp-react-max"
+          ],
+          "dest": "opp_react_max",
+          "label": "opp react max",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.45,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] cap on the reactive lateral offset, before the lane's own clamp",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-react-slew",
+          "flags": [
+            "--opp-react-slew"
+          ],
+          "dest": "opp_react_slew",
+          "label": "opp react slew",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.6,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s] rate limit on it: a target that jumps sideways asks the pure-pursuit teacher for a step steer input",
+          "action": "store",
+          "nullable": false,
+          "metavar": "MPS"
+        },
+        {
+          "flag": "--opp-corner-kappa",
+          "flags": [
+            "--opp-corner-kappa"
+          ],
+          "dest": "opp_corner_kappa",
+          "label": "opp corner kappa",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.15,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[1/m] smoothed raceline curvature above which a point is in a corner, for the `line` behaviour",
+          "action": "store",
+          "nullable": false,
+          "metavar": "INVM"
+        },
+        {
+          "flag": "--opp-corner-min-arc",
+          "flags": [
+            "--opp-corner-min-arc"
+          ],
+          "dest": "opp_corner_min_arc",
+          "label": "opp corner min arc",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] shortest run of such points that counts as one corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-corner-smooth",
+          "flags": [
+            "--opp-corner-smooth"
+          ],
+          "dest": "opp_corner_smooth",
+          "label": "opp corner smooth",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.6,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] window the curvature is averaged over first",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-slots",
+          "flags": [
+            "--opp-slots"
+          ],
+          "dest": "opp_slots",
+          "label": "차량별 상대차 설정",
+          "kind": "json",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|policy|self), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
+          "action": "store",
+          "nullable": false,
+          "metavar": "JSON|@FILE"
+        },
+        {
+          "flag": "--action-mode",
+          "flags": [
+            "--action-mode"
+          ],
+          "dest": "action_mode",
+          "label": "정책 행동 공간",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "direct",
+          "nargs": null,
+          "choices": [
+            "direct",
+            "plan"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "plan: the policy outputs a local trajectory (f1sim.mpc)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--memory",
+          "flags": [
+            "--memory"
+          ],
+          "dest": "memory",
+          "label": "정책 메모리",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "off",
+          "nargs": null,
+          "choices": [
+            "off",
+            "gru"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "give the actor (and by default the critic) a recurrent memory over the per-step trunk embedding, warm-started from --init so that step 0 is bit-identical to it. 'off' is the untouched run in every respect: same network, same rollout, same minibatching, same loss. The six-frame stack stays the input; this extends the window past the 150 ms it covers, which is what a box that has left the scan cannot otherwise survive",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--memory-hidden",
+          "flags": [
+            "--memory-hidden"
+          ],
+          "dest": "memory_hidden",
+          "label": "정책 GRU 크기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 128,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "GRU width (<= 256, the contract's ceiling). 128 over the 384-wide trunk embedding measures at 1.07x the frozen actor's CPU forward time against a 1.5x budget; see `python -m f1sim.learn.budget`",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--memory-critic",
+          "flags": [
+            "--memory-critic"
+          ],
+          "dest": "memory_critic",
+          "label": "가치함수 메모리",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "own",
+          "nargs": null,
+          "choices": [
+            "own",
+            "none"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "'own' gives the critic its own GRU (it already has its own stem, and it reads the privileged vector the actor must never see, so sharing the recurrence would be the one place a value gradient reached the actor's trunk). 'none' leaves the critic feedforward",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-channels",
+          "flags": [
+            "--scan-channels"
+          ],
+          "dest": "scan_channels",
+          "label": "LiDAR 추가 채널",
+          "kind": "list",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "comma separated extra scan channels, off by default (memory,edges,aligned,aligned_prev,aligned_valid,floor,fe_floor,fe_range). 'memory': the closest return seen at each bearing in the last --scan-memory-tau seconds, decayed -- explicit cheap memory the GRU does not have to learn. 'edges': |r[i]-r[i-1]| per beam, so the crack between two boxes in a row reads as two discontinuities rather than an opening. 'floor': the per-beam likelihood that a return is the FLOOR rather than a solid object, from the beam geometry and an attitude tracked off the IMU the observation already carries (`learn/floor.py`); 0 = solid, 1 = floor, 0.5 = the attitude is not usable. 'fe_floor' / 'fe_range': the same two quantities read off the trained sensor front-end (--frontend) instead of the geometry. 'aligned': the signed residual between this scan and the one from --aligned-k steps ago warped into the current ego frame with the car's OWN measured speed, yaw rate and roll/pitch -- static geometry cancels and what moved by itself is what is left (learn.aligned). It is the one channel with a gate, because the tilt is measured rather than known. All of them are arithmetic on what the env already emits and all start as zeroed input columns, so a warm start is still bit-identical",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "separator": "comma"
+        },
+        {
+          "flag": "--aligned-k",
+          "flags": [
+            "--aligned-k"
+          ],
+          "dest": "aligned_k",
+          "label": "aligned k",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 4,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[aligned] control steps of lag the residual is taken over (4 = 100 ms)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "STEPS"
+        },
+        {
+          "flag": "--aligned-tau",
+          "flags": [
+            "--aligned-tau"
+          ],
+          "dest": "aligned_tau",
+          "label": "aligned tau",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.075,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[aligned] soft threshold: sign(R) * max(|R| - tau, 0). Fixed BEFORE training at 2-3 sigma of the static-world floor measured on the real bags (python -m f1sim.learn.aligned_floor), never tuned on a result",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--aligned-tau-rel",
+          "flags": [
+            "--aligned-tau-rel"
+          ],
+          "dest": "aligned_tau_rel",
+          "label": "aligned tau rel",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[aligned] range-proportional addition to tau (0 by default: the contract asks for one number)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "PER_M"
+        },
+        {
+          "flag": "--aligned-tol-beams",
+          "flags": [
+            "--aligned-tol-beams"
+          ],
+          "dest": "aligned_tol_beams",
+          "label": "aligned tol beams",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 4,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[aligned] bearing uncertainty of the warp, in beams",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--aligned-consist-beams",
+          "flags": [
+            "--aligned-consist-beams"
+          ],
+          "dest": "aligned_consist_beams",
+          "label": "aligned consist beams",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 8,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[aligned] bearing tolerance of the two-frame consistency test, in beams",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--aligned-z-tol",
+          "flags": [
+            "--aligned-z-tol"
+          ],
+          "dest": "aligned_z_tol",
+          "label": "aligned z tol",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.05,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[aligned] a warped point further than this out of the current scan plane is dropped as not comparable",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--aligned-gap-fill",
+          "flags": [
+            "--aligned-gap-fill"
+          ],
+          "dest": "aligned_gap_fill",
+          "label": "aligned gap fill",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[aligned] beams a hole left by the warp's resampling may be filled from",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--motion-memory",
+          "flags": [
+            "--motion-memory"
+          ],
+          "dest": "motion_memory",
+          "label": "motion memory",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "split the recurrent state: add a small GRU (--motion-hidden, <= 64) fed by an encoder of the ALIGNED rows only, whose output enters the actor's and critic's first MLP preactivation through its own zero-initialised projection. h_dyn is carried inside the same hidden tensor as the main state, so every path that carries one carries this too. Off = no module, no meta, no RNG draw",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--motion-hidden",
+          "flags": [
+            "--motion-hidden"
+          ],
+          "dest": "motion_hidden",
+          "label": "motion hidden",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 64,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "width of h_dyn. The contract caps it at 64: the claim under test is that the remedy is inductive bias rather than capacity",
+          "action": "store",
+          "nullable": false,
+          "metavar": "H"
+        },
+        {
+          "flag": "--motion-channels",
+          "flags": [
+            "--motion-channels"
+          ],
+          "dest": "motion_channels",
+          "label": "motion channels",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 32,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "output channels of the motion encoder's last convolution",
+          "action": "store",
+          "nullable": false,
+          "metavar": "C"
+        },
+        {
+          "flag": "--motion-critic",
+          "flags": [
+            "--motion-critic"
+          ],
+          "dest": "motion_critic",
+          "label": "motion critic",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "own",
+          "nargs": null,
+          "choices": [
+            "own",
+            "none"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "'own' gives the critic its own motion branch, as --memory-critic does",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-opp-mask",
+          "flags": [
+            "--aux-opp-mask"
+          ],
+          "dest": "aux_opp_mask",
+          "label": "aux opp mask",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "E3-a. Weighted BCE on a per-beam 'is this beam on another car' logit read from the MOTION ENCODER's features. The label is the LiDAR's own scan_type == HIT_CAR -- privileged, train-time, and already cast. The logits are never fed to the planner and never exported",
+          "action": "store",
+          "nullable": false,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-motion",
+          "flags": [
+            "--aux-motion"
+          ],
+          "dest": "aux_motion",
+          "label": "aux motion",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "E3-b. MSE on the nearest opponent's CURRENT relative velocity, read from h_dyn alone. Masked by presence, like the future head's opponent columns",
+          "action": "store",
+          "nullable": false,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--scan-memory-tau",
+          "flags": [
+            "--scan-memory-tau"
+          ],
+          "dest": "scan_memory_tau",
+          "label": "스캔 메모리 시간 (s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 2.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "[s] time constant of the decayed scan-occupancy channel",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--frontend",
+          "flags": [
+            "--frontend"
+          ],
+          "dest": "frontend",
+          "label": "인식 모듈 체크포인트",
+          "kind": "path",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "trained sensor front-end (`work/frontend/train.py`) for the `fe_floor` / `fe_range` scan channels. Frozen: it is a sensor model, not part of the policy, and PPO never sees a gradient through it",
+          "action": "store",
+          "nullable": false,
+          "metavar": "CKPT",
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--floor-att",
+          "flags": [
+            "--floor-att"
+          ],
+          "dest": "floor_att",
+          "label": "노면 자세 입력",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "ego",
+          "nargs": null,
+          "choices": [
+            "ego",
+            "tracker",
+            "vesc"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "attitude source of the `floor` scan channel. 'ego' is `floor.EgoStateAttitude` -- the suspension's calibrated response to the accelerations the car itself produces, read off the wheel speed and the gyro's yaw, which is the most accurate of the three (measured). 'tracker' is `floor.AttitudeTracker`, gyro integration with the accelerometer gated on quiescence. 'vesc' is the orientation quaternion the ROS node reads today, which is wrong by 8 deg rms while driving and is here only so the comparison can be run",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-deltas",
+          "flags": [
+            "--scan-deltas"
+          ],
+          "dest": "scan_deltas",
+          "label": "LiDAR 시간 차분 입력",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "append temporal scan differences for a new model without --init",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--temporal-encoder",
+          "flags": [
+            "--temporal-encoder"
+          ],
+          "dest": "temporal_encoder",
+          "label": "시간 인코더",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "cnn",
+          "nargs": null,
+          "choices": [
+            "cnn",
+            "gru"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-stem",
+          "flags": [
+            "--scan-stem"
+          ],
+          "dest": "scan_stem",
+          "label": "LiDAR 인코더",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "resnet",
+          "nargs": null,
+          "choices": [
+            "plain",
+            "resnet"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "scan encoder for a new model without --init (an --init checkpoint keeps its own)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--opp-future-model",
+          "flags": [
+            "--opp-future-model"
+          ],
+          "dest": "opp_future_model",
+          "label": "상대차 미래 예측",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "pred",
+          "nargs": null,
+          "choices": [
+            "pred",
+            "hybrid",
+            "plan",
+            "constv"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "which prediction the block's 'future' columns carry (f1sim.gym_env.OPP_FUTURE_MODELS); recorded in the spec, because the same columns under two models are two different inputs",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--procedural-obstacles",
+          "flags": [
+            "--procedural-obstacles"
+          ],
+          "dest": "procedural_obstacles",
+          "label": "절차적 장애물 에피소드 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "share of env resets that get a freshly drawn obstacle layout, placed as analytic props from the hard-obstacle patterns (0 = off, and off is byte-identical to a run without the flag)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "FRAC"
+        },
+        {
+          "flag": "--procedural-density",
+          "flags": [
+            "--procedural-density"
+          ],
+          "dest": "procedural_density",
+          "label": "장애물 밀도 (10m당)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "patterns per 10 m of lap when --procedural-obstacles is on",
+          "action": "store",
+          "nullable": false,
+          "metavar": "PER10M"
+        },
+        {
+          "flag": "--procedural-max-props",
+          "flags": [
+            "--procedural-max-props"
+          ],
+          "dest": "procedural_max_props",
+          "label": "장애물 최대 개수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "prop slots per env (0: from the density and the longest lap). Every slot costs the beam tracer one pass per step, so this is the cost dial",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--procedural-raceline-margin",
+          "flags": [
+            "--procedural-raceline-margin"
+          ],
+          "dest": "procedural_raceline_margin",
+          "label": "장애물 레이싱 라인 여유 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.25,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "[m] kept clear either side of the raceline, beyond the car's half-width, so the teacher opponents are never routed through a prop",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--raceline-margin",
+          "flags": [
+            "--raceline-margin"
+          ],
+          "dest": "raceline_margin",
+          "label": "레이싱 라인 경계 여유 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "[m] free space the opponents' raceline keeps from the boundary (default 0.40)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-grip",
+          "flags": [
+            "--teacher-grip"
+          ],
+          "dest": "teacher_grip",
+          "label": "Teacher 마찰 정보",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "true",
+          "nargs": null,
+          "choices": [
+            "true",
+            "nominal",
+            "conservative"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "grip the teacher opponents' speed profile assumes",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-recover-time",
+          "flags": [
+            "--teacher-recover-time"
+          ],
+          "dest": "teacher_recover_time",
+          "label": "Teacher 방향 복구 시간 (s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] >0: cap the teacher's commanded speed at what can still be steered back onto the lane (v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing backwards on the line is told to carry full racing speed",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        }
+      ]
+    },
+    "dagger": {
+      "key": "dagger",
+      "module": "f1sim.learn.dagger",
+      "subcommand": null,
+      "fields": [
+        {
+          "flag": "--name",
+          "flags": [
+            "--name"
+          ],
+          "dest": "name",
+          "label": "실험 이름",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "dagger_{timestamp}",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "default_factory": "timestamp"
+        },
+        {
+          "flag": "--envs",
+          "flags": [
+            "--envs"
+          ],
+          "dest": "envs",
+          "label": "병렬 차량 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1024,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--tracks",
+          "flags": [
+            "--tracks"
+          ],
+          "dest": "tracks",
+          "label": "맵 / 장애물 배치",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "train",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "'train', 'eval' or comma separated catalog names",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--iters",
+          "flags": [
+            "--iters"
+          ],
+          "dest": "iters",
+          "label": "DAgger 반복 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 8,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--steps",
+          "flags": [
+            "--steps"
+          ],
+          "dest": "steps",
+          "label": "수집 스텝",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 250,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "learner steps per iteration (x envs/race-size labels), split across solo/traffic when enabled",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--solo-fraction",
+          "flags": [
+            "--solo-fraction"
+          ],
+          "dest": "solo_fraction",
+          "label": "단독·무장애물 데이터 비율 (0.3 = 30%)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "학습 차량이 수집한 Teacher 라벨 개수 기준입니다. 0.3은 약 30%를 상대차·배치 장애물 없는 환경에서 수집합니다. 스텝 반올림 후 실제 비율은 실행 기록에 남습니다.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--solo-tracks",
+          "flags": [
+            "--solo-tracks"
+          ],
+          "dest": "solo_tracks",
+          "label": "단독 주행 맵 (비우면 선택한 맵의 장애물 제거)",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "비워 두면 위에서 선택한 맵을 사용합니다. 따로 지정한 맵도 배치 장애물을 모두 제거하고 상대차 없이 수집합니다.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "dest": "epochs",
+          "label": "학습 에포크",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 3.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--batch",
+          "flags": [
+            "--batch"
+          ],
+          "dest": "batch",
+          "label": "학습 배치 크기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1024,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lr",
+          "flags": [
+            "--lr"
+          ],
+          "dest": "lr",
+          "label": "시작 학습률",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0003,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--beta0",
+          "flags": [
+            "--beta0"
+          ],
+          "dest": "beta0",
+          "label": "초기 Teacher 실행 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.6,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--speed-cap",
+          "flags": [
+            "--speed-cap"
+          ],
+          "dest": "speed_cap",
+          "label": "최대 주행 속도 (m/s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 8.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--device",
+          "flags": [
+            "--device"
+          ],
+          "dest": "device",
+          "label": "학습 장치",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "cuda",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--action-mode",
+          "flags": [
+            "--action-mode"
+          ],
+          "dest": "action_mode",
+          "label": "정책 행동 공간",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "direct",
+          "nargs": null,
+          "choices": [
+            "direct",
+            "plan"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "plan: the student outputs a local trajectory (f1sim.mpc)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-speed",
+          "flags": [
+            "--teacher-speed"
+          ],
+          "dest": "teacher_speed",
+          "label": "Teacher 속도 배율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "scale on the teacher's speed profile (0.9: fewer teacher crashes through the plan tracker)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--hist-len",
+          "flags": [
+            "--hist-len"
+          ],
+          "dest": "hist_len",
+          "label": "차량 상태 이력 길이",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "proprio history rows in the observation",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-stack",
+          "flags": [
+            "--scan-stack"
+          ],
+          "dest": "scan_stack",
+          "label": "LiDAR 누적 프레임",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-stride",
+          "flags": [
+            "--scan-stride"
+          ],
+          "dest": "scan_stride",
+          "label": "LiDAR 프레임 간격",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-deltas",
+          "flags": [
+            "--scan-deltas"
+          ],
+          "dest": "scan_deltas",
+          "label": "LiDAR 시간 차분 입력",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "append temporal scan differences before the CNN",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--temporal-encoder",
+          "flags": [
+            "--temporal-encoder"
+          ],
+          "dest": "temporal_encoder",
+          "label": "시간 인코더",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "cnn",
+          "nargs": null,
+          "choices": [
+            "cnn",
+            "gru"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-stem",
+          "flags": [
+            "--scan-stem"
+          ],
+          "dest": "scan_stem",
+          "label": "LiDAR 인코더",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "resnet",
+          "nargs": null,
+          "choices": [
+            "plain",
+            "resnet"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "scan encoder: 'resnet' adds GroupNorm/residual blocks, a whole-scan receptive field, a beam-angle channel and a raw per-sector nearest-return bypass",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--raceline-margin",
+          "flags": [
+            "--raceline-margin"
+          ],
+          "dest": "raceline_margin",
+          "label": "레이싱 라인 경계 여유 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "[m] free space the teacher's raceline keeps from the boundary (default 0.40). A minimum-curvature line has no robustness budget: the teacher tracks it with ground-truth pose and latency compensation, the student has neither",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-grip",
+          "flags": [
+            "--teacher-grip"
+          ],
+          "dest": "teacher_grip",
+          "label": "Teacher 마찰 정보",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "true",
+          "nargs": null,
+          "choices": [
+            "true",
+            "nominal",
+            "conservative"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "grip the teacher's speed profile assumes. 'true' is privileged, so identical scans get speed labels up to 2.2x apart and the Huber loss can only fit their mean",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-recover-time",
+          "flags": [
+            "--teacher-recover-time"
+          ],
+          "dest": "teacher_recover_time",
+          "label": "Teacher 방향 복구 시간 (s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] >0: cap the teacher's commanded speed at what can still be steered back onto the lane (v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing backwards on the line is told to carry full racing speed",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher",
+          "flags": [
+            "--teacher"
+          ],
+          "dest": "teacher_kind",
+          "label": "Teacher 종류",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "raceline",
+          "nargs": null,
+          "choices": [
+            "raceline",
+            "interactive"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "raceline: pure pursuit on the precomputed line, blind to the other cars (every DAgger run before this one). interactive: f1sim.interactive_teacher, which scores a family of plans against the opponents' predicted motion and labels with the argmin -- the only one of the two that can demonstrate a pass",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-horizon",
+          "flags": [
+            "--teacher-horizon"
+          ],
+          "dest": "teacher_horizon",
+          "label": "Teacher 예측 시간 (s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] how far the interactive teacher rolls each candidate out and how far ahead it reads the opponents",
+          "action": "store",
+          "nullable": false,
+          "metavar": "S"
+        },
+        {
+          "flag": "--teacher-cand-iters",
+          "flags": [
+            "--teacher-cand-iters"
+          ],
+          "dest": "teacher_cand_iters",
+          "label": "Teacher 후보 개선 반복",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 2,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "Gauss-Newton iterations per candidate plan (the reference plan uses 6; the fit starts from a pure-pursuit blend that is already close)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--teacher-offsets",
+          "flags": [
+            "--teacher-offsets"
+          ],
+          "dest": "teacher_offsets",
+          "label": "Teacher 횡방향 후보 (m)",
+          "kind": "list",
+          "item_kind": "float",
+          "default": "-0.6,-0.3,0,0.3,0.6",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m left of the raceline] the candidate family's lateral offsets",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A,B,C",
+          "separator": "comma"
+        },
+        {
+          "flag": "--teacher-speeds",
+          "flags": [
+            "--teacher-speeds"
+          ],
+          "dest": "teacher_speeds",
+          "label": "Teacher 속도 후보 배율",
+          "kind": "list",
+          "item_kind": "float",
+          "default": "1,0.8,0.55,0.3",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "multipliers on the plan's speed targets",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A,B,C",
+          "separator": "comma"
+        },
+        {
+          "flag": "--teacher-cost",
+          "flags": [
+            "--teacher-cost"
+          ],
+          "dest": "teacher_cost",
+          "label": "Teacher 비용 가중치 5종",
+          "kind": "list",
+          "item_kind": "float",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "the five cost weights (f1sim.interactive_teacher.TeacherCost); empty = its defaults",
+          "action": "store",
+          "nullable": false,
+          "metavar": "PROG,WALL,OPP,CLEAR,SMOOTH",
+          "separator": "comma",
+          "ui_length": 5,
+          "component_names": [
+            "progress",
+            "wall",
+            "opp",
+            "clear",
+            "smooth"
+          ],
+          "component_labels": [
+            "진행",
+            "벽",
+            "상대차",
+            "여유",
+            "부드러움"
+          ],
+          "component_defaults": [
+            1.0,
+            30.0,
+            8.0,
+            1.0,
+            0.35
+          ]
+        },
+        {
+          "flag": "--opp-token",
+          "flags": [
+            "--opp-token"
+          ],
+          "dest": "opp_token",
+          "label": "상대차 상태 입력",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "off",
+          "nargs": null,
+          "choices": [
+            "off",
+            "pos",
+            "posvel",
+            "future"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "privileged opponent block in the observation. An ORACLE: the other cars' true relative position ('pos'), velocity ('posvel') and future ('future'), from the simulator. Refused by the exporter and by the ROS node; a checkpoint trained with it is a measurement, not a policy",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--opp-future-model",
+          "flags": [
+            "--opp-future-model"
+          ],
+          "dest": "opp_future_model",
+          "label": "상대차 미래 예측",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "pred",
+          "nargs": null,
+          "choices": [
+            "pred",
+            "hybrid",
+            "plan",
+            "constv"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "which prediction the 'future' columns and the interactive teacher read (f1sim.gym_env.OPP_FUTURE_MODELS)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--memory",
+          "flags": [
+            "--memory"
+          ],
+          "dest": "memory",
+          "label": "정책 메모리",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "off",
+          "nargs": null,
+          "choices": [
+            "off",
+            "gru"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "gru: a recurrent student, trained by truncated BPTT over --chunk-length steps",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--memory-hidden",
+          "flags": [
+            "--memory-hidden"
+          ],
+          "dest": "memory_hidden",
+          "label": "정책 GRU 크기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 128,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--scan-channels",
+          "flags": [
+            "--scan-channels"
+          ],
+          "dest": "scan_channels",
+          "label": "LiDAR 추가 채널",
+          "kind": "list",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "extra scan channels (memory,edges,aligned,aligned_prev,aligned_valid,floor,fe_floor,fe_range), as in ppo.py",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A,B",
+          "separator": "comma"
+        },
+        {
+          "flag": "--scan-memory-tau",
+          "flags": [
+            "--scan-memory-tau"
+          ],
+          "dest": "scan_memory_tau",
+          "label": "스캔 메모리 시간 (s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 2.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "S"
+        },
+        {
+          "flag": "--speed-loss",
+          "flags": [
+            "--speed-loss"
+          ],
+          "dest": "speed_loss",
+          "label": "속도 모방 손실",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "symmetric",
+          "nargs": null,
+          "choices": [
+            "symmetric",
+            "asym"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "loss on the plan's two SPEED targets (the curvature knots keep the Huber either way). 'symmetric' is the loss every DAgger run before this flag used and is byte-identical to it. 'asym' is quadratic above the teacher's speed and linear below it, in m/s: with a mu-dependent label a symmetric regression fits the conditional MEAN of speed labels that are 2.2x apart, which is too fast on exactly the low-grip draws where too fast ends the episode. The asymmetry moves that optimum to a low quantile, so a student that cannot resolve grip backs off and one that can still reaches the limit at zero loss. Constants: w_over 4, w_under 0.25, under power 1",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--chunk-length",
+          "flags": [
+            "--chunk-length"
+          ],
+          "dest": "chunk_length",
+          "label": "GRU 학습 구간 길이",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 16,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "truncated-BPTT length for a recurrent student. The buffer is (steps, envs), so a chunk is a slice of it; a recurrent policy trained one isolated step at a time is not the policy that drives",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--init",
+          "flags": [
+            "--init"
+          ],
+          "dest": "init",
+          "label": "시작 / 재개 체크포인트",
+          "kind": "path",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "warm start the student from this checkpoint. Memory, extra scan channels and the privileged opponent block are added by name with zeroed new columns, so the student starts as the checkpoint and learns to use what was added",
+          "action": "store",
+          "nullable": false,
+          "metavar": "CKPT",
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--hard-frac",
+          "flags": [
+            "--hard-frac"
+          ],
+          "dest": "hard_frac",
+          "label": "어려운 샘플 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "fraction of each training batch drawn in proportion to the student-teacher gap at collection time. 0 = uniform (previous behaviour). Measured motivation: the student matches the teacher to within 2 %% on the teacher's own trajectory but is 4-10x further off in the second before a collision, and a uniform loss barely sees those states",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--hard-power",
+          "flags": [
+            "--hard-power"
+          ],
+          "dest": "hard_power",
+          "label": "어려운 샘플 가중 지수",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "exponent on the gap when weighting",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--keep-iters",
+          "flags": [
+            "--keep-iters"
+          ],
+          "dest": "keep_iters",
+          "label": "DAgger 데이터 보관 반복 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "aggregate the data of at most this many recent iterations (host RAM)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--start-iter",
+          "flags": [
+            "--start-iter"
+          ],
+          "dest": "start_iter",
+          "label": "DAgger 재개 반복 번호",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "index of the first iteration to run. For RESUMING a killed run from its last checkpoint: beta, the exploration noise and the checkpoint names all key off the true iteration index, so restarting a run that died after iteration 6 needs --start-iter 7, not --iters 1 (which is iteration 0, where beta is 1.0 and the TEACHER drives). What it cannot restore is the aggregated buffer: DAgger trains on the last --keep-iters collections and those live in host RAM only, so a resumed iteration trains on its own data alone. Declare that wherever the run is reported.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--log-every",
+          "flags": [
+            "--log-every"
+          ],
+          "dest": "log_every",
+          "label": "로그 주기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 25,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "training steps between W&B loss rows (was 200)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--eval-steps",
+          "flags": [
+            "--eval-steps"
+          ],
+          "dest": "eval_steps",
+          "label": "평가 스텝",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 800,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--eval-every",
+          "flags": [
+            "--eval-every"
+          ],
+          "dest": "eval_every",
+          "label": "평가 주기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "evaluate every Nth iteration (the last one always). 1 = every iteration, the old behaviour. The evaluation is a diagnostic and cannot reach the training data (see rng_island), so this trades diagnostic resolution for wall-clock and nothing else.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--wandb",
+          "flags": [
+            "--wandb"
+          ],
+          "dest": "wandb",
+          "label": "W&B 기록 모드",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "online",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--seed",
+          "flags": [
+            "--seed"
+          ],
+          "dest": "seed",
+          "label": "난수 시드",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--eager",
+          "flags": [
+            "--eager"
+          ],
+          "dest": "eager",
+          "label": "컴파일 없이 실행",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "disable simulator / tracker compilation (CPU smoke tests)",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--race-size",
+          "flags": [
+            "--race-size"
+          ],
+          "dest": "race_size",
+          "label": "레이스당 차량 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "cars per track instance (>1: opponents in the LiDAR, car-car collisions)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--opponent",
+          "flags": [
+            "--opponent"
+          ],
+          "dest": "opponent",
+          "label": "상대차 기본 종류",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "policy",
+          "nargs": null,
+          "choices": [
+            "policy",
+            "teacher",
+            "mixed",
+            "pool",
+            "slots"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "who drives cars 1..M-1: the policy (self-play), the raceline teacher, per race one or the other (mixed, share set by --mixed-teacher-frac), or per race one entry drawn from --opp-pool (pool)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--mixed-teacher-frac",
+          "flags": [
+            "--mixed-teacher-frac"
+          ],
+          "dest": "mixed_teacher_frac",
+          "label": "혼합 상대차 Teacher 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--opp-speed",
+          "flags": [
+            "--opp-speed"
+          ],
+          "dest": "opp_speed",
+          "label": "상대차 속도 배율 범위",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.6,
+            1.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "teacher opponents: speed scale range per race",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-pool",
+          "flags": [
+            "--opp-pool"
+          ],
+          "dest": "opp_pool",
+          "label": "상대 정책 풀",
+          "kind": "list",
+          "item_kind": "path",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "comma-separated opponent population for --opponent pool: checkpoint paths, 'self' (the learner's own current weights, i.e. self-play) and 'teacher' (the raceline teacher, carrying --opp-events). One entry is drawn per race from the simulator's generator. Empty = off. A checkpoint is the only opponent that takes its own line, defends its own position and makes its own mistakes; every scripted behaviour is still the same tracker on the same line being told what to do",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A.pt,B.pt",
+          "separator": "comma"
+        },
+        {
+          "flag": "--spawn-gap",
+          "flags": [
+            "--spawn-gap"
+          ],
+          "dest": "spawn_gap",
+          "label": "출발 종방향 간격 (m)",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            2.5,
+            6.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] arc along the lane between the cars of a race at spawn, drawn uniformly per reset. The default is the range every race so far was trained at, so an unflagged run is unchanged. Widening it is an opponent-diversity axis: a fixed narrow band shows the policy one approach geometry",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--spawn-order",
+          "flags": [
+            "--spawn-order"
+          ],
+          "dest": "spawn_order",
+          "label": "학습 차량 출발 위치",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "behind",
+          "nargs": null,
+          "choices": [
+            "behind",
+            "ahead",
+            "alongside",
+            "random"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "where the learner starts on the grid of a race whose other cars are not itself: behind (every race trained so far -- a pass to make), ahead (a place to defend, and the only way to be overtaken), alongside (side by side, which is where the contacts measured in traffic actually happen) or random (drawn per race)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--spawn-alongside-sep",
+          "flags": [
+            "--spawn-alongside-sep"
+          ],
+          "dest": "spawn_alongside_sep",
+          "label": "나란한 차량 횡간격 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.15,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] body-to-body lateral gap asked for on an alongside grid; what the lane has room for wins, and a lane with room for one car spawns a stagger",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--spawn-alongside-gap",
+          "flags": [
+            "--spawn-alongside-gap"
+          ],
+          "dest": "spawn_alongside_gap",
+          "label": "나란한 차량 종간격 (m)",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.0,
+            0.2
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] arc stagger inside an alongside grid, drawn independently per car. Small on purpose: a grid's lateral offsets are taken along the centerline normal at each car's own arc position, and those normals stop agreeing a few tens of centimetres apart on a tight corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-events",
+          "flags": [
+            "--opp-events"
+          ],
+          "dest": "opp_events",
+          "label": "상대차 행동 이벤트",
+          "kind": "list",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "comma-separated behaviour for the teacher-driven opponents. Timed events (brake,stop,shift,weave) fire at --opp-event-rate; reactive behaviours (defend,yield,line,oblivious) read the learner's position every step and each takes its own --opp-<name>-prob. Empty = off. A teacher opponent otherwise only ever presents a slower car on the racing line, which is the one overtaking and avoidance problem the policy has already been trained on",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A,B",
+          "separator": "comma"
+        },
+        {
+          "flag": "--opp-event-rate",
+          "flags": [
+            "--opp-event-rate"
+          ],
+          "dest": "opp_event_rate",
+          "label": "상대차 이벤트 빈도 (10s당)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "expected timed events per teacher opponent per 10 s of driving (events do not overlap, so the realized rate is a little below this)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "PER10S"
+        },
+        {
+          "flag": "--opp-brake-scale",
+          "flags": [
+            "--opp-brake-scale"
+          ],
+          "dest": "opp_brake_scale",
+          "label": "opp brake scale",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.0,
+            0.5
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "brake: fraction of its profile speed the opponent drops to",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-brake-time",
+          "flags": [
+            "--opp-brake-time"
+          ],
+          "dest": "opp_brake_time",
+          "label": "opp brake time",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.5,
+            2.5
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] how long a brake event holds",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-stop-time",
+          "flags": [
+            "--opp-stop-time"
+          ],
+          "dest": "opp_stop_time",
+          "label": "opp stop time",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            1.0,
+            4.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] how long a stopped opponent stays stopped",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-shift-offset",
+          "flags": [
+            "--opp-shift-offset"
+          ],
+          "dest": "opp_shift_offset",
+          "label": "opp shift offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.0,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] |lateral offset| of a lane change; the sign is drawn separately",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-shift-hold",
+          "flags": [
+            "--opp-shift-hold"
+          ],
+          "dest": "opp_shift_hold",
+          "label": "opp shift hold",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.5,
+            2.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] time held at the offset, between the ramp in and the ramp out",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-shift-ramp",
+          "flags": [
+            "--opp-shift-ramp"
+          ],
+          "dest": "opp_shift_ramp",
+          "label": "opp shift ramp",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] ramp in / ramp out of a shift",
+          "action": "store",
+          "nullable": false,
+          "metavar": "S"
+        },
+        {
+          "flag": "--opp-weave-amp",
+          "flags": [
+            "--opp-weave-amp"
+          ],
+          "dest": "opp_weave_amp",
+          "label": "opp weave amp",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.1,
+            0.25
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] sinusoidal lateral amplitude of a weave",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-weave-period",
+          "flags": [
+            "--opp-weave-period"
+          ],
+          "dest": "opp_weave_period",
+          "label": "opp weave period",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            2.0,
+            4.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] weave period",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-weave-time",
+          "flags": [
+            "--opp-weave-time"
+          ],
+          "dest": "opp_weave_time",
+          "label": "opp weave time",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            2.0,
+            6.0
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[s] how long a weave lasts",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-event-margin",
+          "flags": [
+            "--opp-event-margin"
+          ],
+          "dest": "opp_event_margin",
+          "label": "opp event margin",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] free space kept beyond the car's half-width when an event moves an opponent off the raceline; the offset is clamped per raceline point against the track's distance field, so it can never reach a wall",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-defend-prob",
+          "flags": [
+            "--opp-defend-prob"
+          ],
+          "dest": "opp_defend_prob",
+          "label": "opp defend prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent defends): while a learner is within --opp-defend-range behind, it moves its line toward the side that learner is coming down, at full amplitude inside --opp-defend-full",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-yield-prob",
+          "flags": [
+            "--opp-yield-prob"
+          ],
+          "dest": "opp_yield_prob",
+          "label": "opp yield prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent yields): with a learner alongside it moves away",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-line-prob",
+          "flags": [
+            "--opp-line-prob"
+          ],
+          "dest": "opp_line_prob",
+          "label": "opp line prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent drives its own corner line): an out-in or in-out offset sweep, drawn per corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-oblivious-prob",
+          "flags": [
+            "--opp-oblivious-prob"
+          ],
+          "dest": "opp_oblivious_prob",
+          "label": "opp oblivious prob",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "P(a teacher-driven opponent's follow-gap slowdown is off): it does not brake for a car ahead or beside it. This is the car that rams -- the situation the training distribution has never contained on purpose",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--opp-defend-offset",
+          "flags": [
+            "--opp-defend-offset"
+          ],
+          "dest": "opp_defend_offset",
+          "label": "opp defend offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.15,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] how far across a defending opponent moves, drawn per race",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-yield-offset",
+          "flags": [
+            "--opp-yield-offset"
+          ],
+          "dest": "opp_yield_offset",
+          "label": "opp yield offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.15,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] ... a yielding one",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-line-offset",
+          "flags": [
+            "--opp-line-offset"
+          ],
+          "dest": "opp_line_offset",
+          "label": "opp line offset",
+          "kind": "list",
+          "item_kind": "float",
+          "default": [
+            0.15,
+            0.35
+          ],
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] ... each end of a corner-line sweep, drawn per corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": [
+            "LOW",
+            "HIGH"
+          ],
+          "separator": "space"
+        },
+        {
+          "flag": "--opp-defend-range",
+          "flags": [
+            "--opp-defend-range"
+          ],
+          "dest": "opp_defend_range",
+          "label": "opp defend range",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] how far behind a learner starts being defended against; 0 = the env's own overtake_range (12 m), the window the overtake reward calls a race",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-defend-full",
+          "flags": [
+            "--opp-defend-full"
+          ],
+          "dest": "opp_defend_full",
+          "label": "opp defend full",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 3.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] inside this the block is at full amplitude, ramping to zero at --opp-defend-range",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-alongside-lon",
+          "flags": [
+            "--opp-alongside-lon"
+          ],
+          "dest": "opp_alongside_lon",
+          "label": "opp alongside lon",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.8,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] |longitudinal offset| within which two cars count as alongside (bodies are 0.58 m long). Read by `yield` and by the census, which must measure the situation the behaviour reacts to",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-alongside-lat",
+          "flags": [
+            "--opp-alongside-lat"
+          ],
+          "dest": "opp_alongside_lat",
+          "label": "opp alongside lat",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.2,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] ... and the lateral bound, so a car across a hairpin is not alongside",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-react-max",
+          "flags": [
+            "--opp-react-max"
+          ],
+          "dest": "opp_react_max",
+          "label": "opp react max",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.45,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] cap on the reactive lateral offset, before the lane's own clamp",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-react-slew",
+          "flags": [
+            "--opp-react-slew"
+          ],
+          "dest": "opp_react_slew",
+          "label": "opp react slew",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.6,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s] rate limit on it: a target that jumps sideways asks the pure-pursuit teacher for a step steer input",
+          "action": "store",
+          "nullable": false,
+          "metavar": "MPS"
+        },
+        {
+          "flag": "--opp-corner-kappa",
+          "flags": [
+            "--opp-corner-kappa"
+          ],
+          "dest": "opp_corner_kappa",
+          "label": "opp corner kappa",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.15,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[1/m] smoothed raceline curvature above which a point is in a corner, for the `line` behaviour",
+          "action": "store",
+          "nullable": false,
+          "metavar": "INVM"
+        },
+        {
+          "flag": "--opp-corner-min-arc",
+          "flags": [
+            "--opp-corner-min-arc"
+          ],
+          "dest": "opp_corner_min_arc",
+          "label": "opp corner min arc",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] shortest run of such points that counts as one corner",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-corner-smooth",
+          "flags": [
+            "--opp-corner-smooth"
+          ],
+          "dest": "opp_corner_smooth",
+          "label": "opp corner smooth",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.6,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] window the curvature is averaged over first",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--opp-slots",
+          "flags": [
+            "--opp-slots"
+          ],
+          "dest": "opp_slots",
+          "label": "차량별 상대차 설정",
+          "kind": "json",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|policy|self), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
+          "action": "store",
+          "nullable": false,
+          "metavar": "JSON|@FILE"
+        }
+      ]
+    },
+    "grip_collect": {
+      "key": "grip_collect",
+      "module": "f1sim.learn.policy_grip_data",
+      "subcommand": "collect",
+      "fields": [
+        {
+          "flag": "--out",
+          "flags": [
+            "--out"
+          ],
+          "dest": "out",
+          "label": "결과 출력 경로",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "output_dir"
+        },
+        {
+          "flag": "--policy",
+          "flags": [
+            "--policy"
+          ],
+          "dest": "policy",
+          "label": "데이터 수집 정책",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--estimator",
+          "flags": [
+            "--estimator"
+          ],
+          "dest": "estimator",
+          "label": "마찰 추정기",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--controller",
+          "flags": [
+            "--controller"
+          ],
+          "dest": "controller",
+          "label": "학습 제어기",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "auto",
+          "nargs": null,
+          "choices": [
+            "auto",
+            "estimated"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--research-estimator",
+          "flags": [
+            "--research-estimator"
+          ],
+          "dest": "research_estimator",
+          "label": "연구용 미승인 추정기 허용",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "모델·제어",
+          "help": "",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--tracks",
+          "flags": [
+            "--tracks"
+          ],
+          "dest": "tracks",
+          "label": "맵 / 장애물 배치",
+          "kind": "str",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--split-seeds",
+          "flags": [
+            "--split-seeds"
+          ],
+          "dest": "split_seeds",
+          "label": "학습·보정·개발·최종 시드",
+          "kind": "list",
+          "item_kind": "int",
+          "default": "18101,19101,20101,21101",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null,
+          "separator": "comma"
+        },
+        {
+          "flag": "--jobs-per-split",
+          "flags": [
+            "--jobs-per-split"
+          ],
+          "dest": "jobs_per_split",
+          "label": "분할별 수집 작업 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 12,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--envs",
+          "flags": [
+            "--envs"
+          ],
+          "dest": "envs",
+          "label": "병렬 차량 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 4,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--steps",
+          "flags": [
+            "--steps"
+          ],
+          "dest": "steps",
+          "label": "수집 스텝",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 400,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--stride",
+          "flags": [
+            "--stride"
+          ],
+          "dest": "stride",
+          "label": "샘플 간격",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 4,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--chunk-steps",
+          "flags": [
+            "--chunk-steps"
+          ],
+          "dest": "chunk_steps",
+          "label": "저장 청크 길이",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 32,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--speed-cap",
+          "flags": [
+            "--speed-cap"
+          ],
+          "dest": "speed_cap",
+          "label": "최대 주행 속도 (m/s)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 10.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--device",
+          "flags": [
+            "--device"
+          ],
+          "dest": "device",
+          "label": "학습 장치",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "cpu",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "출력/실행",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        }
+      ]
+    },
+    "grip_fit": {
+      "key": "grip_fit",
+      "module": "f1sim.learn.policy_grip_data",
+      "subcommand": "fit",
+      "fields": [
+        {
+          "flag": "--data",
+          "flags": [
+            "--data"
+          ],
+          "dest": "data",
+          "label": "수집 데이터 폴더",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "input_dir"
+        },
+        {
+          "flag": "--out",
+          "flags": [
+            "--out"
+          ],
+          "dest": "out",
+          "label": "결과 출력 경로",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "output_dir"
+        },
+        {
+          "flag": "--seed",
+          "flags": [
+            "--seed"
+          ],
+          "dest": "seed",
+          "label": "난수 시드",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "dest": "epochs",
+          "label": "학습 에포크",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--batch-size",
+          "flags": [
+            "--batch-size"
+          ],
+          "dest": "batch_size",
+          "label": "학습 배치 크기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 128,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--hidden",
+          "flags": [
+            "--hidden"
+          ],
+          "dest": "hidden",
+          "label": "추정기 GRU 크기",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 64,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--learning-rate",
+          "flags": [
+            "--learning-rate"
+          ],
+          "dest": "learning_rate",
+          "label": "학습률",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.002,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--init-estimator",
+          "flags": [
+            "--init-estimator"
+          ],
+          "dest": "init_estimator",
+          "label": "초기 마찰 추정기 (학습 이어받기)",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "기본",
+          "help": "optional compatible adaptive estimator weights; current CAL calibration is refitted",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--replay-data",
+          "flags": [
+            "--replay-data"
+          ],
+          "dest": "replay_data",
+          "label": "제어된 TRAIN 재생 데이터",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "optional controlled TRAIN-only canonical sensor/target tensor dictionary; never CAL/DEV/FINAL",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--replay-fraction",
+          "flags": [
+            "--replay-fraction"
+          ],
+          "dest": "replay_fraction",
+          "label": "학습 배치의 재생 데이터 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "replay share per minibatch in (0,1), rounded to rows; requires --replay-data when changed",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        }
+      ]
+    },
+    "grip_final": {
+      "key": "grip_final",
+      "module": "f1sim.learn.policy_grip_data",
+      "subcommand": "final",
+      "fields": [
+        {
+          "flag": "--data",
+          "flags": [
+            "--data"
+          ],
+          "dest": "data",
+          "label": "수집 데이터 폴더",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "input_dir"
+        },
+        {
+          "flag": "--candidate",
+          "flags": [
+            "--candidate"
+          ],
+          "dest": "candidate",
+          "label": "평가할 추정기",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--out",
+          "flags": [
+            "--out"
+          ],
+          "dest": "out",
+          "label": "결과 출력 경로",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "output_file"
+        }
+      ]
+    },
+    "grip_pilot": {
+      "key": "grip_pilot",
+      "module": "f1sim.learn.adaptive_grip_train",
+      "subcommand": null,
+      "fields": [
+        {
+          "flag": "--out",
+          "flags": [
+            "--out"
+          ],
+          "dest": "out",
+          "label": "결과 출력 경로",
+          "kind": "path",
+          "item_kind": "path",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": true,
+          "group": "기본",
+          "help": "",
+          "action": "store",
+          "nullable": true,
+          "metavar": null,
+          "path_mode": "output_dir"
+        },
+        {
+          "flag": "--train-episodes",
+          "flags": [
+            "--train-episodes"
+          ],
+          "dest": "train_episodes",
+          "label": "학습 에피소드 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 128,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cal-episodes",
+          "flags": [
+            "--cal-episodes"
+          ],
+          "dest": "cal_episodes",
+          "label": "보정 에피소드 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 32,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--test-episodes",
+          "flags": [
+            "--test-episodes"
+          ],
+          "dest": "test_episodes",
+          "label": "평가 에피소드 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 32,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--steps",
+          "flags": [
+            "--steps"
+          ],
+          "dest": "steps",
+          "label": "수집 스텝",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 200,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--epochs",
+          "flags": [
+            "--epochs"
+          ],
+          "dest": "epochs",
+          "label": "학습 에포크",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 10,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        }
+      ]
+    }
+  },
+  "contracts": {
+    "slot_superseded": [
+      [
+        "--opponent",
+        "opponent",
+        "policy"
+      ],
+      [
+        "--opp-speed",
+        "opp_speed",
+        [
+          0.6,
+          1.0
+        ]
+      ],
+      [
+        "--opp-pool",
+        "opp_pool",
+        ""
+      ],
+      [
+        "--opp-events",
+        "opp_events",
+        ""
+      ],
+      [
+        "--opp-event-rate",
+        "opp_event_rate",
+        0.0
+      ],
+      [
+        "--spawn-order",
+        "spawn_order",
+        "behind"
+      ],
+      [
+        "--mixed-teacher-frac",
+        "mixed_teacher_frac",
+        0.5
+      ],
+      [
+        "--opp-defend-prob",
+        "opp_defend_prob",
+        0.0
+      ],
+      [
+        "--opp-yield-prob",
+        "opp_yield_prob",
+        0.0
+      ],
+      [
+        "--opp-line-prob",
+        "opp_line_prob",
+        0.0
+      ],
+      [
+        "--opp-oblivious-prob",
+        "opp_oblivious_prob",
+        0.0
+      ]
+    ],
+    "scan_channels": [
+      "memory",
+      "edges",
+      "aligned",
+      "aligned_prev",
+      "aligned_valid",
+      "floor",
+      "fe_floor",
+      "fe_range"
+    ],
+    "aligned_channels": [
+      "aligned",
+      "aligned_prev",
+      "aligned_valid"
+    ],
+    "timed_events": [
+      "brake",
+      "stop",
+      "shift",
+      "weave"
+    ],
+    "reactive_events": [
+      "defend",
+      "yield",
+      "line",
+      "oblivious"
+    ],
+    "reactive_prob_fields": {
+      "defend": "opp_defend_prob",
+      "yield": "opp_yield_prob",
+      "line": "opp_line_prob",
+      "oblivious": "opp_oblivious_prob"
+    },
+    "slot_fields": [
+      "kind",
+      "checkpoint",
+      "controller",
+      "speed_scale",
+      "label_grip",
+      "speed_cap",
+      "events",
+      "event_rate",
+      "reactive",
+      "spawn",
+      "seed"
+    ],
+    "slot_kinds": [
+      {
+        "name": "raceline",
+        "teacher": true,
+        "checkpoint": false
+      },
+      {
+        "name": "interactive",
+        "teacher": true,
+        "checkpoint": false
+      },
+      {
+        "name": "policy",
+        "teacher": false,
+        "checkpoint": true
+      },
+      {
+        "name": "self",
+        "teacher": false,
+        "checkpoint": false
+      }
+    ],
+    "slot_grip": [
+      "true",
+      "nominal",
+      "conservative"
+    ],
+    "slot_spawns": [
+      "ahead",
+      "behind",
+      "alongside",
+      "random"
+    ],
+    "train_tracks": [
+      "real:icra2022",
+      "real:icra2022~rev",
+      "real:icra2022~mir",
+      "real:icra2022~mir~rev",
+      "real:blackbox2021_1",
+      "real:blackbox2021_1~rev",
+      "real:blackbox2021_1~mir",
+      "real:blackbox2021_1~mir~rev",
+      "real:blackbox2021_2",
+      "real:blackbox2021_2~rev",
+      "real:blackbox2021_2~mir",
+      "real:blackbox2021_2~mir~rev",
+      "real:blackbox2021_3",
+      "real:blackbox2021_3~rev",
+      "real:blackbox2021_3~mir",
+      "real:blackbox2021_3~mir~rev",
+      "real:blackbox2022_1",
+      "real:blackbox2022_1~rev",
+      "real:blackbox2022_1~mir",
+      "real:blackbox2022_1~mir~rev",
+      "real:blackbox2022_2",
+      "real:blackbox2022_2~rev",
+      "real:blackbox2022_2~mir",
+      "real:blackbox2022_2~mir~rev",
+      "rt:Spielberg",
+      "rt:Spielberg~rev",
+      "rt:Spielberg~mir",
+      "rt:Spielberg~mir~rev",
+      "rt:Oschersleben",
+      "rt:Oschersleben~rev",
+      "rt:Oschersleben~mir",
+      "rt:Oschersleben~mir~rev",
+      "gen:control:1400",
+      "gen:control:1400~rev",
+      "gen:control:1401",
+      "gen:control:1401~rev",
+      "gen:control:1402",
+      "gen:control:1402~rev",
+      "gen:control:1403",
+      "gen:control:1403~rev",
+      "gen:control:1404",
+      "gen:control:1404~rev",
+      "gen:control:1405",
+      "gen:control:1405~rev",
+      "gen:control:1406",
+      "gen:control:1406~rev",
+      "gen:control:1407",
+      "gen:control:1407~rev",
+      "gen:competition:1000",
+      "gen:competition:1000~rev",
+      "gen:competition:1001",
+      "gen:competition:1001~rev",
+      "gen:competition:1002",
+      "gen:competition:1002~rev",
+      "gen:competition:1003",
+      "gen:competition:1003~rev",
+      "gen:competition:1004",
+      "gen:competition:1004~rev",
+      "gen:competition:1005",
+      "gen:competition:1005~rev",
+      "gen:competition:1006",
+      "gen:competition:1006~rev",
+      "gen:competition:1007",
+      "gen:competition:1007~rev",
+      "gen:circuit:1200",
+      "gen:circuit:1200~rev",
+      "gen:circuit:1201",
+      "gen:circuit:1201~rev",
+      "gen:circuit:1202",
+      "gen:circuit:1202~rev",
+      "gen:circuit:1203",
+      "gen:circuit:1203~rev",
+      "gen:hallway:1100",
+      "gen:hallway:1100~rev",
+      "gen:hallway:1101",
+      "gen:hallway:1101~rev",
+      "gen:hallway:1102",
+      "gen:hallway:1102~rev",
+      "gen:hallway:1103",
+      "gen:hallway:1103~rev",
+      "gen:control:1408+pinch1408",
+      "gen:control:1409+pinch1409",
+      "gen:control:1410+pinch1410",
+      "gen:control:1411+pinch1411",
+      "gen:control:1412+pinch1412",
+      "gen:control:1413+pinch1413",
+      "gen:competition:1008+pinch1008",
+      "gen:competition:1009+pinch1009",
+      "gen:competition:1010+pinch1010",
+      "gen:competition:1011+pinch1011",
+      "real:korea_2026_competition+obs201",
+      "real:korea_2026_competition+obs201~rev",
+      "real:korea_2026_competition+obs201~mir",
+      "real:korea_2026_competition+obs202",
+      "real:korea_2026_competition+obs202~rev",
+      "real:korea_2026_competition+obs202~mir",
+      "real:korea_2026_competition+obs203",
+      "real:korea_2026_competition+obs203~rev",
+      "real:korea_2026_competition+obs203~mir",
+      "real:korea_2026_competition+rlobs211",
+      "real:korea_2026_competition+rlobs211~rev",
+      "real:korea_2026_competition+rlobs211~mir",
+      "real:korea_2026_competition+rlobs212",
+      "real:korea_2026_competition+rlobs212~rev",
+      "real:korea_2026_competition+rlobs212~mir",
+      "real:korea_2026_competition+rlobs213",
+      "real:korea_2026_competition+rlobs213~rev",
+      "real:korea_2026_competition+rlobs213~mir",
+      "real:korea_2026_competition+rlobs214",
+      "real:korea_2026_competition+rlobs214~rev",
+      "real:korea_2026_competition+rlobs214~mir",
+      "real:korea_2026_competition+pinch221",
+      "real:korea_2026_competition+pinch221~rev",
+      "real:korea_2026_competition+pinch222",
+      "real:korea_2026_competition+pinch222~rev",
+      "real:icra2022+obs0",
+      "real:icra2022+obs0~rev",
+      "real:blackbox2021_1+obs1",
+      "real:blackbox2021_1+obs1~rev",
+      "real:blackbox2021_2+obs2",
+      "real:blackbox2021_2+obs2~rev",
+      "real:blackbox2021_3+obs3",
+      "real:blackbox2021_3+obs3~rev",
+      "real:blackbox2022_1+obs4",
+      "real:blackbox2022_1+obs4~rev",
+      "real:blackbox2022_2+obs5",
+      "real:blackbox2022_2+obs5~rev",
+      "real:icra2022+rlobs40",
+      "real:icra2022+rlobs40~rev",
+      "real:blackbox2021_1+rlobs41",
+      "real:blackbox2021_1+rlobs41~rev",
+      "real:blackbox2021_2+rlobs42",
+      "real:blackbox2021_2+rlobs42~rev",
+      "real:blackbox2021_3+rlobs43",
+      "real:blackbox2021_3+rlobs43~rev",
+      "real:blackbox2022_1+rlobs44",
+      "real:blackbox2022_1+rlobs44~rev",
+      "real:blackbox2022_2+rlobs45",
+      "real:blackbox2022_2+rlobs45~rev",
+      "gen:control:1414+rlobs1414",
+      "gen:control:1415+rlobs1415",
+      "gen:control:1416+rlobs1416",
+      "gen:control:1417+rlobs1417",
+      "gen:control:1418+rlobs1418",
+      "gen:control:1419+rlobs1419",
+      "gen:competition:1012+rlobs1012",
+      "gen:competition:1013+rlobs1013",
+      "gen:competition:1014+rlobs1014",
+      "gen:competition:1015+rlobs1015"
+    ],
+    "observation": {
+      "fixed": {
+        "n_beams": 1081,
+        "range_max": 10.0,
+        "v_max": 10.0,
+        "gyro_scale": 5.0,
+        "accel_scale": 10.0,
+        "att_scale": 0.35,
+        "action_history": 2,
+        "hist_stride": 2
+      },
+      "restorable": {
+        "scan_stack": "scan_stack",
+        "scan_stride": "scan_stride",
+        "hist_len": "hist_len",
+        "opp_token": "opp_token",
+        "opp_future_model": "opp_future_model"
+      },
+      "action_dims": {
+        "direct": 2,
+        "plan": 8
+      },
+      "memory": {
+        "layers": 1,
+        "critic": "own"
+      },
+      "privileged_dims": {
+        "solo": 17,
+        "race": 21
+      },
+      "priv_adapters": {
+        "absent_opponent_17_to_21": {
+          "input": 17,
+          "output": 21
+        }
+      }
+    }
+  }
+}

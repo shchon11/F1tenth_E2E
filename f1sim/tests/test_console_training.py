@@ -52,10 +52,9 @@ def test_the_three_groups_are_tabs_of_base_maps(picker):
             assert tracks.group_of(tid) == group or group == "내 환경"
 
 
-def test_the_default_is_the_training_split_itself(picker):
-    """Not a reconstruction of it. The curated list has per-map obstacle seeds by design, and a run
-    launched from the default has to be the run the recipes were measured with."""
-    assert picker.spec() == "train"
+def test_the_default_uses_asset_variants_of_the_training_split(picker):
+    """Fresh launches keep the curated maps/seeds and explicitly switch to real assets."""
+    assert picker.spec() == ",".join(tracks.asset_scenario(tracks.short(n)) for n in tracks.split_names("train"))
     assert set(_checked(picker)) == set(tracks.split_tracks("train"))
     assert picker.count() == 149
     assert "149개 변형" in picker.summary.text()
@@ -65,7 +64,7 @@ def test_one_click_selects_the_whole_training_set(picker):
     picker.clear_selection()
     assert picker.spec() == "" and _checked(picker) == []
     picker.btn_all_train.click()
-    assert picker.spec() == "train"
+    assert picker.spec() == ",".join(tracks.asset_scenario(tracks.short(n)) for n in tracks.split_names("train"))
 
 
 def test_touching_anything_drops_the_split_shortcut_and_emits_the_list(picker):
@@ -92,18 +91,18 @@ def test_an_obstacle_family_is_applied_to_every_selected_map(picker):
         cb.setChecked(d == "")
     picker.obs_boxes[""].setChecked(False)
     picker.obs_boxes["line"].setChecked(True)
-    assert picker.spec() == "real/icra22#line:*"
+    assert picker.spec() == "real/icra22#line:*!assets=mixed:1"
     # `*` is a request for N placements, not one track
     picker.spin_draws.setValue(8)
     assert picker.count() == 8
     picker.combo_seed.setCurrentIndex(picker.combo_seed.findData("fixed"))
     picker.spin_fixed.setValue(44)
-    assert picker.spec() == "real/icra22#line:44"
+    assert picker.spec() == "real/icra22#line:44!assets=mixed:1"
     assert picker.count() == 1
 
 
-def test_an_obstacle_a_track_cannot_carry_is_left_out_rather_than_emitted(picker):
-    """`rt:Monza+obs3` raises in the loader. The picker must not build the name."""
+def test_asset_modes_support_racetracks_without_legacy_raster_suffixes(picker):
+    """New asset markers support Monza while its old +obs loader remains unchanged."""
     picker.clear_selection()
     for lw in picker._lists.values():
         for i in range(lw.count()):
@@ -114,7 +113,7 @@ def test_an_obstacle_a_track_cannot_carry_is_left_out_rather_than_emitted(picker
         cb.setChecked(d == "")
     picker.obs_boxes[""].setChecked(False)
     picker.obs_boxes["edge"].setChecked(True)
-    assert picker.spec() == "real/bb22-3#edge:*"
+    assert set(picker.spec().split(",")) == {"real/bb22-3#edge:*!assets=mixed:1", "rt/monza#edge:*!assets=mixed:1"}
 
 
 def test_every_spec_the_picker_emits_is_one_the_trainer_accepts(picker):
@@ -150,7 +149,7 @@ def test_a_tracks_value_the_controls_cannot_express_is_kept_verbatim(picker):
     assert picker.spec() == spec
     assert "직접 지정한" in picker.summary.text()
     picker.btn_all_train.click()
-    assert picker.spec() == "train"
+    assert picker.spec() == ",".join(tracks.asset_scenario(tracks.short(n)) for n in tracks.split_names("train"))
 
 
 # ================================================================ the argv it builds
@@ -164,10 +163,27 @@ def form(qapp, tmp_path, monkeypatch):
         f.deleteLater()
 
 
-def test_the_default_recipe_emits_the_split_name(form):
+def test_the_default_recipe_emits_explicit_asset_scenarios(form):
     _name, argv, _dev = form.argv()
-    assert argv[argv.index("--tracks") + 1] == "train"
+    assert argv[argv.index("--tracks") + 1] == form.tracks.spec()
+    assert any(tracks.parse(n).asset for n in form.tracks.spec().split(","))
     assert argv[argv.index("--obstacle-draws") + 1] == "8"
+
+
+def test_historical_recipe_is_explicit_and_training_controls_are_available(form):
+    for old_widget in ("combo_controller", "edit_estimator", "ctrl_hint"):
+        assert not hasattr(form, old_widget), old_widget
+    assert "controller" in form.editors and "estimator" in form.editors
+    assert "기본 레이스" in form.combo_recipe.currentText()
+
+    _name, argv, _dev = form.argv()
+    assert form.spin_race.value() == 2 and form.spin_race.isEnabled()
+    assert form.combo_opp.isEnabled()
+    assert argv.count("--controller") == 1
+    assert argv[argv.index("--controller") + 1] == "legacy"
+    assert "--estimator" not in argv
+    assert argv[argv.index("--race-size") + 1] == "2"
+    assert form.combo_device.findText("cuda") >= 0
 
 
 def test_the_narrow_recipes_round_trip_through_the_picker(form):
@@ -218,7 +234,7 @@ upd 12/64 steps 0.20M cap 9.0 | rew/step 1.234 coll 0.900/km prog 41.2 m lap 12.
 
 def test_the_summary_reads_the_argv_the_process_was_started_with():
     s = T.summarize_job(_job(RECORDED), log_text=LOG, progress=T.parse_progress(LOG))
-    assert s.recipe == "원본 레이스 레시피 (권장)"
+    assert s.recipe == "기본 레이스 레시피"
     assert s.tracks_text == "학습 분할 (149개 변형, 53개 맵)"
     assert s.race_text == "2대 · 상대차 mixed"
     assert s.controller == "legacy"

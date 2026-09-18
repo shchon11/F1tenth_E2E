@@ -31,6 +31,37 @@ def _qc(rgb, alpha: float = 1.0) -> QtGui.QColor:
     return QtGui.QColor(r, g, b, int(255 * alpha))
 
 
+def _as_bool(value, default: bool = False) -> bool:
+    """Normalize bools crossing the JSON snapshot boundary, including 0.0/1.0 diagnostics."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "0", "false", "no", "off", "none", "null"):
+            return False
+        if text in ("1", "true", "yes", "on"):
+            return True
+        try:
+            return bool(float(text))
+        except ValueError:
+            return default
+    try:
+        return bool(value)
+    except (TypeError, ValueError):
+        try:
+            return bool(float(value))
+        except (TypeError, ValueError):
+            return default
+
+
+def _finite_mu(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0.0 else None
+
+
 class PolicyInputPanel(QtWidgets.QWidget):
     paint_ms: list = []          # instrumentation: how long each repaint of this panel took
 
@@ -206,10 +237,16 @@ class DashPanel(QtWidgets.QWidget):
         self.mu_g: Optional[float] = None
         self._gg: List[Tuple[float, float]] = []
         self._have = False
+        self._grip_estimate = None
+        self._grip_fault = False
+        self._grip_used_mu = None
+        self._grip_focus = None
+        self._grip_status = "추정 대기"
         self.setToolTip("바깥 눈금은 정책이 명령할 수 있는 최대 속도, 빨간 구간은 속도 상한 초과.\n"
                         "주황 표시는 명령값, 흰 바늘/각도는 실제 측정값.\n\n"
-                        "g-g는 시뮬레이터가 측정한 차체 가속도이고 원은 시뮬이 이 차에 적용한 마찰\n"
-                        "한계입니다. 둘 다 시뮬 참값이며, 정책의 관측이나 접지력 추정이 아닙니다.")
+                        "g-g는 시뮬레이터가 측정한 차체 가속도입니다. 빨강 원은 시뮬 참값 마찰 한계,\n"
+                        "청록 원은 센서 기반 추정 q50이며 반투명 띠는 q10–q90 범위입니다.\n"
+                        "적용 μ는 컨트롤러에 사용한 값입니다.")
 
     def set_data(self, v, v_cmd, v_cap, steer, steer_cmd, v_max, gg, mu_g):
         self.v, self.v_cmd, self.v_cap = float(v), float(v_cmd), float(v_cap)
@@ -223,6 +260,94 @@ class DashPanel(QtWidgets.QWidget):
     def clear(self):
         self._have = False
         self._gg = []
+        self._reset_grip()
+        self._grip_focus = None
+        self.update()
+
+    def clear_grip_estimate(self):
+        """Forget the previous estimate when a new session has no evidence yet."""
+        self._reset_grip()
+        self._grip_focus = None
+        self.update()
+
+    def _reset_grip(self):
+        self._grip_estimate = None
+        self._grip_fault = False
+        self._grip_used_mu = None
+        self._grip_status = "추정 대기"
+
+    @property
+    def grip_status(self) -> str:
+        return self._grip_status
+
+    def set_focus(self, focus: int):
+        focus = int(focus)
+        changed = self._grip_focus is not None and focus != self._grip_focus
+        self._grip_focus = focus
+        if changed:
+            self._reset_grip()
+            self.update()
+
+    def set_grip_estimate(self, estimate):
+        """Set a new estimate, retaining evidence while an incoming frame is uninformative."""
+        if not isinstance(estimate, dict):
+            return
+        warm = _as_bool(estimate.get("warm"))
+        finite = _as_bool(estimate.get("finite"))
+        has_evidence = _as_bool(estimate.get("has_evidence"), default=warm and finite)
+        informative = _as_bool(estimate.get("informative"), default=True)
+        fault = _as_bool(estimate.get("fault"))
+        if fault:
+            used_mu = _finite_mu(estimate.get("used_mu"))
+            self._grip_estimate = None
+            self._grip_fault = True
+            self._grip_used_mu = used_mu
+            self._grip_status = f"센서 확인 · 적용 {used_mu:.2f}" if used_mu is not None else "추정 오류"
+            self.update()
+            return
+        # Cold or explicitly evidence-free packets clear stale evidence before the retention path.
+        if not has_evidence or not warm or not finite:
+            self._reset_grip()
+            self.update()
+            return
+        if not informative and (self._grip_estimate is not None or self._grip_fault):
+            used_mu = _finite_mu(estimate.get("used_mu"))
+            if used_mu is not None:
+                self._grip_used_mu = used_mu
+            if self._grip_fault:
+                self._grip_status = (f"센서 확인 · 적용 {self._grip_used_mu:.2f}"
+                                     if self._grip_used_mu is not None else "추정 오류")
+            elif self._grip_estimate is not None:
+                if used_mu is not None:
+                    self._grip_estimate["used_mu"] = used_mu
+                self._grip_status = f"추정 μ {self._grip_estimate['q50']:.2f} · 적용 {self._grip_estimate['used_mu']:.2f}"
+            self.update()
+            return
+        if not informative:
+            used_mu = _finite_mu(estimate.get("used_mu"))
+            self._reset_grip()
+            self._grip_used_mu = used_mu
+            if used_mu is not None:
+                self._grip_status = f"추정 대기 · 적용 {used_mu:.2f}"
+            self.update()
+            return
+        try:
+            q10 = float(estimate["q10"])
+            q50 = float(estimate["q50"])
+            q90 = float(estimate["q90"])
+            used_mu = float(estimate["used_mu"])
+            valid = all(math.isfinite(v) and v >= 0.0 for v in (q10, q50, q90, used_mu))
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            self._grip_estimate = None
+            self._grip_fault = False
+            self._grip_status = "추정 대기"
+        else:
+            self._grip_estimate = {"used_mu": used_mu, "q10": q10, "q50": q50, "q90": q90}
+            self._grip_fault = False
+            self._grip_used_mu = used_mu
+            self._grip_status = f"추정 μ {q50:.2f} · 적용 {used_mu:.2f}"
         self.update()
 
     # Each gauge owns a column with the same four bands -- caption, dial, value, name -- so nothing
@@ -413,14 +538,44 @@ class DashPanel(QtWidgets.QWidget):
                    C["text.0"] if live else C["text.2"], size=12.5, mono=True, bold=True)
         self._line(p, name_r, "조향", C["text.2"])
 
+    def _gg_radii(self, radius):
+        """Return the shared plot scale, truth radius, estimate radii, and pixels per m/s²."""
+        truth_lim = max(1e-3, float(self.mu_g or 9.81))
+        estimate = self._grip_estimate
+        if estimate is None:
+            plot_lim = truth_lim
+            estimate_radii = None
+        else:
+            estimate_lim = max(estimate["q10"], estimate["q50"], estimate["q90"]) * 9.81
+            plot_lim = max(truth_lim, estimate_lim)
+            px = radius / plot_lim
+            estimate_radii = tuple(estimate[key] * 9.81 * px for key in ("q10", "q50", "q90"))
+        px = radius / plot_lim
+        return plot_lim, truth_lim, radius * truth_lim / plot_lim, estimate_radii, px
+
     def _gg_plot(self, p, cell):
         cap_r, (cx, cy), r, val_r, name_r = self._bands(cell)
-        lim = float(self.mu_g or 9.81)
+        lim, truth_lim, truth_r, estimate_radii, px = self._gg_radii(r)
         p.setBrush(QtCore.Qt.NoBrush)
         p.setPen(QtGui.QPen(QtGui.QColor(C["line.strong"]), 1))
         p.drawEllipse(QtCore.QPointF(cx, cy), r * 0.5, r * 0.5)
+        if estimate_radii is not None:
+            q10_r, q50_r, q90_r = estimate_radii
+            if q90_r > q10_r + 1e-3:
+                band = QtGui.QPainterPath()
+                band.setFillRule(QtCore.Qt.OddEvenFill)
+                band.addEllipse(QtCore.QPointF(cx, cy), q90_r, q90_r)
+                band.addEllipse(QtCore.QPointF(cx, cy), q10_r, q10_r)
+                p.setPen(QtCore.Qt.NoPen)
+                band_colour = QtGui.QColor(C["ego"])
+                band_colour.setAlpha(32)
+                p.setBrush(band_colour)
+                p.drawPath(band)
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.setPen(QtGui.QPen(QtGui.QColor(C["ego"]), 1.5))
+            p.drawEllipse(QtCore.QPointF(cx, cy), q50_r, q50_r)
         p.setPen(QtGui.QPen(QtGui.QColor(C["danger"]), 1.5))       # the friction circle itself
-        p.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+        p.drawEllipse(QtCore.QPointF(cx, cy), truth_r, truth_r)
         p.setPen(QtGui.QPen(QtGui.QColor(C["line"]), 1))
         p.drawLine(QtCore.QPointF(cx - r, cy), QtCore.QPointF(cx + r, cy))
         p.drawLine(QtCore.QPointF(cx, cy - r), QtCore.QPointF(cx, cy + r))
@@ -438,12 +593,14 @@ class DashPanel(QtWidgets.QWidget):
                 p.drawEllipse(QtCore.QPointF(x, y), 1.5, 1.5)
         cur = self._gg[-1] if self._gg else (0.0, 0.0)
         g_now = float(np.hypot(*cur)) / 9.81
-        self._line(p, cap_r, "↑가속  ↓제동  ↔횡가속", C["text.2"], size=7.0)
+        self._line(p, cap_r, self._grip_status,
+                   C["ego"] if estimate_radii is not None else
+                   C["warn"] if self._grip_fault else C["text.2"], size=7.0)
         self._line(p, val_r, f"{g_now:4.2f} g" if self._have else "—",
                    C["text.0"] if self._have else C["text.2"], size=12.5, mono=True, bold=True)
         # The circle is the friction limit the simulator applied to this car, not a value the
         # policy estimated or observed; without the tag it reads as a grip estimate.
-        self._line(p, name_r, f"시뮬 참값 · 마찰 한계 {lim / 9.81:.2f} g" if self._have else "g-g (시뮬 참값)",
+        self._line(p, name_r, f"시뮬 참값 · 마찰 한계 {truth_lim / 9.81:.2f} g" if self._have else "g-g (시뮬 참값)",
                    C["text.2"])
 
 

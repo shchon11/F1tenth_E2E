@@ -599,3 +599,294 @@ class SimGraphFastPath:
         # runs `gc.collect()`, and the env would survive that pass. Nothing leaks for the life of
         # the worker either way; it is a question of freeing on time.
         self.sim = None
+
+
+# ---------------------------------------------------------------- the opponent teacher
+def _view_key(t: torch.Tensor) -> tuple:
+    """Which tensor, as a view: `sim.P["m"]` and `sim.params.buf` share one storage and are not
+    one input."""
+    return (t.untyped_storage().data_ptr(), t.storage_offset(), tuple(t.shape), t.stride(), t.dtype)
+
+
+class _InputRecorder:
+    """Every CUDA tensor a call reads that it did not create, and whether it wrote to any of them.
+
+    A `TorchFunctionMode`, so it sees each torch function and tensor method with its arguments.
+    Inputs are keyed by view (`_view_key`); "created" is tracked by storage: an output whose storage
+    is not an input's is the call's own. A view of an input shares the input's storage, so it stays
+    an input -- which is what makes an in-place write through a view count as a write to the input.
+    """
+
+    def __init__(self, own: Sequence[torch.Tensor] = ()):
+        from torch.overrides import TorchFunctionMode
+
+        rec = self
+        self.inputs: Dict[tuple, torch.Tensor] = {}
+        self.in_storage: set = set()
+        self.made: set = set()
+        #: views the call itself made of an input (`P["lf"][:, None, None]`): they share the input's
+        #: storage but are not held anywhere, and their source is already recorded
+        self.derived: set = set()
+        self.own = {t.untyped_storage().data_ptr() for t in own}
+        self.written: list = []
+
+        class _Mode(TorchFunctionMode):
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                return rec._on(func, args, kwargs or {})
+
+        self._mode = _Mode()
+
+    def _on(self, func, args, kwargs):
+        from torch.utils._pytree import tree_flatten
+        flat = tree_flatten((args, kwargs))[0]
+        for t in flat:
+            if torch.is_tensor(t) and t.device.type == "cuda":
+                p = t.untyped_storage().data_ptr()
+                if p not in self.made and p not in self.own:
+                    k = _view_key(t)
+                    if k not in self.derived:
+                        self.inputs.setdefault(k, t)
+                        self.in_storage.add(p)
+        name = getattr(func, "__name__", "")
+        target = args[0] if args else None
+        inplace = (name.endswith("_") and not name.endswith("__")) or name == "__setitem__" \
+            or "out" in kwargs
+        if inplace and torch.is_tensor(target) and target.untyped_storage().data_ptr() in self.in_storage:
+            self.written.append(name)
+        out = func(*args, **kwargs)
+        for t in tree_flatten(out)[0]:
+            if torch.is_tensor(t):
+                p = t.untyped_storage().data_ptr()
+                if p not in self.in_storage:
+                    self.made.add(p)
+                elif _view_key(t) not in self.inputs:
+                    self.derived.add(_view_key(t))
+        return out
+
+    def __enter__(self):
+        self._mode.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._mode.__exit__(*exc)
+
+
+def _tensor_paths(root, max_depth: int = 6) -> Dict[tuple, list]:
+    """`_view_key` -> every attribute / key path from `root` that reaches that exact CUDA view.
+
+    Walks f1sim objects, dicts, lists, tuples and modules only; anything else is opaque. A path is
+    a tuple of ("a", attr) / ("k", key) steps, resolved by `_resolve`.
+    """
+    found: Dict[int, list] = {}
+    seen: set = set()
+
+    def rec(obj, path, depth):
+        if torch.is_tensor(obj):
+            if obj.device.type == "cuda":
+                found.setdefault(_view_key(obj), []).append(path)
+            return
+        if depth > max_depth or isinstance(obj, _ATOM) or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                rec(v, path + (("k", k),), depth + 1)
+        elif isinstance(obj, (list, tuple)) and len(obj) <= 64:
+            for i, v in enumerate(obj):
+                rec(v, path + (("k", i),), depth + 1)
+        elif isinstance(obj, torch.nn.Module):
+            for n, t in list(obj.named_parameters()) + list(obj.named_buffers()):
+                rec(t, path + tuple(("a", part) for part in n.split(".")), depth + 1)
+        elif type(obj).__module__.startswith("f1sim") and hasattr(obj, "__dict__"):
+            for k, v in list(vars(obj).items()):
+                rec(v, path + (("a", k),), depth + 1)
+
+    rec(root, (), 0)
+    return found
+
+
+def _resolve(root, path):
+    obj = root
+    for kind, key in path:
+        obj = getattr(obj, key) if kind == "a" else obj[key]
+    return obj
+
+
+def _assign(root, path, value) -> None:
+    parent = _resolve(root, path[:-1])
+    kind, key = path[-1]
+    if kind == "a":
+        setattr(parent, key, value)
+    else:
+        parent[key] = value
+
+
+def teacher_eligible(env) -> Tuple[bool, str]:
+    """Can the opponent teacher's call be captured? Decided before anything is attempted."""
+    sim = getattr(env, "sim", None)
+    if sim is None:
+        return False, "시뮬레이터 없음"
+    ok, why = _cuda_eligible(sim)
+    if not ok:
+        return False, why
+    if int(getattr(env, "M", 1)) <= 1 or getattr(env, "teacher", None) is None:
+        return False, "teacher 상대차 없음"
+    if not bool(getattr(env, "teacher_any", False)):
+        return False, "teacher 가 모는 차가 없음"
+    if getattr(env, "pool", None) is not None or getattr(env, "alt_teachers", None):
+        return False, "정책 풀 / 다른 teacher 종류가 섞인 레이스"
+    tracker = getattr(env, "tracker", None)
+    solver = getattr(tracker, "_solver", None)
+    if isinstance(solver, GraphedCallable) and all(
+            getattr(tracker, h, None) is None for h in ("_input_hook", "_plan_hook", "_command_hook")):
+        # The interactive teacher previews the installed MPC in this configuration, and that call
+        # would replay the solver's graph inside this capture -- which CUDA refuses, fatally.
+        return False, "teacher 의 MPC 미리보기가 솔버 그래프를 재생함 (legacy 제어기)"
+    return True, ""
+
+
+class TeacherGraph:
+    """`env._teacher_normalized` for the race's teacher-driven cars, as one CUDA graph.
+
+    Beside a single viewed car, the teacher is most of a step: a candidate family, a Gauss-Newton
+    fit per candidate, a speed certification and a collision preview, each a few hundred tiny
+    kernels. At the viewer's batch sizes launching them costs far more than running them -- 37 ms of
+    a 58 ms step with three cars, against ~20 ms for the whole step without opponents.
+
+    The call is a pure function of tensors the environment holds, but several of those are rebound
+    every step (`sim.state`, `last_result.odom`, `tracker.last_pred`, `_plan_pose`), so a graph that
+    read them at their captured addresses would replay the capture step for ever. So:
+
+    * **Every tensor the call reads is found, not listed.** Capture runs under `_InputRecorder`, and
+      each input is traced back to its attribute paths from the environment. An input with no path,
+      or a write into one, makes the configuration `NotCapturable` and the teacher stays eager.
+    * **The graph reads private copies.** Each input is cloned and the environment's paths point at
+      the clone for the duration of the capture only, then go back. Before every replay each live
+      input is copied into its clone. Nothing the environment owns is ever written by the graph --
+      so an old tensor someone kept (a previous pose, a view of the last state) is never touched.
+    * **Anything it cannot follow sends it back to eager, for good.** A live input whose shape or
+      dtype changed, paths that disagree about which tensor they hold, a guard -- the teacher's
+      speed scale, grip mode, lane clamp, the tracker's spec and hooks, the call's non-tensor
+      arguments -- that no longer matches.
+    """
+
+    def __init__(self, env, example_args: Sequence[Any], log=None):
+        ok, why = teacher_eligible(env)
+        if not ok:
+            raise NotCapturable(why)
+        self.env = env
+        self.teacher = env.teacher
+        self._log = log or (lambda _t: None)
+        self._eager = env._teacher_normalized         # the bound method, not a previous shadow
+        self.fell_back: Optional[str] = None
+        self.replays = 0
+        self.eager_steps = 0
+        self._installed = False
+        teacher = self.teacher
+        guards = {
+            "teacher": lambda: id(env.teacher),
+            "teacher.speed_scale": lambda: teacher.speed_scale,
+            "teacher.label_grip": lambda: teacher.label_grip,
+            "teacher.offset_limit": lambda: teacher.offset_limit,
+            "tracker": lambda: (id(env.tracker), type(env.tracker).__name__),
+            "tracker.spec": lambda: env.tracker.spec,
+            "tracker.hooks": lambda: tuple(id(getattr(env.tracker, h, None))
+                                           for h in ("_input_hook", "_plan_hook", "_command_hook")),
+            "tracker._solver": lambda: id(getattr(env.tracker, "_solver", None)),
+            "env.B": lambda: int(env.B),
+            "env.v_max_policy": lambda: float(env.ecfg.v_max_policy),
+            "env.events": lambda: id(env.events),
+        }
+
+        # 1. Which tensors does the call read, and where do they live?
+        rec = _InputRecorder([a for a in example_args if torch.is_tensor(a)])
+        with torch.no_grad(), rec:
+            self._eager(teacher, *example_args)
+        if rec.written:
+            raise NotCapturable(f"teacher 가 외부 텐서에 씁니다 ({', '.join(sorted(set(rec.written)))})")
+        paths = _tensor_paths(env)
+        refs = []
+        for key, t in rec.inputs.items():
+            ps = paths.get(key)
+            if not ps:
+                raise NotCapturable(f"출처를 찾을 수 없는 teacher 입력 {tuple(t.shape)}/{t.dtype}")
+            live = [_resolve(env, p) for p in ps]
+            refs.append((ps, live))
+
+        # 2. Point every path at a private clone, capture, and put the environment back.
+        self._inputs = []                              # (paths, private clone)
+        for ps, live in refs:
+            clone = live[0].detach().clone()
+            self._inputs.append((ps, clone))
+        try:
+            for (ps, clone), (_, live) in zip(self._inputs, refs):
+                for p in ps:
+                    _assign(env, p, clone)
+
+            def body(*args):
+                with torch.no_grad():
+                    return self._eager(teacher, *args)
+
+            self._gc = GraphedCallable(body, example_args, guards=guards, name="opponent teacher")
+        finally:
+            for (ps, _clone), (_, live) in zip(self._inputs, refs):
+                for p, orig in zip(ps, live):
+                    _assign(env, p, orig)
+        self._log(f"상대차 teacher 그래프 캡처 (입력 {len(self._inputs)}개)")
+
+    # -- ownership / hooks -----------------------------------------------------------
+    def adopt(self) -> None:
+        self._gc.adopt()
+
+    def install(self) -> None:
+        if self._installed:
+            raise GuardViolation("teacher graph is already installed")
+        self.env._teacher_normalized = self
+        self._installed = True
+
+    def release(self) -> None:
+        if self._installed and self.env is not None:
+            self.env.__dict__.pop("_teacher_normalized", None)
+            self._installed = False
+        self._inputs = []
+        self._gc = None
+        self.env = None
+
+    # -- dispatch ---------------------------------------------------------------------
+    def _give_up(self, why: str) -> None:
+        self.fell_back = why
+        self._log(f"상대차 teacher 는 이제 eager 로 돕니다: {why}")
+
+    def __call__(self, teacher, *args):
+        if self.fell_back is not None or teacher is not self.teacher:
+            return self._eager(teacher, *args)
+        env = self.env
+        live_of = []
+        for ps, clone in self._inputs:
+            live = _resolve(env, ps[0])
+            for p in ps[1:]:
+                other = _resolve(env, p)
+                if other is not live and _view_key(other) != _view_key(live):
+                    # Two names for what was one tensor now hold different ones: which of them the
+                    # call reads is not something this can know. Eager for this step only.
+                    self.eager_steps += 1
+                    return self._eager(teacher, *args)
+            if live.shape != clone.shape or live.dtype != clone.dtype:
+                self._give_up(f"입력 {tuple(clone.shape)} 이 {tuple(live.shape)} 로 바뀜")
+                return self._eager(teacher, *args)
+            live_of.append(live)
+        try:
+            self._gc.check_guards()
+        except GuardViolation as exc:
+            self._give_up(str(exc))
+            return self._eager(teacher, *args)
+        for (_ps, clone), live in zip(self._inputs, live_of):
+            if live is not clone:
+                clone.copy_(live)
+        try:
+            out = self._gc(*args)
+        except GuardViolation as exc:
+            self._give_up(str(exc))
+            return self._eager(teacher, *args)
+        self.replays += 1
+        return out

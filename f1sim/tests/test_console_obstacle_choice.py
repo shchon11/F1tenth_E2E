@@ -133,9 +133,9 @@ def test_a_family_can_be_asked_to_clear_the_map_first(window):
     _select(window, "scene/hall")
     window.combo_obstacle.setCurrentIndex(window.combo_obstacle.findData("hard"))
     assert window.chk_bare_first.isEnabled()
-    assert window._scenario() == "scene/hall#hard:*"
+    assert window._scenario() == "scene/hall#hard:*!assets=mixed:1"
     window.chk_bare_first.setChecked(True)
-    assert window._scenario() == "scene/hall#bare+hard:*"
+    assert window._scenario() == "scene/hall#bare+hard:*!assets=mixed:1"
     assert T.parse("scene/hall#bare+hard:3").legacy() == "scene:hall+bare+hard3"
 
 
@@ -143,7 +143,7 @@ def test_the_composition_control_is_off_where_there_is_nothing_to_clear(window):
     _select(window, "scene/empty")
     window.combo_obstacle.setCurrentIndex(window.combo_obstacle.findData("hard"))
     assert not window.chk_bare_first.isEnabled()
-    assert window._scenario() == "scene/empty#hard:*"
+    assert window._scenario() == "scene/empty#hard:*!assets=mixed:1"
 
 
 def test_the_hint_says_a_family_adds(window):
@@ -183,7 +183,7 @@ def picker(qapp, scenes):
 def test_the_training_picker_offers_the_same_two_words(picker):
     assert picker.obs_boxes[""].text() == "기본"
     assert picker.obs_boxes[T.BARE].text() == "없음"
-    assert "걷어" in picker.obs_boxes[T.BARE].toolTip()
+    assert "제거" in picker.obs_boxes[T.BARE].toolTip()
 
 
 def test_the_training_picker_emits_a_seedless_bare(picker):
@@ -204,3 +204,20 @@ def test_the_training_picker_emits_a_seedless_bare(picker):
 def test_a_job_started_with_bare_is_described_as_such():
     text = TR.describe_tracks("scene/hall#bare,scene/hall")
     assert "없음" in text and "기본" not in text.split("장애물")[0]
+
+
+def test_only_five_asset_obstacle_choices_are_visible(window, picker):
+    _select(window, "scene/hall")
+    expected = ["없음", "기본", "랜덤 · 낮음", "랜덤 · 중간", "랜덤 · 높음"]
+    assert [window.combo_obstacle.itemData(i) for i in range(window.combo_obstacle.count())] == list(T.ASSET_OBSTACLES)
+    assert [picker.obs_boxes[k].text() for k in T.ASSET_OBSTACLES] == expected
+    assert "props" not in picker.obs_boxes and "pinch" not in picker.obs_boxes
+    assert not hasattr(window, "obstacle_assets"), "asset type and size are automatic, not new controls"
+
+
+def test_restoring_an_old_split_does_not_convert_its_recorded_obstacles(picker):
+    picker.set_spec("train")
+    assert picker.spec() == "train"
+    picker.btn_all_train.click()
+    scenarios = [T.parse(n) for n in picker.spec().split(",")]
+    assert all(s.asset == "mixed" for s in scenarios if s.obstacle)

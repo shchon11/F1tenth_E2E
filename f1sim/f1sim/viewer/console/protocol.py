@@ -79,6 +79,7 @@ STAGES = [
     ("compile", "torch.compile 컴파일 중"),
     ("geometry", "맵 지오메트리 만드는 중"),
     ("graph", "CUDA 그래프 캡처 중"),
+    ("controller", "자동 제어 준비 중"),
     ("done", "시작"),
 ]
 STAGE_TEXT = dict(STAGES)
@@ -110,10 +111,8 @@ class SessionConfig:
     speed_cap: Optional[float] = None    # None = whatever the checkpoint was trained at
     device: str = "auto"
     #: `torch.compile` the policy and the physics. Off by default: this is a *startup cost*, not
-    #: the GPU switch -- `device` decides that, and a session runs on CUDA either way. Compiling
-    #: pays for itself over a long run with many cars; for opening the viewer to look at one car it
-    #: costs minutes and returns nothing. Headless and training paths set it themselves and are
-    #: unaffected by this default.
+    #: the GPU switch -- `device` decides that, and a session runs on CUDA either way. Explicit
+    #: benchmark and headless callers may still enable it; ordinary driving leaves it disabled.
     compile: bool = False
     randomize: bool = True               # domain randomisation, as in training
     stochastic: bool = False
@@ -126,12 +125,13 @@ class SessionConfig:
     #: driving page and the training page share one widget, and a session saved here can be pasted
     #: into a training command. None = no table, and `opponent` above decides instead.
     opponent_slots: Optional[List[Dict[str, Any]]] = None
-    #: Plan-controller arm installed at run time (`learn.grip_runtime`). "legacy" is the untouched
-    #: MPC. "estimated" / "fixed_low" apply the grip-aware curvature speed limit and mu-dependent
-    #: acceleration/brake budgets on top of the policy's plan -- the deployment configuration that
-    #: benchmarked best -- and are supported for one car per race only, as in training.
-    controller: str = "fixed_low"      # deployment default: constant conservative mu (suite v1, 2026-09-12)
-    estimator: str = ""                  # frozen grip-estimator .pt; required by "estimated"
+    #: Plan-controller arm installed at run time (`learn.grip_runtime`). "auto" is the ordinary
+    #: driving default and uses the worker's automatic sensor runtime. The experiment arms and
+    #: estimator path remain available to explicit benchmark/debug callers.
+    controller: str = "auto"
+    #: Optional frozen grip-estimator path for explicit callers. An empty value lets the worker
+    #: resolve its configured default internally.
+    estimator: str = ""
     #: Surface friction. "random" draws mu per car per reset from the training range (when
     #: randomisation is on) or leaves it nominal; "fixed" pins every car to `mu`, re-applied after
     #: each reset, and can be changed live with CMD_SET_MU.

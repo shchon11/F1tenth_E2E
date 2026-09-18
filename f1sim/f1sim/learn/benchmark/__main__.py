@@ -141,8 +141,7 @@ def cmd_geometry(a) -> int:
             env = _build(map_id, envs=s.envs, race_size=1, seed=s.seeds[0], force_teacher=True)
 
             def drive(_obs, _env=env):
-                return _env.teacher.plan_action(_env.sim.state, _env.sim.P, _env.sim.tid,
-                                                _env.ecfg.v_max_policy, _env.tracker.spec)
+                return _env.teacher_label(_env.teacher)
             t0 = time.perf_counter()
             res = run_cell(env, drive, suite="S", n_steps=a.measure_steps, frozen=False)
             dt = time.perf_counter() - t0
@@ -504,6 +503,8 @@ def _entry_dict(entry) -> dict:
          "cross_runtime": bool(entry.cross_runtime),
          "system_id": entry.system_id, "checkpoint_sha256": entry.checkpoint_sha256,
          "estimator_path": entry.estimator_path, "estimator_sha256": entry.estimator_sha256}
+    if entry.options:
+        d["options"] = dict(entry.options)
     if getattr(entry, "kind", None):
         # An external published baseline. `weights` is the same resolved file as `path`; both are
         # supplied so the adapter can be handed either spelling.

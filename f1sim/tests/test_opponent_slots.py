@@ -174,8 +174,9 @@ def test_the_grip_label_of_each_slot_reaches_the_teacher_and_moves_its_profile()
     codes = env.teacher.label_grip_codes.view(-1, 3)[0].tolist()
     assert codes[1] == LABEL_GRIP_CODE["nominal"] and codes[2] == LABEL_GRIP_CODE["conservative"]
     gb = env.teacher.grip_bin(env.sim.P, env.B, env.device).view(-1, 3)
-    top = len(env.teacher.grip_levels) - 1
-    assert torch.equal(gb[:, 1], torch.full_like(gb[:, 1], top))
+    # Nominal means a 1.0 multiplier, even when profiles above nominal are available.
+    selected = env.teacher.grip_levels_t[gb[:, 1]]
+    assert torch.equal(selected, torch.ones_like(selected))
     assert torch.equal(gb[:, 2], torch.zeros_like(gb[:, 2]))
 
 

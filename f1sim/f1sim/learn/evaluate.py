@@ -76,7 +76,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              teacher_cand_iters: int = 2, teacher_cost: str = "",
              opp_future_model: str = EnvConfig.opp_future_model, opp_extra: dict | None = None,
              opp_token_ablate: bool = False,
-             external: dict | None = None) -> dict:
+             external: dict | None = None, research_estimator: bool = False,
+             research_profile: str | None = None, graph_runtime: bool = False) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -124,6 +125,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     torch.manual_seed(seed)
     np.random.seed(seed)
     cfg = cfg or Config()
+    if graph_runtime:
+        cfg.sim.compile = False
     if mu is not None:
         cfg.rand.enabled = False
         cfg.vehicle.mu = float(mu)
@@ -131,6 +134,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     trs, rls = common.load_tracks(tracks, racelines=teacher or (race_size > 1 and opponent == "teacher"), **rl_kw)
     model = None
     metadata = {}
+    policy_checkpoint = {}
+    controller_record = None
     driver = None
     if external:
         if teacher or ckpt:
@@ -148,12 +153,27 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         # the privileged opponent block, and the env below is configured from the checkpoint's own
         # spec so it produces exactly the one the policy was trained on. Every consumer that cannot
         # -- the exporter, the ROS node -- still refuses it.
-        model, metadata = load_checkpoint(ckpt, device, allow_oracle=True)
+        policy_checkpoint = torch.load(ckpt, map_location="cpu", weights_only=True)
+        controller_record = grip_runtime.validate_runtime_checkpoint(
+            policy_checkpoint, controller, research_estimator=research_estimator)
+        model, metadata = load_checkpoint(ckpt, device, allow_oracle=True,
+                                           allow_controller=(controller_record.get("arm", "legacy") != "legacy"))
+        if controller_record.get("arm") == "auto":
+            from .policy_adaptation import require_exact_actor
+            require_exact_actor(model, policy_checkpoint)
         model.eval()
     mode = ("direct" if external else
             ("plan" if (model is not None and model.meta.get("act_dim", 2) >= 5)
              or (teacher and action_mode == "plan") else "direct"))
     spec = metadata.get("spec", {})
+    if model is not None and not spec:
+        raise ValueError("policy checkpoint has no observation specification")
+    if spec:
+        cfg.lidar.range_max = float(spec.get("range_max", cfg.lidar.range_max))
+        if "n_beams" in spec:
+            cfg.lidar.n_beams = int(spec["n_beams"])
+        if not math.isclose(float(spec.get("att_scale", .35)), .35, rel_tol=0., abs_tol=1e-9):
+            raise ValueError("policy attitude normalization is incompatible with the simulator")
     events = parse_events(opp_events)
     if events and not (race_size > 1 and opponent in ("teacher", "mixed")):
         raise ValueError(f"opponent events {list(events)} need race_size > 1 and a teacher-driven "
@@ -177,14 +197,17 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         raise ValueError(f"probabilities given for {extra_probs}, which are not in opp_events; the "
                          f"run would produce a behaviour the report does not name")
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
+                     compile_tracker=not graph_runtime and bool(cfg.sim.compile),
                      race_size=race_size, opponent=opponent,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
                      **{f"opp_{k}_prob": v for k, v in probs.items()},
                      scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
                      hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
                      opp_future_model=opp_future_model,
-                     **({"action_history": spec["action_history"], "v_max_policy": spec["v_max"]}
-                        if external else {}),
+                     action_history=int(spec.get("action_history", EnvConfig.action_history)),
+                     v_max_policy=float(spec.get("v_max", EnvConfig.v_max_policy)),
+                     imu_gyro_scale=float(spec.get("gyro_scale", EnvConfig.imu_gyro_scale)),
+                     imu_accel_scale=float(spec.get("accel_scale", EnvConfig.imu_accel_scale)),
                      # meta FIRST, and 'off'/'' read as absent. `extra["spec"]` records 'off' as a
                      # literal string, and 'off' is truthy, so `spec.get(...) or meta.get(...)`
                      # short-circuits on it and never consults meta -- which is the only place
@@ -217,9 +240,26 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         ecfg.max_steps = steps
     env = common.make_env(trs, envs, device, ecfg, cfg=cfg, seed=seed, rls=rls, teacher_grip=teacher_grip,
                          teacher_recover_time=teacher_recover_time)
+    if model is not None:
+        common.validate_policy_observation(spec, env)
     env.sim.warmup()
-    ctrl = grip_runtime.ControllerRuntime(env, controller, estimator or None, device=device)
-    ctrl.install()
+    graph_holder = None
+    if graph_runtime and torch.device(device).type == "cuda":
+        from .graph_runtime import prepare_graph_runtime
+        graph_holder = prepare_graph_runtime(env, log=lambda _text: None)
+    ctrl = grip_runtime.ControllerRuntime(
+        env, controller, estimator or None, device=device,
+        research_estimator=research_estimator, research_profile=research_profile,
+        checkpoint_meta=(controller_record if controller_record and controller_record.get("arm") == "auto" else None))
+    try:
+        ctrl.install(graph_rt=graph_holder)
+        if policy_checkpoint:
+            grip_runtime.validate_runtime_checkpoint(policy_checkpoint, ctrl, research_estimator=research_estimator)
+    except BaseException:
+        ctrl.release()
+        if graph_holder is not None:
+            graph_holder.release()
+        raise
     if external:
         from .benchmark import model_adapter as _ma
         from ..params import VehicleParams
@@ -289,6 +329,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     result.update(meter.report())
     ctrl_metrics, _ = ctrl.collect_metrics()
     ctrl.release()
+    if graph_holder is not None:
+        graph_holder.release()
     config_report = asdict(env.cfg)
     dropout = config_report['lidar']['dropout_value']
     if not math.isfinite(dropout):
@@ -326,6 +368,11 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'config': config_report, 'env_config': asdict(env.ecfg),
         'config_nonfinite_convention': 'nonfinite lidar dropout sentinel encoded as a string',
         'controller_arm': controller, 'wheel_model': bool(env.sim.wheel_model),
+        'research_estimator': bool(research_estimator), 'research_profile': research_profile,
+        'controller_runtime_version': ctrl.runtime_version if controller == "auto" else None,
+        'controller_profile': ctrl.gspec.profile_version if controller == "auto" else None,
+        'graph_runtime': graph_holder is not None,
+        'graph_runtime_requested': bool(graph_runtime),
     }
     if ctrl_metrics:
         result['controller'] = ctrl_metrics
@@ -386,6 +433,11 @@ def main() -> None:
                          "inside the loop and need --wheel-model on.")
     ap.add_argument("--estimator", default="",
                     help="frozen grip-estimator checkpoint; required by the estimated arms")
+    ap.add_argument("--research-estimator", action="store_true",
+                    help="explicit research-only evaluation of an unapproved observer")
+    ap.add_argument("--graphs", action="store_true", help="explicit CUDA physics/controller graphs")
+    ap.add_argument("--research-profile", choices=["historical-global-v1"], default=None,
+                    help="paired old-auto ablation; requires --research-estimator")
     ap.add_argument("--wheel-model", choices=["on", "off", "default"], default="default",
                     help="vehicle.wheel_model: the rear axle's rotation state, the ERPM odometry "
                          "and the IMU shock term. 'default' leaves params.py's value alone.")
@@ -502,7 +554,9 @@ def main() -> None:
                                             "line": a.opp_line_prob,
                                             "oblivious": a.opp_oblivious_prob},
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
-                        controller=a.controller, estimator=a.estimator, external=external)
+                        controller=a.controller, estimator=a.estimator, external=external,
+                        research_estimator=a.research_estimator, research_profile=a.research_profile,
+                        graph_runtime=a.graphs)
 
     nominal = Config()
     if a.eager:
