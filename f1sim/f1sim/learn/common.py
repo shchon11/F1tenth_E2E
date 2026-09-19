@@ -227,10 +227,31 @@ def load_tracks(names, racelines: bool = False, drop_infeasible: bool = True, ha
     tracks = [maps.load(n) for n in names]
     if not racelines:
         return tracks, None
-    rls = [Raceline.build_cached(t, **raceline_kw) for t in tracks]
+    # One track's raceline failing to build must not take a 5000-track launch down with it: the
+    # minimum-time solve raises when it does not converge (there is deliberately no fallback to the
+    # unconverged seed), and on 2026-09-18 a single `icra2022_assets_mixed_1` killed a console DAgger
+    # run after the other 5511 tracks had loaded. Under `drop_infeasible` such a track is left out,
+    # loudly, exactly like one whose line does not fit the car; with it off the error still raises.
+    rls, failed = [], []
+    for n, t in zip(names, tracks):
+        try:
+            rls.append(Raceline.build_cached(t, **raceline_kw))
+        except (ValueError, RuntimeError) as e:
+            if not drop_infeasible:
+                raise
+            rls.append(None)
+            failed.append((n, str(e)))
+    if failed:
+        print(f"WARNING: dropping {len(failed)} track(s) whose raceline could not be built:", flush=True)
+        for n, why in failed:
+            print(f"    {n:52s} {why[:140]}", flush=True)
+        if len(failed) == len(names):
+            raise ValueError("no track's raceline could be built; first failure: " + failed[0][1])
     if drop_infeasible:
         keep, dropped = [], []
         for n, t, rl in zip(names, tracks, rls):
+            if rl is None:
+                continue
             c = raceline_clearance(t, rl)
             (keep if c >= half_width + 0.05 else dropped).append((n, t, rl, c))
         if dropped:
