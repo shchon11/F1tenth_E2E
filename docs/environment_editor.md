@@ -22,6 +22,40 @@ on software GL by `work/env-editor/capture_editor.py`; the scene, placements and
 The [top view](media/f1tenth-environment-editor-top.png) is taken mid-stroke: the wall brush's decal
 under the cursor, and the wall already rebuilt behind it.</sub>
 
+## Starting from a SLAM map
+
+**2026-09-20.** The 새 환경 page's **SLAM 맵 불러오기** card takes the pair `slam_toolbox` /
+`map_saver` writes — `map.yaml` plus `map.pgm` or `map.png` — and opens it as a scene: the grid is
+cleaned, the lane is traced, and what appears is an ordinary environment, so every brush, path tool
+and prop works on it and 칠한 덕트 → 경로 makes its hoses editable by handle.
+
+| control | what it decides |
+| --- | --- |
+| 경계 | what the occupied cells *are*: a duct hose a beam sees over (an F1TENTH venue, the default), or tall walls (a building, lab furniture) |
+| 최소 폭 | how far the traced centre stays off anything solid, 0.35 m by default. A doorway narrower than this is not treated as lane |
+| 바깥 잡음 잘라내기 | cut the scan spray that leaked through doorways, keeping the region you actually drove |
+| 주행선 위의 한 점 | which free region is the lane, when the largest one is the wrong one |
+
+The status line reports what was measured — lane length, the tightest half-width, the raceline's lap
+— and a map with a problem (a pinch the car cannot pass, a raceline that will not build) is
+**imported anyway with the problem named**: that map is exactly the one someone opens the editor to
+fix. Save, 검증, and it drives as `scene:<name>` like any other environment.
+
+Outside the console, the same import is a command, and a map can also be used without importing it
+at all:
+
+```bash
+python3 -m f1sim.slam_map ~/maps/venue.yaml --preview venue.png   # measure it, look at it
+python3 -m f1sim.slam_map ~/maps/venue.yaml --install venue       # catalogue it as user:venue
+python3 -m f1sim.scene import-slam ~/maps/venue.yaml venue_scene  # straight to an editable scene
+python3 -m f1sim.learn.dagger --tracks ~/maps/venue.yaml ...      # or just train on the path
+```
+
+`maps.load` traces and caches a centerline for any map given by path, so `--tracks
+/path/to/venue.yaml` now yields a track with a raceline rather than a bare occupancy grid. A tracing
+failure says which of the three causes it was (an unclosed loop, spray joining the lane to the room
+next door, a lane narrower than 최소 폭) rather than failing later as "track needs a centerline".
+
 ## What a scene is
 
 A scene is a folder under `~/f1sim_scenes/<name>/` (root overridable with `$F1SIM_SCENES`):

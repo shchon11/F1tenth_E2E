@@ -1459,6 +1459,33 @@ def cli_import(map_name: str, target: str) -> int:
     return _emit({"dir": d, "props": len(doc.props), "shape": list(doc.shape)})
 
 
+def cli_import_slam(path: str, target: str, *, boundary: str = "duct", seed_xy=None,
+                    min_clearance: float = 0.35, keep_region: bool = True,
+                    despeckle_m2: float = 0.05) -> int:
+    """A SLAM toolbox map (yaml + pgm/png) straight into an editable scene.
+
+    The same conversion `cli_import` does for a catalogue map, one step earlier: `slam_map.load_map`
+    cleans the grid and traces the lane, and what lands in the editor is duct / tall layers and a
+    centerline -- paintable, and (환경 설정 > 칠한 덕트 -> 경로) convertible into editable paths. The
+    report travels with it so the page can say what the map is before anything is drawn.
+    """
+    from . import slam_map
+    _log(f"importing SLAM map {path} ...")
+    track = slam_map.load_map(path, boundary=boundary, seed_xy=seed_xy, min_clearance=min_clearance,
+                              keep_region=keep_region, despeckle_m2=despeckle_m2)
+    name = os.path.basename(scene_dir(target).rstrip(os.sep))
+    yaml_path, img_path = slam_map.resolve_paths(path)
+    report = slam_map.inspect(track)
+    report.yaml_path, report.image_path = yaml_path, img_path
+    doc = SceneDoc.from_track(track, name, source_map=yaml_path)
+    d = doc.save(target)
+    return _emit({"dir": d, "props": len(doc.props), "shape": list(doc.shape),
+                  "lane_length_m": report.lane_length_m, "half_width_min_m": report.half_width_min_m,
+                  "half_width_median_m": report.half_width_median_m,
+                  "raceline_lap_s": report.raceline_lap_s, "fits": report.fits,
+                  "problems": list(report.problems)})
+
+
 def validate(target: str, centerline: str = "keep", raceline: bool = False, seed_xy=None) -> dict:
     """The full check (needs torch through `Track`). Writes an auto-extracted centerline back.
 
@@ -1562,6 +1589,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("import", help="catalogue map -> scene")
     a.add_argument("map_name"); a.add_argument("scene")
+    sl = sub.add_parser("import-slam", help="SLAM toolbox map (yaml + pgm/png) -> scene")
+    sl.add_argument("path", help="the map yaml, its image, or the directory holding them")
+    sl.add_argument("scene")
+    sl.add_argument("--boundary", choices=("duct", "wall"), default="duct")
+    sl.add_argument("--seed-xy", nargs=2, type=float, metavar=("X", "Y"), default=None,
+                    help="[m] a point on the lane, when the map has several free regions")
+    sl.add_argument("--min-clearance", type=float, default=0.35)
+    sl.add_argument("--no-keep-region", action="store_true")
+    sl.add_argument("--despeckle-m2", type=float, default=0.05)
     v = sub.add_parser("validate", help="load, extract the centerline if needed, check")
     v.add_argument("scene"); v.add_argument("--centerline", choices=("auto", "keep"), default="keep")
     v.add_argument("--raceline", action="store_true")
@@ -1573,6 +1609,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.cmd == "import":
             return cli_import(args.map_name, args.scene)
+        if args.cmd == "import-slam":
+            return cli_import_slam(args.path, args.scene, boundary=args.boundary, seed_xy=args.seed_xy,
+                                   min_clearance=args.min_clearance, keep_region=not args.no_keep_region,
+                                   despeckle_m2=args.despeckle_m2)
         if args.cmd == "validate":
             rep = validate(args.scene, centerline=args.centerline, raceline=args.raceline, seed_xy=args.seed)
             return _emit(rep, 0 if rep["ok"] else 1)
