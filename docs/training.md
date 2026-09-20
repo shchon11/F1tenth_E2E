@@ -673,212 +673,25 @@ Writes ONNX, optionally with a TensorRT engine, for the Jetson. The ROS policy n
 same observation encoding as training ([`learn/obs.py`](../f1sim/f1sim/learn/obs.py)), so the
 deployed input is constructed by the same code path — see [ROS 2](ros2.md).
 
-## Experimental: friction-aware control
+## The plan controller
 
-**Opt-in, unfinished, and off by default.** The default arm is `legacy`, the original behaviour.
+The tracker is the tracker: it follows the plan the policy emitted, and nothing is layered on it.
 
-`--controller` selects how the tracker treats tyre friction:
+It used to offer friction-clamp *arms* -- `fixed_low`, `estimated`, `oracle`, plus the composable
+`+clearance` and `+tcs` -- selected with `--controller`. They existed because a policy that had never
+been told the floor's friction drove every floor at one compromise speed, and clamping the tracker
+was the retraining-free way to make that safe: on suite v1 it took the frozen original from 110 to
+136 solo completions and from 16 to 43 at low mu.
 
-| arm | friction used by the tracker |
-| --- | --- |
-| `legacy` | none — no explicit friction limit is applied. **The default.** |
-| `fixed_low` | one conservative constant, identical in every environment |
-| `oracle` | the environment's true friction, per environment. Simulation only: it reads privileged state. |
-| `estimated` | an estimate from causal onboard signals only |
+`--cond dial` tells the policy instead (see above), which makes the clamp redundant and then
+harmful: measured on three pinned frictions, a dial policy with `fixed_low` -- or even a
+perfectly-set `oracle` -- on top was **worse than the dial alone on every one of them**. The policy
+already slows for the floor it was told about, and the clamp can only remove what it does not do
+([the research note](research/mintime-teacher-speed-head-2026-09-19.md) section 7). So there is no
+`--controller` / `--estimator` on `ppo` or `evaluate` and no selector in the console; a session
+records `controller: "legacy"`, the single spelling for "nothing installed".
 
-Any of them may additionally carry either composable layer, written as a suffix: `+clearance` (the
-plan geometry) and `+tcs` (the traction guard). Both are described below, and both can be worn at
-once — the suffixes are written in the order the car meets them, so the fullest composite reads
-`fixed_low+clearance+tcs`.
-
-`oracle` is a **privileged reference for this controller** — what perfect friction knowledge buys
-*given this speed-envelope and bound derivation*. It is not a mathematical upper bound on achievable
-performance: a different controller could use the same knowledge better, and nothing here proves the
-derivation optimal.
-
-`legacy` and `fixed_low` are different things: the first applies no explicit limit at all, the second
-applies a constant one. `oracle` cannot run on a car.
-
-### `+clearance` — the plan kept off what the LiDAR can see
-
-`clearance` is a **composable** arm and a geometry clamp, exactly as `fixed_low` is a friction
-clamp: a runtime layer that needs no training. Each control step it turns the current LiDAR frame —
-and nothing else — into a coarse occupancy grid in the car's own frame, builds a distance field on
-it, and adjusts the policy's plan until every point of it keeps a stated **body-edge** margin
-(default 0.20 m, i.e. 0.34 m from a plan point to the nearest return) from anything the scan saw.
-Where the corridor allows it the plan is bent away from the nearer side; where it does not, the
-plan's speed targets come down so the car arrives slow.
-
-```
-python3 -m f1sim.learn.evaluate CKPT --controller clearance --action-mode plan ...
-python3 -m f1sim.learn.evaluate CKPT --controller fixed_low+clearance ...
-```
-
-**Why it exists.** Measured on the eight held-out proxy tracks on 2026-09-13: the privileged
-raceline teacher completes 30–32 of 32 trials through the same iLQR tracker the policy uses, while
-the policies complete 7–24. At the policies' collisions the **policy's own last plan** had a median
-minimum body-edge clearance of 0.00–0.06 m; 85 % of collisions had a plan margin under 0.10 m and
-49 % of the plans passed *through* occupied cells, while the car still had ~0.2 m of clearance 25 ms
-before impact. The tracks are feasible and the tracker can follow safe plans; the policy plans with
-no margin. See [the research note](research/clearance-arm-2026-09-13.md).
-
-**Where it sits, and why that is the whole design.** On `PlanTracker._plan_hook`, which runs
-*before* the action is decoded — not on the solver. `tracker.last_ref` is built inside `mpc.solve`
-from the action, so it is both what the iLQR follows and what the attribution script measures; an
-arm that changes the action is therefore measured, and executed, as the plan it produced. It also
-makes composition order-free: `fixed_low` binds `tracker._solver` and this binds
-`tracker._plan_hook`, so neither can overwrite the other and the friction envelope is computed on
-the adjusted geometry whichever was installed first.
-
-**What it may see.** The current scan and nothing else. No map, no pose, no `track.edt` — the
-privileged distance field is what the *evaluation* measures with and is not on the runtime path. A
-bearing with no return contributes nothing and everything outside the grid reads as free: the arm
-acts on what the sensor saw rather than braking for the 90° behind the window. That is what lets
-`f1sim_ros/policy_node.py` run this identical code off `/scan`.
-
-**What it may do**, and only these two, both one-sided:
-
-- **bend** — one curvature offset added to the knots inside the tracker's own horizon and tapered to
-  zero beyond it, so the tail curvature (and with it `fixed_low`'s speed envelope over the tail) is
-  untouched. Thirteen candidate offsets are scored on the mean, over the window, of their body-edge
-  clearance saturated at the margin — with everything from a candidate's first *contact* counted as
-  void, because the distance field is unsigned and a plan a metre past a wall would otherwise read
-  as a metre of free space. The smallest bend that meets the margin wins.
-- **slow** — the plan's two speed targets, through a backward braking pass at 3.3 m/s², which is
-  what the command chain was measured to deliver at the bottom of the friction range rather than the
-  5.0 m/s² the tracker is allowed to command. Under `fixed_low` the solver is clamped tighter still
-  (2.97 m/s² on a straight plan at µ 0.734, and less in a corner), so under the composite the pass
-  is optimistic about how late it may start slowing. It is left optimistic deliberately: reading the
-  other layer's bound would make the installation order matter, which is the one property that makes
-  the two composable. The cap is a target re-issued at 40 Hz and tightening as the obstacle nears,
-  and what is actually commanded is the tracker's to bound — a planning approximation, like the grip
-  envelope, and not a stopping guarantee.
-
-It never raises a speed and never straightens a plan the policy bent, and a plan that already keeps
-the margin is returned **bit-identical** — "the arm did nothing" is a fact about the action, not an
-approximation of one.
-
-| knob | default | meaning |
-| --- | --- | --- |
-| `margin` | 0.20 m | body-edge clearance defended; 0.34 m centre-to-return with `body_radius` 0.14 m |
-| `cell` | 0.06 m | occupancy cell; a return is binned to the cell containing it, so the position error is ≤ 0.03 m per axis and unbiased |
-| `d_clip` | 0.60 m | the distance field saturates here, which bounds the transform at 10 offsets per pass |
-| `max_shift` | 0.60 m | lateral authority at the evaluation horizon — an adjustment, not a replan |
-| `horizon_s` | 0.60 s | the far end of the arc the arm is responsible for: the tracker's own `N·dt`. Beyond it the plan is replanned before it is ever executed |
-| `s_min` | 0.50 m | and the near end. `base_link` is the rear axle and the nose is ~0.48 m ahead of it, so a plan point closer than this is inside the car's own footprint — its clearance is a fact about where the car already is, which no bend can move and no speed can change |
-| `a_brake` | 3.3 m/s² | the deceleration the backward pass assumes, measured through the whole command chain at low grip |
-
-**Cost.** The grid is 5 304 cells; the distance field is Felzenszwalb's separable decomposition of
-the *exact* squared transform, written as a fixed number of shifted minima — no chamfer
-approximation, no data-dependent control flow, so it is as graph-safe as the rest of the path.
-Measured under the deployment budget's own protocol (CPU, single thread, batch 1, fp32, the fastest
-of several blocks): **1.25 ms of the 25 ms control step** — 0.48 ms for the occupancy and its
-distance field, 0.77 ms for the candidate search and the cap.
-
-```bash
-python3 -m f1sim.learn.budget --clearance          # the number above, on this machine
-```
-
-`controller/clearance_*` metrics (the fraction of steps bent and slowed, the mean shift and speed
-cut, and the plan margin before and after) are logged alongside the tracker arm's.
-
-**Not trained under.** Training with the arm in the loop is deliberately not done — the grip clamp's
-lesson was that a policy trained under a clamp learns to lean on it (faster laps, worse avoidance),
-so the recipe is train legacy, deploy clamped. Modules: `learn/clearance.py`,
-`tests/test_clearance.py`, `tests/test_policy_node_clearance.py`.
-
-### `+tcs` — the car's traction guard, inside the loop
-
-`tcs` is a **composable** arm: it does not change what the tracker plans under, it shapes the speed
-command between the controller and the VESC. So it is written as a suffix and can be worn on top of
-any of the four above — `--controller tcs` is the legacy tracker plus the guard, and
-**`--controller fixed_low+tcs` is the deployment default**, because `fixed_low` is the control arm
-the benchmark roster runs and the guard is what the car ships.
-
-What runs is `f1sim_ros/f1sim_ros/traction.py` — the same class, unmodified, that
-[`docs/ros2.md`'s traction guard](ros2.md) describes and that `scripts/replay_traction.py` validated
-over the 22 real recordings. It is fed the simulated sensors and nothing else: the ERPM-quantised,
-jitter-stamped wheel speed from `StepResult.odom` / `odom_t`, the last IMU sample's longitudinal
-acceleration, and the emulated `/sensors/core` motor current. Its thresholds are the ones it uses on
-the car, and they travel inside the checkpoint (`experiment.controller.traction.params`) so a
-consumer can refuse a mismatched pair.
-
-```
-python3 -m f1sim.learn.ppo --controller fixed_low+tcs --action-mode plan ...
-python3 -m f1sim.learn.evaluate CKPT --controller fixed_low+tcs --wheel-model on ...
-```
-
-**It needs `vehicle.wheel_model`.** With the switch off the simulated wheel speed *is* the body
-speed, the residual the detector keys on is identically zero, and the arm would be a `legacy` run
-wearing another arm's name — so it refuses to construct rather than run silently inert.
-
-**Cost.** The guard is host Python over scalars: one `update` + `shape` pair per car per control
-step, plus one device→host transfer to fetch its four inputs and one back to return the shaped
-speed. Nothing about it is inside `sim._roll`, so it is outside the CUDA-graph fastpath by
-construction; the two transfers are a synchronise per step, which on the `graphs` backend is the
-cost that matters rather than the Python. Measured numbers are in
-[the wheel-model note](research/wheel-model-2026-09-13.md).
-
-`controller/tcs_*` metrics (active fraction, lock and spin counts, the largest release and cap) are
-logged alongside the tracker arm's.
-
-The `estimated` arm works from:
-
-- a causal history of 40 frames × 11 features — measured speed, IMU, roll/pitch, and the previously
-  **issued** steering and speed commands, all of which exist on the real car;
-- a small quantile model producing a lower, median and upper estimate, with a calibrated lower
-  quantile and an explicit fallback while the history is still filling;
-- the resulting friction adjusts the tracker's curvature-limited speed envelope and its acceleration
-  and braking bounds.
-
-The actor's inputs and outputs are identical across all four arms. That isolates the controller
-**only in a frozen-actor evaluation**, where one fixed set of weights is run under each arm. In the
-matched PPO runs the actor *trains* under its arm, so the trained weights differ and the result is a
-comparison of two (controller, policy) pairs — not of two controllers holding the policy constant.
-Identical architecture does not make the trained policies interchangeable either.
-
-A matched set of PPO runs comparing `fixed_low` and `estimated` — three seeds each — has completed,
-and so has its paired evaluation: 72 cells, 1152 trials, reported in
-[Does estimating friction help the plan tracker?](research/2026-09-11-controller-arm-evaluation.md).
-The short answer is **no robust method-level completion gain** — the seeds disagree on the sign — with
-a consistent but small time advantage among shared successes, and a low-friction regression affecting
-both arms whose **cause is not established** — a one-seed `legacy`-recipe probe
-([follow-up](research/2026-09-11-legacy-recipe-probe.md)) did not separate the recipe from a
-controller × learning interaction.
-
-That evaluation is separate from the frozen-actor grid across the four arms, which holds one policy
-fixed and varies only the controller; the two answer different questions and neither substitutes for
-the other.
-
-The follow-up asked whether a **training-recipe** change recovers the low-friction loss, screening
-the two existing options — restoring the auxiliary friction-prediction objective (`aux`, whose head
-is supervised with true µ; note the training critic separately receives privileged state and
-parameters including true µ in every recipe, while the **actor** inputs exclude it at training and
-deployment alike) and raising the initial KL coefficient
-from 0.05 to 0.20 (`anchor`) — alone and together, two seeds each, all under the `estimated` arm.
-**No recipe was eligible**: the best reached +1.875 pp mean low-friction gain against a required
-≥ 2 pp. The criteria were fixed before the final selection and before the outcomes were inspected,
-and the threshold was not changed after the fact. For every recipe the two training seeds also
-disagree in sign at low friction, so these runs give insufficient evidence of a robust method-level
-benefit. These are engineering eligibility gates, not a significance or power analysis. Protocol,
-per-trial data and the independent eligibility audit:
-[Can a training-recipe change recover low-friction completion?](research/static-grip-retention-2026-09-12.md).
-
-Note that `aux` is not only an objective change: during the first 10 updates PPO's policy gradient
-and KL term are off while the aux term is active, so it also changes *when* the early policy features
-start moving.
-
-### Loading a non-legacy checkpoint
-
-`load_checkpoint` and `load_for_conditioning` **refuse** a checkpoint recorded under a non-`legacy`
-arm unless the caller passes `allow_controller=True`. The default consumers — `watch`, `export` and
-the ROS policy node — do not pass it, because running such a policy through the untouched tracker
-would evaluate plans under a controller they were never shaped for.
-
-The practical limitation today: **research controller checkpoints are not runnable through the
-standard tools.** Only a consumer that installs the matching controller runtime should pass the flag.
-The arm, the controller configuration and the estimator's identity travel inside each checkpoint, so
-a loader can tell what it is being handed.
-
-Modules: `learn/grip_control.py`, `learn/grip_estimator.py`, `learn/grip_runtime.py`,
-`learn/clearance.py`, each with its own test module.
+`learn/grip_runtime.py`, `grip_control.py`, `grip_estimator.py`, `clearance.py` and
+`traction_arm.py` remain, and so do the `controller=` / `estimator=` keyword arguments of
+`evaluate.evaluate`: the [checkpoint benchmark](benchmark.md) records which arm each historical
+system was scored under, and re-reading those results needs the code that produced them.
