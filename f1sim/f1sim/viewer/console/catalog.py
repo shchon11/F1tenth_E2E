@@ -37,7 +37,10 @@ from ... import tracks
 #: `viewer/console/opponent_table.py` imports it directly and pays that cost once, in the widget.
 TEACHER_KINDS_MODULE = "f1sim.opponent_slots"
 
-RUNS_DIR = os.path.join(os.path.expanduser("~"), "f1sim_runs")
+#: Must agree with `f1sim.learn.common.RUNS_DIR` -- the console lists what training writes.
+#: Not imported from there: that module pulls in torch, and this one is on the first-paint path.
+RUNS_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("F1SIM_RUNS") or os.path.join("~", "f1sim_runs")))
 CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt")
 
 

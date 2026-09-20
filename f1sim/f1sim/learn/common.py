@@ -18,7 +18,10 @@ from ..teacher import RacelineTeacher
 from ..track import Track
 from .obs import ObsSpec
 
-RUNS_DIR = os.path.join(os.path.expanduser("~"), "f1sim_runs")
+#: Where runs and checkpoints are written. `$F1SIM_RUNS` overrides it, so a shared machine,
+#: a scratch disk or a second checkout does not have to live in one home directory.
+RUNS_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("F1SIM_RUNS") or os.path.join("~", "f1sim_runs")))
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY")     # None -> the account's default entity (org-scoped keys reject the org itself)
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "f1sim-e2e")
 

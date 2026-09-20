@@ -63,6 +63,18 @@ MIN_CTL_H = 26
 MAIN_BTN_H = 32
 
 
+def _asset(name: str) -> str:
+    """A branding file as a URL a stylesheet can use, or "" when it is not installed.
+
+    Resolved through this module's own location, so it is right in a checkout, a wheel and an
+    AppImage alike. Qt wants forward slashes in a stylesheet url() on every platform.
+    """
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))                     # .../f1sim/viewer/console
+    p = os.path.join(os.path.dirname(os.path.dirname(here)), "assets", "branding", name)
+    return p.replace(os.sep, "/") if os.path.exists(p) else ""
+
+
 def clear_color():
     """GL clear colour as floats, from the same token the panels are drawn against."""
     h = C["bg.viewport"].lstrip("#")
@@ -80,6 +92,11 @@ def qss() -> str:
     not confirmed.
     """
     c = C
+    # A filled square with nothing in it reads as a colour swatch, not as "on". The mark is an
+    # image because a stylesheet cannot put a glyph in an indicator; without the file the square
+    # is still the checked state, just less obviously so.
+    _check = _asset("check-15.png")
+    _CHECK_IMAGE = f"image: url({_check});" if _check else ""
     return f"""
 /* Type and colour are inherited by everything; a *background* is not.
    Painting every QWidget with the window colour draws a dark rectangle behind every label sitting
@@ -180,7 +197,11 @@ QCheckBox::indicator {{
     width: 15px; height: 15px; border-radius: 4px;
     border: 1px solid {c['line.strong']}; background: {c['bg.window']};
 }}
-QCheckBox::indicator:checked {{ background: {c['accent']}; border-color: {c['accent']}; }}
+QCheckBox::indicator:checked {{
+    background: {c['accent']}; border-color: {c['accent']};
+    {_CHECK_IMAGE}
+}}
+QCheckBox::indicator:hover:!checked {{ border-color: {c['accent']}; }}
 QCheckBox:disabled {{ color: {c['text.2']}; }}
 QCheckBox:focus {{ outline: none; }}
 

@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from . import catalog, theme
+from . import app as _app, catalog, theme
 from ... import tracks
 from .catalog import GROUP_CAVEAT, GROUP_HINT, GROUP_ORDER, MapCatalog, RunInfo, format_age
 from .frames import Freshness, INTERP_LAG_FRAMES
@@ -90,7 +90,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("f1sim 주행 콘솔")
+        # ASCII: some taskbars read X11's legacy Latin-1 `WM_NAME` and mangle a Korean title.
+        # `app.APP_NAME` is the one place that decides it. The Korean name is on the header below.
+        self.setWindowTitle(_app.APP_NAME)
         self.resize(1600, 950)
         self.setMinimumSize(1120, 700)
 
@@ -476,6 +478,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # -- advanced
         adv = Collapsible("고급 설정", expanded=False)
         self.adv_fold = adv
+        adv.toggle.toggled.connect(lambda _on: self._queue_panel_cap())
         self.chk_dr = QtWidgets.QCheckBox("차량마다 마찰/지연 무작위화 (학습과 동일)")
         self.chk_dr.setChecked(True)
         self.chk_dr.setToolTip("끄면 모든 차가 공칭 파라미터로 달립니다. 미끄러짐이 정책 탓인지 "
@@ -487,6 +490,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # other car at once. Same widget as the training page's, so a session and a training command
         # cannot describe an opponent differently.
         self.opp_table = OpponentSlotTable()
+        self.opp_table.set_count(max(0, self.spin_grid.value() - 1))
         self.opp_table.changed.connect(self._on_slots_changed)
         self.row_opp = FieldRow(
             "상대차 (차량별 설정)", self.opp_table,
@@ -1013,7 +1017,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "_left_wrap") or not hasattr(self, "opp_table"):
             return
         want = self.PANEL_W
-        if self.opp_table.count() and self.width() >= self.NARROW_W:
+        showing_slots = self.row_opp.isVisible() and self.opp_table.count()
+        if showing_slots and self.width() >= self.NARROW_W:
             want = min(self.PANEL_W_SLOTS, max(self.PANEL_W, self.width() - 900))
         self._left_wrap.setMaximumWidth(want)
         self._left_scroll.setMaximumWidth(want)
@@ -1233,6 +1238,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             for g in names:
                 self.map_group.addItem(f"{g}  ({len(cat.groups[g])})", g)
             self.map_group.setEnabled(True)
+            # Land on the biggest group rather than whatever sorted first: an empty list is the
+            # console's least useful first impression, and 내 환경 is empty until someone draws one.
+            best = max(range(self.map_group.count()),
+                       key=lambda i: len(cat.groups.get(self.map_group.itemData(i) or "", ())),
+                       default=-1)
+            if best >= 0:
+                self.map_group.setCurrentIndex(best)
         self.map_group.blockSignals(False)
         self._refresh_map_list()
         if self._pref_map and cat.ready and self._pref_map in set(cat.ids()):
@@ -1373,7 +1385,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.viewport.set_badge("")
 
         if state == STATE_IDLE:
-            self.status_text.setText("대기 — 런과 맵을 고르고 시작을 누르세요.")
+            self._update_start_hint()
             self.btn_pause.settle(False)
             self.viewport.set_empty_text("맵과 정책 런을 고르고 <b>시작</b>을 누르세요.")
         elif preparing:
@@ -1726,7 +1738,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if not self.run_list.select(run_name):
             pass
         self._selected_run = ckpt_path
-        self.sel_run.setText(f"런: {run_name}/{os.path.basename(ckpt_path)}")
+        self.sel_run.setText(f"런: {self._run_label(ckpt_path)}")
         self.sel_run.setToolTip(ckpt_path)
         self._update_selection_note()
         self._update_start_enabled()
@@ -1806,21 +1818,42 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         return True
 
     def _update_start_hint(self):
+        """The line above 시작, and the idle status bar, which must never say different things.
+
+        The status bar is left alone unless the console is idle: while a session is preparing,
+        running or failed it is carrying that, and a message about what to pick next would be
+        talking over it.
+        """
         if not hasattr(self, "start_hint"):
             return
         if self.state in (STATE_RUNNING, STATE_PAUSED):
             self.start_hint.setText("시작을 다시 누르면 지금 고른 설정으로 새로 시작합니다.")
             return
-        self.start_hint.setText(self._start_blocker() or "준비됐습니다. 시작을 누르세요.")
+        blocker = self._start_blocker()
+        self.start_hint.setText(blocker or "준비됐습니다. 시작을 누르세요.")
+        if self.state == STATE_IDLE and hasattr(self, "status_text"):
+            self.status_text.setText(f"대기 — {blocker}" if blocker else "대기 — 준비됐습니다.")
 
     def _update_start_enabled(self):
         if self.state in (STATE_IDLE, STATE_FAILED):
             self.btn_start.setEnabled(self._can_start())
         self._update_start_hint()
 
+    @staticmethod
+    def _run_label(ckpt_path: str) -> str:
+        """`spec_korea_s904 / ppo_latest.pt` from the checkpoint's absolute path.
+
+        The run directory and the file are the two things that identify a policy; the rest of the
+        path is the same for every row in the list, and printing it wraps the card onto two lines
+        and hides the name at the end of the first.
+        """
+        d, f = os.path.split(ckpt_path)
+        run = os.path.basename(d) or ckpt_path
+        return f"{run} / {f}" if f else run
+
     def _on_run_selected(self, name: str):
         self._selected_run = name
-        self.sel_run.setText(f"런: {name}")
+        self.sel_run.setText(f"런: {self._run_label(name)}")
         self.sel_run.setToolTip(name)
         self._update_selection_note()
         self._update_start_enabled()

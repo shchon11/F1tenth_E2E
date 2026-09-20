@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  f1sim application icon.
+
+  The console's own palette, so the launcher tile and the window agree: a graphite slab
+  (bg.card over bg.window), the racing line in NVIDIA green (primary.line, the colour the app
+  already spends on "running" and on the start action) and the watched car in cyan (ego), the
+  one colour the 3D scene reserves for the car you are following.
+
+  A circuit, not a car. At 16 px a car silhouette is a smudge, while a closed lane still reads as
+  a track. The green ellipse is deliberately not concentric with the lane: it sits mid track down
+  the straights and tightens onto the inside through both corners, which is a racing line and is
+  the one thing this project is actually about.
+
+  Shapes are primitives (rect, ellipse) rather than arc paths: Qt's SVG renderer is Tiny 1.2, and
+  a mis-set arc sweep flag fails as a wrong picture rather than as an error.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="slab" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f2f2f"/>
+      <stop offset="1" stop-color="#141414"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9adb22"/>
+      <stop offset="1" stop-color="#5c9c00"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#slab)"/>
+  <rect x="8.75" y="8.75" width="238.5" height="238.5" rx="53.25" fill="none"
+        stroke="#434343" stroke-width="1.5"/>
+
+  <!-- the lane: an asphalt band, edged dark on the outside so it reads as a surface the car is
+       ON rather than as a ring drawn around the line -->
+  <rect x="34" y="76" width="188" height="104" rx="52" fill="none" stroke="#08080a" stroke-width="48"/>
+  <rect x="34" y="76" width="188" height="104" rx="52" fill="none" stroke="#3c3c44" stroke-width="40"/>
+  <rect x="34" y="76" width="188" height="104" rx="52" fill="none" stroke="#4a4a54" stroke-width="2"
+        stroke-dasharray="10 12" opacity="0.65"/>
+
+  <!-- the racing line -->
+  <ellipse cx="128" cy="128" rx="76" ry="44" fill="none" stroke="url(#line)" stroke-width="8"/>
+
+  <!-- the watched car, on the line, turned into the left corner -->
+  <g transform="translate(64 108) rotate(-64)">
+    <rect x="-14" y="-8.5" width="28" height="17" rx="5.5" fill="#59e6ff"/>
+    <rect x="-14" y="-8.5" width="28" height="17" rx="5.5" fill="none" stroke="#0e0e10" stroke-width="3"/>
+    <rect x="3.5" y="-4.5" width="7.5" height="9" rx="2.2" fill="#0e0e10" opacity="0.5"/>
+  </g>
+</svg>
