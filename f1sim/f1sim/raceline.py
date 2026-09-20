@@ -17,6 +17,46 @@ from scipy import sparse as sp
 from .track import Track, _limit_curvature, resample_closed
 
 
+# --------------------------------------------------------------------------- progress
+#: Where a long build says how it is getting on. Default: one line on stderr.
+#:
+#: This exists because the minimum-time solve is twenty to seventy minutes of silence, and the two
+#: places that wait on it cannot see stderr at all -- the console GUI shows "레이싱 라인 준비 중"
+#: and nothing else for the whole of it, which is indistinguishable from a hang and was reported
+#: as one. A hook rather than a return value because the caller that needs the news
+#: (`viewer.sim_worker`) is four frames above the loop that has it.
+#:
+#: Install with `raceline.progress_to(fn)`; `fn(text)` must be cheap and must not raise.
+_PROGRESS = None
+_PROGRESS_LAST = 0.0
+#: Seconds between reports. The solver's inner loop runs far faster than anyone can read.
+PROGRESS_EVERY = 5.0
+
+
+def progress_to(fn):
+    """Install a progress sink and return the previous one, for `try/finally` restoration."""
+    global _PROGRESS
+    prev, _PROGRESS = _PROGRESS, fn
+    return prev
+
+
+def report(text: str, *, force: bool = False) -> None:
+    """Say how a long build is getting on, at most every `PROGRESS_EVERY` seconds."""
+    global _PROGRESS_LAST
+    import time as _t
+    now = _t.monotonic()
+    if not force and now - _PROGRESS_LAST < PROGRESS_EVERY:
+        return
+    _PROGRESS_LAST = now
+    if _PROGRESS is None:
+        print(f"[raceline] {text}", file=sys.stderr, flush=True)
+        return
+    try:
+        _PROGRESS(text)
+    except Exception:
+        pass                       # a progress sink that fails must not fail the build
+
+
 # --------------------------------------------------------------------------- geometry
 def _circ_diff_matrices(n: int, ds: float):
     """Central first/second difference operators on a closed curve (dense, n x n)."""
@@ -530,8 +570,8 @@ class Raceline:
         t0 = _time.monotonic()
         rl = Raceline.build(track, **kw)
         rl.save(path)
-        print(f"[raceline] {track.name}: built in {(_time.monotonic() - t0) / 60:.1f} min, cached",
-              file=sys.stderr, flush=True)
+        report(f"{track.name}: {(_time.monotonic() - t0) / 60:.1f}분 만에 완성, 캐시에 저장",
+               force=True)
         return rl
 
     #: Set `F1SIM_RACELINE_CACHE_ONLY=1` and a cache miss raises instead of spending twenty minutes
@@ -564,12 +604,10 @@ class Raceline:
                 f"20-70 min) or pass the parameters the run used -- the cache key is every "
                 f"argument of Raceline.build, so --teacher-a-lat / --teacher-a-acc / "
                 f"--teacher-a-brake / --raceline-margin / --raceline-objective all change it.")
-        print(f"[raceline] {name}: cache MISS, building the minimum-time line. This takes 20-70 "
-              f"minutes and is single-threaded.\n"
-              f"[raceline]   parameters: { {k: v for k, v in kw.items()} or 'the defaults'}\n"
-              f"[raceline]   {len(have)} other variant(s) of this track are already cached, so if "
-              f"you expected this to be instant, one of those parameters differs from the run you "
-              f"are comparing against.", file=sys.stderr, flush=True)
+        report(f"{name}: 캐시에 없어 최소시간 라인을 새로 만듭니다 (20~70분, 싱글스레드). "
+               f"파라미터 { {k: v for k, v in kw.items()} or '기본값'} — 이 맵의 다른 변형 "
+               f"{len(have)}개는 이미 캐시에 있으니, 즉시 끝날 줄 아셨다면 그 중 하나와 "
+               f"파라미터가 다릅니다.", force=True)
 
     @staticmethod
     def from_xy(xy: np.ndarray, v: np.ndarray) -> "Raceline":

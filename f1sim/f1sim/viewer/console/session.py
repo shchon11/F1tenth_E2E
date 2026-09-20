@@ -635,7 +635,15 @@ class SessionController(QtCore.QObject):
             self._on_described(msg, seq)
         elif kind == P.MSG_STAGE:
             if msg.get("gen") == self._preparing_gen:
-                self.window.set_stage(msg.get("stage", ""), msg.get("note", ""))
+                stage, note = msg.get("stage", ""), msg.get("note", "")
+                # One line per *change*, not per message: the raceline build ticks every few
+                # seconds with the same stage, and a log that repeated the stage name would bury
+                # the thing it is there to show.
+                if (stage, note) != getattr(self, "_logged_stage", None):
+                    self._logged_stage = (stage, note)
+                    text = P.STAGE_TEXT.get(stage, stage)
+                    self.window.log(f"{text}{' — ' + note if note else ''}")
+                self.window.set_stage(stage, note)
         elif kind == P.MSG_GEOMETRY:
             if msg.get("gen") == self._preparing_gen:
                 self._apply_geometry(msg["geometry"])
@@ -649,6 +657,7 @@ class SessionController(QtCore.QObject):
             self._on_stopped(msg)
         elif kind == P.MSG_LOG:
             self.window.status_text.setText(str(msg.get("text", "")))
+            self.window.log(str(msg.get("text", "")))
         elif kind == P.MSG_BYE:
             self._active_gen = -1
 
@@ -795,6 +804,8 @@ class SessionController(QtCore.QObject):
         self._active_gen = gen
         self._preparing_gen = -1
         self._replacing = False
+        self._logged_stage = None
+        self.window.log("세션 시작", "done")
         facts = msg.get("facts") or {}
         #: kept verbatim so QA can read the worker's own view of the session (device, memory at
         #: the session boundary) without a second message kind
@@ -876,6 +887,7 @@ class SessionController(QtCore.QObject):
         self._clear_start_pending(gen)
         self._replacing = False
         self._teardown_view()
+        self.window.log(f"오류 ({msg.get('where', 'worker')}) — {msg.get('message', '')}", "error")
         self.window.set_error(str(msg.get("where", "worker")), str(msg.get("message", "")),
                               str(msg.get("detail", "")), bool(msg.get("retryable", True)))
         if replacing:

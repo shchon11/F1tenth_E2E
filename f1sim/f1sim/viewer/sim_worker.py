@@ -855,8 +855,19 @@ class SimWorker:
         self.stage(gen, "raceline")
         rls = None
         try:
+            from .. import raceline as _rl_mod
             from ..raceline import Raceline
-            rls = [Raceline.build_cached(track)]
+            # A cold cache here is twenty to seventy minutes in the minimum-time solver, and until
+            # this line existed the console showed "레이싱 라인 준비 중" for the whole of it with
+            # nothing else -- which is what a hang looks like, and is what it was reported as. The
+            # sink is removed again in `finally` because it captures `gen`: left installed, a later
+            # build would report progress against a session that had already been cancelled.
+            prev = _rl_mod.progress_to(lambda text: self.say(P.MSG_STAGE, gen=gen,
+                                                             stage="raceline", note=text))
+            try:
+                rls = [Raceline.build_cached(track)]
+            finally:
+                _rl_mod.progress_to(prev)
         except Exception as exc:
             # The line is only drawn unless teacher opponents actually drive it.
             if need_rl:

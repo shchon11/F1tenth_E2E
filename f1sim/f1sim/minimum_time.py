@@ -250,11 +250,23 @@ class _Problem:
         if self.evaluate(z)[1:].min() < -1e-5:
             z = self.restore(z)
         scale = max(1., self.reference_length / self.vmax)
+        # A tick per SLSQP iteration, so a caller that cannot see stderr -- the console GUI, which
+        # showed "레이싱 라인 준비 중" and nothing else for the whole hour -- has something that
+        # moves. `on_progress` is None unless somebody installed one, and the callback is then not
+        # passed at all, so the solver runs exactly as it did.
+        tick = getattr(self, "on_progress", None)
+        cb = None
+        if tick is not None:
+            counter = [0]
+            def cb(_x, *_a):
+                counter[0] += 1
+                tick(counter[0])
         for attempt in range(2):
             result = minimize(lambda x: self.evaluate(x)[0] / scale, z,
                               jac=lambda x: self.evaluate(x, True)[0] / scale, method="SLSQP", bounds=self.bounds,
                               constraints={"type": "ineq", "fun": lambda x: self.evaluate(x)[1:],
                                            "jac": lambda x: self.evaluate(x, True)[1:]},
+                              callback=cb,
                               options={"maxiter": maxiter, "ftol": 1e-8})
             result.fun = float(result.fun * scale)
             violation = float(max(0., -self.evaluate(result.x)[1:].min()))
@@ -366,9 +378,14 @@ def solve_minimum_time(seed, track, veh_width, margin, profile_kw, width_cap=Non
     # of declaring a coarse feasible trajectory valid or hiding a grip derating.
     check = _Problem(seed, track, profile_kw, veh_width, margin, width_cap,
                      controls, 32, deadline=deadline)
+    from .raceline import report as _report
     for refinement in range(10):
+        _report(f"{track.name}: 최소시간 최적화 {refinement + 1}/10 단계 "
+                f"({(time.monotonic() - started) / 60:.1f}분 경과, {controls} 제어점)", force=True)
         problem = _Problem(seed, track, profile_kw, veh_width, margin, width_cap,
                            controls, 4, deadline=deadline, sample_phases=phases)
+        problem.on_progress = lambda n, t=track.name, r=refinement: _report(
+            f"{t}: {r + 1}/10 단계, 반복 {n}, {(time.monotonic() - started) / 60:.1f}분 경과")
         result = problem.solve(problem.initial if z is None else z, maxiter)
         z = result.x
         fine = check.evaluate(z)

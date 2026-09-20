@@ -1129,6 +1129,35 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         run_card.add(diag)
         v.addWidget(run_card)
 
+        # The console had nowhere to *keep* what the worker said: `MSG_LOG` overwrote one status
+        # line and the stage name replaced itself, so a prepare that takes forty minutes -- a cold
+        # raceline cache does -- looked identical to a hang, and a message that scrolled past was
+        # gone. This is the history, folded away because on a normal session there is nothing in it
+        # worth the space.
+        logs = Collapsible("진행 로그", expanded=False)
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(500)       # a ring buffer: old lines fall off the top
+        self.log_view.setMinimumHeight(120)
+        self.log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        # Same look as the training page's own log box, which this is the drive page's version of.
+        self.log_view.setStyleSheet(f"font-family: '{theme.MONO_FONT}', monospace; "
+                                    f"font-size: 10px; background: {C['bg.window']};")
+        logs.add(self.log_view)
+        row = QtWidgets.QHBoxLayout()
+        btn_copy = QtWidgets.QPushButton("복사")
+        btn_copy.setObjectName("GhostButton")
+        btn_copy.setToolTip("로그 전체를 클립보드로. 오류를 그대로 붙여넣을 때 쓰세요.")
+        btn_copy.clicked.connect(lambda: QtGui.QGuiApplication.clipboard().setText(
+            self.log_view.toPlainText()))
+        btn_clear = QtWidgets.QPushButton("지우기")
+        btn_clear.setObjectName("GhostButton")
+        btn_clear.clicked.connect(self.log_view.clear)
+        row.addWidget(btn_copy); row.addWidget(btn_clear); row.addStretch(1)
+        logs.add(row)
+        self.log_panel = logs
+        v.addWidget(logs)
+
         show = Card("표시")
         self.chk_lidar = QtWidgets.QCheckBox("LiDAR 점")
         self.chk_lidar.setChecked(True)
@@ -1425,6 +1454,25 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self._stage, self._stage_note = stage, note
             self.viewport.set_badge(STAGE_TEXT.get(stage, stage), C["warn"])
             self._show_preparing_progress()
+
+    def log(self, text: str, kind: str = "info") -> None:
+        """One timestamped line into the 진행 로그, and open the panel when it is bad news.
+
+        Deliberately not the status line: that shows one thing at a time and is overwritten by the
+        next. What was missing was a record -- what stage ran, how long it took, what the worker
+        said on the way -- so that a slow start can be read afterwards instead of guessed at.
+        """
+        if not text:
+            return
+        view = getattr(self, "log_view", None)
+        if view is None:
+            return
+        mark = {"error": "✖", "warn": "!", "done": "✔"}.get(kind, "·")
+        view.appendPlainText(f"{time.strftime('%H:%M:%S')}  {mark} {text}")
+        bar = view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        if kind == "error" and hasattr(self, "log_panel") and not self.log_panel.toggle.isChecked():
+            self.log_panel.toggle.setChecked(True)
 
     def set_error(self, where: str, message: str, detail: str = "", retryable: bool = True):
         self._last_error = {"where": where, "message": message, "detail": detail}
