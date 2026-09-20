@@ -454,11 +454,23 @@ class Raceline:
               smooth: float = 0.5, width_cap_ratio: float = 0.8, *,
               mu: float = 1.0489, mu_front: Optional[float] = None,
               mu_rear: Optional[float] = None, vehicle=None,
-              optimize_lap_time: bool = True) -> "Raceline":
+              optimize_lap_time: bool = True,
+              objective: Optional[str] = None) -> "Raceline":
         """margin: free space kept between the car's side and the boundary (0.40 m: the pure-pursuit
         teacher cuts inside the line by up to ~0.15 m at speed, and duct hoses are soft targets anyway).
         width_cap_ratio: a side is never wider than this fraction of the median total lane width,
-        so openings into side rooms / pit areas of SLAM maps do not pull the line off the lane."""
+        so openings into side rooms / pit areas of SLAM maps do not pull the line off the lane.
+
+        `objective` is the older spelling of the same choice, kept because it is what
+        `--raceline-objective` passes and what evaluation scripts written against it send:
+        "min_time" is `optimize_lap_time=True`, "min_curvature" is False. Without it those callers
+        raised TypeError -- and only when the raceline cache missed, so training that reused a
+        prebuilt line ran fine and the evaluation afterwards did not."""
+        if objective is not None:
+            if objective not in ("min_time", "min_curvature"):
+                raise ValueError(f"raceline objective must be 'min_time' or 'min_curvature', "
+                                 f"not {objective!r}")
+            optimize_lap_time = (objective == "min_time")
         track = track.for_planning()
         if track.centerline is None:
             raise ValueError("track needs a centerline")

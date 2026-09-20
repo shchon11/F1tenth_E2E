@@ -201,12 +201,14 @@ def _pick_turns(recipe: TrackRecipe, rng: np.random.Generator) -> Optional[List[
             return seq
         return None
     lo_s = max(2, len(fixed), min(lo, 3))
-    for _ in range(2000):
-        n_total = int(rng.integers(lo_s, hi + 1))
-        seq = list(fixed) + [str(rng.choice(free, p=weights / weights.sum())) for _ in range(n_total - len(fixed))]
-        if abs(sum(TURN_FEATURES[k]["angle"] for k in seq) - 360.0) < 1e-6:
-            rng.shuffle(seq)
-            return seq
+    for floor in dict.fromkeys((lo_s, max(2, len(fixed)))):
+        for _ in range(2000):
+            n_total = int(rng.integers(floor, hi + 1))
+            seq = list(fixed) + [str(rng.choice(free, p=weights / weights.sum()))
+                                 for _ in range(n_total - len(fixed))]
+            if abs(sum(TURN_FEATURES[k]["angle"] for k in seq) - 360.0) < 1e-6:
+                rng.shuffle(seq)
+                return seq
     return None
 
 
@@ -259,6 +261,39 @@ def _self_clear(poly: np.ndarray, clearance: float) -> bool:
     return not bool((d[~near_in_arc] < clearance).any())
 
 
+def lap_impossible_reason(recipe: "TrackRecipe") -> str:
+    """Why this set of turns can never close a lap, or "" when it can.
+
+    A lap is 360 degrees of turning. Each enabled kind contributes its own angle any number of
+    times, so the question is whether some non-negative combination sums to 360 -- which is
+    decidable up front, and worth deciding there: the generator otherwise tries 300 times and
+    then reports a failure that reads like bad luck.
+
+    The editor calls this before enabling 생성, so an impossible combination is refused with its
+    reason instead of after a wait.
+    """
+    enabled = [k for k, c in recipe.turns.items() if c != 0 and k in TURN_FEATURES]
+    if not enabled:
+        return "코너를 하나도 켜지 않았습니다. 한 바퀴를 돌려면 방향을 바꿀 코너가 필요합니다."
+    angles = [TURN_FEATURES[k]["angle"] for k in enabled]
+    if all(a < 0 for a in angles):
+        names = " · ".join(TURN_FEATURES[k]["label"] for k in enabled)
+        return (f"켜 둔 코너가 전부 반대 방향입니다 ({names}). 한 바퀴(+360°)를 돌려면 "
+                f"90° 코너·완만한 커브·유턴 중 하나는 켜야 합니다.")
+    # small search over how many of each kind; angles are multiples of 45 in practice
+    reach = {0.0}
+    for _ in range(16):
+        nxt = {t + a for t in reach for a in angles if -720 <= t + a <= 720}
+        if 360.0 in nxt or any(abs(v - 360.0) < 1e-6 for v in nxt):
+            return ""
+        if nxt <= reach:
+            break
+        reach |= nxt
+    names = " · ".join(TURN_FEATURES[k]["label"] for k in enabled)
+    return (f"켜 둔 코너({names})의 각도로는 정확히 360°를 만들 수 없습니다. "
+            f"90° 코너나 완만한 커브를 함께 켜 보세요.")
+
+
 def generate(recipe: TrackRecipe, seed: int = 0, max_attempts: int = 300) -> GeneratedTrack:
     """A random closed track for `recipe`; raises `RuntimeError` when no lap could be closed."""
     from .scene import sample_path
@@ -273,7 +308,8 @@ def generate(recipe: TrackRecipe, seed: int = 0, max_attempts: int = 300) -> Gen
             reasons[last_reason] += 1
         turns = _pick_turns(recipe, rng)
         if turns is None:
-            raise RuntimeError("켜 둔 코너 항목으로는 한 바퀴(360°)를 만들 수 없습니다. 90° 코너나 유턴을 켜 주세요.")
+            raise RuntimeError(lap_impossible_reason(recipe)
+                               or "켜 둔 코너 항목으로는 한 바퀴(360°)를 만들 수 없습니다.")
         runs = _pick_runs(recipe, len(turns), rng)
         if runs is None:
             last_reason = "run count"

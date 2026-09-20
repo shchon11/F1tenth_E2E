@@ -695,52 +695,6 @@ class Critic(nn.Module):
         return self.head(self.embed(scan, proprio, priv), h, use_memory, self.motion_input(scan))
 
 
-def name_seed(seed: int, name: str) -> int:
-    """A stable per-module seed from `(run seed, module path)`.
-
-    `hash()` is salted per process for strings, so two runs of the same command would disagree; a
-    digest is stable across processes, machines and Python versions, which is what "reproducible from
-    a seed" has to mean.
-    """
-    import hashlib
-    d = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
-    return (int(seed) ^ int.from_bytes(d, "big")) % (2 ** 31 - 1)
-
-
-def reinit_fresh_by_name(model, fresh, seed: int) -> list:
-    """Re-initialise every module whose parameters are all new, from its own NAME. Returns the list.
-
-    Why this exists (`docs/research/motion-memory-2026-09-14.md`): two arms that differ only in how
-    many scan channels they enable do not differ only in that. The wider first convolution has more
-    parameters, so it draws more numbers from the ambient generator, so every module built after it
-    -- including the GRUs a warm start leaves fresh -- gets different weights from the same `--seed`.
-    Measured on the phase-1 arms, `actor.memory.gru.weight_ih_l0` differed by up to 0.176 between two
-    arms meant to differ by one flag, which is a second difference nobody asked for in a comparison
-    built to isolate one.
-
-    Seeding each fresh module from `(seed, its own qualified name)` removes it: a module of the same
-    shape and the same name is initialised identically whatever was built before it. Modules are
-    re-initialised through their own `reset_parameters`, so each keeps the distribution PyTorch gives
-    it rather than one invented here.
-
-    Only modules ALL of whose direct parameters are fresh are touched -- a module holding a single
-    copied weight is left exactly as the checkpoint wrote it.
-    """
-    done = []
-    fresh = set(fresh)
-    for name, mod in model.named_modules():
-        own = [f"{name}.{p}" if name else p for p, _ in mod.named_parameters(recurse=False)]
-        if not own or not all(o in fresh for o in own):
-            continue
-        if not hasattr(mod, "reset_parameters"):
-            continue
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(name_seed(seed, name))
-            mod.reset_parameters()
-        done.append(name)
-    return done
-
-
 def _float_pair(mot):
     """The motion aux pair in float32, `(None, None)` passed through unchanged.
 

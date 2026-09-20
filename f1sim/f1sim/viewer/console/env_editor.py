@@ -1504,6 +1504,8 @@ class EnvEditorPage(QtWidgets.QWidget):
             cnt.setToolTip("개수. '자동'이면 무작위로 몇 개든")
             cnt.setFixedWidth(64)
             chk.toggled.connect(cnt.setEnabled)
+            chk.toggled.connect(lambda _on: self._update_gen_ready())
+            cnt.valueChanged.connect(lambda _v: self._update_gen_ready())
             cnt.setEnabled(chk.isChecked())
             grid.addWidget(chk, i // 2, (i % 2) * 2)
             grid.addWidget(cnt, i // 2, (i % 2) * 2 + 1)
@@ -1519,10 +1521,38 @@ class EnvEditorPage(QtWidgets.QWidget):
         self.btn_regenerate.clicked.connect(self._regenerate)
         gr.addWidget(self.btn_regenerate)
         card.add(gr)
-        self.gen_note = label("고른 항목들로 닫힌 트랙을 무작위로 만듭니다. 결과는 트랙 경로라서 바로 꼭짓점을 잡아 고칠 수 있고, "
-                              "같은 항목·seed 면 같은 트랙이 나옵니다. 배치 생성은 `python -m f1sim.trackgen`.", "hint")
+        self.gen_note = label("", "hint")
+        self.gen_note.setWordWrap(True)
         card.add(self.gen_note)
+        self._update_gen_ready()
         return card
+
+    #: What the note says when the settings are fine and nothing has been generated yet.
+    GEN_READY_NOTE = ("고른 항목들로 닫힌 트랙을 무작위로 만듭니다. 결과는 트랙 경로라서 바로 꼭짓점을 잡아 "
+                      "고칠 수 있고, 같은 항목·seed 면 같은 트랙이 나옵니다. "
+                      "배치 생성은 `python -m f1sim.trackgen`.")
+
+    def _update_gen_ready(self):
+        """Refuse an impossible corner set here rather than after 300 attempts.
+
+        A lap is 360 degrees of turning, so some combinations can never close -- and the failure
+        used to arrive as a wait followed by a message naming a turn the user had already enabled.
+        `trackgen.lap_impossible_reason` decides it from the angles, before anything is drawn.
+        """
+        if not hasattr(self, "gen_note") or not hasattr(self, "btn_generate"):
+            return
+        from f1sim import trackgen as TG
+        why = ""
+        try:
+            why = TG.lap_impossible_reason(self.generator_recipe())
+        except Exception:
+            why = ""
+        self.btn_generate.setEnabled(not why)
+        self.btn_regenerate.setEnabled(not why)
+        self.gen_note.setObjectName("HintWarn" if why else "Hint")
+        self.gen_note.setText(why or self.GEN_READY_NOTE)
+        self.gen_note.style().unpolish(self.gen_note)
+        self.gen_note.style().polish(self.gen_note)
 
     def generator_recipe(self):
         from f1sim import trackgen as TG
@@ -1552,8 +1582,13 @@ class EnvEditorPage(QtWidgets.QWidget):
         self.load_doc(doc, dirty=True)
         feats = " · ".join(dict.fromkeys(TG.RUN_FEATURES.get(f, TG.TURN_FEATURES.get(f, {})).get("label", f)
                                          for f in g.features))
-        self._set_status(f"'{name}' 생성 · 길이 {g.length_m:.1f} m · {g.attempts}번째 시도 · {feats}. "
-                         f"손질한 뒤 저장하세요.")
+        made = (f"'{name}' 생성 · 길이 {g.length_m:.1f} m · {g.attempts}번째 시도 · {feats}. "
+                f"손질한 뒤 저장하세요.")
+        self._set_status(made)
+        self.gen_note.setObjectName("Hint")
+        self.gen_note.setText(made)
+        self.gen_note.style().unpolish(self.gen_note)
+        self.gen_note.style().polish(self.gen_note)
         return True
 
     def _regenerate(self):

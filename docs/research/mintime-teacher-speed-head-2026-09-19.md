@@ -553,3 +553,78 @@ the trial and the full run disagreed, and neither was wrong.
 the generalist dial student, `--lr 2e-4 --lr-end 5e-5 --kl-coef 0.05 --kl-decay 4e6 --gamma 0.997
 --collision-penalty 60 --steer-penalty 0.02 --lap-time-bonus 6 --dial-margin 0.30 --dial-exact 0.30
 --grip-budget-penalty 2.0`, 6.3 M steps on one map, ~45 min.
+
+## 11. Does per-venue specialisation replicate? (2026-09-20)
+
+§10 measured the recipe on one map (`real:map12x16`). Two more, on maps it had never been run on:
+`real:korea_2025_iccas` (a measured venue) and `gen:control:9100` (a generated control track).
+Same recipe, same protocol, seed 903, 6.3 M steps each, ~47 min.
+
+### `real:korea_2025_iccas`
+
+| policy | median lap [s] | best 10 % | collisions / km | a crash every |
+| --- | ---: | ---: | ---: | ---: |
+| teacher (privileged) | 8.20 | 7.62 | 0.00 | 1853 laps |
+| generalist student | 8.73 | 7.97 | 1.70 | 15 laps |
+| **specialised** | **7.58** | 7.05 | 0.81 | 31 laps |
+| — same, dial 0.15 under | 7.70 | 7.15 | **0.57** | **44 laps** |
+
+**13.2 % quicker than the generalist and half its collisions**, and 7.6 % quicker than the
+privileged teacher. The shape of §10 holds here.
+
+### `gen:control:9100` — and it does not hold there
+
+| policy | median lap [s] | best 10 % | collisions / km | a crash every |
+| --- | ---: | ---: | ---: | ---: |
+| teacher (privileged) | 10.32 | 9.67 | 0.03 | 734 laps |
+| generalist student | 10.55 | 9.65 | **0.27** | 68 laps |
+| specialised | **9.82** | 9.20 | 0.91 | 20 laps |
+| — same, dial 0.15 under | 10.07 | 9.43 | 0.61 | 30 laps |
+
+Still quicker -- 6.9 % -- but **3.4× the collisions**, and 2.3× even with the dial 0.15 under.
+The headline of §10 ("10 % quicker AND four times safer") does not generalise.
+
+### What actually decides it: where the generalist already was
+
+| map | generalist coll/km | specialised, dial 0.15 under | lap gain |
+| --- | ---: | ---: | ---: |
+| `real:map12x16` (§10) | 1.18 | 0.29 | 10 % |
+| `real:korea_2025_iccas` | 1.70 | 0.57 | 13 % |
+| `gen:control:9100` | **0.27** | **0.61** | 7 % |
+
+Specialisation does not make a policy safer. It moves the collision rate **towards ~0.3–0.6 per
+km from wherever it started** and spends whatever slack is left on pace. On a map where the
+generalist crashes every 15 laps that reads as a fix; on one where it already crashes only every
+68, the same recipe spends that margin and the result is less safe than what it started from.
+
+That number is not a property of the car — it is where `--collision-penalty 60` balances
+`--lap-time-bonus 6`. Specialising a map the generalist already handles safely therefore needs a
+heavier collision term than the recipe of record, or it is a trade rather than an improvement.
+Untested: whether raising it recovers the margin without giving back the pace.
+
+### The last 10 % of the run is what makes it safe
+
+This run was measured twice, because the first attempt was killed at update 688 of 768 when the
+session that launched it ended. At 90 % of the schedule it was **already at full pace and not yet
+safe**:
+
+| `spec_korea_s904` | median lap [s] | collisions / km |
+| --- | ---: | ---: |
+| at update 688 / 768 (90 %) | 7.55 | 1.95 |
+| at update 688, dial 0.15 under | 7.62 | 1.30 |
+| **at update 768 / 768** | 7.58 | **0.81** |
+| — dial 0.15 under | 7.70 | **0.57** |
+
+Pace is unchanged between them (7.55 → 7.58 s, inside the noise); collisions fall by 2.4×. The
+pace arrives early and the safety arrives last, so a specialisation run stopped short does not
+give a slightly worse policy — it gives a policy that is **as fast as the finished one and twice
+as likely to crash**. The `--kl-decay 4e6` leash releases over the first 4 M of 6.3 M steps, and
+what the remaining 2.3 M buys is the collision term and the grip budget acting on an unleashed
+policy. Read a partial specialisation as unfinished, not as a cheaper version.
+
+### Reproducing this
+
+`lap_eval.py` calls `Raceline.build(objective=…)`. That argument was dropped in the merge of this
+branch onto main and the callers were not, so evaluation raised `TypeError` — but **only when the
+raceline cache missed**, which is why training with `--raceline-objective min_time` ran fine and
+the measurement after it did not. Restored as an alias of `optimize_lap_time`.

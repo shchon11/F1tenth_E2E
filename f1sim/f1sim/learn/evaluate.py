@@ -136,10 +136,6 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     rl_kw.update(limits)                       # same profile the teacher then drives on it
     if raceline_objective is not None:
         rl_kw["objective"] = raceline_objective
-    limits = dict(teacher_limits or {})                # a_lat / a_acc / a_brake: the line is optimised for the
-    rl_kw.update(limits)                               # same profile the teacher then drives on it
-    if raceline_objective is not None:
-        rl_kw["objective"] = raceline_objective
     trs, rls = common.load_tracks(tracks, racelines=teacher or (race_size > 1 and opponent == "teacher"), **rl_kw)
     model = None
     metadata = {}

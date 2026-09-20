@@ -1225,7 +1225,7 @@ def main():
     #: projection and additionally RECORDS which reference this run has, so a `kl_ref` chart can
     #: never be read as a distance from the frozen original when it is not one.
     leashed = a.kl_coef > 0
-    if leashed and cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
+    if leashed and cond_dim and not init_conditional and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
         raise RuntimeError("the KL reference actor was captured after the conditioning projection "
@@ -1587,7 +1587,7 @@ def main():
                     buf_ref_mean[t] = ref_mean[lid]
                     buf_ref_std[t] = ref_std[lid]
                 act, logp = act.float(), logp.float()
-                buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
+                buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv_c[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
                 if buf_floor_lab is not None:
                     # Before the step, for the same reason: `scan_hist[:, 0]` is still the frame
                     # `buf_scan[t]` was built from, so the label names that scan's beams.
@@ -1639,6 +1639,9 @@ def main():
                         # acted on, so advancing the occupancy memory for it would leave the next
                         # episode carrying a step it did not take.
                         final_scan = roll_aug.preview(final_scan, f["ids"], final_pro)
+                    final_priv = info["final_priv"] if not critic_cond else torch.cat(
+                        [info["final_priv"],
+                         cond_t[f["ids"]].to(info["final_priv"].dtype)], 1)
                     with ac:
                         final_val = model.critic.step(
                             final_scan, final_pro, final_priv,
