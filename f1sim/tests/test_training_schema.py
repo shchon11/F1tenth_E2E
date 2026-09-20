@@ -89,10 +89,22 @@ def test_every_job_builds_and_roundtrips_through_actual_parser(kind, tmp_path, a
     assert schema.parse_argv(kind, flags) == expected
 
 
-def test_korean_labels_cover_common_settings_and_reward_terms():
+def test_common_settings_and_reward_terms_have_written_labels():
+    """Every field a person actually sets must carry a label somebody wrote.
+
+    This used to assert the label contained a Hangul character, which is not the same thing and
+    is now wrong: a term of art keeps its English name on purpose -- `controller adaptation`,
+    `max grad norm`, `action space` -- so that the label, the CLI flag and the paper agree. What
+    must not happen is a field falling through to `dest.replace("_", " ")`, which is the fallback
+    `training_schema_export` uses when no label was written for it.
+    """
     fields = {f["dest"]: f for f in schema.get_schema("ppo")["fields"]}
-    for dest in ("envs", "tracks", "adaptation", "controller", "estimator", "init", "lr", "collision_penalty", "lap_bonus", "overtake_bonus", "ttc_penalty", "sideslip_penalty"):
-        assert any("가" <= c <= "힣" for c in fields[dest]["label"])
+    for dest in ("envs", "tracks", "adaptation", "controller", "estimator", "init", "lr",
+                 "collision_penalty", "lap_bonus", "overtake_bonus", "ttc_penalty",
+                 "sideslip_penalty"):
+        label = fields[dest]["label"]
+        assert label, dest
+        assert label != dest.replace("_", " "), f"{dest} has no written label"
 
 
 def test_unknown_inputs_never_become_extra_cli():

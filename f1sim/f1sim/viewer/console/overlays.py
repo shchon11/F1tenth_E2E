@@ -89,7 +89,7 @@ class PolicyInputPanel(QtWidgets.QWidget):
         self._sal_age: Optional[float] = None
         self.setToolTip("정책이 방금 받은 LiDAR 스캔을 위에서 본 그림.\n"
                         "점 밝기 = 그 빔이 행동을 얼마나 움직이는가(saliency).\n"
-                        "선 = 정책이 만든 로컬 플랜, 색은 그 속도 프로파일.")
+                        "선 = 정책이 만든 로컬 plan, 색은 그 속도 프로파일.")
 
     def set_data(self, scan: Optional[np.ndarray], sal: Optional[np.ndarray],
                  plan_ref: Optional[np.ndarray], v_max: float,
@@ -196,7 +196,7 @@ class PolicyInputPanel(QtWidgets.QWidget):
 
         p.setPen(QtGui.QColor(C["text.2"]))
         f = p.font(); f.setPointSizeF(7.0); p.setFont(f)
-        legend = f"{nb}빔 · 반경 {self.span:.0f}m · 플랜색 = 속도 0→{self.v_max:.1f}"
+        legend = f"{nb}빔 · 반경 {self.span:.0f}m · plan 색 = 속도 0→{self.v_max:.1f}"
         if self._sal is None:
             legend += " · saliency 꺼짐"
         elif self._sal_age is not None:

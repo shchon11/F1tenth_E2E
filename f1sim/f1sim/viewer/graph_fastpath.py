@@ -453,7 +453,7 @@ class SimGraphFastPath:
             return _mpc.solve(*args, consts=consts)
 
         self.mpc = GraphedCallable(solve_bound, example_args, name="mpc.solve")
-        self._log("플랜 솔버 그래프 캡처")
+        self._log("plan 솔버 그래프 캡처")
 
     # -- prop leaves --------------------------------------------------------------
     def _leaf_guards(self, owner) -> Dict[str, Callable[[], Any]]:

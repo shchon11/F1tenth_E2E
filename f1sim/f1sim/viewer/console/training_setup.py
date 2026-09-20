@@ -18,14 +18,14 @@ from .widgets import Card, Collapsible, SegmentedButtons, label
 
 
 MODES = (
-    ("ppo", "PPO · 정책 강화학습", "ppo"),
-    ("speed", "자동 제어 · 속도 헤드 적응", "ppo"),
-    ("full", "자동 제어 · 전체 정책 적응", "ppo"),
-    ("dagger", "DAgger · Teacher 증류", "dagger"),
-    ("grip_collect", "마찰 추정 · 주행 데이터 수집", "grip_collect"),
-    ("grip_fit", "마찰 추정 · 데이터로 학습", "grip_fit"),
-    ("grip_final", "마찰 추정 · 최종 평가", "grip_final"),
-    ("grip_pilot", "마찰 추정 · 제한된 파일럿", "grip_pilot"),
+    ("ppo", "PPO", "ppo"),
+    ("speed", "PPO · 속도 head 적응 (자동 제어)", "ppo"),
+    ("full", "PPO · 전체 정책 적응 (자동 제어)", "ppo"),
+    ("dagger", "DAgger · teacher 모방", "dagger"),
+    ("grip_collect", "노면 추정기 · 주행 데이터 수집", "grip_collect"),
+    ("grip_fit", "노면 추정기 · 데이터로 학습", "grip_fit"),
+    ("grip_final", "노면 추정기 · 최종 평가", "grip_final"),
+    ("grip_pilot", "노면 추정기 · 제한된 파일럿", "grip_pilot"),
 )
 
 #: The page a chosen step's own settings are lifted onto, ahead of everything else.
@@ -33,9 +33,9 @@ HIGHLIGHT_GROUP = "이 단계의 핵심"
 
 MODE_NOTES = {
     "ppo": "보상, 환경, 모델과 학습 조건을 직접 설정합니다. 기본 레시피는 현재 에셋 장애물을 사용하는 시작점입니다.",
-    "speed": "조향 경로를 고정하고 속도 출력만 학습합니다. 자동 제어기와 원본 기준 정책을 함께 지정하세요.",
-    "full": "전체 정책을 학습하며 원본 정책의 순환 상태로 계산한 곡률 KL을 사용합니다.",
-    "dagger": "Teacher 모드, 혼합 비율, 수집·증류·평가 일정을 한곳에서 설정합니다.",
+    "speed": "조향 경로를 고정하고 속도 출력만 학습합니다. auto 제어기와 원본 기준 정책을 함께 지정하세요.",
+    "full": "전체 정책을 학습하며 원본 정책의 recurrent state 로 계산한 곡률 KL 을 사용합니다.",
+    "dagger": "teacher 종류, 혼합 비율(beta), 수집·학습·평가 일정을 한곳에서 설정합니다.",
     "grip_collect": "학습 맵을 네 분할로 나눠 주행 데이터를 수집합니다. 같은 설정·출력 폴더로 중단 지점부터 재개합니다.",
     "grip_fit": "고정된 epoch 수로 추정기를 학습합니다. 기존 추정기에서 시작하고 TRAIN 재생 데이터를 섞을 수 있습니다. 새 후보마다 비어 있는 출력 폴더를 사용합니다.",
     "grip_final": "후보의 최종 분할을 한 번 평가합니다. 평가 기록은 다시 덮어쓰지 않습니다.",
@@ -382,6 +382,11 @@ class TrainingSetupForm(QtWidgets.QWidget):
         for mode, title, _kind in MODES:
             self.combo_mode.addItem(title, mode)
         bar.addWidget(self.combo_mode, 2)
+        # With a step chosen the mode is decided by the step, so the picker goes away -- but the
+        # page must still say which learner is about to run, or the card is two buttons and a title.
+        self.mode_label = label("", "field")
+        self.mode_label.setVisible(False)
+        bar.addWidget(self.mode_label, 2)
         self.combo_recipe = QtWidgets.QComboBox()
         self.combo_recipe.setMinimumWidth(0)
         bar.addWidget(self.combo_recipe, 2)
@@ -606,6 +611,10 @@ class TrainingSetupForm(QtWidgets.QWidget):
         self.stage_note.setText(st.blurb if st else
                                 "단계 기본값 없이 아래 설정을 그대로 씁니다.")
         self.combo_mode.setVisible(st is None)
+        self.mode_label.setVisible(st is not None)
+        if st is not None:
+            title = next((t for m, t, _k in MODES if m == st.mode), st.mode)
+            self.mode_label.setText(f"{title} 을(를) 실행합니다")
         if st is None:
             self._mode_changed()
             return
@@ -763,10 +772,10 @@ class TrainingSetupForm(QtWidgets.QWidget):
             raise ValueError(critic_error)
         if self.kind == "ppo" and values.get("adaptation") != "off" and metadata:
             if not values.get("reference") and not metadata.get("original_reference", {}).get("path"):
-                raise ValueError("첫 적응 학습에는 원본 D3 기준 정책을 지정해야 합니다.")
+                raise ValueError("첫 controller adaptation 에는 원본 D3 reference policy 를 지정해야 합니다.")
             same_stage = metadata.get("adaptation") == values["adaptation"]
             if bool(values.get("fresh_opt")) == same_stage:
-                raise ValueError("같은 단계 재개는 Adam 복원, 새 단계 진입은 새 옵티마이저를 사용해야 합니다.")
+                raise ValueError("같은 단계 재개는 Adam 복원, 새 단계 진입은 fresh optimizer 를 사용해야 합니다.")
         argv = self.schema_api.build_argv(self.kind, values, python=sys.executable)
         name = str(values.get("name") or os.path.abspath(os.path.expanduser(str(values.get("out") or self.mode))))
         return name, argv, str(values.get("device") or "cpu")
@@ -1076,9 +1085,9 @@ class TrainingSetupForm(QtWidgets.QWidget):
         if critic_error:
             self.launch_note.setText("관측·모델 설정을 복원했습니다. " + critic_error)
         elif self.kind == "ppo" and values.get("adaptation") != "off" and not values.get("reference"):
-            self.launch_note.setText("첫 적응 학습에는 원본 D3 기준 정책을 지정해야 합니다.")
+            self.launch_note.setText("첫 controller adaptation 에는 원본 D3 reference policy 를 지정해야 합니다.")
         elif not self._resuming:
-            self.launch_note.setText("새 단계 진입: 현재 전체 예산을 유지하고 새 옵티마이저를 사용합니다.")
+            self.launch_note.setText("새 단계 진입: 현재 전체 예산을 유지하고 fresh optimizer 를 사용합니다.")
         elif contract_updates and values.get("adaptation", "off") == "off":
             self.launch_note.setText("저장된 관측·모델·행동 설정을 복원했습니다. 나머지 학습 파라미터는 현재 설정을 유지합니다.")
 

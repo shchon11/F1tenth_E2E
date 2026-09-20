@@ -288,13 +288,24 @@ def _opponent_mix(env) -> str:
         return str(env.ecfg.opponent)
     from ..opponent_slots import mix_summary
     return mix_summary(slots)
+#: A card with less than this free cannot hold a viewer session, so it is not a candidate however
+#: idle it looks. A session is a track, a policy and the frame buffers; 1.5 GiB is the smallest one
+#: measured here with room to spare.
+VIEWER_MIN_FREE_BYTES = 1.5 * 2 ** 30
+
+
 def auto_device() -> str:
     """The card the viewer should run on: the CUDA device with the most memory free, else the CPU.
 
     `torch.device("cuda")` is device 0, and device 0 is where training runs -- so "auto" put the
-    viewer on the busy card every time and both crawled. Free memory is the honest proxy for "not
-    in use", needs no per-machine configuration, and on one GPU it still picks that one.
-    `$F1SIM_VIEWER_DEVICE` overrides it outright.
+    viewer on the busy card every time and both crawled. `$F1SIM_VIEWER_DEVICE` overrides outright.
+
+    The measure is the FRACTION of each card that is free, not the number of bytes. Bytes picked
+    the training card on this machine: a 12 GB card busy with a run still had 6.48 GB free against
+    an idle 8 GB card's 6.46, so the bigger card won by 0.02 GB while one of them was working and
+    the other was not -- 56 % free against 86 %. A fraction says "not in use", which is the thing
+    actually being asked. Cards with too little free memory to hold a session are dropped first,
+    so an almost-empty tiny card cannot win on percentage alone.
     """
     import torch
     forced = os.environ.get("F1SIM_VIEWER_DEVICE")
@@ -306,8 +317,11 @@ def auto_device() -> str:
     if n <= 1:
         return "cuda"
     try:
-        free = [torch.cuda.mem_get_info(i)[0] for i in range(n)]
-        return f"cuda:{max(range(n), key=lambda i: free[i])}"
+        info = [torch.cuda.mem_get_info(i) for i in range(n)]
+        usable = [i for i, (free, _tot) in enumerate(info) if free >= VIEWER_MIN_FREE_BYTES]
+        if not usable:
+            usable = list(range(n))
+        return f"cuda:{max(usable, key=lambda i: info[i][0] / max(1, info[i][1]))}"
     except Exception:
         return "cuda"
 
@@ -742,6 +756,8 @@ class SimWorker:
         device = torch.device(auto_device() if cfg.device == "auto" else cfg.device)
         if device.type == "cuda" and not torch.cuda.is_available():
             raise StartConfigError("CUDA 를 쓸 수 없습니다 (torch.cuda.is_available() = False). 장치를 cpu 로 바꿔 주세요.")
+        if device.type == "cuda":
+            torch.cuda.set_device(device.index if device.index is not None else 0)
         # Nothing to compile on the CPU: inductor leaves this graph of hundreds of tiny ops alone.
         compile_enabled = bool(cfg.compile) and device.type == "cuda"
 
@@ -750,10 +766,10 @@ class SimWorker:
         # benchmark's declared cross-runtime case, and the configuration that scored best).
         arm = str(getattr(cfg, "controller", "legacy") or "legacy")
         if arm not in viewer_arms():
-            raise StartConfigError(f"플랜 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 "
+            raise StartConfigError(f"plan 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 "
                                    f"({' / '.join(viewer_arms())}).")
         if arm not in ("legacy", "auto") and int(cfg.cars_per_race) > 1:
-            raise StartConfigError(f"플랜 제어기 '{arm}' 은 레이스당 차량 수 1에서만 지원합니다 "
+            raise StartConfigError(f"plan 제어기 '{arm}' 은 레이스당 차량 수 1에서만 지원합니다 "
                                    f"(학습·벤치마크와 같은 조건). 레이스당 차량 수를 1로 두거나 legacy 를 고르세요.")
         estimator_path = ""
         # Peek the arm the checkpoint was trained under before loading, so a mismatch is a start
@@ -780,7 +796,7 @@ class SimWorker:
         from ..mpc import ACT_DIM as PLAN_DIM
         if act_dim not in (2, PLAN_DIM):
             raise StartConfigError(
-                f"{os.path.basename(ckpt_path)}: 행동 차원 {act_dim} 은 예전 플랜 표현입니다 "
+                f"{os.path.basename(ckpt_path)}: 행동 차원 {act_dim} 은 예전 plan 표현입니다 "
                 f"(현재는 {PLAN_DIM}). 더 최신 런을 고르세요.")
         mode = "plan" if act_dim == PLAN_DIM else "direct"
         if mode == "direct" and arm != "legacy":
@@ -788,7 +804,7 @@ class SimWorker:
             # the session for a setting that cannot apply (the deployment default is fixed_low)
             # made every direct checkpoint unopenable; say what happened and run it as it is.
             self.say(P.MSG_LOG, gen=gen,
-                     text=f"플랜 제어기 '{arm}' 은 직접 행동(direct) 체크포인트에 적용되지 않아 legacy 로 실행합니다")
+                     text=f"plan 제어기 '{arm}' 은 직접 행동(direct) 체크포인트에 적용되지 않아 legacy 로 실행합니다")
             arm = "legacy"
             estimator_path = ""
         embedded = controller_record if recorded == "auto" else None
@@ -959,7 +975,7 @@ class SimWorker:
             # After the graphs: `install` hooks `tracker._solver`, and the fast path's captured MPC
             # arguments let the grip solver capture its own graph instead of running eager.
             from ..learn.grip_runtime import ControllerRuntime
-            self.say(P.MSG_LOG, gen=gen, text=f"플랜 제어기 설치: {arm}"
+            self.say(P.MSG_LOG, gen=gen, text=f"plan 제어기 설치: {arm}"
                      + (f" | 추정기 {os.path.basename(estimator_path)}" if estimator_path else ""))
             self.stage(gen, "controller", "자동 제어 준비")
             rt = ControllerRuntime(env, arm, estimator_path or None, device=device,
@@ -1079,13 +1095,13 @@ class SimWorker:
             self.stage(gen, "graph", "물리")
             fp.capture_roll(rec["roll"])
             if tracker is not None and "mpc" in rec:
-                self.stage(gen, "graph", "플랜 솔버")
+                self.stage(gen, "graph", "plan 솔버")
                 try:
                     fp.capture_mpc(tracker, rec["mpc"])
                 except NotCapturable as exc:
                     # The physics graphs are the larger win; the solver staying eager is a partial
                     # result, not a failure.
-                    self.say(P.MSG_LOG, gen=gen, text=f"플랜 솔버는 eager 로 둡니다: {exc}")
+                    self.say(P.MSG_LOG, gen=gen, text=f"plan 솔버는 eager 로 둡니다: {exc}")
             # The prop leaves. A map without props skips them by eligibility, not by omission, and
             # either one staying eager is a smaller win rather than a failed session.
             if "contact" in rec:

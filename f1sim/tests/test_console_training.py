@@ -448,10 +448,11 @@ def test_a_dagger_run_gets_its_own_charts_with_the_teacher_beside_the_student(pa
     d = _run_with(tmp_path, "cl_dagger", DAGGER_JSONL)
     page._current_run = str(d)
     page._tick(force=True)
-    assert _titles(page) == ["충돌 / km · 학생 vs 교사", "증류 손실", "랩 타임 · 학생 vs 교사",
-                            "진행 속도 · 학생 vs 교사", "beta (교사 주행 비율)"]
+    assert _titles(page) == ["충돌 / km · student vs teacher", "모방 손실 (imitation loss)",
+                            "랩 타임 · student vs teacher", "진행 속도 · student vs teacher",
+                            "beta (teacher 주행 비율)"]
     ch = page._charts[("student_coll_per_km", "teacher_coll_per_km")]
-    assert len(ch._series) == 2 and ch.labels == ["학생", "교사"]
+    assert len(ch._series) == 2 and ch.labels == ["student", "teacher"]
     assert ch._series[0][0] == 52.6 and ch._series[1] == [7.2, 7.2, 7.2]
     assert ch.x_label == "iter →"
     # the tiles are the iteration's, not an update's: a DAgger run has no steps and no steps/s
@@ -463,7 +464,7 @@ def test_a_dagger_run_gets_its_own_charts_with_the_teacher_beside_the_student(pa
 def test_switching_between_the_two_kinds_rebuilds_the_grid(page, tmp_path):
     ppo = _run_with(tmp_path, "cl_p", PPO_JSONL)
     dag = _run_with(tmp_path, "cl_d", DAGGER_JSONL)
-    for run, first in ((ppo, "충돌 / km"), (dag, "충돌 / km · 학생 vs 교사"), (ppo, "충돌 / km")):
+    for run, first in ((ppo, "충돌 / km"), (dag, "충돌 / km · student vs teacher"), (ppo, "충돌 / km")):
         page._current_run = str(run)
         page._tick(force=True)
         assert _titles(page)[0] == first

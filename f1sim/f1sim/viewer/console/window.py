@@ -495,9 +495,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.row_opp = FieldRow(
             "상대차 (차량별 설정)", self.opp_table,
             "레이스당 차량 수 - 1 줄. 줄마다 종류·체크포인트·속도·이벤트·스폰을 따로 정합니다. "
-            "티처는 선택입니다: 'raceline 티처'는 이 뷰어가 늘 쓰던 티처, "
-            "'interactive 티처'는 상대 차의 예측된 미래까지 보고 계획을 고르는 업그레이드된 쪽입니다 "
-            "(프리셋 '업그레이드 티처').")
+            "teacher 는 선택입니다: 'raceline teacher' 는 이 뷰어가 늘 쓰던 것, "
+            "'interactive teacher' 는 상대 차의 예측된 미래까지 보고 계획을 고르는 업그레이드된 쪽입니다 "
+            "(프리셋 '업그레이드 teacher').")
         adv.add(self.row_opp)
         self.combo_device = QtWidgets.QComboBox()
         # Every card by name, not just "cuda": `torch.device("cuda")` is device 0, and on a machine
@@ -1132,7 +1132,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         show = Card("표시")
         self.chk_lidar = QtWidgets.QCheckBox("LiDAR 점")
         self.chk_lidar.setChecked(True)
-        self.chk_plan = QtWidgets.QCheckBox("플랜 / 예측 궤적")
+        self.chk_plan = QtWidgets.QCheckBox("plan / 예측 궤적")
         self.chk_plan.setChecked(True)
         self.chk_trails = QtWidgets.QCheckBox("주행 궤적")
         self.chk_trails.setChecked(True)

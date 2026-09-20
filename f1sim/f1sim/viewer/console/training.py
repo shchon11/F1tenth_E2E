@@ -131,14 +131,14 @@ class Stage:
 #: the results in docs/research/mintime-teacher-speed-head-2026-09-19.md, so picking a step and
 #: pressing 시작 reproduces that work rather than starting from whatever the CLI defaults are.
 STAGES: Tuple["Stage", ...] = (
-    Stage("imitate", "①", "교사 모방",
-          "레이싱 라인 teacher 를 따라 하도록 가르칩니다 (DAgger). 여기서 나온 student 가 다음 "
+    Stage("imitate", "①", "DAgger",
+          "raceline teacher 를 따라 하도록 student 를 가르칩니다. 여기서 나온 student 가 다음 "
           "단계의 출발점입니다. 보통 가장 오래 걸리고, 한 번만 하면 됩니다.",
           mode="dagger",
           highlights=("name", "tracks", "steps", "teacher_kind", "cond", "init"),
           values={"cond": "dial", "action_mode": "plan", "memory": "off"}),
-    Stage("generalize", "②", "일반화",
-          "student 를 여러 맵에서 강화학습으로 다듬습니다. 처음 보는 맵에서도 도는 정책이 나오지만, "
+    Stage("generalize", "②", "PPO 일반화",
+          "student 를 여러 맵에서 PPO 로 다듬습니다. 처음 보는 맵에서도 도는 정책이 나오지만, "
           "어느 한 맵에서 가장 빠르지는 않습니다.",
           mode="ppo",
           highlights=("name", "init", "tracks", "total", "lr", "cond"),
@@ -147,9 +147,10 @@ STAGES: Tuple["Stage", ...] = (
                   "lr": 3e-4, "lr_end": 1e-4, "kl_coef": 0.05,
                   "race_size": 1, "overtake_bonus": 0.0,
                   "car_proximity_penalty": 0.0, "car_contact_penalty": 0.0}),
-    Stage("specialize", "③", "이 맵에 특화",
+    Stage("specialize", "③", "PPO 맵 특화",
           "맵 하나만 반복해서 그 코스를 외우게 합니다. 가장 빠른 랩은 여기서 나옵니다 — 기록상 "
-          "일반화 정책보다 10 % 빠릅니다. 대신 그 맵 전용이 됩니다. 40 분 정도 걸립니다.",
+          "일반화 정책보다 7~13 % 빠릅니다. 다만 일반화 정책이 이미 그 맵에서 안전하다면 그 여유를 "
+          "속도로 바꾸므로 충돌이 늘 수 있습니다 (연구 노트 §11). 40 분 정도 걸립니다.",
           mode="ppo",
           highlights=("name", "init", "tracks", "total", "collision_penalty",
                       "lap_time_bonus", "dial_margin"),
@@ -1482,14 +1483,14 @@ PPO_CHARTS: Tuple[ChartSpec, ...] = (
 )
 
 DAGGER_CHARTS: Tuple[ChartSpec, ...] = (
-    ChartSpec(("student_coll_per_km", "teacher_coll_per_km"), "충돌 / km · 학생 vs 교사", "/km",
-              ("danger", "text.1"), labels=("학생", "교사"), lower_is_better=True),
-    ChartSpec(("loss",), "증류 손실", "", ("accent",), lower_is_better=True),
-    ChartSpec(("student_lap_s", "teacher_lap_s"), "랩 타임 · 학생 vs 교사", "s",
-              ("warn", "text.1"), labels=("학생", "교사"), lower_is_better=True),
-    ChartSpec(("student_prog_mps", "teacher_prog_mps"), "진행 속도 · 학생 vs 교사", "m/s",
-              ("ok", "text.1"), labels=("학생", "교사")),
-    ChartSpec(("beta",), "beta (교사 주행 비율)", "", ("text.1",)),
+    ChartSpec(("student_coll_per_km", "teacher_coll_per_km"), "충돌 / km · student vs teacher", "/km",
+              ("danger", "text.1"), labels=("student", "teacher"), lower_is_better=True),
+    ChartSpec(("loss",), "모방 손실 (imitation loss)", "", ("accent",), lower_is_better=True),
+    ChartSpec(("student_lap_s", "teacher_lap_s"), "랩 타임 · student vs teacher", "s",
+              ("warn", "text.1"), labels=("student", "teacher"), lower_is_better=True),
+    ChartSpec(("student_prog_mps", "teacher_prog_mps"), "진행 속도 · student vs teacher", "m/s",
+              ("ok", "text.1"), labels=("student", "teacher")),
+    ChartSpec(("beta",), "beta (teacher 주행 비율)", "", ("text.1",)),
 )
 
 GRIP_CHARTS = (ChartSpec(("loss",), "마찰 추정 학습 손실", "", ("accent",), lower_is_better=True),)

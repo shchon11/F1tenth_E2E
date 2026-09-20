@@ -297,26 +297,26 @@ def _cross_validate(kind, a, errors):
     if kind == "ppo":
         adaptive = a["adaptation"] != "off"
         if adaptive:
-            require(a["controller"] == "auto" and bool(a["init"]) and a["memory"] == "gru", "적응 학습에는 auto 제어기, 시작 체크포인트와 GRU가 필요합니다")
-            require(a["cond"] == "none" and a["action_mode"] == "plan" and a["opp_token"] == "off", "적응 학습은 plan 행동과 일반 관측을 사용합니다 (--cond none / --opp-token off)")
-            require(a["init_log_std"] is None, "적응 학습에서는 기존 행동 노이즈를 유지합니다 (--init-log-std 비우기)")
+            require(a["controller"] == "auto" and bool(a["init"]) and a["memory"] == "gru", "controller adaptation 에는 auto 제어기, 시작 checkpoint 와 GRU 가 필요합니다")
+            require(a["cond"] == "none" and a["action_mode"] == "plan" and a["opp_token"] == "off", "controller adaptation 은 plan action 과 일반 관측을 사용합니다 (--cond none / --opp-token off)")
+            require(a["init_log_std"] is None, "controller adaptation 에서는 기존 action noise 를 유지합니다 (--init-log-std 비우기)")
             if race > 0 and a["horizon"] > 0 and a["envs"] >= race:
                 quantum = a["horizon"] * (a["envs"] // race)
-                require(a["total"] == int(a["total"]) and int(a["total"]) % quantum == 0, "적응 학습 전체 스텝은 horizon × 학습 차량 수의 배수여야 합니다")
+                require(a["total"] == int(a["total"]) and int(a["total"]) % quantum == 0, "controller adaptation 의 전체 step 은 horizon × 학습 차량 수의 배수여야 합니다")
         else:
-            require(not a["reference"] and not a["research_estimator"] and a["kl_scope"] is None, "기준 정책·연구용 추정기·KL 범위는 적응 학습 모드에서 설정하세요")
-            require(not ((a["memory"] != "off" or a["scan_channels"]) and a["controller"] != "legacy"), "적응 학습 밖에서 GRU / 추가 채널은 legacy 제어기를 사용합니다")
+            require(not a["reference"] and not a["research_estimator"] and a["kl_scope"] is None, "reference policy · 연구용 estimator · KL scope 는 controller adaptation 모드에서 설정하세요")
+            require(not ((a["memory"] != "off" or a["scan_channels"]) and a["controller"] != "legacy"), "controller adaptation 밖에서 GRU / 추가 channel 은 legacy 제어기를 사용합니다")
         if a["memory"] != "off":
-            require(a["cond"] == "none", "GRU와 마찰 조건 입력을 함께 사용할 수 없습니다")
-            require(a["minibatch"] >= a["horizon"], "GRU 미니배치 크기는 롤아웃 길이 이상이어야 합니다")
+            require(a["cond"] == "none", "GRU 와 friction conditioning 을 함께 사용할 수 없습니다")
+            require(a["minibatch"] >= a["horizon"], "GRU minibatch 크기는 rollout 길이 이상이어야 합니다")
         if a["motion_memory"] or a["aux_opp_mask"] > 0 or a["aux_motion"] > 0:
-            require(a["memory"] == "gru" and a["motion_memory"] and bool(set(a["scan_channels"]) & set(contract["aligned_channels"])), "모션 학습에는 GRU, 모션 메모리, 정렬된 LiDAR 채널이 필요합니다")
+            require(a["memory"] == "gru" and a["motion_memory"] and bool(set(a["scan_channels"]) & set(contract["aligned_channels"])), "motion 학습에는 GRU, motion memory, 정렬된 LiDAR channel 이 필요합니다")
         fraction = a["procedural_obstacles"]
-        require(0 <= fraction <= 1, "절차적 장애물 비율은 0~1입니다")
+        require(0 <= fraction <= 1, "procedural 장애물 비율은 0~1 입니다")
         if fraction:
             require(a["procedural_density"] > 0, "절차적 장애물 밀도는 양수여야 합니다")
         else:
-            require(a["procedural_density"] == 1 and a["procedural_max_props"] == 0 and a["procedural_raceline_margin"] == .25, "장애물 밀도·개수·여유 변경에는 절차적 장애물을 활성화하세요")
+            require(a["procedural_density"] == 1 and a["procedural_max_props"] == 0 and a["procedural_raceline_margin"] == .25, "장애물 밀도·개수·여유 변경에는 procedural 장애물을 활성화하세요")
         if a["opp_token"] != "off":
             require(a["action_mode"] == "plan", "상대차 상태 입력에는 plan 행동이 필요합니다")
         if a["overtake_sustained"] is not None:

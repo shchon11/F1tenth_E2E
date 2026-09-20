@@ -32,7 +32,7 @@
             "--init"
           ],
           "dest": "init",
-          "label": "시작 / 재개 체크포인트",
+          "label": "시작 / 재개 checkpoint",
           "kind": "path",
           "item_kind": "str",
           "default": "",
@@ -52,7 +52,7 @@
             "--envs"
           ],
           "dest": "envs",
-          "label": "병렬 차량 수",
+          "label": "병렬 차량 수 (envs)",
           "kind": "int",
           "item_kind": "int",
           "default": 2048,
@@ -109,7 +109,7 @@
             "--horizon"
           ],
           "dest": "horizon",
-          "label": "롤아웃 길이",
+          "label": "rollout 길이 (horizon)",
           "kind": "int",
           "item_kind": "int",
           "default": 32,
@@ -128,7 +128,7 @@
             "--total"
           ],
           "dest": "total",
-          "label": "전체 학습 환경 스텝",
+          "label": "전체 학습 env step",
           "kind": "float",
           "item_kind": "float",
           "default": 100000000.0,
@@ -147,7 +147,7 @@
             "--epochs"
           ],
           "dest": "epochs",
-          "label": "학습 에포크",
+          "label": "epoch 수",
           "kind": "int",
           "item_kind": "int",
           "default": 3,
@@ -166,7 +166,7 @@
             "--minibatch"
           ],
           "dest": "minibatch",
-          "label": "PPO 미니배치 크기",
+          "label": "PPO minibatch 크기",
           "kind": "int",
           "item_kind": "int",
           "default": 8192,
@@ -185,7 +185,7 @@
             "--lr"
           ],
           "dest": "lr",
-          "label": "시작 학습률",
+          "label": "시작 learning rate",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0003,
@@ -204,7 +204,7 @@
             "--lr-end"
           ],
           "dest": "lr_end",
-          "label": "최종 학습률",
+          "label": "최종 learning rate",
           "kind": "float",
           "item_kind": "float",
           "default": 5e-05,
@@ -223,7 +223,7 @@
             "--gamma"
           ],
           "dest": "gamma",
-          "label": "보상 할인율",
+          "label": "discount γ",
           "kind": "float",
           "item_kind": "float",
           "default": 0.99,
@@ -242,7 +242,7 @@
             "--lam"
           ],
           "dest": "lam",
-          "label": "GAE 계수",
+          "label": "GAE λ",
           "kind": "float",
           "item_kind": "float",
           "default": 0.95,
@@ -261,7 +261,7 @@
             "--clip"
           ],
           "dest": "clip",
-          "label": "PPO 클리핑 폭",
+          "label": "PPO clip ε",
           "kind": "float",
           "item_kind": "float",
           "default": 0.2,
@@ -280,7 +280,7 @@
             "--ent"
           ],
           "dest": "ent",
-          "label": "엔트로피 계수",
+          "label": "entropy 계수",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -299,7 +299,7 @@
             "--vf"
           ],
           "dest": "vf",
-          "label": "가치 손실 계수",
+          "label": "value loss 계수",
           "kind": "float",
           "item_kind": "float",
           "default": 0.5,
@@ -318,7 +318,7 @@
             "--max-grad"
           ],
           "dest": "max_grad",
-          "label": "기울기 최대 노름",
+          "label": "max grad norm",
           "kind": "float",
           "item_kind": "float",
           "default": 0.5,
@@ -337,7 +337,7 @@
             "--sim-backend"
           ],
           "dest": "sim_backend",
-          "label": "시뮬레이션 실행 방식",
+          "label": "시뮬레이터 실행 방식",
           "kind": "choice",
           "item_kind": "str",
           "default": "compile",
@@ -379,7 +379,7 @@
             "--dial-margin"
           ],
           "dest": "dial_margin",
-          "label": "dial margin",
+          "label": "dial margin (학습 중 무작위 하향폭)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.3,
@@ -398,7 +398,7 @@
             "--dial-exact"
           ],
           "dest": "dial_exact",
-          "label": "dial exact",
+          "label": "dial 을 정확히 알려줄 비율",
           "kind": "float",
           "item_kind": "float",
           "default": 0.3,
@@ -417,7 +417,7 @@
             "--grip-budget-penalty"
           ],
           "dest": "grip_budget_penalty",
-          "label": "grip budget penalty",
+          "label": "grip budget penalty (dial 초과)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -436,7 +436,7 @@
             "--raceline-objective"
           ],
           "dest": "raceline_objective",
-          "label": "raceline objective",
+          "label": "raceline 목적함수",
           "kind": "choice",
           "item_kind": "str",
           "default": null,
@@ -458,7 +458,7 @@
             "--teacher-a-lat"
           ],
           "dest": "teacher_a_lat",
-          "label": "teacher a lat",
+          "label": "teacher 횡가속 한계 (m/s²)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -477,7 +477,7 @@
             "--teacher-a-acc"
           ],
           "dest": "teacher_a_acc",
-          "label": "teacher a acc",
+          "label": "teacher 구동가속 한계 (m/s²)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -496,7 +496,7 @@
             "--teacher-a-brake"
           ],
           "dest": "teacher_a_brake",
-          "label": "teacher a brake",
+          "label": "teacher 제동 한계 (m/s²)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -515,7 +515,7 @@
             "--cond"
           ],
           "dest": "cond",
-          "label": "마찰 조건 입력",
+          "label": "friction conditioning (--cond)",
           "kind": "choice",
           "item_kind": "str",
           "default": "none",
@@ -539,7 +539,7 @@
             "--fresh-opt"
           ],
           "dest": "fresh_opt",
-          "label": "새 최적화 상태로 시작",
+          "label": "fresh optimizer 로 시작",
           "kind": "bool",
           "item_kind": "str",
           "default": false,
@@ -558,7 +558,7 @@
             "--adaptation"
           ],
           "dest": "adaptation",
-          "label": "제어기 적응 학습",
+          "label": "controller adaptation",
           "kind": "choice",
           "item_kind": "str",
           "default": "off",
@@ -581,7 +581,7 @@
             "--reference"
           ],
           "dest": "reference",
-          "label": "원본 D3 기준 정책",
+          "label": "원본 D3 reference policy",
           "kind": "path",
           "item_kind": "str",
           "default": "",
@@ -601,7 +601,7 @@
             "--kl-scope"
           ],
           "dest": "kl_scope",
-          "label": "기준 정책 KL 적용 범위",
+          "label": "reference KL 적용 범위",
           "kind": "choice",
           "item_kind": "str",
           "default": null,
@@ -623,7 +623,7 @@
             "--research-estimator"
           ],
           "dest": "research_estimator",
-          "label": "연구용 미승인 추정기 허용",
+          "label": "연구용 미승인 estimator 허용",
           "kind": "bool",
           "item_kind": "str",
           "default": false,
@@ -679,7 +679,7 @@
             "--estimator"
           ],
           "dest": "estimator",
-          "label": "마찰 추정기",
+          "label": "grip estimator",
           "kind": "path",
           "item_kind": "str",
           "default": "",
@@ -699,7 +699,7 @@
             "--critic-priv-adapter"
           ],
           "dest": "critic_priv_adapter",
-          "label": "critic priv adapter",
+          "label": "critic privileged adapter",
           "kind": "str",
           "item_kind": "str",
           "default": "",
@@ -718,7 +718,7 @@
             "--kl-coef"
           ],
           "dest": "kl_coef",
-          "label": "기준 정책 KL 계수",
+          "label": "reference KL 계수",
           "kind": "float",
           "item_kind": "float",
           "default": 0.3,
@@ -737,7 +737,7 @@
             "--kl-decay"
           ],
           "dest": "kl_decay",
-          "label": "KL 감소 스텝",
+          "label": "KL 감소 step",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -756,7 +756,7 @@
             "--cap0"
           ],
           "dest": "cap0",
-          "label": "초기 속도 제한 (m/s)",
+          "label": "초기 speed cap (m/s)",
           "kind": "float",
           "item_kind": "float",
           "default": 4.0,
@@ -775,7 +775,7 @@
             "--cap1"
           ],
           "dest": "cap1",
-          "label": "최종 속도 제한 (m/s)",
+          "label": "최종 speed cap (m/s)",
           "kind": "float",
           "item_kind": "float",
           "default": 8.0,
@@ -794,7 +794,7 @@
             "--cap-steps"
           ],
           "dest": "cap_steps",
-          "label": "속도 제한 증가 스텝",
+          "label": "speed cap 증가 step",
           "kind": "float",
           "item_kind": "float",
           "default": 40000000.0,
@@ -813,7 +813,7 @@
             "--critic-warmup"
           ],
           "dest": "critic_warmup",
-          "label": "가치함수 단독 학습 업데이트",
+          "label": "critic warmup update",
           "kind": "int",
           "item_kind": "int",
           "default": 10,
@@ -889,7 +889,7 @@
             "--save-every"
           ],
           "dest": "save_every",
-          "label": "체크포인트 저장 주기",
+          "label": "checkpoint 저장 주기",
           "kind": "int",
           "item_kind": "int",
           "default": 25,
@@ -908,7 +908,7 @@
             "--seed"
           ],
           "dest": "seed",
-          "label": "난수 시드",
+          "label": "random seed",
           "kind": "int",
           "item_kind": "int",
           "default": 0,
@@ -927,7 +927,7 @@
             "--amp"
           ],
           "dest": "amp",
-          "label": "혼합 정밀도 (bf16)",
+          "label": "mixed precision (bf16)",
           "kind": "bool",
           "item_kind": "str",
           "default": false,
@@ -946,7 +946,7 @@
             "--progress-reward"
           ],
           "dest": "progress_reward",
-          "label": "진행 보상 (m당)",
+          "label": "progress reward (m당)",
           "kind": "float",
           "item_kind": "float",
           "default": 1.0,
@@ -965,7 +965,7 @@
             "--alive-reward"
           ],
           "dest": "alive_reward",
-          "label": "생존 보상 (제어 스텝당)",
+          "label": "alive reward (제어 step당)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -984,7 +984,7 @@
             "--collision-penalty"
           ],
           "dest": "collision_penalty",
-          "label": "벽 충돌 패널티",
+          "label": "벽 충돌 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 10.0,
@@ -1003,7 +1003,7 @@
             "--steer-penalty"
           ],
           "dest": "steer_penalty",
-          "label": "조향 변화 패널티",
+          "label": "조향 변화 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.05,
@@ -1022,7 +1022,7 @@
             "--proximity-penalty"
           ],
           "dest": "proximity_penalty",
-          "label": "벽 근접 패널티",
+          "label": "벽 근접 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.5,
@@ -1060,7 +1060,7 @@
             "--wrong-way-penalty"
           ],
           "dest": "wrong_way_penalty",
-          "label": "역주행 패널티",
+          "label": "역주행 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.2,
@@ -1079,7 +1079,7 @@
             "--collision-speed-penalty"
           ],
           "dest": "collision_speed_penalty",
-          "label": "충돌 속도 패널티",
+          "label": "충돌 속도 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1098,7 +1098,7 @@
             "--cap-gate"
           ],
           "dest": "cap_gate",
-          "label": "속도 증가 충돌 기준",
+          "label": "speed cap 증가 충돌 기준",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1117,7 +1117,7 @@
             "--cap-gate-quantile"
           ],
           "dest": "cap_gate_quantile",
-          "label": "속도 증가 평가 분위수",
+          "label": "speed cap 증가 평가 분위수",
           "kind": "float",
           "item_kind": "float",
           "default": 0.9,
@@ -1136,7 +1136,7 @@
             "--cap-gate-min-km"
           ],
           "dest": "cap_gate_min_km",
-          "label": "속도 증가 최소 평가 거리 (km)",
+          "label": "speed cap 증가 최소 평가 거리 (km)",
           "kind": "float",
           "item_kind": "float",
           "default": 1.0,
@@ -1155,7 +1155,7 @@
             "--proximity-speed-ref"
           ],
           "dest": "proximity_speed_ref",
-          "label": "근접 패널티 속도 기준 (m/s)",
+          "label": "근접 penalty 속도 기준 (m/s)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1174,7 +1174,7 @@
             "--plan-clearance-penalty"
           ],
           "dest": "plan_clearance_penalty",
-          "label": "계획 경로 여유 패널티",
+          "label": "plan 여유 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1193,7 +1193,7 @@
             "--plan-margin"
           ],
           "dest": "plan_margin",
-          "label": "계획 경로 벽 여유 (m)",
+          "label": "plan 벽 여유 (m)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.15,
@@ -1212,7 +1212,7 @@
             "--lap-time-bonus"
           ],
           "dest": "lap_time_bonus",
-          "label": "랩타임 보너스",
+          "label": "랩타임 bonus",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1289,7 +1289,7 @@
             "--steps-base"
           ],
           "dest": "steps_base",
-          "label": "재개 누적 스텝 기준",
+          "label": "재개 누적 step 기준",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -1327,7 +1327,7 @@
             "--overtake-bonus"
           ],
           "dest": "overtake_bonus",
-          "label": "추월 보너스",
+          "label": "추월 bonus",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1365,7 +1365,7 @@
             "--sideslip-penalty"
           ],
           "dest": "sideslip_penalty",
-          "label": "슬립 패널티",
+          "label": "sideslip (슬립각) penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1384,7 +1384,7 @@
             "--aux-opp"
           ],
           "dest": "aux_opp",
-          "label": "aux opp",
+          "label": "aux head · 상대차 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1403,7 +1403,7 @@
             "--aux-grip"
           ],
           "dest": "aux_grip",
-          "label": "aux grip",
+          "label": "aux head · 노면 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1422,7 +1422,7 @@
             "--aux-future"
           ],
           "dest": "aux_future",
-          "label": "aux future",
+          "label": "aux head · 미래 예측 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1441,7 +1441,7 @@
             "--aux-future-k"
           ],
           "dest": "aux_future_k",
-          "label": "aux future k",
+          "label": "aux head · 미래 예측 step 수",
           "kind": "int",
           "item_kind": "int",
           "default": 20,
@@ -1460,7 +1460,7 @@
             "--aux-floor"
           ],
           "dest": "aux_floor",
-          "label": "aux floor",
+          "label": "aux head · 노면 자세 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1479,7 +1479,7 @@
             "--aux-floor-width"
           ],
           "dest": "aux_floor_width",
-          "label": "aux floor width",
+          "label": "aux head · 노면 자세 폭",
           "kind": "int",
           "item_kind": "int",
           "default": 32,
@@ -1498,7 +1498,7 @@
             "--aux-future-width"
           ],
           "dest": "aux_future_width",
-          "label": "aux future width",
+          "label": "aux head · 미래 예측 폭",
           "kind": "int",
           "item_kind": "int",
           "default": 128,
@@ -1517,7 +1517,7 @@
             "--ttc-penalty"
           ],
           "dest": "ttc_penalty",
-          "label": "충돌 예상 시간 패널티",
+          "label": "TTC penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1536,7 +1536,7 @@
             "--ttc-safe"
           ],
           "dest": "ttc_safe",
-          "label": "충돌 예상 시간 기준 (s)",
+          "label": "TTC 기준 (s)",
           "kind": "float",
           "item_kind": "float",
           "default": 1.0,
@@ -1555,7 +1555,7 @@
             "--overtake-sustained"
           ],
           "dest": "overtake_sustained",
-          "label": "선두 유지 거리 · 시간 · 보너스",
+          "label": "선두 유지 거리 · 시간 · bonus",
           "kind": "list",
           "item_kind": "float",
           "default": null,
@@ -1603,7 +1603,7 @@
             "--name-seed-fresh"
           ],
           "dest": "name_seed_fresh",
-          "label": "name seed fresh",
+          "label": "모듈별 이름 기반 재초기화",
           "kind": "bool",
           "item_kind": "str",
           "default": false,
@@ -1622,7 +1622,7 @@
             "--car-proximity-penalty"
           ],
           "dest": "car_proximity_penalty",
-          "label": "상대차 근접 패널티",
+          "label": "상대차 근접 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1641,7 +1641,7 @@
             "--car-contact-penalty"
           ],
           "dest": "car_contact_penalty",
-          "label": "상대차 접촉 패널티",
+          "label": "상대차 접촉 penalty",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1660,7 +1660,7 @@
             "--lap-bonus"
           ],
           "dest": "lap_bonus",
-          "label": "완주 보너스",
+          "label": "완주 bonus",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -1679,7 +1679,7 @@
             "--init-log-std"
           ],
           "dest": "init_log_std",
-          "label": "init log std",
+          "label": "초기 action log_std",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -1698,7 +1698,7 @@
             "--episode-s"
           ],
           "dest": "episode_s",
-          "label": "에피소드 길이 (s)",
+          "label": "episode 길이 (s)",
           "kind": "float",
           "item_kind": "float",
           "default": 40.0,
@@ -1717,7 +1717,7 @@
             "--scan-stack"
           ],
           "dest": "scan_stack",
-          "label": "LiDAR 누적 프레임",
+          "label": "LiDAR 누적 frame",
           "kind": "int",
           "item_kind": "int",
           "default": 3,
@@ -1736,7 +1736,7 @@
             "--scan-stride"
           ],
           "dest": "scan_stride",
-          "label": "LiDAR 프레임 간격",
+          "label": "LiDAR frame 간격",
           "kind": "int",
           "item_kind": "int",
           "default": 1,
@@ -1818,7 +1818,7 @@
             "--mixed-teacher-frac"
           ],
           "dest": "mixed_teacher_frac",
-          "label": "혼합 상대차 Teacher 비율",
+          "label": "혼합 상대차 teacher 비율",
           "kind": "float",
           "item_kind": "float",
           "default": 0.5,
@@ -1860,7 +1860,7 @@
             "--opp-pool"
           ],
           "dest": "opp_pool",
-          "label": "상대 정책 풀",
+          "label": "상대 policy pool",
           "kind": "list",
           "item_kind": "path",
           "default": "",
@@ -1975,7 +1975,7 @@
             "--opp-events"
           ],
           "dest": "opp_events",
-          "label": "상대차 행동 이벤트",
+          "label": "상대차 행동 event",
           "kind": "list",
           "item_kind": "str",
           "default": "",
@@ -1995,7 +1995,7 @@
             "--opp-event-rate"
           ],
           "dest": "opp_event_rate",
-          "label": "상대차 이벤트 빈도 (10s당)",
+          "label": "상대차 event 빈도 (10s당)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -2604,7 +2604,7 @@
             "--action-mode"
           ],
           "dest": "action_mode",
-          "label": "정책 행동 공간",
+          "label": "action space",
           "kind": "choice",
           "item_kind": "str",
           "default": "direct",
@@ -2626,7 +2626,7 @@
             "--memory"
           ],
           "dest": "memory",
-          "label": "정책 메모리",
+          "label": "policy memory",
           "kind": "choice",
           "item_kind": "str",
           "default": "off",
@@ -2648,7 +2648,7 @@
             "--memory-hidden"
           ],
           "dest": "memory_hidden",
-          "label": "정책 GRU 크기",
+          "label": "policy GRU hidden 크기",
           "kind": "int",
           "item_kind": "int",
           "default": 128,
@@ -2667,7 +2667,7 @@
             "--memory-critic"
           ],
           "dest": "memory_critic",
-          "label": "가치함수 메모리",
+          "label": "critic memory",
           "kind": "choice",
           "item_kind": "str",
           "default": "own",
@@ -2689,7 +2689,7 @@
             "--scan-channels"
           ],
           "dest": "scan_channels",
-          "label": "LiDAR 추가 채널",
+          "label": "LiDAR 추가 channel",
           "kind": "list",
           "item_kind": "str",
           "default": "",
@@ -2842,7 +2842,7 @@
             "--motion-memory"
           ],
           "dest": "motion_memory",
-          "label": "motion memory",
+          "label": "motion memory 사용",
           "kind": "bool",
           "item_kind": "str",
           "default": false,
@@ -2861,7 +2861,7 @@
             "--motion-hidden"
           ],
           "dest": "motion_hidden",
-          "label": "motion hidden",
+          "label": "motion GRU hidden 크기",
           "kind": "int",
           "item_kind": "int",
           "default": 64,
@@ -2880,7 +2880,7 @@
             "--motion-channels"
           ],
           "dest": "motion_channels",
-          "label": "motion channels",
+          "label": "motion channel",
           "kind": "int",
           "item_kind": "int",
           "default": 32,
@@ -2899,7 +2899,7 @@
             "--motion-critic"
           ],
           "dest": "motion_critic",
-          "label": "motion critic",
+          "label": "critic 에도 motion 적용",
           "kind": "choice",
           "item_kind": "str",
           "default": "own",
@@ -2921,7 +2921,7 @@
             "--aux-opp-mask"
           ],
           "dest": "aux_opp_mask",
-          "label": "aux opp mask",
+          "label": "aux head · 상대차 mask 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -2940,7 +2940,7 @@
             "--aux-motion"
           ],
           "dest": "aux_motion",
-          "label": "aux motion",
+          "label": "aux head · motion 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -2959,7 +2959,7 @@
             "--scan-memory-tau"
           ],
           "dest": "scan_memory_tau",
-          "label": "스캔 메모리 시간 (s)",
+          "label": "scan memory 시간 (s)",
           "kind": "float",
           "item_kind": "float",
           "default": 2.0,
@@ -2978,7 +2978,7 @@
             "--frontend"
           ],
           "dest": "frontend",
-          "label": "인식 모듈 체크포인트",
+          "label": "frontend checkpoint",
           "kind": "path",
           "item_kind": "str",
           "default": "",
@@ -3040,7 +3040,7 @@
             "--temporal-encoder"
           ],
           "dest": "temporal_encoder",
-          "label": "시간 인코더",
+          "label": "temporal encoder 종류",
           "kind": "choice",
           "item_kind": "str",
           "default": "cnn",
@@ -3062,7 +3062,7 @@
             "--scan-stem"
           ],
           "dest": "scan_stem",
-          "label": "LiDAR 인코더",
+          "label": "LiDAR encoder (scan stem)",
           "kind": "choice",
           "item_kind": "str",
           "default": "resnet",
@@ -3108,7 +3108,7 @@
             "--procedural-obstacles"
           ],
           "dest": "procedural_obstacles",
-          "label": "절차적 장애물 에피소드 비율",
+          "label": "procedural 장애물 episode 비율",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -3165,7 +3165,7 @@
             "--procedural-raceline-margin"
           ],
           "dest": "procedural_raceline_margin",
-          "label": "장애물 레이싱 라인 여유 (m)",
+          "label": "장애물 raceline 여유 (m)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.25,
@@ -3184,7 +3184,7 @@
             "--raceline-margin"
           ],
           "dest": "raceline_margin",
-          "label": "레이싱 라인 경계 여유 (m)",
+          "label": "raceline 경계 여유 (m)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -3203,7 +3203,7 @@
             "--teacher-grip"
           ],
           "dest": "teacher_grip",
-          "label": "Teacher 마찰 정보",
+          "label": "teacher 마찰 정보",
           "kind": "choice",
           "item_kind": "str",
           "default": "true",
@@ -3226,7 +3226,7 @@
             "--teacher-recover-time"
           ],
           "dest": "teacher_recover_time",
-          "label": "Teacher 방향 복구 시간 (s)",
+          "label": "teacher 방향 복구 시간 (s)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -3272,7 +3272,7 @@
             "--envs"
           ],
           "dest": "envs",
-          "label": "병렬 차량 수",
+          "label": "병렬 차량 수 (envs)",
           "kind": "int",
           "item_kind": "int",
           "default": 1024,
@@ -3329,7 +3329,7 @@
             "--steps"
           ],
           "dest": "steps",
-          "label": "수집 스텝",
+          "label": "수집 step",
           "kind": "int",
           "item_kind": "int",
           "default": 250,
@@ -3386,7 +3386,7 @@
             "--epochs"
           ],
           "dest": "epochs",
-          "label": "학습 에포크",
+          "label": "epoch 수",
           "kind": "float",
           "item_kind": "float",
           "default": 3.0,
@@ -3405,7 +3405,7 @@
             "--batch"
           ],
           "dest": "batch",
-          "label": "학습 배치 크기",
+          "label": "batch 크기",
           "kind": "int",
           "item_kind": "int",
           "default": 1024,
@@ -3424,7 +3424,7 @@
             "--lr"
           ],
           "dest": "lr",
-          "label": "시작 학습률",
+          "label": "시작 learning rate",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0003,
@@ -3443,7 +3443,7 @@
             "--beta0"
           ],
           "dest": "beta0",
-          "label": "초기 Teacher 실행 비율",
+          "label": "초기 teacher 실행 비율 (beta)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.6,
@@ -3500,7 +3500,7 @@
             "--action-mode"
           ],
           "dest": "action_mode",
-          "label": "정책 행동 공간",
+          "label": "action space",
           "kind": "choice",
           "item_kind": "str",
           "default": "direct",
@@ -3522,7 +3522,7 @@
             "--teacher-speed"
           ],
           "dest": "teacher_speed",
-          "label": "Teacher 속도 배율",
+          "label": "teacher 속도 배율",
           "kind": "float",
           "item_kind": "float",
           "default": 1.0,
@@ -3560,7 +3560,7 @@
             "--scan-stack"
           ],
           "dest": "scan_stack",
-          "label": "LiDAR 누적 프레임",
+          "label": "LiDAR 누적 frame",
           "kind": "int",
           "item_kind": "int",
           "default": 3,
@@ -3579,7 +3579,7 @@
             "--scan-stride"
           ],
           "dest": "scan_stride",
-          "label": "LiDAR 프레임 간격",
+          "label": "LiDAR frame 간격",
           "kind": "int",
           "item_kind": "int",
           "default": 1,
@@ -3617,7 +3617,7 @@
             "--temporal-encoder"
           ],
           "dest": "temporal_encoder",
-          "label": "시간 인코더",
+          "label": "temporal encoder 종류",
           "kind": "choice",
           "item_kind": "str",
           "default": "cnn",
@@ -3639,7 +3639,7 @@
             "--scan-stem"
           ],
           "dest": "scan_stem",
-          "label": "LiDAR 인코더",
+          "label": "LiDAR encoder (scan stem)",
           "kind": "choice",
           "item_kind": "str",
           "default": "resnet",
@@ -3661,7 +3661,7 @@
             "--raceline-margin"
           ],
           "dest": "raceline_margin",
-          "label": "레이싱 라인 경계 여유 (m)",
+          "label": "raceline 경계 여유 (m)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -3680,7 +3680,7 @@
             "--speed-mode"
           ],
           "dest": "speed_mode",
-          "label": "speed mode",
+          "label": "plan 속도 표현 (speed mode)",
           "kind": "choice",
           "item_kind": "str",
           "default": "linear",
@@ -3703,7 +3703,7 @@
             "--grip-quantile"
           ],
           "dest": "grip_quantile",
-          "label": "grip quantile",
+          "label": "grip pinball τ",
           "kind": "float",
           "item_kind": "float",
           "default": 0.5,
@@ -3722,7 +3722,7 @@
             "--cond"
           ],
           "dest": "cond",
-          "label": "마찰 조건 입력",
+          "label": "friction conditioning (--cond)",
           "kind": "choice",
           "item_kind": "str",
           "default": "none",
@@ -3745,7 +3745,7 @@
             "--dial-margin"
           ],
           "dest": "dial_margin",
-          "label": "dial margin",
+          "label": "dial margin (학습 중 무작위 하향폭)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.3,
@@ -3764,7 +3764,7 @@
             "--dial-exact"
           ],
           "dest": "dial_exact",
-          "label": "dial exact",
+          "label": "dial 을 정확히 알려줄 비율",
           "kind": "float",
           "item_kind": "float",
           "default": 0.3,
@@ -3783,7 +3783,7 @@
             "--aux-grip"
           ],
           "dest": "aux_grip",
-          "label": "aux grip",
+          "label": "aux head · 노면 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -3802,7 +3802,7 @@
             "--aux-opp"
           ],
           "dest": "aux_opp",
-          "label": "aux opp",
+          "label": "aux head · 상대차 가중치",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -3821,7 +3821,7 @@
             "--seq-len"
           ],
           "dest": "seq_len",
-          "label": "seq len",
+          "label": "BPTT 구간 길이 (step)",
           "kind": "int",
           "item_kind": "int",
           "default": 0,
@@ -3840,7 +3840,7 @@
             "--seq-burn"
           ],
           "dest": "seq_burn",
-          "label": "seq burn",
+          "label": "BPTT warm-up step",
           "kind": "int",
           "item_kind": "int",
           "default": 0,
@@ -3859,7 +3859,7 @@
             "--raceline-objective"
           ],
           "dest": "raceline_objective",
-          "label": "raceline objective",
+          "label": "raceline 목적함수",
           "kind": "choice",
           "item_kind": "str",
           "default": null,
@@ -3881,7 +3881,7 @@
             "--teacher-a-lat"
           ],
           "dest": "teacher_a_lat",
-          "label": "teacher a lat",
+          "label": "teacher 횡가속 한계 (m/s²)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -3900,7 +3900,7 @@
             "--teacher-a-acc"
           ],
           "dest": "teacher_a_acc",
-          "label": "teacher a acc",
+          "label": "teacher 구동가속 한계 (m/s²)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -3919,7 +3919,7 @@
             "--teacher-a-brake"
           ],
           "dest": "teacher_a_brake",
-          "label": "teacher a brake",
+          "label": "teacher 제동 한계 (m/s²)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -3938,7 +3938,7 @@
             "--teacher-grip"
           ],
           "dest": "teacher_grip",
-          "label": "Teacher 마찰 정보",
+          "label": "teacher 마찰 정보",
           "kind": "choice",
           "item_kind": "str",
           "default": "true",
@@ -3961,7 +3961,7 @@
             "--teacher-recover-time"
           ],
           "dest": "teacher_recover_time",
-          "label": "Teacher 방향 복구 시간 (s)",
+          "label": "teacher 방향 복구 시간 (s)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -3980,7 +3980,7 @@
             "--teacher"
           ],
           "dest": "teacher_kind",
-          "label": "Teacher 종류",
+          "label": "teacher 종류",
           "kind": "choice",
           "item_kind": "str",
           "default": "raceline",
@@ -4002,7 +4002,7 @@
             "--teacher-horizon"
           ],
           "dest": "teacher_horizon",
-          "label": "Teacher 예측 시간 (s)",
+          "label": "teacher 예측 시간 (s)",
           "kind": "float",
           "item_kind": "float",
           "default": 1.0,
@@ -4021,7 +4021,7 @@
             "--teacher-cand-iters"
           ],
           "dest": "teacher_cand_iters",
-          "label": "Teacher 후보 개선 반복",
+          "label": "teacher 후보 개선 반복",
           "kind": "int",
           "item_kind": "int",
           "default": 2,
@@ -4040,7 +4040,7 @@
             "--teacher-offsets"
           ],
           "dest": "teacher_offsets",
-          "label": "Teacher 횡방향 후보 (m)",
+          "label": "teacher 횡방향 후보 (m)",
           "kind": "list",
           "item_kind": "float",
           "default": "-0.6,-0.3,0,0.3,0.6",
@@ -4060,7 +4060,7 @@
             "--teacher-speeds"
           ],
           "dest": "teacher_speeds",
-          "label": "Teacher 속도 후보 배율",
+          "label": "teacher 속도 후보 배율",
           "kind": "list",
           "item_kind": "float",
           "default": "1,0.8,0.55,0.3",
@@ -4080,7 +4080,7 @@
             "--teacher-cost"
           ],
           "dest": "teacher_cost",
-          "label": "Teacher 비용 가중치 5종",
+          "label": "teacher cost 가중치 5종",
           "kind": "list",
           "item_kind": "float",
           "default": "",
@@ -4170,7 +4170,7 @@
             "--memory"
           ],
           "dest": "memory",
-          "label": "정책 메모리",
+          "label": "policy memory",
           "kind": "choice",
           "item_kind": "str",
           "default": "off",
@@ -4192,7 +4192,7 @@
             "--memory-hidden"
           ],
           "dest": "memory_hidden",
-          "label": "정책 GRU 크기",
+          "label": "policy GRU hidden 크기",
           "kind": "int",
           "item_kind": "int",
           "default": 128,
@@ -4211,7 +4211,7 @@
             "--scan-channels"
           ],
           "dest": "scan_channels",
-          "label": "LiDAR 추가 채널",
+          "label": "LiDAR 추가 channel",
           "kind": "list",
           "item_kind": "str",
           "default": "",
@@ -4231,7 +4231,7 @@
             "--scan-memory-tau"
           ],
           "dest": "scan_memory_tau",
-          "label": "스캔 메모리 시간 (s)",
+          "label": "scan memory 시간 (s)",
           "kind": "float",
           "item_kind": "float",
           "default": 2.0,
@@ -4250,7 +4250,7 @@
             "--speed-loss"
           ],
           "dest": "speed_loss",
-          "label": "속도 모방 손실",
+          "label": "speed imitation loss",
           "kind": "choice",
           "item_kind": "str",
           "default": "symmetric",
@@ -4272,7 +4272,7 @@
             "--chunk-length"
           ],
           "dest": "chunk_length",
-          "label": "GRU 학습 구간 길이",
+          "label": "GRU chunk length",
           "kind": "int",
           "item_kind": "int",
           "default": 16,
@@ -4291,7 +4291,7 @@
             "--init"
           ],
           "dest": "init",
-          "label": "시작 / 재개 체크포인트",
+          "label": "시작 / 재개 checkpoint",
           "kind": "path",
           "item_kind": "str",
           "default": "",
@@ -4311,7 +4311,7 @@
             "--hard-frac"
           ],
           "dest": "hard_frac",
-          "label": "어려운 샘플 비율",
+          "label": "hard sample 비율",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -4330,7 +4330,7 @@
             "--hard-power"
           ],
           "dest": "hard_power",
-          "label": "어려운 샘플 가중 지수",
+          "label": "hard sample 가중 지수",
           "kind": "float",
           "item_kind": "float",
           "default": 1.0,
@@ -4406,7 +4406,7 @@
             "--eval-steps"
           ],
           "dest": "eval_steps",
-          "label": "평가 스텝",
+          "label": "평가 step",
           "kind": "int",
           "item_kind": "int",
           "default": 800,
@@ -4463,7 +4463,7 @@
             "--seed"
           ],
           "dest": "seed",
-          "label": "난수 시드",
+          "label": "random seed",
           "kind": "int",
           "item_kind": "int",
           "default": 0,
@@ -4482,7 +4482,7 @@
             "--eager"
           ],
           "dest": "eager",
-          "label": "컴파일 없이 실행",
+          "label": "컴파일 없이 실행 (eager)",
           "kind": "bool",
           "item_kind": "str",
           "default": false,
@@ -4545,7 +4545,7 @@
             "--mixed-teacher-frac"
           ],
           "dest": "mixed_teacher_frac",
-          "label": "혼합 상대차 Teacher 비율",
+          "label": "혼합 상대차 teacher 비율",
           "kind": "float",
           "item_kind": "float",
           "default": 0.5,
@@ -4587,7 +4587,7 @@
             "--opp-pool"
           ],
           "dest": "opp_pool",
-          "label": "상대 정책 풀",
+          "label": "상대 policy pool",
           "kind": "list",
           "item_kind": "path",
           "default": "",
@@ -4702,7 +4702,7 @@
             "--opp-events"
           ],
           "dest": "opp_events",
-          "label": "상대차 행동 이벤트",
+          "label": "상대차 행동 event",
           "kind": "list",
           "item_kind": "str",
           "default": "",
@@ -4722,7 +4722,7 @@
             "--opp-event-rate"
           ],
           "dest": "opp_event_rate",
-          "label": "상대차 이벤트 빈도 (10s당)",
+          "label": "상대차 event 빈도 (10s당)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.0,
@@ -5358,7 +5358,7 @@
             "--policy"
           ],
           "dest": "policy",
-          "label": "데이터 수집 정책",
+          "label": "데이터 수집 policy",
           "kind": "path",
           "item_kind": "path",
           "default": null,
@@ -5378,7 +5378,7 @@
             "--estimator"
           ],
           "dest": "estimator",
-          "label": "마찰 추정기",
+          "label": "grip estimator",
           "kind": "path",
           "item_kind": "path",
           "default": null,
@@ -5420,7 +5420,7 @@
             "--research-estimator"
           ],
           "dest": "research_estimator",
-          "label": "연구용 미승인 추정기 허용",
+          "label": "연구용 미승인 estimator 허용",
           "kind": "bool",
           "item_kind": "str",
           "default": false,
@@ -5458,7 +5458,7 @@
             "--split-seeds"
           ],
           "dest": "split_seeds",
-          "label": "학습·보정·개발·최종 시드",
+          "label": "학습·보정·개발·최종 seed",
           "kind": "list",
           "item_kind": "int",
           "default": "18101,19101,20101,21101",
@@ -5497,7 +5497,7 @@
             "--envs"
           ],
           "dest": "envs",
-          "label": "병렬 차량 수",
+          "label": "병렬 차량 수 (envs)",
           "kind": "int",
           "item_kind": "int",
           "default": 4,
@@ -5516,7 +5516,7 @@
             "--steps"
           ],
           "dest": "steps",
-          "label": "수집 스텝",
+          "label": "수집 step",
           "kind": "int",
           "item_kind": "int",
           "default": 400,
@@ -5554,7 +5554,7 @@
             "--chunk-steps"
           ],
           "dest": "chunk_steps",
-          "label": "저장 청크 길이",
+          "label": "저장 chunk 길이",
           "kind": "int",
           "item_kind": "int",
           "default": 32,
@@ -5658,7 +5658,7 @@
             "--seed"
           ],
           "dest": "seed",
-          "label": "난수 시드",
+          "label": "random seed",
           "kind": "int",
           "item_kind": "int",
           "default": null,
@@ -5677,7 +5677,7 @@
             "--epochs"
           ],
           "dest": "epochs",
-          "label": "학습 에포크",
+          "label": "epoch 수",
           "kind": "int",
           "item_kind": "int",
           "default": null,
@@ -5696,7 +5696,7 @@
             "--batch-size"
           ],
           "dest": "batch_size",
-          "label": "학습 배치 크기",
+          "label": "batch 크기",
           "kind": "int",
           "item_kind": "int",
           "default": 128,
@@ -5715,7 +5715,7 @@
             "--hidden"
           ],
           "dest": "hidden",
-          "label": "추정기 GRU 크기",
+          "label": "estimator GRU hidden 크기",
           "kind": "int",
           "item_kind": "int",
           "default": 64,
@@ -5734,7 +5734,7 @@
             "--learning-rate"
           ],
           "dest": "learning_rate",
-          "label": "학습률",
+          "label": "learning rate (추정기)",
           "kind": "float",
           "item_kind": "float",
           "default": 0.002,
@@ -5753,7 +5753,7 @@
             "--init-estimator"
           ],
           "dest": "init_estimator",
-          "label": "초기 마찰 추정기 (학습 이어받기)",
+          "label": "초기 grip estimator (이어받기)",
           "kind": "path",
           "item_kind": "path",
           "default": null,
@@ -5773,7 +5773,7 @@
             "--replay-data"
           ],
           "dest": "replay_data",
-          "label": "제어된 TRAIN 재생 데이터",
+          "label": "TRAIN replay 데이터",
           "kind": "path",
           "item_kind": "path",
           "default": null,
@@ -5793,7 +5793,7 @@
             "--replay-fraction"
           ],
           "dest": "replay_fraction",
-          "label": "학습 배치의 재생 데이터 비율",
+          "label": "학습 batch 의 replay 비율",
           "kind": "float",
           "item_kind": "float",
           "default": 0.5,
@@ -5839,7 +5839,7 @@
             "--candidate"
           ],
           "dest": "candidate",
-          "label": "평가할 추정기",
+          "label": "평가할 estimator",
           "kind": "path",
           "item_kind": "path",
           "default": null,
@@ -5906,7 +5906,7 @@
             "--train-episodes"
           ],
           "dest": "train_episodes",
-          "label": "학습 에피소드 수",
+          "label": "학습 episode 수",
           "kind": "int",
           "item_kind": "int",
           "default": 128,
@@ -5925,7 +5925,7 @@
             "--cal-episodes"
           ],
           "dest": "cal_episodes",
-          "label": "보정 에피소드 수",
+          "label": "보정 episode 수",
           "kind": "int",
           "item_kind": "int",
           "default": 32,
@@ -5944,7 +5944,7 @@
             "--test-episodes"
           ],
           "dest": "test_episodes",
-          "label": "평가 에피소드 수",
+          "label": "평가 episode 수",
           "kind": "int",
           "item_kind": "int",
           "default": 32,
@@ -5963,7 +5963,7 @@
             "--steps"
           ],
           "dest": "steps",
-          "label": "수집 스텝",
+          "label": "수집 step",
           "kind": "int",
           "item_kind": "int",
           "default": 200,
@@ -5982,7 +5982,7 @@
             "--epochs"
           ],
           "dest": "epochs",
-          "label": "학습 에포크",
+          "label": "epoch 수",
           "kind": "int",
           "item_kind": "int",
           "default": 10,

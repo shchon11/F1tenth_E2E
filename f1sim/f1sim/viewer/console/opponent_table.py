@@ -20,7 +20,7 @@ Three details worth stating, because each was a choice:
 * **The teacher is a selection, and a kind the tree does not have is listed and disabled.** The
   combo offers `raceline` (the teacher this viewer has always run) and `interactive`
   (`f1sim.interactive_teacher`, which scores its plans against where the other cars are predicted to
-  be) side by side, with 기본 and 업그레이드 티처 as the two presets, so choosing the upgraded
+  be) side by side, with 기본 and 업그레이드 teacher as the two presets, so choosing the upgraded
   teacher is one click and choosing it is what it takes. A kind whose module is missing is still in
   the combo, greyed, with the reason in its tooltip: leaving it out would make "there is no such
   thing" and "it has not merged yet" look the same.
@@ -66,7 +66,7 @@ COLUMN_HELP = {
     "kind": "이 차를 누가 모는지. 병합 전인 종류는 회색으로 남고 이유가 툴팁에 있습니다.",
     "checkpoint": "정책 체크포인트 경로. 툴팁에 제어기 arm 과 메모리 종류가 나옵니다.",
     "speed": "속도 배율 하한–상한. 같으면 고정, 다르면 리셋마다 그 범위에서 뽑습니다.",
-    "grip": "티처의 속도 프로파일이 가정하는 마찰. 티처 종류에만 적용됩니다.",
+    "grip": "teacher 의 속도 프로파일이 가정하는 마찰. teacher 종류에만 적용됩니다.",
     "cap": "이 차만의 속도 상한 [m/s]. 0 이면 세션 상한을 그대로 씁니다.",
     "events": "제동 / 정지 / 차선 변경 / 지그재그 — 이 차가 받을 수 있는 타이머 이벤트.",
     "rate": "이 차가 10초당 받는 타이머 이벤트 수.",
@@ -208,8 +208,8 @@ class SlotRow(QtCore.QObject):
             self.grip.addItem(osl.GRIP_LABEL_SHORT[g], g)
             self.grip.setItemData(self.grip.count() - 1, osl.GRIP_LABEL_TEXT[g],
                                   QtCore.Qt.ToolTipRole)
-        self.grip.setToolTip("티처의 속도 프로파일이 어떤 마찰을 가정하는지. 참값은 특권 정보(privileged)라 "
-                             "학생이 볼 수 없는 값에 라벨이 의존합니다.")
+        self.grip.setToolTip("teacher 의 속도 프로파일이 어떤 마찰을 가정하는지. 참값은 특권 정보(privileged)라 "
+                             "student 가 볼 수 없는 값에 라벨이 의존합니다.")
 
         self.cap = _spin(0.0, 12.0, 0.0, 0.5, 1, 74, " m/s")
         self.cap.setSpecialValueText("없음")
