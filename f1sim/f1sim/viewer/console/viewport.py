@@ -324,6 +324,26 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             f"font-size: {theme.SIZE['hint']}px;")
         self._corner.setVisible(False)
 
+        # A transient line over the scene, the way CARLA's manual_control HUD answers a keypress:
+        # the click happens here, so the confirmation belongs here too. The status bar at the
+        # bottom of the window is three panels away from where the eye is and says the same thing
+        # to nobody. It fades rather than closing, so a screenshot taken a second later is clean.
+        self._toast = QtWidgets.QLabel(self)
+        self._toast.setVisible(False)
+        self._toast.setAlignment(QtCore.Qt.AlignCenter)
+        #: Faded by restyling, not by a QGraphicsOpacityEffect. An effect renders its widget
+        #: through an offscreen pixmap, and this one is a child of a QOpenGLWidget, where that path
+        #: is exactly where child widgets composite badly. The chips above are plain stylesheet
+        #: labels on this same widget and they are known to draw correctly, so this is one too.
+        self._toast_colour = C["text.0"]
+        self._toast_alpha = 1.0
+        self._toast_timer = QtCore.QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._toast_fade_out)
+        self._toast_fade = QtCore.QTimer(self)
+        self._toast_fade.setInterval(40)
+        self._toast_fade.timeout.connect(self._toast_step)
+
         # One pacer. `frameSwapped` fires after the buffer swap, so with vsync on this schedules the
         # next frame exactly when the display is ready for it; the cap timer only bites if the
         # driver or compositor ignored vsync, which would otherwise spin a core for nothing.
@@ -635,6 +655,48 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             self._corner.setText(text)
             self._corner.adjustSize()
             self._place_overlays()
+
+    def notify(self, text: str, kind: str = "info", seconds: float = 2.6):
+        """Say something over the scene for a moment. `kind` is info / good / warn / danger.
+
+        For things that just happened and need no answer -- the dial was applied, recording
+        started, the session reset. Anything the user must act on stays in the status bar, where
+        it does not vanish.
+        """
+        if not text:
+            return
+        self._toast_colour = {"info": C["text.0"], "good": C["ok"],
+                              "warn": C["warn"], "danger": C["danger"]}.get(kind, C["text.0"])
+        self._toast.setText(text)
+        self._toast_fade.stop()
+        self._toast_alpha = 1.0
+        self._restyle_toast()
+        self._toast.adjustSize()
+        self._toast.setVisible(True)
+        self._place_overlays()
+        self._toast_timer.start(int(max(0.4, seconds) * 1000))
+
+    def _restyle_toast(self):
+        a = max(0.0, min(1.0, self._toast_alpha))
+        r, g, b = (int(self._toast_colour[i:i + 2], 16) for i in (1, 3, 5))
+        pct = f"{100 * a:.0f}%"
+        self._toast.setStyleSheet(
+            f"color: rgba({r},{g},{b},{pct}); background: rgba(18,19,22,{88 * a:.0f}%);"
+            f"border: 1px solid rgba(255,255,255,{12 * a:.0f}%);"
+            f"border-left: 3px solid rgba({r},{g},{b},{pct});"
+            f"border-radius: 4px; padding: 7px 14px; font-size: {theme.SIZE['label']}px;")
+
+    def _toast_fade_out(self):
+        self._toast_fade.start()
+
+    def _toast_step(self):
+        self._toast_alpha -= 0.09                    # ~450 ms at the 40 ms interval
+        if self._toast_alpha <= 0.02:
+            self._toast_fade.stop()
+            self._toast_alpha = 0.0
+            self._toast.setVisible(False)
+            return
+        self._restyle_toast()
 
     def set_empty_text(self, html: str):
         self._empty.setText(html)
@@ -1098,6 +1160,10 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         if self._corner.isVisible():
             self._corner.adjustSize()
             self._corner.move(m, m)
+        if self._toast.isVisible():
+            self._toast.adjustSize()
+            self._toast.move(max(m, (self.width() - self._toast.width()) // 2),
+                             max(m, self.height() - self._toast.height() - 3 * m))
 
     def draw_percentiles(self):
         """(p50, p95, max) ms spent inside paintGL, or None."""
