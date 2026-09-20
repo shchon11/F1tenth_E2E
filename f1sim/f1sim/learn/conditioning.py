@@ -34,7 +34,16 @@ MU_OFFSET = 1.0
 MU_SCALE = 0.25
 
 #: How `c` is filled at rollout time.
-SOURCES = ("zero", "true_mu")
+#:
+#: "dial" (2026-09-20) is the deployable one. Friction cannot be read from the car's sensors at a pace
+#: it survives (GRU probe R^2 0.01-0.02 on held-out envs, see the 2026-09-19 research note), but a
+#: student that is *told* it uses all of it -- so the number is supplied, not inferred. A dial
+#: checkpoint is trained with `c = mu - margin` (margin >= 0, drawn per episode) **and with teacher
+#: labels built for that same number**, so `c` is a command -- "use this much grip" -- that is in
+#: distribution on any floor with at least that much. It is never privileged at run time: an operator
+#: or a supervisor sets it. Setting it above the floor's real friction is out of distribution and
+#: measured to be dangerous (1 -> 13 collisions/km), which is why it is approached from below.
+SOURCES = ("zero", "true_mu", "dial")
 
 #: What a conditional checkpoint claims about itself.
 KIND_MU = "current_mu"
@@ -125,7 +134,31 @@ def make_condition(source: str, spec: CondSpec, priv: torch.Tensor, mu_index: in
         return torch.zeros(priv.shape[0], spec.dim, device=priv.device, dtype=priv.dtype)
     if source == "true_mu":
         return mu_to_c(priv[:, mu_index], spec).to(priv.dtype)
+    if source == "dial":
+        raise ValueError("a 'dial' condition is set by the caller (an operator, a supervisor, or the "
+                         "trainer's margin draw), never derived from the privileged vector")
     raise ValueError(f"unknown cond source {source!r}")
+
+
+class DialDraw:
+    """The number a dial student is told, per env and per episode: the floor's friction minus a margin.
+
+    `p_exact` of the episodes get no margin (the dial set exactly right, which is where the pace is);
+    the rest get U(0, margin). Held for the whole episode, because a dial does not flicker. The
+    teacher is asked to drive for this same number (`env.teacher_label(teacher, mu=...)`), so what
+    the student learns is obedience to the dial, not a guess at what lies above it."""
+
+    def __init__(self, env, margin: float, p_exact: float, floor: float = 0.55):
+        self.env, self.margin, self.p_exact, self.floor = env, float(margin), float(p_exact), float(floor)
+        self.m = torch.zeros(env.B, device=env.device)
+
+    def redraw(self, ids_mask: torch.Tensor) -> None:
+        u = torch.rand(self.env.B, device=self.env.device)
+        m = torch.where(torch.rand_like(u) < self.p_exact, torch.zeros_like(u), u * self.margin)
+        self.m = torch.where(ids_mask, m, self.m)
+
+    def value(self) -> torch.Tensor:
+        return (self.env.sim.P["mu"].reshape(-1) - self.m).clamp_min(self.floor)
 
 
 # ---------------------------------------------------------------- critic input adapter

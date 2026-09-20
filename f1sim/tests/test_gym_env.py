@@ -45,3 +45,26 @@ def test_teacher_in_env_gets_positive_return():
     assert collided <= 3, collided
     assert finished >= 10, finished
     assert total.mean() > 20, total.mean()
+
+
+def test_grip_budget_charges_only_for_lateral_acceleration_beyond_the_dial():
+    # The budget is what makes a policy's grip dial a command under RL. Off by default, a separate
+    # reward component, and zero for a car that stays inside what it was given.
+    import torch
+    from f1sim import maps
+    from f1sim.gym_env import EnvConfig, F1VecEnv, REWARD_COMPONENT_KEYS
+    from f1sim.params import Config
+    cfg = Config(); cfg.sim.compile = False
+    env = F1VecEnv([maps.load("real:map12x16")], cfg, EnvConfig(reward_grip_budget=2.0), num_envs=4, device="cpu")
+    env.reset()
+    k = REWARD_COMPONENT_KEYS.index("grip_budget")
+    a = torch.tensor([[0.8, 0.5]]).repeat(4, 1)                      # steer hard at speed
+    env.set_grip_budget(torch.tensor([5.0, 5.0, 0.05, 0.05]))        # generous for two cars, almost nothing for two
+    worst = torch.zeros(4)
+    for _ in range(60):
+        _, _, _, _, info = env.step(a)
+        worst = torch.minimum(worst, info["reward_components"]["grip_budget"])
+    assert (worst[:2] == 0).all() and (worst[2:] < 0).all()
+    env.set_grip_budget(None)
+    _, _, _, _, info = env.step(a)
+    assert (info["reward_components"]["grip_budget"] == 0).all()

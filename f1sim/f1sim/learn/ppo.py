@@ -179,7 +179,20 @@ def main():
                          "only; nothing about the default changes.")
     ap.add_argument("--wandb-group", default="ppo",
                     help="W&B group. The pilot's arms share one so they can be read together.")
-    ap.add_argument("--cond", default="none", choices=("none", "zero", "true_mu"),
+    ap.add_argument("--dial-margin", type=float, default=0.30,
+                    help="--cond dial: the dial is the floor's friction minus a per-episode margin in [0, this]")
+    ap.add_argument("--dial-exact", type=float, default=0.30, help="--cond dial: share of episodes with no margin")
+    ap.add_argument("--grip-budget-penalty", type=float, default=0.0,
+                    help="--cond dial: per second, per (m/s^2)^2 of lateral acceleration beyond what the dial allows. "
+                         "This is what makes the dial a command under RL. A dial is a lower bound on the floor's grip, so "
+                         "return alone teaches the policy to drive faster than it was told; with the budget charged, what "
+                         "is optimised is the lap *inside* the dial")
+    ap.add_argument("--raceline-objective", choices=["min_curvature", "min_time"], default=None,
+                    help="line behind the lap-time reference and the teacher-driven opponents (default min_curvature)")
+    ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of that line's speed profile (default 6)")
+    ap.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] drive limit (default 6)")
+    ap.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] braking limit (default 3)")
+    ap.add_argument("--cond", default="none", choices=("none", "zero", "true_mu", "dial"),
                     help="Stage-1 friction conditioning arm. 'none' is the unmodified policy; 'zero' "
                          "(A0) and 'true_mu' (A1) both add the zero-initialised conditioning "
                          "projection and differ only in what is fed to it. 'true_mu' is a LAB "
@@ -393,8 +406,15 @@ def main():
         raise SystemExit("--overtake-bonus needs --race-size > 1: with no opponent there is nothing to pass.")
     need_rl = opp_cfg.needs_racelines(a) or a.lap_time_bonus > 0
     print(f"loading {len(names)} tracks{' + racelines' if need_rl else ''} ...", flush=True)
-    tracks, rls = common.load_tracks(names, racelines=need_rl,
-                                     **({} if a.raceline_margin is None else {"margin": a.raceline_margin}))
+    limits = common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake)
+    rl_kw = dict(limits)
+    if a.raceline_margin is not None:
+        rl_kw["margin"] = a.raceline_margin
+    if a.raceline_objective is not None:
+        rl_kw["objective"] = a.raceline_objective
+    if a.grip_budget_penalty > 0 and a.cond != "dial":
+        raise SystemExit("--grip-budget-penalty charges for exceeding the dial; without --cond dial there is no dial")
+    tracks, rls = common.load_tracks(names, racelines=need_rl, **rl_kw)
     # One switch sets both halves of the runtime. They are alternatives, not layers: `compile` and
     # `graphs` both end in a CUDA graph, and leaving `compile_tracker` True while asking for explicit
     # graphs would compile the solver anyway and make the choice a half-measure.
@@ -415,6 +435,7 @@ def main():
                                                               reward_car_contact=a.car_contact_penalty,
                                                               reward_car_proximity=a.car_proximity_penalty,
                                                               reward_sideslip=a.sideslip_penalty,
+                                                              reward_grip_budget=a.grip_budget_penalty,
                                                               car_safe_gap=a.car_safe_gap,
                                                               max_steps=int(a.episode_s * 40),
                                                               scan_stack=a.scan_stack, scan_stride=a.scan_stride, hist_len=a.hist_len,
@@ -430,7 +451,7 @@ def main():
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,
-                          teacher_recover_time=a.teacher_recover_time)
+                          teacher_recover_time=a.teacher_recover_time, teacher_limits=limits)
     print(f"sim backend: {a.sim_backend} (cfg.sim.compile={sim_cfg.sim.compile}, "
           f"compile_tracker={_env_compile_tracker})")
     print(f"opponents: {opp_cfg.describe(a)}", flush=True)
@@ -462,7 +483,12 @@ def main():
     obs, info = env.reset(seed=a.seed)
     # After the seeded reset: the histories must start from the observations this run actually saw.
     controller.begin(obs)
-    priv = env.privileged(env.last_result); priv_dim = priv.shape[1]
+    priv = env.privileged(env.last_result); env_priv_dim = priv.shape[1]
+    # A dial run's critic is told the dial: the return of an episode depends on how much grip the car
+    # was allowed, and a critic that sees the floor but not the dial has to explain that as noise.
+    # Appended AFTER the env's columns, so `priv_mu_index` and the opponent block stay where they are.
+    critic_cond = (a.cond == "dial")
+    priv_dim = env_priv_dim + (1 if critic_cond else 0)
     lid = env.learner_ids                                   # races with teacher opponents: only the learners' data is used
     # Stage-1 conditioning. Both arms carry the same projection; only `--cond` differs.
     cond_spec = cond_mod.CondSpec() if a.cond == "none" else cond_mod.spec_for(a.cond)
@@ -472,11 +498,14 @@ def main():
     # match it; without one it is the env's, as before.
     critic_priv_dim = priv_dim
     if priv_adapter == cond_mod.ADAPTER_ABSENT_OPPONENT:
+        if critic_cond:
+            raise SystemExit("--critic-priv-adapter and --cond dial both reshape the critic's input; not combined")
         if priv_dim != 17:
             raise SystemExit(f"--critic-priv-adapter {priv_adapter} expects a solo env (priv 17), got {priv_dim}")
         critic_priv_dim = 21
         print(f"critic privileged adapter: {priv_adapter} (env {priv_dim} -> critic {critic_priv_dim}, "
               f"opponent slots zeroed); raw privileged storage and priv_mu_index={env.priv_mu_index} unchanged")
+    init_conditional = False
     #: The memory / extra-channel configuration this run builds, in the form the model records.
     mem_cfg = memory_spec(kind=a.memory, hidden_size=a.memory_hidden,
                           critic=a.memory_critic) if a.memory != "off" else None
@@ -494,6 +523,20 @@ def main():
                       "act_dim": env.act_dim})
         print(f"init from {a.init} with memory {mem_cfg} channels {chan_cfg} | "
               f"{len(fresh)} fresh tensor(s), all zero-projected: {fresh[:4]}")
+        a.scan_deltas = bool(model.meta.get("scan_deltas", False))
+        a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
+        a.scan_stem = str(model.meta.get("scan_stem", "plain"))
+    elif a.init and cond_dim and int(torch.load(a.init, map_location="cpu")["meta"].get("cond_dim", 0)):
+        # The checkpoint is already conditional (a dial student out of DAgger): it arrives obeying its
+        # input, and that obedience is what the KL leash below holds on to. Nothing is migrated.
+        model, extra = load_checkpoint(a.init, device, override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
+                                                                  "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim, "act_dim": env.act_dim},
+                                       allow_conditional=True, priv_adapter=priv_adapter)
+        src = (model.meta.get("cond") or {}).get("source")
+        if src != a.cond:
+            raise SystemExit(f"--init was trained as a '{src}' conditional checkpoint; this run is --cond {a.cond}")
+        init_conditional = True
+        print(f"init from {a.init} (already conditional: {cond_spec.describe()}) | re-initialized: {extra.get('skipped') or 'nothing'}")
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
@@ -539,8 +582,12 @@ def main():
     # the plan default applies to a fresh actor only. Applied on every --init it silently undoes the
     # annealing each resume, and a resume that more than doubles the exploration noise crashes every
     # episode for the next ~40 updates before it claws back to where the checkpoint already was
+    # ... and to a DAgger checkpoint, which is a fresh actor as far as exploration goes: imitation
+    # never touches `log_std`, so it arrives at its constructor value (std 0.50 in a plan space whose
+    # curvature knots tolerate a tenth of that) and the first updates are spent crashing.
+    from_dagger = bool(a.init) and (extra.get("phase") == "dagger")
     init_log_std = a.init_log_std if a.init_log_std is not None else (
-        -1.8 if (a.action_mode == "plan" and not a.init) else None)
+        -1.8 if (a.action_mode == "plan" and (not a.init or from_dagger)) else None)
     if init_log_std is not None:
         with torch.no_grad(): model.actor.log_std.fill_(init_log_std)
         print(f"actor log_std reset to {init_log_std} (std {math.exp(init_log_std):.3f})")
@@ -558,7 +605,7 @@ def main():
         # this copy was taken -- i.e. before any update.
         raise RuntimeError("the KL reference actor was captured after the memory projection had "
                            "trained; it must be the frozen feedforward baseline")
-    if cond_dim and float(ref.cond.weight.abs().max()) != 0.0:
+    if cond_dim and not init_conditional and float(ref.cond.weight.abs().max()) != 0.0:
         # RuntimeError, not assert: `python -O` strips asserts, and this one is the only thing
         # standing between the two arms and a KL leash that moved with the conditioning.
         raise RuntimeError("the KL reference actor was captured after the conditioning projection "
@@ -566,8 +613,11 @@ def main():
     #: What this run was, recorded in every checkpoint it writes so a result traces back to its arm,
     #: its normalization and its adapter without consulting a shell history.
     experiment_meta = {
-        "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
-        "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
+        "stage": "dial" if a.cond == "dial" else "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
+        "dial": ({"margin": float(a.dial_margin), "exact": float(a.dial_exact), "grip_budget_penalty": float(a.grip_budget_penalty),
+                  "critic_sees_dial": True} if a.cond == "dial" else None),
+        "raceline": {"objective": a.raceline_objective or "min_curvature", **limits},
+        "critic_priv_adapter": priv_adapter, "env_priv_dim": int(env_priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
         "fresh_optimizer": bool(a.fresh_opt), "aux_grip": float(a.aux_grip), "aux_opp": float(a.aux_opp),
         "lab_oracle": bool(cond_spec.lab_oracle), "init": a.init, "seed": int(a.seed),
@@ -691,6 +741,25 @@ def main():
         print(f"recurrent PPO: truncated BPTT over {T} steps, minibatches of {env_chunk} env "
               f"chunk(s) = {env_chunk * T} samples, hidden reset on term|trunc per env")
 
+    dial = cond_mod.DialDraw(env, a.dial_margin, a.dial_exact) if a.cond == "dial" else None
+    dial_new = torch.ones(env.B, dtype=torch.bool, device=device)     # rows whose episode just began: their dial is due a draw
+
+    def condition_now():
+        """(c for the policy, privileged vector for the critic) for the observation in hand.
+
+        For a dial run this is also where the dial is drawn -- once per episode, at its first
+        observation -- and where the env is told the budget it charges for. Called exactly once per
+        observation, including the bootstrap one: the mask is consumed, so a second call is a no-op."""
+        if dial is None:
+            c = cond_mod.make_condition(a.cond, cond_spec, priv, env.priv_mu_index) if cond_dim else None
+            return c, priv
+        dial.redraw(dial_new); dial_new.zero_()
+        d = dial.value()
+        if a.grip_budget_penalty > 0:
+            env.set_grip_budget(d)
+        c = cond_mod.mu_to_c(d, cond_spec).to(priv.dtype)
+        return c, torch.cat([priv, c], 1)
+
     steps_done = 0; update = 0; t_start = time.time(); last_log = {}; last_ctrl = {}; cap = a.cap0
     t_loop = 0.0; t_loop0 = time.time()        # wall time of the last whole update, for --yield-to-viewer
                                                # (t_upd below is the optimiser's own timing, for the log)
@@ -752,8 +821,7 @@ def main():
                     scan = roll_aug(scan)                  # the extra channels, advanced one step
                 # Frozen here, from the privileged vector belonging to THIS observation, before the
                 # step advances the env or a reset re-draws `mu`.
-                cond_t = (cond_mod.make_condition(a.cond, cond_spec, priv, env.priv_mu_index)
-                          if cond_dim else None)
+                cond_t, priv_c = condition_now()
                 # Pre-action, and before the policy is asked for anything: the friction this step's
                 # plan will be tracked under has to be in the MPC before the plan exists.
                 # The truth handed over here is for B3's safety metrics only and is read from the
@@ -764,11 +832,11 @@ def main():
                 controller.pre_action(obs)
                 with ac:
                     act, logp, h_actor_next = sample_rollout_action(model, scan, pro, cond_t, h_actor)
-                    val, h_critic_next = model.critic.step(scan[lid], pro[lid], priv[lid],
+                    val, h_critic_next = model.critic.step(scan[lid], pro[lid], priv_c[lid],
                                                            None if h_critic is None else h_critic[:, lid])
                     val = val.float()
                 act, logp = act.float(), logp.float()
-                buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
+                buf_scan[t] = scan[lid].half(); buf_pro[t] = pro[lid]; buf_priv[t] = priv_c[lid]; buf_act[t] = act[lid]; buf_logp[t] = logp[lid]; buf_val[t] = val
                 if cond_dim:
                     buf_cond[t] = cond_t[lid].float()
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
@@ -788,6 +856,7 @@ def main():
                 # and the episode boundaries recorded, before anything else advances the env.
                 controller.post_step(term, trunc)
                 priv = env.privileged(env.last_result)
+                dial_new |= (term | trunc)                 # the next observation of these rows opens a new episode
                 buf_rew[t] = rew[lid]; buf_done[t] = term[lid].float(); buf_trunc[t] = trunc[lid].float()
                 if "on_policy" in info:
                     buf_mask[t] = info["on_policy"][lid].float()
@@ -802,9 +871,11 @@ def main():
                         # acted on, so advancing the occupancy memory for it would leave the next
                         # episode carrying a step it did not take.
                         final_scan = roll_aug.preview(final_scan, f["ids"])
+                    final_priv = info["final_priv"] if not critic_cond else torch.cat(
+                        [info["final_priv"], cond_t[f["ids"]].to(info["final_priv"].dtype)], 1)   # the dial the episode ENDED under
                     with ac:
                         final_val = model.critic.step(
-                            final_scan, final_pro, info["final_priv"],
+                            final_scan, final_pro, final_priv,
                             None if h_critic is None else h_critic[:, f["ids"]])[0].float()
                     all_final_val = torch.zeros(env.B, device=device)
                     all_final_val[f["ids"]] = final_val
@@ -836,8 +907,9 @@ def main():
                 # The bootstrap value of the state the next chunk starts from: previewed, because
                 # the next chunk's first step advances the channels itself.
                 scan = roll_aug.preview(scan)
+            _c_boot, priv_boot = condition_now()           # draws the dial of any episode that opened on the last step
             with ac:
-                buf_val[T] = model.critic.step(scan[lid], pro[lid], priv[lid],
+                buf_val[T] = model.critic.step(scan[lid], pro[lid], priv_boot[lid],
                                                None if h_critic is None else h_critic[:, lid])[0].float()
             adv = compute_gae(buf_rew, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, a.lam)
             ret = adv + buf_val[:T]

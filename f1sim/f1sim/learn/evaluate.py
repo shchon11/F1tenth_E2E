@@ -25,7 +25,6 @@ from ..params import Config
 from . import common
 from . import grip_runtime
 from .evaluation_metrics import TrialAccumulator
-from .memory import policy_fn as memory_policy_fn
 from .model import load_checkpoint
 
 
@@ -59,6 +58,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
+             raceline_objective: str | None = None, teacher_limits: dict | None = None,
+             speed_mode: str | None = None, dial_offset: float = 0.0,
              opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
              controller: str = "legacy", estimator: str = "") -> dict:
@@ -80,11 +81,15 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     torch.manual_seed(seed)
     np.random.seed(seed)
     rl_kw = {} if raceline_margin is None else {"margin": raceline_margin}
+    limits = dict(teacher_limits or {})                # a_lat / a_acc / a_brake: the line is optimised for the
+    rl_kw.update(limits)                               # same profile the teacher then drives on it
+    if raceline_objective is not None:
+        rl_kw["objective"] = raceline_objective
     trs, rls = common.load_tracks(tracks, racelines=teacher or (race_size > 1 and opponent == "teacher"), **rl_kw)
     model = None
     metadata = {}
     if not teacher:
-        model, metadata = load_checkpoint(ckpt, device)
+        model, metadata = load_checkpoint(ckpt, device, allow_conditional=True)   # the env can produce a lab oracle's input
         model.eval()
     mode = "plan" if (model is not None and model.meta.get("act_dim", 2) >= 5) or (teacher and action_mode == "plan") else "direct"
     spec = metadata.get("spec", {})
@@ -97,7 +102,11 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     if events and not opp_event_rate > 0:
         raise ValueError(f"opponent events {list(events)} at rate {opp_event_rate}: the rate is "
                          f"events per opponent per 10 s, so at 0 nothing ever fires.")
+    # A checkpoint says which speed dimensions it was trained to emit; the flag is for the teacher.
+    speed_mode = speed_mode or metadata.get("speed_mode", "linear")
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
+                     speed_mode=speed_mode if mode == "plan" else "linear",
+                     plan_a_brake=float(metadata.get("plan_a_brake", limits.get("a_brake", 3.0))),
                      race_size=race_size, opponent=opponent,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
                      scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
@@ -114,14 +123,17 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     ctrl = grip_runtime.ControllerRuntime(env, controller, estimator or None, device=device)
     ctrl.install()
     if teacher:
-        teacher_policy = common.make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time)
+        teacher_policy = common.make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time, **limits)
         def policy(obs):
             return env.teacher_label(teacher_policy)
     else:
         # Carries the hidden state and any extra scan channel between steps, and exposes `.reset`
         # so both protocols below can clear them at an episode boundary. For a feedforward
         # checkpoint it is `model.act` with nothing else happening.
-        policy = memory_policy_fn(model, env.B, device=device, deterministic=True)
+        # A dial student is scored with its dial set `dial_offset` away from the floor's true friction:
+        # 0 is "set exactly right" (the reference), negative is the safe side an operator would err on.
+        dial = None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))
+        policy = common.student_policy(model, env, device, dial=dial)
     from .benchmark.overtake import TrafficMeter
     meter = TrafficMeter(env, contention_range_m=contention_range_m,
                          attack_range_m=attack_range_m, vehicle_length=(cfg or Config()).vehicle.length)
@@ -178,6 +190,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'protocol': protocol, 'tracks': list(tracks), 'seed': seed,
         'seeds': {'numpy': seed, 'torch': seed, 'simulator': seed, 'reset': seed if protocol == 'trials' else None},
         'checkpoint': str(ckpt), 'teacher': teacher, 'deterministic_policy': True,
+        'raceline_objective': raceline_objective or 'min_curvature', 'teacher_limits': limits,
+        'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset),
         'action_mode': mode, 'device': str(device), 'steps': steps, 'step_dt': env.sim.control_dt,
         'time_budget_s': steps * env.sim.control_dt, 'envs': envs,
         'race_size': race_size, 'opponent': opponent, 'learners': int(env.learner.sum()),
@@ -264,6 +278,21 @@ def main() -> None:
                     help="[s] >0: cap the teacher's commanded speed at what can still be steered back onto the lane "
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
+    ap.add_argument("--raceline-objective", choices=["min_curvature", "min_time"], default=None,
+                    help="line the teacher follows: 'min_time' refines the minimum-curvature line by descending "
+                         "the lap time of the speed profile at the --teacher-a-* limits (default: min_curvature)")
+    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots"], default=None,
+                    help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). Default: the checkpoint's "
+                         "own, or 'linear' for the teacher")
+    ap.add_argument("--dial-offset", type=float, default=0.0,
+                    help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
+                         "right; -0.15 is an operator erring on the safe side)")
+    ap.add_argument("--teacher-a-lat", type=float, default=None,
+                    help="[m/s^2] lateral limit of the teacher's speed profile at nominal grip (default 6.0; the car "
+                         "measured 9.2-11.5, the simulator's front axle gives out at ~9.5)")
+    ap.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] drive limit of the profile (default 6.0)")
+    ap.add_argument("--teacher-a-brake", type=float, default=None,
+                    help="[m/s^2] braking limit of the profile (default 3.0; the regen limit gives 5.0 nominal here)")
     ap.add_argument("--output", type=Path, help="write the complete strict JSON report")
     ap.add_argument("--eager", action="store_true", help="disable simulator compilation (CPU smoke tests)")
     a = ap.parse_args()
@@ -300,6 +329,8 @@ def main() -> None:
                         budget_laps=a.budget_laps if a.budget_laps > 0 else None, max_steps=a.max_steps,
                         raceline_margin=a.raceline_margin, teacher_grip=a.teacher_grip,
                         teacher_recover_time=a.teacher_recover_time,
+                        raceline_objective=a.raceline_objective, speed_mode=a.speed_mode, dial_offset=a.dial_offset,
+                        teacher_limits=common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake),
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
