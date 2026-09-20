@@ -184,6 +184,15 @@ class SlotRow(QtCore.QObject):
             else:
                 self.kind.setItemData(i, 0, QtCore.Qt.UserRole - 1)      # not selectable
                 self.kind.setItemData(i, k.unavailable_message(), QtCore.Qt.ToolTipRole)
+        # ... and the named mixes, as choices of their own. "One of several drivers, redrawn per
+        # race" is a thing a slot can be, and writing it by hand meant writing `--opp-slots` JSON.
+        for name, text, names, note in osl.KIND_MIXES:
+            ok = all(osl.kind_of(n).available for n in names)
+            self.kind.addItem(text if ok else f"{text} [일부 미병합]", f"mix:{name}")
+            i = self.kind.count() - 1
+            self.kind.setItemData(i, note, QtCore.Qt.ToolTipRole)
+            if not ok:
+                self.kind.setItemData(i, 0, QtCore.Qt.UserRole - 1)
         self.kind.currentIndexChanged.connect(self._on_kind)
 
         self.ckpt = QtWidgets.QPushButton("—")
@@ -262,9 +271,22 @@ class SlotRow(QtCore.QObject):
         if not self.table._loading:
             self.changed.emit()
 
+    def _chosen(self):
+        """(the DriverKind this row shows settings for, the mix it stands for or ()).
+
+        A mix has no single kind, so the settings are driven by its first member -- every member
+        is a teacher, so `teacher` is true for all of them and the grip label and the events apply
+        to whichever is drawn.
+        """
+        data = str(self.kind.currentData() or "raceline")
+        if data.startswith("mix:"):
+            names = osl.MIX_BY_NAME[data[4:]][2]
+            return osl.kind_of(names[0]), names
+        return osl.kind_of(data), ()
+
     def _on_kind(self, *_a):
         """Grey out what this kind cannot carry, rather than accepting it and ignoring it."""
-        kind = osl.kind_of(self.kind.currentData() or "raceline")
+        kind, _mix = self._chosen()
         self.ckpt.setEnabled(kind.checkpoint)
         self.grip.setEnabled(kind.teacher)
         for cb in self.events.values():
@@ -296,7 +318,7 @@ class SlotRow(QtCore.QObject):
 
     def checkpoint_problem(self) -> str:
         """The loader's reason this file cannot drive a car here, or "" when it can."""
-        kind = osl.kind_of(self.kind.currentData() or "raceline")
+        kind, _mix = self._chosen()
         if not kind.checkpoint:
             return ""
         if not self._ckpt_path:
@@ -307,11 +329,13 @@ class SlotRow(QtCore.QObject):
         return ""
 
     def slot(self) -> osl.OpponentSlot:
-        kind = osl.kind_of(self.kind.currentData() or "raceline")
+        kind, mix = self._chosen()
         lo, hi = float(self.lo.value()), float(self.hi.value())
         d = {"kind": kind.name,
              "speed_scale": (lo if abs(hi - lo) < 1e-9 else [lo, min(hi, max(lo, hi))]),
              "spawn": str(self.spawn.currentData() or "ahead")}
+        if mix:
+            d["kind_mix"] = list(mix)
         if kind.checkpoint and self._ckpt_path:
             d["checkpoint"] = self._ckpt_path
             d["controller"] = self._ckpt_arm
@@ -330,7 +354,14 @@ class SlotRow(QtCore.QObject):
         return osl.OpponentSlot.from_dict(d)
 
     def set_slot(self, s: osl.OpponentSlot):
-        i = self.kind.findData(s.kind)
+        # A mix round trips to its own entry when it is one this console offers; a hand-written one
+        # that is not falls back to its first kind rather than being silently dropped.
+        want = s.kind
+        if s.kind_mix:
+            named = next((n for n, _t, names, _o in osl.KIND_MIXES
+                          if tuple(names) == tuple(s.kind_mix)), None)
+            want = f"mix:{named}" if named else s.kind_mix[0]
+        i = self.kind.findData(want)
         if i >= 0:
             self.kind.setCurrentIndex(i)
         self.set_checkpoint(s.checkpoint or "")

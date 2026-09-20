@@ -165,6 +165,26 @@ KINDS: Tuple[DriverKind, ...] = (
                "학습 중인 정책의 현재 가중치 (self-play).", policy=True),
 )
 
+#: Mixes the console offers as a single choice, so "one of several drivers, redrawn per race" is
+#: one click rather than hand-written JSON. Kept here and not in the widget because the trainer
+#: parses the same `kind_mix` and the two must mean the same thing.
+#:
+#: `planners` is the 2026-09-21 recipe: every driver that plans around the other car, and none
+#: that only follows a line. That is also exactly the set
+#: `EnvConfig.procedural_raceline_corridor = "off"` allows, because all four can see a prop.
+KIND_MIXES = (
+    ("planners", "혼합 · 플래너 4종 (매 레이스 무작위)",
+     ("forzaeth", "forzaeth_pred", "lane_switch", "interactive"),
+     "레이스가 리셋될 때마다 ForzaETH spliner / predictive spliner / lane-switch / interactive "
+     "중 하나를 뽑습니다. 라인만 지키는 상대에만 맞춰지는 것을 막고, 네 종류 모두 prop 을 볼 수 "
+     "있어 레이싱 라인 위 장애물과 함께 쓸 수 있습니다."),
+    ("all_teachers", "혼합 · teacher 전부 (raceline 포함)",
+     ("raceline", "forzaeth", "forzaeth_pred", "lane_switch", "interactive"),
+     "위에 raceline 티처까지 더합니다. 기존 학습과 같은 상대도 섞이지만, raceline 은 prop 을 "
+     "보지 못하므로 레이싱 라인 위 장애물과는 함께 쓸 수 없습니다."),
+)
+MIX_BY_NAME = {m[0]: m for m in KIND_MIXES}
+
 KIND_NAMES = tuple(k.name for k in KINDS)
 KIND_BY_NAME = {k.name: k for k in KINDS}
 

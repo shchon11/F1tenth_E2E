@@ -165,7 +165,9 @@ def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--opp-slots", default="", metavar="JSON|@FILE",
                     help="per-opponent configuration: a JSON array with one object per car of a "
                          "race (race_size - 1 of them), or @path/to/slots.json. Each object may "
-                         f"carry kind ({'|'.join(opp_sl.KIND_NAMES)}), checkpoint, controller, "
+                         f"carry kind ({'|'.join(opp_sl.KIND_NAMES)}), kind_mix (several teacher "
+                         f"kinds, one drawn per race reset -- how one run sees every driver "
+                         f"instead of one), checkpoint, controller, "
                          f"speed_scale (a number or [lo, hi]), label_grip "
                          f"({'|'.join(opp_sl.GRIP_LABELS)}), speed_cap [m/s], events "
                          f"({','.join(opp_ev.EVENT_NAMES)}), event_rate, reactive "

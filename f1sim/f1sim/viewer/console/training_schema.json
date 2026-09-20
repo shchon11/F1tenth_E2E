@@ -2593,7 +2593,7 @@
           "choices": null,
           "required": false,
           "group": "teacher·상대차",
-          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|policy|self), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
+          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|forzaeth|forzaeth_pred|lane_switch|policy|self), kind_mix (several teacher kinds, one drawn per race reset -- how one run sees every driver instead of one), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
           "action": "store",
           "nullable": false,
           "metavar": "JSON|@FILE"
@@ -3174,6 +3174,47 @@
           "required": false,
           "group": "환경",
           "help": "[m] kept clear either side of the raceline, beyond the car's half-width, so the teacher opponents are never routed through a prop",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--procedural-raceline-corridor",
+          "flags": [
+            "--procedural-raceline-corridor"
+          ],
+          "dest": "procedural_raceline_corridor",
+          "label": "raceline 위 장애물 허용 (corridor off)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "on",
+          "nargs": null,
+          "choices": [
+            "on",
+            "off"
+          ],
+          "required": false,
+          "group": "환경",
+          "help": "whether that corridor is enforced at all. 'off' lets a layout stand ON the racing line, which is the only way the policy ever meets an obstacle there -- and it does not today. Requires --spawn-runway and every teacher-driven car to be a prop-aware kind (--opp-slots), because a raceline-driven opponent cannot see a prop and its crashes would become the collision rate",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--spawn-runway",
+          "flags": [
+            "--spawn-runway"
+          ],
+          "dest": "spawn_runway",
+          "label": "spawn 활주로 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] of clear road every spawning car is guaranteed ahead of it, prop or wall. 0 = off. A car is placed at up to the spawn speed and cannot stop inside v^2/2a plus its own length, so a crate nearer than that is a collision it was never given the chance to avoid -- and it lands in the collision rate, making the metric read worse the more interesting the layout is. About 3 m for the default spawn speed",
           "action": "store",
           "nullable": false,
           "metavar": "M"
@@ -5320,7 +5361,7 @@
           "choices": null,
           "required": false,
           "group": "teacher·상대차",
-          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|policy|self), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
+          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|forzaeth|forzaeth_pred|lane_switch|policy|self), kind_mix (several teacher kinds, one drawn per race reset -- how one run sees every driver instead of one), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
           "action": "store",
           "nullable": false,
           "metavar": "JSON|@FILE"
@@ -6094,6 +6135,7 @@
     },
     "slot_fields": [
       "kind",
+      "kind_mix",
       "checkpoint",
       "controller",
       "speed_scale",
@@ -6113,6 +6155,21 @@
       },
       {
         "name": "interactive",
+        "teacher": true,
+        "checkpoint": false
+      },
+      {
+        "name": "forzaeth",
+        "teacher": true,
+        "checkpoint": false
+      },
+      {
+        "name": "forzaeth_pred",
+        "teacher": true,
+        "checkpoint": false
+      },
+      {
+        "name": "lane_switch",
         "teacher": true,
         "checkpoint": false
       },

@@ -77,6 +77,8 @@ LABELS = {
     "floor_att": "노면 자세 입력", "opp_token": "상대차 상태 입력", "opp_future_model": "상대차 미래 예측",
     "procedural_obstacles": "procedural 장애물 episode 비율", "procedural_density": "장애물 밀도 (10m당)",
     "procedural_max_props": "장애물 최대 개수", "procedural_raceline_margin": "장애물 raceline 여유 (m)",
+    "procedural_raceline_corridor": "raceline 위 장애물 허용 (corridor off)",
+    "spawn_runway": "spawn 활주로 (m)",
     "raceline_margin": "raceline 경계 여유 (m)", "teacher_grip": "teacher 마찰 정보",
     "teacher_recover_time": "teacher 방향 복구 시간 (s)", "teacher_kind": "teacher 종류",
     "teacher_speed": "teacher 속도 배율", "teacher_horizon": "teacher 예측 시간 (s)",
