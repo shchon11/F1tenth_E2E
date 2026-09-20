@@ -15,10 +15,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..gym_env import EnvConfig
+#: How close an opponent has to be for the auxiliary head to be scored on it [m]. The same range
+#: `ppo.AUX_OPP_RANGE_M` uses, and for the same measured reason: beyond a few metres an opponent is
+#: often occluded or covered by too few beams to read an offset from, so scoring the head out there
+#: mostly teaches it the conditional mean of an empty road.
+AUX_OPP_RANGE_M = 6.0
+
+from ..gym_env import EnvConfig, PRIV_OPP_DIST_SCALE
 from ..mpc import N_KNOTS
 from . import common
 from . import conditioning as cond_mod
+from . import opponent_config as opp_cfg
 from .model import ActorCritic, save_checkpoint
 from .obs import PROPRIO_KEYS, flatten_obs
 
@@ -28,9 +35,9 @@ class StepBuffer:
 
     def __init__(self, k: int, stride: int = 1):
         self.k, self.stride = k, stride
-        self.scan, self.pro, self.lab, self.newep, self.gap, self.cond, self.mu = [], [], [], [], [], [], []
+        self.scan, self.pro, self.lab, self.newep, self.gap, self.cond, self.mu, self.opp = [], [], [], [], [], [], [], []
 
-    def add(self, scan_now, proprio, label, new_episode, gap=None, cond=None, mu=None):
+    def add(self, scan_now, proprio, label, new_episode, gap=None, cond=None, mu=None, opp=None):
         self.scan.append(scan_now.to(torch.float16).cpu()); self.pro.append(proprio.to(torch.float16).cpu())   # a 1 s proprio history is 322 floats/sample
         self.lab.append(label.cpu()); self.newep.append(new_episode.cpu())
         self.gap.append((torch.zeros(label.shape[0]) if gap is None else gap.detach().float().cpu()))
@@ -38,19 +45,24 @@ class StepBuffer:
             self.cond.append(cond.detach().float().cpu())
         if mu is not None:
             self.mu.append(mu.detach().float().cpu())
+        if opp is not None:
+            self.opp.append(opp.detach().float().cpu())
 
     def finalize(self):
         self.S = torch.stack(self.scan); self.P = torch.stack(self.pro); self.L = torch.stack(self.lab); self.N = torch.stack(self.newep)
         self.G = torch.stack(self.gap)                     # |student - teacher| at collection time
         self.C = torch.stack(self.cond) if self.cond else None      # (T,B,D) what the student was conditioned on
         self.M = torch.stack(self.mu) if self.mu else None          # (T,B) normalised friction, the auxiliary target
+        self.O = torch.stack(self.opp) if self.opp else None        # (T,B,4) nearest opponent + whether it is in range
         self.T, self.B = self.S.shape[:2]
-        self.scan, self.pro, self.lab, self.newep, self.gap, self.cond, self.mu = [], [], [], [], [], [], []
+        self.scan, self.pro, self.lab, self.newep, self.gap, self.cond, self.mu, self.opp = [], [], [], [], [], [], [], []
         return self
 
     def extras_at(self, t, b, device):
-        """(conditioning, friction target) for the same rows `samples_at` returns; None where not stored."""
-        return (None if self.C is None else self.C[t, b].to(device), None if self.M is None else self.M[t, b].to(device))
+        """(conditioning, friction target, opponent target) for the rows `samples_at` returns."""
+        return (None if self.C is None else self.C[t, b].to(device),
+                None if self.M is None else self.M[t, b].to(device),
+                None if self.O is None else self.O[t, b].to(device))
 
     def __len__(self):
         return self.T * self.B
@@ -108,11 +120,35 @@ def friction_target(env) -> torch.Tensor:
     return (env.sim.P["mu"].reshape(-1) - cond_mod.MU_OFFSET) / cond_mod.MU_SCALE
 
 
+def opponent_target(env) -> torch.Tensor:
+    """(B,4): the nearest opponent's (ahead, side, closing speed) on the scale the actor's head
+    predicts, and 1 where one is close enough to be scored on.
+
+    A dynamic car is not a labelled input -- the student sees LiDAR returns and nothing else -- so
+    "there is a car there and it is moving like this" has to be read out of how the returns shift
+    between frames. The teacher cannot demonstrate that (it never looks at an opponent), but the
+    simulator knows it, which makes it a dense supervised target where the action is not one.
+    """
+    priv = env.privileged(env.last_result)
+    if env.M <= 1 or priv.shape[1] < 12:
+        return torch.zeros(priv.shape[0], 4, device=priv.device)
+    o = priv[:, 8:11] / torch.tensor([3.0, 1.0, 2.0], device=priv.device)
+    near = (priv[:, 11] * PRIV_OPP_DIST_SCALE < AUX_OPP_RANGE_M).to(priv.dtype)
+    return torch.cat([o, near[:, None]], 1)
+
+
 def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0, need_gap=False, cond_fn=None,
             dial: "cond_mod.DialDraw | None" = None):
     obs, info = env.reset()
     new_ep = torch.ones(env.B, dtype=torch.bool, device=device)
     h = model.initial_hidden(env.B, device)                # None for a feedforward student
+    # In a race only the learner's rows are the student's own experience: the opponents are driven
+    # by the env (`_opponent_actions`) from a teacher, a pool checkpoint or a scripted behaviour, so
+    # their observations carry actions the student did not produce. The policy is still *asked* for
+    # every row -- the env overrides the ones it drives itself -- but only these are stored.
+    lid = env.learner_ids
+    solo = int(lid.numel()) == int(env.B)
+    keep = (lambda x: x) if solo else (lambda x: x[lid])
     with torch.no_grad():
         for t in range(steps):
             scan, pro = flatten_obs(obs)
@@ -123,17 +159,21 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
                 h = h.reset(new_ep)
             c = None if cond_fn is None else cond_fn()
             mu_t = friction_target(env)
+            opp_t = opponent_target(env)
             if beta >= 1.0:
                 # iteration 0 drives the teacher; query the student anyway when the gap is needed
                 gap = None
                 if need_gap:
                     a_s, _, h = model.act(scan, pro, deterministic=True, c=c, h=h)
-                    gap = (a_s - label).abs().mean(1)
-                buf.add(scan[:, 0], pro, label, new_ep, gap, c, mu_t)
+                    gap = keep((a_s - label).abs().mean(1))
+                buf.add(keep(scan[:, 0]), keep(pro), keep(label), keep(new_ep), gap,
+                        None if c is None else keep(c), keep(mu_t), keep(opp_t))
                 a = label
             else:
                 a_student, _, h = model.act(scan, pro, deterministic=True, c=c, h=h)
-                buf.add(scan[:, 0], pro, label, new_ep, (a_student - label).abs().mean(1), c, mu_t)
+                buf.add(keep(scan[:, 0]), keep(pro), keep(label), keep(new_ep),
+                        keep((a_student - label).abs().mean(1)),
+                        None if c is None else keep(c), keep(mu_t), keep(opp_t))
                 if noise > 0:
                     a_student = (a_student + noise * torch.randn_like(a_student)).clamp(-1, 1)
                 use_t = torch.rand(env.B, device=device) < beta
@@ -162,26 +202,27 @@ def imitation_loss(mu, lab, quantile_dim: int = -1, tau: float = 0.5):
 
 
 def sequence_means(model, scan, pro, keep, burn: int = 0, cond=None):
-    """(action means, friction predictions) over a (L, m) block with the recurrence walked step by step
+    """(action means, friction predictions, opponent predictions) over a (L, m) block with the recurrence walked step by step
     from a zero state. The stem runs once for the whole block (as `ActorCritic.evaluate_sequence`
     does); the first `burn` steps only warm the state up and are left out."""
     L, m = scan.shape[:2]
     x, p = model.actor.embed(scan.reshape(L * m, *scan.shape[2:]), pro.reshape(L * m, -1))
     x = x.view(L, m, -1); p = p.view(L, m, -1)
     ha = model.actor.initial_hidden(m, x.device, x.dtype)
-    out, grip = [], []
+    out, grip, opp = [], [], []
     for t in range(L):
         if ha is not None:
             ha = ha * keep[t].to(x.dtype)[None, :, None]
         f, ha = model.actor.head(x[t], None if cond is None else cond[t], ha)
         if t >= burn:
             out.append(torch.tanh(model.actor.mu(f))); grip.append(model.actor.grip(torch.cat([f, p[t]], 1))[:, 0])
-    return torch.cat(out, 0), torch.cat(grip, 0)
+            opp.append(model.actor.opp(f))
+    return torch.cat(out, 0), torch.cat(grip, 0), torch.cat(opp, 0)
 
 
 def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float = 0.0, hard_power: float = 1.0,
                  log_every: int = 25, seq_len: int = 0, seq_burn: int = 0, quantile_dim: int = -1, tau: float = 0.5,
-                 aux_grip: float = 0.0):
+                 aux_grip: float = 0.0, aux_opp: float = 0.0):
     n_total = sum(len(b) for b in bufs)
     steps = max(1, int(epochs * n_total / batch))
     buffer_weights = torch.tensor([len(b) for b in bufs], dtype=torch.float)
@@ -193,15 +234,16 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
             L = min(seq_len, b.T); burn = min(seq_burn, L - 1)
             m = max(1, batch // (L - burn))
             scan, pro, lab, keep = b.sample_sequences(m, L, device)
-            c, fric = b.extras_at(*b.last_index, device)
+            c, fric, opp_t = b.extras_at(*b.last_index, device)
             c = None if c is None else c.view(L, m, -1)
-            mu, grip = sequence_means(model, scan, pro, keep, burn, c)
+            mu, grip, opp = sequence_means(model, scan, pro, keep, burn, c)
             lab = lab[burn:].reshape(-1, lab.shape[-1])
             fric = None if fric is None else fric.view(L, m)[burn:].reshape(-1)
+            opp_t = None if opp_t is None else opp_t.view(L, m, -1)[burn:].reshape(-1, opp_t.shape[-1])
         else:
             scan, pro, lab = b.sample(batch, device, hard_frac, hard_power)
-            c, fric = b.extras_at(*b.last_index, device)
-            mu, grip, _ = model.actor.forward_all(scan, pro, c)
+            c, fric, opp_t = b.extras_at(*b.last_index, device)
+            mu, grip, opp = model.actor.forward_all(scan, pro, c)
         loss = imitation_loss(mu, lab, quantile_dim, tau)
         if aux_grip > 0:
             # The friction the labels were built from, asked of the same features the action comes
@@ -209,11 +251,19 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
             # that only falls when the representation actually holds it.
             aux = F.smooth_l1_loss(grip, fric, beta=0.25)
             loss = loss + aux_grip * aux
+        if aux_opp > 0 and opp_t is not None:
+            # Where the nearest car is and how fast it is closing, from the same features the action
+            # comes from. The teacher cannot show this -- it never looks at an opponent -- so it is a
+            # target rather than a label, and it is scored only where a car is close enough to read.
+            near = opp_t[:, 3:4]
+            aux_o = (((opp - opp_t[:, :3]) ** 2).mean(1, keepdim=True) * near).sum() / near.sum().clamp_min(1.0)
+            loss = loss + aux_opp * aux_o
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.actor.parameters(), 1.0); opt.step()
         losses.append(loss.item())
         if i % log_every == 0:
             log({"dagger/loss": float(np.mean(losses[-log_every:])), "dagger/train_step": i, "dagger/lr": opt.param_groups[0]["lr"],
-                 **({"dagger/aux_grip": float(aux.detach())} if aux_grip > 0 else {})})
+                 **({"dagger/aux_grip": float(aux.detach())} if aux_grip > 0 else {}),
+                 **({"dagger/aux_opp": float(aux_o.detach())} if (aux_opp > 0 and opp_t is not None) else {})})
     return float(np.mean(losses[-500:]))
 
 
@@ -256,6 +306,11 @@ def main():
     ap.add_argument("--aux-grip", type=float, default=0.0,
                     help="weight of an auxiliary loss asking the actor's grip head for the env's friction, from the "
                          "same features the action is read from")
+    ap.add_argument("--aux-opp", type=float, default=0.0,
+                    help="weight of an auxiliary loss asking the actor's opponent head where the nearest car is and "
+                         "how fast it is closing. Needs --race-size > 1. The teacher never looks at an opponent, so "
+                         "it cannot demonstrate a pass or a yield -- but 'a car is there and it moves like this' is "
+                         "read out of how the LiDAR returns shift, and the simulator knows the answer")
     ap.add_argument("--memory", choices=["none", "gru"], default="none", help="recurrent student (learn/memory.py)")
     ap.add_argument("--memory-hidden", type=int, default=128)
     ap.add_argument("--seq-len", type=int, default=0,
@@ -284,6 +339,7 @@ def main():
     ap.add_argument("--keep-iters", type=int, default=5, help="aggregate the data of at most this many recent iterations (host RAM)")
     ap.add_argument("--log-every", type=int, default=25, help="training steps between W&B loss rows (was 200)")
     ap.add_argument("--eval-steps", type=int, default=800); ap.add_argument("--wandb", default="online")
+    opp_cfg.add_arguments(ap)              # --race-size / --opponent / --opp-* : the group PPO shares
     a = ap.parse_args()
     device = torch.device(a.device)
     names = common.track_names(a.tracks)
@@ -300,9 +356,18 @@ def main():
     if a.seq_len > 0 and a.hard_frac > 0:
         ap.error("--hard-frac re-weights single samples and --seq-len draws whole runs; pick one")
     plan_a_brake = limits.get("a_brake", 3.0)             # the envelope's backward pass brakes like the teacher's profile
+    if a.envs % max(1, a.race_size):
+        ap.error(f"--envs {a.envs} is not a multiple of --race-size {a.race_size}")
+    if a.aux_opp > 0 and a.race_size < 2:
+        ap.error("--aux-opp needs --race-size > 1: with no opponent there is nothing for the head to find")
     env = common.make_env(tracks, a.envs, device, EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
                                                              scan_stack=a.scan_stack, scan_stride=a.scan_stride,
-                                                             speed_mode=a.speed_mode, plan_a_brake=plan_a_brake))
+                                                             speed_mode=a.speed_mode, plan_a_brake=plan_a_brake,
+                                                             # every race / opponent / behaviour / spawn field
+                                                             **opp_cfg.env_kwargs(a)),
+                          rls=rls, teacher_limits=limits, teacher_grip=a.teacher_grip,
+                          teacher_recover_time=a.teacher_recover_time)
+    print(f"opponents: {opp_cfg.describe(a)}", flush=True)
     teacher = common.make_teacher(rls, env, grip=a.teacher_grip, recover_time=a.teacher_recover_time, **limits); teacher.speed_scale = a.teacher_speed
     spec = common.obs_spec(env)
     priv_dim = env.privileged(env.reset()[1] and env.last_result).shape[1]
@@ -333,7 +398,7 @@ def main():
         bufs.append(buf); bufs = bufs[-a.keep_iters:]; t_col = tm.lap()        # host RAM: keep the last few iterations (14 GB laptop)
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log, a.hard_frac, a.hard_power, a.log_every,
                             seq_len=a.seq_len, seq_burn=a.seq_burn, quantile_dim=quantile_dim, tau=a.grip_quantile,
-                            aux_grip=a.aux_grip); t_tr = tm.lap()
+                            aux_grip=a.aux_grip, aux_opp=a.aux_opp); t_tr = tm.lap()
         m = common.rollout_metrics(env, common.student_policy(model, env, device), a.eval_steps, a.speed_cap, per_track=True); t_ev = tm.lap()
         if teacher_metrics is None:
             teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps, a.speed_cap,
@@ -351,6 +416,7 @@ def main():
                 "cap": a.speed_cap,          # the viewer defaults to the cap the policy was trained at
                 "samples": sum(len(b) for b in bufs), "metrics": m, "teacher": teacher_metrics, "action_mode": a.action_mode,
                 "speed_mode": a.speed_mode, "plan_a_brake": plan_a_brake, "teacher_limits": limits,
+                "race_size": a.race_size, "opponent": a.opponent, "aux_opp": a.aux_opp,
                 "raceline_objective": a.raceline_objective or "min_curvature"}
         save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, meta)
         save_checkpoint(os.path.join(out, "student_latest.pt"), model, meta)

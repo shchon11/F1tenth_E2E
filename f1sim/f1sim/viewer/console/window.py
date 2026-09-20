@@ -998,6 +998,25 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.ckpt_info.set("저장", f"{format_age(age)} 전" if age is not None else "—")
         self.ckpt_info.set("진행", info.get("progress", "—"))
         self.ckpt_info.set("저장 시점 지표", info.get("metrics", "—"))
+        # The controller arm follows the checkpoint. `fixed_low` is the deployment default for a
+        # policy that was never told the friction -- the retraining-free clamp that took suite v1
+        # from 110 to 136 solo completions. A *dial* policy already slows itself for the floor it is
+        # told about, and putting the clamp on top of it was measured worse on all three frictions
+        # (research note §7), so it opens on `legacy` instead and the hint says why.
+        source = str(info.get("cond_source") or "")
+        arm = str(info.get("controller_arm") or "legacy")
+        want = arm if arm != "legacy" else ("legacy" if source == "dial" else None)
+        if want is not None:
+            i = self.combo_controller.findText(want)
+            if i >= 0:
+                self.combo_controller.setCurrentIndex(i)
+        self.row_dial_hint = source
+        if source == "dial":
+            self.ckpt_info.set("그립 다이얼", "받습니다 — 구성 > 그립 다이얼에서 조절")
+            self.run_note.setText("그립 다이얼 정책입니다. 제어기는 legacy 로 두세요: 정책이 이미 노면에 맞춰 "
+                                  "속도를 내므로 클램프를 겹치면 세 노면 모두에서 더 나빴습니다.")
+        elif source:
+            self.ckpt_info.set("그립 다이얼", f"조건 입력 '{source}' (다이얼 아님)")
         cap = info.get("speed_cap")
         if cap:
             self.spin_cap.setValue(float(cap))

@@ -145,6 +145,12 @@ about 5.1 GB **device-wide** (that reading includes other processes on the card)
 RTX 4060 Ti. Treat it as one data point, not a budget — memory scales with `--envs`, the number of
 distinct tracks held on the GPU, and `--scan-stack`. Measure before committing to a size.
 
+**Which card.** Two NVIDIA GPUs here: CUDA index 0 is the RTX 4070 SUPER and index 1 the RTX 5060
+Laptop (`nvidia-smi` numbers them the other way round; the third adapter `lspci` lists is an AMD
+iGPU with no ROCm torch, so it drives the display and nothing else). Training takes index 0 and
+nothing else does, so a run's throughput does not depend on whether someone is watching a replay;
+evaluation, lap measurement and the console go on index 1 (`CUDA_VISIBLE_DEVICES=1`).
+
 **The dial recipe (2026-09-20).** Friction cannot be read from the car's sensors at a pace it
 survives, but a policy that is told it uses all of it, so the friction is an *input the operator
 sets* — a grip dial — and PPO is built around keeping it one:

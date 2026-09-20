@@ -570,9 +570,12 @@ class SimWorker:
         """Read a checkpoint's metadata without building anything."""
         import torch
         from ..learn import common
+        from ..learn.model import controller_arm_of
         from ..learn.watch import checkpoint_speed_cap, describe_checkpoint_line, latest_run
         ckpt = resolve_checkpoint(run, common.RUNS_DIR, latest_run())
-        extra = (torch.load(ckpt, map_location="cpu", weights_only=False) or {}).get("extra", {})
+        blob = torch.load(ckpt, map_location="cpu", weights_only=False) or {}
+        extra = blob.get("extra", {})
+        cond = ((blob.get("meta") or {}).get("cond") or {})
         metrics = extra.get("metrics") or {}
         bits = []
         if "collision_rate" in metrics:
@@ -590,6 +593,11 @@ class SimWorker:
             "progress": describe_checkpoint_line(extra, ckpt),
             "metrics": ("저장 시점: " + " · ".join(bits)) if bits else "체크포인트에 지표 기록 없음",
             "speed_cap": checkpoint_speed_cap(extra, ckpt, fallback=None),
+            # What kind of policy this is, so the form can follow the checkpoint rather than make the
+            # person remember: a dial policy already slows itself for the floor it is told about, and
+            # a tracker clamp on top of that was measured worse on every friction (research note §7).
+            "cond_source": str(cond.get("source") or ""),
+            "controller_arm": controller_arm_of(blob),
         }
 
     # ================================================================ session build
@@ -1541,7 +1549,7 @@ class SimWorker:
             self.say(P.MSG_ACK, seq=seq, command="cancel", gen=gen,
                      state={"preparing": self.prepare_gen})
 
-        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU):
+        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU, P.CMD_SET_DIAL):
             # These act on a live session. If one is running, its own thread applies them and acks
             # from there, so the ack means "done" rather than "heard".
             if self._sim_thread is not None and self._sim_thread.is_alive():
