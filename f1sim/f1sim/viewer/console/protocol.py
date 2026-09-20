@@ -119,12 +119,13 @@ class SessionConfig:
     randomize: bool = True               # domain randomisation, as in training
     stochastic: bool = False
     opponent: str = "teacher"
-    #: Plan-controller arm installed at run time (`learn.grip_runtime`). "legacy" is the untouched
-    #: MPC. "estimated" / "fixed_low" apply the grip-aware curvature speed limit and mu-dependent
-    #: acceleration/brake budgets on top of the policy's plan -- the deployment configuration that
-    #: benchmarked best -- and are supported for one car per race only, as in training.
-    controller: str = "fixed_low"      # deployment default: constant conservative mu (suite v1, 2026-09-12)
-    estimator: str = ""                  # frozen grip-estimator .pt; required by "estimated"
+    #: The plan controller is the tracker and nothing else. The friction-clamp arms it used to
+    #: offer (`fixed_low` / `estimated` / `oracle`) were the retraining-free way to make a policy
+    #: that had never been told the floor drive it safely; a dial policy is told, and stacking a
+    #: clamp on one was measured worse on every friction. The field stays at "legacy" so the worker
+    #: and the frozen benchmark rosters keep one spelling for "nothing installed".
+    controller: str = "legacy"
+    estimator: str = ""
     #: Surface friction. "random" draws mu per car per reset from the training range (when
     #: randomisation is on) or leaves it nominal; "fixed" pins every car to `mu`, re-applied after
     #: each reset, and can be changed live with CMD_SET_MU.

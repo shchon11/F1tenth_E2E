@@ -52,6 +52,23 @@ def _scroll_panel(width: int) -> Tuple[QtWidgets.QScrollArea, QtWidgets.QVBoxLay
     return area, v
 
 
+def _cuda_device_names() -> List[str]:
+    """`cuda:i` for every visible GPU. Names come from `nvidia-smi` rather than torch: this is the
+    GUI process, and the whole point of the console's split is that it never imports torch."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=4).stdout.strip()
+    except Exception:
+        return ["cuda"]
+    names = []
+    for line in out.splitlines():
+        idx, _, name = line.partition(",")
+        if idx.strip().isdigit():
+            names.append(f"cuda:{idx.strip()}")
+    return names or ["cuda"]
+
+
 class ConsoleWindow(QtWidgets.QMainWindow):
     """The whole UI. A controller connects to the `*_requested` signals and drives `apply_*`."""
 
@@ -451,19 +468,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         adv.add(FieldRow("상대차 주행 방식", self.combo_opponent,
                          "레이스당 차량 수가 2 이상일 때만 의미가 있습니다."))
         self.combo_device = QtWidgets.QComboBox()
-        self.combo_device.addItems(["auto", "cuda", "cpu"])
-        adv.add(FieldRow("연산 장치", self.combo_device, ""))
-        self.combo_controller = QtWidgets.QComboBox()
-        self.combo_controller.addItems(["fixed_low", "legacy", "estimated", "oracle"])   # fixed_low: the deployment default (suite v1, 2026-09-12)
-        adv.add(FieldRow("플랜 제어기 (노면 클램프)", self.combo_controller,
-                         "estimated / fixed_low: 곡률·마찰 기반 속도·가감속 한계를 MPC에 적용합니다 "
-                         "(벤치마크의 @estimated 구성). oracle: 시뮬의 참값 μ를 그대로 쓰는 상한 확인용 "
-                         "(실차 불가). 레이스당 차량 수 1에서만 지원합니다."))
-        self.edit_estimator = QtWidgets.QLineEdit()
-        self.edit_estimator.setPlaceholderText("estimated 전용: 노면 추정기 .pt 경로")
-        self.edit_estimator.setText(SessionConfig.default_estimator())
-        adv.add(FieldRow("노면 추정기", self.edit_estimator,
-                         "비워 두면 $F1SIM_GRIP_ESTIMATOR 또는 ~/f1sim_runs/_estimators/estimator_seed401.pt 를 씁니다."))
+        # Every card by name, not just "cuda": `torch.device("cuda")` is device 0, and on a machine
+        # where device 0 is training that is exactly the one the viewer must not take. "auto" picks
+        # whichever has the most memory free, which is the same answer without having to know.
+        self.combo_device.addItems(["auto"] + _cuda_device_names() + ["cpu"])
+        adv.add(FieldRow("연산 장치", self.combo_device,
+                         "auto: 메모리가 가장 많이 남은 GPU 를 고릅니다 (학습 중인 카드를 피합니다)."))
         self.combo_ros = QtWidgets.QComboBox()
         self.combo_ros.addItem("끄기", "off")
         self.combo_ros.addItem("센서 토픽 발행 (정책이 주행)", "publish")
@@ -998,23 +1008,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.ckpt_info.set("저장", f"{format_age(age)} 전" if age is not None else "—")
         self.ckpt_info.set("진행", info.get("progress", "—"))
         self.ckpt_info.set("저장 시점 지표", info.get("metrics", "—"))
-        # The controller arm follows the checkpoint. `fixed_low` is the deployment default for a
-        # policy that was never told the friction -- the retraining-free clamp that took suite v1
-        # from 110 to 136 solo completions. A *dial* policy already slows itself for the floor it is
-        # told about, and putting the clamp on top of it was measured worse on all three frictions
-        # (research note §7), so it opens on `legacy` instead and the hint says why.
         source = str(info.get("cond_source") or "")
-        arm = str(info.get("controller_arm") or "legacy")
-        want = arm if arm != "legacy" else ("legacy" if source == "dial" else None)
-        if want is not None:
-            i = self.combo_controller.findText(want)
-            if i >= 0:
-                self.combo_controller.setCurrentIndex(i)
-        self.row_dial_hint = source
         if source == "dial":
             self.ckpt_info.set("그립 다이얼", "받습니다 — 구성 > 그립 다이얼에서 조절")
-            self.run_note.setText("그립 다이얼 정책입니다. 제어기는 legacy 로 두세요: 정책이 이미 노면에 맞춰 "
-                                  "속도를 내므로 클램프를 겹치면 세 노면 모두에서 더 나빴습니다.")
+            self.run_note.setText("그립 다이얼 정책입니다. 구성 > 그립 다이얼에서 정책이 쓸 그립을 지정하세요.")
         elif source:
             self.ckpt_info.set("그립 다이얼", f"조건 입력 '{source}' (다이얼 아님)")
         cap = info.get("speed_cap")
@@ -1052,7 +1049,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
                   self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.combo_opponent,
-                  self.combo_device, self.combo_controller, self.edit_estimator, self.combo_ros,
+                  self.combo_device, self.combo_ros,
                   self.seg_direction, self.combo_obstacle):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
         # The seed row follows the obstacle choice, not the session state: 다시 뽑기 is exactly the
@@ -1622,8 +1619,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "randomize": bool(self.chk_dr.isChecked()),
             "stochastic": bool(self.chk_stoch.isChecked()),
             "opponent": self.combo_opponent.currentText(),
-            "controller": self.combo_controller.currentText(),
-            "estimator": self.edit_estimator.text().strip(),
             "mu_mode": str(self.combo_mu.currentData() or "random"),
             "mu": float(self.spin_mu.value()),
             "dial": float(self.spin_dial.value()),
@@ -1688,8 +1683,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.chk_dr.setChecked(bool(v)), "randomize")
         attempt(lambda v: self.chk_stoch.setChecked(bool(v)), "stochastic")
         attempt(combo_text(self.combo_opponent), "opponent")
-        attempt(combo_text(self.combo_controller), "controller")
-        attempt(lambda v: self.edit_estimator.setText(str(v)), "estimator")
         attempt(combo_data(self.combo_mu), "mu_mode")
         attempt(lambda v: self.spin_mu.setValue(float(v)), "mu")
         attempt(lambda v: self.spin_dial.setValue(float(v)), "dial")
@@ -1718,8 +1711,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             randomize=self.chk_dr.isChecked(),
             stochastic=self.chk_stoch.isChecked(),
             opponent=self.combo_opponent.currentText(),
-            controller=self.combo_controller.currentText(),
-            estimator=self.edit_estimator.text().strip(),
             mu_mode=str(self.combo_mu.currentData() or "random"),
             mu=float(self.spin_mu.value()),
             ros2=str(self.combo_ros.currentData() or "off"),

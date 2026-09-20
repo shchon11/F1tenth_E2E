@@ -86,11 +86,15 @@ def test_the_config_the_start_button_sends_has_compile_off(window):
 def test_device_and_compile_are_independent(window):
     """Compiling off must not change which device the session asks for."""
     window._selected_run, window._selected_map = "r", "m"
-    window.combo_device.setCurrentText("cuda")
+    # The device combo lists the machine's cards by name (`cuda:0`, `cuda:1`, ...), so the test
+    # picks whichever CUDA entry it offers rather than a spelling that may not be in the list.
+    cuda = next(window.combo_device.itemText(i) for i in range(window.combo_device.count())
+                if window.combo_device.itemText(i).startswith("cuda"))
+    window.combo_device.setCurrentText(cuda)
     off = window.current_config()
     window.chk_compile.setChecked(True)
     on = window.current_config()
-    assert off.device == on.device == "cuda"
+    assert off.device == on.device == cuda
     assert off.compile is False and on.compile is True
 
 

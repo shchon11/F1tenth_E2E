@@ -203,18 +203,11 @@ def main():
                          "Required for the conditioning arms: adding a parameter shifts the "
                          "positional keys Adam's state is indexed by, and silently re-keying them "
                          "would give the two arms different optimiser state.")
-    ap.add_argument("--controller", default="legacy", choices=grip_rt.ARMS,
-                    help="controller arm between the policy and the wheels. 'legacy' is the "
-                         "untouched path and is the default, so an unflagged run is unchanged. "
-                         "'fixed_low' is the control arm, 'oracle' reads the true friction (lab "
-                         "only), 'estimated' uses the frozen estimator's filtered lower quantile "
-                         "from causal sensors. A '+tcs' suffix (or 'tcs' alone) additionally runs "
-                         "the car's own traction guard on the speed command, fed from the simulated "
-                         "ERPM odometry and IMU; it needs vehicle.wheel_model. 'fixed_low+tcs' is "
-                         "the deployment default.")
-    ap.add_argument("--estimator", default="",
-                    help="frozen grip-estimator checkpoint. Required by --controller estimated, and "
-                         "rejected for every other arm.")
+    # The tracker is the tracker. The friction-clamp arms this used to select were the
+    # retraining-free way to make a policy that had never been told the floor drive it safely;
+    # `--cond dial` tells it, and a clamp stacked on a dial policy measured worse on every friction
+    # (research note 2026-09-19 section 7). `learn.grip_runtime` stays for the frozen benchmark
+    # suites, which record which arm each historical result was scored under.
     ap.add_argument("--critic-priv-adapter", default="",
                     help="declared privileged-input adapter for the critic, e.g. "
                          "'absent_opponent_17_to_21' to run a race-trained critic in a solo env. "
@@ -373,16 +366,6 @@ def main():
         raise SystemExit("--memory with --cond is not a supported combination: both migrate the "
                          "same checkpoint through a different loader, and nothing has measured the "
                          "two zero-initialised projections together.")
-    if (a.memory != "off" or a.scan_channels) and a.controller != "legacy":
-        raise SystemExit(
-            f"--memory/--scan-channels with --controller {a.controller} is not a validated "
-            f"combination: the memory work is measured against the legacy tracker only, and a "
-            f"policy that learns to lean on a friction-limited controller *and* on memory would "
-            f"have two untested changes in one result. Run --controller legacy.")
-    if a.memory != "off" and a.minibatch < a.horizon:
-        raise SystemExit(f"--memory {a.memory} needs --minibatch >= --horizon ({a.minibatch} < "
-                         f"{a.horizon}): a recurrent update's minibatches are whole env chunks of "
-                         f"the horizon, so a minibatch smaller than one chunk cannot be formed.")
     if a.procedural_obstacles:
         if not 0.0 < a.procedural_obstacles <= 1.0:
             raise SystemExit(f"--procedural-obstacles {a.procedural_obstacles}: it is the share of "
@@ -465,20 +448,12 @@ def main():
     # After `prepare_graph_runtime`, never before: that captures `mpc.solve` and assigns
     # `tracker._solver`, so a controller installed earlier is silently overwritten and the run
     # becomes a legacy run wearing another arm's name.
-    controller = grip_rt.ControllerRuntime(env, a.controller, a.estimator or None, device=device)
+    controller = grip_rt.ControllerRuntime(env, "legacy", None, device=device)
     # `graph_rt` carries the eleven real solver arguments recorded during capture; handing them over
     # lets the controller capture its own graph instead of installing an eager solver on top of a
     # run that just paid to capture a graphed one.
     controller.install(graph_rt=graph_rt)
-    controller_on = a.controller != "legacy"
-    if controller_on:
-        # The *tracker* arms are the ones validated solo; `tcs` shapes a speed command and is
-        # indifferent to how many cars share the track, so it is not caught by this.
-        if env.M > 1 and controller.base != "legacy":
-            raise SystemExit(f"--controller {a.controller} is validated solo only; this env has "
-                             f"M={env.M} cars per race")
-        print(f"controller arm: {a.controller}"
-              + (f" | estimator {a.estimator}" if a.estimator else ""))
+    controller_on = False
     spec = common.obs_spec(env)
     obs, info = env.reset(seed=a.seed)
     # After the seeded reset: the histories must start from the observations this run actually saw.

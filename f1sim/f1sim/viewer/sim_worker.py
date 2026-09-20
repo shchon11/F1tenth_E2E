@@ -244,6 +244,30 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
                 "(예: source activate.sh)에서 콘솔을 열어 주세요. 가져오기 실패: " + why)
 
 
+def auto_device() -> str:
+    """The card the viewer should run on: the CUDA device with the most memory free, else the CPU.
+
+    `torch.device("cuda")` is device 0, and device 0 is where training runs -- so "auto" put the
+    viewer on the busy card every time and both crawled. Free memory is the honest proxy for "not
+    in use", needs no per-machine configuration, and on one GPU it still picks that one.
+    `$F1SIM_VIEWER_DEVICE` overrides it outright.
+    """
+    import torch
+    forced = os.environ.get("F1SIM_VIEWER_DEVICE")
+    if forced:
+        return forced
+    if not torch.cuda.is_available():
+        return "cpu"
+    n = torch.cuda.device_count()
+    if n <= 1:
+        return "cuda"
+    try:
+        free = [torch.cuda.mem_get_info(i)[0] for i in range(n)]
+        return f"cuda:{max(range(n), key=lambda i: free[i])}"
+    except Exception:
+        return "cuda"
+
+
 def resolve_checkpoint(run: str, runs_dir: str, latest: str = "") -> str:
     """`run` (a run name, an absolute path, a .pt file, or "latest") -> a checkpoint path.
 
@@ -666,10 +690,7 @@ class SimWorker:
             autoselect = None
             ckpt_path = resolve_checkpoint(cfg.run, common.RUNS_DIR, latest_run())
 
-        if cfg.device == "auto":
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            device = torch.device(cfg.device)
+        device = torch.device(auto_device() if cfg.device == "auto" else cfg.device)
         if device.type == "cuda" and not torch.cuda.is_available():
             raise StartConfigError("CUDA 를 쓸 수 없습니다 (torch.cuda.is_available() = False). 장치를 cpu 로 바꿔 주세요.")
         # Nothing to compile on the CPU: inductor leaves this graph of hundreds of tiny ops alone.

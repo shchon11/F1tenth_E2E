@@ -257,15 +257,9 @@ def main() -> None:
                     help="[m] the tight window: close enough behind that a pass is actually on. "
                          "The wide window saturates on a 33 m lap, which is why there are two")
     ap.add_argument("--seed", type=int, default=123)
-    ap.add_argument("--controller", default="legacy",
-                    help="controller arm to install between the policy and the wheels; one of "
-                         "grip_runtime.ARMS. 'legacy' installs nothing and is the default, so an "
-                         "unflagged run is unchanged. '+clearance' arms keep the plan a stated "
-                         "margin off the local occupancy built from the scan alone. '+tcs' arms "
-                         "run the car's traction guard "
-                         "inside the loop and need --wheel-model on.")
-    ap.add_argument("--estimator", default="",
-                    help="frozen grip-estimator checkpoint; required by the estimated arms")
+    # No `--controller` / `--estimator`: the tracker is the tracker (see `ppo.py`). The keyword
+    # arguments above remain, because the frozen benchmark scores historical systems under the arm
+    # they were measured with and calls this function directly.
     ap.add_argument("--wheel-model", choices=["on", "off", "default"], default="default",
                     help="vehicle.wheel_model: the rear axle's rotation state, the ERPM odometry "
                          "and the IMU shock term. 'default' leaves params.py's value alone.")
@@ -317,8 +311,6 @@ def main() -> None:
                      f"named events never fire and the run is silently the unflagged one.")
     tracks = common.track_names(a.tracks)
 
-    if a.controller not in grip_runtime.ARMS:
-        ap.error(f"--controller {a.controller!r}: expected one of {', '.join(grip_runtime.ARMS)}")
 
     def run(names, config):
         if a.wheel_model != "default":
@@ -334,7 +326,7 @@ def main() -> None:
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
-                        controller=a.controller, estimator=a.estimator)
+                        )
 
     nominal = Config()
     if a.eager:

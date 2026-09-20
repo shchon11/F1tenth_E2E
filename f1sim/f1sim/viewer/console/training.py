@@ -41,7 +41,6 @@ from .widgets import Card, Collapsible, FieldRow, KeyValueList, MetricTile, hlin
 JOBS_DIRNAME = "_console_jobs"
 REPO_F1SIM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 FROZEN_ORIGINAL = os.path.join(catalog.RUNS_DIR, "_baselines", "frozen_original_48cc698f.pt")
-DEFAULT_ESTIMATOR = os.path.join(catalog.RUNS_DIR, "_estimators", "estimator_seed401.pt")
 
 _UPD = re.compile(
     r"upd (?P<k>\d+)/(?P<n>\d+) steps (?P<steps>[\d.]+)M cap (?P<cap>[\d.]+) \| rew/step (?P<rew>[-\d.]+|nan) "
@@ -563,7 +562,7 @@ class JobSummary:
         rows = [("레시피", self.recipe), ("트랙", self.tracks_text), ("레이스", self.race_text)]
         if self.events_text:
             rows.append(("이벤트", self.events_text))
-        rows += [("제어기", self.controller), ("시작 체크포인트", self.init),
+        rows += [("시작 체크포인트", self.init),
                  ("학습률", self.lr_text), ("총 스텝", self.total_text)]
         if self.wandb_url:
             rows.append(("W&B", self.wandb_url))
@@ -1104,13 +1103,7 @@ class RecipeForm(QtWidgets.QWidget):
         g4.addWidget(FieldRow("aux grip", self.edit_aux_grip, "마찰 보조 head 가중치"), 0, 0)
         g4.addWidget(FieldRow("aux opp", self.edit_aux_opp, "상대차 보조 head 가중치"), 0, 1)
         adv.add(g4)
-        self.combo_controller = QtWidgets.QComboBox(); self.combo_controller.addItems(["legacy", "fixed_low", "estimated"])
-        self.combo_controller.currentTextChanged.connect(self._controller_hint)
-        adv.add(FieldRow("학습 중 제어기", self.combo_controller, ""))
-        self.ctrl_hint = label("", "hint.warn")
-        adv.add(self.ctrl_hint)
-        self.edit_estimator = QtWidgets.QLineEdit(DEFAULT_ESTIMATOR if os.path.isfile(DEFAULT_ESTIMATOR) else "")
-        adv.add(FieldRow("노면 추정기", self.edit_estimator, "estimated 전용"))
+
         self.combo_wandb = QtWidgets.QComboBox(); self.combo_wandb.addItems(["online", "offline", "disabled"])
         self.combo_device = QtWidgets.QComboBox(); self.combo_device.addItems(["cuda", "cpu"])
         self.spin_save = QtWidgets.QSpinBox(); self.spin_save.setRange(1, 200); self.spin_save.setValue(10)
@@ -1141,11 +1134,11 @@ class RecipeForm(QtWidgets.QWidget):
         v.addStretch(1)
 
         for w in (self.edit_name, self.edit_lr, self.edit_lr_end, self.edit_kl, self.edit_aux_grip,
-                  self.edit_aux_opp, self.edit_estimator, self.edit_extra):
+                  self.edit_aux_opp, self.edit_extra):
             w.textChanged.connect(self._refresh_preview)
         for w in (self.spin_seed, self.spin_total, self.spin_envs, self.spin_race, self.spin_save):
             w.valueChanged.connect(self._refresh_preview)
-        for w in (self.combo_opp, self.combo_controller, self.combo_wandb, self.combo_device, self.combo_init):
+        for w in (self.combo_opp, self.combo_wandb, self.combo_device, self.combo_init):
             w.currentTextChanged.connect(self._refresh_preview)
         self.chk_restore_opt.toggled.connect(self._refresh_preview)
         self.set_runs([])
@@ -1181,24 +1174,13 @@ class RecipeForm(QtWidgets.QWidget):
         self.edit_aux_grip.setText(f"{r.aux_grip:g}"); self.edit_aux_opp.setText(f"{r.aux_opp:g}")
         self.edit_lr.setText(f"{r.lr:g}"); self.edit_lr_end.setText(f"{r.lr_end:g}"); self.edit_kl.setText(f"{r.kl:g}")
         self.spin_envs.setValue(r.envs); self.spin_total.setValue(r.total)
-        self.combo_controller.setCurrentText("legacy")
         self.edit_name.setText(f"cl_{r.key}_legacy_s{self.spin_seed.value()}_{time.strftime('%m%d%H%M')}")
-        self._refresh_preview()
-
-    def _controller_hint(self, arm: str):
-        if arm == "legacy":
-            self.ctrl_hint.setText("")
-        else:
-            self.ctrl_hint.setText("주의: 클램프를 켠 채 학습한 정책은 클램프에 기대는 계획을 배워 저마찰·회피·추월이 "
-                                   "나빠졌습니다 (2026-09-12, 4개 실행 모두). legacy로 학습하고 배포 때만 켜세요. "
-                                   "또한 estimated/fixed_low 는 레이스당 차량 1에서만 학습됩니다.")
         self._refresh_preview()
 
     def argv(self) -> Tuple[str, List[str], str]:
         r = next(x for x in RECIPES if x.key == self.combo_recipe.currentData())
         name = self.edit_name.text().strip() or f"cl_run_{time.strftime('%m%d%H%M')}"
         race = self.spin_race.value()
-        arm = self.combo_controller.currentText()
         parts = [sys.executable, "-m", "f1sim.learn.ppo"] + shlex.split(COMMON_FLAGS)
         parts += ["--tracks", self.tracks.spec() or "train",
                   "--obstacle-draws", str(self.tracks.draws()),
@@ -1210,13 +1192,11 @@ class RecipeForm(QtWidgets.QWidget):
                   "--aux-grip", self.edit_aux_grip.text().strip() or "0", "--aux-opp", self.edit_aux_opp.text().strip() or "0",
                   "--device", self.combo_device.currentText(), "--wandb", self.combo_wandb.currentText(),
                   "--wandb-group", f"console-{r.key}", "--save-every", str(self.spin_save.value()),
-                  "--name", name, "--controller", arm]
+                  "--name", name]
         if race > 1 and r.race_flags:
             parts += shlex.split(r.race_flags)
         if race == 1:
             parts += ["--cond", "none", "--critic-priv-adapter", "absent_opponent_17_to_21"]
-        if arm == "estimated":
-            parts += ["--estimator", self.edit_estimator.text().strip()]
         if not self.chk_restore_opt.isChecked():
             parts.append("--fresh-opt")
         extra = self.edit_extra.text().strip()
@@ -1240,10 +1220,6 @@ class RecipeForm(QtWidgets.QWidget):
         init = self._init_path()
         if not os.path.isfile(init):
             self.launch_note.setText(f"시작 체크포인트가 없습니다: {init}")
-            return
-        arm = self.combo_controller.currentText()
-        if arm != "legacy" and self.spin_race.value() > 1:
-            self.launch_note.setText(f"'{arm}' 제어기는 레이스당 차량 1에서만 학습됩니다.")
             return
         self.launch_requested.emit(name, parts, device)
 
