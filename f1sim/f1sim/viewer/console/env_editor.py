@@ -1075,6 +1075,57 @@ class EnvEditorPage(QtWidgets.QWidget):
                            "목록에 없는 이름은 검색칸에 직접 쳐도 됩니다.", "hint"))
         lv.addWidget(imp_card)
 
+        # -- start from a SLAM map: the pair `slam_toolbox` / `map_saver` writes. The heavy half
+        # (grid clean-up, lane tracing, the raceline check) is `f1sim.slam_map`, run as a job like
+        # every other Track operation on this page; what lands here is an ordinary scene, so the
+        # brushes, the paths and 칠한 덕트 -> 경로 all work on it.
+        slam_card = Card("SLAM 맵 불러오기")
+        row = QtWidgets.QHBoxLayout()
+        self.slam_path = QtWidgets.QLineEdit()
+        self.slam_path.setPlaceholderText("map.yaml (또는 map.pgm / map.png, 폴더도 됩니다)")
+        row.addWidget(self.slam_path, 1)
+        self.btn_slam_browse = QtWidgets.QPushButton("찾기…")
+        self.btn_slam_browse.clicked.connect(self._browse_slam)
+        row.addWidget(self.btn_slam_browse)
+        slam_card.add(row)
+        opt = QtWidgets.QHBoxLayout()
+        opt.addWidget(label("경계", "hint"))
+        self.slam_boundary = QtWidgets.QComboBox()
+        self.slam_boundary.addItem("덕트 호스 (F1TENTH 트랙)", "duct")
+        self.slam_boundary.addItem("벽 (건물·집기)", "wall")
+        opt.addWidget(self.slam_boundary)
+        opt.addWidget(label("최소 폭", "hint"))
+        self.slam_clearance = QtWidgets.QDoubleSpinBox()
+        self.slam_clearance.setRange(0.15, 2.0); self.slam_clearance.setSingleStep(0.05)
+        self.slam_clearance.setValue(0.35); self.slam_clearance.setSuffix(" m")
+        opt.addWidget(self.slam_clearance)
+        self.slam_keep = QtWidgets.QCheckBox("바깥 잡음 잘라내기")
+        self.slam_keep.setChecked(True)
+        opt.addWidget(self.slam_keep)
+        opt.addStretch(1)
+        slam_card.add(opt)
+        # The one escape hatch the tracing has: which free region is the lane. Off by default (the
+        # largest is taken, which is usually right); on, it is a point the user knows is on the lane.
+        seed = QtWidgets.QHBoxLayout()
+        self.slam_use_seed = QtWidgets.QCheckBox("주행선 위의 한 점 지정")
+        seed.addWidget(self.slam_use_seed)
+        self.slam_seed_x = QtWidgets.QDoubleSpinBox(); self.slam_seed_y = QtWidgets.QDoubleSpinBox()
+        for sb, lab_ in ((self.slam_seed_x, "x"), (self.slam_seed_y, "y")):
+            sb.setRange(-1000.0, 1000.0); sb.setDecimals(2); sb.setSingleStep(0.5)
+            sb.setPrefix(f"{lab_} "); sb.setSuffix(" m"); sb.setEnabled(False)
+            seed.addWidget(sb)
+        self.slam_use_seed.toggled.connect(self.slam_seed_x.setEnabled)
+        self.slam_use_seed.toggled.connect(self.slam_seed_y.setEnabled)
+        seed.addStretch(1)
+        slam_card.add(seed)
+        self.btn_slam = QtWidgets.QPushButton("이 맵 불러와서 편집")
+        self.btn_slam.clicked.connect(self.import_from_slam)
+        slam_card.add(self.btn_slam)
+        slam_card.add(label("slam_toolbox / map_saver 가 만든 yaml + pgm(png) 을 그대로 넣으면 주행선(센터라인)까지 "
+                            "자동으로 뽑아 새 환경으로 엽니다. 스캔이 새어나간 곳이나 끊긴 벽은 불러온 뒤 붓으로 고치면 "
+                            "됩니다. 트랙이 여러 갈래로 잡히면 주행선 위의 한 점을 골라 다시 불러오세요.", "hint"))
+        lv.addWidget(slam_card)
+
         lst = Card("내 환경")
         self.scene_list = QtWidgets.QListWidget()
         self.scene_list.setMinimumHeight(140)
@@ -1906,6 +1957,59 @@ class EnvEditorPage(QtWidgets.QWidget):
                                        .replace("~", "_").replace("@", "_").replace("#", "_"))
         self._run_job(["import", name, target], f"'{name}' 을 가져오는 중… (Track 로드, 몇 초)",
                       lambda code, out, err: self._imported(code, out, err, target))
+
+    # ---------------------------------------------------------------- SLAM map import
+    def _browse_slam(self):
+        start = os.path.dirname(self.slam_path.text().strip()) or os.path.expanduser("~")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "SLAM 맵 고르기", start, "맵 (*.yaml *.yml *.pgm *.png);; 모든 파일 (*)")
+        if path:
+            self.slam_path.setText(path)
+
+    def import_from_slam(self):
+        path = self.slam_path.text().strip()
+        if not path:
+            self._set_status("불러올 SLAM 맵(yaml 또는 이미지)을 고르세요.", danger=True)
+            return
+        if not os.path.exists(os.path.expanduser(path)):
+            self._set_status(f"파일이 없습니다: {path}", danger=True)
+            return
+        if not self._confirm_discard():
+            return
+        stem = os.path.splitext(os.path.basename(os.path.expanduser(path).rstrip(os.sep)))[0] or "slam_map"
+        stem = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in stem)
+        target = self._unique_name(stem or "slam_map")
+        args = ["import-slam", os.path.expanduser(path), target,
+                "--boundary", self.slam_boundary.currentData(),
+                "--min-clearance", f"{self.slam_clearance.value():.2f}"]
+        if self.slam_use_seed.isChecked():
+            args += ["--seed-xy", f"{self.slam_seed_x.value():.3f}", f"{self.slam_seed_y.value():.3f}"]
+        if not self.slam_keep.isChecked():
+            args += ["--no-keep-region"]
+        self._run_job(args, f"SLAM 맵을 읽는 중… (격자 정리·주행선 추출, 십여 초)",
+                      lambda code, out, err: self._imported_slam(code, out, err, target))
+
+    def _imported_slam(self, code, out, err, target):
+        if code != 0 or not out:
+            msg = (err.strip().splitlines() or [str(code)])[-1]
+            self._set_status(f"SLAM 맵 불러오기 실패: {msg}", danger=True)
+            return
+        self.refresh_scene_list()
+        self.scenes_changed.emit()
+        if not self.open_scene(target):
+            return
+        lane = out.get("lane_length_m") or 0.0
+        half = out.get("half_width_min_m") or 0.0
+        lap = out.get("raceline_lap_s")
+        msg = (f"'{target}' 으로 불러왔습니다 · 주행선 {lane:.1f} m · 최소 반폭 {half:.2f} m"
+               + (f" · 레이스라인 {lap:.2f} s" if lap else ""))
+        problems = out.get("problems") or []
+        if problems:
+            # Imported anyway: a map with a pinch point or a failed raceline is exactly the map
+            # someone opens the editor to fix, and refusing it would leave them nothing to fix.
+            self._set_status(msg + " · 확인 필요: " + problems[0], danger=True)
+        else:
+            self._set_status(msg)
 
     def _imported(self, code, out, err, target):
         if code != 0 or not out:

@@ -55,3 +55,66 @@ def test_tracker_speed_and_runtime():
     dt = (time.time() - t0) / 10
     print(f"tracker {B} envs: {dt * 1e3:.1f} ms/step")
     assert dt < 0.2
+
+
+# ---------------------------------------------------------------- speed modes (opt-in)
+def test_speed_mode_dimensions_and_the_linear_reader_refuses_the_others():
+    import pytest
+    from f1sim.mpc import act_dim
+    assert act_dim() == act_dim("linear") == ACT_DIM == N_KNOTS + 2
+    assert act_dim("envelope") == N_KNOTS + 2 and act_dim("knots") == 2 * N_KNOTS
+    with pytest.raises(ValueError):
+        act_dim("spline")
+    # `decode` is what every runtime layer reads a plan through, and it means (v_start, v_end) by
+    # the last two numbers. Handed an envelope plan it must fail, not return a plausible wrong plan.
+    a = torch.zeros(2, ACT_DIM); v = torch.full((2,), 3.0); cap = torch.full((2,), 8.0)
+    with pytest.raises(ValueError):
+        decode(a, v, VMAX, cap, PlanSpec(speed_mode="envelope"))
+
+
+def test_knots_profile_passes_through_its_knots():
+    from f1sim.mpc import decode_profile, encode_knots
+    spec = PlanSpec(speed_mode="knots")
+    kap = torch.zeros(1, N_KNOTS); vk = torch.tensor([[2.0, 3.0, 1.5, 1.5, 4.0, 5.0]])
+    a = encode_knots(kap, vk, VMAX, spec)
+    _, _, prof = decode_profile(a, torch.full((1,), 3.0), VMAX, torch.full((1,), 8.0), spec)
+    at = torch.linspace(0, spec.n_profile - 1, N_KNOTS).round().long()
+    assert prof.shape == (1, spec.n_profile) and torch.allclose(prof[0, at], vk[0], atol=0.12)
+    assert float(prof.min()) >= 1.5 - 1e-5                  # an apex *inside* the plan, which two numbers cannot say
+    _, _, capped = decode_profile(a, torch.full((1,), 3.0), VMAX, torch.full((1,), 2.5), spec)
+    assert float(capped.max()) <= 2.5 + 1e-6
+
+
+def test_envelope_profile_follows_the_corner_and_the_grip_belief():
+    from f1sim.mpc import decode_profile, encode_envelope, path_points
+    spec = PlanSpec(speed_mode="envelope", envelope_forward=False)
+    # straight into a 1.25 m radius corner and out again; the car is at 6 m/s so the plan is 9 m long
+    kap = torch.tensor([[0.0, 0.0, 0.8, 0.8, 0.0, 0.0]]).repeat(3, 1)
+    a_hat = torch.tensor([8.0, 4.0, 8.0]); v_end = torch.tensor([8.0, 8.0, 1.0])
+    v = torch.full((3,), 6.0); cap = torch.full((3,), 8.0)
+    k, Lp, prof = decode_profile(encode_envelope(kap, a_hat, v_end, VMAX, spec), v, VMAX, cap, spec)
+    _, _, _, s, kd = path_points(k, Lp, n=spec.n_profile, return_kappa=True)
+    # never faster than the corner allows at the believed grip, and it gets there by braking in time
+    assert (prof <= torch.sqrt(a_hat[:, None] / kd.abs().clamp_min(1e-3)) + 1e-4).all()
+    i_apex = int(kd[0].argmax())
+    assert abs(float(prof[0, i_apex]) - math.sqrt(8.0 / 0.8)) < 0.05 and float(prof[0, 0]) > float(prof[0, i_apex]) + 1.0
+    dec = (prof[:, :-1] ** 2 - prof[:, 1:] ** 2) / (2 * (Lp / (spec.n_profile - 1))[:, None])
+    assert float(dec.max()) <= spec.a_brake_profile + 1e-3
+    # one scalar is the whole "how slippery is it": halve it and every lateral-limited point slows by sqrt(2)
+    assert (prof[1] <= prof[0] + 1e-5).all() and abs(float(prof[1, i_apex] / prof[0, i_apex]) - math.sqrt(0.5)) < 0.01
+    # and the end speed says what the curvature cannot (a hairpin past the plan, a car in the way)
+    assert float(prof[2, -1]) <= 1.0 + 1e-5 and (prof[2] <= prof[0] + 1e-5).all()
+    # the drive pass starts from the speed the car has, not the one the corner would allow
+    ramp = decode_profile(encode_envelope(kap[:1] * 0, a_hat[:1], v_end[:1], VMAX, spec), torch.full((1,), 2.0), VMAX, cap[:1],
+                          PlanSpec(speed_mode="envelope"))[2]
+    assert abs(float(ramp[0, 0]) - 2.0) < 1e-5 and (ramp[0, 1:] >= ramp[0, :-1] - 1e-6).all() and float(ramp[0, -1]) < 8.0
+
+
+def test_tracker_runs_every_speed_mode():
+    from f1sim.mpc import act_dim
+    for mode in ("envelope", "knots"):
+        tr = PlanTracker(4, "cpu", WB, SMAX, VMAX, spec=PlanSpec(speed_mode=mode), compile_solver=False)
+        a = torch.zeros(4, act_dim(mode)); a[:, :N_KNOTS] = 0.2
+        cmd = tr(a, torch.full((4,), 3.0), torch.full((4,), 8.0))
+        assert cmd.shape == (4, 2) and torch.isfinite(cmd).all() and (cmd[:, 0] > 0).all()
+        assert tr.last_ref.shape == (4, tr.spec.N + 1, 4)

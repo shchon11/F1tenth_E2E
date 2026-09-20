@@ -25,6 +25,28 @@ N_KNOTS = 6                       # 6 knots over a 15 m plan is one every 3 m; 4
 ACT_DIM = N_KNOTS + 2
 XI = torch.linspace(0.0, 1.0, N_KNOTS)
 
+#: How the plan says how fast. "linear" is the action space every checkpoint was trained in and the
+#: default; the other two are opt-in (`PlanSpec.speed_mode`) and change what the speed dimensions mean.
+#:
+#:   linear    2 numbers: the target speed 0.15 s ahead and at the end of the plan, linear between.
+#:             A straight line has its minimum at an end, so an apex *inside* the plan cannot be said:
+#:             measured against the teacher's own profile over the 0.6 s the tracker consumes, the
+#:             line asks for > 0.5 m/s more than the profile allows in 49-60 % of windows (p90 1.1-1.8
+#:             m/s), and the faster the teacher the worse it gets.
+#:   envelope  2 numbers: `a_hat`, the lateral acceleration the policy believes it can use, and
+#:             `v_end`, the speed to arrive at the end of the plan with. The profile is
+#:             v(s) = sqrt(a_hat / |kappa(s)|) on the plan's *own* curvature, braked backwards from
+#:             v_end and ramped forwards from the measured speed -- so it follows the corner by
+#:             construction, and one scalar carries "how slippery is it". Same test: 2-4 %, p90 0.2-0.35.
+#:   knots     N_KNOTS numbers: the speed at each curvature knot, linear between. Same test: 0.3-0.5 %.
+SPEED_MODES = ("linear", "envelope", "knots")
+
+
+def act_dim(speed_mode: str = "linear") -> int:
+    if speed_mode not in SPEED_MODES:
+        raise ValueError(f"speed_mode must be one of {SPEED_MODES}, got {speed_mode!r}")
+    return N_KNOTS + (N_KNOTS if speed_mode == "knots" else 2)
+
 
 @dataclass
 class PlanSpec:
@@ -52,6 +74,12 @@ class PlanSpec:
     r: Tuple[float, float] = (0.3, 0.02)                            # steer, accel effort
     rd: Tuple[float, float] = (6.0, 0.05)                           # steer, accel rate
     iters: int = 2
+    speed_mode: str = "linear"     # SPEED_MODES; anything but "linear" re-interprets the speed dimensions
+    a_hat_max: float = 12.0        # [m/s^2] envelope: the lateral-acceleration belief spans [a_hat_min, a_hat_max]
+    a_hat_min: float = 1.0
+    a_brake_profile: float = 4.0   # [m/s^2] envelope: braking the backward pass plans with (the teacher's a_brake)
+    n_profile: int = 25            # dense samples of the speed profile, the same grid `path_points` uses
+    envelope_forward: bool = True  # envelope: ramp the profile up from the measured speed (ellipse-limited drive)
 
 
 def plan_length(v: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
@@ -60,6 +88,12 @@ def plan_length(v: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
 
 def decode(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec):
     """normalized action (B,6) -> (kappa knots (B,4) [1/m], L_p (B,), v_start (B,), v_end (B,))"""
+    if spec.speed_mode != "linear":
+        # Every runtime layer that reads a plan (grip arms, clearance, viewers) reads it through here
+        # and means (v_start, v_end) by the last two numbers. Under another speed mode they are not
+        # speeds at all, and the result would be a plausible-looking wrong plan rather than an error.
+        raise ValueError(f"mpc.decode reads the 'linear' speed dimensions; this plan is {spec.speed_mode!r} "
+                         f"-- use decode_profile")
     a = action.clamp(-1.0, 1.0)
     Lp = plan_length(v_meas, spec)
     k = a[:, :N_KNOTS] * spec.kappa_max
@@ -72,6 +106,55 @@ def encode(kappas: torch.Tensor, v_start: torch.Tensor, v_end: torch.Tensor, v_m
     """(B,4) curvature knots [1/m], speeds [m/s] -> normalized action (B,6)"""
     return torch.cat([(kappas / spec.kappa_max).clamp(-1, 1), (v_start / v_max * 2 - 1).clamp(-1, 1)[:, None],
                       (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
+
+
+def encode_envelope(kappas: torch.Tensor, a_hat: torch.Tensor, v_end: torch.Tensor, v_max: float, spec: PlanSpec) -> torch.Tensor:
+    """curvature knots [1/m], usable lateral acceleration [m/s^2], end speed [m/s] -> normalized action"""
+    return torch.cat([(kappas / spec.kappa_max).clamp(-1, 1), (a_hat / spec.a_hat_max * 2 - 1).clamp(-1, 1)[:, None],
+                      (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
+
+
+def encode_knots(kappas: torch.Tensor, v_knots: torch.Tensor, v_max: float, spec: PlanSpec) -> torch.Tensor:
+    """curvature knots [1/m], speed at each knot [m/s] -> normalized action (B, 2 * N_KNOTS)"""
+    return torch.cat([(kappas / spec.kappa_max).clamp(-1, 1), (v_knots / v_max * 2 - 1).clamp(-1, 1)], 1)
+
+
+def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec):
+    """'envelope' / 'knots' action -> (kappa knots (B,K) [1/m], L_p (B,), speed profile (B, n_profile) [m/s]).
+
+    The profile is on `path_points`' own uniform arc grid, which is also the grid `reference`
+    interpolates a `v_limit` on -- so it is handed to `reference` as one and nothing else changes."""
+    a = action.clamp(-1.0, 1.0)
+    Lp = plan_length(v_meas, spec)
+    k = a[:, :N_KNOTS] * spec.kappa_max
+    n = spec.n_profile
+    cap = speed_cap[:, None]
+    if spec.speed_mode == "knots":
+        vk = torch.minimum((a[:, N_KNOTS:2 * N_KNOTS] + 1.0) * 0.5 * v_max, cap)
+        pos = torch.linspace(0.0, 1.0, n, device=a.device, dtype=a.dtype)[None] * (N_KNOTS - 1)
+        i0 = pos.floor().clamp(max=N_KNOTS - 2).long(); w = pos - i0.to(a.dtype)
+        i0 = i0.expand(a.shape[0], n)
+        return k, Lp, vk.gather(1, i0) * (1 - w) + vk.gather(1, i0 + 1) * w
+    if spec.speed_mode != "envelope":
+        raise ValueError(f"decode_profile is for the 'envelope' and 'knots' modes, got {spec.speed_mode!r}")
+    a_hat = ((a[:, N_KNOTS] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)[:, None]
+    v_end = torch.minimum((a[:, N_KNOTS + 1] + 1.0) * 0.5 * v_max, speed_cap)
+    _, _, _, _, kap = path_points(k, Lp, n=n, return_kappa=True)
+    g = kap.abs().clamp_min(1e-3) / a_hat                                   # 1 / v_curve^2
+    ds = (Lp / (n - 1)).clamp_min(1e-3)
+    cols = list(torch.minimum(torch.rsqrt(g), cap).unbind(1))
+    cols[-1] = torch.minimum(cols[-1], v_end)
+    # The friction ellipse on both passes, with a_hat as the whole budget: what is spent turning is
+    # not there to brake or drive with. Python constants, so the loops unroll and stay graph-safe.
+    for i in range(n - 2, -1, -1):          # backward: slow in time for what is ahead
+        ax = spec.a_brake_profile * torch.sqrt((1.0 - (cols[i + 1] ** 2 * g[:, i + 1]) ** 2).clamp_min(0.0))
+        cols[i] = torch.minimum(cols[i], torch.sqrt(cols[i + 1] ** 2 + 2.0 * ax * ds))
+    if spec.envelope_forward:
+        cols[0] = torch.minimum(cols[0], v_meas.abs().clamp_min(0.5))
+        for i in range(1, n):               # forward: no more than can be gained from the speed it has
+            ax = spec.a_max * torch.sqrt((1.0 - (cols[i - 1] ** 2 * g[:, i - 1]) ** 2).clamp_min(0.0))
+            cols[i] = torch.minimum(cols[i], torch.sqrt(cols[i - 1] ** 2 + 2.0 * ax * ds))
+    return k, Lp, torch.stack(cols, 1)
 
 
 def path_points(k: torch.Tensor, Lp: torch.Tensor, n: int = 25, return_kappa: bool = False):
@@ -267,8 +350,16 @@ def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSp
           a_walk: Optional[torch.Tensor] = None):
     """Whole tracker step as one function (compiled into a single CUDA graph on the GPU): decode the plan,
     build the reference, predict over the latency, run the iLQR. Returns (u (B,N,2), z (B,N+1,6), ref)."""
-    k, Lp, v0, v1 = decode(action, v_meas, v_max, speed_cap, spec)
-    ref = reference(k, Lp, v0, v1, spec, v_meas, v_limit=v_limit, a_walk=a_walk)
+    if spec.speed_mode == "linear":
+        k, Lp, v0, v1 = decode(action, v_meas, v_max, speed_cap, spec)
+        ref = reference(k, Lp, v0, v1, spec, v_meas, v_limit=v_limit, a_walk=a_walk)
+    else:
+        # The plan carries a whole profile. `reference` already knows how to follow one -- that is
+        # what `v_limit` is -- so the linear target is set to the cap and the profile does the rest.
+        k, Lp, prof = decode_profile(action, v_meas, v_max, speed_cap, spec)
+        if v_limit is not None:
+            prof = torch.minimum(prof, v_limit)
+        ref = reference(k, Lp, speed_cap, speed_cap, spec, v_meas, v_limit=prof, a_walk=a_walk)
     v = v_meas.abs()
     Le = wb + spec.k_us * v * v
     steer_now = torch.atan(yaw_rate * Le / v.clamp_min(0.5)).clamp(-s_max, s_max)

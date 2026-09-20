@@ -1,5 +1,6 @@
 # python / build
 __pycache__/
+.venv/
 *.pyc
 *.egg-info/
 .pytest_cache/
@@ -7,6 +8,8 @@ build/
 # training artefacts (runs live in ~/f1sim_runs)
 wandb/
 *.pt
+# archived result policies, stripped of optimizer state (see checkpoints/README.md)
+!checkpoints/*.pt
 *.onnx
 *.trt
 *.log

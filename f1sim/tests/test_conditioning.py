@@ -348,3 +348,28 @@ def test_zero_arm_is_invariant_to_the_privileged_friction():
     assert torch.equal(ca, cb) and float(ca.abs().max()) == 0.0
     with torch.no_grad():
         assert torch.equal(model.actor(scan, pro, ca), model.actor(scan, pro, cb))
+
+
+# ---------------------------------------------------------------- the dial (2026-09-20)
+def test_dial_is_a_deployable_source_and_is_never_derived_from_privileged_state():
+    spec = C.spec_for("dial")
+    assert spec.dim == 1 and spec.source == "dial" and spec.lab_oracle is False
+    assert C.CondSpec.from_meta(spec.to_meta()) == spec
+    # the trainer's margin draw, an operator or a supervisor sets it; the privileged vector never does
+    with pytest.raises(ValueError, match="set by the caller"):
+        C.make_condition("dial", spec, torch.zeros(4, 17), 8)
+    assert torch.allclose(C.mu_to_c(torch.tensor([1.0, 0.75]), spec)[:, 0], torch.tensor([0.0, -1.0]))
+
+
+def test_dial_draw_is_at_or_below_the_floor_and_held_for_the_episode():
+    class _Sim:  # the two things DialDraw reads
+        P = {"mu": torch.tensor([0.80, 0.95, 1.10, 0.74])}
+    class _Env:
+        B, device, sim = 4, torch.device("cpu"), _Sim()
+    torch.manual_seed(0)
+    d = C.DialDraw(_Env(), margin=0.30, p_exact=0.0)
+    d.redraw(torch.ones(4, dtype=torch.bool)); first = d.value().clone()
+    assert (first <= _Sim.P["mu"] + 1e-6).all() and (first >= _Sim.P["mu"] - 0.30 - 1e-6).all()
+    d.redraw(torch.tensor([True, False, False, False]))            # only env 0 opened a new episode
+    assert torch.equal(d.value()[1:], first[1:])
+    assert (C.DialDraw(_Env(), margin=0.30, p_exact=1.0).value() == _Sim.P["mu"]).all()   # "exact" episodes carry no margin

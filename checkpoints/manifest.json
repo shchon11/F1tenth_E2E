@@ -1,0 +1,21 @@
+[
+ {
+  "file": "dial_student_s901.pt",
+  "run": "dg_dial_s901",
+  "sha256": "a27fd18f685d1712d6ec33ecc0830e1fd272c5d7f54f571876e7d5cab6da5e78",
+  "size_mb": 9.1,
+  "dropped": [],
+  "source_mb": 9.1
+ },
+ {
+  "file": "map12x16_specialist_s903.pt",
+  "run": "spec_map12_fastsafe_budget",
+  "sha256": "df51e197ed4d466a6acd90d3bb656d7170ad49ee97e3e3abccc54177e786c8c1",
+  "size_mb": 9.1,
+  "dropped": [
+   "opt",
+   "opt_param_names"
+  ],
+  "source_mb": 26.5
+ }
+]
