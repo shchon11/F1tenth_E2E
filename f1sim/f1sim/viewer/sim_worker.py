@@ -1651,6 +1651,12 @@ class SimWorker:
         n = 0
         hb = 0.0
         try:
+            import torch
+            dev = session.get("device")
+            if dev is not None and getattr(dev, "type", "") == "cuda":
+                # A fresh thread starts on device 0 regardless of the process's current device, and
+                # the graphs below were captured on the session's. Match it before adopting them.
+                torch.cuda.set_device(dev.index if dev.index is not None else 0)
             fastpath = session.get("fastpath")
             if fastpath is not None:
                 # The graphs were captured on the control thread inside `build_session`; this is the

@@ -1295,7 +1295,7 @@ def main():
     # that had been reconstructed differently. Both arms use a fresh Adam, and the run says so.
     if a.fresh_opt:
         print("optimizer: fresh Adam (--fresh-opt); checkpoint moments not restored")
-    elif a.cond != "none":
+    elif a.cond != "none" and not init_conditional:
         raise SystemExit("--cond requires --fresh-opt: restoring Adam moments across an added "
                          "parameter would give the arms different optimiser state")
     elif a.init and extra.get("opt"):
