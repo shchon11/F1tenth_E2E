@@ -134,6 +134,15 @@ KINDS: Tuple[DriverKind, ...] = (
                teacher=True, module="f1sim.spliner_teacher",
                teacher_factory="f1sim.spliner_teacher:PredictiveSplinerTeacher",
                pending="`f1sim/spliner_teacher.py` 가 이 트리에 없습니다."),
+    DriverKind("lane_switch", "lane-switch (고정 레인)",
+               "레이싱 라인에서 일정 간격으로 떨어진 고정 레인들 중 비어 있는 가장 싼 레인을 골라 "
+               "옮겨 갑니다 (`f1sim.lane_teacher`). UNIST UNICORN 이 공개한 구성(Lane Change "
+               "Planner + Frenet 추종 + L1)과 같은 계열이지만, 공개된 것이 구성요소 이름뿐이라 "
+               "**재현이 아니라 같은 계열의 구현**입니다. 수치는 우리 것이며 모듈에 그렇게 적어 "
+               "두었습니다. spline 계열과 달리 이산 선택 + hysteresis 라 비교 축이 다릅니다.",
+               teacher=True, module="f1sim.lane_teacher",
+               teacher_factory="f1sim.lane_teacher:LaneSwitchTeacher",
+               pending="`f1sim/lane_teacher.py` 가 이 트리에 없습니다."),
     DriverKind("policy", "정책 체크포인트",
                "저장된 정책이 스스로 주행합니다. 자기 라인을 잡고 자기 실수를 합니다.",
                checkpoint=True),

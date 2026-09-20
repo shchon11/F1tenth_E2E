@@ -55,6 +55,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
+from .opponent_planner import FrenetOpponentPlanner
 from .teacher import RacelineTeacher
 
 #: Arc-length offsets of the spline's control points from the opponent's apex, in metres.
@@ -90,7 +91,6 @@ FIXED_PRED_TIME = 0.5
 
 #: State machine codes. Exposed so a caller can log or plot which state each row was in.
 RACING, TRAILING, OVERTAKING = 0, 1, 2
-STATE_NAMES = ("racing", "trailing", "overtaking")
 
 
 def _natural_cubic(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -133,12 +133,15 @@ _SHAPE = _natural_cubic(np.asarray(CONTROL_S, dtype=np.float64),
                         np.eye(len(CONTROL_S))[APEX_I])
 
 
-class SplinerTeacher:
+class SplinerTeacher(FrenetOpponentPlanner):
     """ForzaETH `spliner`, batched. Drop-in wherever this env drives a car with a teacher.
 
     `base` supplies the reference line, the grip-aware speed profile, the latency compensation and
-    the plan fit. This class decides one thing: the lateral offset that line is followed at.
+    the plan fit; `FrenetOpponentPlanner` supplies the Frenet view of the race and the wiring.
+    This class decides one thing: the lateral offset that line is followed at.
     """
+
+    STATE_NAMES = ("racing", "trailing", "overtaking")
 
     def __init__(self, base: RacelineTeacher, env=None, *,
                  evasion_dist: float = EVASION_DIST,
@@ -148,11 +151,7 @@ class SplinerTeacher:
                  side_switch_d: float = SIDE_SWITCH_D,
                  inside_speed_scale: float = INSIDE_SPEED_SCALE,
                  fixed_pred_time: float = 0.0):
-        if not isinstance(base, RacelineTeacher):
-            raise TypeError("SplinerTeacher wraps a RacelineTeacher: the reference line, the speed "
-                            "profile and the plan fit are all its reference, not a reimplementation")
-        self.base = base
-        self.device = base.device
+        super().__init__(base, env=None)          # attach last: the fields below are its inputs
         self.evasion_dist = float(evasion_dist)
         self.bound_mindist = float(bound_mindist)
         self.lookahead = float(lookahead)
@@ -162,126 +161,12 @@ class SplinerTeacher:
         self.fixed_pred_time = float(fixed_pred_time)
         self.shape = torch.tensor(_SHAPE, dtype=torch.float32, device=self.device)   # (6, 4)
         self.knots = torch.tensor(CONTROL_S, dtype=torch.float32, device=self.device)
-        self.env = None
-        self.track = None
-        self.half_width = 0.155
-        self.v_max = 8.0
         #: Which side the pass in progress is committed to, per row: +1 left, -1 right, 0 none.
         #: Held across steps because the side-switch rule is about *changing* it, not about
         #: picking it in the first place.
         self._side: Optional[torch.Tensor] = None
-        #: Which opponent column `_opponents` last picked per row; `_opponent_speed` reads it and
-        #: the tests assert on it.
-        self._nearest: Optional[torch.Tensor] = None
-        #: Last `decide()`, for the tests, the census and anything that wants to plot the state
-        #: machine: the state code per row and the lateral offset it asked for.
-        self.last_state: Optional[torch.Tensor] = None
-        self.last_offset: Optional[torch.Tensor] = None
         if env is not None:
             self.attach(env)
-
-    # ------------------------------------------------------------------ wiring
-    def attach(self, env) -> "SplinerTeacher":
-        """Bind the race this planner is driving in: the walls, the cars, the speed ceiling."""
-        self.env = env
-        self.track = env.sim.track
-        self.half_width = 0.5 * float(env.cfg.vehicle.width)
-        self.v_max = float(env.ecfg.v_max_policy)
-        return self
-
-    #: `label_grip` and `speed_scale` live on the reference teacher, so that every caller which
-    #: sets them (a slot's speed band, `learn.common.make_teacher`) reaches the thing that uses
-    #: them. Same contract as `InteractiveTeacher`.
-    @property
-    def label_grip(self) -> str:
-        return self.base.label_grip
-
-    @label_grip.setter
-    def label_grip(self, v: str):
-        self.base.label_grip = v
-
-    @property
-    def speed_scale(self):
-        return self.base.speed_scale
-
-    @speed_scale.setter
-    def speed_scale(self, v):
-        self.base.speed_scale = v
-
-    @property
-    def offset_limit(self):
-        return self.base.offset_limit
-
-    @offset_limit.setter
-    def offset_limit(self, v):
-        self.base.offset_limit = v
-
-    def project(self, xy, tid=None):
-        return self.base.project(xy, tid)
-
-    # ------------------------------------------------------------------ the command
-    @torch.no_grad()
-    def plan_action(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
-                    v_max: float = 8.0, spec=None, iters: int = 6,
-                    offset: Optional[torch.Tensor] = None,
-                    idx: Optional[torch.Tensor] = None,
-                    plan_speed: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """(B, ACT_DIM) the reference teacher's plan through the offset this planner chose.
-
-        Every argument means what it means on `RacelineTeacher.plan_action`. `offset` is added to
-        the evasion offset rather than replacing it: it is how a scripted lane change reaches the
-        teacher, and a car doing both is doing both.
-        """
-        d, _mode, scale = self.decide(state, tid)
-        a = self.base.plan_action(state, P, tid, v_max, spec, iters=iters,
-                                  offset=self._merge_offset(offset, d),
-                                  idx=idx, plan_speed=plan_speed)
-        return self._scale_plan_speed(a, scale)
-
-    @torch.no_grad()
-    def __call__(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
-                 offset: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """The direct (steer, speed) action space, through the same offset.
-
-        The spline is a *path*, so it carries into this space unchanged; only the speed scaling
-        has to be applied to a column instead of to the plan's two knots.
-        """
-        d, _mode, scale = self.decide(state, tid)
-        cmd = self.base(state, P, tid, offset=self._merge_offset(offset, d))
-        return torch.stack([cmd[:, 0], cmd[:, 1] * scale.to(cmd.dtype)], 1)
-
-    @staticmethod
-    def _merge_offset(caller, chosen):
-        """The offset to hand the reference teacher: the caller's, this planner's, or neither.
-
-        `None` has to survive when neither has one, and not become a tensor of zeros, because the
-        teacher does not treat them the same: given any offset it measures its own off-line error
-        as the signed cross-track distance to that line, and given none it uses the Euclidean
-        distance to the nearest reference point. The two differ by the line's discretisation, so a
-        zeros tensor would make a car with nothing to race drive a hair off the raceline teacher's
-        own speed -- and this baseline's solo pace is exactly what its traffic pace is read
-        against."""
-        if chosen is None:
-            return caller
-        return chosen if caller is None else caller + chosen
-
-    @staticmethod
-    def _scale_plan_speed(action: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        """Scale a normalized plan's two speed targets per row -- the arithmetic
-        `F1VecEnv._opponent_actions` uses for a slot's speed band, for the same reason: the path
-        is unchanged and the profile along it is not.
-
-        An unscaled row is left alone rather than multiplied by one: `(x + 1) * 1 - 1` is not `x`
-        in float32, and a car with nothing to race would otherwise get a plan a few 1e-4 away from
-        the reference teacher's -- which is the one thing this baseline's solo pace must not be.
-        The row test does it without a host sync, which a `scale.all()` short circuit would cost
-        on every step of every race.
-        """
-        out = action.clone()
-        s = scale.to(out.dtype)[:, None]
-        scaled = ((out[:, -2:] + 1.0) * s - 1.0).clamp(-1.0, 1.0)
-        out[:, -2:] = torch.where(s == 1.0, out[:, -2:], scaled)
-        return out
 
     # ------------------------------------------------------------------ the planner
     @torch.no_grad()
@@ -301,7 +186,10 @@ class SplinerTeacher:
         if self._side is None or self._side.shape != (B,) or self._side.device != dev:
             self._side = torch.zeros(B, device=dev, dtype=dt)
 
-        seen = self._opponents(state, tid)
+        # Distances stretch with speed, and the rear bound is the spline's own arc: a manoeuvre is
+        # not over when the other car's gap goes negative, it is over when the line has rejoined.
+        stretch = self._stretch(state)
+        seen = self._opponents(state, tid, CONTROL_S[0] * stretch)
         if seen is None:
             # No opponent structure at all -- a solo env, or a caller this planner cannot match to
             # the simulator's rows. `None` rather than zeros, so the reference teacher takes the
@@ -310,10 +198,6 @@ class SplinerTeacher:
             self.last_state, self.last_offset = mode, zero
             return None, mode, one
         gap, d_opp, idx_opp, tid_b, ego_d = seen
-
-        # Distances stretch with speed: the same manoeuvre needs more road at pace.
-        v = state[:, 3].to(dt)
-        stretch = (1.0 + v / max(self.v_max, 1e-6)).clamp(1.0, 1.5)
 
         # Constant-time prediction: where the opponent will be by the time we are there. Advancing
         # the apex along the arc is upstream's whole prediction, and it is what aims the spline at
@@ -375,78 +259,14 @@ class SplinerTeacher:
     def _side_clearance(self, idx: torch.Tensor, tid: torch.Tensor, d_opp: torch.Tensor,
                         stretch: torch.Tensor):
         """Free space at the left and right evasion points of the opponent's station [m each]."""
-        base = self.base
-        p = base.xy[tid, idx]                                          # (B, 2) reference point
-        t_ = base.tan[tid, idx]
-        n = torch.stack([-t_[..., 1], t_[..., 0]], -1)                 # left-of-travel unit normal
-        step = (self.evasion_dist * stretch).to(p.dtype)
-        d = d_opp.to(p.dtype)
-        left = p + (d + step)[:, None] * n
-        right = p + (d - step)[:, None] * n
-        return (self.track.sample_edt(left, tid).to(d_opp.dtype),
-                self.track.sample_edt(right, tid).to(d_opp.dtype))
+        step = self.evasion_dist * stretch
+        return (self._clearance_at(idx, tid, d_opp + step).to(d_opp.dtype),
+                self._clearance_at(idx, tid, d_opp - step).to(d_opp.dtype))
 
     def _corner_sign(self, idx: torch.Tensor, tid: torch.Tensor) -> torch.Tensor:
         """+1 where the reference line curves left, -1 right, 0 straight. `RacelineTeacher.kappa`
         is signed left-positive, the same sign convention as the lateral offset."""
         return torch.sign(self.base.kappa[tid, idx])
-
-    def _opponents(self, state: torch.Tensor, tid: Optional[torch.Tensor]):
-        """(gap, d_opp, idx_opp, tid, ego_d) for the car each row is racing, or None.
-
-        `gap` is the signed arc to it and `d_opp` its lateral offset from the reference line: the
-        Frenet pair upstream is written in. The longitudinal half comes from the env's own
-        `signed_gaps`, which already wraps at the start line and is already batched; the lateral
-        half is computed here because `RacelineTeacher.project` returns an *unsigned* distance,
-        and which side the other car is on is the entire question.
-
-        None whenever there is nothing to plan against: no race, or a caller that passed a state
-        this planner cannot match to the simulator's rows. Driving the raceline in that case is
-        the honest answer; guessing where the opponents are is not.
-        """
-        env = self.env
-        if env is None or int(getattr(env, "M", 1)) < 2 or self.track is None:
-            return None
-        if env.sim.other_idx is None or state.shape[0] != env.sim.state.shape[0]:
-            return None
-        B = state.shape[0]
-        dev, dt = state.device, state.dtype
-        tid_b = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
-
-        gaps = env.signed_gaps(env.sim.s, env.sim.tid).to(dt)          # (B, C) + is ahead of me
-        other = env.sim.other_idx                                       # (B, C) row of each
-        C = gaps.shape[1]
-        tid_o = tid_b[:, None].expand(B, C).reshape(-1)
-        d_o = self._lateral(state[other.reshape(-1), :2], tid_o)[0].view(B, C)
-
-        # The car that matters is the one this row is closest to passing: the smallest arc that is
-        # not already behind by the whole spline. Ranking that way finishes the pass in progress
-        # before starting the next one, which is what a driver does.
-        stretch = (1.0 + state[:, 3].to(dt) / max(self.v_max, 1e-6)).clamp(1.0, 1.5)
-        rear = CONTROL_S[0] * stretch
-        rank = torch.where(gaps > rear[:, None], gaps, torch.full_like(gaps, float("inf")))
-        j = rank.argmin(1)
-        ar = torch.arange(B, device=dev)
-        far = torch.full((B,), float("inf"), device=dev, dtype=dt)
-        g = torch.where(torch.isfinite(rank[ar, j]), gaps[ar, j], far)
-        idx_opp = self.base.project(state[other[ar, j], :2], tid_b)[0]
-        ego_d = self._lateral(state[:, :2], tid_b)[0]
-        self._nearest = j
-        return g, d_o[ar, j], idx_opp, tid_b, ego_d
-
-    def _opponent_speed(self, state: torch.Tensor) -> torch.Tensor:
-        """Speed of the car `_opponents` picked, per row."""
-        ar = torch.arange(state.shape[0], device=state.device)
-        return state[self.env.sim.other_idx[ar, self._nearest], 3].to(state.dtype)
-
-    def _lateral(self, xy: torch.Tensor, tid: torch.Tensor):
-        """(signed metres left of the reference line, nearest reference index) of each point."""
-        base = self.base
-        idx = base.project(xy, tid)[0]
-        t_ = base.tan[tid, idx]
-        n = torch.stack([-t_[..., 1], t_[..., 0]], -1)
-        return ((xy - base.xy[tid, idx]) * n).sum(-1), idx
-
 
 class PredictiveSplinerTeacher(SplinerTeacher):
     """ForzaETH `predictive spliner`: the same planner, aimed where the other car will be.

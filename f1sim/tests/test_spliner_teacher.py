@@ -345,3 +345,88 @@ def test_both_published_planners_are_registered_and_share_one_implementation():
     assert type(by_kind["forzaeth_pred"]) is PredictiveSplinerTeacher
     assert by_kind["forzaeth"].fixed_pred_time == 0.0
     assert by_kind["forzaeth_pred"].fixed_pred_time == FIXED_PRED_TIME
+
+
+# ============================================================ the lane-switch family
+def test_the_lane_planner_holds_its_lane_and_comes_back():
+    """Two claims a fixed-lane planner lives or dies on, and neither shows in a rollout.
+
+    **Hysteresis**: an argmin over lanes re-run every step flips between two nearly equal ones at
+    the step rate, and the car weaves. **The rate limit**: the lane is a decision, the line to it
+    is a manoeuvre, so the commanded offset may not step.
+    """
+    from f1sim.lane_teacher import CHANGING, LANE_RATE, LaneSwitchTeacher, RACING as L_RACING
+    env = _env(envs=4, race_size=2, opponent="teacher")
+    env.reset(seed=31)
+    p = LaneSwitchTeacher(env.teacher, env=env)
+    idx, _ = _lopsided_station(env, CHEAP)
+    step_cap = LANE_RATE * p.dt
+    prev, offs = 0.0, []
+    for _ in range(80):                       # a car sitting in the racing line, held there
+        _scene(env, 0, 1, opp_idx=idx, gap_m=4.0)
+        d, mode, _ = p.decide(env.sim.state, env.sim.tid)
+        o = float(d[0])
+        assert abs(o - prev) <= step_cap + 1e-6, \
+            f"the offset stepped {abs(o - prev):.3f} m in one tick, cap {step_cap:.3f}"
+        prev = o
+        offs.append(o)
+    assert abs(offs[-1]) > 0.05, f"it never left the blocked lane: {offs[-5:]}"
+    lane_held = p._lane.clone()
+    for _ in range(40):                       # the same scene again: the lane must not wander
+        _scene(env, 0, 1, opp_idx=idx, gap_m=4.0)
+        p.decide(env.sim.state, env.sim.tid)
+    assert torch.equal(p._lane, lane_held), "the lane moved with nothing about the scene changing"
+    # and with the road clear it returns to the racing line, at the same bounded rate
+    for _ in range(400):
+        _scene(env, 0, 1, opp_idx=idx, gap_m=40.0)
+        d, mode, _ = p.decide(env.sim.state, env.sim.tid)
+    assert abs(float(d[0])) < 0.05, f"it never came back to the line: {float(d[0]):.3f}"
+    assert int(mode[0]) == L_RACING
+
+
+def test_the_lane_planner_is_registered_and_says_what_it_is_not():
+    """The registry entry has to carry the claim, because the claim is the honest part: this is
+    the UNICORN *family*, not a reproduction, and a reader choosing an opponent sees only this."""
+    from f1sim.lane_teacher import LaneSwitchTeacher
+    kind = osl.kind_of("lane_switch")
+    assert kind.teacher and kind.available
+    assert "재현이 아니라" in kind.note, "the entry does not say it is not a reproduction"
+    env = _env(envs=12, race_size=3, opponent="slots",
+               opponent_slots=[{"kind": "lane_switch"}, {"kind": "forzaeth"}])
+    env.reset(seed=29)
+    by_kind = dict(zip(env.alt_teacher_kinds, env.alt_teachers))
+    assert isinstance(by_kind["lane_switch"], LaneSwitchTeacher)
+    assert by_kind["lane_switch"].base is env.teacher
+
+
+def test_an_empty_road_is_the_reference_teacher_for_the_lane_planner_too():
+    """Same claim as the spline family's, for the same reason: a baseline's solo pace is what its
+    traffic pace is read against, so with nothing to race it has to be the reference teacher."""
+    from f1sim.lane_teacher import LaneSwitchTeacher
+    from f1sim.mpc import PlanSpec
+    env = _env(envs=6, race_size=1, opponent="policy")
+    env.reset(seed=33)
+    base = common.make_teacher([_track_and_raceline(CHEAP)[1]], env)
+    p = LaneSwitchTeacher(base, env=env)
+    P, tid, spec = env.sim.P, env.sim.tid, PlanSpec()
+    assert torch.equal(base.plan_action(env.sim.state, P, tid, env.ecfg.v_max_policy, spec),
+                       p.plan_action(env.sim.state, P, tid, env.ecfg.v_max_policy, spec))
+
+
+def test_a_lane_planner_that_could_not_come_back_is_refused():
+    """The bound above, as a constructor check rather than a comment.
+
+    Found the hard way: with the first hysteresis chosen by feel, returning from the innermost
+    lane was worth 0.12 and the threshold was 0.25, so every lane was absorbing and the baseline
+    drove a permanent offset. That reads as a tuning problem and is an arithmetic one, so the
+    arithmetic is checked where the numbers are set.
+    """
+    from f1sim.lane_teacher import LaneSwitchTeacher
+    env = _env(envs=4, race_size=2, opponent="teacher")
+    env.reset(seed=37)
+    with pytest.raises(ValueError, match="no way back to the racing line"):
+        LaneSwitchTeacher(env.teacher, env=env, hysteresis=0.25)
+    with pytest.raises(ValueError, match="no way back to the racing line"):
+        LaneSwitchTeacher(env.teacher, env=env, switch_cost=1.0, offline_cost=1.0)
+    with pytest.raises(ValueError, match="racing line"):
+        LaneSwitchTeacher(env.teacher, env=env, lanes=(0.3, 0.6))     # nowhere to come back to
