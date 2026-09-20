@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="f1sim/f1sim/assets/branding/f1sim-128.png" width="96" alt="f1sim">
+
 # F1TENTH&nbsp;E2E
 
 ### An end-to-end driving policy for 1/10-scale autonomous racing — and the batched simulator written to train it
@@ -63,20 +65,65 @@ resets</b>, marked on screen.</sub></td>
 
 ## Quick start
 
-CPU only. No GPU, no ROS, about five minutes.
+You need **Python 3.10+** and a Linux machine. A GPU is optional — training is much faster with one,
+everything else runs fine without.
 
 ```bash
 git clone --recurse-submodules https://github.com/shchon11/F1tenth_E2E.git
 cd F1tenth_E2E
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e f1sim
-python3 -m f1sim.viewer.console
+./setup.sh              # makes .venv, picks the right torch for your hardware, checks it runs
+source .venv/bin/activate
+f1sim-console
 ```
 
-Pick a map in the left column and press **시작**. That is the whole first run — the defaults are
-정방향 / 없음 / 무작위, so **choosing a map is enough to start**
-([viewer design](docs/viewer_design.md#the-map-card-2026-09-12)). The console is the one thing that needs
-PyQt5, which is in no extra on purpose: provide it yourself.
+`setup.sh` looks at what the machine actually has — it reads your NVIDIA driver version and installs
+the CUDA build that driver can load, or a ROCm build, or the CPU build if there is no GPU. It touches
+nothing outside the checkout. Re-run it any time; it upgrades in place.
+
+<table>
+<tr><td><code>./setup.sh --cpu</code></td><td>CPU torch even where there is a GPU</td></tr>
+<tr><td><code>./setup.sh --no-viewer</code></td><td>skip the GUI (a headless training box)</td></tr>
+<tr><td><code>./setup.sh --desktop</code></td><td>also put <b>f1sim Console</b> in the application menu</td></tr>
+<tr><td><code>./setup.sh --venv ~/envs/f1</code></td><td>put the virtualenv somewhere else</td></tr>
+</table>
+
+**Your first run:** pick a policy under **① 정책 런**, a map under **② 맵**, press **시작**. The line
+above the button always says which of the two is still missing. Everything else has a working default
+(정방향 / 없음 / 무작위), so those two choices are the whole first run. Press <kbd>H</kbd> for the keys.
+
+### Where it keeps things
+
+Nothing is written outside your home directory, and every location has an environment variable:
+
+| what | default | override |
+| --- | --- | --- |
+| runs and checkpoints | `~/f1sim_runs` | `$F1SIM_RUNS` |
+| maps you import | `~/.f1sim/maps` | `$F1SIM_MAPS` |
+| environments you draw | `~/f1sim_scenes` | `$F1SIM_SCENES` |
+| console settings | `~/.f1sim/console.json` | `$F1SIM_CONSOLE_PREFS` |
+
+Point `$F1SIM_RUNS` at a scratch disk and nothing else has to change.
+
+### If something does not work
+
+| | |
+| --- | --- |
+| `No module named venv` | `sudo apt install python3-venv` (Debian/Ubuntu) |
+| the console opens but no map appears | the submodules did not clone: `git submodule update --init --recursive` |
+| `torch.cuda.is_available()` is False | your driver is older than the wheel. `./setup.sh --cuda cu121`, or `./setup.sh --cpu` |
+| recording is greyed out | `sudo apt install ffmpeg` — everything else works without it |
+| the GUI uses the GPU you are training on | it picks the emptiest card; pin it with the 연산 장치 control under 고급 설정 |
+
+### Install it as an application
+
+```bash
+packaging/install-desktop-entry.sh --venv .venv    # adds it to the application menu, per user
+packaging/build-appimage.sh                        # a portable single file, dist/f1sim-Console-*.AppImage
+```
+
+The AppImage carries the window, not torch: a CUDA build is gigabytes and has to match the driver of
+whatever machine runs it. The simulation runs in a separate process under your own Python — set
+`F1SIM_WORKER_PYTHON=/path/to/python` if it cannot find one with torch installed.
 
 <details>
 <summary><b>Use it as a library</b> — four lines to a stepping simulator</summary>
@@ -374,6 +421,7 @@ target-period steering gain, latency separated from `k_us`, motion distortion, f
 | [`f1sim_ros/`](f1sim_ros/) | the ROS 2 graph: `policy_node`, `controller_node`, `eval`, `system_check`, the `vesc_sim` and standalone bridges, `pure_pursuit`, `teleop`, launch files, config, sample maps |
 | [`f1sim_interfaces/`](f1sim_interfaces/) | `Plan` and `PolicyState`: the two messages on the boundary between the policy and the controller |
 | [`external/`](external/) · [`docs/`](docs/) | pinned third-party submodules (see [below](#requirements-testing-third-party)); documentation, figures and [research notes](docs/research/) |
+| [`setup.sh`](setup.sh) · [`packaging/`](packaging/) | one-command install (detects CUDA / ROCm / CPU); the desktop entry, its per-user installer and the AppImage build |
 
 **[docs/README.md](docs/README.md) is the documentation index**: the guides
 ([getting started](docs/getting_started.md), [architecture](docs/architecture.md),
@@ -415,12 +463,19 @@ Dated reports with protocol, data, and what each does *not* establish. Newest fi
 
 ## Requirements, testing, third-party
 
-Python ≥ 3.10 with `numpy`, `torch`, `scipy`, `scikit-image`, `pyyaml`, `pillow`, `matplotlib`,
+[`./setup.sh`](setup.sh) installs all of this and is the supported way in. What it installs: Python
+≥ 3.10 with `numpy`, `torch`, `scipy`, `scikit-image`, `pyyaml`, `pillow`, `matplotlib`,
 `websockets`; extras `[gym]`, `[learn]`, `[viewer]`, `[dev]` in
-[`f1sim/pyproject.toml`](f1sim/pyproject.toml). **PyQt5 is in no extra** and the console needs it.
-CUDA is recommended for training and real-time multi-car simulation, not required; ROS 2 Humble only
-for `f1sim_ros/`. Most of the test suite runs on CPU, and so do the benchmark's `plan`, `geometry`,
-`gate` and `feasibility` stages ([benchmark.md](docs/benchmark.md#checking-it-without-a-gpu)):
+[`f1sim/pyproject.toml`](f1sim/pyproject.toml), plus PyQt5, which is in no extra because a headless
+training box does not want it. CUDA is recommended for training and real-time multi-car simulation,
+**not required** — the console, the tests and the CPU benchmark stages all run without a GPU. ROS 2
+Humble is needed only for `f1sim_ros/`, and `ffmpeg` only to record video.
+
+Nothing in the package assumes a particular machine: the GPU is chosen by free memory rather than by
+index (`auto` in the 연산 장치 control), and every directory it writes to has an environment variable
+([above](#where-it-keeps-things)). Most of the test suite runs on CPU, and so do the benchmark's
+`plan`, `geometry`, `gate` and `feasibility` stages
+([benchmark.md](docs/benchmark.md#checking-it-without-a-gpu)):
 
 ```bash
 cd f1sim && python3 -m pytest tests -q
