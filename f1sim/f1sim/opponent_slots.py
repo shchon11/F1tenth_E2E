@@ -120,6 +120,20 @@ KINDS: Tuple[DriverKind, ...] = (
                teacher_factory="f1sim.interactive_teacher:InteractiveTeacher",
                pending="`f1sim/interactive_teacher.py` 가 이 트리에 없습니다 "
                        "(2026-09-16 병합 이후로는 있어야 정상입니다)."),
+    DriverKind("forzaeth", "ForzaETH spliner",
+               "ForzaETH race stack (arXiv:2403.11784) 의 spliner local planner. 상대차 현재 위치를 "
+               "기준으로 7점 spline 을 그려 옆으로 비켜 갑니다 (`f1sim.spliner_teacher`). "
+               "우리 정책의 추월을 견줄 외부 기준선입니다.",
+               teacher=True, module="f1sim.spliner_teacher",
+               teacher_factory="f1sim.spliner_teacher:SplinerTeacher",
+               pending="`f1sim/spliner_teacher.py` 가 이 트리에 없습니다."),
+    DriverKind("forzaeth_pred", "ForzaETH predictive spliner",
+               "같은 planner 를 상대차의 0.5 초 뒤 예측 위치에 겨눕니다. 원 논문은 상대 속도를 "
+               "Gaussian process 로 추정하지만 여기서는 시뮬레이터가 참값을 알므로, 그 추정의 "
+               "오차가 없는 낙관적인 상한으로 읽어야 합니다.",
+               teacher=True, module="f1sim.spliner_teacher",
+               teacher_factory="f1sim.spliner_teacher:PredictiveSplinerTeacher",
+               pending="`f1sim/spliner_teacher.py` 가 이 트리에 없습니다."),
     DriverKind("policy", "정책 체크포인트",
                "저장된 정책이 스스로 주행합니다. 자기 라인을 잡고 자기 실수를 합니다.",
                checkpoint=True),

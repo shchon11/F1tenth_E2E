@@ -69,6 +69,11 @@ class PoolEntry:
     #: cannot run its own. What it buys is a refusal instead of a silent mismatch -- a policy whose
     #: plans were fitted to a friction-limited tracker means something else on the untouched one.
     arm: str = "legacy"
+    #: A `learn.watch.DialSource` for a conditional ("dial") entry, or None for an unconditional
+    #: one. `.c(batch)` is its (batch, cond_dim) input. An opponent has no operator turning a dial for it, so it
+    #: is given one and holds it: the cautious end of the training range, which is what a car you
+    #: are racing against should be doing rather than something the learner cannot anticipate.
+    cond: object = None
 
     @property
     def memory_kind(self) -> str:
@@ -161,11 +166,19 @@ class OpponentPool:
             # No `allow_oracle`, and no slot field that could ask for one: an entry trained on
             # privileged tokens cannot drive off the observation the pool is handed, and an
             # opponent that needs an oracle is not an opponent a deployable policy would ever meet.
-            model, extra = load_checkpoint(path, device, allow_controller=(want != "legacy"))
+            # `allow_conditional`: a dial checkpoint is a policy like any other once something
+            # supplies its dial, and this does (below). Refusing it made the best policies this
+            # project produces the only ones that could not be raced against.
+            model, extra = load_checkpoint(path, device, allow_controller=(want != "legacy"),
+                                           allow_conditional=True)
             _check_compatible(path, dict(model.meta), env, spec)
+            cond = None
+            if int((model.meta.get("cond") or {}).get("dim", 0) or 0):
+                from .watch import dial_for
+                cond = dial_for(model, device)          # the cautious end of the training range
             entries.append(PoolEntry(path=str(path), model=model,
                                      runtime=runtime_for(model, env.B, device), meta=extra,
-                                     arm=recorded))
+                                     arm=recorded, cond=cond))
         return cls(entries, env.B, env.act_dim, device)
 
     @torch.no_grad()
@@ -181,8 +194,9 @@ class OpponentPool:
         scan, proprio = flatten_obs(obs)
         out = torch.zeros(scan.shape[0], self.act_dim, device=scan.device, dtype=scan.dtype)
         for j, ent in enumerate(self.entries):
+            c = None if ent.cond is None else ent.cond.c(scan.shape[0])
             action, _logp, ent.hidden = ent.model.act(ent.runtime.observe(scan, proprio), proprio,
-                                                      deterministic=True, h=ent.hidden)
+                                                      deterministic=True, c=c, h=ent.hidden)
             out = torch.where((driver == OPP_DRIVER_POOL + j)[:, None], action.to(out.dtype), out)
         return out
 

@@ -296,6 +296,9 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         #: `paintGL`, which is the one place the context is current and a frame is in hand.
         self.recorder = None
         self._rec_next = 0.0
+        #: The frame's own simulated clock at which the next video frame is due. None until
+        #: a recording starts, then set from the first frame that carries a `t`.
+        self._rec_next_sim: Optional[float] = None
         #: The frame the window actually drew last. A capture re-renders *that*, so a clip is the
         #: session as it was watched rather than a second draw of whatever arrived in between.
         self._last_drawn: Optional[dict] = None
@@ -753,31 +756,57 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         if dt is not None:
             self.frame_timed.emit(dt)
 
+    #: Most video frames one paint may stand in for. A session ahead of the window repeats its
+    #: last image to keep the clip's time axis true; a *jump* in the simulated clock (a reset, a
+    #: resumed session) must not turn into seconds of frozen video, so it is bounded.
+    REC_MAX_REPEAT = 8
+
     def _pump_recorder(self) -> None:
         """Offer the recorder a frame, if one is due. Inside `paintGL`, after the window's draw.
 
-        Paced by the clock rather than by the paint rate: the window repaints at whatever the
-        display and the keepalive produce, and a clip has to come out at the frame rate it says it
-        has. A capture that is late is simply the next one; a capture the encoder cannot take is
-        dropped and counted by the recorder, never waited for.
+        **Paced by simulation time, not by the wall clock.** The clip is of the car, and the car
+        lives in sim time: a session running at 0.44x real time used to produce a video where
+        everything moved at 0.44x, because a frame was taken every 1/30 s of *our* time. Sampling
+        the frame's own `t` instead means one second of video is one second of simulated driving,
+        whatever the session managed to run at -- which is the only rate a lap time in the clip can
+        be read against.
+
+        A session that runs faster than real time simply has more candidate frames per video
+        frame; one that runs slower has fewer, and repeats the last one rather than stretching
+        time. Without a frame's `t` (a session that has not stepped yet) nothing is written.
         """
         rec = self.recorder
         if rec is None or not rec.ok or self._last_drawn is None:
             return
-        now = time.perf_counter()
-        if now < self._rec_next:
+        sim_t = self._last_drawn.get("t")
+        if sim_t is None:
+            return                      # no simulated clock yet; nothing to pace against
+        sim_t = float(sim_t)
+        if self._rec_next_sim is None:
+            self._rec_next_sim = sim_t
+        if sim_t < self._rec_next_sim:
             return
-        # Next deadline from the one just passed, not from now, so a slow frame does not make the
-        # clip drift slower than its stated rate for ever after.
-        self._rec_next = max(now - rec.due, self._rec_next) + rec.due
         spec = rec.spec
         rgb = self.render_offscreen(spec.width, spec.height, spec.camera,
                                     None if spec.overlays else False)
-        rec.submit(rgb)
+        # How many video frames this paint covers. Normally one; more when the session is running
+        # faster than the window can paint, in which case the image repeats rather than the clip
+        # quietly running fast. Capped so a jump in the simulated clock is not a burst of frames.
+        behind = int((sim_t - self._rec_next_sim) / rec.due) + 1
+        written = max(1, min(behind, self.REC_MAX_REPEAT))
+        for _ in range(written):
+            rec.submit(rgb)
+        # Advance by exactly what was written, so the clip's clock tracks the simulated one without
+        # drifting; re-sync outright only when the simulated clock jumped further than the repeat
+        # cap can cover, which is a reset or a resumed session rather than a slow frame.
+        self._rec_next_sim += rec.due * written
+        if sim_t - self._rec_next_sim > rec.due * self.REC_MAX_REPEAT:
+            self._rec_next_sim = sim_t
 
     def start_recording(self, rec) -> None:
         self.recorder = rec
         self._rec_next = time.perf_counter()
+        self._rec_next_sim = None       # set from the first frame's own clock
 
     def stop_recording(self):
         rec, self.recorder = self.recorder, None

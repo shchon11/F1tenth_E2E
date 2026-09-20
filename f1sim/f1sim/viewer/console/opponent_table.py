@@ -133,7 +133,8 @@ def _read_checkpoint_facts(path: str):
         return ("특권 상대차(oracle) 체크포인트입니다 — 시뮬의 참 상대차 상태를 입력으로 받으므로 "
                 "콘솔·내보내기·ROS 노드에서 주행할 수 없습니다. A0 대조군(opp_token 없음)을 쓰세요.", arm)
     if int(meta.get("cond_dim", 0)):
-        return ("조건부(conditional) 체크포인트입니다 — 조건 입력 없이는 주행할 수 없습니다.", arm)
+        return ("조건부(dial) 체크포인트입니다 — 상대차로는 학습 범위의 가장 보수적인 그립 값으로 "
+                "고정해 주행합니다 (조작할 다이얼이 없으므로).", arm)
     mem = "메모리" if meta.get("memory") else (
         "스캔 채널" if (meta.get("scan_channels") or {}).get("channels") else "피드포워드")
     return f"제어기 {arm} · {mem} · act_dim {int(meta.get('act_dim', 2))}", arm

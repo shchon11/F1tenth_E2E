@@ -206,8 +206,17 @@ class _Problem:
             self.last_jac = torch.func.jacfwd(self.values)(torch.tensor(z)).detach().numpy()
         return self.last_jac if jac else self.last_y
 
+    @torch.enable_grad()
     def restore(self, z):
-        """Restore geometry first, then physical feasibility at modest constant speed."""
+        """Restore geometry first, then physical feasibility at modest constant speed.
+
+        `enable_grad` because this solver needs reverse-mode autograd and its callers do not know
+        that. A raceline is built wherever one is missing, including inside `learn.evaluate`, which
+        is `@torch.no_grad()` from end to end -- and under that decorator `torch.autograd.grad`
+        below raises "element 0 of tensors does not require grad". The failure only ever appeared
+        on a cache miss, so every run that reused a prebuilt line was fine and the first evaluation
+        on a new map died; the requirement belongs to the code that has it, not to every caller.
+        """
         energy = (min(2., .4 * self.vmax) / self.vmax) ** 2
         start = z.copy()
         start[self.controls:] = energy

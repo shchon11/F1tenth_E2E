@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from ..gym_env import OPP_FUTURE_MODELS, EnvConfig
+from .. import opponent_slots as opp_sl
 from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events, split_events
 from ..params import Config
@@ -68,7 +69,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              raceline_objective: str | None = None, teacher_limits: dict | None = None,
              speed_mode: str | None = None, dial_offset: float = 0.0,
-             opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
+             opp_slots="", opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              opp_reactive_probs: dict | None = None,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
              controller: str = "legacy", estimator: str = "",
@@ -125,6 +126,13 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
     torch.manual_seed(seed)
     np.random.seed(seed)
+    # Triton compiles for the CURRENT device, not for the device its arguments live on, so on a
+    # machine with two different cards an evaluation on the second one gets a kernel built for the
+    # first and dies at launch with "no kernel image is available for execution on the device".
+    # The arguments are all on `device` already; this is the one thing that says so to Triton.
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        torch.cuda.set_device(dev.index if dev.index is not None else 0)
     cfg = cfg or Config()
     if graph_runtime:
         cfg.sim.compile = False
@@ -136,7 +144,22 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     rl_kw.update(limits)                       # same profile the teacher then drives on it
     if raceline_objective is not None:
         rl_kw["objective"] = raceline_objective
-    trs, rls = common.load_tracks(tracks, racelines=teacher or (race_size > 1 and opponent == "teacher"), **rl_kw)
+    # A named opponent, if one was asked for. Parsed with the trainer's own parser, so that a table
+    # which trains is a table which evaluates -- one spelling, which is what `opponent_slots` is
+    # for. Resolved here and not later because whether the racelines are needed depends on it: a
+    # slot driven by any teacher kind follows one, and `make_env` would otherwise rebuild them
+    # itself, ignoring the margin and the acceleration limits this run was given.
+    slots = None
+    if opp_slots:
+        slots = opp_slots if isinstance(opp_slots, (list, tuple)) else opp_sl.parse_slots(opp_slots)
+        if race_size < 2:
+            raise ValueError(f"--opp-slots needs a race: race_size is {race_size}. A slot table "
+                             f"describes the OTHER cars, and with one car there are none.")
+        opp_sl.validate_slots(slots, race_size)
+        opponent = "slots"
+    want_rls = teacher or (race_size > 1 and opponent == "teacher") or \
+        bool(slots and any(opp_sl.kind_of(sl.kind).teacher for sl in slots))
+    trs, rls = common.load_tracks(tracks, racelines=want_rls, **rl_kw)
     model = None
     metadata = {}
     policy_checkpoint = {}
@@ -227,6 +250,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      # not fire either, because it tests the value this line just produced.
                      opp_token=_oracle_token(spec, model),
                      opp_token_ablate=bool(opp_token_ablate),
+                     opponent_slots=slots,
                      **(opp_extra or {}))
     if ecfg.opp_token != "off" and not (race_size > 1 and mode == "plan"):
         raise ValueError(f"this checkpoint was trained with privileged opponent tokens "
@@ -424,6 +448,14 @@ def main() -> None:
     ap.add_argument("--protocol", choices=["rolling", "trials"], default="rolling")
     ap.add_argument("--race-size", type=int, default=1)
     ap.add_argument("--opponent", choices=["policy", "teacher"], default="policy")
+    ap.add_argument("--opp-slots", default="", metavar="JSON|@FILE",
+                    help="per-opponent configuration, the same JSON `--opp-slots` takes in "
+                         "training: a JSON array with one object per car of a race "
+                         "(race_size - 1 of them), or @path/to/slots.json. This is how a policy is "
+                         f"raced against a *named* opponent -- kind is one of "
+                         f"{'|'.join(opp_sl.KIND_NAMES)}, which includes the reproduced planners "
+                         f"(forzaeth, forzaeth_pred) a published number can be read against. "
+                         "Sets --opponent slots; empty is off.")
     ap.add_argument("--opp-speed-range", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
                     help="fraction of its raceline profile each teacher opponent drives at "
                          "(default: the EnvConfig 0.6 0.8). The benchmark's traffic family uses "
@@ -566,7 +598,7 @@ def main() -> None:
         return evaluate(a.ckpt, names, a.envs, a.steps, a.speed_cap, a.device, seed=a.seed, cfg=config,
                         teacher=a.teacher, action_mode=a.action_mode, protocol=a.protocol,
                         opp_token_ablate=a.opp_token_ablate,
-                        race_size=a.race_size, opponent=a.opponent,
+                        race_size=a.race_size, opponent=a.opponent, opp_slots=a.opp_slots,
                         budget_laps=a.budget_laps if a.budget_laps > 0 else None, max_steps=a.max_steps,
                         raceline_margin=a.raceline_margin, teacher_grip=a.teacher_grip,
                         raceline_objective=a.raceline_objective, speed_mode=a.speed_mode, dial_offset=a.dial_offset,

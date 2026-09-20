@@ -30,6 +30,12 @@ def plan_geometry_speed(state: torch.Tensor, plan_speed: Optional[torch.Tensor])
     return plan_speed
 
 
+#: The speed profile the teacher drives when no limits are given: the minimum-curvature line's
+#: own 6 / 6 / 3, which is what `--teacher-a-*` documents as its default and what every run before
+#: the limits became overridable used.
+DEFAULT_A_LAT, DEFAULT_A_ACC, DEFAULT_A_BRAKE = 6.0, 6.0, 3.0
+
+
 class RacelineTeacher:
     """mode "pp" (default): pure pursuit on the raceline with understeer compensation
     (effective wheelbase L + k_us v^2; the simulated car turns ~20 % less than kinematic at
@@ -61,6 +67,11 @@ class RacelineTeacher:
             lr=wheelbase * nominal.lr / (nominal.lf + nominal.lr),
             s_max=steer_max, mu=mu_nominal, mu_f_scale=mu_f_scale_nominal)
         vehicle = self.vehicle
+        # `None` means "the default profile", which is what every caller that omits them expects;
+        # they are Optional so an explicit limit can override, not so they can be missing.
+        a_lat = DEFAULT_A_LAT if a_lat is None else a_lat
+        a_acc = DEFAULT_A_ACC if a_acc is None else a_acc
+        a_brake = DEFAULT_A_BRAKE if a_brake is None else a_brake
         rls = [raceline] if isinstance(raceline, Raceline) else list(raceline)     # one per track id
         N = max(len(r.xy) for r in rls)
         # speed profiles per grip level: the teacher is privileged, so it brakes and corners for the

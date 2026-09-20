@@ -507,6 +507,13 @@ class Raceline:
         import inspect
         params = {k: v.default for k, v in inspect.signature(Raceline.build).parameters.items() if k != "track"}
         params.update(kw)                                  # key includes the *effective* parameters, defaults too
+        # `objective` is an alias `build` resolves into `optimize_lap_time` before doing anything,
+        # so `None` is not a choice -- it is the absence of one, and the line it produces is the
+        # line `optimize_lap_time` alone already keys. Keeping it in the key would make every
+        # raceline ever cached miss on the day the parameter was restored, and rebuild each one
+        # into a file byte-identical to the one beside it.
+        if params.get("objective") is None:
+            params.pop("objective", None)
         from .params import VehicleParams
         params["vehicle"] = params["vehicle"] or VehicleParams()
         cl = b"" if track.centerline is None else np.asarray(track.centerline, dtype=np.float32).tobytes()

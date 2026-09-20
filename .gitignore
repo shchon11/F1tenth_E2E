@@ -16,3 +16,6 @@ wandb/
 # generated videos (re-render with f1sim.learn.watch --record / --highlights)
 docs/*.mp4
 !docs/promo.mp4
+
+# Editor-local settings; the tree carries none and the toolchain reads none.
+.vscode/
