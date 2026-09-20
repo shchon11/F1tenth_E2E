@@ -288,6 +288,28 @@ def _opponent_mix(env) -> str:
         return str(env.ecfg.opponent)
     from ..opponent_slots import mix_summary
     return mix_summary(slots)
+def auto_device() -> str:
+    """The card the viewer should run on: the CUDA device with the most memory free, else the CPU.
+
+    `torch.device("cuda")` is device 0, and device 0 is where training runs -- so "auto" put the
+    viewer on the busy card every time and both crawled. Free memory is the honest proxy for "not
+    in use", needs no per-machine configuration, and on one GPU it still picks that one.
+    `$F1SIM_VIEWER_DEVICE` overrides it outright.
+    """
+    import torch
+    forced = os.environ.get("F1SIM_VIEWER_DEVICE")
+    if forced:
+        return forced
+    if not torch.cuda.is_available():
+        return "cpu"
+    n = torch.cuda.device_count()
+    if n <= 1:
+        return "cuda"
+    try:
+        free = [torch.cuda.mem_get_info(i)[0] for i in range(n)]
+        return f"cuda:{max(range(n), key=lambda i: free[i])}"
+    except Exception:
+        return "cuda"
 
 
 def resolve_checkpoint(run: str, runs_dir: str, latest: str = "") -> str:
@@ -620,9 +642,13 @@ class SimWorker:
         """Read a checkpoint's metadata without building anything."""
         import torch
         from ..learn import common
+        from ..learn.model import controller_arm_of
         from ..learn.watch import checkpoint_speed_cap, describe_checkpoint_line, latest_run
         ckpt = resolve_checkpoint(run, common.RUNS_DIR, latest_run())
         extra = (torch.load(ckpt, map_location="cpu", weights_only=True) or {}).get("extra", {})
+        blob = torch.load(ckpt, map_location="cpu", weights_only=False) or {}
+        extra = blob.get("extra", {})
+        cond = ((blob.get("meta") or {}).get("cond") or {})
         metrics = extra.get("metrics") or {}
         bits = []
         if "collision_rate" in metrics:
@@ -640,6 +666,11 @@ class SimWorker:
             "progress": describe_checkpoint_line(extra, ckpt),
             "metrics": ("저장 시점: " + " · ".join(bits)) if bits else "체크포인트에 지표 기록 없음",
             "speed_cap": checkpoint_speed_cap(extra, ckpt, fallback=None),
+            # What kind of policy this is, so the form can follow the checkpoint rather than make the
+            # person remember: a dial policy already slows itself for the floor it is told about, and
+            # a tracker clamp on top of that was measured worse on every friction (research note §7).
+            "cond_source": str(cond.get("source") or ""),
+            "controller_arm": controller_arm_of(blob),
         }
 
     # ================================================================ session build
@@ -676,7 +707,7 @@ class SimWorker:
         from ..gym_env import EnvConfig
         from ..learn import common
         from ..learn.model import load_checkpoint
-        from ..learn.watch import (Introspector, actor_runner, checkpoint_speed_cap,
+        from ..learn.watch import (Introspector, actor_runner, checkpoint_speed_cap, dial_for,
                                    describe_checkpoint_line, latest_compatible_run, latest_run,
                                    viewer_config)
 
@@ -708,10 +739,7 @@ class SimWorker:
             autoselect = None
             ckpt_path = resolve_checkpoint(cfg.run, common.RUNS_DIR, latest_run())
 
-        if cfg.device == "auto":
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            device = torch.device(cfg.device)
+        device = torch.device(auto_device() if cfg.device == "auto" else cfg.device)
         if device.type == "cuda" and not torch.cuda.is_available():
             raise StartConfigError("CUDA 를 쓸 수 없습니다 (torch.cuda.is_available() = False). 장치를 cpu 로 바꿔 주세요.")
         # Nothing to compile on the CPU: inductor leaves this graph of hundreds of tiny ops alone.
@@ -885,13 +913,22 @@ class SimWorker:
         env.sim.warmup()
         self._check_cancel(gen)
 
+        # A `dial` checkpoint drives on a number somebody chooses: it is an input, not a reading.
+        # Defaulted to the session's fixed friction when one is pinned (the honest setting for a
+        # floor you have measured), else to the bottom of the training range, which is the safe end.
+        dial = dial_for(model, device, float(cfg.mu) if str(getattr(cfg, "mu_mode", "random")) == "fixed" else None)
+        if dial is not None:
+            self.say(P.MSG_LOG, gen=gen,
+                     text=f"그립 다이얼 정책입니다 · 다이얼 μ={dial.mu:.3f} 로 시작합니다 "
+                          f"(구성 > 그립 다이얼에서 주행 중에 바꿀 수 있습니다)")
         session = {
             "mu_pin": mu_pin,
             "env": env, "model": model, "extra": extra, "intro": intro, "device": device,
             "mode": mode, "ckpt_path": ckpt_path, "mtime": os.path.getmtime(ckpt_path),
             "autoselect": autoselect,
             "obs": obs, "speed_cap": speed_cap, "compile": compile_enabled,
-            "act_fn": actor_runner(model, device, compile_enabled),
+            "dial": dial,
+            "act_fn": actor_runner(model, device, compile_enabled, dial=dial),
             "info_line": describe_checkpoint_line(extra, ckpt_path),
             "track": track, "cfg": cfg, "focus": 0, "k": 0,
             "scenario": session_scenario, "map_legacy": map_legacy,
@@ -1197,6 +1234,7 @@ class SimWorker:
             "ros2": session["ros"].facts() if session.get("ros") is not None else None,
             "randomize": bool(cfg.randomize),
             "mu_mode": str(getattr(cfg, "mu_mode", "random")),
+            "dial": (None if session.get("dial") is None else round(float(session["dial"].mu), 4)),
             "mu": float(getattr(cfg, "mu", 1.0489)),
             "lidar": {"fov": float(env.cfg.lidar.fov), "range_max": float(env.range_max),
                       "n_beams": int(env.n_beams)},
@@ -1307,7 +1345,8 @@ class SimWorker:
             session.update(model=model, extra=extra, mtime=mt,
                            intro=Introspector(model),
                            info_line=describe_checkpoint_line(extra, session["ckpt_path"]),
-                           act_fn=actor_runner(model, session["device"], session["compile"]))
+                           act_fn=actor_runner(model, session["device"], session["compile"],
+                                               dial=session.get("dial")))
             self._sal_cache = None
             self.say(P.MSG_LOG, gen=self.gen, text=f"체크포인트 갱신을 반영했습니다: {session['info_line']}")
         except Exception as exc:
@@ -1526,6 +1565,15 @@ class SimWorker:
             self.say(P.MSG_ACK, seq=seq, command="set_mu", gen=self.gen,
                      state={"mu_mode": mode, "mu": mu, "last_seq": self.seq - 1,
                             "t": float(session["env"].sim.t)})
+        elif kind == P.CMD_SET_DIAL:
+            dial = session.get("dial")
+            if dial is None:
+                self.say(P.MSG_LOG, gen=self.gen, text="이 체크포인트는 그립 다이얼을 받지 않습니다 (조건 입력 없음)")
+            else:
+                dial.set(float(msg.get("mu", dial.mu)))
+            self.say(P.MSG_ACK, seq=seq, command="set_dial", gen=self.gen,
+                     state={"dial": (None if dial is None else round(float(dial.mu), 4)),
+                            "last_seq": self.seq - 1, "t": float(session["env"].sim.t)})
         elif kind == P.CMD_RESET:
             session["obs"], _ = session["env"].reset()
             if session.get("controller") is not None:
@@ -1688,7 +1736,7 @@ class SimWorker:
             self.say(P.MSG_ACK, seq=seq, command="cancel", gen=gen,
                      state={"preparing": self.prepare_gen})
 
-        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU):
+        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU, P.CMD_SET_DIAL):
             # These act on a live session. If one is running, its own thread applies them and acks
             # from there, so the ack means "done" rather than "heard".
             if self._sim_thread is not None and self._sim_thread.is_alive():

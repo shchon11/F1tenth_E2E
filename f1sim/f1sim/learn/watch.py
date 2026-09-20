@@ -626,6 +626,53 @@ def viewer_config(compile_enabled: bool, randomize: bool = True) -> Config:
     return config
 
 
+class DialSource:
+    """The grip dial a conditional policy is driven with, as one live number.
+
+    A `dial` checkpoint takes "how much grip to use" as an input (`learn.conditioning`), and unlike
+    the lab-oracle arm that number is *chosen*, not read off the environment -- by an operator, a
+    supervisor, or the console's slider. One mutable holder rather than a value passed per call, so
+    turning the dial mid-session reaches a runner that may be inside a CUDA graph capture.
+    """
+
+    def __init__(self, mu: float, spec, device, batch: int = 1):
+        from .conditioning import CondSpec
+        self.spec = spec if isinstance(spec, CondSpec) else CondSpec.from_meta(spec)
+        self.device = device
+        self.mu = float(mu)
+        self._c = None
+        self.set(mu)
+
+    def set(self, mu: float) -> float:
+        """Point the dial at a friction. Returns what it actually became."""
+        from .conditioning import mu_to_c
+        self.mu = float(mu)
+        c = mu_to_c(torch.full((1,), self.mu, device=self.device), self.spec)
+        if self._c is None or self._c.shape[0] != 1:
+            self._c = c
+        else:
+            self._c.copy_(c)                # in place: a captured graph holds this buffer
+        return self.mu
+
+    def c(self, batch: int) -> torch.Tensor:
+        return self._c.expand(int(batch), self._c.shape[1])
+
+
+def dial_for(model, device, mu: Optional[float] = None) -> Optional["DialSource"]:
+    """A `DialSource` for a conditional checkpoint, or None for an unconditional one.
+
+    `mu` defaults to the bottom of the training friction range, which is the setting a person who
+    has not measured their floor should be driving at: a dial set under the real friction is slow
+    and safe, and set over it is neither (measured 1 -> 13 collisions/km at +0.4).
+    """
+    meta = getattr(model, "meta", {}) or {}
+    if not int(meta.get("cond_dim", 0)):
+        return None
+    from .conditioning import CondSpec
+    from .grip_estimator import MU_MIN
+    return DialSource(MU_MIN if mu is None else mu, CondSpec.from_meta(meta.get("cond")), device)
+
+
 class MemoryActorRunner:
     """`(scan, proprio) -> mu` for a recurrent / scan-augmented checkpoint, in the viewer worker.
 
@@ -646,9 +693,9 @@ class MemoryActorRunner:
       `actor_fell_back`, so "compiled" never gets quoted for a run that is not.
     """
 
-    def __init__(self, model, actor, device, compile_enabled: bool, graph_step=None):
+    def __init__(self, model, actor, device, compile_enabled: bool, graph_step=None, dial=None):
         from .memory import add_boundary_listener, runtime_for
-        self.actor, self.device = actor, device
+        self.actor, self.device, self.dial = actor, device, dial
         self.rt = runtime_for(model)
         self.batch = None
         self.h = None                      # the static hidden state; allocated on the first call
@@ -666,7 +713,8 @@ class MemoryActorRunner:
         self._unlisten = add_boundary_listener(self)
 
     def _step(self, scan, proprio, h):
-        return self.actor.step(scan, proprio, None, h)
+        c = None if self.dial is None else self.dial.c(scan.shape[0])
+        return self.actor.step(scan, proprio, c, h)
 
     def reset(self, done=None):
         self.rt.reset(done)
@@ -704,8 +752,11 @@ class MemoryActorRunner:
         return mu
 
 
-def actor_runner(model, device: torch.device, compile_enabled: bool, graph_step=None):
+def actor_runner(model, device: torch.device, compile_enabled: bool, graph_step=None, dial=None):
     """The viewer worker's actor callable: `(scan, proprio) -> mu`.
+
+    `dial` is a `DialSource` for a conditional checkpoint and None for an unconditional one; the
+    runner carries it so the number can be turned mid-session without rebuilding anything.
 
     A feedforward checkpoint gets exactly what it always got. A recurrent (or scan-augmented) one
     gets a `MemoryActorRunner`, which keeps the hidden state and the decayed occupancy channel
@@ -721,10 +772,11 @@ def actor_runner(model, device: torch.device, compile_enabled: bool, graph_step=
     if meta.get("memory") or (meta.get("scan_channels") or {}).get("channels"):
         return MemoryActorRunner(model, actor, device,
                                  compile_enabled and device.type == "cuda",
-                                 graph_step=graph_step)
+                                 graph_step=graph_step, dial=dial)
+    forward = actor.forward if dial is None else (lambda scan, proprio: actor(scan, proprio, dial.c(scan.shape[0])))
     if not compile_enabled or device.type != "cuda":
-        return actor.forward
-    compiled = torch.compile(actor.forward, dynamic=False, mode="reduce-overhead")
+        return forward
+    compiled = torch.compile(forward, dynamic=False, mode="reduce-overhead")
     state = {"call": compiled}
 
     def run(scan, proprio):
@@ -734,10 +786,11 @@ def actor_runner(model, device: torch.device, compile_enabled: bool, graph_step=
             # Falling back keeps the session alive, which is right -- but silently, a session that
             # reports `compile: true` would go on running eager and its timings would be quoted as
             # compiled ones. The behaviour is unchanged; only the fact is now recorded.
-            state["call"] = actor.forward
+            state["call"] = forward
             run.fell_back_to_eager = True
-            return actor(scan, proprio)
+            return forward(scan, proprio)
 
+    run.dial = dial
     run.compiled = True
     run.fell_back_to_eager = False
     return run

@@ -40,6 +40,7 @@ CMD_RESET = "reset"                # re-draw the episode on the current map
 CMD_FOCUS = "focus"                # {"env": int} which car the overlays describe
 CMD_OVERLAY = "overlay"            # {"saliency": bool, "internals": bool, "plan": bool}
 CMD_SET_MU = "set_mu"              # {"mode": "random"|"fixed", "mu": float} live friction control
+CMD_SET_DIAL = "set_dial"          # {"mu": float} live grip dial for a conditional ("dial") policy
 CMD_CANCEL = "cancel"              # abandon an in-flight start (by generation)
 CMD_SHUTDOWN = "shutdown"
 
@@ -137,6 +138,10 @@ class SessionConfig:
     #: each reset, and can be changed live with CMD_SET_MU.
     mu_mode: str = "random"
     mu: float = 1.0489
+    #: Grip dial for a conditional ("dial") checkpoint: how much friction the policy is *told* to
+    #: use. None lets the worker choose -- the pinned friction when one is fixed, else the bottom of
+    #: the training range. Ignored by an unconditional checkpoint, which has no such input.
+    dial: Optional[float] = None
     #: ROS 2 link (`viewer/ros_link.py`). "off": nothing. "publish": car 0's sensors go out as the
     #: real car's topics and the whole scene as visualisation topics while the policy drives.
     #: "drive": the same, and car 0 is driven by `/drive` instead of the policy. Needs rclpy on the

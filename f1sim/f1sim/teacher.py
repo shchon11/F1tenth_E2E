@@ -78,6 +78,7 @@ class RacelineTeacher:
             v.append(np.stack([speed_profile(xr, v_max_profile, a_lat, a_acc, a_brake,
                                             mu=mu_nominal * g, vehicle=vehicle)
                                for g in self.grip_levels]))   # (K, N)
+        self.a_lat = float(a_lat)                                                          # nominal-grip lateral budget of the profiles
         self.xy = torch.tensor(np.stack(xy), dtype=torch.float32, device=self.device)     # (T, N, 2)
         self.v_grip = torch.tensor(np.stack(v), dtype=torch.float32, device=self.device)  # (T, K, N)
         self.v = self.v_grip[:, self.nominal_grip_index]                                    # nominal grip (T, N)
@@ -128,7 +129,7 @@ class RacelineTeacher:
         and geometric fit; privileged body state and grip still select the speed profile. None
         preserves standalone body-speed geometry. The caller must pass the same sample to decode.
         """
-        from .mpc import N_KNOTS, PlanSpec, encode, path_points, plan_length
+        from .mpc import N_KNOTS, PlanSpec, encode, encode_envelope, encode_knots, path_points, plan_length
         spec = spec or PlanSpec()
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         geometry_speed = plan_geometry_speed(state, plan_speed)
@@ -226,6 +227,20 @@ class RacelineTeacher:
         slow = (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)     # off the line: slow down, like the direct teacher
         v0 = self.speed_at(tid, v_idx0, gb) * slow; v1 = self.speed_at(tid, v_idx1, gb) * slow
         cap = self.heading_speed_cap(yaw, tid, idx)
+        if spec.speed_mode == "knots":                             # the profile itself, at the curvature knots
+            vk = self.speed_at(tid[:, None].expand_as(kidx), kidx, gb[:, None].expand_as(kidx)) * slow[:, None]
+            return encode_knots(k, vk if cap is None else torch.minimum(vk, cap[:, None]), v_max, spec)
+        if spec.speed_mode == "envelope":
+            # What the speed dimensions say here is *why* the profile is what it is: the lateral
+            # budget this car's grip gives the profile (a_lat * grip, the one number the student
+            # cannot see and has to infer from how the car answered it), and the speed to arrive at
+            # the end of the plan with, which carries everything past the plan's own curvature.
+            # Speed scales (off-line slowdown, speed_scale, the heading cap) enter squared: v ~ sqrt(a).
+            scale = self.speed_scale * slow
+            if cap is not None:
+                scale = scale * (torch.minimum(v0, cap) / v0.clamp_min(1e-3))
+                v1 = torch.minimum(v1, cap)
+            return encode_envelope(k, self.a_lat * self.grip_levels_t[gb] * scale ** 2, v1, v_max, spec)
         if cap is not None:
             v0 = torch.minimum(v0, cap); v1 = torch.minimum(v1, cap)
         action = encode(k, v0, v1, v_max, spec)

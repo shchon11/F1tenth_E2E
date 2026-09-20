@@ -125,3 +125,59 @@ def test_a_command_reaches_the_viewer_but_only_once() -> None:
     cmd, t = common.viewer_poll_command(stale)
     assert cmd and cmd["set"] == "held-out" and t > stale
     assert common.viewer_poll_command(t)[0] is None           # already seen
+
+
+# ---------------------------------------------------------------- SLAM map import (2026-09-20)
+def _slam_pair(tmp_path, with_centerline=False):
+    """A ROS map_server pair the way slam_toolbox / map_saver writes one: yaml + pgm, no centerline."""
+    import shutil, os
+    from f1sim import maps as _m
+    src = os.path.join(_m.ASSET_MAPS, "map12x16")
+    shutil.copy(src + ".pgm", tmp_path / "venue.pgm")
+    (tmp_path / "venue.yaml").write_text(
+        open(src + ".yaml").read().replace("map12x16.pgm", "venue.pgm"))
+    return str(tmp_path / "venue.yaml")
+
+
+def test_slam_map_is_usable_without_a_centerline_csv(tmp_path):
+    # The whole point: the pair alone is enough. A map that loads but has no centerline cannot build
+    # a raceline, so it cannot be taught, scored or given a lap-time reward -- it only looks loaded.
+    from f1sim import maps
+    from f1sim.raceline import Raceline
+    yaml_path = _slam_pair(tmp_path)
+    t = maps.load(yaml_path)
+    assert t.centerline is not None and len(t.centerline) == 800
+    assert Raceline.build(t).lap_time > 1.0
+
+
+def test_slam_map_import_reports_what_it_measured(tmp_path):
+    from f1sim import slam_map
+    yaml_path = _slam_pair(tmp_path)
+    for given in (yaml_path, str(tmp_path / "venue.pgm"), str(tmp_path)):   # yaml, image, or the folder
+        assert slam_map.resolve_paths(given) == (yaml_path, str(tmp_path / "venue.pgm"))
+    track = slam_map.load_map(yaml_path)
+    rep = slam_map.inspect(track)
+    assert rep.fits and not rep.problems
+    assert rep.lane_length_m > 10.0
+    assert rep.half_width_min_m > slam_map.CAR_WIDTH / 2
+    assert rep.raceline_lap_s and rep.raceline_lap_s > 1.0
+    assert "ready to drive" in rep.text()
+
+
+def test_slam_map_without_a_yaml_says_why(tmp_path):
+    import shutil, os, pytest
+    from f1sim import maps as _m, slam_map
+    shutil.copy(os.path.join(_m.ASSET_MAPS, "map12x16.pgm"), tmp_path / "venue.pgm")
+    with pytest.raises(FileNotFoundError, match="resolution and origin"):
+        slam_map.resolve_paths(str(tmp_path / "venue.pgm"))
+
+
+def test_slam_import_becomes_an_editable_scene(tmp_path, monkeypatch):
+    # The editor's path: import-slam -> a scene the brushes can edit -> a catalogue track again.
+    from f1sim import scene as scene_mod
+    monkeypatch.setenv("F1SIM_SCENES", str(tmp_path / "scenes"))
+    yaml_path = _slam_pair(tmp_path)
+    assert scene_mod.cli_import_slam(yaml_path, "venue_scene") == 0
+    doc = scene_mod.SceneDoc.load("venue_scene")
+    assert doc.centerline is not None and doc.duct.any()
+    assert scene_mod.validate("venue_scene")["ok"]

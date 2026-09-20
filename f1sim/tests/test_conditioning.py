@@ -348,3 +348,72 @@ def test_zero_arm_is_invariant_to_the_privileged_friction():
     assert torch.equal(ca, cb) and float(ca.abs().max()) == 0.0
     with torch.no_grad():
         assert torch.equal(model.actor(scan, pro, ca), model.actor(scan, pro, cb))
+
+
+# ---------------------------------------------------------------- the dial (2026-09-20)
+def test_dial_is_a_deployable_source_and_is_never_derived_from_privileged_state():
+    spec = C.spec_for("dial")
+    assert spec.dim == 1 and spec.source == "dial" and spec.lab_oracle is False
+    assert C.CondSpec.from_meta(spec.to_meta()) == spec
+    # the trainer's margin draw, an operator or a supervisor sets it; the privileged vector never does
+    with pytest.raises(ValueError, match="set by the caller"):
+        C.make_condition("dial", spec, torch.zeros(4, 17), 8)
+    assert torch.allclose(C.mu_to_c(torch.tensor([1.0, 0.75]), spec)[:, 0], torch.tensor([0.0, -1.0]))
+
+
+def test_dial_draw_is_at_or_below_the_floor_and_held_for_the_episode():
+    class _Sim:  # the two things DialDraw reads
+        P = {"mu": torch.tensor([0.80, 0.95, 1.10, 0.74])}
+    class _Env:
+        B, device, sim = 4, torch.device("cpu"), _Sim()
+    torch.manual_seed(0)
+    d = C.DialDraw(_Env(), margin=0.30, p_exact=0.0)
+    d.redraw(torch.ones(4, dtype=torch.bool)); first = d.value().clone()
+    assert (first <= _Sim.P["mu"] + 1e-6).all() and (first >= _Sim.P["mu"] - 0.30 - 1e-6).all()
+    d.redraw(torch.tensor([True, False, False, False]))            # only env 0 opened a new episode
+    assert torch.equal(d.value()[1:], first[1:])
+    assert (C.DialDraw(_Env(), margin=0.30, p_exact=1.0).value() == _Sim.P["mu"]).all()   # "exact" episodes carry no margin
+
+
+def test_a_dial_checkpoint_opens_in_the_viewer_and_a_lab_oracle_does_not(tmp_path):
+    """The viewer refused every conditional checkpoint, which locked out the deployable ones.
+
+    A `dial` policy's input is a setting someone chooses, so it has to load where a person would
+    turn it; a `true_mu` policy's is the environment's true friction, which no car has.
+    """
+    import pytest
+    from f1sim.learn.model import ActorCritic, save_checkpoint, load_checkpoint
+    for source, opens in (("dial", True), ("true_mu", False)):
+        spec = C.spec_for(source)
+        m = ActorCritic(3, 64, 12, 17, act_dim=8, cond_dim=1, cond=spec.to_meta())
+        p = str(tmp_path / f"{source}.pt")
+        save_checkpoint(p, m, {"phase": "ppo"})
+        if opens:
+            back, _ = load_checkpoint(p, "cpu")                      # no opt-in, as the viewer calls it
+            assert back.meta["cond"]["source"] == "dial"
+        else:
+            with pytest.raises(ValueError, match="LAB-ORACLE"):
+                load_checkpoint(p, "cpu")
+            load_checkpoint(p, "cpu", allow_conditional=True)         # a caller that supplies it still may
+
+
+def test_the_dial_is_a_live_number_the_actor_is_driven_with(tmp_path):
+    # It has to be changeable mid-session without rebuilding: the console turns it while driving.
+    from f1sim.learn.model import ActorCritic
+    from f1sim.learn.watch import DialSource, actor_runner, dial_for
+    spec = C.spec_for("dial")
+    m = ActorCritic(3, 64, 12, 17, act_dim=8, cond_dim=1, cond=spec.to_meta())
+    d = dial_for(m, torch.device("cpu"))
+    assert isinstance(d, DialSource) and abs(d.mu - 0.73423) < 1e-6      # the safe end, by default
+    # A fresh conditional actor has its conditioning projection at exactly zero (that is what makes
+    # a warm start bit-identical), so the dial can only be seen once it carries weight.
+    with torch.no_grad():
+        m.actor.cond.weight.normal_(0.0, 0.5)
+    run = actor_runner(m, torch.device("cpu"), False, dial=d)
+    scan, pro = torch.zeros(2, 3, 64), torch.zeros(2, 12)
+    a = run(scan, pro).clone()
+    assert torch.allclose(d.c(2)[0], C.mu_to_c(torch.tensor([d.mu]), spec)[0])
+    d.set(1.10)
+    assert not torch.allclose(a, run(scan, pro))                          # the dial reached the policy
+    m2 = ActorCritic(3, 64, 12, 17, act_dim=8)
+    assert dial_for(m2, torch.device("cpu")) is None                      # unconditional: no dial

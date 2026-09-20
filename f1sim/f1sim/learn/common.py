@@ -275,7 +275,7 @@ def announce_episode_boundaries(env):
 
 def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg: Optional[Config] = None, seed: int = 0,
              rls=None, teacher_grip: str = "true", teacher_recover_time: float = 0.0,
-             opponent_pool: bool = True):
+             opponent_pool: bool = True, teacher_limits: Optional[dict] = None):
     """rls: racelines (one per track) -- required when env_cfg.opponent == "teacher" (opponents follow them).
 
     opponent_pool: load and install the checkpoint population `env_cfg.opp_pool` names when the mode
@@ -291,11 +291,44 @@ def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg:
     if env.M > 1 and env.teacher_any:
         if rls is None:
             rls = [Raceline.build_cached(t) for t in tracks]
-        env.set_teacher(make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time))
+        env.set_teacher(make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time, **(teacher_limits or {})))
     if opponent_pool and env.pool_paths:
         from .opponent_pool import attach     # local: that module imports this one for the obs spec
         attach(env, device=env.device)
     return env
+
+
+def student_policy(model, env: F1VecEnv, device=None, deterministic: bool = True, dial=None):
+    """`memory.policy_fn` for any student: carries the hidden state, and for a conditional actor reads
+    the conditioning at every step (it changes at each reset, so it cannot be fixed).
+
+    dial: for a `dial` checkpoint, a callable returning the (B,) friction the policy is told to use.
+    None means "set exactly right" -- the env's true friction -- which is the reference a supervisor
+    is scored against, not something the car has.
+
+    Simulator-side only. A `true_mu` checkpoint is a lab oracle -- its input is privileged -- which
+    is exactly why the deployment loaders refuse it and why this lives next to the env."""
+    from . import conditioning as cond_mod
+    from .memory import policy_fn, runtime_for
+    from .obs import flatten_obs
+    if not int(model.meta.get("cond_dim", 0)):
+        return policy_fn(model, env.B, device=device, deterministic=deterministic)
+    spec = cond_mod.CondSpec.from_meta(model.meta.get("cond"))
+    rt = runtime_for(model, env.B, device)
+
+    @torch.no_grad()
+    def run(obs):
+        scan, proprio = flatten_obs(obs)
+        if spec.source == "dial":
+            c = cond_mod.mu_to_c(env.sim.P["mu"] if dial is None else dial(), spec)
+        else:
+            c = cond_mod.make_condition(spec.source, spec, env.sim.P["mu"].reshape(-1, 1), 0)
+        action, _lp, rt.hidden = model.act(rt.observe(scan), proprio, deterministic=deterministic, c=c, h=rt.hidden)
+        return action
+
+    run.runtime = rt
+    run.reset = rt.reset
+    return run
 
 
 def obs_spec(env: F1VecEnv) -> ObsSpec:
@@ -306,15 +339,24 @@ def obs_spec(env: F1VecEnv) -> ObsSpec:
                    opp_token=env.opp_token)
 
 
-def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0.0):
+def teacher_limits(a_lat: Optional[float] = None, a_acc: Optional[float] = None,
+                   a_brake: Optional[float] = None) -> dict:
+    """The speed-profile limits a caller actually set, as keywords. Both `Raceline.build` and
+    `RacelineTeacher` take them under these names and both default to 6 / 6 / 3, so an empty dict is
+    the teacher every recorded run had."""
+    return {k: float(v) for k, v in (("a_lat", a_lat), ("a_acc", a_acc), ("a_brake", a_brake)) if v is not None}
+
+
+def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0.0, **limits):
     """grip: which friction the teacher's speed profile assumes. "true" is privileged -- the label then
     depends on mu, which the student cannot observe, so identical scans get speed labels up to ~2.2x
     apart and the regression learns their conditional mean. "nominal"/"conservative" are constant and
-    therefore imitable. Run `python -m f1sim.learn.grip_probe` to measure whether the proprio history recovers mu at all."""
+    therefore imitable. Run `python -m f1sim.learn.grip_probe` to measure whether the proprio history recovers mu at all.
+    limits: `teacher_limits(...)` -- a_lat / a_acc / a_brake of the speed profile the teacher drives."""
     t = RacelineTeacher(rls, wheelbase=env.cfg.vehicle.lf + env.cfg.vehicle.lr, device=env.device,
                         recover_time=recover_time, vehicle=env.cfg.vehicle,
                         mu_nominal=env.cfg.vehicle.mu,
-                        mu_f_scale_nominal=env.cfg.vehicle.mu_f_scale)
+                        mu_f_scale_nominal=env.cfg.vehicle.mu_f_scale, **limits)
     t.label_grip = grip
     return t
 

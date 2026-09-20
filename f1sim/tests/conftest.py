@@ -21,6 +21,22 @@ if os.path.isdir(os.path.join(_ROS, "f1sim_ros")) and sys.path[:1] != [_ROS]:
     sys.path.insert(0, _ROS)
 
 
+@pytest.fixture(autouse=True)
+def _console_prefs_sandbox(tmp_path, monkeypatch):
+    """The console remembers its settings in `~/.f1sim/console.json` (`viewer.console.prefs`).
+
+    Automatic, because the hazard belongs to constructing a `ConsoleWindow` rather than to any one
+    test remembering to opt out: without this a test reads the running user's real file -- so an
+    assertion about a control's default passes or fails depending on how that person last left the
+    console -- and writes to it on close.
+
+    **Per test, not per session.** A shared file leaks between tests just as well as the real one:
+    a test that starts a session saves whatever it had set, and the next test's fresh window
+    restores it. That is exactly the failure this fixture was first written with.
+    """
+    monkeypatch.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path / "console_prefs.json"))
+
+
 def pytest_configure(config):
     """Register the shared markers, then keep headless viewer contexts off EGL.
 

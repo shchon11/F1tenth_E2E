@@ -175,6 +175,38 @@ python3 -m f1sim.learn.dagger --name dagger_it --action-mode plan --envs 258 \
   --memory gru --memory-hidden 128 --scan-channels memory,edges --chunk-length 16
 ```
 
+**The teacher's line and limits** (opt-in; the defaults are the teacher every recorded run had, and
+the default raceline cache keys are unchanged). `--raceline-objective min_time` refines the
+minimum-curvature line by descending the lap time of the speed profile itself
+(`raceline.min_time_raceline`); `--teacher-a-lat` / `--teacher-a-acc` / `--teacher-a-brake` set the
+profile's limits (default 6 / 6 / 3), and the line is optimised for the same limits the teacher then
+drives. `evaluate --teacher` takes the same flags. Measured on nine held-out maps, the line alone is
+8 % quicker at the default limits with no more collisions, and `7 / 6.5 / 4` is the knee of the
+pace-against-collisions curve; at the friction limit (9 and up) the teacher crashes in a quarter of
+its trials and is not a usable label source. See
+[the research note](research/mintime-teacher-speed-head-2026-09-19.md).
+
+**What the plan's speed dimensions mean** (`--speed-mode`, opt-in, plan action space only;
+`mpc.SPEED_MODES`). `linear` is the two speeds every existing checkpoint emits. `envelope` replaces
+them with a grip belief `a_hat` and an end speed, and the profile follows the plan's own curvature —
+`v(s) = sqrt(a_hat / |kappa(s)|)`, braked backwards from the end speed; `--grip-quantile` below 0.5
+puts a pinball loss on `a_hat`, so a student that cannot tell the floor yet assumes the slippery
+end. `knots` emits a speed at every curvature knot (12 action dimensions). The mode is recorded in
+the checkpoint and `evaluate` reads it from there. `mpc.decode` — which the grip arms, the clearance
+arm and the viewers read a plan through — refuses a non-`linear` plan rather than misreading it, so
+those layers do not yet run on the new modes.
+
+**A grip dial** (`--cond dial`, with `--dial-margin` / `--dial-exact`). The student is told the
+floor's friction minus a per-episode margin and the teacher drives for that same number, so the
+input is a command — "use this much grip" — that an operator or a supervisor sets at run time.
+`--cond true_mu` is the lab-oracle form of the same input and `--aux-grip` asks the actor's grip
+head for the friction; see [the research note](research/mintime-teacher-speed-head-2026-09-19.md) §7
+for why the number is supplied rather than inferred.
+
+**A recurrent student.** `--memory gru --seq-len N` trains on contiguous runs of `N` steps per
+environment with the recurrence walked from a zero state (`--seq-burn` leading steps only warm it
+up). Without `--seq-len` the buffer is sampled i.i.d. and the memory is never trained.
+
 ## PPO
 
 Reinforcement learning from the distilled student, with an asymmetric critic that sees privileged
@@ -194,6 +226,36 @@ python3 -m f1sim.learn.ppo --name ppo_v1 \
 about 5.1 GB **device-wide** (that reading includes other processes on the card) on an 8 GB
 RTX 4060 Ti. Treat it as one data point, not a budget — memory scales with `--envs`, the number of
 distinct tracks held on the GPU, and `--scan-stack`. Measure before committing to a size.
+
+**Which card.** Two NVIDIA GPUs here: CUDA index 0 is the RTX 4070 SUPER and index 1 the RTX 5060
+Laptop (`nvidia-smi` numbers them the other way round; the third adapter `lspci` lists is an AMD
+iGPU with no ROCm torch, so it drives the display and nothing else). Training takes index 0 and
+nothing else does, so a run's throughput does not depend on whether someone is watching a replay;
+evaluation, lap measurement and the console go on index 1 (`CUDA_VISIBLE_DEVICES=1`).
+
+**The dial recipe (2026-09-20).** Friction cannot be read from the car's sensors at a pace it
+survives, but a policy that is told it uses all of it, so the friction is an *input the operator
+sets* — a grip dial — and PPO is built around keeping it one:
+
+```bash
+python3 -m f1sim.learn.ppo --name ppo_dial --init ~/f1sim_runs/dg_dial/student_latest.pt \
+  --cond dial --fresh-opt --grip-budget-penalty 2.0 \
+  --action-mode plan --scan-stack 6 --hist-len 20 --tracks train \
+  --raceline-objective min_time --teacher-a-lat 7 --teacher-a-acc 6.5 --teacher-a-brake 4 \
+  --lap-time-bonus 2 --kl-coef 0.05 --kl-decay 4e7 --cap0 9 --cap1 9 --sim-backend graphs --amp
+```
+
+* `--init` is a DAgger student trained with `--cond dial` (the teacher drives for the dial's
+  number, so the student arrives obeying it). It is loaded as it is — nothing is migrated — and the
+  KL leash holds the run to that obedient policy. A DAgger checkpoint's exploration std is reset to
+  the plan-space default (imitation never trains it; it arrives at 0.50).
+* Each episode's dial is the floor's friction minus a margin (`--dial-margin`, `--dial-exact`).
+* `--grip-budget-penalty` charges for lateral acceleration beyond what the dial allows
+  (`EnvConfig.reward_grip_budget`). Without it the dial is only a hint under RL — the floor has at
+  least that much grip, so return alone teaches the policy to go faster than it was told.
+* The critic is told the dial (appended to the privileged vector), and the lap-time reference is the
+  min-time line at the teacher's limits.
+* `evaluate --dial-offset -0.15` scores a checkpoint with its dial set on the safe side.
 
 Relevant flags: `--envs`, `--horizon`, `--epochs`, `--minibatch`, `--total`, `--amp`, `--cap0` /
 `--cap1` / `--cap-steps` (speed-cap curriculum), `--kl-coef` / `--kl-decay`, `--critic-warmup`,
@@ -1202,18 +1264,23 @@ Writes ONNX, optionally with a TensorRT engine, for the Jetson. The ROS policy n
 same observation encoding as training ([`learn/obs.py`](../f1sim/f1sim/learn/obs.py)), so the
 deployed input is constructed by the same code path — see [ROS 2](ros2.md).
 
-## Experimental: friction-aware control
+## The plan controller
 
-**Opt-in, unfinished, and off by default.** The default arm is `legacy`, the original behaviour.
+The tracker is the tracker: it follows the plan the policy emitted, and nothing is layered on it.
 
-`--controller` selects how the tracker treats tyre friction:
+It used to offer friction-clamp *arms* -- `fixed_low`, `estimated`, `oracle`, plus the composable
+`+clearance` and `+tcs` -- selected with `--controller`. They existed because a policy that had never
+been told the floor's friction drove every floor at one compromise speed, and clamping the tracker
+was the retraining-free way to make that safe: on suite v1 it took the frozen original from 110 to
+136 solo completions and from 16 to 43 at low mu.
 
-| arm | friction used by the tracker |
-| --- | --- |
-| `legacy` | none — no explicit friction limit is applied. **The default.** |
-| `fixed_low` | one conservative constant, identical in every environment |
-| `oracle` | the environment's true friction, per environment. Simulation only: it reads privileged state. |
-| `estimated` | an estimate from causal onboard signals only |
+`--cond dial` tells the policy instead (see above), which makes the clamp redundant and then
+harmful: measured on three pinned frictions, a dial policy with `fixed_low` -- or even a
+perfectly-set `oracle` -- on top was **worse than the dial alone on every one of them**. The policy
+already slows for the floor it was told about, and the clamp can only remove what it does not do
+([the research note](research/mintime-teacher-speed-head-2026-09-19.md) section 7). So there is no
+`--controller` / `--estimator` on `ppo` or `evaluate` and no selector in the console; a session
+records `controller: "legacy"`, the single spelling for "nothing installed".
 
 Any of them may additionally carry either composable layer, written as a suffix: `+clearance` (the
 plan geometry) and `+tcs` (the traction guard). Both are described below, and both can be worn at

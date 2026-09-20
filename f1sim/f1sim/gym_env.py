@@ -24,7 +24,7 @@ import math
 import numpy as np
 import torch
 
-from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, encode as plan_encode, decode as plan_decode
+from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, act_dim as plan_act_dim, encode as plan_encode, decode as plan_decode
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
@@ -37,7 +37,8 @@ from .track import Track
 
 REWARD_COMPONENT_KEYS = ("progress", "collision", "collision_speed", "steer_rate", "proximity",
                          "plan_clearance", "wrong_way", "lap", "alive", "car_contact", "overtake",
-                         "lap_time", "car_proximity", "sideslip", "ttc", "overtake_hold")
+                         "lap_time", "car_proximity", "sideslip", "ttc", "overtake_hold",
+                         "grip_budget")
 
 #: [s] the time to contact reported for a pair of cars that is not closing. Finite rather than an
 #: infinity so the penalty stays NaN-free under `torch.compile`; far past any `ttc_safe` anyone
@@ -259,6 +260,12 @@ class EnvConfig:
                                       # low-friction draw the policy carries the same corner speed
                                       # it uses on a grippy one and finds out at the wall.
     sideslip_free: float = 0.06       # [rad] ~3.5 deg: the drift angle a clean fast corner has anyway
+    reward_grip_budget: float = 0.0   # per second, per (m/s^2)^2 of lateral acceleration beyond the budget the car was
+                                      # GIVEN (`set_grip_budget`, a friction in mu units -- the policy's grip dial).
+                                      # Without it a dial is only a hint under RL: the floor has at least that much
+                                      # grip, so the return-maximising policy learns to drive faster than it was told.
+                                      # With it the dial is a command, and what is optimised is the lap inside it.
+    grip_budget_rho: float = 0.95     # share of the front axle's capacity at that friction the budget allows
     reward_alive: float = 0.0
     # Time to contact with the nearest car, per step. The reward audit
     # (`docs/research/reward-audit-2026-09-13.md`) found that nothing prices a *margin* to another
@@ -306,6 +313,9 @@ class EnvConfig:
     hist_len: int = 0                # >0: proprioceptive history rows (speed, imu, roll/pitch, action) in the observation
     hist_stride: int = 2             # steps between rows (20 x 2 = the last second): implicit identification of grip / lag
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
+    speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
+                                     # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
+    plan_a_brake: float = 4.0        # [m/s^2] "envelope" only: braking its backward pass plans with (match the teacher's)
     compile_tracker: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
@@ -663,7 +673,7 @@ class F1VecEnv:
         self.s_prev = torch.zeros(self.B, device=self.device)
         self.hist_len = (e.scan_stack - 1) * e.scan_stride + 1
         self.scan_hist = torch.ones(self.B, self.hist_len, self.n_beams, device=self.device)
-        self.act_dim = PLAN_DIM if e.action_mode == "plan" else 2
+        self.act_dim = plan_act_dim(e.speed_mode) if e.action_mode == "plan" else 2
         self.prev_action = torch.zeros(self.B, self.act_dim, device=self.device)
         self.act_hist = torch.zeros(self.B, self.ecfg.action_history, self.act_dim, device=self.device)
         self.tracker = None; self.prev_steer_norm = torch.zeros(self.B, device=self.device); self.last_cmd = torch.zeros(self.B, 2, device=self.device)
@@ -693,9 +703,12 @@ class F1VecEnv:
                     return self._step_math(*args)
             self._math = _math
         self.tracker_delay = None
+        self.grip_budget = None                                # see `set_grip_budget`
         if e.action_mode == "plan":
+            # `None` for the default mode, so the tracker builds the PlanSpec it always built
+            pspec = None if e.speed_mode == "linear" else PlanSpec(speed_mode=e.speed_mode, a_brake_profile=float(e.plan_a_brake))
             self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
-                                       e.v_max_policy, compile_solver=e.compile_tracker)
+                                       e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
         self.speed_cap = torch.full((self.B,), float(self.ecfg.speed_cap), device=self.device)
         # Self-play with identical cars produces almost no passing: the front car is exactly as fast
@@ -1669,6 +1682,14 @@ class F1VecEnv:
             lap_ids = self._empty_long; lap_times = self._empty_float
         if e.reward_lap_time > 0:
             self._sector_time_reward(r.s, reward, reward_components)
+        if e.reward_grip_budget > 0 and self.grip_budget is not None:
+            # |v r|: the lateral acceleration the path itself demands, from the state (the emulated
+            # accelerometer carries 3 m/s^2 rms of vibration and would make this a noise penalty).
+            allowed = e.grip_budget_rho * self.grip_budget * self.cfg.vehicle.mu_f_scale * 9.81
+            over = ((r.state[:, 3] * r.state[:, 5]).abs() - allowed).clamp_min(0.0)
+            pen = -e.reward_grip_budget * over * over * self.sim.control_dt
+            reward += pen
+            reward_components[:, REWARD_COMPONENT_KEYS.index("grip_budget")] = pen
         self.prev_lap = r.lap.clone()
         info = {"priv": self._priv(r), "progress": r.progress, "lap": r.lap, "wall_dist": r.wall_dist,
                 # a snapshot, like track_id below: _reset_envs re-draws the roles in place further
@@ -1789,6 +1810,7 @@ class F1VecEnv:
             -e.reward_ttc * ttc_pen,
             torch.zeros_like(progress),          # overtake_hold: filled in below, once the new gaps
                                                  # and the episode boundaries of this step are known
+            torch.zeros_like(progress),          # grip_budget: filled in by step(), from a tensor the trainer owns
         ], 1)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         terminated = collision.clone()
@@ -2541,11 +2563,22 @@ class F1VecEnv:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""
         return self.last_result.odom[:, 3] if self.last_result is not None else self.sim.state[:, 3]
 
-    def teacher_label(self, teacher, offset: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """The teacher's action in this env's action space: (steer, speed) or its local plan."""
+    def set_grip_budget(self, mu: Optional[torch.Tensor]) -> None:
+        """(B,) friction each car is allowed to use from now on, or None for no budget. The trainer
+        owns it (it is the policy's dial, redrawn per episode); the env only charges for exceeding it."""
+        self.grip_budget = None if mu is None else mu.to(self.device).reshape(-1)
+
+    def teacher_label(self, teacher, offset: Optional[torch.Tensor] = None,
+                      mu: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """The teacher's action in this env's action space: (steer, speed) or its local plan.
+
+        mu: (B,) friction the teacher should *drive for* instead of the env's own -- the label of a
+        dial-conditioned student, whose input says how much grip to use rather than how much there
+        is. Everything else the teacher is privileged to (latency, calibration) stays the truth."""
+        P = self.sim.P if mu is None else {**self.sim.P, "mu": mu.to(self.sim.P["mu"].dtype)}
         if self.act_dim == 2:
             kwargs = {} if offset is None else {"offset": offset}
-            return self.teacher_action_to_normalized(teacher(self.sim.state, self.sim.P, self.sim.tid, **kwargs))
+            return self.teacher_action_to_normalized(teacher(self.sim.state, P, self.sim.tid, **kwargs))
         from .teacher import RacelineTeacher
         if isinstance(teacher, RacelineTeacher):
             # A global raceline alone does not certify what this tracker will
@@ -2558,11 +2591,11 @@ class F1VecEnv:
             guard = guards.get(teacher)
             if guard is None:
                 guard = guards[teacher] = InteractiveTeacher(teacher, self, offsets=(0.0,), cand_iters=6, lane_clamp=True)
-            action = guard.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
+            action = guard.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
                                        self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
             teacher.last_label_valid = guard.last_label_valid
             return action
-        return teacher.plan_action(self.sim.state, self.sim.P, self.sim.tid, self.ecfg.v_max_policy,
+        return teacher.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
                                    self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
 
     def set_ideal_lap(self, racelines) -> None:

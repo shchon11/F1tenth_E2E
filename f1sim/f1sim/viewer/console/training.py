@@ -1070,7 +1070,7 @@ class JobSummary:
             rows.append(("상대차" if i == 0 else "", line))
         if self.events_text:
             rows.append(("이벤트", self.events_text))
-        rows += [("제어기", self.controller), ("시작 체크포인트", self.init),
+        rows += [("시작 체크포인트", self.init),
                  ("학습률", self.lr_text), ("총 스텝", self.total_text)]
         if self.wandb_url:
             rows.append(("W&B", self.wandb_url))

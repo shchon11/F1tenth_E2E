@@ -18,6 +18,22 @@ them is a list of *runs*, not a list of maps. So there are two names now:
 disk and no recorded name changed meaning**: every checkpoint manifest, W&B config and frozen
 benchmark suite still says `real:blackbox2022_1+rlobs44~rev`, and still means what it always did.
 
+## Bringing your own map
+
+A ROS `map_server` pair — `map.yaml` plus `map.pgm` or `map.png`, which is what `slam_toolbox` and
+`map_saver` write — is a track. Give the path anywhere a track name is taken:
+
+```bash
+python3 -m f1sim.slam_map ~/maps/venue.yaml --preview venue.png   # measure and look before training
+python3 -m f1sim.learn.evaluate CKPT --tracks ~/maps/venue.yaml   # use it by path
+python3 -m f1sim.slam_map ~/maps/venue.yaml --install venue       # or catalogue it: user:venue
+```
+
+The centerline is traced from the free space and cached (`~/.cache/f1sim/centerlines`), so a map
+that arrives with no `_centerline.csv` still gets a raceline, a teacher and a lap-time reference.
+The console's environment editor imports the same pair (see
+[environment editor](environment_editor.md)), which is where to fix a map the tracing got wrong.
+
 ## The scenario grammar
 
 ```

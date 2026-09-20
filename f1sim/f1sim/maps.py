@@ -63,6 +63,11 @@ REAL = {
 }
 CENTERLINE_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "f1sim", "centerlines")
 
+#: Clearance the traced centerline keeps off anything solid when a map arrives with no centerline
+#: csv. The catalogue entries carry their own (0.30-0.45 by venue); this is what a map loaded by
+#: path gets, and it is the value `slam_map` reports against.
+DEFAULT_LANE_CLEARANCE = 0.35
+
 
 def racetrack_names() -> List[str]:
     return sorted(os.path.basename(os.path.dirname(y)) for y in glob.glob(os.path.join(RACETRACKS, "*", "*_map.yaml")))
@@ -305,9 +310,13 @@ def _load_base(name: str, bare: bool = False, **kw) -> Track:
         if kind == "props":                                     # real:x+props<seed>: modelled props
             t = _static_props(t, int(spec))
         return t
-    clearance = kw.pop("min_clearance", None)
+    # A bare path: a ROS map_server pair (yaml + pgm/png), which is what SLAM toolbox writes. It used
+    # to come back as an occupancy grid with no centerline -- so it loaded, and then failed at the
+    # first thing anyone wanted it for (a raceline needs a centerline, and a teacher needs a
+    # raceline). The trace is cached, so the cost is paid once per map.
+    clearance = kw.pop("min_clearance", DEFAULT_LANE_CLEARANCE)
     t = _b(Track.from_ros_map(name, **kw))
-    return _with_auto_centerline(t, clearance) if clearance else t
+    return _with_auto_centerline(t, clearance, kw.get("seed_xy"))
 
 
 def load_many(names, **kw) -> List[Track]:
