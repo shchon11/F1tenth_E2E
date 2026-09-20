@@ -1,0 +1,42 @@
+{
+  "edge": {
+    "scenario": "real/icra22#edge:44!assets=mixed:1",
+    "props": 2,
+    "styles": [
+      "cardboard_box",
+      "marker_post"
+    ],
+    "size_variants": 2,
+    "planning_added_cells": 99,
+    "seconds": 0.15518992696888745,
+    "grid_unchanged": true
+  },
+  "line": {
+    "scenario": "real/icra22#line:44!assets=mixed:1",
+    "props": 4,
+    "styles": [
+      "cardboard_box",
+      "marker_post",
+      "wooden_crate"
+    ],
+    "size_variants": 4,
+    "planning_added_cells": 310,
+    "seconds": 0.06813000800320879,
+    "grid_unchanged": true
+  },
+  "hard": {
+    "scenario": "real/icra22#hard:44!assets=mixed:1",
+    "props": 13,
+    "styles": [
+      "barrier_block",
+      "cardboard_box",
+      "crate_stack_low",
+      "marker_post",
+      "steel_drum"
+    ],
+    "size_variants": 12,
+    "planning_added_cells": 306,
+    "seconds": 0.1976107899681665,
+    "grid_unchanged": true
+  }
+}

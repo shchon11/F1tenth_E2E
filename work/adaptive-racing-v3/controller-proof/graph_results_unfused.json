@@ -1,0 +1,30 @@
+[
+  {
+    "batch": 2,
+    "capture_seconds": 0.6309233109932393,
+    "max_cpu_gpu_errors": [
+      9.5367431640625e-07,
+      9.5367431640625e-07,
+      5.960464477539063e-08
+    ],
+    "graph_solver_ms": 18.39892591931857,
+    "tracker_with_command_ms": 19.06454973310853,
+    "diagnostic_rebind_guard": true,
+    "peak_cuda_mb": 16.322265625,
+    "mutable_mu_feedback_parity": true
+  },
+  {
+    "batch": 48,
+    "capture_seconds": 0.4324660880374722,
+    "max_cpu_gpu_errors": [
+      2.6226043701171875e-06,
+      2.6226043701171875e-06,
+      4.76837158203125e-07
+    ],
+    "graph_solver_ms": 19.104590399656445,
+    "tracker_with_command_ms": 19.680961900545906,
+    "diagnostic_rebind_guard": true,
+    "peak_cuda_mb": 24.65673828125,
+    "mutable_mu_feedback_parity": true
+  }
+]

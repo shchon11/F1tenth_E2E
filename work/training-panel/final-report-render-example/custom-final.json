@@ -1,0 +1,9 @@
+{
+  "render_example": true,
+  "candidate_sha256": "렌더 검증용 예시 · 실제 평가 아님",
+  "metrics": {
+    "mae": 0.07,
+    "q10_exceedance": 0.06
+  },
+  "promoted": false
+}

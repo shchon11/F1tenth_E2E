@@ -1,0 +1,21 @@
+{
+ "captured": "2026-09-13T02:00:58",
+ "seed": 14,
+ "features": [
+  "chicane",
+  "corner",
+  "slalom_fast",
+  "corner",
+  "straight",
+  "sweeper",
+  "cone_slalom",
+  "sweeper",
+  "straight",
+  "corner"
+ ],
+ "scene_dir": "/tmp/claude-1000/-home-shchon11-F1tenth/1ba4bd0e-d409-4b02-9dc7-edc80cb2df59/scratchpad/gen_scenes/rand_14",
+ "props": 3,
+ "software_gl": true,
+ "sha256": "b03b085b406670b0be7a73b237699595624af3d44b970f670c940f7f5f8928fc",
+ "status": "저장했습니다: /tmp/claude-1000/-home-shchon11-F1tenth/1ba4bd0e-d409-4b02-9dc7-edc80cb2df59/scratchpad/gen_scenes/rand_14   ·   업로드 11 ms"
+}

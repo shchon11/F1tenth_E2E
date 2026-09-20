@@ -1,0 +1,74 @@
+{
+  "map": "real/icra22#edge:441!assets=mixed:1",
+  "track": "icra2022_assets_mixed_1",
+  "props": 2,
+  "length_m": 61.97879157215779,
+  "lap_time": 11.632956836619531,
+  "optimization": {
+    "model": "periodic-quasisteady-axle-nlp-v1",
+    "status": "converged",
+    "global_optimum_proven": false,
+    "dynamic_validation": false,
+    "objective": "integral(norm(dxy/dphase)/speed, phase=0..1)",
+    "path_controls": 83,
+    "requested_margin_m": 0.4,
+    "effective_margin_m": [
+      0.1146448974997748,
+      0.4
+    ],
+    "solver_message": "Optimization terminated successfully",
+    "kkt_stationarity": 1.154532853829622e-05,
+    "normalized_constraint_violation": 7.62705129493222e-10,
+    "mesh_checks": [
+      {
+        "samples": 332,
+        "iterations": 79,
+        "time_s": 11.6081693670385,
+        "dense_time_relative_change": 0.00019966349365780435,
+        "dense_normalized_violation": 0.023634196626834095
+      },
+      {
+        "samples": 374,
+        "iterations": 57,
+        "time_s": 11.62044746833205,
+        "dense_time_relative_change": 0.0001490510297266563,
+        "dense_normalized_violation": 0.0059654546130826856
+      },
+      {
+        "samples": 397,
+        "iterations": 56,
+        "time_s": 11.621999744941125,
+        "dense_time_relative_change": 0.00014183130512580822,
+        "dense_normalized_violation": 0.0007465811573471832
+      },
+      {
+        "samples": 411,
+        "iterations": 57,
+        "time_s": 11.622101132019484,
+        "dense_time_relative_change": 0.00014178706905357787,
+        "dense_normalized_violation": 0.00022337585106401564
+      },
+      {
+        "samples": 414,
+        "iterations": 57,
+        "time_s": 11.622101619898368,
+        "dense_time_relative_change": 0.00014172425639745971,
+        "dense_normalized_violation": 7.62705129493222e-10
+      }
+    ],
+    "solved_time_s": 11.620454486188512,
+    "exported_time_s": 11.632956836619531,
+    "export_relative_time_change": 0.0010758916913171123,
+    "export_audit": {
+      "normalized_physical_violation": 1.1102230246251565e-15,
+      "max_axle_friction_ratio": 1.000000000000001,
+      "minimum_body_clearance_above_reserve_m": 0.0028175881028224548,
+      "maximum_steering_rad": 0.4188753992811882,
+      "samples": 3719
+    },
+    "geometry_discretization_reserve_m": 0.003,
+    "path_control_mesh_convergence_tested": false,
+    "elapsed_s": 135.61915952101117
+  },
+  "elapsed_s": 137.7011849799892
+}

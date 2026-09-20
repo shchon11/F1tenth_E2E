@@ -1,0 +1,197 @@
+def _positive_root(a, b, c):
+    """First boundary of a quadratic feasible at zero, including linear/concave cases.
+
+    Torch counterpart of raceline._first_positive_root; all branches stay on device.
+    """
+    disc = b.square() - 4 * a * c
+    den = b + disc.clamp_min(0).sqrt()
+    root = -2 * c / den.clamp_min(1e-12)
+    root = torch.where((disc >= 0) & (den > 1e-12), root, torch.full_like(c, float('inf')))
+    return torch.where(c >= 0, torch.zeros_like(c), root)
+
+
+def resistance(speed, spec: GripSpec):
+    return spec.c_roll * torch.tanh(speed.abs() / .05) + spec.c_drag * speed.square()
+
+
+def _axles(mu, spec):
+    return ((1 - spec.drive_split_r, spec.lr / spec.L, -spec.h / spec.L, mu * spec.mu_f_scale),
+            (spec.drive_split_r, spec.lf / spec.L, spec.h / spec.L, mu * spec.mu_r_scale))
+
+
+def local_accel_bounds(speed, kappa, mu, spec: GripSpec, *, no_resistance=False):
+    """Net acceleration interval at the supplied *actual* speed/curvature.
+
+    Each axle obeys (share*(ax+drag))^2+(load*v^2*k)^2 <=
+    (mu*(g*load+transfer*ax))^2. The connected interval around ax=0 is solved
+    analytically, then intersected with positive axle loads and nominal motor limits.
+    Empty intervals/unsustainable lateral states are reported, never called feasible.
+    """
+    r = torch.zeros_like(speed) if no_resistance else resistance(speed, spec)
+    power = spec.a_max * (spec.v_switch / speed.abs().clamp_min(1e-3)).clamp(max=1)
+    lo, hi = -spec.a_brake - r, power - r
+    bad = torch.zeros_like(speed, dtype=torch.bool)
+    for share, load, transfer, grip in _axles(mu, spec):
+        aa = share ** 2 - (grip * transfer).square()
+        bb = 2 * (share ** 2 * r - grip.square() * G * load * transfer)
+        cc = (share * r).square() + (load * speed.square() * kappa).square() - (grip * G * load).square()
+        bad = bad | (cc > 1e-5)
+        lo = torch.maximum(lo, -_positive_root(aa, -bb, cc))
+        hi = torch.minimum(hi, _positive_root(aa, bb, cc))
+        if transfer < 0:
+            hi = hi.clamp(max=-G * load / transfer)
+        elif transfer > 0:
+            lo = lo.clamp(min=-G * load / transfer)
+    bad = bad | (lo > hi)
+    return lo, hi, bad
+
+
+def _steady_curvature(speed, mu, spec):
+    """Curvature preserving the requested lateral reserve and drag at zero net ax."""
+    r = resistance(speed, spec)
+    cap = torch.full_like(speed, float('inf'))
+    for share, load, _, grip in _axles(mu, spec):
+        residual = ((spec.rho_max * grip * G * load).square() - (share * r).square()).clamp_min(0)
+        cap = torch.minimum(cap, residual.sqrt() / (load * speed.square()).clamp_min(1e-6))
+    return cap
+
+
+def local_speed_profile(k, Lp, speed_cap, v0, v1, mu, v_initial, spec: GripSpec,
+                        plan_spec: _mpc.PlanSpec, v_max: float):
+    """Open-path desired, feasible and reachable profiles; only local edge budgets.
+
+    The feasible envelope uses the same both-axle physics as raceline.speed_profile.
+    Edge budgets conservatively cover both endpoints and all lower resistances, so
+    reducing a sample in the passes cannot invalidate a previous edge. Reachability
+    starts at the measured/delay-predicted speed, even when already outside the
+    envelope. During such recovery the feasible steering cap can differ from the
+    requested path; the path-tracking infeasibility is explicit in diagnostics.
+    """
+    _, _, _, arc, kap = _mpc.path_points(k, Lp, n=spec.n_path, return_kappa=True)
+    n = spec.n_path
+    ds = (Lp / (n - 1)).clamp_min(1e-3)
+    mu_p = mu[:, None]
+    frac = torch.linspace(0., 1., n, device=k.device, dtype=k.dtype)[None]
+    desired = (v0[:, None] + (v1 - v0)[:, None] * frac).clamp_min(0)
+    cap = torch.minimum(desired, speed_cap[:, None]).clamp(max=v_max)
+    curve = torch.full_like(cap, v_max ** 2)
+    # Constant-speed tire demand includes drag, just as in raceline.speed_profile.
+    for share, load, _, grip in _axles(mu_p * spec.rho_max, spec):
+        aa = (share * spec.c_drag) ** 2 + (load * kap).square()
+        bb = torch.full_like(cap, 2 * share ** 2 * spec.c_roll * spec.c_drag)
+        cc = (share * spec.c_roll) ** 2 - (grip * G * load).square()
+        curve = torch.minimum(curve, _positive_root(aa, bb, cc.expand_as(cap)))
+    curve = curve.clamp_min(0).sqrt()
+    cap = torch.minimum(cap, curve)
+    # Nominal power must sustain the upper envelope. Fixed device-only iterations.
+    low, high = torch.zeros_like(cap), cap.clone()
+    for _ in range(12):
+        middle = (low + high) * .5
+        sustainable = resistance(middle, spec) <= spec.a_max * (spec.v_switch / middle.clamp_min(1e-3)).clamp(max=1)
+        low, high = torch.where(sustainable, middle, low), torch.where(sustainable, high, middle)
+    cap = torch.minimum(cap, high)
+    delta = torch.atan((spec.L + plan_spec.k_us * cap.square()) * kap)
+    slew_cap = spec.sv_max * ds[:, None] / (delta[:, 1:] - delta[:, :-1]).abs().clamp_min(1e-6)
+    cap = torch.minimum(cap, torch.cat([slew_cap[:, :1], torch.minimum(slew_cap[:, :-1], slew_cap[:, 1:]), slew_cap[:, -1:]], 1))
+    lo, hi, _ = local_accel_bounds(cap, kap, mu_p, spec)
+    lo_zero, hi_zero, _ = local_accel_bounds(cap, kap, mu_p, spec, no_resistance=True)
+    # Taking both resistance endpoints also covers any speed lowered by the passes.
+    acc = torch.minimum(hi, hi_zero).clamp_min(0)
+    brk = (-torch.maximum(lo, lo_zero)).clamp_min(0)
+    edge_acc = torch.minimum(acc[:, :-1], acc[:, 1:])
+    edge_brk = torch.minimum(brk[:, :-1], brk[:, 1:])
+    cols = list(cap.unbind(1))
+    for i in range(n - 2, -1, -1):
+        cols[i] = torch.minimum(cols[i], (cols[i + 1].square() + 2 * edge_brk[:, i] * ds).sqrt())
+    for i in range(1, n):
+        cols[i] = torch.minimum(cols[i], (cols[i - 1].square() + 2 * edge_acc[:, i - 1] * ds).sqrt())
+    feasible = torch.stack(cols, 1)
+    # Actual speed is never overwritten by a slower target. Local recovery curvature
+    # keeps longitudinal planning well-defined when the desired turn is unreachable.
+    reachable = [v_initial.abs()]
+    for i in range(1, n):
+        speed = reachable[-1]
+        safe_k = torch.minimum(kap[:, i - 1].abs(), _steady_curvature(speed, mu, spec))
+        lower, upper, _ = local_accel_bounds(speed, safe_k, mu, spec)
+        want = (feasible[:, i].square() - speed.square()) / (2 * ds)
+        ax = torch.maximum(torch.minimum(want, upper), lower)
+        reachable.append((speed.square() + 2 * ax * ds).clamp_min(0).sqrt())
+    reachable = torch.stack(reachable, 1)
+    return reachable, {
+        'v_desired': desired, 'v_feasible': feasible, 'v_reachable': reachable,
+        'v_plan': desired, 'v_curve': curve, 'v_limit': feasible,
+        'kappa': kap, 'arc': arc, 'a_acc': acc, 'a_brk': brk,
+        'initial_overspeed': v_initial > feasible[:, 0] + 1e-5,
+        'path_infeasible': reachable > feasible + 1e-4,
+        'a_lat_max': mu_p * min(spec.mu_f_scale, spec.mu_r_scale) * G,
+        'rho': reachable.square() * kap.abs() / (mu_p * min(spec.mu_f_scale, spec.mu_r_scale) * G).clamp_min(1e-6),
+    }
+
+
+def project_local_control(state, control, mu, spec: GripSpec, plan_spec, wb, s_max, v_max):
+    """Project at the rollout state and selected steer, retaining slew during recovery."""
+    speed = state[:, 3]
+    le = wb + plan_spec.k_us * speed.square()
+    steer_cap = torch.atan(le * _steady_curvature(speed, mu, spec)).clamp(max=s_max)
+    slew = spec.sv_max * plan_spec.dt
+    steer_lo = torch.maximum(-steer_cap, state[:, 4] - slew)
+    steer_hi = torch.minimum(steer_cap, state[:, 4] + slew)
+    steer = torch.maximum(torch.minimum(control[:, 0], steer_hi), steer_lo)
+    # An initially infeasible steering state cannot jump inside the cap in one step.
+    # Recover at the servo rate, and expose the remaining violation below.
+    recovery = torch.maximum(torch.minimum(control[:, 0], state[:, 4] + slew), state[:, 4] - slew).clamp(-s_max, s_max)
+    recovery = torch.maximum(torch.minimum(torch.zeros_like(recovery), state[:, 4] + slew), state[:, 4] - slew).clamp(-s_max, s_max)
+    steer = torch.where(steer_lo <= steer_hi, steer, recovery)
+    curvature = torch.tan(steer) / le
+    lower, upper, bad = local_accel_bounds(speed, curvature, mu, spec)
+    # Physical top speed is a state goal, not permission to exceed available brakes.
+    upper = torch.minimum(upper, (v_max - speed) / plan_spec.dt)
+    upper = torch.maximum(upper, lower)
+    accel = torch.maximum(torch.minimum(control[:, 1], upper), lower)
+    bounded = torch.stack([steer, accel], 1)
+    return bounded, lower, upper, bad | (steer_lo > steer_hi)
+
+
+def stage_diagnostics(u, z, mu, spec, plan_spec, wb):
+    speed, steer, ax = z[:, :-1, 3], u[:, :, 0], u[:, :, 1]
+    kap = torch.tan(steer) / (wb + plan_spec.k_us * speed.square())
+    lo, hi, bad = local_accel_bounds(speed, kap, mu[:, None], spec)
+    r = resistance(speed, spec)
+    violations = []
+    for share, load, transfer, grip in _axles(mu[:, None], spec):
+        demand = ((share * (ax + r)).square() + (load * speed.square() * kap).square()).sqrt()
+        available = grip * (G * load + transfer * ax).clamp_min(0)
+        violations.append((demand - available).clamp_min(0))
+    return {'stage_lower': lo, 'stage_upper': hi, 'stage_infeasible': bad,
+            'stage_axle_violation': torch.stack(violations, -1),
+            'stage_accel_violation': torch.maximum(lo - ax, ax - hi).clamp_min(0),
+            'stage_slew_violation': ((steer - z[:, :-1, 4]).abs() - spec.sv_max * plan_spec.dt).clamp_min(0)}
+
+
+def solve_local_grip(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, mu,
+                     spec, wb, s_max, v_max, gspec, consts=None, out_bounds=None,
+                     out_diagnostics=None):
+    k, Lp, v0, v1 = _mpc.decode(action, v_meas, v_max, speed_cap, spec)
+    v = v_meas.abs()
+    le = wb + spec.k_us * v.square()
+    steer_now = torch.atan(yaw_rate * le / v.clamp_min(.5)).clamp(-s_max, s_max)
+    psi0 = yaw_rate * delay
+    z0 = torch.stack([v * delay, .5 * v * psi0 * delay, psi0,
+                      (v + u_prev[:, 1] * delay).clamp_min(0),
+                      torch.where(v > .5, steer_now, u_prev[:, 0]), u_prev[:, 1]], 1)
+    reachable, diag = local_speed_profile(k, Lp, speed_cap, v0, v1, mu, z0[:, 3], gspec, spec, v_max)
+    walk = torch.stack([diag['a_brk'], diag['a_acc']], -1)
+    ref = _mpc.reference(k, Lp, v0, v1, spec, z0[:, 3], a_walk=walk, v_profile=reachable)
+    def project(state, control, stage):
+        return project_local_control(state, control, mu, gspec, spec, wb, s_max, v_max)[0]
+    u, z = _mpc.ilqr(z0, ref, warm, spec, wb, s_max, v_max, consts=consts, projector=project)
+    diag.update(stage_diagnostics(u, z, mu, gspec, spec, wb))
+    if out_bounds is not None:
+        out_bounds.copy_(torch.stack([-diag['stage_lower'][:, 0], diag['stage_upper'][:, 0]], 1))
+    if out_diagnostics is not None:
+        for name, buffer in out_diagnostics.items():
+            if name in diag:
+                buffer.copy_(diag[name])
+    return u, z, ref
+
+

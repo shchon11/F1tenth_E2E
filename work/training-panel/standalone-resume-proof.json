@@ -1,0 +1,19 @@
+{
+  "checkpoint": "/home/shchon11/Documents/Codex/2026-09-17/new-chat/work/panel-cpu-smoke/ppo/ppo_final.pt",
+  "restored": {
+    "scan_stack": 1,
+    "scan_stride": 1,
+    "hist_len": 0,
+    "scan_stem": "plain",
+    "scan_deltas": false,
+    "temporal_encoder": "cnn",
+    "memory": "off",
+    "action_mode": "plan"
+  },
+  "actor_tensors_identical": 29,
+  "skipped": [],
+  "retained_initial_race_size": 2,
+  "blocked_incompatible_critic": true,
+  "compatible_race_size_after_explicit_selection": 1,
+  "gpu_used": false
+}

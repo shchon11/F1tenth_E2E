@@ -1,0 +1,6 @@
+{
+  "map": "scene:scene_0915_2042",
+  "ok": false,
+  "error": "scene:scene_0915_2042: minimum-time solve did not converge (Positive directional derivative for linesearch; normalized violation 0.391)",
+  "elapsed_s": 30.57934756501345
+}

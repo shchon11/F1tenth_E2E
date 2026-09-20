@@ -1,0 +1,67 @@
+{
+  "map": "gen:control:1400+bare",
+  "track": "control_1400",
+  "props": 0,
+  "length_m": 47.90825125099799,
+  "lap_time": 7.372867216524512,
+  "optimization": {
+    "dynamic_validation": false,
+    "effective_margin_m": [
+      0.2362053965718497,
+      0.4
+    ],
+    "elapsed_s": 33.73001611494692,
+    "export_audit": {
+      "max_axle_friction_ratio": 1.0000000000000147,
+      "maximum_steering_rad": 0.14662102129029686,
+      "minimum_body_clearance_above_reserve_m": 0.002828199601373149,
+      "normalized_physical_violation": 1.4654943925052066e-14,
+      "samples": 2875
+    },
+    "export_relative_time_change": 0.005406258626342676,
+    "exported_time_s": 7.372867216524512,
+    "geometry_discretization_reserve_m": 0.003,
+    "global_optimum_proven": false,
+    "kkt_stationarity": 7.259728308284252e-06,
+    "mesh_checks": [
+      {
+        "dense_normalized_violation": 0.0066609152428410145,
+        "dense_time_relative_change": 4.357853594757617e-05,
+        "iterations": 54,
+        "samples": 244,
+        "time_s": 7.325798813639597
+      },
+      {
+        "dense_normalized_violation": 0.00038439776377236146,
+        "dense_time_relative_change": 3.695207202579593e-05,
+        "iterations": 47,
+        "samples": 272,
+        "time_s": 7.333441136638724
+      },
+      {
+        "dense_normalized_violation": 8.02356553115777e-05,
+        "dense_time_relative_change": 3.6331872276991876e-05,
+        "iterations": 47,
+        "samples": 281,
+        "time_s": 7.333481998526291
+      },
+      {
+        "dense_normalized_violation": 8.732360950385619e-06,
+        "dense_time_relative_change": 3.628282734333971e-05,
+        "iterations": 47,
+        "samples": 287,
+        "time_s": 7.33348800192747
+      }
+    ],
+    "model": "periodic-quasisteady-axle-nlp-v1",
+    "normalized_constraint_violation": 9.44953445659825e-10,
+    "objective": "integral(norm(dxy/dphase)/speed, phase=0..1)",
+    "path_control_mesh_convergence_tested": false,
+    "path_controls": 61,
+    "requested_margin_m": 0.4,
+    "solved_time_s": 7.333221922248471,
+    "solver_message": "Optimization terminated successfully",
+    "status": "converged"
+  },
+  "elapsed_s": 0.0034383530146442354
+}

@@ -1,0 +1,9 @@
+{
+  "score": 95,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [],
+  "suggestions": [],
+  "reasoning": "Both actual Qt controls show five placement choices, no manual asset type/size category. Scientific chart labels predicted model laps and separates them from measured driving.",
+  "next_actions": []
+}

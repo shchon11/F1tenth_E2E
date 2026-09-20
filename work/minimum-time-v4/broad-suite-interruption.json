@@ -1,0 +1,5 @@
+{
+  "pid": 4174654,
+  "reason": "Additional cold-map optimizer check interrupted after 1067.77 seconds to respect the bounded training launch scope; 51 tests had passed. It was inside SLSQP, not an assertion failure.",
+  "time": 1789662584.3420196
+}

@@ -1,0 +1,102 @@
+[
+  {
+    "batch": 2,
+    "capture_seconds": 9.564868048997596,
+    "acceleration_status": {
+      "backend": "inductor-pointwise",
+      "reason": "qualified warmup before graph capture",
+      "cache_hit": false,
+      "warmup_seconds": 9.422127405006904
+    },
+    "max_cpu_gpu_errors": [
+      1.9073486328125e-06,
+      1.9073486328125e-06,
+      1.430511474609375e-06
+    ],
+    "graph_solver_ms": 4.802364960778505,
+    "tracker_with_command_ms": 5.087979566693927,
+    "diagnostic_rebind_guard": true,
+    "peak_cuda_mb": 24.4384765625,
+    "mutable_mu_feedback_parity": true
+  },
+  {
+    "batch": 48,
+    "capture_seconds": 8.763559843995608,
+    "acceleration_status": {
+      "backend": "inductor-pointwise",
+      "reason": "qualified warmup before graph capture",
+      "cache_hit": false,
+      "warmup_seconds": 8.62466982199112
+    },
+    "max_cpu_gpu_errors": [
+      3.0994415283203125e-06,
+      3.0994415283203125e-06,
+      1.6689300537109375e-06
+    ],
+    "graph_solver_ms": 5.193762680282816,
+    "tracker_with_command_ms": 5.812641731851424,
+    "diagnostic_rebind_guard": true,
+    "peak_cuda_mb": 56.5439453125,
+    "mutable_mu_feedback_parity": true
+  },
+  {
+    "batch": 2,
+    "capture_seconds": 0.16615508298855275,
+    "acceleration_status": {
+      "backend": "inductor-pointwise",
+      "reason": "qualified warmup before graph capture",
+      "cache_hit": true,
+      "warmup_seconds": 0.032876310986466706
+    },
+    "max_cpu_gpu_errors": [
+      1.9073486328125e-06,
+      1.9073486328125e-06,
+      1.430511474609375e-06
+    ],
+    "graph_solver_ms": 4.487347340909764,
+    "tracker_with_command_ms": 5.109276333435749,
+    "diagnostic_rebind_guard": true,
+    "peak_cuda_mb": 56.5439453125,
+    "mutable_mu_feedback_parity": true
+  },
+  {
+    "batch": 48,
+    "capture_seconds": 0.17209855001419783,
+    "acceleration_status": {
+      "backend": "inductor-pointwise",
+      "reason": "qualified warmup before graph capture",
+      "cache_hit": true,
+      "warmup_seconds": 0.03373892401577905
+    },
+    "max_cpu_gpu_errors": [
+      3.0994415283203125e-06,
+      3.0994415283203125e-06,
+      1.6689300537109375e-06
+    ],
+    "graph_solver_ms": 5.172460980247706,
+    "tracker_with_command_ms": 5.778138333698735,
+    "diagnostic_rebind_guard": true,
+    "peak_cuda_mb": 56.5439453125,
+    "mutable_mu_feedback_parity": true
+  },
+  {
+    "batch": 1,
+    "capture_seconds": 7.461954774043988,
+    "acceleration_status": {
+      "backend": "inductor-pointwise",
+      "reason": "qualified warmup before graph capture",
+      "cache_hit": false,
+      "warmup_seconds": 7.329250238020904
+    },
+    "max_cpu_gpu_errors": [
+      3.5762786865234375e-07,
+      3.5762786865234375e-07,
+      2.384185791015625e-07
+    ],
+    "graph_solver_ms": 4.477438520407304,
+    "tracker_with_command_ms": 4.984770798667644,
+    "diagnostic_rebind_guard": true,
+    "peak_cuda_mb": 56.97705078125,
+    "mutable_mu_feedback_parity": true
+  }
+]

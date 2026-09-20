@@ -1,0 +1,138 @@
+{
+  "score": 95,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [
+    "Standalone observer reports now retain their exact output file as the selectable monitor identity.",
+    "Report metrics and an explicit report-open action replace policy-only output assumptions."
+  ],
+  "suggestions": [],
+  "reasoning": "The exact1000x720 report monitor shows completed status, metrics, full custom report path and a usable report button without clipping. Setup retains the previously verified dark-theme layout at1000x720 and1440x960. Rendered report values are clearly marked synthetic QA examples.",
+  "threshold": 90,
+  "threshold_pass": true,
+  "next_actions": [],
+  "screenshots": [
+    "work/training-panel/setup-1000.png",
+    "work/training-panel/setup-1440.png",
+    "work/training-panel/teacher-custom-1000.png",
+    "work/training-panel/final-report-1000.png"
+  ],
+  "previous": {
+    "score": 95,
+    "verdict": "pass",
+    "category_match": true,
+    "differences": [
+      "Full-width setup with section navigation intentionally replaces the narrow recipe form.",
+      "Observer progress uses epoch/loss rather than PPO metrics."
+    ],
+    "suggestions": [],
+    "reasoning": "Setup renders at exact1000x720 and1440x960, teacher weights have five semantic labels, integrated settings count matches coverage, and adaptive-only controls are disabled in general PPO. Existing graphite palette and typography are retained.",
+    "threshold": 90,
+    "threshold_pass": true,
+    "next_actions": [],
+    "screenshots": [
+      "work/training-panel/setup-1000.png",
+      "work/training-panel/setup-1440.png",
+      "work/training-panel/teacher-custom-1000.png",
+      "work/training-panel/maps-1000.png",
+      "work/training-panel/opponents-1000.png",
+      "work/training-panel/grip-replay-1000.png",
+      "work/training-panel/monitor-1000.png"
+    ],
+    "previous": {
+      "score": 87,
+      "verdict": "revise",
+      "category_match": true,
+      "differences": [
+        "Teacher cost uses one comma list; five semantic weight names are not visible.",
+        "Empty monitor guidance still refers to the former left-side recipe column."
+      ],
+      "suggestions": [
+        "Show optional five named numeric TeacherCost controls with real defaults.",
+        "Point empty-state guidance to the \ud559\uc2b5 \uc124\uc815 tab."
+      ],
+      "reasoning": "Compact layout and map/monitor visibility passed; teacher-cost controls still require out-of-panel knowledge.",
+      "threshold": 90,
+      "threshold_pass": false,
+      "next_actions": [
+        "Use schema component metadata and re-render teacher section."
+      ],
+      "previous": {
+        "score": 88,
+        "verdict": "revise",
+        "category_match": true,
+        "differences": [
+          "A populated monitor tab imposes 758px minimum height on the setup tab, preventing exact1000x720 layout."
+        ],
+        "suggestions": [
+          "Put the monitor in a resizable scroll area so chart/job content does not increase the setup minimum size."
+        ],
+        "reasoning": "Individual controls match the theme; tab minimum sizing must stay independent of historical run chart count.",
+        "threshold": 90,
+        "threshold_pass": false,
+        "next_actions": [
+          "Wrap monitor then re-render both target sizes and all modes."
+        ],
+        "previous": {
+          "score": 89,
+          "verdict": "revise",
+          "category_match": true,
+          "differences": [
+            "Coverage and adaptive-only reference cues are corrected.",
+            "New large-integer editor inherits native white spin buttons inconsistent with the dark controls."
+          ],
+          "suggestions": [
+            "Render arbitrary-width integers with the existing themed line-edit control, retaining typed validation and keyboard stepping."
+          ],
+          "reasoning": "Layouts fit compact and normal windows; one newly introduced numeric control styling mismatch remains.",
+          "threshold": 90,
+          "threshold_pass": false,
+          "next_actions": [
+            "Replace native integer spin chrome and render again."
+          ],
+          "previous": {
+            "score": 88,
+            "verdict": "revise",
+            "category_match": true,
+            "differences": [
+              "Coverage shows 151 supported but 150 displayed although obstacle_draws is integrated; suggests a missing option",
+              "General PPO exposes an enabled D3 reference field that validation forbids outside adaptation"
+            ],
+            "suggestions": [
+              "Report integrated control coverage accurately",
+              "Disable reference for non-adaptive PPO with short mode guidance"
+            ],
+            "reasoning": "Full-width sections fit both sizes without clipping and match the dark console. Two configuration cues need correction before final acceptance.",
+            "threshold": 90,
+            "threshold_pass": false,
+            "next_actions": [
+              "Re-render after coverage count and adaptation-field enablement corrections."
+            ],
+            "previous": {
+              "score": 93,
+              "verdict": "pass",
+              "category_match": true,
+              "differences": [
+                "Full-width setup replaces the former narrow recipe column; section navigation follows the existing graphite theme.",
+                "Backend help remains English where existing trainer help is English."
+              ],
+              "suggestions": [
+                "Verify maps, opponent table and progress view at compact width."
+              ],
+              "reasoning": "1000x720 render has readable labels, visible launch action, no clipping, and consistent existing dark Qt controls. This is a qualitative theme comparison, not screenshot cloning.",
+              "threshold": 90,
+              "threshold_pass": true,
+              "next_actions": [
+                "Render other sections and observer progress."
+              ],
+              "reference_images": [
+                "existing console theme.py and widgets.py"
+              ],
+              "generated_screenshot": "work/training-panel/setup-1000.png"
+            }
+          }
+        }
+      }
+    }
+  }
+}

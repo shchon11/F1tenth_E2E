@@ -1,0 +1,67 @@
+{
+  "map": "gen:control:1400",
+  "track": "control_1400",
+  "props": 0,
+  "length_m": 47.90825125099799,
+  "lap_time": 7.372867216524512,
+  "optimization": {
+    "model": "periodic-quasisteady-axle-nlp-v1",
+    "status": "converged",
+    "global_optimum_proven": false,
+    "dynamic_validation": false,
+    "objective": "integral(norm(dxy/dphase)/speed, phase=0..1)",
+    "path_controls": 61,
+    "requested_margin_m": 0.4,
+    "effective_margin_m": [
+      0.2362053965718497,
+      0.4
+    ],
+    "solver_message": "Optimization terminated successfully",
+    "kkt_stationarity": 7.259728308284252e-06,
+    "normalized_constraint_violation": 9.44953445659825e-10,
+    "mesh_checks": [
+      {
+        "samples": 244,
+        "iterations": 54,
+        "time_s": 7.325798813639597,
+        "dense_time_relative_change": 4.357853594757617e-05,
+        "dense_normalized_violation": 0.0066609152428410145
+      },
+      {
+        "samples": 272,
+        "iterations": 47,
+        "time_s": 7.333441136638724,
+        "dense_time_relative_change": 3.695207202579593e-05,
+        "dense_normalized_violation": 0.00038439776377236146
+      },
+      {
+        "samples": 281,
+        "iterations": 47,
+        "time_s": 7.333481998526291,
+        "dense_time_relative_change": 3.6331872276991876e-05,
+        "dense_normalized_violation": 8.02356553115777e-05
+      },
+      {
+        "samples": 287,
+        "iterations": 47,
+        "time_s": 7.33348800192747,
+        "dense_time_relative_change": 3.628282734333971e-05,
+        "dense_normalized_violation": 8.732360950385619e-06
+      }
+    ],
+    "solved_time_s": 7.333221922248471,
+    "exported_time_s": 7.372867216524512,
+    "export_relative_time_change": 0.005406258626342676,
+    "export_audit": {
+      "normalized_physical_violation": 1.4654943925052066e-14,
+      "max_axle_friction_ratio": 1.0000000000000147,
+      "minimum_body_clearance_above_reserve_m": 0.002828199601373149,
+      "maximum_steering_rad": 0.14662102129029686,
+      "samples": 2875
+    },
+    "geometry_discretization_reserve_m": 0.003,
+    "path_control_mesh_convergence_tested": false,
+    "elapsed_s": 33.73001611494692
+  },
+  "elapsed_s": 35.773460316006094
+}

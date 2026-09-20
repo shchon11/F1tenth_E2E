@@ -1,0 +1,31 @@
+{
+  "score": 97,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [
+    "Cold state replaces the former g-g axis caption with the explicit estimate status '추정 대기'.",
+    "Warm overestimate state scales all circles to the largest estimate, making cyan q50/q90 visibly exceed the smaller red truth circle.",
+    "Fault state removes the estimated circle while retaining the applied limit and warning-colored sensor-check status.",
+    "Cold state remains a full red truth circle with no purported estimate geometry."
+  ],
+  "suggestions": [
+    "Keep the shared scale for overestimates so circle radii remain numerically proportional.",
+    "Retain the compact applied-mu caption at the small normal dashboard width.",
+    "Keep the synthetic preview values documented with the artifact.",
+    "Keep cold and fault captions compact at the normal dashboard width."
+  ],
+  "reasoning": "The existing red truth circle and three-column dashboard remain readable. Warm, cold, fault, and overestimate states communicate evidence availability with proportional circles and no spill into adjacent gauges.",
+  "next_actions": [
+    "No visual edits required; retain the rendered states and complete scoped test verification."
+  ],
+  "reference_images": [
+    "work/grip-visual/reference-before.png"
+  ],
+  "generated_screenshots": [
+    "work/grip-visual/cold.png",
+    "work/grip-visual/estimated-uncertainty.png",
+    "work/grip-visual/fault.png",
+    "work/grip-visual/overestimate.png",
+    "work/grip-visual/fault-overestimate.png"
+  ]
+}

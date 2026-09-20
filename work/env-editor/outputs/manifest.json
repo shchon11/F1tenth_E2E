@@ -1,0 +1,75 @@
+{
+  "captured": "2026-09-12T23:12:03",
+  "scene_dir": "/tmp/claude-1000/-home-shchon11-F1tenth/1ba4bd0e-d409-4b02-9dc7-edc80cb2df59/scratchpad/cap_scenes/capture_hall",
+  "props": [
+    [
+      "p1",
+      "cardboard_box",
+      null,
+      6.0,
+      3.0
+    ],
+    [
+      "p2",
+      "steel_drum",
+      null,
+      13.4,
+      3.4
+    ],
+    [
+      "p3",
+      "barrier_block",
+      null,
+      9.5,
+      9.0
+    ],
+    [
+      "p4",
+      "mesh",
+      "a1",
+      9.8,
+      3.0
+    ],
+    [
+      "p5",
+      "mesh",
+      "a1",
+      5.0,
+      9.0
+    ]
+  ],
+  "assets": [
+    [
+      "a1",
+      "tire_stack",
+      576,
+      [
+        0.5600000019999999,
+        0.560000002,
+        0.5
+      ]
+    ]
+  ],
+  "shape": [
+    240,
+    360
+  ],
+  "resolution": 0.05,
+  "renderer": null,
+  "software_gl": true,
+  "files": {
+    "window": {
+      "path": "../work/env-editor/outputs/f1tenth-environment-editor.png",
+      "sha256": "d2c183498da75421a2bd1db7ab7c444ce28d830419d420b9358f4f22d9ebf0f7"
+    },
+    "viewport": {
+      "path": "../work/env-editor/outputs/f1tenth-environment-editor-viewport.png",
+      "sha256": "cb8a600f0c0277771e04a280fd23e7371843db4485a7011d95c887e68d9c7d99"
+    },
+    "top": {
+      "path": "../work/env-editor/outputs/f1tenth-environment-editor-top.png",
+      "sha256": "fc51aaab8a5c7fea58396dec836598abb4e60aea14ec937ecccbd4e5f3b046a6"
+    }
+  },
+  "status_line": "x   13.40  y    3.40   바닥   ·   저장했습니다: /tmp/claude-1000/-home-shchon11-F1tenth/1ba4bd0e-d409-4b02-9dc7-edc80cb2df59/scratchpad/cap_scenes/capture_hall   ·   업로드 3 ms"
+}

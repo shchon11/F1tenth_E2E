@@ -1,0 +1,71 @@
+{
+  "map": "real:icra2022",
+  "ok": true,
+  "diagnostics": {
+    "model": "periodic-quasisteady-axle-nlp-v1",
+    "status": "converged",
+    "global_optimum_proven": false,
+    "dynamic_validation": false,
+    "objective": "integral(norm(dxy/dphase)/speed, phase=0..1)",
+    "path_controls": 84,
+    "requested_margin_m": 0.4,
+    "effective_margin_m": [
+      0.17736744634220492,
+      0.4
+    ],
+    "solver_message": "Optimization terminated successfully",
+    "kkt_stationarity": 2.1409481977436214e-05,
+    "normalized_constraint_violation": 1.6880005631880837e-09,
+    "mesh_checks": [
+      {
+        "samples": 336,
+        "iterations": 83,
+        "time_s": 11.541114177302292,
+        "dense_time_relative_change": 0.00016772349710896805,
+        "dense_normalized_violation": 0.023752284451349154
+      },
+      {
+        "samples": 384,
+        "iterations": 56,
+        "time_s": 11.552490575439943,
+        "dense_time_relative_change": 0.00011311278451310575,
+        "dense_normalized_violation": 0.006014406611695658
+      },
+      {
+        "samples": 405,
+        "iterations": 59,
+        "time_s": 11.553275816832642,
+        "dense_time_relative_change": 0.00010411020496668622,
+        "dense_normalized_violation": 0.0013673512489417294
+      },
+      {
+        "samples": 421,
+        "iterations": 62,
+        "time_s": 11.553330637326205,
+        "dense_time_relative_change": 0.000103263764840015,
+        "dense_normalized_violation": 4.9149771125062445e-05
+      },
+      {
+        "samples": 427,
+        "iterations": 56,
+        "time_s": 11.553332584536442,
+        "dense_time_relative_change": 0.00010322832756630953,
+        "dense_normalized_violation": 1.6880005631880837e-09
+      }
+    ],
+    "solved_time_s": 11.552139953335923,
+    "exported_time_s": 11.56641895024545,
+    "export_relative_time_change": 0.0012360477770531955,
+    "export_audit": {
+      "normalized_physical_violation": 6.661338147750939e-16,
+      "max_axle_friction_ratio": 1.0000000000000007,
+      "minimum_body_clearance_above_reserve_m": 0.0027555567435407213,
+      "maximum_steering_rad": 0.41868479347437454,
+      "samples": 3710
+    },
+    "geometry_discretization_reserve_m": 0.003,
+    "path_control_mesh_convergence_tested": false,
+    "elapsed_s": 161.5242677750066
+  },
+  "elapsed_s": 163.3682870020275
+}

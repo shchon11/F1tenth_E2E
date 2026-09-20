@@ -1,0 +1,291 @@
+
+import triton
+import triton.language as tl
+
+from torch._inductor.runtime import triton_helpers, triton_heuristics
+from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
+from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
+triton_helpers.set_driver_to_gpu()
+
+@triton_heuristics.pointwise(
+    size_hints={'x': 1}, 
+    filename=__file__,
+    triton_meta={'signature': {'in_out_ptr0': '*fp32', 'in_ptr0': '*fp32', 'in_ptr1': '*fp32', 'in_ptr2': '*fp32', 'in_ptr3': '*fp32', 'in_ptr4': '*fp32', 'out_ptr2': '*fp32', 'xnumel': 'constexpr', 'XBLOCK': 'constexpr'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=34, cc=89, major=8, regs_per_multiprocessor=65536, max_threads_per_multi_processor=1536, max_threads_per_block=1024, warp_size=32), 'constants': {'xnumel': 1}, 'native_matmul': False, 'configs': [{(0,): [['tt.divisibility', 16]], (1,): [['tt.divisibility', 16]], (3,): [['tt.divisibility', 16]], (4,): [['tt.divisibility', 16]], (5,): [['tt.divisibility', 16]], (6,): [['tt.divisibility', 16]]}], 'enable_fp_fusion': True},
+    inductor_meta={'grid_type': 'Grid1D', 'autotune_hints': set(), 'kernel_name': 'triton_poi_fused_abs_add_bitwise_and_clamp_clamp_min_div_full_like_ge_gt_maximum_minimum_mul_neg_pow_reciprocal_rsub_sqrt_sub_tanh_where_zeros_like_0', 'mutated_arg_names': ['in_out_ptr0'], 'optimize_mem': True, 'no_x_dim': False, 'atomic_add_found': False, 'num_load': 5, 'num_store': 2, 'num_reduction': 0, 'backend_hash': 'C4AE5D0BE9AAD72C2766AB07DD996C7AD9C23AFA1F39358C56BEF986E95FF01C', 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False, 'deterministic': False, 'force_filter_reduction_configs': False, 'are_deterministic_algorithms_enabled': False},
+    min_elem_per_thread=0
+)
+@triton.jit
+def triton_poi_fused_abs_add_bitwise_and_clamp_clamp_min_div_full_like_ge_gt_maximum_minimum_mul_neg_pow_reciprocal_rsub_sqrt_sub_tanh_where_zeros_like_0(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, out_ptr2, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 1
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = tl.full([XBLOCK], True, tl.int1)[:]
+    tmp0 = tl.load(in_ptr0 + (0))
+    tmp1 = tl.broadcast_to(tmp0, [XBLOCK])
+    tmp2 = tl.load(in_ptr1 + (0))
+    tmp3 = tl.broadcast_to(tmp2, [XBLOCK])
+    tmp5 = tl.load(in_ptr2 + (0))
+    tmp6 = tl.broadcast_to(tmp5, [XBLOCK])
+    tmp25 = tl.load(in_ptr3 + (0))
+    tmp26 = tl.broadcast_to(tmp25, [XBLOCK])
+    tmp49 = tl.load(in_ptr4 + (0))
+    tmp50 = tl.broadcast_to(tmp49, [XBLOCK])
+    tmp4 = tmp1 * tmp1
+    tmp7 = 14.0
+    tmp8 = tmp6 * tmp7
+    tmp9 = tmp4 + tmp8
+    tmp10 = tl.sqrt_rn(tmp9)
+    tmp11 = triton_helpers.minimum(tmp3, tmp10)
+    tmp12 = triton_helpers.maximum(tmp1, tmp11)
+    tmp13 = tl_math.abs(tmp12)
+    tmp14 = 20.0
+    tmp15 = tmp13 * tmp14
+    tmp16 = libdevice.tanh(tmp15)
+    tmp17 = 0.1
+    tmp18 = tmp16 * tmp17
+    tmp19 = tmp12 * tmp12
+    tmp20 = 0.01
+    tmp21 = tmp19 * tmp20
+    tmp22 = tmp18 + tmp21
+    tmp23 = 0.25
+    tmp24 = tmp22 * tmp23
+    tmp27 = 0.92
+    tmp28 = tmp26 * tmp27
+    tmp29 = tmp28 * tmp28
+    tmp30 = 9.81
+    tmp31 = tmp29 * tmp30
+    tmp32 = 0.5192307692307692
+    tmp33 = tmp31 * tmp32
+    tmp34 = -0.22410660205935795
+    tmp35 = tmp33 * tmp34
+    tmp36 = tmp24 - tmp35
+    tmp37 = 2.0
+    tmp38 = tmp36 * tmp37
+    tmp39 = 1.0
+    tmp40 = tmp26 * tmp39
+    tmp41 = tmp40 * tmp40
+    tmp42 = tmp41 * tmp30
+    tmp43 = 0.4807692307692308
+    tmp44 = tmp42 * tmp43
+    tmp45 = 0.22410660205935795
+    tmp46 = tmp44 * tmp45
+    tmp47 = tmp24 - tmp46
+    tmp48 = tmp47 * tmp37
+    tmp51 = 0.85
+    tmp52 = tmp28 * tmp51
+    tmp53 = tmp52 * tmp30
+    tmp54 = tmp53 * tmp32
+    tmp55 = tmp54 * tmp54
+    tmp56 = 0.5
+    tmp57 = tmp22 * tmp56
+    tmp58 = tmp57 * tmp57
+    tmp59 = tmp55 - tmp58
+    tmp60 = 0.0
+    tmp61 = triton_helpers.maximum(tmp59, tmp60)
+    tmp62 = tl.sqrt_rn(tmp61)
+    tmp63 = tmp19 * tmp32
+    tmp64 = 1e-06
+    tmp65 = triton_helpers.maximum(tmp63, tmp64)
+    tmp66 = (tmp62 / tmp65)
+    tmp67 = float("inf")
+    tmp68 = triton_helpers.minimum(tmp67, tmp66)
+    tmp69 = tmp40 * tmp51
+    tmp70 = tmp69 * tmp30
+    tmp71 = tmp70 * tmp43
+    tmp72 = tmp71 * tmp71
+    tmp73 = tmp72 - tmp58
+    tmp74 = triton_helpers.maximum(tmp73, tmp60)
+    tmp75 = tl.sqrt_rn(tmp74)
+    tmp76 = tmp19 * tmp43
+    tmp77 = triton_helpers.maximum(tmp76, tmp64)
+    tmp78 = (tmp75 / tmp77)
+    tmp79 = triton_helpers.minimum(tmp68, tmp78)
+    tmp80 = triton_helpers.minimum(tmp50, tmp79)
+    tmp81 = tmp63 * tmp80
+    tmp82 = tmp81 * tmp81
+    tmp83 = tmp58 + tmp82
+    tmp84 = tmp28 * tmp30
+    tmp85 = tmp84 * tmp32
+    tmp86 = tmp85 * tmp85
+    tmp87 = tmp83 - tmp86
+    tmp88 = tmp76 * tmp80
+    tmp89 = tmp88 * tmp88
+    tmp90 = tmp58 + tmp89
+    tmp91 = tmp40 * tmp30
+    tmp92 = tmp91 * tmp43
+    tmp93 = tmp92 * tmp92
+    tmp94 = tmp90 - tmp93
+    tmp95 = tmp82 - tmp86
+    tmp96 = tmp89 - tmp93
+    tmp97 = 0.001
+    tmp98 = triton_helpers.maximum(tmp13, tmp97)
+    tmp99 = tl.full([1], 1, tl.int32)
+    tmp100 = (tmp99 / tmp98)
+    tmp101 = 7.319
+    tmp102 = tmp100 * tmp101
+    tmp103 = triton_helpers.minimum(tmp102, tmp39)
+    tmp104 = 7.0
+    tmp105 = tmp103 * tmp104
+    tmp106 = tmp105 - tmp22
+    tmp107 = tmp87 >= tmp60
+    tmp108 = tmp38 * tmp38
+    tmp109 = tmp28 * tmp34
+    tmp110 = tmp109 * tmp109
+    tmp111 = tmp23 - tmp110
+    tmp112 = 4.0
+    tmp113 = tmp111 * tmp112
+    tmp114 = tmp113 * tmp87
+    tmp115 = tmp108 - tmp114
+    tmp116 = tmp115 >= tmp60
+    tmp117 = triton_helpers.maximum(tmp115, tmp60)
+    tmp118 = tl.sqrt_rn(tmp117)
+    tmp119 = tmp38 + tmp118
+    tmp120 = 1e-12
+    tmp121 = tmp119 > tmp120
+    tmp122 = tmp116 & tmp121
+    tmp123 = -2.0
+    tmp124 = tmp87 * tmp123
+    tmp125 = triton_helpers.maximum(tmp119, tmp120)
+    tmp126 = (tmp124 / tmp125)
+    tmp127 = tl.where(tmp122, tmp126, tmp67)
+    tmp128 = tl.where(tmp107, tmp60, tmp127)
+    tmp129 = triton_helpers.minimum(tmp106, tmp128)
+    tmp130 = 22.72870945945946
+    tmp131 = triton_helpers.minimum(tmp129, tmp130)
+    tmp132 = tmp94 >= tmp60
+    tmp133 = tmp48 * tmp48
+    tmp134 = tmp40 * tmp45
+    tmp135 = tmp134 * tmp134
+    tmp136 = tmp23 - tmp135
+    tmp137 = tmp136 * tmp112
+    tmp138 = tmp137 * tmp94
+    tmp139 = tmp133 - tmp138
+    tmp140 = tmp139 >= tmp60
+    tmp141 = triton_helpers.maximum(tmp139, tmp60)
+    tmp142 = tl.sqrt_rn(tmp141)
+    tmp143 = tmp48 + tmp142
+    tmp144 = tmp143 > tmp120
+    tmp145 = tmp140 & tmp144
+    tmp146 = tmp94 * tmp123
+    tmp147 = triton_helpers.maximum(tmp143, tmp120)
+    tmp148 = (tmp146 / tmp147)
+    tmp149 = tl.where(tmp145, tmp148, tmp67)
+    tmp150 = tl.where(tmp132, tmp60, tmp149)
+    tmp151 = triton_helpers.minimum(tmp131, tmp150)
+    tmp152 = tmp95 >= tmp60
+    tmp153 = tmp60 - tmp35
+    tmp154 = tmp153 * tmp37
+    tmp155 = tmp154 * tmp154
+    tmp156 = tmp113 * tmp95
+    tmp157 = tmp155 - tmp156
+    tmp158 = tmp157 >= tmp60
+    tmp159 = triton_helpers.maximum(tmp157, tmp60)
+    tmp160 = tl.sqrt_rn(tmp159)
+    tmp161 = tmp154 + tmp160
+    tmp162 = tmp161 > tmp120
+    tmp163 = tmp158 & tmp162
+    tmp164 = tmp95 * tmp123
+    tmp165 = triton_helpers.maximum(tmp161, tmp120)
+    tmp166 = (tmp164 / tmp165)
+    tmp167 = tl.where(tmp163, tmp166, tmp67)
+    tmp168 = tl.where(tmp152, tmp60, tmp167)
+    tmp169 = triton_helpers.minimum(tmp105, tmp168)
+    tmp170 = triton_helpers.minimum(tmp169, tmp130)
+    tmp171 = tmp96 >= tmp60
+    tmp172 = tmp60 - tmp46
+    tmp173 = tmp172 * tmp37
+    tmp174 = tmp173 * tmp173
+    tmp175 = tmp137 * tmp96
+    tmp176 = tmp174 - tmp175
+    tmp177 = tmp176 >= tmp60
+    tmp178 = triton_helpers.maximum(tmp176, tmp60)
+    tmp179 = tl.sqrt_rn(tmp178)
+    tmp180 = tmp173 + tmp179
+    tmp181 = tmp180 > tmp120
+    tmp182 = tmp177 & tmp181
+    tmp183 = tmp96 * tmp123
+    tmp184 = triton_helpers.maximum(tmp180, tmp120)
+    tmp185 = (tmp183 / tmp184)
+    tmp186 = tl.where(tmp182, tmp185, tmp67)
+    tmp187 = tl.where(tmp171, tmp60, tmp186)
+    tmp188 = triton_helpers.minimum(tmp170, tmp187)
+    tmp189 = triton_helpers.minimum(tmp151, tmp188)
+    tmp190 = -5.0
+    tmp191 = tmp190 - tmp22
+    tmp192 = -tmp38
+    tmp193 = tmp192 * tmp192
+    tmp194 = tmp193 - tmp114
+    tmp195 = tmp194 >= tmp60
+    tmp196 = triton_helpers.maximum(tmp194, tmp60)
+    tmp197 = tl.sqrt_rn(tmp196)
+    tmp198 = tmp192 + tmp197
+    tmp199 = tmp198 > tmp120
+    tmp200 = tmp195 & tmp199
+    tmp201 = triton_helpers.maximum(tmp198, tmp120)
+    tmp202 = (tmp124 / tmp201)
+    tmp203 = tl.where(tmp200, tmp202, tmp67)
+    tmp204 = tl.where(tmp107, tmp60, tmp203)
+    tmp205 = -tmp204
+    tmp206 = triton_helpers.maximum(tmp191, tmp205)
+    tmp207 = -tmp48
+    tmp208 = tmp207 * tmp207
+    tmp209 = tmp208 - tmp138
+    tmp210 = tmp209 >= tmp60
+    tmp211 = triton_helpers.maximum(tmp209, tmp60)
+    tmp212 = tl.sqrt_rn(tmp211)
+    tmp213 = tmp207 + tmp212
+    tmp214 = tmp213 > tmp120
+    tmp215 = tmp210 & tmp214
+    tmp216 = triton_helpers.maximum(tmp213, tmp120)
+    tmp217 = (tmp146 / tmp216)
+    tmp218 = tl.where(tmp215, tmp217, tmp67)
+    tmp219 = tl.where(tmp132, tmp60, tmp218)
+    tmp220 = -tmp219
+    tmp221 = triton_helpers.maximum(tmp206, tmp220)
+    tmp222 = -21.045101351351356
+    tmp223 = triton_helpers.maximum(tmp221, tmp222)
+    tmp224 = -tmp154
+    tmp225 = tmp224 * tmp224
+    tmp226 = tmp225 - tmp156
+    tmp227 = tmp226 >= tmp60
+    tmp228 = triton_helpers.maximum(tmp226, tmp60)
+    tmp229 = tl.sqrt_rn(tmp228)
+    tmp230 = tmp224 + tmp229
+    tmp231 = tmp230 > tmp120
+    tmp232 = tmp227 & tmp231
+    tmp233 = triton_helpers.maximum(tmp230, tmp120)
+    tmp234 = (tmp164 / tmp233)
+    tmp235 = tl.where(tmp232, tmp234, tmp67)
+    tmp236 = tl.where(tmp152, tmp60, tmp235)
+    tmp237 = -tmp236
+    tmp238 = triton_helpers.maximum(tmp190, tmp237)
+    tmp239 = -tmp173
+    tmp240 = tmp239 * tmp239
+    tmp241 = tmp240 - tmp175
+    tmp242 = tmp241 >= tmp60
+    tmp243 = triton_helpers.maximum(tmp241, tmp60)
+    tmp244 = tl.sqrt_rn(tmp243)
+    tmp245 = tmp239 + tmp244
+    tmp246 = tmp245 > tmp120
+    tmp247 = tmp242 & tmp246
+    tmp248 = triton_helpers.maximum(tmp245, tmp120)
+    tmp249 = (tmp183 / tmp248)
+    tmp250 = tl.where(tmp247, tmp249, tmp67)
+    tmp251 = tl.where(tmp171, tmp60, tmp250)
+    tmp252 = -tmp251
+    tmp253 = triton_helpers.maximum(tmp238, tmp252)
+    tmp254 = triton_helpers.maximum(tmp253, tmp222)
+    tmp255 = triton_helpers.maximum(tmp223, tmp254)
+    tmp256 = tmp3 * tmp3
+    tmp257 = tmp256 - tmp4
+    tmp258 = tmp6 * tmp37
+    tmp259 = (tmp257 / tmp258)
+    tmp260 = triton_helpers.minimum(tmp259, tmp189)
+    tmp261 = triton_helpers.maximum(tmp260, tmp255)
+    tmp262 = tmp261 * tmp37
+    tmp263 = tmp262 * tmp6
+    tmp264 = tmp4 + tmp263
+    tmp265 = triton_helpers.maximum(tmp264, tmp60)
+    tmp266 = tl.sqrt_rn(tmp265)
+    tl.store(out_ptr2 + (tl.full([XBLOCK], 0, tl.int32).broadcast_to(XBLOCK)), tmp80, None)
+    tl.store(in_out_ptr0 + (tl.full([XBLOCK], 0, tl.int32).broadcast_to(XBLOCK)), tmp266, None)

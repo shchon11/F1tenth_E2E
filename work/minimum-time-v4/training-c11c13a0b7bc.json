@@ -1,0 +1,74 @@
+{
+  "map": "real:icra2022",
+  "track": "icra2022",
+  "props": 0,
+  "length_m": 61.82481813484456,
+  "lap_time": 11.56641895024545,
+  "optimization": {
+    "dynamic_validation": false,
+    "effective_margin_m": [
+      0.17736744634220492,
+      0.4
+    ],
+    "elapsed_s": 161.5242677750066,
+    "export_audit": {
+      "max_axle_friction_ratio": 1.0000000000000007,
+      "maximum_steering_rad": 0.41868479347437454,
+      "minimum_body_clearance_above_reserve_m": 0.0027555567435407213,
+      "normalized_physical_violation": 6.661338147750939e-16,
+      "samples": 3710
+    },
+    "export_relative_time_change": 0.0012360477770531955,
+    "exported_time_s": 11.56641895024545,
+    "geometry_discretization_reserve_m": 0.003,
+    "global_optimum_proven": false,
+    "kkt_stationarity": 2.1409481977436214e-05,
+    "mesh_checks": [
+      {
+        "dense_normalized_violation": 0.023752284451349154,
+        "dense_time_relative_change": 0.00016772349710896805,
+        "iterations": 83,
+        "samples": 336,
+        "time_s": 11.541114177302292
+      },
+      {
+        "dense_normalized_violation": 0.006014406611695658,
+        "dense_time_relative_change": 0.00011311278451310575,
+        "iterations": 56,
+        "samples": 384,
+        "time_s": 11.552490575439943
+      },
+      {
+        "dense_normalized_violation": 0.0013673512489417294,
+        "dense_time_relative_change": 0.00010411020496668622,
+        "iterations": 59,
+        "samples": 405,
+        "time_s": 11.553275816832642
+      },
+      {
+        "dense_normalized_violation": 4.9149771125062445e-05,
+        "dense_time_relative_change": 0.000103263764840015,
+        "iterations": 62,
+        "samples": 421,
+        "time_s": 11.553330637326205
+      },
+      {
+        "dense_normalized_violation": 1.6880005631880837e-09,
+        "dense_time_relative_change": 0.00010322832756630953,
+        "iterations": 56,
+        "samples": 427,
+        "time_s": 11.553332584536442
+      }
+    ],
+    "model": "periodic-quasisteady-axle-nlp-v1",
+    "normalized_constraint_violation": 1.6880005631880837e-09,
+    "objective": "integral(norm(dxy/dphase)/speed, phase=0..1)",
+    "path_control_mesh_convergence_tested": false,
+    "path_controls": 84,
+    "requested_margin_m": 0.4,
+    "solved_time_s": 11.552139953335923,
+    "solver_message": "Optimization terminated successfully",
+    "status": "converged"
+  },
+  "elapsed_s": 0.01238007697975263
+}

@@ -1,0 +1,9 @@
+{
+  "score": 95,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [],
+  "suggestions": [],
+  "reasoning": "Final actual Qt screenshots show five obstacle modes, no manual asset/size or separate 3D controls, and truthful default split checkmarks. Layout fits 900x690 without clipping.",
+  "next_actions": []
+}

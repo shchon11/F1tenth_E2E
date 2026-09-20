@@ -1,0 +1,90 @@
+{
+  "purpose": "Offline initialization only; not steering or full-footprint feasibility proof. Requested clearance never relaxed. EDT is point sampling, not footprint clearance.",
+  "helper": "f1sim/f1sim/planning_seed.py:obstacle_aware_seed",
+  "rows": [
+    {
+      "scene": "scene_0915_2042",
+      "clearance_requested_m": 0.555,
+      "original_count": 697,
+      "status": "rejected",
+      "reason": "scene:scene_0915_2042: blocked corridor; no ordered obstacle detour at 0.555 m clearance",
+      "elapsed_s": 0.18192607798846439
+    },
+    {
+      "scene": "scene_0915_2042",
+      "clearance_requested_m": 0.405,
+      "original_count": 697,
+      "status": "rejected",
+      "reason": "scene:scene_0915_2042: blocked corridor; no ordered obstacle detour at 0.405 m clearance",
+      "elapsed_s": 0.11570033000316471
+    },
+    {
+      "scene": "scene_0915_2042",
+      "clearance_requested_m": 0.305,
+      "original_count": 697,
+      "status": "routed",
+      "output_count": 1572,
+      "minimum_sampled_edt_m": 0.380788654088974,
+      "elapsed_s": 0.03703461104305461
+    },
+    {
+      "scene": "scene_0915_2042",
+      "clearance_requested_m": 0.255,
+      "original_count": 697,
+      "status": "routed",
+      "output_count": 1576,
+      "minimum_sampled_edt_m": 0.3354102075099945,
+      "elapsed_s": 0.034763137984555215
+    },
+    {
+      "scene": "scene_0915_2042",
+      "clearance_requested_m": 0.205,
+      "original_count": 697,
+      "status": "routed",
+      "output_count": 1576,
+      "minimum_sampled_edt_m": 0.29154759645462036,
+      "elapsed_s": 0.03517366899177432
+    },
+    {
+      "scene": "scene_0915_2026",
+      "clearance_requested_m": 0.555,
+      "original_count": 1031,
+      "status": "rejected",
+      "reason": "scene:scene_0915_2026: blocked corridor; no ordered obstacle detour at 0.555 m clearance",
+      "elapsed_s": 0.17732412699842826
+    },
+    {
+      "scene": "scene_0915_2026",
+      "clearance_requested_m": 0.405,
+      "original_count": 1031,
+      "status": "rejected",
+      "reason": "scene:scene_0915_2026: blocked corridor; no ordered obstacle detour at 0.405 m clearance",
+      "elapsed_s": 0.09668884496204555
+    },
+    {
+      "scene": "scene_0915_2026",
+      "clearance_requested_m": 0.305,
+      "original_count": 1031,
+      "status": "rejected",
+      "reason": "scene:scene_0915_2026: blocked corridor; no ordered obstacle detour at 0.305 m clearance",
+      "elapsed_s": 0.0945450669969432
+    },
+    {
+      "scene": "scene_0915_2026",
+      "clearance_requested_m": 0.255,
+      "original_count": 1031,
+      "status": "rejected",
+      "reason": "scene:scene_0915_2026: blocked corridor; no ordered obstacle detour at 0.255 m clearance",
+      "elapsed_s": 0.09581203601555899
+    },
+    {
+      "scene": "scene_0915_2026",
+      "clearance_requested_m": 0.205,
+      "original_count": 1031,
+      "status": "routed",
+      "output_count": 2149,
+      "minimum_sampled_edt_m": 0.2828427255153656,
+      "elapsed_s": 0.05139870900893584
+    }
+  ]
+}

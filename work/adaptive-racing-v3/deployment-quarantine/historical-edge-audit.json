@@ -1,0 +1,59 @@
+{
+  "profile": "historical-global-v1",
+  "numeric_math_changed": false,
+  "cases": {
+    "rest_stop": {
+      "command": [
+        [
+          0.0,
+          0.03597826510667801
+        ]
+      ],
+      "first_solver_accel": [
+        0.20728860795497894
+      ],
+      "reference_end_x": [
+        0.18000000715255737
+      ],
+      "local_input_hook_installed": false,
+      "local_fault_diagnostics_available": false
+    },
+    "crawl_stop": {
+      "command": [
+        [
+          0.0,
+          0.09394102543592453
+        ]
+      ],
+      "first_solver_accel": [
+        -0.023052357137203217
+      ],
+      "reference_end_x": [
+        0.18000000715255737
+      ],
+      "local_input_hook_installed": false,
+      "local_fault_diagnostics_available": false
+    },
+    "nonfinite_speed": {
+      "error": "RuntimeError",
+      "message": "index -9223372036854775808 is out of bounds for dimension 1 with size 25"
+    },
+    "nonfinite_wheel": {
+      "command": [
+        [
+          0.0,
+          1.2991231679916382
+        ]
+      ],
+      "first_solver_accel": [
+        -4.01753568649292
+      ],
+      "reference_end_x": [
+        0.4274999499320984
+      ],
+      "local_input_hook_installed": false,
+      "local_fault_diagnostics_available": false
+    }
+  },
+  "scope": "Exact rest-stop, launch, finite fault-stop guarantees remain local-v2 only. Historical auto retains its pre-existing 0.3 m/s reference-walk floor and lacks the local sensor-input fault boundary. Wheel feedback is not consumed by its historical command conversion."
+}
