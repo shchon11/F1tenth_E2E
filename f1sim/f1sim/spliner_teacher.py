@@ -199,10 +199,23 @@ class SplinerTeacher(FrenetOpponentPlanner):
             return None, mode, one
         gap, d_opp, idx_opp, tid_b, ego_d = seen
 
+        # A crate on the line is an obstacle too, and upstream's detector says so: it reports
+        # obstacles, not cars. Whichever is nearer ahead is the thing to plan around, and a prop is
+        # a car that will not move -- so it enters with zero speed and the prediction below leaves
+        # it where it is.
+        b_gap, b_d = self._blockage_ahead(state, tid_b, torch.full_like(gap, self.lookahead))
+        take_prop = b_gap < gap.clamp_min(0.0)
+        gap = torch.where(take_prop, b_gap, gap)
+        d_opp = torch.where(take_prop, b_d, d_opp)
+        idx_opp = torch.where(take_prop,
+                              (self.base.project(state[:, :2], tid_b)[0]
+                               + (b_gap.nan_to_num(posinf=0.0) / self.base.ds[tid_b]).round().long()
+                               ) % self.base.N, idx_opp)
+
         # Constant-time prediction: where the opponent will be by the time we are there. Advancing
         # the apex along the arc is upstream's whole prediction, and it is what aims the spline at
         # the gap the car is moving into rather than at the one it is leaving.
-        v_opp = self._opponent_speed(state)
+        v_opp = torch.where(take_prop, torch.zeros_like(gap), self._opponent_speed(state))
         s_apex = gap + self.fixed_pred_time * v_opp
 
         # In the way at all: near the line we are driving, and inside the spline's own arc. The
@@ -247,6 +260,11 @@ class SplinerTeacher(FrenetOpponentPlanner):
         return d_out, mode, scale
 
     # ------------------------------------------------------------------ pieces
+    def reset_rows(self, rows: torch.Tensor) -> None:
+        """A new race on this row is not the pass this one was committed to."""
+        if self._side is not None:
+            self._side[rows] = 0.0
+
     def _shape_at(self, r: torch.Tensor) -> torch.Tensor:
         """The spline's shape at arc position `r` relative to the apex, zero outside its span."""
         i = torch.bucketize(r.to(self.knots.dtype), self.knots[1:-1]).clamp(0, self.shape.shape[0] - 1)

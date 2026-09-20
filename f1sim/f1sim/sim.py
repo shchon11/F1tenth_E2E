@@ -119,6 +119,9 @@ class Simulator:
             if self.cfg.sim.compile_mode == "reduce-overhead":
                 self._post = self._guarded(torch.compile(self._post_roll, dynamic=False, mode="reduce-overhead"), "_post", self._post_roll)
 
+        #: [m] of clear road a spawning car is guaranteed ahead of it; 0 is off and is every run
+        #: before `_spawn_runway_blocked` existed. `F1VecEnv` sets it from `EnvConfig.spawn_runway`.
+        self.spawn_runway = 0.0
         self.state = torch.zeros(num_envs, dyn.STATE_DIM, device=self.device)
         self.ax = torch.zeros(num_envs, device=self.device)
         self.ay = torch.zeros(num_envs, device=self.device)
@@ -324,7 +327,8 @@ class Simulator:
         pose = torch.cat([xy, yaw[:, None]], 1)
         # reject poses too close to walls by pulling them back to the centerline
         bad = self.track.sample_edt(xy, tid) < (self.cfg.vehicle.width if min_clearance is None else min_clearance)
-        if getattr(self.track, "has_props", False):
+        bad = bad | self._spawn_runway_blocked(s, tid, eid, lat)
+        if getattr(self.track, "has_props", False) or self.spawn_runway > 0.0:
             # Props are not in the EDT, so the wall test above cannot see them and a car would spawn
             # standing inside a crate. Reject on the same geometry the contact test uses; if the
             # centerline fallback is itself blocked, nudge along the lane until it is not.
@@ -332,7 +336,9 @@ class Simulator:
             if bad.any():
                 xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
                 pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
-                still = bad & self._spawn_in_prop(pose, tid, eid)   # the centerline point may be blocked too
+                # the centerline point may be blocked too, and so may the road ahead of it
+                still = bad & (self._spawn_in_prop(pose, tid, eid)
+                               | self._spawn_runway_blocked(s, tid, eid, None))
                 # Walk a full lap in even stations rather than a few short nudges. Stopping early
                 # and returning the pose anyway would spawn the car inside a crate and call it a
                 # spawn; if a whole lap has nowhere to stand, that is a broken map and it says so.
@@ -349,8 +355,9 @@ class Simulator:
                     tid_j = tid[idx].repeat_interleave(J)
                     xy_a, yaw_a = self.track.pose_at_s(s_alt.reshape(-1), tid_j)
                     p_alt = torch.cat([xy_a, yaw_a[:, None]], 1)
-                    ok = (~self._spawn_in_prop(p_alt, tid_j,
-                                               None if eid is None else eid[idx].repeat_interleave(J))
+                    eid_j = None if eid is None else eid[idx].repeat_interleave(J)
+                    ok = (~(self._spawn_in_prop(p_alt, tid_j, eid_j)
+                            | self._spawn_runway_blocked(s_alt.reshape(-1), tid_j, eid_j, None))
                           ).reshape(-1, J)
                     first = ok.to(torch.uint8).argmax(1)
                     any_ok = ok.any(1)
@@ -366,6 +373,49 @@ class Simulator:
             xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
             pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
         return pose
+
+    def _spawn_runway_blocked(self, s: torch.Tensor, tid: torch.Tensor, eid, lat) -> torch.Tensor:
+        """(n,) whether a car spawning at arc `s` has something in front it could not avoid.
+
+        A car is placed at up to `spawn_speed_max` and its first control step is one step away. A
+        crate two metres ahead of that is not an obstacle the policy failed to avoid, it is one it
+        was never shown in time -- and it lands in the collision rate all the same, which makes the
+        metric read worse the more interesting the layout is. The user's words (2026-09-21):
+        *"지표가 과장되지 않도록 스폰 직후 피할 수 없는 지점에 장애물이나 벽이 나타나지 않도록"*.
+
+        So the road ahead is sampled along the lane -- the props the distance field cannot see, and
+        the walls it can -- and a blocked runway is rejected exactly like a blocked pose, which puts
+        it through the same walk that already finds somewhere clear to stand.
+
+        `spawn_runway` is the length in metres and 0 is off, which is every run before this existed.
+        It is what the car would need to stop from `spawn_speed_max` plus its own length; the env
+        sets it, and refuses to put obstacles on the racing line without one.
+        """
+        n = s.shape[0]
+        if self.spawn_runway <= 0.0:
+            return torch.zeros(n, dtype=torch.bool, device=self.device)
+        # Sample no more than half a body width apart. Coarser and the check steps over a crate:
+        # measured at 0.5 m spacing it let 1 car in 640 through, which is exactly the kind of
+        # residual that reads later as "the policy occasionally fails at the start".
+        K = max(6, int(math.ceil(self.spawn_runway / (0.5 * self.cfg.vehicle.width))))
+        step = self.spawn_runway / K
+        ds = torch.arange(1, K + 1, device=self.device, dtype=s.dtype) * step
+        L = self.track.length[tid].clamp_min(1e-6)
+        s_ahead = (s[:, None] + ds[None]) % L[:, None]                       # (n, K)
+        tid_k = tid[:, None].expand(n, K).reshape(-1)
+        xy, yaw = self.track.pose_at_s(s_ahead.reshape(-1), tid_k)
+        if lat is not None:
+            # follow the line the car is actually on, not the centerline it is offset from
+            nrm = torch.stack([-torch.sin(yaw), torch.cos(yaw)], 1)
+            xy = xy + nrm * lat[:, None].expand(n, K).reshape(-1, 1)
+        need = 0.5 * self.cfg.vehicle.width
+        blocked = self.track.sample_edt(xy, tid_k) < need
+        props = getattr(self.track, "env_props", None)
+        if props is not None:
+            eid_k = (torch.arange(n, device=self.device) if eid is None else eid)
+            eid_k = eid_k[:, None].expand(n, K).reshape(-1)
+            blocked = blocked | (props.clearance(xy, eid_k) < need)
+        return blocked.view(n, K).any(1)
 
     def _spawn_in_prop(self, pose: torch.Tensor, tid: torch.Tensor,
                        eid: Optional[torch.Tensor] = None) -> torch.Tensor:

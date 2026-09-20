@@ -618,6 +618,18 @@ class InteractiveTeacher:
             depth = depth.reshape(K, B, H)
             penetration = torch.maximum(penetration, depth)
             hit = hit | (depth > 0.0)
+            ep = getattr(self.track, "env_props", None)
+            if ep is not None:
+                # `free` is the margin term's input and it comes from the distance field, which has
+                # never heard of a prop -- so a candidate threading a crate scored as if the lane
+                # beside it were empty. The SAT above already refuses to *touch* one; this is what
+                # makes the teacher keep its `wall_margin` from one as well, which is the
+                # difference between squeezing past and going round.
+                r = float(torch.linalg.vector_norm(self._corners(
+                    torch.zeros(1, 1, 1, 2, device=world.device, dtype=world.dtype),
+                    torch.zeros(1, 1, 1, device=world.device, dtype=world.dtype)), dim=-1).max())
+                pc = ep.clearance(world.reshape(-1, 2), eid).view(K, B, H) - r
+                free = torch.minimum(free, pc.to(free.dtype))
         wall = penetration.mean(2) / max(self.half_width, 1e-6)
         clear = ((1.0 - free / max(self.wall_margin, 1e-6)).clamp_min(0.0) ** 2).mean(2)
         self._last_wall_hits = hit

@@ -53,6 +53,7 @@ class FrenetOpponentPlanner:
         self.device = base.device
         self.env = None
         self.track = None
+        self.props = None
         self.half_width = 0.155
         self.v_max = 8.0
         #: Which opponent column `_opponents` last picked per row. `_opponent_speed` reads it, and
@@ -71,6 +72,12 @@ class FrenetOpponentPlanner:
         self.track = env.sim.track
         self.half_width = 0.5 * float(env.cfg.vehicle.width)
         self.v_max = float(env.ecfg.v_max_policy)
+        #: The procedural obstacle layouts, if this env draws any. They are props, not grid, so the
+        #: distance field knows nothing about them -- which is exactly why the layouts have had to
+        #: be laid outside the racing line for every driver so far. A planner that asks
+        #: `ProceduralObstacles.clearance` does not need that, and `EnvConfig` can then let a crate
+        #: stand on the line (`procedural_raceline_corridor`).
+        self.props = getattr(env, "procedural", None)
         return self
 
     #: `label_grip` and `speed_scale` live on the reference teacher, so that every caller which
@@ -137,6 +144,16 @@ class FrenetOpponentPlanner:
     def decide(self, state: torch.Tensor, tid: Optional[torch.Tensor] = None):
         raise NotImplementedError(f"{type(self).__name__} must choose a lateral offset")
 
+    def reset_rows(self, rows: torch.Tensor) -> None:
+        """Forget whatever this planner was in the middle of, for the rows that just reset.
+
+        A planner carries state across steps on purpose -- which side a pass is committed to, which
+        lane is held -- and a reset puts a different race on that row. Without this the new race
+        inherits the old one's commitment, which is a car that will not change sides for a reason
+        that no longer exists. Subclasses with such state override it; the default has none.
+        """
+        return None
+
     @staticmethod
     def _merge_offset(caller, chosen):
         """The offset to hand the reference teacher: the caller's, this planner's, or neither.
@@ -177,18 +194,37 @@ class FrenetOpponentPlanner:
         """
         return (1.0 + state[:, 3].to(state.dtype) / max(self.v_max, 1e-6)).clamp(1.0, 1.5)
 
-    def _clearance_at(self, idx: torch.Tensor, tid: torch.Tensor, d) -> torch.Tensor:
+    def _clearance_at(self, idx: torch.Tensor, tid: torch.Tensor, d, props_only: bool = False) -> torch.Tensor:
         """Free space at the reference point `idx` displaced `d` metres to its left [m].
 
         The simulator's own distance field, at the point the displaced line actually passes
         through. Better information than a lane half-width, which cannot tell the wide side of a
         corridor from the narrow one: this is the clearance on the side the car really goes.
+
+        And, when the env draws procedural obstacles, the nearest of those too. They are props and
+        not grid, so the distance field alone reports a clear lane through a crate; a planner that
+        believed it would drive into one. Taking the smaller of the two is what makes these
+        baselines able to race a layout that stands on the racing line, which is the only way the
+        policy ever meets an obstacle there.
         """
         base = self.base
         p = base.xy[tid, idx]                                          # (..., 2) reference point
         n = self._normal(tid, idx)
         d = torch.as_tensor(d, device=p.device, dtype=p.dtype)
-        return self.track.sample_edt(p + d[..., None] * n, tid)
+        q = p + d[..., None] * n
+        edt = self.track.sample_edt(q, tid)
+        if self.props is None:
+            return torch.full_like(edt, float("inf")) if props_only else edt
+        # Row b of the batch drives in layout b: one layout per env row, as `redraw` writes them.
+        rows = torch.arange(q.shape[0], device=q.device)
+        rows = rows.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
+        prop = self.props.clearance(q.reshape(-1, 2), rows.reshape(-1)).view(edt.shape).to(edt.dtype)
+        # `props_only` asks the other question: is there something in the road that the reference
+        # line does not already account for. The walls do not qualify -- the line is inside them by
+        # construction, so a probe far enough off it always reports one, and a scan that counted
+        # them would report a blockage everywhere and send the planner round a corner it was
+        # already taking. Measured before this split: 100 % of steps "blocked".
+        return prop if props_only else torch.minimum(edt, prop)
 
     def _normal(self, tid: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """Left-of-travel unit normal of the reference line, the direction `offset` counts in."""
@@ -244,6 +280,60 @@ class FrenetOpponentPlanner:
         ego_d = self._lateral(state[:, :2], tid_b)[0]
         self._nearest = j
         return g, d_o[ar, j], idx_opp, tid_b, ego_d
+
+    #: Lateral probes across the lane when looking for a prop blocking the line, and how far apart
+    #: the stations ahead are sampled [m]. Half a body width in both directions, so a crate cannot
+    #: sit between two probes and be missed.
+    BLOCK_PROBES = (-0.9, -0.6, -0.3, 0.0, 0.3, 0.6, 0.9)
+    BLOCK_STEP = 0.25
+
+    def _blockage_ahead(self, state: torch.Tensor, tid: torch.Tensor, reach: torch.Tensor,
+                        margin: float = 0.10):
+        """(arc, lateral) of the nearest procedural prop standing in the road, per row.
+
+        `inf` where the road is clear, which makes it lose every comparison against a real car and
+        costs the callers no branch.
+
+        Why a planner needs this at all: `_clearance_at` made these baselines able to *choose a
+        side* around a prop, and that is not the same as noticing one. With no car nearby the
+        spliner drives the reference line, and with a crate standing on it -- which is exactly what
+        `procedural_raceline_corridor = "off"` arranges -- it drives into it. Measured: the
+        opponents' termination rate went from 4.9 to 27.3 per km the moment the layouts were
+        allowed onto the line.
+
+        Upstream is on this side of the argument too. The ForzaETH detector reports *obstacles*,
+        not cars; a planner that evades only the things with wheels is the narrower reading. So the
+        blockage is returned in the same (arc, lateral) shape a car is, and the callers pick
+        whichever is nearer and plan around it with the machinery they already have.
+        """
+        if self.props is None:
+            far = torch.full((state.shape[0],), float("inf"), device=state.device,
+                             dtype=state.dtype)
+            return far, torch.zeros_like(far)
+        base = self.base
+        B = state.shape[0]
+        dev, dt = state.device, state.dtype
+        idx = base.project(state[:, :2], tid)[0]
+        K = max(2, int(float(reach.max().item()) / self.BLOCK_STEP))
+        ds = base.ds[tid]                                              # [m] per reference index
+        step = torch.arange(1, K + 1, device=dev, dtype=dt) * self.BLOCK_STEP     # (K,)
+        j = (idx[:, None] + (step[None] / ds[:, None]).round().long()) % base.N   # (B, K)
+        probes = torch.tensor(self.BLOCK_PROBES, device=dev, dtype=dt)            # (L,)
+        L = probes.numel()
+        tid_k = tid[:, None, None].expand(B, K, L)
+        room = self._clearance_at(j[:, :, None].expand(B, K, L), tid_k,
+                                  probes[None, None].expand(B, K, L), props_only=True)
+        blocked = room < (self.half_width + margin)                    # (B, K, L)
+        any_k = blocked.any(2)                                          # (B, K)
+        # the first station in order that is blocked, and `inf` for a row with none
+        first = any_k.to(torch.uint8).argmax(1)
+        arc = step[first]
+        arc = torch.where(any_k.any(1) & (step[first][None] <= reach[None]).squeeze(0),
+                          arc, torch.full_like(arc, float("inf")))
+        # where in the lane it is: the tightest probe at that station is where the crate stands
+        ar = torch.arange(B, device=dev)
+        lat = probes[room[ar, first].argmin(1)]
+        return arc, torch.where(torch.isfinite(arc), lat, torch.zeros_like(lat))
 
     def _opponent_speed(self, state: torch.Tensor) -> torch.Tensor:
         """Speed of the car `_opponents` picked, per row."""

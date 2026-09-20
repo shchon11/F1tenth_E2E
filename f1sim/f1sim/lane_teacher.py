@@ -185,6 +185,18 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
             self.last_state, self.last_offset = mode, zero
             return None, mode, one
         gap, d_opp, idx_opp, tid_b, ego_d = seen
+
+        # A prop standing in the road blocks a lane exactly the way a car does, and it is the case
+        # this planner would otherwise drive straight into: with nobody to pass it holds the racing
+        # line, and `procedural_raceline_corridor = "off"` puts crates on it.
+        b_gap, b_d = self._blockage_ahead(state, tid_b, torch.full_like(gap, self.lookahead))
+        take_prop = b_gap < gap.clamp_min(0.0)
+        gap = torch.where(take_prop, b_gap, gap)
+        d_opp = torch.where(take_prop, b_d, d_opp)
+        idx_opp = torch.where(take_prop,
+                              (self.base.project(state[:, :2], tid_b)[0]
+                               + (b_gap.nan_to_num(posinf=0.0) / self.base.ds[tid_b]).round().long()
+                               ) % self.base.N, idx_opp)
         L = self.lanes.numel()
         lanes = self.lanes.to(dt)                                       # (L,)
 
@@ -240,3 +252,10 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
                            torch.full_like(mode, CHANGING), mode)
         self.last_state, self.last_offset = mode, self._offset
         return self._offset, mode, one
+
+    def reset_rows(self, rows: torch.Tensor) -> None:
+        """A new race starts on the racing line, not in the lane the last one ended in."""
+        if self._lane is None:
+            return
+        self._lane[rows] = int((self.lanes == 0).nonzero()[0, 0])
+        self._offset[rows] = 0.0

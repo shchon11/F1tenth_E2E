@@ -91,6 +91,15 @@ class DriverKind:
     #: silent substitution the whole `available` machinery exists to prevent, arriving by the back
     #: door the moment the branch merges.
     teacher_factory: str = ""
+    #: Whether this driver can see `f1sim.procedural_obstacles` props. They are props and not grid,
+    #: so everything that reads the occupancy distance field is blind to them -- which is why the
+    #: layouts have always been laid outside the racing line. A kind that asks
+    #: `ProceduralObstacles.clearance` and steers round a crate does not need that, and is what
+    #: `EnvConfig.procedural_raceline_corridor = "off"` requires of every teacher-driven car.
+    #:
+    #: False for `raceline`, and not as an oversight: pure pursuit on a fixed line has no lateral
+    #: freedom to use even if it could see one.
+    prop_aware: bool = False
 
     @property
     def available(self) -> bool:
@@ -118,6 +127,9 @@ KINDS: Tuple[DriverKind, ...] = (
                "(`f1sim.interactive_teacher`). 추월을 시범 보일 수 있는 쪽입니다.",
                teacher=True, module="f1sim.interactive_teacher",
                teacher_factory="f1sim.interactive_teacher:InteractiveTeacher",
+               # It scores its candidates against the props with the same polygon SAT the contact
+               # test uses, so it refuses to drive through one and keeps `wall_margin` from it.
+               prop_aware=True,
                pending="`f1sim/interactive_teacher.py` 가 이 트리에 없습니다 "
                        "(2026-09-16 병합 이후로는 있어야 정상입니다)."),
     DriverKind("forzaeth", "ForzaETH spliner",
@@ -126,6 +138,7 @@ KINDS: Tuple[DriverKind, ...] = (
                "우리 정책의 추월을 견줄 외부 기준선입니다.",
                teacher=True, module="f1sim.spliner_teacher",
                teacher_factory="f1sim.spliner_teacher:SplinerTeacher",
+               prop_aware=True,
                pending="`f1sim/spliner_teacher.py` 가 이 트리에 없습니다."),
     DriverKind("forzaeth_pred", "ForzaETH predictive spliner",
                "같은 planner 를 상대차의 0.5 초 뒤 예측 위치에 겨눕니다. 원 논문은 상대 속도를 "
@@ -133,6 +146,7 @@ KINDS: Tuple[DriverKind, ...] = (
                "오차가 없는 낙관적인 상한으로 읽어야 합니다.",
                teacher=True, module="f1sim.spliner_teacher",
                teacher_factory="f1sim.spliner_teacher:PredictiveSplinerTeacher",
+               prop_aware=True,
                pending="`f1sim/spliner_teacher.py` 가 이 트리에 없습니다."),
     DriverKind("lane_switch", "lane-switch (고정 레인)",
                "레이싱 라인에서 일정 간격으로 떨어진 고정 레인들 중 비어 있는 가장 싼 레인을 골라 "
@@ -142,6 +156,7 @@ KINDS: Tuple[DriverKind, ...] = (
                "두었습니다. spline 계열과 달리 이산 선택 + hysteresis 라 비교 축이 다릅니다.",
                teacher=True, module="f1sim.lane_teacher",
                teacher_factory="f1sim.lane_teacher:LaneSwitchTeacher",
+               prop_aware=True,
                pending="`f1sim/lane_teacher.py` 가 이 트리에 없습니다."),
     DriverKind("policy", "정책 체크포인트",
                "저장된 정책이 스스로 주행합니다. 자기 라인을 잡고 자기 실수를 합니다.",
@@ -220,6 +235,17 @@ class OpponentSlot:
     slot 2 moves slot 1's numbers. With it slot 1 replays whatever else changes.
     """
     kind: str = "raceline"
+    #: Several driver kinds for this one car, redrawn at every race reset. Empty is the ordinary
+    #: case: `kind` for the life of the run.
+    #:
+    #: This exists because "the other car moves" is not one behaviour. A policy trained against a
+    #: raceline opponent meets a car that holds a line and nothing else, and the 2026-09-21
+    #: baselines measured what that costs: at an identical pace advantage it contacts a car that
+    #: moves sideways five to ten times as often. Listing the kinds here is how one run sees all of
+    #: them. Every entry must be a teacher kind -- a checkpoint car needs its own plumbing, so
+    #: mixing one in would be a second thing this field means -- and `kind` must be among them.
+    #: A name written twice is drawn twice as often; that is the whole weighting vocabulary.
+    kind_mix: Tuple[str, ...] = ()
     checkpoint: Optional[str] = None
     controller: str = "legacy"
     speed_scale: Tuple[float, float] = (1.0, 1.0)
@@ -246,8 +272,26 @@ class OpponentSlot:
         if unknown:
             raise ValueError(f"opponent slot: unknown field(s) {unknown}; known fields are "
                              f"{sorted(known)}")
-        kind = str(d.get("kind", "raceline"))
+        mix = d.get("kind_mix") or ()
+        if isinstance(mix, str):
+            mix = [mix]
+        mix = tuple(str(x) for x in mix)
+        kind = str(d["kind"]) if d.get("kind") else (mix[0] if mix else "raceline")
         kind_of(kind)                                        # raises on a name that is not a kind
+        if mix:
+            for name in mix:
+                k = kind_of(name)
+                if not (k.teacher and k.teacher_factory) and name != "raceline":
+                    raise ValueError(
+                        f"opponent slot: kind_mix {list(mix)} contains {name!r}, which is not a "
+                        f"teacher kind. A mix redraws which *driver* moves the car; a checkpoint "
+                        f"or a self-play car needs different plumbing and cannot be one of the "
+                        f"draws. Teacher kinds: "
+                        f"{[k2.name for k2 in KINDS if k2.teacher]}")
+            if kind not in mix:
+                raise ValueError(f"opponent slot: kind {kind!r} is not in kind_mix {list(mix)}; "
+                                 f"the named kind has to be one of the ones drawn, or leave it out "
+                                 f"and the first of the mix is used")
         events = opp_ev.parse_events(d.get("events", ()))
         reactive = dict(d.get("reactive") or {})
         # A reactive name written in `events` is accepted and moved where it belongs, because that
@@ -279,7 +323,7 @@ class OpponentSlot:
             raise ValueError(f"opponent slot: event_rate {rate}: events per 10 s, >= 0")
         seed = d.get("seed", None)
         return OpponentSlot(
-            kind=kind,
+            kind=kind, kind_mix=mix,
             checkpoint=(str(d["checkpoint"]) if d.get("checkpoint") else None),
             controller=str(d.get("controller", "legacy")),
             speed_scale=_speed_pair(d.get("speed_scale", 1.0)),
@@ -296,6 +340,8 @@ class OpponentSlot:
         """
         base = OpponentSlot()
         out: Dict = {"kind": self.kind}
+        if self.kind_mix:
+            out["kind_mix"] = list(self.kind_mix)
         lo, hi = self.speed_scale
         if self.checkpoint:
             out["checkpoint"] = self.checkpoint

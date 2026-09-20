@@ -784,6 +784,42 @@ class ProceduralObstacles:
         g = lambda a: torch.gather(a, 1, idx.reshape(idx.shape + (1,) * (a.dim() - 2)).expand(-1, -1, *a.shape[2:]))
         return g(poses), g(n), g(d), g(zlo), g(zhi)
 
+    def clearance(self, xy: torch.Tensor, eid: Optional[torch.Tensor] = None,
+                  k: int = CONTACT_SLOTS) -> torch.Tensor:
+        """(n,) metres from each point of `xy` (n, 2) to the nearest live prop, `inf` if none.
+
+        Why this exists: everything that reads the occupancy grid is blind to these props -- they
+        were never rasterised into it -- and the drivers of the other cars are among them. That is
+        the whole reason a layout has to be laid outside the racing line (`set_raceline`): a car
+        following a line through a crate it cannot see is not a lesson about anything. A driver
+        that can ask this question does not need the line kept clear, which is what lets a layout
+        stand *on* the racing line and the policy meet one there.
+
+        The measure is `max_j (n_j . x - d_j)` over a prism's own faces: negative inside, and
+        outside it is the distance to the nearest face *plane*. For a convex prism that is the true
+        distance whenever the nearest feature is an edge and an under-estimate near a corner, which
+        is the safe direction for a clearance -- it never reports more room than there is.
+
+        Culled to the `k` nearest slots like `near`, and for the same reason. A caller asking about
+        room for a manoeuvre cares about what is close; a prop further away than the eighth nearest
+        is not what stops the car.
+        """
+        from .prop_math import _slot_is_live, _to_world
+        n_pts = xy.shape[0]
+        if eid is None:
+            eid = torch.arange(n_pts, device=xy.device) % self.p_poses.shape[0]
+        poses, pn, pd, zlo, zhi = self.near(xy, eid, k)
+        C, K = pn.shape[1], pn.shape[2]
+        flat = lambda a: a.reshape(n_pts * C, *a.shape[2:])
+        nw, dw = _to_world(flat(pn), flat(pd), flat(poses))
+        valid = flat(pn).pow(2).sum(-1) > 0.5
+        live = _slot_is_live(flat(pn), flat(zlo), flat(zhi))
+        # max over the prism's own faces of the signed plane distance; padded faces cannot win
+        sd = (nw * xy.repeat_interleave(C, 0)[:, None, :]).sum(-1) - dw
+        sd = torch.where(valid, sd, torch.full_like(sd, -float("inf"))).max(1).values
+        sd = torch.where(live, sd, torch.full_like(sd, float("inf")))
+        return sd.view(n_pts, C).min(1).values
+
     def stats(self) -> Dict[str, float]:
         draws, pieces, dropped, missed = (float(x) for x in self._stat.tolist())
         return {"draws": draws, "pieces_per_layout": pieces / max(draws, 1.0),

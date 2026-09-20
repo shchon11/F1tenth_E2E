@@ -646,6 +646,20 @@ def main():
     ap.add_argument("--procedural-raceline-margin", type=float, default=0.25, metavar="M",
                     help="[m] kept clear either side of the raceline, beyond the car's half-width, "
                          "so the teacher opponents are never routed through a prop")
+    ap.add_argument("--procedural-raceline-corridor", choices=["on", "off"], default="on",
+                    help="whether that corridor is enforced at all. 'off' lets a layout stand ON "
+                         "the racing line, which is the only way the policy ever meets an obstacle "
+                         "there -- and it does not today. Requires --spawn-runway and every "
+                         "teacher-driven car to be a prop-aware kind (--opp-slots), because a "
+                         "raceline-driven opponent cannot see a prop and its crashes would become "
+                         "the collision rate")
+    ap.add_argument("--spawn-runway", type=float, default=0.0, metavar="M",
+                    help="[m] of clear road every spawning car is guaranteed ahead of it, prop or "
+                         "wall. 0 = off. A car is placed at up to the spawn speed and cannot stop "
+                         "inside v^2/2a plus its own length, so a crate nearer than that is a "
+                         "collision it was never given the chance to avoid -- and it lands in the "
+                         "collision rate, making the metric read worse the more interesting the "
+                         "layout is. About 3 m for the default spawn speed")
     ap.add_argument("--raceline-margin", type=float, default=None,
                     help="[m] free space the opponents' raceline keeps from the boundary (default 0.40)")
     ap.add_argument("--teacher-grip", choices=["true", "nominal", "conservative"], default="true",
@@ -708,10 +722,12 @@ def main():
         if not a.procedural_density > 0:
             raise SystemExit(f"--procedural-density {a.procedural_density}: at zero no pattern is "
                              f"ever placed and the run is silently the unflagged one.")
-    elif a.procedural_density != 1.0 or a.procedural_max_props or a.procedural_raceline_margin != 0.25:
+    elif (a.procedural_density != 1.0 or a.procedural_max_props
+          or a.procedural_raceline_margin != 0.25 or a.procedural_raceline_corridor != "on"):
         raise SystemExit("--procedural-density / --procedural-max-props / "
-                         "--procedural-raceline-margin without --procedural-obstacles: nothing "
-                         "draws a layout, so these would silently do nothing.")
+                         "--procedural-raceline-margin / --procedural-raceline-corridor without "
+                         "--procedural-obstacles: nothing draws a layout, so these would silently "
+                         "do nothing.")
     if a.opp_token != "off":
         if a.race_size < 2:
             raise SystemExit(f"--opp-token {a.opp_token} needs --race-size > 1: with one car per "
@@ -800,6 +816,8 @@ def main():
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
                                                               procedural_raceline_margin=a.procedural_raceline_margin,
+                                                              procedural_raceline_corridor=a.procedural_raceline_corridor,
+                                                              spawn_runway=a.spawn_runway,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,

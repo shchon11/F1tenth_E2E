@@ -307,6 +307,14 @@ class EnvConfig:
     spawn_lateral_std: float = 0.3
     spawn_yaw_std: float = 0.2
     spawn_min_clearance: float = 0.5  # [m] spawn poses closer to a wall are pulled back to the centerline
+    # [m] of clear road every spawning car is guaranteed ahead of it -- no prop, no wall inside it.
+    # 0 is off, which is every run before this existed. A car is placed at up to `spawn_speed_max`
+    # and cannot stop in less than v^2/2a plus its own length, so a crate inside that distance is a
+    # collision the policy was never given the chance to avoid; it lands in the collision rate all
+    # the same and makes the metric read worse the more interesting the layout is.
+    # `procedural_raceline_corridor = "off"` requires a positive value, because that is the setting
+    # that puts something worth avoiding directly in front of a spawn.
+    spawn_runway: float = 0.0
     spawn_speed_max: float = 3.0     # random initial speed in [0, this]
     resample_track_on_reset: bool = True   # multi-track sets: pick a random track for each new episode
     scan_stride: int = 1             # frames between stacked scans (3 x stride 3 = 225 ms of history: velocity cues)
@@ -478,6 +486,16 @@ class EnvConfig:
     procedural_raceline_margin: float = 0.25   # [m] kept clear either side of the raceline, beyond the
                                       # car's half-width, wherever a pattern reaches -- so the line the
                                       # teacher opponents drive is never the thing that is blocked
+    # Whether that corridor is enforced at all. "on" is every run before this field existed, and
+    # what a raceline-driven opponent needs: it is pure pursuit on a line built from the grid, and
+    # the props are not in the grid, so a crate on the line is a crash it cannot see coming.
+    #
+    # "off" lets a layout stand anywhere, including across the racing line -- which is the only way
+    # the policy ever meets an obstacle there, and it does not today. The env refuses "off" unless
+    # every teacher-driven car is a kind that can see props (`opponent_slots.DriverKind.prop_aware`),
+    # because the alternative is a baseline whose collisions are the layout's fault and a result
+    # nobody can read.
+    procedural_raceline_corridor: str = "on"
 
 
 def _interp_path(xy: torch.Tensor, grid: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -634,7 +652,9 @@ class F1VecEnv:
         # Obstacle layouts redrawn per env at every reset. Built here so the prop tensors exist
         # before anything compiles against them; the raceline corridor arrives later, with the
         # teacher (`set_teacher`), because that is when the line the opponents drive is known.
+        self.sim.spawn_runway = float(e.spawn_runway)
         self.procedural = None
+        self._check_prop_aware_drivers()
         if e.procedural_obstacles > 0:
             from .procedural_obstacles import ProceduralObstacles
             self.procedural = ProceduralObstacles(
@@ -857,17 +877,122 @@ class F1VecEnv:
              if sl.seed is not None else None) for sl in self.slots]
         # Teacher kinds that are not the raceline teacher, and the rows each one drives. `set_teacher`
         # builds the objects; the masks are fixed here because a slot's kind never changes.
+        # Every kind any slot can be driven by, not only the one it starts as: a `kind_mix` slot
+        # changes driver at every race reset, and the objects are built once for all of them.
         alt, masks = [], {}
-        for i, sl in enumerate(self.slots, start=1):
-            kind = sl.driver
-            if not (kind.teacher and kind.teacher_factory):
-                continue
-            if kind.name not in masks:
-                alt.append(kind.name)
-                masks[kind.name] = torch.zeros(self.B, dtype=torch.bool, device=dev)
-            masks[kind.name] |= self.slot == i
+        from .opponent_slots import kind_of as _kind_of
+        self._slot_kinds = [tuple(sl.kind_mix) or (sl.kind,) for sl in self.slots]
+        self._slot_mixed = any(len(k) > 1 for k in self._slot_kinds)
+        for i, names in enumerate(self._slot_kinds, start=1):
+            for name in names:
+                kind = _kind_of(name)
+                if not (kind.teacher and kind.teacher_factory):
+                    continue
+                if kind.name not in masks:
+                    alt.append(kind.name)
+                    masks[kind.name] = torch.zeros(self.B, dtype=torch.bool, device=dev)
+                if len(names) == 1:
+                    masks[kind.name] |= self.slot == i
         self.alt_teacher_kinds = tuple(alt)
         self.alt_teacher_mask = masks
+        #: Which of `alt_teacher_kinds` drives each row right now, or -1 for "the raceline teacher".
+        #: Only mixed slots move; a fixed slot's mask above is already final and this stays -1 for
+        #: it, which is why an unmixed table costs nothing and draws nothing.
+        self.slot_kind_code = torch.full((self.B,), -1, dtype=torch.long, device=dev)
+        #: Rows whose driver `_apply_slot_kinds` owns. A fixed slot's mask bit was set once above
+        #: and must survive every redraw, so the rewrite is scoped to exactly these rows.
+        self._slot_mixed_rows = torch.zeros(self.B, dtype=torch.bool, device=dev)
+        for i, names in enumerate(self._slot_kinds, start=1):
+            if len(names) > 1:
+                self._slot_mixed_rows |= self.slot == i
+        self._slot_kind_ids = [
+            torch.tensor([alt.index(n) if n in alt else -1 for n in names],
+                         dtype=torch.long, device=dev) if len(names) > 1 else None
+            for names in self._slot_kinds]
+        if self._slot_mixed:
+            self._apply_slot_kinds()
+
+    def _check_prop_aware_drivers(self) -> None:
+        """Refuse a layout on the racing line when somebody driving cannot see one.
+
+        `procedural_raceline_corridor = "off"` is what lets an obstacle stand *on* the line, and it
+        is the only way the policy ever meets one there. The price is that every car driven by a
+        teacher now has to steer round a prop by itself, and most cannot: the raceline teacher is
+        pure pursuit on a line built from the occupancy grid, and the props were never rasterised
+        into it. Left unchecked, the layout would simply end the opponents' races, and a collision
+        rate measured against that is the layout's number rather than the policy's.
+
+        So it is refused here, before anything is drawn, with the fix in the message.
+        """
+        e = self.ecfg
+        if e.procedural_raceline_corridor not in ("on", "off"):
+            raise ValueError(f"procedural_raceline_corridor must be 'on' or 'off', not "
+                             f"{e.procedural_raceline_corridor!r}")
+        if e.procedural_raceline_corridor == "on" or e.procedural_obstacles <= 0:
+            return
+        if e.spawn_runway <= 0.0:
+            raise ValueError(
+                "procedural_raceline_corridor='off' puts obstacles on the racing line, which is "
+                "also where cars spawn -- so without spawn_runway every reset can begin a metre "
+                "from a crate at up to spawn_speed_max, and the collision rate that comes out is "
+                "the layout's rather than the policy's. Set spawn_runway to what the car needs to "
+                f"stop from {e.spawn_speed_max:g} m/s plus its own length (about 3 m), or leave "
+                "the corridor on.")
+        if self.M < 2:
+            return
+        from .opponent_slots import KIND_BY_NAME
+        if self.slots is None:
+            if e.opponent in ("teacher", "mixed"):
+                raise ValueError(
+                    "procedural_raceline_corridor='off' puts obstacles on the racing line, and "
+                    f"opponent={e.opponent!r} drives the other cars with the raceline teacher, "
+                    "which cannot see a prop (they are not in the occupancy grid) and has no "
+                    "lateral freedom to use if it could. Name prop-aware drivers with --opp-slots "
+                    f"({', '.join(k.name for k in KIND_BY_NAME.values() if k.prop_aware)}), or "
+                    "leave the corridor on.")
+            return
+        # Every kind a slot can be *drawn as*, not only the one it starts as: a `kind_mix` that
+        # lists `raceline` puts a prop-blind driver on the line at some reset, and the run would
+        # look fine until it did.
+        blind = sorted({name for sl in self.slots for name in (sl.kind_mix or (sl.kind,))
+                        if KIND_BY_NAME[name].teacher and not KIND_BY_NAME[name].prop_aware})
+        if blind:
+            raise ValueError(
+                f"procedural_raceline_corridor='off' puts obstacles on the racing line, and slot "
+                f"kind(s) {blind} cannot see a prop -- their races would end on the layout and "
+                f"every collision number measured against them would be the layout's. Prop-aware "
+                f"kinds: {', '.join(k.name for k in KIND_BY_NAME.values() if k.prop_aware)}.")
+
+    def _redraw_slot_kinds(self, full: torch.Tensor, gen: torch.Generator) -> None:
+        """Redraw which driver moves each `kind_mix` car, once per race that fully reset.
+
+        Per race and not per step, for the reason every other slot draw is: a car that crashes and
+        rejoins is in the same race it started, and a driver that changed mid-race would be a
+        different opponent behind the same car. Uniform over the names listed; a name written twice
+        is drawn twice as often, which is the whole weighting vocabulary and is enough.
+        """
+        if not self._slot_mixed:
+            return
+        G = full.shape[0]
+        code = self.slot_kind_code.view(G, self.M)
+        for i, ids in enumerate(self._slot_kind_ids, start=1):
+            if ids is None:
+                continue
+            pick = ids[torch.randint(ids.numel(), (G,), device=self.device, generator=gen)]
+            code[:, i] = torch.where(full, pick, code[:, i])
+        self._apply_slot_kinds()
+
+    def _apply_slot_kinds(self) -> None:
+        """Rebuild the alt-teacher masks from `slot_kind_code`, in place.
+
+        In place because `_opponent_actions` holds these tensors, and because a fixed slot's bit was
+        set once at construction and must survive: only the rows of mixed slots are rewritten here.
+        """
+        for j, name in enumerate(self.alt_teacher_kinds):
+            mine = self.slot_kind_code == j
+            m = self.alt_teacher_mask[name]
+            m &= ~self._slot_mixed_rows            # clear only what this function owns
+            m |= mine
 
     def _slot_spawn_codes(self, is_full_race: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
         """(G, M) spawn code per car of every race, re-drawing the `random` slots of a full reset.
@@ -913,6 +1038,7 @@ class F1VecEnv:
         e = self.ecfg
         G, M = full.shape[0], self.M
         codes = self._slot_spawn_codes(full, gen)                        # (G, M)
+        self._redraw_slot_kinds(full, gen)
         rank = self._slot_ranks(codes)
         gap_rank = e.spawn_gap[0] + (e.spawn_gap[1] - e.spawn_gap[0]) * torch.rand(
             G, M, device=self.device, generator=gen)
@@ -1025,13 +1151,17 @@ class F1VecEnv:
             from .opponent_slots import build_teacher, kind_of
             self.alt_teachers = [build_teacher(kind_of(name), teacher, self)
                                  for name in self.alt_teacher_kinds]
-        if self.procedural is not None:
+        if self.procedural is not None and self.ecfg.procedural_raceline_corridor != "off":
             # The teacher is pure pursuit on a raceline built from the occupancy grid, and the
             # procedural props are not in the grid: it cannot see them and will not steer round
             # them. So the layouts are laid *outside* the band the raceline occupies, which is the
             # contract's first option ("place patterns only where the raceline is not"). The other
             # option -- teaching `clamp_offset` about props -- bounds an offset away from the line
             # and does nothing about a crate standing on it.
+            #
+            # `procedural_raceline_corridor = "off"` skips this, and then a layout may stand on the
+            # line. `_check_prop_aware_drivers` has already refused that unless every teacher-driven
+            # car is a kind that asks `ProceduralObstacles.clearance` and steers round one.
             self.procedural.set_raceline(teacher)
         if self.events is not None and self.events.enabled:
             # How far off the line each raceline point can be driven without putting a car in the
@@ -1365,6 +1495,12 @@ class F1VecEnv:
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         if self.events is not None:
             self.events.reset(ids)                                  # a respawned car starts with no event
+        for alt in self.alt_teachers:
+            # A planner keeps state across steps on purpose -- which side a pass is committed to,
+            # which lane is held. A respawned car is in a different race and must not inherit it.
+            reset_rows = getattr(alt, "reset_rows", None)
+            if reset_rows is not None:
+                reset_rows(ids)
         if self.pool is not None:
             # A pool checkpoint may carry memory: a hidden state kept across a respawn is a policy
             # remembering a track its car is no longer on.
@@ -1514,6 +1650,12 @@ class F1VecEnv:
         the answer is read back once and kept -- per step it would be a host sync.
         """
         if self.slots is None or not self.alt_teacher_kinds:
+            return True
+        if self._slot_mixed:
+            # A mix can draw `raceline` for any of its cars at any reset, and the answer is cached
+            # on tensor identity -- which does not change, because the masks are rewritten in place.
+            # Rather than invalidate a cache from four places, say yes: the cost is one teacher call
+            # on the resets where no car happened to draw it.
             return True
         key = (id(self.teacher_driven), tuple(id(self.alt_teacher_mask[k]) for k in self.alt_teacher_kinds))
         cached = getattr(self, "_raceline_needed_cache", None)
