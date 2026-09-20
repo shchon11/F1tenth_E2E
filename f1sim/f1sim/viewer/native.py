@@ -55,6 +55,22 @@ def _fix_prime_env():
               "(they blank GLX windows here; set F1SIM_KEEP_PRIME_ENV=1 to keep them)")
 
 
+def unpack_frame(pack):
+    """Name the columns of the per-car pack `_pull_gather` builds.
+
+    The pack is `[state (STATE_DIM), attitude (roll, pitch), lap, collision, s, wall_dist, car_rear (4),
+    car_length]`. The state's width comes from `dynamics.STATE_DIM`, not from a literal: when the wheel
+    model appended `omega_r` (7 -> 8 columns) a literal index list read the wheel speed as roll and
+    shifted every field after it by one -- the HUD printed "body roll +2033 deg", the drawn body tilt
+    followed the wheel speed, and "nearest wall" showed the arclength (deck worker, 2026-09-15)."""
+    from ..dynamics import STATE_DIM
+    b = int(STATE_DIM)
+    return {"x": pack[:, 0], "y": pack[:, 1], "yaw": pack[:, 2], "vx": pack[:, 3], "steer": pack[:, 6],
+            "roll": pack[:, b], "pitch": pack[:, b + 1], "lap": pack[:, b + 2], "coll": pack[:, b + 3],
+            "s": pack[:, b + 4], "wall": pack[:, b + 5], "rear": pack[:, b + 6:b + 10], "len": pack[:, b + 10]}
+
+
+
 class NativeViewer:
     def __init__(self, sim, raceline=None, width: int = 1600, height: int = 900, title: str = "f1sim",
                  headless: bool = False, max_cars: int = 64, duct_diameter: Optional[float] = None,
@@ -195,10 +211,9 @@ class NativeViewer:
         scan = flat[n * pshape[1]:n * pshape[1] + 2 * nb].reshape(2, nb); pv = flat[n * pshape[1] + 2 * nb:]
         env_ids = sel.cpu().numpy() if self.env_ids is None or len(self.env_ids) != n else self.env_ids
         f = int((env_ids == fe).nonzero()[0][0]) if fe in env_ids else 0
-        fr = {"t": t, "n": n, "x": pack[:, 0], "y": pack[:, 1], "yaw": pack[:, 2], "vx": pack[:, 3], "steer": pack[:, 6],
-              "roll": pack[:, 7], "pitch": pack[:, 8], "lap": pack[:, 9], "coll": pack[:, 10], "s": pack[:, 11], "wall": pack[:, 12],
-              "rear": pack[:, 13:17], "len": pack[:, 17], "scan": scan[0], "scan_type": scan[1].astype(np.int32),
-              "focus": f, "focus_env": fe, "ids": env_ids, "P": {k: float(pv[i]) for i, k in enumerate(Pk)}}
+        fr = unpack_frame(pack)
+        fr.update({"t": t, "n": n, "scan": scan[0], "scan_type": scan[1].astype(np.int32),
+                   "focus": f, "focus_env": fe, "ids": env_ids, "P": {k: float(pv[i]) for i, k in enumerate(Pk)}})
         # cars sharing the watched car's race, as opposed to unrelated parallel runs: only these are
         # something it can actually hit
         if self.sim.other_idx is not None:

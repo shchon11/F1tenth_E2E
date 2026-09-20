@@ -156,7 +156,7 @@ blocks with a dilated final stage for whole-scan context, an explicit beam-angle
 explicit windowed-minimum channel, and a raw per-sector nearest-return bypass that carries absolute
 scale past the normalisation) turns the stacked scan into 256 features. A one-layer MLP turns the
 proprio vector into 128. The two are concatenated and passed through a two-layer 256-wide MLP; a
-`tanh` output head emits the 8-number plan. Two auxiliary heads hang off the same trunk — the car's
+`tanh` output head emits the 8-number plan. Auxiliary heads hang off the same trunk — the car's
 friction from the trunk *and* the proprio embedding, and the nearest opponent's offset and closing
 speed from the trunk — and are trained only when `--aux-grip` / `--aux-opp` are on.
 
@@ -169,12 +169,39 @@ sharing the actor's, for the same reason it already carries its own stem: it rea
 state, and sharing the recurrence would be the one place a value gradient reached the actor's
 trunk. The six-frame stack stays the input; memory extends the window past the 150 ms it covers.
 
+**A second, small state (optional, `--motion-memory`).** The recurrence can be *split*: a separate
+GRU of at most 64 units, fed not by the trunk embedding but by a small convolutional encoder of the
+**aligned residual rows** alone (`learn/aligned.py` — the current scan minus the previous one warped
+into the current frame with the car's measured speed, yaw rate and roll/pitch). Its output enters the
+same first-layer preactivation through its own zero-initialised projection, and its state rides
+inside the same hidden tensor as the main one, `[h_main | h_dyn]`, so no inference path learns about
+a second state. Train-time auxiliaries — a per-beam "is this beam on another car" mask on the
+encoder's features, the nearest opponent's current relative velocity from `h_dyn`, and the existing
+future head — attach to that branch and **only** to it, so that the main representation cannot absorb
+them through the ego-dynamics shortcut. The heads are never called by the forward and are therefore
+absent from the exported graph; deployment uses only what `h_dyn` projects into the plan head.
+
 The hidden state is never held inside the module. It is passed in and returned by
 `act()` / `evaluate()` / `Actor.step()`, and every caller resets it at episode boundaries — a
 hidden state carried across a reset is a policy remembering a track it is no longer on. The
 feedforward entry points (`Actor.forward`, `.dist`, `.forward_all`) refuse a recurrent actor rather
 than running it from zeros, because a recurrent policy restarted every step looks exactly like a
 working one.
+
+**Future head (optional, `--aux-future`).** A third auxiliary head, and the only one that does not
+read the action trunk: its input is the actor's **recurrent state** after the step (the GRU's hidden
+state; the trunk features when `--memory off`), and its output is the nearest opponent's relative
+position and velocity, a presence logit, and the ego's own speed and yaw rate, **20 control steps
+(0.5 s) ahead**. The labels are privileged and come from the simulator; nothing the policy sees is
+built from them, and the head is not exported.
+
+It reads the recurrent state on purpose. The other two heads ask for things the present observation
+largely determines, so a hidden state can stay a smoothed copy of that observation and pay nothing.
+This one asks for what the present observation cannot contain, and it asks the *state* — which is
+also the tensor `learn/probe_hidden.py` regresses the same targets out of, so the loss that trains
+it and the measurement that scores it are about one tensor rather than two. Its output layer starts
+at exactly zero (weight and bias), so a warm start is bit-identical and the head still trains from
+the first update; with `--aux-future 0` the module is not built at all.
 
 **Optional scan channels.** `--scan-channels memory,edges` appends one row per channel to the scan's
 channel axis, after every column the original had, computed from the scan alone
@@ -184,9 +211,43 @@ every consumer of that spec are unchanged by them.
 
 **Size and cost.** The frozen original `ppo_race_0910` is 1.17 M actor parameters (2.25 M with its
 critic). A 128-wide GRU on both halves adds 460 k — 1.20× the parameters — and costs about a tenth
-of the actor's forward time. The deployment rule, the measurement protocol and the table are in
-[training.md](training.md#the-deployment-budget) and
-[the research note](research/memory-policy-2026-09-13.md).
+of the actor's forward time. The future head adds another 17 k parameters to a training job and
+nothing at all to the exported graph. The deployment rule, the measurement protocol and the table
+are in [training.md](training.md#the-deployment-budget) and
+[the research note](research/memory-policy-2026-09-13.md); what the future head is for, and the
+probe that measures it, are in [training.md](training.md#predicting-the-near-future---aux-future)
+and [its own note](research/future-head-2026-09-14.md).
+
+### Deployment: where the network stops and the graph starts
+
+Everything above is the actor. On the car it is one node, and the boundary around it is the ROS 2
+topic graph:
+
+```
+/scan /odom /sensors/imu/raw  ──►  policy_node  ──/f1sim/plan──►  controller_node  ──►  /drive
+                                   ObsBuilder                     PlanTracker
+                                   + actor                        + arm + traction guard
+```
+
+The split is not cosmetic. It makes three things true that were not:
+
+* **the arms are not a property of the network's process.** `fixed_low`, `+clearance` and the
+  traction guard live in `controller_node`, so the plan on the wire is arm-agnostic and one
+  recorded plan stream can be replayed through any of them. A published baseline that emits
+  steering and speed directly skips the whole thing, which is what makes the comparison a
+  comparison of systems.
+* **the tracker is reachable without a checkpoint.** `controller_node` reads eight floats off a
+  topic; anything that can produce them can drive the car through the same runtime.
+* **the observation is a message, not an internal.** `learn/obs.py` owns every arithmetic step from
+  sensor value to observation element, `gym_env` calls those same functions, and
+  `F1VecEnv.message_inputs` states a simulator step as the fields the topics carry so the two can
+  be compared by execution rather than by reading. `tests/test_obs_identity.py` does exactly that.
+
+The split is bit-exact against the monolithic node it replaced: 1920 commands over four arms, the
+traction guard on and off, a simulator bag and a real car bag, worst difference 0.000e+00 on
+steering and speed (`tests/test_graph_parity.py`). What the graph can and cannot carry — and why
+batched PPO is not one of the things it can — is [ros2.md](ros2.md); the numbers and the failure
+modes are in [the research note](research/ros-graph-2026-09-15.md).
 
 ## Raceline and teacher
 
@@ -230,7 +291,9 @@ Curvature rather than `y(x)`: a hairpin is just a large curvature, whereas a pol
 bend back on itself.
 
 The teacher becomes a planner too (`RacelineTeacher.plan_action`), so imitation learns plans and PPO
-refines them, and the same tracker code runs on the vehicle.
+refines them, and the same tracker code runs on the vehicle — literally the same code, in
+`controller_node`, checked command for command against the in-process path the benchmark scores
+(`tests/test_graph_parity.py`).
 
 An experimental, opt-in extension adjusts the tracker's speed and acceleration limits from an
 estimate of the current friction; see [Training](training.md#experimental-friction-aware-control).

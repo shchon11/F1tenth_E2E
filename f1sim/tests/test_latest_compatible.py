@@ -170,3 +170,77 @@ def test_a_named_run_under_runs_dir_resolves(runs, monkeypatch):
     monkeypatch.setattr(W, "load_checkpoint", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reached load")))
     with pytest.raises(RuntimeError, match="reached load"):
         W.main(["--run", "named", "--device", "cpu"])
+
+
+def test_latest_auto_skips_unqualified_local_checkpoint_but_manual_load_remains_available(runs, tmp_path):
+    from test_runtime_contract import make_record
+    from f1sim.learn.grip_runtime import LOCAL_AUTO_PROFILE
+    from f1sim.learn.model import load_checkpoint
+    _, record, _ = make_record(tmp_path, LOCAL_AUTO_PROFILE)
+    write_run(runs, 'approved_baseline', mtime=1000)
+    candidate = write_run(runs, 'failed_local_research', mtime=2000,
+                          extra={'experiment': {'controller': record}})
+    selected, skipped = W.latest_compatible_run(allowed_controller='auto')
+    assert os.path.basename(selected) == 'approved_baseline'
+    assert skipped == [('failed_local_research', 'local-v2 research controller has no approved qualification')]
+    path = os.path.join(candidate, 'ppo_latest.pt')
+    assert W.default_consumer_refusal(path, allowed_controller='auto') is None
+    load_checkpoint(path, 'cpu', allow_controller=True)
+
+
+@pytest.mark.parametrize('approved', [False, 1, 'true', None])
+def test_latest_local_requires_exact_controller_qualification_approval(runs, tmp_path, approved):
+    from test_runtime_contract import make_record
+    from f1sim.learn.grip_runtime import LOCAL_AUTO_PROFILE, estimator_content_digest
+    _, record, _ = make_record(tmp_path, LOCAL_AUTO_PROFILE)
+    record['qualification'] = {'approved': approved}
+    # Observer approval alone never promotes the controller/model pair.
+    record['estimator']['meta']['deployment_approved'] = True
+    record['estimator_content_sha256'] = estimator_content_digest(record)
+    write_run(runs, 'research', mtime=2000, extra={'experiment': {'controller': record}})
+    selected, skipped = W.latest_compatible_run(allowed_controller='auto')
+    assert selected == ''
+    assert 'qualification' in skipped[0][1]
+
+
+def test_latest_may_choose_explicitly_qualified_local_pair(runs, tmp_path):
+    from test_runtime_contract import make_record
+    from f1sim.learn.grip_runtime import LOCAL_AUTO_PROFILE
+    _, record, _ = make_record(tmp_path, LOCAL_AUTO_PROFILE)
+    record['qualification'] = {'approved': True, 'evidence': 'test-only qualification fixture'}
+    write_run(runs, 'older_baseline', mtime=1000)
+    candidate = write_run(runs, 'qualified', mtime=2000, extra={'experiment': {'controller': record}})
+    selected, skipped = W.latest_compatible_run(allowed_controller='auto')
+    assert selected == candidate
+    assert skipped == []
+
+
+def test_latest_historical_auto_does_not_require_local_research_qualification(runs, tmp_path):
+    from test_runtime_contract import make_record
+    _, record, _ = make_record(tmp_path)
+    candidate = write_run(runs, 'historical_auto', mtime=2000, extra={'experiment': {'controller': record}})
+    assert W.latest_compatible_run(allowed_controller='auto') == (candidate, [])
+
+
+def test_latest_session_does_not_hot_reload_an_unqualified_local_replacement(runs, tmp_path):
+    from test_runtime_contract import make_record
+    from test_automatic_grip import Env
+    from f1sim.learn.grip_runtime import ControllerRuntime, LOCAL_AUTO_PROFILE
+    from f1sim.viewer.sim_worker import SimWorker
+    _, record, _ = make_record(tmp_path, LOCAL_AUTO_PROFILE)
+    candidate = write_run(runs, 'replacement', mtime=2000, extra={'experiment': {'controller': record}})
+    rt = ControllerRuntime(Env(), 'auto', checkpoint_meta=record).install()
+    worker = SimWorker.__new__(SimWorker)
+    worker.gen = 1
+    logs = []
+    worker.say = lambda kind, **kw: logs.append(kw.get('text', ''))
+    original_model = object()
+    session = {'last_reload': 0., 'ckpt_path': os.path.join(candidate, 'ppo_latest.pt'),
+               'mtime': 1000., 'device': torch.device('cpu'), 'controller': rt,
+               'autoselect': {'requested': 'latest'}, 'model': original_model}
+    try:
+        worker._reload_if_changed(session)
+        assert session['model'] is original_model
+        assert any('qualification' in message for message in logs)
+    finally:
+        rt.release()

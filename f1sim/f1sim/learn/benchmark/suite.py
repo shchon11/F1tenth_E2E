@@ -423,15 +423,29 @@ def of(version: str) -> Suite:
 #: and the observation layout. Truncating these or omitting the sensor models would let a changed
 #: LiDAR or dynamics pass as the same protocol.
 RUNTIME_MODULES = ("sim.py", "gym_env.py", "mpc.py", "params.py", "track.py", "dynamics.py",
-                   "lidar.py", "imu.py", "odom.py", "teacher.py",
+                   "lidar.py", "imu.py", "odom.py", "teacher.py", "raceline.py",
+                   "minimum_time.py", "planning_seed.py", "asset_obstacles.py", "props.py",
+                   "prop_math.py", "maps.py", "tracks.py", "hard_obstacles.py",
+                   "opponent_events.py", "opponent_event_contract.py", "opponent_slots.py", "interactive_teacher.py",
                    "learn/model.py", "learn/obs.py", "learn/common.py", "learn/evaluate.py",
                    "learn/graph_runtime.py", "learn/grip_runtime.py", "learn/grip_control.py",
-                   "learn/grip_estimator.py", "learn/evaluation_metrics.py",
+                   "learn/grip_estimator.py", "learn/adaptive_grip.py", "learn/policy_adaptation.py",
+                   "learn/evaluation_metrics.py",
                    # The `tcs` arm sits in the command path and its thresholds decide what the car
                    # is allowed to do; a changed guard changes a measurement as surely as a changed
                    # tyre model. `actuators.py` joins for the same reason -- it is the one line that
                    # decides whether the VESC loop closes on the wheel or on the body.
-                   "learn/traction_arm.py", "actuators.py")
+                   "learn/traction_arm.py", "actuators.py",
+                   # The published baselines' evaluation path. These files decide what an `external`
+                   # roster entry actually does with a scan -- which beams it reads, what fills the
+                   # bearings this car cannot see, how the output becomes a command -- so a change
+                   # to one of them changes a measurement exactly as a changed tyre model does.
+                   # `learn/baselines/distill.py` and `__main__.py` are deliberately NOT here: they
+                   # train a model and never run inside a scored cell, and listing a file whose
+                   # edits cannot move a number would invalidate every existing result for nothing.
+                   "learn/baselines/__init__.py", "learn/baselines/common.py",
+                   "learn/baselines/backends.py", "learn/baselines/tinylidarnet.py",
+                   "learn/baselines/tinylidarnet_torch.py", "learn/baselines/end2race.py")
 
 
 def source_digest() -> dict:

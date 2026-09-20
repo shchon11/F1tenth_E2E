@@ -256,6 +256,42 @@ def assert_single_obs_spec(rows, *, cell_id: str) -> str:
     return next(iter(groups))
 
 
+#: What has to agree between rows even when their actors read differently shaped observations.
+#: Not `actor_input` and not `calibration`: a direct-action baseline is handed a different tensor by
+#: construction, and it has no plan tracker, so `tracker_cal` / `tracker_delay` are absent from its
+#: command path. Everything about the WORLD the cars were put into is in this list.
+PHYSICAL_PAIR_FIELDS = ("physical_sha256", "sim_t", "sim_imu_phase", "n_envs_total", "race_size")
+
+
+def assert_physically_paired(rows, *, cell_id: str) -> dict:
+    """Every row of a cell started in the same physical world, whatever its actor expects.
+
+    This is the part of pairing that survives an observation-layout split. A published baseline that
+    emits (steer, speed) has `act_dim` 2 and no previous-plan channel, so its ObsSpec can never hash
+    equal to a plan policy's and `assert_paired` will (correctly) refuse to pool them -- but the two
+    are still put on the same track, at the same friction, from the same seeded reset, and if that
+    is *not* true the table is comparing scenarios rather than systems. So it is checked, by name,
+    rather than being lost along with the layout check.
+    """
+    fps = [(r.get("system_id"), (r.get("result") or {}).get("start_fingerprint") or
+            r.get("start_fingerprint")) for r in rows]
+    missing = [sid for sid, fp in fps if not fp]
+    if missing:
+        raise ValueError(f"{cell_id}: no start fingerprint for {sorted(missing)}; a physical "
+                         f"pairing cannot be shown, so these rows are not comparable")
+    for sid, fp in fps:
+        validate_fingerprint(fp, where=f"{cell_id}/{sid}")
+    base_id, base = fps[0]
+    for sid, fp in fps[1:]:
+        differs = [k for k in PHYSICAL_PAIR_FIELDS if base.get(k) != fp.get(k)]
+        if differs:
+            raise ValueError(f"{cell_id}: {sid} did not start in the same world as {base_id} -- "
+                             f"{', '.join(differs)} differ. A comparison between different initial "
+                             f"conditions is not a comparison between systems.")
+    return {"cell_id": cell_id, "n_rows": len(fps), "physically_paired": True,
+            "physical_sha256": base["physical_sha256"]}
+
+
 def assert_paired(rows, *, cell_id: str) -> dict:
     """Every row for one cell must have started identically. Raises naming what differed.
 

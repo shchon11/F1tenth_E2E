@@ -31,9 +31,9 @@ import collections
 import glob
 import math
 import os
-import subprocess
 import sys
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -41,6 +41,10 @@ from PIL import Image, ImageDraw
 
 from ..gym_env import EnvConfig
 from ..params import Config
+# Recording lives in `viewer.recorder` so the console and this CLI cannot end up with two encoders
+# that produce different files from the same frames. Torch-free, and imported by name here because
+# `viewer/__init__` is not.
+from ..viewer import recorder as _recorder
 from . import common
 from .model import load_checkpoint
 from .obs import flatten_obs
@@ -80,7 +84,7 @@ class Introspector:
             self._rt.reset()                       # a different car's memory is not this one's
             self._focus = i
         s = scan[i:i + 1].clone().requires_grad_(True); p = pro[i:i + 1]
-        s_in = self._rt.observe(s)
+        s_in = self._rt.observe(s, p)
         h_in = self._rt.hidden.actor if self._rt.hidden is not None else None
         mu, h = self.model.actor.step(s_in, p, None, h_in)
         g = torch.autograd.grad(mu.abs().sum(), s)[0][0]              # (k, N)
@@ -480,7 +484,8 @@ def latest_run() -> str:
     return best
 
 
-def default_consumer_refusal(path: str) -> Optional[str]:
+def default_consumer_refusal(path: str, *, allowed_controller: Optional[str] = None,
+                            automatic_selection: bool = False) -> Optional[str]:
     """Why `load_checkpoint(path, ...)` with no opt-in flag would refuse, or None if the **metadata**
     is supported.
 
@@ -489,7 +494,8 @@ def default_consumer_refusal(path: str) -> Optional[str]:
 
       * a checkpoint-shaped file at all -- a mapping carrying `meta` and `state_dict`;
       * `residual_plan` (`model.py:372-374`);
-      * `_refuse_controller` (`model.py:324-341`) -- a non-`legacy` recorded controller arm;
+      * `_refuse_controller` -- a non-`legacy` recorded controller arm;
+      * `_refuse_oracle` -- privileged opponent tokens (`f1sim.opp_token`) in the observation;
       * the conditional gate (`model.py:384`) -- `cond_dim > 0` or a lab-oracle source, including the
         `CondSpec.from_meta` parse and its dim-consistency check;
       * an `act_dim` this viewer cannot drive (`2` or the current plan width).
@@ -498,6 +504,10 @@ def default_consumer_refusal(path: str) -> Optional[str]:
     strictness are the loader's business and it still decides; nothing here relaxes any guard, and a
     caller that ignores this and loads directly gets exactly the same refusal. This exists so that
     "open the newest run" can mean "the newest run this viewer can open".
+
+    ``automatic_selection`` additionally quarantines local-v2 research controllers
+    without an explicit controller-level qualification. Named/manual research loads
+    retain the ordinary contract and estimator checks.
 
     `mmap=True, weights_only=True` keeps it cheap and safe: tensor storages are never faulted in, so
     probing every run reads metadata rather than hundreds of megabytes, and nothing in the file is
@@ -539,7 +549,17 @@ def default_consumer_refusal(path: str) -> Optional[str]:
         exp = ((ck.get("extra") or {}).get("experiment") or {})
         arm = str(((exp.get("controller") or {}).get("arm")) or "legacy")
         if arm != "legacy":
-            return f"controller arm {arm!r}"
+            if arm != allowed_controller:
+                return f"controller arm {arm!r}"
+            from .grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
+            record = validate_runtime_checkpoint(ck, arm)
+            if automatic_selection:
+                refusal = automatic_selection_refusal(record)
+                if refusal is not None:
+                    return refusal
+        token = str(meta.get("opp_token") or ((ck.get("extra") or {}).get("spec") or {}).get("opp_token") or "off")
+        if token != "off":
+            return f"privileged opponent tokens (opp_token={token!r}; an oracle, not a policy)"
         from .conditioning import CondSpec
         cond_meta = CondSpec.from_meta(meta.get("cond")).to_meta()   # raises on an inconsistent spec
         cond_dim = meta.get("cond_dim", 0)
@@ -563,7 +583,7 @@ def default_consumer_refusal(path: str) -> Optional[str]:
     return None
 
 
-def latest_compatible_run() -> tuple:
+def latest_compatible_run(*, allowed_controller: Optional[str] = None) -> tuple:
     """(newest run dir the default consumer can open, [(run, why skipped), ...] newest first).
 
     **Ordering note.** `latest_run()` ranks runs by the newest of `ppo_latest.pt` and
@@ -588,7 +608,7 @@ def latest_compatible_run() -> tuple:
             cands.append((os.path.getmtime(files[0]), d, files[0]))
     skipped = []
     for _, d, p in sorted(cands, key=lambda c: c[0], reverse=True):
-        why = default_consumer_refusal(p)
+        why = default_consumer_refusal(p, allowed_controller=allowed_controller, automatic_selection=True)
         if why is None:
             return d, skipped
         skipped.append((os.path.basename(d), why))
@@ -714,7 +734,7 @@ class MemoryActorRunner:
         # checkpoint still holds per-row state, and a listener with no width declared would be sent
         # every env's boundary mask, including ones of the wrong shape.
         self.batch = int(scan.shape[0])
-        scan = self.rt.observe(scan)
+        scan = self.rt.observe(scan, proprio)
         if self.h is None and self.actor.has_memory:
             self.h = self.actor.initial_hidden(scan.shape[0], device=scan.device, dtype=scan.dtype)
         try:
@@ -826,6 +846,9 @@ def main(argv=None):
                          "which is what the graphs remove, and not contention at all")
     ap.add_argument("--stochastic", action="store_true", help="sample actions like during training")
     ap.add_argument("--record", default="", help="headless: write an mp4 (ffmpeg)"); ap.add_argument("--frames", default="", help="headless: write PNG frames here")
+    ap.add_argument("--video-encoder", default="auto", choices=list(_recorder.ENCODERS),
+                    help="mp4 encoder: auto prefers the GPU's h264_nvenc where it actually works "
+                         "and falls back to libx264 (which is what every clip so far was made with)")
     ap.add_argument("--seconds", type=float, default=20.0, help="recording length"); ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--episodes", type=int, default=0, help="highlight mode: run this many episodes, replay the best agent of each")
@@ -1000,15 +1023,13 @@ def main(argv=None):
                 if a.highlights:
                     i = int(rec.ranking[rank]); tag = f"ep{ep:03d}_rank{rank + 1}_agent{i:03d}_{rec.progress[i]:.0f}m"
                     out = os.path.join(a.highlights, tag + ".mp4")
-                    proc = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{v.width}x{v.height}",
-                                             "-r", str(a.fps), "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", out], stdin=subprocess.PIPE)
+                    proc = _recorder.FfmpegEncoder(out, v.width, v.height, a.fps, encoder=a.video_encoder)
                 def sink(vv, proc=proc):
                     if proc is None: return
-                    if vv.scene.fbo_ms is not None: vv.scene.ctx.copy_framebuffer(vv.scene.fbo, vv.scene.fbo_ms)
-                    proc.stdin.write(Image.frombytes("RGB", (vv.width, vv.height), vv.scene.fbo.read(components=3)).transpose(Image.FLIP_TOP_BOTTOM).tobytes())
+                    proc.write(_recorder.scene_rgb(vv.scene, vv.width, vv.height))
                 replay_best(v, rec, model, intro, ep, sink if proc else (lambda vv: None), a.speed_cap, a.fps, rank, realtime=not headless)
                 if proc is not None:
-                    proc.stdin.close(); proc.wait(); print("wrote", out, flush=True)
+                    proc.close(); print("wrote", out, flush=True)
             if not headless and not v.alive: break
         if not headless: v.close()
         return
@@ -1185,8 +1206,7 @@ def main(argv=None):
     n_frames = int(a.seconds * a.fps); sim_per_frame = max(1, round(1.0 / env.sim.control_dt / a.fps))
     proc = None
     if a.record:
-        proc = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{v.width}x{v.height}",
-                                 "-r", str(a.fps), "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", a.record], stdin=subprocess.PIPE)
+        proc = _recorder.FfmpegEncoder(a.record, v.width, v.height, a.fps, encoder=a.video_encoder)
     if a.frames:
         os.makedirs(a.frames, exist_ok=True)
     for i in range(n_frames):
@@ -1196,13 +1216,12 @@ def main(argv=None):
         v.render()
         if proc is not None or a.frames:
             from PIL import Image as _I
-            if v.scene.fbo_ms is not None: v.scene.ctx.copy_framebuffer(v.scene.fbo, v.scene.fbo_ms)
-            data = v.scene.fbo.read(components=3)
-            img = _I.frombytes("RGB", (v.width, v.height), data).transpose(_I.FLIP_TOP_BOTTOM)
-            if proc is not None: proc.stdin.write(img.tobytes())
-            if a.frames and i % a.fps == 0: img.save(os.path.join(a.frames, f"f{i:05d}.png"))
+            rgb = _recorder.scene_rgb(v.scene, v.width, v.height)
+            if proc is not None: proc.write(rgb)
+            if a.frames and i % a.fps == 0:
+                _I.frombytes("RGB", (v.width, v.height), rgb).save(os.path.join(a.frames, f"f{i:05d}.png"))
     if proc is not None:
-        proc.stdin.close(); proc.wait(); print("wrote", a.record)
+        proc.close(); print("wrote", a.record, f"({proc.encoder})")
 
 
 if __name__ == "__main__":

@@ -86,6 +86,191 @@ read from the argv the process was started with and the log it already writes.
 
 See [Tracks](tracks.md) for the ids, the grammar and the splits.
 
+## 기본 vs 없음 in the 장애물 selector (2026-09-15)
+
+The 맵 card's 장애물 combo had one entry for "nothing added": `없음`. That is true of a measured
+floor or a generated layout, which carry no obstacles of their own. It is false of an editor scene,
+which carries whatever its author placed — so picking 없음 on a custom map produced a map full of
+boxes. The user said so:
+
+> 맵 고르고 장애물 정도 여부 선택할 때 없음을 선택하면 기본 맵이 되는데, 내가 커스텀해서 장애물을
+> 놨으면 그 맵 자체가 기본으로 나와서 장애물 없음이라는 말과 안맞아.
+
+One word was doing two jobs, so it is two entries now.
+
+| entry | id | what it builds | label on a scene with 3 placed obstacles |
+| --- | --- | --- | --- |
+| 기본 | *(none)* | the map as authored | `기본 (배치된 장애물 3개)` |
+| 없음 | `#bare` | the placed obstacles removed, walls only | `없음 (배치 장애물 제거)` |
+| the families | `#edge:*` … | added **on top** of whatever the map has | unchanged |
+
+On a map with nothing placed the two are the same track, so 기본 carries no count and 없음 is listed
+**greyed** with `이 맵은 배치 장애물이 없음 — '기본'과 같습니다.` in its tooltip. Greyed rather than
+hidden: "this map has nothing on it" is an answer, and removing the entry would leave 기본 looking
+like the only thing there is. Switching to such a map while 없음 is selected falls back to 기본
+rather than leaving a selection that means nothing.
+
+Beside the combo is **배치 장애물 먼저 제거**, enabled only when both halves of it are true — the map
+has placed obstacles, and a family is selected. It is the `+bare` composition: `scene:hall+bare+hard3`
+is "the author's boxes taken off, then the hard patterns put on", which is how a custom scene is used
+as a bare track for a family. With 기본 or 없음 selected the box is disabled and simply shows the
+state (unchecked / checked), because there it *is* the selection.
+
+The hint under the row changes with the choice: 기본 says the map is used as authored, 없음 says what
+it removes, and a family adds the one sentence the old label contradicted — *장애물 종류는 맵이 이미
+가진 것 위에 더합니다.* The session header names what was actually built (`장애물 없음`, or
+`장애물 기본 (3개)`), from the worker's facts rather than from the control's selection.
+
+The 학습 page's track picker is the same vocabulary as checkboxes — 기본 and 없음 are two boxes, and
+ticking both makes two variants of every selected map, which is what that row has always meant.
+
+One loader change came with it: `+props` used to *replace* a track's props, so `scene:hall+props3`
+quietly threw away the author's boxes as well. It adds now, and places the new ones clear of the old.
+Only an editor scene can arrive there carrying props, so that is the only kind of id whose meaning
+moved.
+
+## The 상대차 table (2026-09-15)
+
+The 주행 page's 고급 설정 had one control for the other cars: a combo, `상대차 주행 방식`, with two
+entries (`teacher`, `policy`). That is the right control for a two-car race and the wrong one for any
+other — it says the same thing about every other car at once, and a race of three is interesting
+precisely when the two other cars are *not* the same car. The user asked for the other way round:
+*"대상차를 티쳐/정책 선택여부 뿐만 아니라 각 대상차에서 적용할 속도 프로파일링 및 체크포인트 등의
+설정이 가능했으면 해."*
+
+It is now a **table**: `레이스당 차량 수 - 1` rows, one per grid slot.
+
+| column | control | notes |
+| --- | --- | --- |
+| 차량 | the slot number | 1 … `race_size - 1`; the learner is car 0 and is not in the table |
+| 종류 | raceline 티처 / interactive 티처 / 정책 체크포인트 / 자기 자신 | **the teacher is a selection.** `raceline` is the teacher this viewer has always run; `interactive` (`f1sim.interactive_teacher`) scores its candidate plans against where the other cars are *predicted* to be, and since `integrate/20260916` it is here and selectable. A kind whose module this tree does not carry is still **listed and greyed, labelled `[병합 후 활성]`**, with the reason in its tooltip — dropping it would make "no such kind" and "not merged yet" look the same, and greying alone reads as "not applicable to this row" |
+| 체크포인트 | file picker | the button shows the basename; its tooltip is the path plus the file's **controller arm** and **memory kind**. An oracle (`opp_token`) or conditional checkpoint is refused here, in red, with the loader's own sentence — before the session is built rather than a minute into it |
+| 속도 배율 | two spins, 하한–상한 | equal = a fixed multiplier; different = a band drawn per reset |
+| 그립 라벨 | 참값 / 공칭 / 보수적 | the friction this teacher's speed profile assumes |
+| 속도 cap | spin, `없음` at 0 | this car's own cap in m/s |
+| 이벤트 | 제동 / 정지 / 차선 / 지그 | the timed events this car may be dropped into |
+| 빈도 | spin | per 10 s, for this car |
+| 반응형 확률 | four spins | defend / yield / line / oblivious, per race, for this car |
+| 스폰 | 앞 / 뒤 / 나란히 / 무작위 | where this car starts **relative to the learner** |
+
+Above the table: a 프리셋 combo — 기본 (raceline 티처 1.0), 업그레이드 티처 (interactive 1.0),
+학습 레시피 (0.6–1.15, 전체 이벤트, teacher + self + checkpoints), 느린 선두 (0.6), 막는 상대
+(defend 1.0) — and 동일하게, which copies row 1 into every other row. The first two presets differ
+by the driver kind and by **nothing else** (same speed profile, same grip label, no events, no
+dispositions), which is what makes "is the visualiser's teacher the upgraded one?" a question with a
+one-click answer rather than a substitution: 기본 stays the raceline teacher. Under it, one line describing the whole table, which turns into the objection when the
+table has one; 시작 is disabled while it does, because a checkpoint the loader will refuse is a start
+that fails after a minute of loading.
+
+Cells a kind cannot carry are disabled rather than accepted and ignored: a `자기 자신` row has no
+speed profile to label and no teacher to script, so its 그립 라벨, 이벤트, 빈도 and 반응형 cells grey
+out. The columns are fixed-width and the table scrolls horizontally in the 420 px panel; that is the
+price of being a table rather than four identical forms, and it is what lets someone see at a glance
+that row 2 is the only one with events.
+
+The **same widget** (`viewer/console/opponent_table.py`) is the 학습 page's, behind a
+`차량별 상대차 설정` switch in the 레이스·제어기 section. On, it emits one `--opp-slots` JSON and drops
+the flags that table replaces; off, the recipes emit exactly the command they always did. One widget
+and not two because the two pages must not be able to disagree about what a slot is — the driving
+page builds a `SessionConfig` out of it, the training page builds a command line out of it, and a
+table that produced something the trainer could not parse would be a second configuration language
+with no way to diff it against the first.
+
+The session header names the mix (`상대차 2x raceline, 1x policy`) and its tooltip lists one line per
+slot; `SessionConfig.opponent_slots` carries the table, so 세션 저장/불러오기 round-trips it. The
+viewport's rival colouring and the 정책 입·출력 panel are untouched — they read `sim.other_idx` and the
+focus car, neither of which a slot table moves — and the ROS 2 link still drives car 0 only.
+
+## 녹화 and 스크린샷 (2026-09-15)
+
+Recording existed only headless — `python -m f1sim.learn.watch --record out.mp4 --seconds N`, three
+copies of the same ffmpeg pipe inside `watch.main`. The user asked for it where the driving is:
+
+> 비디오 렌더러 스크립트같은거 있는것 같은데 이거 좀 비쥬얼라이져 기본 기능에 넣어놔라.
+
+There is one implementation now (`viewer/recorder.py`) and the 주행 page is a caller of it.
+
+### The 녹화 card
+
+| control | what it does |
+| --- | --- |
+| 저장 폴더 | default `~/f1sim_videos`; the file is named `<map>_<time>.mp4` |
+| 해상도 | 720p / 1080p / 현재 창 크기 — **an offscreen render, so the window's size is not the clip's** |
+| 프레임 | 24 / 30 / 60 fps; 30 is what the headless recorder has always used |
+| 카메라 | 현재 카메라, or one of the five — the clip only, the window is left alone |
+| 길이 | seconds, or 수동 정지 |
+| 오버레이 포함 | LiDAR dots, the raceline, car labels — the clip only |
+| 인코더 | 자동 (GPU 우선) / h264_nvenc / libx264 |
+
+`● 녹화 시작` is in the card and again in the control bar under the picture (and on **R**), because
+starting a recording is something you do while watching rather than while setting up. **스크린샷**
+(**S**) writes a PNG through the same offscreen render at the same resolution, so a still and a frame
+of the clip are the same picture.
+
+While a clip is being written the header shows `● REC` — a file is appearing on someone's disk, and a
+UI that does that silently is a UI that fills a disk silently. When it stops, the card shows the file
+with its length, resolution, size, **which encoder wrote it**, any dropped frames, and an 열기 link.
+
+### How a frame gets out
+
+The console process is the one that renders; the worker only sends state. So the thread that must not
+stall is the one painting the window, and it is protected twice:
+
+1. **The capture is a second draw of the frame just drawn**, into an offscreen FBO at the recording's
+   resolution, from inside `paintGL` where the GL context is current. `Scene` draws into
+   `scene.target`; the capture points that at its own framebuffer, sets `scene.width/height`, redraws
+   and puts everything back. `_draw` takes its size from the scene rather than from the widget, which
+   is what makes a 1080p clip 1080p out of a 1200 px window.
+2. **Everything `_draw` advances is snapshotted and restored** — wheel rotation, the trail sequence,
+   the eased chase camera. That is what lets the clip use a different camera and different overlays
+   without the window moving, and what stops the window running at double speed while recording.
+3. **Encoding is a thread behind a bounded queue.** A frame the encoder cannot take is dropped and
+   counted, never waited for. The count is shown beside the clip: a recording with a number of
+   dropped frames next to it is one you can trust.
+
+Capture is paced by the clock at the chosen frame rate, not by the paint rate — the window repaints
+at whatever the display and the keepalive produce, and a clip has to come out at the rate it claims.
+
+### Which encoder
+
+`자동` prefers the GPU's `h264_nvenc` and falls back to `libx264`, and the finished-file line says
+which one ran. "Can the GPU do it" is answered by **encoding two frames with the real command**, not
+by grepping `ffmpeg -encoders`: nvenc is listed on machines with no device, with a driver the runtime
+does not match, and with every session slot taken, and each of those fails at the first frame. The
+probe is lazy, cached per process, skipped entirely when an encoder is named, and overridable with
+`$F1SIM_VIDEO_ENCODER`. If the card passes the probe and still refuses the real stream, the encoder
+falls back to the CPU before a single frame has reached a file rather than handing back an empty mp4.
+
+Rendering is untouched by any of this: the frames come from whatever GL context the session already
+has — the GPU on a desktop, llvmpipe under Xvfb.
+
+## The 현황판 charts (2026-09-16)
+
+The dashboard was empty for every current run. It read the progress line out of W&B's `output.log`
+— which wandb 0.29 no longer writes — and parsed it with one anchored regex that any added term
+broke, and it drew a fixed set of six PPO curves whose names a DAgger run does not have.
+
+Three rules now:
+
+* **The data is the run's own.** Both trainers write `<run>/progress.jsonl`
+  ([schema](training.md#progressjsonl--what-a-run-records-about-itself)). The page falls back to
+  `console-train.log`, then W&B's capture, then the launcher's log, and parses the human lines term
+  by term rather than as one sentence.
+* **The chart set belongs to the run**, not to the page. PPO and DAgger share no metric name, so the
+  grid is rebuilt from the run's `kind`, and a chart whose metric a run never measured (traffic in a
+  solo run) is not drawn as a flat zero line. Order is what the run is judged on first: collisions,
+  lap time, progress, reward; then traffic; then the optimiser's own diagnostics, throughput last.
+  Each chart is one metric, at the size the old six were, with the lower-is-better mark the rest of
+  the console uses and a read-out of the value under the cursor.
+* **An empty chart says why.** `progress.jsonl 없음 · console-train.log 없음 · wandb output.log 없음`
+  on the chart, the whole sentence under the progress bar, and a `기록 …` tag on every row of the run
+  list — the page's previous answer to "there is no data" was to draw axes and nothing else, which
+  is indistinguishable from a broken page.
+
+The two-series charts (student vs teacher) exist because a DAgger student's 52 coll/km is a disaster
+against a teacher at 7 and ordinary against a teacher at 48, and the student's own curve does not
+say which.
+
 ## Verification
 
 Rendered headlessly with the same capture path as the README screenshots (Xvfb + llvmpipe, real

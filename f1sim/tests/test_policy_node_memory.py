@@ -1,6 +1,6 @@
 """The ROS policy node carries a recurrent policy's hidden state across scan callbacks.
 
-Same shape as `test_policy_node_traction.py`: no ROS graph, no device, no vehicle. The node's real
+Same shape as `test_controller_traction.py`: no ROS graph, no device, no vehicle. The node's real
 `on_odom` / `on_imu` / `on_scan` / `_resume` / `on_reset` run against stub messages and a fake
 clock, and the assertions are about the state the node keeps between them.
 
@@ -30,6 +30,7 @@ torch = pytest.importorskip("torch")
 import f1sim_ros.policy_node as pn                            # noqa: E402
 from f1sim.learn.memory import memory_spec, runtime_for       # noqa: E402
 from f1sim.learn.model import ActorCritic, load_for_memory, save_checkpoint  # noqa: E402
+from f1sim.learn.motion import motion_spec                    # noqa: E402
 from f1sim.learn.obs import ObsBuilder, ObsSpec               # noqa: E402
 
 G = pn.G
@@ -58,7 +59,7 @@ class Logger:
     def error(self, t): self.lines.append(("error", t))
 
 
-def memory_model(tmp_path, channels=("memory", "edges")):
+def memory_model(tmp_path, channels=("memory", "edges"), motion=False):
     """A warm-started memory model, deterministic across calls.
 
     The whole build is inside one forked, seeded RNG -- not just the feedforward half. The GRU's
@@ -73,40 +74,60 @@ def memory_model(tmp_path, channels=("memory", "edges")):
         ff = ActorCritic(**meta)
         base = str(tmp_path / "ff.pt")
         save_checkpoint(base, ff, {"spec": {}})
-        m, _e, _f = load_for_memory(base, "cpu", memory_spec(hidden_size=16),
-                                    scan_channels=({"channels": list(channels)} if channels else None))
+        chan = None
+        if channels:
+            chan = {"channels": list(channels)}
+            if any(c.startswith("aligned") for c in channels):
+                from f1sim.learn.obs import motion_index_spec
+                chan["aligned"] = {"proprio": motion_index_spec(SPEC)}
+        m, _e, _f = load_for_memory(base, "cpu", memory_spec(hidden_size=16), scan_channels=chan,
+                                    motion=(motion_spec(hidden_size=8, channels=8) if motion else None),
+                                    motion_heads=(["mask", "dv"] if motion else None))
         with torch.no_grad():                   # so that carrying the state visibly matters
             m.actor.memory.out.weight.normal_(0, 0.3)
+            if motion:
+                m.actor.memory.motion.out.weight.normal_(0, 0.3)
     return m.eval()
 
 
-def make_node(model):
+def make_node(model, spec=SPEC):
+    """The node with every ROS dependency replaced and its real methods intact.
+
+    `SPEC` is a direct-action checkpoint (`act_dim=2`), which publishes `/drive` from this node and
+    bypasses the controller, so the counts below are commands. `plan_node` below is the same stub
+    for a plan checkpoint, where the published thing is a `Plan` -- the memory rules are the same
+    either way, and that is the point of checking both.
+    """
+    from f1sim_ros.deploy import SensorIntake
     n = pn.PolicyNode.__new__(pn.PolicyNode)
     n.device = torch.device("cpu")
-    n.spec = SPEC
-    n.obs = ObsBuilder(SPEC, "cpu")
+    n.spec = spec
+    n.direct = int(spec.act_dim) == 2
+    n.obs = ObsBuilder(spec, "cpu")
     n.model = model
     n.policy_state = runtime_for(model, batch=1, device="cpu")
     n.pub = RecordingPub()
-    n.speed_cap = 8.0; n.steer_max = 0.4189; n.v = 0.0
-    n.imu_buf = []; n.imu_stamps = []
-    n.att = (0.0, 0.0); n.yaw_rate = 0.0
-    n.accel_scale = None; n._unit_warned = False
-    n.tracker = None; n.cal = (0.0, 1.0, 1.0); n.timeout = 0.25
-    n.t_att = n.t_imu = n.t_odom = n.t_scan = None
-    n.imu_mean = None; n.t_imu_mean = None; n.att_stamp = None
+    n.pub_drive = n.pub
+    n.pub_plan = RecordingPub()
+    n.pub_state = RecordingPub()
+    n.speed_cap = 8.0; n.steer_max = 0.4189
+    n.timeout = 0.25
     n._inhibited = False; n._last_inhibit_log = -1e9; n.last_t = None
-    n.traction_arm = "off"; n.traction = None
-    # No plan-geometry layer either: this stub is about the recurrent state, and an arm that
-    # was installed would put a second thing between the policy and the command.
-    n.clearance = None; n._scan_geometry_checked = True
-    n.ax_body = None; n.t_ax = None; n.motor_current = None; n.t_current = None
+    n.seq = 0; n.checkpoint_id = "test/stub.pt@000000000000"
+    n.memory_clears = 0; n.memory_cleared_at = -1.0; n.memory_cleared_reason = ""
     n._log = Logger(); n._now = 100.0
     n.get_logger = lambda: n._log
     n.get_parameter = lambda name: SimpleNamespace(value=True)
     n.clock = lambda: n._now
     n.stamp_now = lambda: ros_time(n._now)
+    n.sensors = SensorIntake(n.clock, n._log, n.timeout)
     return n
+
+
+def published(node):
+    """What this node put on the wire this run: commands for a direct checkpoint, plans for a plan
+    one. The memory assertions are about how many steps were taken, not about which topic."""
+    return node.pub_plan.msgs if not node.direct else node.pub.msgs
 
 
 def imu_msg():
@@ -151,7 +172,7 @@ def test_hidden_state_is_carried_between_scan_callbacks(tmp_path):
     feed(node, 1)
     h2 = hidden(node)
     assert not torch.allclose(h1, h2), "the second scan must act on the carried state"
-    assert len(node.pub.msgs) == 2
+    assert len(published(node)) == 2
 
 
 def test_a_sensor_gap_clears_the_memory_with_the_observation_history(tmp_path):
@@ -184,6 +205,34 @@ def test_reset_clears_the_memory(tmp_path):
     assert any("reset" in t for _l, t in node._log.lines)
 
 
+def test_the_node_runs_the_aligned_channel_and_the_motion_branch(tmp_path):
+    """The only thing this branch adds to the car: the channel, from sensors the node already reads.
+
+    `on_scan` hands `pro` to the runtime, so the warp gets the car's own speed, yaw rate and
+    roll/pitch out of the very vector the policy is about to be given -- there is no second path and
+    no privileged input. The motion state rides inside the same hidden tensor, so the node carries
+    one tensor exactly as before.
+    """
+    rows = ["memory", "edges", "aligned", "aligned_prev", "aligned_valid"]
+    model = memory_model(tmp_path, channels=rows, motion=True)
+    n = make_node(model)
+    width = model.actor.memory.hidden_size + model.actor.memory.motion.hidden_size
+    feed(n, steps=8, r=3.0)
+    h = hidden(n)
+    assert h is not None and h.shape[-1] == width, "one tensor, main state and h_dyn inside it"
+    assert len(n.pub.msgs) == 8 and all(np.isfinite(m.drive.speed) for m in n.pub.msgs)
+    # the channel is stateful and episode-scoped in the node, like the occupancy memory beside it
+    aug = n.policy_state.scan
+    assert aug is not None and aug.aligned is not None
+    assert int(aug.aligned.seen[0]) == 8
+    n.on_reset(None)
+    assert int(aug.aligned.seen[0]) == 0 and hidden(n) is None
+    # and it drives: a scan with a near return on one side produces a finite, bounded command
+    feed(n, steps=6, r=1.5)
+    last = n.pub.msgs[-1]
+    assert abs(float(last.drive.steering_angle)) <= n.steer_max + 1e-6
+
+
 def test_a_legacy_checkpoint_keeps_the_node_exactly_as_it_was(tmp_path):
     meta = dict(n_stack=SPEC.scan_stack, n_beams=SPEC.n_beams, proprio_dim=SPEC.proprio_dim,
                 priv_dim=9, act_dim=SPEC.act_dim, scan_deltas=True, temporal_encoder="cnn")
@@ -194,7 +243,7 @@ def test_a_legacy_checkpoint_keeps_the_node_exactly_as_it_was(tmp_path):
     assert not node.policy_state.stateful
     feed(node, 3)
     assert hidden(node) is None and node.policy_state.scan is None
-    assert len(node.pub.msgs) == 3
+    assert len(published(node)) == 3
     node.on_reset(object())                           # still a legal, inert call
     assert hidden(node) is None
 

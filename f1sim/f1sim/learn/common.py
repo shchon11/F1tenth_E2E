@@ -1,6 +1,7 @@
 """Shared training utilities: track sets, env construction, run dirs, W&B."""
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import List, Optional
@@ -17,9 +18,31 @@ from ..teacher import RacelineTeacher
 from ..track import Track
 from .obs import ObsSpec
 
-RUNS_DIR = os.path.join(os.path.expanduser("~"), "f1sim_runs")
+#: Where runs and checkpoints are written. `$F1SIM_RUNS` overrides it, so a shared machine,
+#: a scratch disk or a second checkout does not have to live in one home directory.
+RUNS_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("F1SIM_RUNS") or os.path.join("~", "f1sim_runs")))
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY")     # None -> the account's default entity (org-scoped keys reject the org itself)
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "f1sim-e2e")
+
+
+def validate_policy_observation(saved: dict, env) -> None:
+    """Reject shape-compatible but numerically different policy observations."""
+    import math
+    if not isinstance(saved, dict) or not saved:
+        raise ValueError("policy checkpoint has no observation specification")
+    expected = ObsSpec(**{key: value for key, value in saved.items()
+                          if key in ObsSpec.__dataclass_fields__})
+    actual = obs_spec(env)
+    for key in ObsSpec.__dataclass_fields__:
+        want, got = getattr(expected, key), getattr(actual, key)
+        if isinstance(want, float) or isinstance(got, float):
+            same = math.isfinite(float(want)) and math.isfinite(float(got)) \
+                and math.isclose(float(want), float(got), rel_tol=0., abs_tol=1e-9)
+        else:
+            same = want == got
+        if not same:
+            raise ValueError(f"policy observation {key}: checkpoint {want!r}, environment {got!r}")
 
 
 # ---------------------------------------------------------------- track sets
@@ -64,12 +87,16 @@ def base_map(name: str) -> str:
     family added to the catalog is covered without a second list to keep in sync. The loop runs to
     a fixed point because the two kinds of suffix can be written in either order.
     """
+    if "!assets=" in name:
+        name = name.rsplit("!assets=", 1)[0]
+    name = tracks.parse(name).legacy()
     prev = None
     while prev != name:
         prev = name
         for m in maps.MODIFIERS:
             if name.endswith(m):
                 name = name[:-len(m)]
+        name, _ = maps._split_bare(name)
         stripped, kind, _ = maps._split_obstacle_suffix(name)
         if kind is not None:
             name = stripped
@@ -182,6 +209,7 @@ def viewer_active(max_age: float = 5.0) -> bool:
 def raceline_clearance(track, rl) -> float:
     """Smallest gap between the raceline and anything solid [m]."""
     from scipy import ndimage
+    track = track.for_planning()
     edt = ndimage.distance_transform_edt(~track.occupancy).astype(np.float32) * track.resolution
     j = np.clip(((rl.xy[:, 0] - track.origin[0]) / track.resolution).astype(int), 0, edt.shape[1] - 1)
     i = np.clip(((rl.xy[:, 1] - track.origin[1]) / track.resolution).astype(int), 0, edt.shape[0] - 1)
@@ -267,7 +295,7 @@ def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg:
         if rls is None:
             rls = [Raceline.build_cached(t) for t in tracks]
         env.set_teacher(make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time, **(teacher_limits or {})))
-    if opponent_pool and env.ecfg.opponent == "pool":
+    if opponent_pool and env.pool_paths:
         from .opponent_pool import attach     # local: that module imports this one for the obs spec
         attach(env, device=env.device)
     return env
@@ -310,7 +338,8 @@ def obs_spec(env: F1VecEnv) -> ObsSpec:
     e = env.ecfg
     return ObsSpec(n_beams=env.n_beams, scan_stack=e.scan_stack, scan_stride=e.scan_stride, action_history=e.action_history,
                    act_dim=env.act_dim, hist_len=e.hist_len, hist_stride=e.hist_stride, range_max=env.range_max, v_max=e.v_max_policy,
-                   gyro_scale=e.imu_gyro_scale, accel_scale=e.imu_accel_scale)
+                   gyro_scale=e.imu_gyro_scale, accel_scale=e.imu_accel_scale,
+                   opp_token=env.opp_token)
 
 
 def teacher_limits(a_lat: Optional[float] = None, a_acc: Optional[float] = None,
@@ -328,7 +357,9 @@ def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0
     therefore imitable. Run `python -m f1sim.learn.grip_probe` to measure whether the proprio history recovers mu at all.
     limits: `teacher_limits(...)` -- a_lat / a_acc / a_brake of the speed profile the teacher drives."""
     t = RacelineTeacher(rls, wheelbase=env.cfg.vehicle.lf + env.cfg.vehicle.lr, device=env.device,
-                        recover_time=recover_time, **limits)
+                        recover_time=recover_time, vehicle=env.cfg.vehicle,
+                        mu_nominal=env.cfg.vehicle.mu,
+                        mu_f_scale_nominal=env.cfg.vehicle.mu_f_scale, **limits)
     t.label_grip = grip
     return t
 
@@ -337,6 +368,75 @@ def run_dir(name: str) -> str:
     d = os.path.join(RUNS_DIR, name)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+#: The file both trainers write their curve to, next to the checkpoints.
+PROGRESS_FILENAME = "progress.jsonl"
+
+
+def _jsonable(v):
+    """A plain Python number/str/bool/list, or None for anything else.
+
+    numpy scalars and 0-d tensors are what a metric dict is actually full of, and `json.dumps`
+    refuses both. NaN and +/-inf are kept (`json.dumps` writes them as `NaN`/`Infinity`): a metric
+    that is not defined this update is data -- "no lap was completed" -- and dropping the key
+    instead would silently shorten one series against the others.
+    """
+    if isinstance(v, bool) or v is None or isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, (np.floating, np.integer)):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if torch.is_tensor(v):
+        return v.item() if v.numel() == 1 else v.detach().cpu().tolist()
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return None
+
+
+class ProgressLog:
+    """`<run_dir>/progress.jsonl`: one JSON object per logged step, flushed on every write.
+
+    The console's training dashboard used to read the progress line out of W&B's `output.log` and
+    parse it with one regex. Both of those are side effects of somebody else's code: wandb 0.29 no
+    longer writes `output.log` at all, a run started with stdout redirected elsewhere leaves nothing
+    in its run directory, and every term added to the human line (`gate`, `kl_ref`, `fut`, `floor
+    bce`) broke the regex. This file is the trainer's own record, in the run directory, in a format
+    that cannot drift: unknown keys are extra series, not a parse failure.
+
+    Never raises. A full disk, a read-only mount or a run directory somebody moved must not take a
+    training run with it -- the file is a side output, not a result.
+    """
+
+    def __init__(self, run_dir: str, filename: str = PROGRESS_FILENAME):
+        self.path = os.path.join(run_dir, filename)
+        self._fh = None
+        self.error: Optional[str] = None
+        try:
+            self._fh = open(self.path, "a", buffering=1)
+        except OSError as exc:                      # pragma: no cover - disk-level failure
+            self.error = str(exc)
+
+    def write(self, record: dict) -> None:
+        if self._fh is None:
+            return
+        try:
+            clean = {k: _jsonable(v) for k, v in record.items()}
+            self._fh.write(json.dumps({k: v for k, v in clean.items() if v is not None}) + "\n")
+            self._fh.flush()
+        except (OSError, ValueError, TypeError) as exc:   # pragma: no cover - disk-level failure
+            self.error = str(exc)
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:                          # pragma: no cover
+                pass
+            self._fh = None
 
 
 def wandb_init(name: str, config: dict, group: Optional[str] = None, mode: Optional[str] = None,

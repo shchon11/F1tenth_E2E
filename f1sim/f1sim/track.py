@@ -86,6 +86,50 @@ class Track:
         return Track(occ, float(resolution), (float(origin[0]), float(origin[1])), edt, centerline, name,
                      duct=duct, tall=tall, duct_height=duct_height)
 
+    def for_planning(self, body_height: float = 0.27) -> "Track":
+        """Grid view including static props, without changing the simulation geometry.
+
+        Props remain analytic in the simulator. Offline path planning instead needs their
+        occupied cells. Use the same four convex height bands as contact detection, projected
+        over the maximum randomized vehicle height by default. Every cell intersecting a band
+        is marked, including thin props falling between cell centers. The result has no analytic
+        props, making repeated projection a no-op.
+        """
+        if not np.isfinite(body_height) or body_height <= 0:
+            raise ValueError("planning body height must be finite and positive")
+        if not self.props:
+            return self
+        from . import props as prop_shapes
+        from .prop_math import section_halfplanes
+
+        occupied = self.occupancy.copy()
+        height, width = occupied.shape
+        resolution = self.resolution
+        origin = np.asarray(self.origin)
+        for placement in self.props:
+            cosine, sine = np.cos(placement.yaw), np.sin(placement.yaw)
+            rotation = np.array([[cosine, -sine], [sine, cosine]])
+            for band in prop_shapes.sections(placement.build(), n_bands=4):
+                if band["z0"] >= body_height or band["z1"] <= 0:
+                    continue
+                polygon = np.asarray(band["polygon"]) @ rotation.T + [placement.x, placement.y]
+                lo = np.floor((polygon.min(axis=0) - origin) / resolution).astype(int)
+                hi = np.floor((polygon.max(axis=0) - origin) / resolution).astype(int)
+                lo = np.maximum(lo, [0, 0])
+                hi = np.minimum(hi, [width - 1, height - 1])
+                if np.any(lo > hi):
+                    continue
+                rows, cols = np.mgrid[lo[1]:hi[1] + 1, lo[0]:hi[0] + 1]
+                centers = np.stack([cols + 0.5, rows + 0.5], axis=-1) * resolution + origin
+                normals, offsets = section_halfplanes(polygon, len(polygon))
+                # SAT: grid axes are handled by the bounding box; polygon axes below.
+                cell_support = 0.5 * resolution * np.abs(normals).sum(axis=1)
+                intersects = np.all(centers @ normals.T <= offsets + cell_support + 1e-12, axis=-1)
+                occupied[rows, cols] |= intersects
+        return Track.from_occupancy(occupied, resolution, self.origin, self.centerline, self.name,
+                                    duct=self.duct, tall=self.tall | (occupied & ~self.occupancy),
+                                    duct_height=self.duct_height)
+
     @staticmethod
     def from_ros_map(yaml_path: str, centerline_csv: Optional[str] = None, duct_height: float = 0.33,
                      boundary: str = "duct", unknown_is_obstacle: bool = True, max_cells: float = 4.5e6,
@@ -352,10 +396,19 @@ class Track:
         open, keep `min_spacing` between props -- but the clearance test uses the prop's own
         circumradius from its declared footprint rather than a drawn box size, and nothing is
         stamped into `occupancy`/`tall`. A prop that will not fit is skipped and counted; it is never
-        placed and silently left without physics."""
+        placed and silently left without physics.
+
+        Props already on the track are **kept**, and the new ones are placed clear of them. An
+        obstacle family adds to what the map has; it does not replace it. This used to replace, and
+        the only tracks that can arrive here carrying props are editor scenes -- so `scene:x+props3`
+        silently threw away the boxes the author had placed, which is the same lie the 없음 label
+        told (`f1sim.tracks`, 2026-09-15). Where there are no existing props -- every other map --
+        the extra test never fires and nothing about the placement changes."""
         from . import props as _props
         if styles is None:
             styles = _props.STYLES
+        existing = tuple(self.props)
+        keep_out = [(p_.x, p_.y, float(p_.build().envelope.radius)) for p_ in existing]
         rng = np.random.default_rng(seed)
         cl = self.centerline if line is None else np.asarray(line, float)
         if cl is None:
@@ -393,6 +446,9 @@ class Track:
             if self.occupancy[rr, cc] or float(self.edt[rr, cc]) < r:
                 skipped += 1
                 continue
+            if any((cx - px) ** 2 + (cy - py) ** 2 < (r + pr + 0.1) ** 2 for px, py, pr in keep_out):
+                skipped += 1                                  # would stand inside a prop already there
+                continue
             yaw = float(math.atan2(tang[i, 1], tang[i, 0]) + rng.uniform(-0.35, 0.35))
             out.append(StaticProp(style, float(cx), float(cy), yaw, seed=sp.seed))
             placed.append(i)
@@ -400,7 +456,7 @@ class Track:
                                  f"{self.name}_props{seed}", duct=self.duct, tall=self.tall,
                                  duct_height=self.duct_height)
         t.edt_duct, t.edt_tall = self.edt_duct, self.edt_tall
-        t.props = tuple(out)
+        t.props = existing + tuple(out)
         if skipped:
             t.props_skipped = skipped
         return t
@@ -582,6 +638,23 @@ class Track:
         h.update(np.packbits(self.duct).tobytes())
         h.update(np.packbits(self.tall).tobytes())
         return (self.occupancy.shape, round(self.resolution, 6), tuple(np.round(self.origin, 4)), float(self.duct_height), h.hexdigest())
+
+    def bare(self) -> "Track":
+        """Copy with the props the map's author placed dropped. The grids are untouched.
+
+        This is the `+bare` suffix (`f1sim.tracks`, obstacle choice 없음). "Untouched" is the whole
+        definition: a painted wall and a painted box are the same cells in the same layer, and
+        guessing which is which is not something a loader may do. What an author *placed* is
+        `props` -- a list of poses -- so that is exactly what this removes.
+
+        Returns `self` when there is nothing to remove, so every map that carries no placements is
+        the object it already was.
+        """
+        if not self.props:
+            return self
+        return Track(self.occupancy, self.resolution, self.origin, self.edt, self.centerline,
+                     self.name + "_bare", duct=self.duct, tall=self.tall, edt_duct=self.edt_duct,
+                     edt_tall=self.edt_tall, duct_height=self.duct_height, props=())
 
     def reversed(self) -> "Track":
         """Same map, lap driven the other way round (centerline reversed). Grids are shared, not
@@ -1340,8 +1413,14 @@ class TrackTensors:
     def edt_gradient(self, xy: torch.Tensor, tid: torch.Tensor, field: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Unit vector pointing away from the nearest wall (central differences). xy (..., 2), tid (...)."""
         eps = self.t_res[tid][..., None]
-        ex = torch.tensor([1.0, 0.0], device=self.device) * eps
-        ey = torch.tensor([0.0, 1.0], device=self.device) * eps
+        # The unit vectors are built once. `torch.tensor(..., device=cuda)` is a pageable host copy,
+        # which waits for everything already queued on the GPU: two of them here made every LiDAR
+        # scan a full device sync, 12.6 of a 20.5 ms viewer step (RTX 4060 Ti, one car).
+        units = getattr(self, "_edt_units", None)
+        if units is None or units.device != self.t_res.device:
+            units = self._edt_units = torch.eye(2, device=self.t_res.device)
+        ex = units[0] * eps
+        ey = units[1] * eps
         gx = self.sample_edt(xy + ex, tid, field) - self.sample_edt(xy - ex, tid, field)
         gy = self.sample_edt(xy + ey, tid, field) - self.sample_edt(xy - ey, tid, field)
         g = torch.stack([gx, gy], -1)

@@ -18,13 +18,15 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from . import catalog, theme
+from . import app as _app, catalog, theme
 from ... import tracks
 from .catalog import GROUP_CAVEAT, GROUP_HINT, GROUP_ORDER, MapCatalog, RunInfo, format_age
 from .frames import Freshness, INTERP_LAG_FRAMES
+from .opponent_table import OpponentSlotTable
 from .overlays import ActivationPanel, DashPanel, PolicyInputPanel
 from .protocol import (SessionConfig, STAGE_TEXT, STATE_FAILED, STATE_IDLE, STATE_PAUSED,
                        STATE_PREPARING, STATE_RUNNING, STATE_STOPPING)
+from .. import recorder as REC
 from .theme import C, SP
 from .viewport import CAMERA_KEYS, CAMERA_MODES, MAX_RENDER_CARS, ViewportWidget
 from .widgets import (Card, Collapsible, FieldRow, FilterList, FlowLayout, KeyValueList,
@@ -88,7 +90,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("f1sim 주행 콘솔")
+        # ASCII: some taskbars read X11's legacy Latin-1 `WM_NAME` and mangle a Korean title.
+        # `app.APP_NAME` is the one place that decides it. The Korean name is on the header below.
+        self.setWindowTitle(_app.APP_NAME)
         self.resize(1600, 950)
         self.setMinimumSize(1120, 700)
 
@@ -200,6 +204,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.header_summary.setObjectName("HeaderSub")
         self.header_summary.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         h.addWidget(self.header_summary, 1)
+        self.header_rec = QtWidgets.QLabel("● REC")
+        self.header_rec.setStyleSheet(f"color: {C['danger']}; font-weight: 600;")
+        self.header_rec.setToolTip("3D 화면을 mp4 로 쓰는 중입니다.")
+        self.header_rec.setVisible(False)
+        h.addWidget(self.header_rec)
 
         self.btn_left_panel = QtWidgets.QPushButton("설정 패널")
         self.btn_left_panel.setObjectName("GhostButton")
@@ -226,6 +235,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- left: what to run
     def _build_left(self) -> QtWidgets.QWidget:
         area, v = _scroll_panel(340)
+        self._left_scroll = area
+        self._panel_nudged_for = 0
         #: The scrolling part of the left panel, kept as an attribute so a caller (a screenshot
         #: script, a test) can put a card on screen without reaching through the widget tree.
         self.left_scroll = area
@@ -260,7 +271,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v.addWidget(sel_card)
 
         # -- policy run
-        run_card = Card("정책 런")
+        run_card = Card("① 정책 런")
         self.run_list = FilterList("런 이름 검색", rows=5)
         self.run_list.activated.connect(self._on_run_selected)
         run_card.add(self.run_list)
@@ -284,7 +295,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # twenty times -- which is not a list of maps and cannot be scanned. Direction, obstacle
         # and seed are three controls under it, defaulting to 정방향 / 없음 / 무작위, so picking a
         # map is enough to drive it.
-        map_card = Card("맵")
+        map_card = Card("② 맵")
         self.map_group = QtWidgets.QComboBox()
         self.map_group.addItem("목록 읽는 중…")
         self.map_group.setEnabled(False)
@@ -313,11 +324,30 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.seg_direction.selected.connect(lambda _k: self._on_scenario_changed())
         map_card.add(FieldRow("방향", self.seg_direction, ""))
 
+        # 기본 / 없음 / the families. `기본` is the map as authored -- an editor scene keeps the
+        # obstacles its author placed -- and `없음` removes them. Those used to be one entry
+        # labelled 없음, which is what the user caught: a custom scene picked with "없음" came up
+        # full of boxes.
+        obs_row = QtWidgets.QHBoxLayout()
+        obs_row.setSpacing(SP[0])
         self.combo_obstacle = QtWidgets.QComboBox()
-        for o in tracks.OBSTACLES:
-            self.combo_obstacle.addItem(tracks.OBSTACLE_LABEL[o], o)
+        for o in tracks.ASSET_OBSTACLES:
+            self.combo_obstacle.addItem(tracks.ASSET_PLACEMENT_LABEL[o], o)
+        self.combo_obstacle.setCurrentIndex(self.combo_obstacle.findData(""))
         self.combo_obstacle.currentIndexChanged.connect(lambda _: self._on_scenario_changed())
-        self.row_obstacle = FieldRow("장애물", self.combo_obstacle, tracks.OBSTACLE_HINT[""])
+        obs_row.addWidget(self.combo_obstacle, 1)
+        # A family ADDS to what the map has. This is how a custom scene is used as a bare track for
+        # one: `scene:x+bare+hard3`. Enabled only where it means something -- a map with placed
+        # obstacles and a family selected.
+        self.chk_bare_first = QtWidgets.QCheckBox("배치 장애물 먼저 제거")
+        self.chk_bare_first.setToolTip(
+            "장애물 종류는 맵이 이미 가진 것 위에 더합니다.\n"
+            "켜면 작성자가 배치한 장애물을 먼저 걷어내고 그 위에 올립니다 (id 로는 +bare).")
+        self.chk_bare_first.toggled.connect(lambda _: self._on_scenario_changed())
+        self.chk_bare_first.hide()
+        obs_box = QtWidgets.QWidget()
+        obs_box.setLayout(obs_row)
+        self.row_obstacle = FieldRow("장애물", obs_box, tracks.OBSTACLE_HINT[""])
         map_card.add(self.row_obstacle)
 
         # Seed. "무작위" is the default because it is what the user asked for: pick a map, get
@@ -355,7 +385,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v.addWidget(map_card)
 
         # -- shape of the session
-        cfg_card = Card("구성")
+        cfg_card = Card("구성  ·  선택 사항")
         self.spin_races = QtWidgets.QSpinBox()
         self.spin_races.setRange(1, 256)
         self.spin_races.setValue(1)
@@ -439,23 +469,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         cfg_card.add(self.row_dial)
         v.addWidget(cfg_card)
 
+        # -- recording. Folded, with its button on the fold's own header row: pressing 녹화 stays
+        # one click, and the seven settings behind it stop standing between 구성 and 고급 설정 on
+        # the panel a first-time user scrolls. (Isaac Sim's property panel does the same thing with
+        # collapsable frames -- everything is there, almost nothing is open.)
+        v.addWidget(self._build_record_card())
+
         # -- advanced
         adv = Collapsible("고급 설정", expanded=False)
-        # Not "CUDA 가속": the label said that and the box was ticked, so opening the viewer looked
-        # like a choice about whether to use the GPU. It is not -- 연산 장치 decides that, and the
-        # session runs on CUDA with this off. What this buys is `torch.compile`, which is a startup
-        # cost paid before anything appears.
-        self.chk_compile = QtWidgets.QCheckBox("torch.compile 사전 컴파일 (시작이 몇 분 느려짐)")
-        self.chk_compile.setChecked(False)
-        self.chk_compile.setToolTip(
-            "GPU 사용 여부와는 무관합니다 — 그건 아래 '연산 장치' 가 정하고, 이 항목을 꺼도\n"
-            "CUDA 로 돌아갑니다.\n\n"
-            "켜면 torch 가 정책과 물리를 컴파일해 step 하나가 빨라집니다. 대신 세션을 시작할 때\n"
-            "그 컴파일을 먼저 끝내야 하므로 화면이 나오기까지 몇 분이 걸릴 수 있습니다.\n"
-            "차 한 대를 보는 용도라면 켜지 않는 편이 빠릅니다. 차가 많거나 오래 돌릴 때 이득입니다.\n\n"
-            "준비 시간은 고정값이 아니라 torch 컴파일 캐시 상태에 좌우됩니다.\n"
-            "준비 중에도 창은 계속 반응하며 [취소] 를 누를 수 있습니다.")
-        adv.add(self.chk_compile)
+        self.adv_fold = adv
+        adv.toggle.toggled.connect(lambda _on: self._queue_panel_cap())
         self.chk_dr = QtWidgets.QCheckBox("차량마다 마찰/지연 무작위화 (학습과 동일)")
         self.chk_dr.setChecked(True)
         self.chk_dr.setToolTip("끄면 모든 차가 공칭 파라미터로 달립니다. 미끄러짐이 정책 탓인지 "
@@ -463,10 +486,19 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         adv.add(self.chk_dr)
         self.chk_stoch = QtWidgets.QCheckBox("학습처럼 행동을 샘플링")
         adv.add(self.chk_stoch)
-        self.combo_opponent = QtWidgets.QComboBox()
-        self.combo_opponent.addItems(["teacher", "policy"])
-        adv.add(FieldRow("상대차 주행 방식", self.combo_opponent,
-                         "레이스당 차량 수가 2 이상일 때만 의미가 있습니다."))
+        # The per-car table, in place of the one combo that used to say the same thing about every
+        # other car at once. Same widget as the training page's, so a session and a training command
+        # cannot describe an opponent differently.
+        self.opp_table = OpponentSlotTable()
+        self.opp_table.set_count(max(0, self.spin_grid.value() - 1))
+        self.opp_table.changed.connect(self._on_slots_changed)
+        self.row_opp = FieldRow(
+            "상대차 (차량별 설정)", self.opp_table,
+            "레이스당 차량 수 - 1 줄. 줄마다 종류·체크포인트·속도·이벤트·스폰을 따로 정합니다. "
+            "티처는 선택입니다: 'raceline 티처'는 이 뷰어가 늘 쓰던 티처, "
+            "'interactive 티처'는 상대 차의 예측된 미래까지 보고 계획을 고르는 업그레이드된 쪽입니다 "
+            "(프리셋 '업그레이드 티처').")
+        adv.add(self.row_opp)
         self.combo_device = QtWidgets.QComboBox()
         # Every card by name, not just "cuda": `torch.device("cuda")` is device 0, and on a machine
         # where device 0 is training that is exactly the one the viewer must not take. "auto" picks
@@ -474,6 +506,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.combo_device.addItems(["auto"] + _cuda_device_names() + ["cpu"])
         adv.add(FieldRow("연산 장치", self.combo_device,
                          "auto: 메모리가 가장 많이 남은 GPU 를 고릅니다 (학습 중인 카드를 피합니다)."))
+        self.grip_note = label("노면 한계 자동 추정", "hint")
+        self.grip_note.setWordWrap(True)
+        self.grip_note.setToolTip("일반 주행은 센서 기반 자동 런타임을 사용합니다. 실험용 제어기와 추정기 경로는 "
+                                  "명시적인 벤치마크·디버그 호출에서만 지정합니다.")
+        adv.add(self.grip_note)
         self.combo_ros = QtWidgets.QComboBox()
         self.combo_ros.addItem("끄기", "off")
         self.combo_ros.addItem("센서 토픽 발행 (정책이 주행)", "publish")
@@ -495,9 +532,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         wv.addWidget(area, 1)
         bar = QtWidgets.QFrame()
         bar.setObjectName("Panel")
-        bh = QtWidgets.QHBoxLayout(bar)
-        bh.setContentsMargins(SP[2], SP[1], SP[2], SP[2])
+        bar_v = QtWidgets.QVBoxLayout(bar)
+        bar_v.setContentsMargins(SP[2], SP[1], SP[2], SP[2])
+        bar_v.setSpacing(SP[0])
+        self.start_hint = label("", "hint")
+        self.start_hint.setWordWrap(True)
+        bar_v.addWidget(self.start_hint)
+        bh = QtWidgets.QHBoxLayout()
+        bh.setContentsMargins(0, 0, 0, 0)
         bh.setSpacing(SP[1])
+        bar_v.addLayout(bh)
         self.btn_start = PendingButton("시작", role="PrimaryButton")
         self.btn_start.setToolTip("선택한 런과 맵으로 세션을 시작합니다.")
         self.btn_start.clicked.connect(self._on_start)
@@ -507,8 +551,201 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_cancel.clicked.connect(self._on_cancel)
         bh.addWidget(self.btn_cancel, 1)
         wv.addWidget(bar)
-        wrap.setMaximumWidth(420)
+        wrap.setMaximumWidth(self.PANEL_W)
+        self._left_wrap = wrap
         return wrap
+
+    def _build_record_card(self) -> QtWidgets.QWidget:
+        """The 녹화 form: where the clip goes, how big, how fast, and what is in it.
+
+        Recording renders the same frames the session is showing into an offscreen buffer at the
+        size chosen here, so the window can be any size and the clip is still 1080p. Encoding runs
+        on its own thread behind a bounded queue: a frame the encoder cannot take is dropped and
+        counted rather than made to wait, because the thread being protected is the one painting the
+        window.
+        """
+        card = Collapsible("녹화", expanded=False)
+        self.record_fold = card
+        self.edit_record = QtWidgets.QLineEdit()
+        self.edit_record.setPlaceholderText(REC.VIDEO_DIR)
+        self.edit_record.setToolTip("저장 폴더. 파일 이름은 맵과 시각으로 자동으로 붙습니다.")
+        browse = QtWidgets.QPushButton("…")
+        browse.setObjectName("GhostButton")
+        browse.setFixedWidth(32)
+        browse.clicked.connect(self._on_record_dir)
+        dir_row = QtWidgets.QHBoxLayout(); dir_row.setSpacing(SP[0])
+        dir_row.addWidget(self.edit_record, 1); dir_row.addWidget(browse)
+        dir_box = QtWidgets.QWidget(); dir_box.setLayout(dir_row)
+        card.add(FieldRow("저장 폴더", dir_box, f"비우면 {REC.VIDEO_DIR}"))
+
+        self.combo_res = QtWidgets.QComboBox()
+        for label_, w_, h_ in REC.RESOLUTIONS:
+            self.combo_res.addItem(label_, (w_, h_))
+        self.combo_res.setToolTip("녹화 해상도. 창 크기와 무관하게 이 크기로 따로 렌더링합니다.")
+        self.combo_fps = QtWidgets.QComboBox()
+        for f_ in REC.FPS_CHOICES:
+            self.combo_fps.addItem(f"{f_} fps", f_)
+        self.combo_fps.setCurrentIndex(list(REC.FPS_CHOICES).index(30))
+        g = QtWidgets.QGridLayout(); g.setHorizontalSpacing(SP[1]); g.setVerticalSpacing(SP[0])
+        g.addWidget(FieldRow("해상도", self.combo_res, ""), 0, 0)
+        g.addWidget(FieldRow("프레임", self.combo_fps, ""), 0, 1)
+        card.add(g)
+
+        self.combo_rec_cam = QtWidgets.QComboBox()
+        self.combo_rec_cam.addItem("현재 카메라", "")
+        for key, text, tip in CAMERA_MODES:
+            self.combo_rec_cam.addItem(text, key)
+            self.combo_rec_cam.setItemData(self.combo_rec_cam.count() - 1, tip, QtCore.Qt.ToolTipRole)
+        self.combo_rec_cam.setToolTip("녹화만 이 카메라로 찍습니다. 화면은 그대로 둡니다.")
+        self.spin_rec_secs = QtWidgets.QDoubleSpinBox()
+        self.spin_rec_secs.setRange(0.0, 3600.0); self.spin_rec_secs.setDecimals(0)
+        self.spin_rec_secs.setSingleStep(5.0); self.spin_rec_secs.setSuffix(" 초")
+        self.spin_rec_secs.setSpecialValueText("수동 정지")
+        self.spin_rec_secs.setToolTip("0 이면 다시 누를 때까지 계속 녹화합니다.")
+        g2 = QtWidgets.QGridLayout(); g2.setHorizontalSpacing(SP[1])
+        g2.addWidget(FieldRow("카메라", self.combo_rec_cam, ""), 0, 0)
+        g2.addWidget(FieldRow("길이", self.spin_rec_secs, ""), 0, 1)
+        card.add(g2)
+
+        self.chk_rec_overlay = QtWidgets.QCheckBox("오버레이 포함 (LiDAR 점·레이싱 라인·차량 라벨)")
+        self.chk_rec_overlay.setChecked(True)
+        self.chk_rec_overlay.setToolTip("끄면 주행만 담긴 깨끗한 영상이 됩니다. 화면 표시는 그대로입니다.")
+        card.add(self.chk_rec_overlay)
+
+        self.combo_rec_enc = QtWidgets.QComboBox()
+        for key in REC.ENCODERS:
+            self.combo_rec_enc.addItem(REC.ENCODER_LABEL[key], key)
+        self.combo_rec_enc.setToolTip(
+            "자동: GPU 인코더(h264_nvenc)가 실제로 되는 기계면 그걸 쓰고, 안 되면 libx264 로 돌아갑니다.\n"
+            "어느 쪽이 쓰였는지는 끝난 파일 줄에 적힙니다. 렌더링은 세션이 쓰는 GL 그대로입니다.")
+        card.add(FieldRow("인코더", self.combo_rec_enc, ""))
+
+        self.btn_record = PendingToggle("● 녹화 시작")
+        self.btn_record.setToolTip("3D 화면을 mp4 로 저장합니다.  (R)")
+        self.btn_record.requested.connect(lambda _want: self._on_record_toggle())
+        card.add_header(self.btn_record)
+        self.record_note = label("", "hint")
+        self.record_note.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+        self.record_note.setOpenExternalLinks(False)
+        self.record_note.linkActivated.connect(self._on_open_video)
+        card.add(self.record_note)
+        if not REC.ffmpeg_available():
+            self.btn_record.setEnabled(False)
+            self.record_note.setText("ffmpeg 이 없어 녹화할 수 없습니다 (apt install ffmpeg).")
+        #: The recording in progress, and a 4 Hz timer that shows how it is going and stops it when
+        #: the requested length is reached. The recorder itself is driven by the viewport's paint.
+        self._recorder = None
+        self._rec_timer = QtCore.QTimer(self)
+        self._rec_timer.setInterval(250)
+        self._rec_timer.timeout.connect(self._record_tick)
+        self._last_video = ""
+        return card
+
+    # ---------------------------------------------------------------- recording
+    def record_settings(self) -> "REC.RecordSpec":
+        """The form as a spec, with the path filled in from the map and the clock."""
+        w, h = self.combo_res.currentData() or (1280, 720)
+        spec = REC.RecordSpec(path="", width=int(w), height=int(h),
+                              fps=int(self.combo_fps.currentData() or 30),
+                              camera=str(self.combo_rec_cam.currentData() or ""),
+                              overlays=self.chk_rec_overlay.isChecked(),
+                              seconds=float(self.spin_rec_secs.value()),
+                              encoder=str(self.combo_rec_enc.currentData() or "auto"))
+        spec = spec.resolved(self.viewport.fb_size())
+        import dataclasses
+        import os
+        name = os.path.basename(REC.default_video_path(self._running_scenario()))
+        folder = self.edit_record.text().strip() or REC.VIDEO_DIR
+        return dataclasses.replace(spec, path=os.path.join(os.path.expanduser(folder), name))
+
+    def _running_scenario(self) -> str:
+        f = self._running_facts or {}
+        return str(f.get("scenario") or f.get("map") or self._scenario() or "f1sim")
+
+    @property
+    def recording(self) -> bool:
+        return self._recorder is not None
+
+    def _on_record_dir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "녹화 저장 폴더", self.edit_record.text().strip() or REC.VIDEO_DIR)
+        if d:
+            self.edit_record.setText(d)
+
+    def _on_record_toggle(self):
+        if self._recorder is not None:
+            self._stop_recording("수동 정지")
+            return
+        if self.state not in (STATE_RUNNING, STATE_PAUSED):
+            self.record_note.setText("세션이 돌고 있을 때만 녹화할 수 있습니다.")
+            self.btn_record.settle(False)
+            return
+        spec = self.record_settings()
+        rec = REC.VideoRecorder(spec)
+        if not rec.ok:
+            self.record_note.setObjectName("HintWarn")
+            self.record_note.setText(rec.error or "녹화를 시작할 수 없습니다.")
+            self.btn_record.settle(False)
+            return
+        self._recorder = rec
+        self.viewport.start_recording(rec)
+        self.viewport.notify(f"● 녹화 시작 — {os.path.basename(spec.path)}", "danger")
+        # The progress line lives inside the fold; open it so a recording in progress is visible.
+        if hasattr(self, "record_fold"):
+            self.record_fold.toggle.setChecked(True)
+        self._rec_timer.start()
+        self.btn_record.setText("■ 녹화 중지")
+        self.btn_record.settle(True)
+        self.record_note.setObjectName("Hint")
+        self.record_note.setText(f"녹화 중 — {os.path.basename(spec.path)}")
+        self._update_rec_badge()
+
+    def _stop_recording(self, why: str = ""):
+        rec, self._recorder = self._recorder, None
+        self.viewport.stop_recording()
+        self._rec_timer.stop()
+        self.btn_record.setText("● 녹화 시작")
+        self.btn_record.settle(False)
+        self._update_rec_badge()
+        if rec is None:
+            return
+        rec.stop()
+        self._last_video = rec.spec.path
+        kind = "HintWarn" if rec.error else "Hint"
+        self.record_note.setObjectName(kind)
+        if rec.error:
+            self.record_note.setText(rec.summary())
+        else:
+            self.record_note.setText(f"{rec.summary()}   <a href='#open'>열기</a>")
+        self.record_note.style().unpolish(self.record_note)
+        self.record_note.style().polish(self.record_note)
+        self.status_text.setText(f"녹화 저장: {rec.spec.path}" + (f" ({why})" if why else ""))
+        self.viewport.notify(("녹화 오류 — " + (rec.error or "")) if rec.error
+                             else f"■ 녹화 저장 — {os.path.basename(rec.spec.path)}",
+                             "danger" if rec.error else "good")
+
+    def _record_tick(self):
+        rec = self._recorder
+        if rec is None:
+            return
+        if rec.error:
+            self._stop_recording("오류")
+            return
+        drops = f" · 버린 프레임 {rec.dropped}" if rec.dropped else ""
+        self.record_note.setText(f"녹화 중 {rec.duration:.1f}초 · {rec.written}프레임{drops}")
+        if rec.spec.seconds and rec.duration >= rec.spec.seconds:
+            self._stop_recording(f"{rec.spec.seconds:.0f}초 도달")
+
+    def _on_open_video(self, _href: str = ""):
+        if not self._last_video or not os.path.isfile(self._last_video):
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_video))
+
+    def _update_rec_badge(self):
+        """The header says so while a clip is being written. It is a file being created on someone's
+        disk; a UI that does that silently is a UI that fills a disk silently."""
+        if hasattr(self, "header_rec"):
+            self.header_rec.setVisible(self.recording)
 
     # ---------------------------------------------------------------- centre: the picture
     def _build_centre(self) -> QtWidgets.QWidget:
@@ -537,6 +774,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
         _, h = group()
 
+        def sep():
+            line = QtWidgets.QFrame()
+            line.setObjectName("BarSep")
+            line.setFrameShape(QtWidgets.QFrame.VLine)
+            line.setFixedWidth(1)
+            return line
+
         self.btn_pause = PendingToggle("일시정지")
         self.btn_pause.setToolTip("시뮬레이션을 멈춥니다. 화면과 조작은 계속 살아 있습니다.  (Space)")
         self.btn_pause.requested.connect(self._on_pause_requested)
@@ -553,6 +797,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         h.addWidget(self.btn_stop)
 
         _, h = group()
+        h.addWidget(sep())
         h.addWidget(label("카메라", "field"))
         self.camera_buttons = SegmentedButtons(CAMERA_MODES)
         self.camera_buttons.set_current("overview")
@@ -560,6 +805,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         h.addWidget(self.camera_buttons)
 
         _, h = group()
+        h.addWidget(sep())
         h.addWidget(label("주시 차량", "field"))
         self.btn_focus_prev = QtWidgets.QPushButton("◀")
         self.btn_focus_prev.setFixedWidth(32)
@@ -580,9 +826,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         _, h = group()
         self.btn_shot = QtWidgets.QPushButton("스크린샷")
         self.btn_shot.setObjectName("GhostButton")
-        self.btn_shot.setToolTip("현재 3D 화면을 PNG로 저장합니다.  (S)")
+        h.addWidget(sep())
+        self.btn_shot.setToolTip("3D 화면을 PNG로 저장합니다. 왼쪽 '녹화' 카드의 해상도로 찍습니다.  (S)")
         self.btn_shot.clicked.connect(self._on_screenshot)
         h.addWidget(self.btn_shot)
+        # The same action as the card's button, within reach of the picture it films.
+        self.btn_record_bar = QtWidgets.QPushButton("● 녹화")
+        self.btn_record_bar.setObjectName("GhostButton")
+        self.btn_record_bar.setToolTip("녹화 시작 / 중지. 설정은 왼쪽 '녹화' 카드에 있습니다.  (R)")
+        self.btn_record_bar.clicked.connect(self._on_record_toggle)
+        h.addWidget(self.btn_record_bar)
         v.addWidget(bar)
 
         # -- policy panels, foldable so they never crowd the picture
@@ -649,6 +902,15 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v.addWidget(self.policy_scroll)
         self.viewport.setMinimumHeight(240)
         return centre
+
+    #: The setup sidebar's width. `PANEL_W_SLOTS` is what it grows to while the 상대차 table has
+    #: rows: ten fixed-width columns do not fit 420 px, and a table one column wide is a table
+    #: nobody can read. It only grows when there is a table, and only while the window has the room
+    #: (`_panel_width`), so a narrow screen keeps the picture.
+    PANEL_W = 420
+    PANEL_W_SLOTS = 640
+    #: What the 3D view keeps when the sidebar grows for the table.
+    CENTRE_MIN_W = 600
 
     #: Below this width the two sidebars leave the 3D view too small to drive by, so the setup
     #: sidebar -- which is only needed between sessions -- folds away once a session is running.
@@ -724,6 +986,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         def run():
             self._cap_queued = False
             self._cap_policy_panel()
+            # Widths are only real after the layout pass, and the sidebar's width depends on the
+            # splitter's: asking for it inside `resizeEvent` reads zeros on the first show.
+            self._apply_panel_width()
 
         QtCore.QTimer.singleShot(0, run)
 
@@ -741,6 +1006,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.policy_fold.toggle.setChecked(False)
             self._policy_autofold_done = True
         self._cap_policy_panel()
+        self._apply_panel_width()
         driving = self.state in (STATE_RUNNING, STATE_PAUSED)
         if (not self._sidebar_autofold_done and driving and self.width() < self.NARROW_W
                 and self.btn_left_panel.isChecked()):
@@ -748,6 +1014,36 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self._sidebar_autofold_done = True
             self.status_text.setText(
                 "창이 좁아 설정 패널을 접었습니다. 위의 '설정 패널' 버튼으로 다시 펼 수 있습니다.")
+
+    def _apply_panel_width(self):
+        """Widen the setup sidebar while the 상대차 table has rows, if the window can spare it.
+
+        The table is ten fixed-width columns; at the sidebar's usual 330 px three of them are
+        visible and the rest is a horizontal scrollbar, which is not a table anyone can read. So the
+        sidebar grows when there is a table to show and shrinks back when there is not -- and only
+        while the window is wide enough that the 3D view keeps 900 px, because the picture is what
+        the page is for. A splitter the user has dragged wider than this is left alone.
+        """
+        if not hasattr(self, "_left_wrap") or not hasattr(self, "opp_table"):
+            return
+        want = self.PANEL_W
+        showing_slots = self.row_opp.isVisible() and self.opp_table.count()
+        if showing_slots and self.width() >= self.NARROW_W:
+            want = min(self.PANEL_W_SLOTS, max(self.PANEL_W, self.width() - 900))
+        self._left_wrap.setMaximumWidth(want)
+        self._left_scroll.setMaximumWidth(want)
+        if self._panel_nudged_for == want or not self.isVisible():
+            # Already offered this width once (a later drag is the user's), or the window has not
+            # been laid out yet -- a splitter re-distributes on first show, so a nudge before that
+            # is simply discarded.
+            return
+        sizes = self.splitter.sizes()
+        if len(sizes) != 3 or not sizes[0] or sizes[1] <= 0:
+            return
+        self._panel_nudged_for = want
+        delta = min(want - sizes[0], max(0, sizes[1] - self.CENTRE_MIN_W))
+        if delta > 0:
+            self.splitter.setSizes([sizes[0] + delta, sizes[1] - delta, sizes[2]])
 
     # ---------------------------------------------------------------- right: is this real
     def _build_right(self) -> QtWidgets.QWidget:
@@ -774,6 +1070,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.drive_info.set("시뮬 참값 μ", "—",
                             tooltip="시뮬레이터가 이 차에 실제로 적용한 마찰계수입니다. 정책이 "
                                     "관측할 수 없는 값이며, 추정치가 아니라 참값입니다.")
+        self.drive_info.set("추정 μ", "추정 대기",
+                            tooltip="센서 기반 추정의 q50(중앙값)과 컨트롤러에 적용한 보수적 상한 "
+                                    "used_mu입니다. 시뮬 참값 μ와 다를 수 있습니다.")
         drive.add(self.drive_info)
         v.addWidget(drive)
 
@@ -917,7 +1216,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         sc("Ctrl+.", drive_only(lambda: self.btn_stop.click() if self.btn_stop.isEnabled() else None))
         sc("Ctrl+F", drive_only(lambda: self.map_list.search.setFocus(QtCore.Qt.ShortcutFocusReason)))
         sc("S", drive_only(lambda: self._on_screenshot()))
+        sc("R", drive_only(lambda: self._on_record_toggle()))
         sc("F1", self.show_help)
+        sc("H", drive_only(self.show_help))
 
     # ================================================================ data in
     def set_runs(self, runs: List[RunInfo]):
@@ -947,6 +1248,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             for g in names:
                 self.map_group.addItem(f"{g}  ({len(cat.groups[g])})", g)
             self.map_group.setEnabled(True)
+            # Land on the biggest group rather than whatever sorted first: an empty list is the
+            # console's least useful first impression, and 내 환경 is empty until someone draws one.
+            best = max(range(self.map_group.count()),
+                       key=lambda i: len(cat.groups.get(self.map_group.itemData(i) or "", ())),
+                       default=-1)
+            if best >= 0:
+                self.map_group.setCurrentIndex(best)
         self.map_group.blockSignals(False)
         self._refresh_map_list()
         if self._pref_map and cat.ready and self._pref_map in set(cat.ids()):
@@ -1035,6 +1343,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         preparing = state == STATE_PREPARING
 
         self.btn_start.setEnabled(state in (STATE_IDLE, STATE_FAILED) and self._can_start())
+        self._update_start_hint()
         self.btn_cancel.setEnabled(preparing)
         self.btn_pause.setEnabled(running)
         self.btn_reset.setEnabled(running)
@@ -1043,14 +1352,22 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_focus_prev.setEnabled(running)
         self.btn_focus_next.setEnabled(running)
         self.btn_shot.setEnabled(running or preparing)
+        if hasattr(self, "btn_record"):
+            can_record = running and REC.ffmpeg_available()
+            self.btn_record.setEnabled(can_record or self.recording)
+            self.btn_record_bar.setEnabled(can_record or self.recording)
+            if self.recording and not running:
+                # The session is gone; nothing will paint another frame into the clip. Close it
+                # rather than leave a file that silently stopped growing.
+                self._stop_recording("세션 종료")
         self.btn_mu_apply.setEnabled(running)
 
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
-                  self.spin_cap, self.chk_compile, self.chk_dr, self.chk_stoch, self.combo_opponent,
-                  self.combo_device, self.combo_ros,
-                  self.seg_direction, self.combo_obstacle):
+                  self.spin_cap, self.chk_dr, self.chk_stoch, self.opp_table, self.combo_device,
+                  self.combo_ros,
+                  self.seg_direction, self.combo_obstacle, self.chk_bare_first):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
         # The seed row follows the obstacle choice, not the session state: 다시 뽑기 is exactly the
         # control you want while something is running, and it restarts the session itself.
@@ -1078,7 +1395,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.viewport.set_badge("")
 
         if state == STATE_IDLE:
-            self.status_text.setText("대기 — 런과 맵을 고르고 시작을 누르세요.")
+            self._update_start_hint()
             self.btn_pause.settle(False)
             self.viewport.set_empty_text("맵과 정책 런을 고르고 <b>시작</b>을 누르세요.")
         elif preparing:
@@ -1146,13 +1463,22 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         summary = f"{run}  ·  {mp}  ·  {races}레이스 × {grid}대 = {cars}대"
         if shown < cars:
             summary += f" (화면 {shown}대)"
+        obs = facts.get("obstacle_text") or ""
+        if obs:
+            n_props = int(facts.get("authored_props") or 0)
+            summary += f"  ·  장애물 {obs}" + (f" ({n_props}개)" if n_props else "")
+        mix = facts.get("opponent_mix") or ""
+        if grid > 1 and mix:
+            summary += f"  ·  상대차 {mix}"
         summary += f"  ·  {device}  ·  세션 #{self.generation}"
         ros = facts.get("ros2")
         if ros:
             summary += "  ·  ROS2 " + ("/drive 제어" if ros.get("mode") == "drive" else "발행")
         self.header_summary.setText(summary)
         self.header_summary.setToolTip(
-            f"{facts.get('scenario_display') or ''}\n로더 이름: {facts.get('map_legacy') or mp}".strip())
+            "\n".join([f"{facts.get('scenario_display') or ''}",
+                        f"로더 이름: {facts.get('map_legacy') or mp}"]
+                       + list(facts.get("opponent_slot_lines") or [])).strip())
         self.combo_focus.blockSignals(True)
         self.combo_focus.clear()
         for cid in self._session_ids[:shown]:
@@ -1164,6 +1490,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.policy_panel.fov = float((facts.get("lidar") or {}).get("fov", 4.71238898))
         self.policy_panel.range_max = float((facts.get("lidar") or {}).get("range_max", 10.0))
         self.dash_panel.v_max = float(facts.get("v_max_policy", 8.0) or 8.0)
+        self.dash_panel.clear_grip_estimate()
+        self.drive_info.set("추정 μ", "추정 대기")
         self.viewport.set_corner_text(f"{mp}\n{run}")
         self._update_running_note()
 
@@ -1179,6 +1507,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 tile.set_unknown()
         else:
             f = int(frame.get("focus", 0))
+            self.dash_panel.set_focus(f)
+            self.dash_panel.set_grip_estimate(frame.get("grip_estimate"))
             n = int(frame.get("n", 0))
             if 0 <= f < n:
                 self.m_speed.set_value(f"{float(frame['vx'][f]):5.2f}")
@@ -1192,6 +1522,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 self.drive_info.set("랩 진행", f"{float(frame['s'][f]):.1f} m")
                 mu = frame.get("mu")
                 self.drive_info.set("시뮬 참값 μ", f"{float(mu):.3f}" if mu is not None else "—")
+                self.drive_info.set("추정 μ", self.dash_panel.grip_status)
             crashed = int((frame["coll"] > 0.5).sum()) if frame.get("coll") is not None else 0
             self.m_coll.set_value(f"{crashed} / {n}", C["danger"] if crashed else None)
 
@@ -1303,6 +1634,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_mu_apply.ack()
         self._pending.pop("set_mu", None)
         self.status_text.setText(f"노면 마찰: {'고정 μ=' + format(mu, '.3f') if mode == 'fixed' else '랜덤 (리셋마다 다시 뽑음)'} — 모든 차량에 적용됨")
+        self.viewport.notify(f"노면 마찰 μ = {mu:.3f}" if mode == "fixed" else "노면 마찰: 랜덤", "good")
 
     def show_dial(self, mu: Optional[float]):
         """The running checkpoint's dial, or None when it has no conditioning input."""
@@ -1319,6 +1651,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._pending.pop("set_dial", None)
         if mu is not None:
             self.status_text.setText(f"그립 다이얼: 정책이 μ={mu:.3f} 만큼의 그립을 쓰도록 지시받았습니다")
+            self.viewport.notify(f"그립 다이얼 = {mu:.3f}", "good")
 
     def _on_dial_apply(self):
         self.btn_dial_apply.mark_pending()
@@ -1347,6 +1680,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.right_panel.setVisible(drive and self.btn_right_panel.isChecked())
         self.training.set_active(key == "train")
         self.editor.set_active(key == "edit")
+        if self.state == STATE_IDLE and hasattr(self, "status_text"):
+            if drive:
+                self._update_start_hint()
+            elif key == "train":
+                self.status_text.setText("학습 — 설정을 고르고 '학습 시작'을 누르세요.")
+            else:
+                self.status_text.setText("환경 — 새로 만들거나 목록에서 고르세요.")
 
     def current_mode(self) -> str:
         for k, i in self.MODE_INDEX.items():
@@ -1376,7 +1716,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                          "family_label": tracks.FAMILY_LABEL["scene"],
                                          "display": f"{tid.split('/', 1)[1]} (에디터)",
                                          "legacy": f"scene:{tid.split('/', 1)[1]}", "note": "",
-                                         "obstacles": list(tracks.OBSTACLES_BY_FAMILY["scene"])})
+                                         "obstacles": list(tracks.OBSTACLES_BY_FAMILY["scene"]),
+                                         "props": tracks.scene_props(tid) or 0})
         return MapCatalog(groups=groups, entries=entries, ready=cat.ready, error=cat.error)
 
     def _scenes_changed_from_editor(self):
@@ -1414,7 +1755,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if not self.run_list.select(run_name):
             pass
         self._selected_run = ckpt_path
-        self.sel_run.setText(f"런: {run_name}/{os.path.basename(ckpt_path)}")
+        self.sel_run.setText(f"런: {self._run_label(ckpt_path)}")
         self.sel_run.setToolTip(ckpt_path)
         self._update_selection_note()
         self._update_start_enabled()
@@ -1468,25 +1809,69 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         text = STAGE_TEXT.get(self._stage, self._stage) if self._stage else "시작 준비 중"
         here = f" · 이 단계 {time.monotonic() - self._stage_since:.0f}초" if self._stage_since else ""
         note = f" · {self._stage_note}" if self._stage_note else ""
-        hint = ""
-        if self._stage == "compile" and total > 20:
-            # the one stage that legitimately takes minutes, and the only one worth explaining
-            hint = ("  torch.compile 사전 컴파일은 몇 분이 걸릴 수 있습니다. "
-                    "'고급 설정 > torch.compile 사전 컴파일' 을 끄면 즉시 시작합니다 — "
-                    "끈 상태에서도 CUDA 그래프는 1초 남짓에 캡처되어 그대로 쓰입니다.")
-        self.status_text.setText(f"준비 중 {total:.0f}초 — {text}{note}{here}.  취소할 수 있습니다.{hint}")
+        self.status_text.setText(f"준비 중 {total:.0f}초 — {text}{note}{here}.  취소할 수 있습니다.")
 
     # ================================================================ user actions
+    def _start_blocker(self) -> str:
+        """Why 시작 is not available, in one short phrase, or "" when it is."""
+        if not self._selected_run and not self._selected_map:
+            return "① 정책 런과 ② 맵을 고르세요."
+        if not self._selected_run:
+            return "① 정책 런을 고르세요."
+        if not self._selected_map:
+            return "② 맵을 고르세요."
+        if hasattr(self, "opp_table") and self.spin_grid.value() > 1 \
+                and self.opp_table.problem(self.spin_grid.value()):
+            return "고급 설정의 상대차 표를 먼저 고치세요."
+        return ""
+
     def _can_start(self) -> bool:
-        return bool(self._selected_run and self._selected_map)
+        if not (self._selected_run and self._selected_map):
+            return False
+        # A slot table that names a checkpoint the loader will refuse is a start that fails after a
+        # minute of loading. The table already knows; the button asks it.
+        if hasattr(self, "opp_table") and self.spin_grid.value() > 1:
+            return not self.opp_table.problem(self.spin_grid.value())
+        return True
+
+    def _update_start_hint(self):
+        """The line above 시작, and the idle status bar, which must never say different things.
+
+        The status bar is left alone unless the console is idle: while a session is preparing,
+        running or failed it is carrying that, and a message about what to pick next would be
+        talking over it.
+        """
+        if not hasattr(self, "start_hint"):
+            return
+        if self.state in (STATE_RUNNING, STATE_PAUSED):
+            self.start_hint.setText("시작을 다시 누르면 지금 고른 설정으로 새로 시작합니다.")
+            return
+        blocker = self._start_blocker()
+        self.start_hint.setText(blocker or "준비됐습니다. 시작을 누르세요.")
+        if (self.state == STATE_IDLE and hasattr(self, "status_text")
+                and self.current_mode() == "drive"):
+            self.status_text.setText(f"대기 — {blocker}" if blocker else "대기 — 준비됐습니다.")
 
     def _update_start_enabled(self):
         if self.state in (STATE_IDLE, STATE_FAILED):
             self.btn_start.setEnabled(self._can_start())
+        self._update_start_hint()
+
+    @staticmethod
+    def _run_label(ckpt_path: str) -> str:
+        """`spec_korea_s904 / ppo_latest.pt` from the checkpoint's absolute path.
+
+        The run directory and the file are the two things that identify a policy; the rest of the
+        path is the same for every row in the list, and printing it wraps the card onto two lines
+        and hides the name at the end of the first.
+        """
+        d, f = os.path.split(ckpt_path)
+        run = os.path.basename(d) or ckpt_path
+        return f"{run} / {f}" if f else run
 
     def _on_run_selected(self, name: str):
         self._selected_run = name
-        self.sel_run.setText(f"런: {name}")
+        self.sel_run.setText(f"런: {self._run_label(name)}")
         self.sel_run.setToolTip(name)
         self._update_selection_note()
         self._update_start_enabled()
@@ -1507,20 +1892,45 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         version of this that wastes a checkpoint load.
         """
         tid = self._selected_map or ""
-        allowed = self.maps.obstacle_options(tid) if tid else list(tracks.OBSTACLES)
+        allowed = tracks.asset_obstacle_options(tid) if tid and tracks.is_spec(tid) else list(tracks.ASSET_OBSTACLES)
+        n_props = self.maps.authored_props(tid) if tid else 0
         want = str(self.combo_obstacle.currentData() or "")
         self.combo_obstacle.blockSignals(True)
         self.combo_obstacle.clear()
-        for o in tracks.OBSTACLES:
-            if o in allowed:
-                self.combo_obstacle.addItem(tracks.OBSTACLE_LABEL[o], o)
+        for o in tracks.ASSET_OBSTACLES:
+            if o not in allowed:
+                continue
+            self.combo_obstacle.addItem(self._obstacle_label(o, n_props), o)
+            i = self.combo_obstacle.count() - 1
+            self.combo_obstacle.setItemData(i, tracks.ASSET_PLACEMENT_HINT[o], QtCore.Qt.ToolTipRole)
+            if o == tracks.BARE and not n_props:
+                # Listed and greyed rather than hidden: "this map has nothing placed on it" is an
+                # answer, and hiding the entry would make 기본 look like the only thing there is.
+                self.combo_obstacle.setItemData(i, 0, QtCore.Qt.UserRole - 1)
+                self.combo_obstacle.setItemData(i, "이 맵은 배치 장애물이 없음 — '기본'과 같습니다.",
+                                                QtCore.Qt.ToolTipRole)
         i = self.combo_obstacle.findData(want)
+        if i >= 0 and want == tracks.BARE and not n_props:
+            i = self.combo_obstacle.findData("")        # the map changed under a now-meaningless 없음
         self.combo_obstacle.setCurrentIndex(i if i >= 0 else 0)
         self.combo_obstacle.blockSignals(False)
+        self._n_props = int(n_props)
         if len(allowed) < len(tracks.OBSTACLES):
             self.row_obstacle.set_hint(
                 f"이 계열은 '{'/'.join(tracks.OBSTACLE_LABEL[o] for o in allowed if o)}' 만 지원합니다.",
                 "hint")
+
+    @staticmethod
+    def _obstacle_label(kind: str, n_props: int) -> str:
+        """The combo's text. The counts are the whole point: 기본 on a scene with three boxes has to
+        say so, or it is the same silent claim 없음 used to make."""
+        if not n_props:
+            return tracks.ASSET_PLACEMENT_LABEL[kind]
+        if kind == "":
+            return f"{tracks.OBSTACLE_LABEL['']} (배치된 장애물 {n_props}개)"
+        if kind == tracks.BARE:
+            return f"{tracks.OBSTACLE_LABEL[tracks.BARE]} (배치 장애물 제거)"
+        return tracks.ASSET_PLACEMENT_LABEL[kind]
 
     def _scenario(self) -> str:
         """The selection and the three controls as one spec string. `#<kind>:*` when the seed is
@@ -1533,19 +1943,36 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if d:
             spec += f"@{d}"
         o = str(self.combo_obstacle.currentData() or "")
-        if o:
-            seed = "*" if str(self.combo_seed.currentData()) == "random" else str(self.spin_seed.value())
-            spec += f"#{o}:{seed}"
-        return spec
+        bare = o == tracks.BARE or (o and self.chk_bare_first.isChecked())
+        family = "" if o == tracks.BARE else o
+        choice = tracks.obstacle_choice(bool(bare), family)
+        if choice:
+            spec += f"#{choice}"
+            if family:                        # `bare` alone places nothing, so it takes no seed
+                seed = "*" if str(self.combo_seed.currentData()) == "random" else str(self.spin_seed.value())
+                spec += f":{seed}"
+        return tracks.asset_scenario(spec)
 
     def _on_scenario_changed(self):
         o = str(self.combo_obstacle.currentData() or "")
-        self.row_obstacle.set_hint(tracks.OBSTACLE_HINT.get(o, ""), "hint")
+        family = o and o != tracks.BARE
+        n_props = int(getattr(self, "_n_props", 0))
+        hint = tracks.ASSET_PLACEMENT_HINT.get(o, "")
+        if family:
+            hint = f"{hint} {tracks.OBSTACLE_ADDS_HINT}"
+        self.row_obstacle.set_hint(hint, "hint")
+        # The composition control only means something where there is something to remove and
+        # something being added on top of it.
+        self.chk_bare_first.setEnabled(bool(family) and n_props > 0)
+        if not family:
+            self.chk_bare_first.blockSignals(True)
+            self.chk_bare_first.setChecked(o == tracks.BARE)
+            self.chk_bare_first.blockSignals(False)
         random_seed = str(self.combo_seed.currentData()) == "random"
         for w in (self.combo_seed, self.btn_reroll):
-            w.setEnabled(bool(o))
-        self.spin_seed.setEnabled(bool(o) and not random_seed)
-        self.btn_reroll.setEnabled(bool(o) and random_seed)
+            w.setEnabled(bool(family))
+        self.spin_seed.setEnabled(bool(family) and not random_seed)
+        self.btn_reroll.setEnabled(bool(family) and random_seed)
         spec = self._scenario()
         self.scenario_line.setText(spec)
         try:
@@ -1600,6 +2027,25 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.row_grid.set_hint(f"같은 트랙에서 {grid}대가 겨룹니다. 상대차는 스캔에도 잡힙니다.", "hint")
         else:
             self.row_grid.reset_hint()
+        # The table is the other cars, so its height is the grid minus the learner. Rows already
+        # filled in survive a change: raising the count from 2 to 3 adds a row, it does not reset
+        # the two that were configured.
+        if hasattr(self, "opp_table"):
+            self.opp_table.set_count(max(0, grid - 1))
+            self.row_opp.setVisible(grid > 1)
+            self._queue_panel_cap()
+            self._on_slots_changed()
+
+    def _on_slots_changed(self):
+        """Show the table's own objection on the field row, and keep 시작 honest about it."""
+        if not hasattr(self, "opp_table"):
+            return
+        problem = self.opp_table.problem(self.spin_grid.value()) if self.spin_grid.value() > 1 else ""
+        if problem:
+            self.row_opp.set_hint(problem, "warn")
+        else:
+            self.row_opp.reset_hint()
+        self._update_start_enabled()
 
     # ---------------------------------------------------------------- remembered settings
     def collect_prefs(self) -> dict:
@@ -1615,16 +2061,28 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "cars_per_race": int(self.spin_grid.value()),
             "speed_cap": float(self.spin_cap.value()),
             "device": self.combo_device.currentText(),
-            "compile": bool(self.chk_compile.isChecked()),
             "randomize": bool(self.chk_dr.isChecked()),
             "stochastic": bool(self.chk_stoch.isChecked()),
-            "opponent": self.combo_opponent.currentText(),
+            "bare_first": bool(self.chk_bare_first.isChecked()),
             "mu_mode": str(self.combo_mu.currentData() or "random"),
             "mu": float(self.spin_mu.value()),
             "dial": float(self.spin_dial.value()),
             "ros2": str(self.combo_ros.currentData() or "off"),
             "saliency": bool(self.chk_saliency.isChecked()),
             "internals": bool(self.chk_internals.isChecked()),
+            # The recording form, and which folds were left open. Both are things a person sets
+            # once and expects to find the way they left them -- which was the complaint that got
+            # any of this remembered in the first place.
+            "record_dir": self.edit_record.text().strip(),
+            "record_res": int(self.combo_res.currentIndex()),
+            "record_fps": int(self.combo_fps.currentData() or 30),
+            "record_camera": str(self.combo_rec_cam.currentData() or ""),
+            "record_seconds": float(self.spin_rec_secs.value()),
+            "record_overlay": bool(self.chk_rec_overlay.isChecked()),
+            "record_encoder": str(self.combo_rec_enc.currentData() or ""),
+            "fold_record": bool(self.record_fold.toggle.isChecked()),
+            "fold_advanced": bool(self.adv_fold.toggle.isChecked()),
+            "fold_checkpoint": bool(self.ckpt_fold.toggle.isChecked()),
         }
 
     def apply_prefs(self, p: dict) -> None:
@@ -1679,16 +2137,31 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.spin_grid.setValue(int(v)), "cars_per_race")
         attempt(lambda v: self.spin_cap.setValue(float(v)), "speed_cap")
         attempt(combo_text(self.combo_device), "device")
-        attempt(lambda v: self.chk_compile.setChecked(bool(v)), "compile")
         attempt(lambda v: self.chk_dr.setChecked(bool(v)), "randomize")
         attempt(lambda v: self.chk_stoch.setChecked(bool(v)), "stochastic")
-        attempt(combo_text(self.combo_opponent), "opponent")
+        attempt(lambda v: self.chk_bare_first.setChecked(bool(v)), "bare_first")
         attempt(combo_data(self.combo_mu), "mu_mode")
         attempt(lambda v: self.spin_mu.setValue(float(v)), "mu")
         attempt(lambda v: self.spin_dial.setValue(float(v)), "dial")
         attempt(combo_data(self.combo_ros), "ros2")
         attempt(lambda v: self.chk_saliency.setChecked(bool(v)), "saliency")
         attempt(lambda v: self.chk_internals.setChecked(bool(v)), "internals")
+        attempt(lambda v: self.edit_record.setText(str(v or "")), "record_dir")
+        attempt(lambda v: self.combo_res.setCurrentIndex(int(v))
+                if 0 <= int(v) < self.combo_res.count() else None, "record_res")
+        def restore_fps(value):
+            i = self.combo_fps.findData(int(value))
+            if i >= 0:
+                self.combo_fps.setCurrentIndex(i)
+
+        attempt(restore_fps, "record_fps")
+        attempt(combo_data(self.combo_rec_cam), "record_camera")
+        attempt(lambda v: self.spin_rec_secs.setValue(float(v)), "record_seconds")
+        attempt(lambda v: self.chk_rec_overlay.setChecked(bool(v)), "record_overlay")
+        attempt(combo_data(self.combo_rec_enc), "record_encoder")
+        attempt(lambda v: self.record_fold.toggle.setChecked(bool(v)), "fold_record")
+        attempt(lambda v: self.adv_fold.toggle.setChecked(bool(v)), "fold_advanced")
+        attempt(lambda v: self.ckpt_fold.toggle.setChecked(bool(v)), "fold_checkpoint")
 
     def save_prefs(self) -> None:
         from . import prefs
@@ -1707,16 +2180,29 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             cars_per_race=self.spin_grid.value(),
             speed_cap=float(self.spin_cap.value()),
             device=self.combo_device.currentText(),
-            compile=self.chk_compile.isChecked(),
+            compile=False,
             randomize=self.chk_dr.isChecked(),
             stochastic=self.chk_stoch.isChecked(),
-            opponent=self.combo_opponent.currentText(),
+            opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
+            opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),
+            controller=SessionConfig.controller,
+            estimator=SessionConfig.estimator,
             mu_mode=str(self.combo_mu.currentData() or "random"),
             mu=float(self.spin_mu.value()),
             ros2=str(self.combo_ros.currentData() or "off"),
             saliency=self.chk_saliency.isChecked(),
             internals=self.chk_internals.isChecked(),
             max_render_cars=MAX_RENDER_CARS,
+            # The recording settings travel with the session so a saved config reproduces the clip.
+            # They are excluded from `affects_simulation`, so changing one never restarts a run.
+            record_dir=self.edit_record.text().strip(),
+            record_width=int((self.combo_res.currentData() or (1280, 720))[0]),
+            record_height=int((self.combo_res.currentData() or (1280, 720))[1]),
+            record_fps=int(self.combo_fps.currentData() or 30),
+            record_camera=str(self.combo_rec_cam.currentData() or ""),
+            record_overlays=self.chk_rec_overlay.isChecked(),
+            record_seconds=float(self.spin_rec_secs.value()),
+            record_encoder=str(self.combo_rec_enc.currentData() or "auto"),
         )
 
     def _on_start(self):
@@ -1737,6 +2223,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def _on_reset(self):
         self.btn_reset.mark_pending()
         self._pending["reset"] = time.monotonic()
+        self.viewport.notify("리셋", "info", 1.4)
         self.reset_requested.emit()
 
     def _on_pause_requested(self, want_paused: bool):
@@ -1791,10 +2278,18 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                      "plan": self.chk_plan.isChecked()})
 
     def _on_screenshot(self):
-        import os
-        path = os.path.join(os.path.expanduser("~"), f"f1sim_{int(time.time())}.png")
-        ok = self.viewport.grab_png(path)
-        self.status_text.setText(f"스크린샷 저장: {path}" if ok else "스크린샷 실패 (GL 화면 없음)")
+        """A PNG of the 3D view, at the resolution the 녹화 card is set to.
+
+        The same offscreen render a recording uses, so a still and a frame of the clip are the same
+        picture -- and so a 1080p screenshot does not depend on how big the window happens to be.
+        """
+        spec = self.record_settings()
+        path = os.path.splitext(spec.path)[0] + ".png"
+        ok = self.viewport.grab_png(path, spec.width, spec.height)
+        self.status_text.setText(
+            f"스크린샷 저장: {path} ({spec.width}×{spec.height})" if ok else "스크린샷 실패 (GL 화면 없음)")
+        if ok:
+            self._last_video = path
 
     def _show_error_detail(self):
         if not self._last_error:
@@ -1811,12 +2306,14 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             f"<tr><td style='padding:3px 14px 3px 0'><b>{k}</b></td><td style='padding:3px 0'>{v}</td></tr>"
             for k, v in [
                 ("Space", "일시정지 / 재개"),
+                ("H / F1", "이 도움말"),
                 ("1 – 5", "카메라 (전체보기 · 추격 · 위에서 · 궤도 · 근접)"),
                 ("[ , ]", "주시 차량 바꾸기"),
                 ("Ctrl+R", "리셋"),
                 ("Ctrl+.", "정지"),
                 ("Ctrl+F", "맵 검색으로 이동"),
                 ("S", "3D 화면 스크린샷"),
+                ("R", "녹화 시작 / 중지"),
                 ("드래그 / 휠", "궤도 카메라 회전 / 확대"),
                 ("환경 페이지", "V 선택 · B 덕트 · W 벽 · E 지우개 · L/K 선 · M 사각형 · P 다각형 · A 배치 · "
                            "Ctrl+Z/Y 되돌리기 · F 전체 보기 · 5 위에서 · 가운데/Alt+드래그 회전 · "

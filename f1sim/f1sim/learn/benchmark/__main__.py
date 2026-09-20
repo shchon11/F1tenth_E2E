@@ -141,8 +141,7 @@ def cmd_geometry(a) -> int:
             env = _build(map_id, envs=s.envs, race_size=1, seed=s.seeds[0], force_teacher=True)
 
             def drive(_obs, _env=env):
-                return _env.teacher.plan_action(_env.sim.state, _env.sim.P, _env.sim.tid,
-                                                _env.ecfg.v_max_policy, _env.tracker.spec)
+                return _env.teacher_label(_env.teacher)
             t0 = time.perf_counter()
             res = run_cell(env, drive, suite="S", n_steps=a.measure_steps, frozen=False)
             dt = time.perf_counter() - t0
@@ -382,16 +381,37 @@ def cmd_run(a) -> int:
         return 4
 
     from . import model_adapter as ma
-    model, extra = ma.load_actor(_entry_dict(entry), a.device)
-    policy = ma.policy_for(model)
+    from f1sim.params import VehicleParams
+    ed = _entry_dict(entry)
+    model, extra = ma.load_actor(ed, a.device)
+    policy = (ma.external_policy(model, extra["spec"], VehicleParams().s_max)
+              if ma.is_external(ed) else ma.policy_for(model))
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, f"{a.system.replace('/', '_')}.cells.jsonl")
     ident0 = suite_mod.protocol_identity(s, entry)
     by_id = {c.cell_id(): c for c in s.cells()}
     done = _resume(path, ident0, by_id, entry, suite_obj=s)
+    # `--only` selects which of the frozen suite's cells are executed and nothing else: the rows
+    # written are the rows an unfiltered run would write, cell for cell, and `protocol_identity` is
+    # untouched, so a filtered file resumes into a full one and vice versa. What it does NOT do is
+    # make a partial file a leaderboard row -- `report` still requires the suite's cells to be
+    # present, and a filtered run is a family table, not a score.
+    #
+    # It exists because a system may be *unscoreable* on part of the suite rather than merely
+    # expensive there: a policy trained with privileged opponent tokens (`f1sim.opp_token`) has no
+    # observation at all in a solo cell, and `model_adapter.build_cell` refuses to invent one.
+    want = set((a.only or "").split(",")) if a.only else None
+    cells = [c for c in s.cells()
+             if want is None or c.suite in want or f"{c.suite}:{c.variant}" in want]
+    if want is not None:
+        print(f"--only {a.only}: {len(cells)} of {len(s.cells())} cells; this file is a family "
+              f"table and not a leaderboard row", file=sys.stderr)
+        if not cells:
+            print(f"--only {a.only} selected no cell of this suite", file=sys.stderr)
+            return 2
     written = 0
     with open(path, "a") as fh:
-        for cell in s.cells():
+        for cell in cells:
             key = cell.cell_id()
             if key in done:
                 continue
@@ -479,10 +499,18 @@ def _entry_dict(entry) -> dict:
     """
     if isinstance(entry, dict):
         return entry
-    return {"path": entry.resolved(), "arm": entry.controller_arm,
-            "cross_runtime": bool(entry.cross_runtime),
-            "system_id": entry.system_id, "checkpoint_sha256": entry.checkpoint_sha256,
-            "estimator_path": entry.estimator_path, "estimator_sha256": entry.estimator_sha256}
+    d = {"path": entry.resolved(), "arm": entry.controller_arm,
+         "cross_runtime": bool(entry.cross_runtime),
+         "system_id": entry.system_id, "checkpoint_sha256": entry.checkpoint_sha256,
+         "estimator_path": entry.estimator_path, "estimator_sha256": entry.estimator_sha256}
+    if entry.options:
+        d["options"] = dict(entry.options)
+    if getattr(entry, "kind", None):
+        # An external published baseline. `weights` is the same resolved file as `path`; both are
+        # supplied so the adapter can be handed either spelling.
+        d.update({"kind": entry.kind, "weights": entry.resolved(),
+                  "options": dict(entry.options or {})})
+    return d
 
 
 def _obstacle_track_for(cell, suite_obj):
@@ -538,8 +566,14 @@ def _obstacle_track_for(cell, suite_obj):
     return [trk], rls, s_obs
 
 
-def _prepare(entry, extra, cell, suite_obj, device):
-    """One prepared cell via the adapter, with the frozen placement and declared spawn applied."""
+def _prepare(entry, extra, cell, suite_obj, device, allow_oracle: bool = False):
+    """One prepared cell via the adapter, with the frozen placement and declared spawn applied.
+
+    `allow_oracle` is forwarded and nothing in this module ever sets it: `run` scores the suite, and
+    a checkpoint that reads the other cars' true state out of the simulator does not produce a suite
+    row. It exists for a caller that is deliberately measuring an oracle arm on the same cells and
+    will label what it gets as one.
+    """
     from . import model_adapter as ma
     tracks = rls = None
     spawn = None
@@ -555,9 +589,10 @@ def _prepare(entry, extra, cell, suite_obj, device):
         tracks, rls, s_obs = _obstacle_track_for(cell, suite_obj)
         spawn = s_obs + suite_obj.s_start_offset_m
     prepared = ma.prepare_cell(_entry_dict(entry), extra, cell_d, adapter,
-                               device, tracks_override=tracks, racelines=rls, spawn_s_m=spawn)
+                               device, tracks_override=tracks, racelines=rls, spawn_s_m=spawn,
+                               allow_oracle=allow_oracle)
     router = None
-    if race_size > 1:
+    if race_size > 1 and prepared.env.tracker is not None:
         # AFTER the adapter: it installs the arm on the original tracker, and wrapping earlier would
         # hook the wrapper instead. Restored before `close()` so the adapter uninstalls the arm from
         # the object it installed it on.
@@ -568,6 +603,14 @@ def _prepare(entry, extra, cell, suite_obj, device):
         reference = PlanTracker(env.B, env.device, original.wb, original.s_max, original.v_max)
         router = RoutedTracker(candidate=original, reference=reference, env=env)
         env.tracker = router
+    elif race_size > 1:
+        # `direct` action mode: there is no tracker to route. That is not a gap in the protocol, it
+        # is the protocol being satisfied structurally -- `gym_env._opponent_actions` builds the
+        # teacher's command from the raceline and `teacher_action_to_normalized` (`:977-985`),
+        # touching nothing the candidate owns, so an external baseline cannot move its opponent even
+        # in principle. `RoutedTracker` exists only because the plan path pushes every car's plan
+        # through one tracker object; here there is none.
+        pass
     return prepared, s_obs, router
 
 
@@ -749,6 +792,10 @@ def main(argv=None) -> int:
     q.add_argument("--lease", action="store_true",
                    help="exclusive GPU access granted; without it `run` verifies and refuses")
     q.add_argument("--estimator", help="pinned frozen student for the independence gate")
+    q.add_argument("--only", help="comma-separated families or family:variant to run "
+                                  "(e.g. 'T' or 'T:pace'). Selects cells of the frozen suite and "
+                                  "changes nothing about how any of them is measured; the result "
+                                  "is a family table, not a leaderboard row.")
     q.add_argument("--gate-steps", type=int, default=60,
                    help="must exceed the estimator's warm_frames or the gate cannot cover warm")
 

@@ -16,12 +16,16 @@ def generate_launch_description():
         DeclareLaunchArgument("device", default_value="cuda"),
         DeclareLaunchArgument("randomize", default_value="true"),
         DeclareLaunchArgument("rviz", default_value="true"),
+        DeclareLaunchArgument("record", default_value="",
+                              description="directory for a rosbag2 of config/record.yaml's topics"),
     ]
     bridge = Node(package="f1sim_ros", executable="bridge", name="f1sim_bridge", output="screen",
                   parameters=[{"map_yaml": LaunchConfiguration("map_yaml"),
                                "random_track_seed": LaunchConfiguration("random_track_seed"),
                                "config_yaml": LaunchConfiguration("config_yaml"),
                                "device": LaunchConfiguration("device"),
+                               "record": LaunchConfiguration("record"),
+                               "record_profile": os.path.join(share, "config", "record.yaml"),
                                "randomize": LaunchConfiguration("randomize")}])
     rviz = Node(package="rviz2", executable="rviz2", arguments=["-d", os.path.join(share, "config", "sim.rviz")],
                 condition=IfCondition(LaunchConfiguration("rviz")))

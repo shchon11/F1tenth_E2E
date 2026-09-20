@@ -288,6 +288,17 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self._cam_eye = None
         self._cam_tgt = None
         self._spin = np.zeros(MAX_RENDER_CARS)
+        #: Offscreen capture target (`render_offscreen`), built on demand at the size asked for.
+        self._cap = None
+        self._cap_ms = None
+        self._cap_key: Optional[Tuple[int, int]] = None
+        #: Set by the console while a recording is running: (recorder, spec). Read at the end of
+        #: `paintGL`, which is the one place the context is current and a frame is in hand.
+        self.recorder = None
+        self._rec_next = 0.0
+        #: The frame the window actually drew last. A capture re-renders *that*, so a clip is the
+        #: session as it was watched rather than a second draw of whatever arrived in between.
+        self._last_drawn: Optional[dict] = None
         self._last_frame_t: Optional[float] = None
         self._trail_seq = -1
 
@@ -312,6 +323,26 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             f"border-radius: 3px; padding: 4px 8px; font-family: '{theme.MONO_FONT}', monospace;"
             f"font-size: {theme.SIZE['hint']}px;")
         self._corner.setVisible(False)
+
+        # A transient line over the scene, the way CARLA's manual_control HUD answers a keypress:
+        # the click happens here, so the confirmation belongs here too. The status bar at the
+        # bottom of the window is three panels away from where the eye is and says the same thing
+        # to nobody. It fades rather than closing, so a screenshot taken a second later is clean.
+        self._toast = QtWidgets.QLabel(self)
+        self._toast.setVisible(False)
+        self._toast.setAlignment(QtCore.Qt.AlignCenter)
+        #: Faded by restyling, not by a QGraphicsOpacityEffect. An effect renders its widget
+        #: through an offscreen pixmap, and this one is a child of a QOpenGLWidget, where that path
+        #: is exactly where child widgets composite badly. The chips above are plain stylesheet
+        #: labels on this same widget and they are known to draw correctly, so this is one too.
+        self._toast_colour = C["text.0"]
+        self._toast_alpha = 1.0
+        self._toast_timer = QtCore.QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._toast_fade_out)
+        self._toast_fade = QtCore.QTimer(self)
+        self._toast_fade.setInterval(40)
+        self._toast_fade.timeout.connect(self._toast_step)
 
         # One pacer. `frameSwapped` fires after the buffer swap, so with vsync on this schedules the
         # next frame exactly when the display is ready for it; the cap timer only bites if the
@@ -393,6 +424,11 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         """
         self._target = None                 # drop the reference; __del__ is a no-op for a reference
         self._target_key = None
+        self.recorder = None                # nothing will paint again; the console closes the file
+        try:
+            self._release_capture_target()
+        except Exception:
+            pass
         scene, self.scene = self.scene, None
         if scene is not None:
             try:
@@ -418,6 +454,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             return
         try:
             self.makeCurrent()
+            self._release_capture_target()      # ours too: the capture FBO is not the Scene's
             self.scene.release()
         except Exception:
             pass
@@ -619,6 +656,48 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             self._corner.adjustSize()
             self._place_overlays()
 
+    def notify(self, text: str, kind: str = "info", seconds: float = 2.6):
+        """Say something over the scene for a moment. `kind` is info / good / warn / danger.
+
+        For things that just happened and need no answer -- the dial was applied, recording
+        started, the session reset. Anything the user must act on stays in the status bar, where
+        it does not vanish.
+        """
+        if not text:
+            return
+        self._toast_colour = {"info": C["text.0"], "good": C["ok"],
+                              "warn": C["warn"], "danger": C["danger"]}.get(kind, C["text.0"])
+        self._toast.setText(text)
+        self._toast_fade.stop()
+        self._toast_alpha = 1.0
+        self._restyle_toast()
+        self._toast.adjustSize()
+        self._toast.setVisible(True)
+        self._place_overlays()
+        self._toast_timer.start(int(max(0.4, seconds) * 1000))
+
+    def _restyle_toast(self):
+        a = max(0.0, min(1.0, self._toast_alpha))
+        r, g, b = (int(self._toast_colour[i:i + 2], 16) for i in (1, 3, 5))
+        pct = f"{100 * a:.0f}%"
+        self._toast.setStyleSheet(
+            f"color: rgba({r},{g},{b},{pct}); background: rgba(18,19,22,{88 * a:.0f}%);"
+            f"border: 1px solid rgba(255,255,255,{12 * a:.0f}%);"
+            f"border-left: 3px solid rgba({r},{g},{b},{pct});"
+            f"border-radius: 4px; padding: 7px 14px; font-size: {theme.SIZE['label']}px;")
+
+    def _toast_fade_out(self):
+        self._toast_fade.start()
+
+    def _toast_step(self):
+        self._toast_alpha -= 0.09                    # ~450 ms at the 40 ms interval
+        if self._toast_alpha <= 0.02:
+            self._toast_fade.stop()
+            self._toast_alpha = 0.0
+            self._toast.setVisible(False)
+            return
+        self._restyle_toast()
+
     def set_empty_text(self, html: str):
         self._empty.setText(html)
 
@@ -654,6 +733,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             else:
                 self._empty.setVisible(False)
                 self._draw(frame)
+                self._last_drawn = frame
         except Exception as exc:
             self._gl_error = f"{type(exc).__name__}: {exc}"
             self.gl_failed.emit(self._gl_error)
@@ -661,6 +741,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                 self.scene.clear()
             except Exception:
                 pass
+        self._pump_recorder()
         self._last_paint = time.perf_counter()
         self._arm_keepalive()          # cancels the pending deadline and sets the next one
         draw_ms = (self._last_paint - t0) * 1e3
@@ -672,10 +753,43 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         if dt is not None:
             self.frame_timed.emit(dt)
 
+    def _pump_recorder(self) -> None:
+        """Offer the recorder a frame, if one is due. Inside `paintGL`, after the window's draw.
+
+        Paced by the clock rather than by the paint rate: the window repaints at whatever the
+        display and the keepalive produce, and a clip has to come out at the frame rate it says it
+        has. A capture that is late is simply the next one; a capture the encoder cannot take is
+        dropped and counted by the recorder, never waited for.
+        """
+        rec = self.recorder
+        if rec is None or not rec.ok or self._last_drawn is None:
+            return
+        now = time.perf_counter()
+        if now < self._rec_next:
+            return
+        # Next deadline from the one just passed, not from now, so a slow frame does not make the
+        # clip drift slower than its stated rate for ever after.
+        self._rec_next = max(now - rec.due, self._rec_next) + rec.due
+        spec = rec.spec
+        rgb = self.render_offscreen(spec.width, spec.height, spec.camera,
+                                    None if spec.overlays else False)
+        rec.submit(rgb)
+
+    def start_recording(self, rec) -> None:
+        self.recorder = rec
+        self._rec_next = time.perf_counter()
+
+    def stop_recording(self):
+        rec, self.recorder = self.recorder, None
+        return rec
+
     def _draw(self, fr: dict):
         sc = self.scene
         n, f = int(fr["n"]), int(fr["focus"])
-        w, h = self.fb_size()
+        # The size of the framebuffer being drawn into, which `_resolve_target` has just set to the
+        # widget's -- and which an offscreen capture sets to the recording's. Asking the widget
+        # directly would give a 1920x1080 clip the window's aspect ratio.
+        w, h = int(sc.width), int(sc.height)
         eye, target, up = self._camera_pose(fr)
         view = G.look_at(eye, target, up)
         near, far, fog0, fog1 = self._depth_range(eye, target)
@@ -1046,6 +1160,10 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         if self._corner.isVisible():
             self._corner.adjustSize()
             self._corner.move(m, m)
+        if self._toast.isVisible():
+            self._toast.adjustSize()
+            self._toast.move(max(m, (self.width() - self._toast.width()) // 2),
+                             max(m, self.height() - self._toast.height() - 3 * m))
 
     def draw_percentiles(self):
         """(p50, p95, max) ms spent inside paintGL, or None."""
@@ -1071,10 +1189,120 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self._cpu_ms.clear()
         self._gl_ms.clear()
 
-    def grab_png(self, path: str) -> bool:
-        """Screenshot through Qt, which reads the widget's own framebuffer correctly."""
+    def grab_png(self, path: str, width: int = 0, height: int = 0) -> bool:
+        """Save the viewport as a PNG. At the window's size through Qt; at any other size offscreen.
+
+        Qt's `grabFramebuffer` reads the widget's own framebuffer, which is the right answer when
+        the size asked for is the size on screen and the cheapest one. A different size is a
+        different render, and that is what `render_offscreen` is for.
+        """
         try:
+            if width and height and (int(width), int(height)) != self.fb_size():
+                rgb = self.render_offscreen(int(width), int(height))
+                if rgb is None:
+                    return False
+                from PIL import Image
+                Image.frombytes("RGB", (int(width), int(height)), rgb).save(path)
+                return True
             img = self.grabFramebuffer()
             return bool(img.save(path))
         except Exception:
             return False
+
+    # ---------------------------------------------------------------- offscreen capture
+    #: The render state `_draw` advances as a side effect of drawing. A capture re-runs `_draw` for
+    #: the same frame, so each of these has to be put back or the second draw would double the wheel
+    #: rotation, re-ease the chase camera and consume the trail update -- the window would visibly
+    #: run at twice the rate while recording.
+    _DRAW_STATE = ("_trail_seq", "_chase_ref", "_cam_wall", "_chase_heading", "_cam_eye", "_cam_tgt")
+
+    def _capture_state(self):
+        return (tuple(getattr(self, a) for a in self._DRAW_STATE), self._spin.copy())
+
+    def _restore_state(self, saved) -> None:
+        values, spin = saved
+        for a, v in zip(self._DRAW_STATE, values):
+            setattr(self, a, v)
+        self._spin[:] = spin
+
+    def _capture_target(self, w: int, h: int):
+        """An offscreen framebuffer of this size, made once and reused. None when GL is not up."""
+        if self.ctx is None or self.scene is None:
+            return None
+        if getattr(self, "_cap_key", None) != (w, h):
+            self._release_capture_target()
+            ms = max(1, int(self.scene.msaa or 1))
+            self._cap_ms = (self.ctx.framebuffer(
+                color_attachments=[self.ctx.renderbuffer((w, h), samples=ms)],
+                depth_attachment=self.ctx.depth_renderbuffer((w, h), samples=ms)) if ms > 1 else None)
+            self._cap = self.ctx.framebuffer(color_attachments=[self.ctx.texture((w, h), 4)],
+                                             depth_attachment=self.ctx.depth_renderbuffer((w, h)))
+            self._cap_key = (w, h)
+        return self._cap
+
+    def _release_capture_target(self) -> None:
+        for name in ("_cap_ms", "_cap"):
+            fbo = getattr(self, name, None)
+            if fbo is not None:
+                try:
+                    for att in getattr(fbo, "color_attachments", ()) or ():
+                        att.release()
+                    if getattr(fbo, "depth_attachment", None) is not None:
+                        fbo.depth_attachment.release()
+                    fbo.release()
+                except Exception:
+                    pass
+            setattr(self, name, None)
+        self._cap_key = None
+
+    def render_offscreen(self, width: int, height: int, camera: str = "",
+                         overlays: Optional[bool] = None) -> Optional[bytes]:
+        """The current frame, drawn again into an FBO of this size. RGB bytes, top row first.
+
+        Called from `paintGL`, where this widget's GL context is current and the frame the window is
+        showing is the frame in hand -- so a clip is the session as it was watched, at whatever
+        resolution was asked for rather than whatever size the window happens to be.
+
+        `camera` and `overlays` are applied to this draw only. That is the whole reason the render
+        state above is snapshotted: a recording can follow the chase camera with the LiDAR dots off
+        while the window stays on the overview with them on, and neither disturbs the other.
+        """
+        if self.ctx is None or self.scene is None or self.geometry_data is None:
+            return None
+        w = max(2, int(width)); h = max(2, int(height))
+        frame = self._last_drawn
+        if frame is None:
+            return None
+        cap = self._capture_target(w, h)
+        if cap is None:
+            return None
+        sc = self.scene
+        saved_target, saved_w, saved_h = sc.target, sc.width, sc.height
+        saved_cam, saved_overlay = self.camera, (self.show_lidar, self.show_raceline, self.show_labels)
+        saved_state = self._capture_state()
+        try:
+            if camera:
+                self.camera = camera
+            if overlays is not None:
+                self.show_lidar = self.show_raceline = self.show_labels = bool(overlays)
+            sc.target = self._cap_ms or cap
+            sc.width, sc.height = w, h
+            sc.clear()
+            self._draw(frame)
+            if self._cap_ms is not None:
+                self.ctx.copy_framebuffer(cap, self._cap_ms)
+            from PIL import Image
+            data = cap.read(components=3)
+            return Image.frombytes("RGB", (w, h), data).transpose(Image.FLIP_TOP_BOTTOM).tobytes()
+        except Exception as exc:
+            self._gl_error = f"capture: {type(exc).__name__}: {exc}"
+            return None
+        finally:
+            self.camera = saved_cam
+            self.show_lidar, self.show_raceline, self.show_labels = saved_overlay
+            self._restore_state(saved_state)
+            sc.target, sc.width, sc.height = saved_target, saved_w, saved_h
+            try:
+                self.ctx.viewport = (0, 0, saved_w, saved_h)
+            except Exception:
+                pass

@@ -59,7 +59,10 @@ def terms(model, ref, batch, device="cpu"):
     h = HYPER
     scan, pro = batch["scan"], batch["pro"]
     priv, act = batch["priv"], batch["act"]
-    logp, ent, val, d, grip, opp_pred, _h = model.evaluate_aux(scan, pro, priv, act, None)
+    # `*_`, not `_h`: `evaluate_aux` grew a future-head slot after this recording was made.
+    # The model here carries no such head, so the slot is None and the arithmetic below is
+    # still the verbatim copy of `ppo.main` as of ae1f4df that the oracle was recorded from.
+    logp, ent, val, d, grip, opp_pred, *_ = model.evaluate_aux(scan, pro, priv, act, None)
     logp, ent, val = logp.float(), ent.float(), val.float()
     w = batch["mask"]
 

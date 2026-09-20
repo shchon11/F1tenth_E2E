@@ -89,6 +89,19 @@ def h(qapp, tmp_path, monkeypatch):
 
 
 # ================================================================ handshake
+@pytest.mark.skipif(sys.platform != "linux", reason="reads the spawned process environment")
+def test_worker_limits_blas_threads_without_changing_parent(h, monkeypatch):
+    keys = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+    for key in keys:
+        monkeypatch.setenv(key, "7")
+    h.controller.start_worker()
+    h.wait_for(lambda: bool(h.controller._worker_hello), what="hello")
+    with open(f"/proc/{h.controller._proc.pid}/environ", "rb") as stream:
+        child = dict(item.split(b"=", 1) for item in stream.read().split(b"\0") if b"=" in item)
+    assert all(child[key.encode()] == b"1" for key in keys)
+    assert all(os.environ[key] == "7" for key in keys)
+
+
 def test_worker_handshake_and_map_catalog(h):
     h.controller.start_worker()
     h.wait_for(lambda: bool(h.controller._worker_hello), what="hello")

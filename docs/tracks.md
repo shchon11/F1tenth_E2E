@@ -37,15 +37,17 @@ The console's environment editor imports the same pair (see
 ## The scenario grammar
 
 ```
-<track id> [ @<direction> ] [ #<obstacle>:<seed> ]
+<track id> [ @<direction> ] [ #[bare+]<obstacle>:<seed> | #bare ]
 
-real/bb22-1                 the map as recorded
+real/bb22-1                 the map as its author left it
 real/bb22-1@rev             driven the other way round
 real/bb22-1@mir             mirrored (left and right swapped)
 real/bb22-1@mir+rev         mirrored and reversed
 real/bb22-1#line:44         boxes on the racing line, placement seed 44
 real/bb22-1@rev#edge:3      reversed, boxes against the lane edge, seed 3
 real/bb22-1#line:*          boxes on the racing line, seed drawn at run time
+scene/my_hall#bare          the obstacles the author placed are taken off — walls only
+scene/my_hall#bare+hard:3   taken off, and then the hard patterns put on
 ```
 
 ### Direction
@@ -60,23 +62,44 @@ real/bb22-1#line:*          boxes on the racing line, seed drawn at run time
 `mir+rev` is one choice rather than two flags because the loader applies mirror and *then* reverse;
 the other order is a different track.
 
-### Obstacles
+### Obstacles: 기본, 없음, and the families (2026-09-15)
 
 | `#` | UI | what stands in the way | loader suffix |
 | --- | --- | --- | --- |
-| *(none)* | 없음 | nothing | |
+| *(none)* | 기본 | **the map as authored.** An editor scene keeps the obstacles its author placed; every other map has none | |
+| `bare` | 없음 | **the authored obstacles are taken off**, walls only. Identical to 기본 on a map that has none | `+bare` |
 | `edge` | 가장자리 | boxes against a lane edge; the racing line stays clear | `+obs<seed>` |
 | `line` | 주행선 위 | boxes **on** the racing line; the car has to plan around them | `+rlobs<seed>` |
 | `pinch` | 좁아짐 | the lane closes down at a few places | `+pinch<seed>` |
 | `props` | 입체 | modelled boxes, crates and a drum — finite convex sections rather than stamped cells | `+props<seed>` |
+| `hard` | 극단 | hand-built-style patterns: box rows, diagonal barriers, chicanes, corner apexes | `+hard<seed>` |
 
-`edge` / `line` / `pinch` are rasterised into the occupancy grid: rotated rectangles of one height
-with no top. `props` are modelled solids. They are different things and both are kept — every
+**Why 기본 and 없음 are two entries.** `""` used to be labelled 없음 and meant "no procedural
+family". On a plain map those are the same sentence. On an editor scene they are not: the scene
+carries the props its author placed, so picking 없음 produced a map full of boxes. The user reported
+it (2026-09-15) — *"장애물 없음이라는 말과 안맞아"* — and the fix is to stop saying one word for two
+things. 기본 is the map as authored, and it says how many obstacles that is; 없음 removes them.
+
+**`bare` takes no seed.** It places nothing, so there is nothing to draw: `#bare`, not `#bare:*`.
+Asking for one is refused rather than ignored.
+
+**The families ADD.** 가장자리 / 주행선 위 / 좁아짐 / 입체 / 극단 go on top of whatever the map
+already has. To use a custom scene as a *bare* track for one of them, compose: `#bare+hard:3`
+(loader `+bare+hard3`). `+bare` is applied to the base map first, then the family — the order is
+fixed and the loader reads it the same way round.
+
+**What `+bare` removes, exactly.** The props the author *placed* — a list of poses (`Track.props`).
+The grids are untouched, so a painted wall stays a wall. A loader may not guess which painted cells
+were meant as scenery: the only thing it can honestly tell apart is what was placed as an object.
+
+`edge` / `line` / `pinch` / `hard` are rasterised into the occupancy grid: rotated rectangles of one
+height with no top. `props` are modelled solids. They are different things and both are kept — every
 checkpoint in the catalogue was trained against the rasterised ones, and redefining a name would
 move the ground under those runs without saying so.
 
 Not every family carries every obstacle: `rt/` (racetracks) and `scene/` (editor) understand `props`
-only, which is the loader's own limit. The picker offers what the track can actually take.
+and `hard` only, which is the loader's own limit. `기본` and `없음` are on every map. The picker
+offers what the track can actually take.
 
 ### Seeds, and what 무작위 does
 

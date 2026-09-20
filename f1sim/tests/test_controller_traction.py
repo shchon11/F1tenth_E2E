@@ -1,8 +1,14 @@
-"""The ROS policy node's traction guard: the `traction` parameter, and what it does to the command.
+"""The controller node's traction guard: the `traction` parameter, and what it does to `/drive`.
 
-Same shape as `test_policy_node_grip.py` and `test_policy_sensor_contract.py`: no ROS graph, no
-device, no vehicle. The node's real `on_odom` / `on_imu` / `on_core` / `on_scan` / `_resume` run
-against stub messages and a fake clock, and the assertions are about what the publisher received.
+The guard moved here from `policy_node` with the split, unchanged; this file moved with it. Same
+shape as `test_controller_arms.py` and `test_policy_sensor_contract.py`: no ROS graph, no device,
+no vehicle. The node's real `on_odom` / `on_imu` / `on_core` / `on_scan` / `on_plan` / `_resume`
+run against stub messages and a fake clock, and the assertions are about what the publisher
+received.
+
+The iLQR tracker is stubbed to a fixed command, because what is under test is the guard's wiring
+and its authority over the published speed, not the tracker -- which has `test_mpc.py`, and whose
+output through this node is pinned bit-for-bit in `test_graph_parity.py`.
 
 What is worth pinning here, as opposed to in `test_traction_guard.py`:
 
@@ -35,12 +41,16 @@ torch = pytest.importorskip("torch")
 
 from builtin_interfaces.msg import Time                       # noqa: E402
 
-import f1sim_ros.policy_node as pn                            # noqa: E402
-from f1sim.learn.memory import PolicyRuntime                   # noqa: E402
-from f1sim.learn.obs import ObsBuilder, ObsSpec               # noqa: E402
+pytest.importorskip("f1sim_interfaces.msg",
+                    reason="f1sim_interfaces is not built; see f1sim_interfaces/README.md")
+
+import f1sim_ros.controller_node as cn                        # noqa: E402
+import f1sim_ros.deploy as deploy                             # noqa: E402
+from f1sim.learn.obs import ObsSpec                           # noqa: E402
+from f1sim_interfaces.msg import Plan                         # noqa: E402
 from f1sim_ros.traction import LOCK, OK, SPIN, TractionGuard, TractionParams  # noqa: E402
 
-G = pn.G
+G = deploy.G
 DT = 0.02                                   # /odom period on this car
 SCAN_DT = 0.025                             # scan period
 
@@ -110,46 +120,60 @@ def ros_time(sec=1.0):
     return t
 
 
-def make_node(traction="on", overrides="", speed_frac=-1.0, cal=(0.0, 1.0, 1.0), v_max=8.0):
-    """`speed_frac` is the action channel the stub actor returns: -1 asks for zero speed (the
-    policy braking), +1 for `v_max`. Zero speed is the default here because it is the case the lock
-    release has to act on -- the policy has already cut the command and the wheel locked anyway."""
-    spec = ObsSpec(n_beams=64, scan_stack=2, scan_stride=1, action_history=2, act_dim=2,
+def _fixed_tracker(speed, steer=0.0):
+    """The tracker, stubbed to a fixed (steer, speed). What the guard is given to shape."""
+    class T:
+        last_ref = None
+        wb = 0.3302                  # the controller publishes the tracker's model of the car
+        s_max = 0.4189
+        v_max = 8.0
+
+        def __call__(self, a, v, cap, yaw_rate, delay=None):
+            return torch.tensor([[steer, speed]])
+
+        def reset(self, idx):
+            pass
+    return T()
+
+
+def make_node(traction="on", overrides="", speed=0.0, cal=(0.0, 1.0, 1.0), v_max=8.0):
+    """`speed` is what the stubbed tracker returns: 0 is the policy already braking, which is the
+    case the lock release has to act on -- the command is cut and the wheel locked anyway."""
+    spec = ObsSpec(n_beams=64, scan_stack=2, scan_stride=1, action_history=2, act_dim=8,
                    hist_len=0, range_max=10.0, v_max=v_max)
-    n = pn.PolicyNode.__new__(pn.PolicyNode)
+    n = cn.ControllerNode.__new__(cn.ControllerNode)
     n.device = torch.device("cpu")
     n.spec = spec
-    n.obs = ObsBuilder(spec, "cpu")
-    n.model = FixedModel(speed_frac, spec.act_dim)
-    n.policy_state = PolicyRuntime()        # inert: this stub actor has no memory to carry
+    n.tracker = _fixed_tracker(speed)
+    n.delay = torch.tensor([0.035])
     n.pub = RecordingPub()
+    n.pub_diag = RecordingPub()
+    n.pub_viz = None; n.pub_viz_clear = None
     n.speed_cap = 8.0
     n.steer_max = 0.4189
-    n.v = 0.0
-    n.imu_buf = []; n.imu_stamps = []
-    n.att = (0.0, 0.0); n.yaw_rate = 0.0
-    n.accel_scale = None                    # let the node detect g from the gravity vector, as it does
-    n._unit_warned = False
-    n.tracker = None
     n.cal = cal
     n.timeout = 0.25
-    n.t_att = n.t_imu = n.t_odom = n.t_scan = None
-    n.imu_mean = None; n.t_imu_mean = None; n.att_stamp = None
-    n._inhibited = False; n._last_inhibit_log = -1e9
-    n.last_t = None
+    n.plan_timeout = 0.25
+    n.grip = None
+    # The guard is what this file is about; the plan-geometry layer stays off so the only thing
+    # shaping the published speed is the one under test.
+    n.clearance = None; n._scan_geometry_checked = True
+    n.controller_arm = "legacy"
+    n._snapshots = []; n._pending = None
+    n.plan = None; n.t_plan = None; n.plan_seq = None; n.plan_checkpoint = ""
+    n._inhibited = False; n._last_inhibit_log = -1e9; n._braking = False
+    n._plan_unmatched = 0; n._last_unmatched_log = -1e9; n._commands = 0
+    n.last_cmd = (0.0, 0.0); n.last_t = None
     n._log = Logger()
     n._now = 100.0
     n.traction_arm = traction
-    n.traction = pn.build_traction_guard(traction, overrides)
-    # The guard is what this file is about; the plan-geometry layer stays off so the only
-    # thing shaping the published speed is the one under test.
-    n.clearance = None; n._scan_geometry_checked = True
-    n.ax_body = None; n.t_ax = None
-    n.motor_current = None; n.t_current = None
+    n.traction = deploy.build_traction_guard(traction, overrides)
+    n.traction_state = "off" if n.traction is None else OK
     n.get_logger = lambda: n._log
     n.get_parameter = lambda name: SimpleNamespace(value=True)
     n.clock = lambda: n._now
     n.stamp_now = lambda: ros_time(n._now)
+    n.sensors = deploy.SensorIntake(n.clock, n._log, n.timeout)
     return n
 
 
@@ -173,13 +197,27 @@ def odom_msg(v):
         linear=SimpleNamespace(x=v), angular=SimpleNamespace(z=0.0))))
 
 
+STAMP = ros_time(1.0)
+
+
 def scan_msg(n_beams=64, r=3.0):
-    return SimpleNamespace(ranges=[r] * n_beams, range_max=10.0,
-                           header=SimpleNamespace(stamp=ros_time(1.0)))
+    return SimpleNamespace(ranges=[r] * n_beams, range_max=10.0, angle_min=-2.356, angle_max=2.356,
+                           header=SimpleNamespace(stamp=STAMP))
+
+
+def plan_msg(seq=0):
+    """The plan the policy would have published for that scan. Its stamp is the scan's, which is
+    how the controller pairs the two; a constant stamp here means every plan matches the newest
+    snapshot, which is what a steady stream does anyway."""
+    m = Plan()
+    m.header.stamp = STAMP
+    m.plan = [0.0] * 8
+    m.seq = int(seq)
+    return m
 
 
 def step(n, v, ax_si, current=None, scan=True):
-    """One /odom + /sensors/imu/raw (+ /sensors/core) cycle, optionally publishing a command."""
+    """One /odom + /sensors/imu/raw (+ /sensors/core) cycle, optionally a scan and its plan."""
     n._now += DT
     n.on_imu(imu_msg(ax_si))
     if current is not None:
@@ -187,6 +225,7 @@ def step(n, v, ax_si, current=None, scan=True):
     n.on_odom(odom_msg(v))
     if scan:
         n.on_scan(scan_msg())
+        n.on_plan(plan_msg(n._commands))
     return n.pub.msgs[-1].drive.speed if n.pub.msgs else None
 
 
@@ -207,14 +246,14 @@ def drive_lock(n, v0=6.0, a_wheel=-60.0, a_body=-6.0, samples=12, current=-25.0)
 
 # ==================================================================== the parameter
 def test_off_is_the_default_and_installs_nothing():
-    assert pn.build_traction_guard("off") is None
-    assert pn.build_traction_guard("") is None
+    assert deploy.build_traction_guard("off") is None
+    assert deploy.build_traction_guard("") is None
     n = make_node(traction="off")
     assert n.traction is None
 
 
 def test_on_installs_the_validated_guard():
-    g = pn.build_traction_guard("on")
+    g = deploy.build_traction_guard("on")
     assert isinstance(g, TractionGuard)
     assert g.p == TractionParams()
 
@@ -222,11 +261,11 @@ def test_on_installs_the_validated_guard():
 def test_an_unknown_arm_is_refused_rather_than_defaulted():
     for arm in ("ON", "true", "1", "yes", "enabled"):
         with pytest.raises(ValueError):
-            pn.build_traction_guard(arm)
+            deploy.build_traction_guard(arm)
 
 
 def test_thresholds_are_reachable_from_the_launch_line():
-    g = pn.build_traction_guard("on", "lock_rate=22.5, spin_rate=9 lock_persist=2")
+    g = deploy.build_traction_guard("on", "lock_rate=22.5, spin_rate=9 lock_persist=2")
     assert g.p.lock_rate == pytest.approx(22.5)
     assert g.p.spin_rate == pytest.approx(9.0)
     assert g.p.lock_persist == 2 and isinstance(g.p.lock_persist, int)
@@ -237,7 +276,7 @@ def test_thresholds_are_reachable_from_the_launch_line():
                                  "lock_rate=18 spin_rate=-1"])
 def test_a_bad_traction_params_string_raises(bad):
     with pytest.raises(ValueError):
-        pn.build_traction_guard("on", bad)
+        deploy.build_traction_guard("on", bad)
 
 
 # ==================================================================== off is inert
@@ -271,14 +310,14 @@ def test_the_guard_sees_metres_per_second_squared_not_g():
     n = make_node()
     drive_cruise(n)
     n.on_imu(imu_msg(-9.81))
-    assert n.ax_body == pytest.approx(-9.81, abs=1e-3)
-    assert n.accel_scale == pytest.approx(G)
+    assert n.sensors.ax_body == pytest.approx(-9.81, abs=1e-3)
+    assert n.sensors.accel_scale == pytest.approx(G)
 
 
 def test_the_guard_is_fed_every_odom_sample_and_shaped_once_per_scan():
-    """/odom is 50 Hz and scans are 40 Hz. Feeding the guard from `on_scan` would drop one wheel
-    speed in five, which is the sample a 40 ms lock lives in; shaping per /odom would rate-limit
-    a command that has not been published yet."""
+    """/odom is 50 Hz and scans are 40 Hz. Feeding the guard from the scan (or the plan) would
+    drop one wheel speed in five, which is the sample a 40 ms lock lives in; shaping per /odom
+    would rate-limit a command that has not been published yet."""
     n = make_node()
     n.traction = rec = RecordingGuard()
     for i in range(21):                     # three odom samples per scan, an extreme version
@@ -287,6 +326,7 @@ def test_the_guard_is_fed_every_odom_sample_and_shaped_once_per_scan():
         n.on_odom(odom_msg(6.0 + 0.01 * i))
         if i % 3 == 0:
             n.on_scan(scan_msg())
+            n.on_plan(plan_msg(i))
     assert len(rec.updates) == 21
     assert len(rec.shapes) == 7
     assert [u[1] for u in rec.updates] == [pytest.approx(6.0 + 0.01 * i) for i in range(21)]
@@ -312,7 +352,7 @@ def test_a_stale_imu_or_current_reaches_the_guard_as_unknown_not_as_its_last_val
     nothing: it holds its filters over a None, but it would compare a live wheel against a dead
     body."""
     n = make_node()
-    n.timeout = 0.10
+    n.timeout = n.sensors.timeout = 0.10
     n.traction = rec = RecordingGuard()
     n.on_imu(imu_msg(-3.0)); n.on_core(core_msg(40.0))
     n._now += DT; n.on_odom(odom_msg(5.0))
@@ -333,7 +373,7 @@ def test_a_spin_is_still_detectable_with_no_core_topic_at_all():
     for i in range(8):
         step(n, 1.0 + 25.0 * (i + 1) * DT, 4.0, None)
     assert n.traction.state.spins == 1
-    assert n.motor_current is None
+    assert n.sensors.motor_current is None
 
 
 # ==================================================================== shaping the command
@@ -346,7 +386,7 @@ def test_the_lock_release_raises_the_published_speed_but_not_past_its_authority(
 
 
 def test_the_published_speed_never_exceeds_the_speed_cap():
-    n = make_node(speed_frac=1.0)           # the policy already asks for v_max
+    n = make_node(speed=8.0)                # the tracker already asks for v_max
     n.speed_cap = 3.0
     drive_cruise(n)
     out = drive_lock(n)
@@ -359,29 +399,17 @@ def test_shaping_happens_before_the_speed_gain_calibration():
     outs = {}
     for gain in (1.0, 2.0):
         n = make_node(cal=(0.0, 1.0, gain))
-        n.tracker = _fixed_tracker(0.0)     # the tracker branch is the one that divides by the gain
-        n.delay = torch.tensor([0.035])
         drive_cruise(n)
         outs[gain] = max(drive_lock(n))
     assert outs[1.0] > 0.5
     assert outs[2.0] == pytest.approx(outs[1.0] / 2.0, rel=1e-6)
 
 
-def _fixed_tracker(speed):
-    class T:
-        def __call__(self, a, v, cap, yaw_rate, delay=None):
-            return torch.tensor([[0.0, speed]])
-
-        def reset(self, idx):
-            pass
-    return T()
-
-
 def test_shaping_is_neutral_while_nothing_is_slipping():
-    n = make_node(speed_frac=0.0, v_max=8.0)
+    n = make_node(speed=4.0, v_max=8.0)
     drive_cruise(n, samples=60)
     speeds = [m.drive.speed for m in n.pub.msgs]
-    assert speeds and all(s == pytest.approx(4.0) for s in speeds)   # (0 + 1) / 2 * 8
+    assert speeds and all(s == pytest.approx(4.0) for s in speeds)
     assert n.traction.state.state == OK
 
 
@@ -396,7 +424,7 @@ def test_a_sensor_gap_resets_the_guard_with_the_observation_history():
     st = n.traction.state
     assert st.locks == 0 and st.spins == 0 and st.state == OK
     assert st == n.traction.state and st.t == 0.0
-    assert "observation, policy memory and tracker history cleared" in n._log.text()
+    assert "tracker history and held plan cleared" in n._log.text()
 
 
 def test_the_guard_is_reset_not_recreated_so_its_parameters_survive_a_gap():
@@ -414,8 +442,8 @@ def test_the_guard_is_reset_not_recreated_so_its_parameters_survive_a_gap():
 def test_a_core_message_with_a_nonfinite_current_is_ignored():
     n = make_node()
     n.on_core(core_msg(12.0))
-    assert n.motor_current == pytest.approx(12.0)
+    assert n.sensors.motor_current == pytest.approx(12.0)
     n.on_core(core_msg(float("nan")))
-    assert n.motor_current == pytest.approx(12.0)
+    assert n.sensors.motor_current == pytest.approx(12.0)
     n.on_core(SimpleNamespace(state=None))
-    assert n.motor_current == pytest.approx(12.0)
+    assert n.sensors.motor_current == pytest.approx(12.0)

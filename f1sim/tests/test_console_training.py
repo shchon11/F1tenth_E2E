@@ -10,7 +10,7 @@ import os
 import time
 
 import pytest
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from f1sim import tracks
 from f1sim.viewer.console import training as T
@@ -52,10 +52,9 @@ def test_the_three_groups_are_tabs_of_base_maps(picker):
             assert tracks.group_of(tid) == group or group == "내 환경"
 
 
-def test_the_default_is_the_training_split_itself(picker):
-    """Not a reconstruction of it. The curated list has per-map obstacle seeds by design, and a run
-    launched from the default has to be the run the recipes were measured with."""
-    assert picker.spec() == "train"
+def test_the_default_uses_asset_variants_of_the_training_split(picker):
+    """Fresh launches keep the curated maps/seeds and explicitly switch to real assets."""
+    assert picker.spec() == ",".join(tracks.asset_scenario(tracks.short(n)) for n in tracks.split_names("train"))
     assert set(_checked(picker)) == set(tracks.split_tracks("train"))
     assert picker.count() == 149
     assert "149개 변형" in picker.summary.text()
@@ -65,7 +64,7 @@ def test_one_click_selects_the_whole_training_set(picker):
     picker.clear_selection()
     assert picker.spec() == "" and _checked(picker) == []
     picker.btn_all_train.click()
-    assert picker.spec() == "train"
+    assert picker.spec() == ",".join(tracks.asset_scenario(tracks.short(n)) for n in tracks.split_names("train"))
 
 
 def test_touching_anything_drops_the_split_shortcut_and_emits_the_list(picker):
@@ -92,18 +91,18 @@ def test_an_obstacle_family_is_applied_to_every_selected_map(picker):
         cb.setChecked(d == "")
     picker.obs_boxes[""].setChecked(False)
     picker.obs_boxes["line"].setChecked(True)
-    assert picker.spec() == "real/icra22#line:*"
+    assert picker.spec() == "real/icra22#line:*!assets=mixed:1"
     # `*` is a request for N placements, not one track
     picker.spin_draws.setValue(8)
     assert picker.count() == 8
     picker.combo_seed.setCurrentIndex(picker.combo_seed.findData("fixed"))
     picker.spin_fixed.setValue(44)
-    assert picker.spec() == "real/icra22#line:44"
+    assert picker.spec() == "real/icra22#line:44!assets=mixed:1"
     assert picker.count() == 1
 
 
-def test_an_obstacle_a_track_cannot_carry_is_left_out_rather_than_emitted(picker):
-    """`rt:Monza+obs3` raises in the loader. The picker must not build the name."""
+def test_asset_modes_support_racetracks_without_legacy_raster_suffixes(picker):
+    """New asset markers support Monza while its old +obs loader remains unchanged."""
     picker.clear_selection()
     for lw in picker._lists.values():
         for i in range(lw.count()):
@@ -114,7 +113,7 @@ def test_an_obstacle_a_track_cannot_carry_is_left_out_rather_than_emitted(picker
         cb.setChecked(d == "")
     picker.obs_boxes[""].setChecked(False)
     picker.obs_boxes["edge"].setChecked(True)
-    assert picker.spec() == "real/bb22-3#edge:*"
+    assert set(picker.spec().split(",")) == {"real/bb22-3#edge:*!assets=mixed:1", "rt/monza#edge:*!assets=mixed:1"}
 
 
 def test_every_spec_the_picker_emits_is_one_the_trainer_accepts(picker):
@@ -150,7 +149,7 @@ def test_a_tracks_value_the_controls_cannot_express_is_kept_verbatim(picker):
     assert picker.spec() == spec
     assert "직접 지정한" in picker.summary.text()
     picker.btn_all_train.click()
-    assert picker.spec() == "train"
+    assert picker.spec() == ",".join(tracks.asset_scenario(tracks.short(n)) for n in tracks.split_names("train"))
 
 
 # ================================================================ the argv it builds
@@ -164,10 +163,27 @@ def form(qapp, tmp_path, monkeypatch):
         f.deleteLater()
 
 
-def test_the_default_recipe_emits_the_split_name(form):
+def test_the_default_recipe_emits_explicit_asset_scenarios(form):
     _name, argv, _dev = form.argv()
-    assert argv[argv.index("--tracks") + 1] == "train"
+    assert argv[argv.index("--tracks") + 1] == form.tracks.spec()
+    assert any(tracks.parse(n).asset for n in form.tracks.spec().split(","))
     assert argv[argv.index("--obstacle-draws") + 1] == "8"
+
+
+def test_historical_recipe_is_explicit_and_training_controls_are_available(form):
+    for old_widget in ("combo_controller", "edit_estimator", "ctrl_hint"):
+        assert not hasattr(form, old_widget), old_widget
+    assert "controller" in form.editors and "estimator" in form.editors
+    assert "기본 레이스" in form.combo_recipe.currentText()
+
+    _name, argv, _dev = form.argv()
+    assert form.spin_race.value() == 2 and form.spin_race.isEnabled()
+    assert form.combo_opp.isEnabled()
+    assert argv.count("--controller") == 1
+    assert argv[argv.index("--controller") + 1] == "legacy"
+    assert "--estimator" not in argv
+    assert argv[argv.index("--race-size") + 1] == "2"
+    assert form.combo_device.findText("cuda") >= 0
 
 
 def test_the_narrow_recipes_round_trip_through_the_picker(form):
@@ -218,7 +234,7 @@ upd 12/64 steps 0.20M cap 9.0 | rew/step 1.234 coll 0.900/km prog 41.2 m lap 12.
 
 def test_the_summary_reads_the_argv_the_process_was_started_with():
     s = T.summarize_job(_job(RECORDED), log_text=LOG, progress=T.parse_progress(LOG))
-    assert s.recipe == "원본 레이스 레시피 (권장)"
+    assert s.recipe == "기본 레이스 레시피"
     assert s.tracks_text == "학습 분할 (149개 변형, 53개 맵)"
     assert s.race_text == "2대 · 상대차 mixed"
     assert s.controller == "legacy"
@@ -274,11 +290,15 @@ def test_the_same_map_three_ways_is_named_once_and_counted_as_one_map():
 
 
 def test_a_suffix_this_version_does_not_know_is_passed_through_rather_than_dropped():
-    """Another branch is training with a `+hard<seed>` obstacle family this registry has never
-    heard of. An unknown name is data, not an error: it is counted, and the map under it is named
-    even though the suffix cannot be."""
+    """Another branch is training with an obstacle family this registry has never heard of. An
+    unknown name is data, not an error: it is counted, and the map under it is named even though the
+    suffix cannot be.
+
+    The suffix used to be `+hard`, which this registry has since learned -- so the test had quietly
+    become a test of `+hard` and its assertion drifted. It names one that is genuinely unknown now.
+    """
     argv = list(RECORDED)
-    argv[argv.index("--tracks") + 1] = "real:icra2022+hard1,real:icra2022+hard1~rev,weird_name"
+    argv[argv.index("--tracks") + 1] = "real:icra2022+blobs1,real:icra2022+blobs1~rev,weird_name"
     s = T.summarize_job(_job(argv))
     assert s.tracks_text == "3개 시나리오 · 2개 맵 · ICRA 2022, weird_name"
 
@@ -342,3 +362,185 @@ def test_the_page_draws_one_card_per_job(qapp, tmp_path, monkeypatch):
         assert card.facts._rows["W&B"].text().startswith("https://wandb.ai/")
     finally:
         page.deleteLater()
+
+
+# ================================================================ the 현황판 charts
+# "학습 패널에서 학습 런에는 다 뜨는데 현황판 그래프에 아무것도 안뜬다." Every current run's charts
+# were empty, and nothing on the page said why. These are about what the page draws now: the chart
+# set belongs to the run's kind, the important metric comes first, and a run with no record says so.
+PPO_JSONL = [
+    {"kind": "ppo", "update": k, "total": 64, "steps": k * 8192, "cap": 9.0,
+     "rew_per_step": 0.1 * k, "coll_per_km": 50.0 / k, "prog_m": 10.0 * k,
+     "lap_s": float("nan") if k < 3 else 14.0, "gate": 9.0, "tk": 149.0,
+     "kl_ref": 0.01 * k, "sps": 4100.0, "wall_s": 12.0 * k,
+     "reward/progress_per_step": 0.05, "reward/collision_per_step": -0.2,
+     "traffic/car_contacts_per_min": 0.5 * k, "traffic/passes_held_per_min": 0.2 * k,
+     "traffic/wall_collisions_per_min": 1.0, "traffic/ttc_share": 0.03}
+    for k in range(1, 6)
+]
+DAGGER_JSONL = [
+    {"kind": "dagger", "iter": k, "total": 6, "beta": 0.5 ** k, "samples": 64500 * (k + 1),
+     "loss": 0.07 / (k + 1), "student_coll_per_km": 52.6 / (k + 1), "student_prog_mps": 3.1 + 0.2 * k,
+     "student_lap_s": 14.8 - 0.3 * k, "teacher_coll_per_km": 7.2, "teacher_prog_mps": 3.6,
+     "teacher_lap_s": 13.6, "wall_s": 1165.0 * (k + 1)}
+    for k in range(3)
+]
+
+
+def _run_with(tmp_path, name, records=(), files=()):
+    d = tmp_path / "runs" / name
+    d.mkdir(parents=True)
+    if records:
+        (d / "progress.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    for fn, text in files:
+        (d / fn).write_text(text)
+    return d
+
+
+@pytest.fixture
+def page(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("F1SIM_SCENES", str(tmp_path / "scenes"))
+    (tmp_path / "runs" / "_console_jobs").mkdir(parents=True)
+    monkeypatch.setattr(T.catalog, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(T, "discover_external_jobs", lambda runs_dir=None: [])
+    p = T.TrainingPage()
+    p.jobs = T.JobManager(str(tmp_path / "runs"))
+    try:
+        yield p
+    finally:
+        p.deleteLater()
+
+
+def _titles(page):
+    return [c.title for c in page._charts.values()]
+
+
+def test_a_ppo_run_plots_the_metrics_that_matter_first(page, tmp_path):
+    """"중요한 메트릭들 위주로 plot하게 해줘": what the policy is judged on, in that order, then
+    the traffic the opponents create, then the optimiser's diagnostics."""
+    d = _run_with(tmp_path, "cl_ppo", PPO_JSONL)
+    page._current_run = str(d)
+    page._tick(force=True)
+    assert _titles(page)[:4] == ["충돌 / km", "랩 타임", "에피소드 진행", "보상 / 스텝"]
+    assert _titles(page)[-1] == "처리량"
+    # the traffic charts exist because this run measured traffic, and they sit before kl_ref
+    titles = _titles(page)
+    assert titles.index("차량 접촉 / 분") < titles.index("KL (원본 대비)")
+    assert titles[-3:] == ["커리큘럼 게이트 (충돌/km)", "채점된 트랙 수", "처리량"]
+    assert {"추월 성공 / 분", "벽 충돌 / 분", "접촉 위험 시간 비율"} <= set(titles)
+    coll = page._charts[("coll_per_km",)]
+    assert coll._series[0] == [50.0, 25.0, 50 / 3, 12.5, 10.0] and coll.lower_is_better
+
+
+def test_a_run_that_measured_no_traffic_gets_no_empty_traffic_charts(page, tmp_path):
+    """A solo run has no contacts to count. A flat zero line would read as "no contacts happened"."""
+    plain = [{k: v for k, v in r.items() if not k.startswith("traffic/")} for r in PPO_JSONL]
+    d = _run_with(tmp_path, "cl_solo", plain)
+    page._current_run = str(d)
+    page._tick(force=True)
+    assert not [t for t in _titles(page) if "분" in t]
+    assert _titles(page)[0] == "충돌 / km"
+
+
+def test_a_dagger_run_gets_its_own_charts_with_the_teacher_beside_the_student(page, tmp_path):
+    """52 coll/km is a disaster against a teacher at 7 and ordinary against a teacher at 48; the
+    student's curve alone does not say which. The old page had no DAgger charts at all."""
+    d = _run_with(tmp_path, "cl_dagger", DAGGER_JSONL)
+    page._current_run = str(d)
+    page._tick(force=True)
+    assert _titles(page) == ["충돌 / km · 학생 vs 교사", "증류 손실", "랩 타임 · 학생 vs 교사",
+                            "진행 속도 · 학생 vs 교사", "beta (교사 주행 비율)"]
+    ch = page._charts[("student_coll_per_km", "teacher_coll_per_km")]
+    assert len(ch._series) == 2 and ch.labels == ["학생", "교사"]
+    assert ch._series[0][0] == 52.6 and ch._series[1] == [7.2, 7.2, 7.2]
+    assert ch.x_label == "iter →"
+    # the tiles are the iteration's, not an update's: a DAgger run has no steps and no steps/s
+    assert page.m_upd.name_label.text() == "반복" and page.m_upd.value.text() == "3/6"
+    assert page.m_steps.name_label.text() == "샘플" and page.m_sps.name_label.text() == "손실"
+    assert page.m_sps.value.text() == "0.0233"
+
+
+def test_switching_between_the_two_kinds_rebuilds_the_grid(page, tmp_path):
+    ppo = _run_with(tmp_path, "cl_p", PPO_JSONL)
+    dag = _run_with(tmp_path, "cl_d", DAGGER_JSONL)
+    for run, first in ((ppo, "충돌 / km"), (dag, "충돌 / km · 학생 vs 교사"), (ppo, "충돌 / km")):
+        page._current_run = str(run)
+        page._tick(force=True)
+        assert _titles(page)[0] == first
+        assert page.charts_grid.count() == len(page._charts)
+
+
+def test_a_blank_chart_says_which_file_was_missing(page, tmp_path):
+    """The bug as reported: empty charts, and no way to tell a broken page from a run that left no
+    record. `fl_a0_control_s701` and every `cl_orc_a*` are exactly this -- stdout went to the
+    launching worker's own log directory, so the run directory holds checkpoints and nothing else."""
+    d = _run_with(tmp_path, "cl_nothing")
+    (d / "ppo_latest.pt").write_bytes(b"")
+    page._current_run = str(d)
+    page._tick(force=True)
+    note = page.source_note.text()
+    assert "progress.jsonl 없음" in note and "wandb output.log 없음" in note
+    assert "progress.jsonl" in note.split("—")[-1]           # and what to do about it
+    for ch in page._charts.values():
+        assert ch.placeholder.startswith("progress.jsonl 없음")
+        assert ch._series == [[]] or all(not s for s in ch._series)
+
+
+def test_the_source_is_named_when_there_is_one(page, tmp_path):
+    d = _run_with(tmp_path, "cl_ppo2", PPO_JSONL)
+    page._current_run = str(d)
+    page._tick(force=True)
+    note = page.source_note.text()
+    assert note.startswith("진행 기록: progress.jsonl") and "5개 지점" in note and "PPO" in note
+
+
+def test_the_run_list_says_per_run_where_its_curve_comes_from(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    (runs / "_console_jobs").mkdir(parents=True)
+    _run_with(tmp_path, "has_jsonl", PPO_JSONL)
+    _run_with(tmp_path, "has_console", files=[("console-train.log", LOG)])
+    _run_with(tmp_path, "has_nothing")
+    monkeypatch.setattr(T.catalog, "RUNS_DIR", str(runs))
+    tags = {name: subtitle.rsplit(" · ", 1)[-1] for name, _p, subtitle, _mt in T.list_run_dirs(str(runs))}
+    assert tags["has_jsonl"] == "기록 progress.jsonl"
+    assert tags["has_console"] == "기록 console-train.log"
+    assert tags.get("has_nothing") is None      # no curve and no checkpoint: not a run to watch yet
+
+
+def test_progress_jsonl_wins_over_every_log_but_an_empty_one_does_not(tmp_path):
+    """A run resumed under the new trainer has both. A `progress.jsonl` that exists but is still
+    empty -- the first minute of a run -- must not hide a log with thirty updates in it."""
+    d = _run_with(tmp_path, "cl_both", PPO_JSONL, files=[("console-train.log", LOG)])
+    assert T.read_progress(str(d)).source_kind == "progress"
+    (d / "progress.jsonl").write_text("")
+    p = T.read_progress(str(d))
+    assert p.source_kind == "console" and p.n_points == 1 and p.update == 12
+
+
+def test_the_wandb_fallback_reads_the_layout_on_disk(tmp_path):
+    """101 runs in `~/f1sim_runs` have one of these and nothing else; wandb 0.29 stopped writing
+    them, which is how the dashboard went blank in the first place."""
+    d = _run_with(tmp_path, "cl_wb")
+    wb = d / "wandb" / "run-20260914_031725-w5h31ib5" / "files"
+    wb.mkdir(parents=True)
+    (wb / "output.log").write_text(LOG)
+    (d / "wandb" / "latest-run").symlink_to(wb.parent)       # must not be read a second time
+    assert T.wandb_output_logs(str(d)) == [str(wb / "output.log")]
+    p = T.read_progress(str(d))
+    assert p.source_kind == "wandb" and p.update == 12
+
+
+def test_the_chart_reads_out_the_value_under_the_cursor(page, tmp_path):
+    """A curve is the shape; the number the run is at is what gets written down."""
+    d = _run_with(tmp_path, "cl_hover", PPO_JSONL)
+    page._current_run = str(d)
+    page._tick(force=True)
+    ch = page._charts[("coll_per_km",)]
+    ch.resize(300, 140)
+    assert ch._readout(4) == "10"                            # the last point, as drawn
+    ch.mouseMoveEvent(QtGui.QMouseEvent(
+        QtCore.QEvent.MouseMove, QtCore.QPointF(48.0, 70.0), QtCore.Qt.NoButton,
+        QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
+    assert ch._hover == 0 and ch._readout(ch._hover) == "50"
+    ch.leaveEvent(None)
+    assert ch._hover is None

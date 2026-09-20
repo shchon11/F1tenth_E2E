@@ -42,7 +42,8 @@ from .track import Track
 
 #: Where `--install` puts maps. Outside the repository on purpose: a venue map is a recording, it
 #: belongs to whoever made it, and a training run that depends on one should say where it came from.
-USER_MAPS = os.path.join(os.path.expanduser("~"), ".f1sim", "maps")
+USER_MAPS = os.path.abspath(os.path.expanduser(
+    os.environ.get("F1SIM_MAPS") or os.path.join("~", ".f1sim", "maps")))
 
 #: Car geometry the report judges the map against (`params.Config().vehicle`), so "does it fit" is
 #: answered in the same numbers the simulator drives with.

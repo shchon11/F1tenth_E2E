@@ -24,7 +24,7 @@ reports how many, so a backlog is a number on screen instead of a mystery.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace as dataclasses_replace
 from typing import Any, Dict, List, Optional
 
 PROTOCOL_VERSION = 1
@@ -80,6 +80,7 @@ STAGES = [
     ("compile", "torch.compile 컴파일 중"),
     ("geometry", "맵 지오메트리 만드는 중"),
     ("graph", "CUDA 그래프 캡처 중"),
+    ("controller", "자동 제어 준비 중"),
     ("done", "시작"),
 ]
 STAGE_TEXT = dict(STAGES)
@@ -111,20 +112,31 @@ class SessionConfig:
     speed_cap: Optional[float] = None    # None = whatever the checkpoint was trained at
     device: str = "auto"
     #: `torch.compile` the policy and the physics. Off by default: this is a *startup cost*, not
-    #: the GPU switch -- `device` decides that, and a session runs on CUDA either way. Compiling
-    #: pays for itself over a long run with many cars; for opening the viewer to look at one car it
-    #: costs minutes and returns nothing. Headless and training paths set it themselves and are
-    #: unaffected by this default.
+    #: the GPU switch -- `device` decides that, and a session runs on CUDA either way. Explicit
+    #: benchmark and headless callers may still enable it; ordinary driving leaves it disabled.
     compile: bool = False
     randomize: bool = True               # domain randomisation, as in training
     stochastic: bool = False
+    #: Who drives the other cars when there is no slot table. Kept for the sessions and recorded
+    #: configs written before `opponent_slots` existed, and for `cars_per_race == 1`, where there is
+    #: no other car for a table to describe.
     opponent: str = "teacher"
-    #: The plan controller is the tracker and nothing else. The friction-clamp arms it used to
-    #: offer (`fixed_low` / `estimated` / `oracle`) were the retraining-free way to make a policy
-    #: that had never been told the floor drive it safely; a dial policy is told, and stacking a
-    #: clamp on one was measured worse on every friction. The field stays at "legacy" so the worker
-    #: and the frozen benchmark rosters keep one spelling for "nothing installed".
+    #: The per-car table (`f1sim.opponent_slots`), as plain JSON objects -- `cars_per_race - 1` of
+    #: them, one per grid slot. This is the same shape `--opp-slots` takes, deliberately: the
+    #: driving page and the training page share one widget, and a session saved here can be pasted
+    #: into a training command. None = no table, and `opponent` above decides instead.
+    opponent_slots: Optional[List[Dict[str, Any]]] = None
+    #: Plan-controller arm installed at run time (`learn.grip_runtime`).
+    #:
+    #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs
+    #: nothing but the checkpoint you picked. `auto` needs a frozen grip estimator, and that file
+    #: is not in the repository, is not produced by any default run, and is not on the machine this
+    #: was written on: with `auto` as the default, pressing 시작 on a fresh install failed with
+    #: "자동 노면 추정 모델을 찾지 못했습니다" and no way forward. The experiment arms and the
+    #: estimator path are still here for explicit benchmark and debug callers, who have the file.
     controller: str = "legacy"
+    #: Optional frozen grip-estimator path for explicit callers. An empty value lets the worker
+    #: resolve its configured default internally.
     estimator: str = ""
     #: Surface friction. "random" draws mu per car per reset from the training range (when
     #: randomisation is on) or leaves it nominal; "fixed" pins every car to `mu`, re-applied after
@@ -144,6 +156,53 @@ class SessionConfig:
     saliency: bool = False
     internals: bool = False
     max_render_cars: int = 64
+    #: Recording settings (`viewer/recorder.py`). Carried here so a session remembers them and a
+    #: saved config reproduces the clip, and excluded from `affects_simulation` below: changing the
+    #: frame rate is not a different simulation, and restarting the session to change it would throw
+    #: away the run you were about to film.
+    record_dir: str = ""                 # "" = ~/f1sim_videos
+    record_width: int = 1280             # 0 x 0 = whatever the window is
+    record_height: int = 720
+    record_fps: int = 30
+    record_camera: str = ""              # "" = whatever the viewport is showing
+    record_overlays: bool = True
+    record_seconds: float = 0.0          # 0 = until stopped
+    record_encoder: str = "auto"         # auto prefers the GPU's h264_nvenc where it works
+
+    def record_spec(self, scenario: str = "", window=(1280, 720)):
+        """These settings as a `viewer.recorder.RecordSpec`, with the output path filled in.
+
+        Built here rather than in the window so the console, a test and any later caller ask the
+        same object for it; `resolved` turns "현재 창 크기" into numbers and makes both sides even
+        for the encoder.
+        """
+        import os
+
+        from .. import recorder as R
+        spec = R.RecordSpec(path="", width=int(self.record_width), height=int(self.record_height),
+                            fps=int(self.record_fps), camera=str(self.record_camera),
+                            overlays=bool(self.record_overlays),
+                            seconds=float(self.record_seconds),
+                            encoder=str(self.record_encoder or "auto"))
+        spec = spec.resolved(window)
+        name = os.path.basename(R.default_video_path(scenario or self.map_name))
+        return dataclasses_replace(spec, path=os.path.join(self.record_dir or R.VIDEO_DIR, name))
+
+    def slots(self):
+        """The table as `OpponentSlot`s, or None. Raises ValueError with the parser's own reason."""
+        from ... import opponent_slots as osl
+        return osl.parse_slots(self.opponent_slots) if self.opponent_slots else None
+
+    def opponent_summary(self) -> str:
+        """One short line naming who the other cars are, for a header. "" for a solo session."""
+        if int(self.cars_per_race) < 2:
+            return ""
+        try:
+            slots = self.slots()
+        except ValueError:
+            slots = None
+        from ... import opponent_slots as osl
+        return osl.mix_summary(slots) if slots else str(self.opponent)
 
     @property
     def total_cars(self) -> int:
@@ -197,6 +256,10 @@ class SessionConfig:
         for k in ("saliency", "internals", "max_render_cars"):
             a.pop(k, None)
             b.pop(k, None)
+        for k in list(a):
+            if k.startswith("record_"):    # recording settings describe the film, not the race
+                a.pop(k, None)
+                b.pop(k, None)
         return a != b
 
 

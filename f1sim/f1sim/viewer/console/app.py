@@ -43,10 +43,57 @@ def create_app(argv: Optional[list] = None, samples: int = 4, vsync: bool = True
     app = QtWidgets.QApplication(argv if argv is not None else sys.argv)
     # what we asked the platform for, so a report can say "asked 4x, got N" rather than assuming
     app.setProperty("f1sim_msaa_requested", int(samples))
-    app.setApplicationName("f1sim 주행 콘솔")
+    # ASCII, on purpose. Qt publishes the window title twice on X11: `_NET_WM_NAME` in UTF-8 and
+    # the legacy `WM_NAME` in Latin-1. Plenty of panels, docks and alt-tab switchers still read the
+    # legacy one, and a Korean name comes out of it as "f1sim ì£¼í–‰ ì½˜ì†”". The Korean name is not
+    # lost: it is on the header inside the window, and in the desktop entry's `Name[ko]`, which is
+    # UTF-8 by specification and handled correctly.
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setOrganizationName("f1sim")
+    # Lets a dock match the running window to its .desktop file, and take the icon and the
+    # localised name from there. Without it a dock falls back on WM_CLASS and the legacy title.
+    if hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName(DESKTOP_ID)
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     apply_theme(app)
     return app
+
+
+#: What the window manager, the taskbar and the desktop entry call this program. See
+#: `create_app` for why it is not the Korean name.
+APP_NAME = "f1sim Console"
+
+#: The desktop entry's basename, without `.desktop`. Reverse-DNS so it cannot collide.
+DESKTOP_ID = "io.f1sim.Console"
+
+
+def icon_dir() -> str:
+    """Where the icon files live, resolved through the imported package rather than a repo path,
+    so it works the same from a checkout, a wheel and an AppImage."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "assets", "branding")
+
+
+def app_icon() -> QtGui.QIcon:
+    """The application icon at every size that ships, or a null icon if none is installed.
+
+    Every size is added rather than only the largest: Qt downscales a 512 px tile into a 16 px
+    tray slot as mush, and the small PNGs are drawn for the size they are.
+    """
+    icon = QtGui.QIcon()
+    d = icon_dir()
+    for n in (16, 24, 32, 48, 64, 128, 256, 512):
+        p = os.path.join(d, f"f1sim-{n}.png")
+        if os.path.exists(p):
+            icon.addFile(p, QtCore.QSize(n, n))
+    if icon.isNull():
+        svg = os.path.join(d, "f1sim.svg")
+        if os.path.exists(svg):
+            icon.addFile(svg)
+    return icon
 
 
 def apply_theme(app: QtWidgets.QApplication) -> None:

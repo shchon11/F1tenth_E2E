@@ -31,6 +31,7 @@ from f1sim.viewer.console.protocol import (STATE_PAUSED, STATE_RUNNING,  # noqa:
 from f1sim.viewer.console.session import SessionController               # noqa: E402
 from f1sim.viewer.console.window import ConsoleWindow                    # noqa: E402
 import f1sim.viewer.sim_worker as sim_worker                             # noqa: E402
+from f1sim.viewer import recorder as REC                                 # noqa: E402
 
 SMOKE_MAP = "gen:competition:2"
 
@@ -106,7 +107,10 @@ def test_real_frames_pass_the_console_validator(live):
 
 
 def test_the_facts_reached_the_window(live):
-    assert SMOKE_MAP in live.window.header_summary.text()
+    """The header names the scenario the worker *built*, in the short grammar the picker speaks --
+    `gen/comp-2`, not the loader's `gen:competition:2`. The assertion predated that rename."""
+    from f1sim import tracks as _T
+    assert _T.parse(SMOKE_MAP).short() in live.window.header_summary.text()
     assert live.window.combo_focus.count() >= 1
     assert live.window.viewport.lidar_cfg.get("n_beams", 0) > 0
     assert live.window.viewport.color_v_max > 0
@@ -173,6 +177,94 @@ def test_pause_settles_only_on_the_workers_ack(live):
     live.wait_for(lambda: live.window.state == STATE_RUNNING, timeout=30, what="RUNNING after ack")
     live.wait_for(lambda: live.controller.buffer.latest["t"] > t_paused, timeout=30,
                   what="time advancing again")
+
+
+# ==================================================================== 녹화 (deliverable 6)
+def _ffprobe(path):
+    import json
+    import subprocess
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    j = json.loads(out.stdout)
+    v = next(st for st in j["streams"] if st.get("codec_type") == "video")
+    return v, j["format"]
+
+
+def test_a_two_second_recording_is_a_playable_mp4(live, tmp_path, monkeypatch):
+    """The whole feature, end to end: a real spawned worker, real frames, a real file.
+
+    Pinned to `libx264` rather than left on `auto`: the GPU here belongs to whatever else is
+    running, and what this test is about is that the frames reach an encoder and come back as a
+    playable file -- not which encoder took them. `test_recorder.py` covers the choice.
+    """
+    pytest.importorskip("PIL")
+    if not REC.ffmpeg_available():
+        pytest.skip("no ffmpeg")
+    monkeypatch.setenv(REC.ENCODER_ENV, "libx264")
+    w = live.window
+    w.edit_record.setText(str(tmp_path))
+    w.combo_res.setCurrentIndex(0)                       # 720p, whatever the window is
+    w.combo_fps.setCurrentIndex(list(REC.FPS_CHOICES).index(30))
+    w.spin_rec_secs.setValue(0)                          # stopped by hand, below
+    spec = w.record_settings()
+    assert (spec.width, spec.height, spec.fps) == (1280, 720, 30)
+
+    w._on_record_toggle()
+    assert w.recording, w.record_note.text()
+    assert w.header_rec.isVisible(), "the header must say a file is being written"
+    live.wait_for(lambda: w._recorder.written >= 60, timeout=120,
+                  what="60 frames (2 s at 30 fps) through the encoder")
+    w._stop_recording("test")
+    assert not w.recording and not w.header_rec.isVisible()
+
+    rec_path = spec.path
+    assert os.path.isfile(rec_path), w.record_note.text()
+    v, fmt = _ffprobe(rec_path)
+    assert (v["width"], v["height"]) == (1280, 720), v
+    assert v["avg_frame_rate"] == "30/1", v["avg_frame_rate"]
+    assert v["codec_name"] == "h264"
+    assert abs(float(fmt["duration"]) - 2.0) <= 0.2, fmt["duration"]
+    # what the console tells the user about it
+    assert "libx264" in w.record_note.text() and "열기" in w.record_note.text()
+
+
+def test_a_screenshot_is_a_png_at_the_size_that_was_asked_for(live, tmp_path):
+    """1080p from a 1200x760 window: the capture is its own offscreen render, so the window's size
+    is not the picture's size."""
+    pytest.importorskip("PIL")
+    from PIL import Image
+    w = live.window
+    w.edit_record.setText(str(tmp_path))
+    w.combo_res.setCurrentIndex(1)                       # 1080p
+    w._on_screenshot()
+    pngs = [p for p in os.listdir(tmp_path) if p.endswith(".png")]
+    assert pngs, w.status_text.text()
+    with Image.open(os.path.join(tmp_path, pngs[0])) as img:
+        assert img.size == (1920, 1080), img.size
+
+
+def test_recording_a_different_camera_leaves_the_window_alone(live, tmp_path, monkeypatch):
+    """A clip filmed from the chase camera with the overlays off must not move the view the user is
+    watching -- the capture re-draws the same frame, and puts back everything that draw advanced."""
+    if not REC.ffmpeg_available():
+        pytest.skip("no ffmpeg")
+    monkeypatch.setenv(REC.ENCODER_ENV, "libx264")
+    w = live.window
+    w.viewport.camera = "overview"
+    w.viewport.show_lidar = True
+    before = (w.viewport.camera, w.viewport.show_lidar, w.viewport._spin.copy(),
+              w.viewport._chase_heading)
+    w.edit_record.setText(str(tmp_path))
+    w.combo_res.setCurrentIndex(0)
+    w.combo_rec_cam.setCurrentIndex(w.combo_rec_cam.findData("chase"))
+    w.chk_rec_overlay.setChecked(False)
+    w._on_record_toggle()
+    live.wait_for(lambda: w._recorder.written >= 5, timeout=60, what="a few recorded frames")
+    w._stop_recording("test")
+    w.combo_rec_cam.setCurrentIndex(0)
+    w.chk_rec_overlay.setChecked(True)
+    assert w.viewport.camera == before[0] and w.viewport.show_lidar == before[1]
 
 
 def test_the_event_loop_kept_answering_throughout(live):

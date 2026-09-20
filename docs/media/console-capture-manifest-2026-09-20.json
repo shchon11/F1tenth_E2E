@@ -1,0 +1,37 @@
+{
+  "captured": "2026-09-20T18:40:02+0900",
+  "script": "f1sim/scripts/capture_console_media.py",
+  "argv": [
+    "--settle",
+    "8"
+  ],
+  "checkpoint": {
+    "path": "checkpoints/dial_student_s901.pt",
+    "sha256": "a27fd18f685d1712",
+    "bytes": 9051883
+  },
+  "map": "gen:competition:2",
+  "window": "1920x1200",
+  "device": "cpu",
+  "gl_renderer": "unknown (glxinfo not installed)",
+  "python": "3.10.12",
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+  "files": {
+    "f1tenth-visualizer-overview.png": {
+      "note": "whole window, overview camera",
+      "sha256": "0f500f6fb3741c26",
+      "bytes": 575564
+    },
+    "f1tenth-visualizer-chase.png": {
+      "note": "chase camera, setup panel collapsed by the app's toggle",
+      "sha256": "d20c0ef3b36b5c9d",
+      "bytes": 561369
+    },
+    "f1tenth-visualizer-policy-panel.png": {
+      "note": "detail crop of the policy input/output strip, at that widget's own geometry",
+      "sha256": "503aa5aab8c410c5",
+      "bytes": 12378
+    }
+  },
+  "read_honestly": "With --gpu absent these are software-rendered on the CPU. The sim 배속 and 렌더 fps figures visible in the panels are llvmpipe figures and are NOT performance numbers."
+}

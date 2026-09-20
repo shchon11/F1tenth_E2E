@@ -183,18 +183,73 @@ def test_single_sample_step_still_carries_an_orientation(meta):
     assert only.header.stamp == pytest.approx(4.995, abs=1e-12)
 
 
-def test_ros_bridge_sources_match_these_rules():
-    """Pin the transcription above to what the bridges actually contain."""
+def test_the_vesc_bridge_source_matches_these_rules():
+    """Pin the transcription above to what `vesc_sim_node` actually contains.
+
+    `bridge_node` no longer matches these strings: its messages are built by
+    `f1sim_ros/sim_messages.py`, which it shares with `eval_node`. That module is checked by
+    behaviour instead -- `test_the_shared_builders_obey_the_same_rules` below runs the real
+    functions against the same three contracts, which is a stronger check than a substring.
+    """
     import os
     root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                         "f1sim_ros", "f1sim_ros")
-    for name in ("bridge_node.py", "vesc_sim_node.py"):
-        src = open(os.path.join(root, name)).read()
-        assert 'sweep = m["time_increment"] * (len(ranges) - 1)' in src, f"{name}: scan sweep offset"
-        assert "stamp = (now - Duration(seconds=sweep)).to_msg()" in src, f"{name}: first-ray stamp"
-        assert "Duration(seconds=float(offsets[k]))" in src, f"{name}: per-sample imu stamp"
-        assert "Duration(seconds=float(offsets[-1]))" in src, f"{name}: summary at latest sample"
-        assert "if k == K - 1:" in src, f"{name}: orientation only on the last sample"
+    src = open(os.path.join(root, "vesc_sim_node.py")).read()
+    assert 'sweep = m["time_increment"] * (len(ranges) - 1)' in src, "scan sweep offset"
+    assert "stamp = (now - Duration(seconds=sweep)).to_msg()" in src, "first-ray stamp"
+    assert "Duration(seconds=float(offsets[k]))" in src, "per-sample imu stamp"
+    assert "Duration(seconds=float(offsets[-1]))" in src, "summary at latest sample"
+    assert "if k == K - 1:" in src, "orientation only on the last sample"
+
+
+def test_the_shared_builders_obey_the_same_rules(meta):  # noqa: C901
+    """The real `sim_messages`, against the three contracts the transcription above encodes.
+
+    Needs the ROS message packages, which the transcription exists precisely to do without -- so it
+    skips rather than weakening the file. When it does run, it is what makes the transcription
+    trustworthy: `bridge_node` and `eval_node` both call these functions and nothing else.
+    """
+    pytest.importorskip("sensor_msgs.msg")
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "f1sim_ros"))
+    from f1sim_ros import sim_messages as sm
+
+    # 1. the scan stamp is one sweep before the end of the step. The full header the message
+    # needs, not just the timing fields the transcription above uses.
+    full = dict(meta, angle_min=-2.35619449, angle_max=2.35619449,
+                angle_increment=4.71238898 / (meta["n_beams"] - 1), range_min=0.0, range_max=10.0)
+    ranges = np.full(meta["n_beams"], 3.0, dtype=np.float32)
+    sweep = sm.scan_sweep_seconds(full, len(ranges))
+    assert sweep == pytest.approx(meta["time_increment"] * (len(ranges) - 1), abs=1e-15)
+    msg = sm.scan_message(full, ranges, _stamp(5.0 - sweep))
+    assert msg.range_max == pytest.approx(10.0)
+    assert len(msg.ranges) == len(ranges)
+
+    # 2. every IMU sample at its own offset before the step end, summary at the latest sample
+    offsets = np.array([0.021, 0.004])
+    raw, summary = sm.imu_messages(np.zeros((2, 6)), np.array([0.1, 0.2, 0.3]), offsets,
+                                   lambda dt: _stamp(5.0 - dt))
+    assert [_seconds(m.header.stamp) for m in raw] == pytest.approx([4.979, 4.996], abs=1e-9)
+    assert _seconds(summary.header.stamp) == pytest.approx(4.996, abs=1e-9)
+
+    # 3. orientation only on the sample the attitude belongs to
+    assert raw[0].orientation_covariance[0] == -1.0
+    assert raw[1].orientation_covariance[0] == 0.0
+    q = raw[1].orientation
+    assert q.w ** 2 + q.x ** 2 + q.y ** 2 + q.z ** 2 == pytest.approx(1.0, abs=1e-12)
+    assert sm.imu_messages(np.zeros((1, 6)), np.zeros(3), np.array([0.005]),
+                           lambda dt: _stamp(5.0 - dt))[0][0].orientation_covariance[0] == 0.0
+
+
+def _stamp(sec):
+    from builtin_interfaces.msg import Time
+    return Time(sec=int(sec), nanosec=int(round((sec - int(sec)) * 1e9)) % 1_000_000_000)
+
+
+def _seconds(stamp):
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
 
 # --------------------------------------------------------------------------- VESC ypr convention

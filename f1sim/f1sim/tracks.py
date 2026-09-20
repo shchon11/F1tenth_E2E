@@ -30,6 +30,7 @@ that discovers racetracks, gym maps and editor scenes.
 from __future__ import annotations
 
 import glob
+import math
 import os
 import random
 import re
@@ -55,34 +56,132 @@ FAMILY_LABEL = {"real": "실측", "rt": "레이스트랙", "gen": "생성", "gym
 DIRECTIONS: Tuple[str, ...] = ("", "rev", "mir", "mir+rev")
 DIRECTION_LABEL = {"": "정방향", "rev": "역방향", "mir": "거울", "mir+rev": "거울+역방향"}
 
-#: Obstacle families. The key is what goes after `#`; `""` is a clean lap.
-#: The names are what the obstacles *do*, which is the thing a user is choosing between --
+#: The **procedural** obstacle families -- the ones a loader *adds* to a map. Each takes a placement
+#: seed. The names are what the obstacles *do*, which is the thing a user is choosing between --
 #: `+obs` vs `+rlobs` said which function stamped them.
-OBSTACLES: Tuple[str, ...] = ("", "edge", "line", "pinch", "props", "hard")
-OBSTACLE_LABEL = {"": "없음", "edge": "가장자리", "line": "주행선 위", "pinch": "좁아짐", "props": "입체",
-                  "hard": "극단 (직접 만든 맵처럼)"}
+OBSTACLE_FAMILIES: Tuple[str, ...] = ("edge", "line", "pinch", "props", "hard")
+
+#: `bare`: not a family, and the reason this axis has three kinds of value rather than two.
+#:
+#: `""` used to be labelled 없음 and meant "no procedural family". For a plain map those are the
+#: same sentence. For an editor scene they are not: the scene carries the props its author placed,
+#: so "없음" showed a map full of boxes. The user said so (2026-09-15): *"장애물 없음이라는 말과
+#: 안맞아"*. So the axis now separates the two: `""` is **기본**, the map as authored, and `bare` is
+#: **없음**, the authored props removed. `bare` takes no seed -- there is nothing to place.
+BARE = "bare"
+
+#: What the 장애물 control offers, in list order: 기본, 없음, then the families.
+OBSTACLES: Tuple[str, ...] = ("", BARE) + OBSTACLE_FAMILIES
+# Fresh controls choose placement, never a separate rendering/physics category.
+ASSET_OBSTACLES = (BARE, "", "edge", "line", "hard")
+ASSET_PLACEMENT_LABEL = {BARE: "없음", "": "기본", "edge": "랜덤 · 낮음",
+                         "line": "랜덤 · 중간", "hard": "랜덤 · 높음"}
+ASSET_PLACEMENT_HINT = {BARE: "배치 장애물을 모두 제거합니다.",
+    "": "맵에 작성자가 배치한 장애물을 그대로 사용합니다.",
+    "edge": "기존 에셋의 종류와 크기를 무작위로 골라 드물게 배치합니다.",
+    "line": "기존 에셋의 종류와 크기를 무작위로 골라 가장자리와 주행선에 배치합니다.",
+    "hard": "기존 극단 배치처럼 줄·사선·시케인·정점·군집·작은 물체를 조밀하게 배치합니다."}
+
+def asset_scenario(spec):
+    sc = _parse_spec(spec) if is_spec(spec) and "!assets=" not in spec else parse(spec)
+    return replace(sc, obstacle={"props": "edge", "pinch": "line"}.get(sc.obstacle, sc.obstacle),
+                   asset="mixed", scale=1.0).short() if sc.obstacle else spec
+
+ASSET_LABELS = {"mixed": "모든 에셋 혼합", "cardboard_box": "골판지 상자",
+                "wooden_crate": "나무 상자", "steel_drum": "드럼통",
+                "crate_stack_low": "낮은 상자 더미", "barrier_block": "방호 블록",
+                "marker_post": "표지 기둥"}
+
+def asset_options():
+    from .props import STYLES
+    return ("mixed",) + tuple(STYLES)
+
+def asset_obstacle_options(track_id):
+    return ("", BARE) if get(track_id).family == "gym" else ASSET_OBSTACLES
+
+OBSTACLE_LABEL = {"": "기본", BARE: "없음", "edge": "가장자리", "line": "주행선 위", "pinch": "좁아짐",
+                  "props": "입체", "hard": "극단 (직접 만든 맵처럼)"}
 OBSTACLE_HINT = {
-    "": "장애물 없이 빈 트랙을 그대로 달립니다.",
+    "": "맵을 만들어진 그대로 씁니다. 에디터에서 장애물을 배치한 장면이면 그 장애물이 그대로 나옵니다.",
+    BARE: "배치된 장애물을 걷어내고 벽만 남깁니다. 배치 장애물이 없는 맵에서는 '기본'과 같습니다.",
     "edge": "차선 가장자리에 상자를 세웁니다. 주행선은 비어 있습니다 (옛 이름 +obs).",
     "line": "주행선 위에 상자를 세웁니다. 피해서 계획해야 합니다 (옛 이름 +rlobs).",
     "pinch": "몇 군데에서 차선 폭을 좁힙니다 (옛 이름 +pinch).",
     "props": "상자·궤짝·드럼을 입체로 세웁니다. 점유 격자가 아니라 유한한 볼록 단면입니다 (옛 이름 +props).",
     "hard": "직접 만든 맵처럼: 상자 줄·사선 장벽·시케인·코너 정점·덩어리·작은 물체. 차선의 55~75 %는 남깁니다 (옛 이름 +hard).",
 }
+#: Every family ADDS to whatever the map already has. Said once, here, because it is the sentence
+#: the old 없음 label contradicted.
+OBSTACLE_ADDS_HINT = "장애물 종류는 맵이 이미 가진 것 *위에* 더합니다. 먼저 걷어내려면 '배치 장애물 먼저 제거'."
+
 #: new name -> the loader's suffix. The loader is not renamed: every checkpoint, manifest and
-#: frozen benchmark file in this repository names its tracks in the old grammar.
-LEGACY_OBSTACLE = {"edge": "obs", "line": "rlobs", "pinch": "pinch", "props": "props", "hard": "hard"}
+#: frozen benchmark file in this repository names its tracks in the old grammar. `bare` is new on
+#: both sides and spelled the same in both (`+bare`), because it has no old name to preserve.
+LEGACY_OBSTACLE = {BARE: "bare", "edge": "obs", "line": "rlobs", "pinch": "pinch",
+                   "props": "props", "hard": "hard"}
 OBSTACLE_FROM_LEGACY = {v: k for k, v in LEGACY_OBSTACLE.items()}
 
-#: Which obstacle families a family of tracks can actually carry, from `maps._load_base`:
-#: racetracks and editor scenes only understand `+props`.
+#: Which obstacle choices a family of tracks can carry, from `maps._load_base`: racetracks and
+#: editor scenes only understand `+props` among the *families*. `""` and `bare` are on every map --
+#: `bare` drops placed props and is simply a no-op where there are none, which is what makes it
+#: safe to offer everywhere and what lets a console grey it rather than hide it.
 OBSTACLES_BY_FAMILY = {
-    "real": ("", "edge", "line", "pinch", "props", "hard"),
-    "gen": ("", "edge", "line", "pinch", "props", "hard"),
-    "rt": ("", "props", "hard"),
-    "scene": ("", "props", "hard"),
-    "gym": ("",),
+    "real": ("", BARE, "edge", "line", "pinch", "props", "hard"),
+    "gen": ("", BARE, "edge", "line", "pinch", "props", "hard"),
+    "rt": ("", BARE, "props", "hard"),
+    "scene": ("", BARE, "props", "hard"),
+    "gym": ("", BARE),
 }
+
+
+def obstacle_choice(bare: bool, obstacle: str) -> str:
+    """The single key the 장애물 control works in: `""`, `"bare"`, a family, or `"bare+<family>"`."""
+    if not bare:
+        return obstacle
+    return f"{BARE}+{obstacle}" if obstacle else BARE
+
+
+def split_choice(choice: str) -> Tuple[bool, str]:
+    """`"bare+hard"` -> (True, "hard"). The inverse of `obstacle_choice`."""
+    c = (choice or "").strip()
+    bare = False
+    if c == BARE:
+        return True, ""
+    if c.startswith(BARE + "+"):
+        bare, c = True, c[len(BARE) + 1:]
+    if c and c not in OBSTACLE_FAMILIES:
+        raise TrackError(f"장애물 종류를 알 수 없습니다: {choice!r} "
+                         f"({', '.join(OBSTACLE_LABEL[o] for o in OBSTACLES)})")
+    return bare, c
+
+
+def choice_label(choice: str) -> str:
+    """Korean text for a 장애물 choice key, compound ones included: `bare+hard` -> `없음 + 극단 …`."""
+    bare, family = split_choice(choice)
+    if bare and family:
+        return f"{OBSTACLE_LABEL[BARE]} + {OBSTACLE_LABEL[family]}"
+    return OBSTACLE_LABEL[BARE if bare else family]
+
+
+def scene_props(track_id: str) -> Optional[int]:
+    """How many props the author placed on this track, or None when the count is not knowable here.
+
+    Only an editor scene can carry them (every other loader builds a track with `props == ()`), and
+    `scene.list_scenes` already reports the number without opening the grids -- so this stays
+    torch-free and cheap enough for a combo to ask on every selection change.
+    """
+    tid = (track_id or "").strip()
+    if not tid.startswith("scene/"):
+        return 0 if tid and "/" in tid and tid.split("/", 1)[0] in FAMILIES else None
+    name = tid.split("/", 1)[1]
+    try:
+        from .scene import list_scenes
+        for s in list_scenes():
+            if s["name"] == name:
+                return int(s["props"])
+    except Exception:
+        return None
+    return None
 
 
 # ---------------------------------------------------------------- the registry
@@ -307,7 +406,8 @@ def catalog(scenes: bool = True, gen_starters: bool = True,
 
 
 # ---------------------------------------------------------------- the scenario grammar
-_SPEC = re.compile(r"^(?P<track>[A-Za-z0-9_\-./]+?)(?:@(?P<dir>[a-z+]+))?(?:#(?P<obs>[a-z]+):(?P<seed>\*|\d+))?$")
+_SPEC = re.compile(r"^(?P<track>[A-Za-z0-9_\-./]+?)(?:@(?P<dir>[a-z+]+))?"
+                   r"(?:#(?P<obs>[a-z+]+)(?::(?P<seed>\*|\d+))?)?$")
 
 
 @dataclass(frozen=True)
@@ -321,14 +421,22 @@ class Scenario:
     track: str = ""
     reverse: bool = False
     mirror: bool = False
+    #: A *procedural family* (`OBSTACLE_FAMILIES`) or `""`. Never `bare` -- that is the flag below,
+    #: because "remove what the author placed" and "add boxes of kind X" are two different things
+    #: that a custom scene wants to ask for at the same time (`scene:x+bare+hard3`).
     obstacle: str = ""
     seed: Optional[int] = None
+    #: Drop the props the map's author placed before anything is added. No-op on a map that has
+    #: none, which is every map except an editor scene.
+    bare: bool = False
     #: Set when the name is not one this module can spell. `legacy()` and `short()` then return it
     #: verbatim -- rebuilding a string we do not understand is how a name silently becomes a
     #: different map. `track` may still be filled in: an *unknown obstacle family on a known map*
     #: (another branch is training with `+hard<seed>`) is still that map, and a list of them should
     #: group and count as that map rather than as one new map per entry.
     raw: str = ""
+    asset: str = ""  # empty preserves historical raster scenario interpretation
+    scale: float = 1.0
 
     # -- the option axes
     @property
@@ -338,6 +446,11 @@ class Scenario:
     @property
     def random_seed(self) -> bool:
         return bool(self.obstacle) and self.seed is None
+
+    @property
+    def choice(self) -> str:
+        """This scenario's 장애물 selection as the control's single key (`obstacle_choice`)."""
+        return obstacle_choice(self.bare, self.obstacle)
 
     @property
     def entry(self) -> TrackEntry:
@@ -355,9 +468,10 @@ class Scenario:
                 raise TrackError(f"방향을 알 수 없습니다: {direction!r} ({', '.join(d or '정방향' for d in DIRECTIONS)})")
             sc = replace(sc, mirror="mir" in direction, reverse="rev" in direction)
         if obstacle is not None:
-            if obstacle not in OBSTACLES:
-                raise TrackError(f"장애물 종류를 알 수 없습니다: {obstacle!r} ({', '.join(o or '없음' for o in OBSTACLES)})")
-            sc = replace(sc, obstacle=obstacle, seed=None if not obstacle else sc.seed)
+            # Takes the control's key, so `"bare"` and `"bare+hard"` are as sayable here as a bare
+            # family name is. A choice with no family has no seed to keep.
+            bare_, family = split_choice(obstacle)
+            sc = replace(sc, bare=bare_, obstacle=family, seed=None if not family else sc.seed)
         if random:
             sc = replace(sc, seed=None)
         elif seed is not None:
@@ -372,9 +486,14 @@ class Scenario:
         s = self.track
         if self.direction:
             s += f"@{self.direction}"
-        if self.obstacle:
-            s += f"#{self.obstacle}:{'*' if self.seed is None else self.seed}"
-        return s
+        if self.bare or self.obstacle:
+            s += "#" + self.choice
+            if self.obstacle:                      # `bare` alone has nothing to place, so no seed
+                s += f":{'*' if self.seed is None else self.seed}"
+        return s + self.asset_suffix()
+
+    def asset_suffix(self):
+        return f"!assets={self.asset}:{self.scale:g}" if self.asset else ""
 
     def legacy(self) -> str:
         """The loader's grammar: `real:blackbox2022_1+rlobs44~mir~rev`. Suffix order is the
@@ -382,6 +501,11 @@ class Scenario:
         if self.raw:
             return self.raw
         s = self.entry.legacy
+        if self.bare:
+            # Before the family suffix, because that is the order the loader applies them: the
+            # author's props are dropped from the *base* map and the family is then added to what
+            # is left. `maps._load_base` reads it the same way round.
+            s += "+bare"
         if self.obstacle:
             if self.seed is None:
                 raise TrackError(f"{self.short()}: 시드가 무작위입니다. expand()/with_seed() 로 "
@@ -391,7 +515,7 @@ class Scenario:
             s += "~mir"
         if self.reverse:
             s += "~rev"
-        return s
+        return s + self.asset_suffix()
 
     def display(self) -> str:
         """One human line: `Blackbox 2022 #1 · 역방향 · 주행선 위 (시드 44)`."""
@@ -403,16 +527,26 @@ class Scenario:
         parts = [self.entry.display]
         if self.direction:
             parts.append(DIRECTION_LABEL[self.direction])
+        if self.bare:
+            parts.append(OBSTACLE_LABEL[BARE])
         if self.obstacle:
             seed = "무작위" if self.seed is None else f"시드 {self.seed}"
-            parts.append(f"{OBSTACLE_LABEL[self.obstacle]} ({seed})")
+            label = ASSET_PLACEMENT_LABEL.get(self.obstacle, OBSTACLE_LABEL[self.obstacle]) if self.asset else OBSTACLE_LABEL[self.obstacle]
+            parts.append(f"{label} ({seed})")
+        if self.asset:
+            parts.append("에셋·크기 자동 무작위" if self.asset == "mixed" and self.scale == 1 else
+                         f"{ASSET_LABELS.get(self.asset, self.asset)} · 크기 배율 {self.scale:g}×")
         return " · ".join(parts)
 
     def validate(self) -> "Scenario":
         """Raise when the track cannot carry the obstacle family asked for."""
         if self.raw or not self.obstacle:
             return self
-        allowed = self.entry.obstacle_options()
+        if self.asset and self.asset not in asset_options():
+            raise TrackError(f"알 수 없는 장애물 에셋: {self.asset}")
+        if not math.isfinite(self.scale) or self.scale <= 0:
+            raise TrackError("장애물 크기는 양수여야 합니다")
+        allowed = asset_obstacle_options(self.track) + ("props", "pinch") if self.asset else self.entry.obstacle_options()
         if self.obstacle not in allowed:
             raise TrackError(
                 f"{self.entry.display} ({self.track}) 은 '{OBSTACLE_LABEL[self.obstacle]}' 장애물을 "
@@ -434,6 +568,19 @@ def parse(spec: str) -> Scenario:
     s = (spec or "").strip()
     if not s:
         raise TrackError("빈 트랙 이름입니다.")
+    if "!assets=" in s:
+        base, config = s.rsplit("!assets=", 1)
+        try:
+            asset, scale = config.split(":")
+            scale = float(scale)
+        except (ValueError, TypeError) as exc:
+            raise TrackError("에셋 설정 형식은 !assets=<에셋>:<크기> 입니다") from exc
+        if asset not in asset_options() or not math.isfinite(scale) or scale <= 0:
+            raise TrackError("등록된 에셋과 양수 크기를 지정하세요")
+        sc = _parse_spec(base) if is_spec(base) else _parse_legacy(base)
+        if sc.raw:
+            raise TrackError("에셋 설정에는 등록된 트랙이 필요합니다")
+        return replace(sc, asset=asset, scale=scale).validate()
     if is_spec(s):
         return _parse_spec(s).validate()
     return _parse_legacy(s)
@@ -450,14 +597,17 @@ def _parse_spec(s: str) -> Scenario:
     if direction not in DIRECTIONS:
         raise TrackError(f"방향을 알 수 없습니다: {direction!r} "
                          f"({', '.join(d for d in DIRECTIONS if d)})")
-    obstacle = m.group("obs") or ""
-    if obstacle and obstacle not in OBSTACLES:
-        raise TrackError(f"장애물 종류를 알 수 없습니다: {obstacle!r} "
-                         f"({', '.join(o for o in OBSTACLES if o)})")
+    bare, obstacle = split_choice(m.group("obs") or "")
     raw_seed = m.group("seed")
+    if obstacle and raw_seed is None:
+        raise TrackError(f"장애물 '{OBSTACLE_LABEL[obstacle]}' 에는 시드가 필요합니다: "
+                         f"#{m.group('obs')}:<시드> 또는 #{m.group('obs')}:* (무작위)")
+    if not obstacle and raw_seed is not None:
+        raise TrackError(f"'{OBSTACLE_LABEL[BARE]}' 는 배치할 것이 없어 시드를 받지 않습니다: "
+                         f"#{m.group('obs')} 로 쓰세요")
     seed = None if (raw_seed is None or raw_seed == "*") else int(raw_seed)
     return Scenario(track=track, mirror="mir" in direction, reverse="rev" in direction,
-                    obstacle=obstacle, seed=seed)
+                    obstacle=obstacle, seed=seed, bare=bare)
 
 
 #: The loader's modifier suffixes, in the order `maps.load` peels them.
@@ -475,6 +625,12 @@ def _parse_legacy(s: str) -> Scenario:
             reverse, name = True, name[:-4]
         elif name.endswith("~mir"):
             mirror, name = True, name[:-4]
+    bare = False
+    if "+bare" in name:
+        # Stripped first and anywhere: it carries no digits, so it cannot be confused with a family
+        # suffix, and `scene:x+bare+hard3` has to survive both peels.
+        head, _, tail = name.partition("+bare")
+        name, bare = head + tail, True
     obstacle, seed = "", None
     for tag in ("+rlobs", "+obs", "+pinch", "+props", "+hard"):   # `+rlobs` first: see maps._split_obstacle_suffix
         if tag in name:
@@ -485,7 +641,8 @@ def _parse_legacy(s: str) -> Scenario:
             break
     tid = id_of_legacy(name)
     if tid is not None:
-        return Scenario(track=tid, reverse=reverse, mirror=mirror, obstacle=obstacle, seed=seed)
+        return Scenario(track=tid, reverse=reverse, mirror=mirror, obstacle=obstacle, seed=seed,
+                        bare=bare)
     # Not a name this module can spell. Before giving up on it entirely, see whether it is a known
     # map carrying an obstacle family we have not heard of -- `real:icra2022+hard1~rev`. Naming the
     # map is most of what a caller wanted; the string still comes back verbatim.

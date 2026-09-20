@@ -101,7 +101,8 @@ about the same object the evidence above is about.
 It also makes the composition order-free. `fixed_low` binds `tracker._solver`; this binds
 `tracker._plan_hook`. Neither can overwrite the other, and the friction envelope is computed on the
 adjusted geometry whichever went on first. `tests/test_clearance.py` and
-`tests/test_policy_node_clearance.py` both assert that, in the simulator and on the node.
+`tests/test_controller_clearance.py` (renamed with the split; it was `test_policy_node_clearance.py`)
+both assert that, in the simulator and on the node.
 
 ### Three things it will not do
 

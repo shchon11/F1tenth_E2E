@@ -9,6 +9,11 @@ description = "GPU-vectorized F1TENTH simulator for RL/IL e2e planner training (
 requires-python = ">=3.10"
 dependencies = ["numpy", "torch", "scipy", "scikit-image", "pyyaml", "pillow", "matplotlib", "websockets"]
 
+[project.scripts]
+# `f1sim-console` is what the desktop entry runs, so a launcher icon does not have to know where
+# the checkout or the virtualenv is. `python -m f1sim.viewer.console` is the same program.
+f1sim-console = "f1sim.viewer.console:main"
+
 [project.optional-dependencies]
 gym = ["gymnasium>=0.29"]
 dev = ["pytest"]
@@ -20,6 +25,10 @@ include = ["f1sim*"]
 
 [tool.setuptools.package-data]
 f1sim = ["assets/*.glb", "assets/*.npz", "assets/maps/*.pgm", "assets/maps/*.yaml",
+         # The window/launcher icon. Resolved through the imported package, so an installed
+         # console shows the same icon a checkout does.
+         "assets/branding/*.svg", "assets/branding/*.png",
+         "viewer/console/training_schema.json",
          "viewer/static/*.html", "viewer/static/*.js", "viewer/static/three/*.js",
          "viewer/static/three/addons/*/*.js",
          # tests/benchmark/test_frozen_placement.py resolves this through the imported package,

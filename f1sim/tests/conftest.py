@@ -38,7 +38,10 @@ def _console_prefs_sandbox(tmp_path, monkeypatch):
 
 
 def pytest_configure(config):
-    """Under the software-GL contract, keep headless viewer contexts off EGL.
+    """Register the shared markers, then keep headless viewer contexts off EGL.
+
+    `slow` means "this builds a real simulator": CPU, seconds not milliseconds. The benchmark
+    subpackage registered it for itself; tests outside that directory need it too.
 
     `NativeViewer(headless=True)` asks for `create_standalone_context(backend="egl")`
     (`native.py:120`); EGL ignores `CUDA_VISIBLE_DEVICES` / `LIBGL_ALWAYS_SOFTWARE` /
@@ -48,6 +51,8 @@ def pytest_configure(config):
     moderngl is an optional viewer dependency: without it there is nothing to patch and the
     non-viewer tests must still collect and run.
     """
+    config.addinivalue_line("markers",
+                            "slow: builds a real simulator; CPU only, seconds not milliseconds")
     if os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1" or not os.environ.get("DISPLAY"):
         return
     try:

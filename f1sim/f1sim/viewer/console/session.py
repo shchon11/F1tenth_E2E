@@ -304,6 +304,18 @@ class SessionController(QtCore.QObject):
             return True
         try:
             ctx = multiprocessing.get_context("spawn")
+            # The worker is the half that needs torch and a GPU; the window never imports either.
+            # Normally both are the same interpreter and this does nothing. It matters when they
+            # are not -- a packaged console (an AppImage carries a small Python for the GUI, and
+            # bundling a torch build that matched every machine's driver is not possible), or a
+            # system Python running the window against a virtualenv that has the CUDA build.
+            worker_python = os.environ.get("F1SIM_WORKER_PYTHON", "").strip()
+            if worker_python:
+                if not os.path.isfile(worker_python) or not os.access(worker_python, os.X_OK):
+                    raise FileNotFoundError(
+                        f"$F1SIM_WORKER_PYTHON={worker_python!r} 은(는) 실행 가능한 파일이 아닙니다. "
+                        f"torch 가 설치된 파이썬 실행 파일의 전체 경로를 지정하세요.")
+                ctx.set_executable(worker_python)
             self._ctl, ctl_theirs = ctx.Pipe(duplex=True)
             # `Pipe(duplex=False)` returns (receive_end, send_end) -- verified, the first end
             # raises "connection is read-only" on send. The console reads frames, the worker
@@ -316,7 +328,21 @@ class SessionController(QtCore.QObject):
             self._proc = ctx.Process(target=target, args=(ctl_theirs, frames_theirs),
                                      kwargs={"log_path": os.path.join(self.runtime_dir, "worker.log")},
                                      name="f1sim-sim-worker", daemon=False)
-            self._proc.start()
+            # These small raceline/solver matrices get slower when each worker
+            # launches a full BLAS thread pool. Spawn must inherit this before
+            # importing NumPy; setting it inside sim_worker.main is too late.
+            thread_keys = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                           "NUMEXPR_NUM_THREADS")
+            previous = {key: os.environ.get(key) for key in thread_keys}
+            try:
+                os.environ.update({key: "1" for key in thread_keys})
+                self._proc.start()
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
             ctl_theirs.close()
             frames_theirs.close()
         except Exception as exc:

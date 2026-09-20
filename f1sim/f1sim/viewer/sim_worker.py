@@ -230,6 +230,15 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
         raise StartConfigError(f"속도 상한 {cfg.speed_cap} m/s 는 범위를 벗어났습니다 (0 초과 30 이하).")
     if int(cfg.max_render_cars) < 1:
         raise StartConfigError(f"화면 표시 차량 수는 1 이상이어야 합니다 (받은 값 {cfg.max_render_cars}).")
+    # The slot table, before the checkpoint is read: a table with the wrong number of rows, or a
+    # kind this tree does not have, is the user's typing and is said here rather than after a
+    # minute of loading.
+    if cfg.opponent_slots and int(cfg.cars_per_race) > 1:
+        from ..opponent_slots import validate_slots
+        try:
+            validate_slots(cfg.slots(), int(cfg.cars_per_race))
+        except ValueError as exc:
+            raise StartConfigError(f"상대차 표: {exc}") from exc
     if str(cfg.device) not in ("auto", "cpu", "cuda") and not str(cfg.device).startswith("cuda:"):
         raise StartConfigError(f"장치 이름을 알 수 없습니다: {cfg.device!r} (auto / cpu / cuda).")
     ros2 = str(getattr(cfg, "ros2", "off") or "off")
@@ -244,6 +253,41 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
                 "(예: source activate.sh)에서 콘솔을 열어 주세요. 가져오기 실패: " + why)
 
 
+def _obstacle_facts(spec: str, track) -> dict:
+    """`obstacle_choice` / `obstacle_text` / `authored_props` for the facts strip."""
+    from .. import tracks as T
+    try:
+        sc = T.parse(str(spec))
+        choice = sc.choice
+        text = T.choice_label(choice)
+    except Exception:
+        choice, text = "", T.OBSTACLE_LABEL[""]
+    return {"obstacle_choice": choice, "obstacle_text": text,
+            "authored_props": int(len(getattr(track, "props", ()) or ()))}
+
+
+def _slot_dicts(env) -> Optional[list]:
+    """The env's slot table as JSON objects, or None when it is not running one."""
+    slots = getattr(env, "slots", None)
+    return None if slots is None else [s.to_dict() for s in slots]
+
+
+def _slot_lines(env) -> Optional[list]:
+    """One readable line per slot, for the facts panel."""
+    slots = getattr(env, "slots", None)
+    return None if slots is None else [f"차량 {i}: {s.describe()}"
+                                       for i, s in enumerate(slots, start=1)]
+
+
+def _opponent_mix(env) -> str:
+    """The short "who are the other cars" line the session header shows."""
+    if env.M < 2:
+        return ""
+    slots = getattr(env, "slots", None)
+    if slots is None:
+        return str(env.ecfg.opponent)
+    from ..opponent_slots import mix_summary
+    return mix_summary(slots)
 def auto_device() -> str:
     """The card the viewer should run on: the CUDA device with the most memory free, else the CPU.
 
@@ -585,7 +629,11 @@ class SimWorker:
         groups = T.groups(scene_ids=scene_ids)
         entries = {e.id: {"id": e.id, "family": e.family, "family_label": e.family_label,
                           "display": e.display, "legacy": e.legacy, "note": e.note,
-                          "obstacles": list(e.obstacle_options())}
+                          "obstacles": list(e.obstacle_options()),
+                          # How many obstacles the map's author placed. Only an editor scene can
+                          # have any; it is what the 장애물 labels count, so the console knows it
+                          # without opening a map.
+                          "props": T.scene_props(e.id) or 0}
                    for e in T.catalog(extra=[t for ids in groups.values() for t in ids])}
         summaries = {g: T.split_summary(T.GROUP_SPLIT[g]) for g in groups if g in T.GROUP_SPLIT}
         return {"groups": groups, "entries": entries, "splits": summaries}
@@ -597,6 +645,7 @@ class SimWorker:
         from ..learn.model import controller_arm_of
         from ..learn.watch import checkpoint_speed_cap, describe_checkpoint_line, latest_run
         ckpt = resolve_checkpoint(run, common.RUNS_DIR, latest_run())
+        extra = (torch.load(ckpt, map_location="cpu", weights_only=True) or {}).get("extra", {})
         blob = torch.load(ckpt, map_location="cpu", weights_only=False) or {}
         extra = blob.get("extra", {})
         cond = ((blob.get("meta") or {}).get("cond") or {})
@@ -627,7 +676,7 @@ class SimWorker:
     # ================================================================ session build
     def load_track(self, name: str):
         from ..learn import common
-        if name.startswith("scene:"):
+        if name.startswith(("scene:", "scene/")):
             # An editor scene is edited and driven again inside one worker lifetime; a cached
             # track would be the scene as it was the first time. `maps.load` keys its own cache
             # on the files' mtimes, so a reload here is cheap when nothing changed.
@@ -670,7 +719,7 @@ class SimWorker:
             # user is least surprised by. `latest_run()` keeps meaning "newest" for `describe` and
             # for the training side. Every skipped run is reported, so this is a visible choice
             # rather than a silent substitution.
-            chosen, skipped = latest_compatible_run()
+            chosen, skipped = latest_compatible_run(allowed_controller=cfg.controller)
             for name, why in skipped:
                 self.say(P.MSG_LOG, gen=gen,
                          text=f"'{name}' 건너뜀: {why} — 이 뷰어는 기본 컨트롤러로 실행합니다")
@@ -703,27 +752,28 @@ class SimWorker:
         if arm not in viewer_arms():
             raise StartConfigError(f"플랜 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 "
                                    f"({' / '.join(viewer_arms())}).")
-        if arm != "legacy" and int(cfg.cars_per_race) > 1:
+        if arm not in ("legacy", "auto") and int(cfg.cars_per_race) > 1:
             raise StartConfigError(f"플랜 제어기 '{arm}' 은 레이스당 차량 수 1에서만 지원합니다 "
                                    f"(학습·벤치마크와 같은 조건). 레이스당 차량 수를 1로 두거나 legacy 를 고르세요.")
         estimator_path = ""
-        if arm.startswith("estimated"):
-            from .console.protocol import SessionConfig as _SC
-            estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
-            if not estimator_path or not os.path.isfile(estimator_path):
-                raise StartConfigError("estimated 제어기는 노면 추정기 .pt 가 필요합니다. 고급 설정의 '노면 추정기' 에 "
-                                       "경로를 넣거나 ~/f1sim_runs/_estimators/estimator_seed401.pt 를 두세요.")
         # Peek the arm the checkpoint was trained under before loading, so a mismatch is a start
         # message that names the setting to change rather than the loader's refusal.
         from ..learn.model import controller_arm_of
-        try:
-            recorded = controller_arm_of(torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=True))
-        except Exception:
-            recorded = "legacy"                  # the loader below will say what is wrong with it
+        from ..learn.grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
+        policy_checkpoint = torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=True)
+        recorded = controller_arm_of(policy_checkpoint)
         if recorded != "legacy" and recorded != arm:
             raise StartConfigError(f"{os.path.basename(ckpt_path)}: '{recorded}' 제어기로 학습된 체크포인트입니다. "
-                                   f"고급 설정의 플랜 제어기를 '{recorded}' 로 맞추세요 (현재 '{arm}').")
+                                   "자동 주행에는 기본 정책 또는 자동 제어로 학습된 체크포인트를 선택하세요.")
+        controller_record = validate_runtime_checkpoint(policy_checkpoint, arm)
+        if autoselect:
+            refusal = automatic_selection_refusal(controller_record)
+            if refusal is not None:
+                raise StartConfigError(refusal)
         model, extra = load_checkpoint(ckpt_path, device, allow_controller=(arm != "legacy"))
+        if recorded == "auto":
+            from ..learn.policy_adaptation import require_exact_actor
+            require_exact_actor(model, policy_checkpoint)
         model.eval()
         intro = Introspector(model)
         act_dim = model.meta.get("act_dim", 2)
@@ -741,6 +791,20 @@ class SimWorker:
                      text=f"플랜 제어기 '{arm}' 은 직접 행동(direct) 체크포인트에 적용되지 않아 legacy 로 실행합니다")
             arm = "legacy"
             estimator_path = ""
+        embedded = controller_record if recorded == "auto" else None
+        if (arm == "auto" or arm.startswith("estimated")) and embedded is None:
+            from .console.protocol import SessionConfig as _SC
+            estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
+            if not estimator_path or not os.path.isfile(estimator_path):
+                if arm == "auto":
+                    self.say(P.MSG_LOG, gen=gen,
+                             text="자동 노면 추정 모델이 없어 기본 제어기(legacy)로 주행합니다. "
+                                  "추정기를 쓰려면 F1SIM_GRIP_ESTIMATOR 를 지정하세요.")
+                    arm, estimator_path = "legacy", ""
+                else:
+                    raise StartConfigError(
+                        f"제어기 '{arm}' 는 노면 추정 모델이 필요합니다. F1SIM_GRIP_ESTIMATOR 를 "
+                        f"지정하거나, 제어기를 'legacy' 로 두세요 (기본값).")
         speed_cap = float(cfg.speed_cap or checkpoint_speed_cap(extra, ckpt_path))
         self._check_cancel(gen)
 
@@ -760,7 +824,17 @@ class SimWorker:
         races = max(1, int(cfg.races))
         grid = max(1, int(cfg.cars_per_race))
         n_cars = races * grid                      # a product: nothing to truncate
-        need_rl = grid > 1 and cfg.opponent == "teacher"
+        try:
+            slots = cfg.slots()
+            if slots is not None:
+                from ..opponent_slots import validate_slots
+                validate_slots(slots, grid)
+        except ValueError as exc:
+            raise StartConfigError(f"상대차 표: {exc}") from exc
+        if slots is not None and grid < 2:
+            slots = None                       # a solo session has no other car to configure
+        need_rl = grid > 1 and (any(sl.teacher_driven for sl in slots) if slots is not None
+                                else cfg.opponent == "teacher")
 
         self.stage(gen, "raceline")
         rls = None
@@ -778,9 +852,14 @@ class SimWorker:
         self.stage(gen, "env")
         spec = extra.get("spec") or {}
         env_cfg = EnvConfig(
-            speed_cap=speed_cap, action_mode=mode, race_size=grid, opponent=cfg.opponent,
+            speed_cap=speed_cap, action_mode=mode, race_size=grid,
+            opponent=("slots" if slots is not None else cfg.opponent),
+            opponent_slots=slots,
             max_steps=int(cfg.episode_s * 40),
-            # opponents at the policy's own cap and the teacher at full raceline pace
+            # opponents at the policy's own cap and the teacher at full raceline pace. With a slot
+            # table each car carries its own scale and its own cap instead, and `selfplay_front_cap`
+            # off is what keeps a `self` slot racing the learner as an equal: what is being watched
+            # here is the policy against itself, and a silently slowed opponent reads as a bug.
             selfplay_front_cap=False, opp_speed_range=(1.0, 1.0),
             scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
             hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
@@ -808,8 +887,16 @@ class SimWorker:
         sim_cfg = viewer_config(compile_enabled, randomize=cfg.randomize)
         if "range_max" in spec:
             sim_cfg.lidar.range_max = float(spec["range_max"])
-        env = common.make_env([track], n_cars, device, env_cfg, cfg=sim_cfg,
-                              rls=rls if need_rl else None)
+        try:
+            env = common.make_env([track], n_cars, device, env_cfg, cfg=sim_cfg,
+                                  rls=rls if need_rl else None)
+        except (ValueError, RuntimeError) as exc:
+            # A slot's checkpoint is loaded here (`learn.opponent_pool`), which is where an oracle
+            # checkpoint, a mismatched observation and a wrong controller arm are all refused. Those
+            # are configuration mistakes, not crashes: the console shows them on the settings panel.
+            if slots is None:
+                raise
+            raise StartConfigError(f"상대차 표: {exc}") from exc
         env.sim.tid.fill_(0)                       # every car on the map that was asked for
         mu_pin = None
         if str(getattr(cfg, "mu_mode", "random")) == "fixed":
@@ -874,9 +961,12 @@ class SimWorker:
             from ..learn.grip_runtime import ControllerRuntime
             self.say(P.MSG_LOG, gen=gen, text=f"플랜 제어기 설치: {arm}"
                      + (f" | 추정기 {os.path.basename(estimator_path)}" if estimator_path else ""))
-            rt = ControllerRuntime(env, arm, estimator_path or None, device=device)
+            self.stage(gen, "controller", "자동 제어 준비")
+            rt = ControllerRuntime(env, arm, estimator_path or None, device=device,
+                                   checkpoint_meta=embedded)
             try:
                 rt.install(graph_rt=session.get("fastpath"), adopt=False)   # adopted on the sim thread
+                validate_runtime_checkpoint(policy_checkpoint, rt)
                 rt.begin(session["obs"])
             except BaseException:
                 rt.release()
@@ -884,6 +974,10 @@ class SimWorker:
             session["controller"] = rt
             session["controller_arm"] = arm
             session["estimator_path"] = estimator_path
+        if session.get("fastpath") is not None:
+            # After the controller: the teacher's collision preview reads whether the tracker has
+            # hooks installed, and a graph captured before them would bake in the other branch.
+            self._prepare_teacher_graph(session, gen)
         ros2 = str(getattr(cfg, "ros2", "off") or "off")
         if ros2 != "off":
             # After everything that can refuse the session: a node that came up for a session
@@ -1017,6 +1111,49 @@ class SimWorker:
         session["fastpath"] = fp
         session["fastpath_ms"] = round((time.perf_counter() - t0) * 1e3, 1)
 
+    def _prepare_teacher_graph(self, session: dict, gen: int) -> None:
+        """Capture the teacher-driven opponents' call as one CUDA graph (`TeacherGraph`).
+
+        Same rules as `_prepare_fastpath`: control thread, during the build, eligibility first. Not
+        eligible or not capturable leaves the teacher eager and says why; with three cars it is
+        most of the step, so a silent eager teacher would read as "the viewer is slow again".
+        """
+        from .graph_fastpath import NotCapturable, TeacherGraph, teacher_eligible
+        env = session["env"]
+        if int(getattr(env, "M", 1)) <= 1:
+            return
+        ok, why = teacher_eligible(env)
+        if not ok:
+            self.say(P.MSG_LOG, gen=gen, text=f"상대차 teacher 는 eager 로 둡니다: {why}")
+            return
+        # The call's own arguments, from a real step -- the follow mask and cap are tensors or not
+        # depending on the race, and guessing would capture against the wrong signature.
+        rec: dict = {}                      # teacher object -> its call's arguments
+        eager = env._teacher_normalized
+
+        def spy(teacher, *a):
+            rec[teacher] = a
+            return eager(teacher, *a)
+
+        env._teacher_normalized = spy
+        try:
+            self._step_once(session)
+        finally:
+            env.__dict__.pop("_teacher_normalized", None)
+        if not rec:
+            self.say(P.MSG_LOG, gen=gen, text="상대차 teacher 호출을 관측하지 못해 eager 로 둡니다.")
+            return
+        self.stage(gen, "graph", "상대차 teacher")
+        t0 = time.perf_counter()
+        try:
+            tg = TeacherGraph(env, rec, log=lambda t: self.say(P.MSG_LOG, gen=gen, text=t))
+        except NotCapturable as exc:
+            self.say(P.MSG_LOG, gen=gen, text=f"상대차 teacher 는 eager 로 둡니다: {exc}")
+            return
+        tg.install()
+        session["teacher_graph"] = tg
+        session["teacher_graph_ms"] = round((time.perf_counter() - t0) * 1e3, 1)
+
     # ---------------------------------------------------------------- geometry
     def build_geometry(self, track, raceline=None) -> dict:
         """Static map meshes as plain arrays, ready for the console to upload.
@@ -1053,6 +1190,10 @@ class SimWorker:
             # seed was drawn, which is the moment a user most needs to be told the number.
             "scenario": str(session.get("scenario") or cfg.map_name),
             "scenario_display": tracks_display(session.get("scenario") or cfg.map_name),
+            # Which 장애물 choice was actually built, and how many obstacles the map's author had
+            # placed. `기본` and `없음` differ only by that number, and the id alone does not carry
+            # it -- `scene/hall` is the map as authored whether that is three boxes or none.
+            **_obstacle_facts(session.get("scenario") or cfg.map_name, session["track"]),
             # The loader's own name for the same thing, kept because a manifest, a benchmark file
             # and a bug report are all written in that grammar.
             "map_legacy": str(session.get("map_legacy") or cfg.map_name),
@@ -1068,6 +1209,13 @@ class SimWorker:
             # must not be read as evidence for the other.
             "actor_compiled": bool(getattr(session.get("act_fn"), "compiled", False)),
             "controller": str(session.get("controller_arm") or "legacy"),
+            # Who the other cars are. `opponent_mix` is the short form the header line shows
+            # ("2x raceline, 1x policy"); `opponent_slots` is the table itself, so a session can be
+            # reproduced -- and pasted into `--opp-slots` -- from what was actually built.
+            "opponent": str(env.ecfg.opponent),
+            "opponent_mix": _opponent_mix(env),
+            "opponent_slots": _slot_dicts(env),
+            "opponent_slot_lines": _slot_lines(env),
             "estimator": os.path.basename(session.get("estimator_path") or ""),
             "physics_compile_requested": bool(env.sim.cfg.sim.compile),
             "physics_compile_mode": str(env.sim.cfg.sim.compile_mode),
@@ -1170,11 +1318,22 @@ class SimWorker:
         if mt == session["mtime"]:
             return
         try:
+            import torch
             from ..learn import common
             from ..learn.model import load_checkpoint
             from ..learn.watch import Introspector, actor_runner, describe_checkpoint_line
             model, extra = load_checkpoint(session["ckpt_path"], session["device"],
                                            allow_controller=session.get("controller") is not None)
+            from ..learn.grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
+            reload_checkpoint = torch.load(session["ckpt_path"], map_location="cpu", weights_only=True)
+            reload_record = validate_runtime_checkpoint(reload_checkpoint, session.get("controller") or "legacy")
+            if session.get("autoselect"):
+                refusal = automatic_selection_refusal(reload_record)
+                if refusal is not None:
+                    raise ValueError(refusal)
+            if reload_record.get("arm") == "auto":
+                from ..learn.policy_adaptation import require_exact_actor
+                require_exact_actor(model, reload_checkpoint)
             model.eval()
             env_spec = common.obs_spec(session["env"])
             # The environment is already built, so a newer checkpoint with different normalizers
@@ -1250,6 +1409,13 @@ class SimWorker:
             if env.tracker.last_pred is not None:
                 plan_pred = env.tracker.last_pred[focus]
                 pieces.append(plan_pred.reshape(-1))
+        estimate = getattr(session.get("controller"), "last_estimate", None)
+        estimate_keys = ("used_mu", "q10", "q50", "q90", "warm", "finite")
+        if estimate:
+            estimate_keys += tuple(key for key in ("confidence", "has_evidence", "informative", "fault")
+                                   if key in estimate)
+            pieces.append(torch.stack([estimate[key].reshape(-1)[focus].float()
+                                       for key in estimate_keys]))
         flat = torch.cat(pieces).cpu().numpy()
 
         i = 0
@@ -1313,6 +1479,9 @@ class SimWorker:
         if imu_mean is not None:
             fr["imu"] = imu_mean.astype(np.float32)     # (6,) gyro xyz, accel xyz, mean of k_imu
             fr["imu_samples"] = k_imu
+        if estimate:
+            fr["grip_estimate"] = {key: float(value)
+                                   for key, value in zip(estimate_keys, flat[-len(estimate_keys):])}
         if sim.other_idx is not None:
             rivals = set(sim.other_idx[focus].tolist())
             fr["opponent"] = np.array([int(e) in rivals for e in ids], bool)
@@ -1475,6 +1644,9 @@ class SimWorker:
             ctrl = session.get("controller")
             if ctrl is not None:
                 ctrl.adopt()                       # the grip solver graph, same rule as above
+            tgraph = session.get("teacher_graph")
+            if tgraph is not None:
+                tgraph.adopt()                     # the opponent teacher's graph, same rule
             while self.alive and self.gen == gen and self.running:
                 # While a new session is being built, only `pause` is applied here: it is the one
                 # command that touches no tensor. Everything else waits, because the control
@@ -1881,6 +2053,10 @@ class SimWorker:
                     pin.release()
                 except Exception:
                     pass
+            tgraph = session.pop("teacher_graph", None)
+            if tgraph is not None:
+                tgraph.release()
+                del tgraph
             fastpath = session.pop("fastpath", None)
             if fastpath is not None:
                 fastpath.release()

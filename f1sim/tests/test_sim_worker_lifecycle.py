@@ -57,8 +57,8 @@ def _fake_env(cars: int = 2):
         return {}, {}
 
     return types.SimpleNamespace(
-        sim=sim, reset=reset, act_dim=2, n_beams=32, range_max=10.0,
-        ecfg=types.SimpleNamespace(v_max_policy=8.0),
+        sim=sim, reset=reset, act_dim=2, n_beams=32, range_max=10.0, M=1,
+        ecfg=types.SimpleNamespace(v_max_policy=8.0, opponent="teacher", opponent_slots=None),
         cfg=types.SimpleNamespace(lidar=types.SimpleNamespace(fov=4.712),
                                   vehicle=types.SimpleNamespace(lr=0.17)),
     )
@@ -82,6 +82,7 @@ class StubWorker(SW.SimWorker):
 
     def build_session(self, cfg, gen):
         env = _fake_env(cfg.total_cars)
+        env.M = cfg.cars_per_race
         for name in ("checkpoint", "map", "env", "warmup", "geometry"):
             self.stage(gen, name)
             if self.build_delay:

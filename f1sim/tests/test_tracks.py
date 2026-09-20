@@ -105,12 +105,20 @@ def test_an_unknown_track_id_says_what_a_good_one_looks_like():
 
 # ================================================================ the grammar
 def _every_scenario():
+    """Every catalogue entry x every direction x every 장애물 *choice* it can carry.
+
+    The choice is what the control holds and what the grammar spells -- `""`, `bare`, a family, or
+    `bare+<family>` -- so it is what has to round trip. A choice that places nothing takes no seed.
+    """
     for e in tracks.catalog(scenes=False):
         for direction in tracks.DIRECTIONS:
-            for obstacle in e.obstacle_options():
-                yield tracks.Scenario(track=e.id, mirror="mir" in direction,
-                                      reverse="rev" in direction, obstacle=obstacle,
-                                      seed=7 if obstacle else None)
+            for choice in e.obstacle_options():
+                for key in ({choice} if choice in ("", tracks.BARE)
+                            else {choice, f"{tracks.BARE}+{choice}"}):
+                    bare, family = tracks.split_choice(key)
+                    yield tracks.Scenario(track=e.id, mirror="mir" in direction,
+                                          reverse="rev" in direction, obstacle=family,
+                                          seed=7 if family else None, bare=bare)
 
 
 def test_every_catalogue_scenario_round_trips_through_both_grammars():
@@ -177,8 +185,10 @@ def test_a_track_is_not_offered_an_obstacle_it_cannot_carry():
     with pytest.raises(tracks.TrackError) as exc:
         tracks.parse("rt/monza#edge:3")
     assert "Monza" in str(exc.value)
-    assert tracks.get("rt/monza").obstacle_options() == ("", "props", "hard")
-    assert tracks.get("real/korea26").obstacle_options() == ("", "edge", "line", "pinch", "props", "hard")
+    # `기본` and `없음` are on every map -- neither adds anything, so neither can be unsupported.
+    assert tracks.get("rt/monza").obstacle_options() == ("", "bare", "props", "hard")
+    assert tracks.get("real/korea26").obstacle_options() == ("", "bare", "edge", "line", "pinch",
+                                                             "props", "hard")
 
 
 @pytest.mark.parametrize("bad", ["real/bb22-1@sideways", "real/bb22-1#nope:3", "real/bb22-1@rev#line",

@@ -23,7 +23,24 @@ from typing import Dict, List, Optional
 
 from ... import tracks
 
-RUNS_DIR = os.path.join(os.path.expanduser("~"), "f1sim_runs")
+#: Where the teacher / opponent KINDS live, and why they are not here. The console's 상대차 table
+#: offers `raceline` (the teacher this viewer has always run) and `interactive`
+#: (`f1sim.interactive_teacher`, which scores its candidate plans against where the other cars are
+#: predicted to be) as a SELECTION, plus `policy` and `self`. That list is
+#: `f1sim.opponent_slots.KINDS` -- one registry, read by the widget, by `--opp-slots` and by the
+#: env, because a second copy here would be a second answer to "which teachers are there" and the
+#: whole point of the registry is that a kind the tree does not carry is *listed and refused*
+#: rather than silently mapped onto the raceline teacher.
+#:
+#: It is not re-exported from this module on purpose: `f1sim.opponent_slots` reaches
+#: `f1sim.opponent_events`, which imports torch, and this module is the one the first paint needs.
+#: `viewer/console/opponent_table.py` imports it directly and pays that cost once, in the widget.
+TEACHER_KINDS_MODULE = "f1sim.opponent_slots"
+
+#: Must agree with `f1sim.learn.common.RUNS_DIR` -- the console lists what training writes.
+#: Not imported from there: that module pulls in torch, and this one is on the first-paint path.
+RUNS_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("F1SIM_RUNS") or os.path.join("~", "f1sim_runs")))
 CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt")
 
 
@@ -130,13 +147,26 @@ class MapCatalog:
         if e:
             return e
         return {"id": track_id, "family": track_id.split("/", 1)[0], "display": track_id,
-                "legacy": track_id, "note": "", "obstacles": list(tracks.OBSTACLES)}
+                "legacy": track_id, "note": "", "obstacles": list(tracks.OBSTACLES), "props": 0}
 
     def display(self, track_id: str) -> str:
         return self.entry(track_id).get("display") or track_id
 
     def obstacle_options(self, track_id: str) -> List[str]:
         return list(self.entry(track_id).get("obstacles") or ("",))
+
+    def authored_props(self, track_id: str) -> int:
+        """How many obstacles this map's author placed. 0 for every map that is not a scene.
+
+        A scene is read live rather than from the entry: the editor is in the same process, and a
+        count that lagged a save would put the wrong number on the 장애물 labels -- which are
+        exactly the labels this number exists to make honest.
+        """
+        if str(track_id).startswith("scene/"):
+            n = tracks.scene_props(track_id)
+            if n is not None:
+                return int(n)
+        return int(self.entry(track_id).get("props") or 0)
 
     def group_of(self, track_id: str) -> Optional[str]:
         for g, names in self.groups.items():

@@ -4,8 +4,9 @@
     fixed_low   mu = 0.73423 everywhere (the control arm)
     oracle      mu = the episode's true friction, per env (lab only)
     estimated   mu = the frozen estimator's filtered lower quantile, from causal sensors only
+    auto        the same causal estimator, with the nominal vehicle's drive/brake torque split
 
-and, composable on top of any of them and on each other (`tcs`, `fixed_low+clearance`,
+and, composable on the historical arms and on each other (`tcs`, `fixed_low+clearance`,
 `fixed_low+clearance+tcs`, ...):
 
     +clearance  a local occupancy built from the current LiDAR frame alone, and the policy's plan
@@ -45,6 +46,9 @@ backend's. **This module never smooths twice**: it calls `lower_mu` and uses wha
 from __future__ import annotations
 
 from collections import deque
+import hashlib
+import json
+import math
 from typing import NamedTuple, Optional
 
 import torch
@@ -75,7 +79,43 @@ def _compose(base: str, layers: tuple) -> str:
 #: second name for something that already has one.
 ARMS = tuple(_compose(base, layers)
              for base in BASE_ARMS
-             for layers in ((), ("clearance",), ("tcs",), ("clearance", "tcs")))
+             for layers in ((), ("clearance",), ("tcs",), ("clearance", "tcs"))) + ("auto",)
+
+DEFAULT_AUTO_PROFILE = "historical-global-v1"
+LOCAL_AUTO_PROFILE = "local-v2"
+AUTO_RUNTIME_VERSION = "automatic-grip-global-v1"
+LOCAL_AUTO_RUNTIME_VERSION = "adaptive-racing-local-v2"
+AUTO_PROFILE_VERSIONS = {
+    DEFAULT_AUTO_PROFILE: AUTO_RUNTIME_VERSION,
+    LOCAL_AUTO_PROFILE: LOCAL_AUTO_RUNTIME_VERSION,
+}
+
+
+def checkpoint_auto_profile(record: dict) -> str:
+    """Read a saved profile without reinterpreting old controller experiments."""
+    saved_spec = record.get("grip_spec")
+    if not isinstance(saved_spec, dict):
+        raise ValueError("checkpoint has no physical controller specification")
+    profile = saved_spec.get("profile_version", DEFAULT_AUTO_PROFILE)
+    if profile not in AUTO_PROFILE_VERSIONS:
+        raise ValueError(f"unsupported checkpoint automatic profile {profile!r}")
+    # Earlier research could explicitly choose historical physics while retaining
+    # the shared local-v2 runtime label. Keep those records reproducible as written.
+    supported = {AUTO_PROFILE_VERSIONS[profile]}
+    if profile == DEFAULT_AUTO_PROFILE:
+        supported.add(LOCAL_AUTO_RUNTIME_VERSION)
+    if record.get("runtime_version") not in supported:
+        raise ValueError("checkpoint automatic runtime version does not match its profile")
+    return profile
+
+
+def automatic_selection_refusal(record: dict) -> Optional[str]:
+    """Qualification applies to unattended selection/reload, not manual research."""
+    if record.get("arm") == "auto" and (record.get("grip_spec") or {}).get("profile_version") == LOCAL_AUTO_PROFILE:
+        qualification = record.get("qualification")
+        if not isinstance(qualification, dict) or qualification.get("approved") is not True:
+            return "local-v2 research controller has no approved qualification"
+    return None
 
 
 class ArmParts(NamedTuple):
@@ -89,6 +129,8 @@ def split_arm(arm: str) -> ArmParts:
     """`"fixed_low+clearance"` -> `("fixed_low", False, True)`; `"tcs"` -> `("legacy", True, False)`."""
     if arm not in ARMS:
         raise ValueError(f"arm must be one of {ARMS}, got {arm!r}")
+    if arm == "auto":
+        return ArmParts("estimated", False, False)
     parts = arm.split("+")
     base = "legacy" if parts[0] in LAYERS else parts[0]
     worn = parts if parts[0] in LAYERS else parts[1:]
@@ -113,7 +155,24 @@ FALLBACK_NONE = 2
 
 def arm_to_grip_mode(arm: str) -> str:
     """The `GripSpec.mode` each arm runs. `fixed_low` is the experiment's name for `fixed`."""
-    return {"fixed_low": "fixed", "oracle": "oracle", "estimated": "estimated"}[arm]
+    return {"fixed_low": "fixed", "oracle": "oracle", "estimated": "estimated",
+            "auto": "estimated"}[arm]
+
+
+def automatic_grip_spec(env, profile_version: str = DEFAULT_AUTO_PROFILE) -> gc.GripSpec:
+    """Nominal onboard vehicle data only; randomized simulator parameters are never read.
+
+    The rear-force split exists only with the wheel model. With it disabled the plant retains
+    the historical rear-only force model, so its share is one. No friction truth is consumed.
+    """
+    vehicle = env.cfg.vehicle
+    nominal = {key: float(getattr(vehicle, key)) for key in
+               ("lf", "lr", "h", "mu_f_scale", "mu_r_scale", "a_max", "a_brake",
+                "c_roll", "c_drag", "v_switch", "sv_max")}
+    return gc.GripSpec(mode="estimated", **nominal,
+                       profile_version=profile_version, motor_tau=float(env.cfg.actuator.motor_tau),
+                       actuator_v_max=float(vehicle.v_max),
+                       drive_split_r=float(vehicle.drive_split_r) if vehicle.wheel_model else 1.0).validate()
 
 
 class IssuedCommandSpy:
@@ -301,9 +360,11 @@ class ControllerRuntime:
 
     def __init__(self, env, arm: str, estimator_path: Optional[str] = None,
                  gspec: Optional[gc.GripSpec] = None, device=None,
-                 traction_params=None, clearance_spec=None):
+                 traction_params=None, clearance_spec=None, *, research_estimator: bool = False,
+                 checkpoint_meta: Optional[dict] = None, research_profile: Optional[str] = None,
+                 auto_profile: Optional[str] = None):
         base, tcs, clear = split_arm(arm)
-        if base == "estimated" and not estimator_path:
+        if base == "estimated" and not estimator_path and not checkpoint_meta:
             raise ValueError("the estimated arm needs --estimator PATH; it has no default")
         if base != "estimated" and estimator_path:
             raise ValueError(f"--estimator is only meaningful for the estimated arm, not {arm!r}")
@@ -312,6 +373,16 @@ class ControllerRuntime:
         if clearance_spec is not None and not clear:
             raise ValueError(f"a clearance spec is only meaningful for a +clearance arm, not {arm!r}")
         self.env, self.arm = env, arm
+        self.research_estimator = bool(research_estimator)
+        for requested in (auto_profile, research_profile):
+            if requested is not None and (arm != "auto" or requested not in AUTO_PROFILE_VERSIONS):
+                raise ValueError("automatic profile selection requires auto and a supported profile")
+        if auto_profile is not None and research_profile is not None and auto_profile != research_profile:
+            raise ValueError("explicit automatic profile selections conflict")
+        self.research_profile = research_profile
+        self.auto_profile_source = None
+        self.runtime_version = None
+        self._checkpoint_meta = checkpoint_meta
         #: The tracker arm underneath, and which composable layers ride on top. Every branch below
         #: keys off `base`, so `fixed_low+clearance` is `fixed_low` plus a plan shaper and nothing
         #: else about the tracker changes.
@@ -335,7 +406,28 @@ class ControllerRuntime:
         self.acc = Accumulator(self.device)
         self.flags = FlagTracker()
         self._pending_truth = None
+        self.last_estimate = None                 # device tensors for live estimate/fallback telemetry
+        self.observation_adapter = None
+        self._obs_multipliers = None
         mode = "legacy" if base == "legacy" else arm_to_grip_mode(base)
+        if arm == "auto":
+            if gspec is not None:
+                raise ValueError("auto derives its grip specification from the nominal vehicle")
+            requested_profile = auto_profile or research_profile
+            if checkpoint_meta:
+                if checkpoint_meta.get("arm") != "auto":
+                    raise ValueError("automatic checkpoint metadata must record the auto arm")
+                saved_profile = checkpoint_auto_profile(checkpoint_meta)
+                if requested_profile is not None and requested_profile != saved_profile:
+                    raise ValueError("explicit automatic profile conflicts with checkpoint profile")
+                profile = saved_profile
+                self.auto_profile_source = "checkpoint"
+                self.runtime_version = checkpoint_meta["runtime_version"]
+            else:
+                profile = requested_profile or DEFAULT_AUTO_PROFILE
+                self.auto_profile_source = "explicit" if requested_profile else "default"
+                self.runtime_version = AUTO_PROFILE_VERSIONS[profile]
+            gspec = automatic_grip_spec(env, profile_version=profile)
         self.gspec = (gspec or gc.GripSpec(mode=mode)).validate()
         if self.gspec.mode != mode:
             raise ValueError(f"arm {arm!r} needs GripSpec(mode={mode!r}), got {self.gspec.mode!r}")
@@ -406,10 +498,16 @@ class ControllerRuntime:
             raise RuntimeError(f"{angles.numel()} bearings for the {self.env.n_beams} beams this "
                                f"env reports: the grid would be built from bearings the returns do "
                                f"not have")
+        from . import floor as fl
+        # Nominal mounting again, for the same reason the bearings are: the floor gate's geometry is
+        # what the car believes about its sensor, not the draw the simulator made.
+        fspec = fl.FloorSpec(mount_x=float(lidar.mount_x), mount_y=float(lidar.mount_y),
+                             mount_z=float(lidar.mount_z))
         return cl.ClearanceArm(tracker, self.clearance_spec or cl.ClearanceSpec(), self.B,
                                self.device, float(self.env.ecfg.v_max_policy), angles,
                                float(self.env.range_max), float(lidar.mount_x),
-                               float(lidar.mount_y))
+                               float(lidar.mount_y), fspec=fspec,
+                               dt=float(self.env.sim.control_dt))
 
     def adopt(self) -> None:
         """Transfer the grip solver graph to the calling thread (viewer: the sim thread). See
@@ -425,7 +523,24 @@ class ControllerRuntime:
         the checkpoint embed silently vacuous -- a passing check over an empty list.
         """
         from .grip_estimator import SensorHistory, load_grip_estimator
-        self.estimator = load_grip_estimator(self.estimator_path, self.device)
+        if self._checkpoint_meta:
+            self.estimator = load_embedded_estimator(self._checkpoint_meta, self.device,
+                                                     research_estimator=self.research_estimator)
+            if self.estimator_path:
+                external = load_grip_estimator(self.estimator_path, "cpu",
+                                               allow_unapproved=self.research_estimator)
+                external_record = {
+                    "estimator": {"feature_spec": external.feature_spec,
+                                  "calibration": external.calibration, "meta": external.meta},
+                    "estimator_architecture": external.arch,
+                    "estimator_state": external.net.state_dict(),
+                }
+                if estimator_content_digest(external_record) != self._checkpoint_meta["estimator_content_sha256"]:
+                    raise ValueError("explicit estimator conflicts with the checkpoint's embedded pair")
+        elif self.research_estimator:
+            self.estimator = load_grip_estimator(self.estimator_path, self.device, allow_unapproved=True)
+        else:
+            self.estimator = load_grip_estimator(self.estimator_path, self.device)
         net = getattr(self.estimator, "net", None)
         if net is None or not list(net.parameters()):
             raise RuntimeError(
@@ -437,7 +552,52 @@ class ControllerRuntime:
             p.requires_grad_(False)                # never reachable by an optimizer
         if any(p.requires_grad for p in net.parameters()):
             raise RuntimeError("the estimator still has trainable parameters after freezing")
+        if self.arm == "auto":
+            self._configure_auto_observations()
         self.history = SensorHistory(self.B, self.device, self.estimator.spec)
+
+    def _configure_auto_observations(self) -> None:
+        """Convert policy-normalized sensors to the frozen estimator's feature contract.
+
+        History normalizes issued commands itself from SI units. Only the nine sensor columns
+        need conversion here; changing the policy's normalization must not change their meaning.
+        """
+        from .grip_estimator import FEATURE_NAMES, FEATURE_SCALES
+        from .obs import ATT_SCALE
+        spec, e = self.estimator.spec, self.env.ecfg
+        # SensorHistory fixes the column order; excitation_frames fixes the acceleration scales.
+        if tuple(spec.names) != FEATURE_NAMES or tuple(spec.scales) != FEATURE_SCALES:
+            raise ValueError("auto requires the canonical estimator feature order and scales")
+        rate = float(self.env.cfg.sim.control_rate)
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("auto requires a finite positive control rate")
+        dt = float(getattr(self.env.sim, "control_dt", 1.0 / rate))
+        if not math.isclose(dt, spec.control_dt, rel_tol=1e-6, abs_tol=1e-9):
+            raise ValueError(f"auto control_dt {dt} does not match estimator {spec.control_dt}; "
+                             "sensor history is not resampled")
+        source = ((float(e.v_max_policy),) + (float(e.imu_gyro_scale),) * 3
+                  + (float(e.imu_accel_scale),) * 3 + (float(ATT_SCALE),) * 2)
+        if any(not math.isfinite(scale) or scale <= 0 for scale in source):
+            raise ValueError("auto requires finite positive policy sensor normalizers")
+        factors = tuple(src / dst for src, dst in zip(source, spec.scales[:9]))
+        self.observation_adapter = {
+            "source_sensor_scales": list(source), "target_sensor_scales": list(spec.scales[:9]),
+            "sensor_multipliers": list(factors), "control_dt": dt,
+            "issued_commands": "SI; normalized once by SensorHistory",
+        }
+        if any(factor != 1.0 for factor in factors):
+            self._obs_multipliers = {
+                key: torch.tensor(factors[start:stop], device=self.device, dtype=torch.float32)
+                for key, start, stop in (("speed", 0, 1), ("imu", 1, 7), ("imu_att", 7, 9))}
+
+    def _estimator_observation(self, obs: dict) -> dict:
+        if self._obs_multipliers is None:
+            return obs
+        # Validate before broadcasting: a malformed one-column IMU must not become six columns.
+        from .grip_estimator import observation_row
+        row = observation_row(obs, self.B, self.device)
+        return {key: row[:, start:stop] * self._obs_multipliers[key]
+                for key, start, stop in (("speed", 0, 1), ("imu", 1, 7), ("imu_att", 7, 9))}
 
     def release(self) -> None:
         if self.grip is not None:
@@ -462,6 +622,7 @@ class ControllerRuntime:
         """
         self._prev_cmd = torch.zeros(self.B, 2, device=self.device)
         self._reset_mask = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        self.last_estimate = None
         if self.spy is not None:
             # `env.reset()` resets every env, which fired the spy. That snapshot is the pre-reset
             # command of whatever ran before this run, not of a step this run took.
@@ -472,11 +633,20 @@ class ControllerRuntime:
     def pre_action(self, obs: dict) -> Optional[torch.Tensor]:
         """Advance the history, infer the friction, and hand it to the MPC. Before the action."""
         if self.clearance is not None:
-            # This step's own LiDAR frame, before the action it will shape is asked for. There is no
-            # episode state to clear: the arm holds one frame and nothing carried across a boundary,
-            # and the observation `step()` returned for a just-reset env is already the new
-            # episode's scan.
+            # This step's own LiDAR frame, before the action it will shape is asked for. The arm
+            # holds one frame and nothing carried across a boundary, so nothing here needs
+            # clearing; its floor gate's attitude tracker does, and `post_step` does that.
             self.clearance.update_scan(obs["scan"])
+            if self.clearance.cspec.floor_gate:
+                # The gate's attitude, from the same IMU columns the policy's own observation
+                # carries -- read out of the observation rather than off `sim.P`, so this is code
+                # the car can run. `imu` is the mean of this step's samples, already normalised.
+                from .obs import floor_inputs
+                idx = self._floor_idx()
+                _speed, gyro, accel, _vesc = floor_inputs(
+                    torch.cat([obs[k] for k in ("speed", "prev_action", "speed_cap", "imu",
+                                                "imu_att")], 1), idx)
+                self.clearance.update_attitude(gyro, accel, obs["speed"][:, 0] * idx["v_max"])
         if self.traction is not None:
             # A finished episode is a sensor gap: a new car, on a new surface, possibly at a
             # different speed. Carrying a latched release across it would release the brake of a
@@ -502,15 +672,35 @@ class ControllerRuntime:
         # it twice and drop the row this step just inserted -- backend's contract is one or the
         # other, not both. The filter state is still mine to reset: backend holds it, I say when an
         # episode ended.
-        self.history.push(obs, self._prev_cmd, done)
+        self.history.push(self._estimator_observation(obs), self._prev_cmd, done)
         ids = torch.nonzero(done).flatten()
         if ids.numel():
             self.estimator.reset_filter(ids)
         features, valid = self.history.inputs()
         used_mu, diag = self.estimator.lower_mu(features, valid)
+        self.last_estimate = diag
         self.grip.update(used_mu)
+        if self.arm == "auto":
+            self.grip.update_feedback(obs["speed"][:, 0] * float(self.env.ecfg.v_max_policy))
         self._record(used_mu, diag)
         return used_mu
+
+    def _floor_idx(self) -> dict:
+        """The proprio column map of the observation this env emits, built once.
+
+        Deliberately the *short* proprio (no history block): `pre_action` assembles the prefix it
+        needs from `obs` rather than taking the flattened vector, because the flattened width
+        depends on `hist_len` and the columns the gate reads are all in the prefix.
+        """
+        if getattr(self, "_fidx", None) is None:
+            from .obs import ObsSpec, att_index_spec
+            e = self.env.ecfg
+            sp = ObsSpec(n_beams=int(self.env.n_beams), act_dim=int(self.env.act_dim),
+                         action_history=int(e.action_history), hist_len=0,
+                         range_max=float(self.env.range_max), v_max=float(e.v_max_policy),
+                         gyro_scale=float(e.imu_gyro_scale), accel_scale=float(e.imu_accel_scale))
+            self._fidx = att_index_spec(sp)
+        return self._fidx
 
     def post_step(self, terminated: torch.Tensor, truncated: torch.Tensor) -> None:
         """Capture the issued command before auto-reset can overwrite it, and mark the boundaries.
@@ -518,13 +708,19 @@ class ControllerRuntime:
         The realised control bound is read here rather than in `pre_action` because the solver has
         now run: at `pre_action` time `last_bounds` still holds the previous step's limits.
         """
+        done = terminated | truncated
+        if self.clearance is not None:
+            # The floor gate's attitude integrator is episode state: a new car on a new floor does
+            # not inherit the last one's tilt. Its at-rest reference is NOT cleared -- that is the
+            # sensor's mounting, which the same car keeps across episodes.
+            self.clearance.reset(done)
         if self.base == "legacy":
-            self._reset_mask = terminated | truncated
+            self._reset_mask = done
             return
         self._record_realised_bounds()
         if self.base == "estimated":
             self._prev_cmd = self.spy.take()
-        self._reset_mask = terminated | truncated
+        self._reset_mask = done
 
     # -- truth, only where it is allowed -----------------------------------------
     def _truth(self) -> torch.Tensor:
@@ -562,8 +758,15 @@ class ControllerRuntime:
         """
         a = self.acc
         warm = diag["warm"].to(used_mu.dtype)
-        fallback = (diag["fallback_reason"] != FALLBACK_NONE).to(used_mu.dtype)
-        at_floor = ((used_mu - self.gspec.mu_fixed).abs() <= FLOOR_EPS).to(used_mu.dtype)
+        if (getattr(self.estimator, "meta", {}) or {}).get("format") == "adaptive_grip_v2":
+            # No new saturation evidence is an intentional hold, not estimator
+            # failure. The adaptive observer also has its own physical floor.
+            fallback = (~diag["warm"] | diag["fault"]).to(used_mu.dtype)
+            floor = self.estimator.consumption.physical_floor
+            at_floor = (used_mu <= floor + FLOOR_EPS).to(used_mu.dtype)
+        else:
+            fallback = (diag["fallback_reason"] != FALLBACK_NONE).to(used_mu.dtype)
+            at_floor = ((used_mu - self.gspec.mu_fixed).abs() <= FLOOR_EPS).to(used_mu.dtype)
         a.add(warm=warm.sum(), fallback=fallback.sum(),
               warm_fallback=(fallback * warm).sum(), q_gap=(diag["q_gap"] * warm).sum(),
               excitation=diag["excitation_pass"].to(used_mu.dtype).sum(),
@@ -613,6 +816,13 @@ class ControllerRuntime:
         meta = {"arm": self.arm, "grip_spec": self.gspec.to_meta(),
                 "estimator_path": self.estimator_path,
                 "flags_fired": list(self.flags.fired)}
+        if self.arm == "auto":
+            meta["runtime_version"] = self.runtime_version
+            meta["auto_profile_source"] = self.auto_profile_source
+            meta["observation_adapter"] = self.observation_adapter
+            meta["research_estimator"] = self.research_estimator
+            if self.research_profile is not None:
+                meta["research_profile"] = self.research_profile
         if self.traction is not None:
             # Every threshold the guard ran under. A `tcs` policy learned to drive with a specific
             # release authority and a specific lock gate; a consumer that installs different ones is
@@ -650,7 +860,110 @@ class ControllerRuntime:
                 raise RuntimeError("the estimator reports no architecture; refusing to embed a "
                                    "state dict that could not be reconstructed from it")
             meta["estimator_architecture"] = _as_plain(arch)
+            meta["estimator_content_sha256"] = estimator_content_digest(meta)
         return meta
+
+
+def estimator_content_digest(record: dict) -> str:
+    """Hash inference-relevant embedded values, independent of pickle paths/timestamps."""
+    est = record.get("estimator") or {}
+    meta = est.get("meta") or {}
+    header = {"architecture": record.get("estimator_architecture"),
+              "feature_spec": est.get("feature_spec"), "calibration": est.get("calibration"),
+              "format": meta.get("format", "grip_estimator_v1"),
+              "consumption": meta.get("consumption"),
+              # Workflow provenance/integrity, not authentication against a local
+              # owner who can rewrite both a checkpoint and its digest.
+              "deployment_approved": meta.get("deployment_approved"),
+              "approval": meta.get("approval")}
+    digest = hashlib.sha256(json.dumps(header, sort_keys=True, separators=(",", ":"),
+                                      allow_nan=False).encode())
+    state = record.get("estimator_state")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("controller checkpoint has no embedded estimator weights")
+    for name, value in sorted(state.items()):
+        if not torch.is_tensor(value):
+            raise ValueError(f"embedded estimator state {name!r} is not a tensor")
+        tensor = value.detach().cpu().contiguous()
+        digest.update(json.dumps([name, str(tensor.dtype), list(tensor.shape)]).encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def load_embedded_estimator(record: dict, device="cpu", *, research_estimator=False):
+    """Restore the exact policy/observer pair without depending on an external path."""
+    expected = record.get("estimator_content_sha256")
+    if not expected or expected != estimator_content_digest(record):
+        raise ValueError("embedded estimator content hash is missing or mismatched")
+    from .grip_estimator import FeatureSpec, QuantileGripNet, GripEstimator
+    est = record["estimator"]
+    spec = FeatureSpec.from_meta(est["feature_spec"])
+    meta = dict(est.get("meta") or {})
+    arch = dict(record["estimator_architecture"])
+    kind = arch.pop("model_kind", meta.get("format", "grip_estimator_v1"))
+    if kind == "adaptive_grip_v2":
+        if not research_estimator and meta.get("deployment_approved") is not True:
+            raise ValueError("embedded adaptive estimator has not passed deployment review")
+        from .adaptive_grip import AdaptiveGripNet, AdaptiveGripEstimator, AdaptiveConsumption
+        consumption = meta.get("consumption")
+        if not isinstance(consumption, dict):
+            raise ValueError("embedded adaptive estimator has no consumption contract")
+        net = AdaptiveGripNet(spec, **arch).to(device)
+        net.load_state_dict(record["estimator_state"], strict=True)
+        result = AdaptiveGripEstimator(net, spec, est["calibration"], meta,
+                                       AdaptiveConsumption(**consumption))
+    elif kind == "grip_estimator_v1":
+        net = QuantileGripNet(spec, **arch).to(device)
+        net.load_state_dict(record["estimator_state"], strict=True)
+        result = GripEstimator(net, spec, est["calibration"], meta)
+    else:
+        raise ValueError(f"unsupported embedded estimator format {kind!r}")
+    # This is provenance of the original file. The independently verified embedded
+    # content digest above is the authority for the reconstructed inference pair.
+    result.sha = est.get("sha256") or ""
+    return result
+
+
+def validate_runtime_checkpoint(ck: dict, controller, *, research_estimator=False) -> dict:
+    """Refuse a trained policy paired with a different automatic control contract.
+
+    A string arm performs structural preflight. Pass the installed runtime before
+    acting/training to additionally verify its effective physical and estimator spec.
+    Legacy-trained weights may intentionally be evaluated under another runtime.
+    """
+    record = ((ck.get("extra") or {}).get("experiment") or {}).get("controller") or {}
+    recorded_arm = record.get("arm", "legacy")
+    requested_arm = controller if isinstance(controller, str) else controller.arm
+    if recorded_arm == "legacy":
+        return record
+    if recorded_arm != requested_arm:
+        raise ValueError(f"checkpoint controller {recorded_arm!r} does not match {requested_arm!r}")
+    if recorded_arm == "auto":
+        checkpoint_auto_profile(record)
+        expected = record.get("estimator_content_sha256")
+        if not expected or expected != estimator_content_digest(record):
+            raise ValueError("checkpoint embedded estimator content hash is missing or mismatched")
+        est_meta = (record.get("estimator") or {}).get("meta") or {}
+        if est_meta.get("format") == "adaptive_grip_v2" and not research_estimator \
+                and est_meta.get("deployment_approved") is not True:
+            raise ValueError("checkpoint uses an adaptive estimator pending deployment review")
+    if not isinstance(controller, str):
+        saved_spec = record.get("grip_spec")
+        if not isinstance(saved_spec, dict):
+            raise ValueError("checkpoint has no physical controller specification")
+        saved_spec = gc.GripSpec(**{key: value for key, value in saved_spec.items()
+                                    if key in gc.GripSpec.__dataclass_fields__}).validate().to_meta()
+        if saved_spec != controller.gspec.to_meta():
+            raise ValueError("checkpoint physical controller specification does not match runtime")
+        if controller.base == "estimated":
+            current = controller.checkpoint_meta()
+            saved_digest = record.get("estimator_content_sha256")
+            matches = (saved_digest == current.get("estimator_content_sha256") if saved_digest else
+                       (record.get("estimator") or {}).get("sha256") ==
+                       (current.get("estimator") or {}).get("sha256"))
+            if not matches:
+                raise ValueError("checkpoint estimator does not match installed runtime")
+    return record
 
 
 def _as_plain(v):

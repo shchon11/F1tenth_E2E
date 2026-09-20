@@ -215,8 +215,7 @@ def reference_snapshots(map_id: str, *, steps: int, envs: int, race_size: int, s
         snaps = []
         for _k in range(steps):
             snaps.append(_snapshot(env))
-            a = env.teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid,
-                                        env.ecfg.v_max_policy, env.tracker.spec)
+            a = env.teacher_label(env.teacher)
             obs, _r, term, trunc, _i = _step_any(env, a)
             if bool((term | trunc)[learner].any()):
                 ended.append((s, len(snaps)))

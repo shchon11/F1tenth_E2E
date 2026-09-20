@@ -65,7 +65,7 @@ EST = ("/home/shchon11/Documents/Codex/2026-09-10/new-chat/work/learning-next/"
 
 def _args(**kw):
     base = dict(suite=None, roster=None, system="sys", out=None, device="cpu", lease=False,
-                estimator=EST, gate_steps=60)
+                estimator=EST, gate_steps=60, only=None)
     base.update(kw)
     return types.SimpleNamespace(**base)
 

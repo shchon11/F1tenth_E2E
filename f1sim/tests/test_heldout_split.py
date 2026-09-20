@@ -125,3 +125,8 @@ def test_the_traffic_guard_refuses_a_training_map():
         su.assert_heldout_maps([common.KOREA26])
     # and a variant of a held-out floor is fine, because the comparison is by base map
     su.assert_heldout_maps(["real:map16x07~rev", "gen:control:9100"])
+
+
+def test_asset_and_bare_variants_cannot_hide_a_heldout_base():
+    assert common.base_map("real/lab16x07@rev#hard:44!assets=mixed:1") == "real:map16x07"
+    assert common.base_map("real:map16x07+bare~rev") == "real:map16x07"

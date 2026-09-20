@@ -417,8 +417,14 @@ def save_grip_estimator(path, net: QuantileGripNet, spec: FeatureSpec, calibrati
     return file_sha256(path)
 
 
-def load_grip_estimator(path, device="cpu") -> GripEstimator:
-    ck = torch.load(path, map_location=device)
+def load_grip_estimator(path, device="cpu", *, allow_unapproved: bool = False) -> GripEstimator:
+    ck = torch.load(path, map_location=device, weights_only=True)
+    if ck.get("format") == "adaptive_grip_v2":
+        if not allow_unapproved and (ck.get("meta") or {}).get("deployment_approved") is not True:
+            raise ValueError("adaptive_grip_v2 candidate has not passed deployment review; "
+                             "use the offline adaptive loader for research evaluation")
+        from .adaptive_grip import load_adaptive_grip_estimator
+        return load_adaptive_grip_estimator(path, device=device)
     if ck.get("format") != "grip_estimator_v1":
         raise ValueError(f"not a grip_estimator_v1 checkpoint: {ck.get('format')!r}")
     spec = FeatureSpec.from_meta(ck["feature_spec"])

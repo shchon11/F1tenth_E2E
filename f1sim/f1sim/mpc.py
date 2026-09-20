@@ -181,7 +181,8 @@ def path_points(k: torch.Tensor, Lp: torch.Tensor, n: int = 25, return_kappa: bo
 
 
 def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = None,
-              v_limit: Optional[torch.Tensor] = None, a_walk: Optional[torch.Tensor] = None):
+              v_limit: Optional[torch.Tensor] = None, a_walk: Optional[torch.Tensor] = None,
+              v_profile: Optional[torch.Tensor] = None):
     """Time-indexed reference (B, N+1, 4) = x, y, heading, speed along the plan. The speed *target*
     is the plan's profile (v0 at the start, linear in arc length to v1 at the end); the position
     reference is walked with the speed the car can actually have: from v_now (measured) towards
@@ -191,17 +192,32 @@ def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = Non
     `v_limit` (B, n) caps the speed target at each of `path_points`' samples -- a friction-derived
     envelope, supplied by the caller; it is interpolated onto the walked arc length the same way the
     pose is. `a_walk` (B, 2) replaces `spec.a_brake` / `spec.a_max` in the walk with per-env values.
-    Both default to None, which is the original behaviour exactly."""
+    ``v_profile`` replaces the speed target (including its measured initial state).
+    ``a_walk`` also accepts local spatial budgets (B,n,2), interpolated at the walked arc.
+    Optional inputs default to None, preserving the original behaviour exactly."""
     x, y, psi, s = path_points(k, Lp)
     S = s[:, -1].clamp_min(1e-3)
     dev = k.device; T = spec.N + 1
     st = torch.zeros(k.shape[0], T, device=dev, dtype=k.dtype); v = torch.zeros_like(st)
-    vw = (v0 if v_now is None else v_now.abs()).clamp_min(0.3)
-    a_brk_w = (-spec.a_brake * spec.dt) if a_walk is None else (-a_walk[:, 0] * spec.dt)
-    a_acc_w = (spec.a_max * spec.dt) if a_walk is None else (a_walk[:, 1] * spec.dt)
+    vw = (v0 if v_now is None else v_now.abs()).clamp_min(0.0 if v_profile is not None else 0.3)
+    local_walk = a_walk is not None and a_walk.ndim == 3
+    a_brk_w = (-spec.a_brake * spec.dt) if a_walk is None else (-a_walk[..., 0] * spec.dt)
+    a_acc_w = (spec.a_max * spec.dt) if a_walk is None else (a_walk[..., 1] * spec.dt)
     for t_ in range(T):
         frac = (st[:, t_] / S).clamp(0.0, 1.0)
         v[:, t_] = v0 + (v1 - v0) * frac                                   # target profile at that point of the path
+        if v_profile is not None:
+            pos = frac * (v_profile.shape[1] - 1)
+            ip = pos.floor().clamp(max=v_profile.shape[1] - 2).long()
+            wp = pos - ip.to(v.dtype)
+            vp0 = v_profile.gather(1, ip[:, None])[:, 0]
+            vp1 = v_profile.gather(1, ip[:, None] + 1)[:, 0]
+            # The spatial planner constrains squared speed (v_next^2-v^2=2*a*ds).
+            # Its edge acceleration advances time even from rest; a zero profile
+            # produces neither fictitious motion nor a launch deadlock.
+            v[:, t_] = (vp0.square() * (1 - wp) + vp1.square() * wp).clamp_min(0).sqrt()
+            edge_accel = (vp1.square() - vp0.square()) / (2 * S / (v_profile.shape[1] - 1))
+            edge_accel = torch.where(st[:, t_] < S, edge_accel, torch.zeros_like(edge_accel))
         if v_limit is not None:
             # the envelope at this arc length, linearly interpolated between the path samples
             pos = frac * (v_limit.shape[1] - 1)
@@ -210,10 +226,20 @@ def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = Non
             cap = v_limit.gather(1, i_[:, None])[:, 0] * (1 - wgt) + v_limit.gather(1, i_[:, None] + 1)[:, 0] * wgt
             v[:, t_] = torch.minimum(v[:, t_], cap)
         if t_ < T - 1:
-            dv = torch.clamp(v[:, t_] - vw, a_brk_w, a_acc_w) if a_walk is None else \
-                torch.maximum(torch.minimum(v[:, t_] - vw, a_acc_w), a_brk_w)
-            vw = (vw + dv).clamp_min(0.3)
-            st[:, t_ + 1] = st[:, t_] + vw * spec.dt
+            if local_walk:
+                pos = frac * (a_walk.shape[1] - 1)
+                iw = pos.floor().clamp(max=a_walk.shape[1] - 2).long()
+                ww = pos - iw.to(v.dtype)
+                bw = a_walk.gather(1, iw[:, None, None].expand(-1, 1, 2))[:, 0] * (1 - ww[:, None]) + a_walk.gather(1, (iw + 1)[:, None, None].expand(-1, 1, 2))[:, 0] * ww[:, None]
+                a_brk_w, a_acc_w = -bw[:, 0] * spec.dt, bw[:, 1] * spec.dt
+            demand = v[:, t_] - vw
+            if v_profile is not None:
+                demand = demand + edge_accel * spec.dt
+            dv = torch.clamp(demand, a_brk_w, a_acc_w) if a_walk is None else torch.maximum(torch.minimum(demand, a_acc_w), a_brk_w)
+            old_vw = vw
+            vw = (vw + dv).clamp_min(0.0 if v_profile is not None else 0.3)
+            step_speed = .5 * (old_vw + vw) if v_profile is not None else vw
+            st[:, t_ + 1] = st[:, t_] + step_speed * spec.dt
     idx = torch.searchsorted(s.contiguous(), st.contiguous()).clamp(1, s.shape[1] - 1)   # (B,T)
     s_lo, s_hi = s.gather(1, idx - 1), s.gather(1, idx)
     w = ((st - s_lo) / (s_hi - s_lo).clamp_min(1e-6)).clamp(0.0, 1.0)
@@ -278,8 +304,13 @@ def build_ilqr_consts(spec: PlanSpec, s_max: float, device, dtype=torch.float32)
 
 
 def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSpec, wb: float, s_max: float, v_max: float,
-         consts=None, bounds: Optional[torch.Tensor] = None):
-    """z0 (B,6) [x,y,psi,v,steer_prev,accel_prev], ref (B,N+1,4), u_warm (B,N,2) -> u (B,N,2), z (B,N+1,6)."""
+         consts=None, bounds: Optional[torch.Tensor] = None, projector=None):
+    """z0 (B,6), ref (B,N+1,4), warm (B,N,2) -> controls and augmented states.
+
+    Bounds may be per environment (B,2,2) or stage (B,N,2,2). An optional
+    projector(state, proposed_control, stage) owns the complete projection and
+    runs on initial warm controls and every forward rollout at its actual state.
+    """
     B, N, dev = z0.shape[0], spec.N, z0.device
     if consts is None:                                                 # unchanged path: build inline
         Q = torch.zeros(6, 6, device=dev); Q[:4, :4] = torch.diag(torch.tensor(spec.q, device=dev))
@@ -295,15 +326,30 @@ def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSp
         # Per-env control bounds: (B, 2, 2) as [[steer_lo, accel_lo], [steer_hi, accel_hi]].
         # Limiting only the reference would leave the solver free to command past the budget, so the
         # same numbers have to reach the clamp in the forward rollout below.
-        lo, hi = bounds[:, 0], bounds[:, 1]
+        lo, hi = (bounds[:, :, 0], bounds[:, :, 1]) if bounds.ndim == 4 else (bounds[:, 0], bounds[:, 1])
+
+    def project(ut, state, t):
+        if projector is not None:
+            return projector(state, ut, t)
+        lt, ht = (lo[:, t], hi[:, t]) if bounds is not None and bounds.ndim == 4 else (lo, hi)
+        ut = torch.maximum(torch.minimum(ut, ht), lt)
+        ut[:, 1] = torch.minimum(ut[:, 1], (v_max - state[:, 3]) / spec.dt)
+        if bounds is not None:
+            ut[:, 1] = torch.maximum(ut[:, 1], lt[:, 1])
+        return ut
 
     def rollout(u):
         z = [z0]
+        controls = []
         for t in range(N):
-            z.append(_dyn(z[-1], u[:, t], spec, wb))
-        return torch.stack(z, 1)
+            # Historical warm starts stay unchanged. New local/stage constraints apply before
+            # linearization, so the backward pass never linearizes an unchecked warm trajectory.
+            ut = project(u[:, t], z[-1], t) if projector is not None or (bounds is not None and bounds.ndim == 4) else u[:, t]
+            controls.append(ut)
+            z.append(_dyn(z[-1], ut, spec, wb))
+        return torch.stack(controls, 1), torch.stack(z, 1)
 
-    u = u_warm.clone(); z = rollout(u)
+    u, z = rollout(u_warm.clone())
     for _ in range(spec.iters):
         # cost derivatives around (z, u): quadratic cost, exact
         e = z.clone(); e[:, :, :4] -= ref                                   # tracking error (u_prev slots kept)
@@ -331,15 +377,7 @@ def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSp
         zn = z0; un = torch.zeros_like(u); zs = [z0]
         for t in range(N):
             ut = u[:, t] + ks[t] + (Ks[t] @ (zn - z[:, t])[..., None]).squeeze(-1)
-            ut = torch.maximum(torch.minimum(ut, hi), lo)
-            ut[:, 1] = torch.minimum(ut[:, 1], (v_max - zn[:, 3]) / spec.dt)   # never command past v_max
-            if bounds is not None:
-                # That clamp is below `lo` whenever the state is already past v_max: at v = v_max + 1
-                # and dt = 50 ms it asks for -20 m/s^2. Legacy keeps it (its floor is the spec's
-                # a_brake, and this is the pre-existing behaviour), but a friction-derived floor
-                # exists precisely to say what the tyre can do, so it is re-applied here rather than
-                # silently exceeded. Overspeed is then shed at the budget over several steps.
-                ut[:, 1] = torch.maximum(ut[:, 1], lo[:, 1])
+            ut = project(ut, zn, t)
             un[:, t] = ut; zn = _dyn(zn, ut, spec, wb); zs.append(zn)
         u, z = un, torch.stack(zs, 1)
     return u, z
@@ -404,6 +442,10 @@ class PlanTracker:
         # every existing caller gets. The viewer's CUDA-graph fast path binds one here for its own
         # tracker only; nothing global is replaced, so other trackers in the process are unaffected.
         self._solver = None
+        # Optional nominal actuator conversion, installed only by the local automatic controller.
+        self._command_hook = None
+        self._input_hook = None
+        self._reset_hook = None
         # Per-instance hook on the *plan*, run before anything is decoded. `None` is the untouched
         # path: no branch is taken and nothing is allocated, so a legacy tracker is what it was.
         # It exists because a runtime layer that adjusts the plan -- `learn/clearance.py` -- has to
@@ -418,6 +460,8 @@ class PlanTracker:
 
     def reset(self, ids: torch.Tensor):
         self.u_prev[ids] = 0.0; self.u_seq[ids] = 0.0
+        if self._reset_hook is not None:
+            self._reset_hook(ids)
 
     @torch.no_grad()
     def __call__(self, action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
@@ -426,6 +470,8 @@ class PlanTracker:
         optional), delay: calibrated command latency [s] (float or (B,), default spec.delay)
         -> (steer [rad], speed cmd [m/s]) (B,2)"""
         sp = self.spec
+        if self._input_hook is not None:
+            action, v_meas, speed_cap, yaw_rate, delay = self._input_hook(action, v_meas, speed_cap, yaw_rate, delay)
         if self._plan_hook is not None:
             # Before the decode, so every consumer below -- the reference, the solver, `last_ref`,
             # `last_pred` and the command -- sees one plan, the adjusted one.
@@ -442,6 +488,8 @@ class PlanTracker:
         u, z, ref = solver(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
         u, z, ref = u.clone(), z.clone(), ref.clone()             # CUDA-graph outputs are reused by the next run
         self.u_seq = u; self.u_prev = u[:, 0].clone(); self.last_ref = ref; self.last_pred = z[:, :, :4]
+        if self._command_hook is not None:
+            return self._command_hook(u, z, v_meas, speed_cap)
         k_ = max(1, int(round(sp.v_cmd_lead / sp.dt)))
         v_cmd = torch.minimum(z[:, k_, 3], speed_cap)
         return torch.stack([u[:, 0, 0], v_cmd], 1)

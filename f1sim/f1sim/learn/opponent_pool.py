@@ -40,8 +40,20 @@ import torch
 
 from ..gym_env import OPP_DRIVER_POOL, POOL_SELF, POOL_TEACHER
 from .memory import PolicyRuntime, runtime_for
-from .model import load_checkpoint
+from .model import controller_arm_of, load_checkpoint
 from .obs import flatten_obs
+
+
+def _recorded_arm(path: str) -> str:
+    """The controller arm a checkpoint file records, without building the model.
+
+    `weights_only=True` because this runs before any compatibility check: reading the header of a
+    file that may turn out to be the wrong architecture entirely should not execute anything in it.
+    """
+    try:
+        return controller_arm_of(torch.load(path, map_location="cpu", mmap=True, weights_only=True))
+    except Exception:
+        return "legacy"                # the loader below says what is actually wrong with it
 
 
 @dataclass
@@ -52,6 +64,18 @@ class PoolEntry:
     runtime: PolicyRuntime
     hidden: object = None
     meta: Optional[dict] = None
+    #: The plan-controller arm this checkpoint records (`learn.model.controller_arm_of`). Reported
+    #: rather than installed: the env has one plan tracker shared by every car, so a pool entry
+    #: cannot run its own. What it buys is a refusal instead of a silent mismatch -- a policy whose
+    #: plans were fitted to a friction-limited tracker means something else on the untouched one.
+    arm: str = "legacy"
+
+    @property
+    def memory_kind(self) -> str:
+        """`memory`, `channels` or `feedforward` -- what carrying its state across a step means."""
+        if self.runtime.memory:
+            return "memory"
+        return "channels" if self.runtime.channels else "feedforward"
 
     @property
     def name(self) -> str:
@@ -59,8 +83,18 @@ class PoolEntry:
 
 
 def _spec_of(env):
+    """The observation spec a POOL ENTRY has to fit, which is not always the learner's.
+
+    Privileged opponent tokens (`f1sim.opp_token`) are the learner's oracle and are stripped from
+    the observation the pool acts on (`F1VecEnv._opponent_obs`), so an entry is checked against the
+    proprio vector without them: a deployable LiDAR-only checkpoint is exactly what belongs in the
+    population, and requiring it to be an oracle too would make the whole race privileged.
+    """
+    from dataclasses import replace
+
     from .common import obs_spec                       # local: common imports the env, we import common
-    return obs_spec(env)
+    spec = obs_spec(env)
+    return replace(spec, opp_token="off") if spec.opp_token != "off" else spec
 
 
 def _check_compatible(path: str, meta: dict, env, spec) -> None:
@@ -101,16 +135,37 @@ class OpponentPool:
         return len(self.entries)
 
     @classmethod
-    def load(cls, paths: Sequence[str], env, device=None) -> "OpponentPool":
-        """Load the checkpoint entries of an `opp_pool` (the `self` / `teacher` entries are the env's)."""
+    def load(cls, paths: Sequence[str], env, device=None,
+             arms: Optional[Dict[str, str]] = None) -> "OpponentPool":
+        """Load the checkpoint entries of an `opp_pool` (the `self` / `teacher` entries are the env's).
+
+        `arms` maps a path to the controller arm the caller says that checkpoint was trained under
+        -- a slot table carries one per row. Naming it is what opts the load in: a checkpoint whose
+        recorded arm is not `legacy` is refused by default, and refused again here when the caller's
+        answer is not the file's, because "running it on the wrong tracker" and "the arms differ" are
+        the same mistake at two different moments.
+        """
         device = torch.device(device or env.device)
         spec = _spec_of(env)
+        arms = dict(arms or {})
         entries = []
         for path in paths:
-            model, extra = load_checkpoint(path, device)
+            want = str(arms.get(str(path), "legacy"))
+            recorded = _recorded_arm(path)
+            if want != recorded:
+                raise ValueError(
+                    f"opponent checkpoint {os.path.basename(str(path))} records controller arm "
+                    f"'{recorded}' but the slot says '{want}'. Its actor emits plans for the "
+                    f"tracker it was trained against; replayed through another one they mean "
+                    f"something else. Set the slot's controller to '{recorded}'.")
+            # No `allow_oracle`, and no slot field that could ask for one: an entry trained on
+            # privileged tokens cannot drive off the observation the pool is handed, and an
+            # opponent that needs an oracle is not an opponent a deployable policy would ever meet.
+            model, extra = load_checkpoint(path, device, allow_controller=(want != "legacy"))
             _check_compatible(path, dict(model.meta), env, spec)
             entries.append(PoolEntry(path=str(path), model=model,
-                                     runtime=runtime_for(model, env.B, device), meta=extra))
+                                     runtime=runtime_for(model, env.B, device), meta=extra,
+                                     arm=recorded))
         return cls(entries, env.B, env.act_dim, device)
 
     @torch.no_grad()
@@ -126,7 +181,7 @@ class OpponentPool:
         scan, proprio = flatten_obs(obs)
         out = torch.zeros(scan.shape[0], self.act_dim, device=scan.device, dtype=scan.dtype)
         for j, ent in enumerate(self.entries):
-            action, _logp, ent.hidden = ent.model.act(ent.runtime.observe(scan), proprio,
+            action, _logp, ent.hidden = ent.model.act(ent.runtime.observe(scan, proprio), proprio,
                                                       deterministic=True, h=ent.hidden)
             out = torch.where((driver == OPP_DRIVER_POOL + j)[:, None], action.to(out.dtype), out)
         return out
@@ -156,12 +211,15 @@ def attach(env, device=None, verbose: bool = True):
     One function so that training, the census and any later caller wire the population the same
     way -- the env refuses to run a pool mode without one, which is the point.
     """
-    if env.ecfg.opponent != "pool":
+    if env.ecfg.opponent not in ("pool", "slots") or not env.pool_paths:
         return None
-    pool = OpponentPool.load(env.pool_paths, env, device=device)
+    arms = {}
+    if getattr(env, "slots", None) is not None:
+        arms = {str(sl.checkpoint): str(sl.controller) for sl in env.slots if sl.checkpoint}
+    pool = OpponentPool.load(env.pool_paths, env, device=device, arms=arms)
     env.set_opponent_pool(pool)
     if verbose:
-        special = [n for n in env.pool_names if n in (POOL_SELF, POOL_TEACHER)]
+        special = [n for n in env.pool_names if n in (POOL_SELF, POOL_TEACHER)]  # noqa: E501
         print(f"opponent pool: {len(env.pool_names)} entr{'y' if len(env.pool_names) == 1 else 'ies'}"
               f" -- {pool.describe() or 'none'}"
               + (f" + {', '.join(special)}" if special else ""), flush=True)

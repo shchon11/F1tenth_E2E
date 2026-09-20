@@ -4,6 +4,7 @@ baseline the RL student must beat."""
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -12,6 +13,21 @@ import numpy as np
 
 from .raceline import Raceline, curvature
 from .track import resample_closed
+
+#: `label_grip` as an integer, for the per-car form. The order is the one `f1sim.opponent_slots`
+#: lists, and it is frozen: a recorded code keeps its meaning.
+LABEL_GRIP_NAMES = ("true", "nominal", "conservative")
+LABEL_GRIP_CODE = {name: i for i, name in enumerate(LABEL_GRIP_NAMES)}
+
+
+def plan_geometry_speed(state: torch.Tensor, plan_speed: Optional[torch.Tensor]) -> torch.Tensor:
+    """SI speed used to encode/decode plan geometry; standalone callers retain body speed."""
+    if plan_speed is None:
+        return state[:, 3]
+    if (not torch.is_tensor(plan_speed) or plan_speed.shape != (state.shape[0],)
+            or not plan_speed.is_floating_point() or plan_speed.device != state.device):
+        raise ValueError("plan_speed must be a floating (B,) tensor in m/s on the state device")
+    return plan_speed
 
 
 class RacelineTeacher:
@@ -35,37 +51,37 @@ class RacelineTeacher:
                  ff_time: float = 0.05, k_e_pp: float = 0.0,
                  mu_nominal: float = 1.0489, mu_f_scale_nominal: float = 0.92,
                  recover_time: float = 0.0, v_recover_min: float = 0.6, a_lat_recover: float = 6.0,
-                 v_max_profile: float = 10.0, a_lat: float = 6.0, a_acc: float = 6.0, a_brake: float = 3.0):
+                 v_max_profile: float = 10.0, a_lat: Optional[float] = None,
+                 a_acc: Optional[float] = None, a_brake: Optional[float] = None, vehicle=None):
         self.device = torch.device(device)
+        from .params import VehicleParams
+        nominal = VehicleParams()
+        self.vehicle = vehicle if vehicle is not None else replace(
+            nominal, lf=wheelbase * nominal.lf / (nominal.lf + nominal.lr),
+            lr=wheelbase * nominal.lr / (nominal.lf + nominal.lr),
+            s_max=steer_max, mu=mu_nominal, mu_f_scale=mu_f_scale_nominal)
+        vehicle = self.vehicle
         rls = [raceline] if isinstance(raceline, Raceline) else list(raceline)     # one per track id
         N = max(len(r.xy) for r in rls)
         # speed profiles per grip level: the teacher is privileged, so it brakes and corners for the
         # friction *this* car has (a_lat and a_acc scale with grip; braking does not, see below)
         from .raceline import speed_profile
-        self.grip_levels = np.linspace(0.45, 1.0, 12)      # never faster than the nominal profile: above nominal grip the
-                                                            # limit is tracking error, not the tyres (measured: faster = more crashes)
+        self.grip_levels = np.r_[np.linspace(0.45, 1.0, 12), 1.1, 1.2]
+        self.nominal_grip_index = 11
         xy, v, kap = [], [], []
         for r in rls:
             xr = resample_closed(r.xy, N)
             xy.append(xr); kap.append(curvature(xr))
-            # Measured on the real car (02_pre-competition bags, IMU a_y/a_x smoothed over 200 ms to
-            # drop vibration spikes -- the raw p99 reads 15.9 m/s^2 and is not sustained for even
-            # 0.02 s): lateral 9.2-11.5, longitudinal +6 to +10, braking -5.4 (IMU) / -6.3 (wheel
-            # speed). mu*g in the simulator is 9.5, so the physics already matched; the profile was
-            # planning at 6.0 * grip, i.e. 30-60 % of what the car can do, which also put the
-            # braking point outside the 10 m the LiDAR can see.
-            # a_lat and a_acc scale with grip; braking does not. Measured on the car, the hardest
-            # 200 ms of braking always coincides with the regen current at 95-100 % of its
-            # configured limit, at -4.2 to -5.7 m/s^2 -- well inside mu*g, so the VESC binds first
-            # and the surface never gets a vote. Scaling it by grip made the teacher plan 2.25 m/s^2
-            # of braking on a low-grip draw where the car can still do 5, costing lap time for
-            # nothing.
-            v.append(np.stack([speed_profile(xr, v_max_profile, a_lat * g, a_acc * g, a_brake)
+            # Recompute the combined-slip profile at each actual friction level.
+            # Motor/regen caps do not scale with grip; the tire constraints decide
+            # whether the surface or the actuator is limiting each segment.
+            v.append(np.stack([speed_profile(xr, v_max_profile, a_lat, a_acc, a_brake,
+                                            mu=mu_nominal * g, vehicle=vehicle)
                                for g in self.grip_levels]))   # (K, N)
         self.a_lat = float(a_lat)                                                          # nominal-grip lateral budget of the profiles
         self.xy = torch.tensor(np.stack(xy), dtype=torch.float32, device=self.device)     # (T, N, 2)
         self.v_grip = torch.tensor(np.stack(v), dtype=torch.float32, device=self.device)  # (T, K, N)
-        self.v = self.v_grip[:, -1]                                                        # nominal grip (T, N)
+        self.v = self.v_grip[:, self.nominal_grip_index]                                    # nominal grip (T, N)
         self.grip_levels_t = torch.tensor(self.grip_levels, dtype=torch.float32, device=self.device)
         self.kappa = torch.tensor(np.stack(kap), dtype=torch.float32, device=self.device) # (T, N) left +
         tan = torch.roll(self.xy, -1, 1) - torch.roll(self.xy, 1, 1)
@@ -92,7 +108,9 @@ class RacelineTeacher:
 
     @torch.no_grad()
     def plan_action(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None, v_max: float = 8.0,
-                    spec=None, iters: int = 6, offset: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    spec=None, iters: int = 6, offset: Optional[torch.Tensor] = None,
+                    idx: Optional[torch.Tensor] = None,
+                    plan_speed: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The teacher as a *planner*: the raceline segment ahead of the car expressed in the plan
         action space (f1sim.mpc: curvature knots along the next L_p of arc + start/end speeds).
         Gauss-Newton fits the knots so the integrated path passes through the raceline points
@@ -100,22 +118,37 @@ class RacelineTeacher:
         a plan-space student imitates.
 
         offset: (B,) metres left of the raceline to plan through (opponent behaviour events), clamped
-        by `offset_limit`. None leaves this function exactly as it was."""
+        by `offset_limit`. None leaves this function exactly as it was.
+
+        idx: the caller's own raceline projection of `state[:, :2]`, when it already has one. Purely
+        a saving -- `project` is an argmin over every raceline point, and a caller that evaluates
+        several plans from ONE pose (`f1sim.interactive_teacher`) would otherwise pay for the same
+        projection once per candidate. None computes it here, as before.
+
+        plan_speed: (B,) incoming tracker odometry speed in m/s. It sets the plan's metric length
+        and geometric fit; privileged body state and grip still select the speed profile. None
+        preserves standalone body-speed geometry. The caller must pass the same sample to decode.
+        """
         from .mpc import N_KNOTS, PlanSpec, encode, encode_envelope, encode_knots, path_points, plan_length
         spec = spec or PlanSpec()
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
+        geometry_speed = plan_geometry_speed(state, plan_speed)
         B = xy.shape[0]; dev = xy.device
         tid = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
-        idx, _ = self.project(xy, tid)
+        # One projection, used twice below (the lateral error the off-line slowdown reads is the
+        # same call's second return). It used to be made twice, which on a long raceline is the
+        # single most expensive thing this function does.
+        idx, lat_err = (self.project(xy, tid) if idx is None
+                        else (idx, (xy - self.xy[tid, idx]).norm(dim=1)))
         if offset is not None:
             offset = self.clamp_offset(offset, tid, idx)
         def normal(j):                                             # left-of-travel unit normal at raceline index j
             t_ = self.tan[tid if j.dim() == 1 else tid[:, None].expand_as(j), j]
             return torch.stack([-t_[..., 1], t_[..., 0]], -1)
         ds = self.ds[tid]
-        Lp = plan_length(vx, spec)
-        # raceline points at 6 arc distances between 0.4 and 1.0 L_p ahead, in the body frame (the near
-        # points are skipped on purpose: like pure pursuit, an off-line car should rejoin gently)
+        Lp = plan_length(geometry_speed, spec)
+        # Fit the raceline ahead; near-term execution is checked against the
+        # installed controller by the environment's teacher guard.
         M = 6
         fr = torch.linspace(0.4, 1.0, M, device=dev)
         pidx = (idx[:, None] + ((Lp[:, None] * fr[None]) / ds[:, None]).round().long()) % self.N        # (B,M)
@@ -132,7 +165,7 @@ class RacelineTeacher:
         # gain scheduling the direct teacher's rejoin has) blended into the raceline's own curvature ahead:
         # the fit below only refines this, so an off-line car neither snaps to the line at full lock
         # (over-correction crashes) nor drifts along beside it (under-correction crashes)
-        ld = (self.k_ld * vx.abs()).clamp(self.ld_min, self.ld_max)
+        ld = (self.k_ld * geometry_speed.abs()).clamp(self.ld_min, self.ld_max)
         ld_idx = (idx + (ld / ds).round().long()) % self.N
         tgt = self.xy[tid, ld_idx] - xy
         if offset is not None:
@@ -141,27 +174,53 @@ class RacelineTeacher:
         k_pp = (2.0 * torch.sin(alpha) / ld).clamp(-spec.kappa_max, spec.kappa_max)
         w = torch.clamp(1.0 - torch.linspace(0, 1, N_KNOTS, device=dev) * Lp[:, None] / ld[:, None], 0.0, 1.0)   # PP weight fades over the lookahead
         k = w * k_pp[:, None] + (1 - w) * k_rl
-        k_init = k.clone()
         gb = self.grip_bin(P, B, dev)
-        k_lim = 0.85 * spec.kappa_max
+        wheelbase = torch.full_like(vx, self.L) if P is None else P.get('lf', self.vehicle.lf) + P.get('lr', self.vehicle.lr)
+        steering = torch.full_like(vx, min(self.steer_max, self.vehicle.s_max)) if P is None else torch.as_tensor(P.get('s_max', self.vehicle.s_max), device=dev, dtype=vx.dtype).clamp(max=self.steer_max)
+        k_lim = 0.85 * torch.minimum(torch.full_like(vx, spec.kappa_max), torch.tan(steering) / wheelbase)
+        k = torch.maximum(torch.minimum(k, k_lim[:, None]), -k_lim[:, None])
+        k_init = k.clone()
 
-        def resid(kk):                                             # path samples at the target arc fractions vs targets
-            x, y, _, _ = path_points(kk, Lp, 25)
-            j = (fr * 24).round().long()
-            return torch.cat([x[:, j] - tx, y[:, j] - ty], 1)      # (B,2M)
         lam, mu, eps = 1e-2, 0.3, 0.02                             # GN damping, ridge towards the pure-pursuit / raceline guess
+        # The six finite-difference perturbations are independent. Evaluate them
+        # with the unperturbed path in one batch instead of launching seven tiny
+        # path integrations and constructing six CUDA scalar tensors per iteration.
+        basis = torch.eye(N_KNOTS, device=dev, dtype=k.dtype)
+        perturb = torch.cat([torch.zeros_like(basis[:1]), eps * basis], 0)
+        lengths = Lp[:, None].expand(-1, N_KNOTS + 1).reshape(-1)
+        sample_idx = (fr * 24).round().long()
+        # Cached: a list -> CUDA tensor is a pageable host copy, which waits for the device.
+        fractions = getattr(self, "_gn_fractions", None)
+        if fractions is None or fractions.device != k.device or fractions.dtype != k.dtype:
+            fractions = self._gn_fractions = torch.tensor([1., .5, .25, .125, 0.], device=dev, dtype=k.dtype)
+        trial_lengths = Lp[:, None].expand(-1, len(fractions)).reshape(-1)
+        rows = torch.arange(B, device=dev)
         for _ in range(iters):
-            r0 = resid(k)
-            J = torch.stack([(resid(k + eps * torch.nn.functional.one_hot(torch.tensor(j, device=dev), N_KNOTS).to(k.dtype)[None]) - r0) / eps
-                             for j in range(N_KNOTS)], 2)          # (B,2M,4)
-            A = J.transpose(1, 2) @ J + (lam + mu) * torch.eye(N_KNOTS, device=dev)
+            paths = (k[:, None, :] + perturb[None]).reshape(-1, N_KNOTS)
+            x, y, _, _ = path_points(paths, lengths, 25)
+            x = x[:, sample_idx].reshape(B, N_KNOTS + 1, M)
+            y = y[:, sample_idx].reshape(B, N_KNOTS + 1, M)
+            residuals = torch.cat([x - tx[:, None], y - ty[:, None]], 2)
+            r0 = residuals[:, 0]
+            J = ((residuals[:, 1:] - r0[:, None]) / eps).transpose(1, 2)
+            A = J.transpose(1, 2) @ J + (lam + mu) * basis
             g = J.transpose(1, 2) @ r0[..., None] + mu * (k - k_init)[..., None]
-            step = torch.linalg.solve(A, g).squeeze(-1)
-            k = (k - step).clamp(-k_lim, k_lim)
+            # `solve_ex` is the same LU solve without the error check, which reads the pivots back
+            # to the host every call. A carries a 0.31 ridge, so it is never singular.
+            step = torch.linalg.solve_ex(A, g)[0].squeeze(-1)
+            # Curved minimum-time paths can make a full GN step overshoot and
+            # oscillate. Accept only a decrease in the actual fit+ridge objective.
+            trials = k[:, None] - fractions[None, :, None] * step[:, None]
+            trials = torch.maximum(torch.minimum(trials, k_lim[:, None, None]), -k_lim[:, None, None])
+            px, py, _, _ = path_points(trials.reshape(-1, N_KNOTS), trial_lengths, 25)
+            px = px[:, sample_idx].reshape(B, len(fractions), M)
+            py = py[:, sample_idx].reshape(B, len(fractions), M)
+            costs = ((px - tx[:, None]).square() + (py - ty[:, None]).square()).sum(-1)
+            costs = costs + mu * (trials - k_init[:, None]).square().sum(-1)
+            k = trials[rows, costs.argmin(1)]
         # speeds from the profile: 0.15 s ahead and at the end of the plan
         v_idx0 = (idx + ((vx.abs() * spec.v_cmd_lead) / ds).round().long()) % self.N
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
-        _, lat_err = self.project(xy, tid)
         if offset is not None:                                     # error against the offset line (see __call__)
             t0, p0 = self.tan[tid, idx], self.xy[tid, idx]
             lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()
@@ -184,9 +243,56 @@ class RacelineTeacher:
             return encode_envelope(k, self.a_lat * self.grip_levels_t[gb] * scale ** 2, v1, v_max, spec)
         if cap is not None:
             v0 = torch.minimum(v0, cap); v1 = torch.minimum(v1, cap)
-        return encode(k, v0, v1, v_max, spec)
+        action = encode(k, v0, v1, v_max, spec)
+        if getattr(self, '_defer_profile_projection', False):
+            return action  # interactive generation certifies after endpoint replacement/scaling
+        return self.project_plan_action(action, state, P, v_max, spec, plan_speed=plan_speed)
+
+    def project_plan_action(self, action, state, P, v_max, spec, *, plan_speed=None):
+        """Certify the final fitted path's desired speeds, independently of its source raceline.
+
+        Endpoint interpolation can accelerate through an interior bend even when
+        both endpoints came from a valid global profile. This teacher-only check
+        preserves feasible actions and tactical zero targets. It does not certify
+        reachability from the actual current speed/slip or replace the controller.
+        """
+        from .mpc import decode, encode
+        from .teacher_feasibility import project_speeds
+        speed = plan_geometry_speed(state, plan_speed)
+        k, length, v0, v1 = decode(action, speed, v_max, torch.full_like(speed, v_max), spec)
+        B = state.shape[0]
+        def parameter(name):
+            default = self.mu_nom if name == 'mu' else getattr(self.vehicle, name)
+            value = P.get(name, default) if P is not None else default
+            return torch.as_tensor(value, device=state.device, dtype=state.dtype).expand(B)
+        codes = self.label_grip_codes
+        if codes is None:
+            codes = torch.full((B,), LABEL_GRIP_CODE[self.label_grip], device=state.device, dtype=torch.long)
+        elif codes.numel() != B:
+            if B % codes.numel():
+                raise ValueError('grip codes must match the batch or its candidate tiling')
+            codes = codes.repeat(B // codes.numel())
+        factor = torch.where(codes == LABEL_GRIP_CODE['conservative'],
+                             torch.full_like(speed, float(self.grip_levels[0])), torch.ones_like(speed))
+        muf = torch.where(codes == LABEL_GRIP_CODE['true'], parameter('mu') * parameter('mu_f_scale'),
+                          factor * self.mu_nom * self.vehicle.mu_f_scale)
+        mur = torch.where(codes == LABEL_GRIP_CODE['true'], parameter('mu') * parameter('mu_r_scale'),
+                          factor * self.mu_nom * self.vehicle.mu_r_scale)
+        out0, out1, scale = project_speeds(k, length, v0, v1, P, self.vehicle, spec, muf, mur)
+        self.last_profile_scale = scale
+        self.last_profile_initial_overspeed = state[:, 3].abs() > out0 + 1e-6
+        self.last_profile_initial_sideslip = torch.atan2(state[:, 4], state[:, 3].abs().clamp_min(1e-6))
+        projected = encode(k, out0, out1, v_max, spec)
+        return torch.where((scale == 1)[:, None], action, projected)
 
     label_grip = "true"          # "true": per-env grip (privileged); "nominal"/"conservative": constant
+
+    #: (B,) per-car override of `label_grip`, as `LABEL_GRIP_CODE` values, or None for the scalar
+    #: above. A race whose opponents were configured one by one (`f1sim.opponent_slots`) can put a
+    #: teacher planning on the true friction next to one planning on the nominal profile, which is a
+    #: fast car beside a repeatable one -- so the label the profile is chosen by became a property of
+    #: the *car* rather than of the teacher. None leaves `grip_bin` the function it was.
+    label_grip_codes: Optional[torch.Tensor] = None
 
     def heading_speed_cap(self, yaw: torch.Tensor, tid: torch.Tensor, idx: torch.Tensor) -> Optional[torch.Tensor]:
         """Speed from which the car can still turn back onto the lane within `recover_time`.
@@ -210,12 +316,33 @@ class RacelineTeacher:
         the label is a function of the observation alone (the price is a slower target, and a teacher
         that can over-drive a low-grip car, which is why collection uses `speed_scale` < 1).
         """
+        if self.label_grip_codes is not None:
+            return self._grip_bin_per_car(P, B, device)
         if self.label_grip == "nominal" or P is None:
-            return torch.full((B,), len(self.grip_levels) - 1, dtype=torch.long, device=device)
+            return torch.full((B,), self.nominal_grip_index, dtype=torch.long, device=device)
         if self.label_grip == "conservative":
             return torch.zeros(B, dtype=torch.long, device=device)
-        g = ((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(max=1.0)
-        return (g[:, None] - self.grip_levels_t[None]).abs().argmin(1)
+        g = ((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(max=float(self.grip_levels[-1]))
+        # A nearest-bin lookup can select a profile with more grip than this car
+        # actually has. Use the lower envelope, including at the high-grip bins.
+        return (torch.searchsorted(self.grip_levels_t, g, right=True) - 1).clamp(0, len(self.grip_levels) - 1)
+
+    def _grip_bin_per_car(self, P, B: int, device) -> torch.Tensor:
+        """`grip_bin` when each car carries its own label. All three answers, then select.
+
+        Computed rather than branched because the rows are mixed: there is no "the" mode to test.
+        Without `P` the privileged answer does not exist for anybody, which is exactly the case the
+        scalar path already turns into `nominal`, so it does the same here."""
+        top = self.nominal_grip_index
+        codes = self.label_grip_codes
+        nominal = torch.full((B,), top, dtype=torch.long, device=device)
+        if P is None:
+            return nominal
+        g = ((P["mu"] * P["mu_f_scale"]) / (self.mu_nom * self.mu_f_nom)).clamp(max=float(self.grip_levels[-1]))
+        true_bin = (torch.searchsorted(self.grip_levels_t, g, right=True) - 1).clamp(0, len(self.grip_levels) - 1)
+        out = torch.where(codes == LABEL_GRIP_CODE["nominal"], nominal, true_bin)
+        return torch.where(codes == LABEL_GRIP_CODE["conservative"],
+                           torch.zeros_like(out), out)
 
     speed_mode = "grip"          # "grip": per-grip profiles (braking points move too); "sqrt": nominal profile x sqrt(grip)
 
@@ -236,7 +363,7 @@ class RacelineTeacher:
         tid = torch.zeros(xy.shape[0], dtype=torch.long, device=xy.device) if tid is None else tid
         d2 = ((xy[:, None, :] - self.xy[tid]) ** 2).sum(-1)
         idx = d2.argmin(1)
-        return idx, d2[torch.arange(len(idx)), idx].sqrt()
+        return idx, d2[torch.arange(len(idx), device=idx.device), idx].sqrt()
 
     def __call__(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
                  offset: Optional[torch.Tensor] = None) -> torch.Tensor:

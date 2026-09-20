@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=f1sim Console
+Name[ko]=f1sim 주행 콘솔
+GenericName=F1TENTH Driving Simulator
+GenericName[ko]=F1TENTH 주행 시뮬레이터
+Comment=Train, watch and evaluate end-to-end F1TENTH racing policies
+Comment[ko]=F1TENTH 종단간 주행 정책을 학습하고, 보고, 평가합니다
+Exec=f1sim-console %f
+Icon=io.f1sim.Console
+Terminal=false
+Categories=Science;Robotics;
+Keywords=f1tenth;racing;simulator;reinforcement learning;autonomous;
+Keywords[ko]=자율주행;강화학습;시뮬레이터;
+StartupNotify=true
+StartupWMClass=f1sim Console

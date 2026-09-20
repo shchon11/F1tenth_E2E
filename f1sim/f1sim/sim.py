@@ -29,7 +29,8 @@ from .track import Track, TrackTensors
 class StepResult:
     scan: torch.Tensor          # (B, N) noisy ranges (inf for no return)
     scan_true: torch.Tensor     # (B, N) noise-free ranges (privileged)
-    scan_type: torch.Tensor     # (B, N) int32 what each beam hit: 0 none, 1 duct, 2 tall object, 3 floor
+    scan_type: torch.Tensor     # (B, N) int32 what each beam hit, `lidar.HIT_*`: 0 none,
+                                # 1 duct, 2 tall object (props included), 3 floor, 4 another car
     attitude: torch.Tensor      # (B, 2) body roll, pitch [rad] (sprung mass)
     odom: torch.Tensor          # (B, 5) VESC odom: x, y, yaw, v, yaw_rate (drifting)
     state: torch.Tensor         # (B, 8) ground truth: x, y, yaw, vx, vy, yaw_rate, steer, omega_r
@@ -480,7 +481,9 @@ class Simulator:
         self.cmd_hist = torch.cat([self.cmd[:, None, :], self.cmd_hist[:, :-1]], 1)
 
         self.pose_prev = self.state[:, :3].clone()
-        self.att_prev = self.att[:, [0, 2]].clone()
+        # Roll/pitch are alternate columns. A strided view avoids constructing a
+        # CUDA index tensor from a Python list (and synchronizing) every step.
+        self.att_prev = self.att[:, :3:2].clone()
         # the sample layout belongs to this step's phase; capture it before the phase advances
         imu_offsets = self._imu_offsets[self._imu_phase]
         state, ax, ay, att, imu_state, imu_samples, i_motor = self._roll(
@@ -520,7 +523,7 @@ class Simulator:
         # --- sensors ---
         pose = state[:, :3]
         scan, scan_true, scan_type = self.lidar.scan(pose, self.pose_prev, P, self.cfg.lidar.motion_distortion,
-                                                     att=att[:, [0, 2]], att_prev=self.att_prev, tid=self.tid, cars=cars,
+                                                     att=att[:, :3:2], att_prev=self.att_prev, tid=self.tid, cars=cars,
                                                      eid=self.eid)
         imu = imu_samples if self.cfg.imu.enabled else None
         imu_att = imu_state[:, 18:21].clone() if self.cfg.imu.enabled else None
@@ -532,7 +535,7 @@ class Simulator:
             self._odom_t_prev = odom_t
         else:
             odom_t = None
-        return StepResult(scan, scan_true, scan_type, att[:, [0, 2]].clone(), odom, state, imu, imu_att,
+        return StepResult(scan, scan_true, scan_type, att[:, 0:3:2].clone(), odom, state, imu, imu_att,
                           self.collided.clone(), ds, s, lateral, self.lap.clone(), wall_dist, self.t,
                           self.car_collision.clone() if self.M > 1 else None,
                           imu_offsets if self.cfg.imu.enabled else None,

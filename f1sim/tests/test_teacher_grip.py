@@ -71,3 +71,13 @@ def test_default_stays_privileged_so_existing_runs_are_unchanged():
 def test_missing_params_still_fall_back_to_nominal():
     teacher = _teacher()
     assert teacher.grip_bin(None, 4, torch.device("cpu")).tolist() == [11] * 4
+
+
+def test_true_grip_never_rounds_up_to_a_more_aggressive_profile():
+    teacher = _teacher()
+    ratios = torch.tensor([0.734, 0.975, 1.0, 1.06, 1.1, 1.15])
+    params = _params(ratios * teacher.mu_nom)
+    bins = teacher.grip_bin(params, len(ratios), torch.device("cpu"))
+    actual_ratio = params["mu"] * params["mu_f_scale"] / (teacher.mu_nom * teacher.mu_f_nom)
+    assert torch.all(teacher.grip_levels_t[bins] <= actual_ratio + 1e-7)
+    assert bins[-1] > teacher.nominal_grip_index
