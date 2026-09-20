@@ -203,7 +203,7 @@ class SplinerTeacher(FrenetOpponentPlanner):
         # obstacles, not cars. Whichever is nearer ahead is the thing to plan around, and a prop is
         # a car that will not move -- so it enters with zero speed and the prediction below leaves
         # it where it is.
-        b_gap, b_d = self._blockage_ahead(state, tid_b, torch.full_like(gap, self.lookahead))
+        b_gap, b_d = self._blockage_ahead(state, tid_b, CONTROL_S[-1] * stretch)
         take_prop = b_gap < gap.clamp_min(0.0)
         gap = torch.where(take_prop, b_gap, gap)
         d_opp = torch.where(take_prop, b_d, d_opp)

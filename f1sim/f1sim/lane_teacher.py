@@ -189,7 +189,7 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         # A prop standing in the road blocks a lane exactly the way a car does, and it is the case
         # this planner would otherwise drive straight into: with nobody to pass it holds the racing
         # line, and `procedural_raceline_corridor = "off"` puts crates on it.
-        b_gap, b_d = self._blockage_ahead(state, tid_b, torch.full_like(gap, self.lookahead))
+        b_gap, b_d = self._blockage_ahead(state, tid_b, 2.0 * self.rear_clear * stretch)
         take_prop = b_gap < gap.clamp_min(0.0)
         gap = torch.where(take_prop, b_gap, gap)
         d_opp = torch.where(take_prop, b_d, d_opp)

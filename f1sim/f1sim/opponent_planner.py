@@ -212,19 +212,24 @@ class FrenetOpponentPlanner:
         n = self._normal(tid, idx)
         d = torch.as_tensor(d, device=p.device, dtype=p.dtype)
         q = p + d[..., None] * n
+        if props_only:
+            # The distance field is not asked at all: the question is what is in the road that the
+            # reference line does not already account for, and the walls are not that. Skipping the
+            # lookup matters -- this path runs over every station and probe of `_blockage_ahead`,
+            # for every planner, on every step.
+            if self.props is None:
+                return torch.full(q.shape[:-1], float("inf"), device=q.device, dtype=q.dtype)
+            rows = torch.arange(q.shape[0], device=q.device)
+            rows = rows.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
+            return self.props.clearance(q.reshape(-1, 2), rows.reshape(-1)).view(q.shape[:-1])
         edt = self.track.sample_edt(q, tid)
         if self.props is None:
-            return torch.full_like(edt, float("inf")) if props_only else edt
+            return edt
         # Row b of the batch drives in layout b: one layout per env row, as `redraw` writes them.
         rows = torch.arange(q.shape[0], device=q.device)
         rows = rows.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
         prop = self.props.clearance(q.reshape(-1, 2), rows.reshape(-1)).view(edt.shape).to(edt.dtype)
-        # `props_only` asks the other question: is there something in the road that the reference
-        # line does not already account for. The walls do not qualify -- the line is inside them by
-        # construction, so a probe far enough off it always reports one, and a scan that counted
-        # them would report a blockage everywhere and send the planner round a corner it was
-        # already taking. Measured before this split: 100 % of steps "blocked".
-        return prop if props_only else torch.minimum(edt, prop)
+        return torch.minimum(edt, prop)
 
     def _normal(self, tid: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """Left-of-travel unit normal of the reference line, the direction `offset` counts in."""
@@ -314,6 +319,9 @@ class FrenetOpponentPlanner:
         B = state.shape[0]
         dev, dt = state.device, state.dtype
         idx = base.project(state[:, :2], tid)[0]
+        # `reach` is the caller's manoeuvre span, not its detection range: a crate further ahead
+        # than the evasion itself reaches is not yet a thing to plan around, and every extra
+        # station here is B x 7 more prop queries on every step of every race.
         K = max(2, int(float(reach.max().item()) / self.BLOCK_STEP))
         ds = base.ds[tid]                                              # [m] per reference index
         step = torch.arange(1, K + 1, device=dev, dtype=dt) * self.BLOCK_STEP     # (K,)
