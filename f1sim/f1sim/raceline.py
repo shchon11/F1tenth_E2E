@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import sys
+
 import numpy as np
 from scipy import sparse as sp
 
@@ -523,9 +525,51 @@ class Raceline:
         path = os.path.join(cache_dir, f"{track.name}_{h}.csv")
         if os.path.exists(path):
             return Raceline.load(path)
+        Raceline._announce_cache_miss(track.name, cache_dir, h, kw, params)
+        import time as _time
+        t0 = _time.monotonic()
         rl = Raceline.build(track, **kw)
         rl.save(path)
+        print(f"[raceline] {track.name}: built in {(_time.monotonic() - t0) / 60:.1f} min, cached",
+              file=sys.stderr, flush=True)
         return rl
+
+    #: Set `F1SIM_RACELINE_CACHE_ONLY=1` and a cache miss raises instead of spending twenty minutes
+    #: to an hour in the minimum-time solver. For anything meant to be quick -- an evaluation, a
+    #: test, a console session -- that is the behaviour you want: the answer "this needs a build"
+    #: in a second beats the same answer after forty minutes of silence.
+    CACHE_ONLY_ENV = "F1SIM_RACELINE_CACHE_ONLY"
+
+    @staticmethod
+    def _announce_cache_miss(name: str, cache_dir: str, h: str, kw: dict, params: dict) -> None:
+        """Say that a build is starting, and say *why* this one and not the last one.
+
+        The cache key is every parameter of `build`, so one different `--teacher-a-lat` or
+        `--raceline-margin` is a fresh twenty-to-seventy-minute optimisation -- and until this
+        existed it happened in total silence, which is why the same command felt instant one day
+        and hung the next. The parameters that were passed are printed because they are the ones
+        that moved; the variants already on disk are counted because "14 of this track, none of
+        them yours" is the sentence that explains it.
+        """
+        import os
+        try:
+            have = sorted(f for f in os.listdir(cache_dir) if f.startswith(name + "_"))
+        except OSError:
+            have = []
+        if os.environ.get(Raceline.CACHE_ONLY_ENV, "") not in ("", "0"):
+            raise RuntimeError(
+                f"raceline cache miss for {name!r} (key {h}) and {Raceline.CACHE_ONLY_ENV} is set. "
+                f"{len(have)} variant(s) of this track are cached, none with these parameters: "
+                f"{ {k: v for k, v in kw.items()} or 'the defaults'}. Build it once (it takes "
+                f"20-70 min) or pass the parameters the run used -- the cache key is every "
+                f"argument of Raceline.build, so --teacher-a-lat / --teacher-a-acc / "
+                f"--teacher-a-brake / --raceline-margin / --raceline-objective all change it.")
+        print(f"[raceline] {name}: cache MISS, building the minimum-time line. This takes 20-70 "
+              f"minutes and is single-threaded.\n"
+              f"[raceline]   parameters: { {k: v for k, v in kw.items()} or 'the defaults'}\n"
+              f"[raceline]   {len(have)} other variant(s) of this track are already cached, so if "
+              f"you expected this to be instant, one of those parameters differs from the run you "
+              f"are comparing against.", file=sys.stderr, flush=True)
 
     @staticmethod
     def from_xy(xy: np.ndarray, v: np.ndarray) -> "Raceline":
