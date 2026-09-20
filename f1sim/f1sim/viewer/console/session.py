@@ -289,6 +289,7 @@ class SessionController(QtCore.QObject):
         w.focus_requested.connect(self.set_focus)
         w.overlay_requested.connect(self.set_overlay)
         w.mu_requested.connect(self.set_mu)
+        w.dial_requested.connect(self.set_dial)
         w.describe_requested.connect(self.describe)
         w.retry_requested.connect(self.retry)
         w.viewport.frame_timed.connect(w.push_frame_time)
@@ -553,6 +554,11 @@ class SessionController(QtCore.QObject):
             return
         self.send(P.CMD_SET_MU, for_gen=self._active_gen, mode=str(mode), mu=float(mu))
 
+    def set_dial(self, mu: float):
+        if self._active_gen < 0:
+            return
+        self.send(P.CMD_SET_DIAL, for_gen=self._active_gen, mu=float(mu))
+
     def set_overlay(self, overlay: dict):
         if self._proc is None or not self._proc.is_alive():
             return
@@ -769,6 +775,10 @@ class SessionController(QtCore.QObject):
         self.last_facts = dict(facts)
         self.buffer.set_generation(gen)
         self.window.set_session_facts(facts)
+        # The dial is a property of the running checkpoint, not of the form: an unconditional one
+        # has no such input and the control stays hidden rather than offering a number that is
+        # dropped on the floor.
+        self.window.show_dial(facts.get("dial"))
         self.window.apply_state(STATE_RUNNING)
         self.window.settle_pause(False)
         self.window.viewport.reset_timing()
@@ -799,7 +809,7 @@ class SessionController(QtCore.QObject):
             self._ignore(f"'{command}' 확인", issued_gen if issued_gen is not None else ack_gen,
                          "worker가 더 새로운 세션으로 넘어감")
             return
-        if command in ("pause", "reset", "focus", "overlay", "set_mu"):
+        if command in ("pause", "reset", "focus", "overlay", "set_mu", "set_dial"):
             # session-scoped: only meaningful for the session that is actually on screen
             if self._active_gen < 0 or (issued_gen is not None and issued_gen != self._active_gen):
                 self._ignore(f"'{command}' 확인", issued_gen, "그 세션은 이미 끝났습니다")
@@ -825,6 +835,9 @@ class SessionController(QtCore.QObject):
             self.window._pending.pop("focus", None)
         elif command == "set_mu":
             self.window.settle_mu(str(state.get("mu_mode", "fixed")), float(state.get("mu", 0.0)))
+        elif command == "set_dial":
+            d = state.get("dial")
+            self.window.settle_dial(None if d is None else float(d))
 
     def _on_error(self, msg: dict):
         gen = int(msg.get("gen", -1))

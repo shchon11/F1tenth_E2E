@@ -373,3 +373,47 @@ def test_dial_draw_is_at_or_below_the_floor_and_held_for_the_episode():
     d.redraw(torch.tensor([True, False, False, False]))            # only env 0 opened a new episode
     assert torch.equal(d.value()[1:], first[1:])
     assert (C.DialDraw(_Env(), margin=0.30, p_exact=1.0).value() == _Sim.P["mu"]).all()   # "exact" episodes carry no margin
+
+
+def test_a_dial_checkpoint_opens_in_the_viewer_and_a_lab_oracle_does_not(tmp_path):
+    """The viewer refused every conditional checkpoint, which locked out the deployable ones.
+
+    A `dial` policy's input is a setting someone chooses, so it has to load where a person would
+    turn it; a `true_mu` policy's is the environment's true friction, which no car has.
+    """
+    import pytest
+    from f1sim.learn.model import ActorCritic, save_checkpoint, load_checkpoint
+    for source, opens in (("dial", True), ("true_mu", False)):
+        spec = C.spec_for(source)
+        m = ActorCritic(3, 64, 12, 17, act_dim=8, cond_dim=1, cond=spec.to_meta())
+        p = str(tmp_path / f"{source}.pt")
+        save_checkpoint(p, m, {"phase": "ppo"})
+        if opens:
+            back, _ = load_checkpoint(p, "cpu")                      # no opt-in, as the viewer calls it
+            assert back.meta["cond"]["source"] == "dial"
+        else:
+            with pytest.raises(ValueError, match="LAB-ORACLE"):
+                load_checkpoint(p, "cpu")
+            load_checkpoint(p, "cpu", allow_conditional=True)         # a caller that supplies it still may
+
+
+def test_the_dial_is_a_live_number_the_actor_is_driven_with(tmp_path):
+    # It has to be changeable mid-session without rebuilding: the console turns it while driving.
+    from f1sim.learn.model import ActorCritic
+    from f1sim.learn.watch import DialSource, actor_runner, dial_for
+    spec = C.spec_for("dial")
+    m = ActorCritic(3, 64, 12, 17, act_dim=8, cond_dim=1, cond=spec.to_meta())
+    d = dial_for(m, torch.device("cpu"))
+    assert isinstance(d, DialSource) and abs(d.mu - 0.73423) < 1e-6      # the safe end, by default
+    # A fresh conditional actor has its conditioning projection at exactly zero (that is what makes
+    # a warm start bit-identical), so the dial can only be seen once it carries weight.
+    with torch.no_grad():
+        m.actor.cond.weight.normal_(0.0, 0.5)
+    run = actor_runner(m, torch.device("cpu"), False, dial=d)
+    scan, pro = torch.zeros(2, 3, 64), torch.zeros(2, 12)
+    a = run(scan, pro).clone()
+    assert torch.allclose(d.c(2)[0], C.mu_to_c(torch.tensor([d.mu]), spec)[0])
+    d.set(1.10)
+    assert not torch.allclose(a, run(scan, pro))                          # the dial reached the policy
+    m2 = ActorCritic(3, 64, 12, 17, act_dim=8)
+    assert dial_for(m2, torch.device("cpu")) is None                      # unconditional: no dial

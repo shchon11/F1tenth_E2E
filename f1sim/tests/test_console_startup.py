@@ -211,3 +211,45 @@ def test_the_training_obstacle_split_is_untouched():
     assert "real:korea_2025_iccas+obs101" in common.EVAL_OBSTACLE_TRACKS
     assert not any("+props" in n for n in common.EVAL_OBSTACLE_TRACKS), (
         "props must not have been quietly added to the training obstacle split")
+
+
+# ---------------------------------------------------------------- remembered settings (2026-09-20)
+def test_console_remembers_its_settings_between_launches(qapp, tmp_path, monkeypatch):
+    """Every control was reset to its default on each launch; the same run set up twice cost the
+    whole sidebar twice."""
+    from f1sim.viewer.console.window import ConsoleWindow
+    monkeypatch.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path / "console.json"))
+
+    w = ConsoleWindow()
+    w.spin_cap.setValue(7.5)
+    w.spin_grid.setValue(3)
+    w.chk_dr.setChecked(False)
+    w.combo_mu.setCurrentIndex(w.combo_mu.findData("fixed"))
+    w.spin_mu.setValue(0.82)
+    w.spin_dial.setValue(0.90)
+    ckpt = tmp_path / "run.pt"; ckpt.write_text("x")
+    w._on_run_selected(str(ckpt))
+    w._selected_map = "real/map12x16"
+    w.save_prefs()
+
+    back = ConsoleWindow()
+    assert back.spin_cap.value() == 7.5 and back.spin_grid.value() == 3
+    assert back.chk_dr.isChecked() is False
+    assert back.combo_mu.currentData() == "fixed" and abs(back.spin_mu.value() - 0.82) < 1e-6
+    assert abs(back.spin_dial.value() - 0.90) < 1e-6
+    assert back._selected_run == str(ckpt)
+    assert back._pref_map == "real/map12x16"       # applied when the worker's catalogue arrives
+
+
+def test_a_setting_that_can_no_longer_be_restored_costs_only_itself(qapp, tmp_path, monkeypatch):
+    from f1sim.viewer.console.window import ConsoleWindow
+    monkeypatch.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path / "console.json"))
+    ckpt = tmp_path / "run.pt"; ckpt.write_text("x")
+    w = ConsoleWindow(); w.spin_cap.setValue(7.5); w._on_run_selected(str(ckpt)); w.save_prefs()
+
+    ckpt.unlink()                                   # the checkpoint is gone; the rest is still valid
+    back = ConsoleWindow()
+    assert back._selected_run is None and back.spin_cap.value() == 7.5
+
+    (tmp_path / "console.json").write_text("{ not json")
+    assert ConsoleWindow().spin_cap.value() == 6.0  # unreadable: defaults, silently

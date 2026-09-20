@@ -65,6 +65,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     overlay_requested = QtCore.pyqtSignal(dict)
     describe_requested = QtCore.pyqtSignal(str)
     mu_requested = QtCore.pyqtSignal(str, float)          # (mode, mu) live friction control
+    dial_requested = QtCore.pyqtSignal(float)             # grip dial for a conditional ("dial") policy
     retry_requested = QtCore.pyqtSignal()
     close_requested = QtCore.pyqtSignal()
 
@@ -80,6 +81,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.maps = MapCatalog()
         self._selected_run: Optional[str] = None
         self._selected_map: Optional[str] = None
+        #: A remembered map id, waiting for the worker's catalogue. The list is built in the worker
+        #: (map names need torch), so at construction time there is nothing to select in yet.
+        self._pref_map: Optional[str] = None
         #: Seeds the worker's draw when the scenario leaves the obstacle seed open. Re-rolled by
         #: 다시 뽑기; part of the config, so a re-roll is a new generation and the facts strip can
         #: print the number that was actually used.
@@ -101,6 +105,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._install_shortcuts()
+        # Last, and after every widget exists: the controls a person set on the previous launch.
+        # A remembered map waits for the worker's catalogue (`set_maps`); everything else applies now.
+        self.restore_prefs()
         self.apply_state(STATE_IDLE)
 
     # ================================================================ construction
@@ -387,6 +394,32 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.row_mu = FieldRow("노면 마찰 μ", mu_box,
                                "학습 범위 0.734~1.154, 공칭 1.049. 고정값은 리셋 뒤에도 유지되고 주행 중 바꿀 수 있습니다.")
         cfg_card.add(self.row_mu)
+
+        # -- grip dial: for a conditional ("dial") checkpoint, the friction the POLICY IS TOLD to
+        # use, which is not the friction the floor has. Friction cannot be read from the car's
+        # sensors at a pace it survives, so a dial policy is given the number instead; a dial under
+        # the real friction is slow and safe, and over it is neither. Hidden for a checkpoint that
+        # has no such input -- a control that does nothing is worse than no control.
+        dial_row = QtWidgets.QHBoxLayout()
+        dial_row.setSpacing(SP[0])
+        self.spin_dial = QtWidgets.QDoubleSpinBox()
+        self.spin_dial.setRange(0.40, 1.40)
+        self.spin_dial.setDecimals(3)
+        self.spin_dial.setSingleStep(0.01)
+        self.spin_dial.setValue(0.734)
+        dial_row.addWidget(self.spin_dial, 1)
+        self.btn_dial_apply = PendingButton("적용")
+        self.btn_dial_apply.setToolTip("주행 중인 정책이 쓰는 그립 값을 지금 바꿉니다.")
+        self.btn_dial_apply.setEnabled(False)
+        self.btn_dial_apply.clicked.connect(self._on_dial_apply)
+        dial_row.addWidget(self.btn_dial_apply)
+        dial_box = QtWidgets.QWidget()
+        dial_box.setLayout(dial_row)
+        self.row_dial = FieldRow("그립 다이얼", dial_box,
+                                 "정책에게 '이만큼의 그립을 써라' 라고 알려 주는 값입니다. 실제 노면보다 낮게 잡으면 "
+                                 "느리지만 안전하고, 높게 잡으면 빠르지도 안전하지도 않습니다.")
+        self.row_dial.setVisible(False)             # shown when a dial checkpoint is running
+        cfg_card.add(self.row_dial)
         v.addWidget(cfg_card)
 
         # -- advanced
@@ -610,6 +643,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     #: Below this width the two sidebars leave the 3D view too small to drive by, so the setup
     #: sidebar -- which is only needed between sessions -- folds away once a session is running.
     NARROW_W = 1400
+
     #: Below this height the policy panels would take a third of the picture they annotate.
     SHORT_H = 820
 
@@ -621,6 +655,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         timer with the status bar narrating it, and `allow_close()` closes for real when the worker
         is actually gone.
         """
+        self.save_prefs()
         if self._closing_allowed:
             ev.accept()
             return
@@ -904,6 +939,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.map_group.setEnabled(True)
         self.map_group.blockSignals(False)
         self._refresh_map_list()
+        if self._pref_map and cat.ready and self._pref_map in set(cat.ids()):
+            self._on_map_selected(self._pref_map)      # the map this window was last used with
+            self.map_list.select(self._pref_map)
+        self._pref_map = None
         self._update_start_enabled()
 
     def _map_rows(self, ids: List[str], with_group: bool):
@@ -1249,6 +1288,27 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._pending.pop("set_mu", None)
         self.status_text.setText(f"노면 마찰: {'고정 μ=' + format(mu, '.3f') if mode == 'fixed' else '랜덤 (리셋마다 다시 뽑음)'} — 모든 차량에 적용됨")
 
+    def show_dial(self, mu: Optional[float]):
+        """The running checkpoint's dial, or None when it has no conditioning input."""
+        self.row_dial.setVisible(mu is not None)
+        self.btn_dial_apply.setEnabled(mu is not None)
+        if mu is not None:
+            self.spin_dial.blockSignals(True)
+            self.spin_dial.setValue(float(mu))
+            self.spin_dial.blockSignals(False)
+
+    def settle_dial(self, mu: Optional[float]):
+        """The worker confirmed a dial change."""
+        self.btn_dial_apply.ack()
+        self._pending.pop("set_dial", None)
+        if mu is not None:
+            self.status_text.setText(f"그립 다이얼: 정책이 μ={mu:.3f} 만큼의 그립을 쓰도록 지시받았습니다")
+
+    def _on_dial_apply(self):
+        self.btn_dial_apply.mark_pending()
+        self._pending["set_dial"] = time.monotonic()
+        self.dial_requested.emit(float(self.spin_dial.value()))
+
     def _on_mu_mode(self, _idx):
         fixed = self.combo_mu.currentData() == "fixed"
         self.spin_mu.setEnabled(fixed)
@@ -1525,6 +1585,107 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         else:
             self.row_grid.reset_hint()
 
+    # ---------------------------------------------------------------- remembered settings
+    def collect_prefs(self) -> dict:
+        """The controls a person sets, as plain values. Read by `prefs.save`."""
+        return {
+            "run": self._selected_run or "",
+            "map": self._selected_map or "",
+            "direction": self.seg_direction.current() or "",
+            "obstacle": str(self.combo_obstacle.currentData() or ""),
+            "obstacle_seed_mode": str(self.combo_seed.currentData() or ""),
+            "obstacle_seed": int(self.spin_seed.value()),
+            "races": int(self.spin_races.value()),
+            "cars_per_race": int(self.spin_grid.value()),
+            "speed_cap": float(self.spin_cap.value()),
+            "device": self.combo_device.currentText(),
+            "compile": bool(self.chk_compile.isChecked()),
+            "randomize": bool(self.chk_dr.isChecked()),
+            "stochastic": bool(self.chk_stoch.isChecked()),
+            "opponent": self.combo_opponent.currentText(),
+            "controller": self.combo_controller.currentText(),
+            "estimator": self.edit_estimator.text().strip(),
+            "mu_mode": str(self.combo_mu.currentData() or "random"),
+            "mu": float(self.spin_mu.value()),
+            "dial": float(self.spin_dial.value()),
+            "ros2": str(self.combo_ros.currentData() or "off"),
+            "saliency": bool(self.chk_saliency.isChecked()),
+            "internals": bool(self.chk_internals.isChecked()),
+        }
+
+    def apply_prefs(self, p: dict) -> None:
+        """Put the remembered values back.
+
+        Field by field, each guarded on its own: a value that no longer parses, a combo entry that
+        has gone away, or a control that has been renamed costs *that* setting and nothing else. A
+        single try block around the lot meant one bad field silently discarded every field after it,
+        which is indistinguishable from not having saved at all.
+        """
+        if not p:
+            return
+
+        def attempt(fn, key):
+            if key in p:
+                try:
+                    fn(p[key])
+                except Exception:
+                    pass
+
+        def combo_text(combo):
+            def run(value):
+                i = combo.findText(str(value))
+                if i >= 0:
+                    combo.setCurrentIndex(i)
+            return run
+
+        def combo_data(combo):
+            def run(value):
+                i = combo.findData(str(value))
+                if i >= 0:
+                    combo.setCurrentIndex(i)
+            return run
+
+        def restore_run(value):
+            # A checkpoint that has been deleted or renamed would leave the window claiming a
+            # selection whose Start fails, so it is dropped and the field reads as a first launch.
+            run = str(value or "")
+            if run and os.path.exists(run):
+                self.run_list.select(run)
+                self._on_run_selected(run)
+
+        # The map list is built in the worker (map names need torch), so at construction time there
+        # is nothing to select in; `set_maps` applies this when the catalogue arrives.
+        attempt(restore_run, "run")
+        attempt(lambda v: setattr(self, "_pref_map", str(v) or None), "map")
+        attempt(lambda v: self.seg_direction.set_current(str(v or "")), "direction")
+        attempt(combo_data(self.combo_obstacle), "obstacle")
+        attempt(combo_data(self.combo_seed), "obstacle_seed_mode")
+        attempt(lambda v: self.spin_seed.setValue(int(v)), "obstacle_seed")
+        attempt(lambda v: self.spin_races.setValue(int(v)), "races")
+        attempt(lambda v: self.spin_grid.setValue(int(v)), "cars_per_race")
+        attempt(lambda v: self.spin_cap.setValue(float(v)), "speed_cap")
+        attempt(combo_text(self.combo_device), "device")
+        attempt(lambda v: self.chk_compile.setChecked(bool(v)), "compile")
+        attempt(lambda v: self.chk_dr.setChecked(bool(v)), "randomize")
+        attempt(lambda v: self.chk_stoch.setChecked(bool(v)), "stochastic")
+        attempt(combo_text(self.combo_opponent), "opponent")
+        attempt(combo_text(self.combo_controller), "controller")
+        attempt(lambda v: self.edit_estimator.setText(str(v)), "estimator")
+        attempt(combo_data(self.combo_mu), "mu_mode")
+        attempt(lambda v: self.spin_mu.setValue(float(v)), "mu")
+        attempt(lambda v: self.spin_dial.setValue(float(v)), "dial")
+        attempt(combo_data(self.combo_ros), "ros2")
+        attempt(lambda v: self.chk_saliency.setChecked(bool(v)), "saliency")
+        attempt(lambda v: self.chk_internals.setChecked(bool(v)), "internals")
+
+    def save_prefs(self) -> None:
+        from . import prefs
+        prefs.save(self.collect_prefs())
+
+    def restore_prefs(self) -> None:
+        from . import prefs
+        self.apply_prefs(prefs.load())
+
     def current_config(self) -> SessionConfig:
         return SessionConfig(
             run=self._selected_run or "latest",
@@ -1550,6 +1711,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     def _on_start(self):
         self.clear_error()
+        self.save_prefs()              # the settings that were actually driven with
         self.btn_start.mark_pending()
         self._pending["start"] = time.monotonic()
         self.start_requested.emit(self.current_config())

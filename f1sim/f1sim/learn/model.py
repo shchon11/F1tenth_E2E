@@ -625,11 +625,12 @@ def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
     `allow_controller` gates a checkpoint trained against a non-legacy plan controller -- see
     `_refuse_controller`.
 
-    `allow_conditional` gates checkpoints that need an input the caller may not be able to produce.
-    A conditional actor requires an explicit `c` at every forward, and a lab-oracle arm's `c` is the
-    true friction -- privileged, and unavailable on the car. The viewer, `export`, `watch`,
-    `evaluate` and the ROS node all call this without the flag, so they refuse such a checkpoint by
-    default rather than running a policy whose input they would have to invent.
+    `allow_conditional` gates checkpoints whose conditioning input the caller may not be able to
+    produce. A conditional actor requires an explicit `c` at every forward; what differs is where
+    that number comes from. A **lab-oracle** arm's `c` is the environment's true friction, which is
+    privileged and does not exist on a car, so it is refused unless the caller opts in. A
+    **deployable** arm's (`dial`) is a setting someone chooses, so it loads -- and the caller is
+    still required to supply it, by the actor itself.
 
     `strict_names` refuses a load that would leave any tensor at fresh initialization. The tolerant
     default is what lets an existing run widen a critic or add a head; a controlled experiment wants
@@ -649,13 +650,21 @@ def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
     if cond_spec.dim != int(meta.get("cond_dim", 0)):
         raise ValueError(f"checkpoint cond_dim {meta.get('cond_dim', 0)} disagrees with its "
                          f"conditioning metadata dim {cond_spec.dim}")
-    if not allow_conditional and (int(meta.get("cond_dim", 0)) or cond_meta.get("lab_oracle")):
+    # A conditional checkpoint needs `c` at every forward, and `Actor._require_cond` enforces that --
+    # so what this gate decides is not "can it run" but "can this caller *get* the number".
+    #
+    #   lab oracle (`true_mu`)  the number is the environment's true friction: privileged, and it
+    #                           does not exist on a car. Refused unless the caller opts in.
+    #   deployable (`dial`)     the number is a setting -- how much grip to use -- that an operator,
+    #                           a supervisor or a viewer's slider provides. Refusing it made every
+    #                           dial policy unopenable in the viewer, which is the one place a person
+    #                           would turn the dial and watch what it does.
+    if not allow_conditional and cond_spec.dim and cond_spec.lab_oracle:
         raise ValueError(
-            f"{os.path.basename(str(path))} is a conditional checkpoint "
-            f"(cond_dim={meta.get('cond_dim', 0)}, source={cond_meta.get('source', '?')}, "
-            f"lab_oracle={bool(cond_meta.get('lab_oracle'))}). It cannot be run without an explicit "
-            f"conditioning input, and a lab-oracle arm's input is privileged and does not exist on "
-            f"the car. Pass allow_conditional=True only from a caller that supplies it.")
+            f"{os.path.basename(str(path))} is a LAB-ORACLE conditional checkpoint "
+            f"(cond_dim={meta.get('cond_dim', 0)}, source={cond_meta.get('source', '?')}). Its "
+            f"conditioning input is the environment's true friction -- privileged, and not something "
+            f"a car can produce. Pass allow_conditional=True only from a caller that supplies it.")
     m = ActorCritic(**meta).to(device)
     sd = m.state_dict(); skipped = []
     for k_, v in ck["state_dict"].items():
