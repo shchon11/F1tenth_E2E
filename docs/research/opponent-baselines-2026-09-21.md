@@ -100,37 +100,50 @@ shape as the `Raceline.build(objective=)` regression of 2026-09-19.
 
 ## 4. The first measurement
 
-`spec_korea_traffic_s906` at 6.3M steps, `real:korea_2025_iccas`, 16 races × 2000 steps, one
-opponent at `speed_scale [0.7, 0.9]`, seed 41, eager. The teacher limits and raceline objective are
-the run's own (`7 / 6.5 / 4`, `min_time`, dial 0.30).
+`spec_korea_traffic_s906` at 6.3M steps, `real:korea_2025_iccas`, 16 races x 2000 steps, one
+opponent at `speed_scale [0.7, 0.9]`, eager. The teacher limits and raceline objective are the
+run's own (`7 / 6.5 / 4`, `min_time`, dial 0.30). **Two seeds, 41 and 77, reported as `41 / 77`** --
+not an error bar, but enough to say which differences survive a reseed and which do not.
 
 | | `raceline` | `forzaeth` | `forzaeth_pred` | `lane_switch` |
 | --- | ---: | ---: | ---: | ---: |
-| lap [s] | 8.03 | 8.27 | 8.00 | 7.92 |
-| collisions / km | 2.14 | **18.11** | 13.29 | 11.98 |
-| passes | 27 | **13** | 23 | 21 |
-| passes / learner-min | 2.02 | **0.97** | 1.72 | 1.57 |
-| pace vs opponent | 1.19 | 1.16 | 1.25 | 1.22 |
-| following fraction | 0.33 | **0.68** | 0.37 | — |
-| defending fraction | 0.40 | **0.18** | 0.37 | — |
-| car contacts | 5 | **44** | 43 | — |
-| wall collisions | 3 | **21** | 5 | 7 |
+| lap [s] | 8.03 / 8.12 | 8.27 / 7.68 | 8.00 / 8.04 | 7.92 / 8.00 |
+| passes | 27 / 27 | 13 / 21 | 23 / 19 | 21 / 19 |
+| passes / learner-min | 2.02 / 2.02 | 0.97 / 1.57 | 1.72 / 1.42 | 1.57 / 1.42 |
+| pace vs opponent | 1.19 / 1.21 | 1.16 / 1.28 | 1.25 / 1.29 | 1.22 / 1.21 |
+| following fraction | 0.33 / 0.30 | 0.68 / 0.44 | 0.37 / 0.51 | 0.51 / 0.49 |
+| defending fraction | 0.40 / 0.38 | 0.18 / 0.24 | 0.37 / 0.29 | 0.27 / 0.22 |
+| car contacts | 5 / 10 | 44 / 40 | 43 / 63 | 36 / 45 |
+| wall collisions | 3 / 5 | 21 / 3 | 5 / 5 | 7 / 1 |
+| collisions / km | 2.14 / 3.99 | 18.11 / 11.56 | 13.29 / 19.30 | 11.98 / 12.70 |
 
-The pace advantage is about the same against all four (1.16–1.25). What changes is everything else:
-against a car that **holds its line** the policy passes 27 times and touches it 5 times; against a
-car that **moves sideways to evade** it passes 13 times and touches it 44. It spends twice as long
-behind (0.68 vs 0.33) and half as long ahead (0.18 vs 0.40).
+Read the `raceline` column first, because it is the control and it says what the noise is: the
+passes are identical across seeds (27 / 27) and the following fraction nearly so (0.33 / 0.30),
+while the small counts move by a factor of two (5 / 10 contacts, 2.14 / 3.99 per km).
+
+Against that:
+
+* **Contacts go up five- to ten-fold and stay there.** 36-63 against the three planners, against
+  5-10 on the control, in every seed. This is the result, and it is not close to the noise.
+* **The pace advantage does not change.** 1.16-1.29 everywhere, including the control. Whatever is
+  happening, it is not that the baselines are faster.
+* **Passes go down and following goes up**, in every cell, though the magnitude is noisy: 13-23
+  passes against 27 / 27, following 0.44-0.68 against 0.30-0.33.
+* **The three planners are not distinguishable from each other at this sample size.** In
+  particular `forzaeth`'s 21 wall collisions on seed 41 were an outlier -- 3 on seed 77 -- so the
+  seed-41 note that it "pushes the policy into walls" where the predictive variant does not was
+  wrong, and a second seed is what caught it.
 
 The reading that fits: this policy was trained entirely against opponents that hold a line, and has
-never seen a car change line. That is a statement about our training mix, not about the ForzaETH
-planner — which is the whole reason for having a driver somebody else designed in the other car.
+never seen a car change line. At identical pace it can no longer find a way past one, and when it
+tries it makes contact. That is a statement about our training mix, not about the ForzaETH planner
+-- which is the whole reason for having a driver somebody else designed in the other car.
 
-**What these numbers do not say.** `car_contacts` counts contacts involving the learner and does
-not attribute fault; the baselines are themselves attempting passes (measured over a 600-step race:
-`forzaeth` 7.0 % overtaking / 26.4 % trailing, `forzaeth_pred` 7.7 % / 30.3 %, `lane_switch` 17.7 %
-changing / 14.5 % trailing), so some share of those 44 is the other car arriving. And this is one
-seed. A second is running; until it lands, treat `forzaeth` 21 walls against `forzaeth_pred` 5 as
-suggestive and not as a difference between the two planners.
+**What these numbers still do not say.** `car_contacts` counts contacts involving the learner and
+does not attribute fault; the baselines are themselves attempting passes (measured over a 600-step
+race: `forzaeth` 7.0 % overtaking / 26.4 % trailing, `forzaeth_pred` 7.7 % / 30.3 %, `lane_switch`
+17.7 % changing / 14.5 % trailing), so some share of those contacts is the other car arriving. A
+fault-attributed count would need the census's per-car breakdown and is not in this note.
 
 ## 5. What this suggests next
 
