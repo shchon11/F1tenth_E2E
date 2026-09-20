@@ -65,6 +65,14 @@ LANE_MARGIN = 0.15
 #: How far ahead a car counts as being in the way [m].
 LOOKAHEAD = 10.0
 
+#: How far BEHIND a car still counts, before the speed scaling [m]. A lane change is finished when
+#: the other car is clear behind, not when its arc goes negative: the bodies are 0.58 m long, so at
+#: 1 m the two cars have barely separated and a planner that stopped counting there would start
+#: back across the road while still alongside -- the contact the whole family exists to avoid. At
+#: 4 m/s three metres is 0.75 s, against the 0.375 s the widest lane change takes at `LANE_RATE`.
+#: Scaled by `_stretch` like every other distance here.
+REAR_CLEAR = 3.0
+
 #: Cost per metre of lane change, and per metre of distance from the racing line. The first is
 #: what makes the planner keep the lane it has; the second is what makes it come back.
 SWITCH_COST = 0.6
@@ -106,6 +114,7 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
                  block_w: float = LANE_BLOCK_W,
                  margin: float = LANE_MARGIN,
                  lookahead: float = LOOKAHEAD,
+                 rear_clear: float = REAR_CLEAR,
                  switch_cost: float = SWITCH_COST,
                  offline_cost: float = OFFLINE_COST,
                  hysteresis: float = HYSTERESIS,
@@ -120,6 +129,7 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         self.block_w = float(block_w)
         self.margin = float(margin)
         self.lookahead = float(lookahead)
+        self.rear_clear = float(rear_clear)
         self.switch_cost = float(switch_cost)
         self.offline_cost = float(offline_cost)
         self.hysteresis = float(hysteresis)
@@ -164,9 +174,11 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
             self._lane = torch.full((B,), on_line, device=dev, dtype=torch.long)
             self._offset = torch.zeros(B, device=dev, dtype=dt)
 
-        # A car is in the way until it is a whole body length behind: a lane change is finished
-        # when the other car is passed, not when its arc goes negative.
-        seen = self._opponents(state, tid, -torch.full((B,), 1.0, device=dev, dtype=dt))
+        # A car is in the way until it is clear behind -- see REAR_CLEAR -- and the distance grows
+        # with speed, like every other distance in these planners.
+        stretch = self._stretch(state)
+        rear = -self.rear_clear * stretch
+        seen = self._opponents(state, tid, rear)
         if seen is None:
             self._lane = torch.full_like(self._lane, int((self.lanes == 0).nonzero()[0, 0]))
             self._offset = torch.zeros_like(self._offset)
@@ -177,7 +189,7 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         lanes = self.lanes.to(dt)                                       # (L,)
 
         # Blocked: the other car sits in this lane, and is close enough ahead to matter.
-        near = (gap < self.lookahead) & (gap > -1.0)
+        near = (gap < self.lookahead) & (gap > rear)
         blocked = ((d_opp[:, None] - lanes[None]).abs() < self.block_w) & near[:, None]
 
         # Drivable: the body fits, at the opponent's station and at our own. Two probes rather

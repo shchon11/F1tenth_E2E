@@ -93,6 +93,23 @@ def _scene(env, ego_row, opp_row, opp_idx, gap_m, opp_lateral=0.0, ego_lateral=0
     return e_idx
 
 
+def _narrow_station(env, track_name, need):
+    """A raceline index where an evasion of `need` metres fits on neither side.
+
+    The planners each have a state for "there is a car there and nowhere to go", and it is the
+    state that decides whether a baseline rear-ends somebody or holds a gap. A track wide enough
+    everywhere would never reach it, so the station is found rather than assumed.
+    """
+    from f1sim.raceline import track_widths
+    track = _track_and_raceline(track_name)[0]
+    wl, wr = track_widths(track, env.teacher.xy[0].cpu().numpy())
+    tight = np.maximum(wl, wr)
+    i = int(tight.argmin())
+    if tight[i] >= need:
+        pytest.skip(f"{track_name} is wide enough everywhere for a {need:.2f} m evasion")
+    return i
+
+
 def _lopsided_station(env, track_name):
     """(index, +1 if the left side is the roomier one) where a pass fits on exactly one side.
 
@@ -430,3 +447,51 @@ def test_a_lane_planner_that_could_not_come_back_is_refused():
         LaneSwitchTeacher(env.teacher, env=env, switch_cost=1.0, offline_cost=1.0)
     with pytest.raises(ValueError, match="racing line"):
         LaneSwitchTeacher(env.teacher, env=env, lanes=(0.3, 0.6))     # nowhere to come back to
+
+
+# ============================================================ the states are reachable
+def test_every_state_the_spline_family_reports_is_reachable():
+    """Three codes in `STATE_NAMES`, three scenes that produce them.
+
+    A state machine whose third state is unreachable is a two-state machine with a misleading
+    log, and TRAILING is the one that matters most: it is what the planner does when there is a
+    car in the way and nowhere to go, which is the difference between holding a gap and driving
+    into the back of somebody.
+    """
+    env = _env(envs=4, race_size=2, opponent="teacher")
+    env.reset(seed=43)
+    p = _planner(env)
+    wide, _ = _lopsided_station(env, CHEAP)
+    narrow = _narrow_station(env, CHEAP, p.evasion_dist + p.half_width + p.bound_mindist)
+
+    _scene(env, 0, 1, opp_idx=wide, gap_m=40.0)                    # nobody near
+    assert int(p.decide(env.sim.state, env.sim.tid)[1][0]) == RACING
+    _scene(env, 0, 1, opp_idx=wide, gap_m=2.0)                     # a car, and room
+    assert int(p.decide(env.sim.state, env.sim.tid)[1][0]) == OVERTAKING
+    _scene(env, 0, 1, opp_idx=narrow, gap_m=2.0)                   # a car, and no room
+    d, mode, _ = p.decide(env.sim.state, env.sim.tid)
+    assert int(mode[0]) == TRAILING, f"state {int(mode[0])} at the narrowest point on the track"
+    assert float(d[0]) == 0.0, "trailing has to put the line back, not hold half an evasion"
+
+
+def test_the_baseline_actually_drives_its_car_in_a_race():
+    """Wired in, not merely constructed.
+
+    Every other test here calls `decide` directly; this one steps the env and asks whether the
+    offsets it chose reached a car. A planner the registry builds but whose command never leaves
+    it would pass everything else and be a raceline teacher under another name in every result --
+    the exact substitution `opponent_slots` was built to prevent.
+    """
+    env = _env(envs=12, race_size=2, opponent="slots",
+               opponent_slots=[{"kind": "forzaeth", "speed_scale": [0.55, 0.7]}])
+    env.reset(seed=47)
+    p = env.alt_teachers[0]
+    mask = env.alt_teacher_mask["forzaeth"]
+    seen = set()
+    off = 0.0
+    for _ in range(150):
+        env.step(torch.zeros(env.B, env.act_dim))
+        seen.update(int(c) for c in p.last_state[mask].unique())
+        off = max(off, float(p.last_offset[mask].abs().max()))
+    assert seen - {RACING}, f"the planner only ever raced in 150 steps: {seen}"
+    assert off > 0.05, f"it never moved off the line in a real race: {off:.3f} m"
