@@ -573,8 +573,6 @@ def main():
                          "how fast it is closing. Needs --race-size > 1. The teacher never looks at an opponent, so "
                          "it cannot demonstrate a pass or a yield -- but 'a car is there and it moves like this' is "
                          "read out of how the LiDAR returns shift, and the simulator knows the answer")
-    ap.add_argument("--memory", choices=["none", "gru"], default="none", help="recurrent student (learn/memory.py)")
-    ap.add_argument("--memory-hidden", type=int, default=128)
     ap.add_argument("--seq-len", type=int, default=0,
                     help="train on contiguous runs of this many steps per env (needs --memory gru to matter). 0 = "
                          "i.i.d. samples, which never contain both the corner that showed the grip and the next one")

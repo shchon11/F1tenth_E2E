@@ -374,6 +374,142 @@
           "metavar": null
         },
         {
+          "flag": "--dial-margin",
+          "flags": [
+            "--dial-margin"
+          ],
+          "dest": "dial_margin",
+          "label": "dial margin",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "--cond dial: the dial is the floor's friction minus a per-episode margin in [0, this]",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--dial-exact",
+          "flags": [
+            "--dial-exact"
+          ],
+          "dest": "dial_exact",
+          "label": "dial exact",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "--cond dial: share of episodes with no margin",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--grip-budget-penalty",
+          "flags": [
+            "--grip-budget-penalty"
+          ],
+          "dest": "grip_budget_penalty",
+          "label": "grip budget penalty",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "--cond dial: per second, per (m/s^2)^2 of lateral acceleration beyond what the dial allows. This is what makes the dial a command under RL. A dial is a lower bound on the floor's grip, so return alone teaches the policy to drive faster than it was told; with the budget charged, what is optimised is the lap *inside* the dial",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--raceline-objective",
+          "flags": [
+            "--raceline-objective"
+          ],
+          "dest": "raceline_objective",
+          "label": "raceline objective",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "min_curvature",
+            "min_time"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "line behind the lap-time reference and the teacher-driven opponents (default min_curvature)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-a-lat",
+          "flags": [
+            "--teacher-a-lat"
+          ],
+          "dest": "teacher_a_lat",
+          "label": "teacher a lat",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s^2] lateral limit of that line's speed profile (default 6)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-a-acc",
+          "flags": [
+            "--teacher-a-acc"
+          ],
+          "dest": "teacher_a_acc",
+          "label": "teacher a acc",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s^2] drive limit (default 6)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-a-brake",
+          "flags": [
+            "--teacher-a-brake"
+          ],
+          "dest": "teacher_a_brake",
+          "label": "teacher a brake",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s^2] braking limit (default 3)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
           "flag": "--cond",
           "flags": [
             "--cond"
@@ -387,7 +523,8 @@
           "choices": [
             "none",
             "zero",
-            "true_mu"
+            "true_mu",
+            "dial"
           ],
           "required": false,
           "group": "모델·제어",
@@ -3533,6 +3670,264 @@
           "required": false,
           "group": "환경",
           "help": "[m] free space the teacher's raceline keeps from the boundary (default 0.40). A minimum-curvature line has no robustness budget: the teacher tracks it with ground-truth pose and latency compensation, the student has neither",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--speed-mode",
+          "flags": [
+            "--speed-mode"
+          ],
+          "dest": "speed_mode",
+          "label": "speed mode",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "linear",
+          "nargs": null,
+          "choices": [
+            "linear",
+            "envelope",
+            "knots"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). 'linear': two speeds, linear between (every existing checkpoint). 'envelope': a grip belief a_hat and an end speed; the profile follows the plan's own curvature. 'knots': a speed at every curvature knot",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--grip-quantile",
+          "flags": [
+            "--grip-quantile"
+          ],
+          "dest": "grip_quantile",
+          "label": "grip quantile",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "envelope only: pinball-loss quantile for the grip-belief dimension. 0.5 is the plain Huber loss; below it, a student that cannot tell the floor yet assumes the slippery end",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--cond",
+          "flags": [
+            "--cond"
+          ],
+          "dest": "cond",
+          "label": "마찰 조건 입력",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "none",
+          "nargs": null,
+          "choices": [
+            "none",
+            "true_mu",
+            "dial"
+          ],
+          "required": false,
+          "group": "모델·제어",
+          "help": "condition the student on friction (learn/conditioning.py). 'true_mu' is a LAB ORACLE: the input is privileged and does not exist on the car. It answers one question -- does a student that is *told* the floor drive it? 'dial' is the deployable form: the student is told the floor's friction minus a per-episode margin and the teacher drives for that same number, so the input is a command an operator or a supervisor sets",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--dial-margin",
+          "flags": [
+            "--dial-margin"
+          ],
+          "dest": "dial_margin",
+          "label": "dial margin",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "dial: largest margin below the true friction",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--dial-exact",
+          "flags": [
+            "--dial-exact"
+          ],
+          "dest": "dial_exact",
+          "label": "dial exact",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "dial: share of episodes with no margin at all",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-grip",
+          "flags": [
+            "--aux-grip"
+          ],
+          "dest": "aux_grip",
+          "label": "aux grip",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "weight of an auxiliary loss asking the actor's grip head for the env's friction, from the same features the action is read from",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-opp",
+          "flags": [
+            "--aux-opp"
+          ],
+          "dest": "aux_opp",
+          "label": "aux opp",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "weight of an auxiliary loss asking the actor's opponent head where the nearest car is and how fast it is closing. Needs --race-size > 1. The teacher never looks at an opponent, so it cannot demonstrate a pass or a yield -- but 'a car is there and it moves like this' is read out of how the LiDAR returns shift, and the simulator knows the answer",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--seq-len",
+          "flags": [
+            "--seq-len"
+          ],
+          "dest": "seq_len",
+          "label": "seq len",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "train on contiguous runs of this many steps per env (needs --memory gru to matter). 0 = i.i.d. samples, which never contain both the corner that showed the grip and the next one",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--seq-burn",
+          "flags": [
+            "--seq-burn"
+          ],
+          "dest": "seq_burn",
+          "label": "seq burn",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "leading steps of each run that only warm the state up",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--raceline-objective",
+          "flags": [
+            "--raceline-objective"
+          ],
+          "dest": "raceline_objective",
+          "label": "raceline objective",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "min_curvature",
+            "min_time"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "line the teacher follows: 'min_time' refines the minimum-curvature line by descending the lap time of the speed profile at the --teacher-a-* limits (default: min_curvature)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-a-lat",
+          "flags": [
+            "--teacher-a-lat"
+          ],
+          "dest": "teacher_a_lat",
+          "label": "teacher a lat",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s^2] lateral limit of the teacher's speed profile (default 6.0)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-a-acc",
+          "flags": [
+            "--teacher-a-acc"
+          ],
+          "dest": "teacher_a_acc",
+          "label": "teacher a acc",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s^2] drive limit of the profile (default 6.0)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--teacher-a-brake",
+          "flags": [
+            "--teacher-a-brake"
+          ],
+          "dest": "teacher_a_brake",
+          "label": "teacher a brake",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m/s^2] braking limit of the profile (default 3.0)",
           "action": "store",
           "nullable": true,
           "metavar": null

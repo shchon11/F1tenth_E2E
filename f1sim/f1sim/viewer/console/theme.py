@@ -15,18 +15,23 @@ from __future__ import annotations
 # the panels, so the only colour on screen is the colour the scene spends on facts. One calm blue
 # accent for selection and focus; NVIDIA-style green only for "running" and the start action.
 C = {
-    "bg.window": "#161616",
-    "bg.panel": "#1c1c1c",
-    "bg.card": "#222222",
-    "bg.raised": "#2c2c2c",
-    "bg.viewport": "#121316",
-    "line": "#303030",
-    "line.strong": "#454545",
-    "text.0": "#e6e6e6",
-    "text.1": "#a9a9a9",
-    "text.2": "#747474",
+    # Four surfaces, far enough apart to be told apart at a glance: the window behind everything,
+    # the panel columns, a card on a panel, and a control raised off a card. They used to span 22
+    # points of grey in total, so a card was invisible against the panel it sat on and the whole
+    # window read as one flat sheet with text scattered over it.
+    "bg.window": "#0e0e10",
+    "bg.panel": "#121215",
+    "bg.card": "#212128",
+    "bg.raised": "#31313a",
+    "bg.sunken": "#000000",          # inputs and lists: the well a value sits in
+    "bg.viewport": "#101114",
+    "line": "#3a3a45",
+    "line.strong": "#54545f",
+    "text.0": "#f2f2f4",
+    "text.1": "#b6b6c0",
+    "text.2": "#7e7e8a",
     "accent": "#5aa9ff",
-    "accent.deep": "#22415f",
+    "accent.deep": "#1d4b7a",
     "primary": "#3d6f0b",
     "primary.hover": "#4c8a10",
     "primary.line": "#76b900",
@@ -53,14 +58,18 @@ UI_FONT = "Noto Sans CJK KR"
 MONO_FONT = "DejaVu Sans Mono"
 FONT_FALLBACK = ["Noto Sans CJK KR", "NanumGothic", "Noto Sans", "DejaVu Sans"]
 
-SIZE = {"title": 14, "section": 11, "body": 12, "label": 11, "hint": 11, "metric": 24, "metric.sm": 14}
+#: Type scale. `section` is small on purpose -- a heading reads as a heading through weight,
+#: letter-spacing and colour, not through size, and making it big would compete with the values
+#: underneath it, which are the thing being read.
+SIZE = {"title": 15, "section": 11, "body": 12, "label": 11, "hint": 11,
+        "metric": 27, "metric.sm": 15}
 
 # ---------------------------------------------------------------- spacing
 SP = (4, 8, 12, 16, 24)
-RADIUS_CTL = 3
-RADIUS_CARD = 4
-MIN_CTL_H = 26
-MAIN_BTN_H = 32
+RADIUS_CTL = 5
+RADIUS_CARD = 8
+MIN_CTL_H = 28
+MAIN_BTN_H = 34
 
 
 def _asset(name: str) -> str:
@@ -126,11 +135,13 @@ QToolTip {{
     background: {c['bg.card']}; border: 1px solid {c['line']};
     border-radius: {RADIUS_CARD}px;
 }}
+/* A heading reads as a heading through weight, spacing and brightness. At text.2 it was dimmer
+   than the hints underneath it, so the panel had no visible structure at all. */
 #SectionLabel {{
-    font-size: {SIZE['section']}px; font-weight: 600; color: {c['text.2']};
-    letter-spacing: 1.1px;
+    font-size: {SIZE['section']}px; font-weight: 700; color: #dcdce4;
+    letter-spacing: 1.3px; padding-bottom: 2px;
 }}
-#FieldLabel {{ font-size: {SIZE['label']}px; font-weight: 500; color: {c['text.1']}; }}
+#FieldLabel {{ font-size: {SIZE['label']}px; font-weight: 600; color: {c['text.1']}; }}
 #Hint {{ font-size: {SIZE['hint']}px; color: {c['text.2']}; }}
 #HintWarn {{ font-size: {SIZE['hint']}px; color: {c['warn']}; }}
 #HintDanger {{ font-size: {SIZE['hint']}px; color: {c['danger']}; }}
@@ -147,9 +158,9 @@ QToolTip {{
 
 /* ---------------------------------------------------------------- buttons */
 QPushButton {{
-    background: {c['bg.card']}; color: {c['text.0']};
+    background: {c['bg.raised']}; color: {c['text.0']};
     border: 1px solid {c['line.strong']}; border-radius: {RADIUS_CTL}px;
-    padding: 6px 12px; min-height: {MIN_CTL_H - 14}px;
+    padding: 6px 13px; min-height: {MIN_CTL_H - 14}px; font-weight: 500;
 }}
 QPushButton:hover:!disabled {{ background: {c['bg.raised']}; border-color: {c['accent']}; }}
 QPushButton:pressed:!disabled {{ background: {c['accent.deep']}; }}
@@ -174,14 +185,26 @@ QPushButton[pending="true"] {{
 
 /* ---------------------------------------------------------------- inputs */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
-    background: {c['bg.window']}; color: {c['text.0']};
-    border: 1px solid {c['line.strong']}; border-radius: {RADIUS_CTL}px;
-    padding: 5px 8px; min-height: {MIN_CTL_H - 12}px;
+    background: {c['bg.sunken']}; color: {c['text.0']};
+    border: 1px solid {c['line']}; border-radius: {RADIUS_CTL}px;
+    padding: 6px 9px; min-height: {MIN_CTL_H - 12}px;
     selection-background-color: {c['accent.deep']};
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{ border: 1px solid {c['accent']}; }}
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+    border-color: {c['line.strong']};
+}}
+/* Focus is two pixels of accent, not one: a one-pixel border change on a dark input is not
+   visible from a normal viewing distance, and "where am I typing" is the one thing a keyboard
+   user needs the window to answer. */
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+    border: 2px solid {c['accent']}; padding: 5px 8px;
+}}
 QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{ color: {c['text.2']}; }}
 #SearchBox {{ font-family: "{MONO_FONT}", monospace; }}
+#CardStrong {{
+    background: {c['bg.card']}; border: 1px solid {c['line.strong']};
+    border-left: 3px solid {c['accent']}; border-radius: {RADIUS_CARD}px;
+}}
 QComboBox::drop-down {{ border: none; width: 18px; }}
 QComboBox QAbstractItemView {{
     background: {c['bg.card']}; color: {c['text.0']};
@@ -195,7 +218,7 @@ QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
 QCheckBox {{ spacing: 8px; color: {c['text.0']}; padding: 3px 0; }}
 QCheckBox::indicator {{
     width: 15px; height: 15px; border-radius: 4px;
-    border: 1px solid {c['line.strong']}; background: {c['bg.window']};
+    border: 1px solid {c['line.strong']}; background: {c['bg.sunken']};
 }}
 QCheckBox::indicator:checked {{
     background: {c['accent']}; border-color: {c['accent']};
@@ -207,7 +230,7 @@ QCheckBox:focus {{ outline: none; }}
 
 /* ---------------------------------------------------------------- lists */
 QListWidget, QTreeWidget {{
-    background: {c['bg.window']}; border: 1px solid {c['line']};
+    background: {c['bg.sunken']}; border: 1px solid {c['line']};
     border-radius: {RADIUS_CTL}px; outline: none;
 }}
 /* right padding leaves room for the scrollbar so a long name is never printed under it */
@@ -251,5 +274,8 @@ QProgressBar {{
 }}
 QProgressBar::chunk {{ background: {c['accent']}; border-radius: 3px; }}
 #StatusBar {{ background: {c['bg.panel']}; border-top: 1px solid {c['line']}; }}
+/* A vertical rule for grouping a row of buttons (transport | camera | capture). Without one the
+   centre bar is twelve identical grey rectangles and nothing says which belong together. */
+#BarSep {{ background: {c['line']}; max-width: 1px; min-width: 1px; }}
 QFrame[frameShape="4"] {{ color: {c['line']}; max-height: 1px; }}
 """

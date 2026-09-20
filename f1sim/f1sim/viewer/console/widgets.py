@@ -409,8 +409,11 @@ class FilterList(QtWidgets.QWidget):
         self.tree.header().setStretchLastSection(False)
         self.tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.tree.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        self.tree.setMinimumHeight(rows * 25)
-        v.addWidget(self.tree, 1)
+        self._rows = int(rows)
+        self._row_h = 25
+        self.tree.setMinimumHeight(3 * self._row_h)
+        self.tree.setMaximumHeight(rows * self._row_h)
+        v.addWidget(self.tree)
         self.status = label("", "hint", self)
         v.addWidget(self.status)
         self._items: List[Tuple[str, str, str, str]] = []      # (group, key, title, subtitle)
@@ -451,6 +454,18 @@ class FilterList(QtWidgets.QWidget):
             it += 1
         return None
 
+    def _fit_height(self):
+        """Height for the rows actually shown, between three rows and `rows`."""
+        n = 0
+        it = QtWidgets.QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            n += 1
+            it += 1
+        n = max(3, min(self._rows, n))
+        h = n * self._row_h + 6
+        self.tree.setMinimumHeight(h)
+        self.tree.setMaximumHeight(h)
+
     def _rebuild(self, keep_selection: bool = True):
         want = self._selected if keep_selection else None
         needle = self.search.text().strip().lower()
@@ -486,6 +501,7 @@ class FilterList(QtWidgets.QWidget):
                 item.setFont(1, f)
             shown += 1
         self.tree.expandAll()
+        self._fit_height()
         self.tree.blockSignals(False)
         if want is not None and self.select(want):
             pass

@@ -774,6 +774,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
         _, h = group()
 
+        def sep():
+            line = QtWidgets.QFrame()
+            line.setObjectName("BarSep")
+            line.setFrameShape(QtWidgets.QFrame.VLine)
+            line.setFixedWidth(1)
+            return line
+
         self.btn_pause = PendingToggle("일시정지")
         self.btn_pause.setToolTip("시뮬레이션을 멈춥니다. 화면과 조작은 계속 살아 있습니다.  (Space)")
         self.btn_pause.requested.connect(self._on_pause_requested)
@@ -790,6 +797,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         h.addWidget(self.btn_stop)
 
         _, h = group()
+        h.addWidget(sep())
         h.addWidget(label("카메라", "field"))
         self.camera_buttons = SegmentedButtons(CAMERA_MODES)
         self.camera_buttons.set_current("overview")
@@ -797,6 +805,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         h.addWidget(self.camera_buttons)
 
         _, h = group()
+        h.addWidget(sep())
         h.addWidget(label("주시 차량", "field"))
         self.btn_focus_prev = QtWidgets.QPushButton("◀")
         self.btn_focus_prev.setFixedWidth(32)
@@ -817,6 +826,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         _, h = group()
         self.btn_shot = QtWidgets.QPushButton("스크린샷")
         self.btn_shot.setObjectName("GhostButton")
+        h.addWidget(sep())
         self.btn_shot.setToolTip("3D 화면을 PNG로 저장합니다. 왼쪽 '녹화' 카드의 해상도로 찍습니다.  (S)")
         self.btn_shot.clicked.connect(self._on_screenshot)
         h.addWidget(self.btn_shot)
@@ -1670,6 +1680,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.right_panel.setVisible(drive and self.btn_right_panel.isChecked())
         self.training.set_active(key == "train")
         self.editor.set_active(key == "edit")
+        if self.state == STATE_IDLE and hasattr(self, "status_text"):
+            if drive:
+                self._update_start_hint()
+            elif key == "train":
+                self.status_text.setText("학습 — 설정을 고르고 '학습 시작'을 누르세요.")
+            else:
+                self.status_text.setText("환경 — 새로 만들거나 목록에서 고르세요.")
 
     def current_mode(self) -> str:
         for k, i in self.MODE_INDEX.items():
@@ -1831,7 +1848,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             return
         blocker = self._start_blocker()
         self.start_hint.setText(blocker or "준비됐습니다. 시작을 누르세요.")
-        if self.state == STATE_IDLE and hasattr(self, "status_text"):
+        if (self.state == STATE_IDLE and hasattr(self, "status_text")
+                and self.current_mode() == "drive"):
             self.status_text.setText(f"대기 — {blocker}" if blocker else "대기 — 준비됐습니다.")
 
     def _update_start_enabled(self):

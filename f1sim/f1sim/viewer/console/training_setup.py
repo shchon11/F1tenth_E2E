@@ -14,7 +14,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets, sip
 
 from . import catalog, theme
 from .opponent_table import OpponentSlotTable
-from .widgets import Card, Collapsible, label
+from .widgets import Card, Collapsible, SegmentedButtons, label
 
 
 MODES = (
@@ -27,6 +27,9 @@ MODES = (
     ("grip_final", "마찰 추정 · 최종 평가", "grip_final"),
     ("grip_pilot", "마찰 추정 · 제한된 파일럿", "grip_pilot"),
 )
+
+#: The page a chosen step's own settings are lifted onto, ahead of everything else.
+HIGHLIGHT_GROUP = "이 단계의 핵심"
 
 MODE_NOTES = {
     "ppo": "보상, 환경, 모델과 학습 조건을 직접 설정합니다. 기본 레시피는 현재 에셋 장애물을 사용하는 시작점입니다.",
@@ -359,6 +362,20 @@ class TrainingSetupForm(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
+        from .training import STAGES
+        self._stage_key = ""
+        stage_card = Card("학습 단계")
+        self.seg_stage = SegmentedButtons(
+            [(st.key, f"{st.number}  {st.title}", st.blurb) for st in STAGES]
+            + [("expert", "직접 설정", "단계 기본값 없이 아래 설정을 그대로 씁니다. 실험용 모드도 여기서 고릅니다.")])
+        self.seg_stage.selected.connect(self._stage_chosen)
+        stage_card.add(self.seg_stage)
+        self.stage_note = label("", "hint")
+        self.stage_note.setWordWrap(True)
+        stage_card.add(self.stage_note)
+        root.addWidget(stage_card)
+        self._open_stage = STAGES[0].key
+
         top = Card("학습 설정")
         bar = QtWidgets.QHBoxLayout()
         self.combo_mode = QtWidgets.QComboBox()
@@ -423,6 +440,9 @@ class TrainingSetupForm(QtWidgets.QWidget):
         self.combo_recipe.currentIndexChanged.connect(self._apply_recipe)
         self._quiet = False
         self._mode_changed()
+        # Open on the first step of the pipeline rather than on a row of four unselected buttons.
+        self.seg_stage.set_current(self._open_stage)
+        self._stage_chosen(self._open_stage)
 
     @property
     def kind(self):
@@ -458,7 +478,10 @@ class TrainingSetupForm(QtWidgets.QWidget):
             widget = self.stack.widget(0)
             self.stack.removeWidget(widget)
             widget.deleteLater()
-        group_order = list(dict.fromkeys(f.get("group", "기타") for f in self.schema["fields"]))
+        group_order = list(dict.fromkeys(self._group_of(f) for f in self.schema["fields"]))
+        if HIGHLIGHT_GROUP in group_order:                 # the step's own settings lead
+            group_order.remove(HIGHLIGHT_GROUP)
+            group_order.insert(0, HIGHLIGHT_GROUP)
         for group in group_order:
             page = QtWidgets.QWidget()
             layout = QtWidgets.QVBoxLayout(page)
@@ -561,10 +584,46 @@ class TrainingSetupForm(QtWidgets.QWidget):
             hint = label(help_text, "hint")
             hint.setWordWrap(True)
             layout.addWidget(hint)
-        group = field.get("group", "기타")
+        group = self._group_of(field)
         self.groups[group][1].insertWidget(self.groups[group][1].count() - 1, row)
         self.groups[group][2].append(dest)
         self.rows[dest] = row
+
+    def _group_of(self, field: dict) -> str:
+        """Which page a setting appears on. The chosen step's own settings move to the front."""
+        from .training import STAGE_BY_KEY
+        st = STAGE_BY_KEY.get(self._stage_key)
+        if st and field.get("dest") in st.highlights:
+            return HIGHLIGHT_GROUP
+        return field.get("group", "기타")
+
+    def _stage_chosen(self, key: str):
+        """Pick a step of the pipeline: set its mode, apply the recipe of record, put its own
+        settings at the top of the form. 직접 설정 leaves everything exactly as the CLI has it."""
+        from .training import STAGE_BY_KEY, default_init
+        self._stage_key = "" if key == "expert" else key
+        st = STAGE_BY_KEY.get(self._stage_key)
+        self.stage_note.setText(st.blurb if st else
+                                "단계 기본값 없이 아래 설정을 그대로 씁니다.")
+        self.combo_mode.setVisible(st is None)
+        if st is None:
+            self._mode_changed()
+            return
+        index = self.combo_mode.findData(st.mode)
+        if index >= 0:
+            self.combo_mode.blockSignals(True)
+            self.combo_mode.setCurrentIndex(index)
+            self.combo_mode.blockSignals(False)
+        self._mode_changed()                      # rebuilds the pages with HIGHLIGHT_GROUP first
+        values = dict(self.values())
+        values.update({k: v for k, v in st.values.items() if k in self.fields})
+        if st.key == "specialize" and "init" in self.fields \
+                and not str(values.get("init") or "").strip():
+            values["init"] = default_init()
+        self.set_values(values)
+        if self.sections.count():
+            self.sections.setCurrentRow(0)
+        self._refresh_preview()
 
     def _compat_aliases(self):
         # Small public handles used by console integration and the shared opponent table tests.
@@ -646,7 +705,7 @@ class TrainingSetupForm(QtWidgets.QWidget):
     def _apply_recipe(self, *_args):
         if self._quiet or self.mode != "ppo":
             return
-        from .training import COMMON_FLAGS, FROZEN_ORIGINAL, RECIPES
+        from .training import COMMON_FLAGS, RECIPES, default_init
         key = self.combo_recipe.currentData()
         recipe = next((r for r in RECIPES if r.key == key), None)
         if recipe is None or key == "custom":
@@ -659,7 +718,7 @@ class TrainingSetupForm(QtWidgets.QWidget):
         values.update(tracks=recipe.tracks, race_size=recipe.race_size, opponent=recipe.opponent,
                       aux_grip=recipe.aux_grip, aux_opp=recipe.aux_opp, lr=recipe.lr,
                       lr_end=recipe.lr_end, kl_coef=recipe.kl, envs=recipe.envs, total=recipe.total,
-                      controller="legacy", adaptation="off", init=FROZEN_ORIGINAL, obstacle_draws=8,
+                      controller="legacy", adaptation="off", init=default_init(), obstacle_draws=8,
                       name=f"cl_{key}_s701_{time.strftime('%m%d_%H%M%S')}", seed=701)
         self.set_values(values)
         if recipe.tracks in ("train", "heldout", "eval"):
@@ -730,10 +789,45 @@ class TrainingSetupForm(QtWidgets.QWidget):
                     note = "저장된 관측·모델·행동 설정을 복원했습니다. 나머지 학습 파라미터는 현재 설정을 유지합니다."
                 else:
                     note = "설정 준비됨"
-                self.launch_note.setText(note)
+                stage_problem = self._stage_problem(values)
+                if stage_problem:
+                    self._set_launch_problem(stage_problem)
+                else:
+                    self._set_launch_ok(note)
         except (ValueError, TypeError) as exc:
             self.preview.setPlainText(str(exc))
-            self.launch_note.setText(str(exc).splitlines()[0][:250])
+            self._set_launch_problem(str(exc).splitlines()[0])
+
+    def _stage_problem(self, values: dict) -> str:
+        """What the chosen step needs that the parser does not check. "" when nothing."""
+        if self._stage_key != "specialize":
+            return ""
+        chosen = [t for t in str(values.get("tracks") or "").replace(" ", "").split(",") if t]
+        if len(chosen) == 1:
+            return ""
+        if not chosen:
+            return "이 단계는 맵 하나를 외우는 학습입니다. 아래에서 맵을 하나 고르세요."
+        return (f"이 단계는 맵 하나를 외우는 학습입니다. 지금 {len(chosen)}개가 골라져 있습니다 "
+                f"— 하나만 남기거나, ② 일반화를 고르세요.")
+
+    def _set_launch_ok(self, note: str):
+        self.launch_note.setObjectName("Hint")
+        self.launch_note.setText(note)
+        self._restyle_launch_note()
+        self.btn_launch.setEnabled(True)
+        self.btn_launch.setToolTip("")
+
+    def _set_launch_problem(self, why: str):
+        """Say what is wrong, where 시작 is, before it is pressed."""
+        self.launch_note.setObjectName("HintWarn")
+        self.launch_note.setText("시작할 수 없습니다 — " + why)
+        self._restyle_launch_note()
+        self.btn_launch.setEnabled(False)
+        self.btn_launch.setToolTip(why)
+
+    def _restyle_launch_note(self):
+        self.launch_note.style().unpolish(self.launch_note)
+        self.launch_note.style().polish(self.launch_note)
 
     def _launch(self):
         try:
@@ -753,7 +847,7 @@ class TrainingSetupForm(QtWidgets.QWidget):
                 if run.is_dir() and any(run.glob("*.pt")):
                     raise ValueError("체크포인트가 있는 런입니다. '이어서'를 사용하거나 새 이름을 지정하세요.")
         except (ValueError, TypeError) as exc:
-            self.launch_note.setText(str(exc))
+            self._set_launch_problem(str(exc).splitlines()[0])
             return
         self.launch_requested.emit(name, argv, device)
 

@@ -33,6 +33,9 @@ def app():
 def form(app, tmp_path, monkeypatch):
     monkeypatch.setenv("F1SIM_SCENES", str(tmp_path / "scenes"))
     widget = TrainingSetupForm()
+    widget.seg_stage.set_current("expert")
+    widget._stage_chosen("expert")
+    widget.combo_mode.setCurrentIndex(widget.combo_mode.findData("ppo"))
     yield widget
     widget.deleteLater()
 

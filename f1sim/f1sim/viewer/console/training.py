@@ -45,6 +45,31 @@ JOBS_DIRNAME = "_console_jobs"
 REPO_F1SIM = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 FROZEN_ORIGINAL = os.path.join(catalog.RUNS_DIR, "_baselines", "frozen_original_48cc698f.pt")
 
+#: Checkpoints the repository itself carries, which is what makes a recipe startable on a machine
+#: that has never trained anything.
+SHIPPED_CHECKPOINTS = os.path.join(os.path.dirname(REPO_F1SIM), "checkpoints")
+
+
+def default_init() -> str:
+    """A checkpoint for a recipe to start PPO from, or "" when there is none to offer.
+
+    Every recipe used to name `FROZEN_ORIGINAL` outright. That file is the 2026-09-10 baseline: it
+    is not in the repository, no default run produces it, and it is not on the machine this was
+    written on -- so the training page opened pre-filled with a path that did not exist and
+    refused to launch until the person worked out what to put there instead. The shipped DAgger
+    student is a real answer to the same question (it is what the dial pipeline starts PPO from),
+    so it is offered when the baseline is absent, and an empty box when neither is.
+    """
+    if os.path.isfile(FROZEN_ORIGINAL):
+        return FROZEN_ORIGINAL
+    try:
+        shipped = sorted(f for f in os.listdir(SHIPPED_CHECKPOINTS)
+                         if f.endswith(".pt") and "student" in f)
+        shipped += sorted(f for f in os.listdir(SHIPPED_CHECKPOINTS) if f.endswith(".pt"))
+    except OSError:
+        return ""
+    return os.path.join(SHIPPED_CHECKPOINTS, shipped[0]) if shipped else ""
+
 # ================================================================ recipes
 COMMON_FLAGS = (
     "--action-mode plan --horizon 32 --minibatch 1024 --epochs 3 --cap0 9.0 --cap1 9.0 --cap-steps 5000000.0 "
@@ -78,6 +103,73 @@ class Recipe:
     kl: float = 0.05
     envs: int = 256
     total: int = 1_048_576
+
+
+@dataclass
+class Stage:
+    """One step of the pipeline this project actually runs, as a thing you can pick.
+
+    The mode list is an axis of *experiments* -- adaptation arms, estimator pilots -- and the
+    three steps that produce the results of record were spread across it: two of them were the
+    same "PPO" entry with different settings, and the third (one map, until it knows the course)
+    was not offered at all. Someone opening this page saw 153 settings and no indication that the
+    work has an order, or that step 2 starts from step 1's output.
+
+    `highlights` are the settings that step is actually about; they are lifted into a group of
+    their own at the top of the form, and everything else stays where it was.
+    """
+    key: str
+    number: str
+    title: str
+    blurb: str
+    mode: str                                   # which entry of MODES it configures
+    highlights: Tuple[str, ...] = ()
+    values: Dict[str, object] = field(default_factory=dict)
+
+
+#: `f1sim.learn` produces a policy in three steps. The defaults here are the ones that produced
+#: the results in docs/research/mintime-teacher-speed-head-2026-09-19.md, so picking a step and
+#: pressing 시작 reproduces that work rather than starting from whatever the CLI defaults are.
+STAGES: Tuple["Stage", ...] = (
+    Stage("imitate", "①", "교사 모방",
+          "레이싱 라인 teacher 를 따라 하도록 가르칩니다 (DAgger). 여기서 나온 student 가 다음 "
+          "단계의 출발점입니다. 보통 가장 오래 걸리고, 한 번만 하면 됩니다.",
+          mode="dagger",
+          highlights=("name", "tracks", "steps", "teacher_kind", "cond", "init"),
+          values={"cond": "dial", "action_mode": "plan", "memory": "off"}),
+    Stage("generalize", "②", "일반화",
+          "student 를 여러 맵에서 강화학습으로 다듬습니다. 처음 보는 맵에서도 도는 정책이 나오지만, "
+          "어느 한 맵에서 가장 빠르지는 않습니다.",
+          mode="ppo",
+          highlights=("name", "init", "tracks", "total", "lr", "cond"),
+          values={"cond": "dial", "action_mode": "plan", "controller": "legacy",
+                  "adaptation": "off", "total": 8_388_608, "envs": 256,
+                  "lr": 3e-4, "lr_end": 1e-4, "kl_coef": 0.05,
+                  "race_size": 1, "overtake_bonus": 0.0,
+                  "car_proximity_penalty": 0.0, "car_contact_penalty": 0.0}),
+    Stage("specialize", "③", "이 맵에 특화",
+          "맵 하나만 반복해서 그 코스를 외우게 합니다. 가장 빠른 랩은 여기서 나옵니다 — 기록상 "
+          "일반화 정책보다 10 % 빠릅니다. 대신 그 맵 전용이 됩니다. 40 분 정도 걸립니다.",
+          mode="ppo",
+          highlights=("name", "init", "tracks", "total", "collision_penalty",
+                      "lap_time_bonus", "dial_margin"),
+          # One map is the whole point of this step, so it starts with none chosen rather
+          # than with the 53-map training set the other steps use.
+          # The recipe of record (research note section 10): leash released over 4 M, the dial
+          # margin KEPT in training, and the grip budget on -- which is what lets the released
+          # leash stay safe.
+          values={"cond": "dial", "action_mode": "plan", "controller": "legacy",
+                  "adaptation": "off", "total": 6_291_456, "envs": 256,
+                  "lr": 2e-4, "lr_end": 5e-5, "kl_coef": 0.05, "kl_decay": 4e6,
+                  "gamma": 0.997, "collision_penalty": 60.0, "steer_penalty": 0.02,
+                  "lap_time_bonus": 6.0, "dial_margin": 0.30, "dial_exact": 0.30,
+                  "grip_budget_penalty": 2.0, "fresh_opt": True, "race_size": 1,
+                  "tracks": "", "overtake_bonus": 0.0,
+                  "car_proximity_penalty": 0.0, "car_contact_penalty": 0.0},
+          ),
+)
+
+STAGE_BY_KEY = {st.key: st for st in STAGES}
 
 
 RECIPES: List[Recipe] = [
