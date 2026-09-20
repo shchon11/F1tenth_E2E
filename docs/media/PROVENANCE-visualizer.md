@@ -1,5 +1,25 @@
 # Visualizer screenshots — provenance
 
+**Re-captured 2026-09-20** after the console's second redesign (numbered steps, the recording form
+folded, the sidebar no longer widened for a table that is not on screen, a real check in the
+checkboxes) and after the fix that made this possible at all: the session's default plan controller
+was `auto`, which **requires** a frozen grip estimator that the repository does not ship, that no
+default run produces and that was not on the machine either — so pressing 시작 with the defaults
+failed. The default is `legacy` again and `auto` falls back to it rather than refusing.
+
+Re-taken with **`f1sim/scripts/capture_console_media.py`, which is now in this repository** — the
+previous captures were made by a script that lived outside it, so re-taking them meant finding one
+file on one machine. Session: the shipped `checkpoints/dial_student_s901.pt`
+(sha256 `a27fd18f685d1712`) on `gen:competition:2`, 1 race × 1 car, `device="cpu"`,
+`LIBGL_ALWAYS_SOFTWARE=1`, 1920 × 1200. Machine-readable:
+[`console-capture-manifest-2026-09-20.json`](console-capture-manifest-2026-09-20.json).
+
+`f1tenth-visualizer-props.png` is **not** from this capture — it is still the 2026-09-12 image, on
+`gen:competition:3+props7`, since the modelled obstacle it exists to show has not changed.
+
+The 2026-09-12 entry below describes the previous capture, and its method still applies.
+
+
 **Re-captured 2026-09-12** after the console's visual redesign ([design note](../viewer_design.md)):
 same headless path (Xvfb 2048 × 1280, llvmpipe, `CUDA_VISIBLE_DEVICES=""`, real `ConsoleWindow` +
 real `sim_worker`), driver `cl_origrecipe_legacy_s701/ppo_final.pt` (legacy-trained, run under the

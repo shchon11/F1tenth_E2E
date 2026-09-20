@@ -126,10 +126,15 @@ class SessionConfig:
     #: driving page and the training page share one widget, and a session saved here can be pasted
     #: into a training command. None = no table, and `opponent` above decides instead.
     opponent_slots: Optional[List[Dict[str, Any]]] = None
-    #: Plan-controller arm installed at run time (`learn.grip_runtime`). "auto" is the ordinary
-    #: driving default and uses the worker's automatic sensor runtime. The experiment arms and
-    #: estimator path remain available to explicit benchmark/debug callers.
-    controller: str = "auto"
+    #: Plan-controller arm installed at run time (`learn.grip_runtime`).
+    #:
+    #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs
+    #: nothing but the checkpoint you picked. `auto` needs a frozen grip estimator, and that file
+    #: is not in the repository, is not produced by any default run, and is not on the machine this
+    #: was written on: with `auto` as the default, pressing 시작 on a fresh install failed with
+    #: "자동 노면 추정 모델을 찾지 못했습니다" and no way forward. The experiment arms and the
+    #: estimator path are still here for explicit benchmark and debug callers, who have the file.
+    controller: str = "legacy"
     #: Optional frozen grip-estimator path for explicit callers. An empty value lets the worker
     #: resolve its configured default internally.
     estimator: str = ""

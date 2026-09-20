@@ -21,8 +21,10 @@ LiDAR and proprioception in. A short local plan out. **No map, no localisation, 
   <img src="docs/media/f1tenth-visualizer-overview.png" width="92%" alt="The f1sim driving console">
 </a>
 
-<sub><b>The console.</b> Drive, train and build environments in one window — software-rendered on CPU here, so its
-<code>sim 배속</code> and <code>렌더 fps</code> are llvmpipe figures, not performance numbers
+<sub><b>The console.</b> Drive, train and build environments in one window. A real session, not a mock-up:
+the shipped <code>dial_student_s901</code> driving <code>gen:competition:2</code>, photographed by
+<a href="f1sim/scripts/capture_console_media.py"><code>capture_console_media.py</code></a>. Software-rendered
+on CPU here, so its <code>sim 배속</code> and <code>렌더 fps</code> are llvmpipe figures, not performance numbers
 (<a href="docs/media/PROVENANCE-visualizer.md">provenance</a>).</sub>
 
 </div>

@@ -748,7 +748,7 @@ class SimWorker:
         # The plan-controller arm this session installs. A checkpoint trained under a non-legacy
         # arm may only run under that same arm; legacy-trained weights may run under any arm (the
         # benchmark's declared cross-runtime case, and the configuration that scored best).
-        arm = str(getattr(cfg, "controller", "auto") or "auto")
+        arm = str(getattr(cfg, "controller", "legacy") or "legacy")
         if arm not in viewer_arms():
             raise StartConfigError(f"플랜 제어기 '{arm}' 은 이 뷰어가 지원하지 않습니다 "
                                    f"({' / '.join(viewer_arms())}).")
@@ -796,9 +796,15 @@ class SimWorker:
             from .console.protocol import SessionConfig as _SC
             estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
             if not estimator_path or not os.path.isfile(estimator_path):
-                raise StartConfigError("자동 노면 추정 모델을 찾지 못했습니다. "
-                                       "F1SIM_GRIP_ESTIMATOR 또는 "
-                                       "~/f1sim_runs/_estimators/estimator_seed401.pt 를 확인하세요.")
+                if arm == "auto":
+                    self.say(P.MSG_LOG, gen=gen,
+                             text="자동 노면 추정 모델이 없어 기본 제어기(legacy)로 주행합니다. "
+                                  "추정기를 쓰려면 F1SIM_GRIP_ESTIMATOR 를 지정하세요.")
+                    arm, estimator_path = "legacy", ""
+                else:
+                    raise StartConfigError(
+                        f"제어기 '{arm}' 는 노면 추정 모델이 필요합니다. F1SIM_GRIP_ESTIMATOR 를 "
+                        f"지정하거나, 제어기를 'legacy' 로 두세요 (기본값).")
         speed_cap = float(cfg.speed_cap or checkpoint_speed_cap(extra, ckpt_path))
         self._check_cancel(gen)
 

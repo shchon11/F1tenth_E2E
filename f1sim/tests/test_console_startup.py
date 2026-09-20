@@ -48,10 +48,18 @@ def window(qapp):
     QtWidgets.QApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 
 
-# ----------------------------------------------------------------- ordinary driving is automatic
-def test_a_default_session_uses_automatic_grip_and_no_compile():
+# ----------------------------------------------------------------- ordinary driving needs nothing
+def test_a_default_session_needs_nothing_but_the_checkpoint():
+    """The default arm must be one that runs with no file the user does not have.
+
+    This asserted `auto`, and `auto` **requires** a frozen grip estimator: not in the repository,
+    not produced by any default run, not on the machine this was written on. So the test passed
+    while pressing 시작 with the defaults failed with "자동 노면 추정 모델을 찾지 못했습니다" --
+    which is the whole reason it is now `legacy`, the plain tracker, which needs only the
+    checkpoint that was picked. The estimator arms remain for callers that have the file.
+    """
     config = SessionConfig()
-    assert config.controller == "auto"
+    assert config.controller == "legacy"
     assert config.estimator == ""
     assert config.compile is False
 
@@ -64,7 +72,9 @@ def test_ordinary_driving_hides_experiment_settings(window):
 
     window._selected_run, window._selected_map = "r", "real:korea_2026_competition"
     config = window.current_config()
-    assert config.controller == "auto"
+    # The window must not name an arm of its own: it asks for whatever a default session is, so
+    # the two cannot drift apart again.
+    assert config.controller == SessionConfig.controller == "legacy"
     assert config.estimator == ""
     assert config.compile is False
 
@@ -79,7 +89,8 @@ def test_device_selection_stays_independent_of_automatic_grip(window):
     window.combo_device.setCurrentText(cuda)
     config = window.current_config()
     assert config.device == cuda
-    assert config.controller == "auto" and config.estimator == ""
+    # Picking a card says nothing about the plan controller; that stays the default either way.
+    assert config.controller == SessionConfig.controller and config.estimator == ""
     assert config.compile is False
 
 

@@ -133,12 +133,24 @@ def main(argv: Optional[list] = None) -> int:
             time.sleep(0.002)
 
     def wait_for(predicate: Callable[[], bool], what: str):
+        from f1sim.viewer.console.protocol import STATE_FAILED
         end = time.monotonic() + a.timeout
+        last = ""
         while time.monotonic() < end:
             if predicate():
                 return
-            pump(0.02)
-        raise SystemExit(f"timed out waiting for {what} (state={window.state})")
+            if window.state == STATE_FAILED:
+                err = getattr(window, "_last_error", None) or {}
+                raise SystemExit("the session failed to start:\n  "
+                                 + (err.get("message") or window.status_text.text())
+                                 + "\n" + (err.get("detail") or ""))
+            now = window.status_text.text()
+            if now != last:                      # so a slow start shows what it is slow at
+                print(f"    [{window.state}] {now}", flush=True)
+                last = now
+            pump(0.05)
+        raise SystemExit(f"timed out after {a.timeout:.0f}s waiting for {what} "
+                         f"(state={window.state}, status={window.status_text.text()!r})")
 
     print(f"checkpoint  {ckpt}")
     print(f"map         {a.map}")
@@ -152,8 +164,8 @@ def main(argv: Optional[list] = None) -> int:
     window._on_run_selected(ckpt)
 
     cfg = SessionConfig(run=ckpt, map_name=a.map, races=1, cars_per_race=1,
-                        device="cpu" if not a.gpu else "auto")
-    controller.start_worker()
+                        device="cpu" if not a.gpu else "auto", compile=False)
+    pump(0.3)
     controller.start_session(cfg)
     wait_for(lambda: window.state == STATE_RUNNING, "the session to start driving")
     print("running; settling…")
@@ -188,6 +200,8 @@ def main(argv: Optional[list] = None) -> int:
 
     controller.stop_session()
     pump(1.5)
+    controller.shutdown()
+    window.viewport.teardown()
 
     manifest = {
         "captured": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
