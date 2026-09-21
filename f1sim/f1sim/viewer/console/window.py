@@ -484,6 +484,14 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.chk_dr.setToolTip("끄면 모든 차가 공칭 파라미터로 달립니다. 미끄러짐이 정책 탓인지 "
                                "낮은 마찰 뽑기 탓인지 구분할 때 끄세요.")
         adv.add(self.chk_dr)
+        self.chk_soft = QtWidgets.QCheckBox("충돌해도 계속 주행 (soft contact)")
+        self.chk_soft.setChecked(True)
+        self.chk_soft.setToolTip(
+            "켜면 벽·덕트·장애물에 닿아도 리셋하지 않고 접촉을 해석합니다: 덕트는 늘어나며 차를 "
+            "천천히 세우고(실측 56개 충돌로 보정), 장애물은 밀리고, IMU·서스펜션이 충격을 느끼며, "
+            "박힌 차는 정지 명령으로 후진해 빠져나옵니다.\n"
+            "끄면 학습·평가 기본값(terminate)처럼 닿는 순간 그 차를 리셋합니다.")
+        adv.add(self.chk_soft)
         self.chk_stoch = QtWidgets.QCheckBox("학습처럼 행동을 샘플링")
         adv.add(self.chk_stoch)
         # The per-car table, in place of the one combo that used to say the same thing about every
@@ -1394,7 +1402,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
-                  self.spin_cap, self.chk_dr, self.chk_stoch, self.opp_table, self.combo_device,
+                  self.spin_cap, self.chk_dr, self.chk_soft, self.chk_stoch, self.opp_table, self.combo_device,
                   self.combo_ros,
                   self.seg_direction, self.combo_obstacle, self.chk_bare_first):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
@@ -2110,6 +2118,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "speed_cap": float(self.spin_cap.value()),
             "device": self.combo_device.currentText(),
             "randomize": bool(self.chk_dr.isChecked()),
+            "collision_soft": bool(self.chk_soft.isChecked()),
             "stochastic": bool(self.chk_stoch.isChecked()),
             "bare_first": bool(self.chk_bare_first.isChecked()),
             "mu_mode": str(self.combo_mu.currentData() or "random"),
@@ -2186,6 +2195,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.spin_cap.setValue(float(v)), "speed_cap")
         attempt(combo_text(self.combo_device), "device")
         attempt(lambda v: self.chk_dr.setChecked(bool(v)), "randomize")
+        attempt(lambda v: self.chk_soft.setChecked(bool(v)), "collision_soft")
         attempt(lambda v: self.chk_stoch.setChecked(bool(v)), "stochastic")
         attempt(lambda v: self.chk_bare_first.setChecked(bool(v)), "bare_first")
         attempt(combo_data(self.combo_mu), "mu_mode")
@@ -2230,6 +2240,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             device=self.combo_device.currentText(),
             compile=False,
             randomize=self.chk_dr.isChecked(),
+            collision_mode=("soft" if self.chk_soft.isChecked() else "terminate"),
             stochastic=self.chk_stoch.isChecked(),
             opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
             opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),

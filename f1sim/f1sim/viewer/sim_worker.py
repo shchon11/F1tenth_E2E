@@ -892,7 +892,10 @@ class SimWorker:
             hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
             compile_tracker=compile_enabled,
             # a switch moves every car itself; re-drawing tracks on reset would scatter them
-            resample_track_on_reset=False)
+            resample_track_on_reset=False,
+            # Under "soft" a touch is resolved and the car carries on -- the duct gives, a crate is
+            # shoved, the IMU and the suspension feel it -- instead of the session resetting it.
+            collision_mode=str(getattr(cfg, "collision_mode", "terminate") or "terminate"))
         if "action_history" in spec:
             # `watch.main` does not pass this through, so a checkpoint trained with a different
             # action history fails there with a shape error deep in the actor. Taking it from the

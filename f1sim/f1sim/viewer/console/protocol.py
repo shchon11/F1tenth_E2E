@@ -116,6 +116,12 @@ class SessionConfig:
     #: benchmark and headless callers may still enable it; ordinary driving leaves it disabled.
     compile: bool = False
     randomize: bool = True               # domain randomisation, as in training
+    #: What a collision is in this session. "soft" here, although training and evaluation default to
+    #: "terminate": the viewer is where you look at how the car behaves, and a car that vanishes to
+    #: its spawn point the instant it touches a wall hides the whole contact model -- which is what
+    #: the user saw driving by hand into a wall ("직접 조작해서 충돌했는데 왜 초기화돼"). The
+    #: numbers the viewer reports are not benchmark numbers either way; the switch is in the UI.
+    collision_mode: str = "soft"
     stochastic: bool = False
     #: Who drives the other cars when there is no slot table. Kept for the sessions and recorded
     #: configs written before `opponent_slots` existed, and for `cars_per_race == 1`, where there is

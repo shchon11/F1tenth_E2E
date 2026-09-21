@@ -669,8 +669,13 @@ class Simulator:
             a_x = ax if a_contact is None else ax + a_contact[:, 0]
             a_y = ay if a_contact is None else ay + a_contact[:, 1]
             # sprung mass: roll to the outside of the corner, dive under braking, squat under throttle
-            w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s
-            w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s
+            # The floor only shakes a car that is moving over it: `road_tilt` was measured driving,
+            # and at a standstill the excitation is gone. The OU state is not reset -- it decays
+            # through `ou_k` with the road's own time constant, which is the suspension settling
+            # rather than the body snapping level. See `VehicleParams.road_tilt_v`.
+            excite = (state[:, dyn.IVX].abs() / P["road_tilt_v"].clamp_min(1e-6)).clamp(0.0, 1.0)
+            w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s * excite
+            w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s * excite
             roll_ss = P["roll_per_g"] * a_y / dyn.G + w_roll
             # asymmetric: the car squats under throttle far more than it dives under (regen-limited) braking
             pitch_ss = -torch.where(a_x > 0, P["pitch_per_g"], P["dive_per_g"]) * a_x / dyn.G + w_pitch

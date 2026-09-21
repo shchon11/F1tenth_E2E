@@ -478,6 +478,40 @@ def _refine_lap_time(seed: np.ndarray, track: Track, veh_width: float, margin: f
     return result if return_result else result.xy
 
 
+#: `VehicleParams` fields added *after* the raceline cache key was defined, none of which the line
+#: reads. They are kept out of the key so that adding one does not orphan every cached line.
+#:
+#: Why this has to exist: the key used to be `repr(VehicleParams())`, all of it, so the day a
+#: suspension-noise parameter (`road_tilt_v`) was added every one of the 738 cached racelines stopped
+#: matching and each track would have rebuilt -- twenty to seventy minutes apiece -- for a field
+#: `Raceline.build` never touches. The line reads sixteen vehicle fields (mass properties, grip,
+#: drag, the actuator limits); switching the key to exactly those would be the principled form, and
+#: would itself invalidate all 738 once, which is why it is not done here.
+#:
+#: A new field goes here if and only if the raceline does not depend on it.
+_ADDED_AFTER_LINE_KEY = frozenset({"road_tilt_v"})
+
+
+class _LineKeyVehicle:
+    """Stands in for a `VehicleParams` inside the cache key, with the same `repr` it had when the
+    key was defined -- dataclass format, declaration order -- minus `_ADDED_AFTER_LINE_KEY`."""
+
+    __slots__ = ("_v",)
+
+    def __init__(self, vehicle):
+        self._v = vehicle
+
+    def __repr__(self) -> str:
+        import dataclasses
+        v = self._v
+        body = ", ".join(f"{fl.name}={getattr(v, fl.name)!r}" for fl in dataclasses.fields(v)
+                         if fl.name not in _ADDED_AFTER_LINE_KEY)
+        return f"{type(v).__name__}({body})"
+
+    def __lt__(self, other):                  # never compared: "vehicle" is a unique key
+        return NotImplemented
+
+
 # --------------------------------------------------------------------------- container
 @dataclass
 class Raceline:
@@ -557,7 +591,7 @@ class Raceline:
         if params.get("objective") is None:
             params.pop("objective", None)
         from .params import VehicleParams
-        params["vehicle"] = params["vehicle"] or VehicleParams()
+        params["vehicle"] = _LineKeyVehicle(params["vehicle"] or VehicleParams())
         cl = b"" if track.centerline is None else np.asarray(track.centerline, dtype=np.float32).tobytes()
         geometry = repr((track.occupancy.shape, track.resolution, tuple(track.origin))).encode()
         h = hashlib.md5(np.packbits(track.occupancy).tobytes() + cl + geometry

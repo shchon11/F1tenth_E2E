@@ -149,6 +149,7 @@ def _move_every_control(w):
     w.spin_grid.setValue(3)
     w.spin_cap.setValue(7.5)
     w.chk_dr.setChecked(False)
+    w.chk_soft.setChecked(False)
     w.chk_stoch.setChecked(True)
     w.chk_saliency.setChecked(not w.chk_saliency.isChecked())
     w.chk_internals.setChecked(not w.chk_internals.isChecked())

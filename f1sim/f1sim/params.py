@@ -134,6 +134,16 @@ class VehicleParams:
                                # 0.6-1.8 deg measured, 0.15-3 Hz): a stationary OU process fed into the
                                # suspension, so the LiDAR plane wobbles as much as the real one without
                                # cornering. 0 = flat floor (the model before 2026-09-13).
+    # [m/s] the speed at which that wobble reaches `road_tilt`; below it the excitation ramps down
+    # linearly to nothing at a standstill. `road_tilt` was measured *driving*, and a floor does not
+    # move under a parked car -- but the OU process ran at full amplitude regardless, so a car
+    # sitting at 0.000 m/s pitched 1.1 deg rms and 5.5 deg at peak, which puts a 0.110 m scan
+    # plane on the floor 1.1 m ahead. The user saw exactly that in the viewer: "움직이지도 않는데
+    # 라이다가 이리저리 땅 봤다가". OURS, not measured: three attempts to recover the speed
+    # dependence from the recordings (accelerometer tilt, forward-range stability at standstill)
+    # were each swamped by something else -- vibration at speed, people and cars crossing in front
+    # of the grid -- so the ramp is a first-principles choice and says so.
+    road_tilt_v: float = 2.0
     road_tau: float = 0.4      # [s] its correlation time (the roll-rate spectrum is flat above ~0.4 Hz)
     susp_wn: float = 17.6      # [rad/s] suspension natural frequency (~2.8 Hz)
     susp_zeta: float = 0.35    # [-] damping ratio (underdamped: visible overshoot after braking)
