@@ -327,7 +327,7 @@ class EpisodeRecorder:
             f = info["final"]
             for j, i in enumerate(f["ids"].tolist()):
                 if self.done_step[i] < 0:
-                    self.done_step[i] = step; self.progress[i] = float(f["progress"][j]); self.collided[i] = bool(f["collided"][j])
+                    self.done_step[i] = step; self.progress[i] = float(f["progress"][j]); self.collided[i] = bool(f["contacts"][j] > 0)
 
     def finalize(self):
         T = len(self.state); self.T = T

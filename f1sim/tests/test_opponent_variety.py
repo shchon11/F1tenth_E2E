@@ -458,3 +458,67 @@ def test_terminate_mode_never_reverses():
     for _ in range(40):
         env.step(torch.full((env.B, env.act_dim), -1.0))
         assert not bool(env.tracker.contact.any()), "the tracker was told about contact under terminate"
+
+
+# ============================================================ 8. soft runs, measured and spread out
+def test_a_staggered_start_spreads_the_resets_and_then_runs_full_episodes():
+    """Under soft nothing terminates, so a batch that starts together resets together forever:
+    s911 reset all 256 cars on the same step every 50 updates. With the first episode staggered
+    the resets land on many different steps, each race's cars still reset together, and every
+    episode after the first is full length."""
+    n = 60
+    env = _env(envs=16, action_mode="plan", max_steps=n, collision_mode="soft",
+               stagger_first_episode=True, opponent_slots=[{"kind_mix": PROP_AWARE}])
+    env.reset(seed=11)
+    first = env.ep_limit.view(-1, env.M)
+    assert bool((first == first[:, :1]).all()), "the cars of one race must share the limit"
+    assert int(first[:, 0].unique().numel()) > 1, "every race drew the same limit"
+    ends = {}
+    for k in range(1, 2 * n + 2):
+        _o, _r, _t, _tr, info = env.step(torch.zeros(env.B, env.act_dim))
+        if "final" in info:
+            f = info["final"]
+            for i, st, stag in zip(f["ids"].tolist(), f["steps"].tolist(), f["staggered"].tolist()):
+                ends.setdefault(i, []).append((k, st, stag))
+    assert len({v[0][0] for v in ends.values()}) > 2, "the first resets still landed together"
+    for i, ev in ends.items():
+        assert ev[0][2] or ev[0][1] == n, "only a cut-short first episode may be flagged staggered"
+        for _k, st, stag in ev[1:]:
+            assert st == n and not stag, f"row {i}: a later episode ran {st} steps, not {n}"
+
+
+def test_without_the_stagger_everything_is_as_before():
+    env = _env(envs=8, action_mode="plan", max_steps=30, collision_mode="soft",
+               opponent_slots=[{"kind_mix": PROP_AWARE}])
+    env.reset(seed=11)
+    assert not bool((env.ep_limit < 30).any()), "no row may carry a limit shorter than max_steps"
+    for _ in range(30):
+        _o, _r, _t, trunc, info = env.step(torch.zeros(env.B, env.act_dim))
+    assert bool(trunc.all()) and not bool(info["final"]["staggered"].any())
+
+
+def test_soft_contacts_are_counted_in_the_episode_and_in_an_evaluation():
+    """s911 logged "coll 0.0/km" for 6.3 M steps of soft contact: `collided` is `terminated`, which
+    soft never sets. `final["contacts"]` counts the onsets the reward charged, and
+    `common.evaluate` counts `info["contact_onset"]` per step, so an unfinished episode's contacts
+    are not lost either."""
+    env = _env(envs=16, procedural_obstacles=1.0, procedural_density=3.0, procedural_max_props=10,
+               procedural_raceline_corridor="off", spawn_runway=3.0, action_mode="plan", max_steps=150,
+               collision_mode="soft", opponent_slots=[{"kind_mix": PROP_AWARE}])
+    env.reset(seed=63)
+    onsets = 0; counted = 0.0
+    for _ in range(150):
+        _o, _r, _t, _tr, info = env.step(torch.zeros(env.B, env.act_dim))
+        onsets += int(info["contact_onset"].sum())
+        if "final" in info:
+            counted += float(info["final"]["contacts"].sum())
+            assert not bool(info["final"]["collided"].any())            # soft: nothing terminated
+    assert onsets > 0, "the scenario has to hit something to test the count"
+    assert counted == onsets, (counted, onsets)
+    # and the evaluation: same scenario, same seed (rollout_metrics reseeds nothing, so seed here)
+    torch.manual_seed(0)
+    env2 = _env(envs=16, procedural_obstacles=1.0, procedural_density=3.0, procedural_max_props=10,
+                procedural_raceline_corridor="off", spawn_runway=3.0, action_mode="plan", max_steps=1600,
+                collision_mode="soft", opponent_slots=[{"kind_mix": PROP_AWARE}])
+    out = common.rollout_metrics(env2, lambda obs: torch.zeros(env2.B, env2.act_dim), steps=150)
+    assert out["collisions_per_km"] > 0.0, out          # used to be 0: no episode ended, none terminated

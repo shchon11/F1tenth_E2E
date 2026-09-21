@@ -493,10 +493,21 @@ class TrafficMeter:
         ev_id = p["event_id"]
         ev_on = ((ev_id[other] != 0).any(dim=1).tolist() if ev_id is not None
                  else [False] * self.n)
+        # Under `collision_mode="soft"` the simulator reports a contact on every step it lasts --
+        # a hose graze is 40 ms, sixteen steps -- and nothing ends the episode, so counting steps
+        # would score one graze as sixteen collisions. Count onsets there, which is what the reward
+        # charges and what `terminate` counts by construction (its crash is the episode's last step).
+        soft = getattr(env.ecfg, "collision_mode", "terminate") == "soft"
+        if soft and getattr(self, "_prev_hit", None) is None:
+            self._prev_hit = [False] * self.n
         for i in range(self.n):
+            touching = bool(hit[i]) and not bool(contact[i])
+            onset = touching and not (soft and self._prev_hit[i] and not bool(learner_fresh[i]))
+            if soft:
+                self._prev_hit[i] = touching
             if bool(contact[i]):
                 self.car_contacts += 1
-            elif bool(hit[i]):
+            elif onset:
                 self.wall_collisions += 1
             if bool(learner_fresh[i]):
                 self.learner_respawns += 1

@@ -538,6 +538,20 @@ def main() -> None:
                          "They are dispositions, not timed events: --opp-event-rate does nothing "
                          "for them, so a named reactive behaviour at probability 0 is never given "
                          "to anybody and the run would silently be the unflagged one -- refused")
+    # The training environment's obstacles and contact model. Without these an evaluation could
+    # only score a policy on the empty track, so spec_korea_contact_s911 -- trained on crates on
+    # the racing line with soft, recoverable contact -- had no way to be measured on what it was
+    # trained for. Same names, types and defaults as `learn.ppo`; unset leaves `EnvConfig`'s.
+    ap.add_argument("--procedural-obstacles", type=float, default=None, metavar="FRAC",
+                    help="share of resets that draw a fresh obstacle layout (as in training)")
+    ap.add_argument("--procedural-density", type=float, default=None, metavar="PER10M")
+    ap.add_argument("--procedural-max-props", type=int, default=None, metavar="N")
+    ap.add_argument("--procedural-raceline-corridor", choices=["on", "off"], default=None)
+    ap.add_argument("--spawn-runway", type=float, default=None, metavar="M")
+    ap.add_argument("--collision-mode", choices=["terminate", "soft"], default=None,
+                    help="'soft' counts every contact onset per km and lets the car recover; "
+                         "'terminate' counts the crashes that end episodes")
+    ap.add_argument("--movable-obstacles", action="store_true", default=None)
     ap.add_argument("--output", type=Path, help="write the complete strict JSON report")
     ap.add_argument("--eager", action="store_true", help="disable simulator compilation (CPU smoke tests)")
     ap.add_argument("--external-kind", default="", choices=["", "tinylidarnet", "end2race"],
@@ -590,7 +604,13 @@ def main() -> None:
                          f"teacher-driven car is given that behaviour for a race, so at 0 it is "
                          f"never given and the run is silently the unflagged one.")
     tracks = common.track_names(a.tracks)
-
+    env_extra = {k: v for k, v in (("procedural_obstacles", a.procedural_obstacles),
+                                   ("procedural_density", a.procedural_density),
+                                   ("procedural_max_props", a.procedural_max_props),
+                                   ("procedural_raceline_corridor", a.procedural_raceline_corridor),
+                                   ("spawn_runway", a.spawn_runway),
+                                   ("collision_mode", a.collision_mode),
+                                   ("movable_obstacles", a.movable_obstacles)) if v is not None}
 
     def run(names, config):
         if a.wheel_model != "default":
@@ -616,7 +636,7 @@ def main() -> None:
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
                         controller=a.controller, estimator=a.estimator, external=external,
                         research_estimator=a.research_estimator, research_profile=a.research_profile,
-                        graph_runtime=a.graphs)
+                        graph_runtime=a.graphs, opp_extra=env_extra or None)
 
     nominal = Config()
     if a.eager:

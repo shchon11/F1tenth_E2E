@@ -517,10 +517,14 @@ def rollout_metrics(env: F1VecEnv, policy_fn, steps: int, speed_cap: Optional[fl
         if per_track:
             step_dist = torch.where(lm, env.sim.state[:, 3].abs() * dt, torch.zeros_like(env.sim.state[:, 3]))
             dist_by_track.index_add_(0, tid_before, step_dist)
-            coll_by_track.index_add_(0, tid_before, (term & lm).float())
+            coll_by_track.index_add_(0, tid_before, (info["contact_onset"] & lm).float())
+        # Per step, not per ended episode: under `collision_mode="soft"` nothing terminates, the
+        # episodes' `collided` is always 0, and contacts in an episode still running when the
+        # evaluation stops would never be counted. Under `terminate` this is the same count.
+        n_coll += int((info["contact_onset"] & lm).sum())
         if "final" in info:
             f = info["final"]; m = lm[f["ids"]]
-            n_ended += int(m.sum()); n_coll += int(f["collided"][m].sum())
+            n_ended += int(m.sum())
     started = nL + n_ended
     distance_m = float(np.mean(speeds)) * nL * steps * dt
     out = {"collision_rate": n_coll / started,

@@ -833,6 +833,9 @@ def main():
                                                               procedural_raceline_corridor=a.procedural_raceline_corridor,
                                                               spawn_runway=a.spawn_runway,
                                                               collision_mode=a.collision_mode,
+                                                              # nothing terminates under soft, so the
+                                                              # batch would reset in lockstep forever
+                                                              stagger_first_episode=a.collision_mode == "soft",
                                                               movable_obstacles=a.movable_obstacles,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
@@ -1683,7 +1686,12 @@ def main():
                     all_final_val = torch.zeros(env.B, device=device)
                     all_final_val[f["ids"]] = final_val
                     buf_final_val[t] = all_final_val[lid]
-                    crashed_l = f["collided"][m].float().tolist(); dist_l = f["progress"][m].tolist()
+                    # `contacts`, not `collided`: under soft nothing terminates and `collided` is
+                    # always 0 -- s911 logged "coll 0.0/km" for 6.3 M steps. A staggered first
+                    # episode (`stagger_first_episode`) was cut short on purpose and is no sample
+                    # of how far an episode gets; it still bootstraps above, it is only not scored.
+                    m = m & ~f["staggered"]
+                    crashed_l = f["contacts"][m].float().tolist(); dist_l = f["progress"][m].tolist()
                     collision_history.extend(zip(crashed_l, dist_l))
                     # info["track_id"] is the pre-reset snapshot. env.sim.tid has already been
                     # re-drawn for these rows by the auto-reset inside env.step, so reading it here
@@ -1692,7 +1700,7 @@ def main():
                     for tid_, crashed, dist in zip(ended_tid, crashed_l, dist_l):
                         track_hist[tid_].append((crashed, dist))
                     ep_stats["return"] += f["return"][m].tolist(); ep_stats["progress"] += f["progress"][m].tolist()
-                    ep_stats["collided"] += f["collided"][m].float().tolist(); ep_stats["steps"] += f["steps"][m].tolist()
+                    ep_stats["collided"] += f["contacts"][m].float().tolist(); ep_stats["steps"] += f["steps"][m].tolist()
                 # The episode boundary, applied to everything that remembers: the two hidden
                 # states and the stateful scan channels -- the decayed occupancy, the aligned
                 # channel's ring buffers and the floor channel's attitude tracker. `obs` is already
@@ -1962,12 +1970,12 @@ def main():
                     log.update({"curriculum/worst_track_coll_per_km": max(per_track),
                                 "curriculum/mean_track_coll_per_km": float(np.mean(per_track))})
             if n_ep:
-                last_log = {"collision_rate": float(np.mean(ep_stats["collided"])), "progress_m": float(np.mean(ep_stats["progress"])),
+                last_log = {"collision_rate": float(np.mean(np.minimum(ep_stats["collided"], 1.0))), "progress_m": float(np.mean(ep_stats["progress"])),
                             "collisions_per_km": 1000.0 * float(np.sum(ep_stats["collided"])) / max(float(np.sum(ep_stats["progress"])), 1e-6),
                             "lap_time_s": float(np.mean(ep_stats["lap_time"])) if ep_stats["lap_time"] else float("nan")}
                 dist = float(np.sum(ep_stats["progress"]))
                 log.update({"episode/return": np.mean(ep_stats["return"]), "episode/progress_m": np.mean(ep_stats["progress"]),
-                            "episode/collision_rate": np.mean(ep_stats["collided"]), "episode/len_steps": np.mean(ep_stats["steps"]),
+                            "episode/collision_rate": np.mean(np.minimum(ep_stats["collided"], 1.0)), "episode/len_steps": np.mean(ep_stats["steps"]),
                             # the hazard rate per metre driven. collision_rate saturates at 1.0 once
                             # episodes are long enough to almost always contain a crash, and stays
                             # there while the policy goes on getting better

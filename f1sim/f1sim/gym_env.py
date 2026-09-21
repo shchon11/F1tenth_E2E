@@ -150,6 +150,14 @@ class EnvConfig:
     imu_accel_scale: float = 10.0    # [m/s^2]
     v_max_policy: float = 10.0       # top speed the policy may command (raceline profile peaks here)
     max_steps: int = 1600            # 40 s at 40 Hz
+    # Give each race's FIRST episode after `reset()` a random length in [1, max_steps] instead of
+    # max_steps; every later episode is full length. Under `collision_mode="soft"` nothing
+    # terminates, so without this every car in the batch spawned on the same step and hit the time
+    # limit on the same step, forever: spec_korea_contact_s911 reset all 256 at once every 50
+    # updates, and the 10 updates after each one were rollouts of nothing but starts (reward -0.047
+    # per step against +0.15 for the other 40). Under `terminate` the crashes spread the resets out
+    # by themselves. Training only: an evaluation that starts every car at once wants full episodes.
+    stagger_first_episode: bool = False
     laps: int = 100                  # truncate after this many laps (racing: keep going)
     reward_progress: float = 1.0     # per meter
     reward_collision: float = -10.0
@@ -783,6 +791,14 @@ class F1VecEnv:
         self.cap_scale = torch.ones(self.B, device=self.device)
         self.teacher_race = torch.zeros(self.B, dtype=torch.bool, device=self.device)   # mixed: this race's others are teachers
         self.ep_step = torch.zeros(self.B, dtype=torch.long, device=self.device)
+        #: A staggered first episode's own time limit, per row; `NO_LIMIT` otherwise. Only ever
+        #: shortens `ecfg.max_steps`, which is still read live -- callers change it after
+        #: construction (the episode-boundary tests do), and a copy taken at reset would miss that.
+        self.ep_limit = torch.full((self.B,), self.NO_LIMIT, dtype=torch.long, device=self.device)
+        #: Soft contacts begun this episode (onsets, as charged). Under `terminate` an episode holds
+        #: at most one and it ends it, so `final["collided"]` counted them; under `soft` nothing
+        #: ends and `collided` was always 0, which is what the training log printed as "0.0/km".
+        self.ep_contacts = torch.zeros(self.B, device=self.device)
         self.lap_start_step = torch.zeros(self.B, dtype=torch.long, device=self.device)   # step of the last finish-line crossing
         self.prev_lap = torch.zeros(self.B, dtype=torch.long, device=self.device)
         self.ep_return = torch.zeros(self.B, device=self.device)
@@ -1579,6 +1595,7 @@ class F1VecEnv:
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
+        self.ep_limit[ids] = self.NO_LIMIT; self.ep_contacts[ids] = 0.0
         self.lap_start_step[ids] = 0; self.prev_lap[ids] = 0
         if self.ecfg.reward_lap_time > 0:
             # a car spawns mid-sector, so its first boundary is not a sector it drove: start the clock
@@ -1822,6 +1839,12 @@ class F1VecEnv:
         if seed is not None:
             self.sim.gen.manual_seed(seed); torch.manual_seed(seed)
         self._reset_envs(torch.arange(self.B, device=self.device))
+        if self.ecfg.stagger_first_episode:
+            # One draw per race, not per car: the leader's limit ends the whole race (see the
+            # truncation in `_step_math`), so the cars of a race have to share it.
+            n = int(self.ecfg.max_steps)
+            per_race = torch.randint(1, n + 1, (self.B // self.M,), generator=self.sim.gen, device=self.device)
+            self.ep_limit.copy_(per_race.repeat_interleave(self.M))
         # one zero-action step so that odom/scan come from the simulator path
         r = self.sim.step(torch.stack([torch.zeros(self.B, device=self.device), self.sim.state[:, 3]], 1))
         self.scan_hist = torch.roll(self.scan_hist, 1, 1); self.scan_hist[:, 0] = self._norm_scan(r.scan)
@@ -1882,6 +1905,7 @@ class F1VecEnv:
             edge = r.collision & ~self._was_touching
             self._was_touching = r.collision.clone()
             r.collision = edge
+            self.ep_contacts += edge.to(self.ep_contacts.dtype)
         self._widen_clearance_to_props(r)
         if self.procedural is not None and e.movable_obstacles:
             # Whatever the contacts shoved this step now slides, and the floor takes it back down.
@@ -1895,7 +1919,7 @@ class F1VecEnv:
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap,
                          plan_ref, self.lap_start_step, car_hit, self.gap_prev, self.gap_valid,
                          self.lead_steps, self.lead_paid,
-                         self._plan_clearance(r.state, plan_ref))
+                         self._plan_clearance(r.state, plan_ref), self.ep_limit)
         (self.scan_hist, steer_rate, reward, reward_components, self.act_hist, terminated, truncated,
          crossed, done, self.ep_return, self.ep_progress, flags, self.gap_prev,
          self.gap_valid, self.lead_steps, self.lead_paid) = (t.clone() for t in out)
@@ -1932,6 +1956,11 @@ class F1VecEnv:
                 "on_policy": self.on_policy.clone(),
                 "scan_true": r.scan_true, "track_id": self.sim.tid.clone(), "lap_times": lap_times, "lap_ids": lap_ids,
                 "learner": self.learner,
+                # A collision this step, counted once: the onset of a soft contact, or the crash
+                # that ends a `terminate` episode. What to count per step, in either mode --
+                # `terminated` is never set under soft, and an evaluation that counted it (or the
+                # episodes' `collided`) read every soft run as collision-free.
+                "contact_onset": r.collision.clone(),
                 "reward_components": dict(zip(REWARD_COMPONENT_KEYS, reward_components.unbind(1)))}
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
@@ -1945,7 +1974,13 @@ class F1VecEnv:
             ids = torch.nonzero(done).flatten()
             info["final"] = {"ids": ids, "return": self.ep_return[ids].clone(), "progress": self.ep_progress[ids].clone(),
                              "steps": self.ep_step[ids].clone(), "collided": terminated[ids].clone(),
-                             "lap_time": self.ep_step[ids].float() * self.sim.control_dt}
+                             "lap_time": self.ep_step[ids].float() * self.sim.control_dt,
+                             # what the episode ran into: its soft contacts, or the one that ended it
+                             "contacts": (self.ep_contacts[ids].clone() if e.collision_mode == "soft"
+                                          else terminated[ids].to(self.ep_contacts.dtype)),
+                             # cut short on purpose (`stagger_first_episode`): not a sample of how
+                             # far an episode gets, so a trainer leaves it out of its episode stats
+                             "staggered": self.ep_limit[ids] < int(e.max_steps)}
             # final observation of the ended episodes (before auto-reset)
             info["final_obs"] = {k: v[ids].clone() for k, v in obs.items()}
             info["final_priv"] = self.privileged(r)[ids].clone()
@@ -2023,7 +2058,7 @@ class F1VecEnv:
 
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
                    ep_return, ep_progress, prev_lap, plan_ref, lap_start_step, car_hit, gap_prev, gap_valid,
-                   lead_steps, lead_paid, plan_clear):
+                   lead_steps, lead_paid, plan_clear, ep_limit):
         """Reward, histories and episode flags as pure tensor math (compiled into one CUDA graph when
         the sim runs in reduce-overhead mode: next to a training job every small kernel waits its turn)."""
         e = self.ecfg
@@ -2117,7 +2152,7 @@ class F1VecEnv:
         # can be taught what to do next. `crash` above still charges for it, and still scales with
         # the speed at impact, so a nudge and a shunt are not the same price.
         terminated = collision.clone() if e.collision_mode == "terminate" else torch.zeros_like(collision)
-        truncated = (~terminated) & ((ep_step >= e.max_steps) | (lap >= e.laps))
+        truncated = (~terminated) & ((ep_step >= ep_limit.clamp(max=e.max_steps)) | (lap >= e.laps))
         if self.M > 1:                                         # the leader's time limit ends the whole race
             truncated = truncated | (truncated & (self.slot == 0)).view(-1, self.M)[:, 0].repeat_interleave(self.M)
             truncated = truncated & ~terminated
@@ -2137,6 +2172,9 @@ class F1VecEnv:
         return (scan_hist, steer_rate, reward, reward_components, act_hist, terminated, truncated, crossed,
                 done, ep_return + reward, ep_progress + progress, flags, gap_now,
                 torch.ones_like(gap_valid), lead_steps, lead_paid)
+
+    #: `ep_limit` of a row that is not in a staggered first episode: never reached.
+    NO_LIMIT = 2 ** 62
 
     def signed_gaps(self, s: torch.Tensor, tid: torch.Tensor) -> torch.Tensor:
         """Arc to each opponent, signed and wrapped to (-L/2, L/2]: + is ahead of me, - is behind.
