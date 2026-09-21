@@ -205,3 +205,62 @@ def test_nothing_unavoidable_stands_in_front_of_a_spawn():
     assert with_runway == 0, f"{with_runway} cars still spawn into something they cannot avoid"
     assert without > 0, ("the same layouts block nobody without the runway either, so this test "
                          "is not measuring the runway")
+
+
+# ============================================================ 4. the obstacle has to cost something
+def test_creeping_into_a_crate_is_not_free():
+    """The clearance reward and the plan-clearance penalty both read the occupancy distance field,
+    and the procedural obstacles are props that were never rasterised into it. So with a crate the
+    only thing in the way, both terms were identically zero and the progress reward was the only
+    live term -- creeping toward one paid *positive* reward right up to contact.
+
+    That is not a theory about the reward. It is what the policy did: raced against a ForzaETH
+    opponent with layouts on the racing line, 42 % of its crashes were into a crate and the median
+    impact speed was 1.3 m/s, whose stopping distance is 0.2 m against 10 m of LiDAR. It saw the
+    crate, slowed almost to a stop, and drove into it anyway, because nothing said not to.
+
+    Checked as arithmetic on the two terms rather than through a rollout, because what is being
+    pinned is the sign of the sum.
+    """
+    env = _env(envs=16, procedural_obstacles=1.0, procedural_density=4.0,
+               procedural_raceline_corridor="off", spawn_runway=3.0, action_mode="plan",
+               reward_proximity=0.5, safe_dist=0.3, reward_plan_clearance=4.0, plan_margin=0.25,
+               opponent_slots=[{"kind_mix": PROP_AWARE}])
+    env.reset(seed=53)
+    grid, both = [], []
+    orig = env._widen_clearance_to_props
+    def spy(r):
+        grid.append(r.wall_dist.clone()); orig(r); both.append(r.wall_dist.clone())
+    env._widen_clearance_to_props = spy
+    for _ in range(150):
+        env.step(torch.zeros(env.B, env.act_dim))
+    g, b = torch.cat(grid), torch.cat(both)
+    tight = b < 0.3                                   # really inside safe_dist of *something*
+    assert bool(tight.any()), "no car ever came within safe_dist of anything; nothing is measured"
+    hidden = tight & (g >= 0.3)                       # ... and the grid alone called it clear
+    assert bool(hidden.any()), (
+        "no step where a prop was the only thing close: the layouts are not reaching the cars, so "
+        "this test would pass for the wrong reason")
+    # the whole point: on those steps the proximity term now has something to charge for
+    assert float(b[hidden].max()) < 0.3
+    assert float(g[hidden].min()) >= 0.3
+
+
+def test_the_plan_clearance_term_sees_a_crate_on_the_planned_path():
+    """The forward-looking half. `reward_plan_clearance` is the largest shaping weight in the
+    traffic recipe (4.0) and it is what charges for a plan drawn somewhere tight -- against the
+    grid alone it charged nothing for one drawn straight through a crate."""
+    env = _env(envs=16, procedural_obstacles=1.0, procedural_density=4.0,
+               procedural_raceline_corridor="off", spawn_runway=3.0, action_mode="plan",
+               reward_plan_clearance=4.0, plan_margin=0.25,
+               opponent_slots=[{"kind_mix": PROP_AWARE}])
+    env.reset(seed=57)
+    saw_finite = False
+    for _ in range(150):
+        env.step(torch.zeros(env.B, env.act_dim))
+        pr = env._plan_prop_clearance(env.sim.state, env.tracker.last_ref)
+        assert pr.shape == (env.B,)
+        if bool(torch.isfinite(pr).any()):
+            saw_finite = True
+            assert float(pr.min()) >= -1.0, "a clearance that far inside a prop is not a clearance"
+    assert saw_finite, "the plan never came near a prop; the term is not being exercised"

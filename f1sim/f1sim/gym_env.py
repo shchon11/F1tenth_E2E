@@ -712,6 +712,8 @@ class F1VecEnv:
         self.row_dim = 1 + 6 + 2 + self.act_dim
         self.hist = torch.zeros(self.B, (e.hist_len - 1) * e.hist_stride + 1, self.row_dim, device=self.device) if e.hist_len > 0 else None
         self._last_feat = torch.zeros(self.B, 9, device=self.device)
+        #: "no prop anywhere near the plan", as a tensor so the compiled reward takes one shape.
+        self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
         self._math = self._step_math
         if self.device.type == "cuda" and self.cfg.sim.compile_mode == "reduce-overhead":
             compiled = torch.compile(self._step_math, dynamic=False, mode="reduce-overhead")
@@ -911,6 +913,35 @@ class F1VecEnv:
             for names in self._slot_kinds]
         if self._slot_mixed:
             self._apply_slot_kinds()
+
+    def _widen_clearance_to_props(self, r) -> None:
+        """Make `wall_dist` mean what its consumers think it means: room to the nearest *thing*.
+
+        It is the occupancy distance field, and the procedural obstacles are props -- never
+        rasterised into that grid. Two consumers read it and both were being misled:
+
+        * `reward_proximity`, which pays per metre driven inside `safe_dist` of a wall, paid
+          nothing at all for driving straight at a crate;
+        * the privileged observation's clearance column, which told the policy it had room while
+          the car sat beside one.
+
+        So the only thing the policy ever learned about an obstacle was the terminal -60 at the
+        moment of contact: no gradient for coming close, none for steering early. That is the
+        sparse-terminal regime, and it produces a policy that avoids one sometimes and drives into
+        the next -- which is what both the numbers and the user's own eye said after 6.3 M steps
+        with layouts on the racing line (2026-09-21).
+
+        The collision test is deliberately NOT touched. `hit` was computed inside the physics roll
+        from the wall-only clearance and the props have their own contact SAT; folding them in here
+        would count one contact twice and turn a prop hit into a wall hit in every report.
+        """
+        if self.procedural is None:
+            return
+        pts = self.sim._footprint_corners(r.state)                     # (B, 4, 2)
+        B, K, _ = pts.shape
+        eid = torch.arange(B, device=pts.device)[:, None].expand(B, K).reshape(-1)
+        prop = self.procedural.clearance(pts.reshape(-1, 2), eid).view(B, K).min(1).values
+        r.wall_dist = torch.minimum(r.wall_dist, prop.to(r.wall_dist.dtype))
 
     def _check_prop_aware_drivers(self) -> None:
         """Refuse a layout on the racing line when somebody driving cannot see one.
@@ -1796,13 +1827,15 @@ class F1VecEnv:
         self.last_cmd = cmd
         e = self.ecfg
         self.ep_step += 1
+        self._widen_clearance_to_props(r)
         plan_ref = self.tracker.last_ref if self.tracker is not None and e.reward_plan_clearance > 0 else self._no_plan
         car_hit = (r.car_collision.float() if r.car_collision is not None
                    else torch.zeros_like(self.ep_return))
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap,
                          plan_ref, self.lap_start_step, car_hit, self.gap_prev, self.gap_valid,
-                         self.lead_steps, self.lead_paid)
+                         self.lead_steps, self.lead_paid,
+                         self._plan_prop_clearance(r.state, plan_ref))
         (self.scan_hist, steer_rate, reward, reward_components, self.act_hist, terminated, truncated,
          crossed, done, self.ep_return, self.ep_progress, flags, self.gap_prev,
          self.gap_valid, self.lead_steps, self.lead_paid) = (t.clone() for t in out)
@@ -1864,9 +1897,31 @@ class F1VecEnv:
         self._last_obs = obs
         return obs, reward, terminated, truncated, info
 
+    def _plan_prop_clearance(self, state, plan_ref):
+        """(B,) room the *planned path* has to the nearest prop, `inf` when there are none.
+
+        Computed here rather than inside `_step_math` because that function is compiled under
+        `reduce-overhead`, and a topk over the layout's slots inside an inductor trace is a graph
+        break at best. One tensor across the boundary costs a recompile and nothing else.
+
+        `reward_plan_clearance` is the forward-looking half of the obstacle signal -- it charges
+        for a plan that goes somewhere tight, which is what teaches a car to turn *before* it has
+        to. Against the occupancy grid alone it charged nothing at all for a plan drawn straight
+        through a crate.
+        """
+        if self.procedural is None or self.ecfg.reward_plan_clearance <= 0 or plan_ref.shape[1] <= 1:
+            return self._no_plan_prop
+        c, sn = torch.cos(state[:, 2])[:, None], torch.sin(state[:, 2])[:, None]
+        px = state[:, 0:1] + plan_ref[:, :, 0] * c - plan_ref[:, :, 1] * sn
+        py = state[:, 1:2] + plan_ref[:, :, 0] * sn + plan_ref[:, :, 1] * c
+        B, P = px.shape
+        eid = torch.arange(B, device=px.device)[:, None].expand(B, P).reshape(-1)
+        return self.procedural.clearance(torch.stack([px, py], -1).reshape(-1, 2),
+                                         eid).view(B, P).min(1).values
+
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
                    ep_return, ep_progress, prev_lap, plan_ref, lap_start_step, car_hit, gap_prev, gap_valid,
-                   lead_steps, lead_paid):
+                   lead_steps, lead_paid, plan_prop):
         """Reward, histories and episode flags as pure tensor math (compiled into one CUDA graph when
         the sim runs in reduce-overhead mode: next to a training job every small kernel waits its turn)."""
         e = self.ecfg
@@ -1886,6 +1941,7 @@ class F1VecEnv:
             plan_x = state[:, 0:1] + plan_ref[:, :, 0] * cosine - plan_ref[:, :, 1] * sine
             plan_y = state[:, 1:2] + plan_ref[:, :, 0] * sine + plan_ref[:, :, 1] * cosine
             clearance = self.sim.track.sample_edt(torch.stack([plan_x, plan_y], -1), tid[:, None]).min(1).values
+            clearance = torch.minimum(clearance, plan_prop.to(clearance.dtype))
             clearance = clearance - 0.5 * self.cfg.vehicle.width
             plan_penalty = (e.plan_margin - clearance).clamp(min=0.0) / e.plan_margin
         # per metre *driven*, not per metre of centerline progress: with progress the penalty vanishes
