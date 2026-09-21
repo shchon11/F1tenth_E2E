@@ -235,18 +235,27 @@ def test_a_half_filled_plan_label_is_refused_rather_than_misaligned():
 
 @pytest.mark.slow
 def test_the_plan_label_is_the_teachers_plan_for_the_same_state():
-    """P[t] must be the action that produced L[t], not the next step's."""
+    """P[t] must be the action that produced L[t], not the next step's.
+
+    The spy sits on `env.teacher_label`, where the label is actually made. It used to sit on
+    `teacher.plan_action`, which stopped being the label on 2026-09-18 (7f7e831): for a
+    `RacelineTeacher` the env now passes the line through an `InteractiveTeacher` guard that checks
+    the pace and braking against the tracker, so the stored plan's two speed knots came out lower
+    than the raw line's and this failed as "off by a step" when nothing was off by anything.
+    Only `collect`'s own call is recorded: `env.step` calls it again for the opponents."""
+    import sys as _sys
     env, teacher, _t, _c = build()
     rows = torch.nonzero(env.on_policy).flatten()
     seen = []
-    real = teacher.plan_action
+    real = env.teacher_label
 
     def spy(*a, **k):
         out = real(*a, **k)
-        seen.append(out[rows].clone().cpu().numpy())
+        if _sys._getframe(1).f_code is distill.collect.__code__:
+            seen.append(out[rows].clone().cpu().numpy())
         return out
 
-    teacher.plan_action = spy
+    env.teacher_label = spy
     buf = distill.collect(env, teacher, None, 6, 1.0, distill.DemoBuffer(range_max=10.0),
                           v_max=10.0, range_max=10.0).finalize()
     assert buf.P is not None and buf.P.shape[:2] == buf.L.shape[:2]
