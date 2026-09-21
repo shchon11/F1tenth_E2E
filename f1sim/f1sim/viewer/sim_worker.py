@@ -865,7 +865,23 @@ class SimWorker:
             prev = _rl_mod.progress_to(lambda text: self.say(P.MSG_STAGE, gen=gen,
                                                              stage="raceline", note=text))
             try:
-                rls = [Raceline.build_cached(track)]
+                if need_rl:
+                    # Something will drive on it -- a teacher opponent -- so it has to exist, and a
+                    # cold cache is worth the wait, which the progress sink above makes visible.
+                    rls = [Raceline.build_cached(track)]
+                else:
+                    # Nothing drives on it. A policy steers from its own LiDAR and never reads a
+                    # raceline, so here the line is only something to *draw*, and a drawing is not
+                    # worth twenty minutes to an hour of minimum-time optimisation. The user, on
+                    # exactly this: "다른 레이싱라인을 쓰는 정책을 쓸 때만 해야지 내 학습 정책과 일반
+                    # ros 키는데에도 왜자꾸 쳐 하는건데". Cached, it is drawn; not cached, it is not.
+                    try:
+                        rls = [Raceline.build_cached(track, cache_only=True)]
+                    except _rl_mod.RacelineCacheMiss:
+                        rls = None
+                        self.say(P.MSG_LOG, gen=gen,
+                                 text="레이싱 라인이 캐시에 없어 그리지 않습니다 — 주행에는 필요 "
+                                      "없으므로 최적화하지 않습니다 (teacher 상대차를 넣으면 그때 만듭니다).")
             finally:
                 _rl_mod.progress_to(prev)
         except Exception as exc:

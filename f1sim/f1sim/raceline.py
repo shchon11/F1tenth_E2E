@@ -478,6 +478,14 @@ def _refine_lap_time(seed: np.ndarray, track: Track, veh_width: float, margin: f
     return result if return_result else result.xy
 
 
+class RacelineCacheMiss(RuntimeError):
+    """The line asked for is not in the cache and the caller asked not to build it.
+
+    A `RuntimeError` because that is what the `F1SIM_RACELINE_CACHE_ONLY` path raised before this
+    class existed, and a caller that caught that must keep catching it.
+    """
+
+
 #: `VehicleParams` fields added *after* the raceline cache key was defined, none of which the line
 #: reads. They are kept out of the key so that adding one does not orphan every cached line.
 #:
@@ -574,8 +582,16 @@ class Raceline:
         return line
 
     @staticmethod
-    def build_cached(track: Track, cache_dir: Optional[str] = None, **kw) -> "Raceline":
-        """Raceline.build with an on-disk cache keyed by the track's occupancy + parameters."""
+    def build_cached(track: Track, cache_dir: Optional[str] = None, *, cache_only: bool = False,
+                     **kw) -> "Raceline":
+        """Raceline.build with an on-disk cache keyed by the track's occupancy + parameters.
+
+        `cache_only`: raise `RacelineCacheMiss` on a miss instead of spending twenty minutes to an
+        hour in the minimum-time solver. For a caller that only wants to *draw* the line, that is
+        the right answer -- a line nobody drives on is not worth an hour. Keyword-only and outside
+        `**kw` on purpose: `**kw` is the cache key, and a flag about how to look something up must
+        not change what is being looked up.
+        """
         import hashlib, os
         track = track.for_planning()
         cache_dir = cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "f1sim", "racelines")
@@ -599,6 +615,9 @@ class Raceline:
         path = os.path.join(cache_dir, f"{track.name}_{h}.csv")
         if os.path.exists(path):
             return Raceline.load(path)
+        if cache_only:
+            raise RacelineCacheMiss(f"raceline for {track.name!r} is not cached with "
+                                    f"{ {k: v for k, v in kw.items()} or 'the defaults'} (key {h})")
         Raceline._announce_cache_miss(track.name, cache_dir, h, kw, params)
         import time as _time
         t0 = _time.monotonic()
@@ -631,7 +650,7 @@ class Raceline:
         except OSError:
             have = []
         if os.environ.get(Raceline.CACHE_ONLY_ENV, "") not in ("", "0"):
-            raise RuntimeError(
+            raise RacelineCacheMiss(
                 f"raceline cache miss for {name!r} (key {h}) and {Raceline.CACHE_ONLY_ENV} is set. "
                 f"{len(have)} variant(s) of this track are cached, none with these parameters: "
                 f"{ {k: v for k, v in kw.items()} or 'the defaults'}. Build it once (it takes "
