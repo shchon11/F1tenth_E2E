@@ -499,6 +499,13 @@ class RacelineCacheMiss(RuntimeError):
 #: A new field goes here if and only if the raceline does not depend on it.
 _ADDED_AFTER_LINE_KEY = frozenset({"road_tilt_v"})
 
+#: `VehicleParams` fields the line does not read whose *default changed* after the key was defined,
+#: each written into the key at the value it had then. Same reason as above: `road_tilt` went
+#: 0.017 -> 0 on 2026-09-21 (the attitude comes from the dynamics alone now), and with it in the key
+#: as-is all 738 cached lines would have rebuilt for a suspension-noise knob `Raceline.build` never
+#: touches.
+_FROZEN_IN_LINE_KEY = {"road_tilt": 0.017}
+
 
 class _LineKeyVehicle:
     """Stands in for a `VehicleParams` inside the cache key, with the same `repr` it had when the
@@ -512,8 +519,8 @@ class _LineKeyVehicle:
     def __repr__(self) -> str:
         import dataclasses
         v = self._v
-        body = ", ".join(f"{fl.name}={getattr(v, fl.name)!r}" for fl in dataclasses.fields(v)
-                         if fl.name not in _ADDED_AFTER_LINE_KEY)
+        body = ", ".join(f"{fl.name}={_FROZEN_IN_LINE_KEY.get(fl.name, getattr(v, fl.name))!r}"
+                         for fl in dataclasses.fields(v) if fl.name not in _ADDED_AFTER_LINE_KEY)
         return f"{type(v).__name__}({body})"
 
     def __lt__(self, other):                  # never compared: "vehicle" is a unique key

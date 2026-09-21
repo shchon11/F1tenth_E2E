@@ -1,7 +1,8 @@
 """The sprung-mass attitude model after the 2026-09-13 calibration: roll follows `roll_per_g`,
 pitch is asymmetric (`pitch_per_g` squat under throttle, `dive_per_g` under braking), and the
 road-tilt process puts `road_tilt` rms of random roll / pitch in while driving straight -- and
-none when it is 0."""
+none when it is 0, which is the default since 2026-09-21: the body tilts only because the dynamics
+tilt it."""
 import numpy as np
 import pytest
 
@@ -57,6 +58,26 @@ def test_roll_and_pitch_gains_are_the_configured_ones(track):
     k_dive = -np.polyfit(ax[dv] / G, pitch[dv], 1)[0]
     assert k_squat == pytest.approx(0.06, rel=0.3), k_squat
     assert abs(k_dive) < 0.03, k_dive                          # near the 0.01 set, far from the 0.06 squat
+
+
+def test_at_a_constant_speed_the_body_does_not_rock(track):
+    # 2026-09-21, the user: "그냥 등속도로 앞으로 가고 있는데에도 스캔이랑 차량이 왜자꾸 출렁거려?"
+    # The attitude is the suspension's answer to what the car is doing, and a car holding 2.5 m/s
+    # with the wheel straight is doing almost nothing. With the old default (`road_tilt` 0.017, an
+    # OU process in time) this was 1.0 deg rms and 4 deg at peak -- the scan plane on the floor
+    # 1.6 m ahead; from the dynamics alone it is a few hundredths of a degree.
+    sim, _ = _sim(track, n=16)
+    cmd = torch.tensor([[0.0, 2.5]]).repeat(16, 1)
+    rows = []
+    for k in range(int(1.6 / sim.control_dt)):
+        r = sim.step(cmd)
+        if k * sim.control_dt >= 0.9:                          # up to speed
+            ok = ~sim.collided
+            rows.append(torch.rad2deg(r.attitude[ok]).numpy())
+    att = np.concatenate(rows)
+    assert len(att) > 50, "the cars must still be driving to be measured"
+    assert np.abs(att).max() < 0.5, np.abs(att).max(0)
+    assert att.std(0).max() < 0.15, att.std(0)
 
 
 def test_road_tilt_adds_its_rms_on_top_of_the_cornering_roll(track):

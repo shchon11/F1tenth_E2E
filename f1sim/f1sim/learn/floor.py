@@ -631,7 +631,9 @@ G_ACC = 9.81
 
 #: [rad] rms of `vehicle.road_tilt`, the floor-and-tyre wobble the suspension setpoint carries on
 #: top of the cornering and braking terms. It is **not a function of the ego state**, so it is the
-#: floor of any estimator built from the ego state -- including a perfect one.
+#: floor of any estimator built from the ego state -- including a perfect one. The simulator's
+#: default has been 0 since 2026-09-21 (the attitude comes from the dynamics alone); 0.017 is what
+#: the real car was measured at, and is what this module's error budget was written against.
 ROAD_TILT_RMS = 0.017
 
 

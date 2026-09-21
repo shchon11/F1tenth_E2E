@@ -130,10 +130,18 @@ class VehicleParams:
     dive_per_g: float = 0.008  # [rad/g] brake DIVE (ax < 0), ~0.5 deg/g: the recordings show almost none
                                # (0-0.7 deg/g) at the -0.45 g the regen limit allows. The earlier LiDAR
                                # floor-strike bracket (5.5-11.8 deg/g) was confounded, as it said.
-    road_tilt: float = 0.017   # [rad] rms random roll / pitch driving straight at steady speed (0.8-1.2 /
-                               # 0.6-1.8 deg measured, 0.15-3 Hz): a stationary OU process fed into the
-                               # suspension, so the LiDAR plane wobbles as much as the real one without
-                               # cornering. 0 = flat floor (the model before 2026-09-13).
+    # [rad] rms of a random roll / pitch added to the suspension's set point -- OFF. It was 0.017
+    # (2026-09-13, from the gyro: 0.8-1.2 deg roll / 0.6-1.8 deg pitch rms driving straight at steady
+    # speed, docs/real_data_calibration.md SS6.1a), an Ornstein-Uhlenbeck process in *time*. Nothing
+    # in the car produced it, so a car at a constant 3 m/s on a flat floor pitched 1.10 deg rms and
+    # 4.09 deg at peak -- the 0.110 m scan plane on the floor 1.6 m ahead -- against 0.018 / 0.11
+    # deg from the dynamics alone. The user, 2026-09-21: "동역학에 기반에서 센서 시뮬레이션이 되어야
+    # 한다니까? ... 그냥 등속도로 앞으로 가고 있는데에도 스캔이랑 차량이 왜자꾸 출렁거려?" The body
+    # now tilts only because the dynamics (a_x, a_y, a contact) tilt it through the springs, and the
+    # IMU reads that. A floor that does tilt the car belongs under the wheels as a fixed height map --
+    # the same bump in the same place every lap -- not as noise in time; that is not modelled.
+    # Left as a knob (the process below is skipped at 0) only so the old behaviour can be reproduced.
+    road_tilt: float = 0.0
     # [m/s] the speed at which that wobble reaches `road_tilt`; below it the excitation ramps down
     # linearly to nothing at a standstill. `road_tilt` was measured *driving*, and a floor does not
     # move under a parked car -- but the OU process ran at full amplitude regardless, so a car
@@ -484,7 +492,7 @@ class RandomizationConfig:
         "vehicle.roll_per_g": (0.6, 1.6),       # 1.0-2.75 deg/g around the measured 1.7
         "vehicle.pitch_per_g": (0.6, 1.4),      # 1.0-2.4 deg/g squat; 2x draws sat 2-4x above the recordings
         "vehicle.dive_per_g": (0.5, 2.0),       # 0.2-0.9 deg/g dive: measured ~0, kept open upward
-        "vehicle.road_tilt": (0.5, 1.5),        # 0.5-1.5 deg rms floor wobble
+        "vehicle.road_tilt": (0.5, 1.5),        # scales the nominal, which is 0: no floor wobble
         "vehicle.susp_wn": (0.75, 1.3),
         "vehicle.susp_zeta": (0.25, 0.55),
         "lidar.mount_yaw": (-0.015, 0.015),

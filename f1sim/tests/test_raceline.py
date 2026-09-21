@@ -75,3 +75,15 @@ def test_default_raceline_cache_key_predates_the_objective(tmp_path):
     Raceline.build_cached(t, cache_dir=str(tmp_path))
     Raceline.build_cached(t, cache_dir=str(tmp_path), objective="min_curvature")
     assert os.listdir(tmp_path) == [f"{t.name}_{h}.csv"]
+
+
+def test_suspension_noise_knobs_do_not_move_the_cache_key():
+    # `road_tilt_v` was added after the key was defined and `road_tilt`'s default went 0.017 -> 0 on
+    # 2026-09-21. The line reads neither; either one reaching the key would rebuild all 738 cached
+    # lines -- twenty to seventy minutes apiece -- on the next console session or training start.
+    from f1sim.params import VehicleParams
+    from f1sim.raceline import _LineKeyVehicle
+    key = repr(_LineKeyVehicle(VehicleParams()))
+    assert "road_tilt=0.017" in key and "road_tilt_v" not in key
+    assert key == repr(_LineKeyVehicle(VehicleParams(road_tilt=0.017)))
+    assert key == repr(_LineKeyVehicle(VehicleParams(road_tilt=0.0, road_tilt_v=5.0)))

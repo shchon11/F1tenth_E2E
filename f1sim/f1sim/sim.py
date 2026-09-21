@@ -652,7 +652,10 @@ class Simulator:
         wn, zeta = P["susp_wn"], P["susp_zeta"]
         # floor / tyre tilt: a stationary Ornstein-Uhlenbeck target (rms road_tilt, correlation
         # road_tau) added to the suspension's set point. Exact discretisation, so the rms is
-        # road_tilt whatever the substep.
+        # road_tilt whatever the substep. OFF by default -- it is noise in time, not dynamics, and
+        # it was what rocked the car and its scan plane at a constant speed; see
+        # `VehicleParams.road_tilt`. At 0 it is not run at all rather than run times zero.
+        tilt_on = float(self.cfg.vehicle.road_tilt) > 0.0
         ou_a = (self.dt / P["road_tau"]).clamp(0.0, 1.0)
         ou_k = 1.0 - ou_a
         ou_s = P["road_tilt"] * torch.sqrt(1.0 - ou_k * ou_k)
@@ -699,9 +702,10 @@ class Simulator:
             # and at a standstill the excitation is gone. The OU state is not reset -- it decays
             # through `ou_k` with the road's own time constant, which is the suspension settling
             # rather than the body snapping level. See `VehicleParams.road_tilt_v`.
-            excite = (state[:, dyn.IVX].abs() / P["road_tilt_v"].clamp_min(1e-6)).clamp(0.0, 1.0)
-            w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s * excite
-            w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s * excite
+            if tilt_on:
+                excite = (state[:, dyn.IVX].abs() / P["road_tilt_v"].clamp_min(1e-6)).clamp(0.0, 1.0)
+                w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s * excite
+                w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s * excite
             roll_ss = P["roll_per_g"] * a_y / dyn.G + w_roll
             # asymmetric: the car squats under throttle far more than it dives under (regen-limited) braking
             pitch_ss = -torch.where(a_x > 0, P["pitch_per_g"], P["dive_per_g"]) * a_x / dyn.G + w_pitch
