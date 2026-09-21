@@ -751,6 +751,8 @@ class F1VecEnv:
         self._last_feat = torch.zeros(self.B, 9, device=self.device)
         #: "no prop anywhere near the plan", as a tensor so the compiled reward takes one shape.
         self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
+        #: Whether each car was in contact last step, so a soft collision is charged on its onset.
+        self._was_touching = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self._math = self._step_math
         if self.device.type == "cuda" and self.cfg.sim.compile_mode == "reduce-overhead":
             compiled = torch.compile(self._step_math, dynamic=False, mode="reduce-overhead")
@@ -1573,6 +1575,7 @@ class F1VecEnv:
             # A pool checkpoint may carry memory: a hidden state kept across a respawn is a policy
             # remembering a track its car is no longer on.
             self.pool.reset(ids)
+        self._was_touching[ids] = False                             # a fresh car is touching nothing
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
@@ -1864,6 +1867,14 @@ class F1VecEnv:
         self.last_cmd = cmd
         e = self.ecfg
         self.ep_step += 1
+        if e.collision_mode == "soft":
+            # Charge the crash once, when it starts. `collided` is now per step rather than
+            # latched, but a car scraping a hose is in contact for the measured 40 ms -- sixteen
+            # steps of it at 40 Hz -- and a penalty designed as a one-off ending would be paid
+            # sixteen times. The rising edge is the impact; the rest is the same impact.
+            edge = r.collision & ~self._was_touching
+            self._was_touching = r.collision.clone()
+            r.collision = edge
         self._widen_clearance_to_props(r)
         if self.procedural is not None and e.movable_obstacles:
             # Whatever the contacts shoved this step now slides, and the floor takes it back down.

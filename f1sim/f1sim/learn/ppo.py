@@ -662,6 +662,11 @@ def main():
                          "off and go again, and above all not end up driving the wrong way "
                          "(--wrong-way-penalty). Not comparable with a 'terminate' run's "
                          "collisions per km without saying so")
+    ap.add_argument("--movable-obstacles", action="store_true",
+                    help="a struck obstacle is shoved instead of being a wall with a crate's "
+                         "shape: each carries the mass of what it is (cardboard box 1.2 kg, "
+                         "wooden crate 10, steel drum 18, against a 3.74 kg car) and a contact "
+                         "exchanges momentum both ways. Needs --collision-mode soft")
     ap.add_argument("--spawn-runway", type=float, default=0.0, metavar="M",
                     help="[m] of clear road every spawning car is guaranteed ahead of it, prop or "
                          "wall. 0 = off. A car is placed at up to the spawn speed and cannot stop "
@@ -828,6 +833,7 @@ def main():
                                                               procedural_raceline_corridor=a.procedural_raceline_corridor,
                                                               spawn_runway=a.spawn_runway,
                                                               collision_mode=a.collision_mode,
+                                                              movable_obstacles=a.movable_obstacles,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,

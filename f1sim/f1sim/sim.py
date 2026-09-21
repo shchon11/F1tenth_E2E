@@ -568,7 +568,12 @@ class Simulator:
             # substeps, because a box can be entered and pushed back out inside one control step.
             hit = hit | self.prop_touched | (self._prop_contact(state)[0] > 0)
         self.prop_touched.zero_()          # in place: `warmup` restores by copy_ into this tensor
-        self.collided = self.collided | hit
+        # Latched while a collision ends the episode -- the car is frozen and the flag has to
+        # survive to the reset that reads it. Under soft contact it must NOT latch: the episode
+        # carries on, and a flag that stays true is a car charged the collision penalty on every
+        # remaining step. Measured before this line was conditional: reward per step ran
+        # -0.95, -3.0, -8.1, -12.6 over four updates and kept going.
+        self.collided = (self.collided | hit) if self.cfg.sim.terminate_on_collision else hit
         self.odom.state = odom_state; self.s = s; self.lap = lap
         odom = odom_state
 

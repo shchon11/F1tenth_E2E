@@ -3223,6 +3223,25 @@
           "metavar": null
         },
         {
+          "flag": "--movable-obstacles",
+          "flags": [
+            "--movable-obstacles"
+          ],
+          "dest": "movable_obstacles",
+          "label": "장애물이 밀림 (질량 있음)",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "a struck obstacle is shoved instead of being a wall with a crate's shape: each carries the mass of what it is (cardboard box 1.2 kg, wooden crate 10, steel drum 18, against a 3.74 kg car) and a contact exchanges momentum both ways. Needs --collision-mode soft",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
           "flag": "--spawn-runway",
           "flags": [
             "--spawn-runway"
