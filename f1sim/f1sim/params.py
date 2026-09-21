@@ -275,6 +275,11 @@ class ImuParams:
     the sensor's internal low-pass, sampling at `rate`, bias + random walk, white noise,
     quantization, and the VESC's own attitude estimate (complementary/Mahony-style filter)."""
     enabled: bool = True
+    # [m/s^2] full scale of the accelerometer. A BMI160-class part is configured to +-16 g and
+    # clips there; the 22 recordings peak at 12.6 g, on the hardest impact in them (8.14 m/s to a
+    # standstill in 20 ms), so 16 g is above everything the car has actually produced and below
+    # what an unclamped contact would emit -- a 3 m/s change inside one 2.5 ms substep is 122 g.
+    accel_range: float = 16.0 * 9.80665
     # Measured on the car: median inter-sample dt over all 22 recordings is 50.00 Hz (per-bag spread
     # 49.91-50.10), not the 100 Hz vesc_tool default this used to assume.
     #

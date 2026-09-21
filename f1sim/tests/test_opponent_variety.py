@@ -318,3 +318,66 @@ def test_a_soft_collision_is_still_charged_for():
         comp = info.get("reward_components") or {}
         charged += float(comp["collision"].sum()) + float(comp["collision_speed"].sum())
     assert charged < 0.0, "a soft contact cost nothing at all"
+
+
+# ============================================================ 6. obstacles that move
+def test_a_shove_obeys_the_mass_it_was_given():
+    """v = J/m, and the floor takes it back at `PROP_GROUND_DECEL`.
+
+    Unit-tested on the two methods rather than through a rollout, because what is being pinned is
+    arithmetic: a 1.2 kg box and an 18 kg drum given the same impulse must end up 15 times apart,
+    which is the whole reason a mass was introduced at all.
+    """
+    from f1sim.procedural_obstacles import PROP_GROUND_DECEL, ProceduralObstacles as PO
+    p = PO.__new__(PO)
+    p.device = torch.device("cpu")
+    p.p_mass = torch.tensor([[1.2, 18.0, 0.0, 10.0]])
+    p.p_vel = torch.zeros(1, 4, 2)
+    p.p_poses = torch.zeros(1, 4, 3)
+    p.p_zlo = torch.zeros(1, 4)
+    p.p_zhi = torch.tensor([[1.0, 1.0, 1.0, -1.0]])          # slot 3 is dead
+    eid = torch.zeros(4, dtype=torch.long)
+    slot = torch.arange(4)
+    J = torch.tensor([[1.0, 0.0]] * 4)
+    p.shove(eid, slot, J)
+    v = p.p_vel[0, :, 0]
+    assert float(v[0]) == pytest.approx(1.0 / 1.2, rel=1e-5)
+    assert float(v[1]) == pytest.approx(1.0 / 18.0, rel=1e-5)
+    assert float(v[2]) == 0.0, "a massless slot is immovable, which is what every prop used to be"
+    assert float(v[3]) == 0.0, "a dead slot was shoved"
+
+    before = p.p_poses[0, 0, 0].clone()
+    p.advance(0.025)
+    assert float(p.p_poses[0, 0, 0] - before) > 0.0, "a shoved prop did not move"
+    assert float(p.p_vel[0, 0, 0]) == pytest.approx(1.0 / 1.2 - PROP_GROUND_DECEL * 0.025, rel=1e-4)
+    for _ in range(200):
+        p.advance(0.025)
+    assert float(p.p_vel[0, 0].norm()) == 0.0, "the floor never stopped it"
+
+
+def test_movable_obstacles_move_and_immovable_ones_do_not():
+    """The wiring, end to end: same seed, same layouts, same actions, one switch."""
+    def run(movable, steps=150):
+        env = _env(envs=16, procedural_obstacles=1.0, procedural_density=3.0,
+                   procedural_max_props=10, procedural_raceline_corridor="off",
+                   spawn_runway=3.0, action_mode="plan", max_steps=1600,
+                   collision_mode="soft", movable_obstacles=movable,
+                   opponent_slots=[{"kind_mix": PROP_AWARE}])
+        env.reset(seed=3)
+        p0 = env.procedural.p_poses[:, :, :2].clone()
+        for _ in range(steps):
+            env.step(torch.zeros(env.B, env.act_dim))
+        live = env.procedural.p_zhi > env.procedural.p_zlo
+        d = (env.procedural.p_poses[:, :, :2] - p0).norm(dim=2)
+        return int(((d > 0.01) & live).sum())
+
+    assert run(False) == 0, "an obstacle moved with movable_obstacles off"
+    assert run(True) > 0, "nothing ever got shoved, so the switch is not reaching the contact"
+
+
+def test_movable_obstacles_need_a_collision_you_survive():
+    """Under `terminate` the episode ends at the touch, so a crate that was shoved aside is a crate
+    nothing ever saw move. Refused rather than silently doing nothing."""
+    with pytest.raises(ValueError, match="collision_mode='soft'"):
+        _env(envs=8, procedural_obstacles=1.0, movable_obstacles=True,
+             collision_mode="terminate", opponent_slots=[{"kind": "forzaeth"}])

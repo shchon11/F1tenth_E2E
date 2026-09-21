@@ -122,6 +122,8 @@ class Simulator:
         #: [m] of clear road a spawning car is guaranteed ahead of it; 0 is off and is every run
         #: before `_spawn_runway_blocked` existed. `F1VecEnv` sets it from `EnvConfig.spawn_runway`.
         self.spawn_runway = 0.0
+        #: Whether a struck prop is shoved or is a wall with a crate's shape. `F1VecEnv` sets it.
+        self.movable_obstacles = False
         self.state = torch.zeros(num_envs, dyn.STATE_DIM, device=self.device)
         self.ax = torch.zeros(num_envs, device=self.device)
         self.ay = torch.zeros(num_envs, device=self.device)
@@ -664,16 +666,21 @@ class Simulator:
             pitch_rate = pitch_rate + pitch_acc * self.dt
             roll = (roll + roll_rate * self.dt).clamp(-0.35, 0.35)
             pitch = (pitch + pitch_rate * self.dt).clamp(-0.35, 0.35)
+            # Before the IMU, and that ordering is the whole point: the contact changes the
+            # velocity outside the dynamics, so an accelerometer fed `ax`/`ay` alone is deaf to it.
+            # The yaw rate damping lands before `yaw_acc` is taken for the same reason.
+            a_contact = None
+            if soft_wall:
+                state, a_contact = self._resolve_wall_contact(state, dt=self.dt)
             if imu_on:
                 yaw_acc = (state[:, dyn.IR] - r_old) / self.dt
-                imu_state = imu_model.substep(imu_state, ax, ay, state[:, dyn.IVX], roll, pitch, roll_rate, pitch_rate,
+                a_x, a_y = (ax, ay) if a_contact is None else (ax + a_contact[:, 0], ay + a_contact[:, 1])
+                imu_state = imu_model.substep(imu_state, a_x, a_y, state[:, dyn.IVX], roll, pitch, roll_rate, pitch_rate,
                                               state[:, dyn.IR], roll_acc, pitch_acc, yaw_acc, r_vec, P, self.dt,
                                               shock=wheel_on)
                 if k in self.imu_idx:
                     smp, imu_state = imu_model.sample(imu_state, P, self.imu_ts)
                     samples.append(smp)
-            if soft_wall:
-                state = self._resolve_wall_contact(state)
         imu_samples = torch.stack(samples, 1) if samples else torch.zeros(state.shape[0], 0, 6, device=state.device)
         # `/sensors/core` `current_motor`, the guard's third (optional) input. The VESC commands a
         # current, and the torque it produces is that current times a constant: this inverts the
@@ -696,7 +703,7 @@ class Simulator:
         # sample_edt is distance to wall cell center; subtract half a cell for the surface
         return d.min(1).values - 0.5 * self.track.t_res[self.tid]
 
-    def _prop_contact(self, state: torch.Tensor, fn=None):
+    def _prop_contact(self, state: torch.Tensor, fn=None, want_slot: bool = False):
         """Penetration depth and outward normal against the placed props: (pen (B,), n (B,2)).
 
         Deliberately not routed through `_footprint_clearance`. That test samples the EDT at the
@@ -720,26 +727,50 @@ class Simulator:
         # order, no host data.
         fl, fr, rl, rr = self._footprint_corners(state).unbind(1)
         corners = torch.stack((fl, fr, rr, rl), 1)
+        if want_slot:
+            *cols, slot_of = tr.props_near(self.tid, state[:, :2], self.eid, self.prop_reach,
+                                           return_slot=True)
+            poses, pn, pd, z_lo, z_hi = cols
+            depth, normal, col = (fn or self._prism)(corners, poses, pn, pd, z_lo, z_hi,
+                                                     self.car_dims[:, 2])
+            rows = torch.arange(col.shape[0], device=col.device)
+            slot = torch.where(col >= 0, slot_of[rows, col.clamp_min(0)],
+                               torch.full_like(col, -1))
+            return depth.clamp_min(0.0), normal, slot
         # Body height, not CoG height: `vehicle.h` is where the mass sits (0.074 m) and doubling it
         # is not a silhouette. `car_dims[:, 2]` is the height the LiDAR already uses for this car.
         depth, normal, _ = (fn or self._prism)(corners, poses, pn, pd, z_lo, z_hi, self.car_dims[:, 2])
         return depth.clamp_min(0.0), normal
 
-    def _resolve_wall_contact(self, state: torch.Tensor) -> torch.Tensor:
-        """Soft wall: push CoG out along EDT gradient and kill the into-wall velocity component."""
+    def _resolve_wall_contact(self, state: torch.Tensor, dt: Optional[float] = None):
+        """Soft wall: push CoG out along EDT gradient and kill the into-wall velocity component.
+
+        With `dt` it also returns the body-frame acceleration the contact imposed, (B, 2), so the
+        IMU can be told about it. It has to be told: the contact changes the velocity *outside* the
+        dynamics, and `ax`/`ay` come from the tyre and actuator forces, so an impact that takes the
+        car from 8 m/s to a standstill used to be reported by the accelerometer as **nothing at
+        all**. The 22 recordings say otherwise -- 62 events above 2.5 g across them, peaking at
+        12.6 g on a hit that went 8.14 m/s to 0.00 in 20 ms -- and on a real car the impact is the
+        largest thing the accelerometer ever sees. A policy that is meant to learn what to do after
+        a touch has to be able to tell that one happened.
+        """
         clr = self._footprint_clearance(state)
         pen = (-clr).clamp_min(0.0)
         touching = pen > 0
         n = self.track.edt_gradient(state[:, :2], self.tid)            # away from wall (world)
+        prop_slot = None                   # set below when the props can be pushed
         if getattr(self.track, "has_props", False):
             # Whichever of wall or prop is deeper owns this step's normal. Blending two normals
             # would push the car somewhere neither contact asks for.
-            pen_p, n_p = self._prop_contact(state, fn=prop_contacts)   # already inside _roll_physics
+            movable = self.movable_obstacles and getattr(self.track, "env_props", None) is not None
+            got = self._prop_contact(state, fn=prop_contacts, want_slot=movable)
+            pen_p, n_p = got[0], got[1]
             self.prop_touched = self.prop_touched | (pen_p > 0)   # substeps, read once per step
             prop_deeper = pen_p > pen
             pen = torch.where(prop_deeper, pen_p, pen)
             n = torch.where(prop_deeper[:, None], n_p.to(n.dtype), n)
             touching = pen > 0
+            prop_slot = got[2] if movable else None
         yaw = state[:, dyn.IYAW]
         c, s = torch.cos(yaw), torch.sin(yaw)
         vwx = state[:, dyn.IVX] * c - state[:, dyn.IVY] * s
@@ -748,16 +779,45 @@ class Simulator:
         into = (vn < 0) & touching
         k = self.cfg.sim.collision_restitution
         f = self.cfg.sim.wall_friction
-        vwx2 = vwx - (1 + k) * vn * n[:, 0]
-        vwy2 = vwy - (1 + k) * vn * n[:, 1]
+        # How much of the impulse the car keeps. Against a wall, all of it: the old expression is
+        # the m_prop -> infinity limit of this one. Against a 10 kg crate with a 3.74 kg car, the
+        # car keeps m_p/(m_c+m_p) = 0.73 of the bounce and the crate takes the rest and slides.
+        share = torch.ones_like(vn)
+        if prop_slot is not None:
+            m_c = float(self.cfg.vehicle.m)
+            rows = torch.arange(state.shape[0], device=state.device)
+            m_p = torch.where(prop_slot >= 0,
+                              self.track.env_props.p_mass[self.eid, prop_slot.clamp_min(0)],
+                              torch.zeros_like(vn))
+            movable_now = into & prop_deeper & (m_p > 0)
+            share = torch.where(movable_now, m_p / (m_c + m_p), share)
+            # Newton's third law, as an impulse on the prop: J = -(1+k) * mu_red * vn along n, and
+            # the prop takes -J. `vn` is negative while driving in, so the crate goes away from us.
+            mu_red = (m_c * m_p) / (m_c + m_p).clamp_min(1e-6)
+            J = (1 + k) * (-vn) * mu_red                               # >= 0 while driving in
+            imp = torch.where(movable_now[:, None], -J[:, None] * n, torch.zeros_like(n))
+            self.track.env_props.shove(self.eid, prop_slot.clamp_min(0), imp)
+        vwx2 = vwx - (1 + k) * share * vn * n[:, 0]
+        vwy2 = vwy - (1 + k) * share * vn * n[:, 1]
         vwx2, vwy2 = vwx2 * (1 - f * 0.05), vwy2 * (1 - f * 0.05)
         vwx = torch.where(into, vwx2, vwx); vwy = torch.where(into, vwy2, vwy)
         st = state.clone()
         st[:, dyn.IVX] = vwx * c + vwy * s
         st[:, dyn.IVY] = -vwx * s + vwy * c
-        st[:, :2] = st[:, :2] + n * (pen * touching.float())[:, None]
+        # The overlap is shared the same way: a crate gets out of the way as much as the car does.
+        st[:, :2] = st[:, :2] + n * (pen * touching.float() * share)[:, None]
         st[:, dyn.IR] = torch.where(touching, st[:, dyn.IR] * 0.9, st[:, dyn.IR])
-        return st
+        if dt is None:
+            return st
+        a_c = torch.stack([(st[:, dyn.IVX] - state[:, dyn.IVX]) / dt,
+                           (st[:, dyn.IVY] - state[:, dyn.IVY]) / dt], 1)
+        # Saturate like the part does. A 3 m/s change inside one 2.5 ms substep is 122 g, and the
+        # MPU-class accelerometers these cars carry are configured to +-16 g -- the recordings peak
+        # at 12.6, comfortably inside that. Without the clamp the policy would be handed a number
+        # no real sensor can produce and would be right to have learned nothing from it.
+        lim = self.cfg.imu.accel_range
+        mag = a_c.norm(dim=1, keepdim=True).clamp_min(1e-9)
+        return st, a_c * (mag.clamp(max=lim) / mag)
 
     # ------------------------------------------------------------------ introspection
     def scan_meta(self) -> Dict[str, float]:

@@ -175,6 +175,28 @@ class Shape:
     z1: float
     across: float             # across-lane extent, inflated by YAW_JITTER
     along: float              # along-lane extent of the nominal footprint
+    mass: float = 0.0         # [kg]; 0 = immovable, which is what every prop was before this
+
+
+#: [kg] what each catalogue style weighs. OURS, not measured: the user's brief was "장애물은 질량이
+#: 10kg정도 되는 강체는 아니지만 준하는 정도", so the working set is around that with the light and
+#: the heavy ends spread either side of it. The car is 3.74 kg, so a wooden crate at 10 kg takes
+#: about a quarter of the impulse and a cardboard box takes most of it -- which is the point: the
+#: policy should learn that some things can be brushed aside and some things stop you.
+#:
+#: A style with no entry is immovable, which is also what every prop was before this existed.
+STYLE_MASS = {
+    "cardboard_box": 1.2,
+    "wooden_crate": 10.0,
+    "steel_drum": 18.0,
+    "barrier_block": 12.0,
+    "crate_stack_low": 9.0,
+    "marker_post": 1.5,
+}
+
+#: Deceleration of a shoved prop on the floor [m/s^2]: mu * g with mu ~ 0.5, so a crate given
+#: 1 m/s travels about 0.10 m. A shove is a shove, not a bowling ball.
+PROP_GROUND_DECEL = 4.9
 
 
 def build_catalogue(k_pad: int) -> Tuple[List[Shape], List[int], List[int]]:
@@ -192,7 +214,8 @@ def build_catalogue(k_pad: int) -> Tuple[List[Shape], List[int], List[int]]:
             y_span = float(fp[:, 1].max() - fp[:, 1].min())
             sink.append(len(shapes))
             shapes.append(Shape(style, tuple(sorted(dims.items())), n, d, 0.0, float(env.height),
-                                x_span + y_span * math.sin(YAW_JITTER), y_span))
+                                x_span + y_span * math.sin(YAW_JITTER), y_span,
+                                float(STYLE_MASS.get(style, 0.0))))
     row_ids.sort(key=lambda i: shapes[i].across)
     return shapes, row_ids, small_ids
 
@@ -298,6 +321,7 @@ class ProceduralObstacles:
         self.sh_d = torch.tensor(np.stack([s.d for s in shapes]), dtype=torch.float32, device=dev)
         self.sh_z0 = torch.tensor([s.z0 for s in shapes], dtype=torch.float32, device=dev)
         self.sh_z1 = torch.tensor([s.z1 for s in shapes], dtype=torch.float32, device=dev)
+        self.sh_mass = torch.tensor([s.mass for s in shapes], dtype=torch.float32, device=dev)
         self.row_id = torch.tensor(row_ids, dtype=torch.long, device=dev)
         self.row_across = torch.tensor([shapes[i].across for i in row_ids], dtype=torch.float32, device=dev)
         self.small_id = torch.tensor(small_ids, dtype=torch.long, device=dev)
@@ -325,6 +349,10 @@ class ProceduralObstacles:
         self.p_d = torch.full((self.B, self.C, k_pad), float("inf"), device=dev, dtype=torch.float32)
         self.p_zlo = z(self.B, self.C)
         self.p_zhi = z(self.B, self.C)                                # z_hi <= z_lo: a dead slot
+        #: [kg] per slot, and the velocity a shove left it with [m/s]. Zero mass is immovable, and
+        #: a layout whose env never enables movable obstacles simply never has these touched.
+        self.p_mass = z(self.B, self.C)
+        self.p_vel = torch.zeros(self.B, self.C, 2, device=self.device)
         #: What the last draw decided, per env: where each pattern sits on the lap [m of arc], which
         #: of `PATTERNS` it is, and whether that slot is a pattern at all. Two (B, P) tensors and a
         #: mask, written by the same `index_copy_` as the slots. Kept because the properties worth
@@ -750,6 +778,41 @@ class ProceduralObstacles:
         self.p_d.index_copy_(0, dst, d[src])
         self.p_zlo.index_copy_(0, dst, z0[src])
         self.p_zhi.index_copy_(0, dst, z1[src])
+        # A fresh layout is a fresh set of objects standing still, whatever the last one was
+        # shoved to -- otherwise a crate would inherit the momentum of the race before it.
+        self.p_mass.index_copy_(0, dst, torch.where(keep, self.sh_mass[sid_k],
+                                                    torch.zeros_like(self.sh_mass[sid_k]))[src])
+        self.p_vel.index_copy_(0, dst, torch.zeros_like(self.p_vel[:D])[src])
+
+    # ------------------------------------------------------------------ being pushed
+    def shove(self, eid: torch.Tensor, slot: torch.Tensor, impulse: torch.Tensor) -> None:
+        """Add a linear impulse [kg m/s] to one prop per row, along the world vector given.
+
+        Rotation is deliberately not modelled. A crate struck off centre really does spin, and
+        adding that means an inertia per shape, a contact point rather than a normal, and a yaw
+        state per slot -- for an effect the policy reads through a LiDAR at 0.25 degrees. What it
+        has to learn is "that one moves and that one does not", and translation carries it.
+        """
+        m = self.p_mass[eid, slot].clamp_min(1e-6)
+        live = (self.p_mass[eid, slot] > 0) & (self.p_zhi[eid, slot] > self.p_zlo[eid, slot])
+        dv = torch.where(live[:, None], impulse / m[:, None], torch.zeros_like(impulse))
+        self.p_vel[eid, slot] = self.p_vel[eid, slot] + dv
+
+    def advance(self, dt: float) -> None:
+        """Slide whatever was shoved, and let the floor stop it.
+
+        `p_poses` is where a prop *is*; its half-planes are prop-local and transformed at query
+        time, so moving one is this and nothing else -- no re-rasterising, no distance field. That
+        is the whole reason a movable obstacle is affordable here and a deformable duct is not.
+        """
+        v = self.p_vel
+        sp = v.norm(dim=2, keepdim=True)
+        if float(sp.max()) <= 0.0:
+            return
+        drop = (PROP_GROUND_DECEL * dt)
+        keep = ((sp - drop) / sp.clamp_min(1e-9)).clamp_min(0.0)
+        self.p_vel = v * keep
+        self.p_poses[:, :, :2] = self.p_poses[:, :, :2] + self.p_vel * dt
 
     # ------------------------------------------------------------------ readers
     def slots(self, eid: Optional[torch.Tensor] = None):
@@ -758,7 +821,7 @@ class ProceduralObstacles:
         return (self.p_poses[eid], self.p_n[eid], self.p_d[eid], self.p_zlo[eid], self.p_zhi[eid])
 
     def near(self, xy: torch.Tensor, eid: Optional[torch.Tensor] = None, k: int = CONTACT_SLOTS,
-             reach: float = 0.0):
+             reach: float = 0.0, return_idx: bool = False):
         """The `k` layout slots nearest each point of `xy` (n, 2), as the same five tensors.
 
         For the *contact* tests -- the car's own footprint, and the spawn rejection -- and not for
@@ -770,7 +833,12 @@ class ProceduralObstacles:
         """
         poses, n, d, zlo, zhi = self.slots(eid)
         if poses.shape[1] <= k:
-            return poses, n, d, zlo, zhi
+            if not return_idx:
+                return poses, n, d, zlo, zhi
+            # No cull: column j *is* slot j, and a caller that has to name the prop it touched
+            # needs that said rather than assumed.
+            straight = torch.arange(poses.shape[1], device=poses.device)
+            return poses, n, d, zlo, zhi, straight[None].expand(xy.shape[0], -1)
         dead = zhi <= zlo
         d2 = (poses[..., :2] - xy[:, None, :]).pow(2).sum(-1)
         d2 = torch.where(dead, torch.full_like(d2, float("inf")), d2)
@@ -782,7 +850,8 @@ class ProceduralObstacles:
             r2 = reach * reach
             self._stat[3] += ((d2 <= r2).sum() - (near_d2 <= r2).sum()).to(torch.float64)
         g = lambda a: torch.gather(a, 1, idx.reshape(idx.shape + (1,) * (a.dim() - 2)).expand(-1, -1, *a.shape[2:]))
-        return g(poses), g(n), g(d), g(zlo), g(zhi)
+        out = (g(poses), g(n), g(d), g(zlo), g(zhi))
+        return out + (idx,) if return_idx else out
 
     def clearance(self, xy: torch.Tensor, eid: Optional[torch.Tensor] = None,
                   k: int = CONTACT_SLOTS) -> torch.Tensor:

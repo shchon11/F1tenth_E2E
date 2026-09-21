@@ -175,6 +175,15 @@ class EnvConfig:
     # It is an option and not the default on purpose: it changes what "collisions per km" counts,
     # so a run under it is not comparable with one under "terminate" without saying so.
     collision_mode: str = "terminate"
+    # Whether a struck obstacle is shoved or is a wall with a crate's shape. Off is every run
+    # before this existed. On, each prop carries the mass of what it is
+    # (`procedural_obstacles.STYLE_MASS`: a cardboard box 1.2 kg, a wooden crate 10, a steel drum
+    # 18, against a 3.74 kg car) and a contact exchanges momentum both ways -- the car keeps
+    # m_p/(m_c+m_p) of the bounce and the prop slides off with the rest until the floor stops it.
+    #
+    # Needs `collision_mode = "soft"` to mean anything: under "terminate" the episode ends at the
+    # touch and nothing after it is ever seen.
+    movable_obstacles: bool = False
     reward_plan_clearance: float = 0.0
     plan_margin: float = 0.15
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
@@ -541,6 +550,10 @@ class F1VecEnv:
         # `SimParams.collision_restitution` / `wall_friction`, both of which document themselves as
         # "when not terminating" -- dead code that nothing could reach.
         self.cfg.sim.terminate_on_collision = self.ecfg.collision_mode == "terminate"
+        if self.ecfg.movable_obstacles and self.ecfg.collision_mode != "soft":
+            raise ValueError(
+                "movable_obstacles needs collision_mode='soft': under 'terminate' the episode ends "
+                "at the touch, so a crate that was shoved aside is a crate nothing ever saw move.")
         self.sim = Simulator(track, self.cfg, num_envs, device, race_size=self.ecfg.race_size)
         self.B, self.device = num_envs, self.sim.device
         # what `scan[:, ::subsample]` actually yields, which is a ceiling, not a floor. These agreed
@@ -689,6 +702,7 @@ class F1VecEnv:
             # how far a prop centre can be from the car's and still touch it: the contact tests cull
             # to the slots inside this, and count anything they dropped that was not
             self.sim.prop_reach = float(self.sim.corners.norm(dim=1).max()) + self.procedural.max_radius
+            self.sim.movable_obstacles = bool(e.movable_obstacles)
         self.opp_scale = torch.ones(self.B, device=self.device)
         #: (B,) the speed-scale draw each car is running, whichever way that car uses it (a teacher
         #: scales its profile, a policy scales its cap). One place to read "how fast was this car
@@ -1851,6 +1865,11 @@ class F1VecEnv:
         e = self.ecfg
         self.ep_step += 1
         self._widen_clearance_to_props(r)
+        if self.procedural is not None and e.movable_obstacles:
+            # Whatever the contacts shoved this step now slides, and the floor takes it back down.
+            # After the roll, so a prop moves between steps and not inside one: the LiDAR and the
+            # contact test in this step both saw it where it was when the step began.
+            self.procedural.advance(self.sim.control_dt)
         plan_ref = self.tracker.last_ref if self.tracker is not None and e.reward_plan_clearance > 0 else self._no_plan
         car_hit = (r.car_collision.float() if r.car_collision is not None
                    else torch.zeros_like(self.ep_return))

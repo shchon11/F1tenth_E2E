@@ -1374,7 +1374,7 @@ class TrackTensors:
         return tuple(torch.cat([b, e], 1) for b, e in zip(base, ep.slots(eid)))
 
     def props_near(self, tid: torch.Tensor, xy: torch.Tensor, eid: Optional[torch.Tensor] = None,
-                   reach: float = 0.0):
+                   reach: float = 0.0, return_slot: bool = False):
         """`props_for`, but keeping only the per-env layout slots that can reach `xy` (n, 2).
 
         For the two tests that ask about the car's own footprint -- the contact SAT and the spawn
@@ -1385,8 +1385,20 @@ class TrackTensors:
         base = (self.p_poses[tid], self.p_n[tid], self.p_d[tid], self.p_zlo[tid], self.p_zhi[tid])
         ep = self.env_props
         if ep is None:
-            return base
-        return tuple(torch.cat([b, e], 1) for b, e in zip(base, ep.near(xy, eid, reach=reach)))
+            if not return_slot:
+                return base
+            # The track's own props are geometry, not objects: nothing can move them, so every
+            # column maps to "no per-env slot".
+            none = torch.full(base[0].shape[:2], -1, dtype=torch.long, device=base[0].device)
+            return base + (none,)
+        got = ep.near(xy, eid, reach=reach, return_idx=return_slot)
+        cat = tuple(torch.cat([b, e], 1) for b, e in zip(base, got[:5]))
+        if not return_slot:
+            return cat
+        # A contact reports a column of the concatenation; the caller needs the per-env slot it
+        # came from to push that prop, and -1 where the column is a track's own fixed one.
+        fixed = torch.full(base[0].shape[:2], -1, dtype=torch.long, device=base[0].device)
+        return cat + (torch.cat([fixed, got[5]], 1),)
 
     # ------------------------------------------------------------------ grids
     def sample_edt(self, xy: torch.Tensor, tid: torch.Tensor, field: Optional[torch.Tensor] = None,
