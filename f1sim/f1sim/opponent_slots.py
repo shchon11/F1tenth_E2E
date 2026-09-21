@@ -403,6 +403,10 @@ class OpponentSlot:
         """One line for a log header, a facts strip and the census."""
         lo, hi = self.speed_scale
         parts = [self.kind if not self.checkpoint else f"{self.kind}:{os.path.basename(self.checkpoint)}"]
+        if self.kind_mix:
+            # `kind` is only the one the slot starts as; each race redraws it from the mix, and a
+            # header naming the first alone read as a run against one opponent kind.
+            parts[0] = "mix(" + "|".join(self.kind_mix) + ")"
         parts.append(f"x{lo:g}" if lo == hi else f"x{lo:g}-{hi:g}")
         if self.teacher_driven:
             parts.append(f"grip {self.label_grip}")
@@ -521,10 +525,11 @@ def mix_summary(slots: Optional[Sequence[OpponentSlot]]) -> str:
         return ""
     order, seen = [], {}
     for s in slots:
-        if s.kind not in seen:
-            seen[s.kind] = 0
-            order.append(s.kind)
-        seen[s.kind] += 1
+        name = "mix(" + "|".join(s.kind_mix) + ")" if s.kind_mix else s.kind
+        if name not in seen:
+            seen[name] = 0
+            order.append(name)
+        seen[name] += 1
     return ", ".join(f"{seen[k]}x {k}" for k in order)
 
 
