@@ -811,8 +811,10 @@ class ProceduralObstacles:
             return
         drop = (PROP_GROUND_DECEL * dt)
         keep = ((sp - drop) / sp.clamp_min(1e-9)).clamp_min(0.0)
-        self.p_vel = v * keep
-        self.p_poses[:, :, :2] = self.p_poses[:, :, :2] + self.p_vel * dt
+        # In place: `shove` runs inside the captured physics roll and writes into this buffer, so
+        # replacing the tensor here would leave the graph writing into one nobody reads any more.
+        self.p_vel.mul_(keep)
+        self.p_poses[:, :, :2] += self.p_vel * dt
 
     # ------------------------------------------------------------------ readers
     def slots(self, eid: Optional[torch.Tensor] = None):

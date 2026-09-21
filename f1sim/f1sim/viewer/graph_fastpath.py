@@ -259,10 +259,11 @@ def roll_eligible(sim) -> Tuple[bool, str]:
     ok, why = _cuda_eligible(sim)
     if not ok:
         return False, why
-    # `_resolve_wall_contact` mutates `self.prop_touched` inside the loop; a graph replays device
-    # work only and would drop that, silently losing substep prop contacts.
-    if not bool(getattr(sim.cfg.sim, "terminate_on_collision", True)):
-        return False, "soft wall 모드 (충돌 시 종료가 꺼져 있음)"
+    # Soft walls used to be refused here: `_resolve_wall_contact` rebound `self.prop_touched` to a
+    # new tensor inside the loop, and a graph replays device work only, so the substep prop contacts
+    # were silently dropped. It is an in-place `logical_or_` now, which a graph records like any
+    # other write to a buffer it owns, and the early-out that skips the resolution when nothing is
+    # touching is a host sync that `_capturing()` keeps out of the capture.
     n = int(getattr(sim, "imu_period", 0) or 0)
     if n <= 0 or len(getattr(sim, "imu_schedule", ()) or ()) != n:
         return False, f"IMU 스케줄이 예상과 다름 (period {n})"

@@ -63,6 +63,17 @@ class StepResult:
                                                    # vehicle.wheel_model off.
 
 
+def _capturing() -> bool:
+    """Whether this call is being recorded into a CUDA graph or traced by `torch.compile` -- the
+    two places a data-dependent Python branch is not allowed."""
+    try:
+        if torch.compiler.is_compiling():
+            return True
+    except AttributeError:
+        pass
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 class Simulator:
     def __init__(self, track, cfg: Optional[Config] = None, num_envs: int = 1,
                  device: Optional[str] = None, track_ids=None, race_size: int = 1):
@@ -770,20 +781,41 @@ class Simulator:
         clr = self._footprint_clearance(state)
         pen = (-clr).clamp_min(0.0)
         touching = pen > 0
-        n = self.track.edt_gradient(state[:, :2], self.tid)            # away from wall (world)
         prop_slot = None                   # set below when the props can be pushed
+        prop_deeper = n_p = None
         if getattr(self.track, "has_props", False):
             # Whichever of wall or prop is deeper owns this step's normal. Blending two normals
             # would push the car somewhere neither contact asks for.
             movable = self.movable_obstacles and getattr(self.track, "env_props", None) is not None
             got = self._prop_contact(state, fn=prop_contacts, want_slot=movable)
             pen_p, n_p = got[0], got[1]
-            self.prop_touched = self.prop_touched | (pen_p > 0)   # substeps, read once per step
+            # In place, and that is the whole reason soft walls can be captured: a CUDA graph replays
+            # device work only, so rebinding the attribute to a new tensor happened once, at capture,
+            # and every replay after it dropped the substep prop contacts. `graph_fastpath` refused
+            # soft walls for exactly that, and the refusal silently cost both the viewer and training
+            # their graphs the day soft became a default -- 0.1x realtime in the viewer, 185 steps/s
+            # against 320 in `spec_korea_contact_s910`.
+            self.prop_touched.logical_or_(pen_p > 0)              # substeps, read once per step
             prop_deeper = pen_p > pen
             pen = torch.where(prop_deeper, pen_p, pen)
-            n = torch.where(prop_deeper[:, None], n_p.to(n.dtype), n)
             touching = pen > 0
             prop_slot = got[2] if movable else None
+        # Nobody touching anything: nothing to resolve, so do none of it. This runs every substep --
+        # 25 per control step -- and costs 2.0 ms of kernel launches a call in eager mode, which is
+        # 50 ms of every 25 ms step spent resolving contacts that are not there. Measured: soft
+        # contact took a viewer step from 70 to 121 ms, 0.36x realtime to 0.21x, and the user saw
+        # 0.1x. The normal field (0.82 ms) and the duct/tall lookup (0.36 ms) only matter where the
+        # car is actually touching, which on an open track is almost never.
+        #
+        # One host sync to decide, which is cheap next to the launches it saves -- but a sync cannot
+        # be recorded into a CUDA graph or traced by `torch.compile`, so under either the full
+        # branch-free path runs, which is what a graph wants anyway: its launches are free.
+        if not _capturing() and not bool(touching.any()):
+            return (state, torch.zeros(state.shape[0], 2, device=state.device, dtype=state.dtype)) \
+                if dt is not None else state
+        n = self.track.edt_gradient(state[:, :2], self.tid)            # away from wall (world)
+        if prop_deeper is not None:
+            n = torch.where(prop_deeper[:, None], n_p.to(n.dtype), n)
         yaw = state[:, dyn.IYAW]
         c, s = torch.cos(yaw), torch.sin(yaw)
         vwx = state[:, dyn.IVX] * c - state[:, dyn.IVY] * s

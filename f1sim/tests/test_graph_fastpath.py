@@ -113,15 +113,71 @@ def test_cpu_session_is_not_eligible_and_says_so():
     assert ok is False and why
 
 
-def test_soft_wall_is_not_eligible():
-    """`_resolve_wall_contact` mutates `prop_touched` inside the substep loop; a graph replays
-    device work only and would silently drop those contacts."""
+def test_soft_wall_is_no_longer_refused():
+    """Soft walls used to be refused because `_resolve_wall_contact` rebound `prop_touched` inside
+    the substep loop, which a graph replay drops. It is an in-place `logical_or_` now; whether the
+    captured roll really keeps those contacts is `test_a_captured_soft_roll_matches_eager`, on a GPU.
+    What this pins is only that the refusal is gone -- the day soft became a default it silently
+    cost the viewer and training their graphs (0.1x realtime; 185 steps/s against 320)."""
     sim = _FakeSim()
-    sim.device = torch.device("cuda")        # not used: the wall check must come first in effect
+    sim.device = torch.device("cuda")
     sim.cfg.sim.terminate_on_collision = False
-    ok, why = roll_eligible(sim)
-    assert ok is False
-    assert "soft wall" in why
+    _ok, why = roll_eligible(sim)
+    assert "soft wall" not in why
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU to capture a graph")
+def test_a_captured_soft_roll_matches_eager():
+    """The thing the old refusal protected: substep prop contacts under soft walls, replayed from a
+    graph, have to be the contacts eager mode sees -- and the car has to end up in the same place.
+
+    Two envs, same seed, same actions, obstacles on the racing line so contacts actually happen;
+    one steps eager and one through `prepare_graph_runtime`. Randomisation, road tilt and the IMU
+    are off, so the only difference between the two is the capture.
+    """
+    import os
+    from f1sim import Config, maps
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common
+    from f1sim.learn.graph_runtime import prepare_graph_runtime
+    from f1sim.raceline import Raceline
+    dev = "cuda:%d" % (torch.cuda.device_count() - 1)
+    torch.cuda.set_device(torch.device(dev))
+    tr = maps.load("gen:competition:0")
+    rl = Raceline.build_cached(tr)
+
+    def build():
+        cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+        cfg.lidar.n_beams = 36; cfg.rand.enabled = False; cfg.vehicle.road_tilt = 0.0
+        cfg.imu.enabled = False
+        ecfg = EnvConfig(race_size=2, opponent="slots", max_steps=4000, hist_len=0,
+                         action_mode="direct", collision_mode="soft",
+                         procedural_obstacles=1.0, procedural_density=3.0,
+                         procedural_raceline_corridor="off", spawn_runway=3.0,
+                         opponent_slots=[{"kind": "forzaeth"}])
+        env = common.make_env([tr], 16, dev, ecfg, cfg=cfg, seed=11, rls=[rl])
+        env.reset(seed=11)
+        return env
+
+    eager, graphed = build(), build()
+    fp = prepare_graph_runtime(graphed, log=lambda _t: None)
+    assert fp is not None, "the soft-wall roll was not captured"
+    # prepare_graph_runtime steps the env to record arguments; bring the eager twin level with it
+    act = torch.zeros(eager.B, eager.act_dim, device=dev)
+    while int(eager.ep_step.max()) < int(graphed.ep_step.max()):
+        eager.step(act)
+    g = torch.Generator(device="cpu").manual_seed(3)
+    touched_e = touched_g = 0
+    for _ in range(80):
+        a = (torch.rand(eager.B, eager.act_dim, generator=g) * 2 - 1).to(dev)
+        _o, _r, _t, _tr, ie = eager.step(a)
+        _o, _r, _t, _tr, ig = graphed.step(a)
+        touched_e += int((ie["wall_dist"] <= 0).sum()); touched_g += int((ig["wall_dist"] <= 0).sum())
+    fp.release()
+    assert touched_e > 0, "nothing was ever touched, so the contact path was not exercised"
+    assert touched_g == touched_e, f"contacts differ: eager {touched_e}, graph {touched_g}"
+    diff = float((eager.sim.state[:, :4] - graphed.sim.state[:, :4]).abs().max())
+    assert diff < 1e-3, f"the graphed roll drifted from eager by {diff}"
 
 
 def test_schedule_disagreeing_with_period_is_not_eligible():

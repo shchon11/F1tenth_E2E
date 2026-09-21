@@ -1317,18 +1317,29 @@ class SimWorker:
             session["gg"].clear()
             self._sal_cache = None
             self.say(P.MSG_LOG, gen=self.gen, text="ROS2 /f1sim/reset: 전 차량을 리셋했습니다")
-        if rt is not None:
-            rt.pre_action(session["obs"])          # history, friction estimate, MPC limits: before the action
-        scan, pro = flatten_obs(session["obs"])
-        with torch.no_grad():
-            mu = session["act_fn"](scan, pro).clone()
-            if session["cfg"].stochastic:
-                act = (mu + model.actor.log_std.exp() * torch.randn_like(mu)).clamp(-1, 1)
-            else:
-                act = mu
+        # `/drive` driving the only car there is: nothing reads a policy action, so none is made.
+        # The old comment kept the forward "so its observation history stays real", but the scan
+        # stack and the action history belong to the env and are kept by `env.step` whatever drove
+        # the car -- the forward was a network evaluation per control step whose output was
+        # discarded, in the one mode whose whole point is that something else is driving. The user:
+        # "ros 브릿징에서 센서 발행하고 /drive로 제어하는 그 모드에서는 정책 입출력이 딱히 필요가
+        # 없는 상황인데 추론은 왜돌리는거야". With more cars than that the policy still drives them,
+        # and runs.
+        drive_only = link is not None and link.mode == "drive" and env.B == 1
+        if drive_only:
+            act = torch.zeros(env.B, env.act_dim, device=env.device)
+        else:
+            if rt is not None:
+                rt.pre_action(session["obs"])      # history, friction estimate, MPC limits: before the action
+            scan, pro = flatten_obs(session["obs"])
+            with torch.no_grad():
+                mu = session["act_fn"](scan, pro).clone()
+                if session["cfg"].stochastic:
+                    act = (mu + model.actor.log_std.exp() * torch.randn_like(mu)).clamp(-1, 1)
+                else:
+                    act = mu
         if link is not None and link.mode == "drive":
-            # The policy still produces an action (its observation history has to stay real),
-            # but car 0 drives what `/drive` said; silence past the timeout is speed 0.
+            # Car `link.car` drives what `/drive` said; silence past the timeout is speed 0.
             steer, speed, _fresh = link.command()
             env.set_external_command(link.car, steer, speed)
         session["obs"], _rew, _term, _trunc, _info = env.step(act)
