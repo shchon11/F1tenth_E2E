@@ -383,7 +383,31 @@ class SimParams:
     physics_dt: float = 0.001     # [s] substep
     control_rate: float = 40.0    # [Hz] policy / lidar rate (one env step)
     terminate_on_collision: bool = True
-    collision_restitution: float = 0.2   # velocity kept along wall on contact when not terminating
+    # How a contact behaves, per boundary material. The track already classifies every occupied
+    # cell as duct hose or tall wall (`Track.duct` / `Track.tall`, with distance fields for both),
+    # and they do not behave alike: a hose deforms and absorbs, a wall does not.
+    #
+    # Measured on the 56 impacts above 1 m/s in the competition recordings, whose boundary is duct
+    # hose (`f1sim/calib/impacts.py`):
+    #
+    #     speed kept, v_after/v_before : p10 0.00   median 0.52   p90 0.77
+    #     peak |a|                     : p10 2.74 g median 4.30 g max 12.62 g
+    #     contact duration             : p10 0.020 median 0.040 s p90 0.350 s
+    #     came to a full stop          : 14 of 56
+    #
+    # Two things follow, and both were wrong before. A duct does not bounce you -- the lower tail
+    # is 0.00 and a quarter of the impacts ended at a standstill -- so its restitution is near
+    # zero, not the 0.2 that was applied to everything. And a real contact lasts about 40 ms,
+    # sixteen substeps, while this simulator removed the whole normal velocity inside one: the
+    # hose stretches and the car stops *gradually*, which is the thing to reproduce.
+    #
+    # `contact_tau_*` is that: the time constant the into-surface velocity is bled off over, so a
+    # contact takes about 2 tau. The duct's is set from the measured median; a tall wall keeps the
+    # old near-instant behaviour because nothing in the recordings measures one.
+    collision_restitution: float = 0.2   # velocity kept along a TALL WALL on contact
+    collision_restitution_duct: float = 0.05    # measured: a hose absorbs, it does not rebound
+    contact_tau_wall: float = 0.004      # [s] a tall wall: a few ms, near the old instant reset
+    contact_tau_duct: float = 0.020      # [s] half the measured 40 ms median duration
     wall_friction: float = 0.5
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA

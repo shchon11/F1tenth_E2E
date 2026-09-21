@@ -239,6 +239,15 @@ def sample(imu_state, P: Dict[str, torch.Tensor], ts: float):
     qg, qa = P["quant_gyro"][:, None], P["quant_accel"][:, None]
     gyro = torch.round(gyro / qg) * qg
     acc = torch.round(acc / qa) * qa
+    # The part clips, and until this line the model did not: the shock term is a power-law tail
+    # (`shock_accel * u ** (-1/shock_alpha)`) with no upper bound, so it could emit 65 g -- four
+    # times anything the 22 recordings contain, whose hardest impact reads 12.62 g. A BMI160-class
+    # accelerometer is configured to +-16 g and returns 16 for everything above it. Clipping at
+    # the range is what the sensor does; leaving it unbounded hands the policy a number no real
+    # one can produce.
+    rng = P.get("accel_range")
+    if rng is not None:
+        acc = acc.clamp(-rng, rng) if not torch.is_tensor(rng) else acc.clamp(-rng[:, None], rng[:, None])
     # VESC attitude filter: integrate gyro, pull roll/pitch toward the accelerometer tilt
     roll_e, pitch_e, yaw_e = ahrs[:, 0], ahrs[:, 1], ahrs[:, 2]
     roll_e = roll_e + gyro[:, 0] * ts

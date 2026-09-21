@@ -654,27 +654,30 @@ class Simulator:
             r_old = state[:, dyn.IR]
             state, ax, ay = dyn.step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt,
                                               wheel=wheel_on)
+            # Before the sprung mass, so the springs feel the hit: the body does not deform but it
+            # is on suspension, and a car that runs into something dives on its nose. The contact
+            # changes the velocity outside the dynamics, so `ax`/`ay` alone never carried it --
+            # the same reason the accelerometer was deaf to an impact.
+            a_contact = None
+            if soft_wall:
+                state, a_contact = self._resolve_wall_contact(state, dt=self.dt)
+            a_x = ax if a_contact is None else ax + a_contact[:, 0]
+            a_y = ay if a_contact is None else ay + a_contact[:, 1]
             # sprung mass: roll to the outside of the corner, dive under braking, squat under throttle
             w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s
             w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s
-            roll_ss = P["roll_per_g"] * ay / dyn.G + w_roll
+            roll_ss = P["roll_per_g"] * a_y / dyn.G + w_roll
             # asymmetric: the car squats under throttle far more than it dives under (regen-limited) braking
-            pitch_ss = -torch.where(ax > 0, P["pitch_per_g"], P["dive_per_g"]) * ax / dyn.G + w_pitch
+            pitch_ss = -torch.where(a_x > 0, P["pitch_per_g"], P["dive_per_g"]) * a_x / dyn.G + w_pitch
             roll_acc = wn * wn * (roll_ss - roll) - 2 * zeta * wn * roll_rate
             pitch_acc = wn * wn * (pitch_ss - pitch) - 2 * zeta * wn * pitch_rate
             roll_rate = roll_rate + roll_acc * self.dt
             pitch_rate = pitch_rate + pitch_acc * self.dt
             roll = (roll + roll_rate * self.dt).clamp(-0.35, 0.35)
             pitch = (pitch + pitch_rate * self.dt).clamp(-0.35, 0.35)
-            # Before the IMU, and that ordering is the whole point: the contact changes the
-            # velocity outside the dynamics, so an accelerometer fed `ax`/`ay` alone is deaf to it.
-            # The yaw rate damping lands before `yaw_acc` is taken for the same reason.
-            a_contact = None
-            if soft_wall:
-                state, a_contact = self._resolve_wall_contact(state, dt=self.dt)
             if imu_on:
+                # `yaw_acc` after the contact's damping, so the gyro sees the jolt too.
                 yaw_acc = (state[:, dyn.IR] - r_old) / self.dt
-                a_x, a_y = (ax, ay) if a_contact is None else (ax + a_contact[:, 0], ay + a_contact[:, 1])
                 imu_state = imu_model.substep(imu_state, a_x, a_y, state[:, dyn.IVX], roll, pitch, roll_rate, pitch_rate,
                                               state[:, dyn.IR], roll_acc, pitch_acc, yaw_acc, r_vec, P, self.dt,
                                               shock=wheel_on)
@@ -777,8 +780,28 @@ class Simulator:
         vwy = state[:, dyn.IVX] * s + state[:, dyn.IVY] * c
         vn = vwx * n[:, 0] + vwy * n[:, 1]
         into = (vn < 0) & touching
-        k = self.cfg.sim.collision_restitution
-        f = self.cfg.sim.wall_friction
+        # Which material this contact is against. The track carries a distance field for the duct
+        # shell and one for the tall wall, so "is the thing I am touching a hose" is a lookup, not
+        # a guess -- and the two behave differently enough that using one number for both was the
+        # reason a duct impact rebounded like concrete.
+        sp = self.cfg.sim
+        is_duct = torch.zeros_like(pen, dtype=torch.bool)
+        if getattr(self.track, "edt_duct", None) is not None:
+            d_duct = self.track.sample_edt(state[:, :2], self.tid, field=self.track.edt_duct)
+            d_tall = self.track.sample_edt(state[:, :2], self.tid, field=self.track.edt_tall)
+            is_duct = d_duct <= d_tall
+        if prop_slot is not None:
+            # A crate is not a hose. Whatever the boundary is made of, a prop contact is the prop's.
+            is_duct = is_duct & ~(prop_deeper & touching)
+        k = torch.where(is_duct, torch.full_like(pen, sp.collision_restitution_duct),
+                        torch.full_like(pen, sp.collision_restitution))
+        tau = torch.where(is_duct, torch.full_like(pen, sp.contact_tau_duct),
+                          torch.full_like(pen, sp.contact_tau_wall))
+        # How much of the normal velocity this substep takes. A real contact lasts about 40 ms on
+        # a duct hose -- sixteen substeps -- and taking all of it in one was what made an impact
+        # invisible to everything that integrates, the suspension included.
+        bleed = (self.dt / tau.clamp_min(1e-6)).clamp(max=1.0)
+        f = sp.wall_friction
         # How much of the impulse the car keeps. Against a wall, all of it: the old expression is
         # the m_prop -> infinity limit of this one. Against a 10 kg crate with a 3.74 kg car, the
         # car keeps m_p/(m_c+m_p) = 0.73 of the bounce and the crate takes the rest and slides.
@@ -794,19 +817,22 @@ class Simulator:
             # Newton's third law, as an impulse on the prop: J = -(1+k) * mu_red * vn along n, and
             # the prop takes -J. `vn` is negative while driving in, so the crate goes away from us.
             mu_red = (m_c * m_p) / (m_c + m_p).clamp_min(1e-6)
-            J = (1 + k) * (-vn) * mu_red                               # >= 0 while driving in
+            J = (1 + k) * bleed * (-vn) * mu_red                       # >= 0 while driving in
             imp = torch.where(movable_now[:, None], -J[:, None] * n, torch.zeros_like(n))
             self.track.env_props.shove(self.eid, prop_slot.clamp_min(0), imp)
-        vwx2 = vwx - (1 + k) * share * vn * n[:, 0]
-        vwy2 = vwy - (1 + k) * share * vn * n[:, 1]
+        vwx2 = vwx - (1 + k) * share * bleed * vn * n[:, 0]
+        vwy2 = vwy - (1 + k) * share * bleed * vn * n[:, 1]
         vwx2, vwy2 = vwx2 * (1 - f * 0.05), vwy2 * (1 - f * 0.05)
         vwx = torch.where(into, vwx2, vwx); vwy = torch.where(into, vwy2, vwy)
         st = state.clone()
         st[:, dyn.IVX] = vwx * c + vwy * s
         st[:, dyn.IVY] = -vwx * s + vwy * c
         # The overlap is shared the same way: a crate gets out of the way as much as the car does.
-        st[:, :2] = st[:, :2] + n * (pen * touching.float() * share)[:, None]
-        st[:, dyn.IR] = torch.where(touching, st[:, dyn.IR] * 0.9, st[:, dyn.IR])
+        # The hose gives: the car is returned over the contact rather than teleported clear of it,
+        # which is what makes the penetration -- and so the acceleration the IMU and the suspension
+        # see -- last the measured 40 ms instead of one substep.
+        st[:, :2] = st[:, :2] + n * (pen * touching.float() * share * bleed)[:, None]
+        st[:, dyn.IR] = torch.where(touching, st[:, dyn.IR] * (1.0 - 0.1 * bleed), st[:, dyn.IR])
         if dt is None:
             return st
         a_c = torch.stack([(st[:, dyn.IVX] - state[:, dyn.IVX]) / dt,
