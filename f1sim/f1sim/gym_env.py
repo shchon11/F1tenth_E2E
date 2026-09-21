@@ -2837,7 +2837,12 @@ class F1VecEnv:
         model cannot reach is the actuator model's problem, not silently capped here."""
         s_max = float(self.s_max)
         steer = max(-s_max, min(s_max, float(steer)))
-        self.ext_cmd[idx] = torch.tensor([steer, float(speed)], device=self.device)
+        # Two scalar fills, not `torch.tensor([...], device=...)`: that is a pageable host copy,
+        # which waits for everything already queued on the GPU. This runs every control step in
+        # the console's /drive mode, so it was a full CPU-GPU sync per step and the two stopped
+        # overlapping -- the step became their sum instead of their maximum.
+        self.ext_cmd[idx, 0].fill_(steer)
+        self.ext_cmd[idx, 1].fill_(float(speed))
         if idx not in self._ext_ids:
             self.ext_mask[idx] = True
             self._ext_ids.add(int(idx))

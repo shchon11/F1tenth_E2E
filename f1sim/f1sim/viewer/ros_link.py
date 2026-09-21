@@ -303,15 +303,25 @@ class RosLink:
             pieces += [plan_ref.reshape(-1).to(r.state.dtype)]
         flat = torch.cat([p.reshape(-1) for p in pieces]).cpu().numpy()
 
+        # Every width is read off the tensor it came from. These used to be written in -- state 7,
+        # odom 5, attitude 2, IMU attitude 3 -- and the day the wheel model added a column to the
+        # state (`dyn.IOMEGA`, STATE_DIM 7 -> 8) every field after it shifted by one float and was
+        # published that way: `/odom` led with the wheel speed, each IMU row came out as
+        # [previous a_z, g_x, g_y, g_z, a_x, a_y] -- gravity in `angular_velocity.x` on the second
+        # sample of every two-sample step, which is one message in five at 50 Hz against 40 Hz, and
+        # no gravity in `linear_acceleration.z` -- and every LiDAR beam sat one index late. At a
+        # standstill most of it reads zero, which is why it survived until someone looked.
         i = 0
-        st = flat[i:i + 7]; i += 7
-        od = flat[i:i + 5]; i += 5
-        i += 2                                  # body roll/pitch: on the frame, not on any topic
+        n_st, n_od, n_att = int(r.state.shape[1]), int(r.odom.shape[1]), int(r.attitude.shape[1])
+        st = flat[i:i + 7]; i += n_st           # x, y, yaw, vx, vy, r, steer -- the rest is not published
+        od = flat[i:i + 5]; i += n_od
+        i += n_att                              # body roll/pitch: on the frame, not on any topic
         coll = bool(flat[i] > 0.5); i += 1
         imu = imu_att = offsets = None
         if k_imu > 0:
+            n_ia = int(r.imu_att.shape[1])
             imu = flat[i:i + k_imu * 6].reshape(k_imu, 6); i += k_imu * 6
-            imu_att = flat[i:i + 3]; i += 3
+            imu_att = flat[i:i + 3]; i += n_ia
             offsets = flat[i:i + k_imu]; i += k_imu
         nb = int(r.scan.shape[1])
         scan = flat[i:i + nb]; i += nb
