@@ -1084,9 +1084,12 @@ class SimWorker:
         eager_contact = sim._prop_contact
         eager_merge = getattr(lidar, "_merge_props", None)
 
-        def contact_spy(*a):
-            rec["contact"] = a
-            return eager_contact(*a)
+        def contact_spy(*a, **kw):
+            # Only the plain `sim.step` call is what the leaf graph is captured for; anything called
+            # with keywords is another site and is passed through untouched, not recorded.
+            if not kw:
+                rec["contact"] = a
+            return eager_contact(*a, **kw)
 
         def merge_spy(*a):
             rec["merge"] = a

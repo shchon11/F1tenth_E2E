@@ -135,6 +135,11 @@ class Simulator:
         self.spawn_runway = 0.0
         #: Whether a struck prop is shoved or is a wall with a crate's shape. `F1VecEnv` sets it.
         self.movable_obstacles = False
+        #: Resolve soft contact every this many substeps (see `_roll_physics`). 5 is 5 ms at the
+        #: 1 ms substep: a quarter of the duct's 20 ms contact time constant, so the response is
+        #: still resolved finely, and a car at 9 m/s travels 4.5 cm into a crate before the next
+        #: check -- inside the half-width margin every contact already tolerates.
+        self.contact_every = max(1, int(getattr(self.cfg.sim, "contact_every", 5)))
         self.state = torch.zeros(num_envs, dyn.STATE_DIM, device=self.device)
         self.ax = torch.zeros(num_envs, device=self.device)
         self.ay = torch.zeros(num_envs, device=self.device)
@@ -675,8 +680,18 @@ class Simulator:
             # changes the velocity outside the dynamics, so `ax`/`ay` alone never carried it --
             # the same reason the accelerometer was deaf to an impact.
             a_contact = None
-            if soft_wall:
-                state, a_contact = self._resolve_wall_contact(state, dt=self.dt)
+            # Every `contact_every` substeps, over the time since the last one -- so the velocity
+            # bled off per second, and with it the calibrated 40 ms duct contact, is unchanged; only
+            # how finely it is integrated is. It has to be coarser than every substep because inside
+            # a CUDA graph the resolution cannot early-out on "nothing touching", so its prop SAT ran
+            # 25 times a control step whether anything was near or not: in the console, on the
+            # user's own scenario (`real/iccas25#line:*!assets=mixed:1`), that was 41.6 ms a step
+            # against terminate's 23.7 -- 0.60x realtime against 1.05x. `k` is a Python int, so the
+            # schedule is fixed per substep at capture and costs a graph nothing.
+            ce = self.contact_every
+            if soft_wall and (k % ce == ce - 1 or k == self.substeps - 1):
+                span = (k % ce) + 1
+                state, a_contact = self._resolve_wall_contact(state, dt=self.dt * span)
             a_x = ax if a_contact is None else ax + a_contact[:, 0]
             a_y = ay if a_contact is None else ay + a_contact[:, 1]
             # sprung mass: roll to the outside of the corner, dive under braking, squat under throttle
@@ -787,7 +802,14 @@ class Simulator:
             # Whichever of wall or prop is deeper owns this step's normal. Blending two normals
             # would push the car somewhere neither contact asks for.
             movable = self.movable_obstacles and getattr(self.track, "env_props", None) is not None
-            got = self._prop_contact(state, fn=prop_contacts, want_slot=movable)
+            # `Simulator._prop_contact`, not `self._prop_contact`: the instance attribute is what
+            # the console swaps for a spy while it records arguments and then for a captured leaf
+            # graph -- both built for the `sim.step` call site, positional-only, one fixed arity.
+            # This call is a different site inside the roll that needs the real computation and
+            # passes keywords, and going through the attribute is what crashed session start with
+            # "contact_spy() got an unexpected keyword argument 'fn'" the day soft walls became
+            # capturable.
+            got = Simulator._prop_contact(self, state, fn=prop_contacts, want_slot=movable)
             pen_p, n_p = got[0], got[1]
             # In place, and that is the whole reason soft walls can be captured: a CUDA graph replays
             # device work only, so rebinding the attribute to a new tensor happened once, at capture,
@@ -842,7 +864,10 @@ class Simulator:
         # How much of the normal velocity this substep takes. A real contact lasts about 40 ms on
         # a duct hose -- sixteen substeps -- and taking all of it in one was what made an impact
         # invisible to everything that integrates, the suspension included.
-        bleed = (self.dt / tau.clamp_min(1e-6)).clamp(max=1.0)
+        # Over the time since the last resolution, which is `dt` when the caller resolves every few
+        # substeps -- using `self.dt` there would bleed a fifth of what the calibration asks for.
+        span_dt = self.dt if dt is None else dt
+        bleed = (span_dt / tau.clamp_min(1e-6)).clamp(max=1.0)
         f = sp.wall_friction
         # How much of the impulse the car keeps. Against a wall, all of it: the old expression is
         # the m_prop -> infinity limit of this one. Against a 10 kg crate with a 3.74 kg car, the

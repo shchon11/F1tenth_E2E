@@ -555,3 +555,47 @@ def test_teacher_graph_matches_eager_bit_for_bit_and_restores_the_env(slots):
     finally:
         w._release_session(s)
     assert "_teacher_normalized" not in env.__dict__
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU to capture a graph")
+def test_the_console_session_captures_soft_walls_with_props():
+    """The console's own session path, on the user's own scenario, because that is the only path the
+    user drives through and it is not the training path.
+
+    `SimWorker._prepare_fastpath` records the arguments of `sim._prop_contact` through a spy and
+    then captures that call as a leaf graph -- both positional-only, one arity. The day soft walls
+    became capturable, `_resolve_wall_contact` called the same attribute from inside the roll with
+    `fn=` and `want_slot=`, and session start died with "contact_spy() got an unexpected keyword
+    argument 'fn'". The fix was verified through `learn.graph_runtime` and never through this, which
+    is how it shipped.
+
+    `real/iccas25#line:*!assets=mixed:1` is exactly what the console hands the worker for
+    "iccas25, line obstacles, random seed" (`tracks.asset_scenario`); a bare `#line:44` rasterises
+    its obstacles into the grid, has no props, and never reaches the crashing call.
+    """
+    from multiprocessing import Pipe
+    from f1sim.viewer import sim_worker
+    from f1sim.viewer.console import protocol as P
+    from f1sim.learn.watch import latest_run
+    run = latest_run()
+    if run is None:
+        pytest.skip("no training run on this machine to load a policy from")
+    dev = "cuda:%d" % (torch.cuda.device_count() - 1)
+    ctl_w, ctl_c = Pipe(duplex=True)
+    fr_r, fr_w = Pipe(duplex=False)
+    w = sim_worker.SimWorker(ctl_w, fr_w)
+    w._hold_parked_ok = True                     # what the hold sets when nothing is stepping
+    cfg = P.SessionConfig(run=str(run), map_name="real/iccas25#line:*!assets=mixed:1",
+                          races=1, cars_per_race=1, device=dev, compile=False,
+                          collision_mode="soft")
+    session = w.build_session(cfg, gen=1)
+    try:
+        env = session["env"]
+        assert env.sim.track.has_props, "the scenario did not produce props, so nothing was tested"
+        assert not env.sim.cfg.sim.terminate_on_collision
+        assert session.get("fastpath") is not None, "the soft-wall session fell back to eager"
+    finally:
+        fp = session.get("fastpath")
+        if fp is not None:
+            fp.release()
+        ctl_c.close(); fr_r.close()
