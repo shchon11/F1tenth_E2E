@@ -57,6 +57,21 @@ class PlanSpec:
                                    # slowing 10 -> 4 m/s needs 7 m at 6 m/s^2. The old 0.7 s / 6 m
                                    # plan covered 5.6 m at 8 m/s against a 9.2 m need, so the plan
                                    # could not even represent the manoeuvre the corner required.
+    # Backing out of something. The speed dimension maps to [0, v_max] and a checkpoint's action
+    # space cannot be widened without re-meaning every plan it has ever emitted, so reverse is not
+    # a dimension of its own: it is what "stop" means when the car is *already* stopped and in
+    # contact with something. Wedged nose-first into a hose or a crate, forward is the obstacle,
+    # and a policy that commands zero speed there is asking to get out.
+    #
+    # The policy still chooses it -- the speed command and the steering are both its own -- and it
+    # cannot be entered any other way, so an ordinary slow corner is untouched. What it cannot
+    # choose is how fast to reverse; `v_reverse` is fixed, which for un-wedging is the behaviour
+    # anyway. Making it a real dimension would cost the three encoders, the two decoders, the ten
+    # places that address the speed knots by position, the tracker, the checkpoint growth path and
+    # the plan viewer, and is written down here rather than left as an unstated shortcut.
+    v_reverse: float = 0.8         # [m/s] how fast backing out goes
+    reverse_v_gate: float = 0.4    # [m/s] only from near standstill -- you cannot reverse at pace
+    reverse_cmd_gate: float = 0.15 # [m/s] a commanded speed under this is "stop", i.e. the request
     v_cmd_lead: float = 0.15       # [s] the first speed target refers to this far ahead
     N: int = 12                    # MPC steps
     dt: float = 0.05               # [s] MPC step
@@ -457,6 +472,10 @@ class PlanTracker:
         self.u_seq = torch.zeros(num_envs, self.spec.N, 2, device=self.device)     # warm start
         self.last_ref = None                                                       # (B,N+1,4) body frame plan, for viewers
         self.last_pred = None                                                      # (B,N+1,4) the tracker's predicted motion
+        #: (B,) whether each car is in contact with something right now. `F1VecEnv` sets it under
+        #: soft collision; left False, `reverse_cmd_gate` can never fire and the tracker is the one
+        #: it has always been.
+        self.contact = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
 
     def reset(self, ids: torch.Tensor):
         self.u_prev[ids] = 0.0; self.u_seq[ids] = 0.0
@@ -492,4 +511,8 @@ class PlanTracker:
             return self._command_hook(u, z, v_meas, speed_cap)
         k_ = max(1, int(round(sp.v_cmd_lead / sp.dt)))
         v_cmd = torch.minimum(z[:, k_, 3], speed_cap)
+        # Stopped, asking to stay stopped, and touching something: back out. See `v_reverse`.
+        stalled = ((v_meas.abs() < sp.reverse_v_gate) & (v_cmd < sp.reverse_cmd_gate)
+                   & self.contact)
+        v_cmd = torch.where(stalled, torch.full_like(v_cmd, -sp.v_reverse), v_cmd)
         return torch.stack([u[:, 0, 0], v_cmd], 1)

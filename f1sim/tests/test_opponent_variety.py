@@ -381,3 +381,80 @@ def test_movable_obstacles_need_a_collision_you_survive():
     with pytest.raises(ValueError, match="collision_mode='soft'"):
         _env(envs=8, procedural_obstacles=1.0, movable_obstacles=True,
              collision_mode="terminate", opponent_slots=[{"kind": "forzaeth"}])
+
+
+# ============================================================ 7. backing out of something
+def test_a_wedged_car_can_reverse_out():
+    """The user's case: *"단단한 장애물에 박았다던지 벽에 박혀 있다던지"*.
+
+    The plan's speed dimension maps to [0, v_max] -- `mpc.decode`: `(a + 1) * 0.5 * v_max` -- so a
+    car nose-first into a hose has no action that means "back up", and the only thing forward of it
+    is the thing it is stuck on. Reverse is therefore what "stop" means when the car is *already*
+    stopped and in contact: the policy still chooses it, through the speed command and the
+    steering, and it cannot be entered any other way, so an ordinary slow corner is untouched.
+
+    Checked by wedging the cars rather than hoping a rollout produces one.
+    """
+    import numpy as np
+    env = _env(envs=8, race_size=1, opponent="policy", action_mode="plan", max_steps=1600,
+               collision_mode="soft")
+    env.reset(seed=3)
+    S, rl = env.sim, _track_and_raceline(TRACK)[1]
+    placed = 0
+    for i in range(env.B):
+        tid = S.tid[i:i + 1]
+        for idx in range(0, 400, 7):
+            p = rl.xy[idx % len(rl.xy)]
+            hit = None
+            for ang in np.linspace(0, 2 * np.pi, 16, endpoint=False):
+                for d in np.arange(0.2, 1.6, 0.05):
+                    q = torch.tensor([[p[0] + d * np.cos(ang), p[1] + d * np.sin(ang)]],
+                                     dtype=torch.float32)
+                    if float(S.track.sample_edt(q, tid)) < 0.10:
+                        hit = (float(q[0, 0]), float(q[0, 1]), float(ang)); break
+                if hit: break
+            if hit:
+                S.state[i, 0], S.state[i, 1], S.state[i, 2] = hit
+                S.state[i, 3] = 0.0
+                placed += 1
+                break
+    assert placed >= env.B // 2, f"only wedged {placed} of {env.B}; the scene is not the scene"
+
+    stop = torch.full((env.B, env.act_dim), -1.0)
+    reversing, contact, vmin = 0, 0, 0.0
+    for _ in range(60):
+        env.step(stop)
+        v = env.sim.state[:, 3]
+        reversing += int((v < -0.05).sum())
+        contact += int(env.tracker.contact.sum())
+        vmin = min(vmin, float(v.min()))
+    assert contact > 0, "nothing was in contact, so nothing was asked to back out"
+    assert reversing > 0, f"no car ever reversed (most negative speed {vmin:.3f} m/s)"
+
+
+def test_reverse_cannot_be_entered_at_speed_or_in_clear_air():
+    """The two gates, because without them "stop" would mean "reverse" everywhere and a policy
+    that lifts for a corner would find itself going backwards."""
+    from f1sim.mpc import PlanSpec
+    sp = PlanSpec()
+    env = _env(envs=8, race_size=1, opponent="policy", action_mode="plan", max_steps=1600,
+               collision_mode="soft")
+    env.reset(seed=5)
+    env.sim.state[:, 3] = 0.0
+    stop = torch.full((env.B, env.act_dim), -1.0)
+    for _ in range(20):                      # stopped, commanding stop, but touching nothing
+        env.step(stop)
+        assert float(env.sim.state[:, 3].min()) >= -1e-3, "reversed with nothing to back out of"
+    assert sp.reverse_v_gate < 1.0 and sp.reverse_cmd_gate < 0.5, \
+        "the gates have to be tight enough that an ordinary slow corner cannot trip them"
+
+
+def test_terminate_mode_never_reverses():
+    """Under `terminate` the episode ends at the touch, so there is no recovery to make and the
+    tracker is the one it has always been."""
+    env = _env(envs=8, race_size=1, opponent="policy", action_mode="plan", max_steps=1600,
+               collision_mode="terminate")
+    env.reset(seed=7)
+    for _ in range(40):
+        env.step(torch.full((env.B, env.act_dim), -1.0))
+        assert not bool(env.tracker.contact.any()), "the tracker was told about contact under terminate"

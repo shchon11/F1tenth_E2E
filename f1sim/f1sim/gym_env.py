@@ -1867,6 +1867,13 @@ class F1VecEnv:
         self.last_cmd = cmd
         e = self.ecfg
         self.ep_step += 1
+        if self.tracker is not None:
+            # What the tracker needs to know for `reverse_cmd_gate`: a car asking to stop while it
+            # is already stopped is only asking to back out if it is stuck on something. Taken
+            # before the edge-detect below, because that rewrites `r.collision` to the onset and
+            # this wants the whole contact -- the car is wedged for the duration, not for a step.
+            self.tracker.contact = (r.collision if e.collision_mode == "soft"
+                                    else torch.zeros_like(r.collision))
         if e.collision_mode == "soft":
             # Charge the crash once, when it starts. `collided` is now per step rather than
             # latched, but a car scraping a hose is in contact for the measured 40 ms -- sixteen
