@@ -653,6 +653,15 @@ def main():
                          "teacher-driven car to be a prop-aware kind (--opp-slots), because a "
                          "raceline-driven opponent cannot see a prop and its crashes would become "
                          "the collision rate")
+    ap.add_argument("--collision-mode", choices=["terminate", "soft"], default="terminate",
+                    help="what a collision is. 'terminate' ends the episode, which is what every "
+                         "number on record was measured under. 'soft' resolves the contact and "
+                         "carries on -- the car is pushed out of penetration, its into-surface "
+                         "velocity is taken, and the crash is charged as a cost. It is the only "
+                         "way a policy can learn what to do AFTER a touch: steer out of it, back "
+                         "off and go again, and above all not end up driving the wrong way "
+                         "(--wrong-way-penalty). Not comparable with a 'terminate' run's "
+                         "collisions per km without saying so")
     ap.add_argument("--spawn-runway", type=float, default=0.0, metavar="M",
                     help="[m] of clear road every spawning car is guaranteed ahead of it, prop or "
                          "wall. 0 = off. A car is placed at up to the spawn speed and cannot stop "
@@ -818,6 +827,7 @@ def main():
                                                               procedural_raceline_margin=a.procedural_raceline_margin,
                                                               procedural_raceline_corridor=a.procedural_raceline_corridor,
                                                               spawn_runway=a.spawn_runway,
+                                                              collision_mode=a.collision_mode,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,

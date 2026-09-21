@@ -158,6 +158,23 @@ class EnvConfig:
     proximity_speed_ref: float = 0.0 # [m/s] >0: the proximity penalty is scaled by (1 + v / ref): fast past a wall costs more than creeping
     reward_wrong_way: float = 0.2    # per step while facing backwards along the lane (progress is signed anyway; this makes it explicit)
     reward_collision_speed: float = 0.0   # extra collision penalty per m/s of speed at impact (a fast crash costs more than a nudge)
+    # What a collision *is*. "terminate" ends the episode, which is every run before this existed
+    # and is what every benchmark number on record was measured under.
+    #
+    # "soft" does not: the simulator already resolves the contact (`Simulator._resolve_wall_contact`
+    # -- push out of penetration, kill the into-surface velocity with `collision_restitution` and
+    # `wall_friction`, damp the yaw rate), the episode continues, and the crash is charged as a cost
+    # instead of an ending. The whole machinery was there and unreachable, because this class forced
+    # `terminate_on_collision = True` whatever the config said.
+    #
+    # Why it matters: with "terminate" the policy can only ever learn to *avoid*. It never sees what
+    # happens after a touch, so it never learns to steer out of one, to back off and go again, or --
+    # the thing that actually decides whether a recovery is worth anything -- not to end up driving
+    # the wrong way (`reward_wrong_way`). A real race has contact in it.
+    #
+    # It is an option and not the default on purpose: it changes what "collisions per km" counts,
+    # so a run under it is not comparable with one under "terminate" without saying so.
+    collision_mode: str = "terminate"
     reward_plan_clearance: float = 0.0
     plan_margin: float = 0.15
     safe_dist: float = 0.30          # [m] body-to-wall gap below which the proximity penalty starts
@@ -516,8 +533,14 @@ class F1VecEnv:
                  num_envs: int = 1024, device: Optional[str] = None):
         """track: a Track or a list of Tracks (envs are spread over them, re-drawn on reset)."""
         self.cfg = cfg or Config()
-        self.cfg.sim.terminate_on_collision = True
         self.ecfg = env_cfg or EnvConfig()
+        if self.ecfg.collision_mode not in ("terminate", "soft"):
+            raise ValueError(f"collision_mode must be 'terminate' or 'soft', not "
+                             f"{self.ecfg.collision_mode!r}")
+        # This used to be an unconditional True, which made `Simulator`'s soft-contact path -- and
+        # `SimParams.collision_restitution` / `wall_friction`, both of which document themselves as
+        # "when not terminating" -- dead code that nothing could reach.
+        self.cfg.sim.terminate_on_collision = self.ecfg.collision_mode == "terminate"
         self.sim = Simulator(track, self.cfg, num_envs, device, race_size=self.ecfg.race_size)
         self.B, self.device = num_envs, self.sim.device
         # what `scan[:, ::subsample]` actually yields, which is a ceiling, not a floor. These agreed
@@ -1835,7 +1858,7 @@ class F1VecEnv:
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap,
                          plan_ref, self.lap_start_step, car_hit, self.gap_prev, self.gap_valid,
                          self.lead_steps, self.lead_paid,
-                         self._plan_prop_clearance(r.state, plan_ref))
+                         self._plan_clearance(r.state, plan_ref))
         (self.scan_hist, steer_rate, reward, reward_components, self.act_hist, terminated, truncated,
          crossed, done, self.ep_return, self.ep_progress, flags, self.gap_prev,
          self.gap_valid, self.lead_steps, self.lead_paid) = (t.clone() for t in out)
@@ -1897,31 +1920,73 @@ class F1VecEnv:
         self._last_obs = obs
         return obs, reward, terminated, truncated, info
 
-    def _plan_prop_clearance(self, state, plan_ref):
-        """(B,) room the *planned path* has to the nearest prop, `inf` when there are none.
+    #: [m] the plan-clearance term probes at least this far along the path, and samples it at most
+    #: this far apart. Both numbers exist because the tracker's reference is *time* indexed -- N*dt
+    #: = 0.6 s of it, whatever the speed -- and that is the wrong axis for "is there something in
+    #: the way":
+    #:
+    #: * at 9 m/s the 13 reference points are 0.45 m apart and a crate is 0.24-0.42 m wide, so the
+    #:   path could straddle one and score clear. Measured: 8.4 % of the cases where a crate was
+    #:   really inside the margin.
+    #: * at 1.3 m/s the whole reference is 0.78 m long -- less than a car -- so a crate a metre
+    #:   ahead was outside it, the footprint was outside `safe_dist`, and the only live term was
+    #:   progress. That is the creep this whole diagnosis started from, and the earlier fix did not
+    #:   close it: making the terms *see* props does nothing if neither is looking that far.
+    #:
+    #: 3 m is the distance a car doing 9 m/s covers in a third of a second and one it can stop in
+    #: from 4.9 m/s; 0.15 m is half a body width, the same rule the spawn runway samples on.
+    PLAN_PROBE_M = 3.0
+    PLAN_SAMPLE_M = 0.15
 
-        Computed here rather than inside `_step_math` because that function is compiled under
-        `reduce-overhead`, and a topk over the layout's slots inside an inductor trace is a graph
-        break at best. One tensor across the boundary costs a recompile and nothing else.
+    def _plan_clearance(self, state, plan_ref):
+        """(B,) room the committed path has, walls and props, or None when the term is off.
 
-        `reward_plan_clearance` is the forward-looking half of the obstacle signal -- it charges
-        for a plan that goes somewhere tight, which is what teaches a car to turn *before* it has
-        to. Against the occupancy grid alone it charged nothing at all for a plan drawn straight
-        through a crate.
+        Replaces the distance-field sampling that used to live in `_step_math`, for three reasons
+        at once: it has to see the props (which are not in that field), it has to sample finely
+        enough to not straddle a crate, and it has to look a fixed distance rather than a fixed
+        time. Computed here and passed in because `_step_math` is compiled under
+        `reduce-overhead`, and a topk over layout slots inside an inductor trace is a graph break
+        at best.
+
+        The car's own width is *not* subtracted here -- the caller does that, as it always did.
         """
-        if self.procedural is None or self.ecfg.reward_plan_clearance <= 0 or plan_ref.shape[1] <= 1:
+        e = self.ecfg
+        if e.reward_plan_clearance <= 0 or plan_ref is None or plan_ref.shape[1] <= 1:
             return self._no_plan_prop
+        ref = plan_ref[:, :, :2]
+        B, P, _ = ref.shape
+        # Densify and extend, in the body frame, before going to world: the reference is a polyline
+        # and its own last heading is the direction the plan was still going in.
+        span = ref[:, -1].norm(dim=1).clamp_min(1e-3)                        # (B,) how far it reaches
+        n_s = max(P, int(math.ceil(float(span.max().item()) / self.PLAN_SAMPLE_M)) + 1)
+        u = torch.linspace(0, P - 1, n_s, device=ref.device)
+        lo = u.floor().long().clamp(max=P - 1); hi = u.ceil().long().clamp(max=P - 1)
+        w = (u - lo).view(1, -1, 1)
+        pts = ref[:, lo] * (1 - w) + ref[:, hi] * w                          # (B, n_s, 2)
+        # ... and carry on in the plan's final direction until `PLAN_PROBE_M` is covered, so a
+        # crawling car is not blind to what it is crawling towards.
+        tail = ref[:, -1] - ref[:, -2]
+        tail = tail / tail.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        extra = (self.PLAN_PROBE_M - span).clamp_min(0.0)                    # (B,)
+        n_e = int(math.ceil(self.PLAN_PROBE_M / self.PLAN_SAMPLE_M))
+        frac = torch.linspace(0, 1, n_e, device=ref.device).view(1, -1, 1)
+        ext = ref[:, -1:, :] + tail[:, None, :] * (extra[:, None, None] * frac)
+        pts = torch.cat([pts, ext], 1)
         c, sn = torch.cos(state[:, 2])[:, None], torch.sin(state[:, 2])[:, None]
-        px = state[:, 0:1] + plan_ref[:, :, 0] * c - plan_ref[:, :, 1] * sn
-        py = state[:, 1:2] + plan_ref[:, :, 0] * sn + plan_ref[:, :, 1] * c
-        B, P = px.shape
-        eid = torch.arange(B, device=px.device)[:, None].expand(B, P).reshape(-1)
-        return self.procedural.clearance(torch.stack([px, py], -1).reshape(-1, 2),
-                                         eid).view(B, P).min(1).values
+        px = state[:, 0:1] + pts[:, :, 0] * c - pts[:, :, 1] * sn
+        py = state[:, 1:2] + pts[:, :, 0] * sn + pts[:, :, 1] * c
+        xy = torch.stack([px, py], -1)
+        n = xy.shape[1]
+        out = self.sim.track.sample_edt(xy, self.sim.tid[:, None]).min(1).values
+        if self.procedural is not None:
+            eid = torch.arange(B, device=xy.device)[:, None].expand(B, n).reshape(-1)
+            prop = self.procedural.clearance(xy.reshape(-1, 2), eid).view(B, n).min(1).values
+            out = torch.minimum(out, prop.to(out.dtype))
+        return out
 
     def _step_math(self, scan, wall_dist, s, state, progress, collision, lap, a, steer_norm, prev_steer_norm, scan_hist, act_hist, ep_step, tid,
                    ep_return, ep_progress, prev_lap, plan_ref, lap_start_step, car_hit, gap_prev, gap_valid,
-                   lead_steps, lead_paid, plan_prop):
+                   lead_steps, lead_paid, plan_clear):
         """Reward, histories and episode flags as pure tensor math (compiled into one CUDA graph when
         the sim runs in reduce-overhead mode: next to a training job every small kernel waits its turn)."""
         e = self.ecfg
@@ -1937,12 +2002,11 @@ class F1VecEnv:
         crash = collision.float()
         plan_penalty = torch.zeros_like(wall_dist)
         if e.reward_plan_clearance > 0 and plan_ref.shape[1] > 1:
-            cosine, sine = torch.cos(state[:, 2])[:, None], torch.sin(state[:, 2])[:, None]
-            plan_x = state[:, 0:1] + plan_ref[:, :, 0] * cosine - plan_ref[:, :, 1] * sine
-            plan_y = state[:, 1:2] + plan_ref[:, :, 0] * sine + plan_ref[:, :, 1] * cosine
-            clearance = self.sim.track.sample_edt(torch.stack([plan_x, plan_y], -1), tid[:, None]).min(1).values
-            clearance = torch.minimum(clearance, plan_prop.to(clearance.dtype))
-            clearance = clearance - 0.5 * self.cfg.vehicle.width
+            # `plan_clear` is `_plan_clearance`: the same question this used to ask of the distance
+            # field alone, asked of the props as well, sampled at half a body width and probed a
+            # fixed distance rather than a fixed 0.6 s. The car's own width is subtracted here, as
+            # it always was -- the path is a centreline and the body is 0.31 m wide.
+            clearance = plan_clear - 0.5 * self.cfg.vehicle.width
             plan_penalty = (e.plan_margin - clearance).clamp(min=0.0) / e.plan_margin
         # per metre *driven*, not per metre of centerline progress: with progress the penalty vanishes
         # for a car that stops next to a wall (progress -> 0) and is charged to one that reverses away
@@ -2011,7 +2075,11 @@ class F1VecEnv:
             torch.zeros_like(progress),          # grip_budget: filled in by step(), from a tensor the trainer owns
         ], 1)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
-        terminated = collision.clone()
+        # Under "soft" a contact is a cost, not an ending: the simulator has already pushed the car
+        # out of it and taken the into-surface velocity, and the episode carries on so the policy
+        # can be taught what to do next. `crash` above still charges for it, and still scales with
+        # the speed at impact, so a nudge and a shunt are not the same price.
+        terminated = collision.clone() if e.collision_mode == "terminate" else torch.zeros_like(collision)
         truncated = (~terminated) & ((ep_step >= e.max_steps) | (lap >= e.laps))
         if self.M > 1:                                         # the leader's time limit ends the whole race
             truncated = truncated | (truncated & (self.slot == 0)).view(-1, self.M)[:, 0].repeat_interleave(self.M)

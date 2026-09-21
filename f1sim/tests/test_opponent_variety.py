@@ -258,9 +258,63 @@ def test_the_plan_clearance_term_sees_a_crate_on_the_planned_path():
     saw_finite = False
     for _ in range(150):
         env.step(torch.zeros(env.B, env.act_dim))
-        pr = env._plan_prop_clearance(env.sim.state, env.tracker.last_ref)
+        pr = env._plan_clearance(env.sim.state, env.tracker.last_ref)
         assert pr.shape == (env.B,)
         if bool(torch.isfinite(pr).any()):
             saw_finite = True
-            assert float(pr.min()) >= -1.0, "a clearance that far inside a prop is not a clearance"
-    assert saw_finite, "the plan never came near a prop; the term is not being exercised"
+            assert float(pr.min()) >= -1.0, "a clearance that far inside anything is not a clearance"
+    assert saw_finite, "the plan never came near anything; the term is not being exercised"
+
+
+# ============================================================ 5. a collision you can drive out of
+def test_soft_collision_does_not_end_the_episode_and_the_car_keeps_driving():
+    """`terminate` is the only thing the policy could ever learn from: avoid, or die.
+
+    It never sees what happens after a touch, so it cannot learn to steer out of one, to back off
+    and go again, or -- the thing that decides whether a recovery was worth anything -- not to end
+    up pointing the wrong way. `Simulator` has resolved soft contacts all along
+    (`_resolve_wall_contact`: out of penetration, into-surface velocity removed by
+    `collision_restitution` and `wall_friction`, yaw rate damped) and `SimParams` documents both
+    constants as "when not terminating" -- but `F1VecEnv.__init__` forced `terminate_on_collision`
+    True whatever the config said, so none of it could run.
+    """
+    def run(mode, steps=120):
+        env = _env(envs=16, procedural_obstacles=1.0, procedural_density=2.0,
+                   procedural_max_props=10, procedural_raceline_corridor="off",
+                   spawn_runway=3.0, action_mode="plan", max_steps=1600,
+                   collision_mode=mode, opponent_slots=[{"kind_mix": PROP_AWARE}])
+        env.reset(seed=61)
+        assert env.cfg.sim.terminate_on_collision == (mode == "terminate")
+        term = 0
+        for _ in range(steps):
+            _o, _r, t, _tr, _i = env.step(torch.zeros(env.B, env.act_dim))
+            term += int(t.sum())
+        return term
+
+    assert run("terminate") > 0, "nothing crashed at all, so the modes cannot be compared"
+    assert run("soft") == 0, "a soft collision still ended the episode"
+
+
+def test_the_collision_mode_is_checked_rather_than_silently_ignored():
+    """A typo here would be a run that quietly used the other model, and every collision number it
+    produced would mean the other thing."""
+    with pytest.raises(ValueError, match="collision_mode"):
+        _env(envs=8, collision_mode="sof")
+
+
+def test_a_soft_collision_is_still_charged_for():
+    """Not terminal is not free. The crash term still fires and still scales with the speed at
+    impact, so a nudge and a shunt are not the same price -- otherwise "soft" would just delete the
+    obstacle penalty that the last three commits were about putting back."""
+    env = _env(envs=16, procedural_obstacles=1.0, procedural_density=3.0,
+               procedural_max_props=10, procedural_raceline_corridor="off", spawn_runway=3.0,
+               action_mode="plan", max_steps=1600, collision_mode="soft",
+               reward_collision=-60.0, reward_collision_speed=0.5,
+               opponent_slots=[{"kind_mix": PROP_AWARE}])
+    env.reset(seed=63)
+    charged = 0.0
+    for _ in range(150):
+        _o, _r, _t, _tr, info = env.step(torch.zeros(env.B, env.act_dim))
+        comp = info.get("reward_components") or {}
+        charged += float(comp["collision"].sum()) + float(comp["collision_speed"].sum())
+    assert charged < 0.0, "a soft contact cost nothing at all"

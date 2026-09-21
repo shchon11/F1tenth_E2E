@@ -3201,6 +3201,28 @@
           "metavar": null
         },
         {
+          "flag": "--collision-mode",
+          "flags": [
+            "--collision-mode"
+          ],
+          "dest": "collision_mode",
+          "label": "충돌 처리 (terminate / soft)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "terminate",
+          "nargs": null,
+          "choices": [
+            "terminate",
+            "soft"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "what a collision is. 'terminate' ends the episode, which is what every number on record was measured under. 'soft' resolves the contact and carries on -- the car is pushed out of penetration, its into-surface velocity is taken, and the crash is charged as a cost. It is the only way a policy can learn what to do AFTER a touch: steer out of it, back off and go again, and above all not end up driving the wrong way (--wrong-way-penalty). Not comparable with a 'terminate' run's collisions per km without saying so",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
           "flag": "--spawn-runway",
           "flags": [
             "--spawn-runway"
