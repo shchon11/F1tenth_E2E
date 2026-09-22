@@ -16,7 +16,8 @@ What replaces the bake
 The same six patterns `hard_obstacles.py` draws -- gate, diagonal, chicane, apex, cluster, scatter,
 with their sizes and their gap rules -- placed as `f1sim.props` **props**: convex prisms that the
 LiDAR and the contact test already handle analytically (`prop_math.py`), with no grid involved.
-A layout is then a few dozen numbers per env (a pose and a shape index per piece), which is a batched
+Plus a seventh, `center`, which `hard_obstacles` has no equivalent of: one wide piece in the middle
+of the lane with a way past on each side (`KINDS`). A layout is then a few dozen numbers per env (a pose and a shape index per piece), which is a batched
 gather on the GPU.
 
 The erosion proof is replaced by *construction*, not dropped. `hard_obstacles` draws a pattern, then
@@ -92,8 +93,17 @@ def _is_compiling() -> bool:
 # numpy/scipy over a grid and this one is torch over a batch; sharing the constants is the whole of
 # what the two have in common. `tests/test_procedural_obstacles.py` pins them equal.
 PATTERNS: Tuple[str, ...] = ("gate", "diagonal", "chicane", "apex", "cluster", "scatter")
+#: What this module draws: `hard_obstacles`' six patterns, plus `center` -- one wide piece standing in
+#: the middle of the lane with a way past on each side. None of the six makes that: every row grows
+#: from a wall, and scatter's objects are small. It is the console's 랜덤 · 중간 (`asset_obstacles`,
+#: family "line"), and s912 and s913 hit that block on 40 of 41 contacts, at walking pace, unable to
+#: pick a side. `PATTERNS` stays `hard_obstacles`' list; `last_kind` indexes this one.
+KINDS: Tuple[str, ...] = PATTERNS + ("center",)
 GAP_FRAC = (0.55, 0.75)   # open share of the lane beside a pattern
 GAP_MIN = 1.20            # [m] never less than this, whatever the lane width
+CENTER_SIDE_MIN = 0.70    # [m] a centre piece's narrow way past: a car and its margin, as the console's
+                          # line family requires. The other side keeps GAP_MIN, like every pattern.
+CENTER_MAX = 0.62         # [m] widest centre piece: the low crate stack
 ROW_GAP = (0.05, 0.25)    # [m] daylight between adjacent boxes of a row -- narrower than the car
 SMALL_SHARE = 0.35        # share of apex and cluster pieces drawn small
 MIN_SPACING = 6.0         # [m] of arc between two patterns
@@ -107,7 +117,8 @@ MIN_PIECE = 0.12          # [m] `_block`'s smallest box: below this nothing is p
 #: one row, at one index -- is not held to what the lane does three metres later. Taking the widest
 #: reach for all six costs patterns on a narrow map: `control_1400`'s lane is 2.00 m at the median
 #: but 1.85 m as a 4 m running minimum, and 1.20 m of that is the gap.
-REACH = {"gate": 0.6, "diagonal": 2.6, "chicane": 4.0, "apex": 0.6, "cluster": 0.9, "scatter": 3.2}
+REACH = {"gate": 0.6, "diagonal": 2.6, "chicane": 4.0, "apex": 0.6, "cluster": 0.9, "scatter": 3.2,
+         "center": 0.6}
 WINDOW = 4.0              # [m] the longest of them: chicane row 2 at 3.5 m plus a crate
 PIECE_WINDOW = 0.8        # [m] of arc one *piece* covers, centred: its own depth plus the yaw
                           # jitter. The raceline corridor is taken over this and not over WINDOW --
@@ -361,7 +372,7 @@ class ProceduralObstacles:
         self.p_sid = torch.full((self.B, self.C), -1, dtype=torch.long, device=dev)
         self.p_vel = torch.zeros(self.B, self.C, 2, device=self.device)
         #: What the last draw decided, per env: where each pattern sits on the lap [m of arc], which
-        #: of `PATTERNS` it is, and whether that slot is a pattern at all. Two (B, P) tensors and a
+        #: of `KINDS` it is, and whether that slot is a pattern at all. Two (B, P) tensors and a
         #: mask, written by the same `index_copy_` as the slots. Kept because the properties worth
         #: checking -- the 6 m spacing, that all six kinds appear -- are properties of the *draw*,
         #: and recovering them from the placed pieces means projecting a prop back onto the
@@ -394,7 +405,7 @@ class ProceduralObstacles:
         cl_all = tr.cl.detach().cpu().numpy()                         # (T, N, 2)
         tan_all = tr.cl_tangent.detach().cpu().numpy()
         reaches = sorted(set(REACH.values()))
-        self.kind_window = torch.tensor([reaches.index(REACH[k]) for k in PATTERNS],
+        self.kind_window = torch.tensor([reaches.index(REACH[k]) for k in KINDS],
                                         dtype=torch.long, device=dev)
         lanes_l, lanes_r, curvs = [], [], []
         lanes_lw = [[] for _ in reaches]
@@ -562,7 +573,7 @@ class ProceduralObstacles:
         s_cand = base[..., None] + cand_u * free[..., None]
         j_cand = (s_cand / self.ds[t][:, None, None]).long() % self.N
         kind = self._draw_kinds(D, P)
-        is_apex = (kind == PATTERNS.index("apex"))[..., None]
+        is_apex = (kind == KINDS.index("apex"))[..., None]
         tid_c = t[:, None, None].expand_as(j_cand)
         win_c = self.kind_window[kind][..., None].expand_as(j_cand)   # each kind's own forward reach
         wl_c = self.lane_lw[win_c, tid_c, j_cand]
@@ -653,10 +664,10 @@ class ProceduralObstacles:
         return out, live & fits
 
     def _draw_kinds(self, D: int, P: int) -> torch.Tensor:
-        """One pattern kind per slot, as a random permutation repeated: every six patterns a lap
-        carries all six kinds, which is what `hard_obstacles` gets from shuffling a cycled list."""
-        perm = torch.argsort(self._rand((D, len(PATTERNS))), dim=1)   # (D,6)
-        idx = torch.arange(P, device=self.device)[None, :] % len(PATTERNS)
+        """One pattern kind per slot, as a random permutation repeated: every seven patterns a lap
+        carries all seven kinds, which is what `hard_obstacles` gets from shuffling a cycled list."""
+        perm = torch.argsort(self._rand((D, len(KINDS))), dim=1)      # (D,7)
+        idx = torch.arange(P, device=self.device)[None, :] % len(KINDS)
         return torch.gather(perm, 1, idx.expand(D, P))
 
     def _pieces(self, kind, act, row_ok, span, span2, side, chic_along, wl, wr, hi, lo, curv):
@@ -690,7 +701,7 @@ class ProceduralObstacles:
 
         # ---- gate: one row straight across ----------------------------------------------------
         g_off, g_live, g_sid = self._row(span, row_ok, Q)
-        put(kind == PATTERNS.index("gate"), g_off, g_live, g_sid)
+        put(kind == KINDS.index("gate"), g_off, g_live, g_sid)
 
         # ---- diagonal: rungs stepping across, the gap at the far end --------------------------
         k = self._randint(3, 6, (D, P)).float()[..., None]
@@ -698,7 +709,7 @@ class ProceduralObstacles:
         d_sid, d_across, d_ok = self._pick_row_leq(step.expand(D, P, Q))
         d_live = row_ok[..., None] & (q < k.long()) & d_ok & (d_across >= MIN_PIECE)
         d_off = (q.float() + 0.5) * step
-        put(kind == PATTERNS.index("diagonal"), d_off, d_live, d_sid, q.float() * 0.5)
+        put(kind == KINDS.index("diagonal"), d_off, d_live, d_sid, q.float() * 0.5)
 
         # ---- chicane: a row from one wall, then 2-3.5 m later a row from the other -------------
         h = Q // 2
@@ -710,7 +721,7 @@ class ProceduralObstacles:
         c_sid = torch.cat([c1_sid[..., :h], c2_sid[..., :h]], -1)
         c_along = torch.where(q < h, torch.zeros_like(zq), chic_along[..., None].expand(D, P, Q))
         c_side = torch.where(q < h, side0, -side0)
-        put(kind == PATTERNS.index("chicane"), c_off, c_live, c_sid, c_along, c_side)
+        put(kind == KINDS.index("chicane"), c_off, c_live, c_sid, c_along, c_side)
 
         # ---- apex: a block on the inside of the corner, small a third of the time ---------------
         a_off, a_live, a_sid = self._row(span, row_ok, 4)
@@ -720,7 +731,7 @@ class ProceduralObstacles:
         a_sid = torch.where(is_small, small_id, a_sid)
         a_live = torch.where(is_small, row_ok[..., None] & (q == 0) & (small_ac + 0.05 <= span[..., None]),
                              a_live)
-        put(kind == PATTERNS.index("apex"), a_off, a_live, a_sid)
+        put(kind == KINDS.index("apex"), a_off, a_live, a_sid)
 
         # ---- cluster: two or three boxes touching, wedged into one side -------------------------
         kc = self._randint(2, 4, (D, P))[..., None]
@@ -731,7 +742,7 @@ class ProceduralObstacles:
         cl_off = (q % 2).float() * (big_ac + 0.02) + 0.5 * cl_across + 0.03
         cl_along = (q // 2).float() * (BOX_D + 0.03)
         cl_live = row_ok[..., None] & (q < kc) & (cl_off + 0.5 * cl_across <= span[..., None])
-        put(kind == PATTERNS.index("cluster"), cl_off, cl_live, cl_sid, cl_along)
+        put(kind == KINDS.index("cluster"), cl_off, cl_live, cl_sid, cl_along)
 
         # ---- scatter: one to three small things anywhere across the lane ------------------------
         ks = self._randint(1, 4, (D, P))[..., None]
@@ -765,8 +776,21 @@ class ProceduralObstacles:
         # 2.5 m lane). `hard_obstacles` draws the offsets the same way and is saved by the erosion
         # proof that rejects the draw; there is no proof here, so the strata are separated by more
         # than a piece is deep and no two objects ever share an arc index.
-        put(kind == PATTERNS.index("scatter"), s_off, s_live, small_id,
+        put(kind == KINDS.index("scatter"), s_off, s_live, small_id,
             q.float() * 1.0 + self._rand((D, P, Q)) * 0.5, s_side)
+
+        # ---- center: one wide piece in the middle of the lane, a way past on each side -----------
+        # Measured from the wall on `side`: a narrow way of CENTER_SIDE_MIN or more, the piece, and
+        # beyond it GAP_MIN or more -- the same guarantee every other pattern gives, on the far side.
+        # `wl + wr` is the narrowest the lane gets over the pattern's reach, and the piece stands at
+        # its own index, so the realised ways are at least these. The narrow one is drawn anywhere
+        # its bounds allow, so the piece stands anywhere from off-centre to dead centre.
+        W = (wl + wr)[..., None].expand(D, P, Q)
+        room = W - GAP_MIN - CENTER_SIDE_MIN - 2.0 * CURVE_INSET
+        ce_sid, ce_across, ce_ok = self._pick_row(room.clamp(max=CENTER_MAX))
+        n_way = CENTER_SIDE_MIN + CURVE_INSET + self._rand((D, P, Q)) * (room - ce_across).clamp_min(0.0)
+        ce_live = act[..., None] & (q == 0) & ce_ok & (ce_across >= MIN_PIECE) & (ce_across <= room)
+        put(kind == KINDS.index("center"), n_way + 0.5 * ce_across, ce_live, ce_sid)
         return off, live, sid, along, pside
 
     # ------------------------------------------------------------------ writing the slots

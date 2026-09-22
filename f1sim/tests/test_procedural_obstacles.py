@@ -339,6 +339,40 @@ def test_the_slot_budget_drops_patterns_at_random_not_in_lap_order():
     assert float(share.min()) > 0.5 / p.P, f"a pattern slot is nearly always the one dropped: {share.tolist()}"
 
 
+def test_a_centre_piece_leaves_a_way_past_on_each_side(catalogue_tracks):
+    """`center`: one piece, clear of both walls -- CENTER_SIDE_MIN on its narrow side and GAP_MIN on
+    the other -- measured on the placed piece against the lane at its own index, the rotated
+    footprint included. And it is drawn: a lap of ICCAS density meets one."""
+    env = make_env(catalogue_tracks, B=48, seed=12, procedural_obstacles=1.0, procedural_density=1.5, n_beams=8)
+    p = env.procedural
+    k_center = po.KINDS.index("center")
+    n_seen = 0
+    for r in range(4):
+        env.reset(seed=40 + r)
+        live = p.p_zhi > p.p_zlo
+        for b in range(env.B):
+            t = int(env.sim.tid[b])
+            cl = env.sim.track.cl[t]
+            tan = env.sim.track.cl_tangent[t]
+            for c in torch.nonzero(live[b]).flatten().tolist():
+                pat = int(p.slot_pattern[b, c])
+                if int(p.last_kind[b, pat]) != k_center:
+                    continue
+                n_seen += 1
+                xy = p.p_poses[b, c, :2]
+                # the piece's own arc index, not the nearest centerline point: blackbox2022_1 folds
+                # 150 m of lap into 55 x 39 m, and the nearest point can be another stretch of it
+                j = int(float(p.last_s[b, pat]) / float(p.ds[t])) % cl.shape[0]      # as `redraw` indexes it
+                nrm = torch.stack([-tan[j, 1], tan[j, 0]])
+                v = float(((xy - cl[j]) * nrm).sum())
+                half = 0.5 * p.shapes[int(p.p_sid[b, c])].across
+                left = float(p.lane_l[t, j]) - (v + half)
+                right = (v - half) + float(p.lane_r[t, j])
+                assert min(left, right) >= po.CENTER_SIDE_MIN - 0.03, (b, c, left, right)
+                assert max(left, right) >= po.GAP_MIN - 0.03, (b, c, left, right)
+    assert n_seen > 20, n_seen
+
+
 def test_a_shared_layout_is_everyones_and_moves_only_on_a_full_reset():
     """`procedural_shared` (the console): every env holds the same layout, a car that resets alone
     keeps it, and a reset of the whole batch draws a new one. `p_sid` names what stands in each slot
@@ -363,7 +397,7 @@ def test_every_pattern_kind_is_drawn(catalogue_tracks):
     env = make_env(catalogue_tracks, B=64, seed=6, procedural_obstacles=1.0, n_beams=8)
     env.reset(seed=6)
     p = env.procedural
-    seen = torch.bincount(p.last_kind[p.last_live], minlength=len(po.PATTERNS)).float()
+    seen = torch.bincount(p.last_kind[p.last_live], minlength=len(po.KINDS)).float()
     assert bool((seen > 0).all()), seen.tolist()
     share = seen / seen.sum()
     assert float(share.min()) > 0.08, f"a kind is nearly never drawn: {share.tolist()}"
@@ -517,7 +551,7 @@ def test_no_piece_stands_on_the_raceline():
 def test_pattern_reaches_cover_the_pieces():
     """`REACH` has to bound what each kind actually places, or the gap arithmetic is measuring the
     lane somewhere the pattern does not reach."""
-    assert set(po.REACH) == set(po.PATTERNS)
+    assert set(po.REACH) == set(po.KINDS)
     assert po.WINDOW == max(po.REACH.values())
     # the longest `along` each kind can draw, plus the deepest piece
     deepest = max(sh.along for sh in po.build_catalogue(po.catalogue_k_pad())[0])
