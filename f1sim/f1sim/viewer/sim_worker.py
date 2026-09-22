@@ -956,6 +956,7 @@ class SimWorker:
 
         self.stage(gen, "env")
         spec = extra.get("spec") or {}
+        exp_meta = extra.get("experiment") or {}
         proc_kw, proc_src = {}, ""
         if getattr(cfg, "procedural", False):
             if scenario.choice:
@@ -981,6 +982,12 @@ class SimWorker:
             # Under "soft" a touch is resolved and the car carries on -- the duct gives, a crate is
             # shoved, the IMU and the suspension feel it -- instead of the session resetting it.
             collision_mode=str(getattr(cfg, "collision_mode", "terminate") or "terminate"),
+            # What this checkpoint's curvature knots mean, from the run that trained it: under
+            # "feasible" a knot is a share of the arc the tyres hold at the plan's speed, and driving
+            # such a policy under the fixed +-1.6 1/m of "absolute" multiplies every plan it emits
+            # by five at racing speed.
+            plan_kappa_mode=str(exp_meta.get("plan_kappa_mode", "absolute")),
+            plan_kappa_a_lat=float(exp_meta.get("plan_kappa_a_lat", 8.0)),
             **proc_kw)
         if "action_history" in spec:
             # `watch.main` does not pass this through, so a checkpoint trained with a different
@@ -1348,6 +1355,8 @@ class SimWorker:
             # must not be read as evidence for the other.
             "actor_compiled": bool(getattr(session.get("act_fn"), "compiled", False)),
             "controller": str(session.get("controller_arm") or "legacy"),
+            # What the policy's curvature knots mean here, as the checkpoint recorded it.
+            "plan_kappa_mode": str(getattr(session["env"].ecfg, "plan_kappa_mode", "absolute")),
             # Who the other cars are. `opponent_mix` is the short form the header line shows
             # ("2x raceline, 1x policy"); `opponent_slots` is the table itself, so a session can be
             # reproduced -- and pasted into `--opp-slots` -- from what was actually built.

@@ -51,6 +51,21 @@ def act_dim(speed_mode: str = "linear") -> int:
 @dataclass
 class PlanSpec:
     kappa_max: float = 1.6         # [1/m] curvature range of the knots (the car's full-lock radius is ~0.74 m)
+    #: What a curvature knot of +-1 means.
+    #:
+    #:   absolute  +-`kappa_max`, whatever the car is doing. Every run before this.
+    #:   feasible  +-min(`kappa_max`, `kappa_a_lat` / v^2): the tightest arc the tyres can hold at the
+    #:             speed the plan starts from.
+    #:
+    #: `absolute` spends the box on arcs the car cannot drive. Measured on s915 at 5 m/s, a 21-point
+    #: sweep of one knot over [-1, 1] produced two distinct trajectories: everything from -1.0 to -0.2
+    #: came out within 1 cm of the same path, because the grip limit (8 m/s^2 -> 0.32 1/m) is reached
+    #: at |a| = 0.2 and the tracker saturates beyond it. The policy's own exploration is wider than
+    #: that band -- log_std ~ 0.15, i.e. 0.24 1/m -- so at racing speed it cannot sample a small
+    #: steering correction at all, and 64 % of its steps sit against the edge of the box.
+    kappa_mode: str = "absolute"
+    kappa_a_lat: float = 8.0       # [m/s^2] the lateral budget `feasible` scales by
+
     horizon_s: float = 1.5         # plan length = horizon_s * v, clamped to [len_min, len_max]
     len_min: float = 2.0
     len_max: float = 15.0          # at 10 m/s the plan must be able to hold a braking manoeuvre:
@@ -101,6 +116,17 @@ def plan_length(v: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
     return (spec.horizon_s * v.abs()).clamp(spec.len_min, spec.len_max)
 
 
+def kappa_scale(v: torch.Tensor, spec: PlanSpec):
+    """What a knot of 1.0 means at speed `v` [1/m] -- a scalar under `absolute`, (B, 1) under
+    `feasible`. Clamped by a floor on v so a standing car still has the full range to turn in."""
+    if spec.kappa_mode == "absolute":
+        return spec.kappa_max
+    if spec.kappa_mode != "feasible":
+        raise ValueError(f"kappa_mode must be 'absolute' or 'feasible', got {spec.kappa_mode!r}")
+    v_floor = math.sqrt(spec.kappa_a_lat / max(spec.kappa_max, 1e-6))     # below this the whole box fits
+    return (spec.kappa_a_lat / v.abs().clamp_min(v_floor).square())[:, None]
+
+
 def decode(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec):
     """normalized action (B,6) -> (kappa knots (B,4) [1/m], L_p (B,), v_start (B,), v_end (B,))"""
     if spec.speed_mode != "linear":
@@ -111,27 +137,42 @@ def decode(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: 
                          f"-- use decode_profile")
     a = action.clamp(-1.0, 1.0)
     Lp = plan_length(v_meas, spec)
-    k = a[:, :N_KNOTS] * spec.kappa_max
+    k = a[:, :N_KNOTS] * kappa_scale(v_meas, spec)
     v0 = torch.minimum((a[:, N_KNOTS] + 1.0) * 0.5 * v_max, speed_cap)
     v1 = torch.minimum((a[:, N_KNOTS + 1] + 1.0) * 0.5 * v_max, speed_cap)
     return k, Lp, v0, v1
 
 
-def encode(kappas: torch.Tensor, v_start: torch.Tensor, v_end: torch.Tensor, v_max: float, spec: PlanSpec) -> torch.Tensor:
+def _knot_action(kappas: torch.Tensor, spec: PlanSpec, v_meas) -> torch.Tensor:
+    """The inverse of what `decode` does to the knots. `v_meas` is the speed the plan starts from and
+    is required under `feasible`, where a knot means a share of what that speed can hold: encoding
+    without it would silently produce an action that decodes to a different path."""
+    if spec.kappa_mode == "absolute":
+        return (kappas / spec.kappa_max).clamp(-1, 1)
+    if v_meas is None:
+        raise ValueError(f"kappa_mode={spec.kappa_mode!r} encodes against the speed the plan starts "
+                         f"from; pass v_meas")
+    return (kappas / kappa_scale(v_meas, spec)).clamp(-1, 1)
+
+
+def encode(kappas: torch.Tensor, v_start: torch.Tensor, v_end: torch.Tensor, v_max: float, spec: PlanSpec,
+           v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
     """(B,4) curvature knots [1/m], speeds [m/s] -> normalized action (B,6)"""
-    return torch.cat([(kappas / spec.kappa_max).clamp(-1, 1), (v_start / v_max * 2 - 1).clamp(-1, 1)[:, None],
+    return torch.cat([_knot_action(kappas, spec, v_meas), (v_start / v_max * 2 - 1).clamp(-1, 1)[:, None],
                       (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
 
 
-def encode_envelope(kappas: torch.Tensor, a_hat: torch.Tensor, v_end: torch.Tensor, v_max: float, spec: PlanSpec) -> torch.Tensor:
+def encode_envelope(kappas: torch.Tensor, a_hat: torch.Tensor, v_end: torch.Tensor, v_max: float, spec: PlanSpec,
+                    v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
     """curvature knots [1/m], usable lateral acceleration [m/s^2], end speed [m/s] -> normalized action"""
-    return torch.cat([(kappas / spec.kappa_max).clamp(-1, 1), (a_hat / spec.a_hat_max * 2 - 1).clamp(-1, 1)[:, None],
+    return torch.cat([_knot_action(kappas, spec, v_meas), (a_hat / spec.a_hat_max * 2 - 1).clamp(-1, 1)[:, None],
                       (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
 
 
-def encode_knots(kappas: torch.Tensor, v_knots: torch.Tensor, v_max: float, spec: PlanSpec) -> torch.Tensor:
+def encode_knots(kappas: torch.Tensor, v_knots: torch.Tensor, v_max: float, spec: PlanSpec,
+                 v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
     """curvature knots [1/m], speed at each knot [m/s] -> normalized action (B, 2 * N_KNOTS)"""
-    return torch.cat([(kappas / spec.kappa_max).clamp(-1, 1), (v_knots / v_max * 2 - 1).clamp(-1, 1)], 1)
+    return torch.cat([_knot_action(kappas, spec, v_meas), (v_knots / v_max * 2 - 1).clamp(-1, 1)], 1)
 
 
 def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec):
@@ -141,7 +182,7 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
     interpolates a `v_limit` on -- so it is handed to `reference` as one and nothing else changes."""
     a = action.clamp(-1.0, 1.0)
     Lp = plan_length(v_meas, spec)
-    k = a[:, :N_KNOTS] * spec.kappa_max
+    k = a[:, :N_KNOTS] * kappa_scale(v_meas, spec)
     n = spec.n_profile
     cap = speed_cap[:, None]
     if spec.speed_mode == "knots":

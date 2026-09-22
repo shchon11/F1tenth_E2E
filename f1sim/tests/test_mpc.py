@@ -1,3 +1,4 @@
+import pytest
 import math, time
 import torch
 from f1sim.mpc import PlanSpec, PlanTracker, decode, encode, reference, ACT_DIM, N_KNOTS
@@ -118,3 +119,42 @@ def test_tracker_runs_every_speed_mode():
         cmd = tr(a, torch.full((4,), 3.0), torch.full((4,), 8.0))
         assert cmd.shape == (4, 2) and torch.isfinite(cmd).all() and (cmd[:, 0] > 0).all()
         assert tr.last_ref.shape == (4, tr.spec.N + 1, 4)
+
+# ==================================================================== what a curvature knot means
+def test_a_feasible_knot_is_a_share_of_the_grip_the_speed_leaves():
+    """`kappa_mode="feasible"`: +-1 is the tightest arc the tyres hold at the plan's own speed, so
+    the box spans what the car can drive instead of a fixed 1.6 1/m it cannot.
+
+    Under "absolute" at 5 m/s a 21-point sweep of one knot produced two trajectories -- everything
+    past |a| = 0.2 asks for more than 8 m/s^2 and the tracker saturates -- while the policy's own
+    exploration (log_std ~ 0.15, i.e. 0.24 1/m) is wider than that whole band."""
+    import torch
+    from f1sim.mpc import PlanSpec, N_KNOTS, decode, encode, kappa_scale
+    sp = PlanSpec(kappa_mode="feasible", kappa_a_lat=8.0)
+    v = torch.tensor([0.5, 2.0, 5.0, 8.0])
+    scale = kappa_scale(v, sp).flatten()
+    assert float(scale[0]) == pytest.approx(sp.kappa_max)          # standing still: the whole box
+    assert float(scale[1]) == pytest.approx(sp.kappa_max)          # 2 m/s: 8 / 4 = 2 > 1.6, clamped
+    assert float(scale[2]) == pytest.approx(8.0 / 25.0)            # 5 m/s: the grip limit itself
+    assert float(scale[3]) == pytest.approx(8.0 / 64.0)
+    a = torch.zeros(4, N_KNOTS + 2); a[:, :N_KNOTS] = 1.0
+    k, _, v0, v1 = decode(a, v, 9.0, torch.full_like(v, 9.0), sp)
+    lat = k[:, 0] * v.square()                                     # lateral acceleration asked for
+    assert float(lat[2]) == pytest.approx(8.0) and float(lat[3]) == pytest.approx(8.0)
+    # and the inverse is the inverse, at the speed the plan starts from
+    back = encode(k[:, :N_KNOTS], v0, v1, 9.0, sp, v_meas=v)
+    assert torch.allclose(back[:, :N_KNOTS], a[:, :N_KNOTS], atol=1e-6)
+    with pytest.raises(ValueError, match="v_meas"):
+        encode(k[:, :N_KNOTS], v0, v1, 9.0, sp)                    # silently wrong plans, refused
+
+
+def test_absolute_is_what_it_always_was():
+    import torch
+    from f1sim.mpc import PlanSpec, N_KNOTS, decode, encode
+    sp = PlanSpec()
+    assert sp.kappa_mode == "absolute"
+    v = torch.tensor([1.0, 6.0])
+    a = torch.zeros(2, N_KNOTS + 2); a[:, :N_KNOTS] = 0.5
+    k, _, v0, v1 = decode(a, v, 9.0, torch.full_like(v, 9.0), sp)
+    assert torch.allclose(k, torch.full_like(k, 0.5 * sp.kappa_max))
+    assert torch.allclose(encode(k[:, :N_KNOTS], v0, v1, 9.0, sp)[:, :N_KNOTS], a[:, :N_KNOTS], atol=1e-6)

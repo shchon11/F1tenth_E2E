@@ -226,7 +226,13 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                          f"run would produce a behaviour the report does not name")
     # A checkpoint says which speed dimensions it was trained to emit; the flag is for the teacher.
     speed_mode = speed_mode or metadata.get("speed_mode", "linear")
+    # ... and what its curvature knots mean. Scoring a "feasible" policy under "absolute" multiplies
+    # every plan it emits by five at racing speed, so this is read, never assumed.
+    exp_meta = metadata.get("experiment") or {}
+    kappa_mode = str(exp_meta.get("plan_kappa_mode", "absolute"))
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
+                     plan_kappa_mode=kappa_mode,
+                     plan_kappa_a_lat=float(exp_meta.get("plan_kappa_a_lat", 8.0)),
                      speed_mode=speed_mode if mode == "plan" else "linear",
                      plan_a_brake=float(metadata.get("plan_a_brake", limits.get("a_brake", 3.0))),
                      compile_tracker=not graph_runtime and bool(cfg.sim.compile),

@@ -240,7 +240,8 @@ class RacelineTeacher:
         cap = self.heading_speed_cap(yaw, tid, idx)
         if spec.speed_mode == "knots":                             # the profile itself, at the curvature knots
             vk = self.speed_at(tid[:, None].expand_as(kidx), kidx, gb[:, None].expand_as(kidx)) * slow[:, None]
-            return encode_knots(k, vk if cap is None else torch.minimum(vk, cap[:, None]), v_max, spec)
+            return encode_knots(k, vk if cap is None else torch.minimum(vk, cap[:, None]), v_max, spec,
+                                v_meas=geometry_speed)
         if spec.speed_mode == "envelope":
             # What the speed dimensions say here is *why* the profile is what it is: the lateral
             # budget this car's grip gives the profile (a_lat * grip, the one number the student
@@ -251,10 +252,11 @@ class RacelineTeacher:
             if cap is not None:
                 scale = scale * (torch.minimum(v0, cap) / v0.clamp_min(1e-3))
                 v1 = torch.minimum(v1, cap)
-            return encode_envelope(k, self.a_lat * self.grip_levels_t[gb] * scale ** 2, v1, v_max, spec)
+            return encode_envelope(k, self.a_lat * self.grip_levels_t[gb] * scale ** 2, v1, v_max, spec,
+                                   v_meas=geometry_speed)
         if cap is not None:
             v0 = torch.minimum(v0, cap); v1 = torch.minimum(v1, cap)
-        action = encode(k, v0, v1, v_max, spec)
+        action = encode(k, v0, v1, v_max, spec, v_meas=geometry_speed)
         if getattr(self, '_defer_profile_projection', False):
             return action  # interactive generation certifies after endpoint replacement/scaling
         return self.project_plan_action(action, state, P, v_max, spec, plan_speed=plan_speed)
@@ -293,7 +295,7 @@ class RacelineTeacher:
         self.last_profile_scale = scale
         self.last_profile_initial_overspeed = state[:, 3].abs() > out0 + 1e-6
         self.last_profile_initial_sideslip = torch.atan2(state[:, 4], state[:, 3].abs().clamp_min(1e-6))
-        projected = encode(k, out0, out1, v_max, spec)
+        projected = encode(k, out0, out1, v_max, spec, v_meas=speed)
         return torch.where((scale == 1)[:, None], action, projected)
 
     label_grip = "true"          # "true": per-env grip (privileged); "nominal"/"conservative": constant

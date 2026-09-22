@@ -365,6 +365,12 @@ class EnvConfig:
     speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
                                      # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
     plan_a_brake: float = 4.0        # [m/s^2] "envelope" only: braking its backward pass plans with (match the teacher's)
+    #: What a curvature knot of +-1 means (`mpc.PlanSpec.kappa_mode`): "absolute" is +-1.6 1/m at any
+    #: speed, "feasible" is the tightest arc the tyres can hold at the speed the plan starts from.
+    #: A checkpoint trained under one and driven under the other is a different policy -- the console
+    #: and the evaluation read the mode the run recorded.
+    plan_kappa_mode: str = "absolute"
+    plan_kappa_a_lat: float = 8.0    # [m/s^2] "feasible" only: the lateral budget it scales by
     compile_tracker: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
@@ -787,7 +793,9 @@ class F1VecEnv:
         self.grip_budget = None                                # see `set_grip_budget`
         if e.action_mode == "plan":
             # `None` for the default mode, so the tracker builds the PlanSpec it always built
-            pspec = None if e.speed_mode == "linear" else PlanSpec(speed_mode=e.speed_mode, a_brake_profile=float(e.plan_a_brake))
+            pspec = (None if e.speed_mode == "linear" and e.plan_kappa_mode == "absolute"
+                     else PlanSpec(speed_mode=e.speed_mode, a_brake_profile=float(e.plan_a_brake),
+                                   kappa_mode=e.plan_kappa_mode, kappa_a_lat=float(e.plan_kappa_a_lat)))
             self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
                                        e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))

@@ -646,6 +646,13 @@ def main():
                     help="share of env resets that get a freshly drawn obstacle layout, placed as "
                          "analytic props from the hard-obstacle patterns (0 = off, and off is "
                          "byte-identical to a run without the flag)")
+    ap.add_argument("--plan-kappa-mode", choices=["absolute", "feasible"], default="absolute",
+                    help="what a curvature knot of +-1 means: +-1.6 1/m ('absolute', every run before "
+                         "this) or the tightest arc the tyres hold at the plan's speed ('feasible'). "
+                         "At 5 m/s 'absolute' spends four fifths of the box on arcs the car cannot "
+                         "drive, and the policy's own exploration is wider than the band that is left.")
+    ap.add_argument("--plan-kappa-a-lat", type=float, default=8.0, metavar="M_S2",
+                    help="'feasible' only: the lateral budget the knots are scaled by")
     ap.add_argument("--procedural-density", type=float, default=1.0, metavar="PER10M",
                     help="patterns per 10 m of lap when --procedural-obstacles is on")
     ap.add_argument("--procedural-max-props", type=int, default=0, metavar="N",
@@ -877,6 +884,8 @@ def main():
                                                               # census shares (learn.opponent_config)
                                                               **opp_cfg.env_kwargs(a),
                                                               opp_future_model=a.opp_future_model,
+                                                              plan_kappa_mode=a.plan_kappa_mode,
+                                                              plan_kappa_a_lat=a.plan_kappa_a_lat,
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
@@ -1349,6 +1358,9 @@ def main():
         "motion": dict(motion_cfg) or None, "motion_heads": list(motion_heads),
         "aux_floor": float(a.aux_floor), "floor_head": dict(floor_head_cfg) or None,
         "lab_oracle": bool(cond_spec.lab_oracle), "init": a.init, "seed": int(a.seed),
+        # What this policy's curvature knots mean. A checkpoint driven under the other mode is a
+        # different policy, so the evaluation and the console read this rather than assume.
+        "plan_kappa_mode": str(a.plan_kappa_mode), "plan_kappa_a_lat": float(a.plan_kappa_a_lat),
         "memory": dict(model.meta.get("memory") or {}) or None,
         "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
         "wandb_group": a.wandb_group,
