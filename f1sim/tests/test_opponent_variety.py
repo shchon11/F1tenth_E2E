@@ -356,9 +356,11 @@ def test_a_shove_obeys_the_mass_it_was_given():
 
 
 def test_movable_obstacles_move_and_immovable_ones_do_not():
-    """The wiring, end to end: same seed, same layouts, same actions, one switch."""
-    def run(movable, steps=150):
-        env = _env(envs=16, procedural_obstacles=1.0, procedural_density=3.0,
+    """The wiring, end to end: same seed, same layouts, same actions, one switch. Enough cars and
+    steps that some car meets a piece whatever the layout draw is -- at 16 cars and 150 steps a
+    change to the generator's draw left every contact a wall one."""
+    def run(movable, steps=300):
+        env = _env(envs=32, procedural_obstacles=1.0, procedural_density=3.0,
                    procedural_max_props=10, procedural_raceline_corridor="off",
                    spawn_runway=3.0, action_mode="plan", max_steps=1600,
                    collision_mode="soft", movable_obstacles=movable,

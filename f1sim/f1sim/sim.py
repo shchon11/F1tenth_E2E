@@ -426,7 +426,11 @@ class Simulator:
             # follow the line the car is actually on, not the centerline it is offset from
             nrm = torch.stack([-torch.sin(yaw), torch.cos(yaw)], 1)
             xy = xy + nrm * lat[:, None].expand(n, K).reshape(-1, 1)
-        need = 0.5 * self.cfg.vehicle.width
+        # Half a body width from the line, measured *between* the samples too: an object whose
+        # nearest point falls half a step from both neighbours is `hypot(need, step/2)` from the
+        # nearer one. Checking `need` alone let a centre piece 0.144 m off the line through (need
+        # 0.155 m) because its closest approach sat between two samples.
+        need = math.hypot(0.5 * self.cfg.vehicle.width, 0.5 * step)
         blocked = self.track.sample_edt(xy, tid_k) < need
         props = getattr(self.track, "env_props", None)
         if props is not None:
