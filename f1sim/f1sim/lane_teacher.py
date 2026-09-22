@@ -107,6 +107,9 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
     reproduced and what is inferred.
     """
 
+    #: Tensors carried from one call to the next, updated in place (see `SplinerTeacher`).
+    GRAPH_STATE = ("_lane", "_offset")
+
     STATE_NAMES = ("racing", "trailing", "changing")
 
     def __init__(self, base: RacelineTeacher, env=None, *,
@@ -126,6 +129,9 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
             raise ValueError(f"lanes {list(lanes)} do not contain the racing line (0.0): a lane "
                              f"planner with nowhere to come back to is a permanent offset")
         self.lanes = torch.tensor(lanes, dtype=torch.float32, device=self.device)
+        # The racing line's lane, from the Python list: `(self.lanes == 0).nonzero()` was a host
+        # synchronise on every call, and a CUDA graph cannot contain one.
+        self._on_line = [float(x) for x in lanes].index(0.0)
         self.block_w = float(block_w)
         self.margin = float(margin)
         self.lookahead = float(lookahead)
@@ -169,10 +175,10 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         zero = torch.zeros(B, device=dev, dtype=dt)
         one = torch.ones(B, device=dev, dtype=dt)
         mode = torch.full((B,), RACING, device=dev, dtype=torch.long)
-        if self._lane is None or self._lane.shape != (B,) or self._lane.device != dev:
-            on_line = int((self.lanes == 0).nonzero()[0, 0])
-            self._lane = torch.full((B,), on_line, device=dev, dtype=torch.long)
-            self._offset = torch.zeros(B, device=dev, dtype=dt)
+        Bf = self._opp_state(state).shape[0]          # memory is whole-batch sized (`row_planning`)
+        if self._lane is None or self._lane.shape != (Bf,) or self._lane.device != dev:
+            self._lane = torch.full((Bf,), self._on_line, device=dev, dtype=torch.long)
+            self._offset = torch.zeros(Bf, device=dev, dtype=dt)
 
         # A car is in the way until it is clear behind -- see REAR_CLEAR -- and the distance grows
         # with speed, like every other distance in these planners.
@@ -180,8 +186,8 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         rear = -self.rear_clear * stretch
         seen = self._opponents(state, tid, rear)
         if seen is None:
-            self._lane = torch.full_like(self._lane, int((self.lanes == 0).nonzero()[0, 0]))
-            self._offset = torch.zeros_like(self._offset)
+            self._put(self._lane, torch.full_like(self._r(self._lane), self._on_line))
+            self._put(self._offset, torch.zeros_like(self._r(self._offset)))
             self.last_state, self.last_offset = mode, zero
             return None, mode, one
         gap, d_opp, idx_opp, tid_b, ego_d = seen
@@ -189,7 +195,8 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         # A prop standing in the road blocks a lane exactly the way a car does, and it is the case
         # this planner would otherwise drive straight into: with nobody to pass it holds the racing
         # line, and `procedural_raceline_corridor = "off"` puts crates on it.
-        b_gap, b_d = self._blockage_ahead(state, tid_b, 2.0 * self.rear_clear * stretch)
+        b_gap, b_d = self._blockage_ahead(state, tid_b, 2.0 * self.rear_clear * stretch,
+                                          2.0 * self.rear_clear * self.STRETCH_MAX)
         take_prop = b_gap < gap.clamp_min(0.0)
         gap = torch.where(take_prop, b_gap, gap)
         d_opp = torch.where(take_prop, b_d, d_opp)
@@ -217,7 +224,8 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
 
         # Cost. The blocked and unusable penalties are large and unequal, so that "somebody is in
         # it" and "it is a wall" are not the same lane to a tie-break.
-        held = lanes[self._lane]                                        # (B,)
+        lane_held = self._r(self._lane)
+        held = lanes[lane_held]                                         # (B,)
         cost = (self.switch_cost * (lanes[None] - held[:, None]).abs()
                 + self.offline_cost * lanes[None].abs())
         cost = cost + torch.where(blocked, torch.full_like(cost, 50.0), torch.zeros_like(cost))
@@ -227,8 +235,8 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         # the argmin flips between two nearly equal lanes at the step rate.
         best = cost.argmin(1)
         ar = torch.arange(B, device=dev)
-        keep = cost[ar, self._lane] <= cost[ar, best] + self.hysteresis
-        lane = torch.where(keep, self._lane, best)
+        keep = cost[ar, lane_held] <= cost[ar, best] + self.hysteresis
+        lane = torch.where(keep, lane_held, best)
 
         # Trailing: every lane a car could use is blocked. This planner has no answer to that --
         # a fixed-lane stack either has a gap or it does not -- so the line goes back to the racing
@@ -236,26 +244,28 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         # the car ahead for every teacher-driven row. Two controllers braking would fight.
         usable = (~blocked) & fits
         trailing = near & ~usable.any(1)
-        on_line = int((self.lanes == 0).nonzero()[0, 0])
-        lane = torch.where(trailing, torch.full_like(lane, on_line), lane)
-        self._lane = lane
+        lane = torch.where(trailing, torch.full_like(lane, self._on_line), lane)
+        self._put(self._lane, lane)        # in place: see GRAPH_STATE
 
         # The line to the chosen lane, rate limited: the lane is a decision, the line to it is a
         # manoeuvre, and a step change in the commanded offset is a step change in the reference
         # the tracker chases. Trailing gets the same limit, so a car that gave up on a pass comes
         # back across the road at the speed it went out.
         step = self.lane_rate * self.dt
-        self._offset = self._offset + (lanes[lane] - self._offset).clamp(-step, step)
+        off_held = self._r(self._offset)
+        new_off = off_held + (lanes[lane] - off_held).clamp(-step, step)
+        self._put(self._offset, new_off)
 
         mode = torch.where(trailing, torch.full_like(mode, TRAILING), mode)
-        mode = torch.where(near & ~trailing & (self._offset.abs() > 1e-3),
+        mode = torch.where(near & ~trailing & (new_off.abs() > 1e-3),
                            torch.full_like(mode, CHANGING), mode)
-        self.last_state, self.last_offset = mode, self._offset
-        return self._offset, mode, one
+        offset = new_off.clone()          # the output must not alias the state it came from
+        self.last_state, self.last_offset = mode, offset
+        return offset, mode, one
 
     def reset_rows(self, rows: torch.Tensor) -> None:
         """A new race starts on the racing line, not in the lane the last one ended in."""
         if self._lane is None:
             return
-        self._lane[rows] = int((self.lanes == 0).nonzero()[0, 0])
+        self._lane[rows] = self._on_line
         self._offset[rows] = 0.0

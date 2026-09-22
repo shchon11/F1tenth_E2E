@@ -41,6 +41,7 @@ from typing import Optional, Sequence
 
 import torch
 
+from .row_planning import RowPlanning
 from .mpc import ACT_DIM, N_KNOTS, PlanSpec, decode, reference
 from .teacher import RacelineTeacher, plan_geometry_speed
 
@@ -113,7 +114,7 @@ SMOOTH_REF_M = 0.5
 OPP_HARD_WEIGHT = 3.0
 
 
-class InteractiveTeacher:
+class InteractiveTeacher(RowPlanning):
     """Best response to the opponents' motion, in the student's own plan space.
 
     Drop-in for `RacelineTeacher` wherever a *label* is wanted (`F1VecEnv.teacher_label`,
@@ -248,6 +249,24 @@ class InteractiveTeacher:
         be quietly pretending to be it. `action_mode="plan"` is what this class is for.
         """
         return self.base(state, P, tid, offset=offset)
+
+    # ------------------------------------------------------------------ rows (`RowPlanning`)
+    def plan_rows(self, rows: torch.Tensor, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
+                  v_max: float = 8.0, spec=None, offset: Optional[torch.Tensor] = None,
+                  plan_speed: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """`plan_action` for `rows` of the batch only, (R, ACT_DIM).
+
+        Every argument is the whole batch's, as `plan_action` takes them; the ego quantities are cut
+        to `rows` and the opponents are still read from the whole batch. The point is the cost: the
+        candidate family, its MPC preview and its prop SAT scale with the rows asked for, and in a
+        race only the rows this teacher drives need it -- in s911's recipe a quarter of the
+        opponents, an eighth of the batch, while the whole batch was being planned for (48 % of a
+        graphed training step at 256 envs). Each row's answer is the one `plan_action` gives it.
+        """
+        with self._row_scope(rows, state) as cut:
+            return self.plan_action(state[rows], None if P is None else {k: cut(v) for k, v in P.items()},
+                                    None if tid is None else tid[rows], v_max, spec,
+                                    offset=cut(offset), plan_speed=cut(plan_speed))
 
     # ------------------------------------------------------------------ the label
     @torch.no_grad()
@@ -408,7 +427,7 @@ class InteractiveTeacher:
         v_meas = rep(plan_geometry_speed(state, plan_speed))
         cap = torch.full_like(v_meas, float(v_max))
         if self.env is not None:
-            cap = rep(self.env.speed_cap.to(state.dtype))
+            cap = rep(self._r(self.env.speed_cap).to(state.dtype))
         k, Lp, v0, v1 = decode(flat, v_meas, v_max, cap, spec)
         H = int(self.horizon_times(spec).numel()) - 1
         ref = reference(k, Lp, v0, v1, replace(spec, N=H), v_meas)              # (K*B, H+1, 4)
@@ -443,18 +462,22 @@ class InteractiveTeacher:
         K, B, D = cand.shape
         tile = lambda x: x[None].expand(K, *x.shape).reshape(-1, *x.shape[1:])
         v = tile(plan_geometry_speed(state, plan_speed))
-        cap = tile(self.env.speed_cap.to(state.dtype))
-        lr = self.env.last_result
-        yaw_rate = (lr.imu[:, :, 2].mean(1) if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0
-                    else v.new_empty(0))
+        cap = tile(self._r(self.env.speed_cap).to(state.dtype))
+        # The same gyro yaw rate the env hands the tracker, read from the fixed-shape copy the env
+        # keeps (`F1VecEnv._note_imu_yaw_rate`) rather than from `last_result.imu`, whose sample
+        # count alternates 1/2 and would send a captured teacher back to eager every other step.
+        held = self._r(getattr(self.env, "imu_yaw_rate", None))
+        yaw_rate = held if held is not None else v.new_empty(0)
         if yaw_rate.numel() == 0:
-            yaw_rate = (plan_geometry_speed(state, plan_speed).abs() * torch.tan(tracker.u_prev[:, 0])
+            yaw_rate = (plan_geometry_speed(state, plan_speed).abs() * torch.tan(self._r(tracker.u_prev)[:, 0])
                         / (tracker.wb + spec.k_us * plan_geometry_speed(state, plan_speed).square()))
-        delay = self.env.tracker_delay
+        delay = self._r(self.env.tracker_delay)
         delay = state.new_full((B,), spec.delay) if delay is None else torch.as_tensor(delay, device=state.device, dtype=state.dtype).expand(B)
-        warm = torch.cat((tracker.u_seq[:, 1:], tracker.u_seq[:, -1:]), 1)
+        u_seq = self._r(tracker.u_seq)
+        warm = torch.cat((u_seq[:, 1:], u_seq[:, -1:]), 1)
         u, z, _ = solve(cand.reshape(K * B, D), v, cap, tile(yaw_rate), tile(delay),
-                        tile(tracker.u_prev), tile(warm), spec, tracker.wb, tracker.s_max, tracker.v_max)
+                        tile(self._r(tracker.u_prev)), tile(warm), spec, tracker.wb, tracker.s_max, tracker.v_max,
+                        consts=tracker.ilqr_consts(spec))
         times = self.horizon_times(spec).to(state.dtype)
         needed = int(times.numel()) + 1
         points = list(z.unbind(1))
@@ -608,7 +631,10 @@ class InteractiveTeacher:
         hit = free < 0.0
         if self.track.has_props:
             from .prop_math import prism_contacts
-            eid = torch.arange(B, device=world.device)[None, :, None].expand(K, B, H).reshape(-1)
+            # env ids, not batch positions: the props are per env, and a subset call's row j is env
+            # `_rows[j]` (`plan_rows`)
+            ids = self._env_rows(B, world.device)
+            eid = ids[None, :, None].expand(K, B, H).reshape(-1)
             sim = self.env.sim if self.env is not None else None
             reach = getattr(sim, "prop_reach", 0.0)
             props = self.track.props_near(t.reshape(-1), world.reshape(-1, 2), eid, reach)
@@ -625,9 +651,11 @@ class InteractiveTeacher:
                 # beside it were empty. The SAT above already refuses to *touch* one; this is what
                 # makes the teacher keep its `wall_margin` from one as well, which is the
                 # difference between squeezing past and going round.
-                r = float(torch.linalg.vector_norm(self._corners(
-                    torch.zeros(1, 1, 1, 2, device=world.device, dtype=world.dtype),
-                    torch.zeros(1, 1, 1, device=world.device, dtype=world.dtype)), dim=-1).max())
+                # The chassis' circumradius: the farthest corner of `_corners` from its centre.
+                # It used to be measured here on the GPU and read back with `float()` -- a host
+                # synchronise on every call, and the reason no CUDA graph could hold this teacher
+                # on a map with props. It is the body's geometry, so it is arithmetic.
+                r = math.hypot(self.half_length, self.half_width)
                 pc = ep.clearance(world.reshape(-1, 2), eid).view(K, B, H) - r
                 free = torch.minimum(free, pc.to(free.dtype))
         wall = penetration.mean(2) / max(self.half_width, 1e-6)
@@ -641,8 +669,8 @@ class InteractiveTeacher:
         sim = getattr(self.env, "sim", None)
         rear = getattr(sim, "car_rear", None)
         other = getattr(sim, "other_idx", None)
-        ego_rear = world.new_zeros(B) if rear is None else rear[:, 0]
-        opp_rear = world.new_zeros(fut.shape[:2]) if rear is None else rear[other, 0]
+        ego_rear = world.new_zeros(B) if rear is None else self._r(rear)[:, 0]
+        opp_rear = world.new_zeros(fut.shape[:2]) if rear is None else rear[self._r(other), 0]
         a = torch.stack((psi.cos(), psi.sin()), -1)[:, :, None]
         b = torch.stack((yaw.cos(), yaw.sin()), -1)[None]
         ap = torch.stack((-a[..., 1], a[..., 0]), -1)
@@ -674,8 +702,8 @@ class InteractiveTeacher:
         sim = getattr(self.env, "sim", None)
         rear = getattr(sim, "car_rear", None)
         other = getattr(sim, "other_idx", None)
-        er = world.new_zeros(B) if rear is None else rear[:, 0]
-        pr = world.new_zeros(fut.shape[:2]) if rear is None else rear[other, 0]
+        er = world.new_zeros(B) if rear is None else self._r(rear)[:, 0]
+        pr = world.new_zeros(fut.shape[:2]) if rear is None else rear[self._r(other), 0]
         pa = psi[:, :, None]
         pb = yaw[None]
         da = torch.atan2((pa[..., 1:] - pa[..., :-1]).sin(), (pa[..., 1:] - pa[..., :-1]).cos())
@@ -724,7 +752,7 @@ class InteractiveTeacher:
         other = getattr(getattr(self.env, "sim", None), "other_idx", None)
         if other is None:
             return None
-        st = state[other]
+        st = self._opp_state(state)[self._r(other)]
         theta = st[..., 5, None] * times
         along = times * torch.sinc(theta / math.pi)
         across = .5 * times * theta * torch.sinc(theta / (2 * math.pi)).square()
@@ -752,7 +780,9 @@ class InteractiveTeacher:
             cost = torch.zeros(K, B, device=world.device, dtype=world.dtype)
             return (cost, torch.ones_like(cost, dtype=torch.bool)) if return_clear else cost
         times = self.horizon_times(spec)
-        fut, present, yaw = self.env.opponent_future(times, model=self.future_model, state=state, return_yaw=True)
+        fut, present, yaw = self.env.opponent_future(times, model=self.future_model,
+                                                     state=self._opp_state(state), return_yaw=True)
+        fut, present, yaw = self._r(fut), self._r(present), self._r(yaw)
         fut = fut.to(world.dtype)                                               # (B, C, H, 2)
         d = fut[None, :, :, :, :] - world[:, :, None, :, :]                     # (K, B, C, H, 2)
         c, sn = torch.cos(psi), torch.sin(psi)                                  # (K, B, H)

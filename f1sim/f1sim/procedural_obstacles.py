@@ -296,6 +296,10 @@ class ProceduralObstacles:
     layout instead of having to be re-recorded.
     """
 
+    #: Carried across a captured teacher call (`viewer.graph_fastpath._state_owners`): the cull's
+    #: running diagnostic totals, which the teachers' prop queries add to.
+    GRAPH_STATE = ("_stat",)
+
     def __init__(self, tracks, B: int, gen: torch.Generator, *, density: float = 1.0,
                  fraction: float = 1.0, max_props: int = 0, raceline_margin: float = 0.25,
                  car_half_width: float = 0.15):

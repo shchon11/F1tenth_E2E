@@ -137,6 +137,7 @@ def env_shell(teacher, state, measured):
     env.teacher_any, env.teacher = True, teacher
     env.teacher_driven = torch.tensor([False, True])
     env.alt_teacher_kinds, env.alt_teachers = [], []
+    env.slots = None                      # no slot table: `_raceline_teacher_needed` reads it
     env.opp_scale = torch.ones(len(state))
     env.follow_cap = lambda _state: (torch.zeros(len(state), dtype=torch.bool), torch.full((len(state),), 8.0))
     return env

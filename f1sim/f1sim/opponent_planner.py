@@ -31,10 +31,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from .row_planning import RowPlanning
+
 from .teacher import RacelineTeacher
 
 
-class FrenetOpponentPlanner:
+class FrenetOpponentPlanner(RowPlanning):
     """The Frenet view of a race, for a planner that chooses a lateral offset.
 
     Subclasses implement `decide(state, tid) -> (offset | None, state_code, speed_scale)` and may
@@ -130,6 +132,21 @@ class FrenetOpponentPlanner:
         return self._scale_plan_speed(a, scale)
 
     @torch.no_grad()
+    def plan_rows(self, rows: torch.Tensor, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
+                  v_max: float = 8.0, spec=None, offset: Optional[torch.Tensor] = None,
+                  plan_speed: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """`plan_action` for `rows` of the batch only, (R, ACT_DIM) -- see `row_planning`. Every
+        argument is the whole batch's; the decision reads the opponents from the whole batch and
+        keeps this planner's memory whole-batch sized."""
+        with self._row_scope(rows, state) as cut:
+            st, td = state[rows], (None if tid is None else tid[rows])
+            d, _mode, scale = self.decide(st, td)
+            a = self.base.plan_action(st, None if P is None else {k: cut(v) for k, v in P.items()}, td,
+                                      v_max, spec, offset=self._merge_offset(cut(offset), d),
+                                      plan_speed=cut(plan_speed))
+            return self._scale_plan_speed(a, scale)
+
+    @torch.no_grad()
     def __call__(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
                  offset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The direct (steer, speed) action space, through the same offset.
@@ -186,13 +203,17 @@ class FrenetOpponentPlanner:
         return out
 
     # ------------------------------------------------------------------ the Frenet view
+    #: The most `_stretch` ever returns. A caller sizing something by the longest manoeuvre it can
+    #: plan (`_blockage_ahead`'s stations) sizes it by this, not by this step's speeds.
+    STRETCH_MAX = 1.5
+
     def _stretch(self, state: torch.Tensor) -> torch.Tensor:
         """`clip(1 + v / v_max, 1.0, 1.5)`: how much more road the same manoeuvre needs at pace.
 
         ForzaETH's scaling, and it is not specific to their planner -- every one of these grows its
         distances with speed, so it lives here.
         """
-        return (1.0 + state[:, 3].to(state.dtype) / max(self.v_max, 1e-6)).clamp(1.0, 1.5)
+        return (1.0 + state[:, 3].to(state.dtype) / max(self.v_max, 1e-6)).clamp(1.0, self.STRETCH_MAX)
 
     def _clearance_at(self, idx: torch.Tensor, tid: torch.Tensor, d, props_only: bool = False) -> torch.Tensor:
         """Free space at the reference point `idx` displaced `d` metres to its left [m].
@@ -219,16 +240,17 @@ class FrenetOpponentPlanner:
             # for every planner, on every step.
             if self.props is None:
                 return torch.full(q.shape[:-1], float("inf"), device=q.device, dtype=q.dtype)
-            rows = torch.arange(q.shape[0], device=q.device)
-            rows = rows.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
-            return self.props.clearance(q.reshape(-1, 2), rows.reshape(-1)).view(q.shape[:-1])
+            ids = self._env_rows(q.shape[0], q.device)
+            ids = ids.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
+            return self.props.clearance(q.reshape(-1, 2), ids.reshape(-1)).view(q.shape[:-1])
         edt = self.track.sample_edt(q, tid)
         if self.props is None:
             return edt
-        # Row b of the batch drives in layout b: one layout per env row, as `redraw` writes them.
-        rows = torch.arange(q.shape[0], device=q.device)
-        rows = rows.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
-        prop = self.props.clearance(q.reshape(-1, 2), rows.reshape(-1)).view(edt.shape).to(edt.dtype)
+        # Env b drives in layout b: one layout per env row, as `redraw` writes them -- and in a
+        # subset call row j is env `_rows[j]`.
+        ids = self._env_rows(q.shape[0], q.device)
+        ids = ids.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
+        prop = self.props.clearance(q.reshape(-1, 2), ids.reshape(-1)).view(edt.shape).to(edt.dtype)
         return torch.minimum(edt, prop)
 
     def _normal(self, tid: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -264,24 +286,25 @@ class FrenetOpponentPlanner:
         env = self.env
         if env is None or int(getattr(env, "M", 1)) < 2 or self.track is None:
             return None
-        if env.sim.other_idx is None or state.shape[0] != env.sim.state.shape[0]:
+        if env.sim.other_idx is None or self._opp_state(state).shape[0] != env.sim.state.shape[0]:
             return None
         B = state.shape[0]
         dev, dt = state.device, state.dtype
         tid_b = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
 
-        gaps = env.signed_gaps(env.sim.s, env.sim.tid).to(dt)          # (B, C) + is ahead of me
-        other = env.sim.other_idx                                       # (B, C) row of each
+        gaps = self._r(env.signed_gaps(env.sim.s, env.sim.tid).to(dt))  # (B, C) + is ahead of me
+        other = self._r(env.sim.other_idx)                              # (B, C) row of each
+        whole = self._opp_state(state)                                  # what `other` points into
         C = gaps.shape[1]
         tid_o = tid_b[:, None].expand(B, C).reshape(-1)
-        d_o = self._lateral(state[other.reshape(-1), :2], tid_o)[0].view(B, C)
+        d_o = self._lateral(whole[other.reshape(-1), :2], tid_o)[0].view(B, C)
 
         rank = torch.where(gaps > rear[:, None], gaps, torch.full_like(gaps, float("inf")))
         j = rank.argmin(1)
         ar = torch.arange(B, device=dev)
         far = torch.full((B,), float("inf"), device=dev, dtype=dt)
         g = torch.where(torch.isfinite(rank[ar, j]), gaps[ar, j], far)
-        idx_opp = self.base.project(state[other[ar, j], :2], tid_b)[0]
+        idx_opp = self.base.project(whole[other[ar, j], :2], tid_b)[0]
         ego_d = self._lateral(state[:, :2], tid_b)[0]
         self._nearest = j
         return g, d_o[ar, j], idx_opp, tid_b, ego_d
@@ -292,8 +315,16 @@ class FrenetOpponentPlanner:
     BLOCK_PROBES = (-0.9, -0.6, -0.3, 0.0, 0.3, 0.6, 0.9)
     BLOCK_STEP = 0.25
 
+    def _block_probes(self, dev, dt) -> torch.Tensor:
+        """`BLOCK_PROBES` as a tensor, built once: a `torch.tensor` of a Python tuple is a
+        host-to-device copy, which a CUDA graph capture refuses."""
+        held = getattr(self, "_probes_t", None)
+        if held is None or held.device != dev or held.dtype != dt:
+            held = self._probes_t = torch.tensor(self.BLOCK_PROBES, device=dev, dtype=dt)
+        return held
+
     def _blockage_ahead(self, state: torch.Tensor, tid: torch.Tensor, reach: torch.Tensor,
-                        margin: float = 0.10):
+                        reach_max: float, margin: float = 0.10):
         """(arc, lateral) of the nearest procedural prop standing in the road, per row.
 
         `inf` where the road is clear, which makes it lose every comparison against a real car and
@@ -320,13 +351,16 @@ class FrenetOpponentPlanner:
         dev, dt = state.device, state.dtype
         idx = base.project(state[:, :2], tid)[0]
         # `reach` is the caller's manoeuvre span, not its detection range: a crate further ahead
-        # than the evasion itself reaches is not yet a thing to plan around, and every extra
-        # station here is B x 7 more prop queries on every step of every race.
-        K = max(2, int(float(reach.max().item()) / self.BLOCK_STEP))
+        # than the evasion itself reaches is not yet a thing to plan around. The station count is
+        # the longest span `reach` can ever be (`reach_max`), not this step's longest: it used to be
+        # `reach.max().item()`, a host synchronise every call and a shape that changed with speed,
+        # so no CUDA graph could hold these planners. Stations past a row's own reach are masked
+        # below exactly as before, so the answer does not change; only the scan length is fixed.
+        K = max(2, int(float(reach_max) / self.BLOCK_STEP))
         ds = base.ds[tid]                                              # [m] per reference index
         step = torch.arange(1, K + 1, device=dev, dtype=dt) * self.BLOCK_STEP     # (K,)
         j = (idx[:, None] + (step[None] / ds[:, None]).round().long()) % base.N   # (B, K)
-        probes = torch.tensor(self.BLOCK_PROBES, device=dev, dtype=dt)            # (L,)
+        probes = self._block_probes(dev, dt)                                       # (L,)
         L = probes.numel()
         tid_k = tid[:, None, None].expand(B, K, L)
         room = self._clearance_at(j[:, :, None].expand(B, K, L), tid_k,
@@ -346,4 +380,4 @@ class FrenetOpponentPlanner:
     def _opponent_speed(self, state: torch.Tensor) -> torch.Tensor:
         """Speed of the car `_opponents` picked, per row."""
         ar = torch.arange(state.shape[0], device=state.device)
-        return state[self.env.sim.other_idx[ar, self._nearest], 3].to(state.dtype)
+        return self._opp_state(state)[self._r(self.env.sim.other_idx)[ar, self._nearest], 3].to(state.dtype)

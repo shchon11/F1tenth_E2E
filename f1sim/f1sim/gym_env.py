@@ -158,6 +158,13 @@ class EnvConfig:
     # per step against +0.15 for the other 40). Under `terminate` the crashes spread the resets out
     # by themselves. Training only: an evaluation that starts every car at once wants full episodes.
     stagger_first_episode: bool = False
+    # How a `kind_mix` slot picks its driver. "redraw": uniformly at every race's reset, so one race
+    # meets every kind over time -- what the console shows. "partition": once, by race number
+    # (race g drives `kind_mix[g % len]`), fixed for the life of the env -- what training wants: the
+    # batch holds every kind in exact proportion at every update, and each kind then owns a fixed
+    # quarter of the rows, so a teacher that can plan a subset (`plan_rows`) is asked for those
+    # rows only. s911's interactive opponent planned the whole batch to drive an eighth of it.
+    kind_mix_assign: str = "redraw"
     laps: int = 100                  # truncate after this many laps (racing: keep going)
     reward_progress: float = 1.0     # per meter
     reward_collision: float = -10.0
@@ -966,8 +973,43 @@ class F1VecEnv:
             torch.tensor([alt.index(n) if n in alt else -1 for n in names],
                          dtype=torch.long, device=dev) if len(names) > 1 else None
             for names in self._slot_kinds]
+        if self.ecfg.kind_mix_assign not in ("redraw", "partition"):
+            raise ValueError(f"kind_mix_assign must be 'redraw' or 'partition', not {self.ecfg.kind_mix_assign!r}")
+        if self._slot_mixed and self.ecfg.kind_mix_assign == "partition":
+            # Race g's mixed slot drives kind_mix[g % len]: balanced, and fixed from here on.
+            G = self.B // self.M
+            code = self.slot_kind_code.view(G, self.M)
+            race = torch.arange(G, device=dev)
+            for i, ids in enumerate(self._slot_kind_ids, start=1):
+                if ids is not None:
+                    code[:, i] = ids[race % ids.numel()]
         if self._slot_mixed:
             self._apply_slot_kinds()
+        self._alt_rows = self._rows_each_kind_can_drive()
+
+    def _rows_each_kind_can_drive(self) -> dict:
+        """The rows each alt kind can ever drive, as a static index, read back once.
+
+        A teacher that can plan a subset (`plan_rows`) is asked for these rows only instead of the
+        whole batch -- the learners' rows and the other kinds' rows never need it. Under
+        `kind_mix_assign="redraw"` that is its fixed slots and every mixed slot listing it, since a
+        redraw can hand it any of those; under "partition" the masks are already final and it is
+        exactly the rows it drives.
+        """
+        from .opponent_slots import kind_of as _kind_of
+        out = {}
+        slot_host = self.slot.cpu()
+        for k in self.alt_teacher_kinds:
+            if self.ecfg.kind_mix_assign == "partition" or not self._slot_mixed:
+                hit = self.alt_teacher_mask[k].cpu()
+            else:
+                own = [i for i, names in enumerate(self._slot_kinds, start=1)
+                       if any(_kind_of(n).name == k for n in names)]
+                hit = torch.zeros_like(slot_host, dtype=torch.bool)
+                for i in own:
+                    hit |= slot_host == i
+            out[k] = torch.nonzero(hit).flatten().to(self.device)
+        return out
 
     def _widen_clearance_to_props(self, r) -> None:
         """Make `wall_dist` mean what its consumers think it means: room to the nearest *thing*.
@@ -1057,8 +1099,8 @@ class F1VecEnv:
         different opponent behind the same car. Uniform over the names listed; a name written twice
         is drawn twice as often, which is the whole weighting vocabulary and is enough.
         """
-        if not self._slot_mixed:
-            return
+        if not self._slot_mixed or self.ecfg.kind_mix_assign == "partition":
+            return                            # partitioned: each race keeps the kind it was given
         G = full.shape[0]
         code = self.slot_kind_code.view(G, self.M)
         for i, ids in enumerate(self._slot_kind_ids, start=1):
@@ -1720,6 +1762,15 @@ class F1VecEnv:
         an = (self._teacher_normalized(self.teacher, ev_off, ev_speed, follow, v_cap)
               if self._raceline_teacher_needed() else out)
         for kind, alt in zip(self.alt_teacher_kinds, self.alt_teachers):
+            rows = self._alt_rows.get(kind) if (self.act_dim != 2 and hasattr(alt, "plan_rows")) else None
+            if rows is not None and rows.numel() == 0:
+                continue                      # partitioned onto no race at all: nothing to drive
+            if rows is not None:
+                # Planned for the rows this kind can drive and nothing else (`_alt_rows`); the
+                # mask then picks, within them, the rows it drives this race.
+                sub = self._teacher_normalized(alt, ev_off, ev_speed, follow, v_cap, rows)
+                an = an.index_copy(0, rows, torch.where(self.alt_teacher_mask[kind][rows][:, None], sub, an[rows]))
+                continue
             # A teacher kind that is not the raceline teacher drives its own slots. Asked for the
             # whole batch and selected, like the pool is, for the same reason: compacting to the
             # rows it owns would be a device-to-host sync every step. The mask is fixed for the life
@@ -1730,6 +1781,26 @@ class F1VecEnv:
                              self._teacher_normalized(alt, ev_off, ev_speed, follow, v_cap), an)
         return torch.where(self.teacher_driven[:, None], an, out)
 
+    def _note_imu_yaw_rate(self, r) -> None:
+        """The last step's gyro yaw rate, (B,), in a tensor whose shape never changes.
+
+        `r.imu` is (B, k, 6) with k the samples that landed in the step -- 1 or 2, alternating,
+        because the IMU runs at 50 Hz and the control at 40. Anything that reads it directly reads a
+        tensor whose shape changes every other step, and a CUDA graph cannot follow one: the
+        interactive teacher's MPC preview did, and its graph went back to eager on the first step
+        after capture. Written in place, so the tensor a capture follows is the one being updated.
+        None without an IMU, which is what readers already test for.
+        """
+        if r is None or r.imu is None or r.imu.shape[1] == 0:
+            self.imu_yaw_rate = None
+            return
+        y = r.imu[:, :, 2].mean(1)
+        held = getattr(self, "imu_yaw_rate", None)
+        if held is None or held.shape != y.shape or held.dtype != y.dtype or held.device != y.device:
+            self.imu_yaw_rate = y.clone()
+        else:
+            held.copy_(y)
+
     def _raceline_teacher_needed(self) -> bool:
         """Does any teacher-driven car take the raceline teacher's command?
 
@@ -1739,12 +1810,17 @@ class F1VecEnv:
         """
         if self.slots is None or not self.alt_teacher_kinds:
             return True
-        if self._slot_mixed:
-            # A mix can draw `raceline` for any of its cars at any reset, and the answer is cached
-            # on tensor identity -- which does not change, because the masks are rewritten in place.
-            # Rather than invalidate a cache from four places, say yes: the cost is one teacher call
-            # on the resets where no car happened to draw it.
+        if self._slot_mixed and any("raceline" in kinds for kinds in self._slot_kinds):
+            # A mix that can draw `raceline` can draw it for any of its cars at any reset, and the
+            # answer is cached on tensor identity -- which does not change, because the masks are
+            # rewritten in place. Rather than invalidate a cache from four places, say yes: the cost
+            # is one teacher call on the resets where no car happened to draw it.
             return True
+        # A mix WITHOUT `raceline` always hands each of its cars to one of its own kinds, so those
+        # rows are covered by an alt mask at every moment and the static check below is exact. It
+        # used to say yes for every mix, which in s911's recipe (four planners, none of them the
+        # raceline teacher) computed the raceline teacher -- 16 % of an env step, 63 ms of 385 at 256
+        # envs -- for a result every row then overwrote.
         key = (id(self.teacher_driven), tuple(id(self.alt_teacher_mask[k]) for k in self.alt_teacher_kinds))
         cached = getattr(self, "_raceline_needed_cache", None)
         if cached is None or cached[0] != key:
@@ -1754,12 +1830,25 @@ class F1VecEnv:
             cached = self._raceline_needed_cache = (key, bool((self.teacher_driven & ~covered).any()))
         return cached[1]
 
-    def _teacher_normalized(self, teacher, ev_off, ev_speed, follow, v_cap):
-        """One teacher's command for the whole batch, as a normalized action.
+    def _teacher_normalized(self, teacher, ev_off, ev_speed, follow, v_cap, rows=None):
+        """One teacher's command for the whole batch, as a normalized action -- or, with `rows`,
+        for those rows only, (R, ACT_DIM), from a teacher that can plan a subset (`plan_rows`).
 
         Split out of `_opponent_actions` so that a second teacher kind is a second call rather than
         a second copy; the instructions are the ones that were inline, in order.
         """
+        if rows is not None:
+            cut = lambda t: t if t is None or not torch.is_tensor(t) or t.dim() == 0 else t[rows]
+            spec, v_max = self.tracker.spec, self.ecfg.v_max_policy
+            an = teacher.plan_rows(rows, self.sim.state, self.sim.P, self.sim.tid, v_max, spec,
+                                   offset=ev_off, plan_speed=self._tracker_plan_speed())
+            an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * cut(self.opp_scale)[:, None] - 1).clamp(-1, 1)
+            if ev_speed is not None:
+                an[:, -2:] = (cut(ev_speed)[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
+            cap_n = (cut(v_cap) / v_max * 2 - 1)[:, None]
+            an[:, -2:] = torch.where(cut(follow)[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
+            return teacher.project_rows(an, rows, self.sim.state, self.sim.P, v_max, spec,
+                                        plan_speed=self._tracker_plan_speed())
         if self.act_dim == 2:
             cmd = teacher(self.sim.state, self.sim.P, self.sim.tid, offset=ev_off)
             v = cmd[:, 1] * self.opp_scale
@@ -1849,6 +1938,7 @@ class F1VecEnv:
         r = self.sim.step(torch.stack([torch.zeros(self.B, device=self.device), self.sim.state[:, 3]], 1))
         self.scan_hist = torch.roll(self.scan_hist, 1, 1); self.scan_hist[:, 0] = self._norm_scan(r.scan)
         self.last_result = r
+        self._note_imu_yaw_rate(r)
         self._plan_fallback(torch.arange(self.B, device=self.device), r.state)
         self.lead_steps.zero_(); self.lead_paid.fill_(1.0)
         obs = self._obs(r)
@@ -1989,6 +2079,7 @@ class F1VecEnv:
             self._plan_fallback(ids, r.state)
             obs = self._obs(r)
         self.last_result = r
+        self._note_imu_yaw_rate(r)
         self._last_obs = obs
         return obs, reward, terminated, truncated, info
 

@@ -99,9 +99,52 @@ def prepare_graph_runtime(env, warmup_steps: int = 2, log=print):
     except BaseException:
         fp.release()
         raise
+    _capture_opponents(env, fp, act, log)
     log(f"graph runtime: captured in {time.perf_counter() - t0:.2f} s "
-        f"({len(fp._by_phase)} physics graph(s), solver {'graphed' if fp.mpc else 'eager'})")
+        f"({len(fp._by_phase)} physics graph(s), solver {'graphed' if fp.mpc else 'eager'}, "
+        f"opponent planners {'graphed' if fp.teacher_graph is not None else 'eager'})")
     return fp
+
+
+def _capture_opponents(env, fp, act, log) -> None:
+    """The teacher-driven opponents' planners, one CUDA graph per planner (`TeacherGraph`).
+
+    They are most of a training step once there are several kinds: in s911's recipe (a race of two,
+    the opponent drawn per race from four planners) `_opponent_actions` was 61 % of an env step at
+    256 envs, eager, each planner a few hundred small kernels asked for the whole batch. The viewer
+    has captured them since `7f7e831`; training never did. Their calls are recorded from one real
+    step, exactly as the viewer records them, and a planner that cannot be captured, or that a
+    later change (a controller hook, a new shape) makes the graph unable to follow, stays or goes
+    back to eager and says why -- the graph guards decide that, not this function.
+    """
+    from ..viewer.graph_fastpath import NotCapturable, TeacherGraph, teacher_eligible
+    ok, why = teacher_eligible(env)
+    if not ok:
+        log(f"graph runtime: opponent planners stay eager ({why})")
+        return
+    rec: dict = {}
+    eager = env._teacher_normalized
+
+    def spy(teacher, *a):
+        rec[teacher] = a
+        return eager(teacher, *a)
+
+    env._teacher_normalized = spy
+    try:
+        env.step(act)
+    finally:
+        env.__dict__.pop("_teacher_normalized", None)
+    if not rec:
+        log("graph runtime: no opponent planner call observed; they stay eager")
+        return
+    try:
+        tg = TeacherGraph(env, rec, log=lambda text: log(f"graph runtime: {text}"))
+    except NotCapturable as exc:
+        log(f"graph runtime: opponent planners stay eager ({exc})")
+        return
+    tg.install()
+    tg.adopt()                           # captured here, replayed here
+    fp.teacher_graph = tg
 
 
 def prepare_actor_graph(actor, scan, proprio, hidden=None, log=print):

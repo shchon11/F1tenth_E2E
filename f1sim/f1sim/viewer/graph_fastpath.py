@@ -375,6 +375,9 @@ class SimGraphFastPath:
         self._shadows: list = []
         self._installed = False
         self._adopted = False
+        #: The opponents' `TeacherGraph`, when a caller attached one (`learn.graph_runtime` does);
+        #: adopted and released with the physics so a training run holds one object, as before.
+        self.teacher_graph = None
 
     # -- capture -----------------------------------------------------------------
     def _guards_for(self, sim) -> Dict[str, Callable[[], Any]]:
@@ -559,6 +562,8 @@ class SimGraphFastPath:
         for gc in (self.mpc, self._leaf_contact, self._leaf_merge):
             if gc is not None:
                 gc.adopt()
+        if self.teacher_graph is not None:
+            self.teacher_graph.adopt()
         self._adopted = True
 
     # -- dispatch ----------------------------------------------------------------
@@ -578,6 +583,9 @@ class SimGraphFastPath:
         Order matters: the dispatcher has to stop pointing at the graphs before the graphs go, or a
         step taken after teardown raises `KeyError` one step later and reads as an unrelated crash.
         """
+        if self.teacher_graph is not None:
+            self.teacher_graph.release()        # its env method back first, like every other hook
+            self.teacher_graph = None
         if self._installed and self.sim is not None:
             self.sim._roll = self._prev_roll
             if self._tracker is not None:
@@ -630,6 +638,8 @@ class _InputRecorder:
         self.derived: set = set()
         self.own = {t.untyped_storage().data_ptr() for t in own}
         self.written: list = []
+        #: the input storages those writes landed in, so a declared state can be told apart
+        self.written_storage: set = set()
 
         class _Mode(TorchFunctionMode):
             def __torch_function__(self, func, types, args=(), kwargs=None):
@@ -654,6 +664,7 @@ class _InputRecorder:
             or "out" in kwargs
         if inplace and torch.is_tensor(target) and target.untyped_storage().data_ptr() in self.in_storage:
             self.written.append(name)
+            self.written_storage.add(target.untyped_storage().data_ptr())
         out = func(*args, **kwargs)
         for t in tree_flatten(out)[0]:
             if torch.is_tensor(t):
@@ -734,13 +745,13 @@ def teacher_eligible(env) -> Tuple[bool, str]:
         return False, "teacher 상대차 없음"
     if not bool(getattr(env, "teacher_any", False)):
         return False, "teacher 가 모는 차가 없음"
-    tracker = getattr(env, "tracker", None)
-    solver = getattr(tracker, "_solver", None)
-    if isinstance(solver, GraphedCallable) and all(
-            getattr(tracker, h, None) is None for h in ("_input_hook", "_plan_hook", "_command_hook")):
-        # The interactive teacher previews the installed MPC in this configuration, and that call
-        # would replay the solver's graph inside this capture -- which CUDA refuses, fatally.
-        return False, "teacher 의 MPC 미리보기가 솔버 그래프를 재생함 (legacy 제어기)"
+    # No refusal for a graphed plan solver. There used to be one -- "the interactive teacher previews
+    # the installed MPC, and that call would replay the solver's graph inside this capture" -- but
+    # the preview calls `mpc.solve` itself (`InteractiveTeacher`, `u, z, _ = solve(cand...)`), at its
+    # own K x B batch, and reads `tracker._solver` only to decide whether the configuration is one
+    # it supports. Nothing replays the solver graph from inside a teacher call. The refusal made
+    # every configuration with the legacy controller -- the console's default and every training
+    # run's -- keep its opponents eager: 61 % of s911's env step at 256 envs.
     return True, ""
 
 
@@ -753,6 +764,20 @@ def _setting(v):
     return v
 
 
+def _state_owners(env, teacher):
+    """The objects whose declared `GRAPH_STATE` a teacher call may carry: the teacher itself, and
+    the prop layout it queries, whose cull keeps a running diagnostic total
+    (`ProceduralObstacles._stat`) that every query adds to -- a counter is state too, and written
+    back after each replay it accumulates exactly as it does eager."""
+    track = getattr(getattr(env, "sim", None), "track", None)
+    owners = [teacher, getattr(env, "procedural", None), getattr(track, "env_props", None)]
+    seen, out = set(), []
+    for o in owners:
+        if o is not None and id(o) not in seen:
+            seen.add(id(o)); out.append(o)
+    return out
+
+
 class _TeacherCapture:
     """One teacher object's call, captured against private clones of everything it reads."""
 
@@ -762,21 +787,44 @@ class _TeacherCapture:
             "teacher.speed_scale": lambda: _setting(getattr(teacher, "speed_scale", None)),
             "teacher.label_grip": lambda: _setting(getattr(teacher, "label_grip", None)),
             "teacher.offset_limit": lambda: _setting(getattr(teacher, "offset_limit", None)),
-            "tracker": lambda: (id(env.tracker), type(env.tracker).__name__),
-            "tracker.spec": lambda: env.tracker.spec,
-            "tracker.hooks": lambda: tuple(id(getattr(env.tracker, h, None))
+            # `getattr(..., None)` throughout: a direct-action env has no tracker at all, and a
+            # guard that raises is a capture that fails for a reason nobody reads.
+            "tracker": lambda: (id(getattr(env, "tracker", None)), type(getattr(env, "tracker", None)).__name__),
+            "tracker.spec": lambda: getattr(getattr(env, "tracker", None), "spec", None),
+            "tracker.hooks": lambda: tuple(id(getattr(getattr(env, "tracker", None), h, None))
                                            for h in ("_input_hook", "_plan_hook", "_command_hook")),
-            "tracker._solver": lambda: id(getattr(env.tracker, "_solver", None)),
+            "tracker._solver": lambda: id(getattr(getattr(env, "tracker", None), "_solver", None)),
             "env.B": lambda: int(env.B),
             "env.v_max_policy": lambda: float(env.ecfg.v_max_policy),
             "env.events": lambda: id(env.events),
         }
 
-        # 1. Which tensors does the call read, and where do they live?
+        # A teacher with memory -- the spliner's side lock, the lane planner's lane -- declares it
+        # (`GRAPH_STATE`) and updates it in place. Those tensors are the one exception to "nothing
+        # the environment owns is written": the graph reads its clone, writes the clone, and
+        # `TeacherGraph.__call__` copies the clone back after every replay, so the teacher carries
+        # its state across steps exactly as it does eager. Anything else it writes still refuses.
+        state = []
+        for owner in _state_owners(env, teacher):
+            for n in getattr(owner, "GRAPH_STATE", ()):
+                t = getattr(owner, n, None)
+                if torch.is_tensor(t) and t.device.type == "cuda" and all(t is not u for u in state):
+                    state.append(t)
+        state_storage = {t.untyped_storage().data_ptr() for t in state}
+        state_keys = {_view_key(t) for t in state}
+
+        # 1. Which tensors does the call read, and where do they live? The recording call is a real
+        #    call and advances a declared state; it is put back, so capturing costs no step.
+        before = [t.clone() for t in state]
         rec = _InputRecorder([a for a in example_args if torch.is_tensor(a)])
-        with torch.no_grad(), rec:
-            eager(teacher, *example_args)
-        if rec.written:
+        try:
+            with torch.no_grad(), rec:
+                eager(teacher, *example_args)
+        finally:
+            for t, b in zip(state, before):
+                t.copy_(b)
+        stray = rec.written_storage - state_storage
+        if stray or (rec.written and not rec.written_storage):
             raise NotCapturable(f"teacher 가 외부 텐서에 씁니다 ({', '.join(sorted(set(rec.written)))})")
         paths = _tensor_paths(env)
         refs = []
@@ -788,6 +836,8 @@ class _TeacherCapture:
 
         # 2. Point every path at a private clone, capture, and put the environment back.
         self.inputs = [(ps, live[0].detach().clone()) for ps, live in refs]
+        #: which of `inputs` are the declared state, written back after each replay
+        self.state_at = [i for i, key in enumerate(rec.inputs) if key in state_keys]
         try:
             for (ps, clone) in self.inputs:
                 for p in ps:
@@ -907,5 +957,7 @@ class TeacherGraph:
         except GuardViolation as exc:
             self._give_up(cap, str(exc))
             return self._eager(teacher, *args)
+        for i in cap.state_at:                 # the teacher's memory, carried to the next step
+            live_of[i].copy_(cap.inputs[i][1])
         self.replays += 1
         return out

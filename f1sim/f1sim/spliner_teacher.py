@@ -141,6 +141,10 @@ class SplinerTeacher(FrenetOpponentPlanner):
     This class decides one thing: the lateral offset that line is followed at.
     """
 
+    #: Tensors carried from one call to the next, updated in place. A captured teacher reads them as
+    #: inputs and writes them back after every replay (`viewer.graph_fastpath._TeacherCapture`).
+    GRAPH_STATE = ("_side",)
+
     STATE_NAMES = ("racing", "trailing", "overtaking")
 
     def __init__(self, base: RacelineTeacher, env=None, *,
@@ -183,8 +187,9 @@ class SplinerTeacher(FrenetOpponentPlanner):
         zero = torch.zeros(B, device=dev, dtype=dt)
         one = torch.ones(B, device=dev, dtype=dt)
         mode = torch.full((B,), RACING, device=dev, dtype=torch.long)
-        if self._side is None or self._side.shape != (B,) or self._side.device != dev:
-            self._side = torch.zeros(B, device=dev, dtype=dt)
+        Bf = self._opp_state(state).shape[0]          # memory is whole-batch sized (`row_planning`)
+        if self._side is None or self._side.shape != (Bf,) or self._side.device != dev:
+            self._side = torch.zeros(Bf, device=dev, dtype=dt)
 
         # Distances stretch with speed, and the rear bound is the spline's own arc: a manoeuvre is
         # not over when the other car's gap goes negative, it is over when the line has rejoined.
@@ -194,7 +199,7 @@ class SplinerTeacher(FrenetOpponentPlanner):
             # No opponent structure at all -- a solo env, or a caller this planner cannot match to
             # the simulator's rows. `None` rather than zeros, so the reference teacher takes the
             # path it takes when nobody asked it for an offset (see `_merge_offset`).
-            self._side = torch.zeros_like(self._side)
+            self._put(self._side, torch.zeros_like(self._r(self._side)))
             self.last_state, self.last_offset = mode, zero
             return None, mode, one
         gap, d_opp, idx_opp, tid_b, ego_d = seen
@@ -203,7 +208,8 @@ class SplinerTeacher(FrenetOpponentPlanner):
         # obstacles, not cars. Whichever is nearer ahead is the thing to plan around, and a prop is
         # a car that will not move -- so it enters with zero speed and the prediction below leaves
         # it where it is.
-        b_gap, b_d = self._blockage_ahead(state, tid_b, CONTROL_S[-1] * stretch)
+        b_gap, b_d = self._blockage_ahead(state, tid_b, CONTROL_S[-1] * stretch,
+                                          CONTROL_S[-1] * self.STRETCH_MAX)
         take_prop = b_gap < gap.clamp_min(0.0)
         gap = torch.where(take_prop, b_gap, gap)
         d_opp = torch.where(take_prop, b_d, d_opp)
@@ -234,8 +240,9 @@ class SplinerTeacher(FrenetOpponentPlanner):
 
         # Do not change sides while committed: off the centre of its own line by more than
         # `side_switch_d` the car is already beside something, and weaving is how contact happens.
-        committed = (self._side != 0) & (ego_d.abs() > self.side_switch_d)
-        side = torch.where(committed, self._side, side)
+        held = self._r(self._side)
+        committed = (held != 0) & (ego_d.abs() > self.side_switch_d)
+        side = torch.where(committed, held, side)
         room = torch.where(side > 0, clear_l, clear_r)
 
         # The apex, and the spline through it evaluated where we are. A cubic spline is linear in
@@ -250,7 +257,9 @@ class SplinerTeacher(FrenetOpponentPlanner):
         mode = torch.where(passing, torch.full_like(mode, OVERTAKING),
                            torch.where(trailing, torch.full_like(mode, TRAILING), mode))
         d_out = torch.where(passing, d_cmd, zero)
-        self._side = torch.where(passing, side, torch.zeros_like(side))
+        # In place, not rebound: the side lock is this planner's memory between steps, and a CUDA
+        # graph can only carry state it is allowed to write back (`GRAPH_STATE`).
+        self._put(self._side, torch.where(passing, side, torch.zeros_like(side)))
 
         # An inside pass gives a little speed back: the inside of a corner is the side the
         # reference line is already turning toward, and it is the shorter, tighter way past.

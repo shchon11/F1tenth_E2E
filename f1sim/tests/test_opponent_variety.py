@@ -522,3 +522,103 @@ def test_soft_contacts_are_counted_in_the_episode_and_in_an_evaluation():
                 collision_mode="soft", opponent_slots=[{"kind_mix": PROP_AWARE}])
     out = common.rollout_metrics(env2, lambda obs: torch.zeros(env2.B, env2.act_dim), steps=150)
     assert out["collisions_per_km"] > 0.0, out          # used to be 0: no episode ended, none terminated
+
+
+def test_a_mix_without_the_raceline_teacher_does_not_compute_it():
+    """s911's recipe mixes four planners and not the raceline teacher, and every one of its cars is
+    driven by one of the four -- yet the raceline teacher ran for the whole batch every step, 16 % of
+    the step, for a command every row then overwrote. It is skipped now, and nothing changes: the
+    same seed, run once skipping it and once forced to compute it, drives the same race to the bit.
+
+    Run one after the other, not interleaved: the LiDAR draws its noise from the global torch RNG,
+    so two envs stepped alternately in one process take each other's draws and part after the first
+    scan whatever the teachers do."""
+    def drive(force):
+        env = _env(envs=16, action_mode="plan", opponent_slots=[{"kind_mix": PROP_AWARE}])
+        if force:
+            env.__dict__["_raceline_teacher_needed"] = lambda: True
+        env.reset(seed=5)                                  # reseeds the global RNG too
+        calls = {"n": 0}
+        real = env._teacher_normalized
+        def spy(teacher, *a, **k):
+            calls["n"] += teacher is env.teacher
+            return real(teacher, *a, **k)
+        env._teacher_normalized = spy
+        a = torch.zeros(env.B, env.act_dim)
+        states, cmds = [], []
+        for _ in range(60):                                # long enough for races to reset and redraw
+            env.step(a)
+            states.append(env.sim.state.clone()); cmds.append(env.last_cmd.clone())
+        return torch.stack(states), torch.stack(cmds), calls["n"], env
+    s0, c0, n0, env = drive(force=False)
+    s1, c1, n1, _ = drive(force=True)
+    assert "raceline" not in PROP_AWARE and not env._raceline_teacher_needed()
+    assert n0 == 0 and n1 == 60, (n0, n1)
+    assert torch.equal(c0, c1), "skipping the raceline teacher changed a command"
+    assert torch.equal(s0, s1), "skipping the raceline teacher moved a car"
+
+
+def test_a_mix_with_the_raceline_teacher_still_computes_it():
+    env = _env(envs=8, opponent_slots=[{"kind_mix": MIX}])
+    env.reset(seed=5)
+    assert "raceline" in MIX and env._raceline_teacher_needed()
+
+
+@pytest.mark.parametrize("assign", ["redraw", "partition"])
+def test_each_opponent_plans_only_the_rows_it_can_drive(assign):
+    """`plan_rows` gives each row the command the whole-batch call gives it, for all four planners.
+
+    They used to be asked for the whole batch -- learners included -- every step, and in s911's
+    recipe that was 61 % of an eager env step at 256 envs. Now each is asked for the rows it can
+    drive: under "redraw" every row of the mixed slot, under "partition" its own races only. Same
+    state both ways -- a planner with memory has it put back between the two calls -- and the same
+    command on those rows, and the same memory left behind for them."""
+    env = _env(envs=32, action_mode="plan", procedural_obstacles=1.0, procedural_density=2.0,
+               procedural_max_props=8, procedural_raceline_corridor="off", spawn_runway=3.0,
+               collision_mode="soft", kind_mix_assign=assign,
+               opponent_slots=[{"kind_mix": PROP_AWARE + ["interactive"]}])
+    env.reset(seed=7)
+    G = env.B // env.M
+    for kind, alt in zip(env.alt_teacher_kinds, env.alt_teachers):
+        rows = env._alt_rows[kind]
+        if assign == "redraw":
+            assert rows.numel() == G, "a mixed slot's rows are every race's second car"
+        else:
+            assert rows.numel() == G // 4, "four kinds share the races equally"
+            assert bool(env.alt_teacher_mask[kind][rows].all()), "partitioned rows are the rows it drives"
+    a = torch.zeros(env.B, env.act_dim)
+    env.step(a)                           # a planner creates its memory on its first call
+    for step in range(40):
+        follow, v_cap = env.follow_cap(env.sim.state)
+        for kind, alt in zip(env.alt_teacher_kinds, env.alt_teachers):
+            rows = env._alt_rows[kind]
+            names = [n for n in getattr(alt, "GRAPH_STATE", ()) if getattr(alt, n, None) is not None]
+            snap = [getattr(alt, n).clone() for n in names]
+            with torch.no_grad():
+                if hasattr(alt, "decide"):
+                    # The decision -- the offset, the manoeuvre, the speed scale -- is exact: it is
+                    # this planner's own row-wise logic, and the thing a subset call could get wrong.
+                    dw = alt.decide(env.sim.state, env.sim.tid)
+                    for n, v in zip(names, snap):
+                        getattr(alt, n).copy_(v)
+                    with alt._row_scope(rows, env.sim.state):
+                        dp = alt.decide(env.sim.state[rows], env.sim.tid[rows])
+                    for n, v in zip(names, snap):
+                        getattr(alt, n).copy_(v)
+                    if dw[0] is not None:
+                        assert torch.equal(dw[0][rows], dp[0]), f"{kind}: offset"
+                    assert torch.equal(dw[1][rows], dp[1]) and torch.equal(dw[2][rows], dp[2]), kind
+                whole = env._teacher_normalized(alt, None, None, follow, v_cap)
+                whole_state = [getattr(alt, n)[rows].clone() for n in names]
+                for n, v in zip(names, snap):
+                    getattr(alt, n).copy_(v)
+                part = env._teacher_normalized(alt, None, None, follow, v_cap, rows)
+            assert part.shape == (rows.numel(), env.act_dim)
+            # 1e-3 in normalised plan units, not bit equality, for the command: the reference
+            # teacher's Gauss-Newton fit is batched linear algebra, a 4-row batch and a 32-row one
+            # reduce in a different order, and six iterations grow the last bits -- measured up to
+            # 3.4e-4 on one curvature knot, 5e-4 1/m, with the decision above identical.
+            torch.testing.assert_close(part, whole[rows], rtol=0, atol=1e-3)
+            for n, v in zip(names, whole_state):
+                assert torch.equal(getattr(alt, n)[rows], v), f"{kind}.{n}"
+        env.step(a)

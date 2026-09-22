@@ -457,6 +457,8 @@ class PlanTracker:
         # every existing caller gets. The viewer's CUDA-graph fast path binds one here for its own
         # tracker only; nothing global is replaced, so other trackers in the process are unaffected.
         self._solver = None
+        #: `ilqr` constants per cost/bound signature, built on first use (see `ilqr_consts`).
+        self._consts_cache = {}
         # Optional nominal actuator conversion, installed only by the local automatic controller.
         self._command_hook = None
         self._input_hook = None
@@ -476,6 +478,25 @@ class PlanTracker:
         #: soft collision; left False, `reverse_cmd_gate` can never fire and the tracker is the one
         #: it has always been.
         self.contact = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+
+    def ilqr_consts(self, spec: PlanSpec):
+        """`build_ilqr_consts` for `spec` on this tracker's device, built once and kept here.
+
+        For a caller that runs `solve` on its own -- the interactive teacher's MPC preview -- inside
+        a CUDA graph capture. Built inline (`consts=None`), the cost matrices are `torch.tensor` of
+        Python tuples, a pageable host-to-device copy that a capture refuses; built here on the
+        first, eager call, the capture only reads them. Kept on the tracker because a capture has to
+        find every tensor a call reads from the environment (`graph_fastpath._tensor_paths`), and
+        `env.tracker` is on that path.
+        """
+        key = (tuple(spec.q), tuple(spec.qf), tuple(spec.r), tuple(spec.rd),
+               float(spec.a_brake), float(spec.a_max), float(self.s_max))
+        c = self._consts_cache.get(key)
+        if c is None:
+            # A list, not the builder's tuple: a capture points each input's path at a private
+            # clone for its duration, and an element of a tuple cannot be re-pointed.
+            c = self._consts_cache[key] = list(build_ilqr_consts(spec, self.s_max, self.u_prev.device))
+        return c
 
     def reset(self, ids: torch.Tensor):
         self.u_prev[ids] = 0.0; self.u_seq[ids] = 0.0

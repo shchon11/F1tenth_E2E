@@ -459,14 +459,18 @@ def _fake_race_env(solver, **tracker_hooks):
                                  teacher_any=True, pool=None, alt_teachers=[], tracker=tracker)
 
 
-def test_teacher_graph_refuses_a_preview_that_would_replay_the_solver_graph():
-    """With the legacy controller the interactive teacher previews the installed MPC, which is the
-    solver's own graph: replaying it inside the teacher's capture is fatal, so it is refused up
-    front. With the auto controller's hooks installed the preview is the reference rollout."""
+def test_a_graphed_plan_solver_no_longer_keeps_the_teacher_eager():
+    """This used to be refused: "with the legacy controller the interactive teacher previews the
+    installed MPC, which is the solver's own graph". The preview calls `mpc.solve` itself, at its
+    own K x B batch, with constants cached on the tracker (`PlanTracker.ilqr_consts`) so the capture
+    makes no host copy -- nothing replays the solver graph from inside a teacher call, and the
+    refusal kept every legacy-controller race's opponents eager (61 % of s911's step). The two
+    parity tests below are what vouch for it now; they failed at "should capture its teacher"
+    while the refusal stood."""
     from f1sim.viewer.graph_fastpath import GraphedCallable, teacher_eligible
     graphed = GraphedCallable.__new__(GraphedCallable)
     ok, why = teacher_eligible(_fake_race_env(graphed))
-    assert not ok and "legacy" in why
+    assert ok, why
     ok, _ = teacher_eligible(_fake_race_env(graphed, _plan_hook=lambda *a: None))
     assert ok
     ok, why = teacher_eligible(types.SimpleNamespace(sim=_FakeSim(), M=3, teacher=object()))
@@ -543,12 +547,16 @@ def test_teacher_graph_matches_eager_bit_for_bit_and_restores_the_env(slots):
         # raceline teacher, whose rows would all be overwritten.
         teachers = ([env.teacher] if env._raceline_teacher_needed() else []) + list(env.alt_teachers)
         assert teachers and len(tg._captures) == len(teachers)
+        # The arguments the env passes: a teacher that plans a subset is asked for its rows.
+        rows_of = {id(t): (env._alt_rows[k],) for k, t in zip(env.alt_teacher_kinds, env.alt_teachers)
+                   if hasattr(t, "plan_rows")}
         for _ in range(120):
             follow, v_cap = env.follow_cap(env.sim.state)
             for t in teachers:
+                extra = rows_of.get(id(t), ())
                 with torch.no_grad():
-                    want = tg._eager(t, None, None, follow, v_cap)
-                    got = tg(t, None, None, follow, v_cap)
+                    want = tg._eager(t, None, None, follow, v_cap, *extra)
+                    got = tg(t, None, None, follow, v_cap, *extra)
                 assert torch.equal(want, got)
             w._step_once(s)
         assert not tg.fell_back and tg.replays > 100 * len(teachers)
@@ -599,3 +607,64 @@ def test_the_console_session_captures_soft_walls_with_props():
         if fp is not None:
             fp.release()
         ctl_c.close(); fr_r.close()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="capturing a graph needs CUDA")
+def test_training_captures_the_opponent_planners_and_they_carry_their_state():
+    """The training runtime graphs the opponents too, and a planner with memory keeps it.
+
+    s911's recipe draws each race's opponent from four planners; eager, they were 61 % of an env
+    step at 256 envs. Two of them remember things between steps -- the spliner which side it
+    committed to, the lane planner its lane and its offset -- so every step each planner is asked
+    twice from the same state: eagerly, and through its graph after the state is put back. The
+    command and the state it leaves behind must match to the bit, over steps that include races
+    resetting with obstacles standing on the racing line."""
+    from f1sim import Config
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common, graph_runtime
+    tracks, rls = common.load_tracks(["gen:competition:2"], racelines=True)
+    ecfg = EnvConfig(race_size=2, opponent="slots", max_steps=90,
+                     opponent_slots=[{"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", "interactive"],
+                                      "speed_scale": [0.7, 1.0]}],
+                     action_mode="plan", procedural_obstacles=1.0, procedural_density=2.0,
+                     procedural_max_props=8, procedural_raceline_corridor="off", spawn_runway=3.0,
+                     collision_mode="soft", movable_obstacles=True, stagger_first_episode=True,
+                     compile_tracker=False)
+    cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = 181
+    env = common.make_env(tracks, 16, "cuda", ecfg, cfg=cfg, seed=3, rls=rls)
+    env.reset(seed=3)
+    logs = []
+    rt = graph_runtime.prepare_graph_runtime(env, log=logs.append)
+    try:
+        tg = rt.teacher_graph
+        assert tg is not None, f"the planners were not captured: {logs}"
+        teachers = list(env.alt_teachers)
+        assert len(tg._captures) == len(teachers) == 4
+        stateful = [t for t in teachers if getattr(t, "GRAPH_STATE", ())]
+        assert len(stateful) == 3, [type(t).__name__ for t in stateful]
+        a = torch.zeros(env.B, env.act_dim, device=env.device)
+        rows_of = {id(t): (env._alt_rows[k],) for k, t in zip(env.alt_teacher_kinds, env.alt_teachers)
+                   if hasattr(t, "plan_rows")}
+        assert rows_of, "the interactive opponent should be planned for its own rows"
+        for _ in range(120):
+            follow, v_cap = env.follow_cap(env.sim.state)
+            for t in teachers:
+                names = getattr(t, "GRAPH_STATE", ())
+                extra = rows_of.get(id(t), ())
+                snap = [getattr(t, n).clone() for n in names]
+                with torch.no_grad():
+                    want = tg._eager(t, None, None, follow, v_cap, *extra)
+                    want_state = [getattr(t, n).clone() for n in names]
+                    for n, v in zip(names, snap):
+                        getattr(t, n).copy_(v)
+                    got = tg(t, None, None, follow, v_cap, *extra)
+                assert torch.equal(want, got), type(t).__name__
+                for n, v in zip(names, want_state):
+                    assert torch.equal(getattr(t, n), v), f"{type(t).__name__}.{n} was not carried"
+            env.step(a)
+        assert not tg.fell_back, tg.fell_back
+        assert tg.replays > 100 * len(teachers)
+    finally:
+        graph_runtime.release_graph_runtime(rt)
+    assert "_teacher_normalized" not in env.__dict__
