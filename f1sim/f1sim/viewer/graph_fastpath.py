@@ -45,6 +45,7 @@ What makes this safe rather than fast-and-wrong:
 from __future__ import annotations
 
 import dataclasses
+import gc
 import threading
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
@@ -146,9 +147,22 @@ class GraphedCallable:
                     fn(*self._static)
             self._capture_stream.wait_stream(side)
             torch.cuda.synchronize()
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self._out = fn(*self._static)
+            # Collect first and not during. Freeing CUDA memory inside a capture raises "operation
+            # not permitted when stream is capturing", and a dead Python cycle holding tensors --
+            # a released fast path, a finished session's env -- is collected whenever the allocator
+            # next trips the threshold, which may be in the middle of this. `torch.cuda.graph` used
+            # to collect on entry and stopped (`torch.compiler.config.force_cudagraph_gc`, off by
+            # default), so doing it here is what makes a capture independent of that timing.
+            gc.collect()
+            enabled = gc.isenabled()
+            gc.disable()
+            try:
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph):
+                    self._out = fn(*self._static)
+            finally:
+                if enabled:
+                    gc.enable()
         except Exception as exc:                       # noqa: BLE001 -- re-raised as fatal
             # No RNG restore here, deliberately. After a failed capture the CUDA generator is in the
             # poisoned state documented at the top of this module, and `set_rng_state_all` can raise
