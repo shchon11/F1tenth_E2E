@@ -13,6 +13,14 @@ from . import props
 from .track import StaticProp
 
 _LINEAR_DIMS = {"width", "depth", "height", "radius", "scale"}
+_FOOTPRINT_DIMS = {"width", "depth", "radius"}
+
+#: [m] No placed asset is shorter than this. The LiDAR scans at 0.110 m above the floor, randomised
+#: to 0.125 m (`params.py`, `lidar.mount_z`), and the body's pitch tilts that plane further; an
+#: obstacle the scan passes over can only be found by hitting it. The high family used to shrink an
+#: asset *uniformly* to fit its box, height included: ICCAS seed 1 stood a 0.108 m crate stack and two
+#: 0.122 m blocks, and s912 and s913 hit that corner 29 times in a kilometre.
+MIN_VISIBLE_HEIGHT = 0.16
 
 
 def scaled_prop(prop, scale):
@@ -26,6 +34,24 @@ def scaled_prop(prop, scale):
         signature = inspect.signature(props.REGISTRY[prop.style])
         for key in _LINEAR_DIMS.intersection(signature.parameters):
             dims[key] = float(dims.get(key, signature.parameters[key].default)) * scale
+    return replace(prop, dims=tuple(sorted(dims.items())))
+
+
+def fitted_prop(prop, footprint, height):
+    """`prop` with its footprint scaled by `footprint` and its height by `height`, never shorter than
+    `MIN_VISIBLE_HEIGHT`. Fitting an asset into a box is a statement about the floor it covers; how
+    tall it stands is what decides whether the LiDAR sees it, and that is not the box's to decide."""
+    if not (math.isfinite(footprint) and footprint > 0 and math.isfinite(height) and height > 0):
+        raise ValueError("asset scale must be finite and positive")
+    if prop.style == "mesh":
+        return scaled_prop(prop, footprint)
+    dims = dict(prop.dims)
+    signature = inspect.signature(props.REGISTRY[prop.style])
+    for key in _FOOTPRINT_DIMS.intersection(signature.parameters):
+        dims[key] = float(dims.get(key, signature.parameters[key].default)) * footprint
+    if "height" in signature.parameters:
+        h = float(dims.get("height", signature.parameters["height"].default)) * height
+        dims["height"] = max(h, MIN_VISIBLE_HEIGHT)
     return replace(prop, dims=tuple(sorted(dims.items())))
 
 
@@ -60,8 +86,8 @@ def with_asset_obstacles(track, family="edge", seed=0, *, asset="mixed", scale=1
             # Accepted legacy patterns prove their boxes passable. Assets fit inside each
             # accepted box, preserving that corridor while using real finite geometry.
             fit = min(sx / span[0], sy / span[1])
-            factor = min(float(rng.uniform(.85, 1.15)) * fit * scale, fit)
-            additions.append(scaled_prop(p, factor))
+            jitter = float(rng.uniform(.85, 1.15))
+            additions.append(fitted_prop(p, min(jitter * fit * scale, fit), jitter * scale))
         out.props = existing + tuple(additions)
         out.hard_patterns = recipe.hard_patterns
         if not additions:
@@ -89,7 +115,9 @@ def with_asset_obstacles(track, family="edge", seed=0, *, asset="mixed", scale=1
         if any(min(abs(arc[i] - arc[j]), length - abs(arc[i] - arc[j])) < 3.0 for j in sites):
             continue
         style = styles[int(rng.integers(len(styles)))]
-        p = scaled_prop(StaticProp(style, 0., 0., seed=int(rng.integers(1 << 30))), scale * float(rng.uniform(.65, 1.35)))
+        base = StaticProp(style, 0., 0., seed=int(rng.integers(1 << 30)))    # drawn before the size, as ever
+        size = scale * float(rng.uniform(.65, 1.35))
+        p = fitted_prop(base, size, size)
         radius = p.build().envelope.radius
         left = track.free_width_along(line[i], normal[i])
         right = track.free_width_along(line[i], -normal[i])

@@ -56,6 +56,25 @@ def test_density_increases_and_high_uses_existing_patterns(circuit):
         assert np.all(np.ptp(p.build().envelope.footprint, axis=0) <= np.array([sx, sy]) + 1e-8)
 
 
+@pytest.mark.parametrize("family", ("edge", "line", "hard"))
+def test_every_placed_asset_stands_above_the_lidar(circuit, family):
+    """Fitting a box shrinks the footprint, never the height below `MIN_VISIBLE_HEIGHT`: an obstacle
+    under the scan plane (0.110 m, randomised to 0.125 m) is one the policy can only find by hitting
+    it. The high family used to scale height with the fit and stood 0.108 m crate stacks."""
+    from f1sim.asset_obstacles import MIN_VISIBLE_HEIGHT
+    for seed in range(1, 30):
+        for p in with_asset_obstacles(circuit, family, seed).props:
+            assert p.build().envelope.height >= MIN_VISIBLE_HEIGHT - 1e-9, (seed, p.style, p.dims)
+
+
+def test_the_high_family_keeps_each_assets_own_height(circuit):
+    """Same seed, same boxes, same footprints as before; the height is the asset's own, jittered."""
+    for p in with_asset_obstacles(circuit, "hard", 44).props:
+        h = p.build().envelope.height
+        own = props.build(p.style, seed=0).envelope.height
+        assert h >= min(0.85 * own, own) - 1e-9 or h == pytest.approx(0.16), (p.style, h, own)
+
+
 def test_authored_default_and_bare_are_unmodified(circuit):
     p = StaticProp("wooden_crate", 17, 10)
     circuit.props = (p,)
