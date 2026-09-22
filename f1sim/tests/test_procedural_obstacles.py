@@ -304,6 +304,41 @@ def test_patterns_keep_their_spacing(catalogue_tracks):
         assert float(gaps.min()) >= po.MIN_SPACING - 1e-3, f"env {b}: {gaps.tolist()}"
 
 
+def test_a_dense_lap_still_moves_its_patterns():
+    """At a density where the 6 m spacing leaves each sector almost no free arc, a pattern must
+    still land anywhere on the lap from one reset to the next. On ICCAS at 1.5 per 10 m each of
+    the seven stood at the same point +-0.1 m at every reset until the sector grid was given a
+    random phase: the policy was learning seven places."""
+    env = make_env(ring_track(), B=16, seed=3, procedural_obstacles=1.0, procedural_density=1.5, n_beams=8)
+    p = env.procedural
+    L = float(env.sim.track.length[0])
+    assert float(L / int(p.n_pat[0]) - po.MIN_SPACING) < 0.5, "the test needs a lap with no free arc"
+    seen = []
+    for r in range(8):
+        env.reset(seed=30 + r)
+        seen.append(p.last_s[:, 0][p.last_live[:, 0]])
+    s0 = torch.cat(seen)
+    counts = torch.histc(s0, bins=8, min=0.0, max=L)
+    assert bool((counts > 0).all()), f"pattern 0 never reached part of the lap: {counts.tolist()}"
+
+
+def test_the_slot_budget_drops_patterns_at_random_not_in_lap_order():
+    """More live pieces than slots: which patterns keep theirs is random. Kept in lap order, the
+    last patterns of a dense lap were dropped at nearly every reset (on ICCAS the last three
+    supplied 51 of 640 kept pieces) and that stretch of the lap never had an obstacle."""
+    env = make_env(ring_track(), B=32, seed=5, procedural_obstacles=1.0, procedural_density=1.5,
+                   procedural_max_props=8, n_beams=8)
+    p = env.procedural
+    kept = torch.zeros(p.P)
+    for r in range(6):
+        env.reset(seed=50 + r)
+        live = p.p_zhi > p.p_zlo
+        kept += torch.bincount(p.slot_pattern[live], minlength=p.P).float()
+    assert p.stats()["dropped_per_layout"] > 1.0, "the test needs a budget that actually binds"
+    share = kept / kept.sum()
+    assert float(share.min()) > 0.5 / p.P, f"a pattern slot is nearly always the one dropped: {share.tolist()}"
+
+
 def test_every_pattern_kind_is_drawn(catalogue_tracks):
     """Six kinds, all of them: a lap with fewer than six patterns still cycles a fresh permutation."""
     env = make_env(catalogue_tracks, B=64, seed=6, procedural_obstacles=1.0, n_beams=8)

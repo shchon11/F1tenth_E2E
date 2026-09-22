@@ -540,7 +540,13 @@ class ProceduralObstacles:
         L = self.tr.length[t][:, None]
         sector = L / n_pat.clamp_min(1).float()
         free = (sector - MIN_SPACING).clamp_min(0.0)
-        base = pat.float() * sector + 0.5 * (sector - free)
+        # The whole grid of sectors is turned by a random phase every draw. Without it pattern k
+        # always sat in sector k, and a dense lap leaves a sector almost no `free` arc: on ICCAS
+        # (43.4 m, density 1.5) the seven patterns stood at the same seven points +-0.1 m at every
+        # reset of s911-s913, so what was learned was seven places, not obstacles. A rigid turn
+        # keeps every gap, the wrap included, so the 6 m spacing is untouched.
+        phase = self._rand((D, 1)) * L
+        base = pat.float() * sector + 0.5 * (sector - free) + phase
         # CANDIDATES stratified places inside the pattern's own slice of the lap. Every candidate
         # keeps the 6 m spacing, so the choice between them is free. The whole placement is worked
         # out for all of them and the pattern then takes one that *fits*: `hard_obstacles` gets the
@@ -613,7 +619,7 @@ class ProceduralObstacles:
         yaw = (torch.atan2(tan[..., 1], tan[..., 0]) + 0.5 * math.pi
                + (self._rand(along.shape) * 2.0 - 1.0) * YAW_JITTER)
 
-        self.last_s.index_copy_(0, dst, take(s_cand)[src])
+        self.last_s.index_copy_(0, dst, torch.remainder(take(s_cand), L)[src])
         self.last_kind.index_copy_(0, dst, kind[src])
         self.last_live.index_copy_(0, dst, (act & live.any(-1))[src])
         self._write(dst, src, xy.reshape(D, P * Q, 2), yaw.reshape(D, P * Q),
@@ -762,9 +768,19 @@ class ProceduralObstacles:
 
     # ------------------------------------------------------------------ writing the slots
     def _write(self, dst, src, xy, yaw, sid, live):
-        """Compact each layout's live pieces into the first `C` slots and copy them into `dst`."""
+        """Compact each layout's live pieces into the first `C` slots and copy them into `dst`.
+
+        When there are more live pieces than slots, the patterns are kept in a random order, whole,
+        and the one the budget runs out in is kept in part. They used to be kept in lap order: with
+        10 slots for seven patterns on ICCAS, the last three were dropped at nearly every reset
+        (51 of 640 kept pieces), so the last 40 % of the lap almost never had an obstacle."""
         D = xy.shape[0]
-        order = torch.argsort((~live).to(torch.int8), dim=1, stable=True)[:, :self.C]
+        P, Q = self.P, self.Q
+        rank = torch.argsort(self._rand((D, P)), dim=1)                # a random order of the patterns
+        prio = torch.empty_like(rank).scatter_(1, rank, torch.arange(P, device=rank.device).expand(D, P))
+        key = (prio[:, :, None] * Q + torch.arange(Q, device=rank.device)[None, None]).reshape(D, P * Q)
+        key = torch.where(live, key, key + P * Q)                      # every dead piece after every live one
+        order = torch.argsort(key, dim=1)[:, :self.C]
         g = lambda a: torch.gather(a, 1, order if a.dim() == 2 else order[..., None].expand(-1, -1, a.shape[-1]))
         keep = g(live)
         sid_k = g(sid)
