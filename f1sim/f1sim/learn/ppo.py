@@ -662,6 +662,41 @@ def main():
                          "off and go again, and above all not end up driving the wrong way "
                          "(--wrong-way-penalty). Not comparable with a 'terminate' run's "
                          "collisions per km without saying so")
+    # ---- the learner. PPO is this file's own loop; SAC shares everything up to it (`learn/sac.py`).
+    ap.add_argument("--algo", choices=["ppo", "sac"], default="ppo",
+                    help="the learning algorithm. 'sac': soft actor-critic with a replay buffer on the "
+                         "same environment, model and conditioning; the actor is the same module, so "
+                         "its checkpoints (sac_u*.pt) load wherever a PPO one does")
+    ap.add_argument("--sac-buffer", type=int, default=500_000, help="replay capacity, learner transitions")
+    ap.add_argument("--sac-batch", type=int, default=256)
+    ap.add_argument("--sac-updates-per-step", type=int, default=2,
+                    help="gradient steps per env step (an env step adds one transition per learner row)")
+    ap.add_argument("--sac-start", type=int, default=20_000, help="transitions buffered before any update")
+    ap.add_argument("--sac-critic-warmup", type=int, default=10_000,
+                    help="updates of the Q functions alone before the actor moves: they start as the "
+                         "PPO value function and know nothing yet about what an action does")
+    ap.add_argument("--sac-tau", type=float, default=0.005)
+    ap.add_argument("--sac-lr-actor", type=float, default=1e-5)
+    ap.add_argument("--sac-actor-every", type=int, default=2,
+                    help="one actor step per this many critic steps (delayed policy updates)")
+    ap.add_argument("--sac-lr-critic", type=float, default=1e-4)
+    ap.add_argument("--sac-alpha0", type=float, default=0.01)
+    ap.add_argument("--sac-target-entropy", type=float, default=None,
+                    help="default: the starting policy's own entropy, so the exploration it had is kept")
+    ap.add_argument("--sac-anchor", type=float, default=5.0,
+                    help="weight of ||mu(s) - mu_init(s)||^2 in the actor loss at the start")
+    ap.add_argument("--sac-anchor-decay", type=float, default=2e6,
+                    help="learner steps over which the anchor decays linearly to zero")
+    ap.add_argument("--sac-contact-frac", type=float, default=0.25,
+                    help="share of each batch drawn from the half second before a wall/prop contact")
+    ap.add_argument("--sac-contact-window", type=int, default=20)
+    ap.add_argument("--kind-mix-assign", choices=["partition", "redraw"], default="partition",
+                    help="how a kind_mix opponent slot picks its driver. 'partition' (training's "
+                         "default): race g drives kind_mix[g %% len], fixed -- every update holds each "
+                         "kind in exact proportion, and a teacher that can plan a subset plans only its "
+                         "own rows (the interactive opponent was half a graphed step planning all of "
+                         "them). 'redraw': uniformly at every race reset, as the console does and as "
+                         "spec_korea_contact_s911/s912 were trained")
     ap.add_argument("--movable-obstacles", action="store_true",
                     help="a struck obstacle is shoved instead of being a wall with a crate's "
                          "shape: each carries the mass of what it is (cardboard box 1.2 kg, "
@@ -836,6 +871,7 @@ def main():
                                                               # nothing terminates under soft, so the
                                                               # batch would reset in lockstep forever
                                                               stagger_first_episode=a.collision_mode == "soft",
+                                                              kind_mix_assign=a.kind_mix_assign,
                                                               movable_obstacles=a.movable_obstacles,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
@@ -1556,6 +1592,41 @@ def main():
                 "stage_cap_state": {
                     "collision_history": list(collision_history),
                     "track_history": [list(history) for history in track_hist]}}
+
+    if a.algo == "sac":
+        from . import sac as sac_mod
+        if memory_on or roll_aug is not None:
+            raise SystemExit("--algo sac: a recurrent actor or extra scan channels are not supported")
+        if controller.base != "legacy":
+            raise SystemExit("--algo sac: controller arms are not supported (use --controller legacy)")
+
+        def save_sac(path, log_i, steps, cap_now):
+            save_checkpoint(path, model, {"spec": spec.__dict__, "phase": "sac", "run": a.name,
+                                          "update": log_i, "steps": steps,
+                                          "total_steps": steps_base + steps, "wandb_id": wandb_id,
+                                          "cap": cap_now, "action_mode": a.action_mode,
+                                          "experiment": experiment_meta_now()})
+
+        hyper = sac_mod.SACHyper(buffer=a.sac_buffer, batch=a.sac_batch,
+                                 updates_per_step=a.sac_updates_per_step, start=a.sac_start,
+                                 critic_warmup=a.sac_critic_warmup, actor_every=a.sac_actor_every,
+                                 tau=a.sac_tau,
+                                 lr_actor=a.sac_lr_actor, lr_critic=a.sac_lr_critic,
+                                 alpha0=a.sac_alpha0, target_entropy=a.sac_target_entropy,
+                                 anchor=a.sac_anchor, anchor_decay=a.sac_anchor_decay,
+                                 contact_frac=a.sac_contact_frac, contact_window=a.sac_contact_window)
+        sac_mod.train(a, env=env, model=model, obs=obs, lid=lid, device=device, cond_dim=cond_dim,
+                      cond_mode=a.cond, cond_spec=cond_spec, dial=dial, dial_new=dial_new, out=out,
+                      progress_log=progress_log, run=run, spec=spec, steps_base=steps_base,
+                      t_start=t_start, save=save_sac, hyper=hyper, gamma=a.gamma, log_every=T,
+                      save_every=a.save_every, amp=a.amp)
+        controller.release()
+        progress_log.close()
+        if graph_rt is not None:
+            from .graph_runtime import release_graph_runtime
+            release_graph_runtime(graph_rt)
+        run.finish()
+        return
 
     n_updates = int(a.total // (T * B))
     while steps_done < a.total:
