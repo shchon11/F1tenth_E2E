@@ -180,60 +180,83 @@ class Replay:
         tt = (ti[:, None] - back) % self.T
         return self._dq(self.scan[tt, j[:, None]])                            # (B, k, N)
 
-    def sample(self, B: int, contact_frac: float = 0.0, gen: Optional[torch.Generator] = None):
-        """A batch of (s, a, r, term, s') with s' rebuilt as the next slot or the kept final.
+    def sample(self, B: int, contact_frac: float = 0.0, gen: Optional[torch.Generator] = None,
+               n_step: int = 1, gamma: float = 0.99):
+        """A batch of n-step transitions: s, a, the discounted return `ret` of the next `n_step`
+        rewards (fewer where the episode ends first), `disc` -- the discount on the bootstrap, 0 after
+        a real ending -- and the bootstrap state s' (the slot `n_step` on, or the episode's kept
+        final observation where it ended by truncation inside the window).
 
-        The newest slot has no successor yet unless its episode ended there, so it is drawn from
-        only through its final. `contact_frac` of the batch comes from the flagged slots when there
-        are any."""
+        Why n-step at all: at gamma 0.997 a one-step target has to carry a lap's reward back through
+        hundreds of bootstraps, and on s911's recipe the critic's loss climbed from 32 to 100 over
+        the first 400 k transitions with the policy frozen. The newest `n_step` slots have no full
+        window yet and are not drawn; neither, in a full ring, are the oldest `k`, whose stacks
+        reach into overwritten frames. `contact_frac` of the batch comes from the flagged slots."""
         dev = self.scan.device
+        n = max(1, int(n_step))
         filled = min(self.t, self.T)
         newest = (self.t - 1) % self.T
+        full = filled == self.T
+        lo_gap = self.k if full else 0                 # oldest slots whose stacks cannot be rebuilt
+        span = (self.T - lo_gap - n - 1) if full else (filled - n - 1)
+        if span < 1:
+            raise RuntimeError(f"replay holds {filled} steps, too few for {n}-step windows")
+        first = (newest + 1 + lo_gap) % self.T if full else 0
+
+        def dist_from_first(t):
+            return (t - first) % self.T
+
         n_c = int(round(B * contact_frac))
         idx_t, idx_j = [], []
         if n_c:
-            cand = torch.nonzero(self.near[:filled]).T if filled < self.T else torch.nonzero(self.near).T
+            cand = torch.nonzero(self.near[:filled]).T
+            if cand.shape[1]:
+                cand = cand[:, dist_from_first(cand[0]) < span]
             if cand.shape[1]:
                 pick = torch.randint(cand.shape[1], (n_c,), device=dev, generator=gen)
                 idx_t.append(cand[0, pick]); idx_j.append(cand[1, pick])
             else:
                 n_c = 0
         u = B - n_c
-        if filled == self.T:
-            # A full ring. The oldest `k` steps have had the frames before them overwritten, so their
-            # stacks cannot be rebuilt, and the newest has no successor yet: draw from the rest.
-            span = self.T - self.k - 1
-            ti = (newest + 1 + self.k + torch.randint(span, (u,), device=dev, generator=gen)) % self.T
-        else:
-            # Filling: every slot but the newest. The first `k` steps of the buffer rebuild their
-            # stacks by repeating the first frame they have, which is one stack in a few thousand.
-            ti = torch.randint(max(filled - 1, 1), (u,), device=dev, generator=gen)
-        idx_t.append(ti); idx_j.append(torch.randint(self.n, (u,), device=dev, generator=gen))
+        idx_t.append((first + torch.randint(span, (u,), device=dev, generator=gen)) % self.T)
+        idx_j.append(torch.randint(self.n, (u,), device=dev, generator=gen))
         ti, j = torch.cat(idx_t), torch.cat(idx_j)
-        # a contact-flagged newest slot without a final has no successor either
-        no_next = (ti == newest) & (self.fin_slot[ti, j] < 0)
-        ti = torch.where(no_next, (ti - 1) % self.T, ti)
 
-        s_scan = self._stack(ti, j)
-        s_pro = self.pro[ti, j].float()
-        s_priv = self.priv[ti, j]
-        s_cond = self.cond[ti, j]
-        nt = (ti + 1) % self.T
-        n_scan = self._stack(nt, j)
-        n_pro = self.pro[nt, j].float()
-        n_priv = self.priv[nt, j]
-        n_cond = self.cond[nt, j]
-        slot = self.fin_slot[ti, j].to(torch.long)
-        has_fin = slot >= 0
-        if bool(has_fin.any()):
-            sl = slot.clamp(min=0)
-            n_scan = torch.where(has_fin[:, None, None], self._dq(self.fin_scan[sl]), n_scan)
-            n_pro = torch.where(has_fin[:, None], self.fin_pro[sl].float(), n_pro)
-            n_priv = torch.where(has_fin[:, None], self.fin_priv[sl], n_priv)
-            n_cond = torch.where(has_fin[:, None], self.fin_cond[sl], n_cond)
-        return {"scan": s_scan, "pro": s_pro, "priv": s_priv, "cond": s_cond,
-                "act": self.act[ti, j], "rew": self.rew[ti, j], "term": self.term[ti, j].float(),
-                "n_scan": n_scan, "n_pro": n_pro, "n_priv": n_priv, "n_cond": n_cond}
+        ks = torch.arange(n, device=dev)
+        seq = (ti[:, None] + ks[None]) % self.T                                 # (B, n)
+        r = self.rew[seq, j[:, None]]
+        lst = self.last[seq, j[:, None]]
+        trm = self.term[seq, j[:, None]]
+        ended = lst.any(1)
+        K = torch.where(ended, lst.to(torch.uint8).argmax(1), torch.full_like(ti, n - 1))
+        inc = (ks[None] <= K[:, None]).to(r.dtype)
+        pw = gamma ** ks.to(r.dtype)
+        ret = (r * pw[None] * inc).sum(1)
+        ar = torch.arange(ti.numel(), device=dev)
+        end_slot = (ti + K) % self.T
+        fslot = self.fin_slot[end_slot, j].to(torch.long)
+        term_end = ended & trm[ar, K]
+        # a truncation whose final observation is no longer kept (its side ring wrapped) is not
+        # bootstrapped from a wrong state: it is treated as an ending, which it nearly is
+        lost = ended & ~term_end & (fslot < 0)
+        disc = (gamma ** (K + 1).to(r.dtype)) * (~(term_end | lost)).to(r.dtype)
+
+        ns = (ti + n) % self.T
+        n_scan = self._stack(ns, j)
+        n_pro = self.pro[ns, j].float()
+        n_priv = self.priv[ns, j]
+        n_cond = self.cond[ns, j]
+        use_fin = ended & (fslot >= 0)
+        if bool(use_fin.any()):
+            sl = fslot.clamp(min=0)
+            n_scan = torch.where(use_fin[:, None, None], self._dq(self.fin_scan[sl]), n_scan)
+            n_pro = torch.where(use_fin[:, None], self.fin_pro[sl].float(), n_pro)
+            n_priv = torch.where(use_fin[:, None], self.fin_priv[sl], n_priv)
+            n_cond = torch.where(use_fin[:, None], self.fin_cond[sl], n_cond)
+        return {"scan": self._stack(ti, j), "pro": self.pro[ti, j].float(), "priv": self.priv[ti, j],
+                "cond": self.cond[ti, j], "act": self.act[ti, j], "ret": ret, "disc": disc,
+                "n_scan": n_scan, "n_pro": n_pro, "n_priv": n_priv, "n_cond": n_cond,
+                "ti": ti, "j": j}
 
 
 # ------------------------------------------------------------------------------------------ hyper
@@ -242,12 +265,20 @@ class SACHyper:
     buffer: int = 500_000          # transitions (learner rows x steps)
     batch: int = 256
     updates_per_step: int = 2      # gradient steps per env step (one env step = one row of the buffer)
-    start: int = 20_000            # transitions in the buffer before any update
+    # Transitions in the buffer before any update. The whole batch starts on the same step, so the
+    # first thousands are nothing but starts -- contact penalties everywhere, a 16-step return of -10
+    # on average against a value of ~55 -- and a critic fitted to them first learns the wrong thing.
+    start: int = 100_000
     critic_warmup: int = 10_000    # updates of the critics alone before the actor moves
     actor_every: int = 2           # one actor (and alpha) step per this many critic steps
     tau: float = 0.005
     lr_actor: float = 1e-5
-    lr_critic: float = 1e-4
+    lr_critic: float = 5e-5
+    # The critic's learning rate ramps up from zero over this many updates. Without it, measured on
+    # s911's recipe, Adam's first steps moved Q(s, a) from 61 to 26 in five updates against a target
+    # of 41 -- every weight at once -- and the loss spent the next thousand updates in the hundreds.
+    critic_lr_warmup: int = 2_000
+    huber: float = 10.0             # the critic loss is Huber with this delta, not squared error
     lr_alpha: float = 1e-4
     alpha0: float = 0.01
     target_entropy: Optional[float] = None   # None: the starting policy's own entropy
@@ -255,6 +286,15 @@ class SACHyper:
     anchor_decay: float = 2e6      # env steps (learner) over which it decays linearly to zero
     contact_frac: float = 0.25
     contact_window: int = 20       # steps (0.5 s) before a contact onset that are flagged
+    n_step: int = 16               # rewards summed before bootstrapping (0.4 s at 40 Hz)
+    # "awac": advantage-weighted regression onto the buffer's own actions -- the policy moves only
+    # toward actions it actually took that the critic ranks above its average, so an error in Q
+    # cannot be climbed the way a reparameterised gradient climbs it. "sac": the soft actor-critic
+    # update, dQ/da through the Gaussian sample, with a learned temperature.
+    actor_loss: str = "awac"
+    awac_beta: float = 1.0         # temperature, in units of the batch's advantage std
+    awac_samples: int = 2          # policy samples for the baseline V(s) = E_pi min Q(s, a)
+    awac_wmax: float = 20.0
 
 
 def _entropy(dist) -> torch.Tensor:
@@ -378,8 +418,9 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
         # ---- updates
         if rb.size >= hyper.start:
             for _ in range(hyper.updates_per_step):
-                bt = rb.sample(hyper.batch, hyper.contact_frac, gen)
-                alpha = log_alpha.exp().detach()
+                bt = rb.sample(hyper.batch, hyper.contact_frac, gen, n_step=hyper.n_step, gamma=gamma)
+                # the soft value's entropy bonus belongs to the soft actor only
+                alpha = log_alpha.exp().detach() if hyper.actor_loss == "sac" else torch.zeros((), device=device)
                 cond_b = bt["cond"] if cond_dim else None
                 n_cond_b = bt["n_cond"] if cond_dim else None
                 with torch.no_grad(), ac:
@@ -389,39 +430,64 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
                     na = nu.clamp(-1, 1)
                     qn = torch.minimum(q1_t(bt["n_scan"], bt["n_pro"], bt["n_priv"], na),
                                        q2_t(bt["n_scan"], bt["n_pro"], bt["n_priv"], na)).float()
-                    y = bt["rew"] + gamma * (1.0 - bt["term"]) * (qn - alpha * nlogp)
+                    y = bt["ret"] + bt["disc"] * (qn - alpha * nlogp)
                 with ac:
                     qa = q1(bt["scan"], bt["pro"], bt["priv"], bt["act"]).float()
                     qb = q2(bt["scan"], bt["pro"], bt["priv"], bt["act"]).float()
-                loss_q = F.mse_loss(qa, y) + F.mse_loss(qb, y)
+                loss_q = (F.huber_loss(qa, y, delta=hyper.huber) + F.huber_loss(qb, y, delta=hyper.huber))
+                for g_ in opt_q.param_groups:
+                    g_["lr"] = hyper.lr_critic * min(1.0, (updates + 1) / max(hyper.critic_lr_warmup, 1))
                 opt_q.zero_grad(set_to_none=True); loss_q.backward()
                 nn.utils.clip_grad_norm_(list(q1.parameters()) + list(q2.parameters()), 10.0)
                 opt_q.step()
-                losses["q"].append(loss_q.detach()); losses["q_mean"].append(qa.detach().mean())
+                losses["q"].append(((qa - y) ** 2).mean().detach()); losses["q_mean"].append(qa.detach().mean())
                 # Delayed policy updates (TD3's), and none at all while the critics are warming up:
                 # the 2026-09-22 smoke gave the actor 200 critic steps' head start and it drove worse
                 # for it (0 -> 2.0 contacts/km on the empty track) -- it was following a Q that
                 # did not yet know what an action does.
                 if updates >= hyper.critic_warmup and updates % max(hyper.actor_every, 1) == 0:
                     frac_anchor = max(0.0, 1.0 - steps_done / max(hyper.anchor_decay, 1.0))
-                    with ac:
-                        d = actor.step_dist(bt["scan"], bt["pro"], cond_b)[0]
-                        uu = d.rsample()
-                        logp = d.log_prob(uu).sum(1).float()
-                        aa = uu.clamp(-1, 1)
-                        qpi = torch.minimum(q1(bt["scan"], bt["pro"], bt["priv"], aa),
-                                            q2(bt["scan"], bt["pro"], bt["priv"], aa)).float()
-                        with torch.no_grad():
+                    if hyper.actor_loss == "awac":
+                        with torch.no_grad(), ac:
+                            minq = lambda act_: torch.minimum(q1(bt["scan"], bt["pro"], bt["priv"], act_),
+                                                              q2(bt["scan"], bt["pro"], bt["priv"], act_)).float()
+                            d_old = actor.step_dist(bt["scan"], bt["pro"], cond_b)[0]
+                            v = torch.stack([minq(d_old.sample().clamp(-1, 1))
+                                             for _ in range(max(1, hyper.awac_samples))]).mean(0)
+                            adv = minq(bt["act"]) - v
+                            w = torch.exp(adv / (hyper.awac_beta * adv.std().clamp_min(1e-3))).clamp(max=hyper.awac_wmax)
                             mu0 = actor0.step_dist(bt["scan"], bt["pro"], cond_b)[0].mean.float()
-                        anchor = ((d.mean.float() - mu0) ** 2).sum(1).mean()
-                    loss_pi = (alpha * logp - qpi).mean() + hyper.anchor * frac_anchor * anchor
-                    opt_pi.zero_grad(set_to_none=True); loss_pi.backward()
-                    nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
-                    opt_pi.step()
-                    loss_a = -(log_alpha * (logp.detach() - target_entropy)).mean()
-                    opt_a.zero_grad(set_to_none=True); loss_a.backward(); opt_a.step()
-                    losses["pi"].append(loss_pi.detach()); losses["alpha"].append(log_alpha.detach().exp())
-                    losses["ent"].append((-logp).detach().mean()); losses["anchor"].append(anchor.detach())
+                        with ac:
+                            d = actor.step_dist(bt["scan"], bt["pro"], cond_b)[0]
+                            logp_buf = d.log_prob(bt["act"]).sum(1).float()
+                            anchor = ((d.mean.float() - mu0) ** 2).sum(1).mean()
+                        loss_pi = -(w * logp_buf).mean() / w.mean().clamp_min(1e-6) \
+                            + hyper.anchor * frac_anchor * anchor
+                        opt_pi.zero_grad(set_to_none=True); loss_pi.backward()
+                        nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+                        opt_pi.step()
+                        losses["pi"].append(loss_pi.detach()); losses["anchor"].append(anchor.detach())
+                        losses["ent"].append(d.entropy().sum(1).mean().detach().float())
+                        losses["alpha"].append(w.mean().detach())          # logged as the mean weight
+                    else:
+                        with ac:
+                            d = actor.step_dist(bt["scan"], bt["pro"], cond_b)[0]
+                            uu = d.rsample()
+                            logp = d.log_prob(uu).sum(1).float()
+                            aa = uu.clamp(-1, 1)
+                            qpi = torch.minimum(q1(bt["scan"], bt["pro"], bt["priv"], aa),
+                                                q2(bt["scan"], bt["pro"], bt["priv"], aa)).float()
+                            with torch.no_grad():
+                                mu0 = actor0.step_dist(bt["scan"], bt["pro"], cond_b)[0].mean.float()
+                            anchor = ((d.mean.float() - mu0) ** 2).sum(1).mean()
+                        loss_pi = (alpha * logp - qpi).mean() + hyper.anchor * frac_anchor * anchor
+                        opt_pi.zero_grad(set_to_none=True); loss_pi.backward()
+                        nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+                        opt_pi.step()
+                        loss_a = -(log_alpha * (logp.detach() - target_entropy)).mean()
+                        opt_a.zero_grad(set_to_none=True); loss_a.backward(); opt_a.step()
+                        losses["pi"].append(loss_pi.detach()); losses["alpha"].append(log_alpha.detach().exp())
+                        losses["ent"].append((-logp).detach().mean()); losses["anchor"].append(anchor.detach())
                 _polyak(q1_t, q1, hyper.tau); _polyak(q2_t, q2, hyper.tau)
                 updates += 1
 
@@ -444,7 +510,8 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
                    "episode/lap_time_s": float(np.mean(ep_stats["lap_time"])) if ep_stats["lap_time"] else float("nan"),
                    "loss/kl_ref": float(kl0), "time/env_steps_per_s": sps,
                    "sac/q_loss": mean(losses["q"]), "sac/q_mean": mean(losses["q_mean"]),
-                   "sac/pi_loss": mean(losses["pi"]), "sac/alpha": mean(losses["alpha"]),
+                   "sac/pi_loss": mean(losses["pi"]),
+                   ("sac/awac_weight" if hyper.actor_loss == "awac" else "sac/alpha"): mean(losses["alpha"]),
                    "sac/entropy": mean(losses["ent"]), "sac/anchor": mean(losses["anchor"]),
                    "sac/updates": updates, "sac/buffer": rb.size,
                    "sac/contact_slots": int(rb.near.sum())}
@@ -459,7 +526,8 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
             print(f"sac {log_i}/{n_logs} steps {(steps_base + steps_done)/1e6:.2f}M | rew/step {log['rollout/reward_per_step']:.3f} "
                   f"coll {log['episode/collisions_per_km']:.1f}/km prog {log['episode/progress_m']:.0f} m "
                   f"lap {log['episode/lap_time_s']:.1f} s | q {log['sac/q_loss']:.3f} Q {log['sac/q_mean']:.1f} "
-                  f"pi {log['sac/pi_loss']:.3f} a {log['sac/alpha']:.4f} H {log['sac/entropy']:.2f} "
+                  f"pi {log['sac/pi_loss']:.3f} {'w' if hyper.actor_loss == 'awac' else 'a'} "
+                  f"{log.get('sac/awac_weight', log.get('sac/alpha', float('nan'))):.4f} H {log['sac/entropy']:.2f} "
                   f"kl0 {log['loss/kl_ref']:.3f} | buf {rb.size} upd {updates} | {sps:.0f} steps/s", flush=True)
             ep_stats = {k_: [] for k_ in ep_stats}
             rew_acc.zero_(); rew_n = 0

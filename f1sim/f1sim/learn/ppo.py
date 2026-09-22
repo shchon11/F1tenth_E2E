@@ -671,7 +671,8 @@ def main():
     ap.add_argument("--sac-batch", type=int, default=256)
     ap.add_argument("--sac-updates-per-step", type=int, default=2,
                     help="gradient steps per env step (an env step adds one transition per learner row)")
-    ap.add_argument("--sac-start", type=int, default=20_000, help="transitions buffered before any update")
+    ap.add_argument("--sac-start", type=int, default=100_000,
+                    help="transitions buffered before any update (the first thousands are all starts)")
     ap.add_argument("--sac-critic-warmup", type=int, default=10_000,
                     help="updates of the Q functions alone before the actor moves: they start as the "
                          "PPO value function and know nothing yet about what an action does")
@@ -679,7 +680,7 @@ def main():
     ap.add_argument("--sac-lr-actor", type=float, default=1e-5)
     ap.add_argument("--sac-actor-every", type=int, default=2,
                     help="one actor step per this many critic steps (delayed policy updates)")
-    ap.add_argument("--sac-lr-critic", type=float, default=1e-4)
+    ap.add_argument("--sac-lr-critic", type=float, default=5e-5)
     ap.add_argument("--sac-alpha0", type=float, default=0.01)
     ap.add_argument("--sac-target-entropy", type=float, default=None,
                     help="default: the starting policy's own entropy, so the exploration it had is kept")
@@ -690,6 +691,13 @@ def main():
     ap.add_argument("--sac-contact-frac", type=float, default=0.25,
                     help="share of each batch drawn from the half second before a wall/prop contact")
     ap.add_argument("--sac-contact-window", type=int, default=20)
+    ap.add_argument("--sac-n-step", type=int, default=16,
+                    help="rewards summed before bootstrapping; 1 is plain one-step TD")
+    ap.add_argument("--sac-actor-loss", choices=["awac", "sac"], default="awac",
+                    help="'awac': advantage-weighted regression onto buffer actions (conservative, the "
+                         "default after sac1's reparameterised actor drove worse behind an unfitted Q); "
+                         "'sac': the soft actor-critic update with a learned temperature")
+    ap.add_argument("--sac-awac-beta", type=float, default=1.0)
     ap.add_argument("--kind-mix-assign", choices=["partition", "redraw"], default="partition",
                     help="how a kind_mix opponent slot picks its driver. 'partition' (training's "
                          "default): race g drives kind_mix[g %% len], fixed -- every update holds each "
@@ -1614,7 +1622,9 @@ def main():
                                  lr_actor=a.sac_lr_actor, lr_critic=a.sac_lr_critic,
                                  alpha0=a.sac_alpha0, target_entropy=a.sac_target_entropy,
                                  anchor=a.sac_anchor, anchor_decay=a.sac_anchor_decay,
-                                 contact_frac=a.sac_contact_frac, contact_window=a.sac_contact_window)
+                                 contact_frac=a.sac_contact_frac, contact_window=a.sac_contact_window,
+                                 n_step=a.sac_n_step, actor_loss=a.sac_actor_loss,
+                                 awac_beta=a.sac_awac_beta)
         sac_mod.train(a, env=env, model=model, obs=obs, lid=lid, device=device, cond_dim=cond_dim,
                       cond_mode=a.cond, cond_spec=cond_spec, dial=dial, dial_new=dial_new, out=out,
                       progress_log=progress_log, run=run, spec=spec, steps_base=steps_base,

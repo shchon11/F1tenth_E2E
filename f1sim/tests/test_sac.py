@@ -83,3 +83,40 @@ def test_the_q_functions_start_as_the_value_function():
     # and it can learn: the action columns receive a gradient
     assert q.c.pro[0].weight.grad is not None
     assert torch.count_nonzero(q.c.pro[0].weight.grad[:, -8:]) > 0
+
+
+def test_n_step_targets_stop_at_endings_and_bootstrap_truncations_from_their_final():
+    """`sample(n_step=...)`: the return sums rewards up to the window or the episode's end, whichever
+    comes first; a real ending (`term`) is not bootstrapped; a truncation is, from the final
+    observation kept for it, discounted by gamma^(steps summed); otherwise from the slot n on."""
+    g = torch.Generator().manual_seed(3)
+    T, n, k, N, n_step, gamma = 60, 5, 3, 7, 6, 0.9
+    rb = Replay(T, n, k, N, 4, 2, 0, 2, "cpu")
+    for t in range(45):
+        last = torch.rand(n, generator=g) < 0.12
+        term = last & (torch.rand(n, generator=g) < 0.5)
+        ids = torch.nonzero(last & ~term).flatten()
+        final = (ids, torch.rand(ids.numel(), k, N, generator=g), torch.randn(ids.numel(), 4, generator=g),
+                 torch.randn(ids.numel(), 2, generator=g), None) if ids.numel() else None
+        rb.add(torch.rand(n, N, generator=g), torch.randn(n, 4, generator=g), torch.randn(n, 2, generator=g),
+               None, torch.rand(n, 2, generator=g), torch.randn(n, generator=g), term, last, final)
+    bt = rb.sample(400, 0.0, g, n_step=n_step, gamma=gamma)
+    for b in range(400):
+        t0, j = int(bt["ti"][b]), int(bt["j"][b])
+        ret, disc, K = 0.0, None, None
+        for m in range(n_step):
+            ret += gamma ** m * float(rb.rew[t0 + m, j])
+            if bool(rb.last[t0 + m, j]):
+                K = m
+                break
+        if K is None:
+            disc = gamma ** n_step
+            want = rb._stack(torch.tensor([t0 + n_step]), torch.tensor([j]))[0]
+        elif bool(rb.term[t0 + K, j]):
+            disc, want = 0.0, None
+        else:
+            disc = gamma ** (K + 1)
+            want = rb._dq(rb.fin_scan[int(rb.fin_slot[t0 + K, j])])
+        assert abs(float(bt["ret"][b]) - ret) < 1e-5 and abs(float(bt["disc"][b]) - disc) < 1e-6, (b, t0, j)
+        if want is not None:
+            assert torch.equal(bt["n_scan"][b], want), (b, t0, j)
