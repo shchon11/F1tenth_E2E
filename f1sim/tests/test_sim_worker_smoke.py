@@ -388,6 +388,36 @@ def test_a_scene_keeps_its_authored_obstacles_and_bare_removes_them(worker, tmp_
         assert frames and np.isfinite(frames[-1]["x"]).all()
 
 
+def test_the_training_obstacles_are_simulated_drawn_and_redrawn_on_reset(worker, tmp_legacy_run):
+    """장애물 "학습과 같음" in a real worker: the env's own generator, one layout for every car, and
+    everything the console needs to draw it -- the catalogue's meshes once, every piece's pose in
+    every frame. A layout that is simulated and not drawn is the invisible collider the placed props
+    refuse to be. A 리셋 is a new layout; asking for a map family as well is refused."""
+    from f1sim.viewer.console.session import _dyn_prop_shapes
+    cfg = P.SessionConfig(run=tmp_legacy_run, map_name=SMOKE_MAP, procedural=True, seed=9, races=2,
+                          cars_per_race=1, device="cpu", compile=False, controller="legacy")
+    worker.send(P.CMD_START, gen=300, config=cfg.to_dict())
+    facts = worker.wait_for(P.MSG_READY, timeout=READY_TIMEOUT, gen=300)["facts"]
+    assert facts["obstacle_choice"] == "train" and "학습과 같음" in facts["obstacle_text"]
+    geom = worker.wait_for(P.MSG_GEOMETRY, gen=300)["geometry"]
+    shapes = _dyn_prop_shapes(geom.get("dyn_props"))
+    assert shapes and int(geom["dyn_prop_slots"]) > 0
+    rows = [f["props_dyn"] for f in worker.collect_frames(2.0) if "props_dyn" in f]
+    assert rows and len(rows[-1]) > 0, "frames must carry the layout"
+    sid = rows[-1][:, 0]
+    assert (sid >= 0).all() and (sid < len(shapes)).all() and np.isfinite(rows[-1]).all()
+    worker.send(P.CMD_RESET, gen=300)
+    time.sleep(0.5)
+    after = [f["props_dyn"] for f in worker.collect_frames(2.0) if "props_dyn" in f]
+    assert after and not (after[-1].shape == rows[-1].shape and np.allclose(after[-1], rows[-1])), \
+        "a 리셋 has to draw a new layout"
+    bad = P.SessionConfig(run=tmp_legacy_run, map_name=SMOKE_MAP + "+rlobs3", procedural=True, races=1,
+                          cars_per_race=1, device="cpu", compile=False, controller="legacy")
+    worker.send(P.CMD_START, gen=301, config=bad.to_dict())
+    err = worker.wait_for(P.MSG_ERROR, timeout=READY_TIMEOUT, gen=301)
+    assert "학습과 같음" in err["message"]
+
+
 # ==================================================================== per-opponent slots
 def test_a_slot_table_builds_a_session_and_the_facts_name_the_mix(worker, tmp_legacy_run):
     """A three-car race whose two other cars are configured separately (`f1sim.opponent_slots`).

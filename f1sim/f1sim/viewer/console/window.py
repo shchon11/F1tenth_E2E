@@ -29,6 +29,14 @@ from .protocol import (SessionConfig, STAGE_TEXT, STATE_FAILED, STATE_IDLE, STAT
 from .. import recorder as REC
 from .theme import C, SP
 from .viewport import CAMERA_KEYS, CAMERA_MODES, MAX_RENDER_CARS, ViewportWidget
+
+#: 장애물 "학습과 같음": not a family baked into the map but the training generator itself
+#: (`SessionConfig.procedural`), so it is a combo entry of its own and never part of the spec string.
+TRAIN_OBSTACLES = "train"
+TRAIN_LABEL = "학습과 같음 (리셋마다 새로)"
+TRAIN_HINT = ("학습 때와 같은 생성기로 장애물을 놓습니다: 패턴 6종(게이트·사선·시케인·코너 정점·덩어리·흩뿌림), "
+              "주행선 위에도, 부딪히면 밀립니다. 모든 차가 같은 배치를 보고, 리셋(Ctrl+R)마다 새 배치입니다. "
+              "밀도와 슬롯 수는 고른 런의 학습 설정을 따릅니다.")
 from .widgets import (Card, Collapsible, FieldRow, FilterList, FlowLayout, KeyValueList,
                       MetricTile, PendingButton, PendingToggle, SegmentedButtons, Sparkbar,
                       StateBadge, hline, label)
@@ -333,6 +341,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.combo_obstacle = QtWidgets.QComboBox()
         for o in tracks.ASSET_OBSTACLES:
             self.combo_obstacle.addItem(tracks.ASSET_PLACEMENT_LABEL[o], o)
+            if o == "":
+                self.combo_obstacle.addItem(TRAIN_LABEL, TRAIN_OBSTACLES)
         self.combo_obstacle.setCurrentIndex(self.combo_obstacle.findData(""))
         self.combo_obstacle.currentIndexChanged.connect(lambda _: self._on_scenario_changed())
         obs_row.addWidget(self.combo_obstacle, 1)
@@ -1965,6 +1975,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 self.combo_obstacle.setItemData(i, 0, QtCore.Qt.UserRole - 1)
                 self.combo_obstacle.setItemData(i, "이 맵은 배치 장애물이 없음 — '기본'과 같습니다.",
                                                 QtCore.Qt.ToolTipRole)
+            if o == "":
+                self.combo_obstacle.addItem(TRAIN_LABEL, TRAIN_OBSTACLES)
+                self.combo_obstacle.setItemData(self.combo_obstacle.count() - 1, TRAIN_HINT,
+                                                QtCore.Qt.ToolTipRole)
         i = self.combo_obstacle.findData(want)
         if i >= 0 and want == tracks.BARE and not n_props:
             i = self.combo_obstacle.findData("")        # the map changed under a now-meaningless 없음
@@ -1999,6 +2013,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if d:
             spec += f"@{d}"
         o = str(self.combo_obstacle.currentData() or "")
+        if o == TRAIN_OBSTACLES:
+            return spec                       # the map as it is; the obstacles come from the env
         bare = o == tracks.BARE or (o and self.chk_bare_first.isChecked())
         family = "" if o == tracks.BARE else o
         choice = tracks.obstacle_choice(bool(bare), family)
@@ -2011,9 +2027,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     def _on_scenario_changed(self):
         o = str(self.combo_obstacle.currentData() or "")
-        family = o and o != tracks.BARE
+        train = o == TRAIN_OBSTACLES
+        family = o and o != tracks.BARE and not train
         n_props = int(getattr(self, "_n_props", 0))
-        hint = tracks.ASSET_PLACEMENT_HINT.get(o, "")
+        hint = TRAIN_HINT if train else tracks.ASSET_PLACEMENT_HINT.get(o, "")
         if family:
             hint = f"{hint} {tracks.OBSTACLE_ADDS_HINT}"
         self.row_obstacle.set_hint(hint, "hint")
@@ -2025,10 +2042,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.chk_bare_first.setChecked(o == tracks.BARE)
             self.chk_bare_first.blockSignals(False)
         random_seed = str(self.combo_seed.currentData()) == "random"
+        seeded = bool(family) or train          # both draw a layout from a seed
         for w in (self.combo_seed, self.btn_reroll):
-            w.setEnabled(bool(family))
-        self.spin_seed.setEnabled(bool(family) and not random_seed)
-        self.btn_reroll.setEnabled(bool(family) and random_seed)
+            w.setEnabled(seeded)
+        self.spin_seed.setEnabled(seeded and not random_seed)
+        self.btn_reroll.setEnabled(seeded and random_seed)
         spec = self._scenario()
         self.scenario_line.setText(spec)
         try:
@@ -2229,11 +2247,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         from . import prefs
         self.apply_prefs(prefs.load())
 
+    def _train_obstacles(self) -> bool:
+        return str(self.combo_obstacle.currentData() or "") == TRAIN_OBSTACLES
+
     def current_config(self) -> SessionConfig:
         return SessionConfig(
             run=self._selected_run or "latest",
             map_name=self._scenario(),
-            seed=int(self._session_seed),
+            # 학습과 같음 has no spec seed to fix: 고정 seeds the generator itself.
+            seed=(int(self.spin_seed.value()) if self._train_obstacles()
+                  and str(self.combo_seed.currentData()) == "fixed" else int(self._session_seed)),
+            procedural=self._train_obstacles(),
             races=self.spin_races.value(),
             cars_per_race=self.spin_grid.value(),
             speed_cap=float(self.spin_cap.value()),

@@ -537,6 +537,11 @@ class EnvConfig:
     # because the alternative is a baseline whose collisions are the layout's fault and a result
     # nobody can read.
     procedural_raceline_corridor: str = "on"
+    # One layout for the whole batch instead of one per env (or per race). The console runs this:
+    # it draws one track, and every car on it has to be driving through the crates that are drawn.
+    # The layout is redrawn only when every env resets together -- the console's 리셋, a new
+    # session -- and a car that resets alone keeps it, as a car respawning mid-race keeps its race's.
+    procedural_shared: bool = False
 
 
 def _interp_path(xy: torch.Tensor, grid: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -1668,6 +1673,11 @@ class F1VecEnv:
         `_reset_envs` decides whether the grid fits.
         """
         if self.procedural is None:
+            return
+        if self.ecfg.procedural_shared:
+            if n == self.B:
+                self.procedural.redraw(self.sim.tid[ids[:1]], torch.arange(self.B, device=self.device),
+                                       torch.zeros(self.B, dtype=torch.long, device=self.device))
             return
         if self.M == 1:
             self.procedural.redraw(self.sim.tid[ids], ids, torch.arange(n, device=self.device))

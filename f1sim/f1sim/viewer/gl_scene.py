@@ -291,6 +291,8 @@ class Scene:
         self.light_dir = np.array([-0.45, -0.6, 1.0]); self.light_dir /= np.linalg.norm(self.light_dir)
         self.static: List[Mesh] = []
         self.car_meshes: List[tuple] = []        # (slot, Mesh)
+        #: the training generator's catalogue, one list of part meshes per shape (`set_dyn_props`)
+        self.dyn_props: List[List[Mesh]] = []
         self.car_pivots: Dict[str, np.ndarray] = {}
         self.lines: Dict[str, tuple] = {}
         self._quad = ctx.buffer(np.array([0, 0, 1, 0, 0, 1, 1, 1], np.float32).tobytes())
@@ -377,6 +379,7 @@ class Scene:
                 pass
 
         self.clear_static()
+        self.clear_dyn_props()
         for name in list(self.lines):
             self.clear_line(name)
         for _, mesh in self.car_meshes:
@@ -427,6 +430,55 @@ class Scene:
                     except Exception:
                         pass
         self.static = []
+
+    def set_dyn_props(self, shapes, max_instances: int):
+        """Upload the training generator's catalogue: `shapes` is, per shape, its parts as dicts of
+        "pos", "nrm", "col", "idx" (and "material") in the shape's own frame. Nothing is drawn until
+        `set_dyn_prop_poses` says where."""
+        self.clear_dyn_props()
+        for parts in shapes:
+            meshes = []
+            for part in parts:
+                m = Mesh(self.ctx, self.prog, self.shadow_prog, np.asarray(part["pos"]), np.asarray(part["nrm"]),
+                         np.asarray(part["col"]), np.asarray(part["idx"]), int(max_instances),
+                         material=str(part.get("material", "plastic")))
+                m.n_inst = 0
+                meshes.append(m)
+            self.dyn_props.append(meshes)
+
+    def set_dyn_prop_poses(self, rows):
+        """(k, 4) rows of [shape id, x, y, yaw], one per live piece, or None for none."""
+        for meshes in self.dyn_props:
+            for m in meshes:
+                m.n_inst = 0
+        if rows is None or not len(self.dyn_props):
+            return
+        rows = np.asarray(rows, np.float32).reshape(-1, 4)
+        sid = rows[:, 0].astype(np.int64)
+        for k in np.unique(sid):
+            if not 0 <= k < len(self.dyn_props):
+                continue
+            sel = rows[sid == k]
+            c, s = np.cos(sel[:, 3]), np.sin(sel[:, 3])
+            mats = np.zeros((len(sel), 4, 4), np.float32)
+            mats[:, 0, 0], mats[:, 0, 1], mats[:, 1, 0], mats[:, 1, 1] = c, -s, s, c
+            mats[:, 2, 2] = mats[:, 3, 3] = 1.0
+            mats[:, 0, 3], mats[:, 1, 3] = sel[:, 1], sel[:, 2]
+            tints = np.ones((len(sel), 4), np.float32)
+            for m in self.dyn_props[k]:
+                m.set_instances(mats, tints)
+
+    def clear_dyn_props(self):
+        for meshes in self.dyn_props:
+            for m in meshes:
+                for attr in ("vao", "vao_shadow", "vbo", "ibo", "inst"):
+                    obj = getattr(m, attr, None)
+                    if obj is not None:
+                        try:
+                            obj.release()
+                        except Exception:
+                            pass
+        self.dyn_props = []
 
     def clear_line(self, name):
         """Remove a named line and free its buffers (add_line overwrites the dict entry but the old
@@ -656,6 +708,9 @@ class Scene:
             self.shadow_prog["u_light_vp"].write(_u(light_vp))
             for m in self.static: m.draw(self.shadow_prog, shadow=True)
             for _, m in self.car_meshes: m.draw(self.shadow_prog, shadow=True)
+            for meshes in self.dyn_props:
+                for m in meshes:
+                    if m.n_inst: m.draw(self.shadow_prog, shadow=True)
             ctx.cull_face = "back"
             self.prog["u_light_vp"].write(_u(light_vp)); self.shadow_tex.use(1); self.prog["u_shadow"].value = 1
         # main pass: sky first (no depth), then the lit scene
@@ -671,6 +726,9 @@ class Scene:
         self.prog["u_shadow_on"].value = 1.0 if self.shadows else 0.0
         for m in self.static: m.draw(self.prog)
         for _, m in self.car_meshes: m.draw(self.prog)
+        for meshes in self.dyn_props:
+            for m in meshes:
+                if m.n_inst: m.draw(self.prog)
         ctx.disable(moderngl.CULL_FACE)
         # lines / points (blended)
         vp = proj @ view

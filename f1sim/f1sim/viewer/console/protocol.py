@@ -107,6 +107,11 @@ class SessionConfig:
     #: changing this, which is also what makes "다시 뽑기" a new generation rather than a live
     #: command: a different seed is a different map.
     seed: int = 0
+    #: 장애물 "학습과 같음": instead of a layout baked into the map, the training generator
+    #: (`f1sim.procedural_obstacles`) with the run's own settings, one layout shared by every car and
+    #: redrawn at every 리셋. `map_name` then names the bare map (no `#family`), and `seed` seeds
+    #: the draw, so 다시 뽑기 is a new sequence of layouts.
+    procedural: bool = False
     races: int = 1
     cars_per_race: int = 1
     speed_cap: Optional[float] = None    # None = whatever the checkpoint was trained at

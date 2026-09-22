@@ -129,6 +129,34 @@ def prop_batches(track) -> list:
     return out
 
 
+def shape_meshes(shapes) -> list:
+    """One mesh per procedural catalogue shape (`procedural_obstacles.Shape`), in the shape's own
+    frame: a list, per shape, of its parts as {"material", "pos", "nrm", "col", "idx"}.
+
+    The procedural layout is not placed geometry -- it is redrawn at every reset, and a shoved piece
+    moves -- so unlike `prop_batches` nothing here is transformed or merged. The viewer draws each
+    shape instanced, at the poses every frame carries. Built from the same `props.build` call the
+    catalogue took its envelope from, so what is drawn is what the LiDAR and the contact test see.
+
+    A shape that will not build raises, for `prop_batches`' reason: it would be an obstacle that is
+    there in every way except on screen.
+    """
+    from .. import props as _props
+    out = []
+    for sh in shapes:
+        try:
+            prop = _props.build(sh.style, seed=0, **dict(sh.dims))
+        except Exception as exc:
+            raise PropBuildError(
+                f"학습 장애물 모양 '{sh.style}' 을 만들지 못했습니다: {exc}\n"
+                f"그리지 못한 채로 주행하면 화면에 없는 충돌체가 됩니다. 세션을 시작하지 않습니다.") from exc
+        out.append([{"material": part.material,
+                     "pos": np.asarray(part.pos, np.float32), "nrm": np.asarray(part.nrm, np.float32),
+                     "col": np.asarray(part.col, np.float32), "idx": np.asarray(part.idx, np.int32),
+                     "n_props": 1, "n_tris": int(len(part.idx) // 3)} for part in prop.parts])
+    return out
+
+
 def build_track_geometry(track, raceline=None, only_props: bool = False):
     """Static map meshes as plain arrays, ready for the console to upload.
 

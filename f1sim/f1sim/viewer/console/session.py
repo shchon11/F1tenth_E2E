@@ -142,6 +142,24 @@ class _Reader(QtCore.QThread):
 _PROP_ARRAYS = ("pos", "nrm", "col", "idx")
 
 
+def _dyn_prop_shapes(raw):
+    """The training generator's catalogue meshes (`geometry.shape_meshes`): one list of parts per
+    shape, each part checked exactly as a placed batch is (`_prop_batches`), for the same reason --
+    these are drawn at the poses of obstacles the simulator is colliding with. None when the
+    session has no training obstacles."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise PropPayloadError(f"학습 장애물 모양 목록이 비었거나 목록이 아닙니다: {type(raw).__name__}")
+    out = []
+    for k, parts in enumerate(raw):
+        v = _prop_batches(parts)
+        if v is None:
+            raise PropPayloadError(f"학습 장애물 모양 {k} 에 메시가 없습니다")
+        out.append(tuple(v))
+    return tuple(out)
+
+
 class PropPayloadError(ValueError):
     """A prop batch that cannot be drawn. Fatal to the session, deliberately -- see `_prop_batches`."""
 
@@ -672,6 +690,7 @@ class SessionController(QtCore.QObject):
         cb = g.get("content_bounds")
         try:
             props = _prop_batches(g.get("props"))
+            dyn_props = _dyn_prop_shapes(g.get("dyn_props"))
         except PropPayloadError as exc:
             # Not a drawing problem to work around: the obstacles are in the simulation whether or
             # not we can draw them. Refuse the session rather than run one whose track contains
@@ -688,7 +707,7 @@ class SessionController(QtCore.QObject):
             backdrop=g.get("backdrop"),
             content_bounds=tuple(cb) if cb is not None else None,
             presentation=dict(pres) if isinstance(pres, dict) else None,
-            props=props)
+            props=props, dyn_props=dyn_props, dyn_prop_slots=int(g.get("dyn_prop_slots") or 0))
         self._geometry_bytes = geom.nbytes()
         self._last_geometry_ms = geom.build_ms
         self.window.viewport.set_geometry(geom)

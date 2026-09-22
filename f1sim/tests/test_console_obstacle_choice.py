@@ -127,6 +127,34 @@ def test_the_default_choice_emits_the_map_itself(window):
     assert window._scenario() == "scene/hall"
 
 
+def test_training_obstacles_emit_the_bare_map_and_turn_the_generator_on(window):
+    """학습과 같음: the map as it is -- no family, no `!assets` -- and `procedural` in the config.
+    The seed controls stay live: the generator draws from the session seed, so 다시 뽑기 means
+    something, and 고정 hands the typed number to the generator since the spec has none."""
+    from f1sim.viewer.console.window import TRAIN_OBSTACLES
+    _select(window, "scene/hall")
+    window.combo_obstacle.setCurrentIndex(window.combo_obstacle.findData(TRAIN_OBSTACLES))
+    assert window._scenario() == "scene/hall"
+    cfg = window.current_config()
+    assert cfg.procedural is True and cfg.map_name == "scene/hall"
+    assert window.combo_seed.isEnabled() and not window.chk_bare_first.isEnabled()
+    window.combo_seed.setCurrentIndex(window.combo_seed.findData("fixed"))
+    window.spin_seed.setValue(4321)
+    assert window.current_config().seed == 4321
+    # and every other choice leaves the generator off
+    window.combo_obstacle.setCurrentIndex(window.combo_obstacle.findData(""))
+    assert window.current_config().procedural is False
+
+
+def test_training_obstacles_survive_a_map_change_and_the_prefs(window):
+    from f1sim.viewer.console.window import TRAIN_OBSTACLES
+    _select(window, "scene/hall")
+    window.combo_obstacle.setCurrentIndex(window.combo_obstacle.findData(TRAIN_OBSTACLES))
+    _select(window, "scene/empty")
+    assert window.combo_obstacle.currentData() == TRAIN_OBSTACLES
+    assert window.collect_prefs()["obstacle"] == TRAIN_OBSTACLES
+
+
 def test_a_family_can_be_asked_to_clear_the_map_first(window):
     """The composition the id grammar spells `scene:hall+bare+hard3`, offered where it means
     something: a map with placed obstacles, and a family going on top of them."""
@@ -207,9 +235,14 @@ def test_a_job_started_with_bare_is_described_as_such():
 
 
 def test_only_five_asset_obstacle_choices_are_visible(window, picker):
+    """Five asset choices, plus 학습과 같음 on the driving page -- which is not a family and is not
+    offered to the training picker, whose own 환경 editors already set the generator."""
+    from f1sim.viewer.console.window import TRAIN_OBSTACLES
     _select(window, "scene/hall")
     expected = ["없음", "기본", "랜덤 · 낮음", "랜덤 · 중간", "랜덤 · 높음"]
-    assert [window.combo_obstacle.itemData(i) for i in range(window.combo_obstacle.count())] == list(T.ASSET_OBSTACLES)
+    want = list(T.ASSET_OBSTACLES)
+    want.insert(want.index("") + 1, TRAIN_OBSTACLES)
+    assert [window.combo_obstacle.itemData(i) for i in range(window.combo_obstacle.count())] == want
     assert [picker.obs_boxes[k].text() for k in T.ASSET_OBSTACLES] == expected
     assert "props" not in picker.obs_boxes and "pinch" not in picker.obs_boxes
     assert not hasattr(window, "obstacle_assets"), "asset type and size are automatic, not new controls"

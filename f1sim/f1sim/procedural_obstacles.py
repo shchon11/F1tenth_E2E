@@ -356,6 +356,9 @@ class ProceduralObstacles:
         #: [kg] per slot, and the velocity a shove left it with [m/s]. Zero mass is immovable, and
         #: a layout whose env never enables movable obstacles simply never has these touched.
         self.p_mass = z(self.B, self.C)
+        #: which catalogue shape (`shapes`) stands in each slot, -1 for a dead one. Nothing in the
+        #: simulation reads it -- the half-planes are the shape -- but a viewer has to know what to draw.
+        self.p_sid = torch.full((self.B, self.C), -1, dtype=torch.long, device=dev)
         self.p_vel = torch.zeros(self.B, self.C, 2, device=self.device)
         #: What the last draw decided, per env: where each pattern sits on the lap [m of arc], which
         #: of `PATTERNS` it is, and whether that slot is a pattern at all. Two (B, P) tensors and a
@@ -790,6 +793,7 @@ class ProceduralObstacles:
         z0 = self.sh_z0[sid_k]
         z1 = torch.where(keep, self.sh_z1[sid_k], self.sh_z0[sid_k] - 1.0)   # dead: z_hi < z_lo
         self.slot_pattern.index_copy_(0, dst, (order // self.Q)[src])
+        self.p_sid.index_copy_(0, dst, torch.where(keep, sid_k, torch.full_like(sid_k, -1))[src])
         self._stat[0] += float(D)
         self._stat[1] += keep.sum().to(torch.float64)
         self._stat[2] += (live.sum(1) - keep.sum(1)).sum().to(torch.float64)

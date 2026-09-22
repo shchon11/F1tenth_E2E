@@ -110,6 +110,7 @@ NORMALIZER_FIELDS = ("v_max", "range_max", "gyro_scale", "accel_scale", "att_sca
 # every existing import keeps working.
 from .geometry import GEOMETRY_VERSION, SMOOTH_SIGMA, PropBuildError, _bbox, build_track_geometry   # noqa: E402,F401
 from .geometry import prop_batches as _prop_batches_impl                                            # noqa: E402
+from .geometry import shape_meshes                                                                  # noqa: E402
 
 
 def _now() -> float:
@@ -251,6 +252,67 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
             raise StartConfigError(
                 "ROS2 연동에는 rclpy 와 메시지 패키지가 필요합니다. ROS 워크스페이스를 소싱한 셸"
                 "(예: source activate.sh)에서 콘솔을 열어 주세요. 가져오기 실패: " + why)
+
+
+#: 장애물 "학습과 같음" when the run did not record its own settings: the recipe every run since
+#: s911 trained on (density 1.5 per 10 m, obstacles allowed on the racing line, a 3 m spawn runway,
+#: movable props), with the 18 slots s914 moved to so a draw keeps all of its patterns.
+PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "procedural_max_props": 18,
+                       "procedural_raceline_corridor": "off", "procedural_raceline_margin": 0.25,
+                       "spawn_runway": 3.0, "movable_obstacles": True}
+
+
+def procedural_settings(ckpt_path: str, collision_mode: str) -> Tuple[dict, str]:
+    """(EnvConfig keywords, where they came from) for the training obstacle generator.
+
+    The checkpoint does not carry its run's command line. `<run>/args.json` does, for runs started
+    since it was written (`ppo.main`); a run with W&B online has the same in its `config.yaml`;
+    anything else gets `PROCEDURAL_DEFAULTS`, and the facts strip says so. A run that trained with
+    no procedural obstacles at all also gets the defaults -- there is nothing of its own to copy.
+    """
+    import glob
+    import json
+    run_dir = os.path.dirname(ckpt_path)
+    args, src = {}, ""
+    path = os.path.join(run_dir, "args.json")
+    if os.path.isfile(path):
+        try:
+            args, src = dict(json.load(open(path))), "런의 args.json"
+        except Exception:
+            args = {}
+    if not args:
+        for cfg_path in sorted(glob.glob(os.path.join(run_dir, "wandb", "*", "files", "config.yaml")), reverse=True):
+            try:
+                import yaml
+                raw = yaml.safe_load(open(cfg_path)) or {}
+                args = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in raw.items()}
+                src = "런의 W&B 설정"
+                break
+            except Exception:
+                args = {}
+    if not args or float(args.get("procedural_obstacles") or 0.0) <= 0.0:
+        args, src = {}, ("기본값 (이 런은 절차적 장애물 없이 학습)" if args else "기본값 (런 설정 기록 없음)")
+    kw = {}
+    for key, default in PROCEDURAL_DEFAULTS.items():
+        value = args.get(key)
+        kw[key] = default if value is None or value == "" else type(default)(value)
+    if str(collision_mode) != "soft":
+        kw["movable_obstacles"] = False          # a shove is resolved only by soft contact
+    kw["procedural_shared"] = True
+    return kw, src
+
+
+def _procedural_facts(session: dict) -> dict:
+    """What 장애물 "학습과 같음" built, for the facts strip; nothing when it is off."""
+    proc = session["env"].procedural
+    if proc is None:
+        return {}
+    e = session["env"].ecfg
+    return {"obstacle_choice": "train",
+            "obstacle_text": (f"학습과 같음 · {e.procedural_density:g}개/10 m · 슬롯 {proc.C} · "
+                              f"주행선 {'비움' if e.procedural_raceline_corridor == 'on' else '위에도'}"
+                              f"{' · 밀림' if e.movable_obstacles else ''} ({session.get('procedural_src') or '?'})"),
+            "procedural": True}
 
 
 def _obstacle_facts(spec: str, track) -> dict:
@@ -894,6 +956,13 @@ class SimWorker:
 
         self.stage(gen, "env")
         spec = extra.get("spec") or {}
+        proc_kw, proc_src = {}, ""
+        if getattr(cfg, "procedural", False):
+            if scenario.choice:
+                raise StartConfigError(
+                    f"장애물 '학습과 같음' 은 맵에 굽는 장애물('{scenario.choice}')과 함께 쓸 수 없습니다 — "
+                    f"맵은 장애물 없이 고르세요.")
+            proc_kw, proc_src = procedural_settings(ckpt_path, getattr(cfg, "collision_mode", "soft"))
         env_cfg = EnvConfig(
             speed_cap=speed_cap, action_mode=mode, race_size=grid,
             opponent=("slots" if slots is not None else cfg.opponent),
@@ -911,7 +980,8 @@ class SimWorker:
             resample_track_on_reset=False,
             # Under "soft" a touch is resolved and the car carries on -- the duct gives, a crate is
             # shoved, the IMU and the suspension feel it -- instead of the session resetting it.
-            collision_mode=str(getattr(cfg, "collision_mode", "terminate") or "terminate"))
+            collision_mode=str(getattr(cfg, "collision_mode", "terminate") or "terminate"),
+            **proc_kw)
         if "action_history" in spec:
             # `watch.main` does not pass this through, so a checkpoint trained with a different
             # action history fails there with a shape error deep in the actor. Taking it from the
@@ -934,9 +1004,14 @@ class SimWorker:
         if "range_max" in spec:
             sim_cfg.lidar.range_max = float(spec["range_max"])
         try:
+            # With the training generator the session's seed seeds the draw: 다시 뽑기 is a new
+            # sequence of layouts. Without it nothing here draws a layout, and the seed stays 0.
             env = common.make_env([track], n_cars, device, env_cfg, cfg=sim_cfg,
+                                  seed=int(cfg.seed) if proc_kw else 0,
                                   rls=rls if need_rl else None)
         except (ValueError, RuntimeError) as exc:
+            if proc_kw and isinstance(exc, ValueError):
+                raise StartConfigError(f"학습과 같은 장애물: {exc}") from exc
             # A slot's checkpoint is loaded here (`learn.opponent_pool`), which is where an oracle
             # checkpoint, a mismatched observation and a wrong controller arm are all refused. Those
             # are configuration mistakes, not crashes: the console shows them on the settings panel.
@@ -987,6 +1062,7 @@ class SimWorker:
             "gg": deque(maxlen=90),
             "last_reload": time.time(),
             "raceline": rls[0] if rls else None,
+            "procedural_src": proc_src,
         }
         if compile_enabled:
             for i in range(8):
@@ -996,6 +1072,12 @@ class SimWorker:
 
         self.stage(gen, "geometry", session_scenario)
         session["geometry"] = self.build_geometry(track, session["raceline"])
+        if env.procedural is not None:
+            # The layout changes at every 리셋 and a shoved crate moves, so these are not placed:
+            # one mesh per catalogue shape, in its own frame, drawn per frame at the poses the
+            # frame carries (`props_dyn`). Built here for the same reason the placed ones are.
+            session["geometry"]["dyn_props"] = self.build_dyn_props(env.procedural)
+            session["geometry"]["dyn_prop_slots"] = int(env.procedural.C)
         # Last, so that nothing which can raise runs between installing the fast path's hooks and
         # handing the session over. A session abandoned after `install()` would keep the env alive
         # through the `sim -> _roll -> fastpath -> sim` cycle.
@@ -1215,6 +1297,13 @@ class SimWorker:
         except PropBuildError as exc:
             raise StartConfigError(str(exc)) from exc
 
+    def build_dyn_props(self, proc) -> list:
+        """`geometry.shape_meshes` for the procedural catalogue, with the worker's error type."""
+        try:
+            return shape_meshes(proc.shapes)
+        except PropBuildError as exc:
+            raise StartConfigError(str(exc)) from exc
+
     def session_facts(self, session: dict, gen: int) -> dict:
         """What was actually built. The console shows this, never what the user asked for."""
         env = session["env"]
@@ -1243,6 +1332,7 @@ class SimWorker:
             # placed. `기본` and `없음` differ only by that number, and the id alone does not carry
             # it -- `scene/hall` is the map as authored whether that is three boxes or none.
             **_obstacle_facts(session.get("scenario") or cfg.map_name, session["track"]),
+            **_procedural_facts(session),
             # The loader's own name for the same thing, kept because a manifest, a benchmark file
             # and a bug report are all written in that grammar.
             "map_legacy": str(session.get("map_legacy") or cfg.map_name),
@@ -1469,6 +1559,12 @@ class SimWorker:
             if env.tracker.last_pred is not None:
                 plan_pred = env.tracker.last_pred[focus]
                 pieces.append(plan_pred.reshape(-1))
+        proc = env.procedural
+        if proc is not None:
+            # The layout every car is driving through (`procedural_shared`: env 0's is everyone's),
+            # one row per slot, [shape id, x, y, yaw]; a dead slot's shape id is -1. Every frame
+            # rather than once per layout, because a shoved crate moves.
+            pieces.append(torch.cat([proc.p_sid[0].float()[:, None], proc.p_poses[0]], 1).reshape(-1))
         estimate = getattr(session.get("controller"), "last_estimate", None)
         estimate_keys = ("used_mu", "q10", "q50", "q90", "warm", "finite")
         if estimate:
@@ -1501,6 +1597,10 @@ class SimWorker:
                 rp = flat[i:i + k2 * c2].reshape(k2, c2); i += k2 * c2
                 plan_pred_w = np.stack([ps[0] + rp[:, 0] * cs - rp[:, 1] * sn,
                                         ps[1] + rp[:, 0] * sn + rp[:, 1] * cs, rp[:, 3]], 1).astype(np.float32)
+        props_dyn = None
+        if proc is not None:
+            blk = flat[i:i + 4 * int(proc.C)].reshape(-1, 4); i += 4 * int(proc.C)
+            props_dyn = _copy(blk[blk[:, 0] >= 0]).astype(np.float32)
 
         session["gg"].append((float(dash_v[5]), float(dash_v[6])))
         ids = np.arange(n, dtype=np.int32)
@@ -1536,6 +1636,8 @@ class SimWorker:
             "info_line": session["info_line"],
             "ckpt_age_s": max(0.0, time.time() - session["mtime"]),
         }
+        if props_dyn is not None:
+            fr["props_dyn"] = props_dyn
         if imu_mean is not None:
             fr["imu"] = imu_mean.astype(np.float32)     # (6,) gyro xyz, accel xyz, mean of k_imu
             fr["imu_samples"] = k_imu

@@ -487,8 +487,13 @@ class SimGraphFastPath:
 
     @staticmethod
     def has_props(track) -> bool:
-        """Whether this track carries any modelled props at all. A map without them has nothing for
-        these two leaves to do, and capturing an empty one buys nothing."""
+        """Whether this track carries any modelled props at all: its own, or a per-env layout from
+        the training generator (`Track.attach_env_props`). A map with neither has nothing for these
+        two leaves to do, and capturing an empty one buys nothing. A map with only the layout has
+        every prop there is in it -- and left eager, the contact test that soft walls run every
+        substep halved the console's rate (58 ms a step for three cars on ICCAS)."""
+        if getattr(track, "env_props", None) is not None:
+            return True
         p = getattr(track, "p_poses", None)
         return torch.is_tensor(p) and p.ndim >= 2 and int(p.shape[1]) > 0
 

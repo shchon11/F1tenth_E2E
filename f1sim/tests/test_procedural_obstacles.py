@@ -339,6 +339,25 @@ def test_the_slot_budget_drops_patterns_at_random_not_in_lap_order():
     assert float(share.min()) > 0.5 / p.P, f"a pattern slot is nearly always the one dropped: {share.tolist()}"
 
 
+def test_a_shared_layout_is_everyones_and_moves_only_on_a_full_reset():
+    """`procedural_shared` (the console): every env holds the same layout, a car that resets alone
+    keeps it, and a reset of the whole batch draws a new one. `p_sid` names what stands in each slot
+    and -1 where nothing does -- the viewer draws from it."""
+    env = make_env(ring_track(), B=4, seed=8, procedural_obstacles=1.0, procedural_shared=True, n_beams=8)
+    env.reset(seed=8)
+    p = env.procedural
+    for b in range(1, env.B):
+        assert torch.equal(p.p_poses[b], p.p_poses[0]) and torch.equal(p.p_sid[b], p.p_sid[0])
+    assert torch.equal(p.p_sid >= 0, p.p_zhi > p.p_zlo)
+    assert int(p.p_sid.max()) < len(p.shapes)
+    held = p.p_poses.clone()
+    env._reset_envs(torch.tensor([2]))
+    assert torch.equal(p.p_poses, held), "a car resetting alone must not move everyone's crates"
+    env._reset_envs(torch.arange(env.B))
+    assert not torch.equal(p.p_poses[0], held[0])
+    assert all(torch.equal(p.p_poses[b], p.p_poses[0]) for b in range(env.B))
+
+
 def test_every_pattern_kind_is_drawn(catalogue_tracks):
     """Six kinds, all of them: a lap with fewer than six patterns still cycles a fresh permutation."""
     env = make_env(catalogue_tracks, B=64, seed=6, procedural_obstacles=1.0, n_beams=8)

@@ -162,6 +162,12 @@ class TrackGeometry:
     #: context. There are four materials in the whole prop catalogue, so this is four uploads
     #: however many props a map places.
     props: Optional[tuple] = None
+    #: The training generator's catalogue (장애물 "학습과 같음"): per shape, its parts in the
+    #: shape's own frame. Not placed -- the layout changes at every reset and a shoved crate moves --
+    #: so these are drawn instanced at the poses each frame carries (`props_dyn`), up to
+    #: `dyn_prop_slots` of each shape.
+    dyn_props: Optional[tuple] = None
+    dyn_prop_slots: int = 0
 
     def prop_counts(self):
         """(props, triangles, batches) -- what the status line and the tests both want."""
@@ -599,6 +605,10 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             # arrive world-transformed and merged, so this is an upload, not a build.
             arrays = tuple(batch[k] for k in ("pos", "nrm", "col", "idx"))
             self._upload_static("props", arrays, material=str(batch.get("material", "plastic")))
+        if geom.dyn_props:
+            self.scene.set_dyn_props(geom.dyn_props, max(1, int(geom.dyn_prop_slots)))
+        else:
+            self.scene.clear_dyn_props()
         if geom.centerline is not None and len(geom.centerline) > 1:
             cl = np.vstack([geom.centerline, geom.centerline[:1]])
             self.scene.add_line("centerline", cl, (0.35, 0.55, 0.9, 0.35), z=0.008)
@@ -869,6 +879,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         else:
             sc.set_focus_ring(0.0, 0.0, on=False)
         sc.set_car_instances(mats, tint, labels=fr.get("ids") if self.show_labels else None)
+        sc.set_dyn_prop_poses(fr.get("props_dyn"))
 
         # `draw_frame(show_points=...)` renders the point VAO, and that VAO only exists once a
         # frame carrying a scan has allocated it. A session with the LiDAR overlay on but no scan
