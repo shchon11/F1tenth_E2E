@@ -14,7 +14,8 @@ What is *not* new, on purpose:
 * **The policy is `model.actor`, unchanged**: the same mean head, the same state-independent
   `log_std`. A SAC checkpoint is an `ActorCritic` checkpoint (`sac_u*.pt`), and the console, the
   evaluation and the ROS node load it exactly as they load a PPO one. The action the env executes is
-  `clamp(u, -1, 1)` of the Gaussian sample `u`, which is what PPO does too.
+  `clamp(u, -1, 1)` of the Gaussian sample `u`, which is what PPO does too -- and, as PPO does, the
+  likelihood the actor is trained on is `u`'s, so the replay stores `u` and not its clamp.
 
 What is new:
 
@@ -86,11 +87,12 @@ class Replay:
     """Learner transitions, time-major per row: slot (t, j) is row j's step t, t modulo `T`.
 
     Stored per slot: the newest scan frame (uint16), the proprio vector (fp16), the critic's
-    privileged vector (fp32, conditioning included), the actor's conditioning, the executed action,
-    the reward, `term` (a real ending -- no bootstrap), `last` (the episode ended here, by `term` or
-    by truncation), and `age`, the steps since the episode's first observation, which is what the
-    stack is rebuilt from. An episode's final observation -- the one after `last` -- is kept in a
-    small side ring (`fin_*`), indexed by `fin_slot`.
+    privileged vector (fp32, conditioning included), the actor's conditioning, the action draw `u`
+    (unclamped; the env executed `executed(u)`), the reward, `term` (a real ending -- no bootstrap),
+    `last` (the episode ended here, by `term` or by truncation), and `age`, the steps since the
+    episode's first observation, which is what the stack is rebuilt from. An episode's final
+    observation -- the one after `last` -- is kept in a small side ring (`fin_*`), indexed by
+    `fin_slot`.
     """
 
     def __init__(self, T: int, n: int, n_stack: int, n_beams: int, pro_dim: int, priv_dim: int,
@@ -301,6 +303,12 @@ def _entropy(dist) -> torch.Tensor:
     return dist.entropy().sum(1)
 
 
+def executed(u: torch.Tensor) -> torch.Tensor:
+    """The action the env executes for a Gaussian draw `u` -- what the Q functions are asked about.
+    The replay holds `u` itself, so a likelihood fitted to it is the policy's own, not a clamped one."""
+    return u.clamp(-1, 1)
+
+
 def _polyak(dst: nn.Module, src: nn.Module, tau: float) -> None:
     with torch.no_grad():
         for p_d, p_s in zip(dst.parameters(), src.parameters()):
@@ -378,7 +386,7 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
             dist = actor.step_dist(scan, pro, c_t)[0]
             u = dist.sample()
         u = u.float()
-        act = u.clamp(-1, 1)
+        act = executed(u)
         obs_n, rew, term, trunc, info = env.step(act)
         done = term | trunc
         # the transition, learner rows only
@@ -401,7 +409,11 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
                 ep_stats["progress"] += f["progress"][m].tolist()
                 ep_stats["contacts"] += f["contacts"][m].float().tolist()
                 ep_stats["steps"] += f["steps"][m].tolist()
-        rb.add(scan[lid, 0], pro[lid], priv_c[lid], None if c_t is None else c_t[lid], act[lid],
+        # The draw is stored, not the clamped action the env executed: the critic clamps it
+        # (`executed`) and the AWAC actor fits its likelihood. Fitting the clamped action instead
+        # pulls every mean near the edge inward -- s911 has |mu| > 0.9 in 10-22 % of states on four
+        # of its eight dimensions -- and sac2 slowed from 8.0 to 8.4 s a lap doing it.
+        rb.add(scan[lid, 0], pro[lid], priv_c[lid], None if c_t is None else c_t[lid], u[lid],
                rew[lid], term[lid], done[lid], final)
         onset = info.get("contact_onset")
         if onset is not None:
@@ -427,13 +439,13 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
                     nd = actor.step_dist(bt["n_scan"], bt["n_pro"], n_cond_b)[0]
                     nu = nd.sample()
                     nlogp = nd.log_prob(nu).sum(1).float()
-                    na = nu.clamp(-1, 1)
+                    na = executed(nu)
                     qn = torch.minimum(q1_t(bt["n_scan"], bt["n_pro"], bt["n_priv"], na),
                                        q2_t(bt["n_scan"], bt["n_pro"], bt["n_priv"], na)).float()
                     y = bt["ret"] + bt["disc"] * (qn - alpha * nlogp)
                 with ac:
-                    qa = q1(bt["scan"], bt["pro"], bt["priv"], bt["act"]).float()
-                    qb = q2(bt["scan"], bt["pro"], bt["priv"], bt["act"]).float()
+                    qa = q1(bt["scan"], bt["pro"], bt["priv"], executed(bt["act"])).float()
+                    qb = q2(bt["scan"], bt["pro"], bt["priv"], executed(bt["act"])).float()
                 loss_q = (F.huber_loss(qa, y, delta=hyper.huber) + F.huber_loss(qb, y, delta=hyper.huber))
                 for g_ in opt_q.param_groups:
                     g_["lr"] = hyper.lr_critic * min(1.0, (updates + 1) / max(hyper.critic_lr_warmup, 1))
@@ -452,9 +464,9 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
                             minq = lambda act_: torch.minimum(q1(bt["scan"], bt["pro"], bt["priv"], act_),
                                                               q2(bt["scan"], bt["pro"], bt["priv"], act_)).float()
                             d_old = actor.step_dist(bt["scan"], bt["pro"], cond_b)[0]
-                            v = torch.stack([minq(d_old.sample().clamp(-1, 1))
+                            v = torch.stack([minq(executed(d_old.sample()))
                                              for _ in range(max(1, hyper.awac_samples))]).mean(0)
-                            adv = minq(bt["act"]) - v
+                            adv = minq(executed(bt["act"])) - v
                             w = torch.exp(adv / (hyper.awac_beta * adv.std().clamp_min(1e-3))).clamp(max=hyper.awac_wmax)
                             mu0 = actor0.step_dist(bt["scan"], bt["pro"], cond_b)[0].mean.float()
                         with ac:
@@ -474,7 +486,7 @@ def train(a, *, env, model, obs, lid, device, cond_dim: int, cond_mode: str, con
                             d = actor.step_dist(bt["scan"], bt["pro"], cond_b)[0]
                             uu = d.rsample()
                             logp = d.log_prob(uu).sum(1).float()
-                            aa = uu.clamp(-1, 1)
+                            aa = executed(uu)
                             qpi = torch.minimum(q1(bt["scan"], bt["pro"], bt["priv"], aa),
                                                 q2(bt["scan"], bt["pro"], bt["priv"], aa)).float()
                             with torch.no_grad():

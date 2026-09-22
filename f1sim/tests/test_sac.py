@@ -85,6 +85,45 @@ def test_the_q_functions_start_as_the_value_function():
     assert torch.count_nonzero(q.c.pro[0].weight.grad[:, -8:]) > 0
 
 
+def test_the_buffer_keeps_the_draw_and_the_critic_sees_what_the_env_executed(monkeypatch, tmp_path):
+    """The replay holds the Gaussian draw `u`, not `clamp(u)`: the AWAC actor fits the policy's
+    likelihood of what it drew. Fitted to clamped draws instead, a mean near the edge is pulled
+    inward every update -- sac2 slowed from 8.0 to 8.4 s a lap that way. The Q functions and the
+    env are still given the clamped action. A few steps of `train` with a wide policy, so draws
+    fall outside [-1, 1], through both the critic and the actor updates."""
+    import types
+    from f1sim.learn import sac as sac_mod
+    env = _env(envs=4)
+    obs, _ = env.reset(seed=5)
+    scan, pro = flatten_obs(obs)
+    priv = env.privileged(env.last_result)
+    model = ActorCritic(n_stack=scan.shape[1], n_beams=scan.shape[2], proprio_dim=pro.shape[1],
+                        priv_dim=priv.shape[1], act_dim=env.act_dim, scan_stem="resnet")
+    with torch.no_grad():
+        model.actor.log_std.fill_(0.4)                  # std 1.5: most draws land outside [-1, 1]
+    stored, executed_by_env, q_inputs = [], [], []
+    add, step, q_fwd = Replay.add, env.step, QNet.forward
+    monkeypatch.setattr(Replay, "add", lambda self, *x, **k: (stored.append(x[4].clone()), add(self, *x, **k))[1])
+    monkeypatch.setattr(env, "step", lambda act: (executed_by_env.append(act.clone()), step(act))[1])
+    monkeypatch.setattr(QNet, "forward", lambda self, s, p, v, act: (q_inputs.append(act.detach()), q_fwd(self, s, p, v, act))[1])
+    a = types.SimpleNamespace(total=4 * 24, cap0=9.0, cap1=9.0, cap_steps=1, grip_budget_penalty=0.0, seed=0)
+    hyper = sac_mod.SACHyper(buffer=256, batch=8, updates_per_step=1, start=4 * 12, critic_warmup=0,
+                             actor_every=1, n_step=3, contact_frac=0.0)
+    lid = env.learner_ids
+    sac_mod.train(a, env=env, model=model, obs=obs, lid=lid, device=torch.device("cpu"), cond_dim=0,
+                  cond_mode="none", cond_spec=None, dial=None, dial_new=torch.zeros(env.B, dtype=torch.bool),
+                  out=str(tmp_path), progress_log=types.SimpleNamespace(write=lambda r: None),
+                  run=types.SimpleNamespace(log=lambda *x, **k: None), spec=None, steps_base=0,
+                  t_start=0.0, save=lambda *x: None, hyper=hyper, gamma=0.99, log_every=1000,
+                  save_every=1000, amp=False)
+    assert len(stored) == len(executed_by_env) == 24
+    for u, act in zip(stored, executed_by_env):
+        torch.testing.assert_close(u.clamp(-1, 1), act[lid], rtol=0, atol=0)
+    draws = torch.cat(stored)
+    assert (draws.abs() > 1).float().mean() > 0.2, "the draws kept must include the ones the env clamped"
+    assert q_inputs and max(float(x.abs().max()) for x in q_inputs) <= 1.0
+
+
 def test_n_step_targets_stop_at_endings_and_bootstrap_truncations_from_their_final():
     """`sample(n_step=...)`: the return sums rewards up to the window or the episode's end, whichever
     comes first; a real ending (`term`) is not bootstrapped; a truncation is, from the final
