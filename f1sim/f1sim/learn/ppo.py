@@ -240,6 +240,14 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
             "clipfrac": ((ratio - 1).abs() > hyper.clip).float().mean()}
 
 
+def _per_km(count, dist_m: float) -> float:
+    """Contacts per km of net progress, NaN when the episodes that ended made none. `progress` is
+    signed: an episode that turned round and drove the wrong way ends with a negative one, and
+    dividing by `max(dist, 1e-6)` then printed s914's "9000000000.0/km" for a single contact."""
+    dist_m = float(dist_m)
+    return 1000.0 * float(count) / dist_m if dist_m > 1.0 else float("nan")
+
+
 def kl_reference_is_baseline(ref, memory_on: bool, kl_coef: float, init: str = "") -> bool:
     """Is the KL reference actor the frozen FEEDFORWARD baseline the leash needs? Raises if it has
     to be and is not.
@@ -1467,6 +1475,16 @@ def main():
     # `--metrics-jsonl` stays what it was (a caller-chosen path for a smoke's report); this one is
     # always written, always in the run directory, and is what the console's dashboard reads.
     progress_log = common.ProgressLog(out)
+    # The command line, next to the checkpoints. A checkpoint does not carry its environment (the
+    # obstacle generator's density and slots, contact, the runway), an offline W&B run writes no
+    # readable config, and the console's 장애물 "학습과 같음" has to rebuild that environment.
+    try:
+        with open(os.path.join(out, "args.json"), "w") as fh:
+            json.dump({k: v for k, v in vars(a).items()
+                       if v is None or isinstance(v, (bool, int, float, str, list, tuple, dict))},
+                      fh, indent=1, sort_keys=True, default=str)
+    except OSError as exc:
+        print(f"args.json not written: {exc}", flush=True)
     # Re-seed before the first rollout, so the ACTION-SAMPLING stream does not depend on how many
     # modules were built. Two arms that differ by a scan channel or by the motion branch consume
     # different amounts of the ambient generator while constructing the network, and without this
@@ -2052,7 +2070,7 @@ def main():
                                 "curriculum/mean_track_coll_per_km": float(np.mean(per_track))})
             if n_ep:
                 last_log = {"collision_rate": float(np.mean(np.minimum(ep_stats["collided"], 1.0))), "progress_m": float(np.mean(ep_stats["progress"])),
-                            "collisions_per_km": 1000.0 * float(np.sum(ep_stats["collided"])) / max(float(np.sum(ep_stats["progress"])), 1e-6),
+                            "collisions_per_km": _per_km(np.sum(ep_stats["collided"]), np.sum(ep_stats["progress"])),
                             "lap_time_s": float(np.mean(ep_stats["lap_time"])) if ep_stats["lap_time"] else float("nan")}
                 dist = float(np.sum(ep_stats["progress"]))
                 log.update({"episode/return": np.mean(ep_stats["return"]), "episode/progress_m": np.mean(ep_stats["progress"]),
@@ -2060,7 +2078,7 @@ def main():
                             # the hazard rate per metre driven. collision_rate saturates at 1.0 once
                             # episodes are long enough to almost always contain a crash, and stays
                             # there while the policy goes on getting better
-                            "episode/collisions_per_km": 1000.0 * float(np.sum(ep_stats["collided"])) / max(dist, 1e-6),
+                            "episode/collisions_per_km": _per_km(np.sum(ep_stats["collided"]), dist),
                             "episode/count": n_ep})
                 if ep_stats["lap_time"]:
                     laps = np.asarray(ep_stats["lap_time"], dtype=float)
