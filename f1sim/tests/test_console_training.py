@@ -153,12 +153,32 @@ def test_a_tracks_value_the_controls_cannot_express_is_kept_verbatim(picker):
 
 
 # ================================================================ the argv it builds
+def _on_the_ppo_recipe(f, key="origrecipe"):
+    """Put the training page where the PPO recipes live, and return it.
+
+    The page opens on step ① of the pipeline -- DAgger -- since the pipeline was added
+    (`d372589`, 2026-09-20, "the training page hid its own pipeline"), and the recipe combo is
+    filled per mode, so a freshly built form holds one entry (사용자 정의) and its command is
+    DAgger's. The tests below are about the PPO recipes, which is a different page of the same
+    form; asking a freshly built form about them is asking the wrong page.
+
+    Measured on 2026-09-23: in this state `RECIPES[0]` does reach the command in full --
+    `--opponent mixed`, `--obstacle-draws 8`, `--controller legacy`, `--race-size 2`, no
+    `--estimator` -- so what follows is the same claim it always was, asked where it applies.
+    """
+    f.set_mode("ppo")
+    i = f.combo_recipe.findData(key)
+    assert i >= 0, f"the ppo page has no {key} recipe: {[f.combo_recipe.itemData(k) for k in range(f.combo_recipe.count())]}"
+    f.combo_recipe.setCurrentIndex(i)
+    return f
+
+
 @pytest.fixture
 def form(qapp, tmp_path, monkeypatch):
     monkeypatch.setenv("F1SIM_SCENES", str(tmp_path / "scenes"))
     f = T.RecipeForm()
     try:
-        yield f
+        yield _on_the_ppo_recipe(f)
     finally:
         f.deleteLater()
 
@@ -184,6 +204,32 @@ def test_historical_recipe_is_explicit_and_training_controls_are_available(form)
     assert "--estimator" not in argv
     assert argv[argv.index("--race-size") + 1] == "2"
     assert form.combo_device.findText("cuda") >= 0
+
+
+def test_a_mode_you_come_back_to_says_which_recipe_its_values_are(qapp, tmp_path, monkeypatch):
+    """Leaving a mode and returning restores its values from the cache; the recipe's *name* has to
+    come back with them.
+
+    It did not, and the page then read 사용자 정의 over another recipe's numbers -- the same class
+    of problem as a 장애물 label that did not describe what was placed. `_mode_changed` only reset
+    the combo for a mode it had never built, and the form builds the PPO page once at construction
+    before opening on step ① of the pipeline, so PPO was always "already built" by the time anyone
+    switched to it.
+    """
+    monkeypatch.setenv("F1SIM_SCENES", str(tmp_path / "scenes"))
+    f = T.RecipeForm()
+    try:
+        f.set_mode("ppo")
+        assert f.combo_recipe.currentData() == "origrecipe", "PPO's own default recipe"
+        f.combo_recipe.setCurrentIndex(f.combo_recipe.findData("sgr"))
+        tracks_before = f.argv()[1][f.argv()[1].index("--tracks") + 1]
+        f.set_mode("dagger")
+        f.set_mode("ppo")
+        assert f.combo_recipe.currentData() == "sgr"
+        argv = f.argv()[1]
+        assert argv[argv.index("--tracks") + 1] == tracks_before == T.SGR_TRACKS
+    finally:
+        f.deleteLater()
 
 
 def test_the_narrow_recipes_round_trip_through_the_picker(form):

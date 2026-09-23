@@ -278,10 +278,16 @@ def test_the_training_page_emits_a_flag_the_trainer_parses(qapp, tmp_path, monke
 
 
 def test_the_training_page_leaves_the_recipes_alone_with_the_switch_off(qapp, tmp_path, monkeypatch):
-    """The recipes are measured configurations. Off, the command must be the one it always was."""
+    """The recipes are measured configurations. Off, the command must be the one it always was.
+
+    Asked of the PPO page, because that is where the PPO recipes are: the form opens on step ① of
+    the pipeline (DAgger) since `d372589`, and the recipe combo is filled per mode.
+    """
     monkeypatch.setenv("F1SIM_SCENES", str(tmp_path / "scenes"))
     form = T.RecipeForm()
     try:
+        form.set_mode("ppo")
+        form.combo_recipe.setCurrentIndex(form.combo_recipe.findData("origrecipe"))
         _name, argv, _dev = form.argv()
         assert "--opp-slots" not in argv
         assert argv[argv.index("--opponent") + 1] == "mixed"
