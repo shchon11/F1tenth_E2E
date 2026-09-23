@@ -4,9 +4,10 @@ What is worth testing here is not that props exist -- `test_prop_sim.py` already
 prop collides and that `prop_math`'s primitives are right -- but the four claims this feature makes
 that nothing else can check:
 
-1. off is off: with `EnvConfig.procedural_obstacles == 0` nothing is allocated, nothing is drawn
-   from the generator and a run is bit-identical to the same run before any of this existed. The
-   reference digest is recorded from the merge base and pinned here.
+1. off is off: with `EnvConfig.procedural_obstacles == 0` nothing is allocated and the run asks the
+   generator for exactly what it asked for before any of this existed. That last part is pinned as
+   a digest of the generator state, taken from the merge base -- not of the observations, which
+   move with every legitimate change to the simulator (see `BASE_GEN_DIGEST`).
 2. the layout really is new at every reset, and really is a function of `sim.gen` alone.
 3. the gap is there by construction: measured on the catalogue maps, over 1000 draws, on the
    geometry actually standing on the track rather than on the arithmetic that placed it.
@@ -17,6 +18,8 @@ from __future__ import annotations
 import ast
 import inspect
 import math
+import os
+import sys
 
 import numpy as np
 import pytest
@@ -109,8 +112,13 @@ def test_row_ladder_is_sorted():
 
 
 # ==================================================================== 2. off is off
-def _digest(procedural: float) -> str:
-    """A fixed rollout reduced to one hash: observations, rewards, flags and the generator state."""
+def _rollout(procedural: float):
+    """The same fixed rollout every time: 40 steps of the same pseudo-random actions on two rings.
+
+    Returns (observation digest, generator-state digest). The first is the physics the run produced
+    and moves whenever the simulator legitimately changes; the second is only *which* random draws
+    the run made, and a change in it means the code asked the generator for something new.
+    """
     import hashlib
     kw = {} if procedural <= 0 else {"procedural_obstacles": procedural}
     env = make_env([ring_track("a"), ring_track("b", R=6.5, w=1.15)], B=16, seed=7, **kw)
@@ -122,19 +130,38 @@ def _digest(procedural: float) -> str:
         obs, rew, term, trunc, info = env.step(act)
         for t in (obs["scan"], obs["speed"], rew, term, trunc):
             h.update(np.ascontiguousarray(t.detach().cpu().numpy()).tobytes())
-    h.update(env.sim.gen.get_state().numpy().tobytes())
-    return h.hexdigest()
+    return h.hexdigest(), hashlib.sha256(env.sim.gen.get_state().numpy().tobytes()).hexdigest()
 
 
-#: `_digest(0.0)` on the merge base (main `4209ec2`, before this branch), recorded 2026-09-13 by
-#: running the same function against a `git archive` of that commit. It is the whole of what
-#: "defaults to byte-identical off" means, so it is pinned rather than compared against a second
-#: run of the same code, which would pass however far the off path had drifted.
-BASE_DIGEST = "7a0f4024a0daec49c60f2e54d437a3c7f1bc4df95b3786b00a7422f9328f162e"
+#: The generator state after `_rollout(0.0)`, as the merge base (main `4209ec2`, before any of this
+#: existed) leaves it. Re-measured 2026-09-23 by checking `4209ec2` out into a worktree and running
+#: this same rollout against it: 295 commits of simulator work later, HEAD still lands here.
+#:
+#: This replaces a pin on the *observation* digest, which had been failing since well before it was
+#: last looked at, for two separate reasons, both measured on 2026-09-23:
+#:
+#: * it did not reproduce on this machine even at the commit that recorded it (`7877b18` produces
+#:   `b67b98b5...`, not the `7a0f4024...` written down beside it), so the old number carried the
+#:   float/library environment it was recorded in as much as it carried the code; and
+#: * the off path's physics really has moved since the merge base, at least twice. The first move
+#:   bisects to `9035c44` (2026-09-21, the road-tilt OU state and a parked car's LiDAR), which is
+#:   deliberate sensor work that has nothing to do with obstacles.
+#:
+#: So an observation pin cannot state this feature's claim: it fails for every unrelated change to
+#: the simulator and it has to be re-recorded per machine. What it was *for* -- "off consumes
+#: nothing, draws nothing, and leaves the run exactly as it was" -- is the generator state, which is
+#: a function of the sequence of draws alone and therefore immune to both. `procedural_obstacles`
+#: draws its layout from `sim.gen`, so any leak of the generator into the off path moves this hash.
+BASE_GEN_DIGEST = "2b7fdc0a639590451d2254e88b57d21a2d2f3cb67d13518d3351785b2db60563"
 
 
-def test_off_is_byte_identical_to_the_merge_base():
-    assert _digest(0.0) == BASE_DIGEST
+def test_off_draws_exactly_what_the_merge_base_drew():
+    assert _rollout(0.0)[1] == BASE_GEN_DIGEST
+
+
+def test_on_draws_more_than_the_merge_base_did():
+    """A guard on the guard: if the layout cost no randomness, the test above would prove nothing."""
+    assert _rollout(1.0)[1] != BASE_GEN_DIGEST
 
 
 def test_off_allocates_nothing():
@@ -148,8 +175,16 @@ def test_off_allocates_nothing():
 
 
 def test_on_changes_the_rollout():
-    """A guard on the guard: if the digest above matched with the option *on*, it would prove nothing."""
-    assert _digest(1.0) != BASE_DIGEST
+    """The observable side of the same claim, compared against this build rather than a pinned
+    number: turning the option on has to move the LiDAR and the rewards. Off vs on in one run, so
+    it says nothing about how the simulator's physics has changed since -- only that the feature
+    is the thing making the difference."""
+    assert _rollout(1.0)[0] != _rollout(0.0)[0]
+
+
+def test_off_is_the_same_run_twice():
+    """And off is deterministic, so the digest above is a fact about the code, not about the day."""
+    assert _rollout(0.0) == _rollout(0.0)
 
 
 # ==================================================================== 3. fresh at every reset
@@ -515,13 +550,40 @@ def test_teacher_opponents_are_never_routed_through_a_piece():
         f"{int(touched[opp].sum())} of {int(opp.sum())} teacher cars touched a piece")
 
 
+def _tracks_that_exist(spec: str) -> list:
+    """`spec`'s track names, minus the `scene:` ones this machine has no scene directory for.
+
+    Scenes live outside the repository (`~/f1sim_scenes`, or `$F1SIM_SCENES`) and are the user's own
+    recordings, so a checkout on another machine simply does not have them. Dropping the missing
+    ones keeps the catalogue tracks -- which every machine builds -- under test instead of skipping
+    the whole check the moment a scene is not there.
+    """
+    from f1sim import scene as scene_mod
+    from f1sim.learn import common
+    out = []
+    for name in common.track_names(spec):
+        raw = str(name)
+        if raw.startswith("scene:"):
+            try:                               # a name with modifiers is not ours to resolve here
+                d = scene_mod.scene_dir(raw.split(":", 1)[1].split("@", 1)[0])
+            except Exception:
+                out.append(name)               # keep it, and let the loader say what is wrong
+                continue
+            if not os.path.isfile(os.path.join(d, "scene.json")):
+                continue
+        out.append(name)
+    return out
+
+
 def test_no_piece_stands_on_the_raceline():
     """The geometric form of the same claim: every placed piece keeps the car's half-width clear of
     the line, measured as a distance in the plane rather than as an offset in a lane frame."""
     from scipy.spatial import cKDTree
     from f1sim.learn import common
-    trs, rls = common.load_tracks(common.track_names("gen:control:1400,scene:scene_0912_2344"),
-                                  racelines=True)
+    names = _tracks_that_exist("gen:control:1400,scene:scene_0912_2344")
+    if not names:
+        pytest.skip("no track of gen:control:1400,scene:scene_0912_2344 is available here")
+    trs, rls = common.load_tracks(names, racelines=True)
     cfg = cpu_cfg(8)
     env = F1VecEnv(trs, cfg, EnvConfig(compile_tracker=False, procedural_obstacles=1.0,
                                        race_size=2, opponent="teacher"), num_envs=24, device="cpu")
@@ -607,7 +669,46 @@ def test_explicit_slot_budget_drops_the_overflow(catalogue_tracks):
 
 
 # ==================================================================== 8. evaluation is untouched
-def test_evaluation_defaults_are_off():
+def _evaluate_env_extra(argv: list) -> dict | None:
+    """What `learn.evaluate.main()` would hand the environment for `argv`, without evaluating.
+
+    `main` builds its parser inline and goes straight to `evaluate(...)`, so the honest way to read
+    its defaults is to run it with `evaluate` replaced by something that records `opp_extra` -- the
+    one channel through which a flag reaches `EnvConfig`. Nothing is loaded and no policy is run.
+    """
+    from f1sim.learn import evaluate as ev
+    seen = {}
+
+    def spy(ckpt, tracks, envs, steps, speed_cap, device, **kw):
+        seen["opp_extra"] = kw.get("opp_extra")
+        return {}
+
+    real_evaluate, real_argv = ev.evaluate, sys.argv
+    try:
+        ev.evaluate, sys.argv = spy, ["evaluate", *argv]
+        ev.main()
+    finally:
+        ev.evaluate, sys.argv = real_evaluate, real_argv
+    return seen["opp_extra"]
+
+
+def test_evaluation_defaults_are_off(capsys):
+    """An evaluation nobody asked for obstacles has none of these, so the frozen suites do not move.
+
+    `evaluate` did grow `--procedural-*` on purpose -- without them `spec_korea_contact_s911` could
+    only be scored on an empty track, which is not what it was trained for. What has to hold is not
+    that the words are absent from the file (which is what this used to assert, and what broke the
+    day the flags landed) but that every one of them is off unless it is asked for: unset, nothing
+    at all reaches `EnvConfig`, and the environment's own default is off.
+    """
     assert EnvConfig().procedural_obstacles == 0.0
-    src = inspect.getsource(__import__("f1sim.learn.evaluate", fromlist=["x"]))
-    assert "procedural" not in src, "evaluate grew a procedural option; the frozen suites move"
+    assert _evaluate_env_extra(["--teacher", "--tracks", "gen:control:1400"]) is None
+    capsys.readouterr()                       # main() prints its (empty) report
+
+
+def test_evaluation_passes_the_option_through_when_it_is_asked_for(capsys):
+    """The guard on the guard: `None` above has to mean "not asked for", not "cannot be asked for"."""
+    extra = _evaluate_env_extra(["--teacher", "--tracks", "gen:control:1400",
+                                 "--procedural-obstacles", "1.0", "--procedural-density", "1.5"])
+    capsys.readouterr()
+    assert extra == {"procedural_obstacles": 1.0, "procedural_density": 1.5}

@@ -1,14 +1,19 @@
 """Guards and failure semantics of the viewer's CUDA-graph fast path.
 
-CPU only. Nothing here captures a graph -- capture needs CUDA, and a *failed* capture poisons the
-process, so the fatal-path tests inject `CaptureFailed` rather than provoking one. That is the
-point of the exercise anyway: what the worker does when capture fails, not that it can fail.
+Most of this is CPU-only: a *failed* capture poisons the process, so the fatal-path tests inject
+`CaptureFailed` rather than provoking one -- what the worker does when capture fails is the point,
+not that it can fail. Those checks must keep passing on a machine with no GPU.
 
-The equivalence of a replayed graph against eager is measured separately on hardware; these are the
-checks that must keep passing without a GPU.
+The rest are the equivalence checks, which do capture, and they are skipped without CUDA. They are
+expensive: each builds whole environments and holds a graph's private memory pool, and capture
+itself needs a contiguous block for the pool it is about to create. A test that leaves its
+environment or its graph behind therefore does not merely waste memory -- it makes a *later*
+capture in the same process fail, which is why every one of them tears down explicitly and why
+`_free_cuda_between_tests` runs after each. See that fixture.
 """
 from __future__ import annotations
 
+import gc
 import sys
 import types
 
@@ -20,6 +25,45 @@ from f1sim.viewer import sim_worker
 from f1sim.viewer.graph_fastpath import (CaptureFailed, GuardViolation, NotCapturable,
                                          SimGraphFastPath, _dict_sig, _freeze, mpc_eligible,
                                          roll_eligible)
+
+
+@pytest.fixture(autouse=True)
+def _free_cuda_between_tests():
+    """Give the next test the memory this one used.
+
+    The CUDA caching allocator does not return a freed block to the driver, and a captured graph
+    owns a private pool that only goes back when the last reference to the graph is dropped. Run
+    the whole file and the captures near the end -- the teacher graph, the opponent planners --
+    used to die inside `torch.cuda.graph(...)` for want of room, while passing on their own. That
+    is a property of this file, not of the code under test: the console's own teardown
+    (`SimWorker._release_session`) already collects and empties the cache, and sessions built back
+    to back through it are fine.
+
+    So: collect the cycles (an env reaches its own tensors through the module graph, so refcounts
+    alone do not free it), then hand the blocks back. Before as well as after, because a test that
+    fails leaves its objects alive in the traceback pytest keeps.
+
+    The current device is put back for the same reason. `test_a_captured_soft_roll_matches_eager`
+    calls `torch.cuda.set_device`, which is process-wide and outlives the test, so every later test
+    that says `device="cuda"` without an index -- the actor capture, the recorder, the training
+    runtime -- silently moved to whichever card that one picked. On a two-GPU machine that is a
+    different card with different free memory, and it is the whole difference between a test that
+    passes alone and the same test failing in a full run.
+    """
+    def sweep():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+    dev0 = torch.cuda.current_device() if torch.cuda.is_available() else None
+    sweep()
+    try:
+        yield
+    finally:
+        if dev0 is not None and torch.cuda.current_device() != dev0:
+            torch.cuda.set_device(dev0)
+        sweep()
 
 
 # --------------------------------------------------------------------- snapshots
@@ -160,24 +204,32 @@ def test_a_captured_soft_roll_matches_eager():
         return env
 
     eager, graphed = build(), build()
-    fp = prepare_graph_runtime(graphed, log=lambda _t: None)
-    assert fp is not None, "the soft-wall roll was not captured"
-    # prepare_graph_runtime steps the env to record arguments; bring the eager twin level with it
-    act = torch.zeros(eager.B, eager.act_dim, device=dev)
-    while int(eager.ep_step.max()) < int(graphed.ep_step.max()):
-        eager.step(act)
-    g = torch.Generator(device="cpu").manual_seed(3)
-    touched_e = touched_g = 0
-    for _ in range(80):
-        a = (torch.rand(eager.B, eager.act_dim, generator=g) * 2 - 1).to(dev)
-        _o, _r, _t, _tr, ie = eager.step(a)
-        _o, _r, _t, _tr, ig = graphed.step(a)
-        touched_e += int((ie["wall_dist"] <= 0).sum()); touched_g += int((ig["wall_dist"] <= 0).sum())
-    fp.release()
-    assert touched_e > 0, "nothing was ever touched, so the contact path was not exercised"
-    assert touched_g == touched_e, f"contacts differ: eager {touched_e}, graph {touched_g}"
-    diff = float((eager.sim.state[:, :4] - graphed.sim.state[:, :4]).abs().max())
-    assert diff < 1e-3, f"the graphed roll drifted from eager by {diff}"
+    fp = None
+    try:
+        fp = prepare_graph_runtime(graphed, log=lambda _t: None)
+        assert fp is not None, "the soft-wall roll was not captured"
+        # prepare_graph_runtime steps the env to record arguments; bring the eager twin level with it
+        act = torch.zeros(eager.B, eager.act_dim, device=dev)
+        while int(eager.ep_step.max()) < int(graphed.ep_step.max()):
+            eager.step(act)
+        g = torch.Generator(device="cpu").manual_seed(3)
+        touched_e = touched_g = 0
+        for _ in range(80):
+            a = (torch.rand(eager.B, eager.act_dim, generator=g) * 2 - 1).to(dev)
+            _o, _r, _t, _tr, ie = eager.step(a)
+            _o, _r, _t, _tr, ig = graphed.step(a)
+            touched_e += int((ie["wall_dist"] <= 0).sum()); touched_g += int((ig["wall_dist"] <= 0).sum())
+        assert touched_e > 0, "nothing was ever touched, so the contact path was not exercised"
+        assert touched_g == touched_e, f"contacts differ: eager {touched_e}, graph {touched_g}"
+        diff = float((eager.sim.state[:, :4] - graphed.sim.state[:, :4]).abs().max())
+        assert diff < 1e-3, f"the graphed roll drifted from eager by {diff}"
+    finally:
+        # Two 16-env environments and a graph pool, on the device the later captures need. The
+        # `release()` alone is not enough: it restores the hooks, and it is dropping the last
+        # reference that hands the pool back (`_free_cuda_between_tests` does the collecting).
+        if fp is not None:
+            fp.release()
+        del fp, eager, graphed
 
 
 def test_schedule_disagreeing_with_period_is_not_eligible():
@@ -448,6 +500,8 @@ def test_captured_actor_step_matches_eager_and_keeps_the_hidden_state_static():
         actor.mu.weight = torch.nn.Parameter(actor.mu.weight.clone())
     with pytest.raises(GuardViolation):
         g(scan, pro, got_h)
+    # `GraphedCallable` has no release: the pool comes back when the last reference goes.
+    del g, actor, scan, pro, h, got_h, want_h, got_mu, want_mu, mu2, h2, want2, wh2
 
 
 # ------------------------------------------------------------------ the opponent teacher
@@ -602,10 +656,13 @@ def test_the_console_session_captures_soft_walls_with_props():
         assert env.sim.track.has_props, "the scenario did not produce props, so nothing was tested"
         assert not env.sim.cfg.sim.terminate_on_collision
         assert session.get("fastpath") is not None, "the soft-wall session fell back to eager"
+        del env
     finally:
-        fp = session.get("fastpath")
-        if fp is not None:
-            fp.release()
+        # The worker's own teardown, not just the fast path's: a built session also holds the
+        # policy, the controller and -- on a scenario with opponents -- a teacher graph, and this
+        # used to release one of the four. What was left standing is what a later capture in this
+        # file could not find room beside.
+        w._release_session(session)
         ctl_c.close(); fr_r.close()
 
 

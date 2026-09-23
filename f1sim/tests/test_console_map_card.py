@@ -129,8 +129,13 @@ def test_the_defaults_are_forward_no_obstacles_random_seed(win):
     ("", "", None, "real/korea26", "real:korea_2026_competition"),
     ("rev", "", None, "real/korea26@rev", "real:korea_2026_competition~rev"),
     ("mir+rev", "", None, "real/korea26@mir+rev", "real:korea_2026_competition~mir~rev"),
-    ("rev", "line", 44, "real/korea26@rev#line:44", "real:korea_2026_competition+rlobs44~rev"),
-    ("", "edge", 3, "real/korea26#edge:3", "real:korea_2026_competition+obs3"),
+    # A family now carries the asset choice too (`tracks.asset_scenario`): the control places
+    # modelled props of a random style and size, so the spec says which catalogue and at what
+    # scale. `!assets=mixed:1` is what "고른 종류 없음, 크기 그대로" reads as.
+    ("rev", "line", 44, "real/korea26@rev#line:44!assets=mixed:1",
+     "real:korea_2026_competition+rlobs44~rev!assets=mixed:1"),
+    ("", "edge", 3, "real/korea26#edge:3!assets=mixed:1",
+     "real:korea_2026_competition+obs3!assets=mixed:1"),
 ])
 def test_the_three_controls_build_the_scenario(win, direction, obstacle, seed, spec, legacy):
     win.map_list.select("real/korea26")
@@ -153,7 +158,7 @@ def test_a_random_seed_is_drawn_by_the_worker_and_is_stable_for_one_config(win):
     win.combo_obstacle.setCurrentIndex(win.combo_obstacle.findData("line"))
     win._on_scenario_changed()
     cfg = win.current_config()
-    assert cfg.map_name == "real/korea26#line:*"
+    assert cfg.map_name == "real/korea26#line:*!assets=mixed:1"
     assert win.btn_reroll.isEnabled()
     drawn = cfg.scenario()
     assert drawn.seed is not None and not drawn.random_seed
@@ -175,15 +180,25 @@ def test_reroll_changes_the_map_and_therefore_the_generation(win):
 
 def test_a_track_is_only_offered_the_obstacles_its_loader_can_carry(win):
     """The *families* are the loader's limit. 기본 and 없음 are not families and are on every map:
-    neither adds anything, so neither can be unsupported."""
+    neither adds anything, so neither can be unsupported.
+
+    Since the families became placements of modelled props (`tracks.ASSET_OBSTACLES`, with the
+    catalogue named by `!assets=`), a racetrack carries all three: what it could never carry was
+    the old grid-rasterised `+obs`/`+pinch`, and there is no such thing on this control any more.
+    Checked against the loader rather than assumed -- `maps.load(tracks.resolve(...))` builds
+    `rt:Monza+rlobs44!assets=mixed:1`, `+hard3` and `+obs7` -- so this list is the loader's answer
+    and not a preference. 학습과 같음 sits after 기본 and is not a family at all (it is the env's
+    generator), so it appears on every map that has the control.
+    """
+    from f1sim.viewer.console.window import TRAIN_OBSTACLES
     win.map_group.setCurrentIndex(win.map_group.findData("검증"))
     assert win.map_list.select("rt/monza")
     offered = [win.combo_obstacle.itemData(i) for i in range(win.combo_obstacle.count())]
-    assert offered == ["", "bare", "props", "hard"], "racetracks take +props / +hard and no other family"
+    assert offered == ["bare", "", TRAIN_OBSTACLES, "edge", "line", "hard"]
     win.map_group.setCurrentIndex(win.map_group.findData("학습"))
     assert win.map_list.select("real/korea26")
     offered = [win.combo_obstacle.itemData(i) for i in range(win.combo_obstacle.count())]
-    assert offered == ["", "bare", "edge", "line", "pinch", "props", "hard"]
+    assert offered == ["bare", "", TRAIN_OBSTACLES, "edge", "line", "hard"]
 
 
 def test_the_selection_card_names_the_map_in_korean(win):
@@ -193,8 +208,8 @@ def test_the_selection_card_names_the_map_in_korean(win):
     win.combo_seed.setCurrentIndex(win.combo_seed.findData("fixed"))
     win.spin_seed.setValue(44)
     win._on_scenario_changed()
-    assert win.sel_map.text() == "맵: Blackbox 2022 #1 · 역방향 · 주행선 위 (시드 44)"
-    assert win.sel_map.toolTip() == "real/bb22-1@rev#line:44"
+    assert win.sel_map.text() == "맵: Blackbox 2022 #1 · 역방향 · 랜덤 · 중간 (시드 44) · 에셋·크기 자동 무작위"
+    assert win.sel_map.toolTip() == "real/bb22-1@rev#line:44!assets=mixed:1"
 
 
 # ================================================================ the facts strip
