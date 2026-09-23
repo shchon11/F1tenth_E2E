@@ -27,6 +27,10 @@ where the generator and the digest test below came from.
   `torch.cuda.set_device` and never puts it back, so every later test that says `device="cuda"`
   silently moves to the other card. On this machine that is the 8 GB laptop GPU the user's console
   is on, rather than the 12 GB one the test would have picked alone.
+* **Nine more console tests had gone stale**, under two redesigns the tests were not moved with.
+  Eight are fixed. The one thing that turned out to be a real defect is small and was found by
+  refusing to edit an expectation until the behaviour behind it had been measured: the training
+  page restored a mode's values without the name of the recipe they came from.
 
 ## 1. 학습과 같음 with more than one car did not start
 
@@ -147,12 +151,11 @@ is now checked by running `evaluate.main()` with the evaluation itself replaced 
 default arguments nothing at all reaches `EnvConfig` (`opp_extra is None`), and with the flags given
 exactly those keys do. The guard is on the behaviour, not on the presence of a word in a file.
 
-## 5. Nine console tests that had gone stale with the asset obstacles
+## 5. Nine console tests that had gone stale under the console's own redesigns
 
 Not part of the brief, found by running the console suite: 9 failures, all from before today and
-all of the same kind as §3 and §4 — a test pinned to a string the code changed on purpose. Five are
-fixed here, four are not, and the difference is whether the current behaviour could be *checked*
-rather than assumed.
+all of the same kind as §3 and §4 — a test pinned to what the code used to do. Two redesigns, five
+days apart, and in both cases the tests were left where they were.
 
 **Fixed (`test_console_map_card.py`).** The 장애물 control became a placement control over modelled
 props on 2026-09-18 (`tracks.ASSET_OBSTACLES`, `asset_scenario`), and the tests were last touched
@@ -169,18 +172,36 @@ builds `rt:Monza+rlobs44!assets=mixed:1`, `+hard3` and `+obs7`. A racetrack coul
 grid-rasterised `+obs`/`+pinch`, and there is no such thing on this control any more, so offering
 all three is right and the pinned list was the stale part.
 
-**Not fixed, and one of them may be a real regression.** All four are on the training-launch page:
+**The other four, which looked like a regression and were not.** All four are on the training-launch
+page, and all four have one cause. `test_the_training_page_leaves_the_recipes_alone_with_the_switch
+_off` expects the default recipe's `--opponent mixed` and gets `policy`, while `RECIPES[0]` in
+`viewer/console/training.py` still says `opponent="mixed"` — which reads exactly like the form no
+longer emitting the recipe it names, and that is how it was first reported.
 
-* `test_the_training_page_leaves_the_recipes_alone_with_the_switch_off` expects the default recipe's
-  `--opponent mixed` and gets `policy`. `RECIPES[0]` in `viewer/console/training.py` still says
-  `opponent="mixed"`, so a fresh `RecipeForm()` is not emitting the recipe it names. The test's own
-  sentence is "the recipes are measured configurations; off, the command must be the one it always
-  was", which is exactly the claim this breaks. **Updating the expectation here would hide it.**
-* `test_the_default_recipe_emits_explicit_asset_scenarios` (`--obstacle-draws` no longer in the
-  command — the draws now look expanded into `--tracks`),
-  `test_historical_recipe_is_explicit_and_training_controls_are_available` (`controller` is not in
-  `form.editors`), `test_the_narrow_recipes_round_trip_through_the_picker` (the track list grew).
-  Each needs someone who knows what the current recipe is meant to be.
+It is not. Building a `RecipeForm` and printing it:
+
+| state | mode | recipe | `--opponent` | `--obstacle-draws` | `--controller` | `--race-size` |
+|---|---|---|---:|---:|---|---:|
+| as constructed | **dagger** | custom | policy | absent | absent | 1 |
+| PPO + 기본 레이스 레시피 | ppo | origrecipe | **mixed** | **8** | **legacy** | **2** |
+
+`RECIPES[0]` reaches the command in full, `--estimator` included by its absence. What changed is
+where the page *opens*: `d372589` (2026-09-20, "the training page hid its own pipeline") added the
+training stages and made the form open on step ① — DAgger — and the recipe combo is filled per
+mode, so a freshly built form holds one entry (사용자 정의). The four tests build a bare form and
+ask it about the PPO recipes, which is now a different page of the same form. They were last
+touched the same day, by a different commit, and were not moved with it.
+
+So they are fixed the way the first five were: the claim is kept and asked where it holds (PPO mode,
+기본 레이스 레시피 selected). Nothing about the recipes changed.
+
+**One real thing came out of it.** Leaving a mode and coming back restores its values from
+`_cache`, but the recipe's *name* was not restored with them: `_mode_changed` only reset the combo
+for a mode it had never built, and the form builds the PPO page once at construction before opening
+on step ①, so PPO was always "already built". The page then read 사용자 정의 over another recipe's
+numbers — the same class of problem as a 장애물 label that does not describe what is placed. The
+recipe key is now cached beside the values and restored with them, and a loaded config file gets
+사용자 정의, which is the honest name for values that came from a file.
 
 ## 6. Not done
 
@@ -199,5 +220,3 @@ all three is right and the pinned list was the stale part.
   CUDA tests skip without a GPU and its 26 CPU ones pass. The fix is the device restore and the
   sessions the file was leaving built; the console path itself was already clean, because
   `SimWorker._release_session` collects and empties the cache.
-* **The four training-page tests of §5**, and in particular whether `--opponent policy` from the
-  default recipe is a regression.
