@@ -261,6 +261,39 @@ PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "
                        "procedural_raceline_corridor": "off", "procedural_raceline_margin": 0.25,
                        "spawn_runway": 3.0, "movable_obstacles": True}
 
+#: 장애물 "학습과 같음" with more than one car: the other cars of the race, as the runs since s911
+#: drove them (`--opp-slots`). Not a preference -- with the corridor off there are crates on the
+#: racing line, and the raceline teacher cannot see a prop (they are not in the occupancy grid),
+#: so `F1VecEnv` refuses the combination outright. Before this, raising 차 대수 above 1 on this
+#: obstacle choice failed the session with the env's English sentence and no way forward from the
+#: console, which is how it shipped: the option was only ever driven solo.
+PROCEDURAL_OPPONENT = {"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", "interactive"],
+                       "speed_scale": [0.7, 1.0]}
+
+
+def procedural_opponents(slots, n_rows: int):
+    """(table, how it was changed) for 학습과 같음 on a grid of more than one car.
+
+    `slots` is what the console asked for, or None. Any row that could be drawn as a driver which
+    is a teacher but cannot see a prop -- the criterion is `F1VecEnv`'s own, read from
+    `opponent_slots.KIND_BY_NAME` rather than copied -- becomes the training mix. Rows that can see
+    one (interactive, the ForzaETH planners, the lane switcher, a policy, a `self` car) are left
+    exactly as the user set them: this is the smallest change that starts, not a preset.
+    """
+    from ..opponent_slots import KIND_BY_NAME, OpponentSlot
+
+    def blind(sl) -> bool:
+        return any(KIND_BY_NAME[name].teacher and not KIND_BY_NAME[name].prop_aware
+                   for name in (sl.kind_mix or (sl.kind,)))
+
+    def want():                                # one row each, as `opponent_slots._repeat` builds them
+        return OpponentSlot.from_dict(dict(PROCEDURAL_OPPONENT))
+
+    if slots is None:
+        return tuple(want() for _ in range(n_rows)), "built"
+    out = tuple(want() if blind(sl) else sl for sl in slots)
+    return out, ("swapped" if any(a is not b for a, b in zip(out, slots)) else "kept")
+
 
 def procedural_settings(ckpt_path: str, collision_mode: str) -> Tuple[dict, str]:
     """(EnvConfig keywords, where they came from) for the training obstacle generator.
@@ -308,10 +341,15 @@ def _procedural_facts(session: dict) -> dict:
     if proc is None:
         return {}
     e = session["env"].ecfg
+    # The share of resets that draw a layout: below 1 some resets put nothing on the track at all,
+    # and a user who sees an empty lap on this choice should be able to read why. Shown only when
+    # it is not 1, because every run since s911 trained at 1 and the strip is already long.
+    share = "" if e.procedural_obstacles >= 1.0 else f" · 리셋의 {e.procedural_obstacles:.0%}만"
     return {"obstacle_choice": "train",
             "obstacle_text": (f"학습과 같음 · {e.procedural_density:g}개/10 m · 슬롯 {proc.C} · "
                               f"주행선 {'비움' if e.procedural_raceline_corridor == 'on' else '위에도'}"
-                              f"{' · 밀림' if e.movable_obstacles else ''} ({session.get('procedural_src') or '?'})"),
+                              f"{' · 밀림' if e.movable_obstacles else ''}{share}"
+                              f" ({session.get('procedural_src') or '?'})"),
             "procedural": True}
 
 
@@ -911,6 +949,21 @@ class SimWorker:
             raise StartConfigError(f"상대차 표: {exc}") from exc
         if slots is not None and grid < 2:
             slots = None                       # a solo session has no other car to configure
+        if getattr(cfg, "procedural", False) and grid > 1:
+            slots, how = procedural_opponents(slots, grid - 1)
+            try:
+                from ..opponent_slots import validate_slots
+                validate_slots(slots, grid)    # again: this table is not the one validated above
+            except ValueError as exc:
+                raise StartConfigError(
+                    f"장애물 '학습과 같음' 의 상대차를 만들지 못했습니다: {exc}") from exc
+            if how != "kept":
+                from ..opponent_slots import mix_summary
+                self.say(P.MSG_LOG, gen=gen,
+                         text=(f"장애물 '학습과 같음': 주행선 위에 장애물이 있어 raceline 티처는 "
+                               f"쓸 수 없습니다(격자에 없는 물체라 보지 못합니다). 다른 차를 학습 때와 "
+                               f"같은 상대로 {'맞췄' if how == 'built' else '바꿨'}습니다 — "
+                               f"{mix_summary(slots)}."))
         need_rl = grid > 1 and (any(sl.teacher_driven for sl in slots) if slots is not None
                                 else cfg.opponent == "teacher")
 
