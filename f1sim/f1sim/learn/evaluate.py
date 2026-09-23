@@ -387,6 +387,20 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
         'raceline_objective': raceline_objective or 'min_curvature', 'teacher_limits': limits,
         'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset),
+        # What the run actually drove under, not what was asked for. The cap is part of the
+        # observation (`obs["speed_cap"]`), so a policy trained at 9 and scored at this flag's
+        # default of 8 is a policy scored on an input it never saw -- which is what happened to
+        # every table in `_eval/mintime-teacher-2026-09-19` before 2026-09-23. It was invisible
+        # because the value was never written down.
+        'speed_cap': float(env.ecfg.speed_cap), 'max_steps': int(env.ecfg.max_steps),
+        'collision_mode': str(env.ecfg.collision_mode),
+        'procedural': {'fraction': float(env.ecfg.procedural_obstacles),
+                       'density': float(env.ecfg.procedural_density),
+                       'max_props': int(env.ecfg.procedural_max_props),
+                       'raceline_corridor': str(env.ecfg.procedural_raceline_corridor),
+                       'movable': bool(env.ecfg.movable_obstacles),
+                       'spawn_runway': float(env.ecfg.spawn_runway)} if env.procedural is not None else None,
+        'plan_kappa_mode': str(getattr(env.ecfg, 'plan_kappa_mode', 'absolute')),
         'teacher_speed': float(teacher_speed) if teacher else None,
         'pinned_mu': float(mu) if mu is not None else None,
         'opp_token': (env.opp_token if env.opp_token != "off" else None),
