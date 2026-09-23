@@ -5,11 +5,14 @@ Most of this is CPU-only: a *failed* capture poisons the process, so the fatal-p
 not that it can fail. Those checks must keep passing on a machine with no GPU.
 
 The rest are the equivalence checks, which do capture, and they are skipped without CUDA. They are
-expensive: each builds whole environments and holds a graph's private memory pool, and capture
-itself needs a contiguous block for the pool it is about to create. A test that leaves its
-environment or its graph behind therefore does not merely waste memory -- it makes a *later*
-capture in the same process fail, which is why every one of them tears down explicitly and why
-`_free_cuda_between_tests` runs after each. See that fixture.
+expensive -- each builds whole environments and holds a graph's private memory pool -- so they tear
+down explicitly, and `_free_cuda_between_tests` sweeps after each. That fixture also restores the
+current CUDA device, which is what actually made this file's results depend on the order it was run
+in; the note on it has the measurement.
+
+Run them on a named card (`CUDA_VISIBLE_DEVICES`), not on whichever one happens to be there: one of
+these tests asks for the *last* device, and on a laptop with a second GPU that is the card the
+user's console is drawing on.
 """
 from __future__ import annotations
 
@@ -29,26 +32,26 @@ from f1sim.viewer.graph_fastpath import (CaptureFailed, GuardViolation, NotCaptu
 
 @pytest.fixture(autouse=True)
 def _free_cuda_between_tests():
-    """Give the next test the memory this one used.
+    """Put back the device this test was given, and the memory it used.
 
-    The CUDA caching allocator does not return a freed block to the driver, and a captured graph
-    owns a private pool that only goes back when the last reference to the graph is dropped. Run
-    the whole file and the captures near the end -- the teacher graph, the opponent planners --
-    used to die inside `torch.cuda.graph(...)` for want of room, while passing on their own. That
-    is a property of this file, not of the code under test: the console's own teardown
-    (`SimWorker._release_session`) already collects and empties the cache, and sessions built back
-    to back through it are fine.
+    **The device is the one that mattered.** `test_a_captured_soft_roll_matches_eager` picks
+    `cuda:(device_count() - 1)` and calls `torch.cuda.set_device`, which is process-wide and
+    outlives the test. Every later test that says `device="cuda"` with no index -- the actor
+    capture, the recorder, the training runtime -- then ran on whichever card that one chose. On
+    this two-GPU machine that is the small one, which is also the card the user's console sits on,
+    so the captures near the end of the file died for want of room while passing on their own.
 
-    So: collect the cycles (an env reaches its own tensors through the module graph, so refcounts
-    alone do not free it), then hand the blocks back. Before as well as after, because a test that
-    fails leaves its objects alive in the traceback pytest keeps.
+    Measured 2026-09-23, with only the big card visible (`CUDA_VISIBLE_DEVICES` naming it): the
+    whole file passes, 34 of 34 -- and it passes with the pre-fix version of this file too, because
+    with one card there is nothing to leak the device to. So the failures were never this file
+    exhausting one GPU; they were this file quietly moving to the other one.
 
-    The current device is put back for the same reason. `test_a_captured_soft_roll_matches_eager`
-    calls `torch.cuda.set_device`, which is process-wide and outlives the test, so every later test
-    that says `device="cuda"` without an index -- the actor capture, the recorder, the training
-    runtime -- silently moved to whichever card that one picked. On a two-GPU machine that is a
-    different card with different free memory, and it is the whole difference between a test that
-    passes alone and the same test failing in a full run.
+    The memory sweep stays, because it is true and cheap: the CUDA caching allocator does not
+    return a freed block to the driver, a captured graph owns a private pool that only goes back
+    when the last reference to it is dropped, and an env reaches its own tensors through reference
+    cycles, so refcounts alone do not free it. It runs before as well as after, because a test that
+    fails leaves its objects alive in the traceback pytest keeps. None of that was the trigger, and
+    the console's own teardown (`SimWorker._release_session`) already does both.
     """
     def sweep():
         gc.collect()

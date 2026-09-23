@@ -23,10 +23,14 @@ where the generator and the digest test below came from.
   on this machine at all, and the off path's physics has legitimately moved since the merge base.
   The claim survives in a form that is immune to both: the *generator state*, which is identical to
   the merge base's across 295 commits.
-* **`test_graph_fastpath.py`'s order dependence is one line.** A test calls
-  `torch.cuda.set_device` and never puts it back, so every later test that says `device="cuda"`
-  silently moves to the other card. On this machine that is the 8 GB laptop GPU the user's console
-  is on, rather than the 12 GB one the test would have picked alone.
+* **`test_graph_fastpath.py`'s order dependence is one line, and it is not the one it looked
+  like.** A test calls `torch.cuda.set_device` and never puts it back, so every later test saying
+  `device="cuda"` moves to the other card — on this machine the 8 GB laptop GPU the user's console
+  is on. Measured after the fact (§7): on one card the whole file passes even *un*-fixed, so the
+  captures were not exhausting a GPU, they were quietly changing which GPU they were on.
+* **The console is realtime with one car and half of it with any opponent** (§7): 24.5 ms a step
+  alone, 49.5 with two cars, 50.1 with three. The step never had opponents before today, because a
+  grid of more than one refused to start.
 * **Nine more console tests had gone stale**, under two redesigns the tests were not moved with.
   Eight are fixed. The one thing that turned out to be a real defect is small and was found by
   refusing to edit an expectation until the behaviour behind it had been measured: the training
@@ -203,20 +207,64 @@ numbers — the same class of problem as a 장애물 label that does not describ
 recipe key is now cached beside the values and restored with them, and a loaded config file gets
 사용자 정의, which is the honest name for values that came from a file.
 
-## 6. Not done
+## 6. On the GPU, once it was free (17:27–17:36, RTX 4070 SUPER)
+
+### The console is realtime alone and half of it with anyone else
+
+`s915`, `real/iccas25`, 학습과 같음, 200 steps after 30 of warm-up, the roll graph captured in
+every case. Realtime is 25.0 ms a step.
+
+| cars | ms/step | × realtime | + the frame the console sends |
+|---:|---:|---:|---:|
+| 1 | 24.5 | 1.02 | 24.9 (1.00×) |
+| 2 | 49.5 | 0.51 | 50.1 (0.50×) |
+| 3 | 50.1 | 0.50 | 50.7 (0.49×) |
+
+**The whole jump is 1 → 2, and 2 → 3 costs 0.6 ms.** The planners are vectorised over the rows, so
+a second opponent is nearly free; what is not free is having an opponent planner at all. The frame
+transfer is 0.5 ms and is not the problem. The old 45.5 ms figure (2026-09-22) can only have been a
+solo session, because a grid of three refused to start until today.
+
+Where the time goes, same session, obstacles on and off:
+
+| | 1 car | 3 cars |
+|---|---:|---:|
+| no obstacles | 17.7 | 28.8 |
+| 학습과 같음 | 24.4 | **50.0** |
+
+and of that 50.0, the opponents' own planning is **22.8 ms** — timed directly through the captured
+teacher graph, which did not fall back. Without the layout attached the same planning is 8.7 ms, so
+the crates make the ForzaETH planners 2.6× more expensive: they are planning around the obstacles,
+which is exactly what the option exists to show. The remaining ~27 ms is the roll — LiDAR and
+contact against 18 props for three cars.
+
+So the lever for realtime with opponents is the opponent planner, not the car count.
+
+### The graph tests' order dependence was the device, not the memory
+
+`tests/test_graph_fastpath.py`, whole file, on the 4070 alone: **34 of 34 pass**, the 8 CUDA tests
+included. Then the same run with this file reverted to its pre-fix version: **also 34 of 34.**
+
+That is the useful measurement, and it corrects the diagnosis. The failures were never this file
+exhausting one GPU — with a single card visible there is nothing to leak the device to, so even the
+un-fixed file passes. What it was doing is `torch.cuda.set_device(cuda:(device_count() - 1))` in
+`test_a_captured_soft_roll_matches_eager` without putting it back, sending every later
+`device="cuda"` test to the other card: here the 8 GB laptop GPU the user's console is already on,
+where the captures at the end of the file had no room. The device restore is the fix; the session
+releases and the cache sweep are correct hygiene that was not the trigger.
+
+One thing to know when running these: `CUDA_VISIBLE_DEVICES` is not in `nvidia-smi` order here.
+Measured — `CUDA_VISIBLE_DEVICES=0` is the 4070, `=1` is the 5060, the reverse of `nvidia-smi`'s
+indices, because CUDA orders by speed unless `CUDA_DEVICE_ORDER=PCI_BUS_ID` says otherwise.
+
+## 7. Not done
 
 * **`args.json` cannot rebuild a run's opponent table.** `ppo.main` writes it through `str()`, so
   `opp_slots` is a repr. Writing `opp_cfg.slots_config(a)` into `args.json` the way it already goes
   into the W&B config would let 학습과 같음 copy each run's own traffic instead of the s911 mix.
-  Not done here: a training run held the GPU and `ppo.py` is its code.
-* **The console's step time with the training obstacles, on any GPU.** 45.5 ms a step for three
-  cars was measured on the 4070 under load (2026-09-22) and 25 ms is realtime, but that was with
-  the old configuration — the session that measured it could only have been the solo one, since a
-  grid of three refused to start until today. The three cars now on the grid are ForzaETH planners
-  and an interactive teacher, which are not free, so the number has to be taken again. Nothing
-  here measures it: the 4070 was training all session and the 5060 is the user's own console.
-  The CPU figures above (69 ms a step solo, 291 ms with three cars, eager) say nothing about it.
-* **`test_graph_fastpath.py`'s CUDA tests** are fixed but not re-run, for the same reason — its 8
-  CUDA tests skip without a GPU and its 26 CPU ones pass. The fix is the device restore and the
-  sessions the file was leaving built; the console path itself was already clean, because
-  `SimWorker._release_session` collects and empties the cache.
+  Not done here: a training run held the GPU for most of the session and `ppo.py` is its code. The
+  fallback (the s911 mix) should stay for runs recorded before it, with the facts strip saying so.
+* **Whether the console should be realtime with opponents at all**, given §6: the two ways to buy
+  the missing 25 ms are a cheaper obstacle query inside the ForzaETH planners (22.8 of 50.0 ms, and
+  2.6× what the same planning costs on a bare track) or planning the opponents less often than
+  every step. Both change what the console shows, so neither is a hygiene decision.
