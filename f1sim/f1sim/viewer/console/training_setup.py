@@ -345,6 +345,8 @@ class TrainingSetupForm(QtWidgets.QWidget):
         self.schema_api = schema
         self.mode = ""
         self._cache = {}
+        #: mode -> the recipe key its cached values were last edited under (`_mode_changed`).
+        self._recipe_cache = {}
         self._resume_modes = set()
         self._metadata_cache = {}
         self._inspection_mode = None
@@ -468,6 +470,9 @@ class TrainingSetupForm(QtWidgets.QWidget):
             return
         if self.mode:
             self._cache[self.mode] = self.values()
+            # With the values, the name they were built under. Restoring one without the other is
+            # what made the page read 사용자 정의 over 기본 레이스 레시피's own numbers.
+            self._recipe_cache[self.mode] = self.combo_recipe.currentData()
             if self._resuming:
                 self._resume_modes.add(self.mode)
             else:
@@ -561,6 +566,14 @@ class TrainingSetupForm(QtWidgets.QWidget):
         self._compat_aliases()
         if self.mode == "ppo" and self.mode not in self._cache:
             self.combo_recipe.setCurrentIndex(self.combo_recipe.findData("origrecipe"))
+        elif self.mode in self._recipe_cache:
+            # Coming back to a mode this session has already been in: the values are restored from
+            # `_cache`, so the name has to come back with them or the page claims one configuration
+            # and holds another. `_quiet` is still set, so this selects the entry without
+            # re-applying the recipe over the values that were just restored.
+            i = self.combo_recipe.findData(self._recipe_cache[self.mode])
+            if i >= 0:
+                self.combo_recipe.setCurrentIndex(i)
         self.recipe_note.setText(MODE_NOTES[self.mode])
         self.btn_resume_file.setEnabled(self.kind in ("ppo", "dagger"))
         self.btn_launch.setText("최종 평가 실행" if self.mode == "grip_final" else
@@ -895,6 +908,9 @@ class TrainingSetupForm(QtWidgets.QWidget):
         if not isinstance(resume_modes, list) or any(key not in valid_modes for key in resume_modes):
             raise ValueError("잘못된 재개 모드 목록입니다.")
         self._cache = restored_modes
+        # A loaded file carries values, not the recipe they came from -- and after a load they are
+        # the user's, whatever produced them. 사용자 정의 is the honest name for that.
+        self._recipe_cache = {}
         self._resume_modes = set(resume_modes)
         self.mode = ""                 # loading must not overwrite the selected saved mode with stale edits
         self.combo_mode.blockSignals(True)
