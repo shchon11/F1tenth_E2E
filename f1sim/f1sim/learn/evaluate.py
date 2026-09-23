@@ -328,14 +328,19 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         dial = None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))
         policy = common.student_policy(model, env, device, dial=dial)
     from .benchmark.overtake import TrafficMeter
+    from .encounter import EncounterMeter
     meter = TrafficMeter(env, contention_range_m=contention_range_m,
                          attack_range_m=attack_range_m, vehicle_length=(cfg or Config()).vehicle.length)
+    # Counted per opportunity, and with the walls told apart from the crates -- neither of which
+    # `collisions_per_km` can do. Both meters wrap `sim.step`; entered in this order the encounter
+    # meter wraps the traffic meter's wrapper and unwinds first, so each sees the same transition.
+    enc = EncounterMeter(env)
     if protocol == "rolling":
         # The meter wraps `sim.step` so every quantity is read BEFORE the auto-reset, the same
         # discipline the benchmark's own loop keeps. `rollout_metrics` is left untouched: it is a
         # validated implementation of a different measurement, and a second caller poking at its
         # internals is how two measurements start disagreeing.
-        with meter:
+        with meter, enc:
             result = common.rollout_metrics(env, policy, steps, speed_cap, controller=ctrl)
         for key, value in result.items():
             if isinstance(value, float) and not math.isfinite(value):
@@ -352,7 +357,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
             raise ValueError("Trial evaluation requires positive centerline lengths")
         trials = TrialAccumulator(lengths, env.sim.control_dt,
                                   time_budget_s=steps * env.sim.control_dt, speed_cap=speed_cap)
-        with meter:
+        with meter, enc:
             for _ in range(steps):
                 ctrl.pre_action(obs)
                 obs, _, term, trunc, info = env.step(policy(obs))
@@ -373,6 +378,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         result['initial_track_ids'] = initial_ids.tolist()
         result['initial_track_lengths_m'] = lengths.tolist()
     result.update(meter.report())
+    result.update(enc.report())
     ctrl_metrics, _ = ctrl.collect_metrics()
     ctrl.release()
     if graph_holder is not None:
