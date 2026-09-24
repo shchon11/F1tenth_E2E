@@ -836,9 +836,13 @@ def main():
             model, _extra = load_checkpoint(a.init, device, override={"priv_dim": priv_dim, "act_dim": env.act_dim})
         model = model.to(device)
     else:
+        # The condition input as ec51507 built it; the merge 75fea37 dropped it, and a fresh student
+        # under --cond was built unconditional and died at its first training batch.
         model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim,
                             scan_deltas=a.scan_deltas, temporal_encoder=a.temporal_encoder,
-                            scan_stem=a.scan_stem, memory=mem_spec, scan_channels=chan).to(device)
+                            scan_stem=a.scan_stem, memory=mem_spec, scan_channels=chan,
+                            **({} if a.cond == "none" else {"cond_dim": 1, "cond": cond_mod.spec_for(a.cond).to_meta()})
+                            ).to(device)
     if int(model.meta["proprio_dim"]) != spec.proprio_dim:
         raise SystemExit(f"the student's proprio width is {model.meta['proprio_dim']} and this env produces "
                          f"{spec.proprio_dim}: --opp-token / --hist-len do not match the checkpoint.")
