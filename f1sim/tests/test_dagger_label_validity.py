@@ -106,11 +106,12 @@ def test_collection_copies_teacher_validity_for_primary_rows(monkeypatch):
 
     class Env:
         B, M = 4, 2
+        learner_ids = torch.tensor([0, 2])
 
         def reset(self):
             return None, {}
 
-        def teacher_label(self, obj):
+        def teacher_label(self, obj, mu=None):
             obj.last_label_valid = torch.tensor([True, False, False, True])
             return torch.zeros(4, dagger.ACT_DIM)
 
@@ -122,6 +123,10 @@ def test_collection_copies_teacher_validity_for_primary_rows(monkeypatch):
     monkeypatch.setattr(dagger, 'flatten_obs', lambda obs: (torch.zeros(4, 1, 5), torch.zeros(4, 1)))
     runtime = SimpleNamespace(scan=None, observe=lambda scan, pro: scan, reset=lambda done: None)
     monkeypatch.setattr(dagger, 'runtime_for', lambda *args: runtime)
-    buf = dagger.collect(Env(), object(), teacher, 1, 1.0, 'cpu', dagger.StepBuffer(1)).finalize()
+    # targets for the auxiliary heads read the simulator, which this stub does not have
+    monkeypatch.setattr(dagger, 'friction_target', lambda env: torch.zeros(4))
+    monkeypatch.setattr(dagger, 'opponent_target', lambda env: torch.zeros(4, 1))
+    model = SimpleNamespace(initial_hidden=lambda batch, device: None)     # feedforward student
+    buf = dagger.collect(Env(), model, teacher, 1, 1.0, 'cpu', dagger.StepBuffer(1)).finalize()
     assert buf.V.tolist() == [[True, False]]
     assert buf.N.tolist() == [[True, True]]

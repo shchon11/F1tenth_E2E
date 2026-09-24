@@ -508,10 +508,17 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
 
 def build_teacher(kind: str, rls, env, a):
     """The teacher whose action becomes the label."""
-    base = common.make_teacher(rls, env, grip=a.teacher_grip, recover_time=a.teacher_recover_time)
+    limits = getattr(a, "_teacher_limits", None) or {}
+    base = common.make_teacher(rls, env, grip=a.teacher_grip, recover_time=a.teacher_recover_time, **limits)
     base.speed_scale = a.teacher_speed
     if kind == "raceline":
-        return base, f"raceline teacher (grip {a.teacher_grip}, speed x{a.teacher_speed:g})"
+        return base, f"raceline teacher (grip {a.teacher_grip}, speed x{a.teacher_speed:g}, limits {limits or 'default'})"
+    if kind == "rollout":
+        from ..rollout_teacher import RolloutTeacher
+        rt = RolloutTeacher(base, env, horizon_s=a.rollout_horizon, every=a.rollout_every)
+        where = "each env's layout line" if rt.layout is not None else "the raceline"
+        return rt, (f"rollout teacher: {rt.K} candidates (offsets from {where} x speed scales), "
+                    f"{rt.H} steps simulated with the opponents' own planners, a decision every {rt.every} steps")
     w = [float(x) for x in a.teacher_cost.split(",")] if a.teacher_cost else None
     cost = TeacherCost(*w) if w else TeacherCost()
     it = InteractiveTeacher(base, env,
@@ -591,7 +598,22 @@ def main():
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
     # ---- which teacher, and how it searches
-    ap.add_argument("--teacher", dest="teacher_kind", default="raceline", choices=["raceline", "interactive"],
+    ap.add_argument("--rollout-horizon", type=float, default=1.5, metavar="S",
+                    help="[s] --teacher rollout: how long each candidate is simulated in the shadow env")
+    ap.add_argument("--rollout-every", type=int, default=10, metavar="STEPS",
+                    help="--teacher rollout: steps between decisions; the chosen candidate policy drives between")
+    # ---- the floor and what a touch is, as in learn.ppo (same EnvConfig fields, same defaults)
+    ap.add_argument("--procedural-obstacles", type=float, default=0.0, metavar="FRAC",
+                    help="share of env resets that get a freshly drawn obstacle layout (learn.ppo)")
+    ap.add_argument("--procedural-density", type=float, default=1.0, metavar="PER10M")
+    ap.add_argument("--procedural-max-props", type=int, default=0, metavar="N")
+    ap.add_argument("--procedural-raceline-margin", type=float, default=0.25, metavar="M")
+    ap.add_argument("--procedural-raceline-corridor", choices=["on", "off"], default="on")
+    ap.add_argument("--collision-mode", choices=["terminate", "soft"], default="terminate")
+    ap.add_argument("--movable-obstacles", action="store_true", help="needs --collision-mode soft (learn.ppo)")
+    ap.add_argument("--spawn-runway", type=float, default=0.0, metavar="M")
+    ap.add_argument("--kind-mix-assign", choices=["partition", "redraw"], default="partition")
+    ap.add_argument("--teacher", dest="teacher_kind", default="raceline", choices=["raceline", "interactive", "rollout"],
                     help="raceline: pure pursuit on the precomputed line, blind to the other cars (every DAgger "
                          "run before this one). interactive: f1sim.interactive_teacher, which scores a family of "
                          "plans against the opponents' predicted motion and labels with the argmin -- the only one "
@@ -686,6 +708,8 @@ def main():
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
         raise SystemExit(f"--scan-channels {unknown}: known channels are {', '.join(SCAN_CHANNELS)}")
+    if a.teacher_kind == "rollout" and a.action_mode != "plan":
+        raise SystemExit("--teacher rollout needs --action-mode plan: its candidates are plans.")
     if a.teacher_kind == "interactive":
         if a.action_mode != "plan":
             raise SystemExit("--teacher interactive needs --action-mode plan: its candidates ARE plans, and in "
@@ -707,8 +731,17 @@ def main():
     names = common.track_names(a.tracks, seed=a.seed)
     need_rl = opp_cfg.needs_racelines(a) or True          # the teacher itself always needs one
     print(f"loading {len(names)} tracks + racelines ...", flush=True)
-    tracks, rls = common.load_tracks(names, racelines=need_rl,
-                                     **({} if a.raceline_margin is None else {"margin": a.raceline_margin}))
+    # The line is optimised for the profile the teacher drives, as in learn.ppo. A merge (75fea37)
+    # dropped these lines and left the flags parsed and ignored: every DAgger run since labelled
+    # with the min-curvature line at the default 6 / 6 / 3 limits whatever it was asked for.
+    limits = common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake)
+    rl_kw = dict(limits)
+    if a.raceline_margin is not None:
+        rl_kw["margin"] = a.raceline_margin
+    if a.raceline_objective is not None:
+        rl_kw["objective"] = a.raceline_objective
+    a._teacher_limits = limits
+    tracks, rls = common.load_tracks(names, racelines=need_rl, **rl_kw)
     cfg = Config()
     if a.eager:
         cfg.sim.compile = False
@@ -717,9 +750,22 @@ def main():
                                     scan_stack=a.scan_stack, scan_stride=a.scan_stride,
                                     opp_token=token, opp_future_model=a.opp_future_model,
                                     compile_tracker=not a.eager,
-                                    **opp_cfg.env_kwargs(a)),
+                                    **opp_cfg.env_kwargs(a),
+                                    procedural_obstacles=a.procedural_obstacles,
+                                    procedural_density=a.procedural_density,
+                                    procedural_max_props=a.procedural_max_props,
+                                    procedural_raceline_margin=a.procedural_raceline_margin,
+                                    procedural_raceline_corridor=a.procedural_raceline_corridor,
+                                    spawn_runway=a.spawn_runway,
+                                    collision_mode=a.collision_mode,
+                                    # nothing terminates under soft, so the batch would reset in
+                                    # lockstep forever (learn.ppo does the same)
+                                    stagger_first_episode=a.collision_mode == "soft",
+                                    kind_mix_assign=a.kind_mix_assign,
+                                    movable_obstacles=a.movable_obstacles),
                           cfg=cfg, seed=a.seed, rls=rls,
-                          teacher_grip=a.teacher_grip, teacher_recover_time=a.teacher_recover_time)
+                          teacher_grip=a.teacher_grip, teacher_recover_time=a.teacher_recover_time,
+                          teacher_limits=limits)
     print(f"opponents: {opp_cfg.describe(a)}", flush=True)
     teacher, teacher_desc = build_teacher(a.teacher_kind, rls, env, a)
     print(f"teacher: {teacher_desc}", flush=True)
@@ -728,8 +774,7 @@ def main():
     solo_names = []
     if solo_steps:
         solo_names = bare_track_names(common.track_names(a.solo_tracks, seed=a.seed) if a.solo_tracks else names)
-        solo_tracks, solo_rls = common.load_tracks(solo_names, racelines=True,
-            **({} if a.raceline_margin is None else {"margin": a.raceline_margin}))
+        solo_tracks, solo_rls = common.load_tracks(solo_names, racelines=True, **rl_kw)
         if not solo_tracks or any(t.props for t in solo_tracks):
             raise SystemExit("solo tracks must be nonempty and contain no placed obstacles")
         # A separate simulator with M=1: no hidden/distant cars or invisible obstacle geometry.

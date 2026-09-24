@@ -17,6 +17,12 @@ as in the real env. A candidate that touches a car, a wall or a prop anywhere in
 of the rest, the one that made the most progress wins. Between decisions the chosen policy keeps
 driving, which is what the shadow simulated.
 
+With procedural props on the floor the candidates are offsets from each env's own layout line
+(`f1sim.layout_line`), not from the empty-track raceline: the line already goes round the props,
+and the shadow sees any candidate that clips one. Measured on ICCAS against `forzaeth` with props
+(seed 77): 0 car contacts, 29 passes, 0 of 428 prop encounters touched, where the line teacher alone,
+blind to the other car, made 27 contacts and 9 passes.
+
 The copy is exact up to sensor noise: the same policy run in the real env and in a shadow copy
 agree to 1.2 mm (median) after 10 steps and ~3 cm after 40. The noise is not copied: the shadow
 draws its own, which is a feature -- a decision that only survives one noise draw is fragile.
@@ -152,8 +158,16 @@ class RolloutTeacher:
                  offsets: Sequence[float] = (-0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6),
                  speeds: Sequence[float] = (1.0, 0.8, 0.6, 0.35),
                  horizon_s: float = 1.5, every: int = 10, lidar_beams: Optional[int] = 36):
-        if not isinstance(base, RacelineTeacher):
+        from .layout_line import LayoutLineTeacher
+        if isinstance(base, RacelineTeacher) and float(getattr(env.ecfg, "procedural_obstacles", 0.0) or 0.0) > 0.0:
+            # Props on the floor: the candidates are offsets from each env's own layout line.
+            base = LayoutLineTeacher(base, env)
+        self.outer = base
+        self.layout = base if isinstance(base, LayoutLineTeacher) else None
+        drive = base.lines if self.layout is not None else base
+        if not isinstance(drive, RacelineTeacher):
             raise TypeError(f"RolloutTeacher drives a RacelineTeacher's line, not {type(base).__name__}")
+        base = drive
         if 0.0 not in offsets or 1.0 not in speeds:
             raise ValueError("the candidate set must contain the plain raceline (offset 0, speed 1)")
         self.env, self.device = env, env.device
@@ -179,22 +193,39 @@ class RolloutTeacher:
     # The env and the DAgger loop set these on the teacher they label with.
     @property
     def speed_scale(self):
-        return self.base.speed_scale
+        return self.outer.speed_scale
 
     @speed_scale.setter
     def speed_scale(self, v):
-        self.base.speed_scale = v
+        self.outer.speed_scale = v
 
     @property
     def label_grip(self):
-        return self.base.label_grip
+        return self.outer.label_grip
 
     @label_grip.setter
     def label_grip(self, v):
-        self.base.label_grip = v
+        self.outer.label_grip = v
 
-    def _candidate(self, teacher, env, off, spd, plan_speed=None):
-        a = teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid, env.ecfg.v_max_policy, env.tracker.spec,
+    def _real_tid(self):
+        if self.layout is None:
+            return self.env.sim.tid
+        rows = torch.arange(self.env.B, device=self.device)
+        return self.layout._line_ids(rows, self.env.sim.state[:, :2])
+
+    def _shadow_tid(self, S):
+        """Shadow row k*B + i drives real row i's line: its rejoin line until it passes the merge
+        point, then its own -- `LayoutLineTeacher._line_ids`, with the joining flag per shadow row."""
+        if self.layout is None:
+            return S.sim.tid
+        B, N = self.env.B, self.base.N
+        j = self.base.project(S.sim.state[:, :2], self._rowmap)[0]
+        passed = torch.remainder(j - self._merge_S, N) < N // 2
+        self._joining_S = self._joining_S & ~passed
+        return self._rowmap + B * self._joining_S.long()
+
+    def _candidate(self, teacher, env, off, spd, plan_speed=None, tid=None):
+        a = teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid if tid is None else tid, env.ecfg.v_max_policy, env.tracker.spec,
                                 offset=off, plan_speed=env._tracker_plan_speed() if plan_speed is None else plan_speed)
         a = a.clone()
         a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
@@ -216,8 +247,12 @@ class RolloutTeacher:
         first = torch.full((K * B,), float(self.H), device=self.device)
         s0 = S.sim.s.clone()
         L = S.sim.track.length[S.sim.tid]
+        if self.layout is not None:
+            self._rowmap = torch.arange(B, device=self.device).repeat(K)
+            self._joining_S = self.layout._joining.repeat(K).clone()
+            self._merge_S = self.layout._merge.repeat(K)
         for t in range(self.H):
-            S.step(self._candidate(self.base_S, S, off, spd))
+            S.step(self._candidate(self.base_S, S, off, spd, tid=self._shadow_tid(S)))
             h = S.sim.car_collision | S.last_result.collision
             first = torch.where(h & ~hit, torch.full_like(first, float(t)), first)
             hit |= h
@@ -236,11 +271,14 @@ class RolloutTeacher:
                     offset=None, idx=None, plan_speed=None):
         if state.shape[0] != self.env.B:
             raise ValueError("RolloutTeacher labels its own env's whole batch")
+        if self.layout is not None:
+            self.layout.refresh()               # rebuilds the lines of envs that were reset
+            self.layout._sync()
         if self._calls % self.every == 0:
             self.decide()
         self._calls += 1
         off = self.c_off[self.choice] if offset is None else self.c_off[self.choice] + offset
-        return self._candidate(self.base, self.env, off, self.c_spd[self.choice], plan_speed)
+        return self._candidate(self.base, self.env, off, self.c_spd[self.choice], plan_speed, tid=self._real_tid())
 
     def __call__(self, state, P=None, tid=None, offset=None):
         raise TypeError("RolloutTeacher is a plan-mode teacher; use plan_action")
