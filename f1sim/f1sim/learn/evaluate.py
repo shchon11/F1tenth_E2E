@@ -106,7 +106,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     against the opponents' predicted motion -- the only one of the two that can demonstrate a pass,
     and the thing `docs/research/interactive-teacher-2026-09-15.md` measures against the other.
     "layout" is `f1sim.layout_line`: the raceline teacher on a minimum-time line built for each env's
-    own obstacle layout (props and walls, not cars; plan action mode, one track).
+    own obstacle layout (props and walls, not cars; plan action mode, one track). "rollout" is
+    `f1sim.rollout_teacher`: candidates simulated in a shadow copy of the env, opponents reacting.
     opp_extra: extra `EnvConfig` fields this function has no parameter of its own for. Two things
     are deliberately NOT among them: the privileged opponent block, which is read off the
     checkpoint's own spec so that a policy trained with it cannot be scored without it by accident
@@ -274,7 +275,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                          f"{opponent!r} and no procedural obstacles: its opponent term is identically "
                          f"zero without another car and there are no props to score, so the run "
                          f"would be a raceline run under a different name.")
-    if teacher and teacher_kind == "interactive" and mode != "plan":
+    if teacher and teacher_kind in ("interactive", "rollout") and mode != "plan":
         raise ValueError("--teacher-kind interactive needs --action-mode plan: its candidates are "
                          "plans.")
     if opp_speed_range is not None:
@@ -322,6 +323,9 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         elif teacher_kind == "layout":
             from ..layout_line import LayoutLineTeacher
             teacher_policy = LayoutLineTeacher(teacher_policy, env)
+        elif teacher_kind == "rollout":
+            from ..rollout_teacher import RolloutTeacher
+            teacher_policy = RolloutTeacher(teacher_policy, env)
         def policy(obs):
             return env.teacher_label(teacher_policy)
     else:
@@ -545,13 +549,15 @@ def main() -> None:
     ap.add_argument("--dial-offset", type=float, default=0.0,
                     help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
                          "right; -0.15 is an operator erring on the safe side)")
-    ap.add_argument("--teacher-kind", default="raceline", choices=["raceline", "interactive", "layout"],
+    ap.add_argument("--teacher-kind", default="raceline", choices=["raceline", "interactive", "layout", "rollout"],
                     help="which privileged teacher --teacher drives. raceline: pure pursuit on the "
                          "precomputed line, blind to the other cars. interactive: "
                          "f1sim.interactive_teacher, which scores a family of plans against the "
                          "opponents' predicted motion -- the only one of the two that can pass. "
                          "layout: f1sim.layout_line, the raceline teacher on a minimum-time line built "
-                         "for each env's own obstacle layout (the obstacle reference; plan mode, one track)")
+                         "for each env's own obstacle layout (the obstacle reference; plan mode, one track). "
+                         "rollout: f1sim.rollout_teacher, which simulates each candidate in a shadow copy "
+                         "of the env with the opponents' own planners reacting (plan mode; ~3 s per decision)")
     ap.add_argument("--teacher-speed", type=float, default=1.0, metavar="SCALE",
                     help="scale on the teacher's own speed profile. The profile already plans at the "
                          "grip limit, so 1.0 IS the limit; collection has historically used less")
