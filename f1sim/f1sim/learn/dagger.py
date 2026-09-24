@@ -902,7 +902,10 @@ def main():
         do_eval = (it % max(1, a.eval_every) == 0) or (it == a.start_iter + a.iters - 1)
         if do_eval:
             with rng_island(env):
-                m = common.rollout_metrics(env, memory_policy_fn(model, env.B, device=device, deterministic=True),
+                # `student_policy`, not `memory.policy_fn`: it is the same runtime for an unconditional
+                # student and passes the dial (set to the true friction) to a conditional one, which
+                # refuses to run without it. The merge 75fea37 swapped them.
+                m = common.rollout_metrics(env, common.student_policy(model, env, device, deterministic=True),
                                            a.eval_steps, a.speed_cap, per_track=True)
             m_iter = it
         t_ev = tm.lap()
