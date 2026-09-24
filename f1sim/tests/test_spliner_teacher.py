@@ -401,6 +401,16 @@ def test_the_lane_planner_holds_its_lane_and_comes_back():
     assert int(mode[0]) == L_RACING
 
 
+def test_the_lane_planner_rate_limits_over_the_env_control_step():
+    """`LANE_RATE` is metres per second. The step it is applied over was read from a `cfg.sim.dt`
+    that does not exist, fell back to 0.01 s against the real 0.025 s, and every lane change ran
+    at 0.4 of its stated rate. The test above reads `p.dt` itself, so it could not see that."""
+    from f1sim.lane_teacher import LaneSwitchTeacher
+    env = _env(envs=4, race_size=2, opponent="teacher")
+    p = LaneSwitchTeacher(env.teacher, env=env)
+    assert p.dt == pytest.approx(env.sim.control_dt)
+
+
 def test_the_lane_planner_is_registered_and_says_what_it_is_not():
     """The registry entry has to carry the claim, because the claim is the honest part: this is
     the UNICORN *family*, not a reproduction, and a reader choosing an opponent sees only this."""

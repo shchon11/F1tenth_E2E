@@ -162,8 +162,10 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
 
     def attach(self, env):
         out = super().attach(env)
-        # The rate limit is per second, and the step it is applied over is the env's.
-        self.dt = float(getattr(env.cfg.sim, "dt", self.dt))
+        # The rate limit is per second, and the step it is applied over is the env's control step.
+        # `cfg.sim` has no `dt` (only `physics_dt` and `control_rate`); reading it fell back to 0.01 s
+        # against the real 0.025 s, so every run before 2026-09-24 changed lanes at 0.64 m/s, not 1.6.
+        self.dt = 1.0 / float(env.cfg.sim.control_rate)
         return out
 
     @torch.no_grad()

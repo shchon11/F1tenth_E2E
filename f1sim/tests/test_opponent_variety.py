@@ -677,7 +677,12 @@ def test_each_opponent_plans_only_the_rows_it_can_drive(assign):
             # teacher's Gauss-Newton fit is batched linear algebra, a 4-row batch and a 32-row one
             # reduce in a different order, and six iterations grow the last bits -- measured up to
             # 3.4e-4 on one curvature knot, 5e-4 1/m, with the decision above identical.
-            torch.testing.assert_close(part, whole[rows], rtol=0, atol=1e-3)
+            # The two speed dimensions get 2e-3: the planner certifies its speeds against the fitted
+            # curvature, which carries that noise into them. Measured 1.3e-3 (0.012 m/s) on one row
+            # once `lane_switch` changed lanes at its stated rate, with the profile lookups -- index
+            # and speed -- bit-identical between the two calls.
+            torch.testing.assert_close(part[:, :-2], whole[rows][:, :-2], rtol=0, atol=1e-3)
+            torch.testing.assert_close(part[:, -2:], whole[rows][:, -2:], rtol=0, atol=2e-3)
             for n, v in zip(names, whole_state):
                 assert torch.equal(getattr(alt, n)[rows], v), f"{kind}.{n}"
         env.step(a)
