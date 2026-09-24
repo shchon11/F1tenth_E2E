@@ -705,3 +705,40 @@ def test_with_two_opponents_only_the_respawned_one_drops_out_of_the_step(rn):
     out = rec.finalize()
     assert out["opponent_progress_m"][0] == pytest.approx(0.20), (
         "the surviving opponent's arc, not a mean with a teleport in it")
+
+
+def test_a_soft_car_contact_is_counted_once_however_many_steps_it_lasts():
+    """Under soft collision a rub is reported on every step it lasts. Until 2026-09-24 the meter
+    added one car contact per such step (the wall branch already counted onsets), so a 0.15 s rub
+    read as six contacts and a race table read contact *time* as a contact count."""
+    import torch
+    from f1sim import Config, maps
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common
+    from f1sim.learn.benchmark.overtake import TrafficMeter
+    from f1sim.raceline import Raceline
+    tr = maps.load("gen:competition:0")
+    cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
+    env = common.make_env([tr], 2, "cpu", EnvConfig(race_size=2, opponent="teacher", hist_len=0,
+                                                   collision_mode="soft"),
+                          cfg=cfg, seed=7, rls=[Raceline.build_cached(tr)])
+    env.reset(seed=7)
+    learner = int(torch.nonzero(env.learner).flatten()[0])
+    pattern = [False] * 3 + [True] * 6 + [False] * 3 + [True] * 2 + [False] * 2
+    real, t = env.sim.step, [0]
+
+    def scripted(*a, **kw):
+        r = real(*a, **kw)
+        on = pattern[t[0]]; t[0] += 1
+        r.car_collision[:] = False; r.collision[:] = False
+        r.car_collision[learner] = on; r.collision[learner] = on
+        return r
+    env.sim.step = scripted
+    act = torch.zeros(env.B, 2)
+    with TrafficMeter(env) as meter:
+        for _ in pattern:
+            env.sim.step(act)
+    out = meter.report()["traffic"] if "traffic" in meter.report() else meter.report()
+    assert out["car_contacts"] == 2, out
+    assert out["car_contact_steps"] == 8, out
+    assert out["wall_collisions"] == 0, out

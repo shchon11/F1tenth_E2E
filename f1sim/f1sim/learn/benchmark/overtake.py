@@ -410,6 +410,7 @@ class TrafficMeter:
                                         hold_steps=hold_steps, repeat=True, keep_history=False)
                            for _ in range(self.n_opponents)] for _ in range(self.n)]
         self.car_contacts = 0
+        self.car_contact_steps = 0
         self.wall_collisions = 0
         self.learner_respawns = 0
         self.event_steps = 0
@@ -498,15 +499,23 @@ class TrafficMeter:
         # would score one graze as sixteen collisions. Count onsets there, which is what the reward
         # charges and what `terminate` counts by construction (its crash is the episode's last step).
         soft = getattr(env.ecfg, "collision_mode", "terminate") == "soft"
+        # The same holds for car contact: until 2026-09-24 it was counted per *step* here, so every
+        # soft-mode race table before then reports car-contact steps (now `car_contact_steps`).
         if soft and getattr(self, "_prev_hit", None) is None:
             self._prev_hit = [False] * self.n
+            self._prev_car = [False] * self.n
         for i in range(self.n):
             touching = bool(hit[i]) and not bool(contact[i])
             onset = touching and not (soft and self._prev_hit[i] and not bool(learner_fresh[i]))
+            car = bool(contact[i])
+            car_onset = car and not (soft and self._prev_car[i] and not bool(learner_fresh[i]))
             if soft:
                 self._prev_hit[i] = touching
-            if bool(contact[i]):
-                self.car_contacts += 1
+                self._prev_car[i] = car
+            if car:
+                self.car_contact_steps += 1
+                if car_onset:
+                    self.car_contacts += 1
             elif onset:
                 self.wall_collisions += 1
             if bool(learner_fresh[i]):
@@ -553,6 +562,7 @@ class TrafficMeter:
             "defending_fraction": sum(t.defending_s for t in self.traces) / exposure,
             "car_contacts": self.car_contacts,
             "car_contacts_per_learner_min": self.car_contacts / learner_min,
+            "car_contact_steps": self.car_contact_steps,
             "wall_collisions": self.wall_collisions,
             "learner_respawns": self.learner_respawns,
             "opp_event_step_fraction": self.event_steps / max(self.steps * max(self.n, 1), 1),
