@@ -158,6 +158,15 @@ KINDS: Tuple[DriverKind, ...] = (
                teacher_factory="f1sim.lane_teacher:LaneSwitchTeacher",
                prop_aware=True,
                pending="`f1sim/lane_teacher.py` 가 이 트리에 없습니다."),
+    DriverKind("layout", "layout 티처 (장애물 배치별 최소시간 라인)",
+               "장애물 배치마다 그 배치를 피하는 최소시간 라인을 GPU 에서 새로 만들고, raceline 티처가 "
+               "그 라인을 따라갑니다 (`f1sim.layout_line`). 2026-09-24 측정: ICCAS 두 시드 17 km, 장애물 "
+               "조우 1575 건에서 장애물·벽 접촉 0. 배치가 바뀌면 (리셋, 밀린 장애물) 그 차의 라인을 다시 "
+               "만듭니다. 다른 차는 보지 않습니다 (follow cap 이 간격을 지킵니다).",
+               teacher=True, module="f1sim.layout_line",
+               teacher_factory="f1sim.layout_line:LayoutLineTeacher",
+               prop_aware=True,
+               pending="`f1sim/layout_line.py` 가 이 트리에 없습니다."),
     DriverKind("policy", "정책 체크포인트",
                "저장된 정책이 스스로 주행합니다. 자기 라인을 잡고 자기 실수를 합니다.",
                checkpoint=True),

@@ -2593,7 +2593,7 @@
           "choices": null,
           "required": false,
           "group": "teacher·상대차",
-          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|forzaeth|forzaeth_pred|lane_switch|policy|self), kind_mix (several teacher kinds, one drawn per race reset -- how one run sees every driver instead of one), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
+          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|forzaeth|forzaeth_pred|lane_switch|layout|policy|self), kind_mix (several teacher kinds, one drawn per race reset -- how one run sees every driver instead of one), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
           "action": "store",
           "nullable": false,
           "metavar": "JSON|@FILE"
@@ -3122,6 +3122,47 @@
           "metavar": "FRAC"
         },
         {
+          "flag": "--plan-kappa-mode",
+          "flags": [
+            "--plan-kappa-mode"
+          ],
+          "dest": "plan_kappa_mode",
+          "label": "plan kappa mode",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "absolute",
+          "nargs": null,
+          "choices": [
+            "absolute",
+            "feasible"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "what a curvature knot of +-1 means: +-1.6 1/m ('absolute', every run before this) or the tightest arc the tyres hold at the plan's speed ('feasible'). At 5 m/s 'absolute' spends four fifths of the box on arcs the car cannot drive, and the policy's own exploration is wider than the band that is left.",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--plan-kappa-a-lat",
+          "flags": [
+            "--plan-kappa-a-lat"
+          ],
+          "dest": "plan_kappa_a_lat",
+          "label": "plan kappa a lat",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 8.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "'feasible' only: the lateral budget the knots are scaled by",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M_S2"
+        },
+        {
           "flag": "--procedural-density",
           "flags": [
             "--procedural-density"
@@ -3218,6 +3259,395 @@
           "required": false,
           "group": "학습",
           "help": "what a collision is. 'terminate' ends the episode, which is what every number on record was measured under. 'soft' resolves the contact and carries on -- the car is pushed out of penetration, its into-surface velocity is taken, and the crash is charged as a cost. It is the only way a policy can learn what to do AFTER a touch: steer out of it, back off and go again, and above all not end up driving the wrong way (--wrong-way-penalty). Not comparable with a 'terminate' run's collisions per km without saying so",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--algo",
+          "flags": [
+            "--algo"
+          ],
+          "dest": "algo",
+          "label": "algo",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "ppo",
+          "nargs": null,
+          "choices": [
+            "ppo",
+            "sac"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "the learning algorithm. 'sac': soft actor-critic with a replay buffer on the same environment, model and conditioning; the actor is the same module, so its checkpoints (sac_u*.pt) load wherever a PPO one does",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-buffer",
+          "flags": [
+            "--sac-buffer"
+          ],
+          "dest": "sac_buffer",
+          "label": "sac buffer",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 500000,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "replay capacity, learner transitions",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-batch",
+          "flags": [
+            "--sac-batch"
+          ],
+          "dest": "sac_batch",
+          "label": "sac batch",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 256,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-updates-per-step",
+          "flags": [
+            "--sac-updates-per-step"
+          ],
+          "dest": "sac_updates_per_step",
+          "label": "sac updates per step",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 2,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "gradient steps per env step (an env step adds one transition per learner row)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-start",
+          "flags": [
+            "--sac-start"
+          ],
+          "dest": "sac_start",
+          "label": "sac start",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 100000,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "transitions buffered before any update (the first thousands are all starts)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-critic-warmup",
+          "flags": [
+            "--sac-critic-warmup"
+          ],
+          "dest": "sac_critic_warmup",
+          "label": "sac critic warmup",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 10000,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "updates of the Q functions alone before the actor moves: they start as the PPO value function and know nothing yet about what an action does",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-tau",
+          "flags": [
+            "--sac-tau"
+          ],
+          "dest": "sac_tau",
+          "label": "sac tau",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.005,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-lr-actor",
+          "flags": [
+            "--sac-lr-actor"
+          ],
+          "dest": "sac_lr_actor",
+          "label": "sac lr actor",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1e-05,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-actor-every",
+          "flags": [
+            "--sac-actor-every"
+          ],
+          "dest": "sac_actor_every",
+          "label": "sac actor every",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 2,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "one actor step per this many critic steps (delayed policy updates)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-lr-critic",
+          "flags": [
+            "--sac-lr-critic"
+          ],
+          "dest": "sac_lr_critic",
+          "label": "sac lr critic",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 5e-05,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-alpha0",
+          "flags": [
+            "--sac-alpha0"
+          ],
+          "dest": "sac_alpha0",
+          "label": "sac alpha0",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.01,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-target-entropy",
+          "flags": [
+            "--sac-target-entropy"
+          ],
+          "dest": "sac_target_entropy",
+          "label": "sac target entropy",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "default: the starting policy's own entropy, so the exploration it had is kept",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-anchor",
+          "flags": [
+            "--sac-anchor"
+          ],
+          "dest": "sac_anchor",
+          "label": "sac anchor",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 5.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "weight of ||mu(s) - mu_init(s)||^2 in the actor loss at the start",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-anchor-decay",
+          "flags": [
+            "--sac-anchor-decay"
+          ],
+          "dest": "sac_anchor_decay",
+          "label": "sac anchor decay",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 2000000.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "learner steps over which the anchor decays linearly to zero",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-contact-frac",
+          "flags": [
+            "--sac-contact-frac"
+          ],
+          "dest": "sac_contact_frac",
+          "label": "sac contact frac",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.25,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "share of each batch drawn from the half second before a wall/prop contact",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-contact-window",
+          "flags": [
+            "--sac-contact-window"
+          ],
+          "dest": "sac_contact_window",
+          "label": "sac contact window",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 20,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-n-step",
+          "flags": [
+            "--sac-n-step"
+          ],
+          "dest": "sac_n_step",
+          "label": "sac n step",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 16,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "rewards summed before bootstrapping; 1 is plain one-step TD",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-actor-loss",
+          "flags": [
+            "--sac-actor-loss"
+          ],
+          "dest": "sac_actor_loss",
+          "label": "sac actor loss",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "awac",
+          "nargs": null,
+          "choices": [
+            "awac",
+            "sac"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "'awac': advantage-weighted regression onto buffer actions (conservative, the default after sac1's reparameterised actor drove worse behind an unfitted Q); 'sac': the soft actor-critic update with a learned temperature",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--sac-awac-beta",
+          "flags": [
+            "--sac-awac-beta"
+          ],
+          "dest": "sac_awac_beta",
+          "label": "sac awac beta",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--kind-mix-assign",
+          "flags": [
+            "--kind-mix-assign"
+          ],
+          "dest": "kind_mix_assign",
+          "label": "kind mix assign",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "partition",
+          "nargs": null,
+          "choices": [
+            "partition",
+            "redraw"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "how a kind_mix opponent slot picks its driver. 'partition' (training's default): race g drives kind_mix[g %% len], fixed -- every update holds each kind in exact proportion, and a teacher that can plan a subset plans only its own rows (the interactive opponent was half a graphed step planning all of them). 'redraw': uniformly at every race reset, as the console does and as spec_korea_contact_s911/s912 were trained",
           "action": "store",
           "nullable": false,
           "metavar": null
@@ -5402,7 +5832,7 @@
           "choices": null,
           "required": false,
           "group": "teacher·상대차",
-          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|forzaeth|forzaeth_pred|lane_switch|policy|self), kind_mix (several teacher kinds, one drawn per race reset -- how one run sees every driver instead of one), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
+          "help": "per-opponent configuration: a JSON array with one object per car of a race (race_size - 1 of them), or @path/to/slots.json. Each object may carry kind (raceline|interactive|forzaeth|forzaeth_pred|lane_switch|layout|policy|self), kind_mix (several teacher kinds, one drawn per race reset -- how one run sees every driver instead of one), checkpoint, controller, speed_scale (a number or [lo, hi]), label_grip (true|nominal|conservative), speed_cap [m/s], events (brake,stop,shift,weave), event_rate, reactive ({defend: p,yield: p,line: p,oblivious: p}), spawn (ahead|behind|alongside|random, where that car starts relative to the learner) and seed. Slot i of every race in the batch is built from spec i, so 'a slow car ahead and a defending car alongside' is one run rather than two. Replaces --opponent / --opp-speed / --opp-pool / --opp-events / --spawn-order, which say one thing about every opponent at once; the remaining --opp-* flags are the shared *ranges* an event draws from and still apply. Empty = off, and off is the env this flag was added to",
           "action": "store",
           "nullable": false,
           "metavar": "JSON|@FILE"
@@ -6211,6 +6641,11 @@
       },
       {
         "name": "lane_switch",
+        "teacher": true,
+        "checkpoint": false
+      },
+      {
+        "name": "layout",
         "teacher": true,
         "checkpoint": false
       },

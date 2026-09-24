@@ -321,16 +321,18 @@ class EncounterMeter:
         dist_m = float(self._dist_m.item())
         km = dist_m / 1000.0
         ci = _wilson(n_hit, n_enc)
-        per_km = lambda c: (c / km if km > 0.001 else float("nan"))
+        # undefined is None, not nan: the report is written as strict JSON, and a run with no
+        # contact at all (no contacted encounter to divide by) used to fail to save.
+        per_km = lambda c: (c / km if km > 0.001 else None)
         prop = int(self._prop_onsets.sum().item())
         wall = int(self._wall_onsets.sum().item())
         cars = int(self._car_onsets.sum().item())
         return {"obstacle_encounters": {
             "encounters": n_enc,
             "contacted": n_hit,
-            "contact_rate": (n_hit / n_enc) if n_enc else float("nan"),
+            "contact_rate": (n_hit / n_enc) if n_enc else None,
             "contact_rate_ci95": list(ci) if ci else None,
-            "onsets_per_contacted_encounter": (onsets_hit / n_hit) if n_hit else float("nan"),
+            "onsets_per_contacted_encounter": (onsets_hit / n_hit) if n_hit else None,
             "open_at_end": int(still.long().sum().item()),
             "prop_onsets": prop, "wall_onsets": wall, "car_onsets": cars,
             "prop_onsets_outside_encounter": int(self._prop_orphans.sum().item()),

@@ -30,6 +30,56 @@ def plan_geometry_speed(state: torch.Tensor, plan_speed: Optional[torch.Tensor])
     return plan_speed
 
 
+def fit_knots(k: torch.Tensor, tx: torch.Tensor, ty: torch.Tensor, Lp: torch.Tensor, fr: torch.Tensor,
+              k_lim: torch.Tensor, iters: int, fractions: torch.Tensor) -> torch.Tensor:
+    """Gauss-Newton fit of the plan's curvature knots so the integrated path passes through the
+    body-frame points (tx, ty) (B, M), which sit at fractions `fr` (M,) of the plan length `Lp`.
+
+    `k` (B, N_KNOTS) is the initial guess and also what the ridge pulls towards; `k_lim` (B,) bounds
+    every knot; `fractions` are the step lengths tried per iteration. Shared by every teacher that
+    expresses a path in the plan action space, so all of them fit it the same way.
+    """
+    from .mpc import N_KNOTS, path_points
+    B, dev = k.shape[0], k.device
+    M = fr.shape[0]
+    k_init = k.clone()
+
+    lam, mu, eps = 1e-2, 0.3, 0.02                             # GN damping, ridge towards the pure-pursuit / raceline guess
+    # The six finite-difference perturbations are independent. Evaluate them
+    # with the unperturbed path in one batch instead of launching seven tiny
+    # path integrations and constructing six CUDA scalar tensors per iteration.
+    basis = torch.eye(N_KNOTS, device=dev, dtype=k.dtype)
+    perturb = torch.cat([torch.zeros_like(basis[:1]), eps * basis], 0)
+    lengths = Lp[:, None].expand(-1, N_KNOTS + 1).reshape(-1)
+    sample_idx = (fr * 24).round().long()
+    trial_lengths = Lp[:, None].expand(-1, len(fractions)).reshape(-1)
+    rows = torch.arange(B, device=dev)
+    for _ in range(iters):
+        paths = (k[:, None, :] + perturb[None]).reshape(-1, N_KNOTS)
+        x, y, _, _ = path_points(paths, lengths, 25)
+        x = x[:, sample_idx].reshape(B, N_KNOTS + 1, M)
+        y = y[:, sample_idx].reshape(B, N_KNOTS + 1, M)
+        residuals = torch.cat([x - tx[:, None], y - ty[:, None]], 2)
+        r0 = residuals[:, 0]
+        J = ((residuals[:, 1:] - r0[:, None]) / eps).transpose(1, 2)
+        A = J.transpose(1, 2) @ J + (lam + mu) * basis
+        g = J.transpose(1, 2) @ r0[..., None] + mu * (k - k_init)[..., None]
+        # `solve_ex` is the same LU solve without the error check, which reads the pivots back
+        # to the host every call. A carries a 0.31 ridge, so it is never singular.
+        step = torch.linalg.solve_ex(A, g)[0].squeeze(-1)
+        # Curved minimum-time paths can make a full GN step overshoot and
+        # oscillate. Accept only a decrease in the actual fit+ridge objective.
+        trials = k[:, None] - fractions[None, :, None] * step[:, None]
+        trials = torch.maximum(torch.minimum(trials, k_lim[:, None, None]), -k_lim[:, None, None])
+        px, py, _, _ = path_points(trials.reshape(-1, N_KNOTS), trial_lengths, 25)
+        px = px[:, sample_idx].reshape(B, len(fractions), M)
+        py = py[:, sample_idx].reshape(B, len(fractions), M)
+        costs = ((px - tx[:, None]).square() + (py - ty[:, None]).square()).sum(-1)
+        costs = costs + mu * (trials - k_init[:, None]).square().sum(-1)
+        k = trials[rows, costs.argmin(1)]
+    return k
+
+
 #: The speed profile the teacher drives when no limits are given: the minimum-curvature line's
 #: own 6 / 6 / 3, which is what `--teacher-a-*` documents as its default and what every run before
 #: the limits became overridable used.
@@ -90,6 +140,7 @@ class RacelineTeacher:
                                             mu=mu_nominal * g, vehicle=vehicle)
                                for g in self.grip_levels]))   # (K, N)
         self.a_lat = float(a_lat)                                                          # nominal-grip lateral budget of the profiles
+        self.a_acc, self.a_brake = float(a_acc), float(a_brake)                            # the profiles' drive / braking limits
         self.xy = torch.tensor(np.stack(xy), dtype=torch.float32, device=self.device)     # (T, N, 2)
         self.v_grip = torch.tensor(np.stack(v), dtype=torch.float32, device=self.device)  # (T, K, N)
         self.v = self.v_grip[:, self.nominal_grip_index]                                    # nominal grip (T, N)
@@ -190,45 +241,11 @@ class RacelineTeacher:
         steering = torch.full_like(vx, min(self.steer_max, self.vehicle.s_max)) if P is None else torch.as_tensor(P.get('s_max', self.vehicle.s_max), device=dev, dtype=vx.dtype).clamp(max=self.steer_max)
         k_lim = 0.85 * torch.minimum(torch.full_like(vx, spec.kappa_max), torch.tan(steering) / wheelbase)
         k = torch.maximum(torch.minimum(k, k_lim[:, None]), -k_lim[:, None])
-        k_init = k.clone()
-
-        lam, mu, eps = 1e-2, 0.3, 0.02                             # GN damping, ridge towards the pure-pursuit / raceline guess
-        # The six finite-difference perturbations are independent. Evaluate them
-        # with the unperturbed path in one batch instead of launching seven tiny
-        # path integrations and constructing six CUDA scalar tensors per iteration.
-        basis = torch.eye(N_KNOTS, device=dev, dtype=k.dtype)
-        perturb = torch.cat([torch.zeros_like(basis[:1]), eps * basis], 0)
-        lengths = Lp[:, None].expand(-1, N_KNOTS + 1).reshape(-1)
-        sample_idx = (fr * 24).round().long()
         # Cached: a list -> CUDA tensor is a pageable host copy, which waits for the device.
         fractions = getattr(self, "_gn_fractions", None)
         if fractions is None or fractions.device != k.device or fractions.dtype != k.dtype:
             fractions = self._gn_fractions = torch.tensor([1., .5, .25, .125, 0.], device=dev, dtype=k.dtype)
-        trial_lengths = Lp[:, None].expand(-1, len(fractions)).reshape(-1)
-        rows = torch.arange(B, device=dev)
-        for _ in range(iters):
-            paths = (k[:, None, :] + perturb[None]).reshape(-1, N_KNOTS)
-            x, y, _, _ = path_points(paths, lengths, 25)
-            x = x[:, sample_idx].reshape(B, N_KNOTS + 1, M)
-            y = y[:, sample_idx].reshape(B, N_KNOTS + 1, M)
-            residuals = torch.cat([x - tx[:, None], y - ty[:, None]], 2)
-            r0 = residuals[:, 0]
-            J = ((residuals[:, 1:] - r0[:, None]) / eps).transpose(1, 2)
-            A = J.transpose(1, 2) @ J + (lam + mu) * basis
-            g = J.transpose(1, 2) @ r0[..., None] + mu * (k - k_init)[..., None]
-            # `solve_ex` is the same LU solve without the error check, which reads the pivots back
-            # to the host every call. A carries a 0.31 ridge, so it is never singular.
-            step = torch.linalg.solve_ex(A, g)[0].squeeze(-1)
-            # Curved minimum-time paths can make a full GN step overshoot and
-            # oscillate. Accept only a decrease in the actual fit+ridge objective.
-            trials = k[:, None] - fractions[None, :, None] * step[:, None]
-            trials = torch.maximum(torch.minimum(trials, k_lim[:, None, None]), -k_lim[:, None, None])
-            px, py, _, _ = path_points(trials.reshape(-1, N_KNOTS), trial_lengths, 25)
-            px = px[:, sample_idx].reshape(B, len(fractions), M)
-            py = py[:, sample_idx].reshape(B, len(fractions), M)
-            costs = ((px - tx[:, None]).square() + (py - ty[:, None]).square()).sum(-1)
-            costs = costs + mu * (trials - k_init[:, None]).square().sum(-1)
-            k = trials[rows, costs.argmin(1)]
+        k = fit_knots(k, tx, ty, Lp, fr, k_lim, iters, fractions)
         # speeds from the profile: 0.15 s ahead and at the end of the plan
         v_idx0 = (idx + ((vx.abs() * spec.v_cmd_lead) / ds).round().long()) % self.N
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
@@ -237,6 +254,27 @@ class RacelineTeacher:
             lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()
         slow = (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)     # off the line: slow down, like the direct teacher
         v0 = self.speed_at(tid, v_idx0, gb) * slow; v1 = self.speed_at(tid, v_idx1, gb) * slow
+        if self.speed_lead_s is not None:
+            # Where the profile rises, ask for the speed it reaches `speed_lead_s` later: the tracker
+            # closes a speed error at about half the rate the profile climbs (see the attribute).
+            # A max, so a braking zone keeps the speed of the point the car is at.
+            v_lead = self.speed_at(tid, (idx + ((vx.abs() * self.speed_lead_s) / ds).round().long()) % self.N, gb) * slow
+            v0 = torch.maximum(v0, v_lead)
+        if self.speed_horizon_s is not None and spec.speed_mode == "linear":
+            # The end speed as the straight line through the profile `speed_horizon_s` ahead -- the
+            # part of a plan the tracker follows before the next one replaces it. Through the
+            # profile at the plan's END instead, a plan approaching a corner slows linearly over
+            # all of its 1.5 s where the profile holds speed and brakes late (see the attribute).
+            s_h = (geometry_speed.abs() * self.speed_horizon_s).clamp(min=0.3)
+            v_h = self.speed_at(tid, (idx + (s_h / ds).round().long()) % self.N, gb) * slow
+            v1 = (v0 + (v_h - v0) * Lp / torch.minimum(s_h, Lp)).clamp(0.0, v_max)
+        if self.speed_error_gain is not None:
+            # Proportional feedback on the speed error, through the plan, as one shift of the whole
+            # speed line: the tracker approaches a reference step at about 2.5 m/s^2 whatever its
+            # size, so a car behind the profile is handed a higher line and one ahead of it (a
+            # braking zone) a lower one.
+            dv = self.speed_error_gain * (v0 - vx.abs())
+            v0 = (v0 + dv).clamp(0.0, v_max); v1 = (v1 + dv).clamp(0.0, v_max)
         cap = self.heading_speed_cap(yaw, tid, idx)
         if spec.speed_mode == "knots":                             # the profile itself, at the curvature knots
             vk = self.speed_at(tid[:, None].expand_as(kidx), kidx, gb[:, None].expand_as(kidx)) * slow[:, None]
@@ -257,9 +295,26 @@ class RacelineTeacher:
         if cap is not None:
             v0 = torch.minimum(v0, cap); v1 = torch.minimum(v1, cap)
         action = encode(k, v0, v1, v_max, spec, v_meas=geometry_speed)
-        if getattr(self, '_defer_profile_projection', False):
+        if getattr(self, '_defer_profile_projection', False) or not self.certify_speeds:
             return action  # interactive generation certifies after endpoint replacement/scaling
         return self.project_plan_action(action, state, P, v_max, spec, plan_speed=plan_speed)
+
+    #: [s] When set, the plan's end speed is chosen so its linear speed passes through the profile
+    #: this far ahead (see `plan_action`). None: through the profile at the plan's end, every run
+    #: before 2026-09-24. Measured on ICCAS with friction pinned, the raceline teacher drove 7.97 s
+    #: against its own profile's 6.58 s, and the braking zones held most of the gap: the planned speed
+    #: sat up to 2.4 m/s under the profile at the car's point through them.
+    speed_horizon_s: Optional[float] = None
+    #: [s] opt-in, see plan_action. Off: every run before 2026-09-24.
+    speed_lead_s: Optional[float] = None
+    #: opt-in, see plan_action. Off: every run before 2026-09-24.
+    speed_error_gain: Optional[float] = None
+    #: Pass the plan's speeds through `project_plan_action`. True: every run before 2026-09-24.
+    certify_speeds: bool = True
+    # Measured 2026-09-24, line teacher, ICCAS, friction pinned (lap; profile 6.58 s, policy 7.86 s):
+    # defaults 7.98; horizon 0.5 s 7.73 (0.6 s); + certify off 7.34; + lead 0.5 s 7.23; error gain
+    # 1-3 7.27-7.34; speed_scale 1.1 7.10, 1.2 7.21. With procedural props and random friction the
+    # certify-off variants touched props (4/876 and 8/850 encounters against 0/803), so none is on.
 
     def project_plan_action(self, action, state, P, v_max, spec, *, plan_speed=None):
         """Certify the final fitted path's desired speeds, independently of its source raceline.

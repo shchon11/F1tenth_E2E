@@ -345,7 +345,7 @@ class Simulator:
         pose = torch.cat([xy, yaw[:, None]], 1)
         # reject poses too close to walls by pulling them back to the centerline
         bad = self.track.sample_edt(xy, tid) < (self.cfg.vehicle.width if min_clearance is None else min_clearance)
-        bad = bad | self._spawn_runway_blocked(s, tid, eid, lat)
+        bad = bad | self._spawn_runway_blocked(s, tid, eid, lat) | self._spawn_heading_blocked(pose, tid, eid)
         if getattr(self.track, "has_props", False) or self.spawn_runway > 0.0:
             # Props are not in the EDT, so the wall test above cannot see them and a car would spawn
             # standing inside a crate. Reject on the same geometry the contact test uses; if the
@@ -356,7 +356,8 @@ class Simulator:
                 pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
                 # the centerline point may be blocked too, and so may the road ahead of it
                 still = bad & (self._spawn_in_prop(pose, tid, eid)
-                               | self._spawn_runway_blocked(s, tid, eid, None))
+                               | self._spawn_runway_blocked(s, tid, eid, None)
+                               | self._spawn_heading_blocked(pose, tid, eid))
                 # Walk a full lap in even stations rather than a few short nudges. Stopping early
                 # and returning the pose anyway would spawn the car inside a crate and call it a
                 # spawn; if a whole lap has nowhere to stand, that is a broken map and it says so.
@@ -377,6 +378,13 @@ class Simulator:
                     ok = (~(self._spawn_in_prop(p_alt, tid_j, eid_j)
                             | self._spawn_runway_blocked(s_alt.reshape(-1), tid_j, eid_j, None))
                           ).reshape(-1, J)
+                    # The straight line ahead as well, where some station has it: on a bend the lane
+                    # runway follows the lane, while a car placed at speed goes straight until its
+                    # steering comes round -- a car set on a tight left-hander at 2.4 m/s with crates
+                    # past the outside of it had no path round them at full lock. Only a preference:
+                    # a lap with no such station keeps the lane rule rather than refusing to spawn.
+                    straight = ok & ~self._spawn_heading_blocked(p_alt, tid_j, eid_j).reshape(-1, J)
+                    ok = torch.where(straight.any(1, keepdim=True), straight, ok)
                     first = ok.to(torch.uint8).argmax(1)
                     any_ok = ok.any(1)
                     chosen = p_alt.reshape(-1, J, 3)[torch.arange(idx.numel(), device=self.device), first]
@@ -436,12 +444,56 @@ class Simulator:
         if props is not None:
             eid_k = (torch.arange(n, device=self.device) if eid is None else eid)
             eid_k = eid_k[:, None].expand(n, K).reshape(-1)
-            blocked = blocked | (props.clearance(xy, eid_k) < need)
+            # props keep `SPAWN_PROP_GAP` from the body's swept width as well (see
+            # `_spawn_heading_blocked`): a car set on the centreline at 2.9 m/s with a crate 0.25 m
+            # off its front corner's path, on a bending lane, touched it five steps in
+            need_p = math.hypot(0.5 * self.cfg.vehicle.width + self.SPAWN_PROP_GAP, 0.5 * step)
+            blocked = blocked | (props.clearance(xy, eid_k) < need_p)
         return blocked.view(n, K).any(1)
+
+    #: [m] how close to a prop a car may be placed, when a spawn runway is required (see `_spawn_in_prop`).
+    SPAWN_PROP_GAP = 0.25
+
+    def _spawn_heading_blocked(self, pose: torch.Tensor, tid: torch.Tensor, eid) -> torch.Tensor:
+        """(n,) whether a prop stands on the straight line the car is *pointing* along.
+
+        `_spawn_runway_blocked` walks the lane at the car's lateral offset, but the pose it is
+        checking carries `spawn_yaw_std` of heading noise on top of the lane's direction -- and a
+        lane that bends away from the raceline adds more. Measured on 2026-09-24: a car placed
+        0.43 m off the raceline at 2.9 m/s, about 40 degrees off it, with a crate 0.34 m from its
+        nose on the line it was pointing along and a clear lane beside it. Nothing could have
+        avoided that crate; the lane check passed it.
+
+        Props only, over the same `spawn_runway`: a wall along the heading is a long surface the car
+        can steer off, the lane check already keeps the lane clear of it, and a rejected pose
+        falls back to the lane's own heading, where the two checks coincide.
+        """
+        n = pose.shape[0]
+        props = getattr(self.track, "env_props", None)
+        if self.spawn_runway <= 0.0 or props is None:
+            return torch.zeros(n, dtype=torch.bool, device=self.device)
+        K = max(6, int(math.ceil(self.spawn_runway / (0.5 * self.cfg.vehicle.width))))
+        step = self.spawn_runway / K
+        ds = torch.arange(1, K + 1, device=self.device, dtype=pose.dtype) * step
+        hd = torch.stack([torch.cos(pose[:, 2]), torch.sin(pose[:, 2])], 1)
+        xy = (pose[:, None, :2] + ds[None, :, None] * hd[:, None]).reshape(-1, 2)
+        # The body's swept width plus the same sideways gap `_spawn_in_prop` keeps: a crate just
+        # ahead of a front corner, 0.25 m clear of the straight path at 2.9 m/s, was hit five steps
+        # later by a car turning towards the line.
+        need = math.hypot(0.5 * self.cfg.vehicle.width + self.SPAWN_PROP_GAP, 0.5 * step)
+        eid_k = (torch.arange(n, device=self.device) if eid is None else eid)
+        eid_k = eid_k[:, None].expand(n, K).reshape(-1)
+        return (props.clearance(xy, eid_k) < need).view(n, K).any(1)
 
     def _spawn_in_prop(self, pose: torch.Tensor, tid: torch.Tensor,
                        eid: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Whether each candidate spawn pose has its footprint overlapping a prop.
+        """Whether each candidate spawn pose has its footprint overlapping a prop -- or, when a
+        runway is required, standing within `SPAWN_PROP_GAP` of one.
+
+        The gap is the runway's rule applied sideways. Measured 2026-09-24: a car placed 0.23 m
+        beside a crate, clear of it and of its runway, touched it within five steps at walking
+        pace -- turning towards the line swings the tail outwards, into the crate. Nothing could
+        have done otherwise from that pose, and it counted as the driver's contact.
 
         The eager `prism_contacts`, deliberately: this runs at reset on whatever partial batch is
         resetting, so a `dynamic=False` compile would recompile for every distinct size."""
@@ -452,7 +504,17 @@ class Simulator:
         poses, pn, pd, z_lo, z_hi = self.track.props_near(tid, pose[:, :2], eid, self.prop_reach)
         h = self.car_dims[:pose.shape[0], 2] if self.car_dims.shape[0] >= pose.shape[0] else 0.25
         depth, _, _ = prism_contacts(pts[:, [0, 1, 3, 2]], poses, pn, pd, z_lo, z_hi, h)
-        return depth > 0
+        inside = depth > 0
+        props = getattr(self.track, "env_props", None)
+        if self.spawn_runway <= 0.0 or props is None:
+            return inside
+        # the outline: corners and edge midpoints, and the prop distance there
+        mid = 0.5 * (pts + pts[:, [1, 3, 0, 2]])
+        outline = torch.cat([pts, mid], 1)                                   # (n, 8, 2)
+        n = pose.shape[0]
+        e = (torch.arange(n, device=self.device) if eid is None else eid)[:, None].expand(n, 8).reshape(-1)
+        near = props.clearance(outline.reshape(-1, 2), e).view(n, 8).amin(1) < self.SPAWN_PROP_GAP
+        return inside | near
 
     def reset(self, env_ids: Optional[torch.Tensor] = None, poses: Optional[torch.Tensor] = None,
               speed: Optional[torch.Tensor] = None, track_ids: Optional[torch.Tensor] = None):

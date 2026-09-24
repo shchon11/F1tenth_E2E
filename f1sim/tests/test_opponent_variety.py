@@ -11,6 +11,7 @@ Three things the user asked for on 2026-09-21, and each one is a claim a rollout
 Small tracks and a 36-beam LiDAR, the convention of `test_opponent_slots.py`.
 """
 import functools
+import math
 
 import pytest
 import torch
@@ -205,6 +206,62 @@ def test_nothing_unavoidable_stands_in_front_of_a_spawn():
     assert with_runway == 0, f"{with_runway} cars still spawn into something they cannot avoid"
     assert without > 0, ("the same layouts block nobody without the runway either, so this test "
                          "is not measuring the runway")
+
+
+def test_nothing_stands_on_the_line_a_spawn_is_pointing_along():
+    """The lane check above walks the lane; a spawned car points `spawn_yaw_std` off it. Measured
+    along each car's own heading, over 20 resets, against the same env without the runway.
+
+    Only cars that point clearly off the lane (0.1 rad) are counted. A rejected pose falls back to
+    the lane's own heading, and on a bend a straight ray from there leaves the lane that the lane
+    check has already cleared -- so for those the straight ray is the wrong question, and the lane
+    check above is the right one."""
+    env = _env(envs=32, procedural_obstacles=1.0, procedural_density=4.0,
+               procedural_raceline_corridor="off", spawn_runway=3.0,
+               opponent_slots=[{"kind_mix": PROP_AWARE}])
+    need = 0.5 * float(env.cfg.vehicle.width)
+
+    def blocked(n=20):
+        bad = 0
+        for t in range(n):
+            env.reset(seed=600 + t)
+            st, eid = env.sim.state, torch.arange(env.B)
+            hd = torch.stack([torch.cos(st[:, 2]), torch.sin(st[:, 2])], 1)
+            _, lane = env.sim.track.pose_at_s(env.sim.s, env.sim.tid)
+            off = (torch.remainder(st[:, 2] - lane + math.pi, 2 * math.pi) - math.pi).abs() > 0.1
+            d = torch.full((env.B,), float("inf"))
+            for k in range(1, 25):
+                d = torch.minimum(d, env.procedural.clearance(st[:, :2] + hd * (3.0 * k / 24.0), eid))
+            bad += int(((d < need) & off).sum())
+        return bad
+
+    with_runway = blocked()
+    env.sim.spawn_runway = 0.0
+    without = blocked()
+    assert with_runway == 0, f"{with_runway} cars still spawn pointing at a prop they cannot avoid"
+    assert without > 0, "the same layouts put no prop ahead of anybody, so this measures nothing"
+
+
+def test_no_car_is_placed_hugging_a_prop():
+    """Clear of a prop is not enough: turning towards the line swings the tail, and a car placed
+    0.23 m beside a crate touched it within five steps. Every spawned body keeps
+    `SPAWN_PROP_GAP` from every prop, measured at its corners and edge midpoints."""
+    env = _env(envs=32, procedural_obstacles=1.0, procedural_density=4.0,
+               procedural_raceline_corridor="off", spawn_runway=3.0,
+               opponent_slots=[{"kind_mix": PROP_AWARE}])
+    gap = env.sim.SPAWN_PROP_GAP
+    worst = float("inf")
+    for t in range(20):
+        env.reset(seed=700 + t)
+        st = env.sim.state
+        c, s_ = torch.cos(st[:, 2]), torch.sin(st[:, 2])
+        R = torch.stack([torch.stack([c, -s_], -1), torch.stack([s_, c], -1)], -2)
+        pts = torch.einsum("bij,kj->bki", R, env.sim.corners) + st[:, None, :2]
+        pts = torch.cat([pts, 0.5 * (pts + pts[:, [1, 3, 0, 2]])], 1)
+        e = torch.arange(env.B)[:, None].expand(-1, 8).reshape(-1)
+        worst = min(worst, float(env.procedural.clearance(pts.reshape(-1, 2), e).min()))
+    # one control step of motion may close a little of it before this is read
+    assert worst >= gap - 0.05, f"a car was placed {worst:.3f} m from a prop (gap {gap})"
 
 
 # ============================================================ 4. the obstacle has to cost something

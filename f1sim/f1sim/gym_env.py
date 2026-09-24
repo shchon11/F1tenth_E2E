@@ -370,6 +370,17 @@ class EnvConfig:
     #: A checkpoint trained under one and driven under the other is a different policy -- the console
     #: and the evaluation read the mode the run recorded.
     plan_kappa_mode: str = "absolute"
+    #: Speed feedforward between the plan tracker and the VESC. The VESC loop is first order
+    #: (`actuators.vesc_accel`: accel = (target - speed) / motor_tau), and the tracker commands the
+    #: speed it predicts 0.15 s ahead as if it were reached -- so the car accelerates in proportion
+    #: to how far that prediction leads: measured, 3 m/s^2 per 1 m/s of lead, and the command led by
+    #: under 0.5 m/s most of the time against the 2 m/s a 6.5 m/s^2 profile needs. On: the command
+    #: is the loop's inverse, predicted speed + calibrated motor time constant x planned acceleration. Off (the
+    #: default) is every run before 2026-09-24, bit for bit. Measured with the line teacher on ICCAS
+    #: (friction pinned): lap 7.34 s either way. The command follows the tracker's plan, and the
+    #: tracker itself plans only ~2.5 m/s^2 while its reference leads the car, so the lead it adds is
+    #: small; see docs/research/layout-line-teacher-2026-09-24.md.
+    tracker_speed_ff: bool = False
     plan_kappa_a_lat: float = 8.0    # [m/s^2] "feasible" only: the lateral budget it scales by
     compile_tracker: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
@@ -900,10 +911,15 @@ class F1VecEnv:
         if self.tracker_delay is None:
             self.tracker_delay = torch.zeros(self.B, device=self.device)
             self.tracker_cal = torch.zeros(self.B, 3, device=self.device)          # steer bias, steer gain, speed gain
+            self.tracker_motor_tau = torch.zeros(self.B, device=self.device)
         self.tracker_delay[ids] = (P["cmd_delay"][ids] + 0.5 * P["servo_tau"][ids] + u(0.02)).clamp(0.0, 0.2)
         self.tracker_cal[ids, 0] = P["steer_bias"][ids] + u(0.01)
         self.tracker_cal[ids, 1] = P["steer_gain"][ids] * (1 + u(0.04))
         self.tracker_cal[ids, 2] = P["speed_gain"][ids] * (1 + u(0.03))
+        # measured once like the rest, to +-10 %: `tracker_speed_ff` reads it. Drawn only when it is
+        # on -- a draw here moves the generator, and every spawn after it, for runs that never read it.
+        if self.ecfg.tracker_speed_ff:
+            self.tracker_motor_tau[ids] = P["motor_tau"][ids] * (1 + u(0.10))
 
     # ------------------------------------------------------------------ slots mode
     def _build_slot_tables(self):
@@ -1982,6 +1998,14 @@ class F1VecEnv:
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
             self._capture_plan(self.sim.state)
+            if self.ecfg.tracker_speed_ff:
+                # The inverse of the VESC's first-order loop, accel = (cmd - v) / tau: to get the
+                # acceleration the tracker planned, command the speed it will be at when the command
+                # lands (`last_pred` starts one latency ahead) plus tau times that acceleration.
+                v_ff = (self.tracker.last_pred[:, 0, 3]
+                        + self.tracker_motor_tau * self.tracker.u_seq[:, 0, 1]).clamp_min(0.0)
+                raw = torch.stack([raw[:, 0], torch.where(raw[:, 1] < 0, raw[:, 1],
+                                   torch.minimum(v_ff, self.speed_cap))], 1)
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)
