@@ -27,8 +27,11 @@ The copy is exact up to sensor noise: the same policy run in the real env and in
 agree to 1.2 mm (median) after 10 steps and ~3 cm after 40. The noise is not copied: the shadow
 draws its own, which is a feature -- a decision that only survives one noise draw is fragile.
 
-Cost is set by kernel launches, not by K or B: a shadow step of 896 rows is ~70 ms with the
-physics compiled, so a decision over 1.5 s is ~3 s, whatever the batch.
+Cost. On the empty track with one opponent kind, a shadow step of 896 rows is ~70 ms with the
+physics compiled, a decision over 1.5 s ~3 s. On the full training floor (18 props, four opponent
+kinds) the opponents' own planners are 80-90 % of it -- `interactive` alone adds 60 % -- and the
+cost grows with the rows: about 12-16 labels a second whatever the batch. `graphs=True` runs the
+shadow under the CUDA-graph runtime: 10.5 -> 7.1 s a decision at 32 envs, same fidelity.
 """
 from __future__ import annotations
 
@@ -109,21 +112,29 @@ def _tile_rows(obj, B: int, K: int) -> None:
 class ShadowEnv:
     """K copies of an env's races, refreshed from it on demand."""
 
-    def __init__(self, env, K: int, *, lidar_beams: Optional[int] = 36):
+    def __init__(self, env, K: int, *, lidar_beams: Optional[int] = 36, graphs: bool = False):
         from .gym_env import F1VecEnv
         self.env, self.K = env, int(K)
         cfg = copy.deepcopy(env.cfg)
+        ecfg = copy.deepcopy(env.ecfg)
         if lidar_beams:
             # Nothing the teacher or the opponents read comes from the scan.
             cfg.lidar.n_beams = int(lidar_beams)
-        self.S = F1VecEnv(env.sim.tracks, cfg, copy.deepcopy(env.ecfg), num_envs=self.K * env.B,
-                          device=str(env.device))
+        if graphs:
+            # The CUDA-graph runtime and torch.compile are alternatives (learn.graph_runtime).
+            cfg.sim.compile = False
+            ecfg.compile_tracker = False
+        self.S = F1VecEnv(env.sim.tracks, cfg, ecfg, num_envs=self.K * env.B, device=str(env.device))
+        self.graph = None
         if getattr(env, "teacher", None) is not None:
             t = copy.copy(env.teacher)
             _tile_rows(t, env.B, self.K)
             self.S.set_teacher(t)
         self.S.reset(seed=0)
         self.S.step(torch.zeros(self.S.B, self.S.act_dim, device=self.S.device))   # lazy state
+        if graphs and self.S.device.type == "cuda":
+            from .learn.graph_runtime import prepare_graph_runtime
+            self.graph = prepare_graph_runtime(self.S, log=lambda _t: None)
         self._paths = None
 
     def refresh(self) -> None:
@@ -157,7 +168,8 @@ class RolloutTeacher:
     def __init__(self, base: RacelineTeacher, env, *,
                  offsets: Sequence[float] = (-0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6),
                  speeds: Sequence[float] = (1.0, 0.8, 0.6, 0.35),
-                 horizon_s: float = 1.5, every: int = 10, lidar_beams: Optional[int] = 36):
+                 horizon_s: float = 1.5, every: int = 10, lidar_beams: Optional[int] = 36,
+                 graphs: bool = False):
         from .layout_line import LayoutLineTeacher
         if isinstance(base, RacelineTeacher) and float(getattr(env.ecfg, "procedural_obstacles", 0.0) or 0.0) > 0.0:
             # Props on the floor: the candidates are offsets from each env's own layout line.
@@ -179,7 +191,7 @@ class RolloutTeacher:
         self.H = max(1, int(round(horizon_s / env.sim.control_dt)))
         self.every = max(1, int(every))
         self.base = base
-        self.shadow = ShadowEnv(env, self.K, lidar_beams=lidar_beams)
+        self.shadow = ShadowEnv(env, self.K, lidar_beams=lidar_beams, graphs=graphs)
         self.base_S = copy.copy(base)
         _tile_rows(self.base_S, env.B, self.K)
         B = env.B
