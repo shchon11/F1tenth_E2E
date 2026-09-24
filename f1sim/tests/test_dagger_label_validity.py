@@ -130,3 +130,42 @@ def test_collection_copies_teacher_validity_for_primary_rows(monkeypatch):
     buf = dagger.collect(Env(), model, teacher, 1, 1.0, 'cpu', dagger.StepBuffer(1)).finalize()
     assert buf.V.tolist() == [[True, False]]
     assert buf.N.tolist() == [[True, True]]
+
+
+def test_a_conditional_student_is_handed_its_condition_when_it_drives(monkeypatch):
+    """Once beta < 1 the student is asked for an action every step. A dial student refuses to act
+    without its condition, and the collection loop had stopped passing it (merge 75fea37): a run
+    got through iteration 0, where only the teacher drives, and died at iteration 1."""
+    seen = []
+
+    class Env:
+        B, M = 4, 2
+        learner_ids = torch.tensor([0, 2])
+
+        def reset(self):
+            return None, {}
+
+        def teacher_label(self, obj, mu=None):
+            return torch.zeros(4, dagger.ACT_DIM)
+
+        def step(self, action):
+            return None, None, None, None, {}
+
+    class Model:
+        def initial_hidden(self, batch, device):
+            return None
+
+        def act(self, scan, pro, deterministic=True, c=None, h=None):
+            seen.append(c)
+            if c is None:
+                raise ValueError("conditional actor called without its condition")
+            return torch.zeros(4, dagger.ACT_DIM), None, h
+
+    monkeypatch.setattr(dagger, 'flatten_obs', lambda obs: (torch.zeros(4, 1, 5), torch.zeros(4, 1)))
+    runtime = SimpleNamespace(scan=None, observe=lambda scan, pro: scan, reset=lambda done: None, hidden=None)
+    monkeypatch.setattr(dagger, 'runtime_for', lambda *args: runtime)
+    monkeypatch.setattr(dagger, 'friction_target', lambda env: torch.zeros(4))
+    monkeypatch.setattr(dagger, 'opponent_target', lambda env: torch.zeros(4, 1))
+    dagger.collect(Env(), Model(), SimpleNamespace(last_label_valid=None), 2, 0.5, 'cpu', dagger.StepBuffer(1),
+                   cond_fn=lambda: torch.ones(4, 1))
+    assert seen and all(c is not None for c in seen)

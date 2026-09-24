@@ -389,7 +389,8 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
             mu_t, opp_t = friction_target(env), opponent_target(env)
             student = None
             if beta < 1.0 or need_gap:
-                student, _lp, rt.hidden = model.act(seen, pro, deterministic=True, h=rt.hidden)
+                # c: the fourth thing the merge 75fea37 lost -- a dial student refuses to act without it
+                student, _lp, rt.hidden = model.act(seen, pro, deterministic=True, c=c, h=rt.hidden)
             gap = None if student is None else (student - label).abs().mean(1)
             buf.add(scan[ids, 0], pro[ids], label[ids], new_ep[ids],
                     None if gap is None else gap[ids], None if mem is None else mem[ids],
@@ -686,6 +687,9 @@ def main():
                          "iteration trains on its own data alone. Declare that wherever the run is reported.")
     ap.add_argument("--log-every", type=int, default=25, help="training steps between W&B loss rows (was 200)")
     ap.add_argument("--eval-steps", type=int, default=800)
+    ap.add_argument("--teacher-eval-steps", type=int, default=None, metavar="N",
+                    help="steps of the one-off teacher measurement (default --eval-steps; 0 skips it). The "
+                         "rollout teacher took 1.8 h for 800 steps at 256 envs, which a resumed run need not repeat")
     ap.add_argument("--eval-every", type=int, default=1,
                     help="evaluate every Nth iteration (the last one always). 1 = every "
                          "iteration, the old behaviour. The evaluation is a diagnostic and "
@@ -914,9 +918,12 @@ def main():
                                            a.eval_steps, a.speed_cap, per_track=True)
             m_iter = it
         t_ev = tm.lap()
+        if teacher_metrics is None and a.teacher_eval_steps == 0:
+            teacher_metrics = {}                        # measured already (a resumed run)
         if teacher_metrics is None:
             with rng_island(env):
-                teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher), a.eval_steps,
+                teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher),
+                                                         a.eval_steps if a.teacher_eval_steps is None else a.teacher_eval_steps,
                                                          a.speed_cap, per_track=True)
         t_teach = tm.lap()
         scalar = lambda d: {k: v for k, v in d.items() if not isinstance(v, list)}      # per-track arrays stay out of W&B
