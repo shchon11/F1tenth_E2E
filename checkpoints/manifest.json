@@ -17,5 +17,27 @@
    "opt_param_names"
   ],
   "source_mb": 26.5
+ },
+ {
+  "file": "iccas_specialist_s915_u768.pt",
+  "run": "spec_korea_contact_s915",
+  "sha256": "1b129e4020245bf88d3903cbb14016f6fc847b18c3fe07f7b3ef11504e2d3ca2",
+  "size_mb": 9.1,
+  "dropped": [
+   "opt",
+   "opt_param_names"
+  ],
+  "source_mb": 26.5
+ },
+ {
+  "file": "iccas_specialist_s915_u1152.pt",
+  "run": "spec_korea_contact_s915",
+  "sha256": "906dd38ce5fd98f81597d84dd1abde9695ec195fd16d0addbd3eefbf2cc4e246",
+  "size_mb": 9.1,
+  "dropped": [
+   "opt",
+   "opt_param_names"
+  ],
+  "source_mb": 26.5
  }
 ]

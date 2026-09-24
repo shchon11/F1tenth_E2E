@@ -63,3 +63,41 @@ runs (`ppo_dial_s901`, with and without the grip budget) were 1–2 % quicker th
 started from and no safer, so the student is the generalist of record; and `spec_map12_revised` /
 `spec_map12_fastsafe_nobudget` are the same specialisation with the grip budget off — quicker again
 (6.97 / 7.15 s) at four times the collision rate.
+
+## ICCAS specialists (added 2026-09-24)
+
+The two best policies of the `spec_korea_contact` line on `real:korea_2025_iccas`, trained against
+procedural obstacles (up to 18 props) and slot opponents (`forzaeth`, `forzaeth_pred`, `lane_switch`,
+`interactive`, speed 0.7–1.0 of their own profile). Same run, two updates; Adam moments dropped as
+above, and both re-measured after stripping to the same lap, collision rate and mean speed as the
+run's own file.
+
+| file | what it is | sha256 (first 16) |
+| --- | --- | --- |
+| `iccas_specialist_s915_u768.pt` | `spec_korea_contact_s915`, update 768 — the reference policy of the 09-23/24 work | `1b129e4020245bf8` |
+| `iccas_specialist_s915_u1152.pt` | the same run, update 1152 — statistically tied with u768 | `906dd38ce5fd98f8` |
+
+Static contacts (walls and props) per km, pooled over five obstacle scenarios and two evaluation
+seeds (77, 78), from `~/f1sim_runs/_eval/mintime-teacher-2026-09-19/eval_center{,78}/`:
+
+| | contacts / km | per seed | lap, props | lap, empty |
+| --- | ---: | ---: | ---: | ---: |
+| `iccas_specialist_s915_u768` | 5.32 (275 / 52 km) | 5.86 / 4.80 | 8.42 s | 7.98 s |
+| `iccas_specialist_s915_u1152` | 5.18 (266 / 51 km) | 5.02 / 5.33 | 8.39 s | 7.88 s |
+| every other checkpoint measured the same way (s912–s915, 7 of them) | 6.20–8.25 | | | |
+
+Read these with two caveats. They were taken with the grip dial **0.30 above** the true friction,
+which is outside the range the policy was trained on (`dial = mu - U(0, 0.30)`); at the reference
+setting, dial 0.0, u768 laps the empty track in 7.86 / 7.96 s (seeds 77 / 78) and, under the
+2026-09-24 spawn rules, touches props 5.03 times per km. And the car-contact column those tables
+also carry is left out on purpose: before 2026-09-24 the traffic meter counted every *step* of a
+soft contact rather than its onset, so it measured contact time, not contacts.
+
+Both are dial-conditioned like the others:
+
+```bash
+python3 -m f1sim.learn.evaluate checkpoints/iccas_specialist_s915_u768.pt --action-mode plan \
+    --tracks real:korea_2025_iccas --race-size 2 --opp-slots '[{"kind":"forzaeth"}]' \
+    --teacher-a-lat 7.0 --teacher-a-acc 6.5 --teacher-a-brake 4.0 --raceline-objective min_time \
+    --collision-mode soft --dial-offset 0.0
+```
