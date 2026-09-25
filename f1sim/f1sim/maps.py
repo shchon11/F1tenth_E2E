@@ -171,8 +171,15 @@ def load(name: str, **kw) -> Track:
 def _raceline_obstacles(track: Track, seed: int, n: Optional[int] = None, **kw) -> Track:
     """Boxes standing on the *raceline*, so the fast line is blocked and the car has to plan around
     them. `+obs` hugs the wall and leaves the line clear; `+rlobs` does not."""
-    from .raceline import Raceline
-    rl = Raceline.build_cached(track)
+    from .raceline import Raceline, RacelineCacheMiss
+    # The line only says where the fast line runs, so the boxes can block it; nobody drives it. A
+    # cached minimum-time line is used as before, and on a miss the minimum-curvature line (1.3 s)
+    # instead of the lap-time solver (20-70 min a track): the train split's cache stopped matching
+    # after the 09-20 merge, and loading it rebuilt ~120 of these one hour at a time.
+    try:
+        rl = Raceline.build_cached(track, cache_only=True)
+    except RacelineCacheMiss:
+        rl = Raceline.build_cached(track, objective="min_curvature")
     line = rl.xy
     kw.setdefault("speeds", rl.v)                    # the profile decides the reaction time a box creates
     if n is None:
