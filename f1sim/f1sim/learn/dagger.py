@@ -919,7 +919,10 @@ def main():
             m_iter = it
         t_ev = tm.lap()
         if teacher_metrics is None and a.teacher_eval_steps == 0:
-            teacher_metrics = {}                        # measured already (a resumed run)
+            # measured already (a resumed run): the fields every record below reads, not measured
+            nan = float("nan")
+            teacher_metrics = {"collisions_per_km": nan, "collisions_per_km_worst": nan,
+                               "progress_rate_mps": nan, "lap_time_s": nan, "skipped": True}
         if teacher_metrics is None:
             with rng_island(env):
                 teacher_metrics = common.rollout_metrics(env, lambda o: env.teacher_label(teacher),
