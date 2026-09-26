@@ -760,10 +760,16 @@ def main():
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
     if unknown:
         raise SystemExit(f"--scan-channels {unknown}: known channels are {', '.join(SCAN_CHANNELS)}")
-    if a.memory != "off" and a.cond != "none":
-        raise SystemExit("--memory with --cond is not a supported combination: both migrate the "
-                         "same checkpoint through a different loader, and nothing has measured the "
-                         "two zero-initialised projections together.")
+    init_is_conditional = bool(a.init) and int(torch.load(a.init, map_location="cpu", weights_only=False)
+                                                ["meta"].get("cond_dim", 0)) > 0
+    if a.memory != "off" and a.cond != "none" and not init_is_conditional:
+        # Both would be migrated at once: the conditioning projection and the GRU's output projection,
+        # two zero-initialised additions nothing has measured together. A checkpoint that is already
+        # conditional (a dial student or specialist) only gains the memory, which load_for_memory
+        # adds bit-identically; that case is allowed below.
+        raise SystemExit("--memory with --cond is not a supported combination unless --init is already "
+                         "conditional: both migrate the same checkpoint through a different loader, and "
+                         "nothing has measured the two zero-initialised projections together.")
     if (a.memory != "off" or a.scan_channels) and a.controller != "legacy" and not adaptive:
         raise SystemExit(
             f"--memory/--scan-channels with --controller {a.controller} is not a validated "
@@ -1122,6 +1128,7 @@ def main():
             # what a warm start produces and main's behaviour is the unseeded one.
             init_seed=(a.seed if a.name_seed_fresh else None),
             allow_controller=allow_controller_init,
+            allow_conditional=bool(cond_dim) and init_is_conditional,
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
@@ -1133,6 +1140,11 @@ def main():
         a.scan_deltas = bool(model.meta.get("scan_deltas", False))
         a.temporal_encoder = str(model.meta.get("temporal_encoder", "cnn"))
         a.scan_stem = str(model.meta.get("scan_stem", "plain"))
+        if cond_dim and init_is_conditional:
+            src = (model.meta.get("cond") or {}).get("source")
+            if src != a.cond:
+                raise SystemExit(f"--init was trained as a '{src}' conditional checkpoint; this run is --cond {a.cond}")
+            init_conditional = True
     elif a.init and cond_dim and int(torch.load(a.init, map_location="cpu")["meta"].get("cond_dim", 0)):
         # The checkpoint is already conditional (a dial student out of DAgger): it arrives obeying its
         # input, and that obedience is what the KL leash below holds on to. Nothing is migrated.

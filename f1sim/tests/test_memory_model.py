@@ -227,3 +227,33 @@ def test_channels_without_memory_are_a_legitimate_arm(tmp_path):
     assert torch.equal(a0, a1) and torch.equal(v0, v1)
     with pytest.raises(ValueError, match="extra steps"):
         load_for_memory(path, "cpu", None, None)
+
+
+def test_a_conditional_checkpoint_takes_memory_bit_identically():
+    """A dial student or specialist is already conditional, so adding a GRU migrates one thing, not
+    two: with the memory's projection zero, its action equals the original's for any dial value.
+    This is what lets `learn.ppo --memory gru --cond dial` start from such a checkpoint."""
+    import os
+    from f1sim.learn import conditioning as cond_mod
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "iccas_specialist_s915_u768.pt")
+    if not os.path.exists(path):
+        pytest.skip("archived checkpoint not present")
+    torch.set_num_threads(1)
+    base, _ = load_checkpoint(path, "cpu", allow_conditional=True)
+    mem, _extra, fresh = load_for_memory(path, "cpu", memory_spec(hidden_size=128), allow_conditional=True,
+                                         future_head={"k": 20, "width": 64})
+    base.eval(); mem.eval()
+    assert fresh and all(".memory." in f or f.startswith("actor.future.") for f in fresh), fresh
+    assert int(mem.meta.get("cond_dim", 0)) == 1 and mem.meta["cond"] == base.meta["cond"]
+    meta = base.meta
+    g = torch.Generator().manual_seed(3)
+    scan = torch.rand(4, meta["n_stack"], meta["n_beams"], generator=g)
+    pro = torch.rand(4, meta["proprio_dim"], generator=g) * 2 - 1
+    spec = cond_mod.CondSpec.from_meta(meta["cond"])
+    for mu in (0.6, 1.05):
+        c = cond_mod.mu_to_c(torch.full((4,), mu), spec)
+        with torch.no_grad():
+            a0, _, _ = base.act(scan, pro, deterministic=True, c=c)
+            a1, _, h1 = mem.act(scan, pro, deterministic=True, c=c, h=None)
+            a2, _, _ = mem.act(scan, pro, deterministic=True, c=c, h=h1)
+        assert torch.equal(a0, a1) and torch.equal(a0, a2), (a0 - a1).abs().max()
