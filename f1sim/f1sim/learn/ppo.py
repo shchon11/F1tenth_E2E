@@ -720,6 +720,11 @@ def main():
                          "own rows (the interactive opponent was half a graphed step planning all of "
                          "them). 'redraw': uniformly at every race reset, as the console does and as "
                          "spec_korea_contact_s911/s912 were trained")
+    ap.add_argument("--replay-contacts", type=float, default=0.0, metavar="P",
+                    help="probability that a whole-race reset starts from a scene recorded "
+                         "--replay-lag seconds before one of the learner's car contacts (two-car races; "
+                         "GT Sophy's 'mistake learning'). 0 = off, byte-identical to a run without it")
+    ap.add_argument("--replay-lag", type=float, default=0.75, metavar="S")
     ap.add_argument("--movable-obstacles", action="store_true",
                     help="a struck obstacle is shoved instead of being a wall with a crate's "
                          "shape: each carries the mass of what it is (cardboard box 1.2 kg, "
@@ -904,6 +909,8 @@ def main():
                                                               stagger_first_episode=a.collision_mode == "soft",
                                                               kind_mix_assign=a.kind_mix_assign,
                                                               movable_obstacles=a.movable_obstacles,
+                                                              replay_contacts=a.replay_contacts,
+                                                              replay_lag_s=a.replay_lag,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,

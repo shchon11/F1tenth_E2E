@@ -158,6 +158,13 @@ class EnvConfig:
     # per step against +0.15 for the other 40). Under `terminate` the crashes spread the resets out
     # by themselves. Training only: an evaluation that starts every car at once wants full episodes.
     stagger_first_episode: bool = False
+    #: Probability that a whole-race reset starts from a scene recorded `replay_lag_s` before one of
+    #: the learner's car contacts, instead of the grid (two-car races only). GT Sophy's "mistake
+    #: learning": the moments the policy gets wrong are rare in a rollout, and restarting just before
+    #: them is the cheapest way to make them common. 0 builds nothing: every run before 2026-09-27.
+    replay_contacts: float = 0.0
+    replay_lag_s: float = 0.75
+    replay_bank: int = 1024
     # How a `kind_mix` slot picks its driver. "redraw": uniformly at every race's reset, so one race
     # meets every kind over time -- what the console shows. "partition": once, by race number
     # (race g drives `kind_mix[g % len]`), fixed for the life of the env -- what training wants: the
@@ -574,6 +581,79 @@ def _interp_path(xy: torch.Tensor, grid: torch.Tensor, t: torch.Tensor) -> torch
     return xy[:, i0] * (1 - w) + xy[:, (i0 + 1).clamp(max=n - 1)] * w
 
 
+class _ContactReplay:
+    """Records two-car scenes shortly before the learner's car contacts and hands them back as
+    spawn poses (see `EnvConfig.replay_contacts`). Poses and speeds only: a replayed race starts
+    with fresh planner memory, a fresh opponent speed draw and the layout of its own reset, so what
+    it repeats is the geometry of the moment, not the moment."""
+
+    def __init__(self, B: int, e, dt: float, device):
+        self.lag = max(1, int(round(e.replay_lag_s / dt)))
+        self.D = self.lag + 1
+        self.hist = torch.zeros(self.D, B, 4, device=device)          # x, y, yaw, speed per step
+        self.ptr = 0
+        self.filled = torch.zeros(B, dtype=torch.long, device=device)  # steps recorded since the car's reset
+        self.prev = torch.zeros(B, dtype=torch.bool, device=device)
+        C = int(e.replay_bank)
+        self.bank = torch.zeros(C, 10, device=device)                 # tid, kind, learner x y yaw v, opp x y yaw v
+        self.n = 0; self.head = 0; self.C = C
+        self.p = float(e.replay_contacts)
+        self.recorded = 0; self.replayed = 0
+
+    def record(self, env, car_hit: torch.Tensor) -> None:
+        st = env.sim.state
+        self.hist[self.ptr] = torch.stack([st[:, 0], st[:, 1], st[:, 2], st[:, 3]], 1)
+        self.ptr = (self.ptr + 1) % self.D
+        fresh = env.ep_step <= 1
+        self.filled = torch.where(fresh, torch.zeros_like(self.filled), self.filled + 1)
+        onset = car_hit & ~self.prev & env.learner & (self.filled > self.lag)
+        self.prev = car_hit.clone()
+        rows = onset.nonzero().flatten()
+        if rows.numel() == 0:                                         # host sync only on the rare step
+            return
+        old = self.hist[(self.ptr - 1 - self.lag) % self.D]           # the scene `lag` steps back
+        j = env.sim.other_idx[rows, 0]
+        kinds = getattr(env, "slot_kind_code", None)                  # slot mode only; one kind otherwise
+        kind = kinds[j, None].float() if kinds is not None else torch.zeros_like(rows[:, None], dtype=torch.float)
+        e = torch.cat([env.sim.tid[rows, None].float(), kind, old[rows], old[j]], 1)
+        for k in range(e.shape[0]):
+            self.bank[self.head] = e[k]; self.head = (self.head + 1) % self.C; self.n = min(self.n + 1, self.C)
+        self.recorded += int(e.shape[0])
+
+    def apply(self, env, ids, poses, speed, gen):
+        """Replace the grid poses of whole-race resets, with probability p per race."""
+        if self.n == 0:
+            return poses, speed
+        in_ids = torch.zeros(env.B, dtype=torch.bool, device=env.device); in_ids[ids] = True
+        full = in_ids.view(-1, 2).all(1)
+        learner_pos = ((env.slot[ids] == 0) & full[env.race[ids]]).nonzero().flatten()
+        if learner_pos.numel() == 0:
+            return poses, speed
+        pick = torch.rand(learner_pos.numel(), device=env.device, generator=gen) < self.p
+        learner_pos = learner_pos[pick]
+        if learner_pos.numel() == 0:
+            return poses, speed
+        poses, speed = poses.clone(), speed.clone()
+        bank = self.bank[:self.n]
+        for q in learner_pos.tolist():
+            row = int(ids[q]); j = int(env.sim.other_idx[row, 0])
+            qo = int((ids == j).nonzero().flatten()[0])
+            kinds = getattr(env, "slot_kind_code", None)
+            ok = (bank[:, 0] == float(env.sim.tid[row])) & (bank[:, 1] == (float(kinds[j]) if kinds is not None else 0.0))
+            cand = ok.nonzero().flatten()
+            if cand.numel() == 0:
+                continue
+            b = bank[cand[torch.randint(cand.numel(), (1,), device=env.device, generator=gen)]][0]
+            pl, po = b[2:5][None], b[6:9][None]
+            tid = env.sim.tid[[row, j]]
+            if bool(env.sim._spawn_in_prop(torch.cat([pl, po]), tid, torch.tensor([row, j], device=env.device)).any()):
+                continue                                              # the new layout stands where the scene was
+            poses[q], poses[qo] = b[2:5], b[6:9]
+            speed[q], speed[qo] = b[5], b[9]
+            self.replayed += 1
+        return poses, speed
+
+
 class F1VecEnv:
     def __init__(self, track, cfg: Optional[Config] = None, env_cfg: Optional[EnvConfig] = None,
                  num_envs: int = 1024, device: Optional[str] = None):
@@ -790,6 +870,11 @@ class F1VecEnv:
         self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
         #: Whether each car was in contact last step, so a soft collision is charged on its onset.
         self._was_touching = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self._replay = None
+        if self.ecfg.replay_contacts > 0:
+            if self.M != 2:
+                raise ValueError("replay_contacts replays a two-car scene; race_size must be 2")
+            self._replay = _ContactReplay(self.B, self.ecfg, 1.0 / self.cfg.sim.control_rate, self.device)
         self._math = self._step_math
         if self.device.type == "cuda" and self.cfg.sim.compile_mode == "reduce-overhead":
             compiled = torch.compile(self._step_math, dynamic=False, mode="reduce-overhead")
@@ -1641,6 +1726,8 @@ class F1VecEnv:
         poses = self.sim.sample_spawn(n, e.spawn_lateral_std, yaw_std, s=s, tid=self.sim.tid[ids],
                                       min_clearance=min_clear, lat=lat, eid=ids)
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
+        if self._replay is not None and self.M == 2:
+            poses, speed = self._replay.apply(self, ids, poses, speed, gen)
         self.sim.reset(ids, poses, speed)
         self.sim.odom.state[ids, 3] = speed
         self.prev_action[ids] = 0.0
@@ -2047,6 +2134,8 @@ class F1VecEnv:
         plan_ref = self.tracker.last_ref if self.tracker is not None and e.reward_plan_clearance > 0 else self._no_plan
         car_hit = (r.car_collision.float() if r.car_collision is not None
                    else torch.zeros_like(self.ep_return))
+        if self._replay is not None:
+            self._replay.record(self, car_hit > 0)
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap,
                          plan_ref, self.lap_start_step, car_hit, self.gap_prev, self.gap_valid,
