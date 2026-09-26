@@ -618,7 +618,10 @@ class _ContactReplay:
         e = torch.cat([env.sim.tid[rows, None].float(), kind, old[rows], old[j]], 1)
         for k in range(e.shape[0]):
             self.bank[self.head] = e[k]; self.head = (self.head + 1) % self.C; self.n = min(self.n + 1, self.C)
+        before = self.recorded
         self.recorded += int(e.shape[0])
+        if self.recorded // 50 != before // 50:              # a trace that the arm is doing anything at all
+            print(f"[replay] {self.recorded} scenes recorded, {self.replayed} races started from one", flush=True)
 
     def apply(self, env, ids, poses, speed, gen):
         """Replace the grid poses of whole-race resets, with probability p per race."""
