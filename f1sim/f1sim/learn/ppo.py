@@ -726,6 +726,10 @@ def main():
     ap.add_argument("--merge-penalty", type=float, default=0.0, metavar="W",
                     help="charge W per metre of the learner's own lateral motion toward a car level with "
                          "it or just behind, within 1 m sideways (cutting back in after a pass). 0 = off")
+    ap.add_argument("--progress-gate", type=float, default=0.0, metavar="ON",
+                    help="1 = multiply the progress reward by a safety factor in [--gate-min, 1] that falls "
+                         "as the body gap to another car shrinks below 0.3 m + closing speed x 0.5 s. 0 = off")
+    ap.add_argument("--gate-min", type=float, default=0.3)
     ap.add_argument("--replay-contacts", type=float, default=0.0, metavar="P",
                     help="probability that a whole-race reset starts from a scene recorded "
                          "--replay-lag seconds before one of the learner's car contacts (two-car races; "
@@ -918,6 +922,8 @@ def main():
                                                               replay_contacts=a.replay_contacts,
                                                               reward_rear_end=a.rear_end_penalty,
                                                               reward_merge=a.merge_penalty,
+                                                              reward_progress_gate=a.progress_gate,
+                                                              gate_min=a.gate_min,
                                                               replay_lag_s=a.replay_lag,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,

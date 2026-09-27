@@ -78,3 +78,27 @@ def test_off_leaves_the_components_at_zero():
     _, _, _, _, info = env.step(a)
     rc = info["reward_components"]
     assert float(rc["rear_end"].abs().sum()) == 0.0 and float(rc["merge"].abs().sum()) == 0.0
+
+
+def test_the_progress_gate_is_one_in_the_clear_and_shrinks_running_up_on_a_car():
+    env = _env(reward_progress_gate=1.0)
+    _place(env, 20.0, 30.0, v_me=4.0, v_op=4.0)           # 10 m apart: nothing to fear
+    assert float(env.progress_gate(env.sim.state)[0]) == 1.0
+    _place(env, 20.0, 20.9, v_me=4.0, v_op=1.0)           # 0.9 m centre to centre, closing at 3 m/s
+    g = float(env.progress_gate(env.sim.state)[0])
+    assert env.ecfg.gate_min <= g < 0.8, g
+    _place(env, 20.9, 20.0, v_me=1.0, v_op=4.0)           # the same, but it is behind me running up
+    assert float(env.progress_gate(env.sim.state)[0]) == 1.0
+
+
+def test_the_gate_scales_only_positive_progress_and_off_is_the_old_reward():
+    env = _env(reward_progress_gate=1.0)
+    _place(env, 20.0, 20.9, v_me=4.0, v_op=1.0)
+    a = torch.zeros(env.B, env.act_dim); a[:, -2:] = 4.0 / env.ecfg.v_max_policy * 2 - 1
+    _, _, _, _, info = env.step(a)
+    pg = float(info["reward_components"]["progress"][0])
+    env0 = _env()
+    _place(env0, 20.0, 20.9, v_me=4.0, v_op=1.0)
+    _, _, _, _, info0 = env0.step(a)
+    p0 = float(info0["reward_components"]["progress"][0])
+    assert p0 > 0 and 0 < pg < p0

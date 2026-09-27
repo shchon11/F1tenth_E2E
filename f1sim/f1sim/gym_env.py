@@ -171,6 +171,17 @@ class EnvConfig:
     #: it sees and remembers. 0 = off: every run before 2026-09-27.
     reward_rear_end: float = 0.0
     reward_merge: float = 0.0
+    #: Multiplicative safety on the progress reward (robotics practice; the F1TENTH overtaking RL of 2025
+    #: scales progress by (1 - proximity) the same way): progress x g, g = 1 - (1 - gate_min) x danger,
+    #: danger rising linearly from 0 at a body gap of gate_gap + closing x gate_tau to 1 at contact,
+    #: closing measured along the line of sight -- so running up on a car ahead and sliding into one
+    #: alongside both shrink it. Summed penalties let the policy trade one failure for another (merge
+    #: penalty x3: cut-backs 25 -> 16, rear-ends 10 -> 17); a product leaves nothing to trade.
+    #: 0 = off: every run before 2026-09-27.
+    reward_progress_gate: float = 0.0          # 1.0 = on (a flag with room for a strength)
+    gate_min: float = 0.3
+    gate_gap: float = 0.3
+    gate_tau: float = 0.5
     replay_contacts: float = 0.0
     replay_lag_s: float = 0.75
     replay_bank: int = 1024
@@ -2043,6 +2054,18 @@ class F1VecEnv:
         trigger = e.opp_follow_gap + closing * closing / (2.0 * e.opp_follow_decel)     # room to brake in
         return gap < trigger, (v_ahead * e.opp_follow_ratio).clamp_min(0.5)
 
+    def progress_gate(self, state: torch.Tensor) -> torch.Tensor:
+        """(B,) in [gate_min, 1]: 1 when every other car is beyond its closing-speed-dependent safe
+        gap, falling linearly to gate_min at body contact. See `EnvConfig.reward_progress_gate`."""
+        e = self.ecfg
+        gap, closing = self.car_gap_closing(state)                        # (B, C) body gap, closing speed
+        safe = e.gate_gap + closing.clamp_min(0.0) * e.gate_tau
+        danger = ((safe - gap) / safe.clamp_min(1e-3)).clamp(0.0, 1.0)
+        # a car clearly behind (more than a car length) closing on me is its business, not mine
+        behind = self.signed_gaps(self.sim.s, self.sim.tid) < -0.6
+        danger = torch.where(behind, torch.zeros_like(danger), danger).amax(1)
+        return 1.0 - (1.0 - e.gate_min) * danger
+
     def _interaction_penalties(self, state: torch.Tensor, car_hit: torch.Tensor):
         """(rear-end penalty, merge penalty), (B,) each, <= 0. See `EnvConfig.reward_rear_end`."""
         e = self.ecfg
@@ -2209,6 +2232,14 @@ class F1VecEnv:
             pen = -e.reward_grip_budget * over * over * self.sim.control_dt
             reward += pen
             reward_components[:, REWARD_COMPONENT_KEYS.index("grip_budget")] = pen
+        if e.reward_progress_gate > 0 and self.sim.other_idx is not None:
+            g = self.progress_gate(r.state)
+            ip = REWARD_COMPONENT_KEYS.index("progress")
+            pc = reward_components[:, ip]
+            # only positive progress is gated: a car going backwards keeps its full cost
+            gated = torch.where(pc > 0, pc * g, pc)
+            reward += gated - pc
+            reward_components[:, ip] = gated
         if (e.reward_rear_end > 0 or e.reward_merge > 0) and self.sim.other_idx is not None:
             pen_r, pen_m = self._interaction_penalties(r.state, car_hit > 0)
             reward += pen_r + pen_m
