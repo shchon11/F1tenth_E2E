@@ -720,6 +720,12 @@ def main():
                          "own rows (the interactive opponent was half a graphed step planning all of "
                          "them). 'redraw': uniformly at every race reset, as the console does and as "
                          "spec_korea_contact_s911/s912 were trained")
+    ap.add_argument("--rear-end-penalty", type=float, default=0.0, metavar="W",
+                    help="charge the onset of a contact with a car ahead W x (relative speed)^2 "
+                         "(GT Sophy's rear-end term). 0 = off")
+    ap.add_argument("--merge-penalty", type=float, default=0.0, metavar="W",
+                    help="charge W per metre of the learner's own lateral motion toward a car level with "
+                         "it or just behind, within 1 m sideways (cutting back in after a pass). 0 = off")
     ap.add_argument("--replay-contacts", type=float, default=0.0, metavar="P",
                     help="probability that a whole-race reset starts from a scene recorded "
                          "--replay-lag seconds before one of the learner's car contacts (two-car races; "
@@ -910,6 +916,8 @@ def main():
                                                               kind_mix_assign=a.kind_mix_assign,
                                                               movable_obstacles=a.movable_obstacles,
                                                               replay_contacts=a.replay_contacts,
+                                                              reward_rear_end=a.rear_end_penalty,
+                                                              reward_merge=a.merge_penalty,
                                                               replay_lag_s=a.replay_lag,
                                                               compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
                           cfg=sim_cfg,

@@ -38,7 +38,7 @@ from .track import Track
 REWARD_COMPONENT_KEYS = ("progress", "collision", "collision_speed", "steer_rate", "proximity",
                          "plan_clearance", "wrong_way", "lap", "alive", "car_contact", "overtake",
                          "lap_time", "car_proximity", "sideslip", "ttc", "overtake_hold",
-                         "grip_budget")
+                         "grip_budget", "rear_end", "merge")
 
 #: [s] the time to contact reported for a pair of cars that is not closing. Finite rather than an
 #: infinity so the penalty stays NaN-free under `torch.compile`; far past any `ttc_safe` anyone
@@ -162,6 +162,15 @@ class EnvConfig:
     #: the learner's car contacts, instead of the grid (two-car races only). GT Sophy's "mistake
     #: learning": the moments the policy gets wrong are rare in a rollout, and restarting just before
     #: them is the cheapest way to make them common. 0 builds nothing: every run before 2026-09-27.
+    #: The two ways the learner makes most of its car contacts (docs/research, 2026-09-27: 25 % rear-ending
+    #: a car its own plan runs through, 34 % cutting back in right after a pass, mostly onto a car in the
+    #: LiDAR's rear blind zone). `reward_rear_end` charges the onset of a contact with a car ahead by the
+    #: squared relative speed (GT Sophy's rear-end term); `reward_merge` charges, per metre, the learner's
+    #: own lateral motion toward a car that is level with it or just behind while the two are within a
+    #: metre sideways. Both read the simulator's truth; the policy has to learn to satisfy them from what
+    #: it sees and remembers. 0 = off: every run before 2026-09-27.
+    reward_rear_end: float = 0.0
+    reward_merge: float = 0.0
     replay_contacts: float = 0.0
     replay_lag_s: float = 0.75
     replay_bank: int = 1024
@@ -2034,6 +2043,33 @@ class F1VecEnv:
         trigger = e.opp_follow_gap + closing * closing / (2.0 * e.opp_follow_decel)     # room to brake in
         return gap < trigger, (v_ahead * e.opp_follow_ratio).clamp_min(0.5)
 
+    def _interaction_penalties(self, state: torch.Tensor, car_hit: torch.Tensor):
+        """(rear-end penalty, merge penalty), (B,) each, <= 0. See `EnvConfig.reward_rear_end`."""
+        e = self.ecfg
+        j = self.sim.other_idx[:, 0]
+        c, s_ = torch.cos(state[:, 2]), torch.sin(state[:, 2])
+        vw = torch.stack([state[:, 3] * c - state[:, 4] * s_, state[:, 3] * s_ + state[:, 4] * c], 1)
+        pen_r = torch.zeros_like(state[:, 0]); pen_m = torch.zeros_like(state[:, 0])
+        if e.reward_rear_end > 0:
+            prev = getattr(self, "_rear_prev", None)
+            if prev is None:
+                prev = self._rear_prev = torch.zeros_like(car_hit)
+            gap = self.signed_gaps(self.sim.s, self.sim.tid)[:, 0]
+            onset = car_hit & ~prev & (gap > 0.3)                        # the other car is ahead of me
+            dv2 = (vw - vw[j]).square().sum(1)
+            pen_r = torch.where(onset, -e.reward_rear_end * dv2, pen_r)
+            self._rear_prev = car_hit.clone()
+        if e.reward_merge > 0:
+            co, so = torch.cos(state[j, 2]), torch.sin(state[j, 2])
+            d = state[:, :2] - state[j, :2]                              # me relative to it
+            along = d[:, 0] * co + d[:, 1] * so                          # + : I am ahead of it
+            side = -d[:, 0] * so + d[:, 1] * co                          # + : I am on its left
+            v_side = -vw[:, 0] * so + vw[:, 1] * co                      # my own lateral velocity in its frame
+            toward = (-torch.sign(side) * v_side).clamp_min(0.0)
+            near = (along > -0.3) & (along < 1.2) & (side.abs() < 1.0)
+            pen_m = torch.where(near & self.learner, -e.reward_merge * toward * self.sim.control_dt, pen_m)
+        return pen_r, pen_m
+
     def car_contact_charge(self, s: torch.Tensor, tid: torch.Tensor, car_hit: torch.Tensor) -> torch.Tensor:
         """The contact penalty falls on the car behind. The one in front was driven into; charging it
         would teach that completing a pass is dangerous, which is the opposite of the lesson."""
@@ -2173,6 +2209,11 @@ class F1VecEnv:
             pen = -e.reward_grip_budget * over * over * self.sim.control_dt
             reward += pen
             reward_components[:, REWARD_COMPONENT_KEYS.index("grip_budget")] = pen
+        if (e.reward_rear_end > 0 or e.reward_merge > 0) and self.sim.other_idx is not None:
+            pen_r, pen_m = self._interaction_penalties(r.state, car_hit > 0)
+            reward += pen_r + pen_m
+            reward_components[:, REWARD_COMPONENT_KEYS.index("rear_end")] = pen_r
+            reward_components[:, REWARD_COMPONENT_KEYS.index("merge")] = pen_m
         self.prev_lap = r.lap.clone()
         info = {"priv": self._priv(r), "progress": r.progress, "lap": r.lap, "wall_dist": r.wall_dist,
                 # a snapshot, like track_id below: _reset_envs re-draws the roles in place further
@@ -2370,6 +2411,8 @@ class F1VecEnv:
             torch.zeros_like(progress),          # overtake_hold: filled in below, once the new gaps
                                                  # and the episode boundaries of this step are known
             torch.zeros_like(progress),          # grip_budget: filled in by step(), from a tensor the trainer owns
+            torch.zeros_like(progress),          # rear_end: filled in by step() (`_interaction_penalties`)
+            torch.zeros_like(progress),          # merge: likewise
         ], 1)
         act_hist = torch.cat([a[:, None, :], act_hist[:, :-1]], 1)
         # Under "soft" a contact is a cost, not an ending: the simulator has already pushed the car
