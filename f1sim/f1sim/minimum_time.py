@@ -272,7 +272,11 @@ class _Problem:
             violation = float(max(0., -self.evaluate(result.x)[1:].min()))
             if result.success and violation <= 2e-6:
                 return result
-            z = self.restore(initial)
+            # An iteration limit on a point that is already feasible is progress, not a failure:
+            # continue from it rather than throwing it away for the initial guess. Restarting was
+            # right only for a run that went somewhere infeasible. Seen 2026-09-28: ICCAS with the
+            # refitted tyres stopped at maxiter with violation 1.96e-6 and the restart repeated it.
+            z = result.x if (result.status == 9 and violation <= 1e-4) else self.restore(initial)
         raise ValueError(f"{self.track.name}: minimum-time solve did not converge "
                          f"({result.message}; normalized violation {violation:.3g})")
 

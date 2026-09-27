@@ -497,14 +497,24 @@ class RacelineCacheMiss(RuntimeError):
 #: would itself invalidate all 738 once, which is why it is not done here.
 #:
 #: A new field goes here if and only if the raceline does not depend on it.
-_ADDED_AFTER_LINE_KEY = frozenset({"road_tilt_v"})
+_ADDED_AFTER_LINE_KEY = frozenset({"road_tilt_v", "mu_ref", "mu_stiffness_exp"})
 
 #: `VehicleParams` fields the line does not read whose *default changed* after the key was defined,
 #: each written into the key at the value it had then. Same reason as above: `road_tilt` went
 #: 0.017 -> 0 on 2026-09-21 (the attitude comes from the dynamics alone now), and with it in the key
 #: as-is all 738 cached lines would have rebuilt for a suspension-noise knob `Raceline.build` never
 #: touches.
-_FROZEN_IN_LINE_KEY = {"road_tilt": 0.017}
+_FROZEN_IN_LINE_KEY = {"road_tilt": 0.017,
+                       # 2026-09-28 refit (docs/research/dynamics-replay-2026-09-28.md). The tyre
+                       # curve is not read by the line at all. The drive limit is: the speed
+                       # profile's acceleration phases use a_max / v_switch, and a line built with
+                       # the new 5.6 / 6.0 is a little slower out of corners -- measured on ICCAS's
+                       # min-time line, profile lap 6.953 -> 6.976 s (+0.3 %). Freezing them keeps
+                       # the 900+ cached lines (20-70 min each to rebuild) at that small, stated
+                       # optimism; the simulated car still has its real limit, so a teacher on
+                       # such a line only asks for 0.3 % more than the car gives out of a corner.
+                       "B_f": 8.0, "B_r": 9.0, "C_f": 1.3, "C_r": 1.3, "E_f": 0.97, "E_r": 0.97,
+                       "a_max": 7.0, "v_switch": 7.319}
 
 
 class _LineKeyVehicle:

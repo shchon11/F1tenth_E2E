@@ -103,7 +103,7 @@ class RacelineTeacher:
                  lookahead_gain: float = 0.35, lookahead_min: float = 0.6, lookahead_max: float = 2.5,
                  speed_lookahead_time: float = 0.35, lateral_slowdown: float = 0.6,
                  speed_scale: float = 1.0, steer_max: float = 0.4189,
-                 k_e: float = 2.5, k_psi: float = 1.0, v_soft: float = 1.0, k_us: float = 0.003,
+                 k_e: float = 2.5, k_psi: float = 1.0, v_soft: float = 1.0, k_us: float = 0.02,
                  ff_time: float = 0.05, k_e_pp: float = 0.0,
                  mu_nominal: float = 1.0489, mu_f_scale_nominal: float = 0.92,
                  recover_time: float = 0.0, v_recover_min: float = 0.6, a_lat_recover: float = 6.0,

@@ -673,7 +673,7 @@ class EgoStateAttitude:
     """
 
     #: [m/s^2] the largest body longitudinal acceleration this car produces
-    #: (`params.VehicleParams.a_max` 7.0 on the drive side). A wheel-speed derivative past this is
+    #: (`params.VehicleParams.a_max` 5.6 on the drive side since 2026-09-28, 7.0 before). A wheel-speed derivative past this is
     #: the wheel slipping, not the car accelerating.
     A_BODY_MAX = 12.0
     #: [s] low-pass on the wheel speed before differentiating, and on the yaw rate. 0.08 s keeps the

@@ -34,7 +34,9 @@ def test_tracker_straight_and_arc():
         cmd = tr(a, v, cap)
     steer = cmd[:, 0].cpu()
     assert abs(steer[0]) < 0.02
-    d_kin = math.atan(WB / R)                                             # kinematic steer for that radius
+    # the steer for that radius on the tracker's own model: kinematic plus its understeer term
+    # (k_us 0.02 since 2026-09-28 makes that 1.4x the kinematic angle at 3 m/s)
+    d_kin = math.atan((WB + spec.k_us * 3.0 ** 2) / R)
     assert 0.5 * d_kin < steer[1] < 1.3 * d_kin, (steer[1], d_kin)
     assert abs(steer[2] + steer[1]) < 0.03                                # mirror symmetric
     assert torch.allclose(cmd[:, 1].cpu(), torch.full((3,), 3.0), atol=0.3)  # speed target followed

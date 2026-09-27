@@ -47,6 +47,14 @@ def pacejka(alpha: torch.Tensor, B: torch.Tensor, C: torch.Tensor, E: torch.Tens
     return torch.sin(C * torch.atan(Ba - E * (Ba - torch.atan(Ba))))
 
 
+def lateral_B(P):
+    """(B_f, B_r) the lateral magic formula is evaluated with: `vehicle.B_*` scaled by
+    (mu_ref / mu) ** (1 - mu_stiffness_exp), so the cornering stiffness mu * B * C * Fz is the one on
+    `mu_ref` when the exponent is 0 and follows mu when it is 1. See VehicleParams.mu_stiffness_exp."""
+    k = (P["mu_ref"] / P["mu"]) ** (1.0 - P["mu_stiffness_exp"])
+    return P["B_f"] * k, P["B_r"] * k
+
+
 def pacejka_slope(alpha: torch.Tensor, B: torch.Tensor, C: torch.Tensor, E: torch.Tensor) -> torch.Tensor:
     """d/d(alpha) of `pacejka`, in closed form.
 
@@ -120,7 +128,8 @@ def step_dynamics(state: torch.Tensor, steer_target: torch.Tensor, a_cmd: torch.
     Fzf = m * G * lr / L - m * h * ax_prev / L
     Fzr = m * G * lf / L + m * h * ax_prev / L
     Fzf, Fzr = Fzf.clamp_min(0.0), Fzr.clamp_min(0.0)
-    Fyf = mu * P["mu_f_scale"] * Fzf * pacejka(alpha_f, P["B_f"], P["C_f"], P["E_f"])
+    B_f, B_r = lateral_B(P)
+    Fyf = mu * P["mu_f_scale"] * Fzf * pacejka(alpha_f, B_f, P["C_f"], P["E_f"])
     # rear tire: combined slip via friction circle -- requested (Fx, Fy) keeps its direction
     # and is capped in magnitude at mu*Fz (sliding tire), so hard throttle in a corner costs
     # lateral grip (power oversteer) but does not zero it out.
@@ -145,7 +154,7 @@ def step_dynamics(state: torch.Tensor, steer_target: torch.Tensor, a_cmd: torch.
     else:
         Fx_req = m * a_cmd
         share_r = torch.ones_like(Fx_req)
-    Fy_req = mu_r * Fzr * pacejka(alpha_r, P["B_r"], P["C_r"], P["E_r"])
+    Fy_req = mu_r * Fzr * pacejka(alpha_r, B_r, P["C_r"], P["E_r"])
     F_lim = mu_r * Fzr
     F_mag = torch.sqrt(Fx_req ** 2 + Fy_req ** 2).clamp_min(1e-6)
     scale = torch.clamp(F_lim / F_mag, max=1.0)

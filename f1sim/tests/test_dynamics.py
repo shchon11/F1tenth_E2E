@@ -48,16 +48,21 @@ def test_low_speed_yaw_rate_is_kinematic():
 
 def test_high_speed_cornering_saturates_and_is_stable():
     """Moderate steer at a speed where the kinematic model would demand > mu*g: lateral accel
-    must be friction-limited, the car must slide (understeer) rather than spin, stay finite."""
+    must be friction-limited, the car must slide (understeer) rather than spin, stay finite.
+
+    0.30 rad, not the 0.15 it was: the tyres refitted to the recordings on 2026-09-28 are soft
+    (B 2/3, C 1.8) and make only ~half their peak force at 0.15 rad of slip, so 0.15 rad of steer
+    can no longer reach the limit at all -- which the recordings agree with: the one slide in them
+    came at near full lock."""
     sim = make_sim()
     for _ in range(int(6.0 / sim.control_dt)):
-        r = sim.step(torch.tensor([[0.15, 6.0]]))
+        r = sim.step(torch.tensor([[0.30, 6.0]]))
     st = r.state[0]
     assert torch.isfinite(st).all()
     v = math.hypot(st[3].item(), st[4].item())
     ay = v * st[5].item()
     L = sim.cfg.vehicle.lf + sim.cfg.vehicle.lr
-    ay_kin = v ** 2 * math.tan(0.15) / L
+    ay_kin = v ** 2 * math.tan(0.30) / L
     assert ay_kin > sim.cfg.vehicle.mu * 9.81, "test setup: kinematic demand must exceed grip"
     assert ay < sim.cfg.vehicle.mu * 9.81 * 1.05, ay
     assert ay > 0.6 * sim.cfg.vehicle.mu * 9.81, ay

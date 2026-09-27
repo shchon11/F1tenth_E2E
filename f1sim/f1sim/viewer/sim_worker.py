@@ -337,7 +337,7 @@ def procedural_settings(ckpt_path: str, collision_mode: str) -> Tuple[dict, str]
 
 def _procedural_facts(session: dict) -> dict:
     """What 장애물 "학습과 같음" built, for the facts strip; nothing when it is off."""
-    proc = session["env"].procedural
+    proc = getattr(session["env"], "procedural", None)       # a stand-in env without the generator: off
     if proc is None:
         return {}
     e = session["env"].ecfg

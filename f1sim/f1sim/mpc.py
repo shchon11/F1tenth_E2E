@@ -91,7 +91,14 @@ class PlanSpec:
     N: int = 12                    # MPC steps
     dt: float = 0.05               # [s] MPC step
     delay: float = 0.035           # [s] nominal command latency the tracker predicts over (delay + half the servo lag)
-    k_us: float = 0.003            # [s^2/m] understeer: effective wheelbase L + k_us v^2
+    k_us: float = 0.02             # [s^2/m] understeer: effective wheelbase L + k_us v^2. 0.02 since
+                                   # 2026-09-28: quasi-steady cornering in the competition recordings
+                                   # gives 0.018-0.023 (9 500 samples, 2-9 m/s); 0.003 was the stiff-tyre
+                                   # sim's own value (0.002-0.003). On the refitted sim the line teacher
+                                   # laps ICCAS in 8.51 s at 0.02 against 9.57 s at 0.003 (0.013: 8.77,
+                                   # 0.03: 8.67 with contacts), and c2 goes 8.88 -> 8.24 s with race
+                                   # collisions 8.50 -> 4.90 /km. The car's own tracker
+                                   # (f1sim_ros controller_node) builds this spec too.
     a_max: float = 6.0             # [m/s^2] tracker acceleration bound (drive side)
     a_brake: float = 5.0           # [m/s^2] braking bound. Asymmetric because the car is: braking is
                                    # limited by the VESC regen current at -4.2 to -5.7 m/s^2 while the

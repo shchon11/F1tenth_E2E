@@ -83,7 +83,7 @@ def test_auto_uses_nominal_4wd_split_and_actuator_budgets():
     assert gr.automatic_grip_spec(env, profile_version=gr.LOCAL_AUTO_PROFILE).profile_version == "local-v2"
     assert spec.drive_split_r == 0.5
     _, acc, brk = gc.budgets(torch.tensor([gc.MU_FIXED_LOW]), torch.zeros(1), spec)
-    assert acc.item() == pytest.approx(7.0)
+    assert acc.item() == pytest.approx(env.cfg.vehicle.a_max)      # the nominal car's drive limit (5.6 since 09-28)
     assert brk.item() == pytest.approx(5.0)
     env.cfg.vehicle.a_brake = 4.2
     _, _, brk = gc.budgets(torch.tensor([gc.MU_FIXED_LOW]), torch.zeros(1),

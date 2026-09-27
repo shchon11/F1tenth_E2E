@@ -25,14 +25,38 @@ class VehicleParams:
     mu: float = 1.0489         # peak friction coefficient
     mu_f_scale: float = 0.92   # front/rear grip asymmetry -> understeer at the limit (front saturates first)
     mu_r_scale: float = 1.0
-    # B*C ~ cornering stiffness per unit load [1/rad]; f1tenth_gym measured C_Sf=4.72, C_Sr=5.46,
-    # peak slip angle ~ 2.57/B rad  (B=8 -> 18 deg, B=9 -> 16 deg). Front softer -> mild understeer.
-    B_f: float = 8.0           # stiffness factor, front
-    C_f: float = 1.3           # shape factor, front
-    E_f: float = 0.97          # curvature factor, front
-    B_r: float = 9.0
-    C_r: float = 1.3
-    E_r: float = 0.97
+    # B*C ~ cornering stiffness per unit load [1/rad]; f1tenth_gym measured C_Sf=4.72, C_Sr=5.46.
+    # Fitted 2026-09-28 by replaying 928 one-second segments of the competition recordings through
+    # the sim on an open floor (f1sim/scripts/replay_dynamics.py, docs/research/dynamics-replay-
+    # 2026-09-28.md): with the steering calibration taken as correct, the old B 8/9, C 1.3 (B*C
+    # 10.4/11.7, over twice the gym's) yawed 1.25-1.42x the car for the same command, the excess
+    # growing with speed. B 2.0/3.0, C 1.8 (B*C 3.6/5.4: rear = the gym's, front softer -- steering
+    # compliance under load looks like a softer front tyre) brings it to 0.97-1.02 and halves the
+    # yaw-rate error (0.49 -> 0.24 rad/s with servo_tau 0.08). The softer curve peaks at a larger slip
+    # angle, and with E 0.97 the car could not hold more than 7.8 m/s^2 even at full lock, where the
+    # recordings have 316 one-second segments above 8. E moves the peak without touching the linear
+    # stiffness: E 0 lifts the full-lock steady limit to 8.2 and trims the replay error to 0.237
+    # (a_y>=8 yaw ratio 0.92 -> 0.94); lower E buys little more and costs speed-tracking error. The
+    # one recorded slide (map16x07, -25..-40 deg sideslip) is reproduced (-33 deg); the low-speed
+    # spin after it is not, by this model or the old one.
+    # Friction and cornering stiffness are separate properties of a tyre on a floor: the peak
+    # (mu) is the surface, the slope at small slip is mostly the carcass. The magic formula scales
+    # both with mu, so a floor drawn at mu 0.7 also got a tyre 33 % softer at every slip angle --
+    # the car handled differently long before it got near its limit, which is a cue to the floor
+    # the real car does not give (docs/research/grip-sensing-references-2026-09-28.md: friction is
+    # identifiable only at 50-80 % of the peak). `mu_stiffness_exp` = 0 holds the cornering
+    # stiffness at its value on `mu_ref`, whatever mu is drawn (B scaled by mu_ref/mu); 1 is the
+    # formula's own scaling, which every run before 2026-09-28 used. At mu == mu_ref the two agree.
+    # The recordings do not settle it (no floor with a known lower mu); they do not contradict it:
+    # on the pre-competition floors the replay fits best at the nominal mu.
+    mu_ref: float = 1.0489
+    mu_stiffness_exp: float = 0.0
+    B_f: float = 2.0           # stiffness factor, front
+    C_f: float = 1.8           # shape factor, front
+    E_f: float = 0.0           # curvature factor, front (0.97 before 2026-09-28)
+    B_r: float = 3.0
+    C_r: float = 1.8
+    E_r: float = 0.0
     # Kinematic <-> dynamic blend: below v_blend_min pure kinematic, above v_blend_max pure dynamic
     v_blend_min: float = 0.8   # [m/s]
     v_blend_max: float = 2.0   # [m/s]
@@ -41,7 +65,10 @@ class VehicleParams:
     sv_max: float = 3.2        # [rad/s] max steering rate (servo)
     v_max: float = 12.0        # [m/s]
     v_min: float = -3.0        # [m/s] reverse limit
-    a_max: float = 7.0         # [m/s^2] motor accel limit (VESC current limit); traction limit applies on top
+    a_max: float = 5.6         # [m/s^2] motor accel limit (VESC current limit); traction limit applies on top.
+                               # 5.6 / v_switch 6.0 is the p90 envelope of every current-limited 200 ms
+                               # window in the recordings (docs/research/sim2real-audit-2026-09-21.md
+                               # section 4.1); no window exceeds 5.9. It was 7.0 / 7.319.
     a_brake: float = 5.0       # [m/s^2] max braking decel. Braking on this car is limited by the
                                # VESC regen current, not by the tyres: at the hardest 200 ms of
                                # braking in each recording the regen current sits at 95-100 % of
@@ -54,7 +81,7 @@ class VehicleParams:
                                # speed twice as fast as the real car can.
                                # (-9.2 and -10.6 also appear in the recordings, but the motor
                                # current is *positive* at those instants: they are impacts.)
-    v_switch: float = 7.319    # [m/s] above this, accel scales with v_switch/v (power limit)
+    v_switch: float = 6.0      # [m/s] above this, accel scales with v_switch/v (power limit)
     # ---- rear axle as a rotating body (2026-09-13) ----------------------------------------
     # `wheel_model` off reproduces the model that was here before: rear longitudinal force set
     # straight from the commanded acceleration, wheel speed == body speed, so the wheel can neither
@@ -160,7 +187,10 @@ class VehicleParams:
 @dataclass
 class ActuatorParams:
     # Steering servo: first-order lag + rate limit + angle bias
-    servo_tau: float = 0.04        # [s] time constant
+    servo_tau: float = 0.08        # [s] time constant. 0.08 minimises the yaw-rate error of the
+                                   # recordings' replay (0.04: 0.282, 0.08: 0.241, 0.12: 0.254 rad/s);
+                                   # the 09-21 audit's 0.12 came from delay alone, before the tyres
+                                   # were fitted. It was 0.04.
     steer_bias: float = 0.0        # [rad] mechanical trim error (randomized)
     steer_gain: float = 1.0        # command scaling error
     # VESC speed loop: first-order tracking of commanded speed via PID-like accel
@@ -427,6 +457,18 @@ class SimParams:
     contact_tau_wall: float = 0.004      # [s] a tall wall: a few ms, near the old instant reset
     contact_tau_duct: float = 0.020      # [s] half the measured 40 ms median duration
     wall_friction: float = 0.5
+    # Wall and prop contacts push at the touching point (rigid-body impulse, so a corner hit turns
+    # the car) rather than at the centre. False is every run before 2026-09-28. See
+    # Simulator._resolve_wall_contact.
+    contact_at_point: bool = True
+    contact_lever: float = 0.2    # share of the contact point's lever arm the impulse acts through.
+                                  # 1 is a rigid point contact and spins the car far more than the
+                                  # recordings (|yaw-rate change| p50 2.38 against 1.38 rad/s): the
+                                  # hose gives and the wall rubs. 0.2 matches the magnitude (p50 1.47
+                                  # / p90 3.34 against 1.38 / 3.73) in 167 duct hits at 2-8 m/s,
+                                  # +-46 deg (scratchpad wall_hits.py, 2026-09-28). The sign-flip
+                                  # rate (28 % against 50 %) depends on how the driver reacts after
+                                  # the hit, which that test holds fixed, so it was not fitted.
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
@@ -483,7 +525,7 @@ class RandomizationConfig:
                                             # 0 is a clean floor, 2.5x the fitted rate is a bad one
         "imu.shock_accel": (0.7, 1.5),
         "vehicle.c_roll": (0.5, 2.0),
-        "actuator.servo_tau": (0.02, 0.06),
+        "actuator.servo_tau": (0.05, 0.11),     # around the replay-fitted 0.08 (was 0.02-0.06)
         "actuator.steer_bias": (-0.03, 0.03),
         "actuator.steer_gain": (0.92, 1.08),
         "actuator.motor_tau": (0.10, 0.30),

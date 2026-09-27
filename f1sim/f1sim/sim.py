@@ -225,7 +225,13 @@ class Simulator:
         n = ids.numel()
         u = lambda lo, hi: lo + (hi - lo) * torch.rand(n, device=self.device, generator=self.gen)
         self.car_dims[ids] = torch.stack([u(0.45, 0.58), u(0.26, 0.34), u(0.15, 0.27)], 1)
-        self.car_porosity[ids] = u(0.05, 0.30)
+        # Fraction of the beams hitting another car that return nothing. Measured on 19 299 car-sized
+        # objects in the competition recordings: 0.165 % of their beams (p50 0 %, p99 7 % per
+        # object; docs/research/dynamics-collision-audit-2026-09-21.md section 1.2). It was 5-30 %
+        # (mean 17.5 %): the other car flickered out of the scan a hundred times more often than on
+        # the real track, and a policy trained on that cannot tell a real disappearance (occlusion)
+        # from the usual flicker.
+        self.car_porosity[ids] = u(0.0, 0.004)
         # a small cardboard box strapped to the rear bumper at LiDAR height: depth, width, z bottom, z top
         self.car_rear[ids] = torch.stack([u(0.06, 0.11), u(0.13, 0.22), u(0.08, 0.12), u(0.22, 0.30)], 1)
         self.car_rear_porosity[ids] = u(0.0, 0.05)
@@ -265,8 +271,17 @@ class Simulator:
         return sets
 
     def _car_contacts(self, state: torch.Tensor) -> torch.Tensor:
-        """Separating-axis test between each car's footprint and the other cars of its race -> (B,) bool."""
-        pts = self._footprint_corners(state)                              # (B,4,2)
+        """Separating-axis test between each car's footprint and the other cars of its race -> (B,) bool.
+
+        Each car collides with the body the other cars' LiDAR draws for it: the footprint is scaled
+        by the same `car_dims` length / 0.50 the mesh is (`_car_boxes`). A fixed 0.58 m box on every
+        car, whatever size it was drawn, put up to 11 cm of body where the scan showed nothing
+        (docs/research/dynamics-collision-audit-2026-09-21.md section 2.4). Walls and props still use
+        the car's own measured footprint (`_footprint_corners`)."""
+        c_, s_ = torch.cos(state[:, dyn.IYAW]), torch.sin(state[:, dyn.IYAW])
+        R = torch.stack([torch.stack([c_, -s_], -1), torch.stack([s_, c_], -1)], -2)          # (B,2,2)
+        local = self.corners[None] * (self.car_dims[:, 0] / 0.50)[:, None, None]              # (B,4,2)
+        pts = torch.einsum("bij,bkj->bki", R, local) + state[:, None, :2]                     # (B,4,2)
         yaw = state[:, dyn.IYAW]
         ext = torch.stack([-self.car_rear[:, 0] * torch.cos(yaw), -self.car_rear[:, 0] * torch.sin(yaw)], 1)
         pts = torch.cat([pts, pts[:, 2:] + ext[:, None, :]], 1)         # + rear box corners (B,6,2)
@@ -957,11 +972,37 @@ class Simulator:
             J = (1 + k) * bleed * (-vn) * mu_red                       # >= 0 while driving in
             imp = torch.where(movable_now[:, None], -J[:, None] * n, torch.zeros_like(n))
             self.track.env_props.shove(self.eid, prop_slot.clamp_min(0), imp)
-        vwx2 = vwx - (1 + k) * share * bleed * vn * n[:, 0]
-        vwy2 = vwy - (1 + k) * share * bleed * vn * n[:, 1]
+        # The impulse acts where the car touches, not at its centre (2026-09-28). The contact point
+        # is the footprint's extreme point against the normal -- one corner for a glancing hit, the
+        # two front corners' midpoint for a square one (a soft arg-min, so it stays branch-free for
+        # the graphs). A rigid body struck at an offset p takes J = -(1+k) v_pn / (1/m + (p x n)^2/Iz)
+        # and turns by J (p x n) / Iz. The old form pushed the centre only, so a contact could damp
+        # the yaw rate but never create it; in the recordings half the impacts (48 %) raise |yaw
+        # rate| and half (50 %) flip its sign, against 29 % / 12 % simulated
+        # (docs/research/dynamics-collision-audit-2026-09-21.md section 2.2). This car's Iz (0.047)
+        # is small next to m p^2 (0.34 at a front corner), so a corner hit mostly spins it. A square
+        # hit has p x n = 0 and is exactly the old centre impulse, so the calibrated decelerations
+        # of head-on impacts are unchanged.
+        r_now = state[:, dyn.IR]
+        cw = torch.einsum("bij,kj->bki", torch.stack([torch.stack([c, -s], -1), torch.stack([s, c], -1)], -2),
+                          self.corners)                                            # (B,4,2) world offsets
+        proj = (cw * n[:, None, :]).sum(-1)                                           # along the normal
+        w = torch.softmax(-(proj - proj.min(1, keepdim=True).values) / 0.01, 1)       # the deepest corner(s)
+        p_c = (w[..., None] * cw).sum(1)                                              # (B,2) contact offset
+        pxn = (p_c[:, 0] * n[:, 1] - p_c[:, 1] * n[:, 0]) * getattr(sp, "contact_lever", 1.0)
+        vpn = (vwx - r_now * p_c[:, 1]) * n[:, 0] + (vwy + r_now * p_c[:, 0]) * n[:, 1]
+        if not getattr(sp, "contact_at_point", True):
+            p_c = torch.zeros_like(p_c); pxn = torch.zeros_like(pxn); vpn = vn
+        into = (vpn < 0) & touching
+        m_car, Iz = self.P["m"], self.P["Iz"]
+        J = (1 + k) * share * bleed * (-vpn) / (1.0 / m_car + pxn * pxn / Iz)       # >= 0 while driving in
+        vwx2 = vwx + J / m_car * n[:, 0]
+        vwy2 = vwy + J / m_car * n[:, 1]
         vwx2, vwy2 = vwx2 * (1 - f * 0.05), vwy2 * (1 - f * 0.05)
+        r2 = r_now + J * pxn / Iz
         vwx = torch.where(into, vwx2, vwx); vwy = torch.where(into, vwy2, vwy)
         st = state.clone()
+        st[:, dyn.IR] = torch.where(into, r2, r_now)
         st[:, dyn.IVX] = vwx * c + vwy * s
         st[:, dyn.IVY] = -vwx * s + vwy * c
         # The overlap is shared the same way: a crate gets out of the way as much as the car does.

@@ -56,9 +56,10 @@ def privileged_targets(sim):
     af = steer - torch.atan2(vy + p["lf"] * yaw_rate, vx_safe)
     ar = -torch.atan2(vy - p["lr"] * yaw_rate, vx_safe)
     kappa = (state[:, dyn.IOMEGA] * p["r_w"] - vx) / vx.abs().clamp_min(p["v_slip_eps"])
-    uf = dyn.pacejka(af, p["B_f"], p["C_f"], p["E_f"]).abs()
+    B_f, B_r = dyn.lateral_B(p)
+    uf = dyn.pacejka(af, B_f, p["C_f"], p["E_f"]).abs()
     ux = dyn.pacejka(kappa, p["B_x"], p["C_x"], p["E_x"])
-    uy = dyn.pacejka(ar, p["B_r"], p["C_r"], p["E_r"])
+    uy = dyn.pacejka(ar, B_r, p["C_r"], p["E_r"])
     ur = torch.sqrt(ux.square() + uy.square()).clamp_max(1.0)
     utilization = torch.maximum(uf, ur)
     # Endpoint near the tire-force peak, at a speed where dynamic tire equations dominate.

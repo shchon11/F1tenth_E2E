@@ -152,7 +152,11 @@ def _rollout(procedural: float):
 #: nothing, draws nothing, and leaves the run exactly as it was" -- is the generator state, which is
 #: a function of the sequence of draws alone and therefore immune to both. `procedural_obstacles`
 #: draws its layout from `sim.gen`, so any leak of the generator into the off path moves this hash.
-BASE_GEN_DIGEST = "2b7fdc0a639590451d2254e88b57d21a2d2f3cb67d13518d3351785b2db60563"
+# 2026-09-28: the tyre / servo / drive-limit / contact refit changes which cars touch a wall inside
+# the 40 steps, and a touch resets and draws. Checked: with every refitted value set back to its old
+# one, this rollout reproduces the previous digest 2b7fdc0a...b60563 exactly, so the refit asks the
+# generator for nothing new; the digest below is the same draws on the new physics.
+BASE_GEN_DIGEST = "83157158624670a31d1b443b719924e7d1ae2c784aaa6765a8afa66bbb13686c"
 
 
 def test_off_draws_exactly_what_the_merge_base_drew():

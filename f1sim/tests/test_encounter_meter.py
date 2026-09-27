@@ -27,9 +27,18 @@ def _track_and_raceline(name: str):
     return track, Raceline.build_cached(track)
 
 
-def _env(envs=16, seed=5, **cfg_kw):
+def _env(envs=16, seed=5, legacy_car=False, **cfg_kw):
     tr, rl = _track_and_raceline(TRACK)
     cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
+    if legacy_car:
+        # The car before the 2026-09-28 refit (stiff tyres, fast servo, centre-only contacts). Only
+        # the scrape test needs it: on the refitted car the raceline teacher still touches crates
+        # (18 onsets in 32 x 1200 steps) but never inside an approach the meter opens, so the
+        # scenario stopped exercising the bookkeeping it is there to check. Policies on the refitted
+        # car do meet their crates inside approaches (0-2 of 12-33 onsets outside, seed 77).
+        v, a = cfg.vehicle, cfg.actuator
+        v.B_f, v.B_r, v.C_f, v.C_r, v.a_max, v.v_switch, v.mu_stiffness_exp = 8.0, 9.0, 1.3, 1.3, 7.0, 7.319, 1.0
+        a.servo_tau = 0.04; cfg.sim.contact_at_point = False
     ecfg = EnvConfig(**{"race_size": 1, "max_steps": 600, "hist_len": 0, "action_mode": "plan",
                         "collision_mode": "soft", "speed_cap": 6.0,
                         "procedural_obstacles": 1.0, "procedural_density": 2.0,
@@ -107,7 +116,7 @@ def test_a_long_scrape_is_one_encounter_and_the_repetition_is_still_visible():
     in it. `onsets_per_contacted_encounter` is reported so the multiplier stays readable instead of
     being silently folded into the rate, as `collisions_per_km` folds it.
     """
-    env, rl = _env()
+    env, rl = _env(legacy_car=True)
     teacher = common.make_teacher([rl], env, a_lat=7.0, a_acc=6.5, a_brake=4.0)
     env.reset(seed=5)
     with EncounterMeter(env) as meter:
