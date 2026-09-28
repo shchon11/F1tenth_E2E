@@ -428,9 +428,16 @@ class InteractiveTeacher(RowPlanning):
         cap = torch.full_like(v_meas, float(v_max))
         if self.env is not None:
             cap = rep(self._r(self.env.speed_cap).to(state.dtype))
-        k, Lp, v0, v1 = decode(flat, v_meas, v_max, cap, spec)
         H = int(self.horizon_times(spec).numel()) - 1
-        ref = reference(k, Lp, v0, v1, replace(spec, N=H), v_meas)              # (K*B, H+1, 4)
+        if spec.speed_mode == "linear":
+            k, Lp, v0, v1 = decode(flat, v_meas, v_max, cap, spec)
+            ref = reference(k, Lp, v0, v1, replace(spec, N=H), v_meas)          # (K*B, H+1, 4)
+        else:
+            # a profile-mode plan: the tracker follows its profile as a speed limit (`mpc.solve`),
+            # and the same reference is what gets scored here
+            from .mpc import decode_profile
+            k, Lp, prof = decode_profile(flat, v_meas, v_max, cap, spec)
+            ref = reference(k, Lp, cap, cap, replace(spec, N=H), v_meas, v_limit=prof)
         c, sn = rep(torch.cos(state[:, 2])), rep(torch.sin(state[:, 2]))
         x = rep(state[:, 0])[:, None] + ref[:, :, 0] * c[:, None] - ref[:, :, 1] * sn[:, None]
         y = rep(state[:, 1])[:, None] + ref[:, :, 0] * sn[:, None] + ref[:, :, 1] * c[:, None]

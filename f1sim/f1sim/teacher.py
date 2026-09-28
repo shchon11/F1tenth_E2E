@@ -438,7 +438,11 @@ class RacelineTeacher:
         if self.speed_mode == "sqrt":
             g = self.grip_levels_t[gb]
             return self.v[tid, idx] * torch.sqrt(g) * self.speed_scale
-        return self.v_grip[tid, gb, idx] * self.speed_scale
+        v = self.v_grip[tid, gb, idx]
+        sc = self.speed_scale
+        if torch.is_tensor(sc) and sc.ndim == 1 and v.ndim == 2:
+            sc = sc[:, None]                      # a per-car scale over several lookups per car
+        return v * sc
 
     def clamp_offset(self, offset: torch.Tensor, tid: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """Cut a commanded lateral offset down to what the lane has room for at this raceline point."""
