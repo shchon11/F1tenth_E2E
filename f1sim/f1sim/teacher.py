@@ -191,7 +191,7 @@ class RacelineTeacher:
         and geometric fit; privileged body state and grip still select the speed profile. None
         preserves standalone body-speed geometry. The caller must pass the same sample to decode.
         """
-        from .mpc import N_KNOTS, PlanSpec, encode, encode_envelope, encode_knots, path_points, plan_length
+        from .mpc import N_KNOTS, PlanSpec, encode, encode_budget, encode_envelope, encode_knots, path_points, plan_length
         spec = spec or PlanSpec()
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         geometry_speed = plan_geometry_speed(state, plan_speed)
@@ -280,6 +280,21 @@ class RacelineTeacher:
             vk = self.speed_at(tid[:, None].expand_as(kidx), kidx, gb[:, None].expand_as(kidx)) * slow[:, None]
             return encode_knots(k, vk if cap is None else torch.minimum(vk, cap[:, None]), v_max, spec,
                                 v_meas=geometry_speed)
+        if spec.speed_mode == "budget":
+            # The grip budget is the floor's and this teacher's global pace only; every reason to go
+            # slower than it (off the line, a heading the cap distrusts) is a ceiling on the profile.
+            a_hat = self.a_lat * self.grip_levels_t[gb] * self.speed_scale ** 2
+            # The ceiling is the fastest this teacher wants to be anywhere along the plan (its
+            # profile there, off-line slowdown included), not its speed right now: a ceiling at the
+            # current speed would pin the profile under it and delay every exit by a step.
+            span = ((v_idx1 - v_idx0) % self.N)[:, None]
+            frac = torch.linspace(0.0, 1.0, 9, device=span.device)[None]
+            i_s = (v_idx0[:, None] + (span * frac).round().long()) % self.N
+            v_top = (self.speed_at(tid[:, None].expand_as(i_s), i_s, gb[:, None].expand_as(i_s)).amax(1)) * slow
+            v_cap = v_top if cap is None else torch.minimum(v_top, cap)
+            v_end = v1 if cap is None else torch.minimum(v1, cap)
+            return encode_budget(k, a_hat.expand_as(v0) if torch.is_tensor(a_hat) else torch.full_like(v0, a_hat),
+                                 v_end, v_cap, v_max, spec, v_meas=geometry_speed)
         if spec.speed_mode == "envelope":
             # What the speed dimensions say here is *why* the profile is what it is: the lateral
             # budget this car's grip gives the profile (a_lat * grip, the one number the student

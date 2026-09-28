@@ -548,9 +548,11 @@ def main() -> None:
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of the teacher's speed profile")
     ap.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] drive limit of the profile")
     ap.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] braking limit of the profile")
+    ap.add_argument("--speed-command-tau", type=float, default=None,
+                    help="[s] low-pass on a 'profile' speed command (EnvConfig.speed_command_tau)")
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
                     help="who sets the VESC speed command. Default: the checkpoint's own (tracker for every run before 2026-09-28)")
-    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots"], default=None,
+    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget"], default=None,
                     help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). Default: the checkpoint's own")
     ap.add_argument("--dial-offset", type=float, default=0.0,
                     help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
@@ -659,7 +661,8 @@ def main() -> None:
                                    ("procedural_raceline_corridor", a.procedural_raceline_corridor),
                                    ("spawn_runway", a.spawn_runway),
                                    ("collision_mode", a.collision_mode),
-                                   ("movable_obstacles", a.movable_obstacles)) if v is not None}
+                                   ("movable_obstacles", a.movable_obstacles),
+                                   ("speed_command_tau", a.speed_command_tau)) if v is not None}
 
     def run(names, config):
         if a.wheel_model != "default":

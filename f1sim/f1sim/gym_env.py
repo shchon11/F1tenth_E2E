@@ -417,6 +417,12 @@ class EnvConfig:
     #: the profile commanded directly the teacher laps ICCAS 4 % quicker. Meant for the profile
     #: speed modes ("envelope", "knots"), whose profile is what the policy actually decides.
     speed_command: str = "tracker"
+    #: [s] "profile" only: first-order low-pass on the profile's speed command. A profile is built
+    #: afresh every 25 ms from the plan's own curvature, and v = sqrt(a / kappa) turns a small wobble
+    #: in a student's curvature into a large one in speed; the tracker used to absorb it. Measured on
+    #: the first envelope/profile DAgger student (ICCAS): step-to-step command change median 0.16 m/s
+    #: (p90 0.77) against 0.06 (0.17) through the tracker. 0 is no filter.
+    speed_command_tau: float = 0.0
     plan_kappa_a_lat: float = 8.0    # [m/s^2] "feasible" only: the lateral budget it scales by
     compile_tracker: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
@@ -2205,6 +2211,15 @@ class F1VecEnv:
                 v_land = ref_v.gather(1, i0[:, None])[:, 0] * (1 - w) + ref_v.gather(1, i0[:, None] + 1)[:, 0] * w
                 slope = (ref_v.gather(1, i0[:, None] + 1)[:, 0] - ref_v.gather(1, i0[:, None])[:, 0]) / dt_t
                 v_pr = (v_land + self.tracker_motor_tau * slope).clamp_min(0.0)
+                if self.ecfg.speed_command_tau > 0:
+                    k_f = self.sim.control_dt / (self.ecfg.speed_command_tau + self.sim.control_dt)
+                    prev = getattr(self, "_v_pr_prev", None)
+                    if prev is None or prev.shape != v_pr.shape:
+                        prev = v_meas.clone()
+                    # a car that has just been reset starts its filter from where it is
+                    prev = torch.where(self.ep_step <= 1, v_meas, prev)
+                    v_pr = prev + k_f * (v_pr - prev)
+                    self._v_pr_prev = v_pr.detach()
                 raw = torch.stack([raw[:, 0], torch.where(raw[:, 1] < 0, raw[:, 1],
                                    torch.minimum(v_pr, self.speed_cap))], 1)
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)

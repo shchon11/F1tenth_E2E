@@ -39,13 +39,18 @@ XI = torch.linspace(0.0, 1.0, N_KNOTS)
 #:             v_end and ramped forwards from the measured speed -- so it follows the corner by
 #:             construction, and one scalar carries "how slippery is it". Same test: 2-4 %, p90 0.2-0.35.
 #:   knots     N_KNOTS numbers: the speed at each curvature knot, linear between. Same test: 0.3-0.5 %.
-SPEED_MODES = ("linear", "envelope", "knots")
+#:   budget    3 numbers (2026-09-28): the grip budget `a_hat` (a property of the floor -- never a
+#:             way to slow down), the speed to arrive at the end of the plan with, and `v_cap`, a
+#:             ceiling on the whole profile: the one place an intent to go slower than the grip
+#:             allows (recovering, off the line, a car ahead) lives. "envelope" had to fold those
+#:             intents into a_hat, squared, and a student learned that a car in trouble has no grip.
+SPEED_MODES = ("linear", "envelope", "knots", "budget")
 
 
 def act_dim(speed_mode: str = "linear") -> int:
     if speed_mode not in SPEED_MODES:
         raise ValueError(f"speed_mode must be one of {SPEED_MODES}, got {speed_mode!r}")
-    return N_KNOTS + (N_KNOTS if speed_mode == "knots" else 2)
+    return N_KNOTS + {"knots": N_KNOTS, "budget": 3}.get(speed_mode, 2)
 
 
 @dataclass
@@ -182,6 +187,13 @@ def encode_envelope(kappas: torch.Tensor, a_hat: torch.Tensor, v_end: torch.Tens
                       (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
 
 
+def encode_budget(kappas: torch.Tensor, a_hat: torch.Tensor, v_end: torch.Tensor, v_cap: torch.Tensor, v_max: float,
+                  spec: PlanSpec, v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """curvature knots [1/m], grip budget [m/s^2], end speed and profile ceiling [m/s] -> normalized action"""
+    return torch.cat([_knot_action(kappas, spec, v_meas), (a_hat / spec.a_hat_max * 2 - 1).clamp(-1, 1)[:, None],
+                      (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None], (v_cap / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
+
+
 def encode_knots(kappas: torch.Tensor, v_knots: torch.Tensor, v_max: float, spec: PlanSpec,
                  v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
     """curvature knots [1/m], speed at each knot [m/s] -> normalized action (B, 2 * N_KNOTS)"""
@@ -204,9 +216,13 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
         i0 = pos.floor().clamp(max=N_KNOTS - 2).long(); w = pos - i0.to(a.dtype)
         i0 = i0.expand(a.shape[0], n)
         return k, Lp, vk.gather(1, i0) * (1 - w) + vk.gather(1, i0 + 1) * w
-    if spec.speed_mode != "envelope":
-        raise ValueError(f"decode_profile is for the 'envelope' and 'knots' modes, got {spec.speed_mode!r}")
+    if spec.speed_mode not in ("envelope", "budget"):
+        raise ValueError(f"decode_profile is for the 'envelope', 'budget' and 'knots' modes, got {spec.speed_mode!r}")
     a_hat = ((a[:, N_KNOTS] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)[:, None]
+    if spec.speed_mode == "budget":
+        # the ceiling bounds every sample of the profile, so it is folded into the cap they all see
+        cap = torch.minimum(cap, ((a[:, N_KNOTS + 2] + 1.0) * 0.5 * v_max)[:, None])
+        speed_cap = cap[:, 0]
     v_end = torch.minimum((a[:, N_KNOTS + 1] + 1.0) * 0.5 * v_max, speed_cap)
     _, _, _, _, kap = path_points(k, Lp, n=n, return_kappa=True)
     g = kap.abs().clamp_min(1e-3) / a_hat                                   # 1 / v_curve^2

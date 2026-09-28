@@ -62,3 +62,35 @@ def test_the_forward_pass_respects_the_cars_power_limit():
     v = prof[0].numpy()
     gain = (v[1:] ** 2 - v[:-1] ** 2) / (2 * ds)                      # the acceleration each step implies
     assert gain.max() <= spec.a_drive_profile * spec.v_switch_profile / 6.0 + 1e-3
+
+
+def test_budget_ceiling_bounds_the_whole_profile_and_the_grip_budget_does_not_move():
+    spec = mpc.PlanSpec(speed_mode="budget")
+    k = torch.zeros(2, mpc.N_KNOTS)
+    a = mpc.encode_budget(k, torch.tensor([8.0, 8.0]), torch.tensor([9.0, 9.0]), torch.tensor([9.0, 3.0]), 10.0, spec)
+    _, _, prof = mpc.decode_profile(a, torch.tensor([3.0, 3.0]), 10.0, torch.tensor([10.0, 10.0]), spec)
+    assert float(prof[1].max()) <= 3.0 + 1e-4                          # the ceiling holds everywhere
+    assert float(prof[0].max()) > 3.5                                  # and without it the car may go
+    assert mpc.act_dim("budget") == mpc.N_KNOTS + 3
+
+
+def test_the_budget_teacher_puts_slowing_down_in_the_ceiling_not_in_the_grip():
+    from f1sim.raceline import Raceline
+    from f1sim import maps
+    tr = maps.load("gen:competition:0"); rl = Raceline.build_cached(tr)
+    cfg = Config(); cfg.sim.compile = False; cfg.rand.enabled = False
+    env = common.make_env([tr], 2, "cpu", EnvConfig(action_mode="plan", race_size=1, speed_mode="budget",
+                                                     speed_command="profile", compile_tracker=False), cfg=cfg, seed=1, rls=[rl])
+    teacher = common.make_teacher([rl], env)
+    env.reset(seed=1)
+    # on the teacher's own line (not the centreline), one car on it and one 0.4 m to its side
+    p0 = torch.tensor(rl.xy[40], dtype=torch.float32); t = torch.tensor(rl.xy[41] - rl.xy[39], dtype=torch.float32)
+    yaw0 = torch.atan2(t[1], t[0])
+    xy = p0[None].expand(2, 2).clone(); yaw = yaw0.expand(2).clone()
+    nrm = torch.stack([-torch.sin(yaw), torch.cos(yaw)], 1)
+    env.sim.reset(torch.arange(2), torch.cat([xy + nrm * torch.tensor([0.0, 0.4])[:, None], yaw[:, None]], 1), torch.full((2,), 3.0))
+    lab = env.teacher_label(teacher)
+    a_hat = (lab[:, mpc.N_KNOTS] + 1) / 2 * env.tracker.spec.a_hat_max
+    v_cap = (lab[:, mpc.N_KNOTS + 2] + 1) / 2 * env.ecfg.v_max_policy
+    assert abs(float(a_hat[0] - a_hat[1])) < 1e-4                      # 0.4 m off the line: same grip
+    assert float(v_cap[1]) < float(v_cap[0])                           # ... a lower ceiling instead

@@ -646,7 +646,7 @@ def main():
                     help="share of env resets that get a freshly drawn obstacle layout, placed as "
                          "analytic props from the hard-obstacle patterns (0 = off, and off is "
                          "byte-identical to a run without the flag)")
-    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots"], default=None,
+    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget"], default=None,
                     help="the plan's speed dimensions (f1sim.mpc.SPEED_MODES). Default: the --init checkpoint's own, "
                          "'linear' without one. A different one from the init's is refused")
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
