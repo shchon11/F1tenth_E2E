@@ -326,6 +326,11 @@ class RacelineTeacher:
         """
         from .mpc import decode, encode
         from .teacher_feasibility import project_speeds
+        if spec.speed_mode != "linear":
+            # A profile mode's speeds are built from the plan's own curvature, the grip budget and
+            # the car's drive / brake limits (`mpc.decode_profile`): feasible by construction, and
+            # its dimensions are not the two linear speeds this check certifies.
+            return action
         speed = plan_geometry_speed(state, plan_speed)
         k, length, v0, v1 = decode(action, speed, v_max, torch.full_like(speed, v_max), spec)
         B = state.shape[0]

@@ -563,6 +563,9 @@ def main():
                     help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). 'linear': two speeds, linear "
                          "between (every existing checkpoint). 'envelope': a grip belief a_hat and an end speed; the "
                          "profile follows the plan's own curvature. 'knots': a speed at every curvature knot")
+    ap.add_argument("--speed-command", choices=["tracker", "profile"], default="tracker",
+                    help="who sets the VESC speed command (EnvConfig.speed_command): the plan tracker, or the plan's "
+                         "own speed profile sent directly (for the profile speed modes)")
     ap.add_argument("--grip-quantile", type=float, default=0.5,
                     help="envelope only: pinball-loss quantile for the grip-belief dimension. 0.5 is the plain Huber "
                          "loss; below it, a student that cannot tell the floor yet assumes the slippery end")
@@ -756,6 +759,7 @@ def main():
         cfg.sim.compile = False
     env = common.make_env(tracks, a.envs, device,
                           EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
+                      speed_mode=a.speed_mode, speed_command=a.speed_command,
                                     scan_stack=a.scan_stack, scan_stride=a.scan_stride,
                                     opp_token=token, opp_future_model=a.opp_future_model,
                                     compile_tracker=not a.eager,
@@ -789,6 +793,7 @@ def main():
         # A separate simulator with M=1: no hidden/distant cars or invisible obstacle geometry.
         solo_env = common.make_env(solo_tracks, env.B // env.M, device,
             EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
+                      speed_mode=a.speed_mode, speed_command=a.speed_command,
                       scan_stack=a.scan_stack, scan_stride=a.scan_stride, opp_token="off",
                       race_size=1, compile_tracker=not a.eager),
             cfg=replace(cfg, sim=replace(cfg.sim)), seed=a.seed + 1, rls=solo_rls,
@@ -811,6 +816,11 @@ def main():
     chan = scan_channel_spec({"channels": a.scan_channels, "memory_tau_s": a.scan_memory_tau}) if a.scan_channels else None
     mem_spec = memory_spec(hidden_size=a.memory_hidden) if a.memory != "off" else None
     if a.init:
+        _init_out = common.plan_output_of(torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {})
+        if _init_out != {"speed_mode": a.speed_mode, "speed_command": a.speed_command}:
+            raise SystemExit(f"--init {a.init} was trained under {_init_out}, this run asks for speed_mode="
+                             f"{a.speed_mode!r} speed_command={a.speed_command!r}: its action dimensions would be "
+                             f"read as something they are not. Start the new output contract from scratch.")
         # RESUME vs WARM START. `load_for_memory` adds a GRU / extra channels / an opponent token to
         # a checkpoint that has none, and it refuses -- correctly -- to touch one that already has
         # them, because that would re-initialise a trained path. A resumed arm (--start-iter > 0)
@@ -977,6 +987,7 @@ def main():
                 "samples": sum(len(b) for b in bufs), "metrics": m, "metrics_from_iter": m_iter,
                 "teacher": teacher_metrics,
                 "action_mode": a.action_mode, "teacher_kind": a.teacher_kind, "teacher_desc": teacher_desc,
+                "speed_mode": a.speed_mode, "speed_command": a.speed_command,
                 "collection_mix": mix, "solo_samples": counts["solo"], "traffic_samples": counts["traffic"],
                 "opp_token": token, "opp_future_model": a.opp_future_model,
                 # declared before training and carried by every checkpoint, so an arm's loss is

@@ -239,8 +239,11 @@ def test_mixed_true_nominal_and_conservative_labels_use_their_declared_grip_sema
     spec = PlanSpec()
     state = torch.zeros(3, 8)
     state[:, 3] = 6.0
+    # Peak curvature 0.5, not the 0.8 it was: with the measured understeer (k_us 0.02 since
+    # 2026-09-28) full lock holds 0.8 1/m only up to ~3.4 m/s, so on that arc the steering limit
+    # bound before any friction did and every grip label came out the same speed.
     action = encode(
-        torch.tensor([[0.0, 0.3, 0.8, 0.8, 0.3, 0.0]]).expand(3, -1),
+        torch.tensor([[0.0, 0.3, 0.5, 0.5, 0.3, 0.0]]).expand(3, -1),
         torch.full((3,), 7.0), torch.full((3,), 7.0), 8.0, spec
     )
     # The nominal and conservative rows deliberately receive the same low true mu.  Nominal

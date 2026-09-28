@@ -646,6 +646,11 @@ def main():
                     help="share of env resets that get a freshly drawn obstacle layout, placed as "
                          "analytic props from the hard-obstacle patterns (0 = off, and off is "
                          "byte-identical to a run without the flag)")
+    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots"], default=None,
+                    help="the plan's speed dimensions (f1sim.mpc.SPEED_MODES). Default: the --init checkpoint's own, "
+                         "'linear' without one. A different one from the init's is refused")
+    ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
+                    help="who sets the VESC speed command (EnvConfig.speed_command). Default: the init's own")
     ap.add_argument("--plan-kappa-mode", choices=["absolute", "feasible"], default="absolute",
                     help="what a curvature knot of +-1 means: +-1.6 1/m ('absolute', every run before "
                          "this) or the tightest arc the tyres hold at the plan's speed ('feasible'). "
@@ -777,6 +782,15 @@ def main():
         raise SystemExit(f"--scan-channels {unknown}: known channels are {', '.join(SCAN_CHANNELS)}")
     init_is_conditional = bool(a.init) and int(torch.load(a.init, map_location="cpu", weights_only=False)
                                                 ["meta"].get("cond_dim", 0)) > 0
+    # The plan-output contract comes from the checkpoint the run starts from; a flag may only restate it.
+    _init_out = (common.plan_output_of(torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {})
+                 if a.init else {"speed_mode": "linear", "speed_command": "tracker"})
+    for _k in ("speed_mode", "speed_command"):
+        if getattr(a, _k) is None:
+            setattr(a, _k, _init_out[_k])
+        elif a.init and getattr(a, _k) != _init_out[_k]:
+            raise SystemExit(f"--{_k.replace('_', '-')} {getattr(a, _k)!r}: --init {a.init} was trained under "
+                             f"{_init_out[_k]!r}, and its action dimensions mean that")
     if a.memory != "off" and a.cond != "none" and not init_is_conditional:
         # Both would be migrated at once: the conditioning projection and the GRU's output projection,
         # two zero-initialised additions nothing has measured together. A checkpoint that is already
@@ -907,6 +921,7 @@ def main():
                                                               opp_future_model=a.opp_future_model,
                                                               plan_kappa_mode=a.plan_kappa_mode,
                                                               plan_kappa_a_lat=a.plan_kappa_a_lat,
+                                                              speed_mode=a.speed_mode, speed_command=a.speed_command,
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
@@ -1394,6 +1409,7 @@ def main():
         # What this policy's curvature knots mean. A checkpoint driven under the other mode is a
         # different policy, so the evaluation and the console read this rather than assume.
         "plan_kappa_mode": str(a.plan_kappa_mode), "plan_kappa_a_lat": float(a.plan_kappa_a_lat),
+        "speed_mode": str(a.speed_mode), "speed_command": str(a.speed_command),
         "memory": dict(model.meta.get("memory") or {}) or None,
         "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
         "wandb_group": a.wandb_group,

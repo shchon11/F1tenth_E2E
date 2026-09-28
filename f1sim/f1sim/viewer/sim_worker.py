@@ -1010,6 +1010,8 @@ class SimWorker:
         self.stage(gen, "env")
         spec = extra.get("spec") or {}
         exp_meta = extra.get("experiment") or {}
+        from ..learn.common import plan_output_of
+        _plan_out = plan_output_of(extra)
         proc_kw, proc_src = {}, ""
         if getattr(cfg, "procedural", False):
             if scenario.choice:
@@ -1041,6 +1043,10 @@ class SimWorker:
             # by five at racing speed.
             plan_kappa_mode=str(exp_meta.get("plan_kappa_mode", "absolute")),
             plan_kappa_a_lat=float(exp_meta.get("plan_kappa_a_lat", 8.0)),
+            # ... and what its speed dimensions mean and who turns them into the VESC command
+            # (learn.common.plan_output_of): a profile-mode policy read as "linear" would have its
+            # grip belief taken for a speed.
+            **({k: v for k, v in _plan_out.items()} if mode == "plan" else {}),
             **proc_kw)
         if "action_history" in spec:
             # `watch.main` does not pass this through, so a checkpoint trained with a different

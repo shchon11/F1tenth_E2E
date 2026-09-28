@@ -408,6 +408,15 @@ class EnvConfig:
     #: tracker itself plans only ~2.5 m/s^2 while its reference leads the car, so the lead it adds is
     #: small; see docs/research/layout-line-teacher-2026-09-24.md.
     tracker_speed_ff: bool = False
+    #: Who sets the speed command (2026-09-28). "tracker": the plan tracker's predicted speed, as
+    #: every run before. "profile": the speed the plan's own profile asks for, sent straight to the
+    #: VESC -- the reference speed where the command lands plus the calibrated motor time constant
+    #: times the reference's acceleration (the inverse of the VESC's first-order loop). The tracker
+    #: still steers along a reference walked at that profile. Measured on the refitted car: the
+    #: tracker plans only ~2.5 m/s^2 and holds even the line teacher at ~75 % of its profile; with
+    #: the profile commanded directly the teacher laps ICCAS 4 % quicker. Meant for the profile
+    #: speed modes ("envelope", "knots"), whose profile is what the policy actually decides.
+    speed_command: str = "tracker"
     plan_kappa_a_lat: float = 8.0    # [m/s^2] "feasible" only: the lateral budget it scales by
     compile_tracker: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
@@ -913,6 +922,8 @@ class F1VecEnv:
         self.grip_budget = None                                # see `set_grip_budget`
         if e.action_mode == "plan":
             # `None` for the default mode, so the tracker builds the PlanSpec it always built
+            if e.speed_command not in ("tracker", "profile"):
+                raise ValueError(f"speed_command must be 'tracker' or 'profile', not {e.speed_command!r}")
             pspec = (None if e.speed_mode == "linear" and e.plan_kappa_mode == "absolute"
                      else PlanSpec(speed_mode=e.speed_mode, a_brake_profile=float(e.plan_a_brake),
                                    kappa_mode=e.plan_kappa_mode, kappa_a_lat=float(e.plan_kappa_a_lat)))
@@ -1027,7 +1038,7 @@ class F1VecEnv:
         self.tracker_cal[ids, 2] = P["speed_gain"][ids] * (1 + u(0.03))
         # measured once like the rest, to +-10 %: `tracker_speed_ff` reads it. Drawn only when it is
         # on -- a draw here moves the generator, and every spawn after it, for runs that never read it.
-        if self.ecfg.tracker_speed_ff:
+        if self.ecfg.tracker_speed_ff or self.ecfg.speed_command == "profile":
             self.tracker_motor_tau[ids] = P["motor_tau"][ids] * (1 + u(0.10))
 
     # ------------------------------------------------------------------ slots mode
@@ -2181,6 +2192,21 @@ class F1VecEnv:
                         + self.tracker_motor_tau * self.tracker.u_seq[:, 0, 1]).clamp_min(0.0)
                 raw = torch.stack([raw[:, 0], torch.where(raw[:, 1] < 0, raw[:, 1],
                                    torch.minimum(v_ff, self.speed_cap))], 1)
+            if self.ecfg.speed_command == "profile":
+                # The reference is time-indexed from now at the tracker's dt, starting at the
+                # measured speed and walked towards the plan's profile within the tracker's own
+                # drive / brake bounds. Read it where the command lands (the VESC's delay plus the
+                # zero-order hold of one control step) and add tau x its slope, so the first-order
+                # loop reaches the profile instead of trailing it by tau.
+                ref_v = self.tracker.last_ref[:, :, 3]
+                dt_t = self.tracker.spec.dt
+                t_land = (self.sim.P["cmd_delay"] + self.sim.control_dt) / dt_t
+                i0 = t_land.floor().long().clamp(0, ref_v.shape[1] - 2); w = (t_land - i0.float()).clamp(0, 1)
+                v_land = ref_v.gather(1, i0[:, None])[:, 0] * (1 - w) + ref_v.gather(1, i0[:, None] + 1)[:, 0] * w
+                slope = (ref_v.gather(1, i0[:, None] + 1)[:, 0] - ref_v.gather(1, i0[:, None])[:, 0]) / dt_t
+                v_pr = (v_land + self.tracker_motor_tau * slope).clamp_min(0.0)
+                raw = torch.stack([raw[:, 0], torch.where(raw[:, 1] < 0, raw[:, 1],
+                                   torch.minimum(v_pr, self.speed_cap))], 1)
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)

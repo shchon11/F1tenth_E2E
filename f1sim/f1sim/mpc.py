@@ -115,6 +115,12 @@ class PlanSpec:
     a_hat_max: float = 12.0        # [m/s^2] envelope: the lateral-acceleration belief spans [a_hat_min, a_hat_max]
     a_hat_min: float = 1.0
     a_brake_profile: float = 4.0   # [m/s^2] envelope: braking the backward pass plans with (the teacher's a_brake)
+    #: envelope: the drive side of the forward pass, as the car has it -- a current limit a_drive up
+    #: to v_switch and a power limit above it (a_drive * v_switch / v), the VehicleParams defaults
+    #: since the 2026-09-28 refit. Before that the forward pass used the tracker's a_max (6.0) with
+    #: no power limit, a car 7 % stronger off the line and far stronger at speed than this one.
+    a_drive_profile: float = 5.6
+    v_switch_profile: float = 6.0
     n_profile: int = 25            # dense samples of the speed profile, the same grid `path_points` uses
     envelope_forward: bool = True  # envelope: ramp the profile up from the measured speed (ellipse-limited drive)
 
@@ -215,7 +221,8 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
     if spec.envelope_forward:
         cols[0] = torch.minimum(cols[0], v_meas.abs().clamp_min(0.5))
         for i in range(1, n):               # forward: no more than can be gained from the speed it has
-            ax = spec.a_max * torch.sqrt((1.0 - (cols[i - 1] ** 2 * g[:, i - 1]) ** 2).clamp_min(0.0))
+            drive = spec.a_drive_profile * (spec.v_switch_profile / cols[i - 1].clamp_min(1e-3)).clamp(max=1.0)
+            ax = drive * torch.sqrt((1.0 - (cols[i - 1] ** 2 * g[:, i - 1]) ** 2).clamp_min(0.0))
             cols[i] = torch.minimum(cols[i], torch.sqrt(cols[i - 1] ** 2 + 2.0 * ax * ds))
     return k, Lp, torch.stack(cols, 1)
 

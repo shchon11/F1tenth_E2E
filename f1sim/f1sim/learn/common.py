@@ -350,6 +350,18 @@ def teacher_limits(a_lat: Optional[float] = None, a_acc: Optional[float] = None,
     return {k: float(v) for k, v in (("a_lat", a_lat), ("a_acc", a_acc), ("a_brake", a_brake)) if v is not None}
 
 
+def plan_output_of(extra: dict) -> dict:
+    """The plan-output contract a checkpoint was trained under: what its speed dimensions mean
+    (`speed_mode`) and who turns them into the VESC's speed command (`speed_command`). Read, never
+    assumed: a profile-mode policy driven as "linear" emits a grip belief and an end speed that
+    would be read as two speeds. Checkpoints written before 2026-09-28 carry neither and are
+    ("linear", "tracker")."""
+    extra = extra or {}
+    exp = extra.get("experiment") or {}
+    return {"speed_mode": str(extra.get("speed_mode") or exp.get("speed_mode") or "linear"),
+            "speed_command": str(extra.get("speed_command") or exp.get("speed_command") or "tracker")}
+
+
 def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0.0, **limits):
     """grip: which friction the teacher's speed profile assumes. "true" is privileged -- the label then
     depends on mu, which the student cannot observe, so identical scans get speed labels up to ~2.2x

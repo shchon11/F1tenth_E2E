@@ -68,7 +68,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              raceline_objective: str | None = None, teacher_limits: dict | None = None,
-             speed_mode: str | None = None, dial_offset: float = 0.0,
+             speed_mode: str | None = None, dial_offset: float = 0.0, speed_command: str | None = None,
              opp_slots="", opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              opp_reactive_probs: dict | None = None,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
@@ -228,7 +228,9 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         raise ValueError(f"probabilities given for {extra_probs}, which are not in opp_events; the "
                          f"run would produce a behaviour the report does not name")
     # A checkpoint says which speed dimensions it was trained to emit; the flag is for the teacher.
-    speed_mode = speed_mode or metadata.get("speed_mode", "linear")
+    _out = common.plan_output_of(metadata)
+    speed_mode = speed_mode or _out["speed_mode"]
+    speed_command = speed_command or _out["speed_command"]
     # ... and what its curvature knots mean. Scoring a "feasible" policy under "absolute" multiplies
     # every plan it emits by five at racing speed, so this is read, never assumed.
     exp_meta = metadata.get("experiment") or {}
@@ -237,6 +239,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      plan_kappa_mode=kappa_mode,
                      plan_kappa_a_lat=float(exp_meta.get("plan_kappa_a_lat", 8.0)),
                      speed_mode=speed_mode if mode == "plan" else "linear",
+                     speed_command=speed_command if mode == "plan" else "tracker",
                      plan_a_brake=float(metadata.get("plan_a_brake", limits.get("a_brake", 3.0))),
                      compile_tracker=not graph_runtime and bool(cfg.sim.compile),
                      race_size=race_size, opponent=opponent,
@@ -420,6 +423,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                        'movable': bool(env.ecfg.movable_obstacles),
                        'spawn_runway': float(env.ecfg.spawn_runway)} if env.procedural is not None else None,
         'plan_kappa_mode': str(getattr(env.ecfg, 'plan_kappa_mode', 'absolute')),
+        'speed_command': str(getattr(env.ecfg, 'speed_command', 'tracker')),
         'teacher_speed': float(teacher_speed) if teacher else None,
         'pinned_mu': float(mu) if mu is not None else None,
         'opp_token': (env.opp_token if env.opp_token != "off" else None),
@@ -544,6 +548,8 @@ def main() -> None:
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of the teacher's speed profile")
     ap.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] drive limit of the profile")
     ap.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] braking limit of the profile")
+    ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
+                    help="who sets the VESC speed command. Default: the checkpoint's own (tracker for every run before 2026-09-28)")
     ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots"], default=None,
                     help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). Default: the checkpoint's own")
     ap.add_argument("--dial-offset", type=float, default=0.0,
@@ -665,6 +671,7 @@ def main() -> None:
                         budget_laps=a.budget_laps if a.budget_laps > 0 else None, max_steps=a.max_steps,
                         raceline_margin=a.raceline_margin, teacher_grip=a.teacher_grip,
                         raceline_objective=a.raceline_objective, speed_mode=a.speed_mode, dial_offset=a.dial_offset,
+                        speed_command=a.speed_command,
                         teacher_limits=common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake),
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
