@@ -285,6 +285,14 @@ class OpponentSlot:
     reactive: Dict[str, float] = field(default_factory=dict)
     spawn: str = "ahead"
     seed: Optional[int] = None
+    #: A league for a teacher-driven slot (2026-09-28): at every full race reset this car is driven,
+    #: with probability `ckpt_p`, by one of these checkpoints (uniform) instead of by its teacher
+    #: kind. The learner then meets the drivers a network makes -- merging, defending, braking late --
+    #: next to the scripted ones, from one run. Off (empty) by default: nothing is drawn and every
+    #: configuration without it runs exactly as before. `speed_scale` follows the car's driver as it
+    #: always does: a profile scale under a teacher, a cap against `selfplay_pace_ref` under a network.
+    ckpt_mix: Tuple[str, ...] = ()
+    ckpt_p: float = 0.0
 
     # ---------------------------------------------------------------- construction
     @staticmethod
@@ -351,6 +359,22 @@ class OpponentSlot:
         if not (math.isfinite(rate) and rate >= 0.0):
             raise ValueError(f"opponent slot: event_rate {rate}: events per 10 s, >= 0")
         seed = d.get("seed", None)
+        ckpt_mix = d.get("ckpt_mix") or ()
+        if isinstance(ckpt_mix, str):
+            ckpt_mix = [ckpt_mix]
+        ckpt_mix = tuple(str(x) for x in ckpt_mix)
+        ckpt_p = float(d.get("ckpt_p", 0.5 if ckpt_mix else 0.0))
+        if ckpt_mix:
+            if not kind_of(kind).teacher:
+                raise ValueError(f"opponent slot: ckpt_mix on a {kind!r} slot -- a league draws between a "
+                                 f"teacher and checkpoints, so the slot has to be teacher-driven")
+            if d.get("checkpoint"):
+                raise ValueError("opponent slot: both checkpoint and ckpt_mix -- a fixed checkpoint "
+                                 "car and a league draw are two answers to who drives it")
+        if not (0.0 <= ckpt_p <= 1.0):
+            raise ValueError(f"opponent slot: ckpt_p {ckpt_p}: a probability is in [0, 1]")
+        if ckpt_p > 0 and not ckpt_mix:
+            raise ValueError("opponent slot: ckpt_p without ckpt_mix -- no checkpoints to draw")
         return OpponentSlot(
             kind=kind, kind_mix=mix,
             checkpoint=(str(d["checkpoint"]) if d.get("checkpoint") else None),
@@ -359,7 +383,8 @@ class OpponentSlot:
             label_grip=grip, speed_cap=cap,
             events=tuple(timed), event_rate=rate,
             reactive={k: float(v) for k, v in reactive.items() if float(v) > 0.0},
-            spawn=spawn, seed=(None if seed is None else int(seed)))
+            spawn=spawn, seed=(None if seed is None else int(seed)),
+            ckpt_mix=ckpt_mix, ckpt_p=(ckpt_p if ckpt_mix else 0.0))
 
     def to_dict(self) -> Dict:
         """The JSON object this slot came from -- only the fields that are not the default.
@@ -393,6 +418,9 @@ class OpponentSlot:
             out["spawn"] = self.spawn
         if self.seed is not None:
             out["seed"] = int(self.seed)
+        if self.ckpt_mix:
+            out["ckpt_mix"] = list(self.ckpt_mix)
+            out["ckpt_p"] = self.ckpt_p
         return out
 
     # ---------------------------------------------------------------- what it is
@@ -425,6 +453,8 @@ class OpponentSlot:
             parts.append(f"{'+'.join(self.events)}@{self.event_rate:g}/10s")
         if self.reactive:
             parts.append("+".join(f"{n} {p:g}" for n, p in sorted(self.reactive.items())))
+        if self.ckpt_mix:
+            parts.append(f"league {self.ckpt_p:.0%} of {len(self.ckpt_mix)} ckpt")
         parts.append(f"spawn {self.spawn}")
         return " · ".join(parts)
 
@@ -500,6 +530,9 @@ def validate_slots(slots: Sequence[OpponentSlot], race_size: int, *,
                              f"one, so it would be ignored. Use kind 'policy', or drop the path.")
         if kind.checkpoint and require_files and not os.path.exists(s.checkpoint):
             raise ValueError(f"{where}: no such checkpoint {s.checkpoint!r}.")
+        for ck in s.ckpt_mix:
+            if require_files and not os.path.exists(ck):
+                raise ValueError(f"{where}: no such checkpoint {ck!r} in ckpt_mix.")
         if not kind.teacher:
             if s.events or s.reactive:
                 raise ValueError(

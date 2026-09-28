@@ -740,8 +740,9 @@ class F1VecEnv:
             # entry is stateless apart from a runtime whose rows are the whole batch anyway.
             paths, seen = [], set()
             for sl in self.slots:
-                if sl.checkpoint and sl.checkpoint not in seen:
-                    seen.add(sl.checkpoint); paths.append(sl.checkpoint)
+                for ck in ((sl.checkpoint,) if sl.checkpoint else ()) + tuple(sl.ckpt_mix):
+                    if ck not in seen:
+                        seen.add(ck); paths.append(ck)
             self.pool_names = tuple(paths)
         if e.opponent == "pool":
             if self.M < 2:
@@ -1067,6 +1068,11 @@ class F1VecEnv:
         self.slot_cap = t(cap)[self.slot]
         self.slot_cap_set = t(cap_set, torch.bool)[self.slot]
         self.slot_grip_code = t(grip, torch.long)[self.slot]
+        #: League slots (`OpponentSlot.ckpt_mix`): per grid slot, the probability a race draws a
+        #: checkpoint for it and the driver codes it draws from. Empty when no slot has a league,
+        #: and then `_redraw_slot_league` draws nothing.
+        self._league = [(i, float(sl.ckpt_p), t([OPP_DRIVER_POOL + ck_index[c] for c in sl.ckpt_mix], torch.long))
+                        for i, sl in enumerate(self.slots, start=1) if sl.ckpt_mix and sl.ckpt_p > 0]
         #: (B,) the spawn each car's *race* drew, so a car respawning mid-race rejoins the grid its
         #: race started on. Only the `random` slots move; the rest are their own code for ever.
         self.slot_spawn_code = self.slot_spawn_of[self.slot].clone()
@@ -1247,6 +1253,25 @@ class F1VecEnv:
             code[:, i] = torch.where(full, pick, code[:, i])
         self._apply_slot_kinds()
 
+    def _redraw_slot_league(self, full: torch.Tensor, gen: torch.Generator) -> None:
+        """Per race that fully reset: does a league slot's car get a checkpoint or its teacher?
+
+        Before `_slot_speeds`, which reads `teacher_driven` to decide whether the drawn speed scale
+        goes on a teacher profile or on a network's cap. Learner rows never move: a league slot is a
+        teacher slot, and a checkpoint car is an opponent like any other.
+        """
+        if not self._league:
+            return
+        G = full.shape[0]
+        drv = self.opp_driver.view(G, self.M)
+        for i, p, codes in self._league:
+            use = torch.rand(G, device=self.device, generator=gen) < p
+            pick = codes[torch.randint(codes.numel(), (G,), device=self.device, generator=gen)]
+            new = torch.where(use, pick, torch.full_like(pick, OPP_DRIVER_TEACHER))
+            drv[:, i] = torch.where(full, new, drv[:, i])
+        self.teacher_driven.copy_((self.opp_driver == OPP_DRIVER_TEACHER) & (self.slot > 0))
+        self.pool_driven.copy_(self.opp_driver >= OPP_DRIVER_POOL)
+
     def _apply_slot_kinds(self) -> None:
         """Rebuild the alt-teacher masks from `slot_kind_code`, in place.
 
@@ -1304,6 +1329,7 @@ class F1VecEnv:
         G, M = full.shape[0], self.M
         codes = self._slot_spawn_codes(full, gen)                        # (G, M)
         self._redraw_slot_kinds(full, gen)
+        self._redraw_slot_league(full, gen)
         rank = self._slot_ranks(codes)
         gap_rank = e.spawn_gap[0] + (e.spawn_gap[1] - e.spawn_gap[0]) * torch.rand(
             G, M, device=self.device, generator=gen)
