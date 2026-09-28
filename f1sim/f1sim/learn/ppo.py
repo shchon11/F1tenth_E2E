@@ -922,6 +922,8 @@ def main():
                                                               plan_kappa_mode=a.plan_kappa_mode,
                                                               plan_kappa_a_lat=a.plan_kappa_a_lat,
                                                               speed_mode=a.speed_mode, speed_command=a.speed_command,
+                                                              tracker_speed_weight=_init_out.get("tracker_speed_weight"),
+                                                              tracker_a_max=_init_out.get("tracker_a_max"),
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
@@ -1410,6 +1412,7 @@ def main():
         # different policy, so the evaluation and the console read this rather than assume.
         "plan_kappa_mode": str(a.plan_kappa_mode), "plan_kappa_a_lat": float(a.plan_kappa_a_lat),
         "speed_mode": str(a.speed_mode), "speed_command": str(a.speed_command),
+        "tracker_speed_weight": _init_out.get("tracker_speed_weight"), "tracker_a_max": _init_out.get("tracker_a_max"),
         "memory": dict(model.meta.get("memory") or {}) or None,
         "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
         "wandb_group": a.wandb_group,

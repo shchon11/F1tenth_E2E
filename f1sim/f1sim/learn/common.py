@@ -358,8 +358,13 @@ def plan_output_of(extra: dict) -> dict:
     ("linear", "tracker")."""
     extra = extra or {}
     exp = extra.get("experiment") or {}
-    return {"speed_mode": str(extra.get("speed_mode") or exp.get("speed_mode") or "linear"),
-            "speed_command": str(extra.get("speed_command") or exp.get("speed_command") or "tracker")}
+    out = {"speed_mode": str(extra.get("speed_mode") or exp.get("speed_mode") or "linear"),
+           "speed_command": str(extra.get("speed_command") or exp.get("speed_command") or "tracker")}
+    for k in ("tracker_speed_weight", "tracker_a_max"):          # the tracker the plans were fitted to
+        v = extra.get(k, exp.get(k))
+        if v is not None:
+            out[k] = float(v)
+    return out
 
 
 def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0.0, **limits):

@@ -566,6 +566,8 @@ def main():
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default="tracker",
                     help="who sets the VESC speed command (EnvConfig.speed_command): the plan tracker, or the plan's "
                          "own speed profile sent directly (for the profile speed modes)")
+    ap.add_argument("--tracker-speed-weight", type=float, default=None, help="EnvConfig.tracker_speed_weight")
+    ap.add_argument("--tracker-a-max", type=float, default=None, help="EnvConfig.tracker_a_max")
     ap.add_argument("--grip-quantile", type=float, default=0.5,
                     help="envelope only: pinball-loss quantile for the grip-belief dimension. 0.5 is the plain Huber "
                          "loss; below it, a student that cannot tell the floor yet assumes the slippery end")
@@ -760,6 +762,7 @@ def main():
     env = common.make_env(tracks, a.envs, device,
                           EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
                       speed_mode=a.speed_mode, speed_command=a.speed_command,
+                      tracker_speed_weight=a.tracker_speed_weight, tracker_a_max=a.tracker_a_max,
                                     scan_stack=a.scan_stack, scan_stride=a.scan_stride,
                                     opp_token=token, opp_future_model=a.opp_future_model,
                                     compile_tracker=not a.eager,
@@ -794,6 +797,7 @@ def main():
         solo_env = common.make_env(solo_tracks, env.B // env.M, device,
             EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
                       speed_mode=a.speed_mode, speed_command=a.speed_command,
+                      tracker_speed_weight=a.tracker_speed_weight, tracker_a_max=a.tracker_a_max,
                       scan_stack=a.scan_stack, scan_stride=a.scan_stride, opp_token="off",
                       race_size=1, compile_tracker=not a.eager),
             cfg=replace(cfg, sim=replace(cfg.sim)), seed=a.seed + 1, rls=solo_rls,
@@ -817,7 +821,7 @@ def main():
     mem_spec = memory_spec(hidden_size=a.memory_hidden) if a.memory != "off" else None
     if a.init:
         _init_out = common.plan_output_of(torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {})
-        if _init_out != {"speed_mode": a.speed_mode, "speed_command": a.speed_command}:
+        if {k: _init_out.get(k) for k in ("speed_mode", "speed_command")} != {"speed_mode": a.speed_mode, "speed_command": a.speed_command}:
             raise SystemExit(f"--init {a.init} was trained under {_init_out}, this run asks for speed_mode="
                              f"{a.speed_mode!r} speed_command={a.speed_command!r}: its action dimensions would be "
                              f"read as something they are not. Start the new output contract from scratch.")
@@ -988,6 +992,7 @@ def main():
                 "teacher": teacher_metrics,
                 "action_mode": a.action_mode, "teacher_kind": a.teacher_kind, "teacher_desc": teacher_desc,
                 "speed_mode": a.speed_mode, "speed_command": a.speed_command,
+                "tracker_speed_weight": a.tracker_speed_weight, "tracker_a_max": a.tracker_a_max,
                 "collection_mix": mix, "solo_samples": counts["solo"], "traffic_samples": counts["traffic"],
                 "opp_token": token, "opp_future_model": a.opp_future_model,
                 # declared before training and carried by every checkpoint, so an arm's loss is

@@ -423,6 +423,11 @@ class EnvConfig:
     #: the first envelope/profile DAgger student (ICCAS): step-to-step command change median 0.16 m/s
     #: (p90 0.77) against 0.06 (0.17) through the tracker. 0 is no filter.
     speed_command_tau: float = 0.0
+    #: The plan tracker's speed-tracking weight and drive bound, when not None (2026-09-28). The
+    #: defaults (0.4, 6.0 m/s^2) plan ~2.5 m/s^2 while the reference leads the car; the line teacher
+    #: on ICCAS goes 8.618 -> 8.400 s with (2.0, 7.0) under the 'budget' output. None: unchanged.
+    tracker_speed_weight: Optional[float] = None
+    tracker_a_max: Optional[float] = None
     plan_kappa_a_lat: float = 8.0    # [m/s^2] "feasible" only: the lateral budget it scales by
     compile_tracker: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
@@ -930,9 +935,19 @@ class F1VecEnv:
             # `None` for the default mode, so the tracker builds the PlanSpec it always built
             if e.speed_command not in ("tracker", "profile"):
                 raise ValueError(f"speed_command must be 'tracker' or 'profile', not {e.speed_command!r}")
-            pspec = (None if e.speed_mode == "linear" and e.plan_kappa_mode == "absolute"
+            _trk = e.tracker_speed_weight is not None or e.tracker_a_max is not None
+            pspec = (None if e.speed_mode == "linear" and e.plan_kappa_mode == "absolute" and not _trk
                      else PlanSpec(speed_mode=e.speed_mode, a_brake_profile=float(e.plan_a_brake),
                                    kappa_mode=e.plan_kappa_mode, kappa_a_lat=float(e.plan_kappa_a_lat)))
+            if _trk:
+                import dataclasses as _dc
+                _kw = {}
+                if e.tracker_a_max is not None:
+                    _kw["a_max"] = float(e.tracker_a_max)
+                if e.tracker_speed_weight is not None:
+                    _kw["q"] = pspec.q[:3] + (float(e.tracker_speed_weight),)
+                    _kw["qf"] = pspec.qf[:3] + (float(e.tracker_speed_weight),)
+                pspec = _dc.replace(pspec, **_kw)
             self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
                                        e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
