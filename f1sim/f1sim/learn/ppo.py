@@ -226,10 +226,14 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
     d = torch.distributions.Normal(d.mean.float(), d.stddev.float())
     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, d).sum(1), w)
     ent_w = wmean(ent, w)
-    loss = (hyper.vf * vf + (0.0 if freeze_actor else 1.0) * (pg - hyper.ent * ent_w
-            + hyper.kl_coef * kl_ref) + hyper.aux_grip * aux + hyper.aux_opp * aux_o
+    # The auxiliary heads read the actor's trunk (encoder, memory), so while the actor is frozen they
+    # are off too: left on, they moved that trunk with the KL leash switched off, and a GRU warm start
+    # from a DAgger student drifted to kl_ref 13 -> 49 in two "frozen" updates (0.8 -> 0.3 unfrozen).
+    on = 0.0 if freeze_actor else 1.0
+    loss = (hyper.vf * vf + on * (pg - hyper.ent * ent_w + hyper.kl_coef * kl_ref
+            + hyper.aux_grip * aux + hyper.aux_opp * aux_o
             + hyper.aux_future * aux_f + hyper.aux_opp_mask * aux_m + hyper.aux_motion * aux_dv
-            + hyper.aux_floor * aux_fl)
+            + hyper.aux_floor * aux_fl))
     return {"pg": pg, "vf": vf, "ent": ent_w, "entropy_mean": ent.mean(), "kl_ref": kl_ref,
             "aux_grip": aux, "aux_opp": aux_o, "aux_future": aux_f,
             "aux_future_parts": aux_f_parts, "aux_opp_mask": aux_m,

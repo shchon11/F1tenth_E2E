@@ -102,6 +102,29 @@ def _spec_of(env):
     return replace(spec, opp_token="off") if spec.opp_token != "off" else spec
 
 
+def _check_contract(path: str, extra: Optional[dict], env) -> None:
+    """Refuse a checkpoint whose plan-output contract (`mpc.contract_of`) is not this env's.
+
+    The shape check above cannot catch it: "envelope" and "linear" are both N_KNOTS + 2 wide, and
+    the speed command or tracker weights do not change the width at all. The env decodes and tracks
+    every car's plan with its own one contract, so an entry trained under another would drive with
+    its speed dimensions read as something they never meant.
+    """
+    from ..mpc import contract_of
+    e = env.ecfg
+    have = contract_of(extra)
+    want = {"speed_mode": str(e.speed_mode), "speed_command": str(e.speed_command)}
+    for k in ("tracker_speed_weight", "tracker_a_max"):
+        if getattr(e, k, None) is not None:
+            want[k] = float(getattr(e, k))
+    if have != want:
+        raise ValueError(
+            f"opponent checkpoint {os.path.basename(str(path))} was trained under plan-output "
+            f"contract {have} but this env runs {want}. Every car's plan is decoded and tracked "
+            f"under the env's contract, so this entry's speed dimensions would mean something else: "
+            f"race it only in an env with its own contract.")
+
+
 def _check_compatible(path: str, meta: dict, env, spec) -> None:
     """Refuse a checkpoint whose observation or action space is not this env's.
 
@@ -172,6 +195,7 @@ class OpponentPool:
             model, extra = load_checkpoint(path, device, allow_controller=(want != "legacy"),
                                            allow_conditional=True)
             _check_compatible(path, dict(model.meta), env, spec)
+            _check_contract(path, extra, env)
             cond = None
             if int((model.meta.get("cond") or {}).get("dim", 0) or 0):
                 from .watch import dial_for

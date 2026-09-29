@@ -574,3 +574,33 @@ def test_export_does_not_carry_the_future_head(tmp_path, monkeypatch):
         side = json.load(f)
     assert side["outputs"] == ["action", "hidden_next"]
     assert "future_head" in side["meta"], "the checkpoint still records what it was trained with"
+
+
+def test_a_frozen_actor_is_frozen_the_auxiliary_head_included():
+    """--critic-warmup: nothing that feeds the actor moves. The future head reads the GRU, so while the
+    actor is frozen its term is off as well -- left on, it moved the recurrence with the KL leash off
+    (a DAgger warm start went kl_ref 13 -> 49 in two frozen updates)."""
+    torch.manual_seed(11)
+    m = ActorCritic(**SMALL, memory=memory_spec(hidden_size=32), future_head=future_spec(width=16))
+    with torch.no_grad():
+        m.actor.future.net[2].weight.normal_(0, 0.5)             # past the zero init: the GRU has a gradient
+    ref = copy.deepcopy(m.actor).eval()
+    for p in ref.parameters():
+        p.requires_grad_(False)
+    n = 12
+    b = _batch(m, n=n)
+    target = torch.randn(n, FUTURE_LABEL_DIM); target[:, FUTURE_PRESENT_INDEX] = 1.0
+
+    def gru_grad(freeze):
+        out = minibatch_losses(m, ref, scan=b["scan"], pro=b["pro"], priv=b["priv"], act=b["act"],
+                               logp_old=b["logp"], adv=b["adv"], ret=b["ret"], val_old=b["val"],
+                               w=b["mask"], hyper=PPOHyper(clip=0.2, vf=0.5, ent=0.0, kl_coef=0.05,
+                                                           aux_future=1.0),
+                               future=target, future_valid=torch.ones(n), freeze_actor=freeze)
+        m.zero_grad()
+        out["loss"].backward()
+        g = m.actor.memory.gru.weight_ih_l0.grad
+        return 0.0 if g is None else float(g.abs().max())
+
+    assert gru_grad(False) > 0
+    assert gru_grad(True) == 0.0

@@ -94,3 +94,20 @@ def test_the_budget_teacher_puts_slowing_down_in_the_ceiling_not_in_the_grip():
     v_cap = (lab[:, mpc.N_KNOTS + 2] + 1) / 2 * env.ecfg.v_max_policy
     assert abs(float(a_hat[0] - a_hat[1])) < 1e-4                      # 0.4 m off the line: same grip
     assert float(v_cap[1]) < float(v_cap[0])                           # ... a lower ceiling instead
+
+
+def test_an_opponent_under_another_contract_is_refused_even_when_its_width_fits():
+    from types import SimpleNamespace
+    import pytest
+    from f1sim.learn.opponent_pool import _check_contract
+    env = SimpleNamespace(ecfg=EnvConfig(action_mode="plan"))                  # linear / tracker
+    _check_contract("old.pt", {}, env)                                          # every pre-contract checkpoint
+    assert mpc.act_dim("envelope") == mpc.act_dim("linear")                     # why the shape check misses it
+    with pytest.raises(ValueError, match="contract"):
+        _check_contract("env.pt", {"speed_mode": "envelope", "speed_command": "profile"}, env)
+    coupled = SimpleNamespace(ecfg=EnvConfig(action_mode="plan", speed_mode="budget", tracker_speed_weight=2.0,
+                                             tracker_a_max=7.0))
+    _check_contract("budT.pt", {"experiment": {"speed_mode": "budget", "tracker_speed_weight": 2.0,
+                                               "tracker_a_max": 7.0}}, coupled)
+    with pytest.raises(ValueError, match="contract"):
+        _check_contract("bud.pt", {"speed_mode": "budget"}, coupled)             # same outputs, other tracker
