@@ -1332,8 +1332,13 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                     motion_heads: Optional[Sequence[str]] = None,
                     floor_head: Optional[dict] = None,
                     opp_token: Optional[str] = None,
-                    init_seed: Optional[int] = None) -> Tuple[ActorCritic, dict, list]:
+                    init_seed: Optional[int] = None,
+                    fresh_critic_ok: bool = False) -> Tuple[ActorCritic, dict, list]:
     """Load a feedforward checkpoint into a recurrent actor-critic, by name, preserving every weight.
+
+    `fresh_critic_ok`: a critic weight whose shape changed keeps the fresh initialisation instead of
+    refusing. Only for a checkpoint whose critic was never trained -- a DAgger student (`extra`
+    phase "dagger"), which imitates with the actor alone -- where nothing is lost; the caller decides.
 
     Warm start, not re-initialisation. The memory is an addition to the original network, so at
     step 0 the result *is* the original:
@@ -1470,6 +1475,7 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     #: and everything right of it is shifted, which is what makes the forward bit-identical.
     grown = {}
     widened = {}                                    # name -> (columns before the block, columns after)
+    kept_fresh = set()
     unused, mismatched = [], []
     for k, v in src.items():
         if k not in sd:
@@ -1490,6 +1496,9 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         if split is not None:
             widened[k] = split
         else:
+            if fresh_critic_ok and k.startswith("critic."):
+                kept_fresh.add(k)
+                continue                             # an untrained critic: its fresh weights stand
             mismatched.append((k, tuple(v.shape), tuple(sd[k].shape)))
     fresh = [k for k in sd if k not in src]
     if unused or mismatched or set(fresh) - allowed_fresh:
@@ -1517,6 +1526,8 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
                          f"changed elsewhere is a re-layout rather than an append.")
     with torch.no_grad():
         for k, v in src.items():
+            if k in kept_fresh:
+                continue
             if k in grown:
                 at, n = grown[k]
                 w = torch.zeros_like(sd[k])

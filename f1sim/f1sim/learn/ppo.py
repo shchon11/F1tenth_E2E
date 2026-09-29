@@ -1167,6 +1167,9 @@ def main():
             init_seed=(a.seed if a.name_seed_fresh else None),
             allow_controller=allow_controller_init,
             allow_conditional=bool(cond_dim) and init_is_conditional,
+            # a DAgger student's critic was never trained (DAgger fits the actor only), so a critic
+            # whose privileged input grew -- a solo student entering a race -- starts fresh
+            fresh_critic_ok=(torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {}).get("phase") == "dagger",
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})

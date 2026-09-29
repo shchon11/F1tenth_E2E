@@ -257,3 +257,18 @@ def test_a_conditional_checkpoint_takes_memory_bit_identically():
             a1, _, h1 = mem.act(scan, pro, deterministic=True, c=c, h=None)
             a2, _, _ = mem.act(scan, pro, deterministic=True, c=c, h=h1)
         assert torch.equal(a0, a1) and torch.equal(a0, a2), (a0 - a1).abs().max()
+
+
+def test_a_dagger_students_untrained_critic_may_start_fresh_in_a_wider_env_and_nothing_else_may(tmp_path):
+    """A solo DAgger student entering a race: the critic's privileged input grows by the opponent
+    block. DAgger never trains the critic, so its fresh weights may stand; a trained critic may not."""
+    torch.manual_seed(0)
+    m = ActorCritic(3, 36, 12, 5, act_dim=2)
+    p = str(tmp_path / "student.pt")
+    save_checkpoint(p, m, {"phase": "dagger"})
+    got, _extra, _fresh = load_for_memory(p, "cpu", memory_spec(hidden_size=16), override={"priv_dim": 9},
+                                          fresh_critic_ok=True)
+    for k, v in m.actor.state_dict().items():                  # the actor is copied untouched
+        assert torch.equal(got.actor.state_dict()[k], v), k
+    with pytest.raises(ValueError, match="not clean"):
+        load_for_memory(p, "cpu", memory_spec(hidden_size=16), override={"priv_dim": 9})
