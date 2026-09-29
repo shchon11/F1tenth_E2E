@@ -111,3 +111,46 @@ def test_an_opponent_under_another_contract_is_refused_even_when_its_width_fits(
                                                "tracker_a_max": 7.0}}, coupled)
     with pytest.raises(ValueError, match="contract"):
         _check_contract("bud.pt", {"speed_mode": "budget"}, coupled)             # same outputs, other tracker
+
+
+def _launch_budget(steps=20, **kw):
+    cfg = Config(); cfg.sim.compile = False; cfg.rand.enabled = False
+    env = common.make_env([_open_floor()], 2, "cpu", EnvConfig(action_mode="plan", race_size=1, collision_mode="soft",
+                                                               speed_mode="budget", compile_tracker=False, speed_cap=9.0,
+                                                               tracker_speed_weight=2.0, tracker_a_max=7.0, **kw),
+                          cfg=cfg, seed=1)
+    env.reset(seed=1)
+    env.sim.reset(torch.arange(2), torch.tensor([[5.0, 20.0, 0.0]] * 2), torch.full((2,), 2.0))
+    a = torch.zeros(2, env.act_dim)
+    a[:, -3:] = 1.0                                          # all the grip, top end speed, no ceiling
+    v0 = float(env.sim.state[0, 3])
+    for _ in range(steps):
+        env.step(a)
+    return (float(env.sim.state[0, 3]) - v0) / (steps * env.sim.control_dt)
+
+
+def test_a_coupled_budget_plan_asked_for_everything_gets_near_the_cars_drive_limit():
+    # 2026-09-30: the profile ramped from the measured speed while the iLQR started one latency
+    # ahead of it, and the command trailed the motor lag: ~2.6 m/s^2 of the car's 5.6.
+    old = _launch_budget()
+    new = _launch_budget(tracker_profile_from_prediction=True, tracker_speed_ff=True)
+    assert old < 3.0, old
+    assert new > 3.8 and new > old + 1.0, (new, old)
+
+
+def test_the_executor_flags_travel_with_the_contract():
+    ex = {"experiment": {"speed_mode": "budget", "tracker_speed_weight": 2.0, "tracker_a_max": 7.0,
+                         "tracker_profile_from_prediction": True, "tracker_speed_ff": True}}
+    c = mpc.contract_of(ex)
+    assert c["tracker_profile_from_prediction"] is True and c["tracker_speed_ff"] is True
+    assert mpc.contract_spec(c).profile_from_prediction is True
+    assert "tracker_speed_ff" not in mpc.contract_of({"tracker_speed_ff": False})   # old contracts compare equal
+    from types import SimpleNamespace
+    import pytest
+    from f1sim.learn.opponent_pool import _check_contract
+    env = SimpleNamespace(ecfg=EnvConfig(action_mode="plan", speed_mode="budget", tracker_speed_weight=2.0,
+                                         tracker_a_max=7.0, tracker_profile_from_prediction=True, tracker_speed_ff=True))
+    _check_contract("new.pt", ex, env)
+    with pytest.raises(ValueError, match="contract"):
+        _check_contract("budT.pt", {"experiment": {"speed_mode": "budget", "tracker_speed_weight": 2.0,
+                                                   "tracker_a_max": 7.0}}, env)

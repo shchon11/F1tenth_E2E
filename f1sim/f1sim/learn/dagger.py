@@ -568,6 +568,10 @@ def main():
                          "own speed profile sent directly (for the profile speed modes)")
     ap.add_argument("--tracker-speed-weight", type=float, default=None, help="EnvConfig.tracker_speed_weight")
     ap.add_argument("--tracker-a-max", type=float, default=None, help="EnvConfig.tracker_a_max")
+    ap.add_argument("--tracker-profile-from-prediction", action="store_true",
+                    help="EnvConfig.tracker_profile_from_prediction (profile speed modes)")
+    ap.add_argument("--tracker-speed-ff", action="store_true",
+                    help="EnvConfig.tracker_speed_ff: the VESC command is the motor-loop inverse of the tracker's plan")
     ap.add_argument("--grip-quantile", type=float, default=0.5,
                     help="envelope only: pinball-loss quantile for the grip-belief dimension. 0.5 is the plain Huber "
                          "loss; below it, a student that cannot tell the floor yet assumes the slippery end")
@@ -763,6 +767,8 @@ def main():
                           EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
                       speed_mode=a.speed_mode, speed_command=a.speed_command,
                       tracker_speed_weight=a.tracker_speed_weight, tracker_a_max=a.tracker_a_max,
+                      tracker_profile_from_prediction=a.tracker_profile_from_prediction,
+                      tracker_speed_ff=a.tracker_speed_ff,
                                     scan_stack=a.scan_stack, scan_stride=a.scan_stride,
                                     opp_token=token, opp_future_model=a.opp_future_model,
                                     compile_tracker=not a.eager,
@@ -798,6 +804,8 @@ def main():
             EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
                       speed_mode=a.speed_mode, speed_command=a.speed_command,
                       tracker_speed_weight=a.tracker_speed_weight, tracker_a_max=a.tracker_a_max,
+                      tracker_profile_from_prediction=a.tracker_profile_from_prediction,
+                      tracker_speed_ff=a.tracker_speed_ff,
                       scan_stack=a.scan_stack, scan_stride=a.scan_stride, opp_token="off",
                       race_size=1, compile_tracker=not a.eager),
             cfg=replace(cfg, sim=replace(cfg.sim)), seed=a.seed + 1, rls=solo_rls,
@@ -993,6 +1001,8 @@ def main():
                 "action_mode": a.action_mode, "teacher_kind": a.teacher_kind, "teacher_desc": teacher_desc,
                 "speed_mode": a.speed_mode, "speed_command": a.speed_command,
                 "tracker_speed_weight": a.tracker_speed_weight, "tracker_a_max": a.tracker_a_max,
+                **({"tracker_profile_from_prediction": True} if a.tracker_profile_from_prediction else {}),
+                **({"tracker_speed_ff": True} if a.tracker_speed_ff else {}),
                 "collection_mix": mix, "solo_samples": counts["solo"], "traffic_samples": counts["traffic"],
                 "opp_token": token, "opp_future_model": a.opp_future_model,
                 # declared before training and carried by every checkpoint, so an arm's loss is

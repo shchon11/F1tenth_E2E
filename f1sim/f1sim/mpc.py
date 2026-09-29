@@ -128,6 +128,13 @@ class PlanSpec:
     v_switch_profile: float = 6.0
     n_profile: int = 25            # dense samples of the speed profile, the same grid `path_points` uses
     envelope_forward: bool = True  # envelope: ramp the profile up from the measured speed (ellipse-limited drive)
+    #: Profile modes: start the profile's forward pass and the reference walk from the speed the
+    #: tracker predicts for when its command lands (measured + planned accel x delay) instead of the
+    #: measured speed. From the measured one, the reference sat ~0.2 m/s under the prediction the
+    #: iLQR starts from, so every re-plan saw itself ahead of its own ramp and planned ~3.7 of the
+    #: ramp's 5.4 m/s^2: a car asked for everything reached 3.0 m/s^2 of its 5.6 (2026-09-30).
+    #: False keeps every checkpoint trained before that exact; a contract field (`contract_of`).
+    profile_from_prediction: bool = False
 
 
 def contract_of(extra: Optional[dict]) -> dict:
@@ -142,6 +149,9 @@ def contract_of(extra: Optional[dict]) -> dict:
         v = extra.get(k, exp.get(k))
         if v is not None:
             out[k] = float(v)
+    for k in ("tracker_profile_from_prediction", "tracker_speed_ff"):
+        if extra.get(k, exp.get(k)):
+            out[k] = True                                    # present only when on: older contracts compare equal
     return out
 
 
@@ -156,12 +166,21 @@ def contract_spec(contract: Optional[dict], base: Optional["PlanSpec"] = None) -
     if mode == "linear" and w is None and amax is None and base is None:
         return None
     import dataclasses
-    spec = dataclasses.replace(base or PlanSpec(), speed_mode=mode)
+    spec = dataclasses.replace(base or PlanSpec(), speed_mode=mode,
+                               profile_from_prediction=bool(c.get("tracker_profile_from_prediction", False)))
     if amax is not None:
         spec = dataclasses.replace(spec, a_max=float(amax))
     if w is not None:
         spec = dataclasses.replace(spec, q=spec.q[:3] + (float(w),), qf=spec.qf[:3] + (float(w),))
     return spec
+
+
+def feedforward_speed_command(pred_v0: torch.Tensor, acc0: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+    """The VESC speed command under the `tracker_speed_ff` contract: the inverse of its first-order loop,
+    accel = (cmd - v) / tau. Commands the speed the tracker predicts for when the command lands
+    (`PlanTracker.last_pred[:, 0, 3]`, one latency ahead) plus tau x the acceleration it planned there
+    (`u_seq[:, 0, 1]`). Shared by the env and the car's controller node."""
+    return (pred_v0 + tau * acc0).clamp_min(0.0)
 
 
 def profile_speed_command(ref_v: torch.Tensor, dt: float, t_land: torch.Tensor, tau: torch.Tensor,
@@ -246,8 +265,12 @@ def encode_knots(kappas: torch.Tensor, v_knots: torch.Tensor, v_max: float, spec
     return torch.cat([_knot_action(kappas, spec, v_meas), (v_knots / v_max * 2 - 1).clamp(-1, 1)], 1)
 
 
-def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec):
+def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec,
+                   v_start: Optional[torch.Tensor] = None):
     """'envelope' / 'knots' action -> (kappa knots (B,K) [1/m], L_p (B,), speed profile (B, n_profile) [m/s]).
+
+    `v_start` (B,): the speed the forward pass ramps up from, when not the measured one
+    (`PlanSpec.profile_from_prediction`). The plan's length and curvature scale stay on `v_meas`.
 
     The profile is on `path_points`' own uniform arc grid, which is also the grid `reference`
     interpolates a `v_limit` on -- so it is handed to `reference` as one and nothing else changes."""
@@ -281,7 +304,7 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
         ax = spec.a_brake_profile * torch.sqrt((1.0 - (cols[i + 1] ** 2 * g[:, i + 1]) ** 2).clamp_min(0.0))
         cols[i] = torch.minimum(cols[i], torch.sqrt(cols[i + 1] ** 2 + 2.0 * ax * ds))
     if spec.envelope_forward:
-        cols[0] = torch.minimum(cols[0], v_meas.abs().clamp_min(0.5))
+        cols[0] = torch.minimum(cols[0], (v_meas if v_start is None else v_start).abs().clamp_min(0.5))
         for i in range(1, n):               # forward: no more than can be gained from the speed it has
             drive = spec.a_drive_profile * (spec.v_switch_profile / cols[i - 1].clamp_min(1e-3)).clamp(max=1.0)
             ax = drive * torch.sqrt((1.0 - (cols[i - 1] ** 2 * g[:, i - 1]) ** 2).clamp_min(0.0))
@@ -526,10 +549,12 @@ def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSp
     else:
         # The plan carries a whole profile. `reference` already knows how to follow one -- that is
         # what `v_limit` is -- so the linear target is set to the cap and the profile does the rest.
-        k, Lp, prof = decode_profile(action, v_meas, v_max, speed_cap, spec)
+        v_start = (v_meas.abs() + u_prev[:, 1] * delay).clamp_min(0.0) if spec.profile_from_prediction else None
+        k, Lp, prof = decode_profile(action, v_meas, v_max, speed_cap, spec, v_start=v_start)
         if v_limit is not None:
             prof = torch.minimum(prof, v_limit)
-        ref = reference(k, Lp, speed_cap, speed_cap, spec, v_meas, v_limit=prof, a_walk=a_walk)
+        ref = reference(k, Lp, speed_cap, speed_cap, spec, v_meas if v_start is None else v_start,
+                        v_limit=prof, a_walk=a_walk)
     v = v_meas.abs()
     Le = wb + spec.k_us * v * v
     steer_now = torch.atan(yaw_rate * Le / v.clamp_min(0.5)).clamp(-s_max, s_max)

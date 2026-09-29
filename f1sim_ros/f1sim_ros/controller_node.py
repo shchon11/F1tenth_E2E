@@ -482,6 +482,11 @@ class ControllerNode(Node):
         steer = float(max(-self.steer_max,
                           min(self.steer_max, (float(cmd[0]) - self.cal[0]) / self.cal[1])))
         speed = float(cmd[1])
+        if (getattr(self, "contract", None) or {}).get("tracker_speed_ff") and speed >= 0.0:
+            # the motor-loop inverse of the tracker's own plan, as in training (`f1sim.mpc.feedforward_speed_command`)
+            from f1sim.mpc import feedforward_speed_command
+            speed = min(float(feedforward_speed_command(self.tracker.last_pred[:, 0, 3], self.tracker.u_seq[:, 0, 1],
+                                                        self.motor_tau)[0]), self.speed_cap)
         if (getattr(self, "contract", None) or {}).get("speed_command") == "profile" and speed >= 0.0:
             # the plan's own profile sent to the VESC, as in training (`f1sim.mpc.profile_speed_command`)
             from f1sim.mpc import profile_speed_command

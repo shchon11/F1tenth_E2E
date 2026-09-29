@@ -117,6 +117,9 @@ def _check_contract(path: str, extra: Optional[dict], env) -> None:
     for k in ("tracker_speed_weight", "tracker_a_max"):
         if getattr(e, k, None) is not None:
             want[k] = float(getattr(e, k))
+    for k in ("tracker_profile_from_prediction", "tracker_speed_ff"):
+        if getattr(e, k, False):
+            want[k] = True
     if have != want:
         raise ValueError(
             f"opponent checkpoint {os.path.basename(str(path))} was trained under plan-output "
