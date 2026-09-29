@@ -401,6 +401,10 @@ def main():
                          "speed/safety balance the reward alone does not")
     ap.add_argument("--cap0", type=float, default=4.0); ap.add_argument("--cap1", type=float, default=8.0); ap.add_argument("--cap-steps", type=float, default=40e6)
     ap.add_argument("--critic-warmup", type=int, default=10, help="updates with the actor frozen")
+    ap.add_argument("--fresh-critic-ok", action="store_true",
+                    help="memory warm start only: a critic weight whose shape changed (a solo checkpoint's critic in a "
+                         "race, whose privileged input grew) keeps its fresh init instead of refusing; the actor must "
+                         "still copy exactly. Pair with --critic-warmup")
     ap.add_argument("--device", default="cuda"); ap.add_argument("--wandb", default="online")
     ap.add_argument("--log-every", type=int, default=1, help="updates between W&B rows (1 = every update)")
     ap.add_argument("--save-every", type=int, default=25); ap.add_argument("--seed", type=int, default=0)
@@ -1175,7 +1179,10 @@ def main():
             allow_conditional=bool(cond_dim) and init_is_conditional,
             # a DAgger student's critic was never trained (DAgger fits the actor only), so a critic
             # whose privileged input grew -- a solo student entering a race -- starts fresh
-            fresh_critic_ok=(torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {}).get("phase") == "dagger",
+            # --fresh-critic-ok says the same of a PPO critic trained for another env (a solo specialist
+            # entering a race): its input no longer means what it did, and the actor still has to copy exactly
+            fresh_critic_ok=(a.fresh_critic_ok or
+                             (torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {}).get("phase") == "dagger"),
             override={"n_stack": spec.scan_stack, "n_beams": spec.n_beams,
                       "proprio_dim": spec.proprio_dim, "priv_dim": critic_priv_dim,
                       "act_dim": env.act_dim})
