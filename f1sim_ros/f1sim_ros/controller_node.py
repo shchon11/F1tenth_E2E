@@ -96,6 +96,9 @@ class ControllerNode(Node):
         # The plan action space: the same iLQR tracker as in training turns the local trajectory
         # into (steer, speed); cmd_delay = the measured command latency of this car.
         d("wheelbase", 0.3302); d("cmd_delay", 0.035)
+        # the "profile" speed command (a checkpoint's plan-output contract, `f1sim.mpc.contract_of`):
+        # the VESC loop's time constant it inverts and the control period the command is held for
+        d("motor_tau", 0.2); d("control_dt", 0.025)
         # Residual servo calibration the stack's steering_angle_to_servo_offset/gain do not absorb
         # (rad, ratio); the published angle is (cmd - steer_bias) / steer_gain. See
         # docs/ros2.md -- the polarity is opposite between this car's two servo configurations, so
@@ -131,6 +134,8 @@ class ControllerNode(Node):
         p = lambda n: self.get_parameter(n).value
 
         self.device = torch.device(p("device"))
+        # the plain plan-output contract unless the checkpoint says otherwise (`_observation_spec`)
+        self.contract = {"speed_mode": "linear", "speed_command": "tracker"}
         self.spec = self._observation_spec(str(p("checkpoint")), int(p("n_beams")),
                                            float(p("range_max")), float(p("v_max")))
         self.speed_cap = float(p("speed_cap")); self.steer_max = float(p("steer_max"))
@@ -141,15 +146,29 @@ class ControllerNode(Node):
             raise ValueError(f"plan_timeout must be a positive finite number, got {self.plan_timeout}")
         self.sensors = SensorIntake(self.clock, self.get_logger(), self.timeout)
 
-        from f1sim.mpc import PlanTracker
+        from f1sim.mpc import PlanTracker, contract_spec
+        # How this checkpoint's plan is executed -- its speed dimensions, who sets the speed
+        # command and the tracker it was fitted to -- exactly as the simulator executed it in training.
         self.tracker = PlanTracker(1, self.device, float(p("wheelbase")), self.steer_max,
-                                   float(self.spec.v_max))
+                                   float(self.spec.v_max), spec=contract_spec(self.contract))
+        self.motor_tau = torch.tensor([float(p("motor_tau"))], device=self.device)
+        self.control_dt = float(p("control_dt"))
         self.delay = torch.tensor([float(p("cmd_delay"))], device=self.device)
         # Plan controller arm. "fixed_low" (default) limits corner speed and accel/brake budgets for
         # a conservative constant friction; "legacy" is the untouched tracker. A "+clearance" suffix
         # adds the geometry layer: a local occupancy built from this scan alone (no map), and the
         # plan bent and slowed until it keeps `clearance_margin` from anything the scanner saw.
         self.controller_arm = str(p("controller"))
+        from f1sim.mpc import act_dim as _act_dim
+        if _act_dim(self.contract["speed_mode"]) != 8:
+            raise ValueError(
+                f"the checkpoint's plans are '{self.contract['speed_mode']}' with "
+                f"{_act_dim(self.contract['speed_mode'])} numbers, and f1sim_interfaces/Plan carries a "
+                f"fixed 8; the message has to grow before this checkpoint can drive the car")
+        if self.contract["speed_mode"] != "linear" and self.controller_arm != "legacy":
+            raise ValueError(
+                f"the checkpoint's plans are '{self.contract['speed_mode']}' (a speed profile), and the "
+                f"'{self.controller_arm}' arm reads plans as two linear speeds; run it with controller:=legacy")
         self.grip = install_grip_arm(self.tracker, self.controller_arm, self.device,
                                      mu=(float(p("grip_mu")) or None))
         self.clearance = install_clearance_arm(self.tracker, self.controller_arm, self.device,
@@ -251,6 +270,7 @@ class ControllerNode(Node):
         rather than an error. The explicit parameters are for a controller with no checkpoint on
         this disk; giving both and disagreeing is refused rather than resolved by precedence.
         """
+        self.contract = {"speed_mode": "linear", "speed_command": "tracker"}   # no checkpoint: the plain contract
         from f1sim.learn.obs import ObsSpec as _Spec
         override = {k: v for k, v in (("n_beams", int(n_beams)), ("range_max", float(range_max)),
                                       ("v_max", float(v_max))) if v}
@@ -261,6 +281,8 @@ class ControllerNode(Node):
                     "tracker fall back to the ObsSpec defaults, which is right only by accident.")
             return _Spec(**override)
         ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        from f1sim.mpc import contract_of
+        self.contract = contract_of(ck.get("extra"))
         spec_d = dict((ck.get("extra") or {}).get("spec") or {})
         spec = _Spec(**spec_d) if spec_d else _Spec()
         for k, v in override.items():
@@ -460,6 +482,13 @@ class ControllerNode(Node):
         steer = float(max(-self.steer_max,
                           min(self.steer_max, (float(cmd[0]) - self.cal[0]) / self.cal[1])))
         speed = float(cmd[1])
+        if (getattr(self, "contract", None) or {}).get("speed_command") == "profile" and speed >= 0.0:
+            # the plan's own profile sent to the VESC, as in training (`f1sim.mpc.profile_speed_command`)
+            from f1sim.mpc import profile_speed_command
+            dt_t = self.tracker.spec.dt
+            t_land = (self.delay + self.control_dt) / dt_t
+            speed = min(float(profile_speed_command(self.tracker.last_ref[:, :, 3], dt_t, t_land,
+                                                    self.motor_tau)[0]), self.speed_cap)
         if self.traction is not None:
             # Last thing before the command leaves, and *before* `speed_gain`: the guard reasons in
             # the car's own m/s -- it compares the command against a body speed estimated from this

@@ -351,20 +351,11 @@ def teacher_limits(a_lat: Optional[float] = None, a_acc: Optional[float] = None,
 
 
 def plan_output_of(extra: dict) -> dict:
-    """The plan-output contract a checkpoint was trained under: what its speed dimensions mean
-    (`speed_mode`) and who turns them into the VESC's speed command (`speed_command`). Read, never
-    assumed: a profile-mode policy driven as "linear" emits a grip belief and an end speed that
-    would be read as two speeds. Checkpoints written before 2026-09-28 carry neither and are
-    ("linear", "tracker")."""
-    extra = extra or {}
-    exp = extra.get("experiment") or {}
-    out = {"speed_mode": str(extra.get("speed_mode") or exp.get("speed_mode") or "linear"),
-           "speed_command": str(extra.get("speed_command") or exp.get("speed_command") or "tracker")}
-    for k in ("tracker_speed_weight", "tracker_a_max"):          # the tracker the plans were fitted to
-        v = extra.get(k, exp.get(k))
-        if v is not None:
-            out[k] = float(v)
-    return out
+    """The plan-output contract a checkpoint was trained under (`mpc.contract_of`, which the car's
+    controller node reads too). Read, never assumed: a profile-mode policy driven as "linear" emits a
+    grip belief and an end speed that would be read as two speeds."""
+    from ..mpc import contract_of
+    return contract_of(extra)
 
 
 def make_teacher(rls, env: F1VecEnv, grip: str = "true", recover_time: float = 0.0, **limits):

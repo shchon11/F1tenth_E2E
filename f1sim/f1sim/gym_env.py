@@ -2219,18 +2219,10 @@ class F1VecEnv:
                 # drive / brake bounds. Read it where the command lands (the VESC's delay plus the
                 # zero-order hold of one control step) and add tau x its slope, so the first-order
                 # loop reaches the profile instead of trailing it by tau.
-                ref_v = self.tracker.last_ref[:, :, 3]
-                dt_t = self.tracker.spec.dt
-                t_land = (self.sim.P["cmd_delay"] + self.sim.control_dt) / dt_t
-                i0 = t_land.floor().long().clamp(0, ref_v.shape[1] - 2); w = (t_land - i0.float()).clamp(0, 1)
-                v_land = ref_v.gather(1, i0[:, None])[:, 0] * (1 - w) + ref_v.gather(1, i0[:, None] + 1)[:, 0] * w
-                slope = (ref_v.gather(1, i0[:, None] + 1)[:, 0] - ref_v.gather(1, i0[:, None])[:, 0]) / dt_t
-                # Never below the tracker's own walking speed (`mpc.reference` walks a linear plan at
-                # >= 0.3 m/s). The teachers' labels lean on it: a car stopped and turned far off its
-                # line is labelled "speed 0, full lock", which the tracker executes as a slow turn back
-                # onto the line. Without the floor that label parks the car for good -- the first
-                # budget-mode student stood still 68 % of the time on blackbox2022_3 reversed.
-                v_pr = (v_land + self.tracker_motor_tau * slope).clamp_min(0.3)
+                from .mpc import profile_speed_command
+                t_land = (self.sim.P["cmd_delay"] + self.sim.control_dt) / self.tracker.spec.dt
+                v_pr = profile_speed_command(self.tracker.last_ref[:, :, 3], self.tracker.spec.dt, t_land,
+                                             self.tracker_motor_tau)
                 if self.ecfg.speed_command_tau > 0:
                     k_f = self.sim.control_dt / (self.ecfg.speed_command_tau + self.sim.control_dt)
                     prev = getattr(self, "_v_pr_prev", None)

@@ -130,6 +130,52 @@ class PlanSpec:
     envelope_forward: bool = True  # envelope: ramp the profile up from the measured speed (ellipse-limited drive)
 
 
+def contract_of(extra: Optional[dict]) -> dict:
+    """The plan-output contract a checkpoint was trained under, from its `extra` block: what its speed
+    dimensions mean, who sets the VESC speed command and the tracker it was fitted to. Checkpoints
+    written before 2026-09-28 carry none of it and are ("linear", "tracker", default tracker)."""
+    extra = extra or {}
+    exp = extra.get("experiment") or {}
+    out = {"speed_mode": str(extra.get("speed_mode") or exp.get("speed_mode") or "linear"),
+           "speed_command": str(extra.get("speed_command") or exp.get("speed_command") or "tracker")}
+    for k in ("tracker_speed_weight", "tracker_a_max"):
+        v = extra.get(k, exp.get(k))
+        if v is not None:
+            out[k] = float(v)
+    return out
+
+
+def contract_spec(contract: Optional[dict], base: Optional["PlanSpec"] = None) -> Optional["PlanSpec"]:
+    """The tracker spec a checkpoint's plan-output contract (`learn.common.plan_output_of`) asks for,
+    or None for the plain contract (linear speeds, tracker command, default tracker) -- the spec every
+    runtime has always built. Shared by the env, the console and the car's controller node, so the
+    three execute a plan the same way."""
+    c = contract or {}
+    mode = str(c.get("speed_mode", "linear"))
+    w, amax = c.get("tracker_speed_weight"), c.get("tracker_a_max")
+    if mode == "linear" and w is None and amax is None and base is None:
+        return None
+    import dataclasses
+    spec = dataclasses.replace(base or PlanSpec(), speed_mode=mode)
+    if amax is not None:
+        spec = dataclasses.replace(spec, a_max=float(amax))
+    if w is not None:
+        spec = dataclasses.replace(spec, q=spec.q[:3] + (float(w),), qf=spec.qf[:3] + (float(w),))
+    return spec
+
+
+def profile_speed_command(ref_v: torch.Tensor, dt: float, t_land: torch.Tensor, tau: torch.Tensor,
+                          floor: float = 0.3) -> torch.Tensor:
+    """The VESC speed command for the "profile" contract: the tracker reference's speed where the
+    command lands (`t_land`, in reference steps) plus tau x its slope -- the inverse of the VESC's
+    first-order loop -- and never under the tracker's own walking speed (`floor`), which the teachers'
+    "speed 0, full lock" recovery labels rely on. `ref_v` (B, T) is `PlanTracker.last_ref[..., 3]`."""
+    i0 = t_land.floor().long().clamp(0, ref_v.shape[1] - 2)
+    w = (t_land - i0.to(ref_v.dtype)).clamp(0, 1)
+    a0 = ref_v.gather(1, i0[:, None])[:, 0]; a1 = ref_v.gather(1, i0[:, None] + 1)[:, 0]
+    return (a0 * (1 - w) + a1 * w + tau * (a1 - a0) / dt).clamp_min(floor)
+
+
 def plan_length(v: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
     return (spec.horizon_s * v.abs()).clamp(spec.len_min, spec.len_max)
 
