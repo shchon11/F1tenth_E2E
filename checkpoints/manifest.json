@@ -39,5 +39,16 @@
    "opt_param_names"
   ],
   "source_mb": 26.5
+ },
+ {
+  "file": "iccas_league_c_s949.pt",
+  "run": "spec_korea_c2newC_s949",
+  "sha256": "ed9849f8a633d8f1a254be76827820b1c8255d951217eaab3f3be01381690074",
+  "size_mb": 11.0,
+  "dropped": [
+   "opt",
+   "opt_param_names"
+  ],
+  "source_mb": 32.5
  }
 ]

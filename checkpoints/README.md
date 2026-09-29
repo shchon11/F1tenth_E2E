@@ -101,3 +101,23 @@ python3 -m f1sim.learn.evaluate checkpoints/iccas_specialist_s915_u768.pt --acti
     --teacher-a-lat 7.0 --teacher-a-acc 6.5 --teacher-a-brake 4.0 --raceline-objective min_time \
     --collision-mode soft --dial-offset 0.0
 ```
+
+## `iccas_league_c_s949.pt` (2026-09-29): the ICCAS specialist on the refitted simulator, trained with a league
+
+Trained on the simulator refitted to the car's recordings on 2026-09-28 (tyres, servo, drive limit,
+contacts, LiDAR porosity, tracker understeer k_us 0.02; `docs/research/sim-realism-2026-09-28.md`), so
+every earlier checkpoint here is an old-simulator policy and this is the first one for the current
+car. Recipe: s915u768 + GRU + opponent auxiliaries, rear-end and merge penalties, and a league -- in
+40 % of races the opponent is driven by one of three earlier policies instead of a planner
+(`OpponentSlot.ckpt_mix`). Linear plan output, tracker speed command (what the car's controller node runs).
+
+ICCAS, 4 seeds x 4 planner opponents (`docs/research/retrain-plan-2026-09-28.md`):
+
+| | car contacts | per km | passes | solo lap | props / km |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| same recipe without the league (2 training seeds) | 172 / 185 | 2.55 | 256 / 277 | 8.13 / 7.73 s | 3.04 / 2.11 |
+| **this file** | **126** | **1.82** | 246 | 8.18 s | **1.39** |
+| its league replicate (seed 951) | 170 | 2.40 | 245 | 7.90 s | 1.82 |
+
+Against learned opponents it never met (B s948, gate s944): 3.07 and 1.84 contacts / km, against
+8.40 and 7.33 for the recipe without the league. Re-measured after stripping: identical to the source run.
