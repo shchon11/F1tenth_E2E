@@ -54,14 +54,22 @@ XI = torch.linspace(0.0, 1.0, N_KNOTS)
 #:             END reach back to NOW -- linear's v1 ~ 0, budget's v_end 5.2 -> 2.2 m/s after race
 #:             training (straights 4.7 against the line's 8.0 m/s), both through the profile. Under
 #:             "timed" a late brake costs no speed now.
-SPEED_MODES = ("linear", "envelope", "knots", "budget", "timed")
+#:   tspeed    N_ACC + 1 numbers (2026-09-30): "timed" with the SPEED at N_ACC time knots (horizon_s / N_ACC
+#:             apart, the last at horizon_s) instead of the acceleration; piecewise linear in time from the
+#:             speed the car will have when the command lands, under the same instantaneous limits and no
+#:             backward pass. Why: an acceleration label is bang-bang -- measured on ICCAS, a 0.2 m/s change
+#:             of the car's speed moves "timed"'s speed dimensions 0.118 on average (p90 0.50, max 0.80 of
+#:             the range 2) against 0.02 for linear and budget, and the "timed" DAgger student finished 69.9 %
+#:             of held-out runs against 77.7 %. A speed at a time is continuous in the state, and is what the
+#:             "position every t seconds" convention says anyway.
+SPEED_MODES = ("linear", "envelope", "knots", "budget", "timed", "tspeed")
 N_ACC = 4                         # acceleration knots over the plan's horizon_s (0.5 s apart at 1.5 s)
 
 
 def act_dim(speed_mode: str = "linear") -> int:
     if speed_mode not in SPEED_MODES:
         raise ValueError(f"speed_mode must be one of {SPEED_MODES}, got {speed_mode!r}")
-    return N_KNOTS + {"knots": N_KNOTS, "budget": 3, "timed": N_ACC + 1}.get(speed_mode, 2)
+    return N_KNOTS + {"knots": N_KNOTS, "budget": 3, "timed": N_ACC + 1, "tspeed": N_ACC + 1}.get(speed_mode, 2)
 
 
 @dataclass
@@ -280,8 +288,15 @@ def encode_timed(kappas: torch.Tensor, acc: torch.Tensor, a_hat: torch.Tensor, s
                       (a_hat / spec.a_hat_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
 
 
+def encode_tspeed(kappas: torch.Tensor, v_knots: torch.Tensor, a_hat: torch.Tensor, v_max: float, spec: PlanSpec,
+                  v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """curvature knots [1/m], speed at the N_ACC time knots [m/s], grip budget [m/s^2] -> normalized action"""
+    return torch.cat([_knot_action(kappas, spec, v_meas), (v_knots / v_max * 2 - 1).clamp(-1, 1),
+                      (a_hat / spec.a_hat_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
+
+
 def _decode_timed(a: torch.Tensor, k: torch.Tensor, Lp: torch.Tensor, v0: torch.Tensor, speed_cap: torch.Tensor,
-                  spec: PlanSpec) -> torch.Tensor:
+                  spec: PlanSpec, v_max: float = 10.0) -> torch.Tensor:
     """'timed': integrate the acceleration knots in time along the path, return the speed on the path's
     arc grid (B, n_profile). Limits are instantaneous only (see SPEED_MODES)."""
     n = spec.n_profile
@@ -289,6 +304,9 @@ def _decode_timed(a: torch.Tensor, k: torch.Tensor, Lp: torch.Tensor, v0: torch.
     acc_n = a[:, N_KNOTS:N_KNOTS + N_ACC]
     a_hat = ((a[:, N_KNOTS + N_ACC] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)
     acc_k = torch.where(acc_n >= 0, acc_n * spec.a_drive_profile, acc_n * spec.a_brake)
+    tspeed = spec.speed_mode == "tspeed"
+    if tspeed:
+        v_k = (acc_n + 1.0) * 0.5 * v_max                                 # (B, N_ACC) speed at t_1 .. t_N
     M = spec.n_time
     dt = spec.horizon_s / M
     ds = (Lp / (n - 1)).clamp_min(1e-3)
@@ -296,10 +314,19 @@ def _decode_timed(a: torch.Tensor, k: torch.Tensor, Lp: torch.Tensor, v0: torch.
     v = torch.minimum(v, speed_cap)
     s = torch.zeros_like(v)
     ts, vs = [s], [v]
+    v_first = v
     for i in range(M):                       # Python constants: unrolls, graph-safe
-        pos = (i / M) * (N_ACC - 1)
-        j = min(int(pos), N_ACC - 2); w = pos - j
-        a_cmd = acc_k[:, j] * (1 - w) + acc_k[:, j + 1] * w
+        if tspeed:
+            # the target speed one step on, linear in time from the start speed through the knots
+            q = (i + 1) / M * N_ACC                                     # in knot intervals
+            j = min(int(math.ceil(q)) - 1, N_ACC - 1); w = q - j
+            lo = v_first if j == 0 else v_k[:, j - 1]
+            a_cmd = (lo * (1 - w) + v_k[:, j] * w - v) / dt
+            a_cmd = a_cmd.clamp(min=-spec.a_brake)
+        else:
+            pos = (i / M) * (N_ACC - 1)
+            j = min(int(pos), N_ACC - 2); w = pos - j
+            a_cmd = acc_k[:, j] * (1 - w) + acc_k[:, j + 1] * w
         fi = (s / ds).clamp(max=n - 1.001); i0 = fi.floor().long(); wf = fi - i0.to(v.dtype)
         kap_here = kap.gather(1, i0[:, None])[:, 0] * (1 - wf) + kap.gather(1, (i0 + 1).clamp(max=n - 1)[:, None])[:, 0] * wf
         a_y = v * v * kap_here.abs()
@@ -349,8 +376,8 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
         i0 = pos.floor().clamp(max=N_KNOTS - 2).long(); w = pos - i0.to(a.dtype)
         i0 = i0.expand(a.shape[0], n)
         return k, Lp, vk.gather(1, i0) * (1 - w) + vk.gather(1, i0 + 1) * w
-    if spec.speed_mode == "timed":
-        return k, Lp, _decode_timed(a, k, Lp, v_meas if v_start is None else v_start, speed_cap, spec)
+    if spec.speed_mode in ("timed", "tspeed"):
+        return k, Lp, _decode_timed(a, k, Lp, v_meas if v_start is None else v_start, speed_cap, spec, v_max)
     if spec.speed_mode not in ("envelope", "budget"):
         raise ValueError(f"decode_profile is for the 'envelope', 'budget', 'knots' and 'timed' modes, got {spec.speed_mode!r}")
     a_hat = ((a[:, N_KNOTS] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)[:, None]
@@ -618,7 +645,7 @@ def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSp
         # "timed" always starts from the prediction: its speed is an integral in time from the moment
         # the command lands, and from the measured speed it would trail the iLQR's first state
         v_start = ((v_meas.abs() + u_prev[:, 1] * delay).clamp_min(0.0)
-                   if spec.profile_from_prediction or spec.speed_mode == "timed" else None)
+                   if spec.profile_from_prediction or spec.speed_mode in ("timed", "tspeed") else None)
         k, Lp, prof = decode_profile(action, v_meas, v_max, speed_cap, spec, v_start=v_start)
         if v_limit is not None:
             prof = torch.minimum(prof, v_limit)

@@ -204,3 +204,21 @@ def test_the_timed_teacher_label_reproduces_the_teacher_s_own_speed():
     # a slow car is told to accelerate hard, one near the line's speed is not
     assert float(prof[0, 5] - prof[0, 0]) > 1.0
     assert float(lab[0, mpc.N_KNOTS]) > 0.9
+
+
+def test_a_tspeed_plan_s_late_stop_costs_no_speed_now_and_its_labels_are_continuous():
+    spec = mpc.PlanSpec(speed_mode="tspeed")
+    K, A = mpc.N_KNOTS, mpc.N_ACC
+    assert mpc.act_dim("tspeed") == K + A + 1
+    go = torch.zeros(1, mpc.act_dim("tspeed")); go[:, K:] = 1.0
+    stop = go.clone(); stop[:, K + A - 2:K + A] = -1.0                  # speed 0 at 1.125 and 1.5 s
+    v, cap = torch.tensor([5.0]), torch.tensor([9.0])
+    _, Lp, p_go = mpc.decode_profile(go, v, 10.0, cap, spec)
+    _, _, p_stop = mpc.decode_profile(stop, v, 10.0, cap, spec)
+    s = torch.linspace(0, 1, spec.n_profile) * Lp[0]
+    early = s < 0.2 * float(Lp[0])
+    assert torch.allclose(p_go[0, early], p_stop[0, early])
+    # a speed knot at the speed the car has holds it: no drift from the integration
+    hold = torch.zeros(1, mpc.act_dim("tspeed")); hold[:, K:K + A] = 5.0 / 10.0 * 2 - 1; hold[:, -1] = 1.0
+    _, _, p_hold = mpc.decode_profile(hold, v, 10.0, cap, spec)
+    assert float((p_hold - 5.0).abs().max()) < 1e-3

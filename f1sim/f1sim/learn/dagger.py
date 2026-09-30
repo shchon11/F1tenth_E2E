@@ -559,7 +559,7 @@ def main():
                     help="[m] free space the teacher's raceline keeps from the boundary (default 0.40). A "
                          "minimum-curvature line has no robustness budget: the teacher tracks it with ground-truth "
                          "pose and latency compensation, the student has neither")
-    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget", "timed"], default="linear",
+    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget", "timed", "tspeed"], default="linear",
                     help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). 'linear': two speeds, linear "
                          "between (every existing checkpoint). 'envelope': a grip belief a_hat and an end speed; the "
                          "profile follows the plan's own curvature. 'knots': a speed at every curvature knot")
@@ -885,7 +885,7 @@ def main():
     #: costs the car. `--grip-quantile` below 0.5 makes "cannot tell yet" mean the slippery end.
     from ..mpc import N_ACC
     quantile_dim = (N_KNOTS if a.speed_mode in ("envelope", "budget")
-                    else N_KNOTS + N_ACC if a.speed_mode == "timed" else -1)
+                    else N_KNOTS + N_ACC if a.speed_mode in ("timed", "tspeed") else -1)
     opt = torch.optim.Adam(model.actor.parameters(), lr=a.lr)
     run = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "tracks": names,
                                                "teacher_desc": teacher_desc, "collection_mix": mix,

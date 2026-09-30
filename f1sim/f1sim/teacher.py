@@ -192,7 +192,7 @@ class RacelineTeacher:
         preserves standalone body-speed geometry. The caller must pass the same sample to decode.
         """
         from .mpc import (N_ACC, N_KNOTS, PlanSpec, encode, encode_budget, encode_envelope, encode_knots, encode_timed,
-                          path_points, plan_length)
+                          encode_tspeed, path_points, plan_length)
         spec = spec or PlanSpec()
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         geometry_speed = plan_geometry_speed(state, plan_speed)
@@ -296,7 +296,7 @@ class RacelineTeacher:
             v_end = v1 if cap is None else torch.minimum(v1, cap)
             return encode_budget(k, a_hat.expand_as(v0) if torch.is_tensor(a_hat) else torch.full_like(v0, a_hat),
                                  v_end, v_cap, v_max, spec, v_meas=geometry_speed)
-        if spec.speed_mode == "timed":
+        if spec.speed_mode in ("timed", "tspeed"):
             # Drive this teacher's own profile (off-line slowdown and the heading cap included) forward
             # in time from the speed the car has: each step asks for the speed the profile holds where
             # the car will be one step on, within the car's drive limit and the profile's braking.
@@ -306,7 +306,7 @@ class RacelineTeacher:
             a_hat = a_hat.expand_as(v0) if torch.is_tensor(a_hat) else torch.full_like(v0, a_hat)
             M = spec.n_time; dt = spec.horizon_s / M
             v = geometry_speed.abs().clone(); s_arc = torch.zeros_like(v)
-            accs = []
+            accs, vs = [], [v]
             for _ in range(M):
                 ahead = (idx + ((s_arc + v * dt) / ds).round().long()) % self.N
                 tgt = self.speed_at(tid, ahead, gb) * slow
@@ -319,6 +319,14 @@ class RacelineTeacher:
                 v_new = (v + acc * dt).clamp_min(0.0)
                 s_arc = s_arc + 0.5 * (v + v_new) * dt
                 v = v_new
+                vs.append(v)
+            if spec.speed_mode == "tspeed":
+                V = torch.stack(vs, 1)                                      # (B, M+1) at t = 0, dt, ..
+                cols = []
+                for j in range(N_ACC):
+                    q = (j + 1) / N_ACC * M; i0 = min(int(q), M - 1); w = q - i0
+                    cols.append(V[:, i0] * (1 - w) + V[:, i0 + 1] * w)
+                return encode_tspeed(k, torch.stack(cols, 1), a_hat, v_max, spec, v_meas=geometry_speed)
             A = torch.stack(accs, 1)                                        # (B, M)
             at = [min(int(round(j / (N_ACC - 1) * M)), M - 1) for j in range(N_ACC)]
             return encode_timed(k, A[:, at], a_hat, spec, v_meas=geometry_speed)

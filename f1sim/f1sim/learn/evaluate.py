@@ -556,7 +556,7 @@ def main() -> None:
                     help="[s] low-pass on a 'profile' speed command (EnvConfig.speed_command_tau)")
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
                     help="who sets the VESC speed command. Default: the checkpoint's own (tracker for every run before 2026-09-28)")
-    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget", "timed"], default=None,
+    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget", "timed", "tspeed"], default=None,
                     help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). Default: the checkpoint's own")
     ap.add_argument("--dial-offset", type=float, default=0.0,
                     help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
