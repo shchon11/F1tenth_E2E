@@ -70,6 +70,7 @@ from ..gym_env import (EnvConfig, FUTURE_LABEL_KEYS, FUTURE_PRESENT_INDEX,
                        PRIV_OPP_DIST_SCALE)
 from ..params import Config
 from . import common
+from . import conditioning as cond_mod
 from . import grip_runtime
 from . import opponent_config as opp_cfg
 from .future import FUTURE_K, FUTURE_OPPONENT_KEYS, align_future_targets
@@ -156,7 +157,14 @@ def collect(env, model, steps: int, device, controller=None, seed: int = 0,
             scan = aug(scan, pro)
         if controller is not None:
             controller.pre_action(obs)
-        act, state, h_next = model.actor.probe_state(scan, pro, None, h)
+        # a dial-conditioned checkpoint is probed with its dial set to the floor's true friction, the
+        # evaluation's reference setting (`common.student_policy`, dial offset 0)
+        c = None
+        if int(model.meta.get("cond_dim", 0) or 0):
+            spec = cond_mod.CondSpec.from_meta(model.meta.get("cond"))
+            c = (cond_mod.mu_to_c(env.sim.P["mu"], spec) if spec.source == "dial" else
+                 cond_mod.make_condition(spec.source, spec, env.sim.P["mu"].reshape(-1, 1), 0)).to(scan.dtype)
+        act, state, h_next = model.actor.probe_state(scan, pro, c, h)
         states.append(state[lid].float().cpu())
         labels.append(_labels(env, visible_only)[lid].float().cpu())
         obs, _rew, term, trunc, _info = env.step(act.clamp(-1, 1))
