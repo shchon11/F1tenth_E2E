@@ -252,6 +252,23 @@ def _per_km(count, dist_m: float) -> float:
     return 1000.0 * float(count) / dist_m if dist_m > 1.0 else float("nan")
 
 
+def lagrange_step(rew: torch.Tensor, components: torch.Tensor, progress_m: torch.Tensor, mask: torch.Tensor,
+                  specs: dict, lr: float, lam_max: float) -> torch.Tensor:
+    """`--lagrange`: one dual-ascent step per constraint, then the reward with each fixed contact penalty
+    replaced by its multiplier. `components` (T, B, K) are the env's reward components, `progress_m` (T, B)
+    metres of progress, `mask` (T, B) the policy's own rows. Each spec: component `index`, its env
+    `weight` (to turn the component back into onsets), `target` per km, current `lam`; `rate` and `lam`
+    are updated in place."""
+    km = float((progress_m.clamp_min(0) * mask).sum()) / 1000.0
+    for spec in specs.values():
+        comp = components[:, :, spec["index"]]
+        count = -comp / spec["weight"]                                   # onsets (>= 0) per step
+        spec["rate"] = float((count * mask).sum()) / max(km, 1e-3)
+        spec["lam"] = min(max(spec["lam"] + lr * (spec["rate"] - spec["target"]), 0.0), lam_max)
+        rew = rew - comp - spec["lam"] * count
+    return rew
+
+
 def kl_reference_is_baseline(ref, memory_on: bool, kl_coef: float, init: str = "") -> bool:
     """Is the KL reference actor the frozen FEEDFORWARD baseline the leash needs? Raises if it has
     to be and is not.
@@ -733,6 +750,17 @@ def main():
                          "own rows (the interactive opponent was half a graphed step planning all of "
                          "them). 'redraw': uniformly at every race reset, as the console does and as "
                          "spec_korea_contact_s911/s912 were trained")
+    ap.add_argument("--lagrange", default="", metavar="NAME=PER_KM,...",
+                    help="constrained PPO (2026-10-01): contact rates as constraints instead of hand-set penalty "
+                         "weights. NAME is 'wall' (soft-contact onsets with walls and props, the collision "
+                         "component) or 'car' (car-contact onsets); PER_KM the target, in the evaluation's own unit. "
+                         "Each gets a multiplier updated by dual ascent after every rollout, lambda += lr * (rate - "
+                         "target), and the step reward carries -lambda per contact in place of the fixed penalty. "
+                         "Needs that component's own weight nonzero (--collision-penalty / --car-contact-penalty) so "
+                         "the onset is visible; the weight itself is removed from the reward.")
+    ap.add_argument("--lagrange-lr", type=float, default=2.0, help="dual step per (contact/km) of violation")
+    ap.add_argument("--lagrange-init", type=float, default=8.0)
+    ap.add_argument("--lagrange-max", type=float, default=200.0)
     ap.add_argument("--rear-end-penalty", type=float, default=0.0, metavar="W",
                     help="charge the onset of a contact with a car ahead W x (relative speed)^2 "
                          "(GT Sophy's rear-end term). 0 = off")
@@ -1415,6 +1443,9 @@ def main():
         **({"adaptation": a.adaptation, "original_reference": reference_id,
             "kl_scope": a.kl_scope, "research_estimator": bool(a.research_estimator)} if adaptive else {}),
         "reward": reward_meta,
+        "lagrange": ({x.split("=")[0].strip(): {"target": float(x.split("=")[1]), "lambda_init": float(a.lagrange_init),
+                                                "lr": float(a.lagrange_lr)}
+                      for x in a.lagrange.split(",") if x.strip()} if a.lagrange else None),
         "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
@@ -1590,7 +1621,23 @@ def main():
     buf_rew = torch.zeros(T, B, device=device); buf_done = torch.zeros(T, B, device=device); buf_trunc = torch.zeros(T, B, device=device)
     buf_val = torch.zeros(T + 1, B, device=device)
     buf_final_val = torch.zeros(T, B, device=device)
+    # --lagrange: constraint name -> the reward component whose onsets it counts, that component's own weight
+    # (to turn it back into a count), the target per km and the multiplier
+    lagrange = {}
+    for item in filter(None, (x.strip() for x in a.lagrange.split(","))):
+        name, target = item.split("=")
+        key, weight = {"wall": ("collision", abs(env.ecfg.reward_collision)),
+                       "car": ("car_contact", abs(env.ecfg.reward_car_contact))}[name.strip()]
+        if weight <= 0:
+            raise SystemExit(f"--lagrange {name}: its component '{key}' has weight 0, so its onsets are invisible; "
+                             f"give it a nonzero penalty (it is removed from the reward and replaced by the multiplier)")
+        lagrange[name.strip()] = {"index": REWARD_COMPONENT_KEYS.index(key), "weight": weight,
+                                  "target": float(target), "lam": float(a.lagrange_init), "rate": float("nan")}
+    if lagrange:
+        print("constrained PPO: " + ", ".join(f"{n} <= {v['target']}/km (lambda0 {v['lam']})" for n, v in lagrange.items()),
+              flush=True)
     buf_reward_components = torch.zeros(T, B, len(REWARD_COMPONENT_KEYS), device=device)
+    buf_prog = torch.zeros(T, B, device=device)                  # metres of progress per step (--lagrange rates)
     # mixed opponents: a teacher-driven car's transitions sit in the buffer (its width is fixed) but
     # carry no weight in the loss -- its actions are the teacher's, not the policy's
     buf_mask = torch.ones(T, B, device=device)
@@ -1847,6 +1894,7 @@ def main():
                 if "on_policy" in info:
                     buf_mask[t] = info["on_policy"][lid].float()
                 buf_reward_components[t] = torch.stack([info["reward_components"][key][lid] for key in REWARD_COMPONENT_KEYS], 1)
+                buf_prog[t] = info["progress"][lid]
                 ep_stats["lap_time"] += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
                 buf_final_val[t].zero_()
                 if "final" in info:
@@ -1920,6 +1968,13 @@ def main():
             with ac:
                 buf_val[T] = model.critic.step(scan[lid], pro[lid], priv_boot[lid],
                                                None if h_critic is None else h_critic[:, lid])[0].float()
+            if lagrange:
+                # contacts this rollout (onsets, from the component and its own weight), the rate per km of
+                # the policy's own progress, the dual step, then the reward with the fixed penalty swapped
+                # for the multiplier. The multiplier is applied BEFORE the step it was just updated on:
+                # this rollout is scored with the price its own violation set.
+                buf_rew = lagrange_step(buf_rew, buf_reward_components, buf_prog, buf_mask, lagrange,
+                                        a.lagrange_lr, a.lagrange_max)
             adv = compute_gae(buf_rew, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, a.lam)
             ret = adv + buf_val[:T]
         t_roll = tm.lap()
@@ -2113,6 +2168,8 @@ def main():
             # over the policy's own cars only. With mixed opponents the teacher-driven car of a race
             # sits in the buffer too, and its overtake reward is the mirror image of the learner's,
             # so an unweighted mean of the pair reads ~0 no matter how much passing is going on.
+            for n_, v_ in lagrange.items():
+                log[f"lagrange/{n_}_lambda"] = v_["lam"]; log[f"lagrange/{n_}_rate_per_km"] = v_["rate"]
             m_ = buf_mask[..., None]
             log.update({f"reward/{key}_per_step": ((buf_reward_components[:, :, index:index + 1] * m_).sum()
                                                    / m_.sum().clamp_min(1.0)).item()
@@ -2202,6 +2259,7 @@ def main():
                   f"lap {log.get('episode/lap_time_s', float('nan')):.1f} s | gate {log.get('curriculum/gate_coll_per_km', float('nan')):.1f} "
                   f"({log.get('curriculum/tracks_scored', 0):.0f} tk) | kl_ref {log['loss/kl_ref']:.3f}"
                   + (f" | fut {log['loss/aux_future_mse']:.3f}" if 'loss/aux_future_mse' in log else "")
+                  + "".join(f" | {n} {v['rate']:.2f}/km lam {v['lam']:.1f}" for n, v in lagrange.items())
                   + (f" | mask {log['loss/aux_opp_mask']:.3f} r{log.get('loss/aux_opp_mask/mask_recall', float('nan')):.2f}"
                      if 'loss/aux_opp_mask' in log else "")
                   + (f" | dv {log['loss/aux_motion_mse']:.4f}" if 'loss/aux_motion_mse' in log else "")
