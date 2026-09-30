@@ -44,13 +44,24 @@ XI = torch.linspace(0.0, 1.0, N_KNOTS)
 #:             ceiling on the whole profile: the one place an intent to go slower than the grip
 #:             allows (recovering, off the line, a car ahead) lives. "envelope" had to fold those
 #:             intents into a_hat, squared, and a student learned that a car in trouble has no grip.
-SPEED_MODES = ("linear", "envelope", "knots", "budget")
+#:   timed     N_ACC + 1 numbers (2026-09-30): the longitudinal acceleration at N_ACC knots over the
+#:             plan's `horizon_s` in TIME, and the grip budget `a_hat`. The speed is their integral from
+#:             the speed the car will have when the command lands, limited instantaneously by the drive
+#:             limit, the friction circle and v^2 |kappa| <= a_hat on the path -- and by nothing that
+#:             comes later: there is no backward pass. Path (the curvature knots, as ever) and speed
+#:             together are the car's position every t seconds. Why: re-planned every 25 ms, a plan
+#:             is a commitment only for its first steps, and every other mode let a hedge at the plan's
+#:             END reach back to NOW -- linear's v1 ~ 0, budget's v_end 5.2 -> 2.2 m/s after race
+#:             training (straights 4.7 against the line's 8.0 m/s), both through the profile. Under
+#:             "timed" a late brake costs no speed now.
+SPEED_MODES = ("linear", "envelope", "knots", "budget", "timed")
+N_ACC = 4                         # acceleration knots over the plan's horizon_s (0.5 s apart at 1.5 s)
 
 
 def act_dim(speed_mode: str = "linear") -> int:
     if speed_mode not in SPEED_MODES:
         raise ValueError(f"speed_mode must be one of {SPEED_MODES}, got {speed_mode!r}")
-    return N_KNOTS + {"knots": N_KNOTS, "budget": 3}.get(speed_mode, 2)
+    return N_KNOTS + {"knots": N_KNOTS, "budget": 3, "timed": N_ACC + 1}.get(speed_mode, 2)
 
 
 @dataclass
@@ -127,6 +138,7 @@ class PlanSpec:
     a_drive_profile: float = 5.6
     v_switch_profile: float = 6.0
     n_profile: int = 25            # dense samples of the speed profile, the same grid `path_points` uses
+    n_time: int = 30               # timed: integration steps over horizon_s (0.05 s at 1.5 s)
     envelope_forward: bool = True  # envelope: ramp the profile up from the measured speed (ellipse-limited drive)
     #: Profile modes: start the profile's forward pass and the reference walk from the speed the
     #: tracker predicts for when its command lands (measured + planned accel x delay) instead of the
@@ -259,6 +271,58 @@ def encode_budget(kappas: torch.Tensor, a_hat: torch.Tensor, v_end: torch.Tensor
                       (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None], (v_cap / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
 
 
+def encode_timed(kappas: torch.Tensor, acc: torch.Tensor, a_hat: torch.Tensor, spec: PlanSpec,
+                 v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """curvature knots [1/m], acceleration at the N_ACC time knots [m/s^2], grip budget [m/s^2] -> normalized
+    action. A positive acceleration is a share of the drive limit, a negative one of the braking bound."""
+    a_n = torch.where(acc >= 0, acc / spec.a_drive_profile, acc / spec.a_brake).clamp(-1, 1)
+    return torch.cat([_knot_action(kappas, spec, v_meas), a_n,
+                      (a_hat / spec.a_hat_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
+
+
+def _decode_timed(a: torch.Tensor, k: torch.Tensor, Lp: torch.Tensor, v0: torch.Tensor, speed_cap: torch.Tensor,
+                  spec: PlanSpec) -> torch.Tensor:
+    """'timed': integrate the acceleration knots in time along the path, return the speed on the path's
+    arc grid (B, n_profile). Limits are instantaneous only (see SPEED_MODES)."""
+    n = spec.n_profile
+    _, _, _, s_path, kap = path_points(k, Lp, n=n, return_kappa=True)
+    acc_n = a[:, N_KNOTS:N_KNOTS + N_ACC]
+    a_hat = ((a[:, N_KNOTS + N_ACC] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)
+    acc_k = torch.where(acc_n >= 0, acc_n * spec.a_drive_profile, acc_n * spec.a_brake)
+    M = spec.n_time
+    dt = spec.horizon_s / M
+    ds = (Lp / (n - 1)).clamp_min(1e-3)
+    v = v0.abs().clamp(min=0.0)
+    v = torch.minimum(v, speed_cap)
+    s = torch.zeros_like(v)
+    ts, vs = [s], [v]
+    for i in range(M):                       # Python constants: unrolls, graph-safe
+        pos = (i / M) * (N_ACC - 1)
+        j = min(int(pos), N_ACC - 2); w = pos - j
+        a_cmd = acc_k[:, j] * (1 - w) + acc_k[:, j + 1] * w
+        fi = (s / ds).clamp(max=n - 1.001); i0 = fi.floor().long(); wf = fi - i0.to(v.dtype)
+        kap_here = kap.gather(1, i0[:, None])[:, 0] * (1 - wf) + kap.gather(1, (i0 + 1).clamp(max=n - 1)[:, None])[:, 0] * wf
+        a_y = v * v * kap_here.abs()
+        drive = spec.a_drive_profile * (spec.v_switch_profile / v.clamp_min(1e-3)).clamp(max=1.0)
+        fric = torch.sqrt((a_hat * a_hat - a_y * a_y).clamp_min(0.0))
+        a_x = torch.minimum(a_cmd, torch.minimum(drive, fric))
+        v_new = (v + a_x * dt).clamp_min(0.0)
+        fi = ((s + v_new * dt) / ds).clamp(max=n - 1.001); i0 = fi.floor().long(); wf = fi - i0.to(v.dtype)
+        kap_next = kap.gather(1, i0[:, None])[:, 0] * (1 - wf) + kap.gather(1, (i0 + 1).clamp(max=n - 1)[:, None])[:, 0] * wf
+        v_new = torch.minimum(torch.minimum(v_new, torch.sqrt(a_hat / kap_next.abs().clamp_min(1e-3))), speed_cap)
+        s = s + 0.5 * (v + v_new) * dt
+        v = v_new
+        ts.append(s); vs.append(v)
+    S = torch.stack(ts, 1); V = torch.stack(vs, 1)                       # (B, M+1), S non-decreasing
+    # the speed at each arc sample: where the integral reached it, else (past s(T)) the last speed
+    idx = torch.searchsorted(S.contiguous(), s_path.contiguous()).clamp(1, M)
+    s_lo, s_hi = S.gather(1, idx - 1), S.gather(1, idx)
+    wgt = ((s_path - s_lo) / (s_hi - s_lo).clamp_min(1e-6)).clamp(0.0, 1.0)
+    prof = V.gather(1, idx - 1) * (1 - wgt) + V.gather(1, idx) * wgt
+    prof = torch.where(s_path > S[:, -1:], V[:, -1:], prof)
+    return prof
+
+
 def encode_knots(kappas: torch.Tensor, v_knots: torch.Tensor, v_max: float, spec: PlanSpec,
                  v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
     """curvature knots [1/m], speed at each knot [m/s] -> normalized action (B, 2 * N_KNOTS)"""
@@ -285,8 +349,10 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
         i0 = pos.floor().clamp(max=N_KNOTS - 2).long(); w = pos - i0.to(a.dtype)
         i0 = i0.expand(a.shape[0], n)
         return k, Lp, vk.gather(1, i0) * (1 - w) + vk.gather(1, i0 + 1) * w
+    if spec.speed_mode == "timed":
+        return k, Lp, _decode_timed(a, k, Lp, v_meas if v_start is None else v_start, speed_cap, spec)
     if spec.speed_mode not in ("envelope", "budget"):
-        raise ValueError(f"decode_profile is for the 'envelope', 'budget' and 'knots' modes, got {spec.speed_mode!r}")
+        raise ValueError(f"decode_profile is for the 'envelope', 'budget', 'knots' and 'timed' modes, got {spec.speed_mode!r}")
     a_hat = ((a[:, N_KNOTS] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)[:, None]
     if spec.speed_mode == "budget":
         # the ceiling bounds every sample of the profile, so it is folded into the cap they all see
@@ -549,7 +615,10 @@ def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSp
     else:
         # The plan carries a whole profile. `reference` already knows how to follow one -- that is
         # what `v_limit` is -- so the linear target is set to the cap and the profile does the rest.
-        v_start = (v_meas.abs() + u_prev[:, 1] * delay).clamp_min(0.0) if spec.profile_from_prediction else None
+        # "timed" always starts from the prediction: its speed is an integral in time from the moment
+        # the command lands, and from the measured speed it would trail the iLQR's first state
+        v_start = ((v_meas.abs() + u_prev[:, 1] * delay).clamp_min(0.0)
+                   if spec.profile_from_prediction or spec.speed_mode == "timed" else None)
         k, Lp, prof = decode_profile(action, v_meas, v_max, speed_cap, spec, v_start=v_start)
         if v_limit is not None:
             prof = torch.minimum(prof, v_limit)

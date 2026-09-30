@@ -154,3 +154,53 @@ def test_the_executor_flags_travel_with_the_contract():
     with pytest.raises(ValueError, match="contract"):
         _check_contract("budT.pt", {"experiment": {"speed_mode": "budget", "tracker_speed_weight": 2.0,
                                                    "tracker_a_max": 7.0}}, env)
+
+
+def test_a_timed_plan_s_late_brake_costs_no_speed_now():
+    spec = mpc.PlanSpec(speed_mode="timed")
+    K, A = mpc.N_KNOTS, mpc.N_ACC
+    assert mpc.act_dim("timed") == K + A + 1
+    go = torch.zeros(1, mpc.act_dim("timed")); go[:, K:] = 1.0
+    hedge = go.clone(); hedge[:, K + A - 2:K + A] = -1.0             # brake over the plan's last part
+    v, cap = torch.tensor([5.0]), torch.tensor([9.0])
+    _, Lp, p_go = mpc.decode_profile(go, v, 10.0, cap, spec)
+    _, _, p_hedge = mpc.decode_profile(hedge, v, 10.0, cap, spec)
+    n = spec.n_profile
+    s = torch.linspace(0, 1, n) * Lp[0]
+    early = s < 0.5 * float(Lp[0]) * 0.4                                  # the part the car drives before it re-plans
+    assert torch.allclose(p_go[0, early], p_hedge[0, early]), (p_go, p_hedge)
+    assert float(p_hedge[0, -1]) < float(p_go[0, -1]) - 1.0
+
+
+def test_a_timed_plan_respects_the_friction_circle_and_the_drive_limit():
+    spec = mpc.PlanSpec(speed_mode="timed")
+    K = mpc.N_KNOTS
+    a = torch.zeros(1, mpc.act_dim("timed")); a[:, K:] = 1.0
+    a[:, :K] = 0.5                                                        # a steady turn, 0.8 1/m
+    _, Lp, prof = mpc.decode_profile(a, torch.tensor([1.0]), 10.0, torch.tensor([9.0]), spec)
+    assert float(prof.max()) <= (spec.a_hat_max / 0.8) ** 0.5 + 1e-3        # v^2 kappa <= a_hat
+    a[:, :K] = 0.0
+    _, Lp, prof = mpc.decode_profile(a, torch.tensor([6.0]), 10.0, torch.tensor([20.0]), spec)
+    ds = float(Lp[0]) / (spec.n_profile - 1)
+    gain = (prof[0, 1:] ** 2 - prof[0, :-1] ** 2) / (2 * ds)
+    assert float(gain.max()) <= spec.a_drive_profile * spec.v_switch_profile / 6.0 + 0.05
+
+
+def test_the_timed_teacher_label_reproduces_the_teacher_s_own_speed():
+    from f1sim.raceline import Raceline
+    from f1sim import maps
+    tr = maps.load("gen:competition:0"); rl = Raceline.build_cached(tr)
+    cfg = Config(); cfg.sim.compile = False; cfg.rand.enabled = False
+    env = common.make_env([tr], 2, "cpu", EnvConfig(action_mode="plan", race_size=1, speed_mode="timed",
+                                                     compile_tracker=False), cfg=cfg, seed=1, rls=[rl])
+    teacher = common.make_teacher([rl], env)
+    env.reset(seed=1)
+    p0 = torch.tensor(rl.xy[40], dtype=torch.float32); t = torch.tensor(rl.xy[41] - rl.xy[39], dtype=torch.float32)
+    yaw = torch.atan2(t[1], t[0]).expand(2).clone()
+    v_now = torch.tensor([1.0, 0.8 * float(rl.v[40])])
+    env.sim.reset(torch.arange(2), torch.cat([p0[None].expand(2, 2), yaw[:, None]], 1), v_now)
+    lab = env.teacher_label(teacher)
+    _, Lp, prof = mpc.decode_profile(lab, v_now, env.ecfg.v_max_policy, torch.full((2,), 9.0), env.tracker.spec)
+    # a slow car is told to accelerate hard, one near the line's speed is not
+    assert float(prof[0, 5] - prof[0, 0]) > 1.0
+    assert float(lab[0, mpc.N_KNOTS]) > 0.9
