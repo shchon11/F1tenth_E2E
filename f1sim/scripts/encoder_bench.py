@@ -14,7 +14,9 @@ directly: the same targets, the same data, trained with supervision, for three e
           window (8 updates, every 3 steps, 8 channels, bf16: what fits beside two trainings) from an empty memory; the encoder reads memory + the current raster.
 
 Targets: `F1VecEnv.future_labels` of this instant -- the nearest opponent's (lon, lat) position and (vlon, vlat)
-relative velocity in the ego frame and its presence. R^2 and MAE on present rows of held-out tracks.
+relative velocity in the ego frame -- on rows where that car is VISIBLE (>= 3 beams of the newest scan hit a car
+within 12 deg of its bearing; the 90 deg behind the LiDAR is blind), and a visibility logit. R^2 and MAE on visible
+rows of held-out tracks.
 
     python scripts/encoder_bench.py collect OUT.pt [--steps 1500]
     python scripts/encoder_bench.py train OUT.pt [--epochs 8]
@@ -25,8 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-TRAIN = ["real:icra2022", "real:icra2022~rev", "real:blackbox2021_1", "real:blackbox2022_1~mir", "real:blackbox2021_3",
-         "gen:competition:1001", "gen:control:1401", "gen:circuit:1201", "gen:hallway:1101", "gen:competition:1005~rev"]
+# every 4th track of the training split (~37): the first run's 10 tracks were memorised by every arm
+TRAIN = None
 TEST = ["real:korea_2025_iccas", "real:blackbox2022_3", "real:map12x16", "gen:competition:0"]
 SLOTS = '[{"kind_mix":["forzaeth","forzaeth_pred","lane_switch","interactive"],"speed_scale":[0.55,0.95]},' \
         '{"kind_mix":["forzaeth","forzaeth_pred","lane_switch","interactive"],"speed_scale":[0.55,0.95]}]'
@@ -73,6 +75,18 @@ def collect(names, steps, envs, seed, device):
 
 
 # ------------------------------------------------------------------ inputs
+VIS_BEAMS, VIS_DEG = 3, 12.0
+
+
+def visible(d, t, l, angles):
+    """(B,) the nearest opponent is seen by the newest scan: enough car-hit beams near its bearing."""
+    lab = d["lab"][t, l]
+    bearing = torch.atan2(lab[:, 1], lab[:, 0])                            # lon/lat share one scale
+    car = d["car"][t, l].to(angles.device)
+    near = (angles[None].cpu() - bearing[:, None]).abs() < math.radians(VIS_DEG)
+    return (lab[:, 6] > 0.5) & ((car.cpu() & near).sum(1) >= VIS_BEAMS)
+
+
 def windows(d, need):
     """(t, l) index pairs whose last `need` steps are one episode."""
     T, L = d["done"].shape
@@ -241,9 +255,9 @@ def evaluate(model, d, t, l, angles, device, bs=96):
             preds.append(model(x1, x2).cpu()); labs.append(d["lab"][tt, ll])
     model.train()
     P, Y = torch.cat(preds), torch.cat(labs)
-    pres = Y[:, 6] > 0.5
+    pres = visible(d, t, l, angles)
     from f1sim.gym_env import PRIV_OPP_DIST_SCALE as S
-    res = {"present_rows": int(pres.sum()),
+    res = {"visible_rows": int(pres.sum()),
            "presence_acc": float(((P[:, 4] > 0) == pres).float().mean())}
     for c, name in enumerate(["lon", "lat", "vlon", "vlat"]):
         y, p = Y[pres, c], P[pres, c]
@@ -259,8 +273,8 @@ def train(path, epochs, device, arms, seed):
     t_tr, l_tr = windows(tr, need); t_te, l_te = windows(te, need)
     from f1sim.learn.aligned import beam_angles
     angles = beam_angles(tr["n_beams"], tr["fov"], device=device)
-    print(f"train rows {t_tr.shape[0]} (present {int((tr['lab'][t_tr, l_tr][:, 6] > 0.5).sum())}), "
-          f"test rows {t_te.shape[0]}", flush=True)
+    print(f"train rows {t_tr.shape[0]} (visible {int(visible(tr, t_tr, l_tr, angles).sum())}), "
+          f"test rows {t_te.shape[0]} (visible {int(visible(te, t_te, l_te, angles).sum())})", flush=True)
     results = {}
     for arm in arms:
         torch.manual_seed(seed)
@@ -277,7 +291,9 @@ def train(path, epochs, device, arms, seed):
             perm = torch.randperm(n)
             for i in range(0, n - bs + 1, bs):
                 sel = perm[i:i + bs]; tt, ll = t_tr[sel], l_tr[sel]
-                y = tr["lab"][tt, ll].to(device)
+                y = tr["lab"][tt, ll].clone()
+                y[:, 6] = visible(tr, tt, ll, angles).float()
+                y = y.to(device)
                 x1 = stack_1d(tr, tt, ll).to(device) if m.s1 is not None else None
                 x2 = second(m.arm, tr, tt, ll, angles, device) if m.s2 is not None else None
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(arm == "bevmem")):
@@ -306,7 +322,10 @@ if __name__ == "__main__":
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     if a.mode == "collect":
-        D = {"train": collect(TRAIN, a.steps, a.envs, a.seed, a.device),
+        from f1sim.learn import common
+        train_names = TRAIN or common.track_names("train")[::4]
+        print(len(train_names), "training tracks", flush=True)
+        D = {"train": collect(train_names, a.steps, a.envs, a.seed, a.device),
              "test": collect(TEST, a.steps // 2, a.envs, a.seed + 1, a.device)}
         torch.save(D, a.path); print("saved", a.path, flush=True)
     else:

@@ -2776,6 +2776,29 @@ class F1VecEnv:
         out[:, 5] = st[:, 5] / e.imu_gyro_scale
         return out
 
+    def opponent_visible(self, r: Optional[StepResult] = None, beams: int = 3, deg: float = 12.0) -> torch.Tensor:
+        """(B,) bool: the nearest opponent (the one `privileged()` columns 8-11 describe) is seen by the newest
+        scan -- at least `beams` returns off a car within `deg` of its bearing from the LiDAR.
+
+        Privileged, train-time only. What it is for: an auxiliary target about the other car is only
+        learnable where the scan holds it. The 90 deg behind the sensor are blind, and a car hidden
+        behind another car or a wall is not in the returns; scoring those rows asks the network to
+        guess (measured 2026-09-30: 27 % of rows in 3-car races, and they held the held-out R^2 of a
+        supervised position read-out at -0.19-0.35 against 0.76-0.81 with the mask).
+        """
+        res = self.last_result if r is None else r
+        if self.M <= 1:
+            return torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        pv = self._priv(res)
+        dx = pv[:, 8] * PRIV_OPP_DIST_SCALE - self.cfg.lidar.mount_x
+        dy = pv[:, 9] * PRIV_OPP_DIST_SCALE - self.cfg.lidar.mount_y
+        bearing = torch.atan2(dy, dx)
+        fov = self.cfg.lidar.fov
+        ang = torch.linspace(-0.5 * fov, 0.5 * fov, int(self.n_beams), device=self.device, dtype=pv.dtype)
+        near = (ang[None] - bearing[:, None]).abs() < math.radians(deg)
+        car = self.opponent_beam_mask(res) > 0.5
+        return (car & near).sum(1) >= beams
+
     def opponent_beam_mask(self, r: Optional[StepResult] = None) -> torch.Tensor:
         """(B, N) 1 where this beam of the NEWEST scan came back off another car, else 0.
 

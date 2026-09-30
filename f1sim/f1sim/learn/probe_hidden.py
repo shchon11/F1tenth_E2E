@@ -100,8 +100,19 @@ def flatten_stack(scan: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _labels(env, visible_only: bool) -> torch.Tensor:
+    """`future_labels`, and under `visible_only` the opponent columns and presence zeroed where the scan does not
+    hold the car (`F1VecEnv.opponent_visible`) -- a state cannot know what its sensor never saw."""
+    lab = env.future_labels()
+    if visible_only:
+        vis = env.opponent_visible().to(lab.dtype)
+        lab[:, :4] = lab[:, :4] * vis[:, None]
+        lab[:, FUTURE_PRESENT_INDEX] = lab[:, FUTURE_PRESENT_INDEX] * vis
+    return lab
+
+
 def collect(env, model, steps: int, device, controller=None, seed: int = 0,
-            stack_mode: str = "full"):
+            stack_mode: str = "full", visible_only: bool = False):
     """Roll the policy out and return (states, labels, boundary), one column per learner car.
 
     * `states` (steps, L, H): the actor's state at t -- the GRU's hidden state AFTER the step that
@@ -147,7 +158,7 @@ def collect(env, model, steps: int, device, controller=None, seed: int = 0,
             controller.pre_action(obs)
         act, state, h_next = model.actor.probe_state(scan, pro, None, h)
         states.append(state[lid].float().cpu())
-        labels.append(env.future_labels()[lid].float().cpu())
+        labels.append(_labels(env, visible_only)[lid].float().cpu())
         obs, _rew, term, trunc, _info = env.step(act.clamp(-1, 1))
         if controller is not None:
             controller.post_step(term, trunc)
@@ -156,7 +167,7 @@ def collect(env, model, steps: int, device, controller=None, seed: int = 0,
         h = reset_hidden(h_next, done)
         if aug is not None:
             aug.reset(done)
-    labels.append(env.future_labels()[lid].float().cpu())
+    labels.append(_labels(env, visible_only)[lid].float().cpu())
     return torch.stack(states), torch.stack(labels), torch.stack(boundary)
 
 
@@ -523,6 +534,8 @@ def main() -> None:
                          "policy visits different situations")
     ap.add_argument("--k", default=f"0,{FUTURE_K}",
                     help="comma-separated lookaheads in control steps (40 Hz). 0 is the present")
+    ap.add_argument("--visible-only", action="store_true",
+                    help="score the opponent columns only where the nearest car is visible to the newest scan")
     ap.add_argument("--current", action="store_true",
                     help="the E1 measurement: the nearest opponent's PRESENT relative state "
                          "(dx, dy, dv_x, dv_y in the ego frame). Forces --k 0 and names the four "
@@ -642,7 +655,7 @@ def main() -> None:
         print(f"[{label}] {note}; rolling out {a.steps} steps x {int(env.learner_ids.numel())} "
               f"learner cars ...", flush=True)
         states, labels, boundary = collect(env, model, a.steps, device, controller=ctrl,
-                                           seed=a.seed, stack_mode=a.stack_mode)
+                                           seed=a.seed, stack_mode=a.stack_mode, visible_only=a.visible_only)
         if a.save_states:
             os.makedirs(a.save_states, exist_ok=True)
             torch.save({"states": states, "labels": labels, "boundary": boundary, "ckpt": path,

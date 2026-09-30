@@ -45,6 +45,8 @@ from . import conditioning as cond_mod
 
 #: How close an opponent has to be for the auxiliary head to be scored on it [m]; `ppo.AUX_OPP_RANGE_M`.
 AUX_OPP_RANGE_M = 6.0
+#: --aux-opp-visible, set once by main(): score the opponent head only where the scan holds the car
+AUX_OPP_VISIBLE = [False]
 from . import opponent_config as opp_cfg
 from .memory import policy_fn as memory_policy_fn, memory_spec, runtime_for
 from .model import ActorCritic, load_checkpoint, load_for_memory, save_checkpoint, scan_channel_spec
@@ -334,7 +336,7 @@ def friction_target(env) -> torch.Tensor:
     return (env.sim.P["mu"].reshape(-1) - cond_mod.MU_OFFSET) / cond_mod.MU_SCALE
 
 
-def opponent_target(env) -> torch.Tensor:
+def opponent_target(env, visible_only: bool = False) -> torch.Tensor:
     """(B,4): the nearest opponent's (ahead, side, closing speed) on the scale the actor's head
     predicts, and 1 where one is close enough to be scored on.
 
@@ -348,6 +350,9 @@ def opponent_target(env) -> torch.Tensor:
         return torch.zeros(priv.shape[0], 4, device=priv.device)
     o = priv[:, 8:11] / torch.tensor([3.0, 1.0, 2.0], device=priv.device)
     near = (priv[:, 11] * PRIV_OPP_DIST_SCALE < AUX_OPP_RANGE_M).to(priv.dtype)
+    if visible_only:
+        # only where the scan holds the car (`F1VecEnv.opponent_visible`): a car behind the ego is not a target
+        near = near * env.opponent_visible().to(priv.dtype)
     return torch.cat([o, near[:, None]], 1)
 
 
@@ -386,7 +391,7 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
             label = env.teacher_label(teacher, mu=None if dial is None else dial.value())
             valid = getattr(teacher, "last_label_valid", None)
             c = None if cond_fn is None else cond_fn()
-            mu_t, opp_t = friction_target(env), opponent_target(env)
+            mu_t, opp_t = friction_target(env), opponent_target(env, visible_only=AUX_OPP_VISIBLE[0])
             student = None
             if beta < 1.0 or need_gap:
                 # c: the fourth thing the merge 75fea37 lost -- a dial student refuses to act without it
@@ -591,6 +596,9 @@ def main():
                          "how fast it is closing. Needs --race-size > 1. The teacher never looks at an opponent, so "
                          "it cannot demonstrate a pass or a yield -- but 'a car is there and it moves like this' is "
                          "read out of how the LiDAR returns shift, and the simulator knows the answer")
+    ap.add_argument("--aux-opp-visible", action="store_true",
+                    help="score --aux-opp only where the nearest car is visible (>= 3 car returns near its bearing, "
+                         "F1VecEnv.opponent_visible). Off: every car within range, behind the ego included")
     ap.add_argument("--seq-len", type=int, default=0,
                     help="train on contiguous runs of this many steps per env (needs --memory gru to matter). 0 = "
                          "i.i.d. samples, which never contain both the corner that showed the grip and the next one")
@@ -709,6 +717,7 @@ def main():
     ap.add_argument("--eager", action="store_true", help="disable simulator / tracker compilation (CPU smoke tests)")
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
+    AUX_OPP_VISIBLE[0] = bool(a.aux_opp_visible)
     opp_cfg.validate(a)
     if a.keep_iters < 1:
         raise SystemExit("--keep-iters must be positive")
