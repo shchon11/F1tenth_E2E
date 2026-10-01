@@ -69,9 +69,12 @@ class StepBuffer:
         #: What the student was conditioned on, and the two auxiliary targets. Empty lists for a run
         #: that asks for none, which is how `extras_at` answers None without a branch per field.
         self.cond, self.mu, self.opp = [], [], []
+        #: --maneuver: every candidate's plan, the teacher's choice, every candidate's outcome, and
+        #: whether that outcome was simulated from THIS state (the teacher decides every few steps)
+        self.man = []
 
     def add(self, scan_now, proprio, label, new_episode, gap=None, mem=None, valid=None,
-            cond=None, mu=None, opp=None):
+            cond=None, mu=None, opp=None, man=None):
         valid = (torch.ones(label.shape[0], dtype=torch.bool) if valid is None
                  else valid.detach().to(device="cpu", dtype=torch.bool).clone())
         if valid.shape != label.shape[:1]:
@@ -87,6 +90,11 @@ class StepBuffer:
         for store, value in ((self.cond, cond), (self.mu, mu), (self.opp, opp)):
             if value is not None:
                 store.append(value.detach().float().cpu())
+        if man is not None:
+            plans, choice, hit, prog, fresh = man
+            self.man.append((plans.detach().to(torch.float16).cpu(), choice.detach().long().cpu(),
+                             hit.detach().bool().cpu(), prog.detach().to(torch.float16).cpu(),
+                             fresh.detach().bool().cpu()))
 
     def finalize(self):
         self.S = torch.stack(self.scan); self.P = torch.stack(self.pro); self.L = torch.stack(self.lab); self.N = torch.stack(self.newep)
@@ -98,10 +106,12 @@ class StepBuffer:
         self.C = torch.stack(self.cond) if self.cond else None      # (T,B,D) the dial the student drove on
         self.M = torch.stack(self.mu) if self.mu else None          # (T,B) normalised friction
         self.O = torch.stack(self.opp) if self.opp else None        # (T,B,4) nearest opponent + in-range flag
+        self.MAN = tuple(torch.stack(x) for x in zip(*self.man)) if self.man else None   # (T,B,K,A) (T,B) (T,B,K) x2 (T,B)
         self.T, self.B = self.S.shape[:2]
         self.scan, self.pro, self.lab, self.newep, self.gap, self.mem = [], [], [], [], [], []
         self.valid = []
         self.cond, self.mu, self.opp = [], [], []
+        self.man = []
         return self
 
     def extras_at(self, t, b, device):
@@ -109,6 +119,14 @@ class StepBuffer:
         return (None if self.C is None else self.C[t, b].to(device),
                 None if self.M is None else self.M[t, b].to(device),
                 None if self.O is None else self.O[t, b].to(device))
+
+    def man_at(self, t, b, device):
+        """(plans, choice, hit, prog, fresh) of the --maneuver labels for the rows `samples_at` returned."""
+        if self.MAN is None:
+            return None
+        plans, choice, hit, prog, fresh = self.MAN
+        return (plans[t, b].to(device).float(), choice[t, b].to(device), hit[t, b].to(device),
+                prog[t, b].to(device).float(), fresh[t, b].to(device))
 
     def __len__(self):
         return self.T * self.B
@@ -357,7 +375,7 @@ def opponent_target(env, visible_only: bool = False) -> torch.Tensor:
 
 
 def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0, need_gap=False,
-            cond_fn=None, dial=None):
+            cond_fn=None, dial=None, maneuver: bool = False):
     """Roll the env for `steps`, labelling every state with the teacher and storing it.
 
     The student is driven through its `PolicyRuntime`, so a recurrent or scan-augmented checkpoint
@@ -397,10 +415,17 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
                 # c: the fourth thing the merge 75fea37 lost -- a dial student refuses to act without it
                 student, _lp, rt.hidden = model.act(seen, pro, deterministic=True, c=c, h=rt.hidden)
             gap = None if student is None else (student - label).abs().mean(1)
+            man = None
+            if maneuver:
+                # the same parameters the label was drawn for (a dial label drives for the dial's friction)
+                P_lab = env.sim.P if dial is None else {**env.sim.P, "mu": dial.value().to(env.sim.P["mu"].dtype)}
+                plans = teacher.candidate_plans(P_lab)
+                fresh = torch.full((env.B,), bool(teacher.decided_now), dtype=torch.bool, device=device)
+                man = (plans[ids], teacher.choice[ids], teacher.outcome_hit[ids], teacher.outcome_prog[ids], fresh[ids])
             buf.add(scan[ids, 0], pro[ids], label[ids], new_ep[ids],
                     None if gap is None else gap[ids], None if mem is None else mem[ids],
                     valid=None if valid is None else valid[ids],
-                    cond=None if c is None else c[ids], mu=mu_t[ids], opp=opp_t[ids])
+                    cond=None if c is None else c[ids], mu=mu_t[ids], opp=opp_t[ids], man=man)
             if beta >= 1.0:
                 a = label                               # iteration 0 drives the teacher
             else:
@@ -455,7 +480,7 @@ def sequence_means(model, scan, pro, keep, burn: int = 0, cond=None):
 def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float = 0.0, hard_power: float = 1.0,
                  log_every: int = 25, chunk: int = 0, speed_loss: str = "symmetric",
                  v_max: float = 10.0, quantile_dim: int = -1, tau: float = 0.5,
-                 aux_grip: float = 0.0, aux_opp: float = 0.0):
+                 aux_grip: float = 0.0, aux_opp: float = 0.0, maneuver_w=(1.0, 1.0, 1.0, 1.0)):
     n_stored = sum(len(b) for b in bufs)
     n_total = sum(b.valid_count for b in bufs)
     log({"dagger/valid_labels": n_total, "dagger/invalid_labels": n_stored - n_total})
@@ -466,6 +491,7 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
     buffer_weights = torch.tensor([b.valid_count for b in bufs], dtype=torch.float)
     recurrent = model.actor.has_memory
     losses, knots, speeds = [], [], []
+    man_log = {}
     for i in range(steps):
         b = bufs[torch.multinomial(buffer_weights, 1).item()]
         if recurrent:
@@ -486,8 +512,26 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
         else:
             scan, pro, lab = b.sample(batch, device, hard_frac, hard_power)
             c, fric, opp_t = b.extras_at(*b.last_index, device)
-            mu, grip, opp = model.actor.forward_all(scan, pro, c)
-        loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True)
+            if model.actor.maneuver is None:
+                mu, grip, opp = model.actor.forward_all(scan, pro, c)
+        if not recurrent and model.actor.maneuver is not None:
+            # every candidate's plan, the teacher's choice and every candidate's simulated outcome: the
+            # single-plan regression is not used -- it would pull whichever candidate is ranked first
+            # toward a different candidate's plan
+            from .maneuver import maneuver_loss
+            man = b.man_at(*b.last_index, device)
+            if man is None:
+                raise RuntimeError("--maneuver needs every buffer to carry maneuver labels (rollout teacher only)")
+            out = model.actor.maneuver_forward(scan, pro, c)
+            grip, opp = out["grip"], out["opp"]
+            mp = maneuver_loss(out, *man)
+            wp, wc, wr, wg = maneuver_w
+            loss = wp * mp["plan"] + wc * mp["choice"] + wr * mp["risk"] + wg * mp["prog"]
+            part = {"knot": mp["plan"], "speed": mp["choice"]}
+            for k_ in ("plan", "choice", "risk", "prog", "choice_acc"):
+                man_log.setdefault(k_, []).append(float(mp[k_]))
+        else:
+            loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True)
         if aux_grip > 0 and grip is not None and fric is not None:
             # The friction the labels were built from, asked of the same features the action comes
             # from. Imitation alone averages it away (the "imitation gap").
@@ -508,7 +552,10 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
                  "dagger/speed_loss": float(np.mean(speeds[-log_every:])),
                  "dagger/train_step": i, "dagger/lr": opt.param_groups[0]["lr"]})
     log({"dagger/optimizer_updates": len(losses),
-         "dagger/skipped_empty_batches": steps - len(losses)})
+         "dagger/skipped_empty_batches": steps - len(losses),
+         **{f"maneuver/{k}": float(np.mean(v[-500:])) for k, v in man_log.items()}})
+    if man_log:
+        print("  maneuver: " + " ".join(f"{k} {np.mean(v[-500:]):.4f}" for k, v in man_log.items()), flush=True)
     return float(np.mean(losses[-500:])) if losses else 0.0
 
 
@@ -596,6 +643,12 @@ def main():
                          "how fast it is closing. Needs --race-size > 1. The teacher never looks at an opponent, so "
                          "it cannot demonstrate a pass or a yield -- but 'a car is there and it moves like this' is "
                          "read out of how the LiDAR returns shift, and the simulator knows the answer")
+    ap.add_argument("--maneuver", action="store_true",
+                    help="learn/maneuver.py: the student carries the rollout teacher's whole decision -- every "
+                         "candidate's plan, which one the teacher takes, and each candidate's simulated outcome "
+                         "(contact within the horizon, progress) -- and acts on the candidate it ranks first. "
+                         "Needs --teacher rollout and a feedforward student")
+    ap.add_argument("--maneuver-weights", default="1,1,1,1", help="plan,choice,risk,progress loss weights")
     ap.add_argument("--aux-opp-visible", action="store_true",
                     help="score --aux-opp only where the nearest car is visible (>= 3 car returns near its bearing, "
                          "F1VecEnv.opponent_visible). Off: every car within range, behind the ego included")
@@ -718,6 +771,13 @@ def main():
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
     AUX_OPP_VISIBLE[0] = bool(a.aux_opp_visible)
+    if a.maneuver:
+        if a.teacher_kind != "rollout":
+            raise SystemExit("--maneuver distils the rollout teacher's candidates: needs --teacher rollout")
+        if a.memory != "off":
+            raise SystemExit("--maneuver is feedforward for now: drop --memory")
+        if a.init and not (torch.load(a.init, map_location="cpu", weights_only=False).get("meta") or {}).get("maneuver"):
+            raise SystemExit("--maneuver with an --init that has no maneuver head: start the head fresh (no --init)")
     opp_cfg.validate(a)
     if a.keep_iters < 1:
         raise SystemExit("--keep-iters must be positive")
@@ -881,7 +941,11 @@ def main():
         model = ActorCritic(spec.scan_stack, spec.n_beams, spec.proprio_dim, priv_dim, act_dim=env.act_dim,
                             scan_deltas=a.scan_deltas, temporal_encoder=a.temporal_encoder,
                             scan_stem=a.scan_stem, memory=mem_spec, scan_channels=chan,
-                            **({} if a.cond == "none" else {"cond_dim": 1, "cond": cond_mod.spec_for(a.cond).to_meta()})
+                            **({} if a.cond == "none" else {"cond_dim": 1, "cond": cond_mod.spec_for(a.cond).to_meta()}),
+                            **({} if not a.maneuver else {"maneuver": {
+                                "K": int(teacher.K),
+                                "offsets": sorted({float(x) for x in teacher.c_off.tolist()}),
+                                "speeds": sorted({float(x) for x in teacher.c_spd.tolist()}, reverse=True)}})
                             ).to(device)
     if int(model.meta["proprio_dim"]) != spec.proprio_dim:
         raise SystemExit(f"the student's proprio width is {model.meta['proprio_dim']} and this env produces "
@@ -926,7 +990,9 @@ def main():
             buf = collect(active_env, model, active_teacher, n_steps, beta, device,
                           StepBuffer(spec.scan_stack, spec.scan_stride, a.scan_channels),
                           noise=0.05 if it else 0.0, need_gap=a.hard_frac > 0,
-                          cond_fn=cond_fn, dial=dial).finalize()
+                          cond_fn=cond_fn, dial=dial, maneuver=a.maneuver and cohort == "traffic").finalize()
+            if a.maneuver and cohort != "traffic":
+                raise SystemExit("--maneuver: the solo cohort's raceline teacher has no candidates; use a traffic-only mix")
             counts[cohort] = len(buf)
             current.append(buf)
         buffer_iters.append(current)
@@ -936,7 +1002,8 @@ def main():
         loss = train_epochs(model, bufs, a.epochs, a.batch, device, opt, log, a.hard_frac, a.hard_power,
                             a.log_every, chunk=a.chunk_length, speed_loss=a.speed_loss,
                             v_max=env.ecfg.v_max_policy, quantile_dim=quantile_dim, tau=a.grip_quantile,
-                            aux_grip=a.aux_grip, aux_opp=a.aux_opp); t_tr = tm.lap()
+                            aux_grip=a.aux_grip, aux_opp=a.aux_opp,
+                            maneuver_w=tuple(float(x) for x in a.maneuver_weights.split(","))); t_tr = tm.lap()
         # Diagnostics only, and fenced off from the training stream. `eval_every` skips the
         # measurement, never the collection or the training: 75 % of a calibrated iteration was
         # this rollout (873 s of 1165), and eight iterations of it is two hours of measuring a

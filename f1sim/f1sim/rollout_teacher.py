@@ -199,6 +199,13 @@ class RolloutTeacher:
         #: (B,) False where every candidate touched something inside the horizon.
         self.last_label_valid = torch.ones(B, dtype=torch.bool, device=self.device)
         self.last_first_hit = torch.full((B,), float(self.H), device=self.device)
+        #: Every candidate's outcome at the last decision (`learn/maneuver.py` distils them): (B, K) touched
+        #: something inside the horizon, the step it first did (H if never), and metres of progress.
+        self.outcome_hit = torch.zeros(B, self.K, dtype=torch.bool, device=self.device)
+        self.outcome_first = torch.full((B, self.K), float(self.H), device=self.device)
+        self.outcome_prog = torch.zeros(B, self.K, device=self.device)
+        #: True on the plan_action call that ran a decision: the outcome above belongs to THIS state.
+        self.decided_now = False
         self._calls = 0
         self.decisions = 0
 
@@ -236,8 +243,11 @@ class RolloutTeacher:
         self._joining_S = self._joining_S & ~passed
         return self._rowmap + B * self._joining_S.long()
 
-    def _candidate(self, teacher, env, off, spd, plan_speed=None, tid=None):
-        a = teacher.plan_action(env.sim.state, env.sim.P, env.sim.tid if tid is None else tid, env.ecfg.v_max_policy, env.tracker.spec,
+    def _candidate(self, teacher, env, off, spd, plan_speed=None, tid=None, P=None):
+        # P: the parameters the plan is drawn FOR -- the caller's (a dial label passes the dial's friction).
+        # The shadow's own candidates keep the shadow's physics, which is the truth the risk is judged on.
+        a = teacher.plan_action(env.sim.state, env.sim.P if P is None else P, env.sim.tid if tid is None else tid,
+                                env.ecfg.v_max_policy, env.tracker.spec,
                                 offset=off, plan_speed=env._tracker_plan_speed() if plan_speed is None else plan_speed)
         a = a.clone()
         a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
@@ -274,6 +284,7 @@ class RolloutTeacher:
         # whose first contact is latest.
         score = torch.where(hit, -1e3 + first, prog - 0.05 * self.c_off.abs()[:, None])
         self.choice = score.argmax(0)
+        self.outcome_hit, self.outcome_first, self.outcome_prog = hit.T.clone(), first.T.clone(), prog.T.clone()
         self.last_label_valid = ~hit.all(0)
         self.last_first_hit = first.gather(0, self.choice[None])[0]
         self.decisions += 1
@@ -286,11 +297,39 @@ class RolloutTeacher:
         if self.layout is not None:
             self.layout.refresh()               # rebuilds the lines of envs that were reset
             self.layout._sync()
-        if self._calls % self.every == 0:
+        self.decided_now = self._calls % self.every == 0
+        if self.decided_now:
             self.decide()
         self._calls += 1
         off = self.c_off[self.choice] if offset is None else self.c_off[self.choice] + offset
-        return self._candidate(self.base, self.env, off, self.c_spd[self.choice], plan_speed, tid=self._real_tid())
+        # P, not the env's own: a dial label drives for the dial's friction. Before 2026-10-01 this passed
+        # the env's true parameters, so a dial-conditioned student of this teacher learned to ignore its dial.
+        return self._candidate(self.base, self.env, off, self.c_spd[self.choice], plan_speed, tid=self._real_tid(), P=P)
+
+    @torch.no_grad()
+    def candidate_plans(self, P=None, batched: bool = True) -> torch.Tensor:
+        """(B, K, A): the plan every candidate would issue from the env's current state -- the label of
+        the maneuver head's `plans`. Call after `plan_action` of the same step (the lines are synced)."""
+        env, B, K = self.env, self.env.B, self.K
+        if not batched:
+            tid = self._real_tid()
+            out = [self._candidate(self.base, env, self.c_off[k].expand(B), self.c_spd[k].expand(B), tid=tid, P=P)
+                   for k in range(K)]
+            return torch.stack(out, 1)
+        # All K at once on the K-times tiled copy of the line teacher the shadow already keeps (`base_S`,
+        # row k*B + i = real row i under candidate k): one call instead of K. Same answer (tested).
+        P0 = env.sim.P if P is None else P
+        PK = {n: (v.repeat(K, *([1] * (v.dim() - 1))) if torch.is_tensor(v) and v.dim() > 0 and v.shape[0] == B else v)
+              for n, v in P0.items()}
+        for n in ("speed_scale", "label_grip_codes"):
+            v = getattr(self.base, n, None)
+            setattr(self.base_S, n, v.repeat(K, *([1] * (v.dim() - 1))) if torch.is_tensor(v) and v.shape[:1] == (B,) else v)
+        self.base_S.label_grip = self.base.label_grip
+        off = self.c_off.repeat_interleave(B); spd = self.c_spd.repeat_interleave(B)
+        a = self.base_S.plan_action(env.sim.state.repeat(K, 1), PK, self._real_tid().repeat(K), env.ecfg.v_max_policy,
+                                    env.tracker.spec, offset=off, plan_speed=env._tracker_plan_speed().repeat(K)).clone()
+        a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
+        return a.view(K, B, -1).transpose(0, 1).contiguous()
 
     def __call__(self, state, P=None, tid=None, offset=None):
         raise TypeError("RolloutTeacher is a plan-mode teacher; use plan_action")

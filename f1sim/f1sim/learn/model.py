@@ -295,6 +295,10 @@ class Actor(nn.Module):
         #: existed -- which is what `tests/data/ppo_loss_oracle.json` pins.
         self.floor = None
         self.floor_spec: Optional[dict] = None
+        #: K candidate plans + which one + what each leads to (`learn/maneuver.py`). Absent unless
+        #: `ActorCritic(maneuver=...)` attaches it last; with it the action is the chosen candidate's plan.
+        self.maneuver = None
+        self.maneuver_spec: Optional[dict] = None
 
     def attach_motion(self, motion: dict, rows: Sequence[int], n_beams: int,
                       heads: Sequence[str] = ()) -> None:
@@ -363,6 +367,28 @@ class Actor(nn.Module):
     @property
     def has_floor_head(self) -> bool:
         return self.floor is not None
+
+    def attach_maneuver(self, spec: dict) -> None:
+        from .maneuver import ManeuverHead, maneuver_spec
+        cfg = maneuver_spec(**spec)
+        self.maneuver = ManeuverHead(self.mu.in_features, self.mu.out_features, cfg["K"], cfg["hidden"])
+        self.maneuver_spec = dict(cfg)
+
+    def _action_mean(self, feat: torch.Tensor) -> torch.Tensor:
+        """The action every entry point returns: the plain head's, or the maneuver head's chosen plan."""
+        if self.maneuver is None:
+            return torch.tanh(self.mu(feat))
+        from .maneuver import ManeuverHead
+        return ManeuverHead.select(self.maneuver(feat))
+
+    def maneuver_forward(self, scan, proprio, c=None) -> dict:
+        """The maneuver head's four outputs (feedforward): for the DAgger loss."""
+        self._feedforward_only("maneuver")
+        feat, p, _h, _enc, _fl = self._parts(scan, proprio, c)
+        out = self.maneuver(feat)
+        out["grip"] = self.grip(torch.cat([feat, p], 1))[:, 0]
+        out["opp"] = self.opp(feat)
+        return out
 
     def _require_cond(self, c, batch):
         """A conditional actor is never run on an implied zero.
@@ -462,7 +488,7 @@ class Actor(nn.Module):
         because "what does the policy's state carry" is a question about all of it.
         """
         feat, _p, h_next, _enc, _fl = self._parts(scan, proprio, c, h)
-        return torch.tanh(self.mu(feat)), self.recurrent_state(feat, h_next), h_next
+        return self._action_mean(feat), self.recurrent_state(feat, h_next), h_next
 
     def initial_hidden(self, batch: int, device=None, dtype=None):
         return None if self.memory is None else self.memory.initial(batch, device, dtype)
@@ -554,7 +580,7 @@ class Actor(nn.Module):
 
     def forward(self, scan, proprio, c=None):
         self._feedforward_only("forward")
-        return torch.tanh(self.mu(self._parts(scan, proprio, c)[0]))
+        return self._action_mean(self._parts(scan, proprio, c)[0])
 
     def forward_all(self, scan, proprio, c=None):
         """(action mean, grip prediction, opponent-motion prediction) from one pass through the trunk."""
@@ -570,7 +596,7 @@ class Actor(nn.Module):
     #: converted call site is written once and does not branch on the checkpoint.
     def step(self, scan, proprio, c=None, h=None, use_memory: bool = True):
         feat, _p, h_next, _enc, _fl = self._parts(scan, proprio, c, h, use_memory)
-        return torch.tanh(self.mu(feat)), h_next
+        return self._action_mean(feat), h_next
 
     def step_all(self, scan, proprio, c=None, h=None, use_memory: bool = True,
                  floor: bool = False):
@@ -584,7 +610,7 @@ class Actor(nn.Module):
         the extra tensors `forward_beams` returns are not even formed on the rollout path.
         """
         feat, p, h_next, enc, fl = self._parts(scan, proprio, c, h, use_memory, floor)
-        return (torch.tanh(self.mu(feat)), self.grip(torch.cat([feat, p], 1))[:, 0],
+        return (self._action_mean(feat), self.grip(torch.cat([feat, p], 1))[:, 0],
                 self.opp(feat), self.future_from(feat, h_next),
                 self.motion_aux(enc, h_next), fl, h_next)
 
@@ -847,7 +873,8 @@ class ActorCritic(nn.Module):
                  memory: Optional[dict] = None, scan_channels: Optional[dict] = None,
                  future_head: Optional[dict] = None, motion: Optional[dict] = None,
                  motion_heads: Optional[Sequence[str]] = None,
-                 floor_head: Optional[dict] = None, opp_token: Optional[str] = None):
+                 floor_head: Optional[dict] = None, opp_token: Optional[str] = None,
+                 maneuver: Optional[dict] = None):
         super().__init__()
         mem = memory_spec(**memory) if memory else None
         chan = scan_channel_spec(scan_channels)
@@ -918,6 +945,9 @@ class ActorCritic(nn.Module):
             self.meta["future_head"] = dict(self.actor.future_spec)
         if fl_head:
             self.meta["floor_head"] = dict(self.actor.floor_spec)
+        if maneuver:
+            self.actor.attach_maneuver(maneuver)                     # last: every other weight draws as before
+            self.meta["maneuver"] = dict(self.actor.maneuver_spec)
         # Declarative only: the block is part of `proprio_dim` above, so nothing here builds a
         # module. What it buys is that the *loader* can refuse the checkpoint (`load_checkpoint`'s
         # `allow_oracle`), which is the one place every consumer -- exporter, ROS node, viewer,
@@ -1055,7 +1085,7 @@ class ActorCritic(nn.Module):
                 states.append(ha[-1])
         feat = torch.cat(feats, 0)                       # (T * m, hidden), row-major (step, env)
         val = torch.cat(values, 0)
-        mu = torch.tanh(self.actor.mu(feat)).float()
+        mu = self.actor._action_mean(feat).float()
         d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
         grip = self.actor.grip(torch.cat([feat, pa], 1))[:, 0]
         opp = self.actor.opp(feat)
