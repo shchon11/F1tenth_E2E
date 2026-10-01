@@ -524,7 +524,9 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
                 raise RuntimeError("--maneuver needs every buffer to carry maneuver labels (rollout teacher only)")
             out = model.actor.maneuver_forward(scan, pro, c)
             grip, opp = out["grip"], out["opp"]
-            mp = maneuver_loss(out, *man)
+            mspec = model.actor.maneuver_spec
+            mp = (maneuver_loss(out, *man, base=out["base"], i_line=mspec["i_line"])
+                  if mspec.get("mode") == "transform" else maneuver_loss(out, *man))
             wp, wc, wr, wg = maneuver_w
             loss = wp * mp["plan"] + wc * mp["choice"] + wr * mp["risk"] + wg * mp["prog"]
             part = {"knot": mp["plan"], "speed": mp["choice"]}
@@ -649,6 +651,9 @@ def main():
                          "(contact within the horizon, progress) -- and acts on the candidate it ranks first. "
                          "Needs --teacher rollout and a feedforward student")
     ap.add_argument("--maneuver-weights", default="1,1,1,1", help="plan,choice,risk,progress loss weights")
+    ap.add_argument("--maneuver-mode", choices=("transform", "plans"), default="transform",
+                    help="'transform': ONE regressed plan (the teacher's plain-line candidate) and the candidates as "
+                         "its shifts -- what generalises; 'plans': K regressed plans (2026-10-01, held-out 42 %%)")
     ap.add_argument("--aux-opp-visible", action="store_true",
                     help="score --aux-opp only where the nearest car is visible (>= 3 car returns near its bearing, "
                          "F1VecEnv.opponent_visible). Off: every car within range, behind the ego included")
@@ -945,7 +950,13 @@ def main():
                             **({} if not a.maneuver else {"maneuver": {
                                 "K": int(teacher.K),
                                 "offsets": sorted({float(x) for x in teacher.c_off.tolist()}),
-                                "speeds": sorted({float(x) for x in teacher.c_spd.tolist()}, reverse=True)}})
+                                "speeds": sorted({float(x) for x in teacher.c_spd.tolist()}, reverse=True),
+                                **({} if a.maneuver_mode != "transform" else {
+                                    "mode": "transform", "cand_off": teacher.c_off.tolist(),
+                                    "cand_spd": teacher.c_spd.tolist(), "i_line": int(teacher.i_line),
+                                    "v_max": float(env.ecfg.v_max_policy),
+                                    "k_lim": 0.85 * min(float(env.tracker.spec.kappa_max),
+                                                        math.tan(env.cfg.vehicle.s_max) / (env.cfg.vehicle.lf + env.cfg.vehicle.lr))})}})
                             ).to(device)
     if int(model.meta["proprio_dim"]) != spec.proprio_dim:
         raise SystemExit(f"the student's proprio width is {model.meta['proprio_dim']} and this env produces "

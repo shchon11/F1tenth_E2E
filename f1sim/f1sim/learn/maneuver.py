@@ -39,10 +39,21 @@ PROG_SCALE = 10.0
 
 
 def maneuver_spec(K: int = 28, hidden: int = 256, offsets: Optional[Sequence[float]] = None,
-                  speeds: Optional[Sequence[float]] = None) -> dict:
+                  speeds: Optional[Sequence[float]] = None, mode: str = "plans",
+                  cand_off: Optional[Sequence[float]] = None, cand_spd: Optional[Sequence[float]] = None,
+                  i_line: Optional[int] = None, v_max: Optional[float] = None, k_lim: Optional[float] = None) -> dict:
     """The recorded build of a head. `offsets` / `speeds` name the candidate set it was trained on (the
     teacher's, candidate k = (offsets[k // len(speeds)], speeds[k % len(speeds)])), for a reader."""
     out = {"K": int(K), "hidden": int(hidden)}
+    if mode not in ("plans", "transform"):
+        raise ValueError(f"maneuver mode must be 'plans' or 'transform', got {mode!r}")
+    if mode == "transform":
+        # the candidates are transforms of the plain head's ONE plan (`offset_plan`), so the head needs
+        # each candidate's (offset, speed scale), which one is the plain line, and how to decode a plan
+        if cand_off is None or cand_spd is None or i_line is None or v_max is None or k_lim is None:
+            raise ValueError("maneuver mode 'transform' needs cand_off, cand_spd, i_line, v_max and k_lim")
+        out.update(mode="transform", cand_off=[float(x) for x in cand_off], cand_spd=[float(x) for x in cand_spd],
+                   i_line=int(i_line), v_max=float(v_max), k_lim=float(k_lim))
     if offsets is not None:
         out["offsets"] = [float(o) for o in offsets]
     if speeds is not None:
@@ -51,19 +62,22 @@ def maneuver_spec(K: int = 28, hidden: int = 256, offsets: Optional[Sequence[flo
 
 
 class ManeuverHead(nn.Module):
-    def __init__(self, in_dim: int, act_dim: int, K: int, hidden: int = 256):
+    def __init__(self, in_dim: int, act_dim: int, K: int, hidden: int = 256, transform: bool = False):
         super().__init__()
-        self.K, self.A = int(K), int(act_dim)
+        self.K, self.A, self.transform = int(K), int(act_dim), bool(transform)
         self.trunk = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU())
-        self.plans = nn.Linear(hidden, self.K * self.A)
+        # 'transform': no plans of its own -- the candidates are the plain head's plan, shifted
+        self.plans = None if self.transform else nn.Linear(hidden, self.K * self.A)
         self.score = nn.Linear(hidden, self.K)
         self.risk = nn.Linear(hidden, self.K)
         self.prog = nn.Linear(hidden, self.K)
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         h = self.trunk(feat)
-        plans = torch.tanh(self.plans(h)).view(-1, self.K, self.A)
-        return {"plans": plans, "score": self.score(h), "risk": self.risk(h), "prog": self.prog(h)}
+        out = {"score": self.score(h), "risk": self.risk(h), "prog": self.prog(h)}
+        if self.plans is not None:
+            out["plans"] = torch.tanh(self.plans(h)).view(-1, self.K, self.A)
+        return out
 
     @staticmethod
     def rank(out: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -81,15 +95,21 @@ class ManeuverHead(nn.Module):
 
 
 def maneuver_loss(out: Dict[str, torch.Tensor], plans_t: torch.Tensor, choice_t: torch.Tensor,
-                  hit_t: torch.Tensor, prog_t: torch.Tensor, fresh: torch.Tensor) -> Dict[str, torch.Tensor]:
+                  hit_t: torch.Tensor, prog_t: torch.Tensor, fresh: torch.Tensor,
+                  base: Optional[torch.Tensor] = None, i_line: Optional[int] = None) -> Dict[str, torch.Tensor]:
     """The four terms. `plans_t` (B, K, A) the teacher's plan for every candidate, `choice_t` (B,) the
     candidate it drove, `hit_t` / `prog_t` (B, K) the shadow simulation's outcome of every candidate
     (metres), valid on the rows where `fresh` (B,) -- the steps the teacher actually decided on."""
-    plan = F.smooth_l1_loss(out["plans"], plans_t, beta=0.1)
-    # and the candidate the teacher drove, on its own: the plan that is actually executed most of the time
-    A = plans_t.shape[2]
-    pick = lambda x: x.gather(1, choice_t[:, None, None].expand(-1, 1, A))[:, 0]
-    plan = plan + F.smooth_l1_loss(pick(out["plans"]), pick(plans_t), beta=0.1)
+    if base is not None:
+        # 'transform': the plain head's one plan learns the teacher's plain-line candidate; every other
+        # candidate is a transform of it, so there is nothing else to regress
+        plan = F.smooth_l1_loss(base, plans_t[:, int(i_line)], beta=0.1)
+    else:
+        plan = F.smooth_l1_loss(out["plans"], plans_t, beta=0.1)
+        # and the candidate the teacher drove, on its own: the plan that is actually executed most of the time
+        A = plans_t.shape[2]
+        pick = lambda x: x.gather(1, choice_t[:, None, None].expand(-1, 1, A))[:, 0]
+        plan = plan + F.smooth_l1_loss(pick(out["plans"]), pick(plans_t), beta=0.1)
     choice = F.cross_entropy(out["score"], choice_t)
     acc = (out["score"].argmax(1) == choice_t).float().mean()
     f = fresh.bool()
@@ -146,3 +166,59 @@ class ManeuverDist:
         h = torch.distributions.Categorical(logits=self.logits).entropy() \
             + torch.distributions.Normal(torch.zeros_like(self.std), self.std).entropy().sum()
         return (h / self.A)[:, None].expand(-1, self.A)
+
+
+def offset_candidates(base: torch.Tensor, v_meas: torch.Tensor, offsets: torch.Tensor, speeds: torch.Tensor,
+                      v_max: float, spec, k_lim: float, iters: int = 6) -> torch.Tensor:
+    """(B, K, A) the K candidates as transforms of ONE plan (linear output), the way the rollout teacher
+    builds its own: candidate k follows the base plan's path shifted `offsets[k]` metres to its left
+    (fitted through the shifted points at 40-100 % of the plan, as `RacelineTeacher.plan_action` fits an
+    offset line) with both speeds scaled by `speeds[k]`. The teacher shifts the RACELINE, which only it
+    can see; a student shifts its own plan -- the one thing it already predicts well on unseen tracks.
+    `offsets` / `speeds` are (K,)."""
+    from ..mpc import N_KNOTS, decode, encode, path_points
+    from ..teacher import fit_knots
+    B, K = base.shape[0], offsets.shape[0]
+    cap = torch.full_like(v_meas, v_max)
+    k0, Lp, v0, v1 = decode(base, v_meas, v_max, cap, spec)
+    x, y, psi, _ = path_points(k0, Lp, 25)
+    fr = torch.linspace(0.4, 1.0, 6, device=base.device, dtype=base.dtype)
+    si = (fr * 24).round().long()
+    px, py, pp = x[:, si], y[:, si], psi[:, si]                       # (B, 6)
+    o = offsets.to(base)[None, :, None]                               # (1, K, 1)
+    tx = (px[:, None] - o * torch.sin(pp)[:, None]).reshape(B * K, -1)
+    ty = (py[:, None] + o * torch.cos(pp)[:, None]).reshape(B * K, -1)
+    kK = k0.repeat_interleave(K, 0); LpK = Lp.repeat_interleave(K, 0)
+    lim = torch.full((B * K,), float(k_lim), device=base.device, dtype=base.dtype)
+    fractions = torch.tensor([1., .5, .25, .125, 0.], device=base.device, dtype=base.dtype)
+    kf = fit_knots(kK, tx, ty, LpK, fr, lim, iters, fractions)
+    a = encode(kf, v0.repeat_interleave(K, 0), v1.repeat_interleave(K, 0), v_max, spec,
+               v_meas=v_meas.repeat_interleave(K, 0))
+    s = speeds.to(base).repeat(B)
+    a = a.clone(); a[:, -2:] = ((a[:, -2:] + 1.0) * s[:, None] - 1.0).clamp(-1.0, 1.0)
+    return a.view(B, K, -1)
+
+
+def offset_plan(base: torch.Tensor, v_meas: torch.Tensor, off: torch.Tensor, spd: torch.Tensor, v_max: float,
+                spec, k_lim: float, iters: int = 6) -> torch.Tensor:
+    """(B, A) ONE candidate per row -- `offset_candidates` for per-row (offset, speed scale) `off`, `spd` (B,).
+    What a 'transform' head executes: only the chosen candidate is built; a zero offset is the base plan itself."""
+    from ..mpc import decode, encode, path_points
+    from ..teacher import fit_knots
+    B = base.shape[0]
+    a = base
+    if bool((off != 0).any()):
+        cap = torch.full_like(v_meas, v_max)
+        k0, Lp, v0, v1 = decode(base, v_meas, v_max, cap, spec)
+        x, y, psi, _ = path_points(k0, Lp, 25)
+        fr = torch.linspace(0.4, 1.0, 6, device=base.device, dtype=base.dtype)
+        si = (fr * 24).round().long()
+        o = off.to(base)[:, None]
+        tx = x[:, si] - o * torch.sin(psi[:, si]); ty = y[:, si] + o * torch.cos(psi[:, si])
+        lim = torch.full((B,), float(k_lim), device=base.device, dtype=base.dtype)
+        fractions = torch.tensor([1., .5, .25, .125, 0.], device=base.device, dtype=base.dtype)
+        kf = fit_knots(k0, tx, ty, Lp, fr, lim, iters, fractions)
+        shifted = encode(kf, v0, v1, v_max, spec, v_meas=v_meas)
+        a = torch.where((off != 0)[:, None], shifted, base)
+    a = a.clone(); a[:, -2:] = ((a[:, -2:] + 1.0) * spd.to(base)[:, None] - 1.0).clamp(-1.0, 1.0)
+    return a

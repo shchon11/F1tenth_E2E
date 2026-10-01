@@ -67,3 +67,44 @@ def test_a_candidate_predicted_to_hit_is_vetoed_even_if_the_teacher_logit_prefer
     out = {"score": torch.tensor([[3.0, 2.0]]), "plans": torch.tensor([[[0.5], [-0.5]]]),
            "risk": torch.tensor([[6.0, -6.0]])}                  # candidate 0: sure contact
     assert float(ManeuverHead.select(out)) == -0.5
+
+
+def _transform_model():
+    spec = {"K": 3, "mode": "transform", "cand_off": [0.0, 0.4, -0.4], "cand_spd": [1.0, 1.0, 0.6], "i_line": 0,
+            "v_max": 10.0, "k_lim": 1.2}
+    return ActorCritic(**SMALL, maneuver=spec)
+
+
+def test_a_transform_head_executes_its_one_plan_shifted_to_the_chosen_candidate(tmp_path):
+    torch.manual_seed(4)
+    m = _transform_model()
+    scan, pro = torch.rand(4, 2, 64), torch.rand(4, 6)
+    pro[:, 0] = 0.5                                              # 5 m/s
+    with torch.no_grad():
+        m.actor.maneuver.score.bias.copy_(torch.tensor([5.0, 0.0, 0.0])); m.actor.maneuver.score.weight.zero_()
+        m.actor.maneuver.risk.bias.fill_(-10.0); m.actor.maneuver.risk.weight.zero_()
+    base = m.actor.maneuver_forward(scan, pro)["base"]
+    assert torch.allclose(m.actor.forward(scan, pro), base, atol=1e-6)    # the plain line: the plan itself
+    with torch.no_grad():
+        m.actor.maneuver.score.bias.copy_(torch.tensor([0.0, 0.0, 5.0]))
+    a = m.actor.forward(scan, pro)
+    assert (a[:, :6] - base[:, :6]).abs().max() > 1e-3          # shifted path
+    assert torch.allclose(a[:, 6:], ((base[:, 6:] + 1) * 0.6 - 1).clamp(-1, 1), atol=1e-5)   # slower
+    a.sum().backward()
+    assert m.actor.mu.weight.grad.abs().sum() > 0               # the gradient reaches the plain plan
+    p = tmp_path / "t.pt"; save_checkpoint(str(p), m, {})
+    m2, _ = load_checkpoint(str(p))
+    assert torch.allclose(m2.actor.forward(scan, pro), a.detach(), atol=1e-5)
+
+
+def test_a_recurrent_transform_actor_re_evaluates_a_sequence():
+    from f1sim.learn.memory import memory_spec
+    torch.manual_seed(5)
+    spec = {"K": 3, "mode": "transform", "cand_off": [0.0, 0.4, -0.4], "cand_spd": [1.0, 1.0, 0.6], "i_line": 0,
+            "v_max": 10.0, "k_lim": 1.2}
+    m = ActorCritic(**SMALL, maneuver=spec, memory=memory_spec(hidden_size=16))
+    T, B = 3, 2
+    scan, pro, priv = torch.rand(T, B, 2, 64), torch.rand(T, B, 6), torch.rand(T, B, 4)
+    act = torch.zeros(T, B, 8)
+    out = m.evaluate_sequence(scan, pro, priv, act, None, m.initial_hidden(B), torch.ones(T, B))
+    assert out[0].shape == (T * B,)

@@ -371,7 +371,8 @@ class Actor(nn.Module):
     def attach_maneuver(self, spec: dict) -> None:
         from .maneuver import ManeuverHead, maneuver_spec
         cfg = maneuver_spec(**spec)
-        self.maneuver = ManeuverHead(self.mu.in_features, self.mu.out_features, cfg["K"], cfg["hidden"])
+        self.maneuver = ManeuverHead(self.mu.in_features, self.mu.out_features, cfg["K"], cfg["hidden"],
+                                     transform=cfg.get("mode") == "transform")
         self.maneuver_spec = dict(cfg)
 
     def _action_mean(self, feat: torch.Tensor) -> torch.Tensor:
@@ -382,12 +383,30 @@ class Actor(nn.Module):
         out = self.maneuver(feat)
         #: the last forward's outputs, read by `_make_dist` right after in the same call
         self._last_man = out
-        return ManeuverHead.select(out)
+        if not self.maneuver.transform:
+            return ManeuverHead.select(out)
+        # 'transform': the plain head's plan, shifted to the candidate the ranking picks. The shift is a
+        # fit, not differentiated through: the gradient reaches the plain plan straight through.
+        from ..mpc import PlanSpec
+        from .maneuver import offset_plan
+        base = torch.tanh(self.mu(feat))
+        v = getattr(self, "_last_v", None)
+        if v is None or v.shape[0] != base.shape[0]:
+            raise RuntimeError("a 'transform' maneuver head needs the speed of the same forward (Actor._parts)")
+        cfg = self.maneuver_spec
+        k = ManeuverHead.rank(out).argmax(1)
+        off = torch.tensor(cfg["cand_off"], device=base.device, dtype=base.dtype)[k]
+        spd = torch.tensor(cfg["cand_spd"], device=base.device, dtype=base.dtype)[k]
+        with torch.no_grad():
+            cand = offset_plan(base.detach().float(), v.float(), off.float(), spd.float(), cfg["v_max"], PlanSpec(),
+                               cfg["k_lim"]).to(base.dtype)
+        out["k"] = k
+        return base + (cand - base.detach())
 
     def _make_dist(self, mu: torch.Tensor):
         """The action distribution around the mean `_action_mean` just returned: a Normal for the plain
         head, the candidate mixture (`maneuver.ManeuverDist`) for a maneuver head."""
-        if self.maneuver is None:
+        if self.maneuver is None or self.maneuver.transform:
             return torch.distributions.Normal(mu, self.log_std.exp().expand_as(mu))
         from .maneuver import ManeuverDist
         return ManeuverDist(self._last_man, self.log_std.exp())
@@ -397,6 +416,7 @@ class Actor(nn.Module):
         self._feedforward_only("maneuver")
         feat, p, _h, _enc, _fl = self._parts(scan, proprio, c)
         out = self.maneuver(feat)
+        out["base"] = torch.tanh(self.mu(feat))
         out["grip"] = self.grip(torch.cat([feat, p], 1))[:, 0]
         out["opp"] = self.opp(feat)
         return out
@@ -576,6 +596,9 @@ class Actor(nn.Module):
 
     def _parts(self, scan, proprio, c=None, h=None, use_memory: bool = True, floor: bool = False):
         c = self._require_cond(c, proprio.shape[0])
+        if self.maneuver is not None and self.maneuver.transform:
+            # the measured speed the plan is decoded at (observation channel 0 is speed / v_max), for the shift
+            self._last_v = proprio[:, 0] * self.maneuver_spec["v_max"]
         if floor and self.floor is not None:
             x, p, fl = self.embed_floor(scan, proprio)
         else:
@@ -1096,6 +1119,9 @@ class ActorCritic(nn.Module):
                 states.append(ha[-1])
         feat = torch.cat(feats, 0)                       # (T * m, hidden), row-major (step, env)
         val = torch.cat(values, 0)
+        if self.actor.maneuver is not None and self.actor.maneuver.transform:
+            # the per-row speed the shift decodes at, in the same (step, env) row order as `feat`
+            self.actor._last_v = proprio.reshape(-1, proprio.shape[-1])[:, 0] * self.actor.maneuver_spec["v_max"]
         mu = self.actor._action_mean(feat).float()
         d = self.actor._make_dist(mu)
         grip = self.actor.grip(torch.cat([feat, pa], 1))[:, 0]
