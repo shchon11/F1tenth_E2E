@@ -262,7 +262,17 @@ def lagrange_step(rew: torch.Tensor, components: torch.Tensor, progress_m: torch
     km = float((progress_m.clamp_min(0) * mask).sum()) / 1000.0
     for spec in specs.values():
         comp = components[:, :, spec["index"]]
-        count = -comp / spec["weight"]                                   # onsets (>= 0) per step
+        count = -comp / spec["weight"]                                   # (T, B) >= 0
+        if spec.get("onset"):
+            # the component is charged every step in contact (the car-contact penalty is): count the
+            # first step of each contact, against the last step of the previous rollout for t = 0
+            touching = count > 0
+            prev = spec.get("prev")
+            if prev is None or prev.shape != touching.shape[1:]:
+                prev = torch.zeros_like(touching[0])
+            before = torch.cat([prev[None], touching[:-1]], 0)
+            spec["prev"] = touching[-1].clone()
+            count = (touching & ~before).to(comp.dtype)
         spec["rate"] = float((count * mask).sum()) / max(km, 1e-3)
         spec["lam"] = min(max(spec["lam"] + lr * (spec["rate"] - spec["target"]), 0.0), lam_max)
         rew = rew - comp - spec["lam"] * count
@@ -1631,8 +1641,10 @@ def main():
         if weight <= 0:
             raise SystemExit(f"--lagrange {name}: its component '{key}' has weight 0, so its onsets are invisible; "
                              f"give it a nonzero penalty (it is removed from the reward and replaced by the multiplier)")
+        # car contacts are charged every step in contact; the constraint counts onsets, the evaluation's unit
         lagrange[name.strip()] = {"index": REWARD_COMPONENT_KEYS.index(key), "weight": weight,
-                                  "target": float(target), "lam": float(a.lagrange_init), "rate": float("nan")}
+                                  "target": float(target), "lam": float(a.lagrange_init), "rate": float("nan"),
+                                  "onset": name.strip() == "car"}
     if lagrange:
         print("constrained PPO: " + ", ".join(f"{n} <= {v['target']}/km (lambda0 {v['lam']})" for n, v in lagrange.items()),
               flush=True)
