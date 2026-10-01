@@ -112,6 +112,7 @@ def _labels(env, visible_only: bool) -> torch.Tensor:
     return lab
 
 
+@torch.no_grad()
 def collect(env, model, steps: int, device, controller=None, seed: int = 0,
             stack_mode: str = "full", visible_only: bool = False):
     """Roll the policy out and return (states, labels, boundary), one column per learner car.
