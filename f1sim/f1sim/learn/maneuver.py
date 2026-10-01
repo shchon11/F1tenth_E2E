@@ -66,9 +66,17 @@ class ManeuverHead(nn.Module):
         return {"plans": plans, "score": self.score(h), "risk": self.risk(h), "prog": self.prog(h)}
 
     @staticmethod
+    def rank(out: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """(B, K) what the action is chosen by: the teacher-choice logit plus log P(no contact) from the risk
+        head -- imitation, vetoed by the predicted outcome. The teacher's own choice is near-tied among
+        candidates that are all clear, so its label alone ranked the clear ones well and the ones that
+        hit badly (first DAgger iteration: choice accuracy 0.39, the student at 604 contacts/km)."""
+        return out["score"] + F.logsigmoid(-out["risk"])
+
+    @staticmethod
     def select(out: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """(B, A): the plan of the candidate the score ranks first."""
-        k = out["score"].argmax(1)
+        """(B, A): the plan of the candidate ranked first."""
+        k = ManeuverHead.rank(out).argmax(1)
         return out["plans"].gather(1, k[:, None, None].expand(-1, 1, out["plans"].shape[2]))[:, 0]
 
 
@@ -78,6 +86,10 @@ def maneuver_loss(out: Dict[str, torch.Tensor], plans_t: torch.Tensor, choice_t:
     candidate it drove, `hit_t` / `prog_t` (B, K) the shadow simulation's outcome of every candidate
     (metres), valid on the rows where `fresh` (B,) -- the steps the teacher actually decided on."""
     plan = F.smooth_l1_loss(out["plans"], plans_t, beta=0.1)
+    # and the candidate the teacher drove, on its own: the plan that is actually executed most of the time
+    A = plans_t.shape[2]
+    pick = lambda x: x.gather(1, choice_t[:, None, None].expand(-1, 1, A))[:, 0]
+    plan = plan + F.smooth_l1_loss(pick(out["plans"]), pick(plans_t), beta=0.1)
     choice = F.cross_entropy(out["score"], choice_t)
     acc = (out["score"].argmax(1) == choice_t).float().mean()
     f = fresh.bool()
@@ -105,7 +117,7 @@ class ManeuverDist:
     """
 
     def __init__(self, out: dict, std: torch.Tensor):
-        self.logits = out["score"].float()
+        self.logits = ManeuverHead.rank(out).float()
         self.plans = out["plans"].float()                              # (B, K, A)
         B, K, A = self.plans.shape
         self.A = A

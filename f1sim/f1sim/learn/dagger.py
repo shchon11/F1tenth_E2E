@@ -529,7 +529,7 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
             loss = wp * mp["plan"] + wc * mp["choice"] + wr * mp["risk"] + wg * mp["prog"]
             part = {"knot": mp["plan"], "speed": mp["choice"]}
             for k_ in ("plan", "choice", "risk", "prog", "choice_acc"):
-                man_log.setdefault(k_, []).append(float(mp[k_]))
+                man_log.setdefault(k_, []).append(float(mp[k_].detach()))
         else:
             loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True)
         if aux_grip > 0 and grip is not None and fric is not None:

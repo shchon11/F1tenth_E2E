@@ -12,7 +12,7 @@ def test_the_action_is_the_chosen_candidates_plan_and_survives_a_save(tmp_path):
     m = ActorCritic(**SMALL, maneuver={"K": 5})
     scan, pro = torch.rand(3, 2, 64), torch.rand(3, 6)
     out = m.actor.maneuver_forward(scan, pro)
-    k = out["score"].argmax(1)
+    k = ManeuverHead.rank(out).argmax(1)
     want = out["plans"][torch.arange(3), k]
     assert torch.allclose(m.actor.forward(scan, pro), want)
     p = tmp_path / "m.pt"; save_checkpoint(str(p), m, {})
@@ -41,7 +41,8 @@ def test_the_ppo_policy_is_the_candidate_mixture_and_its_log_prob_is_exact():
     import math
     from f1sim.learn.maneuver import ManeuverDist
     torch.manual_seed(2)
-    out = {"score": torch.tensor([[2.0, 0.0]]), "plans": torch.tensor([[[0.5], [-0.5]]])}
+    out = {"score": torch.tensor([[2.0, 0.0]]), "plans": torch.tensor([[[0.5], [-0.5]]]),
+           "risk": torch.full((1, 2), -30.0)}                    # no predicted contact: the rank is the score
     d = ManeuverDist(out, torch.tensor([0.2]))
     a = torch.tensor([[0.1]])
     p = torch.softmax(out["score"], 1)[0]
@@ -60,3 +61,9 @@ def test_acting_and_ppo_re_evaluation_agree_on_the_log_prob():
     inside = (a.abs() < 1).all(1)                  # act scores the sample before its clamp, as the Normal head does
     assert inside.any() and torch.allclose(lp[inside], lp2[inside], atol=1e-5)
     assert a.shape == (5, 8)
+
+
+def test_a_candidate_predicted_to_hit_is_vetoed_even_if_the_teacher_logit_prefers_it():
+    out = {"score": torch.tensor([[3.0, 2.0]]), "plans": torch.tensor([[[0.5], [-0.5]]]),
+           "risk": torch.tensor([[6.0, -6.0]])}                  # candidate 0: sure contact
+    assert float(ManeuverHead.select(out)) == -0.5
