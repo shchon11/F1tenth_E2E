@@ -87,3 +87,50 @@ def maneuver_loss(out: Dict[str, torch.Tensor], plans_t: torch.Tensor, choice_t:
     else:
         risk = prog = out["risk"].sum() * 0.0
     return {"plan": plan, "choice": choice, "risk": risk, "prog": prog, "choice_acc": acc}
+
+
+class ManeuverDist:
+    """The policy of an actor with a maneuver head, for PPO: a mixture over the K candidates.
+
+        p(a) = sum_k softmax(score)_k * N(a | plan_k, std)
+
+    Sampling draws the candidate first and then the plan around it, so exploration happens at the
+    level of "take another line / back off", not only as per-step noise on one plan. The log
+    probability is the exact mixture (logsumexp), so the PPO ratio needs no stored candidate index.
+    It quacks like the `Normal` the plain head returns where the callers use it: `log_prob(a)` and
+    `entropy()` are (B, A) with the per-sample total spread over the columns (callers `.sum(1)`),
+    `mean` is the plan of the top-ranked candidate (the deterministic action), `stddev` is per dim.
+    The entropy is the categorical's plus one component's -- an upper bound on the mixture's, used
+    only as an exploration bonus.
+    """
+
+    def __init__(self, out: dict, std: torch.Tensor):
+        self.logits = out["score"].float()
+        self.plans = out["plans"].float()                              # (B, K, A)
+        B, K, A = self.plans.shape
+        self.A = A
+        self.std = std.float().expand(A)
+        self._top = self.plans.gather(1, self.logits.argmax(1)[:, None, None].expand(-1, 1, A))[:, 0]
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self._top
+
+    @property
+    def stddev(self) -> torch.Tensor:
+        return self.std.expand_as(self._top)
+
+    def sample(self) -> torch.Tensor:
+        k = torch.distributions.Categorical(logits=self.logits).sample()
+        mu = self.plans.gather(1, k[:, None, None].expand(-1, 1, self.A))[:, 0]
+        return mu + self.std * torch.randn_like(mu)
+
+    def log_prob(self, a: torch.Tensor) -> torch.Tensor:
+        comp = torch.distributions.Normal(self.plans, self.std).log_prob(a.float()[:, None, :]).sum(-1)   # (B, K)
+        lp = torch.logsumexp(F.log_softmax(self.logits, 1) + comp, 1)
+        return (lp / self.A)[:, None].expand(-1, self.A)
+
+    def entropy(self) -> torch.Tensor:
+        h = torch.distributions.Categorical(logits=self.logits).entropy() \
+            + torch.distributions.Normal(torch.zeros_like(self.std), self.std).entropy().sum()
+        return (h / self.A)[:, None].expand(-1, self.A)

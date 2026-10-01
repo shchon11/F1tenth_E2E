@@ -35,3 +35,28 @@ def test_choosing_never_averages_two_good_options():
         opt.zero_grad(); (l["plan"] + l["choice"]).backward(); opt.step()
     a = ManeuverHead.select(head(feat[:1]))
     assert abs(float(a)) > 0.6, a                              # one of the two, not the middle
+
+
+def test_the_ppo_policy_is_the_candidate_mixture_and_its_log_prob_is_exact():
+    import math
+    from f1sim.learn.maneuver import ManeuverDist
+    torch.manual_seed(2)
+    out = {"score": torch.tensor([[2.0, 0.0]]), "plans": torch.tensor([[[0.5], [-0.5]]])}
+    d = ManeuverDist(out, torch.tensor([0.2]))
+    a = torch.tensor([[0.1]])
+    p = torch.softmax(out["score"], 1)[0]
+    n = lambda mu: math.exp(-0.5 * ((0.1 - mu) / 0.2) ** 2) / (0.2 * math.sqrt(2 * math.pi))
+    want = math.log(float(p[0]) * n(0.5) + float(p[1]) * n(-0.5))
+    assert abs(float(d.log_prob(a).sum(1)) - want) < 1e-5
+    assert torch.allclose(d.mean, torch.tensor([[0.5]]))
+
+
+def test_acting_and_ppo_re_evaluation_agree_on_the_log_prob():
+    torch.manual_seed(3)
+    m = ActorCritic(**SMALL, maneuver={"K": 4})
+    scan, pro, priv = torch.rand(5, 2, 64), torch.rand(5, 6), torch.rand(5, 4)
+    a, lp, _ = m.act(scan, pro)
+    lp2 = m.evaluate(scan, pro, priv, a)[0]
+    inside = (a.abs() < 1).all(1)                  # act scores the sample before its clamp, as the Normal head does
+    assert inside.any() and torch.allclose(lp[inside], lp2[inside], atol=1e-5)
+    assert a.shape == (5, 8)

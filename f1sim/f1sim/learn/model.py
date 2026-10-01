@@ -379,7 +379,18 @@ class Actor(nn.Module):
         if self.maneuver is None:
             return torch.tanh(self.mu(feat))
         from .maneuver import ManeuverHead
-        return ManeuverHead.select(self.maneuver(feat))
+        out = self.maneuver(feat)
+        #: the last forward's outputs, read by `_make_dist` right after in the same call
+        self._last_man = out
+        return ManeuverHead.select(out)
+
+    def _make_dist(self, mu: torch.Tensor):
+        """The action distribution around the mean `_action_mean` just returned: a Normal for the plain
+        head, the candidate mixture (`maneuver.ManeuverDist`) for a maneuver head."""
+        if self.maneuver is None:
+            return torch.distributions.Normal(mu, self.log_std.exp().expand_as(mu))
+        from .maneuver import ManeuverDist
+        return ManeuverDist(self._last_man, self.log_std.exp())
 
     def maneuver_forward(self, scan, proprio, c=None) -> dict:
         """The maneuver head's four outputs (feedforward): for the DAgger loss."""
@@ -617,7 +628,7 @@ class Actor(nn.Module):
     def step_dist(self, scan, proprio, c=None, h=None, use_memory: bool = True):
         mu, h_next = self.step(scan, proprio, c, h, use_memory)
         mu = mu.float()
-        return torch.distributions.Normal(mu, self.log_std.exp().expand_as(mu)), h_next
+        return self._make_dist(mu), h_next
 
     def feedforward_dist(self, scan, proprio, c=None):
         """The distribution this actor's feedforward part alone produces: the GRU is not run and
@@ -1023,7 +1034,7 @@ class ActorCritic(nn.Module):
         ha, hc = self._split(h)
         mu, grip, opp, fut, mot, fl, ha = self.actor.step_all(scan, proprio, c, ha, floor=floor)
         mu = mu.float()
-        d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
+        d = self.actor._make_dist(mu)
         v, hc = self.critic.step(scan, proprio, priv, hc)
         return (d.log_prob(actions).sum(1), d.entropy().sum(1), v, d, grip.float(), opp.float(),
                 None if fut is None else fut.float(), _float_pair(mot),
@@ -1086,7 +1097,7 @@ class ActorCritic(nn.Module):
         feat = torch.cat(feats, 0)                       # (T * m, hidden), row-major (step, env)
         val = torch.cat(values, 0)
         mu = self.actor._action_mean(feat).float()
-        d = torch.distributions.Normal(mu, self.actor.log_std.exp().expand_as(mu))
+        d = self.actor._make_dist(mu)
         grip = self.actor.grip(torch.cat([feat, pa], 1))[:, 0]
         opp = self.actor.opp(feat)
         h_seq = None if not states else torch.cat(states, 0)[None]
