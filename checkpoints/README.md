@@ -121,3 +121,19 @@ ICCAS, 4 seeds x 4 planner opponents (`docs/research/retrain-plan-2026-09-28.md`
 
 Against learned opponents it never met (B s948, gate s944): 3.07 and 1.84 contacts / km, against
 8.40 and 7.33 for the recipe without the league. Re-measured after stripping: identical to the source run.
+
+## `iccas_constrained_v2R.pt` (2026-10-02) — best ICCAS race policy so far
+
+Linear plan output. Lineage: DAgger with the line teacher on every training track → ICCAS solo PPO
+(feedforward) → race PPO with a GRU, KL leash and a league (`ffR_lin`) → **12.6 M steps of race PPO
+under the constrained reward** (`--lagrange wall=3.0,car=1.5`: reward is progress + lap + lap time,
+wall/prop and at-fault car contacts are Lagrangian constraints; GAE λ 0.97; league of 5 learned
+policies + 4 planners at p 0.5). Optimizer moments dropped; re-measured identical after stripping.
+
+| ICCAS, 4 seeds × 4 planners, dial 0 | v2R | ffR_lin (its start) | C (`iccas_league_c_s949`) |
+| --- | ---: | ---: | ---: |
+| solo lap | **7.66 s** | 7.86 s | 8.18 s |
+| car contacts | 160 | 227 | **126** |
+| passes | 235 | 270 | 246 |
+| prop contacts / km | 1.25 | **0.89** | 1.39 |
+| unseen learned opponents B / gate, contacts (2 seeds) | **18 / 17** | 53 / 39 | — |

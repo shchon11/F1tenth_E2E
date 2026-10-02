@@ -50,5 +50,15 @@
    "opt_param_names"
   ],
   "source_mb": 32.5
+ },
+ {
+  "file": "iccas_constrained_v2R.pt",
+  "run": "v2R",
+  "sha256": "9d44a36a4d0acfe3663832bfe64190ea55b18d14f2ee14ff0f9403c07f705abd",
+  "size_mb": 10.5,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 31.0
  }
 ]
