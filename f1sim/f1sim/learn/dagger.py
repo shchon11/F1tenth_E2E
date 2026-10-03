@@ -376,6 +376,7 @@ def opponent_target(env, visible_only: bool = False) -> torch.Tensor:
 
 def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0, need_gap=False,
             cond_fn=None, dial=None, maneuver: bool = False):
+    maneuver_meta = (model.meta.get("maneuver") or {}) if maneuver else {}
     """Roll the env for `steps`, labelling every state with the teacher and storing it.
 
     The student is driven through its `PolicyRuntime`, so a recurrent or scan-augmented checkpoint
@@ -416,7 +417,15 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
                 student, _lp, rt.hidden = model.act(seen, pro, deterministic=True, c=c, h=rt.hidden)
             gap = None if student is None else (student - label).abs().mean(1)
             man = None
-            if maneuver:
+            if maneuver and not hasattr(teacher, "candidate_plans"):
+                # a solo cohort's line teacher has no candidates: its label IS the plain line (candidate
+                # i_line), which is what a 'transform' head regresses; nothing was simulated, so no outcome
+                K_, i_line = int(maneuver_meta["K"]), int(maneuver_meta["i_line"])
+                plans = label[:, None, :].expand(-1, K_, -1)
+                zeros = torch.zeros(env.B, K_, device=device)
+                man = (plans[ids], torch.full((env.B,), i_line, dtype=torch.long, device=device)[ids],
+                       zeros[ids].bool(), zeros[ids], torch.zeros(env.B, dtype=torch.bool, device=device)[ids])
+            elif maneuver:
                 # the same parameters the label was drawn for (a dial label drives for the dial's friction)
                 P_lab = env.sim.P if dial is None else {**env.sim.P, "mu": dial.value().to(env.sim.P["mu"].dtype)}
                 plans = teacher.candidate_plans(P_lab)
@@ -793,8 +802,9 @@ def main():
         raise SystemExit(str(exc)) from exc
     if a.solo_tracks and not solo_steps:
         raise SystemExit("--solo-tracks needs a positive --solo-fraction")
-    if solo_steps and (a.race_size < 2 or a.teacher_kind != "interactive" or token != "off"):
-        raise SystemExit("--solo-fraction needs --race-size >= 2, --teacher interactive and --opp-token off "
+    # the traffic teacher may be the interactive or the rollout one; the solo cohort is labelled by the line teacher either way
+    if solo_steps and (a.race_size < 2 or a.teacher_kind not in ("interactive", "rollout") or token != "off"):
+        raise SystemExit("--solo-fraction needs --race-size >= 2, --teacher interactive or rollout and --opp-token off "
                          "so empty and traffic observations share the same actor contract")
     a.scan_channels = [c.strip() for c in str(a.scan_channels).split(",") if c.strip()]
     unknown = [c for c in a.scan_channels if c not in SCAN_CHANNELS]
@@ -965,6 +975,11 @@ def main():
     dial = cond_mod.DialDraw(env, a.dial_margin, a.dial_exact) if a.cond == "dial" else None
     cond_fn = None if cspec is None else (
         lambda: cond_mod.mu_to_c(dial.value() if dial is not None else env.sim.P["mu"], cspec))
+    # the solo cohort's env has its own batch: its own dial and condition (one shared DialDraw broke on the size)
+    solo_dial = (cond_mod.DialDraw(solo_env, a.dial_margin, a.dial_exact)
+                 if a.cond == "dial" and solo_env is not None else None)
+    solo_cond_fn = None if (cspec is None or solo_env is None) else (
+        lambda: cond_mod.mu_to_c(solo_dial.value() if solo_dial is not None else solo_env.sim.P["mu"], cspec))
     #: The action dimension whose error is not symmetric: too little grip costs lap time, too much
     #: costs the car. `--grip-quantile` below 0.5 makes "cannot tell yet" mean the slippery end.
     from ..mpc import N_ACC
@@ -1001,9 +1016,10 @@ def main():
             buf = collect(active_env, model, active_teacher, n_steps, beta, device,
                           StepBuffer(spec.scan_stack, spec.scan_stride, a.scan_channels),
                           noise=0.05 if it else 0.0, need_gap=a.hard_frac > 0,
-                          cond_fn=cond_fn, dial=dial, maneuver=a.maneuver and cohort == "traffic").finalize()
-            if a.maneuver and cohort != "traffic":
-                raise SystemExit("--maneuver: the solo cohort's raceline teacher has no candidates; use a traffic-only mix")
+                          cond_fn=cond_fn if cohort == "traffic" else solo_cond_fn,
+                          dial=dial if cohort == "traffic" else solo_dial, maneuver=a.maneuver).finalize()
+            if a.maneuver and cohort != "traffic" and a.maneuver_mode != "transform":
+                raise SystemExit("--maneuver-mode plans: the solo cohort's raceline teacher has no candidates to regress")
             counts[cohort] = len(buf)
             current.append(buf)
         buffer_iters.append(current)
