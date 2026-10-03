@@ -60,5 +60,15 @@
    "extra.opt"
   ],
   "source_mb": 31.0
+ },
+ {
+  "file": "iccas_constrained_safe_s976.pt",
+  "run": "v2R_s976",
+  "sha256": "8156209b9e63e9aa5d60046b435e14c5bdbf2ec494b041538e26cb9cf5846927",
+  "size_mb": 10.5,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 31.0
  }
 ]

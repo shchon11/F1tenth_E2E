@@ -137,3 +137,19 @@ policies + 4 planners at p 0.5). Optimizer moments dropped; re-measured identica
 | passes | 235 | 270 | 246 |
 | prop contacts / km | 1.25 | **0.89** | 1.39 |
 | unseen learned opponents B / gate, contacts (2 seeds) | **18 / 17** | 53 / 39 | — |
+
+## `iccas_constrained_safe_s976.pt` (2026-10-04) — the safest ICCAS race policy so far
+
+The v2R recipe (above) on training seed 976, picked from five seeds (973 = v2R, 976-979). Optimizer
+moments dropped; re-measured identical after stripping.
+
+| ICCAS, 4 seeds × 4 planners, dial 0 | s976 | v2R (fastest) | C |
+| --- | ---: | ---: | ---: |
+| solo lap | 7.91 s | **7.66 s** | 8.18 s |
+| car contacts | **119** | 160 | 126 |
+| passes | 236 | 235 | **246** |
+| prop contacts / km | **1.10** | 1.25 | 1.39 |
+| unseen learned opponents B / gate, contacts / passes (2 seeds) | 19/37, 23/29 | 18/14, 17/12 | — |
+
+The five seeds of the same recipe ranged 119-204 car contacts and 7.66-8.25 s solo laps: one seed
+is not a measurement of a recipe.
