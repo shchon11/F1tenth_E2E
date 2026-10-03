@@ -108,3 +108,18 @@ def test_a_recurrent_transform_actor_re_evaluates_a_sequence():
     act = torch.zeros(T, B, 8)
     out = m.evaluate_sequence(scan, pro, priv, act, None, m.initial_hidden(B), torch.ones(T, B))
     assert out[0].shape == (T * B,)
+
+
+def test_a_transform_policy_is_the_candidate_mixture_so_ppo_trains_the_choice():
+    torch.manual_seed(6)
+    m = _transform_model()
+    scan, pro, priv = torch.rand(4, 2, 64), torch.rand(4, 6), torch.rand(4, 4)
+    pro[:, 0] = 0.5
+    with torch.no_grad():
+        a, lp, _ = m.act(scan, pro)                              # rollout: no gradient
+    lp2, ent, v, d, _h = m.evaluate(scan, pro, priv, a)          # update: with gradient
+    inside = (a.abs() < 1).all(1)
+    assert torch.allclose(lp[inside], lp2[inside], atol=1e-4)    # the same distribution both times
+    lp2.sum().backward()
+    assert m.actor.maneuver.score.weight.grad.abs().sum() > 0     # the choice gets a gradient
+    assert m.actor.mu.weight.grad.abs().sum() > 0                 # and so does the plain plan

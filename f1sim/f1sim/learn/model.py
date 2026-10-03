@@ -395,6 +395,19 @@ class Actor(nn.Module):
             raise RuntimeError("a 'transform' maneuver head needs the speed of the same forward (Actor._parts)")
         cfg = self.maneuver_spec
         k = ManeuverHead.rank(out).argmax(1)
+        if True:   # rollout and update must use the same distribution, so always every candidate
+            # PPO: every candidate, so the policy is the candidate mixture (`ManeuverDist`) and the CHOICE is
+            # learned too -- with only the chosen shift, PPO could move the plain plan but never pick a faster
+            # candidate (the ICCAS solo stage from a cautious DAgger student sat at 20 s laps for 3 M steps)
+            from .maneuver import offset_candidates
+            offs = torch.tensor(cfg["cand_off"], device=base.device, dtype=torch.float32)
+            spds = torch.tensor(cfg["cand_spd"], device=base.device, dtype=torch.float32)
+            with torch.no_grad():
+                cands = offset_candidates(base.detach().float(), v.float(), offs, spds, cfg["v_max"], PlanSpec(),
+                                          cfg["k_lim"]).to(base.dtype)
+            out["plans"] = base[:, None, :] + (cands - base.detach()[:, None, :])
+            out["k"] = k
+            return ManeuverHead.select(out)
         off = torch.tensor(cfg["cand_off"], device=base.device, dtype=base.dtype)[k]
         spd = torch.tensor(cfg["cand_spd"], device=base.device, dtype=base.dtype)[k]
         with torch.no_grad():
@@ -406,7 +419,7 @@ class Actor(nn.Module):
     def _make_dist(self, mu: torch.Tensor):
         """The action distribution around the mean `_action_mean` just returned: a Normal for the plain
         head, the candidate mixture (`maneuver.ManeuverDist`) for a maneuver head."""
-        if self.maneuver is None or self.maneuver.transform:
+        if self.maneuver is None or (self.maneuver.transform and "plans" not in self._last_man):
             return torch.distributions.Normal(mu, self.log_std.exp().expand_as(mu))
         from .maneuver import ManeuverDist
         return ManeuverDist(self._last_man, self.log_std.exp())
