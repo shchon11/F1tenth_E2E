@@ -196,6 +196,14 @@ class ActuatorParams:
     # VESC speed loop: first-order tracking of commanded speed via PID-like accel
     motor_tau: float = 0.20        # [s] time constant of speed response
     speed_gain: float = 1.0        # ERPM<->m/s calibration error (randomized)
+    # OPT-IN real-car speed loop (2026-10-04). 38 sustained speed-command rises in the 08-26/27
+    # competition recordings fit an acceleration-capped first-order loop: cap 2.5 m/s^2, tau 0.7 s,
+    # 0.1 s extra delay (rmse 0.59 m/s); this model's defaults (tau 0.2, a_max 5.6) miss them by
+    # 1.34-1.69 m/s. The cap is the speed loop's, not the motor's -- the car launches at 10.5 m/s^2
+    # from rest -- so it sits on the drive side of `vesc_accel` only; braking is left to `a_brake`.
+    # 0 = off (both), which is every run before this.
+    motor_ramp: float = 0.0        # [m/s^2] drive-side cap on the speed loop's acceleration request
+    motor_delay: float = 0.0       # [s] extra delay of the speed channel only, on top of cmd_delay
     amp_per_nm: float = 29.2       # [A per N m at the wheel] motor current per unit drive torque,
                                    # used only to emulate `/sensors/core` `current_motor` for the
                                    # traction guard's optional spin gate. MEASURED at the one point

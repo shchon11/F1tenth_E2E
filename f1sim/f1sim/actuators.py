@@ -25,4 +25,7 @@ def vesc_accel(speed_cmd: torch.Tensor, v_fb: torch.Tensor, P: Dict[str, torch.T
     fights every slip back to zero and the wheel state has nothing to do.
     """
     v_tgt = (speed_cmd * P["speed_gain"]).clamp(P["v_min"], P["v_max"])
-    return (v_tgt - v_fb) / P["motor_tau"]
+    a = (v_tgt - v_fb) / P["motor_tau"]
+    # `motor_ramp` > 0: the real car's speed loop caps its drive-side request (ActuatorParams).
+    ramp = P.get("motor_ramp")
+    return a if ramp is None else torch.where(ramp > 0, torch.minimum(a, ramp), a)

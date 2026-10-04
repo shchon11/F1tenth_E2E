@@ -113,6 +113,11 @@ class Simulator:
             if k == "actuator.cmd_delay":
                 max_delay = max(max_delay, hi)
         max_delay = max(max_delay, self.cfg.actuator.cmd_delay + self.cfg.actuator.cmd_delay_jitter)
+        motor_delay = float(self.cfg.actuator.motor_delay)
+        for k, (lo, hi) in self.cfg.rand.ranges.items():
+            if k == "actuator.motor_delay":
+                motor_delay = max(motor_delay, hi)
+        max_delay += motor_delay          # the speed channel looks this much further back
         # command history: index 0 = current control step, 1 = previous, ... (commands are
         # piecewise constant per control step, so latency is a lookup into this history)
         self.hist_len = int(math.ceil(max_delay / self.control_dt)) + 2
@@ -751,6 +756,9 @@ class Simulator:
             age = delay_s - (k + 1) * self.dt
             idx = torch.ceil(age / self.control_dt).long().clamp(0, self.hist_len - 1)
             eff = cmd_hist[ar, idx]                                   # (B,2) command in effect
+            # the speed channel's own extra delay (`motor_delay`, 0 = the same command)
+            idx_m = torch.ceil((age + P["motor_delay"]) / self.control_dt).long().clamp(0, self.hist_len - 1)
+            eff = torch.stack([eff[:, 0], cmd_hist[ar, idx_m, 1]], 1)
             steer_tgt = servo_target(eff[:, 0], P)
             # The VESC loop closes on ERPM -- the wheel -- not on the body. See actuators.vesc_accel.
             v_fb = state[:, dyn.IOMEGA] * P["r_w"] if wheel_on else state[:, dyn.IVX]
