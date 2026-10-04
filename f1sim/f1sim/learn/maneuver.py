@@ -41,7 +41,8 @@ PROG_SCALE = 10.0
 def maneuver_spec(K: int = 28, hidden: int = 256, offsets: Optional[Sequence[float]] = None,
                   speeds: Optional[Sequence[float]] = None, mode: str = "plans",
                   cand_off: Optional[Sequence[float]] = None, cand_spd: Optional[Sequence[float]] = None,
-                  i_line: Optional[int] = None, v_max: Optional[float] = None, k_lim: Optional[float] = None) -> dict:
+                  i_line: Optional[int] = None, v_max: Optional[float] = None, k_lim: Optional[float] = None,
+                  temp: float = 1.0) -> dict:
     """The recorded build of a head. `offsets` / `speeds` name the candidate set it was trained on (the
     teacher's, candidate k = (offsets[k // len(speeds)], speeds[k % len(speeds)])), for a reader."""
     out = {"K": int(K), "hidden": int(hidden)}
@@ -54,6 +55,11 @@ def maneuver_spec(K: int = 28, hidden: int = 256, offsets: Optional[Sequence[flo
             raise ValueError("maneuver mode 'transform' needs cand_off, cand_spd, i_line, v_max and k_lim")
         out.update(mode="transform", cand_off=[float(x) for x in cand_off], cand_spd=[float(x) for x in cand_spd],
                    i_line=int(i_line), v_max=float(v_max), k_lim=float(k_lim))
+    if float(temp) != 1.0:
+        # the PPO mixture's choice temperature (`ManeuverDist`); the deterministic action is the argmax either way
+        if not float(temp) > 0:
+            raise ValueError(f"maneuver temp must be positive, got {temp}")
+        out["temp"] = float(temp)
     if offsets is not None:
         out["offsets"] = [float(o) for o in offsets]
     if speeds is not None:
@@ -144,8 +150,12 @@ class ManeuverDist:
     only as an exploration bonus.
     """
 
-    def __init__(self, out: dict, std: torch.Tensor):
-        self.logits = ManeuverHead.rank(out).float()
+    def __init__(self, out: dict, std: torch.Tensor, temp: float = 1.0):
+        # temp < 1 sharpens the choice. At 1 a DAgger student on ICCAS solo puts 0.77 on its top candidate,
+        # so a PPO rollout drew another candidate on 23 % of steps -- a line / speed jump every 0.11 s, and
+        # the solo stage's wall rate climbed 16 -> 34/km. 0.33 makes it one every ~2 s (scratchpad
+        # choice_temp.py). The argmax, and so the deterministic action, is unchanged.
+        self.logits = ManeuverHead.rank(out).float() / float(temp)
         self.plans = out["plans"].float()                              # (B, K, A)
         B, K, A = self.plans.shape
         self.A = A

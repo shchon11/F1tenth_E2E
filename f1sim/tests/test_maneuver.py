@@ -143,3 +143,24 @@ def test_a_fresh_transform_head_on_a_plain_student_drives_as_that_student(tmp_pa
     m2, _ = load_checkpoint(str(p))
     with torch.no_grad():
         assert torch.allclose(m2.actor.forward(scan, pro), before, atol=1e-6)
+
+
+def test_a_choice_temperature_sharpens_the_mixture_keeps_the_mean_and_survives_a_save(tmp_path):
+    from f1sim.learn.maneuver import ManeuverDist
+    torch.manual_seed(6)
+    m = _transform_model()
+    scan, pro = torch.rand(8, 2, 64), torch.rand(8, 6)
+    pro[:, 0] = 0.5
+    with torch.no_grad():
+        m.actor.maneuver.score.bias.copy_(torch.tensor([1.0, 0.0, 0.0])); m.actor.maneuver.score.weight.zero_()
+        m.actor.forward(scan, pro); d1 = m.actor._make_dist(None)
+        m.actor.maneuver_spec["temp"] = 0.25; m.meta["maneuver"] = dict(m.actor.maneuver_spec)
+        m.actor.forward(scan, pro); d2 = m.actor._make_dist(None)
+    assert isinstance(d2, ManeuverDist)
+    assert torch.allclose(d1.mean, d2.mean)
+    p1, p2 = torch.softmax(d1.logits, 1)[:, 0], torch.softmax(d2.logits, 1)[:, 0]
+    assert (p2 > p1 + 0.2).all()
+    a = d2.sample(); assert torch.isfinite(d2.log_prob(a)).all()
+    p = tmp_path / "t.pt"; save_checkpoint(str(p), m, {})
+    m2, _ = load_checkpoint(str(p))
+    assert m2.actor.maneuver_spec["temp"] == 0.25

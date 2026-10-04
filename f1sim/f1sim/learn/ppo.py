@@ -428,6 +428,9 @@ def main():
                          "speed/safety balance the reward alone does not")
     ap.add_argument("--cap0", type=float, default=4.0); ap.add_argument("--cap1", type=float, default=8.0); ap.add_argument("--cap-steps", type=float, default=40e6)
     ap.add_argument("--critic-warmup", type=int, default=10, help="updates with the actor frozen")
+    ap.add_argument("--maneuver-temp", type=float, default=None,
+                    help="maneuver head only: the PPO mixture's candidate-choice temperature (recorded in the "
+                         "checkpoint; < 1 sharpens it). None keeps the checkpoint's (1.0 if unset)")
     ap.add_argument("--fresh-critic-ok", action="store_true",
                     help="memory warm start only: a critic weight whose shape changed (a solo checkpoint's critic in a "
                          "race, whose privileged input grew) keeps its fresh init instead of refusing; the actor must "
@@ -1290,6 +1293,14 @@ def main():
                             scan_channels=chan_cfg, future_head=fut_cfg, motion=mot_cfg,
                             motion_heads=mot_heads, floor_head=floor_cfg,
                             opp_token=tok_cfg).to(device)
+    if a.maneuver_temp is not None:
+        if getattr(model.actor, "maneuver", None) is None:
+            raise SystemExit("--maneuver-temp needs a checkpoint with a maneuver head")
+        if not a.maneuver_temp > 0:
+            raise SystemExit("--maneuver-temp must be positive")
+        model.actor.maneuver_spec["temp"] = float(a.maneuver_temp)
+        model.meta["maneuver"] = dict(model.actor.maneuver_spec)
+        print(f"maneuver choice temperature {a.maneuver_temp:g}", flush=True)
     if a.name_seed_fresh:
         # The other half of "these arms differ by one thing". Building the model consumes draws from
         # the ambient generator in proportion to its parameter count, so an arm with a wider proprio
