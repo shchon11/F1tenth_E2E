@@ -582,6 +582,26 @@ class RandomizationConfig:
         "imu.bandwidth": (0.8, 1.2),
         "imu.ahrs_tau": (0.5, 2.0),
     })
+    def widened(self, w: float) -> Dict[str, RandRange]:
+        """Every range stretched `w` times about its midpoint (`w` = 1: the ranges as they are). A range that
+        starts at or above zero stays there (delays, noise, a physical scale), and a multiplicative scale
+        stays above 0.1 of nominal. The 'boot camp' widening of the training distribution (2026-10-04);
+        the 09-07 note above is why it is a flag and not the default -- extremes alone taught caution."""
+        if not w > 0:
+            raise ValueError(f"widen factor must be positive, got {w}")
+        if w == 1.0:
+            return dict(self.ranges)
+        out: Dict[str, RandRange] = {}
+        for k, (lo, hi) in self.ranges.items():
+            mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo) * w
+            nlo, nhi = mid - half, mid + half
+            if lo >= 0:
+                nlo = max(nlo, 0.0)
+            if k in self.scale_fields:
+                nlo = max(nlo, 0.1)
+            out[k] = (nlo, nhi)
+        return out
+
     scale_fields: Tuple[str, ...] = (
         "vehicle.I_w", "vehicle.B_x", "vehicle.C_x", "vehicle.r_w",
         "odom.stamp_jitter_std", "imu.shock_rate", "imu.shock_accel",

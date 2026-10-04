@@ -402,9 +402,13 @@ class Actor(nn.Module):
             from .maneuver import offset_candidates
             offs = torch.tensor(cfg["cand_off"], device=base.device, dtype=torch.float32)
             spds = torch.tensor(cfg["cand_spd"], device=base.device, dtype=torch.float32)
+            # the distinct offsets, worked out on the host from the spec (no device sync per step)
+            u_list = sorted(set(float(x) for x in cfg["cand_off"]))
+            uniq = (torch.tensor(u_list, device=base.device, dtype=torch.float32),
+                    torch.tensor([u_list.index(float(x)) for x in cfg["cand_off"]], device=base.device))
             with torch.no_grad():
                 cands = offset_candidates(base.detach().float(), v.float(), offs, spds, cfg["v_max"], PlanSpec(),
-                                          cfg["k_lim"]).to(base.dtype)
+                                          cfg["k_lim"], uniq=uniq).to(base.dtype)
             out["plans"] = base[:, None, :] + (cands - base.detach()[:, None, :])
             out["k"] = k
             return ManeuverHead.select(out)

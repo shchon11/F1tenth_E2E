@@ -208,6 +208,23 @@ class OpponentPool:
                                      arm=recorded, cond=cond))
         return cls(entries, env.B, env.act_dim, device)
 
+    def replace(self, j: int, path: str, env) -> None:
+        """Swap entry `j` for the checkpoint at `path` (a growing league: the learner's own snapshot
+        takes an old snapshot's place). The cars entry `j` drives keep their driver index and are
+        driven by the new weights from the next step; their carried state starts fresh. Same checks
+        as `load` -- a snapshot of the learner passes them by construction."""
+        if not 0 <= int(j) < len(self.entries):
+            raise IndexError(f"pool entry {j} of {len(self.entries)}")
+        old = self.entries[int(j)]
+        new = OpponentPool.load([path], env, device=self.device,
+                                arms={str(path): old.arm} if old.arm != "legacy" else None).entries[0]
+        new.model.eval()
+        for prm in new.model.parameters():
+            prm.requires_grad_(False)
+        new.runtime.ensure(self.B, self.device)
+        new.hidden = None
+        self.entries[int(j)] = new
+
     @torch.no_grad()
     def act(self, obs: Optional[Dict[str, torch.Tensor]], driver: torch.Tensor) -> torch.Tensor:
         """(B, act_dim) normalized action, valid on the rows `driver` assigns to a pool entry.

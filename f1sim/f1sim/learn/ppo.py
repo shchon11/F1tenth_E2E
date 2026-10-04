@@ -428,6 +428,15 @@ def main():
                          "speed/safety balance the reward alone does not")
     ap.add_argument("--cap0", type=float, default=4.0); ap.add_argument("--cap1", type=float, default=8.0); ap.add_argument("--cap-steps", type=float, default=40e6)
     ap.add_argument("--critic-warmup", type=int, default=10, help="updates with the actor frozen")
+    ap.add_argument("--league-slots", default="", metavar="A.pt,B.pt",
+                    help="growing self-play league: these opponent checkpoints (each must be in a slot's ckpt_mix) "
+                         "are seats that the learner's own snapshots take over, round robin, every --league-every "
+                         "updates -- the pool keeps its fixed members and gains the learner's past selves")
+    ap.add_argument("--league-every", type=int, default=64, metavar="U")
+    ap.add_argument("--rand-widen", type=float, default=1.0, metavar="W",
+                    help="stretch every physics randomisation range W times about its midpoint (1 = as configured)")
+    ap.add_argument("--rand-range", action="append", default=[], metavar="GROUP.FIELD=LO,HI",
+                    help="set / add one randomisation range (after --rand-widen), e.g. actuator.motor_delay=0,0.1")
     ap.add_argument("--maneuver-temp", type=float, default=None,
                     help="maneuver head only: the PPO mixture's candidate-choice temperature (recorded in the "
                          "checkpoint; < 1 sharpens it). None keeps the checkpoint's (1.0 if unset)")
@@ -935,6 +944,17 @@ def main():
     # `graphs` both end in a CUDA graph, and leaving `compile_tracker` True while asking for explicit
     # graphs would compile the solver anyway and make the choice a half-measure.
     sim_cfg = Config()
+    if a.rand_widen != 1.0:
+        sim_cfg.rand.ranges = sim_cfg.rand.widened(a.rand_widen)
+    for spec_ in a.rand_range:
+        key_, _, val_ = spec_.partition("=")
+        lo_, hi_ = (float(x) for x in val_.split(","))
+        grp_, _, fld_ = key_.partition(".")
+        if not hasattr(getattr(sim_cfg, grp_, None), fld_):
+            raise SystemExit(f"--rand-range: unknown parameter {key_}")
+        sim_cfg.rand.ranges[key_] = (lo_, hi_)
+    if a.rand_widen != 1.0 or a.rand_range:
+        print(f"physics randomisation: widen x{a.rand_widen:g}, extra {list(a.rand_range)}", flush=True)
     sim_cfg.sim.compile = (a.sim_backend == "compile")
     _env_compile_tracker = (a.sim_backend == "compile")
     if a.sim_backend != "compile" and device.type != "cuda":
@@ -1007,6 +1027,20 @@ def main():
         from .graph_runtime import prepare_graph_runtime
         # On the training thread, which is the one that will replay them.
         graph_rt = prepare_graph_runtime(env)
+    league_seats, league_next = [], 0
+    if a.league_slots:
+        if getattr(env, "pool", None) is None:
+            raise SystemExit("--league-slots needs checkpoint opponents (a slot's ckpt_mix / --opp-pool)")
+        norm_ = lambda q: os.path.realpath(os.path.expanduser(q))
+        paths_ = [norm_(q) for q in env.pool_paths]
+        for q in a.league_slots.split(","):
+            if norm_(q) not in paths_:
+                raise SystemExit(f"--league-slots: {q} is not one of the pool's checkpoints {list(env.pool_paths)}")
+            league_seats.append(paths_.index(norm_(q)))
+        if a.league_every < 1:
+            raise SystemExit("--league-every must be >= 1")
+        print(f"league: {len(league_seats)} seat(s) {league_seats}, the learner's snapshot every {a.league_every} updates",
+              flush=True)
     # After `prepare_graph_runtime`, never before: that captures `mpc.solve` and assigns
     # `tracker._solver`, so a controller installed earlier is silently overwritten and the run
     # becomes a legacy run wearing another arm's name.
@@ -2294,6 +2328,14 @@ def main():
                      if 'loss/aux_floor_bce' in log else "")
                   + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         t_loop = time.time() - t_loop0
+        if league_seats and update % a.league_every == 0:
+            # the learner's current self takes the oldest league seat
+            k_ = league_next % len(league_seats); league_next += 1
+            lp_ = os.path.join(out, f"league_{k_}.pt")
+            save_checkpoint(lp_, model, {"spec": spec.__dict__, "phase": "ppo", "run": a.name, "update": update,
+                                         "action_mode": a.action_mode, "experiment": experiment_meta_now()})
+            env.pool.replace(league_seats[k_], lp_, env)
+            print(f"league: update {update} -> seat {k_} (pool entry {league_seats[k_]})", flush=True)
         if update % a.save_every == 0:
             meta = {"spec": spec.__dict__, "phase": "ppo", "run": a.name, "update": update, "updates": n_updates,
                     "steps": steps_done, "total_steps": steps_base + steps_done, "wandb_id": wandb_id,

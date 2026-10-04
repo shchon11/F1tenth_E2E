@@ -28,7 +28,7 @@ guidance an onboard selector or a constrained RL stage can read.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Tuple, Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -187,7 +187,8 @@ class ManeuverDist:
 
 
 def offset_candidates(base: torch.Tensor, v_meas: torch.Tensor, offsets: torch.Tensor, speeds: torch.Tensor,
-                      v_max: float, spec, k_lim: float, iters: int = 6) -> torch.Tensor:
+                      v_max: float, spec, k_lim: float, iters: int = 6,
+                      uniq: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
     """(B, K, A) the K candidates as transforms of ONE plan (linear output), the way the rollout teacher
     builds its own: candidate k follows the base plan's path shifted `offsets[k]` metres to its left
     (fitted through the shifted points at 40-100 % of the plan, as `RacelineTeacher.plan_action` fits an
@@ -203,18 +204,27 @@ def offset_candidates(base: torch.Tensor, v_meas: torch.Tensor, offsets: torch.T
     fr = torch.linspace(0.4, 1.0, 6, device=base.device, dtype=base.dtype)
     si = (fr * 24).round().long()
     px, py, pp = x[:, si], y[:, si], psi[:, si]                       # (B, 6)
-    o = offsets.to(base)[None, :, None]                               # (1, K, 1)
-    tx = (px[:, None] - o * torch.sin(pp)[:, None]).reshape(B * K, -1)
-    ty = (py[:, None] + o * torch.cos(pp)[:, None]).reshape(B * K, -1)
-    kK = k0.repeat_interleave(K, 0); LpK = Lp.repeat_interleave(K, 0)
-    lim = torch.full((B * K,), float(k_lim), device=base.device, dtype=base.dtype)
+    # The path depends on the offset alone -- a speed scale only multiplies the two speeds -- so the
+    # Gauss-Newton fit runs once per DISTINCT offset (7 of the 28 candidates) and is shared. It was
+    # the whole cost of a maneuver step (104 ms of fits per 256-car step, 441 ms per 1024 minibatch).
+    if uniq is None:
+        uo, inv = torch.unique(offsets, return_inverse=True)
+    else:
+        uo, inv = uniq
+    U = uo.shape[0]
+    o = uo.to(base)[None, :, None]                                    # (1, U, 1)
+    tx = (px[:, None] - o * torch.sin(pp)[:, None]).reshape(B * U, -1)
+    ty = (py[:, None] + o * torch.cos(pp)[:, None]).reshape(B * U, -1)
+    kK = k0.repeat_interleave(U, 0); LpK = Lp.repeat_interleave(U, 0)
+    lim = torch.full((B * U,), float(k_lim), device=base.device, dtype=base.dtype)
     fractions = torch.tensor([1., .5, .25, .125, 0.], device=base.device, dtype=base.dtype)
     kf = fit_knots(kK, tx, ty, LpK, fr, lim, iters, fractions)
-    a = encode(kf, v0.repeat_interleave(K, 0), v1.repeat_interleave(K, 0), v_max, spec,
-               v_meas=v_meas.repeat_interleave(K, 0))
+    au = encode(kf, v0.repeat_interleave(U, 0), v1.repeat_interleave(U, 0), v_max, spec,
+                v_meas=v_meas.repeat_interleave(U, 0)).view(B, U, -1)
+    a = au[:, inv.to(base.device)]                                    # (B, K, A)
     # a zero offset is the base plan itself, not its refit (as in `offset_plan`)
     z = (offsets == 0).to(base.device)
-    a = torch.where(z[None, :, None], base[:, None, :].expand(B, K, -1), a.view(B, K, -1)).reshape(B * K, -1)
+    a = torch.where(z[None, :, None], base[:, None, :].expand(B, K, -1), a).reshape(B * K, -1)
     s = speeds.to(base).repeat(B)
     a = a.clone(); a[:, -2:] = ((a[:, -2:] + 1.0) * s[:, None] - 1.0).clamp(-1.0, 1.0)
     return a.view(B, K, -1)
