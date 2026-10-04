@@ -730,6 +730,10 @@ class F1VecEnv:
         self.M = e.race_size
         ar = torch.arange(self.B, device=self.device)
         self.race, self.slot = ar // self.M, ar % self.M
+        #: prioritized level replay (`learn.level_replay.LevelReplay`, one seat per race); None = off
+        self.level_replay = None
+        #: (B,) the level seed each row's race is playing (-1: not drawn through a level replay)
+        self.level_seed = torch.full((self.B,), -1, dtype=torch.long, device=self.device)
         if e.opponent not in OPPONENT_MODES:
             raise ValueError(f"opponent {e.opponent!r} is not one of {list(OPPONENT_MODES)}")
         if e.spawn_order not in SPAWN_ORDERS:
@@ -750,6 +754,11 @@ class F1VecEnv:
             # The files are not opened here -- `learn.opponent_pool` does that and says what is
             # wrong with a checkpoint far better than an existence test can.
             validate_slots(self.slots, self.M, require_files=False)
+            #: (M,) probability each seat is filled per race (seat 0, the learner, always); None when every
+            #: slot is always there -- then nothing is drawn and a seed reproduces every earlier run
+            pres = [1.0] + [float(sl.present) for sl in self.slots]
+            self._present_p = (None if all(p_ >= 1.0 for p_ in pres)
+                               else torch.tensor(pres, device=self.device))
         elif e.opponent == "slots":
             raise ValueError("opponent 'slots' with no opponent_slots: the table *is* the "
                              "configuration, so an absent one is not 'the default opponent'. Pass "
@@ -1628,10 +1637,46 @@ class F1VecEnv:
             dx, dy = dn[:, 0] * c + dn[:, 1] * sn, -dn[:, 0] * sn + dn[:, 1] * c
             dv = st[o[ar, j], 3] - st[:, 3]
             s_ = PRIV_OPP_DIST_SCALE
-            pv = torch.cat([pv, torch.stack([dx / s_, dy / s_, dv / s_, dist[ar, j] / s_], 1)], 1)
+            if self.sim.absent_any:
+                # an empty seat's car is parked 1 km away: read as "no car near" at a bounded 30 m, not
+                # as a 200-unit input to the critic
+                far = self.sim.absent[o[ar, j]]
+                dx = torch.where(far, torch.full_like(dx, 30.0), dx); dy = torch.where(far, torch.zeros_like(dy), dy)
+                dv = torch.where(far, torch.zeros_like(dv), dv)
+                dd = torch.where(far, torch.full_like(dx, 30.0), dist[ar, j])
+            else:
+                dd = dist[ar, j]
+            pv = torch.cat([pv, torch.stack([dx / s_, dy / s_, dv / s_, dd / s_], 1)], 1)
         return pv
 
     def _reset_envs(self, ids: torch.Tensor):
+        """Reset these rows. With a `level_replay` (prioritized level replay, `learn.level_replay`) every
+        race that resets whole is reset on its own, with the simulator's generator set to the level seed
+        the replay chooses for that race seat -- which makes the seed name the whole level: venue variant,
+        layout, opponents, grid, physics. The main stream is restored after each, so the rest of the
+        batch draws exactly as it would have. Off (None): exactly the reset it always was."""
+        if getattr(self, "level_replay", None) is None or ids.numel() == 0:
+            return self._reset_envs_core(ids)
+        M = self.M
+        in_ids = torch.zeros(self.B, dtype=torch.bool, device=self.device); in_ids[ids] = True
+        full = in_ids.view(-1, M).all(1)
+        whole = full[self.race] & in_ids
+        part = ids[~whole[ids]]
+        if part.numel():
+            self._reset_envs_core(part, fill=False)          # a car rejoining its race: the main stream
+        gen = self.sim.gen
+        for r in torch.nonzero(full).flatten().tolist():
+            rows = torch.arange(r * M, (r + 1) * M, device=self.device)
+            seed = int(self.level_replay.choose(r))
+            st = gen.get_state(); gen.manual_seed(seed)
+            try:
+                self._reset_envs_core(rows, fill=False)
+            finally:
+                gen.set_state(st)
+            self.level_seed[rows] = seed
+        return self._fill_scans(ids, self.sim.odom.state[ids, 3])
+
+    def _reset_envs_core(self, ids: torch.Tensor, fill: bool = True):
         if ids.numel() == 0:
             return
         e = self.ecfg
@@ -1816,6 +1861,14 @@ class F1VecEnv:
         if self._replay is not None and self.M == 2:
             poses, speed = self._replay.apply(self, ids, poses, speed, gen)
         self.sim.reset(ids, poses, speed)
+        if self.M > 1 and getattr(self, "_present_p", None) is not None:
+            # 0-3 opponents: each seat of a race that resets whole is filled with its slot's `present`
+            # probability; an empty seat's car is parked off the map until its race resets again
+            u_ = torch.rand(full.shape[0], self.M, device=self.device, generator=gen)
+            empty = (u_ >= self._present_p[None, :])[race, slot]
+            self.sim.unpark(ids[is_full & ~empty])
+            self.sim.park(ids[is_full & empty])
+            speed = torch.where(is_full & empty, torch.zeros_like(speed), speed)
         self.sim.odom.state[ids, 3] = speed
         self.prev_action[ids] = 0.0
         if self.act_dim == 2:
@@ -1849,8 +1902,15 @@ class F1VecEnv:
             L_ = self.sim.track.length[self.sim.tid[ids]].clamp_min(1e-6)
             self.sector_idx[ids] = (s_new / L_ * self.sector_lim.shape[1]).long().clamp_(0, self.sector_lim.shape[1] - 1)
             self.sector_t0[ids] = 0.0; self.sector_valid[ids] = False; self.s_prev[ids] = s_new
-        # fill the scan history with a fresh scan from the new pose. Scanned for the whole batch on the
-        # compiled path (fixed shapes -> one CUDA graph); a per-reset partial batch would run eager kernels
+        if not fill:
+            return None
+        return self._fill_scans(ids, speed)
+
+    def _fill_scans(self, ids: torch.Tensor, speed: torch.Tensor):
+        """Fill the scan history of reset rows with a fresh scan from the new pose. Scanned for the whole
+        batch on the compiled path (fixed shapes -> one CUDA graph); a per-reset partial batch would run
+        eager kernels."""
+        e = self.ecfg
         cars = self.sim._car_boxes(self.sim.state) if self.M > 1 else None
         scan, scan_true, scan_type = self.sim.lidar.scan(self.sim.state[:, :3], None, self.sim.P, motion_distortion=False, tid=self.sim.tid, cars=cars, compiled=True, eid=self.sim.eid)
         self.scan_hist[ids] = self._norm_scan(scan[ids])[:, None, :]

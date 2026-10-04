@@ -433,6 +433,11 @@ def main():
                          "are seats that the learner's own snapshots take over, round robin, every --league-every "
                          "updates -- the pool keeps its fixed members and gains the learner's past selves")
     ap.add_argument("--league-every", type=int, default=64, metavar="U")
+    ap.add_argument("--level-replay", type=float, default=0.0, metavar="P",
+                    help="prioritized level replay: at a race reset, replay a past level of that race seat with "
+                         "probability P, chosen by its mean |advantage| (most left to learn) and staleness; "
+                         "0 = off (every reset a fresh draw, as before)")
+    ap.add_argument("--level-replay-size", type=int, default=24, metavar="N")
     ap.add_argument("--rand-widen", type=float, default=1.0, metavar="W",
                     help="stretch every physics randomisation range W times about its midpoint (1 = as configured)")
     ap.add_argument("--rand-range", action="append", default=[], metavar="GROUP.FIELD=LO,HI",
@@ -1111,6 +1116,12 @@ def main():
         print(f"controller arm: {a.controller}"
               + (f" | estimator {a.estimator}" if a.estimator else ""))
     spec = common.obs_spec(env)
+    if a.level_replay > 0:
+        from .level_replay import LevelReplay
+        env.level_replay = LevelReplay(env.B // env.M, p_replay=a.level_replay, size=a.level_replay_size,
+                                       seed=a.seed)
+        print(f"level replay: p {a.level_replay:g}, {a.level_replay_size} levels per race seat, "
+              f"{env.B // env.M} seats", flush=True)
     obs, info = env.reset(seed=a.seed)
     # After the seeded reset: the histories must start from the observations this run actually saw.
     controller.begin(obs)
@@ -1676,6 +1687,7 @@ def main():
     buf_rew = torch.zeros(T, B, device=device); buf_done = torch.zeros(T, B, device=device); buf_trunc = torch.zeros(T, B, device=device)
     buf_val = torch.zeros(T + 1, B, device=device)
     buf_final_val = torch.zeros(T, B, device=device)
+    buf_lvl = torch.full((T, B), -1, dtype=torch.long, device=device) if a.level_replay > 0 else None
     # --lagrange: constraint name -> the reward component whose onsets it counts, that component's own weight
     # (to turn it back into a count), the target per km and the multiplier
     lagrange = {}
@@ -1924,6 +1936,8 @@ def main():
                     buf_mask_lab[t] = env.opponent_beam_mask()[lid].to(torch.uint8)
                 if cond_dim:
                     buf_cond[t] = cond_t[lid].float()
+                if buf_lvl is not None:
+                    buf_lvl[t] = env.level_seed[lid]                 # the level this step is played on
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
                 # Advanced but NOT yet reset: the truncation bootstrap below reads the value of the
                 # terminal observation, which belongs to the episode that just ended.
@@ -2034,6 +2048,18 @@ def main():
                                         a.lagrange_lr, a.lagrange_max)
             adv = compute_gae(buf_rew, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, a.lam)
             ret = adv + buf_val[:T]
+            if buf_lvl is not None:
+                # each level's score: the mean |advantage| of the learner's steps on it (learn.level_replay)
+                seat = env.race[lid].cpu().numpy()
+                lv = buf_lvl.cpu().numpy(); aa = adv.abs().float().cpu().numpy()
+                seat_tb = np.broadcast_to(seat[None, :], lv.shape)
+                ok = lv >= 0
+                keys = np.stack([seat_tb[ok], lv[ok]], 1)
+                if keys.shape[0]:
+                    uk, inv = np.unique(keys, axis=0, return_inverse=True)
+                    sums = np.bincount(inv.ravel(), weights=aa[ok]); cnts = np.bincount(inv.ravel())
+                    for (st_, sd_), sm_, cn_ in zip(uk, sums, cnts):
+                        env.level_replay.accumulate(int(st_), int(sd_), float(sm_), int(cn_))
         t_roll = tm.lap()
         # ---------------- update
         model.train()
@@ -2328,6 +2354,9 @@ def main():
                      if 'loss/aux_floor_bce' in log else "")
                   + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         t_loop = time.time() - t_loop0
+        if getattr(env, "level_replay", None) is not None and update % 16 == 0:
+            print("level replay: " + " ".join(f"{k} {v:.3g}" if isinstance(v, float) else f"{k} {v}"
+                                              for k, v in env.level_replay.stats().items()), flush=True)
         if league_seats and update % a.league_every == 0:
             # the learner's current self takes the oldest league seat
             k_ = league_next % len(league_seats); league_next += 1

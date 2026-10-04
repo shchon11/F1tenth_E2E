@@ -462,6 +462,29 @@ def speed_profile(pts: np.ndarray, v_max: float = 10.0, a_lat: Optional[float] =
     return np.sqrt(np.maximum(u, 0.))
 
 
+def _keep_clear(xy: np.ndarray, track: Track, need: float, iters: int = 30) -> np.ndarray:
+    """Push each point of a closed line up the wall-distance field until it has `need` metres of
+    clearance (or `iters` steps), then smooth lightly. For a line moved onto a slightly different grid."""
+    from scipy import ndimage as _nd
+    edt = track.edt.astype(np.float64)
+    gy, gx = np.gradient(edt)
+    res, (ox, oy) = track.resolution, track.origin
+    H, W = edt.shape
+    p = np.array(xy, dtype=float)
+    for _ in range(iters):
+        j = np.clip((p[:, 0] - ox) / res, 0, W - 1.001); i = np.clip((p[:, 1] - oy) / res, 0, H - 1.001)
+        c = _nd.map_coordinates(edt, [i, j], order=1)
+        low = c < need
+        if not low.any():
+            break
+        g = np.stack([_nd.map_coordinates(gx, [i, j], order=1), _nd.map_coordinates(gy, [i, j], order=1)], 1)
+        g /= np.linalg.norm(g, axis=1, keepdims=True) + 1e-9
+        p[low] += g[low] * np.minimum(need - c[low], res)[:, None]
+    k = np.array([0.25, 0.5, 0.25])
+    p = np.stack([np.convolve(np.concatenate([p[-1:, d], p[:, d], p[:1, d]]), k, "valid") for d in (0, 1)], 1)
+    return p
+
+
 def _refine_lap_time(seed: np.ndarray, track: Track, veh_width: float, margin: float,
                      profile_kw: dict, width_cap: Optional[float] = None,
                      kappa_max: Optional[float] = None, max_seconds: Optional[float] = None,
@@ -556,7 +579,7 @@ class Raceline:
               mu: float = 1.0489, mu_front: Optional[float] = None,
               mu_rear: Optional[float] = None, vehicle=None,
               optimize_lap_time: bool = True,
-              objective: Optional[str] = None) -> "Raceline":
+              objective: Optional[str] = None, seed_xy: Optional[np.ndarray] = None) -> "Raceline":
         """margin: free space kept between the car's side and the boundary (0.40 m: the pure-pursuit
         teacher cuts inside the line by up to ~0.15 m at speed, and duct hoses are soft targets anyway).
         width_cap_ratio: a side is never wider than this fraction of the median total lane width,
@@ -583,13 +606,31 @@ class Raceline:
         c = resample_closed(routed, len(track.centerline))
         wl, wr = track_widths(track, c)
         cap = width_cap_ratio * float(np.median(wl + wr)) if width_cap_ratio else None
-        xy = min_curvature_raceline(c, veh_width=veh_width, margin=margin, iters=iters, smooth=smooth,
-                                    track=track, width_cap=cap, kappa_max=kappa_max, margin_min=0.)
+        if seed_xy is not None:
+            # a starting line handed in (a warped venue: its original's line, scaled): the solve refines
+            # a few centimetres instead of finding the line from a min-curvature start
+            xy = resample_closed(np.asarray(seed_xy, dtype=float), len(track.centerline))
+        else:
+            xy = min_curvature_raceline(c, veh_width=veh_width, margin=margin, iters=iters, smooth=smooth,
+                                        track=track, width_cap=cap, kappa_max=kappa_max, margin_min=0.)
         profile_kw = dict(v_max=v_max, a_lat=a_lat, a_acc=a_acc, a_brake=a_brake,
                           mu=mu, mu_front=mu_front, mu_rear=mu_rear, vehicle=vehicle)
         if optimize_lap_time:
-            result = _refine_lap_time(xy, track, veh_width, margin, profile_kw, width_cap=cap,
-                                      return_result=True)
+            try:
+                result = _refine_lap_time(xy, track, veh_width, margin, profile_kw, width_cap=cap,
+                                          return_result=True)
+            except ValueError as err:
+                if seed_xy is None:
+                    raise
+                # A warped venue whose refine stops a hair short of the solver's tolerance (measured:
+                # normalized violation 3e-4 to 4e-3): its original's minimum-time line, scaled and
+                # pushed off any wall the warp moved closer, with its own speed profile. Labelled as
+                # such in `optimization`, not passed off as a converged solve.
+                xy2 = _keep_clear(xy, track, veh_width / 2 + 0.12)
+                line = Raceline.from_xy(xy2, speed_profile(xy2, **profile_kw))
+                line.optimization = {"status": "warp-seed", "model": "original venue's minimum-time line, "
+                                     "scaled and cleared", "solver_error": str(err)[-200:]}
+                return line
             line = Raceline.from_xy(result.xy, result.v)
             line.optimization = result.diagnostics
             return line
@@ -623,6 +664,9 @@ class Raceline:
         # into a file byte-identical to the one beside it.
         if params.get("objective") is None:
             params.pop("objective", None)
+        # a starting point, not a parameter of the line: never part of the key
+        params.pop("seed_xy", None)
+        kw.pop("seed_xy", None)
         from .params import VehicleParams
         params["vehicle"] = _LineKeyVehicle(params["vehicle"] or VehicleParams())
         cl = b"" if track.centerline is None else np.asarray(track.centerline, dtype=np.float32).tobytes()
@@ -638,7 +682,14 @@ class Raceline:
         Raceline._announce_cache_miss(track.name, cache_dir, h, kw, params)
         import time as _time
         t0 = _time.monotonic()
-        rl = Raceline.build(track, **kw)
+        seed = None
+        parent = getattr(track, "warp_parent", None)
+        if parent is not None and kw.get("objective", "min_time" if kw.get("optimize_lap_time", True) else None) == "min_time":
+            # +warp<seed>: start from the original venue's own (cached) line, scaled the way the grid was
+            base = Raceline.build_cached(parent, cache_dir, **kw)
+            cx, cy = track.warp_center; sc = track.warp_scale
+            seed = np.stack([cx + (base.xy[:, 0] - cx) * sc, cy + (base.xy[:, 1] - cy) * sc], 1)
+        rl = Raceline.build(track, **kw) if seed is None else Raceline.build(track, seed_xy=seed, **kw)
         rl.save(path)
         report(f"{track.name}: {(_time.monotonic() - t0) / 60:.1f}분 만에 완성, 캐시에 저장",
                force=True)

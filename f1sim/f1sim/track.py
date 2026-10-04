@@ -267,6 +267,148 @@ class Track:
         return Track.from_occupancy(occ, res, (origin[0], origin[1]), cl, name, duct=duct, tall=tall,
                                     duct_height=duct_height)
 
+    def with_warp(self, seed: int = 0, scale=(0.95, 1.05), width=(-0.10, 0.10), dents=(1, 3),
+                  dent_depth=(0.08, 0.22), dent_run=(1.0, 3.0), shaves=(1, 3), shave_depth=(0.06, 0.18),
+                  shave_run=(1.0, 2.5), wall=0.10, min_half=0.55) -> "Track":
+        """The same venue as it could be rebuilt on another day (2026-10-04, the user's 'boot camp'):
+        the whole layout a few per cent bigger or smaller (`scale`), the lane a little wider or
+        narrower everywhere (`width`, metres per side), a few places where a wall section sits further
+        in (`dents`), and a few corners whose inside is cut back (`shaves`). Deterministic in `seed`.
+
+        Edits are made on the DRIVABLE region (the free component the centerline runs in), and every
+        moved boundary gets a fresh `wall` thick wall behind it, so a thin SLAM wall is never eaten
+        through and the infield never opens. A widening that would join two parts of the lap that a
+        thin wall separates is detected (adjacent lane cells whose nearest centerline points are
+        > 2 m of lap apart) and that edit is dropped. The lane never goes below `min_half` per side
+        at the centerline. New wall cells take the duct / tall class of the nearest old wall cell."""
+        if self.centerline is None:
+            raise ValueError("a warp needs a centerline")
+        if getattr(self, "props", ()):
+            raise ValueError("a warp rescales the grid; placed props would have to move with it (not done)")
+        rng = np.random.default_rng(int(seed) + 9157)
+        res = self.resolution
+        occ0 = self.occupancy
+        H, W = occ0.shape
+        cl = self.centerline
+        cj = np.clip(((cl[:, 0] - self.origin[0]) / res).astype(int), 0, W - 1)
+        ci = np.clip(((cl[:, 1] - self.origin[1]) / res).astype(int), 0, H - 1)
+        lab, _ = ndimage.label(~occ0)
+        drive = np.isin(lab, np.unique(lab[ci, cj]))
+        seg = np.linalg.norm(np.roll(cl, -1, 0) - cl, axis=1)
+        s_cl = np.concatenate([[0.0], np.cumsum(seg)[:-1]]); L = float(seg.sum())
+        xs = np.arange(W) * res + self.origin[0]; ys = np.arange(H) * res + self.origin[1]
+        gx, gy = np.meshgrid(xs, ys)
+        from scipy.spatial import cKDTree
+        tree = cKDTree(cl)
+        _, near_all = tree.query(np.stack([gx.ravel(), gy.ravel()], 1))
+        s_pix = s_cl[near_all].reshape(H, W)
+
+        def jumps(dr):
+            # adjacent drivable cells whose nearest centerline points are far apart along the lap
+            n = 0
+            for a_, b_ in ((dr[:, 1:] & dr[:, :-1], (s_pix[:, 1:], s_pix[:, :-1])),
+                           (dr[1:, :] & dr[:-1, :], (s_pix[1:, :], s_pix[:-1, :]))):
+                ds = np.abs(b_[0] - b_[1]); ds = np.minimum(ds, L - ds)
+                n += int((a_ & (ds > 2.0)).sum())
+            return n
+
+        base_jumps = jumps(drive)
+
+        def edit(dr, d, window=None):
+            """Move the boundary of `dr` by d metres (>0 outward, <0 inward), inside `window` only."""
+            win = np.ones_like(dr) if window is None else window
+            if d > 0:
+                dist = ndimage.distance_transform_edt(~dr) * res
+                new = dr | ((dist <= d) & win)
+            else:
+                dist = ndimage.distance_transform_edt(dr) * res
+                new = dr & ~((dist <= -d) & win)
+            return new
+
+        def contested(d):
+            """Cells within d + wall outside the lane whose nearby lane cells lie > 2 m of lap apart: a thin
+            wall between two parts of the lap. A widening there would join them, so it is left out."""
+            idx_ = ndimage.distance_transform_edt(~drive, return_distances=False, return_indices=True)
+            s_near = s_pix[idx_[0], idx_[1]]
+            band = (~drive) & (ndimage.distance_transform_edt(~drive) * res <= d + wall)
+            size = int(2 * math.ceil((d + wall) / res)) + 3
+            # both representations must see the jump (the lap's own wrap at s = 0 shows in one only)
+            o2 = np.ones_like(drive)
+            for sv in (s_near, (s_near + L / 2) % L):
+                big = np.where(band, sv, -1e9); small = np.where(band, sv, 1e9)
+                o2 &= band & ((ndimage.maximum_filter(big, size) - ndimage.minimum_filter(small, size)) > 2.0)
+            return ndimage.binary_dilation(o2, iterations=int(round(0.5 / res)))
+
+        edits = []
+        drive_new = drive.copy()
+        d_w = float(rng.uniform(*width))
+        cand = edit(drive_new, d_w, None if d_w <= 0 else ~contested(d_w))
+        if jumps(cand) <= base_jumps:
+            drive_new = cand; edits.append(f"width {d_w:+.2f}")
+        tang = np.roll(cl, -1, 0) - np.roll(cl, 1, 0)
+        tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
+        kap = np.cross(tang, np.roll(tang, -1, 0)) / np.maximum(np.roll(seg, 0), 1e-6)
+
+        def window_at(i, run, side):
+            t_ = tang[i]; nrm = np.array([-t_[1], t_[0]]) * side
+            along = (gx - cl[i, 0]) * t_[0] + (gy - cl[i, 1]) * t_[1]
+            across = (gx - cl[i, 0]) * nrm[0] + (gy - cl[i, 1]) * nrm[1]
+            return (np.abs(along) < run / 2) & (across > 0)
+
+        used = []
+        for _ in range(int(rng.integers(dents[0], dents[1] + 1))):
+            for _try in range(20):
+                i = int(rng.integers(len(cl)))
+                if any(min(abs(s_cl[i] - s_cl[j]), L - abs(s_cl[i] - s_cl[j])) < 4.0 for j in used):
+                    continue
+                dep = float(rng.uniform(*dent_depth)); run = float(rng.uniform(*dent_run))
+                cand = edit(drive_new, -dep, window_at(i, run, 1.0 if rng.uniform() < 0.5 else -1.0))
+                drive_new = cand; used.append(i); edits.append(f"dent {dep:.2f}m x {run:.1f}m at s={s_cl[i]:.1f}")
+                break
+        order = np.argsort(-np.abs(kap))
+        for _ in range(int(rng.integers(shaves[0], shaves[1] + 1))):
+            for i in order[: max(8, len(order) // 10)][rng.permutation(max(8, len(order) // 10))]:
+                i = int(i)
+                if any(min(abs(s_cl[i] - s_cl[j]), L - abs(s_cl[i] - s_cl[j])) < 3.0 for j in used):
+                    continue
+                dep = float(rng.uniform(*shave_depth)); run = float(rng.uniform(*shave_run))
+                inner = 1.0 if kap[i] > 0 else -1.0            # the side the corner turns towards
+                cand = edit(drive_new, dep, window_at(i, run, inner) & ~contested(dep))
+                if jumps(cand) <= base_jumps:
+                    drive_new = cand; edits.append(f"shave {dep:.2f}m x {run:.1f}m at s={s_cl[i]:.1f}")
+                used.append(i)
+                break
+        # never below min_half at the centerline: restore the original lane where an edit took too much
+        half = ndimage.distance_transform_edt(drive_new) * res
+        if (half[ci, cj] < min_half).any():
+            bad = np.zeros_like(drive); bad[ci[half[ci, cj] < min_half], cj[half[ci, cj] < min_half]] = True
+            bad = ndimage.binary_dilation(bad, iterations=int(round(2.0 / res)))
+            drive_new = np.where(bad, drive, drive_new)
+            edits.append("min-width restore")
+        # walls: everything within `wall` outside the new lane is wall; inside it is free; the rest as before
+        out_d = ndimage.distance_transform_edt(~drive_new) * res
+        new_wall = (~drive_new) & (out_d <= wall)
+        occ = occ0.copy()
+        occ[drive_new] = False
+        occ |= new_wall
+        idx = ndimage.distance_transform_edt(~occ0, return_distances=False, return_indices=True)
+        nearest = lambda m: m[idx[0], idx[1]]
+        duct = tall = None
+        if self.duct is not None:
+            duct = self.duct.copy(); duct[drive_new] = False; duct |= new_wall & nearest(self.duct)
+        if self.tall is not None:
+            tall = self.tall.copy(); tall[drive_new] = False; tall |= new_wall & nearest(self.tall)
+        sc = float(rng.uniform(*scale))
+        cx, cy = self.origin[0] + W * res / 2, self.origin[1] + H * res / 2
+        origin = (cx - (cx - self.origin[0]) * sc, cy - (cy - self.origin[1]) * sc)
+        cl_new = np.stack([cx + (cl[:, 0] - cx) * sc, cy + (cl[:, 1] - cy) * sc], 1)
+        t = Track.from_occupancy(occ, res * sc, origin, cl_new, f"{self.name}_warp{seed}", duct=duct, tall=tall,
+                                 duct_height=self.duct_height)
+        t.warp_edits = [f"scale {sc:.3f}"] + edits
+        # what `Raceline.build_cached` needs to start the warped venue's line from the original's
+        t.warp_parent, t.warp_scale, t.warp_center = self, sc, (cx, cy)
+        return t
+
     def with_pinches(self, seed: int = 0, n: int = 3, keep: float = 0.45, run: float = 1.6) -> "Track":
         """Copy of the track with the boundary pushed inward at a few places along the lane.
 

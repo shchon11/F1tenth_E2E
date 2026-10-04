@@ -231,6 +231,13 @@ def _load_base(name: str, bare: bool = False, **kw) -> Track:
     """
     name, b = _split_bare(name)
     bare = bare or b
+    if "+warp" in name:                                    # x+warp<seed>: the venue as rebuilt another day
+        base, _, spec = name.rpartition("+warp")
+        if not spec.isdigit():
+            raise ValueError(f"+warp takes a seed: {name!r}")
+        t = _load_base(base, bare=bare, **kw).with_warp(int(spec))
+        t.name = name
+        return t
     _b = (lambda t: t.bare()) if bare else (lambda t: t)
     if "+hard" in name:                                    # any family: hand-built-style patterns on top
         base, _, spec = name.rpartition("+hard")

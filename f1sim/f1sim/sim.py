@@ -177,6 +177,7 @@ class Simulator:
                                                                                     # Track.project)
         self.lap = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.collided = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self.absent = torch.zeros(num_envs, dtype=torch.bool, device=self.device)   # `park`
         #: Prop contact seen inside a substep, latched until `step` reads it. A box can be entered
         #: and pushed back out between two control steps, and a collision that the physics resolved
         #: but nothing reported is a collision the caller never learns about.
@@ -253,6 +254,34 @@ class Simulator:
         (-0.165, 0.120, 0.11, 0.045, 0.00, 0.11, 0.35),
         (-0.165, -0.120, 0.11, 0.045, 0.00, 0.11, 0.35),
     )
+
+    #: (B,) a car that is not in this race (an empty opponent seat). Set by `park`, cleared by `unpark`.
+    absent_any: bool = False
+
+    def park(self, ids: torch.Tensor) -> None:
+        """Take these cars out of the race: parked 1 km off the map (each at its own spot), at rest, frozen,
+        their wall / car contacts masked. Far away is what keeps them out of every other car's LiDAR,
+        contact test and nearest-opponent column without a mask in each of those places."""
+        if not hasattr(self, "absent") or self.absent.shape[0] != self.B:
+            self.absent = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        if ids.numel() == 0:
+            return
+        self.absent[ids] = True
+        self.absent_any = True
+        st = self.state
+        st[ids] = 0.0
+        st[ids, 0] = -1000.0 - 5.0 * ids.to(st.dtype)
+        st[ids, 1] = -1000.0
+        if self.wheel_model:
+            st[ids, dyn.IOMEGA] = 0.0
+        self.collided[ids] = False
+
+    def unpark(self, ids: torch.Tensor) -> None:
+        """These cars are in the race again (the next `reset` places them)."""
+        if not hasattr(self, "absent") or ids.numel() == 0:
+            return
+        self.absent[ids] = False
+        self.absent_any = bool(self.absent.any())
 
     def _car_boxes(self, state: torch.Tensor):
         """Box sets the LiDAR of each env sees: the other cars' parts and their rear detection boxes."""
@@ -632,6 +661,10 @@ class Simulator:
         if self.cfg.actuator.cmd_delay_jitter > 0:
             delay_s = delay_s + torch.rand(self.B, device=self.device, generator=self.gen) * self.cfg.actuator.cmd_delay_jitter
         frozen = self.collided & self.cfg.sim.terminate_on_collision
+        if self.absent_any:
+            # a parked car (an empty seat, `park`): no command, no motion
+            self.cmd = torch.where(self.absent[:, None], torch.zeros_like(self.cmd), self.cmd)
+            frozen = frozen | self.absent
         self.cmd_hist = torch.cat([self.cmd[:, None, :], self.cmd_hist[:, :-1]], 1)
 
         self.pose_prev = self.state[:, :3].clone()
@@ -670,6 +703,10 @@ class Simulator:
             # substeps, because a box can be entered and pushed back out inside one control step.
             hit = hit | self.prop_touched | (self._prop_contact(state)[0] > 0)
         self.prop_touched.zero_()          # in place: `warmup` restores by copy_ into this tensor
+        if self.absent_any:
+            hit = hit & ~self.absent
+            if self.M > 1:
+                self.car_collision = self.car_collision & ~self.absent
         # Latched while a collision ends the episode -- the car is frozen and the flag has to
         # survive to the reset that reads it. Under soft contact it must NOT latch: the episode
         # carries on, and a flag that stays true is a car charged the collision penalty on every

@@ -293,6 +293,10 @@ class OpponentSlot:
     #: always does: a profile scale under a teacher, a cap against `selfplay_pace_ref` under a network.
     ckpt_mix: Tuple[str, ...] = ()
     ckpt_p: float = 0.0
+    #: Probability this car takes part in a race (2026-10-04, 'boot camp': 0-3 opponents). At every full
+    #: race reset the seat is filled with this probability; an empty seat's car is parked far off the
+    #: map, frozen, unseen and untouchable (`Simulator.absent`). 1.0 draws nothing: as before.
+    present: float = 1.0
 
     # ---------------------------------------------------------------- construction
     @staticmethod
@@ -375,6 +379,9 @@ class OpponentSlot:
             raise ValueError(f"opponent slot: ckpt_p {ckpt_p}: a probability is in [0, 1]")
         if ckpt_p > 0 and not ckpt_mix:
             raise ValueError("opponent slot: ckpt_p without ckpt_mix -- no checkpoints to draw")
+        present = float(d.get("present", 1.0))
+        if not (0.0 <= present <= 1.0):
+            raise ValueError(f"opponent slot: present {present}: a probability is in [0, 1]")
         return OpponentSlot(
             kind=kind, kind_mix=mix,
             checkpoint=(str(d["checkpoint"]) if d.get("checkpoint") else None),
@@ -384,7 +391,7 @@ class OpponentSlot:
             events=tuple(timed), event_rate=rate,
             reactive={k: float(v) for k, v in reactive.items() if float(v) > 0.0},
             spawn=spawn, seed=(None if seed is None else int(seed)),
-            ckpt_mix=ckpt_mix, ckpt_p=(ckpt_p if ckpt_mix else 0.0))
+            ckpt_mix=ckpt_mix, ckpt_p=(ckpt_p if ckpt_mix else 0.0), present=present)
 
     def to_dict(self) -> Dict:
         """The JSON object this slot came from -- only the fields that are not the default.
@@ -421,6 +428,8 @@ class OpponentSlot:
         if self.ckpt_mix:
             out["ckpt_mix"] = list(self.ckpt_mix)
             out["ckpt_p"] = self.ckpt_p
+        if self.present != base.present:
+            out["present"] = self.present
         return out
 
     # ---------------------------------------------------------------- what it is
