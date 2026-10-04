@@ -125,7 +125,7 @@ def test_collection_copies_teacher_validity_for_primary_rows(monkeypatch):
     monkeypatch.setattr(dagger, 'runtime_for', lambda *args: runtime)
     # targets for the auxiliary heads read the simulator, which this stub does not have
     monkeypatch.setattr(dagger, 'friction_target', lambda env: torch.zeros(4))
-    monkeypatch.setattr(dagger, 'opponent_target', lambda env: torch.zeros(4, 1))
+    monkeypatch.setattr(dagger, 'opponent_target', lambda env, **kw: torch.zeros(4, 1))
     model = SimpleNamespace(initial_hidden=lambda batch, device: None)     # feedforward student
     buf = dagger.collect(Env(), model, teacher, 1, 1.0, 'cpu', dagger.StepBuffer(1)).finalize()
     assert buf.V.tolist() == [[True, False]]
@@ -165,7 +165,7 @@ def test_a_conditional_student_is_handed_its_condition_when_it_drives(monkeypatc
     runtime = SimpleNamespace(scan=None, observe=lambda scan, pro: scan, reset=lambda done: None, hidden=None)
     monkeypatch.setattr(dagger, 'runtime_for', lambda *args: runtime)
     monkeypatch.setattr(dagger, 'friction_target', lambda env: torch.zeros(4))
-    monkeypatch.setattr(dagger, 'opponent_target', lambda env: torch.zeros(4, 1))
+    monkeypatch.setattr(dagger, 'opponent_target', lambda env, **kw: torch.zeros(4, 1))
     dagger.collect(Env(), Model(), SimpleNamespace(last_label_valid=None), 2, 0.5, 'cpu', dagger.StepBuffer(1),
                    cond_fn=lambda: torch.ones(4, 1))
     assert seen and all(c is not None for c in seen)

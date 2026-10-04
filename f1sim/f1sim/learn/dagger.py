@@ -790,8 +790,10 @@ def main():
             raise SystemExit("--maneuver distils the rollout teacher's candidates: needs --teacher rollout")
         if a.memory != "off":
             raise SystemExit("--maneuver is feedforward for now: drop --memory")
-        if a.init and not (torch.load(a.init, map_location="cpu", weights_only=False).get("meta") or {}).get("maneuver"):
-            raise SystemExit("--maneuver with an --init that has no maneuver head: start the head fresh (no --init)")
+        if (a.init and not (torch.load(a.init, map_location="cpu", weights_only=False).get("meta") or {}).get("maneuver")
+                and a.maneuver_mode != "transform"):
+            raise SystemExit("--maneuver 'plans' with an --init that has no maneuver head: its K plans would start "
+                             "untrained; only 'transform' keeps the checkpoint's plan as its plain plan")
     opp_cfg.validate(a)
     if a.keep_iters < 1:
         raise SystemExit("--keep-iters must be positive")
@@ -911,6 +913,16 @@ def main():
     priv_dim = env.privileged(env.reset()[1] and env.last_result).shape[1]
     chan = scan_channel_spec({"channels": a.scan_channels, "memory_tau_s": a.scan_memory_tau}) if a.scan_channels else None
     mem_spec = memory_spec(hidden_size=a.memory_hidden) if a.memory != "off" else None
+    man_spec = None if not a.maneuver else {
+        "K": int(teacher.K),
+        "offsets": sorted({float(x) for x in teacher.c_off.tolist()}),
+        "speeds": sorted({float(x) for x in teacher.c_spd.tolist()}, reverse=True),
+        **({} if a.maneuver_mode != "transform" else {
+            "mode": "transform", "cand_off": teacher.c_off.tolist(),
+            "cand_spd": teacher.c_spd.tolist(), "i_line": int(teacher.i_line),
+            "v_max": float(env.ecfg.v_max_policy),
+            "k_lim": 0.85 * min(float(env.tracker.spec.kappa_max),
+                                math.tan(env.cfg.vehicle.s_max) / (env.cfg.vehicle.lf + env.cfg.vehicle.lr))})}
     if a.init:
         _init_out = common.plan_output_of(torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {})
         if {k: _init_out.get(k) for k in ("speed_mode", "speed_command")} != {"speed_mode": a.speed_mode, "speed_command": a.speed_command}:
@@ -949,6 +961,14 @@ def main():
             print(f"warm start from {os.path.basename(a.init)}: {len(fresh)} fresh tensor(s)", flush=True)
         else:
             model, _extra = load_checkpoint(a.init, device, override={"priv_dim": priv_dim, "act_dim": env.act_dim})
+        if man_spec is not None and getattr(model.actor, "maneuver", None) is None:
+            # A plain student under a fresh 'transform' head: its plan IS the plain plan the head shifts,
+            # so it starts driving exactly as the checkpoint did and only the choice / risk / progress
+            # heads start from scratch.
+            model.actor.attach_maneuver(man_spec)
+            model.actor.maneuver.prefer(man_spec["i_line"])
+            model.meta["maneuver"] = dict(model.actor.maneuver_spec)
+            print(f"maneuver head (transform) attached fresh to {os.path.basename(a.init)}'s plan", flush=True)
         model = model.to(device)
     else:
         # The condition input as ec51507 built it; the merge 75fea37 dropped it, and a fresh student
@@ -957,16 +977,7 @@ def main():
                             scan_deltas=a.scan_deltas, temporal_encoder=a.temporal_encoder,
                             scan_stem=a.scan_stem, memory=mem_spec, scan_channels=chan,
                             **({} if a.cond == "none" else {"cond_dim": 1, "cond": cond_mod.spec_for(a.cond).to_meta()}),
-                            **({} if not a.maneuver else {"maneuver": {
-                                "K": int(teacher.K),
-                                "offsets": sorted({float(x) for x in teacher.c_off.tolist()}),
-                                "speeds": sorted({float(x) for x in teacher.c_spd.tolist()}, reverse=True),
-                                **({} if a.maneuver_mode != "transform" else {
-                                    "mode": "transform", "cand_off": teacher.c_off.tolist(),
-                                    "cand_spd": teacher.c_spd.tolist(), "i_line": int(teacher.i_line),
-                                    "v_max": float(env.ecfg.v_max_policy),
-                                    "k_lim": 0.85 * min(float(env.tracker.spec.kappa_max),
-                                                        math.tan(env.cfg.vehicle.s_max) / (env.cfg.vehicle.lf + env.cfg.vehicle.lr))})}})
+                            **({} if man_spec is None else {"maneuver": man_spec})
                             ).to(device)
     if int(model.meta["proprio_dim"]) != spec.proprio_dim:
         raise SystemExit(f"the student's proprio width is {model.meta['proprio_dim']} and this env produces "

@@ -123,3 +123,23 @@ def test_a_transform_policy_is_the_candidate_mixture_so_ppo_trains_the_choice():
     lp2.sum().backward()
     assert m.actor.maneuver.score.weight.grad.abs().sum() > 0     # the choice gets a gradient
     assert m.actor.mu.weight.grad.abs().sum() > 0                 # and so does the plain plan
+
+
+def test_a_fresh_transform_head_on_a_plain_student_drives_as_that_student(tmp_path):
+    """Warm start (dagger --init of a plain student with --maneuver transform): the attached head prefers
+    the plain line, so the action is the student's own plan (to float rounding), and it survives a save."""
+    torch.manual_seed(5)
+    plain = ActorCritic(**SMALL)
+    scan, pro = torch.rand(16, 2, 64), torch.rand(16, 6)
+    pro[:, 0] = 0.5
+    with torch.no_grad():
+        before = plain.actor.forward(scan, pro)
+        plain.actor.attach_maneuver({"K": 3, "mode": "transform", "cand_off": [0.4, 0.0, -0.4],
+                                     "cand_spd": [1.0, 1.0, 0.6], "i_line": 1, "v_max": 10.0, "k_lim": 1.2})
+        plain.actor.maneuver.prefer(1)
+        plain.meta["maneuver"] = dict(plain.actor.maneuver_spec)
+        assert torch.allclose(plain.actor.forward(scan, pro), before, atol=1e-6)
+    p = tmp_path / "w.pt"; save_checkpoint(str(p), plain, {})
+    m2, _ = load_checkpoint(str(p))
+    with torch.no_grad():
+        assert torch.allclose(m2.actor.forward(scan, pro), before, atol=1e-6)

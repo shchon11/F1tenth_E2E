@@ -79,6 +79,14 @@ class ManeuverHead(nn.Module):
             out["plans"] = torch.tanh(self.plans(h)).view(-1, self.K, self.A)
         return out
 
+    @torch.no_grad()
+    def prefer(self, i: int, margin: float = 4.0) -> None:
+        """A fresh head that ranks candidate `i` first everywhere: attached to a trained plain student
+        ('transform', i = the plain line) it drives exactly as that student did until it learns otherwise."""
+        self.score.weight.mul_(0.1)
+        self.score.bias.zero_()
+        self.score.bias[int(i)] = float(margin)
+
     @staticmethod
     def rank(out: Dict[str, torch.Tensor]) -> torch.Tensor:
         """(B, K) what the action is chosen by: the teacher-choice logit plus log P(no contact) from the risk
@@ -194,6 +202,9 @@ def offset_candidates(base: torch.Tensor, v_meas: torch.Tensor, offsets: torch.T
     kf = fit_knots(kK, tx, ty, LpK, fr, lim, iters, fractions)
     a = encode(kf, v0.repeat_interleave(K, 0), v1.repeat_interleave(K, 0), v_max, spec,
                v_meas=v_meas.repeat_interleave(K, 0))
+    # a zero offset is the base plan itself, not its refit (as in `offset_plan`)
+    z = (offsets == 0).to(base.device)
+    a = torch.where(z[None, :, None], base[:, None, :].expand(B, K, -1), a.view(B, K, -1)).reshape(B * K, -1)
     s = speeds.to(base).repeat(B)
     a = a.clone(); a[:, -2:] = ((a[:, -2:] + 1.0) * s[:, None] - 1.0).clamp(-1.0, 1.0)
     return a.view(B, K, -1)
