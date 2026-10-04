@@ -110,14 +110,22 @@ class ManeuverHead(nn.Module):
 
 def maneuver_loss(out: Dict[str, torch.Tensor], plans_t: torch.Tensor, choice_t: torch.Tensor,
                   hit_t: torch.Tensor, prog_t: torch.Tensor, fresh: torch.Tensor,
-                  base: Optional[torch.Tensor] = None, i_line: Optional[int] = None) -> Dict[str, torch.Tensor]:
+                  base: Optional[torch.Tensor] = None, i_line: Optional[int] = None,
+                  plan_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
     """The four terms. `plans_t` (B, K, A) the teacher's plan for every candidate, `choice_t` (B,) the
     candidate it drove, `hit_t` / `prog_t` (B, K) the shadow simulation's outcome of every candidate
     (metres), valid on the rows where `fresh` (B,) -- the steps the teacher actually decided on."""
     if base is not None:
         # 'transform': the plain head's one plan learns the teacher's plain-line candidate; every other
         # candidate is a transform of it, so there is nothing else to regress
-        plan = F.smooth_l1_loss(base, plans_t[:, int(i_line)], beta=0.1)
+        if plan_mask is None:
+            plan = F.smooth_l1_loss(base, plans_t[:, int(i_line)], beta=0.1)
+        else:
+            # rows the plain plan is not taught on (`plan_mask` False): a car close ahead, where the plain line
+            # drives THROUGH it -- learned there, the plain plan also drove through props (v9: 19 props/km)
+            per = F.smooth_l1_loss(base, plans_t[:, int(i_line)], beta=0.1, reduction="none").mean(1)
+            m = plan_mask.to(per.dtype)
+            plan = (per * m).sum() / m.sum().clamp_min(1.0)
     else:
         plan = F.smooth_l1_loss(out["plans"], plans_t, beta=0.1)
         # and the candidate the teacher drove, on its own: the plan that is actually executed most of the time

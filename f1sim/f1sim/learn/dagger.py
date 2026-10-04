@@ -489,7 +489,8 @@ def sequence_means(model, scan, pro, keep, burn: int = 0, cond=None):
 def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float = 0.0, hard_power: float = 1.0,
                  log_every: int = 25, chunk: int = 0, speed_loss: str = "symmetric",
                  v_max: float = 10.0, quantile_dim: int = -1, tau: float = 0.5,
-                 aux_grip: float = 0.0, aux_opp: float = 0.0, maneuver_w=(1.0, 1.0, 1.0, 1.0)):
+                 aux_grip: float = 0.0, aux_opp: float = 0.0, maneuver_w=(1.0, 1.0, 1.0, 1.0),
+                 maneuver_plan_clear: bool = False):
     n_stored = sum(len(b) for b in bufs)
     n_total = sum(b.valid_count for b in bufs)
     log({"dagger/valid_labels": n_total, "dagger/invalid_labels": n_stored - n_total})
@@ -534,7 +535,13 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
             out = model.actor.maneuver_forward(scan, pro, c)
             grip, opp = out["grip"], out["opp"]
             mspec = model.actor.maneuver_spec
-            mp = (maneuver_loss(out, *man, base=out["base"], i_line=mspec["i_line"])
+            pmask = None
+            if maneuver_plan_clear:
+                if opp_t is None:
+                    raise RuntimeError("--maneuver-plan-clear needs the opponent target (--aux-opp)")
+                # no car in range ahead (the aux target's own `near`, visible-only under --aux-opp-visible)
+                pmask = ~((opp_t[:, 3] > 0) & (opp_t[:, 0] > 0))
+            mp = (maneuver_loss(out, *man, base=out["base"], i_line=mspec["i_line"], plan_mask=pmask)
                   if mspec.get("mode") == "transform" else maneuver_loss(out, *man))
             wp, wc, wr, wg = maneuver_w
             loss = wp * mp["plan"] + wc * mp["choice"] + wr * mp["risk"] + wg * mp["prog"]
@@ -660,6 +667,9 @@ def main():
                          "(contact within the horizon, progress) -- and acts on the candidate it ranks first. "
                          "Needs --teacher rollout and a feedforward student")
     ap.add_argument("--maneuver-weights", default="1,1,1,1", help="plan,choice,risk,progress loss weights")
+    ap.add_argument("--maneuver-plan-clear", action="store_true",
+                    help="'transform': teach the plain plan only where no car is in range ahead (the plain-line label "
+                         "drives through it; avoiding cars is the choice's job). Needs --aux-opp")
     ap.add_argument("--maneuver-mode", choices=("transform", "plans"), default="transform",
                     help="'transform': ONE regressed plan (the teacher's plain-line candidate) and the candidates as "
                          "its shifts -- what generalises; 'plans': K regressed plans (2026-10-01, held-out 42 %%)")
@@ -785,6 +795,8 @@ def main():
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
     AUX_OPP_VISIBLE[0] = bool(a.aux_opp_visible)
+    if a.maneuver_plan_clear and not (a.maneuver and a.maneuver_mode == "transform" and a.aux_opp > 0):
+        raise SystemExit("--maneuver-plan-clear needs --maneuver --maneuver-mode transform and --aux-opp > 0")
     if a.maneuver:
         if a.teacher_kind != "rollout":
             raise SystemExit("--maneuver distils the rollout teacher's candidates: needs --teacher rollout")
@@ -1043,7 +1055,8 @@ def main():
                             a.log_every, chunk=a.chunk_length, speed_loss=a.speed_loss,
                             v_max=env.ecfg.v_max_policy, quantile_dim=quantile_dim, tau=a.grip_quantile,
                             aux_grip=a.aux_grip, aux_opp=a.aux_opp,
-                            maneuver_w=tuple(float(x) for x in a.maneuver_weights.split(","))); t_tr = tm.lap()
+                            maneuver_w=tuple(float(x) for x in a.maneuver_weights.split(",")),
+                            maneuver_plan_clear=a.maneuver_plan_clear); t_tr = tm.lap()
         # Diagnostics only, and fenced off from the training stream. `eval_every` skips the
         # measurement, never the collection or the training: 75 % of a calibrated iteration was
         # this rollout (873 s of 1165), and eight iterations of it is two hours of measuring a

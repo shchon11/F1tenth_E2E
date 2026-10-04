@@ -164,3 +164,18 @@ def test_a_choice_temperature_sharpens_the_mixture_keeps_the_mean_and_survives_a
     p = tmp_path / "t.pt"; save_checkpoint(str(p), m, {})
     m2, _ = load_checkpoint(str(p))
     assert m2.actor.maneuver_spec["temp"] == 0.25
+
+
+def test_the_plain_plan_is_not_taught_where_a_car_is_close_ahead():
+    torch.manual_seed(7)
+    B, K, A = 6, 3, 8
+    out = {"score": torch.zeros(B, K), "risk": torch.zeros(B, K), "prog": torch.zeros(B, K)}
+    base = torch.zeros(B, A, requires_grad=True)
+    plans_t = torch.zeros(B, K, A); plans_t[:3, 0] = 0.5                 # rows 0-2: a big plan error
+    args = (plans_t, torch.zeros(B, dtype=torch.long), torch.zeros(B, K), torch.zeros(B, K), torch.zeros(B))
+    full = maneuver_loss(out, *args, base=base, i_line=0)["plan"]
+    mask = torch.tensor([False, False, False, True, True, True])         # rows 0-2: a car close ahead
+    clear = maneuver_loss(out, *args, base=base, i_line=0, plan_mask=mask)["plan"]
+    assert full > 0 and float(clear) == 0.0
+    clear.backward()
+    assert base.grad.abs().sum() == 0
