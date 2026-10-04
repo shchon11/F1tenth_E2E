@@ -307,7 +307,7 @@ class RolloutTeacher:
         return self._candidate(self.base, self.env, off, self.c_spd[self.choice], plan_speed, tid=self._real_tid(), P=P)
 
     @torch.no_grad()
-    def candidate_plans(self, P=None, batched: bool = True) -> torch.Tensor:
+    def candidate_plans(self, P=None, batched: bool = True, lateral_slow: bool = True) -> torch.Tensor:
         """(B, K, A): the plan every candidate would issue from the env's current state -- the label of
         the maneuver head's `plans`. Call after `plan_action` of the same step (the lines are synced)."""
         env, B, K = self.env, self.env.B, self.K
@@ -326,8 +326,14 @@ class RolloutTeacher:
             setattr(self.base_S, n, v.repeat(K, *([1] * (v.dim() - 1))) if torch.is_tensor(v) and v.shape[:1] == (B,) else v)
         self.base_S.label_grip = self.base.label_grip
         off = self.c_off.repeat_interleave(B); spd = self.c_spd.repeat_interleave(B)
+        # lateral_slow=False: no off-line slowdown in the plans (a 'transform' maneuver head's plain plan -- slowing down is
+        # the candidate CHOICE's job there; with it, a student that executes offsets learned a plain plan 0.64x slow)
+        keep_slow = self.base_S.lat_slow
+        if not lateral_slow:
+            self.base_S.lat_slow = 0.0
         a = self.base_S.plan_action(env.sim.state.repeat(K, 1), PK, self._real_tid().repeat(K), env.ecfg.v_max_policy,
                                     env.tracker.spec, offset=off, plan_speed=env._tracker_plan_speed().repeat(K)).clone()
+        self.base_S.lat_slow = keep_slow
         a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
         return a.view(K, B, -1).transpose(0, 1).contiguous()
 

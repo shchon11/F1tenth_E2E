@@ -428,7 +428,7 @@ def collect(env, model, teacher, steps, beta, device, buf: StepBuffer, noise=0.0
             elif maneuver:
                 # the same parameters the label was drawn for (a dial label drives for the dial's friction)
                 P_lab = env.sim.P if dial is None else {**env.sim.P, "mu": dial.value().to(env.sim.P["mu"].dtype)}
-                plans = teacher.candidate_plans(P_lab)
+                plans = teacher.candidate_plans(P_lab, lateral_slow=maneuver_meta.get("mode") != "transform")
                 fresh = torch.full((env.B,), bool(teacher.decided_now), dtype=torch.bool, device=device)
                 man = (plans[ids], teacher.choice[ids], teacher.outcome_hit[ids], teacher.outcome_prog[ids], fresh[ids])
             buf.add(scan[ids, 0], pro[ids], label[ids], new_ep[ids],
@@ -976,6 +976,8 @@ def main():
     cond_fn = None if cspec is None else (
         lambda: cond_mod.mu_to_c(dial.value() if dial is not None else env.sim.P["mu"], cspec))
     # the solo cohort's env has its own batch: its own dial and condition (one shared DialDraw broke on the size)
+    if a.maneuver and a.maneuver_mode == "transform" and solo_teacher is not None:
+        solo_teacher.lat_slow = 0.0      # the solo cohort's plain-line label, on the same terms as the traffic one
     solo_dial = (cond_mod.DialDraw(solo_env, a.dial_margin, a.dial_exact)
                  if a.cond == "dial" and solo_env is not None else None)
     solo_cond_fn = None if (cspec is None or solo_env is None) else (
