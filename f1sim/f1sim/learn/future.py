@@ -81,8 +81,8 @@ def future_spec(k: int = FUTURE_K, width: int = FUTURE_WIDTH, source: Optional[s
         raise ValueError(f"future head k {k} must be >= 0 control steps")
     if width <= 0:
         raise ValueError(f"future head width {width} must be positive")
-    if source is not None and source not in ("memory", "trunk", "motion"):
-        raise ValueError(f"future head source must be 'memory', 'motion' or 'trunk', got {source!r}")
+    if source is not None and source not in ("memory", "trunk", "motion", "decision"):
+        raise ValueError(f"future head source must be 'memory', 'motion', 'trunk' or 'decision', got {source!r}")
     if targets is not None and tuple(targets) != FUTURE_LABEL_KEYS:
         raise ValueError(f"this checkpoint's future head was trained on targets {list(targets)}, "
                          f"which are not this build's {list(FUTURE_LABEL_KEYS)}")

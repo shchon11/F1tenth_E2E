@@ -528,6 +528,9 @@ def main():
                          f"boundaries and where no opponent is in range. 0 = off, and off the head is "
                          f"not built at all: same parameters, same state dict, same loss. Measure "
                          f"what it did with `python -m f1sim.learn.probe_hidden`")
+    ap.add_argument("--aux-future-source", default=None, choices=("decision",),
+                    help="'decision': the future head reads the features the action head reads instead of the "
+                         "recurrent state (None: as before)")
     ap.add_argument("--aux-future-k", type=int, default=FUTURE_K,
                     help=f"lookahead of --aux-future in control steps (40 Hz). Default {FUTURE_K} "
                          f"= 0.5 s. Only the last k steps of each --horizon chunk go unlabelled, so "
@@ -1210,7 +1213,8 @@ def main():
     #: actor fills it in (`Actor.attach_future`). Naming it here was right while there were two
     #: possibilities and wrong as soon as there were three -- with a motion branch the head reads
     #: `h_dyn`, and a spec that said "memory" would be refused by the actor it was built for.
-    fut_cfg = (future_spec(k=a.aux_future_k, width=a.aux_future_width)
+    fut_cfg = (future_spec(k=a.aux_future_k, width=a.aux_future_width,
+                           **({"source": a.aux_future_source} if a.aux_future_source else {}))
                if a.aux_future > 0 else None)
     if fut_cfg and future_labelled_fraction(a.horizon, a.aux_future_k) <= 0.0:
         raise SystemExit(f"--aux-future-k {a.aux_future_k} needs --horizon > {a.aux_future_k - 1} "

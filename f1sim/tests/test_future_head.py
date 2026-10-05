@@ -604,3 +604,31 @@ def test_a_frozen_actor_is_frozen_the_auxiliary_head_included():
 
     assert gru_grad(False) > 0
     assert gru_grad(True) == 0.0
+
+
+def test_a_decision_source_head_reads_the_action_heads_features_and_survives_the_warm_start(tmp_path):
+    """--aux-future-source decision: the head reads `feat` (what `mu` reads), not the recurrent state."""
+    torch.manual_seed(21)
+    base = ActorCritic(**SMALL)
+    path = str(tmp_path / "ff.pt"); save_checkpoint(path, base, {"spec": {}})
+    m, _extra, fresh = load_for_memory(path, "cpu", memory_spec(hidden_size=32),
+                                       future_head={"k": FUTURE_K, "width": 16, "source": "decision"})
+    assert m.meta["future_head"]["source"] == "decision"
+    assert m.actor.future.net[0].in_features == m.actor.mu.in_features
+    scan, pro = torch.rand(4, 3, 64), torch.rand(4, 16)
+    base.eval(); m.eval()
+    with torch.no_grad():                                   # a zero-output head changes nothing at start
+        assert torch.equal(base.act(scan, pro, deterministic=True)[0],
+                           m.act(scan, pro, deterministic=True, h=None)[0])
+    feat, _p, h_next, _e, _f = m.actor._parts(scan, pro, None, m.actor.initial_hidden(4))
+    assert torch.equal(m.actor.future_input(feat, h_next), feat)
+    with torch.no_grad():
+        m.actor.future.net[2].weight.normal_()              # a trained head: its loss reaches the trunk
+    m.actor.zero_grad()
+    m.actor.future_from(feat, h_next).pow(2).sum().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for n, p in m.actor.named_parameters()
+               if not n.startswith("future.") and not n.startswith("mu."))
+    again = str(tmp_path / "dec.pt"); save_checkpoint(again, m, {"spec": {}})
+    from f1sim.learn.model import load_checkpoint
+    m2, _ = load_checkpoint(again)
+    assert m2.meta["future_head"]["source"] == "decision"

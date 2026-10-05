@@ -338,6 +338,14 @@ class Actor(nn.Module):
         from the same `--seed`. Built after both, the head is the only thing the flag adds.
         """
         spec = future_spec(**future)
+        if spec["source"] == "decision":
+            # 'decision' (2026-10-06): the head reads the features the ACTION head reads (`feat`, the input
+            # of `mu`). Measured on the boot-camp policy: its GRU state carried the opponent's 0.5 s lateral
+            # move at R2 0.20 (0.55 is reachable), its decision features at -0.36 -- known, not used. A
+            # target on `feat` puts "where will that car be" on the path the plan is computed from.
+            self.future = FutureHead(self.mu.in_features, spec["width"])
+            self.future_spec = dict(spec)
+            return
         # Which tensor the head reads follows from what this actor HAS, and it is the same tensor
         # `future_input` returns -- including the case the addendum adds, where a motion branch
         # exists and every auxiliary reads `h_dyn` alone rather than the main state.
@@ -510,6 +518,8 @@ class Actor(nn.Module):
         rests on them being one tensor. `h_next` is None when the recurrence was deliberately
         switched off (`use_memory=False`, the KL reference's path), and then there is no state.
         """
+        if (getattr(self, "future_spec", None) or {}).get("source") == "decision":
+            return feat
         if self.memory is None:
             return feat
         if h_next is None:
