@@ -153,3 +153,24 @@ moments dropped; re-measured identical after stripping.
 
 The five seeds of the same recipe ranged 119-204 car contacts and 7.66-8.25 s solo laps: one seed
 is not a measurement of a recipe.
+
+## `iccas_bootcamp_safe.pt` (2026-10-05) — fewest car and prop contacts so far
+
+Lineage: the champion's feedforward ICCAS solo stage (`ffS_lin`) → **12.6 M steps of "boot camp" race PPO**
+(`ppo_boot.sh`, commits 91f5510 / e303c49): ICCAS plus 16 rebuilt variants of it (`+warp`: size ±5 %, lane
+±0.10 m, wall sections set in, corners cut back), a race of 4 whose 3 opponent seats are each filled with
+p 0.5 per race (0-3 opponents), the four planners with scripted defending / line holding and brake / stop /
+shift / weave events or (p 0.5) a learned policy from a league that the learner's own snapshots join every
+64 updates, prioritized level replay (p 0.5), the constrained reward of v2R, KL 0.05 to the solo stage.
+Optimizer moments dropped; re-measured identical after stripping (seed 77 vs interactive).
+
+| ICCAS, 4 seeds × 4 planners, dial 0 | boot camp | s976 (prev. safest) | v2R (fastest) |
+| --- | ---: | ---: | ---: |
+| solo lap | 7.89 s | 7.91 s | **7.66 s** |
+| car contacts | **102** | 119 | 160 |
+| passes | 218 | **236** | 235 |
+| prop contacts / km | **0.45** | 1.10 | 1.25 |
+| unseen learned opponents B / gate, contacts / passes (2 seeds) | 26/22, 17/22 | 19/37, 23/29 | 18/14, 17/12 |
+
+Its 30 % checkpoint scored 185 contacts / 0.87 props/km: the gains came over the whole run. The same boot camp
+with KL 0 from v2R drifted (kl_ref 24, solo 9.8 s at 26 %) and was stopped.

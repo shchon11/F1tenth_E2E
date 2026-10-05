@@ -70,5 +70,15 @@
    "extra.opt"
   ],
   "source_mb": 31.0
+ },
+ {
+  "file": "iccas_bootcamp_safe.pt",
+  "run": "bootA2R",
+  "sha256": "5645aaea9bca5c71f628a3a89323c7f1437971b508d88d24027a502f587fa5df",
+  "size_mb": 11.0,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 32.5
  }
 ]
