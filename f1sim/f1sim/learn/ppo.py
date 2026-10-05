@@ -208,7 +208,8 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
         with torch.no_grad(), ac:
             # Preserve the historical memoryless baseline for ordinary PPO.
             d_ref = ref.feedforward_dist(ref_scan, ref_pro, ref_cond)
-        ref_mean, ref_std = d_ref.mean.float(), d_ref.stddev.float()
+        # a maneuver actor is leashed on its plain-line plan (`ManeuverDist.anchor`), not on the top candidate
+        ref_mean, ref_std = getattr(d_ref, "anchor", d_ref.mean).float(), d_ref.stddev.float()
     else:
         ref_mean, ref_std = reference_params
         if sequence is not None:
@@ -219,11 +220,11 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
             raise ValueError("stored recurrent reference does not align with the PPO minibatch")
     if kl_scope == "curvature":
         ref_mean, ref_std = ref_mean[:, :6], ref_std[:, :6]
-        d = torch.distributions.Normal(d.mean.float()[:, :6], d.stddev.float()[:, :6])
+        d = torch.distributions.Normal(getattr(d, "anchor", d.mean).float()[:, :6], d.stddev.float()[:, :6])
     elif kl_scope != "all":
         raise ValueError(f"unknown KL scope {kl_scope!r}")
     d_ref = torch.distributions.Normal(ref_mean, ref_std)
-    d = torch.distributions.Normal(d.mean.float(), d.stddev.float())
+    d = torch.distributions.Normal(getattr(d, "anchor", d.mean).float(), d.stddev.float())
     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, d).sum(1), w)
     ent_w = wmean(ent, w)
     # The auxiliary heads read the actor's trunk (encoder, memory), so while the actor is frozen they

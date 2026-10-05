@@ -150,7 +150,7 @@ class ManeuverDist:
     only as an exploration bonus.
     """
 
-    def __init__(self, out: dict, std: torch.Tensor, temp: float = 1.0):
+    def __init__(self, out: dict, std: torch.Tensor, temp: float = 1.0, anchor_index: Optional[int] = None):
         # temp < 1 sharpens the choice. At 1 a DAgger student on ICCAS solo puts 0.77 on its top candidate,
         # so a PPO rollout drew another candidate on 23 % of steps -- a line / speed jump every 0.11 s, and
         # the solo stage's wall rate climbed 16 -> 34/km. 0.33 makes it one every ~2 s (scratchpad
@@ -161,6 +161,11 @@ class ManeuverDist:
         self.A = A
         self.std = std.float().expand(A)
         self._top = self.plans.gather(1, self.logits.argmax(1)[:, None, None].expand(-1, 1, A))[:, 0]
+        #: What a KL leash should hold near its reference: the plain line's plan ('transform': the base plan
+        #: itself), not `mean`. `mean` is the TOP candidate's plan, so a leash on it charges every switch to
+        #: another line or pace as a jump of the whole plan -- measured, a leashed boot-camp run (bootB) kept
+        #: its contacts flat for 2400 updates while the plain-head run beside it halved them. None: `mean`.
+        self.anchor = self._top if anchor_index is None else self.plans[:, int(anchor_index)]
 
     @property
     def mean(self) -> torch.Tensor:

@@ -164,3 +164,18 @@ def test_a_choice_temperature_sharpens_the_mixture_keeps_the_mean_and_survives_a
     p = tmp_path / "t.pt"; save_checkpoint(str(p), m, {})
     m2, _ = load_checkpoint(str(p))
     assert m2.actor.maneuver_spec["temp"] == 0.25
+
+
+def test_the_kl_anchor_is_the_plain_line_plan_not_the_top_candidate():
+    """A leash on `mean` (the top candidate) charges a switch of line as a jump of the whole plan."""
+    torch.manual_seed(8)
+    m = _transform_model()                                      # i_line 0
+    scan, pro = torch.rand(6, 2, 64), torch.rand(6, 6)
+    pro[:, 0] = 0.5
+    with torch.no_grad():
+        m.actor.maneuver.score.bias.copy_(torch.tensor([0.0, 0.0, 8.0])); m.actor.maneuver.score.weight.zero_()
+        m.actor.maneuver.risk.bias.fill_(-10.0); m.actor.maneuver.risk.weight.zero_()
+        m.actor.forward(scan, pro); d = m.actor._make_dist(None)
+        base = m.actor.maneuver_forward(scan, pro)["base"]
+    assert not torch.allclose(d.mean, base, atol=1e-3)           # the top candidate is another line / pace
+    assert torch.allclose(d.anchor, base, atol=1e-5)              # the leash holds the plain plan

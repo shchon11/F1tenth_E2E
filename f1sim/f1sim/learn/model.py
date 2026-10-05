@@ -426,7 +426,8 @@ class Actor(nn.Module):
         if self.maneuver is None or (self.maneuver.transform and "plans" not in self._last_man):
             return torch.distributions.Normal(mu, self.log_std.exp().expand_as(mu))
         from .maneuver import ManeuverDist
-        return ManeuverDist(self._last_man, self.log_std.exp(), temp=self.maneuver_spec.get("temp", 1.0))
+        return ManeuverDist(self._last_man, self.log_std.exp(), temp=self.maneuver_spec.get("temp", 1.0),
+                            anchor_index=self.maneuver_spec.get("i_line"))
 
     def maneuver_forward(self, scan, proprio, c=None) -> dict:
         """The maneuver head's four outputs (feedforward): for the DAgger loss."""
