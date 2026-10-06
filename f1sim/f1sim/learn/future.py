@@ -60,7 +60,7 @@ FUTURE_OPPONENT_KEYS = ("opp_lon", "opp_lat", "opp_vlon", "opp_vlat")
 
 
 def future_spec(k: int = FUTURE_K, width: int = FUTURE_WIDTH, source: Optional[str] = None,
-                targets: Optional[Sequence[str]] = None) -> dict:
+                targets: Optional[Sequence[str]] = None, into_policy: bool = False) -> dict:
     """The `meta["future_head"]` block, validated. Written by the trainer, read by every loader.
 
     Idempotent -- `future_spec(**future_spec())` is the same dict -- because a checkpoint's recorded
@@ -86,7 +86,15 @@ def future_spec(k: int = FUTURE_K, width: int = FUTURE_WIDTH, source: Optional[s
     if targets is not None and tuple(targets) != FUTURE_LABEL_KEYS:
         raise ValueError(f"this checkpoint's future head was trained on targets {list(targets)}, "
                          f"which are not this build's {list(FUTURE_LABEL_KEYS)}")
-    return {"k": k, "width": width, "source": source, "targets": list(FUTURE_LABEL_KEYS)}
+    if into_policy and source != "decision":
+        raise ValueError("into_policy needs source 'decision': the prediction is computed from the features the "
+                         "action head reads, then handed to it")
+    out = {"k": k, "width": width, "source": source, "targets": list(FUTURE_LABEL_KEYS)}
+    if into_policy:
+        # (2026-10-07) the head's prediction (detached) is an extra INPUT of the action head: 'where will that
+        # car be in 0.5 s' as an explicit variable the plan is computed from, not only a side target
+        out["into_policy"] = True
+    return out
 
 
 class FutureHead(nn.Module):

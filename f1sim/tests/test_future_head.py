@@ -632,3 +632,36 @@ def test_a_decision_source_head_reads_the_action_heads_features_and_survives_the
     from f1sim.learn.model import load_checkpoint
     m2, _ = load_checkpoint(again)
     assert m2.meta["future_head"]["source"] == "decision"
+
+
+def test_into_policy_feeds_the_detached_prediction_to_the_action_head_from_zero(tmp_path):
+    """--aux-future-into-policy: mu reads [feat | prediction]; the warm start acts exactly as the checkpoint;
+    the action's gradient never reaches the prediction head (it learns from its own target only)."""
+    torch.manual_seed(31)
+    base = ActorCritic(**SMALL)
+    path = str(tmp_path / "ff.pt"); save_checkpoint(path, base, {"spec": {}})
+    m, _extra, fresh = load_for_memory(path, "cpu", memory_spec(hidden_size=32),
+                                       future_head={"k": FUTURE_K, "width": 16, "source": "decision",
+                                                    "into_policy": True})
+    assert m.meta["future_head"].get("into_policy") is True
+    H = m.actor.hidden_width
+    assert m.actor.mu.in_features == H + m.actor.future.net[2].out_features
+    scan, pro = torch.rand(4, 3, 64), torch.rand(4, 16)
+    base.eval(); m.eval()
+    with torch.no_grad():
+        assert torch.allclose(base.act(scan, pro, deterministic=True)[0], m.act(scan, pro, deterministic=True, h=None)[0],
+                              atol=1e-6)                     # zero columns: the same action (to float rounding)
+        m.actor.future.net[2].weight.normal_(); m.actor.mu.weight[:, H:].normal_()
+        a1 = m.act(scan, pro, deterministic=True, h=None)[0]
+    assert not torch.allclose(a1, base.act(scan, pro, deterministic=True)[0], atol=1e-4)   # the prediction now steers
+    m.actor.zero_grad(); m.train()
+    feat, _p, _hn, _e, _f = m.actor._parts(scan, pro, None, m.actor.initial_hidden(4))
+    m.actor._action_mean(feat).sum().backward()
+    assert m.actor.mu.weight.grad[:, H:].abs().sum() > 0                    # the action head uses the prediction
+    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in m.actor.future.parameters())
+    m.eval()
+    again = str(tmp_path / "ip.pt"); save_checkpoint(again, m, {"spec": {}})
+    from f1sim.learn.model import load_checkpoint
+    m2, _ = load_checkpoint(again); m2.eval()
+    with torch.no_grad():
+        assert torch.allclose(m2.act(scan, pro, deterministic=True, h=None)[0], a1, atol=1e-6)

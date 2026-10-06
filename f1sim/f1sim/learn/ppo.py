@@ -548,6 +548,9 @@ def main():
     ap.add_argument("--aux-future-source", default=None, choices=("decision",),
                     help="'decision': the future head reads the features the action head reads instead of the "
                          "recurrent state (None: as before)")
+    ap.add_argument("--aux-future-into-policy", action="store_true",
+                    help="with --aux-future-source decision: the head's prediction (detached) is also an input of "
+                         "the action head, its columns starting at zero")
     ap.add_argument("--aux-future-k", type=int, default=FUTURE_K,
                     help=f"lookahead of --aux-future in control steps (40 Hz). Default {FUTURE_K} "
                          f"= 0.5 s. Only the last k steps of each --horizon chunk go unlabelled, so "
@@ -1236,7 +1239,8 @@ def main():
     #: possibilities and wrong as soon as there were three -- with a motion branch the head reads
     #: `h_dyn`, and a spec that said "memory" would be refused by the actor it was built for.
     fut_cfg = (future_spec(k=a.aux_future_k, width=a.aux_future_width,
-                           **({"source": a.aux_future_source} if a.aux_future_source else {}))
+                           **({"source": a.aux_future_source} if a.aux_future_source else {}),
+                           **({"into_policy": True} if a.aux_future_into_policy else {}))
                if a.aux_future > 0 else None)
     if fut_cfg and future_labelled_fraction(a.horizon, a.aux_future_k) <= 0.0:
         raise SystemExit(f"--aux-future-k {a.aux_future_k} needs --horizon > {a.aux_future_k - 1} "

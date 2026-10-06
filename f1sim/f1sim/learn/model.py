@@ -339,12 +339,22 @@ class Actor(nn.Module):
         """
         spec = future_spec(**future)
         if spec["source"] == "decision":
+            feat_dim = self.hidden_width
             # 'decision' (2026-10-06): the head reads the features the ACTION head reads (`feat`, the input
             # of `mu`). Measured on the boot-camp policy: its GRU state carried the opponent's 0.5 s lateral
             # move at R2 0.20 (0.55 is reachable), its decision features at -0.36 -- known, not used. A
             # target on `feat` puts "where will that car be" on the path the plan is computed from.
-            self.future = FutureHead(self.mu.in_features, spec["width"])
+            self.future = FutureHead(feat_dim, spec["width"])
             self.future_spec = dict(spec)
+            if spec.get("into_policy"):
+                # the action head reads [feat | prediction]: the original columns keep their weights, the new
+                # ones start at zero, so attaching this changes no action until training moves them
+                old_mu = self.mu
+                self.mu = nn.Linear(feat_dim + self.future.net[2].out_features, old_mu.out_features)
+                with torch.no_grad():
+                    self.mu.weight.zero_()
+                    self.mu.weight[:, :feat_dim] = old_mu.weight
+                    self.mu.bias.copy_(old_mu.bias)
             return
         # Which tensor the head reads follows from what this actor HAS, and it is the same tensor
         # `future_input` returns -- including the case the addendum adds, where a motion branch
@@ -379,14 +389,22 @@ class Actor(nn.Module):
     def attach_maneuver(self, spec: dict) -> None:
         from .maneuver import ManeuverHead, maneuver_spec
         cfg = maneuver_spec(**spec)
-        self.maneuver = ManeuverHead(self.mu.in_features, self.mu.out_features, cfg["K"], cfg["hidden"],
+        self.maneuver = ManeuverHead(self.hidden_width, self.mu.out_features, cfg["K"], cfg["hidden"],
                                      transform=cfg.get("mode") == "transform")
         self.maneuver_spec = dict(cfg)
+
+    def _mu(self, feat: torch.Tensor) -> torch.Tensor:
+        """The action head's pre-activation: `mu(feat)`, or with a future head `into_policy`, `mu([feat | its
+        prediction])` -- the prediction detached, so it is trained by its own target only."""
+        fs = getattr(self, "future_spec", None) or {}
+        if fs.get("into_policy") and self.future is not None:
+            return self.mu(torch.cat([feat, self.future(feat).detach()], -1))
+        return self.mu(feat)
 
     def _action_mean(self, feat: torch.Tensor) -> torch.Tensor:
         """The action every entry point returns: the plain head's, or the maneuver head's chosen plan."""
         if self.maneuver is None:
-            return torch.tanh(self.mu(feat))
+            return torch.tanh(self._mu(feat))
         from .maneuver import ManeuverHead
         out = self.maneuver(feat)
         #: the last forward's outputs, read by `_make_dist` right after in the same call
@@ -397,7 +415,7 @@ class Actor(nn.Module):
         # fit, not differentiated through: the gradient reaches the plain plan straight through.
         from ..mpc import PlanSpec
         from .maneuver import offset_plan
-        base = torch.tanh(self.mu(feat))
+        base = torch.tanh(self._mu(feat))
         v = getattr(self, "_last_v", None)
         if v is None or v.shape[0] != base.shape[0]:
             raise RuntimeError("a 'transform' maneuver head needs the speed of the same forward (Actor._parts)")
@@ -442,7 +460,7 @@ class Actor(nn.Module):
         self._feedforward_only("maneuver")
         feat, p, _h, _enc, _fl = self._parts(scan, proprio, c)
         out = self.maneuver(feat)
-        out["base"] = torch.tanh(self.mu(feat))
+        out["base"] = torch.tanh(self._mu(feat))
         out["grip"] = self.grip(torch.cat([feat, p], 1))[:, 0]
         out["opp"] = self.opp(feat)
         return out
@@ -1587,6 +1605,10 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
         # The other is the proprio embedding gaining the privileged opponent block. The actor's
         # input is the proprio vector, so the columns go on the end; the critic's is
         # cat([proprio, priv]), so they go in at the old proprio width -- `_proprio_growth`.
+        if (k == "actor.mu.weight" and (future_head or {}).get("into_policy") and v.dim() == 2
+                and sd[k].shape[0] == v.shape[0] and sd[k].shape[1] > v.shape[1]):
+            grown[k] = (v.shape[1], sd[k].shape[1] - v.shape[1])     # prediction columns appended, zeroed
+            continue
         split = _proprio_growth(k, v, sd[k], p_old, k_tok) if k_tok else None
         if split is not None:
             widened[k] = split
@@ -1610,7 +1632,7 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
             f"{sorted(set(fresh) - allowed_fresh)[:6]}. Every original weight must transfer "
             f"unchanged; only the memory modules, the future head (and the zeroed new scan-channel "
             f"columns) may be new.{hint}")
-    n_conv = sum(1 for k in grown if src[k].dim() == 3)
+    n_conv = sum(1 for k in grown if src[k].dim() == 3 and k != "actor.mu.weight")
     if chan and n_conv != 2:
         raise ValueError(f"expected the actor's and the critic's first convolution to grow by "
                          f"{len(chan['channels'])} input channel(s); {n_conv} did: {sorted(grown)}")
