@@ -45,10 +45,11 @@ rest of the env relies on:
   already braking for a car ahead never accelerates because an event asked it to. `oblivious` is
   the deliberate exception and it works the other way round -- it removes the cap rather than
   raising the command through it.
-* **The lateral offset can never reach a wall.** `offset_limit` is the free space at each raceline
-  point minus the car's half-width and a margin, precomputed once from the track's distance field;
-  the teacher clamps the commanded offset -- scripted plus reactive, they are summed -- against it
-  at the car's own raceline index. The reactive part is additionally capped at `opp_react_max` and
+* **The lateral offset can never reach a wall.** `offset_limit` is the room on each side of each
+  raceline point (`raceline_offset_limit_sided`: swept along the normal against the track's distance
+  field, kept clear by the car's half-width and a margin, and the smallest over the next few metres),
+  precomputed once; the teacher clamps the commanded offset -- scripted plus reactive, they are
+  summed -- against it at the car's own raceline index. The reactive part is additionally capped at `opp_react_max` and
   rate-limited to `opp_react_slew` m/s, because a target that jumps sideways asks the pure-pursuit
   teacher for a step steer input.
 * **With `opp_events=()` nothing here runs** and nothing is drawn from the generator, so an
@@ -93,6 +94,47 @@ def raceline_offset_limit(teacher, track, car_half_width: float, margin: float) 
     tid = torch.arange(T, device=track.device)[:, None].expand(T, N)
     clearance = track.sample_edt(xy, tid)
     return (clearance - car_half_width - margin).clamp_min(0.0)
+
+
+def raceline_offset_limit_sided(teacher, track, car_half_width: float, margin: float, step: float = 0.05,
+                                max_offset: float = 1.2, span_m: float = 3.0) -> torch.Tensor:
+    """(T, N, 2) largest offset to the LEFT (+) and to the RIGHT (-, as a magnitude) at each raceline point.
+
+    `raceline_offset_limit` bounds both sides by the free space in every direction, so where the line hugs
+    an apex the open side is clamped to the tight side's room: measured on the benchmark maps the per-side
+    room is a median 0.60-0.80 m against its 0.28-0.64 m (`learn.benchmark.experts.TrafficExpert`). A
+    scripted cut-in toward a car on the open side was cut to a nudge -- on ICCAS a 0.3-1.0 m cut toward an
+    overlapping car netted +0.2-0.3 m -- which is the very situation the opponents exist to stage.
+
+    Swept, as TrafficExpert does: walk out along the normal in `step` increments while the point keeps the
+    car's half-width plus `margin` of clearance, monotone so space beyond a pinch is never claimed; then the
+    minimum over the next `span_m` of arc, because the clamp is read at the car's own point and the car then
+    drives a few metres before a narrowing would shrink it.
+    """
+    xy = teacher.xy.to(track.device)                                   # (T, N, 2)
+    tan = teacher.tan.to(track.device)
+    T, N, _ = xy.shape
+    tid = torch.arange(T, device=track.device)[:, None].expand(T, N)
+    need = car_half_width + margin
+    out = []
+    for sign in (1.0, -1.0):
+        nrm = torch.stack([-tan[..., 1], tan[..., 0]], -1) * sign
+        ok = torch.ones(T, N, dtype=torch.bool, device=track.device)
+        lim = torch.zeros(T, N, device=track.device)
+        o = step
+        while o <= max_offset + 1e-9:
+            ok = ok & (track.sample_edt(xy + nrm * o, tid) >= need)
+            lim = torch.where(ok, torch.full_like(lim, o), lim)
+            o += step
+        out.append(lim)
+    lim = torch.stack(out, -1)                                         # (T, N, 2)
+    ds = (teacher.ds.to(track.device) if torch.is_tensor(teacher.ds) else torch.as_tensor(teacher.ds)).clamp_min(1e-6)
+    w = torch.ceil(span_m / ds).long().clamp(0, N - 1)                 # (T,) points in the window per track
+    fwd = lim.clone()
+    for k in range(1, int(w.max()) + 1):
+        on = (k <= w)[:, None, None]
+        fwd = torch.where(on, torch.minimum(fwd, torch.roll(lim, -k, dims=1)), fwd)
+    return fwd
 
 
 def _circular_runs(mask: np.ndarray):

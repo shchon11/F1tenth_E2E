@@ -95,7 +95,8 @@ class RacelineTeacher:
     on the 26-track set at 6 m/s, collisions per env per 15 s: pp 0.13 vs stanley 0.39."""
 
     #: (T, N) largest |lateral offset| each raceline point tolerates, set by the env when opponent
-    #: behaviour events are on (f1sim.opponent_events.raceline_offset_limit). None: no clamp, which
+    #: behaviour events are on (f1sim.opponent_events.raceline_offset_limit_sided: (T, N, 2) left / right
+    #: room; a (T, N) symmetric bound is also accepted). None: no clamp, which
     #: is also what every caller that never passes `offset` sees.
     offset_limit: Optional[torch.Tensor] = None
 
@@ -480,10 +481,13 @@ class RacelineTeacher:
         return v * sc
 
     def clamp_offset(self, offset: torch.Tensor, tid: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        """Cut a commanded lateral offset down to what the lane has room for at this raceline point."""
+        """Cut a commanded lateral offset down to what the lane has room for at this raceline point.
+        `offset_limit` (T, N) is one bound for both sides; (T, N, 2) is (left, right) room."""
         if self.offset_limit is None:
             return offset
         lim = self.offset_limit[tid, idx]
+        if lim.ndim == offset.ndim + 1:
+            return torch.maximum(torch.minimum(offset, lim[..., 0]), -lim[..., 1])
         return torch.clamp(offset, -lim, lim)
 
     def project(self, xy: torch.Tensor, tid: Optional[torch.Tensor] = None):

@@ -438,7 +438,8 @@ def test_the_reactive_offset_is_clamped_by_the_lane():
         idx, _ = env.teacher.project(env.sim.state[:, :2], env.sim.tid)
         want = env.events.lateral_offset()
         got = env.teacher.clamp_offset(want, env.sim.tid, idx)
-        lim = env.teacher.offset_limit[env.sim.tid, idx]
+        lim = env.teacher.offset_limit[env.sim.tid, idx]          # (B, 2): room to the left, to the right
+        lim = torch.where(got >= 0, lim[:, 0], lim[:, 1])
         assert float((got.abs() - lim).max()) <= 1e-5, "a reactive offset was outside the lane's budget"
         worst = max(worst, float((want.abs() - got.abs()).max()))
     assert worst > 0.0, "the clamp never bit: this track has a section narrower than 0.45 m of offset"
@@ -650,7 +651,8 @@ def test_each_flag_lands_on_its_env_config_field(monkeypatch, flag, field, expec
                "reward_plan_clearance", "plan_margin", "reward_lap", "reward_lap_time",
                "reward_overtake", "reward_car_contact", "reward_car_proximity", "reward_sideslip",
                "car_safe_gap", "max_steps", "scan_stack", "scan_stride", "hist_len", "race_size",
-               "opponent", "compile_tracker", "opp_events", "opp_event_rate"}
+               "opponent", "compile_tracker", "opp_events", "opp_event_rate",
+               "kind_mix_assign"}   # ppo trains with 'partition' (its --kind-mix-assign default), the env's is 'redraw'
     assert set(changed) <= allowed, f"{flag} also changed {sorted(set(changed) - allowed)}"
 
 

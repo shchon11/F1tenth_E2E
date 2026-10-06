@@ -277,11 +277,12 @@ def test_weave_oscillates_within_its_amplitude():
 def test_the_offset_budget_leaves_the_car_clear_of_the_wall():
     """`raceline_offset_limit` is the free space at each raceline point minus the body and a margin."""
     env = _env(events=("shift",), rate=1.0, envs=4, seed=71)
-    lim = env.teacher.offset_limit
+    half, margin = 0.5 * env.cfg.vehicle.width, env.ecfg.opp_event_margin
+    # The symmetric helper (TrafficExpert's bound); the env's own per-side one is checked below.
+    lim = raceline_offset_limit(env.teacher, env.sim.track, half, margin)
     assert lim is not None and lim.shape == env.teacher.xy.shape[:2]
     tid = torch.zeros(lim.shape, dtype=torch.long)
     clearance = env.sim.track.sample_edt(env.teacher.xy, tid)
-    half, margin = 0.5 * env.cfg.vehicle.width, env.ecfg.opp_event_margin
     assert float((lim - (clearance - half - margin).clamp_min(0.0)).abs().max()) < 1e-5
     assert float(lim.min()) >= 0.0
     # A car sitting at the limit still has `margin` of body-to-wall gap left, everywhere on the lane.
@@ -301,10 +302,38 @@ def test_a_narrow_section_clamps_the_commanded_offset():
         idx, _ = env.teacher.project(env.sim.state[:, :2], env.sim.tid)
         want = env.events.lateral_offset()
         got = env.teacher.clamp_offset(want, env.sim.tid, idx)
-        lim = env.teacher.offset_limit[env.sim.tid, idx]
+        lim = env.teacher.offset_limit[env.sim.tid, idx]          # (B, 2): room to the left, to the right
+        lim = torch.where(got >= 0, lim[:, 0], lim[:, 1])
         assert float((got.abs() - lim).max()) <= 1e-5, "a commanded offset was outside the lane's budget"
         worst = max(worst, float((want.abs() - got.abs())[opp].max()))
     assert worst > 0.5, "the clamp never bit: a 3 m shift should be cut hard on every section of this lane"
+
+
+def test_the_lane_budget_is_per_side_and_keeps_the_wall_clearance():
+    """Where the line runs near one wall the open side keeps its own room, and no bound reaches a wall.
+
+    The symmetric bound clamps both sides to the tight side's room, which cut a staged cut-in toward a car
+    on the open side to a nudge. The per-side sweep must give strictly more somewhere on this track, and
+    every bound it gives must leave the car's half-width plus the margin of clearance.
+    """
+    env = _env(events=("shift",), rate=1.0)
+    T = env.teacher
+    hw, m = 0.5 * env.cfg.vehicle.width, env.ecfg.opp_event_margin
+    sided = T.offset_limit
+    assert sided.ndim == 3 and sided.shape[-1] == 2
+    sym = raceline_offset_limit(T, env.sim.track, hw, m)
+    assert float((sided.max(-1).values - sym).max()) > 0.2, "the open side never got more than the tight side's room"
+    tid = torch.zeros(T.xy.shape[1], dtype=torch.long)
+    nrm = torch.stack([-T.tan[0, :, 1], T.tan[0, :, 0]], -1)
+    for k, sign in ((0, 1.0), (1, -1.0)):
+        at = T.xy[0] + nrm * sign * sided[0, :, k:k + 1]
+        assert float(env.sim.track.sample_edt(at, tid).min()) >= hw + m - 1e-4
+    # and the clamp honours the side: a big shift left is cut to the left room, right to the right room
+    idx = torch.arange(0, T.xy.shape[1], 37)
+    t_ = torch.zeros_like(idx)
+    big = torch.full(idx.shape, 5.0)
+    assert torch.allclose(T.clamp_offset(big, t_, idx), sided[0, idx, 0])
+    assert torch.allclose(T.clamp_offset(-big, t_, idx), -sided[0, idx, 1])
 
 
 def test_an_event_never_lifts_an_opponent_over_its_follow_gap_cap():

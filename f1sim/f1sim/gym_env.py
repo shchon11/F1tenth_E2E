@@ -26,7 +26,7 @@ import torch
 
 from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, act_dim as plan_act_dim, encode as plan_encode, decode as plan_decode
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
-                               raceline_offset_limit, split_events)
+                               raceline_offset_limit_sided, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
 from .opp_token import (OPP_TOKEN_CARS, OPP_TOKEN_HORIZONS_S, OPP_TOKEN_PLAN_SOURCE,
                         OPP_TOKEN_SCALE, opp_token_car_dim, opp_token_dim, sample_body_traj,
@@ -1506,9 +1506,9 @@ class F1VecEnv:
             # wall, measured once from the track's distance field. The teacher clamps against it at
             # the car's own raceline index, so a shift through a narrow section shrinks instead of
             # crashing. Nothing is computed, and nothing changes, when no event moves a car sideways.
-            teacher.offset_limit = raceline_offset_limit(teacher, self.sim.track,
-                                                         0.5 * self.cfg.vehicle.width,
-                                                         self.ecfg.opp_event_margin)
+            teacher.offset_limit = raceline_offset_limit_sided(teacher, self.sim.track,
+                                                               0.5 * self.cfg.vehicle.width,
+                                                               self.ecfg.opp_event_margin)
         if self.events is not None and self.events.needs_corners:
             # Where the corners are on each raceline, for the `line` behaviour. Built once here for
             # the same reason the offset budget is: it is a function of the track set, not of a step.
