@@ -275,7 +275,24 @@ def lagrange_step(rew: torch.Tensor, components: torch.Tensor, progress_m: torch
             spec["prev"] = touching[-1].clone()
             count = (touching & ~before).to(comp.dtype)
         spec["rate"] = float((count * mask).sum()) / max(km, 1e-3)
-        spec["lam"] = min(max(spec["lam"] + lr * (spec["rate"] - spec["target"]), 0.0), lam_max)
+        anneal = spec.get("anneal")
+        if anneal:
+            # A target the environment cannot reach pins the multiplier at its cap for the whole run (measured:
+            # the boot camp's 3 / 1.5 per km against 13-25 / 5-15 in training, lambda at 300 for 100 % of it),
+            # which turns the constraint into one huge fixed penalty. So the target walks down from what the
+            # policy actually does: measured for `every` updates (multiplier held), then every `every` updates
+            # set to `frac` x the smoothed rate, never above the last one and never below the requested target.
+            ema = spec.get("ema")
+            spec["ema"] = spec["rate"] if ema is None or ema != ema else 0.95 * ema + 0.05 * spec["rate"]
+            spec["n"] = spec.get("n", 0) + 1
+            if spec["n"] % anneal["every"] == 0:
+                cur = spec.get("target_now", float("inf"))
+                spec["target_now"] = max(spec["target"], min(cur, anneal["frac"] * spec["ema"]))
+            target = spec.get("target_now")
+            if target is not None:
+                spec["lam"] = min(max(spec["lam"] + lr * (spec["rate"] - target), 0.0), lam_max)
+        else:
+            spec["lam"] = min(max(spec["lam"] + lr * (spec["rate"] - spec["target"]), 0.0), lam_max)
         rew = rew - comp - spec["lam"] * count
     return rew
 
@@ -792,6 +809,11 @@ def main():
     ap.add_argument("--lagrange-lr", type=float, default=2.0, help="dual step per (contact/km) of violation")
     ap.add_argument("--lagrange-init", type=float, default=8.0)
     ap.add_argument("--lagrange-max", type=float, default=200.0)
+    ap.add_argument("--lagrange-anneal", type=float, default=0.0, metavar="FRAC",
+                    help="walk each constraint's target down from the measured rate: after --lagrange-anneal-every "
+                         "updates of measuring (multiplier held), every that many updates the target becomes FRAC x the "
+                         "smoothed rate (never up, never below the --lagrange value). 0 = fixed targets, as before")
+    ap.add_argument("--lagrange-anneal-every", type=int, default=64, metavar="U")
     ap.add_argument("--rear-end-penalty", type=float, default=0.0, metavar="W",
                     help="charge the onset of a contact with a car ahead W x (relative speed)^2 "
                          "(GT Sophy's rear-end term). 0 = off")
@@ -1706,7 +1728,9 @@ def main():
         # car contacts are charged every step in contact; the constraint counts onsets, the evaluation's unit
         lagrange[name.strip()] = {"index": REWARD_COMPONENT_KEYS.index(key), "weight": weight,
                                   "target": float(target), "lam": float(a.lagrange_init), "rate": float("nan"),
-                                  "onset": name.strip() == "car"}
+                                  "onset": name.strip() == "car",
+                                  **({"anneal": {"frac": float(a.lagrange_anneal), "every": int(a.lagrange_anneal_every)}}
+                                     if a.lagrange_anneal > 0 else {})}
     if lagrange:
         print("constrained PPO: " + ", ".join(f"{n} <= {v['target']}/km (lambda0 {v['lam']})" for n, v in lagrange.items()),
               flush=True)
@@ -2347,7 +2371,9 @@ def main():
                   f"lap {log.get('episode/lap_time_s', float('nan')):.1f} s | gate {log.get('curriculum/gate_coll_per_km', float('nan')):.1f} "
                   f"({log.get('curriculum/tracks_scored', 0):.0f} tk) | kl_ref {log['loss/kl_ref']:.3f}"
                   + (f" | fut {log['loss/aux_future_mse']:.3f}" if 'loss/aux_future_mse' in log else "")
-                  + "".join(f" | {n} {v['rate']:.2f}/km lam {v['lam']:.1f}" for n, v in lagrange.items())
+                  + "".join(f" | {n} {v['rate']:.2f}/km lam {v['lam']:.1f}"
+                            + (f" tgt {v.get('target_now', float('nan')):.2f}" if v.get('anneal') else "")
+                            for n, v in lagrange.items())
                   + (f" | mask {log['loss/aux_opp_mask']:.3f} r{log.get('loss/aux_opp_mask/mask_recall', float('nan')):.2f}"
                      if 'loss/aux_opp_mask' in log else "")
                   + (f" | dv {log['loss/aux_motion_mse']:.4f}" if 'loss/aux_motion_mse' in log else "")

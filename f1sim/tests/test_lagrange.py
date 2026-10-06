@@ -42,3 +42,30 @@ def test_a_contact_charged_every_step_counts_once_per_contact():
     comp2 = torch.zeros(T, B, 3); comp2[0:3, 0, 1] = -5.0        # continues from the last rollout's contact? no
     lagrange_step(torch.zeros(T, B), comp2, torch.full((T, B), 50.0), torch.ones(T, B), spec, lr=0.0, lam_max=10.0)
     assert abs(spec["car"]["rate"] - 1.0) < 1e-6
+
+
+def test_an_annealed_target_starts_at_the_measured_rate_and_follows_the_policy_down():
+    """The target sits FRAC below what the policy does, so the multiplier pushes instead of pinning; it only
+    moves down as the policy improves, and never below the requested target."""
+    import torch
+    from f1sim.learn.ppo import lagrange_step
+    spec = {"index": 0, "weight": 1.0, "target": 1.0, "lam": 40.0, "rate": float("nan"),
+            "anneal": {"frac": 0.5, "every": 4}}
+    T, B = 10, 4
+    prog = torch.full((T, B), 10.0); mask = torch.ones(T, B)    # 400 m per rollout
+    def run(onsets_per_rollout, n):
+        comp = torch.zeros(T, B, 1); comp[0, :onsets_per_rollout, 0] = -1.0
+        lams = []
+        for _ in range(n):
+            lagrange_step(torch.zeros(T, B), comp, prog, mask, {"c": spec}, lr=0.5, lam_max=300.0)
+            lams.append(spec["lam"])
+        return lams
+    lams = run(4, 3)
+    assert lams == [40.0, 40.0, 40.0]                           # held while measuring (10 / km)
+    run(4, 1)
+    assert abs(spec["target_now"] - 5.0) < 1e-9                 # half the measured 10 / km
+    run(4, 4)
+    assert spec["lam"] > 40.0                                   # above target: pushes
+    run(1, 400)                                                 # the policy improves to 2.5 / km
+    assert 1.0 <= spec["target_now"] < 2.0                      # followed it down, not below 1
+    assert spec["lam"] < 300.0
