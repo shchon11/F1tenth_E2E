@@ -756,7 +756,7 @@ class Simulator:
         # sensor; with it off `omega_r * r_w` is identically `vx` and this is the old call.
         v_odom = state[:, dyn.IOMEGA] * P["r_w"] if self.wheel_model else state[:, dyn.IVX]
         odom_state = self.odom.update_pure(odom_state, v_odom, cmd[:, 0], P, self.control_dt,
-                                           quantise=self.wheel_model)
+                                           quantise=self.wheel_model, yaw_rate_true=state[:, dyn.IR])
         if self.track.cl is not None:
             s, lateral, cl_idx = self.track.project(state[:, :2], tid, prev_idx=cl_idx)
             ds = s - s_prev

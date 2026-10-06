@@ -289,13 +289,21 @@ class LidarParams:
 
 @dataclass
 class OdomParams:
-    """VESC-derived odometry (vesc_to_odom): speed from ERPM, yaw rate from
-    commanded steering angle. No IMU by default (optional imu_* fields for later)."""
+    """VESC-derived odometry (vesc_to_odom): speed from ERPM; yaw rate from the gyro (the competition car) or
+    from the commanded steering angle (`yaw_from_gyro` 0, the pre-competition car)."""
     speed_noise_std: float = 0.05      # [m/s]
     speed_scale_err: float = 0.0       # multiplicative error, randomized (erpm gain)
     steer_offset: float = 0.0          # [rad] residual servo-offset calibration error (randomized)
     steer_gain_err: float = 0.0        # residual servo-gain calibration error (randomized)
     yaw_rate_noise_std: float = 0.02   # [rad/s]
+    yaw_from_gyro: float = 1.0         # 1: twist.angular.z (and the heading it integrates) is the body yaw rate;
+                                       # 0: the kinematic restatement v*tan(steer)/L. MEASURED 2026-10-07 on
+                                       # the two longest competition bags (455 m, 584 m): /odom angular.z / gyro
+                                       # median 1.00 at 1-3 m/s, 0.98-0.99 at 3-5, 0.93-0.94 at 5-7 (a filter's
+                                       # lag), whole-run heading ratio 1.00; against v*tan(cmd)/L the
+                                       # correlation is only 0.59-0.65. The kinematic form, which the seven
+                                       # pre-competition bags do restate (calib/bagread.py), overstates the turn
+                                       # by (L + k_us v^2)/L on the refitted understeering car -- 38 % at 2.5 m/s.
     # ---- ERPM channel artefacts (live only with vehicle.wheel_model) -----------------------
     # MEASURED over the 22 recordings' 88 975 /odom steps; see
     # docs/real_data_calibration.md "The ERPM channel".

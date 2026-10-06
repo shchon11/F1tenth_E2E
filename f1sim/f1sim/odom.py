@@ -1,7 +1,7 @@
 """VESC-style odometry (vesc_to_odom). The IMU model lives in imu.py."""
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -9,8 +9,9 @@ from .dynamics import wrap_angle
 
 
 class VescOdom:
-    """Dead-reckoned pose from measured speed (ERPM) and *commanded* steering angle,
-    exactly like the f1tenth vesc_to_odom node. State (B, 5): x, y, yaw, v, yaw_rate.
+    """Dead-reckoned pose from measured speed (ERPM) and a yaw rate: the gyro's on the competition car
+    (`OdomParams.yaw_from_gyro`, measured), or the *commanded* steering angle's like the stock f1tenth
+    vesc_to_odom node. State (B, 5): x, y, yaw, v, yaw_rate.
 
     The speed it reports is the **wheel** speed, not the ground speed: `vesc_to_odom` divides an
     ERPM count by a calibration gain and publishes the result as `twist.twist.linear.x`. With
@@ -30,17 +31,21 @@ class VescOdom:
         self.state[env_ids, 3:] = 0.0
 
     def update(self, v_wheel: torch.Tensor, steer_cmd: torch.Tensor, P: Dict[str, torch.Tensor],
-               dt: float, quantise: bool = False):
-        self.state = self.update_pure(self.state, v_wheel, steer_cmd, P, dt, quantise)
+               dt: float, quantise: bool = False, yaw_rate_true: Optional[torch.Tensor] = None):
+        self.state = self.update_pure(self.state, v_wheel, steer_cmd, P, dt, quantise, yaw_rate_true)
         return self.state
 
     @staticmethod
     def update_pure(state: torch.Tensor, v_wheel: torch.Tensor, steer_cmd: torch.Tensor,
-                    P: Dict[str, torch.Tensor], dt: float, quantise: bool = False):
+                    P: Dict[str, torch.Tensor], dt: float, quantise: bool = False,
+                    yaw_rate_true: Optional[torch.Tensor] = None):
         """One dead-reckoning step as a pure function of the previous odometry state (compilable).
 
         `quantise` puts the reported speed on the ERPM lattice. It is applied *before* the pose is
         integrated, because the real node integrates the same quantised number it publishes.
+        `yaw_rate_true` is the body yaw rate; where `P["yaw_from_gyro"]` is set (the competition car,
+        `params.OdomParams`) the reported yaw rate is it plus noise instead of the steering restatement.
+        Without it every env gets the restatement, as before 2026-10-07.
         """
         v_meas = v_wheel * (1.0 + P["speed_scale_err"]) + torch.randn_like(v_wheel) * P["speed_noise_std"]
         if quantise:
@@ -50,7 +55,10 @@ class VescOdom:
         # odom knows steer_bias and steer_gain up to residuals (steer_offset, steer_gain_err)
         steer_est = (steer_cmd * P["steer_gain"] + P["steer_bias"]) * (1.0 + P["steer_gain_err"]) + P["steer_offset"]
         L = P["lf"] + P["lr"]
-        yaw_rate = v_meas * torch.tan(steer_est) / L + torch.randn_like(v_wheel) * P["yaw_rate_noise_std"]
+        yaw_rate = v_meas * torch.tan(steer_est) / L
+        if yaw_rate_true is not None:
+            yaw_rate = torch.where(P["yaw_from_gyro"] > 0.5, yaw_rate_true, yaw_rate)
+        yaw_rate = yaw_rate + torch.randn_like(v_wheel) * P["yaw_rate_noise_std"]
         yaw = wrap_angle(state[:, 2] + yaw_rate * dt)
         return torch.stack([state[:, 0] + v_meas * torch.cos(yaw) * dt, state[:, 1] + v_meas * torch.sin(yaw) * dt, yaw, v_meas, yaw_rate], 1)
 

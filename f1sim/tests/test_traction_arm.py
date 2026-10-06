@@ -112,7 +112,10 @@ def test_the_guard_fires_on_simulated_slip_and_raises_the_command_it_receives():
     # the shaper only ever raises a locked command, never lowers it below what was asked
     d = (with_arm - without)
     assert float(d.max()) > 0.05, float(d.max())
-    assert float(d.max()) <= TractionParams().release_max + 1e-6
+    # ... and by at most `release_max` on the step it acts on. That bound is the arm's own (out - in); the two
+    # runs' commands cannot test it, because once the guard has acted the runs diverge and the commands they ask
+    # for differ by more than any one release (2.15 m/s on the 2026-09-28 refitted car).
+    assert m["controller/tcs_release_max"] <= TractionParams().release_max + 1e-6, m
 
 
 def test_it_is_fed_the_simulated_sensors_and_nothing_else(monkeypatch):
