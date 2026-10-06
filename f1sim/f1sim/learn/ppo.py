@@ -377,6 +377,11 @@ def main():
     ap.add_argument("--horizon", type=int, default=32); ap.add_argument("--total", type=float, default=100e6)
     ap.add_argument("--epochs", type=int, default=3); ap.add_argument("--minibatch", type=int, default=8192)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--lr-end", type=float, default=5e-5)
+    ap.add_argument("--fresh-lr-mult", type=float, default=1.0, metavar="M",
+                    help="parameters the --init checkpoint does not have (a memory GRU, a motion branch, an "
+                         "auxiliary head added at a warm start) train at M x the scheduled lr in their own Adam "
+                         "group. Grown tensors (new columns of an existing layer) stay in the base group. "
+                         "1 = one group, as before")
     ap.add_argument("--gamma", type=float, default=0.99); ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2); ap.add_argument("--ent", type=float, default=0.0)
     ap.add_argument("--vf", type=float, default=0.5); ap.add_argument("--max-grad", type=float, default=0.5)
@@ -1576,7 +1581,27 @@ def main():
         fired at update 40 -- the one field whose whole purpose is to travel with the result.
         """
         return {**experiment_meta, "controller": controller.checkpoint_meta()}
-    opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
+    # A warm start that ADDS modules (a memory GRU on a feedforward init, a motion branch, auxiliary heads)
+    # would otherwise train them from their initialisation at the fine-tuning lr of everything else --
+    # 5e-5 walking down to 5e-6 -- which leaves a fresh head a few percent into its own curve after
+    # thousands of updates. `--fresh-lr-mult` puts the tensors the init does not have in their own group.
+    named_params = list(model.named_parameters())
+    fresh_names = set()
+    if a.fresh_lr_mult != 1.0 and a.init:
+        init_keys = set((torch.load(a.init, map_location="cpu", weights_only=False).get("state_dict") or {}).keys())
+        fresh_names = {n_ for n_, _ in named_params if n_ not in init_keys}
+    base_np = [(n_, p_) for n_, p_ in named_params if n_ not in fresh_names]
+    fresh_np = [(n_, p_) for n_, p_ in named_params if n_ in fresh_names]
+    opt_groups = [{"params": [p_ for _, p_ in base_np], "lr_mult": 1.0}]
+    if fresh_np:
+        opt_groups.append({"params": [p_ for _, p_ in fresh_np], "lr": a.lr * a.fresh_lr_mult,
+                           "lr_mult": float(a.fresh_lr_mult)})
+        print(f"optimizer: {len(fresh_np)} tensors the init does not have "
+              f"({sum(p_.numel() for _, p_ in fresh_np)} params, e.g. {fresh_np[0][0]}) train at "
+              f"{a.fresh_lr_mult:g}x the lr")
+    #: The flat parameter order of `opt` (group by group): what the saved moments are indexed by.
+    opt_param_names = [n_ for n_, _ in base_np + fresh_np]
+    opt = torch.optim.Adam(opt_groups, lr=a.lr, eps=1e-5)
     speed_freeze = SpeedRowFreeze(model) if a.adaptation == "speed" else None
     optimizer_restored = False
     # Adam's moments are part of where training got to. Dropping them on every resume restarts the
@@ -1601,7 +1626,7 @@ def main():
         sd = dict(extra["opt"]); st = dict(sd.get("state", {}))
         params = [p_ for g in opt.param_groups for p_ in g["params"]]
         # NOT `names`: that holds the track manifest, and the run config below still needs it
-        param_names = [n_ for n_, _ in model.named_parameters()]
+        param_names = opt_param_names
         saved_names = extra.get("opt_param_names")
         if same_stage_resume and saved_names is None:
             raise RuntimeError("adaptive same-stage resume needs optimizer parameter names")
@@ -1613,7 +1638,15 @@ def main():
             # would either refuse (group size) or hand a critic layer the actor's moments
             by_name = {saved_names[i]: entry for i, entry in st.items() if isinstance(i, int) and i < len(saved_names)}
             st = {i: by_name[n_] for i, n_ in enumerate(param_names) if n_ in by_name}
-            sd["param_groups"] = [dict(g, params=list(range(len(params)))) for g in sd["param_groups"][:1]]
+            # Mirror the groups this optimizer has (one, or base + fresh): indices are positions in
+            # the flat order `param_names` lists, group after group.
+            base_g, off, groups = sd["param_groups"][0], 0, []
+            for g in opt.param_groups:
+                n_g = len(g["params"])
+                groups.append(dict(base_g, params=list(range(off, off + n_g)), lr=g["lr"],
+                                   lr_mult=g.get("lr_mult", 1.0)))
+                off += n_g
+            sd["param_groups"] = groups
         # The opponent-token block widens the two proprio input layers. Their Adam moments are
         # element-wise, so they can be carried across the same column insert the weights were --
         # and they have to be, or the control arm would restore state the oracle arms dropped.
@@ -1904,7 +1937,7 @@ def main():
         else:
             kl_coef = a.kl_coef * max(0.0, 1.0 - steps_done / a.kl_decay)
             lr = a.lr + (a.lr_end - a.lr) * frac
-        for g in opt.param_groups: g["lr"] = lr
+        for g in opt.param_groups: g["lr"] = lr * g.get("lr_mult", 1.0)
         # Hand the GPU back while someone is watching. A viewer next to a full-rate run measured
         # 1-2 fps and 125 ms per sim step no matter how few cars it drew: the cost was queueing
         # behind this process, not drawing. Sleeping a slice of each update leaves device gaps the
@@ -2404,7 +2437,7 @@ def main():
             meta = {"spec": spec.__dict__, "phase": "ppo", "run": a.name, "update": update, "updates": n_updates,
                     "steps": steps_done, "total_steps": steps_base + steps_done, "wandb_id": wandb_id,
                     "cap": cap, "action_mode": a.action_mode, "metrics": {**last_log, **last_ctrl},
-                    "opt": opt.state_dict(), "opt_param_names": [n_ for n_, _ in model.named_parameters()],
+                    "opt": opt.state_dict(), "opt_param_names": opt_param_names,
                     "experiment": experiment_meta_now(), **adaptation_progress_meta()}
             save_checkpoint(os.path.join(out, f"ppo_u{update}.pt"), model, meta)
             save_checkpoint(os.path.join(out, "ppo_latest.pt"), model, meta)
@@ -2412,7 +2445,7 @@ def main():
                     {"spec": spec.__dict__, "phase": "ppo", "run": a.name, "update": update, "updates": n_updates,
                      "steps": steps_done, "total_steps": steps_base + steps_done, "wandb_id": wandb_id,
                      "cap": cap, "action_mode": a.action_mode, "metrics": {**last_log, **last_ctrl},
-                     "opt": opt.state_dict(), "opt_param_names": [n_ for n_, _ in model.named_parameters()],
+                     "opt": opt.state_dict(), "opt_param_names": opt_param_names,
                      "experiment": experiment_meta_now(), **adaptation_progress_meta()})
     # Unconditionally, and before the graph runtime: the controller installs a solver hook and a
     # wrapper around `env._reset_envs` whatever the sim backend is, so releasing it only when graphs
