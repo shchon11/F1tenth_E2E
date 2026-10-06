@@ -326,7 +326,7 @@ def student_policy(model, env: F1VecEnv, device=None, deterministic: bool = True
             c = cond_mod.mu_to_c(env.sim.P["mu"] if dial is None else dial(), spec)
         else:
             c = cond_mod.make_condition(spec.source, spec, env.sim.P["mu"].reshape(-1, 1), 0)
-        action, _lp, rt.hidden = model.act(rt.observe(scan), proprio, deterministic=deterministic, c=c, h=rt.hidden)
+        action, _lp, rt.hidden = model.act(rt.observe(scan, proprio), proprio, deterministic=deterministic, c=c, h=rt.hidden)
         return action
 
     run.runtime = rt
