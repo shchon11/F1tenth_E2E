@@ -80,5 +80,16 @@
    "extra.opt"
   ],
   "source_mb": 32.5
+ },
+ {
+  "file": "iccas_bootcamp_safest.pt",
+  "run": "bootA2R",
+  "update": 5856,
+  "sha256": "f96b2fccd4d8be7cc70c2bbc3b12532683fd1d6308140015ecfdfcc3b549b1f8",
+  "size_mb": 10.5,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 31.0
  }
 ]

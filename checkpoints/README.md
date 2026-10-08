@@ -174,3 +174,24 @@ Optimizer moments dropped; re-measured identical after stripping (seed 77 vs int
 
 Its 30 % checkpoint scored 185 contacts / 0.87 props/km: the gains came over the whole run. The same boot camp
 with KL 0 from v2R drifted (kl_ref 24, solo 9.8 s at 26 %) and was stopped.
+
+## `iccas_bootcamp_safest.pt` (2026-10-08) — fewest car contacts so far (59), chosen from the run's last 20 checkpoints
+
+The same run as `iccas_bootcamp_safe.pt` (bootA2R), **update 5856 of 6144** instead of the final. The run's late
+checkpoints swing (33/65/45/33 contacts on a quick test of the last four), so the last 20 (u5536-u6144) were scored on
+a quick test with **selection seeds 81/83** — not the table's seeds 77-80 — against `forzaeth_pred` and
+`lane_switch`: u5888 17, u5856 23, u5824 34, u6016 35, …, the final 41, the worst 82. The best two went through the
+full table below. Optimizer moments dropped; re-measured identical after stripping (seed 77, all six scenarios, same GPU; on another GPU
+the float path differs and single contacts move by one).
+
+| ICCAS, 4 seeds × 4 planners, dial 0 | **u5856 (this)** | boot camp final | s976 | v2R (fastest) |
+| --- | ---: | ---: | ---: | ---: |
+| solo lap | 8.62 s | 7.89 s | 7.91 s | **7.66 s** |
+| car contacts | **59** | 102 | 119 | 160 |
+| passes | 198 | 218 | **236** | 235 |
+| contacts per pass | **0.30** | 0.47 | 0.50 | 0.68 |
+| prop contacts / km | 0.70 | **0.45** | 1.10 | 1.25 |
+| unseen learned opponents B / gate, contacts / passes (2 seeds) | 15/10, 14/8 | 26/22, 17/22 | 19/37, 23/29 | 18/14, 17/12 |
+
+The price is pace and boldness: 0.73 s slower alone and far fewer passes against unseen learned cars. Use it where
+contact matters more than lap time; v2R stays the fastest. u5888 scored 61 contacts / 168 passes on 3 seeds.
