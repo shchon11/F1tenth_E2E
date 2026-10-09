@@ -91,5 +91,16 @@
    "extra.opt"
   ],
   "source_mb": 31.0
+ },
+ {
+  "file": "iccas_bootcamp_balanced.pt",
+  "run": "bootA13R",
+  "update": 2784,
+  "sha256": "931f0a76787472125903a7ffcf88be703dcf28353a989d00d9e3d8702932615e",
+  "size_mb": 10.5,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 31.0
  }
 ]
