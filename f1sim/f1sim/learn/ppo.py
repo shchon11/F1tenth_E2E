@@ -376,6 +376,11 @@ def main():
                          "names are recorded in the run manifest.")
     ap.add_argument("--horizon", type=int, default=32); ap.add_argument("--total", type=float, default=100e6)
     ap.add_argument("--epochs", type=int, default=3); ap.add_argument("--minibatch", type=int, default=8192)
+    ap.add_argument("--grad-accum", type=int, default=1,
+                    help="split each minibatch into this many pieces and add up their gradients before "
+                         "the one optimiser step, in a piece's memory. The PPO terms (policy, value, "
+                         "entropy, KL) add up to the whole minibatch's exactly; an auxiliary head's "
+                         "loss, normalised by its own label mask, becomes the mean over pieces")
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--lr-end", type=float, default=5e-5)
     ap.add_argument("--fresh-lr-mult", type=float, default=1.0, metavar="M",
                     help="parameters the --init checkpoint does not have (a memory GRU, a motion branch, an "
@@ -915,6 +920,8 @@ def main():
         if not a.motion_memory:
             raise SystemExit("--aux-opp-mask / --aux-motion are losses on the motion branch and "
                              "there is no branch without --motion-memory.")
+    if a.grad_accum < 1:
+        raise SystemExit("--grad-accum must be >= 1")
     if a.memory != "off" and a.minibatch < a.horizon:
         raise SystemExit(f"--memory {a.memory} needs --minibatch >= --horizon ({a.minibatch} < "
                          f"{a.horizon}): a recurrent update's minibatches are whole env chunks of "
@@ -2173,10 +2180,23 @@ def main():
         # so the flat buffers are indexed by exactly the rows the sequence block contains.
         units = B if memory_on else n
         step_units = env_chunk if memory_on else a.minibatch
+        # --grad-accum K walks the same minibatches in K pieces: zero the gradient on a group's
+        # first piece, weight each piece's loss by its share of the group's mask, step on the last.
+        accum = a.grad_accum
+        if step_units % accum:
+            raise SystemExit(f"--grad-accum {accum} must divide the minibatch's {step_units} "
+                             f"{'env chunks' if memory_on else 'samples'}")
+        piece = step_units // accum
+        rows = ((lambda c: (torch.arange(T, device=device)[:, None] * B + c[None, :]).reshape(-1))
+                if memory_on else (lambda c: c))
         for ep in range(a.epochs):
             perm = torch.randperm(units, device=device)
-            for i in range(0, units, step_units):
-                sel = perm[i:i + step_units]
+            for i in range(0, units, piece):
+                sel = perm[i:i + piece]
+                first = (i // piece) % accum == 0
+                last = (i // piece) % accum == accum - 1 or i + piece >= units
+                if first and accum > 1:
+                    w_group = f_mask[rows(perm[i:i + step_units])].sum().clamp_min(1.0)
                 seq = None
                 if memory_on:
                     cols = sel
@@ -2218,7 +2238,10 @@ def main():
                 pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
                                               terms["aux_grip"], terms["aux_opp"])
                 loss = terms["loss"]
-                opt.zero_grad()
+                if accum > 1:
+                    loss = loss * (f_mask[idx].sum().clamp_min(1.0) / w_group)
+                if first:
+                    opt.zero_grad()
                 if cond_dim or controller_on or memory_on:
                     # Scoped to the conditioning, controller and memory arms so the legacy path
                     # keeps its exact behaviour.
@@ -2233,20 +2256,21 @@ def main():
                                            f"(pg={float(pg):.4g} vf={float(vf):.4g} "
                                            f"kl_ref={float(kl_ref):.4g})")
                 loss.backward()
-                if speed_freeze is not None:
-                    speed_freeze.before_step()
-                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.max_grad,
-                                                    error_if_nonfinite=bool(cond_dim or controller_on or memory_on))
-                opt.step()
-                if speed_freeze is not None:
-                    speed_freeze.after_step()
+                if last:
+                    if speed_freeze is not None:
+                        speed_freeze.before_step()
+                    gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.max_grad,
+                                                        error_if_nonfinite=bool(cond_dim or controller_on or memory_on))
+                    opt.step()
+                    if speed_freeze is not None:
+                        speed_freeze.after_step()
                 with torch.no_grad():
                     stats["pg"].append(pg.item()); stats["vf"].append(vf.item())
                     stats["ent"].append(terms["entropy_mean"].item())
                     stats["kl_ref"].append(kl_ref.item())
                     stats["approx_kl"].append(terms["approx_kl"].item())
                     stats["clipfrac"].append(terms["clipfrac"].item())
-                    if memory_on: stats.setdefault("grad_norm", []).append(float(gn))
+                    if memory_on and last: stats.setdefault("grad_norm", []).append(float(gn))
                     if floor_on:
                         stats.setdefault("aux_floor", []).append(terms["aux_floor"].item())
                         for key, value in terms["aux_floor_parts"].items():
