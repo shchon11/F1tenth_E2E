@@ -27,6 +27,7 @@ import rclpy
 import torch
 from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Empty as EmptyMsg
@@ -38,7 +39,7 @@ from f1sim_interfaces.msg import Perception, Plan, PolicyState
 
 from f1sim_ros.deploy import (CONTROL_RATE, G, IMU_BUF_MAX, LIDAR_FOV, LIDAR_MOUNT_X, SensorIntake,
                               attitude_from_orientation, covariance0, header_seconds,
-                              quat_to_rp, resample_ranges)
+                              policy_condition, quat_to_rp, resample_ranges)
 
 try:
     from vesc_msgs.msg import VescImuStamped
@@ -75,6 +76,8 @@ class PolicyNode(Node):
     att_source = "vesc"
     ego_att = None
     pub_perception = None
+    #: The actor's condition: None for an unconditional checkpoint, the grip dial's `c` otherwise.
+    cond = None
 
     def __init__(self):
         super().__init__("f1sim_policy")
@@ -119,7 +122,22 @@ class PolicyNode(Node):
         # the controller's clearance arm has its floor gate on, and OPTIONAL either way: a
         # controller that never receives it falls back to its own geometry.
         self.declare_parameter("perception_topic", "/f1sim/policy/perception")
+        # The friction a grip-dial checkpoint (`meta["cond"]`, source `dial`) is told to use, in the
+        # simulator's mu units. NaN = unset, and a dial checkpoint refuses to start on it: there is
+        # no number this node could assume that someone did not have to choose for the venue. An
+        # unconditional checkpoint ignores it. See `deploy.policy_condition` and config/graph.yaml.
+        # Read-only: `c` is computed once below, so a live `ros2 param set` would be reported as
+        # applied while the policy kept driving the old dial. Change it by restarting the node.
+        self.declare_parameter("dial", float("nan"), ParameterDescriptor(
+            read_only=True, description="grip dial (sim mu units) the policy is told; set at start only"))
+        # The launch argument `dial:=<mu>`, as a string: used when not empty, so a launch line can set the
+        # venue's grip without a second copy of graph.yaml (`launch_graph.policy_node`).
+        # Dynamically typed: the launch hands it a string, `ros2 run ... -p dial_override:=0.9` a double.
+        self.declare_parameter("dial_override", "", ParameterDescriptor(
+            read_only=True, dynamic_typing=True, description="launch `dial:=`; overrides `dial` when not empty"))
         p = lambda n: self.get_parameter(n).value
+        dial_arg = str(p("dial_override")).strip()
+        self.dial = float(dial_arg) if dial_arg else float(p("dial"))
         self.device = torch.device(p("device"))
         # No `allow_oracle` and no parameter to set one. A checkpoint trained with privileged
         # opponent tokens (`f1sim.opp_token`) reads the simulator's exact description of the other
@@ -136,6 +154,7 @@ class PolicyNode(Node):
         # the right place for it: the builder is what would have to produce the block on the car.
         self.obs = ObsBuilder(self.spec, self.device)
         self.checkpoint_id = checkpoint_id(ckpt)
+        self.cond = policy_condition(self.model, self.dial, self.device)
         #: The policy's episode state: the recurrent hidden state and the decayed scan-occupancy
         #: channel, for this one car. Empty (and `stateful` False) for a feedforward checkpoint, so
         #: nothing below changes for one. It is cleared in exactly two places, both of which mean
@@ -196,7 +215,7 @@ class PolicyNode(Node):
         # warm up
         s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
         with torch.no_grad():
-            self.model.act(self.policy_state.observe(s, pr), pr, deterministic=True,
+            self.model.act(self.policy_state.observe(s, pr), pr, deterministic=True, c=self.cond,
                            h=self.policy_state.hidden)
         self.obs.reset()
         self.policy_state.reset()                # the warm-up is not part of any episode
@@ -206,6 +225,8 @@ class PolicyNode(Node):
                                    f"{p('reset_topic')} and when the scan stream restarts")
         self.get_logger().info(
             f"policy {self.checkpoint_id} on {self.device}, speed cap {self.speed_cap} m/s, "
+            + (f"grip dial mu={self.dial:.4f}, "
+               if (self.model.meta.get("cond") or {}).get("source") == "dial" else "")
             + (f"direct action: publishing {p('drive_topic')} and bypassing the controller"
                if self.direct else
                f"publishing {p('plan_topic')} ({self.spec.act_dim}-D plan) at the scan rate; "
@@ -334,7 +355,7 @@ class PolicyNode(Node):
             # speed, yaw rate and roll/pitch that are already in `pro` -- the same three sensors
             # this node already reads, and the reason the channel is deployable at all.
             a, _, self.policy_state.hidden = self.model.act(
-                self.policy_state.observe(scan, pro), pro, deterministic=True,
+                self.policy_state.observe(scan, pro), pro, deterministic=True, c=self.cond,
                 h=self.policy_state.hidden)
         self.obs.push_action(a[0])
         enabled = bool(self.get_parameter("enabled").value)

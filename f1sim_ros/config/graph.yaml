@@ -13,11 +13,30 @@
   ros__parameters:
     # --- what drives ---------------------------------------------------------
     checkpoint: ""            # absolute path to the exported actor; required
-    device: "cpu"             # "cuda" on a machine with one; the car has none
+    device: "cpu"             # "cuda" on a machine with one (the car's Jetson AGX Orin has one). Set it with the
+                              # launch argument `device:=cuda`: the launch's own default (cpu) is laid over this file
     # The speed ceiling the POLICY is told about: it is an observation channel, so it changes what
     # the network emits, not just what the tracker allows. It has to match the controller's
     # `speed_cap` below -- `system_check` reports both and says so when they differ.
     speed_cap: 4.0
+    # The grip dial, for a checkpoint trained with one (meta cond source "dial" -- e.g.
+    # iccas_bootcamp_safest.pt). REQUIRED by such a checkpoint: the node refuses to start without
+    # it (NaN = unset) rather than assume a friction. Ignored by an unconditional checkpoint.
+    # It is the friction the policy is TOLD to use, in the simulator's mu units (`P["mu"]`: nominal
+    # floor 1.0489, training range 0.73423..1.15379). Training told it mu - U(0, 0.30), exact in
+    # 30 % of episodes (`--dial-margin 0.30 --dial-exact 0.30`), so a dial at or a little under the
+    # floor's real grip is in distribution; the evaluation tables are scored at dial = true mu
+    # (`--dial-offset 0.0`). Above the real grip is the dangerous side (1 -> 13 collisions/km at +0.4).
+    # 0.73423 is the bottom of the training friction range (`grip_estimator.MU_MIN`), the console's
+    # default dial and the controller's `fixed_low` grip_mu below: never above any floor the policy
+    # trained on. Against the simulator's nominal floor (mu 1.0489, the floor docs/real_data_calibration.md
+    # compares the real car with -- mu itself was never fitted to the car) that is a margin of 0.31, just
+    # past the trained 0.30 -- slower than the policy can go, not unsafe.
+    # SET THIS PER VENUE: once the track's mu is measured, use it (dial-offset 0), or a little under --
+    # here, or with the launch argument `dial:=<mu>`, which is laid over this file when given.
+    # Read-only once the node is up (`ros2 param set` is refused): change it by restarting the node.
+    dial: 0.73423
+    dial_override: ""        # filled by the launch argument `dial:=<mu>`; leave empty here
 
     # --- topics --------------------------------------------------------------
     plan_topic: "/f1sim/plan"
@@ -63,6 +82,10 @@
     steer_max: 0.4189
     wheelbase: 0.3302
     cmd_delay: 0.035          # s, the measured command latency this car's tracker predicts over
+    # The "profile" speed command only (a checkpoint's plan-output contract): the VESC speed loop's
+    # time constant it inverts, and the control period each command is held for.
+    motor_tau: 0.2            # s
+    control_dt: 0.025         # s
     steer_bias: 0.0           # rad; published angle = (cmd - steer_bias) / steer_gain
     steer_gain: 1.0           # LEAVE AT 1.0 until the servo configuration is confirmed: the two
     speed_gain: 1.0           # recorded configurations have OPPOSITE polarity (docs/ros2.md)

@@ -5,7 +5,7 @@ turns a message into a number they both use lives here, in one implementation, b
 load-bearing claim of the split -- that the graph publishes the same `/drive` the old monolithic
 node did -- is only as strong as the amount of code the two sides cannot disagree about.
 
-Three groups:
+Four groups:
 
 * the arms (`split_deployable`, `install_grip_arm`, `install_clearance_arm`,
   `build_traction_guard`), moved here verbatim from `policy_node` because they now belong to the
@@ -14,7 +14,8 @@ Three groups:
 * `SensorIntake`, the `/odom` + `/sensors/imu(/raw)` + `/scan` reader both nodes run. The policy
   needs the IMU mean for the observation and the controller needs its gyro-z for the tracker and
   its accelerometer for the traction guard, and those have to be the same number computed the same
-  way from the same samples or the parity claim is a coincidence.
+  way from the same samples or the parity claim is a coincidence;
+* `policy_condition`, the grip dial a conditional checkpoint is driven with.
 """
 import math
 
@@ -152,6 +153,43 @@ def build_traction_guard(arm: str, overrides: str = ""):
                              f"{', '.join(sorted(fields))}")
         kw[name] = int(value) if fields[name].type == "int" else float(value)
     return TractionGuard(TractionParams(**kw).validate())
+
+
+# ------------------------------------------------------------------ the policy's condition
+def policy_condition(model, dial, device):
+    """`c` for the actor, or None for an unconditional checkpoint.
+
+    A grip-dial checkpoint (`meta["cond"]`, source `dial`) takes "how much grip to use" as an input
+    and has no number to fall back on: the actor refuses a missing `c` (`Actor._require_cond`), and
+    a default here would be a friction somebody never chose, driven at speed. So the node's `dial`
+    parameter has to be set (NaN = unset), and it has to lie inside what training ever told the
+    network -- `[conditioning.DIAL_FLOOR, grip_estimator.MU_MAX]` -- because a dial above the floor's
+    real friction is measured to be dangerous (1 -> 13 collisions/km at +0.4) and one outside the
+    trained range is unknown territory. The A0 arm (source `zero`) was trained on `c = 0` and gets
+    exactly that; an unconditional checkpoint ignores the parameter.
+    """
+    from f1sim.learn.conditioning import DIAL_FLOOR, CondSpec, mu_to_c
+    from f1sim.learn.grip_estimator import MU_MAX
+    spec = CondSpec.from_meta((getattr(model, "meta", None) or {}).get("cond"))
+    if not spec.dim:
+        return None
+    if spec.source == "zero":
+        return torch.zeros(1, spec.dim, device=device)
+    if spec.source != "dial":
+        raise ValueError(f"this checkpoint's condition is {spec.describe()}: the car cannot produce "
+                         f"it, and it is not a dial an operator can set")
+    dial = float("nan") if dial is None else float(dial)
+    if not math.isfinite(dial):
+        raise ValueError(
+            "this checkpoint is a grip-dial policy and needs the parameter 'dial' -- the friction it "
+            "is told to use, in the simulator's mu units (nominal floor 1.0489). There is no default. "
+            "Set it in config/graph.yaml or with -p dial:=<mu>: the venue's measured mu, or below it; "
+            f"{DIAL_FLOOR}..{MU_MAX} is the range training covered.")
+    if not DIAL_FLOOR <= dial <= MU_MAX:
+        raise ValueError(f"dial {dial} is outside the range this policy was trained on "
+                         f"[{DIAL_FLOOR}, {MU_MAX}]; a dial above the floor's real friction is the "
+                         f"dangerous side (measured 1 -> 13 collisions/km at +0.4)")
+    return mu_to_c(torch.tensor([dial], dtype=torch.float32), spec).to(device)
 
 
 # ------------------------------------------------------------------ message arithmetic

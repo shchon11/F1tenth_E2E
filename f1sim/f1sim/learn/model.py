@@ -35,6 +35,18 @@ class ResBlock1d(nn.Module):
         return F.gelu(y + (x if self.skip is None else self.skip(x)))
 
 
+def sector_index(length: int, sectors: int) -> torch.Tensor:
+    """(sectors, width) beam indices of PyTorch's adaptive pooling bins, `[floor(i L/S), ceil((i+1) L/S))`.
+
+    Bins differ in width by at most one when `length` is not a multiple of `sectors`; a short bin is
+    padded by repeating its own last index, which a max cannot see. Built once from the static beam
+    count, so a forward is one gather and one reduction and an exported graph holds it as a constant.
+    """
+    bins = [(i * length // sectors, -(-(i + 1) * length // sectors)) for i in range(sectors)]
+    width = max(e - s for s, e in bins)
+    return torch.tensor([[min(s + j, e - 1) for j in range(width)] for s, e in bins], dtype=torch.long)
+
+
 class ScanStem(nn.Module):
     """1D CNN over the beam axis. 1080 beams -> 256 features.
 
@@ -72,6 +84,7 @@ class ScanStem(nn.Module):
                              "extra channel is not a frame")
         self.scan_deltas, self.temporal_encoder, self.scan_stem = scan_deltas, temporal_encoder, scan_stem
         self.register_buffer("beam_angle", torch.linspace(-1.0, 1.0, n_beams)[None, None, :], persistent=False)
+        self.register_buffer("sector_index", sector_index(n_beams, self.SECTORS), persistent=False)
         if scan_stem == "resnet":
             per_frame = temporal_encoder == "gru"
             cin = (1 if per_frame else (2 * n_stack - 1 if scan_deltas else n_stack)) + 2 + self.extra_channels   # + angle + min-pool + extras
@@ -144,8 +157,14 @@ class ScanStem(nn.Module):
         GroupNorm standardises each group over the whole beam axis, so after the trunk a corridor
         1 m wide and one 3 m wide look alike -- exactly the absolute scale a speed decision needs.
         This bypass carries it to the head un-normalised, and doubles as the classical gap-follower
-        descriptor (min range per sector) that the conv stack would otherwise have to rediscover."""
-        return -F.adaptive_max_pool1d(-x[:, :1], self.SECTORS).flatten(1)
+        descriptor (min range per sector) that the conv stack would otherwise have to rediscover.
+
+        Written as a gather over `sector_index` rather than `F.adaptive_max_pool1d(-x, SECTORS)`,
+        which the ONNX exporter refuses whenever the beam count is not a multiple of 36 -- 1081 is
+        not, so the deployed policy could not be exported. The bins are the pool's own, the max is
+        exact, so the values are bit-identical (`test_deploy_dial_export.py`); `max(-1)` rather than `amax`
+        so a tie's gradient also goes to one beam, as the pool's did."""
+        return -(-x[:, 0, self.sector_index]).max(-1).values
 
     def _resnet_features(self, x: torch.Tensor, extra: Optional[torch.Tensor] = None,
                          beams: bool = False):

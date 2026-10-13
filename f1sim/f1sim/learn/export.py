@@ -4,6 +4,12 @@ A recurrent checkpoint (`--memory gru`) exports as `(scan, proprio, hidden) -> (
 hidden_next)`: the state is an input and an output, never module state, because that is the only
 form a graph runtime can carry. Extra scan channels widen the `scan` input; the sidecar JSON
 records exactly what to feed and what to keep.
+
+A grip-dial checkpoint (`meta["cond"]`, source `dial`) takes the dial as one more input, `dial`
+(batch, 1), in friction units -- the number an operator sets, the ROS node's `dial` parameter. The
+graph applies the checkpoint's own `(dial - offset) / scale` (`conditioning.mu_to_c`), so a consumer
+never re-implements the normalisation; the sidecar records the spec. There is no default for it in
+the graph: a conditional actor is never run on an implied number (`Actor._require_cond`).
 """
 from __future__ import annotations
 
@@ -13,15 +19,32 @@ import os
 import numpy as np
 import torch
 
+from .conditioning import CondSpec, mu_to_c
 from .model import load_checkpoint
 
 
-class ActorOnly(torch.nn.Module):
-    def __init__(self, actor):
-        super().__init__(); self.actor = actor
+def _condition(spec: CondSpec, proprio, dial):
+    """`c` for the actor from the graph's `dial` input: None for an unconditional checkpoint, zeros
+    for the A0 arm (trained on c = 0, so it has no dial), the checkpoint's normalisation otherwise."""
+    if not spec.dim:
+        return None
+    if spec.source == "zero":
+        return proprio.new_zeros(proprio.shape[0], spec.dim)
+    return mu_to_c(dial, spec).to(proprio.dtype)
 
-    def forward(self, scan, proprio):
-        return self.actor(scan, proprio)          # deterministic action in [-1, 1]
+
+def takes_dial(spec: CondSpec) -> bool:
+    """Whether the exported graph has a `dial` input. A lab-oracle spec never reaches here
+    (`load_checkpoint` refuses it), and the A0 arm's `c` is a constant zero."""
+    return bool(spec.dim) and spec.source == "dial"
+
+
+class ActorOnly(torch.nn.Module):
+    def __init__(self, actor, cond: CondSpec = CondSpec()):
+        super().__init__(); self.actor = actor; self.cond = cond
+
+    def forward(self, scan, proprio, dial=None):
+        return self.actor(scan, proprio, _condition(self.cond, proprio, dial))   # deterministic action in [-1, 1]
 
 
 class RecurrentActorOnly(torch.nn.Module):
@@ -35,11 +58,11 @@ class RecurrentActorOnly(torch.nn.Module):
     does, and the sidecar JSON records which ones and in what order.
     """
 
-    def __init__(self, actor):
-        super().__init__(); self.actor = actor
+    def __init__(self, actor, cond: CondSpec = CondSpec()):
+        super().__init__(); self.actor = actor; self.cond = cond
 
-    def forward(self, scan, proprio, hidden):
-        return self.actor.step(scan, proprio, None, hidden)
+    def forward(self, scan, proprio, hidden, dial=None):
+        return self.actor.step(scan, proprio, _condition(self.cond, proprio, dial), hidden)
 
 
 def main():
@@ -70,18 +93,25 @@ def main():
     k_in = k + len(channels)                       # what the forward takes, extra channels included
     scan, pro = torch.rand(1, k_in, N), torch.rand(1, P)
     recurrent = model.actor.has_memory
+    cond = CondSpec.from_meta(model.meta.get("cond"))
     if recurrent:
-        m = RecurrentActorOnly(model.actor).eval()
+        m = RecurrentActorOnly(model.actor, cond).eval()
         h = model.actor.initial_hidden(1)
         args, names = (scan, pro, h), ["scan", "proprio", "hidden"]
         outs = ["action", "hidden_next"]
         dyn = {"scan": {0: "batch"}, "proprio": {0: "batch"}, "hidden": {1: "batch"},
                "action": {0: "batch"}, "hidden_next": {1: "batch"}}
     else:
-        m = ActorOnly(model.actor).eval()
+        m = ActorOnly(model.actor, cond).eval()
         args, names = (scan, pro), ["scan", "proprio"]
         outs = ["action"]
         dyn = {"scan": {0: "batch"}, "proprio": {0: "batch"}, "action": {0: "batch"}}
+    dial = None
+    if takes_dial(cond):
+        # Any value in the trained range traces the same graph; this one is only the probe below.
+        dial = torch.full((1, 1), 0.9)
+        args, names = args + (dial,), names + ["dial"]
+        dyn["dial"] = {0: "batch"}
     # dynamo=False: torch>=2.6 defaults to the dynamo exporter, which needs `onnxscript` and is not
     # installed here. The TorchScript path handles both scan stems (GroupNorm, adaptive pooling included).
     torch.onnx.export(m, args, out, input_names=names, output_names=outs, opset_version=17,
@@ -94,7 +124,11 @@ def main():
         json.dump({"spec": spec, "meta": model.meta,
                    "inputs": {"scan_channels": ["frame"] * k + channels,
                               "scan_width": k_in, "proprio": P,
-                              "hidden": (list(h.shape) if recurrent else None)},
+                              "hidden": (list(h.shape) if recurrent else None),
+                              # (batch, 1) friction the policy is told to use; the graph applies
+                              # `cond`'s (dial - offset) / scale itself. None: no dial input.
+                              "dial": ([1] if dial is not None else None),
+                              "cond": cond.to_meta()},
                    "outputs": outs}, f, indent=1)
     try:
         import onnxruntime as ort
@@ -102,12 +136,15 @@ def main():
         feed = {"scan": scan.numpy(), "proprio": pro.numpy()}
         if recurrent:
             feed["hidden"] = h.numpy()
+        if dial is not None:
+            feed["dial"] = dial.numpy()
         y = sess.run(None, feed)
         ref = m(*args)
         ref = (ref,) if torch.is_tensor(ref) else ref
         err = max(float(np.abs(yi - ri.detach().numpy()).max()) for yi, ri in zip(y, ref))
         print(f"onnx ok: {out}  max |onnx - torch| = {err:.2e}"
-              + ("  (recurrent: hidden in, hidden_next out)" if recurrent else ""))
+              + ("  (recurrent: hidden in, hidden_next out)" if recurrent else "")
+              + (f"  (grip dial input: {cond.describe()})" if dial is not None else ""))
     except ImportError:
         print(f"onnx written: {out} (install onnxruntime to verify)")
     if a.trt:
@@ -115,6 +152,8 @@ def main():
         inputs = [torch_tensorrt.Input((1, k_in, N)), torch_tensorrt.Input((1, P))]
         if recurrent:
             inputs.append(torch_tensorrt.Input(tuple(h.shape)))
+        if dial is not None:
+            inputs.append(torch_tensorrt.Input((1, 1)))
         trt = torch_tensorrt.compile(m, inputs=inputs, enabled_precisions={torch.float16})
         torch.jit.save(trt, os.path.splitext(out)[0] + "_trt.ts"); print("tensorrt module saved")
 

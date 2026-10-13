@@ -140,6 +140,11 @@ def make_condition(source: str, spec: CondSpec, priv: torch.Tensor, mu_index: in
     raise ValueError(f"unknown cond source {source!r}")
 
 
+#: The lowest number a dial student was ever told: `DialDraw` clamps `mu - margin` here. With the
+#: top of the friction draw (`grip_estimator.MU_MAX`) it bounds every dial the network saw.
+DIAL_FLOOR = 0.55
+
+
 class DialDraw:
     """The number a dial student is told, per env and per episode: the floor's friction minus a margin.
 
@@ -148,7 +153,7 @@ class DialDraw:
     teacher is asked to drive for this same number (`env.teacher_label(teacher, mu=...)`), so what
     the student learns is obedience to the dial, not a guess at what lies above it."""
 
-    def __init__(self, env, margin: float, p_exact: float, floor: float = 0.55):
+    def __init__(self, env, margin: float, p_exact: float, floor: float = DIAL_FLOOR):
         self.env, self.margin, self.p_exact, self.floor = env, float(margin), float(p_exact), float(floor)
         self.m = torch.zeros(env.B, device=env.device)
 

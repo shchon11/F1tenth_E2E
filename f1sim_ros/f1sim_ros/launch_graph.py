@@ -54,6 +54,9 @@ def common_arguments():
                               description="controller markers on /f1sim/viz/plan and /clearance"),
         DeclareLaunchArgument("policy", default_value="true",
                               description="false runs the controller alone, for an external planner"),
+        DeclareLaunchArgument("dial", default_value="",
+                              description="grip dial told to a conditional policy (simulator mu units); "
+                                          "empty = config_yaml's value"),
     ]
 
 
@@ -69,7 +72,10 @@ def _overrides():
 
 
 def policy_node(**kw):
-    params = dict(_overrides()); params.update(kw)
+    """The policy node. `dial:=` reaches it as `dial_override`, a string the node reads only when it is
+    not empty: laid over `dial` directly, an unset argument would replace the file's value with nothing,
+    and a numeric default would be a second place the venue's grip is written down."""
+    params = dict(_overrides()); params["dial_override"] = arg("dial"); params.update(kw)
     return Node(package="f1sim_ros", executable="policy", name="f1sim_policy", output="screen",
                 condition=IfCondition(LaunchConfiguration("policy")),
                 parameters=[LaunchConfiguration("config_yaml"), params])

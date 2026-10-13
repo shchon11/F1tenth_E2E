@@ -359,11 +359,9 @@ def test_the_export_carries_the_motion_branch_and_no_head(tmp_path):
     check that the "never called" stays true as the forward is edited.
     """
     onnx = pytest.importorskip("onnx")
-    # 288 beams, not 256: the resnet stem's sector profile is an `adaptive_max_pool1d` to 36, and
-    # the ONNX exporter refuses an output size that is not a factor of the input. That is a property
-    # of the stem this branch did not touch (the real policy has 1081 beams and exports through the
-    # same path in `test_future_head.py`); using a divisible count here keeps this test about the
-    # heads.
+    # 288 beams: historically the sector profile was an `adaptive_max_pool1d` the exporter refused
+    # for a count that is not a multiple of 36. It is a gather now (`model.sector_index`) and any
+    # count exports; the number is kept so this test stays about the heads.
     big = dict(SMALL, n_beams=288)
     spec = ObsSpec(n_beams=288, scan_stack=6, act_dim=8, action_history=2, hist_len=0)
     chan = {"channels": ["memory", "edges"] + ROWS, "aligned": {"proprio": motion_index_spec(spec)}}
