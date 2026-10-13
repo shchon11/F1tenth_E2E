@@ -138,8 +138,8 @@ def _check_compatible(path: str, meta: dict, env, spec) -> None:
     """
     if getattr(env, "obs_version", 1) != 1:
         # Every pool entry today is a v1 checkpoint, and a v2 env emits no v1 observation. Driving
-        # the league from a v2 learner's env needs a builder per seat (the redesign's stage-1 item
-        # "상대 좌석별 ObsBuilder"); until then this is refused rather than fed the wrong vector.
+        # the league from a v2 learner's env needs an observation builder per seat (the redesign's
+        # stage-1 list); until then this is refused rather than fed the wrong vector.
         raise ValueError(
             f"--opp-pool entry {os.path.basename(path)}: this env emits observation contract "
             f"v{env.obs_version}, and pool opponents are driven off the env's own observation. A "

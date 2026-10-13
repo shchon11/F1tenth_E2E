@@ -148,6 +148,14 @@ class PolicyNode(Node):
         # with the metadata nor one with only the spec can reach the wheels.
         ckpt = str(p("checkpoint"))
         self.model, extra = load_checkpoint(ckpt, self.device); self.model.eval()
+        if (getattr(self.model, "meta", None) or {}).get("arch") == "v2":
+            # A v2 actor reads observation contract v2 (`learn.obs.ObsBuilderV2`: newest frames,
+            # [speed, gyro z] + issued-action history, the dial as an input) and this node builds
+            # v1's. Refused by name rather than by the TypeError a v2 spec would raise below.
+            raise RuntimeError(
+                f"{os.path.basename(ckpt)} is a v2 checkpoint (learn.model_v2). This node builds "
+                f"observation contract v1; the v2 path (ObsBuilderV2 + learn.export.ActorV2Only) "
+                f"is not wired into it yet.")
         self.spec = ObsSpec(**extra["spec"]) if extra.get("spec") else ObsSpec()
         # `ObsSpec.opp_token` is "off" when there is none -- a STRING, so `if self.spec.opp_token`
         # is true for every checkpoint. The refusal is `ObsBuilder`'s, on the next line, and it is
