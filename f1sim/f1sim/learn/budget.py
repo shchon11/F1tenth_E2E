@@ -276,21 +276,26 @@ def v2_budget(n_frames=(1, 2, 3), n_beams: int = 1081, iters: int = 200, repeats
     from .export import export_v2, ort_step_ms
     from .model_v2 import ActorCriticV2, block_parameter_counts
     rows = []
-    for k in n_frames:
-        torch.manual_seed(0)
-        m = ActorCriticV2(n_beams=n_beams, n_frames=int(k)).eval()
-        row = {"n_frames": int(k), "n_beams": int(n_beams), "params": block_parameter_counts(m),
-               "torch_ms": v2_actor_step_ms(m, iters=iters, threads=threads, repeats=repeats),
-               "protocol": protocol(iters, repeats, threads)}
-        d = out_dir or tempfile.mkdtemp(prefix="v2_budget_")
-        path = os.path.join(d, f"actor_v2_k{k}.onnx")
-        rep = export_v2(m, path)
-        row["onnx_max_abs_err"] = rep["max_abs_err"]
-        try:
-            row["onnxruntime_ms"] = ort_step_ms(path, m, iters=iters, repeats=repeats, threads=threads)
-        except ImportError:
-            row["onnxruntime_ms"] = None
-        rows.append(row)
+    tmp = None if out_dir else tempfile.TemporaryDirectory(prefix="v2_budget_")
+    d = out_dir or tmp.name
+    try:
+        for k in n_frames:
+            torch.manual_seed(0)
+            m = ActorCriticV2(n_beams=n_beams, n_frames=int(k)).eval()
+            row = {"n_frames": int(k), "n_beams": int(n_beams), "params": block_parameter_counts(m),
+                   "torch_ms": v2_actor_step_ms(m, iters=iters, threads=threads, repeats=repeats),
+                   "protocol": protocol(iters, repeats, threads)}
+            path = os.path.join(d, f"actor_v2_k{k}.onnx")
+            rep = export_v2(m, path)
+            row["onnx_max_abs_err"] = rep["max_abs_err"]
+            try:
+                row["onnxruntime_ms"] = ort_step_ms(path, m, iters=iters, repeats=repeats, threads=threads)
+            except ImportError:
+                row["onnxruntime_ms"] = None
+            rows.append(row)
+    finally:
+        if tmp is not None:
+            tmp.cleanup()                     # the graphs were only the vehicle for the timing
     return rows
 
 

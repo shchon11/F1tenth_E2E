@@ -6,11 +6,12 @@ leaves every other weight drawn exactly as without it.
 
 * **B8, opponent slots** (docs/research/architecture-redesign-2026-10-13.md, B8). Three slots x
   [presence logit, dx / 5, dy / 2, v_lat / 2] read from `[e | y]`, the features the action head
-  reads -- including the memory's output, which is the point: the redesign's bisection found the GRU
-  learns to carry anything only under a dense target that cannot be met without memory (all three
-  GRU variants 3/3 seeds with one, none without; `proposal-temporal/aux_*.json`), and G1 measured it
-  on real driving: occluded-within-1-s position R^2 0.609 with the trainable stem and this memory,
-  -0.111 without memory. The slots are an unordered set, matched to the cars by the cheapest of the
+  reads -- including the memory's output, which is the point: the redesign's bisection found that
+  with the stem's gradient flowing on every step a GRU does not learn to carry a cue, and that a
+  dense target which cannot be met without memory makes all three GRU variants learn it, 3/3 seeds
+  (`proposal-temporal/aux_*.json`; on this actor, `tests/test_model_v2.py`: learned at iteration
+  205 with one, flat at chance for 500 without). G1 measured it on real driving: occluded-within-
+  1-s position R^2 0.609 with the trainable stem and this memory, -0.111 without memory. The slots are an unordered set, matched to the cars by the cheapest of the
   slot permutations (`b8_loss`) -- a distance-ordered slot list relabels at every swap of rank,
   which a judge of the redesign pointed out.
 
@@ -20,6 +21,14 @@ leaves every other weight drawn exactly as without it.
   definition, exactly as a car beyond 6 m is, and its slot is neither supervised nor penalised.
   Requirement P2 asks for the positions of up to three cars within 6 m; a fourth car within 6 m of
   a 0.5 m car is a pile-up, not a race.
+
+  A caveat measured on a CPU toy (the 8-step recall with B8 as the ONLY auxiliary, fresh network):
+  with the remembered car at one of two places the set loss has a hedge -- two slots on the two
+  answers, presence 0.5 each, 2 ln 2 / 3 = 0.46 -- and the memory did not learn in 400 iterations;
+  with a continuous position it did, slowly (action error 0.084 against a 0.333 floor after 1000
+  iterations, 0.546 with the state cut; a direct dense regression learns the binary task in 205).
+  Real positions are continuous, but one B8 step is a small gradient (/ 3 slots, x 0.5), so the
+  training unit should log it against the imitation loss's (the redesign's G5 per-loss norms).
 
   Which candidates may be scored is the visibility mask (`b8_know_mask`): seen by >= 3 beams within
   the last 3 s (120 steps), AND that sighting inside the current training window -- the chunk or

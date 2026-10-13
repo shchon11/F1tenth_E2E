@@ -88,3 +88,20 @@ def test_the_wrapper_is_the_actors_step():
         a, h = w(scan, ego, dial, m.actor.initial_hidden(2))
         b, k = m.actor.step(scan, ego, (dial - 1.0) / 0.25, m.actor.initial_hidden(2))
     assert torch.equal(a, b) and torch.equal(h, k)
+
+
+def test_the_budget_table_runs_and_leaves_no_files(tmp_path, monkeypatch):
+    """`python -m f1sim.learn.budget --v2`: the numbers are a CPU proxy for the Orin; what is
+    pinned is that the table is produced and its temporary graphs are gone afterwards."""
+    import tempfile
+    from f1sim.learn.budget import v2_budget
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    threads = torch.get_num_threads()
+    try:
+        rows = v2_budget([1], n_beams=271, iters=3, repeats=1)
+    finally:
+        torch.set_num_threads(threads)
+    r = rows[0]
+    assert r["params"]["actor (deployed)"] == 860_592 and r["torch_ms"] > 0      # 271 beams: a 9-cell neck
+    assert r["onnx_max_abs_err"] <= 1e-5 and r["onnxruntime_ms"] > 0
+    assert os.listdir(str(tmp_path)) == []
