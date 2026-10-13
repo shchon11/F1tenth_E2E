@@ -25,6 +25,7 @@ import torch
 
 from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX, OPP_FUTURE_MODELS,
                        PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS)
+from ..mpc import plan_layout
 from ..opp_token import OPP_TOKEN_MODES, describe as describe_opp_token
 from ..params import Config
 from . import common
@@ -96,7 +97,7 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
                      val_old, w, cond=None, hyper: PPOHyper, autocast=None,
                      freeze_actor: bool = False, sequence=None,
                      future=None, future_valid=None, beam_mask=None, dv=None,
-                     floor_label=None, reference_params=None, kl_scope="all") -> dict:
+                     floor_label=None, reference_params=None, kl_scope="all", layout=None) -> dict:
     """One PPO minibatch's loss terms, feedforward or recurrent.
 
     Lifted out of `main`'s inner loop unchanged so that (a) the recurrent path and the feedforward
@@ -225,8 +226,10 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
         if ref_mean.shape != d.mean.shape or ref_std.shape != d.stddev.shape:
             raise ValueError("stored recurrent reference does not align with the PPO minibatch")
     if kl_scope == "curvature":
-        ref_mean, ref_std = ref_mean[:, :6], ref_std[:, :6]
-        d = torch.distributions.Normal(getattr(d, "anchor", d.mean).float()[:, :6], d.stddev.float()[:, :6])
+        # the path columns of the run's plan (`layout`, an `mpc.plan_layout`; None is "linear")
+        cols = (layout or plan_layout("linear")).path
+        ref_mean, ref_std = ref_mean[:, cols], ref_std[:, cols]
+        d = torch.distributions.Normal(getattr(d, "anchor", d.mean).float()[:, cols], d.stddev.float()[:, cols])
     elif kl_scope != "all":
         raise ValueError(f"unknown KL scope {kl_scope!r}")
     d_ref = torch.distributions.Normal(ref_mean, ref_std)
@@ -1427,7 +1430,7 @@ def main():
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
-    if adaptive and (not memory_on or model.actor.mu.out_features != 8):
+    if adaptive and (not memory_on or model.actor.mu.out_features != plan_layout(a.speed_mode).act_dim):
         raise SystemExit("adaptive training requires the trained recurrent 8D D3 actor")
     if adaptive:
         require_exact_actor(model, init_ck)
@@ -1643,7 +1646,7 @@ def main():
         if not crit:
             raise SystemExit("--clip-split: this model has no 'critic.' parameters")
         clip_sets = (act, crit)
-    speed_freeze = SpeedRowFreeze(model) if a.adaptation == "speed" else None
+    speed_freeze = SpeedRowFreeze(model, plan_layout(a.speed_mode)) if a.adaptation == "speed" else None
     optimizer_restored = False
     # Adam's moments are part of where training got to. Dropping them on every resume restarts the
     # step-size estimate from nothing, which is the other half of why a resume costs updates before
@@ -2290,7 +2293,8 @@ def main():
                                          autocast=ac, freeze_actor=freeze_actor, sequence=seq,
                                          future=fut_mb, future_valid=fut_valid_mb,
                                          beam_mask=mask_mb, dv=dv_mb, floor_label=floor_mb,
-                                         reference_params=ref_mb, kl_scope=a.kl_scope)
+                                         reference_params=ref_mb, kl_scope=a.kl_scope,
+                                         layout=plan_layout(a.speed_mode))
                 pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
                                               terms["aux_grip"], terms["aux_opp"])
                 loss = terms["loss"]
@@ -2395,10 +2399,10 @@ def main():
                       if stats.get("aux_motion") else {}),
                    **{f"loss/{key}": float(np.mean(v)) for key, v in stats.items()
                       if key.startswith("aux_opp_mask/") or key.startswith("aux_motion/")},
-                   "policy/log_std_steer": (model.actor.log_std[:-2].mean() if a.action_mode == "plan"
-                                             else model.actor.log_std[0]).item(),
-                   "policy/log_std_speed": (model.actor.log_std[-2:].mean() if a.action_mode == "plan"
-                                             else model.actor.log_std[1]).item(),
+                   "policy/log_std_steer": (model.actor.log_std[plan_layout(a.speed_mode).other].mean()
+                                             if a.action_mode == "plan" else model.actor.log_std[0]).item(),
+                   "policy/log_std_speed": (model.actor.log_std[plan_layout(a.speed_mode).speed].mean()
+                                             if a.action_mode == "plan" else model.actor.log_std[1]).item(),
                    "time/rollout_s": t_roll, "time/update_s": t_upd, "time/env_steps_per_s": n / (t_roll + t_upd),
                    "time/elapsed_min": (time.time() - t_start) / 60}
             # over the policy's own cars only. With mixed opponents the teacher-driven car of a race

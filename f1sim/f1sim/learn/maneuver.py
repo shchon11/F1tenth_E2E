@@ -200,7 +200,7 @@ def offset_candidates(base: torch.Tensor, v_meas: torch.Tensor, offsets: torch.T
     offset line) with both speeds scaled by `speeds[k]`. The teacher shifts the RACELINE, which only it
     can see; a student shifts its own plan -- the one thing it already predicts well on unseen tracks.
     `offsets` / `speeds` are (K,)."""
-    from ..mpc import N_KNOTS, decode, encode, path_points
+    from ..mpc import decode, encode, path_points, plan_layout
     from ..teacher import fit_knots
     B, K = base.shape[0], offsets.shape[0]
     cap = torch.full_like(v_meas, v_max)
@@ -231,7 +231,8 @@ def offset_candidates(base: torch.Tensor, v_meas: torch.Tensor, offsets: torch.T
     z = (offsets == 0).to(base.device)
     a = torch.where(z[None, :, None], base[:, None, :].expand(B, K, -1), a).reshape(B * K, -1)
     s = speeds.to(base).repeat(B)
-    a = a.clone(); a[:, -2:] = ((a[:, -2:] + 1.0) * s[:, None] - 1.0).clamp(-1.0, 1.0)
+    sp = plan_layout(spec).speed
+    a = a.clone(); a[:, sp] = ((a[:, sp] + 1.0) * s[:, None] - 1.0).clamp(-1.0, 1.0)
     return a.view(B, K, -1)
 
 
@@ -239,7 +240,7 @@ def offset_plan(base: torch.Tensor, v_meas: torch.Tensor, off: torch.Tensor, spd
                 spec, k_lim: float, iters: int = 6) -> torch.Tensor:
     """(B, A) ONE candidate per row -- `offset_candidates` for per-row (offset, speed scale) `off`, `spd` (B,).
     What a 'transform' head executes: only the chosen candidate is built; a zero offset is the base plan itself."""
-    from ..mpc import decode, encode, path_points
+    from ..mpc import decode, encode, path_points, plan_layout
     from ..teacher import fit_knots
     B = base.shape[0]
     a = base
@@ -256,5 +257,6 @@ def offset_plan(base: torch.Tensor, v_meas: torch.Tensor, off: torch.Tensor, spd
         kf = fit_knots(k0, tx, ty, Lp, fr, lim, iters, fractions)
         shifted = encode(kf, v0, v1, v_max, spec, v_meas=v_meas)
         a = torch.where((off != 0)[:, None], shifted, base)
-    a = a.clone(); a[:, -2:] = ((a[:, -2:] + 1.0) * spd.to(base)[:, None] - 1.0).clamp(-1.0, 1.0)
+    sp = plan_layout(spec).speed
+    a = a.clone(); a[:, sp] = ((a[:, sp] + 1.0) * spd.to(base)[:, None] - 1.0).clamp(-1.0, 1.0)
     return a

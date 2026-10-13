@@ -29,6 +29,7 @@ import math
 import os
 import random
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -36,7 +37,7 @@ import torch.nn.functional as F
 
 from ..gym_env import EnvConfig, PRIV_OPP_DIST_SCALE, OPP_FUTURE_MODELS
 from ..opp_token import OPP_TOKEN_MODES, validate_opp_token
-from ..mpc import ACT_DIM, N_KNOTS
+from ..mpc import ACT_DIM, PlanLayout, plan_layout  # noqa: F401 -- ACT_DIM: the default plan width, read as dagger.ACT_DIM
 from ..interactive_teacher import DEFAULT_OFFSETS, DEFAULT_SPEEDS, InteractiveTeacher, TeacherCost
 from .. import tracks as track_catalog
 from ..params import Config
@@ -233,34 +234,40 @@ class StepBuffer:
 #: than to be slow.
 W_OVER, W_UNDER, UNDER_POW = 4.0, 0.25, 1.0
 
-#: Both halves of the plan action, so the split cannot drift from `mpc.ACT_DIM`.
-SPEED_COLS = slice(N_KNOTS, ACT_DIM)
-KNOT_COLS = slice(0, N_KNOTS)
+#: The two halves of the default ("linear") plan action, for callers that address its columns. The
+#: loss itself reads the run's own layout (`plan_loss(layout=...)`): a module constant was the
+#: linear split whatever the run's speed mode, which in "wp4" -- also 8 wide -- would have scored
+#: two curvatures as speeds without any shape complaining.
+KNOT_COLS = plan_layout("linear").path
+SPEED_COLS = plan_layout("linear").speed
 
 
 def plan_loss(mu: torch.Tensor, lab: torch.Tensor, speed_loss: str, v_max: float,
-              parts: bool = False):
+              parts: bool = False, layout: Optional[PlanLayout] = None):
     """Huber on the whole plan (`symmetric`), or Huber on the knots plus an asymmetric speed term.
 
     `symmetric` is `F.smooth_l1_loss(mu, lab, beta=0.1)` and nothing else, so `--speed-loss
     symmetric` is byte-identical to every DAgger run before this flag existed.
 
-    `asym` keeps the curvature knots on that same loss and replaces only the two speed targets. The
-    two halves are recombined in the proportion the single mean had them -- 6 knots to 2 speeds --
-    so the knot term keeps its old magnitude and only the speed term is a new thing.
+    `asym` keeps the curvature knots on that same loss and replaces only the speed targets
+    (`layout.speed`, the run's `mpc.plan_layout`; None is "linear"). The two halves are recombined
+    in the proportion the single mean had them -- 6 knots to 2 speeds in a linear plan -- so the
+    knot term keeps its old magnitude and only the speed term is a new thing. A column that is
+    neither (a grip budget) stays on the knot side's Huber.
     """
     if speed_loss == "symmetric":
         total = F.smooth_l1_loss(mu, lab, beta=0.1)
         return (total, {"knot": total, "speed": total}) if parts else total
-    knot = F.smooth_l1_loss(mu[..., KNOT_COLS], lab[..., KNOT_COLS], beta=0.1)
+    lay = layout or plan_layout("linear")
+    knot = F.smooth_l1_loss(mu[..., lay.other], lab[..., lay.other], beta=0.1)
     # normalized plan speed a -> m/s is (a + 1)/2 * v_max, so an error in a is (v_max / 2) times
     # the error in m/s. The loss is defined in m/s because that is the unit the asymmetry is about.
-    e = (mu[..., SPEED_COLS] - lab[..., SPEED_COLS]) * (0.5 * v_max)
+    e = (mu[..., lay.speed] - lab[..., lay.speed]) * (0.5 * v_max)
     over = e.clamp_min(0.0)
     under = (-e).clamp_min(0.0)
     speed = (W_OVER * over ** 2 + W_UNDER * under ** UNDER_POW).mean()
-    n_k, n_s = N_KNOTS, ACT_DIM - N_KNOTS
-    total = (n_k * knot + n_s * speed) / ACT_DIM
+    n_k, n_s = lay.act_dim - lay.n_speed, lay.n_speed
+    total = (n_k * knot + n_s * speed) / lay.act_dim
     return (total, {"knot": knot, "speed": speed}) if parts else total
 
 
@@ -489,7 +496,8 @@ def sequence_means(model, scan, pro, keep, burn: int = 0, cond=None):
 def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float = 0.0, hard_power: float = 1.0,
                  log_every: int = 25, chunk: int = 0, speed_loss: str = "symmetric",
                  v_max: float = 10.0, quantile_dim: int = -1, tau: float = 0.5,
-                 aux_grip: float = 0.0, aux_opp: float = 0.0, maneuver_w=(1.0, 1.0, 1.0, 1.0)):
+                 aux_grip: float = 0.0, aux_opp: float = 0.0, maneuver_w=(1.0, 1.0, 1.0, 1.0),
+                 layout: Optional[PlanLayout] = None):
     n_stored = sum(len(b) for b in bufs)
     n_total = sum(b.valid_count for b in bufs)
     log({"dagger/valid_labels": n_total, "dagger/invalid_labels": n_stored - n_total})
@@ -542,7 +550,7 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
             for k_ in ("plan", "choice", "risk", "prog", "choice_acc"):
                 man_log.setdefault(k_, []).append(float(mp[k_].detach()))
         else:
-            loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True)
+            loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True, layout=layout)
         if aux_grip > 0 and grip is not None and fric is not None:
             # The friction the labels were built from, asked of the same features the action comes
             # from. Imitation alone averages it away (the "imitation gap").
@@ -995,9 +1003,8 @@ def main():
         lambda: cond_mod.mu_to_c(solo_dial.value() if solo_dial is not None else solo_env.sim.P["mu"], cspec))
     #: The action dimension whose error is not symmetric: too little grip costs lap time, too much
     #: costs the car. `--grip-quantile` below 0.5 makes "cannot tell yet" mean the slippery end.
-    from ..mpc import N_ACC
-    quantile_dim = (N_KNOTS if a.speed_mode in ("envelope", "budget")
-                    else N_KNOTS + N_ACC if a.speed_mode in ("timed", "tspeed") else -1)
+    plan_cols = plan_layout(a.speed_mode)
+    quantile_dim = -1 if plan_cols.grip is None else plan_cols.grip
     opt = torch.optim.Adam(model.actor.parameters(), lr=a.lr)
     run = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "tracks": names,
                                                "teacher_desc": teacher_desc, "collection_mix": mix,
@@ -1043,7 +1050,8 @@ def main():
                             a.log_every, chunk=a.chunk_length, speed_loss=a.speed_loss,
                             v_max=env.ecfg.v_max_policy, quantile_dim=quantile_dim, tau=a.grip_quantile,
                             aux_grip=a.aux_grip, aux_opp=a.aux_opp,
-                            maneuver_w=tuple(float(x) for x in a.maneuver_weights.split(","))); t_tr = tm.lap()
+                            maneuver_w=tuple(float(x) for x in a.maneuver_weights.split(",")),
+                            layout=plan_cols); t_tr = tm.lap()
         # Diagnostics only, and fenced off from the training stream. `eval_every` skips the
         # measurement, never the collection or the training: 75 % of a calibrated iteration was
         # this rollout (873 s of 1165), and eight iterations of it is two hours of measuring a

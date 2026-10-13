@@ -191,9 +191,12 @@ def from_bag(path: str, spec: Optional[ObsSpec] = None, *, speed_cap: float = 4.
         t_scan = t_scan[:max_frames]
     n = len(t_scan)
 
-    plan = b.v[PLAN][:, :8] if b.has(PLAN) else None
+    from ..mpc import PLAN_WIRE_DIM
+    # The topic's fixed width, whatever the plan means: these are the numbers the policy emitted,
+    # which is what its action history held, in any speed mode that fits the wire.
+    plan = b.v[PLAN][:, :PLAN_WIRE_DIM] if b.has(PLAN) else None
     if action_source == "auto":
-        action_source = "plan" if (plan is not None and spec.act_dim == 8) else (
+        action_source = "plan" if (plan is not None and spec.act_dim == PLAN_WIRE_DIM) else (
             "drive" if (spec.act_dim == 2 and b.has(DRIVE)) else "zeros")
 
     builder = ObsBuilder(spec, "cpu")

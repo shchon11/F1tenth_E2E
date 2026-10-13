@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from .mpc import plan_layout
 from .teacher import RacelineTeacher
 
 #: Row tensors whose VALUES are row indices (or derived from the row's position in the batch). The
@@ -250,7 +251,8 @@ class RolloutTeacher:
                                 env.ecfg.v_max_policy, env.tracker.spec,
                                 offset=off, plan_speed=env._tracker_plan_speed() if plan_speed is None else plan_speed)
         a = a.clone()
-        a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
+        sp = plan_layout(env.tracker.spec).speed
+        a[:, sp] = ((a[:, sp] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
         return a
 
     @torch.no_grad()
@@ -334,7 +336,8 @@ class RolloutTeacher:
         a = self.base_S.plan_action(env.sim.state.repeat(K, 1), PK, self._real_tid().repeat(K), env.ecfg.v_max_policy,
                                     env.tracker.spec, offset=off, plan_speed=env._tracker_plan_speed().repeat(K)).clone()
         self.base_S.lat_slow = keep_slow
-        a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
+        sp = plan_layout(env.tracker.spec).speed
+        a[:, sp] = ((a[:, sp] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
         return a.view(K, B, -1).transpose(0, 1).contiguous()
 
     def __call__(self, state, P=None, tid=None, offset=None):

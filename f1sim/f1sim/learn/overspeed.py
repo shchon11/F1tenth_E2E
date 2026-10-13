@@ -28,7 +28,6 @@ import torch
 
 from ..gym_env import EnvConfig
 from ..interactive_teacher import InteractiveTeacher
-from ..mpc import ACT_DIM, N_KNOTS
 from ..params import Config
 from . import common
 from .memory import policy_fn as memory_policy_fn
@@ -44,11 +43,12 @@ def collect(env, policy, teacher, steps: int, seed: int = 0):
     if hasattr(policy, "reset"):
         policy.reset()
     errs, mus = [], []
+    sp = env.plan_layout.speed
     for _ in range(steps):
         lab = env.teacher_label(teacher)
         act = policy(obs)
         # normalized plan speed a -> m/s, the same map `mpc.decode` uses before the cap
-        e = (act[:, N_KNOTS:ACT_DIM] - lab[:, N_KNOTS:ACT_DIM]) * (0.5 * v_max)
+        e = (act[:, sp] - lab[:, sp]) * (0.5 * v_max)
         errs.append(e[lid].float().cpu())
         mus.append((env.sim.P["mu"] * env.sim.P["mu_f_scale"])[lid].float().cpu())
         obs, _r, term, trunc, _i = env.step(act)

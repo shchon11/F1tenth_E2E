@@ -129,7 +129,7 @@ class FrenetOpponentPlanner(RowPlanning):
         a = self.base.plan_action(state, P, tid, v_max, spec, iters=iters,
                                   offset=self._merge_offset(offset, d),
                                   idx=idx, plan_speed=plan_speed)
-        return self._scale_plan_speed(a, scale)
+        return self._scale_plan_speed(a, scale, spec)
 
     @torch.no_grad()
     def plan_rows(self, rows: torch.Tensor, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
@@ -144,7 +144,7 @@ class FrenetOpponentPlanner(RowPlanning):
             a = self.base.plan_action(st, None if P is None else {k: cut(v) for k, v in P.items()}, td,
                                       v_max, spec, offset=self._merge_offset(cut(offset), d),
                                       plan_speed=cut(plan_speed))
-            return self._scale_plan_speed(a, scale)
+            return self._scale_plan_speed(a, scale, spec)
 
     @torch.no_grad()
     def __call__(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
@@ -187,19 +187,21 @@ class FrenetOpponentPlanner(RowPlanning):
         return chosen if caller is None else caller + chosen
 
     @staticmethod
-    def _scale_plan_speed(action: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        """Scale a normalized plan's two speed targets per row -- the arithmetic
-        `F1VecEnv._opponent_actions` uses for a slot's speed band, for the same reason: the path
-        is unchanged and the profile along it is not.
+    def _scale_plan_speed(action: torch.Tensor, scale: torch.Tensor, spec=None) -> torch.Tensor:
+        """Scale a normalized plan's speed targets (`mpc.plan_layout(spec).speed`) per row -- the
+        arithmetic `F1VecEnv._opponent_actions` uses for a slot's speed band, for the same reason:
+        the path is unchanged and the profile along it is not. `spec` None is the default plan.
 
         An unscaled row is left alone rather than multiplied by one: `(x + 1) * 1 - 1` is not `x`
         in float32. The row test does it without a host sync, which a `scale.all()` short circuit
         would cost on every step of every race.
         """
+        from .mpc import plan_layout
+        sp = plan_layout(spec).speed
         out = action.clone()
         s = scale.to(out.dtype)[:, None]
-        scaled = ((out[:, -2:] + 1.0) * s - 1.0).clamp(-1.0, 1.0)
-        out[:, -2:] = torch.where(s == 1.0, out[:, -2:], scaled)
+        scaled = ((out[:, sp] + 1.0) * s - 1.0).clamp(-1.0, 1.0)
+        out[:, sp] = torch.where(s == 1.0, out[:, sp], scaled)
         return out
 
     # ------------------------------------------------------------------ the Frenet view

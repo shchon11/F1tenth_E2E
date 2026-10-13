@@ -86,7 +86,7 @@ class _PurePursuit:
         v_tgt = torch.minimum(torch.full_like(v_curve, self.v_ref), v_curve) * self.speed_scale()
         v_tgt = v_tgt.clamp(self.v_floor, float(e.ecfg.v_max_policy))
 
-        knots = kappa[:, None].expand(-1, mpc.N_KNOTS).contiguous()
+        knots = kappa[:, None].expand(-1, mpc.plan_layout(spec).n_path).contiguous()
         return mpc.encode(knots, v_tgt, v_tgt, float(e.ecfg.v_max_policy), spec).clamp(-1.0, 1.0)
 
 
@@ -423,9 +423,10 @@ class TrafficExpert:
         # `gym_env._opponent_actions` scales an event's speed keeps one convention for "drive this
         # plan slower" rather than inventing a second.
         an = an.clone()
-        target = ((an[:, -2:] + 1) * 0.5 * float(e.ecfg.v_max_policy)) * off_line[:, None]
+        sp = mpc.plan_layout(e.tracker.spec).speed
+        target = ((an[:, sp] + 1) * 0.5 * float(e.ecfg.v_max_policy)) * off_line[:, None]
         target = torch.where(holding[:, None],
                              torch.minimum(target, (scale * float(e.ecfg.v_max_policy))[:, None]),
                              target)
-        an[:, -2:] = (target / max(float(e.ecfg.v_max_policy), 1e-6) * 2 - 1).clamp(-1.0, 1.0)
+        an[:, sp] = (target / max(float(e.ecfg.v_max_policy), 1e-6) * 2 - 1).clamp(-1.0, 1.0)
         return an.clamp(-1.0, 1.0)

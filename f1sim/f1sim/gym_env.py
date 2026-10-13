@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, act_dim as plan_act_dim, encode as plan_encode, decode as plan_decode
+from .mpc import plan_layout as _plan_layout
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit_sided, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
@@ -1890,7 +1891,7 @@ class F1VecEnv:
         if self.act_dim == 2:
             self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
         else:
-            self.prev_action[ids, -2:] = (speed / e.v_max_policy * 2 - 1)[:, None]
+            self.prev_action[ids, self.plan_layout.speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
             self.tracker.reset(ids); self._calibrate_tracker(ids)
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         if self.events is not None:
@@ -2126,13 +2127,14 @@ class F1VecEnv:
         if rows is not None:
             cut = lambda t: t if t is None or not torch.is_tensor(t) or t.dim() == 0 else t[rows]
             spec, v_max = self.tracker.spec, self.ecfg.v_max_policy
+            sp = self.plan_layout.speed
             an = teacher.plan_rows(rows, self.sim.state, self.sim.P, self.sim.tid, v_max, spec,
                                    offset=ev_off, plan_speed=self._tracker_plan_speed())
-            an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * cut(self.opp_scale)[:, None] - 1).clamp(-1, 1)
+            an = an.clone(); an[:, sp] = ((an[:, sp] + 1) * cut(self.opp_scale)[:, None] - 1).clamp(-1, 1)
             if ev_speed is not None:
-                an[:, -2:] = (cut(ev_speed)[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
+                an[:, sp] = (cut(ev_speed)[:, None] * (an[:, sp] + 1) - 1).clamp(-1, 1)
             cap_n = (cut(v_cap) / v_max * 2 - 1)[:, None]
-            an[:, -2:] = torch.where(cut(follow)[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
+            an[:, sp] = torch.where(cut(follow)[:, None], torch.minimum(an[:, sp], cap_n), an[:, sp])
             return teacher.project_rows(an, rows, self.sim.state, self.sim.P, v_max, spec,
                                         plan_speed=self._tracker_plan_speed())
         if self.act_dim == 2:
@@ -2145,11 +2147,12 @@ class F1VecEnv:
             v = torch.where(follow, torch.minimum(v, v_cap), v)
             return self.teacher_action_to_normalized(torch.stack([cmd[:, 0], v], 1))
         an = self.teacher_label(teacher, offset=ev_off)
-        an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
+        sp = self.plan_layout.speed
+        an = an.clone(); an[:, sp] = ((an[:, sp] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
         if ev_speed is not None:                             # same scaling in the normalized plan speeds
-            an[:, -2:] = (ev_speed[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
+            an[:, sp] = (ev_speed[:, None] * (an[:, sp] + 1) - 1).clamp(-1, 1)
         cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
-        an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
+        an[:, sp] = torch.where(follow[:, None], torch.minimum(an[:, sp], cap_n), an[:, sp])
         # Scripted pace/events can replace the certified endpoints (including
         # speed multipliers above one). Certify the final teacher plan again;
         # policy-driven rows and their controller are unchanged.
@@ -3417,6 +3420,14 @@ class F1VecEnv:
     def teacher_action_to_normalized(self, cmd: torch.Tensor) -> torch.Tensor:
         """(steer [rad], speed [m/s]) -> policy action in [-1, 1] (direct action space)."""
         return torch.stack([cmd[:, 0] / self.s_max, cmd[:, 1] / self.ecfg.v_max_policy * 2 - 1], 1).clamp(-1, 1)
+
+    @property
+    def plan_layout(self):
+        """Which columns of this env's plans are path and which speed: `mpc.plan_layout` of the spec
+        its tracker decodes with. Read by every place that scales or sets a plan's speed -- "linear"
+        and "wp4" are both 8 wide, so a positional slice would scale the wrong numbers without any
+        shape complaining. Plan mode only."""
+        return _plan_layout(self.tracker.spec)
 
     def _tracker_plan_speed(self) -> torch.Tensor:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""

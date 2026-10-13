@@ -159,12 +159,12 @@ class ControllerNode(Node):
         # adds the geometry layer: a local occupancy built from this scan alone (no map), and the
         # plan bent and slowed until it keeps `clearance_margin` from anything the scanner saw.
         self.controller_arm = str(p("controller"))
-        from f1sim.mpc import act_dim as _act_dim
-        if _act_dim(self.contract["speed_mode"]) != 8:
+        from f1sim.mpc import PLAN_WIRE_DIM, act_dim as _act_dim
+        if _act_dim(self.contract["speed_mode"]) != PLAN_WIRE_DIM:
             raise ValueError(
                 f"the checkpoint's plans are '{self.contract['speed_mode']}' with "
                 f"{_act_dim(self.contract['speed_mode'])} numbers, and f1sim_interfaces/Plan carries a "
-                f"fixed 8; the message has to grow before this checkpoint can drive the car")
+                f"fixed {PLAN_WIRE_DIM}; the message has to grow before this checkpoint can drive the car")
         if self.contract["speed_mode"] != "linear" and self.controller_arm != "legacy":
             raise ValueError(
                 f"the checkpoint's plans are '{self.contract['speed_mode']}' (a speed profile), and the "
@@ -236,7 +236,7 @@ class ControllerNode(Node):
         self.create_timer(max(0.002, float(p("watchdog_period"))), self.on_watchdog)
 
         # Warm the tracker's solver (and, on CUDA, its compiled graph) before anything drives.
-        self.tracker(torch.zeros(1, 8, device=self.device), torch.zeros(1, device=self.device),
+        self.tracker(torch.zeros(1, PLAN_WIRE_DIM, device=self.device), torch.zeros(1, device=self.device),
                      torch.tensor([self.speed_cap], device=self.device), None, delay=self.delay)
         self.tracker.reset(torch.zeros(1, dtype=torch.long, device=self.device))
         if self.clearance is not None:

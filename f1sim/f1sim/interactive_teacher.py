@@ -42,7 +42,7 @@ from typing import Optional, Sequence
 import torch
 
 from .row_planning import RowPlanning
-from .mpc import ACT_DIM, N_KNOTS, PlanSpec, decode, reference
+from .mpc import PlanSpec, decode, plan_layout, reference
 from .teacher import RacelineTeacher, plan_geometry_speed
 
 #: Lateral offsets [m left of the raceline] the candidate family spans. Symmetric, and wide enough
@@ -53,7 +53,7 @@ from .teacher import RacelineTeacher, plan_geometry_speed
 #: one as fits.
 DEFAULT_OFFSETS = (-0.6, -0.3, 0.0, 0.3, 0.6)
 
-#: Multipliers on the plan's two speed targets. 1.0 is the raceline teacher's own plan, 0.8 is
+#: Multipliers on the plan's speed targets. 1.0 is the raceline teacher's own plan, 0.8 is
 #: following, 0.55 and 0.3 are braking -- the candidate a car that has stopped in the lane has to
 #: make winnable, because the alternative at 8 m/s is a rear-end the cost function cannot avoid by
 #: steering alone.
@@ -310,8 +310,9 @@ class InteractiveTeacher(RowPlanning):
         The offsets go through `RacelineTeacher.plan_action` itself, on one (n_off * B) tile, so
         each candidate IS the raceline teacher's plan through the offset line -- lane clamp,
         understeer, latency compensation and all -- rather than a reimplementation that would drift
-        away from it. The speeds are then a scaling of the plan's two normalized speed targets,
-        which is the same arithmetic `gym_env._opponent_actions` uses for `opp_scale`, and costs
+        away from it. The speeds are then a scaling of the plan's normalized speed targets
+        (`mpc.plan_layout(spec).speed`), which is the same arithmetic `gym_env._opponent_actions` uses
+        for `opp_scale`, and costs
         nothing: the path is unchanged, the profile along it is not.
 
         `cand_iters` is the Gauss-Newton budget per candidate. The fit starts from the pure-pursuit
@@ -345,14 +346,16 @@ class InteractiveTeacher(RowPlanning):
         # arrive already carrying "and slow down" and the argmin could never separate the two. The
         # speed the family starts from is therefore the ON-LINE plan's, for every offset.
         i0 = self.i0
-        a = torch.cat([a[..., :-2], a[i0:i0 + 1, :, -2:].expand(n_off, B, 2)], 2)
+        sp = plan_layout(spec).speed
+        a = torch.cat([a[..., :sp.start], a[i0:i0 + 1, :, sp].expand(n_off, B, sp.stop - sp.start),
+                       a[..., sp.stop:]], 2)
         out = a[None].expand(n_spd, n_off, B, a.shape[2]).clone()
         sc = self.speeds.view(n_spd, 1, 1, 1)
-        out[..., -2:] = ((out[..., -2:] + 1.0) * sc - 1.0).clamp(-1.0, 1.0)
+        out[..., sp] = ((out[..., sp] + 1.0) * sc - 1.0).clamp(-1.0, 1.0)
         # offset-major so that a choice index reads as (offset, speed) without a stride argument
         out = out.permute(1, 0, 2, 3).reshape(n_off * n_spd, B, a.shape[2])
         brake = out[self.base_index:self.base_index + 1].clone()
-        brake[..., -2:] = -1.0
+        brake[..., sp] = -1.0
         evade = self._evasion_candidates(out[self.base_index], state, P, v_max, spec, plan_speed)
         # Preserve every regular index and the automatic raceline-brake index.
         out = torch.cat([out, brake, evade], 0)
@@ -397,11 +400,12 @@ class InteractiveTeacher(RowPlanning):
             signs = self._evade_signs = state.new_tensor([1., 1., -1., -1.])
         # The first two knots provide immediate authority; later knots retain
         # the existing route, avoiding a second long-horizon path optimizer.
-        fade = (1 - torch.arange(N_KNOTS, device=state.device, dtype=state.dtype) / 2).clamp_min(0)
-        out[..., :N_KNOTS] = base[None, :, :N_KNOTS] * (1 - fade) + signs[:, None, None] * limit[None, :, None] * fade
+        lay = plan_layout(spec)
+        fade = (1 - torch.arange(lay.n_path, device=state.device, dtype=state.dtype) / 2).clamp_min(0)
+        out[..., lay.path] = base[None, :, lay.path] * (1 - fade) + signs[:, None, None] * limit[None, :, None] * fade
         coast = (2 * speed / v_max - 1).clamp(-1, 1)
         targets = torch.stack((coast, -torch.ones_like(coast), coast, -torch.ones_like(coast)))
-        out[..., -2:] = targets[..., None]
+        out[..., lay.speed] = targets[..., None]
         return out
 
     def horizon_times(self, spec: PlanSpec) -> torch.Tensor:

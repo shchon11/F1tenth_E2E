@@ -612,7 +612,7 @@ class GripMPC:
                  self.last_diagnostics["wheel_feedback_fault"] | self.last_diagnostics["mu_input_fault"])
         self.last_diagnostics["input_fault"].copy_(fault)
         stop = torch.zeros_like(action)
-        stop[:, _mpc.N_KNOTS:] = -1
+        stop[:, _mpc.plan_layout(self.tracker.spec).speed] = -1
         safe_action = torch.where(fault[:, None], stop, action)
         safe_cap = torch.where(fault, torch.zeros_like(speed_cap), speed_cap)
         return safe_action, speed, safe_cap, yaw, latency

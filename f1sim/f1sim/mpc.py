@@ -12,7 +12,10 @@ plan is re-issued every step in the body frame, so the real car runs exactly the
 
 Why: the plan is a smooth, actuator-independent action space (easier exploration, the tracker
 absorbs servo calibration / latency), the tracker's model makes the sim-to-real step explicit,
-and the plan itself is a safety hook (it can be checked against the scan before execution)."""
+and the plan itself is a safety hook (it can be checked against the scan before execution).
+
+What the numbers of a plan mean -- the layout above is the first one; today's linear plan has six
+knots over 1.5 s -- is the speed mode's (`SPEED_MODES`), and which column is which is `plan_layout`'s."""
 from __future__ import annotations
 
 import math
@@ -64,12 +67,91 @@ XI = torch.linspace(0.0, 1.0, N_KNOTS)
 #:             "position every t seconds" convention says anyway.
 SPEED_MODES = ("linear", "envelope", "knots", "budget", "timed", "tspeed")
 N_ACC = 4                         # acceleration knots over the plan's horizon_s (0.5 s apart at 1.5 s)
+#: [f1sim_interfaces/Plan] The plan on the wire between policy_node and controller_node is a fixed
+#: float32[8] -- whatever the speed mode, which is why the width can never say what a plan means.
+PLAN_WIRE_DIM = 8
+
+
+@dataclass(frozen=True)
+class PlanLayout:
+    """Where each part of a plan action lives under one speed mode (`plan_layout`).
+
+    `path` is the curvature columns. `speed` is the columns that say how fast: what a speed scale
+    multiplies through (a + 1) * s - 1, what a stop sets to -1 and what a speed loss reads in m/s.
+    `grip` is the column of the grip budget a_hat, for the modes that carry one.
+
+    It exists because "linear" and "wp4" are both 8 wide: a slice written for one layout -- the last
+    two numbers as the speeds, the first six as the path -- is a plausible-looking wrong plan in the
+    other, never a shape error. Every layer that addresses part of a plan reads it here."""
+    speed_mode: str
+    act_dim: int
+    path: slice
+    speed: slice
+    grip: Optional[int] = None
+
+    @property
+    def n_path(self) -> int:
+        return self.path.stop - self.path.start
+
+    @property
+    def n_speed(self) -> int:
+        return self.speed.stop - self.speed.start
+
+    @property
+    def other(self):
+        """Every column that is not a speed, in order: a slice when they are one block (the path,
+        and the grip budget where it sits before the speeds), else a list of column indices
+        ("timed" / "tspeed", whose grip budget comes after them)."""
+        if self.speed.stop == self.act_dim:
+            return slice(0, self.speed.start)
+        return [i for i in range(self.act_dim) if not self.speed.start <= i < self.speed.stop]
+
+
+#: The speed columns of the older profile modes, as chosen here (2026-10-14). Before this table every
+#: layer took the LAST TWO numbers as "the speeds", which was right for linear, and for budget's
+#: (v_end, v_cap) -- its a_hat is the floor's, "never a way to slow down" -- and envelope's
+#: (a_hat, v_end), where a_hat is how that mode says "slower" at all. It was wrong for the wide modes:
+#: knots scaled two of its six speeds, timed and tspeed their last knot and the grip budget. Those now
+#: scale every speed knot (timed: every acceleration knot, so a scale below one turns cruising into
+#: braking and a stop is full braking at every knot).
+_LAYOUTS = {mode: PlanLayout(mode, width, slice(*path), slice(*speed), grip) for mode, width, path, speed, grip in (
+    # mode       width                  path            speed                        grip budget
+    ("linear",   N_KNOTS + 2,           (0, N_KNOTS),   (N_KNOTS, N_KNOTS + 2),      None),           # v0, v1
+    ("envelope", N_KNOTS + 2,           (0, N_KNOTS),   (N_KNOTS, N_KNOTS + 2),      N_KNOTS),        # a_hat, v_end
+    ("knots",    2 * N_KNOTS,           (0, N_KNOTS),   (N_KNOTS, 2 * N_KNOTS),      None),
+    ("budget",   N_KNOTS + 3,           (0, N_KNOTS),   (N_KNOTS + 1, N_KNOTS + 3),  N_KNOTS),        # v_end, v_cap
+    ("timed",    N_KNOTS + N_ACC + 1,   (0, N_KNOTS),   (N_KNOTS, N_KNOTS + N_ACC),  N_KNOTS + N_ACC),
+    ("tspeed",   N_KNOTS + N_ACC + 1,   (0, N_KNOTS),   (N_KNOTS, N_KNOTS + N_ACC),  N_KNOTS + N_ACC),
+)}
+
+
+def plan_layout(source=None) -> PlanLayout:
+    """The layout of a plan action under `source`: a speed mode, a `PlanSpec`, or a plan-output
+    contract (`contract_of`, `learn.common.plan_output_of`). None is the plain contract, "linear".
+
+    A dict has to be a contract, i.e. carry "speed_mode": a checkpoint's raw `extra` keeps it under
+    "experiment" in older runs, and reading that as "linear" would be the silent misreading this
+    function exists to prevent."""
+    if source is None:
+        mode = "linear"
+    elif isinstance(source, str):
+        mode = source
+    elif isinstance(source, dict):
+        if "speed_mode" not in source:
+            raise ValueError("plan_layout reads a plan-output contract; pass contract_of(extra), not a raw extra block")
+        mode = str(source["speed_mode"])
+    else:
+        mode = str(source.speed_mode)
+    lay = _LAYOUTS.get(mode)
+    if lay is None:
+        raise ValueError(f"speed_mode must be one of {SPEED_MODES}, got {mode!r}")
+    return lay
 
 
 def act_dim(speed_mode: str = "linear") -> int:
     if speed_mode not in SPEED_MODES:
         raise ValueError(f"speed_mode must be one of {SPEED_MODES}, got {speed_mode!r}")
-    return N_KNOTS + {"knots": N_KNOTS, "budget": 3, "timed": N_ACC + 1, "tspeed": N_ACC + 1}.get(speed_mode, 2)
+    return plan_layout(speed_mode).act_dim
 
 
 @dataclass
@@ -239,10 +321,11 @@ def decode(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: 
         raise ValueError(f"mpc.decode reads the 'linear' speed dimensions; this plan is {spec.speed_mode!r} "
                          f"-- use decode_profile")
     a = action.clamp(-1.0, 1.0)
+    lay = _LAYOUTS["linear"]
     Lp = plan_length(v_meas, spec)
-    k = a[:, :N_KNOTS] * kappa_scale(v_meas, spec)
-    v0 = torch.minimum((a[:, N_KNOTS] + 1.0) * 0.5 * v_max, speed_cap)
-    v1 = torch.minimum((a[:, N_KNOTS + 1] + 1.0) * 0.5 * v_max, speed_cap)
+    k = a[:, lay.path] * kappa_scale(v_meas, spec)
+    v0 = torch.minimum((a[:, lay.speed.start] + 1.0) * 0.5 * v_max, speed_cap)
+    v1 = torch.minimum((a[:, lay.speed.start + 1] + 1.0) * 0.5 * v_max, speed_cap)
     return k, Lp, v0, v1
 
 
@@ -301,8 +384,9 @@ def _decode_timed(a: torch.Tensor, k: torch.Tensor, Lp: torch.Tensor, v0: torch.
     arc grid (B, n_profile). Limits are instantaneous only (see SPEED_MODES)."""
     n = spec.n_profile
     _, _, _, s_path, kap = path_points(k, Lp, n=n, return_kappa=True)
-    acc_n = a[:, N_KNOTS:N_KNOTS + N_ACC]
-    a_hat = ((a[:, N_KNOTS + N_ACC] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)
+    lay = _LAYOUTS[spec.speed_mode]
+    acc_n = a[:, lay.speed]
+    a_hat = ((a[:, lay.grip] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)
     acc_k = torch.where(acc_n >= 0, acc_n * spec.a_drive_profile, acc_n * spec.a_brake)
     tspeed = spec.speed_mode == "tspeed"
     if tspeed:
@@ -366,12 +450,13 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
     The profile is on `path_points`' own uniform arc grid, which is also the grid `reference`
     interpolates a `v_limit` on -- so it is handed to `reference` as one and nothing else changes."""
     a = action.clamp(-1.0, 1.0)
+    lay = plan_layout(spec)
     Lp = plan_length(v_meas, spec)
-    k = a[:, :N_KNOTS] * kappa_scale(v_meas, spec)
+    k = a[:, lay.path] * kappa_scale(v_meas, spec)
     n = spec.n_profile
     cap = speed_cap[:, None]
     if spec.speed_mode == "knots":
-        vk = torch.minimum((a[:, N_KNOTS:2 * N_KNOTS] + 1.0) * 0.5 * v_max, cap)
+        vk = torch.minimum((a[:, lay.speed] + 1.0) * 0.5 * v_max, cap)
         pos = torch.linspace(0.0, 1.0, n, device=a.device, dtype=a.dtype)[None] * (N_KNOTS - 1)
         i0 = pos.floor().clamp(max=N_KNOTS - 2).long(); w = pos - i0.to(a.dtype)
         i0 = i0.expand(a.shape[0], n)
@@ -380,12 +465,13 @@ def decode_profile(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, spe
         return k, Lp, _decode_timed(a, k, Lp, v_meas if v_start is None else v_start, speed_cap, spec, v_max)
     if spec.speed_mode not in ("envelope", "budget"):
         raise ValueError(f"decode_profile is for the 'envelope', 'budget', 'knots' and 'timed' modes, got {spec.speed_mode!r}")
-    a_hat = ((a[:, N_KNOTS] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)[:, None]
+    # both modes: the grip budget, then the end speed, then (budget) the ceiling
+    a_hat = ((a[:, lay.grip] + 1.0) * 0.5 * spec.a_hat_max).clamp_min(spec.a_hat_min)[:, None]
     if spec.speed_mode == "budget":
         # the ceiling bounds every sample of the profile, so it is folded into the cap they all see
-        cap = torch.minimum(cap, ((a[:, N_KNOTS + 2] + 1.0) * 0.5 * v_max)[:, None])
+        cap = torch.minimum(cap, ((a[:, lay.grip + 2] + 1.0) * 0.5 * v_max)[:, None])
         speed_cap = cap[:, 0]
-    v_end = torch.minimum((a[:, N_KNOTS + 1] + 1.0) * 0.5 * v_max, speed_cap)
+    v_end = torch.minimum((a[:, lay.grip + 1] + 1.0) * 0.5 * v_max, speed_cap)
     _, _, _, _, kap = path_points(k, Lp, n=n, return_kappa=True)
     g = kap.abs().clamp_min(1e-3) / a_hat                                   # 1 / v_curve^2
     ds = (Lp / (n - 1)).clamp_min(1e-3)
