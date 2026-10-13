@@ -220,9 +220,8 @@ def test_a_wp4_plan_is_never_read_as_a_linear_one():
     with pytest.raises(ValueError, match="wp4"):
         mpc.solve(a, vm, cap, torch.zeros(2), torch.full((2,), 0.035), torch.zeros(2, 2), torch.zeros(2, 12, 2),
                   SPEC, 0.33, 0.42, V_MAX, v_limit=torch.ones(2, 25))       # an arm's speed limit
-    from f1sim.teacher import RacelineTeacher
-    with pytest.raises(NotImplementedError, match="wp4"):
-        RacelineTeacher.plan_action(None, torch.zeros(2, 8), spec=SPEC)
+    # The raceline teacher used to refuse a wp4 spec here; it now encodes one itself
+    # (`RacelineTeacher._plan_wp4`, tests/test_wp4_teachers.py).
 
 
 def test_the_wp4_solve_traces_as_one_graph():

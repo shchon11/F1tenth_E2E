@@ -734,17 +734,22 @@ WP_FIT_POINTS = 8
 
 
 def fit_wp4(k: torch.Tensor, tx: torch.Tensor, ty: torch.Tensor, L: torch.Tensor, spec: PlanSpec, iters: int = 8,
-            k_lim=None) -> torch.Tensor:
+            k_lim=None, ridge: float = 0.0) -> torch.Tensor:
     """Gauss-Newton fit of the WP_K waypoint curvatures (B, WP_K) [1/m] so the wp4 path of length `L`
     passes through the body-frame points (tx, ty) (B, WP_FIT_POINTS) at fractions 1/M .. M/M of L.
 
-    `k` is the initial guess. Unlike `teacher.fit_knots` there is no ridge back towards it: the
-    target here is a path the caller already chose (a teacher's plan), not a raceline to be blended
-    with pure pursuit, so a path the format can hold comes back exactly. A line search over the step
-    length never accepts a worse fit. Measured from guesses 0.3 1/m off (64 random plans, L 1-4.8 m):
-    the worst knot error is 2.1 / 1e-3 / 8e-6 1/m after 4 / 6 / 8 iterations, hence 8. `k_lim`
-    bounds the curvature (default: what an action of +-1 means here, so the fit never lands where
-    `encode_wp4` would clip it)."""
+    `k` is the initial guess. By default there is no ridge back towards it: when the target is a
+    path the caller already chose (a teacher's plan, `wp4_refit`), a path the format can hold comes
+    back exactly. A line search over the step length never accepts a worse fit. Measured from
+    guesses 0.3 1/m off (64 random plans, L 1-4.8 m): the worst knot error is 2.1 / 1e-3 / 8e-6 1/m
+    after 4 / 6 / 8 iterations, hence 8. `k_lim` bounds the curvature (default: what an action of
+    +-1 means here, so the fit never lands where `encode_wp4` would clip it).
+
+    `ridge` > 0 pulls the fit towards the initial guess with that weight [m^2 per (1/m)^2] -- the
+    raceline teacher's own form (`teacher.fit_knots`, 0.3), for a fit straight to the line points
+    whose guess is the pure-pursuit / line-curvature blend: an off-line car then neither snaps to
+    the line at full lock nor drifts beside it. A Python constant, so ridge 0 is the fit above
+    instruction for instruction."""
     B, K = k.shape
     M = tx.shape[1]
     if spec.wp_grid % M:
@@ -762,18 +767,25 @@ def fit_wp4(k: torch.Tensor, tx: torch.Tensor, ty: torch.Tensor, L: torch.Tensor
     LJ = L[:, None].expand(-1, K + 1).reshape(-1)
     LT = L[:, None].expand(-1, fractions.shape[0]).reshape(-1)
     rows = torch.arange(B, device=dev)
+    k_init = k
     for _ in range(iters):                    # Python constant: unrolls, graph-safe
         x, y, _, _, _ = wp4_path((k[:, None, :] + perturb[None]).reshape(-1, K), LJ, spec, extend=1.0)
         r = torch.cat([x[:, si].view(B, K + 1, M) - tx[:, None], y[:, si].view(B, K + 1, M) - ty[:, None]], 2)
         J = ((r[:, 1:] - r[:, :1]) / eps).transpose(1, 2)                    # (B, 2M, K)
         A = J.transpose(1, 2) @ J
         A = A + (lam * A.diagonal(dim1=1, dim2=2).mean(1)[:, None, None] + 1e-9) * basis
-        step = torch.linalg.solve_ex(A, J.transpose(1, 2) @ r[:, 0, :, None])[0].squeeze(-1)
+        g = J.transpose(1, 2) @ r[:, 0, :, None]
+        if ridge:                             # least squares of [r; sqrt(ridge) (k - k_init)]
+            A = A + ridge * basis
+            g = g + ridge * (k - k_init)[..., None]
+        step = torch.linalg.solve_ex(A, g)[0].squeeze(-1)
         trials = k[:, None] - fractions[None, :, None] * step[:, None]
         if lim is not None:
             trials = torch.maximum(torch.minimum(trials, lim[:, None, None]), -lim[:, None, None])
         px, py, _, _, _ = wp4_path(trials.reshape(-1, K), LT, spec, extend=1.0)
         cost = ((px[:, si].view(B, -1, M) - tx[:, None]).square() + (py[:, si].view(B, -1, M) - ty[:, None]).square()).sum(-1)
+        if ridge:
+            cost = cost + ridge * (trials - k_init[:, None]).square().sum(-1)
         k = trials[rows, cost.argmin(1)]
     return k
 
@@ -807,6 +819,24 @@ def wp4_refit(k_src: torch.Tensor, Lp_src: torch.Tensor, v_meas: torch.Tensor, s
     if k_lim is None and spec.kappa_mode == "absolute":
         k0 = k0.clamp(-spec.kappa_max, spec.kappa_max)
     return fit_wp4(k0, x[:, si], y[:, si], L, spec, iters=iters, k_lim=k_lim)
+
+
+def wp4_braking(v_meas: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
+    """(B, WP_K) [m/s] the waypoint speeds of braking from the measured speed at the tracker's own
+    a_brake, v_k = sqrt(max(v^2 - 2 a_brake s_k, 0)): what "stop" is as a wp4 plan.
+
+    Not every speed at -1 (output-format design 5). That asks to be standing at s_1, 0.15 s from
+    now -- 40 m/s^2 from 6 m/s -- which no decode turns into a profile the car can follow: v(0) is the
+    measured speed and the backward pass runs from v_4 back to v_1 only. As a label it is four numbers
+    pinned to the corner of the box, where exploration noise is clipped one way.
+
+    It is not free. The tracker follows this curve with its usual speed lag (q_v 0.4, design 8): from
+    4.9 m/s (255 states visited on ICCAS) it plans -2.9 m/s^2 at once and ends its window at 2.8 m/s,
+    where four -1s -- a zero speed target pulling on every step, like the linear plan's v0 = v1 = 0
+    -- plan -4.9 and end at 2.1 (v_cmd 0.12 m/s lower). The stop that is drawn is the softer one."""
+    L = plan_length(v_meas, spec)
+    s = L[:, None] * torch.arange(1, WP_K + 1, device=v_meas.device, dtype=v_meas.dtype) / WP_K
+    return (v_meas.abs()[:, None].square() - 2.0 * spec.a_brake * s).clamp_min(0.0).sqrt()
 
 
 def _dyn(z, u, spec: PlanSpec, wb: float):

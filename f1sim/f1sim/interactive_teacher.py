@@ -332,6 +332,7 @@ class InteractiveTeacher(RowPlanning):
         scale = self.base.speed_scale
         g.speed_scale = rep(scale) if torch.is_tensor(scale) and scale.shape[:1] == (B,) else scale
         g.label_grip = self.base.label_grip
+        g.wp4_path = self.base.wp4_path             # a copy taken at construction would keep the old recipe
         codes = self.base.label_grip_codes
         g.label_grip_codes = None if codes is None else rep(codes)
         g.offset_limit = self.base.offset_limit if self.lane_clamp else None
@@ -355,7 +356,7 @@ class InteractiveTeacher(RowPlanning):
         # offset-major so that a choice index reads as (offset, speed) without a stride argument
         out = out.permute(1, 0, 2, 3).reshape(n_off * n_spd, B, a.shape[2])
         brake = out[self.base_index:self.base_index + 1].clone()
-        brake[..., sp] = -1.0
+        brake[..., sp] = self._stop_speeds(state, v_max, spec, plan_speed)
         evade = self._evasion_candidates(out[self.base_index], state, P, v_max, spec, plan_speed)
         # Preserve every regular index and the automatic raceline-brake index.
         out = torch.cat([out, brake, evade], 0)
@@ -404,9 +405,27 @@ class InteractiveTeacher(RowPlanning):
         fade = (1 - torch.arange(lay.n_path, device=state.device, dtype=state.dtype) / 2).clamp_min(0)
         out[..., lay.path] = base[None, :, lay.path] * (1 - fade) + signs[:, None, None] * limit[None, :, None] * fade
         coast = (2 * speed / v_max - 1).clamp(-1, 1)
+        if lay.speed_mode == "wp4":
+            stop = self._stop_speeds(state, v_max, spec, plan_speed)                    # (B, WP_K)
+            out[..., lay.speed] = torch.stack((coast[:, None].expand_as(stop), stop,
+                                               coast[:, None].expand_as(stop), stop))
+            return out
         targets = torch.stack((coast, -torch.ones_like(coast), coast, -torch.ones_like(coast)))
         out[..., lay.speed] = targets[..., None]
         return out
+
+    @staticmethod
+    def _stop_speeds(state, v_max, spec, plan_speed=None):
+        """The speed columns of "stop", normalized: -1 for the linear plan (v0 = v1 = 0, which its
+        tracker brakes through at a_brake), and for a wp4 plan the braking curve at the tracker's
+        a_brake from the speed the plan is laid out with (`mpc.wp4_braking`) -- -1 there would ask
+        to be standing 0.15 s from now, a label of four saturated numbers."""
+        lay = plan_layout(spec)
+        if lay.speed_mode != "wp4":
+            return -1.0
+        from .mpc import wp4_braking
+        v = wp4_braking(plan_geometry_speed(state, plan_speed), spec)
+        return (v / v_max * 2 - 1).clamp(-1, 1)
 
     def horizon_times(self, spec: PlanSpec) -> torch.Tensor:
         """The instants the trajectory and the opponents' futures are both sampled at [s]."""
@@ -436,6 +455,12 @@ class InteractiveTeacher(RowPlanning):
         if spec.speed_mode == "linear":
             k, Lp, v0, v1 = decode(flat, v_meas, v_max, cap, spec)
             ref = reference(k, Lp, v0, v1, replace(spec, N=H), v_meas)          # (K*B, H+1, 4)
+        elif spec.speed_mode == "wp4":
+            # the wp4 tracker's own reference (`mpc.solve`'s wp4 branch), walked over the scoring
+            # horizon instead of the tracker's window: past its 0.6 s the walk reads the plan's
+            # extension (kappa_4, v_4 held), not a line the plan never drew
+            from .mpc import wp4_reference
+            ref = wp4_reference(flat, v_meas, v_max, cap, replace(spec, N=H))
         else:
             # a profile-mode plan: the tracker follows its profile as a speed limit (`mpc.solve`),
             # and the same reference is what gets scored here

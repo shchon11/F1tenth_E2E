@@ -541,6 +541,7 @@ class LayoutLineTeacher:
     def _sync(self) -> None:
         b, l_ = self.base, self.lines
         l_.speed_scale, l_.label_grip, l_.label_grip_codes = b.speed_scale, b.label_grip, b.label_grip_codes
+        l_.wp4_path = b.wp4_path        # how a "wp4" label's path is made: the base teacher's choice
         l_.offset_limit = None          # an offset limit is per raceline point of the base line
 
     def project(self, xy, tid=None):

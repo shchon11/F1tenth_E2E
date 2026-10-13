@@ -265,6 +265,7 @@ class RolloutTeacher:
             v = getattr(self.base, k, None)
             setattr(self.base_S, k, v.repeat(K, *([1] * (v.dim() - 1))) if torch.is_tensor(v) and v.shape[:1] == (B,) else v)
         self.base_S.label_grip = self.base.label_grip
+        self.base_S.wp4_path = self.base.wp4_path
         off = self.c_off.repeat_interleave(B)            # shadow row k*B + i drives candidate k
         spd = self.c_spd.repeat_interleave(B)
         hit = torch.zeros(K * B, dtype=torch.bool, device=self.device)
@@ -327,6 +328,7 @@ class RolloutTeacher:
             v = getattr(self.base, n, None)
             setattr(self.base_S, n, v.repeat(K, *([1] * (v.dim() - 1))) if torch.is_tensor(v) and v.shape[:1] == (B,) else v)
         self.base_S.label_grip = self.base.label_grip
+        self.base_S.wp4_path = self.base.wp4_path
         off = self.c_off.repeat_interleave(B); spd = self.c_spd.repeat_interleave(B)
         # lateral_slow=False: no off-line slowdown in the plans (a 'transform' maneuver head's plain plan -- slowing down is
         # the candidate CHOICE's job there; with it, a student that executes offsets learned a plain plan 0.64x slow)
