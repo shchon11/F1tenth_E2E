@@ -217,6 +217,18 @@ class EnvConfig:
     # It is an option and not the default on purpose: it changes what "collisions per km" counts,
     # so a run under it is not comparable with one under "terminate" without saying so.
     collision_mode: str = "terminate"
+    # What the `collision` reward component (and so `--lagrange wall=`) counts under "soft". False: walls and
+    # props only, as `--lagrange` documents. True: also every car contact, which is how every run before
+    # 2026-10-13 was trained -- the simulator ORs the car flag into its collision flag, so a car contact was
+    # charged at the wall's multiplier on top of the car's (the 10-13 audit: 27-52 % of the training "wall"
+    # rate was cars). Turning the double charge off halves a car contact's price unless the car multiplier
+    # takes over the wall's share.
+    collision_counts_cars: bool = False
+    # Whether a car contact's charge is decided once, when it begins. The rule (`car_contact_charge`) exempts
+    # the car that was clearly in front; read every step, cars that pass through each other (soft mode has no
+    # car-car response) swap the order within 1-19 steps and the exempt car is charged anyway (96/96 exempt
+    # at the first step, then charged). True holds the first step's verdict for the whole contact.
+    car_charge_latch: bool = True
     # Whether a struck obstacle is shoved or is a wall with a crate's shape. Off is every run
     # before this existed. On, each prop carries the mass of what it is
     # (`procedural_obstacles.STYLE_MASS`: a cardboard box 1.2 kg, a wooden crate 10, a steel drum
@@ -926,6 +938,10 @@ class F1VecEnv:
         self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
         #: Whether each car was in contact last step, so a soft collision is charged on its onset.
         self._was_touching = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self._was_touching_wall = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: Car contacts: in contact last step, and whether the contact under way is charged (`car_charge_latch`).
+        self._car_prev = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self._car_resp = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self._replay = None
         if self.ecfg.replay_contacts > 0:
             if self.M != 2:
@@ -1890,6 +1906,8 @@ class F1VecEnv:
             # remembering a track its car is no longer on.
             self.pool.reset(ids)
         self._was_touching[ids] = False                             # a fresh car is touching nothing
+        self._was_touching_wall[ids] = False
+        self._car_prev[ids] = False; self._car_resp[ids] = False
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
@@ -1981,7 +1999,7 @@ class F1VecEnv:
         for target, scan in zip((current.scan, current.scan_true, current.scan_type), scans):
             target[ids] = scan[ids]
         for target in (current.attitude, current.imu, current.imu_att, current.collision,
-                       current.progress, current.lap, current.car_collision):
+                       current.progress, current.lap, current.car_collision, current.wall_collision):
             if target is not None:
                 target[ids] = 0
         return current
@@ -2230,6 +2248,21 @@ class F1VecEnv:
         responsible = dn > -0.6
         return car_hit * responsible.to(car_hit.dtype)
 
+    def _car_charge(self, s: torch.Tensor, tid: torch.Tensor, car_hit: torch.Tensor) -> torch.Tensor:
+        """Per car, 1 while a contact it is charged for lasts. `car_contact_charge` decides who is charged; with
+        `car_charge_latch` it decides once, at the step the contact begins, and the verdict holds until the
+        cars separate."""
+        if self.sim.other_idx is None:
+            return car_hit
+        if not self.ecfg.car_charge_latch:
+            return self.car_contact_charge(s, tid, car_hit)
+        hit = car_hit > 0
+        onset = hit & ~self._car_prev
+        verdict = self.car_contact_charge(s, tid, torch.ones_like(car_hit)) > 0
+        self._car_resp = torch.where(onset, verdict, self._car_resp) & hit
+        self._car_prev = hit
+        return self._car_resp.to(car_hit.dtype)
+
     # ------------------------------------------------------------------ API
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
@@ -2333,6 +2366,13 @@ class F1VecEnv:
             self._was_touching = r.collision.clone()
             r.collision = edge
             self.ep_contacts += edge.to(self.ep_contacts.dtype)
+            if e.collision_counts_cars or r.wall_collision is None:
+                crash = edge
+            else:
+                crash = r.wall_collision & ~self._was_touching_wall
+                self._was_touching_wall = r.wall_collision.clone()
+        else:
+            crash = r.collision
         self._widen_clearance_to_props(r)
         if self.procedural is not None and e.movable_obstacles:
             # Whatever the contacts shoved this step now slides, and the floor takes it back down.
@@ -2344,9 +2384,10 @@ class F1VecEnv:
                    else torch.zeros_like(self.ep_return))
         if self._replay is not None:
             self._replay.record(self, car_hit > 0)
-        out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, r.collision, r.lap, a, steer_norm, self.prev_steer_norm,
+        car_charge = self._car_charge(r.s, self.sim.tid, car_hit)
+        out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, crash, r.lap, a, steer_norm, self.prev_steer_norm,
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap,
-                         plan_ref, self.lap_start_step, car_hit, self.gap_prev, self.gap_valid,
+                         plan_ref, self.lap_start_step, car_charge, self.gap_prev, self.gap_valid,
                          self.lead_steps, self.lead_paid,
                          self._plan_clearance(r.state, plan_ref), self.ep_limit)
         (self.scan_hist, steer_rate, reward, reward_components, self.act_hist, terminated, truncated,
@@ -2403,9 +2444,13 @@ class F1VecEnv:
                 # `terminated` is never set under soft, and an evaluation that counted it (or the
                 # episodes' `collided`) read every soft run as collision-free.
                 "contact_onset": r.collision.clone(),
+                # what the `collision` component charged this step: wall/prop onsets (or, with
+                # `collision_counts_cars`, every onset)
+                "wall_onset": crash.clone(),
                 "reward_components": dict(zip(REWARD_COMPONENT_KEYS, reward_components.unbind(1)))}
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
+            info["car_charge"] = car_charge
         if self.events is not None:
             # What each opponent is doing right now, for a viewer or a logger: event id (0 = none,
             # f1sim.opponent_events.EVENT_ID), seconds left, and the lateral offset it is holding.
@@ -2579,7 +2624,7 @@ class F1VecEnv:
             -e.reward_wrong_way * wrong_way,
             lap_bonus,
             torch.full_like(progress, e.reward_alive),
-            -e.reward_car_contact * (self.car_contact_charge(s, tid, car_hit) if self.sim.other_idx is not None else car_hit),
+            -e.reward_car_contact * car_hit,     # already the charge: `_car_charge` in step()
             e.reward_overtake * gap_gain,
             torch.zeros_like(progress),          # lap_time: filled in on the crossing, in step()
             -e.reward_car_proximity * car_prox * travelled,

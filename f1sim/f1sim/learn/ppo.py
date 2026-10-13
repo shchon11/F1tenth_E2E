@@ -390,6 +390,13 @@ def main():
     ap.add_argument("--gamma", type=float, default=0.99); ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2); ap.add_argument("--ent", type=float, default=0.0)
     ap.add_argument("--vf", type=float, default=0.5); ap.add_argument("--max-grad", type=float, default=0.5)
+    ap.add_argument("--clip-split", action="store_true",
+                    help="clip the actor's and the critic's gradients to --max-grad separately (2026-10-13 audit). "
+                         "One norm over both lets the critic -- norm 1.6k-31k under a contact multiplier of 300-1000 "
+                         "-- set the clip factor for the actor too, which leaves the actor's Adam step dominated by "
+                         "eps: a lambda-1000 continuation moved its actor by 1e-4 relative in 128 updates")
+    ap.add_argument("--adam-eps", type=float, default=1e-5,
+                    help="Adam's eps (1e-5, every run so far). With --clip-split, 1e-8 keeps eps out of the step")
     ap.add_argument("--sim-backend", default="compile", choices=("compile", "eager", "graphs"),
                     help="simulator runtime. 'compile' is the current default and what every run so "
                          "far used (torch.compile on the physics substep loop and the plan solver). "
@@ -759,6 +766,10 @@ def main():
                          "teacher-driven car to be a prop-aware kind (--opp-slots), because a "
                          "raceline-driven opponent cannot see a prop and its crashes would become "
                          "the collision rate")
+    ap.add_argument("--legacy-car-wall-charge", action="store_true",
+                    help="reproduce the contact accounting of every run before 2026-10-13: a car contact also "
+                         "counts as a wall/prop collision (charged at the wall multiplier too), and the "
+                         "car-behind exemption is re-read every step of a contact instead of at its start")
     ap.add_argument("--collision-mode", choices=["terminate", "soft"], default="terminate",
                     help="what a collision is. 'terminate' ends the episode, which is what every "
                          "number on record was measured under. 'soft' resolves the contact and "
@@ -814,7 +825,9 @@ def main():
     ap.add_argument("--lagrange", default="", metavar="NAME=PER_KM,...",
                     help="constrained PPO (2026-10-01): contact rates as constraints instead of hand-set penalty "
                          "weights. NAME is 'wall' (soft-contact onsets with walls and props, the collision "
-                         "component) or 'car' (car-contact onsets); PER_KM the target, in the evaluation's own unit. "
+                         "component; before 2026-10-13 it also counted every car contact, EnvConfig."
+                         "collision_counts_cars) or 'car' (onsets of the car contacts the learner is charged for; "
+                         "the exempt ones show as car_all); PER_KM the target, in the evaluation's own unit. "
                          "Each gets a multiplier updated by dual ascent after every rollout, lambda += lr * (rate - "
                          "target), and the step reward carries -lambda per contact in place of the fixed penalty. "
                          "Needs that component's own weight nonzero (--collision-penalty / --car-contact-penalty) so "
@@ -1053,6 +1066,8 @@ def main():
                                                               stagger_first_episode=a.collision_mode == "soft",
                                                               kind_mix_assign=a.kind_mix_assign,
                                                               movable_obstacles=a.movable_obstacles,
+                                                              collision_counts_cars=a.legacy_car_wall_charge,
+                                                              car_charge_latch=not a.legacy_car_wall_charge,
                                                               replay_contacts=a.replay_contacts,
                                                               reward_rear_end=a.rear_end_penalty,
                                                               reward_merge=a.merge_penalty,
@@ -1608,7 +1623,15 @@ def main():
               f"{a.fresh_lr_mult:g}x the lr")
     #: The flat parameter order of `opt` (group by group): what the saved moments are indexed by.
     opt_param_names = [n_ for n_, _ in base_np + fresh_np]
-    opt = torch.optim.Adam(opt_groups, lr=a.lr, eps=1e-5)
+    opt = torch.optim.Adam(opt_groups, lr=a.lr, eps=a.adam_eps)
+    #: --clip-split: the two parameter sets clipped one by one (every other tensor goes with the actor)
+    clip_sets = None
+    if a.clip_split:
+        crit = [p_ for n_, p_ in named_params if n_.startswith("critic.")]
+        act = [p_ for n_, p_ in named_params if not n_.startswith("critic.")]
+        if not crit:
+            raise SystemExit("--clip-split: this model has no 'critic.' parameters")
+        clip_sets = (act, crit)
     speed_freeze = SpeedRowFreeze(model) if a.adaptation == "speed" else None
     optimizer_restored = False
     # Adam's moments are part of where training got to. Dropping them on every resume restarts the
@@ -1696,6 +1719,8 @@ def main():
             print(f"optimizer state not restored ({exc}); starting Adam fresh")
     if same_stage_resume and not optimizer_restored:
         raise RuntimeError("adaptive same-stage resume requires the saved Adam state")
+    for g in opt.param_groups:
+        g["eps"] = a.adam_eps                 # a restored state dict brings the eps it was saved with
     # Resume the same W&B run across legs. Every --init here carries the whole network over, so the
     # curves belong to one training history: a fresh run per leg restarts the x axis at zero and the
     # only question worth asking of the charts -- is this better than before the change? -- stops
@@ -1780,6 +1805,11 @@ def main():
               flush=True)
     buf_reward_components = torch.zeros(T, B, len(REWARD_COMPONENT_KEYS), device=device)
     buf_prog = torch.zeros(T, B, device=device)                  # metres of progress per step (--lagrange rates)
+    # every car contact of the learner rows, charged or exempt: `--lagrange car=` sees only the charged ones,
+    # and "car_all" next to it is how much the exemption takes out
+    buf_car_hit = torch.zeros(T, B, device=device) if env.M > 1 else None
+    car_prev_row = torch.zeros(B, dtype=torch.bool, device=device)
+    car_all_rate = float("nan")
     # mixed opponents: a teacher-driven car's transitions sit in the buffer (its width is fixed) but
     # carry no weight in the loss -- its actions are the teacher's, not the policy's
     buf_mask = torch.ones(T, B, device=device)
@@ -2039,6 +2069,8 @@ def main():
                     buf_mask[t] = info["on_policy"][lid].float()
                 buf_reward_components[t] = torch.stack([info["reward_components"][key][lid] for key in REWARD_COMPONENT_KEYS], 1)
                 buf_prog[t] = info["progress"][lid]
+                if buf_car_hit is not None and "car_collision" in info:
+                    buf_car_hit[t] = info["car_collision"][lid].float()
                 ep_stats["lap_time"] += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
                 buf_final_val[t].zero_()
                 if "final" in info:
@@ -2112,6 +2144,19 @@ def main():
             with ac:
                 buf_val[T] = model.critic.step(scan[lid], pro[lid], priv_boot[lid],
                                                None if h_critic is None else h_critic[:, lid])[0].float()
+            # the reward without its contact terms, per policy step, and the metres per policy step: with the
+            # contact rates per km these give the objective at any multiplier, J = drive - sum(lam * rate * m / 1000)
+            ci_ = {key: index for index, key in enumerate(REWARD_COMPONENT_KEYS)}
+            drive_ = buf_rew - buf_reward_components[:, :, ci_["collision"]] - buf_reward_components[:, :, ci_["car_contact"]]
+            n_pol_ = buf_mask.sum().clamp_min(1.0)
+            drive_per_step = float((drive_ * buf_mask).sum() / n_pol_)
+            prog_per_step = float((buf_prog * buf_mask).sum() / n_pol_)
+            if buf_car_hit is not None:
+                touching = buf_car_hit > 0
+                car_on = touching & ~torch.cat([car_prev_row[None], touching[:-1]], 0)
+                car_prev_row = touching[-1].clone()
+                km_ = float((buf_prog.clamp_min(0) * buf_mask).sum()) / 1000.0
+                car_all_rate = float((car_on.float() * buf_mask).sum()) / max(km_, 1e-3)
             if lagrange:
                 # contacts this rollout (onsets, from the component and its own weight), the rate per km of
                 # the policy's own progress, the dual step, then the reward with the fixed penalty swapped
@@ -2259,8 +2304,14 @@ def main():
                 if last:
                     if speed_freeze is not None:
                         speed_freeze.before_step()
-                    gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.max_grad,
-                                                        error_if_nonfinite=bool(cond_dim or controller_on or memory_on))
+                    nonfinite = bool(cond_dim or controller_on or memory_on)
+                    if clip_sets is None:
+                        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.max_grad,
+                                                            error_if_nonfinite=nonfinite)
+                    else:
+                        gn = torch.nn.utils.clip_grad_norm_(clip_sets[0], a.max_grad, error_if_nonfinite=nonfinite)
+                        gn_c = torch.nn.utils.clip_grad_norm_(clip_sets[1], a.max_grad, error_if_nonfinite=nonfinite)
+                        stats.setdefault("grad_norm_critic", []).append(float(gn_c))
                     opt.step()
                     if speed_freeze is not None:
                         speed_freeze.after_step()
@@ -2315,6 +2366,7 @@ def main():
                    "loss/pg": np.mean(stats["pg"]), "loss/vf": np.mean(stats["vf"]), "loss/entropy": np.mean(stats["ent"]),
                    "loss/kl_ref": np.mean(stats["kl_ref"]), "loss/approx_kl": np.mean(stats["approx_kl"]), "loss/clipfrac": np.mean(stats["clipfrac"]),
                    **({"loss/grad_norm": float(np.mean(stats["grad_norm"]))} if stats.get("grad_norm") else {}),
+                   **({"loss/grad_norm_critic": float(np.mean(stats["grad_norm_critic"]))} if stats.get("grad_norm_critic") else {}),
                    **({"loss/aux_grip_mse": float(np.mean(stats["aux_grip"]))} if stats.get("aux_grip") else {}),
                    **({"loss/aux_opp_mse": float(np.mean(stats["aux_opp"]))} if stats.get("aux_opp") else {}),
                    # the total the coefficient multiplies, then every component of it: a head whose
@@ -2343,6 +2395,10 @@ def main():
             # so an unweighted mean of the pair reads ~0 no matter how much passing is going on.
             for n_, v_ in lagrange.items():
                 log[f"lagrange/{n_}_lambda"] = v_["lam"]; log[f"lagrange/{n_}_rate_per_km"] = v_["rate"]
+            if buf_car_hit is not None:
+                log["contacts/car_all_per_km"] = car_all_rate
+            log["rollout/driving_reward_per_step"] = drive_per_step
+            log["rollout/progress_per_step"] = prog_per_step
             m_ = buf_mask[..., None]
             log.update({f"reward/{key}_per_step": ((buf_reward_components[:, :, index:index + 1] * m_).sum()
                                                    / m_.sum().clamp_min(1.0)).item()
@@ -2435,6 +2491,7 @@ def main():
                   + "".join(f" | {n} {v['rate']:.2f}/km lam {v['lam']:.1f}"
                             + (f" tgt {v.get('target_now', float('nan')):.2f}" if v.get('anneal') else "")
                             for n, v in lagrange.items())
+                  + (f" | car_all {car_all_rate:.2f}/km" if buf_car_hit is not None else "")
                   + (f" | mask {log['loss/aux_opp_mask']:.3f} r{log.get('loss/aux_opp_mask/mask_recall', float('nan')):.2f}"
                      if 'loss/aux_opp_mask' in log else "")
                   + (f" | dv {log['loss/aux_motion_mse']:.4f}" if 'loss/aux_motion_mse' in log else "")

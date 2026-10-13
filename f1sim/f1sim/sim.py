@@ -61,6 +61,8 @@ class StepResult:
     motor_current: Optional[torch.Tensor] = None   # (B,) emulated VESC `current_motor` [A], the
                                                    # third input the traction guard takes. None with
                                                    # vehicle.wheel_model off.
+    wall_collision: Optional[torch.Tensor] = None  # (B,) bool: walls and props only -- `collision` also ORs in
+                                                   # `car_collision`, so a car contact read through it is a wall too
 
 
 def _capturing() -> bool:
@@ -694,8 +696,6 @@ class Simulator:
         wall_dist, hit, odom_state, s, ds, lateral, lap, cl_idx = (
             t.clone() for t in self._post(state, self.odom.state, self.cmd, self.s, self.lap, self.tid, P, self.cl_idx))
         self.cl_idx = cl_idx
-        if self.M > 1:
-            hit = hit | self.car_collision
         if getattr(self.track, "has_props", False):
             # `_post` reads the occupancy EDT and props are not in it, so without this a car drives
             # through a box: `terminate_on_collision` never fires, and with soft walls the contact is
@@ -707,6 +707,11 @@ class Simulator:
             hit = hit & ~self.absent
             if self.M > 1:
                 self.car_collision = self.car_collision & ~self.absent
+        # Walls and props alone, before the cars are ORed in: the wall constraint counts these, and read
+        # through `collision` a car contact was charged at the wall's price as well as the car's.
+        wall_hit = hit
+        if self.M > 1:
+            hit = hit | self.car_collision
         # Latched while a collision ends the episode -- the car is frozen and the flag has to
         # survive to the reset that reads it. Under soft contact it must NOT latch: the episode
         # carries on, and a flag that stays true is a car charged the collision penalty on every
@@ -735,7 +740,7 @@ class Simulator:
                           self.collided.clone(), ds, s, lateral, self.lap.clone(), wall_dist, self.t,
                           self.car_collision.clone() if self.M > 1 else None,
                           imu_offsets if self.cfg.imu.enabled else None,
-                          odom_t, i_motor if self.wheel_model else None)
+                          odom_t, i_motor if self.wheel_model else None, wall_hit.clone())
 
     def _guarded(self, compiled, attr, eager):
         """Compiled callable that falls back to eager for good if inductor/Triton fails at first use."""
