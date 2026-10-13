@@ -65,8 +65,23 @@ XI = torch.linspace(0.0, 1.0, N_KNOTS)
 #:             the range 2) against 0.02 for linear and budget, and the "timed" DAgger student finished 69.9 %
 #:             of held-out runs against 77.7 %. A speed at a time is continuous in the state, and is what the
 #:             "position every t seconds" convention says anyway.
-SPEED_MODES = ("linear", "envelope", "knots", "budget", "timed", "tspeed")
+#:   wp4       2026-10-14 (docs/research/output-format-2026-10-14.md): WP_K waypoints x (curvature, speed),
+#:             8 numbers, and the plan is only as long as the tracker's own window -- L = wp_horizon_s
+#:             (0.6 s, N x dt) of the measured speed. Waypoint k sits at s_k = k / WP_K * L; the curvature
+#:             is kappa_1 on [0, s_1] and linear in s after it, the speed starts at the measured one and
+#:             is linear in v^2 between waypoints (one acceleration per interval), and a backward pass at
+#:             the tracker's a_brake makes every action a profile the car can brake through. Why: the
+#:             tracker executes 0.6 s of linear's 1.5 s plan, so knots 4-5 steer by 0.0003 and 0 deg per
+#:             unit and v1 moves the command by 21 % of v0 -- 18-22 % of the exploration noise went into
+#:             dimensions the car never felt, and PPO parked v1 at ~0.1 as a free hedge. Inside the
+#:             window every wp4 dimension moves the car (design 4: kappa_1..4 steer 58 / 6.7 / 1.8 / 1.7
+#:             deg per unit, v_1..4 move the command 0.56 / 0.59 / 0.38 / 0.24 m/s per unit). Lap time
+#:             is not the reason: the teacher's labels replay ICCAS in 7.925 s, but so do two speed
+#:             points over the same window; linear's production labels lose their 0.5 s to the 1.5 s
+#:             end point and the speed certification, not to the format.
+SPEED_MODES = ("linear", "envelope", "knots", "budget", "timed", "tspeed", "wp4")
 N_ACC = 4                         # acceleration knots over the plan's horizon_s (0.5 s apart at 1.5 s)
+WP_K = 4                          # wp4: waypoints over the plan. K = 6 laps within 0.5 % of it, as does a dense 24.
 #: [f1sim_interfaces/Plan] The plan on the wire between policy_node and controller_node is a fixed
 #: float32[8] -- whatever the speed mode, which is why the width can never say what a plan means.
 PLAN_WIRE_DIM = 8
@@ -122,6 +137,7 @@ _LAYOUTS = {mode: PlanLayout(mode, width, slice(*path), slice(*speed), grip) for
     ("budget",   N_KNOTS + 3,           (0, N_KNOTS),   (N_KNOTS + 1, N_KNOTS + 3),  N_KNOTS),        # v_end, v_cap
     ("timed",    N_KNOTS + N_ACC + 1,   (0, N_KNOTS),   (N_KNOTS, N_KNOTS + N_ACC),  N_KNOTS + N_ACC),
     ("tspeed",   N_KNOTS + N_ACC + 1,   (0, N_KNOTS),   (N_KNOTS, N_KNOTS + N_ACC),  N_KNOTS + N_ACC),
+    ("wp4",      2 * WP_K,              (0, WP_K),      (WP_K, 2 * WP_K),            None),           # v_1 .. v_4
 )}
 
 
@@ -237,6 +253,26 @@ class PlanSpec:
     #: ramp's 5.4 m/s^2: a car asked for everything reached 3.0 m/s^2 of its 5.6 (2026-09-30).
     #: False keeps every checkpoint trained before that exact; a contract field (`contract_of`).
     profile_from_prediction: bool = False
+    #: "wp4" (see SPEED_MODES). The plan is wp_horizon_s of the measured speed, which is the tracker's
+    #: own N x dt: a plan longer than the window the iLQR executes leaves dimensions that move nothing
+    #: (linear's knots 4-5) or become a free hedge (linear's v1). Longer and still alive was measured
+    #: and lost: N 30 over 1.5 s costs 22.9 ms against the 17 ms budget, a non-uniform 1.2 s horizon
+    #: laps 3 % slower and the same 4 + 4 spread over 1.5 s 0.5 % slower with two knots dead again.
+    #: The floor keeps a standing car's waypoints apart; the ceiling is 10 m/s x 0.6 s.
+    wp_horizon_s: float = 0.6
+    wp_len_min: float = 1.0
+    wp_len_max: float = 6.0
+    #: Samples per plan length on the grid the path and the profile live on: 12 per waypoint interval,
+    #: so every waypoint is a sample and the heading integral of the piecewise linear curvature is
+    #: exact. The grid runs on to wp_extend * L holding kappa_4 and v_4: the reference walk outruns
+    #: the plan by up to 2.1 x (from 1.7 m/s with everything asked for, a_max 6: 0.6 v + 1.08 m on a
+    #: 1 m plan), and past the end it then still reads what the policy said instead of a hard-coded
+    #: straight line.
+    wp_grid: int = 48
+    wp_extend: float = 2.5
+    #: [m/s] the floor of the reference walk: the linear plan's creep, so a plan asking to stop still
+    #: lays a path to steer along (the teachers' "speed 0, full lock" recovery).
+    wp_walk_floor: float = 0.3
 
 
 def contract_of(extra: Optional[dict]) -> dict:
@@ -298,6 +334,8 @@ def profile_speed_command(ref_v: torch.Tensor, dt: float, t_land: torch.Tensor, 
 
 
 def plan_length(v: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
+    if spec.speed_mode == "wp4":
+        return (spec.wp_horizon_s * v.abs()).clamp(spec.wp_len_min, spec.wp_len_max)
     return (spec.horizon_s * v.abs()).clamp(spec.len_min, spec.len_max)
 
 
@@ -346,6 +384,90 @@ def encode(kappas: torch.Tensor, v_start: torch.Tensor, v_end: torch.Tensor, v_m
     """(B,4) curvature knots [1/m], speeds [m/s] -> normalized action (B,6)"""
     return torch.cat([_knot_action(kappas, spec, v_meas), (v_start / v_max * 2 - 1).clamp(-1, 1)[:, None],
                       (v_end / v_max * 2 - 1).clamp(-1, 1)[:, None]], 1)
+
+
+# ---------------------------------------------------------------------------------------------- wp4
+# Everything below is tensor arithmetic on shapes fixed by the spec -- the grid size, the waypoint
+# count and every loop are Python constants -- with no host read anywhere, so `solve` keeps compiling
+# into one CUDA graph and per-row values (speed, cap, delay) stay tensor arguments.
+def decode_wp4(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec):
+    """'wp4' action (B, 2 WP_K) -> (curvature at the waypoints (B, WP_K) [1/m], plan length L (B,),
+    speed at the waypoints (B, WP_K) [m/s]).
+
+    The speeds come out capped at `speed_cap` and through one backward braking pass at the tracker's
+    own bound, v_k <= sqrt(v_{k+1}^2 + 2 a_brake ds): every action decodes to a profile the car can
+    brake through, and a low v_4 is a promise kept from now on rather than a free hedge. There is no
+    lateral cap sqrt(a / |kappa|): on the teacher's labels it never bound, but under PPO's initial
+    noise (sigma 0.165) it bound in 93 % of samples and took 0.256 m/s off the executed command on
+    average, all of it one way; the backward pass alone costs 0.076. Grip is the policy's, the
+    dial's and the arms' call -- envelope / budget folded it into the profile and failed."""
+    if spec.speed_mode != "wp4":
+        raise ValueError(f"decode_wp4 reads 'wp4' plans; this spec is {spec.speed_mode!r}")
+    lay = _LAYOUTS["wp4"]
+    a = action.clamp(-1.0, 1.0)
+    L = plan_length(v_meas, spec)
+    k = a[:, lay.path] * kappa_scale(v_meas, spec)
+    v = torch.minimum((a[:, lay.speed] + 1.0) * 0.5 * v_max, speed_cap[:, None])
+    ds = L / WP_K
+    cols = list(v.unbind(1))
+    for i in range(WP_K - 2, -1, -1):                 # Python constants: unrolls, graph-safe
+        cols[i] = torch.minimum(cols[i], torch.sqrt(cols[i + 1] ** 2 + 2.0 * spec.a_brake * ds))
+    return k, L, torch.stack(cols, 1)
+
+
+def encode_wp4(kappas: torch.Tensor, v_knots: torch.Tensor, v_max: float, spec: PlanSpec,
+               v_meas: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """(B, WP_K) curvature at the waypoints [1/m], (B, WP_K) speed at them [m/s] -> normalized 'wp4'
+    action. The inverse of `decode_wp4` on what it returns: a profile the cap and the backward pass
+    leave alone comes back to the same numbers (`tests/test_wp4.py`)."""
+    return torch.cat([_knot_action(kappas, spec, v_meas), (v_knots / v_max * 2 - 1).clamp(-1, 1)], 1)
+
+
+def _wp4_grid(spec: PlanSpec, extend: float, ref: torch.Tensor):
+    """The wp4 sample grid over [0, extend * L]: n, the plan fraction of each sample (1, n), and the
+    waypoint interval / weight that interpolates knot values (index 0 is s = 0) at each sample."""
+    n = int(round(spec.wp_grid * extend)) + 1
+    u = torch.linspace(0.0, extend, n, device=ref.device, dtype=ref.dtype)[None]
+    pos = (u * WP_K).clamp(0.0, float(WP_K))                    # held at the last waypoint past s_K
+    i0 = pos.floor().clamp(max=WP_K - 1).long()
+    return n, u, i0.expand(ref.shape[0], n), pos - i0.to(ref.dtype)
+
+
+def _integrate(kap: torch.Tensor, ds: torch.Tensor):
+    """Heading and body-frame position along samples of curvature `kap` (B, n) spaced `ds` (B, 1)
+    apart, both by the trapezoid rule -- `path_points`' own integration."""
+    psi = torch.cumsum(0.5 * (kap[:, 1:] + kap[:, :-1]) * ds, 1)
+    psi = torch.cat([torch.zeros_like(psi[:, :1]), psi], 1)
+    cx, sy = torch.cos(psi), torch.sin(psi)
+    x = torch.cat([torch.zeros_like(psi[:, :1]), torch.cumsum(0.5 * (cx[:, 1:] + cx[:, :-1]) * ds, 1)], 1)
+    y = torch.cat([torch.zeros_like(psi[:, :1]), torch.cumsum(0.5 * (sy[:, 1:] + sy[:, :-1]) * ds, 1)], 1)
+    return x, y, psi
+
+
+def wp4_path(kappa: torch.Tensor, L: torch.Tensor, spec: PlanSpec, extend: Optional[float] = None):
+    """A wp4 plan in the body frame: x, y, heading, arc length and curvature, each (B, n), on a grid
+    uniform in arc length over [0, extend * L] (`spec.wp_extend` by default; 1 is the plan alone).
+
+    The curvature is kappa_1 over [0, s_1] -- the plan has no say over the curvature the car is
+    already driving, only over where it goes next -- linear in arc length between the waypoints and
+    held at kappa_K past s_K."""
+    ext = spec.wp_extend if extend is None else float(extend)
+    n, u, i0, w = _wp4_grid(spec, ext, kappa)
+    kv = torch.cat([kappa[:, :1], kappa], 1)                     # (B, K+1): s = 0, s_1, .., s_K
+    kap = kv.gather(1, i0) * (1 - w) + kv.gather(1, i0 + 1) * w
+    x, y, psi = _integrate(kap, (L * ext / (n - 1))[:, None])
+    return x, y, psi, u * L[:, None], kap
+
+
+def wp4_profile(v_start: torch.Tensor, v_knots: torch.Tensor, L: torch.Tensor, spec: PlanSpec,
+                extend: Optional[float] = None) -> torch.Tensor:
+    """The speed along a wp4 plan on `wp4_path`'s grid, (B, n): `v_start` at s = 0, the waypoint speeds
+    at s_k, linear in v^2 between them -- one constant acceleration per interval, the shape the
+    tracker's reference walk integrates -- and v_K past s_K."""
+    ext = spec.wp_extend if extend is None else float(extend)
+    _, _, i0, w = _wp4_grid(spec, ext, v_knots)
+    vv = torch.cat([v_start[:, None], v_knots], 1).square()
+    return (vv.gather(1, i0) * (1 - w) + vv.gather(1, i0 + 1) * w).clamp_min(0.0).sqrt()
 
 
 def encode_envelope(kappas: torch.Tensor, a_hat: torch.Tensor, v_end: torch.Tensor, v_max: float, spec: PlanSpec,
@@ -516,7 +638,7 @@ def path_points(k: torch.Tensor, Lp: torch.Tensor, n: int = 25, return_kappa: bo
 
 def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = None,
               v_limit: Optional[torch.Tensor] = None, a_walk: Optional[torch.Tensor] = None,
-              v_profile: Optional[torch.Tensor] = None):
+              v_profile: Optional[torch.Tensor] = None, path=None, walk_floor: Optional[float] = None):
     """Time-indexed reference (B, N+1, 4) = x, y, heading, speed along the plan. The speed *target*
     is the plan's profile (v0 at the start, linear in arc length to v1 at the end); the position
     reference is walked with the speed the car can actually have: from v_now (measured) towards
@@ -528,12 +650,18 @@ def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = Non
     pose is. `a_walk` (B, 2) replaces `spec.a_brake` / `spec.a_max` in the walk with per-env values.
     ``v_profile`` replaces the speed target (including its measured initial state).
     ``a_walk`` also accepts local spatial budgets (B,n,2), interpolated at the walked arc.
+    ``path`` (x, y, heading, arc), each (B, n) and uniform in arc length, replaces the linear plan's
+    own `path_points(k, Lp)` -- a format with a path of its own ("wp4") walks it through this same
+    code, and `k` / `Lp` are then not read. ``walk_floor`` replaces the walk's floor (0.3 m/s, or 0
+    under ``v_profile``).
     Optional inputs default to None, preserving the original behaviour exactly."""
-    x, y, psi, s = path_points(k, Lp)
+    x, y, psi, s = path_points(k, Lp) if path is None else path
     S = s[:, -1].clamp_min(1e-3)
-    dev = k.device; T = spec.N + 1
-    st = torch.zeros(k.shape[0], T, device=dev, dtype=k.dtype); v = torch.zeros_like(st)
-    vw = (v0 if v_now is None else v_now.abs()).clamp_min(0.0 if v_profile is not None else 0.3)
+    like = k if path is None else s
+    dev = like.device; T = spec.N + 1
+    st = torch.zeros(like.shape[0], T, device=dev, dtype=like.dtype); v = torch.zeros_like(st)
+    floor = (0.0 if v_profile is not None else 0.3) if walk_floor is None else walk_floor
+    vw = (v0 if v_now is None else v_now.abs()).clamp_min(floor)
     local_walk = a_walk is not None and a_walk.ndim == 3
     a_brk_w = (-spec.a_brake * spec.dt) if a_walk is None else (-a_walk[..., 0] * spec.dt)
     a_acc_w = (spec.a_max * spec.dt) if a_walk is None else (a_walk[..., 1] * spec.dt)
@@ -571,7 +699,7 @@ def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = Non
                 demand = demand + edge_accel * spec.dt
             dv = torch.clamp(demand, a_brk_w, a_acc_w) if a_walk is None else torch.maximum(torch.minimum(demand, a_acc_w), a_brk_w)
             old_vw = vw
-            vw = (vw + dv).clamp_min(0.0 if v_profile is not None else 0.3)
+            vw = (vw + dv).clamp_min(floor)
             step_speed = .5 * (old_vw + vw) if v_profile is not None else vw
             st[:, t_ + 1] = st[:, t_] + step_speed * spec.dt
     idx = torch.searchsorted(s.contiguous(), st.contiguous()).clamp(1, s.shape[1] - 1)   # (B,T)
@@ -584,6 +712,101 @@ def reference(k, Lp, v0, v1, spec: PlanSpec, v_now: Optional[torch.Tensor] = Non
     xr = xr + over * torch.cos(pe); yr = yr + over * torch.sin(pe)
     pr = torch.where(st > S[:, None], pe.expand_as(pr), pr)
     return torch.stack([xr, yr, pr, v], 2)
+
+
+def wp4_reference(action: torch.Tensor, v_meas: torch.Tensor, v_max: float, speed_cap: torch.Tensor, spec: PlanSpec,
+                  v_start: Optional[torch.Tensor] = None, a_walk: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """The tracker reference (B, N+1, 4) of a 'wp4' plan: decoded, laid on its grid and walked by
+    `reference`'s own `v_profile` branch -- the one walk every profile is followed by, so there is no
+    second copy to drift. The profile starts at the measured speed (`v_start`: the speed the tracker
+    predicts for when its command lands, under `profile_from_prediction`), the walk accelerates
+    within a_max * dt and never drops under the linear plan's 0.3 m/s creep (`wp_walk_floor`)."""
+    k, L, v = decode_wp4(action, v_meas, v_max, speed_cap, spec)
+    v0 = (v_meas if v_start is None else v_start).abs()
+    x, y, psi, s, _ = wp4_path(k, L, spec)
+    prof = wp4_profile(v0, v, L, spec)
+    return reference(None, L, speed_cap, speed_cap, spec, v0, a_walk=a_walk, v_profile=prof,
+                     path=(x, y, psi, s), walk_floor=spec.wp_walk_floor)
+
+
+#: wp4 fits: target points per plan length (two per waypoint interval, each a grid sample).
+WP_FIT_POINTS = 8
+
+
+def fit_wp4(k: torch.Tensor, tx: torch.Tensor, ty: torch.Tensor, L: torch.Tensor, spec: PlanSpec, iters: int = 8,
+            k_lim=None) -> torch.Tensor:
+    """Gauss-Newton fit of the WP_K waypoint curvatures (B, WP_K) [1/m] so the wp4 path of length `L`
+    passes through the body-frame points (tx, ty) (B, WP_FIT_POINTS) at fractions 1/M .. M/M of L.
+
+    `k` is the initial guess. Unlike `teacher.fit_knots` there is no ridge back towards it: the
+    target here is a path the caller already chose (a teacher's plan), not a raceline to be blended
+    with pure pursuit, so a path the format can hold comes back exactly. A line search over the step
+    length never accepts a worse fit. Measured from guesses 0.3 1/m off (64 random plans, L 1-4.8 m):
+    the worst knot error is 2.1 / 1e-3 / 8e-6 1/m after 4 / 6 / 8 iterations, hence 8. `k_lim`
+    bounds the curvature (default: what an action of +-1 means here, so the fit never lands where
+    `encode_wp4` would clip it)."""
+    B, K = k.shape
+    M = tx.shape[1]
+    if spec.wp_grid % M:
+        raise ValueError(f"fit_wp4 samples the plan's own grid: {M} points do not divide wp_grid {spec.wp_grid}")
+    dev, dt_ = k.device, k.dtype
+    if k_lim is None:
+        k_lim = spec.kappa_max if spec.kappa_mode == "absolute" else None
+    lim = (torch.full((B,), float(k_lim), device=dev, dtype=dt_) if not torch.is_tensor(k_lim) and k_lim is not None
+           else k_lim)
+    si = torch.arange(1, M + 1, device=dev) * (spec.wp_grid // M)            # (M,) grid samples of the targets
+    lam, eps = 1e-6, 0.02
+    basis = torch.eye(K, device=dev, dtype=dt_)
+    perturb = torch.cat([torch.zeros_like(basis[:1]), eps * basis], 0)       # (K+1, K): the point and K probes
+    fractions = torch.linspace(1.0, 0.0, 5, device=dev, dtype=dt_).square()   # 1, .56, .25, .06, 0
+    LJ = L[:, None].expand(-1, K + 1).reshape(-1)
+    LT = L[:, None].expand(-1, fractions.shape[0]).reshape(-1)
+    rows = torch.arange(B, device=dev)
+    for _ in range(iters):                    # Python constant: unrolls, graph-safe
+        x, y, _, _, _ = wp4_path((k[:, None, :] + perturb[None]).reshape(-1, K), LJ, spec, extend=1.0)
+        r = torch.cat([x[:, si].view(B, K + 1, M) - tx[:, None], y[:, si].view(B, K + 1, M) - ty[:, None]], 2)
+        J = ((r[:, 1:] - r[:, :1]) / eps).transpose(1, 2)                    # (B, 2M, K)
+        A = J.transpose(1, 2) @ J
+        A = A + (lam * A.diagonal(dim1=1, dim2=2).mean(1)[:, None, None] + 1e-9) * basis
+        step = torch.linalg.solve_ex(A, J.transpose(1, 2) @ r[:, 0, :, None])[0].squeeze(-1)
+        trials = k[:, None] - fractions[None, :, None] * step[:, None]
+        if lim is not None:
+            trials = torch.maximum(torch.minimum(trials, lim[:, None, None]), -lim[:, None, None])
+        px, py, _, _, _ = wp4_path(trials.reshape(-1, K), LT, spec, extend=1.0)
+        cost = ((px[:, si].view(B, -1, M) - tx[:, None]).square() + (py[:, si].view(B, -1, M) - ty[:, None]).square()).sum(-1)
+        k = trials[rows, cost.argmin(1)]
+    return k
+
+
+def wp4_refit(k_src: torch.Tensor, Lp_src: torch.Tensor, v_meas: torch.Tensor, spec: PlanSpec, iters: int = 8,
+              k_lim=None) -> torch.Tensor:
+    """The waypoint curvatures (B, WP_K) [1/m] of the wp4 plan that drives the first L of a path in the
+    linear format's geometry -- N_KNOTS curvature knots evenly over `Lp_src` (`path_points`), e.g. a
+    teacher's 1.5 s plan. L is `plan_length(v_meas, spec)`, inside Lp_src at every speed (0.6 s against
+    1.5 s, 1 m against 2 m at a standstill).
+
+    Why the teacher's own plan and not the raceline points: fitted to the line directly, a 0.6 s plan
+    snaps back to it within 0.6 s -- in traffic replay that stopped cars off the line (a deadlock) and
+    touched the icra2022 walls 20 times; refitting the first window of the gentle 1.5 s line change
+    the teacher scored touched none (design 5).
+
+    The source is integrated on the fit's own grid (the window, `wp_grid` samples) and sampled at the
+    fit's points, so a source the format can represent is returned as it is; the initial guess is
+    the source's curvature at the waypoints. `k_lim` (B,) is the caller's own bound -- a teacher's
+    0.85 x steering-limited curvature, which the format's +-kappa_max (the default) is looser than:
+    unbounded, 5 % of the refitted knots on icra2022 landed past it."""
+    L = plan_length(v_meas, spec)
+    n, u, _, _ = _wp4_grid(spec, 1.0, k_src)                     # the window's samples, 0 .. L
+    pos = (u * L[:, None] / Lp_src[:, None].clamp_min(1e-6)).clamp(0.0, 1.0) * (N_KNOTS - 1)
+    i0 = pos.floor().clamp(max=N_KNOTS - 2).long(); w = pos - i0.to(k_src.dtype)
+    kap = k_src.gather(1, i0) * (1 - w) + k_src.gather(1, i0 + 1) * w     # the source's curvature there
+    x, y, _ = _integrate(kap, (L / (n - 1))[:, None])
+    M = WP_FIT_POINTS
+    si = torch.arange(1, M + 1, device=k_src.device) * (spec.wp_grid // M)
+    k0 = kap[:, torch.arange(1, WP_K + 1, device=k_src.device) * (spec.wp_grid // WP_K)]
+    if k_lim is None and spec.kappa_mode == "absolute":
+        k0 = k0.clamp(-spec.kappa_max, spec.kappa_max)
+    return fit_wp4(k0, x[:, si], y[:, si], L, spec, iters=iters, k_lim=k_lim)
 
 
 def _dyn(z, u, spec: PlanSpec, wb: float):
@@ -725,6 +948,16 @@ def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSp
     if spec.speed_mode == "linear":
         k, Lp, v0, v1 = decode(action, v_meas, v_max, speed_cap, spec)
         ref = reference(k, Lp, v0, v1, spec, v_meas, v_limit=v_limit, a_walk=a_walk)
+    elif spec.speed_mode == "wp4":
+        # The runtime arms hand `v_limit` / local walk budgets on the linear plan's 25-sample grid over
+        # its 1.5 s length; on wp4's own grid they would land at the wrong arc lengths. Refused, not
+        # resampled, until the arms are ported (output-format design 6, unit 8): the controller node
+        # already runs a non-linear plan on the legacy arm only.
+        if v_limit is not None or (a_walk is not None and a_walk.ndim == 3):
+            raise ValueError("a 'wp4' plan takes no v_limit / local a_walk yet: those are laid on the linear "
+                             "plan's grid (run the legacy arm)")
+        v_start = ((v_meas.abs() + u_prev[:, 1] * delay).clamp_min(0.0) if spec.profile_from_prediction else None)
+        ref = wp4_reference(action, v_meas, v_max, speed_cap, spec, v_start=v_start, a_walk=a_walk)
     else:
         # The plan carries a whole profile. `reference` already knows how to follow one -- that is
         # what `v_limit` is -- so the linear target is set to the cap and the profile does the rest.

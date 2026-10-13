@@ -195,6 +195,13 @@ class RacelineTeacher:
         from .mpc import (N_ACC, N_KNOTS, PlanSpec, encode, encode_budget, encode_envelope, encode_knots, encode_timed,
                           encode_tspeed, path_points, plan_length)
         spec = spec or PlanSpec()
+        if spec.speed_mode == "wp4":
+            # Not yet: a wp4 label is THIS plan's first window refitted (`mpc.wp4_refit`) with the
+            # profile sampled at the waypoints (output-format design 5, migration step 3). Until that
+            # encoder is wired in, a wp4 spec would fall through to the linear encoder below and hand
+            # back six knots and two speeds to be read as four and four, which is no error at all.
+            raise NotImplementedError("RacelineTeacher.plan_action has no 'wp4' encoder yet; build the linear "
+                                      "plan and refit it with mpc.wp4_refit / mpc.encode_wp4")
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         geometry_speed = plan_geometry_speed(state, plan_speed)
         B = xy.shape[0]; dev = xy.device

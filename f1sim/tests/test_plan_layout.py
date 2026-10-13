@@ -144,11 +144,12 @@ def test_the_guard_sees_what_it_is_for():
 
 
 # ------------------------------------------------------------------ the layouts
-def test_linear_is_six_knots_then_two_speeds():
-    lin = mpc.plan_layout("linear")
+def test_linear_is_six_knots_then_two_speeds_and_wp4_four_and_four():
+    lin, wp4 = mpc.plan_layout("linear"), mpc.plan_layout("wp4")
     assert (lin.act_dim, lin.path, lin.speed, lin.grip) == (8, slice(0, 6), slice(6, 8), None)
-    assert lin.act_dim == mpc.ACT_DIM == mpc.PLAN_WIRE_DIM
-    assert lin.other == slice(0, 6)
+    assert (wp4.act_dim, wp4.path, wp4.speed, wp4.grip) == (8, slice(0, 4), slice(4, 8), None)
+    assert lin.act_dim == wp4.act_dim == mpc.ACT_DIM == mpc.PLAN_WIRE_DIM        # why positions lie
+    assert lin.other == slice(0, 6) and wp4.other == slice(0, 4)
 
 
 @pytest.mark.parametrize("mode", mpc.SPEED_MODES)
@@ -168,9 +169,11 @@ def test_the_layout_is_read_from_a_mode_a_spec_or_a_contract_and_never_guessed()
     assert mpc.plan_layout(None) is mpc.plan_layout("linear")
     assert mpc.plan_layout(mpc.PlanSpec(speed_mode="budget")) is mpc.plan_layout("budget")
     assert mpc.plan_layout(mpc.contract_of({"experiment": {"speed_mode": "budget"}})) is mpc.plan_layout("budget")
+    assert mpc.plan_layout(mpc.PlanSpec(speed_mode="wp4")) is mpc.plan_layout("wp4")
+    assert mpc.plan_layout(mpc.contract_of({"experiment": {"speed_mode": "wp4"}})) is mpc.plan_layout("wp4")
     assert mpc.plan_layout(mpc.contract_of({})) is mpc.plan_layout("linear")
     with pytest.raises(ValueError, match="contract"):
-        mpc.plan_layout({"experiment": {"speed_mode": "budget"}})  # a raw `extra` would read as linear
+        mpc.plan_layout({"experiment": {"speed_mode": "wp4"}})     # a raw `extra` would read as linear
     with pytest.raises(ValueError, match="speed_mode"):
         mpc.plan_layout("wp6")
 

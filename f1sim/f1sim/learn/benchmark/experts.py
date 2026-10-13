@@ -86,7 +86,11 @@ class _PurePursuit:
         v_tgt = torch.minimum(torch.full_like(v_curve, self.v_ref), v_curve) * self.speed_scale()
         v_tgt = v_tgt.clamp(self.v_floor, float(e.ecfg.v_max_policy))
 
-        knots = kappa[:, None].expand(-1, mpc.plan_layout(spec).n_path).contiguous()
+        lay = mpc.plan_layout(spec)
+        knots = kappa[:, None].expand(-1, lay.n_path).contiguous()
+        if lay.speed_mode == "wp4":                  # the same arc at the same speed, as waypoints
+            return mpc.encode_wp4(knots, v_tgt[:, None].expand(-1, lay.n_speed), float(e.ecfg.v_max_policy),
+                                  spec).clamp(-1.0, 1.0)
         return mpc.encode(knots, v_tgt, v_tgt, float(e.ecfg.v_max_policy), spec).clamp(-1.0, 1.0)
 
 
