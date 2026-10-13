@@ -88,6 +88,8 @@ class PPOHyper:
     priv_mu_index: int = 16
     aux_opp_range_m: float = AUX_OPP_RANGE_M
     m_gt_1: bool = False
+    #: the value clip, in return units; None = `clip` (every run before 2026-10-13), 0 = no clip
+    vf_clip: Optional[float] = None
 
 
 def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old, adv, ret,
@@ -202,8 +204,12 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
                                        w.float())
     ratio = (logp - logp_old).exp()
     pg = -wmean(torch.min(ratio * adv, ratio.clamp(1 - hyper.clip, 1 + hyper.clip) * adv), w)
-    v_clipped = val_old + (val - val_old).clamp(-hyper.clip, hyper.clip)
-    vf = 0.5 * wmean(torch.max((val - ret) ** 2, (v_clipped - ret) ** 2), w)
+    vclip = hyper.clip if hyper.vf_clip is None else hyper.vf_clip
+    if vclip > 0:
+        v_clipped = val_old + (val - val_old).clamp(-vclip, vclip)
+        vf = 0.5 * wmean(torch.max((val - ret) ** 2, (v_clipped - ret) ** 2), w)
+    else:
+        vf = 0.5 * wmean((val - ret) ** 2, w)
     if reference_params is None:
         with torch.no_grad(), ac:
             # Preserve the historical memoryless baseline for ordinary PPO.
@@ -390,6 +396,11 @@ def main():
     ap.add_argument("--gamma", type=float, default=0.99); ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2); ap.add_argument("--ent", type=float, default=0.0)
     ap.add_argument("--vf", type=float, default=0.5); ap.add_argument("--max-grad", type=float, default=0.5)
+    ap.add_argument("--vf-clip", type=float, default=None,
+                    help="PPO's value clip, in RETURN units (default: --clip, 0.2, as every run so far; 0 = off). The "
+                         "returns are not normalised: under a contact multiplier of 300-1000 they spread with sd ~125 "
+                         "while the clip lets the value move 0.2 per update, so the critic cannot follow a contact "
+                         "(measured before one: V 53.5 against a realised -513; 2026-10-13 architecture audit)")
     ap.add_argument("--clip-split", action="store_true",
                     help="clip the actor's and the critic's gradients to --max-grad separately (2026-10-13 audit). "
                          "One norm over both lets the critic -- norm 1.6k-31k under a contact multiplier of 300-1000 "
@@ -2212,7 +2223,7 @@ def main():
         f_adv = (f_adv - adv_mean) / (adv_std + 1e-8)
         stats = {"pg": [], "vf": [], "ent": [], "kl_ref": [], "approx_kl": [], "clipfrac": []}
         freeze_actor = update < a.critic_warmup
-        hyper = PPOHyper(clip=a.clip, vf=a.vf, ent=a.ent, kl_coef=kl_coef, aux_grip=a.aux_grip,
+        hyper = PPOHyper(clip=a.clip, vf=a.vf, ent=a.ent, kl_coef=kl_coef, aux_grip=a.aux_grip, vf_clip=a.vf_clip,
                          aux_opp=a.aux_opp, aux_future=(a.aux_future if future_on else 0.0),
                          aux_opp_mask=(a.aux_opp_mask if mask_on else 0.0),
                          aux_motion=(a.aux_motion if dv_on else 0.0),
