@@ -240,6 +240,60 @@ def baseline_step_ms(driver, iters: int = 200, threads: int = 1, repeats: int = 
             "protocol": protocol(iters, repeats, threads)}
 
 
+def v2_actor_step_ms(model, iters: int = 200, threads: int = 1, repeats: int = 5) -> float:
+    """Milliseconds per control step of a v2 actor (`learn.model_v2`) under `PROTOCOL`: the deployed
+    function, `ActorV2.step(scan, ego, c, h) -> (action, h')`, with the state carried. The min-pool
+    channel is inside it; there are no extra channels to build on the car."""
+    from torch.utils import benchmark
+    torch.set_num_threads(threads)
+    a = model.actor.eval()
+    spec = model.obs_spec
+    g = torch.Generator().manual_seed(0)
+    ramp = torch.linspace(0.2, 1.0, spec.n_beams)
+    scan = (ramp[None, None, :].expand(1, spec.n_frames, -1)
+            + 0.01 * torch.rand(1, spec.n_frames, spec.n_beams, generator=g)).clamp(0, 1).contiguous()
+    ego = 0.3 * torch.randn(1, spec.ego_dim, generator=g)
+    c = torch.zeros(1, 1)
+    h = a.initial_hidden(1)
+
+    def forward():
+        with torch.no_grad():
+            a.step(scan, ego, c, h)
+
+    t = benchmark.Timer(stmt="f()", globals={"f": forward}, num_threads=threads)
+    return min(t.timeit(iters).median for _ in range(max(1, repeats))) * 1e3
+
+
+def v2_budget(n_frames=(1, 2, 3), n_beams: int = 1081, iters: int = 200, repeats: int = 5,
+              threads: int = 1, out_dir: Optional[str] = None) -> list:
+    """The v2 actor's budget rows: parameters per block, torch eager and onnxruntime milliseconds
+    per step (`PROTOCOL`), and the exported graph's parity with torch over 20 recurrent steps.
+
+    Built from a fresh network: the weights do not change the arithmetic. The car is a Jetson AGX
+    Orin with ~17 ms per scan for the actor AND the plan tracker (requirement T1); these are this
+    desktop's CPU numbers, a proxy -- G7 measures the board."""
+    import tempfile
+    from .export import export_v2, ort_step_ms
+    from .model_v2 import ActorCriticV2, block_parameter_counts
+    rows = []
+    for k in n_frames:
+        torch.manual_seed(0)
+        m = ActorCriticV2(n_beams=n_beams, n_frames=int(k)).eval()
+        row = {"n_frames": int(k), "n_beams": int(n_beams), "params": block_parameter_counts(m),
+               "torch_ms": v2_actor_step_ms(m, iters=iters, threads=threads, repeats=repeats),
+               "protocol": protocol(iters, repeats, threads)}
+        d = out_dir or tempfile.mkdtemp(prefix="v2_budget_")
+        path = os.path.join(d, f"actor_v2_k{k}.onnx")
+        rep = export_v2(m, path)
+        row["onnx_max_abs_err"] = rep["max_abs_err"]
+        try:
+            row["onnxruntime_ms"] = ort_step_ms(path, m, iters=iters, repeats=repeats, threads=threads)
+        except ImportError:
+            row["onnxruntime_ms"] = None
+        rows.append(row)
+    return rows
+
+
 def measure(model, device="cpu", iters: int = 200, threads: int = 1, repeats: int = 5) -> dict:
     torch.set_num_threads(threads)
     out = dict(actor_step_ms(model, device=device, iters=iters, threads=threads, repeats=repeats))
@@ -324,7 +378,25 @@ def main(argv=None):
                     help="also time the learned sensor front-end (batch 1). With a path, that "
                          "checkpoint; without one, an untrained network of the shipped shape, "
                          "which costs the same")
+    ap.add_argument("--v2", nargs="?", const="1,2,3", default=None, metavar="FRAMES",
+                    help="time the v2 actor (learn.model_v2) instead: comma separated frame counts "
+                         "(default 1,2,3); parameters per block, torch and onnxruntime ms, ONNX parity")
     a = ap.parse_args(argv)
+
+    if a.v2 is not None:
+        rows = v2_budget([int(x) for x in a.v2.split(",") if x.strip()], iters=a.iters, repeats=a.repeats)
+        print(f"v2 actor budget proxy: {rows[0]['protocol']}")
+        print(f"{'frames':>6s} {'actor par':>10s} {'stem par':>9s} {'torch ms':>9s} {'ort ms':>8s} {'|onnx-torch|':>13s}")
+        for r in rows:
+            ort_ms = "-" if r["onnxruntime_ms"] is None else f"{r['onnxruntime_ms']:.3f}"
+            err = "-" if r["onnx_max_abs_err"] is None else f"{r['onnx_max_abs_err']:.2e}"
+            print(f"{r['n_frames']:6d} {r['params']['actor (deployed)']:10d} {r['params']['B1+B2 stem']:9d} "
+                  f"{r['torch_ms']:9.3f} {ort_ms:>8s} {err:>13s}")
+        if a.json:
+            import json
+            with open(a.json, "w") as f:
+                json.dump(rows, f, indent=1)
+        return 0
 
     from .model import load_checkpoint, load_for_memory
     from .memory import memory_spec

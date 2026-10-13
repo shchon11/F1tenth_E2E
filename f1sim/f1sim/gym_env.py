@@ -2605,6 +2605,13 @@ class F1VecEnv:
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
             info["car_charge"] = car_charge
+        if self.obs_version == 2:
+            # Critique B5: the v2 policy does not observe the speed cap, and the plan decode clips
+            # every speed at it -- on a clipped step the speed dimensions get no reward gradient
+            # and can drift. Which steps those were, for the trainer to count.
+            lay = self.plan_layout
+            v_plan = (a[:, lay.speed] + 1.0) * 0.5 * e.v_max_policy
+            info["speed_capped"] = (v_plan > self.speed_cap[:, None]).any(1)
         if self.events is not None:
             # What each opponent is doing right now, for a viewer or a logger: event id (0 = none,
             # f1sim.opponent_events.EVENT_ID), seconds left, and the lateral offset it is holding.
@@ -3124,7 +3131,7 @@ class F1VecEnv:
         herr = torch.remainder(st[:, 2] - yaw_c + math.pi, 2 * math.pi) - math.pi
         vm = float(e.v_max_policy)
         ego = torch.stack([st[:, 3] / vm, st[:, 4] / 2.0, st[:, 5] / float(e.imu_gyro_scale), res.lateral,
-                           herr / math.pi, res.s / self.sim.track.length[self.sim.tid],
+                           herr / math.pi, torch.remainder(res.s / self.sim.track.length[self.sim.tid], 1.0),
                            (res.progress / self.sim.control_dt / vm).clamp(-2.0, 2.0),
                            (res.wall_dist / 2.0).clamp(-1.0, 3.0)], 1)
         K, S = PRIV_V2_OPP_SLOTS, PRIV_OPP_DIST_SCALE

@@ -192,3 +192,15 @@ def test_visibility_is_tracked_through_real_steps_and_off_costs_nothing():
     assert off._opp_age is None
     with pytest.raises(RuntimeError):
         off.opponent_tracks_v2()
+
+
+def test_a_v2_step_says_whether_the_cap_clipped_the_plan():
+    """Critique B5: the cap is not observed, so the trainer has to be told when it bit."""
+    env = _env(race_size=1, envs=2, opp_visibility=False)
+    env.set_speed_cap(4.0)
+    env.reset(seed=2)
+    a = torch.zeros(env.B, env.act_dim)
+    a[0, 4:] = 1.0                                   # 10 m/s everywhere: clipped to 4
+    a[1, 4:] = -0.5                                  # 2.5 m/s: under the cap
+    _o, _r, _te, _tr, info = env.step(a)
+    assert info["speed_capped"].tolist() == [True, False]

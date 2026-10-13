@@ -13,6 +13,12 @@ buffers, because the env's are fused into a compiled step; `MessageInputs` and
 step as the messages the graph would have carried and driving the node's builder from them.
 `tests/test_obs_identity.py` is the check: identical message-equivalent inputs, identical tensors.
 
+Contract v2 (2026-10-14, the redesign's B1-B4; `ObsSpecV2`, `ObsBuilderV2`, `ego_columns`) is the
+second section of this file: the newest 1..3 frames, an ego vector of [speed, gyro z] now plus 20
+rows x [speed, gyro z, the 8 issued plan numbers] -- 202 columns, no column a duplicate of another
+-- and the grip dial as one more input. `contract_table_v2(spec)` prints the column table; v1 below
+is unchanged and is what every checkpoint without `version: 2` in its spec reads.
+
 `ScanAugment` adds the optional extra scan channels (`SCAN_CHANNELS`) on the policy side of that
 boundary: they are functions of the scan the env already emits, so the env, the observation spec
 recorded in a checkpoint's `extra["spec"]` and every consumer of that spec are untouched by them.
@@ -740,7 +746,7 @@ class EgoColumn:
     name: str            # e.g. "speed@t", "gyro_z@t-3", "action[5]@t-1"
     quantity: str        # "speed", "gyro_z", "action[k]"
     lag: int             # control steps before the observation; 0 is now
-    norm: str            # what the raw value is divided by, in words
+    norm: str            # what the raw value is divided by; "1 (as issued)": the policy's own [-1, 1]
     mirror: float        # +1 or -1
 
 
@@ -827,7 +833,7 @@ def ego_columns(spec: ObsSpecV2) -> list:
         add("gyro_z", lag, "gyro_scale", -1.0)
         for k in range(int(spec.act_dim)):
             # a curvature flips with the world, a speed does not
-            add(f"action[{k}]", lag, "none: the policy's own [-1, 1] output",
+            add(f"action[{k}]", lag, "1 (as issued)",
                 -1.0 if path.start <= k < path.stop else +1.0)
     return cols
 

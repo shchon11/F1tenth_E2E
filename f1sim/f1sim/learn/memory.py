@@ -296,7 +296,10 @@ def runtime_for(model, batch: Optional[int] = None, device=None) -> PolicyRuntim
     """
     meta = getattr(model, "meta", {}) or {}
     chan = meta.get("scan_channels") or {}
-    rt = PolicyRuntime(memory=bool(meta.get("memory")), channels=chan.get("channels") or (),
+    # A v2 actor (`learn.model_v2`) always carries its GRU state; its meta says so by "arch", which
+    # no v1 meta has.
+    rt = PolicyRuntime(memory=bool(meta.get("memory")) or meta.get("arch") == "v2",
+                       channels=chan.get("channels") or (),
                        n_beams=int(meta.get("n_beams", 0)),
                        tau_s=float(chan.get("memory_tau_s", 2.0)),
                        aligned=chan.get("aligned"), floor=chan.get("floor"))
