@@ -136,6 +136,14 @@ def _check_compatible(path: str, meta: dict, env, spec) -> None:
     half-random driver in the other car. What a pool entry has to be is a policy that can already
     drive this observation.
     """
+    if getattr(env, "obs_version", 1) != 1:
+        # Every pool entry today is a v1 checkpoint, and a v2 env emits no v1 observation. Driving
+        # the league from a v2 learner's env needs a builder per seat (the redesign's stage-1 item
+        # "상대 좌석별 ObsBuilder"); until then this is refused rather than fed the wrong vector.
+        raise ValueError(
+            f"--opp-pool entry {os.path.basename(path)}: this env emits observation contract "
+            f"v{env.obs_version}, and pool opponents are driven off the env's own observation. A "
+            f"per-seat observation builder is needed before a v2 learner can race the pool.")
     want = {"n_beams": env.n_beams, "n_stack": env.ecfg.scan_stack,
             "proprio_dim": spec.proprio_dim, "act_dim": env.act_dim}
     bad = {k: (int(meta.get(k, -1)), int(v)) for k, v in want.items() if int(meta.get(k, -1)) != int(v)}
