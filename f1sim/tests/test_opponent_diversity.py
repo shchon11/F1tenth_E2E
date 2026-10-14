@@ -624,8 +624,6 @@ def _env_cfg_for(monkeypatch, extra_argv):
     (["--spawn-order", "random"], "spawn_order", "random"),
     (["--spawn-alongside-sep", "0.2"], "spawn_alongside_sep", 0.2),
     (["--spawn-alongside-sep-min", "0.1"], "spawn_alongside_sep_min", 0.1),
-    (["--spawn-alongside-hold", "0.5"], "spawn_alongside_hold", 0.5),
-    (["--spawn-alongside-ramp", "0.0"], "spawn_alongside_ramp", 0.0),
     (["--spawn-as-race", "off"], "spawn_as_race", False),
     (["--spawn-alongside-gap", "0.1", "0.3"], "spawn_alongside_gap", (0.1, 0.3)),
     (["--opp-speed", "1.0", "1.3"], "opp_speed_range", (1.0, 1.3)),
@@ -689,7 +687,6 @@ RACE = ["--race-size", "2", "--opponent", "teacher"]
     (["--race-size", "2", "--opponent", "policy", "--opp-events", "defend",
       "--opp-defend-prob", "0.5"], "teacher-driven"),
     (["--race-size", "1", "--opponent", "pool", "--opp-pool", "self"], "--race-size 1"),
-    (RACE + ["--spawn-alongside-hold", "-1"], "--spawn-alongside-hold"),
     (RACE + ["--spawn-alongside-sep", "-0.1"], "--spawn-alongside-sep"),
 ])
 def test_a_configuration_that_would_silently_do_nothing_is_refused(argv, needle):

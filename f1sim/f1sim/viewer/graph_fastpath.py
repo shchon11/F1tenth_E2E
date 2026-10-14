@@ -783,11 +783,6 @@ def _setting(v):
     return v
 
 
-def _hold_setting(h):
-    """`_setting` for a `teacher.LaneHold`: None, or the layout of its per-car weights."""
-    return None if h is None else ("hold",) + _setting(h.w)
-
-
 def _state_owners(env, teacher):
     """The objects whose declared `GRAPH_STATE` a teacher call may carry: the teacher itself, and
     the prop layout it queries, whose cull keeps a running diagnostic total
@@ -811,10 +806,6 @@ class _TeacherCapture:
             "teacher.speed_scale": lambda: _setting(getattr(teacher, "speed_scale", None)),
             "teacher.label_grip": lambda: _setting(getattr(teacher, "label_grip", None)),
             "teacher.offset_limit": lambda: _setting(getattr(teacher, "offset_limit", None)),
-            # The rolling start's lane hold lives on the reference teacher every kind wraps
-            # (`teacher.LaneHold`). Its tensors are inputs the capture follows by path; whether
-            # there is one at all is a branch the graph bakes in, so it is guarded by layout.
-            "teacher.lane_hold": lambda: _hold_setting(getattr(getattr(teacher, "base", teacher), "lane_hold", None)),
             # `getattr(..., None)` throughout: a direct-action env has no tracker at all, and a
             # guard that raises is a capture that fails for a reason nobody reads.
             "tracker": lambda: (id(getattr(env, "tracker", None)), type(getattr(env, "tracker", None)).__name__),

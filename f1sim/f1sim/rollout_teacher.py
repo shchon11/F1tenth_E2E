@@ -160,12 +160,6 @@ class ShadowEnv:
         # (a row tensor, copied above) is a time on the real env's clock.
         S.sim.t = env.sim.t
         S.sim._imu_phase = env.sim._imu_phase
-        # The rolling start's host count (`F1VecEnv._note_spawn_formation`): its rows, held offsets,
-        # weights and episode clocks are row tensors and came across above, but whether the env
-        # recomputes the weights at all this step is this int. The shadow's own ran down in its own
-        # steps, so without it an opponent the real race holds on its placement offset would keep
-        # the weight it had at the refresh in every copy -- held for ever, or never released.
-        S._roll_steps_left = env._roll_steps_left
 
 
 class RolloutTeacher:
