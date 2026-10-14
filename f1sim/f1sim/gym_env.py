@@ -29,7 +29,8 @@ from .mpc import plan_layout as _plan_layout
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit_sided, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
-from .learn.obs import EGO_SENSOR_KEYS, OBS_VERSIONS, V2_MAX_FRAMES, norm_gyro_z
+from .learn.obs import (EGO_SENSOR_KEYS, OBS_VERSIONS, V2_MAX_FRAMES, assemble_ego_v2, norm_gyro_z,
+                        v2_ego_dim, v2_ring_len)
 from .opp_token import (OPP_TOKEN_CARS, OPP_TOKEN_HORIZONS_S, OPP_TOKEN_PLAN_SOURCE,
                         OPP_TOKEN_SCALE, opp_token_car_dim, opp_token_dim, sample_body_traj,
                         straight_traj, to_ego, to_world, validate_opp_token)
@@ -459,9 +460,10 @@ class EnvConfig:
     hist_stride: int = 2             # steps between rows (20 x 2 = the last second): implicit identification of grip / lag
     #: Observation contract (`learn.obs.OBS_VERSIONS`). 1 is every run before 2026-10-14 and the
     #: default leaves it bit-identical (`tests/test_v1_bit_identity.py`). 2 is `learn.obs.ObsSpecV2`:
-    #: {"scan": the newest `scan_stack` (1..3) frames, "ego": [speed, gyro z] now + `hist_len` rows
-    #: of [speed, gyro z, the issued action] `hist_stride` steps apart} -- no speed cap, attitude,
-    #: accelerometer, gyro x/y or prev_action key. Plan mode only; the IMU must be on.
+    #: {"scan": the newest `scan_stack` (1..3) frames, "ego": [speed, gyro z] now + the action issued
+    #: two steps back + `hist_len` rows of [speed, gyro z, the issued action] `hist_stride` steps
+    #: apart} -- no speed cap, attitude, accelerometer, gyro x/y or prev_action key. Plan mode only;
+    #: the IMU must be on.
     obs_version: int = 1
     #: Per-opponent LiDAR visibility for the v2 opponent-slot auxiliary (B8) and the nearest-visible-
     #: car head: each step, the car beams of the newest scan attributed to each seat and the steps
@@ -1014,7 +1016,9 @@ class F1VecEnv:
         if self.obs_version == 2:
             self._check_obs_v2()
             self.hist = None
-            self.hist2 = torch.zeros(self.B, (e.hist_len - 1) * e.hist_stride + 1,
+            # one row per step back, enough for the oldest history row and for a_{t-2}
+            # (`learn.obs.v2_ring_len`: 39 rows for the contract's 20 x 2, as before a_{t-2})
+            self.hist2 = torch.zeros(self.B, v2_ring_len(e.hist_len, e.hist_stride),
                                      len(EGO_SENSOR_KEYS) + self.act_dim, device=self.device)
             self._last_feat2 = torch.zeros(self.B, len(EGO_SENSOR_KEYS), device=self.device)
             #: rows whose next observation is their episode's first: `_obs_v2` fills their history
@@ -1171,7 +1175,7 @@ class F1VecEnv:
         try:
             import gymnasium as gym
             if self.obs_version == 2:
-                ego_dim = len(EGO_SENSOR_KEYS) + int(self.ecfg.hist_len) * (len(EGO_SENSOR_KEYS) + self.act_dim)
+                ego_dim = v2_ego_dim(self.ecfg.hist_len, self.ecfg.hist_stride, self.act_dim)
                 obs = gym.spaces.Dict({
                     "scan": gym.spaces.Box(0.0, 1.0, (self.ecfg.scan_stack, self.n_beams), np.float32),
                     "ego": gym.spaces.Box(-5.0, 5.0, (ego_dim,), np.float32)})
@@ -1729,8 +1733,9 @@ class F1VecEnv:
     def _obs_v2(self, r: StepResult) -> Dict[str, torch.Tensor]:
         """Contract v2 (`learn.obs.ObsSpecV2`): {"scan": the newest frames, "ego": (B, ego_dim)}.
 
-        The ego vector is [speed, gyro z] of THIS observation and the history ring's rows, every
-        `hist_stride`-th -- `learn.obs.ego_columns` is the table. A row whose episode just started
+        The ego vector is [speed, gyro z] of THIS observation, the action issued two steps back and
+        the history ring's rows, every `hist_stride`-th -- `learn.obs.ego_columns` is the table,
+        `learn.obs.assemble_ego_v2` the one assembly the car's builder shares. A row whose episode just started
         is filled here, from its own first observation with zero actions, which is the rule
         `ObsBuilderV2` applies on the car: one rule on both sides, so they agree from the first
         step on rather than only after the history has rolled over. `torch.where` rather than a
@@ -1747,7 +1752,7 @@ class F1VecEnv:
         self.hist2 = torch.where(self._fresh2[:, None, None], fill[:, None, :].expand_as(self.hist2), self.hist2)
         self._fresh2 = torch.zeros_like(self._fresh2)
         self._last_feat2 = feat
-        ego = torch.cat([feat, self.hist2[:, ::e.hist_stride].reshape(self.B, -1)], 1)
+        ego = assemble_ego_v2(feat, self.hist2, e.hist_len, e.hist_stride)
         return {"scan": self.scan_hist[:, ::e.scan_stride].clone(), "ego": ego}
 
     def message_inputs(self, i: int, r: Optional[StepResult] = None) -> MessageInputs:

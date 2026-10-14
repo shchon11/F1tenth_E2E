@@ -39,7 +39,7 @@ def test_the_v2_actor_exports_at_1081_beams_within_1e_5_of_torch(tmp_path, n_fra
     names = " ".join(i.name for i in g.graph.initializer)
     assert not any(h in names for h in ("b8", "beam_car", "near_car")), "a train-time head is in the graph"
     side = json.load(open(str(tmp_path / "actor_v2.json")))
-    assert side["arch"] == "v2" and len(side["ego_columns"]) == 202
+    assert side["arch"] == "v2" and len(side["ego_columns"]) == 210
     assert side["inputs"]["scan"] == [1, n_frames, 1081] and side["inputs"]["hidden"] == [1, 1, 128]
     assert any("dial" in line for line in side["contract"])
 
@@ -52,7 +52,7 @@ def test_the_graph_reads_the_dial_in_mu_and_runs_a_batch(tmp_path):
     export_v2(m, path, steps=2)
     sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
     g = torch.Generator().manual_seed(2)
-    scan = torch.rand(3, 1, 1081, generator=g); ego = 0.3 * torch.randn(3, 202, generator=g)
+    scan = torch.rand(3, 1, 1081, generator=g); ego = 0.3 * torch.randn(3, 210, generator=g)
     dial = torch.tensor([[0.55], [0.75], [1.0]])
     h = torch.zeros(1, 3, 128)
     a_o, h_o = sess.run(None, {"scan": scan.numpy(), "ego": ego.numpy(), "dial": dial.numpy(), "hidden": h.numpy()})
@@ -83,7 +83,7 @@ def test_the_wrapper_is_the_actors_step():
     m = ActorCriticV2(n_beams=271).eval()
     from f1sim.learn.conditioning import CondSpec
     w = ActorV2Only(m.actor, CondSpec.from_meta(m.meta["cond"]))
-    scan, ego, dial = torch.rand(2, 1, 271), torch.randn(2, 202), torch.full((2, 1), 0.8)
+    scan, ego, dial = torch.rand(2, 1, 271), torch.randn(2, 210), torch.full((2, 1), 0.8)
     with torch.no_grad():
         a, h = w(scan, ego, dial, m.actor.initial_hidden(2))
         b, k = m.actor.step(scan, ego, (dial - 1.0) / 0.25, m.actor.initial_hidden(2))
@@ -102,6 +102,6 @@ def test_the_budget_table_runs_and_leaves_no_files(tmp_path, monkeypatch):
     finally:
         torch.set_num_threads(threads)
     r = rows[0]
-    assert r["params"]["actor (deployed)"] == 860_592 and r["torch_ms"] > 0      # 271 beams: a 9-cell neck
+    assert r["params"]["actor (deployed)"] == 861_616 and r["torch_ms"] > 0      # 271 beams: a 9-cell neck
     assert r["onnx_max_abs_err"] <= 1e-5 and r["onnxruntime_ms"] > 0
     assert os.listdir(str(tmp_path)) == []

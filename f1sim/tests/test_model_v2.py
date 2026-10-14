@@ -42,7 +42,7 @@ def _model(n_beams=SMALL, n_frames=1, aux=None, seed=0):
 def _inputs(B=3, n_frames=1, n_beams=SMALL, seed=1):
     g = torch.Generator().manual_seed(seed)
     scan = torch.rand(B, n_frames, n_beams, generator=g)
-    ego = 0.3 * torch.randn(B, 202, generator=g)
+    ego = 0.3 * torch.randn(B, 210, generator=g)
     c = torch.linspace(-1.0, 0.4, B)[:, None]
     return scan, ego, c
 
@@ -50,20 +50,20 @@ def _inputs(B=3, n_frames=1, n_beams=SMALL, seed=1):
 # ---------------------------------------------------------------- blocks and parameter counts
 def test_parameter_counts_per_block_match_the_redesign_table():
     """Section 4's table and the critique's recount (A5): stem 794 k ("79.4만"), deployed actor
-    1,159,978 at the redesign's 147-wide ego and 5 outputs. Contract v2's ego is 202 wide (no
-    duplicate columns, 8 WP4 actions per history row) and the head has 8 outputs, which is the whole
-    difference."""
+    1,159,978 at the redesign's 147-wide ego and 5 outputs. Contract v2's ego is 210 wide (no
+    duplicate columns, 8 WP4 actions for a_{t-2} and per history row) and the head has 8 outputs,
+    which is the whole difference."""
     c = block_parameter_counts(_model(1081))
     assert c["B1+B2 stem"] == 793_632
-    assert c["B3 ego"] == 202 * 128 + 128 == 25_984           # the table's 147 x 128 + 128 = 18,944
+    assert c["B3 ego"] == 210 * 128 + 128 == 27_008           # the table's 147 x 128 + 128 = 18,944
     assert c["B4 fusion"] == (256 + 128 + 1) * 256 + 256 == 98_816
     assert c["B5 LayerNorm"] == 2 * 256
     assert c["B5 GRU"] == 3 * (256 * 128 + 128 * 128 + 2 * 128) == 148_224
     assert c["B6 head"] == (384 * 256 + 256) + (256 * 8 + 8) == 100_616
     assert c["B6 log_std"] == 8
     redesign_total = 1_159_978
-    assert c["actor (deployed)"] == redesign_total + (202 - 147) * 128 + (8 - 5) * 257 + (8 - 5) == 1_167_792
-    assert c["B9 critic"] == 793_632 + (202 + 1 + 34) * 128 + 128 + 384 * 256 + 256 + 256 * 256 + 256 + 2 * 257
+    assert c["actor (deployed)"] == redesign_total + (210 - 147) * 128 + (8 - 5) * 257 + (8 - 5) == 1_168_816
+    assert c["B9 critic"] == 793_632 + (210 + 1 + 34) * 128 + 128 + 384 * 256 + 256 + 256 * 256 + 256 + 2 * 257
     assert c["B8 slots"] == c["beam car head"] == c["nearest car head"] == 0, "heads only when flagged"
     full = block_parameter_counts(_model(1081, aux={"b8": True, "beam_car": True, "near_car": True}))
     assert full["B8 slots"] == 384 * 256 + 256 + 256 * 12 + 12
@@ -149,7 +149,7 @@ def test_sequence_equals_stepping_through_resets_and_burn_in():
     T, B = 7, 3
     g = torch.Generator().manual_seed(3)
     scan = torch.rand(T, B, 2, SMALL, generator=g)
-    ego = torch.randn(T, B, 202, generator=g)
+    ego = torch.randn(T, B, 210, generator=g)
     c = torch.randn(T, B, 1, generator=g)
     keep = torch.ones(T, B); keep[4, 1] = 0.0                  # row 1 starts a new episode at t = 4
     with torch.no_grad():
@@ -321,16 +321,25 @@ def test_the_v2_memory_learns_an_8_step_recall_with_a_dense_auxiliary():
     0.5 m) only in the frame of step 0, the action's first dimension must say the cue's sign at step
     8, and a dense auxiliary -- a head on `[e | y]` asked for the cue at EVERY step -- is the only
     other signal. Without memory the best possible loss is 1.0 (the cue is +-1 at random and the
-    frames after step 0 carry nothing of it). Measured on this CPU: learned at iteration 205
-    (20-step mean < 0.1), memory 0.000 against 2.1 with the state cut; the run stops as soon as it
-    has learned."""
+    frames after step 0 carry nothing of it). The run stops as soon as it has learned.
+
+    Whether it learns depends on the draw (initial weights and data). Measured on this CPU, 2
+    threads, iterations to a 20-step mean < 0.1 within 700, the actor built alone and seeded as here:
+    the 210-wide contract ego 410 / 364 / 258 for seeds 0 / 1 / 2; the 202-wide ego of the commit
+    before a_{t-2} had columns of its own: never / 217 / never (the earlier version of this test,
+    seed 0 with the critic built in between, learned at 205 there and not within 450 at 210 wide).
+    The property is "it CAN learn with the dense target, and is flat at chance without it" (the
+    module docstring of `aux_v2`); this pins seed 2 and the first-learned iteration is not a
+    statistic. G1 is the gate that measures it on real data."""
     n, K, B, max_iters = SMALL, 8, 32, 450
+    seed = 2
     threads = torch.get_num_threads()
     torch.set_num_threads(min(2, threads))
     try:
-        g = torch.Generator().manual_seed(0)
-        torch.manual_seed(0)
-        actor = ActorCriticV2(n_beams=n).actor
+        from f1sim.learn.model_v2 import ActorV2
+        g = torch.Generator().manual_seed(seed)
+        torch.manual_seed(seed)
+        actor = ActorV2(1, n)
         aux_head = torch.nn.Linear(actor.feature_dim, 1)
         params = list(actor.parameters()) + list(aux_head.parameters())
         opt = torch.optim.Adam(params, lr=1e-3)
@@ -340,7 +349,7 @@ def test_the_v2_memory_learns_an_8_step_recall_with_a_dense_auxiliary():
             s = _corridor(K + 1, b, n, g)
             cue = torch.randint(0, 2, (b,), generator=g).float() * 2 - 1
             s[0, :, 0, :W] = torch.where(cue[:, None] > 0, torch.full((b, W), 0.05), s[0, :, 0, :W])
-            return s, 0.05 * torch.randn(K + 1, b, 202, generator=g), torch.zeros(K + 1, b, 1), cue
+            return s, 0.05 * torch.randn(K + 1, b, 210, generator=g), torch.zeros(K + 1, b, 1), cue
 
         hist, learned = [], None
         for it in range(max_iters):

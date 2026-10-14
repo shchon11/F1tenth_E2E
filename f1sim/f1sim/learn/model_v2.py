@@ -4,7 +4,7 @@ docs/research/architecture-redesign-2026-10-13.md (section 4 "새 구조", corre
 "관문 결과와 설계 정정") with the WP4 plan output of docs/research/output-format-2026-10-14.md:
 
     scan (B, K, N) ─► B1 [frames | 9-tap min-pool of frame 0] ─► B2 ResNet stem, no bypass ─► s (256)
-    ego  (B, 202)  ─► B3 Linear ─► GELU ─────────────────────────────────────────────────────► p (128)
+    ego  (B, 210)  ─► B3 Linear ─► GELU ─────────────────────────────────────────────────────► p (128)
     dial c (B, 1)  ───────────────────────────────────────────────────────────────────────────► c
                       B4  e = GELU(Linear([s | p | c] -> 256))
                       B5  y, h' = GRU(LayerNorm(e), h)      (128, chrono update gate)
@@ -22,7 +22,8 @@ Why each choice, with the measurement that decided it (the redesign's ledger, se
   fc variance, the neck alone reads sector distance at R^2 0.81-0.95, and the bypass was what broke
   the ONNX export. 794 k parameters; G1's trainable copy of exactly this stem is what made occluded
   recall work (R^2 0.609).
-* B3 -- the ego vector of contract v2 (`learn.obs.ObsSpecV2`, 202 columns, none duplicated).
+* B3 -- the ego vector of contract v2 (`learn.obs.ObsSpecV2`, 210 columns, none duplicated: now,
+  a_{t-2}, and 20 history rows that start with a_{t-1}'s step).
 * B4 -- the dial is an ordinary input column: v1's zero-initialised additive projection existed
   only to keep a warm start bit-identical, and there is nothing to warm-start here. Not LayerNorm'd
   on its own (a one-wide LayerNorm is a constant, which would kill the dial -- a judge's catch).
@@ -59,6 +60,9 @@ from .aux_v2 import AUX_HEADS, BeamCarHead, NearestCarHead, OpponentSlotHead, au
 from .memory import Hidden
 from .model import ResBlock1d
 from .obs import MINPOOL_TAPS, ObsSpecV2
+
+#: The contract's ego width (`learn.obs.ObsSpecV2`, 210): the default every v2 module is built at.
+EGO_DIM = ObsSpecV2().ego_dim
 
 #: `meta["arch"]` of every v2 checkpoint. A v1 checkpoint has no "arch" key at all.
 ARCH = "v2"
@@ -183,7 +187,7 @@ def init_stem_from_v1(stem: StemV2, v1_stem: dict, v1_meta: dict) -> list:
 class ActorV2(nn.Module):
     """B1-B6. `step` / `forward` is the deployed function: (scan, ego, c, h) -> (action, h')."""
 
-    def __init__(self, n_frames: int = 1, n_beams: int = 1081, ego_dim: int = 202, act_dim: int = 8,
+    def __init__(self, n_frames: int = 1, n_beams: int = 1081, ego_dim: int = EGO_DIM, act_dim: int = 8,
                  speed_mode: str = "wp4", hidden: int = 128, width: int = 256, ego_width: int = 128):
         super().__init__()
         self.act_dim, self.hidden_size, self.width = int(act_dim), int(hidden), int(width)
@@ -346,7 +350,7 @@ class CriticV2(nn.Module):
     so the two can share one stored observation. The value is in the normalised units the training
     unit's value normaliser defines; this module only produces it."""
 
-    def __init__(self, n_beams: int = 1081, ego_dim: int = 202, priv_dim: int = 34, width: int = 256,
+    def __init__(self, n_beams: int = 1081, ego_dim: int = EGO_DIM, priv_dim: int = 34, width: int = 256,
                  branch: int = 128):
         super().__init__()
         self.ego_dim, self.priv_dim = int(ego_dim), int(priv_dim)
@@ -374,7 +378,7 @@ class ActorCriticV2(nn.Module):
     """The v2 pair. Every constructor argument is recorded in `meta` and nothing else is, so
     `ActorCriticV2(**meta)` rebuilds it (`load_v2`)."""
 
-    def __init__(self, arch: str = ARCH, n_beams: int = 1081, n_frames: int = 1, ego_dim: int = 202,
+    def __init__(self, arch: str = ARCH, n_beams: int = 1081, n_frames: int = 1, ego_dim: int = EGO_DIM,
                  act_dim: int = 8, speed_mode: str = "wp4", priv_dim: int = 34, hidden: int = 128,
                  cond_dim: int = 1, cond: Optional[dict] = None, obs: Optional[dict] = None,
                  aux: Optional[dict] = None):
