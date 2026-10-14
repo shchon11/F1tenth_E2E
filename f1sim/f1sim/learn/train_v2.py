@@ -9,6 +9,10 @@ stated numbers so the tests can hold it on its own (`tests/test_train_v2.py`):
   `gym_env.PRIV_V2_MIRROR`, `aux_v2.B8_LABEL_MIRROR`, `aux_v2.NEAR_MIRROR`). G1's appendix-2 result:
   the visible-opponent lateral error p50 0.138 m missed the 0.10 m bar, and the left-right flip with a
   longer run reached 0.097 -- so the flip is part of the recipe ("좌우 반전 증강 추가").
+* **`ActionDropout`** -- per sequence, every issued-action column of the ego zeroed (the copycat
+  study's arm B, docs/research/copycat-2026-10-14.md): the v2smoke_b student came to repeat the
+  speeds it had issued (a +0.5 m/s history raised its output 0.38-0.41 m/s) instead of reading the
+  scan; with the columns gone from half the sequences the trunk has to answer from the sensors.
 * **`bc_loss_wp4`** -- imitation in the DECODED space (output-format 5): Huber on the four
   waypoints' lateral position [m] and on their speed [m/s], through `mpc.decode_wp4` and
   `mpc.wp4_path`. In the normalised space a unit of kappa_1 moves the window's end by 4.76 m and a
@@ -47,7 +51,7 @@ import torch.nn.functional as F
 from ..gym_env import OPP_MEMORY_STEPS, OPP_NEVER_SEEN, PRIV_V2_MIRROR
 from ..mpc import WP_K, PlanSpec, decode, decode_wp4, encode_wp4, plan_length, wp4_path, wp4_refit
 from .aux_v2 import B8_LABEL_MIRROR, B8_SLOTS, NEAR_MIRROR, b8_know_mask, b8_loss
-from .obs import ObsSpecV2, action_mirror_signs, ego_mirror_signs
+from .obs import ObsSpecV2, action_columns, action_mirror_signs, ego_mirror_signs
 
 
 # ---------------------------------------------------------------------------------- mirroring
@@ -92,6 +96,48 @@ class Mirror:
             sel = flip.to(v.device).view(1, -1, *([1] * (v.dim() - 2)))
             out[k] = torch.where(sel, self.mirrored(k, v), v)
         return out
+
+
+class ActionDropout:
+    """Action-history dropout over a block of training sequences: with probability `p` per
+    sequence, every ego column that holds an issued action (`obs.action_columns`: a_{t-2} and every
+    history row's plan) is zero for the WHOLE sequence -- burn-in and scored steps alike, so the
+    recurrent state never meets a history that appears half way -- and the measured columns (speed,
+    gyro z, now and in the history) are untouched. Training only: collection and evaluation read the
+    columns as the car does.
+
+    Why (the copycat study's arm B, docs/research/copycat-2026-10-14.md; ChauffeurNet's past-motion
+    dropout is the same remedy): three v2 DAgger iterations on e3781a7 (v2smoke_b) took ICCAS solo
+    completion 55 -> 11 -> 2 of 128 while the student's output speed tracked its own issued speeds
+    (+0.5 m/s in the history's speed columns -> +0.38-0.41 m/s out, a gain of 0.75-0.82 at iteration
+    2). Zero is the value an episode's first history already holds (`ObsBuilderV2`'s fill), so a
+    dropped sequence is a state the network meets at every respawn anyway."""
+
+    def __init__(self, spec: ObsSpecV2, p: float):
+        if not 0.0 <= float(p) <= 1.0:
+            raise ValueError(f"action dropout is a probability, got {p}")
+        self.p = float(p)
+        self.cols = action_columns(spec)
+        if self.p > 0 and not self.cols:
+            raise ValueError("action dropout on a contract without issued-action columns "
+                             "(ego_actions off): there is nothing to drop")
+        keep = torch.ones(int(spec.ego_dim))
+        keep[list(self.cols)] = 0.0
+        self.keep = keep
+
+    def draw(self, m: int, device=None) -> torch.Tensor:
+        """(m,) bool: which of `m` sequences lose their action columns. Drawn on `device`, as the
+        mirror's flips are, so the CPU stream that picks the sequences is the one a run without
+        dropout has."""
+        return torch.rand(m, device=device) < self.p
+
+    def apply(self, batch: Dict[str, torch.Tensor], drop: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """`batch` holds (T, m, ...) tensors; returns it with `ego` zeroed in the action columns of the
+        sequences `drop` (m,) marks. Every other key comes back as it was."""
+        ego = batch["ego"]
+        keep = self.keep.to(device=ego.device, dtype=ego.dtype)
+        sel = drop.to(ego.device).view(1, -1, 1)
+        return {**batch, "ego": torch.where(sel, ego * keep, ego)}
 
 
 def mirror_state(state: torch.Tensor, x_lo: float, x_hi: float) -> torch.Tensor:

@@ -838,6 +838,15 @@ def main():
                     help="v2: each episode the learner's speed cap is drawn uniformly in [LO, HI] m/s and not "
                          "observed, so its speed history stays in distribution at the car's 4 m/s cap "
                          "(default 3 9; 0 0 = off, the fixed --speed-cap)")
+    ap.add_argument("--v2-ego-actions", choices=("on", "off"), default=None,
+                    help="v2: whether the ego vector carries the plans the policy issued (a_{t-2} and the 1 s "
+                         "history's). off: [speed, gyro z] now and the history's [speed, gyro z] only -- the "
+                         "copycat study's arm A (docs/research/copycat-2026-10-14.md). Default: --init's "
+                         "contract, else the contract default (learn.obs.EGO_ACTIONS_DEFAULT)")
+    ap.add_argument("--action-dropout", type=float, default=None, metavar="P",
+                    help="v2: per training sequence, with probability P zero every issued-action column of the "
+                         "ego (a_{t-2} and the history's), never at collection or evaluation -- the copycat "
+                         "study's arm B (docs/research/copycat-2026-10-14.md; default 0)")
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
     v2_applied = None
@@ -847,7 +856,8 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
                               "aux_beam_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta",
-                              "bc_clearance", "learner_cap_range", "opponent_speed_mode")
+                              "bc_clearance", "learner_cap_range", "opponent_speed_mode", "v2_ego_actions",
+                              "action_dropout")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")

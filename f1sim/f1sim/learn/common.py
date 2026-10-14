@@ -33,9 +33,11 @@ def validate_policy_observation(saved: dict, env) -> None:
         raise ValueError("policy checkpoint has no observation specification")
     cls = ObsSpec
     if int(saved.get("version", 1)) == 2:
-        # contract v2 (`learn.obs.ObsSpecV2`): the same field-by-field comparison, on its own fields
+        # contract v2 (`learn.obs.ObsSpecV2`): the same field-by-field comparison, on its own fields,
+        # with a dict older than one of them read as what it meant then (`ObsSpecV2.from_dict`)
         from .obs import ObsSpecV2 as cls
-    expected = cls(**{key: value for key, value in saved.items() if key in cls.__dataclass_fields__})
+    fields = {key: value for key, value in saved.items() if key in cls.__dataclass_fields__}
+    expected = cls.from_dict(fields) if hasattr(cls, "from_dict") else cls(**fields)
     actual = obs_spec(env)
     if type(actual) is not cls:
         raise ValueError(f"policy observation contract v{int(saved.get('version', 1))}, environment emits "
@@ -349,7 +351,7 @@ def obs_spec(env: F1VecEnv):
         return ObsSpecV2(n_beams=env.n_beams, n_frames=e.scan_stack, frame_stride=e.scan_stride,
                          act_dim=env.act_dim, speed_mode=e.speed_mode, hist_len=e.hist_len,
                          hist_stride=e.hist_stride, range_max=env.range_max, v_max=e.v_max_policy,
-                         gyro_scale=e.imu_gyro_scale).validate()
+                         gyro_scale=e.imu_gyro_scale, ego_actions=bool(e.ego_actions)).validate()
     return ObsSpec(n_beams=env.n_beams, scan_stack=e.scan_stack, scan_stride=e.scan_stride, action_history=e.action_history,
                    act_dim=env.act_dim, hist_len=e.hist_len, hist_stride=e.hist_stride, range_max=env.range_max, v_max=e.v_max_policy,
                    gyro_scale=e.imu_gyro_scale, accel_scale=e.imu_accel_scale,

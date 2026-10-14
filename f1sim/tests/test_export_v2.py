@@ -44,6 +44,22 @@ def test_the_v2_actor_exports_at_1081_beams_within_1e_5_of_torch(tmp_path, n_fra
     assert any("dial" in line for line in side["contract"])
 
 
+def test_the_contract_without_issued_actions_exports_its_42_columns(tmp_path):
+    """Arm A of the copycat study (`ObsSpecV2.ego_actions` False): the graph's `ego` input is 42 wide
+    and the sidecar's table -- what the car builds -- names no issued action."""
+    from f1sim.learn.obs import ObsSpecV2
+    torch.manual_seed(4)
+    spec = ObsSpecV2(ego_actions=False)
+    m = ActorCriticV2(n_beams=1081, ego_dim=spec.ego_dim, obs=dict(vars(spec))).eval()
+    path = str(tmp_path / "actor_a.onnx")
+    rep = export_v2(m, path, steps=5)
+    assert rep["max_abs_err"] is not None and rep["max_abs_err"] <= 1e-5, rep
+    side = json.load(open(str(tmp_path / "actor_a.json")))
+    assert side["inputs"]["ego"] == [1, 42] and len(side["ego_columns"]) == 42
+    assert not any("action[" in c for c in side["ego_columns"]) and side["spec"]["ego_actions"] is False
+    assert any("issued actions: none" in line for line in side["contract"])
+
+
 def test_the_graph_reads_the_dial_in_mu_and_runs_a_batch(tmp_path):
     from f1sim.learn.conditioning import CondSpec, mu_to_c
     torch.manual_seed(1)

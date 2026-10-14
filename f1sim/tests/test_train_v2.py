@@ -9,6 +9,9 @@
 * the mirror: an involution on every key, applied per sequence, and -- where the simulator can check
   it -- the mirrored teacher label IS the label of the mirrored state, and the mirrored env's scan,
   B8 / nearest-car / per-beam labels and critic geometry are the sign tables applied to the original's;
+* the action-history dropout (the copycat study's arm B): a dropped sequence loses every issued-action
+  column for every step and keeps every measured one, the others are untouched, it commutes with the
+  mirror, and a contract without action columns refuses it;
 * the B8 window: knowable only what the state saw since it started;
 * per-loss gradient norms and the parameter-movement measure.
 """
@@ -28,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from f1sim.gym_env import OPP_NEVER_SEEN, PRIV_V2_MIRROR  # noqa: E402
 from f1sim.learn import train_v2 as tv  # noqa: E402
 from f1sim.learn.aux_v2 import B8_LABEL_MIRROR, NEAR_MIRROR  # noqa: E402
-from f1sim.learn.obs import ObsSpecV2, action_mirror_signs, ego_columns, mirror_scan  # noqa: E402
+from f1sim.learn.obs import ObsSpecV2, action_columns, action_mirror_signs, ego_columns, mirror_scan  # noqa: E402
 from f1sim.mpc import PlanSpec, encode_wp4, plan_length  # noqa: E402
 
 SPEC = PlanSpec(speed_mode="wp4")
@@ -310,6 +313,45 @@ def test_mirroring_twice_is_the_identity_on_every_key_and_only_flipped_sequences
     assert torch.equal(once["b8_lab"][:, 0], b["b8_lab"][:, 0] * torch.tensor(B8_LABEL_MIRROR))
     assert torch.equal(once["near"][:, 0], b["near"][:, 0] * torch.tensor(NEAR_MIRROR))
     assert torch.equal(once["priv"][:, 0], b["priv"][:, 0] * torch.tensor(PRIV_V2_MIRROR))
+
+
+# ---------------------------------------------------------------- the action-history dropout (arm B)
+def test_action_dropout_zeroes_every_issued_action_of_a_dropped_sequence_and_nothing_else():
+    spec, b = _batch(T=6, m=4)
+    drop = torch.tensor([True, False, False, True])
+    out = tv.ActionDropout(spec, 0.5).apply(b, drop)
+    act = list(action_columns(spec))
+    meas = [c.index for c in ego_columns(spec) if not c.quantity.startswith("action[")]
+    assert len(act) == 168 and len(meas) == 42
+    for j in range(4):
+        if drop[j]:
+            assert out["ego"][:, j][:, act].abs().sum() == 0, "a dropped sequence keeps an action column"
+            assert torch.equal(out["ego"][:, j][:, meas], b["ego"][:, j][:, meas]), "a measured column moved"
+        else:
+            assert torch.equal(out["ego"][:, j], b["ego"][:, j])
+    for k in b:
+        if k != "ego":
+            assert out[k] is b[k], k
+    # with the mirror, in either order: zero is zero under a sign
+    mir = tv.Mirror(spec)
+    flip = torch.tensor([True, True, False, False])
+    d = tv.ActionDropout(spec, 0.5)
+    assert torch.equal(d.apply(mir.apply(b, flip), drop)["ego"], mir.apply(d.apply(b, drop), flip)["ego"])
+
+
+def test_action_dropout_draws_per_sequence_and_refuses_a_contract_without_actions():
+    spec = ObsSpecV2(n_beams=31)
+    torch.manual_seed(0)
+    draws = tv.ActionDropout(spec, 0.5).draw(20000)
+    assert draws.dtype == torch.bool and abs(float(draws.float().mean()) - 0.5) < 0.02
+    assert not bool(tv.ActionDropout(spec, 0.0).draw(100).any()) and bool(tv.ActionDropout(spec, 1.0).draw(100).all())
+    a = ObsSpecV2(n_beams=31, ego_actions=False)
+    with pytest.raises(ValueError):
+        tv.ActionDropout(a, 0.5)
+    assert tv.ActionDropout(a, 0.0).cols == ()          # nothing asked, nothing to drop: allowed
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError):
+            tv.ActionDropout(spec, bad)
 
 
 def test_the_mirror_of_a_state_is_an_involution():

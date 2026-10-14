@@ -464,10 +464,10 @@ V2_ARMS = ("legacy",)
 def _v2_spec_problems(meta: Dict[str, Any], spec, skipped: List[str], env_act_dim: int) -> List[str]:
     """`obs_spec_problems` for a v2 checkpoint in a v2 session: the contract field by field."""
     from ..learn.obs import ObsSpecV2
-    want = ObsSpecV2(**(meta.get("obs") or {}))
+    want = ObsSpecV2.from_dict(meta.get("obs") or {})
     labels = (("n_beams", "LiDAR 빔 수"), ("n_frames", "스캔 프레임 수"), ("frame_stride", "프레임 간격"),
               ("hist_len", "이력 행 수"), ("hist_stride", "이력 간격"), ("act_dim", "행동 차원"),
-              ("speed_mode", "plan 형식"))
+              ("speed_mode", "plan 형식"), ("ego_actions", "ego 의 지난 행동 열"))
     out = [f"{label}: 체크포인트 {getattr(want, key)} vs 이 세션 {getattr(spec, key)}"
            for key, label in labels if getattr(want, key) != getattr(spec, key)]
     if int(meta.get("act_dim", want.act_dim)) != int(env_act_dim):
@@ -1063,11 +1063,16 @@ class SimWorker:
         # its own contract when the run wrote none (`meta["obs"]` is what the network was built for).
         spec = extra.get("spec") or ((model.meta.get("obs") or {}) if is_v2 else {})
         if is_v2:
-            # contract v2: the env emits {"scan": the newest n_frames, "ego": the 210-wide vector}
+            # contract v2: the env emits {"scan": the newest n_frames, "ego": the 210-wide vector (42
+            # without the issued actions)}
             # (`F1VecEnv._obs_v2`, the same assembly as the car's `ObsBuilderV2`), with the frames and
             # history the contract names; v1's action history, attitude and accelerometer are not in it
+            from ..learn.obs import ObsSpecV2
             obs_kw = dict(obs_version=2, scan_stack=int(spec["n_frames"]), scan_stride=int(spec["frame_stride"]),
-                          hist_len=int(spec["hist_len"]), hist_stride=int(spec["hist_stride"]))
+                          hist_len=int(spec["hist_len"]), hist_stride=int(spec["hist_stride"]),
+                          # with or without the issued actions (`ObsSpecV2.ego_actions`; a spec older
+                          # than the field had them)
+                          ego_actions=bool(ObsSpecV2.from_dict(spec).ego_actions))
         else:
             obs_kw = dict(scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
                           hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2))

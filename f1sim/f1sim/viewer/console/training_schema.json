@@ -6566,6 +6566,47 @@
           "separator": "space"
         },
         {
+          "flag": "--v2-ego-actions",
+          "flags": [
+            "--v2-ego-actions"
+          ],
+          "dest": "v2_ego_actions",
+          "label": "v2 ego 에 지난 행동(plan) 열 포함 (off = 속도·yaw rate 이력만, copycat 대책 A)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "on",
+            "off"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: whether the ego vector carries the plans the policy issued (a_{t-2} and the 1 s history's). off: [speed, gyro z] now and the history's [speed, gyro z] only -- the copycat study's arm A (docs/research/copycat-2026-10-14.md). Default: --init's contract, else the contract default (learn.obs.EGO_ACTIONS_DEFAULT)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--action-dropout",
+          "flags": [
+            "--action-dropout"
+          ],
+          "dest": "action_dropout",
+          "label": "v2 행동 이력 dropout 확률 (학습 sequence 마다 지난 행동 열을 0으로, copycat 대책 B)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: per training sequence, with probability P zero every issued-action column of the ego (a_{t-2} and the history's), never at collection or evaluation -- the copycat study's arm B (docs/research/copycat-2026-10-14.md; default 0)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "P"
+        },
+        {
           "flag": "--race-size",
           "flags": [
             "--race-size"

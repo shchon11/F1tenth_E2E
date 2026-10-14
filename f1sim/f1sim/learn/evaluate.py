@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from ..gym_env import OPP_FUTURE_MODELS, EnvConfig
+from ..mpc import SPEED_MODES
 from .. import opponent_slots as opp_sl
 from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events, split_events
@@ -254,9 +255,12 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     # network) names its fields differently -- frames, not a stack -- and the env has to be told to emit
     # that contract (`EnvConfig.obs_version`); everything else about the run is the same.
     if int(spec.get("version", 1)) == 2:
+        from .obs import ObsSpecV2
         obs_kw = dict(obs_version=2, scan_stack=int(spec["n_frames"]), scan_stride=int(spec["frame_stride"]),
                       hist_len=int(spec["hist_len"]), hist_stride=int(spec["hist_stride"]),
-                      v_max_policy=float(spec["v_max"]), imu_gyro_scale=float(spec["gyro_scale"]))
+                      v_max_policy=float(spec["v_max"]), imu_gyro_scale=float(spec["gyro_scale"]),
+                      # with or without the issued actions; a spec older than the field had them
+                      ego_actions=bool(ObsSpecV2.from_dict(spec).ego_actions))
     else:
         obs_kw = dict(scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
                       hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
@@ -587,8 +591,12 @@ def main() -> None:
                     help="[s] low-pass on a 'profile' speed command (EnvConfig.speed_command_tau)")
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
                     help="who sets the VESC speed command. Default: the checkpoint's own (tracker for every run before 2026-09-28)")
-    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget", "timed", "tspeed"], default=None,
-                    help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). Default: the checkpoint's own")
+    # Every mode the tracker reads (`mpc.SPEED_MODES`), so the WP4 teacher -- the v2 student's -- is
+    # one command line too; the v2smoke had to call `evaluate()` from a script to score it.
+    ap.add_argument("--speed-mode", choices=list(SPEED_MODES), default=None,
+                    help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES; wp4: the v2 network's "
+                         "four waypoints). Default: the checkpoint's own; with --teacher, the format the "
+                         "teacher writes its labels in")
     ap.add_argument("--dial-offset", type=float, default=0.0,
                     help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
                          "right; -0.15 is an operator erring on the safe side)")

@@ -29,8 +29,8 @@ from .mpc import plan_layout as _plan_layout
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit_sided, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
-from .learn.obs import (EGO_SENSOR_KEYS, OBS_VERSIONS, V2_MAX_FRAMES, assemble_ego_v2, norm_gyro_z,
-                        v2_ego_dim, v2_ring_len)
+from .learn.obs import (EGO_ACTIONS_DEFAULT, EGO_SENSOR_KEYS, OBS_VERSIONS, V2_MAX_FRAMES, assemble_ego_v2,
+                        norm_gyro_z, v2_ego_dim, v2_ring_len)
 from .opp_token import (OPP_TOKEN_CARS, OPP_TOKEN_HORIZONS_S, OPP_TOKEN_PLAN_SOURCE,
                         OPP_TOKEN_SCALE, opp_token_car_dim, opp_token_dim, sample_body_traj,
                         straight_traj, to_ego, to_world, validate_opp_token)
@@ -469,6 +469,12 @@ class EnvConfig:
     #: apart} -- no speed cap, attitude, accelerometer, gyro x/y or prev_action key. Plan mode only;
     #: the IMU must be on.
     obs_version: int = 1
+    #: Contract v2 only (`learn.obs.ObsSpecV2.ego_actions`): whether the ego vector carries the
+    #: actions the policy issued (a_{t-2} and every history row's plan). False is the copycat study's
+    #: arm A -- [speed, gyro z] now and the history's [speed, gyro z], 42 columns -- because the issued
+    #: actions were measured to be what v2 DAgger's student copied (docs/research/copycat-2026-10-14.md).
+    #: The history ring records the actions either way; only the assembly reads less.
+    ego_actions: bool = EGO_ACTIONS_DEFAULT
     #: Per-opponent LiDAR visibility for the v2 opponent-slot auxiliary (B8) and the nearest-visible-
     #: car head: each step, the car beams of the newest scan attributed to each seat and the steps
     #: since each seat was last seen (>= 3 beams within 6 m of the LiDAR). Off computes nothing.
@@ -1229,6 +1235,9 @@ class F1VecEnv:
         if not 1 <= int(e.scan_stack) <= V2_MAX_FRAMES:
             raise ValueError(f"obs_version 2 takes the newest 1..{V2_MAX_FRAMES} frames; "
                              f"scan_stack is {e.scan_stack}")
+        if not isinstance(e.ego_actions, (bool, np.bool_)):
+            raise ValueError(f"ego_actions is a bool (the v2 ego with or without the issued actions), "
+                             f"got {e.ego_actions!r}")
         if int(e.hist_len) < 1:
             raise ValueError("obs_version 2's ego vector is its history: hist_len must be >= 1 "
                              "(the contract's is 20 rows, hist_stride 2)")
@@ -1237,7 +1246,8 @@ class F1VecEnv:
         try:
             import gymnasium as gym
             if self.obs_version == 2:
-                ego_dim = v2_ego_dim(self.ecfg.hist_len, self.ecfg.hist_stride, self.act_dim)
+                ego_dim = v2_ego_dim(self.ecfg.hist_len, self.ecfg.hist_stride, self.act_dim,
+                                     bool(self.ecfg.ego_actions))
                 obs = gym.spaces.Dict({
                     "scan": gym.spaces.Box(0.0, 1.0, (self.ecfg.scan_stack, self.n_beams), np.float32),
                     "ego": gym.spaces.Box(-5.0, 5.0, (ego_dim,), np.float32)})
@@ -1847,7 +1857,8 @@ class F1VecEnv:
         """Contract v2 (`learn.obs.ObsSpecV2`): {"scan": the newest frames, "ego": (B, ego_dim)}.
 
         The ego vector is [speed, gyro z] of THIS observation, the action issued two steps back and
-        the history ring's rows, every `hist_stride`-th -- `learn.obs.ego_columns` is the table,
+        the history ring's rows, every `hist_stride`-th (without the issued actions when
+        `EnvConfig.ego_actions` is off) -- `learn.obs.ego_columns` is the table,
         `learn.obs.assemble_ego_v2` the one assembly the car's builder shares. A row whose episode just started
         is filled here, from its own first observation with zero actions, which is the rule
         `ObsBuilderV2` applies on the car: one rule on both sides, so they agree from the first
@@ -1865,7 +1876,7 @@ class F1VecEnv:
         self.hist2 = torch.where(self._fresh2[:, None, None], fill[:, None, :].expand_as(self.hist2), self.hist2)
         self._fresh2 = torch.zeros_like(self._fresh2)
         self._last_feat2 = feat
-        ego = assemble_ego_v2(feat, self.hist2, e.hist_len, e.hist_stride)
+        ego = assemble_ego_v2(feat, self.hist2, e.hist_len, e.hist_stride, bool(e.ego_actions))
         return {"scan": self.scan_hist[:, ::e.scan_stride].clone(), "ego": ego}
 
     def message_inputs(self, i: int, r: Optional[StepResult] = None) -> MessageInputs:
@@ -4049,7 +4060,8 @@ class F1VecEnv:
         self.grip_budget = None if mu is None else mu.to(self.device).reshape(-1)
 
     def teacher_label(self, teacher, offset: Optional[torch.Tensor] = None,
-                      mu: Optional[torch.Tensor] = None, spec=None) -> torch.Tensor:
+                      mu: Optional[torch.Tensor] = None, spec=None,
+                      rows: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The teacher's action in this env's action space: (steer, speed) or its local plan.
 
         mu: (B,) friction the teacher should *drive for* instead of the env's own -- the label of a
@@ -4057,12 +4069,23 @@ class F1VecEnv:
         is. Everything else the teacher is privileged to (latency, calibration) stays the truth.
 
         spec: the plan format to write it in -- the tracker's own (the learner's) by default; the
-        opponents' commands pass `opp_plan_spec`."""
+        opponents' commands pass `opp_plan_spec`.
+
+        rows: the env rows to label, (R,) long -- the result is then (R, ACT_DIM), and the teacher's
+        `last_label_valid` is (R,) too. The guard over the raceline teacher and the interactive
+        teacher plan those rows only (`InteractiveTeacher.plan_rows`; the opponents are still read
+        from the whole batch, `row_planning`), each row getting the command the whole-batch call
+        gives it; any other teacher is asked for the whole batch and cut. Every argument stays the
+        whole batch's. Why: in a race of four the guard labelled every car while DAgger stores the
+        learner's quarter -- 0.118 s of every 0.56 s collection step at 512 cars (v2smoke_b, 21 % of
+        collection), for rows nothing reads."""
         P = self.sim.P if mu is None else {**self.sim.P, "mu": mu.to(self.sim.P["mu"].dtype)}
         if self.act_dim == 2:
             kwargs = {} if offset is None else {"offset": offset}
-            return self.teacher_action_to_normalized(teacher(self.sim.state, P, self.sim.tid, **kwargs))
+            a = self.teacher_action_to_normalized(teacher(self.sim.state, P, self.sim.tid, **kwargs))
+            return a if rows is None else a[rows]
         spec = self.tracker.spec if spec is None else spec
+        v_max, v_meas = self.ecfg.v_max_policy, self._tracker_plan_speed()
         from .teacher import RacelineTeacher
         if isinstance(teacher, RacelineTeacher):
             # A global raceline alone does not certify what this tracker will
@@ -4075,12 +4098,43 @@ class F1VecEnv:
             guard = guards.get(teacher)
             if guard is None:
                 guard = guards[teacher] = InteractiveTeacher(teacher, self, offsets=(0.0,), cand_iters=6, lane_clamp=True)
-            action = guard.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
-                                       spec, offset=offset, plan_speed=self._tracker_plan_speed())
+            if rows is None:
+                action = guard.plan_action(self.sim.state, P, self.sim.tid, v_max, spec, offset=offset,
+                                           plan_speed=v_meas)
+            else:
+                action = guard.plan_rows(rows, self.sim.state, P, self.sim.tid, v_max, spec, offset=offset,
+                                         plan_speed=v_meas)
             teacher.last_label_valid = guard.last_label_valid
             return action
-        return teacher.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
-                                   spec, offset=offset, plan_speed=self._tracker_plan_speed())
+        from .interactive_teacher import InteractiveTeacher
+        if rows is not None and isinstance(teacher, InteractiveTeacher):
+            # its subset call scores and validates exactly those rows (`last_label_valid` (R,)); the
+            # layout teacher's `plan_rows` keeps a per-env validity it does not refresh, so it is not
+            # asked for a subset here
+            return teacher.plan_rows(rows, self.sim.state, P, self.sim.tid, v_max, spec, offset=offset,
+                                     plan_speed=v_meas)
+        a = teacher.plan_action(self.sim.state, P, self.sim.tid, v_max, spec, offset=offset, plan_speed=v_meas)
+        if rows is None:
+            return a
+        valid = getattr(teacher, "last_label_valid", None)
+        if torch.is_tensor(valid) and valid.shape[:1] == a.shape[:1]:
+            teacher.last_label_valid = valid[rows]
+        return a[rows]
+
+    def action_driven(self) -> torch.Tensor:
+        """(B,) bool: the cars whose command is `step`'s `action` argument -- every row
+        `_opponent_actions` does not overwrite with a pool checkpoint's or a teacher's command. The
+        learners (slot 0) always; in self-play, mixed or pool races the opponent seats the policy
+        drives as well. A label written for any other row is thrown away by `step`, so a trainer
+        that labels only these rows (`learn.dagger_v2.label_rows`) drives exactly as before."""
+        if self.M == 1 or self.ecfg.opponent not in ("teacher", "mixed", "pool", "slots"):
+            return torch.ones(self.B, dtype=torch.bool, device=self.device)
+        mine = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        if self.pool is not None:
+            mine = mine & ~self.pool_driven
+        if self.teacher_any:
+            mine = mine & ~self.teacher_driven
+        return mine
 
     def set_ideal_lap(self, racelines) -> None:
         """Fastest plausible time per track and per sector, from the raceline speed profile: sum(ds / v).
