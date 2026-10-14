@@ -1,0 +1,82 @@
+{
+ "states": 512,
+ "speed_mean": 1.628511667251587,
+ "track": "real:korea_2025_iccas",
+ "seed": 0,
+ "dims": [
+  {
+   "dim": 0,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.6522834300994873,
+   "end_speed_mps_per_unit": 0.09516020864248276,
+   "steer_deg_per_unit": 16.18338394165039,
+   "vcmd_mps_per_unit": 0.0515860840678215,
+   "pass": true
+  },
+  {
+   "dim": 1,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.3228599727153778,
+   "end_speed_mps_per_unit": 0.04182756692171097,
+   "steer_deg_per_unit": 4.842057228088379,
+   "vcmd_mps_per_unit": 0.01814902201294899,
+   "pass": true
+  },
+  {
+   "dim": 2,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.2313292920589447,
+   "end_speed_mps_per_unit": 0.028825685381889343,
+   "steer_deg_per_unit": 1.8319302797317505,
+   "vcmd_mps_per_unit": 0.010320539586246014,
+   "pass": true
+  },
+  {
+   "dim": 3,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.26506760716438293,
+   "end_speed_mps_per_unit": 0.0286342054605484,
+   "steer_deg_per_unit": 0.22177402675151825,
+   "vcmd_mps_per_unit": 0.008492871187627316,
+   "pass": true
+  },
+  {
+   "dim": 4,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.12898316979408264,
+   "end_speed_mps_per_unit": 0.3511401116847992,
+   "steer_deg_per_unit": 3.789274215698242,
+   "vcmd_mps_per_unit": 0.5304689407348633,
+   "pass": true
+  },
+  {
+   "dim": 5,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.14604245126247406,
+   "end_speed_mps_per_unit": 0.6290165781974792,
+   "steer_deg_per_unit": 2.0843515396118164,
+   "vcmd_mps_per_unit": 0.5108623504638672,
+   "pass": true
+  },
+  {
+   "dim": 6,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.14146697521209717,
+   "end_speed_mps_per_unit": 0.9004408717155457,
+   "steer_deg_per_unit": 1.2742059230804443,
+   "vcmd_mps_per_unit": 0.36864691972732544,
+   "pass": true
+  },
+  {
+   "dim": 7,
+   "states": 512,
+   "end_lateral_m_per_unit": 0.19393965601921082,
+   "end_speed_mps_per_unit": 2.7331557273864746,
+   "steer_deg_per_unit": 0.746031641960144,
+   "vcmd_mps_per_unit": 0.4207800626754761,
+   "pass": true
+  }
+ ],
+ "pass": true,
+ "wall_s": 186.0637514591217
+}

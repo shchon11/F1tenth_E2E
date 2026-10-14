@@ -833,7 +833,11 @@ def wp4_braking(v_meas: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
     It is not free. The tracker follows this curve with its usual speed lag (q_v 0.4, design 8): from
     4.9 m/s (255 states visited on ICCAS) it plans -2.9 m/s^2 at once and ends its window at 2.8 m/s,
     where four -1s -- a zero speed target pulling on every step, like the linear plan's v0 = v1 = 0
-    -- plan -4.9 and end at 2.1 (v_cmd 0.12 m/s lower). The stop that is drawn is the softer one."""
+    -- plan -4.9 and end at 2.1 (v_cmd 0.12 m/s lower). The stop that is drawn is the softer one:
+    softer than the guard's own x0.3 candidate (-4.4), against linear's stop at -5.0. In traffic it
+    shows -- the guard's ego against lane_switch cars (ICCAS, 2 seeds) touched them 1.38 times per km
+    with this stop, 0.76 with four -1s, 0.33 in linear (docs/research/wp4-label-gates-2026-10-14/,
+    gate 3). Kept as design 5 prescribes it until that trade is decided."""
     L = plan_length(v_meas, spec)
     s = L[:, None] * torch.arange(1, WP_K + 1, device=v_meas.device, dtype=v_meas.dtype) / WP_K
     return (v_meas.abs()[:, None].square() - 2.0 * spec.a_brake * s).clamp_min(0.0).sqrt()

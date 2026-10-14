@@ -20,7 +20,16 @@ teacher's label at the same states and tracker inputs.
 authority: up to 512 states whose measured speed is 1-2 m/s (they come from the spawns, which start
 at 0-3 m/s); each dimension moved +-0.05, and how far that moves the tracker's predicted state at
 the end of its window -- lateral position [m/unit] and speed [m/s/unit] -- plus the executed steer
-[deg/unit] and v_cmd [m/s/unit], the columns of the design's authority table.
+[deg/unit] and v_cmd [m/s/unit], the columns of the design's authority table. The registered run
+takes the first such states it meets, i.e. the first steps after the spawns, when the tracker's warm
+start is still empty; `--min-step 40` takes them from 1 s on.
+
+Measured 2026-10-14 (the "refit" teacher, ICCAS, seed 0; RESULTS.md there):
+  noise-bias  v_cmd bias -0.074 m/s (gate >= -0.10), steering noise 7.37 deg against linear's 7.73
+              (0.95, gate <= 1.1); the backward pass binds in 69 % of the noisy samples; with a flat
+              sigma of 0.165 the bias is -0.075 and the steering 9.28 deg, the design's -0.076 / 9.8.
+  authority   every dimension past 0.1 (kappa_1..4 lateral 0.67 / 0.34 / 0.26 / 0.37 m/unit, v_1..4
+              speed 0.15 / 0.33 / 0.58 / 2.74 m/s/unit, 512 states at 1.49 m/s); from 1 s on the same.
 """
 from __future__ import annotations
 
@@ -142,6 +151,8 @@ def authority(a):
         lab = env.teacher_label(t)
         inp = tracker_inputs(env)
         m = (inp["v"].abs() >= 1.0) & (inp["v"].abs() <= 2.0)
+        if k < a.min_step:
+            m = m & False                     # supplementary: past the spawn's cold tracker warm start
         if bool(m.any()):
             states.append({kk: vv[m] for kk, vv in inp.items()}); labels.append(lab[m].clone())
             n += int(m.sum())
@@ -181,6 +192,7 @@ def main():
     ap.add_argument("--draws", type=int, default=16)
     ap.add_argument("--steps", type=int, default=1200, help="noise-bias: replay length (464 states at 1200)")
     ap.add_argument("--max-states", type=int, default=512)
+    ap.add_argument("--min-step", type=int, default=0, help="authority: take states from this step on (0: registered)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default="")
     a = ap.parse_args()

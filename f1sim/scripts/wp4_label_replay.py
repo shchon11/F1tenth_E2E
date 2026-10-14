@@ -25,6 +25,15 @@ icra2022 15.350 s, 9 contacts), and the design-section-5 refit (the 1.5 s plan's
 1.6 % / 1.3 % quicker but touched the icra2022 walls 14 times against 9 -- one seed, ~2 km. That is
 the question `RacelineTeacher.wp4_path` was settled on, at scale and through the guard (see there):
 "refit", 978 contacts in 977 km at 4.63 m/s, three tracks x two seeds solo and two x two in traffic.
+
+The closed-loop gates on that teacher (2026-10-14, docs/research/wp4-label-gates-2026-10-14/), each
+against the linear teacher's production labels, which drive slower: props 0 contacts in 17.5 km
+(pass); traffic car contacts per km 1.38 / 1.84 / 0.39 against 0.33 / 1.72 / 0.06 with lane_switch /
+forzaeth_pred / interactive opponents, first-curvature jumps 0.48 / 1.48 / 0.35 % (fail); icra2022
+walls 3.31 per km at 3.92 m/s against 2.44 at 3.13 for linear with a 0.6 s end and no certification
+(fail); noise replay 5.06 against 3.39 per km at 3.93 against 3.68 m/s (fail). At equal pace -- raw
+labels against that linear -- the wp4 labels touch the icra2022 walls 20 % less (5.59 against 7.02
+per km, both 15.03 s laps) and under noise 41 % less (6.25 against 10.56).
 """
 from __future__ import annotations
 
