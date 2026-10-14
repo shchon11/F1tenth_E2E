@@ -379,6 +379,10 @@ def _runtime_matches(rt, batch: int) -> bool:
 
 def describe(meta: dict) -> str:
     """One line for a log or a checkpoint header."""
+    if (meta or {}).get("arch") == "v2":
+        # `learn.model_v2`: one GRU (B5) on the fused features, no scan channels; it has no
+        # "memory" block, so the v1 reading below would have called it feedforward
+        return f"v2 GRU h={int(meta.get('hidden', 128))} (LayerNorm input, chrono gate; critic: none)"
     mem = (meta or {}).get("memory")
     ch = ((meta or {}).get("scan_channels") or {}).get("channels") or ()
     if not mem and not ch:

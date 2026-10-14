@@ -5,7 +5,7 @@ turns a message into a number they both use lives here, in one implementation, b
 load-bearing claim of the split -- that the graph publishes the same `/drive` the old monolithic
 node did -- is only as strong as the amount of code the two sides cannot disagree about.
 
-Four groups:
+Five groups:
 
 * the arms (`split_deployable`, `install_grip_arm`, `install_clearance_arm`,
   `build_traction_guard`), moved here verbatim from `policy_node` because they now belong to the
@@ -15,7 +15,9 @@ Four groups:
   needs the IMU mean for the observation and the controller needs its gyro-z for the tracker and
   its accelerometer for the traction guard, and those have to be the same number computed the same
   way from the same samples or the parity claim is a coincidence;
-* `policy_condition`, the grip dial a conditional checkpoint is driven with.
+* `policy_condition`, the grip dial a conditional checkpoint is driven with;
+* `observation_builder`, the observation contract (v1 `ObsBuilder`, or v2 `ObsBuilderV2` for a
+  `learn.model_v2` checkpoint) the policy node builds from those topics.
 """
 import math
 
@@ -190,6 +192,29 @@ def policy_condition(model, dial, device):
                          f"[{DIAL_FLOOR}, {MU_MAX}]; a dial above the floor's real friction is the "
                          f"dangerous side (measured 1 -> 13 collisions/km at +0.4)")
     return mu_to_c(torch.tensor([dial], dtype=torch.float32), spec).to(device)
+
+
+# ------------------------------------------------------------------ the observation contract
+def observation_builder(model, extra: dict, device):
+    """(spec, builder, contract version) the node builds this checkpoint's observation with.
+
+    v1: `ObsSpec` from `extra["spec"]` (the defaults for a checkpoint without one) and `ObsBuilder`,
+    exactly what the node always built. v2 (`meta["arch"] == "v2"`, `learn.model_v2`): `ObsSpecV2`
+    and `ObsBuilderV2` -- the newest frame(s), [speed, gyro z] now, the plan issued two steps back
+    and the 1 s stride-2 history of [speed, gyro z, the plan issued], from the same three topics.
+    The network's own contract (`meta["obs"]`) is the authority; the trainer's `extra["spec"]` must
+    say the same thing, and a checkpoint whose two disagree is refused rather than resolved."""
+    from f1sim.learn.obs import ObsBuilder, ObsBuilderV2, ObsSpec, spec_from_dict
+    meta = getattr(model, "meta", None) or {}
+    if meta.get("arch") == "v2":
+        spec = model.obs_spec.validate()
+        saved = (extra or {}).get("spec")
+        if saved and spec_from_dict(saved) != spec:
+            raise ValueError(f"this v2 checkpoint's network was built for {spec} and its run recorded "
+                             f"{spec_from_dict(saved)}: one of the two is not the policy's observation")
+        return spec, ObsBuilderV2(spec, device), 2
+    spec = ObsSpec(**extra["spec"]) if (extra or {}).get("spec") else ObsSpec()
+    return spec, ObsBuilder(spec, device), 1
 
 
 # ------------------------------------------------------------------ message arithmetic
@@ -413,12 +438,17 @@ class SensorIntake:
         # gap still expires at `timeout` instead of being renewed by every scan.
         return self.imu_mean
 
-    def stale(self, now, check_scan=False):
-        """Which actor inputs are not fresh enough to drive on. Empty means go."""
+    def stale(self, now, check_scan=False, attitude=True):
+        """Which actor inputs are not fresh enough to drive on. Empty means go.
+
+        `attitude=False` for a policy that does not read it: observation contract v2 has no
+        roll / pitch column (the quaternion correlated 0.14 with the truth while driving, and five of
+        thirteen car recordings swing it past 40 deg), so a missing or refused orientation is not a
+        reason for a v2 graph to stop. The IMU itself still is: the gyro's z axis is a v2 input."""
         out = []
         if self.t_imu_mean is None or now - self.t_imu_mean > self.timeout:
             out.append("imu")
-        if self.t_att is None or now - self.t_att > self.timeout:
+        if attitude and (self.t_att is None or now - self.t_att > self.timeout):
             out.append("attitude")
         if self.t_odom is None or now - self.t_odom > self.timeout:
             out.append("odom")

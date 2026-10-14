@@ -373,12 +373,14 @@ def test_the_v2_memory_learns_an_8_step_recall_with_a_dense_auxiliary():
         torch.set_num_threads(threads)
 
 
-def test_the_console_refuses_a_v2_checkpoint_by_name():
-    """The console builds observation contract v1 today; a v2 checkpoint is refused with a sentence
-    that says so (at load and on a hot reload), not by the v1 introspector or a scan-shape error."""
-    from f1sim.learn.obs import ObsSpec
-    from f1sim.viewer.sim_worker import V2_REFUSAL, obs_spec_problems
+def test_the_console_takes_a_v2_checkpoint_in_a_v2_session_and_names_a_contract_switch():
+    """The console drives v2 since UNIT 5a (`tests/test_v2_console.py` drives it): its compatibility
+    check accepts a v2 checkpoint in a session built on contract v2, and a checkpoint of the other
+    contract -- a hot reload that switched networks -- is one sentence that says so."""
+    from f1sim.learn.obs import ObsSpec, ObsSpecV2
+    from f1sim.viewer.sim_worker import obs_spec_problems
     m = _model()
-    assert obs_spec_problems(m.meta, ObsSpec(n_beams=SMALL), [], 8) == [V2_REFUSAL]
+    assert obs_spec_problems(m.meta, ObsSpecV2(n_beams=SMALL), [], 8) == []
+    assert obs_spec_problems(m.meta, ObsSpec(n_beams=SMALL), [], 8) == ["관측 계약: 체크포인트 v2 vs 이 세션 v1"]
     v1_meta = {"n_beams": SMALL, "n_stack": 3, "act_dim": 8}
     assert obs_spec_problems(v1_meta, ObsSpec(n_beams=SMALL, scan_stack=3, act_dim=8), [], 8) == []

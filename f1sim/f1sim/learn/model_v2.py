@@ -214,6 +214,12 @@ class ActorV2(nn.Module):
     def feature_dim(self) -> int:
         return self.width + self.hidden_size
 
+    @property
+    def has_memory(self) -> bool:
+        """Always: B5 is part of the deployed function. Read by the inference paths that carry a
+        hidden state for whatever actor they are handed (`learn.watch.MemoryActorRunner`)."""
+        return True
+
     def _check_c(self, c, batch: int) -> torch.Tensor:
         """The dial is required: a v2 actor is never run on an implied number (v1's rule)."""
         if c is None:

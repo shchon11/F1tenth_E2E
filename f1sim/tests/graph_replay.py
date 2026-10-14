@@ -139,13 +139,13 @@ class Collector:
 
 # ------------------------------------------------------------------ parameter files
 POLICY_PARAMS = ("checkpoint", "device", "speed_cap", "sensor_timeout", "imu_accel_scale",
-                 "enabled", "steer_max", "drive_topic")
+                 "enabled", "steer_max", "drive_topic", "dial")
 #: The monolithic node's parameters, in ONE node section: it is a single node named `f1sim_policy`
 #: and it declares the policy's and the controller's parameters together, which is the thing the
-#: split undid.
-MONOLITH_PARAMS = POLICY_PARAMS + ("controller", "grip_mu", "clearance_margin", "traction",
-                                   "traction_params", "wheelbase", "cmd_delay", "steer_bias",
-                                   "steer_gain", "speed_gain")
+#: split undid. (Without "dial": the monolith predates it, and no monolith run passes one.)
+MONOLITH_PARAMS = tuple(k for k in POLICY_PARAMS if k != "dial") + (
+    "controller", "grip_mu", "clearance_margin", "traction", "traction_params", "wheelbase", "cmd_delay",
+    "steer_bias", "steer_gain", "speed_gain")
 CONTROLLER_PARAMS = ("checkpoint", "device", "speed_cap", "steer_max", "sensor_timeout",
                      "plan_timeout", "controller", "grip_mu", "clearance_margin", "traction",
                      "traction_params", "wheelbase", "cmd_delay", "steer_bias", "steer_gain",

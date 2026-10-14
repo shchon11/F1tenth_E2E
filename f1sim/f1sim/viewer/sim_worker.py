@@ -453,11 +453,26 @@ def resolve_checkpoint(run: str, runs_dir: str, latest: str = "") -> str:
     raise FileNotFoundError(f"{path} 에 ppo_latest.pt / student_latest.pt 가 없습니다.")
 
 
-#: A v2 checkpoint (`learn.model_v2`, `meta["arch"] == "v2"`) reads observation contract v2
-#: (`learn.obs.ObsBuilderV2`), which this worker does not build yet. Refused by name, at load and on a
-#: hot reload, rather than reaching the v1 introspector or a scan-shape error mid-session.
-V2_REFUSAL = ("관측 계약 v2 체크포인트(learn.model_v2)입니다. 이 콘솔은 아직 v1 관측만 만들며 "
-              "v2 경로(ObsBuilderV2, 다이얼 입력, GRU 상태)는 연결 전입니다")
+#: A v2 checkpoint (`learn.model_v2`, `meta["arch"] == "v2"`) reads observation contract v2: the
+#: session's env is built to emit it (`EnvConfig.obs_version` 2, the frames and history the contract
+#: names), the actor runs through `learn.watch.MemoryActorRunner` (its GRU state kept between steps
+#: and cleared at every episode boundary) with the grip dial as its input column, and its WP4 plans
+#: are tracked by the legacy controller it was trained with.
+V2_ARMS = ("legacy",)
+
+
+def _v2_spec_problems(meta: Dict[str, Any], spec, skipped: List[str], env_act_dim: int) -> List[str]:
+    """`obs_spec_problems` for a v2 checkpoint in a v2 session: the contract field by field."""
+    from ..learn.obs import ObsSpecV2
+    want = ObsSpecV2(**(meta.get("obs") or {}))
+    labels = (("n_beams", "LiDAR 빔 수"), ("n_frames", "스캔 프레임 수"), ("frame_stride", "프레임 간격"),
+              ("hist_len", "이력 행 수"), ("hist_stride", "이력 간격"), ("act_dim", "행동 차원"),
+              ("speed_mode", "plan 형식"))
+    out = [f"{label}: 체크포인트 {getattr(want, key)} vs 이 세션 {getattr(spec, key)}"
+           for key, label in labels if getattr(want, key) != getattr(spec, key)]
+    if int(meta.get("act_dim", want.act_dim)) != int(env_act_dim):
+        out.append(f"행동 차원: 체크포인트 {int(meta.get('act_dim'))} vs 이 세션 {int(env_act_dim)}")
+    return out
 
 
 def obs_spec_problems(meta: Dict[str, Any], spec, skipped: List[str], env_act_dim: int) -> List[str]:
@@ -469,11 +484,24 @@ def obs_spec_problems(meta: Dict[str, Any], spec, skipped: List[str], env_act_di
     it drives, with part of the actor at its random initialisation. The picture looks like a policy
     and is not one, which is the worst possible failure for a tool whose job is to be believed.
 
+    The observation contract first (v1 `ObsSpec` / v2 `ObsSpecV2`): a checkpoint of one contract in a
+    session built for the other is one sentence, not a list of mismatched fields -- that is the hot
+    reload of a run that switched networks.
+
     Returns a list of sentences; empty means the model and the environment agree.
     """
-    if (meta or {}).get("arch") == "v2":
-        return [V2_REFUSAL]
+    ck_v2 = (meta or {}).get("arch") == "v2"
+    env_v2 = int(getattr(spec, "version", 1)) == 2
+    if ck_v2 != env_v2:
+        return [f"관측 계약: 체크포인트 v{2 if ck_v2 else 1} vs 이 세션 v{2 if env_v2 else 1}"]
     out: List[str] = []
+    if ck_v2:
+        out = _v2_spec_problems(meta, spec, skipped, env_act_dim)
+        actor_skipped = sorted(k for k in (skipped or []) if k.startswith("actor."))
+        if actor_skipped:
+            shown = ", ".join(actor_skipped[:4]) + (" 외" if len(actor_skipped) > 4 else "")
+            out.append(f"actor 가중치 {len(actor_skipped)}개가 파일에서 읽히지 않고 초기값으로 남았습니다 ({shown})")
+        return out
     pairs = (
         ("n_beams", "n_beams", int(getattr(spec, "n_beams", -1)), "LiDAR 빔 수"),
         ("n_stack", "scan_stack", int(getattr(spec, "scan_stack", -1)), "스캔 스택"),
@@ -890,19 +918,31 @@ class SimWorker:
         if recorded != "legacy" and recorded != arm:
             raise StartConfigError(f"{os.path.basename(ckpt_path)}: '{recorded}' 제어기로 학습된 체크포인트입니다. "
                                    "자동 주행에는 기본 정책 또는 자동 제어로 학습된 체크포인트를 선택하세요.")
+        is_v2 = (policy_checkpoint.get("meta") or {}).get("arch") == "v2"
+        if is_v2 and arm not in V2_ARMS:
+            # A v2 policy plans in WP4 (four waypoints x curvature, speed), trained and evaluated under
+            # the legacy tracker only (`ppo_v2` refuses a controller arm); the grip / clearance arms
+            # read a plan's speed columns as linear's two speeds -- the car's controller node refuses
+            # the same combination. "자동" asks the worker to choose, so it chooses legacy and says so.
+            if arm == "auto":
+                self.say(P.MSG_LOG, gen=gen, text="v2 정책(WP4 plan)은 legacy 제어기로 학습된 정책이라 "
+                                                  "자동 제어기 대신 legacy 로 주행합니다")
+                arm = "legacy"
+            else:
+                raise StartConfigError(
+                    f"{os.path.basename(ckpt_path)}: v2 정책(WP4 plan)은 legacy 제어기로만 주행합니다. "
+                    f"'{arm}' 은 plan 의 속도 열을 linear 형식의 두 속도로 읽는 제어기라 WP4 계획을 해석하지 "
+                    f"못합니다. 제어기를 legacy 로 두세요.")
         controller_record = validate_runtime_checkpoint(policy_checkpoint, arm)
         if autoselect:
             refusal = automatic_selection_refusal(controller_record)
             if refusal is not None:
                 raise StartConfigError(refusal)
         model, extra = load_checkpoint(ckpt_path, device, allow_controller=(arm != "legacy"))
-        if (getattr(model, "meta", None) or {}).get("arch") == "v2":
-            raise StartConfigError(f"{os.path.basename(ckpt_path)}: {V2_REFUSAL}.")
         if recorded == "auto":
             from ..learn.policy_adaptation import require_exact_actor
             require_exact_actor(model, policy_checkpoint)
         model.eval()
-        intro = Introspector(model)
         act_dim = model.meta.get("act_dim", 2)
         from ..mpc import ACT_DIM as PLAN_DIM
         if act_dim not in (2, PLAN_DIM):
@@ -1019,7 +1059,18 @@ class SimWorker:
         self._check_cancel(gen)
 
         self.stage(gen, "env")
-        spec = extra.get("spec") or {}
+        # The observation the checkpoint was trained on, as its run recorded it -- for a v2 network
+        # its own contract when the run wrote none (`meta["obs"]` is what the network was built for).
+        spec = extra.get("spec") or ((model.meta.get("obs") or {}) if is_v2 else {})
+        if is_v2:
+            # contract v2: the env emits {"scan": the newest n_frames, "ego": the 210-wide vector}
+            # (`F1VecEnv._obs_v2`, the same assembly as the car's `ObsBuilderV2`), with the frames and
+            # history the contract names; v1's action history, attitude and accelerometer are not in it
+            obs_kw = dict(obs_version=2, scan_stack=int(spec["n_frames"]), scan_stride=int(spec["frame_stride"]),
+                          hist_len=int(spec["hist_len"]), hist_stride=int(spec["hist_stride"]))
+        else:
+            obs_kw = dict(scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
+                          hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2))
         exp_meta = extra.get("experiment") or {}
         from ..learn.common import plan_output_of
         _plan_out = plan_output_of(extra)
@@ -1040,8 +1091,7 @@ class SimWorker:
             # off is what keeps a `self` slot racing the learner as an equal: what is being watched
             # here is the policy against itself, and a silently slowed opponent reads as a bug.
             selfplay_front_cap=False, opp_speed_range=(1.0, 1.0),
-            scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
-            hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+            **obs_kw,
             compile_tracker=compile_enabled,
             # a switch moves every car itself; re-drawing tracks on reset would scatter them
             resample_track_on_reset=False,
@@ -1127,7 +1177,9 @@ class SimWorker:
                           f"(구성 > 그립 다이얼에서 주행 중에 바꿀 수 있습니다)")
         session = {
             "mu_pin": mu_pin,
-            "env": env, "model": model, "extra": extra, "intro": intro, "device": device,
+            "env": env, "model": model, "extra": extra, "device": device,
+            # after the dial: the saliency forward needs the same `c` the driving forward gets
+            "intro": Introspector(model, dial=dial),
             "mode": mode, "ckpt_path": ckpt_path, "mtime": os.path.getmtime(ckpt_path),
             "autoselect": autoselect,
             "obs": obs, "speed_cap": speed_cap, "compile": compile_enabled,
@@ -1454,6 +1506,8 @@ class SimWorker:
             "speed_cap": float(session["speed_cap"]),
             "v_max_policy": float(env.ecfg.v_max_policy),
             "action_mode": session["mode"],
+            # the observation contract this session's env emits: 2 for a `learn.model_v2` policy
+            "obs_version": int(getattr(env, "obs_version", 1)),
             "info_line": session["info_line"],
             "ros2": session["ros"].facts() if session.get("ros") is not None else None,
             "randomize": bool(cfg.randomize),
@@ -1578,7 +1632,7 @@ class SimWorker:
                 session["mtime"] = mt          # do not re-read the same incompatible file
                 return
             session.update(model=model, extra=extra, mtime=mt,
-                           intro=Introspector(model),
+                           intro=Introspector(model, dial=session.get("dial")),
                            info_line=describe_checkpoint_line(extra, session["ckpt_path"]),
                            act_fn=actor_runner(model, session["device"], session["compile"],
                                                dial=session.get("dial")))
