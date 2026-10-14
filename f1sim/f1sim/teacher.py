@@ -366,8 +366,21 @@ class RacelineTeacher:
     #:           of the window, and both overshoot doing it (direct up to 9 cm, refit up to 14 cm)
     #:   hybrid  direct where the plan follows the line itself, refit where it follows an offset
     #:           line (blended over the first 10 cm of offset, so a ramping offset never jumps)
+    #:
+    #: "refit", by label replay (docs/research/wp4-label-gates-2026-10-14/, pre-registered: the fewest
+    #: contacts per km among recipes within 2 % of the best pace). Guard labels, 1024 envs x 30 s x 2
+    #: seeds per track, walls per km at mean speed:
+    #:   ICCAS            refit 0.044 at 4.77 m/s    direct 0.124 at 4.71
+    #:   icra2022         refit 3.31  at 3.92        direct 2.93  at 3.66   (direct 6 % slower a lap)
+    #:   blackbox2021_1   refit 0.012 at 5.29        direct 0.116 at 5.18
+    #: and the interactive teacher racing raceline cars at 0.7-0.9 (ICCAS + icra2022, 2 seeds), walls +
+    #: cars per km: refit 1.39, hybrid 1.74, direct 2.91 -- the direct fit to an offset line is the
+    #: snap the design saw. Pooled, 1.00 per km at 4.63 m/s against hybrid 0.98 at 4.51 and direct 1.12
+    #: at 4.50. The direct labels also jump more from step to step (first curvature by > 0.1: 0.19 /
+    #: 0.15 % against 0.06 / 0.02 % on ICCAS / blackbox) and the guard blocks them more often (0.15 /
+    #: 0.20 % against 0.06 / 0.03 %), although on a circle they hold the line where the refit strays.
     WP4_PATHS = ("refit", "direct", "hybrid")
-    wp4_path: str = "hybrid"
+    wp4_path: str = "refit"
 
     def _plan_wp4(self, state, P, tid, v_max, spec, iters, offset, idx, plan_speed) -> torch.Tensor:
         """`plan_action` for a "wp4" spec: four waypoints x (curvature, speed) over the tracker's

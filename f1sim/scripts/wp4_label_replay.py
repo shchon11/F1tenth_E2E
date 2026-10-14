@@ -23,7 +23,8 @@ labels built outside the teacher: the design prototype's (a GN fit straight to t
 the design exactly on this tree's decoder (ICCAS 7.925 s, 0 contacts, |v_profile - v| 0.906;
 icra2022 15.350 s, 9 contacts), and the design-section-5 refit (the 1.5 s plan's first window) lapped
 1.6 % / 1.3 % quicker but touched the icra2022 walls 14 times against 9 -- one seed, ~2 km. That is
-the question `RacelineTeacher.wp4_path` was settled on (see there).
+the question `RacelineTeacher.wp4_path` was settled on, at scale and through the guard (see there):
+"refit", 978 contacts in 977 km at 4.63 m/s, three tracks x two seeds solo and two x two in traffic.
 """
 from __future__ import annotations
 
@@ -119,7 +120,7 @@ def main():
     env.reset()
     B = env.B
     laps = []
-    wall = car = car_spawn = prop = 0
+    wall = car = car_spawn = prop = wall_spawn = 0
     km = 0.0
     n_after = stop_off = 0
     jumps = n_pairs = 0
@@ -149,6 +150,7 @@ def main():
         _, _, _, _, info = env.step(act)
         on = info["wall_onset"] & ego
         wall += int(on.sum())
+        wall_spawn += int((on & (env.ep_step <= spawn_steps)).sum())       # counted, and also shown apart
         if track_props:
             # a wall/prop onset whose footprint is clear of the walls' distance field was a prop
             prop += int((on & (info["wall_dist"] > 0.0)).sum())
@@ -175,7 +177,7 @@ def main():
            "lap_median": float(np.median(laps)) if laps.size else None,
            "lap_mean": float(laps.mean()) if laps.size else None,
            "mean_speed": vsum / max(nv, 1),
-           "wall_contacts": wall, "wall_per_km": wall / max(km, 1e-9),
+           "wall_contacts": wall, "wall_per_km": wall / max(km, 1e-9), "wall_contacts_first_2s": wall_spawn,
            "prop_contacts": prop if track_props else None,
            "car_contacts": car, "car_per_km": car / max(km, 1e-9), "car_contacts_first_2s": car_spawn,
            "offline_stop_frac": stop_off / max(n_after, 1),
