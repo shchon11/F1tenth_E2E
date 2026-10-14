@@ -422,6 +422,9 @@ class SimGraphFastPath:
             # Read live: closing over the track object captured here would compare it against
             # itself, so a TrackTensors swap would never be seen.
             "sim.track": lambda: id(sim.track),
+            # The soft contact's impact record is written in place by the captured roll: a rebound
+            # tensor would be replayed against the old address and read 0 for ever after.
+            "sim.wall_impact": lambda: getattr(sim, "wall_impact", None),
         }
         for attr in dir(sim.track):
             if attr.startswith("p_") and torch.is_tensor(getattr(sim.track, attr, None)):
