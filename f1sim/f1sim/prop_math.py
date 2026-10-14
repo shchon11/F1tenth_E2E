@@ -6,8 +6,6 @@ Two runtime functions, plus the build-time helper that feeds them:
   offsets, padded to a fixed `k_pad`.
 * `ray_prisms_hits` -- torch. Beams against finite convex prisms.
 * `prism_contacts` -- torch. The car rectangle against those prisms, by SAT.
-* `prism_separation` -- torch. The same SAT read the other way: how far apart they are, not only
-  how deep they overlap (the v2 DAgger measures how often its labels pass within 0.3 m of a prop).
 
 Everything at runtime is pure torch with no data-dependent Python branching: the only Python loop
 is over `C`, which is a static shape. `torch.where` is used freely -- it is a tensor op, not a
@@ -329,48 +327,3 @@ def prism_contacts(corners: torch.Tensor, poses: torch.Tensor, pn: torch.Tensor,
     normal = torch.where(overlap.unsqueeze(-1), normal, torch.zeros_like(normal))
     idx = torch.where(overlap, idx, torch.full_like(idx, -1))
     return depth, normal, idx
-
-
-def prism_separation(corners: torch.Tensor, poses: torch.Tensor, pn: torch.Tensor,
-                     pd: torch.Tensor, z_lo: torch.Tensor, z_hi: torch.Tensor, car_h) -> torch.Tensor:
-    """(B,) the SAT separation [m] between the car rectangle and its nearest prop section.
-
-    The same axes and the same one-sided tests as `prism_contacts` -- every outward edge normal of
-    both polygons -- but the minimum overlap is reported signed instead of clipped at zero: for two
-    convex polygons the largest gap along any of those normals is the separation along the best
-    separating axis, a lower bound on the Euclidean distance that is exact when the nearest features
-    are an edge and a face. Negative is the penetration `prism_contacts` returns (`-depth` of the
-    deepest prop), and a row with no live prop at the car's height is `+inf`.
-
-    Why a separation and not `depth > 0`: the v2 DAgger measures where the teacher's plan passes
-    within 0.3 m of a prop (`train_v2.plan_clearance`; the redesign's 6장 2 BC mask masked those
-    rows until 2026-10-14 and now only counts them -- the teacher plans round props), and 0.3 m of
-    room is invisible to a test that only says "touching or not".
-    """
-    B = corners.shape[0]
-    dtype, device = corners.dtype, corners.device
-    sep = torch.full((B,), float("inf"), device=device, dtype=dtype)
-    if poses.shape[1] == 0:
-        return sep
-    h = torch.as_tensor(car_h, device=device, dtype=dtype).reshape(-1)
-    h = h.expand(B) if h.numel() == 1 else h
-    nxt = corners.roll(-1, 1)
-    e = nxt - corners
-    area2 = (corners[..., 0] * nxt[..., 1] - nxt[..., 0] * corners[..., 1]).sum(1)
-    wind = torch.where(area2 < 0, -torch.ones_like(area2), torch.ones_like(area2))[:, None]
-    m = torch.stack([e[..., 1], -e[..., 0]], -1) * wind.unsqueeze(-1)
-    m = m / m.norm(dim=-1, keepdim=True).clamp_min(EPS)
-    e_off = torch.einsum("bij,bkj->bik", m, corners).amax(-1)
-    for c in range(poses.shape[1]):
-        nw, dw = _to_world(pn[:, c], pd[:, c], poses[:, c])
-        valid = pn[:, c].pow(2).sum(-1) > 0.5
-        live = _slot_is_live(pn[:, c], z_lo[:, c], z_hi[:, c]) \
-            & (z_lo[:, c] < h) & (z_hi[:, c] > 0)
-        car_proj = torch.einsum("bkj,bij->bki", nw, corners)
-        d_prop = torch.where(valid, dw - car_proj.amin(-1), torch.full_like(dw, float("inf")))
-        verts = _polygon_vertices(nw, dw, valid)
-        prop_proj = torch.einsum("bij,bkj->bik", m, verts)
-        prop_min = torch.where(valid.unsqueeze(1), prop_proj, torch.full_like(prop_proj, float("inf"))).amin(-1)
-        d_c = torch.minimum(d_prop.amin(1), (e_off - prop_min).amin(1))     # the least overlap
-        sep = torch.minimum(sep, torch.where(live, -d_c, torch.full_like(d_c, float("inf"))))
-    return sep

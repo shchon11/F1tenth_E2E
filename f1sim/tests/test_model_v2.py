@@ -63,7 +63,8 @@ def test_parameter_counts_per_block_match_the_redesign_table():
     assert c["B6 log_std"] == 8
     redesign_total = 1_159_978
     assert c["actor (deployed)"] == redesign_total + (210 - 147) * 128 + (8 - 5) * 257 + (8 - 5) == 1_168_816
-    assert c["B9 critic"] == 793_632 + (210 + 1 + 34) * 128 + 128 + 384 * 256 + 256 + 256 * 256 + 256 + 2 * 257
+    # the critic reads 33 privileged columns (`gym_env.PRIV_V2_DIM`; 34 with the speed cap until 2026-10-14)
+    assert c["B9 critic"] == 793_632 + (210 + 1 + 33) * 128 + 128 + 384 * 256 + 256 + 256 * 256 + 256 + 2 * 257
     assert c["B8 slots"] == c["beam car head"] == c["nearest car head"] == 0, "heads only when flagged"
     full = block_parameter_counts(_model(1081, aux={"b8": True, "beam_car": True, "near_car": True}))
     assert full["B8 slots"] == 384 * 256 + 256 + 256 * 12 + 12
@@ -80,7 +81,7 @@ def test_shapes_and_ranges(n_frames):
     scan, ego, c = _inputs(n_frames=n_frames)
     with torch.no_grad():
         mu, h = m.actor.step(scan, ego, c)
-        v, logit = m.critic(scan, ego, c, torch.randn(3, 34))
+        v, logit = m.critic(scan, ego, c, torch.randn(3, 33))
     assert mu.shape == (3, 8) and h.shape == (1, 3, 128) and float(mu.abs().max()) <= 1.0
     assert v.shape == logit.shape == (3,)
     with pytest.raises(ValueError):
@@ -131,7 +132,7 @@ def test_the_critic_has_its_own_one_frame_stem_and_no_state():
     assert cr.stem is not m.actor.stem and cr.stem.n_frames == 1
     assert not any(isinstance(x, torch.nn.RNNBase) for x in cr.modules())
     scan, ego, c = _inputs(n_frames=3)
-    priv = torch.randn(3, 34)
+    priv = torch.randn(3, 33)
     with torch.no_grad():
         v0, l0 = cr(scan, ego, c, priv)
         older = scan.clone(); older[:, 1:] = torch.rand_like(older[:, 1:])

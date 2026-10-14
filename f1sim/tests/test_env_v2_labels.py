@@ -71,7 +71,10 @@ def _place(env, row, ahead, left, dyaw=0.0, speed=None):
 
 # ---------------------------------------------------------------- the critic's vector
 def test_privileged_v2_is_versioned_bounded_and_ordered():
-    assert len(PRIV_V2_KEYS) == len(set(PRIV_V2_KEYS)) == PRIV_V2_DIM == 8 + 3 * 7 + 4 + 1
+    # ego, three opponents, the geometry -- no speed-cap column since 2026-10-14 (it served the
+    # learner's random cap; the env's own cap is one number for every row)
+    assert len(PRIV_V2_KEYS) == len(set(PRIV_V2_KEYS)) == PRIV_V2_DIM == 8 + 3 * 7 + 4
+    assert "speed_cap" not in PRIV_V2_KEYS
     assert len(PRIV_V2_MIRROR) == PRIV_V2_DIM
     env = _env(race_size=4, envs=8)
     env.reset(seed=2)
@@ -81,7 +84,6 @@ def test_privileged_v2_is_versioned_bounded_and_ordered():
     assert torch.isfinite(pv).all() and float(pv.abs().max()) <= 6.0 + 1e-5
     assert env.privileged(env.last_result).shape == (8, 8 + 4 + 8 + 1), "v1's vector must not move"
     col = {k: i for i, k in enumerate(PRIV_V2_KEYS)}
-    assert torch.allclose(pv[:, col["speed_cap"]], env.speed_cap / env.ecfg.v_max_policy)
     d = pv[:, [col[f"opp{j}_dist"] for j in range(3)]]
     assert bool((d[:, 0] <= d[:, 1]).all() and (d[:, 1] <= d[:, 2]).all()), "not nearest first"
     assert torch.equal(pv[:, col["near_dist"]], pv[:, col["opp0_dist"]])

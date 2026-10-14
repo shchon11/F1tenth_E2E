@@ -57,6 +57,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..gym_env import PRIV_V2_DIM
 from .aux_v2 import AUX_HEADS, BeamCarHead, NearestCarHead, OpponentSlotHead, aux_spec
 from .memory import Hidden
 from .model import ResBlock1d
@@ -357,7 +358,7 @@ class CriticV2(nn.Module):
     so the two can share one stored observation. The value is in the normalised units the training
     unit's value normaliser defines; this module only produces it."""
 
-    def __init__(self, n_beams: int = 1081, ego_dim: int = EGO_DIM, priv_dim: int = 34, width: int = 256,
+    def __init__(self, n_beams: int = 1081, ego_dim: int = EGO_DIM, priv_dim: int = PRIV_V2_DIM, width: int = 256,
                  branch: int = 128):
         super().__init__()
         self.ego_dim, self.priv_dim = int(ego_dim), int(priv_dim)
@@ -386,7 +387,7 @@ class ActorCriticV2(nn.Module):
     `ActorCriticV2(**meta)` rebuilds it (`load_v2`)."""
 
     def __init__(self, arch: str = ARCH, n_beams: int = 1081, n_frames: int = 1, ego_dim: int = EGO_DIM,
-                 act_dim: int = 8, speed_mode: str = "wp4", priv_dim: int = 34, hidden: int = 128,
+                 act_dim: int = 8, speed_mode: str = "wp4", priv_dim: int = PRIV_V2_DIM, hidden: int = 128,
                  cond_dim: int = 1, cond: Optional[dict] = None, obs: Optional[dict] = None,
                  aux: Optional[dict] = None):
         super().__init__()

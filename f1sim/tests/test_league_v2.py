@@ -8,7 +8,7 @@ where it updates its own, and the env reads each league entry's rows in the entr
 
 * a v1 league seat in a v2 env commands, bit for bit, what the same checkpoint commands in a v1 env
   from the same state -- its observation, its plan, its command and the whole simulator state, step
-  for step through full race resets and a single car's respawn, with the v2 env's learner cap on;
+  for step through full race resets and a single car's respawn;
 * the reverse: a v2 entry in a v1 env (its own v2 builder) commands what it commands in a v2 env (the
   env's own observation);
 * a mixed race -- a v2 learner, a v1 league seat, a scripted seat, a v2 league entry -- runs, each car
@@ -57,7 +57,7 @@ def v2_ckpt(tmp_path_factory):
     return generated_v2_checkpoint(str(tmp_path_factory.mktemp("v2") / "gen_v2.pt"))
 
 
-def _env(slots, *, v2: bool, envs=4, seed=7, cap=None, **kw):
+def _env(slots, *, v2: bool, envs=4, seed=7, **kw):
     tr, rl = _track()
     cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 1081
     if v2:
@@ -66,8 +66,7 @@ def _env(slots, *, v2: bool, envs=4, seed=7, cap=None, **kw):
         obs = dict(scan_stack=6, hist_len=20, hist_stride=2)
     obs.update(kw)
     e = EnvConfig(action_mode="plan", race_size=len(slots) + 1, opponent="slots", opponent_slots=slots,
-                  collision_mode="soft", compile_tracker=False, max_steps=25, speed_cap=9.0,
-                  **({"learner_cap_range": cap} if cap else {}), **obs)
+                  collision_mode="soft", compile_tracker=False, max_steps=25, speed_cap=9.0, **obs)
     env = common.make_env([tr], envs, "cpu", e, cfg=cfg, seed=seed, rls=[rl])
     env.reset(seed=seed)
     return env
@@ -102,7 +101,7 @@ def test_a_v1_league_seat_in_a_v2_env_commands_what_it_commands_in_a_v1_env():
     v1 = _env(slot, v2=False)
     assert v1.pool.entries[0].seat_key is None                    # a v1 env: the env's own observation
     a = _drive(v1, lambda e: e._last_obs)
-    v2 = _env(slot, v2=True, cap=(3.0, 9.0), opponent_speed_mode="linear")
+    v2 = _env(slot, v2=True, opponent_speed_mode="linear")
     ent = v2.pool.entries[0]
     assert ent.seat_key is not None and ent.speed_mode == "linear" and len(v2.pool.seat_builders) == 1
     b = _drive(v2, lambda e: e.pool.seats[ent.seat_key].obs)
@@ -111,8 +110,6 @@ def test_a_v1_league_seat_in_a_v2_env_commands_what_it_commands_in_a_v1_env():
     # the race really was raced: the league cars moved and the resets happened
     assert float((a[-1]["state"][~v1.learner, :2] - a[0]["state"][~v1.learner, :2]).norm(dim=1).min()) > 0.5
     assert int(v1.ep_step.max()) < STEPS
-    # the v2 env's learner caps were drawn and never reached the league seat's observation
-    assert bool(((v2.speed_cap[v2.learner] >= 3.0) & (v2.speed_cap[v2.learner] <= 9.0)).all())
 
 
 def test_a_v2_entry_in_a_v1_env_commands_what_it_commands_in_a_v2_env(v2_ckpt):
@@ -136,7 +133,7 @@ def test_a_mixed_race_runs_every_seat_in_its_own_contract_and_format(v2_ckpt):
     slots = [{"kind_mix": ["forzaeth", "lane_switch"], "ckpt_mix": [V1], "ckpt_p": 1.0, "speed_scale": [0.8, 0.9]},
              {"kind": "lane_switch", "speed_scale": [0.7, 0.8]},
              {"kind_mix": ["forzaeth"], "ckpt_mix": [v2_ckpt], "ckpt_p": 1.0, "speed_scale": [0.8, 0.9]}]
-    env = _env(slots, v2=True, envs=8, seed=5, cap=(3.0, 9.0), opponent_speed_mode="linear")
+    env = _env(slots, v2=True, envs=8, seed=5, opponent_speed_mode="linear")
     model, _ = load_checkpoint(v2_ckpt)
     dial = dial_for(model, "cpu")
     obs, h = env._last_obs, Hidden()

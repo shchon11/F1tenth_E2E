@@ -54,12 +54,17 @@ PRIV_OPP_DIST_SCALE = 5.0
 
 # ---- contract v2's critic vector (`F1VecEnv.privileged_v2`) -----------------------------------------
 #: The redesign's B9 as corrected by the 10-14 gates (architecture-redesign appendix 2): ego 8, three
-#: opponents x 7, the explicit geometry the information-gap gate measured (+0.049 AUC and R over the
-#: same critic without it, CI excluding 0), and the speed cap (critique B5: the policy does not see
-#: the cap, so the critic has to, or the biggest cause of the return is invisible to it). Every
-#: column is divided by a fixed scale so all of them are O(1) -- v1's progress rate reached 56
-#: unnormalised. The dial is NOT here: the trainer owns it (`conditioning.DialDraw`) and hands the
-#: critic the same `c` column the actor reads.
+#: opponents x 7 and the explicit geometry the information-gap gate measured (+0.049 AUC and R over
+#: the same critic without it, CI excluding 0) -- 33 columns. Every column is divided by a fixed
+#: scale so all of them are O(1) -- v1's progress rate reached 56 unnormalised. The dial is NOT here:
+#: the trainer owns it (`conditioning.DialDraw`) and hands the critic the same `c` column the actor
+#: reads.
+#:
+#: No speed-cap column (removed 2026-10-14). It was there for the learner's unobserved random cap
+#: (critique B5), a guess no measurement backed, which is gone; the cap left is the env's own -- the
+#: fixed `--speed-cap` in DAgger, the curriculum's in PPO, one number for every learner row of a
+#: batch -- so the column was a constant. (A self-play front car's cap, `selfplay_front_cap`, and a
+#: slot table's cap on a `self` seat still differ per row; the critic does not see them.)
 #:
 #: v1's `privileged()` is untouched (21 wide in a race, 22 with the dial): every v1 critic keeps it.
 PRIV_V2_EGO_KEYS = ("vx", "vy", "yaw_rate", "lateral", "heading_err", "lap_frac", "progress_rate",
@@ -73,7 +78,7 @@ PRIV_V2_OPP_SLOTS = 3
 PRIV_V2_GEO_KEYS = ("near_dist", "near_closing", "near_ttc", "min_ttc")
 PRIV_V2_KEYS = (PRIV_V2_EGO_KEYS
                 + tuple(f"opp{j}_{k}" for j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS)
-                + PRIV_V2_GEO_KEYS + ("speed_cap",))
+                + PRIV_V2_GEO_KEYS)
 PRIV_V2_DIM = len(PRIV_V2_KEYS)
 #: [s] TTC reported when nothing closes faster than `PRIV_V2_TTC_MIN_CLOSING`, and its cap. The
 #: align gate's numbers; with no opponent at all: distance 30 m, closing 0, TTC 10, min TTC 10.
@@ -85,7 +90,7 @@ PRIV_V2_MIRROR = tuple(
     {"vy": -1.0, "yaw_rate": -1.0, "lateral": -1.0, "heading_err": -1.0}.get(k, 1.0)
     for k in PRIV_V2_EGO_KEYS) + tuple(
     {"dy": -1.0, "dvy": -1.0, "dyaw": -1.0}.get(k, 1.0)
-    for _j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS) + (1.0,) * (len(PRIV_V2_GEO_KEYS) + 1)
+    for _j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS) + (1.0,) * len(PRIV_V2_GEO_KEYS)
 
 # ---- per-seat visibility for the v2 opponent-slot auxiliary (B8) -----------------------------------
 #: [m] a seat is a label candidate within this distance of the LiDAR (requirement P2: the positions of
@@ -181,10 +186,6 @@ SPAWN_ORDER_ID = {name: i for i, name in enumerate(SPAWN_ORDERS[:3])}
 #: every opponent, `EnvConfig.opponent_slots` carries one `f1sim.opponent_slots.OpponentSlot` per
 #: grid slot and slot i of every race in the batch is built from spec i.
 OPPONENT_MODES = ("policy", "teacher", "mixed", "pool", "slots")
-
-#: Offset of the learner-cap generator's seed from the env's (`EnvConfig.learner_cap_range`). Its own
-#: stream, so the draw neither moves nor follows the spawn / track / opponent draws of `sim.gen`.
-LEARNER_CAP_SEED = 0x5CA9
 
 #: `OpponentSlot.spawn` as an integer, in `f1sim.opponent_slots.SLOT_SPAWNS` order. Slot 0 -- the
 #: learner -- is not placed by a spec and carries this sentinel.
@@ -479,24 +480,6 @@ class EnvConfig:
     #: car head: each step, the car beams of the newest scan attributed to each seat and the steps
     #: since each seat was last seen (>= 3 beams within 6 m of the LiDAR). Off computes nothing.
     opp_visibility: bool = False
-    #: (lo, hi) [m/s]: every episode of a policy-driven car draws its own speed cap uniformly in this
-    #: band (the redesign's 5장 '실행 쪽', critique B5). Contract v2 does not observe the cap, so the
-    #: actor cannot tell a capped episode from a slow one -- which is the point: the car runs at a
-    #: 4 m/s cap, and a policy that only ever drove under 9 would meet a speed history out of its
-    #: training distribution there. The critic is told (`privileged_v2`'s last column is the row's
-    #: cap). The draw only lowers the cap the env would set anyway (`cap_base * cap_scale`, so the
-    #: curriculum and a self-play front car's cap still bound it), and comes from a generator of its
-    #: own (`_cap_gen`, seeded from the env seed): turning it on moves no spawn, track or opponent
-    #: draw. () is off -- nothing drawn, every env before 2026-10-14.
-    learner_cap_range: tuple = ()
-    #: With `learner_cap_range` on: the probability that a policy-driven car's episode draws a cap at
-    #: all; the others run at the cap the env would set anyway. Drawn per episode from the same
-    #: generator (`_cap_gen`), after the cap itself and only below 1, so 1.0 consumes the stream it
-    #: always did -- every episode capped, as every env of UNIT 5b. Why less: on a step the cap clips,
-    #: the plan decode cuts the speeds at it and the speed dimensions change nothing the car does (no
-    #: reward gradient, `info["speed_capped"]`); with every episode capped at U(3, 9) that was 47 % of
-    #: the learner's steps (UNIT 5b's collection, 564 / 1200).
-    learner_cap_prob: float = 1.0
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
                                      # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
@@ -1194,21 +1177,6 @@ class F1VecEnv:
         # with, and both are the same network learning both sides of the situation.
         self.cap_base = float(self.ecfg.speed_cap)
         self.cap_scale = torch.ones(self.B, device=self.device)
-        #: The policy-driven cars' per-episode speed cap (`EnvConfig.learner_cap_range`): (B,) [m/s],
-        #: +inf on the rows that did not draw one. None when off, and then nothing below reads it.
-        self._learner_cap = None
-        self._cap_gen = None
-        self._cap_suspended = False
-        if e.learner_cap_range:
-            lo, hi = (float(x) for x in e.learner_cap_range)
-            if not (0.0 < lo <= hi <= e.v_max_policy):
-                raise ValueError(f"learner_cap_range {e.learner_cap_range}: needs 0 < lo <= hi <= v_max_policy "
-                                 f"({e.v_max_policy:g} m/s)")
-            if not 0.0 <= float(e.learner_cap_prob) <= 1.0:
-                raise ValueError(f"learner_cap_prob {e.learner_cap_prob}: a probability in [0, 1]")
-            self._learner_cap = torch.full((self.B,), float("inf"), device=self.device)
-            self._cap_gen = torch.Generator(device=self.device)
-            self._cap_gen.manual_seed(int(self.cfg.sim.seed) + LEARNER_CAP_SEED)
         self.teacher_race = torch.zeros(self.B, dtype=torch.bool, device=self.device)   # mixed: this race's others are teachers
         self.ep_step = torch.zeros(self.B, dtype=torch.long, device=self.device)
         #: A staggered first episode's own time limit, per row; `NO_LIMIT` otherwise. Only ever
@@ -2316,55 +2284,9 @@ class F1VecEnv:
             L_ = self.sim.track.length[self.sim.tid[ids]].clamp_min(1e-6)
             self.sector_idx[ids] = (s_new / L_ * self.sector_lim.shape[1]).long().clamp_(0, self.sector_lim.shape[1] - 1)
             self.sector_t0[ids] = 0.0; self.sector_valid[ids] = False; self.s_prev[ids] = s_new
-        if self._learner_cap is not None:
-            self._draw_learner_cap(ids)
         if not fill:
             return None
         return self._fill_scans(ids, speed)
-
-    def _draw_learner_cap(self, ids: torch.Tensor) -> None:
-        """A new episode's speed cap for each policy-driven car among `ids` (`EnvConfig.learner_cap_range`).
-
-        Per episode, as the dial is (`conditioning.DialDraw`): a cap that changed mid-episode would be
-        a car that suddenly slows for no reason the actor can see. `on_policy` is read after this
-        reset's driver draw, so a "mixed" / "pool" race's self-play opponents draw too and its
-        teacher or league cars never do. The cap of every row is then what the env would set without
-        the draw (`cap_base * cap_scale`, the curriculum and any self-play / slot cap) lowered to it --
-        recomputed rather than lowered in place, so a row's draws never stack across episodes.
-
-        `learner_cap_prob` < 1: an episode is capped with that probability, the rest keep +inf (the
-        cap the env would set anyway). The coin comes after the cap's own draw, from the same
-        generator, so at 1 nothing more is drawn and every cap is the one it was."""
-        lo, hi = (float(x) for x in self.ecfg.learner_cap_range)
-        u = torch.rand(ids.numel(), device=self.device, generator=self._cap_gen)
-        mine = self.on_policy[ids] & (not self._cap_suspended)
-        p = float(self.ecfg.learner_cap_prob)
-        if p < 1.0:
-            mine = mine & (torch.rand(ids.numel(), device=self.device, generator=self._cap_gen) < p)
-        self._learner_cap[ids] = torch.where(mine, lo + (hi - lo) * u, torch.full_like(u, float("inf")))
-        self.speed_cap[ids] = torch.minimum(self.cap_base * self.cap_scale[ids], self._learner_cap[ids])
-
-    @property
-    def learner_cap(self) -> Optional[torch.Tensor]:
-        """(B,) [m/s] each policy-driven car's cap for this episode (+inf where none was drawn), or None
-        when `learner_cap_range` is off."""
-        return self._learner_cap
-
-    def learner_cap_suspended(self):
-        """A context in which resets draw no learner cap: a measurement inside a training loop (DAgger's
-        per-iteration evaluation) scores the policy at the fixed cap every earlier table used. The
-        rows it resets keep +inf until their next reset outside it."""
-        import contextlib
-
-        @contextlib.contextmanager
-        def _ctx():
-            prev = self._cap_suspended
-            self._cap_suspended = True
-            try:
-                yield
-            finally:
-                self._cap_suspended = prev
-        return _ctx()
 
     def _note_spawn_formation(self, ids: torch.Tensor, abreast: torch.Tensor) -> None:
         """Record which resetting cars were placed abreast (a parked seat is in no row)."""
@@ -2720,8 +2642,6 @@ class F1VecEnv:
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
             self.sim.gen.manual_seed(seed); torch.manual_seed(seed)
-            if self._cap_gen is not None:
-                self._cap_gen.manual_seed(int(seed) + LEARNER_CAP_SEED)    # a seed names the caps too
         self._reset_envs(torch.arange(self.B, device=self.device))
         if self.ecfg.stagger_first_episode:
             # One draw per race, not per car: the leader's limit ends the whole race (see the
@@ -2917,9 +2837,10 @@ class F1VecEnv:
             info["car_collision"] = r.car_collision
             info["car_charge"] = car_charge
         if self.obs_version == 2:
-            # Critique B5: the v2 policy does not observe the speed cap, and the plan decode clips
-            # every speed at it -- on a clipped step the speed dimensions get no reward gradient
-            # and can drift. Which steps those were, for the trainer to count.
+            # Critique B5: the v2 policy does not observe the speed cap (the env's own: DAgger's fixed
+            # --speed-cap, PPO's curriculum), and the plan decode clips every speed at it -- on a
+            # clipped step the speed dimensions get no reward gradient and can drift. Which steps
+            # those were, for the trainer to count.
             lay = self.plan_layout
             v_plan = (a[:, lay.speed] + 1.0) * 0.5 * e.v_max_policy
             info["speed_capped"] = (v_plan > self.speed_cap[:, None]).any(1)
@@ -3480,8 +3401,7 @@ class F1VecEnv:
             geo = torch.cat([dist_c.gather(1, j) / S, clos.gather(1, j) / S,
                              ttc.gather(1, j) / PRIV_V2_TTC_CAP,
                              ttc.min(1, keepdim=True).values / PRIV_V2_TTC_CAP], 1)
-        cap = (self.speed_cap / vm)[:, None].to(st.dtype)
-        return torch.cat([ego, opp.reshape(self.B, -1), geo, cap], 1)
+        return torch.cat([ego, opp.reshape(self.B, -1), geo], 1)
 
     def _lidar_pose(self):
         """(mount x, mount y, beam angles (B, N_sensor)) of each car's LiDAR in its body frame: the
@@ -4123,9 +4043,6 @@ class F1VecEnv:
     def set_speed_cap(self, v: float):
         self.cap_base = float(min(v, self.ecfg.v_max_policy))
         self.speed_cap = self.cap_base * self.cap_scale
-        if self._learner_cap is not None:
-            # the curriculum moves every update; an episode's own draw holds under it
-            self.speed_cap = torch.minimum(self.speed_cap, self._learner_cap)
 
     # convenience for the teacher / IL
     @property

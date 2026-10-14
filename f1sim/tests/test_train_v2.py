@@ -28,7 +28,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from f1sim.gym_env import OPP_NEVER_SEEN, PRIV_V2_MIRROR  # noqa: E402
+from f1sim.gym_env import OPP_NEVER_SEEN, PRIV_V2_DIM, PRIV_V2_MIRROR  # noqa: E402
 from f1sim.learn import train_v2 as tv  # noqa: E402
 from f1sim.learn.aux_v2 import B8_LABEL_MIRROR, NEAR_MIRROR  # noqa: E402
 from f1sim.learn.obs import ObsSpecV2, action_columns, action_mirror_signs, ego_columns, mirror_scan  # noqa: E402
@@ -80,7 +80,7 @@ def _critic_and_inputs(dtype=torch.float32, rows=64):
             cr.value.weight.mul_(30.0); cr.value.bias.fill_(0.7)
         g = torch.Generator().manual_seed(5)
         x = (torch.rand(rows, 1, 61, generator=g).to(dtype), 0.3 * torch.randn(rows, 210, generator=g).to(dtype),
-             torch.full((rows, 1), -0.4, dtype=dtype), 0.5 * torch.randn(rows, 34, generator=g).to(dtype))
+             torch.full((rows, 1), -0.4, dtype=dtype), 0.5 * torch.randn(rows, PRIV_V2_DIM, generator=g).to(dtype))
     return cr, x
 
 
@@ -284,7 +284,8 @@ def _batch(T=5, m=4, n=31, seed=0):
     g = torch.Generator().manual_seed(seed)
     spec = ObsSpecV2(n_beams=n)
     return spec, {"scan": torch.rand(T, m, 1, n, generator=g), "ego": torch.randn(T, m, spec.ego_dim, generator=g),
-                  "label": torch.rand(T, m, 8, generator=g) * 2 - 1, "priv": torch.randn(T, m, 34, generator=g),
+                  "label": torch.rand(T, m, 8, generator=g) * 2 - 1,
+                  "priv": torch.randn(T, m, PRIV_V2_DIM, generator=g),
                   "b8_lab": torch.randn(T, m, 3, 3, generator=g), "near": torch.randn(T, m, 5, generator=g),
                   "beam": torch.randint(-1, 2, (T, m, n), generator=g).to(torch.int8),
                   "c": torch.randn(T, m, 1, generator=g), "keep": torch.ones(T, m),

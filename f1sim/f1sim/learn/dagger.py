@@ -315,11 +315,9 @@ def rng_island(env):
     identical draw whether the eval before it ran 800 steps, 200, or none at all. That is what lets
     `--eval-steps` and `--eval-every` be tuned for cost without touching the experiment.
     """
-    cap_gen = getattr(env, "_cap_gen", None)     # the learner cap's own stream (`EnvConfig.learner_cap_range`)
     saved = {"cpu": torch.get_rng_state(),
              "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
              "sim": env.sim.gen.get_state(),
-             "cap": None if cap_gen is None else cap_gen.get_state(),
              "py": random.getstate(),
              "np": np.random.get_state()}
     try:
@@ -329,8 +327,6 @@ def rng_island(env):
         if saved["cuda"] is not None:
             torch.cuda.set_rng_state_all(saved["cuda"])
         env.sim.gen.set_state(saved["sim"])
-        if saved["cap"] is not None:
-            cap_gen.set_state(saved["cap"])
         random.setstate(saved["py"])
         np.random.set_state(saved["np"])
 
@@ -830,20 +826,6 @@ def main():
     ap.add_argument("--aux-balance-beta", type=float, default=None, metavar="B",
                     help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
                          "last five measurements)")
-    ap.add_argument("--bc-clearance", type=float, default=None, metavar="M",
-                    help="v2: no imitation loss on a label whose plan passes within M metres of another car over "
-                         "the tracker's 0.6 s window -- the teacher does not see the cars -- while the auxiliary "
-                         "losses keep the row (default 0.3, the redesign's; 0 = off). Props do not mask: the "
-                         "teacher plans round them; the share of labels that close to a prop is logged")
-    ap.add_argument("--learner-cap-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
-                    help="v2: each episode the learner's speed cap is drawn uniformly in [LO, HI] m/s and not "
-                         "observed, so its speed history stays in distribution at the car's 4 m/s cap "
-                         "(default 3 9; 0 0 = off, the fixed --speed-cap)")
-    ap.add_argument("--learner-cap-prob", type=float, default=None, metavar="P",
-                    help="v2: the probability that a learner episode draws that cap at all; the rest drive at "
-                         "the fixed --speed-cap (default 0.3: with every episode capped 47 %% of the learner's "
-                         "steps had the plan's speed clipped, steps whose speed dimensions change nothing; "
-                         "1 = every episode)")
     ap.add_argument("--v2-ego-actions", choices=("on", "off"), default=None,
                     help="v2: whether the ego vector carries the plans the policy issued (a_{t-2} and the 1 s "
                          "history's). off: [speed, gyro z] now and the history's [speed, gyro z] only -- the "
@@ -862,8 +844,7 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
                               "aux_beam_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta",
-                              "bc_clearance", "learner_cap_range", "learner_cap_prob", "opponent_speed_mode",
-                              "v2_ego_actions", "action_dropout")
+                              "opponent_speed_mode", "v2_ego_actions", "action_dropout")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
