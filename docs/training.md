@@ -903,22 +903,16 @@ every car is the learner, so only `alongside` is a different grid there.
   `--spawn-alongside-sep-min` apart (0.15 m) where only that fits, and where neither fits that race
   spawns staggered instead. Two cars spawned in contact terminate on step 1, so this is decided per
   race, not per car. `--spawn-alongside-sep 0.15` is the grid every run before 2026-10-14 had.
-* **Rolling start** (`--spawn-alongside-hold 1 --spawn-alongside-ramp 1`): a teacher-driven car
-  placed abreast holds the lateral position it was placed at for the hold, then eases onto its line
-  over the ramp. Before it, an opponent steered for its line from the first step and reached the
-  learner in 0.1–0.5 s from 0.15 m — a contact no policy can answer, charged to the learner. Held,
-  the merge is meant to wait for the ramp; it is still a merge, the learner's to brake for or drive
-  round, so a contact in it stays charged. **Measured, it does not do that yet**: with every seat
-  spawning alongside (80 learner episodes each, same seeds) it gave 23 / 19 contacts (raw /
-  charged) in 6 s against 20 / 18 with it off, at the same times — the offset that holds the placed
-  position at the lookahead point is cut by the lane clamp at the car's own raceline point, and 83 of
-  228 abreast opponents were cut by more than 5 cm and drifted a median 0.21–0.26 m toward the
-  learner within the hold. It rides on the opponent-event offset channel, so it is on only when
-  events are (`--opp-events`, or a slot's events): without them the teachers' offset is None, and an
-  offset that is a tensor on some steps and None on others is not something one CUDA graph of the
-  teacher call can replay. A planner kind (`forzaeth`, `lane_switch`, `interactive`) adds its own
-  lateral choice to the held offset, so the hold stops the pull to the line, not a lane change; a
-  `layout` car is not held at all (its line is its own). `0 0` turns it off.
+* **Rolling start: tried, measured, removed (2026-10-14).** A teacher-driven car placed abreast was
+  held on the lane position it was placed at for 1 s and eased onto its own line over 1 s, so that
+  the learner would meet a merge it can answer instead of one in 0.1–0.5 s. The first version did
+  not hold (the lane clamp cut the held offset, and the planner kinds added their own lateral choice
+  to it); the fixed one did — the abreast opponent's motion toward the learner at 1 s was a median
+  +0.01 m against +0.23 m without it — but the pre-registered test (every seat abreast, 176 learner
+  episodes an arm, same seeds) asked for half the contacts with the abreast partner in the first
+  2 s and got 25 against 32 raw (22 against 30 charged): the merge came in the ramp instead (1–2 s:
+  17 against 18). It delayed the merge and did not remove it, so it is gone — flags, fields and
+  code (`docs/research/rolling-start-2026-10-14.md`; the code is in commit 95b069f).
 * **What the spawn changes of 2026-10-14 did to contacts**, measured in the boot-camp configuration
   (race of 4, random seats, the four planners, events, 3 m runway, movable props; the learner
   `iccas_bootcamp_safest` sampled as in training; 10-s episodes, 160 learner episodes before and 158
@@ -934,7 +928,8 @@ every car is the learner, so only `alongside` is a different grid there.
   contacts with cars that were not in the learner's abreast row (13 → 4 after step 0, p ≈ 0.03;
   the grid now keeps `--spawn-gap`, and an empty seat no longer has a place on the lap). Contacts
   with the abreast partner after step 0 did not change (11 → 12, the opponent the car moving in
-  every time): that is the rolling start's job, and it does not do it yet (above).
+  every time). The "after" row ran with the first rolling start on; it changed nothing there, and
+  the rolling start has since been removed (above).
 * `--race-size 3` works with all of it. The spawn arc is cumulative — each car sits its own
   `--spawn-gap` behind the car in front of it — rather than `rank × gap`, which scrambled a grid of
   three whenever the draws differed.

@@ -14,13 +14,11 @@ fire there and could not have caught it. These run the configuration that does:
    at least `spawn_gap[0]` minus the abreast stagger apart in arc. And a car rejoining a race
    keeps `spawn_gap[0]` from every race mate.
 2. **An empty seat has no place on the lap.** `signed_gaps` reads half a lap for it.
-3. **An abreast teacher holds its offset, then eases onto its line** (`spawn_alongside_hold`): the
-   centreline offset it was placed at, so it does not close on the car beside it in the first second.
-   It rides on the opponent-event offset channel: without events the teachers' offset stays None.
-   These pin the mechanism only. It does not remove the merge -- what it was measured to do to car
-   contacts is in `EnvConfig.spawn_alongside_hold`.
-4. **The preferred abreast separation is used where it fits** (`spawn_alongside_sep`), the minimum
+3. **The preferred abreast separation is used where it fits** (`spawn_alongside_sep`), the minimum
    (`spawn_alongside_sep_min`) where only that does, a stagger where neither does.
+
+(A rolling start for abreast opponents had its tests here; it was measured not to remove the merge
+and was taken out -- docs/research/rolling-start-2026-10-14.md.)
 """
 import functools
 import math
@@ -33,9 +31,6 @@ from f1sim.gym_env import EnvConfig
 from f1sim.learn import common
 
 ICCAS = ["real:korea_2025_iccas", "real:korea_2025_iccas+warp3", "real:korea_2025_iccas+warp11"]
-#: The opponent-event channel switched on with no event that will ever fire in a test this long:
-#: the rolling start exists only where that channel does (`EnvConfig.spawn_alongside_hold`).
-QUIET_EVENTS = dict(opp_events=("shift",), opp_event_rate=1e-9)
 WIDE = "real:blackbox2022_1"
 TRACK = "gen:competition:0"
 
@@ -175,65 +170,7 @@ def test_an_empty_seat_has_no_place_on_the_lap():
     assert seen > 0, "no empty seat was drawn: the test would pass with the mask off"
 
 
-# --------------------------------------------------------------------------- 3. rolling start
-def _lateral_from_line(env, rows):
-    t = env.teacher
-    xy = env.sim.state[rows, :2]; tid = env.sim.tid[rows]
-    idx = t.project(xy, tid)[0]
-    tan = t.tan[tid, idx]
-    return ((xy - t.xy[tid, idx]) * torch.stack([-tan[:, 1], tan[:, 0]], 1)).sum(1)
-
-
-def _lateral_from_centreline(env, rows):
-    return env.sim.track.project(env.sim.state[rows, :2], env.sim.tid[rows], prev_idx=env.sim.cl_idx[rows])[1]
-
-
-@pytest.mark.parametrize("hold", [1.0, 0.0])
-def test_an_abreast_teacher_holds_its_offset_then_eases_onto_its_line(hold):
-    """The offset held is the *centreline* one the car was placed at: the learner beside it holds its
-    lane, and a car held at a fixed raceline offset would follow the raceline across the lane --
-    sideways, into the learner, which is the closing the rolling start is for."""
-    # soft contacts: under "terminate" a car that crashes respawns mid-test with a fresh offset.
-    # The event channel on with a rate no event fires at: the rolling start rides on it.
-    env = _make([WIDE], 32, 19, race_size=2, opponent="teacher", spawn_order="alongside",
-                collision_mode="soft", **QUIET_EVENTS,
-                spawn_alongside_hold=hold, spawn_alongside_ramp=1.0 if hold else 0.0)
-    env.reset(seed=23)
-    opp = (~env.learner).nonzero().flatten()
-    assert bool(env.spawn_abreast[opp].all()), "the wide track should fit every row abreast"
-    if not hold:
-        assert env._roll_cfg is False and float(env._rolling_start().abs().max()) == 0.0
-        return
-    assert bool(env.roll_on[opp].all()) and not bool(env.roll_on[env.learner].any()), \
-        "only the teacher cars roll: the learner has no line to hold"
-    cl0 = env.roll_cl0[opp].clone()
-    # `reset` ends with one zero-action physics step, so the car has moved a step (<= 3 m/s x 25 ms
-    # along a heading jittered by `spawn_alongside_yaw`) since the offset was read at placement
-    assert torch.allclose(cl0, _lateral_from_centreline(env, opp), atol=0.04)
-    rl0 = _lateral_from_line(env, opp)
-    far = rl0.abs() > 0.25                                        # placed well off its line
-    assert int(far.sum()) >= 4
-    dt = env.sim.control_dt
-    cl, rl = [], []
-    for k in range(int(round(2.6 / dt))):
-        assert bool((env.ep_step[opp] == k).all()), "a car reset during the test"
-        roll = env._rolling_start()[opp]
-        t = k * dt
-        w = 1.0 if t <= hold else max(0.0, 1.0 - (t - hold))
-        assert bool(((roll == 0) == (w == 0)).all()), f"t={t:.2f}"
-        env.step(torch.zeros(env.B, env.act_dim))
-        cl.append(_lateral_from_centreline(env, opp)); rl.append(_lateral_from_line(env, opp))
-    # held: through the hold the car stays on the centreline offset it was placed at; after hold +
-    # ramp + 0.6 s it is near its line
-    for k in (int(0.5 / dt), int(1.0 / dt)):
-        drift = (cl[k] - cl0)[far].abs()
-        assert float(drift.median()) < 0.06, f"drifted {float(drift.median()):.2f} m off its placement at {k * dt:.2f} s"
-    end = rl[-1][far].abs()
-    assert float(end.median()) < 0.5 * float(rl0[far].abs().median()), "never eased onto its line"
-    assert float(env._rolling_start().abs().max()) == 0.0, "still offset after hold + ramp"
-
-
-# --------------------------------------------------------------------------- 4. separation
+# --------------------------------------------------------------------------- 3. separation
 def _abreast_spacing(env):
     """(min |lateral| of each learner's race mate in the learner's frame, abreast-row extent)."""
     e = env.ecfg
@@ -269,65 +206,3 @@ def test_a_lane_without_room_for_the_preferred_gap_takes_the_minimum_or_staggers
     assert bool(env.spawn_abreast.all())
     assert float(lat.min()) > extent + minimum - 0.06 and float(lat.max()) < extent + minimum + 0.1, (
         f"abreast centres {float(lat.min()):.3f}-{float(lat.max()):.3f} m apart, extent {extent:.3f}")
-
-
-# --------------------------------------------------------------------------- 5. the offset channel
-def _spy_offsets(env):
-    """Record (offset handed to the teacher, the events' own offset, rolling steps left) per call."""
-    seen = []
-    eager = env._teacher_normalized
-
-    def spy(teacher, ev_off, *a, **k):
-        ref = None if env.events is None or not env.events.enabled else env.events.lateral_offset()
-        seen.append((None if ev_off is None else ev_off.clone(), ref, env._roll_steps_left))
-        return eager(teacher, ev_off, *a, **k)
-
-    env._teacher_normalized = spy
-    return seen
-
-
-def test_without_events_the_teachers_offset_stays_none():
-    """`OffsetPlanner._merge_offset`: a zeros tensor is not None to a teacher, and an argument that is a
-    tensor on some steps and None on others is not one captured CUDA graph (`TeacherGraph`)."""
-    env = _make([WIDE], 8, 19, race_size=2, opponent="teacher", spawn_order="alongside",
-                collision_mode="soft")
-    assert env._roll_cfg is False
-    seen = _spy_offsets(env)
-    env.reset(seed=23)
-    assert bool(env.spawn_abreast[~env.learner].all())
-    for _ in range(5):
-        env.step(torch.zeros(env.B, env.act_dim))
-    assert seen and all(off is None for off, _, _ in seen)
-
-
-def test_with_no_row_rolling_the_teachers_get_the_events_offset_untouched():
-    env = _make([WIDE], 8, 19, race_size=2, opponent="teacher", spawn_order="alongside",
-                collision_mode="soft", **QUIET_EVENTS)
-    assert env._roll_cfg is True
-    seen = _spy_offsets(env)
-    env.reset(seed=23)
-    window = int(math.ceil((env.ecfg.spawn_alongside_hold + env.ecfg.spawn_alongside_ramp)
-                           / env.sim.control_dt)) + 1
-    for _ in range(window + 5):
-        env.step(torch.zeros(env.B, env.act_dim))
-    rolled = [off for off, ref, left in seen if not torch.equal(off, ref)]
-    assert rolled, "the rolling start never added an offset: the test would pass with it off"
-    # the call on which the count reaches 0 is the window's last (its weight is 0 by then anyway)
-    k0 = next(i for i, (_, _, left) in enumerate(seen) if left == 0)
-    after = seen[k0 + 1:]
-    assert len(after) >= 3 and all(left == 0 and torch.equal(off, ref) for off, ref, left in after)
-
-
-def test_a_layout_driven_car_does_not_roll():
-    """It drives its own line, and the table the rolling start converts offsets with is the raceline's."""
-    env = _make([WIDE], 8, 19, race_size=2, opponent="teacher", spawn_order="alongside",
-                collision_mode="soft", **QUIET_EVENTS)
-    env.reset(seed=23)
-    opp = ~env.learner
-    assert bool(env.roll_on[opp].all())
-    env.alt_teacher_mask["layout"] = opp.clone()       # as `_build_slot_tables` keeps a `layout` slot's rows
-    try:
-        env.reset(seed=23)
-    finally:
-        env.alt_teacher_mask.pop("layout")
-    assert bool(env.spawn_abreast[opp].all()) and not bool(env.roll_on.any())

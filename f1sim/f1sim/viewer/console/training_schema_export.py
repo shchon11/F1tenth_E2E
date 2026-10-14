@@ -96,8 +96,6 @@ LABELS = {
     "opp_pool": "상대 policy pool", "opp_slots": "차량별 상대차 설정", "spawn_gap": "출발 종방향 간격 (m)",
     "spawn_order": "학습 차량 출발 위치", "spawn_alongside_sep": "나란한 차량 횡간격 (m)",
     "spawn_alongside_sep_min": "나란한 차량 최소 횡간격 (m, 좁은 구간)",
-    "spawn_alongside_hold": "rolling start · 나란한 상대차 위치 유지 (s)",
-    "spawn_alongside_ramp": "rolling start · 라인 복귀 시간 (s)",
     "spawn_as_race": "레이스 단위 출발 배치",
     "spawn_alongside_gap": "나란한 차량 종간격 (m)", "opp_events": "상대차 행동 event",
     "opp_event_rate": "상대차 event 빈도 (10s당)", "out": "결과 출력 경로", "data": "수집 데이터 폴더",
