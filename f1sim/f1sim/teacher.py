@@ -195,6 +195,10 @@ class RacelineTeacher:
         from .mpc import (N_ACC, N_KNOTS, PlanSpec, encode, encode_budget, encode_envelope, encode_knots, encode_timed,
                           encode_tspeed, path_points, plan_length)
         spec = spec or PlanSpec()
+        if spec.speed_mode == "wp4":
+            # Its own encoder (`_plan_wp4`): falling through to the linear one below would hand back
+            # six knots and two speeds to be read as four and four, which is no error at all.
+            return self._plan_wp4(state, P, tid, v_max, spec, iters, offset, idx, plan_speed)
         xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
         geometry_speed = plan_geometry_speed(state, plan_speed)
         B = xy.shape[0]; dev = xy.device
@@ -349,6 +353,133 @@ class RacelineTeacher:
         if getattr(self, '_defer_profile_projection', False) or not self.certify_speeds:
             return action  # interactive generation certifies after endpoint replacement/scaling
         return self.project_plan_action(action, state, P, v_max, spec, plan_speed=plan_speed)
+
+    #: How a "wp4" label's path is made (`_plan_wp4`; output-format design 5):
+    #:   refit   the linear 1.5 s plan above, its first window refitted to the four waypoints
+    #:           (`mpc.wp4_refit`). That plan is fitted to the line only from 40 % of its length on,
+    #:           so its window is the pure-pursuit guess and six knots' smoothness: for a car ON the
+    #:           line it strays up to 19 cm from it in corners at speed (gen:competition:0, 24
+    #:           states at 2-8 m/s; 0.20-0.29 1/m on a 0.25 1/m circle at 5.5 m/s)
+    #:   direct  the four waypoint curvatures fitted straight to the line over the window, from the
+    #:           pure-pursuit / line-curvature blend and with this teacher's own 0.3 ridge back to it:
+    #:           up to 9 cm on the same states. Both bring a car 0.3 m off the line back by the end
+    #:           of the window, and both overshoot doing it (direct up to 9 cm, refit up to 14 cm)
+    #:   hybrid  direct where the plan follows the line itself, refit where it follows an offset
+    #:           line (blended over the first 10 cm of offset, so a ramping offset never jumps)
+    #:
+    #: "refit", by label replay (docs/research/wp4-label-gates-2026-10-14/, pre-registered: the fewest
+    #: contacts per km among recipes within 2 % of the best pace). Guard labels, 1024 envs x 30 s x 2
+    #: seeds per track, walls per km at mean speed:
+    #:   ICCAS            refit 0.044 at 4.77 m/s    direct 0.124 at 4.71
+    #:   icra2022         refit 3.31  at 3.92        direct 2.93  at 3.66   (direct 6 % slower a lap)
+    #:   blackbox2021_1   refit 0.012 at 5.29        direct 0.116 at 5.18
+    #: and the interactive teacher racing raceline cars at 0.7-0.9 (ICCAS + icra2022, 2 seeds), walls +
+    #: cars per km: refit 1.39, hybrid 1.74, direct 2.91 -- the direct fit to an offset line is the
+    #: snap the design saw. Pooled, 1.00 per km at 4.63 m/s against hybrid 0.98 at 4.51 and direct 1.12
+    #: at 4.50. The direct labels also jump more from step to step (first curvature by > 0.1: 0.19 /
+    #: 0.15 % against 0.06 / 0.02 % on ICCAS / blackbox) and the guard blocks them more often (0.15 /
+    #: 0.20 % against 0.06 / 0.03 %), although on a circle they hold the line where the refit strays.
+    WP4_PATHS = ("refit", "direct", "hybrid")
+    wp4_path: str = "refit"
+
+    def _plan_wp4(self, state, P, tid, v_max, spec, iters, offset, idx, plan_speed) -> torch.Tensor:
+        """`plan_action` for a "wp4" spec: four waypoints x (curvature, speed) over the tracker's
+        own 0.6 s window (output-format design 3 and 5).
+
+        Path: `wp4_path`. Speeds: this teacher's grip profile at each waypoint's arc times its
+        off-line slowdown, under the heading cap -- the same profile the linear plan's two speeds
+        are read from, read at the waypoints. No speed lead and no certification: the decoder's
+        backward pass at the tracker's a_brake is the feasibility step, and the lead (v0 sampled
+        0.15 s ahead) is what waypoint 1 already is. The linear options that shape v0 / v1
+        (`speed_horizon_s`, `speed_lead_s`, `speed_error_gain`) have no meaning here and are refused
+        rather than ignored."""
+        from .mpc import (WP_FIT_POINTS, WP_K, encode_wp4, fit_wp4, kappa_scale, plan_layout, plan_length,
+                          wp4_refit)
+        if self.wp4_path not in self.WP4_PATHS:
+            raise ValueError(f"wp4_path must be one of {self.WP4_PATHS}, got {self.wp4_path!r}")
+        if self.speed_horizon_s is not None or self.speed_lead_s is not None or self.speed_error_gain is not None:
+            raise ValueError("speed_horizon_s / speed_lead_s / speed_error_gain shape the linear plan's two speeds; "
+                             "a wp4 label reads the profile at its waypoints")
+        xy, yaw, vx = state[:, :2], state[:, 2], state[:, 3]
+        geometry_speed = plan_geometry_speed(state, plan_speed)
+        B = xy.shape[0]; dev = xy.device
+        tid = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
+        idx, lat_err = (self.project(xy, tid) if idx is None
+                        else (idx, (xy - self.xy[tid, idx]).norm(dim=1)))
+        if offset is not None:
+            offset = self.clamp_offset(offset, tid, idx)
+        ds = self.ds[tid]
+        L = plan_length(geometry_speed, spec)
+        uk = torch.arange(1, WP_K + 1, device=dev, dtype=xy.dtype) / WP_K          # waypoint fractions of L
+        wheelbase = torch.full_like(vx, self.L) if P is None else P.get('lf', self.vehicle.lf) + P.get('lr', self.vehicle.lr)
+        steering = torch.full_like(vx, min(self.steer_max, self.vehicle.s_max)) if P is None else torch.as_tensor(P.get('s_max', self.vehicle.s_max), device=dev, dtype=vx.dtype).clamp(max=self.steer_max)
+        k_lim = 0.85 * torch.minimum(torch.full_like(vx, spec.kappa_max), torch.tan(steering) / wheelbase)
+        recipe = self.wp4_path
+        # hybrid with no offset at all is the direct fit; the refit is not computed for it
+        use_refit = recipe == "refit" or (recipe == "hybrid" and offset is not None)
+        use_direct = recipe in ("direct", "hybrid")
+        if use_refit:
+            # The linear plan this teacher would give, path only: its speeds are not read, so its
+            # certification is skipped (the same switch the interactive teacher's family uses).
+            lin = replace(spec, speed_mode="linear")
+            held = getattr(self, "_defer_profile_projection", False)
+            self._defer_profile_projection = True
+            try:
+                a_lin = self.plan_action(state, P, tid, v_max, lin, iters=iters, offset=offset, idx=idx,
+                                         plan_speed=plan_speed)
+            finally:
+                self._defer_profile_projection = held
+            k6 = a_lin[:, plan_layout(lin).path] * kappa_scale(geometry_speed, lin)
+            # 4 iterations: from the source's own curvature the refit has converged by then -- against
+            # 16, the path moves at most 0.29 mm after 2, 0.01 mm after 3 and nothing after 4 (256
+            # states visited on icra2022)
+            k_refit = wp4_refit(k6, plan_length(geometry_speed, lin), geometry_speed, spec, iters=4, k_lim=k_lim)
+        if use_direct:
+            def normal(j):                                         # left-of-travel unit normal at raceline index j
+                t_ = self.tan[tid if j.dim() == 1 else tid[:, None].expand_as(j), j]
+                return torch.stack([-t_[..., 1], t_[..., 0]], -1)
+            M = WP_FIT_POINTS
+            u = torch.arange(1, M + 1, device=dev, dtype=xy.dtype) / M
+            pidx = (idx[:, None] + ((L[:, None] * u[None]) / ds[:, None]).round().long()) % self.N
+            pts = self.xy[tid[:, None].expand_as(pidx), pidx] - xy[:, None, :]
+            if offset is not None:
+                pts = pts + offset[:, None, None] * normal(pidx)
+            c, s_ = torch.cos(yaw), torch.sin(yaw)
+            tx = pts[..., 0] * c[:, None] + pts[..., 1] * s_[:, None]
+            ty = -pts[..., 0] * s_[:, None] + pts[..., 1] * c[:, None]
+            # the guess: pure pursuit fading into the line's own curvature over the lookahead, at the
+            # waypoints -- `plan_action`'s guess, on this plan's arcs
+            kidx = (idx[:, None] + ((L[:, None] * uk[None]) / ds[:, None]).round().long()) % self.N
+            k_rl = self.kappa[tid[:, None].expand_as(kidx), kidx]
+            ld = (self.k_ld * geometry_speed.abs()).clamp(self.ld_min, self.ld_max)
+            ld_idx = (idx + (ld / ds).round().long()) % self.N
+            tgt = self.xy[tid, ld_idx] - xy
+            if offset is not None:
+                tgt = tgt + offset[:, None] * normal(ld_idx)
+            alpha = torch.atan2(-tgt[:, 0] * s_ + tgt[:, 1] * c, tgt[:, 0] * c + tgt[:, 1] * s_)
+            k_pp = (2.0 * torch.sin(alpha) / ld).clamp(-spec.kappa_max, spec.kappa_max)
+            w = torch.clamp(1.0 - uk[None] * L[:, None] / ld[:, None], 0.0, 1.0)
+            k0 = w * k_pp[:, None] + (1 - w) * k_rl
+            k0 = torch.maximum(torch.minimum(k0, k_lim[:, None]), -k_lim[:, None])
+            k_direct = fit_wp4(k0, tx, ty, L, spec, iters=iters, k_lim=k_lim, ridge=0.3)
+        if use_refit and use_direct:
+            blend = (offset.abs() / 0.1).clamp(0.0, 1.0)[:, None]
+            k = blend * k_refit + (1 - blend) * k_direct
+        else:
+            k = k_refit if use_refit else k_direct
+        # speeds: the profile at the waypoints, slowed off the line (against the offset line when
+        # there is one, as `plan_action` measures it) and under the heading cap
+        if offset is not None:
+            t0, p0 = self.tan[tid, idx], self.xy[tid, idx]
+            lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()
+        slow = (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)
+        vidx = (idx[:, None] + ((L[:, None] * uk[None]) / ds[:, None]).round().long()) % self.N
+        gb = self.grip_bin(P, B, dev)
+        v = self.speed_at(tid[:, None].expand_as(vidx), vidx, gb[:, None].expand_as(vidx)) * slow[:, None]
+        cap = self.heading_speed_cap(yaw, tid, idx)
+        if cap is not None:
+            v = torch.minimum(v, cap[:, None])
+        return encode_wp4(k, v, v_max, spec, v_meas=geometry_speed)
 
     #: [s] When set, the plan's end speed is chosen so its linear speed passes through the profile
     #: this far ahead (see `plan_action`). None: through the profile at the plan's end, every run

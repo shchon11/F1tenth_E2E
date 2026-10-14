@@ -6,6 +6,14 @@ and publishes the raw normalized plan. The iLQR tracker, the grip and clearance 
 traction guard used to live here too; they are `controller_node` now, and the plan on the wire
 between them is arm-agnostic, so the same plan stream can be replayed through any arm.
 
+A v2 checkpoint (`learn.model_v2`, the redesign's actor) is driven the same way on observation
+contract v2 (`ObsBuilderV2`, `deploy.observation_builder`): the newest scan, [speed, gyro z] and the
+plans the node itself issued (a_{t-1}, a_{t-2} and the 1 s stride-2 history), the grip dial as an
+input column, and the GRU state carried from one scan callback to the next. Its plans are WP4
+(four waypoints x curvature, speed); the controller reads that contract from the same checkpoint
+and builds the WP4 tracker. Roll / pitch are not a v2 input, so a v2 node does not stop for a
+missing orientation (`SensorIntake.stale(attitude=False)`).
+
 Two things still end here rather than on the wire:
 
 * a **direct-action** checkpoint (`act_dim == 2`, the legacy `--action-mode direct`) has no plan to
@@ -34,12 +42,14 @@ from std_msgs.msg import Empty as EmptyMsg
 
 from f1sim.learn.memory import describe as describe_memory, runtime_for
 from f1sim.learn.model import load_checkpoint
-from f1sim.learn.obs import ObsBuilder, ObsSpec
+# The node's observation is built in `deploy.observation_builder` (v1 `ObsBuilder` or v2
+# `ObsBuilderV2`); the v1 names stay importable from here, where callers have always found them.
+from f1sim.learn.obs import ObsBuilder, ObsSpec  # noqa: F401
 from f1sim_interfaces.msg import Perception, Plan, PolicyState
 
 from f1sim_ros.deploy import (CONTROL_RATE, G, IMU_BUF_MAX, LIDAR_FOV, LIDAR_MOUNT_X, SensorIntake,
                               attitude_from_orientation, covariance0, header_seconds,
-                              policy_condition, quat_to_rp, resample_ranges)
+                              observation_builder, policy_condition, quat_to_rp, resample_ranges)
 
 try:
     from vesc_msgs.msg import VescImuStamped
@@ -78,6 +88,9 @@ class PolicyNode(Node):
     pub_perception = None
     #: The actor's condition: None for an unconditional checkpoint, the grip dial's `c` otherwise.
     cond = None
+    #: Observation contract v2 (a `learn.model_v2` checkpoint): `ObsBuilderV2.build(ranges, speed,
+    #: gyro_z)` and no attitude requirement. False on a hand-assembled node, which is a v1 node.
+    v2 = False
 
     def __init__(self):
         super().__init__("f1sim_policy")
@@ -148,11 +161,13 @@ class PolicyNode(Node):
         # with the metadata nor one with only the spec can reach the wheels.
         ckpt = str(p("checkpoint"))
         self.model, extra = load_checkpoint(ckpt, self.device); self.model.eval()
-        self.spec = ObsSpec(**extra["spec"]) if extra.get("spec") else ObsSpec()
+        # The observation contract the checkpoint was trained on: v1 (`ObsBuilder`) or, for a
+        # `learn.model_v2` network, v2 (`ObsBuilderV2`) -- `deploy.observation_builder` decides.
         # `ObsSpec.opp_token` is "off" when there is none -- a STRING, so `if self.spec.opp_token`
-        # is true for every checkpoint. The refusal is `ObsBuilder`'s, on the next line, and it is
+        # is true for every checkpoint. The refusal is `ObsBuilder`'s, inside that call, and it is
         # the right place for it: the builder is what would have to produce the block on the car.
-        self.obs = ObsBuilder(self.spec, self.device)
+        self.spec, self.obs, version = observation_builder(self.model, extra, self.device)
+        self.v2 = version == 2
         self.checkpoint_id = checkpoint_id(ckpt)
         self.cond = policy_condition(self.model, self.dial, self.device)
         #: The policy's episode state: the recurrent hidden state and the decayed scan-occupancy
@@ -182,7 +197,7 @@ class PolicyNode(Node):
         from f1sim.learn import floor as _floor
         self.ego_att = _floor.EgoStateAttitude(1, device=self.device,
                                                dt=1.0 / float(CONTROL_RATE), source="wheel")
-        if self.att_source == "ego":
+        if self.att_source == "ego" and not self.v2:
             self.get_logger().warning(
                 "attitude_source:=ego -- the policy's roll/pitch observation columns now come from "
                 "f1sim.learn.floor.EgoStateAttitude, not from the orientation quaternion. The "
@@ -213,7 +228,10 @@ class PolicyNode(Node):
         self.pub_drive = self.create_publisher(AckermannDriveStamped, p("drive_topic"), 1) if self.direct else None
         self.last_t = None
         # warm up
-        s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
+        if self.v2:
+            s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, 0.0)
+        else:
+            s, pr = self.obs.build(np.full(self.spec.n_beams, 5.0), 0.0, np.zeros(6), np.zeros(2), self.speed_cap)
         with torch.no_grad():
             self.model.act(self.policy_state.observe(s, pr), pr, deterministic=True, c=self.cond,
                            h=self.policy_state.hidden)
@@ -223,6 +241,14 @@ class PolicyNode(Node):
             self.get_logger().info(f"policy memory: {describe_memory(self.model.meta)}; hidden state "
                                    f"carried across scan callbacks, cleared on "
                                    f"{p('reset_topic')} and when the scan stream restarts")
+        if self.v2:
+            sp = self.spec
+            self.get_logger().info(
+                f"observation contract v2: {sp.n_frames} frame(s) of {sp.n_beams} beams, ego {sp.ego_dim} "
+                f"([speed, gyro z], a_t-2, {sp.hist_len} x {sp.hist_stride}-step history of the plans this "
+                f"node issued), grip dial as an input; no roll/pitch input, so an orientation the IMU does "
+                f"not deliver does not stop the policy. Plans are '{sp.speed_mode}': the controller has to "
+                f"load this same checkpoint (and run controller:=legacy) to track them")
         self.get_logger().info(
             f"policy {self.checkpoint_id} on {self.device}, speed cap {self.speed_cap} m/s, "
             + (f"grip dial mu={self.dial:.4f}, "
@@ -260,7 +286,7 @@ class PolicyNode(Node):
         which the controller sees as a plan that stopped arriving.
         """
         now = self.clock()
-        stale = self.sensors.stale(now, check_scan=True)
+        stale = self.sensors.stale(now, check_scan=True, attitude=not self.v2)
         if stale:
             self._inhibit(stale, self.stamp_now())
 
@@ -316,7 +342,7 @@ class PolicyNode(Node):
         now = self.clock()
         self.sensors.t_scan = now
         imu_mean = self.sensors.take_imu_mean(now)
-        stale = self.sensors.stale(now)
+        stale = self.sensors.stale(now, attitude=not self.v2)
         if stale:
             self._inhibit(stale, self.stamp_now())
             return
@@ -347,7 +373,14 @@ class PolicyNode(Node):
                 att = (float(last[0, 0]), float(last[0, 1]))
             elif rp is not None:
                 att = (float(rp[0, 0]), float(rp[0, 1]))
-        scan, pro = self.obs.build(r, self.sensors.v, imu_mean, att, self.speed_cap)
+        if self.v2:
+            # contract v2: the scan, the odometry speed and the gyro's z axis -- the mean of this
+            # scan's IMU samples, the number the controller's tracker reads as the yaw rate. The
+            # history (a_{t-1} in its row 0, a_{t-2}, 1 s at stride 2) is the builder's ring, fed
+            # by `push_action` below with exactly what this node publishes.
+            scan, pro = self.obs.build(r, self.sensors.v, float(imu_mean[2]))
+        else:
+            scan, pro = self.obs.build(r, self.sensors.v, imu_mean, att, self.speed_cap)
         with torch.no_grad():
             # The hidden state goes in and the next one comes out: the policy's memory of this run
             # lives here, between callbacks, and nowhere else.

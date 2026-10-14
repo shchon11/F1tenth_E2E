@@ -130,6 +130,7 @@ def env_shell(teacher, state, measured):
     env.opponent_future = future
     env.ecfg = SimpleNamespace(v_max_policy=8.0, opponent="teacher")
     env.tracker = SimpleNamespace(spec=mpc.PlanSpec())
+    env.opp_plan_spec = env.tracker.spec  # one plan format: the opponents' commands are written in the tracker's
     odom = torch.zeros(len(state), 4)
     odom[:, 3] = measured
     env.last_result = SimpleNamespace(odom=odom)

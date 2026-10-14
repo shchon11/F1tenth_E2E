@@ -29,6 +29,7 @@ import math
 import os
 import random
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -36,7 +37,7 @@ import torch.nn.functional as F
 
 from ..gym_env import EnvConfig, PRIV_OPP_DIST_SCALE, OPP_FUTURE_MODELS
 from ..opp_token import OPP_TOKEN_MODES, validate_opp_token
-from ..mpc import ACT_DIM, N_KNOTS
+from ..mpc import ACT_DIM, PlanLayout, plan_layout  # noqa: F401 -- ACT_DIM: the default plan width, read as dagger.ACT_DIM
 from ..interactive_teacher import DEFAULT_OFFSETS, DEFAULT_SPEEDS, InteractiveTeacher, TeacherCost
 from .. import tracks as track_catalog
 from ..params import Config
@@ -233,34 +234,40 @@ class StepBuffer:
 #: than to be slow.
 W_OVER, W_UNDER, UNDER_POW = 4.0, 0.25, 1.0
 
-#: Both halves of the plan action, so the split cannot drift from `mpc.ACT_DIM`.
-SPEED_COLS = slice(N_KNOTS, ACT_DIM)
-KNOT_COLS = slice(0, N_KNOTS)
+#: The two halves of the default ("linear") plan action, for callers that address its columns. The
+#: loss itself reads the run's own layout (`plan_loss(layout=...)`): a module constant was the
+#: linear split whatever the run's speed mode, which in "wp4" -- also 8 wide -- would have scored
+#: two curvatures as speeds without any shape complaining.
+KNOT_COLS = plan_layout("linear").path
+SPEED_COLS = plan_layout("linear").speed
 
 
 def plan_loss(mu: torch.Tensor, lab: torch.Tensor, speed_loss: str, v_max: float,
-              parts: bool = False):
+              parts: bool = False, layout: Optional[PlanLayout] = None):
     """Huber on the whole plan (`symmetric`), or Huber on the knots plus an asymmetric speed term.
 
     `symmetric` is `F.smooth_l1_loss(mu, lab, beta=0.1)` and nothing else, so `--speed-loss
     symmetric` is byte-identical to every DAgger run before this flag existed.
 
-    `asym` keeps the curvature knots on that same loss and replaces only the two speed targets. The
-    two halves are recombined in the proportion the single mean had them -- 6 knots to 2 speeds --
-    so the knot term keeps its old magnitude and only the speed term is a new thing.
+    `asym` keeps the curvature knots on that same loss and replaces only the speed targets
+    (`layout.speed`, the run's `mpc.plan_layout`; None is "linear"). The two halves are recombined
+    in the proportion the single mean had them -- 6 knots to 2 speeds in a linear plan -- so the
+    knot term keeps its old magnitude and only the speed term is a new thing. A column that is
+    neither (a grip budget) stays on the knot side's Huber.
     """
     if speed_loss == "symmetric":
         total = F.smooth_l1_loss(mu, lab, beta=0.1)
         return (total, {"knot": total, "speed": total}) if parts else total
-    knot = F.smooth_l1_loss(mu[..., KNOT_COLS], lab[..., KNOT_COLS], beta=0.1)
+    lay = layout or plan_layout("linear")
+    knot = F.smooth_l1_loss(mu[..., lay.other], lab[..., lay.other], beta=0.1)
     # normalized plan speed a -> m/s is (a + 1)/2 * v_max, so an error in a is (v_max / 2) times
     # the error in m/s. The loss is defined in m/s because that is the unit the asymmetry is about.
-    e = (mu[..., SPEED_COLS] - lab[..., SPEED_COLS]) * (0.5 * v_max)
+    e = (mu[..., lay.speed] - lab[..., lay.speed]) * (0.5 * v_max)
     over = e.clamp_min(0.0)
     under = (-e).clamp_min(0.0)
     speed = (W_OVER * over ** 2 + W_UNDER * under ** UNDER_POW).mean()
-    n_k, n_s = N_KNOTS, ACT_DIM - N_KNOTS
-    total = (n_k * knot + n_s * speed) / ACT_DIM
+    n_k, n_s = lay.act_dim - lay.n_speed, lay.n_speed
+    total = (n_k * knot + n_s * speed) / lay.act_dim
     return (total, {"knot": knot, "speed": speed}) if parts else total
 
 
@@ -489,7 +496,8 @@ def sequence_means(model, scan, pro, keep, burn: int = 0, cond=None):
 def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float = 0.0, hard_power: float = 1.0,
                  log_every: int = 25, chunk: int = 0, speed_loss: str = "symmetric",
                  v_max: float = 10.0, quantile_dim: int = -1, tau: float = 0.5,
-                 aux_grip: float = 0.0, aux_opp: float = 0.0, maneuver_w=(1.0, 1.0, 1.0, 1.0)):
+                 aux_grip: float = 0.0, aux_opp: float = 0.0, maneuver_w=(1.0, 1.0, 1.0, 1.0),
+                 layout: Optional[PlanLayout] = None):
     n_stored = sum(len(b) for b in bufs)
     n_total = sum(b.valid_count for b in bufs)
     log({"dagger/valid_labels": n_total, "dagger/invalid_labels": n_stored - n_total})
@@ -542,7 +550,7 @@ def train_epochs(model, bufs, epochs, batch, device, opt, log, hard_frac: float 
             for k_ in ("plan", "choice", "risk", "prog", "choice_acc"):
                 man_log.setdefault(k_, []).append(float(mp[k_].detach()))
         else:
-            loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True)
+            loss, part = plan_loss(mu, lab, speed_loss, v_max, parts=True, layout=layout)
         if aux_grip > 0 and grip is not None and fric is not None:
             # The friction the labels were built from, asked of the same features the action comes
             # from. Imitation alone averages it away (the "imitation gap").
@@ -782,8 +790,67 @@ def main():
     ap.add_argument("--wandb", default="online")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eager", action="store_true", help="disable simulator / tracker compilation (CPU smoke tests)")
+    # ---- the v2 network (learn.model_v2, learn.dagger_v2). Every flag below is v2's own: None on a
+    # v1 run, which refuses any of them set, so an unflagged run is the run it always was.
+    ap.add_argument("--arch", choices=("v1", "v2"), default="v1",
+                    help="v2: the redesigned actor (docs/research/architecture-redesign-2026-10-13.md) on "
+                         "observation contract v2 and WP4 plans -- recurrent sequences with burn-in "
+                         "(--seq-burn 40, --chunk-length 80 unless set), imitation in the decoded WP4 space, B8, "
+                         "left-right mirroring. v1: every run before it")
+    ap.add_argument("--v2-frames", type=int, default=None, metavar="K",
+                    help="v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)")
+    ap.add_argument("--v2-init-stem", default=None, metavar="CKPT",
+                    help="v2: seed a fresh student's two stems from this v1 resnet checkpoint "
+                         "(model_v2.init_stems_from_v1, as G1 / G4 did)")
+    ap.add_argument("--wp4-label", choices=("env", "linear-refit"), default=None,
+                    help="v2: where the WP4 labels come from. 'env' (default): the env's teacher-label API, "
+                         "where feat/v2's wp4 teachers plug in. 'linear-refit': the raceline teacher's linear "
+                         "plan, first window refitted to the four waypoints -- a stand-in for tests and smoke "
+                         "runs on a tree whose teachers do not speak wp4")
+    ap.add_argument("--mirror-prob", type=float, default=None, metavar="P",
+                    help="v2: probability that a training sequence is mirrored left-right (default 0.5)")
+    ap.add_argument("--aux-b8", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the B8 opponent-slot loss (default 0.5, the redesign's; 0 builds no head)")
+    ap.add_argument("--aux-near-car", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; "
+                         "0 builds no head)")
+    ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
+                    help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
+                         "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
+                         "the imitation loss (default 10; 0 = off, the coefficients alone)")
+    ap.add_argument("--aux-balance-rho", type=float, default=None, metavar="RHO",
+                    help="v2: the largest auxiliary / imitation trunk-gradient ratio the balance allows (default 0.5)")
+    ap.add_argument("--aux-balance-beta", type=float, default=None, metavar="B",
+                    help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
+                         "last five measurements)")
+    ap.add_argument("--v2-ego-actions", choices=("on", "off"), default=None,
+                    help="v2: whether the ego vector carries the plans the policy issued (a_{t-2} and the 1 s "
+                         "history's). off: [speed, gyro z] now and the history's [speed, gyro z] only -- the "
+                         "copycat study's arm A (docs/research/copycat-2026-10-14.md). Default: --init's "
+                         "contract, else the contract default (learn.obs.EGO_ACTIONS_DEFAULT)")
+    ap.add_argument("--action-dropout", type=float, default=None, metavar="P",
+                    help="v2: per training sequence, with probability P zero every issued-action column of the "
+                         "ego (a_{t-2} and the history's), never at collection or evaluation -- the copycat "
+                         "study's arm B (docs/research/copycat-2026-10-14.md; default 0)")
+    ap.add_argument("--updates", type=int, default=None, metavar="N",
+                    help="v2: optimiser updates per iteration, whatever the iteration's data holds, instead of "
+                         "--epochs' passes over it. The it0 learning curve is in updates (itcurve, 2026-10-14: 41 "
+                         "updates -- 3 epochs of one 30,720-row iteration -- left the held-out error 2.6x above "
+                         "its 3000-update value), and a pass count would grow the training with every "
+                         "aggregated iteration")
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
+    v2_applied = None
+    if a.arch == "v2":
+        from . import dagger_v2
+        v2_applied = dagger_v2.prepare_args(ap, a)
+    else:
+        set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
+                              "aux_balance_every", "aux_balance_rho", "aux_balance_beta", "opponent_speed_mode",
+                              "v2_ego_actions", "action_dropout", "updates")
+                  if getattr(a, k) is not None]
+        if set_v2:
+            raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
     AUX_OPP_VISIBLE[0] = bool(a.aux_opp_visible)
     if a.maneuver:
         if a.teacher_kind != "rollout":
@@ -870,7 +937,8 @@ def main():
                                     # lockstep forever (learn.ppo does the same)
                                     stagger_first_episode=a.collision_mode == "soft",
                                     kind_mix_assign=a.kind_mix_assign,
-                                    movable_obstacles=a.movable_obstacles),
+                                    movable_obstacles=a.movable_obstacles,
+                                    **({} if v2_applied is None else dagger_v2.env_kwargs(a))),
                           cfg=cfg, seed=a.seed, rls=rls,
                           teacher_grip=a.teacher_grip, teacher_recover_time=a.teacher_recover_time,
                           teacher_limits=limits)
@@ -878,6 +946,9 @@ def main():
     teacher, teacher_desc = build_teacher(a.teacher_kind, rls, env, a)
     print(f"teacher: {teacher_desc}", flush=True)
     spec = common.obs_spec(env)
+    if v2_applied is not None:
+        return dagger_v2.run(a, env=env, teacher=teacher, teacher_desc=teacher_desc, names=names, device=device,
+                             applied=v2_applied)
     solo_env = solo_teacher = None
     solo_names = []
     if solo_steps:
@@ -995,9 +1066,8 @@ def main():
         lambda: cond_mod.mu_to_c(solo_dial.value() if solo_dial is not None else solo_env.sim.P["mu"], cspec))
     #: The action dimension whose error is not symmetric: too little grip costs lap time, too much
     #: costs the car. `--grip-quantile` below 0.5 makes "cannot tell yet" mean the slippery end.
-    from ..mpc import N_ACC
-    quantile_dim = (N_KNOTS if a.speed_mode in ("envelope", "budget")
-                    else N_KNOTS + N_ACC if a.speed_mode in ("timed", "tspeed") else -1)
+    plan_cols = plan_layout(a.speed_mode)
+    quantile_dim = -1 if plan_cols.grip is None else plan_cols.grip
     opt = torch.optim.Adam(model.actor.parameters(), lr=a.lr)
     run = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "tracks": names,
                                                "teacher_desc": teacher_desc, "collection_mix": mix,
@@ -1043,7 +1113,8 @@ def main():
                             a.log_every, chunk=a.chunk_length, speed_loss=a.speed_loss,
                             v_max=env.ecfg.v_max_policy, quantile_dim=quantile_dim, tau=a.grip_quantile,
                             aux_grip=a.aux_grip, aux_opp=a.aux_opp,
-                            maneuver_w=tuple(float(x) for x in a.maneuver_weights.split(","))); t_tr = tm.lap()
+                            maneuver_w=tuple(float(x) for x in a.maneuver_weights.split(",")),
+                            layout=plan_cols); t_tr = tm.lap()
         # Diagnostics only, and fenced off from the training stream. `eval_every` skips the
         # measurement, never the collection or the training: 75 % of a calibrated iteration was
         # this rollout (873 s of 1165), and eight iterations of it is two hours of measuring a

@@ -128,8 +128,22 @@ LABELS = {
     "learning_rate": "learning rate (추정기)",
     "sideslip_penalty": "sideslip (슬립각) penalty",
     "temporal_encoder": "temporal encoder 종류",
+    # -- the v2 network (learn.model_v2 / dagger_v2 / ppo_v2); every one of these is refused on a v1 run
+    "arch": "network 구조 (v1 / v2)", "v2_frames": "v2 LiDAR frame 수",
+    "v2_init_stem": "v2 stem 초기화 checkpoint (v1)", "wp4_label": "v2 WP4 teacher label 출처",
+    "mirror_prob": "v2 좌우 반전 증강 확률", "critic_lr": "v2 critic learning rate",
+    "value_norm_beta": "v2 value 정규화 EMA β", "contact_bce": "v2 '1초 안 차 접촉' BCE 가중치",
+    "aux_b8": "aux head · B8 상대차 slot 가중치 (v2)", "aux_near_car": "aux head · 최근접 상대차 가중치 (v2)",
+    "aux_balance_every": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
+    "aux_balance_rho": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
+    "aux_balance_beta": "aux gradient 균형 EMA β (측정당, v2)",
+    "opponent_speed_mode": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",
+    "v2_ego_actions": "v2 ego 에 지난 행동(plan) 열 포함 (off = 속도·yaw rate 이력만, copycat 대책 A)",
+    "action_dropout": "v2 행동 이력 dropout 확률 (학습 sequence 마다 지난 행동 열을 0으로, copycat 대책 B)",
+    "updates": "v2 반복마다 최적화 업데이트 수 (비우면 epoch 수로; 데이터가 쌓여도 학습량이 같음)",
 }
 PATHS = {"init_estimator": "input_file", "replay_data": "input_file", "init": "input_file", "reference": "input_file", "estimator": "input_file",
+         "v2_init_stem": "input_file",
          "frontend": "input_file", "policy": "input_file", "candidate": "input_file",
          "data": "input_dir", "out": "output_dir", "metrics_jsonl": "output_file"}
 CSV_LISTS = {"scan_channels": "str", "opp_events": "str", "opp_pool": "path",
@@ -146,7 +160,7 @@ def _group(dest):
         return "PPO 보상"
     if dest in {"name", "init", "init_estimator", "reference", "policy", "candidate", "data", "out", "seed"}:
         return "기본"
-    if dest.startswith(("teacher", "opp_", "spawn_", "mixed_")) or dest == "opponent":
+    if dest.startswith(("teacher", "opp_", "spawn_", "mixed_")) or dest in ("opponent", "opponent_speed_mode"):
         return "teacher·상대차"
     if dest in {"envs", "tracks", "obstacle_draws", "race_size", "episode_s", "speed_cap", "raceline_margin", "solo_fraction", "solo_tracks"} or dest.startswith("procedural_"):
         return "환경"

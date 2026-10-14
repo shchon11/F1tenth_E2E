@@ -1,0 +1,100 @@
+{
+ "/home/shchon11/f1sim_runs/v2smoke_b/student_it0.pt": {
+  "recorded": {
+   "bias_v": 1.0305634662508965,
+   "mae_v": 1.3618345707654953,
+   "mae_lat": 0.22790729627013206,
+   "v_student": 4.397931814193726,
+   "v_label": 3.367368370294571
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 1.0401980876922607,
+   "mae_v": 1.3666002452373505,
+   "mae_lat": 0.22803307138383389,
+   "v_student": 4.407566547393799,
+   "v_label": 3.367368370294571
+  },
+  "zero_actions": {
+   "bias_v": 1.1512461379170418,
+   "mae_v": 1.398998111486435,
+   "mae_lat": 0.23018047586083412,
+   "v_student": 4.518614292144775,
+   "v_label": 3.367368370294571
+  },
+  "teacher_history": {
+   "bias_v": 0.4174875058233738,
+   "mae_v": 1.0615810751914978,
+   "mae_lat": 0.21640538983047009,
+   "v_student": 3.7848559617996216,
+   "v_label": 3.367368370294571
+  },
+  "act_speed_plus_0.5mps": {
+   "bias_v": 1.2794984132051468,
+   "mae_v": 1.4938496798276901,
+   "mae_lat": 0.23207301273941994,
+   "v_student": 4.646866679191589,
+   "v_label": 3.367368370294571
+  },
+  "gains": {
+   "meas_speed_hist": 0.019269466400146484,
+   "act_speed_hist": 0.49786972999572754
+  },
+  "contract": {
+   "ego_dim": 210,
+   "ego_actions": true,
+   "n_action_cols": 168,
+   "n_act_speed_cols": 84,
+   "n_meas_hist_cols": 20,
+   "iter": 0
+  }
+ },
+ "/home/shchon11/f1sim_runs/v2smoke_b/student_it2.pt": {
+  "recorded": {
+   "bias_v": 1.3632867485284805,
+   "mae_v": 1.7501418590545654,
+   "mae_lat": 0.23342871107161045,
+   "v_student": 4.730655193328857,
+   "v_label": 3.367368370294571
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 1.3689269870519638,
+   "mae_v": 1.754689335823059,
+   "mae_lat": 0.2333612833172083,
+   "v_student": 4.736295282840729,
+   "v_label": 3.367368370294571
+  },
+  "zero_actions": {
+   "bias_v": 1.5718095153570175,
+   "mae_v": 1.8867897540330887,
+   "mae_lat": 0.25123181194067,
+   "v_student": 4.939177870750427,
+   "v_label": 3.367368370294571
+  },
+  "teacher_history": {
+   "bias_v": 0.25206591561436653,
+   "mae_v": 0.4749968498945236,
+   "mae_lat": 0.20043286494910717,
+   "v_student": 3.619434267282486,
+   "v_label": 3.367368370294571
+  },
+  "act_speed_plus_0.5mps": {
+   "bias_v": 1.740186482667923,
+   "mae_v": 2.002039149403572,
+   "mae_lat": 0.242849200963974,
+   "v_student": 5.107554793357849,
+   "v_label": 3.367368370294571
+  },
+  "gains": {
+   "meas_speed_hist": 0.011280179023742676,
+   "act_speed_hist": 0.7537992000579834
+  },
+  "contract": {
+   "ego_dim": 210,
+   "ego_actions": true,
+   "n_action_cols": 168,
+   "n_act_speed_cols": 84,
+   "n_meas_hist_cols": 20,
+   "iter": 2
+  }
+ }
+}

@@ -116,25 +116,31 @@ class RecurrentReference:
 
 
 class SpeedRowFreeze:
-    """Train only the final two action rows while preserving exact frozen actor weights."""
+    """Train only the speed rows of the action (`layout.speed`, an `mpc.plan_layout`; None is the
+    linear plan's last two) while preserving exact frozen actor weights for every other row."""
 
-    def __init__(self, model):
+    def __init__(self, model, layout=None):
+        from ..mpc import plan_layout
         actor = model.actor
-        if actor.mu.out_features != 8 or actor.log_std.numel() != 8:
-            raise ValueError("speed adaptation requires the 8D plan actor")
+        lay = layout or plan_layout("linear")
+        if actor.mu.out_features != lay.act_dim or actor.log_std.numel() != lay.act_dim:
+            raise ValueError(f"speed adaptation requires the {lay.act_dim}D plan actor")
         for param in actor.parameters():
             param.requires_grad_(False)
         for param in (actor.mu.weight, actor.mu.bias, actor.log_std):
             param.requires_grad_(True)
         self.params = (actor.mu.weight, actor.mu.bias, actor.log_std)
-        self.frozen_rows = tuple(param[:6].detach().clone() for param in self.params)
+        self.rows = lay.other                                  # the rows that stay as they are
+        self.frozen_rows = tuple(param[self.rows].detach().clone() for param in self.params)
 
+    # Assignments, not `[rows].zero_()` / `.copy_()`: `rows` is a list for the modes whose grip
+    # budget sits after the speeds, and indexing with a list hands back a copy.
     def before_step(self):
         for param in self.params:
             if param.grad is not None:
-                param.grad[:6].zero_()
+                param.grad[self.rows] = 0.0
 
     @torch.no_grad()
     def after_step(self):
         for param, frozen in zip(self.params, self.frozen_rows):
-            param[:6].copy_(frozen)
+            param[self.rows] = frozen

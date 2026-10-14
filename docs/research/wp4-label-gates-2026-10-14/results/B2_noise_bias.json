@@ -1,0 +1,25 @@
+{
+ "states": 464,
+ "draws": 16,
+ "track": "real:korea_2025_iccas",
+ "seed": 0,
+ "wp4_per_dim": {
+  "vcmd_bias_mean": -0.07418853789567947,
+  "vcmd_bias_p10": -0.20769238471984863,
+  "share_binding": 0.6881734728813171,
+  "steer_noise_rms_deg": 7.372759819030762
+ },
+ "wp4_flat_-1.8": {
+  "vcmd_bias_mean": -0.07530535012483597,
+  "vcmd_bias_p10": -0.2100893259048462,
+  "share_binding": 0.6924838423728943,
+  "steer_noise_rms_deg": 9.27907943725586
+ },
+ "linear": {
+  "steer_noise_rms_deg": 7.727580547332764
+ },
+ "steer_noise_ratio": 0.9540838524906129,
+ "pass_bias": true,
+ "pass_steer": true,
+ "wall_s": 266.0232696533203
+}

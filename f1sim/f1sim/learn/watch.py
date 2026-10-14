@@ -60,9 +60,17 @@ class Introspector:
     it, but nothing downstream depends on the two being identical.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, dial=None):
         self.model = model; self.h = {}
-        model.actor.mlp.register_forward_hook(lambda m, i, o: self.h.__setitem__("hidden", o.detach()))
+        #: The session's `DialSource` for a conditional actor: the saliency forward needs the same `c`
+        #: the driving forward gets. Without it a dial checkpoint's actor refuses the call (it never
+        #: runs on an implied number), and the saliency and internals panels stayed empty for every
+        #: dial policy -- which is every v2 checkpoint and the current best v1 ones.
+        self.dial = dial
+        # The 256-wide layer the internals panel draws: v1's first MLP layer, v2's fusion B4 (the
+        # features the GRU and the head read); the stem's 256 features on both.
+        hidden = model.actor.fuse if (getattr(model, "meta", None) or {}).get("arch") == "v2" else model.actor.mlp
+        hidden.register_forward_hook(lambda m, i, o: self.h.__setitem__("hidden", o.detach()))
         model.actor.stem.fc.register_forward_hook(lambda m, i, o: self.h.__setitem__("stem", o.detach()))
         from .memory import add_boundary_listener, runtime_for
         self._rt = runtime_for(model)
@@ -86,7 +94,8 @@ class Introspector:
         s = scan[i:i + 1].clone().requires_grad_(True); p = pro[i:i + 1]
         s_in = self._rt.observe(s, p)
         h_in = self._rt.hidden.actor if self._rt.hidden is not None else None
-        mu, h = self.model.actor.step(s_in, p, None, h_in)
+        c = None if self.dial is None else self.dial.c(1)
+        mu, h = self.model.actor.step(s_in, p, c, h_in)
         g = torch.autograd.grad(mu.abs().sum(), s)[0][0]              # (k, N)
         if self._rt.hidden is not None:
             from .memory import Hidden
@@ -428,6 +437,15 @@ def checkpoint_speed_cap(extra: dict, ckpt_path: str, fallback: float = 6.0) -> 
     return fallback
 
 
+def _v2_ego_width(spec: dict):
+    """The ego width a v2 spec dict implies, or "?" for one that does not parse."""
+    try:
+        from .obs import spec_from_dict
+        return spec_from_dict(spec).ego_dim
+    except Exception:
+        return "?"
+
+
 def describe_checkpoint_line(extra: dict, path: str) -> str:
     """One plain line about a checkpoint: which run, which iteration / update, how it was doing.
 
@@ -458,6 +476,11 @@ def describe_checkpoint_line(extra: dict, path: str) -> str:
     # which the trainer records, because this function is not given `meta`.
     exp = extra.get("experiment") or {}
     mem, chans = exp.get("memory") or {}, (exp.get("scan_channels") or {}).get("channels") or ()
+    if extra.get("arch") == "v2":
+        # the redesigned actor: its own observation contract, WP4 plans and a GRU that always runs
+        sp = extra.get("spec") or {}
+        core += (f"   |  v2: {sp.get('n_frames', '?')} frame(s), ego {_v2_ego_width(sp)}, "
+                 f"{extra.get('speed_mode', 'wp4')} plan, GRU memory")
     if mem or chans:
         bits = []
         if mem:
@@ -542,8 +565,14 @@ def default_consumer_refusal(path: str, *, allowed_controller: Optional[str] = N
         import inspect
         ctor = dict(meta)
         ctor.pop("residual_plan", None)
+        # a v2 checkpoint is built by `model_v2.ActorCriticV2` (`load_checkpoint` dispatches on the
+        # "arch" key no v1 meta has), so its meta is checked against that constructor
+        if ctor.get("arch") == "v2":
+            from .model_v2 import ActorCriticV2 as ctor_cls
+        else:
+            ctor_cls = ActorCritic
         try:
-            inspect.signature(ActorCritic).bind(**ctor)
+            inspect.signature(ctor_cls).bind(**ctor)
         except TypeError as exc:
             return f"metadata does not fit the model constructor ({exc})"
         exp = ((ck.get("extra") or {}).get("experiment") or {})
@@ -769,7 +798,10 @@ def actor_runner(model, device: torch.device, compile_enabled: bool, graph_step=
     for module in actor.modules():
         module._forward_hooks.clear(); module._forward_pre_hooks.clear()
     meta = getattr(model, "meta", {}) or {}
-    if meta.get("memory") or (meta.get("scan_channels") or {}).get("channels"):
+    # A v2 actor (`learn.model_v2`) always carries its GRU state (B5): the runner keeps it between
+    # steps and clears it at every episode boundary, exactly as for a v1 memory checkpoint; its
+    # `step(scan, ego, c, h)` has v1's signature with the ego vector where the proprio was.
+    if meta.get("memory") or (meta.get("scan_channels") or {}).get("channels") or meta.get("arch") == "v2":
         return MemoryActorRunner(model, actor, device,
                                  compile_enabled and device.type == "cuda",
                                  graph_step=graph_step, dial=dial)

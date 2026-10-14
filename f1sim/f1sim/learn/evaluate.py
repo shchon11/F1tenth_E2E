@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from ..gym_env import OPP_FUTURE_MODELS, EnvConfig
+from ..mpc import SPEED_MODES
 from .. import opponent_slots as opp_sl
 from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events, split_events
@@ -62,6 +63,14 @@ def _oracle_token(spec: dict, model) -> str:
     return _m(getattr(model, "meta", None) if model is not None else None) or _m(spec) or "off"
 
 
+def _opponent_format(asked: str | None, spec: dict, mode: str, race_size: int, opponent: str) -> str | None:
+    """`EnvConfig.opponent_speed_mode` for `evaluate`'s "auto" (see its docstring) or what was asked."""
+    if asked != "auto":
+        return asked
+    v2 = int((spec or {}).get("version", 1)) == 2
+    return "linear" if (v2 and mode == "plan" and race_size > 1 and opponent != "policy") else None
+
+
 @torch.no_grad()
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
@@ -79,7 +88,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              opp_future_model: str = EnvConfig.opp_future_model, opp_extra: dict | None = None,
              opp_token_ablate: bool = False,
              external: dict | None = None, research_estimator: bool = False,
-             research_profile: str | None = None, graph_runtime: bool = False) -> dict:
+             research_profile: str | None = None, graph_runtime: bool = False,
+             opponent_speed_mode: str | None = "auto") -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -124,6 +134,12 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     for a tracker to follow -- and it is the same driver object `f1sim_ros.baseline_node` and the
     benchmark's `external` roster kind use, so "the same evaluation" means the same code and not a
     second implementation of it. `controller` must be `legacy` (i.e. nothing installed) with it.
+
+    opponent_speed_mode: the plan format of the cars the policy does not drive (`EnvConfig.
+    opponent_speed_mode`). "auto": a contract-v2 checkpoint (WP4) races scripted and teacher cars that
+    plan LINEAR -- the format its boot camp trains against and the measured choice of the wp4 label
+    gates (RESULTS 7) -- and every other run is what it was (every car in the policy's format). A
+    league checkpoint among the opponents plans in its own format whatever this says.
     """
     if protocol not in ("rolling", "trials") or steps < 1 or envs < 1 or race_size < 1 or envs % race_size:
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
@@ -235,6 +251,23 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     # every plan it emits by five at racing speed, so this is read, never assumed.
     exp_meta = metadata.get("experiment") or {}
     kappa_mode = str(exp_meta.get("plan_kappa_mode", "absolute"))
+    # The observation the checkpoint was trained on. A contract-v2 spec (`learn.obs.ObsSpecV2`, the v2
+    # network) names its fields differently -- frames, not a stack -- and the env has to be told to emit
+    # that contract (`EnvConfig.obs_version`); everything else about the run is the same.
+    if int(spec.get("version", 1)) == 2:
+        from .obs import ObsSpecV2
+        obs_kw = dict(obs_version=2, scan_stack=int(spec["n_frames"]), scan_stride=int(spec["frame_stride"]),
+                      hist_len=int(spec["hist_len"]), hist_stride=int(spec["hist_stride"]),
+                      v_max_policy=float(spec["v_max"]), imu_gyro_scale=float(spec["gyro_scale"]),
+                      # with or without the issued actions; a spec older than the field had them
+                      ego_actions=bool(ObsSpecV2.from_dict(spec).ego_actions))
+    else:
+        obs_kw = dict(scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
+                      hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+                      action_history=int(spec.get("action_history", EnvConfig.action_history)),
+                      v_max_policy=float(spec.get("v_max", EnvConfig.v_max_policy)),
+                      imu_gyro_scale=float(spec.get("gyro_scale", EnvConfig.imu_gyro_scale)),
+                      imu_accel_scale=float(spec.get("accel_scale", EnvConfig.imu_accel_scale)))
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
                      plan_kappa_mode=kappa_mode,
                      plan_kappa_a_lat=float(exp_meta.get("plan_kappa_a_lat", 8.0)),
@@ -249,13 +282,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      race_size=race_size, opponent=opponent,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
                      **{f"opp_{k}_prob": v for k, v in probs.items()},
-                     scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
-                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+                     **obs_kw,
                      opp_future_model=opp_future_model,
-                     action_history=int(spec.get("action_history", EnvConfig.action_history)),
-                     v_max_policy=float(spec.get("v_max", EnvConfig.v_max_policy)),
-                     imu_gyro_scale=float(spec.get("gyro_scale", EnvConfig.imu_gyro_scale)),
-                     imu_accel_scale=float(spec.get("accel_scale", EnvConfig.imu_accel_scale)),
                      # meta FIRST, and 'off'/'' read as absent. `extra["spec"]` records 'off' as a
                      # literal string, and 'off' is truthy, so `spec.get(...) or meta.get(...)`
                      # short-circuits on it and never consults meta -- which is the only place
@@ -267,6 +295,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      opp_token=_oracle_token(spec, model),
                      opp_token_ablate=bool(opp_token_ablate),
                      opponent_slots=slots,
+                     opponent_speed_mode=_opponent_format(opponent_speed_mode, spec, mode, race_size, opponent),
                      **(opp_extra or {}))
     if ecfg.opp_token != "off" and not (race_size > 1 and mode == "plan"):
         raise ValueError(f"this checkpoint was trained with privileged opponent tokens "
@@ -413,6 +442,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
         'raceline_objective': raceline_objective or 'min_curvature', 'teacher_limits': limits,
         'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset),
+        # the format the other cars planned in (None: the policy's own); league seats plan in their own
+        'opponent_speed_mode': env.ecfg.opponent_speed_mode,
         # What the run actually drove under, not what was asked for. The cap is part of the
         # observation (`obs["speed_cap"]`), so a policy trained at 9 and scored at this flag's
         # default of 8 is a policy scored on an input it never saw -- which is what happened to
@@ -495,6 +526,10 @@ def main() -> None:
     ap.add_argument("--protocol", choices=["rolling", "trials"], default="rolling")
     ap.add_argument("--race-size", type=int, default=1)
     ap.add_argument("--opponent", choices=["policy", "teacher"], default="policy")
+    ap.add_argument("--opponent-speed-mode", default="auto", choices=["auto", "linear", "wp4"],
+                    help="plan format of the cars the policy does not drive. auto: LINEAR scripted / teacher "
+                         "cars for a v2 (WP4) checkpoint, as its boot camp trains (wp4-label-gates RESULTS 7), "
+                         "the policy's own format otherwise; league checkpoints always plan in their own")
     ap.add_argument("--opp-slots", default="", metavar="JSON|@FILE",
                     help="per-opponent configuration, the same JSON `--opp-slots` takes in "
                          "training: a JSON array with one object per car of a race "
@@ -556,8 +591,12 @@ def main() -> None:
                     help="[s] low-pass on a 'profile' speed command (EnvConfig.speed_command_tau)")
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
                     help="who sets the VESC speed command. Default: the checkpoint's own (tracker for every run before 2026-09-28)")
-    ap.add_argument("--speed-mode", choices=["linear", "envelope", "knots", "budget", "timed", "tspeed"], default=None,
-                    help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). Default: the checkpoint's own")
+    # Every mode the tracker reads (`mpc.SPEED_MODES`), so the WP4 teacher -- the v2 student's -- is
+    # one command line too; the v2smoke had to call `evaluate()` from a script to score it.
+    ap.add_argument("--speed-mode", choices=list(SPEED_MODES), default=None,
+                    help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES; wp4: the v2 network's "
+                         "four waypoints). Default: the checkpoint's own; with --teacher, the format the "
+                         "teacher writes its labels in")
     ap.add_argument("--dial-offset", type=float, default=0.0,
                     help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
                          "right; -0.15 is an operator erring on the safe side)")
@@ -693,7 +732,8 @@ def main() -> None:
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
                         controller=a.controller, estimator=a.estimator, external=external,
                         research_estimator=a.research_estimator, research_profile=a.research_profile,
-                        graph_runtime=a.graphs, opp_extra=env_extra or None)
+                        graph_runtime=a.graphs, opp_extra=env_extra or None,
+                        opponent_speed_mode=a.opponent_speed_mode)
 
     nominal = Config()
     if a.eager:

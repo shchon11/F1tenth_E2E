@@ -25,9 +25,12 @@ import numpy as np
 import torch
 
 from .mpc import ACT_DIM as PLAN_DIM, PlanSpec, PlanTracker, act_dim as plan_act_dim, encode as plan_encode, decode as plan_decode
+from .mpc import plan_layout as _plan_layout
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit_sided, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
+from .learn.obs import (EGO_ACTIONS_DEFAULT, EGO_SENSOR_KEYS, OBS_VERSIONS, V2_MAX_FRAMES, assemble_ego_v2,
+                        norm_gyro_z, v2_ego_dim, v2_ring_len)
 from .opp_token import (OPP_TOKEN_CARS, OPP_TOKEN_HORIZONS_S, OPP_TOKEN_PLAN_SOURCE,
                         OPP_TOKEN_SCALE, opp_token_car_dim, opp_token_dim, sample_body_traj,
                         straight_traj, to_ego, to_world, validate_opp_token)
@@ -48,6 +51,67 @@ TTC_FAR = 1e3
 #: The nearest-opponent columns of privileged() are stored as metres (or m/s) divided by this, to
 #: keep them O(1) for the critic. Anything comparing them against a real distance must multiply.
 PRIV_OPP_DIST_SCALE = 5.0
+
+# ---- contract v2's critic vector (`F1VecEnv.privileged_v2`) -----------------------------------------
+#: The redesign's B9 as corrected by the 10-14 gates (architecture-redesign appendix 2): ego 8, three
+#: opponents x 7 and the explicit geometry the information-gap gate measured (+0.049 AUC and R over
+#: the same critic without it, CI excluding 0) -- 33 columns. Every column is divided by a fixed
+#: scale so all of them are O(1) -- v1's progress rate reached 56 unnormalised. The dial is NOT here:
+#: the trainer owns it (`conditioning.DialDraw`) and hands the critic the same `c` column the actor
+#: reads.
+#:
+#: No speed-cap column (removed 2026-10-14). It was there for the learner's unobserved random cap
+#: (critique B5), a guess no measurement backed, which is gone; the cap left is the env's own -- the
+#: fixed `--speed-cap` in DAgger, the curriculum's in PPO, one number for every learner row of a
+#: batch -- so the column was a constant. (A self-play front car's cap, `selfplay_front_cap`, and a
+#: slot table's cap on a `self` seat still differ per row; the critic does not see them.)
+#:
+#: v1's `privileged()` is untouched (21 wide in a race, 22 with the dial): every v1 critic keeps it.
+PRIV_V2_EGO_KEYS = ("vx", "vy", "yaw_rate", "lateral", "heading_err", "lap_frac", "progress_rate",
+                    "wall_dist")
+#: Per opponent, nearest first by centre distance, absent seats all zero -- the layout the G4 gate
+#: collected and trained on (`present, dx/5, dy/5, dist/5, dvx/5, dvy/5, dyaw`).
+PRIV_V2_OPP_KEYS = ("present", "dx", "dy", "dist", "dvx", "dvy", "dyaw")
+PRIV_V2_OPP_SLOTS = 3
+#: The align gate's 'explicit geometry': the nearest present opponent's centre distance, its closing
+#: speed and time to contact, and the minimum time to contact over present opponents.
+PRIV_V2_GEO_KEYS = ("near_dist", "near_closing", "near_ttc", "min_ttc")
+PRIV_V2_KEYS = (PRIV_V2_EGO_KEYS
+                + tuple(f"opp{j}_{k}" for j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS)
+                + PRIV_V2_GEO_KEYS)
+PRIV_V2_DIM = len(PRIV_V2_KEYS)
+#: [s] TTC reported when nothing closes faster than `PRIV_V2_TTC_MIN_CLOSING`, and its cap. The
+#: align gate's numbers; with no opponent at all: distance 30 m, closing 0, TTC 10, min TTC 10.
+PRIV_V2_TTC_CAP = 10.0
+PRIV_V2_TTC_MIN_CLOSING = 0.05
+PRIV_V2_NO_OPP_DIST = 30.0
+#: Each column's sign under a left-right mirror of the world (for the training unit's augmentation).
+PRIV_V2_MIRROR = tuple(
+    {"vy": -1.0, "yaw_rate": -1.0, "lateral": -1.0, "heading_err": -1.0}.get(k, 1.0)
+    for k in PRIV_V2_EGO_KEYS) + tuple(
+    {"dy": -1.0, "dvy": -1.0, "dyaw": -1.0}.get(k, 1.0)
+    for _j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS) + (1.0,) * len(PRIV_V2_GEO_KEYS)
+
+# ---- per-seat visibility for the v2 opponent-slot auxiliary (B8) -----------------------------------
+#: [m] a seat is a label candidate within this distance of the LiDAR (requirement P2: the positions of
+#: up to three cars within 6 m).
+OPP_LABEL_RANGE_M = 6.0
+#: A seat is SEEN on a step when at least this many of the newest scan's car beams land on it -- the
+#: rule G1, align and the perception gate all used (`opponent_visible` uses it for the nearest car).
+OPP_SEEN_BEAMS = 3
+#: [steps] a sighting stays a label this long (3 s at 40 Hz): occlusions last p50 0.68 s, p90 1.71 s,
+#: behind the car p90 2.96 s (requirement M1).
+OPP_MEMORY_STEPS = 120
+#: `age` of a seat that has not been seen since its track began (episode start or respawn).
+OPP_NEVER_SEEN = 1_000_000
+#: [m] a car beam is attributed to the seat whose body + rear detection box (the rectangle the LiDAR
+#: draws for it, `Simulator._car_boxes`) is nearest its true hit point, if it is within this. The
+#: scan is motion-distorted over 25 ms (0.22 m at 9 m/s), which is what the tolerance absorbs.
+OPP_ATTRIB_TOL_M = 0.30
+#: A return is VALID -- one the seat attribution counts (`_attribute_car_beams`) -- when it is finite,
+#: short of range_max, and the noisy range is within this of the true one (the perception gate's
+#: definition).
+BEAM_VALID_TOL_M = 0.30
 
 #: The columns of `F1VecEnv.future_labels`, in order. The first six are regression targets for the
 #: auxiliary future head (`f1sim.learn.future`); the last is the target of a presence *logit*, 1
@@ -400,9 +464,36 @@ class EnvConfig:
     scan_stride: int = 1             # frames between stacked scans (3 x stride 3 = 225 ms of history: velocity cues)
     hist_len: int = 0                # >0: proprioceptive history rows (speed, imu, roll/pitch, action) in the observation
     hist_stride: int = 2             # steps between rows (20 x 2 = the last second): implicit identification of grip / lag
+    #: Observation contract (`learn.obs.OBS_VERSIONS`). 1 is every run before 2026-10-14 and the
+    #: default leaves it bit-identical (`tests/test_v1_bit_identity.py`). 2 is `learn.obs.ObsSpecV2`:
+    #: {"scan": the newest `scan_stack` (1..3) frames, "ego": [speed, gyro z] now + the action issued
+    #: two steps back + `hist_len` rows of [speed, gyro z, the issued action] `hist_stride` steps
+    #: apart} -- no speed cap, attitude, accelerometer, gyro x/y or prev_action key. Plan mode only;
+    #: the IMU must be on.
+    obs_version: int = 1
+    #: Contract v2 only (`learn.obs.ObsSpecV2.ego_actions`): whether the ego vector carries the
+    #: actions the policy issued (a_{t-2} and every history row's plan). False is the copycat study's
+    #: arm A -- [speed, gyro z] now and the history's [speed, gyro z], 42 columns -- because the issued
+    #: actions were measured to be what v2 DAgger's student copied (docs/research/copycat-2026-10-14.md).
+    #: The history ring records the actions either way; only the assembly reads less.
+    ego_actions: bool = EGO_ACTIONS_DEFAULT
+    #: Per-opponent LiDAR visibility for the v2 opponent-slot auxiliary (B8) and the nearest-visible-
+    #: car head: each step, the car beams of the newest scan attributed to each seat and the steps
+    #: since each seat was last seen (>= 3 beams within 6 m of the LiDAR). Off computes nothing.
+    opp_visibility: bool = False
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
                                      # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
+    #: Plan only: the format the cars this env's learner does NOT drive plan in -- teacher-driven seats
+    #: (the raceline teacher and every OpponentPlanner kind) and league checkpoints -- when it is not
+    #: `speed_mode` (output-format design 6, migration step 6). None: every car plans in `speed_mode`,
+    #: as in every env before 2026-10-14. "linear" beside speed_mode "wp4" is the migration's race: the
+    #: scripted cars keep the plan they were built for and the league keeps the format it was trained
+    #: in, the learner's rows (and the labels a teacher writes for them) are wp4, and one tracker reads
+    #: each row in its own format with one iLQR solve (`PlanTracker.row_format`). Without it the wp4
+    #: label gates raced wp4 opponents, so a wp4-against-linear comparison was one world against
+    #: another rather than one label against another (docs/research/wp4-label-gates-2026-10-14/).
+    opponent_speed_mode: Optional[str] = None
     plan_a_brake: float = 4.0        # [m/s^2] "envelope" only: braking its backward pass plans with (match the teacher's)
     #: What a curvature knot of +-1 means (`mpc.PlanSpec.kappa_mode`): "absolute" is +-1.6 1/m at any
     #: speed, "feasible" is the tightest arc the tyres can hold at the speed the plan starts from.
@@ -975,6 +1066,35 @@ class F1VecEnv:
         self.row_dim = 1 + 6 + 2 + self.act_dim
         self.hist = torch.zeros(self.B, (e.hist_len - 1) * e.hist_stride + 1, self.row_dim, device=self.device) if e.hist_len > 0 else None
         self._last_feat = torch.zeros(self.B, 9, device=self.device)
+        #: Observation contract v2 (`EnvConfig.obs_version`, `learn.obs.ObsSpecV2`). It keeps its own
+        #: history ring -- rows of [speed, gyro z, issued action] -- and none of v1's: `self.hist` is
+        #: None under v2, so every v1 history path below is skipped rather than computed for nothing.
+        #: Under v1 (the default) these stay None and nothing else in this class looks at them.
+        self.obs_version = int(e.obs_version)
+        self.hist2 = None
+        self._last_feat2 = None
+        self._fresh2 = None
+        if self.obs_version not in OBS_VERSIONS:
+            raise ValueError(f"obs_version must be one of {OBS_VERSIONS}, got {e.obs_version}")
+        if self.obs_version == 2:
+            self._check_obs_v2()
+            self.hist = None
+            # one row per step back, enough for the oldest history row and for a_{t-2}
+            # (`learn.obs.v2_ring_len`: 39 rows for the contract's 20 x 2, as before a_{t-2})
+            self.hist2 = torch.zeros(self.B, v2_ring_len(e.hist_len, e.hist_stride),
+                                     len(EGO_SENSOR_KEYS) + self.act_dim, device=self.device)
+            self._last_feat2 = torch.zeros(self.B, len(EGO_SENSOR_KEYS), device=self.device)
+            #: rows whose next observation is their episode's first: `_obs_v2` fills their history
+            #: from it (`ObsBuilderV2`'s rule) and clears the flag
+            self._fresh2 = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        #: Per-seat LiDAR visibility (`EnvConfig.opp_visibility`): car beams of the newest scan on
+        #: each seat of `sim.other_idx`, and steps since that seat was last seen. None when off.
+        self._opp_beams = None
+        self._opp_age = None
+        if e.opp_visibility:
+            C = max(0, self.M - 1)
+            self._opp_beams = torch.zeros(self.B, C, dtype=torch.long, device=self.device)
+            self._opp_age = torch.full((self.B, C), OPP_NEVER_SEEN, dtype=torch.long, device=self.device)
         #: "no prop anywhere near the plan", as a tensor so the compiled reward takes one shape.
         self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
         #: Whether each car was in contact last step, so a soft collision is charged on its onset.
@@ -1023,6 +1143,31 @@ class F1VecEnv:
             self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
                                        e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
+        #: The spec the cars the learner does not drive plan in (`EnvConfig.opponent_speed_mode`): the
+        #: tracker's own, the very object, unless that names another format -- then the tracker's with
+        #: that speed mode, and the tracker reads every row in its own (`_sync_row_formats`).
+        self.opp_plan_spec = None if self.tracker is None else self.tracker.spec
+        self._row_codes = None
+        #: Per league entry, the format its rows are read in (`_set_entry_formats`): a uint8 table
+        #: indexed by driver code -- the learner's, the opponents', then checkpoint entry j's own at
+        #: `OPP_DRIVER_POOL + j`. None while every entry plans in the opponents' format.
+        self._pool_codes = None
+        if e.opponent_speed_mode is not None and e.opponent_speed_mode != e.speed_mode:
+            from .mpc import ROW_FORMATS
+            if self.tracker is None:
+                raise ValueError("opponent_speed_mode is a plan format: it needs action_mode 'plan'")
+            if e.speed_mode not in ROW_FORMATS or e.opponent_speed_mode not in ROW_FORMATS:
+                raise ValueError(f"one tracker reads the plan formats {ROW_FORMATS} side by side; speed_mode "
+                                 f"{e.speed_mode!r} with opponent_speed_mode {e.opponent_speed_mode!r} is not a pair of them")
+            import dataclasses as _dc
+            self.opp_plan_spec = _dc.replace(self.tracker.spec, speed_mode=e.opponent_speed_mode)
+            #: (code of the learner's format, code of the others'), as 0-d tensors so the per-step
+            #: selection in `_sync_row_formats` allocates and synchronises nothing
+            self._row_codes = tuple(torch.tensor(ROW_FORMATS.index(m), dtype=torch.uint8, device=self.device)
+                                    for m in (e.speed_mode, e.opponent_speed_mode))
+            self.tracker.set_row_formats(torch.full((self.B,), ROW_FORMATS.index(e.speed_mode),
+                                                    dtype=torch.uint8, device=self.device))
+            self._sync_row_formats()
         self.speed_cap = torch.full((self.B,), float(self.ecfg.speed_cap), device=self.device)
         # Self-play with identical cars produces almost no passing: the front car is exactly as fast
         # as the one behind, so races settle into a constant-gap procession and the overtake and
@@ -1095,9 +1240,38 @@ class F1VecEnv:
             self._plan_alt = torch.zeros(self.B, self.tracker.spec.N + 1, 4, device=self.device)
         self.single_observation_space, self.single_action_space = self._spaces()
 
+    def _check_obs_v2(self) -> None:
+        """Refuse a v2 env that could not produce the v2 observation honestly."""
+        e = self.ecfg
+        if e.action_mode != "plan":
+            raise ValueError("obs_version 2 is the plan policy's contract (its history holds plan "
+                             "actions): set action_mode 'plan'")
+        if not (e.obs_imu and self.cfg.imu.enabled):
+            raise ValueError("obs_version 2 reads the gyro's z axis; the IMU is off "
+                             "(EnvConfig.obs_imu / cfg.imu.enabled)")
+        if validate_opp_token(e.opp_token) != "off":
+            raise ValueError("opp_token is an oracle block of the v1 proprio vector; contract v2 has "
+                             "no place for it")
+        if not 1 <= int(e.scan_stack) <= V2_MAX_FRAMES:
+            raise ValueError(f"obs_version 2 takes the newest 1..{V2_MAX_FRAMES} frames; "
+                             f"scan_stack is {e.scan_stack}")
+        if not isinstance(e.ego_actions, (bool, np.bool_)):
+            raise ValueError(f"ego_actions is a bool (the v2 ego with or without the issued actions), "
+                             f"got {e.ego_actions!r}")
+        if int(e.hist_len) < 1:
+            raise ValueError("obs_version 2's ego vector is its history: hist_len must be >= 1 "
+                             "(the contract's is 20 rows, hist_stride 2)")
+
     def _spaces(self):
         try:
             import gymnasium as gym
+            if self.obs_version == 2:
+                ego_dim = v2_ego_dim(self.ecfg.hist_len, self.ecfg.hist_stride, self.act_dim,
+                                     bool(self.ecfg.ego_actions))
+                obs = gym.spaces.Dict({
+                    "scan": gym.spaces.Box(0.0, 1.0, (self.ecfg.scan_stack, self.n_beams), np.float32),
+                    "ego": gym.spaces.Box(-5.0, 5.0, (ego_dim,), np.float32)})
+                return obs, gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
             spaces = {
                 "scan": gym.spaces.Box(0.0, 1.0, (self.ecfg.scan_stack, self.n_beams), np.float32),
                 "speed": gym.spaces.Box(-1.0, 2.0, (1,), np.float32),
@@ -1594,6 +1768,10 @@ class F1VecEnv:
         same reason the teacher is: loading a checkpoint means `learn.model`, and the env is below
         `learn` in the import order. The env owns which car each entry drives; the pool owns how an
         entry is asked for an action.
+
+        Called again whenever an entry is swapped (`OpponentPool.replace`): each entry plans in its
+        own format (`entry_formats`, `_set_entry_formats`) and may read its own observation contract
+        (`seat_builders`, fed by this env's hooks), and both can change with a swap.
         """
         if self.ecfg.opponent not in ("pool", "slots"):
             raise RuntimeError(f"set_opponent_pool on an env with opponent={self.ecfg.opponent!r}: "
@@ -1602,7 +1780,54 @@ class F1VecEnv:
         if len(pool) != len(self.pool_paths):
             raise ValueError(f"the pool holds {len(pool)} checkpoint(s) but opp_pool names "
                              f"{len(self.pool_paths)}: {list(self.pool_paths)}")
+        formats = getattr(pool, "entry_formats", None)
+        if formats is not None:
+            self._set_entry_formats(list(formats))
         self.pool = pool
+
+    def _seat_builders(self) -> tuple:
+        """The pool's per-seat observation builders (`learn.seat_obs`): one per observation contract an
+        entry reads that is not this env's own. Empty -- every v1 pool in a v1 env, every path before
+        2026-10-14 -- and then no hook below does anything."""
+        return getattr(self.pool, "seat_builders", ()) if self.pool is not None else ()
+
+    def _set_entry_formats(self, formats: list) -> None:
+        """Read each league entry's rows in the entry's own plan format (output-format design 6).
+
+        `formats[j]` is checkpoint entry j's speed mode (`OpponentPool.entry_formats`, from its
+        contract). While every entry plans in the opponents' format (`opp_plan_spec`) nothing changes:
+        the env reads every non-learner row in that format, as before. A v2 learner's snapshot joining
+        a linear league -- or a linear league seat beside wp4 scripted cars -- needs per-row formats:
+        the tracker's codes are written per driver (`_row_format_codes`), with the one iLQR solve the
+        mixed tracker already runs (`mpc.solve(row_format=...)`, bit for bit the single-format solve
+        per row)."""
+        if self.tracker is None:
+            return                                    # direct actions: no plan format to read
+        from .mpc import ROW_FORMATS
+        opp_mode = self.opp_plan_spec.speed_mode
+        if self._pool_codes is None and all(f == opp_mode for f in formats):
+            return
+        modes = [self.tracker.spec.speed_mode, opp_mode] + list(formats)
+        bad = [m for m in modes if m not in ROW_FORMATS]
+        if bad:
+            raise ValueError(f"league entries plan in {sorted(set(formats))} beside the learner's "
+                             f"{self.tracker.spec.speed_mode!r} and the opponents' {opp_mode!r}; one tracker reads "
+                             f"only {ROW_FORMATS} side by side")
+        if self._row_codes is None:
+            if self.tracker._solver is not None:
+                # a solver graph recorded without codes would be handed one more argument than it took
+                raise ValueError("a league entry plans in another format than every car of this env, and the "
+                                 "tracker's solver was already captured for one format: give the env its "
+                                 "opponents' format (EnvConfig.opponent_speed_mode) from the start")
+            ego = ROW_FORMATS.index(self.tracker.spec.speed_mode)
+            self._row_codes = tuple(torch.tensor(c, dtype=torch.uint8, device=self.device)
+                                    for c in (ego, ROW_FORMATS.index(opp_mode)))
+            self.tracker.set_row_formats(torch.full((self.B,), ego, dtype=torch.uint8, device=self.device))
+        lut = [ROW_FORMATS.index(self.tracker.spec.speed_mode), ROW_FORMATS.index(opp_mode)]
+        assert len(lut) == OPP_DRIVER_POOL
+        lut += [ROW_FORMATS.index(f) for f in formats]
+        self._pool_codes = torch.tensor(lut, dtype=torch.uint8, device=self.device)
+        self._sync_row_formats()
 
     def learner_view(self, state: Optional[torch.Tensor] = None) -> LearnerView:
         """Where the policy-driven cars are, from every car's own frame, right now.
@@ -1642,6 +1867,8 @@ class F1VecEnv:
         return norm_scan(scan[:, :: self.ecfg.scan_subsample], self.range_max)
 
     def _obs(self, r: StepResult) -> Dict[str, torch.Tensor]:
+        if self.obs_version == 2:
+            return self._obs_v2(r)
         speed = norm_speed(r.odom[:, 3], self.ecfg.v_max_policy)[:, None]
         obs = {"scan": self.scan_hist[:, ::self.ecfg.scan_stride].clone(), "speed": speed, "prev_action": self.act_hist.reshape(self.B, -1).clone(),
                "speed_cap": norm_speed(self.speed_cap, self.ecfg.v_max_policy)[:, None]}
@@ -1659,6 +1886,32 @@ class F1VecEnv:
             # start from a checkpoint without it a column-append rather than a re-layout.
             obs["opp_token"] = self.opp_tokens(r)
         return obs
+
+    def _obs_v2(self, r: StepResult) -> Dict[str, torch.Tensor]:
+        """Contract v2 (`learn.obs.ObsSpecV2`): {"scan": the newest frames, "ego": (B, ego_dim)}.
+
+        The ego vector is [speed, gyro z] of THIS observation, the action issued two steps back and
+        the history ring's rows, every `hist_stride`-th (without the issued actions when
+        `EnvConfig.ego_actions` is off) -- `learn.obs.ego_columns` is the table,
+        `learn.obs.assemble_ego_v2` the one assembly the car's builder shares. A row whose episode just started
+        is filled here, from its own first observation with zero actions, which is the rule
+        `ObsBuilderV2` applies on the car: one rule on both sides, so they agree from the first
+        step on rather than only after the history has rolled over. `torch.where` rather than a
+        branch on the flag: no host sync per step.
+        """
+        e = self.ecfg
+        if r.imu is None or r.imu.shape[1] == 0:
+            raise RuntimeError("obs_version 2 reads the gyro's z axis and this step delivered no IMU "
+                               "sample; the node inhibits on such a step, and so must the env")
+        speed = norm_speed(r.odom[:, 3], e.v_max_policy)[:, None]
+        gz = norm_gyro_z(r.imu.mean(1)[:, 2:3], e.imu_gyro_scale)
+        feat = torch.cat([speed, gz], 1)
+        fill = torch.cat([feat, torch.zeros(self.B, self.act_dim, device=feat.device, dtype=feat.dtype)], 1)
+        self.hist2 = torch.where(self._fresh2[:, None, None], fill[:, None, :].expand_as(self.hist2), self.hist2)
+        self._fresh2 = torch.zeros_like(self._fresh2)
+        self._last_feat2 = feat
+        ego = assemble_ego_v2(feat, self.hist2, e.hist_len, e.hist_stride, bool(e.ego_actions))
+        return {"scan": self.scan_hist[:, ::e.scan_stride].clone(), "ego": ego}
 
     def message_inputs(self, i: int, r: Optional[StepResult] = None) -> MessageInputs:
         """One car's control step, stated as the topics the ROS graph would have carried.
@@ -1981,7 +2234,26 @@ class F1VecEnv:
         if self.act_dim == 2:
             self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
         else:
-            self.prev_action[ids, -2:] = (speed / e.v_max_policy * 2 - 1)[:, None]
+            self.prev_action[ids, self.plan_layout.speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
+            if self._row_codes is not None and self._pool_codes is None:
+                # A car that plans in the opponents' format starts from "hold this speed" in THAT
+                # format: a league checkpoint reads its own previous action back as an observation
+                held = torch.zeros_like(self.prev_action[ids])
+                held[:, _plan_layout(self.opp_plan_spec).speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
+                self.prev_action[ids] = torch.where(self._opp_format_rows()[ids][:, None], held, self.prev_action[ids])
+            elif self._row_codes is not None:
+                # ... and with league entries in formats of their own, each car in its own: the codes
+                # are read after this reset's driver draw (`_redraw_slot_league` above), so a seat
+                # handed from a linear checkpoint to a wp4 one holds its speed in wp4's layout
+                from .mpc import ROW_FORMATS
+                codes = self._row_format_codes()[ids]
+                v_n = (speed / e.v_max_policy * 2 - 1)[:, None]
+                out = self.prev_action[ids]
+                for c, mode in enumerate(ROW_FORMATS):
+                    held = torch.zeros_like(out)
+                    held[:, _plan_layout(mode).speed] = v_n
+                    out = torch.where((codes == c)[:, None], held, out)
+                self.prev_action[ids] = out
             self.tracker.reset(ids); self._calibrate_tracker(ids)
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         if self.events is not None:
@@ -2001,6 +2273,8 @@ class F1VecEnv:
         self._car_prev[ids] = False; self._car_resp[ids] = False
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
+        for seat in self._seat_builders():
+            seat.reset_actions(ids, self.prev_action)
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
         self.ep_limit[ids] = self.NO_LIMIT; self.ep_contacts[ids] = 0.0
         self.lap_start_step[ids] = 0; self.prev_lap[ids] = 0
@@ -2030,6 +2304,10 @@ class F1VecEnv:
         if self.hist is not None:
             feat = torch.zeros(ids.numel(), 9, device=self.device); feat[:, 0] = speed / e.v_max_policy
             self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.act_dim, device=self.device)], 1)[:, None, :]
+        if self.hist2 is not None:
+            self._fresh2[ids] = True                     # filled from the row's first observation
+        for seat in self._seat_builders():
+            seat.fill(ids, scan, speed)                  # a league seat's own contract, the same fresh scan
 
         return scan, scan_true, scan_type
 
@@ -2220,14 +2498,16 @@ class F1VecEnv:
         """
         if rows is not None:
             cut = lambda t: t if t is None or not torch.is_tensor(t) or t.dim() == 0 else t[rows]
-            spec, v_max = self.tracker.spec, self.ecfg.v_max_policy
+            # the opponents' format, which is the tracker's own unless `opponent_speed_mode` says otherwise
+            spec, v_max = self.opp_plan_spec, self.ecfg.v_max_policy
+            sp = _plan_layout(spec).speed
             an = teacher.plan_rows(rows, self.sim.state, self.sim.P, self.sim.tid, v_max, spec,
                                    offset=ev_off, plan_speed=self._tracker_plan_speed())
-            an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * cut(self.opp_scale)[:, None] - 1).clamp(-1, 1)
+            an = an.clone(); an[:, sp] = ((an[:, sp] + 1) * cut(self.opp_scale)[:, None] - 1).clamp(-1, 1)
             if ev_speed is not None:
-                an[:, -2:] = (cut(ev_speed)[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
+                an[:, sp] = (cut(ev_speed)[:, None] * (an[:, sp] + 1) - 1).clamp(-1, 1)
             cap_n = (cut(v_cap) / v_max * 2 - 1)[:, None]
-            an[:, -2:] = torch.where(cut(follow)[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
+            an[:, sp] = torch.where(cut(follow)[:, None], torch.minimum(an[:, sp], cap_n), an[:, sp])
             return teacher.project_rows(an, rows, self.sim.state, self.sim.P, v_max, spec,
                                         plan_speed=self._tracker_plan_speed())
         if self.act_dim == 2:
@@ -2239,19 +2519,20 @@ class F1VecEnv:
             v = v if ev_speed is None else v * ev_speed
             v = torch.where(follow, torch.minimum(v, v_cap), v)
             return self.teacher_action_to_normalized(torch.stack([cmd[:, 0], v], 1))
-        an = self.teacher_label(teacher, offset=ev_off)
-        an = an.clone(); an[:, -2:] = ((an[:, -2:] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
+        an = self.teacher_label(teacher, offset=ev_off, spec=self.opp_plan_spec)
+        sp = _plan_layout(self.opp_plan_spec).speed
+        an = an.clone(); an[:, sp] = ((an[:, sp] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
         if ev_speed is not None:                             # same scaling in the normalized plan speeds
-            an[:, -2:] = (ev_speed[:, None] * (an[:, -2:] + 1) - 1).clamp(-1, 1)
+            an[:, sp] = (ev_speed[:, None] * (an[:, sp] + 1) - 1).clamp(-1, 1)
         cap_n = (v_cap / self.ecfg.v_max_policy * 2 - 1)[:, None]
-        an[:, -2:] = torch.where(follow[:, None], torch.minimum(an[:, -2:], cap_n), an[:, -2:])
+        an[:, sp] = torch.where(follow[:, None], torch.minimum(an[:, sp], cap_n), an[:, sp])
         # Scripted pace/events can replace the certified endpoints (including
         # speed multipliers above one). Certify the final teacher plan again;
         # policy-driven rows and their controller are unchanged.
         projector = getattr(getattr(teacher, 'base', teacher), 'project_plan_action', None)
         if projector is not None:
             an = projector(an, self.sim.state, self.sim.P, self.ecfg.v_max_policy,
-                           self.tracker.spec, plan_speed=self._tracker_plan_speed())
+                           self.opp_plan_spec, plan_speed=self._tracker_plan_speed())
         return an
 
     def _opponent_obs(self):
@@ -2380,6 +2661,10 @@ class F1VecEnv:
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
             self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.act_dim, device=self.device)], 1)[:, None, :]
             obs = self._obs(r)
+        for seat in self._seat_builders():
+            seat.begin(r)                                          # the same start, in each league contract
+        if self._opp_age is not None:
+            self._update_opp_visibility(r, torch.ones(self.B, dtype=torch.bool, device=self.device))
         self._last_obs = obs
         return obs, {"priv": self._priv(r)}
 
@@ -2395,6 +2680,7 @@ class F1VecEnv:
             # Before the solve, because `last_pred` comes back in the body frame of exactly this
             # pose and `car_future` has to put it back in the world.
             self._plan_pose = self.sim.state[:, :3].clone()
+            self._sync_row_formats()
             raw = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
@@ -2491,7 +2777,12 @@ class F1VecEnv:
         self.prev_steer_norm = steer_norm; self.prev_action = a
         if self.hist is not None:
             self.hist = torch.cat([torch.cat([self._last_feat, a], 1)[:, None, :], self.hist[:, :-1]], 1)
+        if self.hist2 is not None:
+            # the row the observation `a` was decided from, and `a` itself: what the car felt, what it was told
+            self.hist2 = torch.cat([torch.cat([self._last_feat2, a], 1)[:, None, :], self.hist2[:, :-1]], 1)
         obs = self._obs(r)
+        for seat in self._seat_builders():
+            seat.advance(r, a)                                     # each league contract's own histories
         any_done, any_lap = flags.tolist()                          # the one host sync of the step
         # true lap times: time between consecutive finish-line crossings (a spawn mid-track does not count)
         if any_lap:
@@ -2546,6 +2837,14 @@ class F1VecEnv:
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
             info["car_charge"] = car_charge
+        if self.obs_version == 2:
+            # Critique B5: the v2 policy does not observe the speed cap (the env's own: DAgger's fixed
+            # --speed-cap, PPO's curriculum), and the plan decode clips every speed at it -- on a
+            # clipped step the speed dimensions get no reward gradient and can drift. Which steps
+            # those were, for the trainer to count.
+            lay = self.plan_layout
+            v_plan = (a[:, lay.speed] + 1.0) * 0.5 * e.v_max_policy
+            info["speed_capped"] = (v_plan > self.speed_cap[:, None]).any(1)
         if self.events is not None:
             # What each opponent is doing right now, for a viewer or a logger: event id (0 = none,
             # f1sim.opponent_events.EVENT_ID), seconds left, and the lateral offset it is holding.
@@ -2566,10 +2865,18 @@ class F1VecEnv:
             # final observation of the ended episodes (before auto-reset)
             info["final_obs"] = {k: v[ids].clone() for k, v in obs.items()}
             info["final_priv"] = self.privileged(r)[ids].clone()
+            if self.obs_version == 2:
+                # the v2 critic's vector of the same terminal observation, for the truncation bootstrap
+                info["final_priv_v2"] = self.privileged_v2(r)[ids].clone()
             scans = self._reset_envs(ids)
             r = self._reset_result(r, ids, scans)
             self._plan_fallback(ids, r.state)
             obs = self._obs(r)
+            for seat in self._seat_builders():
+                seat.refresh(r)                                    # the reset rows' first observation
+        if self._opp_age is not None:
+            # after the resets: the age describes the observation the next action is taken from
+            self._update_opp_visibility(r, done if any_done else None)
         self.last_result = r
         self._note_imu_yaw_rate(r)
         self._last_obs = obs
@@ -3030,6 +3337,215 @@ class F1VecEnv:
         if res is None:
             raise RuntimeError("opponent_beam_mask needs a stepped env: call reset() first")
         return (res.scan_type == HIT_CAR).to(res.scan.dtype)
+
+    # ------------------------------------------------------------------ contract v2: critic and labels
+    def _opp_rel(self, st: torch.Tensor):
+        """Every seat of `sim.other_idx` relative to the ego, in the ego body frame (x forward, origin
+        at the ego pose): dx, dy [m], dyaw [rad], dvx, dvy [m/s] (world velocities differenced, then
+        rotated into the ego frame, so dx + dt dvx is to first order where the car will be), centre
+        distance [m] and whether the seat's car is in the race at all (not parked). All (B, C).
+        The G4 gate's `opp_block` arithmetic, which the critic results were measured on."""
+        o = self.sim.other_idx
+        me, ot = st[:, None, :], st[o]
+        d = ot[..., :2] - me[..., :2]
+        c, s = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+        dx, dy = d[..., 0] * c + d[..., 1] * s, -d[..., 0] * s + d[..., 1] * c
+        co, so = torch.cos(ot[..., 2]), torch.sin(ot[..., 2])
+        vwx = (ot[..., 3] * co - ot[..., 4] * so) - (me[..., 3] * c - me[..., 4] * s)
+        vwy = (ot[..., 3] * so + ot[..., 4] * co) - (me[..., 3] * s + me[..., 4] * c)
+        dvx, dvy = vwx * c + vwy * s, -vwx * s + vwy * c
+        dyaw = torch.remainder(ot[..., 2] - me[..., 2] + math.pi, 2 * math.pi) - math.pi
+        present = (~self.sim.absent[o]) if self.sim.absent_any else torch.ones_like(dx, dtype=torch.bool)
+        return dx, dy, dyaw, dvx, dvy, d.norm(dim=-1), present
+
+    def privileged_v2(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, PRIV_V2_DIM) the v2 critic's privileged vector, in `PRIV_V2_KEYS` order.
+
+        Critic-only and never an observation. v1's `privileged()` is untouched, so a v1 critic keeps
+        its 21 (+ dial) columns. The scales are fixed, not learned or measured per run, so the same
+        number means the same thing in every checkpoint: speeds over v_max (10), the side slip over
+        2 m/s, yaw rate over the gyro scale (5 rad/s), lateral offset in metres, heading error over
+        pi, the progress rate over v_max clamped to +-2 (a lap wrap is a one-step spike), the wall
+        distance over 2 m clamped to [-1, 3], opponents as the G4 gate stored them, the geometry's
+        distances and speeds over 5 and its times over the 10 s cap.
+        """
+        res = self.last_result if r is None else r
+        if res is None:
+            raise RuntimeError("privileged_v2 needs a stepped env: call reset() first")
+        e, st = self.ecfg, res.state
+        xy_c, yaw_c = self.sim.track.pose_at_s(res.s, self.sim.tid)
+        herr = torch.remainder(st[:, 2] - yaw_c + math.pi, 2 * math.pi) - math.pi
+        vm = float(e.v_max_policy)
+        ego = torch.stack([st[:, 3] / vm, st[:, 4] / 2.0, st[:, 5] / float(e.imu_gyro_scale), res.lateral,
+                           herr / math.pi, torch.remainder(res.s / self.sim.track.length[self.sim.tid], 1.0),
+                           (res.progress / self.sim.control_dt / vm).clamp(-2.0, 2.0),
+                           (res.wall_dist / 2.0).clamp(-1.0, 3.0)], 1)
+        K, S = PRIV_V2_OPP_SLOTS, PRIV_OPP_DIST_SCALE
+        opp = torch.zeros(self.B, K, len(PRIV_V2_OPP_KEYS), device=st.device, dtype=st.dtype)
+        geo = torch.tensor([PRIV_V2_NO_OPP_DIST / S, 0.0, 1.0, 1.0], device=st.device,
+                           dtype=st.dtype).expand(self.B, -1).clone()
+        if self.M > 1:
+            dx, dy, dyaw, dvx, dvy, dist, present = self._opp_rel(st)
+            blk = torch.stack([present.to(st.dtype), dx / S, dy / S, dist / S, dvx / S, dvy / S, dyaw], 2)
+            blk = blk * present[..., None].to(st.dtype)
+            key = torch.where(present, dist, torch.full_like(dist, 1e6))
+            order = key.argsort(1)                                   # nearest present seat first
+            blk = blk.gather(1, order[..., None].expand(-1, -1, blk.shape[2]))
+            n = min(K, blk.shape[1])
+            opp[:, :n] = blk[:, :n]
+            dist_c = torch.where(present, dist, torch.full_like(dist, PRIV_V2_NO_OPP_DIST))
+            clos = torch.where(present, -(dx * dvx + dy * dvy) / dist_c.clamp_min(1e-3), torch.zeros_like(dist))
+            ttc = torch.where(present & (clos > PRIV_V2_TTC_MIN_CLOSING),
+                              (dist_c / clos.clamp_min(1e-3)).clamp(0.0, PRIV_V2_TTC_CAP),
+                              torch.full_like(dist, PRIV_V2_TTC_CAP))
+            j = key.argmin(1, keepdim=True)
+            geo = torch.cat([dist_c.gather(1, j) / S, clos.gather(1, j) / S,
+                             ttc.gather(1, j) / PRIV_V2_TTC_CAP,
+                             ttc.min(1, keepdim=True).values / PRIV_V2_TTC_CAP], 1)
+        return torch.cat([ego, opp.reshape(self.B, -1), geo], 1)
+
+    def _lidar_pose(self):
+        """(mount x, mount y, beam angles (B, N_sensor)) of each car's LiDAR in its body frame: the
+        per-env truth the scan was cast with (`Lidar._rays` reads the same `P` entries)."""
+        P, cl = self.sim.P, self.cfg.lidar
+        mx = P["mount_x"] if "mount_x" in P else torch.full((self.B,), float(cl.mount_x), device=self.device)
+        my = P["mount_y"] if "mount_y" in P else torch.full((self.B,), float(cl.mount_y), device=self.device)
+        ang = self.sim.lidar.angles[None, :]
+        if "mount_yaw" in P:
+            ang = ang + P["mount_yaw"][:, None]
+        return mx, my, ang
+
+    def _beam_valid(self, res: StepResult) -> torch.Tensor:
+        """(B, N_sensor) bool: a return the seat attribution may count (`BEAM_VALID_TOL_M`)."""
+        rng, tru = res.scan, res.scan_true
+        return (torch.isfinite(rng) & (rng < self.range_max - 1e-3)
+                & ((rng - tru).abs() < BEAM_VALID_TOL_M))
+
+    def _attribute_car_beams(self, res: StepResult) -> torch.Tensor:
+        """(B, C) long: valid car returns of the newest scan, attributed seat by seat.
+
+        The LiDAR marks a beam HIT_CAR without saying which car (`lidar.Lidar.scan`), so each car
+        beam goes to the seat whose body + rear detection box -- the rectangle the scan draws for it
+        -- is nearest the beam's TRUE hit point, if within `OPP_ATTRIB_TOL_M`. A beam stopped by one
+        car is not counted for the car behind it: occlusion comes out of the scan itself.
+        """
+        from .lidar import HIT_CAR
+        C = self.M - 1
+        if C <= 0:
+            return torch.zeros(self.B, 0, dtype=torch.long, device=self.device)
+        car = (res.scan_type == HIT_CAR) & self._beam_valid(res)
+        mx, my, ang = self._lidar_pose()
+        rt = torch.where(torch.isfinite(res.scan_true), res.scan_true, torch.zeros_like(res.scan_true))
+        px = mx[:, None] + rt * torch.cos(ang)                       # (B, N) hit points, ego frame
+        py = my[:, None] + rt * torch.sin(ang)
+        dx, dy, dyaw, _dvx, _dvy, _dist, present = self._opp_rel(res.state)
+        c, s = torch.cos(dyaw)[..., None], torch.sin(dyaw)[..., None]
+        ex, ey = px[:, None, :] - dx[..., None], py[:, None, :] - dy[..., None]
+        qx, qy = ex * c + ey * s, -ex * s + ey * c                   # (B, C, N) in each seat's frame
+        o = self.sim.other_idx
+        L, W = self.sim.car_dims[o][..., 0], self.sim.car_dims[o][..., 1]
+        rd, rw = self.sim.car_rear[o][..., 0], self.sim.car_rear[o][..., 1]
+        x_lo, x_hi = (-(0.5 * L + rd))[..., None], (0.5 * L)[..., None]
+        hw = (0.5 * torch.maximum(W, rw))[..., None]
+        out_x = (x_lo - qx).clamp_min(0.0) + (qx - x_hi).clamp_min(0.0)
+        out_y = (qy.abs() - hw).clamp_min(0.0)
+        dbox = torch.sqrt(out_x * out_x + out_y * out_y)
+        dbox = torch.where(present[..., None], dbox, torch.full_like(dbox, float("inf")))
+        dmin, j = dbox.min(1)                                        # (B, N)
+        hit = car & (dmin < OPP_ATTRIB_TOL_M)
+        counts = torch.zeros(self.B, C, dtype=torch.long, device=self.device)
+        return counts.scatter_add_(1, j, hit.long())
+
+    def _update_opp_visibility(self, res: StepResult, reset_rows: Optional[torch.Tensor]) -> None:
+        """Advance every seat's `age` (steps since it was last seen) by one observation.
+
+        A seat's track ends when either car of the pair starts a new episode: the ego's own reset
+        clears every track it held, and a seat whose car respawned is a different car in a different
+        place (the perception gate's rule: identity broken at respawn and episode start)."""
+        if self._opp_age is None or self.M <= 1:
+            return
+        age = (self._opp_age + 1).clamp_max(OPP_NEVER_SEEN)
+        if reset_rows is not None:
+            o = self.sim.other_idx
+            gone = reset_rows[:, None] | reset_rows[o]
+            age = torch.where(gone, torch.full_like(age, OPP_NEVER_SEEN), age)
+        beams = self._attribute_car_beams(res)
+        mx, my, _ang = self._lidar_pose()
+        dx, dy, _dyaw, _dvx, _dvy, _dist, present = self._opp_rel(res.state)
+        dist_l = torch.hypot(dx - mx[:, None], dy - my[:, None])
+        seen = present & (beams >= OPP_SEEN_BEAMS) & (dist_l < OPP_LABEL_RANGE_M)
+        self._opp_age = torch.where(seen, torch.zeros_like(age), age)
+        self._opp_beams = beams
+
+    def opponent_tracks_v2(self, r: Optional[StepResult] = None) -> Dict[str, torch.Tensor]:
+        """Per seat, the labels of the v2 opponent-slot auxiliary (B8), for THIS observation.
+
+        Train-time only, privileged. Keys, all (B, C) unless noted, C = race_size - 1:
+          present  the seat's car is in the race (not parked)
+          cand     present and within OPP_LABEL_RANGE_M of the LiDAR: a car the head should report
+          lab      (B, C, 3) [dx / 5, dy / 2, v_lat / 2], LiDAR frame (x forward from the LiDAR,
+                   y left), v_lat the relative lateral velocity in the ego frame -- the align and
+                   perception gates' targets
+          dist     distance from the LiDAR [m]
+          beams    valid car returns of the newest scan on this seat (`_attribute_car_beams`)
+          age      steps since the seat was last seen (>= OPP_SEEN_BEAMS beams within range);
+                   0 = seen now, OPP_NEVER_SEEN = not since its track began
+        Which candidates are KNOWABLE inside a training window -- seen within OPP_MEMORY_STEPS and
+        that sighting inside the chunk or its burn-in -- is the trainer's to decide, because only it
+        knows the window: `learn.aux_v2.b8_know_mask(cand, age, steps_into_window)`.
+        Needs `EnvConfig.opp_visibility`: the age is a running count, not a function of one step.
+        """
+        if self._opp_age is None:
+            raise RuntimeError("opponent_tracks_v2 needs EnvConfig.opp_visibility: the age since a "
+                               "seat was last seen is counted every step, not recomputed on demand")
+        res = self.last_result if r is None else r
+        C = max(0, self.M - 1)
+        dev, dt_ = self.device, res.state.dtype
+        if C == 0:
+            z = torch.zeros(self.B, 0, device=dev)
+            return {"present": z.bool(), "cand": z.bool(), "lab": torch.zeros(self.B, 0, 3, device=dev),
+                    "dist": z, "beams": z.long(), "age": z.long()}
+        mx, my, _ang = self._lidar_pose()
+        dx, dy, _dyaw, _dvx, dvy, _dist, present = self._opp_rel(res.state)
+        lx, ly = dx - mx[:, None], dy - my[:, None]
+        dist_l = torch.hypot(lx, ly)
+        pf = present.to(dt_)
+        lab = torch.stack([lx / 5.0, ly / 2.0, dvy / 2.0], 2) * pf[..., None]
+        return {"present": present, "cand": present & (dist_l < OPP_LABEL_RANGE_M), "lab": lab,
+                "dist": torch.where(present, dist_l, torch.full_like(dist_l, float("inf"))),
+                "beams": self._opp_beams.clone(), "age": self._opp_age.clone()}
+
+    def nearest_visible_car_v2(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, 5) the nearest car the newest scan SEES -- >= OPP_SEEN_BEAMS of its returns, within
+        OPP_LABEL_RANGE_M of the LiDAR: [exists, dx / 5, dy / 2, closing / 5, v_lat / 2], LiDAR
+        frame, closing = -(unit line of sight . relative velocity). Zeros where none is seen.
+
+        The target of the perception gate's auxiliary B (the align gate found the true distance to
+        the nearest visible car alone gives contact-risk AUC 0.902). Train-time only; needs
+        `EnvConfig.opp_visibility` for this step's attributed beams."""
+        if self._opp_beams is None:
+            raise RuntimeError("nearest_visible_car_v2 needs EnvConfig.opp_visibility")
+        res = self.last_result if r is None else r
+        out = torch.zeros(self.B, 5, device=self.device, dtype=res.state.dtype)
+        if self.M <= 1:
+            return out
+        mx, my, _ang = self._lidar_pose()
+        dx, dy, _dyaw, dvx, dvy, _dist, present = self._opp_rel(res.state)
+        lx, ly = dx - mx[:, None], dy - my[:, None]
+        dist_l = torch.hypot(lx, ly)
+        seen = present & (self._opp_beams >= OPP_SEEN_BEAMS) & (dist_l < OPP_LABEL_RANGE_M)
+        key = torch.where(seen, dist_l, torch.full_like(dist_l, float("inf")))
+        j = key.argmin(1, keepdim=True)
+        ex = seen.any(1).to(out.dtype)
+        g = lambda t: t.gather(1, j)[:, 0]
+        dl = g(dist_l).clamp_min(1e-6)
+        closing = -(g(lx) * g(dvx) + g(ly) * g(dvy)) / dl
+        out[:, 0] = ex
+        out[:, 1] = ex * g(lx) / 5.0
+        out[:, 2] = ex * g(ly) / 2.0
+        out[:, 3] = ex * closing / 5.0
+        out[:, 4] = ex * g(dvy) / 2.0
+        return out
 
     @torch.no_grad()
     def car_future(self, times, model: Optional[str] = None,
@@ -3524,6 +4040,43 @@ class F1VecEnv:
         """(steer [rad], speed [m/s]) -> policy action in [-1, 1] (direct action space)."""
         return torch.stack([cmd[:, 0] / self.s_max, cmd[:, 1] / self.ecfg.v_max_policy * 2 - 1], 1).clamp(-1, 1)
 
+    @property
+    def plan_layout(self):
+        """Which columns of this env's plans are path and which speed: `mpc.plan_layout` of the spec
+        its tracker decodes with. Read by every place that scales or sets a plan's speed -- "linear"
+        and "wp4" are both 8 wide, so a positional slice would scale the wrong numbers without any
+        shape complaining. Plan mode only. The learner's plans; the opponents' are `opp_plan_spec`'s
+        (`EnvConfig.opponent_speed_mode`)."""
+        return _plan_layout(self.tracker.spec)
+
+    def _opp_format_rows(self) -> torch.Tensor:
+        """(B,) the cars that plan in `opp_plan_spec`'s format: driven by a teacher or by a league
+        checkpoint (unless that entry plans in a format of its own, `_row_format_codes`). A `self` pool
+        entry is the learner's own weights, so its car plans like the learner."""
+        return self.teacher_driven | self.pool_driven
+
+    def _row_format_codes(self) -> torch.Tensor:
+        """(B,) uint8 code into `mpc.ROW_FORMATS` of the format each car plans in: the learner's, the
+        opponents' for a teacher or league car -- and a league car's own entry's format once the
+        entries differ (`_set_entry_formats`)."""
+        ego, opp = self._row_codes
+        codes = torch.where(self._opp_format_rows(), opp, ego)
+        if self._pool_codes is not None:
+            codes = torch.where(self.pool_driven, self._pool_codes[self.opp_driver], codes)
+        return codes
+
+    def _sync_row_formats(self) -> None:
+        """Point each row of the tracker at its car's plan format (`EnvConfig.opponent_speed_mode`, and
+        each league entry's own).
+
+        From the driver masks at every step rather than kept in step with them: "mixed", "pool" and
+        the league slots redraw those masks at race resets, and the rollout teacher's shadow env has
+        them copied in wholesale. In place, so a captured solver graph follows it. Nothing at all
+        when every car plans in one format."""
+        if self._row_codes is None:
+            return
+        self.tracker.row_format.copy_(self._row_format_codes())
+
     def _tracker_plan_speed(self) -> torch.Tensor:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""
         return self.last_result.odom[:, 3] if self.last_result is not None else self.sim.state[:, 3]
@@ -3534,16 +4087,32 @@ class F1VecEnv:
         self.grip_budget = None if mu is None else mu.to(self.device).reshape(-1)
 
     def teacher_label(self, teacher, offset: Optional[torch.Tensor] = None,
-                      mu: Optional[torch.Tensor] = None) -> torch.Tensor:
+                      mu: Optional[torch.Tensor] = None, spec=None,
+                      rows: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The teacher's action in this env's action space: (steer, speed) or its local plan.
 
         mu: (B,) friction the teacher should *drive for* instead of the env's own -- the label of a
         dial-conditioned student, whose input says how much grip to use rather than how much there
-        is. Everything else the teacher is privileged to (latency, calibration) stays the truth."""
+        is. Everything else the teacher is privileged to (latency, calibration) stays the truth.
+
+        spec: the plan format to write it in -- the tracker's own (the learner's) by default; the
+        opponents' commands pass `opp_plan_spec`.
+
+        rows: the env rows to label, (R,) long -- the result is then (R, ACT_DIM), and the teacher's
+        `last_label_valid` is (R,) too. The guard over the raceline teacher and the interactive
+        teacher plan those rows only (`InteractiveTeacher.plan_rows`; the opponents are still read
+        from the whole batch, `row_planning`), each row getting the command the whole-batch call
+        gives it; any other teacher is asked for the whole batch and cut. Every argument stays the
+        whole batch's. Why: in a race of four the guard labelled every car while DAgger stores the
+        learner's quarter -- 0.118 s of every 0.56 s collection step at 512 cars (v2smoke_b, 21 % of
+        collection), for rows nothing reads."""
         P = self.sim.P if mu is None else {**self.sim.P, "mu": mu.to(self.sim.P["mu"].dtype)}
         if self.act_dim == 2:
             kwargs = {} if offset is None else {"offset": offset}
-            return self.teacher_action_to_normalized(teacher(self.sim.state, P, self.sim.tid, **kwargs))
+            a = self.teacher_action_to_normalized(teacher(self.sim.state, P, self.sim.tid, **kwargs))
+            return a if rows is None else a[rows]
+        spec = self.tracker.spec if spec is None else spec
+        v_max, v_meas = self.ecfg.v_max_policy, self._tracker_plan_speed()
         from .teacher import RacelineTeacher
         if isinstance(teacher, RacelineTeacher):
             # A global raceline alone does not certify what this tracker will
@@ -3556,12 +4125,43 @@ class F1VecEnv:
             guard = guards.get(teacher)
             if guard is None:
                 guard = guards[teacher] = InteractiveTeacher(teacher, self, offsets=(0.0,), cand_iters=6, lane_clamp=True)
-            action = guard.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
-                                       self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
+            if rows is None:
+                action = guard.plan_action(self.sim.state, P, self.sim.tid, v_max, spec, offset=offset,
+                                           plan_speed=v_meas)
+            else:
+                action = guard.plan_rows(rows, self.sim.state, P, self.sim.tid, v_max, spec, offset=offset,
+                                         plan_speed=v_meas)
             teacher.last_label_valid = guard.last_label_valid
             return action
-        return teacher.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
-                                   self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
+        from .interactive_teacher import InteractiveTeacher
+        if rows is not None and isinstance(teacher, InteractiveTeacher):
+            # its subset call scores and validates exactly those rows (`last_label_valid` (R,)); the
+            # layout teacher's `plan_rows` keeps a per-env validity it does not refresh, so it is not
+            # asked for a subset here
+            return teacher.plan_rows(rows, self.sim.state, P, self.sim.tid, v_max, spec, offset=offset,
+                                     plan_speed=v_meas)
+        a = teacher.plan_action(self.sim.state, P, self.sim.tid, v_max, spec, offset=offset, plan_speed=v_meas)
+        if rows is None:
+            return a
+        valid = getattr(teacher, "last_label_valid", None)
+        if torch.is_tensor(valid) and valid.shape[:1] == a.shape[:1]:
+            teacher.last_label_valid = valid[rows]
+        return a[rows]
+
+    def action_driven(self) -> torch.Tensor:
+        """(B,) bool: the cars whose command is `step`'s `action` argument -- every row
+        `_opponent_actions` does not overwrite with a pool checkpoint's or a teacher's command. The
+        learners (slot 0) always; in self-play, mixed or pool races the opponent seats the policy
+        drives as well. A label written for any other row is thrown away by `step`, so a trainer
+        that labels only these rows (`learn.dagger_v2.label_rows`) drives exactly as before."""
+        if self.M == 1 or self.ecfg.opponent not in ("teacher", "mixed", "pool", "slots"):
+            return torch.ones(self.B, dtype=torch.bool, device=self.device)
+        mine = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        if self.pool is not None:
+            mine = mine & ~self.pool_driven
+        if self.teacher_any:
+            mine = mine & ~self.teacher_driven
+        return mine
 
     def set_ideal_lap(self, racelines) -> None:
         """Fastest plausible time per track and per sector, from the raceline speed profile: sum(ds / v).

@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from .mpc import plan_layout
 from .teacher import RacelineTeacher
 
 #: Row tensors whose VALUES are row indices (or derived from the row's position in the batch). The
@@ -250,7 +251,8 @@ class RolloutTeacher:
                                 env.ecfg.v_max_policy, env.tracker.spec,
                                 offset=off, plan_speed=env._tracker_plan_speed() if plan_speed is None else plan_speed)
         a = a.clone()
-        a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
+        sp = plan_layout(env.tracker.spec).speed
+        a[:, sp] = ((a[:, sp] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
         return a
 
     @torch.no_grad()
@@ -263,6 +265,7 @@ class RolloutTeacher:
             v = getattr(self.base, k, None)
             setattr(self.base_S, k, v.repeat(K, *([1] * (v.dim() - 1))) if torch.is_tensor(v) and v.shape[:1] == (B,) else v)
         self.base_S.label_grip = self.base.label_grip
+        self.base_S.wp4_path = self.base.wp4_path
         off = self.c_off.repeat_interleave(B)            # shadow row k*B + i drives candidate k
         spd = self.c_spd.repeat_interleave(B)
         hit = torch.zeros(K * B, dtype=torch.bool, device=self.device)
@@ -325,6 +328,7 @@ class RolloutTeacher:
             v = getattr(self.base, n, None)
             setattr(self.base_S, n, v.repeat(K, *([1] * (v.dim() - 1))) if torch.is_tensor(v) and v.shape[:1] == (B,) else v)
         self.base_S.label_grip = self.base.label_grip
+        self.base_S.wp4_path = self.base.wp4_path
         off = self.c_off.repeat_interleave(B); spd = self.c_spd.repeat_interleave(B)
         # lateral_slow=False: no off-line slowdown in the plans (a 'transform' maneuver head's plain plan -- slowing down is
         # the candidate CHOICE's job there; with it, a student that executes offsets learned a plain plan 0.64x slow)
@@ -334,7 +338,8 @@ class RolloutTeacher:
         a = self.base_S.plan_action(env.sim.state.repeat(K, 1), PK, self._real_tid().repeat(K), env.ecfg.v_max_policy,
                                     env.tracker.spec, offset=off, plan_speed=env._tracker_plan_speed().repeat(K)).clone()
         self.base_S.lat_slow = keep_slow
-        a[:, -2:] = ((a[:, -2:] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
+        sp = plan_layout(env.tracker.spec).speed
+        a[:, sp] = ((a[:, sp] + 1.0) * spd[:, None] - 1.0).clamp(-1.0, 1.0)
         return a.view(K, B, -1).transpose(0, 1).contiguous()
 
     def __call__(self, state, P=None, tid=None, offset=None):

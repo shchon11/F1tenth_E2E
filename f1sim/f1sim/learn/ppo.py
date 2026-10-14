@@ -25,6 +25,7 @@ import torch
 
 from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX, OPP_FUTURE_MODELS,
                        PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS)
+from ..mpc import plan_layout
 from ..opp_token import OPP_TOKEN_MODES, describe as describe_opp_token
 from ..params import Config
 from . import common
@@ -96,7 +97,7 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
                      val_old, w, cond=None, hyper: PPOHyper, autocast=None,
                      freeze_actor: bool = False, sequence=None,
                      future=None, future_valid=None, beam_mask=None, dv=None,
-                     floor_label=None, reference_params=None, kl_scope="all") -> dict:
+                     floor_label=None, reference_params=None, kl_scope="all", layout=None) -> dict:
     """One PPO minibatch's loss terms, feedforward or recurrent.
 
     Lifted out of `main`'s inner loop unchanged so that (a) the recurrent path and the feedforward
@@ -225,8 +226,10 @@ def minibatch_losses(model: ActorCritic, ref, *, scan, pro, priv, act, logp_old,
         if ref_mean.shape != d.mean.shape or ref_std.shape != d.stddev.shape:
             raise ValueError("stored recurrent reference does not align with the PPO minibatch")
     if kl_scope == "curvature":
-        ref_mean, ref_std = ref_mean[:, :6], ref_std[:, :6]
-        d = torch.distributions.Normal(getattr(d, "anchor", d.mean).float()[:, :6], d.stddev.float()[:, :6])
+        # the path columns of the run's plan (`layout`, an `mpc.plan_layout`; None is "linear")
+        cols = (layout or plan_layout("linear")).path
+        ref_mean, ref_std = ref_mean[:, cols], ref_std[:, cols]
+        d = torch.distributions.Normal(getattr(d, "anchor", d.mean).float()[:, cols], d.stddev.float()[:, cols])
     elif kl_scope != "all":
         raise ValueError(f"unknown KL scope {kl_scope!r}")
     d_ref = torch.distributions.Normal(ref_mean, ref_std)
@@ -886,7 +889,53 @@ def main():
                     help="[s] >0: cap the teacher's commanded speed at what can still be steered back onto the lane "
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
+    # ---- the v2 network (learn.model_v2, learn.ppo_v2). Every flag below is v2's own: None on a v1
+    # run, which refuses any of them set, so an unflagged run is the run it always was.
+    ap.add_argument("--arch", choices=("v1", "v2"), default="v1",
+                    help="v2: the redesigned actor-critic (docs/research/architecture-redesign-2026-10-13.md) "
+                         "on observation contract v2 and WP4 plans: one value stream with value normalisation "
+                         "and a 'car contact within 1 s' classifier on a critic that reads privileged_v2, no KL "
+                         "leash (kl_ref logged only), --clip-split, Adam eps 1e-8, --vf-clip 0, actor lr 2e-5 -> "
+                         "1e-5, critic lr 3e-4, horizon 128, minibatch 4096 in 4 pieces unless set. v1: every "
+                         "run before it")
+    ap.add_argument("--v2-frames", type=int, default=None, metavar="K",
+                    help="v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)")
+    ap.add_argument("--v2-init-stem", default=None, metavar="CKPT",
+                    help="v2 without --init: seed both stems from this v1 resnet checkpoint (model_v2.init_stems_from_v1)")
+    ap.add_argument("--critic-lr", type=float, default=None,
+                    help="v2: the critic's learning rate, constant (default 3e-4, the redesign's); --lr / --lr-end "
+                         "schedule the actor")
+    ap.add_argument("--value-norm-beta", type=float, default=None, metavar="B",
+                    help="v2: per-update EMA weight of the return statistics the critic's targets are "
+                         "normalised by (default 0.99, about the last hundred updates)")
+    ap.add_argument("--contact-bce", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the critic's 'charged car contact within 1 s' BCE (default 1.0, G4's)")
+    ap.add_argument("--aux-b8", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the B8 opponent-slot loss on the actor (default 0.5, the redesign's)")
+    ap.add_argument("--aux-near-car", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; "
+                         "0 builds no head)")
+    ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
+                    help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
+                         "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
+                         "the policy gradient (default 10; 0 = off, the coefficients alone)")
+    ap.add_argument("--aux-balance-rho", type=float, default=None, metavar="RHO",
+                    help="v2: the largest auxiliary / policy-gradient trunk-gradient ratio the balance allows (default 0.5)")
+    ap.add_argument("--aux-balance-beta", type=float, default=None, metavar="B",
+                    help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
+                         "last five measurements)")
     a = ap.parse_args()
+    v2_applied = None
+    if a.arch == "v2":
+        from . import ppo_v2
+        v2_applied = ppo_v2.prepare_args(ap, a)
+    else:
+        set_v2 = [k for k in ("v2_frames", "v2_init_stem", "critic_lr", "value_norm_beta", "contact_bce", "aux_b8",
+                              "aux_near_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta",
+                              "opponent_speed_mode")
+                  if getattr(a, k) is not None]
+        if set_v2:
+            raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
     adaptive = a.adaptation != "off"
     if adaptive:
         if a.controller != "auto" or not a.init or a.memory != "gru":
@@ -1085,7 +1134,9 @@ def main():
                                                               reward_progress_gate=a.progress_gate,
                                                               gate_min=a.gate_min,
                                                               replay_lag_s=a.replay_lag,
-                                                              compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
+                                                              compile_tracker=_env_compile_tracker,
+                                                              **({} if v2_applied is None else ppo_v2.env_kwargs(a))),
+                          seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,
                           teacher_recover_time=a.teacher_recover_time, teacher_limits=limits)
@@ -1192,6 +1243,10 @@ def main():
     obs, info = env.reset(seed=a.seed)
     # After the seeded reset: the histories must start from the observations this run actually saw.
     controller.begin(obs)
+    if v2_applied is not None:
+        return ppo_v2.train(a, env=env, obs=obs, device=device, names=names, init_ck=init_ck,
+                            controller=controller, graph_rt=graph_rt, applied=v2_applied,
+                            league_seats=league_seats)
     priv = env.privileged(env.last_result); env_priv_dim = priv.shape[1]
     # A dial run's critic is told the dial: the return of an episode depends on how much grip the car
     # was allowed, and a critic that sees the floor but not the dial has to explain that as noise.
@@ -1427,7 +1482,7 @@ def main():
     #: Read back from the model, never from the flags: an `--init` checkpoint that already carries
     #: memory keeps its own, and the rollout below has to agree with what was built.
     memory_on = bool(model.meta.get("memory"))
-    if adaptive and (not memory_on or model.actor.mu.out_features != 8):
+    if adaptive and (not memory_on or model.actor.mu.out_features != plan_layout(a.speed_mode).act_dim):
         raise SystemExit("adaptive training requires the trained recurrent 8D D3 actor")
     if adaptive:
         require_exact_actor(model, init_ck)
@@ -1643,7 +1698,7 @@ def main():
         if not crit:
             raise SystemExit("--clip-split: this model has no 'critic.' parameters")
         clip_sets = (act, crit)
-    speed_freeze = SpeedRowFreeze(model) if a.adaptation == "speed" else None
+    speed_freeze = SpeedRowFreeze(model, plan_layout(a.speed_mode)) if a.adaptation == "speed" else None
     optimizer_restored = False
     # Adam's moments are part of where training got to. Dropping them on every resume restarts the
     # step-size estimate from nothing, which is the other half of why a resume costs updates before
@@ -2290,7 +2345,8 @@ def main():
                                          autocast=ac, freeze_actor=freeze_actor, sequence=seq,
                                          future=fut_mb, future_valid=fut_valid_mb,
                                          beam_mask=mask_mb, dv=dv_mb, floor_label=floor_mb,
-                                         reference_params=ref_mb, kl_scope=a.kl_scope)
+                                         reference_params=ref_mb, kl_scope=a.kl_scope,
+                                         layout=plan_layout(a.speed_mode))
                 pg, vf, kl_ref, aux, aux_o = (terms["pg"], terms["vf"], terms["kl_ref"],
                                               terms["aux_grip"], terms["aux_opp"])
                 loss = terms["loss"]
@@ -2395,10 +2451,10 @@ def main():
                       if stats.get("aux_motion") else {}),
                    **{f"loss/{key}": float(np.mean(v)) for key, v in stats.items()
                       if key.startswith("aux_opp_mask/") or key.startswith("aux_motion/")},
-                   "policy/log_std_steer": (model.actor.log_std[:-2].mean() if a.action_mode == "plan"
-                                             else model.actor.log_std[0]).item(),
-                   "policy/log_std_speed": (model.actor.log_std[-2:].mean() if a.action_mode == "plan"
-                                             else model.actor.log_std[1]).item(),
+                   "policy/log_std_steer": (model.actor.log_std[plan_layout(a.speed_mode).other].mean()
+                                             if a.action_mode == "plan" else model.actor.log_std[0]).item(),
+                   "policy/log_std_speed": (model.actor.log_std[plan_layout(a.speed_mode).speed].mean()
+                                             if a.action_mode == "plan" else model.actor.log_std[1]).item(),
                    "time/rollout_s": t_roll, "time/update_s": t_upd, "time/env_steps_per_s": n / (t_roll + t_upd),
                    "time/elapsed_min": (time.time() - t_start) / 60}
             # over the policy's own cars only. With mixed opponents the teacher-driven car of a race

@@ -2909,6 +2909,28 @@
           "metavar": "M"
         },
         {
+          "flag": "--opponent-speed-mode",
+          "flags": [
+            "--opponent-speed-mode"
+          ],
+          "dest": "opponent_speed_mode",
+          "label": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "linear",
+            "wp4"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "the plan format of the cars the learner does not drive -- scripted seats and league checkpoints of the opponents' format -- when it is not the learner's (one tracker reads each car's plan in its own format; a league checkpoint always plans in its own). A v2 run (--arch v2, WP4 learner) defaults to linear in a race, the measured choice (wp4-label-gates RESULTS 7); a v1 run refuses it",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
           "flag": "--opp-slots",
           "flags": [
             "--opp-slots"
@@ -4374,6 +4396,219 @@
           "action": "store",
           "nullable": false,
           "metavar": null
+        },
+        {
+          "flag": "--arch",
+          "flags": [
+            "--arch"
+          ],
+          "dest": "arch",
+          "label": "network 구조 (v1 / v2)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "v1",
+          "nargs": null,
+          "choices": [
+            "v1",
+            "v2"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: the redesigned actor-critic (docs/research/architecture-redesign-2026-10-13.md) on observation contract v2 and WP4 plans: one value stream with value normalisation and a 'car contact within 1 s' classifier on a critic that reads privileged_v2, no KL leash (kl_ref logged only), --clip-split, Adam eps 1e-8, --vf-clip 0, actor lr 2e-5 -> 1e-5, critic lr 3e-4, horizon 128, minibatch 4096 in 4 pieces unless set. v1: every run before it",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--v2-frames",
+          "flags": [
+            "--v2-frames"
+          ],
+          "dest": "v2_frames",
+          "label": "v2 LiDAR frame 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--v2-init-stem",
+          "flags": [
+            "--v2-init-stem"
+          ],
+          "dest": "v2_init_stem",
+          "label": "v2 stem 초기화 checkpoint (v1)",
+          "kind": "path",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2 without --init: seed both stems from this v1 resnet checkpoint (model_v2.init_stems_from_v1)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "CKPT",
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--critic-lr",
+          "flags": [
+            "--critic-lr"
+          ],
+          "dest": "critic_lr",
+          "label": "v2 critic learning rate",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: the critic's learning rate, constant (default 3e-4, the redesign's); --lr / --lr-end schedule the actor",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--value-norm-beta",
+          "flags": [
+            "--value-norm-beta"
+          ],
+          "dest": "value_norm_beta",
+          "label": "v2 value 정규화 EMA β",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: per-update EMA weight of the return statistics the critic's targets are normalised by (default 0.99, about the last hundred updates)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "B"
+        },
+        {
+          "flag": "--contact-bce",
+          "flags": [
+            "--contact-bce"
+          ],
+          "dest": "contact_bce",
+          "label": "v2 '1초 안 차 접촉' BCE 가중치",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: weight of the critic's 'charged car contact within 1 s' BCE (default 1.0, G4's)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-b8",
+          "flags": [
+            "--aux-b8"
+          ],
+          "dest": "aux_b8",
+          "label": "aux head · B8 상대차 slot 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the B8 opponent-slot loss on the actor (default 0.5, the redesign's)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-near-car",
+          "flags": [
+            "--aux-near-car"
+          ],
+          "dest": "aux_near_car",
+          "label": "aux head · 최근접 상대차 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; 0 builds no head)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-balance-every",
+          "flags": [
+            "--aux-balance-every"
+          ],
+          "dest": "aux_balance_every",
+          "label": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x the policy gradient (default 10; 0 = off, the coefficients alone)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--aux-balance-rho",
+          "flags": [
+            "--aux-balance-rho"
+          ],
+          "dest": "aux_balance_rho",
+          "label": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: the largest auxiliary / policy-gradient trunk-gradient ratio the balance allows (default 0.5)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "RHO"
+        },
+        {
+          "flag": "--aux-balance-beta",
+          "flags": [
+            "--aux-balance-beta"
+          ],
+          "dest": "aux_balance_beta",
+          "label": "aux gradient 균형 EMA β (측정당, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the last five measurements)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "B"
         }
       ]
     },
@@ -6072,6 +6307,263 @@
           "metavar": null
         },
         {
+          "flag": "--arch",
+          "flags": [
+            "--arch"
+          ],
+          "dest": "arch",
+          "label": "network 구조 (v1 / v2)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "v1",
+          "nargs": null,
+          "choices": [
+            "v1",
+            "v2"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: the redesigned actor (docs/research/architecture-redesign-2026-10-13.md) on observation contract v2 and WP4 plans -- recurrent sequences with burn-in (--seq-burn 40, --chunk-length 80 unless set), imitation in the decoded WP4 space, B8, left-right mirroring. v1: every run before it",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--v2-frames",
+          "flags": [
+            "--v2-frames"
+          ],
+          "dest": "v2_frames",
+          "label": "v2 LiDAR frame 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--v2-init-stem",
+          "flags": [
+            "--v2-init-stem"
+          ],
+          "dest": "v2_init_stem",
+          "label": "v2 stem 초기화 checkpoint (v1)",
+          "kind": "path",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: seed a fresh student's two stems from this v1 resnet checkpoint (model_v2.init_stems_from_v1, as G1 / G4 did)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "CKPT",
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--wp4-label",
+          "flags": [
+            "--wp4-label"
+          ],
+          "dest": "wp4_label",
+          "label": "v2 WP4 teacher label 출처",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "env",
+            "linear-refit"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: where the WP4 labels come from. 'env' (default): the env's teacher-label API, where feat/v2's wp4 teachers plug in. 'linear-refit': the raceline teacher's linear plan, first window refitted to the four waypoints -- a stand-in for tests and smoke runs on a tree whose teachers do not speak wp4",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--mirror-prob",
+          "flags": [
+            "--mirror-prob"
+          ],
+          "dest": "mirror_prob",
+          "label": "v2 좌우 반전 증강 확률",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: probability that a training sequence is mirrored left-right (default 0.5)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "P"
+        },
+        {
+          "flag": "--aux-b8",
+          "flags": [
+            "--aux-b8"
+          ],
+          "dest": "aux_b8",
+          "label": "aux head · B8 상대차 slot 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the B8 opponent-slot loss (default 0.5, the redesign's; 0 builds no head)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-near-car",
+          "flags": [
+            "--aux-near-car"
+          ],
+          "dest": "aux_near_car",
+          "label": "aux head · 최근접 상대차 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; 0 builds no head)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-balance-every",
+          "flags": [
+            "--aux-balance-every"
+          ],
+          "dest": "aux_balance_every",
+          "label": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x the imitation loss (default 10; 0 = off, the coefficients alone)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--aux-balance-rho",
+          "flags": [
+            "--aux-balance-rho"
+          ],
+          "dest": "aux_balance_rho",
+          "label": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: the largest auxiliary / imitation trunk-gradient ratio the balance allows (default 0.5)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "RHO"
+        },
+        {
+          "flag": "--aux-balance-beta",
+          "flags": [
+            "--aux-balance-beta"
+          ],
+          "dest": "aux_balance_beta",
+          "label": "aux gradient 균형 EMA β (측정당, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the last five measurements)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "B"
+        },
+        {
+          "flag": "--v2-ego-actions",
+          "flags": [
+            "--v2-ego-actions"
+          ],
+          "dest": "v2_ego_actions",
+          "label": "v2 ego 에 지난 행동(plan) 열 포함 (off = 속도·yaw rate 이력만, copycat 대책 A)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "on",
+            "off"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: whether the ego vector carries the plans the policy issued (a_{t-2} and the 1 s history's). off: [speed, gyro z] now and the history's [speed, gyro z] only -- the copycat study's arm A (docs/research/copycat-2026-10-14.md). Default: --init's contract, else the contract default (learn.obs.EGO_ACTIONS_DEFAULT)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--action-dropout",
+          "flags": [
+            "--action-dropout"
+          ],
+          "dest": "action_dropout",
+          "label": "v2 행동 이력 dropout 확률 (학습 sequence 마다 지난 행동 열을 0으로, copycat 대책 B)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: per training sequence, with probability P zero every issued-action column of the ego (a_{t-2} and the history's), never at collection or evaluation -- the copycat study's arm B (docs/research/copycat-2026-10-14.md; default 0)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "P"
+        },
+        {
+          "flag": "--updates",
+          "flags": [
+            "--updates"
+          ],
+          "dest": "updates",
+          "label": "v2 반복마다 최적화 업데이트 수 (비우면 epoch 수로; 데이터가 쌓여도 학습량이 같음)",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: optimiser updates per iteration, whatever the iteration's data holds, instead of --epochs' passes over it. The it0 learning curve is in updates (itcurve, 2026-10-14: 41 updates -- 3 epochs of one 30,720-row iteration -- left the held-out error 2.6x above its 3000-update value), and a pass count would grow the training with every aggregated iteration",
+          "action": "store",
+          "nullable": true,
+          "metavar": "N"
+        },
+        {
           "flag": "--race-size",
           "flags": [
             "--race-size"
@@ -6922,6 +7414,28 @@
           "action": "store",
           "nullable": false,
           "metavar": "M"
+        },
+        {
+          "flag": "--opponent-speed-mode",
+          "flags": [
+            "--opponent-speed-mode"
+          ],
+          "dest": "opponent_speed_mode",
+          "label": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "linear",
+            "wp4"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "the plan format of the cars the learner does not drive -- scripted seats and league checkpoints of the opponents' format -- when it is not the learner's (one tracker reads each car's plan in its own format; a league checkpoint always plans in its own). A v2 run (--arch v2, WP4 learner) defaults to linear in a race, the measured choice (wp4-label-gates RESULTS 7); a v1 run refuses it",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
         },
         {
           "flag": "--opp-slots",

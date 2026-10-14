@@ -1,0 +1,24 @@
+/home/shchon11/.local/lib/python3.10/site-packages/torch/cuda/__init__.py:1061: UserWarning: Can't initialize NVML
+  raw_cnt = _raw_device_count_nvml()
+loading 149 tracks + racelines ...
+opponents: race 4 | per-slot (3x mix(forzaeth|forzaeth_pred|lane_switch|interactive)) | spawn gap 2.5-6 m
+  car 1: mix(forzaeth|forzaeth_pred|lane_switch|interactive) · x0.7-1.05 · grip true · brake+stop+shift+weave@0.5/10s · defend 0.3+line 0.2+oblivious 0.1 · spawn random
+  car 2: mix(forzaeth|forzaeth_pred|lane_switch|interactive) · x0.7-1.05 · grip true · brake+stop+shift+weave@0.5/10s · defend 0.3+line 0.2+oblivious 0.1 · spawn random
+  car 3: mix(forzaeth|forzaeth_pred|lane_switch|interactive) · x0.7-1.05 · grip true · brake+stop+shift+weave@0.5/10s · defend 0.3+line 0.2+oblivious 0.1 · spawn random
+teacher: raceline teacher (grip true, speed x1, limits {'a_lat': 7.0, 'a_acc': 6.5, 'a_brake': 4.0})
+v2 stems seeded from iccas_bootcamp_safest.pt: actor 50 / critic 50 tensors
+v2 DAgger: 1 frame(s), ego 210 (issued actions in it), action dropout p 0.5, sequences burn-in 40 + chunk 80, mirror p 0.5, labels 'env', aux {'b8': 0.5, 'near': 0.5, 'beam': 5.0} balanced every 10 updates to <= 0.5 x the imitation's trunk gradient (EMA 0.8) | v2 defaults applied: {'chunk_length': 80, 'seq_burn': 40}
+v2 DAgger race: BC clearance mask 0.3 m | learner cap U(3, 9) m/s per episode, not observed | opponents plan linear
+  losses bc_lat 0.0819 bc_speed 1.1128 b8 1.2670 near 1.8064 beam 0.5851 | B8 knowable 0.64 | trunk grad norms bc 2.37 b8 1.21 near 3.04 beam 0.82 total_clip_input 4.56 | aux scale b8 0.532 near 0.358 beam 0.659 pull/bc b8 0.14 near 0.24 beam 0.23 | measuring 24.5 % of training time
+  held-out heads (the initial weights, on this collection): nearest car |dy| p50 <3 m 0.460 m, dist 0.608 m, presence AUC 0.439 | per-beam precision 0.028 recall 0.477 | B8 |dy| p50 <3 m 0.354 m
+  collection: BC-masked 12.94 % of 29627 valid labels (car 12.23 %, prop 0.79 %) | speed-capped 33.1 % of learner steps
+iter 0: beta 1.00 samples 30720 loss 2.5726 | student 101.8 coll/km prog 2.95 m/s lap nan s | teacher 7.2 coll/km lap nan s | 147+8+70+82 s
+  losses bc_lat 0.0652 bc_speed 0.7538 b8 0.8919 near 1.5343 beam 0.1606 | B8 knowable 0.64 | trunk grad norms bc 4.13 b8 1.09 near 3.17 beam 1.07 total_clip_input 6.27 | aux scale b8 0.862 near 0.571 beam 0.912 pull/bc b8 0.19 near 0.48 beam 0.30 | measuring 14.5 % of training time
+  held-out heads (the weights before iteration 1, on this collection): nearest car |dy| p50 <3 m 0.380 m, dist 0.579 m, presence AUC 0.579 | per-beam precision 0.023 recall 0.007 | B8 |dy| p50 <3 m 0.274 m
+  collection: BC-masked 11.56 % of 28027 valid labels (car 11.24 %, prop 0.65 %) | speed-capped 38.6 % of learner steps
+iter 1: beta 0.60 samples 61440 loss 2.1538 | student not measured (last at 0) | teacher 7.2 coll/km lap nan s | 101+14+0+0 s
+  losses bc_lat 0.0632 bc_speed 0.7089 b8 0.7770 near 0.9918 beam 0.0507 | B8 knowable 0.64 | trunk grad norms bc 4.2 b8 1.6 near 3.61 beam 1.17 total_clip_input 6.8 | aux scale b8 0.917 near 0.624 beam 0.983 pull/bc b8 0.35 near 0.51 beam 0.43 | measuring 13.8 % of training time
+  held-out heads (the weights before iteration 2, on this collection): nearest car |dy| p50 <3 m 0.308 m, dist 0.975 m, presence AUC 0.815 | per-beam precision 0.880 recall 0.308 | B8 |dy| p50 <3 m 0.252 m
+  collection: BC-masked 11.08 % of 27322 valid labels (car 10.08 %, prop 1.02 %) | speed-capped 40.3 % of learner steps
+iter 2: beta 0.30 samples 92160 loss 1.6541 | student 55.5 coll/km prog 3.21 m/s lap nan s | teacher 7.2 coll/km lap nan s | 102+21+75+0 s
+exit 0

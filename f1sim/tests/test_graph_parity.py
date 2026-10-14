@@ -35,6 +35,7 @@ pytest.importorskip(
 torch = pytest.importorskip("torch")
 
 import graph_replay as gr                                   # noqa: E402
+from f1sim.mpc import PlanTracker                           # noqa: E402
 from f1sim.learn.model import ActorCritic, save_checkpoint  # noqa: E402
 from f1sim.learn.obs import ObsSpec                         # noqa: E402
 
@@ -207,3 +208,70 @@ def test_the_controller_is_the_in_process_tracker_the_benchmark_scores(arm, sequ
     d = np.abs(np.asarray(run.tracked_commands()) - np.asarray(ref))
     assert d.max() <= TOL, (f"{arm}: worst steer {d[:, 0].max():.3e} rad, "
                             f"worst speed {d[:, 1].max():.3e} m/s")
+
+
+# ------------------------------------------------------------------ wp4
+@pytest.fixture(scope="module")
+def checkpoint_wp4(tmp_path_factory):
+    """The same network under a 'wp4' plan-output contract. The policy node publishes the eight
+    numbers it always did; only the contract says to read them as four waypoints x (curvature,
+    speed), and the controller has to take that from the checkpoint, not from the message width."""
+    meta = dict(n_stack=SPEC.scan_stack, n_beams=SPEC.n_beams, proprio_dim=SPEC.proprio_dim,
+                priv_dim=9, act_dim=SPEC.act_dim, scan_deltas=True, temporal_encoder="cnn")
+    with torch.random.fork_rng():
+        torch.manual_seed(20260915)
+        model = ActorCritic(**meta)
+    path = str(tmp_path_factory.mktemp("graph_wp4") / "plan_wp4.pt")
+    save_checkpoint(path, model, {"spec": SPEC.__dict__.copy(), "phase": "ppo", "speed_mode": "wp4"})
+    return path
+
+
+def _sim_tracker(speed_mode):
+    """The tracker the SIMULATOR drives a plan with: built by `F1VecEnv` itself from its EnvConfig,
+    on a bare floor -- the path every training rollout and evaluation takes."""
+    from test_profile_executor import _open_floor
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common
+    from f1sim.params import Config
+    cfg = Config(); cfg.sim.compile = False; cfg.rand.enabled = False
+    env = common.make_env([_open_floor()], 1, "cpu", EnvConfig(action_mode="plan", speed_mode=speed_mode,
+                                                               compile_tracker=False, v_max_policy=SPEC.v_max),
+                          cfg=cfg, seed=1)
+    env.tracker.reset(torch.zeros(1, dtype=torch.long))
+    return env.tracker
+
+
+@pytest.mark.parametrize("seq_name", sorted(SEQUENCES))
+def test_a_wp4_plan_commands_the_same_on_the_car_as_in_the_simulator(seq_name, sequences, checkpoint_wp4,
+                                                                      tmp_path):
+    """Output-format design 7, test 1: the graph's `/drive` for a wp4 checkpoint is bit-identical to
+    the simulator's own tracker fed the same plans and the same measurements -- and is not what the
+    same numbers command when read as a linear plan, so the format is really the one in force.
+
+    The legacy arm only: the grip and clearance arms read a plan as two linear speeds and the
+    controller refuses them for any other contract until they are ported (design 6)."""
+    from f1sim.mpc import contract_of, contract_spec
+    seq = sequences[seq_name]
+    p = params(checkpoint_wp4, arm="legacy")
+    run = gr.run_graph(seq, FRAMES, p, tmp_path)
+    sim = _sim_tracker("wp4")
+    # what the node builds from the checkpoint (`ControllerNode._observation_spec` -> `contract_spec`)
+    car = contract_spec(contract_of(torch.load(checkpoint_wp4, map_location="cpu", weights_only=False)["extra"]))
+    assert car.speed_mode == "wp4" and sim.spec == car
+    linear = PlanTracker(1, "cpu", p["wheelbase"], p["steer_max"], SPEC.v_max, compile_solver=False)
+    frames_with_plans = [f for f, keep_ in zip(seq.frames(FRAMES), _plan_frames(seq, run)) if keep_]
+    delay = torch.tensor([p["cmd_delay"]])
+    ref, lin = [], []
+    for f, plan in zip(frames_with_plans, run.plans):
+        args = (torch.tensor([plan]), torch.tensor([float(f.odom_v[-1])]), torch.tensor([p["speed_cap"]]),
+                torch.tensor([float(np.asarray(f.imu)[:, 2].mean())]))
+        for tr, out in ((sim, ref), (linear, lin)):
+            cmd = tr(*args, delay=delay)[0]
+            out.append((max(-p["steer_max"], min(p["steer_max"], float(cmd[0]))), float(cmd[1])))
+    assert len(run.plans) >= FRAMES - 2, f"only {len(run.plans)} plans over {FRAMES} frames"
+    got = np.asarray(run.tracked_commands())
+    d = np.abs(got - np.asarray(ref))
+    assert d.max() == 0.0, (f"wp4 on {seq_name}: worst steer {d[:, 0].max():.3e} rad, "
+                            f"worst speed {d[:, 1].max():.3e} m/s")
+    assert np.abs(got - np.asarray(lin)).max() > 1e-2, "the controller drove these plans as linear ones"
+

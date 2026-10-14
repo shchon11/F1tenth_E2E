@@ -545,13 +545,15 @@ def adjust(action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
     # already keeps the margin leaves through a bit-identical action rather than through a
     # round trip that happens to land close.
     bent = dk_b != 0.0
-    k_norm = (a[:, :_mpc.N_KNOTS] + (dk_b[:, None] / spec.kappa_max) * taper).clamp(-1.0, 1.0)
+    lay = _mpc.plan_layout(spec)                      # "linear": `decode` above refuses anything else
+    i_v0, i_v1 = lay.speed.start, lay.speed.start + 1
+    k_norm = (a[:, lay.path] + (dk_b[:, None] / spec.kappa_max) * taper).clamp(-1.0, 1.0)
     enc = lambda v: (v / v_max * 2.0 - 1.0).clamp(-1.0, 1.0)
     a_new = torch.cat([
-        torch.where(bent[:, None], k_norm, action[:, :_mpc.N_KNOTS]),
-        torch.where(v0_new < v0, enc(v0_new), action[:, _mpc.N_KNOTS])[:, None],
-        torch.where(v1_new < v1, enc(v1_new), action[:, _mpc.N_KNOTS + 1])[:, None],
-        action[:, _mpc.N_KNOTS + 2:],
+        torch.where(bent[:, None], k_norm, action[:, lay.path]),
+        torch.where(v0_new < v0, enc(v0_new), action[:, i_v0])[:, None],
+        torch.where(v1_new < v1, enc(v1_new), action[:, i_v1])[:, None],
+        action[:, lay.speed.stop:],
     ], 1)
 
     # The largest *index* inside the window, not the count: the window is an interval that

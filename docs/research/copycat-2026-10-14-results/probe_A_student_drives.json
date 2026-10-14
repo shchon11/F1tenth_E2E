@@ -1,0 +1,83 @@
+{
+ "/home/shchon11/f1sim_runs/v2cc_A/student_it0.pt": {
+  "recorded": {
+   "bias_v": 1.2136650532484055,
+   "mae_v": 1.5135552287101746,
+   "mae_lat": 0.23415067791938782,
+   "v_student": 4.7293471693992615,
+   "v_label": 3.51568204164505
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 1.2262256890535355,
+   "mae_v": 1.5206520557403564,
+   "mae_lat": 0.23427567817270756,
+   "v_student": 4.741907775402069,
+   "v_label": 3.51568204164505
+  },
+  "gains": {
+   "meas_speed_hist": 0.025121212005615234
+  },
+  "contract": {
+   "ego_dim": 42,
+   "ego_actions": false,
+   "n_action_cols": 0,
+   "n_act_speed_cols": 0,
+   "n_meas_hist_cols": 20,
+   "iter": 0
+  }
+ },
+ "/home/shchon11/f1sim_runs/v2cc_A/student_it1.pt": {
+  "recorded": {
+   "bias_v": 1.399994820356369,
+   "mae_v": 1.594239979982376,
+   "mae_lat": 0.23659716360270977,
+   "v_student": 4.915677011013031,
+   "v_label": 3.51568204164505
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 1.435173973441124,
+   "mae_v": 1.616667091846466,
+   "mae_lat": 0.23685991950333118,
+   "v_student": 4.950856029987335,
+   "v_label": 3.51568204164505
+  },
+  "gains": {
+   "meas_speed_hist": 0.0703580379486084
+  },
+  "contract": {
+   "ego_dim": 42,
+   "ego_actions": false,
+   "n_action_cols": 0,
+   "n_act_speed_cols": 0,
+   "n_meas_hist_cols": 20,
+   "iter": 1
+  }
+ },
+ "/home/shchon11/f1sim_runs/v2cc_A/student_it2.pt": {
+  "recorded": {
+   "bias_v": 0.9515803828835487,
+   "mae_v": 1.2955339550971985,
+   "mae_lat": 0.2310862671583891,
+   "v_student": 4.46726256608963,
+   "v_label": 3.51568204164505
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 0.9903352484107018,
+   "mae_v": 1.3121558725833893,
+   "mae_lat": 0.23144011944532394,
+   "v_student": 4.506017327308655,
+   "v_label": 3.51568204164505
+  },
+  "gains": {
+   "meas_speed_hist": 0.07750952243804932
+  },
+  "contract": {
+   "ego_dim": 42,
+   "ego_actions": false,
+   "n_action_cols": 0,
+   "n_act_speed_cols": 0,
+   "n_meas_hist_cols": 20,
+   "iter": 2
+  }
+ }
+}

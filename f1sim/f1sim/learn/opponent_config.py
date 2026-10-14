@@ -177,6 +177,12 @@ def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="[m] shortest run of such points that counts as one corner")
     ap.add_argument("--opp-corner-smooth", type=float, default=0.6, metavar="M",
                     help="[m] window the curvature is averaged over first")
+    ap.add_argument("--opponent-speed-mode", default=None, choices=["linear", "wp4"],
+                    help="the plan format of the cars the learner does not drive -- scripted seats and league "
+                         "checkpoints of the opponents' format -- when it is not the learner's (one tracker "
+                         "reads each car's plan in its own format; a league checkpoint always plans in its own). "
+                         "A v2 run (--arch v2, WP4 learner) defaults to linear in a race, the measured choice "
+                         "(wp4-label-gates RESULTS 7); a v1 run refuses it")
     ap.add_argument("--opp-slots", default="", metavar="JSON|@FILE",
                     help="per-opponent configuration: a JSON array with one object per car of a "
                          "race (race_size - 1 of them), or @path/to/slots.json. Each object may "
@@ -314,6 +320,7 @@ def env_kwargs(a) -> dict:
     """The EnvConfig fields these flags set. One dict, so no caller can set a subset by accident."""
     return dict(race_size=a.race_size, opponent=a.opponent,
                 opponent_slots=getattr(a, "opp_slots", None) or None,
+                opponent_speed_mode=getattr(a, "opponent_speed_mode", None),
                 mixed_teacher_frac=a.mixed_teacher_frac,
                 opp_speed_range=tuple(a.opp_speed),
                 opp_pool=tuple(a.opp_pool),

@@ -612,7 +612,7 @@ class GripMPC:
                  self.last_diagnostics["wheel_feedback_fault"] | self.last_diagnostics["mu_input_fault"])
         self.last_diagnostics["input_fault"].copy_(fault)
         stop = torch.zeros_like(action)
-        stop[:, _mpc.N_KNOTS:] = -1
+        stop[:, _mpc.plan_layout(self.tracker.spec).speed] = -1
         safe_action = torch.where(fault[:, None], stop, action)
         safe_cap = torch.where(fault, torch.zeros_like(speed_cap), speed_cap)
         return safe_action, speed, safe_cap, yaw, latency
@@ -712,6 +712,10 @@ class GripMPC:
             raise RuntimeError("the legacy arm installs nothing; do not call install()")
         if self._installed:
             raise RuntimeError("already installed")
+        if getattr(self.tracker, "row_format", None) is not None:
+            # this arm decodes every row as a linear plan (`solve_grip`); a wp4 row would be misread
+            raise RuntimeError("a tracker with per-row plan formats runs the legacy arm until the arms are "
+                               "ported (output-format design 6, unit 8)")
         if graph:
             if example_args is None:
                 raise ValueError("graph=True needs example_args recorded from a real step")
