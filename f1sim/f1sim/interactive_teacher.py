@@ -356,7 +356,7 @@ class InteractiveTeacher(RowPlanning):
         # offset-major so that a choice index reads as (offset, speed) without a stride argument
         out = out.permute(1, 0, 2, 3).reshape(n_off * n_spd, B, a.shape[2])
         brake = out[self.base_index:self.base_index + 1].clone()
-        brake[..., sp] = self._stop_speeds(state, v_max, spec, plan_speed)
+        brake[..., sp] = -1.0                                # stop: a zero speed target, in both formats
         evade = self._evasion_candidates(out[self.base_index], state, P, v_max, spec, plan_speed)
         # Preserve every regular index and the automatic raceline-brake index.
         out = torch.cat([out, brake, evade], 0)
@@ -405,27 +405,39 @@ class InteractiveTeacher(RowPlanning):
         fade = (1 - torch.arange(lay.n_path, device=state.device, dtype=state.dtype) / 2).clamp_min(0)
         out[..., lay.path] = base[None, :, lay.path] * (1 - fade) + signs[:, None, None] * limit[None, :, None] * fade
         coast = (2 * speed / v_max - 1).clamp(-1, 1)
-        if lay.speed_mode == "wp4":
-            stop = self._stop_speeds(state, v_max, spec, plan_speed)                    # (B, WP_K)
+        if self.wp4_evasion_brake not in self.WP4_EVASION_BRAKES:
+            raise ValueError(f"wp4_evasion_brake must be one of {self.WP4_EVASION_BRAKES}, got {self.wp4_evasion_brake!r}")
+        if lay.speed_mode == "wp4" and self.wp4_evasion_brake == "curve":
+            from .mpc import wp4_braking
+            stop = (wp4_braking(plan_geometry_speed(state, plan_speed), spec) / v_max * 2 - 1).clamp(-1, 1)
             out[..., lay.speed] = torch.stack((coast[:, None].expand_as(stop), stop,
                                                coast[:, None].expand_as(stop), stop))
             return out
+        # every speed column of a candidate at one target: the speed it has, or zero
         targets = torch.stack((coast, -torch.ones_like(coast), coast, -torch.ones_like(coast)))
         out[..., lay.speed] = targets[..., None]
         return out
 
-    @staticmethod
-    def _stop_speeds(state, v_max, spec, plan_speed=None):
-        """The speed columns of "stop", normalized: -1 for the linear plan (v0 = v1 = 0, which its
-        tracker brakes through at a_brake), and for a wp4 plan the braking curve at the tracker's
-        a_brake from the speed the plan is laid out with (`mpc.wp4_braking`) -- -1 there would ask
-        to be standing 0.15 s from now, a label of four saturated numbers."""
-        lay = plan_layout(spec)
-        if lay.speed_mode != "wp4":
-            return -1.0
-        from .mpc import wp4_braking
-        v = wp4_braking(plan_geometry_speed(state, plan_speed), spec)
-        return (v / v_max * 2 - 1).clamp(-1, 1)
+    #: "Stop" in a plan's speed columns is -1 -- a zero speed target -- in both formats: the on-line
+    #: brake candidate always, and the two braking evasions under "stop". "curve" gives a wp4 plan's
+    #: braking evasions the tracker's a_brake curve from the plan speed instead (`mpc.wp4_braking`).
+    #:
+    #: Output-format design 5 drew every wp4 stop as that curve, so that it would not be four saturated
+    #: numbers. Measured (docs/research/wp4-label-gates-2026-10-14/, RESULTS 4 and 7), the tracker's
+    #: lazy speed weight (q_v 0.4) follows a feasible curve lazily: from the same 4842 ICCAS states the
+    #: curve executed -2.9 m/s^2 at once against -5.0 for -1, softer than the guard's own x0.3
+    #: candidate (-4.4), and the guard's wp4 ego touched lane_switch cars 1.38 times per km with it
+    #: against 0.76 with -1. The -1 is not an unphysical label either: the decoder's backward pass and
+    #: the tracker's a_brake clamp keep what is executed within the car's braking.
+    #:
+    #: "stop" for the evasions too, by the rule set before the measurement (keep the curve only if it
+    #: is no worse): the guard's wp4 ego against linear lane_switch / forzaeth_pred / interactive cars
+    #: (ICCAS, 2 seeds, 93 km each) touched cars and walls after 2 s 0.87 times per km with -1 and 1.17
+    #: with the curve (cars 0.64 against 0.97), at the same pace; a braking evasion was the label in
+    #: 0.25-0.8 % of steps. With -1 the same guard on icra2022 alone touched the walls 2.48 times per km
+    #: against 3.31 with the curve stop of UNIT 2, both at 3.92 m/s.
+    WP4_EVASION_BRAKES = ("stop", "curve")
+    wp4_evasion_brake: str = "stop"
 
     def horizon_times(self, spec: PlanSpec) -> torch.Tensor:
         """The instants the trajectory and the opponents' futures are both sampled at [s]."""

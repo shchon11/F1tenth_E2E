@@ -4,8 +4,9 @@
 speeds read off its grip profile at the waypoints -- and everything built on it (the env's guard,
 the interactive teacher, the opponent planners, the rollout teacher, the layout-line teacher) drives
 a wp4 race. The guard's candidates are previewed on the wp4 tracker (`mpc.solve`'s wp4 branch, or
-`wp4_reference` on the reference fallback), its "stop" is the tracker's braking curve rather than
-four saturated numbers, and a linear label does not move by a bit.
+`wp4_reference` on the reference fallback), its "stop" is a zero speed target in both formats (the
+a_brake curve design 5 drew executed softer than the guard's own x0.3 candidate: RESULTS 4 and 7 of
+docs/research/wp4-label-gates-2026-10-14/), and a linear label does not move by a bit.
 
 The label-quality gates of design section 7 are closed-loop measurements, not unit tests:
 `f1sim/scripts/wp4_label_replay.py` and `f1sim/scripts/wp4_label_gates.py`
@@ -205,8 +206,13 @@ def _drive(env, teacher, steps):
         env.step(env.teacher_label(teacher))
 
 
-def test_stop_is_the_trackers_braking_curve_and_linear_keeps_its_minus_one():
+@pytest.mark.parametrize("evasion", ["stop", "curve"])
+def test_stop_is_a_zero_speed_target_in_both_formats(evasion, monkeypatch):
+    """The on-line brake is -1 on every speed column in both formats; the two braking evasions are
+    too, unless `wp4_evasion_brake` is "curve" -- then a wp4 plan's follow the tracker's a_brake curve
+    from the plan speed (`mpc.wp4_braking`). Linear never moves."""
     from f1sim.interactive_teacher import InteractiveTeacher
+    monkeypatch.setattr(InteractiveTeacher, "wp4_evasion_brake", evasion)
     for mode in ("wp4", "linear"):
         env, t = _env(mode)
         _drive(env, t, 30)
@@ -217,18 +223,19 @@ def test_stop_is_the_trackers_braking_curve_and_linear_keeps_its_minus_one():
                               plan_speed=v)
         n_reg = it.offsets.numel() * it.speeds.numel()
         sp = mpc.plan_layout(env.tracker.spec).speed
-        stops = cand[[n_reg, n_reg + 2, n_reg + 4]][..., sp]          # the brake, and both braking evasions
+        assert (cand[n_reg][..., sp] == -1).all(), mode                   # the brake
+        brakes = cand[[n_reg + 2, n_reg + 4]][..., sp]                     # both braking evasions
         coasts = cand[[n_reg + 1, n_reg + 3]][..., sp]
-        if mode == "linear":
-            assert (stops == -1).all()
+        assert ((coasts + 1) / 2 * env.ecfg.v_max_policy - v.abs()[None, :, None]).abs().max() < 1e-4
+        if mode == "linear" or evasion == "stop":
+            assert (brakes == -1).all(), (mode, evasion)
             continue
         L = mpc.plan_length(v, env.tracker.spec)
         s = L[:, None] * torch.arange(1, 5) / 4
         want = (v.abs()[:, None] ** 2 - 2 * env.tracker.spec.a_brake * s).clamp_min(0).sqrt()
-        got = (stops + 1) / 2 * env.ecfg.v_max_policy
+        got = (brakes + 1) / 2 * env.ecfg.v_max_policy
         assert (got - want[None]).abs().max() < 1e-4
         assert (v.abs() > 1.0).all() and (got[0, :, 0] > 0).all()   # not "stand still 0.15 s from now"
-        assert ((coasts + 1) / 2 * env.ecfg.v_max_policy - v.abs()[None, :, None]).abs().max() < 1e-4
 
 
 def test_the_guard_previews_wp4_plans_on_the_wp4_tracker_and_its_fallback():

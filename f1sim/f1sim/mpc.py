@@ -828,21 +828,23 @@ def wp4_refit(k_src: torch.Tensor, Lp_src: torch.Tensor, v_meas: torch.Tensor, s
 
 def wp4_braking(v_meas: torch.Tensor, spec: PlanSpec) -> torch.Tensor:
     """(B, WP_K) [m/s] the waypoint speeds of braking from the measured speed at the tracker's own
-    a_brake, v_k = sqrt(max(v^2 - 2 a_brake s_k, 0)): what "stop" is as a wp4 plan.
+    a_brake, v_k = sqrt(max(v^2 - 2 a_brake s_k, 0)): braking drawn as a profile the car can follow.
 
-    Not every speed at -1 (output-format design 5). That asks to be standing at s_1, 0.15 s from
-    now -- 40 m/s^2 from 6 m/s -- which no decode turns into a profile the car can follow: v(0) is the
-    measured speed and the backward pass runs from v_4 back to v_1 only. As a label it is four numbers
-    pinned to the corner of the box, where exploration noise is clipped one way.
+    Output-format design 5 made this wp4's "stop": every speed at -1 asks to be standing at s_1,
+    0.15 s from now -- 40 m/s^2 from 6 m/s -- four numbers pinned to the corner of the box. Measured,
+    it is the softer stop. The tracker follows the curve with its usual speed lag (q_v 0.4, design 8):
+    from 4.9 m/s (255 states visited on ICCAS) it plans -2.9 m/s^2 at once and ends its window at
+    2.8 m/s, where four -1s -- a zero speed target pulling on every step, like the linear plan's
+    v0 = v1 = 0 -- plan -4.9 and end at 2.1; softer than the guard's own x0.3 candidate (-4.4), against
+    linear's stop at -5.0. The guard's ego touched lane_switch cars 1.38 times per km with it and 0.76
+    with four -1s (ICCAS, 2 seeds, the opponents planning wp4 as well).
 
-    It is not free. The tracker follows this curve with its usual speed lag (q_v 0.4, design 8): from
-    4.9 m/s (255 states visited on ICCAS) it plans -2.9 m/s^2 at once and ends its window at 2.8 m/s,
-    where four -1s -- a zero speed target pulling on every step, like the linear plan's v0 = v1 = 0
-    -- plan -4.9 and end at 2.1 (v_cmd 0.12 m/s lower). The stop that is drawn is the softer one:
-    softer than the guard's own x0.3 candidate (-4.4), against linear's stop at -5.0. In traffic it
-    shows -- the guard's ego against lane_switch cars (ICCAS, 2 seeds) touched them 1.38 times per km
-    with this stop, 0.76 with four -1s, 0.33 in linear (docs/research/wp4-label-gates-2026-10-14/,
-    gate 3). Kept as design 5 prescribes it until that trade is decided."""
+    So since 2026-10-14 "stop" is four -1s in wp4 as in linear (`InteractiveTeacher`; the decision and
+    its measurements are RESULTS 7 of docs/research/wp4-label-gates-2026-10-14/): the decoder's backward
+    pass and the tracker's a_brake clamp keep what is executed within the car's braking, so the -1 is
+    no unphysical label. The two braking evasions were to keep this curve if it measured no worse; it
+    measured worse (cars and walls 1.17 against 0.87 per km against linear traffic), so they are -1
+    too. The curve is what `InteractiveTeacher.wp4_evasion_brake = "curve"` still selects."""
     L = plan_length(v_meas, spec)
     s = L[:, None] * torch.arange(1, WP_K + 1, device=v_meas.device, dtype=v_meas.dtype) / WP_K
     return (v_meas.abs()[:, None].square() - 2.0 * spec.a_brake * s).clamp_min(0.0).sqrt()
