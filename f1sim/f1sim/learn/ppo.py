@@ -913,9 +913,11 @@ def main():
     ap.add_argument("--aux-b8", type=float, default=None, metavar="COEF",
                     help="v2: weight of the B8 opponent-slot loss on the actor (default 0.5, the redesign's)")
     ap.add_argument("--aux-near-car", type=float, default=None, metavar="COEF",
-                    help="v2: weight of the nearest-visible-car head (default 0: not built)")
+                    help="v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; "
+                         "0 builds no head)")
     ap.add_argument("--aux-beam-car", type=float, default=None, metavar="COEF",
-                    help="v2: weight of the per-beam car / not-car head (default 0: not built)")
+                    help="v2: weight of the per-beam car / not-car head (default 5, the perception gate's, "
+                         "before the adaptive balance; 0 builds no head)")
     ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
                     help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
                          "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
@@ -925,6 +927,10 @@ def main():
     ap.add_argument("--aux-balance-beta", type=float, default=None, metavar="B",
                     help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
                          "last five measurements)")
+    ap.add_argument("--learner-cap-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="v2: each episode the learner's speed cap is drawn uniformly in [LO, HI] m/s (under the "
+                         "--cap0/--cap1 curriculum) and not observed by the actor -- the critic reads it -- so its "
+                         "speed history stays in distribution at the car's 4 m/s cap (default 3 9; 0 0 = off)")
     a = ap.parse_args()
     v2_applied = None
     if a.arch == "v2":
@@ -933,7 +939,8 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "critic_lr", "value_norm_beta", "contact_bce", "aux_b8",
                               "aux_near_car", "aux_beam_car", "aux_balance_every", "aux_balance_rho",
-                              "aux_balance_beta") if getattr(a, k) is not None]
+                              "aux_balance_beta", "learner_cap_range", "opponent_speed_mode")
+                  if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
     adaptive = a.adaptation != "off"
@@ -1245,7 +1252,8 @@ def main():
     controller.begin(obs)
     if v2_applied is not None:
         return ppo_v2.train(a, env=env, obs=obs, device=device, names=names, init_ck=init_ck,
-                            controller=controller, graph_rt=graph_rt, applied=v2_applied)
+                            controller=controller, graph_rt=graph_rt, applied=v2_applied,
+                            league_seats=league_seats)
     priv = env.privileged(env.last_result); env_priv_dim = priv.shape[1]
     # A dial run's critic is told the dial: the return of an episode depends on how much grip the car
     # was allowed, and a critic that sees the floor but not the dial has to explain that as noise.

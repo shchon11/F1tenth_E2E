@@ -191,16 +191,25 @@ def test_an_opponent_format_needs_a_plan_tracker_that_can_mix_it():
             common.make_env([tr], 4, "cpu", EnvConfig(race_size=2, opponent="policy", **kw), cfg=cfg, seed=0)
 
 
-def test_a_league_checkpoint_is_held_to_the_format_its_rows_are_read_in():
+def test_a_league_checkpoint_plans_in_its_own_format_and_the_rest_of_its_contract_is_the_envs():
+    """Per entry (UNIT 5b): a league checkpoint's rows are read in the format it was trained in, if
+    the tracker can read that format beside the others (`mpc.ROW_FORMATS`); the speed command and the
+    tracker's settings, which one tracker cannot vary by row, are still the env's. Its rows are
+    then planned in it (`tests/test_league_v2.py` drives such races)."""
     from f1sim.learn.opponent_pool import _check_contract
     env = types.SimpleNamespace(ecfg=EnvConfig(action_mode="plan", speed_mode="wp4", opponent_speed_mode="linear"))
-    _check_contract("league.pt", {"speed_mode": "linear"}, env)                 # the league as it is
-    with pytest.raises(ValueError, match="plan-output"):
-        _check_contract("ego.pt", {"speed_mode": "wp4"}, env)
+    assert _check_contract("league.pt", {"speed_mode": "linear"}, env) == "linear"    # the league as it is
+    assert _check_contract("ego.pt", {"speed_mode": "wp4"}, env) == "wp4"             # the learner's snapshot
     one = types.SimpleNamespace(ecfg=EnvConfig(action_mode="plan", speed_mode="wp4"))
-    _check_contract("ego.pt", {"speed_mode": "wp4"}, one)
-    with pytest.raises(ValueError, match="plan-output"):
-        _check_contract("league.pt", {"speed_mode": "linear"}, one)
+    assert _check_contract("ego.pt", {"speed_mode": "wp4"}, one) == "wp4"
+    assert _check_contract("league.pt", {"speed_mode": "linear"}, one) == "linear"
+    with pytest.raises(ValueError, match="plan-output"):                             # no per-row reading of it
+        _check_contract("env.pt", {"speed_mode": "envelope"}, env)
+    with pytest.raises(ValueError, match="plan-output"):                             # one speed command for all
+        _check_contract("prof.pt", {"speed_mode": "wp4", "speed_command": "profile"}, env)
+    lin = types.SimpleNamespace(ecfg=EnvConfig(action_mode="plan", speed_mode="envelope"))
+    with pytest.raises(ValueError, match="plan-output"):                             # a learner no row can mix with
+        _check_contract("league.pt", {"speed_mode": "linear"}, lin)
 
 
 # ----------------------------------------------------------------------------------------- the GPU

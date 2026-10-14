@@ -46,6 +46,12 @@ leaves every other weight drawn exactly as without it.
 
 The loss weights are the gates' (w_pos 10, w_vl 0.1, B8 coefficient 0.5); they are defaults here and
 the training unit owns the coefficients.
+
+The perception gate's decision (2026-10-14): every v2 run trains all three, on one frame, at the gate's
+coefficients -- B8 0.5, nearest car 0.5, per-beam 5 -- before the adaptive balance (numbers at
+`dagger_v2.PERCEPTION_AUX_DEFAULTS`: the nearest visible car's |dy| p50 within 3 m 0.422 -> 0.256 m,
+contact AUC 0.804 -> 0.889). Checked against the gate's training code (scratchpad/arch/gates/percep/
+train.py): these heads, losses and normalisations are its own, layer for layer and term for term.
 """
 from __future__ import annotations
 

@@ -62,6 +62,14 @@ def _oracle_token(spec: dict, model) -> str:
     return _m(getattr(model, "meta", None) if model is not None else None) or _m(spec) or "off"
 
 
+def _opponent_format(asked: str | None, spec: dict, mode: str, race_size: int, opponent: str) -> str | None:
+    """`EnvConfig.opponent_speed_mode` for `evaluate`'s "auto" (see its docstring) or what was asked."""
+    if asked != "auto":
+        return asked
+    v2 = int((spec or {}).get("version", 1)) == 2
+    return "linear" if (v2 and mode == "plan" and race_size > 1 and opponent != "policy") else None
+
+
 @torch.no_grad()
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
@@ -79,7 +87,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              opp_future_model: str = EnvConfig.opp_future_model, opp_extra: dict | None = None,
              opp_token_ablate: bool = False,
              external: dict | None = None, research_estimator: bool = False,
-             research_profile: str | None = None, graph_runtime: bool = False) -> dict:
+             research_profile: str | None = None, graph_runtime: bool = False,
+             opponent_speed_mode: str | None = "auto") -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -124,6 +133,12 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     for a tracker to follow -- and it is the same driver object `f1sim_ros.baseline_node` and the
     benchmark's `external` roster kind use, so "the same evaluation" means the same code and not a
     second implementation of it. `controller` must be `legacy` (i.e. nothing installed) with it.
+
+    opponent_speed_mode: the plan format of the cars the policy does not drive (`EnvConfig.
+    opponent_speed_mode`). "auto": a contract-v2 checkpoint (WP4) races scripted and teacher cars that
+    plan LINEAR -- the format its boot camp trains against and the measured choice of the wp4 label
+    gates (RESULTS 7) -- and every other run is what it was (every car in the policy's format). A
+    league checkpoint among the opponents plans in its own format whatever this says.
     """
     if protocol not in ("rolling", "trials") or steps < 1 or envs < 1 or race_size < 1 or envs % race_size:
         raise ValueError("Require a valid protocol, positive steps/envs, and envs divisible by race_size")
@@ -276,6 +291,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      opp_token=_oracle_token(spec, model),
                      opp_token_ablate=bool(opp_token_ablate),
                      opponent_slots=slots,
+                     opponent_speed_mode=_opponent_format(opponent_speed_mode, spec, mode, race_size, opponent),
                      **(opp_extra or {}))
     if ecfg.opp_token != "off" and not (race_size > 1 and mode == "plan"):
         raise ValueError(f"this checkpoint was trained with privileged opponent tokens "
@@ -422,6 +438,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
         'raceline_objective': raceline_objective or 'min_curvature', 'teacher_limits': limits,
         'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset),
+        # the format the other cars planned in (None: the policy's own); league seats plan in their own
+        'opponent_speed_mode': env.ecfg.opponent_speed_mode,
         # What the run actually drove under, not what was asked for. The cap is part of the
         # observation (`obs["speed_cap"]`), so a policy trained at 9 and scored at this flag's
         # default of 8 is a policy scored on an input it never saw -- which is what happened to
@@ -504,6 +522,10 @@ def main() -> None:
     ap.add_argument("--protocol", choices=["rolling", "trials"], default="rolling")
     ap.add_argument("--race-size", type=int, default=1)
     ap.add_argument("--opponent", choices=["policy", "teacher"], default="policy")
+    ap.add_argument("--opponent-speed-mode", default="auto", choices=["auto", "linear", "wp4"],
+                    help="plan format of the cars the policy does not drive. auto: LINEAR scripted / teacher "
+                         "cars for a v2 (WP4) checkpoint, as its boot camp trains (wp4-label-gates RESULTS 7), "
+                         "the policy's own format otherwise; league checkpoints always plan in their own")
     ap.add_argument("--opp-slots", default="", metavar="JSON|@FILE",
                     help="per-opponent configuration, the same JSON `--opp-slots` takes in "
                          "training: a JSON array with one object per car of a race "
@@ -702,7 +724,8 @@ def main() -> None:
                         contention_range_m=a.contention_range, attack_range_m=a.attack_range,
                         controller=a.controller, estimator=a.estimator, external=external,
                         research_estimator=a.research_estimator, research_profile=a.research_profile,
-                        graph_runtime=a.graphs, opp_extra=env_extra or None)
+                        graph_runtime=a.graphs, opp_extra=env_extra or None,
+                        opponent_speed_mode=a.opponent_speed_mode)
 
     nominal = Config()
     if a.eager:

@@ -323,5 +323,7 @@ S4·S5·S6은 같은 두 스크립트의 옵션(`--ego raw`, `--linear-horizon 0
 
 1. **interactive 상대와의 초과 접촉**(0.24 대 0.06~0.12/km, 8건). 어느 후보, 어느 상황에서 나는지 아직 모릅니다.
 2. **학습 진입점이 `opponent_speed_mode`를 아직 노출하지 않습니다**(이주 4단계). 기본값 None에서 wp4 레이스의 상대는 wp4로 계획하고, linear 리그를 붙이면 계약 검사가 거부합니다.
+   - UNIT 5b에서 해결: dagger·ppo·evaluate에 `--opponent-speed-mode`를 넣었습니다. v2 run은 레이스에서 linear가 기본입니다(7.4의 측정). 리그 좌석은 자기 관측 계약과 자기 형식으로 몹니다.
 3. 리그 엔트리마다 다른 형식(지금은 상대 행이 모두 한 형식), arm 포팅(이주 8단계), Plan.msg format(7단계).
+   - 엔트리별 형식은 UNIT 5b에서 넣었습니다(`F1VecEnv._set_entry_formats`). arm 포팅과 Plan.msg format은 남아 있습니다.
 4. forzaeth_pred 교통의 벽 접촉(wp4 0.47 대 0.6 s linear 0.16/km).

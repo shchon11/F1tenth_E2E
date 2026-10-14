@@ -126,6 +126,34 @@ def test_a_v2_session_takes_the_legacy_controller_only(v2_run):
         w._release_session(s)
 
 
+@pytest.mark.slow
+def test_a_v2_session_races_a_v1_league_seat_in_its_own_contract_and_format(v2_run):
+    """The console's race against the boot camp's league (UNIT 5b): a v2 session with a v1 checkpoint in
+    its opponent table builds (it used to be refused by name), the scripted / league cars plan linear
+    while the learner plans wp4, the league seat is shown its own v1 observation, and every car drives."""
+    v1 = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                      "checkpoints", "iccas_bootcamp_safest.pt")
+    if not os.path.exists(v1):
+        pytest.skip("archived v1 checkpoint not present")
+    logs = []
+    w = _worker(logs)
+    slots = [{"kind_mix": ["forzaeth", "lane_switch"], "ckpt_mix": [v1], "ckpt_p": 1.0, "speed_scale": [0.8, 0.9]}]
+    s = w.build_session(_cfg(v2_run, cars_per_race=2, opponent_slots=slots), 0)
+    try:
+        env = s["env"]
+        assert env.obs_version == 2 and env.ecfg.opponent_speed_mode == "linear"
+        ent = env.pool.entries[0]
+        assert ent.seat_key is not None and ent.speed_mode == "linear" and ent.seat_spec.scan_stack == 6
+        x0 = env.sim.state[:, :2].clone()
+        for _ in range(40):
+            w._step_once(s)
+        assert env.tracker.row_format.tolist() == [1, 0]                 # the learner wp4, the league seat linear
+        assert float((env.sim.state[1, :2] - x0[1]).norm()) > 0.5, "the league car should drive"
+        assert w._snapshot(s)["plan"] is not None
+    finally:
+        w._release_session(s)
+
+
 def test_the_contract_check_names_a_switch_between_v1_and_v2():
     """`obs_spec_problems`, which both the start and the hot reload run: a v2 checkpoint in a v2
     session is accepted field by field; across contracts it is one sentence."""

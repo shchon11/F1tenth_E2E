@@ -36,6 +36,17 @@ Logged besides v1's numbers: each loss's gradient norm on the trunk it shares (a
 B8, the other heads; critic: value, contact), the actor's relative movement per update (G5's
 <= 2e-3), the share of speed-capped steps (critique B5: the cap is not observed and the decode clips
 at it), the value normaliser's mean / std, the contact labels' positive rate, coverage and AUC.
+
+The boot camp's race (UNIT 5b, 2026-10-14):
+
+* **The learner's speed cap is drawn per episode**, U(3, 9) m/s by default (`--learner-cap-range`,
+  `EnvConfig.learner_cap_range`) under the --cap0/--cap1 curriculum, not observed by the actor; the
+  critic reads it (`privileged_v2`'s cap column). The share of learner steps whose plan the cap
+  clipped and the mean cap drawn are logged (`rollout/speed_capped_frac`, `rollout/learner_cap_mean`).
+* **The league** (`--league-slots`): the v1 checkpoints of the boot camp's seats drive in their own
+  observation contract and plan linear (`learn.seat_obs`, per-entry formats), and every
+  `--league-every` updates the learner's own v2 snapshot takes a seat -- read in wp4, shown the env's
+  own observation. Scripted seats plan linear (`--opponent-speed-mode`, the measured default).
 """
 from __future__ import annotations
 
@@ -53,27 +64,30 @@ from ..gym_env import PRIV_V2_DIM, REWARD_COMPONENT_KEYS
 from . import common
 from . import conditioning as cond_mod
 from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
-from .dagger_v2 import AUX_TERMS, check_balance_args, explicit_flags, make_balance
+from .dagger_v2 import (AUX_TERMS, LEARNER_CAP_RANGE, PERCEPTION_AUX_DEFAULTS, apply_race_defaults,
+                        check_balance_args, explicit_flags, make_balance)
 from .memory import reset_hidden
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
 from .obs import ObsSpecV2
 from .returns import compute_gae
 from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, CONTACT_HORIZON, ValueNorm,
-                       actor_trunk_parameters, b8_sequence_loss, binary_auc, contact_labels, contact_onsets,
-                       critic_trunk_parameters, deployed_actor_parameters, flat_parameters, loss_grad_norms,
-                       relative_movement, select_tracks)
+                       actor_trunk_parameters, aux_heldout_metrics, b8_sequence_loss, binary_auc, contact_labels,
+                       contact_onsets, critic_trunk_parameters, deployed_actor_parameters, flat_parameters,
+                       loss_grad_norms, relative_movement, select_tracks)
 
 #: v1 flags whose v2 default differs, applied when the command line does not set them: the
 #: decisions above, and the redesign's optimiser section (actor lr 2e-5 -> 1e-5, horizon 128,
 #: minibatch 4096 = 32 env chunks of 128 in 4 accumulated pieces).
 V2_DEFAULTS = {"clip_split": True, "adam_eps": 1e-8, "vf_clip": 0.0, "kl_coef": 0.0,
                "lr": 2e-5, "lr_end": 1e-5, "horizon": 128, "minibatch": 4096, "grad_accum": 4}
-#: The v2-only flags' defaults (None on the parser, so a v1 run can refuse them).
+#: The v2-only flags' defaults (None on the parser, so a v1 run can refuse them). The perception
+#: auxiliaries are the perception gate's decision (1 frame, all three heads on, the gate's coefficients
+#: before the adaptive balance; its numbers at `dagger_v2.PERCEPTION_AUX_DEFAULTS`).
 V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "critic_lr": 3e-4, "value_norm_beta": 0.99,
-                    "contact_bce": 1.0, "aux_b8": 0.5, "aux_near_car": 0.0, "aux_beam_car": 0.0,
+                    "contact_bce": 1.0, **PERCEPTION_AUX_DEFAULTS,
                     "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
-                    "aux_balance_beta": BALANCE_BETA}
+                    "aux_balance_beta": BALANCE_BETA, "learner_cap_range": LEARNER_CAP_RANGE}
 #: Rows x steps of the rollout the PopArt check re-evaluates on a log update: two critic forwards of
 #: this many rows, a few milliseconds beside an update of the whole buffer.
 POPART_CHECK_ROWS = 32
@@ -82,7 +96,7 @@ POPART_CHECK_STEPS = 4
 V2_REFUSED = {"memory": "off", "scan_channels": "", "motion_memory": False, "aux_opp": 0.0, "aux_grip": 0.0,
               "aux_future": 0.0, "aux_floor": 0.0, "aux_opp_mask": 0.0, "aux_motion": 0.0, "opp_token": "off",
               "adaptation": "off", "algo": "ppo", "critic_priv_adapter": "", "maneuver_temp": None,
-              "init_log_std": None, "league_slots": "", "fresh_lr_mult": 1.0, "name_seed_fresh": False,
+              "init_log_std": None, "fresh_lr_mult": 1.0, "name_seed_fresh": False,
               "scan_deltas": False, "hist_len": 0, "controller": "legacy", "cap_gate": 0.0,
               "reference": "", "research_estimator": False, "estimator": ""}
 
@@ -112,7 +126,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     if min(a.contact_bce, a.aux_b8, a.aux_near_car, a.aux_beam_car) < 0 or not 0 < a.value_norm_beta < 1:
         raise SystemExit("v2 loss weights are >= 0 and --value-norm-beta is in (0, 1)")
     check_balance_args(a)
-    applied = {}
+    applied = apply_race_defaults(a)
     for k, v in V2_DEFAULTS.items():
         if k not in given:
             setattr(a, k, v)
@@ -127,9 +141,11 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
 
 
 def env_kwargs(a) -> dict:
-    """What a v2 run adds to the v1 EnvConfig fields `ppo.main` passes."""
+    """What a v2 run adds to the v1 EnvConfig fields `ppo.main` passes (the opponents' format travels
+    with the opponent flags, `opponent_config.env_kwargs`)."""
     return {"obs_version": 2, "hist_stride": ObsSpecV2().hist_stride,
-            "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0)}
+            "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0),
+            "learner_cap_range": tuple(a.learner_cap_range)}
 
 
 def _per_km(count, dist_m: float) -> float:
@@ -137,8 +153,10 @@ def _per_km(count, dist_m: float) -> float:
     return 1000.0 * float(count) / dist_m if dist_m > 1.0 else float("nan")
 
 
-def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, applied: dict):
-    """The PPO loop for `--arch v2`, from the env `ppo.main` built and reset."""
+def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, applied: dict,
+          league_seats=()):
+    """The PPO loop for `--arch v2`, from the env `ppo.main` built and reset. `league_seats`: the pool
+    entries `--league-slots` named, which the learner's own snapshots take over in turn."""
     from .ppo import lagrange_step
     spec = common.obs_spec(env)
     if not isinstance(spec, ObsSpecV2):
@@ -239,6 +257,13 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                 "max_grad": float(a.max_grad), "critic_warmup": int(a.critic_warmup)},
                   "value_norm_beta": float(a.value_norm_beta), "dial": {"margin": float(a.dial_margin),
                                                                         "exact": float(a.dial_exact)},
+                  # the LAST weights are the run's result, never ones picked by a loss (the perception
+                  # gate: the risk head overfit at ~2.7 epochs while the perception heads kept improving)
+                  "checkpoint_rule": "last",
+                  "race": {"learner_cap_range": list(env.ecfg.learner_cap_range),
+                           "opponent_speed_mode": env.ecfg.opponent_speed_mode,
+                           "league_seats": [int(j) for j in league_seats],
+                           "league_every": int(a.league_every) if league_seats else None},
                   "controller": controller.checkpoint_meta()}
     steps_base = int(init_extra.get("total_steps", 0) or 0) if (a.init and init_extra.get("phase") == "ppo") else 0
     if a.steps_base is not None:
@@ -265,6 +290,13 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
           + (f" balanced every {balance.every} updates to <= {balance.rho:g} x pg (EMA {balance.beta:g})"
              if balance.enabled else " (no auxiliary balance)")
           + f" | value normaliser with PopArt | v2 defaults applied: {applied or 'none'}", flush=True)
+    lc = env.ecfg.learner_cap_range
+    print("v2 PPO race: learner cap "
+          + (f"U({lc[0]:g}, {lc[1]:g}) m/s per episode under the curriculum, not observed" if lc else "the curriculum's")
+          + f" | opponents plan {env.ecfg.opponent_speed_mode or 'wp4 (as the learner)'}"
+          + (f" | league: the learner's snapshot takes seat(s) {list(league_seats)} in turn every {a.league_every} "
+             f"updates" if league_seats else ""), flush=True)
+    league_next = 0
     torch.manual_seed(a.seed)
     env.sim.warmup()
     # ---------------------------------------------------------------- buffers (learner rows)
@@ -531,6 +563,20 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist).sum(-1))
                     approx_kl = ((ratio - 1) - (logp - fl(buf_logp[:, cols]))).mean()
                     clipfrac = ((ratio - 1).abs() > a.clip).float().mean()
+                if log_now and ep == 0 and i == 0:
+                    # the heads on this rollout before any of this update's steps: held out for the
+                    # weights that drove it (`train_v2.aux_heldout_metrics`; logged, never a selection
+                    # rule -- the run keeps its last checkpoint, the perception gate's finding)
+                    lab_ = {}
+                    if on["near"]:
+                        lab_["near"] = buf_near[:, cols]
+                    if on["beam"]:
+                        lab_["beam"] = buf_beam[:, cols]
+                    if on["b8"]:
+                        lab_.update(b8_lab=buf_b8_lab[:, cols], b8_cand=buf_b8_cand[:, cols], b8_age=buf_b8_age[:, cols])
+                    for k_, v_ in aux_heldout_metrics({k: v.detach() for k, v in seq.items() if torch.is_tensor(v)},
+                                                      lab_, buf_since[:, cols]).items():
+                        stats.setdefault(f"heldout/{k_}", []).append(v_)
                 if (log_now or due) and ep == 0 and i == 0:
                     # each loss's pull on the trunk it shares, before anything is clipped or stepped
                     # (no entropy term: the log std is state-independent, its trunk gradient is zero),
@@ -592,6 +638,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                    "rollout/mean_speed": env.sim.state[:, 3].mean().item(),
                    "rollout/value_mean": float(buf_val[:T].mean()), "rollout/adv_std": float(adv.std()),
                    "rollout/speed_capped_frac": float((buf_capped.float() * buf_mask).sum() / n_pol),
+                   "rollout/learner_cap_mean": float(env.speed_cap[lid].mean()),
                    "value_norm/mean": vnorm.mean, "value_norm/std": vnorm.std,
                    "contact/label_rate": float((y_c * y_valid).sum() / y_valid.sum().clamp_min(1)),
                    "contact/label_valid_frac": float(y_valid.float().mean()),
@@ -602,7 +649,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                    "time/env_steps_per_s": T * B / max(t_roll + t_upd, 1e-9),
                    "time/elapsed_min": (time.time() - t_start) / 60}
             for k, v in stats.items():
-                log[(k if k.startswith("grad") else f"loss/{k}")] = float(np.mean(v))
+                log[(k if k.startswith(("grad", "heldout/")) else f"loss/{k}")] = float(np.mean(v))
             if balance.enabled:
                 log.update({f"balance/scale_{k}": v for k, v in balance.scale.items()})
                 log.update({f"balance/pull_{k}": v for k, v in balance.pull().items()})
@@ -650,7 +697,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   f"| pg {log.get('loss/pg', float('nan')):.4f} vf {log.get('loss/vf', float('nan')):.4f} "
                   f"bce {log.get('loss/contact_bce', float('nan')):.4f} b8 {log.get('loss/b8', float('nan')):.4f} "
                   f"kl_ref {log.get('loss/kl_ref', float('nan')):.4f} | move {move:.2e} | capped "
-                  f"{log['rollout/speed_capped_frac']:.2f} | vnorm {vnorm.mean:.2f}+-{vnorm.std:.2f}"
+                  f"{log['rollout/speed_capped_frac']:.2f} (cap {log['rollout/learner_cap_mean']:.1f}) | "
+                  f"vnorm {vnorm.mean:.2f}+-{vnorm.std:.2f}"
                   + (f" (PopArt dev {popart[0]:.1e})" if popart is not None else "")
                   + (" | aux scale " + " ".join(f"{k} {v:.3g}" for k, v in balance.scale.items())
                      if balance.enabled else "")
@@ -659,6 +707,16 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         if getattr(env, "level_replay", None) is not None and update % 16 == 0:
             print("level replay: " + " ".join(f"{k} {v:.3g}" if isinstance(v, float) else f"{k} {v}"
                                               for k, v in env.level_replay.stats().items()), flush=True)
+        if league_seats and update % a.league_every == 0:
+            # the learner's current self takes the oldest league seat: a v2 entry, read in wp4 and shown
+            # the env's own observation, beside the v1 seats in theirs (`opponent_pool`, `seat_obs`).
+            # The weights and the contract only -- a seat drives, it is never resumed.
+            k_ = league_next % len(league_seats); league_next += 1
+            lp_ = os.path.join(out, f"league_{k_}.pt")
+            snap = {key: v for key, v in meta_now().items() if key not in ("opt", "opt_param_names")}
+            save_checkpoint(lp_, model, snap)
+            env.pool.replace(league_seats[k_], lp_, env)
+            print(f"league: update {update} -> seat {k_} (pool entry {league_seats[k_]})", flush=True)
         if update % a.save_every == 0:
             meta = meta_now()
             save_checkpoint(os.path.join(out, f"ppo_u{update}.pt"), model, meta)

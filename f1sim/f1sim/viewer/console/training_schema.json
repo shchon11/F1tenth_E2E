@@ -2868,6 +2868,28 @@
           "metavar": "M"
         },
         {
+          "flag": "--opponent-speed-mode",
+          "flags": [
+            "--opponent-speed-mode"
+          ],
+          "dest": "opponent_speed_mode",
+          "label": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "linear",
+            "wp4"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "the plan format of the cars the learner does not drive -- scripted seats and league checkpoints of the opponents' format -- when it is not the learner's (one tracker reads each car's plan in its own format; a league checkpoint always plans in its own). A v2 run (--arch v2, WP4 learner) defaults to linear in a race, the measured choice (wp4-label-gates RESULTS 7); a v1 run refuses it",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
           "flag": "--opp-slots",
           "flags": [
             "--opp-slots"
@@ -4485,7 +4507,7 @@
           "choices": null,
           "required": false,
           "group": "고급",
-          "help": "v2: weight of the nearest-visible-car head (default 0: not built)",
+          "help": "v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; 0 builds no head)",
           "action": "store",
           "nullable": true,
           "metavar": "COEF"
@@ -4504,7 +4526,7 @@
           "choices": null,
           "required": false,
           "group": "고급",
-          "help": "v2: weight of the per-beam car / not-car head (default 0: not built)",
+          "help": "v2: weight of the per-beam car / not-car head (default 5, the perception gate's, before the adaptive balance; 0 builds no head)",
           "action": "store",
           "nullable": true,
           "metavar": "COEF"
@@ -4565,6 +4587,29 @@
           "action": "store",
           "nullable": true,
           "metavar": "B"
+        },
+        {
+          "flag": "--learner-cap-range",
+          "flags": [
+            "--learner-cap-range"
+          ],
+          "dest": "learner_cap_range",
+          "label": "v2 학습 차 속도 상한 무작위 범위 [m/s] (에피소드마다, 관측 안 함, 0 0 = 끔)",
+          "kind": "list",
+          "item_kind": "float",
+          "default": null,
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: each episode the learner's speed cap is drawn uniformly in [LO, HI] m/s (under the --cap0/--cap1 curriculum) and not observed by the actor -- the critic reads it -- so its speed history stays in distribution at the car's 4 m/s cap (default 3 9; 0 0 = off)",
+          "action": "store",
+          "nullable": true,
+          "metavar": [
+            "LO",
+            "HI"
+          ],
+          "separator": "space"
         }
       ]
     },
@@ -6397,7 +6442,7 @@
           "choices": null,
           "required": false,
           "group": "고급",
-          "help": "v2: weight of the nearest-visible-car head (default 0: not built)",
+          "help": "v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; 0 builds no head)",
           "action": "store",
           "nullable": true,
           "metavar": "COEF"
@@ -6416,7 +6461,7 @@
           "choices": null,
           "required": false,
           "group": "고급",
-          "help": "v2: weight of the per-beam car / not-car head (default 0: not built)",
+          "help": "v2: weight of the per-beam car / not-car head (default 5, the perception gate's, before the adaptive balance; 0 builds no head)",
           "action": "store",
           "nullable": true,
           "metavar": "COEF"
@@ -6477,6 +6522,48 @@
           "action": "store",
           "nullable": true,
           "metavar": "B"
+        },
+        {
+          "flag": "--bc-clearance",
+          "flags": [
+            "--bc-clearance"
+          ],
+          "dest": "bc_clearance",
+          "label": "v2 BC 여유 마스크 [m] (다른 차·소품과 이보다 가까운 teacher plan은 모방 안 함, 0 = 끔)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: no imitation loss on a label whose plan passes within M metres of another car or a prop over the tracker's 0.6 s window -- the teacher does not see the cars -- while the auxiliary losses keep the row (default 0.3, the redesign's; 0 = off)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "M"
+        },
+        {
+          "flag": "--learner-cap-range",
+          "flags": [
+            "--learner-cap-range"
+          ],
+          "dest": "learner_cap_range",
+          "label": "v2 학습 차 속도 상한 무작위 범위 [m/s] (에피소드마다, 관측 안 함, 0 0 = 끔)",
+          "kind": "list",
+          "item_kind": "float",
+          "default": null,
+          "nargs": 2,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: each episode the learner's speed cap is drawn uniformly in [LO, HI] m/s and not observed, so its speed history stays in distribution at the car's 4 m/s cap (default 3 9; 0 0 = off, the fixed --speed-cap)",
+          "action": "store",
+          "nullable": true,
+          "metavar": [
+            "LO",
+            "HI"
+          ],
+          "separator": "space"
         },
         {
           "flag": "--race-size",
@@ -7288,6 +7375,28 @@
           "action": "store",
           "nullable": false,
           "metavar": "M"
+        },
+        {
+          "flag": "--opponent-speed-mode",
+          "flags": [
+            "--opponent-speed-mode"
+          ],
+          "dest": "opponent_speed_mode",
+          "label": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "linear",
+            "wp4"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "the plan format of the cars the learner does not drive -- scripted seats and league checkpoints of the opponents' format -- when it is not the learner's (one tracker reads each car's plan in its own format; a league checkpoint always plans in its own). A v2 run (--arch v2, WP4 learner) defaults to linear in a race, the measured choice (wp4-label-gates RESULTS 7); a v1 run refuses it",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
         },
         {
           "flag": "--opp-slots",

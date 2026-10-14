@@ -182,6 +182,10 @@ SPAWN_ORDER_ID = {name: i for i, name in enumerate(SPAWN_ORDERS[:3])}
 #: grid slot and slot i of every race in the batch is built from spec i.
 OPPONENT_MODES = ("policy", "teacher", "mixed", "pool", "slots")
 
+#: Offset of the learner-cap generator's seed from the env's (`EnvConfig.learner_cap_range`). Its own
+#: stream, so the draw neither moves nor follows the spawn / track / opponent draws of `sim.gen`.
+LEARNER_CAP_SEED = 0x5CA9
+
 #: `OpponentSlot.spawn` as an integer, in `f1sim.opponent_slots.SLOT_SPAWNS` order. Slot 0 -- the
 #: learner -- is not placed by a spec and carries this sentinel.
 SLOT_SPAWN_LEARNER = -1
@@ -469,6 +473,16 @@ class EnvConfig:
     #: car head: each step, the car beams of the newest scan attributed to each seat and the steps
     #: since each seat was last seen (>= 3 beams within 6 m of the LiDAR). Off computes nothing.
     opp_visibility: bool = False
+    #: (lo, hi) [m/s]: every episode of a policy-driven car draws its own speed cap uniformly in this
+    #: band (the redesign's 5장 '실행 쪽', critique B5). Contract v2 does not observe the cap, so the
+    #: actor cannot tell a capped episode from a slow one -- which is the point: the car runs at a
+    #: 4 m/s cap, and a policy that only ever drove under 9 would meet a speed history out of its
+    #: training distribution there. The critic is told (`privileged_v2`'s last column is the row's
+    #: cap). The draw only lowers the cap the env would set anyway (`cap_base * cap_scale`, so the
+    #: curriculum and a self-play front car's cap still bound it), and comes from a generator of its
+    #: own (`_cap_gen`, seeded from the env seed): turning it on moves no spawn, track or opponent
+    #: draw. () is off -- nothing drawn, every env before 2026-10-14.
+    learner_cap_range: tuple = ()
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
                                      # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
@@ -1095,6 +1109,10 @@ class F1VecEnv:
         #: that speed mode, and the tracker reads every row in its own (`_sync_row_formats`).
         self.opp_plan_spec = None if self.tracker is None else self.tracker.spec
         self._row_codes = None
+        #: Per league entry, the format its rows are read in (`_set_entry_formats`): a uint8 table
+        #: indexed by driver code -- the learner's, the opponents', then checkpoint entry j's own at
+        #: `OPP_DRIVER_POOL + j`. None while every entry plans in the opponents' format.
+        self._pool_codes = None
         if e.opponent_speed_mode is not None and e.opponent_speed_mode != e.speed_mode:
             from .mpc import ROW_FORMATS
             if self.tracker is None:
@@ -1121,6 +1139,19 @@ class F1VecEnv:
         # with, and both are the same network learning both sides of the situation.
         self.cap_base = float(self.ecfg.speed_cap)
         self.cap_scale = torch.ones(self.B, device=self.device)
+        #: The policy-driven cars' per-episode speed cap (`EnvConfig.learner_cap_range`): (B,) [m/s],
+        #: +inf on the rows that did not draw one. None when off, and then nothing below reads it.
+        self._learner_cap = None
+        self._cap_gen = None
+        self._cap_suspended = False
+        if e.learner_cap_range:
+            lo, hi = (float(x) for x in e.learner_cap_range)
+            if not (0.0 < lo <= hi <= e.v_max_policy):
+                raise ValueError(f"learner_cap_range {e.learner_cap_range}: needs 0 < lo <= hi <= v_max_policy "
+                                 f"({e.v_max_policy:g} m/s)")
+            self._learner_cap = torch.full((self.B,), float("inf"), device=self.device)
+            self._cap_gen = torch.Generator(device=self.device)
+            self._cap_gen.manual_seed(int(self.cfg.sim.seed) + LEARNER_CAP_SEED)
         self.teacher_race = torch.zeros(self.B, dtype=torch.bool, device=self.device)   # mixed: this race's others are teachers
         self.ep_step = torch.zeros(self.B, dtype=torch.long, device=self.device)
         #: A staggered first episode's own time limit, per row; `NO_LIMIT` otherwise. Only ever
@@ -1693,6 +1724,10 @@ class F1VecEnv:
         same reason the teacher is: loading a checkpoint means `learn.model`, and the env is below
         `learn` in the import order. The env owns which car each entry drives; the pool owns how an
         entry is asked for an action.
+
+        Called again whenever an entry is swapped (`OpponentPool.replace`): each entry plans in its
+        own format (`entry_formats`, `_set_entry_formats`) and may read its own observation contract
+        (`seat_builders`, fed by this env's hooks), and both can change with a swap.
         """
         if self.ecfg.opponent not in ("pool", "slots"):
             raise RuntimeError(f"set_opponent_pool on an env with opponent={self.ecfg.opponent!r}: "
@@ -1701,7 +1736,54 @@ class F1VecEnv:
         if len(pool) != len(self.pool_paths):
             raise ValueError(f"the pool holds {len(pool)} checkpoint(s) but opp_pool names "
                              f"{len(self.pool_paths)}: {list(self.pool_paths)}")
+        formats = getattr(pool, "entry_formats", None)
+        if formats is not None:
+            self._set_entry_formats(list(formats))
         self.pool = pool
+
+    def _seat_builders(self) -> tuple:
+        """The pool's per-seat observation builders (`learn.seat_obs`): one per observation contract an
+        entry reads that is not this env's own. Empty -- every v1 pool in a v1 env, every path before
+        2026-10-14 -- and then no hook below does anything."""
+        return getattr(self.pool, "seat_builders", ()) if self.pool is not None else ()
+
+    def _set_entry_formats(self, formats: list) -> None:
+        """Read each league entry's rows in the entry's own plan format (output-format design 6).
+
+        `formats[j]` is checkpoint entry j's speed mode (`OpponentPool.entry_formats`, from its
+        contract). While every entry plans in the opponents' format (`opp_plan_spec`) nothing changes:
+        the env reads every non-learner row in that format, as before. A v2 learner's snapshot joining
+        a linear league -- or a linear league seat beside wp4 scripted cars -- needs per-row formats:
+        the tracker's codes are written per driver (`_row_format_codes`), with the one iLQR solve the
+        mixed tracker already runs (`mpc.solve(row_format=...)`, bit for bit the single-format solve
+        per row)."""
+        if self.tracker is None:
+            return                                    # direct actions: no plan format to read
+        from .mpc import ROW_FORMATS
+        opp_mode = self.opp_plan_spec.speed_mode
+        if self._pool_codes is None and all(f == opp_mode for f in formats):
+            return
+        modes = [self.tracker.spec.speed_mode, opp_mode] + list(formats)
+        bad = [m for m in modes if m not in ROW_FORMATS]
+        if bad:
+            raise ValueError(f"league entries plan in {sorted(set(formats))} beside the learner's "
+                             f"{self.tracker.spec.speed_mode!r} and the opponents' {opp_mode!r}; one tracker reads "
+                             f"only {ROW_FORMATS} side by side")
+        if self._row_codes is None:
+            if self.tracker._solver is not None:
+                # a solver graph recorded without codes would be handed one more argument than it took
+                raise ValueError("a league entry plans in another format than every car of this env, and the "
+                                 "tracker's solver was already captured for one format: give the env its "
+                                 "opponents' format (EnvConfig.opponent_speed_mode) from the start")
+            ego = ROW_FORMATS.index(self.tracker.spec.speed_mode)
+            self._row_codes = tuple(torch.tensor(c, dtype=torch.uint8, device=self.device)
+                                    for c in (ego, ROW_FORMATS.index(opp_mode)))
+            self.tracker.set_row_formats(torch.full((self.B,), ego, dtype=torch.uint8, device=self.device))
+        lut = [ROW_FORMATS.index(self.tracker.spec.speed_mode), ROW_FORMATS.index(opp_mode)]
+        assert len(lut) == OPP_DRIVER_POOL
+        lut += [ROW_FORMATS.index(f) for f in formats]
+        self._pool_codes = torch.tensor(lut, dtype=torch.uint8, device=self.device)
+        self._sync_row_formats()
 
     def learner_view(self, state: Optional[torch.Tensor] = None) -> LearnerView:
         """Where the policy-driven cars are, from every car's own frame, right now.
@@ -2072,12 +2154,25 @@ class F1VecEnv:
             self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
         else:
             self.prev_action[ids, self.plan_layout.speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
-            if self._row_codes is not None:
+            if self._row_codes is not None and self._pool_codes is None:
                 # A car that plans in the opponents' format starts from "hold this speed" in THAT
                 # format: a league checkpoint reads its own previous action back as an observation
                 held = torch.zeros_like(self.prev_action[ids])
                 held[:, _plan_layout(self.opp_plan_spec).speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
                 self.prev_action[ids] = torch.where(self._opp_format_rows()[ids][:, None], held, self.prev_action[ids])
+            elif self._row_codes is not None:
+                # ... and with league entries in formats of their own, each car in its own: the codes
+                # are read after this reset's driver draw (`_redraw_slot_league` above), so a seat
+                # handed from a linear checkpoint to a wp4 one holds its speed in wp4's layout
+                from .mpc import ROW_FORMATS
+                codes = self._row_format_codes()[ids]
+                v_n = (speed / e.v_max_policy * 2 - 1)[:, None]
+                out = self.prev_action[ids]
+                for c, mode in enumerate(ROW_FORMATS):
+                    held = torch.zeros_like(out)
+                    held[:, _plan_layout(mode).speed] = v_n
+                    out = torch.where((codes == c)[:, None], held, out)
+                self.prev_action[ids] = out
             self.tracker.reset(ids); self._calibrate_tracker(ids)
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         if self.events is not None:
@@ -2097,6 +2192,8 @@ class F1VecEnv:
         self._car_prev[ids] = False; self._car_resp[ids] = False
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
+        for seat in self._seat_builders():
+            seat.reset_actions(ids, self.prev_action)
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
         self.ep_limit[ids] = self.NO_LIMIT; self.ep_contacts[ids] = 0.0
         self.lap_start_step[ids] = 0; self.prev_lap[ids] = 0
@@ -2107,9 +2204,48 @@ class F1VecEnv:
             L_ = self.sim.track.length[self.sim.tid[ids]].clamp_min(1e-6)
             self.sector_idx[ids] = (s_new / L_ * self.sector_lim.shape[1]).long().clamp_(0, self.sector_lim.shape[1] - 1)
             self.sector_t0[ids] = 0.0; self.sector_valid[ids] = False; self.s_prev[ids] = s_new
+        if self._learner_cap is not None:
+            self._draw_learner_cap(ids)
         if not fill:
             return None
         return self._fill_scans(ids, speed)
+
+    def _draw_learner_cap(self, ids: torch.Tensor) -> None:
+        """A new episode's speed cap for each policy-driven car among `ids` (`EnvConfig.learner_cap_range`).
+
+        Per episode, as the dial is (`conditioning.DialDraw`): a cap that changed mid-episode would be
+        a car that suddenly slows for no reason the actor can see. `on_policy` is read after this
+        reset's driver draw, so a "mixed" / "pool" race's self-play opponents draw too and its
+        teacher or league cars never do. The cap of every row is then what the env would set without
+        the draw (`cap_base * cap_scale`, the curriculum and any self-play / slot cap) lowered to it --
+        recomputed rather than lowered in place, so a row's draws never stack across episodes."""
+        lo, hi = (float(x) for x in self.ecfg.learner_cap_range)
+        u = torch.rand(ids.numel(), device=self.device, generator=self._cap_gen)
+        mine = self.on_policy[ids] & (not self._cap_suspended)
+        self._learner_cap[ids] = torch.where(mine, lo + (hi - lo) * u, torch.full_like(u, float("inf")))
+        self.speed_cap[ids] = torch.minimum(self.cap_base * self.cap_scale[ids], self._learner_cap[ids])
+
+    @property
+    def learner_cap(self) -> Optional[torch.Tensor]:
+        """(B,) [m/s] each policy-driven car's cap for this episode (+inf where none was drawn), or None
+        when `learner_cap_range` is off."""
+        return self._learner_cap
+
+    def learner_cap_suspended(self):
+        """A context in which resets draw no learner cap: a measurement inside a training loop (DAgger's
+        per-iteration evaluation) scores the policy at the fixed cap every earlier table used. The
+        rows it resets keep +inf until their next reset outside it."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _ctx():
+            prev = self._cap_suspended
+            self._cap_suspended = True
+            try:
+                yield
+            finally:
+                self._cap_suspended = prev
+        return _ctx()
 
     def _fill_scans(self, ids: torch.Tensor, speed: torch.Tensor):
         """Fill the scan history of reset rows with a fresh scan from the new pose. Scanned for the whole
@@ -2124,6 +2260,8 @@ class F1VecEnv:
             self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.act_dim, device=self.device)], 1)[:, None, :]
         if self.hist2 is not None:
             self._fresh2[ids] = True                     # filled from the row's first observation
+        for seat in self._seat_builders():
+            seat.fill(ids, scan, speed)                  # a league seat's own contract, the same fresh scan
 
         return scan, scan_true, scan_type
 
@@ -2459,6 +2597,8 @@ class F1VecEnv:
     def reset(self, seed: Optional[int] = None):
         if seed is not None:
             self.sim.gen.manual_seed(seed); torch.manual_seed(seed)
+            if self._cap_gen is not None:
+                self._cap_gen.manual_seed(int(seed) + LEARNER_CAP_SEED)    # a seed names the caps too
         self._reset_envs(torch.arange(self.B, device=self.device))
         if self.ecfg.stagger_first_episode:
             # One draw per race, not per car: the leader's limit ends the whole race (see the
@@ -2477,6 +2617,8 @@ class F1VecEnv:
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
             self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.act_dim, device=self.device)], 1)[:, None, :]
             obs = self._obs(r)
+        for seat in self._seat_builders():
+            seat.begin(r)                                          # the same start, in each league contract
         if self._opp_age is not None:
             self._update_opp_visibility(r, torch.ones(self.B, dtype=torch.bool, device=self.device))
         self._last_obs = obs
@@ -2595,6 +2737,8 @@ class F1VecEnv:
             # the row the observation `a` was decided from, and `a` itself: what the car felt, what it was told
             self.hist2 = torch.cat([torch.cat([self._last_feat2, a], 1)[:, None, :], self.hist2[:, :-1]], 1)
         obs = self._obs(r)
+        for seat in self._seat_builders():
+            seat.advance(r, a)                                     # each league contract's own histories
         any_done, any_lap = flags.tolist()                          # the one host sync of the step
         # true lap times: time between consecutive finish-line crossings (a spawn mid-track does not count)
         if any_lap:
@@ -2683,6 +2827,8 @@ class F1VecEnv:
             r = self._reset_result(r, ids, scans)
             self._plan_fallback(ids, r.state)
             obs = self._obs(r)
+            for seat in self._seat_builders():
+                seat.refresh(r)                                    # the reset rows' first observation
         if self._opp_age is not None:
             # after the resets: the age describes the observation the next action is taken from
             self._update_opp_visibility(r, done if any_done else None)
@@ -3843,6 +3989,9 @@ class F1VecEnv:
     def set_speed_cap(self, v: float):
         self.cap_base = float(min(v, self.ecfg.v_max_policy))
         self.speed_cap = self.cap_base * self.cap_scale
+        if self._learner_cap is not None:
+            # the curriculum moves every update; an episode's own draw holds under it
+            self.speed_cap = torch.minimum(self.speed_cap, self._learner_cap)
 
     # convenience for the teacher / IL
     @property
@@ -3864,11 +4013,23 @@ class F1VecEnv:
 
     def _opp_format_rows(self) -> torch.Tensor:
         """(B,) the cars that plan in `opp_plan_spec`'s format: driven by a teacher or by a league
-        checkpoint. A `self` pool entry is the learner's own weights, so its car plans like the learner."""
+        checkpoint (unless that entry plans in a format of its own, `_row_format_codes`). A `self` pool
+        entry is the learner's own weights, so its car plans like the learner."""
         return self.teacher_driven | self.pool_driven
 
+    def _row_format_codes(self) -> torch.Tensor:
+        """(B,) uint8 code into `mpc.ROW_FORMATS` of the format each car plans in: the learner's, the
+        opponents' for a teacher or league car -- and a league car's own entry's format once the
+        entries differ (`_set_entry_formats`)."""
+        ego, opp = self._row_codes
+        codes = torch.where(self._opp_format_rows(), opp, ego)
+        if self._pool_codes is not None:
+            codes = torch.where(self.pool_driven, self._pool_codes[self.opp_driver], codes)
+        return codes
+
     def _sync_row_formats(self) -> None:
-        """Point each row of the tracker at its car's plan format (`EnvConfig.opponent_speed_mode`).
+        """Point each row of the tracker at its car's plan format (`EnvConfig.opponent_speed_mode`, and
+        each league entry's own).
 
         From the driver masks at every step rather than kept in step with them: "mixed", "pool" and
         the league slots redraw those masks at race resets, and the rollout teacher's shadow env has
@@ -3876,8 +4037,7 @@ class F1VecEnv:
         when every car plans in one format."""
         if self._row_codes is None:
             return
-        ego, opp = self._row_codes
-        self.tracker.row_format.copy_(torch.where(self._opp_format_rows(), opp, ego))
+        self.tracker.row_format.copy_(self._row_format_codes())
 
     def _tracker_plan_speed(self) -> torch.Tensor:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""

@@ -179,6 +179,94 @@ def linear_spec_of(spec: PlanSpec) -> PlanSpec:
     return replace(spec, speed_mode="linear")
 
 
+# ---------------------------------------------------------------------- the BC clearance mask
+#: [m] the v2 DAgger imitates no label whose plan passes closer than this to another car or a prop
+#: (the redesign's 6장 2 "교사 plan의 여유가 0.3 m 미만인 행은 BC에서 마스크"; decision's ④). The
+#: number is requirement D1's: side by side a body-to-body gap of 0.3 m is what the 0.11 s steer-to-yaw
+#: lag needs to react to a 0.53-0.94 m/s closing car (3장). The teacher is car-blind (the raceline
+#: teacher, `RacelineTeacher`) or only partly car-aware (the interactive guard), so inside that gap
+#: its plan is not what to imitate -- PPO, which is charged for contacts, has to decide there. The
+#: auxiliary losses keep those rows: where the cars are is exactly what they learn.
+BC_CLEARANCE_M = 0.3
+
+
+def rect_separation(ca: torch.Tensor, ha: torch.Tensor, la, wa, cb: torch.Tensor, hb: torch.Tensor, lb, wb):
+    """SAT separation [m] of two oriented rectangles: centres `ca` / `cb` (..., 2), headings `ha` / `hb`
+    (...), half-lengths `la` / `lb` and half-widths `wa` / `wb` (broadcastable). The largest gap along
+    the four edge normals: positive is a lower bound on the distance between the bodies (exact face to
+    face, the side-by-side case D1 is about), negative the overlap along the least-overlapping axis --
+    `Simulator._car_contacts` calls a pair in contact exactly where this is <= 0."""
+    ua = torch.stack([ha.cos(), ha.sin()], -1)
+    va = torch.stack([-ha.sin(), ha.cos()], -1)
+    ub = torch.stack([hb.cos(), hb.sin()], -1)
+    vb = torch.stack([-hb.sin(), hb.cos()], -1)
+    d = cb - ca
+    best = None
+    for n in (ua, va, ub, vb):
+        dot = lambda u: (u * n).sum(-1).abs()
+        gap = dot(d) - (la * dot(ua) + wa * dot(va) + lb * dot(ub) + wb * dot(vb))
+        best = gap if best is None else torch.maximum(best, gap)
+    return best
+
+
+@torch.no_grad()
+def plan_clearance(env, action: torch.Tensor, spec: Optional[PlanSpec] = None) -> Dict[str, torch.Tensor]:
+    """{"car", "prop", "min"}: (B,) the least clearance [m] of the plan `action` over the tracker's
+    window (`N + 1` samples, 0.6 s) -- to the other cars of the race and to the props.
+
+    The plan is the reference the tracker would follow (`mpc._plan_reference`, the learner's own spec
+    unless `spec` says otherwise), put in the world from each car's pose. The other cars are where
+    their own trackers predict them at the same instants (`F1VecEnv.opponent_future`, "pred": the
+    tracker's rollout of each car's actual plan, 3x the raceline walk's accuracy) with their contact
+    bodies (`Simulator._car_contacts`': the footprint scaled by `car_dims` plus the rear detection
+    box); a car outside `overtake_range` is not counted. Props: the car's own footprint against the
+    prop sections by SAT (`prop_math.prism_separation`), the static and the per-env ones alike.
+    +inf where nothing is in reach."""
+    from ..mpc import _plan_reference
+    from ..prop_math import prism_separation
+    sim, B = env.sim, env.B
+    spec = env.tracker.spec if spec is None else spec
+    st = sim.state
+    v = env._tracker_plan_speed()
+    delay = env.tracker_delay if env.tracker_delay is not None else torch.full_like(v, spec.delay)
+    ref = _plan_reference(action, v, env.speed_cap.to(v.dtype), delay, env.tracker.u_prev, spec,
+                          env.ecfg.v_max_policy, None, None)                        # (B, H, 4) body frame
+    H = ref.shape[1]
+    c, s = st[:, 2].cos()[:, None], st[:, 2].sin()[:, None]
+    xy = torch.stack([st[:, 0, None] + ref[..., 0] * c - ref[..., 1] * s,
+                      st[:, 1, None] + ref[..., 0] * s + ref[..., 1] * c], -1)     # (B, H, 2)
+    psi = st[:, 2, None] + ref[..., 2]
+    inf = torch.full((B,), float("inf"), device=st.device, dtype=st.dtype)
+    out = {"car": inf, "prop": inf.clone()}
+    if env.M > 1:
+        times = torch.arange(H, device=st.device, dtype=st.dtype) * spec.dt
+        fut, present, yaw = env.opponent_future(times, model="pred", return_yaw=True)
+        o = sim.other_idx                                                           # (B, C)
+        fx, hw = float(sim.corners[0, 0]), float(sim.corners[0, 1])
+        k = sim.car_dims[:, 0] / 0.50
+        rear = sim.car_rear[:, 0]
+        hl_all, hw_all = fx * k + 0.5 * rear, hw * k                                # the contact body
+        heading = lambda h: torch.stack([h.cos(), h.sin()], -1)
+        ego_c = xy - 0.5 * rear[:, None, None] * heading(psi)                       # (B, H, 2)
+        opp_c = fut.to(st.dtype) - 0.5 * rear[o][..., None, None] * heading(yaw.to(st.dtype))   # (B, C, H, 2)
+        sep = rect_separation(ego_c[:, None], psi[:, None], hl_all[:, None, None], hw_all[:, None, None],
+                              opp_c, yaw.to(st.dtype), hl_all[o][..., None], hw_all[o][..., None])
+        sep = torch.where(present[..., None], sep, torch.full_like(sep, float("inf")))
+        out["car"] = sep.amin(2).amin(1)
+    if getattr(sim.track, "has_props", False):
+        eid = torch.arange(B, device=st.device).repeat_interleave(H)
+        pts = xy.reshape(-1, 2)
+        a = psi.reshape(-1)
+        R = torch.stack([torch.stack([a.cos(), -a.sin()], -1), torch.stack([a.sin(), a.cos()], -1)], -2)
+        fl, fr, rl, rr = (torch.einsum("bij,kj->bki", R, sim.corners) + pts[:, None, :]).unbind(1)
+        # reach 0: the k nearest slots of each sample, and no touch on the layout's miss counter
+        props = sim.track.props_near(sim.tid[eid], pts, eid, 0.0)
+        sep = prism_separation(torch.stack((fl, fr, rr, rl), 1), *props, sim.car_dims[eid, 2])
+        out["prop"] = sep.view(B, H).amin(1)
+    out["min"] = torch.minimum(out["car"], out["prop"])
+    return out
+
+
 # ------------------------------------------------------------------------------- the B8 window
 def select_tracks(lab: torch.Tensor, cand: torch.Tensor, age: torch.Tensor, dist: torch.Tensor,
                   slots: int = B8_SLOTS):
@@ -397,6 +485,80 @@ def contact_labels(onset: torch.Tensor, term: torch.Tensor, trunc: torch.Tensor,
         label[t] = (od <= H - 1).float()
         valid[t] = (ed >= H - 1) | eterm
     return label, valid
+
+
+# ---------------------------------------------------------------- held-out auxiliary metrics
+def _p50(x: torch.Tensor) -> float:
+    return float(x.median()) if x.numel() else float("nan")
+
+
+@torch.no_grad()
+def aux_heldout_metrics(out: dict, s: dict, since: Optional[torch.Tensor] = None,
+                        max_age: int = OPP_MEMORY_STEPS) -> Dict[str, float]:
+    """The perception gate's held-out metrics of the auxiliary heads, in metres and m/s, on data the
+    weights have not been trained on (scratchpad/arch/gates/percep/PREREG.md M1-M3).
+
+    Why logged at all, and per iteration: the gate kept its "best" weights by the validation risk
+    loss, which bottomed out at ~2.7 epochs and then overfit (0.46 -> 0.51) while the perception
+    auxiliaries kept improving (the nearest-car loss 0.95 -> 0.27 over 12 epochs, PREREG 수정 5). A
+    trainer that picked its checkpoint by a risk or value loss would throw that away, so the v2
+    trainers keep the LAST checkpoint and log these instead of choosing by them.
+
+    `out` is `ActorV2.sequence`'s dict ("near_car" (T, m, 5), "beam_car" (T, m, N), "b8" (T, m, S, 4)
+    -- whichever heads exist; after a burn-in its steps only), `s` the labels ("near", "beam",
+    "b8_lab" / "b8_cand" / "b8_age") on the same (T, m) steps, `since` the steps into each row's state
+    window there, for B8's knowability (`b8_know_mask`). Keys:
+
+      near_presence_auc     the nearest-visible-car head's "a car is seen" logit
+      near_{dy,dx,dist}_p50_3m, near_closing_p50_3m, near_dy_p50_6m
+                            the gate's M1: |error| p50 on rows where a car is seen within 3 m
+                            (6 m), whatever the presence logit says
+      beam_{precision,recall}  the per-beam head at logit 0, on valid returns (the gate's M2)
+      b8_{dy,dx}_p50_3m     the gate's M3: knowable tracks within 3 m against the slot the loss's own
+                            cheapest assignment gives them
+    """
+    m = {}
+    if "near_car" in out and "near" in s:
+        p, t = out["near_car"].float().reshape(-1, 5), s["near"].float().reshape(-1, 5)
+        ex = t[:, 0] > 0.5
+        m["near_presence_auc"] = binary_auc(p[:, 0], ex)
+        dist = torch.hypot(t[:, 1] * 5.0, t[:, 2] * 2.0)
+        for r_, tag in ((3.0, "3m"), (6.0, "6m")):
+            rows = ex & (dist < r_)
+            dy = ((p[rows, 2] - t[rows, 2]) * 2.0).abs()
+            m[f"near_dy_p50_{tag}"] = _p50(dy)
+            if tag == "3m":
+                m["near_dx_p50_3m"] = _p50(((p[rows, 1] - t[rows, 1]) * 5.0).abs())
+                m["near_dist_p50_3m"] = _p50((torch.hypot(p[rows, 1] * 5.0, p[rows, 2] * 2.0) - dist[rows]).abs())
+                m["near_closing_p50_3m"] = _p50(((p[rows, 3] - t[rows, 3]) * 5.0).abs())
+                m["near_rows_3m"] = float(rows.sum())
+    if "beam_car" in out and "beam" in s:
+        lg, lb = out["beam_car"].float(), s["beam"]
+        valid, car, said = lb >= 0, lb == 1, lg > 0
+        tp = float((said & car & valid).sum())
+        m["beam_precision"] = tp / max(1.0, float((said & valid).sum()))
+        m["beam_recall"] = tp / max(1.0, float((car & valid).sum()))
+    if "b8" in out and "b8_lab" in s:
+        from .aux_v2 import B8_W_POS, B8_W_VL, _perms
+        pred = out["b8"].float()
+        lab, cand = s["b8_lab"].float(), s["b8_cand"].bool()
+        st_ = since if since is not None else torch.zeros(cand.shape[:-1], dtype=torch.long, device=cand.device)
+        know = b8_know_mask(cand, s["b8_age"], st_, max_age)
+        S = pred.shape[-2]
+        ex, pos, vl = pred[..., 0], pred[..., 1:3], pred[..., 3]
+        c_on = (F.softplus(-ex)[..., :, None] + B8_W_POS * ((pos[..., :, None, :] - lab[..., None, :, :2]) ** 2).sum(-1)
+                + B8_W_VL * (vl[..., :, None] - lab[..., None, :, 2]) ** 2)
+        cost = torch.where(know[..., None, :], c_on, torch.where(cand[..., None, :], torch.zeros_like(c_on),
+                                                                  F.softplus(ex)[..., :, None].expand_as(c_on)))
+        P = _perms(S, pred.device)
+        slot = torch.arange(S, device=pred.device)
+        best = P[cost[..., slot[None, :], P].sum(-1).argmin(-1)]                # (..., S): slot s -> track
+        track_of = best.argsort(-1)                                             # track j -> its slot
+        got = pos.gather(-2, track_of[..., None].expand(*track_of.shape, 2))    # (..., S tracks, 2)
+        near3 = know & (torch.hypot(lab[..., 0] * 5.0, lab[..., 1] * 2.0) < 3.0)
+        m["b8_dy_p50_3m"] = _p50(((got[..., 1] - lab[..., 1]) * 2.0).abs()[near3])
+        m["b8_dx_p50_3m"] = _p50(((got[..., 0] - lab[..., 0]) * 5.0).abs()[near3])
+    return m
 
 
 def binary_auc(score: torch.Tensor, label: torch.Tensor) -> float:

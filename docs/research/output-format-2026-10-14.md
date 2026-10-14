@@ -188,8 +188,10 @@
 - 행별 형식 플래그 텐서를 둡니다. linear 기준과 wp4 기준을 모두 만든 뒤 **기준 단계에서 where로 고르고, iLQR은 한 번만** 풉니다. 추가 비용은 4~14 %입니다. iLQR을 두 번 푸는 방식은 비용이 2배라 쓰지 않습니다(judge-integration-spatial/bench_batch.json).
   - 구현(2026-10-14): `EnvConfig.opponent_speed_mode`, `PlanTracker.row_format`, `mpc.solve(..., row_format)`. 교사가 모는 좌석과 리그 체크포인트는 그 형식으로, 학습자 행은 `speed_mode`로 계획합니다. 행마다 단일 형식 solve와 비트 단위로 같고, 비용은 wp4 단독 대비 CUDA graph +4~6 %, eager +8~12 %입니다(wp4-label-gates RESULTS 7.3).
 - _check_contract(opponent_pool.py:105)를 엔트리별 계약으로 완화합니다.
-  - 구현: 체크포인트는 자기가 모는 행을 읽는 형식(`opponent_speed_mode`)과 대조합니다. 엔트리마다 다른 형식은 아직 없습니다.
+  - 구현: 체크포인트는 자기가 모는 행을 읽는 형식(`opponent_speed_mode`)과 대조합니다. ~~엔트리마다 다른 형식은 아직 없습니다.~~
+  - 구현(UNIT 5b): 엔트리마다 자기 형식으로 읽습니다(`F1VecEnv._set_entry_formats`, 운전자 코드별 표). linear 리그 좌석과 wp4 학습자 스냅샷이 한 레이스에 섞여도 추종기는 한 번만 풉니다. 형식 외의 계약(속도 명령, 추종기 가중치)은 여전히 env의 것이어야 합니다.
 - redesign이 proprio를 바꾸므로 좌석별 ObsBuilder는 어차피 필요합니다. 폭 8을 유지해서 얻는 리그 쪽 이득은 행동 텐서에 한정됩니다.
+  - 구현(UNIT 5b): `learn/seat_obs.py`. v2 env 안의 v1 좌석이 v1 env에서와 비트 단위로 같은 명령을 냅니다(`tests/test_league_v2.py`).
 
 **콘솔**
 - sim_worker.py:897의 (2, 8) 검사는 그대로 통과합니다. 모드는 계약으로 판정합니다.

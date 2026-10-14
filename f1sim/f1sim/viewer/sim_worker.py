@@ -1085,6 +1085,12 @@ class SimWorker:
             speed_cap=speed_cap, action_mode=mode, race_size=grid,
             opponent=("slots" if slots is not None else cfg.opponent),
             opponent_slots=slots,
+            # A v2 (WP4) policy races scripted cars that plan LINEAR, the race its boot camp trains in
+            # and the measured choice of the wp4 label gates (RESULTS 7); a league checkpoint in the
+            # table plans in its own format and is shown its own observation (`learn.seat_obs`). A v1
+            # session is the one it always was.
+            opponent_speed_mode=("linear" if is_v2 and mode == "plan" and grid > 1
+                                 and (slots is not None or cfg.opponent != "policy") else None),
             max_steps=int(cfg.episode_s * 40),
             # opponents at the policy's own cap and the teacher at full raceline pace. With a slot
             # table each car carries its own scale and its own cap instead, and `selfplay_front_cap`

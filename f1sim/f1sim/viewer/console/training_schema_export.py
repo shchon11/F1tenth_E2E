@@ -136,6 +136,9 @@ LABELS = {
     "aux_balance_every": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
     "aux_balance_rho": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
     "aux_balance_beta": "aux gradient 균형 EMA β (측정당, v2)",
+    "bc_clearance": "v2 BC 여유 마스크 [m] (다른 차·소품과 이보다 가까운 teacher plan은 모방 안 함, 0 = 끔)",
+    "learner_cap_range": "v2 학습 차 속도 상한 무작위 범위 [m/s] (에피소드마다, 관측 안 함, 0 0 = 끔)",
+    "opponent_speed_mode": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",
 }
 PATHS = {"init_estimator": "input_file", "replay_data": "input_file", "init": "input_file", "reference": "input_file", "estimator": "input_file",
          "v2_init_stem": "input_file",
@@ -155,7 +158,7 @@ def _group(dest):
         return "PPO 보상"
     if dest in {"name", "init", "init_estimator", "reference", "policy", "candidate", "data", "out", "seed"}:
         return "기본"
-    if dest.startswith(("teacher", "opp_", "spawn_", "mixed_")) or dest == "opponent":
+    if dest.startswith(("teacher", "opp_", "spawn_", "mixed_")) or dest in ("opponent", "opponent_speed_mode"):
         return "teacher·상대차"
     if dest in {"envs", "tracks", "obstacle_draws", "race_size", "episode_s", "speed_cap", "raceline_margin", "solo_fraction", "solo_tracks"} or dest.startswith("procedural_"):
         return "환경"

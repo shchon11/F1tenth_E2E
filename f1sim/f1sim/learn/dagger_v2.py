@@ -39,6 +39,24 @@ label to train the car's policy on.
 
 What DAgger does not train: the critic (PPO's critic warm-up does) and `log_std` (imitation never
 touches it; the per-dimension initial values of B6 reach PPO as they were built).
+
+The race it is collected in (UNIT 5b, 2026-10-14):
+
+* **The BC clearance mask** (the redesign's 6장 2): a row whose label plans to pass within
+  `--bc-clearance` (0.3 m, `train_v2.BC_CLEARANCE_M`) of another car or a prop over the tracker's
+  window (`train_v2.plan_clearance`) carries no imitation loss -- the teacher does not see the cars,
+  so there its plan is not the thing to copy -- and keeps every auxiliary loss. The masked share of
+  the valid labels is measured on every collection and logged (`collect/bc_masked_frac`, with the
+  car and prop parts).
+* **The learner's random speed cap** (`--learner-cap-range`, default 3-9 m/s, `EnvConfig.
+  learner_cap_range`): drawn per episode, not observed by the actor. Labels are imitated in the
+  decoded space without the cap (`bc_loss_wp4`), so the speed dimensions learn the teacher's intent
+  while the speed history the actor reads includes capped driving -- the car runs at 4 m/s. The share
+  of steps whose executed plan the cap clipped is logged (`collect/speed_capped_frac`). The
+  per-iteration evaluations run at the fixed `--speed-cap` (`F1VecEnv.learner_cap_suspended`).
+* **Scripted opponents and the league plan LINEAR** (`--opponent-speed-mode`, default linear in a
+  race): the measured choice of the wp4 label gates (RESULTS 7); a league checkpoint is shown its own
+  observation contract (`learn.seat_obs`).
 """
 from __future__ import annotations
 
@@ -58,23 +76,78 @@ from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
 from .obs import ObsSpecV2
-from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, BC_CONSTANTS, AuxBalance, Mirror,
-                       accumulate_grads, actor_trunk_parameters, b8_sequence_loss, bc_loss_wp4, linear_spec_of,
-                       linear_to_wp4, loss_grads, select_tracks, steps_since_window_start)
+from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, BC_CLEARANCE_M, BC_CONSTANTS, AuxBalance,
+                       Mirror, accumulate_grads, actor_trunk_parameters, aux_heldout_metrics, b8_sequence_loss,
+                       bc_loss_wp4, linear_spec_of, linear_to_wp4, loss_grads, plan_clearance, select_tracks,
+                       steps_since_window_start)
 
 #: Where a v2 run's teacher labels come from (see the module docstring).
 WP4_LABEL_SOURCES = ("env", "linear-refit")
 
+#: [m/s] the learner's per-episode speed cap of a v2 run unless `--learner-cap-range` says otherwise
+#: (the redesign's 5장 '실행 쪽': "3~9 m/s에서 무작위로", not observed; critique B5). 9 is the boot
+#: camp's curriculum cap (cap0 = cap1 = 9), 3 below the car's 4.
+LEARNER_CAP_RANGE = (3.0, 9.0)
+
 #: The v2 defaults of flags v1 also has, applied when the command line does not set them: the
 #: redesign's burn-in 40 + chunk 80 (G1), and the plan / dial contract every v2 actor is built for.
 V2_DEFAULTS = {"chunk_length": 80, "seq_burn": 40}
+#: The perception auxiliaries every v2 run trains unless told otherwise -- the perception gate's
+#: decision (2026-10-14, scratchpad/arch/gates/percep/PREREG.md + results.txt; the coordinator's call):
+#: ONE frame, and all three heads on. Boot-camp data (1.06 M rows, 2 seeds x 4 folds, episode
+#: bootstrap 400), V4 (1 frame + A + B + B8) against V1 (1 frame + B8):
+#:   nearest visible car |dy| p50 within 3 m   0.256 vs 0.422 m  (-0.166 [-0.180, -0.149])
+#:   its distance error p50 within 3 m          0.329 vs 0.536 m  (-0.207 [-0.222, -0.191])
+#:   B8 |dy| p50, seen within 3 m                0.322 vs 0.407 m  (-0.085 [-0.096, -0.072])
+#:   contact-in-1-s AUC (BCE head)               0.889 vs 0.804    (+0.086 [+0.069, +0.105])
+#: Frames bought nothing with the auxiliaries on (2 / 3 frames vs 1: every metric "no measurable
+#: difference", V6 - V4, V7 - V4), so 1 (`v2_frames`). Auxiliary B alone did most of it (V3 - V1 |dy|
+#: -0.148); A took the per-beam car mask AP from 0.23 to 0.58-0.60 and |dy| -0.084 alone, within noise
+#: on top of B (V4 - V3 -0.017). No variant passed the pre-registered bar (|dy| <= 0.15 m and AUC >= 0.85).
+#: Coefficients are the gate's, applied BEFORE the adaptive balance (`AuxBalance`): B8 0.5 (w_pos 10,
+#: w_vl 0.1), nearest car 0.5 (presence BCE + 10 pos^2 + 1 closing^2 + 0.1 v_lat^2), per-beam 5 (its
+#: pilot: 0.5 x B8's stem gradient over A's at 1 = 5.80 -> 5). UNIT 3's heads and losses
+#: (`aux_v2.NearestCarHead` / `BeamCarHead` / `b8_loss`, `nearest_car_loss`, `beam_car_loss`) are the
+#: gate's own definitions, layer for layer and term for term, and its labels (>= 3 attributed valid
+#: HIT_CAR returns, within 6 m of the LiDAR) are the env's (`F1VecEnv.nearest_visible_car_v2`,
+#: `beam_car_labels_v2`): nothing in them changed.
+PERCEPTION_AUX_DEFAULTS = {"aux_b8": 0.5, "aux_near_car": 0.5, "aux_beam_car": 5.0}
 #: The defaults of the v2-only flags (None on the parser, so a v1 run can refuse them).
 V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "wp4_label": "env", "mirror_prob": 0.5,
-                    "aux_b8": 0.5, "aux_near_car": 0.0, "aux_beam_car": 0.0,
+                    **PERCEPTION_AUX_DEFAULTS,
                     "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
-                    "aux_balance_beta": BALANCE_BETA}
+                    "aux_balance_beta": BALANCE_BETA, "bc_clearance": BC_CLEARANCE_M,
+                    "learner_cap_range": LEARNER_CAP_RANGE}
 #: The auxiliary losses, by the name `sequence_losses` gives them and the coefficient key they take.
 AUX_TERMS = ("b8", "near", "beam")
+
+
+def apply_race_defaults(a) -> dict:
+    """The race a v2 run is collected / trained in, where the command line said nothing; returns what
+    it applied. Shared by both v2 trainers (`ppo_v2.prepare_args` calls it too).
+
+    * `opponent_speed_mode` "linear" in a race: the wp4 learner races scripted cars and league seats
+      that plan linear -- the measured choice (wp4-label-gates RESULTS 7.4: against linear cars the
+      wp4 labels' traffic contacts are level with linear's, 0.64 vs 0.61-0.69 per km pooled; with wp4
+      cars every label touched more). Alone, or in self-play (every car the learner), there is no
+      other driver, and no per-row formats are built.
+    * `learner_cap_range` 3-9 m/s, and `--learner-cap-range 0 0` switches it off."""
+    applied = {}
+    others = (int(getattr(a, "race_size", 1)) > 1
+              and (getattr(a, "opponent", "policy") != "policy" or bool(getattr(a, "opp_slots", ""))))
+    if getattr(a, "opponent_speed_mode", None) is None and others:
+        a.opponent_speed_mode = applied["opponent_speed_mode"] = "linear"
+    if a.opponent_speed_mode is not None and a.opponent_speed_mode not in ("linear", "wp4"):
+        raise SystemExit("--opponent-speed-mode for a v2 run is 'linear' or 'wp4' (the per-row tracker's formats)")
+    lo, hi = (float(x) for x in a.learner_cap_range)
+    if lo == 0.0 and hi == 0.0:
+        a.learner_cap_range = ()
+    elif not 0.0 < lo <= hi <= 10.0:
+        raise SystemExit("--learner-cap-range LO HI: 0 < LO <= HI <= 10 m/s (0 0 switches it off)")
+    else:
+        a.learner_cap_range = (lo, hi)
+    return applied
+
 
 #: v1 options a v2 run cannot honour, with the value that means "not asked for". Refused rather than
 #: ignored: a run that names an option and then runs without it looks like evidence it did nothing.
@@ -125,8 +198,10 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
                          f"{a.teacher_kind} teacher's search would be silently dropped")
     if min(a.aux_b8, a.aux_near_car, a.aux_beam_car) < 0:
         raise SystemExit("auxiliary weights are >= 0")
+    if not 0.0 <= float(a.bc_clearance) < 5.0:
+        raise SystemExit("--bc-clearance is a clearance in metres, >= 0 (0 switches the mask off)")
     check_balance_args(a)
-    applied = {}
+    applied = apply_race_defaults(a)
     for k, v in V2_DEFAULTS.items():
         if k not in given:
             setattr(a, k, v)
@@ -157,10 +232,12 @@ def make_balance(a, main: str, active) -> AuxBalance:
 
 
 def env_kwargs(a) -> dict:
-    """The EnvConfig fields a v2 run adds to the v1 ones `dagger.main` passes: contract v2, and the
-    per-seat visibility the B8 / nearest-car labels are counted from."""
+    """The EnvConfig fields a v2 run adds to the v1 ones `dagger.main` passes: contract v2, the
+    per-seat visibility the B8 / nearest-car labels are counted from, and the learner's random cap.
+    (`opponent_speed_mode` travels with the opponent flags, `opponent_config.env_kwargs`.)"""
     return {"obs_version": 2, "hist_stride": ObsSpecV2().hist_stride,
-            "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0)}
+            "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0),
+            "learner_cap_range": tuple(a.learner_cap_range)}
 
 
 # ------------------------------------------------------------------------------- teacher labels
@@ -223,13 +300,16 @@ class SequenceBuffer:
     history in it), the teacher's label and its validity, whether the step began an episode, the
     dial column `c` the student was given, and -- when their heads train -- the B8 tracks (`select_tracks`:
     labels, candidates, AGE: knowability is decided per sampled window), the nearest-visible-car
-    target and the per-beam car labels."""
+    target and the per-beam car labels; and with the clearance mask on, `bcok`: whether the label's
+    plan keeps its clearance (`train_v2.plan_clearance`), i.e. whether it is imitated at all."""
 
-    KEYS = ("scan", "ego", "label", "valid", "newep", "c", "b8_lab", "b8_cand", "b8_age", "near", "beam")
+    KEYS = ("scan", "ego", "label", "valid", "newep", "c", "b8_lab", "b8_cand", "b8_age", "near", "beam", "bcok")
 
     def __init__(self, n_frames: int, frame_stride: int = 1):
         self.k, self.stride = int(n_frames), int(frame_stride)
         self.lists = {k: [] for k in self.KEYS}
+        #: what the collection measured on its way (`collect`): the masked label share, the capped steps
+        self.stats: dict = {}
 
     def add(self, **row):
         for k in self.KEYS:
@@ -267,13 +347,14 @@ class SequenceBuffer:
                 cur = torch.where(blocked, cur, cur - 1)
         return torch.stack(out, 1)
 
-    def sample(self, m: int, length: int, device) -> dict:
+    def sample(self, m: int, length: int, device, generator: Optional[torch.Generator] = None) -> dict:
         """`m` runs of `length` contiguous steps, each from one learner: a dict of (length, m, ...)
         tensors on `device` (float32 where they were stored in half), plus `keep` (length, m) -- 0 at
-        a step that began an episode, where the state must not be carried in."""
+        a step that began an episode, where the state must not be carried in. `generator`: a stream
+        of the caller's (the held-out evaluation draws its windows without moving training's)."""
         length = max(1, min(int(length), self.T))
-        t0 = torch.randint(self.T - length + 1, (m,))
-        b = torch.randint(self.B, (m,))
+        t0 = torch.randint(self.T - length + 1, (m,), generator=generator)
+        b = torch.randint(self.B, (m,), generator=generator)
         ts = (t0[None, :] + torch.arange(length)[:, None]).reshape(-1)
         bs = b[None, :].expand(length, m).reshape(-1)
         shape = lambda x: x.view(length, m, *x.shape[1:])
@@ -286,6 +367,8 @@ class SequenceBuffer:
             out[k] = shape(x).to(device)
         out["keep"] = (~out.pop("newep")).float()
         out["valid"] = out["valid"].bool()
+        if "bcok" in out:
+            out["bcok"] = out["bcok"].bool()
         if "b8_age" in out:
             out["b8_age"] = out["b8_age"].long()
             out["b8_cand"] = out["b8_cand"].bool()
@@ -294,7 +377,8 @@ class SequenceBuffer:
 
 # ------------------------------------------------------------------------------- collection
 def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf: SequenceBuffer, noise: float,
-            dial: cond_mod.DialDraw, cspec, b8: bool, near: bool, beam: bool) -> SequenceBuffer:
+            dial: cond_mod.DialDraw, cspec, b8: bool, near: bool, beam: bool,
+            bc_clearance: float = 0.0) -> SequenceBuffer:
     """Roll the env for `steps`, label every state with the teacher, store the learners' rows.
 
     Iteration 0 (beta 1) drives the teacher; later ones mix the student in with probability
@@ -302,13 +386,21 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
     steps the teacher's action is taken -- and the state is zeroed where an episode ends, so the
     state it acts from is the one it would have on the car. The dial is drawn per episode
     (`conditioning.DialDraw`: mu - U(0, 0.3), exact with p 0.3, the redesign's B4) and the teacher
-    drives for that same number."""
+    drives for that same number.
+
+    `bc_clearance` > 0: every label's plan is measured against the other cars and the props
+    (`train_v2.plan_clearance`) and a row that comes closer than that is stored with `bcok` False --
+    imitated by none of the BC loss, all of the auxiliary ones. What the collection saw is left on
+    the buffer as `buf.stats`: the masked share of the valid labels (cars, props, either) and the share
+    of steps whose executed plan the learner's cap clipped (`info["speed_capped"]`)."""
     obs, _info = env.reset()
     # the primary learner of each race, as v1's DAgger stores: the other seats' trajectories are
     # driven by their own population and are not what this intervention visited
     ids = torch.arange(0, env.B, env.M, device=env.device)
     new_ep = torch.ones(env.B, dtype=torch.bool, device=env.device)
     h = model.actor.initial_hidden(env.B, device=device)
+    z = lambda: torch.zeros((), dtype=torch.float64, device=env.device)
+    tally = {"valid": z(), "masked": z(), "masked_car": z(), "masked_prop": z(), "capped": z(), "steps": z()}
     with torch.no_grad():
         for _t in range(steps):
             scan, ego = obs["scan"], obs["ego"]
@@ -321,6 +413,15 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
                 student, h = model.actor.step(scan.to(device), ego.to(device), c.to(device), h)
             row = {"scan": scan[ids, 0], "ego": ego[ids], "label": label[ids], "valid": valid[ids],
                    "newep": new_ep[ids], "c": c[ids]}
+            if bc_clearance > 0:
+                cl = plan_clearance(env, label)
+                ok = cl["min"] >= bc_clearance
+                row["bcok"] = ok[ids]
+                v_ = valid[ids].to(env.device)
+                tally["valid"] += v_.sum()
+                tally["masked"] += (v_ & ~ok[ids]).sum()
+                tally["masked_car"] += (v_ & (cl["car"][ids] < bc_clearance)).sum()
+                tally["masked_prop"] += (v_ & (cl["prop"][ids] < bc_clearance)).sum()
             if b8:
                 tr = env.opponent_tracks_v2()
                 lab3, cand3, age3 = select_tracks(tr["lab"], tr["cand"], tr["age"], tr["dist"])
@@ -337,13 +438,55 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
                 if noise > 0:
                     a_s = (a_s + noise * torch.randn_like(a_s)).clamp(-1, 1)
                 a = torch.where((torch.rand(env.B, device=label.device) < beta)[:, None], label, a_s)
-            obs, _rew, term, trunc, _info = env.step(a)
+            obs, _rew, term, trunc, info = env.step(a)
+            if "speed_capped" in info:
+                tally["capped"] += info["speed_capped"][ids].sum()
+                tally["steps"] += ids.numel()
             new_ep = (term | trunc).to(env.device)
             h = h * (~new_ep).to(h.dtype).to(h.device)[None, :, None]
+    n = {k: float(v) for k, v in tally.items()}
+    frac = lambda a, b: a / b if b > 0 else float("nan")
+    buf.stats = {"bc_clearance_m": float(bc_clearance), "bc_valid_labels": n["valid"],
+                 "bc_masked_frac": frac(n["masked"], n["valid"]),
+                 "bc_masked_car_frac": frac(n["masked_car"], n["valid"]),
+                 "bc_masked_prop_frac": frac(n["masked_prop"], n["valid"]),
+                 "speed_capped_frac": frac(n["capped"], n["steps"])}
     return buf
 
 
 # ---------------------------------------------------------------------------------- training
+#: Windows of a fresh collection the auxiliary heads are scored on before training sees it.
+HELDOUT_WINDOWS = 16
+
+
+@torch.no_grad()
+def heldout_aux(model, buf: SequenceBuffer, *, burn: int, chunk: int, device, coefs: dict, seed: int) -> dict:
+    """The auxiliary heads' held-out metrics (`train_v2.aux_heldout_metrics`) on a collection the
+    weights were not trained on: the iteration's fresh buffer, scored BEFORE `train_epochs` uses it, so
+    the numbers are those of the checkpoint the previous iteration saved. `HELDOUT_WINDOWS` windows
+    of burn-in + chunk, drawn from a generator of their own (training's draws do not move).
+
+    Why per iteration and never a selection rule: the perception gate's risk head overfit after ~2.7
+    epochs while its perception auxiliaries kept improving (nearest-car loss 0.95 -> 0.27 over 12), so
+    a checkpoint picked by a loss would lose them; the run keeps its last checkpoint
+    (`student_latest.pt`) and these say what its heads read."""
+    if not any(float(coefs.get(k, 0.0)) > 0 for k in AUX_TERMS) or len(buf) == 0:
+        return {}
+    length = min(burn + chunk, buf.T)
+    b = burn if burn + chunk <= buf.T else min(burn, int(round(length * burn / max(1, burn + chunk))))
+    s = buf.sample(HELDOUT_WINDOWS, length, device, generator=torch.Generator().manual_seed(int(seed)))
+    was = model.training
+    model.eval()
+    try:
+        out = model.actor.sequence(s["scan"], s["ego"], s["c"], keep=s["keep"], burn_in=b,
+                                   beams=float(coefs.get("beam", 0.0)) > 0)
+    finally:
+        model.train(was)
+    since = steps_since_window_start(s["keep"])[b:]
+    lab = {k: s[k][b:] for k in ("near", "beam", "b8_lab", "b8_cand", "b8_age") if k in s}
+    return aux_heldout_metrics(out, lab, since)
+
+
 def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs: dict, beams: bool):
     """The v2 imitation losses on one batch of sequences `s` (`SequenceBuffer.sample`, mirrored or
     not): {"total", "bc", "bc_lat", "bc_speed", "b8", "b8_knowable", "near", "beam"} -- every part a
@@ -355,6 +498,10 @@ def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs
     flat = lambda x: x[sl].reshape(T * m, *x.shape[2:])
     v_meas = flat(s["ego"])[:, 0] * v_max                    # speed@t: the speed the plan is laid out from
     valid = flat(s["valid"]).float()
+    if "bcok" in s:
+        # the clearance mask: a label planned within --bc-clearance of a car or a prop is not imitated
+        # (`collect`); the auxiliary losses below see every row
+        valid = valid * flat(s["bcok"]).float()
     bc, parts = bc_loss_wp4(out["mu"].reshape(T * m, -1), flat(s["label"]), v_meas, plan_spec, v_max, weight=valid)
     zero = torch.zeros((), device=bc.device)
     res = {"bc": bc, "bc_lat": parts["lat"].detach(), "bc_speed": parts["speed"].detach(),
@@ -544,6 +691,13 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
           + (f"balanced every {balance.every} updates to <= {balance.rho:g} x the imitation's trunk gradient "
              f"(EMA {balance.beta:g}) " if balance.enabled else "(no auxiliary balance) ")
           + f"| v2 defaults applied: {applied or 'none'}", flush=True)
+    race = {"bc_clearance_m": float(a.bc_clearance), "learner_cap_range": list(a.learner_cap_range),
+            "opponent_speed_mode": a.opponent_speed_mode}
+    print(f"v2 DAgger race: BC clearance mask {a.bc_clearance:g} m"
+          + (" (off)" if not a.bc_clearance else "") + " | learner cap "
+          + (f"U({a.learner_cap_range[0]:g}, {a.learner_cap_range[1]:g}) m/s per episode, not observed"
+             if a.learner_cap_range else f"fixed {a.speed_cap:g} m/s")
+          + f" | opponents plan {a.opponent_speed_mode or 'wp4 (as the learner)'}", flush=True)
     run_ = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "arch": ARCH, "tracks": names,
                                                 "teacher_desc": teacher_desc, "v2_defaults": applied},
                              group="dagger", mode=a.wandb)
@@ -558,9 +712,16 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         beta = 1.0 if it == 0 else a.beta0 * (0.5 ** (it - 1))
         tm = common.Timer()
         buf = collect(env, model, labeler, a.steps, beta, device, SequenceBuffer(spec.n_frames, spec.frame_stride),
-                      noise=0.05 if it else 0.0, dial=dial, cspec=cspec, **want).finalize()
+                      noise=0.05 if it else 0.0, dial=dial, cspec=cspec, bc_clearance=float(a.bc_clearance),
+                      **want).finalize()
         buffer_iters = (buffer_iters + [buf])[-a.keep_iters:]
         t_col = tm.lap()
+        log({f"collect/{k}": v for k, v in buf.stats.items()})
+        # the heads that collected it, on data they have not trained on (`heldout_aux`)
+        held = heldout_aux(model, buf, burn=seq["burn_in"], chunk=seq["chunk"], device=device, coefs=coefs,
+                           seed=int(a.seed) * 1000 + it)
+        if held:
+            log({f"heldout/{k}": v for k, v in held.items()})
         model.train()
         loss, parts = train_epochs(model, buffer_iters, epochs=a.epochs, batch=a.batch, burn=seq["burn_in"],
                                    chunk=seq["chunk"], device=device, opt=opt, log=log, plan_spec=plan_spec,
@@ -570,8 +731,9 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         t_tr = tm.lap()
         do_eval = (it % max(1, a.eval_every) == 0) or (it == a.start_iter + a.iters - 1)
         if do_eval:
-            with rng_island(env):
-                # the dial set exactly right (None: the true friction), the reference a supervisor is scored on
+            with rng_island(env), env.learner_cap_suspended():
+                # the dial set exactly right (None: the true friction), the reference a supervisor is scored on,
+                # at the fixed --speed-cap every DAgger table was measured at
                 m = common.rollout_metrics(env, common.student_policy(model, env, device, deterministic=True),
                                            a.eval_steps, a.speed_cap, per_track=True)
             m_iter = it
@@ -579,7 +741,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         if teacher_metrics is None:
             n_t = a.eval_steps if a.teacher_eval_steps is None else a.teacher_eval_steps
             if n_t:
-                with rng_island(env):
+                with rng_island(env), env.learner_cap_suspended():
                     teacher_metrics = common.rollout_metrics(env, lambda o: labeler()[0], n_t, a.speed_cap,
                                                              per_track=True)
             else:
@@ -600,7 +762,10 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                   "teacher_prog_mps": teacher_metrics["progress_rate_mps"],
                   "teacher_lap_s": teacher_metrics["lap_time_s"], "wall_s": time.time() - t0,
                   "collect_s": t_col, "train_s": t_tr, "eval_s": t_ev, "teacher_eval_s": t_teach,
-                  "metrics_from_iter": m_iter, **{f"train/{k}": v for k, v in parts.items()}}
+                  "metrics_from_iter": m_iter, **{f"train/{k}": v for k, v in parts.items()},
+                  **{f"collect/{k}": v for k, v in buf.stats.items()},
+                  **{f"heldout/{k}": v for k, v in held.items()},
+                  **({"heldout_scores_iter": it - 1} if held else {})}
         if do_eval:
             record.update({"student_coll_per_km": m["collisions_per_km"], "student_prog_mps": m["progress_rate_mps"],
                            "student_lap_s": m["lap_time_s"]})
@@ -617,6 +782,18 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                  if balance.enabled else "")
               + (f" | measuring {100 * parts['measure_overhead_frac']:.1f} % of training time"
                  if "measure_overhead_frac" in parts else ""), flush=True)
+        if held:
+            fmt = lambda k: f"{held[k]:.3f}" if k in held else "-"
+            whose = "the initial weights" if it == a.start_iter and not a.init else f"the weights before iteration {it}"
+            print(f"  held-out heads ({whose}, on this collection): nearest car |dy| p50 "
+                  f"<3 m {fmt('near_dy_p50_3m')} m, dist {fmt('near_dist_p50_3m')} m, presence AUC "
+                  f"{fmt('near_presence_auc')} | per-beam precision {fmt('beam_precision')} recall "
+                  f"{fmt('beam_recall')} | B8 |dy| p50 <3 m {fmt('b8_dy_p50_3m')} m", flush=True)
+        st_ = buf.stats
+        print(f"  collection: BC-masked {100 * st_.get('bc_masked_frac', float('nan')):.2f} % of "
+              f"{st_.get('bc_valid_labels', 0):.0f} valid labels (car {100 * st_.get('bc_masked_car_frac', float('nan')):.2f} %, "
+              f"prop {100 * st_.get('bc_masked_prop_frac', float('nan')):.2f} %) | speed-capped "
+              f"{100 * st_.get('speed_capped_frac', float('nan')):.1f} % of learner steps", flush=True)
         print(f"iter {it}: beta {beta:.2f} samples {n_samples} loss {loss:.4f} | {stud} | teacher "
               f"{teacher_metrics['collisions_per_km']:.1f} coll/km lap {teacher_metrics['lap_time_s']:.1f} s | "
               f"{t_col:.0f}+{t_tr:.0f}+{t_ev:.0f}+{t_teach:.0f} s", flush=True)
@@ -632,7 +809,10 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                 "wp4_label": a.wp4_label, "bc": dict(BC_CONSTANTS), "sequence": seq,
                 "mirror_prob": float(a.mirror_prob), "aux_coefs": coefs, "aux_balance": balance.state_dict(),
                 "dial": {"margin": float(a.dial_margin), "exact": float(a.dial_exact)},
-                "v2_defaults": applied, "teacher_grip": a.teacher_grip, "teacher_speed": a.teacher_speed}
+                "v2_defaults": applied, "teacher_grip": a.teacher_grip, "teacher_speed": a.teacher_speed,
+                "race": race, "collect": dict(buf.stats), "heldout": dict(held),
+                # the LAST weights, always: never a checkpoint picked by a loss (`heldout_aux`)
+                "checkpoint_rule": "last"}
         save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, meta)
         save_checkpoint(os.path.join(out, "student_latest.pt"), model, meta)
     progress_log.close()
