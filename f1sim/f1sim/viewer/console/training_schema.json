@@ -4610,6 +4610,25 @@
             "HI"
           ],
           "separator": "space"
+        },
+        {
+          "flag": "--learner-cap-prob",
+          "flags": [
+            "--learner-cap-prob"
+          ],
+          "dest": "learner_cap_prob",
+          "label": "v2 속도 상한을 뽑는 학습 차 에피소드 비율 (0.3 = 30%, 1 = 매 에피소드)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: the probability that a learner episode draws that cap at all; the rest drive at the curriculum's cap (default 0.3: with every episode capped 47 %% of the learner's steps had the plan's speed clipped, steps whose speed dimensions get no gradient; 1 = every episode)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "P"
         }
       ]
     },
@@ -6564,6 +6583,25 @@
             "HI"
           ],
           "separator": "space"
+        },
+        {
+          "flag": "--learner-cap-prob",
+          "flags": [
+            "--learner-cap-prob"
+          ],
+          "dest": "learner_cap_prob",
+          "label": "v2 속도 상한을 뽑는 학습 차 에피소드 비율 (0.3 = 30%, 1 = 매 에피소드)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: the probability that a learner episode draws that cap at all; the rest drive at the fixed --speed-cap (default 0.3: with every episode capped 47 %% of the learner's steps had the plan's speed clipped, steps whose speed dimensions change nothing; 1 = every episode)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "P"
         },
         {
           "flag": "--race-size",

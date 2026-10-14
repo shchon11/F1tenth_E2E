@@ -483,6 +483,14 @@ class EnvConfig:
     #: own (`_cap_gen`, seeded from the env seed): turning it on moves no spawn, track or opponent
     #: draw. () is off -- nothing drawn, every env before 2026-10-14.
     learner_cap_range: tuple = ()
+    #: With `learner_cap_range` on: the probability that a policy-driven car's episode draws a cap at
+    #: all; the others run at the cap the env would set anyway. Drawn per episode from the same
+    #: generator (`_cap_gen`), after the cap itself and only below 1, so 1.0 consumes the stream it
+    #: always did -- every episode capped, as every env of UNIT 5b. Why less: on a step the cap clips,
+    #: the plan decode cuts the speeds at it and the speed dimensions change nothing the car does (no
+    #: reward gradient, `info["speed_capped"]`); with every episode capped at U(3, 9) that was 47 % of
+    #: the learner's steps (UNIT 5b's collection, 564 / 1200).
+    learner_cap_prob: float = 1.0
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
                                      # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
@@ -1149,6 +1157,8 @@ class F1VecEnv:
             if not (0.0 < lo <= hi <= e.v_max_policy):
                 raise ValueError(f"learner_cap_range {e.learner_cap_range}: needs 0 < lo <= hi <= v_max_policy "
                                  f"({e.v_max_policy:g} m/s)")
+            if not 0.0 <= float(e.learner_cap_prob) <= 1.0:
+                raise ValueError(f"learner_cap_prob {e.learner_cap_prob}: a probability in [0, 1]")
             self._learner_cap = torch.full((self.B,), float("inf"), device=self.device)
             self._cap_gen = torch.Generator(device=self.device)
             self._cap_gen.manual_seed(int(self.cfg.sim.seed) + LEARNER_CAP_SEED)
@@ -2218,10 +2228,17 @@ class F1VecEnv:
         reset's driver draw, so a "mixed" / "pool" race's self-play opponents draw too and its
         teacher or league cars never do. The cap of every row is then what the env would set without
         the draw (`cap_base * cap_scale`, the curriculum and any self-play / slot cap) lowered to it --
-        recomputed rather than lowered in place, so a row's draws never stack across episodes."""
+        recomputed rather than lowered in place, so a row's draws never stack across episodes.
+
+        `learner_cap_prob` < 1: an episode is capped with that probability, the rest keep +inf (the
+        cap the env would set anyway). The coin comes after the cap's own draw, from the same
+        generator, so at 1 nothing more is drawn and every cap is the one it was."""
         lo, hi = (float(x) for x in self.ecfg.learner_cap_range)
         u = torch.rand(ids.numel(), device=self.device, generator=self._cap_gen)
         mine = self.on_policy[ids] & (not self._cap_suspended)
+        p = float(self.ecfg.learner_cap_prob)
+        if p < 1.0:
+            mine = mine & (torch.rand(ids.numel(), device=self.device, generator=self._cap_gen) < p)
         self._learner_cap[ids] = torch.where(mine, lo + (hi - lo) * u, torch.full_like(u, float("inf")))
         self.speed_cap[ids] = torch.minimum(self.cap_base * self.cap_scale[ids], self._learner_cap[ids])
 

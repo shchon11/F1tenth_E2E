@@ -4,7 +4,7 @@ the opponents' plan format, and the boot camp's league in the v2 trainers.
 * the cap: drawn per episode for the policy-driven cars only, from a stream of its own (an env with it
   spawns exactly as one without), held under the curriculum's `set_speed_cap`, never stacked across
   episodes, off inside `learner_cap_suspended`, read by the critic (`privileged_v2`) and by nothing the
-  actor sees;
+  actor sees; on `learner_cap_prob` of the episodes only, 1 drawing exactly the caps it always did;
 * the clearance: the rectangle and prism SAT separations against known geometry and against the
   simulator's own contact test, and `plan_clearance` on a race -- a plan into a standing car is inside
   0.3 m, the same plan beside it is not, a car parked on a crate is inside its prop;
@@ -89,6 +89,32 @@ def test_the_cap_is_drawn_per_episode_for_the_learner_only_and_moves_no_other_dr
     # a seeded reset names the caps too
     again = _env(learner_cap_range=(3.0, 9.0))
     assert torch.equal(again.learner_cap, _env(learner_cap_range=(3.0, 9.0)).learner_cap)
+
+
+def test_a_share_of_the_episodes_draws_a_cap_and_every_episode_draws_the_caps_it_always_did():
+    every = _env(learner_cap_range=(3.0, 9.0))
+    assert torch.equal(every.learner_cap, _env(learner_cap_range=(3.0, 9.0), learner_cap_prob=1.0).learner_cap)
+    off = _env()
+    some = _env(learner_cap_range=(3.0, 9.0), learner_cap_prob=0.3)
+    assert torch.equal(some.sim.state, off.sim.state)                   # the coin is the cap's own stream too
+    ego = some.learner
+    rows = torch.nonzero(ego).flatten()
+    drawn, caps = [], []
+    for _ in range(40):
+        some._reset_envs(rows)
+        drawn.append(torch.isfinite(some.learner_cap[rows]))
+        caps.append(some.speed_cap[rows].clone())
+    drawn, caps = torch.stack(drawn), torch.stack(caps)
+    assert 0.2 < float(drawn.float().mean()) < 0.4                     # 320 episodes, 0.3 +- 0.026
+    assert bool(((caps[drawn] >= 3.0) & (caps[drawn] <= 9.0)).all())
+    assert bool((caps[~drawn] == 9.0).all())                             # the rest: the env's own cap
+    assert torch.equal(some.speed_cap[~ego], off.speed_cap[~ego])        # the teacher cars never draw
+    # the critic reads the cap in force either way, the actor nothing
+    assert torch.allclose(some.privileged_v2()[:, -1], some.speed_cap / some.ecfg.v_max_policy)
+    none = _env(learner_cap_range=(3.0, 9.0), learner_cap_prob=0.0)
+    assert bool(torch.isinf(none.learner_cap).all()) and torch.equal(none.speed_cap, off.speed_cap)
+    with pytest.raises(ValueError, match="learner_cap_prob"):
+        _env(learner_cap_range=(3.0, 9.0), learner_cap_prob=1.5)
 
 
 def test_a_measurement_inside_a_run_scores_at_the_fixed_cap():
@@ -273,18 +299,21 @@ def test_a_v2_run_races_linear_opponents_under_a_random_cap_unless_told(module, 
         return a, applied
     a, applied = run("--race-size", "4", "--opponent", "teacher")
     assert a.opponent_speed_mode == "linear" and applied["opponent_speed_mode"] == "linear"
-    assert a.learner_cap_range == (3.0, 9.0)
+    assert a.learner_cap_range == (3.0, 9.0) and a.learner_cap_prob == 0.3
     # the perception gate's decision: one frame, every perception head on at the gate's coefficients
     assert (a.v2_frames, a.aux_b8, a.aux_near_car, a.aux_beam_car) == (1, 0.5, 0.5, 5.0)
     assert p.env_kwargs(a)["opp_visibility"] is True
-    assert p.env_kwargs(a)["learner_cap_range"] == (3.0, 9.0)
+    assert p.env_kwargs(a)["learner_cap_range"] == (3.0, 9.0) and p.env_kwargs(a)["learner_cap_prob"] == 0.3
+    a, _ = run("--learner-cap-prob", "1")
+    assert a.learner_cap_prob == 1.0 and p.env_kwargs(a)["learner_cap_prob"] == 1.0
     a, _ = run("--race-size", "4", "--opponent", "teacher", "--opponent-speed-mode", "wp4", "--learner-cap-range", "0", "0")
     assert a.opponent_speed_mode == "wp4" and a.learner_cap_range == ()
     a, applied = run()                                                    # alone: no other car to plan for
     assert a.opponent_speed_mode is None and "opponent_speed_mode" not in applied
     a, _ = run("--race-size", "2", "--opponent", "policy")             # self-play: every car the learner
     assert a.opponent_speed_mode is None
-    for bad in (["--learner-cap-range", "5", "3"], ["--learner-cap-range", "0", "12"]):
+    for bad in (["--learner-cap-range", "5", "3"], ["--learner-cap-range", "0", "12"], ["--learner-cap-prob", "1.5"],
+                ["--learner-cap-prob", "-0.1"], ["--learner-cap-range", "0", "0", "--learner-cap-prob", "0.5"]):
         argv = ["--arch", "v2", *bad]
         with pytest.raises(SystemExit):
             p.prepare_args(ap, ap.parse_args(argv), argv)
@@ -301,6 +330,8 @@ def test_a_v2_run_races_linear_opponents_under_a_random_cap_unless_told(module, 
 @pytest.mark.parametrize("module,flag,val", [("f1sim.learn.dagger", "--bc-clearance", ["0.3"]),
                                              ("f1sim.learn.dagger", "--learner-cap-range", ["3", "9"]),
                                              ("f1sim.learn.ppo", "--learner-cap-range", ["3", "9"]),
+                                             ("f1sim.learn.dagger", "--learner-cap-prob", ["0.3"]),
+                                             ("f1sim.learn.ppo", "--learner-cap-prob", ["0.3"]),
                                              ("f1sim.learn.ppo", "--opponent-speed-mode", ["linear"]),
                                              ("f1sim.learn.dagger", "--opponent-speed-mode", ["wp4"])])
 def test_a_v1_run_refuses_the_v2_race_flags(monkeypatch, module, flag, val):
@@ -366,8 +397,8 @@ def test_v2_ppo_races_the_v1_league_and_its_snapshot_takes_the_seat(tmp_path, mo
         _m, ex = load_checkpoint(str(tmp_path / "pl" / "ppo_final.pt"))
         assert ex["experiment"]["checkpoint_rule"] == "last"
         race = ex["experiment"]["race"]
-        assert race == {"learner_cap_range": [3.0, 9.0], "opponent_speed_mode": "linear", "league_seats": [0],
-                        "league_every": 1}
+        assert race == {"learner_cap_range": [3.0, 9.0], "learner_cap_prob": 0.3, "opponent_speed_mode": "linear",
+                        "league_seats": [0], "league_every": 1}
     finally:
         torch.set_num_threads(threads)
 
@@ -388,7 +419,7 @@ def test_v2_dagger_logs_the_masked_and_capped_shares_of_its_collection(tmp_path,
         assert 0.0 <= rec["collect/bc_masked_frac"] <= 1.0 and rec["collect/bc_valid_labels"] > 0
         assert 0.0 <= rec["collect/speed_capped_frac"] <= 1.0
         _m, extra = load_checkpoint(str(tmp_path / "dm" / "student_latest.pt"))
-        assert extra["race"] == {"bc_clearance_m": 0.3, "learner_cap_range": [3.0, 9.0],
+        assert extra["race"] == {"bc_clearance_m": 0.3, "learner_cap_range": [3.0, 9.0], "learner_cap_prob": 0.3,
                                  "opponent_speed_mode": "linear"}
         assert extra["collect"]["bc_masked_frac"] == rec["collect/bc_masked_frac"]
         # the perception heads by default, scored held out every iteration; the last weights kept

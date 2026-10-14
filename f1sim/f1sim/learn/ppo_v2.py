@@ -40,9 +40,12 @@ at it), the value normaliser's mean / std, the contact labels' positive rate, co
 The boot camp's race (UNIT 5b, 2026-10-14):
 
 * **The learner's speed cap is drawn per episode**, U(3, 9) m/s by default (`--learner-cap-range`,
-  `EnvConfig.learner_cap_range`) under the --cap0/--cap1 curriculum, not observed by the actor; the
-  critic reads it (`privileged_v2`'s cap column). The share of learner steps whose plan the cap
-  clipped and the mean cap drawn are logged (`rollout/speed_capped_frac`, `rollout/learner_cap_mean`).
+  `EnvConfig.learner_cap_range`) on `--learner-cap-prob` (0.3) of the episodes, under the --cap0/--cap1
+  curriculum, not observed by the actor; the critic reads it (`privileged_v2`'s cap column). The share
+  of learner steps whose plan the cap clipped and the mean cap in force are logged
+  (`rollout/speed_capped_frac`, `rollout/learner_cap_mean`): on a clipped step the speed dimensions
+  change nothing the car does, and with every episode capped that was 47 % of the steps
+  (`dagger_v2.LEARNER_CAP_PROB`).
 * **The league** (`--league-slots`): the v1 checkpoints of the boot camp's seats drive in their own
   observation contract and plan linear (`learn.seat_obs`, per-entry formats), and every
   `--league-every` updates the learner's own v2 snapshot takes a seat -- read in wp4, shown the env's
@@ -64,8 +67,8 @@ from ..gym_env import PRIV_V2_DIM, REWARD_COMPONENT_KEYS
 from . import common
 from . import conditioning as cond_mod
 from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
-from .dagger_v2 import (AUX_TERMS, LEARNER_CAP_RANGE, PERCEPTION_AUX_DEFAULTS, apply_race_defaults,
-                        check_balance_args, explicit_flags, make_balance)
+from .dagger_v2 import (AUX_TERMS, LEARNER_CAP_PROB, LEARNER_CAP_RANGE, PERCEPTION_AUX_DEFAULTS,
+                        apply_race_defaults, cap_summary, check_balance_args, explicit_flags, make_balance)
 from .memory import reset_hidden
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
@@ -87,7 +90,8 @@ V2_DEFAULTS = {"clip_split": True, "adam_eps": 1e-8, "vf_clip": 0.0, "kl_coef": 
 V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "critic_lr": 3e-4, "value_norm_beta": 0.99,
                     "contact_bce": 1.0, **PERCEPTION_AUX_DEFAULTS,
                     "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
-                    "aux_balance_beta": BALANCE_BETA, "learner_cap_range": LEARNER_CAP_RANGE}
+                    "aux_balance_beta": BALANCE_BETA, "learner_cap_range": LEARNER_CAP_RANGE,
+                    "learner_cap_prob": LEARNER_CAP_PROB}
 #: Rows x steps of the rollout the PopArt check re-evaluates on a log update: two critic forwards of
 #: this many rows, a few milliseconds beside an update of the whole buffer.
 POPART_CHECK_ROWS = 32
@@ -126,7 +130,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     if min(a.contact_bce, a.aux_b8, a.aux_near_car, a.aux_beam_car) < 0 or not 0 < a.value_norm_beta < 1:
         raise SystemExit("v2 loss weights are >= 0 and --value-norm-beta is in (0, 1)")
     check_balance_args(a)
-    applied = apply_race_defaults(a)
+    applied = apply_race_defaults(a, given)
     for k, v in V2_DEFAULTS.items():
         if k not in given:
             setattr(a, k, v)
@@ -145,7 +149,7 @@ def env_kwargs(a) -> dict:
     with the opponent flags, `opponent_config.env_kwargs`)."""
     return {"obs_version": 2, "hist_stride": ObsSpecV2().hist_stride,
             "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0),
-            "learner_cap_range": tuple(a.learner_cap_range)}
+            "learner_cap_range": tuple(a.learner_cap_range), "learner_cap_prob": float(a.learner_cap_prob)}
 
 
 def _per_km(count, dist_m: float) -> float:
@@ -261,6 +265,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   # gate: the risk head overfit at ~2.7 epochs while the perception heads kept improving)
                   "checkpoint_rule": "last",
                   "race": {"learner_cap_range": list(env.ecfg.learner_cap_range),
+                           "learner_cap_prob": (float(env.ecfg.learner_cap_prob) if env.ecfg.learner_cap_range
+                                                else None),
                            "opponent_speed_mode": env.ecfg.opponent_speed_mode,
                            "league_seats": [int(j) for j in league_seats],
                            "league_every": int(a.league_every) if league_seats else None},
@@ -290,9 +296,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
           + (f" balanced every {balance.every} updates to <= {balance.rho:g} x pg (EMA {balance.beta:g})"
              if balance.enabled else " (no auxiliary balance)")
           + f" | value normaliser with PopArt | v2 defaults applied: {applied or 'none'}", flush=True)
-    lc = env.ecfg.learner_cap_range
     print("v2 PPO race: learner cap "
-          + (f"U({lc[0]:g}, {lc[1]:g}) m/s per episode under the curriculum, not observed" if lc else "the curriculum's")
+          + cap_summary(env.ecfg.learner_cap_range, env.ecfg.learner_cap_prob, "the curriculum's")
+          + (" (under the curriculum)" if env.ecfg.learner_cap_range else "")
           + f" | opponents plan {env.ecfg.opponent_speed_mode or 'wp4 (as the learner)'}"
           + (f" | league: the learner's snapshot takes seat(s) {list(league_seats)} in turn every {a.league_every} "
              f"updates" if league_seats else ""), flush=True)

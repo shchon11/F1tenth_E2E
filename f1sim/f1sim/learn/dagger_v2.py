@@ -49,11 +49,12 @@ The race it is collected in (UNIT 5b, 2026-10-14):
   the valid labels is measured on every collection and logged (`collect/bc_masked_frac`, with the
   car and prop parts).
 * **The learner's random speed cap** (`--learner-cap-range`, default 3-9 m/s, `EnvConfig.
-  learner_cap_range`): drawn per episode, not observed by the actor. Labels are imitated in the
-  decoded space without the cap (`bc_loss_wp4`), so the speed dimensions learn the teacher's intent
-  while the speed history the actor reads includes capped driving -- the car runs at 4 m/s. The share
-  of steps whose executed plan the cap clipped is logged (`collect/speed_capped_frac`). The
-  per-iteration evaluations run at the fixed `--speed-cap` (`F1VecEnv.learner_cap_suspended`).
+  learner_cap_range`): drawn per episode on `--learner-cap-prob` (0.3) of the episodes, not observed
+  by the actor. Labels are imitated in the decoded space without the cap (`bc_loss_wp4`), so the
+  speed dimensions learn the teacher's intent while the speed history the actor reads includes capped
+  driving -- the car runs at 4 m/s. The share of steps whose executed plan the cap clipped is logged
+  (`collect/speed_capped_frac`). The per-iteration evaluations run at the fixed `--speed-cap`
+  (`F1VecEnv.learner_cap_suspended`).
 * **Scripted opponents and the league plan LINEAR** (`--opponent-speed-mode`, default linear in a
   race): the measured choice of the wp4 label gates (RESULTS 7); a league checkpoint is shown its own
   observation contract (`learn.seat_obs`).
@@ -88,6 +89,15 @@ WP4_LABEL_SOURCES = ("env", "linear-refit")
 #: (the redesign's 5장 '실행 쪽': "3~9 m/s에서 무작위로", not observed; critique B5). 9 is the boot
 #: camp's curriculum cap (cap0 = cap1 = 9), 3 below the car's 4.
 LEARNER_CAP_RANGE = (3.0, 9.0)
+#: The share of a v2 run's learner episodes that draw that cap at all (`EnvConfig.learner_cap_prob`,
+#: unless `--learner-cap-prob` says otherwise); the rest drive at the fixed / curriculum cap. UNIT 5b
+#: capped every episode and measured 47 % of the learner's steps with the plan's speed clipped (564 /
+#: 1200; ICCAS, a race of 4, 8 envs x 200 / 400 steps, seeds 1 / 2): on such a step the speed
+#: dimensions change nothing the car does, so PPO's gradient on them is noise, and half the run's
+#: speed signal went that way. 0.3 keeps capped driving in the speed history the actor reads (the car
+#: runs at 4 m/s) on under a third of the steps: in that collection an uncapped episode had none of its
+#: steps clipped at the 9 m/s cap, so at 0.3 it expects 0.3 x 47 % = 14 %.
+LEARNER_CAP_PROB = 0.3
 
 #: The v2 defaults of flags v1 also has, applied when the command line does not set them: the
 #: redesign's burn-in 40 + chunk 80 (G1), and the plan / dial contract every v2 actor is built for.
@@ -117,12 +127,12 @@ V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "wp4_label": "env", "mir
                     **PERCEPTION_AUX_DEFAULTS,
                     "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
                     "aux_balance_beta": BALANCE_BETA, "bc_clearance": BC_CLEARANCE_M,
-                    "learner_cap_range": LEARNER_CAP_RANGE}
+                    "learner_cap_range": LEARNER_CAP_RANGE, "learner_cap_prob": LEARNER_CAP_PROB}
 #: The auxiliary losses, by the name `sequence_losses` gives them and the coefficient key they take.
 AUX_TERMS = ("b8", "near", "beam")
 
 
-def apply_race_defaults(a) -> dict:
+def apply_race_defaults(a, given=frozenset()) -> dict:
     """The race a v2 run is collected / trained in, where the command line said nothing; returns what
     it applied. Shared by both v2 trainers (`ppo_v2.prepare_args` calls it too).
 
@@ -131,7 +141,11 @@ def apply_race_defaults(a) -> dict:
       wp4 labels' traffic contacts are level with linear's, 0.64 vs 0.61-0.69 per km pooled; with wp4
       cars every label touched more). Alone, or in self-play (every car the learner), there is no
       other driver, and no per-row formats are built.
-    * `learner_cap_range` 3-9 m/s, and `--learner-cap-range 0 0` switches it off."""
+    * `learner_cap_range` 3-9 m/s on `learner_cap_prob` 0.3 of the episodes, and `--learner-cap-range
+      0 0` switches it off (a `--learner-cap-prob` named with it is refused: it would draw nothing).
+
+    `given`: the dests the command line set (`explicit_flags`); without it nothing is refused for
+    having been named."""
     applied = {}
     others = (int(getattr(a, "race_size", 1)) > 1
               and (getattr(a, "opponent", "policy") != "policy" or bool(getattr(a, "opp_slots", ""))))
@@ -146,6 +160,11 @@ def apply_race_defaults(a) -> dict:
         raise SystemExit("--learner-cap-range LO HI: 0 < LO <= HI <= 10 m/s (0 0 switches it off)")
     else:
         a.learner_cap_range = (lo, hi)
+    if not 0.0 <= float(a.learner_cap_prob) <= 1.0:
+        raise SystemExit("--learner-cap-prob is a probability in [0, 1] (1 = every episode capped)")
+    if not a.learner_cap_range and "learner_cap_prob" in given:
+        raise SystemExit("--learner-cap-prob with the cap off (--learner-cap-range 0 0) would draw nothing")
+    a.learner_cap_prob = float(a.learner_cap_prob)
     return applied
 
 
@@ -201,7 +220,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     if not 0.0 <= float(a.bc_clearance) < 5.0:
         raise SystemExit("--bc-clearance is a clearance in metres, >= 0 (0 switches the mask off)")
     check_balance_args(a)
-    applied = apply_race_defaults(a)
+    applied = apply_race_defaults(a, given)
     for k, v in V2_DEFAULTS.items():
         if k not in given:
             setattr(a, k, v)
@@ -237,7 +256,15 @@ def env_kwargs(a) -> dict:
     (`opponent_speed_mode` travels with the opponent flags, `opponent_config.env_kwargs`.)"""
     return {"obs_version": 2, "hist_stride": ObsSpecV2().hist_stride,
             "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0),
-            "learner_cap_range": tuple(a.learner_cap_range)}
+            "learner_cap_range": tuple(a.learner_cap_range), "learner_cap_prob": float(a.learner_cap_prob)}
+
+
+def cap_summary(cap_range, cap_prob: float, otherwise: str) -> str:
+    """The learner cap as a run's race line prints it (both trainers)."""
+    if not cap_range:
+        return otherwise
+    return (f"U({cap_range[0]:g}, {cap_range[1]:g}) m/s on {100 * float(cap_prob):g} % of the episodes, "
+            f"not observed")
 
 
 # ------------------------------------------------------------------------------- teacher labels
@@ -692,11 +719,11 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
              f"(EMA {balance.beta:g}) " if balance.enabled else "(no auxiliary balance) ")
           + f"| v2 defaults applied: {applied or 'none'}", flush=True)
     race = {"bc_clearance_m": float(a.bc_clearance), "learner_cap_range": list(a.learner_cap_range),
+            "learner_cap_prob": float(a.learner_cap_prob) if a.learner_cap_range else None,
             "opponent_speed_mode": a.opponent_speed_mode}
     print(f"v2 DAgger race: BC clearance mask {a.bc_clearance:g} m"
           + (" (off)" if not a.bc_clearance else "") + " | learner cap "
-          + (f"U({a.learner_cap_range[0]:g}, {a.learner_cap_range[1]:g}) m/s per episode, not observed"
-             if a.learner_cap_range else f"fixed {a.speed_cap:g} m/s")
+          + cap_summary(a.learner_cap_range, a.learner_cap_prob, f"fixed {a.speed_cap:g} m/s")
           + f" | opponents plan {a.opponent_speed_mode or 'wp4 (as the learner)'}", flush=True)
     run_ = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "arch": ARCH, "tracks": names,
                                                 "teacher_desc": teacher_desc, "v2_defaults": applied},

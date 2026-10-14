@@ -838,6 +838,11 @@ def main():
                     help="v2: each episode the learner's speed cap is drawn uniformly in [LO, HI] m/s and not "
                          "observed, so its speed history stays in distribution at the car's 4 m/s cap "
                          "(default 3 9; 0 0 = off, the fixed --speed-cap)")
+    ap.add_argument("--learner-cap-prob", type=float, default=None, metavar="P",
+                    help="v2: the probability that a learner episode draws that cap at all; the rest drive at "
+                         "the fixed --speed-cap (default 0.3: with every episode capped 47 %% of the learner's "
+                         "steps had the plan's speed clipped, steps whose speed dimensions change nothing; "
+                         "1 = every episode)")
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
     v2_applied = None
@@ -847,7 +852,7 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
                               "aux_beam_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta",
-                              "bc_clearance", "learner_cap_range", "opponent_speed_mode")
+                              "bc_clearance", "learner_cap_range", "learner_cap_prob", "opponent_speed_mode")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
