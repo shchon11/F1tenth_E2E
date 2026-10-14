@@ -107,8 +107,12 @@ timing with the abreast partner.
 
 Harness `drive4.py`, tables `ana4.py`, raw pickles `P1_*.pkl` / `P2_*.pkl`, all in
 `/tmp/claude-1000/-home-shchon11-F1tenth-E2E/d98b5699-f98e-4674-9a12-ab5a57bf35f1/scratchpad/roll/m/`
-(the development diagnostics `H*` and the CPU harness `drive3.py` beside them); both arms of each
-measurement ran side by side with the same seed and got the same placements (same `spawn_stats`).
+(the development diagnostics `H*` and the CPU harness `drive3.py` beside them). Both arms of each
+measurement ran side by side with the same seed: 216 of 220 (measurement 1) and 79 of 80
+(measurement 2) abreast opponents started at the same track station and lateral offset (within 6 mm)
+in both arms. The rest differ, which fits the one thing placement does differently with the hold on
+(not checked further): a held car spawns with no heading jitter, and the spawn-runway check reads
+the heading.
 Contacts are raw / charged onsets of the learner; "abreast" is the partner laid abreast with it at
 that episode's reset; motion toward the learner is the abreast opponent's centreline offset change,
 signed toward the learner, median / p90 / max over opponents not yet in contact with it.
