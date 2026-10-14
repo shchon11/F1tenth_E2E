@@ -235,6 +235,20 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     # every plan it emits by five at racing speed, so this is read, never assumed.
     exp_meta = metadata.get("experiment") or {}
     kappa_mode = str(exp_meta.get("plan_kappa_mode", "absolute"))
+    # The observation the checkpoint was trained on. A contract-v2 spec (`learn.obs.ObsSpecV2`, the v2
+    # network) names its fields differently -- frames, not a stack -- and the env has to be told to emit
+    # that contract (`EnvConfig.obs_version`); everything else about the run is the same.
+    if int(spec.get("version", 1)) == 2:
+        obs_kw = dict(obs_version=2, scan_stack=int(spec["n_frames"]), scan_stride=int(spec["frame_stride"]),
+                      hist_len=int(spec["hist_len"]), hist_stride=int(spec["hist_stride"]),
+                      v_max_policy=float(spec["v_max"]), imu_gyro_scale=float(spec["gyro_scale"]))
+    else:
+        obs_kw = dict(scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
+                      hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+                      action_history=int(spec.get("action_history", EnvConfig.action_history)),
+                      v_max_policy=float(spec.get("v_max", EnvConfig.v_max_policy)),
+                      imu_gyro_scale=float(spec.get("gyro_scale", EnvConfig.imu_gyro_scale)),
+                      imu_accel_scale=float(spec.get("accel_scale", EnvConfig.imu_accel_scale)))
     ecfg = EnvConfig(speed_cap=speed_cap, resample_track_on_reset=True, action_mode=mode,
                      plan_kappa_mode=kappa_mode,
                      plan_kappa_a_lat=float(exp_meta.get("plan_kappa_a_lat", 8.0)),
@@ -249,13 +263,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      race_size=race_size, opponent=opponent,
                      opp_events=events, opp_event_rate=float(opp_event_rate),
                      **{f"opp_{k}_prob": v for k, v in probs.items()},
-                     scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
-                     hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2),
+                     **obs_kw,
                      opp_future_model=opp_future_model,
-                     action_history=int(spec.get("action_history", EnvConfig.action_history)),
-                     v_max_policy=float(spec.get("v_max", EnvConfig.v_max_policy)),
-                     imu_gyro_scale=float(spec.get("gyro_scale", EnvConfig.imu_gyro_scale)),
-                     imu_accel_scale=float(spec.get("accel_scale", EnvConfig.imu_accel_scale)),
                      # meta FIRST, and 'off'/'' read as absent. `extra["spec"]` records 'off' as a
                      # literal string, and 'off' is truthy, so `spec.get(...) or meta.get(...)`
                      # short-circuits on it and never consults meta -- which is the only place

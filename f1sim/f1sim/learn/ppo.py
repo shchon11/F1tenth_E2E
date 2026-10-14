@@ -889,7 +889,43 @@ def main():
                     help="[s] >0: cap the teacher's commanded speed at what can still be steered back onto the lane "
                          "(v <= a_lat * t / heading_error). 0 keeps the old behaviour, where a car facing "
                          "backwards on the line is told to carry full racing speed")
+    # ---- the v2 network (learn.model_v2, learn.ppo_v2). Every flag below is v2's own: None on a v1
+    # run, which refuses any of them set, so an unflagged run is the run it always was.
+    ap.add_argument("--arch", choices=("v1", "v2"), default="v1",
+                    help="v2: the redesigned actor-critic (docs/research/architecture-redesign-2026-10-13.md) "
+                         "on observation contract v2 and WP4 plans: one value stream with value normalisation "
+                         "and a 'car contact within 1 s' classifier on a critic that reads privileged_v2, no KL "
+                         "leash (kl_ref logged only), --clip-split, Adam eps 1e-8, --vf-clip 0, actor lr 2e-5 -> "
+                         "1e-5, critic lr 3e-4, horizon 128, minibatch 4096 in 4 pieces unless set. v1: every "
+                         "run before it")
+    ap.add_argument("--v2-frames", type=int, default=None, metavar="K",
+                    help="v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)")
+    ap.add_argument("--v2-init-stem", default=None, metavar="CKPT",
+                    help="v2 without --init: seed both stems from this v1 resnet checkpoint (model_v2.init_stems_from_v1)")
+    ap.add_argument("--critic-lr", type=float, default=None,
+                    help="v2: the critic's learning rate, constant (default 3e-4, the redesign's); --lr / --lr-end "
+                         "schedule the actor")
+    ap.add_argument("--value-norm-beta", type=float, default=None, metavar="B",
+                    help="v2: per-update EMA weight of the return statistics the critic's targets are "
+                         "normalised by (default 0.99, about the last hundred updates)")
+    ap.add_argument("--contact-bce", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the critic's 'charged car contact within 1 s' BCE (default 1.0, G4's)")
+    ap.add_argument("--aux-b8", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the B8 opponent-slot loss on the actor (default 0.5, the redesign's)")
+    ap.add_argument("--aux-near-car", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the nearest-visible-car head (default 0: not built)")
+    ap.add_argument("--aux-beam-car", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the per-beam car / not-car head (default 0: not built)")
     a = ap.parse_args()
+    v2_applied = None
+    if a.arch == "v2":
+        from . import ppo_v2
+        v2_applied = ppo_v2.prepare_args(ap, a)
+    else:
+        set_v2 = [k for k in ("v2_frames", "v2_init_stem", "critic_lr", "value_norm_beta", "contact_bce", "aux_b8",
+                              "aux_near_car", "aux_beam_car") if getattr(a, k) is not None]
+        if set_v2:
+            raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
     adaptive = a.adaptation != "off"
     if adaptive:
         if a.controller != "auto" or not a.init or a.memory != "gru":
@@ -1088,7 +1124,9 @@ def main():
                                                               reward_progress_gate=a.progress_gate,
                                                               gate_min=a.gate_min,
                                                               replay_lag_s=a.replay_lag,
-                                                              compile_tracker=_env_compile_tracker), seed=a.seed, rls=rls,
+                                                              compile_tracker=_env_compile_tracker,
+                                                              **({} if v2_applied is None else ppo_v2.env_kwargs(a))),
+                          seed=a.seed, rls=rls,
                           cfg=sim_cfg,
                           teacher_grip=a.teacher_grip,
                           teacher_recover_time=a.teacher_recover_time, teacher_limits=limits)
@@ -1195,6 +1233,9 @@ def main():
     obs, info = env.reset(seed=a.seed)
     # After the seeded reset: the histories must start from the observations this run actually saw.
     controller.begin(obs)
+    if v2_applied is not None:
+        return ppo_v2.train(a, env=env, obs=obs, device=device, names=names, init_ck=init_ck,
+                            controller=controller, graph_rt=graph_rt, applied=v2_applied)
     priv = env.privileged(env.last_result); env_priv_dim = priv.shape[1]
     # A dial run's critic is told the dial: the return of an episode depends on how much grip the car
     # was allowed, and a critic that sees the floor but not the dial has to explain that as noise.

@@ -31,10 +31,16 @@ def validate_policy_observation(saved: dict, env) -> None:
     import math
     if not isinstance(saved, dict) or not saved:
         raise ValueError("policy checkpoint has no observation specification")
-    expected = ObsSpec(**{key: value for key, value in saved.items()
-                          if key in ObsSpec.__dataclass_fields__})
+    cls = ObsSpec
+    if int(saved.get("version", 1)) == 2:
+        # contract v2 (`learn.obs.ObsSpecV2`): the same field-by-field comparison, on its own fields
+        from .obs import ObsSpecV2 as cls
+    expected = cls(**{key: value for key, value in saved.items() if key in cls.__dataclass_fields__})
     actual = obs_spec(env)
-    for key in ObsSpec.__dataclass_fields__:
+    if type(actual) is not cls:
+        raise ValueError(f"policy observation contract v{int(saved.get('version', 1))}, environment emits "
+                         f"{type(actual).__name__}")
+    for key in cls.__dataclass_fields__:
         want, got = getattr(expected, key), getattr(actual, key)
         if isinstance(want, float) or isinstance(got, float):
             same = math.isfinite(float(want)) and math.isfinite(float(got)) \
