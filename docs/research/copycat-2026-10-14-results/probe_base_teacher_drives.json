@@ -1,0 +1,149 @@
+{
+ "/home/shchon11/f1sim_runs/v2cc_base/student_it0.pt": {
+  "recorded": {
+   "bias_v": 0.02486544451676309,
+   "mae_v": 0.7974662780761719,
+   "mae_lat": 0.12132168840616941,
+   "v_student": 4.167442202568054,
+   "v_label": 4.142576724290848
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 0.033284664852544665,
+   "mae_v": 0.7961965650320053,
+   "mae_lat": 0.12133272457867861,
+   "v_student": 4.175861477851868,
+   "v_label": 4.142576724290848
+  },
+  "zero_actions": {
+   "bias_v": 0.32628287747502327,
+   "mae_v": 1.0887743532657623,
+   "mae_lat": 0.13170603848993778,
+   "v_student": 4.4688597321510315,
+   "v_label": 4.142576724290848
+  },
+  "teacher_history": {
+   "bias_v": 0.024865307146683335,
+   "mae_v": 0.7974666506052017,
+   "mae_lat": 0.12132167164236307,
+   "v_student": 4.167442142963409,
+   "v_label": 4.142576724290848
+  },
+  "act_speed_plus_0.5mps": {
+   "bias_v": 0.27256206423044205,
+   "mae_v": 0.8034884706139565,
+   "mae_lat": 0.12164581660181284,
+   "v_student": 4.415138781070709,
+   "v_label": 4.142576724290848
+  },
+  "gains": {
+   "meas_speed_hist": 0.016838550567626953,
+   "act_speed_hist": 0.49539315700531006
+  },
+  "contract": {
+   "ego_dim": 210,
+   "ego_actions": true,
+   "n_action_cols": 168,
+   "n_act_speed_cols": 84,
+   "n_meas_hist_cols": 20,
+   "iter": 0
+  }
+ },
+ "/home/shchon11/f1sim_runs/v2cc_base/student_it1.pt": {
+  "recorded": {
+   "bias_v": 0.15352035872638226,
+   "mae_v": 0.4775019586086273,
+   "mae_lat": 0.09994383994489908,
+   "v_student": 4.296097040176392,
+   "v_label": 4.142576724290848
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 0.15348298661410809,
+   "mae_v": 0.47758300602436066,
+   "mae_lat": 0.0999068133533001,
+   "v_student": 4.296059787273407,
+   "v_label": 4.142576724290848
+  },
+  "zero_actions": {
+   "bias_v": 0.9273366406559944,
+   "mae_v": 1.6166197657585144,
+   "mae_lat": 0.1403758991509676,
+   "v_student": 5.069913387298584,
+   "v_label": 4.142576724290848
+  },
+  "teacher_history": {
+   "bias_v": 0.15352076943963766,
+   "mae_v": 0.47750169411301613,
+   "mae_lat": 0.09994362015277147,
+   "v_student": 4.296097636222839,
+   "v_label": 4.142576724290848
+  },
+  "act_speed_plus_0.5mps": {
+   "bias_v": 0.6001610830426216,
+   "mae_v": 0.7210298702120781,
+   "mae_lat": 0.11042064987123013,
+   "v_student": 4.742737948894501,
+   "v_label": 4.142576724290848
+  },
+  "gains": {
+   "meas_speed_hist": -7.450580596923828e-05,
+   "act_speed_hist": 0.8932818174362183
+  },
+  "contract": {
+   "ego_dim": 210,
+   "ego_actions": true,
+   "n_action_cols": 168,
+   "n_act_speed_cols": 84,
+   "n_meas_hist_cols": 20,
+   "iter": 1
+  }
+ },
+ "/home/shchon11/f1sim_runs/v2cc_base/student_it2.pt": {
+  "recorded": {
+   "bias_v": -0.041244677384383976,
+   "mae_v": 0.3834024555981159,
+   "mae_lat": 0.08760229032486677,
+   "v_student": 4.101331979036331,
+   "v_label": 4.142576724290848
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": -0.05040166855906136,
+   "mae_v": 0.38517818227410316,
+   "mae_lat": 0.08747757971286774,
+   "v_student": 4.092175096273422,
+   "v_label": 4.142576724290848
+  },
+  "zero_actions": {
+   "bias_v": 0.7830952741205692,
+   "mae_v": 1.6009950190782547,
+   "mae_lat": 0.1364079751074314,
+   "v_student": 4.925671935081482,
+   "v_label": 4.142576724290848
+  },
+  "teacher_history": {
+   "bias_v": -0.04124515666626394,
+   "mae_v": 0.38340115919709206,
+   "mae_lat": 0.08760209567844868,
+   "v_student": 4.101331651210785,
+   "v_label": 4.142576724290848
+  },
+  "act_speed_plus_0.5mps": {
+   "bias_v": 0.4164612926542759,
+   "mae_v": 0.5377890020608902,
+   "mae_lat": 0.09493944514542818,
+   "v_student": 4.5590381026268005,
+   "v_label": 4.142576724290848
+  },
+  "gains": {
+   "meas_speed_hist": -0.01831376552581787,
+   "act_speed_hist": 0.9154122471809387
+  },
+  "contract": {
+   "ego_dim": 210,
+   "ego_actions": true,
+   "n_action_cols": 168,
+   "n_act_speed_cols": 84,
+   "n_meas_hist_cols": 20,
+   "iter": 2
+  }
+ }
+}

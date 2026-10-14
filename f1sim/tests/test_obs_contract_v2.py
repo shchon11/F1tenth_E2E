@@ -11,6 +11,12 @@ check to show the check catches the duplicate it was written for.
 
 The env and the node must build the same v2 observation from the same messages; the slow test
 drives the batched env and `ObsBuilderV2` side by side, as `test_obs_identity.py` does for v1.
+
+The contract without the issued actions (`ObsSpecV2.ego_actions` False, the copycat study's arm A,
+docs/research/copycat-2026-10-14.md) is held to the same rules: its table names each column once, its
+builder's data has no duplicate column, it is the full contract's ego with the action columns taken
+out (one ring, two readings), the env and the node agree on it, and a spec dict written before the
+field existed still reads as the contract it was.
 """
 from __future__ import annotations
 
@@ -23,9 +29,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from f1sim.learn.obs import (ObsBuilder, ObsBuilderV2, ObsSpec, ObsSpecV2, action_mirror_signs,  # noqa: E402
-                             assemble_ego_v2, contract_table_v2, ego_columns, ego_mirror_signs,
-                             flatten_obs, mirror_scan, spec_from_dict)
+from f1sim.learn.obs import (ObsBuilder, ObsBuilderV2, ObsSpec, ObsSpecV2, action_columns,  # noqa: E402
+                             action_mirror_signs, assemble_ego_v2, contract_table_v2, ego_columns,
+                             ego_mirror_signs, flatten_obs, mirror_scan, spec_from_dict)
 
 
 def _drive(builder, steps: int, act_dim: int, seed: int = 0, v2: bool = True):
@@ -179,6 +185,68 @@ def test_a_t2_is_the_action_two_steps_back_and_is_not_repeated_where_the_history
     assert torch.equal(ego[0, 10:], ring[0, [0, 2, 4]].reshape(-1))   # rows at lags 1, 3, 5
 
 
+# ---------------------------------------------------------------- without the issued actions (arm A)
+def test_the_contract_without_issued_actions_reads_only_measured_columns():
+    spec = ObsSpecV2(ego_actions=False).validate()
+    cols = ego_columns(spec)
+    assert len(cols) == spec.ego_dim == 2 + 20 * 2 == 42
+    assert [c.index for c in cols] == list(range(42))
+    assert {c.quantity for c in cols} == {"speed", "gyro_z"}
+    assert spec.prev_action_lags == () and action_columns(spec) == ()
+    # now, then the history rows 1, 3, ..., 39 steps back -- the same second the full contract reads
+    assert sorted({c.lag for c in cols}) == [0] + list(range(1, 40, 2))
+    keys = [(c.quantity, c.lag) for c in cols]
+    assert len(set(keys)) == len(keys), "two columns claim the same quantity at the same lag"
+    assert ego_mirror_signs(spec).tolist() == [1.0, -1.0] * 21
+    # the full contract's issued actions are exactly the columns this one does not have
+    full = ObsSpecV2()
+    assert len(action_columns(full)) == full.ego_dim - spec.ego_dim == 8 + 20 * 8
+    assert all(ego_columns(full)[i].quantity.startswith("action[") for i in action_columns(full))
+    text = contract_table_v2(spec)
+    assert "action[" not in text and "issued actions: none" in text
+    assert spec.ring_len == full.ring_len and spec.row_dim == full.row_dim, "one ring for both contracts"
+
+
+def test_the_two_contracts_read_one_ring_and_agree_on_every_measured_column():
+    """The same sensor values and the same issued actions: the arm-A builder's ego is the full
+    builder's with the action columns taken out, at every step from the first, and no two of its
+    columns carry the same numbers."""
+    full, a = ObsSpecV2(), ObsSpecV2(ego_actions=False)
+    warm = (full.hist_len - 1) * full.hist_stride + 1
+    e_full = _drive(ObsBuilderV2(full), warm + 60, full.act_dim)
+    e_a = _drive(ObsBuilderV2(a), warm + 60, a.act_dim)
+    dropped = set(action_columns(full))
+    keep = [i for i in range(full.ego_dim) if i not in dropped]
+    assert e_a.shape[1] == 42 and torch.equal(e_a, e_full[:, keep])
+    assert _n_distinct_columns(e_a[warm:]) == a.ego_dim
+    # the shared assembly, on a ring whose row i is i + 1 steps back: the sensor half of each row
+    ring = torch.arange(5 * 10, dtype=torch.float32).reshape(1, 5, 10)
+    feat = torch.tensor([[-1.0, -2.0]])
+    ego = assemble_ego_v2(feat, ring, hist_len=3, hist_stride=2, actions=False)
+    assert ego[0].tolist() == [-1.0, -2.0] + ring[0, [0, 2, 4], :2].reshape(-1).tolist()
+
+
+def test_a_spec_dict_older_than_ego_actions_reads_as_the_contract_it_was():
+    """Every v2 checkpoint before the copycat study recorded its spec without `ego_actions`, and every
+    one of them observed its issued actions: read back, that is the contract, whatever the default."""
+    from f1sim.learn.model_v2 import ActorCriticV2
+    old = {k: v for k, v in vars(ObsSpecV2()).items() if k != "ego_actions"}
+    assert ObsSpecV2.from_dict(old).ego_actions is True and spec_from_dict(old).ego_dim == 210
+    a = ObsSpecV2(ego_actions=False)
+    assert spec_from_dict(vars(a)) == a and spec_from_dict(vars(a)).ego_dim == 42
+    for bad in ("off", 0, None):
+        with pytest.raises(ValueError):
+            ObsSpecV2(ego_actions=bad).validate()
+    # a network rebuilt from an old meta reads 210 columns, and its meta says so from now on
+    old_meta = {k: v for k, v in vars(ObsSpecV2(n_beams=61)).items() if k != "ego_actions"}
+    m = ActorCriticV2(n_beams=61, obs=old_meta)
+    assert m.obs_spec.ego_actions is True and m.meta["obs"]["ego_actions"] is True and m.obs_spec.ego_dim == 210
+    m_a = ActorCriticV2(n_beams=61, ego_dim=42, obs=dict(vars(ObsSpecV2(n_beams=61, ego_actions=False))))
+    assert m_a.obs_spec.ego_dim == 42 and m_a.actor.ego[0].in_features == 42
+    with pytest.raises(ValueError):                    # a network that does not read the contract's width
+        ActorCriticV2(n_beams=61, obs=dict(vars(ObsSpecV2(n_beams=61, ego_actions=False))))
+
+
 # ---------------------------------------------------------------- the env (builds a simulator)
 def _env(n_frames=1, race_size=1, envs=2, **kw):
     from f1sim import Config
@@ -201,15 +269,17 @@ def _actions(env, t):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("n_frames", [1, 3])
-def test_the_env_and_the_node_build_the_same_v2_observation(n_frames):
+@pytest.mark.parametrize("n_frames,ego_actions", [(1, True), (3, True), (1, False)])
+def test_the_env_and_the_node_build_the_same_v2_observation(n_frames, ego_actions):
     from f1sim.learn import common
-    env = _env(n_frames)
+    env = _env(n_frames, ego_actions=ego_actions)
     spec = common.obs_spec(env)
-    assert isinstance(spec, ObsSpecV2) and spec.n_frames == n_frames and spec.ego_dim == 210
+    width = 210 if ego_actions else 42
+    assert isinstance(spec, ObsSpecV2) and spec.n_frames == n_frames and spec.ego_dim == width
+    assert spec.ego_actions is ego_actions and env.single_observation_space["ego"].shape == (width,)
     builder = ObsBuilderV2(spec)
     obs, _ = env.reset(seed=1)
-    assert set(obs) == {"scan", "ego"} and obs["ego"].shape == (2, 210)
+    assert set(obs) == {"scan", "ego"} and obs["ego"].shape == (2, width)
     s0, e0 = builder.build_message(env.message_inputs(0))
     assert torch.equal(e0, obs["ego"][0:1]), "the first observation's history fill differs"
     warm = n_frames - 1
@@ -229,7 +299,8 @@ def test_the_env_and_the_node_build_the_same_v2_observation(n_frames):
 
 @pytest.mark.slow
 def test_a_v2_env_refuses_what_it_cannot_observe_honestly():
-    for bad in (dict(action_mode="direct"), dict(scan_stack=4), dict(hist_len=0), dict(obs_imu=False)):
+    for bad in (dict(action_mode="direct"), dict(scan_stack=4), dict(hist_len=0), dict(obs_imu=False),
+                dict(ego_actions="off")):
         with pytest.raises(ValueError):
             _env(**bad)
     with pytest.raises(ValueError):
@@ -252,3 +323,16 @@ def test_a_reset_row_restarts_its_history_from_its_own_first_observation():
     assert torch.equal(rows[:, :, :2], ego[:, None, :2].expand(-1, 20, -1))
     assert rows[:, :, 2:].abs().sum() == 0
     assert set(info["final_obs"]) == {"scan", "ego"}
+
+
+@pytest.mark.slow
+def test_without_issued_actions_a_reset_row_restarts_from_its_first_observation_too():
+    env = _env(envs=2, max_steps=6, ego_actions=False)
+    env.reset(seed=1)
+    for t in range(6):
+        obs, _r, te, tr, info = env.step(_actions(env, t))
+    assert bool((te | tr).all())
+    ego = obs["ego"]
+    assert ego.shape == (2, 42)
+    rows = ego[:, 2:].reshape(2, 20, 2)
+    assert torch.equal(rows, ego[:, None, :2].expand(-1, 20, -1))

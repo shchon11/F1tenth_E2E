@@ -68,7 +68,8 @@ from . import common
 from . import conditioning as cond_mod
 from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
 from .dagger_v2 import (AUX_TERMS, LEARNER_CAP_PROB, LEARNER_CAP_RANGE, PERCEPTION_AUX_DEFAULTS,
-                        apply_race_defaults, cap_summary, check_balance_args, explicit_flags, make_balance)
+                        apply_race_defaults, cap_summary, check_balance_args, explicit_flags, make_balance,
+                        resolve_ego_actions)
 from .memory import reset_hidden
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
@@ -146,10 +147,13 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
 
 def env_kwargs(a) -> dict:
     """What a v2 run adds to the v1 EnvConfig fields `ppo.main` passes (the opponents' format travels
-    with the opponent flags, `opponent_config.env_kwargs`)."""
+    with the opponent flags, `opponent_config.env_kwargs`). The ego vector is the one `--init`'s
+    network reads -- with or without the issued actions (`ObsSpecV2.ego_actions`), the contract its
+    DAgger run chose -- and the contract default for a fresh network."""
     return {"obs_version": 2, "hist_stride": ObsSpecV2().hist_stride,
             "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0),
-            "learner_cap_range": tuple(a.learner_cap_range), "learner_cap_prob": float(a.learner_cap_prob)}
+            "learner_cap_range": tuple(a.learner_cap_range), "learner_cap_prob": float(a.learner_cap_prob),
+            "ego_actions": resolve_ego_actions(a)}
 
 
 def _per_km(count, dist_m: float) -> float:

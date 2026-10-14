@@ -1,0 +1,83 @@
+{
+ "/home/shchon11/f1sim_runs/v2cc_A/student_it0.pt": {
+  "recorded": {
+   "bias_v": 0.49427420645952225,
+   "mae_v": 1.0399600490927696,
+   "mae_lat": 0.11662362515926361,
+   "v_student": 4.636851012706757,
+   "v_label": 4.142576724290848
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 0.5057142227888107,
+   "mae_v": 1.042825125157833,
+   "mae_lat": 0.11682962346822023,
+   "v_student": 4.648290932178497,
+   "v_label": 4.142576724290848
+  },
+  "gains": {
+   "meas_speed_hist": 0.022879838943481445
+  },
+  "contract": {
+   "ego_dim": 42,
+   "ego_actions": false,
+   "n_action_cols": 0,
+   "n_act_speed_cols": 0,
+   "n_meas_hist_cols": 20,
+   "iter": 0
+  }
+ },
+ "/home/shchon11/f1sim_runs/v2cc_A/student_it1.pt": {
+  "recorded": {
+   "bias_v": 0.750951312482357,
+   "mae_v": 1.066378690302372,
+   "mae_lat": 0.09951340220868587,
+   "v_student": 4.89352810382843,
+   "v_label": 4.142576724290848
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 0.7837072089314461,
+   "mae_v": 1.0832814574241638,
+   "mae_lat": 0.09984744060784578,
+   "v_student": 4.926284074783325,
+   "v_label": 4.142576724290848
+  },
+  "gains": {
+   "meas_speed_hist": 0.06551194190979004
+  },
+  "contract": {
+   "ego_dim": 42,
+   "ego_actions": false,
+   "n_action_cols": 0,
+   "n_act_speed_cols": 0,
+   "n_meas_hist_cols": 20,
+   "iter": 1
+  }
+ },
+ "/home/shchon11/f1sim_runs/v2cc_A/student_it2.pt": {
+  "recorded": {
+   "bias_v": 0.4462858494371176,
+   "mae_v": 0.9071468263864517,
+   "mae_lat": 0.09825643338263035,
+   "v_student": 4.588862597942352,
+   "v_label": 4.142576724290848
+  },
+  "meas_speed_hist_plus_0.5mps": {
+   "bias_v": 0.48557238280773163,
+   "mae_v": 0.9172135144472122,
+   "mae_lat": 0.09865941014140844,
+   "v_student": 4.6281492710113525,
+   "v_label": 4.142576724290848
+  },
+  "gains": {
+   "meas_speed_hist": 0.07857334613800049
+  },
+  "contract": {
+   "ego_dim": 42,
+   "ego_actions": false,
+   "n_action_cols": 0,
+   "n_act_speed_cols": 0,
+   "n_meas_hist_cols": 20,
+   "iter": 2
+  }
+ }
+}

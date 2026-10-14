@@ -172,7 +172,7 @@ def _observation_of(path: str, model, extra: Optional[dict], env, spec):
     name = os.path.basename(str(path))
     env_v2 = getattr(env, "obs_version", 1) == 2
     if meta.get("arch") == "v2":
-        own = ObsSpecV2(**meta["obs"]).validate()
+        own = ObsSpecV2.from_dict(meta["obs"]).validate()
         if env_v2 and own == spec:
             return None, None
     elif not env_v2:

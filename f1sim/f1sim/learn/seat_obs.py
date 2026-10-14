@@ -151,8 +151,8 @@ class SeatObsV2:
     """The v2 observation (`ObsSpecV2`) of every row, as `F1VecEnv._obs_v2` builds it: the newest
     frames, and the per-step ring of [speed, gyro z, issued action] filled from an episode's first
     observation (zero actions) -- `ObsBuilderV2`'s rule, applied by `observe` to the rows `fill` marked.
-    For a v2 entry whose contract is not the env's: in a v1 env, or a v2 env with other frames or
-    history."""
+    For a v2 entry whose contract is not the env's: in a v1 env, or a v2 env with other frames,
+    history or issued-action columns (`ObsSpecV2.ego_actions`)."""
 
     version = 2
 
@@ -199,7 +199,7 @@ class SeatObsV2:
         self._fresh = torch.zeros_like(self._fresh)
         self._last_feat2 = feat
         self.obs = {"scan": self.scan_hist[:, ::s.frame_stride].clone(),
-                    "ego": assemble_ego_v2(feat, self.hist2, s.hist_len, s.hist_stride)}
+                    "ego": assemble_ego_v2(feat, self.hist2, s.hist_len, s.hist_stride, s.ego_actions)}
 
 
 def make_seat(spec, env):

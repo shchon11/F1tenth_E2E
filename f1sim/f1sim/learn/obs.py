@@ -16,8 +16,11 @@ step as the messages the graph would have carried and driving the node's builder
 Contract v2 (2026-10-14, the redesign's B1-B4; `ObsSpecV2`, `ObsBuilderV2`, `ego_columns`) is the
 second section of this file: the newest 1..3 frames, an ego vector of [speed, gyro z] now, the 8
 plan numbers issued two steps back, and 20 rows x [speed, gyro z, the 8 issued plan numbers] --
-210 columns, no column a duplicate of another -- and the grip dial as one more input. `contract_table_v2(spec)` prints the column table; v1 below
-is unchanged and is what every checkpoint without `version: 2` in its spec reads.
+210 columns, no column a duplicate of another -- and the grip dial as one more input. Its variant
+without the issued actions (`ObsSpecV2.ego_actions` False: [speed, gyro z] now and 20 rows of
+[speed, gyro z], 42 columns) is the copycat study's arm A (docs/research/copycat-2026-10-14.md).
+`contract_table_v2(spec)` prints the column table; v1 below is unchanged and is what every
+checkpoint without `version: 2` in its spec reads.
 
 `ScanAugment` adds the optional extra scan channels (`SCAN_CHANNELS`) on the policy side of that
 boundary: they are functions of the scan the env already emits, so the env, the observation spec
@@ -718,6 +721,17 @@ class ObsBuilder:
 # the action AS THE POLICY EMITTED IT -- clamped to [-1, 1], before the cap, the WP4 decode and its
 # backward braking pass -- on the car (`ObsBuilderV2.push_action` is fed the network's output) and in
 # the simulator alike. The speed columns are measured, so whatever the cap did shows up there.
+#
+# The issued actions are a contract option (`ObsSpecV2.ego_actions`), because they were measured to
+# be the copycat channel of v2 DAgger (docs/research/copycat-2026-10-14.md; the v2smoke_b smoke on
+# e3781a7): over three iterations the student's ICCAS solo completion fell 55 -> 11 -> 2 of 128 while
+# the teacher's was 127, raising the history's issued speeds by 0.5 m/s raised the output speed by
+# 0.38-0.41 m/s (a gain of 0.45-0.50 at iteration 0, 0.75-0.82 at 2), and zeroing the action columns
+# took the speed error to 1.89 m/s -- the student had learnt to repeat what it had been issuing. With
+# `ego_actions` False the ego vector is [speed, gyro z] now and the history's [speed, gyro z]: the
+# measured response stays (grip and lag are still identifiable from it), the issued intent does not.
+# The per-step ring keeps its action columns either way, so the env, `ObsBuilderV2` and the league's
+# `SeatObsV2` keep one ring layout and only `assemble_ego_v2` decides what the network reads.
 
 #: The observation contract versions. 1 is every checkpoint before 2026-10-14 (`ObsSpec`); 2 is
 #: `ObsSpecV2`. A spec dict carries `version` only from 2 on, which is how `spec_from_dict` tells them
@@ -742,6 +756,15 @@ MINPOOL_TAPS = 9
 #: history already holds (stride 1) gets no extra columns: `v2_prev_action_lags`.
 PREV_ACTION_LAGS = (2,)
 
+#: Whether a v2 ego vector carries the issued actions (a_{t-2} and every history row's plan) unless
+#: its spec says otherwise -- `ObsSpecV2.ego_actions`, `EnvConfig.ego_actions`, the trainers' default.
+EGO_ACTIONS_DEFAULT = True
+
+#: What a contract-v2 spec dict written before `ego_actions` existed meant: every v2 checkpoint up to
+#: the copycat study (2026-10-14) observed its issued actions. `ObsSpecV2.from_dict` fills it in, so
+#: changing `EGO_ACTIONS_DEFAULT` never re-reads an old checkpoint as the other contract.
+EGO_ACTIONS_LEGACY = True
+
 
 def v2_hist_lags(hist_len: int, hist_stride: int) -> Tuple[int, ...]:
     """The lags [control steps] of the v2 history rows: row j is `1 + j * hist_stride` steps back."""
@@ -761,20 +784,28 @@ def v2_ring_len(hist_len: int, hist_stride: int) -> int:
     return max((int(hist_len) - 1) * int(hist_stride) + 1, max(v2_prev_action_lags(hist_len, hist_stride), default=1))
 
 
-def v2_ego_dim(hist_len: int, hist_stride: int, act_dim: int) -> int:
-    """Width of the v2 ego vector: now, the extra action lags, the history rows."""
+def v2_ego_dim(hist_len: int, hist_stride: int, act_dim: int, actions: bool = True) -> int:
+    """Width of the v2 ego vector: now, the extra action lags, the history rows. `actions` False
+    (`ObsSpecV2.ego_actions`): now and the history's sensor columns only -- 42 for the 20 x 2."""
     n = len(EGO_SENSOR_KEYS)
+    if not actions:
+        return n + int(hist_len) * n
     return n + len(v2_prev_action_lags(hist_len, hist_stride)) * int(act_dim) + int(hist_len) * (n + int(act_dim))
 
 
-def assemble_ego_v2(feat: torch.Tensor, ring: torch.Tensor, hist_len: int, hist_stride: int) -> torch.Tensor:
+def assemble_ego_v2(feat: torch.Tensor, ring: torch.Tensor, hist_len: int, hist_stride: int,
+                    actions: bool = True) -> torch.Tensor:
     """The v2 ego vector (B, ego_dim) from this observation's sensor columns `feat` (B, 2) and the
     per-step ring (B, `v2_ring_len`, 2 + act_dim) whose row i holds [speed, gyro z, the action issued]
-    of the step i + 1 back. THE assembly: the env (`gym_env._obs_v2`) and the car's builder
-    (`ObsBuilderV2.build`) both call it, so the column order of `ego_columns` is written once."""
+    of the step i + 1 back. THE assembly: the env (`gym_env._obs_v2`), the car's builder
+    (`ObsBuilderV2.build`) and a league seat's (`seat_obs.SeatObsV2`) all call it, so the column
+    order of `ego_columns` is written once. `actions` False drops every issued-action column (the
+    extra lags and the rows' plans) and keeps the ring's sensor columns: the same ring, read less."""
     n, B = len(EGO_SENSOR_KEYS), feat.shape[0]
-    prev = [ring[:, lag - 1, n:] for lag in v2_prev_action_lags(hist_len, hist_stride)]
     rows = ring[:, 0:(int(hist_len) - 1) * int(hist_stride) + 1:int(hist_stride)]
+    if not actions:
+        return torch.cat([feat, rows[..., :n].reshape(B, -1)], 1)
+    prev = [ring[:, lag - 1, n:] for lag in v2_prev_action_lags(hist_len, hist_stride)]
     return torch.cat([feat, *prev, rows.reshape(B, -1)], 1)
 
 
@@ -803,7 +834,12 @@ class ObsSpecV2:
     `act_dim` / `speed_mode` are the plan output the action columns hold (WP4 by default,
     docs/research/output-format-2026-10-14.md); `hist_len` x `hist_stride` is the history (20 x 2 =
     the last second at 40 Hz, the length v1's history had and the one whose permutation sensitivity
-    measured 31-71 % of the action sd). The extra action lags (`PREV_ACTION_LAGS`) follow from it."""
+    measured 31-71 % of the action sd). The extra action lags (`PREV_ACTION_LAGS`) follow from it.
+    `ego_actions` False is the contract without any issued action (the copycat study's arm A); the
+    plan the policy emits is still `act_dim` wide, and the ring still records it.
+
+    A dict read back from a checkpoint goes through `from_dict` (`spec_from_dict` does), never
+    `ObsSpecV2(**d)`: a dict written before `ego_actions` existed has to mean what it meant then."""
     version: int = 2
     n_beams: int = 1081
     n_frames: int = 1
@@ -815,14 +851,24 @@ class ObsSpecV2:
     range_max: float = 10.0
     v_max: float = 10.0
     gyro_scale: float = 5.0
+    ego_actions: bool = EGO_ACTIONS_DEFAULT
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> "ObsSpecV2":
+        """The spec a checkpoint's dict (`vars(spec)`, `meta["obs"]`) describes, not validated. A dict
+        without `ego_actions` predates the field and observed its actions (`EGO_ACTIONS_LEGACY`)."""
+        d = dict(d or {})
+        d.setdefault("ego_actions", EGO_ACTIONS_LEGACY)
+        return cls(**d)
 
     @property
     def row_dim(self) -> int:
+        """Width of a ring row, [speed, gyro z, the issued action], whatever `ego_actions` reads of it."""
         return len(EGO_SENSOR_KEYS) + self.act_dim
 
     @property
     def prev_action_lags(self) -> Tuple[int, ...]:
-        return v2_prev_action_lags(self.hist_len, self.hist_stride)
+        return v2_prev_action_lags(self.hist_len, self.hist_stride) if self.ego_actions else ()
 
     @property
     def ring_len(self) -> int:
@@ -830,7 +876,7 @@ class ObsSpecV2:
 
     @property
     def ego_dim(self) -> int:
-        return v2_ego_dim(self.hist_len, self.hist_stride, self.act_dim)
+        return v2_ego_dim(self.hist_len, self.hist_stride, self.act_dim, self.ego_actions)
 
     @property
     def scan_shape(self) -> Tuple[int, int]:
@@ -840,6 +886,10 @@ class ObsSpecV2:
         from ..mpc import plan_layout
         if int(self.version) != 2:
             raise ValueError(f"ObsSpecV2 is contract version 2, got version {self.version}")
+        if not isinstance(self.ego_actions, (bool, np.bool_)):
+            # a string from a command line or a hand-written JSON ("off") is truthy, and a spec that
+            # read it as True would build the other contract without a word
+            raise ValueError(f"ego_actions is a bool, got {self.ego_actions!r}")
         if not 1 <= int(self.n_frames) <= V2_MAX_FRAMES:
             raise ValueError(f"v2 takes the newest 1..{V2_MAX_FRAMES} frames, got {self.n_frames}")
         if int(self.frame_stride) < 1 or int(self.hist_stride) < 1:
@@ -858,7 +908,7 @@ def spec_from_dict(d: dict):
     every checkpoint written before v2 existed, unchanged."""
     d = dict(d or {})
     if int(d.get("version", 1)) == 2:
-        return ObsSpecV2(**d).validate()
+        return ObsSpecV2.from_dict(d).validate()
     return ObsSpec(**d)
 
 
@@ -870,7 +920,8 @@ def ego_columns(spec: ObsSpecV2) -> list:
     the contract's stride-2 history), then the history rows. History row j (j = 0 .. hist_len-1) is
     the step `1 + j * hist_stride` control steps back: the speed and gyro z measured AT that step's
     observation and the action the policy issued FROM it. Row 0 is therefore one step back, never
-    now -- the "now" columns are the only lag-0 ones.
+    now -- the "now" columns are the only lag-0 ones. With `ego_actions` False there are no action
+    columns at all: now, then each row's speed and gyro z.
     """
     from ..mpc import plan_layout
     path = plan_layout(spec.speed_mode).path
@@ -894,6 +945,8 @@ def ego_columns(spec: ObsSpecV2) -> list:
         lag = 1 + j * int(spec.hist_stride)
         add("speed", lag, "v_max", +1.0)
         add("gyro_z", lag, "gyro_scale", -1.0)
+        if not spec.ego_actions:
+            continue
         for k in range(int(spec.act_dim)):
             add(f"action[{k}]", lag, "1 (as issued)", mirror_of(k))
     return cols
@@ -903,6 +956,13 @@ def ego_mirror_signs(spec: ObsSpecV2) -> torch.Tensor:
     """(ego_dim,) +-1: an ego vector multiplied by this is the ego vector of the mirrored world.
     For the mirror augmentation the training unit adds (the G1 gate's left-right flip)."""
     return torch.tensor([c.mirror for c in ego_columns(spec)], dtype=torch.float32)
+
+
+def action_columns(spec: ObsSpecV2) -> Tuple[int, ...]:
+    """The ego columns that hold an issued action (a_{t-2} and every history row's plan), in order;
+    () for a spec without them. What DAgger v2's action-history dropout zeroes (`--action-dropout`)
+    and what the copycat probe perturbs -- read off the table, never re-derived from a layout."""
+    return tuple(c.index for c in ego_columns(spec) if c.quantity.startswith("action["))
 
 
 def action_mirror_signs(speed_mode: str) -> torch.Tensor:
@@ -929,7 +989,11 @@ def contract_table_v2(spec: ObsSpecV2) -> str:
              f"  (in graph)  {MINPOOL_TAPS}-tap min-pool of scan[:, 0], appended as the last stem "
              f"channel; no beam-angle ramp",
              f"  dial        grip dial [mu]; the network reads c = (dial - 1.0) / 0.25 "
-             f"(conditioning.mu_to_c) as one fusion column"]
+             f"(conditioning.mu_to_c) as one fusion column",
+             "  issued actions: " + ("a_{t-2} and every history row's plan, as the policy emitted them"
+                                     if s.ego_actions else
+                                     "none -- the ego is the measured speed and gyro z only "
+                                     "(ego_actions off, docs/research/copycat-2026-10-14.md)")]
     for c in ego_columns(s):
         lines.append(f"  ego[{c.index:3d}]  {c.name:18s} / {c.norm:12s} mirror {c.mirror:+.0f}")
     return "\n".join(lines)
@@ -980,7 +1044,7 @@ class ObsBuilderV2:
         feat = torch.cat([v, gz], 1)
         if first:
             self.hist[:] = torch.cat([feat, torch.zeros(1, s.act_dim, device=self.device)], 1)[:, None, :]
-        ego = assemble_ego_v2(feat, self.hist, s.hist_len, s.hist_stride)
+        ego = assemble_ego_v2(feat, self.hist, s.hist_len, s.hist_stride, s.ego_actions)
         self._pending = feat; self._first = False
         return self.scan_hist[:, ::s.frame_stride].clone(), ego
 

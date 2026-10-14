@@ -60,6 +60,14 @@ The race it is collected in (UNIT 5b, 2026-10-14):
 * **Scripted opponents and the league plan LINEAR** (`--opponent-speed-mode`, default linear in a
   race): the measured choice of the wp4 label gates (RESULTS 7); a league checkpoint is shown its own
   observation contract (`learn.seat_obs`).
+
+The copycat study (docs/research/copycat-2026-10-14.md): three iterations on e3781a7 (v2smoke_b) made
+the student worse -- ICCAS solo completion 55 -> 11 -> 2 of 128 -- while its output speed followed the
+speeds it had issued. Two remedies are options here: `--v2-ego-actions off` (the contract without the
+issued actions, `ObsSpecV2.ego_actions`) and `--action-dropout P` (`train_v2.ActionDropout`, the action
+columns of a sequence zeroed with probability P in training only). And labels are written only for
+the rows the action drives (`label_rows`): the guard used to label all four cars of a race for the one
+row a race stores.
 """
 from __future__ import annotations
 
@@ -78,11 +86,11 @@ from . import conditioning as cond_mod
 from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
-from .obs import ObsSpecV2
-from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, BC_CLEARANCE_M, BC_CONSTANTS, AuxBalance,
-                       Mirror, accumulate_grads, actor_trunk_parameters, aux_heldout_metrics, b8_sequence_loss,
-                       bc_loss_wp4, linear_spec_of, linear_to_wp4, loss_grads, plan_clearance, select_tracks,
-                       steps_since_window_start)
+from .obs import EGO_ACTIONS_DEFAULT, ObsSpecV2
+from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, BC_CLEARANCE_M, BC_CONSTANTS, ActionDropout,
+                       AuxBalance, Mirror, accumulate_grads, actor_trunk_parameters, aux_heldout_metrics,
+                       b8_sequence_loss, bc_loss_wp4, linear_spec_of, linear_to_wp4, loss_grads, plan_clearance,
+                       select_tracks, steps_since_window_start)
 
 #: Where a v2 run's teacher labels come from (see the module docstring).
 WP4_LABEL_SOURCES = ("env", "linear-refit")
@@ -124,12 +132,17 @@ V2_DEFAULTS = {"chunk_length": 80, "seq_burn": 40}
 #: HIT_CAR returns, within 6 m of the LiDAR) are the env's (`F1VecEnv.nearest_visible_car_v2`,
 #: `beam_car_labels_v2`): nothing in them changed.
 PERCEPTION_AUX_DEFAULTS = {"aux_b8": 0.5, "aux_near_car": 0.5, "aux_beam_car": 5.0}
+#: Probability that a training sequence loses its issued-action columns (`--action-dropout`,
+#: `train_v2.ActionDropout`) unless the command line says otherwise.
+ACTION_DROPOUT = 0.0
 #: The defaults of the v2-only flags (None on the parser, so a v1 run can refuse them).
+#: `--v2-ego-actions` is not here: its default is --init's contract when there is one (`prepare_args`).
 V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "wp4_label": "env", "mirror_prob": 0.5,
                     **PERCEPTION_AUX_DEFAULTS,
                     "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
                     "aux_balance_beta": BALANCE_BETA, "bc_clearance": BC_CLEARANCE_M,
-                    "learner_cap_range": LEARNER_CAP_RANGE, "learner_cap_prob": LEARNER_CAP_PROB}
+                    "learner_cap_range": LEARNER_CAP_RANGE, "learner_cap_prob": LEARNER_CAP_PROB,
+                    "action_dropout": ACTION_DROPOUT}
 #: The auxiliary losses, by the name `sequence_losses` gives them and the coefficient key they take.
 AUX_TERMS = ("b8", "near", "beam")
 
@@ -178,6 +191,28 @@ V2_REFUSED = {"memory": "off", "scan_channels": "", "maneuver": False, "opp_toke
               "temporal_encoder": "cnn", "hist_len": 0}
 
 
+def ego_actions_of(path: str) -> bool:
+    """Whether the v2 checkpoint at `path` observes its issued actions (`ObsSpecV2.ego_actions`, a
+    checkpoint older than the field: yes). Not a v2 checkpoint: the contract default -- the trainer
+    refuses it for its own reasons, and a v1 stem seeds a fresh network either way."""
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    meta = ck.get("meta") or {}
+    if meta.get("arch") != ARCH:
+        return EGO_ACTIONS_DEFAULT
+    return bool(ObsSpecV2.from_dict(meta.get("obs") or {}).ego_actions)
+
+
+def resolve_ego_actions(a) -> bool:
+    """`a.v2_ego_actions` ("on" / "off" / None) as the bool the env is built with: what the command line
+    said, else the contract of the checkpoint `--init` continues, else `EGO_ACTIONS_DEFAULT`."""
+    said = getattr(a, "v2_ego_actions", None)
+    if said is not None:
+        if said not in ("on", "off"):
+            raise SystemExit("--v2-ego-actions is 'on' or 'off'")
+        return said == "on"
+    return ego_actions_of(a.init) if getattr(a, "init", "") else bool(EGO_ACTIONS_DEFAULT)
+
+
 def explicit_flags(ap: argparse.ArgumentParser, argv=None) -> set:
     """The dests the command line set explicitly. argparse cannot tell "given, equal to the default"
     from "not given", and a v2 default must only replace the latter: parsed once more into a
@@ -221,6 +256,12 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
         raise SystemExit("auxiliary weights are >= 0")
     if not 0.0 <= float(a.bc_clearance) < 5.0:
         raise SystemExit("--bc-clearance is a clearance in metres, >= 0 (0 switches the mask off)")
+    a.v2_ego_actions = "on" if resolve_ego_actions(a) else "off"
+    if not 0.0 <= float(a.action_dropout) <= 1.0:
+        raise SystemExit("--action-dropout is a probability")
+    if float(a.action_dropout) > 0 and a.v2_ego_actions == "off":
+        raise SystemExit("--action-dropout zeroes the ego's issued-action columns, and with --v2-ego-actions off "
+                         "there are none: pick one of the two")
     check_balance_args(a)
     applied = apply_race_defaults(a, given)
     for k, v in V2_DEFAULTS.items():
@@ -258,7 +299,8 @@ def env_kwargs(a) -> dict:
     (`opponent_speed_mode` travels with the opponent flags, `opponent_config.env_kwargs`.)"""
     return {"obs_version": 2, "hist_stride": ObsSpecV2().hist_stride,
             "opp_visibility": bool(a.aux_b8 > 0 or a.aux_near_car > 0),
-            "learner_cap_range": tuple(a.learner_cap_range), "learner_cap_prob": float(a.learner_cap_prob)}
+            "learner_cap_range": tuple(a.learner_cap_range), "learner_cap_prob": float(a.learner_cap_prob),
+            "ego_actions": a.v2_ego_actions == "on"}
 
 
 def cap_summary(cap_range, cap_prob: float, otherwise: str) -> str:
@@ -270,6 +312,21 @@ def cap_summary(cap_range, cap_prob: float, otherwise: str) -> str:
 
 
 # ------------------------------------------------------------------------------- teacher labels
+def label_rows(env) -> Optional[torch.Tensor]:
+    """The env rows a label is needed for: the cars this step's action drives (`F1VecEnv.
+    action_driven` -- the learners, and in self-play / mixed / pool races the seats the policy drives).
+    A scripted, teacher or league car's command is the env's own, so its label would be thrown away.
+    None when that is every row (solo, self-play). One host sync per step: which seats the policy
+    drives is redrawn at race resets in mixed and pool races.
+
+    Measured on v2smoke_b (512 cars, races of 4, e3781a7): labelling every car cost 0.118 s of each
+    0.56 s collection step (21 %); one row in four is the learner's."""
+    mine = env.action_driven()
+    if bool(mine.all()):
+        return None
+    return torch.nonzero(mine).flatten()
+
+
 class Wp4Labels:
     """(label (B, 8) normalised wp4, valid (B,) bool) for the env's current state, the teacher
     driving for friction `mu` (the dial's number, as `F1VecEnv.teacher_label` takes it)."""
@@ -292,16 +349,29 @@ class Wp4Labels:
             self.base = teacher
 
     @torch.no_grad()
-    def __call__(self, mu: Optional[torch.Tensor] = None):
+    def __call__(self, mu: Optional[torch.Tensor] = None, rows: Optional[torch.Tensor] = None):
+        """`rows` (R,): label those env rows only (`label_rows`); the result is still (B, 8) / (B,),
+        zero and invalid on every other row -- nothing reads them, and `step` overwrites their command."""
+        env = self.env
+        if rows is not None:
+            lab_r, valid_r = self._label(mu, rows)
+            lab = torch.zeros(env.B, lab_r.shape[1], device=lab_r.device, dtype=lab_r.dtype)
+            valid = torch.zeros(env.B, dtype=torch.bool, device=lab_r.device)
+            return lab.index_copy(0, rows.to(lab.device), lab_r), valid.index_copy(0, rows.to(lab.device), valid_r)
+        return self._label(mu, None)
+
+    def _label(self, mu, rows):
         env = self.env
         if self.source == "env":
             try:
-                lab = env.teacher_label(self.teacher, mu=mu)
+                lab = env.teacher_label(self.teacher, mu=mu, rows=rows)
             except NotImplementedError as exc:
                 raise SystemExit(f"the env's teacher does not speak wp4 on this tree ({exc}). The wp4 teachers "
                                  f"live on feat/v2; until it is merged run with --wp4-label linear-refit "
                                  f"(a stand-in for tests and smoke runs, see learn.dagger_v2).") from exc
             valid = getattr(self.teacher, "last_label_valid", None)
+            if valid is not None and valid.shape[0] != lab.shape[0]:
+                valid = None                    # a teacher that does not state validity per labelled row
         else:
             P = env.sim.P if mu is None else {**env.sim.P, "mu": mu.to(env.sim.P["mu"].dtype)}
             v = env._tracker_plan_speed()
@@ -313,6 +383,8 @@ class Wp4Labels:
             s_max = s_max.clamp(max=b.steer_max).expand_as(v)
             k_lim = 0.85 * torch.minimum(torch.full_like(v, self.spec.kappa_max), torch.tan(s_max) / wb)
             lab = linear_to_wp4(a_lin, v, self.lin, self.spec, env.ecfg.v_max_policy, k_lim=k_lim)
+            if rows is not None:
+                lab = lab[rows]                 # the stand-in refits the whole batch and is cut
             valid = None
         ok = torch.isfinite(lab).all(1)
         valid = ok if valid is None else (valid.to(ok.device).bool() & ok)
@@ -440,7 +512,9 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
             dial.redraw(new_ep)
             mu_dial = dial.value()
             c = cond_mod.mu_to_c(mu_dial, cspec).to(scan.dtype)
-            label, valid = labeler(mu=mu_dial)
+            # the stored rows are labelled, and any other row the action drives (self-play seats); a
+            # scripted or league car's label would be computed for a command `step` overwrites
+            label, valid = labeler(mu=mu_dial, rows=label_rows(env))
             student = None
             if beta < 1.0:
                 student, h = model.actor.step(scan.to(device), ego.to(device), c.to(device), h)
@@ -557,7 +631,8 @@ def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs
 
 def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: int, device, opt, log,
                  plan_spec, v_max: float, coefs: dict, mirror: Optional[Mirror], mirror_prob: float,
-                 log_every: int = 25, max_grad: float = 1.0, balance: Optional[AuxBalance] = None):
+                 log_every: int = 25, max_grad: float = 1.0, balance: Optional[AuxBalance] = None,
+                 dropout: Optional[ActionDropout] = None):
     """Truncated BPTT over sequences of `burn + chunk` steps; `batch` scored steps per update (so
     `batch // chunk` sequences). Every buffer is drawn in proportion to its valid labels, as v1.
     Returns (the last updates' mean loss, {each part's and each gradient norm's mean over the
@@ -573,7 +648,11 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
     40 + 80): a measured update costs 1.73x a plain one with B8, 2.76x with all four losses, so at
     `every` 10 the balance costs +7 % / +18 % of the training compute (UNIT 4's way of measuring --
     norms with the graph kept, then the update's own backward -- 2.31x / 3.43x). With the balance on,
-    its measurements are also the logged rows; with it off, `log_every` measures as before."""
+    its measurements are also the logged rows; with it off, `log_every` measures as before.
+
+    `dropout` (`train_v2.ActionDropout`, `--action-dropout`): after the mirror, each sequence loses its
+    issued-action columns with the dropout's probability; the share it dropped is in the summary
+    (`action_dropped_frac`)."""
     n_valid = sum(b.valid_count for b in bufs)
     log({"dagger/valid_labels": n_valid, "dagger/invalid_labels": sum(len(b) for b in bufs) - n_valid})
     if not n_valid:
@@ -596,11 +675,16 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
     hist = {k: [] for k in ("total", "bc", "bc_lat", "bc_speed", "b8", "b8_knowable", "near", "beam")}
     grads = {}
     t_measured, t_plain, n_measured = 0.0, 0.0, 0
+    n_drop, n_seq = 0.0, 0
     for i in range(steps):
         b = bufs[int(torch.multinomial(weights, 1))]
         s = b.sample(m, burn + chunk, device)
         if mirror is not None and mirror_prob > 0:
             s = mirror.apply(s, torch.rand(m, device=s["scan"].device) < mirror_prob)
+        if dropout is not None and dropout.p > 0:
+            drop = dropout.draw(m, s["ego"].device)
+            s = dropout.apply(s, drop)
+            n_drop += float(drop.float().sum()); n_seq += m
         t0 = time.perf_counter()
         eff = coefs if balance is None else balance.coefs(coefs)
         terms = sequence_losses(model, s, burn=burn, plan_spec=plan_spec, v_max=v_max, coefs=eff, beams=beams)
@@ -659,6 +743,8 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
     summary = {k: float(np.mean(v)) for k, v in hist.items() if v}
     summary.update({f"grad_{k}": float(np.mean(v)) for k, v in grads.items()})
     summary["updates"] = steps
+    if n_seq:
+        summary["action_dropped_frac"] = n_drop / n_seq
     if balance is not None:
         summary.update({f"aux_scale_{k}": v for k, v in balance.scale.items()})
         summary.update({f"aux_pull_{k}": v for k, v in balance.pull().items()})
@@ -713,11 +799,14 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
     dial = cond_mod.DialDraw(env, a.dial_margin, a.dial_exact)
     labeler = Wp4Labels(env, teacher, a.wp4_label)
     mirror = Mirror(spec) if a.mirror_prob > 0 else None
+    dropout = ActionDropout(spec, a.action_dropout) if float(a.action_dropout) > 0 else None
     plan_spec = env.tracker.spec
     v_max = float(env.ecfg.v_max_policy)
     opt = torch.optim.Adam(model.actor.parameters(), lr=a.lr)
     seq = {"burn_in": int(a.seq_burn), "chunk": int(a.chunk_length)}
-    print(f"v2 DAgger: {spec.n_frames} frame(s), ego {spec.ego_dim}, sequences burn-in {seq['burn_in']} + "
+    print(f"v2 DAgger: {spec.n_frames} frame(s), ego {spec.ego_dim} (issued actions "
+          f"{'in it' if spec.ego_actions else 'NOT in it'}), action dropout p {float(a.action_dropout):g}, "
+          f"sequences burn-in {seq['burn_in']} + "
           f"chunk {seq['chunk']}, mirror p {a.mirror_prob:g}, labels '{a.wp4_label}', aux {coefs} "
           + (f"balanced every {balance.every} updates to <= {balance.rho:g} x the imitation's trunk gradient "
              f"(EMA {balance.beta:g}) " if balance.enabled else "(no auxiliary balance) ")
@@ -757,7 +846,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         loss, parts = train_epochs(model, buffer_iters, epochs=a.epochs, batch=a.batch, burn=seq["burn_in"],
                                    chunk=seq["chunk"], device=device, opt=opt, log=log, plan_spec=plan_spec,
                                    v_max=v_max, coefs=coefs, mirror=mirror, mirror_prob=a.mirror_prob,
-                                   log_every=a.log_every, balance=balance)
+                                   log_every=a.log_every, balance=balance, dropout=dropout)
         model.eval()
         t_tr = tm.lap()
         do_eval = (it % max(1, a.eval_every) == 0) or (it == a.start_iter + a.iters - 1)
@@ -773,8 +862,9 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
             n_t = a.eval_steps if a.teacher_eval_steps is None else a.teacher_eval_steps
             if n_t:
                 with rng_island(env), env.learner_cap_suspended():
-                    teacher_metrics = common.rollout_metrics(env, lambda o: labeler()[0], n_t, a.speed_cap,
-                                                             per_track=True)
+                    # the cars the action drives only (`label_rows`); `step` overwrites every other
+                    teacher_metrics = common.rollout_metrics(env, lambda o: labeler(rows=label_rows(env))[0],
+                                                             n_t, a.speed_cap, per_track=True)
             else:
                 nan = float("nan")
                 teacher_metrics = {"collisions_per_km": nan, "collisions_per_km_worst": nan,
@@ -838,7 +928,8 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                 **({"tracker_profile_from_prediction": True} if a.tracker_profile_from_prediction else {}),
                 **({"tracker_speed_ff": True} if a.tracker_speed_ff else {}),
                 "wp4_label": a.wp4_label, "bc": dict(BC_CONSTANTS), "sequence": seq,
-                "mirror_prob": float(a.mirror_prob), "aux_coefs": coefs, "aux_balance": balance.state_dict(),
+                "mirror_prob": float(a.mirror_prob), "action_dropout": float(a.action_dropout),
+                "aux_coefs": coefs, "aux_balance": balance.state_dict(),
                 "dial": {"margin": float(a.dial_margin), "exact": float(a.dial_exact)},
                 "v2_defaults": applied, "teacher_grip": a.teacher_grip, "teacher_speed": a.teacher_speed,
                 "race": race, "collect": dict(buf.stats), "heldout": dict(held),

@@ -23,7 +23,8 @@ Why each choice, with the measurement that decided it (the redesign's ledger, se
   the ONNX export. 794 k parameters; G1's trainable copy of exactly this stem is what made occluded
   recall work (R^2 0.609).
 * B3 -- the ego vector of contract v2 (`learn.obs.ObsSpecV2`, 210 columns, none duplicated: now,
-  a_{t-2}, and 20 history rows that start with a_{t-1}'s step).
+  a_{t-2}, and 20 history rows that start with a_{t-1}'s step; 42 without the issued actions,
+  `ego_actions` False -- the copycat study's arm A, docs/research/copycat-2026-10-14.md).
 * B4 -- the dial is an ordinary input column: v1's zero-initialised additive projection existed
   only to keep a warm start bit-identical, and there is nothing to warm-start here. Not LayerNorm'd
   on its own (a one-wide LayerNorm is a constant, which would kill the dial -- a judge's catch).
@@ -395,8 +396,9 @@ class ActorCriticV2(nn.Module):
         cs = CondSpec.from_meta(cond) if cond else spec_for("dial")
         if cs.dim != 1 or int(cond_dim) != 1 or cs.source != "dial":
             raise ValueError(f"the v2 dial is one deployable input column (source 'dial'), got {cs}")
-        spec = ObsSpecV2(**obs).validate() if obs else ObsSpecV2(n_beams=n_beams, n_frames=n_frames,
-                                                                act_dim=act_dim, speed_mode=speed_mode)
+        # `from_dict`: a checkpoint written before `ego_actions` existed is read as the contract it was
+        spec = ObsSpecV2.from_dict(obs).validate() if obs else ObsSpecV2(n_beams=n_beams, n_frames=n_frames,
+                                                                        act_dim=act_dim, speed_mode=speed_mode)
         if (spec.n_beams, spec.n_frames, spec.ego_dim, spec.act_dim, spec.speed_mode) != (
                 int(n_beams), int(n_frames), int(ego_dim), int(act_dim), str(speed_mode)):
             raise ValueError(f"the observation contract {spec} does not match the network "
@@ -420,7 +422,7 @@ class ActorCriticV2(nn.Module):
 
     @property
     def obs_spec(self) -> ObsSpecV2:
-        return ObsSpecV2(**self.meta["obs"])
+        return ObsSpecV2.from_dict(self.meta["obs"])
 
     @property
     def has_memory(self) -> bool:

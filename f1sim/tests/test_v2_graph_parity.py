@@ -22,7 +22,9 @@ the measured latency). The run is one episode (soft contacts, no time limit), so
 reset nor the node's `/f1sim/reset` is inside the window; the reset rule is held separately below.
 
 The checkpoint is generated (deterministic, any machine); `F1SIM_V2_PARITY_CKPT=<path.pt>` runs the
-same comparison on a trained one (UNIT 5a ran it on UNIT 4's smoke checkpoints).
+same comparison on a trained one (UNIT 5a ran it on UNIT 4's smoke checkpoints). The contract without
+the issued actions (`ObsSpecV2.ego_actions` False, the copycat study's arm A) runs the same comparison
+on a generated checkpoint of its own.
 """
 from __future__ import annotations
 
@@ -55,6 +57,12 @@ def checkpoint(tmp_path_factory):
     return generated_v2_checkpoint(str(tmp_path_factory.mktemp("v2parity") / "student_latest.pt"))
 
 
+@pytest.fixture(scope="module")
+def checkpoint_no_actions(tmp_path_factory):
+    return generated_v2_checkpoint(str(tmp_path_factory.mktemp("v2parity_a") / "student_latest.pt"),
+                                   ego_actions=False)
+
+
 def in_process(ckpt: str, steps: int, seed: int = 3):
     """Drive the simulator with the checkpoint, the way every in-process path does (`model.act`
     with the hidden state carried, the dial's `c`, the env's own WP4 tracker): per step, the
@@ -72,7 +80,8 @@ def in_process(ckpt: str, steps: int, seed: int = 3):
     cfg = Config(); cfg.rand.enabled = False; cfg.sim.compile = False
     ec = EnvConfig(action_mode="plan", race_size=1, speed_cap=CAP, obs_version=2, scan_stack=spec.n_frames,
                    scan_stride=spec.frame_stride, hist_len=spec.hist_len, hist_stride=spec.hist_stride,
-                   v_max_policy=spec.v_max, imu_gyro_scale=spec.gyro_scale, compile_tracker=False,
+                   v_max_policy=spec.v_max, imu_gyro_scale=spec.gyro_scale, ego_actions=spec.ego_actions,
+                   compile_tracker=False,
                    collision_mode="soft", max_steps=10 ** 6, laps=10 ** 6, **common.plan_output_of(extra))
     env = common.make_env(tracks, 1, "cpu", ec, cfg=cfg, seed=seed)
     obs, _ = env.reset(seed=seed)
@@ -133,6 +142,17 @@ def graph_params(ckpt: str, ref: dict) -> dict:
 
 @pytest.mark.slow
 def test_a_v2_checkpoint_drives_the_graph_bit_identically_to_the_simulator(checkpoint, tmp_path):
+    _graph_parity(checkpoint, tmp_path)
+
+
+@pytest.mark.slow
+def test_a_v2_checkpoint_without_issued_actions_drives_the_graph_bit_identically(checkpoint_no_actions, tmp_path):
+    """The node builds the 42-wide ego of the copycat study's arm A from the same three topics."""
+    ref = _graph_parity(checkpoint_no_actions, tmp_path)
+    assert ref["model"].obs_spec.ego_dim == 42 and ref["env"].ecfg.ego_actions is False
+
+
+def _graph_parity(checkpoint, tmp_path) -> dict:
     ref = in_process(checkpoint, STEPS)
     rows = ref["rows"]
     assert len(rows) == STEPS, "the episode ended inside the window (see the module doc)"
@@ -167,11 +187,13 @@ def test_a_v2_checkpoint_drives_the_graph_bit_identically_to_the_simulator(check
         print(f"v2 graph parity: {len(rows)} steps bit-identical (plans and /drive); speed up to "
               f"{speeds.max():.2f} m/s, |steer| up to {np.abs(got[:, 0]).max():.3f} rad, "
               f"{sum(r['contact'] for r in rows)} contact steps")
+        assert policy.obs.spec == ref["model"].obs_spec, "the node built another observation contract"
     finally:
         policy.destroy_node(); controller.destroy_node()
         import rclpy
         if rclpy.ok():
             rclpy.shutdown()
+    return ref
 
 
 @pytest.mark.slow

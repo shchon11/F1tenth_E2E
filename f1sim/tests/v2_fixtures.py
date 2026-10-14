@@ -10,18 +10,21 @@ import torch
 CAP = 6.0
 
 
-def generated_v2_checkpoint(path: str) -> str:
+def generated_v2_checkpoint(path: str, ego_actions: bool = True) -> str:
     """A v2 actor-critic at the deployed 1081 beams, seeded inside a forked RNG so the suite's global
     generator is left as it was. The action head's last layer is put back to an untrained network's
-    scale (B6 builds it x 0.1, which leaves every plan near zero) so the plans visibly move."""
+    scale (B6 builds it x 0.1, which leaves every plan near zero) so the plans visibly move.
+    `ego_actions` False: the contract without the issued actions (`ObsSpecV2.ego_actions`, 42 ego
+    columns), the copycat study's arm A."""
     from f1sim.learn.model import save_checkpoint
     from f1sim.learn.model_v2 import ActorCriticV2
     from f1sim.learn.obs import ObsSpecV2
+    spec = ObsSpecV2(ego_actions=bool(ego_actions))
     with torch.random.fork_rng():
         torch.manual_seed(20261014)
-        m = ActorCriticV2(n_beams=1081)
+        m = ActorCriticV2(n_beams=1081, ego_dim=spec.ego_dim, obs=dict(vars(spec)))
         with torch.no_grad():
             m.actor.mu.weight.mul_(10.0)
-    save_checkpoint(path, m, {"spec": dict(vars(ObsSpecV2())), "phase": "dagger", "arch": "v2", "run": "tiny_v2",
+    save_checkpoint(path, m, {"spec": dict(vars(spec)), "phase": "dagger", "arch": "v2", "run": "tiny_v2",
                               "iter": 0, "iters": 1, "speed_mode": "wp4", "speed_command": "tracker", "cap": CAP})
     return path

@@ -112,6 +112,38 @@ def test_the_console_session_drives_the_v2_actor_exactly_as_model_act_does(v2_ru
 
 
 @pytest.mark.slow
+def test_the_console_drives_a_v2_actor_without_issued_actions(tmp_path):
+    """The copycat study's arm A in the console: the session's env emits the 42-wide ego the checkpoint
+    reads, and the console's actions are `model.act`'s with the state carried."""
+    from f1sim.learn.memory import Hidden
+    from f1sim.learn.obs import flatten_obs
+    from v2_fixtures import generated_v2_checkpoint
+    d = tmp_path / "tiny_v2_a"
+    d.mkdir()
+    generated_v2_checkpoint(str(d / "student_latest.pt"), ego_actions=False)
+    logs = []
+    w = _worker(logs)
+    s = w.build_session(_cfg(str(d)), 0)
+    try:
+        env, model = s["env"], s["model"]
+        assert env.obs_version == 2 and env.ecfg.ego_actions is False and model.obs_spec.ego_dim == 42
+        assert s["obs"]["ego"].shape[1] == 42
+        acted = []
+        run = s["act_fn"]
+        s["act_fn"] = lambda scan, ego: acted.append(run(scan, ego).clone()) or acted[-1]
+        h = Hidden()
+        for _ in range(40):
+            scan, ego = flatten_obs(s["obs"])
+            with torch.no_grad():
+                want, _lp, h = model.act(scan, ego, deterministic=True, c=s["dial"].c(scan.shape[0]), h=h)
+            w._step_once(s)
+            assert torch.equal(acted[-1], want), f"console action differs at step {len(acted)}"
+        assert float(env.sim.state[0, 3]) > 0.5, "the car should be moving"
+    finally:
+        w._release_session(s)
+
+
+@pytest.mark.slow
 def test_a_v2_session_takes_the_legacy_controller_only(v2_run):
     from f1sim.viewer.sim_worker import StartConfigError
     logs = []
@@ -169,6 +201,12 @@ def test_the_contract_check_names_a_switch_between_v1_and_v2():
     assert obs_spec_problems(v1_meta, ObsSpec(n_beams=61, scan_stack=3, act_dim=8), [], 8) == []
     bad = obs_spec_problems(m.meta, ObsSpecV2(n_beams=61, n_frames=2), ["actor.mu.weight"], 8)
     assert len(bad) == 2 and "스캔 프레임 수" in bad[0] and "초기값" in bad[1]
+    # the copycat study's contract without the issued actions is a different observation, named as such
+    no_act = obs_spec_problems(m.meta, ObsSpecV2(n_beams=61, ego_actions=False), [], 8)
+    assert len(no_act) == 1 and "지난 행동 열" in no_act[0]
+    # and a meta written before the field existed is the contract with them
+    old = dict(m.meta, obs={k: v for k, v in m.meta["obs"].items() if k != "ego_actions"})
+    assert obs_spec_problems(old, ObsSpecV2(n_beams=61), [], 8) == []
 
 
 # ==================================================================== the real worker process
