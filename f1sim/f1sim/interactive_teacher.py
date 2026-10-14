@@ -334,14 +334,6 @@ class InteractiveTeacher(RowPlanning):
         codes = self.base.label_grip_codes
         g.label_grip_codes = None if codes is None else rep(codes)
         g.offset_limit = self.base.offset_limit if self.lane_clamp else None
-        # The rolling start's lane hold (`teacher.LaneHold`), over the whole family: at full weight
-        # every offset candidate is the held line, so what this search chooses during a hold is a
-        # speed, not a side -- its lateral choice is handed back as the ramp lowers the weight. Only
-        # for a caller that passed an offset (the opponent command always does where a hold can
-        # happen); a label asked for without one plans unheld, as `RacelineTeacher` itself would.
-        h = getattr(self.base, "lane_hold", None)
-        hold = h if (h is not None and offset is not None and h.w.shape[0] == B) else None
-        g.lane_hold = None if hold is None else hold.rows(rep)
         a = g.plan_action(rep(state), Pt, rep(tid), v_max, spec,
                           iters=self.cand_iters, offset=off, idx=rep(idx),
                           plan_speed=None if plan_speed is None else rep(plan_geometry_speed(state, plan_speed)))
@@ -361,7 +353,7 @@ class InteractiveTeacher(RowPlanning):
         out = out.permute(1, 0, 2, 3).reshape(n_off * n_spd, B, a.shape[2])
         brake = out[self.base_index:self.base_index + 1].clone()
         brake[..., -2:] = -1.0
-        evade = self._evasion_candidates(out[self.base_index], state, P, v_max, spec, plan_speed, hold=hold)
+        evade = self._evasion_candidates(out[self.base_index], state, P, v_max, spec, plan_speed)
         # Preserve every regular index and the automatic raceline-brake index.
         out = torch.cat([out, brake, evade], 0)
         K = out.shape[0]
@@ -372,7 +364,7 @@ class InteractiveTeacher(RowPlanning):
                                              plan_speed=tile(plan_geometry_speed(state, plan_speed)))
         return final.reshape_as(out)
 
-    def _evasion_candidates(self, base, state, P, v_max, spec, plan_speed=None, hold=None):
+    def _evasion_candidates(self, base, state, P, v_max, spec, plan_speed=None):
         """Immediate left/right, each coasting or braking, then rejoin base geometry.
 
         Raceline offsets are fitted far down the road; they may all begin with
@@ -380,10 +372,6 @@ class InteractiveTeacher(RowPlanning):
         These four bounded alternatives use current axle grip and steering
         authority. The common speed projector and collision preview still decide
         whether any is usable; their existence is not a safety certificate.
-
-        `hold` (`teacher.LaneHold`, this call's rows): a held car's evasions keep the held line
-        (`base`, the held offset-0 plan) at full weight -- they stay a coast and a brake -- and
-        turn away only as the ramp lowers the weight.
         """
         speed = plan_geometry_speed(state, plan_speed).abs()
         vehicle = self.base.vehicle
@@ -414,11 +402,6 @@ class InteractiveTeacher(RowPlanning):
         coast = (2 * speed / v_max - 1).clamp(-1, 1)
         targets = torch.stack((coast, -torch.ones_like(coast), coast, -torch.ones_like(coast)))
         out[..., -2:] = targets[..., None]
-        if hold is not None:
-            w = hold.w.to(out.dtype)[None, :, None]
-            k_held = base[None, :, :N_KNOTS].expand_as(out[..., :N_KNOTS])
-            out[..., :N_KNOTS] = torch.where(w > 0, k_held + (1 - w) * (out[..., :N_KNOTS] - k_held),
-                                             out[..., :N_KNOTS])
         return out
 
     def horizon_times(self, spec: PlanSpec) -> torch.Tensor:

@@ -12,8 +12,12 @@ ten-second episodes. Broken down by how many cars the abreast row had, the hold 
 a two-car row in both measurements (16 -> 7 each) and does nothing for a row of three or four
 (16 -> 18), which is most of what an every-seat-abreast grid lays out.
 
-**Since then:** the hold is back for rows of two only, under a second test pre-registered for it
-(see "Restored for rows of two" and "PREREG 2 (two-car rows)" at the end).
+**PREREG 2 (the same hold for rows of two only): FAIL by its pre-registered test, removed again.**
+Contacts with the abreast partner in the first 2 s went 24 -> 13 raw, a ratio of 0.54 against the
+<= 0.50 it had to show (23 -> 11 charged; 21 -> 10 in the pairs themselves), while all the learner's
+car contacts went 51 -> 35 raw (4.2 -> 2.9 per learner-km; the guard passed easily) -- 352 ten-second
+episodes an arm. Every file but this note is back at 45d1113; the measured code is commit 5af1900.
+See "Restored for rows of two", "PREREG 2 (two-car rows)" and "Result 2" at the end.
 
 Branch `fix/rolling-start` (from `main` 4db62bc). Background: commit 4db62bc added a rolling start for
 teacher-driven opponents placed abreast of the learner (`EnvConfig.spawn_alongside_hold` /
@@ -237,7 +241,7 @@ row actually placed, empty seats excluded). A car of a row of three or four star
 rolling start off, bit for bit (`test_only_a_row_of_two_is_held`: race of 4 on the random grid, every
 race without a pair identical to the off arm over 2.5 s). On the boot-camp grid nearly every row is
 a pair (measurement 2: 60 of the 70 learner episodes that had a row). If the new test fails, this
-goes again, back to 45d1113.
+goes again, back to 45d1113. (It failed, and went: see "Removed again".)
 
 ## PREREG 2 (two-car rows)
 
@@ -312,3 +316,81 @@ moving the threshold.
 contact of this configuration: the unit tests (5af1900's message), a probe of the new test's grid
 (row sizes and who is held, blackbox2022_1, race of 4), the configuration capture, and a 120-step
 smoke run of the harness on seed 899, both arms, read for exit status, run time and memory only.
+
+## Result 2 (code 5af1900, measured 15:23-16:26 on the RTX 5060)
+
+Harness `drive5.py`, tables `ana5.py` (output `P3_tables.md`), raw pickles `P3_{on,off}_{811,812}.pkl`,
+all in `/tmp/claude-1000/-home-shchon11-F1tenth-E2E/d98b5699-f98e-4674-9a12-ab5a57bf35f1/scratchpad/roll2/m/`.
+Every run went its full 4400 steps (176 learner episodes each), no error. The arms laid out the same
+grids: the same 211 / 121 / 18 / 2 learner episodes with no row / a row of two / three / four, and
+160 of 163 abreast opponents at the same track station and lateral offset (within 6 mm). The OFF arm
+is the code before this branch: with the rolling start off, 5af1900 drove the boot-camp
+configuration bit for bit like 4db62bc (201 steps x 16 cars, every seat abreast and the random grid,
+the learner on zero and on random actions; states, contact and charge flags, rewards).
+
+Seeds 811 + 812 pooled, raw / charged contacts of the learner (in brackets: those with the abreast
+partner):
+
+| arm | episodes | learner-km | 0-1 s | 1-2 s | 2-4 s | 4-6 s | 6-10 s | total | abreast partner, first 2 s |
+|---|---|---|---|---|---|---|---|---|---|
+| ON | 352 | 12.25 | 4 / 3 (4 / 3) | 9 / 8 (9 / 8) | 11 / 11 (6 / 6) | 3 / 3 (1 / 1) | 8 / 7 (4 / 3) | **35 / 32** | **13 / 11** |
+| OFF | 352 | 12.22 | 17 / 16 (17 / 16) | 7 / 7 (7 / 7) | 13 / 13 (7 / 7) | 4 / 4 (2 / 2) | 10 / 7 (2 / 2) | **51 / 47** | **24 / 23** |
+
+By the size of the learner's abreast row (learner included):
+
+| arm | episodes, row of 0 / 2 / 3 / 4 | opponents held | abreast partner, first 2 s, rows of 2 · 3 · 4 | all contacts in 10 s, episodes with a row of 0 / 2 / 3 / 4 (raw) |
+|---|---|---|---|---|
+| ON | 211 / 121 / 18 / 2 | 121 (one per pair, none else) | 10 / 8 · 3 / 3 · 0 / 0 | 9 / 21 / 3 / 2 |
+| OFF | 211 / 121 / 18 / 2 | 0 | 21 / 20 · 3 / 3 · 0 / 0 | 9 / 37 / 3 / 2 |
+
+Motion toward the learner (m, median / p90 / max over the abreast opponents not yet in contact):
+
+| arm | row | opponents | 0.5 s | 1.0 s | 1.5 s | 2.0 s |
+|---|---|---|---|---|---|---|
+| ON | 2 | 121 | +0.01 / +0.11 / +0.37 | -0.00 / +0.14 / +0.53 | +0.02 / +0.13 / +0.53 | +0.09 / +0.54 / +0.75 |
+| OFF | 2 | 121 | +0.07 / +0.21 / +0.48 | +0.16 / +0.65 / +1.18 | +0.25 / +1.09 / +1.31 | +0.36 / +1.08 / +1.48 |
+| ON = OFF | 3-4 | 42 | +0.05 / +0.21 / +0.52 | +0.15 / +0.70 / +0.97 | +0.26 / +1.01 / +1.45 | +0.22 / +1.14 / +1.97 |
+
+Merge timing with the abreast partner (body gap under 0.10 m / in contact):
+
+| arm | row | opponents | merged by 1 / 2 / 2.5 s | in contact by 1 / 2 / 2.5 s | contact time median (p10-p90) | released by a prop |
+|---|---|---|---|---|---|---|
+| ON | 2 | 121 | 11 / 19 / 23 | 1 / 9 / 11 | 1.53 s (1.03-2.15) | 7 |
+| OFF | 2 | 121 | 23 / 29 / 32 | 13 / 20 / 22 | 0.89 s (0.56-1.74) | 0 |
+| ON = OFF | 3-4 | 42 | 5 / 7 / 8 | 3 / 3 / 4 | 0.50 s (0.39-1.86) | 0 |
+
+Per seed (abreast partner in the first 2 s; of it in rows of two; all contacts; raw / charged):
+811 ON 6 / 4, 4 / 2, 15 / 12 against OFF 12 / 11, 10 / 9, 23 / 20; 812 ON 7 / 7, 6 / 6, 20 / 20
+against OFF 12 / 12, 11 / 11, 28 / 27.
+
+**PASS-A: FAIL.** 13 against 24 is a ratio of 0.54 (needed <= 0.50); one-sided exact conditional
+binomial p = 0.048 for ON this low at equal rates (first-2-s exposure 1.992 / 1.980 learner-km).
+Charged 11 against 23, rows of two alone 10 against 21 -- both under half, and neither is the
+pre-registered metric. **PASS-B: PASS.** 35 against 51 contacts (2.86 against 4.17 per learner-km);
+one-sided p = 0.97 for ON this high at equal rates. **VERDICT: FAIL** (PASS-A failed).
+
+## What PREREG 2 says
+
+* **The pairs hold, and their early merges halve, as PREREG 1's split said.** A held pair's
+  opponent stays put through the hold (1 s: median -0.00 m toward the learner, p90 0.14, against
+  +0.16 / 0.65) and meets the learner later (contact 1.53 s median against 0.89 s); 11 of 121 pairs
+  were in contact by 2.5 s against 22. In the first second the learner's contacts went 17 -> 4.
+* **It missed the line it had to clear, narrowly, on the metric chosen beforehand.** The raw count
+  over every row is 13 against 24; the 3 contacts in rows of three are in both arms (unheld there,
+  those races drove alike in both: their motion and merge rows above are the same numbers), and
+  they are what holds the ratio above one half. Read on the pairs alone or on charged contacts it would
+  have passed; the test was not set up that way, and it is not re-read to pass.
+* **Nothing got worse, and the whole 10 s improved.** All contacts 51 -> 35 raw, every one of the
+  difference in the episodes with a held pair (37 -> 21; episodes with no row or a larger one: 14
+  and 14). The 1-2 s bin is the ramp (9 against 7): some merges are delayed into it, not removed.
+* Whether to test it a third time, and on what, is open; this measurement cannot be re-read to
+  decide it.
+
+## Removed again
+
+As pre-registered: the tree is back to 45d1113 in every file but this note -- the fields
+`spawn_alongside_hold` / `spawn_alongside_ramp`, the flags (console schema as 45d1113 regenerated
+it), the env's hold state, `teacher.LaneHold` and its users, the pair rule, the rollout shadow's
+copy, their tests. The code that was measured is commit 5af1900. With it removed, the tree drives
+the boot-camp configuration bit for bit like 4db62bc with its rolling start off (the same four
+201-step comparisons as above).

@@ -2251,44 +2251,6 @@
           "metavar": "M"
         },
         {
-          "flag": "--spawn-alongside-hold",
-          "flags": [
-            "--spawn-alongside-hold"
-          ],
-          "dest": "spawn_alongside_hold",
-          "label": "rolling start · 2대 나란한 줄의 상대차 위치 유지 (s)",
-          "kind": "float",
-          "item_kind": "float",
-          "default": 1.0,
-          "nargs": null,
-          "choices": null,
-          "required": false,
-          "group": "teacher·상대차",
-          "help": "[s] rolling start: a teacher-driven opponent placed alongside the learner in a row of TWO cars holds the lane position it was placed at this long, then eases onto its line over --spawn-alongside-ramp, so that the merge waits for the ramp instead of starting on the first step. A row of three or more starts unheld: measured 2026-10-14 in the boot-camp config, holding every row halved a pair's contacts with its abreast partner in the first 2 s (16 -> 7) and did nothing for rows of three or four (16 -> 18 with every seat alongside; see EnvConfig.spawn_alongside_hold). Needs opponent events (--opp-events or a slot's events): it rides on their lateral-offset channel. 0 and 0: off, the start of every run before 2026-10-14",
-          "action": "store",
-          "nullable": false,
-          "metavar": "S"
-        },
-        {
-          "flag": "--spawn-alongside-ramp",
-          "flags": [
-            "--spawn-alongside-ramp"
-          ],
-          "dest": "spawn_alongside_ramp",
-          "label": "rolling start · 라인 복귀 시간 (s)",
-          "kind": "float",
-          "item_kind": "float",
-          "default": 1.0,
-          "nargs": null,
-          "choices": null,
-          "required": false,
-          "group": "teacher·상대차",
-          "help": "[s] rolling start: how long the opponent takes to ease from its held position onto its line, linearly, after --spawn-alongside-hold",
-          "action": "store",
-          "nullable": false,
-          "metavar": "S"
-        },
-        {
           "flag": "--spawn-as-race",
           "flags": [
             "--spawn-as-race"
@@ -6302,44 +6264,6 @@
           "action": "store",
           "nullable": false,
           "metavar": "M"
-        },
-        {
-          "flag": "--spawn-alongside-hold",
-          "flags": [
-            "--spawn-alongside-hold"
-          ],
-          "dest": "spawn_alongside_hold",
-          "label": "rolling start · 2대 나란한 줄의 상대차 위치 유지 (s)",
-          "kind": "float",
-          "item_kind": "float",
-          "default": 1.0,
-          "nargs": null,
-          "choices": null,
-          "required": false,
-          "group": "teacher·상대차",
-          "help": "[s] rolling start: a teacher-driven opponent placed alongside the learner in a row of TWO cars holds the lane position it was placed at this long, then eases onto its line over --spawn-alongside-ramp, so that the merge waits for the ramp instead of starting on the first step. A row of three or more starts unheld: measured 2026-10-14 in the boot-camp config, holding every row halved a pair's contacts with its abreast partner in the first 2 s (16 -> 7) and did nothing for rows of three or four (16 -> 18 with every seat alongside; see EnvConfig.spawn_alongside_hold). Needs opponent events (--opp-events or a slot's events): it rides on their lateral-offset channel. 0 and 0: off, the start of every run before 2026-10-14",
-          "action": "store",
-          "nullable": false,
-          "metavar": "S"
-        },
-        {
-          "flag": "--spawn-alongside-ramp",
-          "flags": [
-            "--spawn-alongside-ramp"
-          ],
-          "dest": "spawn_alongside_ramp",
-          "label": "rolling start · 라인 복귀 시간 (s)",
-          "kind": "float",
-          "item_kind": "float",
-          "default": 1.0,
-          "nargs": null,
-          "choices": null,
-          "required": false,
-          "group": "teacher·상대차",
-          "help": "[s] rolling start: how long the opponent takes to ease from its held position onto its line, linearly, after --spawn-alongside-hold",
-          "action": "store",
-          "nullable": false,
-          "metavar": "S"
         },
         {
           "flag": "--spawn-as-race",
