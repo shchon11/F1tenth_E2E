@@ -373,7 +373,11 @@ def test_an_idle_hold_changes_nothing():
     s_on, s_off = run(on), run(off)
     still = ~on.roll_on.view(-1, 2).any(1).repeat_interleave(2)            # races nobody in which is held
     assert bool(still.any()) and bool((~still).any()), "the draw should give both kinds of race"
-    assert torch.equal(s_on[0], s_off[0]), "the hold drew from the generator at the reset"
+    # the same draws at the reset: every car not held exactly where it was; a held car starts lined up
+    # with its lane (`_reset_envs_core`), so only its heading differs -- and its position by the one
+    # zero-action step `reset` ends with
+    assert torch.equal(s_on[0][~on.roll_on], s_off[0][~on.roll_on]), "the hold drew from the generator at the reset"
+    assert float((s_on[0][on.roll_on, :2] - s_off[0][on.roll_on, :2]).norm(dim=1).max()) < 0.02
     for k in range(n + 1):
         assert torch.equal(s_on[k][still], s_off[k][still]), f"an unheld race diverged at step {k}"
     assert not torch.equal(s_on[-1][~still], s_off[-1][~still]), "the held races did not differ: vacuous"
