@@ -83,6 +83,20 @@ def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="[m] the narrowest lateral gap an alongside grid may take, used only where "
                          "the lane has no room for --spawn-alongside-sep. At or above it: no "
                          "fallback")
+    ap.add_argument("--spawn-alongside-hold", type=float, default=1.0, metavar="S",
+                    help="[s] rolling start: a teacher-driven opponent placed alongside the learner "
+                         "in a row of TWO cars holds the lane position it was placed at this long, "
+                         "then eases onto its line over --spawn-alongside-ramp, so that the merge "
+                         "waits for the ramp instead of starting on the first step. A row of three or "
+                         "more starts unheld: measured 2026-10-14 in the boot-camp config, holding "
+                         "every row halved a pair's contacts with its abreast partner in the first "
+                         "2 s (16 -> 7) and did nothing for rows of three or four (16 -> 18 with "
+                         "every seat alongside; see EnvConfig.spawn_alongside_hold). Needs opponent "
+                         "events (--opp-events or a slot's events): it rides on their lateral-offset "
+                         "channel. 0 and 0: off, the start of every run before 2026-10-14")
+    ap.add_argument("--spawn-alongside-ramp", type=float, default=1.0, metavar="S",
+                    help="[s] rolling start: how long the opponent takes to ease from its held "
+                         "position onto its line, linearly, after --spawn-alongside-hold")
     ap.add_argument("--spawn-as-race", choices=["on", "off"], default="on",
                     help="lay out each race as one: a car rejected at its spawn (a wall, the spawn "
                          "runway, a crate) moves the whole race along the lap with it, an alongside "
@@ -303,11 +317,14 @@ def validate(a) -> None:
                          f"order is where the learner starts relative to the other cars of its "
                          f"race, and there are none.")
     for flag, attr in (("--spawn-alongside-sep", "spawn_alongside_sep"),
-                       ("--spawn-alongside-sep-min", "spawn_alongside_sep_min")):
+                       ("--spawn-alongside-sep-min", "spawn_alongside_sep_min"),
+                       ("--spawn-alongside-hold", "spawn_alongside_hold"),
+                       ("--spawn-alongside-ramp", "spawn_alongside_ramp")):
         v = float(getattr(a, attr, 0.0))
         if not (math.isfinite(v) and v >= 0.0):
-            raise SystemExit(f"{flag} {v}: needs a finite value >= 0 (a gap in metres); a negative "
-                             f"one lays cars on top of each other.")
+            raise SystemExit(f"{flag} {v}: needs a finite value >= 0 (a gap in metres, a time in "
+                             f"seconds); a negative one lays cars on top of each other or runs a "
+                             f"rolling start backwards.")
 
 
 def env_kwargs(a) -> dict:
@@ -321,6 +338,8 @@ def env_kwargs(a) -> dict:
                 spawn_order=a.spawn_order,
                 spawn_alongside_sep=a.spawn_alongside_sep,
                 spawn_alongside_sep_min=a.spawn_alongside_sep_min,
+                spawn_alongside_hold=a.spawn_alongside_hold,
+                spawn_alongside_ramp=a.spawn_alongside_ramp,
                 spawn_as_race=a.spawn_as_race == "on",
                 spawn_alongside_gap=tuple(a.spawn_alongside_gap),
                 opp_events=a.opp_events, opp_event_rate=a.opp_event_rate,

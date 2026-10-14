@@ -12,6 +12,9 @@ ten-second episodes. Broken down by how many cars the abreast row had, the hold 
 a two-car row in both measurements (16 -> 7 each) and does nothing for a row of three or four
 (16 -> 18), which is most of what an every-seat-abreast grid lays out.
 
+**Since then:** the hold is back for rows of two only, under a second test pre-registered for it
+(see "Restored for rows of two" at the end).
+
 Branch `fix/rolling-start` (from `main` 4db62bc). Background: commit 4db62bc added a rolling start for
 teacher-driven opponents placed abreast of the learner (`EnvConfig.spawn_alongside_hold` /
 `spawn_alongside_ramp`) and measured that it did **not** reduce the abreast opponent's merge contacts
@@ -221,3 +224,17 @@ off; runs on 4db62bc's defaults had the first (non-holding) version on.
   was bit for bit the planner's own with no hold installed.
 * An idle hold changed no trajectory bit for bit; the captured teacher graph replayed the hold bit
   for bit (CUDA, every kind, through hold, ramp and after).
+
+## Restored for rows of two
+
+The post-hoc split above is the reason for a second test with its own pre-registration. The hold of
+95b069f / 788da6f is back -- `EnvConfig.spawn_alongside_hold` / `spawn_alongside_ramp` (defaults 1.0
+/ 1.0), `--spawn-alongside-hold` / `--spawn-alongside-ramp` (console schema regenerated), the env's
+hold state, `teacher.LaneHold` and its users, the rollout shadow's copy of the host count, and their
+tests -- with one change: only an abreast row of exactly two cars, the learner and one
+teacher-driven opponent, is held and lined up at the spawn (`F1VecEnv._abreast_pair`, read from the
+row actually placed, empty seats excluded). A car of a row of three or four starts as with the
+rolling start off, bit for bit (`test_only_a_row_of_two_is_held`: race of 4 on the random grid, every
+race without a pair identical to the off arm over 2.5 s). On the boot-camp grid nearly every row is
+a pair (measurement 2: 60 of the 70 learner episodes that had a row). If the new test fails, this
+goes again, back to 45d1113.

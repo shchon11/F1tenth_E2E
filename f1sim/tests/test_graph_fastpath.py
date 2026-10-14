@@ -728,3 +728,59 @@ def test_training_captures_the_opponent_planners_and_they_carry_their_state():
     finally:
         graph_runtime.release_graph_runtime(rt)
     assert "_teacher_normalized" not in env.__dict__
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="capturing a graph needs CUDA")
+def test_the_rolling_start_is_replayed_by_the_teacher_graph():
+    """The rolling start's lane hold (`teacher.LaneHold`) inside a captured teacher call: every
+    planner kind abreast of the learner, the event channel on, through the hold, the ramp and after.
+    The hold's per-car tensors are env tensors written in place every step, so the replay has to
+    follow them: each step every teacher is asked eagerly and through its graph, with the offset and
+    speed the env really hands it, and the two commands must match to the bit."""
+    from f1sim import Config
+    from f1sim.gym_env import EnvConfig
+    from f1sim.learn import common, graph_runtime
+    tracks, rls = common.load_tracks(["gen:competition:2"], racelines=True)
+    ecfg = EnvConfig(race_size=2, opponent="slots", max_steps=200,
+                     opponent_slots=[{"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", "interactive"],
+                                      "speed_scale": [0.7, 1.0], "spawn": "alongside",
+                                      "events": ["shift"], "event_rate": 1e-9}],
+                     action_mode="plan", collision_mode="soft", compile_tracker=False)
+    cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = 181
+    env = common.make_env(tracks, 16, "cuda", ecfg, cfg=cfg, seed=3, rls=rls)
+    assert env._roll_cfg and env.teacher.lane_hold is not None
+    env.reset(seed=3)
+    logs = []
+    rt = graph_runtime.prepare_graph_runtime(env, log=logs.append)
+    try:
+        tg = rt.teacher_graph
+        assert tg is not None, f"the planners were not captured: {logs}"
+        env.reset(seed=5)                                   # a fresh start, so the hold is live
+        assert bool(env.roll_on.any())
+        teachers = list(env.alt_teachers)
+        a = torch.zeros(env.B, env.act_dim, device=env.device)
+        rows_of = {id(t): (env._alt_rows[k],) for k, t in zip(env.alt_teacher_kinds, env.alt_teachers)
+                   if hasattr(t, "plan_rows")}
+        held = 0
+        for _ in range(100):                                # 2.5 s: hold, ramp and after
+            if env._roll_steps_left > 0:
+                env._rolling_start()
+            held += int((env.roll_w > 0).sum())
+            ev_off, ev_speed = env.events.lateral_offset(), env.events.speed_scale()
+            follow, v_cap = env.follow_cap(env.sim.state)
+            for t in teachers:
+                names = getattr(t, "GRAPH_STATE", ())
+                extra = rows_of.get(id(t), ())
+                snap = [getattr(t, n).clone() for n in names]
+                with torch.no_grad():
+                    want = tg._eager(t, ev_off, ev_speed, follow, v_cap, *extra)
+                    for n, v in zip(names, snap):
+                        getattr(t, n).copy_(v)
+                    got = tg(t, ev_off, ev_speed, follow, v_cap, *extra)
+                assert torch.equal(want, got), type(t).__name__
+            env.step(a)
+        assert held > 0, "nobody was held: the test would pass with the hold off"
+        assert not tg.fell_back, tg.fell_back
+    finally:
+        graph_runtime.release_graph_runtime(rt)

@@ -4,8 +4,8 @@ baseline the RL student must beat."""
 from __future__ import annotations
 
 import math
-from dataclasses import replace
-from typing import Optional
+from dataclasses import dataclass, replace
+from typing import Callable, Optional
 
 import torch
 
@@ -18,6 +18,71 @@ from .track import resample_closed
 #: lists, and it is frozen: a recorded code keeps its meaning.
 LABEL_GRIP_NAMES = ("true", "nominal", "conservative")
 LABEL_GRIP_CODE = {name: i for i, name in enumerate(LABEL_GRIP_NAMES)}
+
+
+@dataclass
+class LaneHold:
+    """A lateral position held in the lane's own coordinates: the rolling start's hold
+    (`gym_env.EnvConfig.spawn_alongside_hold`), installed on the teacher that drives the opponents.
+
+    A car with weight `w` > 0 is steered, at every point the teacher plans through -- each plan
+    point, the pure-pursuit target, the error its slowdown reads -- toward the blend
+    `w * (the held point) + (1 - w) * (the raceline offset point it was asked for)`. The held point
+    is the one at centreline offset `cl` at the same distance ahead along the CENTRELINE from the
+    car's own station, so the held line is the lane position itself and not one raceline offset (a
+    constant raceline offset follows the raceline across the lane: a car moving sideways while it
+    is meant to be still). Everything a caller adds to the offset -- the events' shifts, a planner
+    kind's own choice of side -- is inside the second term, so the hold scales all of it by `1 - w`
+    without any of them knowing, and at `w` = 0 the plan is the planner's own, bit for bit.
+
+    Measured why (2026-10-14, boot-camp config, 228 abreast opponents): the first version held one
+    raceline offset fitted at the pure-pursuit lookahead and summed it with the planners' offsets.
+    The lane clamp cut that offset at the car's own raceline point (`RacelineTeacher.clamp_offset`),
+    where the room is measured from a different raceline position -- the 83 cars cut by more than
+    5 cm moved 0.21-0.26 m toward the learner in 1 s (median, p90 0.59) -- and a planner's choice
+    rode on top of the held offset (`OffsetPlanner._merge_offset`). Here the held offset is cut
+    where it is applied, against the lane's own room at that station (`room`, the same test the
+    abreast grid was placed with), and nothing is summed with it. The raceline is not the frame
+    either: a raceline point's foot on the centreline jumps across a sharp corner (the line cuts
+    inside the bend's centre), so the held line is sampled from the car's centreline station.
+
+    A lane position is held at the speed it allows (`RacelineTeacher._hold_speed_cap`): the
+    raceline's profile is for the raceline's radius, and the inside of a bend at a fixed offset is a
+    tighter one. Driven at the profile, a car held on the inside slides out across the lane -- into
+    the car beside it. Measured (2026-10-14, blackbox2022_1): a car held 0.36 m inside a 75-degree,
+    0.8 m-radius bend at 2.9 m/s accelerated with the profile to 3.6 m/s and slid 0.6 m out in
+    0.6 s at full lock. Where the held line is tighter than the car can steer at all it is driven
+    at full lock: the hold can delay a merge, not repeal the geometry.
+
+    The held line is followed by its own arc length: the plan's path reaches its points at
+    fractions of the plan length, and on the inside of a bend the held line is shorter than the
+    centreline by the factor 1 - c kappa (16 % at 0.35 m inside a 2.3 m radius) -- points placed by
+    centreline arc there left a fit 0.5 m off them, the car 0.13 m off its lane in 0.5 s.
+
+    Per car (written in place by the env every step of a hold): `w` the weight, `cl` the centreline
+    offset held (left +), `ci` the car's centreline index (`Simulator.cl_idx`). Per station of the
+    track's resampled centreline (`TrackTensors.cl`): `cxy` (T, n, 2) the points, `ctan` (T, n, 2)
+    the unit tangents, `seg` (T,) the spacing, `room` (T, n, 2) the free lateral room left (+) /
+    right (magnitude) of the centreline for the car's body and margin, `kap` (T, n) the centreline's
+    curvature (left +)."""
+    w: torch.Tensor
+    cl: torch.Tensor
+    ci: torch.Tensor
+    cxy: torch.Tensor
+    ctan: torch.Tensor
+    seg: torch.Tensor
+    room: torch.Tensor
+    kap: torch.Tensor
+    #: The held line is walked ahead of each car in `step` centreline points a sample, `n_steps`
+    #: samples (`RacelineTeacher._hold_line`): fixed per track set, so every call has one shape.
+    step: int = 1
+    n_steps: int = 120
+
+    def rows(self, f: Callable[[torch.Tensor], torch.Tensor]) -> "LaneHold":
+        """The same hold with its per-car tensors passed through `f` -- a cut to the rows a call
+        plans for, or a tile over a candidate family; the per-station tables are shared."""
+        return LaneHold(f(self.w), f(self.cl), f(self.ci), self.cxy, self.ctan, self.seg, self.room, self.kap,
+                        self.step, self.n_steps)
 
 
 def plan_geometry_speed(state: torch.Tensor, plan_speed: Optional[torch.Tensor]) -> torch.Tensor:
@@ -99,6 +164,127 @@ class RacelineTeacher:
     #: room; a (T, N) symmetric bound is also accepted). None: no clamp, which
     #: is also what every caller that never passes `offset` sees.
     offset_limit: Optional[torch.Tensor] = None
+
+    #: The rolling start's lane hold (`LaneHold`), installed by the env only where one can happen
+    #: (`F1VecEnv.set_teacher`). It acts on a call that passes an `offset` -- the opponent command
+    #: always does there -- of the batch it was built for; a call without one, or of another size (a
+    #: label for some rows, a candidate tile), plans as if it were None. None: every call exactly as
+    #: before it existed.
+    lane_hold: Optional[LaneHold] = None
+
+    def _hold_for(self, offset: Optional[torch.Tensor], B: int) -> Optional[LaneHold]:
+        h = self.lane_hold
+        if h is None or offset is None or h.w.shape[0] != B:
+            return None
+        return h
+
+    #: [m] how far ahead a held car looks for the tightest bend of the lane position it holds, and
+    #: how finely. Braking from 6 m/s to 2.5 m/s at the profile's 4 m/s^2 takes 3.7 m; a held car
+    #: spawns at up to 3 m/s and the hold is 1 s.
+    HOLD_PREVIEW_M = 6.0
+    HOLD_PREVIEW_STEP_M = 0.25
+    #: [m] how far the car may be from its centreline index's vertex, along the lane, before the
+    #: station is read as that far and no further (the index is the last physics step's, the pose a
+    #: latency-compensated one).
+    HOLD_STATION_SLACK_M = 1.0
+
+    def _hold_station(self, h: LaneHold, tid: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
+        """(B,) each car's station on the centreline, as a fractional index of `h.cxy`."""
+        ci = h.ci
+        along = ((xy - h.cxy[tid, ci]) * h.ctan[tid, ci]).sum(-1)
+        slack = self.HOLD_STATION_SLACK_M
+        return ci.to(xy.dtype) + along.clamp(-slack, slack) / h.seg[tid]
+
+    def _hold_at(self, h: LaneHold, tid: torch.Tensor, f: torch.Tensor):
+        """(held point (..., 2), the held offset c (...), the centreline index (...), tid matching)
+        at fractional centreline index `f` (B,) or (B, M). c is `h.cl` cut to the room there."""
+        n = h.cxy.shape[1]
+        tj = tid if f.dim() == 1 else tid[:, None].expand_as(f)
+        fl = torch.floor(f)
+        i = torch.remainder(fl.long(), n)
+        t = h.ctan[tj, i]
+        p = h.cxy[tj, i] + ((f - fl) * h.seg[tj])[..., None] * t
+        cl = h.cl if f.dim() == 1 else h.cl[:, None]
+        room = h.room[tj, i]
+        c = torch.maximum(torch.minimum(cl, room[..., 0]), -room[..., 1])
+        return p + c[..., None] * torch.stack([-t[..., 1], t[..., 0]], -1), c, i, tj
+
+    def _hold_kappa(self, h: LaneHold, tid: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        """Signed curvature (left +) of the held lane position at fractional centreline index `f`:
+        the centreline's carried to the held offset c as a parallel curve, kappa / (1 - c kappa), and
+        no tighter than the car can steer -- past that, or past the bend's centre, it is a full-lock
+        bend, which is what the car will be driving."""
+        _, c, i, tj = self._hold_at(h, tid, f)
+        kc = h.kap[tj, i]
+        den = 1.0 - c * kc
+        k_car = math.tan(self.steer_max) / self.L
+        k = torch.where(den > 1e-3, kc / den.clamp_min(1e-3), torch.sign(kc) * k_car)
+        return k.clamp(-k_car, k_car)
+
+    def _hold_line(self, h: LaneHold, tid: torch.Tensor, xy: torch.Tensor):
+        """The held line ahead of each car: (points (B, K+1, 2), their arc along it from the first
+        (B, K+1), their fractional centreline index (B, K+1)) for K = `h.n_steps` samples
+        `h.step` centreline points apart, starting at the car's own station."""
+        f0 = self._hold_station(h, tid, xy)
+        k = torch.arange(h.n_steps + 1, device=xy.device, dtype=f0.dtype) * h.step
+        f = f0[:, None] + k[None]
+        pts = self._hold_at(h, tid, f)[0]
+        arc = torch.cat([torch.zeros_like(f[:, :1]), (pts[:, 1:] - pts[:, :-1]).norm(dim=-1).cumsum(1)], 1)
+        return pts, arc, f
+
+    @staticmethod
+    def _hold_sample(line, d: torch.Tensor):
+        """(points (B, M, 2), fractional centreline indices (B, M)) of the held line at arc `d`
+        (B, M) along it from the car, linearly between its samples; past the walk, its last one."""
+        pts, arc, f = line
+        K = arc.shape[1] - 1
+        j = torch.searchsorted(arc, d.contiguous()).clamp(1, K)
+        a0, a1 = arc.gather(1, j - 1), arc.gather(1, j)
+        u = ((d - a0) / (a1 - a0).clamp_min(1e-6)).clamp(0.0, 1.0)
+        p0 = pts.gather(1, (j - 1)[..., None].expand(*j.shape, 2))
+        p1 = pts.gather(1, j[..., None].expand(*j.shape, 2))
+        f0, f1 = f.gather(1, j - 1), f.gather(1, j)
+        return p0 + u[..., None] * (p1 - p0), f0 + u * (f1 - f0)
+
+    def _hold_speed_cap(self, h: LaneHold, tid: torch.Tensor, line, gb: torch.Tensor) -> torch.Tensor:
+        """(B,) the fastest a held car may go now, +inf for a car that is not held: the speed from
+        which it can still brake (at the profile's `a_brake`) to what each bend of its held lane
+        position allows over the next `HOLD_PREVIEW_M` (the profile's own lateral budget, `a_lat`
+        x grip). Divided by sqrt(w), so it fades out with the hold over the ramp."""
+        arc = line[1]
+        d = getattr(self, "_hold_preview", None)
+        if d is None or d.device != arc.device or d.dtype != arc.dtype:
+            n = int(round(self.HOLD_PREVIEW_M / self.HOLD_PREVIEW_STEP_M)) + 1
+            d = self._hold_preview = torch.arange(n, device=arc.device, dtype=arc.dtype) * self.HOLD_PREVIEW_STEP_M
+        f = self._hold_sample(line, d[None].expand(arc.shape[0], -1))[1]
+        k = self._hold_kappa(h, tid, f).abs().clamp_min(1e-3)
+        a = (self.a_lat * self.grip_levels_t[gb])[:, None]
+        v = torch.sqrt(a / k + 2.0 * self.a_brake * d[None]).amin(1)
+        return torch.where(h.w > 0, v / h.w.clamp_min(1e-6).sqrt(), torch.full_like(v, math.inf))
+
+    def _hold_cap_fn(self, h: Optional[LaneHold], tid: torch.Tensor, line, gb: torch.Tensor):
+        """`v -> v` capped by `_hold_speed_cap` on the held rows, untouched (bit for bit) on the
+        others and everywhere when there is no hold. `v` is (B,) or (B, K)."""
+        if h is None:
+            return lambda v: v
+        cap = self._hold_speed_cap(h, tid, line, gb)
+        held = h.w > 0
+
+        def apply(v):
+            if v.dim() == 2:
+                return torch.where(held[:, None], torch.minimum(v, cap[:, None]), v)
+            return torch.where(held, torch.minimum(v, cap), v)
+        return apply
+
+    def _hold_error(self, h: LaneHold, tid: torch.Tensor, held: torch.Tensor, j: torch.Tensor,
+                    offset: torch.Tensor) -> torch.Tensor:
+        """(B,) how far the blended target beside the car (the held point `held` (B, 2), raceline
+        index `j`) sits from the offset point there, along the raceline normal at `j`: what a lateral
+        error measured against the offset line is off by."""
+        tn = self.tan[tid, j]
+        n_rl = torch.stack([-tn[:, 1], tn[:, 0]], 1)
+        off_pt = self.xy[tid, j] + offset[:, None] * n_rl
+        return h.w * ((held - off_pt) * n_rl).sum(1)
 
     def __init__(self, raceline, wheelbase: float = 0.3302, device="cpu", mode: str = "pp",
                  lookahead_gain: float = 0.35, lookahead_min: float = 0.6, lookahead_max: float = 2.5,
@@ -206,6 +392,9 @@ class RacelineTeacher:
                         else (idx, (xy - self.xy[tid, idx]).norm(dim=1)))
         if offset is not None:
             offset = self.clamp_offset(offset, tid, idx)
+        hold = self._hold_for(offset, B)
+        if hold is not None:
+            line = self._hold_line(hold, tid, xy)                  # the held lane position ahead of each car
         def normal(j):                                             # left-of-travel unit normal at raceline index j
             t_ = self.tan[tid if j.dim() == 1 else tid[:, None].expand_as(j), j]
             return torch.stack([-t_[..., 1], t_[..., 0]], -1)
@@ -219,12 +408,25 @@ class RacelineTeacher:
         pts = self.xy[tid[:, None].expand_as(pidx), pidx] - xy[:, None, :]
         if offset is not None:                                     # plan through the offset line, not the raceline
             pts = pts + offset[:, None, None] * normal(pidx)
+            if hold is not None:
+                # Each plan point blended toward the held lane position the same distance ahead along
+                # the centreline (`LaneHold`). A `where` and not a plain sum, so a car with no hold
+                # plans bit for bit as before.
+                held = self._hold_sample(line, Lp[:, None] * fr[None])[0]
+                ww = hold.w[:, None, None]
+                pts = torch.where(ww > 0, pts + ww * ((held - xy[:, None, :]) - pts), pts)
         c, s_ = torch.cos(yaw), torch.sin(yaw)
         tx = pts[..., 0] * c[:, None] + pts[..., 1] * s_[:, None]
         ty = -pts[..., 0] * s_[:, None] + pts[..., 1] * c[:, None]
         # initial knots: the raceline curvature at the knot arc distances
         kidx = (idx[:, None] + ((Lp[:, None] * torch.linspace(0, 1, N_KNOTS, device=dev)[None]) / ds[:, None]).round().long()) % self.N
         k_rl = self.kappa[tid[:, None].expand_as(kidx), kidx].clone()
+        if hold is not None:
+            # a held car's own bend, not the raceline's, is where its fit starts (and what the ridge
+            # in `fit_knots` pulls towards)
+            k_h = self._hold_kappa(hold, tid, self._hold_sample(
+                line, Lp[:, None] * torch.linspace(0, 1, N_KNOTS, device=dev)[None])[1])
+            k_rl = torch.where(hold.w[:, None] > 0, k_rl + hold.w[:, None] * (k_h - k_rl), k_rl)
         # initial guess = what pure pursuit would do (its lookahead grows with speed, which is exactly the
         # gain scheduling the direct teacher's rejoin has) blended into the raceline's own curvature ahead:
         # the fit below only refines this, so an off-line car neither snaps to the line at full lock
@@ -234,6 +436,9 @@ class RacelineTeacher:
         tgt = self.xy[tid, ld_idx] - xy
         if offset is not None:
             tgt = tgt + offset[:, None] * normal(ld_idx)
+            if hold is not None:
+                held = self._hold_sample(line, ld[:, None])[0][:, 0]
+                tgt = torch.where(hold.w[:, None] > 0, tgt + hold.w[:, None] * ((held - xy) - tgt), tgt)
         alpha = torch.atan2(-tgt[:, 0] * s_ + tgt[:, 1] * c, tgt[:, 0] * c + tgt[:, 1] * s_)
         k_pp = (2.0 * torch.sin(alpha) / ld).clamp(-spec.kappa_max, spec.kappa_max)
         w = torch.clamp(1.0 - torch.linspace(0, 1, N_KNOTS, device=dev) * Lp[:, None] / ld[:, None], 0.0, 1.0)   # PP weight fades over the lookahead
@@ -253,7 +458,14 @@ class RacelineTeacher:
         v_idx1 = (idx + (Lp / ds).round().long()) % self.N
         if offset is not None:                                     # error against the offset line (see __call__)
             t0, p0 = self.tan[tid, idx], self.xy[tid, idx]
-            lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()
+            e_off = t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset
+            lat_err = e_off.abs()
+            if hold is not None:
+                # ... and against the held position where a hold applies: a car sitting on the lane
+                # position it is told to hold is not off its line, and slowed for it it would drop
+                # back out of the abreast row it is holding.
+                lat_err = torch.where(hold.w > 0, (e_off - self._hold_error(hold, tid, line[0][:, 0], idx, offset)).abs(),
+                                      lat_err)
         slow = (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)     # off the line: slow down, like the direct teacher
         v0 = self.speed_at(tid, v_idx0, gb) * slow; v1 = self.speed_at(tid, v_idx1, gb) * slow
         if self.speed_lead_s is not None:
@@ -278,9 +490,10 @@ class RacelineTeacher:
             dv = self.speed_error_gain * (v0 - vx.abs())
             v0 = (v0 + dv).clamp(0.0, v_max); v1 = (v1 + dv).clamp(0.0, v_max)
         cap = self.heading_speed_cap(yaw, tid, idx)
+        hc = self._hold_cap_fn(hold, tid, line if hold is not None else None, gb)   # a held car: what its lane position allows
         if spec.speed_mode == "knots":                             # the profile itself, at the curvature knots
             vk = self.speed_at(tid[:, None].expand_as(kidx), kidx, gb[:, None].expand_as(kidx)) * slow[:, None]
-            return encode_knots(k, vk if cap is None else torch.minimum(vk, cap[:, None]), v_max, spec,
+            return encode_knots(k, hc(vk if cap is None else torch.minimum(vk, cap[:, None])), v_max, spec,
                                 v_meas=geometry_speed)
         if spec.speed_mode == "budget":
             # The grip budget is the floor's and this teacher's global pace only; every reason to go
@@ -293,8 +506,8 @@ class RacelineTeacher:
             frac = torch.linspace(0.0, 1.0, 9, device=span.device)[None]
             i_s = (v_idx0[:, None] + (span * frac).round().long()) % self.N
             v_top = (self.speed_at(tid[:, None].expand_as(i_s), i_s, gb[:, None].expand_as(i_s)).amax(1)) * slow
-            v_cap = v_top if cap is None else torch.minimum(v_top, cap)
-            v_end = v1 if cap is None else torch.minimum(v1, cap)
+            v_cap = hc(v_top if cap is None else torch.minimum(v_top, cap))
+            v_end = hc(v1 if cap is None else torch.minimum(v1, cap))
             return encode_budget(k, a_hat.expand_as(v0) if torch.is_tensor(a_hat) else torch.full_like(v0, a_hat),
                                  v_end, v_cap, v_max, spec, v_meas=geometry_speed)
         if spec.speed_mode in ("timed", "tspeed"):
@@ -313,6 +526,7 @@ class RacelineTeacher:
                 tgt = self.speed_at(tid, ahead, gb) * slow
                 if cap is not None:
                     tgt = torch.minimum(tgt, cap)
+                tgt = hc(tgt)
                 drive = spec.a_drive_profile * (spec.v_switch_profile / v.clamp_min(1e-3)).clamp(max=1.0)
                 acc = ((tgt - v) / dt).clamp(min=-self.a_brake)
                 acc = torch.minimum(acc, drive)
@@ -341,10 +555,15 @@ class RacelineTeacher:
             if cap is not None:
                 scale = scale * (torch.minimum(v0, cap) / v0.clamp_min(1e-3))
                 v1 = torch.minimum(v1, cap)
+            if hold is not None:
+                v0h = v0 if cap is None else torch.minimum(v0, cap)
+                scale = torch.where(hold.w > 0, scale * (hc(v0h) / v0h.clamp_min(1e-3)), scale)
+                v1 = hc(v1)
             return encode_envelope(k, self.a_lat * self.grip_levels_t[gb] * scale ** 2, v1, v_max, spec,
                                    v_meas=geometry_speed)
         if cap is not None:
             v0 = torch.minimum(v0, cap); v1 = torch.minimum(v1, cap)
+        v0, v1 = hc(v0), hc(v1)
         action = encode(k, v0, v1, v_max, spec, v_meas=geometry_speed)
         if getattr(self, '_defer_profile_projection', False) or not self.certify_speeds:
             return action  # interactive generation certifies after endpoint replacement/scaling
@@ -515,14 +734,22 @@ class RacelineTeacher:
             xy = xy + torch.stack([vx * torch.cos(yaw_c), vx * torch.sin(yaw_c)], 1) * dt_c[:, None]
             yaw = yaw_c
         idx, lat_err = self.project(xy, tid)
+        hold, hold_e = None, None
         if offset is not None:
             # The offset line is the raceline displaced along its own normal, so the car's error
             # against it is its signed error against the raceline minus the offset -- and the
             # off-line speed slowdown below has to read *that*, or a car sitting perfectly on a
             # 0.35 m offset would be told it is 0.35 m off and slowed for it every step it holds.
             offset = self.clamp_offset(offset, tid, idx)
+            hold = self._hold_for(offset, xy.shape[0])
             t0, p0 = self.tan[tid, idx], self.xy[tid, idx]
-            lat_err = (t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset).abs()
+            e_off = t0[:, 0] * (xy[:, 1] - p0[:, 1]) - t0[:, 1] * (xy[:, 0] - p0[:, 0]) - offset
+            lat_err = e_off.abs()
+            if hold is not None:
+                # the same against the held lane position (`LaneHold`), where a hold applies
+                line = self._hold_line(hold, tid, xy)
+                hold_e = self._hold_error(hold, tid, line[0][:, 0], idx, offset)
+                lat_err = torch.where(hold.w > 0, (e_off - hold_e).abs(), lat_err)
         ds = self.ds[tid]
         if self.mode == "pp":
             ld = (self.k_ld * vx.abs()).clamp(self.ld_min, self.ld_max)
@@ -531,6 +758,9 @@ class RacelineTeacher:
             if offset is not None:
                 tn = self.tan[tid, tgt_idx]
                 tgt = tgt + offset[:, None] * torch.stack([-tn[:, 1], tn[:, 0]], 1)   # normal, left +
+                if hold is not None:
+                    held = self._hold_sample(line, ld[:, None])[0][:, 0]
+                    tgt = torch.where(hold.w[:, None] > 0, tgt + hold.w[:, None] * (held - tgt), tgt)
             dx, dy = tgt[:, 0] - xy[:, 0], tgt[:, 1] - xy[:, 1]
             alpha = torch.atan2(dy, dx) - yaw
             alpha = torch.remainder(alpha + math.pi, 2 * math.pi) - math.pi
@@ -541,6 +771,8 @@ class RacelineTeacher:
                 t = self.tan[tid, idx]; p = self.xy[tid, idx]
                 e = t[:, 0] * (xy[:, 1] - p[:, 1]) - t[:, 1] * (xy[:, 0] - p[:, 0])
                 e = e if offset is None else e - offset
+                if hold is not None:
+                    e = torch.where(hold.w > 0, e - hold_e, e)
                 steer = steer - torch.atan(self.k_e_pp * e / (vx.abs() + self.v_soft))
         else:
             front = xy + self.L * torch.stack([torch.cos(yaw), torch.sin(yaw)], 1)
@@ -548,6 +780,9 @@ class RacelineTeacher:
             t = self.tan[tid, fidx]; p = self.xy[tid, fidx]
             e = t[:, 0] * (front[:, 1] - p[:, 1]) - t[:, 1] * (front[:, 0] - p[:, 0])      # left of the line +
             e = e if offset is None else e - offset          # error against the offset line, same normal
+            if hold is not None:
+                front_held = self._hold_sample(line, torch.full_like(vx, self.L)[:, None])[0][:, 0]
+                e = torch.where(hold.w > 0, e - self._hold_error(hold, tid, front_held, fidx, offset), e)
             psi = torch.atan2(t[:, 1], t[:, 0]) - yaw
             psi = torch.remainder(psi + math.pi, 2 * math.pi) - math.pi
             k_idx = (fidx + ((vx.abs() * self.ff_time) / ds).round().long()) % self.N
@@ -556,11 +791,13 @@ class RacelineTeacher:
             steer = ff + self.k_psi * psi - torch.atan(self.k_e * e / (vx.abs() + self.v_soft))
         steer = steer.clamp(-self.steer_max, self.steer_max)
         v_idx = (idx + ((vx.abs() * self.t_v) / ds).round().long()) % self.N
-        v_cmd = self.speed_at(tid, v_idx, self.grip_bin(P, xy.shape[0], xy.device))
+        gb = self.grip_bin(P, xy.shape[0], xy.device)
+        v_cmd = self.speed_at(tid, v_idx, gb)
         v_cmd = v_cmd * (1.0 - self.lat_slow * lat_err).clamp(0.3, 1.0)   # slow down when off-line
         cap = self.heading_speed_cap(yaw, tid, idx)
         if cap is not None:
             v_cmd = torch.minimum(v_cmd, cap)
+        v_cmd = self._hold_cap_fn(hold, tid, line if hold is not None else None, gb)(v_cmd)   # a held car: what its lane position allows
         if P is not None:
             v_cmd = v_cmd / P["speed_gain"]
             steer = ((steer - P["steer_bias"]) / P["steer_gain"]).clamp(-self.steer_max, self.steer_max)
