@@ -19,8 +19,15 @@ The redesign's stage 2 (docs/research/architecture-redesign-2026-10-13.md 6장 2
   nearest-visible-car and per-beam heads behind their own coefficients.
 * **Left-right mirroring**, p = `--mirror-prob` (0.5) per sequence (`train_v2.Mirror`; G1's
   appendix-2 correction: the flip took the visible lateral error p50 from 0.138 to 0.097 m).
-* **Per-loss gradient norms** on the shared trunk (BC vs B8 vs the others), every `--log-every`
-  updates.
+* **Per-loss gradient norms** on the shared trunk (BC vs B8 vs the others) and the **auxiliary
+  balance** (`train_v2.AuxBalance`): every `--aux-balance-every` (10) updates each auxiliary's
+  multiplier is set from those norms so that it pulls the trunk at most `--aux-balance-rho` (0.5) x
+  the imitation loss -- UNIT 4's smoke measured B8 at 1.8x and the nearest-car head at 4.8x the
+  imitation's pull. A measured update is assembled from the per-loss gradients themselves
+  (`train_v2.accumulate_grads`), so measuring costs one backward pass per auxiliary rather than one
+  per loss plus the update's own (+7 % of the training compute with B8 at every 10, see
+  `train_epochs`). With the balance off (`--aux-balance-every 0`) the norms are measured every
+  `--log-every` updates, as before.
 
 Teacher labels. A v2 run speaks WP4. `--wp4-label env` asks the env's teacher-label API
 (`F1VecEnv.teacher_label`), which is where the wp4-speaking teachers of feat/v2 plug in; on a tree
@@ -51,9 +58,9 @@ from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
 from .obs import ObsSpecV2
-from .train_v2 import (BC_CONSTANTS, Mirror, actor_trunk_parameters, b8_sequence_loss, bc_loss_wp4,
-                       linear_spec_of, linear_to_wp4, loss_grad_norms, select_tracks,
-                       steps_since_window_start)
+from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, BC_CONSTANTS, AuxBalance, Mirror,
+                       accumulate_grads, actor_trunk_parameters, b8_sequence_loss, bc_loss_wp4, linear_spec_of,
+                       linear_to_wp4, loss_grads, select_tracks, steps_since_window_start)
 
 #: Where a v2 run's teacher labels come from (see the module docstring).
 WP4_LABEL_SOURCES = ("env", "linear-refit")
@@ -63,7 +70,11 @@ WP4_LABEL_SOURCES = ("env", "linear-refit")
 V2_DEFAULTS = {"chunk_length": 80, "seq_burn": 40}
 #: The defaults of the v2-only flags (None on the parser, so a v1 run can refuse them).
 V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "wp4_label": "env", "mirror_prob": 0.5,
-                    "aux_b8": 0.5, "aux_near_car": 0.0, "aux_beam_car": 0.0}
+                    "aux_b8": 0.5, "aux_near_car": 0.0, "aux_beam_car": 0.0,
+                    "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
+                    "aux_balance_beta": BALANCE_BETA}
+#: The auxiliary losses, by the name `sequence_losses` gives them and the coefficient key they take.
+AUX_TERMS = ("b8", "near", "beam")
 
 #: v1 options a v2 run cannot honour, with the value that means "not asked for". Refused rather than
 #: ignored: a run that names an option and then runs without it looks like evidence it did nothing.
@@ -114,6 +125,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
                          f"{a.teacher_kind} teacher's search would be silently dropped")
     if min(a.aux_b8, a.aux_near_car, a.aux_beam_car) < 0:
         raise SystemExit("auxiliary weights are >= 0")
+    check_balance_args(a)
     applied = {}
     for k, v in V2_DEFAULTS.items():
         if k not in given:
@@ -125,6 +137,23 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     if int(a.seq_burn) < 0 or int(a.chunk_length) < 1:
         raise SystemExit("--seq-burn must be >= 0 and --chunk-length >= 1")
     return applied
+
+
+def check_balance_args(a) -> None:
+    """`--aux-balance-*`, shared by both v2 trainers (`ppo_v2.prepare_args` calls it too)."""
+    if int(a.aux_balance_every) < 0:
+        raise SystemExit("--aux-balance-every is a number of updates (0 switches the balance off)")
+    if not (math.isfinite(float(a.aux_balance_rho)) and float(a.aux_balance_rho) > 0):
+        raise SystemExit("--aux-balance-rho is a positive ratio of gradient norms")
+    if not 0.0 <= float(a.aux_balance_beta) < 1.0:
+        raise SystemExit("--aux-balance-beta is an EMA weight in [0, 1)")
+
+
+def make_balance(a, main: str, active) -> AuxBalance:
+    """The run's `AuxBalance` over the auxiliaries that train (`active`, names as the trainer keys
+    them), from the `--aux-balance-*` flags."""
+    return AuxBalance(main, [k for k in AUX_TERMS if k in active], every=int(a.aux_balance_every),
+                      rho=float(a.aux_balance_rho), beta=float(a.aux_balance_beta))
 
 
 def env_kwargs(a) -> dict:
@@ -350,12 +379,23 @@ def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs
 
 def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: int, device, opt, log,
                  plan_spec, v_max: float, coefs: dict, mirror: Optional[Mirror], mirror_prob: float,
-                 log_every: int = 25, max_grad: float = 1.0):
+                 log_every: int = 25, max_grad: float = 1.0, balance: Optional[AuxBalance] = None):
     """Truncated BPTT over sequences of `burn + chunk` steps; `batch` scored steps per update (so
     `batch // chunk` sequences). Every buffer is drawn in proportion to its valid labels, as v1.
     Returns (the last updates' mean loss, {each part's and each gradient norm's mean over the
     iteration}) -- the summary goes into the iteration's progress record, so a run that logs nowhere
-    else still says what B8 weighed against the imitation."""
+    else still says what B8 weighed against the imitation.
+
+    `balance` (`train_v2.AuxBalance`, main loss "bc"): on the updates it is due, each loss's gradient
+    is taken on its own (`train_v2.loss_grads`), the norms on the shared trunk set the multipliers,
+    and the update's gradient is ASSEMBLED from those per-loss gradients with the multipliers now in
+    force -- the same gradient `total.backward()` would give (up to the order of the float sums), one
+    backward pass per loss and none more. Every other update is the plain backward of the total at
+    the multipliers in force. Measured on the CPU at the deployed shapes (1081 beams, 4 sequences of
+    40 + 80): a measured update costs 1.73x a plain one with B8, 2.76x with all four losses, so at
+    `every` 10 the balance costs +7 % / +18 % of the training compute (UNIT 4's way of measuring --
+    norms with the graph kept, then the update's own backward -- 2.31x / 3.43x). With the balance on,
+    its measurements are also the logged rows; with it off, `log_every` measures as before."""
     n_valid = sum(b.valid_count for b in bufs)
     log({"dagger/valid_labels": n_valid, "dagger/invalid_labels": sum(len(b) for b in bufs) - n_valid})
     if not n_valid:
@@ -374,42 +414,83 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
     trunk = actor_trunk_parameters(model.actor)
     params = [p for p in model.actor.parameters() if p.requires_grad]
     beams = coefs.get("beam", 0.0) > 0
+    active = [k for k in AUX_TERMS if coefs.get(k, 0.0) > 0]
     hist = {k: [] for k in ("total", "bc", "bc_lat", "bc_speed", "b8", "b8_knowable", "near", "beam")}
     grads = {}
+    t_measured, t_plain, n_measured = 0.0, 0.0, 0
     for i in range(steps):
         b = bufs[int(torch.multinomial(weights, 1))]
         s = b.sample(m, burn + chunk, device)
         if mirror is not None and mirror_prob > 0:
             s = mirror.apply(s, torch.rand(m, device=s["scan"].device) < mirror_prob)
-        terms = sequence_losses(model, s, burn=burn, plan_spec=plan_spec, v_max=v_max, coefs=coefs, beams=beams)
+        t0 = time.perf_counter()
+        eff = coefs if balance is None else balance.coefs(coefs)
+        terms = sequence_losses(model, s, burn=burn, plan_spec=plan_spec, v_max=v_max, coefs=eff, beams=beams)
         loss = terms["total"]
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite DAgger v2 loss at step {i}: " +
                                ", ".join(f"{k} {float(v):.4g}" for k, v in terms.items()))
+        due = balance is not None and balance.due()
+        # With the balance on, its measurements are the logged ones too (a row every `every` updates):
+        # a measured update costs 1.7x a plain one with B8 (2.8x with all four losses, CPU at 1081
+        # beams), so measuring again on --log-every's own schedule would add a third of that again.
+        measure = due if (balance is not None and balance.enabled) else i % log_every == 0
         gn = None
-        if i % log_every == 0:
-            # each loss's pull on the trunk the losses share (before the optimiser step), so a
-            # B8 that cannot move the memory -- or swamps the imitation -- shows as a number
-            gn = loss_grad_norms({k: (coefs.get(k, 1.0) if k != "bc" else 1.0) * terms[k]
-                                  for k in ("bc", "b8", "near", "beam") if terms[k].requires_grad}, trunk)
         opt.zero_grad()
-        loss.backward()
+        if measure:
+            # each loss's pull on the trunk the losses share, before the optimiser step: the
+            # auxiliaries at their configured coefficient, BEFORE the balance's multiplier -- the
+            # number the multiplier is computed from, and the one UNIT 4's logs carry
+            parts = {"bc": terms["bc"], **{k: coefs[k] * terms[k] for k in active if terms[k].requires_grad}}
+            gn, per = loss_grads(parts, params, norm_params=trunk, retain=False)
+            if due:
+                balance.observe(gn)
+            w = {"bc": 1.0, **{k: (1.0 if balance is None else balance.scale.get(k, 1.0)) for k in active}}
+            accumulate_grads(params, per, w)
+            loss = terms["bc"].detach() + sum(w[k] * parts[k].detach() for k in parts if k != "bc")
+            terms["total"] = loss
+        else:
+            loss.backward()
         total_gn = torch.nn.utils.clip_grad_norm_(params, max_grad)
         opt.step()
+        if balance is not None:
+            balance.tick()
+        if device.type == "cuda":
+            # free: the loss read-out below waits for the device anyway, and without it a plain
+            # update's clock would stop before its kernels ran
+            torch.cuda.synchronize()
+        if gn is not None:
+            t_measured += time.perf_counter() - t0; n_measured += 1
+        else:
+            t_plain += time.perf_counter() - t0
         for k in hist:
             hist[k].append(float(terms[k].detach()))
         if gn is not None:
             gn["total_clip_input"] = float(total_gn)
             for k, v in gn.items():
                 grads.setdefault(k, []).append(v)
-            row = {f"dagger/{k}": float(np.mean(v[-log_every:])) for k, v in hist.items()}
+            span = balance.every if (balance is not None and balance.enabled) else log_every
+            row = {f"dagger/{k}": float(np.mean(v[-span:])) for k, v in hist.items()}
             row.update({f"dagger/grad_{k}": v for k, v in gn.items()})
+            if balance is not None:
+                row.update({f"dagger/aux_scale_{k}": v for k, v in balance.scale.items()})
+                row.update({f"dagger/aux_pull_{k}": v for k, v in balance.pull().items()})
             row.update({"dagger/train_step": i, "dagger/lr": opt.param_groups[0]["lr"]})
             log(row)
     log({"dagger/optimizer_updates": steps})
     summary = {k: float(np.mean(v)) for k, v in hist.items() if v}
     summary.update({f"grad_{k}": float(np.mean(v)) for k, v in grads.items()})
     summary["updates"] = steps
+    if balance is not None:
+        summary.update({f"aux_scale_{k}": v for k, v in balance.scale.items()})
+        summary.update({f"aux_pull_{k}": v for k, v in balance.pull().items()})
+    # what measuring cost, from this iteration's own clocks: a measured update against a plain one,
+    # both from the forward to the optimiser step (sampling and mirroring are outside either)
+    n_plain = steps - n_measured
+    if n_measured and n_plain:
+        summary["measure_update_s"] = t_measured / n_measured
+        summary["plain_update_s"] = t_plain / n_plain
+        summary["measure_overhead_frac"] = (t_measured - n_measured * t_plain / n_plain) / max(1e-9, t_measured + t_plain)
     return float(np.mean(hist["total"][-500:])), summary
 
 
@@ -423,6 +504,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
     coefs = {"b8": float(a.aux_b8), "near": float(a.aux_near_car), "beam": float(a.aux_beam_car)}
     aux = aux_spec(b8=coefs["b8"] > 0, beam_car=coefs["beam"] > 0, near_car=coefs["near"] > 0)
     priv_dim = int(env.privileged_v2(env.reset()[1] and env.last_result).shape[1])
+    balance = make_balance(a, "bc", [k for k in AUX_TERMS if coefs[k] > 0])
     if a.init:
         ck_meta = (torch.load(a.init, map_location="cpu", weights_only=True).get("meta") or {})
         if ck_meta.get("arch") != ARCH:
@@ -435,6 +517,12 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
               f"heads {want}, fresh: {[k for k, v in want.items() if v and not have.get(k)]}", flush=True)
         if model.obs_spec != spec:
             raise SystemExit(f"--init's observation contract {model.obs_spec} is not this env's {spec}")
+        if extra.get("phase") == "dagger" and extra.get("aux_balance"):
+            # the multipliers the student was being trained with; a fresh balance would re-measure
+            # from 1 and let the auxiliaries pull at full weight until its first measurement
+            balance.load_state_dict(extra["aux_balance"])
+            print(f"auxiliary balance restored: {balance.scale} after {balance.measurements} measurements",
+                  flush=True)
     else:
         model = ActorCriticV2(n_beams=spec.n_beams, n_frames=spec.n_frames, ego_dim=spec.ego_dim,
                               act_dim=spec.act_dim, speed_mode=spec.speed_mode, priv_dim=priv_dim,
@@ -453,7 +541,9 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
     seq = {"burn_in": int(a.seq_burn), "chunk": int(a.chunk_length)}
     print(f"v2 DAgger: {spec.n_frames} frame(s), ego {spec.ego_dim}, sequences burn-in {seq['burn_in']} + "
           f"chunk {seq['chunk']}, mirror p {a.mirror_prob:g}, labels '{a.wp4_label}', aux {coefs} "
-          f"| v2 defaults applied: {applied or 'none'}", flush=True)
+          + (f"balanced every {balance.every} updates to <= {balance.rho:g} x the imitation's trunk gradient "
+             f"(EMA {balance.beta:g}) " if balance.enabled else "(no auxiliary balance) ")
+          + f"| v2 defaults applied: {applied or 'none'}", flush=True)
     run_ = common.wandb_init(a.name, vars(a) | {"phase": "dagger", "arch": ARCH, "tracks": names,
                                                 "teacher_desc": teacher_desc, "v2_defaults": applied},
                              group="dagger", mode=a.wandb)
@@ -475,7 +565,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         loss, parts = train_epochs(model, buffer_iters, epochs=a.epochs, batch=a.batch, burn=seq["burn_in"],
                                    chunk=seq["chunk"], device=device, opt=opt, log=log, plan_spec=plan_spec,
                                    v_max=v_max, coefs=coefs, mirror=mirror, mirror_prob=a.mirror_prob,
-                                   log_every=a.log_every)
+                                   log_every=a.log_every, balance=balance)
         model.eval()
         t_tr = tm.lap()
         do_eval = (it % max(1, a.eval_every) == 0) or (it == a.start_iter + a.iters - 1)
@@ -521,7 +611,12 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         print("  losses " + " ".join(f"{k} {parts[k]:.4f}" for k in ("bc_lat", "bc_speed", "b8", "near", "beam")
                                      if k in parts)
               + f" | B8 knowable {parts.get('b8_knowable', float('nan')):.2f} | trunk grad norms "
-              + " ".join(f"{k[5:]} {v:.3g}" for k, v in parts.items() if k.startswith("grad_")), flush=True)
+              + " ".join(f"{k[5:]} {v:.3g}" for k, v in parts.items() if k.startswith("grad_"))
+              + (" | aux scale " + " ".join(f"{k[10:]} {v:.3g}" for k, v in parts.items() if k.startswith("aux_scale_"))
+                 + " pull/bc " + " ".join(f"{k[9:]} {v:.2f}" for k, v in parts.items() if k.startswith("aux_pull_"))
+                 if balance.enabled else "")
+              + (f" | measuring {100 * parts['measure_overhead_frac']:.1f} % of training time"
+                 if "measure_overhead_frac" in parts else ""), flush=True)
         print(f"iter {it}: beta {beta:.2f} samples {n_samples} loss {loss:.4f} | {stud} | teacher "
               f"{teacher_metrics['collisions_per_km']:.1f} coll/km lap {teacher_metrics['lap_time_s']:.1f} s | "
               f"{t_col:.0f}+{t_tr:.0f}+{t_ev:.0f}+{t_teach:.0f} s", flush=True)
@@ -535,7 +630,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                 **({"tracker_profile_from_prediction": True} if a.tracker_profile_from_prediction else {}),
                 **({"tracker_speed_ff": True} if a.tracker_speed_ff else {}),
                 "wp4_label": a.wp4_label, "bc": dict(BC_CONSTANTS), "sequence": seq,
-                "mirror_prob": float(a.mirror_prob), "aux_coefs": coefs,
+                "mirror_prob": float(a.mirror_prob), "aux_coefs": coefs, "aux_balance": balance.state_dict(),
                 "dial": {"margin": float(a.dial_margin), "exact": float(a.dial_exact)},
                 "v2_defaults": applied, "teacher_grip": a.teacher_grip, "teacher_speed": a.teacher_speed}
         save_checkpoint(os.path.join(out, f"student_it{it}.pt"), model, meta)

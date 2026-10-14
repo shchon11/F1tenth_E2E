@@ -11,7 +11,15 @@ decisions that are not reopened here:
   norm of 1.6k-31k set the actor's clip factor) with Adam eps 1e-8, each with its own learning rate
   (actor 2e-5 -> 1e-5, critic 3e-4, the redesign's numbers).
 * **No value clip** (`--vf-clip 0`, e39b34c) and **value normalisation** (`train_v2.ValueNorm`): the
-  critic learns normalised returns, the GAE reads de-normalised values.
+  critic learns normalised returns, the GAE reads de-normalised values, and every statistics update
+  rescales the value head's last layer (PopArt) so the critic's de-normalised values survive it --
+  checked live on the log updates (`value_norm/popart_max_dev`).
+* **The auxiliary balance** (`train_v2.AuxBalance`, main loss = the policy gradient): every
+  `--aux-balance-every` (10) updates the per-loss trunk gradient norms set each auxiliary's
+  multiplier so it pulls the shared trunk at most `--aux-balance-rho` (0.5) x the policy gradient.
+  UNIT 4's smoke measured B8 at 4.5x and the nearest-car head at 25x the policy gradient's pull.
+  The measurement is one backward pass per loss on the update's first piece -- the piece the
+  per-loss norms were already logged from.
 * **One value stream plus "car contact within 1 s"** (G4): a BCE head on the critic, its labels built
   from the rollout buffer (`train_v2.contact_labels`: charged car-contact onsets in the next 40
   steps, masked where that second crosses the chunk end or a truncation).
@@ -45,15 +53,16 @@ from ..gym_env import PRIV_V2_DIM, REWARD_COMPONENT_KEYS
 from . import common
 from . import conditioning as cond_mod
 from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
-from .dagger_v2 import explicit_flags
+from .dagger_v2 import AUX_TERMS, check_balance_args, explicit_flags, make_balance
 from .memory import reset_hidden
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
 from .obs import ObsSpecV2
 from .returns import compute_gae
-from .train_v2 import (CONTACT_HORIZON, ValueNorm, actor_trunk_parameters, b8_sequence_loss, binary_auc,
-                       contact_labels, contact_onsets, critic_trunk_parameters, deployed_actor_parameters,
-                       flat_parameters, loss_grad_norms, relative_movement, select_tracks)
+from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, CONTACT_HORIZON, ValueNorm,
+                       actor_trunk_parameters, b8_sequence_loss, binary_auc, contact_labels, contact_onsets,
+                       critic_trunk_parameters, deployed_actor_parameters, flat_parameters, loss_grad_norms,
+                       relative_movement, select_tracks)
 
 #: v1 flags whose v2 default differs, applied when the command line does not set them: the
 #: decisions above, and the redesign's optimiser section (actor lr 2e-5 -> 1e-5, horizon 128,
@@ -62,7 +71,13 @@ V2_DEFAULTS = {"clip_split": True, "adam_eps": 1e-8, "vf_clip": 0.0, "kl_coef": 
                "lr": 2e-5, "lr_end": 1e-5, "horizon": 128, "minibatch": 4096, "grad_accum": 4}
 #: The v2-only flags' defaults (None on the parser, so a v1 run can refuse them).
 V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "critic_lr": 3e-4, "value_norm_beta": 0.99,
-                    "contact_bce": 1.0, "aux_b8": 0.5, "aux_near_car": 0.0, "aux_beam_car": 0.0}
+                    "contact_bce": 1.0, "aux_b8": 0.5, "aux_near_car": 0.0, "aux_beam_car": 0.0,
+                    "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
+                    "aux_balance_beta": BALANCE_BETA}
+#: Rows x steps of the rollout the PopArt check re-evaluates on a log update: two critic forwards of
+#: this many rows, a few milliseconds beside an update of the whole buffer.
+POPART_CHECK_ROWS = 32
+POPART_CHECK_STEPS = 4
 #: v1 options a v2 run cannot honour, at the value that means "not asked for".
 V2_REFUSED = {"memory": "off", "scan_channels": "", "motion_memory": False, "aux_opp": 0.0, "aux_grip": 0.0,
               "aux_future": 0.0, "aux_floor": 0.0, "aux_opp_mask": 0.0, "aux_motion": 0.0, "opp_token": "off",
@@ -96,6 +111,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
         raise SystemExit("--init continues a v2 policy; --v2-init-stem seeds a fresh one from a v1 stem")
     if min(a.contact_bce, a.aux_b8, a.aux_near_car, a.aux_beam_car) < 0 or not 0 < a.value_norm_beta < 1:
         raise SystemExit("v2 loss weights are >= 0 and --value-norm-beta is in (0, 1)")
+    check_balance_args(a)
     applied = {}
     for k, v in V2_DEFAULTS.items():
         if k not in given:
@@ -168,6 +184,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     if init_extra.get("value_norm") and init_extra.get("phase") == "ppo":
         vnorm.load_state_dict(init_extra["value_norm"])
         print(f"value normaliser restored: mean {vnorm.mean:.3f} std {vnorm.std:.3f}", flush=True)
+    # The auxiliary balance, against the policy gradient. A DAgger student's balance is not carried
+    # over: it was measured against the imitation loss, a different main term.
+    balance = make_balance(a, "pg", [k for k in AUX_TERMS if on[k]])
+    if init_extra.get("aux_balance") and init_extra.get("phase") == "ppo":
+        balance.load_state_dict(init_extra["aux_balance"])
+        print(f"auxiliary balance restored: {balance.scale} after {balance.measurements} measurements", flush=True)
     # The drift monitor's reference: the actor this leg starts from, frozen, walked with its own state.
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters():
@@ -208,7 +230,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   "losses": {"vf": float(a.vf), "vf_clip": float(a.vf_clip), "contact_bce": coefs["contact"],
                              "contact_horizon_steps": CONTACT_HORIZON, "aux_b8": coefs["b8"],
                              "aux_near_car": coefs["near"], "aux_beam_car": coefs["beam"], "ent": float(a.ent),
-                             "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)"},
+                             "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
+                             "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
+                                             "beta": balance.beta, "names": list(balance.names)},
+                             "value_norm": "PopArt (the value head rescaled at every statistics update)"},
                   "optimizer": {"actor_lr": [float(a.lr), float(a.lr_end)], "critic_lr": float(a.critic_lr),
                                 "adam_eps": float(a.adam_eps), "clip_split": bool(a.clip_split),
                                 "max_grad": float(a.max_grad), "critic_warmup": int(a.critic_warmup)},
@@ -236,8 +261,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     print(f"v2 PPO: horizon {T} x {B} learner rows, minibatch {a.minibatch} = {max(1, a.minibatch // T)} env chunk(s) "
           f"in {a.grad_accum} piece(s) | actor lr {a.lr:g}->{a.lr_end:g}, critic lr {a.critic_lr:g}, eps {a.adam_eps:g}, "
           f"clip-split {a.clip_split}, vf-clip {a.vf_clip:g}, kl_coef 0 | contact BCE {coefs['contact']:g}, "
-          f"B8 {coefs['b8']:g}, near {coefs['near']:g}, beam {coefs['beam']:g} | v2 defaults applied: {applied or 'none'}",
-          flush=True)
+          f"B8 {coefs['b8']:g}, near {coefs['near']:g}, beam {coefs['beam']:g}"
+          + (f" balanced every {balance.every} updates to <= {balance.rho:g} x pg (EMA {balance.beta:g})"
+             if balance.enabled else " (no auxiliary balance)")
+          + f" | value normaliser with PopArt | v2 defaults applied: {applied or 'none'}", flush=True)
     torch.manual_seed(a.seed)
     env.sim.warmup()
     # ---------------------------------------------------------------- buffers (learner rows)
@@ -313,7 +340,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 "wandb_id": wandb_id, "cap": cap, "action_mode": "plan", "speed_mode": "wp4",
                 "speed_command": str(a.speed_command), "metrics": dict(last_log),
                 "opt": opt.state_dict(), "opt_param_names": opt_param_names,
-                "value_norm": vnorm.state_dict(),
+                "value_norm": vnorm.state_dict(), "aux_balance": balance.state_dict(),
                 "experiment": {**experiment, "controller": controller.checkpoint_meta()}}
     ac = torch.autocast("cuda", dtype=torch.bfloat16, enabled=a.amp and device.type == "cuda")
     while steps_done < a.total:
@@ -327,6 +354,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
             time.sleep(min(t_loop * a.yield_to_viewer, 1.0))
         t_loop0 = time.time()
         tm = common.Timer()
+        # The update this loop makes is logged (below, after the count moves on) when the NEW count
+        # is a multiple of --log-every, or it is the first. Decided here, once, so what is measured
+        # for the log (per-loss norms, the PopArt check) is measured on the update that is logged --
+        # the two conditions used to differ by one, and with --log-every > 1 every measurement but
+        # the first landed on an update that was never logged.
+        log_now = (update + 1) % a.log_every == 0 or update == 0
         # ------------------------------------------------------------ rollout
         model.eval()
         buf_h0.copy_(h_actor.detach()[:, lid])
@@ -403,7 +436,20 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 rew_used = lagrange_step(buf_rew, buf_comp, buf_prog, buf_mask, lagrange, a.lagrange_lr, a.lagrange_max)
             adv = compute_gae(rew_used, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, a.lam)
             ret = adv + buf_val[:T]
-            vnorm.update(ret, buf_mask)
+            popart = None
+            if log_now:
+                # PopArt, checked live: a few stored states' de-normalised values before and after
+                # the statistics move, in float32 outside autocast. Rounding only (~1e-6 relative).
+                rs, rb = slice(0, min(T, POPART_CHECK_STEPS)), slice(0, min(B, POPART_CHECK_ROWS))
+                pick = lambda x: x[rs, rb].reshape(-1, *x.shape[2:])
+                chk = (pick(buf_scan).float(), pick(buf_ego), pick(buf_c), pick(buf_priv))
+                v_before = vnorm.denormalize(model.critic(*chk)[0].float())
+            # the statistics move and the value head moves with them (PopArt): every value the critic
+            # has learnt keeps its meaning, only the targets it is trained towards are re-expressed
+            vnorm.update(ret, buf_mask, preserve=model.critic.value)
+            if log_now:
+                v_after = vnorm.denormalize(model.critic(*chk)[0].float())
+                popart = (float((v_after - v_before).abs().max()), float(v_before.abs().max()))
             ret_n = vnorm.normalize(ret)
             y_c, y_valid = contact_labels(buf_onset, buf_done, buf_trunc, CONTACT_HORIZON)
             if buf_lvl is not None:
@@ -428,7 +474,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         on_actor = 0.0 if freeze_actor else 1.0
         theta0 = flat_parameters(deployed)
         stats = {}
-        log_now = update % a.log_every == 0 or update == 0
+        due = balance.due()
+        t_measure = 0.0
         for ep in range(a.epochs):
             perm = torch.randperm(B, device=device)
             for i in range(0, B, piece):
@@ -484,22 +531,31 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist).sum(-1))
                     approx_kl = ((ratio - 1) - (logp - fl(buf_logp[:, cols]))).mean()
                     clipfrac = ((ratio - 1).abs() > a.clip).float().mean()
-                actor_terms = pg - a.ent * ent_w + coefs["b8"] * b8 + coefs["near"] * near + coefs["beam"] * beam
-                loss = a.vf * vf + coefs["contact"] * bce + on_actor * actor_terms
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"non-finite v2 PPO loss at update {update} (pg {float(pg):.4g} vf {float(vf):.4g} "
-                                       f"bce {float(bce):.4g} b8 {float(b8):.4g})")
-                if log_now and ep == 0 and i == 0:
+                if (log_now or due) and ep == 0 and i == 0:
                     # each loss's pull on the trunk it shares, before anything is clipped or stepped
-                    # (no entropy term: the log std is state-independent, its trunk gradient is zero)
+                    # (no entropy term: the log std is state-independent, its trunk gradient is zero),
+                    # the auxiliaries at their configured coefficient -- before the balance's
+                    # multiplier, which is computed from exactly these numbers
+                    t_m = time.perf_counter()
                     gn = loss_grad_norms({"pg": pg,
                                           "b8": coefs["b8"] * b8 if on["b8"] else None,
                                           "near": coefs["near"] * near if on["near"] else None,
                                           "beam": coefs["beam"] * beam if on["beam"] else None}, actor_trunk)
-                    gn.update({f"critic_{k}": v for k, v in loss_grad_norms(
-                        {"vf": a.vf * vf, "contact": coefs["contact"] * bce}, critic_trunk).items()})
+                    if due:
+                        balance.observe(gn)
+                    t_measure += time.perf_counter() - t_m
+                    if log_now:
+                        gn.update({f"critic_{k}": v for k, v in loss_grad_norms(
+                            {"vf": a.vf * vf, "contact": coefs["contact"] * bce}, critic_trunk).items()})
                     for k, v in gn.items():
                         stats.setdefault(f"grad/{k}", []).append(v)
+                s_ = balance.scale
+                actor_terms = (pg - a.ent * ent_w + coefs["b8"] * s_.get("b8", 1.0) * b8
+                               + coefs["near"] * s_.get("near", 1.0) * near + coefs["beam"] * s_.get("beam", 1.0) * beam)
+                loss = a.vf * vf + coefs["contact"] * bce + on_actor * actor_terms
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f"non-finite v2 PPO loss at update {update} (pg {float(pg):.4g} vf {float(vf):.4g} "
+                                       f"bce {float(bce):.4g} b8 {float(b8):.4g})")
                 if accum > 1:
                     loss = loss * (w.sum().clamp_min(1.0) / w_group)
                 if first:
@@ -522,10 +578,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 if b8_know is not None:
                     stats.setdefault("b8_knowable", []).append(float(b8_know))
         move = relative_movement(theta0, deployed)
+        balance.tick()
         t_upd = tm.lap()
         steps_done += T * B; update += 1
         # ------------------------------------------------------------ logging
-        if update % a.log_every == 0 or update == 1:
+        if log_now:                                  # (update % a.log_every == 0 or update == 1)
             n_pol = buf_mask.sum().clamp_min(1.0)
             km = float((buf_prog.clamp_min(0) * buf_mask).sum()) / 1000.0
             sel = y_valid & (buf_mask > 0)
@@ -546,6 +603,14 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                    "time/elapsed_min": (time.time() - t_start) / 60}
             for k, v in stats.items():
                 log[(k if k.startswith("grad") else f"loss/{k}")] = float(np.mean(v))
+            if balance.enabled:
+                log.update({f"balance/scale_{k}": v for k, v in balance.scale.items()})
+                log.update({f"balance/pull_{k}": v for k, v in balance.pull().items()})
+                log["balance/measurements"] = balance.measurements
+            # the measurement's own cost this update (0 when nothing was measured), against the update
+            log["time/grad_measure_s"] = t_measure
+            if popart is not None:
+                log["value_norm/popart_max_dev"], log["value_norm/popart_value_scale"] = popart
             ls = model.actor.log_std.detach()
             log["policy/log_std_kappa"] = float(ls[:4].mean()); log["policy/log_std_speed"] = float(ls[4:].mean())
             log.update({f"reward/{k}_per_step": float((buf_comp[:, :, i_] * buf_mask).sum() / n_pol)
@@ -585,8 +650,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   f"| pg {log.get('loss/pg', float('nan')):.4f} vf {log.get('loss/vf', float('nan')):.4f} "
                   f"bce {log.get('loss/contact_bce', float('nan')):.4f} b8 {log.get('loss/b8', float('nan')):.4f} "
                   f"kl_ref {log.get('loss/kl_ref', float('nan')):.4f} | move {move:.2e} | capped "
-                  f"{log['rollout/speed_capped_frac']:.2f} | vnorm {vnorm.mean:.2f}+-{vnorm.std:.2f} | "
-                  f"{log['time/env_steps_per_s']:.0f} steps/s", flush=True)
+                  f"{log['rollout/speed_capped_frac']:.2f} | vnorm {vnorm.mean:.2f}+-{vnorm.std:.2f}"
+                  + (f" (PopArt dev {popart[0]:.1e})" if popart is not None else "")
+                  + (" | aux scale " + " ".join(f"{k} {v:.3g}" for k, v in balance.scale.items())
+                     if balance.enabled else "")
+                  + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         t_loop = time.time() - t_loop0
         if getattr(env, "level_replay", None) is not None and update % 16 == 0:
             print("level replay: " + " ".join(f"{k} {v:.3g}" if isinstance(v, float) else f"{k} {v}"

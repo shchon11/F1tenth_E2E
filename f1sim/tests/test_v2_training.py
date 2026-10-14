@@ -42,9 +42,11 @@ def test_a_v2_ppo_run_gets_the_redesigns_defaults_and_keeps_what_it_was_told():
     assert (a.lr, a.lr_end, a.horizon, a.minibatch, a.grad_accum) == (5e-5, 1e-5, 64, 256, 2)
     assert "lr" not in applied and applied["lr_end"] == 1e-5 and applied["clip_split"] is True
     assert (a.critic_lr, a.contact_bce, a.aux_b8, a.value_norm_beta) == (3e-4, 1.0, 0.5, 0.99)
+    assert (a.aux_balance_every, a.aux_balance_rho, a.aux_balance_beta) == (10, 0.5, 0.8)
     assert (a.action_mode, a.speed_mode, a.cond, a.scan_stack, a.hist_len) == ("plan", "wp4", "dial", 1, 20)
     for bad in (["--kl-coef", "0.05"], ["--memory", "gru"], ["--controller", "fixed_low"], ["--init-log-std", "-2"],
-                ["--minibatch", "100"]):
+                ["--minibatch", "100"], ["--aux-balance-rho", "0"], ["--aux-balance-beta", "1"],
+                ["--aux-balance-every", "-1"]):
         argv = ["--arch", "v2", *bad]
         with pytest.raises(SystemExit):
             ppo_v2.prepare_args(ap, ap.parse_args(argv), argv)
@@ -59,6 +61,7 @@ def test_a_v2_dagger_run_gets_burn_in_40_and_chunk_80_unless_told():
     applied = dagger_v2.prepare_args(ap, a, argv)
     assert (a.seq_burn, a.chunk_length) == (40, 80) and applied == {"chunk_length": 80, "seq_burn": 40}
     assert (a.mirror_prob, a.aux_b8, a.wp4_label, a.v2_frames) == (0.5, 0.5, "env", 1)
+    assert (a.aux_balance_every, a.aux_balance_rho, a.aux_balance_beta) == (10, 0.5, 0.8)
     argv = ["--arch", "v2", "--chunk-length", "40", "--v2-frames", "2"]
     a = ap.parse_args(argv)
     applied = dagger_v2.prepare_args(ap, a, argv)
@@ -70,7 +73,9 @@ def test_a_v2_dagger_run_gets_burn_in_40_and_chunk_80_unless_told():
             dagger_v2.prepare_args(ap, ap.parse_args(argv), argv)
 
 
-@pytest.mark.parametrize("module,flag", [("f1sim.learn.ppo", "--critic-lr"), ("f1sim.learn.dagger", "--mirror-prob")])
+@pytest.mark.parametrize("module,flag", [("f1sim.learn.ppo", "--critic-lr"), ("f1sim.learn.dagger", "--mirror-prob"),
+                                         ("f1sim.learn.ppo", "--aux-balance-rho"),
+                                         ("f1sim.learn.dagger", "--aux-balance-beta")])
 def test_a_v1_run_refuses_the_v2_flags(monkeypatch, module, flag):
     import importlib
     mod = importlib.import_module(module)
@@ -157,6 +162,10 @@ def test_dagger_ppo_evaluate_end_to_end_on_the_cpu(runs, monkeypatch):
         rec = [json.loads(x) for x in open(runs / "dg" / "progress.jsonl")][-1]
         assert rec["arch"] == "v2" and rec["train/grad_bc"] > 0 and rec["train/grad_b8"] > 0
         assert all(k in rec for k in ("train/bc_lat", "train/bc_speed", "train/b8", "train/grad_near", "train/grad_beam"))
+        # the auxiliary balance: measured from the first update, multipliers in (0, 1], in the checkpoint
+        assert all(0 < rec[f"train/aux_scale_{k}"] <= 1 for k in ("b8", "near", "beam"))
+        assert extra["aux_balance"]["main"] == "bc" and extra["aux_balance"]["measurements"] >= 1
+        assert extra["aux_balance"]["scale"] == {k: rec[f"train/aux_scale_{k}"] for k in ("b8", "near", "beam")}
         _run_main("f1sim.learn.ppo", ["--arch", "v2", "--name", "pp", "--init", st, "--envs", "4", "--race-size",
                                       "2", "--opponent", "policy", "--tracks", TRACK, "--horizon", "48",
                                       "--minibatch", "96", "--grad-accum", "1", "--total", "384", "--epochs", "2",
@@ -173,11 +182,19 @@ def test_dagger_ppo_evaluate_end_to_end_on_the_cpu(runs, monkeypatch):
         assert first["policy/actor_move"] == 0.0 and recs[1]["policy/actor_move"] > 0
         assert recs[1]["value_norm/std"] > 0 and 0 < first["contact/label_valid_frac"] < 1
         for k in ("grad/pg", "grad/b8", "grad/near", "grad/beam", "grad/critic_vf", "grad/critic_contact",
-                  "rollout/speed_capped_frac", "loss/contact_bce", "loss/b8_knowable"):
+                  "rollout/speed_capped_frac", "loss/contact_bce", "loss/b8_knowable", "balance/scale_b8",
+                  "balance/pull_near", "value_norm/popart_max_dev"):
             assert k in first, k
+        # PopArt, live: the critic's de-normalised values moved by rounding only across the first
+        # statistics update (identity -> the batch's), however far the statistics went
+        for r in recs:
+            assert r["value_norm/popart_max_dev"] <= 1e-4 * max(1.0, r["value_norm/popart_value_scale"]
+                                                              + abs(r["value_norm/mean"]) + r["value_norm/std"])
+        assert all(0 < first[f"balance/scale_{k}"] <= 1 for k in ("b8", "near", "beam"))
         ck = str(runs / "pp" / "ppo_final.pt")
         m2, ex2 = load_checkpoint(ck)
         assert isinstance(m2, ActorCriticV2) and ex2["value_norm"]["debias"] > 0 and ex2["arch"] == "v2"
+        assert ex2["aux_balance"]["main"] == "pg" and ex2["aux_balance"]["updates"] == 2
         res = evaluate(ck, [TRACK], envs=2, steps=200, speed_cap=6.0, device="cpu", seed=5,
                        cfg=_eager_config())
         md = res["metadata"]

@@ -66,6 +66,74 @@ def test_value_norm_is_a_debiased_ema_and_respects_weights():
         tv.ValueNorm(beta=1.0)
 
 
+def _critic_and_inputs(dtype=torch.float32, rows=64):
+    """A v2 critic at a small beam count and fixed inputs for it (B9 exactly as built; only the
+    beam count is small so the test is fast)."""
+    from f1sim.learn.model_v2 import CriticV2
+    with torch.random.fork_rng():
+        torch.manual_seed(4)
+        cr = CriticV2(n_beams=61).to(dtype).eval()
+        with torch.no_grad():                  # a trained head's size: the init's x 0.1 would hide errors
+            cr.value.weight.mul_(30.0); cr.value.bias.fill_(0.7)
+        g = torch.Generator().manual_seed(5)
+        x = (torch.rand(rows, 1, 61, generator=g).to(dtype), 0.3 * torch.randn(rows, 210, generator=g).to(dtype),
+             torch.full((rows, 1), -0.4, dtype=dtype), 0.5 * torch.randn(rows, 34, generator=g).to(dtype))
+    return cr, x
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_popart_keeps_the_critics_values_across_a_statistics_update(dtype):
+    """PopArt (UNIT 5a): the value head is rescaled with the statistics, so sigma' V' + mu' of every
+    state is what sigma V + mu was -- through the whole critic, across the first update (identity ->
+    the batch's statistics, here G4's scale: mean -500, sd 125) and a later one that moves the mean
+    by +600 and halves the spread. float64 shows the formula is exact; float32 that the stored head
+    keeps it to the last bits. Without `preserve`, the same update moves the values by hundreds."""
+    cr, x = _critic_and_inputs(dtype)
+    vn = tv.ValueNorm(beta=0.9)
+    denorm = lambda: vn.denormalize(cr(*x)[0])
+    g = torch.Generator().manual_seed(6)
+    eps = torch.finfo(dtype).eps
+    devs, stats = [], []
+    for ret in (-500.0 + 125.0 * torch.randn(4000, generator=g), 100.0 + 60.0 * torch.randn(4000, generator=g)):
+        with torch.no_grad():
+            before = denorm()
+            vn.update(ret, preserve=cr.value)
+            after = denorm()
+            # "float precision" of a de-normalised value is that of its terms, sigma' V' and mu': a
+            # value of 0.8 written as 125 x 4.0064 - 500 carries the rounding of a 500, whatever the
+            # rescale does (this is the representation's floor, not PopArt's error)
+            scale = vn.std * float(cr(*x)[0].abs().max()) + abs(vn.mean)
+        dev = float((after - before).abs().max())
+        devs.append(dev / scale)
+        stats.append((vn.mean, vn.std))
+        assert dev <= 8 * eps * scale, (dtype, dev, scale)
+    # both updates really moved the statistics (the check above is not vacuous): identity -> about
+    # (-500, 125), then the EMA's mixture with a batch 600 higher (-183, 315 here) ...
+    assert stats[0][0] < -450 and stats[0][1] > 100
+    assert stats[1][0] - stats[0][0] > 200 and stats[1][1] - stats[0][1] > 100
+    # ... and without the rescale the same kind of move re-means every value
+    cr2, x2 = _critic_and_inputs(dtype)
+    vn2 = tv.ValueNorm(beta=0.9)
+    with torch.no_grad():
+        before = vn2.denormalize(cr2(*x2)[0])
+        vn2.update(-500.0 + 125.0 * torch.randn(4000, generator=g))
+        moved = float((vn2.denormalize(cr2(*x2)[0]) - before).abs().max())
+    assert moved > 100.0
+    print(f"PopArt relative deviation ({dtype}): " + ", ".join(f"{d:.2e}" for d in devs))
+
+
+def test_popart_refuses_a_head_it_cannot_preserve_and_leaves_an_unmoved_head_alone():
+    vn = tv.ValueNorm()
+    with pytest.raises(ValueError):
+        vn.update(torch.randn(10), preserve=torch.nn.Linear(4, 2))
+    with pytest.raises(ValueError):
+        vn.update(torch.randn(10), preserve=torch.nn.Linear(4, 1, bias=False))
+    head = torch.nn.Linear(4, 1)
+    w0, b0 = head.weight.clone(), head.bias.clone()
+    vn.update(torch.ones(3), torch.zeros(3), preserve=head)       # no weight: no statistics move
+    assert torch.equal(head.weight, w0) and torch.equal(head.bias, b0)
+
+
 # ---------------------------------------------------------------- contact within 1 s
 def _brute(onset, term, trunc, H):
     T, B = onset.shape
@@ -429,6 +497,122 @@ def test_loss_grad_norms_measure_each_term_and_leave_grad_alone():
     assert w.grad is None
     (a + b).backward()                     # the graph is still there
     assert w.grad is not None
+
+
+def test_per_loss_gradients_assemble_the_backward_of_the_weighted_total():
+    """`loss_grads` + `accumulate_grads` is how a measured DAgger update is made: the per-loss
+    gradients the balance measured, weighted by its multipliers, summed into `.grad` -- the gradient
+    `(sum_k w_k L_k).backward()` gives, without the extra backward pass. Norms are over the trunk
+    only; gradients cover the heads too."""
+    from f1sim.learn import dagger_v2
+    from f1sim.learn.model_v2 import ActorCriticV2
+    torch.manual_seed(0)
+    m = ActorCriticV2(n_beams=61, aux={"b8": True, "near_car": True})
+    s = _sequences()
+    kw = dict(burn=3, plan_spec=SPEC, v_max=10.0, coefs={"b8": 0.5, "near": 0.5}, beams=False)
+    params = [p for p in m.actor.parameters() if p.requires_grad]
+    trunk = tv.actor_trunk_parameters(m.actor)
+    w = {"bc": 1.0, "b8": 0.3, "near": 0.07}
+    t = dagger_v2.sequence_losses(m, s, **kw)
+    parts = {"bc": t["bc"], "b8": 0.5 * t["b8"], "near": 0.5 * t["near"]}
+    norms, per = tv.loss_grads(parts, params, norm_params=trunk, retain=False)
+    tv.accumulate_grads(params, per, w)
+    got = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in params]
+    for p in params:
+        p.grad = None
+    t2 = dagger_v2.sequence_losses(m, s, **kw)
+    (t2["bc"] + w["b8"] * 0.5 * t2["b8"] + w["near"] * 0.5 * t2["near"]).backward()
+    want = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in params]
+    worst = max(float((a - b).abs().max()) / max(1e-12, float(b.abs().max())) for a, b in zip(got, want))
+    assert worst < 1e-5, worst
+    # the norms are each loss's own, on the trunk, as `loss_grad_norms` measures them
+    for p in params:
+        p.grad = None
+    t3 = dagger_v2.sequence_losses(m, s, **kw)
+    ref = tv.loss_grad_norms({"bc": t3["bc"], "b8": 0.5 * t3["b8"], "near": 0.5 * t3["near"]}, trunk)
+    assert norms == pytest.approx(ref, rel=1e-5)
+    assert all(v > 0 for v in norms.values())
+
+
+def _sequences(T=8, n=2, seed=1):
+    g = torch.Generator().manual_seed(seed)
+    return {"scan": torch.rand(T, n, 1, 61, generator=g), "ego": 0.3 * torch.rand(T, n, 210, generator=g),
+            "c": torch.zeros(T, n, 1), "keep": torch.ones(T, n), "valid": torch.ones(T, n, dtype=torch.bool),
+            "label": torch.rand(T, n, 8, generator=g) * 2 - 1, "b8_lab": 0.2 * torch.randn(T, n, 3, 3, generator=g),
+            "b8_cand": torch.ones(T, n, 3, dtype=torch.bool), "b8_age": torch.zeros(T, n, 3, dtype=torch.long),
+            "near": torch.cat([torch.ones(T, n, 1), 0.3 * torch.randn(T, n, 4, generator=g)], -1)}
+
+
+def test_the_balance_multiplier_is_rho_times_main_over_aux_capped_at_one_and_smoothed():
+    """UNIT 4's DAgger smoke norms (bc 0.89, B8 1.62, nearest car 4.24, per beam 0.17) through the
+    rule s = min(1, rho |g_main| / |g_i|): the first measurement sets it outright, later ones through
+    the EMA, a weak auxiliary keeps 1, and a measurement with nothing to measure against changes
+    nothing."""
+    b = tv.AuxBalance("bc", ["b8", "near", "beam"], every=10, rho=0.5, beta=0.8)
+    assert b.due() and b.scale == {"b8": 1.0, "near": 1.0, "beam": 1.0}
+    raw = b.observe({"bc": 0.89, "b8": 1.62, "near": 4.24, "beam": 0.17})
+    assert raw["b8"] == pytest.approx(0.5 * 0.89 / 1.62) and raw["near"] == pytest.approx(0.5 * 0.89 / 4.24)
+    assert raw["beam"] == 1.0                                   # already under rho x bc: untouched
+    assert b.scale == raw
+    assert b.pull() == pytest.approx({"b8": 0.5, "near": 0.5, "beam": 0.17 / 0.89})
+    assert b.coefs({"b8": 0.5, "near": 0.5, "contact": 1.0}) == pytest.approx(
+        {"b8": 0.5 * raw["b8"], "near": 0.5 * raw["near"], "contact": 1.0})
+    b.observe({"bc": 0.89, "b8": 0.89, "near": 4.24, "beam": 0.17})      # B8 now at 1x bc: raw 0.5
+    assert b.scale["b8"] == pytest.approx(0.8 * raw["b8"] + 0.2 * 0.5)
+    before = dict(b.scale)
+    b.observe({"bc": 0.0, "b8": 3.0})                               # no main gradient: nothing moves
+    b.observe({"bc": 0.9, "b8": 0.0, "near": float("nan")})          # no aux gradient: that aux keeps its own
+    assert b.scale["b8"] == before["b8"] and b.scale["near"] == before["near"]
+    assert b.due()                                                  # update 0 is measured ...
+    b.tick()
+    for _ in range(9):
+        assert not b.due()
+        b.tick()
+    assert b.due()                                                  # ... and update 10
+    # a checkpoint carries it; a resume keeps its own flags, and a different main loss is refused
+    c = tv.AuxBalance("bc", ["b8", "near", "beam", "extra"], every=5, rho=0.25, beta=0.5)
+    c.load_state_dict(b.state_dict())
+    assert {k: c.scale[k] for k in b.scale} == b.scale and c.scale["extra"] == 1.0
+    assert (c.every, c.rho, c.beta, c.updates) == (5, 0.25, 0.5, b.updates)
+    with pytest.raises(ValueError):
+        tv.AuxBalance("pg", ["b8"]).load_state_dict(b.state_dict())
+    off = tv.AuxBalance("bc", ["b8"], every=0)
+    assert not off.enabled and not off.due()
+    for bad in (dict(every=-1), dict(rho=0.0), dict(beta=1.0)):
+        with pytest.raises(ValueError):
+            tv.AuxBalance("bc", ["b8"], **bad)
+
+
+def test_dagger_training_holds_the_auxiliary_pull_at_rho():
+    """`dagger_v2.train_epochs` on a buffer of random sequences with B8 and the nearest-car head at
+    0.5: the balance measures on its schedule, the multipliers settle, and the effective pull of each
+    auxiliary (multiplier x its trunk gradient / the imitation's) is at or under rho -- where the
+    configured coefficients alone put the nearest-car head far above it."""
+    from f1sim.learn import dagger_v2
+    from f1sim.learn.model_v2 import ActorCriticV2
+    torch.manual_seed(0)
+    m = ActorCriticV2(n_beams=61, aux={"b8": True, "near_car": True})
+    buf = dagger_v2.SequenceBuffer(n_frames=1)
+    s = _sequences(T=40, n=3, seed=2)
+    for t in range(40):
+        buf.add(scan=s["scan"][t, :, 0], ego=s["ego"][t], label=s["label"][t], valid=s["valid"][t],
+                newep=torch.tensor([t == 0] * 3), c=s["c"][t], b8_lab=s["b8_lab"][t], b8_cand=s["b8_cand"][t],
+                b8_age=s["b8_age"][t], near=s["near"][t])
+    buf.finalize()
+    opt = torch.optim.Adam(m.actor.parameters(), lr=1e-4)
+    rows = []
+    bal = tv.AuxBalance("bc", ["b8", "near"], every=4, rho=0.5, beta=0.5)
+    _loss, summary = dagger_v2.train_epochs(
+        m, [buf], epochs=12.0, batch=16, burn=4, chunk=8, device=torch.device("cpu"), opt=opt, log=rows.append,
+        plan_spec=SPEC, v_max=10.0, coefs={"b8": 0.5, "near": 0.5}, mirror=None, mirror_prob=0.0,
+        log_every=1000, balance=bal)
+    assert summary["updates"] >= 12 and bal.measurements == -(-summary["updates"] // 4)
+    first = [r for r in rows if "dagger/grad_near" in r][0]
+    assert first["dagger/grad_near"] > 0.5 * first["dagger/grad_bc"], "the test needs an auxiliary to tame"
+    assert 0 < bal.scale["near"] < 1
+    for k, v in bal.pull().items():
+        assert v <= 0.5 * 1.25, (k, v, bal.scale)                  # the EMA's lag, at most
+    assert summary["aux_scale_near"] == bal.scale["near"] and "measure_overhead_frac" in summary
 
 
 def test_relative_movement():

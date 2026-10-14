@@ -28,13 +28,20 @@ stated numbers so the tests can hold it on its own (`tests/test_train_v2.py`):
 * **`loss_grad_norms`** -- each loss's gradient norm on the parameters the losses share (the G5
   item "손실별 기울기 노름"): B8 is one small step (/ 3 slots, x 0.5) and has to be read against the
   imitation loss's to know whether it can move the memory at all (`aux_v2`'s CPU toy).
+* **`AuxBalance`** -- what those norms showed, acted on: on UNIT 4's smoke runs the auxiliaries at
+  their configured coefficients pulled the shared trunk 2-25x harder than the loss the policy is
+  trained for, so each auxiliary gets a multiplier that holds its pull at most `rho` x the main loss's.
+* **PopArt** (`ValueNorm.update(..., preserve=head)`) -- a statistics update rescales the value head's
+  last layer so the de-normalised value of every state is what it was before the update.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import replace
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from ..gym_env import OPP_MEMORY_STEPS, OPP_NEVER_SEEN, PRIV_V2_MIRROR
@@ -242,8 +249,15 @@ class ValueNorm:
     `denormalize(critic)`. Updated once per PPO update with that rollout's returns, weighted by the
     policy's own rows. `beta` per UPDATE: 0.99 keeps about the last hundred updates (a run of the
     redesign's size is 50-200 updates), so the scale follows a policy whose contact cost falls while
-    one rollout cannot jerk it (the stats move the meaning of every critic output, and there is no
-    PopArt rescale of the last layer here). Before the first update it is the identity.
+    one rollout cannot jerk it. Before the first update it is the identity.
+
+    A statistics update changes the meaning of every critic output: the same normalised number
+    de-normalises to a different value. `update(..., preserve=head)` is PopArt's answer (van Hasselt
+    et al. 2016, "Learning values across many orders of magnitude"): the value head's last layer is
+    rescaled in the same step so that sigma' (W' z + b') + mu' = sigma (W z + b) + mu for every z --
+    the critic's de-normalised values are exactly what they were, and only the targets it is trained
+    towards move. Without it, the first update alone (identity -> the batch's statistics, sd ~125 in
+    G4's runs) re-meant every value the critic had learnt by two orders of magnitude.
 
     Why at all (G4, architecture-redesign appendix 2): the returns spread with sd ~125 under a contact
     price of 300-1000 while the value moved 0.2 per update under the old clip; unclipped and
@@ -269,18 +283,51 @@ class ValueNorm:
         return max(var, self.eps) ** 0.5
 
     @torch.no_grad()
-    def update(self, x: torch.Tensor, weight: Optional[torch.Tensor] = None) -> None:
+    def update(self, x: torch.Tensor, weight: Optional[torch.Tensor] = None,
+               preserve: Optional[nn.Linear] = None) -> None:
+        """Fold one rollout's returns in. `preserve`: the critic's value head (a one-output
+        `nn.Linear`, the last layer), rescaled so its de-normalised outputs survive the update
+        (`rescale_head`)."""
+        if preserve is not None:
+            self._check_head(preserve)                 # before anything moves: a refusal changes nothing
         x = x.detach().double().reshape(-1)
         w = torch.ones_like(x) if weight is None else weight.detach().double().reshape(-1)
         n = float(w.sum())
         if n <= 0:
             return
+        old_mean, old_std = self.mean, self.std
         bm = float((x * w).sum()) / n
         bs = float((x * x * w).sum()) / n
         b = self.beta
         self.m1 = b * self.m1 + (1 - b) * bm
         self.m2 = b * self.m2 + (1 - b) * bs
         self.debias = b * self.debias + (1 - b)
+        if preserve is not None:
+            self.rescale_head(preserve, old_mean, old_std)
+
+    @torch.no_grad()
+    def rescale_head(self, head: nn.Linear, old_mean: float, old_std: float) -> None:
+        """PopArt's output-preserving update of the value head for a move from (old_mean, old_std)
+        to the current statistics: W' = W sigma / sigma', b' = (sigma b + mu - mu') / sigma'.
+
+        Computed in float64 and stored in the head's dtype, so the de-normalised output moves by
+        rounding only (`tests/test_train_v2.py` holds it to float32 precision through the whole
+        critic). Adam's moments for the head are left as they are: they normalise each parameter's
+        step by its own gradient scale, and at beta 0.99 the scale moves ~1 % per update."""
+        self._check_head(head)
+        new_mean, new_std = self.mean, self.std
+        if new_mean == old_mean and new_std == old_std:
+            return
+        a = float(old_std) / float(new_std)
+        head.weight.copy_(head.weight.double() * a)
+        head.bias.copy_((head.bias.double() * float(old_std) + (float(old_mean) - float(new_mean)))
+                        / float(new_std))
+
+    @staticmethod
+    def _check_head(head) -> None:
+        if not isinstance(head, nn.Linear) or head.out_features != 1 or head.bias is None:
+            raise ValueError("PopArt rescales a one-output nn.Linear value head with a bias (a shifted "
+                             "mean has nowhere else to go)")
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / self.std
@@ -389,20 +436,181 @@ def deployed_actor_parameters(actor) -> list:
     return [p for p in actor.parameters() if id(p) not in heads]
 
 
+def loss_grads(terms: Dict[str, Optional[torch.Tensor]], params: Iterable[torch.Tensor],
+               norm_params: Optional[Iterable[torch.Tensor]] = None, retain: bool = True):
+    """({name: L2 norm of d term / d norm_params}, {name: (d term / d p for p in params)}): each term's
+    gradient on its own, without touching `.grad`.
+
+    `params` are the tensors the gradients are taken for (None where a term does not reach one);
+    the norm is over `norm_params`, a subset of them (all of them when None) -- the shared trunk,
+    while the gradients cover the heads too, so a caller can assemble its update from these very
+    gradients instead of paying for one more backward (`accumulate_grads`). `retain=False` frees the
+    graph with the last term. A term that is None, not a tensor with a graph, or does not reach
+    `norm_params` reads 0 and has no entry in the gradients."""
+    params = [p for p in params if p.requires_grad]
+    keep = None if norm_params is None else {id(p) for p in norm_params}
+    names = [k for k, t in terms.items() if t is not None and torch.is_tensor(t) and t.requires_grad]
+    norms = {k: 0.0 for k in terms}
+    grads = {}
+    for j, name in enumerate(names):
+        g = torch.autograd.grad(terms[name], params, retain_graph=retain or j < len(names) - 1,
+                                allow_unused=True)
+        sq = [gi.detach().float().pow(2).sum() for gi, p in zip(g, params)
+              if gi is not None and (keep is None or id(p) in keep)]
+        norms[name] = float(torch.stack(sq).sum().sqrt()) if sq else 0.0
+        grads[name] = g
+    return norms, grads
+
+
 def loss_grad_norms(terms: Dict[str, Optional[torch.Tensor]], params: Iterable[torch.Tensor]) -> Dict[str, float]:
     """{name: L2 norm of d term / d params} for each term, without touching `.grad`. The graph is
     retained, so the caller's own backward of the total still works afterwards. A term that does not
     reach `params` (or is None / not a tensor with a graph) reads 0."""
+    return loss_grads(terms, params)[0]
+
+
+@torch.no_grad()
+def accumulate_grads(params: Sequence[torch.Tensor], grads: Dict[str, Sequence[Optional[torch.Tensor]]],
+                     weights: Dict[str, float]) -> None:
+    """`p.grad += sum_k weights[k] * grads[k][i]` for parameter i -- the backward of
+    `sum_k weights[k] * term_k`, assembled from `loss_grads`' per-term gradients (same `params`,
+    same order). Equal to that backward up to the order the floating-point sums are taken in."""
     params = [p for p in params if p.requires_grad]
-    out = {}
-    for name, loss in terms.items():
-        if loss is None or not torch.is_tensor(loss) or not loss.requires_grad:
-            out[name] = 0.0
-            continue
-        grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
-        sq = [g.detach().float().pow(2).sum() for g in grads if g is not None]
-        out[name] = float(torch.stack(sq).sum().sqrt()) if sq else 0.0
-    return out
+    for i, p in enumerate(params):
+        acc = None
+        for k, g in grads.items():
+            gi = g[i]
+            if gi is None:
+                continue
+            w = float(weights.get(k, 1.0))
+            gi = gi if w == 1.0 else gi * w
+            acc = gi if acc is None else acc + gi
+        if acc is not None:
+            p.grad = acc.detach() if p.grad is None else p.grad + acc
+
+
+# ----------------------------------------------------------------- auxiliary gradient balance
+#: UNIT 5a's adaptive auxiliary scale, defaults (each one a flag on both trainers). What decided it,
+#: the per-loss gradient norms on the shared actor trunk of UNIT 4's smoke runs, each auxiliary at its
+#: configured coefficient:
+#:     DAgger  bc 0.89   B8 1.62   nearest car 4.24   per beam 0.17
+#:     PPO     pg 0.72   B8 3.24   nearest car 18.2
+#: The trunk was being shaped mostly by the heads that never drive -- the A9/A10 pattern ("heads
+#: learned better, drove worse": 188 vs 109 car contacts) in the making. rho 0.5 lets an auxiliary
+#: pull at most half as hard as the loss the policy is trained for: enough to write the memory B8
+#: exists for (its value), never enough to steer the trunk away from the action. `every` 10: the
+#: measurement is a backward pass per loss, so it is taken on one update in ten -- measured on the CPU
+#: at the deployed shapes, +7 % of DAgger's training compute with B8 (+18 % with all four losses; see
+#: `learn.dagger_v2.train_epochs`), and in PPO one piece of the update's many. `beta` 0.8 per
+#: measurement: about the last five measurements, 50 updates -- a minibatch's ratio moves with which
+#: cars it happens to hold, and one noisy batch should not swing a coefficient.
+BALANCE_EVERY = 10
+BALANCE_RHO = 0.5
+BALANCE_BETA = 0.8
+
+
+class AuxBalance:
+    """Each auxiliary loss's pull on the shared actor trunk, held at most `rho` x the main loss's.
+
+    Every `every` optimiser updates the trainer measures each loss's gradient norm on the shared
+    trunk (`actor_trunk_parameters`; the main loss -- imitation for DAgger, the policy gradient for
+    PPO -- and each auxiliary already times its configured coefficient) and hands the norms to
+    `observe`. Auxiliary i's multiplier is then
+
+        s_i = min(1, rho |g_main| / |g_i|)
+
+    smoothed by an EMA over measurements (the first measurement sets it outright: starting from 1
+    would leave the imbalance in force for the EMA's whole time constant, which is the thing being
+    fixed). The multiplier only ever turns an auxiliary DOWN; one that is already weaker than
+    rho x the main loss keeps its configured coefficient. It applies on top of that coefficient
+    (`coefs`). A measurement with no main gradient (nothing to measure against) changes nothing; an
+    auxiliary with no gradient in this batch keeps its multiplier.
+
+    `state_dict` goes into every checkpoint, so a resumed run continues with the multipliers it had
+    rather than re-measuring from 1."""
+
+    def __init__(self, main: str, names: Sequence[str], every: int = BALANCE_EVERY, rho: float = BALANCE_RHO,
+                 beta: float = BALANCE_BETA):
+        if int(every) < 0:
+            raise ValueError(f"the balance period is >= 0 updates (0 = off), got {every}")
+        if not (math.isfinite(float(rho)) and float(rho) > 0):
+            raise ValueError(f"rho is a positive ratio, got {rho}")
+        if not 0.0 <= float(beta) < 1.0:
+            raise ValueError(f"the balance EMA weight is in [0, 1), got {beta}")
+        self.main, self.names = str(main), tuple(str(k) for k in names)
+        self.every, self.rho, self.beta = int(every), float(rho), float(beta)
+        self.scale = {k: 1.0 for k in self.names}
+        self.seen = {k: 0 for k in self.names}
+        #: optimiser updates counted by `tick`, and how many of them were measured
+        self.updates = 0
+        self.measurements = 0
+        self.last_norms: Dict[str, float] = {}
+        self.last_raw: Dict[str, float] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self.every > 0 and bool(self.names)
+
+    def due(self) -> bool:
+        """Is the coming update one whose gradients are measured (the first one always is)?"""
+        return self.enabled and self.updates % self.every == 0
+
+    def tick(self) -> None:
+        """One optimiser update done."""
+        self.updates += 1
+
+    def observe(self, norms: Dict[str, float]) -> Dict[str, float]:
+        """Fold one measurement in; returns this measurement's raw multipliers."""
+        g_main = float(norms.get(self.main, 0.0))
+        self.last_norms = {k: float(v) for k, v in norms.items()}
+        raw = {}
+        if not (math.isfinite(g_main) and g_main > 0.0):
+            return raw
+        for k in self.names:
+            g = float(norms.get(k, 0.0))
+            if not (math.isfinite(g) and g > 0.0):
+                continue
+            s = min(1.0, self.rho * g_main / g)
+            raw[k] = s
+            self.scale[k] = s if self.seen[k] == 0 else self.beta * self.scale[k] + (1.0 - self.beta) * s
+            self.seen[k] += 1
+        self.last_raw = raw
+        self.measurements += 1
+        return raw
+
+    def coefs(self, base: Dict[str, float]) -> Dict[str, float]:
+        """The coefficients to train with: each balanced one times its multiplier, the rest as given."""
+        return {k: (float(v) * self.scale[k] if k in self.scale else float(v)) for k, v in base.items()}
+
+    def pull(self) -> Dict[str, float]:
+        """The last measurement's effective pull of each auxiliary relative to the main loss,
+        s_i |g_i| / |g_main| with the multiplier now in force: <= rho once the EMA has settled."""
+        g_main = float(self.last_norms.get(self.main, 0.0))
+        if not g_main > 0.0:
+            return {}
+        return {k: self.scale[k] * float(self.last_norms.get(k, 0.0)) / g_main for k in self.names}
+
+    def state_dict(self) -> dict:
+        return {"main": self.main, "names": list(self.names), "every": self.every, "rho": self.rho,
+                "beta": self.beta, "scale": dict(self.scale), "seen": dict(self.seen),
+                "updates": self.updates, "measurements": self.measurements,
+                "last_norms": dict(self.last_norms), "last_raw": dict(self.last_raw)}
+
+    def load_state_dict(self, d: dict) -> None:
+        """The multipliers and counters of a run being resumed. The configuration (`every`, `rho`,
+        `beta`) stays this run's: a resume that changes a flag gets the flag it asked for. A head this
+        run trains that the checkpoint's run did not starts at 1, unmeasured; a different main loss
+        (a DAgger balance handed to PPO) is refused -- the ratios mean something else."""
+        if str(d.get("main")) != self.main:
+            raise ValueError(f"a balance measured against {d.get('main')!r} cannot continue against {self.main!r}")
+        for k in self.names:
+            if k in (d.get("scale") or {}):
+                self.scale[k] = float(d["scale"][k])
+                self.seen[k] = int((d.get("seen") or {}).get(k, 1))
+        self.updates = int(d.get("updates", 0))
+        self.measurements = int(d.get("measurements", 0))
+        self.last_norms = {k: float(v) for k, v in (d.get("last_norms") or {}).items()}
+        self.last_raw = {k: float(v) for k, v in (d.get("last_raw") or {}).items()}
 
 
 @torch.no_grad()

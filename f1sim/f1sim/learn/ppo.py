@@ -916,6 +916,15 @@ def main():
                     help="v2: weight of the nearest-visible-car head (default 0: not built)")
     ap.add_argument("--aux-beam-car", type=float, default=None, metavar="COEF",
                     help="v2: weight of the per-beam car / not-car head (default 0: not built)")
+    ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
+                    help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
+                         "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
+                         "the policy gradient (default 10; 0 = off, the coefficients alone)")
+    ap.add_argument("--aux-balance-rho", type=float, default=None, metavar="RHO",
+                    help="v2: the largest auxiliary / policy-gradient trunk-gradient ratio the balance allows (default 0.5)")
+    ap.add_argument("--aux-balance-beta", type=float, default=None, metavar="B",
+                    help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
+                         "last five measurements)")
     a = ap.parse_args()
     v2_applied = None
     if a.arch == "v2":
@@ -923,7 +932,8 @@ def main():
         v2_applied = ppo_v2.prepare_args(ap, a)
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "critic_lr", "value_norm_beta", "contact_bce", "aux_b8",
-                              "aux_near_car", "aux_beam_car") if getattr(a, k) is not None]
+                              "aux_near_car", "aux_beam_car", "aux_balance_every", "aux_balance_rho",
+                              "aux_balance_beta") if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
     adaptive = a.adaptation != "off"
