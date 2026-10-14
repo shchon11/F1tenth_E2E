@@ -176,7 +176,7 @@ class ContactSeverityMeter:
         self._run_on = torch.zeros_like(self._run_on)
         km = float(self._dist.item()) / 1000.0
         per_km = lambda c: (c / km if km > 0.001 else None)
-        hard_from = sum(1 for e in BUCKET_EDGES if e < HARD_MPS)          # first bucket at or above HARD_MPS
+        hard_from = sum(1 for e in BUCKET_EDGES if e <= HARD_MPS)         # the bucket that starts at HARD_MPS
         out = {}
         for k in KINDS:
             if k == "car" and not self.races:

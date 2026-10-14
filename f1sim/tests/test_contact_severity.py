@@ -175,17 +175,19 @@ def _script(env: F1VecEnv, poses, speeds, steps: int):
 
 def test_the_meter_files_each_onset_by_its_severity():
     from f1sim.learn.severity_meter import ContactSeverityMeter
-    env = F1VecEnv(_post_floor(), _cfg(), EnvConfig(collision_mode="soft", speed_cap=6.0), num_envs=2, device="cpu")
+    env = F1VecEnv(_post_floor(), _cfg(), EnvConfig(collision_mode="soft", speed_cap=6.0), num_envs=3, device="cpu")
     env.reset(seed=3)
     with ContactSeverityMeter(env) as meter:
         assert env.sim.measure_impacts is True
-        _script(env, [[POST[0] - 1.0, POST[1], 0.0], [POST[0] - 0.45, POST[1], 0.0]], [2.0, 0.3], 80)
+        _script(env, [[POST[0] - 1.0, POST[1], 0.0], [POST[0] - 0.45, POST[1], 0.0], [POST[0] - 0.6, POST[1], 0.0]],
+                [2.0, 0.3, 0.8], 80)
     assert env.sim.measure_impacts is False                               # put back
     rep = meter.report()["contact_severity"]
     w = rep["wall_prop"]
-    assert w["onsets"] >= 2
-    assert w["counts"][2] == 1 and w["counts"][0] >= 1                    # the 2 m/s hit, the 0.3 m/s nudge
-    assert w["hard"] == 1 and abs(w["max_mps"] - 2.0) < 0.1
+    assert w["onsets"] >= 3
+    # the 2 m/s hit, the 0.8 m/s bump and the 0.3 m/s nudge (and the cars' re-touches, all soft)
+    assert w["counts"][3] == 0 and w["counts"][2] == 1 and w["counts"][1] >= 1 and w["counts"][0] >= 1
+    assert w["hard"] == 1 and abs(w["max_mps"] - 2.0) < 0.1               # >= 1 m/s: the hit alone
     assert rep["wall_prop_physical"]["hard"] == 1
     assert rep["prop"]["counts"] == w["counts"]                           # every one of them was the post
     assert rep["prop_physical"]["counts"] == rep["wall_prop_physical"]["counts"]
