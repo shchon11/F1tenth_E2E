@@ -71,6 +71,33 @@ def test_the_shadow_drives_like_the_real_race():
     assert float(err.max()) < 0.01, f"shadow drifted {float(err.max()):.4f} m in 10 steps"
 
 
+def test_a_refresh_carries_the_rolling_start_over():
+    """An opponent the real race holds on its placement offset (`EnvConfig.spawn_alongside_hold`) is
+    held in every copy too. The rows, offsets and clocks are row tensors; whether the env adds the
+    offset at all is a host count, and the shadow's own had run down in its own steps."""
+    from f1sim.rollout_teacher import ShadowEnv
+    tr, rl = _track_and_raceline()
+    cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
+    ecfg = EnvConfig(race_size=2, opponent="teacher", action_mode="plan", collision_mode="soft",
+                     max_steps=4000, hist_len=0, spawn_order="alongside",
+                     opp_events=("shift",), opp_event_rate=1e-9)   # the offset channel on, no event fires
+    env = common.make_env([tr], 4, "cpu", ecfg, cfg=cfg, seed=5, rls=[rl])
+    teacher = common.make_teacher([rl], env)
+    sh = ShadowEnv(env, 2, lidar_beams=None)
+    sh.S._roll_steps_left = 0                  # as after the decisions that ran it down
+    env.reset(seed=7)
+    assert env._roll_cfg and bool(env.roll_on.any()) and env._roll_steps_left > 0
+    env.step(_raw(env, teacher))
+    sh.refresh()
+    assert sh.S._roll_steps_left == env._roll_steps_left
+    assert torch.equal(sh.S.roll_on.view(2, env.B)[1], env.roll_on)
+    assert torch.equal(sh.S.roll_cl0.view(2, env.B)[1], env.roll_cl0)
+    # and it is what the env's opponents act on: the same offset in the shadow as in the real race
+    roll = env._rolling_start()
+    assert float(roll.abs().max()) > 0.0
+    assert torch.allclose(sh.S._rolling_start().view(2, env.B)[1], roll, atol=1e-6)
+
+
 def test_the_candidate_set_has_to_contain_the_raceline():
     from f1sim.rollout_teacher import RolloutTeacher
     env, teacher = _env(envs=2)

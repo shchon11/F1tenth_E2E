@@ -79,3 +79,26 @@ def test_a_contact_records_the_scene_from_before_it():
     want = trail[onset - rp.lag]
     me = int(((env.sim.tid.float() == rec[0]) & env.learner).nonzero()[0])
     assert torch.allclose(rec[2:4], want[me], atol=1e-4), (rec[2:4], want[me])
+
+
+def test_a_replayed_race_gets_no_rolling_start():
+    """Its poses are the recorded moment before a contact, not a grid: holding the opponent on the
+    offset it happens to stand at (`EnvConfig.spawn_alongside_hold`) would replay a different scene.
+    The same config without a scene in the bank lays the race abreast and does roll it."""
+    tr, rl = _track_and_raceline()
+    cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
+    ecfg = EnvConfig(race_size=2, opponent="teacher", action_mode="plan", collision_mode="soft", max_steps=4000,
+                     hist_len=0, replay_contacts=1.0, spawn_order="alongside",
+                     opp_events=("shift",), opp_event_rate=1e-9)    # the offset channel on, no event fires
+    env = common.make_env([tr], 4, "cpu", ecfg, cfg=cfg, seed=5, rls=[rl])
+    env.reset(seed=5)
+    opp = ~env.learner
+    assert env._roll_cfg and bool(env.spawn_abreast[opp].any()) and bool(env.roll_on[opp].any())
+    rp = env._replay
+    xy, yaw = env.sim.track.pose_at_s(torch.tensor([10.0, 12.5]), env.sim.tid[:2])
+    rp.bank[0] = torch.tensor([float(env.sim.tid[0]), 0.0, float(xy[0, 0]), float(xy[0, 1]), float(yaw[0]), 3.0,
+                               float(xy[1, 0]), float(xy[1, 1]), float(yaw[1]), 2.5])
+    rp.n = 1
+    env._reset_envs(torch.arange(env.B))
+    assert rp.replayed == env.B // 2
+    assert not bool(env.roll_on.any()) and not bool(env.spawn_abreast.any())

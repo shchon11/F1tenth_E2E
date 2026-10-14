@@ -180,6 +180,7 @@ class Simulator:
         self.lap = torch.zeros(num_envs, dtype=torch.long, device=self.device)
         self.collided = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self.absent = torch.zeros(num_envs, dtype=torch.bool, device=self.device)   # `park`
+        self.spawn_stats = {"rejected": 0, "group_walks": 0, "fallback_rows": 0, "crowded": 0}
         #: Prop contact seen inside a substep, latched until `step` reads it. A box can be entered
         #: and pushed back out between two control steps, and a collision that the physics resolved
         #: but nothing reported is a collision the caller never learns about.
@@ -263,7 +264,10 @@ class Simulator:
     def park(self, ids: torch.Tensor) -> None:
         """Take these cars out of the race: parked 1 km off the map (each at its own spot), at rest, frozen,
         their wall / car contacts masked. Far away is what keeps them out of every other car's LiDAR,
-        contact test and nearest-opponent column without a mask in each of those places."""
+        contact test and nearest-opponent column without a mask in each of those places -- for the
+        terms that read *positions*. Not for the arc: `s` comes from a lane projection that searches
+        only a few metres around the last index, so a parked car keeps a place on the lap, and
+        `F1VecEnv.signed_gaps` has to mask it (it reads `absent`)."""
         if not hasattr(self, "absent") or self.absent.shape[0] != self.B:
             self.absent = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         if ids.numel() == 0:
@@ -337,7 +341,9 @@ class Simulator:
     def sample_spawn(self, n: int, lateral_std: float = 0.3, yaw_std=0.2,
                      s: Optional[torch.Tensor] = None, tid: Optional[torch.Tensor] = None,
                      min_clearance=None, lat: Optional[torch.Tensor] = None,
-                     eid: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     eid: Optional[torch.Tensor] = None, group: Optional[torch.Tensor] = None,
+                     active: Optional[torch.Tensor] = None, lat_fixed: Optional[torch.Tensor] = None,
+                     avoid_s: Optional[torch.Tensor] = None, clear_gap: float = 0.0) -> torch.Tensor:
         """Random poses along the centerline of each env's track (tid (n,), default track 0). Returns (n, 3).
 
         min_clearance: scalar, or an (n,) tensor when the rows want different bounds -- an alongside
@@ -353,12 +359,29 @@ class Simulator:
         rejection below has to test the pose against *that env's* crates, and a track id does not
         say which env is being reset.
 
-        One interaction between the last two worth stating, because it is the reason
-        `gym_env._reset_envs` tests an abreast grid against the props itself: the prop rejection
-        below replaces a blocked pose with a *centerline* pose, which throws away whatever `lat`
-        asked for. For a grid laid abreast that would put both cars on one line, i.e. in contact. So
-        an abreast row is only ever handed to this function once its caller has established that the
-        pose is clear of both the walls and the props, and the rejection never fires on it.
+        The rest describe a *race*, and exist because every fallback below used to treat each car
+        alone (2026-10-14, the G4 boot-camp audit: 122 of 379 charged car contacts began in the
+        first 2 s of an episode, 59 of them on step 0, every one charged to the learner):
+
+        group (n,): rows with the same id are one race laid out together. When a car of the group
+        is rejected (a wall, its runway, a crate on its heading, a crate under it), the *whole*
+        group walks the lap by one common arc offset, so every car keeps its lateral offset and its
+        arc gap to the others; the station taken is the first one where every car of the group
+        passes. Placement probe, boot-camp config, 1,600 races: 23 % of abreast and 26 % of grid
+        cars were rejected, the per-car centerline pull and lap walk put 153 learner pairs in
+        overlap at placement (both abreast cars walked to the same station; one abreast car pulled
+        onto the centerline beside its partner; a walked car landing on another) and 116 grid
+        pairs within 2.4 m of arc. None given: every row is its own group, the rule this function
+        always had.
+        active (n,): rows that take part. An inactive row (an empty seat, parked right after this)
+        is neither tested nor allowed to hold the race up; it rides along with its group.
+        lat_fixed (n,): rows whose `lat` is part of a formation (an abreast row). Such a row is never
+        pulled to the centerline -- pulled onto the line its partner is beside, it is in contact.
+        A free row (a staggered grid car, whose lateral is a draw) still may be, at its own arc.
+        avoid_s (n, C), clear_gap: arc positions this row must stay `clear_gap` metres of arc away
+        from (NaN: none) -- a car rejoining a race already under way, whose mates are where they
+        are. Also what the rare fallback below uses when a group has no common station: the cars
+        that failed walk on their own, each kept `clear_gap` from every other car of its group.
         """
         tid = torch.zeros(n, dtype=torch.long, device=self.device) if tid is None else tid.to(self.device)
         no_cl = ~self.track.cl_ok[tid] if self.track.cl is not None else torch.ones(n, dtype=torch.bool, device=self.device)
@@ -380,7 +403,9 @@ class Simulator:
                                      None if s is None else s[~no_cl], tid[~no_cl],
                                      min_clearance=sel(min_clearance),
                                      lat=None if lat is None else lat[~no_cl],
-                                     eid=None if eid is None else eid[~no_cl])
+                                     eid=None if eid is None else eid[~no_cl],
+                                     group=sel(group), active=sel(active), lat_fixed=sel(lat_fixed),
+                                     avoid_s=sel(avoid_s), clear_gap=clear_gap)
             poses[~no_cl] = rest
             return poses
         if s is None:
@@ -391,65 +416,198 @@ class Simulator:
                else lat.to(self.device))
         nrm = torch.stack([-torch.sin(yaw), torch.cos(yaw)], 1)
         xy = xy + nrm * lat[:, None]
-        yaw = yaw + torch.randn(n, device=self.device, generator=self.gen) * (
+        dyaw = torch.randn(n, device=self.device, generator=self.gen) * (
             yaw_std.to(self.device) if torch.is_tensor(yaw_std) else yaw_std)
+        yaw = yaw + dyaw
         pose = torch.cat([xy, yaw[:, None]], 1)
+        min_cl = self.cfg.vehicle.width if min_clearance is None else min_clearance
         # reject poses too close to walls by pulling them back to the centerline
-        bad = self.track.sample_edt(xy, tid) < (self.cfg.vehicle.width if min_clearance is None else min_clearance)
-        bad = bad | self._spawn_runway_blocked(s, tid, eid, lat) | self._spawn_heading_blocked(pose, tid, eid)
-        if getattr(self.track, "has_props", False) or self.spawn_runway > 0.0:
-            # Props are not in the EDT, so the wall test above cannot see them and a car would spawn
-            # standing inside a crate. Reject on the same geometry the contact test uses; if the
-            # centerline fallback is itself blocked, nudge along the lane until it is not.
-            bad = bad | self._spawn_in_prop(pose, tid, eid)
+        wall = self.track.sample_edt(xy, tid) < min_cl
+        bad = wall | self._spawn_runway_blocked(s, tid, eid, lat) | self._spawn_heading_blocked(pose, tid, eid)
+        heavy = getattr(self.track, "has_props", False) or self.spawn_runway > 0.0
+        # No props, no runway: only the wall test can reject, and only a free row takes this short
+        # path. An abreast row rejected by the walls (its caller's room check is meant to make that
+        # impossible) still walks with its race rather than being pulled onto its partner's line.
+        formation_bad = lat_fixed is not None and bool((bad & lat_fixed.to(self.device).bool()).any())
+        if not heavy and avoid_s is None and not formation_bad:
             if bad.any():
                 xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
                 pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
-                # the centerline point may be blocked too, and so may the road ahead of it
-                still = bad & (self._spawn_in_prop(pose, tid, eid)
-                               | self._spawn_runway_blocked(s, tid, eid, None)
-                               | self._spawn_heading_blocked(pose, tid, eid))
-                # Walk a full lap in even stations rather than a few short nudges. Stopping early
-                # and returning the pose anyway would spawn the car inside a crate and call it a
-                # spawn; if a whole lap has nowhere to stand, that is a broken map and it says so.
-                # All 32 stations are tested in one call rather than one call each. Same answer --
-                # the pose taken is still the first station in order that is clear -- but with a
-                # per-env obstacle layout the loop was thirty-two Python-looped SAT passes over the
-                # slot dimension per reset, measured at 46 ms of a 116 ms step at `--envs 256`.
-                L = self.track.length[tid].clamp_min(1e-6)
-                idx = torch.nonzero(still, as_tuple=True)[0]
-                if idx.numel():
-                    J = 32
-                    ar_j = torch.arange(1, J + 1, device=self.device, dtype=L.dtype)
-                    s_alt = (s[idx][:, None] + L[idx][:, None] * (ar_j[None] / 33.0)) % L[idx][:, None]
-                    tid_j = tid[idx].repeat_interleave(J)
-                    xy_a, yaw_a = self.track.pose_at_s(s_alt.reshape(-1), tid_j)
-                    p_alt = torch.cat([xy_a, yaw_a[:, None]], 1)
-                    eid_j = None if eid is None else eid[idx].repeat_interleave(J)
-                    ok = (~(self._spawn_in_prop(p_alt, tid_j, eid_j)
-                            | self._spawn_runway_blocked(s_alt.reshape(-1), tid_j, eid_j, None))
-                          ).reshape(-1, J)
-                    # The straight line ahead as well, where some station has it: on a bend the lane
-                    # runway follows the lane, while a car placed at speed goes straight until its
-                    # steering comes round -- a car set on a tight left-hander at 2.4 m/s with crates
-                    # past the outside of it had no path round them at full lock. Only a preference:
-                    # a lap with no such station keeps the lane rule rather than refusing to spawn.
-                    straight = ok & ~self._spawn_heading_blocked(p_alt, tid_j, eid_j).reshape(-1, J)
-                    ok = torch.where(straight.any(1, keepdim=True), straight, ok)
-                    first = ok.to(torch.uint8).argmax(1)
-                    any_ok = ok.any(1)
-                    chosen = p_alt.reshape(-1, J, 3)[torch.arange(idx.numel(), device=self.device), first]
-                    pose[idx[any_ok]] = chosen[any_ok]
-                    still[idx[any_ok]] = False
-                if bool(still.any()):
-                    raise RuntimeError(
-                        f"{int(still.sum())} env(s) have no spawn pose clear of the placed props "
-                        f"anywhere on their lap; the track's props block the centerline")
             return pose
-        if bad.any():
-            xy0, yaw0 = self.track.pose_at_s(s[bad], tid[bad])
-            pose[bad] = torch.cat([xy0, yaw0[:, None]], 1)
+        # Props are not in the EDT, so the wall test above cannot see them and a car would spawn
+        # standing inside a crate. Reject on the same geometry the contact test uses; if the
+        # centerline fallback is itself blocked, walk the lap until a station is clear.
+        z = torch.zeros(n, dtype=torch.bool, device=self.device)
+        fixed = z if lat_fixed is None else lat_fixed.to(self.device).bool()
+        act = ~z if active is None else active.to(self.device).bool()
+        L = self.track.length[tid].clamp_min(1e-6)
+        if heavy:
+            bad = bad | self._spawn_in_prop(pose, tid, eid)
+        bad = bad | self._spawn_too_close(s, L, avoid_s, clear_gap)
+        own_ok = ~bad
+        # A free row may still fall back to the centerline at its own arc: the arc gap to its race
+        # mates is unchanged by that, and it is the fallback every run before this one had. A row in
+        # a formation may not (see `lat_fixed`).
+        free_bad = bad & ~fixed
+        if bool(free_bad.any()):
+            xy0, yaw0 = self.track.pose_at_s(s[free_bad], tid[free_bad])
+            pose[free_bad] = torch.cat([xy0, yaw0[:, None]], 1)
+        cen_bad = self._spawn_too_close(s, L, avoid_s, clear_gap)
+        if heavy:
+            cen_bad = cen_bad | (self._spawn_in_prop(pose, tid, eid) | self._spawn_runway_blocked(s, tid, eid, None)
+                                 | self._spawn_heading_blocked(pose, tid, eid))
+        still = (fixed & bad) | (free_bad & cen_bad)
+        need = still & act
+        self._spawn_stat("rejected", int((bad & act).sum()))
+        if not bool(need.any()):
+            return pose
+        grp = torch.arange(n, device=self.device) if group is None else group.to(self.device).long()
+        # Every row of a group that has a car to move -- the whole race moves, not the one car.
+        moving = torch.isin(grp, grp[need])
+        rows = torch.nonzero(moving, as_tuple=True)[0]
+        gw, gidx = torch.unique(grp[rows], return_inverse=True)
+        try_own = (fixed | own_ok)[rows]
+        try_cen = ~fixed[rows]
+        J = 32
+        st_ok, st_l, own_l, own_s, s_alt, p_own, p_cen = self._spawn_stations(
+            rows, s, L, tid, eid, lat, dyaw, min_cl, try_own, try_cen, act[rows], avoid_s, clear_gap, J)
+        # Per group: a station is clear when every active car of the group is. Clear with the
+        # straight line ahead of each car as well, where some station has it: on a bend the lane
+        # runway follows the lane, while a car placed at speed goes straight until its steering
+        # comes round -- a car set on a tight left-hander at 2.4 m/s with crates past the outside of
+        # it had no path round them at full lock. Only a preference: a lap with no such station
+        # keeps the lane rule rather than refusing to spawn.
+        G = gw.numel()
+        fail_s = torch.zeros(G, J, device=self.device).index_add_(0, gidx, (~st_ok).float())
+        fail_l = torch.zeros(G, J, device=self.device).index_add_(0, gidx, (~st_l).float())
+        strict, loose = fail_s == 0, fail_l == 0
+        use_strict = strict.any(1)
+        ok = torch.where(use_strict[:, None], strict, loose)
+        first = ok.to(torch.uint8).argmax(1)
+        found = ok.any(1)
+        k = torch.arange(rows.numel(), device=self.device)
+        j = first[gidx]
+        own_here = try_own & torch.where(use_strict[gidx], own_s[k, j], own_l[k, j])
+        chosen = torch.where(own_here[:, None], p_own[k, j], p_cen[k, j])
+        placed = found[gidx]
+        pose[rows[placed]] = chosen[placed]
+        self._spawn_stat("group_walks", int(found.sum()))
+        if bool((~found).any()):
+            # No common station anywhere on the lap. The formation is given up rather than the
+            # contact: the cars that were clear stay where they are, and each of the others walks
+            # on its own, refusing every station within `clear_gap` of a car of its group already
+            # placed. Never seen in the boot-camp probe; counted, so a map where it is not rare says so.
+            s_out = s.clone()
+            s_out[rows[placed]] = s_alt[k, j][placed]
+            for g in torch.nonzero(~found, as_tuple=True)[0].tolist():
+                mem = rows[gidx == g]
+                for r in mem[need[mem]].tolist():
+                    mates = mem[(mem != r) & act[mem] & ~need[mem]]
+                    av = s_out[mates][None, :]
+                    if avoid_s is not None:
+                        av = torch.cat([avoid_s[r:r + 1].to(av.dtype), av], 1)
+                    rr = torch.tensor([r], device=self.device)
+                    p1, s1 = self._spawn_walk_one(rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, av, clear_gap, J)
+                    if p1 is None:
+                        # crowded: no station clear of the props *and* of the other cars. Clear of
+                        # the props is the old guarantee and is kept; the car gap is what gives.
+                        self._spawn_stat("crowded", 1)
+                        p1, s1 = self._spawn_walk_one(rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, None, 0.0, J)
+                    if p1 is None:
+                        raise RuntimeError(
+                            "1 env has no spawn pose clear of the placed props anywhere on its lap; "
+                            "the track's props block the centerline")
+                    pose[r] = p1; s_out[r] = s1
+                    need[r] = False
+                    self._spawn_stat("fallback_rows", 1)
         return pose
+
+    #: Running counts from `sample_spawn` (host ints): cars rejected at their asked pose, races walked
+    #: as one, cars placed by the per-car fallback, and those of them no station kept clear of their
+    #: race mates. A census, so a map or a config where the fallbacks are not rare is visible.
+    spawn_stats: Dict[str, int]
+
+    def _spawn_stat(self, key: str, k: int) -> None:
+        """Add to `spawn_stats`, creating it on a simulator put together without `__init__` (a test
+        shell): a census must not be what a spawn dies on."""
+        st = self.__dict__.get("spawn_stats")
+        if st is None:
+            st = self.spawn_stats = {"rejected": 0, "group_walks": 0, "fallback_rows": 0, "crowded": 0}
+        st[key] = st.get(key, 0) + k
+
+    def _spawn_too_close(self, s: torch.Tensor, L: torch.Tensor, avoid_s, gap: float) -> torch.Tensor:
+        """(n,) whether arc `s` is within `gap` of any of the row's `avoid_s` (NaN entries ignored)."""
+        if avoid_s is None or gap <= 0.0:
+            return torch.zeros(s.shape[0], dtype=torch.bool, device=self.device)
+        a = avoid_s.to(self.device, s.dtype)
+        d = (a - s[:, None] + L[:, None] / 2) % L[:, None] - L[:, None] / 2
+        return (d.abs() < gap).any(1)
+
+    def _spawn_stations(self, rows, s, L, tid, eid, lat, dyaw, min_cl, try_own, try_cen, act,
+                        avoid_s, clear_gap: float, J: int):
+        """Every row of `rows` tested at J stations L/33 apart ahead of its asked arc.
+
+        Two candidates per station: the row's own pose moved along the lane (its lateral offset and
+        heading jitter kept, tested against everything the asked pose was: walls at `min_cl`, the
+        runway at that offset, props, a prop on its heading) and the centerline pose there (props,
+        the centerline runway, the lane heading). Returns, per (row, station): clear with the
+        heading test (strict) and without it (lane), for whichever candidates the row may take; the
+        own candidate's two verdicts; the station arc; both candidate poses. Inactive rows pass.
+
+        All J stations in one call per test rather than one call each: same answer, but with a
+        per-env obstacle layout the loop was thirty-two Python-looped SAT passes over the slot
+        dimension per reset, measured at 46 ms of a 116 ms step at `--envs 256`.
+        """
+        R = rows.numel()
+        heavy = getattr(self.track, "has_props", False) or self.spawn_runway > 0.0
+        ar_j = torch.arange(1, J + 1, device=self.device, dtype=L.dtype)
+        s_alt = (s[rows][:, None] + L[rows][:, None] * (ar_j[None] / 33.0)) % L[rows][:, None]   # (R, J)
+        sf = s_alt.reshape(-1)
+        rep = lambda t_: t_[rows].repeat_interleave(J)
+        tid_j = rep(tid)
+        eid_j = None if eid is None else rep(eid)
+        lat_j = rep(lat); dyaw_j = rep(dyaw)
+        mc = rep(min_cl) if torch.is_tensor(min_cl) else min_cl
+        xy_c, yaw_c = self.track.pose_at_s(sf, tid_j)
+        nrm = torch.stack([-torch.sin(yaw_c), torch.cos(yaw_c)], 1)
+        p_own = torch.cat([xy_c + nrm * lat_j[:, None], (yaw_c + dyaw_j)[:, None]], 1)
+        p_cen = torch.cat([xy_c, yaw_c[:, None]], 1)
+        L_j = rep(L)
+        av_j = None if avoid_s is None else avoid_s[rows].repeat_interleave(J, 0)
+        close = self._spawn_too_close(sf, L_j, av_j, clear_gap)
+        own_l = ~(close | (self.track.sample_edt(p_own[:, :2], tid_j) < mc))
+        cen_l = ~close
+        own_hd = cen_hd = torch.zeros_like(close)
+        if heavy:
+            own_l = own_l & ~(self._spawn_runway_blocked(sf, tid_j, eid_j, lat_j) | self._spawn_in_prop(p_own, tid_j, eid_j))
+            cen_l = cen_l & ~(self._spawn_runway_blocked(sf, tid_j, eid_j, None) | self._spawn_in_prop(p_cen, tid_j, eid_j))
+            own_hd = self._spawn_heading_blocked(p_own, tid_j, eid_j)
+            cen_hd = self._spawn_heading_blocked(p_cen, tid_j, eid_j)
+        v = lambda t_: t_.view(R, J)
+        own_l, cen_l, own_hd, cen_hd = v(own_l), v(cen_l), v(own_hd), v(cen_hd)
+        own_s, cen_s = own_l & ~own_hd, cen_l & ~cen_hd
+        to, tc, ia = try_own[:, None], try_cen[:, None], ~act[:, None]
+        st_ok = ia | (to & own_s) | (tc & cen_s)
+        st_l = ia | (to & own_l) | (tc & cen_l)
+        return st_ok, st_l, own_l, own_s, s_alt, p_own.view(R, J, 3), p_cen.view(R, J, 3)
+
+    def _spawn_walk_one(self, rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, avoid, gap: float, J: int):
+        """One car's own lap walk (the fallback): first clear station's (pose, arc), or (None, None)."""
+        avoid_full = None
+        if avoid is not None:
+            avoid_full = torch.full((s.shape[0], avoid.shape[1]), float("nan"), device=self.device, dtype=s.dtype)
+            avoid_full[rr] = avoid.to(s.dtype)
+        f = fixed[rr]
+        st_ok, st_l, own_l, own_s, s_alt, p_own, p_cen = self._spawn_stations(
+            rr, s, L, tid, eid, lat, dyaw, min_cl, torch.ones_like(f), ~f,
+            torch.ones_like(f), avoid_full, gap, J)
+        ok = st_ok if bool(st_ok.any()) else st_l
+        if not bool(ok.any()):
+            return None, None
+        j = int(ok[0].to(torch.uint8).argmax())
+        strict = ok is st_ok
+        use_own = bool((own_s if strict else own_l)[0, j])
+        return (p_own if use_own else p_cen)[0, j], s_alt[0, j]
 
     def _spawn_runway_blocked(self, s: torch.Tensor, tid: torch.Tensor, eid, lat) -> torch.Tensor:
         """(n,) whether a car spawning at arc `s` has something in front it could not avoid.
