@@ -1270,6 +1270,15 @@ def _refuse_oracle(ck: dict, path, allow_oracle: bool) -> str:
     return mode
 
 
+def _refuse_v2_migration(ck: dict, path) -> None:
+    """The v1 warm-start loaders (`load_for_conditioning`, `load_for_memory`) add v1 modules to a v1
+    network by name; a v2 checkpoint has none of those names, and quietly building a v1 network
+    around its meta would be a different policy. They refuse it."""
+    if (ck.get("meta") or {}).get("arch") == "v2":
+        raise ValueError(f"{os.path.basename(str(path))} is a v2 checkpoint (learn.model_v2); the v1 "
+                         f"migration loaders do not apply to it. Load it with load_checkpoint.")
+
+
 def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
                     allow_conditional: bool = False, strict_names: bool = False,
                     priv_adapter: Optional[str] = None,
@@ -1301,6 +1310,14 @@ def load_checkpoint(path, device="cpu", override: Optional[dict] = None,
     identical in the results.
     """
     ck = torch.load(path, map_location=device, weights_only=True)
+    if (ck.get("meta") or {}).get("arch") == "v2":
+        # The redesign's actor-critic (`learn.model_v2`). A v1 checkpoint has no "arch" key, so
+        # everything below is reached by exactly the checkpoints it always was. The dial of a v2
+        # actor is a deployable input, never a lab oracle, so `allow_conditional` has nothing to gate.
+        from .model_v2 import load_v2
+        _refuse_controller(ck, path, allow_controller)
+        _refuse_oracle(ck, path, allow_oracle)
+        return load_v2(ck, path, device, override, strict_names)
     meta = dict(ck["meta"]); meta.update(override or {})
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")
@@ -1375,6 +1392,7 @@ def load_for_conditioning(path, device, cond_dim: int, cond_meta: dict,
     a training job, so leaving it open would let a controller-trained checkpoint in through the side.
     """
     ck = torch.load(path, map_location=device, weights_only=True)
+    _refuse_v2_migration(ck, path)
     meta = dict(ck["meta"]); meta.update(override or {})
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")
@@ -1522,6 +1540,7 @@ def load_for_memory(path, device, memory: Optional[dict] = None,
     leaving them open would let a refused checkpoint in through the side.
     """
     ck = torch.load(path, map_location=device, weights_only=True)
+    _refuse_v2_migration(ck, path)
     meta = dict(ck["meta"]); meta.update(override or {})
     if meta.pop("residual_plan", False):
         raise ValueError("experimental residual-plan checkpoints are not supported")

@@ -126,8 +126,19 @@ LABELS = {
     "learning_rate": "learning rate (추정기)",
     "sideslip_penalty": "sideslip (슬립각) penalty",
     "temporal_encoder": "temporal encoder 종류",
+    # -- the v2 network (learn.model_v2 / dagger_v2 / ppo_v2); every one of these is refused on a v1 run
+    "arch": "network 구조 (v1 / v2)", "v2_frames": "v2 LiDAR frame 수",
+    "v2_init_stem": "v2 stem 초기화 checkpoint (v1)", "wp4_label": "v2 WP4 teacher label 출처",
+    "mirror_prob": "v2 좌우 반전 증강 확률", "critic_lr": "v2 critic learning rate",
+    "value_norm_beta": "v2 value 정규화 EMA β", "contact_bce": "v2 '1초 안 차 접촉' BCE 가중치",
+    "aux_b8": "aux head · B8 상대차 slot 가중치 (v2)", "aux_near_car": "aux head · 최근접 상대차 가중치 (v2)",
+    "aux_beam_car": "aux head · beam별 차 판별 가중치 (v2)",
+    "aux_balance_every": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
+    "aux_balance_rho": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
+    "aux_balance_beta": "aux gradient 균형 EMA β (측정당, v2)",
 }
 PATHS = {"init_estimator": "input_file", "replay_data": "input_file", "init": "input_file", "reference": "input_file", "estimator": "input_file",
+         "v2_init_stem": "input_file",
          "frontend": "input_file", "policy": "input_file", "candidate": "input_file",
          "data": "input_dir", "out": "output_dir", "metrics_jsonl": "output_file"}
 CSV_LISTS = {"scan_channels": "str", "opp_events": "str", "opp_pool": "path",
@@ -245,9 +256,12 @@ def _privileged_contract(cfg, env_cfg):
     zeros = torch.zeros(2)
     track = SimpleNamespace(length=torch.ones(1),
                             pose_at_s=lambda s, tid: (torch.zeros(len(s), 2), torch.zeros_like(s)))
+    # `absent_any`: the race has no empty seat. `_priv` reads it since the 0-3-opponent boot camp
+    # (2026-10-05), and without it this export died before writing anything -- the schema had not
+    # been regenerated since 09-24, so every flag added after that was missing from the console.
     sim = SimpleNamespace(track=track, tid=torch.zeros(2, dtype=torch.long),
                           control_dt=1 / cfg.sim.control_rate,
-                          other_idx=torch.tensor([[1], [0]]),
+                          other_idx=torch.tensor([[1], [0]]), absent_any=False,
                           P={name: torch.ones(2) for name in F1VecEnv.PRIV_PARAMS})
     env = SimpleNamespace(B=2, device=torch.device("cpu"), ecfg=env_cfg, sim=sim,
                           speed_cap=torch.ones(2), PRIV_PARAMS=F1VecEnv.PRIV_PARAMS)

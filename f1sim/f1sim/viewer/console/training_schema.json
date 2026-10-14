@@ -180,6 +180,25 @@
           "metavar": null
         },
         {
+          "flag": "--grad-accum",
+          "flags": [
+            "--grad-accum"
+          ],
+          "dest": "grad_accum",
+          "label": "grad accum",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "split each minibatch into this many pieces and add up their gradients before the one optimiser step, in a piece's memory. The PPO terms (policy, value, entropy, KL) add up to the whole minibatch's exactly; an auxiliary head's loss, normalised by its own label mask, becomes the mean over pieces",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
           "flag": "--lr",
           "flags": [
             "--lr"
@@ -216,6 +235,25 @@
           "action": "store",
           "nullable": false,
           "metavar": null
+        },
+        {
+          "flag": "--fresh-lr-mult",
+          "flags": [
+            "--fresh-lr-mult"
+          ],
+          "dest": "fresh_lr_mult",
+          "label": "fresh lr mult",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "parameters the --init checkpoint does not have (a memory GRU, a motion branch, an auxiliary head added at a warm start) train at M x the scheduled lr in their own Adam group. Grown tensors (new columns of an existing layer) stay in the base group. 1 = one group, as before",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
         },
         {
           "flag": "--gamma",
@@ -327,6 +365,63 @@
           "required": false,
           "group": "학습",
           "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--vf-clip",
+          "flags": [
+            "--vf-clip"
+          ],
+          "dest": "vf_clip",
+          "label": "vf clip",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "PPO's value clip, in RETURN units (default: --clip, 0.2, as every run so far; 0 = off). The returns are not normalised: under a contact multiplier of 300-1000 they spread with sd ~125 while the clip lets the value move 0.2 per update, so the critic cannot follow a contact (measured before one: V 53.5 against a realised -513; 2026-10-13 architecture audit)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--clip-split",
+          "flags": [
+            "--clip-split"
+          ],
+          "dest": "clip_split",
+          "label": "clip split",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "clip the actor's and the critic's gradients to --max-grad separately (2026-10-13 audit). One norm over both lets the critic -- norm 1.6k-31k under a contact multiplier of 300-1000 -- set the clip factor for the actor too, which leaves the actor's Adam step dominated by eps: a lambda-1000 continuation moved its actor by 1e-4 relative in 128 updates",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--adam-eps",
+          "flags": [
+            "--adam-eps"
+          ],
+          "dest": "adam_eps",
+          "label": "adam eps",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1e-05,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "Adam's eps (1e-5, every run so far). With --clip-split, 1e-8 keeps eps out of the step",
           "action": "store",
           "nullable": false,
           "metavar": null
@@ -823,6 +918,159 @@
           "group": "학습",
           "help": "updates with the actor frozen",
           "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--league-slots",
+          "flags": [
+            "--league-slots"
+          ],
+          "dest": "league_slots",
+          "label": "league slots",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "growing self-play league: these opponent checkpoints (each must be in a slot's ckpt_mix) are seats that the learner's own snapshots take over, round robin, every --league-every updates -- the pool keeps its fixed members and gains the learner's past selves",
+          "action": "store",
+          "nullable": false,
+          "metavar": "A.pt,B.pt"
+        },
+        {
+          "flag": "--league-every",
+          "flags": [
+            "--league-every"
+          ],
+          "dest": "league_every",
+          "label": "league every",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 64,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "U"
+        },
+        {
+          "flag": "--level-replay",
+          "flags": [
+            "--level-replay"
+          ],
+          "dest": "level_replay",
+          "label": "level replay",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "prioritized level replay: at a race reset, replay a past level of that race seat with probability P, chosen by its mean |advantage| (most left to learn) and staleness; 0 = off (every reset a fresh draw, as before)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--level-replay-size",
+          "flags": [
+            "--level-replay-size"
+          ],
+          "dest": "level_replay_size",
+          "label": "level replay size",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 24,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--rand-widen",
+          "flags": [
+            "--rand-widen"
+          ],
+          "dest": "rand_widen",
+          "label": "rand widen",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "stretch every physics randomisation range W times about its midpoint (1 = as configured)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "W"
+        },
+        {
+          "flag": "--rand-range",
+          "flags": [
+            "--rand-range"
+          ],
+          "dest": "rand_range",
+          "label": "rand range",
+          "kind": "list",
+          "item_kind": "str",
+          "default": [],
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "set / add one randomisation range (after --rand-widen), e.g. actuator.motor_delay=0,0.1",
+          "action": "append",
+          "nullable": false,
+          "metavar": "GROUP.FIELD=LO,HI",
+          "separator": "space"
+        },
+        {
+          "flag": "--maneuver-temp",
+          "flags": [
+            "--maneuver-temp"
+          ],
+          "dest": "maneuver_temp",
+          "label": "maneuver temp",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "maneuver head only: the PPO mixture's candidate-choice temperature (recorded in the checkpoint; < 1 sharpens it). None keeps the checkpoint's (1.0 if unset)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--fresh-critic-ok",
+          "flags": [
+            "--fresh-critic-ok"
+          ],
+          "dest": "fresh_critic_ok",
+          "label": "fresh critic ok",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "memory warm start only: a critic weight whose shape changed (a solo checkpoint's critic in a race, whose privileged input grew) keeps its fresh init instead of refusing; the actor must still copy exactly. Pair with --critic-warmup",
+          "action": "store_true",
           "nullable": false,
           "metavar": null
         },
@@ -1432,6 +1680,46 @@
           "group": "고급",
           "help": "weight of an auxiliary loss making the actor's RECURRENT STATE (the trunk features with --memory off) predict, 20 control steps (0.50 s) ahead: the nearest opponent's relative position and velocity in the ego frame, a presence logit, and the ego's own speed and yaw rate. Privileged labels from the simulator, masked across episode boundaries and where no opponent is in range. 0 = off, and off the head is not built at all: same parameters, same state dict, same loss. Measure what it did with `python -m f1sim.learn.probe_hidden`",
           "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-future-source",
+          "flags": [
+            "--aux-future-source"
+          ],
+          "dest": "aux_future_source",
+          "label": "aux future source",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "decision"
+          ],
+          "required": false,
+          "group": "고급",
+          "help": "'decision': the future head reads the features the action head reads instead of the recurrent state (None: as before)",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-future-into-policy",
+          "flags": [
+            "--aux-future-into-policy"
+          ],
+          "dest": "aux_future_into_policy",
+          "label": "aux future into policy",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "with --aux-future-source decision: the head's prediction (detached) is also an input of the action head, its columns starting at zero",
+          "action": "store_true",
           "nullable": false,
           "metavar": null
         },
@@ -3122,6 +3410,54 @@
           "metavar": "FRAC"
         },
         {
+          "flag": "--speed-mode",
+          "flags": [
+            "--speed-mode"
+          ],
+          "dest": "speed_mode",
+          "label": "plan 속도 표현 (speed mode)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "linear",
+            "envelope",
+            "knots",
+            "budget",
+            "timed",
+            "tspeed"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "the plan's speed dimensions (f1sim.mpc.SPEED_MODES). Default: the --init checkpoint's own, 'linear' without one. A different one from the init's is refused",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--speed-command",
+          "flags": [
+            "--speed-command"
+          ],
+          "dest": "speed_command",
+          "label": "speed command",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "tracker",
+            "profile"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "who sets the VESC speed command (EnvConfig.speed_command). Default: the init's own",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
           "flag": "--plan-kappa-mode",
           "flags": [
             "--plan-kappa-mode"
@@ -3238,6 +3574,25 @@
           "group": "환경",
           "help": "whether that corridor is enforced at all. 'off' lets a layout stand ON the racing line, which is the only way the policy ever meets an obstacle there -- and it does not today. Requires --spawn-runway and every teacher-driven car to be a prop-aware kind (--opp-slots), because a raceline-driven opponent cannot see a prop and its crashes would become the collision rate",
           "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--legacy-car-wall-charge",
+          "flags": [
+            "--legacy-car-wall-charge"
+          ],
+          "dest": "legacy_car_wall_charge",
+          "label": "legacy car wall charge",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "reproduce the contact accounting of every run before 2026-10-13: a car contact also counts as a wall/prop collision (charged at the wall multiplier too), and the car-behind exemption is re-read every step of a contact instead of at its start",
+          "action": "store_true",
           "nullable": false,
           "metavar": null
         },
@@ -3653,6 +4008,234 @@
           "metavar": null
         },
         {
+          "flag": "--lagrange",
+          "flags": [
+            "--lagrange"
+          ],
+          "dest": "lagrange",
+          "label": "lagrange",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "constrained PPO (2026-10-01): contact rates as constraints instead of hand-set penalty weights. NAME is 'wall' (soft-contact onsets with walls and props, the collision component; before 2026-10-13 it also counted every car contact, EnvConfig.collision_counts_cars) or 'car' (onsets of the car contacts the learner is charged for; the exempt ones show as car_all); PER_KM the target, in the evaluation's own unit. Each gets a multiplier updated by dual ascent after every rollout, lambda += lr * (rate - target), and the step reward carries -lambda per contact in place of the fixed penalty. Needs that component's own weight nonzero (--collision-penalty / --car-contact-penalty) so the onset is visible; the weight itself is removed from the reward.",
+          "action": "store",
+          "nullable": false,
+          "metavar": "NAME=PER_KM,..."
+        },
+        {
+          "flag": "--lagrange-lr",
+          "flags": [
+            "--lagrange-lr"
+          ],
+          "dest": "lagrange_lr",
+          "label": "lagrange lr",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 2.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "dual step per (contact/km) of violation",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lagrange-init",
+          "flags": [
+            "--lagrange-init"
+          ],
+          "dest": "lagrange_init",
+          "label": "lagrange init",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 8.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lagrange-max",
+          "flags": [
+            "--lagrange-max"
+          ],
+          "dest": "lagrange_max",
+          "label": "lagrange max",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 200.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--lagrange-anneal",
+          "flags": [
+            "--lagrange-anneal"
+          ],
+          "dest": "lagrange_anneal",
+          "label": "lagrange anneal",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "walk each constraint's target down from the measured rate: after --lagrange-anneal-every updates of measuring (multiplier held), every that many updates the target becomes FRAC x the smoothed rate (never up, never below the --lagrange value). 0 = fixed targets, as before",
+          "action": "store",
+          "nullable": false,
+          "metavar": "FRAC"
+        },
+        {
+          "flag": "--lagrange-anneal-every",
+          "flags": [
+            "--lagrange-anneal-every"
+          ],
+          "dest": "lagrange_anneal_every",
+          "label": "lagrange anneal every",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 64,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "U"
+        },
+        {
+          "flag": "--rear-end-penalty",
+          "flags": [
+            "--rear-end-penalty"
+          ],
+          "dest": "rear_end_penalty",
+          "label": "rear end penalty",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "charge the onset of a contact with a car ahead W x (relative speed)^2 (GT Sophy's rear-end term). 0 = off",
+          "action": "store",
+          "nullable": false,
+          "metavar": "W"
+        },
+        {
+          "flag": "--merge-penalty",
+          "flags": [
+            "--merge-penalty"
+          ],
+          "dest": "merge_penalty",
+          "label": "merge penalty",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "charge W per metre of the learner's own lateral motion toward a car level with it or just behind, within 1 m sideways (cutting back in after a pass). 0 = off",
+          "action": "store",
+          "nullable": false,
+          "metavar": "W"
+        },
+        {
+          "flag": "--progress-gate",
+          "flags": [
+            "--progress-gate"
+          ],
+          "dest": "progress_gate",
+          "label": "progress gate",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "1 = multiply the progress reward by a safety factor in [--gate-min, 1] that falls as the body gap to another car shrinks below 0.3 m + closing speed x 0.5 s. 0 = off",
+          "action": "store",
+          "nullable": false,
+          "metavar": "ON"
+        },
+        {
+          "flag": "--gate-min",
+          "flags": [
+            "--gate-min"
+          ],
+          "dest": "gate_min",
+          "label": "gate min",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--replay-contacts",
+          "flags": [
+            "--replay-contacts"
+          ],
+          "dest": "replay_contacts",
+          "label": "replay contacts",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "probability that a whole-race reset starts from a scene recorded --replay-lag seconds before one of the learner's car contacts (two-car races; GT Sophy's 'mistake learning'). 0 = off, byte-identical to a run without it",
+          "action": "store",
+          "nullable": false,
+          "metavar": "P"
+        },
+        {
+          "flag": "--replay-lag",
+          "flags": [
+            "--replay-lag"
+          ],
+          "dest": "replay_lag",
+          "label": "replay lag",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.75,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "S"
+        },
+        {
           "flag": "--movable-obstacles",
           "flags": [
             "--movable-obstacles"
@@ -3750,6 +4333,238 @@
           "action": "store",
           "nullable": false,
           "metavar": null
+        },
+        {
+          "flag": "--arch",
+          "flags": [
+            "--arch"
+          ],
+          "dest": "arch",
+          "label": "network 구조 (v1 / v2)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "v1",
+          "nargs": null,
+          "choices": [
+            "v1",
+            "v2"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: the redesigned actor-critic (docs/research/architecture-redesign-2026-10-13.md) on observation contract v2 and WP4 plans: one value stream with value normalisation and a 'car contact within 1 s' classifier on a critic that reads privileged_v2, no KL leash (kl_ref logged only), --clip-split, Adam eps 1e-8, --vf-clip 0, actor lr 2e-5 -> 1e-5, critic lr 3e-4, horizon 128, minibatch 4096 in 4 pieces unless set. v1: every run before it",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--v2-frames",
+          "flags": [
+            "--v2-frames"
+          ],
+          "dest": "v2_frames",
+          "label": "v2 LiDAR frame 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--v2-init-stem",
+          "flags": [
+            "--v2-init-stem"
+          ],
+          "dest": "v2_init_stem",
+          "label": "v2 stem 초기화 checkpoint (v1)",
+          "kind": "path",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2 without --init: seed both stems from this v1 resnet checkpoint (model_v2.init_stems_from_v1)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "CKPT",
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--critic-lr",
+          "flags": [
+            "--critic-lr"
+          ],
+          "dest": "critic_lr",
+          "label": "v2 critic learning rate",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: the critic's learning rate, constant (default 3e-4, the redesign's); --lr / --lr-end schedule the actor",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--value-norm-beta",
+          "flags": [
+            "--value-norm-beta"
+          ],
+          "dest": "value_norm_beta",
+          "label": "v2 value 정규화 EMA β",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: per-update EMA weight of the return statistics the critic's targets are normalised by (default 0.99, about the last hundred updates)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "B"
+        },
+        {
+          "flag": "--contact-bce",
+          "flags": [
+            "--contact-bce"
+          ],
+          "dest": "contact_bce",
+          "label": "v2 '1초 안 차 접촉' BCE 가중치",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: weight of the critic's 'charged car contact within 1 s' BCE (default 1.0, G4's)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-b8",
+          "flags": [
+            "--aux-b8"
+          ],
+          "dest": "aux_b8",
+          "label": "aux head · B8 상대차 slot 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the B8 opponent-slot loss on the actor (default 0.5, the redesign's)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-near-car",
+          "flags": [
+            "--aux-near-car"
+          ],
+          "dest": "aux_near_car",
+          "label": "aux head · 최근접 상대차 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the nearest-visible-car head (default 0: not built)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-beam-car",
+          "flags": [
+            "--aux-beam-car"
+          ],
+          "dest": "aux_beam_car",
+          "label": "aux head · beam별 차 판별 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the per-beam car / not-car head (default 0: not built)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-balance-every",
+          "flags": [
+            "--aux-balance-every"
+          ],
+          "dest": "aux_balance_every",
+          "label": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x the policy gradient (default 10; 0 = off, the coefficients alone)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--aux-balance-rho",
+          "flags": [
+            "--aux-balance-rho"
+          ],
+          "dest": "aux_balance_rho",
+          "label": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: the largest auxiliary / policy-gradient trunk-gradient ratio the balance allows (default 0.5)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "RHO"
+        },
+        {
+          "flag": "--aux-balance-beta",
+          "flags": [
+            "--aux-balance-beta"
+          ],
+          "dest": "aux_balance_beta",
+          "label": "aux gradient 균형 EMA β (측정당, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the last five measurements)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "B"
         }
       ]
     },
@@ -4200,12 +5015,113 @@
           "choices": [
             "linear",
             "envelope",
-            "knots"
+            "knots",
+            "budget",
+            "timed",
+            "tspeed"
           ],
           "required": false,
           "group": "학습",
           "help": "what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES). 'linear': two speeds, linear between (every existing checkpoint). 'envelope': a grip belief a_hat and an end speed; the profile follows the plan's own curvature. 'knots': a speed at every curvature knot",
           "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--speed-command",
+          "flags": [
+            "--speed-command"
+          ],
+          "dest": "speed_command",
+          "label": "speed command",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "tracker",
+          "nargs": null,
+          "choices": [
+            "tracker",
+            "profile"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "who sets the VESC speed command (EnvConfig.speed_command): the plan tracker, or the plan's own speed profile sent directly (for the profile speed modes)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--tracker-speed-weight",
+          "flags": [
+            "--tracker-speed-weight"
+          ],
+          "dest": "tracker_speed_weight",
+          "label": "tracker speed weight",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "EnvConfig.tracker_speed_weight",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--tracker-a-max",
+          "flags": [
+            "--tracker-a-max"
+          ],
+          "dest": "tracker_a_max",
+          "label": "tracker a max",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "EnvConfig.tracker_a_max",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--tracker-profile-from-prediction",
+          "flags": [
+            "--tracker-profile-from-prediction"
+          ],
+          "dest": "tracker_profile_from_prediction",
+          "label": "tracker profile from prediction",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "EnvConfig.tracker_profile_from_prediction (profile speed modes)",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--tracker-speed-ff",
+          "flags": [
+            "--tracker-speed-ff"
+          ],
+          "dest": "tracker_speed_ff",
+          "label": "tracker speed ff",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "EnvConfig.tracker_speed_ff: the VESC command is the motor-loop inverse of the tracker's plan",
+          "action": "store_true",
           "nullable": false,
           "metavar": null
         },
@@ -4324,6 +5240,85 @@
           "group": "고급",
           "help": "weight of an auxiliary loss asking the actor's opponent head where the nearest car is and how fast it is closing. Needs --race-size > 1. The teacher never looks at an opponent, so it cannot demonstrate a pass or a yield -- but 'a car is there and it moves like this' is read out of how the LiDAR returns shift, and the simulator knows the answer",
           "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--maneuver",
+          "flags": [
+            "--maneuver"
+          ],
+          "dest": "maneuver",
+          "label": "maneuver",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "learn/maneuver.py: the student carries the rollout teacher's whole decision -- every candidate's plan, which one the teacher takes, and each candidate's simulated outcome (contact within the horizon, progress) -- and acts on the candidate it ranks first. Needs --teacher rollout and a feedforward student",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--maneuver-weights",
+          "flags": [
+            "--maneuver-weights"
+          ],
+          "dest": "maneuver_weights",
+          "label": "maneuver weights",
+          "kind": "str",
+          "item_kind": "str",
+          "default": "1,1,1,1",
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "plan,choice,risk,progress loss weights",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--maneuver-mode",
+          "flags": [
+            "--maneuver-mode"
+          ],
+          "dest": "maneuver_mode",
+          "label": "maneuver mode",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "transform",
+          "nargs": null,
+          "choices": [
+            "transform",
+            "plans"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "'transform': ONE regressed plan (the teacher's plain-line candidate) and the candidates as its shifts -- what generalises; 'plans': K regressed plans (2026-10-01, held-out 42 %%)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--aux-opp-visible",
+          "flags": [
+            "--aux-opp-visible"
+          ],
+          "dest": "aux_opp_visible",
+          "label": "aux opp visible",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "score --aux-opp only where the nearest car is visible (>= 3 car returns near its bearing, F1VecEnv.opponent_visible). Off: every car within range, behind the ego included",
+          "action": "store_true",
           "nullable": false,
           "metavar": null
         },
@@ -4487,6 +5482,246 @@
           "metavar": null
         },
         {
+          "flag": "--rollout-horizon",
+          "flags": [
+            "--rollout-horizon"
+          ],
+          "dest": "rollout_horizon",
+          "label": "rollout horizon",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.5,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "[s] --teacher rollout: how long each candidate is simulated in the shadow env",
+          "action": "store",
+          "nullable": false,
+          "metavar": "S"
+        },
+        {
+          "flag": "--rollout-graphs",
+          "flags": [
+            "--rollout-graphs"
+          ],
+          "dest": "rollout_graphs",
+          "label": "rollout graphs",
+          "kind": "choice",
+          "item_kind": "int",
+          "default": 1,
+          "nargs": null,
+          "choices": [
+            0,
+            1
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "--teacher rollout: run the shadow env under the CUDA-graph runtime (1) rather than torch.compile. Measured 7.1 against 10.5 s a decision on the training floor, with the shadow tracking the real env as closely (1.3 mm median after 10 steps)",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--rollout-every",
+          "flags": [
+            "--rollout-every"
+          ],
+          "dest": "rollout_every",
+          "label": "rollout every",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 10,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "--teacher rollout: steps between decisions; the chosen candidate policy drives between",
+          "action": "store",
+          "nullable": false,
+          "metavar": "STEPS"
+        },
+        {
+          "flag": "--procedural-obstacles",
+          "flags": [
+            "--procedural-obstacles"
+          ],
+          "dest": "procedural_obstacles",
+          "label": "procedural 장애물 episode 비율",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "share of env resets that get a freshly drawn obstacle layout (learn.ppo)",
+          "action": "store",
+          "nullable": false,
+          "metavar": "FRAC"
+        },
+        {
+          "flag": "--procedural-density",
+          "flags": [
+            "--procedural-density"
+          ],
+          "dest": "procedural_density",
+          "label": "장애물 밀도 (10m당)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 1.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "PER10M"
+        },
+        {
+          "flag": "--procedural-max-props",
+          "flags": [
+            "--procedural-max-props"
+          ],
+          "dest": "procedural_max_props",
+          "label": "장애물 최대 개수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": 0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "N"
+        },
+        {
+          "flag": "--procedural-raceline-margin",
+          "flags": [
+            "--procedural-raceline-margin"
+          ],
+          "dest": "procedural_raceline_margin",
+          "label": "장애물 raceline 여유 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.25,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--procedural-raceline-corridor",
+          "flags": [
+            "--procedural-raceline-corridor"
+          ],
+          "dest": "procedural_raceline_corridor",
+          "label": "raceline 위 장애물 허용 (corridor off)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "on",
+          "nargs": null,
+          "choices": [
+            "on",
+            "off"
+          ],
+          "required": false,
+          "group": "환경",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--collision-mode",
+          "flags": [
+            "--collision-mode"
+          ],
+          "dest": "collision_mode",
+          "label": "충돌 처리 (terminate / soft)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "terminate",
+          "nargs": null,
+          "choices": [
+            "terminate",
+            "soft"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--movable-obstacles",
+          "flags": [
+            "--movable-obstacles"
+          ],
+          "dest": "movable_obstacles",
+          "label": "장애물이 밀림 (질량 있음)",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "needs --collision-mode soft (learn.ppo)",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--spawn-runway",
+          "flags": [
+            "--spawn-runway"
+          ],
+          "dest": "spawn_runway",
+          "label": "spawn 활주로 (m)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--kind-mix-assign",
+          "flags": [
+            "--kind-mix-assign"
+          ],
+          "dest": "kind_mix_assign",
+          "label": "kind mix assign",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "partition",
+          "nargs": null,
+          "choices": [
+            "partition",
+            "redraw"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
           "flag": "--teacher",
           "flags": [
             "--teacher"
@@ -4499,7 +5734,8 @@
           "nargs": null,
           "choices": [
             "raceline",
-            "interactive"
+            "interactive",
+            "rollout"
           ],
           "required": false,
           "group": "teacher·상대차",
@@ -4932,6 +6168,25 @@
           "metavar": null
         },
         {
+          "flag": "--teacher-eval-steps",
+          "flags": [
+            "--teacher-eval-steps"
+          ],
+          "dest": "teacher_eval_steps",
+          "label": "teacher eval steps",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "steps of the one-off teacher measurement (default --eval-steps; 0 skips it). The rollout teacher took 1.8 h for 800 steps at 256 envs, which a resumed run need not repeat",
+          "action": "store",
+          "nullable": true,
+          "metavar": "N"
+        },
+        {
           "flag": "--eval-every",
           "flags": [
             "--eval-every"
@@ -5006,6 +6261,222 @@
           "action": "store_true",
           "nullable": false,
           "metavar": null
+        },
+        {
+          "flag": "--arch",
+          "flags": [
+            "--arch"
+          ],
+          "dest": "arch",
+          "label": "network 구조 (v1 / v2)",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "v1",
+          "nargs": null,
+          "choices": [
+            "v1",
+            "v2"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: the redesigned actor (docs/research/architecture-redesign-2026-10-13.md) on observation contract v2 and WP4 plans -- recurrent sequences with burn-in (--seq-burn 40, --chunk-length 80 unless set), imitation in the decoded WP4 space, B8, left-right mirroring. v1: every run before it",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--v2-frames",
+          "flags": [
+            "--v2-frames"
+          ],
+          "dest": "v2_frames",
+          "label": "v2 LiDAR frame 수",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--v2-init-stem",
+          "flags": [
+            "--v2-init-stem"
+          ],
+          "dest": "v2_init_stem",
+          "label": "v2 stem 초기화 checkpoint (v1)",
+          "kind": "path",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: seed a fresh student's two stems from this v1 resnet checkpoint (model_v2.init_stems_from_v1, as G1 / G4 did)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "CKPT",
+          "path_mode": "input_file"
+        },
+        {
+          "flag": "--wp4-label",
+          "flags": [
+            "--wp4-label"
+          ],
+          "dest": "wp4_label",
+          "label": "v2 WP4 teacher label 출처",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": null,
+          "nargs": null,
+          "choices": [
+            "env",
+            "linear-refit"
+          ],
+          "required": false,
+          "group": "학습",
+          "help": "v2: where the WP4 labels come from. 'env' (default): the env's teacher-label API, where feat/v2's wp4 teachers plug in. 'linear-refit': the raceline teacher's linear plan, first window refitted to the four waypoints -- a stand-in for tests and smoke runs on a tree whose teachers do not speak wp4",
+          "action": "store",
+          "nullable": true,
+          "metavar": null
+        },
+        {
+          "flag": "--mirror-prob",
+          "flags": [
+            "--mirror-prob"
+          ],
+          "dest": "mirror_prob",
+          "label": "v2 좌우 반전 증강 확률",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: probability that a training sequence is mirrored left-right (default 0.5)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "P"
+        },
+        {
+          "flag": "--aux-b8",
+          "flags": [
+            "--aux-b8"
+          ],
+          "dest": "aux_b8",
+          "label": "aux head · B8 상대차 slot 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the B8 opponent-slot loss (default 0.5, the redesign's; 0 builds no head)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-near-car",
+          "flags": [
+            "--aux-near-car"
+          ],
+          "dest": "aux_near_car",
+          "label": "aux head · 최근접 상대차 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the nearest-visible-car head (default 0: not built)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-beam-car",
+          "flags": [
+            "--aux-beam-car"
+          ],
+          "dest": "aux_beam_car",
+          "label": "aux head · beam별 차 판별 가중치 (v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: weight of the per-beam car / not-car head (default 0: not built)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "COEF"
+        },
+        {
+          "flag": "--aux-balance-every",
+          "flags": [
+            "--aux-balance-every"
+          ],
+          "dest": "aux_balance_every",
+          "label": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x the imitation loss (default 10; 0 = off, the coefficients alone)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "K"
+        },
+        {
+          "flag": "--aux-balance-rho",
+          "flags": [
+            "--aux-balance-rho"
+          ],
+          "dest": "aux_balance_rho",
+          "label": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: the largest auxiliary / imitation trunk-gradient ratio the balance allows (default 0.5)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "RHO"
+        },
+        {
+          "flag": "--aux-balance-beta",
+          "flags": [
+            "--aux-balance-beta"
+          ],
+          "dest": "aux_balance_beta",
+          "label": "aux gradient 균형 EMA β (측정당, v2)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "고급",
+          "help": "v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the last five measurements)",
+          "action": "store",
+          "nullable": true,
+          "metavar": "B"
         },
         {
           "flag": "--race-size",
@@ -6616,7 +8087,10 @@
       "event_rate",
       "reactive",
       "spawn",
-      "seed"
+      "seed",
+      "ckpt_mix",
+      "ckpt_p",
+      "present"
     ],
     "slot_kinds": [
       {

@@ -47,6 +47,8 @@ ALLOWED = {
     ("f1sim/f1sim/viewer/server.py",
      "cars = torch.stack([st[:, 0], st[:, 1], st[:, 2], st[:, 6], st[:, 3], r.lap[:n].float(),"),
     ("f1sim/f1sim/viewer/sim_worker.py", '"steer": _copy(p[:, 6]), "roll": _copy(p[:, 7]), "pitch": _copy(p[:, 8]),'),
+    # the v2 mirror check flips the same state vector's steering angle with the yaw rate
+    ("f1sim/f1sim/learn/train_v2.py", "s[:, 6] = -state[:, 6]"),
     # the adaptive grip estimator's feature vector, column 6 of its own layout
     ("f1sim/f1sim/learn/adaptive_grip.py", "x[..., 6] - 0.981,"),
     # the first six names of a list, in an error message

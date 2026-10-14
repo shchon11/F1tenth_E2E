@@ -86,6 +86,9 @@ class ScanSnapshot:
 
 
 class ControllerNode(Node):
+    #: Class default for a node assembled with `__new__` (several tests do): the v1 rule.
+    attitude_required = True
+
     def __init__(self):
         super().__init__("f1sim_controller")
         d = self.declare_parameter
@@ -140,6 +143,10 @@ class ControllerNode(Node):
                                            float(p("range_max")), float(p("v_max")))
         self.speed_cap = float(p("speed_cap")); self.steer_max = float(p("steer_max"))
         self.cal = (float(p("steer_bias")), float(p("steer_gain")), float(p("speed_gain")))
+        #: The policy's own stale rule, so the two nodes stop on the same inputs: a v2 policy reads no
+        #: roll / pitch (`SensorIntake.stale(attitude=False)`), and a controller that kept requiring a
+        #: fresh orientation would stop the car the policy is still planning for. v1 is unchanged.
+        self.attitude_required = int(getattr(self.spec, "version", 1)) != 2
         self.timeout = float(p("sensor_timeout"))
         self.plan_timeout = float(p("plan_timeout"))
         if not math.isfinite(self.plan_timeout) or self.plan_timeout <= 0.0:
@@ -284,7 +291,13 @@ class ControllerNode(Node):
         from f1sim.mpc import contract_of
         self.contract = contract_of(ck.get("extra"))
         spec_d = dict((ck.get("extra") or {}).get("spec") or {})
-        spec = _Spec(**spec_d) if spec_d else _Spec()
+        if int(spec_d.get("version", 1)) == 2:
+            # observation contract v2 (a `learn.model_v2` checkpoint): different field names, the same
+            # three numbers this node needs (beam count, range scale, speed scale)
+            from f1sim.learn.obs import spec_from_dict
+            spec = spec_from_dict(spec_d)
+        else:
+            spec = _Spec(**spec_d) if spec_d else _Spec()
         for k, v in override.items():
             if abs(float(getattr(spec, k)) - float(v)) > 1e-9:
                 raise ValueError(
@@ -359,7 +372,7 @@ class ControllerNode(Node):
         now = self.clock()
         self.sensors.t_scan = now
         imu_mean = self.sensors.take_imu_mean(now)
-        stale = self.sensors.stale(now)
+        stale = self.sensors.stale(now, attitude=self.attitude_required)
         if stale:
             self._inhibit(stale, self.stamp_now())
             return
@@ -523,7 +536,7 @@ class ControllerNode(Node):
         policy process and a car still driving on the last plan it sent.
         """
         now = self.clock()
-        stale = self.sensors.stale(now, check_scan=True)
+        stale = self.sensors.stale(now, check_scan=True, attitude=self.attitude_required)
         if stale:
             self._inhibit(stale, self.stamp_now())
             return

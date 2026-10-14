@@ -31,10 +31,16 @@ def validate_policy_observation(saved: dict, env) -> None:
     import math
     if not isinstance(saved, dict) or not saved:
         raise ValueError("policy checkpoint has no observation specification")
-    expected = ObsSpec(**{key: value for key, value in saved.items()
-                          if key in ObsSpec.__dataclass_fields__})
+    cls = ObsSpec
+    if int(saved.get("version", 1)) == 2:
+        # contract v2 (`learn.obs.ObsSpecV2`): the same field-by-field comparison, on its own fields
+        from .obs import ObsSpecV2 as cls
+    expected = cls(**{key: value for key, value in saved.items() if key in cls.__dataclass_fields__})
     actual = obs_spec(env)
-    for key in ObsSpec.__dataclass_fields__:
+    if type(actual) is not cls:
+        raise ValueError(f"policy observation contract v{int(saved.get('version', 1))}, environment emits "
+                         f"{type(actual).__name__}")
+    for key in cls.__dataclass_fields__:
         want, got = getattr(expected, key), getattr(actual, key)
         if isinstance(want, float) or isinstance(got, float):
             same = math.isfinite(float(want)) and math.isfinite(float(got)) \
@@ -334,8 +340,16 @@ def student_policy(model, env: F1VecEnv, device=None, deterministic: bool = True
     return run
 
 
-def obs_spec(env: F1VecEnv) -> ObsSpec:
+def obs_spec(env: F1VecEnv):
+    """The observation contract this env emits: `ObsSpec` (v1, every env before 2026-10-14) or, for
+    `EnvConfig.obs_version == 2`, `ObsSpecV2`."""
     e = env.ecfg
+    if getattr(env, "obs_version", 1) == 2:
+        from .obs import ObsSpecV2
+        return ObsSpecV2(n_beams=env.n_beams, n_frames=e.scan_stack, frame_stride=e.scan_stride,
+                         act_dim=env.act_dim, speed_mode=e.speed_mode, hist_len=e.hist_len,
+                         hist_stride=e.hist_stride, range_max=env.range_max, v_max=e.v_max_policy,
+                         gyro_scale=e.imu_gyro_scale).validate()
     return ObsSpec(n_beams=env.n_beams, scan_stack=e.scan_stack, scan_stride=e.scan_stride, action_history=e.action_history,
                    act_dim=env.act_dim, hist_len=e.hist_len, hist_stride=e.hist_stride, range_max=env.range_max, v_max=e.v_max_policy,
                    gyro_scale=e.imu_gyro_scale, accel_scale=e.imu_accel_scale,

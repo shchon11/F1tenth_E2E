@@ -29,6 +29,8 @@ from .mpc import plan_layout as _plan_layout
 from .opponent_events import (NO_EVENT, LearnerView, OpponentEvents, raceline_corners,
                                raceline_offset_limit_sided, split_events)
 from .learn.obs import ATT_SCALE, MessageInputs, norm_att, norm_imu, norm_scan, norm_speed
+from .learn.obs import (EGO_SENSOR_KEYS, OBS_VERSIONS, V2_MAX_FRAMES, assemble_ego_v2, norm_gyro_z,
+                        v2_ego_dim, v2_ring_len)
 from .opp_token import (OPP_TOKEN_CARS, OPP_TOKEN_HORIZONS_S, OPP_TOKEN_PLAN_SOURCE,
                         OPP_TOKEN_SCALE, opp_token_car_dim, opp_token_dim, sample_body_traj,
                         straight_traj, to_ego, to_world, validate_opp_token)
@@ -49,6 +51,61 @@ TTC_FAR = 1e3
 #: The nearest-opponent columns of privileged() are stored as metres (or m/s) divided by this, to
 #: keep them O(1) for the critic. Anything comparing them against a real distance must multiply.
 PRIV_OPP_DIST_SCALE = 5.0
+
+# ---- contract v2's critic vector (`F1VecEnv.privileged_v2`) -----------------------------------------
+#: The redesign's B9 as corrected by the 10-14 gates (architecture-redesign appendix 2): ego 8, three
+#: opponents x 7, the explicit geometry the information-gap gate measured (+0.049 AUC and R over the
+#: same critic without it, CI excluding 0), and the speed cap (critique B5: the policy does not see
+#: the cap, so the critic has to, or the biggest cause of the return is invisible to it). Every
+#: column is divided by a fixed scale so all of them are O(1) -- v1's progress rate reached 56
+#: unnormalised. The dial is NOT here: the trainer owns it (`conditioning.DialDraw`) and hands the
+#: critic the same `c` column the actor reads.
+#:
+#: v1's `privileged()` is untouched (21 wide in a race, 22 with the dial): every v1 critic keeps it.
+PRIV_V2_EGO_KEYS = ("vx", "vy", "yaw_rate", "lateral", "heading_err", "lap_frac", "progress_rate",
+                    "wall_dist")
+#: Per opponent, nearest first by centre distance, absent seats all zero -- the layout the G4 gate
+#: collected and trained on (`present, dx/5, dy/5, dist/5, dvx/5, dvy/5, dyaw`).
+PRIV_V2_OPP_KEYS = ("present", "dx", "dy", "dist", "dvx", "dvy", "dyaw")
+PRIV_V2_OPP_SLOTS = 3
+#: The align gate's 'explicit geometry': the nearest present opponent's centre distance, its closing
+#: speed and time to contact, and the minimum time to contact over present opponents.
+PRIV_V2_GEO_KEYS = ("near_dist", "near_closing", "near_ttc", "min_ttc")
+PRIV_V2_KEYS = (PRIV_V2_EGO_KEYS
+                + tuple(f"opp{j}_{k}" for j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS)
+                + PRIV_V2_GEO_KEYS + ("speed_cap",))
+PRIV_V2_DIM = len(PRIV_V2_KEYS)
+#: [s] TTC reported when nothing closes faster than `PRIV_V2_TTC_MIN_CLOSING`, and its cap. The
+#: align gate's numbers; with no opponent at all: distance 30 m, closing 0, TTC 10, min TTC 10.
+PRIV_V2_TTC_CAP = 10.0
+PRIV_V2_TTC_MIN_CLOSING = 0.05
+PRIV_V2_NO_OPP_DIST = 30.0
+#: Each column's sign under a left-right mirror of the world (for the training unit's augmentation).
+PRIV_V2_MIRROR = tuple(
+    {"vy": -1.0, "yaw_rate": -1.0, "lateral": -1.0, "heading_err": -1.0}.get(k, 1.0)
+    for k in PRIV_V2_EGO_KEYS) + tuple(
+    {"dy": -1.0, "dvy": -1.0, "dyaw": -1.0}.get(k, 1.0)
+    for _j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS) + (1.0,) * (len(PRIV_V2_GEO_KEYS) + 1)
+
+# ---- per-seat visibility for the v2 opponent-slot auxiliary (B8) -----------------------------------
+#: [m] a seat is a label candidate within this distance of the LiDAR (requirement P2: the positions of
+#: up to three cars within 6 m).
+OPP_LABEL_RANGE_M = 6.0
+#: A seat is SEEN on a step when at least this many of the newest scan's car beams land on it -- the
+#: rule G1, align and the perception gate all used (`opponent_visible` uses it for the nearest car).
+OPP_SEEN_BEAMS = 3
+#: [steps] a sighting stays a label this long (3 s at 40 Hz): occlusions last p50 0.68 s, p90 1.71 s,
+#: behind the car p90 2.96 s (requirement M1).
+OPP_MEMORY_STEPS = 120
+#: `age` of a seat that has not been seen since its track began (episode start or respawn).
+OPP_NEVER_SEEN = 1_000_000
+#: [m] a car beam is attributed to the seat whose body + rear detection box (the rectangle the LiDAR
+#: draws for it, `Simulator._car_boxes`) is nearest its true hit point, if it is within this. The
+#: scan is motion-distorted over 25 ms (0.22 m at 9 m/s), which is what the tolerance absorbs.
+OPP_ATTRIB_TOL_M = 0.30
+#: A return is VALID -- usable as a per-beam label -- when it is finite, short of range_max, and the
+#: noisy range is within this of the true one (the perception gate's definition).
+BEAM_VALID_TOL_M = 0.30
 
 #: The columns of `F1VecEnv.future_labels`, in order. The first six are regression targets for the
 #: auxiliary future head (`f1sim.learn.future`); the last is the target of a presence *logit*, 1
@@ -401,6 +458,17 @@ class EnvConfig:
     scan_stride: int = 1             # frames between stacked scans (3 x stride 3 = 225 ms of history: velocity cues)
     hist_len: int = 0                # >0: proprioceptive history rows (speed, imu, roll/pitch, action) in the observation
     hist_stride: int = 2             # steps between rows (20 x 2 = the last second): implicit identification of grip / lag
+    #: Observation contract (`learn.obs.OBS_VERSIONS`). 1 is every run before 2026-10-14 and the
+    #: default leaves it bit-identical (`tests/test_v1_bit_identity.py`). 2 is `learn.obs.ObsSpecV2`:
+    #: {"scan": the newest `scan_stack` (1..3) frames, "ego": [speed, gyro z] now + the action issued
+    #: two steps back + `hist_len` rows of [speed, gyro z, the issued action] `hist_stride` steps
+    #: apart} -- no speed cap, attitude, accelerometer, gyro x/y or prev_action key. Plan mode only;
+    #: the IMU must be on.
+    obs_version: int = 1
+    #: Per-opponent LiDAR visibility for the v2 opponent-slot auxiliary (B8) and the nearest-visible-
+    #: car head: each step, the car beams of the newest scan attributed to each seat and the steps
+    #: since each seat was last seen (>= 3 beams within 6 m of the LiDAR). Off computes nothing.
+    opp_visibility: bool = False
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
                                      # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
@@ -945,6 +1013,35 @@ class F1VecEnv:
         self.row_dim = 1 + 6 + 2 + self.act_dim
         self.hist = torch.zeros(self.B, (e.hist_len - 1) * e.hist_stride + 1, self.row_dim, device=self.device) if e.hist_len > 0 else None
         self._last_feat = torch.zeros(self.B, 9, device=self.device)
+        #: Observation contract v2 (`EnvConfig.obs_version`, `learn.obs.ObsSpecV2`). It keeps its own
+        #: history ring -- rows of [speed, gyro z, issued action] -- and none of v1's: `self.hist` is
+        #: None under v2, so every v1 history path below is skipped rather than computed for nothing.
+        #: Under v1 (the default) these stay None and nothing else in this class looks at them.
+        self.obs_version = int(e.obs_version)
+        self.hist2 = None
+        self._last_feat2 = None
+        self._fresh2 = None
+        if self.obs_version not in OBS_VERSIONS:
+            raise ValueError(f"obs_version must be one of {OBS_VERSIONS}, got {e.obs_version}")
+        if self.obs_version == 2:
+            self._check_obs_v2()
+            self.hist = None
+            # one row per step back, enough for the oldest history row and for a_{t-2}
+            # (`learn.obs.v2_ring_len`: 39 rows for the contract's 20 x 2, as before a_{t-2})
+            self.hist2 = torch.zeros(self.B, v2_ring_len(e.hist_len, e.hist_stride),
+                                     len(EGO_SENSOR_KEYS) + self.act_dim, device=self.device)
+            self._last_feat2 = torch.zeros(self.B, len(EGO_SENSOR_KEYS), device=self.device)
+            #: rows whose next observation is their episode's first: `_obs_v2` fills their history
+            #: from it (`ObsBuilderV2`'s rule) and clears the flag
+            self._fresh2 = torch.ones(self.B, dtype=torch.bool, device=self.device)
+        #: Per-seat LiDAR visibility (`EnvConfig.opp_visibility`): car beams of the newest scan on
+        #: each seat of `sim.other_idx`, and steps since that seat was last seen. None when off.
+        self._opp_beams = None
+        self._opp_age = None
+        if e.opp_visibility:
+            C = max(0, self.M - 1)
+            self._opp_beams = torch.zeros(self.B, C, dtype=torch.long, device=self.device)
+            self._opp_age = torch.full((self.B, C), OPP_NEVER_SEEN, dtype=torch.long, device=self.device)
         #: "no prop anywhere near the plan", as a tensor so the compiled reward takes one shape.
         self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
         #: Whether each car was in contact last step, so a soft collision is charged on its onset.
@@ -1086,9 +1183,34 @@ class F1VecEnv:
             self._plan_alt = torch.zeros(self.B, self.tracker.spec.N + 1, 4, device=self.device)
         self.single_observation_space, self.single_action_space = self._spaces()
 
+    def _check_obs_v2(self) -> None:
+        """Refuse a v2 env that could not produce the v2 observation honestly."""
+        e = self.ecfg
+        if e.action_mode != "plan":
+            raise ValueError("obs_version 2 is the plan policy's contract (its history holds plan "
+                             "actions): set action_mode 'plan'")
+        if not (e.obs_imu and self.cfg.imu.enabled):
+            raise ValueError("obs_version 2 reads the gyro's z axis; the IMU is off "
+                             "(EnvConfig.obs_imu / cfg.imu.enabled)")
+        if validate_opp_token(e.opp_token) != "off":
+            raise ValueError("opp_token is an oracle block of the v1 proprio vector; contract v2 has "
+                             "no place for it")
+        if not 1 <= int(e.scan_stack) <= V2_MAX_FRAMES:
+            raise ValueError(f"obs_version 2 takes the newest 1..{V2_MAX_FRAMES} frames; "
+                             f"scan_stack is {e.scan_stack}")
+        if int(e.hist_len) < 1:
+            raise ValueError("obs_version 2's ego vector is its history: hist_len must be >= 1 "
+                             "(the contract's is 20 rows, hist_stride 2)")
+
     def _spaces(self):
         try:
             import gymnasium as gym
+            if self.obs_version == 2:
+                ego_dim = v2_ego_dim(self.ecfg.hist_len, self.ecfg.hist_stride, self.act_dim)
+                obs = gym.spaces.Dict({
+                    "scan": gym.spaces.Box(0.0, 1.0, (self.ecfg.scan_stack, self.n_beams), np.float32),
+                    "ego": gym.spaces.Box(-5.0, 5.0, (ego_dim,), np.float32)})
+                return obs, gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
             spaces = {
                 "scan": gym.spaces.Box(0.0, 1.0, (self.ecfg.scan_stack, self.n_beams), np.float32),
                 "speed": gym.spaces.Box(-1.0, 2.0, (1,), np.float32),
@@ -1619,6 +1741,8 @@ class F1VecEnv:
         return norm_scan(scan[:, :: self.ecfg.scan_subsample], self.range_max)
 
     def _obs(self, r: StepResult) -> Dict[str, torch.Tensor]:
+        if self.obs_version == 2:
+            return self._obs_v2(r)
         speed = norm_speed(r.odom[:, 3], self.ecfg.v_max_policy)[:, None]
         obs = {"scan": self.scan_hist[:, ::self.ecfg.scan_stride].clone(), "speed": speed, "prev_action": self.act_hist.reshape(self.B, -1).clone(),
                "speed_cap": norm_speed(self.speed_cap, self.ecfg.v_max_policy)[:, None]}
@@ -1636,6 +1760,31 @@ class F1VecEnv:
             # start from a checkpoint without it a column-append rather than a re-layout.
             obs["opp_token"] = self.opp_tokens(r)
         return obs
+
+    def _obs_v2(self, r: StepResult) -> Dict[str, torch.Tensor]:
+        """Contract v2 (`learn.obs.ObsSpecV2`): {"scan": the newest frames, "ego": (B, ego_dim)}.
+
+        The ego vector is [speed, gyro z] of THIS observation, the action issued two steps back and
+        the history ring's rows, every `hist_stride`-th -- `learn.obs.ego_columns` is the table,
+        `learn.obs.assemble_ego_v2` the one assembly the car's builder shares. A row whose episode just started
+        is filled here, from its own first observation with zero actions, which is the rule
+        `ObsBuilderV2` applies on the car: one rule on both sides, so they agree from the first
+        step on rather than only after the history has rolled over. `torch.where` rather than a
+        branch on the flag: no host sync per step.
+        """
+        e = self.ecfg
+        if r.imu is None or r.imu.shape[1] == 0:
+            raise RuntimeError("obs_version 2 reads the gyro's z axis and this step delivered no IMU "
+                               "sample; the node inhibits on such a step, and so must the env")
+        speed = norm_speed(r.odom[:, 3], e.v_max_policy)[:, None]
+        gz = norm_gyro_z(r.imu.mean(1)[:, 2:3], e.imu_gyro_scale)
+        feat = torch.cat([speed, gz], 1)
+        fill = torch.cat([feat, torch.zeros(self.B, self.act_dim, device=feat.device, dtype=feat.dtype)], 1)
+        self.hist2 = torch.where(self._fresh2[:, None, None], fill[:, None, :].expand_as(self.hist2), self.hist2)
+        self._fresh2 = torch.zeros_like(self._fresh2)
+        self._last_feat2 = feat
+        ego = assemble_ego_v2(feat, self.hist2, e.hist_len, e.hist_stride)
+        return {"scan": self.scan_hist[:, ::e.scan_stride].clone(), "ego": ego}
 
     def message_inputs(self, i: int, r: Optional[StepResult] = None) -> MessageInputs:
         """One car's control step, stated as the topics the ROS graph would have carried.
@@ -1973,6 +2122,8 @@ class F1VecEnv:
         if self.hist is not None:
             feat = torch.zeros(ids.numel(), 9, device=self.device); feat[:, 0] = speed / e.v_max_policy
             self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.act_dim, device=self.device)], 1)[:, None, :]
+        if self.hist2 is not None:
+            self._fresh2[ids] = True                     # filled from the row's first observation
 
         return scan, scan_true, scan_type
 
@@ -2326,6 +2477,8 @@ class F1VecEnv:
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
             self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.act_dim, device=self.device)], 1)[:, None, :]
             obs = self._obs(r)
+        if self._opp_age is not None:
+            self._update_opp_visibility(r, torch.ones(self.B, dtype=torch.bool, device=self.device))
         self._last_obs = obs
         return obs, {"priv": self._priv(r)}
 
@@ -2438,6 +2591,9 @@ class F1VecEnv:
         self.prev_steer_norm = steer_norm; self.prev_action = a
         if self.hist is not None:
             self.hist = torch.cat([torch.cat([self._last_feat, a], 1)[:, None, :], self.hist[:, :-1]], 1)
+        if self.hist2 is not None:
+            # the row the observation `a` was decided from, and `a` itself: what the car felt, what it was told
+            self.hist2 = torch.cat([torch.cat([self._last_feat2, a], 1)[:, None, :], self.hist2[:, :-1]], 1)
         obs = self._obs(r)
         any_done, any_lap = flags.tolist()                          # the one host sync of the step
         # true lap times: time between consecutive finish-line crossings (a spawn mid-track does not count)
@@ -2493,6 +2649,13 @@ class F1VecEnv:
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
             info["car_charge"] = car_charge
+        if self.obs_version == 2:
+            # Critique B5: the v2 policy does not observe the speed cap, and the plan decode clips
+            # every speed at it -- on a clipped step the speed dimensions get no reward gradient
+            # and can drift. Which steps those were, for the trainer to count.
+            lay = self.plan_layout
+            v_plan = (a[:, lay.speed] + 1.0) * 0.5 * e.v_max_policy
+            info["speed_capped"] = (v_plan > self.speed_cap[:, None]).any(1)
         if self.events is not None:
             # What each opponent is doing right now, for a viewer or a logger: event id (0 = none,
             # f1sim.opponent_events.EVENT_ID), seconds left, and the lateral offset it is holding.
@@ -2513,10 +2676,16 @@ class F1VecEnv:
             # final observation of the ended episodes (before auto-reset)
             info["final_obs"] = {k: v[ids].clone() for k, v in obs.items()}
             info["final_priv"] = self.privileged(r)[ids].clone()
+            if self.obs_version == 2:
+                # the v2 critic's vector of the same terminal observation, for the truncation bootstrap
+                info["final_priv_v2"] = self.privileged_v2(r)[ids].clone()
             scans = self._reset_envs(ids)
             r = self._reset_result(r, ids, scans)
             self._plan_fallback(ids, r.state)
             obs = self._obs(r)
+        if self._opp_age is not None:
+            # after the resets: the age describes the observation the next action is taken from
+            self._update_opp_visibility(r, done if any_done else None)
         self.last_result = r
         self._note_imu_yaw_rate(r)
         self._last_obs = obs
@@ -2966,6 +3135,230 @@ class F1VecEnv:
         if res is None:
             raise RuntimeError("opponent_beam_mask needs a stepped env: call reset() first")
         return (res.scan_type == HIT_CAR).to(res.scan.dtype)
+
+    # ------------------------------------------------------------------ contract v2: critic and labels
+    def _opp_rel(self, st: torch.Tensor):
+        """Every seat of `sim.other_idx` relative to the ego, in the ego body frame (x forward, origin
+        at the ego pose): dx, dy [m], dyaw [rad], dvx, dvy [m/s] (world velocities differenced, then
+        rotated into the ego frame, so dx + dt dvx is to first order where the car will be), centre
+        distance [m] and whether the seat's car is in the race at all (not parked). All (B, C).
+        The G4 gate's `opp_block` arithmetic, which the critic results were measured on."""
+        o = self.sim.other_idx
+        me, ot = st[:, None, :], st[o]
+        d = ot[..., :2] - me[..., :2]
+        c, s = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+        dx, dy = d[..., 0] * c + d[..., 1] * s, -d[..., 0] * s + d[..., 1] * c
+        co, so = torch.cos(ot[..., 2]), torch.sin(ot[..., 2])
+        vwx = (ot[..., 3] * co - ot[..., 4] * so) - (me[..., 3] * c - me[..., 4] * s)
+        vwy = (ot[..., 3] * so + ot[..., 4] * co) - (me[..., 3] * s + me[..., 4] * c)
+        dvx, dvy = vwx * c + vwy * s, -vwx * s + vwy * c
+        dyaw = torch.remainder(ot[..., 2] - me[..., 2] + math.pi, 2 * math.pi) - math.pi
+        present = (~self.sim.absent[o]) if self.sim.absent_any else torch.ones_like(dx, dtype=torch.bool)
+        return dx, dy, dyaw, dvx, dvy, d.norm(dim=-1), present
+
+    def privileged_v2(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, PRIV_V2_DIM) the v2 critic's privileged vector, in `PRIV_V2_KEYS` order.
+
+        Critic-only and never an observation. v1's `privileged()` is untouched, so a v1 critic keeps
+        its 21 (+ dial) columns. The scales are fixed, not learned or measured per run, so the same
+        number means the same thing in every checkpoint: speeds over v_max (10), the side slip over
+        2 m/s, yaw rate over the gyro scale (5 rad/s), lateral offset in metres, heading error over
+        pi, the progress rate over v_max clamped to +-2 (a lap wrap is a one-step spike), the wall
+        distance over 2 m clamped to [-1, 3], opponents as the G4 gate stored them, the geometry's
+        distances and speeds over 5 and its times over the 10 s cap.
+        """
+        res = self.last_result if r is None else r
+        if res is None:
+            raise RuntimeError("privileged_v2 needs a stepped env: call reset() first")
+        e, st = self.ecfg, res.state
+        xy_c, yaw_c = self.sim.track.pose_at_s(res.s, self.sim.tid)
+        herr = torch.remainder(st[:, 2] - yaw_c + math.pi, 2 * math.pi) - math.pi
+        vm = float(e.v_max_policy)
+        ego = torch.stack([st[:, 3] / vm, st[:, 4] / 2.0, st[:, 5] / float(e.imu_gyro_scale), res.lateral,
+                           herr / math.pi, torch.remainder(res.s / self.sim.track.length[self.sim.tid], 1.0),
+                           (res.progress / self.sim.control_dt / vm).clamp(-2.0, 2.0),
+                           (res.wall_dist / 2.0).clamp(-1.0, 3.0)], 1)
+        K, S = PRIV_V2_OPP_SLOTS, PRIV_OPP_DIST_SCALE
+        opp = torch.zeros(self.B, K, len(PRIV_V2_OPP_KEYS), device=st.device, dtype=st.dtype)
+        geo = torch.tensor([PRIV_V2_NO_OPP_DIST / S, 0.0, 1.0, 1.0], device=st.device,
+                           dtype=st.dtype).expand(self.B, -1).clone()
+        if self.M > 1:
+            dx, dy, dyaw, dvx, dvy, dist, present = self._opp_rel(st)
+            blk = torch.stack([present.to(st.dtype), dx / S, dy / S, dist / S, dvx / S, dvy / S, dyaw], 2)
+            blk = blk * present[..., None].to(st.dtype)
+            key = torch.where(present, dist, torch.full_like(dist, 1e6))
+            order = key.argsort(1)                                   # nearest present seat first
+            blk = blk.gather(1, order[..., None].expand(-1, -1, blk.shape[2]))
+            n = min(K, blk.shape[1])
+            opp[:, :n] = blk[:, :n]
+            dist_c = torch.where(present, dist, torch.full_like(dist, PRIV_V2_NO_OPP_DIST))
+            clos = torch.where(present, -(dx * dvx + dy * dvy) / dist_c.clamp_min(1e-3), torch.zeros_like(dist))
+            ttc = torch.where(present & (clos > PRIV_V2_TTC_MIN_CLOSING),
+                              (dist_c / clos.clamp_min(1e-3)).clamp(0.0, PRIV_V2_TTC_CAP),
+                              torch.full_like(dist, PRIV_V2_TTC_CAP))
+            j = key.argmin(1, keepdim=True)
+            geo = torch.cat([dist_c.gather(1, j) / S, clos.gather(1, j) / S,
+                             ttc.gather(1, j) / PRIV_V2_TTC_CAP,
+                             ttc.min(1, keepdim=True).values / PRIV_V2_TTC_CAP], 1)
+        cap = (self.speed_cap / vm)[:, None].to(st.dtype)
+        return torch.cat([ego, opp.reshape(self.B, -1), geo, cap], 1)
+
+    def _lidar_pose(self):
+        """(mount x, mount y, beam angles (B, N_sensor)) of each car's LiDAR in its body frame: the
+        per-env truth the scan was cast with (`Lidar._rays` reads the same `P` entries)."""
+        P, cl = self.sim.P, self.cfg.lidar
+        mx = P["mount_x"] if "mount_x" in P else torch.full((self.B,), float(cl.mount_x), device=self.device)
+        my = P["mount_y"] if "mount_y" in P else torch.full((self.B,), float(cl.mount_y), device=self.device)
+        ang = self.sim.lidar.angles[None, :]
+        if "mount_yaw" in P:
+            ang = ang + P["mount_yaw"][:, None]
+        return mx, my, ang
+
+    def _beam_valid(self, res: StepResult) -> torch.Tensor:
+        """(B, N_sensor) bool: a return a per-beam label may be scored on (`BEAM_VALID_TOL_M`)."""
+        rng, tru = res.scan, res.scan_true
+        return (torch.isfinite(rng) & (rng < self.range_max - 1e-3)
+                & ((rng - tru).abs() < BEAM_VALID_TOL_M))
+
+    def _attribute_car_beams(self, res: StepResult) -> torch.Tensor:
+        """(B, C) long: valid car returns of the newest scan, attributed seat by seat.
+
+        The LiDAR marks a beam HIT_CAR without saying which car (`lidar.Lidar.scan`), so each car
+        beam goes to the seat whose body + rear detection box -- the rectangle the scan draws for it
+        -- is nearest the beam's TRUE hit point, if within `OPP_ATTRIB_TOL_M`. A beam stopped by one
+        car is not counted for the car behind it: occlusion comes out of the scan itself.
+        """
+        from .lidar import HIT_CAR
+        C = self.M - 1
+        if C <= 0:
+            return torch.zeros(self.B, 0, dtype=torch.long, device=self.device)
+        car = (res.scan_type == HIT_CAR) & self._beam_valid(res)
+        mx, my, ang = self._lidar_pose()
+        rt = torch.where(torch.isfinite(res.scan_true), res.scan_true, torch.zeros_like(res.scan_true))
+        px = mx[:, None] + rt * torch.cos(ang)                       # (B, N) hit points, ego frame
+        py = my[:, None] + rt * torch.sin(ang)
+        dx, dy, dyaw, _dvx, _dvy, _dist, present = self._opp_rel(res.state)
+        c, s = torch.cos(dyaw)[..., None], torch.sin(dyaw)[..., None]
+        ex, ey = px[:, None, :] - dx[..., None], py[:, None, :] - dy[..., None]
+        qx, qy = ex * c + ey * s, -ex * s + ey * c                   # (B, C, N) in each seat's frame
+        o = self.sim.other_idx
+        L, W = self.sim.car_dims[o][..., 0], self.sim.car_dims[o][..., 1]
+        rd, rw = self.sim.car_rear[o][..., 0], self.sim.car_rear[o][..., 1]
+        x_lo, x_hi = (-(0.5 * L + rd))[..., None], (0.5 * L)[..., None]
+        hw = (0.5 * torch.maximum(W, rw))[..., None]
+        out_x = (x_lo - qx).clamp_min(0.0) + (qx - x_hi).clamp_min(0.0)
+        out_y = (qy.abs() - hw).clamp_min(0.0)
+        dbox = torch.sqrt(out_x * out_x + out_y * out_y)
+        dbox = torch.where(present[..., None], dbox, torch.full_like(dbox, float("inf")))
+        dmin, j = dbox.min(1)                                        # (B, N)
+        hit = car & (dmin < OPP_ATTRIB_TOL_M)
+        counts = torch.zeros(self.B, C, dtype=torch.long, device=self.device)
+        return counts.scatter_add_(1, j, hit.long())
+
+    def _update_opp_visibility(self, res: StepResult, reset_rows: Optional[torch.Tensor]) -> None:
+        """Advance every seat's `age` (steps since it was last seen) by one observation.
+
+        A seat's track ends when either car of the pair starts a new episode: the ego's own reset
+        clears every track it held, and a seat whose car respawned is a different car in a different
+        place (the perception gate's rule: identity broken at respawn and episode start)."""
+        if self._opp_age is None or self.M <= 1:
+            return
+        age = (self._opp_age + 1).clamp_max(OPP_NEVER_SEEN)
+        if reset_rows is not None:
+            o = self.sim.other_idx
+            gone = reset_rows[:, None] | reset_rows[o]
+            age = torch.where(gone, torch.full_like(age, OPP_NEVER_SEEN), age)
+        beams = self._attribute_car_beams(res)
+        mx, my, _ang = self._lidar_pose()
+        dx, dy, _dyaw, _dvx, _dvy, _dist, present = self._opp_rel(res.state)
+        dist_l = torch.hypot(dx - mx[:, None], dy - my[:, None])
+        seen = present & (beams >= OPP_SEEN_BEAMS) & (dist_l < OPP_LABEL_RANGE_M)
+        self._opp_age = torch.where(seen, torch.zeros_like(age), age)
+        self._opp_beams = beams
+
+    def opponent_tracks_v2(self, r: Optional[StepResult] = None) -> Dict[str, torch.Tensor]:
+        """Per seat, the labels of the v2 opponent-slot auxiliary (B8), for THIS observation.
+
+        Train-time only, privileged. Keys, all (B, C) unless noted, C = race_size - 1:
+          present  the seat's car is in the race (not parked)
+          cand     present and within OPP_LABEL_RANGE_M of the LiDAR: a car the head should report
+          lab      (B, C, 3) [dx / 5, dy / 2, v_lat / 2], LiDAR frame (x forward from the LiDAR,
+                   y left), v_lat the relative lateral velocity in the ego frame -- the align and
+                   perception gates' targets
+          dist     distance from the LiDAR [m]
+          beams    valid car returns of the newest scan on this seat (`_attribute_car_beams`)
+          age      steps since the seat was last seen (>= OPP_SEEN_BEAMS beams within range);
+                   0 = seen now, OPP_NEVER_SEEN = not since its track began
+        Which candidates are KNOWABLE inside a training window -- seen within OPP_MEMORY_STEPS and
+        that sighting inside the chunk or its burn-in -- is the trainer's to decide, because only it
+        knows the window: `learn.aux_v2.b8_know_mask(cand, age, steps_into_window)`.
+        Needs `EnvConfig.opp_visibility`: the age is a running count, not a function of one step.
+        """
+        if self._opp_age is None:
+            raise RuntimeError("opponent_tracks_v2 needs EnvConfig.opp_visibility: the age since a "
+                               "seat was last seen is counted every step, not recomputed on demand")
+        res = self.last_result if r is None else r
+        C = max(0, self.M - 1)
+        dev, dt_ = self.device, res.state.dtype
+        if C == 0:
+            z = torch.zeros(self.B, 0, device=dev)
+            return {"present": z.bool(), "cand": z.bool(), "lab": torch.zeros(self.B, 0, 3, device=dev),
+                    "dist": z, "beams": z.long(), "age": z.long()}
+        mx, my, _ang = self._lidar_pose()
+        dx, dy, _dyaw, _dvx, dvy, _dist, present = self._opp_rel(res.state)
+        lx, ly = dx - mx[:, None], dy - my[:, None]
+        dist_l = torch.hypot(lx, ly)
+        pf = present.to(dt_)
+        lab = torch.stack([lx / 5.0, ly / 2.0, dvy / 2.0], 2) * pf[..., None]
+        return {"present": present, "cand": present & (dist_l < OPP_LABEL_RANGE_M), "lab": lab,
+                "dist": torch.where(present, dist_l, torch.full_like(dist_l, float("inf"))),
+                "beams": self._opp_beams.clone(), "age": self._opp_age.clone()}
+
+    def nearest_visible_car_v2(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, 5) the nearest car the newest scan SEES -- >= OPP_SEEN_BEAMS of its returns, within
+        OPP_LABEL_RANGE_M of the LiDAR: [exists, dx / 5, dy / 2, closing / 5, v_lat / 2], LiDAR
+        frame, closing = -(unit line of sight . relative velocity). Zeros where none is seen.
+
+        The target of the perception gate's auxiliary B (the align gate found the true distance to
+        the nearest visible car alone gives contact-risk AUC 0.902). Train-time only; needs
+        `EnvConfig.opp_visibility` for this step's attributed beams."""
+        if self._opp_beams is None:
+            raise RuntimeError("nearest_visible_car_v2 needs EnvConfig.opp_visibility")
+        res = self.last_result if r is None else r
+        out = torch.zeros(self.B, 5, device=self.device, dtype=res.state.dtype)
+        if self.M <= 1:
+            return out
+        mx, my, _ang = self._lidar_pose()
+        dx, dy, _dyaw, dvx, dvy, _dist, present = self._opp_rel(res.state)
+        lx, ly = dx - mx[:, None], dy - my[:, None]
+        dist_l = torch.hypot(lx, ly)
+        seen = present & (self._opp_beams >= OPP_SEEN_BEAMS) & (dist_l < OPP_LABEL_RANGE_M)
+        key = torch.where(seen, dist_l, torch.full_like(dist_l, float("inf")))
+        j = key.argmin(1, keepdim=True)
+        ex = seen.any(1).to(out.dtype)
+        g = lambda t: t.gather(1, j)[:, 0]
+        dl = g(dist_l).clamp_min(1e-6)
+        closing = -(g(lx) * g(dvx) + g(ly) * g(dvy)) / dl
+        out[:, 0] = ex
+        out[:, 1] = ex * g(lx) / 5.0
+        out[:, 2] = ex * g(ly) / 2.0
+        out[:, 3] = ex * closing / 5.0
+        out[:, 4] = ex * g(dvy) / 2.0
+        return out
+
+    def beam_car_labels_v2(self, r: Optional[StepResult] = None) -> torch.Tensor:
+        """(B, N) int8 per-beam label of the newest scan for the car / not-car head: 1 a valid return
+        off another car, 0 a valid return off anything else, -1 no usable return (no return, past
+        range, or the noisy range more than BEAM_VALID_TOL_M off the truth). At the observation's
+        beam resolution (`scan_subsample`), like `floor_labels`. From the simulator's own hit types
+        (`StepResult.scan_type`), so nothing in the simulator changes to produce it."""
+        from .lidar import HIT_CAR
+        res = self.last_result if r is None else r
+        sub = self.ecfg.scan_subsample
+        valid = self._beam_valid(res)[:, ::sub]
+        car = (res.scan_type[:, ::sub] == HIT_CAR)
+        lab = torch.where(car, torch.ones_like(car, dtype=torch.int8), torch.zeros_like(car, dtype=torch.int8))
+        return torch.where(valid, lab, torch.full_like(lab, -1))
 
     @torch.no_grad()
     def car_future(self, times, model: Optional[str] = None,

@@ -10,6 +10,10 @@ A grip-dial checkpoint (`meta["cond"]`, source `dial`) takes the dial as one mor
 graph applies the checkpoint's own `(dial - offset) / scale` (`conditioning.mu_to_c`), so a consumer
 never re-implements the normalisation; the sidecar records the spec. There is no default for it in
 the graph: a conditional actor is never run on an implied number (`Actor._require_cond`).
+
+A v2 checkpoint (`learn.model_v2`, `meta["arch"] == "v2"`) exports as `(scan, ego, dial, hidden) ->
+(action, hidden_next)` -- `export_v2` -- with the observation contract's column table in the sidecar
+(`learn.obs.contract_table_v2`), so the car builds exactly the vector the network was trained on.
 """
 from __future__ import annotations
 
@@ -47,6 +51,99 @@ class ActorOnly(torch.nn.Module):
         return self.actor(scan, proprio, _condition(self.cond, proprio, dial))   # deterministic action in [-1, 1]
 
 
+class ActorV2Only(torch.nn.Module):
+    """The deployed v2 graph (`learn.model_v2.ActorV2`): (scan, ego, dial, hidden) -> (action,
+    hidden_next).
+
+    `dial` is in friction units, the number the ROS node's `dial` parameter holds; the graph applies
+    the checkpoint's `(dial - offset) / scale` itself (`conditioning.mu_to_c`), so a consumer never
+    re-implements the normalisation. No default anywhere: the v2 actor has no implied dial. The
+    min-pool channel is computed in the graph from `scan`; the auxiliary heads are not in it."""
+
+    def __init__(self, actor, cond: CondSpec):
+        super().__init__(); self.actor = actor; self.cond = cond
+
+    def forward(self, scan, ego, dial, hidden):
+        return self.actor.step(scan, ego, mu_to_c(dial, self.cond).to(ego.dtype), hidden)
+
+
+def export_v2(model, out: str, steps: int = 20, seed: int = 0) -> dict:
+    """Export a v2 actor to ONNX (opset 17), write the sidecar, and check it against torch.
+
+    The check runs `steps` control steps with the hidden state fed back, as the car runs it, on a
+    corridor-like scan, and reports the worst |onnx - torch| over the action and the state. The
+    redesign's X1 requirement is <= 1e-5 at 1081 beams."""
+    import json
+    from .obs import contract_table_v2, ego_columns
+    model = model.eval()
+    meta = model.meta
+    cond = CondSpec.from_meta(meta["cond"])
+    spec = model.obs_spec
+    g = torch.Generator().manual_seed(seed)
+    n, k, E = spec.n_beams, spec.n_frames, spec.ego_dim
+    ramp = torch.linspace(0.15, 1.0, n)
+
+    def scan_at(t):
+        return (ramp[None, None, :] * (0.7 + 0.3 * torch.rand(1, k, 1, generator=g))
+                + 0.02 * torch.rand(1, k, n, generator=g)).clamp(0, 1)
+
+    m = ActorV2Only(model.actor, cond).eval()
+    args = (scan_at(0), 0.3 * torch.randn(1, E, generator=g), torch.full((1, 1), 0.85),
+            model.actor.initial_hidden(1))
+    names, outs = ["scan", "ego", "dial", "hidden"], ["action", "hidden_next"]
+    dyn = {"scan": {0: "batch"}, "ego": {0: "batch"}, "dial": {0: "batch"}, "hidden": {1: "batch"},
+           "action": {0: "batch"}, "hidden_next": {1: "batch"}}
+    torch.onnx.export(m, args, out, input_names=names, output_names=outs, opset_version=17,
+                      dynamic_axes=dyn, dynamo=False)
+    with open(os.path.splitext(out)[0] + ".json", "w") as f:
+        json.dump({"arch": meta["arch"], "meta": meta, "spec": dict(vars(spec)),
+                   "contract": contract_table_v2(spec).splitlines(),
+                   "ego_columns": [c.name for c in ego_columns(spec)],
+                   "inputs": {"scan": [1, k, n], "ego": [1, E], "dial": [1, 1],
+                              "hidden": list(args[3].shape), "cond": cond.to_meta()},
+                   "outputs": outs}, f, indent=1)
+    report = {"onnx": out, "max_abs_err": None, "steps": int(steps)}
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return report
+    so = ort.SessionOptions(); so.intra_op_num_threads = 1; so.inter_op_num_threads = 1
+    sess = ort.InferenceSession(out, so, providers=["CPUExecutionProvider"])
+    h_t, h_o, err = args[3], args[3].numpy(), 0.0
+    for t in range(int(steps)):
+        sc, eg = scan_at(t), 0.3 * torch.randn(1, E, generator=g)
+        dial = torch.full((1, 1), 0.6 + 0.04 * (t % 10))
+        with torch.no_grad():
+            a_t, h_t = m(sc, eg, dial, h_t)
+        a_o, h_o = sess.run(None, {"scan": sc.numpy(), "ego": eg.numpy(), "dial": dial.numpy(), "hidden": h_o})
+        err = max(err, float(np.abs(a_o - a_t.numpy()).max()), float(np.abs(h_o - h_t.numpy()).max()))
+    report["max_abs_err"] = err
+    return report
+
+
+def ort_step_ms(onnx_path: str, model, iters: int = 200, repeats: int = 5, threads: int = 1) -> float:
+    """Milliseconds per control step of an exported v2 actor under onnxruntime, batch 1, the fastest
+    of `repeats` blocks of `iters` (`learn.budget`'s protocol, for the graph the car would run)."""
+    import time
+    import onnxruntime as ort
+    spec = model.obs_spec
+    so = ort.SessionOptions(); so.intra_op_num_threads = int(threads); so.inter_op_num_threads = 1
+    sess = ort.InferenceSession(onnx_path, so, providers=["CPUExecutionProvider"])
+    feed = {"scan": np.random.rand(1, spec.n_frames, spec.n_beams).astype(np.float32),
+            "ego": np.random.randn(1, spec.ego_dim).astype(np.float32),
+            "dial": np.full((1, 1), 0.85, np.float32),
+            "hidden": np.zeros((1, 1, model.actor.hidden_size), np.float32)}
+    for _ in range(20):
+        sess.run(None, feed)
+    best = float("inf")
+    for _ in range(max(1, repeats)):
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            sess.run(None, feed)
+        best = min(best, (time.perf_counter() - t0) / iters)
+    return best * 1e3
+
+
 class RecurrentActorOnly(torch.nn.Module):
     """A memory actor as a pure function: (scan, proprio, hidden) -> (action, next hidden).
 
@@ -74,6 +171,15 @@ def main():
     # as part of `proprio` is a graph nobody can feed. `load_checkpoint` refuses it here by
     # default, with the reason; there is deliberately no flag on this tool to override that.
     model, extra = load_checkpoint(a.ckpt, "cpu"); model.eval()
+    if (getattr(model, "meta", None) or {}).get("arch") == "v2":
+        out = a.out or os.path.splitext(a.ckpt)[0] + ".onnx"
+        rep = export_v2(model, out)
+        err = rep["max_abs_err"]
+        print(f"onnx ok: {out}  (v2: scan, ego, dial, hidden -> action, hidden_next)"
+              + ("" if err is None else f"  max |onnx - torch| over {rep['steps']} recurrent steps = {err:.2e}"))
+        if a.trt:
+            raise SystemExit("--trt is not wired for the v2 graph yet; build the engine from the .onnx")
+        return
     spec = extra.get("spec", {})
     if str(spec.get("opp_token") or "off") != "off":
         # An oracle is not a deployment target. The block is the other cars' exact position,

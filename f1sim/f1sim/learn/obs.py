@@ -13,6 +13,12 @@ buffers, because the env's are fused into a compiled step; `MessageInputs` and
 step as the messages the graph would have carried and driving the node's builder from them.
 `tests/test_obs_identity.py` is the check: identical message-equivalent inputs, identical tensors.
 
+Contract v2 (2026-10-14, the redesign's B1-B4; `ObsSpecV2`, `ObsBuilderV2`, `ego_columns`) is the
+second section of this file: the newest 1..3 frames, an ego vector of [speed, gyro z] now, the 8
+plan numbers issued two steps back, and 20 rows x [speed, gyro z, the 8 issued plan numbers] --
+210 columns, no column a duplicate of another -- and the grip dial as one more input. `contract_table_v2(spec)` prints the column table; v1 below
+is unchanged and is what every checkpoint without `version: 2` in its spec reads.
+
 `ScanAugment` adds the optional extra scan channels (`SCAN_CHANNELS`) on the policy side of that
 boundary: they are functions of the scan the env already emits, so the env, the observation spec
 recorded in a checkpoint's `extra["spec"]` and every consumer of that spec are untouched by them.
@@ -594,7 +600,13 @@ class ObsSpec:
 
 
 def flatten_obs(obs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    """gym env obs dict -> (scan (B,k,N), proprio (B,P)) in the canonical order."""
+    """gym env obs dict -> (scan (B,k,N), proprio (B,P)) in the canonical order.
+
+    A contract-v2 observation (`ObsSpecV2`) is already flat -- `{"scan", "ego"}` -- and comes back
+    as (scan, ego). "ego" is a key no v1 observation has, so the v1 concatenation below is reached
+    by exactly the dicts it always was."""
+    if "ego" in obs:
+        return obs["scan"], obs["ego"]
     return obs["scan"], torch.cat([obs[k] for k in PROPRIO_KEYS if k in obs], 1)
 
 
@@ -673,3 +685,311 @@ class ObsBuilder:
                              "node inhibits instead, and so should the caller")
         return self.build(r, float(mi.speed), imu.mean(0), np.asarray(mi.att, dtype=np.float32),
                           float(mi.speed_cap))
+
+
+# =====================================================================================================
+# Observation contract v2 (2026-10-14)
+# =====================================================================================================
+#
+# docs/research/architecture-redesign-2026-10-13.md, blocks B1-B4, with the critique's A5 applied.
+# What changed against v1 (`ObsSpec`) and why, each from the redesign's ledger (section 2):
+#
+#   * the scan is the newest frame -- `n_frames` 1..3, default 1. Six frames were 83 % of the input
+#     and the learned stem had turned its time sensitivity down from 1.07 to 0.33; one frame and six
+#     read the opponent equally (EV 0.41 vs 0.40). Whether two or three return is the perception
+#     gate's call, so the count is a spec field, not a constant.
+#   * no beam-angle ramp: it is the same row for every sample (zero variance), so it is not an input.
+#     The 9-tap min-pool of the newest frame stays (23.5 % of the first convolution's variance) --
+#     it is computed INSIDE the network (`model_v2.StemV2`), from the frame, on the car as in training.
+#   * the ego vector is [speed, gyro z] now, the action issued two steps back, and a one-second
+#     history of [speed, gyro z, the action the policy issued]. Gone: attitude (correlation 0.14 with the truth, rms 7.2 deg, and 5 of 13 car
+#     recordings stalled the node at 40 deg), the speed cap (zero variance over training; the car's
+#     0.4 is out of distribution), gyro x/y and the accelerometer (vibration rms 0.15-0.41 rad/s, no
+#     requirement reads them) and `prev_action`, whose a_{t-1} IS history row 0's action -- the
+#     duplicate the critique's A5 found. The redesign's B3 asked for the last two issued actions;
+#     a_{t-1} is history row 0's, a_{t-2} sits in no stride-2 row (they are 1, 3, 5, ... steps back),
+#     so it has columns of its own (`PREV_ACTION_LAGS`) -- and only while the history does not already
+#     hold its lag. No column of v2 duplicates another (`ego_columns` states it,
+#     `tests/test_obs_contract_v2.py` checks it on the table and on the builder's data).
+#   * the grip dial is an ordinary input -- not part of `ego`, a separate (B, 1) input the fusion
+#     layer reads as one more column (B4), normalised exactly as `conditioning.mu_to_c` does.
+#
+# Not observed, on purpose (B5 of the critique): the speed cap. The history's action columns hold
+# the action AS THE POLICY EMITTED IT -- clamped to [-1, 1], before the cap, the WP4 decode and its
+# backward braking pass -- on the car (`ObsBuilderV2.push_action` is fed the network's output) and in
+# the simulator alike. The speed columns are measured, so whatever the cap did shows up there.
+
+#: The observation contract versions. 1 is every checkpoint before 2026-10-14 (`ObsSpec`); 2 is
+#: `ObsSpecV2`. A spec dict carries `version` only from 2 on, which is how `spec_from_dict` tells them
+#: apart without touching a single v1 checkpoint.
+OBS_VERSIONS = (1, 2)
+
+#: What one v2 history row holds before its action columns, and what "now" holds. In this order.
+EGO_SENSOR_KEYS = ("speed", "gyro_z")
+
+#: The redesign's B1: one to three of the newest frames. More was measured as noise (see above).
+V2_MAX_FRAMES = 3
+
+#: The min-pool window of B1 [beams]. 9 taps = 2.25 deg at 1081 beams over 270 deg: the nearest
+#: return in a window is what decides a collision, and strided convolutions blur it away.
+MINPOOL_TAPS = 9
+
+#: Issued actions the ego vector carries BESIDES its history rows, as lags [control steps]. The
+#: redesign's B3 asked for the last two the policy issued, a_{t-1} and a_{t-2} (v1 observed both, as
+#: `prev_action`). a_{t-1} is history row 0's action (lag 1) -- critique A5's duplicate, not repeated
+#: -- but a stride-2 history holds lags 1, 3, 5, ... and never 2, so without these columns the
+#: network sees where the plan is and not how it is changing at the step it acts on. A lag the
+#: history already holds (stride 1) gets no extra columns: `v2_prev_action_lags`.
+PREV_ACTION_LAGS = (2,)
+
+
+def v2_hist_lags(hist_len: int, hist_stride: int) -> Tuple[int, ...]:
+    """The lags [control steps] of the v2 history rows: row j is `1 + j * hist_stride` steps back."""
+    return tuple(1 + j * int(hist_stride) for j in range(int(hist_len)))
+
+
+def v2_prev_action_lags(hist_len: int, hist_stride: int) -> Tuple[int, ...]:
+    """The `PREV_ACTION_LAGS` the history does not already hold -- the ego vector's extra action
+    lags, in order. (2,) for the contract's 20 x 2; () for a stride-1 history, whose row 1 IS lag 2."""
+    held = set(v2_hist_lags(hist_len, hist_stride))
+    return tuple(lag for lag in PREV_ACTION_LAGS if lag not in held)
+
+
+def v2_ring_len(hist_len: int, hist_stride: int) -> int:
+    """Rows of the per-step ring both builders keep (row i = i + 1 steps back): enough for the
+    oldest history row and for every extra action lag. 39 for the contract's 20 x 2."""
+    return max((int(hist_len) - 1) * int(hist_stride) + 1, max(v2_prev_action_lags(hist_len, hist_stride), default=1))
+
+
+def v2_ego_dim(hist_len: int, hist_stride: int, act_dim: int) -> int:
+    """Width of the v2 ego vector: now, the extra action lags, the history rows."""
+    n = len(EGO_SENSOR_KEYS)
+    return n + len(v2_prev_action_lags(hist_len, hist_stride)) * int(act_dim) + int(hist_len) * (n + int(act_dim))
+
+
+def assemble_ego_v2(feat: torch.Tensor, ring: torch.Tensor, hist_len: int, hist_stride: int) -> torch.Tensor:
+    """The v2 ego vector (B, ego_dim) from this observation's sensor columns `feat` (B, 2) and the
+    per-step ring (B, `v2_ring_len`, 2 + act_dim) whose row i holds [speed, gyro z, the action issued]
+    of the step i + 1 back. THE assembly: the env (`gym_env._obs_v2`) and the car's builder
+    (`ObsBuilderV2.build`) both call it, so the column order of `ego_columns` is written once."""
+    n, B = len(EGO_SENSOR_KEYS), feat.shape[0]
+    prev = [ring[:, lag - 1, n:] for lag in v2_prev_action_lags(hist_len, hist_stride)]
+    rows = ring[:, 0:(int(hist_len) - 1) * int(hist_stride) + 1:int(hist_stride)]
+    return torch.cat([feat, *prev, rows.reshape(B, -1)], 1)
+
+
+def norm_gyro_z(gyro_z: torch.Tensor, gyro_scale: float) -> torch.Tensor:
+    """[rad/s] -> the v2 observation's yaw-rate column. The same division `norm_imu` applies to the
+    gyro, written once more only because v2 reads the z axis alone."""
+    return gyro_z / gyro_scale
+
+
+@dataclass(frozen=True)
+class EgoColumn:
+    """One column of the v2 ego vector. `(quantity, lag)` is unique per column -- that is the
+    no-duplicate rule -- and `mirror` is its sign under a left-right mirror of the world."""
+    index: int
+    name: str            # e.g. "speed@t", "gyro_z@t-3", "action[5]@t-1"
+    quantity: str        # "speed", "gyro_z", "action[k]"
+    lag: int             # control steps before the observation; 0 is now
+    norm: str            # what the raw value is divided by; "1 (as issued)": the policy's own [-1, 1]
+    mirror: float        # +1 or -1
+
+
+@dataclass
+class ObsSpecV2:
+    """The v2 observation contract. Recorded as `extra["spec"]` (via `vars`) like `ObsSpec`.
+
+    `act_dim` / `speed_mode` are the plan output the action columns hold (WP4 by default,
+    docs/research/output-format-2026-10-14.md); `hist_len` x `hist_stride` is the history (20 x 2 =
+    the last second at 40 Hz, the length v1's history had and the one whose permutation sensitivity
+    measured 31-71 % of the action sd). The extra action lags (`PREV_ACTION_LAGS`) follow from it."""
+    version: int = 2
+    n_beams: int = 1081
+    n_frames: int = 1
+    frame_stride: int = 1         # control steps between stacked frames (25 ms at 40 Hz)
+    act_dim: int = 8
+    speed_mode: str = "wp4"
+    hist_len: int = 20
+    hist_stride: int = 2
+    range_max: float = 10.0
+    v_max: float = 10.0
+    gyro_scale: float = 5.0
+
+    @property
+    def row_dim(self) -> int:
+        return len(EGO_SENSOR_KEYS) + self.act_dim
+
+    @property
+    def prev_action_lags(self) -> Tuple[int, ...]:
+        return v2_prev_action_lags(self.hist_len, self.hist_stride)
+
+    @property
+    def ring_len(self) -> int:
+        return v2_ring_len(self.hist_len, self.hist_stride)
+
+    @property
+    def ego_dim(self) -> int:
+        return v2_ego_dim(self.hist_len, self.hist_stride, self.act_dim)
+
+    @property
+    def scan_shape(self) -> Tuple[int, int]:
+        return (self.n_frames, self.n_beams)
+
+    def validate(self) -> "ObsSpecV2":
+        from ..mpc import plan_layout
+        if int(self.version) != 2:
+            raise ValueError(f"ObsSpecV2 is contract version 2, got version {self.version}")
+        if not 1 <= int(self.n_frames) <= V2_MAX_FRAMES:
+            raise ValueError(f"v2 takes the newest 1..{V2_MAX_FRAMES} frames, got {self.n_frames}")
+        if int(self.frame_stride) < 1 or int(self.hist_stride) < 1:
+            raise ValueError("frame_stride and hist_stride are control steps and must be >= 1")
+        if int(self.hist_len) < 1:
+            raise ValueError("the v2 ego vector IS its history: hist_len must be >= 1 (20 by contract)")
+        lay = plan_layout(self.speed_mode)
+        if lay.act_dim != int(self.act_dim):
+            raise ValueError(f"act_dim {self.act_dim} is not speed mode {self.speed_mode!r}'s "
+                             f"{lay.act_dim}: the history's action columns would be mislabelled")
+        return self
+
+
+def spec_from_dict(d: dict):
+    """`ObsSpec` or `ObsSpecV2` from a checkpoint's `extra["spec"]`. A dict without `version` is v1:
+    every checkpoint written before v2 existed, unchanged."""
+    d = dict(d or {})
+    if int(d.get("version", 1)) == 2:
+        return ObsSpecV2(**d).validate()
+    return ObsSpec(**d)
+
+
+def ego_columns(spec: ObsSpecV2) -> list:
+    """The v2 ego vector's column table, in order. This IS the contract: `ObsBuilderV2` and the env
+    assemble exactly this, and the exported sidecar carries it for the car.
+
+    Order: "now" (speed, gyro z), the extra action lags (`ObsSpecV2.prev_action_lags`: a_{t-2} for
+    the contract's stride-2 history), then the history rows. History row j (j = 0 .. hist_len-1) is
+    the step `1 + j * hist_stride` control steps back: the speed and gyro z measured AT that step's
+    observation and the action the policy issued FROM it. Row 0 is therefore one step back, never
+    now -- the "now" columns are the only lag-0 ones.
+    """
+    from ..mpc import plan_layout
+    path = plan_layout(spec.speed_mode).path
+    cols, i = [], 0
+
+    def add(q, lag, norm, mirror):
+        nonlocal i
+        cols.append(EgoColumn(i, f"{q}@t" + (f"-{lag}" if lag else ""), q, int(lag), norm, float(mirror)))
+        i += 1
+
+    def mirror_of(k):
+        # a curvature flips with the world, a speed does not
+        return -1.0 if path.start <= k < path.stop else +1.0
+
+    add("speed", 0, "v_max", +1.0)
+    add("gyro_z", 0, "gyro_scale", -1.0)
+    for lag in spec.prev_action_lags:
+        for k in range(int(spec.act_dim)):
+            add(f"action[{k}]", lag, "1 (as issued)", mirror_of(k))
+    for j in range(int(spec.hist_len)):
+        lag = 1 + j * int(spec.hist_stride)
+        add("speed", lag, "v_max", +1.0)
+        add("gyro_z", lag, "gyro_scale", -1.0)
+        for k in range(int(spec.act_dim)):
+            add(f"action[{k}]", lag, "1 (as issued)", mirror_of(k))
+    return cols
+
+
+def ego_mirror_signs(spec: ObsSpecV2) -> torch.Tensor:
+    """(ego_dim,) +-1: an ego vector multiplied by this is the ego vector of the mirrored world.
+    For the mirror augmentation the training unit adds (the G1 gate's left-right flip)."""
+    return torch.tensor([c.mirror for c in ego_columns(spec)], dtype=torch.float32)
+
+
+def action_mirror_signs(speed_mode: str) -> torch.Tensor:
+    """(act_dim,) +-1 for a plan action: curvature columns flip, speed columns do not."""
+    from ..mpc import plan_layout
+    lay = plan_layout(speed_mode)
+    return torch.tensor([-1.0 if lay.path.start <= k < lay.path.stop else 1.0
+                         for k in range(lay.act_dim)], dtype=torch.float32)
+
+
+def mirror_scan(scan: torch.Tensor) -> torch.Tensor:
+    """The scan of the mirrored world: beam i <-> beam N-1-i. Exact because the beams are
+    `linspace(-fov/2, fov/2, N)`, symmetric about the car's x axis."""
+    return scan.flip(-1)
+
+
+def contract_table_v2(spec: ObsSpecV2) -> str:
+    """The v2 contract as text: every input the graph takes, every column, every normalisation."""
+    s = spec
+    lines = [f"observation contract v2: scan (B, {s.n_frames}, {s.n_beams}), ego (B, {s.ego_dim}), "
+             f"dial (B, 1); actions {s.act_dim} ({s.speed_mode})",
+             f"  scan[:, k]  LaserScan.ranges at t - k*{s.frame_stride}, k = 0..{s.n_frames - 1}: "
+             f"range / {s.range_max:g}, no return -> 1.0",
+             f"  (in graph)  {MINPOOL_TAPS}-tap min-pool of scan[:, 0], appended as the last stem "
+             f"channel; no beam-angle ramp",
+             f"  dial        grip dial [mu]; the network reads c = (dial - 1.0) / 0.25 "
+             f"(conditioning.mu_to_c) as one fusion column"]
+    for c in ego_columns(s):
+        lines.append(f"  ego[{c.index:3d}]  {c.name:18s} / {c.norm:12s} mirror {c.mirror:+.0f}")
+    return "\n".join(lines)
+
+
+class ObsBuilderV2:
+    """Deployment-side builder for contract v2: raw sensor values in, the env's tensors out.
+
+    The same discipline as `ObsBuilder`: `push_action(a)` after every forward with the action the
+    network emitted, `build(...)` once per scan. Its history ring and the env's are filled by the
+    same rule -- the first observation fills every row with itself and zero actions -- so after
+    `(n_frames - 1) * frame_stride` steps the two are bit-identical
+    (`tests/test_obs_contract_v2.py::test_the_env_and_the_node_build_the_same_v2_observation`).
+    """
+
+    def __init__(self, spec: ObsSpecV2, device="cpu"):
+        self.spec = spec.validate()
+        self.device = torch.device(device)
+        self.reset()
+
+    def reset(self):
+        s = self.spec
+        self.scan_hist = torch.ones(1, (s.n_frames - 1) * s.frame_stride + 1, s.n_beams, device=self.device)
+        self.hist = torch.zeros(1, s.ring_len, s.row_dim, device=self.device)
+        self._pending = None
+        self._first = True
+
+    def push_action(self, action_norm):
+        """The action this step's observation produced, as the network emitted it (in [-1, 1])."""
+        a = torch.as_tensor(action_norm, dtype=torch.float32, device=self.device).reshape(1, self.spec.act_dim)
+        if self._pending is not None:
+            row = torch.cat([self._pending, a.clamp(-1.0, 1.0)], 1)
+            self.hist = torch.cat([row[:, None, :], self.hist[:, :-1]], 1)
+
+    def build(self, ranges, speed: float, gyro_z: float):
+        """ranges (N,) metres (inf / nan: no return), speed [m/s] (VESC odometry), gyro_z [rad/s]
+        (mean of the IMU samples of this scan) -> (scan (1, n_frames, N), ego (1, ego_dim))."""
+        s = self.spec
+        r = torch.as_tensor(np.asarray(ranges, dtype=np.float32), device=self.device)
+        scan = norm_scan(r, s.range_max)[None]
+        first = self._first
+        if first:
+            self.scan_hist[:] = scan[:, None, :]
+        else:
+            self.scan_hist = torch.roll(self.scan_hist, 1, 1); self.scan_hist[:, 0] = scan
+        v = norm_speed(torch.tensor([[float(speed)]], device=self.device), s.v_max)
+        gz = norm_gyro_z(torch.tensor([[float(gyro_z)]], device=self.device), s.gyro_scale)
+        feat = torch.cat([v, gz], 1)
+        if first:
+            self.hist[:] = torch.cat([feat, torch.zeros(1, s.act_dim, device=self.device)], 1)[:, None, :]
+        ego = assemble_ego_v2(feat, self.hist, s.hist_len, s.hist_stride)
+        self._pending = feat; self._first = False
+        return self.scan_hist[:, ::s.frame_stride].clone(), ego
+
+    def build_message(self, mi: "MessageInputs"):
+        """One control step as the graph's topics carry it (`MessageInputs`), through `build`.
+        `att` and `speed_cap` are carried by the message and not read: v2 observes neither."""
+        r = resample_ranges(mi.ranges, mi.range_max, self.spec.n_beams)
+        imu = np.asarray(mi.imu, dtype=np.float32).reshape(-1, 6)
+        if imu.shape[0] == 0:
+            raise ValueError("a control step with no IMU sample has no observation to build: the "
+                             "node inhibits instead, and so should the caller")
+        return self.build(r, float(mi.speed), float(imu.mean(0)[2]))

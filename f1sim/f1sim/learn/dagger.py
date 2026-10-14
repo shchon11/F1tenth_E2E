@@ -790,8 +790,52 @@ def main():
     ap.add_argument("--wandb", default="online")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--eager", action="store_true", help="disable simulator / tracker compilation (CPU smoke tests)")
+    # ---- the v2 network (learn.model_v2, learn.dagger_v2). Every flag below is v2's own: None on a
+    # v1 run, which refuses any of them set, so an unflagged run is the run it always was.
+    ap.add_argument("--arch", choices=("v1", "v2"), default="v1",
+                    help="v2: the redesigned actor (docs/research/architecture-redesign-2026-10-13.md) on "
+                         "observation contract v2 and WP4 plans -- recurrent sequences with burn-in "
+                         "(--seq-burn 40, --chunk-length 80 unless set), imitation in the decoded WP4 space, B8, "
+                         "left-right mirroring. v1: every run before it")
+    ap.add_argument("--v2-frames", type=int, default=None, metavar="K",
+                    help="v2: newest LiDAR frames the actor reads, 1..3 (default 1; the perception gate decides)")
+    ap.add_argument("--v2-init-stem", default=None, metavar="CKPT",
+                    help="v2: seed a fresh student's two stems from this v1 resnet checkpoint "
+                         "(model_v2.init_stems_from_v1, as G1 / G4 did)")
+    ap.add_argument("--wp4-label", choices=("env", "linear-refit"), default=None,
+                    help="v2: where the WP4 labels come from. 'env' (default): the env's teacher-label API, "
+                         "where feat/v2's wp4 teachers plug in. 'linear-refit': the raceline teacher's linear "
+                         "plan, first window refitted to the four waypoints -- a stand-in for tests and smoke "
+                         "runs on a tree whose teachers do not speak wp4")
+    ap.add_argument("--mirror-prob", type=float, default=None, metavar="P",
+                    help="v2: probability that a training sequence is mirrored left-right (default 0.5)")
+    ap.add_argument("--aux-b8", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the B8 opponent-slot loss (default 0.5, the redesign's; 0 builds no head)")
+    ap.add_argument("--aux-near-car", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the nearest-visible-car head (default 0: not built)")
+    ap.add_argument("--aux-beam-car", type=float, default=None, metavar="COEF",
+                    help="v2: weight of the per-beam car / not-car head (default 0: not built)")
+    ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
+                    help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
+                         "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
+                         "the imitation loss (default 10; 0 = off, the coefficients alone)")
+    ap.add_argument("--aux-balance-rho", type=float, default=None, metavar="RHO",
+                    help="v2: the largest auxiliary / imitation trunk-gradient ratio the balance allows (default 0.5)")
+    ap.add_argument("--aux-balance-beta", type=float, default=None, metavar="B",
+                    help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
+                         "last five measurements)")
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
+    v2_applied = None
+    if a.arch == "v2":
+        from . import dagger_v2
+        v2_applied = dagger_v2.prepare_args(ap, a)
+    else:
+        set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
+                              "aux_beam_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta")
+                  if getattr(a, k) is not None]
+        if set_v2:
+            raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
     AUX_OPP_VISIBLE[0] = bool(a.aux_opp_visible)
     if a.maneuver:
         if a.teacher_kind != "rollout":
@@ -878,7 +922,8 @@ def main():
                                     # lockstep forever (learn.ppo does the same)
                                     stagger_first_episode=a.collision_mode == "soft",
                                     kind_mix_assign=a.kind_mix_assign,
-                                    movable_obstacles=a.movable_obstacles),
+                                    movable_obstacles=a.movable_obstacles,
+                                    **({} if v2_applied is None else dagger_v2.env_kwargs(a))),
                           cfg=cfg, seed=a.seed, rls=rls,
                           teacher_grip=a.teacher_grip, teacher_recover_time=a.teacher_recover_time,
                           teacher_limits=limits)
@@ -886,6 +931,9 @@ def main():
     teacher, teacher_desc = build_teacher(a.teacher_kind, rls, env, a)
     print(f"teacher: {teacher_desc}", flush=True)
     spec = common.obs_spec(env)
+    if v2_applied is not None:
+        return dagger_v2.run(a, env=env, teacher=teacher, teacher_desc=teacher_desc, names=names, device=device,
+                             applied=v2_applied)
     solo_env = solo_teacher = None
     solo_names = []
     if solo_steps:
