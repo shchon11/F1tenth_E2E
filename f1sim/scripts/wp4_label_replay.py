@@ -11,12 +11,15 @@ tracker). `--ego raw` skips the guard, `--ego interactive` labels with the traff
 
     python f1sim/scripts/wp4_label_replay.py --track real:korea_2025_iccas --format wp4 --envs 256 --steps 1200
     python f1sim/scripts/wp4_label_replay.py --format wp4 --opponent forzaeth_pred --envs 128     # traffic
+    python f1sim/scripts/wp4_label_replay.py --format wp4 --opp-format linear --opponent lane_switch  # linear cars
     python f1sim/scripts/wp4_label_replay.py --format linear --noise                                # gate 6
 
 Counted on the ego rows (`env.learner`): wall/prop contact onsets (`info["wall_onset"]`), car contact
 onsets except in the first 2 s of an episode (a spawn-contact bug is being fixed separately), km,
 laps, the share of steps stopped off the line (< 0.3 m/s and > 0.15 m from the raceline, after 2 s)
-and the share of label steps whose first curvature number jumps by more than 0.1 (design 7 test 3).
+and the share of label steps whose first curvature number jumps by more than 0.1 (design 7 test 3);
+walls after 2 s apart, and how often the guard's (or the interactive ego's) label is the stop, an
+evasion, a braking evasion.
 
 History. UNIT 1 (2026-10-14, 8 CPU envs, 60 s, seed 0, the min-time teacher 7 / 6.5 / 4) replayed
 labels built outside the teacher: the design prototype's (a GN fit straight to the line) reproduced
@@ -34,6 +37,14 @@ walls 3.31 per km at 3.92 m/s against 2.44 at 3.13 for linear with a 0.6 s end a
 (fail); noise replay 5.06 against 3.39 per km at 3.93 against 3.68 m/s (fail). At equal pace -- raw
 labels against that linear -- the wp4 labels touch the icra2022 walls 20 % less (5.59 against 7.02
 per km, both 15.03 s laps) and under noise 41 % less (6.25 against 10.56).
+
+After the registration (RESULTS 7): the stop candidate and the braking evasions are -1 in wp4 too,
+and `--opp-format linear` keeps the opponents in the plan they were built for while the ego plans wp4
+(`EnvConfig.opponent_speed_mode`). Against lane_switch / forzaeth_pred / interactive cars the guard's
+wp4 ego then touched them 0.40 / 1.29 / 0.24 times per km, production linear 0.33 / 1.72 / 0.06 and
+linear with a 0.6 s end and no certification 0.37 / 1.37 / 0.12 -- pooled 0.64 against 0.69 / 0.61 at
+4.05 against 3.88 / 3.95 m/s; only the interactive excess is past 1 sigma. Alone on icra2022 the
+guard's walls fell from 3.31 to 2.48 per km at 3.92 m/s with the -1 stop.
 """
 from __future__ import annotations
 
@@ -47,6 +58,7 @@ import torch
 
 from f1sim import mpc
 from f1sim.gym_env import EnvConfig
+from f1sim.interactive_teacher import InteractiveTeacher
 from f1sim.learn import common
 from f1sim.params import Config
 from f1sim.teacher import RacelineTeacher
@@ -64,7 +76,8 @@ def build(a):
     trs, rls = common.load_tracks([a.track], racelines=True, objective="min_time", **LIMITS)
     cfg = Config(); cfg.sim.compile = False
     kw = dict(speed_cap=a.speed_cap, action_mode="plan", speed_mode=a.format, max_steps=a.steps + 10,
-              laps=10 ** 6, collision_mode="soft", compile_tracker=False)
+              laps=10 ** 6, collision_mode="soft", compile_tracker=False,
+              opponent_speed_mode=None if a.opp_format == "same" else a.opp_format)
     if a.opponent == "teacher":
         kw.update(race_size=2, opponent="teacher", opp_speed_range=tuple(a.opp_speed))
     elif a.opponent != "none":
@@ -77,6 +90,8 @@ def build(a):
                   procedural_raceline_corridor="off", spawn_runway=3.0)
     env = common.make_env(trs, a.envs, a.device, EnvConfig(**kw), cfg=cfg, seed=a.seed, rls=rls, teacher_limits=LIMITS)
     teacher = common.make_teacher(rls, env, **LIMITS)
+    if a.evasion_brake:
+        InteractiveTeacher.wp4_evasion_brake = a.evasion_brake       # the guard's, the ego's and the opponents'
     if a.recipe:
         teacher.wp4_path = a.recipe
     if a.linear_horizon is not None:
@@ -87,7 +102,6 @@ def build(a):
         env.teacher.wp4_path = teacher.wp4_path
     label = teacher
     if a.ego == "interactive":
-        from f1sim.interactive_teacher import InteractiveTeacher
         label = InteractiveTeacher(teacher, env, cand_iters=2)            # learn/dagger.py's defaults
     elif a.ego == "layout":
         from f1sim.layout_line import LayoutLineTeacher
@@ -107,6 +121,10 @@ def main():
                     help="none | teacher (raceline opponents) | an opponent-slot kind (lane_switch, forzaeth_pred, "
                          "interactive, ...)")
     ap.add_argument("--opp-speed", type=float, nargs=2, default=(0.7, 1.0))
+    ap.add_argument("--opp-format", choices=("same", "linear", "wp4"), default="same",
+                    help="the opponents' plan format (EnvConfig.opponent_speed_mode): 'same' is --format's")
+    ap.add_argument("--evasion-brake", choices=("stop", "curve"), default=None,
+                    help="InteractiveTeacher.wp4_evasion_brake (default: the class's own)")
     ap.add_argument("--props", action="store_true", help="procedural props on the floor (use --ego layout)")
     ap.add_argument("--noise", action="store_true", help="add PPO's initial per-dimension noise (LOG_STD) to the label")
     ap.add_argument("--linear-horizon", type=float, default=None, help="RacelineTeacher.speed_horizon_s (linear)")
@@ -136,6 +154,9 @@ def main():
     prev_lab, prev_car = None, torch.zeros(B, dtype=torch.bool, device=env.device)
     vsum, nv = 0.0, 0
     blocked = valid_n = 0
+    # which candidate the label is: the on-line stop, an evasion, a braking evasion (ego rows, after 2 s)
+    chooser = label if a.ego == "interactive" else None             # the guard exists after its first label
+    n_choice = ch_stop = ch_evade = ch_evade_brake = 0
     track_props = bool(a.props)
     t0 = time.time()
     for k in range(a.steps):
@@ -145,6 +166,16 @@ def main():
         valid = getattr(label, "last_label_valid", None)
         if torch.is_tensor(valid) and valid.shape == ego.shape:
             blocked += int((~valid & ego).sum()); valid_n += int(ego.sum())
+        if chooser is None and a.ego == "guard":
+            chooser = getattr(env, "_raceline_teacher_guards", {}).get(teacher)
+        if chooser is not None and chooser.last_choice is not None:
+            j = chooser.last_choice
+            reg = chooser.offsets.numel() * chooser.speeds.numel()       # then: stop, (coast, brake) x 2 sides
+            on = ego & (env.ep_step >= spawn_steps)
+            n_choice += int(on.sum())
+            ch_stop += int((on & (j == reg)).sum())
+            ch_evade += int((on & (j > reg)).sum())
+            ch_evade_brake += int((on & (j > reg) & ((j - reg) % 2 == 0)).sum())
         act = lab
         if a.noise:
             act = (lab + sigma * torch.randn(lab.shape, generator=gen, device=env.device)).clamp(-1.0, 1.0)
@@ -181,17 +212,23 @@ def main():
     res = {"track": a.track, "format": a.format, "recipe": teacher.wp4_path if a.format == "wp4" else None,
            "ego": a.ego, "opponent": a.opponent, "opp_speed": list(a.opp_speed), "props": a.props, "noise": a.noise,
            "linear_horizon": a.linear_horizon, "certify": teacher.certify_speeds, "envs": a.envs,
+           "opp_format": env.opp_plan_spec.speed_mode if a.opponent != "none" else None,
+           "evasion_brake": InteractiveTeacher.wp4_evasion_brake,
            "ego_rows": int(ego.sum()), "steps": a.steps, "seed": a.seed,
            "km": km, "laps": int(laps.size),
            "lap_median": float(np.median(laps)) if laps.size else None,
            "lap_mean": float(laps.mean()) if laps.size else None,
            "mean_speed": vsum / max(nv, 1),
            "wall_contacts": wall, "wall_per_km": wall / max(km, 1e-9), "wall_contacts_first_2s": wall_spawn,
+           "wall_per_km_after_2s": (wall - wall_spawn) / max(km, 1e-9),
            "prop_contacts": prop if track_props else None,
            "car_contacts": car, "car_per_km": car / max(km, 1e-9), "car_contacts_first_2s": car_spawn,
            "offline_stop_frac": stop_off / max(n_after, 1),
            "kappa1_jump_frac": jumps / max(n_pairs, 1),
            "label_blocked_frac": blocked / max(valid_n, 1) if valid_n else None,
+           "choice_stop_frac": ch_stop / n_choice if n_choice else None,
+           "choice_evade_frac": ch_evade / n_choice if n_choice else None,
+           "choice_evade_brake_frac": ch_evade_brake / n_choice if n_choice else None,
            "wall_s": wall_s, "ms_per_step": 1000 * wall_s / a.steps}
     print(json.dumps(res))
     if a.out:
