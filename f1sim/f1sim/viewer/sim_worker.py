@@ -1063,8 +1063,8 @@ class SimWorker:
         # its own contract when the run wrote none (`meta["obs"]` is what the network was built for).
         spec = extra.get("spec") or ((model.meta.get("obs") or {}) if is_v2 else {})
         if is_v2:
-            # contract v2: the env emits {"scan": the newest n_frames, "ego": the 210-wide vector (42
-            # without the issued actions)}
+            # contract v2: the env emits {"scan": the newest n_frames, "ego": the 42-wide vector (210
+            # with the issued actions)}
             # (`F1VecEnv._obs_v2`, the same assembly as the car's `ObsBuilderV2`), with the frames and
             # history the contract names; v1's action history, attitude and accelerometer are not in it
             from ..learn.obs import ObsSpecV2

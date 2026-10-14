@@ -35,6 +35,8 @@ from f1sim.learn.obs import ObsSpecV2, action_columns, action_mirror_signs, ego_
 from f1sim.mpc import PlanSpec, encode_wp4, plan_length  # noqa: E402
 
 SPEC = PlanSpec(speed_mode="wp4")
+#: The default contract's ego width, which a v2 network is built at by default: 42 since 2026-10-15
+EGO = ObsSpecV2().ego_dim
 
 
 # ---------------------------------------------------------------- the value normaliser
@@ -79,7 +81,7 @@ def _critic_and_inputs(dtype=torch.float32, rows=64):
         with torch.no_grad():                  # a trained head's size: the init's x 0.1 would hide errors
             cr.value.weight.mul_(30.0); cr.value.bias.fill_(0.7)
         g = torch.Generator().manual_seed(5)
-        x = (torch.rand(rows, 1, 61, generator=g).to(dtype), 0.3 * torch.randn(rows, 210, generator=g).to(dtype),
+        x = (torch.rand(rows, 1, 61, generator=g).to(dtype), 0.3 * torch.randn(rows, EGO, generator=g).to(dtype),
              torch.full((rows, 1), -0.4, dtype=dtype), 0.5 * torch.randn(rows, PRIV_V2_DIM, generator=g).to(dtype))
     return cr, x
 
@@ -280,9 +282,10 @@ def test_a_linear_plan_becomes_the_wp4_plan_that_drives_its_first_window():
 
 
 # ---------------------------------------------------------------- the mirror
-def _batch(T=5, m=4, n=31, seed=0):
+def _batch(T=5, m=4, n=31, seed=0, ego_actions=None):
+    """`ego_actions` None: the contract's default ego; True / False names the contract."""
     g = torch.Generator().manual_seed(seed)
-    spec = ObsSpecV2(n_beams=n)
+    spec = ObsSpecV2(n_beams=n) if ego_actions is None else ObsSpecV2(n_beams=n, ego_actions=ego_actions)
     return spec, {"scan": torch.rand(T, m, 1, n, generator=g), "ego": torch.randn(T, m, spec.ego_dim, generator=g),
                   "label": torch.rand(T, m, 8, generator=g) * 2 - 1,
                   "priv": torch.randn(T, m, PRIV_V2_DIM, generator=g),
@@ -291,8 +294,9 @@ def _batch(T=5, m=4, n=31, seed=0):
                   "b8_age": torch.randint(0, 200, (T, m, 3), generator=g)}
 
 
-def test_mirroring_twice_is_the_identity_on_every_key_and_only_flipped_sequences_move():
-    spec, b = _batch()
+@pytest.mark.parametrize("ego_actions", [True, None], ids=["with_issued_actions", "default_contract"])
+def test_mirroring_twice_is_the_identity_on_every_key_and_only_flipped_sequences_move(ego_actions):
+    spec, b = _batch(ego_actions=ego_actions)
     mir = tv.Mirror(spec)
     flip = torch.tensor([True, False, True, False])
     once = mir.apply(b, flip)
@@ -306,8 +310,10 @@ def test_mirroring_twice_is_the_identity_on_every_key_and_only_flipped_sequences
     e, e1 = b["ego"][:, 0], once["ego"][:, 0]
     assert torch.equal(e1[:, col["speed@t"]], e[:, col["speed@t"]])
     assert torch.equal(e1[:, col["gyro_z@t"]], -e[:, col["gyro_z@t"]])
-    assert torch.equal(e1[:, col["action[0]@t-2"]], -e[:, col["action[0]@t-2"]])
-    assert torch.equal(e1[:, col["action[5]@t-3"]], e[:, col["action[5]@t-3"]])
+    assert torch.equal(e1[:, col["gyro_z@t-3"]], -e[:, col["gyro_z@t-3"]])
+    if spec.ego_actions:                       # the issued actions: a curvature flips, a speed does not
+        assert torch.equal(e1[:, col["action[0]@t-2"]], -e[:, col["action[0]@t-2"]])
+        assert torch.equal(e1[:, col["action[5]@t-3"]], e[:, col["action[5]@t-3"]])
     assert torch.equal(once["label"][:, 0], b["label"][:, 0] * action_mirror_signs("wp4"))
     assert torch.equal(once["b8_lab"][:, 0], b["b8_lab"][:, 0] * torch.tensor(B8_LABEL_MIRROR))
     assert torch.equal(once["near"][:, 0], b["near"][:, 0] * torch.tensor(NEAR_MIRROR))
@@ -316,7 +322,7 @@ def test_mirroring_twice_is_the_identity_on_every_key_and_only_flipped_sequences
 
 # ---------------------------------------------------------------- the action-history dropout (arm B)
 def test_action_dropout_zeroes_every_issued_action_of_a_dropped_sequence_and_nothing_else():
-    spec, b = _batch(T=6, m=4)
+    spec, b = _batch(T=6, m=4, ego_actions=True)          # arm B drops the full contract's action columns
     drop = torch.tensor([True, False, False, True])
     out = tv.ActionDropout(spec, 0.5).apply(b, drop)
     act = list(action_columns(spec))
@@ -339,7 +345,7 @@ def test_action_dropout_zeroes_every_issued_action_of_a_dropped_sequence_and_not
 
 
 def test_action_dropout_draws_per_sequence_and_refuses_a_contract_without_actions():
-    spec = ObsSpecV2(n_beams=31)
+    spec = ObsSpecV2(n_beams=31, ego_actions=True)
     torch.manual_seed(0)
     draws = tv.ActionDropout(spec, 0.5).draw(20000)
     assert draws.dtype == torch.bool and abs(float(draws.float().mean()) - 0.5) < 0.02
@@ -579,7 +585,7 @@ def test_per_loss_gradients_assemble_the_backward_of_the_weighted_total():
 
 def _sequences(T=8, n=2, seed=1):
     g = torch.Generator().manual_seed(seed)
-    return {"scan": torch.rand(T, n, 1, 61, generator=g), "ego": 0.3 * torch.rand(T, n, 210, generator=g),
+    return {"scan": torch.rand(T, n, 1, 61, generator=g), "ego": 0.3 * torch.rand(T, n, EGO, generator=g),
             "c": torch.zeros(T, n, 1), "keep": torch.ones(T, n), "valid": torch.ones(T, n, dtype=torch.bool),
             "label": torch.rand(T, n, 8, generator=g) * 2 - 1, "b8_lab": 0.2 * torch.randn(T, n, 3, 3, generator=g),
             "b8_cand": torch.ones(T, n, 3, dtype=torch.bool), "b8_age": torch.zeros(T, n, 3, dtype=torch.long),

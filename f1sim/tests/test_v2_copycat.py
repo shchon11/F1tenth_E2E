@@ -2,8 +2,9 @@
 (docs/research/copycat-2026-10-14.md).
 
 * the command line: `--v2-ego-actions` (arm A: the contract without the issued actions) and
-  `--action-dropout` (arm B) default to the contract / no dropout, refuse each other and nonsense, are
-  refused by a v1 run, and a run continuing a checkpoint (`--init`, a PPO leg) takes its contract;
+  `--action-dropout` (arm B) default to the contract (without the issued actions since 2026-10-15,
+  `learn.obs.EGO_ACTIONS_DEFAULT`) / no dropout, refuse each other and nonsense, are refused by a v1
+  run, and a run continuing a checkpoint (`--init`, a PPO leg) takes its contract;
   evaluate's `--speed-mode` takes wp4;
 * the labels: written only for the cars the action drives (`label_rows`, `F1VecEnv.action_driven`) --
   the guard is asked for those rows and gives each the label the whole-batch call gives it -- while
@@ -41,18 +42,26 @@ def test_the_copycat_options_default_to_the_contract_and_refuse_each_other():
     argv = ["--arch", "v2"]
     a = ap.parse_args(argv)
     dagger_v2.prepare_args(ap, a, argv)
-    assert a.v2_ego_actions == "on" and a.action_dropout == 0.0
-    assert dagger_v2.env_kwargs(a)["ego_actions"] is True
+    # the contract's default since 2026-10-15: the ego carries no issued action
+    assert a.v2_ego_actions == "off" and a.action_dropout == 0.0
+    assert dagger_v2.env_kwargs(a)["ego_actions"] is False
     argv = ["--arch", "v2", "--v2-ego-actions", "off"]
     a = ap.parse_args(argv)
     dagger_v2.prepare_args(ap, a, argv)
     assert a.v2_ego_actions == "off" and dagger_v2.env_kwargs(a)["ego_actions"] is False
-    argv = ["--arch", "v2", "--action-dropout", "0.5"]
+    argv = ["--arch", "v2", "--v2-ego-actions", "on"]               # the full contract, by name
     a = ap.parse_args(argv)
     dagger_v2.prepare_args(ap, a, argv)
-    assert a.action_dropout == 0.5 and a.v2_ego_actions == "on"
-    for bad in (["--action-dropout", "0.5", "--v2-ego-actions", "off"], ["--action-dropout", "1.5"],
-                ["--action-dropout", "-0.1"]):
+    assert a.v2_ego_actions == "on" and dagger_v2.env_kwargs(a)["ego_actions"] is True
+    argv = ["--arch", "v2", "--action-dropout", "0.5", "--v2-ego-actions", "on"]
+    a = ap.parse_args(argv)
+    dagger_v2.prepare_args(ap, a, argv)
+    assert a.action_dropout == 0.5 and a.v2_ego_actions == "on" and dagger_v2.env_kwargs(a)["ego_actions"] is True
+    # arm B zeroes the issued-action columns: refused where there are none -- the default included --
+    # and refused as nonsense on the contract that has them
+    for bad in (["--action-dropout", "0.5"], ["--action-dropout", "0.5", "--v2-ego-actions", "off"],
+                ["--action-dropout", "1.5", "--v2-ego-actions", "on"],
+                ["--action-dropout", "-0.1", "--v2-ego-actions", "on"]):
         argv = ["--arch", "v2", *bad]
         with pytest.raises(SystemExit):
             dagger_v2.prepare_args(ap, ap.parse_args(argv), argv)
@@ -82,13 +91,15 @@ def test_a_v1_run_refuses_the_copycat_flags(monkeypatch, flag, val):
 def test_a_run_that_continues_a_checkpoint_takes_its_contract(tmp_path):
     from v2_fixtures import generated_v2_checkpoint
     a_ck = generated_v2_checkpoint(str(tmp_path / "a.pt"), ego_actions=False)
-    full_ck = generated_v2_checkpoint(str(tmp_path / "full.pt"))
+    full_ck = generated_v2_checkpoint(str(tmp_path / "full.pt"), ego_actions=True)
     assert dagger_v2.ego_actions_of(a_ck) is False and dagger_v2.ego_actions_of(full_ck) is True
     ap = _parser("f1sim.learn.dagger")
-    argv = ["--arch", "v2", "--init", a_ck]
-    a = ap.parse_args(argv)
-    dagger_v2.prepare_args(ap, a, argv)
-    assert a.v2_ego_actions == "off"
+    # either contract: since 2026-10-15 it is the full one that differs from the default
+    for ck, want in ((a_ck, "off"), (full_ck, "on")):
+        argv = ["--arch", "v2", "--init", ck]
+        a = ap.parse_args(argv)
+        dagger_v2.prepare_args(ap, a, argv)
+        assert a.v2_ego_actions == want
     # a PPO leg has no flag of its own: the env reads the contract --init's network was trained on
     pp = _parser("f1sim.learn.ppo")
     for ck, want in ((a_ck, False), (full_ck, True)):
@@ -96,10 +107,11 @@ def test_a_run_that_continues_a_checkpoint_takes_its_contract(tmp_path):
         b = pp.parse_args(argv)
         ppo_v2.prepare_args(pp, b, argv)
         assert ppo_v2.env_kwargs(b)["ego_actions"] is want
+    # and a fresh network the contract's default, without the issued actions
     argv = ["--arch", "v2"]
     b = pp.parse_args(argv)
     ppo_v2.prepare_args(pp, b, argv)
-    assert ppo_v2.env_kwargs(b)["ego_actions"] is True
+    assert ppo_v2.env_kwargs(b)["ego_actions"] is False
 
 
 def test_evaluate_takes_the_wp4_speed_mode():
@@ -262,7 +274,7 @@ def test_an_arm_b_run_drops_half_its_sequences_action_columns_and_says_so(tmp_pa
                                          "--epochs", "4", "--batch", "64", "--device", "cpu", "--eager",
                                          "--wandb", "disabled", "--wp4-label", "env", "--eval-steps", "20",
                                          "--teacher-eval-steps", "0", "--speed-cap", "8", "--aux-near-car", "0",
-                                         "--log-every", "1", "--action-dropout", "0.5"],
+                                         "--log-every", "1", "--action-dropout", "0.5", "--v2-ego-actions", "on"],
                   tmp_path, monkeypatch)
         rec = [json.loads(x) for x in open(tmp_path / "cb" / "progress.jsonl")][-1]
         assert 0.0 < rec["train/action_dropped_frac"] < 1.0

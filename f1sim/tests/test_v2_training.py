@@ -88,9 +88,9 @@ def test_a_v1_run_refuses_the_v2_flags(monkeypatch, module, flag):
 # ---------------------------------------------------------------- the DAgger buffer
 def test_the_buffer_rebuilds_the_frame_stack_the_env_had():
     buf = dagger_v2.SequenceBuffer(n_frames=3)
-    T, L, N = 6, 2, 4
+    T, L, N, E = 6, 2, 4, ObsSpecV2().ego_dim
     for t in range(T):
-        buf.add(scan=torch.full((L, N), float(t)), ego=torch.zeros(L, 210), label=torch.zeros(L, 8),
+        buf.add(scan=torch.full((L, N), float(t)), ego=torch.zeros(L, E), label=torch.zeros(L, 8),
                 valid=torch.ones(L, dtype=torch.bool), newep=torch.tensor([t == 0, t in (0, 3)]),
                 c=torch.zeros(L, 1))
     buf.finalize()
@@ -98,7 +98,7 @@ def test_the_buffer_rebuilds_the_frame_stack_the_env_had():
     # env 0 at t 4: frames 4, 3, 2; env 1 began an episode at 3: frames 4, 3, 3; t 1: 1, 0, 0
     assert stack[:, :, 0].tolist() == [[4, 3, 2], [4, 3, 3], [1, 0, 0]]
     s = buf.sample(3, 5, "cpu")
-    assert s["scan"].shape == (5, 3, 3, N) and s["ego"].shape == (5, 3, 210) and s["keep"].shape == (5, 3)
+    assert s["scan"].shape == (5, 3, 3, N) and s["ego"].shape == (5, 3, E) and s["keep"].shape == (5, 3)
     assert s["valid"].dtype == torch.bool and "newep" not in s
 
 
@@ -110,7 +110,7 @@ def test_burn_in_steps_carry_no_loss_and_b8_reaches_the_trunk():
     m = ActorCriticV2(n_beams=61, aux={"b8": True})
     T, n, burn = 8, 2, 3
     g = torch.Generator().manual_seed(1)
-    s = {"scan": torch.rand(T, n, 1, 61, generator=g), "ego": 0.3 * torch.rand(T, n, 210, generator=g),
+    s = {"scan": torch.rand(T, n, 1, 61, generator=g), "ego": 0.3 * torch.rand(T, n, m.obs_spec.ego_dim, generator=g),
          "c": torch.zeros(T, n, 1), "keep": torch.ones(T, n), "valid": torch.ones(T, n, dtype=torch.bool),
          "label": torch.rand(T, n, 8, generator=g) * 2 - 1, "b8_lab": 0.2 * torch.randn(T, n, 3, 3, generator=g),
          "b8_cand": torch.ones(T, n, 3, dtype=torch.bool), "b8_age": torch.zeros(T, n, 3, dtype=torch.long)}

@@ -366,8 +366,8 @@ class SequenceBuffer:
     one learner's steps; its frame stack is rebuilt from the stored newest frames at sampling time (the
     env's own history, which repeats an episode's first frame backwards, is what `frames_at` rebuilds).
 
-    What one step stores: the newest frame (fp16), the ego vector (fp16 -- 210 numbers, the 1-s
-    history in it), the teacher's label and its validity, whether the step began an episode, the
+    What one step stores: the newest frame (fp16), the ego vector (fp16 -- 42 numbers, 210 with the
+    issued actions; the 1-s history in it), the teacher's label and its validity, whether the step began an episode, the
     dial column `c` the student was given, and -- when their heads train -- the B8 tracks (`select_tracks`:
     labels, candidates, AGE: knowability is decided per sampled window) and the nearest-visible-car
     target."""

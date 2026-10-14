@@ -22,9 +22,11 @@ the measured latency). The run is one episode (soft contacts, no time limit), so
 reset nor the node's `/f1sim/reset` is inside the window; the reset rule is held separately below.
 
 The checkpoint is generated (deterministic, any machine); `F1SIM_V2_PARITY_CKPT=<path.pt>` runs the
-same comparison on a trained one (UNIT 5a ran it on UNIT 4's smoke checkpoints). The contract without
-the issued actions (`ObsSpecV2.ego_actions` False, the copycat study's arm A) runs the same comparison
-on a generated checkpoint of its own.
+same comparison on a trained one (UNIT 5a ran it on UNIT 4's smoke checkpoints). The generated one is
+the contract WITH the issued actions (`ObsSpecV2.ego_actions` True, every v2 checkpoint before
+2026-10-15), named explicitly: it is the one whose ego reads the node's own plans back from the ring.
+The contract without them (the copycat study's arm A, the default since 2026-10-15) runs the same
+comparison on a generated checkpoint of its own.
 """
 from __future__ import annotations
 
@@ -54,7 +56,9 @@ def checkpoint(tmp_path_factory):
     given = os.environ.get("F1SIM_V2_PARITY_CKPT")
     if given:
         return given
-    return generated_v2_checkpoint(str(tmp_path_factory.mktemp("v2parity") / "student_latest.pt"))
+    # the issued plans in the ego (see the module doc); `checkpoint_no_actions` is the default contract
+    return generated_v2_checkpoint(str(tmp_path_factory.mktemp("v2parity") / "student_latest.pt"),
+                                   ego_actions=True)
 
 
 @pytest.fixture(scope="module")

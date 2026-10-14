@@ -4,7 +4,7 @@ docs/research/architecture-redesign-2026-10-13.md (section 4 "새 구조", corre
 "관문 결과와 설계 정정") with the WP4 plan output of docs/research/output-format-2026-10-14.md:
 
     scan (B, K, N) ─► B1 [frames | 9-tap min-pool of frame 0] ─► B2 ResNet stem, no bypass ─► s (256)
-    ego  (B, 210)  ─► B3 Linear ─► GELU ─────────────────────────────────────────────────────► p (128)
+    ego  (B, 42)   ─► B3 Linear ─► GELU ─────────────────────────────────────────────────────► p (128)
     dial c (B, 1)  ───────────────────────────────────────────────────────────────────────────► c
                       B4  e = GELU(Linear([s | p | c] -> 256))
                       B5  y, h' = GRU(LayerNorm(e), h)      (128, chrono update gate)
@@ -22,9 +22,10 @@ Why each choice, with the measurement that decided it (the redesign's ledger, se
   fc variance, the neck alone reads sector distance at R^2 0.81-0.95, and the bypass was what broke
   the ONNX export. 794 k parameters; G1's trainable copy of exactly this stem is what made occluded
   recall work (R^2 0.609).
-* B3 -- the ego vector of contract v2 (`learn.obs.ObsSpecV2`, 210 columns, none duplicated: now,
-  a_{t-2}, and 20 history rows that start with a_{t-1}'s step; 42 without the issued actions,
-  `ego_actions` False -- the copycat study's arm A, docs/research/copycat-2026-10-14.md).
+* B3 -- the ego vector of contract v2 (`learn.obs.ObsSpecV2`): [speed, gyro z] now and 20 history rows
+  of [speed, gyro z], 42 columns -- the default since 2026-10-15 (`ego_actions` False; the issued
+  actions were the copycat channel, docs/research/itcurve-2026-10-14.md). With `ego_actions` True, 210
+  columns, none duplicated: now, a_{t-2}, and 20 history rows that start with a_{t-1}'s step.
 * B4 -- the dial is an ordinary input column: v1's zero-initialised additive projection existed
   only to keep a warm start bit-identical, and there is nothing to warm-start here. Not LayerNorm'd
   on its own (a one-wide LayerNorm is a constant, which would kill the dial -- a judge's catch).
@@ -63,7 +64,8 @@ from .memory import Hidden
 from .model import ResBlock1d
 from .obs import MINPOOL_TAPS, ObsSpecV2
 
-#: The contract's ego width (`learn.obs.ObsSpecV2`, 210): the default every v2 module is built at.
+#: The contract's ego width (`learn.obs.ObsSpecV2`: 42, 210 with the issued actions): the default every
+#: v2 module is built at.
 EGO_DIM = ObsSpecV2().ego_dim
 
 #: `meta["arch"]` of every v2 checkpoint. A v1 checkpoint has no "arch" key at all.

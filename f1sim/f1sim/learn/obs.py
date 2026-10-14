@@ -14,11 +14,12 @@ step as the messages the graph would have carried and driving the node's builder
 `tests/test_obs_identity.py` is the check: identical message-equivalent inputs, identical tensors.
 
 Contract v2 (2026-10-14, the redesign's B1-B4; `ObsSpecV2`, `ObsBuilderV2`, `ego_columns`) is the
-second section of this file: the newest 1..3 frames, an ego vector of [speed, gyro z] now, the 8
-plan numbers issued two steps back, and 20 rows x [speed, gyro z, the 8 issued plan numbers] --
-210 columns, no column a duplicate of another -- and the grip dial as one more input. Its variant
-without the issued actions (`ObsSpecV2.ego_actions` False: [speed, gyro z] now and 20 rows of
-[speed, gyro z], 42 columns) is the copycat study's arm A (docs/research/copycat-2026-10-14.md).
+second section of this file: the newest 1..3 frames, an ego vector of [speed, gyro z] now and 20 rows
+x [speed, gyro z] -- 42 columns -- and the grip dial as one more input. That is the default since
+2026-10-15 (`ObsSpecV2.ego_actions` False, docs/research/itcurve-2026-10-14.md: the issued actions were
+the copycat channel). With `ego_actions` True the ego also carries the 8 plan numbers issued two steps
+back and each row's issued plan -- 210 columns, no column a duplicate of another -- the contract every
+v2 checkpoint before that date was trained on.
 `contract_table_v2(spec)` prints the column table; v1 below is unchanged and is what every
 checkpoint without `version: 2` in its spec reads.
 
@@ -704,8 +705,9 @@ class ObsBuilder:
 #   * no beam-angle ramp: it is the same row for every sample (zero variance), so it is not an input.
 #     The 9-tap min-pool of the newest frame stays (23.5 % of the first convolution's variance) --
 #     it is computed INSIDE the network (`model_v2.StemV2`), from the frame, on the car as in training.
-#   * the ego vector is [speed, gyro z] now, the action issued two steps back, and a one-second
-#     history of [speed, gyro z, the action the policy issued]. Gone: attitude (correlation 0.14 with the truth, rms 7.2 deg, and 5 of 13 car
+#   * the ego vector is [speed, gyro z] now and a one-second history of [speed, gyro z] -- and, with
+#     `ego_actions` True (the default until 2026-10-15), the action issued two steps back and each history
+#     row's issued action. Gone: attitude (correlation 0.14 with the truth, rms 7.2 deg, and 5 of 13 car
 #     recordings stalled the node at 40 deg), the speed cap (zero variance over training; the car's
 #     0.4 is out of distribution), gyro x/y and the accelerometer (vibration rms 0.15-0.41 rad/s, no
 #     requirement reads them) and `prev_action`, whose a_{t-1} IS history row 0's action -- the
@@ -758,7 +760,14 @@ PREV_ACTION_LAGS = (2,)
 
 #: Whether a v2 ego vector carries the issued actions (a_{t-2} and every history row's plan) unless
 #: its spec says otherwise -- `ObsSpecV2.ego_actions`, `EnvConfig.ego_actions`, the trainers' default.
-EGO_ACTIONS_DEFAULT = True
+#: False since 2026-10-15 (itcurve ADDENDUM A, 4 seeds, iteration 0 trained to 3000 updates): with the
+#: issued actions the student's held-out error fell 2.7x while its ICCAS solo completion stayed at 3 / 39 /
+#: 9 / 1 of 128 -- an issued-speed copy gain of 0.83-0.93 from 100 updates on, the causal-confusion
+#: signature; without them it completed 29 / 45 / 79 / 91 (at its own plateau, 1600 updates) and its
+#: held-out gains became laps (Spearman -0.36 .. -0.96 against +0.67 .. -0.61 for the full contract). The
+#: two reasons the redesign gave them (B3) were grip identification, already refuted (R^2 <= 0.05), and
+#: M2's "own commands and response >= 0.6 s", which the tracker's motor model covers for execution.
+EGO_ACTIONS_DEFAULT = False
 
 #: What a contract-v2 spec dict written before `ego_actions` existed meant: every v2 checkpoint up to
 #: the copycat study (2026-10-14) observed its issued actions. `ObsSpecV2.from_dict` fills it in, so

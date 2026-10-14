@@ -3,8 +3,8 @@
 The opponent pool (`learn.opponent_pool`) used to hand every entry the env's own observation, which is
 right exactly while the league and the learner share one contract -- and refused the rest. That
 stopped being true with the v2 redesign (docs/research/architecture-redesign-2026-10-13.md 6장 1단계,
-"상대 좌석별 ObsBuilder"): a v2 learner's env emits contract v2 (the newest frame and the 210-wide ego
-vector) while every league seat of the boot camp is a v1 checkpoint (six frames, the 366-wide proprio
+"상대 좌석별 ObsBuilder"): a v2 learner's env emits contract v2 (the newest frame and the 42-wide ego
+vector, 210 with the issued actions) while every league seat of the boot camp is a v1 checkpoint (six frames, the 366-wide proprio
 vector with attitude, accelerometer and speed cap, linear plans); and the learner's own v2 snapshots
 join that league as it grows. Without a builder per contract neither safest nor the league could be
 raced by a v2 learner -- the redesign's stated price of `opponent_pool._check_compatible`.

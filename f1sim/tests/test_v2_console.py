@@ -7,7 +7,8 @@ cleared at every episode boundary), the grip dial as its input, its WP4 plans tr
 controller it was trained with, and the saliency / internals panels working on it.
 
 * in process: the console's actions are, bit for bit, `model.act` with the hidden state carried
-  and the session's dial -- before and after a reset, which clears the state;
+  and the session's dial -- before and after a reset, which clears the state -- for a checkpoint of
+  either ego contract (without the issued actions, the default since 2026-10-15, or with them);
 * as a process (slow): the real spawned worker, over its pipes, starts the session, streams frames
   of a car that moves, follows the dial and the reset commands, and draws the saliency map.
 """
@@ -29,8 +30,8 @@ MAP = "gen:competition:0"
 
 @pytest.fixture(scope="module")
 def v2_run(tmp_path_factory):
-    """A run directory with one v2 checkpoint (deterministic, at the simulator's 1081 beams), or the
-    trained one `F1SIM_V2_CONSOLE_CKPT` names."""
+    """A run directory with one v2 checkpoint (deterministic, at the simulator's 1081 beams, the
+    contract's default ego), or the trained one `F1SIM_V2_CONSOLE_CKPT` names."""
     given = os.environ.get("F1SIM_V2_CONSOLE_CKPT")
     if given:
         return given
@@ -113,21 +114,36 @@ def test_the_console_session_drives_the_v2_actor_exactly_as_model_act_does(v2_ru
 
 @pytest.mark.slow
 def test_the_console_drives_a_v2_actor_without_issued_actions(tmp_path):
-    """The copycat study's arm A in the console: the session's env emits the 42-wide ego the checkpoint
-    reads, and the console's actions are `model.act`'s with the state carried."""
+    """The copycat study's arm A in the console (the contract's default since 2026-10-15): the session's
+    env emits the 42-wide ego the checkpoint reads, and the console's actions are `model.act`'s with the
+    state carried."""
+    _console_acts_as_model_act(tmp_path / "tiny_v2_a", ego_actions=False, width=42)
+
+
+@pytest.mark.slow
+def test_the_console_drives_a_v2_actor_with_issued_actions(tmp_path):
+    """The full contract in the console -- every v2 checkpoint before 2026-10-15, and a run with
+    `--v2-ego-actions on` -- now that the default reads no issued action: the session's env is built
+    from the checkpoint's own contract and emits the 210-wide ego it reads."""
+    _console_acts_as_model_act(tmp_path / "tiny_v2_full", ego_actions=True, width=210)
+
+
+def _console_acts_as_model_act(d, ego_actions: bool, width: int):
+    """A generated checkpoint of one contract (`ego_actions`) in a console session: the env emits the
+    `width`-wide ego it reads, and 40 steps of the console's actions are `model.act`'s with the state
+    carried, of a car that moves."""
     from f1sim.learn.memory import Hidden
     from f1sim.learn.obs import flatten_obs
     from v2_fixtures import generated_v2_checkpoint
-    d = tmp_path / "tiny_v2_a"
     d.mkdir()
-    generated_v2_checkpoint(str(d / "student_latest.pt"), ego_actions=False)
+    generated_v2_checkpoint(str(d / "student_latest.pt"), ego_actions=ego_actions)
     logs = []
     w = _worker(logs)
     s = w.build_session(_cfg(str(d)), 0)
     try:
         env, model = s["env"], s["model"]
-        assert env.obs_version == 2 and env.ecfg.ego_actions is False and model.obs_spec.ego_dim == 42
-        assert s["obs"]["ego"].shape[1] == 42
+        assert env.obs_version == 2 and env.ecfg.ego_actions is ego_actions and model.obs_spec.ego_dim == width
+        assert s["obs"]["ego"].shape[1] == width
         acted = []
         run = s["act_fn"]
         s["act_fn"] = lambda scan, ego: acted.append(run(scan, ego).clone()) or acted[-1]
@@ -201,12 +217,18 @@ def test_the_contract_check_names_a_switch_between_v1_and_v2():
     assert obs_spec_problems(v1_meta, ObsSpec(n_beams=61, scan_stack=3, act_dim=8), [], 8) == []
     bad = obs_spec_problems(m.meta, ObsSpecV2(n_beams=61, n_frames=2), ["actor.mu.weight"], 8)
     assert len(bad) == 2 and "스캔 프레임 수" in bad[0] and "초기값" in bad[1]
-    # the copycat study's contract without the issued actions is a different observation, named as such
-    no_act = obs_spec_problems(m.meta, ObsSpecV2(n_beams=61, ego_actions=False), [], 8)
-    assert len(no_act) == 1 and "지난 행동 열" in no_act[0]
-    # and a meta written before the field existed is the contract with them
-    old = dict(m.meta, obs={k: v for k, v in m.meta["obs"].items() if k != "ego_actions"})
-    assert obs_spec_problems(old, ObsSpecV2(n_beams=61), [], 8) == []
+    # the copycat study's contract without the issued actions is a different observation, named as such,
+    # either way round: since 2026-10-15 it is the default (`m`), and the full one is named explicitly
+    full_spec = ObsSpecV2(n_beams=61, ego_actions=True)
+    full = ActorCriticV2(n_beams=61, ego_dim=full_spec.ego_dim, obs=dict(vars(full_spec)))
+    assert obs_spec_problems(full.meta, full_spec, [], 8) == []
+    for meta, session in ((full.meta, ObsSpecV2(n_beams=61, ego_actions=False)), (m.meta, full_spec)):
+        no_act = obs_spec_problems(meta, session, [], 8)
+        assert len(no_act) == 1 and "지난 행동 열" in no_act[0]
+    # and a meta written before the field existed is the contract with them, not the default
+    old = dict(full.meta, obs={k: v for k, v in full.meta["obs"].items() if k != "ego_actions"})
+    assert obs_spec_problems(old, full_spec, [], 8) == []
+    assert len(obs_spec_problems(old, ObsSpecV2(n_beams=61), [], 8)) == 1
 
 
 # ==================================================================== the real worker process
