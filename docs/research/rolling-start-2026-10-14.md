@@ -13,7 +13,7 @@ a two-car row in both measurements (16 -> 7 each) and does nothing for a row of 
 (16 -> 18), which is most of what an every-seat-abreast grid lays out.
 
 **Since then:** the hold is back for rows of two only, under a second test pre-registered for it
-(see "Restored for rows of two" at the end).
+(see "Restored for rows of two" and "PREREG 2 (two-car rows)" at the end).
 
 Branch `fix/rolling-start` (from `main` 4db62bc). Background: commit 4db62bc added a rolling start for
 teacher-driven opponents placed abreast of the learner (`EnvConfig.spawn_alongside_hold` /
@@ -238,3 +238,77 @@ rolling start off, bit for bit (`test_only_a_row_of_two_is_held`: race of 4 on t
 race without a pair identical to the off arm over 2.5 s). On the boot-camp grid nearly every row is
 a pair (measurement 2: 60 of the 70 learner episodes that had a row). If the new test fails, this
 goes again, back to 45d1113.
+
+## PREREG 2 (two-car rows)
+
+Written before any contact measurement of the pairs-only hold (commit 5af1900), and committed before
+the measurement starts. The thresholds are the ones the task set.
+
+**Question.** PREREG 1's post-hoc split says a held pair merges half as often in its first 2 s
+(16 -> 7 in both measurements) and a held row of three or four does not (16 -> 18). Does the hold
+restricted to rows of two cut the learner's early contacts with its abreast partner in the
+boot-camp configuration itself, without making its car contacts worse overall?
+
+**Arms.** ON: `spawn_alongside_hold = 1.0`, `spawn_alongside_ramp = 1.0` (the defaults: a row of
+two held, a row of three or four not). OFF: both 0 (`_roll_cfg` False: nothing held, nobody lined
+up). Same commit, same seeds, same env count.
+
+**Configuration.** The boot-camp `EnvConfig` exactly as `ppo.py` builds it from `ppo_boot.sh`'s
+flags, captured afresh on 5af1900 by stopping `ppo.main` at `common.make_env`
+(`roll2/m/ecfg_boot2.pkl`, field for field the same as PREREG 1's `ecfg_boot.pkl`): ICCAS and its
+16 warps, race of 4, three seats of the forzaeth / forzaeth_pred / lane_switch / interactive mix
+(partitioned per race), each present with p 0.5 and placed `random` (ahead / behind / alongside),
+reactive defend 0.3 / line 0.2 / oblivious 0.1, events brake / stop / shift / weave at 0.5 per 10 s,
+procedural props (density 1.5, at most 18, movable, no raceline corridor), soft contacts, 3 m spawn
+runway. Different from training, as in PREREG 1: no league (`ckpt_mix` with `ckpt_p` 0.5 -- a
+checkpoint-driven seat is never held, and the capture leaves it out, so every seat is a planner),
+no level replay (a trainer-side seed scheduler, not the env), 10-s episodes (`max_steps` 400)
+truncated at their length with `stagger_first_episode` off, so both arms reset at the same steps,
+and the tracker eager. Learner `checkpoints/iccas_bootcamp_safest.pt` (sha256 f96b2fcc...49b1f8),
+actions sampled from its distribution with the training dial draw (margin 0.30, exact 0.30), speed
+cap 9.
+
+**Size.** Two new seeds, 811 and 812 (PREREG 1 and its development runs used 401 / 402, 501 / 502,
+701 / 702; the spawn work before it 71-74, 101 / 102, 201 / 202, 601), each 4400 steps x 64 envs
+(16 races of 4) = 176 learner episodes per seed and arm: **352 learner episodes an arm**. Harness
+`roll2/m/drive5.py` (PREREG 1's `drive4.py` plus the row-size records), tables `roll2/m/ana5.py`,
+launcher `roll2/m/run_gpu2.sh`, all under
+`/tmp/claude-1000/-home-shchon11-F1tenth-E2E/d98b5699-f98e-4674-9a12-ab5a57bf35f1/scratchpad/`;
+GPU index 1 (RTX 5060), the two arms of a seed side by side.
+
+**Metrics** (the definitions of PREREG 1). A contact is a raw car-contact onset of the learner (the
+rising edge of `info["car_collision"]` on its row), charged if `info["car_charge"]` rose with it;
+its partner is the car in box overlap after the step, else the nearest present race mate.
+* *Primary (A):* contacts whose partner is an opponent laid abreast with the learner at that
+  episode's reset, with the onset in the first 2 s (episode step < 80), pooled over both seeds.
+  Every abreast row counts: a row of three or four is unheld in both arms, so it counts the same way
+  in each.
+* *Guard (B):* all of the learner's contacts in the 10 s, any partner, pooled over both seeds.
+
+**PASS-A:** ON <= 0.5 x OFF (point estimate). Reported with it: the charged counts, the rows-of-two
+part, and the exact one-sided conditional binomial p of ON this low at equal rates (p0 = the ON
+arm's share of the first-2-s learner-km).
+
+**PASS-B (not worse):** the exact one-sided conditional binomial test of ON given ON + OFF, with p0
+the ON arm's share of the learner-km, gives p >= 0.10 for "ON this high or higher at equal rates".
+
+**Verdict.** PASS iff PASS-A and PASS-B. On PASS the pairs-only rolling start stays, defaults
+1.0 / 1.0. On FAIL it is removed again: the tree goes back to 45d1113's state in every file but this
+document, which says so.
+
+**Also reported, not part of the verdict:** raw / charged contacts by time bin (0-1, 1-2, 2-4,
+4-6, 6-10 s) and by the size of the learner's abreast row (none, 2, 3, 4), how many opponents were
+held; the abreast opponents' centreline motion toward the learner at 0.5 / 1 / 1.5 / 2 s (median /
+p90 / max over the opponents not yet in contact), by row size; merge and contact timing; each seed
+on its own.
+
+**Calibration, not a criterion.** PREREG 1's guard measurement (same configuration, 176 episodes,
+every row held) had 17 first-2-s contacts with the abreast partner OFF and 7 ON, 16 and 7 of them
+in rows of two. If pairs behave the same here, ON should come to about 0.45-0.5 x OFF (rows of three
+count in both arms): this test can fail on noise alone, and that risk is accepted rather than
+moving the threshold.
+
+**Disclosed.** Before this was written, only these ran on the new code, none of them reading a
+contact of this configuration: the unit tests (5af1900's message), a probe of the new test's grid
+(row sizes and who is held, blackbox2022_1, race of 4), the configuration capture, and a 120-step
+smoke run of the harness on seed 899, both arms, read for exit status, run time and memory only.
