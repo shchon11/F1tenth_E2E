@@ -898,9 +898,38 @@ every car is the learner, so only `alongside` is a different grid there.
 * `alongside` puts the cars abreast, which is where the contacts measured in traffic actually
   happen. The lateral separation is what the track's own distance field has room for at each car's
   spawn point, sized against the **rotated** footprint (the spawn yaw jitter is cut to
-  `spawn_alongside_yaw` for an abreast row, since cars on a grid are lined up with the track); where
-  two bodies do not fit, that race spawns staggered instead. Two cars spawned in contact terminate
-  on step 1, so this is decided per race, not per car.
+  `spawn_alongside_yaw` for an abreast row, since cars on a grid are lined up with the track): the
+  bodies are laid `--spawn-alongside-sep` apart (0.30 m) where the lane has room for that,
+  `--spawn-alongside-sep-min` apart (0.15 m) where only that fits, and where neither fits that race
+  spawns staggered instead. Two cars spawned in contact terminate on step 1, so this is decided per
+  race, not per car. `--spawn-alongside-sep 0.15` is the grid every run before 2026-10-14 had.
+* **Rolling start: tried, measured, removed (2026-10-14).** A teacher-driven car placed abreast was
+  held on the lane position it was placed at for 1 s and eased onto its own line over 1 s, so that
+  the learner would meet a merge it can answer instead of one in 0.1–0.5 s. The first version did
+  not hold (the lane clamp cut the held offset, and the planner kinds added their own lateral choice
+  to it); the fixed one did — the abreast opponent's motion toward the learner at 1 s was a median
+  +0.01 m against +0.23 m without it — but the pre-registered test (every seat abreast, 176 learner
+  episodes an arm, same seeds) asked for half the contacts with the abreast partner in the first
+  2 s and got 25 against 32 raw (22 against 30 charged): the merge came in the ramp instead (1–2 s:
+  17 against 18). It delayed the merge and did not remove it, so it is gone — flags, fields and
+  code (`docs/research/rolling-start-2026-10-14.md`; the code is in commit 95b069f).
+* **What the spawn changes of 2026-10-14 did to contacts**, measured in the boot-camp configuration
+  (race of 4, random seats, the four planners, events, 3 m runway, movable props; the learner
+  `iccas_bootcamp_safest` sampled as in training; 10-s episodes, 160 learner episodes before and 158
+  after, about 5.7 km each). Car-contact onsets, raw / charged to the learner:
+
+  | | step 0 | 0–2 s | 2–4 s | 4–6 s | 6–10 s | all |
+  |---|---|---|---|---|---|---|
+  | before (a0bfb5c) | 12 / 12 | 20 / 16 | 5 / 4 | 5 / 4 | 6 / 6 | 36 / 30 |
+  | after | 0 / 0 | 6 / 5 | 4 / 4 | 1 / 1 | 5 / 5 | 16 / 15 |
+
+  (step 0 is inside 0–2 s.) What went: every step-0 contact — the placement, 9 of them with the car
+  laid abreast and 3 with another car of the grid placed on top of it — and most of the later
+  contacts with cars that were not in the learner's abreast row (13 → 4 after step 0, p ≈ 0.03;
+  the grid now keeps `--spawn-gap`, and an empty seat no longer has a place on the lap). Contacts
+  with the abreast partner after step 0 did not change (11 → 12, the opponent the car moving in
+  every time). The "after" row ran with the first rolling start on; it changed nothing there, and
+  the rolling start has since been removed (above).
 * `--race-size 3` works with all of it. The spawn arc is cumulative — each car sits its own
   `--spawn-gap` behind the car in front of it — rather than `rank × gap`, which scrambled a grid of
   three whenever the draws differed.
@@ -972,8 +1001,16 @@ car off the line.
 * **Nobody spawns in contact.** Measured over 512–528 spawns per grid per track at
   `--race-size 2` and `3`: zero. With `--procedural-obstacles` on, the grid is tested against the
   drawn layout as well as against the lane — a crate standing where an abreast grid wants to be
-  makes that race start staggered, because the spawn's prop rejection replaces a blocked pose with a
-  *centerline* one and two cars pulled onto one line are two cars in contact.
+  makes that race start staggered. And a race is laid out as one (`--spawn-as-race on`, the
+  default since 2026-10-14): a car rejected at its spawn — a wall, the `--spawn-runway`, a crate on
+  its heading — moves its whole race along the lap with it, so every car keeps its lateral offset
+  and its arc gap to the others; an abreast row is never pulled onto one line; an empty seat
+  (`present` < 1) neither holds the race up nor is made room for, and has no place on the lap for
+  `signed_gaps` (the follow cap, the progress gate, the charge rule) to read; a car rejoining a race
+  keeps `--spawn-gap` LOW from every race mate. Before that each car was moved alone, and in the
+  boot-camp configuration (race of 4, random seats, 3 m runway, 1.5 props per 10 m) 74 learner
+  pairs in 800 races overlapped at placement — 59 of G4's 379 charged car contacts began on step 0;
+  laid out as one, none of 1,008 races does (`tests/test_spawn_race.py`).
 * **Each step, `info["opp_event"]`** reports `id` (0 = none, otherwise the 1-based index into
   `brake, stop, shift, weave, defend, yield, line, oblivious`), `time_left`, the `offset` in metres,
   and two bitmasks — `react` (which reactive behaviours are acting right now) and `disposition`

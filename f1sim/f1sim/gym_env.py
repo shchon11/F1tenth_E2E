@@ -577,10 +577,34 @@ class EnvConfig:
                                      # where the contacts actually happen) or "random" (drawn per
                                      # race from the three). In a self-play race every car is the
                                      # learner, so only "alongside" is a different grid there.
-    spawn_alongside_sep: float = 0.15  # [m] body-to-body lateral gap asked for on an alongside grid.
-                                     # What the lane has room for wins: where two bodies plus this
-                                     # gap do not fit, the race spawns staggered instead, because
-                                     # two cars spawned in contact terminate on step 1 for ever.
+    #: [m] body-to-body lateral gap an abreast row is laid out with, where the lane has room for it.
+    #: Where two bodies plus this gap do not fit, `spawn_alongside_sep_min` is tried, and where that
+    #: does not fit either the race spawns staggered, because two cars spawned in contact terminate
+    #: on step 1 for ever. Before 2026-10-14 the gap was 0.15 m, and in the boot-camp config an
+    #: opponent steering for its line from there reached the learner in 0.1-0.5 s (22 of G4's 122
+    #: early contacts, all charged to the learner, whose own lateral speed was under 0.11 m/s).
+    #: 0.15 (with the minimum at 0.15 or below): the grid every run before 2026-10-14 had.
+    spawn_alongside_sep: float = 0.30
+    #: [m] the narrowest body-to-body gap an abreast row may take: used only for a race whose lane
+    #: has no room for `spawn_alongside_sep`, so a narrow section still gets a side-by-side start
+    #: instead of a stagger. At or above `spawn_alongside_sep`: no fallback, one gap only.
+    spawn_alongside_sep_min: float = 0.15
+    # A rolling start for teacher-driven opponents placed abreast -- hold the lane position they were
+    # placed at for 1 s, then ease onto their line over 1 s -- was built, fixed and measured on
+    # 2026-10-14 and removed (docs/research/rolling-start-2026-10-14.md; the code is in 95b069f).
+    # Pre-registered test, boot-camp config with every seat abreast, 176 learner episodes an arm, same
+    # seeds: contacts with the abreast partner in the first 2 s went 32 -> 25 raw (30 -> 22 charged),
+    # against the >= 50 % drop it had to show. The hold held -- motion toward the learner at 1 s
+    # median +0.01 m against +0.23 -- and the merge happened in the ramp instead (1-2 s: 17 against
+    # 18): it delayed the merge, it did not remove it.
+    #: Lay a race out as one: a rejected car walks the whole race along the lap with it, an abreast
+    #: row is never pulled onto one line, empty seats neither block nor get tested, a car rejoining
+    #: a race keeps `spawn_gap[0]` of arc from every race mate (see `Simulator.sample_spawn`).
+    #: False: the per-car placement before 2026-10-14, kept only to reproduce old tables -- in the
+    #: boot-camp config 74 learner pairs in 800 races overlapped at placement (about 9 % of learner
+    #: episodes), and in a 10-s drive 12 of 160 learner episodes began with a contact on step 0, all
+    #: charged to the learner (0 of 158 laid out as one).
+    spawn_as_race: bool = True
     spawn_alongside_gap: tuple = (0.0, 0.2)   # [m] arc stagger inside an alongside grid, drawn
                                      # independently per car. Small on purpose: the lateral offsets
                                      # of a grid are measured along the centerline normal at each
@@ -780,19 +804,25 @@ class _ContactReplay:
             print(f"[replay] {self.recorded} scenes recorded, {self.replayed} races started from one", flush=True)
 
     def apply(self, env, ids, poses, speed, gen):
-        """Replace the grid poses of whole-race resets, with probability p per race."""
+        """Replace the grid poses of whole-race resets, with probability p per race.
+
+        Returns (poses, speed, replayed): `replayed` (n,) marks the rows given a recorded scene, which
+        are not the grid they were laid out as -- in particular not an abreast row (`spawn_abreast`):
+        their poses are the recorded moment before a contact."""
+        none = torch.zeros(ids.numel(), dtype=torch.bool, device=env.device)
         if self.n == 0:
-            return poses, speed
+            return poses, speed, none
         in_ids = torch.zeros(env.B, dtype=torch.bool, device=env.device); in_ids[ids] = True
         full = in_ids.view(-1, 2).all(1)
         learner_pos = ((env.slot[ids] == 0) & full[env.race[ids]]).nonzero().flatten()
         if learner_pos.numel() == 0:
-            return poses, speed
+            return poses, speed, none
         pick = torch.rand(learner_pos.numel(), device=env.device, generator=gen) < self.p
         learner_pos = learner_pos[pick]
         if learner_pos.numel() == 0:
-            return poses, speed
+            return poses, speed, none
         poses, speed = poses.clone(), speed.clone()
+        replayed = none.clone()
         bank = self.bank[:self.n]
         for q in learner_pos.tolist():
             row = int(ids[q]); j = int(env.sim.other_idx[row, 0])
@@ -809,11 +839,19 @@ class _ContactReplay:
                 continue                                              # the new layout stands where the scene was
             poses[q], poses[qo] = b[2:5], b[6:9]
             speed[q], speed[qo] = b[5], b[9]
+            replayed[q] = replayed[qo] = True
             self.replayed += 1
-        return poses, speed
+        return poses, speed, replayed
 
 
 class F1VecEnv:
+    # The spawn state `__init__` sets, as a class default that means "off": an env put together
+    # without `__init__` (a test shell, `F1VecEnv.__new__` plus the attributes the code under test
+    # reads) reaches `signed_gaps`, and died there with an AttributeError when this existed only as an
+    # instance attribute.
+    #: whether `signed_gaps` masks empty seats (any seat with `present` < 1)
+    _present_mask_gaps = False
+
     def __init__(self, track, cfg: Optional[Config] = None, env_cfg: Optional[EnvConfig] = None,
                  num_envs: int = 1024, device: Optional[str] = None):
         """track: a Track or a list of Tracks (envs are spread over them, re-drawn on reset)."""
@@ -964,6 +1002,9 @@ class F1VecEnv:
         #: Which grid each race drew (`SPAWN_ORDER_ID`), so a single car respawning mid-race does
         #: not re-draw its race's order.
         self.spawn_order_race = torch.zeros(self.B, dtype=torch.long, device=self.device)
+        #: (B,) whether each car was placed in an abreast row at its last reset (`_note_spawn_formation`).
+        self.spawn_abreast = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self._present_mask_gaps = getattr(self, "_present_p", None) is not None
         #: The observation the policy last saw, which is the one a pool opponent acts on: the pool
         #: is asked for its action at the top of `step()`, before any new observation exists.
         self._last_obs = None
@@ -1575,13 +1616,17 @@ class F1VecEnv:
         mid = n_ahead[:, None].expand_as(codes)
         return torch.where(ahead, rank_ahead, torch.where(behind, rank_behind, mid))
 
-    def _slot_grid(self, ids, full, gen, base, L_race):
-        """Where every resetting car of a slot-mode race spawns: (rank, arc, lat, clearance, yaw).
+    def _slot_grid(self, ids, full, gen, base, L_race, present=None):
+        """Where every resetting car of a slot-mode race spawns: (rank, arc, lat, clearance, yaw,
+        abreast).
 
         The same three questions the flag-driven grid answers -- what order, what arc, and whether an
         abreast row fits between the walls -- asked per car instead of per race. Everything is
         computed for the whole batch and then read at `ids`: the rank of a car depends on the codes
         of its race mates, so the natural shape here is (G, M) and not (n,).
+
+        present (G, M): which seats this race fills. An empty seat is not part of an abreast row --
+        a car that is not there neither needs room beside the learner nor pushes it off-centre.
         """
         e = self.ecfg
         G, M = full.shape[0], self.M
@@ -1599,6 +1644,8 @@ class F1VecEnv:
         # so a table with no `alongside` slot never touches this path at all.
         slot_index = torch.arange(M, device=self.device)
         group = (codes == SLOT_SPAWN_ID_ALONGSIDE)
+        if present is not None:
+            group = group & present
         group[:, 0] = True
         g_size = group.sum(1)
         want = torch.zeros(G, M, device=self.device)
@@ -1607,24 +1654,32 @@ class F1VecEnv:
         extent = (self.cfg.vehicle.width * math.cos(psi) + self.cfg.vehicle.length * math.sin(psi))
         if bool((g_size > 1).any()):
             j = group.cumsum(1) - 1                                      # index within the group
-            want = torch.where(group, (j - (g_size[:, None] - 1) / 2.0) * (extent + e.spawn_alongside_sep),
-                               torch.zeros_like(want))
             s_group = s_rank.gather(1, rank.clamp_min(0)) - stagger      # each group member's own arc
             tid_row = self.sim.tid.view(-1, M)
             xy0, yaw0 = self.sim.track.pose_at_s(s_group.reshape(-1), tid_row.reshape(-1))
             room = (self.sim.track.sample_edt(xy0, tid_row.reshape(-1)).view(G, M)
                     - 0.5 * extent - e.opp_event_margin)
-            headroom = torch.where(group, room - want.abs() - 0.03,
-                                   torch.full_like(room, math.inf))
-            if getattr(self.sim.track, "has_props", False):
-                nrm = torch.stack([-torch.sin(yaw0), torch.cos(yaw0)], 1)
-                pose_ab = torch.cat([xy0 + nrm * want.reshape(-1)[:, None], yaw0[:, None]], 1)
-                blocked = self.sim._spawn_in_prop(pose_ab, tid_row.reshape(-1),
-                                                  torch.arange(self.B, device=self.device)).view(G, M)
-                headroom = torch.where(group & blocked, torch.full_like(headroom, -math.inf), headroom)
-            # Per race: a row with one car abreast and another staggered is exactly the grid that
-            # collides, because the stagger puts that car back on the arc the abreast one holds.
-            fits = (headroom.amin(1) >= 0.0) & (g_size > 1) & full
+
+            def fit(sep):
+                w = torch.where(group, (j - (g_size[:, None] - 1) / 2.0) * (extent + sep), torch.zeros_like(want))
+                headroom = torch.where(group, room - w.abs() - 0.03, torch.full_like(room, math.inf))
+                if getattr(self.sim.track, "has_props", False):
+                    nrm = torch.stack([-torch.sin(yaw0), torch.cos(yaw0)], 1)
+                    pose_ab = torch.cat([xy0 + nrm * w.reshape(-1)[:, None], yaw0[:, None]], 1)
+                    blocked = self.sim._spawn_in_prop(pose_ab, tid_row.reshape(-1),
+                                                      torch.arange(self.B, device=self.device)).view(G, M)
+                    headroom = torch.where(group & blocked, torch.full_like(headroom, -math.inf), headroom)
+                # Per race: a row with one car abreast and another staggered is exactly the grid that
+                # collides, because the stagger puts that car back on the arc the abreast one holds.
+                return w, (headroom.amin(1) >= 0.0) & (g_size > 1) & full
+
+            # The preferred separation where the lane has room for it, `spawn_alongside_sep_min` where
+            # only that fits; the order of the draws above is untouched by either.
+            want, fits = fit(e.spawn_alongside_sep)
+            if e.spawn_alongside_sep_min < e.spawn_alongside_sep:
+                want_n, fits_n = fit(e.spawn_alongside_sep_min)
+                want = torch.where(fits[:, None], want, want_n)
+                fits = fits | fits_n
             # Where it does not fit, the alongside cars fall back to starting ahead -- the stagger
             # that path takes has no lateral offset to lose, so it spawns safely.
             codes = torch.where(fits[:, None], codes,
@@ -1642,7 +1697,7 @@ class F1VecEnv:
         yaw_all = torch.where(abreast, torch.full_like(lat_all, min(e.spawn_yaw_std, e.spawn_alongside_yaw)),
                               torch.full_like(lat_all, e.spawn_yaw_std))
         flat = lambda t_: t_.reshape(-1)[ids]
-        return (flat(rank).float(), flat(s_cars), flat(lat_all), flat(min_all), flat(yaw_all))
+        return (flat(rank).float(), flat(s_cars), flat(lat_all), flat(min_all), flat(yaw_all), flat(abreast))
 
     def _slot_speeds(self, ids, slot, is_full, full, gen):
         """Draw each resetting car's speed scale from *its own* slot's band, and set its cap.
@@ -1990,6 +2045,12 @@ class F1VecEnv:
             L = self.sim.track.length[self.sim.tid[ids]]
             gap = e.spawn_gap[0] + (e.spawn_gap[1] - e.spawn_gap[0]) * torch.rand(n, device=self.device, generator=gen)
             base = torch.rand(full.shape[0], device=self.device, generator=gen)   # leader position, fraction of a lap
+            abreast_rows = torch.zeros(n, dtype=torch.bool, device=self.device)
+            empty_g = None
+            if e.spawn_as_race and getattr(self, "_present_p", None) is not None:
+                # Who is in the race is drawn before the grid is laid out, not after: an empty seat
+                # must neither hold the race's placement up nor be what an abreast row makes room for.
+                empty_g = torch.rand(full.shape[0], self.M, device=self.device, generator=gen) >= self._present_p[None, :]
             # Slot 0 is the learner when the opponents are teachers, and the learner belongs at the
             # *back* of the grid: an overtake is a car behind catching and passing a car ahead, and a
             # learner spawned as the leader meets that situation only if a faster teacher passes it
@@ -2022,7 +2083,8 @@ class F1VecEnv:
                 # than patching it: there is no "the order" left to patch, and no "the opponent" to
                 # ask whether the race is scripted.
                 L_race = self.sim.track.length[self.sim.tid].view(-1, self.M)[:, 0]
-                rank, s_full, lat, min_clear, yaw_std = self._slot_grid(ids, full, gen, base, L_race)
+                rank, s_full, lat, min_clear, yaw_std, abreast_rows = self._slot_grid(
+                    ids, full, gen, base, L_race, present=None if empty_g is None else ~empty_g)
             else:
                 # Whether this race's *other* cars are something other than the policy under
                 # training. It decides both halves of the grid: only such a race has a "the learner"
@@ -2076,7 +2138,6 @@ class F1VecEnv:
                               + self.cfg.vehicle.length * math.sin(psi))
                     al = e.spawn_alongside_gap[0] + (e.spawn_alongside_gap[1] - e.spawn_alongside_gap[0]) \
                         * torch.rand(n, device=self.device, generator=gen)
-                    want = (slot.float() - (self.M - 1) / 2.0) * (extent + e.spawn_alongside_sep)
                     # Independent per car, not `slot * al`: an accumulating stagger spreads a three-car
                     # grid over a metre of arc, and on a 2 m radius the centerline normal turns enough
                     # over that distance that "0.56 m apart along the normal" stops meaning 0.56 m
@@ -2084,26 +2145,36 @@ class F1VecEnv:
                     s_slot = torch.remainder(base[race] * L - al, L)
                     xy0, yaw0 = self.sim.track.pose_at_s(s_slot, self.sim.tid[ids])
                     room = self.sim.track.sample_edt(xy0, self.sim.tid[ids]) - 0.5 * extent - e.opp_event_margin
-                    # Per *race*, not per car: a race with one car abreast and another staggered is
-                    # exactly the grid that collides, because the stagger puts the last slot back on the
-                    # leader's own arc position -- where the abreast car already is. Measured with the
-                    # decision taken per car: 232 of 528 three-car spawns in contact.
-                    headroom = room - want.abs() - 0.03
-                    if getattr(self.sim.track, "has_props", False):
-                        # Props are not in the distance field, so `room` cannot see them. A crate
-                        # standing where the grid wants to be would send the abreast cars into
-                        # `sample_spawn`'s prop rejection, which replaces a blocked pose with a
-                        # *centerline* one -- and two cars pulled onto one line are two cars in contact.
-                        # So the grid is tested against the layout as well (drawn already, see
-                        # `_redraw_layouts`), and a race the crates block starts staggered instead: that
-                        # path goes through the rejection safely, because it has no lateral offset to
-                        # lose. `-inf` rather than a flag so the per-race reduction below covers it.
-                        nrm = torch.stack([-torch.sin(yaw0), torch.cos(yaw0)], 1)
-                        pose_ab = torch.cat([xy0 + nrm * want[:, None], yaw0[:, None]], 1)
-                        blocked = self.sim._spawn_in_prop(pose_ab, self.sim.tid[ids], ids)
-                        headroom = torch.where(blocked, torch.full_like(headroom, -math.inf), headroom)
-                    worst = torch.full((self.B // self.M,), math.inf, device=self.device)
-                    worst.scatter_reduce_(0, race, headroom, reduce="amin", include_self=False)
+
+                    def fit(sep):
+                        w = (slot.float() - (self.M - 1) / 2.0) * (extent + sep)
+                        # Per *race*, not per car: a race with one car abreast and another staggered
+                        # is exactly the grid that collides, because the stagger puts the last slot
+                        # back on the leader's own arc position -- where the abreast car already is.
+                        # Measured with the decision taken per car: 232 of 528 three-car spawns in
+                        # contact.
+                        headroom = room - w.abs() - 0.03
+                        if getattr(self.sim.track, "has_props", False):
+                            # Props are not in the distance field, so `room` cannot see them. A crate
+                            # standing where the grid wants to be would send the abreast row into
+                            # `sample_spawn`'s rejection -- which now walks the whole race rather than
+                            # pulling one car onto its partner's line, but a row the crates block
+                            # where it was drawn is still better started staggered here than moved
+                            # half a lap. `-inf` rather than a flag so the per-race reduction covers it.
+                            nrm = torch.stack([-torch.sin(yaw0), torch.cos(yaw0)], 1)
+                            pose_ab = torch.cat([xy0 + nrm * w[:, None], yaw0[:, None]], 1)
+                            blocked = self.sim._spawn_in_prop(pose_ab, self.sim.tid[ids], ids)
+                            headroom = torch.where(blocked, torch.full_like(headroom, -math.inf), headroom)
+                        worst_ = torch.full((self.B // self.M,), math.inf, device=self.device)
+                        worst_.scatter_reduce_(0, race, headroom, reduce="amin", include_self=False)
+                        return w, worst_
+
+                    want, worst = fit(e.spawn_alongside_sep)
+                    if e.spawn_alongside_sep_min < e.spawn_alongside_sep:
+                        # `spawn_alongside_sep_min` for a race whose lane has no room for the preferred gap
+                        want_n, worst_n = fit(e.spawn_alongside_sep_min)
+                        want = torch.where(worst[race] >= 0.0, want, want_n)
+                        worst = torch.maximum(worst, worst_n)
                     abreast = (order == SPAWN_ORDER_ID["alongside"]) & is_full & (worst[race] >= 0.0)
                     rank = torch.where((order == SPAWN_ORDER_ID["alongside"]) & ~abreast,
                                        (self.M - 1 - slot).float(), rank)
@@ -2117,6 +2188,7 @@ class F1VecEnv:
                                             torch.full_like(lat, e.spawn_min_clearance))
                     yaw_std = torch.where(abreast, torch.full_like(lat, min(e.spawn_yaw_std, e.spawn_alongside_yaw)),
                                           torch.full_like(lat, e.spawn_yaw_std))
+                    abreast_rows = abreast
             other = self.sim.other_idx[ids, 0]
             s_part = self.sim.s[other] - gap                                  # behind the next car of the race
             s = torch.remainder(torch.where(is_full, s_full, s_part), L)
@@ -2144,20 +2216,39 @@ class F1VecEnv:
                     self.cap_scale[ids] = torch.where(capped, front_cap / max(self.cap_base, 1e-6),
                                                       torch.ones_like(self.opp_scale[ids]))
                     self.speed_cap[ids] = self.cap_base * self.cap_scale[ids]
+        race_kw = {}
+        if self.M > 1 and e.spawn_as_race:
+            # The race is laid out as one (`Simulator.sample_spawn`, `group`): a race resetting
+            # whole walks together, a car rejoining one is its own group and keeps `spawn_gap[0]`
+            # of arc from every race mate that is in the race.
+            G_ = full.shape[0]
+            group = torch.where(is_full, race, G_ + torch.arange(n, device=self.device))
+            empty_rows = (torch.zeros_like(is_full) if empty_g is None else empty_g[race, slot]) & is_full
+            active = ~empty_rows & ~(~is_full & self.sim.absent[ids])
+            race_kw = dict(group=group, active=active, lat_fixed=abreast_rows, clear_gap=float(e.spawn_gap[0]))
+            if bool((~is_full).any()):
+                o_ = self.sim.other_idx[ids]
+                mate_s = torch.where(self.sim.absent[o_] | is_full[:, None],
+                                     torch.full_like(self.sim.s[o_], float("nan")), self.sim.s[o_])
+                race_kw["avoid_s"] = mate_s
         poses = self.sim.sample_spawn(n, e.spawn_lateral_std, yaw_std, s=s, tid=self.sim.tid[ids],
-                                      min_clearance=min_clear, lat=lat, eid=ids)
+                                      min_clearance=min_clear, lat=lat, eid=ids, **race_kw)
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
         if self._replay is not None and self.M == 2:
-            poses, speed = self._replay.apply(self, ids, poses, speed, gen)
+            poses, speed, replayed = self._replay.apply(self, ids, poses, speed, gen)
+            abreast_rows = abreast_rows & ~replayed          # a recorded scene, not a grid
         self.sim.reset(ids, poses, speed)
         if self.M > 1 and getattr(self, "_present_p", None) is not None:
             # 0-3 opponents: each seat of a race that resets whole is filled with its slot's `present`
             # probability; an empty seat's car is parked off the map until its race resets again
-            u_ = torch.rand(full.shape[0], self.M, device=self.device, generator=gen)
-            empty = (u_ >= self._present_p[None, :])[race, slot]
+            if empty_g is None:                   # `spawn_as_race` off: drawn here, as it always was
+                empty_g = torch.rand(full.shape[0], self.M, device=self.device, generator=gen) >= self._present_p[None, :]
+            empty = empty_g[race, slot]
             self.sim.unpark(ids[is_full & ~empty])
             self.sim.park(ids[is_full & empty])
             speed = torch.where(is_full & empty, torch.zeros_like(speed), speed)
+        if self.M > 1:
+            self._note_spawn_formation(ids, abreast_rows)
         self.sim.odom.state[ids, 3] = speed
         self.prev_action[ids] = 0.0
         if self.act_dim == 2:
@@ -2263,6 +2354,10 @@ class F1VecEnv:
             finally:
                 self._cap_suspended = prev
         return _ctx()
+
+    def _note_spawn_formation(self, ids: torch.Tensor, abreast: torch.Tensor) -> None:
+        """Record which resetting cars were placed abreast (a parked seat is in no row)."""
+        self.spawn_abreast[ids] = abreast & ~self.sim.absent[ids]
 
     def _fill_scans(self, ids: torch.Tensor, speed: torch.Tensor):
         """Fill the scan history of reset rows with a fresh scan from the new pose. Scanned for the whole
@@ -3047,7 +3142,18 @@ class F1VecEnv:
         reward reading its change sees a whole lap lost at the one moment that mattered.
         """
         L_ = self.sim.track.length[tid][:, None]
-        return (s[self.sim.other_idx] - s[:, None] + L_ / 2) % L_ - L_ / 2
+        d = (s[self.sim.other_idx] - s[:, None] + L_ / 2) % L_ - L_ / 2
+        if self._present_mask_gaps:
+            # An empty seat is parked 1 km off the map, but the lane projection only searches 3 m of
+            # arc around its last index, so its `s` stays on the lap -- at its grid slot, then
+            # drifting to a local minimum. Measured (2026-10-14, boot-camp config): the parked seat
+            # was the nearest car by arc in 1,711 of 3,941 live row-steps of races with an empty
+            # seat, and the "car" a teacher held 0.5 m/s behind in 616 of 1,190 follow-gap
+            # triggers. Half a lap is as far as a signed arc goes; nothing reads it as near.
+            # Decided at construction (any seat with `present` < 1), not on `absent_any`: a Python
+            # flag that flips at resets would be a guard the compiled step math recompiles on.
+            d = torch.where(self.sim.absent[self.sim.other_idx], L_.expand_as(d) / 2, d)
+        return d
 
     def car_gap_closing(self, state: torch.Tensor):
         """(body-to-body gap [m], line-of-sight closing speed [m/s]) to every opponent, (B, C) each.

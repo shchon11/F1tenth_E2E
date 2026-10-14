@@ -2221,15 +2221,56 @@
           "label": "나란한 차량 횡간격 (m)",
           "kind": "float",
           "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] body-to-body lateral gap an alongside grid is laid out with where the lane has room for it; where it does not, --spawn-alongside-sep-min is tried, and a lane with room for neither spawns a stagger. 0.15 (with the minimum at 0.15): the grid of every run before 2026-10-14, where an opponent steering for its line reached the learner in 0.1-0.5 s",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--spawn-alongside-sep-min",
+          "flags": [
+            "--spawn-alongside-sep-min"
+          ],
+          "dest": "spawn_alongside_sep_min",
+          "label": "나란한 차량 최소 횡간격 (m, 좁은 구간)",
+          "kind": "float",
+          "item_kind": "float",
           "default": 0.15,
           "nargs": null,
           "choices": null,
           "required": false,
           "group": "teacher·상대차",
-          "help": "[m] body-to-body lateral gap asked for on an alongside grid; what the lane has room for wins, and a lane with room for one car spawns a stagger",
+          "help": "[m] the narrowest lateral gap an alongside grid may take, used only where the lane has no room for --spawn-alongside-sep. At or above it: no fallback",
           "action": "store",
           "nullable": false,
           "metavar": "M"
+        },
+        {
+          "flag": "--spawn-as-race",
+          "flags": [
+            "--spawn-as-race"
+          ],
+          "dest": "spawn_as_race",
+          "label": "레이스 단위 출발 배치",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "on",
+          "nargs": null,
+          "choices": [
+            "on",
+            "off"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "lay out each race as one: a car rejected at its spawn (a wall, the spawn runway, a crate) moves the whole race along the lap with it, an alongside row is never pulled onto one line, an empty seat neither blocks the race nor is made room for, and a car rejoining a race keeps --spawn-gap LOW from every race mate. off: the per-car placement of every run before 2026-10-14, kept to reproduce old tables -- in the boot-camp config about one learner episode in eleven started overlapping another car",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
         },
         {
           "flag": "--spawn-alongside-gap",
@@ -6768,15 +6809,56 @@
           "label": "나란한 차량 횡간격 (m)",
           "kind": "float",
           "item_kind": "float",
+          "default": 0.3,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "[m] body-to-body lateral gap an alongside grid is laid out with where the lane has room for it; where it does not, --spawn-alongside-sep-min is tried, and a lane with room for neither spawns a stagger. 0.15 (with the minimum at 0.15): the grid of every run before 2026-10-14, where an opponent steering for its line reached the learner in 0.1-0.5 s",
+          "action": "store",
+          "nullable": false,
+          "metavar": "M"
+        },
+        {
+          "flag": "--spawn-alongside-sep-min",
+          "flags": [
+            "--spawn-alongside-sep-min"
+          ],
+          "dest": "spawn_alongside_sep_min",
+          "label": "나란한 차량 최소 횡간격 (m, 좁은 구간)",
+          "kind": "float",
+          "item_kind": "float",
           "default": 0.15,
           "nargs": null,
           "choices": null,
           "required": false,
           "group": "teacher·상대차",
-          "help": "[m] body-to-body lateral gap asked for on an alongside grid; what the lane has room for wins, and a lane with room for one car spawns a stagger",
+          "help": "[m] the narrowest lateral gap an alongside grid may take, used only where the lane has no room for --spawn-alongside-sep. At or above it: no fallback",
           "action": "store",
           "nullable": false,
           "metavar": "M"
+        },
+        {
+          "flag": "--spawn-as-race",
+          "flags": [
+            "--spawn-as-race"
+          ],
+          "dest": "spawn_as_race",
+          "label": "레이스 단위 출발 배치",
+          "kind": "choice",
+          "item_kind": "str",
+          "default": "on",
+          "nargs": null,
+          "choices": [
+            "on",
+            "off"
+          ],
+          "required": false,
+          "group": "teacher·상대차",
+          "help": "lay out each race as one: a car rejected at its spawn (a wall, the spawn runway, a crate) moves the whole race along the lap with it, an alongside row is never pulled onto one line, an empty seat neither blocks the race nor is made room for, and a car rejoining a race keeps --spawn-gap LOW from every race mate. off: the per-car placement of every run before 2026-10-14, kept to reproduce old tables -- in the boot-camp config about one learner episode in eleven started overlapping another car",
+          "action": "store",
+          "nullable": false,
+          "metavar": null
         },
         {
           "flag": "--spawn-alongside-gap",

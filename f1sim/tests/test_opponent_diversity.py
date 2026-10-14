@@ -470,8 +470,11 @@ def test_an_alongside_grid_is_actually_alongside_and_not_in_contact():
 
 def test_a_lane_with_room_for_one_car_staggers_instead_of_spawning_a_contact():
     """The whole point of consulting the distance field. A narrow track keeps some races staggered
-    and the rest properly abreast; what it must never do is put two cars in one place."""
-    env = _env(envs=32, track=TRACK, spawn_order="alongside", spawn_alongside_sep=1.5)
+    and the rest properly abreast; what it must never do is put two cars in one place. The minimum
+    is asked for at 1.5 m too: `spawn_alongside_sep` is only the preferred gap, and a lane with no
+    room for it takes `spawn_alongside_sep_min` (0.15 m) before it staggers."""
+    env = _env(envs=32, track=TRACK, spawn_order="alongside", spawn_alongside_sep=1.5,
+               spawn_alongside_sep_min=1.5)
     contacts = 0
     for k in range(6):
         env.reset(seed=89 + k)
@@ -620,6 +623,8 @@ def _env_cfg_for(monkeypatch, extra_argv):
 @pytest.mark.parametrize("flag,field,expected", [
     (["--spawn-order", "random"], "spawn_order", "random"),
     (["--spawn-alongside-sep", "0.2"], "spawn_alongside_sep", 0.2),
+    (["--spawn-alongside-sep-min", "0.1"], "spawn_alongside_sep_min", 0.1),
+    (["--spawn-as-race", "off"], "spawn_as_race", False),
     (["--spawn-alongside-gap", "0.1", "0.3"], "spawn_alongside_gap", (0.1, 0.3)),
     (["--opp-speed", "1.0", "1.3"], "opp_speed_range", (1.0, 1.3)),
     (["--opp-events", "defend", "--opp-defend-prob", "0.4"], "opp_defend_prob", 0.4),
@@ -682,6 +687,7 @@ RACE = ["--race-size", "2", "--opponent", "teacher"]
     (["--race-size", "2", "--opponent", "policy", "--opp-events", "defend",
       "--opp-defend-prob", "0.5"], "teacher-driven"),
     (["--race-size", "1", "--opponent", "pool", "--opp-pool", "self"], "--race-size 1"),
+    (RACE + ["--spawn-alongside-sep", "-0.1"], "--spawn-alongside-sep"),
 ])
 def test_a_configuration_that_would_silently_do_nothing_is_refused(argv, needle):
     ap = oc.add_arguments(__import__("argparse").ArgumentParser())
