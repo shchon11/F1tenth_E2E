@@ -774,6 +774,10 @@ class F1VecEnv:
     _roll_cfg = False
     #: control steps in which some row can still be rolling (a host count, see `_note_spawn_formation`)
     _roll_steps_left = 0
+    #: (B,) this step's rolling-start weights and centreline indices (`_rolling_start`); None in a
+    #: shell built without them
+    roll_w = None
+    roll_ci = None
     #: whether `signed_gaps` masks empty seats (any seat with `present` < 1)
     _present_mask_gaps = False
 
@@ -933,8 +937,15 @@ class F1VecEnv:
         self.spawn_abreast = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self.roll_on = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self.roll_cl0 = torch.zeros(self.B, device=self.device)
-        #: Control steps left in which some row can still be rolling: a host count, so the two lane
-        #: projections the rolling start costs are paid in the first seconds after a reset only.
+        #: (B,) the weight of the hold in each car's lateral target this step (1 through the hold, down
+        #: to 0 over the ramp, 0 for every other car). The same tensor as the teacher's
+        #: `LaneHold.w` (`set_teacher`), written in place, so a captured teacher call reads it.
+        self.roll_w = torch.zeros(self.B, device=self.device)
+        #: (B,) each car's centreline index this step (`Simulator.cl_idx`, which the simulator rebinds
+        #: every step), copied in place for the same reason.
+        self.roll_ci = torch.zeros(self.B, dtype=torch.long, device=self.device)
+        #: Control steps left in which some row can still be rolling: a host count, so the weights
+        #: are recomputed in the first seconds after a reset only and stay 0 the rest of the time.
         self._roll_steps_left = 0
         self._present_mask_gaps = getattr(self, "_present_p", None) is not None
         if (self.M > 1 and (e.spawn_alongside_hold > 0 or e.spawn_alongside_ramp > 0)
@@ -1627,6 +1638,13 @@ class F1VecEnv:
             teacher.offset_limit = raceline_offset_limit_sided(teacher, self.sim.track,
                                                                0.5 * self.cfg.vehicle.width,
                                                                self.ecfg.opp_event_margin)
+        if self._roll_cfg and self.sim.track.cl is not None:
+            # The rolling start's lane hold (`teacher.LaneHold`), on the one teacher every
+            # teacher-driven car plans through -- the planner kinds and the interactive search wrap
+            # it -- for the life of the env: installed or not is decided here once, so a captured
+            # teacher call never meets it appearing (`viewer.graph_fastpath.TeacherGraph` guards it).
+            from .teacher import LaneHold
+            teacher.lane_hold = LaneHold(self.roll_w, self.roll_cl0, self.roll_ci, *self._lane_hold_tables())
         if self.events is not None and self.events.needs_corners:
             # Where the corners are on each raceline, for the `line` behaviour. Built once here for
             # the same reason the offset budget is: it is a function of the track set, not of a step.
@@ -2005,6 +2023,19 @@ class F1VecEnv:
                 mate_s = torch.where(self.sim.absent[o_] | is_full[:, None],
                                      torch.full_like(self.sim.s[o_], float("nan")), self.sim.s[o_])
                 race_kw["avoid_s"] = mate_s
+        if self.M > 1 and self._roll_cfg:
+            # A car the rolling start will hold (`_note_spawn_formation`'s rule) starts lined up
+            # with its lane. Its heading jitter is a lateral velocity the hold cannot take back
+            # before it has carried the car sideways -- toward the car beside it in half the
+            # draws: measured (2026-10-14, blackbox2022_1, plan teacher holding its lane), 0.075
+            # rad at 3 m/s was 6.9 cm toward the learner after 0.33 s. The draw is still made, so
+            # the generator's stream is the same with the rolling start on or off.
+            held = abreast_rows & self.teacher_driven[ids]
+            layout = self.alt_teacher_mask.get("layout")
+            if layout is not None:
+                held = held & ~layout[ids]
+            yaw_std = torch.where(held, torch.zeros(n, device=self.device),
+                                  torch.as_tensor(yaw_std, dtype=torch.float32, device=self.device).expand(n))
         poses = self.sim.sample_spawn(n, e.spawn_lateral_std, yaw_std, s=s, tid=self.sim.tid[ids],
                                       min_clearance=min_clear, lat=lat, eid=ids, **race_kw)
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
@@ -2075,12 +2106,11 @@ class F1VecEnv:
         on = here & self.teacher_driven[ids] & self._roll_cfg     # nothing holds a car with it off
         layout = self.alt_teacher_mask.get("layout")
         if layout is not None:
-            # A `layout` car drives its own line, rebuilt round each layout (`f1sim.layout_line`), and
-            # the offset it is handed is measured from that line; the table the rolling start turns a
-            # centreline offset into a line offset with is the raceline's. Handed one, it would be
-            # steered by the gap between the two lines -- on a layout that bends its line round a
-            # crate, metres. Building the table per layout line on every relayout is not worth it for
-            # a start, so this kind starts the way every car did before 2026-10-14.
+            # A `layout` car drives its own line, rebuilt round each layout (`f1sim.layout_line`) on a
+            # teacher of its own, and the hold's per-station tables (`LaneHold`) are the raceline's:
+            # indexed by that line's points they would put the car metres off on a layout that bends
+            # its line round a crate. Building them per layout line on every relayout is not worth it
+            # for a start, so this kind starts the way every car did before 2026-10-14.
             on = on & ~layout[ids]
         self.roll_on[ids] = on
         cl0 = torch.zeros(ids.numel(), device=self.device)
@@ -2093,55 +2123,113 @@ class F1VecEnv:
                                                       / self.sim.control_dt)) + 1
         self.roll_cl0[ids] = torch.where(on, cl0, torch.zeros_like(cl0))
 
-    def _rolling_start(self) -> torch.Tensor:
-        """(B,) the lateral offset, metres left of its line, the rolling start asks of each car: for
-        an abreast-placed teacher car, the raceline offset that keeps it on the centreline offset it
-        was placed at, for `spawn_alongside_hold` seconds, then eased to 0 (its own line) over
-        `spawn_alongside_ramp` (linear, like the `shift` event's ramps). 0 for every other car.
-
-        A teacher follows one offset along the whole stretch it plans through, so the offset is the
-        one that holds the placed centreline offset at the teacher's lookahead point rather than at
-        the car: where the raceline crosses the lane, an offset right for where the car *is* points
-        it along the raceline's sideways run. Measured (2026-10-14, ICCAS, 64 races of 2 placed
-        abreast, the 30 opponents > 0.15 m off the raceline, centreline offset moved toward the
-        learner after 1.0 s): no rolling start p90 1.16 m / max 1.26 m; held at the car's own point
-        p90 0.42 / max 0.67; held at 0.5x the lookahead p90 0.26 / max 0.37; at the lookahead (this)
-        p90 0.09 / max 0.14; at 1.5x p90 0.12 / max 0.27. That is the raceline teacher holding a
-        line; what the rolling start does to car contacts, end to end with the boot-camp planners,
-        is in `EnvConfig.spawn_alongside_hold`."""
+    def _hold_weight(self, ahead: float = 0.0) -> torch.Tensor:
+        """(B,) the rolling start's weight for every car `ahead` seconds from now: 1 through
+        `spawn_alongside_hold` after the reset, down to 0 over `spawn_alongside_ramp` (linear, like
+        the `shift` event's ramps), 0 for every car that is not a held one."""
         e = self.ecfg
-        z = torch.zeros(self.B, device=self.device)
-        t_ = self.teacher
-        if self._roll_steps_left <= 0 or not hasattr(t_, "tan"):
-            return z
-        t = self.ep_step.to(z.dtype) * self.sim.control_dt
+        t = self.ep_step.to(self.roll_w.dtype) * self.sim.control_dt + ahead
         w = (1.0 - (t - e.spawn_alongside_hold) / max(e.spawn_alongside_ramp, 1e-6)).clamp(0.0, 1.0)
-        live = self.roll_on & self.teacher_driven & (w > 0)
-        tab = self._raceline_lane_offset()
-        xy, tid = self.sim.state[:, :2], self.sim.tid
-        idx = t_.project(xy, tid)[0]
-        ld = (t_.k_ld * self.sim.state[:, 3].abs()).clamp(t_.ld_min, t_.ld_max) * self._rolling_preview
-        j = (idx + (ld / t_.ds[tid]).round().long()) % t_.N
-        return torch.where(live, w * (self.roll_cl0 - tab[tid, j]), z)
+        return torch.where(self.roll_on & self.teacher_driven, w, torch.zeros_like(w))
 
-    #: Fraction of the teacher's pure-pursuit lookahead the rolling start holds its offset at (see
-    #: `_rolling_start` for the sweep that chose 1).
-    _rolling_preview = 1.0
+    def _rolling_start(self) -> torch.Tensor:
+        """Write this step's hold weights into `roll_w` -- the tensor the teacher's `LaneHold` reads
+        -- and return it.
 
-    def _raceline_lane_offset(self) -> torch.Tensor:
-        """(T, N) the centreline offset (left +) of every raceline point, built once per teacher."""
-        t_ = self.teacher
-        tab = getattr(self, "_rl_lane_tab", None)
-        if tab is not None and tab[0] is t_:
-            return tab[1]
-        rows = []
-        for k in range(t_.xy.shape[0]):
-            xy_k = t_.xy[k].to(self.device)
-            tid_k = torch.full((xy_k.shape[0],), k, dtype=torch.long, device=self.device)
-            rows.append(self.sim.track.project(xy_k, tid_k)[1])
-        out = torch.stack(rows, 0)
-        self._rl_lane_tab = (t_, out)
-        return out
+        The hold itself is the teacher's (`teacher.LaneHold`): every point it plans through moves to
+        the centreline offset the car was placed at, cut to the lane's room at that point's own
+        station, and whatever lateral target the car was given besides -- the events' offset, a
+        planner kind's own choice of side -- is scaled by 1 - w. So through the hold the car neither
+        follows its raceline across the lane nor changes lane, and over the ramp it hands the side
+        back to its planner, ending exactly on that planner's choice.
+
+        The first version (until 2026-10-14) added one raceline offset to the events' offset
+        instead, fitted at the pure-pursuit lookahead. Two things undid it in the boot-camp config:
+        the lane clamp cut it at the car's own raceline point, against room measured from a
+        different raceline position, and the planner kinds added their own offset on top of it.
+        Measured on 228 abreast opponents, the 83 cut by more than 5 cm moved 0.21-0.26 m toward
+        the learner within 1 s (median, p90 0.59), and contacts with the abreast car were not
+        reduced (23 / 19 raw / charged in 80 six-second episodes with it, 20 / 18 without)."""
+        self.roll_ci.copy_(self.sim.cl_idx)
+        if self.procedural is not None:
+            # A crate on the held line within stopping distance releases that car for the rest of
+            # its episode: going round it is its planner's job (the hold would scale that choice
+            # away), and holding a car into a crate is not a start. Placement keeps
+            # `spawn_runway` clear ahead, not the 3-5 m a held car covers in its hold.
+            self.roll_on &= ~self._hold_blocked()
+        self.roll_w.copy_(self._hold_weight())
+        return self.roll_w
+
+    #: [m] the held line is searched for procedural props this far ahead at most, in these steps
+    HOLD_PROP_REACH = 4.0
+    HOLD_PROP_STEP = 0.2
+
+    def _hold_blocked(self) -> torch.Tensor:
+        """(B,) cars whose held lane position runs into a procedural prop within their stopping
+        distance (at the teacher's `a_brake`) plus a body length: a point of the held line with less
+        than half the body plus `opp_event_margin` of clearance from one."""
+        t_, h = self.teacher, getattr(self.teacher, "lane_hold", None)
+        if h is None or self.procedural is None:
+            return torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        st = self.sim.state
+        line = t_._hold_line(h, self.sim.tid, st[:, :2])
+        K = int(round(self.HOLD_PROP_REACH / self.HOLD_PROP_STEP))
+        d = torch.arange(1, K + 1, device=self.device, dtype=st.dtype) * self.HOLD_PROP_STEP
+        pts = t_._hold_sample(line, d[None].expand(self.B, -1))[0]                     # (B, K, 2)
+        eid = torch.arange(self.B, device=self.device).repeat_interleave(K)
+        clear = self.procedural.clearance(pts.reshape(-1, 2), eid).view(self.B, K)
+        v = st[:, 3].clamp_min(0.0)
+        reach = v * v / (2.0 * float(t_.a_brake)) + float(self.cfg.vehicle.length)
+        need = 0.5 * float(self.cfg.vehicle.width) + float(self.ecfg.opp_event_margin)
+        return ((clear < need) & (d[None] <= reach[:, None])).any(1)
+
+    def _lane_hold_tables(self):
+        """(cxy, ctan, seg, room, kap, step, n_steps): the per-station half of the rolling start's
+        `LaneHold`, on the track's own resampled centreline -- its points and unit tangents, the
+        spacing, the lateral room left and right of it for the body plus `opp_event_margin`, its
+        curvature (left +, over +-`HOLD_KAPPA_SPAN` of arc: a few centimetres a point, a three-point
+        curvature is noise), and how the held line is walked (`HOLD_LINE_*`).
+
+        The room is swept along the normal in `HOLD_ROOM_STEP` steps against the distance field,
+        monotone so space beyond a pinch is not claimed. It is the test the abreast row was placed
+        with (`_slot_grid`: the distance field at the centreline less half the rotated body and the
+        margin), so a car is not cut off the place it was put: placement keeps 0.03 m of headroom
+        and half a body rotated by 3 sigma of `spawn_alongside_yaw` (5 cm more than half the width),
+        against the sweep's 2 cm step."""
+        tr = self.sim.track
+        cxy, ctan = tr.cl, tr.cl_tangent                                      # (T, n, 2) each
+        T, n, _ = cxy.shape
+        seg = (tr.length / n).clamp_min(1e-6)                                 # (T,)
+        nrm = torch.stack([-ctan[..., 1], ctan[..., 0]], -1)
+        need = 0.5 * float(self.cfg.vehicle.width) + float(self.ecfg.opp_event_margin)
+        tid_g = torch.arange(T, device=self.device)[:, None].expand(T, n)
+        room = []
+        for sign in (1.0, -1.0):
+            ok = tr.sample_edt(cxy, tid_g) >= need
+            lim = torch.zeros(T, n, device=self.device)
+            o = self.HOLD_ROOM_STEP
+            while o <= self.HOLD_ROOM_MAX + 1e-9:
+                ok = ok & (tr.sample_edt(cxy + nrm * (sign * o), tid_g) >= need)
+                lim = torch.where(ok, torch.full_like(lim, o), lim)
+                o += self.HOLD_ROOM_STEP
+            room.append(lim)
+        ang = torch.atan2(ctan[..., 1], ctan[..., 0])
+        m = max(1, int(round(self.HOLD_KAPPA_SPAN / float(seg.max()))))
+        turn = torch.remainder(torch.roll(ang, -m, 1) - torch.roll(ang, m, 1) + math.pi, 2 * math.pi) - math.pi
+        kap = turn / (2 * m * seg[:, None])
+        step = max(1, int(round(self.HOLD_LINE_STEP_M / float(seg.max()))))
+        n_steps = int(math.ceil(self.HOLD_LINE_M / (step * float(seg.min()))))
+        return cxy, ctan, seg, torch.stack(room, -1), kap, step, n_steps
+
+    #: [m] step and reach of the lane-room sweep `_lane_hold_tables` builds the hold's clamp from.
+    HOLD_ROOM_STEP = 0.02
+    HOLD_ROOM_MAX = 1.6
+    #: [m] half the arc the hold's centreline curvature is measured over.
+    HOLD_KAPPA_SPAN = 0.15
+    #: [m] the held line is walked this far ahead of a car, in samples this far apart: past the plan
+    #: of a car at 7 m/s (1.5 s of it) on a straight -- 2 s after its reset, a held car is slower.
+    HOLD_LINE_M = 12.0
+    HOLD_LINE_STEP_M = 0.1
 
     def _fill_scans(self, ids: torch.Tensor, speed: torch.Tensor):
         """Fill the scan history of reset rows with a fresh scan from the new pose. Scanned for the whole
@@ -2238,13 +2326,13 @@ class F1VecEnv:
                 # where the learner is *now*, which is the state this step's command will act on.
                 self.events.step_reactive(self.learner_view())
             ev_speed, ev_off = self.events.speed_scale(), self.events.lateral_offset()
-        if self._roll_cfg and self._roll_steps_left > 0 and ev_off is not None and self.teacher is not None:
-            # Summed with the events' offset, as their scripted and reactive halves are summed, and
-            # clamped with it against the lane (`RacelineTeacher.offset_limit`, installed whenever the
-            # events are on -- and `_roll_cfg` requires them). The channel is a tensor on every step
-            # whether or not a row is rolling; with no row that can still be rolling nothing is added,
-            # so the teachers get exactly what the events alone would hand them.
-            ev_off = ev_off + self._rolling_start()
+        if self._roll_cfg and self._roll_steps_left > 0:
+            # The hold's weights for this step, which the teacher's lane hold reads (`LaneHold`,
+            # installed by `set_teacher` whenever `_roll_cfg` -- which requires the events, so the
+            # offset channel the hold acts on is a tensor on every step). The offset itself is left
+            # as the events made it: the hold replaces the lateral target instead of adding to it.
+            # Once no row can still be rolling the weights are all 0 and are not written again.
+            self._rolling_start()
             self._roll_steps_left -= 1
         out = action
         if self.pool is not None:

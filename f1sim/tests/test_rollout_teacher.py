@@ -73,8 +73,9 @@ def test_the_shadow_drives_like_the_real_race():
 
 def test_a_refresh_carries_the_rolling_start_over():
     """An opponent the real race holds on its placement offset (`EnvConfig.spawn_alongside_hold`) is
-    held in every copy too. The rows, offsets and clocks are row tensors; whether the env adds the
-    offset at all is a host count, and the shadow's own had run down in its own steps."""
+    held in every copy too. The rows, offsets, weights and clocks are row tensors; whether the env
+    recomputes the weights at all is a host count, and the shadow's own had run down in its own steps.
+    The shadow's teacher holds the shadow's own rows (`teacher.LaneHold`), not the real env's."""
     from f1sim.rollout_teacher import ShadowEnv
     tr, rl = _track_and_raceline()
     cfg = Config(); cfg.sim.compile_mode = "none"; cfg.lidar.n_beams = 36
@@ -92,10 +93,13 @@ def test_a_refresh_carries_the_rolling_start_over():
     assert sh.S._roll_steps_left == env._roll_steps_left
     assert torch.equal(sh.S.roll_on.view(2, env.B)[1], env.roll_on)
     assert torch.equal(sh.S.roll_cl0.view(2, env.B)[1], env.roll_cl0)
-    # and it is what the env's opponents act on: the same offset in the shadow as in the real race
-    roll = env._rolling_start()
-    assert float(roll.abs().max()) > 0.0
-    assert torch.allclose(sh.S._rolling_start().view(2, env.B)[1], roll, atol=1e-6)
+    assert torch.equal(sh.S.roll_w.view(2, env.B)[1], env.roll_w)
+    # and it is what the env's opponents act on: the same weights in the shadow as in the real race
+    w = env._rolling_start().clone()
+    assert float(w.max()) > 0.0
+    assert torch.equal(sh.S._rolling_start().view(2, env.B)[1], w)
+    assert sh.S.teacher.lane_hold.w is sh.S.roll_w and sh.S.teacher.lane_hold.w.shape[0] == sh.S.B
+    assert env.teacher.lane_hold.w is env.roll_w
 
 
 def test_the_candidate_set_has_to_contain_the_raceline():

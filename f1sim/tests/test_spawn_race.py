@@ -14,14 +14,16 @@ fire there and could not have caught it. These run the configuration that does:
    at least `spawn_gap[0]` minus the abreast stagger apart in arc. And a car rejoining a race
    keeps `spawn_gap[0]` from every race mate.
 2. **An empty seat has no place on the lap.** `signed_gaps` reads half a lap for it.
-3. **An abreast teacher holds its offset, then eases onto its line** (`spawn_alongside_hold`): the
-   centreline offset it was placed at, so it does not close on the car beside it in the first second.
-   It rides on the opponent-event offset channel: without events the teachers' offset stays None.
-   These pin the mechanism only. It does not remove the merge -- what it was measured to do to car
-   contacts is in `EnvConfig.spawn_alongside_hold`.
+3. **An abreast teacher holds its lane position, then hands the side back to its planner**
+   (`spawn_alongside_hold`, `teacher.LaneHold`): through the hold it keeps the centreline offset it
+   was placed at -- whatever its planner kind would choose -- so it does not close on the car beside
+   it in the first second; over the ramp its own choice comes back, and at the end it is exactly that
+   choice. It needs the opponent-event offset channel: without events the teachers' offset stays
+   None. What it was measured to do to car contacts is in `EnvConfig.spawn_alongside_hold`.
 4. **The preferred abreast separation is used where it fits** (`spawn_alongside_sep`), the minimum
    (`spawn_alongside_sep_min`) where only that does, a stagger where neither does.
 """
+import copy
 import functools
 import math
 
@@ -202,10 +204,11 @@ def test_an_abreast_teacher_holds_its_offset_then_eases_onto_its_line(hold):
     opp = (~env.learner).nonzero().flatten()
     assert bool(env.spawn_abreast[opp].all()), "the wide track should fit every row abreast"
     if not hold:
-        assert env._roll_cfg is False and float(env._rolling_start().abs().max()) == 0.0
+        assert env._roll_cfg is False and env.teacher.lane_hold is None
         return
     assert bool(env.roll_on[opp].all()) and not bool(env.roll_on[env.learner].any()), \
         "only the teacher cars roll: the learner has no line to hold"
+    assert env.teacher.lane_hold.w is env.roll_w, "the teacher reads the env's weights in place"
     cl0 = env.roll_cl0[opp].clone()
     # `reset` ends with one zero-action physics step, so the car has moved a step (<= 3 m/s x 25 ms
     # along a heading jittered by `spawn_alongside_yaw`) since the offset was read at placement
@@ -217,20 +220,165 @@ def test_an_abreast_teacher_holds_its_offset_then_eases_onto_its_line(hold):
     cl, rl = [], []
     for k in range(int(round(2.6 / dt))):
         assert bool((env.ep_step[opp] == k).all()), "a car reset during the test"
-        roll = env._rolling_start()[opp]
+        w_now = env._rolling_start()[opp]
         t = k * dt
         w = 1.0 if t <= hold else max(0.0, 1.0 - (t - hold))
-        assert bool(((roll == 0) == (w == 0)).all()), f"t={t:.2f}"
+        assert torch.allclose(w_now, torch.full_like(w_now, w), atol=1e-4), f"t={t:.2f}"
         env.step(torch.zeros(env.B, env.act_dim))
         cl.append(_lateral_from_centreline(env, opp)); rl.append(_lateral_from_line(env, opp))
     # held: through the hold the car stays on the centreline offset it was placed at; after hold +
     # ramp + 0.6 s it is near its line
     for k in (int(0.5 / dt), int(1.0 / dt)):
         drift = (cl[k] - cl0)[far].abs()
-        assert float(drift.median()) < 0.06, f"drifted {float(drift.median()):.2f} m off its placement at {k * dt:.2f} s"
+        assert float(drift.median()) < 0.03, f"drifted {float(drift.median()):.2f} m off its placement at {k * dt:.2f} s"
     end = rl[-1][far].abs()
     assert float(end.median()) < 0.5 * float(rl0[far].abs().median()), "never eased onto its line"
-    assert float(env._rolling_start().abs().max()) == 0.0, "still offset after hold + ramp"
+    assert float(env.roll_w.abs().max()) == 0.0, "still held after hold + ramp"
+
+
+KINDS = ("raceline", "forzaeth", "forzaeth_pred", "lane_switch", "interactive")
+
+
+def _kind_env(kind, envs=16, seed=37, **kw):
+    """Race of 2 in the plan action space: the learner and one opponent of `kind` placed beside it,
+    with the event channel on and silent."""
+    seat = {"kind": kind, "present": 1.0, "spawn": "alongside", "events": ["shift"], "event_rate": 1e-9}
+    return _make([WIDE], envs, seed, race_size=2, opponent="slots", opponent_slots=[seat], action_mode="plan",
+                 collision_mode="soft", **kw)
+
+
+def _held_learner(env):
+    """A copy of the env's teacher that holds each LEARNER on the lane position it was placed at (a
+    `LaneHold` of its own, the env's centreline index shared), so that the learner beside a held
+    opponent does not close the gap either: whatever moves toward it in the hold is the opponent."""
+    from f1sim.teacher import LaneHold
+    h = env.teacher.lane_hold
+    tl = copy.copy(env.teacher)
+    cl = _lateral_from_centreline(env, torch.arange(env.B))
+    tl.lane_hold = LaneHold(env.learner.float(), cl, env.roll_ci, h.cxy, h.ctan, h.seg, h.room, h.kap,
+                            h.step, h.n_steps)
+    return tl
+
+
+def _drivable(env, rows, reach=4.0, k_max=0.3):
+    """Whether the lane position each held car keeps is one it can drive through the hold without a
+    turn-in transient: no bend of it tighter than `k_max` (3.3 m radius) over the `reach` metres it
+    covers. Inside a hairpin a fixed offset can be tighter than the car's full lock, and no hold makes
+    that drivable; and a car placed in a bend starts at zero steer, so the tracker's turn-in carries
+    it out first -- measured on this track, 0.4 1/m at 3.5 m/s: 6.9 cm out in 0.3 s, then 12 cm back
+    in, the same for every planner kind (the spawn, not the hold)."""
+    t_, h = env.teacher, env.teacher.lane_hold
+    env.roll_ci.copy_(env.sim.cl_idx)
+    tid = env.sim.tid
+    line = t_._hold_line(h, tid, env.sim.state[:, :2])
+    d = torch.linspace(0.0, reach, 17)[None].expand(env.B, -1)
+    k = t_._hold_kappa(h, tid, t_._hold_sample(line, d)[1]).abs().amax(1)
+    return k[rows] <= k_max
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_the_hold_holds_for_every_planner_kind(kind):
+    """Through the hold a held opponent does not move toward the learner beside it -- whatever its
+    planner kind would choose (`LaneHold` scales that by 1 - w) and however the raceline runs across
+    the lane -- on every start whose lane position is drivable at all (`_drivable`)."""
+    env = _kind_env(kind)
+    assert env._roll_cfg and env.teacher.lane_hold is not None
+    tl = _held_learner(env)
+    dt = env.sim.control_dt
+    hold_k = int(round(env.ecfg.spawn_alongside_hold / dt))
+    worst, n_ok, tight = [], 0, []
+    for r in range(3):
+        env.reset(seed=60 + r)
+        opp = (env.roll_on & ~env.learner).nonzero().flatten()
+        assert opp.numel() >= env.B // 4, f"only {opp.numel()} of {env.B // 2} opponents placed abreast"
+        lrn = opp - 1
+        tl.lane_hold.cl.copy_(_lateral_from_centreline(env, torch.arange(env.B)))
+        cl0 = env.roll_cl0[opp].clone()
+        side = torch.sign(_lateral_from_centreline(env, lrn) - cl0)
+        ok = _drivable(env, opp)
+        toward = torch.full_like(cl0, -math.inf)
+        for k in range(hold_k):
+            env.step(env.teacher_label(tl, offset=torch.zeros(env.B)))
+            toward = torch.maximum(toward, (_lateral_from_centreline(env, opp) - cl0) * side)
+        worst += toward[ok].tolist(); n_ok += int(ok.sum())
+        tight += toward[~ok].tolist()
+    assert n_ok >= 12, f"only {n_ok} drivable starts: the test would pass on nothing"
+    assert max(worst) < 0.05, (f"{kind}: moved up to {max(worst):.3f} m toward the learner in the hold "
+                               f"({sorted(worst)[-5:]}); hairpin starts excluded: {sorted(tight)[-3:]}")
+
+
+def _plans_with_choice(env, alt, d, w):
+    """The plan `alt` hands every opponent row when its own lateral choice is `d` [m] and the hold's
+    weight is `w`, and the same with no hold installed at all."""
+    B = env.B
+    off = env.events.lateral_offset()
+    choice = torch.full((B,), float(d))
+    alt.decide = lambda state, tid=None: (choice[:state.shape[0]], torch.zeros(state.shape[0], dtype=torch.long),
+                                          torch.ones(state.shape[0]))
+    env.roll_w.copy_(torch.where(env.roll_on, torch.full((B,), float(w)), torch.zeros(B)))
+    env.roll_ci.copy_(env.sim.cl_idx)
+    args = (env.sim.state, env.sim.P, env.sim.tid, env.ecfg.v_max_policy, env.tracker.spec)
+    held = alt.plan_action(*args, offset=off, plan_speed=env._tracker_plan_speed())
+    keep = env.teacher.lane_hold
+    env.teacher.lane_hold = None
+    try:
+        bare = alt.plan_action(*args, offset=off, plan_speed=env._tracker_plan_speed())
+    finally:
+        env.teacher.lane_hold = keep
+    return held, bare
+
+
+@pytest.mark.parametrize("kind", ["forzaeth", "lane_switch"])
+def test_the_hold_overrides_a_planners_choice_and_the_ramp_hands_it_back(kind):
+    """A planner kind's own offset (`FrenetOpponentPlanner.decide`) does not move a held car: at full
+    weight the plan is the held line whichever side the planner picks. At weight 0 -- the end of the
+    ramp -- the plan is the planner's own, bit for bit the plan with no hold installed at all."""
+    env = _kind_env(kind, envs=8, seed=41)
+    env.reset(seed=43)
+    alt = env.alt_teachers[env.alt_teacher_kinds.index(kind)]
+    rows = (env.roll_on & ~env.learner).nonzero().flatten()
+    assert rows.numel() >= 2
+    left, _ = _plans_with_choice(env, alt, +0.45, 1.0)
+    right, _ = _plans_with_choice(env, alt, -0.45, 1.0)
+    assert torch.allclose(left[rows], right[rows], atol=1e-4), "a held car's plan moved with its planner's choice"
+    for d in (+0.45, -0.45):
+        held, bare = _plans_with_choice(env, alt, d, 0.0)
+        assert torch.equal(held, bare), "at the end of the ramp the plan is not exactly the planner's own"
+    mid, _ = _plans_with_choice(env, alt, +0.45, 0.5)
+    _, own = _plans_with_choice(env, alt, +0.45, 0.0)
+    assert not torch.allclose(mid[rows], left[rows], atol=1e-3) and not torch.allclose(mid[rows], own[rows], atol=1e-3)
+    assert (left[~env.roll_on] == own[~env.roll_on]).all(), "a car that is not held planned differently"
+
+
+def test_an_idle_hold_changes_nothing():
+    """Installed but holding nobody -- every race not laid abreast, and every race once its ramp is
+    over -- the hold leaves every car's trajectory bit for bit what it is with the rolling start off."""
+    kw = dict(race_size=2, opponent="teacher", spawn_order="random", action_mode="plan", collision_mode="soft",
+              **QUIET_EVENTS)
+    on = _make([WIDE], 16, 47, **kw)
+    off = _make([WIDE], 16, 47, spawn_alongside_hold=0.0, spawn_alongside_ramp=0.0, **kw)
+    assert on._roll_cfg and on.teacher.lane_hold is not None
+    assert not off._roll_cfg and off.teacher.lane_hold is None
+    n = int(round(2.5 / on.sim.control_dt))
+
+    def run(env):
+        # one after the other, not interleaved: `reset(seed)` seeds the global generator as well as the
+        # simulator's, and the sensor noise draws from it
+        env.reset(seed=50)
+        states = [env.sim.state.clone()]
+        for _ in range(n):
+            env.step(torch.zeros(env.B, env.act_dim))
+            states.append(env.sim.state.clone())
+        return states
+    s_on, s_off = run(on), run(off)
+    still = ~on.roll_on.view(-1, 2).any(1).repeat_interleave(2)            # races nobody in which is held
+    assert bool(still.any()) and bool((~still).any()), "the draw should give both kinds of race"
+    assert torch.equal(s_on[0], s_off[0]), "the hold drew from the generator at the reset"
+    for k in range(n + 1):
+        assert torch.equal(s_on[k][still], s_off[k][still]), f"an unheld race diverged at step {k}"
+    assert not torch.equal(s_on[-1][~still], s_off[-1][~still]), "the held races did not differ: vacuous"
+    # after hold + ramp the weights are all 0 and the planners are handed back exactly
+    assert float(on.roll_w.abs().max()) == 0.0 and on._roll_steps_left == 0
 
 
 # --------------------------------------------------------------------------- 4. separation
@@ -300,22 +448,25 @@ def test_without_events_the_teachers_offset_stays_none():
     assert seen and all(off is None for off, _, _ in seen)
 
 
-def test_with_no_row_rolling_the_teachers_get_the_events_offset_untouched():
+def test_the_offset_channel_is_the_events_own_and_the_weights_run_down():
+    """The hold replaces the lateral target inside the teacher (`LaneHold`); it adds nothing to the
+    offset the events hand the teachers, which stays a tensor on every step. Its weights are written
+    only while some row can still be rolling, and are 0 once the window is over."""
     env = _make([WIDE], 8, 19, race_size=2, opponent="teacher", spawn_order="alongside",
                 collision_mode="soft", **QUIET_EVENTS)
     assert env._roll_cfg is True
     seen = _spy_offsets(env)
+    weights = []
     env.reset(seed=23)
     window = int(math.ceil((env.ecfg.spawn_alongside_hold + env.ecfg.spawn_alongside_ramp)
                            / env.sim.control_dt)) + 1
     for _ in range(window + 5):
         env.step(torch.zeros(env.B, env.act_dim))
-    rolled = [off for off, ref, left in seen if not torch.equal(off, ref)]
-    assert rolled, "the rolling start never added an offset: the test would pass with it off"
-    # the call on which the count reaches 0 is the window's last (its weight is 0 by then anyway)
+        weights.append(env.roll_w.clone())
+    assert all(off is not None and torch.equal(off, ref) for off, ref, _ in seen)
+    assert float(weights[0].max()) == 1.0, "nobody was held: the test would pass with it off"
     k0 = next(i for i, (_, _, left) in enumerate(seen) if left == 0)
-    after = seen[k0 + 1:]
-    assert len(after) >= 3 and all(left == 0 and torch.equal(off, ref) for off, ref, left in after)
+    assert len(seen) - k0 >= 3 and all(float(w.abs().max()) == 0.0 for w in weights[k0:])
 
 
 def test_a_layout_driven_car_does_not_roll():

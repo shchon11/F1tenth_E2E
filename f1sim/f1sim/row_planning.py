@@ -62,17 +62,23 @@ class RowPlanning:
         grip codes -- and `project_plan_action` tiles the codes to whatever batch it is handed by
         repeating them, so a subset call against the full-length codes would either raise or,
         where the lengths happen to divide, read another car's code without a word. They are cut to
-        the same rows for the duration and put back after.
+        the same rows for the duration and put back after. So is the rolling start's lane hold
+        (`teacher.LaneHold`): uncut, a subset call would not match its batch and would plan as if
+        no car were held.
         """
         base, B = self.base, state.shape[0]
         cut = lambda t: t[rows] if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] == B else t
-        held = (base.speed_scale, base.label_grip_codes)
+        held = (base.speed_scale, base.label_grip_codes, getattr(base, "lane_hold", None))
         self._rows, self._full_state = rows, state
         base.speed_scale, base.label_grip_codes = cut(held[0]), cut(held[1])
+        if held[2] is not None:
+            base.lane_hold = held[2].rows(cut)
         try:
             yield cut
         finally:
-            base.speed_scale, base.label_grip_codes = held
+            base.speed_scale, base.label_grip_codes = held[:2]
+            if held[2] is not None:
+                base.lane_hold = held[2]
             self._rows = self._full_state = None
 
     def project_rows(self, action: torch.Tensor, rows: torch.Tensor, state: torch.Tensor, P, v_max: float,
