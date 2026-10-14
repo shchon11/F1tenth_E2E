@@ -7,7 +7,7 @@ Two runtime functions, plus the build-time helper that feeds them:
 * `ray_prisms_hits` -- torch. Beams against finite convex prisms.
 * `prism_contacts` -- torch. The car rectangle against those prisms, by SAT.
 * `prism_separation` -- torch. The same SAT read the other way: how far apart they are, not only
-  how deep they overlap (the v2 DAgger's clearance mask asks "within 0.3 m of a prop?").
+  how deep they overlap (the v2 DAgger measures how often its labels pass within 0.3 m of a prop).
 
 Everything at runtime is pure torch with no data-dependent Python branching: the only Python loop
 is over `C`, which is a static shape. `torch.where` is used freely -- it is a tensor op, not a
@@ -342,9 +342,10 @@ def prism_separation(corners: torch.Tensor, poses: torch.Tensor, pn: torch.Tenso
     are an edge and a face. Negative is the penetration `prism_contacts` returns (`-depth` of the
     deepest prop), and a row with no live prop at the car's height is `+inf`.
 
-    Why a separation and not `depth > 0`: the v2 DAgger masks the imitation loss where the teacher's
-    plan passes within 0.3 m of a prop (the redesign's 6장 2 BC mask; `train_v2.plan_clearance`),
-    and 0.3 m of room is invisible to a test that only says "touching or not".
+    Why a separation and not `depth > 0`: the v2 DAgger measures where the teacher's plan passes
+    within 0.3 m of a prop (`train_v2.plan_clearance`; the redesign's 6장 2 BC mask masked those
+    rows until 2026-10-14 and now only counts them -- the teacher plans round props), and 0.3 m of
+    room is invisible to a test that only says "touching or not".
     """
     B = corners.shape[0]
     dtype, device = corners.dtype, corners.device

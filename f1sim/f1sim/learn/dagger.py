@@ -831,9 +831,10 @@ def main():
                     help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
                          "last five measurements)")
     ap.add_argument("--bc-clearance", type=float, default=None, metavar="M",
-                    help="v2: no imitation loss on a label whose plan passes within M metres of another car or a "
-                         "prop over the tracker's 0.6 s window -- the teacher does not see the cars -- while the "
-                         "auxiliary losses keep the row (default 0.3, the redesign's; 0 = off)")
+                    help="v2: no imitation loss on a label whose plan passes within M metres of another car over "
+                         "the tracker's 0.6 s window -- the teacher does not see the cars -- while the auxiliary "
+                         "losses keep the row (default 0.3, the redesign's; 0 = off). Props do not mask: the "
+                         "teacher plans round them; the share of labels that close to a prop is logged")
     ap.add_argument("--learner-cap-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                     help="v2: each episode the learner's speed cap is drawn uniformly in [LO, HI] m/s and not "
                          "observed, so its speed history stays in distribution at the car's 4 m/s cap "

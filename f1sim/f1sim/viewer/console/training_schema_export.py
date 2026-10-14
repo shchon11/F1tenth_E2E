@@ -136,7 +136,7 @@ LABELS = {
     "aux_balance_every": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
     "aux_balance_rho": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
     "aux_balance_beta": "aux gradient 균형 EMA β (측정당, v2)",
-    "bc_clearance": "v2 BC 여유 마스크 [m] (다른 차·소품과 이보다 가까운 teacher plan은 모방 안 함, 0 = 끔)",
+    "bc_clearance": "v2 BC 여유 마스크 [m] (다른 차와 이보다 가까운 teacher plan은 모방 안 함, 0 = 끔)",
     "learner_cap_range": "v2 학습 차 속도 상한 무작위 범위 [m/s] (에피소드마다, 관측 안 함, 0 0 = 끔)",
     "learner_cap_prob": "v2 속도 상한을 뽑는 학습 차 에피소드 비율 (0.3 = 30%, 1 = 매 에피소드)",
     "opponent_speed_mode": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",

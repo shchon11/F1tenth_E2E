@@ -180,13 +180,22 @@ def linear_spec_of(spec: PlanSpec) -> PlanSpec:
 
 
 # ---------------------------------------------------------------------- the BC clearance mask
-#: [m] the v2 DAgger imitates no label whose plan passes closer than this to another car or a prop
-#: (the redesign's 6장 2 "교사 plan의 여유가 0.3 m 미만인 행은 BC에서 마스크"; decision's ④). The
-#: number is requirement D1's: side by side a body-to-body gap of 0.3 m is what the 0.11 s steer-to-yaw
-#: lag needs to react to a 0.53-0.94 m/s closing car (3장). The teacher is car-blind (the raceline
+#: [m] the v2 DAgger imitates no label whose plan passes closer than this to another car (the
+#: redesign's 6장 2 "교사 plan의 여유가 0.3 m 미만인 행은 BC에서 마스크"; decision's ④). The number is
+#: requirement D1's: side by side a body-to-body gap of 0.3 m is what the 0.11 s steer-to-yaw lag
+#: needs to react to a 0.53-0.94 m/s closing car (3장). The teacher is car-blind (the raceline
 #: teacher, `RacelineTeacher`) or only partly car-aware (the interactive guard), so inside that gap
 #: its plan is not what to imitate -- PPO, which is charged for contacts, has to decide there. The
 #: auxiliary losses keep those rows: where the cars are is exactly what they learn.
+#:
+#: Props do not mask (2026-10-14): the mask exists because the teacher does not see the CARS, and it
+#: does plan round the props -- with `procedural_raceline_corridor` on (the default, the boot camp's)
+#: every prop is laid `procedural_raceline_margin` (0.25 m) beyond the half-width clear of the
+#: raceline it drives, so a plan passing a crate at ~0.25 m is the line by construction, not a miss.
+#: UNIT 5b masked props too: 21 of 1200 valid labels (1.75 %), each a pass the corridor lays out on
+#: purpose, went out of the imitation. With the cars alone the same collection masks 98 / 1200 = 8.2 %
+#: (9.9 % before; seeds 1-10 of it: 14.5 % against 18.3 %). `plan_clearance` still measures the props
+#: and DAgger logs that share (`collect/bc_near_prop_frac`), unmasked.
 BC_CLEARANCE_M = 0.3
 
 
@@ -212,7 +221,9 @@ def rect_separation(ca: torch.Tensor, ha: torch.Tensor, la, wa, cb: torch.Tensor
 @torch.no_grad()
 def plan_clearance(env, action: torch.Tensor, spec: Optional[PlanSpec] = None) -> Dict[str, torch.Tensor]:
     """{"car", "prop", "min"}: (B,) the least clearance [m] of the plan `action` over the tracker's
-    window (`N + 1` samples, 0.6 s) -- to the other cars of the race and to the props.
+    window (`N + 1` samples, 0.6 s) -- to the other cars of the race and to the props. The BC mask
+    reads "car" alone (`BC_CLEARANCE_M`: the teacher plans round the props); "prop" is measured for
+    the record, and "min" is the least of the two.
 
     The plan is the reference the tracker would follow (`mpc._plan_reference`, the learner's own spec
     unless `spec` says otherwise), put in the world from each car's pose. The other cars are where

@@ -8,8 +8,9 @@ the opponents' plan format, and the boot camp's league in the v2 trainers.
 * the clearance: the rectangle and prism SAT separations against known geometry and against the
   simulator's own contact test, and `plan_clearance` on a race -- a plan into a standing car is inside
   0.3 m, the same plan beside it is not, a car parked on a crate is inside its prop;
-* the mask: a row that keeps no clearance carries no imitation loss and every auxiliary one, and a
-  collection reports its masked share and its capped share;
+* the mask: a row that keeps no clearance from another car carries no imitation loss and every
+  auxiliary one; a prop that close masks nothing (the teacher plans round props) and is only counted;
+  a collection reports its masked share, its near-prop share and its capped share;
 * the command lines: v2 runs default to linear opponents in a race, the 3-9 m/s cap and the 0.3 m mask;
   v1 refuses all three; evaluate's "auto" picks linear opponents for a v2 checkpoint only;
 * end to end (slow): v2 PPO races a v1 league seat that its own snapshot takes over, and v2 DAgger
@@ -246,13 +247,49 @@ def test_a_collection_reports_its_masked_and_capped_shares():
     st = buf.stats
     assert st["bc_valid_labels"] > 0 and 0.0 < st["bc_masked_frac"] <= 1.0
     assert st["bc_masked_frac"] == pytest.approx(1.0 - float(buf.data["bcok"][buf.data["valid"]].float().mean()))
-    assert st["bc_masked_car_frac"] > 0 and st["bc_masked_prop_frac"] == 0.0
+    assert st["bc_near_prop_frac"] == 0.0                                 # no props on this track
     assert 0.0 <= st["speed_capped_frac"] <= 1.0
     off = dagger_v2.collect(env, model, dagger_v2.Wp4Labels(env, teacher, "env"), 3, 1.0, torch.device("cpu"),
                             dagger_v2.SequenceBuffer(1), noise=0.0, dial=cm.DialDraw(env, 0.3, 0.3),
                             cspec=cm.CondSpec.from_meta(model.meta["cond"]), b8=False, near=False,
                             beam=False).finalize()
     assert "bcok" not in off.data and math.isnan(off.stats["bc_masked_frac"])
+
+
+def test_the_mask_is_the_other_cars_alone_and_a_close_prop_is_only_counted(monkeypatch):
+    """The teacher does not see the cars, so a label that passes one within the clearance is not
+    imitated; it does plan round the props (the raceline corridor keeps its line 0.25 m clear of every
+    prop), so a label that passes a prop as close is imitated and only counted."""
+    from f1sim.learn import conditioning as cm
+    from f1sim.learn import dagger_v2
+    from f1sim.learn.model_v2 import ActorCriticV2
+    env = _env(envs=4, beams=61)
+    learners = torch.arange(0, env.B, env.M)                            # the rows collect() stores: 0 and 2
+    assert learners.tolist() == [0, 2]
+
+    def clearance(env_, label):
+        inf = torch.full((env_.B,), float("inf"))
+        car, prop = inf.clone(), inf.clone()
+        car[0] = 0.1                                                     # learner 0 plans past a car at 0.1 m
+        prop[2] = 0.1                                                    # learner 1 past a crate at 0.1 m
+        return {"car": car, "prop": prop, "min": torch.minimum(car, prop)}
+
+    monkeypatch.setattr(dagger_v2, "plan_clearance", clearance)
+    teacher = common.make_teacher([_track()[1]], env)
+    torch.manual_seed(0)
+    model = ActorCriticV2(n_beams=61, obs=dict(vars(common.obs_spec(env))))
+    buf = dagger_v2.collect(env, model, dagger_v2.Wp4Labels(env, teacher, "env"), 4, 1.0, torch.device("cpu"),
+                            dagger_v2.SequenceBuffer(1), noise=0.0, dial=cm.DialDraw(env, 0.3, 0.3),
+                            cspec=cm.CondSpec.from_meta(model.meta["cond"]), b8=False, near=False, beam=False,
+                            bc_clearance=0.3).finalize()
+    ok, valid = buf.data["bcok"], buf.data["valid"]
+    assert not bool(ok[:, 0].any()) and bool(ok[:, 1].all())            # the car masks, the crate does not
+    n = float(valid.sum())
+    assert n > 0
+    st = buf.stats
+    assert st["bc_masked_frac"] == pytest.approx(float(valid[:, 0].sum()) / n)
+    assert st["bc_near_prop_frac"] == pytest.approx(float(valid[:, 1].sum()) / n)
+    assert "bc_masked_car_frac" not in st and "bc_masked_prop_frac" not in st
 
 
 # ===================================================================== held-out auxiliary metrics
@@ -417,6 +454,7 @@ def test_v2_dagger_logs_the_masked_and_capped_shares_of_its_collection(tmp_path,
                                          "--aux-b8", "0", "--log-every", "1"], tmp_path, monkeypatch)
         rec = [json.loads(x) for x in open(tmp_path / "dm" / "progress.jsonl")][-1]
         assert 0.0 <= rec["collect/bc_masked_frac"] <= 1.0 and rec["collect/bc_valid_labels"] > 0
+        assert 0.0 <= rec["collect/bc_near_prop_frac"] <= 1.0
         assert 0.0 <= rec["collect/speed_capped_frac"] <= 1.0
         _m, extra = load_checkpoint(str(tmp_path / "dm" / "student_latest.pt"))
         assert extra["race"] == {"bc_clearance_m": 0.3, "learner_cap_range": [3.0, 9.0], "learner_cap_prob": 0.3,

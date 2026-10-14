@@ -43,11 +43,13 @@ touches it; the per-dimension initial values of B6 reach PPO as they were built)
 The race it is collected in (UNIT 5b, 2026-10-14):
 
 * **The BC clearance mask** (the redesign's 6장 2): a row whose label plans to pass within
-  `--bc-clearance` (0.3 m, `train_v2.BC_CLEARANCE_M`) of another car or a prop over the tracker's
-  window (`train_v2.plan_clearance`) carries no imitation loss -- the teacher does not see the cars,
-  so there its plan is not the thing to copy -- and keeps every auxiliary loss. The masked share of
-  the valid labels is measured on every collection and logged (`collect/bc_masked_frac`, with the
-  car and prop parts).
+  `--bc-clearance` (0.3 m, `train_v2.BC_CLEARANCE_M`) of another car over the tracker's window
+  (`train_v2.plan_clearance`) carries no imitation loss -- the teacher does not see the cars, so
+  there its plan is not the thing to copy -- and keeps every auxiliary loss. Props do not mask: the
+  teacher plans round them (the raceline corridor keeps its line 0.25 m clear of every prop), so a
+  close pass there is the label to copy. The masked share of the valid labels is measured on every
+  collection and logged (`collect/bc_masked_frac`), and beside it the share whose plan passes as
+  close to a prop (`collect/bc_near_prop_frac`, imitated).
 * **The learner's random speed cap** (`--learner-cap-range`, default 3-9 m/s, `EnvConfig.
   learner_cap_range`): drawn per episode on `--learner-cap-prob` (0.3) of the episodes, not observed
   by the actor. Labels are imitated in the decoded space without the cap (`bc_loss_wp4`), so the
@@ -328,14 +330,16 @@ class SequenceBuffer:
     dial column `c` the student was given, and -- when their heads train -- the B8 tracks (`select_tracks`:
     labels, candidates, AGE: knowability is decided per sampled window), the nearest-visible-car
     target and the per-beam car labels; and with the clearance mask on, `bcok`: whether the label's
-    plan keeps its clearance (`train_v2.plan_clearance`), i.e. whether it is imitated at all."""
+    plan keeps its clearance from the other cars (`train_v2.plan_clearance`), i.e. whether it is
+    imitated at all."""
 
     KEYS = ("scan", "ego", "label", "valid", "newep", "c", "b8_lab", "b8_cand", "b8_age", "near", "beam", "bcok")
 
     def __init__(self, n_frames: int, frame_stride: int = 1):
         self.k, self.stride = int(n_frames), int(frame_stride)
         self.lists = {k: [] for k in self.KEYS}
-        #: what the collection measured on its way (`collect`): the masked label share, the capped steps
+        #: what the collection measured on its way (`collect`): the masked label share, the near-prop
+        #: label share, the capped steps
         self.stats: dict = {}
 
     def add(self, **row):
@@ -416,9 +420,11 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
     drives for that same number.
 
     `bc_clearance` > 0: every label's plan is measured against the other cars and the props
-    (`train_v2.plan_clearance`) and a row that comes closer than that is stored with `bcok` False --
-    imitated by none of the BC loss, all of the auxiliary ones. What the collection saw is left on
-    the buffer as `buf.stats`: the masked share of the valid labels (cars, props, either) and the share
+    (`train_v2.plan_clearance`), and a row whose plan comes closer than that to another car is stored
+    with `bcok` False -- imitated by none of the BC loss, all of the auxiliary ones. A prop that close
+    masks nothing (the teacher plans round props, `train_v2.BC_CLEARANCE_M`); its share is counted.
+    What the collection saw is left on the buffer as `buf.stats`: the masked share of the valid labels
+    (another car within the clearance), the share passing a prop as close (not masked), and the share
     of steps whose executed plan the learner's cap clipped (`info["speed_capped"]`)."""
     obs, _info = env.reset()
     # the primary learner of each race, as v1's DAgger stores: the other seats' trajectories are
@@ -427,7 +433,7 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
     new_ep = torch.ones(env.B, dtype=torch.bool, device=env.device)
     h = model.actor.initial_hidden(env.B, device=device)
     z = lambda: torch.zeros((), dtype=torch.float64, device=env.device)
-    tally = {"valid": z(), "masked": z(), "masked_car": z(), "masked_prop": z(), "capped": z(), "steps": z()}
+    tally = {"valid": z(), "masked": z(), "near_prop": z(), "capped": z(), "steps": z()}
     with torch.no_grad():
         for _t in range(steps):
             scan, ego = obs["scan"], obs["ego"]
@@ -442,13 +448,12 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
                    "newep": new_ep[ids], "c": c[ids]}
             if bc_clearance > 0:
                 cl = plan_clearance(env, label)
-                ok = cl["min"] >= bc_clearance
+                ok = cl["car"] >= bc_clearance                  # the cars alone: the teacher sees the props
                 row["bcok"] = ok[ids]
                 v_ = valid[ids].to(env.device)
                 tally["valid"] += v_.sum()
                 tally["masked"] += (v_ & ~ok[ids]).sum()
-                tally["masked_car"] += (v_ & (cl["car"][ids] < bc_clearance)).sum()
-                tally["masked_prop"] += (v_ & (cl["prop"][ids] < bc_clearance)).sum()
+                tally["near_prop"] += (v_ & (cl["prop"][ids] < bc_clearance)).sum()
             if b8:
                 tr = env.opponent_tracks_v2()
                 lab3, cand3, age3 = select_tracks(tr["lab"], tr["cand"], tr["age"], tr["dist"])
@@ -475,8 +480,7 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
     frac = lambda a, b: a / b if b > 0 else float("nan")
     buf.stats = {"bc_clearance_m": float(bc_clearance), "bc_valid_labels": n["valid"],
                  "bc_masked_frac": frac(n["masked"], n["valid"]),
-                 "bc_masked_car_frac": frac(n["masked_car"], n["valid"]),
-                 "bc_masked_prop_frac": frac(n["masked_prop"], n["valid"]),
+                 "bc_near_prop_frac": frac(n["near_prop"], n["valid"]),
                  "speed_capped_frac": frac(n["capped"], n["steps"])}
     return buf
 
@@ -526,7 +530,7 @@ def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs
     v_meas = flat(s["ego"])[:, 0] * v_max                    # speed@t: the speed the plan is laid out from
     valid = flat(s["valid"]).float()
     if "bcok" in s:
-        # the clearance mask: a label planned within --bc-clearance of a car or a prop is not imitated
+        # the clearance mask: a label planned within --bc-clearance of another car is not imitated
         # (`collect`); the auxiliary losses below see every row
         valid = valid * flat(s["bcok"]).float()
     bc, parts = bc_loss_wp4(out["mu"].reshape(T * m, -1), flat(s["label"]), v_meas, plan_spec, v_max, weight=valid)
@@ -818,8 +822,8 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                   f"{fmt('beam_recall')} | B8 |dy| p50 <3 m {fmt('b8_dy_p50_3m')} m", flush=True)
         st_ = buf.stats
         print(f"  collection: BC-masked {100 * st_.get('bc_masked_frac', float('nan')):.2f} % of "
-              f"{st_.get('bc_valid_labels', 0):.0f} valid labels (car {100 * st_.get('bc_masked_car_frac', float('nan')):.2f} %, "
-              f"prop {100 * st_.get('bc_masked_prop_frac', float('nan')):.2f} %) | speed-capped "
+              f"{st_.get('bc_valid_labels', 0):.0f} valid labels (another car within {a.bc_clearance:g} m; a prop "
+              f"that close, imitated: {100 * st_.get('bc_near_prop_frac', float('nan')):.2f} %) | speed-capped "
               f"{100 * st_.get('speed_capped_frac', float('nan')):.1f} % of learner steps", flush=True)
         print(f"iter {it}: beta {beta:.2f} samples {n_samples} loss {loss:.4f} | {stud} | teacher "
               f"{teacher_metrics['collisions_per_km']:.1f} coll/km lap {teacher_metrics['lap_time_s']:.1f} s | "

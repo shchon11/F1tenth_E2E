@@ -6548,7 +6548,7 @@
             "--bc-clearance"
           ],
           "dest": "bc_clearance",
-          "label": "v2 BC 여유 마스크 [m] (다른 차·소품과 이보다 가까운 teacher plan은 모방 안 함, 0 = 끔)",
+          "label": "v2 BC 여유 마스크 [m] (다른 차와 이보다 가까운 teacher plan은 모방 안 함, 0 = 끔)",
           "kind": "float",
           "item_kind": "float",
           "default": null,
@@ -6556,7 +6556,7 @@
           "choices": null,
           "required": false,
           "group": "학습",
-          "help": "v2: no imitation loss on a label whose plan passes within M metres of another car or a prop over the tracker's 0.6 s window -- the teacher does not see the cars -- while the auxiliary losses keep the row (default 0.3, the redesign's; 0 = off)",
+          "help": "v2: no imitation loss on a label whose plan passes within M metres of another car over the tracker's 0.6 s window -- the teacher does not see the cars -- while the auxiliary losses keep the row (default 0.3, the redesign's; 0 = off). Props do not mask: the teacher plans round them; the share of labels that close to a prop is logged",
           "action": "store",
           "nullable": true,
           "metavar": "M"
