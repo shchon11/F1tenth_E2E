@@ -109,11 +109,16 @@ def _check_contract(path: str, extra: Optional[dict], env) -> None:
     the speed command or tracker weights do not change the width at all. The env decodes and tracks
     every car's plan with its own one contract, so an entry trained under another would drive with
     its speed dimensions read as something they never meant.
+
+    The speed mode an entry is held to is the one the env reads the league's rows in:
+    `EnvConfig.opponent_speed_mode` when set (a wp4 learner racing the linear league reads those rows
+    as linear, `PlanTracker.row_format`), else the env's own.
     """
     from ..mpc import contract_of
     e = env.ecfg
     have = contract_of(extra)
-    want = {"speed_mode": str(e.speed_mode), "speed_command": str(e.speed_command)}
+    mode = getattr(e, "opponent_speed_mode", None) or e.speed_mode
+    want = {"speed_mode": str(mode), "speed_command": str(e.speed_command)}
     for k in ("tracker_speed_weight", "tracker_a_max"):
         if getattr(e, k, None) is not None:
             want[k] = float(getattr(e, k))

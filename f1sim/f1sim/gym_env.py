@@ -404,6 +404,16 @@ class EnvConfig:
     action_mode: str = "direct"      # "direct": (steer, speed); "plan": short local trajectory tracked by an MPC (f1sim.mpc)
     speed_mode: str = "linear"       # plan only, `mpc.SPEED_MODES`: what the plan's speed dimensions mean. "linear" is
                                      # every existing checkpoint's; "envelope" / "knots" are opt-in experiments
+    #: Plan only: the format the cars this env's learner does NOT drive plan in -- teacher-driven seats
+    #: (the raceline teacher and every OpponentPlanner kind) and league checkpoints -- when it is not
+    #: `speed_mode` (output-format design 6, migration step 6). None: every car plans in `speed_mode`,
+    #: as in every env before 2026-10-14. "linear" beside speed_mode "wp4" is the migration's race: the
+    #: scripted cars keep the plan they were built for and the league keeps the format it was trained
+    #: in, the learner's rows (and the labels a teacher writes for them) are wp4, and one tracker reads
+    #: each row in its own format with one iLQR solve (`PlanTracker.row_format`). Without it the wp4
+    #: label gates raced wp4 opponents, so a wp4-against-linear comparison was one world against
+    #: another rather than one label against another (docs/research/wp4-label-gates-2026-10-14/).
+    opponent_speed_mode: Optional[str] = None
     plan_a_brake: float = 4.0        # [m/s^2] "envelope" only: braking its backward pass plans with (match the teacher's)
     #: What a curvature knot of +-1 means (`mpc.PlanSpec.kappa_mode`): "absolute" is +-1.6 1/m at any
     #: speed, "feasible" is the tightest arc the tyres can hold at the speed the plan starts from.
@@ -983,6 +993,27 @@ class F1VecEnv:
             self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
                                        e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
+        #: The spec the cars the learner does not drive plan in (`EnvConfig.opponent_speed_mode`): the
+        #: tracker's own, the very object, unless that names another format -- then the tracker's with
+        #: that speed mode, and the tracker reads every row in its own (`_sync_row_formats`).
+        self.opp_plan_spec = None if self.tracker is None else self.tracker.spec
+        self._row_codes = None
+        if e.opponent_speed_mode is not None and e.opponent_speed_mode != e.speed_mode:
+            from .mpc import ROW_FORMATS
+            if self.tracker is None:
+                raise ValueError("opponent_speed_mode is a plan format: it needs action_mode 'plan'")
+            if e.speed_mode not in ROW_FORMATS or e.opponent_speed_mode not in ROW_FORMATS:
+                raise ValueError(f"one tracker reads the plan formats {ROW_FORMATS} side by side; speed_mode "
+                                 f"{e.speed_mode!r} with opponent_speed_mode {e.opponent_speed_mode!r} is not a pair of them")
+            import dataclasses as _dc
+            self.opp_plan_spec = _dc.replace(self.tracker.spec, speed_mode=e.opponent_speed_mode)
+            #: (code of the learner's format, code of the others'), as 0-d tensors so the per-step
+            #: selection in `_sync_row_formats` allocates and synchronises nothing
+            self._row_codes = tuple(torch.tensor(ROW_FORMATS.index(m), dtype=torch.uint8, device=self.device)
+                                    for m in (e.speed_mode, e.opponent_speed_mode))
+            self.tracker.set_row_formats(torch.full((self.B,), ROW_FORMATS.index(e.speed_mode),
+                                                    dtype=torch.uint8, device=self.device))
+            self._sync_row_formats()
         self.speed_cap = torch.full((self.B,), float(self.ecfg.speed_cap), device=self.device)
         # Self-play with identical cars produces almost no passing: the front car is exactly as fast
         # as the one behind, so races settle into a constant-gap procession and the overtake and
@@ -1892,6 +1923,12 @@ class F1VecEnv:
             self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
         else:
             self.prev_action[ids, self.plan_layout.speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
+            if self._row_codes is not None:
+                # A car that plans in the opponents' format starts from "hold this speed" in THAT
+                # format: a league checkpoint reads its own previous action back as an observation
+                held = torch.zeros_like(self.prev_action[ids])
+                held[:, _plan_layout(self.opp_plan_spec).speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
+                self.prev_action[ids] = torch.where(self._opp_format_rows()[ids][:, None], held, self.prev_action[ids])
             self.tracker.reset(ids); self._calibrate_tracker(ids)
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
         if self.events is not None:
@@ -2126,8 +2163,9 @@ class F1VecEnv:
         """
         if rows is not None:
             cut = lambda t: t if t is None or not torch.is_tensor(t) or t.dim() == 0 else t[rows]
-            spec, v_max = self.tracker.spec, self.ecfg.v_max_policy
-            sp = self.plan_layout.speed
+            # the opponents' format, which is the tracker's own unless `opponent_speed_mode` says otherwise
+            spec, v_max = self.opp_plan_spec, self.ecfg.v_max_policy
+            sp = _plan_layout(spec).speed
             an = teacher.plan_rows(rows, self.sim.state, self.sim.P, self.sim.tid, v_max, spec,
                                    offset=ev_off, plan_speed=self._tracker_plan_speed())
             an = an.clone(); an[:, sp] = ((an[:, sp] + 1) * cut(self.opp_scale)[:, None] - 1).clamp(-1, 1)
@@ -2146,8 +2184,8 @@ class F1VecEnv:
             v = v if ev_speed is None else v * ev_speed
             v = torch.where(follow, torch.minimum(v, v_cap), v)
             return self.teacher_action_to_normalized(torch.stack([cmd[:, 0], v], 1))
-        an = self.teacher_label(teacher, offset=ev_off)
-        sp = self.plan_layout.speed
+        an = self.teacher_label(teacher, offset=ev_off, spec=self.opp_plan_spec)
+        sp = _plan_layout(self.opp_plan_spec).speed
         an = an.clone(); an[:, sp] = ((an[:, sp] + 1) * self.opp_scale[:, None] - 1).clamp(-1, 1)   # speed scale
         if ev_speed is not None:                             # same scaling in the normalized plan speeds
             an[:, sp] = (ev_speed[:, None] * (an[:, sp] + 1) - 1).clamp(-1, 1)
@@ -2159,7 +2197,7 @@ class F1VecEnv:
         projector = getattr(getattr(teacher, 'base', teacher), 'project_plan_action', None)
         if projector is not None:
             an = projector(an, self.sim.state, self.sim.P, self.ecfg.v_max_policy,
-                           self.tracker.spec, plan_speed=self._tracker_plan_speed())
+                           self.opp_plan_spec, plan_speed=self._tracker_plan_speed())
         return an
 
     def _opponent_obs(self):
@@ -2303,6 +2341,7 @@ class F1VecEnv:
             # Before the solve, because `last_pred` comes back in the body frame of exactly this
             # pose and `car_future` has to put it back in the world.
             self._plan_pose = self.sim.state[:, :3].clone()
+            self._sync_row_formats()
             raw = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
@@ -3426,8 +3465,26 @@ class F1VecEnv:
         """Which columns of this env's plans are path and which speed: `mpc.plan_layout` of the spec
         its tracker decodes with. Read by every place that scales or sets a plan's speed -- "linear"
         and "wp4" are both 8 wide, so a positional slice would scale the wrong numbers without any
-        shape complaining. Plan mode only."""
+        shape complaining. Plan mode only. The learner's plans; the opponents' are `opp_plan_spec`'s
+        (`EnvConfig.opponent_speed_mode`)."""
         return _plan_layout(self.tracker.spec)
+
+    def _opp_format_rows(self) -> torch.Tensor:
+        """(B,) the cars that plan in `opp_plan_spec`'s format: driven by a teacher or by a league
+        checkpoint. A `self` pool entry is the learner's own weights, so its car plans like the learner."""
+        return self.teacher_driven | self.pool_driven
+
+    def _sync_row_formats(self) -> None:
+        """Point each row of the tracker at its car's plan format (`EnvConfig.opponent_speed_mode`).
+
+        From the driver masks at every step rather than kept in step with them: "mixed", "pool" and
+        the league slots redraw those masks at race resets, and the rollout teacher's shadow env has
+        them copied in wholesale. In place, so a captured solver graph follows it. Nothing at all
+        when every car plans in one format."""
+        if self._row_codes is None:
+            return
+        ego, opp = self._row_codes
+        self.tracker.row_format.copy_(torch.where(self._opp_format_rows(), opp, ego))
 
     def _tracker_plan_speed(self) -> torch.Tensor:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""
@@ -3439,16 +3496,20 @@ class F1VecEnv:
         self.grip_budget = None if mu is None else mu.to(self.device).reshape(-1)
 
     def teacher_label(self, teacher, offset: Optional[torch.Tensor] = None,
-                      mu: Optional[torch.Tensor] = None) -> torch.Tensor:
+                      mu: Optional[torch.Tensor] = None, spec=None) -> torch.Tensor:
         """The teacher's action in this env's action space: (steer, speed) or its local plan.
 
         mu: (B,) friction the teacher should *drive for* instead of the env's own -- the label of a
         dial-conditioned student, whose input says how much grip to use rather than how much there
-        is. Everything else the teacher is privileged to (latency, calibration) stays the truth."""
+        is. Everything else the teacher is privileged to (latency, calibration) stays the truth.
+
+        spec: the plan format to write it in -- the tracker's own (the learner's) by default; the
+        opponents' commands pass `opp_plan_spec`."""
         P = self.sim.P if mu is None else {**self.sim.P, "mu": mu.to(self.sim.P["mu"].dtype)}
         if self.act_dim == 2:
             kwargs = {} if offset is None else {"offset": offset}
             return self.teacher_action_to_normalized(teacher(self.sim.state, P, self.sim.tid, **kwargs))
+        spec = self.tracker.spec if spec is None else spec
         from .teacher import RacelineTeacher
         if isinstance(teacher, RacelineTeacher):
             # A global raceline alone does not certify what this tracker will
@@ -3462,11 +3523,11 @@ class F1VecEnv:
             if guard is None:
                 guard = guards[teacher] = InteractiveTeacher(teacher, self, offsets=(0.0,), cand_iters=6, lane_clamp=True)
             action = guard.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
-                                       self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
+                                       spec, offset=offset, plan_speed=self._tracker_plan_speed())
             teacher.last_label_valid = guard.last_label_valid
             return action
         return teacher.plan_action(self.sim.state, P, self.sim.tid, self.ecfg.v_max_policy,
-                                   self.tracker.spec, offset=offset, plan_speed=self._tracker_plan_speed())
+                                   spec, offset=offset, plan_speed=self._tracker_plan_speed())
 
     def set_ideal_lap(self, racelines) -> None:
         """Fastest plausible time per track and per sector, from the raceline speed profile: sum(ds / v).

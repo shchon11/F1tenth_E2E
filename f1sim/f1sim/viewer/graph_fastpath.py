@@ -468,7 +468,10 @@ class SimGraphFastPath:
         consts = self._consts
 
         def solve_bound(*args):
-            return _mpc.solve(*args, consts=consts)
+            # `consts` in its own place: a tracker with per-row plan formats hands `solve` its codes
+            # positionally after the four optional slots (`PlanTracker.__call__`), so a keyword here
+            # would collide with the `None` it passes there
+            return _mpc.solve(*args[:11], consts, *args[12:])
 
         self.mpc = GraphedCallable(solve_bound, example_args, name="mpc.solve")
         self._log("plan 솔버 그래프 캡처")
@@ -810,6 +813,8 @@ class _TeacherCapture:
             # guard that raises is a capture that fails for a reason nobody reads.
             "tracker": lambda: (id(getattr(env, "tracker", None)), type(getattr(env, "tracker", None)).__name__),
             "tracker.spec": lambda: getattr(getattr(env, "tracker", None), "spec", None),
+            # the format the opponents' commands are written in (`EnvConfig.opponent_speed_mode`)
+            "env.opp_plan_spec": lambda: getattr(env, "opp_plan_spec", None),
             "tracker.hooks": lambda: tuple(id(getattr(getattr(env, "tracker", None), h, None))
                                            for h in ("_input_hook", "_plan_hook", "_command_hook")),
             "tracker._solver": lambda: id(getattr(getattr(env, "tracker", None), "_solver", None)),

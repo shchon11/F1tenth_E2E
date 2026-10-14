@@ -19,7 +19,7 @@ knots over 1.5 s -- is the speed mode's (`SPEED_MODES`), and which column is whi
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import torch
@@ -85,6 +85,11 @@ WP_K = 4                          # wp4: waypoints over the plan. K = 6 laps wit
 #: [f1sim_interfaces/Plan] The plan on the wire between policy_node and controller_node is a fixed
 #: float32[8] -- whatever the speed mode, which is why the width can never say what a plan means.
 PLAN_WIRE_DIM = 8
+#: The plan formats one tracker reads side by side, a format per row (`PlanTracker.row_format`), in
+#: the order of their codes: a row flagged 0 is read as "linear", 1 as "wp4" -- the numbering the
+#: design gives Plan.msg's `format` field (output-format design 6). Both are 8 wide, which is why the
+#: code has to travel with the plan rather than be inferred from it.
+ROW_FORMATS = ("linear", "wp4")
 
 
 @dataclass(frozen=True)
@@ -976,9 +981,41 @@ def ilqr(z0: torch.Tensor, ref: torch.Tensor, u_warm: torch.Tensor, spec: PlanSp
 
 def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSpec, wb: float, s_max: float, v_max: float,
           consts=None, v_limit: Optional[torch.Tensor] = None, bounds: Optional[torch.Tensor] = None,
-          a_walk: Optional[torch.Tensor] = None):
+          a_walk: Optional[torch.Tensor] = None, row_format: Optional[torch.Tensor] = None):
     """Whole tracker step as one function (compiled into a single CUDA graph on the GPU): decode the plan,
-    build the reference, predict over the latency, run the iLQR. Returns (u (B,N,2), z (B,N+1,6), ref)."""
+    build the reference, predict over the latency, run the iLQR. Returns (u (B,N,2), z (B,N+1,6), ref).
+
+    `row_format` (B,) integer codes into `ROW_FORMATS`: each row's plan is read in its own format
+    instead of `spec.speed_mode` (`PlanTracker.row_format`). The reference of every format is built
+    for every row and each row takes its own, so the iLQR -- the bulk of the work, and format-blind:
+    one cost, one horizon, one set of bounds -- runs once. Output-format design 6 measured that at
+    +4-14 % over one format, against 2x for solving twice. A row's reference is then the one its
+    format alone builds, and every row's u / z / ref is the single-format solve's, bit for bit
+    (`tests/test_row_formats.py`)."""
+    if row_format is None:
+        ref = _plan_reference(action, v_meas, speed_cap, delay, u_prev, spec, v_max, v_limit, a_walk)
+    else:
+        # `replace` at trace time, so a compiled solve keeps one graph; the arms' grids (v_limit, local
+        # walk budgets) are refused by the wp4 reference exactly as on a wp4-only tracker
+        refs = [_plan_reference(action, v_meas, speed_cap, delay, u_prev, replace(spec, speed_mode=mode), v_max,
+                                v_limit, a_walk) for mode in ROW_FORMATS]
+        ref = refs[0]
+        for code in range(1, len(ROW_FORMATS)):            # Python constants: unrolls, graph-safe
+            ref = torch.where((row_format == code)[:, None, None], refs[code], ref)
+    v = v_meas.abs()
+    Le = wb + spec.k_us * v * v
+    steer_now = torch.atan(yaw_rate * Le / v.clamp_min(0.5)).clamp(-s_max, s_max)
+    psi0 = yaw_rate * delay
+    z0 = torch.stack([v * delay, 0.5 * v * psi0 * delay, psi0, (v + u_prev[:, 1] * delay).clamp_min(0.0),
+                      torch.where(v > 0.5, steer_now, u_prev[:, 0]), u_prev[:, 1]], 1)
+    u, z = ilqr(z0, ref, warm, spec, wb, s_max, v_max, consts, bounds=bounds)
+    return u, z, ref
+
+
+def _plan_reference(action, v_meas, speed_cap, delay, u_prev, spec: PlanSpec, v_max: float,
+                    v_limit: Optional[torch.Tensor], a_walk: Optional[torch.Tensor]) -> torch.Tensor:
+    """`solve`'s first half for one format: the tracker reference (B, N+1, 4) of `action` read in
+    `spec.speed_mode`."""
     if spec.speed_mode == "linear":
         k, Lp, v0, v1 = decode(action, v_meas, v_max, speed_cap, spec)
         ref = reference(k, Lp, v0, v1, spec, v_meas, v_limit=v_limit, a_walk=a_walk)
@@ -1004,14 +1041,7 @@ def solve(action, v_meas, speed_cap, yaw_rate, delay, u_prev, warm, spec: PlanSp
             prof = torch.minimum(prof, v_limit)
         ref = reference(k, Lp, speed_cap, speed_cap, spec, v_meas if v_start is None else v_start,
                         v_limit=prof, a_walk=a_walk)
-    v = v_meas.abs()
-    Le = wb + spec.k_us * v * v
-    steer_now = torch.atan(yaw_rate * Le / v.clamp_min(0.5)).clamp(-s_max, s_max)
-    psi0 = yaw_rate * delay
-    z0 = torch.stack([v * delay, 0.5 * v * psi0 * delay, psi0, (v + u_prev[:, 1] * delay).clamp_min(0.0),
-                      torch.where(v > 0.5, steer_now, u_prev[:, 0]), u_prev[:, 1]], 1)
-    u, z = ilqr(z0, ref, warm, spec, wb, s_max, v_max, consts, bounds=bounds)
-    return u, z, ref
+    return ref
 
 
 _solve_compiled = {}
@@ -1069,6 +1099,30 @@ class PlanTracker:
         #: soft collision; left False, `reverse_cmd_gate` can never fire and the tracker is the one
         #: it has always been.
         self.contact = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: Per-row plan format (output-format design 6): None -- every row's plan is read in
+        #: `spec.speed_mode`, as by every tracker before 2026-10-14 -- or (B,) uint8 codes into
+        #: `ROW_FORMATS` (`set_row_formats`), each row read in its own format by one solve. A race in
+        #: which the ego plans wp4 while the scripted cars and the league checkpoints keep the linear
+        #: plan they were built and trained in is then one tracker, not two.
+        self.row_format: Optional[torch.Tensor] = None
+
+    def set_row_formats(self, codes: Optional[torch.Tensor]) -> None:
+        """From the next call on, read row i's plan in `ROW_FORMATS[codes[i]]` -- or, with None, every
+        row in `spec.speed_mode` again.
+
+        Written in place once the tensor exists: a captured solver graph reads it at its address, as
+        it does every per-row input, so a rebound tensor would leave the graph on the old codes."""
+        if codes is None:
+            self.row_format = None
+            return
+        if self.spec.speed_mode not in ROW_FORMATS:
+            # `spec` is still what the callers plan the tracker's own rows with (`F1VecEnv.teacher_label`);
+            # a mode no row can be read in would make that a plan nothing decodes
+            raise ValueError(f"per-row plan formats are {ROW_FORMATS}; this tracker's own format is "
+                             f"{self.spec.speed_mode!r}")
+        if self.row_format is None:
+            self.row_format = torch.zeros(self.B, dtype=torch.uint8, device=self.device)
+        self.row_format.copy_(codes)
 
     def ilqr_consts(self, spec: PlanSpec):
         """`build_ilqr_consts` for `spec` on this tracker's device, built once and kept here.
@@ -1101,6 +1155,11 @@ class PlanTracker:
         optional), delay: calibrated command latency [s] (float or (B,), default spec.delay)
         -> (steer [rad], speed cmd [m/s]) (B,2)"""
         sp = self.spec
+        if self.row_format is not None and (self._input_hook is not None or self._plan_hook is not None
+                                            or self._command_hook is not None):
+            # the runtime arms (grip, clearance) decode the plan as linear; a wp4 row would be misread
+            raise ValueError("per-row plan formats run on the plain tracker: the runtime arms read one plan "
+                             "format until they are ported (output-format design 6, unit 8)")
         if self._input_hook is not None:
             action, v_meas, speed_cap, yaw_rate, delay = self._input_hook(action, v_meas, speed_cap, yaw_rate, delay)
         if self._plan_hook is not None:
@@ -1116,7 +1175,14 @@ class PlanTracker:
             delay = torch.full_like(v, float(delay))
         warm = torch.cat([self.u_seq[:, 1:], self.u_seq[:, -1:]], 1)
         solver = self._solver or (solve_fast if self.compile_solver else solve)
-        u, z, ref = solver(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
+        if self.row_format is None:
+            u, z, ref = solver(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max, self.v_max)
+        else:
+            # The codes ride positionally, as a tensor argument like every per-row input: a solver
+            # recorder (`learn.graph_runtime`) and a captured graph of `solve` take the tracker's
+            # arguments as *args, and the graph copies its tensor arguments in at every replay.
+            u, z, ref = solver(action, v_meas, speed_cap, yaw_rate, delay, self.u_prev, warm, sp, self.wb, self.s_max,
+                               self.v_max, None, None, None, None, self.row_format)
         u, z, ref = u.clone(), z.clone(), ref.clone()             # CUDA-graph outputs are reused by the next run
         self.u_seq = u; self.u_prev = u[:, 0].clone(); self.last_ref = ref; self.last_pred = z[:, :, :4]
         if self._command_hook is not None:
