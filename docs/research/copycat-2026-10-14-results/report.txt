@@ -1,0 +1,72 @@
+teacher ICCAS solo: 127/128 completions, 0.168 coll/km over 5.97 km -> T = 3 x = 0.503 coll/km
+
+== baseline (v2cc_base): FAIL {'a_nondecreasing': False, 'b_it2_ge_103': False, 'c_it2_cpk_le_T': False}
+  it0: ICCAS   4/128   65.758 coll/km (124 over 1.89 km)  speed 3.64 m/s  lap 10.643750000000084
+  it1: ICCAS   0/128  144.471 coll/km (128 over 0.89 km)  speed 4.05 m/s  lap None
+  it2: ICCAS   0/128   41.242 coll/km (90 over 2.18 km)  speed 1.81 m/s  lap None
+  race it0 beta 1.00: student 123.50870789573187 coll/km prog 2.943910426646471 | teacher 5.49 | bc_lat 0.0840 bc_speed 1.0491 | dropped None | masked 0.129 capped 0.331 | collect 240 train 10 eval 72 teacher-eval 85 s
+  race it1 beta 0.60: student None coll/km prog None | teacher 5.49 | bc_lat 0.0679 bc_speed 0.4930 | dropped None | masked 0.109 capped 0.372 | collect 110 train 14 eval 0 teacher-eval 0 s
+  race it2 beta 0.30: student 104.95787211231854 coll/km prog 2.0922719091176987 | teacher 5.49 | bc_lat 0.0711 bc_speed 0.4536 | dropped None | masked 0.116 capped 0.363 | collect 117 train 21 eval 76 teacher-eval 0 s
+  collect it0: 240 s, labels 0.0568 s/step, env.step 0.925 s/step
+  collect it1: 110 s, labels 0.0592 s/step, env.step 0.378 s/step
+  collect it2: 117 s, labels 0.0626 s/step, env.step 0.406 s/step
+  held-out teacher_drives       it0: speed MAE 0.797 m/s (bias +0.025), lateral MAE 0.121 m, car rows speed MAE 0.940807543694973
+  held-out teacher_drives       it1: speed MAE 0.478 m/s (bias +0.154), lateral MAE 0.100 m, car rows speed MAE 0.5376270785927773
+  held-out teacher_drives       it2: speed MAE 0.383 m/s (bias -0.041), lateral MAE 0.088 m, car rows speed MAE 0.423456322401762
+  held-out last_student_drives  it0: speed MAE 1.254 m/s (bias -0.063), lateral MAE 0.173 m, car rows speed MAE 1.2030537873506546
+  held-out last_student_drives  it1: speed MAE 1.656 m/s (bias -0.973), lateral MAE 0.165 m, car rows speed MAE 1.552053153514862
+  held-out last_student_drives  it2: speed MAE 1.864 m/s (bias -1.341), lateral MAE 0.172 m, car rows speed MAE 1.742850348353386
+  probe last_student_drives  it0: action-speed gain 0.300, measured-speed gain 0.006, recorded speed MAE 1.254 (zero actions 1.473, teacher history 0.946)
+  probe last_student_drives  it1: action-speed gain 0.776, measured-speed gain -0.004, recorded speed MAE 1.656 (zero actions 2.100, teacher history 0.464)
+  probe last_student_drives  it2: action-speed gain 0.823, measured-speed gain -0.011, recorded speed MAE 1.864 (zero actions 1.911, teacher history 0.337)
+  probe teacher_drives       it0: action-speed gain 0.495, measured-speed gain 0.017, recorded speed MAE 0.797 (zero actions 1.089, teacher history 0.797)
+  probe teacher_drives       it1: action-speed gain 0.893, measured-speed gain -0.000, recorded speed MAE 0.478 (zero actions 1.617, teacher history 0.478)
+  probe teacher_drives       it2: action-speed gain 0.915, measured-speed gain -0.018, recorded speed MAE 0.383 (zero actions 1.601, teacher history 0.383)
+
+== A (v2cc_A): FAIL {'a_nondecreasing': True, 'b_it2_ge_103': False, 'c_it2_cpk_le_T': False}
+  it0: ICCAS   1/128   70.774 coll/km (127 over 1.79 km)  speed 4.10 m/s  lap 10.600000000000083
+  it1: ICCAS   3/128   59.778 coll/km (125 over 2.09 km)  speed 4.50 m/s  lap 9.391666666666731
+  it2: ICCAS   9/128   51.910 coll/km (119 over 2.29 km)  speed 4.17 m/s  lap 9.583333333333401
+  race it0 beta 1.00: student 104.52335281240572 coll/km prog 3.3659587427973747 | teacher 5.49 | bc_lat 0.0940 bc_speed 1.1038 | dropped None | masked 0.129 capped 0.331 | collect 146 train 8 eval 84 teacher-eval 118 s
+  race it1 beta 0.60: student None coll/km prog None | teacher 5.49 | bc_lat 0.0714 bc_speed 0.7804 | dropped None | masked 0.116 capped 0.406 | collect 121 train 14 eval 0 teacher-eval 0 s
+  race it2 beta 0.30: student 79.06955935327619 coll/km prog 3.3562828958034516 | teacher 5.49 | bc_lat 0.0715 bc_speed 0.7991 | dropped None | masked 0.127 capped 0.432 | collect 122 train 21 eval 80 teacher-eval 0 s
+  collect it0: 146 s, labels 0.0558 s/step, env.step 0.536 s/step
+  collect it1: 121 s, labels 0.0657 s/step, env.step 0.416 s/step
+  collect it2: 122 s, labels 0.0696 s/step, env.step 0.418 s/step
+  held-out teacher_drives       it0: speed MAE 1.040 m/s (bias +0.494), lateral MAE 0.117 m, car rows speed MAE 1.2315776646137238
+  held-out teacher_drives       it1: speed MAE 1.066 m/s (bias +0.751), lateral MAE 0.100 m, car rows speed MAE 1.1904472261667252
+  held-out teacher_drives       it2: speed MAE 0.907 m/s (bias +0.446), lateral MAE 0.098 m, car rows speed MAE 1.0680264681577682
+  held-out last_student_drives  it0: speed MAE 1.514 m/s (bias +1.214), lateral MAE 0.234 m, car rows speed MAE 1.3542237132787704
+  held-out last_student_drives  it1: speed MAE 1.594 m/s (bias +1.400), lateral MAE 0.237 m, car rows speed MAE 1.415249541401863
+  held-out last_student_drives  it2: speed MAE 1.296 m/s (bias +0.952), lateral MAE 0.231 m, car rows speed MAE 1.1489460840821266
+  probe last_student_drives  it0: action-speed gain nan, measured-speed gain 0.025, recorded speed MAE 1.514 (zero actions nan, teacher history nan)
+  probe last_student_drives  it1: action-speed gain nan, measured-speed gain 0.070, recorded speed MAE 1.594 (zero actions nan, teacher history nan)
+  probe last_student_drives  it2: action-speed gain nan, measured-speed gain 0.078, recorded speed MAE 1.296 (zero actions nan, teacher history nan)
+  probe teacher_drives       it0: action-speed gain nan, measured-speed gain 0.023, recorded speed MAE 1.040 (zero actions nan, teacher history nan)
+  probe teacher_drives       it1: action-speed gain nan, measured-speed gain 0.066, recorded speed MAE 1.066 (zero actions nan, teacher history nan)
+  probe teacher_drives       it2: action-speed gain nan, measured-speed gain 0.079, recorded speed MAE 0.907 (zero actions nan, teacher history nan)
+
+== B (v2cc_B): FAIL {'a_nondecreasing': False, 'b_it2_ge_103': False, 'c_it2_cpk_le_T': False}
+  it0: ICCAS   8/128   51.771 coll/km (120 over 2.32 km)  speed 3.88 m/s  lap 10.246875000000077
+  it1: ICCAS   5/128   69.212 coll/km (123 over 1.78 km)  speed 4.35 m/s  lap 8.93000000000006
+  it2: ICCAS  60/128   17.641 coll/km (68 over 3.85 km)  speed 4.04 m/s  lap 10.17083333333341
+  race it0 beta 1.00: student 101.7583019195285 coll/km prog 2.9478674098849296 | teacher 7.15 | bc_lat 0.0819 bc_speed 1.1128 | dropped 0.5130984643179766 | masked 0.129 capped 0.331 | collect 147 train 8 eval 70 teacher-eval 82 s
+  race it1 beta 0.60: student None coll/km prog None | teacher 7.15 | bc_lat 0.0652 bc_speed 0.7538 | dropped 0.487962962962963 | masked 0.116 capped 0.386 | collect 101 train 14 eval 0 teacher-eval 0 s
+  race it2 beta 0.30: student 55.509841089908825 coll/km prog 3.2098989591002463 | teacher 7.15 | bc_lat 0.0632 bc_speed 0.7089 | dropped 0.4918392969240427 | masked 0.111 capped 0.403 | collect 102 train 21 eval 75 teacher-eval 0 s
+  collect it0: 147 s, labels 0.0540 s/step, env.step 0.541 s/step
+  collect it1: 101 s, labels 0.0543 s/step, env.step 0.349 s/step
+  collect it2: 102 s, labels 0.0550 s/step, env.step 0.353 s/step
+  held-out teacher_drives       it0: speed MAE 0.875 m/s (bias +0.119), lateral MAE 0.122 m, car rows speed MAE 1.0441195964813232
+  held-out teacher_drives       it1: speed MAE 0.848 m/s (bias +0.386), lateral MAE 0.098 m, car rows speed MAE 0.9522959664463997
+  held-out teacher_drives       it2: speed MAE 0.672 m/s (bias -0.086), lateral MAE 0.089 m, car rows speed MAE 0.7873297557234764
+  held-out last_student_drives  it0: speed MAE 1.358 m/s (bias +0.907), lateral MAE 0.263 m, car rows speed MAE 1.2899243086576462
+  held-out last_student_drives  it1: speed MAE 1.666 m/s (bias +1.407), lateral MAE 0.257 m, car rows speed MAE 1.4578151553869247
+  held-out last_student_drives  it2: speed MAE 1.251 m/s (bias +0.746), lateral MAE 0.258 m, car rows speed MAE 1.1659291461110115
+  probe last_student_drives  it0: action-speed gain 0.333, measured-speed gain 0.017, recorded speed MAE 1.358 (zero actions 1.394, teacher history 1.166)
+  probe last_student_drives  it1: action-speed gain 0.321, measured-speed gain 0.043, recorded speed MAE 1.666 (zero actions 1.789, teacher history 1.364)
+  probe last_student_drives  it2: action-speed gain 0.274, measured-speed gain 0.059, recorded speed MAE 1.251 (zero actions 1.267, teacher history 0.898)
+  probe teacher_drives       it0: action-speed gain 0.291, measured-speed gain 0.015, recorded speed MAE 0.875 (zero actions 0.973, teacher history 0.875)
+  probe teacher_drives       it1: action-speed gain 0.295, measured-speed gain 0.039, recorded speed MAE 0.848 (zero actions 1.008, teacher history 0.848)
+  probe teacher_drives       it2: action-speed gain 0.279, measured-speed gain 0.059, recorded speed MAE 0.672 (zero actions 0.893, teacher history 0.672)
+
+verdict: no arm passes
