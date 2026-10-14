@@ -158,11 +158,9 @@ def b8_select(lab: torch.Tensor, cand: torch.Tensor, know: torch.Tensor, dist: t
     LiDAR distance are the set; the rest leave the row's assignment entirely."""
     C = lab.shape[-2]
     if C < slots:
-        pad = slots - C
-        lab = torch.cat([lab, lab.new_zeros(*lab.shape[:-2], pad, lab.shape[-1])], -2)
-        cand = torch.cat([cand, cand.new_zeros(*cand.shape[:-1], pad)], -1)
-        know = torch.cat([know, know.new_zeros(*know.shape[:-1], pad)], -1)
-        return lab, cand, know
+        pad = slots - C                                      # absent tracks after the real ones
+        return (F.pad(lab, (0, 0, 0, pad)), F.pad(cand.to(torch.uint8), (0, pad)).bool(),
+                F.pad(know.to(torch.uint8), (0, pad)).bool())
     if C == slots:
         return lab, cand, know
     key = torch.where(cand, dist, torch.full_like(dist, float("inf")))

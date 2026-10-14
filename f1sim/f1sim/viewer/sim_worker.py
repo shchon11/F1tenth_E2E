@@ -453,6 +453,13 @@ def resolve_checkpoint(run: str, runs_dir: str, latest: str = "") -> str:
     raise FileNotFoundError(f"{path} 에 ppo_latest.pt / student_latest.pt 가 없습니다.")
 
 
+#: A v2 checkpoint (`learn.model_v2`, `meta["arch"] == "v2"`) reads observation contract v2
+#: (`learn.obs.ObsBuilderV2`), which this worker does not build yet. Refused by name, at load and on a
+#: hot reload, rather than reaching the v1 introspector or a scan-shape error mid-session.
+V2_REFUSAL = ("관측 계약 v2 체크포인트(learn.model_v2)입니다. 이 콘솔은 아직 v1 관측만 만들며 "
+              "v2 경로(ObsBuilderV2, 다이얼 입력, GRU 상태)는 연결 전입니다")
+
+
 def obs_spec_problems(meta: Dict[str, Any], spec, skipped: List[str], env_act_dim: int) -> List[str]:
     """Everything about this checkpoint that does not match the environment we just built.
 
@@ -464,6 +471,8 @@ def obs_spec_problems(meta: Dict[str, Any], spec, skipped: List[str], env_act_di
 
     Returns a list of sentences; empty means the model and the environment agree.
     """
+    if (meta or {}).get("arch") == "v2":
+        return [V2_REFUSAL]
     out: List[str] = []
     pairs = (
         ("n_beams", "n_beams", int(getattr(spec, "n_beams", -1)), "LiDAR 빔 수"),
@@ -887,6 +896,8 @@ class SimWorker:
             if refusal is not None:
                 raise StartConfigError(refusal)
         model, extra = load_checkpoint(ckpt_path, device, allow_controller=(arm != "legacy"))
+        if (getattr(model, "meta", None) or {}).get("arch") == "v2":
+            raise StartConfigError(f"{os.path.basename(ckpt_path)}: {V2_REFUSAL}.")
         if recorded == "auto":
             from ..learn.policy_adaptation import require_exact_actor
             require_exact_actor(model, policy_checkpoint)

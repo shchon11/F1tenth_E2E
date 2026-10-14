@@ -362,3 +362,14 @@ def test_the_v2_memory_learns_an_8_step_recall_with_a_dense_auxiliary():
         assert with_mem < 0.1 and cut > 0.5, (with_mem, cut)
     finally:
         torch.set_num_threads(threads)
+
+
+def test_the_console_refuses_a_v2_checkpoint_by_name():
+    """The console builds observation contract v1 today; a v2 checkpoint is refused with a sentence
+    that says so (at load and on a hot reload), not by the v1 introspector or a scan-shape error."""
+    from f1sim.learn.obs import ObsSpec
+    from f1sim.viewer.sim_worker import V2_REFUSAL, obs_spec_problems
+    m = _model()
+    assert obs_spec_problems(m.meta, ObsSpec(n_beams=SMALL), [], 8) == [V2_REFUSAL]
+    v1_meta = {"n_beams": SMALL, "n_stack": 3, "act_dim": 8}
+    assert obs_spec_problems(v1_meta, ObsSpec(n_beams=SMALL, scan_stack=3, act_dim=8), [], 8) == []
