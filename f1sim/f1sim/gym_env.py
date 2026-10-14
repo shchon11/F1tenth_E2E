@@ -108,8 +108,9 @@ OPP_NEVER_SEEN = 1_000_000
 #: draws for it, `Simulator._car_boxes`) is nearest its true hit point, if it is within this. The
 #: scan is motion-distorted over 25 ms (0.22 m at 9 m/s), which is what the tolerance absorbs.
 OPP_ATTRIB_TOL_M = 0.30
-#: A return is VALID -- usable as a per-beam label -- when it is finite, short of range_max, and the
-#: noisy range is within this of the true one (the perception gate's definition).
+#: A return is VALID -- one the seat attribution counts (`_attribute_car_beams`) -- when it is finite,
+#: short of range_max, and the noisy range is within this of the true one (the perception gate's
+#: definition).
 BEAM_VALID_TOL_M = 0.30
 
 #: The columns of `F1VecEnv.future_labels`, in order. The first six are regression targets for the
@@ -3415,7 +3416,7 @@ class F1VecEnv:
         return mx, my, ang
 
     def _beam_valid(self, res: StepResult) -> torch.Tensor:
-        """(B, N_sensor) bool: a return a per-beam label may be scored on (`BEAM_VALID_TOL_M`)."""
+        """(B, N_sensor) bool: a return the seat attribution may count (`BEAM_VALID_TOL_M`)."""
         rng, tru = res.scan, res.scan_true
         return (torch.isfinite(rng) & (rng < self.range_max - 1e-3)
                 & ((rng - tru).abs() < BEAM_VALID_TOL_M))
@@ -3545,20 +3546,6 @@ class F1VecEnv:
         out[:, 3] = ex * closing / 5.0
         out[:, 4] = ex * g(dvy) / 2.0
         return out
-
-    def beam_car_labels_v2(self, r: Optional[StepResult] = None) -> torch.Tensor:
-        """(B, N) int8 per-beam label of the newest scan for the car / not-car head: 1 a valid return
-        off another car, 0 a valid return off anything else, -1 no usable return (no return, past
-        range, or the noisy range more than BEAM_VALID_TOL_M off the truth). At the observation's
-        beam resolution (`scan_subsample`), like `floor_labels`. From the simulator's own hit types
-        (`StepResult.scan_type`), so nothing in the simulator changes to produce it."""
-        from .lidar import HIT_CAR
-        res = self.last_result if r is None else r
-        sub = self.ecfg.scan_subsample
-        valid = self._beam_valid(res)[:, ::sub]
-        car = (res.scan_type[:, ::sub] == HIT_CAR)
-        lab = torch.where(car, torch.ones_like(car, dtype=torch.int8), torch.zeros_like(car, dtype=torch.int8))
-        return torch.where(valid, lab, torch.full_like(lab, -1))
 
     @torch.no_grad()
     def car_future(self, times, model: Optional[str] = None,

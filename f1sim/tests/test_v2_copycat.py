@@ -186,8 +186,7 @@ def test_a_collection_labels_the_learner_rows_only(monkeypatch):
     model = ActorCriticV2(n_beams=61, obs=dict(vars(common.obs_spec(env))))
     buf = dagger_v2.collect(env, model, dagger_v2.Wp4Labels(env, teacher, "env"), 12, 0.5, torch.device("cpu"),
                             dagger_v2.SequenceBuffer(1), noise=0.0, dial=cm.DialDraw(env, 0.3, 0.3),
-                            cspec=cm.CondSpec.from_meta(model.meta["cond"]), b8=False, near=False,
-                            beam=False).finalize()
+                            cspec=cm.CondSpec.from_meta(model.meta["cond"]), b8=False, near=False).finalize()
     learners = torch.arange(0, env.B, env.M)
     assert len(asked) == 12 and all(r is not None and torch.equal(r, learners) for r in asked)
     assert buf.data["label"].shape == (12, learners.numel(), 8) and buf.valid_count > 0
@@ -215,7 +214,7 @@ def test_an_arm_a_student_is_trained_evaluated_and_continued_on_its_own_contract
                                          "--epochs", "1", "--batch", "64", "--device", "cpu", "--eager",
                                          "--wandb", "disabled", "--wp4-label", "env", "--eval-steps", "20",
                                          "--teacher-eval-steps", "20", "--speed-cap", "8", "--aux-near-car", "0",
-                                         "--aux-beam-car", "0", "--log-every", "1", "--v2-ego-actions", "off"],
+                                         "--log-every", "1", "--v2-ego-actions", "off"],
                   tmp_path, monkeypatch)
         st = str(tmp_path / "ca" / "student_latest.pt")
         model, extra = load_checkpoint(st)
@@ -232,7 +231,7 @@ def test_an_arm_a_student_is_trained_evaluated_and_continued_on_its_own_contract
                                       "--minibatch", "32", "--grad-accum", "1", "--total", "64", "--epochs", "1",
                                       "--device", "cpu", "--sim-backend", "eager", "--wandb", "disabled",
                                       "--log-every", "1", "--save-every", "1", "--critic-warmup", "1",
-                                      "--aux-near-car", "0", "--aux-beam-car", "0", "--collision-mode", "soft"],
+                                      "--aux-near-car", "0", "--collision-mode", "soft"],
                   tmp_path, monkeypatch)
         m2, ex2 = load_checkpoint(str(tmp_path / "cp" / "ppo_final.pt"))
         assert m2.obs_spec == spec and ex2["arch"] == "v2"
@@ -251,7 +250,7 @@ def test_an_arm_b_run_drops_half_its_sequences_action_columns_and_says_so(tmp_pa
                                          "--epochs", "4", "--batch", "64", "--device", "cpu", "--eager",
                                          "--wandb", "disabled", "--wp4-label", "env", "--eval-steps", "20",
                                          "--teacher-eval-steps", "0", "--speed-cap", "8", "--aux-near-car", "0",
-                                         "--aux-beam-car", "0", "--log-every", "1", "--action-dropout", "0.5"],
+                                         "--log-every", "1", "--action-dropout", "0.5"],
                   tmp_path, monkeypatch)
         rec = [json.loads(x) for x in open(tmp_path / "cb" / "progress.jsonl")][-1]
         assert 0.0 < rec["train/action_dropped_frac"] < 1.0

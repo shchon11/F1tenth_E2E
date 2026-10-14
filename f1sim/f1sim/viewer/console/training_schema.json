@@ -4554,25 +4554,6 @@
           "metavar": "COEF"
         },
         {
-          "flag": "--aux-beam-car",
-          "flags": [
-            "--aux-beam-car"
-          ],
-          "dest": "aux_beam_car",
-          "label": "aux head · beam별 차 판별 가중치 (v2)",
-          "kind": "float",
-          "item_kind": "float",
-          "default": null,
-          "nargs": null,
-          "choices": null,
-          "required": false,
-          "group": "고급",
-          "help": "v2: weight of the per-beam car / not-car head (default 5, the perception gate's, before the adaptive balance; 0 builds no head)",
-          "action": "store",
-          "nullable": true,
-          "metavar": "COEF"
-        },
-        {
           "flag": "--aux-balance-every",
           "flags": [
             "--aux-balance-every"
@@ -6461,25 +6442,6 @@
           "required": false,
           "group": "고급",
           "help": "v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; 0 builds no head)",
-          "action": "store",
-          "nullable": true,
-          "metavar": "COEF"
-        },
-        {
-          "flag": "--aux-beam-car",
-          "flags": [
-            "--aux-beam-car"
-          ],
-          "dest": "aux_beam_car",
-          "label": "aux head · beam별 차 판별 가중치 (v2)",
-          "kind": "float",
-          "item_kind": "float",
-          "default": null,
-          "nargs": null,
-          "choices": null,
-          "required": false,
-          "group": "고급",
-          "help": "v2: weight of the per-beam car / not-car head (default 5, the perception gate's, before the adaptive balance; 0 builds no head)",
           "action": "store",
           "nullable": true,
           "metavar": "COEF"

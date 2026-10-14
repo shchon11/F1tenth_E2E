@@ -16,7 +16,8 @@ The redesign's stage 2 (docs/research/architecture-redesign-2026-10-13.md 6장 2
 * **B8 on the sequences** (critique B1: v1's recurrent DAgger set the auxiliary heads to None): the
   opponent-slot head on every scored step, with the window's knowability mask -- a car is a target
   only if the state, started at the burn-in's first step, has seen it within the last 3 s. The
-  nearest-visible-car and per-beam heads behind their own coefficients.
+  nearest-visible-car head behind its own coefficient (the per-beam car head is gone, see
+  `PERCEPTION_AUX_DEFAULTS`).
 * **Left-right mirroring**, p = `--mirror-prob` (0.5) per sequence (`train_v2.Mirror`; G1's
   appendix-2 correction: the flip took the visible lateral error p50 from 0.138 to 0.097 m).
 * **Per-loss gradient norms** on the shared trunk (BC vs B8 vs the others) and the **auxiliary
@@ -86,7 +87,7 @@ import torch
 
 from . import common
 from . import conditioning as cond_mod
-from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
+from .aux_v2 import aux_spec, nearest_car_loss
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
 from .obs import EGO_ACTIONS_DEFAULT, ObsSpecV2
@@ -101,25 +102,33 @@ WP4_LABEL_SOURCES = ("env", "linear-refit")
 #: redesign's burn-in 40 + chunk 80 (G1), and the plan / dial contract every v2 actor is built for.
 V2_DEFAULTS = {"chunk_length": 80, "seq_burn": 40}
 #: The perception auxiliaries every v2 run trains unless told otherwise -- the perception gate's
-#: decision (2026-10-14, scratchpad/arch/gates/percep/PREREG.md + results.txt; the coordinator's call):
-#: ONE frame, and all three heads on. Boot-camp data (1.06 M rows, 2 seeds x 4 folds, episode
-#: bootstrap 400), V4 (1 frame + A + B + B8) against V1 (1 frame + B8):
-#:   nearest visible car |dy| p50 within 3 m   0.256 vs 0.422 m  (-0.166 [-0.180, -0.149])
-#:   its distance error p50 within 3 m          0.329 vs 0.536 m  (-0.207 [-0.222, -0.191])
-#:   B8 |dy| p50, seen within 3 m                0.322 vs 0.407 m  (-0.085 [-0.096, -0.072])
-#:   contact-in-1-s AUC (BCE head)               0.889 vs 0.804    (+0.086 [+0.069, +0.105])
+#: decision (2026-10-14, scratchpad/arch/gates/percep/PREREG.md + results.txt; the coordinator's call)
+#: as amended the same day: ONE frame, B8 and the nearest-visible-car head (auxiliary B). Boot-camp
+#: data (1.06 M rows, 2 seeds x 4 folds, episode bootstrap 400), V3 (1 frame + B + B8) against V1
+#: (1 frame + B8):
+#:   nearest visible car |dy| p50 within 3 m   0.274 vs 0.422 m  (-0.148 [-0.161, -0.132])
+#:   its distance error p50 within 3 m          0.345 vs 0.536 m  (-0.191 [-0.209, -0.176])
+#:   B8 |dy| p50, seen within 3 m                0.331 vs 0.407 m  (-0.076 [-0.086, -0.066])
+#:   contact-in-1-s AUC (BCE head)               0.887 vs 0.804    (+0.083 [+0.067, +0.101])
 #: Frames bought nothing with the auxiliaries on (2 / 3 frames vs 1: every metric "no measurable
-#: difference", V6 - V4, V7 - V4), so 1 (`v2_frames`). Auxiliary B alone did most of it (V3 - V1 |dy|
-#: -0.148); A took the per-beam car mask AP from 0.23 to 0.58-0.60 and |dy| -0.084 alone, within noise
-#: on top of B (V4 - V3 -0.017). No variant passed the pre-registered bar (|dy| <= 0.15 m and AUC >= 0.85).
+#: difference", V6 - V4, V7 - V4 -- measured with auxiliary A on as well), so 1 (`v2_frames`). No
+#: variant passed the pre-registered bar (|dy| <= 0.15 m and AUC >= 0.85).
+#:
+#: The per-beam car / not-car head (auxiliary A, `--aux-beam-car`, default 5 until 2026-10-14) is
+#: gone, code and flag. It was added on the premise that picking the cars out of the props is the
+#: bottleneck, and the gate's own diagnosis refuted that premise: the nearest-car |dy| is the same with
+#: and without a prop within 1.5 m (V1 0.423 vs 0.422 m), and of all its readouts within 3 m, 42-63 %
+#: miss the car by more than 0.5 m and land on nothing, 4-5 % on a prop and 3-4 % on another car
+#: (diag.py, V1-V7). On top of B -- which aims at the bottleneck that was measured, ranging -- it
+#: bought -0.017 m [-0.024, -0.012] (V4 - V3, "no measurable difference").
+#:
 #: Coefficients are the gate's, applied BEFORE the adaptive balance (`AuxBalance`): B8 0.5 (w_pos 10,
-#: w_vl 0.1), nearest car 0.5 (presence BCE + 10 pos^2 + 1 closing^2 + 0.1 v_lat^2), per-beam 5 (its
-#: pilot: 0.5 x B8's stem gradient over A's at 1 = 5.80 -> 5). UNIT 3's heads and losses
-#: (`aux_v2.NearestCarHead` / `BeamCarHead` / `b8_loss`, `nearest_car_loss`, `beam_car_loss`) are the
-#: gate's own definitions, layer for layer and term for term, and its labels (>= 3 attributed valid
-#: HIT_CAR returns, within 6 m of the LiDAR) are the env's (`F1VecEnv.nearest_visible_car_v2`,
-#: `beam_car_labels_v2`): nothing in them changed.
-PERCEPTION_AUX_DEFAULTS = {"aux_b8": 0.5, "aux_near_car": 0.5, "aux_beam_car": 5.0}
+#: w_vl 0.1), nearest car 0.5 (presence BCE + 10 pos^2 + 1 closing^2 + 0.1 v_lat^2). UNIT 3's heads
+#: and losses (`aux_v2.NearestCarHead` / `b8_loss`, `nearest_car_loss`) are the gate's own
+#: definitions, layer for layer and term for term, and its labels (>= 3 attributed valid HIT_CAR
+#: returns, within 6 m of the LiDAR) are the env's (`F1VecEnv.nearest_visible_car_v2`): nothing in
+#: them changed.
+PERCEPTION_AUX_DEFAULTS = {"aux_b8": 0.5, "aux_near_car": 0.5}
 #: Probability that a training sequence loses its issued-action columns (`--action-dropout`,
 #: `train_v2.ActionDropout`) unless the command line says otherwise.
 ACTION_DROPOUT = 0.0
@@ -130,7 +139,7 @@ V2_ONLY_DEFAULTS = {"v2_frames": 1, "v2_init_stem": "", "wp4_label": "env", "mir
                     "aux_balance_every": BALANCE_EVERY, "aux_balance_rho": BALANCE_RHO,
                     "aux_balance_beta": BALANCE_BETA, "action_dropout": ACTION_DROPOUT}
 #: The auxiliary losses, by the name `sequence_losses` gives them and the coefficient key they take.
-AUX_TERMS = ("b8", "near", "beam")
+AUX_TERMS = ("b8", "near")
 
 
 def apply_race_defaults(a) -> dict:
@@ -205,7 +214,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     if bad:
         raise SystemExit(f"--arch v2: {', '.join('--' + k.replace('_', '-') for k in bad)} belong to the v1 "
                          f"network or its observation; the v2 actor has its own memory (B5), auxiliary heads "
-                         f"(--aux-b8 / --aux-near-car / --aux-beam-car) and contract (learn.obs.ObsSpecV2)")
+                         f"(--aux-b8 / --aux-near-car) and contract (learn.obs.ObsSpecV2)")
     if "action_mode" in given and a.action_mode != "plan":
         raise SystemExit("--arch v2 is the plan policy (its ego history holds WP4 plan actions)")
     if "speed_mode" in given:
@@ -221,7 +230,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     if a.wp4_label == "linear-refit" and a.teacher_kind != "raceline":
         raise SystemExit("--wp4-label linear-refit refits the RACELINE teacher's linear plan; the "
                          f"{a.teacher_kind} teacher's search would be silently dropped")
-    if min(a.aux_b8, a.aux_near_car, a.aux_beam_car) < 0:
+    if min(a.aux_b8, a.aux_near_car) < 0:
         raise SystemExit("auxiliary weights are >= 0")
     a.v2_ego_actions = "on" if resolve_ego_actions(a) else "off"
     if not 0.0 <= float(a.action_dropout) <= 1.0:
@@ -358,10 +367,10 @@ class SequenceBuffer:
     What one step stores: the newest frame (fp16), the ego vector (fp16 -- 210 numbers, the 1-s
     history in it), the teacher's label and its validity, whether the step began an episode, the
     dial column `c` the student was given, and -- when their heads train -- the B8 tracks (`select_tracks`:
-    labels, candidates, AGE: knowability is decided per sampled window), the nearest-visible-car
-    target and the per-beam car labels."""
+    labels, candidates, AGE: knowability is decided per sampled window) and the nearest-visible-car
+    target."""
 
-    KEYS = ("scan", "ego", "label", "valid", "newep", "c", "b8_lab", "b8_cand", "b8_age", "near", "beam")
+    KEYS = ("scan", "ego", "label", "valid", "newep", "c", "b8_lab", "b8_cand", "b8_age", "near")
 
     def __init__(self, n_frames: int, frame_stride: int = 1):
         self.k, self.stride = int(n_frames), int(frame_stride)
@@ -433,7 +442,7 @@ class SequenceBuffer:
 
 # ------------------------------------------------------------------------------- collection
 def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf: SequenceBuffer, noise: float,
-            dial: cond_mod.DialDraw, cspec, b8: bool, near: bool, beam: bool) -> SequenceBuffer:
+            dial: cond_mod.DialDraw, cspec, b8: bool, near: bool) -> SequenceBuffer:
     """Roll the env for `steps`, label every state with the teacher, store the learners' rows.
 
     Iteration 0 (beta 1) drives the teacher; later ones mix the student in with probability
@@ -476,8 +485,6 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
                 row.update(b8_lab=lab3[ids], b8_cand=cand3[ids], b8_age=age3[ids])
             if near:
                 row["near"] = env.nearest_visible_car_v2()[ids]
-            if beam:
-                row["beam"] = env.beam_car_labels_v2()[ids]
             buf.add(**row)
             if student is None:
                 a = label
@@ -521,21 +528,20 @@ def heldout_aux(model, buf: SequenceBuffer, *, burn: int, chunk: int, device, co
     was = model.training
     model.eval()
     try:
-        out = model.actor.sequence(s["scan"], s["ego"], s["c"], keep=s["keep"], burn_in=b,
-                                   beams=float(coefs.get("beam", 0.0)) > 0)
+        out = model.actor.sequence(s["scan"], s["ego"], s["c"], keep=s["keep"], burn_in=b)
     finally:
         model.train(was)
     since = steps_since_window_start(s["keep"])[b:]
-    lab = {k: s[k][b:] for k in ("near", "beam", "b8_lab", "b8_cand", "b8_age") if k in s}
+    lab = {k: s[k][b:] for k in ("near", "b8_lab", "b8_cand", "b8_age") if k in s}
     return aux_heldout_metrics(out, lab, since)
 
 
-def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs: dict, beams: bool):
+def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs: dict):
     """The v2 imitation losses on one batch of sequences `s` (`SequenceBuffer.sample`, mirrored or
-    not): {"total", "bc", "bc_lat", "bc_speed", "b8", "b8_knowable", "near", "beam"} -- every part a
+    not): {"total", "bc", "bc_lat", "bc_speed", "b8", "b8_knowable", "near"} -- every part a
     tensor (zero where its coefficient is off), the parts that train carrying their graph."""
     actor = model.actor
-    out = actor.sequence(s["scan"], s["ego"], s["c"], keep=s["keep"], burn_in=burn, beams=beams)
+    out = actor.sequence(s["scan"], s["ego"], s["c"], keep=s["keep"], burn_in=burn)
     sl = slice(burn, None)
     T, m = out["mu"].shape[:2]
     flat = lambda x: x[sl].reshape(T * m, *x.shape[2:])
@@ -544,7 +550,7 @@ def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs
     bc, parts = bc_loss_wp4(out["mu"].reshape(T * m, -1), flat(s["label"]), v_meas, plan_spec, v_max, weight=valid)
     zero = torch.zeros((), device=bc.device)
     res = {"bc": bc, "bc_lat": parts["lat"].detach(), "bc_speed": parts["speed"].detach(),
-           "b8": zero, "b8_knowable": zero, "near": zero, "beam": zero}
+           "b8": zero, "b8_knowable": zero, "near": zero}
     total = bc
     if coefs.get("b8", 0.0) > 0 and "b8" in out:
         since = steps_since_window_start(s["keep"])[sl]
@@ -555,10 +561,6 @@ def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs
         near = nearest_car_loss(out["near_car"].float(), s["near"][sl]).mean()
         res["near"] = near
         total = total + coefs["near"] * near
-    if coefs.get("beam", 0.0) > 0 and "beam_car" in out:
-        beam = beam_car_loss(out["beam_car"].float().reshape(T * m, -1), flat(s["beam"]))
-        res["beam"] = beam
-        total = total + coefs["beam"] * beam
     res["total"] = total
     return res
 
@@ -579,10 +581,11 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
     force -- the same gradient `total.backward()` would give (up to the order of the float sums), one
     backward pass per loss and none more. Every other update is the plain backward of the total at
     the multipliers in force. Measured on the CPU at the deployed shapes (1081 beams, 4 sequences of
-    40 + 80): a measured update costs 1.73x a plain one with B8, 2.76x with all four losses, so at
-    `every` 10 the balance costs +7 % / +18 % of the training compute (UNIT 4's way of measuring --
-    norms with the graph kept, then the update's own backward -- 2.31x / 3.43x). With the balance on,
-    its measurements are also the logged rows; with it off, `log_every` measures as before.
+    40 + 80): a measured update costs 1.73x a plain one with B8, 2.76x with all four losses of the
+    time (the per-beam car head's included, gone since 2026-10-14), so at `every` 10 the balance
+    costs +7 % / +18 % of the training compute (UNIT 4's way of measuring -- norms with the graph
+    kept, then the update's own backward -- 2.31x / 3.43x). With the balance on, its measurements are
+    also the logged rows; with it off, `log_every` measures as before.
 
     `dropout` (`train_v2.ActionDropout`, `--action-dropout`): after the mirror, each sequence loses its
     issued-action columns with the dropout's probability; the share it dropped is in the summary
@@ -604,9 +607,8 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
     weights = torch.tensor([float(b.valid_count) for b in bufs])
     trunk = actor_trunk_parameters(model.actor)
     params = [p for p in model.actor.parameters() if p.requires_grad]
-    beams = coefs.get("beam", 0.0) > 0
     active = [k for k in AUX_TERMS if coefs.get(k, 0.0) > 0]
-    hist = {k: [] for k in ("total", "bc", "bc_lat", "bc_speed", "b8", "b8_knowable", "near", "beam")}
+    hist = {k: [] for k in ("total", "bc", "bc_lat", "bc_speed", "b8", "b8_knowable", "near")}
     grads = {}
     t_measured, t_plain, n_measured = 0.0, 0.0, 0
     n_drop, n_seq = 0.0, 0
@@ -621,15 +623,15 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
             n_drop += float(drop.float().sum()); n_seq += m
         t0 = time.perf_counter()
         eff = coefs if balance is None else balance.coefs(coefs)
-        terms = sequence_losses(model, s, burn=burn, plan_spec=plan_spec, v_max=v_max, coefs=eff, beams=beams)
+        terms = sequence_losses(model, s, burn=burn, plan_spec=plan_spec, v_max=v_max, coefs=eff)
         loss = terms["total"]
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite DAgger v2 loss at step {i}: " +
                                ", ".join(f"{k} {float(v):.4g}" for k, v in terms.items()))
         due = balance is not None and balance.due()
         # With the balance on, its measurements are the logged ones too (a row every `every` updates):
-        # a measured update costs 1.7x a plain one with B8 (2.8x with all four losses, CPU at 1081
-        # beams), so measuring again on --log-every's own schedule would add a third of that again.
+        # a measured update costs 1.7x a plain one with B8 (2.8x with all four losses of the time, CPU
+        # at 1081 beams), so measuring again on --log-every's own schedule would add a third of that again.
         measure = due if (balance is not None and balance.enabled) else i % log_every == 0
         gn = None
         opt.zero_grad()
@@ -699,8 +701,8 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
     spec = common.obs_spec(env)
     if not isinstance(spec, ObsSpecV2):
         raise SystemExit("--arch v2 needs the env built with obs_version 2")
-    coefs = {"b8": float(a.aux_b8), "near": float(a.aux_near_car), "beam": float(a.aux_beam_car)}
-    aux = aux_spec(b8=coefs["b8"] > 0, beam_car=coefs["beam"] > 0, near_car=coefs["near"] > 0)
+    coefs = {"b8": float(a.aux_b8), "near": float(a.aux_near_car)}
+    aux = aux_spec(b8=coefs["b8"] > 0, near_car=coefs["near"] > 0)
     priv_dim = int(env.privileged_v2(env.reset()[1] and env.last_result).shape[1])
     balance = make_balance(a, "bc", [k for k in AUX_TERMS if coefs[k] > 0])
     if a.init:
@@ -755,7 +757,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
     progress_log = common.ProgressLog(out)
     log = lambda d: run_.log(d)
     env.sim.warmup()
-    want = {"b8": coefs["b8"] > 0, "near": coefs["near"] > 0, "beam": coefs["beam"] > 0}
+    want = {"b8": coefs["b8"] > 0, "near": coefs["near"] > 0}
     buffer_iters, teacher_metrics, m, m_iter = [], None, None, -1
     t0 = time.time()
     for it in range(a.start_iter, a.start_iter + a.iters):
@@ -823,7 +825,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         progress_log.write(record)
         stud = (f"student {m['collisions_per_km']:.1f} coll/km prog {m['progress_rate_mps']:.2f} m/s "
                 f"lap {m['lap_time_s']:.1f} s" if do_eval else f"student not measured (last at {m_iter})")
-        print("  losses " + " ".join(f"{k} {parts[k]:.4f}" for k in ("bc_lat", "bc_speed", "b8", "near", "beam")
+        print("  losses " + " ".join(f"{k} {parts[k]:.4f}" for k in ("bc_lat", "bc_speed", "b8", "near")
                                      if k in parts)
               + f" | B8 knowable {parts.get('b8_knowable', float('nan')):.2f} | trunk grad norms "
               + " ".join(f"{k[5:]} {v:.3g}" for k, v in parts.items() if k.startswith("grad_"))
@@ -837,8 +839,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
             whose = "the initial weights" if it == a.start_iter and not a.init else f"the weights before iteration {it}"
             print(f"  held-out heads ({whose}, on this collection): nearest car |dy| p50 "
                   f"<3 m {fmt('near_dy_p50_3m')} m, dist {fmt('near_dist_p50_3m')} m, presence AUC "
-                  f"{fmt('near_presence_auc')} | per-beam precision {fmt('beam_precision')} recall "
-                  f"{fmt('beam_recall')} | B8 |dy| p50 <3 m {fmt('b8_dy_p50_3m')} m", flush=True)
+                  f"{fmt('near_presence_auc')} | B8 |dy| p50 <3 m {fmt('b8_dy_p50_3m')} m", flush=True)
         print(f"  collection: speed-capped {100 * buf.stats.get('speed_capped_frac', float('nan')):.1f} % of "
               f"learner steps (the fixed {a.speed_cap:g} m/s cap clipped the executed plan)", flush=True)
         print(f"iter {it}: beta {beta:.2f} samples {n_samples} loss {loss:.4f} | {stud} | teacher "

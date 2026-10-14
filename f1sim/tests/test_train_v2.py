@@ -287,7 +287,6 @@ def _batch(T=5, m=4, n=31, seed=0):
                   "label": torch.rand(T, m, 8, generator=g) * 2 - 1,
                   "priv": torch.randn(T, m, PRIV_V2_DIM, generator=g),
                   "b8_lab": torch.randn(T, m, 3, 3, generator=g), "near": torch.randn(T, m, 5, generator=g),
-                  "beam": torch.randint(-1, 2, (T, m, n), generator=g).to(torch.int8),
                   "c": torch.randn(T, m, 1, generator=g), "keep": torch.ones(T, m),
                   "b8_age": torch.randint(0, 200, (T, m, 3), generator=g)}
 
@@ -302,7 +301,6 @@ def test_mirroring_twice_is_the_identity_on_every_key_and_only_flipped_sequences
         assert torch.equal(twice[k], b[k]), k
         assert torch.equal(once[k][:, 1], b[k][:, 1]) and torch.equal(once[k][:, 3], b[k][:, 3]), k
     assert torch.equal(once["scan"][:, 0], mirror_scan(b["scan"][:, 0]))
-    assert torch.equal(once["beam"][:, 2], b["beam"][:, 2].flip(-1))
     assert torch.equal(once["c"], b["c"]) and torch.equal(once["b8_age"], b["b8_age"])
     col = {c.name: c.index for c in ego_columns(spec)}
     e, e1 = b["ego"][:, 0], once["ego"][:, 0]
@@ -431,7 +429,7 @@ def test_a_mirrored_teacher_label_is_the_label_of_the_mirrored_state():
 def test_the_mirrored_world_is_the_sign_tables_applied_to_the_original():
     """Two simulators, a map and its mirror image, the same two cars placed mirror-wise: the newest
     scan reversed beam for beam (`obs.mirror_scan`), the B8 track labels times `B8_LABEL_MIRROR`, the
-    nearest-visible-car target times `NEAR_MIRROR`, the per-beam car labels reversed, and the critic's
+    nearest-visible-car target times `NEAR_MIRROR`, the valid car returns reversed, and the critic's
     opponent block and geometry times `PRIV_V2_MIRROR` -- every table the DAgger mirror applies,
     checked against what the simulator computes for the mirrored world. Noise-free scans (the
     noise is drawn per beam and has no mirror); the car drawn as boxes, which are symmetric."""
@@ -475,9 +473,11 @@ def test_the_mirrored_world_is_the_sign_tables_applied_to_the_original():
     na, nb = ea._norm_scan(ra.scan), eb._norm_scan(rb.scan)
     d_scan = (nb - mirror_scan(na)).abs()
     assert float(d_scan.median()) < 1e-4 and float((d_scan > 0.01).float().mean()) < 0.01, float(d_scan.max())
-    la, lb = ea.beam_car_labels_v2(ra), eb.beam_car_labels_v2(rb)
-    assert int((la[0] == 1).sum()) >= 10, "the car 2 m ahead should be in the scan"
-    assert float((lb != la.flip(-1)).float().mean()) < 0.01
+    from f1sim.lidar import HIT_CAR
+    ca = (ra.scan_type == HIT_CAR) & ea._beam_valid(ra)                     # the valid car returns
+    cb = (rb.scan_type == HIT_CAR) & eb._beam_valid(rb)
+    assert int(ca[0].sum()) >= 10, "the car 2 m ahead should be in the scan"
+    assert float((cb != ca.flip(-1)).float().mean()) < 0.01
     ta, tb = ea.opponent_tracks_v2(ra), eb.opponent_tracks_v2(rb)
     assert torch.equal(ta["cand"], tb["cand"]) and int(ta["age"][0, 0]) == int(tb["age"][0, 0]) == 0
     assert torch.allclose(tb["lab"], ta["lab"] * torch.tensor(B8_LABEL_MIRROR), atol=1e-4)
@@ -552,7 +552,7 @@ def test_per_loss_gradients_assemble_the_backward_of_the_weighted_total():
     torch.manual_seed(0)
     m = ActorCriticV2(n_beams=61, aux={"b8": True, "near_car": True})
     s = _sequences()
-    kw = dict(burn=3, plan_spec=SPEC, v_max=10.0, coefs={"b8": 0.5, "near": 0.5}, beams=False)
+    kw = dict(burn=3, plan_spec=SPEC, v_max=10.0, coefs={"b8": 0.5, "near": 0.5})
     params = [p for p in m.actor.parameters() if p.requires_grad]
     trunk = tv.actor_trunk_parameters(m.actor)
     w = {"bc": 1.0, "b8": 0.3, "near": 0.07}

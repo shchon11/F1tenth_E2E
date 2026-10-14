@@ -76,7 +76,7 @@ class Mirror:
                       "b8_lab": torch.tensor(B8_LABEL_MIRROR, dtype=torch.float32),
                       "near": torch.tensor(NEAR_MIRROR, dtype=torch.float32)}
         #: beam-indexed keys: reversed along the last axis (`obs.mirror_scan`'s rule)
-        self.beams = ("scan", "beam")
+        self.beams = ("scan",)
 
     def mirrored(self, key: str, x: torch.Tensor) -> torch.Tensor:
         """`x` of the mirrored world, for every row (no selection)."""
@@ -462,16 +462,15 @@ def aux_heldout_metrics(out: dict, s: dict, since: Optional[torch.Tensor] = None
     trainer that picked its checkpoint by a risk or value loss would throw that away, so the v2
     trainers keep the LAST checkpoint and log these instead of choosing by them.
 
-    `out` is `ActorV2.sequence`'s dict ("near_car" (T, m, 5), "beam_car" (T, m, N), "b8" (T, m, S, 4)
-    -- whichever heads exist; after a burn-in its steps only), `s` the labels ("near", "beam",
-    "b8_lab" / "b8_cand" / "b8_age") on the same (T, m) steps, `since` the steps into each row's state
-    window there, for B8's knowability (`b8_know_mask`). Keys:
+    `out` is `ActorV2.sequence`'s dict ("near_car" (T, m, 5), "b8" (T, m, S, 4) -- whichever heads
+    exist; after a burn-in its steps only), `s` the labels ("near", "b8_lab" / "b8_cand" / "b8_age")
+    on the same (T, m) steps, `since` the steps into each row's state window there, for B8's
+    knowability (`b8_know_mask`). Keys:
 
       near_presence_auc     the nearest-visible-car head's "a car is seen" logit
       near_{dy,dx,dist}_p50_3m, near_closing_p50_3m, near_dy_p50_6m
                             the gate's M1: |error| p50 on rows where a car is seen within 3 m
                             (6 m), whatever the presence logit says
-      beam_{precision,recall}  the per-beam head at logit 0, on valid returns (the gate's M2)
       b8_{dy,dx}_p50_3m     the gate's M3: knowable tracks within 3 m against the slot the loss's own
                             cheapest assignment gives them
     """
@@ -490,12 +489,6 @@ def aux_heldout_metrics(out: dict, s: dict, since: Optional[torch.Tensor] = None
                 m["near_dist_p50_3m"] = _p50((torch.hypot(p[rows, 1] * 5.0, p[rows, 2] * 2.0) - dist[rows]).abs())
                 m["near_closing_p50_3m"] = _p50(((p[rows, 3] - t[rows, 3]) * 5.0).abs())
                 m["near_rows_3m"] = float(rows.sum())
-    if "beam_car" in out and "beam" in s:
-        lg, lb = out["beam_car"].float(), s["beam"]
-        valid, car, said = lb >= 0, lb == 1, lg > 0
-        tp = float((said & car & valid).sum())
-        m["beam_precision"] = tp / max(1.0, float((said & valid).sum()))
-        m["beam_recall"] = tp / max(1.0, float((car & valid).sum()))
     if "b8" in out and "b8_lab" in s:
         from .aux_v2 import B8_W_POS, B8_W_VL, _perms
         pred = out["b8"].float()
@@ -552,7 +545,7 @@ def critic_trunk_parameters(critic) -> list:
 
 def deployed_actor_parameters(actor) -> list:
     """Every parameter of the deployed actor (the exported graph's), without the train-time heads."""
-    heads = {id(p) for h in (actor.b8, actor.beam_car, actor.near_car) if h is not None for p in h.parameters()}
+    heads = {id(p) for h in (actor.b8, actor.near_car) if h is not None for p in h.parameters()}
     return [p for p in actor.parameters() if id(p) not in heads]
 
 

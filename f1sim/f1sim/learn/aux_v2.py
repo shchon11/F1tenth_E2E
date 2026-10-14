@@ -37,9 +37,6 @@ leaves every other weight drawn exactly as without it.
   judge-learnability-minimal/chunk_mask.json). A candidate that is NOT knowable still occupies a
   slot -- at zero cost, so the head is neither told it is there nor told it is not.
 
-* **Per-beam car / not-car** (appendix 2's candidate, the perception gate's auxiliary A): a light
-  head on the stem's neck map, one logit per beam, scored on valid returns only.
-
 * **Nearest visible car** (appendix 2, perception gate auxiliary B): [exists, dx / 5, dy / 2,
   closing / 5, v_lat / 2] of the nearest car the newest scan sees, from `[e | y]`. The align gate
   found the true distance to that one car gives contact-risk AUC 0.902 by itself.
@@ -47,16 +44,20 @@ leaves every other weight drawn exactly as without it.
 The loss weights are the gates' (w_pos 10, w_vl 0.1, B8 coefficient 0.5); they are defaults here and
 the training unit owns the coefficients.
 
-The perception gate's decision (2026-10-14): every v2 run trains all three, on one frame, at the gate's
-coefficients -- B8 0.5, nearest car 0.5, per-beam 5 -- before the adaptive balance (numbers at
-`dagger_v2.PERCEPTION_AUX_DEFAULTS`: the nearest visible car's |dy| p50 within 3 m 0.422 -> 0.256 m,
-contact AUC 0.804 -> 0.889). Checked against the gate's training code (scratchpad/arch/gates/percep/
+The perception gate's decision (2026-10-14): every v2 run trains both, on one frame, at the gate's
+coefficients -- B8 0.5, nearest car 0.5 -- before the adaptive balance (numbers at
+`dagger_v2.PERCEPTION_AUX_DEFAULTS`: the nearest visible car's |dy| p50 within 3 m 0.422 -> 0.274 m,
+contact AUC 0.804 -> 0.887). Checked against the gate's training code (scratchpad/arch/gates/percep/
 train.py): these heads, losses and normalisations are its own, layer for layer and term for term.
+
+Removed the same day: the per-beam car / not-car head (the gate's auxiliary A, a light head on the
+stem's neck map, one logit per beam). Its premise -- that picking the cars out of the props is the
+bottleneck -- is what the gate's own diagnosis refuted, and on top of B it bought -0.017 m
+(`dagger_v2.PERCEPTION_AUX_DEFAULTS` has the numbers).
 """
 from __future__ import annotations
 
 import itertools
-import math
 from typing import Optional
 
 import torch
@@ -65,8 +66,8 @@ import torch.nn.functional as F
 
 from ..gym_env import OPP_MEMORY_STEPS
 
-#: The three auxiliary families, in the order they are attached.
-AUX_HEADS = ("b8", "beam_car", "near_car")
+#: The auxiliary families, in the order they are attached.
+AUX_HEADS = ("b8", "near_car")
 
 B8_SLOTS = 3
 #: Per slot: presence logit, dx / 5, dy / 2, v_lat / 2 (LiDAR frame), the align / perception gates'.
@@ -84,9 +85,9 @@ NEAR_W_VL = 0.1
 NEAR_MIRROR = (1.0, 1.0, -1.0, 1.0, -1.0)
 
 
-def aux_spec(b8: bool = False, beam_car: bool = False, near_car: bool = False) -> dict:
+def aux_spec(b8: bool = False, near_car: bool = False) -> dict:
     """The `meta["aux"]` block, validated: which train-time heads a v2 actor carries."""
-    return {"b8": bool(b8), "beam_car": bool(beam_car), "near_car": bool(near_car)}
+    return {"b8": bool(b8), "near_car": bool(near_car)}
 
 
 class OpponentSlotHead(nn.Module):
@@ -110,24 +111,6 @@ class NearestCarHead(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
-
-
-class BeamCarHead(nn.Module):
-    """Per-beam car logit from the stem's neck map (B, 48, L): two convolutions on the map, each cell
-    unfolded into the `up` beams it covers (the trunk's total stride, 32), cropped to N beams. The
-    perception gate's auxiliary A, on the map `fc` reads -- so the gradient reaches exactly the
-    features the action is computed from."""
-
-    def __init__(self, neck_channels: int, cells: int, n_beams: int, width: int = 64):
-        super().__init__()
-        self.n_beams, self.cells = int(n_beams), int(cells)
-        self.up = int(math.ceil(self.n_beams / self.cells))
-        self.net = nn.Sequential(nn.Conv1d(neck_channels, width, 3, padding=1), nn.GELU(),
-                                 nn.Conv1d(width, self.up, 1))
-
-    def forward(self, neck: torch.Tensor) -> torch.Tensor:
-        o = self.net(neck)                                           # (B, up, L)
-        return o.permute(0, 2, 1).reshape(o.shape[0], self.cells * self.up)[:, :self.n_beams]
 
 
 # ---------------------------------------------------------------- B8 targets and loss
@@ -211,12 +194,3 @@ def nearest_car_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
            + NEAR_W_CLOSING * (pred[..., 3] - target[..., 3]) ** 2
            + NEAR_W_VL * (pred[..., 4] - target[..., 4]) ** 2)
     return bce + ex * reg
-
-
-def beam_car_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Masked per-beam BCE (scalar): `labels` from `F1VecEnv.beam_car_labels_v2`, 1 car, 0 not a
-    car, -1 no usable return (not scored)."""
-    m = (labels >= 0).to(logits.dtype)
-    y = (labels == 1).to(logits.dtype)
-    l_ = F.binary_cross_entropy_with_logits(logits, y, reduction="none")
-    return (l_ * m).sum() / m.sum().clamp_min(1.0)

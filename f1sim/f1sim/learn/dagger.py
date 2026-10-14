@@ -814,9 +814,6 @@ def main():
     ap.add_argument("--aux-near-car", type=float, default=None, metavar="COEF",
                     help="v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; "
                          "0 builds no head)")
-    ap.add_argument("--aux-beam-car", type=float, default=None, metavar="COEF",
-                    help="v2: weight of the per-beam car / not-car head (default 5, the perception gate's, "
-                         "before the adaptive balance; 0 builds no head)")
     ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
                     help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
                          "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
@@ -843,8 +840,8 @@ def main():
         v2_applied = dagger_v2.prepare_args(ap, a)
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
-                              "aux_beam_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta",
-                              "opponent_speed_mode", "v2_ego_actions", "action_dropout")
+                              "aux_balance_every", "aux_balance_rho", "aux_balance_beta", "opponent_speed_mode",
+                              "v2_ego_actions", "action_dropout")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")

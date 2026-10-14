@@ -134,7 +134,6 @@ LABELS = {
     "mirror_prob": "v2 좌우 반전 증강 확률", "critic_lr": "v2 critic learning rate",
     "value_norm_beta": "v2 value 정규화 EMA β", "contact_bce": "v2 '1초 안 차 접촉' BCE 가중치",
     "aux_b8": "aux head · B8 상대차 slot 가중치 (v2)", "aux_near_car": "aux head · 최근접 상대차 가중치 (v2)",
-    "aux_beam_car": "aux head · beam별 차 판별 가중치 (v2)",
     "aux_balance_every": "aux gradient 균형 측정 주기 (update, 0 = 끔, v2)",
     "aux_balance_rho": "aux gradient 균형 상한 ρ (aux / main trunk gradient, v2)",
     "aux_balance_beta": "aux gradient 균형 EMA β (측정당, v2)",

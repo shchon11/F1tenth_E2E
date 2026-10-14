@@ -122,8 +122,6 @@ def test_a_car_ahead_is_attributed_to_its_seat_and_one_behind_is_not_seen():
     car_valid = int(((res.scan_type[0] == 4) & env._beam_valid(res)[0]).sum())
     assert car_valid >= 10, "a car 2 m ahead should fill a good arc of the scan"
     assert int(beams[0, 0]) == car_valid, "every car return belongs to the only other car"
-    lab = env.beam_car_labels_v2(res)
-    assert int((lab[0] == 1).sum()) == car_valid and set(lab.unique().tolist()) <= {-1, 0, 1}
     env._update_opp_visibility(res, None)
     tr = env.opponent_tracks_v2(res)
     assert int(tr["age"][0, 0]) == 0 and bool(tr["cand"][0, 0])
@@ -187,8 +185,9 @@ def test_visibility_is_tracked_through_real_steps_and_off_costs_nothing():
     assert bool(((tr["age"] == 0) == (tr["present"] & (tr["beams"] >= OPP_SEEN_BEAMS)
                                       & (tr["dist"] < 6.0))).all())
     # every attributed beam is a valid car return of that row's newest scan
-    lab = env.beam_car_labels_v2()
-    assert bool((tr["beams"].sum(1) <= (lab == 1).sum(1)).all())
+    res = env.last_result
+    car_valid = ((res.scan_type == 4) & env._beam_valid(res)).sum(1)
+    assert bool((tr["beams"].sum(1) <= car_valid).all())
     off = _env(race_size=2, envs=2, opp_visibility=False)
     off.reset(seed=2)
     assert off._opp_age is None

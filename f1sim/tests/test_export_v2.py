@@ -28,8 +28,7 @@ from f1sim.learn.model_v2 import ActorCriticV2  # noqa: E402
 @pytest.mark.parametrize("n_frames", [1, 3])
 def test_the_v2_actor_exports_at_1081_beams_within_1e_5_of_torch(tmp_path, n_frames):
     torch.manual_seed(0)
-    m = ActorCriticV2(n_beams=1081, n_frames=n_frames,
-                      aux={"b8": True, "beam_car": True, "near_car": True}).eval()
+    m = ActorCriticV2(n_beams=1081, n_frames=n_frames, aux={"b8": True, "near_car": True}).eval()
     path = str(tmp_path / "actor_v2.onnx")
     rep = export_v2(m, path, steps=20)
     assert rep["max_abs_err"] is not None and rep["max_abs_err"] <= 1e-5, rep
@@ -37,7 +36,7 @@ def test_the_v2_actor_exports_at_1081_beams_within_1e_5_of_torch(tmp_path, n_fra
     assert [i.name for i in g.graph.input] == ["scan", "ego", "dial", "hidden"]
     assert [o.name for o in g.graph.output] == ["action", "hidden_next"]
     names = " ".join(i.name for i in g.graph.initializer)
-    assert not any(h in names for h in ("b8", "beam_car", "near_car")), "a train-time head is in the graph"
+    assert not any(h in names for h in ("b8", "near_car")), "a train-time head is in the graph"
     side = json.load(open(str(tmp_path / "actor_v2.json")))
     assert side["arch"] == "v2" and len(side["ego_columns"]) == 210
     assert side["inputs"]["scan"] == [1, n_frames, 1081] and side["inputs"]["hidden"] == [1, 1, 128]

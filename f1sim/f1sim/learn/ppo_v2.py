@@ -67,7 +67,7 @@ import torch.nn.functional as F
 from ..gym_env import PRIV_V2_DIM, REWARD_COMPONENT_KEYS
 from . import common
 from . import conditioning as cond_mod
-from .aux_v2 import aux_spec, beam_car_loss, nearest_car_loss
+from .aux_v2 import aux_spec, nearest_car_loss
 from .dagger_v2 import (AUX_TERMS, PERCEPTION_AUX_DEFAULTS, apply_race_defaults, check_balance_args, explicit_flags,
                         make_balance, resolve_ego_actions)
 from .memory import reset_hidden
@@ -127,7 +127,7 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
         raise SystemExit("--arch v2 reads the grip dial (a deployable input column); no other conditioning")
     if a.init and a.v2_init_stem:
         raise SystemExit("--init continues a v2 policy; --v2-init-stem seeds a fresh one from a v1 stem")
-    if min(a.contact_bce, a.aux_b8, a.aux_near_car, a.aux_beam_car) < 0 or not 0 < a.value_norm_beta < 1:
+    if min(a.contact_bce, a.aux_b8, a.aux_near_car) < 0 or not 0 < a.value_norm_beta < 1:
         raise SystemExit("v2 loss weights are >= 0 and --value-norm-beta is in (0, 1)")
     check_balance_args(a)
     applied = apply_race_defaults(a)
@@ -169,9 +169,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         raise SystemExit("--arch v2 needs the env built with obs_version 2")
     lid = env.learner_ids
     T, B = int(a.horizon), int(lid.numel())
-    coefs = {"contact": float(a.contact_bce), "b8": float(a.aux_b8), "near": float(a.aux_near_car),
-             "beam": float(a.aux_beam_car)}
-    aux = aux_spec(b8=coefs["b8"] > 0, beam_car=coefs["beam"] > 0, near_car=coefs["near"] > 0)
+    coefs = {"contact": float(a.contact_bce), "b8": float(a.aux_b8), "near": float(a.aux_near_car)}
+    aux = aux_spec(b8=coefs["b8"] > 0, near_car=coefs["near"] > 0)
     priv_dim = int(env.privileged_v2(env.last_result).shape[1])
     if priv_dim != PRIV_V2_DIM:
         raise SystemExit(f"privileged_v2 is {priv_dim} wide, the v2 critic reads {PRIV_V2_DIM}")
@@ -198,10 +197,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
             rep = init_stems_from_v1(model, a.v2_init_stem, device)
             print(f"v2 stems seeded from {os.path.basename(a.v2_init_stem)}: actor {len(rep['actor'])} / "
                   f"critic {len(rep['critic'])} tensors", flush=True)
-    has = {"b8": model.actor.b8 is not None, "near": model.actor.near_car is not None,
-           "beam": model.actor.beam_car is not None}
-    on = {k: coefs[k] > 0 and has[k] for k in ("b8", "near", "beam")}
-    for k in ("b8", "near", "beam"):
+    has = {"b8": model.actor.b8 is not None, "near": model.actor.near_car is not None}
+    on = {k: coefs[k] > 0 and has[k] for k in ("b8", "near")}
+    for k in ("b8", "near"):
         if has[k] and not on[k]:
             print(f"head {k}: PRESENT BUT NOT TRAINED (its weight is 0)", flush=True)
     vnorm = ValueNorm(a.value_norm_beta)
@@ -253,7 +251,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                 for x in a.lagrange.split(",") if x.strip()} if a.lagrange else None),
                   "losses": {"vf": float(a.vf), "vf_clip": float(a.vf_clip), "contact_bce": coefs["contact"],
                              "contact_horizon_steps": CONTACT_HORIZON, "aux_b8": coefs["b8"],
-                             "aux_near_car": coefs["near"], "aux_beam_car": coefs["beam"], "ent": float(a.ent),
+                             "aux_near_car": coefs["near"], "ent": float(a.ent),
                              "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
                              "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
                                              "beta": balance.beta, "names": list(balance.names)},
@@ -291,7 +289,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     print(f"v2 PPO: horizon {T} x {B} learner rows, minibatch {a.minibatch} = {max(1, a.minibatch // T)} env chunk(s) "
           f"in {a.grad_accum} piece(s) | actor lr {a.lr:g}->{a.lr_end:g}, critic lr {a.critic_lr:g}, eps {a.adam_eps:g}, "
           f"clip-split {a.clip_split}, vf-clip {a.vf_clip:g}, kl_coef 0 | contact BCE {coefs['contact']:g}, "
-          f"B8 {coefs['b8']:g}, near {coefs['near']:g}, beam {coefs['beam']:g}"
+          f"B8 {coefs['b8']:g}, near {coefs['near']:g}"
           + (f" balanced every {balance.every} updates to <= {balance.rho:g} x pg (EMA {balance.beta:g})"
              if balance.enabled else " (no auxiliary balance)")
           + f" | value normaliser with PopArt | v2 defaults applied: {applied or 'none'}", flush=True)
@@ -325,8 +323,6 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         buf_b8_lab, buf_b8_cand, buf_b8_age = z(T, B, 3, 3), z(T, B, 3, dtype=torch.bool), z(T, B, 3, dtype=torch.long)
     if on["near"]:
         buf_near = z(T, B, 5)
-    if on["beam"]:
-        buf_beam = z(T, B, N, dtype=torch.int8)
     h_actor = model.actor.initial_hidden(env.B, device=device)
     h_ref = ref.initial_hidden(env.B, device=device)
     buf_h0 = z(1, B, model.actor.hidden_size)
@@ -423,8 +419,6 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     buf_b8_lab[t], buf_b8_cand[t], buf_b8_age[t] = l3[lid], c3[lid], g3[lid]
                 if on["near"]:
                     buf_near[t] = env.nearest_visible_car_v2()[lid]
-                if on["beam"]:
-                    buf_beam[t] = env.beam_car_labels_v2()[lid]
                 if buf_lvl is not None:
                     buf_lvl[t] = env.level_seed[lid]
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
@@ -524,8 +518,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 w = fl(buf_mask[:, cols])
                 with ac:
                     seq = model.actor.sequence(buf_scan[:, cols].float(), buf_ego[:, cols], buf_c[:, cols],
-                                               h0=buf_h0[:, cols].contiguous(), keep=buf_keep[:, cols],
-                                               beams=on["beam"])
+                                               h0=buf_h0[:, cols].contiguous(), keep=buf_keep[:, cols])
                     v_n, logit = model.critic(fl(buf_scan[:, cols].float()), fl(buf_ego[:, cols]),
                                               fl(buf_c[:, cols]), fl(buf_priv[:, cols]))
                 mu = fl(seq["mu"]).float()
@@ -551,7 +544,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     / yv.sum().clamp_min(1.0)
                 ent_w = wmean(ent)
                 zero = torch.zeros((), device=device)
-                b8 = near = beam = zero
+                b8 = near = zero
                 b8_know = None
                 if on["b8"]:
                     b8, st_b8 = b8_sequence_loss(seq["b8"], buf_b8_lab[:, cols], buf_b8_cand[:, cols],
@@ -559,8 +552,6 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     b8_know = st_b8["knowable"]
                 if on["near"]:
                     near = wmean(nearest_car_loss(fl(seq["near_car"]).float(), fl(buf_near[:, cols])))
-                if on["beam"]:
-                    beam = beam_car_loss(fl(seq["beam_car"]).float(), fl(buf_beam[:, cols]))
                 with torch.no_grad():
                     d_ref = torch.distributions.Normal(fl(buf_ref_mu[:, cols]), ref_std.expand_as(mu))
                     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist).sum(-1))
@@ -573,8 +564,6 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     lab_ = {}
                     if on["near"]:
                         lab_["near"] = buf_near[:, cols]
-                    if on["beam"]:
-                        lab_["beam"] = buf_beam[:, cols]
                     if on["b8"]:
                         lab_.update(b8_lab=buf_b8_lab[:, cols], b8_cand=buf_b8_cand[:, cols], b8_age=buf_b8_age[:, cols])
                     for k_, v_ in aux_heldout_metrics({k: v.detach() for k, v in seq.items() if torch.is_tensor(v)},
@@ -588,8 +577,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     t_m = time.perf_counter()
                     gn = loss_grad_norms({"pg": pg,
                                           "b8": coefs["b8"] * b8 if on["b8"] else None,
-                                          "near": coefs["near"] * near if on["near"] else None,
-                                          "beam": coefs["beam"] * beam if on["beam"] else None}, actor_trunk)
+                                          "near": coefs["near"] * near if on["near"] else None}, actor_trunk)
                     if due:
                         balance.observe(gn)
                     t_measure += time.perf_counter() - t_m
@@ -600,7 +588,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                         stats.setdefault(f"grad/{k}", []).append(v)
                 s_ = balance.scale
                 actor_terms = (pg - a.ent * ent_w + coefs["b8"] * s_.get("b8", 1.0) * b8
-                               + coefs["near"] * s_.get("near", 1.0) * near + coefs["beam"] * s_.get("beam", 1.0) * beam)
+                               + coefs["near"] * s_.get("near", 1.0) * near)
                 loss = a.vf * vf + coefs["contact"] * bce + on_actor * actor_terms
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"non-finite v2 PPO loss at update {update} (pg {float(pg):.4g} vf {float(vf):.4g} "
@@ -622,7 +610,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     stats.setdefault("grad_norm_critic", []).append(float(g_c))
                 for k, v in (("pg", pg), ("vf", vf), ("contact_bce", bce), ("entropy", ent.mean()),
                              ("kl_ref", kl_ref), ("approx_kl", approx_kl), ("clipfrac", clipfrac),
-                             ("b8", b8), ("near_car", near), ("beam_car", beam)):
+                             ("b8", b8), ("near_car", near)):
                     stats.setdefault(k, []).append(float(v.detach()))
                 if b8_know is not None:
                     stats.setdefault("b8_knowable", []).append(float(b8_know))

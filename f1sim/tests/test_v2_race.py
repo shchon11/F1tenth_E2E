@@ -3,9 +3,9 @@ boot camp's league in the v2 trainers.
 
 * what 2026-10-14 removed stays removed: the learner's unobserved random cap (`EnvConfig.
   learner_cap_range` / `learner_cap_prob`, `--learner-cap-range` / `--learner-cap-prob`), the critic's
-  speed-cap column (`privileged_v2` is 33 wide) and the BC clearance mask (`--bc-clearance`,
-  `train_v2.plan_clearance`, `prop_math.prism_separation`) -- neither the env nor a command line
-  takes them;
+  speed-cap column (`privileged_v2` is 33 wide), the BC clearance mask (`--bc-clearance`,
+  `train_v2.plan_clearance`, `prop_math.prism_separation`) and the per-beam car head (`--aux-beam-car`,
+  `aux_v2.BeamCarHead`, `F1VecEnv.beam_car_labels_v2`) -- neither the env nor a command line takes them;
 * the cap: the env's own (DAgger's fixed `--speed-cap`), not observed; a step says where it clipped
   the plan, and a collection imitates every valid label and reports its capped share;
 * the command lines: v2 runs default to linear opponents in a race; v1 refuses the flag; evaluate's
@@ -34,10 +34,11 @@ from f1sim.learn import common  # noqa: E402
 TRACK = "gen:competition:0"
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 V1 = os.path.join(ROOT, "checkpoints", "iccas_bootcamp_safest.pt")
-#: The flags 2026-10-14 removed: no v2 default stood on a measurement.
+#: The flags 2026-10-14 removed: no v2 default stood on a measurement, or the measurement refuted it.
 REMOVED_FLAGS = {"f1sim.learn.dagger": (["--learner-cap-range", "3", "9"], ["--learner-cap-prob", "0.3"],
-                                        ["--bc-clearance", "0.3"]),
-                 "f1sim.learn.ppo": (["--learner-cap-range", "3", "9"], ["--learner-cap-prob", "0.3"])}
+                                        ["--bc-clearance", "0.3"], ["--aux-beam-car", "5"]),
+                 "f1sim.learn.ppo": (["--learner-cap-range", "3", "9"], ["--learner-cap-prob", "0.3"],
+                                     ["--aux-beam-car", "5"])}
 
 
 @functools.lru_cache(maxsize=1)
@@ -60,28 +61,30 @@ def _env(envs=8, seed=3, beams=36, **kw):
 
 
 # ===================================================================== removed on 2026-10-14
-def test_the_random_cap_its_critic_column_and_the_bc_mask_are_gone():
+def test_the_random_cap_its_critic_column_the_bc_mask_and_the_beam_head_are_gone():
     from f1sim import prop_math
-    from f1sim.learn import dagger_v2, ppo_v2, train_v2
+    from f1sim.gym_env import F1VecEnv
+    from f1sim.learn import aux_v2, dagger_v2, ppo_v2, train_v2
     fields = {f.name for f in dataclasses.fields(EnvConfig)}
     assert not fields & {"learner_cap_range", "learner_cap_prob"}
     with pytest.raises(TypeError):
         EnvConfig(learner_cap_range=(3.0, 9.0))
     assert "speed_cap" not in PRIV_V2_KEYS and PRIV_V2_DIM == 8 + 3 * 7 + 4
-    assert "bcok" not in dagger_v2.SequenceBuffer.KEYS
+    assert not {"bcok", "beam"} & set(dagger_v2.SequenceBuffer.KEYS)
+    assert aux_v2.AUX_HEADS == ("b8", "near_car") and dagger_v2.AUX_TERMS == ("b8", "near")
     for mod, names in ((dagger_v2, ("LEARNER_CAP_RANGE", "LEARNER_CAP_PROB", "cap_summary")),
                        (train_v2, ("BC_CLEARANCE_M", "plan_clearance", "rect_separation")),
-                       (prop_math, ("prism_separation",))):
+                       (prop_math, ("prism_separation",)), (aux_v2, ("BeamCarHead", "beam_car_loss")),
+                       (F1VecEnv, ("learner_cap", "learner_cap_suspended", "beam_car_labels_v2"))):
         assert not [n for n in names if hasattr(mod, n)], mod.__name__
     for defaults in (dagger_v2.V2_ONLY_DEFAULTS, ppo_v2.V2_ONLY_DEFAULTS):
-        assert not set(defaults) & {"learner_cap_range", "learner_cap_prob", "bc_clearance"}
+        assert not set(defaults) & {"learner_cap_range", "learner_cap_prob", "bc_clearance", "aux_beam_car"}
 
 
 def test_the_critic_reads_33_columns_and_the_actor_no_cap():
     env = _env(envs=4)
     pv = env.privileged_v2()
     assert pv.shape == (env.B, PRIV_V2_DIM) == (4, 33)
-    assert not hasattr(env, "learner_cap") and not hasattr(env, "learner_cap_suspended")
     assert set(env._last_obs) == {"scan", "ego"}
     env.set_speed_cap(5.0)                                               # the curriculum moves the env's cap
     assert bool((env.speed_cap == 5.0).all())
@@ -111,8 +114,7 @@ def test_a_collection_imitates_every_valid_label_and_reports_its_capped_share():
     model = ActorCriticV2(n_beams=61, obs=dict(vars(common.obs_spec(env))))
     buf = dagger_v2.collect(env, model, dagger_v2.Wp4Labels(env, teacher, "env"), 30, 1.0, torch.device("cpu"),
                             dagger_v2.SequenceBuffer(1), noise=0.0, dial=cm.DialDraw(env, 0.3, 0.3),
-                            cspec=cm.CondSpec.from_meta(model.meta["cond"]), b8=False, near=False,
-                            beam=False).finalize()
+                            cspec=cm.CondSpec.from_meta(model.meta["cond"]), b8=False, near=False).finalize()
     assert set(buf.stats) == {"speed_capped_frac"}
     assert 0.0 < buf.stats["speed_capped_frac"] <= 1.0                 # the teacher plans above a 3 m/s cap
     assert "bcok" not in buf.data and buf.valid_count > 0
@@ -120,7 +122,7 @@ def test_a_collection_imitates_every_valid_label_and_reports_its_capped_share():
     T = buf.T
     s = buf.sample(2, T, torch.device("cpu"), generator=torch.Generator().manual_seed(0))
     assert "bcok" not in s
-    kw = dict(burn=0, plan_spec=env.tracker.spec, v_max=float(env.ecfg.v_max_policy), coefs={}, beams=False)
+    kw = dict(burn=0, plan_spec=env.tracker.spec, v_max=float(env.ecfg.v_max_policy), coefs={})
     full = dagger_v2.sequence_losses(model, s, **kw)
     none = dagger_v2.sequence_losses(model, {**s, "valid": torch.zeros_like(s["valid"])}, **kw)
     assert float(full["bc"].detach()) > 0.0 and float(none["bc"].detach()) == 0.0
@@ -135,18 +137,16 @@ def test_the_heldout_metrics_read_the_heads_in_metres():
     near[0, 0, 0] = 0.0; near[0, 0, 1:] = 0.0                                # no car seen there
     pred = near.clone(); pred[..., 0] = torch.where(near[..., 0] > 0, 4.0, -4.0)
     pred[..., 2] += 0.1 / 2.0                                                # 0.1 m off sideways
-    beam_lab = torch.tensor([1, 1, 0, 0, -1], dtype=torch.int8).expand(T, m, 5)
-    beam_lg = torch.tensor([3.0, -3.0, -3.0, 3.0, 3.0]).expand(T, m, 5)
     lab = torch.zeros(T, m, 3, 3); lab[..., 0, :] = torch.tensor([1.0 / 5.0, -0.4 / 2.0, 0.0])
     cand = torch.zeros(T, m, 3, dtype=torch.bool); cand[..., 0] = True
     b8 = torch.zeros(T, m, 3, 4); b8[..., 2, 0] = 5.0; b8[..., 2, 1:3] = torch.tensor([1.0 / 5.0, -0.3 / 2.0])
     b8[..., :2, 0] = -5.0                                                     # the car is in slot 2
-    out = {"near_car": pred, "beam_car": beam_lg, "b8": b8}
-    s = {"near": near, "beam": beam_lab, "b8_lab": lab, "b8_cand": cand, "b8_age": torch.zeros(T, m, 3, dtype=torch.long)}
+    out = {"near_car": pred, "b8": b8}
+    s = {"near": near, "b8_lab": lab, "b8_cand": cand, "b8_age": torch.zeros(T, m, 3, dtype=torch.long)}
     got = aux_heldout_metrics(out, s, torch.full((T, m), 10, dtype=torch.long))
     assert got["near_presence_auc"] == 1.0 and got["near_rows_3m"] == T * m - 1
     assert got["near_dy_p50_3m"] == pytest.approx(0.1, abs=1e-5) and got["near_dx_p50_3m"] == pytest.approx(0.0, abs=1e-6)
-    assert got["beam_precision"] == pytest.approx(0.5) and got["beam_recall"] == pytest.approx(0.5)
+    assert not [k for k in got if k.startswith("beam_")]                     # the per-beam head is gone
     assert got["b8_dy_p50_3m"] == pytest.approx(0.1, abs=1e-5) and got["b8_dx_p50_3m"] == pytest.approx(0.0, abs=1e-6)
     assert aux_heldout_metrics({}, {}) == {}
 
@@ -171,7 +171,7 @@ def test_a_v2_run_races_linear_opponents_unless_told(module, prep):
     a, applied = run("--race-size", "4", "--opponent", "teacher")
     assert a.opponent_speed_mode == "linear" and applied["opponent_speed_mode"] == "linear"
     # the perception gate's decision: one frame, every perception head on at the gate's coefficients
-    assert (a.v2_frames, a.aux_b8, a.aux_near_car, a.aux_beam_car) == (1, 0.5, 0.5, 5.0)
+    assert (a.v2_frames, a.aux_b8, a.aux_near_car) == (1, 0.5, 0.5) and not hasattr(a, "aux_beam_car")
     kw = p.env_kwargs(a)
     assert kw["opp_visibility"] is True and not set(kw) & {"learner_cap_range", "learner_cap_prob"}
     a, _ = run("--race-size", "4", "--opponent", "teacher", "--opponent-speed-mode", "wp4")
@@ -194,7 +194,8 @@ def test_the_removed_flags_are_unknown_to_both_architectures(module):
                 ap.parse_args(argv)
     from f1sim.viewer.console.training_schema_export import SCHEMA_PATH
     schema = SCHEMA_PATH.read_text()
-    assert not [d for d in ("learner_cap_range", "learner_cap_prob", "bc_clearance") if f'"dest": "{d}"' in schema]
+    gone = ("learner_cap_range", "learner_cap_prob", "bc_clearance", "aux_beam_car")
+    assert not [d for d in gone if f'"dest": "{d}"' in schema]
 
 
 @pytest.mark.parametrize("module,flag,val", [("f1sim.learn.ppo", "--opponent-speed-mode", ["linear"]),
@@ -258,7 +259,7 @@ def test_v2_ppo_races_the_v1_league_and_its_snapshot_takes_the_seat(tmp_path, mo
         snap = tmp_path / "pl" / "league_0.pt"
         model, extra = load_checkpoint(str(snap))
         assert isinstance(model, ActorCriticV2) and "opt" not in extra and extra["speed_mode"] == "wp4"
-        assert all(k in recs[0] for k in ("heldout/near_presence_auc", "heldout/beam_precision", "heldout/b8_dy_p50_3m"))
+        assert all(k in recs[0] for k in ("heldout/near_presence_auc", "heldout/near_dy_p50_3m", "heldout/b8_dy_p50_3m"))
         _m, ex = load_checkpoint(str(tmp_path / "pl" / "ppo_final.pt"))
         assert ex["experiment"]["checkpoint_rule"] == "last"
         assert ex["experiment"]["race"] == {"opponent_speed_mode": "linear", "league_seats": [0], "league_every": 1}
@@ -288,7 +289,7 @@ def test_v2_dagger_logs_the_capped_share_of_its_collection(tmp_path, monkeypatch
         assert _m.meta["priv_dim"] == PRIV_V2_DIM
         # the perception heads by default, scored held out every iteration; the last weights kept
         assert extra["checkpoint_rule"] == "last" and rec["heldout_scores_iter"] == -1
-        assert all(k in rec for k in ("heldout/near_presence_auc", "heldout/beam_recall", "heldout/near_dy_p50_3m"))
+        assert all(k in rec for k in ("heldout/near_presence_auc", "heldout/near_dist_p50_3m", "heldout/near_dy_p50_3m"))
         assert set(extra["heldout"]) == {k[len("heldout/"):] for k in rec if k.startswith("heldout/")}
     finally:
         torch.set_num_threads(threads)

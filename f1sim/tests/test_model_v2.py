@@ -65,11 +65,11 @@ def test_parameter_counts_per_block_match_the_redesign_table():
     assert c["actor (deployed)"] == redesign_total + (210 - 147) * 128 + (8 - 5) * 257 + (8 - 5) == 1_168_816
     # the critic reads 33 privileged columns (`gym_env.PRIV_V2_DIM`; 34 with the speed cap until 2026-10-14)
     assert c["B9 critic"] == 793_632 + (210 + 1 + 33) * 128 + 128 + 384 * 256 + 256 + 256 * 256 + 256 + 2 * 257
-    assert c["B8 slots"] == c["beam car head"] == c["nearest car head"] == 0, "heads only when flagged"
-    full = block_parameter_counts(_model(1081, aux={"b8": True, "beam_car": True, "near_car": True}))
+    assert c["B8 slots"] == c["nearest car head"] == 0, "heads only when flagged"
+    full = block_parameter_counts(_model(1081, aux={"b8": True, "near_car": True}))
     assert full["B8 slots"] == 384 * 256 + 256 + 256 * 12 + 12
     assert full["nearest car head"] == 384 * 256 + 256 + 256 * 5 + 5
-    assert full["beam car head"] == 48 * 64 * 3 + 64 + 64 * 32 + 32
+    assert "beam car head" not in full                           # removed 2026-10-14 (`aux_v2`)
     assert full["actor (deployed)"] == c["actor (deployed)"]
     # one more frame is one more input row of the first convolution: 48 x 7 weights
     assert block_parameter_counts(_model(1081, 3))["B1+B2 stem"] == 793_632 + 2 * 48 * 7
@@ -172,18 +172,20 @@ def test_sequence_equals_stepping_through_resets_and_burn_in():
 # ---------------------------------------------------------------- train-time heads
 def test_heads_are_built_last_only_when_flagged_and_never_touch_the_forward():
     plain = _model(seed=5)
-    full = _model(seed=5, aux={"b8": True, "beam_car": True, "near_car": True})
+    full = _model(seed=5, aux={"b8": True, "near_car": True})
     sp, sf = plain.state_dict(), full.state_dict()
-    heads = [k for k in sf if k.startswith(("actor.b8.", "actor.beam_car.", "actor.near_car."))]
+    heads = [k for k in sf if k.startswith(("actor.b8.", "actor.near_car."))]
     assert heads and set(sf) - set(sp) == set(heads)
     assert all(torch.equal(sp[k], sf[k]) for k in sp), "a head moved a weight it does not own"
     scan, ego, c = _inputs()
     with torch.no_grad():
         assert torch.equal(plain.actor.step(scan, ego, c)[0], full.actor.step(scan, ego, c)[0])
-        out = full.actor.step_all(scan, ego, c, beams=True)
-    assert out["b8"].shape == (3, 3, 4) and out["near_car"].shape == (3, 5)
-    assert out["beam_car"].shape == (3, SMALL) and out["z"].shape == (3, 384)
-    assert full.meta["aux"] == {"b8": True, "beam_car": True, "near_car": True}
+        out = full.actor.step_all(scan, ego, c)
+    assert out["b8"].shape == (3, 3, 4) and out["near_car"].shape == (3, 5) and out["z"].shape == (3, 384)
+    assert full.meta["aux"] == {"b8": True, "near_car": True}
+    # the per-beam car head is gone (2026-10-14): no flag builds it
+    with pytest.raises(TypeError):
+        _model(aux={"beam_car": True})
 
 
 def test_b8_loss_is_a_set_loss_over_the_six_slot_permutations():
@@ -228,10 +230,7 @@ def test_b8_know_mask_reads_age_and_the_window():
     assert aux_v2.b8_know_mask(cand, age, torch.tensor([10])).tolist() == [[True, False, False, False]]
 
 
-def test_the_beam_and_nearest_car_losses():
-    logits = torch.tensor([[5.0, -5.0, 0.0, 9.0]])
-    labels = torch.tensor([[1, 0, -1, -1]], dtype=torch.int8)
-    assert float(aux_v2.beam_car_loss(logits, labels)) < 0.01  # the -1 beams are not scored
+def test_the_nearest_car_loss():
     pred = torch.tensor([[3.0, 0.2, 0.1, 0.0, 0.0], [3.0, 9.0, 9.0, 9.0, 9.0]])
     none = torch.zeros(2, 5)
     l = aux_v2.nearest_car_loss(pred, none)

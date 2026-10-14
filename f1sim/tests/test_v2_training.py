@@ -114,7 +114,7 @@ def test_burn_in_steps_carry_no_loss_and_b8_reaches_the_trunk():
          "c": torch.zeros(T, n, 1), "keep": torch.ones(T, n), "valid": torch.ones(T, n, dtype=torch.bool),
          "label": torch.rand(T, n, 8, generator=g) * 2 - 1, "b8_lab": 0.2 * torch.randn(T, n, 3, 3, generator=g),
          "b8_cand": torch.ones(T, n, 3, dtype=torch.bool), "b8_age": torch.zeros(T, n, 3, dtype=torch.long)}
-    kw = dict(burn=burn, plan_spec=PlanSpec(speed_mode="wp4"), v_max=10.0, coefs={"b8": 0.5}, beams=False)
+    kw = dict(burn=burn, plan_spec=PlanSpec(speed_mode="wp4"), v_max=10.0, coefs={"b8": 0.5})
     a = dagger_v2.sequence_losses(m, s, **kw)
     s2 = dict(s); s2["label"] = s["label"].clone(); s2["label"][:burn] = 0.9   # burn-in labels: anything
     b = dagger_v2.sequence_losses(m, s2, **kw)
@@ -152,26 +152,27 @@ def test_dagger_ppo_evaluate_end_to_end_on_the_cpu(runs, monkeypatch):
                                          "--opponent", "policy", "--tracks", TRACK, "--iters", "1", "--steps", "48",
                                          "--epochs", "2", "--batch", "64", "--device", "cpu", "--eager",
                                          "--wandb", "disabled", "--wp4-label", "linear-refit", "--eval-steps", "30",
-                                         "--teacher-eval-steps", "0", "--aux-near-car", "0.5", "--aux-beam-car", "0.5",
+                                         "--teacher-eval-steps", "0", "--aux-near-car", "0.5",
                                          "--speed-cap", "6", "--log-every", "1"], runs, monkeypatch)
         st = str(runs / "dg" / "student_latest.pt")
         model, extra = load_checkpoint(st)
         assert isinstance(model, ActorCriticV2) and extra["phase"] == "dagger" and extra["speed_mode"] == "wp4"
         assert extra["sequence"] == {"burn_in": 40, "chunk": 80} and extra["wp4_label"] == "linear-refit"
-        assert model.meta["aux"] == {"b8": True, "beam_car": True, "near_car": True}
+        assert model.meta["aux"] == {"b8": True, "near_car": True}
         rec = [json.loads(x) for x in open(runs / "dg" / "progress.jsonl")][-1]
         assert rec["arch"] == "v2" and rec["train/grad_bc"] > 0 and rec["train/grad_b8"] > 0
-        assert all(k in rec for k in ("train/bc_lat", "train/bc_speed", "train/b8", "train/grad_near", "train/grad_beam"))
+        assert all(k in rec for k in ("train/bc_lat", "train/bc_speed", "train/b8", "train/near", "train/grad_near"))
+        assert not [k for k in rec if "beam" in k], "the per-beam car head is gone (2026-10-14)"
         # the auxiliary balance: measured from the first update, multipliers in (0, 1], in the checkpoint
-        assert all(0 < rec[f"train/aux_scale_{k}"] <= 1 for k in ("b8", "near", "beam"))
+        assert all(0 < rec[f"train/aux_scale_{k}"] <= 1 for k in ("b8", "near"))
         assert extra["aux_balance"]["main"] == "bc" and extra["aux_balance"]["measurements"] >= 1
-        assert extra["aux_balance"]["scale"] == {k: rec[f"train/aux_scale_{k}"] for k in ("b8", "near", "beam")}
+        assert extra["aux_balance"]["scale"] == {k: rec[f"train/aux_scale_{k}"] for k in ("b8", "near")}
         _run_main("f1sim.learn.ppo", ["--arch", "v2", "--name", "pp", "--init", st, "--envs", "4", "--race-size",
                                       "2", "--opponent", "policy", "--tracks", TRACK, "--horizon", "48",
                                       "--minibatch", "96", "--grad-accum", "1", "--total", "384", "--epochs", "2",
                                       "--device", "cpu", "--sim-backend", "eager", "--wandb", "disabled",
                                       "--log-every", "1", "--save-every", "1", "--critic-warmup", "1",
-                                      "--aux-near-car", "0.5", "--aux-beam-car", "0.5", "--car-contact-penalty", "1",
+                                      "--aux-near-car", "0.5", "--car-contact-penalty", "1",
                                       "--collision-mode", "soft"], runs, monkeypatch)
         recs = [json.loads(x) for x in open(runs / "pp" / "progress.jsonl")]
         assert [r["update"] for r in recs] == [1, 2]
@@ -181,7 +182,7 @@ def test_dagger_ppo_evaluate_end_to_end_on_the_cpu(runs, monkeypatch):
         assert abs(first["loss/approx_kl"]) < 1e-6 and abs(first["loss/kl_ref"]) < 1e-6
         assert first["policy/actor_move"] == 0.0 and recs[1]["policy/actor_move"] > 0
         assert recs[1]["value_norm/std"] > 0 and 0 < first["contact/label_valid_frac"] < 1
-        for k in ("grad/pg", "grad/b8", "grad/near", "grad/beam", "grad/critic_vf", "grad/critic_contact",
+        for k in ("grad/pg", "grad/b8", "grad/near", "grad/critic_vf", "grad/critic_contact",
                   "rollout/speed_capped_frac", "loss/contact_bce", "loss/b8_knowable", "balance/scale_b8",
                   "balance/pull_near", "value_norm/popart_max_dev"):
             assert k in first, k
@@ -190,7 +191,7 @@ def test_dagger_ppo_evaluate_end_to_end_on_the_cpu(runs, monkeypatch):
         for r in recs:
             assert r["value_norm/popart_max_dev"] <= 1e-4 * max(1.0, r["value_norm/popart_value_scale"]
                                                               + abs(r["value_norm/mean"]) + r["value_norm/std"])
-        assert all(0 < first[f"balance/scale_{k}"] <= 1 for k in ("b8", "near", "beam"))
+        assert all(0 < first[f"balance/scale_{k}"] <= 1 for k in ("b8", "near"))
         ck = str(runs / "pp" / "ppo_final.pt")
         m2, ex2 = load_checkpoint(ck)
         assert isinstance(m2, ActorCriticV2) and ex2["value_norm"]["debias"] > 0 and ex2["arch"] == "v2"

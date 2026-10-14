@@ -58,7 +58,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..gym_env import PRIV_V2_DIM
-from .aux_v2 import AUX_HEADS, BeamCarHead, NearestCarHead, OpponentSlotHead, aux_spec
+from .aux_v2 import AUX_HEADS, NearestCarHead, OpponentSlotHead, aux_spec
 from .memory import Hidden
 from .model import ResBlock1d
 from .obs import MINPOOL_TAPS, ObsSpecV2
@@ -134,12 +134,6 @@ class StemV2(nn.Module):
         near = -F.max_pool1d(-scan[:, :1], kernel_size=MINPOOL_TAPS, stride=1, padding=pad)
         return torch.cat([scan, near], 1)
 
-    def forward_map(self, scan: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(features (B, 256), neck map (B, 48, cells)): the map is what `fc` reads, and what the
-        per-beam auxiliary head reads, from one pass."""
-        nk = self.neck(self.trunk(self.rows(scan)))
-        return self.fc(nk.flatten(1)), nk
-
     def forward(self, scan: torch.Tensor) -> torch.Tensor:
         return self.fc(self.neck(self.trunk(self.rows(scan))).flatten(1))
 
@@ -209,7 +203,6 @@ class ActorV2(nn.Module):
         self.log_std = nn.Parameter(init)
         #: train-time heads, attached by `ActorCriticV2` after both networks (`aux_v2`)
         self.b8 = None
-        self.beam_car = None
         self.near_car = None
 
     @property
@@ -236,15 +229,11 @@ class ActorV2(nn.Module):
         return torch.zeros(1, int(batch), self.hidden_size, device=device or ref.device, dtype=dtype or ref.dtype)
 
     # -------------------------------------------------------------- the per-step pieces
-    def embed(self, scan, ego, c, beams: bool = False):
-        """e (B, 256) = B4(stem(scan), B3(ego), c); with `beams`, also the neck map (B, 48, cells)."""
+    def embed(self, scan, ego, c):
+        """e (B, 256) = B4(stem(scan), B3(ego), c)."""
         c = self._check_c(c, ego.shape[0])
-        if beams:
-            s, nk = self.stem.forward_map(scan)
-        else:
-            s, nk = self.stem(scan), None
-        e = self.fuse(torch.cat([s, self.ego(ego), c.to(s.dtype)], 1))
-        return (e, nk) if beams else e
+        s = self.stem(scan)
+        return self.fuse(torch.cat([s, self.ego(ego), c.to(s.dtype)], 1))
 
     def recur(self, e: torch.Tensor, h: Optional[torch.Tensor]):
         """One B5 step: (y (B, hidden), h' (1, B, hidden))."""
@@ -278,28 +267,23 @@ class ActorV2(nn.Module):
         mu, h_next = self.step(scan, ego, c, h)
         return self.dist_of(mu), h_next
 
-    def step_all(self, scan, ego, c, h=None, beams: bool = False) -> dict:
+    def step_all(self, scan, ego, c, h=None) -> dict:
         """Everything one step produces, for training: {"mu", "z", "h", and each attached head's
-        output -- "b8" (B, 3, 4), "near_car" (B, 5), "beam_car" (B, N) when `beams`}."""
-        if beams and self.beam_car is not None:
-            e, nk = self.embed(scan, ego, c, beams=True)
-        else:
-            e, nk = self.embed(scan, ego, c), None
+        output -- "b8" (B, 3, 4), "near_car" (B, 5)}."""
+        e = self.embed(scan, ego, c)
         y, h_next = self.recur(e, h)
         z = self.features(e, y)
         out = {"mu": self.action_mean(z), "z": z, "h": h_next}
-        out.update(self.aux(z, nk))
+        out.update(self.aux(z))
         return out
 
-    def aux(self, z: torch.Tensor, neck: Optional[torch.Tensor] = None) -> dict:
-        """The attached heads' outputs on features `z` (and the neck map, for the per-beam head)."""
+    def aux(self, z: torch.Tensor) -> dict:
+        """The attached heads' outputs on features `z`."""
         out = {}
         if self.b8 is not None:
             out["b8"] = self.b8(z)
         if self.near_car is not None:
             out["near_car"] = self.near_car(z)
-        if self.beam_car is not None and neck is not None:
-            out["beam_car"] = self.beam_car(neck)
         return out
 
     def _walk(self, e: torch.Tensor, h: torch.Tensor, keep: Optional[torch.Tensor]):
@@ -316,14 +300,14 @@ class ActorV2(nn.Module):
             ys.append(y_t[:, 0])
         return torch.stack(ys, 0), h
 
-    def sequence(self, scan, ego, c, h0=None, keep=None, burn_in: int = 0, beams: bool = False) -> dict:
+    def sequence(self, scan, ego, c, h0=None, keep=None, burn_in: int = 0) -> dict:
         """A (T, B) block for truncated BPTT: the hook the training unit builds its losses on.
 
         `scan` (T, B, K, N), `ego` (T, B, E), `c` (T, B, 1); `keep` (T, B), 0 where the state must not
         be carried into that step (its episode began there). The first `burn_in` steps only warm the
         state -- no graph, no outputs -- which is the redesign's burn-in 40 + chunk 80. The stem runs
         once for the whole block. Returns {"z" (T-b, B, 384), "mu" (T-b, B, act_dim), "h" (final),
-        each head's output with the same leading (T-b, B), "neck" when `beams`}."""
+        each head's output with the same leading (T-b, B)}."""
         T, B = scan.shape[0], scan.shape[1]
         flat = lambda t: t.reshape(t.shape[0] * t.shape[1], *t.shape[2:])
         h = h0 if h0 is not None else self.initial_hidden(B, scan.device, scan.dtype)
@@ -334,20 +318,11 @@ class ActorV2(nn.Module):
                 _y, h = self._walk(eb, h, None if keep is None else keep[:b])
             h = h.detach()
         n = T - b
-        want_map = beams and self.beam_car is not None
-        if want_map:
-            e, nk = self.embed(flat(scan[b:]), flat(ego[b:]), flat(c[b:]), beams=True)
-        else:
-            e, nk = self.embed(flat(scan[b:]), flat(ego[b:]), flat(c[b:])), None
-        e = e.view(n, B, -1)
+        e = self.embed(flat(scan[b:]), flat(ego[b:]), flat(c[b:])).view(n, B, -1)
         y, h = self._walk(e, h, None if keep is None else keep[b:])
         z = self.features(e, y)
         out = {"z": z, "mu": self.action_mean(z), "h": h}
-        heads = self.aux(z, None)
-        if want_map:
-            heads["beam_car"] = self.beam_car(nk).view(n, B, -1)
-            out["neck"] = nk
-        out.update(heads)
+        out.update(self.aux(z))
         return out
 
 
@@ -412,9 +387,6 @@ class ActorCriticV2(nn.Module):
         # without it by that head alone (v1's rule for every head it ever added).
         if ax["b8"]:
             self.actor.b8 = OpponentSlotHead(self.actor.feature_dim)
-        if ax["beam_car"]:
-            st = self.actor.stem
-            self.actor.beam_car = BeamCarHead(st.neck_channels, st.cells, st.n_beams)
         if ax["near_car"]:
             self.actor.near_car = NearestCarHead(self.actor.feature_dim)
         self.meta = dict(arch=ARCH, n_beams=int(n_beams), n_frames=int(n_frames), ego_dim=int(ego_dim),
@@ -464,7 +436,6 @@ def block_parameter_counts(model: ActorCriticV2) -> dict:
            "B5 GRU": n(a.gru), "B6 head": n(a.head) + n(a.mu), "B6 log_std": a.log_std.numel()}
     out["actor (deployed)"] = sum(out.values())
     out["B8 slots"] = n(a.b8)
-    out["beam car head"] = n(a.beam_car)
     out["nearest car head"] = n(a.near_car)
     out["B9 critic"] = n(model.critic)
     return out
