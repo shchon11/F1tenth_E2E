@@ -1474,6 +1474,11 @@ PPO_CHARTS: Tuple[ChartSpec, ...] = (
               lower_is_better=True, optional=True),
     ChartSpec(("traffic/wall_collisions_per_min",), "벽 충돌 / 분", "/분", ("danger",),
               lower_is_better=True, optional=True),
+    # --contact-severity-min: the onsets the penalties charge (at or above the threshold) next to all of them
+    ChartSpec(("contacts/wall_hard_per_km", "contacts/wall_all_per_km"), "벽·장애물 접촉 / km · 세기 하한 이상 vs 전체",
+              "/km", ("danger", "text.1"), labels=("하한 이상", "전체"), lower_is_better=True, optional=True),
+    ChartSpec(("contacts/car_onset_hard_per_km", "contacts/car_onset_all_per_km"), "차량 접촉 / km · 세기 하한 이상 vs 전체",
+              "/km", ("danger", "text.1"), labels=("하한 이상", "전체"), lower_is_better=True, optional=True),
     ChartSpec(("traffic/ttc_share",), "접촉 위험 시간 비율", "", ("warn",),
               lower_is_better=True, optional=True),
     ChartSpec(("kl_ref",), "KL (원본 대비)", "", ("text.1",)),

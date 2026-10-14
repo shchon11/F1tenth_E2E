@@ -3682,6 +3682,25 @@
           "metavar": null
         },
         {
+          "flag": "--contact-severity-min",
+          "flags": [
+            "--contact-severity-min"
+          ],
+          "dest": "contact_severity_min",
+          "label": "접촉 세기 하한 (m/s): 이보다 약한 스침은 penalty·lagrange 에서 빠짐 (0 = 모든 접촉, soft 전용)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "[m/s] charge only the contact onsets at least this hard -- the speed of the two surfaces into each other along the contact normal, at the contact point (f1sim.contact_severity). A softer onset is free for the collision and car-contact penalties and for --lagrange's onset counts; a harder one is charged exactly as before. Both counts are logged (contacts/*_all_per_km, contacts/*_hard_per_km). 0 = every onset, as before. Needs --collision-mode soft",
+          "action": "store",
+          "nullable": false,
+          "metavar": "V"
+        },
+        {
           "flag": "--algo",
           "flags": [
             "--algo"

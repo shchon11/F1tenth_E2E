@@ -293,6 +293,14 @@ class EnvConfig:
     # car-car response) swap the order within 1-19 steps and the exempt car is charged anyway (96/96 exempt
     # at the first step, then charged). True holds the first step's verdict for the whole contact.
     car_charge_latch: bool = True
+    # [m/s] The impact severity a contact onset needs to be charged (`f1sim.contact_severity`): the speed of
+    # the two surfaces into each other along the contact normal, at the contact point. 0 charges every
+    # onset, which is every run before this existed. Above 0 an onset slower than this is free -- for the
+    # `collision` component (and `collision_speed`, which rides on the same onset), so for `--lagrange
+    # wall=`, and for the car-contact charge, so for `--lagrange car=` -- and one at or above it is charged
+    # exactly as before. The goal it serves (2026-10-15): fast with the odd graze is good, hard hits are
+    # not. Soft contact only: under terminate every contact ends the episode whatever it cost.
+    contact_severity_min: float = 0.0
     # Whether a struck obstacle is shoved or is a wall with a crate's shape. Off is every run
     # before this existed. On, each prop carries the mass of what it is
     # (`procedural_obstacles.STYLE_MASS`: a cardboard box 1.2 kg, a wooden crate 10, a steel drum
@@ -858,7 +866,19 @@ class F1VecEnv:
             raise ValueError(
                 "movable_obstacles needs collision_mode='soft': under 'terminate' the episode ends "
                 "at the touch, so a crate that was shoved aside is a crate nothing ever saw move.")
+        sev_min = float(self.ecfg.contact_severity_min)
+        if not (sev_min >= 0.0 and math.isfinite(sev_min)):
+            raise ValueError(f"contact_severity_min is a speed in m/s, >= 0; got {self.ecfg.contact_severity_min!r}")
+        if sev_min > 0.0 and self.ecfg.collision_mode != "soft":
+            raise ValueError("contact_severity_min needs collision_mode='soft': under 'terminate' every contact "
+                             "ends the episode, so a free graze would still be the end of it.")
+        if sev_min > 0.0 and self.ecfg.collision_counts_cars:
+            raise ValueError("contact_severity_min with collision_counts_cars: the legacy double charge reads a car "
+                             "contact through the wall flag; charge by severity on the split accounting only.")
         self.sim = Simulator(track, self.cfg, num_envs, device, race_size=self.ecfg.race_size)
+        if sev_min > 0.0:
+            # the car contacts' closing speed is measured only when somebody reads it
+            self.sim.measure_impacts = True
         self.B, self.device = num_envs, self.sim.device
         # what `scan[:, ::subsample]` actually yields, which is a ceiling, not a floor. These agreed
         # while the LiDAR had 1080 beams; the measured count is 1081 (270 deg / 0.25 deg, endpoints
@@ -1103,6 +1123,12 @@ class F1VecEnv:
         #: Car contacts: in contact last step, and whether the contact under way is charged (`car_charge_latch`).
         self._car_prev = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self._car_resp = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: `contact_severity_min`: the wall/prop impact carried from the physical contact's start to its
+        #: onset (`contact_severity.carry_wall_impact`), and per car, in contact last step and whether the
+        #: contact under way was hard enough to be charged (decided at its first step).
+        self._wall_pending = torch.zeros(self.B, device=self.device)
+        self._car_sev_prev = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self._car_sev_ok = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self._replay = None
         if self.ecfg.replay_contacts > 0:
             if self.M != 2:
@@ -2271,6 +2297,8 @@ class F1VecEnv:
         self._was_touching[ids] = False                             # a fresh car is touching nothing
         self._was_touching_wall[ids] = False
         self._car_prev[ids] = False; self._car_resp[ids] = False
+        if self.ecfg.contact_severity_min > 0:
+            self._wall_pending[ids] = 0.0; self._car_sev_prev[ids] = False; self._car_sev_ok[ids] = False
         self.gap_prev[ids] = 0.0; self.gap_valid[ids] = False       # no gain scored on the first step
         self.act_hist[ids] = self.prev_action[ids][:, None, :]
         for seat in self._seat_builders():
@@ -2372,7 +2400,8 @@ class F1VecEnv:
         for target, scan in zip((current.scan, current.scan_true, current.scan_type), scans):
             target[ids] = scan[ids]
         for target in (current.attitude, current.imu, current.imu_att, current.collision,
-                       current.progress, current.lap, current.car_collision, current.wall_collision):
+                       current.progress, current.lap, current.car_collision, current.wall_collision,
+                       current.wall_impact, current.car_impact):
             if target is not None:
                 target[ids] = 0
         return current
@@ -2624,6 +2653,29 @@ class F1VecEnv:
         responsible = dn > -0.6
         return car_hit * responsible.to(car_hit.dtype)
 
+    def _severity_gate(self, r: StepResult, crash: torch.Tensor) -> dict:
+        """`contact_severity_min`: which of this step's contact onsets are hard enough to charge.
+
+        Walls and props: `crash` (the onsets of `wall_collision`) at or above the threshold, each with the
+        impact carried from its physical contact's start (`contact_severity.carry_wall_impact`; the flag
+        can rise steps after the hit). Cars: a contact is charged for its whole length if its first step's
+        closing speed (`car_impact`) reaches the threshold, decided once like `car_charge_latch` decides
+        who pays -- `car_basis` is the per-step contact flag with the soft ones taken out, which is what
+        `_car_charge` then charges. Returns the onsets both ways for the log."""
+        from .contact_severity import after_onset, carry_wall_impact
+        v_min = float(self.ecfg.contact_severity_min)
+        carry = carry_wall_impact(self._wall_pending, r.wall_impact, r.wall_collision)
+        self._wall_pending = after_onset(carry, crash)
+        out = {"wall_all": crash, "wall_hard": crash & (carry >= v_min)}
+        if r.car_collision is not None:
+            hit = r.car_collision
+            onset = hit & ~self._car_sev_prev
+            hard = onset & (r.car_impact >= v_min)
+            self._car_sev_ok = torch.where(onset, hard, self._car_sev_ok) & hit
+            self._car_sev_prev = hit.clone()
+            out.update(car_all=onset, car_hard=hard, car_basis=self._car_sev_ok.to(self.ep_return.dtype))
+        return out
+
     def _car_charge(self, s: torch.Tensor, tid: torch.Tensor, car_hit: torch.Tensor) -> torch.Tensor:
         """Per car, 1 while a contact it is charged for lasts. `car_contact_charge` decides who is charged; with
         `car_charge_latch` it decides once, at the step the contact begins, and the verdict holds until the
@@ -2754,6 +2806,10 @@ class F1VecEnv:
                 self._was_touching_wall = r.wall_collision.clone()
         else:
             crash = r.collision
+        # `contact_severity_min`: an onset slower than it is not charged (`_severity_gate`). 0 skips all of it.
+        gate = self._severity_gate(r, crash) if e.contact_severity_min > 0 else None
+        if gate is not None:
+            crash = gate["wall_hard"]
         self._widen_clearance_to_props(r)
         if self.procedural is not None and e.movable_obstacles:
             # Whatever the contacts shoved this step now slides, and the floor takes it back down.
@@ -2765,7 +2821,9 @@ class F1VecEnv:
                    else torch.zeros_like(self.ep_return))
         if self._replay is not None:
             self._replay.record(self, car_hit > 0)
-        car_charge = self._car_charge(r.s, self.sim.tid, car_hit)
+        # Under `contact_severity_min` only the hard contacts reach the charge; the replay above and the
+        # rear-end / merge terms below still see every contact.
+        car_charge = self._car_charge(r.s, self.sim.tid, car_hit if gate is None else gate.get("car_basis", car_hit))
         out = self._math(r.scan, r.wall_dist, r.s, r.state, r.progress, crash, r.lap, a, steer_norm, self.prev_steer_norm,
                          self.scan_hist, self.act_hist, self.ep_step, self.sim.tid, self.ep_return, self.ep_progress, self.prev_lap,
                          plan_ref, self.lap_start_step, car_charge, self.gap_prev, self.gap_valid,
@@ -2837,6 +2895,13 @@ class F1VecEnv:
         if r.car_collision is not None:
             info["car_collision"] = r.car_collision
             info["car_charge"] = car_charge
+        if gate is not None:
+            # the onsets both ways, for the trainer's log: every one, and those at or above the threshold
+            # (`wall_onset` above is the charged, hard one)
+            info["wall_onset_all"] = gate["wall_all"]
+            if "car_all" in gate:
+                info["car_onset_all"] = gate["car_all"]
+                info["car_onset_hard"] = gate["car_hard"]
         if self.obs_version == 2:
             # Critique B5: the v2 policy does not observe the speed cap (the env's own: DAgger's fixed
             # --speed-cap, PPO's curriculum), and the plan decode clips every speed at it -- on a
