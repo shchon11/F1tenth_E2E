@@ -140,6 +140,7 @@ LABELS = {
     "opponent_speed_mode": "상대차 plan 형식 (v2: 기본 linear, 리그 checkpoint는 자기 형식)",
     "v2_ego_actions": "v2 ego 에 지난 행동(plan) 열 포함 (off = 속도·yaw rate 이력만, copycat 대책 A)",
     "action_dropout": "v2 행동 이력 dropout 확률 (학습 sequence 마다 지난 행동 열을 0으로, copycat 대책 B)",
+    "updates": "v2 반복마다 최적화 업데이트 수 (비우면 epoch 수로; 데이터가 쌓여도 학습량이 같음)",
 }
 PATHS = {"init_estimator": "input_file", "replay_data": "input_file", "init": "input_file", "reference": "input_file", "estimator": "input_file",
          "v2_init_stem": "input_file",

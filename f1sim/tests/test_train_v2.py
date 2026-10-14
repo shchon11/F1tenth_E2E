@@ -658,6 +658,39 @@ def test_dagger_training_holds_the_auxiliary_pull_at_rho():
     assert summary["aux_scale_near"] == bal.scale["near"] and "measure_overhead_frac" in summary
 
 
+def test_dagger_updates_fix_the_count_whatever_the_data():
+    """`--updates`: the iteration runs exactly that many optimiser updates, for any `epochs` and any
+    amount of data; without it the count is `epochs` passes over the valid labels, as before."""
+    from f1sim.learn import dagger_v2
+    from f1sim.learn.model_v2 import ActorCriticV2
+
+    def buffer(n):
+        buf = dagger_v2.SequenceBuffer(n_frames=1)
+        s = _sequences(T=40, n=n, seed=3)
+        for t in range(40):
+            buf.add(scan=s["scan"][t, :, 0], ego=s["ego"][t], label=s["label"][t], valid=s["valid"][t],
+                    newep=torch.tensor([t == 0] * n), c=s["c"][t])
+        return buf.finalize()
+
+    def run(bufs, **kw):
+        torch.manual_seed(0)
+        m = ActorCriticV2(n_beams=61)
+        opt = torch.optim.Adam(m.actor.parameters(), lr=1e-4)
+        _loss, summary = dagger_v2.train_epochs(
+            m, bufs, batch=16, burn=4, chunk=8, device=torch.device("cpu"), opt=opt, log=lambda d: None,
+            plan_spec=SPEC, v_max=10.0, coefs={}, mirror=None, mirror_prob=0.0, log_every=1000, **kw)
+        steps = {int(st["step"]) for st in opt.state.values()}
+        return summary["updates"], steps
+
+    small, big = [buffer(2)], [buffer(2), buffer(3)]
+    for bufs in (small, big):
+        for epochs in (0.5, 20.0):
+            assert run(bufs, epochs=epochs, updates=7) == (7, {7})
+    n_small, _ = run(small, epochs=4.0)
+    n_big, _ = run(big, epochs=4.0)
+    assert n_big > n_small > 1                     # passes over the data: the count grows with it
+
+
 def test_relative_movement():
     p = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
     before = tv.flat_parameters([p])

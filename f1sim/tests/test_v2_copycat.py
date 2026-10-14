@@ -58,7 +58,19 @@ def test_the_copycat_options_default_to_the_contract_and_refuse_each_other():
             dagger_v2.prepare_args(ap, ap.parse_args(argv), argv)
 
 
-@pytest.mark.parametrize("flag,val", [("--v2-ego-actions", "off"), ("--action-dropout", "0.5")])
+def test_updates_per_iteration_is_a_positive_count_or_unset():
+    ap = _parser("f1sim.learn.dagger")
+    for argv, want in ((["--arch", "v2"], None), (["--arch", "v2", "--updates", "3000"], 3000)):
+        a = ap.parse_args(argv)
+        dagger_v2.prepare_args(ap, a, argv)
+        assert a.updates == want
+    for bad in ("0", "-5"):
+        argv = ["--arch", "v2", "--updates", bad]
+        with pytest.raises(SystemExit):
+            dagger_v2.prepare_args(ap, ap.parse_args(argv), argv)
+
+
+@pytest.mark.parametrize("flag,val", [("--v2-ego-actions", "off"), ("--action-dropout", "0.5"), ("--updates", "100")])
 def test_a_v1_run_refuses_the_copycat_flags(monkeypatch, flag, val):
     from f1sim.learn import dagger
     monkeypatch.setattr(sys, "argv", ["f1sim.learn.dagger", flag, val])

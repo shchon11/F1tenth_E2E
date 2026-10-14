@@ -235,6 +235,8 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     a.v2_ego_actions = "on" if resolve_ego_actions(a) else "off"
     if not 0.0 <= float(a.action_dropout) <= 1.0:
         raise SystemExit("--action-dropout is a probability")
+    if a.updates is not None and int(a.updates) < 1:
+        raise SystemExit("--updates is a number of optimiser updates per iteration (>= 1)")
     if float(a.action_dropout) > 0 and a.v2_ego_actions == "off":
         raise SystemExit("--action-dropout zeroes the ego's issued-action columns, and with --v2-ego-actions off "
                          "there are none: pick one of the two")
@@ -568,7 +570,7 @@ def sequence_losses(model, s: dict, *, burn: int, plan_spec, v_max: float, coefs
 def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: int, device, opt, log,
                  plan_spec, v_max: float, coefs: dict, mirror: Optional[Mirror], mirror_prob: float,
                  log_every: int = 25, max_grad: float = 1.0, balance: Optional[AuxBalance] = None,
-                 dropout: Optional[ActionDropout] = None):
+                 dropout: Optional[ActionDropout] = None, updates: Optional[int] = None):
     """Truncated BPTT over sequences of `burn + chunk` steps; `batch` scored steps per update (so
     `batch // chunk` sequences). Every buffer is drawn in proportion to its valid labels, as v1.
     Returns (the last updates' mean loss, {each part's and each gradient norm's mean over the
@@ -589,7 +591,10 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
 
     `dropout` (`train_v2.ActionDropout`, `--action-dropout`): after the mirror, each sequence loses its
     issued-action columns with the dropout's probability; the share it dropped is in the summary
-    (`action_dropped_frac`)."""
+    (`action_dropped_frac`).
+
+    `updates` (`--updates`): this many optimiser updates, whatever the buffers hold, in place of
+    `epochs` passes over their valid labels."""
     n_valid = sum(b.valid_count for b in bufs)
     log({"dagger/valid_labels": n_valid, "dagger/invalid_labels": sum(len(b) for b in bufs) - n_valid})
     if not n_valid:
@@ -603,7 +608,7 @@ def train_epochs(model, bufs, *, epochs: float, batch: int, burn: int, chunk: in
         chunk = length - burn
         print(f"  sequences shortened to the {T_min}-step collection: burn-in {burn} + chunk {chunk}", flush=True)
     m = max(1, int(batch) // max(1, chunk))
-    steps = max(1, int(epochs * n_valid / (m * chunk)))
+    steps = int(updates) if updates else max(1, int(epochs * n_valid / (m * chunk)))
     weights = torch.tensor([float(b.valid_count) for b in bufs])
     trunk = actor_trunk_parameters(model.actor)
     params = [p for p in model.actor.parameters() if p.requires_grad]
@@ -742,7 +747,8 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
     seq = {"burn_in": int(a.seq_burn), "chunk": int(a.chunk_length)}
     print(f"v2 DAgger: {spec.n_frames} frame(s), ego {spec.ego_dim} (issued actions "
           f"{'in it' if spec.ego_actions else 'NOT in it'}), action dropout p {float(a.action_dropout):g}, "
-          f"sequences burn-in {seq['burn_in']} + "
+          + (f"{int(a.updates)} updates per iteration, " if a.updates else f"{a.epochs:g} epochs per iteration, ")
+          + f"sequences burn-in {seq['burn_in']} + "
           f"chunk {seq['chunk']}, mirror p {a.mirror_prob:g}, labels '{a.wp4_label}', aux {coefs} "
           + (f"balanced every {balance.every} updates to <= {balance.rho:g} x the imitation's trunk gradient "
              f"(EMA {balance.beta:g}) " if balance.enabled else "(no auxiliary balance) ")
@@ -777,7 +783,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         loss, parts = train_epochs(model, buffer_iters, epochs=a.epochs, batch=a.batch, burn=seq["burn_in"],
                                    chunk=seq["chunk"], device=device, opt=opt, log=log, plan_spec=plan_spec,
                                    v_max=v_max, coefs=coefs, mirror=mirror, mirror_prob=a.mirror_prob,
-                                   log_every=a.log_every, balance=balance, dropout=dropout)
+                                   log_every=a.log_every, balance=balance, dropout=dropout, updates=a.updates)
         model.eval()
         t_tr = tm.lap()
         do_eval = (it % max(1, a.eval_every) == 0) or (it == a.start_iter + a.iters - 1)
@@ -856,6 +862,7 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                 **({"tracker_speed_ff": True} if a.tracker_speed_ff else {}),
                 "wp4_label": a.wp4_label, "bc": dict(BC_CONSTANTS), "sequence": seq,
                 "mirror_prob": float(a.mirror_prob), "action_dropout": float(a.action_dropout),
+                "updates_per_iter": (int(a.updates) if a.updates else None), "epochs_per_iter": float(a.epochs),
                 "aux_coefs": coefs, "aux_balance": balance.state_dict(),
                 "dial": {"margin": float(a.dial_margin), "exact": float(a.dial_exact)},
                 "v2_defaults": applied, "teacher_grip": a.teacher_grip, "teacher_speed": a.teacher_speed,

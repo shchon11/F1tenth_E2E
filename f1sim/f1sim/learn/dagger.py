@@ -832,6 +832,12 @@ def main():
                     help="v2: per training sequence, with probability P zero every issued-action column of the "
                          "ego (a_{t-2} and the history's), never at collection or evaluation -- the copycat "
                          "study's arm B (docs/research/copycat-2026-10-14.md; default 0)")
+    ap.add_argument("--updates", type=int, default=None, metavar="N",
+                    help="v2: optimiser updates per iteration, whatever the iteration's data holds, instead of "
+                         "--epochs' passes over it. The it0 learning curve is in updates (itcurve, 2026-10-14: 41 "
+                         "updates -- 3 epochs of one 30,720-row iteration -- left the held-out error 2.6x above "
+                         "its 3000-update value), and a pass count would grow the training with every "
+                         "aggregated iteration")
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
     v2_applied = None
@@ -841,7 +847,7 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
                               "aux_balance_every", "aux_balance_rho", "aux_balance_beta", "opponent_speed_mode",
-                              "v2_ego_actions", "action_dropout")
+                              "v2_ego_actions", "action_dropout", "updates")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")

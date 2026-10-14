@@ -6545,6 +6545,25 @@
           "metavar": "P"
         },
         {
+          "flag": "--updates",
+          "flags": [
+            "--updates"
+          ],
+          "dest": "updates",
+          "label": "v2 반복마다 최적화 업데이트 수 (비우면 epoch 수로; 데이터가 쌓여도 학습량이 같음)",
+          "kind": "int",
+          "item_kind": "int",
+          "default": null,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "학습",
+          "help": "v2: optimiser updates per iteration, whatever the iteration's data holds, instead of --epochs' passes over it. The it0 learning curve is in updates (itcurve, 2026-10-14: 41 updates -- 3 epochs of one 30,720-row iteration -- left the held-out error 2.6x above its 3000-update value), and a pass count would grow the training with every aggregated iteration",
+          "action": "store",
+          "nullable": true,
+          "metavar": "N"
+        },
+        {
           "flag": "--race-size",
           "flags": [
             "--race-size"
