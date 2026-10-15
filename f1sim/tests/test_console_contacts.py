@@ -155,20 +155,26 @@ def test_interpolated_playback_keeps_a_marker_where_it_was_once_and_fades_it_smo
     k_p, k_q = 4, 10
 
     def frame_at(j):
-        held = {}
+        held, now = {}, {}
         if j >= k_p:
             held[0] = (WALL, P, 1.6, max(0.0, 0.3 - DT * (j - k_p)))
         if j >= k_q:
             held[1] = held[2] = (CAR, Q, 0.8, max(0.0, 0.3 - DT * (j - k_q)))
-        return a_frame(t=DT * j, seq=j, contact=block(3, held=held))
+        if j == k_p:
+            now[0] = (WALL, P, 1.6)                         # the touch on the step of the hit is the hit
+        if j == k_q:
+            now[1] = now[2] = (CAR, Q, 0.8)
+        return a_frame(t=DT * j, seq=j, contact=block(3, held=held, now=now))
 
     feed = [frame_at(j) for j in range(40)]
+    stamp = CT.ImpactClock()                                # as SessionController does on arrival
     b = FrameBuffer(capacity=4)
     b.set_generation(0)
     nxt, draws = 0, []
     for _ in range(int(40 * DT / 0.005) + 20):
         clock[0] += 0.005
         while nxt < len(feed) and feed[nxt]["t"] <= clock[0] - 100.0 + 1e-9:
+            stamp.stamp(feed[nxt])
             assert b.push(feed[nxt])
             nxt += 1
         out = b.frame_to_draw(interpolate=True)
@@ -191,6 +197,89 @@ def test_interpolated_playback_keeps_a_marker_where_it_was_once_and_fades_it_smo
     assert np.max(-np.diff(seq)) < 0.1, seq                   # and smoothly: no step at a frame boundary
     shown = (on[-1] - on[0] + 1) * 0.005
     assert 0.3 - 2 * DT <= shown <= 0.3 + 2 * DT, shown       # for the hold, give or take a frame
+
+
+def test_a_hit_fades_from_when_it_happened_and_a_long_push_is_drawn_where_it_touches():
+    """A 2 m/s hit at P, then the car keeps pushing for a second while the contact slides away from P.
+
+    Every contact step restarts the hold and the hit stays the hold's record, so a hit timed by the hold
+    looked fresh -- and stood at P -- for as long as the car touched. Timed from when it happened
+    (`ImpactClock`), it is gone after `hold_s`; the touch is drawn where the car touches now.
+    """
+    P = (3.0, 2.0)
+    stamp = CT.ImpactClock()
+    frames = []
+    for j in range(60):
+        held, now = {}, {}
+        if j >= 4:
+            pushing = j < 44
+            left = 0.3 if pushing else max(0.0, 0.3 - DT * (j - 43))
+            held[0] = (WALL, P, 2.0, left)
+            if pushing:
+                now[0] = (WALL, (P[0] + 0.05 * (j - 4), P[1]), 2.0 if j == 4 else 0.0)
+        fr = a_frame(t=DT * j, seq=j, contact=block(3, held=held, now=now))
+        stamp.stamp(fr)
+        frames.append(fr)
+    assert frames[30]["contact"]["impact_t"][0] == pytest.approx(DT * 4, abs=1e-6)   # the hit's own time
+
+    def marks(j):
+        """{point rounded to the mm: (alpha, diameter)} of the markers drawn for frame j."""
+        rows = CT.contact_marks(frames[j])
+        return {} if rows is None else {(round(float(r[0]), 3), round(float(r[1]), 3)): (float(r[6]), float(r[7]))
+                                        for r in rows}
+
+    assert list(marks(4)) == [P]                                               # the hit, once
+    at10 = marks(10)
+    assert at10[P][0] == pytest.approx(1.0 - 6 * DT / 0.3, abs=1e-3)           # fading from the hit
+    touch = (round(P[0] + 0.05 * 6, 3), P[1])
+    assert touch in at10 and at10[touch][1] < at10[P][1]                       # and the push, smaller
+    assert list(marks(30)) == [(round(P[0] + 0.05 * 26, 3), P[1])]            # the hit has gone; the push is where it is
+    assert marks(50) == {}                                                     # let go: nothing on the track
+    w = [float(CT.car_highlight(frames[j])[2][0]) for j in (4, 30, 46, 50)]
+    assert w[0] == pytest.approx(1.0)                                          # a flash
+    assert w[1] == pytest.approx(CT.HIGHLIGHT_MIN)                             # a steady glow while pushing
+    assert w[1] > w[2] > w[3] > 0.0                                            # fading once it let go
+
+
+def test_a_car_pressed_where_it_hit_never_loses_its_marker():
+    """Hit at P, then pressed against P: the hit alone at first (the touch is the hit), the fading hit
+    and the steady touch once the hit is the fainter, the touch alone after the hold -- never nothing."""
+    P = (3.0, 2.0)
+    stamp = CT.ImpactClock()
+    counts, touch_alpha = [], CT.MARK_ALPHA_MIN
+    for j in range(30):
+        fr = a_frame(t=DT * j, seq=j, contact=block(3, held={0: (WALL, P, 2.0, 0.3)},
+                                                    now={0: (WALL, P, 2.0 if j == 0 else 0.0)}))
+        stamp.stamp(fr)
+        rows = CT.contact_marks(fr)
+        assert rows is not None and np.allclose(rows[:, :2], P)
+        counts.append(len(rows))
+        if j == 0:
+            assert len(rows) == 1 and rows[0, 6] == pytest.approx(1.0)
+        if j * DT >= 0.3 + DT:                            # (float32 holds: a step of slack)
+            assert len(rows) == 1 and rows[0, 6] == pytest.approx(touch_alpha)
+    assert 2 in counts                                     # both, while the hit fades through the touch
+
+
+def test_the_impact_clock_keeps_a_records_time_and_starts_over_with_a_new_one_or_session():
+    clock = CT.ImpactClock()
+
+    def stamped(t, held, gen=0):
+        fr = a_frame(t=t, gen=gen, contact=block(3, held=held))
+        clock.stamp(fr)
+        return fr["contact"]["impact_t"]
+
+    t0 = stamped(1.0, {0: (WALL, (1.0, 1.0), 1.2, 0.3)})
+    assert t0[0] == pytest.approx(1.0) and np.isnan(t0[1:]).all()
+    assert stamped(1.1, {0: (WALL, (1.0, 1.0), 1.2, 0.3)})[0] == pytest.approx(1.0)      # unchanged: kept
+    assert stamped(1.2, {0: (WALL, (1.0, 1.0), 1.2, 0.2)})[0] == pytest.approx(1.0)
+    # a harder contact takes the record: its own time, the hold's latest contact step
+    assert stamped(1.3, {0: (CAR, (2.0, 1.0), 2.5, 0.25)})[0] == pytest.approx(1.25)
+    assert np.isnan(stamped(1.4, {})[0])                                                 # nothing held
+    # another session: nothing carries over, even an identical record
+    stamped(2.0, {0: (WALL, (1.0, 1.0), 1.2, 0.3)})
+    assert stamped(2.5, {0: (WALL, (1.0, 1.0), 1.2, 0.3)}, gen=1)[0] == pytest.approx(2.5)
+    clock.stamp(a_frame())                                                               # no block: no-op
 
 
 def test_a_frame_drawn_raw_reads_its_own_hold():
@@ -263,10 +352,11 @@ def test_the_viewport_hands_the_scene_the_markers_and_lights_the_cars(viewport):
     np.testing.assert_allclose(tint[1], viewport.TINT_OTHER)                        # untouched: as before
     assert tint[2, 0] > tint[2, 1] and tint[2, 0] > viewport.TINT_OTHER[0]           # the other one, red
     ring = calls["set_focus_ring"][1]["colour"]
-    np.testing.assert_allclose(ring[:3], orange, atol=1e-6)                         # the ring takes the kind
-    (xy, cols), _ = calls["set_contact_rings"]
-    np.testing.assert_allclose(xy, [[fr["x"][2], fr["y"][2]]])                       # a ring for the other car
-    np.testing.assert_allclose(cols[0, :3], red)
+    assert ring == pytest.approx(viewport.RING_FOCUS)                                # the watched car stays cyan
+    (xy, cols), kw = calls["set_contact_rings"]
+    np.testing.assert_allclose(xy, [[fr["x"][0], fr["y"][0]], [fr["x"][2], fr["y"][2]]])   # a ring per contact
+    np.testing.assert_allclose(cols[:, :3], [orange, red])
+    assert kw["radius"] > 0.34                                                       # outside the watched car's
     # the markers are an overlay; the car's own colour is not
     viewport.show_contacts = False
     viewport._draw(fr)

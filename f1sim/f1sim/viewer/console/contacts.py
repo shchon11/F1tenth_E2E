@@ -16,13 +16,21 @@ simulator now records all of that (`Simulator.contact_frame`), per drawn car:
 No Qt and no GL in here, like `frames.py`: the viewport and the window hand a frame to these functions
 and draw what comes back, so the whole data path is testable without a window.
 
+**Two markers per car, at most.** The *hit*: the hold's hardest contact, at its point, fading and
+spreading over `hold_s` from when it happened. The *touch*: this step's contact, at its point, while
+the car is touching -- small and faint for a resting push or scrape, so it follows the contact as it
+moves. The hit is timed from the record itself (`ImpactClock`, stamped on each frame as it arrives),
+not from the hold: every contact step restarts the hold, so a hard hit followed by a long push kept
+the hit's record -- and its marker -- for as long as the cars touched. Measured on a 4-car ICCAS
+self-play race: held points a median 1.8 m (up to 2.5 m) behind cars that were still pushing, for up
+to 43 s.
+
 **Interpolation.** `FrameBuffer.frame_to_draw` interpolates poses between two frames and takes every
 other key -- this block included -- from the newer one, `f1`, whose simulated time it records as
 ``t_frame``. Everything here reads one frame's block and nothing else: a marker sits at the point the
 block names (never a blend of two frames' points, which would slide a marker between two different
-contacts), one per car, so a frame drawn several times draws the same markers each time. Only the
-fade follows the drawn time: ``held_s + (t_frame - t)``, so a hold runs out smoothly between frames
-instead of in 25 ms steps.
+contacts), so a frame drawn several times draws the same markers each time. Only the fades follow the
+drawn time ``t``, so they run smoothly between frames instead of in 25 ms steps.
 """
 from __future__ import annotations
 
@@ -105,9 +113,35 @@ def _block(fr: dict) -> Optional[dict]:
         return None
     if out["hold_s"] <= 0.0:
         return None
-    out["held_kind"] = np.where((out["held_kind"] >= KIND_WALL) & (out["held_kind"] <= KIND_CAR),
-                                out["held_kind"], KIND_NONE)
+    # this step's contact, and when the held record happened (`ImpactClock`) -- both optional: a block
+    # without them draws the hit by the hold, as the record alone allows
+    try:
+        out["kind"] = np.asarray(blk["kind"]).astype(np.int64).reshape(-1)[:n]
+        out["point"] = np.asarray(blk["point"], np.float64).reshape(-1, 2)[:n]
+        out["severity"] = np.asarray(blk["severity"], np.float64).reshape(-1)[:n]
+        if any(len(out[k]) != n for k in ("kind", "point", "severity")):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        out["kind"] = np.zeros(n, np.int64)
+        out["point"] = np.zeros((n, 2))
+        out["severity"] = np.zeros(n)
+    try:
+        imp = np.asarray(blk["impact_t"], np.float64).reshape(-1)[:n]
+        out["impact_t"] = imp if len(imp) == n else None
+    except (KeyError, TypeError, ValueError):
+        out["impact_t"] = None
+    for k in ("held_kind", "kind"):
+        out[k] = np.where((out[k] >= KIND_WALL) & (out[k] <= KIND_CAR), out[k], KIND_NONE)
     return out
+
+
+def _times(fr: dict) -> Tuple[float, float]:
+    """(t, t_frame): the time the frame is drawn at and the time its block belongs to."""
+    try:
+        t = float(fr.get("t", 0.0))
+        return t, float(fr.get("t_frame", t))
+    except (TypeError, ValueError):
+        return 0.0, 0.0
 
 
 def hold_left(fr: dict, blk: Optional[dict] = None) -> Optional[np.ndarray]:
@@ -120,15 +154,27 @@ def hold_left(fr: dict, blk: Optional[dict] = None) -> Optional[np.ndarray]:
     blk = _block(fr) if blk is None else blk
     if blk is None:
         return None
-    try:
-        t = float(fr.get("t", 0.0))
-        t_frame = float(fr.get("t_frame", t))
-    except (TypeError, ValueError):
-        t = t_frame = 0.0
+    t, t_frame = _times(fr)
     lead = max(0.0, t_frame - t)
     held = blk["held_s"]
     left = np.where(held > 0.0, np.minimum(held + lead, blk["hold_s"]), 0.0)
     return np.where(blk["held_kind"] > KIND_NONE, left, 0.0)
+
+
+def impact_age(fr: dict, blk: Optional[dict] = None) -> Optional[np.ndarray]:
+    """(n,) seconds since each car's held contact happened, at the time the frame is drawn; inf where
+    nothing is held. From the frame's ``impact_t`` (`ImpactClock`); without it, the time since the
+    hold's last contact step, which is all the record alone says."""
+    blk = _block(fr) if blk is None else blk
+    if blk is None:
+        return None
+    if blk["impact_t"] is not None:
+        t, _ = _times(fr)
+        age = np.where(np.isfinite(blk["impact_t"]), np.maximum(0.0, t - blk["impact_t"]), np.inf)
+    else:
+        left = hold_left(fr, blk)
+        age = np.where(left > 0.0, blk["hold_s"] - left, np.inf)
+    return np.where(blk["held_kind"] > KIND_NONE, age, np.inf)
 
 
 def severity_scale(sev) -> np.ndarray:
@@ -138,27 +184,10 @@ def severity_scale(sev) -> np.ndarray:
     return np.sqrt(s)
 
 
-def contact_marks(fr: dict) -> Optional[np.ndarray]:
-    """(k, len(MARK_COLUMNS)) float32: one marker per held contact, for `Scene.set_contact_marks`.
-
-    Colour by kind; diameter, on-screen minimum and brightness by severity; ``phase`` runs 0 -> 1 over
-    the hold (the shader's ring expands with it) and the alpha fades 1 -> 0; ``hard`` is 1 at or above
-    the simulator's `hard_mps`. None when there is nothing to draw.
-    """
-    blk = _block(fr)
-    if blk is None:
-        return None
-    left = hold_left(fr, blk)
-    live = np.flatnonzero(left > 0.0)
-    if not len(live):
-        return None
-    hold = blk["hold_s"]
-    kind = blk["held_kind"][live]
-    sev = blk["held_severity"][live]
-    pt = blk["held_point"][live]
-    fade = left[live] / hold
+def _mark_rows(kind, pt, sev, fade, hard_mps) -> np.ndarray:
+    """Marker rows (`MARK_COLUMNS`) for contacts of these kinds, points and severities, `fade` 1 -> 0."""
     s = severity_scale(sev)
-    rows = np.zeros((len(live), len(MARK_COLUMNS)), np.float32)
+    rows = np.zeros((len(kind), len(MARK_COLUMNS)), np.float32)
     rows[:, 0:2] = pt
     rows[:, 2] = MARK_Z
     rows[:, 3:6] = KIND_RGB[kind]
@@ -166,18 +195,49 @@ def contact_marks(fr: dict) -> Optional[np.ndarray]:
     rows[:, 7] = MARK_D[0] + (MARK_D[1] - MARK_D[0]) * s
     rows[:, 8] = MARK_PX[0] + (MARK_PX[1] - MARK_PX[0]) * s
     rows[:, 9] = 1.0 - fade
-    rows[:, 10] = (sev >= blk["hard_mps"]).astype(np.float32)
-    ok = np.isfinite(rows).all(1)
-    rows, kind, sev = rows[ok], kind[ok], sev[ok]
+    rows[:, 10] = (np.asarray(sev) >= hard_mps).astype(np.float32)
+    return rows
+
+
+def contact_marks(fr: dict) -> Optional[np.ndarray]:
+    """(k, len(MARK_COLUMNS)) float32 marker rows for `Scene.set_contact_marks`; None for none.
+
+    The hit -- each car's held contact, at its point, for `hold_s` after it happened: the alpha fades
+    1 -> 0 and ``phase`` runs 0 -> 1 (the shader spreads its ring with it). The touch -- this step's
+    contact, at its point, while the car touches: no fade, ``phase`` 0. Both coloured by kind; diameter,
+    on-screen minimum and brightness by severity; ``hard`` 1 at or above the simulator's `hard_mps`.
+    """
+    blk = _block(fr)
+    if blk is None:
+        return None
+    hold, hard_mps = blk["hold_s"], blk["hard_mps"]
+    age = impact_age(fr, blk)
+    hit = np.flatnonzero(age < hold)
+    now = np.flatnonzero(blk["kind"] > KIND_NONE)
+    if not len(hit) and not len(now):
+        return None
+    rows = np.concatenate([
+        _mark_rows(blk["held_kind"][hit], blk["held_point"][hit], blk["held_severity"][hit],
+                   1.0 - age[hit] / hold, hard_mps),
+        _mark_rows(blk["kind"][now], blk["point"][now], blk["severity"][now], np.ones(len(now)), hard_mps)])
+    kind = np.concatenate([blk["held_kind"][hit], blk["kind"][now]])
+    sev = np.concatenate([blk["held_severity"][hit], blk["severity"][now]])
+    touch = np.concatenate([np.zeros(len(hit), bool), np.ones(len(now), bool)])
+    ok = np.isfinite(rows).all(1) & np.isfinite(sev)
+    rows, kind, sev, touch = rows[ok], kind[ok], sev[ok], touch[ok]
     if not len(rows):
         return None
-    # One contact, one marker. The cars of a car-car contact both hold it, at the same point; drawn
-    # twice it would be twice as bright as the same hit on a wall. Harder (then fresher) first, and a
-    # marker is dropped when one of its kind already stands within MERGE_M.
+    # One contact, one marker. The cars of a car-car contact both hold it, at the same point, and on the
+    # step of a hit the touch is the hit: drawn twice it would be twice as bright as the same hit on a
+    # wall. Harder, then brighter, first; a marker is dropped when one of its kind within MERGE_M covers
+    # it -- the same contact seen by the other car, or anything at least as bright. A car still pressed
+    # where it hit keeps its touch once the fading hit is fainter than the touch.
     order = np.lexsort((-rows[:, 6], -sev))
     keep = []
     for j in order:
-        if not any(kind[i] == kind[j] and np.hypot(*(rows[i, :2] - rows[j, :2])) < MERGE_M for i in keep):
+        covered = any(kind[i] == kind[j] and np.hypot(*(rows[i, :2] - rows[j, :2])) < MERGE_M
+                      and (touch[i] == touch[j] or rows[i, 6] >= rows[j, 6] - 1e-6) for i in keep)
+        if not covered:
             keep.append(j)
     return rows[np.sort(np.asarray(keep, np.int64))]
 
@@ -185,21 +245,68 @@ def contact_marks(fr: dict) -> Optional[np.ndarray]:
 def car_highlight(fr: dict) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """(hot (n, 3), colour (n, 3), weight (n,)) -- how each car is lit by the contact it holds.
 
-    ``hot`` is the over-bright tint a car's body is pulled toward, ``colour`` the kind's plain colour
-    (for the ground ring), ``weight`` 0 (nothing held) .. 1 (a full-scale hit, just now): it fades with
-    the hold, so a hit stays visible for `hold_s` after the car has backed off. None without a block.
+    ``hot`` is the over-bright tint a car's body is pulled toward, ``colour`` the held kind's plain
+    colour (for the ground ring), ``weight`` 0 .. 1, the larger of two parts: the hit, a flash fading
+    over `hold_s` from when it happened, brighter the harder it was; and the touch, `HIGHLIGHT_MIN`
+    while the car touches and fading with the hold once it has let go. A hard hit followed by a long
+    push is a flash, then a steady glow while they push, then a fade. None without a block.
     """
     blk = _block(fr)
     if blk is None:
         return None
-    left = hold_left(fr, blk)
+    hold = blk["hold_s"]
     kind = blk["held_kind"]
-    fade = left / blk["hold_s"]
     s = severity_scale(blk["held_severity"])
-    w = np.where(kind > KIND_NONE, fade * (HIGHLIGHT_MIN + (1.0 - HIGHLIGHT_MIN) * s), 0.0)
+    age = impact_age(fr, blk)
+    w_hit = np.clip(1.0 - age / hold, 0.0, 1.0) * (HIGHLIGHT_MIN + (1.0 - HIGHLIGHT_MIN) * s)
+    w_touch = HIGHLIGHT_MIN * hold_left(fr, blk) / hold
+    w = np.where(kind > KIND_NONE, np.maximum(w_hit, w_touch), 0.0)
     w = np.where(np.isfinite(w), np.clip(w, 0.0, 1.0), 0.0)
     colour = KIND_RGB[kind].astype(np.float32)
     return (colour * HIGHLIGHT_GAIN).astype(np.float32), colour, w.astype(np.float32)
+
+
+class ImpactClock:
+    """When each car's held contact happened, stamped onto every frame as it arrives (``impact_t``).
+
+    The frame has the hold's record (its hardest contact) but not the record's time, and the hold says
+    nothing about it either: every contact step restarts the hold, so a hit followed by a long push
+    kept a hold that looked like a fresh hit for as long as the cars touched (see the module note). A
+    record that differs from the previous frame's is new and happened at the hold's latest contact step,
+    ``t - (hold_s - held_s)`` -- exact when the worker sends every step, within a frame otherwise; an
+    unchanged one keeps its time. Applied once per frame in arrival order (`SessionController`), so
+    drawing stays a function of the frame alone. A new session or car count starts over.
+    """
+
+    def __init__(self):
+        self._key = None
+        self._rec: Optional[np.ndarray] = None
+        self._t: Optional[np.ndarray] = None
+
+    def stamp(self, fr: dict) -> None:
+        blk = fr.get("contact") if isinstance(fr, dict) else None
+        if not isinstance(blk, dict):
+            return
+        try:
+            n, t = int(fr["n"]), float(fr["t"])
+            hold = float(blk.get("hold_s", 0.3))
+            kind = np.asarray(blk["held_kind"]).astype(np.int64).reshape(-1)[:n]
+            rec = np.concatenate([kind[:, None].astype(np.float64),
+                                  np.asarray(blk["held_point"], np.float64).reshape(-1, 2)[:n],
+                                  np.asarray(blk["held_severity"], np.float64).reshape(-1)[:n, None]], 1)
+            left = np.asarray(blk["held_s"], np.float64).reshape(-1)[:n]
+        except (KeyError, TypeError, ValueError):
+            return
+        if len(rec) != n or len(left) != n:
+            return
+        held = (kind > KIND_NONE) & (left > 0.0)
+        t_rec = np.where(held, t - (hold - left), np.nan)
+        key = (fr.get("gen"), n)
+        if key == self._key and self._rec is not None:
+            same = (rec == self._rec).all(1) & held & np.isfinite(self._t)
+            t_rec = np.where(same, self._t, t_rec)
+        self._key, self._rec, self._t = key, rec, t_rec
+        blk["impact_t"] = t_rec
 
 
 # ---------------------------------------------------------------- the panel's numbers

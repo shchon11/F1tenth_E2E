@@ -871,7 +871,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             sc.set_focus_ring(float(fr["x"][f]), float(fr["y"][f]), colour=ring)
         else:
             sc.set_focus_ring(0.0, 0.0, on=False)
-        sc.set_contact_rings(*(rings or (None, None)))
+        sc.set_contact_rings(*(rings or (None, None)), radius=self.CONTACT_RING_M)
         sc.set_car_instances(mats, tint, labels=fr.get("ids") if self.show_labels else None)
         sc.set_dyn_prop_poses(fr.get("props_dyn"))
         # Where each held contact touched, what it was and how hard (`contacts.contact_marks`).
@@ -929,15 +929,19 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
     TINT_COLLIDED = (1.0, 0.35, 0.3, 1.0)
     RING_COLLIDED = (1.0, 0.35, 0.3, 0.9)
 
+    #: [m] the contact ring, just outside the watched car's own (`Scene.set_focus_ring`, 0.34 m): the
+    #: watched car keeps its cyan ring, so which car is watched never changes colour with a contact
+    CONTACT_RING_M = 0.42
+
     def _car_tints(self, fr: dict, n: int, f: int):
-        """(tint (n, 4) float32, the watched car's ring colour or None, the other cars' contact rings
-        as (xy (k, 2), colour (k, 4)) or None) for this frame.
+        """(tint (n, 4) float32, the watched car's ring colour or None, the contact rings as
+        (xy (k, 2), colour (k, 4)) or None) for this frame.
 
         A car holding a contact (`contacts.car_highlight`) is lit in the colour of what it touched --
         orange a wall or duct hose, yellow a crate, red another car -- and gets a ring of that colour
-        on the ground (the watched car's own ring changes colour), while the simulator holds it (until
-        0.3 s after the last touch), fading with the hold, a hard hit brighter than a graze. The ring
-        is what shows from far away: a tint is mostly lost on a car seen from above, which is the
+        on the ground, while the simulator holds it (until 0.3 s after the last touch): a flash for a
+        hit, brighter the harder, a steady glow while it keeps touching, a fade once it lets go. The
+        ring is what shows from far away: a tint is mostly lost on a car seen from above, which is the
         electronics deck. This replaces the red `coll` flag: true only on the steps that end touching
         something -- one 25 ms frame for a hit that bounces off -- and silent on what was touched. A
         frame with no contact block (an older worker) still gets that red flag.
@@ -955,12 +959,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         if hl is not None and len(hl[2]) == n:
             hot, colour, w = hl
             tint[:, :3] = tint[:, :3] * (1.0 - w[:, None]) + hot * w[:, None]
-            if watched and w[f] > 0.0:
-                ring[:3] = ring[:3] * (1.0 - w[f]) + colour[f] * w[f]
-                ring[3] = max(float(ring[3]), 0.95)
             lit = w > 0.0
-            if watched:
-                lit[f] = False
             if lit.any():
                 xy = np.stack([np.asarray(fr["x"], np.float32)[:n], np.asarray(fr["y"], np.float32)[:n]], 1)
                 cols = np.concatenate([colour, np.clip(0.25 + w, 0.0, 1.0)[:, None]], 1)

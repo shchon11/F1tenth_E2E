@@ -676,9 +676,9 @@ class Scene:
         cols = np.tile(np.asarray(colour, np.float32), (len(a), 1))
         self._upload_dyn("ring", np.concatenate([pts, cols], 1)); self.ring_n = len(a)
 
-    def set_contact_rings(self, xy, colours, radius=0.34, segments=32):
+    def set_contact_rings(self, xy, colours, radius=0.42, segments=32):
         """Rings on the ground around the cars holding a contact: `xy` (k, 2) centres, `colours`
-        (k, 4). None or empty clears them. The watched car's ring is `set_focus_ring`, apart."""
+        (k, 4). None or empty clears them. The watched car's own ring is `set_focus_ring`, apart."""
         if xy is None or not len(xy):
             self.crings_n = 0
             return
