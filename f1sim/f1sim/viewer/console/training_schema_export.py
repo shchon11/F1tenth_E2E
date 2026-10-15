@@ -142,6 +142,7 @@ LABELS = {
     "action_dropout": "v2 행동 이력 dropout 확률 (학습 sequence 마다 지난 행동 열을 0으로, copycat 대책 B)",
     "updates": "v2 반복마다 최적화 업데이트 수 (비우면 epoch 수로; 데이터가 쌓여도 학습량이 같음)",
     "contact_severity_min": "접촉 세기 하한 (m/s): 이보다 약한 스침은 penalty·lagrange 에서 빠짐 (0 = 모든 접촉, soft 전용)",
+    "legacy_contacts": "2026-10-15 이전 접촉 물리 (벽 접촉 일부 누락·차끼리 통과·소품 충격 오류, 예전 결과 재현용)",
 }
 PATHS = {"init_estimator": "input_file", "replay_data": "input_file", "init": "input_file", "reference": "input_file", "estimator": "input_file",
          "v2_init_stem": "input_file",
@@ -164,7 +165,7 @@ def _group(dest):
         return "기본"
     if dest.startswith(("teacher", "opp_", "spawn_", "mixed_")) or dest in ("opponent", "opponent_speed_mode"):
         return "teacher·상대차"
-    if dest in {"envs", "tracks", "obstacle_draws", "race_size", "episode_s", "speed_cap", "raceline_margin", "solo_fraction", "solo_tracks"} or dest.startswith("procedural_"):
+    if dest in {"envs", "tracks", "obstacle_draws", "race_size", "episode_s", "speed_cap", "raceline_margin", "solo_fraction", "solo_tracks", "legacy_contacts"} or dest.startswith("procedural_"):
         return "환경"
     if dest.startswith(("scan_", "memory", "motion_", "aligned_")) or dest in {"action_mode", "temporal_encoder", "adaptation", "controller", "estimator", "research_estimator", "cond", "hist_len", "frontend", "floor_att", "critic_priv_adapter"}:
         return "모델·제어"

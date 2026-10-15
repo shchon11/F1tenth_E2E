@@ -485,6 +485,17 @@ class SimParams:
                                   # +-46 deg (scratchpad wall_hits.py, 2026-09-28). The sign-flip
                                   # rate (28 % against 50 %) depends on how the driver reacts after
                                   # the hit, which that test holds fixed, so it was not fitted.
+    # ---- Contact physics of 2026-10-15 (feat/v2-physics). Every switch below is on by default; all
+    # of them off (`legacy_contacts`, the `--legacy-contacts` flag) is feat/v2-severity bit for bit.
+    #
+    # Report every wall contact the soft resolution handles: latched over the substeps and ORed into
+    # the step's collision flag, the way prop contacts already were (`Simulator.prop_touched`). The
+    # flag used to be the step-end corner test on the 5 cm grid alone, and the soft contact pushes
+    # the car back out every 5 ms, so most contacts had left the wall cell by the end of the step:
+    # of the physical wall contacts of the feat/v2 policies, 0 % below 0.5 m/s were flagged, 11 % at
+    # 1-2 m/s and 60 % at 2-3 m/s. The wall penalty, `--lagrange wall=` and `collisions_per_km`
+    # counted the props and the hardest wall hits only. Soft contact only (terminate never resolves).
+    wall_latch: bool = True
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
@@ -653,6 +664,19 @@ class Config:
         import yaml
         with open(path) as f:
             return Config.from_dict(yaml.safe_load(f) or {})
+
+
+#: The `SimParams` switches of the 2026-10-15 contact physics, each on by default. All of them off
+#: reproduces feat/v2-severity: soft-mode rollouts bit-identical (state and reward), the numbers of
+#: every evaluation and training run before them.
+CONTACT_FIXES = ("wall_latch",)
+
+
+def legacy_contacts(cfg: Config) -> Config:
+    """Switch the 2026-10-15 contact physics off (`CONTACT_FIXES`), in place; returns `cfg`."""
+    for name in CONTACT_FIXES:
+        setattr(cfg.sim, name, False)
+    return cfg
 
 
 def float_fields(dc) -> list[str]:

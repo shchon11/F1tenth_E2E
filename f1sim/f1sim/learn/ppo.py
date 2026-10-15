@@ -27,7 +27,7 @@ from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX, OPP_FU
                        PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS)
 from ..mpc import plan_layout
 from ..opp_token import OPP_TOKEN_MODES, describe as describe_opp_token
-from ..params import Config
+from ..params import Config, legacy_contacts
 from . import common
 from . import conditioning as cond_mod
 from . import grip_runtime as grip_rt
@@ -904,6 +904,10 @@ def main():
                          "shape: each carries the mass of what it is (cardboard box 1.2 kg, "
                          "wooden crate 10, steel drum 18, against a 3.74 kg car) and a contact "
                          "exchanges momentum both ways. Needs --collision-mode soft")
+    ap.add_argument("--legacy-contacts", action="store_true",
+                    help="the contact physics before 2026-10-15 (params.CONTACT_FIXES all off): wall contacts "
+                         "flagged only by the step-end grid test, prop impulses on the car's own speed, a prop "
+                         "set per car, cars that pass through each other. Reproduces earlier runs' numbers")
     ap.add_argument("--spawn-runway", type=float, default=0.0, metavar="M",
                     help="[m] of clear road every spawning car is guaranteed ahead of it, prop or "
                          "wall. 0 = off. A car is placed at up to the spawn speed and cannot stop "
@@ -1113,6 +1117,8 @@ def main():
     if a.rand_widen != 1.0 or a.rand_range:
         print(f"physics randomisation: widen x{a.rand_widen:g}, extra {list(a.rand_range)}", flush=True)
     sim_cfg.sim.compile = (a.sim_backend == "compile")
+    if a.legacy_contacts:
+        legacy_contacts(sim_cfg)
     _env_compile_tracker = (a.sim_backend == "compile")
     if a.sim_backend != "compile" and device.type != "cuda":
         print(f"--sim-backend {a.sim_backend} on {device.type}: physics/solver compile is off "

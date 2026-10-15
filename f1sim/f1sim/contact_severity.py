@@ -16,6 +16,11 @@ re-pressing at scrape speed. The physical contact is the run of steps that resol
 (`wall_impact > 0`) or reported one, and a run is charged its impact at most once: after an onset the
 carry restarts, so the flag flickering during a scrape gives onsets at scrape speed.
 
+Since `SimParams.wall_latch` (2026-10-15, on by default) the flag is no longer that step-end test alone:
+every wall contact the roll resolved is latched into its step, and a contact is held until the footprint is
+a grid cell clear, so the flag rises on the step of the hit and the carry is the onset step's own impact.
+The carry stays: it is what a `--legacy-contacts` run reads.
+
 Cars. Soft mode has no car-car response and the car test is exact geometry at the end of the step,
 so the flag rises on the step the bodies first overlap, at their approach speed: the onset step's
 `car_impact` is the severity.

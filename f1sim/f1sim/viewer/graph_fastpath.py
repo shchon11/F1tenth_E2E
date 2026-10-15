@@ -425,6 +425,10 @@ class SimGraphFastPath:
             # The soft contact's impact record is written in place by the captured roll: a rebound
             # tensor would be replayed against the old address and read 0 for ever after.
             "sim.wall_impact": lambda: getattr(sim, "wall_impact", None),
+            # The 2026-10-15 contact physics: its switches decide what the roll records and does (read
+            # at Python level, so baked in at capture), and its latches are written in place.
+            "cfg.sim.wall_latch": lambda: bool(getattr(sim.cfg.sim, "wall_latch", False)),
+            "sim.wall_touched": lambda: getattr(sim, "wall_touched", None),
         }
         for attr in dir(sim.track):
             if attr.startswith("p_") and torch.is_tensor(getattr(sim.track, attr, None)):

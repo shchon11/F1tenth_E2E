@@ -23,7 +23,7 @@ from ..mpc import SPEED_MODES
 from .. import opponent_slots as opp_sl
 from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events, split_events
-from ..params import Config
+from ..params import Config, legacy_contacts
 from . import common
 from . import grip_runtime
 from .evaluation_metrics import TrialAccumulator
@@ -651,6 +651,9 @@ def main() -> None:
                     help="'soft' counts every contact onset per km and lets the car recover; "
                          "'terminate' counts the crashes that end episodes")
     ap.add_argument("--movable-obstacles", action="store_true", default=None)
+    ap.add_argument("--legacy-contacts", action="store_true",
+                    help="the contact physics before 2026-10-15 (params.CONTACT_FIXES off): reproduces "
+                         "the numbers of every evaluation before it")
     ap.add_argument("--output", type=Path, help="write the complete strict JSON report")
     ap.add_argument("--eager", action="store_true", help="disable simulator compilation (CPU smoke tests)")
     ap.add_argument("--external-kind", default="", choices=["", "tinylidarnet", "end2race"],
@@ -715,6 +718,8 @@ def main() -> None:
     def run(names, config):
         if a.wheel_model != "default":
             config.vehicle.wheel_model = a.wheel_model == "on"
+        if a.legacy_contacts:
+            legacy_contacts(config)
         return evaluate(a.ckpt, names, a.envs, a.steps, a.speed_cap, a.device, seed=a.seed, cfg=config,
                         teacher=a.teacher, action_mode=a.action_mode, protocol=a.protocol,
                         opp_token_ablate=a.opp_token_ablate,

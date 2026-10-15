@@ -62,7 +62,10 @@ class StepResult:
                                                    # third input the traction guard takes. None with
                                                    # vehicle.wheel_model off.
     wall_collision: Optional[torch.Tensor] = None  # (B,) bool: walls and props only -- `collision` also ORs in
-                                                   # `car_collision`, so a car contact read through it is a wall too
+                                                   # `car_collision`, so a car contact read through it is a wall too.
+                                                   # Soft contact with `SimParams.wall_latch`: every wall contact
+                                                   # the roll resolved this step, held until the footprint is a
+                                                   # grid cell clear (before it: the step-end corner test only)
     # How hard a contact is, [m/s]: the speed of the two surfaces into each other along the contact
     # normal, at the contact point. A graze along a wall and a head-on hit are both one contact onset;
     # these tell them apart. 0 where nothing touched.
@@ -198,6 +201,13 @@ class Simulator:
         #: and pushed back out between two control steps, and a collision that the physics resolved
         #: but nothing reported is a collision the caller never learns about.
         self.prop_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: The same for the walls (`SimParams.wall_latch`): a wall contact the soft resolution handled
+        #: inside the roll, latched until `step` reads it. The step-end corner test alone missed most
+        #: of them -- the resolution pushes the car back out every few milliseconds. Written in place,
+        #: like `prop_touched`, so a captured graph keeps writing into it.
+        self.wall_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: Whether the last step ended in wall contact (`wall_latch`'s release hysteresis, see `step`).
+        self.wall_engaged = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         #: [m/s] This step's wall / prop impact severity: the largest speed into the surface, at the
         #: contact point, of any contact `_resolve_wall_contact` resolved (`StepResult.wall_impact`).
         #: Written in place inside the roll -- a CUDA graph replays writes to this storage, a rebound
@@ -851,6 +861,8 @@ class Simulator:
         self.collided[env_ids] = False
         self.car_collision[env_ids] = False
         self.prop_touched[env_ids] = False
+        self.wall_touched[env_ids] = False
+        self.wall_engaged[env_ids] = False
         self.wall_impact[env_ids] = 0.0
         self.steps[env_ids] = 0
         self._resample_car_dims(env_ids)
@@ -870,7 +882,8 @@ class Simulator:
         keep = {k: getattr(self, k).clone() for k in ("state", "ax", "ay", "att", "att_prev", "pose_prev", "cmd",
                                                      "cmd_hist", "s", "lap", "collided", "steps", "imu_state",
                                                      "cl_idx", "car_collision", "prop_touched",
-                                                     "wall_impact", "_odom_t_prev")}
+                                                     "wall_touched", "wall_engaged", "wall_impact",
+                                                     "_odom_t_prev")}
         odom, t, phase = self.odom.state.clone(), self.t, self._imu_phase
         # The throw-away steps consume randomness from two places, not one: `self.gen` (spawn draws,
         # command-delay jitter) and the GLOBAL torch generator, which is what imu.sample's
@@ -947,6 +960,19 @@ class Simulator:
         wall_dist, hit, odom_state, s, ds, lateral, lap, cl_idx = (
             t.clone() for t in self._post(state, self.odom.state, self.cmd, self.s, self.lap, self.tid, P, self.cl_idx))
         self.cl_idx = cl_idx
+        if self._wall_latch_on():
+            # Every wall contact the roll resolved (`SimParams.wall_latch`), not only the ones still in
+            # the wall cell at the end of the step. In place, for the same reason as `prop_touched`.
+            hit = hit | self.wall_touched
+            self.wall_touched.zero_()
+            # And a contact ends when the footprint is a grid cell clear, not at the first resolution
+            # that finds it outside the wall cell. The test reads a nearest-cell distance field, so the
+            # penetration it sees is 0 or half a cell: a car resting on the hose is pushed 6 mm out,
+            # creeps back across the cell edge and was a fresh contact every 50 ms (a 1.5 m/s hit and
+            # stop: four onsets, at 1.49, 0.11, 0.05 and 0.01 m/s). Gaps under a cell the grid cannot
+            # tell from contact; a car that backs a cell away and comes back has two contacts.
+            hit = hit | (self.wall_engaged & (wall_dist < self.track.t_res[self.tid]))
+            self.wall_engaged.copy_(hit & ~self.absent if self.absent_any else hit)
         if getattr(self.track, "has_props", False):
             # `_post` reads the occupancy EDT and props are not in it, so without this a car drives
             # through a box: `terminate_on_collision` never fires, and with soft walls the contact is
@@ -1007,6 +1033,12 @@ class Simulator:
                           imu_offsets if self.cfg.imu.enabled else None,
                           odom_t, i_motor if self.wheel_model else None, wall_hit.clone(),
                           wall_impact, car_impact)
+
+    def _wall_latch_on(self) -> bool:
+        """`SimParams.wall_latch` under soft contact. Read at Python level inside the roll, so it is
+        part of a captured graph's structure (`graph_fastpath` guards it)."""
+        return (bool(getattr(self.cfg.sim, "wall_latch", False)) and not self.cfg.sim.terminate_on_collision
+                and getattr(self, "wall_touched", None) is not None)
 
     def _guarded(self, compiled, attr, eager):
         """Compiled callable that falls back to eager for good if inductor/Triton fails at first use."""
@@ -1197,6 +1229,9 @@ class Simulator:
         clr = self._footprint_clearance(state)
         pen = (-clr).clamp_min(0.0)
         touching = pen > 0
+        if self._wall_latch_on():
+            # the walls alone, before a prop can take over `touching` (props latch `prop_touched`)
+            self.wall_touched.logical_or_(touching)
         prop_slot = None                   # set below when the props can be pushed
         prop_deeper = n_p = None
         if getattr(self.track, "has_props", False):
