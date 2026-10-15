@@ -318,3 +318,38 @@ def test_the_last_contact_outlives_its_marker_and_forgets_on_reset_or_another_ca
     last.update((1, 0), CT.focus_summary(hit))
     last.update((1, 2), CT.focus_summary(a_frame(t=5.0, focus=2, contact=hit["contact"])))
     assert last.text(5.0) == "—"                                   # another car: its own last contact
+
+
+@pytest.fixture(scope="module")
+def window(qapp):
+    from f1sim.viewer.console.window import ConsoleWindow
+    w = ConsoleWindow()
+    yield w
+    w.close()
+    w.deleteLater()
+
+
+def _telemetry(window, fr):
+    from f1sim.viewer.console.frames import Freshness
+    window.update_telemetry(fr, Freshness(0.0, 0.0, 0.0, 0, True), {}, 1.0, 60.0, None)
+
+
+def test_the_contact_tile_counts_the_watched_cars_episode(window):
+    from f1sim.viewer.console.theme import C
+    fr = a_frame(t=3.0, focus=1, contact=block(3, held={1: (CAR, (4.0, 3.0), 1.3, 0.2)},
+                                               onsets={0: (9, 9, 9), 1: (2, 0, 1)}, hard={1: (0, 0, 1)}))
+    _telemetry(window, fr)
+    assert window.m_coll.value.text() == "3 · 세게 1"
+    assert window.m_coll._colour == C["danger"]
+    assert "세게 ≥1.0 m/s" in window.m_coll.name_label.text()      # the threshold, where the count is
+    kinds = window.drive_info.value_label("접촉 종류").text()
+    assert "벽</span> 2" in kinds and "장애물</span> 0" in kinds and "차</span> 1" in kinds
+    assert "1.30 m/s" in window.drive_info.value_label("최근 접촉").text()
+    # grazes only: amber, not red
+    _telemetry(window, a_frame(t=4.0, focus=0, contact=block(3, onsets={0: (4, 0, 0)})))
+    assert (window.m_coll.value.text(), window.m_coll._colour) == ("4 · 세게 0", C["warn"])
+    _telemetry(window, a_frame(t=4.0, focus=2, contact=block(3)))
+    assert (window.m_coll.value.text(), window.m_coll._colour) == ("0", None)
+    # an older worker: the old count of cars flagged in this frame
+    _telemetry(window, a_frame(t=4.0, coll=np.array([1.0, 0.0, 1.0], np.float32)))
+    assert window.m_coll.value.text() == "2 / 3" and window.m_coll.name_label.text() == "충돌"
