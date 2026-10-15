@@ -562,3 +562,18 @@ def test_the_evaluation_meter_files_walls_on_their_own():
     rep = meter.report()["contact_severity"]
     assert rep["wall"]["counts"] == [0, 0, 1, 0], rep["wall"]
     assert rep["prop"]["onsets"] == 0 and rep["wall_prop"]["counts"] == [0, 0, 1, 0]
+
+
+def test_a_crate_shoved_into_the_hose_stops_at_it():
+    """A 1.2 kg box standing 25 cm off the bottom hose, hit from the lane side at 3 m/s: it slides to the
+    hose and stops there, instead of sliding on into it and off the map."""
+    sim, po = _prop_scene("cardboard_box")
+    po.p_poses[:, 0] = torch.tensor([12.0, 0.45, 0.0])
+    r_in = float(po.p_d[0, 0].min())
+    sim.reset(torch.arange(2), torch.tensor([[12.0, 1.3, -math.pi / 2], [20.0, 25.0, 0.0]]), torch.tensor([3.0, 0.0]))
+    low = 1e9
+    for t in range(40):
+        sim.step(torch.tensor([[0.0, 3.0 if t < 6 else -0.5], [0.0, 0.0]]))
+        low = min(low, float(po.p_poses[0, 0, 1]))
+    assert float(po.p_vel[0, 0].norm()) == 0.0
+    assert 0.2 + r_in - 0.03 < low < 0.30, (low, r_in)          # at the hose (its surface at y = 0.2)

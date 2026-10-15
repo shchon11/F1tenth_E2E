@@ -885,15 +885,39 @@ class ProceduralObstacles:
         self.p_vel[eid, sl] = self.p_vel[eid, sl] + dv
         self.p_poses[eid, sl, :2] = self.p_poses[eid, sl, :2] + dxy
 
-    def drift(self, dt: float) -> None:
+    def drift(self, dt: float, tid: Optional[torch.Tensor] = None) -> None:
         """`advance` without its early-out, for inside the physics roll: a host read there would stall a
         graph capture. Same law -- the floor takes `PROP_GROUND_DECEL` off the speed, then the prop slides
-        -- run every contact window, so a shoved prop is where it is when the next contact is tested."""
+        -- run every contact window, so a shoved prop is where it is when the next contact is tested.
+
+        With `tid` (each env row's track) a prop also stops at the walls (`stop_at_walls`) before it slides."""
         v = self.p_vel
         sp = v.norm(dim=2, keepdim=True)
         keep = ((sp - PROP_GROUND_DECEL * dt) / sp.clamp_min(1e-9)).clamp_min(0.0)
         self.p_vel.mul_(keep)
+        if tid is not None:
+            self.stop_at_walls(tid)
         self.p_poses[:, :, :2] += self.p_vel * dt
+
+    def stop_at_walls(self, tid: torch.Tensor) -> None:
+        """A prop sliding into a wall stops at it: once the wall's surface is within the prop's inscribed
+        radius of its centre, the part of its velocity into the wall is taken out -- the hose takes the blow and
+        nothing bounces off it. Velocity only, so a piece the layout stood against the wall is not moved. The
+        inscribed radius is the nearest of the prop's own face planes (`p_d`), which a box rotated in the
+        corner of a cell can poke past by a few cm; a crate shoved along the lane used to slide into the hose
+        and on through it. In place and branch-free: it runs inside the captured physics roll."""
+        B, C = self.p_vel.shape[:2]
+        xy = self.p_poses[:, :, :2]
+        t = tid[:, None].expand(B, C)
+        r_in = self.p_d.min(-1).values.clamp(max=1.0)                 # padding faces are +inf
+        # The distance field is the nearest cell's, so it reads the wall's surface to within half a cell either
+        # way: stop half a cell early rather than half a cell into the hose.
+        res = self.tr.t_res[t]
+        reach = self.tr.sample_edt(xy, t) - 0.5 * res                    # centre to the wall's surface
+        n = self.tr.edt_gradient(xy, t)                                   # away from the wall
+        vn = (self.p_vel * n).sum(-1)
+        stop = (self.p_zhi > self.p_zlo) & (self.p_mass > 0) & (reach <= r_in + 0.5 * res) & (vn < 0)
+        self.p_vel.sub_(torch.where(stop, vn, torch.zeros_like(vn))[..., None] * n)
 
     def advance(self, dt: float) -> None:
         """Slide whatever was shoved, and let the floor stop it.

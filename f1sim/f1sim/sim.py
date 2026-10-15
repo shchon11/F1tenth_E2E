@@ -1413,8 +1413,9 @@ class Simulator:
             if soft_wall and (k % ce == ce - 1 or k == self.substeps - 1):
                 span = (k % ce) + 1
                 if props_move:
-                    # the props slide over the same window, so the contact sees them where they are
-                    self.track.env_props.drift(self.dt * span)
+                    # the props slide over the same window, so the contact sees them where they are, and a
+                    # prop shoved into a wall stops at it
+                    self.track.env_props.drift(self.dt * span, self.tid)
                 v_pre = state[:, dyn.IVX:dyn.IVY + 1]
                 state, a_contact = self._resolve_wall_contact(state, dt=self.dt * span)
                 if cars:

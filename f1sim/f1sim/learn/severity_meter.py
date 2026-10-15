@@ -119,7 +119,7 @@ class ContactSeverityMeter:
     # -- one transition -------------------------------------------------------------------------
     def _add(self, kind: str, sev: torch.Tensor, mask: torch.Tensor) -> None:
         m = mask.long()
-        sev = sev.float()
+        sev = sev.float().contiguous()             # a column of the per-kind impacts is a strided view
         self._cnt[kind].index_add_(0, torch.bucketize(sev, self.edges, right=True), m)
         fine = (sev / FINE_BIN).floor().long().clamp(0, self.n_fine - 1)
         self._fine[kind].index_add_(0, fine, m)
