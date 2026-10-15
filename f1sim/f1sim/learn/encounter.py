@@ -243,9 +243,18 @@ class EncounterMeter:
         # (`gym_env` rebinds `self.learner`), and a mask cached at construction would keep scoring
         # the row an opponent now drives.
         lm = self.env.learner
-        prop_onset = onset & self._prop_step & ~car & lm
-        car_onset = onset & car & lm
-        wall_onset = onset & ~self._prop_step & ~car & lm
+        kinds = getattr(r, "contact_onsets", None)
+        if kinds is not None:
+            # The simulator's onsets per kind (`SimParams.wall_latch`), the edge the gym layer publishes
+            # then. One per step still: a car onset is the car's, else a prop onset is the prop's.
+            onset = kinds.any(1)
+            car_onset = kinds[:, 2] & lm
+            prop_onset = kinds[:, 1] & ~kinds[:, 2] & lm
+            wall_onset = kinds[:, 0] & ~kinds[:, 1] & ~kinds[:, 2] & lm
+        else:
+            prop_onset = onset & self._prop_step & ~car & lm
+            car_onset = onset & car & lm
+            wall_onset = onset & ~self._prop_step & ~car & lm
         self._prop_onsets += prop_onset.long()
         self._car_onsets += car_onset.long()
         self._wall_onsets += wall_onset.long()

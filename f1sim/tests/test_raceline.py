@@ -87,3 +87,6 @@ def test_suspension_noise_knobs_do_not_move_the_cache_key():
     assert "road_tilt=0.017" in key and "road_tilt_v" not in key
     assert key == repr(_LineKeyVehicle(VehicleParams(road_tilt=0.017)))
     assert key == repr(_LineKeyVehicle(VehicleParams(road_tilt=0.0, road_tilt_v=5.0)))
+    # the contact-moment fields of 2026-10-15 neither
+    assert not any(f in key for f in ("Ixx", "Iyy", "contact_z_end", "contact_z_side"))
+    assert key == repr(_LineKeyVehicle(VehicleParams(Ixx=1.0, Iyy=1.0, contact_z_end=0.0, contact_z_side=0.2)))

@@ -211,6 +211,15 @@ def test_frames_carry_real_finite_state(worker, cpu_session):
         assert f[key].shape == (n,), f"{key} has shape {f[key].shape}, expected {(n,)}"
         assert np.isfinite(f[key]).all(), f"{key} has non-finite values"
     assert f["rear"].shape == (n, 4)
+    # what a later console change draws a contact from (`Simulator.contact_frame`), per drawn car
+    c = f["contact"]
+    for key, shape in (("kind", (n,)), ("point", (n, 2)), ("severity", (n,)), ("held", (n,)), ("held_s", (n,)),
+                       ("held_kind", (n,)), ("held_point", (n, 2)), ("held_severity", (n,)), ("onsets", (n, 3)),
+                       ("hard", (n, 3))):
+        assert c[key].shape == shape, (key, c[key].shape)
+        assert np.isfinite(c[key]).all(), key
+    assert set(np.unique(c["kind"])) <= {0, 1, 2, 3} and c["kinds"] == ("none", "wall", "prop", "car")
+    assert (c["onsets"] >= c["hard"]).all() and (c["hard"] >= 0).all()
     assert f["scan"].shape == (cpu_session["lidar"]["n_beams"],)
     assert f["scan_type"].dtype == np.int32 and set(np.unique(f["scan_type"])) <= {0, 1, 2, 3, 4}
     assert f["ids"].dtype == np.int32 and f["ids"].tolist() == list(range(n))

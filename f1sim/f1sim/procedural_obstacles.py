@@ -833,6 +833,27 @@ class ProceduralObstacles:
         self.p_vel.index_copy_(0, dst, torch.zeros_like(self.p_vel[:D])[src])
 
     # ------------------------------------------------------------------ being pushed
+    #: How many consecutive env rows share one prop set: the cars of a race (`SimParams.props_per_race`,
+    #: set by `F1VecEnv`). Every row keeps its own copy -- every reader indexes by env row and is left as it
+    #: was -- and every change is the race's total, applied to each of its copies (`_race_add`), so the
+    #: copies stay identical: the crate one car shoved is where the others meet it, and two cars pushing
+    #: one crate add up. 1 is a set per car, every run before 2026-10-15: an opponent drove into a crate
+    #: where it stood before the learner moved it, and the console drew env 0's copy alone.
+    share_m = 1
+
+    def _race_add(self, buf: torch.Tensor, eid: torch.Tensor, slot: torch.Tensor, val: torch.Tensor) -> None:
+        """`buf[eid, slot] += val`, in place, summed over each race's rows and given to all of them.
+        eid must be the whole batch in row order (the physics roll's `Simulator.eid`). Deterministic --
+        an `index_add_` onto distinct cells, then a sum over the race -- and capturable: no host data."""
+        B, C, M = buf.shape[0], buf.shape[1], int(self.share_m)
+        if eid.shape[0] != B:
+            raise ValueError(f"a race-shared prop update needs the whole batch in row order ({B} rows), "
+                             f"got {eid.shape[0]}")
+        D = torch.zeros(B * C, val.shape[-1], device=val.device, dtype=buf.dtype)
+        D.index_add_(0, eid * C + slot, val.to(buf.dtype))
+        D = D.view(B // M, M, C, -1).sum(1, keepdim=True).expand(B // M, M, C, val.shape[-1])
+        buf.add_(D.reshape(B, C, -1))
+
     def shove(self, eid: torch.Tensor, slot: torch.Tensor, impulse: torch.Tensor) -> None:
         """Add a linear impulse [kg m/s] to one prop per row, along the world vector given.
 
@@ -844,7 +865,59 @@ class ProceduralObstacles:
         m = self.p_mass[eid, slot].clamp_min(1e-6)
         live = (self.p_mass[eid, slot] > 0) & (self.p_zhi[eid, slot] > self.p_zlo[eid, slot])
         dv = torch.where(live[:, None], impulse / m[:, None], torch.zeros_like(impulse))
+        if self.share_m > 1:
+            self._race_add(self.p_vel, eid, slot, dv)
+            return
         self.p_vel[eid, slot] = self.p_vel[eid, slot] + dv
+
+    def push(self, eid: torch.Tensor, slot: torch.Tensor, dv: torch.Tensor, dxy: torch.Tensor) -> None:
+        """Change one prop per row by `dv` [m/s] and move it by `dxy` [m] (world), in place: the contact's
+        share of the impulse and of the overlap (`Simulator._resolve_wall_contact`, `SimParams.prop_relative`).
+        Rows whose `slot` is -1, massless or dead are left alone; a race's rows add up (`share_m`)."""
+        sl = slot.clamp_min(0)
+        live = (slot >= 0) & (self.p_mass[eid, sl] > 0) & (self.p_zhi[eid, sl] > self.p_zlo[eid, sl])
+        dv = torch.where(live[:, None], dv, torch.zeros_like(dv))
+        dxy = torch.where(live[:, None], dxy, torch.zeros_like(dxy))
+        if self.share_m > 1:
+            self._race_add(self.p_vel, eid, sl, dv)
+            self._race_add(self.p_poses[:, :, :2], eid, sl, dxy)
+            return
+        self.p_vel[eid, sl] = self.p_vel[eid, sl] + dv
+        self.p_poses[eid, sl, :2] = self.p_poses[eid, sl, :2] + dxy
+
+    def drift(self, dt: float, tid: Optional[torch.Tensor] = None) -> None:
+        """`advance` without its early-out, for inside the physics roll: a host read there would stall a
+        graph capture. Same law -- the floor takes `PROP_GROUND_DECEL` off the speed, then the prop slides
+        -- run every contact window, so a shoved prop is where it is when the next contact is tested.
+
+        With `tid` (each env row's track) a prop also stops at the walls (`stop_at_walls`) before it slides."""
+        v = self.p_vel
+        sp = v.norm(dim=2, keepdim=True)
+        keep = ((sp - PROP_GROUND_DECEL * dt) / sp.clamp_min(1e-9)).clamp_min(0.0)
+        self.p_vel.mul_(keep)
+        if tid is not None:
+            self.stop_at_walls(tid)
+        self.p_poses[:, :, :2] += self.p_vel * dt
+
+    def stop_at_walls(self, tid: torch.Tensor) -> None:
+        """A prop sliding into a wall stops at it: once the wall's surface is within the prop's inscribed
+        radius of its centre, the part of its velocity into the wall is taken out -- the hose takes the blow and
+        nothing bounces off it. Velocity only, so a piece the layout stood against the wall is not moved. The
+        inscribed radius is the nearest of the prop's own face planes (`p_d`), which a box rotated in the
+        corner of a cell can poke past by a few cm; a crate shoved along the lane used to slide into the hose
+        and on through it. In place and branch-free: it runs inside the captured physics roll."""
+        B, C = self.p_vel.shape[:2]
+        xy = self.p_poses[:, :, :2]
+        t = tid[:, None].expand(B, C)
+        r_in = self.p_d.min(-1).values.clamp(max=1.0)                 # padding faces are +inf
+        # The distance field is the nearest cell's, so it reads the wall's surface to within half a cell either
+        # way: stop half a cell early rather than half a cell into the hose.
+        res = self.tr.t_res[t]
+        reach = self.tr.sample_edt(xy, t) - 0.5 * res                    # centre to the wall's surface
+        n = self.tr.edt_gradient(xy, t)                                   # away from the wall
+        vn = (self.p_vel * n).sum(-1)
+        stop = (self.p_zhi > self.p_zlo) & (self.p_mass > 0) & (reach <= r_in + 0.5 * res) & (vn < 0)
+        self.p_vel.sub_(torch.where(stop, vn, torch.zeros_like(vn))[..., None] * n)
 
     def advance(self, dt: float) -> None:
         """Slide whatever was shoved, and let the floor stop it.

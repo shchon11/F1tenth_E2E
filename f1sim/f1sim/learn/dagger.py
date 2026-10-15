@@ -40,7 +40,7 @@ from ..opp_token import OPP_TOKEN_MODES, validate_opp_token
 from ..mpc import ACT_DIM, PlanLayout, plan_layout  # noqa: F401 -- ACT_DIM: the default plan width, read as dagger.ACT_DIM
 from ..interactive_teacher import DEFAULT_OFFSETS, DEFAULT_SPEEDS, InteractiveTeacher, TeacherCost
 from .. import tracks as track_catalog
-from ..params import Config
+from ..params import Config, legacy_contacts
 from . import common
 from . import conditioning as cond_mod
 
@@ -709,6 +709,8 @@ def main():
     ap.add_argument("--procedural-raceline-corridor", choices=["on", "off"], default="on")
     ap.add_argument("--collision-mode", choices=["terminate", "soft"], default="terminate")
     ap.add_argument("--movable-obstacles", action="store_true", help="needs --collision-mode soft (learn.ppo)")
+    ap.add_argument("--legacy-contacts", action="store_true",
+                    help="the contact physics before 2026-10-15 (learn.ppo --legacy-contacts)")
     ap.add_argument("--spawn-runway", type=float, default=0.0, metavar="M")
     ap.add_argument("--kind-mix-assign", choices=["partition", "redraw"], default="partition")
     ap.add_argument("--teacher", dest="teacher_kind", default="raceline", choices=["raceline", "interactive", "rollout"],
@@ -916,6 +918,8 @@ def main():
     cfg = Config()
     if a.eager:
         cfg.sim.compile = False
+    if a.legacy_contacts:
+        legacy_contacts(cfg)
     env = common.make_env(tracks, a.envs, device,
                           EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
                       speed_mode=a.speed_mode, speed_command=a.speed_command,

@@ -422,6 +422,30 @@ class SimGraphFastPath:
             # Read live: closing over the track object captured here would compare it against
             # itself, so a TrackTensors swap would never be seen.
             "sim.track": lambda: id(sim.track),
+            # The soft contact's impact record is written in place by the captured roll: a rebound
+            # tensor would be replayed against the old address and read 0 for ever after.
+            "sim.wall_impact": lambda: getattr(sim, "wall_impact", None),
+            # The 2026-10-15 contact physics: its switches decide what the roll records and does (read
+            # at Python level, so baked in at capture), and its latches are written in place.
+            "cfg.sim.wall_latch": lambda: bool(getattr(sim.cfg.sim, "wall_latch", False)),
+            "sim.wall_touched": lambda: getattr(sim, "wall_touched", None),
+            "sim.impact_kind": lambda: getattr(sim, "impact_kind", None),
+            "sim.contact_pt": lambda: getattr(sim, "contact_pt", None),
+            "sim.contact_pt_sev": lambda: getattr(sim, "contact_pt_sev", None),
+            "cfg.sim.prop_relative": lambda: bool(getattr(sim.cfg.sim, "prop_relative", False)),
+            "cfg.sim.body_friction": lambda: float(getattr(sim.cfg.sim, "body_friction", 0.0)),
+            "sim.movable_obstacles": lambda: bool(getattr(sim, "movable_obstacles", False)),
+            "props.share_m": lambda: int(getattr(getattr(sim.track, "env_props", None), "share_m", 1)),
+            "cfg.sim.contact_accel_hold": lambda: bool(getattr(sim.cfg.sim, "contact_accel_hold", False)),
+            "sim.contact_acc": lambda: getattr(sim, "contact_acc", None),
+            "cfg.sim.car_response": lambda: bool(getattr(sim.cfg.sim, "car_response", False)),
+            "cfg.sim.contact_moments": lambda: bool(getattr(sim.cfg.sim, "contact_moments", False)),
+            "cfg.sim.car_restitution": lambda: float(getattr(sim.cfg.sim, "car_restitution", 0.0)),
+            "sim.M": lambda: int(getattr(sim, "M", 1)),
+            "sim.other_idx": lambda: getattr(sim, "other_idx", None),
+            "sim.car_rear": lambda: getattr(sim, "car_rear", None),
+            "sim.car_touched": lambda: getattr(sim, "car_touched", None),
+            "sim.car_impact_roll": lambda: getattr(sim, "car_impact_roll", None),
         }
         for attr in dir(sim.track):
             if attr.startswith("p_") and torch.is_tensor(getattr(sim.track, attr, None)):

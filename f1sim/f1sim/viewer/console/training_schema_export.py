@@ -141,6 +141,8 @@ LABELS = {
     "v2_ego_actions": "v2 ego 에 지난 행동(plan) 열 포함 (off = 속도·yaw rate 이력만, copycat 대책 A)",
     "action_dropout": "v2 행동 이력 dropout 확률 (학습 sequence 마다 지난 행동 열을 0으로, copycat 대책 B)",
     "updates": "v2 반복마다 최적화 업데이트 수 (비우면 epoch 수로; 데이터가 쌓여도 학습량이 같음)",
+    "contact_severity_min": "접촉 세기 하한 (m/s): 이보다 약한 스침은 penalty·lagrange 에서 빠짐 (0 = 모든 접촉, soft 전용)",
+    "legacy_contacts": "2026-10-15 이전 접촉 물리 (벽 접촉 일부 누락·차끼리 통과·소품 충격 오류, 예전 결과 재현용)",
 }
 PATHS = {"init_estimator": "input_file", "replay_data": "input_file", "init": "input_file", "reference": "input_file", "estimator": "input_file",
          "v2_init_stem": "input_file",
@@ -152,7 +154,8 @@ CSV_LISTS = {"scan_channels": "str", "opp_events": "str", "opp_pool": "path",
 REWARDS = {"progress_reward", "alive_reward", "collision_penalty", "steer_penalty", "proximity_penalty", "safe_dist", "wrong_way_penalty",
            "collision_speed_penalty", "proximity_speed_ref", "plan_clearance_penalty", "plan_margin",
            "lap_time_bonus", "lap_bonus", "overtake_bonus", "overtake_sustained", "car_safe_gap",
-           "sideslip_penalty", "ttc_penalty", "ttc_safe", "car_proximity_penalty", "car_contact_penalty"}
+           "sideslip_penalty", "ttc_penalty", "ttc_safe", "car_proximity_penalty", "car_contact_penalty",
+           "contact_severity_min"}
 
 
 def _group(dest):
@@ -162,7 +165,7 @@ def _group(dest):
         return "기본"
     if dest.startswith(("teacher", "opp_", "spawn_", "mixed_")) or dest in ("opponent", "opponent_speed_mode"):
         return "teacher·상대차"
-    if dest in {"envs", "tracks", "obstacle_draws", "race_size", "episode_s", "speed_cap", "raceline_margin", "solo_fraction", "solo_tracks"} or dest.startswith("procedural_"):
+    if dest in {"envs", "tracks", "obstacle_draws", "race_size", "episode_s", "speed_cap", "raceline_margin", "solo_fraction", "solo_tracks", "legacy_contacts"} or dest.startswith("procedural_"):
         return "환경"
     if dest.startswith(("scan_", "memory", "motion_", "aligned_")) or dest in {"action_mode", "temporal_encoder", "adaptation", "controller", "estimator", "research_estimator", "cond", "hist_len", "frontend", "floor_att", "critic_priv_adapter"}:
         return "모델·제어"

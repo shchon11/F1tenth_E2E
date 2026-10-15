@@ -96,8 +96,14 @@ def _env_digest() -> dict:
     from f1sim import Config
     from f1sim.gym_env import EnvConfig
     from f1sim.learn import common
+    from f1sim.params import legacy_contacts
     tracks, _rls = common.load_tracks(["gen:competition:0"], racelines=True)
     cfg = Config(); cfg.sim.compile = False
+    # The reference was recorded before the contact physics of 2026-10-15 (`params.CONTACT_FIXES`), which
+    # change what a soft race does on purpose -- cars now push each other, every wall contact is charged.
+    # This digest guards the v1 observation, privileged vector and reward code, so it runs on the physics
+    # the reference was written with; the new physics has its own tests (test_contact_physics.py).
+    legacy_contacts(cfg)
     ec = EnvConfig(action_mode="plan", race_size=2, opponent="policy", hist_len=20, hist_stride=2,
                    scan_stack=6, compile_tracker=False, collision_mode="soft")
     env = common.make_env(tracks, 4, "cpu", ec, cfg=cfg, seed=7)

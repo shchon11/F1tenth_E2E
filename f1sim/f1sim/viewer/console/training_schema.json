@@ -3682,6 +3682,25 @@
           "metavar": null
         },
         {
+          "flag": "--contact-severity-min",
+          "flags": [
+            "--contact-severity-min"
+          ],
+          "dest": "contact_severity_min",
+          "label": "접촉 세기 하한 (m/s): 이보다 약한 스침은 penalty·lagrange 에서 빠짐 (0 = 모든 접촉, soft 전용)",
+          "kind": "float",
+          "item_kind": "float",
+          "default": 0.0,
+          "nargs": null,
+          "choices": null,
+          "required": false,
+          "group": "PPO 보상",
+          "help": "[m/s] charge only the contact onsets at least this hard -- the speed of the two surfaces into each other along the contact normal, at the contact point (f1sim.contact_severity). A softer onset is free for the collision and car-contact penalties and for --lagrange's onset counts; a harder one is charged exactly as before. Both counts are logged (contacts/*_all_per_km, contacts/*_hard_per_km). 0 = every onset, as before. Needs --collision-mode soft",
+          "action": "store",
+          "nullable": false,
+          "metavar": "V"
+        },
+        {
           "flag": "--algo",
           "flags": [
             "--algo"
@@ -4313,6 +4332,25 @@
           "required": false,
           "group": "학습",
           "help": "a struck obstacle is shoved instead of being a wall with a crate's shape: each carries the mass of what it is (cardboard box 1.2 kg, wooden crate 10, steel drum 18, against a 3.74 kg car) and a contact exchanges momentum both ways. Needs --collision-mode soft",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--legacy-contacts",
+          "flags": [
+            "--legacy-contacts"
+          ],
+          "dest": "legacy_contacts",
+          "label": "2026-10-15 이전 접촉 물리 (벽 접촉 일부 누락·차끼리 통과·소품 충격 오류, 예전 결과 재현용)",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "the contact physics before 2026-10-15 (params.CONTACT_FIXES all off): wall contacts flagged only by the step-end grid test, prop impulses on the car's own speed, a prop set per car, cars that pass through each other. Reproduces earlier runs' numbers",
           "action": "store_true",
           "nullable": false,
           "metavar": null
@@ -5720,6 +5758,25 @@
           "required": false,
           "group": "학습",
           "help": "needs --collision-mode soft (learn.ppo)",
+          "action": "store_true",
+          "nullable": false,
+          "metavar": null
+        },
+        {
+          "flag": "--legacy-contacts",
+          "flags": [
+            "--legacy-contacts"
+          ],
+          "dest": "legacy_contacts",
+          "label": "2026-10-15 이전 접촉 물리 (벽 접촉 일부 누락·차끼리 통과·소품 충격 오류, 예전 결과 재현용)",
+          "kind": "bool",
+          "item_kind": "str",
+          "default": false,
+          "nargs": 0,
+          "choices": null,
+          "required": false,
+          "group": "환경",
+          "help": "the contact physics before 2026-10-15 (learn.ppo --legacy-contacts)",
           "action": "store_true",
           "nullable": false,
           "metavar": null

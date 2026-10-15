@@ -62,7 +62,41 @@ class StepResult:
                                                    # third input the traction guard takes. None with
                                                    # vehicle.wheel_model off.
     wall_collision: Optional[torch.Tensor] = None  # (B,) bool: walls and props only -- `collision` also ORs in
-                                                   # `car_collision`, so a car contact read through it is a wall too
+                                                   # `car_collision`, so a car contact read through it is a wall too.
+                                                   # Soft contact with `SimParams.wall_latch`: every wall contact
+                                                   # the roll resolved this step, held until the footprint is a
+                                                   # grid cell clear (before it: the step-end corner test only)
+    # How hard a contact is, [m/s]: the speed of the two surfaces into each other along the contact
+    # normal, at the contact point. A graze along a wall and a head-on hit are both one contact onset;
+    # these tell them apart. 0 where nothing touched.
+    wall_impact: Optional[torch.Tensor] = None     # (B,) walls and props. Soft contact: the largest speed into
+                                                   # the surface that `_resolve_wall_contact` resolved this step
+                                                   # (the `-vpn` its impulse is computed from), over all the
+                                                   # step's resolutions -- including a touch resolved and left
+                                                   # inside the step, which `wall_collision` does not report.
+                                                   # Terminate: the crash state's, with `measure_impacts` only
+                                                   # (None without it).
+    car_impact: Optional[torch.Tensor] = None      # (B,) car contacts (`car_collision`): the closing speed of the
+                                                   # two bodies at the end of the step (`Simulator._car_contacts`).
+                                                   # None unless `measure_impacts`, and in a solo run.
+    # Contact onsets per kind (soft contact with `SimParams.wall_latch`, None otherwise): columns wall, prop,
+    # car. A contact of one kind starting while one of another lasts is its own onset -- a crate hit while
+    # the car grinds a hose was no rising edge of the merged flag, so it was never counted or charged.
+    contact_onsets: Optional[torch.Tensor] = None   # (B, 3) bool: the kind's contact began this step
+    contact_impacts: Optional[torch.Tensor] = None  # (B, 3) [m/s] this step's impact per kind: walls and props as
+                                                    # `wall_impact` (split by which owned the contact), cars the
+                                                    # closing speed (`car_impact`, 0 where not measured)
+
+
+#: Columns of `Simulator.contact_frame`, one row per car: this step's hardest contact (kind 0 none, 1 wall,
+#: 2 prop, 3 car; where it touched, world [m]; how hard [m/s]), the contact held for the console's eye
+#: (seconds left, and the hardest contact of the hold: kind, point, severity), and the episode's onsets per
+#: kind, all of them and the hard ones (>= `contact_severity.HARD_MPS`).
+CONTACT_FRAME_COLUMNS = ("kind", "x", "y", "severity", "held_s", "held_kind", "held_x", "held_y", "held_severity",
+                         "onsets_wall", "onsets_prop", "onsets_car", "hard_wall", "hard_prop", "hard_car")
+CONTACT_KINDS = ("none", "wall", "prop", "car")
+#: [s] how long a contact stays on the console's contact flag after the car stops touching
+CONTACT_HOLD_S = 0.3
 
 
 def _capturing() -> bool:
@@ -185,6 +219,48 @@ class Simulator:
         #: and pushed back out between two control steps, and a collision that the physics resolved
         #: but nothing reported is a collision the caller never learns about.
         self.prop_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: The same for the walls (`SimParams.wall_latch`): a wall contact the soft resolution handled
+        #: inside the roll, latched until `step` reads it. The step-end corner test alone missed most
+        #: of them -- the resolution pushes the car back out every few milliseconds. Written in place,
+        #: like `prop_touched`, so a captured graph keeps writing into it.
+        self.wall_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: Whether the last step ended in wall contact (`wall_latch`'s release hysteresis, see `step`).
+        self.wall_engaged = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: [m/s^2] body-frame acceleration the last contact resolution imposed, held until the next one
+        #: (`SimParams.contact_accel_hold`): it covers the window that resolution resolved, which runs on
+        #: into the next control step. Written in place at the end of the roll.
+        self.contact_acc = torch.zeros(num_envs, 2, device=self.device)
+        #: Car-car contact seen inside the roll (`SimParams.car_response`), latched like `wall_touched`: the
+        #: response pushes two cars apart within the step, so the step-end test alone would miss it.
+        self.car_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: [m/s] the largest closing speed along the contact normal at the contact point that a car-car
+        #: resolution saw this step -- the speed the impulse took (`StepResult.car_impact`). Zeroed in place
+        #: before each roll.
+        self.car_impact_roll = torch.zeros(num_envs, device=self.device)
+        #: [m/s] `wall_impact` split by kind, (B, 2) walls, props: the step's largest speed into whichever
+        #: owned each resolution's contact. In place inside the roll, zeroed before it.
+        self.impact_kind = torch.zeros(num_envs, 2, device=self.device)
+        #: Per kind (wall, prop, car), whether the last step ended in contact: the onsets' memory.
+        self.kind_prev = torch.zeros(num_envs, 3, dtype=torch.bool, device=self.device)
+        #: Where this step's hardest contact touched, world [m], and its speed [m/s] (the roll keeps the
+        #: hardest resolution's point, in place; zeroed before each roll).
+        self.contact_pt = torch.zeros(num_envs, 2, device=self.device)
+        self.contact_pt_sev = torch.zeros(num_envs, device=self.device)
+        #: What the console draws (`contact_frame`), per car, updated in place every step: this step's
+        #: hardest contact, the one held for `CONTACT_HOLD_S`, and the episode's onsets per kind, all / hard.
+        self.contact_now = torch.zeros(num_envs, 4, device=self.device)        # kind, x, y, severity
+        self.contact_held = torch.zeros(num_envs, 5, device=self.device)       # seconds left, kind, x, y, severity
+        self.contact_counts = torch.zeros(num_envs, 6, dtype=torch.long, device=self.device)
+        #: [m/s] This step's wall / prop impact severity: the largest speed into the surface, at the
+        #: contact point, of any contact `_resolve_wall_contact` resolved (`StepResult.wall_impact`).
+        #: Written in place inside the roll -- a CUDA graph replays writes to this storage, a rebound
+        #: attribute would be dropped (the `prop_touched` lesson) -- and zeroed in place before each roll.
+        self.wall_impact = torch.zeros(num_envs, device=self.device)
+        #: Whether `step` also measures the severities the roll does not record: a car contact's
+        #: closing speed (races) and, under `terminate_on_collision`, a crash's speed into the wall.
+        #: Off by default, so nothing pays for them unread; eager work after the roll, so it can be
+        #: switched at any time (the evaluation's severity meter does, and an env charging by severity).
+        self.measure_impacts = False
         #: Env rows in their own order, for `TrackTensors.props_for` when a per-env prop layout is
         #: attached. Held rather than built per call: `arange` inside a compiled region is host data
         #: and a host-to-device copy invalidates a CUDA graph capture.
@@ -310,14 +386,25 @@ class Simulator:
         sets.append((pos, torch.stack([rear[..., 0], rear[..., 1], rear[..., 3]], -1), rear[..., 2:4], self.car_rear_porosity))
         return sets
 
-    def _car_contacts(self, state: torch.Tensor) -> torch.Tensor:
+    def _car_contacts(self, state: torch.Tensor, impact: bool = False):
         """Separating-axis test between each car's footprint and the other cars of its race -> (B,) bool.
 
         Each car collides with the body the other cars' LiDAR draws for it: the footprint is scaled
         by the same `car_dims` length / 0.50 the mesh is (`_car_boxes`). A fixed 0.58 m box on every
         car, whatever size it was drawn, put up to 11 cm of body where the scan showed nothing
         (docs/research/dynamics-collision-audit-2026-09-21.md section 2.4). Walls and props still use
-        the car's own measured footprint (`_footprint_corners`)."""
+        the car's own measured footprint (`_footprint_corners`).
+
+        impact: also return (B,) the contact's closing speed [m/s] (`StepResult.car_impact`), the
+        largest over the cars this one touches, 0 without contact. Soft mode has no car-car response,
+        so the velocities at the end of the step are still the approach. The normal is the axis the
+        bodies entered on: of the four SAT axes, the one whose overlap is the youngest at the current
+        closing rate (penetration / closing speed). The axis of least overlap is the usual choice and
+        is wrong exactly where it matters -- a fast corner-to-corner rear-end overlaps 7 cm along the
+        cars and 2 cm across them, and least overlap would score the 3 m/s hit as the 0 m/s sideways
+        graze. The velocities are taken at the contact point (the vertices of each body inside the
+        other; the midpoint of the two centres when none is), so a spinning car's swinging tail counts
+        and two cars cornering together are not read as closing on each other."""
         c_, s_ = torch.cos(state[:, dyn.IYAW]), torch.sin(state[:, dyn.IYAW])
         R = torch.stack([torch.stack([c_, -s_], -1), torch.stack([s_, c_], -1)], -2)          # (B,2,2)
         local = self.corners[None] * (self.car_dims[:, 0] / 0.50)[:, None, None]              # (B,4,2)
@@ -327,15 +414,66 @@ class Simulator:
         pts = torch.cat([pts, pts[:, 2:] + ext[:, None, :]], 1)         # + rear box corners (B,6,2)
         ax = torch.stack([torch.cos(yaw), torch.sin(yaw)], 1); ay = torch.stack([-torch.sin(yaw), torch.cos(yaw)], 1)
         hit = torch.zeros(state.shape[0], dtype=torch.bool, device=state.device)
+        if impact:
+            sev = torch.zeros(state.shape[0], dtype=state.dtype, device=state.device)
+            xy, w = state[:, :2], state[:, dyn.IR]
+            v = torch.stack([state[:, dyn.IVX] * c_ - state[:, dyn.IVY] * s_,
+                             state[:, dyn.IVX] * s_ + state[:, dyn.IVY] * c_], 1)       # (B,2) world velocity
         for c in range(self.M - 1):
             o = self.other_idx[:, c]
             po = pts[o]
             sep = torch.zeros_like(hit)
+            spans = []
             for axis in (ax, ay, ax[o], ay[o]):
                 pa = (pts * axis[:, None, :]).sum(-1); pb = (po * axis[:, None, :]).sum(-1)
                 sep = sep | (pa.max(1).values < pb.min(1).values) | (pb.max(1).values < pa.min(1).values)
+                if impact:
+                    spans.append((axis, pa, pb))
             hit = hit | ~sep
+            if impact:
+                sev = torch.maximum(sev, torch.where(~sep, self._car_closing_speed(spans, pts, po, xy, xy[o], v, v[o],
+                                                                                   w, w[o]), torch.zeros_like(sev)))
+        if impact:
+            return hit, sev
         return hit
+
+    @staticmethod
+    def _car_closing_speed(spans, pts, po, x_a, x_b, v_a, v_b, w_a, w_b) -> torch.Tensor:
+        """(B,) closing speed of body a (vertices `pts`) on body b (`po`) along their entry axis, at the
+        contact point; `spans` holds (axis, a's projections, b's projections) for the four SAT axes, a's
+        two first. See `_car_contacts`."""
+        lo_a = [pa.min(1).values for _, pa, _ in spans]; hi_a = [pa.max(1).values for _, pa, _ in spans]
+        lo_b = [pb.min(1).values for _, _, pb in spans]; hi_b = [pb.max(1).values for _, _, pb in spans]
+        # the contact point: a's vertices inside b (tested on b's own axes, the last two) and b's inside a
+        a_in_b = torch.ones_like(pts[..., 0], dtype=torch.bool)
+        b_in_a = torch.ones_like(a_in_b)
+        for k, (_, pa, pb) in enumerate(spans):
+            if k < 2:
+                b_in_a = b_in_a & (pb >= lo_a[k][:, None]) & (pb <= hi_a[k][:, None])
+            else:
+                a_in_b = a_in_b & (pa >= lo_b[k][:, None]) & (pa <= hi_b[k][:, None])
+        wa, wb = a_in_b.to(pts.dtype), b_in_a.to(pts.dtype)
+        cnt = wa.sum(1) + wb.sum(1)
+        mid = 0.5 * (x_a + x_b)
+        p = torch.where((cnt > 0)[:, None],
+                        ((wa[..., None] * pts).sum(1) + (wb[..., None] * po).sum(1)) / cnt.clamp_min(1.0)[:, None], mid)
+        ra, rb = p - x_a, p - x_b
+        va = v_a + w_a[:, None] * torch.stack([-ra[:, 1], ra[:, 0]], 1)
+        vb = v_b + w_b[:, None] * torch.stack([-rb[:, 1], rb[:, 0]], 1)
+        v_rel = va - vb                                                    # a's velocity relative to b
+        best_t = torch.full_like(mid[:, 0], float("inf"))
+        best_s = torch.zeros_like(best_t)
+        for k, (axis, _, _) in enumerate(spans):
+            above = (lo_a[k] + hi_a[k]) > (lo_b[k] + hi_b[k])              # a on the +axis side of b
+            depth = torch.where(above, hi_b[k] - lo_a[k], hi_a[k] - lo_b[k])
+            vu = (v_rel * axis).sum(1)
+            closing = torch.where(above, -vu, vu)                          # > 0: moving into b along this axis
+            t = torch.where(closing > 1e-3, depth.clamp_min(0.0) / closing.clamp_min(1e-3),
+                            torch.full_like(best_t, float("inf")))
+            better = t < best_t
+            best_t = torch.where(better, t, best_t)
+            best_s = torch.where(better, closing, best_s)
+        return best_s
 
     # ------------------------------------------------------------------ reset
     def sample_spawn(self, n: int, lateral_std: float = 0.3, yaw_std=0.2,
@@ -766,6 +904,19 @@ class Simulator:
         self.collided[env_ids] = False
         self.car_collision[env_ids] = False
         self.prop_touched[env_ids] = False
+        self.wall_touched[env_ids] = False
+        self.wall_engaged[env_ids] = False
+        self.impact_kind[env_ids] = 0.0
+        self.kind_prev[env_ids] = False
+        self.contact_pt[env_ids] = 0.0
+        self.contact_pt_sev[env_ids] = 0.0
+        self.contact_now[env_ids] = 0.0
+        self.contact_held[env_ids] = 0.0
+        self.contact_counts[env_ids] = 0
+        self.contact_acc[env_ids] = 0.0
+        self.car_touched[env_ids] = False
+        self.car_impact_roll[env_ids] = 0.0
+        self.wall_impact[env_ids] = 0.0
         self.steps[env_ids] = 0
         self._resample_car_dims(env_ids)
 
@@ -784,7 +935,11 @@ class Simulator:
         keep = {k: getattr(self, k).clone() for k in ("state", "ax", "ay", "att", "att_prev", "pose_prev", "cmd",
                                                      "cmd_hist", "s", "lap", "collided", "steps", "imu_state",
                                                      "cl_idx", "car_collision", "prop_touched",
-                                                     "_odom_t_prev")}
+                                                     "wall_touched", "wall_engaged", "wall_impact",
+                                                     "impact_kind", "kind_prev", "contact_acc",
+                                                     "contact_pt", "contact_pt_sev", "contact_now",
+                                                     "contact_held", "contact_counts",
+                                                     "car_touched", "car_impact_roll", "_odom_t_prev")}
         odom, t, phase = self.odom.state.clone(), self.t, self._imu_phase
         # The throw-away steps consume randomness from two places, not one: `self.gen` (spawn draws,
         # command-delay jitter) and the GLOBAL torch generator, which is what imu.sample's
@@ -833,6 +988,13 @@ class Simulator:
         self.att_prev = self.att[:, :3:2].clone()
         # the sample layout belongs to this step's phase; capture it before the phase advances
         imu_offsets = self._imu_offsets[self._imu_phase]
+        # In place, before the roll records into it: this step's impacts and nothing older -- not a
+        # warm-up's, not a graph capture's throw-away runs.
+        self.wall_impact.zero_()
+        self.impact_kind.zero_()
+        self.contact_pt_sev.zero_()
+        if self._car_response_on():
+            self.car_impact_roll.zero_()
         state, ax, ay, att, imu_state, imu_samples, i_motor = self._roll(
             self.state, self.ax, self.att, self.imu_state, self.cmd_hist, delay_s, P)
         self._imu_phase = (self._imu_phase + 1) % self.imu_period
@@ -848,18 +1010,48 @@ class Simulator:
 
         # --- collision check on footprint ---
         cars = None
+        car_impact = None
         if self.M > 1:
-            self.car_collision = self._car_contacts(state)
+            if self.measure_impacts:
+                self.car_collision, car_impact = self._car_contacts(state, impact=True)
+            else:
+                self.car_collision = self._car_contacts(state)
+            if self._car_response_on():
+                # Every car contact the roll resolved, not only an overlap left at the step's end (the
+                # response pushes the cars apart within milliseconds), and its severity is the closing
+                # speed the impulses took. Not the step-end reading: after an impulse the bodies separate,
+                # and a corner hit leaves them spinning -- a 3 m/s corner-to-corner rear-end read 5.5 m/s
+                # there, the spin of the corners, not the hit.
+                self.car_collision = self.car_collision | self.car_touched
+                self.car_touched.zero_()
+                if car_impact is not None:
+                    car_impact = self.car_impact_roll.clone()
             cars = self._car_boxes(state)
         wall_dist, hit, odom_state, s, ds, lateral, lap, cl_idx = (
             t.clone() for t in self._post(state, self.odom.state, self.cmd, self.s, self.lap, self.tid, P, self.cl_idx))
         self.cl_idx = cl_idx
+        if self._wall_latch_on():
+            # Every wall contact the roll resolved (`SimParams.wall_latch`), not only the ones still in
+            # the wall cell at the end of the step. In place, for the same reason as `prop_touched`.
+            hit = hit | self.wall_touched
+            self.wall_touched.zero_()
+            # And a contact ends when the footprint is a grid cell clear, not at the first resolution
+            # that finds it outside the wall cell. The test reads a nearest-cell distance field, so the
+            # penetration it sees is 0 or half a cell: a car resting on the hose is pushed 6 mm out,
+            # creeps back across the cell edge and was a fresh contact every 50 ms (a 1.5 m/s hit and
+            # stop: four onsets, at 1.49, 0.11, 0.05 and 0.01 m/s). Gaps under a cell the grid cannot
+            # tell from contact; a car that backs a cell away and comes back has two contacts.
+            hit = hit | (self.wall_engaged & (wall_dist < self.track.t_res[self.tid]))
+            self.wall_engaged.copy_(hit & ~self.absent if self.absent_any else hit)
+        wall_only = hit
+        prop_now = None
         if getattr(self.track, "has_props", False):
             # `_post` reads the occupancy EDT and props are not in it, so without this a car drives
             # through a box: `terminate_on_collision` never fires, and with soft walls the contact is
             # resolved by `_resolve_wall_contact` yet never reported. `prop_touched` also carries the
             # substeps, because a box can be entered and pushed back out inside one control step.
-            hit = hit | self.prop_touched | (self._prop_contact(state)[0] > 0)
+            prop_now = self.prop_touched | (self._prop_contact(state)[0] > 0)
+            hit = hit | prop_now
         self.prop_touched.zero_()          # in place: `warmup` restores by copy_ into this tensor
         if self.absent_any:
             hit = hit & ~self.absent
@@ -868,6 +1060,44 @@ class Simulator:
         # Walls and props alone, before the cars are ORed in: the wall constraint counts these, and read
         # through `collision` a car contact was charged at the wall's price as well as the car's.
         wall_hit = hit
+        # Impact severities (`StepResult.wall_impact`, `car_impact`). Soft contact recorded its own in
+        # the roll; a terminate crash is not resolved, so its state at the end of the step is the
+        # impact. Read-only either way: nothing here feeds back into the physics.
+        if not self.cfg.sim.terminate_on_collision:
+            wall_impact = self.wall_impact.clone()
+        elif self.measure_impacts:
+            wall_impact = torch.where(wall_hit, self._wall_contact_speed(state), torch.zeros_like(self.wall_impact))
+        else:
+            wall_impact = None
+        if self.absent_any:
+            if wall_impact is not None:
+                wall_impact = torch.where(self.absent, torch.zeros_like(wall_impact), wall_impact)
+            if car_impact is not None:
+                car_impact = torch.where(self.car_collision, car_impact, torch.zeros_like(car_impact))
+        contact_onsets = contact_impacts = None
+        # Onsets per kind. With the wall contact held until the car is a cell clear, a crate touched while a
+        # hose is being scraped is no rising edge of the merged flag; counted per kind it is its own contact,
+        # charged and filed with its own impact. Kept in every mode for the console (`contact_frame`); handed
+        # to the env and the meters only with `wall_latch`, so a legacy run charges what it always did.
+        z = torch.zeros_like(wall_only)
+        kinds = torch.stack([wall_only, z if prop_now is None else prop_now,
+                             self.car_collision if self.M > 1 else z], 1)
+        if self.absent_any:
+            kinds = kinds & ~self.absent[:, None]
+        onsets_k = kinds & ~self.kind_prev
+        self.kind_prev.copy_(kinds)
+        if car_impact is not None:
+            car_sev = car_impact
+        elif self.M > 1 and self._car_response_on():
+            car_sev = self.car_impact_roll
+        else:
+            car_sev = torch.zeros_like(self.wall_impact)
+        impacts_k = torch.cat([self.impact_kind, car_sev[:, None].to(self.impact_kind.dtype)], 1)
+        if self.absent_any:
+            impacts_k = torch.where(self.absent[:, None], torch.zeros_like(impacts_k), impacts_k)
+        self._update_contact_frame(kinds, onsets_k, impacts_k)
+        if self._wall_latch_on():
+            contact_onsets, contact_impacts = onsets_k, impacts_k
         if self.M > 1:
             hit = hit | self.car_collision
         # Latched while a collision ends the episode -- the car is frozen and the flag has to
@@ -898,7 +1128,193 @@ class Simulator:
                           self.collided.clone(), ds, s, lateral, self.lap.clone(), wall_dist, self.t,
                           self.car_collision.clone() if self.M > 1 else None,
                           imu_offsets if self.cfg.imu.enabled else None,
-                          odom_t, i_motor if self.wheel_model else None, wall_hit.clone())
+                          odom_t, i_motor if self.wheel_model else None, wall_hit.clone(),
+                          wall_impact, car_impact, contact_onsets, contact_impacts)
+
+    def _record_contact_point(self, pt: torch.Tensor, sev: torch.Tensor, touching: torch.Tensor) -> None:
+        """Keep `pt` as this step's contact point where a contact touches at least as hard as the step's hardest
+        so far (`contact_pt`, `contact_pt_sev`, in place -- the roll is captured with it)."""
+        better = touching & (sev.to(self.contact_pt_sev.dtype) >= self.contact_pt_sev)
+        self.contact_pt.copy_(torch.where(better[:, None], pt.to(self.contact_pt.dtype), self.contact_pt))
+        self.contact_pt_sev.copy_(torch.where(better, sev.to(self.contact_pt_sev.dtype), self.contact_pt_sev))
+
+    def contact_frame(self, rows: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(n, len(CONTACT_FRAME_COLUMNS)) float: what the console needs to draw each car's contacts (see the
+        columns). One tensor so the console's single device-to-host copy can carry it."""
+        out = torch.cat([self.contact_now, self.contact_held, self.contact_counts.to(self.contact_now.dtype)], 1)
+        return out if rows is None else out[rows]
+
+    def _update_contact_frame(self, kinds: torch.Tensor, onsets: torch.Tensor, impacts: torch.Tensor) -> None:
+        """The console's per-car contact record, in place (`contact_frame`): kinds/onsets (B, 3) bool and
+        impacts (B, 3) [m/s] per kind (wall, prop, car), this step's."""
+        from .contact_severity import HARD_MPS
+        sev_k = torch.where(kinds, impacts, torch.full_like(impacts, -1.0))
+        # the hardest kind touching; ties go to the later column (car over prop over wall)
+        best = (sev_k + torch.arange(3, device=sev_k.device, dtype=sev_k.dtype) * 1e-6).argmax(1)
+        any_ = kinds.any(1)
+        kind = torch.where(any_, best + 1, torch.zeros_like(best)).to(self.contact_now.dtype)
+        sev = torch.where(any_, sev_k.max(1).values.clamp_min(0.0), torch.zeros_like(kind))
+        pt = torch.where(any_[:, None], self.contact_pt, torch.zeros_like(self.contact_pt))
+        self.contact_now.copy_(torch.cat([kind[:, None], pt, sev[:, None]], 1))
+        held = self.contact_held
+        left = (held[:, 0] - self.control_dt).clamp_min(0.0)
+        # a contact this step (re)starts the hold; it takes the held record when it is the hold's hardest
+        take = any_ & ((held[:, 0] <= 0.0) | (sev >= held[:, 4]))
+        rec = torch.cat([torch.full_like(sev, CONTACT_HOLD_S)[:, None], kind[:, None], pt, sev[:, None]], 1)
+        new = torch.where(take[:, None], rec, held)
+        new[:, 0] = torch.where(any_, torch.full_like(left, CONTACT_HOLD_S), left)
+        self.contact_held.copy_(new)
+        hard = onsets & (impacts >= HARD_MPS)
+        self.contact_counts.add_(torch.cat([onsets, hard], 1).to(self.contact_counts.dtype))
+
+    def _car_response_on(self) -> bool:
+        """`SimParams.car_response` in a race under soft contact. Python-level, so `graph_fastpath` guards it."""
+        return (self.M > 1 and bool(getattr(self.cfg.sim, "car_response", False))
+                and not self.cfg.sim.terminate_on_collision and getattr(self, "car_touched", None) is not None)
+
+    #: [m] the most a car-car resolution moves one car to separate two bodies. A contact found at its first
+    #: resolution is at most (closing speed x 5 ms) deep -- 4.5 cm at 9 m/s; a deeper overlap (a placement
+    #: that left two cars inside each other) is undone over a few resolutions rather than in one jump.
+    CAR_PUSH_MAX = 0.05
+
+    def _resolve_car_contact(self, state: torch.Tensor) -> torch.Tensor:
+        """Soft car-car contact (`SimParams.car_response`): one resolution, every car against the other
+        cars of its race. Returns the new state; records the contact (`car_touched`) and the closing speed
+        the impulse took (`car_impact_roll`) in place.
+
+        Each car is the body the other cars' LiDAR draws (`_car_contacts`: the footprint scaled by its
+        `car_dims`, the rear detection box on the back). For each pair, by SAT on the four box axes:
+
+        * the normal is the axis the bodies entered on -- the youngest overlap at the current closing rate
+          (penetration / closing speed), as `_car_closing_speed` measures it -- or, with nothing closing,
+          the axis of least overlap; the contact point is the mean of the vertices of each box inside the
+          other; the relative velocity is taken at that point, yaw rate included;
+        * the impulse is the rigid two-body one, J = -(1+e) v_n / (1/m_a + 1/m_b + (r_a x n)^2/I_a +
+          (r_b x n)^2/I_b), each car's own mass and yaw inertia from its parameters, plus a tangential
+          impulse up to `body_friction` x J; e is `car_restitution`;
+        * each car is moved half the penetration out along the normal (at most `CAR_PUSH_MAX`).
+
+        Every row computes its pair from the pair's state alone, in a fixed order (the lower env row is
+        body a), so the two rows of a pair compute the same impulse bit for bit and each applies its own
+        half: momentum is conserved exactly, nothing is scattered, the partner rows (`other_idx`) are
+        static, nothing is read back to the host -- the resolution runs inside the compiled roll and is
+        captured with it."""
+        sp = self.cfg.sim
+        e = float(getattr(sp, "car_restitution", 0.2))
+        mu = float(getattr(sp, "body_friction", 0.3))
+        yaw = state[:, dyn.IYAW]
+        c_, s_ = torch.cos(yaw), torch.sin(yaw)
+        R = torch.stack([torch.stack([c_, -s_], -1), torch.stack([s_, c_], -1)], -2)
+        local = self.corners[None] * (self.car_dims[:, 0] / 0.50)[:, None, None]
+        pts = torch.einsum("bij,bkj->bki", R, local) + state[:, None, :2]
+        ext = torch.stack([-self.car_rear[:, 0] * c_, -self.car_rear[:, 0] * s_], 1)
+        pts = torch.cat([pts, pts[:, 2:] + ext[:, None, :]], 1)                     # (B,6,2), as `_car_contacts`
+        ex = torch.stack([c_, s_], 1)
+        ey = torch.stack([-s_, c_], 1)
+        xy = state[:, :2]
+        w = state[:, dyn.IR]
+        v = torch.stack([state[:, dyn.IVX] * c_ - state[:, dyn.IVY] * s_,
+                         state[:, dyn.IVX] * s_ + state[:, dyn.IVY] * c_], 1)       # world velocity
+        m, Iz = self.P["m"], self.P["Iz"]
+        perp = lambda r: torch.stack([-r[:, 1], r[:, 0]], 1)
+        cross = lambda a, b: a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+        me = self.eid
+        dv = torch.zeros_like(v)
+        dw = torch.zeros_like(w)
+        dx = torch.zeros_like(xy)
+        hit = torch.zeros_like(w, dtype=torch.bool)
+        sev = torch.zeros_like(w)
+        pt = torch.zeros_like(xy)
+        for c in range(self.M - 1):
+            o = self.other_idx[:, c]
+            lo, hi = torch.minimum(me, o), torch.maximum(me, o)
+            a_side = me < o                                           # this row is body a of its pair
+            PA, PB = pts[lo], pts[hi]
+            axes = (ex[lo], ey[lo], ex[hi], ey[hi])
+            pa = [(PA * ax_[:, None, :]).sum(-1) for ax_ in axes]
+            pb = [(PB * ax_[:, None, :]).sum(-1) for ax_ in axes]
+            loa, hia = [x.min(1).values for x in pa], [x.max(1).values for x in pa]
+            lob, hib = [x.min(1).values for x in pb], [x.max(1).values for x in pb]
+            sep = torch.zeros_like(hit)
+            for k in range(4):
+                sep = sep | (hia[k] < lob[k]) | (hib[k] < loa[k])
+            over = ~sep
+            # the contact point: a's vertices inside b (b's own axes) and b's inside a
+            a_in_b = (pa[2] >= lob[2][:, None]) & (pa[2] <= hib[2][:, None]) \
+                & (pa[3] >= lob[3][:, None]) & (pa[3] <= hib[3][:, None])
+            b_in_a = (pb[0] >= loa[0][:, None]) & (pb[0] <= hia[0][:, None]) \
+                & (pb[1] >= loa[1][:, None]) & (pb[1] <= hia[1][:, None])
+            wa, wb = a_in_b.to(xy.dtype), b_in_a.to(xy.dtype)
+            cnt = wa.sum(1) + wb.sum(1)
+            p = torch.where((cnt > 0)[:, None],
+                            ((wa[..., None] * PA).sum(1) + (wb[..., None] * PB).sum(1)) / cnt.clamp_min(1.0)[:, None],
+                            0.5 * (xy[lo] + xy[hi]))
+            ra, rb = p - xy[lo], p - xy[hi]
+            v_rel = (v[hi] + w[hi][:, None] * perp(rb)) - (v[lo] + w[lo][:, None] * perp(ra))   # b relative to a
+            # the normal, pointing from a to b: the entry axis, or least overlap when nothing closes
+            best_t = torch.full_like(w, float("inf"))
+            n = torch.zeros_like(xy); pen = torch.zeros_like(w)
+            least = torch.full_like(w, float("inf"))
+            n_l = torch.zeros_like(xy)
+            for k in range(4):
+                b_up = (lob[k] + hib[k]) > (loa[k] + hia[k])          # b on the +axis side of a
+                depth = torch.where(b_up, hia[k] - lob[k], hib[k] - loa[k]).clamp_min(0.0)
+                n_k = axes[k] * torch.where(b_up, 1.0, -1.0)[:, None]
+                closing = -(v_rel * n_k).sum(1)
+                t = torch.where(closing > 1e-3, depth / closing.clamp_min(1e-3), torch.full_like(w, float("inf")))
+                better = t < best_t
+                best_t = torch.where(better, t, best_t)
+                n = torch.where(better[:, None], n_k, n)
+                pen = torch.where(better, depth, pen)
+                fewer = depth < least
+                least = torch.where(fewer, depth, least)
+                n_l = torch.where(fewer[:, None], n_k, n_l)
+            entered = torch.isfinite(best_t)
+            n = torch.where(entered[:, None], n, n_l)
+            pen = torch.where(entered, pen, least)
+            vn = (v_rel * n).sum(1)                                   # < 0: closing
+            ran, rbn = cross(ra, n), cross(rb, n)
+            ml, mh, Il, Ih = m[lo], m[hi], Iz[lo], Iz[hi]
+            Jn = torch.where(over, (1 + e) * (-vn).clamp_min(0.0)
+                             / (1.0 / ml + 1.0 / mh + ran * ran / Il + rbn * rbn / Ih), torch.zeros_like(w))
+            t_ = perp(n)
+            rat, rbt = cross(ra, t_), cross(rb, t_)
+            Jt = -(v_rel * t_).sum(1) / (1.0 / ml + 1.0 / mh + rat * rat / Il + rbt * rbt / Ih)
+            Jt = torch.maximum(torch.minimum(Jt, mu * Jn), -mu * Jn)
+            imp = Jn[:, None] * n + Jt[:, None] * t_                  # on b; a takes -imp
+            sgn = torch.where(a_side, -1.0, 1.0)
+            my_imp = sgn[:, None] * imp
+            dv = dv + my_imp / m[:, None]
+            dw = dw + cross(torch.where(a_side[:, None], ra, rb), my_imp) / Iz
+            push = torch.where(over, (0.5 * pen).clamp(max=self.CAR_PUSH_MAX), torch.zeros_like(pen))
+            dx = dx + sgn[:, None] * n * push[:, None]
+            hit = hit | over
+            sev_c = torch.where(over, (-vn).clamp_min(0.0), torch.zeros_like(vn))
+            pt = torch.where((over & (sev_c >= sev))[:, None], p, pt)
+            sev = torch.maximum(sev, sev_c)
+        self.car_touched.logical_or_(hit)
+        self.car_impact_roll.copy_(torch.maximum(self.car_impact_roll, sev.to(self.car_impact_roll.dtype)))
+        self._record_contact_point(pt, sev, hit)
+        v2 = v + dv
+        st = state.clone()
+        st[:, :2] = xy + dx
+        st[:, dyn.IVX] = v2[:, 0] * c_ + v2[:, 1] * s_
+        st[:, dyn.IVY] = -v2[:, 0] * s_ + v2[:, 1] * c_
+        st[:, dyn.IR] = w + dw
+        return st
+
+    def _props_move_in_roll(self) -> bool:
+        """`SimParams.prop_relative` with movable props under soft contact: a struck prop is a second body,
+        moved in place inside the roll (`ProceduralObstacles.drift` / `push`). Python-level, guarded."""
+        return (bool(getattr(self.cfg.sim, "prop_relative", False)) and bool(getattr(self, "movable_obstacles", False))
+                and not self.cfg.sim.terminate_on_collision
+                and getattr(self.track, "env_props", None) is not None)
+
+    def _wall_latch_on(self) -> bool:
+        """`SimParams.wall_latch` under soft contact. Read at Python level inside the roll, so it is
+        part of a captured graph's structure (`graph_fastpath` guards it)."""
+        return (bool(getattr(self.cfg.sim, "wall_latch", False)) and not self.cfg.sim.terminate_on_collision
+                and getattr(self, "wall_touched", None) is not None)
 
     def _guarded(self, compiled, attr, eager):
         """Compiled callable that falls back to eager for good if inductor/Triton fails at first use."""
@@ -951,6 +1367,19 @@ class Simulator:
         samples = []
         a_cmd_last = torch.zeros_like(ax)
         soft_wall = not self.cfg.sim.terminate_on_collision
+        props_move = soft_wall and self._props_move_in_roll()
+        cars = soft_wall and self._car_response_on()
+        # `SimParams.contact_moments`: a contact turns the body about its CoG at the height it pushes. Per env:
+        # [rad/s^2] of roll / pitch per [m/s^2] of contact acceleration across / along the car.
+        moments = soft_wall and bool(getattr(self.cfg.sim, "contact_moments", False))
+        if moments:
+            k_roll = (P["h"] - P["contact_z_side"]) * P["m"] / P["Ixx"]
+            k_pitch = (P["h"] - P["contact_z_end"]) * P["m"] / P["Iyy"]
+        # `SimParams.contact_accel_hold`: the contact's acceleration over its whole window, carried across
+        # control steps in `contact_acc` (the last window of a step reaches into the next one).
+        hold = soft_wall and bool(getattr(self.cfg.sim, "contact_accel_hold", False)) \
+            and getattr(self, "contact_acc", None) is not None
+        a_hold = self.contact_acc if hold else None
         ar = torch.arange(self.B, device=state.device)
         for k in range(self.substeps):
             age = delay_s - (k + 1) * self.dt
@@ -983,7 +1412,28 @@ class Simulator:
             ce = self.contact_every
             if soft_wall and (k % ce == ce - 1 or k == self.substeps - 1):
                 span = (k % ce) + 1
+                if props_move:
+                    # the props slide over the same window, so the contact sees them where they are, and a
+                    # prop shoved into a wall stops at it
+                    self.track.env_props.drift(self.dt * span, self.tid)
+                v_pre = state[:, dyn.IVX:dyn.IVY + 1]
                 state, a_contact = self._resolve_wall_contact(state, dt=self.dt * span)
+                if cars:
+                    v_wall = state[:, dyn.IVX:dyn.IVY + 1]
+                    state = self._resolve_car_contact(state)
+                    if not hold:
+                        # the per-substep form (`contact_accel_hold` off), clipped the way it clips the walls
+                        a_car = (state[:, dyn.IVX:dyn.IVY + 1] - v_wall) / (self.dt * span)
+                        mag = a_car.norm(dim=1, keepdim=True).clamp_min(1e-9)
+                        a_contact = a_contact + a_car * (mag.clamp(max=self.cfg.imu.accel_range) / mag)
+                if hold:
+                    # Everything this window's contacts did to the velocity, spread over the window and
+                    # applied for its length -- so the springs and the accelerometer integrate the whole
+                    # change. Not clipped here: the body takes whatever the contact gives it, and the
+                    # accelerometer clips at its range when it is sampled (`imu.sample`).
+                    a_hold = (state[:, dyn.IVX:dyn.IVY + 1] - v_pre) / (self.dt * span)
+            if hold:
+                a_contact = a_hold
             a_x = ax if a_contact is None else ax + a_contact[:, 0]
             a_y = ay if a_contact is None else ay + a_contact[:, 1]
             # sprung mass: roll to the outside of the corner, dive under braking, squat under throttle
@@ -995,13 +1445,29 @@ class Simulator:
                 excite = (state[:, dyn.IVX].abs() / P["road_tilt_v"].clamp_min(1e-6)).clamp(0.0, 1.0)
                 w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s * excite
                 w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s * excite
-            roll_ss = P["roll_per_g"] * a_y / dyn.G + w_roll
+            # The per-g gains are the tyres' (a force at the ground, through the suspension); with
+            # `contact_moments` a contact's acceleration turns the body at its own height instead (below).
+            s_x, s_y = (ax, ay) if moments else (a_x, a_y)
+            roll_ss = P["roll_per_g"] * s_y / dyn.G + w_roll
             # asymmetric: the car squats under throttle far more than it dives under (regen-limited) braking
-            pitch_ss = -torch.where(a_x > 0, P["pitch_per_g"], P["dive_per_g"]) * a_x / dyn.G + w_pitch
+            pitch_ss = -torch.where(s_x > 0, P["pitch_per_g"], P["dive_per_g"]) * s_x / dyn.G + w_pitch
             roll_acc = wn * wn * (roll_ss - roll) - 2 * zeta * wn * roll_rate
             pitch_acc = wn * wn * (pitch_ss - pitch) - 2 * zeta * wn * pitch_rate
+            if moments and a_contact is not None:
+                # (h - z) F / I about the CoG, F = m a: a push across the car at the flank height rolls it, one
+                # along it at the bumper height pitches it -- nose down when it is stopped from the front.
+                roll_acc = roll_acc + k_roll * a_contact[:, 1]
+                pitch_acc = pitch_acc - k_pitch * a_contact[:, 0]
             roll_rate = roll_rate + roll_acc * self.dt
             pitch_rate = pitch_rate + pitch_acc * self.dt
+            if moments:
+                # The suspension's travel ends at +-0.35 rad: there the body stops turning further, so the
+                # rate into the stop is taken out (the gyro read a rate the clamped angle never followed).
+                # Hard contacts reach it now; the tyres alone never did.
+                roll_rate = torch.where((roll + roll_rate * self.dt).abs() >= 0.35,
+                                        torch.where(roll_rate * roll > 0, torch.zeros_like(roll_rate), roll_rate), roll_rate)
+                pitch_rate = torch.where((pitch + pitch_rate * self.dt).abs() >= 0.35,
+                                         torch.where(pitch_rate * pitch > 0, torch.zeros_like(pitch_rate), pitch_rate), pitch_rate)
             roll = (roll + roll_rate * self.dt).clamp(-0.35, 0.35)
             pitch = (pitch + pitch_rate * self.dt).clamp(-0.35, 0.35)
             if imu_on:
@@ -1014,6 +1480,8 @@ class Simulator:
                     smp, imu_state = imu_model.sample(imu_state, P, self.imu_ts)
                     samples.append(smp)
         imu_samples = torch.stack(samples, 1) if samples else torch.zeros(state.shape[0], 0, 6, device=state.device)
+        if hold:
+            self.contact_acc.copy_(a_hold)                 # in place: a captured graph keeps writing it
         # `/sensors/core` `current_motor`, the guard's third (optional) input. The VESC commands a
         # current, and the torque it produces is that current times a constant: this inverts the
         # last substep's motor torque through `amp_per_nm`, which is calibrated in ActuatorParams
@@ -1089,6 +1557,9 @@ class Simulator:
         clr = self._footprint_clearance(state)
         pen = (-clr).clamp_min(0.0)
         touching = pen > 0
+        if self._wall_latch_on():
+            # the walls alone, before a prop can take over `touching` (props latch `prop_touched`)
+            self.wall_touched.logical_or_(touching)
         prop_slot = None                   # set below when the props can be pushed
         prop_deeper = n_p = None
         if getattr(self.track, "has_props", False):
@@ -1166,7 +1637,18 @@ class Simulator:
         # the m_prop -> infinity limit of this one. Against a 10 kg crate with a 3.74 kg car, the
         # car keeps m_p/(m_c+m_p) = 0.73 of the bounce and the crate takes the rest and slides.
         share = torch.ones_like(vn)
-        if prop_slot is not None:
+        # `SimParams.prop_relative`: a movable prop is a second body (below, after the contact point).
+        rel = prop_slot is not None and self._props_move_in_roll()
+        mov = v_p = None
+        if rel:
+            ep = self.track.env_props
+            sl = prop_slot.clamp_min(0)
+            m_p = torch.where(prop_slot >= 0, ep.p_mass[self.eid, sl], torch.zeros_like(vn))
+            mov = prop_deeper & touching & (m_p > 0)                   # a movable prop owns this contact
+            m_c = self.P["m"]
+            share = torch.where(mov, m_p / (m_c + m_p).clamp_min(1e-6), share)
+            v_p = torch.where(mov[:, None], ep.p_vel[self.eid, sl].to(n.dtype), torch.zeros_like(n))
+        if prop_slot is not None and not rel:
             m_c = float(self.cfg.vehicle.m)
             rows = torch.arange(state.shape[0], device=state.device)
             m_p = torch.where(prop_slot >= 0,
@@ -1201,13 +1683,58 @@ class Simulator:
         vpn = (vwx - r_now * p_c[:, 1]) * n[:, 0] + (vwy + r_now * p_c[:, 0]) * n[:, 1]
         if not getattr(sp, "contact_at_point", True):
             p_c = torch.zeros_like(p_c); pxn = torch.zeros_like(pxn); vpn = vn
+        if v_p is not None:
+            vpn = vpn - (v_p * n).sum(1)                                 # a moving prop: relative speed
         into = (vpn < 0) & touching
+        # How hard this is (`wall_impact`): the speed into the surface at the contact point -- the
+        # `-vpn` the impulse below takes -- kept as the step's maximum. A contact is first seen with
+        # its whole approach speed and every resolution after bleeds it, so for an impact the maximum
+        # is its first resolution. Only read here; in place, so a captured graph keeps recording it.
+        self.wall_impact.copy_(torch.maximum(
+            self.wall_impact, torch.where(into, -vpn, torch.zeros_like(vpn)).to(self.wall_impact.dtype)))
+        # ... and split by which owned the contact, walls or a prop (`StepResult.contact_impacts`)
+        sev_now = torch.where(into, -vpn, torch.zeros_like(vpn)).to(self.impact_kind.dtype)
+        is_prop = prop_deeper if prop_deeper is not None else torch.zeros_like(into)
+        self.impact_kind.copy_(torch.maximum(self.impact_kind, torch.stack(
+            [torch.where(is_prop, torch.zeros_like(sev_now), sev_now), torch.where(is_prop, sev_now, torch.zeros_like(sev_now))], 1)))
+        # ... and where it touched, for the console: the deepest corner(s) of this resolution if it is the
+        # step's hardest so far (a resting contact, 0 m/s, is kept while nothing harder came)
+        self._record_contact_point(state[:, :2] + p_c, sev_now, touching)
         m_car, Iz = self.P["m"], self.P["Iz"]
         J = (1 + k) * share * bleed * (-vpn) / (1.0 / m_car + pxn * pxn / Iz)       # >= 0 while driving in
         vwx2 = vwx + J / m_car * n[:, 0]
         vwy2 = vwy + J / m_car * n[:, 1]
         vwx2, vwy2 = vwx2 * (1 - f * 0.05), vwy2 * (1 - f * 0.05)
         r2 = r_now + J * pxn / Iz
+        if mov is not None:
+            # A movable prop is a second body (`SimParams.prop_relative`). The impulse is the two-body one
+            # on the RELATIVE velocity at the contact point, J = -(1+k) u_n / (1/m_c + (p x n)^2/Iz + 1/m_p),
+            # with Coulomb friction (`body_friction`) along the tangent, and the prop takes exactly -J
+            # (`push`), moved in place inside the roll with the floor slowing it (`drift`). The old form
+            # took the car's own into-prop speed and left the prop where it stood until the step ended, so
+            # every resolution of the step shoved it again: a 1.2 kg box left at about 2.6x the car's speed
+            # while the car kept 0.18 of its own -- energy created. Now one impact is one impulse and the
+            # momentum is conserved; with k <= 1 and the lever used the same way in u and in the turn
+            # (`contact_lever`), no contact gains energy.
+            lam = getattr(sp, "contact_lever", 1.0) if getattr(sp, "contact_at_point", True) else 0.0
+            t_ = torch.stack([-n[:, 1], n[:, 0]], 1)
+            pxt = (p_c[:, 0] * t_[:, 1] - p_c[:, 1] * t_[:, 0]) * lam
+            inv_p = torch.where(mov, 1.0 / m_p.clamp_min(1e-6), torch.zeros_like(m_p))
+            dvx, dvy = vwx - v_p[:, 0], vwy - v_p[:, 1]
+            u_n = dvx * n[:, 0] + dvy * n[:, 1] + r_now * pxn
+            u_t = dvx * t_[:, 0] + dvy * t_[:, 1] + r_now * pxt
+            Jn = (1 + k) * bleed * (-u_n).clamp_min(0.0) / (1.0 / m_car + pxn * pxn / Iz + inv_p)
+            Jt = -bleed * u_t / (1.0 / m_car + pxt * pxt / Iz + inv_p)
+            mu = float(getattr(sp, "body_friction", 0.3))
+            Jt = torch.maximum(torch.minimum(Jt, mu * Jn), -mu * Jn)
+            Px, Py = Jn * n[:, 0] + Jt * t_[:, 0], Jn * n[:, 1] + Jt * t_[:, 1]
+            vwx2 = torch.where(mov, vwx + Px / m_car, vwx2)
+            vwy2 = torch.where(mov, vwy + Py / m_car, vwy2)
+            r2 = torch.where(mov, r_now + (pxn * Jn + pxt * Jt) / Iz, r2)
+            into = into | mov
+            # the prop's half of it: -P, and its share of the overlap (the car takes `share` below)
+            ep.push(self.eid, prop_slot, -torch.stack([Px, Py], 1) * inv_p[:, None],
+                    -n * (pen * (1.0 - share) * bleed * mov.to(pen.dtype))[:, None])
         vwx = torch.where(into, vwx2, vwx); vwy = torch.where(into, vwy2, vwy)
         st = state.clone()
         st[:, dyn.IR] = torch.where(into, r2, r_now)
@@ -1230,6 +1757,36 @@ class Simulator:
         lim = self.cfg.imu.accel_range
         mag = a_c.norm(dim=1, keepdim=True).clamp_min(1e-9)
         return st, a_c * (mag.clamp(max=lim) / mag)
+
+    def _wall_contact_speed(self, state: torch.Tensor) -> torch.Tensor:
+        """(B,) speed INTO the wall or prop at the contact point, for a car standing in one at `state`
+        (0 elsewhere): the quantity `_resolve_wall_contact` records as `wall_impact`, by the same rules
+        -- the deeper of wall and prop owns the normal, the contact point is the deepest corner(s)
+        along it -- for the crash a terminate step reports and never resolves. Pure: reads `state`."""
+        clr = self._footprint_clearance(state)
+        pen = (-clr).clamp_min(0.0)
+        touching = clr <= 0.0                              # `_post_roll`'s own test for the reported hit
+        n = self.track.edt_gradient(state[:, :2], self.tid)
+        if getattr(self.track, "has_props", False):
+            pen_p, n_p = Simulator._prop_contact(self, state, fn=prop_contacts)[:2]
+            deeper = pen_p > pen
+            n = torch.where(deeper[:, None], n_p.to(n.dtype), n)
+            touching = touching | (pen_p > 0)
+        yaw = state[:, dyn.IYAW]
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        vwx = state[:, dyn.IVX] * c - state[:, dyn.IVY] * s
+        vwy = state[:, dyn.IVX] * s + state[:, dyn.IVY] * c
+        if getattr(self.cfg.sim, "contact_at_point", True):
+            r_now = state[:, dyn.IR]
+            cw = torch.einsum("bij,kj->bki", torch.stack([torch.stack([c, -s], -1), torch.stack([s, c], -1)], -2),
+                              self.corners)
+            proj = (cw * n[:, None, :]).sum(-1)
+            w = torch.softmax(-(proj - proj.min(1, keepdim=True).values) / 0.01, 1)
+            p_c = (w[..., None] * cw).sum(1)
+            vpn = (vwx - r_now * p_c[:, 1]) * n[:, 0] + (vwy + r_now * p_c[:, 0]) * n[:, 1]
+        else:
+            vpn = vwx * n[:, 0] + vwy * n[:, 1]
+        return torch.where(touching, (-vpn).clamp_min(0.0), torch.zeros_like(vpn))
 
     # ------------------------------------------------------------------ introspection
     def scan_meta(self) -> Dict[str, float]:

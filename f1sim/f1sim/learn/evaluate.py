@@ -23,7 +23,7 @@ from ..mpc import SPEED_MODES
 from .. import opponent_slots as opp_sl
 from .. import opponent_events as opp_ev
 from ..opponent_events import describe as describe_events, parse_events, split_events
-from ..params import Config
+from ..params import Config, legacy_contacts
 from . import common
 from . import grip_runtime
 from .evaluation_metrics import TrialAccumulator
@@ -384,12 +384,16 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     # `collisions_per_km` can do. Both meters wrap `sim.step`; entered in this order the encounter
     # meter wraps the traffic meter's wrapper and unwinds first, so each sees the same transition.
     enc = EncounterMeter(env)
+    # How hard each contact onset was (walls and props, cars), in severity buckets per km. Wraps
+    # `sim.step` like the other two and reads only; it switches `sim.measure_impacts` on for the run.
+    from .severity_meter import ContactSeverityMeter
+    sev = ContactSeverityMeter(env)
     if protocol == "rolling":
         # The meter wraps `sim.step` so every quantity is read BEFORE the auto-reset, the same
         # discipline the benchmark's own loop keeps. `rollout_metrics` is left untouched: it is a
         # validated implementation of a different measurement, and a second caller poking at its
         # internals is how two measurements start disagreeing.
-        with meter, enc:
+        with meter, enc, sev:
             result = common.rollout_metrics(env, policy, steps, speed_cap, controller=ctrl)
         for key, value in result.items():
             if isinstance(value, float) and not math.isfinite(value):
@@ -406,7 +410,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
             raise ValueError("Trial evaluation requires positive centerline lengths")
         trials = TrialAccumulator(lengths, env.sim.control_dt,
                                   time_budget_s=steps * env.sim.control_dt, speed_cap=speed_cap)
-        with meter, enc:
+        with meter, enc, sev:
             for _ in range(steps):
                 ctrl.pre_action(obs)
                 obs, _, term, trunc, info = env.step(policy(obs))
@@ -428,6 +432,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         result['initial_track_lengths_m'] = lengths.tolist()
     result.update(meter.report())
     result.update(enc.report())
+    result.update(sev.report())
     ctrl_metrics, _ = ctrl.collect_metrics()
     ctrl.release()
     if graph_holder is not None:
@@ -646,6 +651,9 @@ def main() -> None:
                     help="'soft' counts every contact onset per km and lets the car recover; "
                          "'terminate' counts the crashes that end episodes")
     ap.add_argument("--movable-obstacles", action="store_true", default=None)
+    ap.add_argument("--legacy-contacts", action="store_true",
+                    help="the contact physics before 2026-10-15 (params.CONTACT_FIXES off): reproduces "
+                         "the numbers of every evaluation before it")
     ap.add_argument("--output", type=Path, help="write the complete strict JSON report")
     ap.add_argument("--eager", action="store_true", help="disable simulator compilation (CPU smoke tests)")
     ap.add_argument("--external-kind", default="", choices=["", "tinylidarnet", "end2race"],
@@ -710,6 +718,8 @@ def main() -> None:
     def run(names, config):
         if a.wheel_model != "default":
             config.vehicle.wheel_model = a.wheel_model == "on"
+        if a.legacy_contacts:
+            legacy_contacts(config)
         return evaluate(a.ckpt, names, a.envs, a.steps, a.speed_cap, a.device, seed=a.seed, cfg=config,
                         teacher=a.teacher, action_mode=a.action_mode, protocol=a.protocol,
                         opp_token_ablate=a.opp_token_ablate,

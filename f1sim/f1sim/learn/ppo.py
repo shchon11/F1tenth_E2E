@@ -27,7 +27,7 @@ from ..gym_env import (EnvConfig, FUTURE_LABEL_DIM, FUTURE_PRESENT_INDEX, OPP_FU
                        PRIV_OPP_DIST_SCALE, REWARD_COMPONENT_KEYS)
 from ..mpc import plan_layout
 from ..opp_token import OPP_TOKEN_MODES, describe as describe_opp_token
-from ..params import Config
+from ..params import Config, legacy_contacts
 from . import common
 from . import conditioning as cond_mod
 from . import grip_runtime as grip_rt
@@ -260,6 +260,29 @@ def _per_km(count, dist_m: float) -> float:
     dividing by `max(dist, 1e-6)` then printed s914's "9000000000.0/km" for a single contact."""
     dist_m = float(dist_m)
     return 1000.0 * float(count) / dist_m if dist_m > 1.0 else float("nan")
+
+
+#: `--contact-severity-min`'s log, both ways: (info key, log key) per column of `severity_onsets`
+SEVERITY_LOG = (("wall_onset_all", "contacts/wall_all_per_km"), ("wall_onset", "contacts/wall_hard_per_km"),
+                ("car_onset_all", "contacts/car_onset_all_per_km"), ("car_onset_hard", "contacts/car_onset_hard_per_km"))
+
+
+def severity_onsets(info: dict, rows: torch.Tensor) -> torch.Tensor:
+    """(len(rows), 4) this step's contact onsets under `--contact-severity-min`: wall/prop onsets all and
+    charged (at or above the threshold), car-contact onsets all and hard. Zeros where the env has no such
+    column (a solo run has no cars)."""
+    cols = []
+    for key, _ in SEVERITY_LOG:
+        v = info.get(key)
+        cols.append(v[rows].float() if v is not None else torch.zeros(rows.numel(), device=rows.device))
+    return torch.stack(cols, 1)
+
+
+def severity_rates(onsets: torch.Tensor, progress_m: torch.Tensor, mask: torch.Tensor) -> dict:
+    """Per km of the policy's own progress -- the unit `lagrange_step` counts its constraints in."""
+    km = float((progress_m.clamp_min(0) * mask).sum()) / 1000.0
+    tot = (onsets * mask[..., None]).sum((0, 1)).tolist()
+    return {log_key: (c / km if km > 1e-3 else float("nan")) for (_, log_key), c in zip(SEVERITY_LOG, tot)}
 
 
 def lagrange_step(rew: torch.Tensor, components: torch.Tensor, progress_m: torch.Tensor, mask: torch.Tensor,
@@ -793,6 +816,13 @@ def main():
                          "off and go again, and above all not end up driving the wrong way "
                          "(--wrong-way-penalty). Not comparable with a 'terminate' run's "
                          "collisions per km without saying so")
+    ap.add_argument("--contact-severity-min", type=float, default=0.0, metavar="V",
+                    help="[m/s] charge only the contact onsets at least this hard -- the speed of the two surfaces "
+                         "into each other along the contact normal, at the contact point (f1sim.contact_severity). "
+                         "A softer onset is free for the collision and car-contact penalties and for --lagrange's "
+                         "onset counts; a harder one is charged exactly as before. Both counts are logged "
+                         "(contacts/*_all_per_km, contacts/*_hard_per_km). 0 = every onset, as before. Needs "
+                         "--collision-mode soft")
     # ---- the learner. PPO is this file's own loop; SAC shares everything up to it (`learn/sac.py`).
     ap.add_argument("--algo", choices=["ppo", "sac"], default="ppo",
                     help="the learning algorithm. 'sac': soft actor-critic with a replay buffer on the "
@@ -874,6 +904,10 @@ def main():
                          "shape: each carries the mass of what it is (cardboard box 1.2 kg, "
                          "wooden crate 10, steel drum 18, against a 3.74 kg car) and a contact "
                          "exchanges momentum both ways. Needs --collision-mode soft")
+    ap.add_argument("--legacy-contacts", action="store_true",
+                    help="the contact physics before 2026-10-15 (params.CONTACT_FIXES all off): wall contacts "
+                         "flagged only by the step-end grid test, prop impulses on the car's own speed, a prop "
+                         "set per car, cars that pass through each other. Reproduces earlier runs' numbers")
     ap.add_argument("--spawn-runway", type=float, default=0.0, metavar="M",
                     help="[m] of clear road every spawning car is guaranteed ahead of it, prop or "
                          "wall. 0 = off. A car is placed at up to the spawn speed and cannot stop "
@@ -1058,6 +1092,14 @@ def main():
         rl_kw["objective"] = a.raceline_objective
     if a.grip_budget_penalty > 0 and a.cond != "dial":
         raise SystemExit("--grip-budget-penalty charges for exceeding the dial; without --cond dial there is no dial")
+    if a.contact_severity_min < 0:
+        raise SystemExit("--contact-severity-min is a speed in m/s, >= 0")
+    if a.contact_severity_min > 0 and a.collision_mode != "soft":
+        raise SystemExit("--contact-severity-min needs --collision-mode soft: under terminate every contact ends the "
+                         "episode, so a free graze would still be the end of it")
+    if a.contact_severity_min > 0 and a.legacy_car_wall_charge:
+        raise SystemExit("--contact-severity-min with --legacy-car-wall-charge: the legacy accounting reads a car "
+                         "contact through the wall flag; charge by severity on the split accounting only")
     tracks, rls = common.load_tracks(names, racelines=need_rl, **rl_kw)
     # One switch sets both halves of the runtime. They are alternatives, not layers: `compile` and
     # `graphs` both end in a CUDA graph, and leaving `compile_tracker` True while asking for explicit
@@ -1075,6 +1117,8 @@ def main():
     if a.rand_widen != 1.0 or a.rand_range:
         print(f"physics randomisation: widen x{a.rand_widen:g}, extra {list(a.rand_range)}", flush=True)
     sim_cfg.sim.compile = (a.sim_backend == "compile")
+    if a.legacy_contacts:
+        legacy_contacts(sim_cfg)
     _env_compile_tracker = (a.sim_backend == "compile")
     if a.sim_backend != "compile" and device.type != "cuda":
         print(f"--sim-backend {a.sim_backend} on {device.type}: physics/solver compile is off "
@@ -1121,6 +1165,7 @@ def main():
                                                               procedural_raceline_corridor=a.procedural_raceline_corridor,
                                                               spawn_runway=a.spawn_runway,
                                                               collision_mode=a.collision_mode,
+                                                              contact_severity_min=a.contact_severity_min,
                                                               # nothing terminates under soft, so the
                                                               # batch would reset in lockstep forever
                                                               stagger_first_episode=a.collision_mode == "soft",
@@ -1622,7 +1667,7 @@ def main():
         "reward_proximity", "safe_dist", "reward_plan_clearance", "plan_margin", "reward_wrong_way",
         "reward_lap", "reward_lap_time", "reward_alive", "reward_car_contact", "reward_overtake",
         "reward_car_proximity", "car_safe_gap", "reward_sideslip", "reward_ttc", "ttc_safe",
-        "reward_overtake_hold", "overtake_hold_dist", "overtake_hold_time")}
+        "reward_overtake_hold", "overtake_hold_dist", "overtake_hold_time", "contact_severity_min")}
     #: What this run was, recorded in every checkpoint it writes so a result traces back to its arm,
     #: its normalization and its adapter without consulting a shell history.
     experiment_meta = {
@@ -1876,6 +1921,9 @@ def main():
     buf_car_hit = torch.zeros(T, B, device=device) if env.M > 1 else None
     car_prev_row = torch.zeros(B, dtype=torch.bool, device=device)
     car_all_rate = float("nan")
+    # --contact-severity-min: the learner's onsets both ways, all and at or above the threshold
+    buf_sev = torch.zeros(T, B, len(SEVERITY_LOG), device=device) if env.ecfg.contact_severity_min > 0 else None
+    sev_rates = {}
     # mixed opponents: a teacher-driven car's transitions sit in the buffer (its width is fixed) but
     # carry no weight in the loss -- its actions are the teacher's, not the policy's
     buf_mask = torch.ones(T, B, device=device)
@@ -2137,6 +2185,8 @@ def main():
                 buf_prog[t] = info["progress"][lid]
                 if buf_car_hit is not None and "car_collision" in info:
                     buf_car_hit[t] = info["car_collision"][lid].float()
+                if buf_sev is not None:
+                    buf_sev[t] = severity_onsets(info, lid)
                 ep_stats["lap_time"] += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
                 buf_final_val[t].zero_()
                 if "final" in info:
@@ -2223,6 +2273,8 @@ def main():
                 car_prev_row = touching[-1].clone()
                 km_ = float((buf_prog.clamp_min(0) * buf_mask).sum()) / 1000.0
                 car_all_rate = float((car_on.float() * buf_mask).sum()) / max(km_, 1e-3)
+            if buf_sev is not None:
+                sev_rates = severity_rates(buf_sev, buf_prog, buf_mask)
             if lagrange:
                 # contacts this rollout (onsets, from the component and its own weight), the rate per km of
                 # the policy's own progress, the dual step, then the reward with the fixed penalty swapped
@@ -2464,6 +2516,7 @@ def main():
                 log[f"lagrange/{n_}_lambda"] = v_["lam"]; log[f"lagrange/{n_}_rate_per_km"] = v_["rate"]
             if buf_car_hit is not None:
                 log["contacts/car_all_per_km"] = car_all_rate
+            log.update(sev_rates)
             log["rollout/driving_reward_per_step"] = drive_per_step
             log["rollout/progress_per_step"] = prog_per_step
             m_ = buf_mask[..., None]
@@ -2559,6 +2612,9 @@ def main():
                             + (f" tgt {v.get('target_now', float('nan')):.2f}" if v.get('anneal') else "")
                             for n, v in lagrange.items())
                   + (f" | car_all {car_all_rate:.2f}/km" if buf_car_hit is not None else "")
+                  + (f" | >={a.contact_severity_min:g} m/s wall {sev_rates['contacts/wall_hard_per_km']:.2f}"
+                     f"/{sev_rates['contacts/wall_all_per_km']:.2f} car {sev_rates['contacts/car_onset_hard_per_km']:.2f}"
+                     f"/{sev_rates['contacts/car_onset_all_per_km']:.2f}/km" if sev_rates else "")
                   + (f" | mask {log['loss/aux_opp_mask']:.3f} r{log.get('loss/aux_opp_mask/mask_recall', float('nan')):.2f}"
                      if 'loss/aux_opp_mask' in log else "")
                   + (f" | dv {log['loss/aux_motion_mse']:.4f}" if 'loss/aux_motion_mse' in log else "")

@@ -182,6 +182,31 @@ class VehicleParams:
     road_tau: float = 0.4      # [s] its correlation time (the roll-rate spectrum is flat above ~0.4 Hz)
     susp_wn: float = 17.6      # [rad/s] suspension natural frequency (~2.8 Hz)
     susp_zeta: float = 0.35    # [-] damping ratio (underdamped: visible overshoot after braking)
+    # What a contact does to the sprung mass (`SimParams.contact_moments`). A contact pushes the body where it
+    # touches, not at the ground the tyres push from: a horizontal force F at height z turns the body about
+    # its CoG at (h - z) F / I. Tyre forces keep the calibrated per-g gains above; a contact's acceleration
+    # turns the body through these instead.
+    #   Ixx, Iyy: the sprung mass's roll and pitch inertia. ESTIMATED, not measured: the measured yaw inertia
+    #   Iz (0.047 kg m^2) taken as a uniform box of the footprint's aspect (0.58 : 0.31 -> 0.34 x 0.18 m of
+    #   effective mass extent) and 0.10 m of effective height (the mass between the chassis plate and the
+    #   deck, CoG 7.4 cm): Ixx = m (0.183^2 + 0.10^2) / 12, Iyy = m (0.343^2 + 0.10^2) / 12.
+    #   contact_z_end / contact_z_side: [m] the height a contact on the car's end (bumper) / flank pushes at.
+    #   FITTED to the 56 hose impacts above 1 m/s in the competition recordings (2026-10-15): with these, the
+    #   simulated IMU's peak pitch / roll rate per m/s of the impact's velocity change (the accelerometer
+    #   integrated over the event, the recordings' own rule) is 2.29 / 2.19 rad/s against the recorded median
+    #   2.44 / 2.34 (end-dominant / flank-dominant impacts; through the tyre gains alone it was 0.21 / 0.67),
+    #   and the attitude swing a scripted hit leaves, median 9 / 8 deg, sits inside the recordings' integrated
+    #   gyro (6-14 deg median). Both heights are below the CoG -- the bumper at 3 cm, the flank pushed near the
+    #   wheel centres -- so a hit from the front dives the nose, and a car struck on its flank tips towards the
+    #   side that was hit (its bottom is pushed away first). The recordings fix the size, not the sign: their
+    #   first gyro lobes go either way (9 of 16 end hits dive first, 9 of 21 flank hits tip towards the side
+    #   hit), which one height per axis cannot reproduce -- the hose, 20-33 cm round, meets a car above or
+    #   below its CoG depending on what of the car reaches it first. Nor the speed: the recorded rocking rings
+    #   at ~12 Hz, the sprung mass here at its 2.8 Hz.
+    Ixx: float = 0.0136        # [kg m^2]
+    Iyy: float = 0.0398        # [kg m^2]
+    contact_z_end: float = 0.031
+    contact_z_side: float = 0.060
 
 
 @dataclass
@@ -485,6 +510,56 @@ class SimParams:
                                   # +-46 deg (scratchpad wall_hits.py, 2026-09-28). The sign-flip
                                   # rate (28 % against 50 %) depends on how the driver reacts after
                                   # the hit, which that test holds fixed, so it was not fitted.
+    # ---- Contact physics of 2026-10-15 (feat/v2-physics). Every switch below is on by default; all
+    # of them off (`legacy_contacts`, the `--legacy-contacts` flag) is feat/v2-severity bit for bit.
+    #
+    # Report every wall contact the soft resolution handles: latched over the substeps and ORed into
+    # the step's collision flag, the way prop contacts already were (`Simulator.prop_touched`). The
+    # flag used to be the step-end corner test on the 5 cm grid alone, and the soft contact pushes
+    # the car back out every 5 ms, so most contacts had left the wall cell by the end of the step:
+    # of the physical wall contacts of the feat/v2 policies, 0 % below 0.5 m/s were flagged, 11 % at
+    # 1-2 m/s and 60 % at 2-3 m/s. The wall penalty, `--lagrange wall=` and `collisions_per_km`
+    # counted the props and the hardest wall hits only. Soft contact only (terminate never resolves).
+    wall_latch: bool = True
+    # A movable prop is a second body: the impulse is the two-body one on the relative velocity at the
+    # contact point, the prop takes exactly its opposite and its share of the overlap, and it moves in place
+    # inside the roll (slowed by the floor every contact window), so the next contact test sees it where it
+    # is. Before, the impulse took the car's own speed into the prop and the prop only moved after the step,
+    # so each of up to five resolutions shoved it again: a 1.2 kg box left at about 2.6x the car's speed
+    # while the car kept 0.18 of its own (energy created).
+    prop_relative: bool = True
+    # The cars of a race share one prop set: the crate the learner shoved is where the opponent meets it,
+    # and two cars pushing one crate add up. Before, every car had its own copy of the race's layout.
+    props_per_race: bool = True
+    # Coulomb friction coefficient of a body-on-body contact (car-prop, car-car): the tangential impulse is
+    # at most this times the normal one. Plastic bumper on cardboard, wood or another car's plastic: 0.3 is a
+    # textbook value for those pairs; nothing in the recordings measures it.
+    body_friction: float = 0.3
+    # The acceleration a contact puts on the car -- what the suspension and the IMU are told about -- is
+    # held over the window its resolution covers. A resolution runs every `contact_every` substeps (5 ms)
+    # and changes the velocity by what the contact did over that window; that change divided by the window
+    # used to be applied for a single 1 ms substep, so the springs and the accelerometer felt a fifth of
+    # every impact, and it was clipped at the accelerometer's 16 g before the springs saw it. Held, the
+    # integral is the whole velocity change, and the only clip is the sensor's own (`imu.sample`).
+    contact_accel_hold: bool = True
+    # Cars of a race collide with each other under soft contact: at every contact resolution (5 ms) two
+    # overlapping cars exchange an impulse at their contact point -- restitution `car_restitution`, Coulomb
+    # friction `body_friction`, each car's own mass and yaw inertia -- and are pushed apart by half the
+    # penetration each. Before, soft mode had no car-car response at all: cars drove through each other and
+    # a rear-end existed only in the reward. Off reproduces that (`--legacy-contacts`).
+    car_response: bool = True
+    # Velocity kept along the normal after a car-car impact. No recording has two cars touching; 0.2 is the
+    # value a plastic bumper on plastic/foam gives in the impact literature and the tall-wall value this
+    # simulator already uses -- the hose's 0.05 comes from a hose that deforms, which a car does not much.
+    car_restitution: float = 0.2
+    # A contact turns the sprung mass about its CoG -- roll from a push on the flank, pitch from one on an end
+    # -- at the height it pushes (`VehicleParams.contact_z_*`, `Ixx`, `Iyy`). Before, the contact's
+    # acceleration went through the tyre gains (`roll_per_g`, `dive_per_g`): a force at the ground, so a
+    # 3.5 m/s nose-first hose hit pitched the car under 1 deg and the gyro read 0.2 rad/s per m/s of impact
+    # where the recordings read 2.4. With it, the +-0.35 rad attitude limit is a stop: the rate into it is
+    # taken out there (the body rests on its travel) instead of running on while the angle is held, which
+    # had the gyro read a rate the body was not turning at.
+    contact_moments: bool = True
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
@@ -653,6 +728,20 @@ class Config:
         import yaml
         with open(path) as f:
             return Config.from_dict(yaml.safe_load(f) or {})
+
+
+#: The `SimParams` switches of the 2026-10-15 contact physics, each on by default. All of them off
+#: reproduces feat/v2-severity: soft-mode rollouts bit-identical (state and reward), the numbers of
+#: every evaluation and training run before them.
+CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race", "contact_accel_hold", "car_response",
+                 "contact_moments")
+
+
+def legacy_contacts(cfg: Config) -> Config:
+    """Switch the 2026-10-15 contact physics off (`CONTACT_FIXES`), in place; returns `cfg`."""
+    for name in CONTACT_FIXES:
+        setattr(cfg.sim, name, False)
+    return cfg
 
 
 def float_fields(dc) -> list[str]:

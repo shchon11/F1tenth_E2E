@@ -163,7 +163,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
           league_seats=()):
     """The PPO loop for `--arch v2`, from the env `ppo.main` built and reset. `league_seats`: the pool
     entries `--league-slots` named, which the learner's own snapshots take over in turn."""
-    from .ppo import lagrange_step
+    from .ppo import lagrange_step, severity_onsets, severity_rates, SEVERITY_LOG
     spec = common.obs_spec(env)
     if not isinstance(spec, ObsSpecV2):
         raise SystemExit("--arch v2 needs the env built with obs_version 2")
@@ -243,7 +243,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         "safe_dist", "reward_plan_clearance", "plan_margin", "reward_wrong_way", "reward_lap", "reward_lap_time",
         "reward_alive", "reward_car_contact", "reward_overtake", "reward_car_proximity", "car_safe_gap",
         "reward_sideslip", "reward_ttc", "ttc_safe", "reward_overtake_hold", "overtake_hold_dist",
-        "overtake_hold_time")}
+        "overtake_hold_time", "contact_severity_min")}
     experiment = {"arch": ARCH, "kl_reference": "leg_start_actor_recurrent (monitor only, kl_coef 0)",
                   "reward": reward_meta, "init": a.init, "seed": int(a.seed), "speed_mode": "wp4",
                   "speed_command": str(a.speed_command), "v2_defaults": applied,
@@ -318,6 +318,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     buf_ref_mu = z(T, B, A)
     buf_prog = z(T, B)
     buf_comp = z(T, B, len(REWARD_COMPONENT_KEYS))
+    # --contact-severity-min: the learner's onsets both ways, all and at or above the threshold
+    buf_sev = z(T, B, len(SEVERITY_LOG)) if env.ecfg.contact_severity_min > 0 else None
     buf_lvl = torch.full((T, B), -1, dtype=torch.long, device=device) if a.level_replay > 0 else None
     if on["b8"]:
         buf_b8_lab, buf_b8_cand, buf_b8_age = z(T, B, 3, 3), z(T, B, 3, dtype=torch.bool), z(T, B, 3, dtype=torch.long)
@@ -431,6 +433,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     buf_mask[t] = info["on_policy"][lid].float()
                 buf_comp[t] = torch.stack([info["reward_components"][k][lid] for k in REWARD_COMPONENT_KEYS], 1)
                 buf_prog[t] = info["progress"][lid]
+                if buf_sev is not None:
+                    buf_sev[t] = severity_onsets(info, lid)
                 if "car_charge" in info:
                     onset, charge_prev = contact_onsets(info["car_charge"] > 0, charge_prev, done_now)
                     buf_onset[t] = onset[lid]
@@ -654,6 +658,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                         for i_, k in enumerate(REWARD_COMPONENT_KEYS)})
             for n_, v_ in lagrange.items():
                 log[f"lagrange/{n_}_lambda"] = v_["lam"]; log[f"lagrange/{n_}_rate_per_km"] = v_["rate"]
+            sev_rates = severity_rates(buf_sev, buf_prog, buf_mask) if buf_sev is not None else {}
+            log.update(sev_rates)
             if ep_stats["return"]:
                 dist_m = float(np.sum(ep_stats["progress"]))
                 last_log = {"collisions_per_km": _per_km(np.sum(ep_stats["contacts"]), dist_m),
@@ -691,6 +697,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   + (f" (PopArt dev {popart[0]:.1e})" if popart is not None else "")
                   + (" | aux scale " + " ".join(f"{k} {v:.3g}" for k, v in balance.scale.items())
                      if balance.enabled else "")
+                  + (f" | >={a.contact_severity_min:g} m/s wall {sev_rates['contacts/wall_hard_per_km']:.2f}"
+                     f"/{sev_rates['contacts/wall_all_per_km']:.2f} car {sev_rates['contacts/car_onset_hard_per_km']:.2f}"
+                     f"/{sev_rates['contacts/car_onset_all_per_km']:.2f}/km" if sev_rates else "")
                   + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         t_loop = time.time() - t_loop0
         if getattr(env, "level_replay", None) is not None and update % 16 == 0:

@@ -271,6 +271,36 @@ PROCEDURAL_OPPONENT = {"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", 
                        "speed_scale": [0.7, 1.0]}
 
 
+def contact_frame_dict(blk: np.ndarray) -> dict:
+    """A frame's per-car contact record (`Simulator.contact_frame`, rows = the drawn cars) as named arrays:
+
+    * ``kind`` (n,) int8 -- this step's hardest contact: 0 none, 1 wall, 2 prop, 3 car (``kinds``);
+      ``point`` (n, 2) where it touched, world [m]; ``severity`` (n,) [m/s] the speed into each other there;
+    * ``held`` (n,) bool and ``held_s`` (n,) [s] left -- a contact stays on this flag for ``hold_s`` after the
+      car stops touching, so a hit is visible longer than one 25 ms frame; ``held_kind``, ``held_point``,
+      ``held_severity`` the hardest contact of the hold;
+    * ``onsets`` / ``hard`` (n, 3) int32 -- the episode's contacts per kind (wall, prop, car), all of them and
+      those at or above ``hard_mps``.
+    """
+    from ..sim import CONTACT_FRAME_COLUMNS, CONTACT_HOLD_S, CONTACT_KINDS
+    from ..contact_severity import HARD_MPS
+    col = {name: j for j, name in enumerate(CONTACT_FRAME_COLUMNS)}
+    b = np.asarray(blk, dtype=np.float32)
+    c = lambda name: b[:, col[name]].copy()
+    return {
+        "kind": c("kind").round().astype(np.int8),
+        "point": b[:, [col["x"], col["y"]]].copy(),
+        "severity": c("severity"),
+        "held": c("held_s") > 0.0, "held_s": c("held_s"),
+        "held_kind": c("held_kind").round().astype(np.int8),
+        "held_point": b[:, [col["held_x"], col["held_y"]]].copy(),
+        "held_severity": c("held_severity"),
+        "onsets": b[:, [col["onsets_wall"], col["onsets_prop"], col["onsets_car"]]].round().astype(np.int32),
+        "hard": b[:, [col["hard_wall"], col["hard_prop"], col["hard_car"]]].round().astype(np.int32),
+        "kinds": CONTACT_KINDS, "hold_s": CONTACT_HOLD_S, "hard_mps": HARD_MPS,
+    }
+
+
 def procedural_opponents(slots, n_rows: int):
     """(table, how it was changed) for 학습과 같음 on a grid of more than one car.
 
@@ -1705,10 +1735,16 @@ class SimWorker:
                 pieces.append(plan_pred.reshape(-1))
         proc = env.procedural
         if proc is not None:
-            # The layout every car is driving through (`procedural_shared`: env 0's is everyone's),
-            # one row per slot, [shape id, x, y, yaw]; a dead slot's shape id is -1. Every frame
-            # rather than once per layout, because a shoved crate moves.
-            pieces.append(torch.cat([proc.p_sid[0].float()[:, None], proc.p_poses[0]], 1).reshape(-1))
+            # The layout the focus car is driving through -- its race's set: the cars of a race share
+            # one (`SimParams.props_per_race`), and every row holds that race's copy. One row per slot,
+            # [shape id, x, y, yaw]; a dead slot's shape id is -1. Every frame rather than once per
+            # layout, because a shoved crate moves.
+            pieces.append(torch.cat([proc.p_sid[focus].float()[:, None], proc.p_poses[focus]], 1).reshape(-1))
+        # Each drawn car's contacts (`Simulator.contact_frame`): this step's hardest, the one held for the eye,
+        # the episode's onsets per kind. In the same single copy as everything else.
+        cframe = sim.contact_frame(sel) if hasattr(sim, "contact_frame") else None
+        if cframe is not None:
+            pieces.append(cframe.reshape(-1))
         estimate = getattr(session.get("controller"), "last_estimate", None)
         estimate_keys = ("used_mu", "q10", "q50", "q90", "warm", "finite")
         if estimate:
@@ -1745,6 +1781,10 @@ class SimWorker:
         if proc is not None:
             blk = flat[i:i + 4 * int(proc.C)].reshape(-1, 4); i += 4 * int(proc.C)
             props_dyn = _copy(blk[blk[:, 0] >= 0]).astype(np.float32)
+        contact = None
+        if cframe is not None:
+            k_ = int(cframe.shape[1])
+            contact = contact_frame_dict(flat[i:i + n * k_].reshape(n, k_)); i += n * k_
 
         session["gg"].append((float(dash_v[5]), float(dash_v[6])))
         ids = np.arange(n, dtype=np.int32)
@@ -1782,6 +1822,8 @@ class SimWorker:
         }
         if props_dyn is not None:
             fr["props_dyn"] = props_dyn
+        if contact is not None:
+            fr["contact"] = contact
         if imu_mean is not None:
             fr["imu"] = imu_mean.astype(np.float32)     # (6,) gyro xyz, accel xyz, mean of k_imu
             fr["imu_samples"] = k_imu
