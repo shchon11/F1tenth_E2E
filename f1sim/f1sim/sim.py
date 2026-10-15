@@ -1293,6 +1293,12 @@ class Simulator:
         soft_wall = not self.cfg.sim.terminate_on_collision
         props_move = soft_wall and self._props_move_in_roll()
         cars = soft_wall and self._car_response_on()
+        # `SimParams.contact_moments`: a contact turns the body about its CoG at the height it pushes. Per env:
+        # [rad/s^2] of roll / pitch per [m/s^2] of contact acceleration across / along the car.
+        moments = soft_wall and bool(getattr(self.cfg.sim, "contact_moments", False))
+        if moments:
+            k_roll = (P["h"] - P["contact_z_side"]) * P["m"] / P["Ixx"]
+            k_pitch = (P["h"] - P["contact_z_end"]) * P["m"] / P["Iyy"]
         # `SimParams.contact_accel_hold`: the contact's acceleration over its whole window, carried across
         # control steps in `contact_acc` (the last window of a step reaches into the next one).
         hold = soft_wall and bool(getattr(self.cfg.sim, "contact_accel_hold", False)) \
@@ -1362,13 +1368,29 @@ class Simulator:
                 excite = (state[:, dyn.IVX].abs() / P["road_tilt_v"].clamp_min(1e-6)).clamp(0.0, 1.0)
                 w_roll = w_roll * ou_k + torch.randn_like(w_roll) * ou_s * excite
                 w_pitch = w_pitch * ou_k + torch.randn_like(w_pitch) * ou_s * excite
-            roll_ss = P["roll_per_g"] * a_y / dyn.G + w_roll
+            # The per-g gains are the tyres' (a force at the ground, through the suspension); with
+            # `contact_moments` a contact's acceleration turns the body at its own height instead (below).
+            s_x, s_y = (ax, ay) if moments else (a_x, a_y)
+            roll_ss = P["roll_per_g"] * s_y / dyn.G + w_roll
             # asymmetric: the car squats under throttle far more than it dives under (regen-limited) braking
-            pitch_ss = -torch.where(a_x > 0, P["pitch_per_g"], P["dive_per_g"]) * a_x / dyn.G + w_pitch
+            pitch_ss = -torch.where(s_x > 0, P["pitch_per_g"], P["dive_per_g"]) * s_x / dyn.G + w_pitch
             roll_acc = wn * wn * (roll_ss - roll) - 2 * zeta * wn * roll_rate
             pitch_acc = wn * wn * (pitch_ss - pitch) - 2 * zeta * wn * pitch_rate
+            if moments and a_contact is not None:
+                # (h - z) F / I about the CoG, F = m a: a push across the car at the flank height rolls it, one
+                # along it at the bumper height pitches it -- nose down when it is stopped from the front.
+                roll_acc = roll_acc + k_roll * a_contact[:, 1]
+                pitch_acc = pitch_acc - k_pitch * a_contact[:, 0]
             roll_rate = roll_rate + roll_acc * self.dt
             pitch_rate = pitch_rate + pitch_acc * self.dt
+            if moments:
+                # The suspension's travel ends at +-0.35 rad: there the body stops turning further, so the
+                # rate into the stop is taken out (the gyro read a rate the clamped angle never followed).
+                # Hard contacts reach it now; the tyres alone never did.
+                roll_rate = torch.where((roll + roll_rate * self.dt).abs() >= 0.35,
+                                        torch.where(roll_rate * roll > 0, torch.zeros_like(roll_rate), roll_rate), roll_rate)
+                pitch_rate = torch.where((pitch + pitch_rate * self.dt).abs() >= 0.35,
+                                         torch.where(pitch_rate * pitch > 0, torch.zeros_like(pitch_rate), pitch_rate), pitch_rate)
             roll = (roll + roll_rate * self.dt).clamp(-0.35, 0.35)
             pitch = (pitch + pitch_rate * self.dt).clamp(-0.35, 0.35)
             if imu_on:

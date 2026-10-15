@@ -437,6 +437,7 @@ class SimGraphFastPath:
             "cfg.sim.contact_accel_hold": lambda: bool(getattr(sim.cfg.sim, "contact_accel_hold", False)),
             "sim.contact_acc": lambda: getattr(sim, "contact_acc", None),
             "cfg.sim.car_response": lambda: bool(getattr(sim.cfg.sim, "car_response", False)),
+            "cfg.sim.contact_moments": lambda: bool(getattr(sim.cfg.sim, "contact_moments", False)),
             "cfg.sim.car_restitution": lambda: float(getattr(sim.cfg.sim, "car_restitution", 0.0)),
             "sim.M": lambda: int(getattr(sim, "M", 1)),
             "sim.other_idx": lambda: getattr(sim, "other_idx", None),

@@ -182,6 +182,31 @@ class VehicleParams:
     road_tau: float = 0.4      # [s] its correlation time (the roll-rate spectrum is flat above ~0.4 Hz)
     susp_wn: float = 17.6      # [rad/s] suspension natural frequency (~2.8 Hz)
     susp_zeta: float = 0.35    # [-] damping ratio (underdamped: visible overshoot after braking)
+    # What a contact does to the sprung mass (`SimParams.contact_moments`). A contact pushes the body where it
+    # touches, not at the ground the tyres push from: a horizontal force F at height z turns the body about
+    # its CoG at (h - z) F / I. Tyre forces keep the calibrated per-g gains above; a contact's acceleration
+    # turns the body through these instead.
+    #   Ixx, Iyy: the sprung mass's roll and pitch inertia. ESTIMATED, not measured: the measured yaw inertia
+    #   Iz (0.047 kg m^2) taken as a uniform box of the footprint's aspect (0.58 : 0.31 -> 0.34 x 0.18 m of
+    #   effective mass extent) and 0.10 m of effective height (the mass between the chassis plate and the
+    #   deck, CoG 7.4 cm): Ixx = m (0.183^2 + 0.10^2) / 12, Iyy = m (0.343^2 + 0.10^2) / 12.
+    #   contact_z_end / contact_z_side: [m] the height a contact on the car's end (bumper) / flank pushes at.
+    #   FITTED to the 56 hose impacts above 1 m/s in the competition recordings (2026-10-15): with these, the
+    #   simulated IMU's peak pitch / roll rate per m/s of the impact's velocity change (the accelerometer
+    #   integrated over the event, the recordings' own rule) is 2.29 / 2.19 rad/s against the recorded median
+    #   2.44 / 2.34 (end-dominant / flank-dominant impacts; through the tyre gains alone it was 0.21 / 0.67),
+    #   and the attitude swing a scripted hit leaves, median 9 / 8 deg, sits inside the recordings' integrated
+    #   gyro (6-14 deg median). Both heights are below the CoG -- the bumper at 3 cm, the flank pushed near the
+    #   wheel centres -- so a hit from the front dives the nose, and a car struck on its flank tips towards the
+    #   side that was hit (its bottom is pushed away first). The recordings fix the size, not the sign: their
+    #   first gyro lobes go either way (9 of 16 end hits dive first, 9 of 21 flank hits tip towards the side
+    #   hit), which one height per axis cannot reproduce -- the hose, 20-33 cm round, meets a car above or
+    #   below its CoG depending on what of the car reaches it first. Nor the speed: the recorded rocking rings
+    #   at ~12 Hz, the sprung mass here at its 2.8 Hz.
+    Ixx: float = 0.0136        # [kg m^2]
+    Iyy: float = 0.0398        # [kg m^2]
+    contact_z_end: float = 0.031
+    contact_z_side: float = 0.060
 
 
 @dataclass
@@ -527,6 +552,14 @@ class SimParams:
     # value a plastic bumper on plastic/foam gives in the impact literature and the tall-wall value this
     # simulator already uses -- the hose's 0.05 comes from a hose that deforms, which a car does not much.
     car_restitution: float = 0.2
+    # A contact turns the sprung mass about its CoG -- roll from a push on the flank, pitch from one on an end
+    # -- at the height it pushes (`VehicleParams.contact_z_*`, `Ixx`, `Iyy`). Before, the contact's
+    # acceleration went through the tyre gains (`roll_per_g`, `dive_per_g`): a force at the ground, so a
+    # 3.5 m/s nose-first hose hit pitched the car under 1 deg and the gyro read 0.2 rad/s per m/s of impact
+    # where the recordings read 2.4. With it, the +-0.35 rad attitude limit is a stop: the rate into it is
+    # taken out there (the body rests on its travel) instead of running on while the angle is held, which
+    # had the gyro read a rate the body was not turning at.
+    contact_moments: bool = True
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
@@ -700,7 +733,8 @@ class Config:
 #: The `SimParams` switches of the 2026-10-15 contact physics, each on by default. All of them off
 #: reproduces feat/v2-severity: soft-mode rollouts bit-identical (state and reward), the numbers of
 #: every evaluation and training run before them.
-CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race", "contact_accel_hold", "car_response")
+CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race", "contact_accel_hold", "car_response",
+                 "contact_moments")
 
 
 def legacy_contacts(cfg: Config) -> Config:

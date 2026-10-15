@@ -434,3 +434,55 @@ def test_the_response_is_soft_contact_only_and_off_reproduces_the_pass_through()
             sim.reset(torch.arange(2), torch.tensor([[10.0, 15.0, 0.0], [11.0, 15.0, 0.0]]), torch.tensor([5.0, 2.0]))
             out.append(torch.stack([sim.step(torch.tensor([[0.0, 5.0], [0.0, 2.0]])).state for _ in range(20)]))
         assert torch.equal(out[0], out[1]) == terminate
+
+
+# ------------------------------------------------------------------ 5. contacts turn the body
+def _attitude_run(moments: bool, pose, v, vy=0.0, steps=40):
+    """One car into the bottom hose; per step (roll, pitch) and the IMU gyro samples."""
+    cfg = _cfg()
+    cfg.sim.contact_moments = moments
+    sim = Simulator(_floor(), cfg, num_envs=1, device="cpu")
+    sim.reset(torch.arange(1), torch.tensor([pose]), torch.tensor([v]))
+    sim.state[0, 4] = vy
+    att, gyro, hit = [], [], False
+    for _ in range(steps):
+        r = sim.step(torch.tensor([[0.0, 0.0 if hit else v]]))
+        hit = hit or float(r.wall_impact[0]) > 0
+        att.append(r.attitude[0].clone())
+        gyro.append(r.imu[0, :, 0:2].clone())
+    return torch.stack(att), torch.cat(gyro), sim
+
+
+def test_a_nose_first_hit_dives_the_nose_and_a_side_slide_rolls_the_car():
+    """3.5 m/s square into the hose: the nose dives (pitch +) several degrees; a 3.5 m/s sideways slide into it
+    tips the car towards the side that hit (roll +: struck on the right, pushed to +y at the bottom). Through
+    the tyre gains alone (before) the same hit pitched the car a degree, and the gyro read a tenth of the
+    recorded impacts."""
+    for moments in (True, False):
+        att, gyro, _ = _attitude_run(moments, [10.0, 0.9, -math.pi / 2], 3.5)
+        pk = float(att[:, 1].max())
+        if moments:
+            assert pk > 0.08, pk                              # > 4.6 deg, nose down
+            assert float(att[:, 1].abs().max()) <= 0.35 + 1e-6    # the suspension's travel
+            # the recorded impacts' median: 2.4 rad/s of pitch rate per m/s of impact
+            assert 1.5 < float(gyro[:, 1].abs().max()) / 3.5 < 3.5
+        else:
+            assert pk < 0.03, pk
+    att, gyro, _ = _attitude_run(True, [10.0, 0.40, 0.0], 1.5, vy=-3.5)
+    assert float(att[:, 0].max()) > 0.08 and float(att[:, 0].max()) >= -float(att[:, 0].min())
+
+
+def test_a_rear_end_lifts_the_nose_of_the_car_in_front_and_dives_the_one_behind():
+    """Pushed from behind at the bumper, below the CoG: the car in front pitches nose up (pitch -); the car
+    behind, stopped by its own bumper, dives (pitch +)."""
+    cfg = _cfg()
+    sim = Simulator(_floor(), cfg, num_envs=2, device="cpu", race_size=2)
+    sim.reset(torch.arange(2), torch.tensor([[9.6, 15.0, 0.0], [10.6, 15.0, 0.0]]), torch.tensor([4.0, 1.0]))
+    _fix_bodies(sim)
+    pitch = []
+    for _ in range(14):
+        r = sim.step(torch.tensor([[0.0, 4.0], [0.0, 1.0]]))
+        pitch.append(r.attitude[:, 1].clone())
+    pitch = torch.stack(pitch)
+    assert float(pitch[:, 1].min()) < -0.03, pitch[:, 1]
+    assert float(pitch[:, 0].max()) > 0.03, pitch[:, 0]
