@@ -259,6 +259,54 @@ def test_camera_modes_all_render(widget, qapp):
     assert not errors, errors
 
 
+def a_contact(n, car, kind, point, severity, left=0.3):
+    """A frame's contact block (`sim_worker.contact_frame_dict`'s keys) with one car holding one contact."""
+    blk = {"held_s": np.zeros(n, np.float32), "held_kind": np.zeros(n, np.int8),
+           "held_point": np.zeros((n, 2), np.float32), "held_severity": np.zeros(n, np.float32),
+           "onsets": np.zeros((n, 3), np.int32), "hard": np.zeros((n, 3), np.int32),
+           "hold_s": 0.3, "hard_mps": 1.0}
+    blk["held_s"][car], blk["held_kind"][car] = left, kind
+    blk["held_point"][car], blk["held_severity"][car] = point, severity
+    return blk
+
+
+def test_a_contact_marker_is_drawn_where_the_car_touched_in_its_kind_colour(widget, qapp):
+    """A hard hit on a hose, 0.3 m ahead of the watched car: a warm (orange) mark there in the top view,
+    and nothing there with the overlay off. A hit on another car is red, not orange."""
+    widget.set_geometry(oval_geometry())
+    for _ in range(3):
+        widget.update()
+        qapp.processEvents()
+    assert widget.geometry_data is not None
+    fr = a_frame()
+    fr["contact"] = a_contact(2, 0, 1, (float(fr["x"][0]) + 0.3, float(fr["y"][0])), 2.0)
+
+    def shot(frame, contacts=True):
+        widget.show_contacts = contacts
+        widget._last_drawn = frame
+        widget.makeCurrent()
+        try:
+            rgb = widget.render_offscreen(320, 240, "top")
+        finally:
+            widget.doneCurrent()
+            widget.show_contacts = True
+        assert rgb is not None, widget._gl_error
+        return np.frombuffer(rgb, np.uint8).reshape(240, 320, 3).astype(np.int32)
+
+    on, off = shot(fr), shot(fr, contacts=False)
+    mark = np.abs(on - off).sum(2) > 60
+    assert mark.sum() > 40, mark.sum()
+    ys, xs = np.nonzero(mark)
+    # where the car touched: just ahead of the screen centre, where the top view puts the watched car
+    assert abs(xs.mean() - 160) < 40 and abs(ys.mean() - 120) < 40, (xs.mean(), ys.mean())
+    px = on[mark]
+    assert np.mean(px[:, 0] > px[:, 2] + 60) > 0.5                       # orange: red well above blue
+    fr["contact"] = a_contact(2, 0, 3, (float(fr["x"][0]) + 0.3, float(fr["y"][0])), 2.0)
+    car = shot(fr)
+    px = car[np.abs(car - off).sum(2) > 60]
+    assert len(px) and np.mean((px[:, 0] > px[:, 1] + 60) & (px[:, 0] > px[:, 2] + 60)) > 0.4   # red
+
+
 # --------------------------------------------------------------------------- depth range / fog
 #
 # A user reported `rt:Monza` rendering as a flat sheet with the walls gone. The cause was not the

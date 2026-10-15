@@ -179,6 +179,44 @@ POINT_FS = """
 in vec4 v_col; out vec4 f_col;
 void main() { vec2 d = gl_PointCoord - 0.5; float r2 = dot(d, d); if (r2 > 0.25) discard; f_col = vec4(v_col.rgb, v_col.a * (1.0 - smoothstep(0.14, 0.25, r2))); }
 """
+# Contact markers (`Scene.set_contact_marks`, built by `viewer.console.contacts.contact_marks`): one
+# sprite per contact, sized in the world -- a hard hit is bigger than a graze from every camera -- but
+# never below a per-marker pixel floor, so it still shows from an overview of a whole circuit.
+MARK_VS = """
+#version 330
+in vec3 in_pos; in vec4 in_col; in vec4 in_shape;          // shape: diameter [m], min px, phase, hard
+uniform mat4 u_vp; uniform float u_px_per_m; uniform float u_max_px;
+out vec4 v_col; out vec2 v_shape;
+void main() {
+    gl_Position = u_vp * vec4(in_pos, 1.0);
+    gl_PointSize = clamp(in_shape.x * u_px_per_m / max(gl_Position.w, 1e-3), in_shape.y, u_max_px);
+    v_col = in_col; v_shape = in_shape.zw;
+}
+"""
+# In the kind's colour: a hot point, a filled disc (the dent) and a solid band at its edge that
+# spreads outward as the hold runs out (phase 0 -> 1), with a thin dark rim outside the band so it
+# reads on a white hose as well as on the dark floor; a hard contact gets a second, outer ring.
+# Ordinary alpha blending: added light would wash an orange mark on a white hose out to white.
+MARK_FS = """
+#version 330
+in vec4 v_col; in vec2 v_shape; out vec4 f_col;
+float band(float r, float at, float half_w) { return 1.0 - smoothstep(0.0, half_w, abs(r - at)); }
+void main() {
+    float r = length(gl_PointCoord - 0.5) * 2.0;           // 0 at the point, 1 at the sprite's edge
+    if (r > 1.0) discard;
+    float phase = v_shape.x, hard = v_shape.y;
+    float rr = mix(0.40, 0.80, phase);
+    float ring = band(r, rr, 0.10);
+    float fill = (1.0 - smoothstep(rr - 0.08, rr, r)) * 0.45 * (1.0 - 0.6 * phase);
+    float core = (1.0 - smoothstep(0.08, 0.20, r)) * (1.0 - 0.8 * phase);
+    float outer = hard * band(r, rr + 0.17, 0.05);
+    float ca = clamp(ring + fill + core + outer, 0.0, 1.0);
+    float da = 0.6 * max(band(r, rr + 0.10, 0.035), hard * band(r, rr + 0.235, 0.03)) * (1.0 - ca);
+    float a = ca + da;
+    vec3 rgb = mix(v_col.rgb, vec3(1.0), 0.6 * core);
+    f_col = vec4(rgb * ca / max(a, 1e-4), a * v_col.a);
+}
+"""
 HUD_VS = """
 #version 330
 in vec2 in_uv; uniform vec4 u_rect; out vec2 v_uv;
@@ -272,6 +310,14 @@ class Scene:
         self.shadow_prog = ctx.program(vertex_shader=SHADOW_VS, fragment_shader=SHADOW_FS) if shadows else None
         self.line_prog = ctx.program(vertex_shader=LINE_VS, fragment_shader=LINE_FS)
         self.point_prog = ctx.program(vertex_shader=POINT_VS, fragment_shader=POINT_FS)
+        self.mark_prog = ctx.program(vertex_shader=MARK_VS, fragment_shader=MARK_FS)
+        self.marks_vbo = self.marks_vao = None; self.marks_n = 0
+        # The largest point this driver draws (llvmpipe: 255 px). Asked once; a sprite larger than
+        # this would be clamped by the driver anyway, but silently.
+        try:
+            self.mark_max_px = float(min(160.0, float(ctx.info.get("GL_POINT_SIZE_RANGE", (1.0, 64.0))[1])))
+        except Exception:
+            self.mark_max_px = 64.0
         self.hud_prog = ctx.program(vertex_shader=HUD_VS, fragment_shader=HUD_FS)
         self.label_prog = ctx.program(vertex_shader=LABEL_VS, fragment_shader=LABEL_FS)
         self.sky_prog = ctx.program(vertex_shader=SKY_VS, fragment_shader=SKY_FS)
@@ -299,6 +345,7 @@ class Scene:
         self.hud_vao = ctx.vertex_array(self.hud_prog, [(self._quad, "2f", "in_uv")])
         self.sky_vao = ctx.vertex_array(self.sky_prog, [(self._quad, "2f", "in_uv")])
         self.ring_vbo = self.ring_vao = None; self.ring_n = 0
+        self.crings_vbo = self.crings_vao = None; self.crings_n = 0
         self.hud_tex = None; self.hud_size = (0, 0)
         self._build_label_atlas()
         self._make_targets()
@@ -389,18 +436,20 @@ class Scene:
         for attr in ("shadow_fbo", "shadow_tex", "hud_tex", "hud_vao", "_quad", "label_tex",
                      "label_pos", "label_vao", "pts_vao", "pts_vbo", "trail_vao", "trail_vbo",
                      "plan0_vao", "plan0_vbo", "plan0c_vao", "plan0c_vbo", "plan1_vao", "plan1_vbo",
-                     "ring_vao", "ring_vbo", "sky_vao"):
+                     "ring_vao", "ring_vbo", "crings_vao", "crings_vbo", "marks_vao", "marks_vbo", "sky_vao"):
             drop(getattr(self, attr, None))
             if hasattr(self, attr):
                 setattr(self, attr, None)
         for tex, _size in list(getattr(self, "panels", {}).values()):
             drop(tex)
         self.panels = {}
-        for prog in ("prog", "shadow_prog", "line_prog", "point_prog", "hud_prog", "label_prog", "sky_prog"):
+        for prog in ("prog", "shadow_prog", "line_prog", "point_prog", "mark_prog", "hud_prog", "label_prog",
+                     "sky_prog"):
             drop(getattr(self, prog, None))
             setattr(self, prog, None)
         self.target = None
         self.n_labels = 0
+        self.marks_n = self.crings_n = 0
 
     # ---------------------------------------------------------------- geometry builders
     def _add_static(self, pos, nrm, col, idx, **kw):
@@ -627,6 +676,49 @@ class Scene:
         cols = np.tile(np.asarray(colour, np.float32), (len(a), 1))
         self._upload_dyn("ring", np.concatenate([pts, cols], 1)); self.ring_n = len(a)
 
+    def set_contact_rings(self, xy, colours, radius=0.34, segments=32):
+        """Rings on the ground around the cars holding a contact: `xy` (k, 2) centres, `colours`
+        (k, 4). None or empty clears them. The watched car's ring is `set_focus_ring`, apart."""
+        if xy is None or not len(xy):
+            self.crings_n = 0
+            return
+        xy = np.asarray(xy, np.float32).reshape(-1, 2)
+        cols = np.asarray(colours, np.float32).reshape(-1, 4)
+        a = np.linspace(0.0, 2 * np.pi, segments + 1, dtype=np.float32)
+        ang = np.stack([a[:-1], a[1:]], 1).reshape(-1)                    # GL_LINES: both ends of each segment
+        pts = np.empty((len(xy), len(ang), 7), np.float32)
+        pts[..., 0] = xy[:, 0:1] + radius * np.cos(ang)[None]
+        pts[..., 1] = xy[:, 1:2] + radius * np.sin(ang)[None]
+        pts[..., 2] = 0.016
+        pts[..., 3:] = cols[:, None, :]
+        self._upload_dyn("crings", pts.reshape(-1, 7))
+        self.crings_n = pts.shape[0] * pts.shape[1]
+
+    #: floats per contact marker: position (3), colour + alpha (4), shape (4) -- see MARK_VS
+    MARK_FLOATS = 11
+
+    def set_contact_marks(self, rows):
+        """(k, 11) rows of [x, y, z, r, g, b, a, diameter m, min px, phase, hard], or None for none.
+
+        `viewer.console.contacts.contact_marks` builds them. Drawn by `draw_frame` over everything
+        else, depth test off: a contact under a car's nose or behind a hose is still a contact."""
+        if rows is None or not len(rows):
+            self.marks_n = 0
+            return
+        data = np.ascontiguousarray(np.asarray(rows, np.float32).reshape(-1, self.MARK_FLOATS))
+        if self.marks_vbo is None or self.marks_vbo.size < data.nbytes:
+            for old in (self.marks_vao, self.marks_vbo):
+                if old is not None:
+                    try:
+                        old.release()
+                    except Exception:
+                        pass
+            self.marks_vbo = self.ctx.buffer(reserve=max(data.nbytes, 64 * self.MARK_FLOATS * 4), dynamic=True)
+            self.marks_vao = self.ctx.vertex_array(self.mark_prog, [(self.marks_vbo, "3f 4f 4f", "in_pos", "in_col",
+                                                                     "in_shape")])
+        self.marks_vbo.write(data.tobytes())
+        self.marks_n = len(data)
+
     def push_trail_points(self, x, y):
         n = min(len(x), self.trails.shape[0]); x, y = x[:n], y[:n]
         self.trails[:n] = np.roll(self.trails[:n], -1, axis=1)
@@ -756,10 +848,23 @@ class Scene:
         if self.ring_n > 1:
             self.ctx.line_width = 2.5
             self.ring_vao.render(moderngl.LINE_STRIP, vertices=self.ring_n)
+        if getattr(self, "crings_n", 0):
+            self.ctx.line_width = 2.5
+            self.crings_vao.render(moderngl.LINES, vertices=self.crings_n)
         self.ctx.line_width = 1.0
         if show_points:
             self.point_prog["u_vp"].write(_u(vp)); self.point_prog["u_size"].value = 12.0
             self.pts_vao.render(moderngl.POINTS, vertices=self.n_pts)
+        # contact markers: over everything, depth test off -- a contact under a car's nose or behind
+        # a hose is still a contact
+        if getattr(self, "marks_n", 0) and self.marks_vao is not None:
+            ctx.disable(moderngl.DEPTH_TEST)
+            self.mark_prog["u_vp"].write(_u(vp))
+            # pixels per metre at clip w = 1: half the viewport height times the projection's y scale
+            self.mark_prog["u_px_per_m"].value = 0.5 * float(self.height) * float(np.asarray(proj)[1, 1])
+            self.mark_prog["u_max_px"].value = self.mark_max_px
+            self.marks_vao.render(moderngl.POINTS, vertices=self.marks_n)
+            ctx.enable(moderngl.DEPTH_TEST)
         # labels
         if self.n_labels:
             self.label_prog["u_view"].write(_u(view)); self.label_prog["u_proj"].write(_u(proj)); self.label_prog["u_size"].value = 0.09

@@ -1,9 +1,9 @@
 """Design tokens and the Qt stylesheet built from them.
 
 One place decides colour, type and spacing, so a value has the same meaning everywhere. The 3D
-scene already spends colour on facts -- cyan is the watched car, amber a rival in the same race,
-red a collision -- and the panels reuse exactly those, so a colour never means two things in one
-window.
+scene already spends colour on facts -- cyan is the watched car, amber a rival in the same race, and a
+contact is coloured by what was touched: orange a wall or duct hose, yellow a crate, red another car --
+and the panels reuse exactly those, so a colour never means two things in one window.
 
 No Qt import happens at module import time beyond QtGui/QtCore, which are cheap; nothing here
 touches torch or a GPU.
@@ -40,6 +40,12 @@ C = {
     "warn": "#f0a030",
     "danger": "#ff5c5c",
     "rival": "#f2a044",
+    # -- contacts, by what was touched (`console.contacts`): the marker at the contact point, the
+    # flash on the car and the kind's name on the panel. Saturated and brighter than `rival`, and the
+    # car's flash is over-bright and fades, so a car lit by a wall does not read as a rival.
+    "contact.wall": "#ff7a1a",
+    "contact.prop": "#ffd426",
+    "contact.car": "#ff3344",
     # -- instrument shading. The gauges are drawn objects, not charts, so they get their own few
     # tones: a dial well that is slightly lighter at the top, a rim with a top-lit gradient, and a
     # needle that stays white against both.
