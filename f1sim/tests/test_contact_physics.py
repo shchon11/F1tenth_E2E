@@ -547,3 +547,18 @@ def test_the_console_record_tells_a_car_from_a_crate():
         f = _frame(sim, row)
         assert f["kind"] == 3.0 and f["severity"] > 2.5 and (f["onsets_car"], f["hard_car"]) == (1.0, 1.0)
         assert float(r.state[0, 0]) < f["x"] < float(r.state[1, 0])
+
+
+def test_the_evaluation_meter_files_walls_on_their_own():
+    """`contact_severity.wall`: the wall onsets alone, at their own impact -- a 1.5 m/s hose hit is one wall
+    onset in [1, 2) m/s, and nothing is filed as a prop."""
+    from f1sim.gym_env import EnvConfig, F1VecEnv
+    from f1sim.learn.severity_meter import ContactSeverityMeter
+    from test_contact_severity import _script
+    env = F1VecEnv(_floor(), _cfg(), EnvConfig(collision_mode="soft", speed_cap=6.0), num_envs=1, device="cpu")
+    env.reset(seed=3)
+    with ContactSeverityMeter(env) as meter:
+        _script(env, [[10.0, 0.75, -math.pi / 2]], [1.5], 30)
+    rep = meter.report()["contact_severity"]
+    assert rep["wall"]["counts"] == [0, 0, 1, 0], rep["wall"]
+    assert rep["prop"]["onsets"] == 0 and rep["wall_prop"]["counts"] == [0, 0, 1, 0]

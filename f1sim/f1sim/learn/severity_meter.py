@@ -30,9 +30,11 @@ from ..contact_severity import BUCKET_EDGES, HARD_MPS, after_onset, carry_wall_i
 #: [m/s] the fine histogram's bin width and top (one overflow bin past it), for the distribution's shape
 FINE_BIN = 0.1
 FINE_TOP = 10.0
-#: `prop` / `prop_physical` are the subsets of `wall_prop` / `wall_prop_physical` that touched a prop
+#: `prop` / `prop_physical` are the subsets of `wall_prop` / `wall_prop_physical` that touched a prop;
+#: `wall` the wall onsets alone (with the simulator's onsets per kind, `SimParams.wall_latch`, a wall and a
+#: crate that start on one step are one `wall_prop` onset and one each here)
 KINDS = ("wall_prop", "wall_prop_onset_step", "wall_prop_physical", "wall_prop_physical_unflagged", "car",
-         "prop", "prop_physical")
+         "prop", "prop_physical", "wall")
 
 
 class ContactSeverityMeter:
@@ -147,6 +149,7 @@ class ContactSeverityMeter:
             on_l = onset & lm
             self._add("wall_prop", carry, on_l)
             self._add("prop", ki[:, 1], kinds[:, 1] & lm)
+            self._add("wall", ki[:, 0], kinds[:, 0] & lm)
             self._add("wall_prop_onset_step", carry, on_l)
         else:
             onset = level & ~(self._wall_prev & ~fresh)
@@ -156,6 +159,7 @@ class ContactSeverityMeter:
             on_l = onset & lm
             self._add("wall_prop", carry, on_l)
             self._add("prop", carry, on_l & prop)
+            self._add("wall", carry, on_l & ~prop)
             self._add("wall_prop_onset_step", imp, on_l)
             bc = torch.bucketize(carry, self.edges, right=True)
             bs = torch.bucketize(imp.float(), self.edges, right=True)
@@ -221,6 +225,9 @@ class ContactSeverityMeter:
                      "wall_prop_onset_step: the same onsets, the onset step's own resolutions only; "
                      "wall_prop_physical: resolved contacts as runs of steps, flagged or not, each its peak; "
                      "_unflagged: those runs no onset counted. prop / prop_physical: the subsets that touched a "
-                     "prop (the rest are walls). car: onsets of car_collision, closing speed at the onset step. "
+                     "prop (the rest are walls); wall: the wall onsets alone. With the simulator's onsets per kind "
+                     "(contact_onsets, SimParams.wall_latch) every kind's onset carries its own step's impact. "
+                     "car: onsets of car_collision, closing speed at the onset step (the first impulse's with "
+                     "the car-car response). "
                      "per_km over the learners' distance driven (|vx| dt)."),
         }}
