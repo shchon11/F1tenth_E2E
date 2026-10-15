@@ -1209,8 +1209,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.chk_contacts.setToolTip(
             "차가 닿은 자리에 표시가 뜹니다. 색은 닿은 것: 주황 = 벽·덕트 호스, 노랑 = 장애물, 빨강 = 다른 차.\n"
             "크고 밝을수록 세게 부딪힌 것이고(작고 흐리면 스친 것), 바깥 고리가 하나 더 있으면 '세게'로 "
-            "센 접촉입니다.\n마지막으로 닿은 뒤 0.3초 동안 퍼지며 사라집니다. 차 자체도 같은 색으로 빛납니다 "
-            "(이 표시는 끄지 않습니다).")
+            "센 접촉입니다.\n부딪힌 표시는 0.3초 동안 퍼지며 사라지고, 계속 닿아 있는 동안에는 지금 닿은 "
+            "자리에 작은 표시가 남습니다. 차 자체도 같은 색으로 빛나고 바닥에 같은 색 고리가 생깁니다 "
+            "(이 둘은 끄지 않습니다).")
         for w in (self.chk_lidar, self.chk_plan, self.chk_trails, self.chk_raceline, self.chk_labels,
                   self.chk_contacts):
             show.add(w)
