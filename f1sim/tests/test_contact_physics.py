@@ -238,3 +238,61 @@ def test_a_crate_hit_while_scraping_a_hose_is_its_own_onset():
     first_prop = int(torch.nonzero(on[:, 1])[0])
     assert first_prop > int(torch.nonzero(on[:, 0])[0]) and flags[first_prop - 1], "hit during the scrape"
     assert float(imp[first_prop, 1]) > 1.5 and float(imp[first_prop, 0]) == 0.0
+
+
+# ------------------------------------------------------------------ 3. the contact's acceleration, whole
+def _contact_accel(monkeypatch, hold: bool, v: float = 4.0, steps: int = 40):
+    """A square duct hit at `v`. Per substep, the acceleration the springs and the accelerometer were given
+    minus the tyres' own -- what the contact added -- and per resolution the velocity change it made."""
+    import f1sim.dynamics as dyn_mod
+    import f1sim.imu as imu_mod
+    cfg = _cfg()
+    cfg.sim.contact_accel_hold = hold
+    sim = Simulator(_floor(), cfg, num_envs=1, device="cpu")
+    tyre, added, dv = [], [], []
+    real_dyn, real_imu, real_res = dyn_mod.step_dynamics, imu_mod.substep, Simulator._resolve_wall_contact
+
+    def spy_dyn(*a, **kw):
+        out = real_dyn(*a, **kw)
+        tyre.append(float(out[1][0]))
+        return out
+
+    def spy_imu(imu_state, ax, ay, *a, **kw):
+        added.append(float(ax[0]) - tyre[-1])
+        return real_imu(imu_state, ax, ay, *a, **kw)
+
+    def spy_res(self, state, dt=None):
+        out = real_res(self, state, dt=dt)
+        dv.append(float(out[0][0, 3] - state[0, 3]))
+        return out
+
+    monkeypatch.setattr(dyn_mod, "step_dynamics", spy_dyn)
+    monkeypatch.setattr(imu_mod, "substep", spy_imu)
+    monkeypatch.setattr(Simulator, "_resolve_wall_contact", spy_res)
+    sim.reset(torch.arange(1), torch.tensor([[10.0, 0.9, -math.pi / 2]]), torch.tensor([v]))
+    imu = []
+    for t in range(steps):
+        r = sim.step(torch.tensor([[0.0, v if t < 6 else 0.0]]))
+        imu.append(r.imu[0])
+    return added, dv, torch.cat(imu), sim
+
+
+@pytest.mark.parametrize("hold", [True, False])
+def test_the_springs_and_the_imu_feel_the_whole_impact(monkeypatch, hold):
+    """Integrated over the contact, the acceleration the suspension and the accelerometer are given equals
+    the velocity change the contact made. Before, each resolution's change was applied for one 1 ms substep
+    of its 5 ms window, and clipped at 16 g: a fifth of every impact, less where it clipped."""
+    added, dv, imu, sim = _contact_accel(monkeypatch, hold)
+    dt = sim.dt
+    total_dv = sum(dv)
+    assert total_dv < -3.0, total_dv                          # a 4 m/s hit, stopped by the hose
+    felt = sum(added) * dt
+    if hold:
+        assert abs(felt - total_dv) < 0.01 * abs(total_dv), (felt, total_dv)
+        # unclipped where the body feels it -- the first window takes 1 m/s off in 5 ms, 21 g ...
+        assert max(abs(a) for a in added) > 16 * 9.80665
+    else:
+        assert abs(felt) < 0.25 * abs(total_dv), (felt, total_dv)
+    # ... and the accelerometer still clips at its range when it is sampled
+    rng = float(sim.cfg.imu.accel_range)
+    assert float(imu[:, 3:6].abs().max()) <= rng + 1e-3

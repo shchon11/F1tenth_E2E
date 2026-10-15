@@ -510,6 +510,13 @@ class SimParams:
     # at most this times the normal one. Plastic bumper on cardboard, wood or another car's plastic: 0.3 is a
     # textbook value for those pairs; nothing in the recordings measures it.
     body_friction: float = 0.3
+    # The acceleration a contact puts on the car -- what the suspension and the IMU are told about -- is
+    # held over the window its resolution covers. A resolution runs every `contact_every` substeps (5 ms)
+    # and changes the velocity by what the contact did over that window; that change divided by the window
+    # used to be applied for a single 1 ms substep, so the springs and the accelerometer felt a fifth of
+    # every impact, and it was clipped at the accelerometer's 16 g before the springs saw it. Held, the
+    # integral is the whole velocity change, and the only clip is the sensor's own (`imu.sample`).
+    contact_accel_hold: bool = True
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
@@ -683,7 +690,7 @@ class Config:
 #: The `SimParams` switches of the 2026-10-15 contact physics, each on by default. All of them off
 #: reproduces feat/v2-severity: soft-mode rollouts bit-identical (state and reward), the numbers of
 #: every evaluation and training run before them.
-CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race")
+CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race", "contact_accel_hold")
 
 
 def legacy_contacts(cfg: Config) -> Config:

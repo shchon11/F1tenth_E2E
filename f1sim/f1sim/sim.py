@@ -215,6 +215,10 @@ class Simulator:
         self.wall_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         #: Whether the last step ended in wall contact (`wall_latch`'s release hysteresis, see `step`).
         self.wall_engaged = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: [m/s^2] body-frame acceleration the last contact resolution imposed, held until the next one
+        #: (`SimParams.contact_accel_hold`): it covers the window that resolution resolved, which runs on
+        #: into the next control step. Written in place at the end of the roll.
+        self.contact_acc = torch.zeros(num_envs, 2, device=self.device)
         #: [m/s] `wall_impact` split by kind, (B, 2) walls, props: the step's largest speed into whichever
         #: owned each resolution's contact. In place inside the roll, zeroed before it.
         self.impact_kind = torch.zeros(num_envs, 2, device=self.device)
@@ -877,6 +881,7 @@ class Simulator:
         self.wall_engaged[env_ids] = False
         self.impact_kind[env_ids] = 0.0
         self.kind_prev[env_ids] = False
+        self.contact_acc[env_ids] = 0.0
         self.wall_impact[env_ids] = 0.0
         self.steps[env_ids] = 0
         self._resample_car_dims(env_ids)
@@ -897,7 +902,7 @@ class Simulator:
                                                      "cmd_hist", "s", "lap", "collided", "steps", "imu_state",
                                                      "cl_idx", "car_collision", "prop_touched",
                                                      "wall_touched", "wall_engaged", "wall_impact",
-                                                     "impact_kind", "kind_prev",
+                                                     "impact_kind", "kind_prev", "contact_acc",
                                                      "_odom_t_prev")}
         odom, t, phase = self.odom.state.clone(), self.t, self._imu_phase
         # The throw-away steps consume randomness from two places, not one: `self.gen` (spawn draws,
@@ -1134,6 +1139,11 @@ class Simulator:
         a_cmd_last = torch.zeros_like(ax)
         soft_wall = not self.cfg.sim.terminate_on_collision
         props_move = soft_wall and self._props_move_in_roll()
+        # `SimParams.contact_accel_hold`: the contact's acceleration over its whole window, carried across
+        # control steps in `contact_acc` (the last window of a step reaches into the next one).
+        hold = soft_wall and bool(getattr(self.cfg.sim, "contact_accel_hold", False)) \
+            and getattr(self, "contact_acc", None) is not None
+        a_hold = self.contact_acc if hold else None
         ar = torch.arange(self.B, device=state.device)
         for k in range(self.substeps):
             age = delay_s - (k + 1) * self.dt
@@ -1169,7 +1179,16 @@ class Simulator:
                 if props_move:
                     # the props slide over the same window, so the contact sees them where they are
                     self.track.env_props.drift(self.dt * span)
+                v_pre = state[:, dyn.IVX:dyn.IVY + 1]
                 state, a_contact = self._resolve_wall_contact(state, dt=self.dt * span)
+                if hold:
+                    # Everything this window's contacts did to the velocity, spread over the window and
+                    # applied for its length -- so the springs and the accelerometer integrate the whole
+                    # change. Not clipped here: the body takes whatever the contact gives it, and the
+                    # accelerometer clips at its range when it is sampled (`imu.sample`).
+                    a_hold = (state[:, dyn.IVX:dyn.IVY + 1] - v_pre) / (self.dt * span)
+            if hold:
+                a_contact = a_hold
             a_x = ax if a_contact is None else ax + a_contact[:, 0]
             a_y = ay if a_contact is None else ay + a_contact[:, 1]
             # sprung mass: roll to the outside of the corner, dive under braking, squat under throttle
@@ -1200,6 +1219,8 @@ class Simulator:
                     smp, imu_state = imu_model.sample(imu_state, P, self.imu_ts)
                     samples.append(smp)
         imu_samples = torch.stack(samples, 1) if samples else torch.zeros(state.shape[0], 0, 6, device=state.device)
+        if hold:
+            self.contact_acc.copy_(a_hold)                 # in place: a captured graph keeps writing it
         # `/sensors/core` `current_motor`, the guard's third (optional) input. The VESC commands a
         # current, and the torque it produces is that current times a constant: this inverts the
         # last substep's motor torque through `amp_per_nm`, which is calibrated in ActuatorParams

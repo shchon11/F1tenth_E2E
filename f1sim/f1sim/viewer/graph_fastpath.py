@@ -434,6 +434,8 @@ class SimGraphFastPath:
             "cfg.sim.body_friction": lambda: float(getattr(sim.cfg.sim, "body_friction", 0.0)),
             "sim.movable_obstacles": lambda: bool(getattr(sim, "movable_obstacles", False)),
             "props.share_m": lambda: int(getattr(getattr(sim.track, "env_props", None), "share_m", 1)),
+            "cfg.sim.contact_accel_hold": lambda: bool(getattr(sim.cfg.sim, "contact_accel_hold", False)),
+            "sim.contact_acc": lambda: getattr(sim, "contact_acc", None),
         }
         for attr in dir(sim.track):
             if attr.startswith("p_") and torch.is_tensor(getattr(sim.track, attr, None)):
