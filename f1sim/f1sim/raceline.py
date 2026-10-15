@@ -520,7 +520,11 @@ class RacelineCacheMiss(RuntimeError):
 #: would itself invalidate all 738 once, which is why it is not done here.
 #:
 #: A new field goes here if and only if the raceline does not depend on it.
-_ADDED_AFTER_LINE_KEY = frozenset({"road_tilt_v", "mu_ref", "mu_stiffness_exp"})
+_ADDED_AFTER_LINE_KEY = frozenset({"road_tilt_v", "mu_ref", "mu_stiffness_exp",
+                                   # 2026-10-15: what a contact does to the sprung mass (`contact_moments`);
+                                   # the line never reads them, and in the key they missed every cached line
+                                   # (an evaluation then spent minutes in a minimum-time solve that failed)
+                                   "Ixx", "Iyy", "contact_z_end", "contact_z_side"})
 
 #: `VehicleParams` fields the line does not read whose *default changed* after the key was defined,
 #: each written into the key at the value it had then. Same reason as above: `road_tilt` went
