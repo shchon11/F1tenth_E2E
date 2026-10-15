@@ -83,3 +83,137 @@ def test_the_latch_is_soft_contact_only():
         sim.reset(torch.arange(1), torch.tensor([[10.0, 0.75, -math.pi / 2]]), torch.tensor([3.0]))
         out.append(torch.stack([sim.step(torch.tensor([[0.0, 3.0]])).state for _ in range(12)]))
     assert torch.equal(out[0], out[1])
+
+
+# ------------------------------------------------------------------ 2. props: the impulse, one set per race
+BOX = (12.0, 15.0)
+
+
+def _prop_scene(style: str = "cardboard_box", relative: bool = True, share: bool = True, B: int = 2):
+    """A race of `B` cars on the open floor and one prop of `style` at `BOX`, movable, every other slot dead."""
+    from f1sim.procedural_obstacles import ProceduralObstacles
+    cfg = _cfg()
+    cfg.sim.prop_relative = relative
+    cfg.sim.props_per_race = share
+    sim = Simulator(_floor(), cfg, num_envs=B, device="cpu", race_size=B)
+    po = ProceduralObstacles(sim.track, B, sim.gen, density=1.0, max_props=4)
+    sim.track.attach_env_props(po)
+    sim.movable_obstacles = True
+    sim.prop_reach = float(sim.corners.norm(dim=1).max()) + po.max_radius
+    po.share_m = B if share else 1
+    sid = next(i for i, s in enumerate(po.shapes) if s.style == style)
+    po.p_poses.zero_(); po.p_zlo.zero_(); po.p_zhi.fill_(-1.0); po.p_mass.zero_(); po.p_vel.zero_()
+    po.p_sid.fill_(-1)
+    po.p_poses[:, 0] = torch.tensor([BOX[0], BOX[1], 0.0])
+    po.p_n[:, 0] = po.sh_n[sid]; po.p_d[:, 0] = po.sh_d[sid]
+    po.p_zlo[:, 0] = po.sh_z0[sid]; po.p_zhi[:, 0] = po.sh_z1[sid]; po.p_mass[:, 0] = po.sh_mass[sid]
+    po.p_sid[:, 0] = sid
+    return sim, po
+
+
+def _touching_pose(sim, y: float, yaw: float = 0.0, depth: float = 0.004):
+    """x at which a car at (x, y, yaw) overlaps the prop by about `depth`, walking in from the west."""
+    for i in range(2000):
+        x = BOX[0] - 1.2 + 0.001 * i
+        st = torch.zeros(sim.B, sim.state.shape[1])
+        st[:, 0], st[:, 1], st[:, 2] = x, y, yaw
+        st[1:, 0], st[1:, 1] = 25.0, 25.0                        # the other cars far away
+        if float(sim._prop_contact(st)[0][0]) > depth:
+            return st
+    raise AssertionError("never reached the prop")
+
+
+def _energy_momentum(sim, po, st):
+    m, Iz = float(sim.P["m"][0]), float(sim.P["Iz"][0])
+    yaw = float(st[0, 2]); c, s = math.cos(yaw), math.sin(yaw)
+    vx, vy, w = float(st[0, 3]), float(st[0, 4]), float(st[0, 5])
+    v = torch.tensor([vx * c - vy * s, vx * s + vy * c])
+    mp = float(po.p_mass[0, 0]); vp = po.p_vel[0, 0].clone()
+    ke = 0.5 * m * float(v @ v) + 0.5 * Iz * w * w + 0.5 * mp * float(vp @ vp)
+    return ke, m * v + mp * vp
+
+
+@pytest.mark.parametrize("style, y, yaw, v, w", [
+    ("cardboard_box", 15.0, 0.0, 3.0, 0.0),             # square, a 1.2 kg box
+    ("cardboard_box", 15.13, 0.0, 3.0, 0.0),            # a front corner
+    ("cardboard_box", 15.13, 0.3, 3.0, 4.0),            # a corner, the car spinning and at an angle
+    ("wooden_crate", 15.0, 0.0, 4.0, 0.0),              # 10 kg
+    ("steel_drum", 15.1, -0.2, 2.0, -3.0),              # 18 kg, off centre, spinning the other way
+])
+def test_a_prop_impulse_conserves_momentum_and_creates_no_energy(style, y, yaw, v, w):
+    sim, po = _prop_scene(style)
+    st = _touching_pose(sim, y, yaw)
+    st[0, 3], st[0, 5] = v, w
+    ke0, p0 = _energy_momentum(sim, po, st)
+    out, _a = sim._resolve_wall_contact(st, dt=0.005)
+    ke1, p1 = _energy_momentum(sim, po, out)
+    assert float(po.p_vel[0, 0].norm()) > 0.1, "the prop was not pushed"
+    assert torch.allclose(p1, p0, atol=1e-4 * float(p0.norm())), (p0, p1)
+    assert ke1 <= ke0 * (1 + 1e-6), (ke0, ke1)
+    assert torch.equal(po.p_vel[1, 0], po.p_vel[0, 0])          # the race's other car holds the same crate
+
+
+def test_one_impact_is_one_impulse():
+    """3 m/s into a 1.2 kg box: it leaves at (1+e) m_c/(m_c+m_p) of the closing speed (less the floor's pull
+    over the rest of the step) and the car keeps the rest. The old impulse took the car's own speed at each of
+    the step's resolutions while the box stood still: 7.6 m/s for the box, 0.53 left to the car."""
+    out = {}
+    for rel in (False, True):
+        sim, po = _prop_scene(relative=rel)
+        sim.reset(torch.arange(2), torch.tensor([[10.6, 15.0, 0.0], [20.0, 25.0, 0.0]]), torch.tensor([3.0, 0.0]))
+        v_hit = None
+        for t in range(25):
+            r = sim.step(torch.tensor([[0.0, 3.0], [0.0, 0.0]]))
+            if float(r.wall_impact[0]) > 0:
+                v_hit, box, car = float(r.wall_impact[0]), float(po.p_vel[0, 0, 0]), float(r.state[0, 3])
+                break
+            v_before = float(r.state[0, 3])
+            if not rel:
+                po.advance(sim.control_dt)                      # what the env did after every step
+        assert v_hit is not None
+        out[rel] = (v_hit, box, car, v_before)
+    v_hit, box, car, v0 = out[True]
+    m_c, m_p, e = 3.74, 1.2, 0.2
+    want = (1 + e) * m_c / (m_c + m_p) * v_hit
+    assert want - 0.13 < box <= want + 1e-3, (box, want)        # one impulse, then up to 20 ms of floor
+    assert 2.0 < car < 2.4
+    old_box = out[False][1]
+    assert old_box > 2.4 * out[False][0], "the scene no longer shows the old impulse's energy gain"
+
+
+def test_two_cars_of_a_race_push_one_crate_and_add_up():
+    sim, po = _prop_scene("wooden_crate")
+    slot = torch.zeros(2, dtype=torch.long)
+    po.push(torch.arange(2), slot, torch.tensor([[0.3, 0.0], [0.2, 0.1]]), torch.tensor([[0.01, 0.0], [0.0, 0.02]]))
+    for row in range(2):
+        assert torch.allclose(po.p_vel[row, 0], torch.tensor([0.5, 0.1]))
+        assert torch.allclose(po.p_poses[row, 0, :2], torch.tensor([BOX[0] + 0.01, BOX[1] + 0.02]))
+    sim1, po1 = _prop_scene("wooden_crate", share=False)
+    po1.push(torch.arange(2), slot, torch.tensor([[0.3, 0.0], [0.2, 0.1]]), torch.zeros(2, 2))
+    assert torch.allclose(po1.p_vel[0, 0], torch.tensor([0.3, 0.0]))     # a set per car: each its own
+
+
+@pytest.mark.parametrize("share", [True, False])
+def test_the_other_car_meets_the_crate_where_it_was_pushed(share):
+    """Car 0 shoves a box 0.6 m along; car 1 then drives across the box's old place and its new one. With a
+    set per race it passes the empty old place and hits the box where it is; with a set per car (the old way)
+    it hit a box that was no longer there and drove through the one that was."""
+    sim, po = _prop_scene(share=share)
+    sim.reset(torch.arange(2), torch.tensor([[10.6, 15.0, 0.0], [20.0, 25.0, 0.0]]), torch.tensor([3.0, 0.0]))
+    for t in range(60):
+        r = sim.step(torch.tensor([[0.0, 3.0 if t < 14 else -1.0], [0.0, 0.0]]))
+    moved = float(po.p_poses[0, 0, 0])
+    assert moved > BOX[0] + 0.4 and float(po.p_vel[0, 0].norm()) == 0.0
+    contacts = {}
+    for name, x in (("old place", BOX[0]), ("new place", moved)):
+        hits = 0
+        sim.reset(torch.tensor([1]), torch.tensor([[x, BOX[1] - 1.2, math.pi / 2]]), torch.tensor([1.5]))
+        for t in range(30):
+            r = sim.step(torch.tensor([[0.0, 0.0], [0.0, 1.5]]))
+            hits += int(bool(sim.prop_touched[1]) or float(r.wall_impact[1]) > 0)
+        sim.reset(torch.tensor([1]), torch.tensor([[20.0, 25.0, 0.0]]), torch.tensor([0.0]))
+        contacts[name] = hits
+    if share:
+        assert contacts["old place"] == 0 and contacts["new place"] > 0, contacts
+    else:
+        assert contacts["old place"] > 0 and contacts["new place"] == 0, contacts

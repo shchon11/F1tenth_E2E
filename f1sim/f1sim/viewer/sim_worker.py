@@ -1705,10 +1705,11 @@ class SimWorker:
                 pieces.append(plan_pred.reshape(-1))
         proc = env.procedural
         if proc is not None:
-            # The layout every car is driving through (`procedural_shared`: env 0's is everyone's),
-            # one row per slot, [shape id, x, y, yaw]; a dead slot's shape id is -1. Every frame
-            # rather than once per layout, because a shoved crate moves.
-            pieces.append(torch.cat([proc.p_sid[0].float()[:, None], proc.p_poses[0]], 1).reshape(-1))
+            # The layout the focus car is driving through -- its race's set: the cars of a race share
+            # one (`SimParams.props_per_race`), and every row holds that race's copy. One row per slot,
+            # [shape id, x, y, yaw]; a dead slot's shape id is -1. Every frame rather than once per
+            # layout, because a shoved crate moves.
+            pieces.append(torch.cat([proc.p_sid[focus].float()[:, None], proc.p_poses[focus]], 1).reshape(-1))
         estimate = getattr(session.get("controller"), "last_estimate", None)
         estimate_keys = ("used_mu", "q10", "q50", "q90", "warm", "finite")
         if estimate:

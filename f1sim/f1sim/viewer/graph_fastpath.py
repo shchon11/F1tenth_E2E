@@ -429,6 +429,10 @@ class SimGraphFastPath:
             # at Python level, so baked in at capture), and its latches are written in place.
             "cfg.sim.wall_latch": lambda: bool(getattr(sim.cfg.sim, "wall_latch", False)),
             "sim.wall_touched": lambda: getattr(sim, "wall_touched", None),
+            "cfg.sim.prop_relative": lambda: bool(getattr(sim.cfg.sim, "prop_relative", False)),
+            "cfg.sim.body_friction": lambda: float(getattr(sim.cfg.sim, "body_friction", 0.0)),
+            "sim.movable_obstacles": lambda: bool(getattr(sim, "movable_obstacles", False)),
+            "props.share_m": lambda: int(getattr(getattr(sim.track, "env_props", None), "share_m", 1)),
         }
         for attr in dir(sim.track):
             if attr.startswith("p_") and torch.is_tensor(getattr(sim.track, attr, None)):

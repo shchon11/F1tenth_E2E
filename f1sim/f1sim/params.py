@@ -496,6 +496,20 @@ class SimParams:
     # 1-2 m/s and 60 % at 2-3 m/s. The wall penalty, `--lagrange wall=` and `collisions_per_km`
     # counted the props and the hardest wall hits only. Soft contact only (terminate never resolves).
     wall_latch: bool = True
+    # A movable prop is a second body: the impulse is the two-body one on the relative velocity at the
+    # contact point, the prop takes exactly its opposite and its share of the overlap, and it moves in place
+    # inside the roll (slowed by the floor every contact window), so the next contact test sees it where it
+    # is. Before, the impulse took the car's own speed into the prop and the prop only moved after the step,
+    # so each of up to five resolutions shoved it again: a 1.2 kg box left at about 2.6x the car's speed
+    # while the car kept 0.18 of its own (energy created).
+    prop_relative: bool = True
+    # The cars of a race share one prop set: the crate the learner shoved is where the opponent meets it,
+    # and two cars pushing one crate add up. Before, every car had its own copy of the race's layout.
+    props_per_race: bool = True
+    # Coulomb friction coefficient of a body-on-body contact (car-prop, car-car): the tangential impulse is
+    # at most this times the normal one. Plastic bumper on cardboard, wood or another car's plastic: 0.3 is a
+    # textbook value for those pairs; nothing in the recordings measures it.
+    body_friction: float = 0.3
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
@@ -669,7 +683,7 @@ class Config:
 #: The `SimParams` switches of the 2026-10-15 contact physics, each on by default. All of them off
 #: reproduces feat/v2-severity: soft-mode rollouts bit-identical (state and reward), the numbers of
 #: every evaluation and training run before them.
-CONTACT_FIXES = ("wall_latch",)
+CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race")
 
 
 def legacy_contacts(cfg: Config) -> Config:

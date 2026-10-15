@@ -1034,6 +1034,13 @@ class Simulator:
                           odom_t, i_motor if self.wheel_model else None, wall_hit.clone(),
                           wall_impact, car_impact)
 
+    def _props_move_in_roll(self) -> bool:
+        """`SimParams.prop_relative` with movable props under soft contact: a struck prop is a second body,
+        moved in place inside the roll (`ProceduralObstacles.drift` / `push`). Python-level, guarded."""
+        return (bool(getattr(self.cfg.sim, "prop_relative", False)) and bool(getattr(self, "movable_obstacles", False))
+                and not self.cfg.sim.terminate_on_collision
+                and getattr(self.track, "env_props", None) is not None)
+
     def _wall_latch_on(self) -> bool:
         """`SimParams.wall_latch` under soft contact. Read at Python level inside the roll, so it is
         part of a captured graph's structure (`graph_fastpath` guards it)."""
@@ -1091,6 +1098,7 @@ class Simulator:
         samples = []
         a_cmd_last = torch.zeros_like(ax)
         soft_wall = not self.cfg.sim.terminate_on_collision
+        props_move = soft_wall and self._props_move_in_roll()
         ar = torch.arange(self.B, device=state.device)
         for k in range(self.substeps):
             age = delay_s - (k + 1) * self.dt
@@ -1123,6 +1131,9 @@ class Simulator:
             ce = self.contact_every
             if soft_wall and (k % ce == ce - 1 or k == self.substeps - 1):
                 span = (k % ce) + 1
+                if props_move:
+                    # the props slide over the same window, so the contact sees them where they are
+                    self.track.env_props.drift(self.dt * span)
                 state, a_contact = self._resolve_wall_contact(state, dt=self.dt * span)
             a_x = ax if a_contact is None else ax + a_contact[:, 0]
             a_y = ay if a_contact is None else ay + a_contact[:, 1]
@@ -1309,7 +1320,18 @@ class Simulator:
         # the m_prop -> infinity limit of this one. Against a 10 kg crate with a 3.74 kg car, the
         # car keeps m_p/(m_c+m_p) = 0.73 of the bounce and the crate takes the rest and slides.
         share = torch.ones_like(vn)
-        if prop_slot is not None:
+        # `SimParams.prop_relative`: a movable prop is a second body (below, after the contact point).
+        rel = prop_slot is not None and self._props_move_in_roll()
+        mov = v_p = None
+        if rel:
+            ep = self.track.env_props
+            sl = prop_slot.clamp_min(0)
+            m_p = torch.where(prop_slot >= 0, ep.p_mass[self.eid, sl], torch.zeros_like(vn))
+            mov = prop_deeper & touching & (m_p > 0)                   # a movable prop owns this contact
+            m_c = self.P["m"]
+            share = torch.where(mov, m_p / (m_c + m_p).clamp_min(1e-6), share)
+            v_p = torch.where(mov[:, None], ep.p_vel[self.eid, sl].to(n.dtype), torch.zeros_like(n))
+        if prop_slot is not None and not rel:
             m_c = float(self.cfg.vehicle.m)
             rows = torch.arange(state.shape[0], device=state.device)
             m_p = torch.where(prop_slot >= 0,
@@ -1344,6 +1366,8 @@ class Simulator:
         vpn = (vwx - r_now * p_c[:, 1]) * n[:, 0] + (vwy + r_now * p_c[:, 0]) * n[:, 1]
         if not getattr(sp, "contact_at_point", True):
             p_c = torch.zeros_like(p_c); pxn = torch.zeros_like(pxn); vpn = vn
+        if v_p is not None:
+            vpn = vpn - (v_p * n).sum(1)                                 # a moving prop: relative speed
         into = (vpn < 0) & touching
         # How hard this is (`wall_impact`): the speed into the surface at the contact point -- the
         # `-vpn` the impulse below takes -- kept as the step's maximum. A contact is first seen with
@@ -1357,6 +1381,35 @@ class Simulator:
         vwy2 = vwy + J / m_car * n[:, 1]
         vwx2, vwy2 = vwx2 * (1 - f * 0.05), vwy2 * (1 - f * 0.05)
         r2 = r_now + J * pxn / Iz
+        if mov is not None:
+            # A movable prop is a second body (`SimParams.prop_relative`). The impulse is the two-body one
+            # on the RELATIVE velocity at the contact point, J = -(1+k) u_n / (1/m_c + (p x n)^2/Iz + 1/m_p),
+            # with Coulomb friction (`body_friction`) along the tangent, and the prop takes exactly -J
+            # (`push`), moved in place inside the roll with the floor slowing it (`drift`). The old form
+            # took the car's own into-prop speed and left the prop where it stood until the step ended, so
+            # every resolution of the step shoved it again: a 1.2 kg box left at about 2.6x the car's speed
+            # while the car kept 0.18 of its own -- energy created. Now one impact is one impulse and the
+            # momentum is conserved; with k <= 1 and the lever used the same way in u and in the turn
+            # (`contact_lever`), no contact gains energy.
+            lam = getattr(sp, "contact_lever", 1.0) if getattr(sp, "contact_at_point", True) else 0.0
+            t_ = torch.stack([-n[:, 1], n[:, 0]], 1)
+            pxt = (p_c[:, 0] * t_[:, 1] - p_c[:, 1] * t_[:, 0]) * lam
+            inv_p = torch.where(mov, 1.0 / m_p.clamp_min(1e-6), torch.zeros_like(m_p))
+            dvx, dvy = vwx - v_p[:, 0], vwy - v_p[:, 1]
+            u_n = dvx * n[:, 0] + dvy * n[:, 1] + r_now * pxn
+            u_t = dvx * t_[:, 0] + dvy * t_[:, 1] + r_now * pxt
+            Jn = (1 + k) * bleed * (-u_n).clamp_min(0.0) / (1.0 / m_car + pxn * pxn / Iz + inv_p)
+            Jt = -bleed * u_t / (1.0 / m_car + pxt * pxt / Iz + inv_p)
+            mu = float(getattr(sp, "body_friction", 0.3))
+            Jt = torch.maximum(torch.minimum(Jt, mu * Jn), -mu * Jn)
+            Px, Py = Jn * n[:, 0] + Jt * t_[:, 0], Jn * n[:, 1] + Jt * t_[:, 1]
+            vwx2 = torch.where(mov, vwx + Px / m_car, vwx2)
+            vwy2 = torch.where(mov, vwy + Py / m_car, vwy2)
+            r2 = torch.where(mov, r_now + (pxn * Jn + pxt * Jt) / Iz, r2)
+            into = into | mov
+            # the prop's half of it: -P, and its share of the overlap (the car takes `share` below)
+            ep.push(self.eid, prop_slot, -torch.stack([Px, Py], 1) * inv_p[:, None],
+                    -n * (pen * (1.0 - share) * bleed * mov.to(pen.dtype))[:, None])
         vwx = torch.where(into, vwx2, vwx); vwy = torch.where(into, vwy2, vwy)
         st = state.clone()
         st[:, dyn.IR] = torch.where(into, r2, r_now)

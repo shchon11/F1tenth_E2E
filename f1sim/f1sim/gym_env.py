@@ -1040,6 +1040,10 @@ class F1VecEnv:
             # to the slots inside this, and count anything they dropped that was not
             self.sim.prop_reach = float(self.sim.corners.norm(dim=1).max()) + self.procedural.max_radius
             self.sim.movable_obstacles = bool(e.movable_obstacles)
+            # One prop set per race (`SimParams.props_per_race`): every change is the race's total, given
+            # to each of its cars' copies, so they all see the crate where it was pushed to.
+            if self.M > 1 and bool(getattr(self.cfg.sim, "props_per_race", False)):
+                self.procedural.share_m = int(self.M)
         self.opp_scale = torch.ones(self.B, device=self.device)
         #: (B,) the speed-scale draw each car is running, whichever way that car uses it (a teacher
         #: scales its profile, a policy scales its cap). One place to read "how fast was this car
@@ -2811,10 +2815,11 @@ class F1VecEnv:
         if gate is not None:
             crash = gate["wall_hard"]
         self._widen_clearance_to_props(r)
-        if self.procedural is not None and e.movable_obstacles:
+        if self.procedural is not None and e.movable_obstacles and not self.sim._props_move_in_roll():
             # Whatever the contacts shoved this step now slides, and the floor takes it back down.
             # After the roll, so a prop moves between steps and not inside one: the LiDAR and the
-            # contact test in this step both saw it where it was when the step began.
+            # contact test in this step both saw it where it was when the step began. Only without
+            # `SimParams.prop_relative`, which moves the props inside the roll instead.
             self.procedural.advance(self.sim.control_dt)
         plan_ref = self.tracker.last_ref if self.tracker is not None and e.reward_plan_clearance > 0 else self._no_plan
         car_hit = (r.car_collision.float() if r.car_collision is not None
