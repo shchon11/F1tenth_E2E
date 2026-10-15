@@ -296,3 +296,141 @@ def test_the_springs_and_the_imu_feel_the_whole_impact(monkeypatch, hold):
     # ... and the accelerometer still clips at its range when it is sampled
     rng = float(sim.cfg.imu.accel_range)
     assert float(imu[:, 3:6].abs().max()) <= rng + 1e-3
+
+
+# ------------------------------------------------------------------ 4. cars collide with each other
+def _race(response: bool = True, B: int = 2) -> Simulator:
+    cfg = _cfg()
+    cfg.sim.car_response = response
+    sim = Simulator(_floor(), cfg, num_envs=B, device="cpu", race_size=B)
+    sim.measure_impacts = True
+    _fix_bodies(sim)
+    return sim
+
+
+def _fix_bodies(sim):
+    """Every car the nominal 0.58 x 0.31 m body with an 8 cm rear box (the draw is random per reset)."""
+    sim.car_dims[:, 0] = 0.50
+    sim.car_rear[:, 0] = 0.08
+    sim.car_rear[:, 1] = 0.18
+
+
+def _cars_overlapping(sim, poses, vel, w=None):
+    """A state with the cars at `poses`, world-frame velocities `vel`, yaw rates `w`."""
+    st = torch.zeros(sim.B, sim.state.shape[1])
+    st[:, :3] = torch.tensor(poses, dtype=torch.float32)
+    yaw = st[:, 2]
+    for i in range(sim.B):
+        c, s = math.cos(float(yaw[i])), math.sin(float(yaw[i]))
+        vx, vy = vel[i]
+        st[i, 3], st[i, 4] = vx * c + vy * s, -vx * s + vy * c
+    if w is not None:
+        st[:, 5] = torch.tensor(w, dtype=torch.float32)
+    return st
+
+
+def _least_overlap(sim, st) -> float:
+    """Of the four SAT axes of the two bodies, the smallest overlap of their projections [m] (< 0: apart)."""
+    c, s_ = torch.cos(st[:, 2]), torch.sin(st[:, 2])
+    R = torch.stack([torch.stack([c, -s_], -1), torch.stack([s_, c], -1)], -2)
+    local = sim.corners[None] * (sim.car_dims[:, 0] / 0.50)[:, None, None]
+    pts = torch.einsum("bij,bkj->bki", R, local) + st[:, None, :2]
+    ext = torch.stack([-sim.car_rear[:, 0] * c, -sim.car_rear[:, 0] * s_], 1)
+    pts = torch.cat([pts, pts[:, 2:] + ext[:, None, :]], 1)
+    axes = [torch.stack([c[i], s_[i]]) for i in range(2)] + [torch.stack([-s_[i], c[i]]) for i in range(2)]
+    best = float("inf")
+    for a in axes:
+        pa, pb = pts[0] @ a, pts[1] @ a
+        best = min(best, float(torch.minimum(pa.max(), pb.max()) - torch.maximum(pa.min(), pb.min())))
+    return best
+
+
+def _momentum_energy(sim, st):
+    m, Iz = sim.P["m"], sim.P["Iz"]
+    c, s = torch.cos(st[:, 2]), torch.sin(st[:, 2])
+    v = torch.stack([st[:, 3] * c - st[:, 4] * s, st[:, 3] * s + st[:, 4] * c], 1)
+    p = (m[:, None] * v).sum(0)
+    ke = float((0.5 * m * (v * v).sum(1) + 0.5 * Iz * st[:, 5] ** 2).sum())
+    return p, ke, v
+
+
+@pytest.mark.parametrize("poses, vel, w, e_closing", [
+    # rear-end: 5 m/s into a car doing 2, bodies 1 cm into each other, straight
+    ([[10.0, 15.0, 0.0], [10.65, 15.0, 0.0]], [(5.0, 0.0), (2.0, 0.0)], None, 3.0),
+    # head-on, 2 + 2
+    ([[10.0, 15.0, 0.0], [10.57, 15.0, math.pi]], [(2.0, 0.0), (-2.0, 0.0)], None, 4.0),
+    # off-centre rear-end, the cars at an angle and the one behind spinning
+    ([[10.0, 15.0, 0.1], [10.53, 15.15, -0.05]], [(4.0, 0.3), (1.0, 0.0)], [2.0, -0.5], None),
+    # T-bone
+    ([[10.0, 15.0, math.pi / 2], [10.0, 15.43, 0.0]], [(0.0, 3.0), (0.0, 0.0)], None, 3.0),
+])
+def test_a_car_impact_conserves_momentum_and_keeps_the_restitution(poses, vel, w, e_closing):
+    sim = _race()
+    st = _cars_overlapping(sim, poses, vel, w)
+    assert bool(sim._car_contacts(st).all()), "the scene does not overlap"
+    p0, ke0, v0 = _momentum_energy(sim, st)
+    out = sim._resolve_car_contact(st)
+    p1, ke1, v1 = _momentum_energy(sim, out)
+    assert torch.allclose(p1, p0, atol=1e-5 * float(p0.norm()) + 1e-6), (p0, p1)
+    assert ke1 <= ke0 * (1 + 1e-6), (ke0, ke1)
+    assert bool(sim.car_touched.all())
+    imp = sim.car_impact_roll
+    assert float(imp[0]) == float(imp[1])                      # one contact, one number, both cars
+    if e_closing is not None:
+        assert abs(float(imp[0]) - e_closing) < 0.03 * e_closing + 0.01, (float(imp[0]), e_closing)
+        # straight and square: the normal velocity reverses to e times itself
+        d0 = (v0[1] - v0[0]); d1 = (v1[1] - v1[0])
+        n = d0 / d0.norm()
+        e = float(sim.cfg.sim.car_restitution)
+        assert abs(float(d1 @ n) + e * float(d0 @ n)) < 0.02 * float(d0.norm()), (float(d1 @ n), float(d0 @ n))
+        # and pushed apart, half the overlap each: touching at most
+        assert _least_overlap(sim, st) > 0.005 and _least_overlap(sim, out) < 1e-4, _least_overlap(sim, out)
+
+
+def test_a_rear_end_pushes_the_car_in_front_forward():
+    """4 m/s into a car rolling at 1 m/s: the car in front is shoved forward and the one behind slows. Before
+    (no response) the front car never noticed: the bodies passed through each other."""
+    out = {}
+    for resp in (True, False):
+        sim = _race(resp)
+        sim.reset(torch.arange(2), torch.tensor([[9.6, 15.0, 0.0], [10.6, 15.0, 0.0]]), torch.tensor([4.0, 1.0]))
+        _fix_bodies(sim)
+        front, back, contact = [], [], []
+        for t in range(30):
+            r = sim.step(torch.tensor([[0.0, 4.0], [0.0, 1.0]]))
+            front.append(float(r.state[1, 3])); back.append(float(r.state[0, 3]))
+            contact.append(bool(r.car_collision[0]))
+        first = contact.index(True)
+        out[resp] = (front, back, first, r)
+    front, back, first, r = out[True]
+    assert max(front[first:first + 3]) > front[first - 1] + 1.5, front[first - 3:first + 4]
+    assert back[first] < back[first - 1] - 1.5
+    # and the cars do not end inside each other
+    assert float(r.state[1, 0] - r.state[0, 0]) > 0.5
+    front0, _, first0, r0 = out[False]
+    assert max(front0[first0:]) < 1.1
+    assert float(r0.state[1, 0] - r0.state[0, 0]) < 0.0, "without the response the car behind drove through"
+
+
+def test_car_impact_is_the_closing_speed_at_the_first_impulse():
+    sim = _race()
+    sim.reset(torch.arange(2), torch.tensor([[10.0, 15.0, 0.0], [11.0, 15.0, 0.0]]), torch.tensor([5.0, 2.0]))
+    _fix_bodies(sim)
+    imps = []
+    for _ in range(30):
+        r = sim.step(torch.tensor([[0.0, 5.0], [0.0, 2.0]]))
+        imps.append(float(r.car_impact[0]) if bool(r.car_collision[0]) else None)
+    on = next(i for i, x in enumerate(imps) if x is not None)
+    assert abs(imps[on] - 3.0) < 0.15, imps[on]
+
+
+def test_the_response_is_soft_contact_only_and_off_reproduces_the_pass_through():
+    for terminate in (True, False):
+        out = []
+        for resp in (False, True):
+            cfg = _cfg(terminate=terminate)
+            cfg.sim.car_response = resp
+            sim = Simulator(_floor(), cfg, num_envs=2, device="cpu", race_size=2)
+            sim.reset(torch.arange(2), torch.tensor([[10.0, 15.0, 0.0], [11.0, 15.0, 0.0]]), torch.tensor([5.0, 2.0]))
+            out.append(torch.stack([sim.step(torch.tensor([[0.0, 5.0], [0.0, 2.0]])).state for _ in range(20)]))
+        assert torch.equal(out[0], out[1]) == terminate

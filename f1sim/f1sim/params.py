@@ -517,6 +517,16 @@ class SimParams:
     # every impact, and it was clipped at the accelerometer's 16 g before the springs saw it. Held, the
     # integral is the whole velocity change, and the only clip is the sensor's own (`imu.sample`).
     contact_accel_hold: bool = True
+    # Cars of a race collide with each other under soft contact: at every contact resolution (5 ms) two
+    # overlapping cars exchange an impulse at their contact point -- restitution `car_restitution`, Coulomb
+    # friction `body_friction`, each car's own mass and yaw inertia -- and are pushed apart by half the
+    # penetration each. Before, soft mode had no car-car response at all: cars drove through each other and
+    # a rear-end existed only in the reward. Off reproduces that (`--legacy-contacts`).
+    car_response: bool = True
+    # Velocity kept along the normal after a car-car impact. No recording has two cars touching; 0.2 is the
+    # value a plastic bumper on plastic/foam gives in the impact literature and the tall-wall value this
+    # simulator already uses -- the hose's 0.05 comes from a hose that deforms, which a car does not much.
+    car_restitution: float = 0.2
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
@@ -690,7 +700,7 @@ class Config:
 #: The `SimParams` switches of the 2026-10-15 contact physics, each on by default. All of them off
 #: reproduces feat/v2-severity: soft-mode rollouts bit-identical (state and reward), the numbers of
 #: every evaluation and training run before them.
-CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race", "contact_accel_hold")
+CONTACT_FIXES = ("wall_latch", "prop_relative", "props_per_race", "contact_accel_hold", "car_response")
 
 
 def legacy_contacts(cfg: Config) -> Config:
