@@ -88,6 +88,17 @@ class StepResult:
                                                     # closing speed (`car_impact`, 0 where not measured)
 
 
+#: Columns of `Simulator.contact_frame`, one row per car: this step's hardest contact (kind 0 none, 1 wall,
+#: 2 prop, 3 car; where it touched, world [m]; how hard [m/s]), the contact held for the console's eye
+#: (seconds left, and the hardest contact of the hold: kind, point, severity), and the episode's onsets per
+#: kind, all of them and the hard ones (>= `contact_severity.HARD_MPS`).
+CONTACT_FRAME_COLUMNS = ("kind", "x", "y", "severity", "held_s", "held_kind", "held_x", "held_y", "held_severity",
+                         "onsets_wall", "onsets_prop", "onsets_car", "hard_wall", "hard_prop", "hard_car")
+CONTACT_KINDS = ("none", "wall", "prop", "car")
+#: [s] how long a contact stays on the console's contact flag after the car stops touching
+CONTACT_HOLD_S = 0.3
+
+
 def _capturing() -> bool:
     """Whether this call is being recorded into a CUDA graph or traced by `torch.compile` -- the
     two places a data-dependent Python branch is not allowed."""
@@ -231,6 +242,15 @@ class Simulator:
         self.impact_kind = torch.zeros(num_envs, 2, device=self.device)
         #: Per kind (wall, prop, car), whether the last step ended in contact: the onsets' memory.
         self.kind_prev = torch.zeros(num_envs, 3, dtype=torch.bool, device=self.device)
+        #: Where this step's hardest contact touched, world [m], and its speed [m/s] (the roll keeps the
+        #: hardest resolution's point, in place; zeroed before each roll).
+        self.contact_pt = torch.zeros(num_envs, 2, device=self.device)
+        self.contact_pt_sev = torch.zeros(num_envs, device=self.device)
+        #: What the console draws (`contact_frame`), per car, updated in place every step: this step's
+        #: hardest contact, the one held for `CONTACT_HOLD_S`, and the episode's onsets per kind, all / hard.
+        self.contact_now = torch.zeros(num_envs, 4, device=self.device)        # kind, x, y, severity
+        self.contact_held = torch.zeros(num_envs, 5, device=self.device)       # seconds left, kind, x, y, severity
+        self.contact_counts = torch.zeros(num_envs, 6, dtype=torch.long, device=self.device)
         #: [m/s] This step's wall / prop impact severity: the largest speed into the surface, at the
         #: contact point, of any contact `_resolve_wall_contact` resolved (`StepResult.wall_impact`).
         #: Written in place inside the roll -- a CUDA graph replays writes to this storage, a rebound
@@ -888,6 +908,11 @@ class Simulator:
         self.wall_engaged[env_ids] = False
         self.impact_kind[env_ids] = 0.0
         self.kind_prev[env_ids] = False
+        self.contact_pt[env_ids] = 0.0
+        self.contact_pt_sev[env_ids] = 0.0
+        self.contact_now[env_ids] = 0.0
+        self.contact_held[env_ids] = 0.0
+        self.contact_counts[env_ids] = 0
         self.contact_acc[env_ids] = 0.0
         self.car_touched[env_ids] = False
         self.car_impact_roll[env_ids] = 0.0
@@ -912,6 +937,8 @@ class Simulator:
                                                      "cl_idx", "car_collision", "prop_touched",
                                                      "wall_touched", "wall_engaged", "wall_impact",
                                                      "impact_kind", "kind_prev", "contact_acc",
+                                                     "contact_pt", "contact_pt_sev", "contact_now",
+                                                     "contact_held", "contact_counts",
                                                      "car_touched", "car_impact_roll", "_odom_t_prev")}
         odom, t, phase = self.odom.state.clone(), self.t, self._imu_phase
         # The throw-away steps consume randomness from two places, not one: `self.gen` (spawn draws,
@@ -965,6 +992,7 @@ class Simulator:
         # warm-up's, not a graph capture's throw-away runs.
         self.wall_impact.zero_()
         self.impact_kind.zero_()
+        self.contact_pt_sev.zero_()
         if self._car_response_on():
             self.car_impact_roll.zero_()
         state, ax, ay, att, imu_state, imu_samples, i_motor = self._roll(
@@ -1047,21 +1075,29 @@ class Simulator:
             if car_impact is not None:
                 car_impact = torch.where(self.car_collision, car_impact, torch.zeros_like(car_impact))
         contact_onsets = contact_impacts = None
+        # Onsets per kind. With the wall contact held until the car is a cell clear, a crate touched while a
+        # hose is being scraped is no rising edge of the merged flag; counted per kind it is its own contact,
+        # charged and filed with its own impact. Kept in every mode for the console (`contact_frame`); handed
+        # to the env and the meters only with `wall_latch`, so a legacy run charges what it always did.
+        z = torch.zeros_like(wall_only)
+        kinds = torch.stack([wall_only, z if prop_now is None else prop_now,
+                             self.car_collision if self.M > 1 else z], 1)
+        if self.absent_any:
+            kinds = kinds & ~self.absent[:, None]
+        onsets_k = kinds & ~self.kind_prev
+        self.kind_prev.copy_(kinds)
+        if car_impact is not None:
+            car_sev = car_impact
+        elif self.M > 1 and self._car_response_on():
+            car_sev = self.car_impact_roll
+        else:
+            car_sev = torch.zeros_like(self.wall_impact)
+        impacts_k = torch.cat([self.impact_kind, car_sev[:, None].to(self.impact_kind.dtype)], 1)
+        if self.absent_any:
+            impacts_k = torch.where(self.absent[:, None], torch.zeros_like(impacts_k), impacts_k)
+        self._update_contact_frame(kinds, onsets_k, impacts_k)
         if self._wall_latch_on():
-            # Onsets per kind. With the wall contact held until the car is a cell clear, a crate touched while
-            # a hose is being scraped is no rising edge of the merged flag; counted per kind it is its own
-            # contact, charged and filed with its own impact.
-            z = torch.zeros_like(wall_only)
-            kinds = torch.stack([wall_only, z if prop_now is None else prop_now,
-                                 self.car_collision if self.M > 1 else z], 1)
-            if self.absent_any:
-                kinds = kinds & ~self.absent[:, None]
-            contact_onsets = kinds & ~self.kind_prev
-            self.kind_prev.copy_(kinds)
-            car_sev = car_impact if car_impact is not None else torch.zeros_like(self.wall_impact)
-            contact_impacts = torch.cat([self.impact_kind, car_sev[:, None].to(self.impact_kind.dtype)], 1)
-            if self.absent_any:
-                contact_impacts = torch.where(self.absent[:, None], torch.zeros_like(contact_impacts), contact_impacts)
+            contact_onsets, contact_impacts = onsets_k, impacts_k
         if self.M > 1:
             hit = hit | self.car_collision
         # Latched while a collision ends the episode -- the car is frozen and the flag has to
@@ -1094,6 +1130,42 @@ class Simulator:
                           imu_offsets if self.cfg.imu.enabled else None,
                           odom_t, i_motor if self.wheel_model else None, wall_hit.clone(),
                           wall_impact, car_impact, contact_onsets, contact_impacts)
+
+    def _record_contact_point(self, pt: torch.Tensor, sev: torch.Tensor, touching: torch.Tensor) -> None:
+        """Keep `pt` as this step's contact point where a contact touches at least as hard as the step's hardest
+        so far (`contact_pt`, `contact_pt_sev`, in place -- the roll is captured with it)."""
+        better = touching & (sev.to(self.contact_pt_sev.dtype) >= self.contact_pt_sev)
+        self.contact_pt.copy_(torch.where(better[:, None], pt.to(self.contact_pt.dtype), self.contact_pt))
+        self.contact_pt_sev.copy_(torch.where(better, sev.to(self.contact_pt_sev.dtype), self.contact_pt_sev))
+
+    def contact_frame(self, rows: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(n, len(CONTACT_FRAME_COLUMNS)) float: what the console needs to draw each car's contacts (see the
+        columns). One tensor so the console's single device-to-host copy can carry it."""
+        out = torch.cat([self.contact_now, self.contact_held, self.contact_counts.to(self.contact_now.dtype)], 1)
+        return out if rows is None else out[rows]
+
+    def _update_contact_frame(self, kinds: torch.Tensor, onsets: torch.Tensor, impacts: torch.Tensor) -> None:
+        """The console's per-car contact record, in place (`contact_frame`): kinds/onsets (B, 3) bool and
+        impacts (B, 3) [m/s] per kind (wall, prop, car), this step's."""
+        from .contact_severity import HARD_MPS
+        sev_k = torch.where(kinds, impacts, torch.full_like(impacts, -1.0))
+        # the hardest kind touching; ties go to the later column (car over prop over wall)
+        best = (sev_k + torch.arange(3, device=sev_k.device, dtype=sev_k.dtype) * 1e-6).argmax(1)
+        any_ = kinds.any(1)
+        kind = torch.where(any_, best + 1, torch.zeros_like(best)).to(self.contact_now.dtype)
+        sev = torch.where(any_, sev_k.max(1).values.clamp_min(0.0), torch.zeros_like(kind))
+        pt = torch.where(any_[:, None], self.contact_pt, torch.zeros_like(self.contact_pt))
+        self.contact_now.copy_(torch.cat([kind[:, None], pt, sev[:, None]], 1))
+        held = self.contact_held
+        left = (held[:, 0] - self.control_dt).clamp_min(0.0)
+        # a contact this step (re)starts the hold; it takes the held record when it is the hold's hardest
+        take = any_ & ((held[:, 0] <= 0.0) | (sev >= held[:, 4]))
+        rec = torch.cat([torch.full_like(sev, CONTACT_HOLD_S)[:, None], kind[:, None], pt, sev[:, None]], 1)
+        new = torch.where(take[:, None], rec, held)
+        new[:, 0] = torch.where(any_, torch.full_like(left, CONTACT_HOLD_S), left)
+        self.contact_held.copy_(new)
+        hard = onsets & (impacts >= HARD_MPS)
+        self.contact_counts.add_(torch.cat([onsets, hard], 1).to(self.contact_counts.dtype))
 
     def _car_response_on(self) -> bool:
         """`SimParams.car_response` in a race under soft contact. Python-level, so `graph_fastpath` guards it."""
@@ -1152,6 +1224,7 @@ class Simulator:
         dx = torch.zeros_like(xy)
         hit = torch.zeros_like(w, dtype=torch.bool)
         sev = torch.zeros_like(w)
+        pt = torch.zeros_like(xy)
         for c in range(self.M - 1):
             o = self.other_idx[:, c]
             lo, hi = torch.minimum(me, o), torch.maximum(me, o)
@@ -1216,9 +1289,12 @@ class Simulator:
             push = torch.where(over, (0.5 * pen).clamp(max=self.CAR_PUSH_MAX), torch.zeros_like(pen))
             dx = dx + sgn[:, None] * n * push[:, None]
             hit = hit | over
-            sev = torch.maximum(sev, torch.where(over, (-vn).clamp_min(0.0), torch.zeros_like(vn)))
+            sev_c = torch.where(over, (-vn).clamp_min(0.0), torch.zeros_like(vn))
+            pt = torch.where((over & (sev_c >= sev))[:, None], p, pt)
+            sev = torch.maximum(sev, sev_c)
         self.car_touched.logical_or_(hit)
         self.car_impact_roll.copy_(torch.maximum(self.car_impact_roll, sev.to(self.car_impact_roll.dtype)))
+        self._record_contact_point(pt, sev, hit)
         v2 = v + dv
         st = state.clone()
         st[:, :2] = xy + dx
@@ -1620,6 +1696,9 @@ class Simulator:
         is_prop = prop_deeper if prop_deeper is not None else torch.zeros_like(into)
         self.impact_kind.copy_(torch.maximum(self.impact_kind, torch.stack(
             [torch.where(is_prop, torch.zeros_like(sev_now), sev_now), torch.where(is_prop, sev_now, torch.zeros_like(sev_now))], 1)))
+        # ... and where it touched, for the console: the deepest corner(s) of this resolution if it is the
+        # step's hardest so far (a resting contact, 0 m/s, is kept while nothing harder came)
+        self._record_contact_point(state[:, :2] + p_c, sev_now, touching)
         m_car, Iz = self.P["m"], self.P["Iz"]
         J = (1 + k) * share * bleed * (-vpn) / (1.0 / m_car + pxn * pxn / Iz)       # >= 0 while driving in
         vwx2 = vwx + J / m_car * n[:, 0]

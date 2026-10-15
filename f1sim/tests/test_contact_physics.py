@@ -486,3 +486,64 @@ def test_a_rear_end_lifts_the_nose_of_the_car_in_front_and_dives_the_one_behind(
     pitch = torch.stack(pitch)
     assert float(pitch[:, 1].min()) < -0.03, pitch[:, 1]
     assert float(pitch[:, 0].max()) > 0.03, pitch[:, 0]
+
+
+# ------------------------------------------------------------------ 6. what the console draws
+def _frame(sim, row=0):
+    from f1sim.sim import CONTACT_FRAME_COLUMNS
+    f = sim.contact_frame()[row]
+    return {k: float(f[j]) for j, k in enumerate(CONTACT_FRAME_COLUMNS)}
+
+
+def test_the_console_record_names_the_contact_holds_it_and_counts_the_episode():
+    """A 1.5 m/s hose hit: kind wall, its severity and a point on the hose, held for 0.3 s after the car has
+    backed off, one wall onset and one hard one; the reset starts the episode's counts again."""
+    from f1sim.sim import CONTACT_HOLD_S
+    cfg = _cfg()
+    sim = Simulator(_floor(), cfg, num_envs=1, device="cpu")
+    sim.reset(torch.arange(1), torch.tensor([[10.0, 0.75, -math.pi / 2]]), torch.tensor([1.5]))
+    plan = [1.5] * 10 + [-1.5] * 30
+    frames, contact = [], []
+    for v in plan:
+        r = sim.step(torch.tensor([[0.0, v]]))
+        frames.append(_frame(sim))
+        contact.append(bool(r.wall_collision[0]))
+    first = contact.index(True)
+    f = frames[first]
+    assert f["kind"] == 1.0 and abs(f["severity"] - 1.5) < 0.05
+    assert abs(f["y"] - 0.2) < 0.06 and abs(f["x"] - 10.0) < 0.2          # on the hose, under the car's nose
+    assert f["held_s"] == pytest.approx(CONTACT_HOLD_S) and f["held_kind"] == 1.0
+    last = len(contact) - 1 - contact[::-1].index(True)
+    after = [frames[i]["held_s"] for i in range(last + 1, len(frames))]
+    steps_held = sum(1 for h in after if h > 0)
+    assert steps_held == round(CONTACT_HOLD_S / sim.control_dt) - 1, after   # 0.3 s, counting the contact step
+    assert all(frames[i]["kind"] == 0.0 for i in range(last + 1, len(frames)))
+    assert frames[last + 1]["held_severity"] == pytest.approx(frames[first]["severity"])   # the hold keeps the hit
+    assert (frames[-1]["onsets_wall"], frames[-1]["hard_wall"]) == (1.0, 1.0)
+    assert frames[-1]["onsets_prop"] == frames[-1]["onsets_car"] == 0.0
+    sim.reset(torch.arange(1))
+    assert all(v == 0.0 for v in _frame(sim).values())
+
+
+def test_the_console_record_tells_a_car_from_a_crate():
+    sim, po = _prop_scene("cardboard_box")
+    # car 0 into the box at 0.8 m/s; car 1 parked
+    sim.reset(torch.arange(2), torch.tensor([[11.0, 15.0, 0.0], [20.0, 25.0, 0.0]]), torch.tensor([0.8, 0.0]))
+    kinds = []
+    for _ in range(40):
+        sim.step(torch.tensor([[0.0, 0.8], [0.0, 0.0]]))
+        kinds.append(_frame(sim)["kind"])
+    f = _frame(sim)
+    assert 2.0 in kinds and f["onsets_prop"] >= 1 and f["hard_prop"] == 0.0 and f["onsets_wall"] == 0.0
+    # a 3 m/s rear-end: both cars a car contact, a hard one, the point between them
+    sim = _race()
+    sim.reset(torch.arange(2), torch.tensor([[10.0, 15.0, 0.0], [11.0, 15.0, 0.0]]), torch.tensor([5.0, 2.0]))
+    _fix_bodies(sim)
+    for _ in range(12):
+        r = sim.step(torch.tensor([[0.0, 5.0], [0.0, 2.0]]))
+        if bool(r.car_collision.all()):
+            break
+    for row in (0, 1):
+        f = _frame(sim, row)
+        assert f["kind"] == 3.0 and f["severity"] > 2.5 and (f["onsets_car"], f["hard_car"]) == (1.0, 1.0)
+        assert float(r.state[0, 0]) < f["x"] < float(r.state[1, 0])
