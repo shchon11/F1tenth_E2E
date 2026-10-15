@@ -133,18 +133,33 @@ class ContactSeverityMeter:
         if level is None or imp is None:         # nothing to file (no wall flag, or nothing measured)
             self.steps += 1
             return
-        onset = level & ~(self._wall_prev & ~fresh)
-        self._wall_prev = level.clone()
-        carry = carry_wall_impact(torch.where(fresh, torch.zeros_like(self._pend), self._pend), imp.float(), level)
-        self._pend = after_onset(carry, onset)
-        on_l = onset & lm
+        kinds = getattr(r, "contact_onsets", None)
         prop = self._prop_step
-        self._add("wall_prop", carry, on_l)
-        self._add("prop", carry, on_l & prop)
-        self._add("wall_prop_onset_step", imp, on_l)
-        bc = torch.bucketize(carry, self.edges, right=True)
-        bs = torch.bucketize(imp.float(), self.edges, right=True)
-        self._lifted += ((bc > bs) & on_l).long().sum()
+        if kinds is not None:
+            # The simulator's onsets per kind (`SimParams.wall_latch`): the flag rises on the step of the hit,
+            # so an onset's severity is its own step's impact for its own kind, and a crate hit during a wall
+            # contact is filed as well. `wall_prop` is one per step, as the collision component charges it.
+            ki = r.contact_impacts.float()
+            onset = kinds[:, 0] | kinds[:, 1]
+            self._wall_prev = level.clone()
+            carry = torch.maximum(torch.where(kinds[:, 0], ki[:, 0], torch.zeros_like(ki[:, 0])),
+                                  torch.where(kinds[:, 1], ki[:, 1], torch.zeros_like(ki[:, 1])))
+            on_l = onset & lm
+            self._add("wall_prop", carry, on_l)
+            self._add("prop", ki[:, 1], kinds[:, 1] & lm)
+            self._add("wall_prop_onset_step", carry, on_l)
+        else:
+            onset = level & ~(self._wall_prev & ~fresh)
+            self._wall_prev = level.clone()
+            carry = carry_wall_impact(torch.where(fresh, torch.zeros_like(self._pend), self._pend), imp.float(), level)
+            self._pend = after_onset(carry, onset)
+            on_l = onset & lm
+            self._add("wall_prop", carry, on_l)
+            self._add("prop", carry, on_l & prop)
+            self._add("wall_prop_onset_step", imp, on_l)
+            bc = torch.bucketize(carry, self.edges, right=True)
+            bs = torch.bucketize(imp.float(), self.edges, right=True)
+            self._lifted += ((bc > bs) & on_l).long().sum()
         # physical runs: open while the roll resolved something or the flag is up
         touch = (imp > 0) | level
         closing = self._run_on & (fresh | ~touch)
@@ -160,7 +175,7 @@ class ContactSeverityMeter:
         self._run_prop = torch.where(start, prop, (self._run_prop | prop) & cont)
         self._run_on = touch.clone()
         if self.races and r.car_collision is not None and r.car_impact is not None:
-            c_on = r.car_collision & ~(self._car_prev & ~fresh)
+            c_on = r.car_collision & ~(self._car_prev & ~fresh) if kinds is None else kinds[:, 2]
             self._car_prev = r.car_collision.clone()
             self._add("car", r.car_impact, c_on & lm)
         self._dist += (r.state[:, 3].abs() * lm.float()).sum().double() * self.dt

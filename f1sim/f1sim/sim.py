@@ -79,6 +79,13 @@ class StepResult:
     car_impact: Optional[torch.Tensor] = None      # (B,) car contacts (`car_collision`): the closing speed of the
                                                    # two bodies at the end of the step (`Simulator._car_contacts`).
                                                    # None unless `measure_impacts`, and in a solo run.
+    # Contact onsets per kind (soft contact with `SimParams.wall_latch`, None otherwise): columns wall, prop,
+    # car. A contact of one kind starting while one of another lasts is its own onset -- a crate hit while
+    # the car grinds a hose was no rising edge of the merged flag, so it was never counted or charged.
+    contact_onsets: Optional[torch.Tensor] = None   # (B, 3) bool: the kind's contact began this step
+    contact_impacts: Optional[torch.Tensor] = None  # (B, 3) [m/s] this step's impact per kind: walls and props as
+                                                    # `wall_impact` (split by which owned the contact), cars the
+                                                    # closing speed (`car_impact`, 0 where not measured)
 
 
 def _capturing() -> bool:
@@ -208,6 +215,11 @@ class Simulator:
         self.wall_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         #: Whether the last step ended in wall contact (`wall_latch`'s release hysteresis, see `step`).
         self.wall_engaged = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: [m/s] `wall_impact` split by kind, (B, 2) walls, props: the step's largest speed into whichever
+        #: owned each resolution's contact. In place inside the roll, zeroed before it.
+        self.impact_kind = torch.zeros(num_envs, 2, device=self.device)
+        #: Per kind (wall, prop, car), whether the last step ended in contact: the onsets' memory.
+        self.kind_prev = torch.zeros(num_envs, 3, dtype=torch.bool, device=self.device)
         #: [m/s] This step's wall / prop impact severity: the largest speed into the surface, at the
         #: contact point, of any contact `_resolve_wall_contact` resolved (`StepResult.wall_impact`).
         #: Written in place inside the roll -- a CUDA graph replays writes to this storage, a rebound
@@ -863,6 +875,8 @@ class Simulator:
         self.prop_touched[env_ids] = False
         self.wall_touched[env_ids] = False
         self.wall_engaged[env_ids] = False
+        self.impact_kind[env_ids] = 0.0
+        self.kind_prev[env_ids] = False
         self.wall_impact[env_ids] = 0.0
         self.steps[env_ids] = 0
         self._resample_car_dims(env_ids)
@@ -883,6 +897,7 @@ class Simulator:
                                                      "cmd_hist", "s", "lap", "collided", "steps", "imu_state",
                                                      "cl_idx", "car_collision", "prop_touched",
                                                      "wall_touched", "wall_engaged", "wall_impact",
+                                                     "impact_kind", "kind_prev",
                                                      "_odom_t_prev")}
         odom, t, phase = self.odom.state.clone(), self.t, self._imu_phase
         # The throw-away steps consume randomness from two places, not one: `self.gen` (spawn draws,
@@ -935,6 +950,7 @@ class Simulator:
         # In place, before the roll records into it: this step's impacts and nothing older -- not a
         # warm-up's, not a graph capture's throw-away runs.
         self.wall_impact.zero_()
+        self.impact_kind.zero_()
         state, ax, ay, att, imu_state, imu_samples, i_motor = self._roll(
             self.state, self.ax, self.att, self.imu_state, self.cmd_hist, delay_s, P)
         self._imu_phase = (self._imu_phase + 1) % self.imu_period
@@ -973,12 +989,15 @@ class Simulator:
             # tell from contact; a car that backs a cell away and comes back has two contacts.
             hit = hit | (self.wall_engaged & (wall_dist < self.track.t_res[self.tid]))
             self.wall_engaged.copy_(hit & ~self.absent if self.absent_any else hit)
+        wall_only = hit
+        prop_now = None
         if getattr(self.track, "has_props", False):
             # `_post` reads the occupancy EDT and props are not in it, so without this a car drives
             # through a box: `terminate_on_collision` never fires, and with soft walls the contact is
             # resolved by `_resolve_wall_contact` yet never reported. `prop_touched` also carries the
             # substeps, because a box can be entered and pushed back out inside one control step.
-            hit = hit | self.prop_touched | (self._prop_contact(state)[0] > 0)
+            prop_now = self.prop_touched | (self._prop_contact(state)[0] > 0)
+            hit = hit | prop_now
         self.prop_touched.zero_()          # in place: `warmup` restores by copy_ into this tensor
         if self.absent_any:
             hit = hit & ~self.absent
@@ -1001,6 +1020,22 @@ class Simulator:
                 wall_impact = torch.where(self.absent, torch.zeros_like(wall_impact), wall_impact)
             if car_impact is not None:
                 car_impact = torch.where(self.car_collision, car_impact, torch.zeros_like(car_impact))
+        contact_onsets = contact_impacts = None
+        if self._wall_latch_on():
+            # Onsets per kind. With the wall contact held until the car is a cell clear, a crate touched while
+            # a hose is being scraped is no rising edge of the merged flag; counted per kind it is its own
+            # contact, charged and filed with its own impact.
+            z = torch.zeros_like(wall_only)
+            kinds = torch.stack([wall_only, z if prop_now is None else prop_now,
+                                 self.car_collision if self.M > 1 else z], 1)
+            if self.absent_any:
+                kinds = kinds & ~self.absent[:, None]
+            contact_onsets = kinds & ~self.kind_prev
+            self.kind_prev.copy_(kinds)
+            car_sev = car_impact if car_impact is not None else torch.zeros_like(self.wall_impact)
+            contact_impacts = torch.cat([self.impact_kind, car_sev[:, None].to(self.impact_kind.dtype)], 1)
+            if self.absent_any:
+                contact_impacts = torch.where(self.absent[:, None], torch.zeros_like(contact_impacts), contact_impacts)
         if self.M > 1:
             hit = hit | self.car_collision
         # Latched while a collision ends the episode -- the car is frozen and the flag has to
@@ -1032,7 +1067,7 @@ class Simulator:
                           self.car_collision.clone() if self.M > 1 else None,
                           imu_offsets if self.cfg.imu.enabled else None,
                           odom_t, i_motor if self.wheel_model else None, wall_hit.clone(),
-                          wall_impact, car_impact)
+                          wall_impact, car_impact, contact_onsets, contact_impacts)
 
     def _props_move_in_roll(self) -> bool:
         """`SimParams.prop_relative` with movable props under soft contact: a struck prop is a second body,
@@ -1375,6 +1410,11 @@ class Simulator:
         # is its first resolution. Only read here; in place, so a captured graph keeps recording it.
         self.wall_impact.copy_(torch.maximum(
             self.wall_impact, torch.where(into, -vpn, torch.zeros_like(vpn)).to(self.wall_impact.dtype)))
+        # ... and split by which owned the contact, walls or a prop (`StepResult.contact_impacts`)
+        sev_now = torch.where(into, -vpn, torch.zeros_like(vpn)).to(self.impact_kind.dtype)
+        is_prop = prop_deeper if prop_deeper is not None else torch.zeros_like(into)
+        self.impact_kind.copy_(torch.maximum(self.impact_kind, torch.stack(
+            [torch.where(is_prop, torch.zeros_like(sev_now), sev_now), torch.where(is_prop, sev_now, torch.zeros_like(sev_now))], 1)))
         m_car, Iz = self.P["m"], self.P["Iz"]
         J = (1 + k) * share * bleed * (-vpn) / (1.0 / m_car + pxn * pxn / Iz)       # >= 0 while driving in
         vwx2 = vwx + J / m_car * n[:, 0]

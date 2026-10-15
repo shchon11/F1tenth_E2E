@@ -2668,9 +2668,15 @@ class F1VecEnv:
         `_car_charge` then charges. Returns the onsets both ways for the log."""
         from .contact_severity import after_onset, carry_wall_impact
         v_min = float(self.ecfg.contact_severity_min)
-        carry = carry_wall_impact(self._wall_pending, r.wall_impact, r.wall_collision)
-        self._wall_pending = after_onset(carry, crash)
-        out = {"wall_all": crash, "wall_hard": crash & (carry >= v_min)}
+        if r.contact_onsets is not None:
+            # onsets per kind, each with its own step's impact (the flag rises on the step of the hit)
+            on, imp = r.contact_onsets, r.contact_impacts
+            hard = (on[:, 0] & (imp[:, 0] >= v_min)) | (on[:, 1] & (imp[:, 1] >= v_min))
+            out = {"wall_all": crash, "wall_hard": crash & hard}
+        else:
+            carry = carry_wall_impact(self._wall_pending, r.wall_impact, r.wall_collision)
+            self._wall_pending = after_onset(carry, crash)
+            out = {"wall_all": crash, "wall_hard": crash & (carry >= v_min)}
         if r.car_collision is not None:
             hit = r.car_collision
             onset = hit & ~self._car_sev_prev
@@ -2799,14 +2805,17 @@ class F1VecEnv:
             # latched, but a car scraping a hose is in contact for the measured 40 ms -- sixteen
             # steps of it at 40 Hz -- and a penalty designed as a one-off ending would be paid
             # sixteen times. The rising edge is the impact; the rest is the same impact.
-            edge = r.collision & ~self._was_touching
+            # With the simulator's onsets per kind (`SimParams.wall_latch`) a contact of one kind that
+            # starts during another -- a crate hit while scraping a hose -- is an onset too.
+            on = r.contact_onsets
+            edge = (r.collision & ~self._was_touching) if on is None else on.any(1)
             self._was_touching = r.collision.clone()
             r.collision = edge
             self.ep_contacts += edge.to(self.ep_contacts.dtype)
             if e.collision_counts_cars or r.wall_collision is None:
                 crash = edge
             else:
-                crash = r.wall_collision & ~self._was_touching_wall
+                crash = (r.wall_collision & ~self._was_touching_wall) if on is None else (on[:, 0] | on[:, 1])
                 self._was_touching_wall = r.wall_collision.clone()
         else:
             crash = r.collision

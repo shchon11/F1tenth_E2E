@@ -217,3 +217,24 @@ def test_the_other_car_meets_the_crate_where_it_was_pushed(share):
         assert contacts["old place"] == 0 and contacts["new place"] > 0, contacts
     else:
         assert contacts["old place"] > 0 and contacts["new place"] == 0, contacts
+
+
+def test_a_crate_hit_while_scraping_a_hose_is_its_own_onset():
+    """A car scrapes along the hose into a crate standing against it. The wall contact holds the whole time
+    (the merged flag never drops), so the hit was no rising edge of it and nothing counted or charged it;
+    per kind it is a prop onset with its own 1.8 m/s impact."""
+    sim, po = _prop_scene("wooden_crate")
+    po.p_poses[:, 0] = torch.tensor([12.0, 0.45, 0.0])
+    sim.reset(torch.arange(2), torch.tensor([[10.0, 0.38, -0.08], [20.0, 25.0, 0.0]]), torch.tensor([2.0, 0.0]))
+    flags, on, imp = [], [], []
+    for _ in range(40):
+        r = sim.step(torch.tensor([[0.0, 2.0], [0.0, 0.0]]))
+        flags.append(bool(r.wall_collision[0]))
+        on.append(r.contact_onsets[0].clone())
+        imp.append(r.contact_impacts[0].clone())
+    on, imp = torch.stack(on), torch.stack(imp)
+    assert len(_onsets(flags)) == 1, "the merged flag rose once: the scrape"
+    assert int(on[:, 0].sum()) == 1 and int(on[:, 2].sum()) == 0
+    first_prop = int(torch.nonzero(on[:, 1])[0])
+    assert first_prop > int(torch.nonzero(on[:, 0])[0]) and flags[first_prop - 1], "hit during the scrape"
+    assert float(imp[first_prop, 1]) > 1.5 and float(imp[first_prop, 0]) == 0.0
