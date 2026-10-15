@@ -32,6 +32,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .. import gl_scene as G
+from . import contacts as CT
 from . import theme
 from .frames import FrameBuffer, RateMeter
 from .theme import C
@@ -274,6 +275,9 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self.show_raceline = True
         self.show_trails = True
         self.show_labels = True
+        #: Contact markers at the points the cars touched (`contacts.contact_marks`). The cars' own
+        #: contact colours are not an overlay and stay on.
+        self.show_contacts = True
         self.interpolate = True
         self.paused = False
         #: wall clock at the last camera update, so the chase easing can be expressed in time
@@ -862,24 +866,16 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             S = np.diag([d, w_, zhi - zlo, 1.0]).astype(np.float32)
             mats[i, 6] = M @ tilt @ G.trans([bx, 0.0, 0.5 * (zlo + zhi)]) @ S
 
-        # Same colour vocabulary as the panels: cyan is the car being watched, amber a rival in its
-        # race, red a collision, everything else dimmed so the watched car is findable at a glance.
-        # The watched car is drawn in its true (neutral) colours with a cyan ring on the ground
-        # under it; the rest are dimmed, a rival tinted amber, a collided car red.
-        tint = np.full((n, 4), 0.42, np.float32)
-        tint[:, 3] = 1.0
-        opp = fr.get("opponent")
-        if opp is not None and len(opp) == n:
-            tint[np.asarray(opp, bool)] = (0.95, 0.62, 0.25, 1.0)
-        tint[fr["coll"] > 0.5] = (1.0, 0.35, 0.3, 1.0)
-        if 0 <= f < n:
-            tint[f] = (0.96, 1.0, 1.0, 1.0) if fr["coll"][f] <= 0.5 else tint[f]
-            sc.set_focus_ring(float(fr["x"][f]), float(fr["y"][f]),
-                              colour=(1.0, 0.35, 0.3, 0.9) if fr["coll"][f] > 0.5 else (0.35, 0.9, 1.0, 0.85))
+        tint, ring, rings = self._car_tints(fr, n, f)
+        if ring is not None:
+            sc.set_focus_ring(float(fr["x"][f]), float(fr["y"][f]), colour=ring)
         else:
             sc.set_focus_ring(0.0, 0.0, on=False)
+        sc.set_contact_rings(*(rings or (None, None)), radius=self.CONTACT_RING_M)
         sc.set_car_instances(mats, tint, labels=fr.get("ids") if self.show_labels else None)
         sc.set_dyn_prop_poses(fr.get("props_dyn"))
+        # Where each held contact touched, what it was and how hard (`contacts.contact_marks`).
+        sc.set_contact_marks(CT.contact_marks(fr) if self.show_contacts else None)
 
         # `draw_frame(show_points=...)` renders the point VAO, and that VAO only exists once a
         # frame carrying a scan has allocated it. A session with the LiDAR overlay on but no scan
@@ -921,6 +917,61 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         for buf in (self._cpu_ms, self._gl_ms):
             if len(buf) > 240:
                 del buf[:len(buf) - 240]
+
+    #: The cars' own colours, the same vocabulary as the panels: the watched car in its true (neutral)
+    #: colours with a cyan ring on the ground under it, a rival in its race amber, everything else
+    #: dimmed so the watched car is findable at a glance.
+    TINT_OTHER = (0.42, 0.42, 0.42, 1.0)
+    TINT_RIVAL = (0.95, 0.62, 0.25, 1.0)
+    TINT_FOCUS = (0.96, 1.0, 1.0, 1.0)
+    RING_FOCUS = (0.35, 0.9, 1.0, 0.85)
+    #: A collision flag with no contact block to say what it was (an older worker): the old red.
+    TINT_COLLIDED = (1.0, 0.35, 0.3, 1.0)
+    RING_COLLIDED = (1.0, 0.35, 0.3, 0.9)
+
+    #: [m] the contact ring, just outside the watched car's own (`Scene.set_focus_ring`, 0.34 m): the
+    #: watched car keeps its cyan ring, so which car is watched never changes colour with a contact
+    CONTACT_RING_M = 0.42
+
+    def _car_tints(self, fr: dict, n: int, f: int):
+        """(tint (n, 4) float32, the watched car's ring colour or None, the contact rings as
+        (xy (k, 2), colour (k, 4)) or None) for this frame.
+
+        A car holding a contact (`contacts.car_highlight`) is lit in the colour of what it touched --
+        orange a wall or duct hose, yellow a crate, red another car -- and gets a ring of that colour
+        on the ground, while the simulator holds it (until 0.3 s after the last touch): a flash for a
+        hit, brighter the harder, a steady glow while it keeps touching, a fade once it lets go. The
+        ring is what shows from far away: a tint is mostly lost on a car seen from above, which is the
+        electronics deck. This replaces the red `coll` flag: true only on the steps that end touching
+        something -- one 25 ms frame for a hit that bounces off -- and silent on what was touched. A
+        frame with no contact block (an older worker) still gets that red flag.
+        """
+        tint = np.tile(np.asarray(self.TINT_OTHER, np.float32), (n, 1))
+        opp = fr.get("opponent")
+        if opp is not None and len(opp) == n:
+            tint[np.asarray(opp, bool)] = self.TINT_RIVAL
+        watched = 0 <= f < n
+        if watched:
+            tint[f] = self.TINT_FOCUS
+        ring = np.asarray(self.RING_FOCUS, np.float32) if watched else None
+        rings = None
+        hl = CT.car_highlight(fr)
+        if hl is not None and len(hl[2]) == n:
+            hot, colour, w = hl
+            tint[:, :3] = tint[:, :3] * (1.0 - w[:, None]) + hot * w[:, None]
+            lit = w > 0.0
+            if lit.any():
+                xy = np.stack([np.asarray(fr["x"], np.float32)[:n], np.asarray(fr["y"], np.float32)[:n]], 1)
+                cols = np.concatenate([colour, np.clip(0.25 + w, 0.0, 1.0)[:, None]], 1)
+                rings = (xy[lit], cols[lit])
+        else:
+            coll = fr.get("coll")
+            if coll is not None and len(coll) >= n:
+                hit = np.asarray(coll, np.float32)[:n] > 0.5
+                tint[hit] = self.TINT_COLLIDED
+                if watched and hit[f]:
+                    ring = np.asarray(self.RING_COLLIDED, np.float32)
+        return tint, (tuple(float(v) for v in ring) if ring is not None else None), rings
 
     def _scan_points(self, fr):
         """LiDAR hit points of the focus car, same beam geometry as f1sim.lidar.Lidar.rays."""
@@ -1318,13 +1369,14 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             return None
         sc = self.scene
         saved_target, saved_w, saved_h = sc.target, sc.width, sc.height
-        saved_cam, saved_overlay = self.camera, (self.show_lidar, self.show_raceline, self.show_labels)
+        saved_cam = self.camera
+        saved_overlay = (self.show_lidar, self.show_raceline, self.show_labels, self.show_contacts)
         saved_state = self._capture_state()
         try:
             if camera:
                 self.camera = camera
             if overlays is not None:
-                self.show_lidar = self.show_raceline = self.show_labels = bool(overlays)
+                self.show_lidar = self.show_raceline = self.show_labels = self.show_contacts = bool(overlays)
             sc.target = self._cap_ms or cap
             sc.width, sc.height = w, h
             sc.clear()
@@ -1339,7 +1391,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             return None
         finally:
             self.camera = saved_cam
-            self.show_lidar, self.show_raceline, self.show_labels = saved_overlay
+            self.show_lidar, self.show_raceline, self.show_labels, self.show_contacts = saved_overlay
             self._restore_state(saved_state)
             sc.target, sc.width, sc.height = saved_target, saved_w, saved_h
             try:

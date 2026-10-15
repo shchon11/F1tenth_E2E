@@ -32,6 +32,7 @@ from PyQt5 import QtCore
 
 from . import catalog, protocol as P
 from .catalog import MapCatalog
+from .contacts import ImpactClock
 from .frames import FrameBuffer
 from .protocol import (LatestSlot, SessionConfig, STATE_FAILED, STATE_IDLE, STATE_PAUSED,
                        STATE_PREPARING, STATE_RUNNING, STATE_STOPPING)
@@ -254,6 +255,9 @@ class SessionController(QtCore.QObject):
         self._ctl_reader: Optional[_Reader] = None
         self._frame_reader: Optional[_Reader] = None
         self._frame_slot = LatestSlot(INBOUND_CAPACITY)
+        #: Times each car's held contact on arrival (`contacts.ImpactClock`), so the viewport can fade a
+        #: hit from when it happened rather than from the hold, which every later touch restarts.
+        self._impact_clock = ImpactClock()
 
         self._seq = 0
         self._generation = 0            # allocated here, monotonic, never reused
@@ -971,6 +975,7 @@ class SessionController(QtCore.QObject):
             frame = self._frame_slot.get(timeout=0.0)
             if frame is None:
                 break
+            self._impact_clock.stamp(frame)
             self.buffer.push(frame)
             n += 1
             if n > 64:                 # a runaway producer must not starve the event loop

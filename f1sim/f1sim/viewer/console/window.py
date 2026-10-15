@@ -21,6 +21,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from . import app as _app, catalog, theme
 from ... import tracks
 from .catalog import GROUP_CAVEAT, GROUP_HINT, GROUP_ORDER, MapCatalog, RunInfo, format_age
+from . import contacts as CT
 from .frames import Freshness, INTERP_LAG_FRAMES
 from .opponent_table import OpponentSlotTable
 from .overlays import ActivationPanel, DashPanel, PolicyInputPanel
@@ -96,6 +97,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     retry_requested = QtCore.pyqtSignal()
     close_requested = QtCore.pyqtSignal()
 
+    #: What the 접촉 tile and rows count. The threshold itself is printed on the tile once a frame
+    #: carries it (`contacts.hard_label`): it is the simulator's, the one the evaluation reports use.
+    CONTACT_TIP = ("주시 차량이 이번 에피소드에서 닿은 횟수입니다. 닿기 시작한 순간을 한 번으로, 닿은 것의 종류마다 "
+                   "따로 셉니다 (벽·덕트 호스 / 장애물 / 다른 차).\n'세게'는 부딪힌 속도(닿는 면에 수직인 상대 "
+                   "속도)가 기준 이상인 접촉이며, 기준은 평가 리포트의 '세게'와 같은 값입니다 "
+                   "(contact_severity.HARD_MPS).\n에피소드가 리셋되면 0부터 다시 셉니다.")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # ASCII: some taskbars read X11's legacy Latin-1 `WM_NAME` and mangle a Korean title.
@@ -131,6 +139,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._policy_autofold_done = False
         self._sidebar_autofold_done = False
         self._closing_allowed = False
+        #: The watched car's most recent contact, kept after its marker has faded (`최근 접촉`).
+        self._last_contact = CT.LastContact()
 
         self._build_ui()
         self._install_shortcuts()
@@ -625,7 +635,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         g2.addWidget(FieldRow("길이", self.spin_rec_secs, ""), 0, 1)
         card.add(g2)
 
-        self.chk_rec_overlay = QtWidgets.QCheckBox("오버레이 포함 (LiDAR 점·레이싱 라인·차량 라벨)")
+        self.chk_rec_overlay = QtWidgets.QCheckBox("오버레이 포함 (LiDAR 점·레이싱 라인·차량 라벨·접촉 지점)")
         self.chk_rec_overlay.setChecked(True)
         self.chk_rec_overlay.setToolTip("끄면 주행만 담긴 깨끗한 영상이 됩니다. 화면 표시는 그대로입니다.")
         card.add(self.chk_rec_overlay)
@@ -1073,7 +1083,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         grid.setVerticalSpacing(SP[1])
         self.m_speed = MetricTile("속도", "m/s")
         self.m_lap = MetricTile("랩", "", small=True)
-        self.m_coll = MetricTile("충돌", "대", small=True)
+        # The watched car's contacts this episode, and how many of them were hard: the difference
+        # between "it grazes now and then" and "it hits things" is what this tile is for. The kinds
+        # and the last contact are two rows of `drive_info` below.
+        self.m_coll = MetricTile("접촉", "회", small=True, tooltip=self.CONTACT_TIP)
         self.m_wall = MetricTile("가장 가까운 벽", "m", small=True)
         grid.addWidget(self.m_speed, 0, 0)
         grid.addWidget(self.m_lap, 0, 1)
@@ -1085,6 +1098,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.drive_info.set("조향", "—")
         self.drive_info.set("자세 roll/pitch", "—")
         self.drive_info.set("랩 진행", "—")
+        self.drive_info.set("접촉 종류", "—", tooltip=self.CONTACT_TIP)
+        self.drive_info.set("최근 접촉", "—",
+                            tooltip="주시 차량이 마지막으로 닿은 것과 그 속도(닿는 면에 수직인 상대 속도). "
+                                    "표시가 사라진 뒤에도 다음 접촉까지 남아 있습니다.")
         self.drive_info.set("시뮬 참값 μ", "—",
                             tooltip="시뮬레이터가 이 차에 실제로 적용한 마찰계수입니다. 정책이 "
                                     "관측할 수 없는 값이며, 추정치가 아니라 참값입니다.")
@@ -1187,7 +1204,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.chk_raceline.setChecked(True)
         self.chk_labels = QtWidgets.QCheckBox("차량 번호")
         self.chk_labels.setChecked(True)
-        for w in (self.chk_lidar, self.chk_plan, self.chk_trails, self.chk_raceline, self.chk_labels):
+        self.chk_contacts = QtWidgets.QCheckBox("접촉 지점")
+        self.chk_contacts.setChecked(True)
+        self.chk_contacts.setToolTip(
+            "차가 닿은 자리에 표시가 뜹니다. 색은 닿은 것: 주황 = 벽·덕트 호스, 노랑 = 장애물, 빨강 = 다른 차.\n"
+            "크고 밝을수록 세게 부딪힌 것이고(작고 흐리면 스친 것), 바깥 고리가 하나 더 있으면 '세게'로 "
+            "센 접촉입니다.\n부딪힌 표시는 0.3초 동안 퍼지며 사라지고, 계속 닿아 있는 동안에는 지금 닿은 "
+            "자리에 작은 표시가 남습니다. 차 자체도 같은 색으로 빛나고 바닥에 같은 색 고리가 생깁니다 "
+            "(이 둘은 끄지 않습니다).")
+        for w in (self.chk_lidar, self.chk_plan, self.chk_trails, self.chk_raceline, self.chk_labels,
+                  self.chk_contacts):
             show.add(w)
             w.toggled.connect(self._apply_local_overlays)
         v.addWidget(show)
@@ -1589,8 +1615,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 mu = frame.get("mu")
                 self.drive_info.set("시뮬 참값 μ", f"{float(mu):.3f}" if mu is not None else "—")
                 self.drive_info.set("추정 μ", self.dash_panel.grip_status)
-            crashed = int((frame["coll"] > 0.5).sum()) if frame.get("coll") is not None else 0
-            self.m_coll.set_value(f"{crashed} / {n}", C["danger"] if crashed else None)
+            self._update_contacts(frame, f, n)
 
         self.m_simrate.set_value(f"{sim_rate:5.2f}" if sim_rate is not None else "—",
                                  None if sim_rate is None or sim_rate > 0.9 else C["warn"])
@@ -1645,6 +1670,34 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         elif self.state == STATE_RUNNING:
             self.viewport.set_badge("")
         self._update_health(fresh, stats)
+
+    def _update_contacts(self, frame: dict, f: int, n: int) -> None:
+        """The 접촉 tile and its two rows, for the watched car (`contacts.focus_summary`).
+
+        Red once any contact of the episode was hard, amber while all of them were grazes: the
+        question is whether the car hits things, not whether it ever touches one. A frame with no
+        contact block (an older worker) gets the old count of cars flagged this frame.
+        """
+        s = CT.focus_summary(frame, f) if 0 <= f < n else None
+        ids = frame.get("ids")
+        try:
+            car = int(ids[f]) if ids is not None and 0 <= f < len(ids) else f
+        except (TypeError, ValueError):
+            car = f
+        self._last_contact.update((self.generation, car), s)
+        if s is None:
+            crashed = int((frame["coll"] > 0.5).sum()) if frame.get("coll") is not None else 0
+            self.m_coll.name_label.setText("충돌")
+            self.m_coll.unit.setText("대")
+            self.m_coll.set_value(f"{crashed} / {n}", C["danger"] if crashed else None)
+            self.drive_info.set("접촉 종류", "—")
+            self.drive_info.set("최근 접촉", "—")
+            return
+        self.m_coll.name_label.setText(f"접촉 · {CT.hard_label(s.hard_mps)}")
+        self.m_coll.unit.setText("회")
+        self.m_coll.set_value(CT.tile_text(s), {"hard": C["danger"], "graze": C["warn"]}.get(s.level))
+        self.drive_info.set("접촉 종류", CT.breakdown_html(s))
+        self.drive_info.set("최근 접촉", self._last_contact.text(frame.get("t")))
 
     def _update_health(self, fresh: Freshness, stats: dict):
         """One line that says whether the folded diagnostics are worth opening."""
@@ -2344,6 +2397,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v.show_trails = self.chk_trails.isChecked()
         v.show_raceline = self.chk_raceline.isChecked()
         v.show_labels = self.chk_labels.isChecked()
+        v.show_contacts = self.chk_contacts.isChecked()
         if not self.chk_plan.isChecked():
             v.plan = v.plan_pred = None
         v.update()

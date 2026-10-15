@@ -28,6 +28,7 @@ the matching `CLEAR_RGB` / `HORIZON_RGB` / `ZENITH_RGB`).
 | `primary` / `primary.line` | `#3d6f0b` / `#76b900` | the start button and the running badge only |
 | `ego` | `#59e6ff` | the watched car: ring in the scene, marker in the policy panel |
 | `rival` / `warn` / `danger` | `#f2a044` / `#f0a030` / `#ff5c5c` | a rival car and commanded values; preparing; collision and over-cap |
+| `contact.wall` / `.prop` / `.car` | `#ff7a1a` / `#ffd426` / `#ff3344` | what a car touched: a wall or duct hose, a crate, another car (marker, car flash, panel names) |
 
 Type: body 12 px, labels 11 px, section headings 11 px with letter-spacing, metrics in
 `DejaVu Sans Mono`. Radii 3 px on controls, 4 px on cards. Header 44 px.
@@ -40,7 +41,8 @@ Type: body 12 px, labels 11 px, section headings 11 px with letter-spacing, metr
 | ground | light grey plate, 1 m lattice only | asphalt-toned apron (`0.135`) that dissolves into a backdrop disc of the same tone; 1 m and 5 m lattices, each fading with pixel footprint |
 | duct barriers | mirror-like, ±26 % corrugation bands | satin (`metal` = 48 / 0.55), ±11 % bands |
 | lighting | grey hemisphere, single key | cool sky ambient + warm ground bounce, warm key, fresnel rim |
-| cars | tint multiplied a blue-grey paint so every car was teal | neutral paint; ego drawn true-colour with a cyan ring on the ground, rival amber, collided red, others dimmed |
+| cars | tint multiplied a blue-grey paint so every car was teal | neutral paint; ego drawn true-colour with a cyan ring on the ground, rival amber, others dimmed; a car in contact flashes in the contact's colour with a second ring of it on the ground |
+| contacts | the car red for the one 25 ms frame its `coll` flag was up | a marker at the contact point, coloured by what was touched and sized by how hard (see *Contacts* below) |
 | plan | 6 px wire | 0.11 m translucent ribbon + 2.5 px core, speed-coloured; tracker prediction stays a thin line |
 | LiDAR | hard 22 px discs, saturated | 12 px soft discs, by hit type (duct amber, tall object magenta, floor teal, car yellow) |
 | trails | constant alpha | fade out behind the car |
@@ -270,6 +272,35 @@ Three rules now:
 The two-series charts (student vs teacher) exist because a DAgger student's 52 coll/km is a disaster
 against a teacher at 7 and ordinary against a teacher at 48, and the student's own curve does not
 say which.
+
+## Contacts (2026-10-15)
+
+The user judges a policy by watching it, and a contact was the red `coll` flag: up only on the steps
+that end touching something (one frame for a hit that bounces off), the same for a hose, a crate and
+a car, with no place, no size and no count. The simulator records each car's contacts now
+(`Simulator.contact_frame`, frame key `contact`); `viewer/console/contacts.py` turns that into:
+
+* **a marker where it hit**, in the kind's colour, its size and brightness growing with the impact
+  speed (a graze small and faint, full size at 1.5 m/s), a second ring when the contact counts as hard
+  (the simulator's `hard_mps`, the evaluation's threshold). Sized in metres, never below 8–32 px on
+  screen, so 전체보기 of a large circuit still shows it; drawn over everything, so a contact under a
+  car's nose shows from behind. It fades and its ring spreads over 0.3 s **from the hit** — timed on
+  arrival (`ImpactClock`), not by the simulator's hold, which every later touch restarts: by the hold,
+  a hit followed by a long push stood where the hit had been, up to 2.5 m behind the cars, for as long
+  as they pushed (43 s on one ICCAS self-play race).
+* **a marker where it touches now**, while it touches: small and faint for a resting push or scrape,
+  so a lasting contact is drawn where it is. The two cars of a car-car contact draw one of each.
+* **the car flashing** in the same colour — a flash for a hit, a steady glow while it keeps touching,
+  a fade once it lets go — with a ring of it on the ground just outside the watched car's cyan ring,
+  which keeps its colour. `표시 › 접촉 지점` hides the markers; the flash stays.
+* **the 접촉 tile** for the watched car: the episode's contacts and how many were hard
+  (`접촉 · 세게 ≥1.0 m/s  5 · 세게 1`), red once any was hard, amber while all were grazes; rows
+  for the count per kind (each name in its marker colour, which makes the panel the legend) and the
+  last contact's kind and speed, kept after the marker has gone.
+
+Frame interpolation blends poses only; the contact block is the newer frame's and is never blended,
+so a marker never slides between two contacts or doubles, and the fade runs on to the drawn time
+(`t_frame`) instead of stepping at frame boundaries.
 
 ## Verification
 

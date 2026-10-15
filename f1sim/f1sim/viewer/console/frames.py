@@ -393,6 +393,11 @@ class FrameBuffer:
             dyaw = (f1["yaw"] - f0["yaw"] + math.pi) % (2 * math.pi) - math.pi
             out["yaw"] = f0["yaw"] + dyaw * a
         out["t"] = self._play_t
+        # Everything not blended above -- the contact block among it -- is f1's, and stays f1's: a
+        # contact point is an event, and blending two frames' points would slide a marker between
+        # two different contacts. What a reader may need is the time those values belong to, so a
+        # countdown in them (the contact hold) can run on smoothly to the drawn time.
+        out["t_frame"] = f1["t"]
         return out
 
     def freeze(self) -> None:
