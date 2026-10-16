@@ -216,3 +216,25 @@ identical after stripping (seed 77, all six scenarios, same GPU).
 
 The best all-round point so far: seven more car contacts than the safest over 16 races, but 0.42 s a lap faster,
 4.7× fewer prop contacts, and the fewest contacts against unseen learned opponents (15 over 4 races vs 29 / 43).
+
+## Fixed-physics ICCAS policies (added 2026-10-16)
+
+`iccas_bootcamp_safe.pt` trained on in the fixed contact physics (main 0cc3151: car-car impulses, shared props, every
+wall contact counted). Only impacts at >= 1.5 m/s were charged, with annealed lagrange targets, no KL, and the contK
+recipe otherwise (`pipeline/v1fix.sh`). The checkpoints are full: actor, critic, `meta` and `extra`.
+
+| file | what it is | sha256 (first 16) |
+| --- | --- | --- |
+| `iccas_fixphys_s1102_u384.pt` | `v1fix_s1102`, update 384: the balanced one | `09ac138b10b77589` |
+| `iccas_fixphys_s1101_u448.pt` | `v1fix_s1101` u384 + 64 more updates: the fastest one | `69d1272633ae7763` |
+
+**8-seed noise protocol** (seeds 81-88 x 4 planners, race of 2, props on the line, ICCAS, 126-134 km each). "Hard" means
+an impact at >= 1.5 m/s normal speed.
+
+| policy | race speed | hard walls+props /km | hard cars /km | ICCAS solo lap (128 trials) |
+| --- | ---: | ---: | ---: | ---: |
+| `iccas_bootcamp_safe` | 4.10 m/s | 0.93 | 1.21 | 8.59 s |
+| `iccas_fixphys_s1102_u384` | 4.23 m/s | 0.75 | 0.88 | 8.46 s |
+| `iccas_fixphys_s1101_u448` | 4.37 m/s | 1.45 | 1.72 | 8.31 s |
+
+s1102 u384 is faster than safe and hits hard less often. s1101 u448 is the fastest, at more hard hits.
