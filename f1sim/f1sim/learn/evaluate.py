@@ -109,6 +109,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              raceline_objective: str | None = None, teacher_limits: dict | None = None,
+             ego_teacher_limits: dict | None = None,
              speed_mode: str | None = None, dial_offset: float = 0.0, speed_command: str | None = None,
              opp_slots="", opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              opp_reactive_probs: dict | None = None,
@@ -211,6 +212,15 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     want_rls = teacher or (race_size > 1 and opponent == "teacher") or \
         bool(slots and any(opp_sl.kind_of(sl.kind).teacher for sl in slots))
     trs, rls = common.load_tracks(tracks, racelines=want_rls, **rl_kw)
+    # A planner driving the ego car may be tuned for pace on its own line (its global planner's ax/ay)
+    # while the opponents keep the protocol's line, so the race it is scored in is the one our
+    # policies are scored in. Unset: the ego teacher drives the protocol's line, as always.
+    ego_rls, ego_limits = rls, limits
+    if teacher and ego_teacher_limits:
+        ego_limits = dict(ego_teacher_limits)
+        ego_kw = {k: v for k, v in rl_kw.items() if k not in ("a_lat", "a_acc", "a_brake")}
+        ego_kw.update(ego_limits)
+        _, ego_rls = common.load_tracks(tracks, racelines=True, **ego_kw)
     model = None
     metadata = {}
     policy_checkpoint = {}
@@ -379,7 +389,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         from ..params import VehicleParams
         policy = _ma.external_policy(driver, spec, float(VehicleParams().s_max))
     elif teacher:
-        teacher_policy = common.make_teacher(rls, env, grip=teacher_grip, recover_time=teacher_recover_time, **limits)
+        teacher_policy = common.make_teacher(ego_rls, env, grip=teacher_grip, recover_time=teacher_recover_time,
+                                             **ego_limits)
         teacher_policy.speed_scale = float(teacher_speed)
         if teacher_kind == "interactive":
             from ..interactive_teacher import InteractiveTeacher, TeacherCost
@@ -490,6 +501,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'seeds': {'numpy': seed, 'torch': seed, 'simulator': seed, 'reset': seed if protocol == 'trials' else None},
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
         'raceline_objective': raceline_objective or 'min_curvature', 'teacher_limits': limits,
+        'ego_teacher_limits': (ego_limits if teacher and ego_teacher_limits else None),
         'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset),
         # the format the other cars planned in (None: the policy's own); league seats plan in their own
         'opponent_speed_mode': env.ecfg.opponent_speed_mode,
@@ -636,6 +648,9 @@ def main() -> None:
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of the teacher's speed profile")
     ap.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] drive limit of the profile")
     ap.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] braking limit of the profile")
+    ap.add_argument("--ego-teacher-limits", default="", metavar="A_LAT,A_ACC,A_BRAKE",
+                    help="with --teacher: the ego planner's own line and profile, the opponents keeping "
+                         "the --teacher-a-* line (a planner baseline tuned for pace in the same race)")
     ap.add_argument("--speed-command-tau", type=float, default=None,
                     help="[s] low-pass on a 'profile' speed command (EnvConfig.speed_command_tau)")
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
@@ -774,6 +789,8 @@ def main() -> None:
                         raceline_objective=a.raceline_objective, speed_mode=a.speed_mode, dial_offset=a.dial_offset,
                         speed_command=a.speed_command,
                         teacher_limits=common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake),
+                        ego_teacher_limits=(common.teacher_limits(*(float(x) for x in a.ego_teacher_limits.split(",")))
+                                            if a.ego_teacher_limits else None),
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,
