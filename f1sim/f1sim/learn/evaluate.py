@@ -701,7 +701,7 @@ def main() -> None:
                          "the numbers of every evaluation before it")
     ap.add_argument("--output", type=Path, help="write the complete strict JSON report")
     ap.add_argument("--eager", action="store_true", help="disable simulator compilation (CPU smoke tests)")
-    ap.add_argument("--external-kind", default="", choices=["", "tinylidarnet", "end2race"],
+    ap.add_argument("--external-kind", default="", choices=["", "tinylidarnet", "end2race", "ftg", "disparity"],
                     help="evaluate a published baseline (f1sim.learn.baselines) instead of a "
                          "checkpoint: it drives (steer, speed) directly and wears no controller arm")
     ap.add_argument("--external-weights", default="")

@@ -32,7 +32,7 @@ EXTERNAL_ARM = "none"
 
 #: Baselines `f1sim.learn.baselines.load` knows. Restated rather than imported so that verifying a
 #: roster does not drag in onnxruntime/torch backends; `load_actor` is where the real load happens.
-EXTERNAL_KINDS = ("tinylidarnet", "end2race")
+EXTERNAL_KINDS = ("tinylidarnet", "end2race", "ftg", "disparity")
 
 ARMS = tuple(a for a in _RUNTIME_ARMS if not split_arm(a)[0] == "oracle")
 

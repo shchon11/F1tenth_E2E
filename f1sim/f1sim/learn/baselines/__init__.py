@@ -10,13 +10,17 @@ The vendored upstream checkouts live under `external/baselines/` and are read-on
                  NO LICENCE FILE -- evaluation and citation only.
   End2Race       michigan-traffic-lab/End2Race @ c563dd07a8cefc978f88a09def82153469b6879c
                  (2025-11-12), MIT.
+
+The reactive classics (`reactive.py`, 2026-10-17) need no weights: `ftg` is ForzaETH's Follow-the-Gap
+(race_stack @ e7d07f7, MIT, vendored under `external/baselines/forzaeth_ftg/`), `disparity` the
+Disparity Extender built from its authors' description. Their `weights` argument names nothing.
 """
 from __future__ import annotations
 
 from .common import (BaselineDriver, BaselineError, OUR_FOV, OUR_N_BEAMS, ScanContract,  # noqa: F401
                      map_scan, scan_is_identity, unseen_fraction)
 
-KINDS = ("tinylidarnet", "end2race")
+KINDS = ("tinylidarnet", "end2race", "ftg", "disparity")
 
 
 def load(kind: str, weights: str, **opts) -> BaselineDriver:
@@ -28,4 +32,10 @@ def load(kind: str, weights: str, **opts) -> BaselineDriver:
     if k == "end2race":
         from . import end2race
         return end2race.load(weights, **opts)
+    if k == "ftg":
+        from . import reactive
+        return reactive.load_ftg(weights, **opts)
+    if k == "disparity":
+        from . import reactive
+        return reactive.load_disparity(weights, **opts)
     raise BaselineError(f"unknown baseline kind {kind!r}; known: {', '.join(KINDS)}")
