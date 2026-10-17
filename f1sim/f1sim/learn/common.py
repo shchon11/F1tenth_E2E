@@ -306,7 +306,32 @@ def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg:
     if opponent_pool and env.pool_paths:
         from .opponent_pool import attach     # local: that module imports this one for the obs spec
         attach(env, device=env.device)
+    if getattr(env, "external_slot_rows", None):
+        env.set_external_drivers(external_drivers(env))
     return env
+
+
+def external_drivers(env) -> dict:
+    """grid slot -> a `learn.baselines` driver for every external slot of `env.slots`, bound to the
+    simulator's own scanner (its beam count, field of view and range), as `baseline_node` binds to
+    the car's `LaserScan`. End2Race's repo is the vendored checkout next to this one unless the slot
+    names another."""
+    import os as _os
+    from . import baselines
+    lid = env.cfg.lidar
+    out = {}
+    for i, sl in enumerate(env.slots, start=1):
+        if not sl.external_driven:
+            continue
+        opts = dict(sl.options or {})
+        if sl.driver.external == "end2race":
+            opts.setdefault("repo", _os.path.join(_os.path.dirname(__file__), "..", "..", "..",
+                                                  "external", "baselines", "End2Race"))
+            opts.setdefault("device", "cpu")
+        drv = baselines.load(sl.driver.external, sl.weights or "none", **opts)
+        drv.bind_scanner(n_beams=int(lid.n_beams), fov=float(lid.fov), range_max=float(lid.range_max))
+        out[i] = drv
+    return out
 
 
 def student_policy(model, env: F1VecEnv, device=None, deterministic: bool = True, dial=None):
@@ -564,3 +589,69 @@ def rollout_metrics(env: F1VecEnv, policy_fn, steps: int, speed_cap: Optional[fl
         out["collisions_per_km_p90"] = float(np.nanpercentile(rate, 90)) if np.isfinite(rate).any() else float("nan")
         out["worst_track_index"] = int(np.nanargmax(rate)) if np.isfinite(rate).any() else -1
     return out
+
+
+#: Kinds that may drive the ego car in place of a checkpoint (the console's "내 차", 2026-10-17).
+EGO_PLANNER_KINDS = ("raceline", "forzaeth", "forzaeth_pred", "lane_switch")
+EGO_EXTERNAL_KINDS = ("tinylidarnet", "end2race", "ftg", "disparity")
+
+
+class PlannerEgoDriver:
+    """A planner driving the ego rows on its OWN path follower (steer, speed), as
+    `evaluate --teacher --action-mode direct` drives it, with ground-truth pose and the other cars'
+    true state -- privileged, which is how the modular baselines are measured here. Its TRAILING state
+    gets the env's follow cap, the gap every teacher-driven opponent keeps (`F1VecEnv.follow_cap`).
+    Used through `F1VecEnv.set_ego_driver`, which calls `command_env` every step."""
+
+    needs_speed = False
+
+    def __init__(self, teacher, kind: str):
+        self.teacher, self.kind = teacher, kind
+        self.rows = None
+
+    def command_env(self, env, rows):
+        import torch
+        cmd = self.teacher(env.sim.state, env.sim.P, env.sim.tid)[rows].clone()
+        follow, v_cap = env.follow_cap(env.sim.state)
+        cmd[:, 1] = torch.where(follow[rows], torch.minimum(cmd[:, 1], v_cap[rows]), cmd[:, 1])
+        return cmd
+
+    def reset(self, mask) -> None:
+        fn = getattr(self.teacher, "reset_rows", None)
+        if fn is not None and self.rows is not None:
+            import torch
+            ids = self.rows[torch.as_tensor(mask, device=self.rows.device)]
+            if ids.numel():
+                fn(ids)
+
+    def describe(self) -> dict:
+        return {"kind": self.kind, "driver": type(self.teacher).__name__, "privileged": "ground-truth pose + opponents"}
+
+
+def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] = None, rls=None,
+                     limits: Optional[dict] = None):
+    """The ego driver the console's "내 차" names: a `PlannerEgoDriver` over our raceline teacher (wrapped
+    in the published planner's class for forzaeth / forzaeth_pred / lane_switch, as the opponents
+    are), or a `learn.baselines` driver bound to the simulator's scanner. `rls` is the line a planner
+    drives (with `limits` its own profile); `options` are the baseline's own (`baselines.load`)."""
+    import os as _os
+    if kind in EGO_PLANNER_KINDS:
+        if not rls:
+            raise ValueError(f"ego '{kind}' drives a raceline, and this session has none")
+        base = make_teacher(rls, env, grip="true", **(limits or {}))
+        if kind != "raceline":
+            from ..opponent_slots import build_teacher, kind_of
+            base = build_teacher(kind_of(kind), base, env)
+        return PlannerEgoDriver(base, kind)
+    if kind in EGO_EXTERNAL_KINDS:
+        from . import baselines
+        opts = dict(options or {})
+        if kind == "end2race":
+            opts.setdefault("repo", _os.path.join(_os.path.dirname(__file__), "..", "..", "..",
+                                                  "external", "baselines", "End2Race"))
+            opts.setdefault("device", "cpu")
+        drv = baselines.load(kind, weights or "none", **opts)
+        lid = env.cfg.lidar
+        drv.bind_scanner(n_beams=int(lid.n_beams), fov=float(lid.fov), range_max=float(lid.range_max))
+        return drv
+    raise ValueError(f"unknown ego driver {kind!r}: policy, {', '.join(EGO_PLANNER_KINDS + EGO_EXTERNAL_KINDS)}")

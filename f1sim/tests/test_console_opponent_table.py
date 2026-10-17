@@ -320,3 +320,33 @@ def test_the_jobs_card_lists_one_line_per_slot(qapp):
     rows = dict(s.lines())
     assert "상대차" in rows and "raceline" in rows["상대차"]
     assert len(s.slot_lines) == 2
+
+
+# ================================================================ external baselines (2026-10-17)
+def _row0(table):
+    table.set_count(1)
+    return table.rows[0] if hasattr(table, "rows") else table._rows[0]
+
+
+def test_an_external_reactive_driver_carries_its_pace_option(table):
+    row = _row0(table)
+    row.kind.setCurrentIndex(row.kind.findData("ftg"))
+    assert row.pace.isEnabled() and not row.ckpt.isEnabled()
+    row.pace.setValue(8.0)
+    s = row.slot()
+    assert s.kind == "ftg" and s.options == {"max_speed": 8.0} and s.weights is None
+    assert row.checkpoint_problem() == ""
+
+
+def test_a_network_baseline_needs_its_weights_file(table, tmp_path):
+    row = _row0(table)
+    row.kind.setCurrentIndex(row.kind.findData("tinylidarnet"))
+    assert row.ckpt.isEnabled() and not row.pace.isEnabled()
+    assert "가중치" in row.checkpoint_problem()
+    w = tmp_path / "tln.pt"; w.write_bytes(b"x")
+    row._weights_path = str(w); row._on_kind()
+    s = row.slot()
+    assert s.weights == str(w) and row.checkpoint_problem() == ""
+    other = _row0(table)
+    other.set_slot(s)
+    assert other.slot() == s

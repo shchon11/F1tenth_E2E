@@ -1005,6 +1005,9 @@ class F1VecEnv:
         #: a *race* flag; these are per car, and slot 0 is in neither.
         self.teacher_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self.pool_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self.external_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self.external_slot_rows: Dict[int, torch.Tensor] = {}
+        self.external_drivers: Dict[int, object] = {}        # set_external_drivers()
         if self.M > 1 and e.opponent == "teacher":
             self.teacher_driven[self.slot > 0] = True
         if self.slots is not None:
@@ -1371,6 +1374,13 @@ class F1VecEnv:
         self.opp_driver = self.slot_driver_of[self.slot].clone()
         self.teacher_driven = (self.opp_driver == OPP_DRIVER_TEACHER) & (self.slot > 0)
         self.pool_driven = self.opp_driver >= OPP_DRIVER_POOL
+        #: Slots driven by a published baseline from the car's own sensors (`DriverKind.external`):
+        #: grid slot -> its rows. The drivers themselves come from `set_external_drivers`.
+        self.external_slot_rows = {i: torch.nonzero(self.slot == i).flatten()
+                                   for i, sl in enumerate(self.slots, start=1) if sl.external_driven}
+        self.external_driven = torch.zeros(self.B, dtype=torch.bool, device=dev)
+        for rows in self.external_slot_rows.values():
+            self.external_driven[rows] = True
         self.on_policy = self.learner.clone()
         self.slot_scale_lo, self.slot_scale_hi = t(lo)[self.slot], t(hi)[self.slot]
         self.slot_cap = t(cap)[self.slot]
@@ -1790,6 +1800,55 @@ class F1VecEnv:
             self.events.corners = raceline_corners(teacher, self.ecfg.opp_corner_kappa,
                                                    self.ecfg.opp_corner_min_arc,
                                                    self.ecfg.opp_corner_smooth)
+
+    def set_external_drivers(self, drivers: Dict[int, object]) -> None:
+        """The published baselines that drive the `external` slots: grid slot -> a
+        `learn.baselines.BaselineDriver`, already bound to this car's scanner. Injected, like the pool,
+        because building one imports `learn`, which sits above the env."""
+        missing = sorted(set(self.external_slot_rows) - set(drivers))
+        if missing:
+            raise ValueError(f"external slot(s) {missing} have no driver")
+        self.external_drivers = dict(drivers)
+
+    def set_ego_driver(self, driver) -> None:
+        """A published driver for the ego car of every race (slot 0) in place of the caller's action
+        (the console's "내 차", 2026-10-17). The same override as an external opponent: its command
+        replaces the row's after the tracker, and the other cars predict it at constant velocity. A
+        planner (`learn.common.PlannerEgoDriver`) is asked through `command_env(env, rows)`; a sensor
+        baseline through its scan and speed."""
+        rows = torch.nonzero(self.slot == 0).flatten()
+        self.external_slot_rows[0] = rows
+        self.external_drivers[0] = driver
+        self.external_driven[rows] = True
+        if hasattr(driver, "rows"):
+            driver.rows = rows
+
+    def _external_commands(self, cmd: torch.Tensor) -> torch.Tensor:
+        """Each external slot's (steer, speed) from its cars' own raw scans and odometry speed, in
+        place of whatever the tracker or the caller's action made of those rows. The scan is the
+        one the policy's observation was built from this step (`last_result`), saturated at the
+        scanner's range as on the car; steering is clamped to the lock and the speed to the car's cap.
+        One host round trip per step: these drivers are numpy / CPU models, exactly as on the car."""
+        lr = self.last_result
+        if lr is None:
+            return cmd
+        rmax = float(self.cfg.lidar.range_max)
+        for i, rows in self.external_slot_rows.items():
+            drv = self.external_drivers[i]
+            if hasattr(drv, "command_env"):                  # a planner: privileged state, not a scan
+                c = drv.command_env(self, rows).to(cmd.dtype)
+                steer = c[:, 0].clamp(-float(self.s_max), float(self.s_max))
+                speed = torch.minimum(c[:, 1], self.speed_cap[rows].to(cmd.dtype))
+                cmd = cmd.index_copy(0, rows, torch.stack([steer, speed], 1))
+                continue
+            rng = torch.nan_to_num(lr.scan[rows].float(), nan=rmax, posinf=rmax, neginf=0.0).clamp(0.0, rmax)
+            v = lr.odom[rows, 3].float() if drv.needs_speed else None
+            c = drv.command(drv.adapt(rng.cpu().numpy()), None if v is None else v.cpu().numpy())
+            c = torch.as_tensor(c, dtype=cmd.dtype, device=cmd.device)
+            steer = c[:, 0].clamp(-float(self.s_max), float(self.s_max))
+            speed = torch.minimum(c[:, 1], self.speed_cap[rows].to(cmd.dtype))
+            cmd = cmd.index_copy(0, rows, torch.stack([steer, speed], 1))
+        return cmd
 
     def set_opponent_pool(self, pool):
         """Population that drives the opponent cars (opponent == "pool").
@@ -2298,6 +2357,12 @@ class F1VecEnv:
             # A pool checkpoint may carry memory: a hidden state kept across a respawn is a policy
             # remembering a track its car is no longer on.
             self.pool.reset(ids)
+        for i, drv in self.external_drivers.items():
+            # End2Race is a GRU: the same reasoning, per external slot's own rows.
+            rows = self.external_slot_rows[i]
+            hit = torch.isin(rows, ids)
+            if bool(hit.any()):
+                drv.reset(hit.cpu().numpy())
         self._was_touching[ids] = False                             # a fresh car is touching nothing
         self._was_touching_wall[ids] = False
         self._car_prev[ids] = False; self._car_resp[ids] = False
@@ -2786,6 +2851,8 @@ class F1VecEnv:
             # car. Before the external override on purpose -- a teleoperated or ROS-driven car is
             # the mux output, which the node does not shape either.
             cmd = self.cmd_shaper(cmd)
+        if self.external_drivers:
+            cmd = self._external_commands(cmd)
         if self._ext_ids:
             cmd = torch.where(self.ext_mask[:, None], self.ext_cmd, cmd)
         steer_norm = cmd[:, 0] / self.s_max
@@ -3672,13 +3739,19 @@ class F1VecEnv:
         out = st[:, None, :2] + vw[:, None, :] * t[None, :, None]          # constant velocity
         if mode == "constv" or self.M == 1:
             return out
+        cv = out
+        # A car an external baseline drives (`external_driven`) has a tracker row too, solving the
+        # caller's placeholder action -- a phantom plan nothing executes. Its honest prediction is the
+        # constant-velocity floor, which is what every other model falls back to for a car it cannot read.
+        ext = self.external_driven if bool(self.external_drivers) else None
+        keep = (lambda res: res if ext is None else torch.where(ext[:, None, None], cv, res))
         pred = self._tracker_future(st, t)
         if mode == "pred":
-            return out if pred is None else pred
+            return keep(out if pred is None else pred)
         if mode == "hybrid":
             seam = self._tracker_seam()
             if pred is None or seam is None or self.teacher is None:
-                return out if pred is None else pred
+                return keep(out if pred is None else pred)
             # Both models evaluated at the requested times AND at the seam, so the tail can be
             # attached to the tracker's own endpoint rather than to the walk's -- otherwise the
             # prediction would jump by the walk's error at the join, which is the error the tracker
@@ -3686,13 +3759,13 @@ class F1VecEnv:
             tt = torch.cat([t, t.new_full((1,), seam)])
             pa, wa = self._tracker_future(st, tt), self._raceline_future(st, tt)
             late = (t > seam)[None, :, None]
-            return torch.where(late, pa[:, -1:] + (wa[:, :-1] - wa[:, -1:]), pa[:, :-1])
+            return keep(torch.where(late, pa[:, -1:] + (wa[:, :-1] - wa[:, -1:]), pa[:, :-1]))
         if self.teacher is not None and bool(self.teacher_driven.any()):
             walk = self._raceline_future(st, t)
             out = torch.where(self.teacher_driven[:, None, None], walk, out)
         if pred is not None:
             out = torch.where((~self.teacher_driven)[:, None, None], pred, out)
-        return out
+        return keep(out)
 
     def _tracker_seam(self) -> Optional[float]:
         """[s from now] the last instant the plan tracker's own rollout reaches, or None without one.

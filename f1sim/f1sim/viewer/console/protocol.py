@@ -137,6 +137,16 @@ class SessionConfig:
     #: driving page and the training page share one widget, and a session saved here can be pasted
     #: into a training command. None = no table, and `opponent` above decides instead.
     opponent_slots: Optional[List[Dict[str, Any]]] = None
+    #: Who drives the ego car of every race (2026-10-17). "policy" is the checkpoint `run`. Any other
+    #: kind is a published driver whose (steer, speed) replaces the policy's after the tracker -- the
+    #: checkpoint then only sets the observation contract and the overlays: a planner ("raceline",
+    #: "forzaeth", "forzaeth_pred", "lane_switch") on its own path follower with ground-truth pose,
+    #: or a sensor-only baseline ("tinylidarnet", "end2race", "ftg", "disparity").
+    ego_kind: str = "policy"
+    ego_weights: str = ""                    # a network baseline's weights file
+    ego_options: Dict[str, Any] = field(default_factory=dict)   # e.g. {"max_speed": 8.0} for ftg
+    #: A planner ego's own line and profile limits (a_lat, a_acc, a_brake); None = the session's line.
+    ego_limits: Optional[List[float]] = None
     #: Plan-controller arm installed at run time (`learn.grip_runtime`).
     #:
     #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs

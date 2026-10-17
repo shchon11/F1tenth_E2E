@@ -24,6 +24,7 @@ from .catalog import GROUP_CAVEAT, GROUP_HINT, GROUP_ORDER, MapCatalog, RunInfo,
 from . import contacts as CT
 from .frames import Freshness, INTERP_LAG_FRAMES
 from .opponent_table import OpponentSlotTable
+from .ego_driver import EgoDriverPanel
 from .overlays import ActivationPanel, DashPanel, PolicyInputPanel
 from .protocol import (SessionConfig, STAGE_TEXT, STATE_FAILED, STATE_IDLE, STATE_PAUSED,
                        STATE_PREPARING, STATE_RUNNING, STATE_STOPPING)
@@ -293,6 +294,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.run_list = FilterList("런 이름 검색", rows=5)
         self.run_list.activated.connect(self._on_run_selected)
         run_card.add(self.run_list)
+        # Who drives the ego car: the run above, or a published planner / baseline (2026-10-17).
+        self.ego_panel = EgoDriverPanel()
+        self.ego_panel.changed.connect(self._update_start_enabled)
+        run_card.add(self.ego_panel)
         self.ckpt_fold = Collapsible("체크포인트 상세", expanded=False)
         self.ckpt_info = KeyValueList()
         self.ckpt_info.set("체크포인트", "—")
@@ -1942,6 +1947,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if hasattr(self, "opp_table") and self.spin_grid.value() > 1 \
                 and self.opp_table.problem(self.spin_grid.value()):
             return "고급 설정의 상대차 표를 먼저 고치세요."
+        if hasattr(self, "ego_panel") and self.ego_panel.problem():
+            return self.ego_panel.problem()
         return ""
 
     def _can_start(self) -> bool:
@@ -1949,6 +1956,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             return False
         # A slot table that names a checkpoint the loader will refuse is a start that fails after a
         # minute of loading. The table already knows; the button asks it.
+        if hasattr(self, "ego_panel") and self.ego_panel.problem():
+            return False
         if hasattr(self, "opp_table") and self.spin_grid.value() > 1:
             return not self.opp_table.problem(self.spin_grid.value())
         return True
@@ -2211,6 +2220,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "fold_record": bool(self.record_fold.toggle.isChecked()),
             "fold_advanced": bool(self.adv_fold.toggle.isChecked()),
             "fold_checkpoint": bool(self.ckpt_fold.toggle.isChecked()),
+            "ego": self.ego_panel.config(),
         }
 
     def apply_prefs(self, p: dict) -> None:
@@ -2291,6 +2301,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.record_fold.toggle.setChecked(bool(v)), "fold_record")
         attempt(lambda v: self.adv_fold.toggle.setChecked(bool(v)), "fold_advanced")
         attempt(lambda v: self.ckpt_fold.toggle.setChecked(bool(v)), "fold_checkpoint")
+        attempt(lambda v: self.ego_panel.set_config(dict(v or {})), "ego")
 
     def save_prefs(self) -> None:
         from . import prefs
@@ -2321,6 +2332,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             stochastic=self.chk_stoch.isChecked(),
             opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
             opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),
+            **self.ego_panel.config(),
             controller=SessionConfig.controller,
             estimator=SessionConfig.estimator,
             mu_mode=str(self.combo_mu.currentData() or "random"),

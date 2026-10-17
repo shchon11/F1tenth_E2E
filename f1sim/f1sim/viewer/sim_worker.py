@@ -109,6 +109,30 @@ NORMALIZER_FIELDS = ("v_max", "range_max", "gyro_scale", "accel_scale", "att_sca
 # in `viewer/geometry.py` now (torch-free, shared with the environment editor); re-exported here so
 # every existing import keeps working.
 from .geometry import GEOMETRY_VERSION, SMOOTH_SIGMA, PropBuildError, _bbox, build_track_geometry   # noqa: E402,F401
+#: The line every teacher-driven car (and a planner ego) drives in the console: the training and
+#: evaluation teacher's -- minimum-time at a_lat 7 / a_acc 6.5 / a_brake 4 (2026-10-17). Before, the
+#: console built the default line (6 / 6 / 3), so its opponents drove slower than the ones a policy
+#: was trained and scored against.
+TRAIN_LIMITS = {"a_lat": 7.0, "a_acc": 6.5, "a_brake": 4.0}
+TRAIN_LINE = dict(TRAIN_LIMITS, objective="min_time")
+
+
+def ego_description(kind: str, weights: str = "", options=None, limits=None) -> str:
+    """One short line naming who drives the ego car, for the log and the header."""
+    from .. import opponent_slots as osl
+    try:
+        label = osl.kind_of(kind).label
+    except ValueError:
+        label = kind
+    parts = [label]
+    if weights:
+        parts.append(os.path.basename(str(weights)))
+    if options:
+        parts.append(",".join(f"{k}={v}" for k, v in sorted(dict(options).items())))
+    if limits:
+        parts.append("라인 " + "/".join(f"{float(limits[k]):g}" for k in ("a_lat", "a_acc", "a_brake") if k in limits))
+    return " · ".join(parts)
+
 from .geometry import prop_batches as _prop_batches_impl                                            # noqa: E402
 from .geometry import shape_meshes                                                                  # noqa: E402
 
@@ -1047,6 +1071,9 @@ class SimWorker:
                                f"{mix_summary(slots)}."))
         need_rl = grid > 1 and (any(sl.teacher_driven for sl in slots) if slots is not None
                                 else cfg.opponent == "teacher")
+        ego_kind = str(getattr(cfg, "ego_kind", "policy") or "policy")
+        if ego_kind in common.EGO_PLANNER_KINDS:
+            need_rl = True                         # the ego itself drives the line
 
         self.stage(gen, "raceline")
         rls = None
@@ -1064,7 +1091,7 @@ class SimWorker:
                 if need_rl:
                     # Something will drive on it -- a teacher opponent -- so it has to exist, and a
                     # cold cache is worth the wait, which the progress sink above makes visible.
-                    rls = [Raceline.build_cached(track)]
+                    rls = [Raceline.build_cached(track, **TRAIN_LINE)]
                 else:
                     # Nothing drives on it. A policy steers from its own LiDAR and never reads a
                     # raceline, so here the line is only something to *draw*, and a drawing is not
@@ -1072,7 +1099,7 @@ class SimWorker:
                     # exactly this: "다른 레이싱라인을 쓰는 정책을 쓸 때만 해야지 내 학습 정책과 일반
                     # ros 키는데에도 왜자꾸 쳐 하는건데". Cached, it is drawn; not cached, it is not.
                     try:
-                        rls = [Raceline.build_cached(track, cache_only=True)]
+                        rls = [Raceline.build_cached(track, cache_only=True, **TRAIN_LINE)]
                     except _rl_mod.RacelineCacheMiss:
                         rls = None
                         self.say(P.MSG_LOG, gen=gen,
@@ -1176,7 +1203,7 @@ class SimWorker:
             # sequence of layouts. Without it nothing here draws a layout, and the seed stays 0.
             env = common.make_env([track], n_cars, device, env_cfg, cfg=sim_cfg,
                                   seed=int(cfg.seed) if proc_kw else 0,
-                                  rls=rls if need_rl else None)
+                                  rls=rls if need_rl else None, teacher_limits=TRAIN_LIMITS)
         except (ValueError, RuntimeError) as exc:
             if proc_kw and isinstance(exc, ValueError):
                 raise StartConfigError(f"학습과 같은 장애물: {exc}") from exc
@@ -1187,6 +1214,25 @@ class SimWorker:
                 raise
             raise StartConfigError(f"상대차 표: {exc}") from exc
         env.sim.tid.fill_(0)                       # every car on the map that was asked for
+        ego_note = ""
+        if ego_kind != "policy":
+            # Another driver for the ego car: the checkpoint keeps the observation contract and the
+            # overlays, and this driver's (steer, speed) replaces its command (`set_ego_driver`).
+            ego_rls, ego_lim = rls, dict(TRAIN_LIMITS)
+            lim = getattr(cfg, "ego_limits", None)
+            try:
+                if ego_kind in common.EGO_PLANNER_KINDS and lim:
+                    ego_lim = common.teacher_limits(*[float(x) for x in lim])
+                    ego_rls = [Raceline.build_cached(track, objective="min_time", **ego_lim)]
+                drv = common.build_ego_driver(env, ego_kind, str(getattr(cfg, "ego_weights", "") or ""),
+                                              dict(getattr(cfg, "ego_options", None) or {}),
+                                              rls=ego_rls, limits=ego_lim)
+            except Exception as exc:
+                raise StartConfigError(f"내 차 주행기 '{ego_kind}': {exc}") from exc
+            env.set_ego_driver(drv)
+            ego_note = ego_description(ego_kind, getattr(cfg, "ego_weights", ""), getattr(cfg, "ego_options", None),
+                                       ego_lim if ego_kind in common.EGO_PLANNER_KINDS else None)
+            self.say(P.MSG_LOG, gen=gen, text=f"내 차: {ego_note} — 정책 체크포인트는 관측·표시에만 씁니다")
         mu_pin = None
         if str(getattr(cfg, "mu_mode", "random")) == "fixed":
             mu_pin = MuPin(env, float(getattr(cfg, "mu", 1.0489))).install()   # before the first reset
@@ -1226,7 +1272,8 @@ class SimWorker:
             "obs": obs, "speed_cap": speed_cap, "compile": compile_enabled,
             "dial": dial,
             "act_fn": actor_runner(model, device, compile_enabled, dial=dial),
-            "info_line": describe_checkpoint_line(extra, ckpt_path),
+            "info_line": (f"내 차: {ego_note} · " if ego_note else "") + describe_checkpoint_line(extra, ckpt_path),
+            "ego_kind": ego_kind,
             "track": track, "cfg": cfg, "focus": 0, "k": 0,
             "scenario": session_scenario, "map_legacy": map_legacy,
             "gg": deque(maxlen=90),

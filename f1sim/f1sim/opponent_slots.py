@@ -100,6 +100,14 @@ class DriverKind:
     #: False for `raceline`, and not as an oversight: pure pursuit on a fixed line has no lateral
     #: freedom to use even if it could see one.
     prop_aware: bool = False
+    #: A published baseline driving this car from its own sensors (`f1sim.learn.baselines`, 2026-10-17):
+    #: the `baselines.load` kind name, e.g. "ftg". Its command is computed from the car's own raw scan
+    #: and odometry speed and replaces the car's command after the tracker (`F1VecEnv.step`), so it
+    #: drives in a plan-mode env as well as in a direct one. Built by `learn.common.make_env`.
+    external: str = ""
+    #: Whether the slot must name a weights file (`OpponentSlot.weights`): the networks do, the
+    #: reactive algorithms (ftg, disparity) have none.
+    needs_weights: bool = False
 
     @property
     def available(self) -> bool:
@@ -167,6 +175,22 @@ KINDS: Tuple[DriverKind, ...] = (
                teacher_factory="f1sim.layout_line:LayoutLineTeacher",
                prop_aware=True,
                pending="`f1sim/layout_line.py` 가 이 트리에 없습니다."),
+    DriverKind("tinylidarnet", "TinyLidarNet (E2E)",
+               "CSL-KU TinyLidarNet (IROS 2024): 라이다만 보고 조향·속도를 내는 1D CNN. 가중치 파일을 "
+               "고릅니다 -- 공개 가중치(tools/baselines/tln_L_published.pt) 또는 이 환경에서 학습한 것.",
+               external="tinylidarnet", needs_weights=True, prop_aware=True, module="f1sim.learn.baselines"),
+    DriverKind("end2race", "End2Race (E2E)",
+               "michigan-traffic-lab End2Race: 라이다 + 속도를 받는 GRU. 공개 가중치 또는 이 환경에서 "
+               "학습한 가중치 파일을 고릅니다.",
+               external="end2race", needs_weights=True, prop_aware=True, module="f1sim.learn.baselines"),
+    DriverKind("ftg", "Follow-the-Gap (ForzaETH)",
+               "ForzaETH race stack 의 Follow-the-Gap 을 그대로 옮긴 것. 지도·위치추정 없이 라이다만 "
+               "봅니다. 옵션 max_speed (대회 설정 6.0).",
+               external="ftg", prop_aware=True, module="f1sim.learn.baselines"),
+    DriverKind("disparity", "Disparity Extender",
+               "UNC 의 Disparity Extender (CPSWeek 2019 우승) 를 원저자 설명대로 구현. 라이다만 봅니다. "
+               "옵션 top_speed.",
+               external="disparity", prop_aware=True, module="f1sim.learn.baselines"),
     DriverKind("policy", "정책 체크포인트",
                "저장된 정책이 스스로 주행합니다. 자기 라인을 잡고 자기 실수를 합니다.",
                checkpoint=True),
@@ -297,6 +321,10 @@ class OpponentSlot:
     #: race reset the seat is filled with this probability; an empty seat's car is parked far off the
     #: map, frozen, unseen and untouchable (`Simulator.absent`). 1.0 draws nothing: as before.
     present: float = 1.0
+    #: For an external kind (`DriverKind.external`): its weights file, and the driver's own options
+    #: (`baselines.load(kind, weights, **options)`, e.g. {"max_speed": 8} for ftg).
+    weights: Optional[str] = None
+    options: Dict = field(default_factory=dict)
 
     # ---------------------------------------------------------------- construction
     @staticmethod
@@ -382,6 +410,20 @@ class OpponentSlot:
         present = float(d.get("present", 1.0))
         if not (0.0 <= present <= 1.0):
             raise ValueError(f"opponent slot: present {present}: a probability is in [0, 1]")
+        weights = str(d["weights"]) if d.get("weights") else None
+        options = d.get("options") or {}
+        if not isinstance(options, dict):
+            raise ValueError(f"opponent slot: options must be a JSON object, got {type(options).__name__}")
+        ext = kind_of(kind)
+        if ext.external:
+            # A missing weights file is `validate_slots`'s to refuse, as a missing checkpoint is: the
+            # console builds a slot on every edit, before the file has been picked.
+            if mix or ckpt_mix or d.get("checkpoint"):
+                raise ValueError(f"opponent slot: kind {kind!r} drives from its own sensors; it cannot be "
+                                 f"mixed with other kinds, a league or a checkpoint")
+        elif weights or options:
+            raise ValueError(f"opponent slot: weights/options belong to an external kind "
+                             f"({[k.name for k in KINDS if k.external]}), not to {kind!r}")
         return OpponentSlot(
             kind=kind, kind_mix=mix,
             checkpoint=(str(d["checkpoint"]) if d.get("checkpoint") else None),
@@ -391,7 +433,8 @@ class OpponentSlot:
             events=tuple(timed), event_rate=rate,
             reactive={k: float(v) for k, v in reactive.items() if float(v) > 0.0},
             spawn=spawn, seed=(None if seed is None else int(seed)),
-            ckpt_mix=ckpt_mix, ckpt_p=(ckpt_p if ckpt_mix else 0.0), present=present)
+            ckpt_mix=ckpt_mix, ckpt_p=(ckpt_p if ckpt_mix else 0.0), present=present,
+            weights=weights, options=dict(options))
 
     def to_dict(self) -> Dict:
         """The JSON object this slot came from -- only the fields that are not the default.
@@ -430,6 +473,10 @@ class OpponentSlot:
             out["ckpt_p"] = self.ckpt_p
         if self.present != base.present:
             out["present"] = self.present
+        if self.weights:
+            out["weights"] = self.weights
+        if self.options:
+            out["options"] = dict(self.options)
         return out
 
     # ---------------------------------------------------------------- what it is
@@ -445,10 +492,18 @@ class OpponentSlot:
     def policy_driven(self) -> bool:
         return self.driver.policy
 
+    @property
+    def external_driven(self) -> bool:
+        return bool(self.driver.external)
+
     def describe(self) -> str:
         """One line for a log header, a facts strip and the census."""
         lo, hi = self.speed_scale
         parts = [self.kind if not self.checkpoint else f"{self.kind}:{os.path.basename(self.checkpoint)}"]
+        if self.weights:
+            parts[0] = f"{self.kind}:{os.path.basename(self.weights)}"
+        if self.options:
+            parts.append(",".join(f"{k}={v}" for k, v in sorted(self.options.items())))
         if self.kind_mix:
             # `kind` is only the one the slot starts as; each race redraws it from the mix, and a
             # header naming the first alone read as a run against one opponent kind.
@@ -542,6 +597,10 @@ def validate_slots(slots: Sequence[OpponentSlot], race_size: int, *,
         for ck in s.ckpt_mix:
             if require_files and not os.path.exists(ck):
                 raise ValueError(f"{where}: no such checkpoint {ck!r} in ckpt_mix.")
+        if kind.external and kind.needs_weights and not s.weights:
+            raise ValueError(f"{where}: needs a weights file -- that is what drives the car.")
+        if kind.external and kind.needs_weights and require_files and not os.path.exists(s.weights):
+            raise ValueError(f"{where}: no such weights file {s.weights!r}.")
         if not kind.teacher:
             if s.events or s.reactive:
                 raise ValueError(

@@ -104,6 +104,12 @@ def _checkpoint_facts(path: str):
     return _CK_CACHE[key]
 
 
+#: The reactive drivers' pace option name, per external kind (`learn.baselines.reactive`).
+PACE_KNOB = {"ftg": "max_speed", "disparity": "top_speed"}
+#: Where the baseline weights live (public conversions and the ones trained in this environment).
+BASELINES_DIR = os.path.expanduser("~/f1sim_runs/_eval/mintime-teacher-2026-09-19/pipeline/tools/baselines")
+
+
 def describe_checkpoint(path: str) -> str:
     """One line about a checkpoint file, or the loader's own reason it cannot drive a car here."""
     return _checkpoint_facts(path)[0]
@@ -201,6 +207,14 @@ class SlotRow(QtCore.QObject):
         self.ckpt.clicked.connect(self._pick_checkpoint)
         self._ckpt_path = ""
         self._ckpt_arm = "legacy"
+        #: An external kind's weights file (`OpponentSlot.weights`) -- the same button picks it.
+        self._weights_path = ""
+        #: The reactive drivers' one pace knob (ftg max_speed, disparity top_speed); 0 = its default.
+        self.pace = _spin(0.0, 15.0, 0.0, 0.5, 1, 58, " m/s")
+        self.pace.setSpecialValueText("기본")
+        self.pace.setToolTip("Follow-the-Gap 의 max_speed / Disparity Extender 의 top_speed. 기본 = 대회 설정"
+                             " (ftg 6.0, disparity 6.0). 다른 종류에서는 쓰지 않습니다.")
+        self.pace.valueChanged.connect(self._emit)
 
         self.lo = _spin(0.05, 3.0, 1.0, 0.05, 2, 58)
         self.hi = _spin(0.05, 3.0, 1.0, 0.05, 2, 58)
@@ -261,7 +275,7 @@ class SlotRow(QtCore.QObject):
 
     # ---------------------------------------------------------------- cells
     def widgets(self) -> dict:
-        return {"car": self.car, "kind": self.kind, "checkpoint": self.ckpt,
+        return {"car": self.car, "kind": self.kind, "checkpoint": _cell(self.ckpt, self.pace),
                 "speed": _cell(self.lo, label("–", "hint"), self.hi),
                 "grip": self.grip, "cap": self.cap, "events": self.events_cell,
                 "rate": self.rate, "reactive": self.reactive_cell, "spawn": self.spawn}
@@ -287,7 +301,8 @@ class SlotRow(QtCore.QObject):
     def _on_kind(self, *_a):
         """Grey out what this kind cannot carry, rather than accepting it and ignoring it."""
         kind, _mix = self._chosen()
-        self.ckpt.setEnabled(kind.checkpoint)
+        self.ckpt.setEnabled(kind.checkpoint or kind.needs_weights)
+        self.pace.setEnabled(kind.external in PACE_KNOB)
         self.grip.setEnabled(kind.teacher)
         for cb in self.events.values():
             cb.setEnabled(kind.teacher)
@@ -296,10 +311,26 @@ class SlotRow(QtCore.QObject):
             sp.setEnabled(kind.teacher)
         if not kind.checkpoint:
             self._ckpt_path, self._ckpt_arm = "", "legacy"
+        if not kind.needs_weights:
+            self._weights_path = ""
+        if kind.needs_weights:
+            self.ckpt.setText(os.path.basename(self._weights_path) or "가중치 파일…")
+            self.ckpt.setToolTip(self._weights_path or "이 주행기의 가중치 파일 (.pt/.pth): 공개 가중치 또는 이 "
+                                 "환경에서 학습한 것 (~/f1sim_runs/_eval/.../pipeline/tools/baselines/)")
+        elif not kind.checkpoint:
             self.ckpt.setText("—"); self.ckpt.setToolTip("")
         self._emit()
 
     def _pick_checkpoint(self):
+        kind, _mix = self._chosen()
+        if kind.needs_weights:
+            start = os.path.dirname(self._weights_path) or BASELINES_DIR
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self.table, f"{kind.label} 가중치", start, "가중치 (*.pt *.pth);;모든 파일 (*)")
+            if path:
+                self._weights_path = str(path)
+                self._on_kind()
+            return
         start = os.path.dirname(self._ckpt_path) or os.path.expanduser("~/f1sim_runs")
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self.table, "상대차 체크포인트", start, "체크포인트 (*.pt);;모든 파일 (*)")
@@ -319,6 +350,12 @@ class SlotRow(QtCore.QObject):
     def checkpoint_problem(self) -> str:
         """The loader's reason this file cannot drive a car here, or "" when it can."""
         kind, _mix = self._chosen()
+        if kind.needs_weights:
+            if not self._weights_path:
+                return f"차량 {self.index}: {kind.label} 의 가중치 파일을 골라야 합니다."
+            if not os.path.isfile(self._weights_path):
+                return f"차량 {self.index}: 가중치 파일이 없습니다: {self._weights_path}"
+            return ""
         if not kind.checkpoint:
             return ""
         if not self._ckpt_path:
@@ -339,6 +376,10 @@ class SlotRow(QtCore.QObject):
         if kind.checkpoint and self._ckpt_path:
             d["checkpoint"] = self._ckpt_path
             d["controller"] = self._ckpt_arm
+        if kind.needs_weights and self._weights_path:
+            d["weights"] = self._weights_path
+        if kind.external in PACE_KNOB and self.pace.value() > 0:
+            d["options"] = {PACE_KNOB[kind.external]: float(self.pace.value())}
         if kind.teacher:
             d["label_grip"] = str(self.grip.currentData() or "true")
             ev = [n for n in opp_ev.EVENT_NAMES if self.events[n].isChecked()]
@@ -365,6 +406,9 @@ class SlotRow(QtCore.QObject):
         if i >= 0:
             self.kind.setCurrentIndex(i)
         self.set_checkpoint(s.checkpoint or "")
+        self._weights_path = s.weights or ""
+        knob = PACE_KNOB.get(s.driver.external)
+        self.pace.setValue(float((s.options or {}).get(knob, 0.0)) if knob else 0.0)
         lo, hi = s.speed_scale
         self.lo.setValue(lo); self.hi.setValue(hi)
         g = self.grip.findData(s.label_grip)

@@ -174,6 +174,8 @@ def _move_every_control(w):
     w.record_fold.toggle.setChecked(True)
     w.adv_fold.toggle.setChecked(True)
     w.ckpt_fold.toggle.setChecked(True)
+    w.ego_panel.kind.setCurrentIndex(w.ego_panel.kind.findData("ftg"))
+    w.ego_panel.pace.setValue(8.0)
 
 
 #: `run` needs a checkpoint on disk and `map` needs the worker's catalogue (`set_maps` applies it),
