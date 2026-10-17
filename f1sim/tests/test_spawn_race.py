@@ -206,3 +206,76 @@ def test_a_lane_without_room_for_the_preferred_gap_takes_the_minimum_or_staggers
     assert bool(env.spawn_abreast.all())
     assert float(lat.min()) > extent + minimum - 0.06 and float(lat.max()) < extent + minimum + 0.1, (
         f"abreast centres {float(lat.min()):.3f}-{float(lat.max()):.3f} m apart, extent {extent:.3f}")
+
+
+# --------------------------------------------------------------------------- 4. a lap the crates block
+# map3R2_s1321 (ICRA 2022 boot camp, 2026-10-17) died at update 413 of 512: a car rejoining a race found
+# no spawn station clear of the race's (shoved, movable) crates and `sample_spawn` raised. The tests
+# below patch the geometry tests so that only the fallback's control flow decides.
+
+def _arcs_near(sim, pose, row: int = 0):
+    """Arc of the centerline point nearest to `pose` (on row `row`'s track)."""
+    tid = sim.tid[row:row + 1]
+    L = float(sim.track.length[tid])
+    ss = torch.linspace(0.0, L, 4001)[:-1]
+    xy, _ = sim.track.pose_at_s(ss, tid.repeat(ss.numel()))
+    return float(ss[(xy - pose[:2]).norm(dim=1).argmin()])
+
+
+def _blocked_sim(runway_clear=None, prop_free=None):
+    """A boot-camp sim whose runway test passes only on `runway_clear` (lo, hi) and whose prop test
+    passes only on `prop_free` (lo, hi); None = blocked everywhere (runway) / free everywhere (props)."""
+    env = _boot_env(envs=8)
+    sim = env.sim
+    L = float(sim.track.length[sim.tid[0]])
+    tid0 = sim.tid[0]
+
+    def arc_of(pose):
+        xy = pose[:, :2]
+        ss = torch.linspace(0.0, L, 4001)[:-1]
+        cxy, _ = sim.track.pose_at_s(ss, tid0.repeat(ss.numel()))
+        return ss[torch.cdist(xy, cxy).argmin(1)]
+
+    def inside(s, win):
+        return (s >= win[0]) & (s < win[1])
+
+    sim._spawn_runway_blocked = (lambda s, tid, eid, lat: torch.ones_like(s, dtype=torch.bool)) if runway_clear is None \
+        else (lambda s, tid, eid, lat: ~inside(s, runway_clear))
+    sim._spawn_heading_blocked = lambda pose, tid, eid: torch.zeros(pose.shape[0], dtype=torch.bool)
+    sim._spawn_in_prop = (lambda pose, tid, eid: torch.zeros(pose.shape[0], dtype=torch.bool)) if prop_free is None \
+        else (lambda pose, tid, eid: ~inside(arc_of(pose), prop_free))
+    sim.spawn_stats = {}
+    return sim, L
+
+
+def _spawn_one(sim, s0: float = 0.0):
+    return sim.sample_spawn(1, 0.0, 0.0, s=torch.tensor([s0]), tid=sim.tid[:1], lat=torch.zeros(1),
+                            eid=torch.tensor([0]))[0]
+
+
+def test_a_clear_stretch_between_the_lap_walks_stations_is_found():
+    """The 32 stations sit L/33 apart (1.9 m on ICRA 2022); a 0.3 m clear runway halfway between two
+    of them used to end the run. It is found by the denser walk, with every test kept."""
+    sim0, L = _blocked_sim()
+    lo = L * 5.5 / 33 - 0.15
+    sim, _ = _blocked_sim(runway_clear=(lo, lo + 0.3))
+    pose = _spawn_one(sim)
+    assert lo - 0.02 <= _arcs_near(sim, pose) < lo + 0.32
+    assert sim.spawn_stats.get("dense", 0) == 1 and sim.spawn_stats.get("runway_waived", 0) == 0
+
+
+def test_no_clear_runway_anywhere_waives_the_runway_but_not_the_crates():
+    """No clear runway on the whole lap: the car still stands clear of every crate."""
+    sim0, L = _blocked_sim()
+    lo = L * 0.61
+    sim, _ = _blocked_sim(prop_free=(lo, lo + 0.4))
+    pose = _spawn_one(sim)
+    assert lo - 0.02 <= _arcs_near(sim, pose) < lo + 0.42
+    assert sim.spawn_stats.get("runway_waived", 0) == 1
+
+
+def test_crates_on_every_station_still_raise():
+    """A lap with no prop-free pose at all is a broken layout, not something to drive through."""
+    sim, _ = _blocked_sim(prop_free=(-2.0, -1.0))
+    with pytest.raises(RuntimeError, match="no spawn pose clear"):
+        _spawn_one(sim)

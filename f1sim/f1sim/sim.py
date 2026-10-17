@@ -652,6 +652,21 @@ class Simulator:
                         self._spawn_stat("crowded", 1)
                         p1, s1 = self._spawn_walk_one(rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, None, 0.0, J)
                     if p1 is None:
+                        # Every one of the J stations (L/33 apart: 1.9 m on ICRA 2022) is blocked. A
+                        # race that has run a while has shoved its movable crates around, and a car
+                        # rejoining it keeps that layout; the clear stretches can lie between the
+                        # stations. Look between them, everything else kept (2026-10-17: map3R2_s1321
+                        # died here at update 413 of an 8-hour run).
+                        self._spawn_stat("dense", 1)
+                        p1, s1 = self._spawn_walk_one(rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, None, 0.0,
+                                                      4 * J + 3, den=4 * 33.0)
+                    if p1 is None:
+                        # Still none: no clear 3 m runway anywhere. Standing clear of the props and
+                        # the walls is kept; the runway and the heading test give, counted.
+                        self._spawn_stat("runway_waived", 1)
+                        p1, s1 = self._spawn_walk_one(rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, None, 0.0,
+                                                      4 * J + 3, den=4 * 33.0, runway=False)
+                    if p1 is None:
                         raise RuntimeError(
                             "1 env has no spawn pose clear of the placed props anywhere on its lap; "
                             "the track's props block the centerline")
@@ -682,8 +697,10 @@ class Simulator:
         return (d.abs() < gap).any(1)
 
     def _spawn_stations(self, rows, s, L, tid, eid, lat, dyaw, min_cl, try_own, try_cen, act,
-                        avoid_s, clear_gap: float, J: int):
-        """Every row of `rows` tested at J stations L/33 apart ahead of its asked arc.
+                        avoid_s, clear_gap: float, J: int, den: float = 33.0, runway: bool = True):
+        """Every row of `rows` tested at J stations L/den apart ahead of its asked arc (L/33 unless
+        the fallback looks between them). `runway=False` drops the runway and heading tests and keeps
+        walls and props: the last resort of a lap with no clear runway anywhere.
 
         Two candidates per station: the row's own pose moved along the lane (its lateral offset and
         heading jitter kept, tested against everything the asked pose was: walls at `min_cl`, the
@@ -699,7 +716,7 @@ class Simulator:
         R = rows.numel()
         heavy = getattr(self.track, "has_props", False) or self.spawn_runway > 0.0
         ar_j = torch.arange(1, J + 1, device=self.device, dtype=L.dtype)
-        s_alt = (s[rows][:, None] + L[rows][:, None] * (ar_j[None] / 33.0)) % L[rows][:, None]   # (R, J)
+        s_alt = (s[rows][:, None] + L[rows][:, None] * (ar_j[None] / den)) % L[rows][:, None]   # (R, J)
         sf = s_alt.reshape(-1)
         rep = lambda t_: t_[rows].repeat_interleave(J)
         tid_j = rep(tid)
@@ -716,11 +733,14 @@ class Simulator:
         own_l = ~(close | (self.track.sample_edt(p_own[:, :2], tid_j) < mc))
         cen_l = ~close
         own_hd = cen_hd = torch.zeros_like(close)
-        if heavy:
+        if heavy and runway:
             own_l = own_l & ~(self._spawn_runway_blocked(sf, tid_j, eid_j, lat_j) | self._spawn_in_prop(p_own, tid_j, eid_j))
             cen_l = cen_l & ~(self._spawn_runway_blocked(sf, tid_j, eid_j, None) | self._spawn_in_prop(p_cen, tid_j, eid_j))
             own_hd = self._spawn_heading_blocked(p_own, tid_j, eid_j)
             cen_hd = self._spawn_heading_blocked(p_cen, tid_j, eid_j)
+        elif heavy:
+            own_l = own_l & ~self._spawn_in_prop(p_own, tid_j, eid_j)
+            cen_l = cen_l & ~self._spawn_in_prop(p_cen, tid_j, eid_j)
         v = lambda t_: t_.view(R, J)
         own_l, cen_l, own_hd, cen_hd = v(own_l), v(cen_l), v(own_hd), v(cen_hd)
         own_s, cen_s = own_l & ~own_hd, cen_l & ~cen_hd
@@ -729,8 +749,10 @@ class Simulator:
         st_l = ia | (to & own_l) | (tc & cen_l)
         return st_ok, st_l, own_l, own_s, s_alt, p_own.view(R, J, 3), p_cen.view(R, J, 3)
 
-    def _spawn_walk_one(self, rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, avoid, gap: float, J: int):
-        """One car's own lap walk (the fallback): first clear station's (pose, arc), or (None, None)."""
+    def _spawn_walk_one(self, rr, s, L, tid, eid, lat, dyaw, min_cl, fixed, avoid, gap: float, J: int,
+                        den: float = 33.0, runway: bool = True):
+        """One car's own lap walk (the fallback): first clear station's (pose, arc), or (None, None).
+        `den` and `runway` as in `_spawn_stations`."""
         avoid_full = None
         if avoid is not None:
             avoid_full = torch.full((s.shape[0], avoid.shape[1]), float("nan"), device=self.device, dtype=s.dtype)
@@ -738,7 +760,7 @@ class Simulator:
         f = fixed[rr]
         st_ok, st_l, own_l, own_s, s_alt, p_own, p_cen = self._spawn_stations(
             rr, s, L, tid, eid, lat, dyaw, min_cl, torch.ones_like(f), ~f,
-            torch.ones_like(f), avoid_full, gap, J)
+            torch.ones_like(f), avoid_full, gap, J, den=den, runway=runway)
         ok = st_ok if bool(st_ok.any()) else st_l
         if not bool(ok.any()):
             return None, None
