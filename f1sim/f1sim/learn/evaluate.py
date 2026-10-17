@@ -71,6 +71,38 @@ def _opponent_format(asked: str | None, spec: dict, mode: str, race_size: int, o
     return "linear" if (v2 and mode == "plan" and race_size > 1 and opponent != "policy") else None
 
 
+#: Opponent planners that may drive the learner's car (`--teacher --teacher-kind forzaeth`, 2026-10-17:
+#: the user asked for the published stacks as baselines, not only as opponents).
+EGO_PLANNER_KINDS = ("forzaeth", "forzaeth_pred", "lane_switch")
+
+
+def _ego_follow(env, teacher, an: torch.Tensor) -> torch.Tensor:
+    """The follow cap on a planner driving the ego car.
+
+    These planners hand TRAILING's speed to the env: `F1VecEnv.follow_cap` holds a braking gap behind
+    the car ahead, and the env applies it to teacher-driven OPPONENTS only (`_teacher_normalized`).
+    Driving the ego without it, the state machine would trail at full raceline speed into the car it
+    decided not to pass -- a baseline handicapped by our plumbing, not by its design. The same cap, in
+    the same order, then the same re-certification of the plan.
+    """
+    from ..gym_env import _plan_layout
+    follow, v_cap = env.follow_cap(env.sim.state)
+    v_max = env.ecfg.v_max_policy
+    if env.act_dim == 2:
+        v = (an[:, 1] + 1) / 2 * v_max
+        v = torch.where(follow, torch.minimum(v, v_cap), v)
+        return torch.stack([an[:, 0], (v / v_max * 2 - 1).clamp(-1, 1)], 1)
+    spec = env.tracker.spec
+    sp = _plan_layout(spec).speed
+    an = an.clone()
+    cap_n = (v_cap / v_max * 2 - 1)[:, None]
+    an[:, sp] = torch.where(follow[:, None], torch.minimum(an[:, sp], cap_n), an[:, sp])
+    projector = getattr(getattr(teacher, "base", teacher), "project_plan_action", None)
+    if projector is not None:
+        an = projector(an, env.sim.state, env.sim.P, v_max, spec, plan_speed=env._tracker_plan_speed())
+    return an
+
+
 @torch.no_grad()
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
@@ -362,8 +394,20 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         elif teacher_kind == "rollout":
             from ..rollout_teacher import RolloutTeacher
             teacher_policy = RolloutTeacher(teacher_policy, env)
-        def policy(obs):
-            return env.teacher_label(teacher_policy)
+        elif teacher_kind in EGO_PLANNER_KINDS:
+            # A published planner driving the learner's car: the implementation the opponents use
+            # (the `opponent_slots` registry), so ForzaETH's spliner as the ego is the spliner the
+            # policies raced against, not a second transcription of it.
+            import importlib
+            from .. import opponent_slots as _os
+            mod, cls = _os.kind_of(teacher_kind).teacher_factory.split(":")
+            teacher_policy = getattr(importlib.import_module(mod), cls)(teacher_policy, env)
+        if teacher_kind in EGO_PLANNER_KINDS:
+            def policy(obs):
+                return _ego_follow(env, teacher_policy, env.teacher_label(teacher_policy))
+        else:
+            def policy(obs):
+                return env.teacher_label(teacher_policy)
     else:
         # Carries the hidden state and any extra scan channel between steps, and exposes `.reset`
         # so both protocols below can clear them at an episode boundary. For a feedforward
@@ -605,7 +649,8 @@ def main() -> None:
     ap.add_argument("--dial-offset", type=float, default=0.0,
                     help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
                          "right; -0.15 is an operator erring on the safe side)")
-    ap.add_argument("--teacher-kind", default="raceline", choices=["raceline", "interactive", "layout", "rollout"],
+    ap.add_argument("--teacher-kind", default="raceline",
+                    choices=["raceline", "interactive", "layout", "rollout", *EGO_PLANNER_KINDS],
                     help="which privileged teacher --teacher drives. raceline: pure pursuit on the "
                          "precomputed line, blind to the other cars. interactive: "
                          "f1sim.interactive_teacher, which scores a family of plans against the "
