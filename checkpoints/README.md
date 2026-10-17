@@ -238,3 +238,27 @@ an impact at >= 1.5 m/s normal speed.
 | `iccas_fixphys_s1101_u448` | 4.37 m/s | 1.45 | 1.72 | 8.31 s |
 
 s1102 u384 is faster than safe and hits hard less often. s1101 u448 is the fastest, at more hard hits.
+
+## Korea 2026 policy (added 2026-10-17)
+
+The same recipe (`v1fix`) run on a second map, `real:korea_2026_competition` + 16 warps, from `iccas_fixphys_s1102_u384`
+(which had never driven Korea 2026). Two seeds, 512 updates each; the pick is `map2_s1201` update 384. Full checkpoint:
+actor, critic, `meta` and `extra`.
+
+| file | what it is | sha256 (first 16) |
+| --- | --- | --- |
+| `korea26_fixphys_s1201_u384.pt` | `map2_s1201`, update 384: the Korea 2026 pick | `d2bf8a5bffa6a979` |
+
+**8-seed noise protocol on Korea 2026** (seeds 81-88 x 4 planners, race of 2, props on the line). "Hard" = impact >= 1.5 m/s.
+
+| policy | race speed | hard walls+props /km | hard cars /km | Korea 2026 solo lap (128 trials) |
+| --- | ---: | ---: | ---: | ---: |
+| `iccas_fixphys_s1102_u384` (the start) | 3.57 m/s | 0.77 | 0.24 | 10.78 s |
+| `korea26_fixphys_s1201_u384` | 4.02 m/s | 1.02 | 0.62 | 9.92 s |
+| `map2_s1202` u256 (not archived) | 4.05 m/s | 0.76 | 1.17 | 10.02 s |
+| `map2_s1202` u512 (not archived) | 3.96 m/s | 0.65 | 1.17 | 9.90 s |
+
+On 2 seeds, `iccas_bootcamp_safe` drove Korea 2026 at 3.44 m/s with 1.63 / 0.42 hard hits per km and a 10.93 s solo lap.
+The map-specific training made the car 0.86 s a lap faster and 13 % faster in races. Hard hits rose from 1.0 to 1.6 per
+km, mostly with cars; that is the same level as the ICCAS picks above (1.6-2.1). The pick is nearly the fastest of the
+four and has the fewest hard hits of the trained ones.
