@@ -175,19 +175,19 @@ KINDS: Tuple[DriverKind, ...] = (
                teacher_factory="f1sim.layout_line:LayoutLineTeacher",
                prop_aware=True,
                pending="`f1sim/layout_line.py` 가 이 트리에 없습니다."),
-    DriverKind("tinylidarnet", "TinyLidarNet (E2E)",
+    DriverKind("tinylidarnet", "TinyLidarNet",
                "CSL-KU TinyLidarNet (IROS 2024): 라이다만 보고 조향·속도를 내는 1D CNN. 가중치 파일을 "
                "고릅니다 -- 공개 가중치(tools/baselines/tln_L_published.pt) 또는 이 환경에서 학습한 것.",
                external="tinylidarnet", needs_weights=True, prop_aware=True, module="f1sim.learn.baselines"),
-    DriverKind("end2race", "End2Race (E2E)",
+    DriverKind("end2race", "End2Race",
                "michigan-traffic-lab End2Race: 라이다 + 속도를 받는 GRU. 공개 가중치 또는 이 환경에서 "
                "학습한 가중치 파일을 고릅니다.",
                external="end2race", needs_weights=True, prop_aware=True, module="f1sim.learn.baselines"),
-    DriverKind("ftg", "Follow-the-Gap (ForzaETH)",
+    DriverKind("ftg", "ForzaETH FTG",
                "ForzaETH race stack 의 Follow-the-Gap 을 그대로 옮긴 것. 지도·위치추정 없이 라이다만 "
                "봅니다. 옵션 max_speed (대회 설정 6.0).",
                external="ftg", prop_aware=True, module="f1sim.learn.baselines"),
-    DriverKind("disparity", "Disparity Extender",
+    DriverKind("disparity", "Disparity Ext.",
                "UNC 의 Disparity Extender (CPSWeek 2019 우승) 를 원저자 설명대로 구현. 라이다만 봅니다. "
                "옵션 top_speed.",
                external="disparity", prop_aware=True, module="f1sim.learn.baselines"),

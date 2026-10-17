@@ -210,7 +210,7 @@ class SlotRow(QtCore.QObject):
         #: An external kind's weights file (`OpponentSlot.weights`) -- the same button picks it.
         self._weights_path = ""
         #: The reactive drivers' one pace knob (ftg max_speed, disparity top_speed); 0 = its default.
-        self.pace = _spin(0.0, 15.0, 0.0, 0.5, 1, 58, " m/s")
+        self.pace = _spin(0.0, 15.0, 0.0, 0.5, 1, 74, " m/s")
         self.pace.setSpecialValueText("기본")
         self.pace.setToolTip("Follow-the-Gap 의 max_speed / Disparity Extender 의 top_speed. 기본 = 대회 설정"
                              " (ftg 6.0, disparity 6.0). 다른 종류에서는 쓰지 않습니다.")
