@@ -32,7 +32,7 @@ def _log(path):
     return log
 
 
-def build_teacher(kind: str, rls, env, log):
+def build_teacher(kind: str, rls, env, log, limits=None):
     """The expert whose tracked command is the label.
 
     `interactive` is worker 17's `f1sim.interactive_teacher.InteractiveTeacher`. It lives on
@@ -42,7 +42,7 @@ def build_teacher(kind: str, rls, env, log):
     """
     from f1sim.learn import common
 
-    base = common.make_teacher(rls, env, grip="true")
+    base = common.make_teacher(rls, env, grip="true", **(limits or {}))
     if kind == "raceline":
         return base, ("RacelineTeacher (grip 'true'): the DRY RUN. It is blind to the other cars, "
                       "so a student distilled from it can at best learn 'pass the car you see'.")
@@ -69,7 +69,14 @@ def cmd_distill(a) -> int:
     names = common.track_names(a.tracks) if a.tracks in ("train", "eval") else \
         [t for t in a.tracks.replace("\n", ",").split(",") if t.strip()]
     log(f"{a.name}: {len(names)} tracks, arch {a.arch}, teacher {a.teacher}, device {device}")
-    tracks, rls = common.load_tracks(names, racelines=True, drop_infeasible=False)
+    # The teacher's line and speed profile: the same as the student it is compared with was taught
+    # (`--teacher-a-*`, `--raceline-objective`, as ppo/dagger take them). Unset is the old 6/6/3 teacher.
+    limits = common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake)
+    rl_kw = dict(limits)
+    if a.raceline_objective:
+        rl_kw["objective"] = a.raceline_objective
+    log(f"  teacher line: {rl_kw or 'defaults (a_lat 6 / a_acc 6 / a_brake 3)'}")
+    tracks, rls = common.load_tracks(names, racelines=True, drop_infeasible=False, **rl_kw)
     log(f"  {len(tracks)} tracks built")
 
     overrides = {"iters": a.iters, "steps": a.steps, "beta0": a.beta0, "seed": a.seed}
@@ -79,7 +86,9 @@ def cmd_distill(a) -> int:
         tracks, rls, a.learners, device, spec_beams=a.n_beams, range_max=a.range_max,
         v_max=a.v_max, seed=a.seed, overrides=overrides)
     env.sim.warmup()
-    teacher, teacher_note = build_teacher(a.teacher, rls, env, log)
+    teacher, teacher_note = build_teacher(a.teacher, rls, env, log, limits)
+    if rl_kw:
+        teacher_note += f" | line {rl_kw}"
     log(f"  teacher: {teacher_note}")
     proto = distill.collection_protocol(env, cfg, names, a.teacher, teacher_note)
     log(f"  {proto['n_cars']} cars = {proto['n_learners']} learners x {proto['race_size']}, "
@@ -237,6 +246,10 @@ def main(argv=None) -> int:
     d.add_argument("--keep-iters", type=int, default=4)
     d.add_argument("--seed", type=int, default=distill.D3_ENV["seed"])
     d.add_argument("--speed-cap", type=float, default=distill.D3_ENV["speed_cap"])
+    d.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] the teacher profile's lateral limit")
+    d.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] its drive limit")
+    d.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] its braking limit")
+    d.add_argument("--raceline-objective", default=None, help="the teacher line's objective (e.g. min_time)")
     d.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     d.add_argument("--n-beams", type=int, default=1081)
     d.add_argument("--fov", type=float, default=4.71238898)
