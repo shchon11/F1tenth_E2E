@@ -167,7 +167,7 @@ class DemoBuffer:
 
 # --------------------------------------------------------------------------- collection
 def make_collection_env(tracks, rls, n_learners, device, *, spec_beams, range_max, v_max,
-                        seed, overrides=None):
+                        seed, overrides=None, env_extra=None):
     """The environment D3 collects in: worker 17's race, in `plan` action mode.
 
     `plan` and not `direct`, although every student here emits (steer, speed). Three reasons, in
@@ -189,7 +189,7 @@ def make_collection_env(tracks, rls, n_learners, device, *, spec_beams, range_ma
 
     cfg = dict(D3_ENV)
     cfg.update(overrides or {})
-    ecfg = EnvConfig(
+    kw = dict(
         speed_cap=float(cfg["speed_cap"]), action_mode="plan", resample_track_on_reset=True,
         race_size=int(cfg["race_size"]), opponent=str(cfg["opponent"]),
         opp_speed_range=tuple(cfg["opp_speed_range"]), spawn_order=str(cfg["spawn_order"]),
@@ -201,6 +201,16 @@ def make_collection_env(tracks, rls, n_learners, device, *, spec_beams, range_ma
         # out of it -- so it is kept at its cheapest. Nothing physical depends on it.
         scan_stack=1, scan_stride=1, action_history=1, hist_len=0,
         v_max_policy=float(v_max))
+    # `env_extra` may replace a D3 field as well as add one: with props on the racing line the
+    # raceline-teacher opponents are refused (they cannot see a prop), so the caller swaps in a
+    # prop-aware slot table, and the global scripted-event fields then belong to the slots.
+    extra = dict(env_extra or {})
+    if extra.get("opponent") == "slots":
+        for k in ("opp_events", "opp_event_rate", "opp_defend_prob", "opp_yield_prob", "opp_line_prob",
+                  "opp_oblivious_prob", "opp_speed_range"):
+            kw.pop(k, None)
+    kw.update(extra)
+    ecfg = EnvConfig(**kw)
     from f1sim.params import Config
     c = Config()
     c.lidar.n_beams = int(spec_beams)

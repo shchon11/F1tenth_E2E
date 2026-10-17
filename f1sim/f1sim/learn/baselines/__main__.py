@@ -80,11 +80,16 @@ def cmd_distill(a) -> int:
     log(f"  {len(tracks)} tracks built")
 
     overrides = {"iters": a.iters, "steps": a.steps, "beta0": a.beta0, "seed": a.seed}
+    # EnvConfig fields added to the D3 world, e.g. the props our own students trained among
+    # (`{"procedural_obstacles": 1.0, "procedural_density": 1.5, ...}`); recorded in the log.
+    env_extra = json.loads(a.env_extra) if a.env_extra else {}
+    if env_extra:
+        log(f"  env extra: {env_extra}")
     if a.speed_cap:
         overrides["speed_cap"] = a.speed_cap
     env, cfg = distill.make_collection_env(
         tracks, rls, a.learners, device, spec_beams=a.n_beams, range_max=a.range_max,
-        v_max=a.v_max, seed=a.seed, overrides=overrides)
+        v_max=a.v_max, seed=a.seed, overrides=overrides, env_extra=env_extra)
     env.sim.warmup()
     teacher, teacher_note = build_teacher(a.teacher, rls, env, log, limits)
     if rl_kw:
@@ -250,6 +255,7 @@ def main(argv=None) -> int:
     d.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] its drive limit")
     d.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] its braking limit")
     d.add_argument("--raceline-objective", default=None, help="the teacher line's objective (e.g. min_time)")
+    d.add_argument("--env-extra", default="", help="JSON of EnvConfig fields added to the D3 world (props etc.)")
     d.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     d.add_argument("--n-beams", type=int, default=1081)
     d.add_argument("--fov", type=float, default=4.71238898)
