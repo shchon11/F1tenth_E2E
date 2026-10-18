@@ -695,7 +695,8 @@ class PlannerEgoDriver:
         if mode is not None and self.stack is not None and self.kind in ("forzaeth", "forzaeth_pred"):
             trailing, gap, vs, visible = self._trailing_opponent(rows, mode, idx, td)
         steer, speed = mp(s_r[:, :2], s_r[:, 2], s_r[:, 3], path_xy, path_v, kappa, ds, d_glob, gb,
-                          trailing=trailing, opp_gap=gap, opp_vs=vs, opp_visible=visible, ego_vs=s_r[:, 3])
+                          trailing=trailing, opp_gap=gap, opp_vs=vs, opp_visible=visible, ego_vs=s_r[:, 3],
+                          yaw_rate=s_r[:, 5])
         return torch.stack([steer, speed / P["speed_gain"][rows]], 1)
 
     def _trailing_opponent(self, rows, mode, idx, td):

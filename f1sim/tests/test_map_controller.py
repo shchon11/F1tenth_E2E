@@ -205,3 +205,5 @@ def test_the_switches_move_what_they_name():
     assert abs(float((a["l1_point"][0, 0] - 1.0)) - float(a["l1"])) < 0.06            # L1 of arc ahead
     m, _ = run(steer_speed="measured")
     assert float(m["lat_acc"]) < float(a["lat_acc"])          # v_t = 3 m/s against the planned 6
+    dly, _ = run(delay_comp=0.1)
+    assert int(dly["idx_near"]) == int(a["idx_near"]) + 3      # carried 3 m/s x 0.1 s = 0.3 m forward

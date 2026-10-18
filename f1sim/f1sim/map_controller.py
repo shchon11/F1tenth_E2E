@@ -97,6 +97,10 @@ class MAPParams:
     l1_point: str = "arc"           # "arc" (both codes) | "euclid" (the paper's L1 guidance)
     steer_speed: str = "planned"    # "planned" (both codes) | "measured" (paper eq. 2's v_t)
     lut_interp: str = "code"        # "code" (nearest v column, np.interp pair) | "linear" (bilinear)
+    #: [s] not in MAP: the pose is first carried forward this long at the measured speed and yaw rate,
+    #: the actuation delay the reference teacher's pure pursuit compensates (cmd_delay + servo_tau / 2,
+    #: 0.055 s on this car). 0 is race_stack.
+    delay_comp: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "MAPParams":
@@ -340,7 +344,7 @@ class MAPController:
                  path_v: torch.Tensor, path_kappa: torch.Tensor, spacing: torch.Tensor, d_global: torch.Tensor,
                  grip: torch.Tensor, trailing: Optional[torch.Tensor] = None, opp_gap: Optional[torch.Tensor] = None,
                  opp_vs: Optional[torch.Tensor] = None, opp_visible: Optional[torch.Tensor] = None,
-                 ego_vs: Optional[torch.Tensor] = None):
+                 ego_vs: Optional[torch.Tensor] = None, yaw_rate: Optional[torch.Tensor] = None):
         """-> (steer command [rad], speed command [m/s]), (R,) each. `trailing` (R,) bool marks the
         cars whose planner is TRAILING an opponent that exists (race_stack: ``state == "TRAILING" and
         opponent is not None``); `opp_gap` / `opp_vs` / `opp_visible` describe it, `ego_vs` is the car's
@@ -350,6 +354,12 @@ class MAPController:
         dev = pos.device
         ar = torch.arange(R, device=dev)
         trailing = torch.zeros(R, dtype=torch.bool, device=dev) if trailing is None else trailing
+        if p.delay_comp > 0:
+            t_ = p.delay_comp
+            r_ = torch.zeros_like(yaw) if yaw_rate is None else yaw_rate
+            mid = yaw + 0.5 * r_ * t_
+            pos = pos + (v_now * t_)[:, None] * torch.stack([torch.cos(mid), torch.sin(mid)], 1)
+            yaw = yaw + r_ * t_
         vvec = torch.stack([torch.cos(yaw) * v_now, torch.sin(yaw) * v_now], 1)
 
         # calc_lateral_error_norm: |frenet d| to the GLOBAL line, normalised over 0..0.5 m to 0..0.5
