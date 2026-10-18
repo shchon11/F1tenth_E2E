@@ -207,3 +207,8 @@ def test_the_switches_move_what_they_name():
     assert float(m["lat_acc"]) < float(a["lat_acc"])          # v_t = 3 m/s against the planned 6
     dly, _ = run(delay_comp=0.1)
     assert int(dly["idx_near"]) == int(a["idx_near"]) + 3      # carried 3 m/s x 0.1 s = 0.3 m forward
+    c0 = M.MAPController(lut, M.MAPParams(steer_rate_limit=10.0), 1, "cpu", 0.4189)
+    c1 = M.MAPController(lut, M.MAPParams(steer_rate_limit=10.0, lat_slow=0.6), 1, "cpu", 0.4189)
+    _s0, v0 = c0(**base)
+    _s1, v1 = c1(**base)
+    assert abs(float(v1) / float(v0) - (1 - 0.6 * 0.4)) < 1e-4   # 0.4 m off the path: x 0.76

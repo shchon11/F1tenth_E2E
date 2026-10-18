@@ -101,6 +101,11 @@ class MAPParams:
     #: the actuation delay the reference teacher's pure pursuit compensates (cmd_delay + servo_tau / 2,
     #: 0.055 s on this car). 0 is race_stack.
     delay_comp: float = 0.0
+    #: [1/m] not in MAP either: the speed command x clip(1 - lat_slow * |error to the path|, 0.3, 1), the
+    #: off-line slowdown of the pure pursuit MAP replaces (its 0.6). race_stack's own reduction is gated by
+    #: the curvature ahead (2 mean|kappa| / 0.8 - 2 > 0, i.e. hairpins of radius < 1.25 m) and so is
+    #: almost never active on these tracks. 0 is race_stack.
+    lat_slow: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "MAPParams":
@@ -393,6 +398,10 @@ class MAPController:
             speed_cmd = global_speed
             self.i_gap = torch.zeros_like(self.i_gap)
         speed_cmd = speed_adjust_lat_err(speed_cmd, lat_e_norm, self.curv_wp)
+        if p.lat_slow > 0:
+            # the error to the path being followed: the distance to its nearest waypoint
+            e_path = (path_xy[ar, idx_near] - pos).norm(dim=1)
+            speed_cmd = speed_cmd * (1.0 - p.lat_slow * e_path).clamp(0.3, 1.0)
 
         # ---------------------------------------------------------------- lateral (calc_L1_point)
         # `curvature_waypoints`: mean |kappa| from the nearest waypoint to the end of the local array
