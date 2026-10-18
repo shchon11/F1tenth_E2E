@@ -124,7 +124,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              opp_token_ablate: bool = False,
              external: dict | None = None, research_estimator: bool = False,
              research_profile: str | None = None, graph_runtime: bool = False,
-             opponent_speed_mode: str | None = "auto") -> dict:
+             opponent_speed_mode: str | None = "auto", ego_stack: str = "oracle",
+             ego_stack_params: dict | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -390,6 +391,24 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         from .benchmark import model_adapter as _ma
         from ..params import VehicleParams
         policy = _ma.external_policy(driver, spec, float(VehicleParams().s_max))
+    elif teacher and ego_stack == "modular":
+        # A modular baseline as it would run on the car (2026-10-18, the user: no ground truth): its
+        # own particle filter, its own detection and tracking, the nominal actuator model, its own
+        # path follower -- the console's planner ego (`common.build_ego_driver`), one implementation.
+        # It drives through the env's external-driver override, so the action handed in is unread.
+        if teacher_kind not in ("raceline", *EGO_PLANNER_KINDS):
+            raise ValueError(f"--ego-stack modular drives a planner (raceline, {', '.join(EGO_PLANNER_KINDS)}), "
+                             f"not {teacher_kind!r}")
+        if teacher_grip != "true" or teacher_recover_time or teacher_speed != 1.0:
+            raise ValueError("--ego-stack modular takes the planner's own settings; teacher grip/recover/speed "
+                             "knobs belong to the teacher path")
+        ego_driver = common.build_ego_driver(env, teacher_kind, rls=ego_rls, limits=ego_limits, estimated=True,
+                                             stack_params=ego_stack_params)
+        env.set_ego_driver(ego_driver)
+        _zeros = torch.zeros(env.B, env.act_dim, device=env.device)
+
+        def policy(obs):
+            return _zeros
     elif teacher:
         teacher_policy = common.make_teacher(ego_rls, env, grip=teacher_grip, recover_time=teacher_recover_time,
                                              **ego_limits)
@@ -504,6 +523,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'checkpoint': str(ckpt), 'teacher': teacher, 'teacher_kind': teacher_kind if teacher else None,
         'raceline_objective': raceline_objective or 'min_curvature', 'teacher_limits': limits,
         'ego_teacher_limits': (ego_limits if teacher and ego_teacher_limits else None),
+        'ego_stack': (ego_stack if teacher else None),
+        'ego_stack_params': (ego_stack_params if teacher and ego_stack == "modular" else None),
         'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset),
         # the format the other cars planned in (None: the policy's own); league seats plan in their own
         'opponent_speed_mode': env.ecfg.opponent_speed_mode,
@@ -650,6 +671,12 @@ def main() -> None:
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of the teacher's speed profile")
     ap.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] drive limit of the profile")
     ap.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] braking limit of the profile")
+    ap.add_argument("--ego-stack", choices=["oracle", "modular"], default="oracle",
+                    help="with --teacher: 'modular' runs the planner on its own particle-filter localisation "
+                         "and LiDAR detection/tracking with the nominal actuator model (a baseline as on the "
+                         "car); 'oracle' hands it the simulator's state (an upper bound, label it so)")
+    ap.add_argument("--ego-stack-params", default="", metavar="JSON",
+                    help='{"pf": {...PFParams}, "det": {...DetectParams}, "trk": {...TrackParams}}')
     ap.add_argument("--ego-teacher-limits", default="", metavar="A_LAT,A_ACC,A_BRAKE",
                     help="with --teacher: the ego planner's own line and profile, the opponents keeping "
                          "the --teacher-a-* line (a planner baseline tuned for pace in the same race)")
@@ -793,6 +820,8 @@ def main() -> None:
                         teacher_limits=common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake),
                         ego_teacher_limits=(common.teacher_limits(*(float(x) for x in a.ego_teacher_limits.split(",")))
                                             if a.ego_teacher_limits else None),
+                        ego_stack=a.ego_stack,
+                        ego_stack_params=(json.loads(a.ego_stack_params) if a.ego_stack_params else None),
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,

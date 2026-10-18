@@ -51,6 +51,16 @@ NET_BEAM = (0.55, 0.82, 1.00, 0.85)        # a network's input beams
 STATE_KO = {"racing": "레이싱 라인 주행", "trailing": "앞차 뒤따르는 중", "overtaking": "추월 중 (회피 스플라인)",
             "changing": "차선 변경 중"}
 
+# A modular stack's own estimates (`modular_stack.ModularStack`), drawn as its RViz would.
+PARTICLE = (1.00, 0.55, 0.20, 0.45)        # the particle filter's particles
+EST_POSE = (0.95, 0.35, 0.95, 1.00)        # where the car believes it is
+DETECTION = (1.00, 0.92, 0.30, 0.95)       # this scan's detections
+TRACK_MOVING = (1.00, 0.30, 0.30, 1.00)    # a confirmed moving track (a car)
+TRACK_STATIC = (0.75, 0.75, 0.80, 1.00)    # a confirmed static track (a crate, a stopped car)
+#: particles drawn of each filter, and the time a track's velocity arrow spans [s]
+PARTICLES_DRAWN = 120
+ARROW_S = 0.5
+
 
 def external_rows(env) -> Dict[int, Tuple[int, int]]:
     """env row -> (slot, index among that slot's rows), for every car an external driver drives."""
@@ -110,29 +120,50 @@ def scanner_to_world(pose, mount):
 # ----------------------------------------------------------------------------------- planners
 def planner_tensors(drv, env, row: int) -> list:
     """Device tensors for one planner-driven row, flattened, for the snapshot's single host copy:
-    lookahead origin (2), target (2), path (2n), reference line (2n), profile speed (n), state (1)."""
+    lookahead origin (2), target (2), path (2n), reference line (2n), profile speed (n), state (1),
+    then -- with a modular stack -- what it believes (`stack_tensors`). The path is computed from
+    the state the planner itself drives on: the stack's estimate, not the truth."""
     import torch
     t = drv.teacher
     base = getattr(t, "base", t)
     frenet = base is not t
     dev = env.sim.state.device
     rows = torch.tensor([int(row)], device=dev)
+    stack = getattr(drv, "stack", None)
+    state = stack.est_state if stack is not None else env.sim.state
+    P = stack.nominal_P(env) if stack is not None else env.sim.P
     offset = getattr(t, "last_offset", None) if frenet else None
-    ex = base.explain_rows(env.sim.state, env.sim.P, env.sim.tid, rows, offset=offset,
-                           horizon_m=PLAN_HORIZON_M, n=PLAN_POINTS)
+    ex = base.explain_rows(state, P, env.sim.tid, rows, offset=offset, horizon_m=PLAN_HORIZON_M, n=PLAN_POINTS)
     path = ex["line"]
     if frenet:
-        d = t.path_offsets(rows, ex["s"], env.sim.state[rows, 3])
+        d = t.path_offsets(rows, ex["s"], state[rows, 3])
         if d is not None:
             path = path + d[..., None] * ex["normal"]
     last = getattr(t, "last_state", None) if frenet else None
     code = last[rows].float() if last is not None else torch.full((1,), -1.0, device=dev)
-    return [ex["origin"].reshape(-1).float(), ex["target"].reshape(-1).float(), path.reshape(-1).float(),
-            ex["line"].reshape(-1).float(), ex["v"].reshape(-1).float(), code.reshape(-1)]
+    out = [ex["origin"].reshape(-1).float(), ex["target"].reshape(-1).float(), path.reshape(-1).float(),
+           ex["line"].reshape(-1).float(), ex["v"].reshape(-1).float(), code.reshape(-1)]
+    if stack is not None:
+        out += stack_tensors(stack, env, int(row))
+    return out
 
 
-def planner_floats(n: int = PLAN_POINTS) -> int:
-    return 2 + 2 + 2 * n + 2 * n + n + 1
+def stack_tensors(stack, env, row: int) -> list:
+    """est pose (3), localisation error (1), particles (2k), detections (3c), tracks (5t)."""
+    import torch
+    i = int((stack.rows == row).nonzero()[0, 0])
+    pf, per = stack.pf, stack.per
+    k = min(PARTICLES_DRAWN, pf.N)
+    part = pf.particles[i, :k, :2]
+    err = (pf.estimate[i, :2] - env.sim.state[row, :2]).norm().reshape(1)
+    det = torch.cat([per.det_xy[i], per.det_valid[i, :, None].float()], 1)
+    tid = env.sim.tid[row].expand(per.T)
+    x = per.x[i]
+    tip = per.to_world(x[:, 0] + x[:, 2] * ARROW_S, x[:, 1] + x[:, 3] * ARROW_S, tid)
+    moving = (x[:, 2].abs() >= per.tp.static_speed).float()
+    trk = torch.cat([stack.obs_xy[row], tip, (per.confirmed[i].float() * (1.0 + moving))[:, None]], 1)
+    return [pf.estimate[i].float(), err.float(), part.reshape(-1).float(), det.reshape(-1).float(),
+            trk.reshape(-1).float()]
 
 
 def planner_overlay(drv, flat: np.ndarray, n: int = PLAN_POINTS):
@@ -142,7 +173,7 @@ def planner_overlay(drv, flat: np.ndarray, n: int = PLAN_POINTS):
     path = flat[i:i + 2 * n].reshape(n, 2); i += 2 * n
     line = flat[i:i + 2 * n].reshape(n, 2); i += 2 * n
     v = flat[i:i + n]; i += n
-    code = int(round(float(flat[i])))
+    code = int(round(float(flat[i]))); i += 1
     kind, title = kind_title(drv)
     names = getattr(drv.teacher, "STATE_NAMES", None)
     state = STATE_KO.get(names[code], names[code]) if names and 0 <= code < len(names) else "레이싱 라인 주행"
@@ -154,6 +185,31 @@ def planner_overlay(drv, flat: np.ndarray, n: int = PLAN_POINTS):
               {"xy": tgt[None], "rgba": TARGET, "px": 13.0}]
     legend = (f"{title} · {state} · 색 띠 = 따라가는 경로와 속도 프로파일 · 작은 점 = 경로 웨이포인트(0.5 m) · "
               f"큰 점 = 경로 추종기가 겨누는 점" + (" · 회색 = 레이싱 라인" if len(lines) > 1 else ""))
+    stack = getattr(drv, "stack", None)
+    if stack is not None:
+        est = flat[i:i + 3]; i += 3
+        err = float(flat[i]); i += 1
+        k = min(PARTICLES_DRAWN, stack.pf.N)
+        part = flat[i:i + 2 * k].reshape(k, 2); i += 2 * k
+        C = stack.per.det_xy.shape[1]
+        det = flat[i:i + 3 * C].reshape(C, 3); i += 3 * C
+        T = stack.per.T
+        trk = flat[i:i + 5 * T].reshape(T, 5); i += 5 * T
+        head = est[:2] + 0.45 * np.array([math.cos(est[2]), math.sin(est[2])], np.float32)
+        lines.append({"xy": np.stack([est[:2], head]), "rgba": EST_POSE, "w": 2.5})
+        on = trk[:, 4] > 0.5
+        if on.any():
+            seg = np.stack([trk[on, 0:2], trk[on, 2:4]], 1).reshape(-1, 2)
+            lines.append({"xy": seg, "rgba": TRACK_MOVING, "w": 2.0, "segments": True})
+        points = [{"xy": part, "rgba": PARTICLE, "px": 3.0}] + points
+        points.append({"xy": est[None, :2], "rgba": EST_POSE, "px": 9.0})
+        points.append({"xy": det[det[:, 2] > 0.5, :2], "rgba": DETECTION, "px": 6.0})
+        points.append({"xy": trk[trk[:, 4] > 1.5, :2], "rgba": TRACK_MOVING, "px": 11.0})
+        points.append({"xy": trk[(trk[:, 4] > 0.5) & (trk[:, 4] < 1.5), :2], "rgba": TRACK_STATIC, "px": 11.0})
+        legend += (f" · 위치추정 오차 {err * 100:.0f} cm (주황 = 파티클, 보라 = 추정 위치와 방향) · 노랑 = 이번 스캔 검출 · "
+                   f"빨강 = 추적 중인 움직이는 장애물(선 = {ARROW_S:g}초 예측), 회색 = 정지 장애물")
+    else:
+        legend += " · 위치·상대 참값 (oracle)"
     drv_fr = {"kind": kind, "title": title, "legend": legend, "lines": lines, "points": points}
     return np.concatenate([path, v[:, None]], 1).astype(np.float32), drv_fr
 

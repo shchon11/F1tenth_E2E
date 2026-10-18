@@ -693,21 +693,24 @@ class Scene:
         self._upload_dyn(f"plan{slot}", np.concatenate([pts, cols], 1)); setattr(self, n_attr, len(pts))
 
     #: How many lines and marker groups a driver overlay may carry (each is one buffer).
-    DRV_MAX_LINES = 6
-    DRV_MAX_POINTS = 4
+    DRV_MAX_LINES = 8
+    DRV_MAX_POINTS = 8
 
     def set_driver_overlay(self, lines=None, points=None):
         """What a non-policy driver computed (`viewer.driver_viz`): `lines` [(pts (n, 3), rgba (4,),
-        width px)] drawn as polylines, `points` [(pts (n, 3), rgba (4,), size px)] as fixed-size
-        discs over the scene. None or empty clears them."""
+        width px[, segments])] drawn as polylines -- or as separate segments, point pairs, when the
+        fourth item is true -- and `points` [(pts (n, 3), rgba (4,), size px)] as fixed-size discs
+        over the scene. None or empty clears them."""
         self.drv_lines, self.drv_points = [], []
-        for i, (pts, rgba, width) in enumerate((lines or [])[:self.DRV_MAX_LINES]):
+        for i, item in enumerate((lines or [])[:self.DRV_MAX_LINES]):
+            pts, rgba, width = item[:3]
+            segments = bool(item[3]) if len(item) > 3 else False
             pts = np.asarray(pts, np.float32).reshape(-1, 3)
             if len(pts) < 2:
                 continue
             cols = np.tile(np.asarray(rgba, np.float32), (len(pts), 1))
             self._upload_dyn(f"drvl{i}", np.concatenate([pts, cols], 1))
-            self.drv_lines.append((f"drvl{i}", len(pts), float(width)))
+            self.drv_lines.append((f"drvl{i}", len(pts), float(width), segments))
         for i, (pts, rgba, px) in enumerate((points or [])[:self.DRV_MAX_POINTS]):
             pts = np.asarray(pts, np.float32).reshape(-1, 3)
             if not len(pts):
@@ -904,9 +907,10 @@ class Scene:
             ctx.depth_mask = True
             self.ctx.line_width = 2.5
             self.plan0c_vao.render(moderngl.LINE_STRIP, vertices=n0)
-        for key, n, width in self.drv_lines:
+        for key, n, width, segments in self.drv_lines:
             self.ctx.line_width = width
-            getattr(self, f"{key}_vao").render(moderngl.LINE_STRIP, vertices=n)
+            getattr(self, f"{key}_vao").render(moderngl.LINES if segments else moderngl.LINE_STRIP,
+                                               vertices=n - (n % 2) if segments else n)
         if self.ring_n > 1:
             self.ctx.line_width = 2.5
             self.ring_vao.render(moderngl.LINE_STRIP, vertices=self.ring_n)

@@ -597,20 +597,32 @@ EGO_EXTERNAL_KINDS = ("tinylidarnet", "end2race", "ftg", "disparity")
 
 
 class PlannerEgoDriver:
-    """A planner driving the ego rows on its OWN path follower (steer, speed), as
-    `evaluate --teacher --action-mode direct` drives it, with ground-truth pose and the other cars'
-    true state -- privileged, which is how the modular baselines are measured here. Its TRAILING state
-    gets the env's follow cap, the gap every teacher-driven opponent keeps (`F1VecEnv.follow_cap`).
-    Used through `F1VecEnv.set_ego_driver`, which calls `command_env` every step."""
+    """A planner driving the ego rows on its OWN path follower (steer, speed). Used through
+    `F1VecEnv.set_ego_driver`, which calls `command_env` every step.
+
+    With a `stack` (`modular_stack.ModularStack`, the default from `build_ego_driver`) it drives on
+    what the car can know: its pose from a particle filter on its odometry and scan, the other cars
+    and the crates from detection and tracking on that scan, the nominal actuator model -- and holds
+    its trailing gap behind the nearest moving track. Without one (`estimated=False`) it is handed
+    the simulator's state, the opponents' true state and this episode's actuator parameters: an
+    ORACLE, an upper bound to label as such, never "the baseline" (the user, 2026-10-18: "모듈형은
+    왜 상대 위치랑 자기 위치를 gt로 써?")."""
 
     needs_speed = False
 
-    def __init__(self, teacher, kind: str):
+    def __init__(self, teacher, kind: str, stack=None):
         self.teacher, self.kind = teacher, kind
+        self.stack = stack
         self.rows = None
 
     def command_env(self, env, rows):
         import torch
+        if self.stack is not None:
+            st = self.stack.update(env)
+            cmd = self.teacher(st, self.stack.nominal_P(env), env.sim.tid)[rows].clone()
+            follow, v_cap = self.stack.follow_cap(env, st)
+            cmd[:, 1] = torch.where(follow[rows], torch.minimum(cmd[:, 1], v_cap[rows]), cmd[:, 1])
+            return cmd
         cmd = self.teacher(env.sim.state, env.sim.P, env.sim.tid)[rows].clone()
         if env.M > 1:                                  # alone on the track there is no car to trail
             follow, v_cap = env.follow_cap(env.sim.state)
@@ -626,11 +638,13 @@ class PlannerEgoDriver:
                 fn(ids)
 
     def describe(self) -> dict:
-        return {"kind": self.kind, "driver": type(self.teacher).__name__, "privileged": "ground-truth pose + opponents"}
+        return {"kind": self.kind, "driver": type(self.teacher).__name__,
+                "perception": ("particle filter + scan detection/tracking, nominal actuators" if self.stack is not None
+                               else "ORACLE: ground-truth pose, opponents and actuator parameters")}
 
 
 def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] = None, rls=None,
-                     limits: Optional[dict] = None):
+                     limits: Optional[dict] = None, estimated: bool = True, stack_params: Optional[dict] = None):
     """The ego driver the console's "내 차" names: a `PlannerEgoDriver` over our raceline teacher (wrapped
     in the published planner's class for forzaeth / forzaeth_pred / lane_switch, as the opponents
     are), or a `learn.baselines` driver bound to the simulator's scanner. `rls` is the line a planner
@@ -639,11 +653,24 @@ def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] 
     if kind in EGO_PLANNER_KINDS:
         if not rls:
             raise ValueError(f"ego '{kind}' drives a raceline, and this session has none")
-        base = make_teacher(rls, env, grip="true", **(limits or {}))
+        ref = make_teacher(rls, env, grip="true", **(limits or {}))
+        planner = ref
         if kind != "raceline":
             from ..opponent_slots import build_teacher, kind_of
-            base = build_teacher(kind_of(kind), base, env)
-        return PlannerEgoDriver(base, kind)
+            planner = build_teacher(kind_of(kind), ref, env)
+        stack = None
+        if estimated:
+            import torch as _torch
+            from ..modular_stack import ModularStack
+            from ..localization import PFParams
+            from ..perception import DetectParams, TrackParams
+            sp = dict(stack_params or {})
+            stack = ModularStack(env, _torch.nonzero(env.slot == 0).flatten(), ref,
+                                 pf=PFParams(**sp.get("pf", {})), det=DetectParams(**sp.get("det", {})),
+                                 trk=TrackParams(**sp.get("trk", {})))
+            if planner is not ref:
+                planner.observer = stack
+        return PlannerEgoDriver(planner, kind, stack)
     if kind in EGO_EXTERNAL_KINDS:
         from . import baselines
         opts = dict(options or {})

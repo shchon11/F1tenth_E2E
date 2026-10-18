@@ -46,6 +46,12 @@ class FrenetOpponentPlanner(RowPlanning):
     #: What `decide`'s second return means, index by code. Subclasses override.
     STATE_NAMES: Tuple[str, ...] = ("racing",)
 
+    #: Where the other cars and the crates come from. None: the simulator (what the opponents in our
+    #: races use -- they are traffic). A `modular_stack.ModularStack`: the car's own perception --
+    #: detection and tracking on its LiDAR, from its localisation estimate -- which is what a planner
+    #: compared against our policy is given (2026-10-18, no ground truth).
+    observer = None
+
     def __init__(self, base: RacelineTeacher, env=None):
         if not isinstance(base, RacelineTeacher):
             raise TypeError(f"{type(self).__name__} wraps a RacelineTeacher: the reference line, "
@@ -245,6 +251,8 @@ class FrenetOpponentPlanner(RowPlanning):
         n = self._normal(tid, idx)
         d = torch.as_tensor(d, device=p.device, dtype=p.dtype)
         q = p + d[..., None] * n
+        if props_only and self.observer is not None:
+            return self.observer.obstacle_clearance(q).to(q.dtype)
         if props_only:
             # The distance field is not asked at all: the question is what is in the road that the
             # reference line does not already account for, and the walls are not that. Skipping the
@@ -255,6 +263,10 @@ class FrenetOpponentPlanner(RowPlanning):
             ids = self._env_rows(q.shape[0], q.device)
             ids = ids.view(-1, *([1] * (q.dim() - 2))).expand(q.shape[:-1])
             return self.props.clearance(q.reshape(-1, 2), ids.reshape(-1)).view(q.shape[:-1])
+        if self.observer is not None:
+            # The map is known (a SLAM map); what stands in the road is only what the car tracked.
+            obs = self.observer.obstacle_clearance(q).to(q.dtype)
+            return obs if props_only else torch.minimum(self.track.sample_edt(q, tid), obs)
         edt = self.track.sample_edt(q, tid)
         if self.props is None:
             return edt
@@ -295,6 +307,8 @@ class FrenetOpponentPlanner(RowPlanning):
         this planner cannot match to the simulator's rows. Driving the raceline in that case is
         the honest answer; guessing where the other cars are is not.
         """
+        if self.observer is not None:
+            return self.observer.opponents(self, state, tid, rear)
         env = self.env
         if env is None or int(getattr(env, "M", 1)) < 2 or self.track is None:
             return None
@@ -354,7 +368,9 @@ class FrenetOpponentPlanner(RowPlanning):
         blockage is returned in the same (arc, lateral) shape a car is, and the callers pick
         whichever is nearer and plan around it with the machinery they already have.
         """
-        if self.props is None:
+        if self.props is None or self.observer is not None:
+            # With an observer the crates are among its tracks already: `_opponents` plans around
+            # the nearest of them, car or crate, as upstream's detector reports obstacles.
             far = torch.full((state.shape[0],), float("inf"), device=state.device,
                              dtype=state.dtype)
             return far, torch.zeros_like(far)
@@ -391,5 +407,7 @@ class FrenetOpponentPlanner(RowPlanning):
 
     def _opponent_speed(self, state: torch.Tensor) -> torch.Tensor:
         """Speed of the car `_opponents` picked, per row."""
+        if self.observer is not None:
+            return self.observer.opponent_speed(self, state)
         ar = torch.arange(state.shape[0], device=state.device)
         return self._opp_state(state)[self._r(self.env.sim.other_idx)[ar, self._nearest], 3].to(state.dtype)

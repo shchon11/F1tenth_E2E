@@ -987,7 +987,8 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             p = np.asarray(xy, np.float32).reshape(-1, 2)
             return np.concatenate([p, np.full((len(p), 1), z, np.float32)], 1)
         try:
-            sc.set_driver_overlay([(lift(l["xy"], 0.07), l["rgba"], l.get("w", 2.0)) for l in drv.get("lines") or []],
+            sc.set_driver_overlay([(lift(l["xy"], 0.07), l["rgba"], l.get("w", 2.0), l.get("segments", False))
+                                   for l in drv.get("lines") or []],
                                   [(lift(q["xy"], 0.09), q["rgba"], q.get("px", 6.0)) for q in drv.get("points") or []])
         except (KeyError, TypeError, ValueError):
             sc.set_driver_overlay(None, None)

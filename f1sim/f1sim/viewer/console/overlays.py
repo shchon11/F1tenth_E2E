@@ -231,7 +231,11 @@ class PolicyInputPanel(QtWidgets.QWidget):
             if len(pts) > 1:
                 p.setPen(QtGui.QPen(_qc(ln["rgba"], float(ln["rgba"][3])), max(1.0, float(ln.get("w", 2.0)) * 0.8),
                                     QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
-                p.drawPolyline(QtGui.QPolygonF(pts))
+                if ln.get("segments"):
+                    for a, b in zip(pts[0::2], pts[1::2]):
+                        p.drawLine(a, b)
+                else:
+                    p.drawPolyline(QtGui.QPolygonF(pts))
         for grp in self._drv.get("points") or []:
             r = max(1.5, float(grp.get("px", 6.0)) * 0.35)
             p.setPen(QtGui.QPen(QtGui.QColor(10, 12, 16, 200), 1.0))
