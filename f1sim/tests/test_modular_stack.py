@@ -100,3 +100,22 @@ def test_a_planner_with_an_observer_reads_no_ground_truth():
     st.obs_d[ego, 0] = 0.3
     g, d, *_ = sp._opponents(env.sim.state, env.sim.tid, torch.full((env.B,), -4.0))
     assert abs(float(g[ego]) - 2.0) < 0.15 and abs(float(d[ego]) - 0.3) < 1e-6
+
+
+def test_the_tuning_knobs_reach_the_planner_and_the_networks():
+    """What tune.py turns must be what drives: the planner's own kwargs, the follower's, a speed scale."""
+    import math as _m
+    from f1sim.learn import baselines
+    env, rl, lim = _env(race_size=2, envs=1, seed=3)
+    drv = common.build_ego_driver(env, "forzaeth", rls=[rl], limits=lim,
+                                  stack_params={"pf": {"n_particles": 50}, "teacher": {"lookahead_gain": 0.5},
+                                                "planner": {"evasion_dist": 0.8}, "det": {"min_points": 4}})
+    assert drv.teacher.evasion_dist == 0.8 and drv.teacher.base.k_ld == 0.5
+    assert drv.stack.per.dp.min_points == 4 and drv.stack.pf.N == 50
+    a = baselines.load("ftg", "none")
+    b = baselines.load("ftg", "none", speed_scale=1.5)
+    for d in (a, b):
+        d.bind_scanner(n_beams=1081, fov=1.5 * _m.pi, range_max=10.0)
+    scan = np.full((1, 1081), 3.0, np.float32)
+    ca, cb = a.command(scan, np.array([1.0], np.float32)), b.command(scan, np.array([1.0], np.float32))
+    assert cb[0, 0] == pytest.approx(ca[0, 0]) and cb[0, 1] == pytest.approx(1.5 * ca[0, 1])

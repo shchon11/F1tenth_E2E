@@ -653,18 +653,22 @@ def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] 
     if kind in EGO_PLANNER_KINDS:
         if not rls:
             raise ValueError(f"ego '{kind}' drives a raceline, and this session has none")
-        ref = make_teacher(rls, env, grip="true", **(limits or {}))
+        # `stack_params` carries the planner's own knobs as well as the stack's: "teacher" -- the
+        # reference follower's (`RacelineTeacher`: its speed profile's a_lat / a_acc / a_brake and
+        # v_max_profile, the pure-pursuit lookahead, the off-line slowdown), "planner" -- the
+        # spliner's / lane switcher's. They are what a team tunes, and what a fair comparison tunes.
+        sp = dict(stack_params or {})
+        ref = make_teacher(rls, env, grip="true", **dict(limits or {}, **sp.get("teacher", {})))
         planner = ref
         if kind != "raceline":
             from ..opponent_slots import build_teacher, kind_of
-            planner = build_teacher(kind_of(kind), ref, env)
+            planner = build_teacher(kind_of(kind), ref, env, **sp.get("planner", {}))
         stack = None
         if estimated:
             import torch as _torch
             from ..modular_stack import ModularStack
             from ..localization import PFParams
             from ..perception import DetectParams, TrackParams
-            sp = dict(stack_params or {})
             stack = ModularStack(env, _torch.nonzero(env.slot == 0).flatten(), ref,
                                  pf=PFParams(**sp.get("pf", {})), det=DetectParams(**sp.get("det", {})),
                                  trk=TrackParams(**sp.get("trk", {})))

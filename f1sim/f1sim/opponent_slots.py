@@ -223,7 +223,7 @@ KIND_NAMES = tuple(k.name for k in KINDS)
 KIND_BY_NAME = {k.name: k for k in KINDS}
 
 
-def build_teacher(kind: DriverKind, base, env):
+def build_teacher(kind: DriverKind, base, env, **kw):
     """The driver object a non-raceline teacher kind needs, built from the raceline teacher.
 
     One factory call, named by the registry entry: the per-car tensors (`speed_scale`,
@@ -235,7 +235,7 @@ def build_teacher(kind: DriverKind, base, env):
     if not mod_name or not cls_name:
         raise ValueError(f"opponent kind {kind.name!r} has no teacher factory to build")
     cls = getattr(importlib.import_module(mod_name), cls_name)
-    return cls(base, env=env)
+    return cls(base, env=env, **kw)
 
 
 def kind_of(name: str) -> DriverKind:

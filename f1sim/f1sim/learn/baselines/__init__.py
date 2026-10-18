@@ -11,9 +11,14 @@ The vendored upstream checkouts live under `external/baselines/` and are read-on
   End2Race       michigan-traffic-lab/End2Race @ c563dd07a8cefc978f88a09def82153469b6879c
                  (2025-11-12), MIT.
 
-The reactive classics (`reactive.py`, 2026-10-17) need no weights: `ftg` is ForzaETH's Follow-the-Gap
-(race_stack @ e7d07f7, MIT, vendored under `external/baselines/forzaeth_ftg/`), `disparity` the
-Disparity Extender built from its authors' description. Their `weights` argument names nothing.
+The reactive classics (`reactive.py`, 2026-10-17) need no weights: `ftg` is Follow-the-Gap (the
+RoboRacer course's reactive method; ForzaETH's implementation, race_stack @ e7d07f7, MIT, vendored
+under `external/baselines/forzaeth_ftg/`), `disparity` the Disparity Extender built from its authors'
+description. Their `weights` argument names nothing.
+
+Every kind also takes `speed_scale` (default 1): a multiplier on the speed it commands. It is the pace
+knob a team turns on a network that outputs speed, and the one a fair comparison tunes for the
+networks here (2026-10-18, the user: a baseline needing a speed limit must be tuned, not run as is).
 """
 from __future__ import annotations
 
@@ -24,7 +29,15 @@ KINDS = ("tinylidarnet", "end2race", "ftg", "disparity")
 
 
 def load(kind: str, weights: str, **opts) -> BaselineDriver:
-    """One baseline, ready to drive. `opts` are the driver's own, documented in its module."""
+    """One baseline, ready to drive. `opts` are the driver's own, documented in its module, plus
+    `speed_scale` for every kind."""
+    scale = float(opts.pop("speed_scale", 1.0))
+    drv = _load(kind, weights, **opts)
+    drv.speed_scale = scale
+    return drv
+
+
+def _load(kind: str, weights: str, **opts) -> BaselineDriver:
     k = str(kind or "").strip().lower()
     if k == "tinylidarnet":
         from . import tinylidarnet

@@ -71,6 +71,8 @@ class BaselineDriver:
     """
 
     KIND = "?"
+    #: Multiplier on the commanded speed (`load(..., speed_scale=...)`), 1 = as published.
+    speed_scale = 1.0
     #: Whether `command()` reads the `speed` argument at all. TinyLidarNet does not (it is a
     #: LiDAR-only network); End2Race does. The node uses this to decide whether a stale `/odom` is a
     #: reason to stop the car -- demanding a sensor the network never reads would stop it for
@@ -165,6 +167,9 @@ class BaselineDriver:
         self._ensure_batch(r.shape[0])
         out = self._forward(r, v)
         out = np.asarray(out, dtype=np.float32).reshape(r.shape[0], 2)
+        if self.speed_scale != 1.0:
+            out = out.copy()
+            out[:, 1] *= np.float32(self.speed_scale)
         if not np.isfinite(out).all():
             raise BaselineError(f"{self.KIND}: the network produced a non-finite command")
         return out
