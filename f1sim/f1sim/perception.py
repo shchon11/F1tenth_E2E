@@ -79,6 +79,8 @@ class Perception:
         self.active = torch.zeros(R, T, dtype=torch.bool, device=self.device)
         self.hits = torch.zeros(R, T, dtype=torch.long, device=self.device)
         self.misses = torch.zeros(R, T, dtype=torch.long, device=self.device)
+        #: per track: half extents behind / ahead (along s) and left / right (along d) of its centre [m]
+        self.ext = torch.zeros(R, T, 4, device=self.device)
         C = int(self.dp.max_obs)
         self.det_xy = torch.zeros(R, C, 2, device=self.device)          # this scan's detections (viewer)
         self.det_valid = torch.zeros(R, C, dtype=torch.bool, device=self.device)
@@ -177,6 +179,19 @@ class Perception:
         cen = torch.gather(centre, 1, j[..., None].expand(R, C, 2))
         w = torch.gather(cnt, 1, j)
         keep = torch.isfinite(near)
+        # Its extent, as upstream's obstacle message carries it (s_start/s_end, d_left/d_right): the
+        # cluster's two end points and its centre, in the Frenet frame. The far side is not seen, so
+        # the depth is at least `2 * center_shift` -- the same guess that placed the centre.
+        ends = torch.cat([torch.gather(first, 1, j[..., None].expand(R, C, 2)),
+                          torch.gather(last, 1, j[..., None].expand(R, C, 2)), cen], 1)       # (R, 3C, 2)
+        s3, d3, _ = self.frenet(ends, tid[:, None].expand(R, 3 * C))
+        s3, d3 = s3.view(R, 3, C), d3.view(R, 3, C)
+        L = self.base.length[tid][:, None]
+        rel = torch.remainder(s3 - s3[:, 2:3] + 0.5 * L[..., None], L[..., None]) - 0.5 * L[..., None]
+        ext_s0 = torch.minimum(rel.amin(1), torch.full_like(rel[:, 0], -dp.center_shift))      # (R, C) <= 0
+        ext_s1 = torch.maximum(rel.amax(1), torch.full_like(rel[:, 0], dp.center_shift))       # >= 0
+        ext_dl = (d3.amax(1) - d3[:, 2]).clamp_min(0.0)                                        # left of centre
+        ext_dr = (d3[:, 2] - d3.amin(1)).clamp_min(0.0)                                        # right of centre
         # One object, one detection: the breakpoint detector cuts a car at its corner into two
         # clusters a few centimetres apart, and two tracks for one car is a car the planner sees
         # twice. A cluster within `merge_dist` of a nearer kept one is folded into it (count-weighted).
@@ -190,7 +205,16 @@ class Perception:
             ar = torch.arange(R, device=self.device)
             wt, wc = w[ar, tgt], w[:, c]
             merged = (cen[ar, tgt] * wt[:, None] + cen[:, c] * wc[:, None]) / (wt + wc).clamp_min(1.0)[:, None]
+            # the folded cluster's extent stays covered: both boxes, around the merged centre
+            # Both boxes stay covered around the merged centre (conservatively, as discs: the target's
+            # extent plus how far its centre moved, and the folded one's reach from the new centre).
+            move = (merged - cen[ar, tgt]).norm(dim=-1)
+            reach = (cen[:, c] - merged).norm(dim=-1) + torch.maximum(torch.maximum(ext_dl[:, c], ext_dr[:, c]),
+                                                                       torch.maximum(-ext_s0[:, c], ext_s1[:, c]))
             cen[ar, tgt] = torch.where(fold[:, None], merged, cen[ar, tgt])
+            for e_t in (ext_dl, ext_dr, ext_s1):
+                e_t[ar, tgt] = torch.where(fold, torch.maximum(e_t[ar, tgt] + move, reach), e_t[ar, tgt])
+            ext_s0[ar, tgt] = torch.where(fold, torch.minimum(ext_s0[ar, tgt] - move, -reach), ext_s0[ar, tgt])
             w[ar, tgt] = torch.where(fold, wt + wc, wt)
             keep[:, c] = keep[:, c] & ~fold
         # inside the lane: the raceline's own left/right room at the centre's station
@@ -199,6 +223,7 @@ class Perception:
         inside = (d_c < self.lane_left[tt, i_c] - dp.lane_margin) & (d_c > -self.lane_right[tt, i_c] + dp.lane_margin)
         keep = keep & inside
         self.det_xy, self.det_valid = cen, keep
+        self.det_ext = torch.stack([-ext_s0, ext_s1, ext_dl, ext_dr], -1)        # (R, C, 4) half extents >= 0
         return cen, keep, s_c, d_c
 
     # ------------------------------------------------------------------ tracking
@@ -235,6 +260,7 @@ class Perception:
         jj = assign.clamp_min(0)
         z_s = torch.gather(s_c, 1, jj)
         z_d = torch.gather(d_c, 1, jj)
+        z_e = torch.gather(self.det_ext, 1, jj[..., None].expand(R, T, 4))
         # update
         H = torch.zeros(2, 4, device=self.device)
         H[0, 0] = H[1, 1] = 1.0
@@ -246,6 +272,7 @@ class Perception:
         x_new = self.x + (K @ y[..., None])[..., 0]
         P_new = (torch.eye(4, device=self.device) - K @ H) @ self.P
         self.x = torch.where(got[..., None], x_new, self.x)
+        self.ext = torch.where(got[..., None], 0.5 * self.ext + 0.5 * z_e, self.ext)
         self.P = torch.where(got[..., None, None], P_new, self.P)
         self.x[..., 0] = torch.remainder(self.x[..., 0], L[:, None])
         self.hits = torch.where(got, self.hits + 1, self.hits)
@@ -263,6 +290,7 @@ class Perception:
             init = torch.stack([s_c[:, c], d_c[:, c], torch.zeros(R, device=self.device),
                                 torch.zeros(R, device=self.device)], -1)[:, None, :].expand(R, T, 4)
             self.x = torch.where(m[..., None], init, self.x)
+            self.ext = torch.where(m[..., None], self.det_ext[:, c][:, None, :].expand(R, T, 4), self.ext)
             self.P = torch.where(m[..., None, None], P0.expand(R, T, 4, 4), self.P)
             self.hits = torch.where(m, torch.ones_like(self.hits), self.hits)
             self.misses = torch.where(m, torch.zeros_like(self.misses), self.misses)

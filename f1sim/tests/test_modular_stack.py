@@ -119,3 +119,45 @@ def test_the_tuning_knobs_reach_the_planner_and_the_networks():
     scan = np.full((1, 1081), 3.0, np.float32)
     ca, cb = a.command(scan, np.array([1.0], np.float32)), b.command(scan, np.array([1.0], np.float32))
     assert cb[0, 0] == pytest.approx(ca[0, 0]) and cb[0, 1] == pytest.approx(1.5 * ca[0, 1])
+
+
+def _upstream_spliner(env, rl, lim, obs):
+    """A spliner in upstream mode reading `obs` (a fixed obstacle list) through a stub observer."""
+    from f1sim.spliner_teacher import SplinerTeacher
+
+    class Stub:
+        def obstacle_list(self, planner, state, tid):
+            return obs
+    base = common.make_teacher([rl], env, grip="true", **lim)
+    sp = SplinerTeacher(base, env=env, upstream=True, fixed_pred_time=0.0)
+    sp.observer = Stub()
+    return sp
+
+
+def _one_obstacle(B, gap, d, half_w):
+    t = lambda v: torch.full((B, 1), float(v))
+    return {"gap": t(gap), "d": t(d), "vs": t(0), "vd": t(0), "back": t(0.15), "front": t(0.15),
+            "left": t(half_w), "right": t(half_w), "ok": torch.ones(B, 1, dtype=torch.bool)}
+
+
+def test_upstream_spliner_puts_the_apex_beyond_the_obstacles_edge():
+    """Upstream `_more_space`: the apex is evasion_dist beyond the obstacle's EDGE. A 1 m wide row at
+    the line is passed 0.5 + 0.65 = 1.15 m off it (where the lane has room), not 0.65 m off its centre."""
+    env, rl, lim = _env(race_size=1, envs=2, seed=3)
+    for w, want in ((0.15, 0.80), (0.5, 1.15)):
+        sp = _upstream_spliner(env, rl, lim, _one_obstacle(env.B, 4.0, 0.0, w))
+        lb, rb = sp._lane_bounds()
+        sp.decide(env.sim.state, env.sim.tid)
+        d_apex = sp.last_spline[0]
+        passing = [b for b in range(env.B) if int(sp.last_state[b]) == 2]
+        assert passing, f"no row passes a {2 * w:.1f} m obstacle 4 m ahead (states {sp.last_state.tolist()})"
+        for b in passing:                                          # the apex is the edge + evasion
+            assert abs(abs(float(d_apex[b])) - want) < 1e-5, (w, float(d_apex[b]))
+
+
+def test_upstream_spliner_trails_where_the_spline_would_meet_the_boundary():
+    """No room on either side (a 3 m wide obstacle): upstream drops the evasion -> TRAILING, offset 0."""
+    env, rl, lim = _env(race_size=1, envs=2, seed=3)
+    sp = _upstream_spliner(env, rl, lim, _one_obstacle(env.B, 4.0, 0.0, 1.5))
+    d, mode, _ = sp.decide(env.sim.state, env.sim.tid)
+    assert bool((mode == 1).all()) and float(d.abs().max()) == 0.0

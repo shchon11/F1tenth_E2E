@@ -662,7 +662,15 @@ def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] 
         planner = ref
         if kind != "raceline":
             from ..opponent_slots import build_teacher, kind_of
-            planner = build_teacher(kind_of(kind), ref, env, **sp.get("planner", {}))
+            pk = dict(sp.get("planner", {}))
+            if kind in ("forzaeth", "forzaeth_pred"):
+                # The ego baseline runs upstream's spline planner, not the simplified one our traffic
+                # runs (`SplinerTeacher.upstream`), with upstream's own prediction time for `forzaeth`.
+                from ..spliner_teacher import UPSTREAM_PRED_TIME
+                pk.setdefault("upstream", True)
+                if kind == "forzaeth":
+                    pk.setdefault("fixed_pred_time", UPSTREAM_PRED_TIME)
+            planner = build_teacher(kind_of(kind), ref, env, **pk)
         stack = None
         if estimated:
             import torch as _torch

@@ -51,6 +51,9 @@ class ModularStack:
         self.obs_vs = torch.zeros(B, T, device=dev)
         self.obs_ok = torch.zeros(B, T, dtype=torch.bool, device=dev)
         self.obs_xy = torch.zeros(B, T, 2, device=dev)
+        self.obs_vd = torch.zeros(B, T, device=dev)
+        #: half extents behind / ahead / left / right of each track's centre [m] (`Perception.ext`)
+        self.obs_ext = torch.zeros(B, T, 4, device=dev)
         self.est_state = env.sim.state.clone()
         self._nearest = torch.zeros(B, dtype=torch.long, device=dev)
         act = env.cfg.actuator
@@ -85,6 +88,8 @@ class ModularStack:
         self.obs_s[rows] = self.per.x[..., 0]
         self.obs_d[rows] = self.per.x[..., 1]
         self.obs_vs[rows] = self.per.x[..., 2]
+        self.obs_vd[rows] = self.per.x[..., 3]
+        self.obs_ext[rows] = self.per.ext
         self.obs_xy[rows] = self.per.to_world(self.per.x[..., 0], self.per.x[..., 1], tid[:, None].expand_as(ok))
         return st
 
@@ -125,6 +130,17 @@ class ModularStack:
         self._nearest = j
         return g, self.obs_d[ar, j].to(dt), idx_opp, tid_b, ego_d
 
+    def obstacle_list(self, planner, state, tid):
+        """Every track of each row's car as upstream's `ObstacleArray` carries it, relative to the car:
+        (gap to the centre [m, + ahead], d centre, vs, vd, half extents behind / ahead / left / right,
+        valid), each (B, T). What `SplinerTeacher` in upstream mode plans from."""
+        gaps, _ = self._gaps(planner, state, tid)
+        ok = self.obs_ok & torch.isfinite(gaps)
+        g = torch.where(ok, gaps, torch.zeros_like(gaps))
+        e = self.obs_ext
+        return {"gap": g, "d": self.obs_d, "vs": self.obs_vs, "vd": self.obs_vd, "back": e[..., 0],
+                "front": e[..., 1], "left": e[..., 2], "right": e[..., 3], "ok": ok}
+
     def opponent_speed(self, planner, state):
         ar = torch.arange(state.shape[0], device=state.device)
         return self.obs_vs[ar, self._nearest].clamp_min(0.0).to(state.dtype)
@@ -135,7 +151,8 @@ class ModularStack:
         static = self.obs_ok & (self.obs_vs.abs() < self.per.tp.static_speed)
         B = q.shape[0]
         flat = q.reshape(B, -1, 2)
-        d = (flat[:, :, None, :] - self.obs_xy[:, None, :, :]).norm(dim=-1) - self.per.tp.obs_radius
+        radius = torch.maximum(self.obs_ext.amax(-1), torch.full_like(self.obs_ext[..., 0], self.per.tp.obs_radius))
+        d = (flat[:, :, None, :] - self.obs_xy[:, None, :, :]).norm(dim=-1) - radius[:, None, :]
         d = torch.where(static[:, None, :], d, torch.full_like(d, float("inf")))
         return d.amin(-1).view(q.shape[:-1])
 

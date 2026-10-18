@@ -92,6 +92,10 @@ FIXED_PRED_TIME = 0.5
 #: State machine codes. Exposed so a caller can log or plot which state each row was in.
 RACING, TRAILING, OVERTAKING = 0, 1, 2
 
+#: Upstream's extra stretch of the control points when the pass is on the outside of the corner
+#: (`do_spline`: `si = s_apex + dst * 1.75`, a "TODO make parameter" there).
+OUTSIDE_STRETCH = 1.75
+
 
 def _natural_cubic(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """(n-1, 4) coefficients of the natural cubic spline through (x, y), lowest power first.
@@ -154,8 +158,16 @@ class SplinerTeacher(FrenetOpponentPlanner):
                  obs_traj_thresh: float = OBS_TRAJ_THRESH,
                  side_switch_d: float = SIDE_SWITCH_D,
                  inside_speed_scale: float = INSIDE_SPEED_SCALE,
-                 fixed_pred_time: float = 0.0):
+                 fixed_pred_time: float = 0.0,
+                 upstream: bool = False,
+                 outside_stretch: float = OUTSIDE_STRETCH):
         super().__init__(base, env=None)          # attach last: the fields below are its inputs
+        #: True: `decide` is upstream's `do_spline` (race_stack @ 6a2900a, see `_decide_upstream`) --
+        #: what an ego baseline runs. False: the simplified spliner the opponents in our races have
+        #: always run, kept so that the traffic our policies were trained and scored against does
+        #: not change under them.
+        self.upstream = bool(upstream)
+        self.outside_stretch = float(outside_stretch)
         self.evasion_dist = float(evasion_dist)
         self.bound_mindist = float(bound_mindist)
         self.lookahead = float(lookahead)
@@ -179,6 +191,194 @@ class SplinerTeacher(FrenetOpponentPlanner):
     @torch.no_grad()
     def decide(self, state: torch.Tensor, tid: Optional[torch.Tensor] = None
                ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        if self.upstream:
+            return self._decide_upstream(state, tid)
+        return self._decide_simplified(state, tid)
+
+    @torch.no_grad()
+    def _decide_upstream(self, state: torch.Tensor, tid: Optional[torch.Tensor] = None
+                         ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Upstream's `SplinePlanner.do_spline` (ForzaETH race_stack @ 6a2900a, `planner/local_planners/
+        spline_planner/spline_planner.py`), batched -- read from the source, line for line where it
+        decides anything:
+
+        * obstacles within 10 m are moved `fixed_pred_time` ahead at their tracked (vs, vd)
+          (`_predict_obs_movement`, mode "constant": upstream's default 0.15 s);
+        * only obstacles with |d_center| < `obs_traj_thresh` and within `lookahead` ahead count
+          (`_obs_filtering`), the closest of them is the one splined around;
+        * the apex sits at the obstacle's longitudinal centre (s_start + s_end) / 2, displaced
+          `evasion_dist` beyond its LEFT or RIGHT EDGE -- not its centre (`_more_space`): a side is
+          usable when the gap between that edge and the track boundary exceeds evasion_dist +
+          spline_bound_mindist; with both or neither usable, the apex nearer the raceline wins; an
+          apex on the far side of the raceline is pulled back to it;
+        * the control points stretch by clip(1 + v / v_max, 1, 1.5), and by 1.75 more when the pass is
+          on the outside of the corner; the offset is clipped to [0, d_apex];
+        * no side switch while more than 0.25 m off the raceline (`_check_ot_side_possible`), and no
+          evasion at all where the spline comes within `spline_bound_mindist` of the boundary -- both
+          leave the car on the raceline behind the obstacle (TRAILING; the env's or the stack's
+          follow cap holds the gap, upstream's state machine does it there);
+        * an inside pass drives the plan's speed x 0.9.
+
+        One addition, ours: an obstacle stays the one splined around until the car is `4 m x stretch`
+        past it (`CONTROL_S[0]`), because this runs stateless per step and upstream's state machine is
+        what finishes a pass there.
+        """
+        B = state.shape[0]
+        dev, dt = state.device, state.dtype
+        zero = torch.zeros(B, device=dev, dtype=dt)
+        one = torch.ones(B, device=dev, dtype=dt)
+        mode = torch.full((B,), RACING, device=dev, dtype=torch.long)
+        Bf = self._opp_state(state).shape[0]
+        if self._side is None or self._side.shape != (Bf,) or self._side.device != dev:
+            self._side = torch.zeros(Bf, device=dev, dtype=dt)
+        tid_b = torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid
+        obs = self._obstacles(state, tid_b)
+        if obs is None:
+            self.last_state, self.last_offset, self.last_spline = mode, zero, None
+            return None, mode, one
+        stretch = self._stretch(state)
+        base = self.base
+        # prediction (`_predict_obs_movement`, constant): only obstacles within 10 m are moved
+        near = obs["ok"] & (obs["gap"] < 10.0)
+        gap = torch.where(near, obs["gap"] + self.fixed_pred_time * obs["vs"], obs["gap"])
+        dc = torch.where(near, obs["d"] + self.fixed_pred_time * obs["vd"], obs["d"])
+        rear = CONTROL_S[0] * stretch
+        cand = obs["ok"] & (dc.abs() < self.obs_traj_thresh) & (gap < self.lookahead) & (gap > rear[:, None])
+        rank = torch.where(cand, gap, torch.full_like(gap, float("inf")))
+        j = rank.argmin(1)
+        ar = torch.arange(B, device=dev)
+        engaged = torch.isfinite(rank[ar, j])
+        g, d0 = gap[ar, j], dc[ar, j]
+        back, front = obs["back"][ar, j], obs["front"][ar, j]
+        gap_apex = g + 0.5 * (front - back)                       # (s_start + s_end) / 2
+        d_left = d0 + obs["left"][ar, j]
+        d_right = d0 - obs["right"][ar, j]
+        ds = base.ds[tid_b]
+        idx_e = base.project(state[:, :2], tid_b)[0]
+        idx_apex = torch.remainder(idx_e + (gap_apex / ds).round().long(), base.N)
+        lane_l, lane_r = self._lane_bounds()
+        lb, rb = lane_l[tid_b, idx_apex], lane_r[tid_b, idx_apex]
+        left_gap, right_gap = (lb - d_left).abs(), (rb + d_right).abs()
+        min_space = self.evasion_dist + self.bound_mindist
+        cand_l, cand_r = d_left + self.evasion_dist, d_right - self.evasion_dist
+        only_r = (right_gap > min_space) & (left_gap < min_space)
+        only_l = (left_gap > min_space) & (right_gap < min_space)
+        go_left = torch.where(only_r, torch.zeros_like(only_r),
+                              torch.where(only_l, torch.ones_like(only_l), cand_l.abs() <= cand_r.abs()))
+        side = torch.where(go_left, one, -one)
+        d_apex = torch.where(go_left, cand_l.clamp_min(0.0), cand_r.clamp_max(0.0))
+        # the outside of the corner at the apex: the sign of the summed curvature over the next 2 m
+        n_k = max(2, int(round(2.0 / float(base.ds.min()))))
+        kk = torch.remainder(idx_apex[:, None] + torch.arange(n_k, device=dev)[None], base.N)
+        outside = torch.where(base.kappa[tid_b[:, None], kk].sum(1) < 0, one, -one)   # + left
+        span = stretch * torch.where(outside == side, torch.full_like(one, self.outside_stretch), one)
+        # side lock and the track-bound check -> no evasion (TRAILING)
+        held = self._r(self._side)
+        ego_d = self._lateral(state[:, :2], tid_b)[0]
+        blocked_switch = (ego_d.abs() > self.side_switch_d) & (held != 0) & (side != held)
+        rs = torch.linspace(CONTROL_S[0], CONTROL_S[-1], 33, device=dev, dtype=dt)
+        lo, hi = torch.minimum(d_apex, zero), torch.maximum(d_apex, zero)
+        d_s = (d_apex[:, None] * self._shape_at(rs).to(dt)[None]).clamp(min=lo[:, None]).clamp(max=hi[:, None])
+        idx_s = torch.remainder(idx_e[:, None] + ((gap_apex[:, None] + rs[None] * span[:, None]) / ds[:, None]).round().long(),
+                                base.N)
+        bound = torch.where(side[:, None] > 0, lane_l[tid_b[:, None], idx_s], lane_r[tid_b[:, None], idx_s])
+        too_close = ((d_s.abs() > 0.1) & (d_s.abs() > bound - self.bound_mindist)).any(1)
+        danger = blocked_switch | too_close
+        passing = engaged & ~danger
+        trailing = engaged & danger
+        r0 = ((0.0 - gap_apex) / span).to(dt)
+        d_cmd = (d_apex * self._shape_at(r0)).clamp(min=lo).clamp(max=hi)
+        d_out = torch.where(passing, d_cmd, zero)
+        mode = torch.where(passing, torch.full_like(mode, OVERTAKING),
+                           torch.where(trailing, torch.full_like(mode, TRAILING), mode))
+        self._put(self._side, torch.where(passing, side, held))
+        scale = torch.where(passing & (outside != side), one * self.inside_speed_scale, one)
+        self.last_state, self.last_offset = mode, d_out
+        self.last_spline = (d_apex, gap_apex, span)
+        return d_out, mode, scale
+
+    def _obstacles(self, state: torch.Tensor, tid: torch.Tensor):
+        """Upstream's `ObstacleArray` relative to each car: the observer's tracks (the modular
+        stack), or -- the oracle -- the other cars and the procedural props from the simulator, with
+        their true footprints. (B, K) tensors: gap to the centre (+ ahead, on the raceline's own
+        arc), d centre, vs, vd, half extents back / front / left / right, ok. None: nothing to see."""
+        if self.observer is not None:
+            return self.observer.obstacle_list(self, state, tid)
+        env, base = self.env, self.base
+        if env is None:
+            return None
+        B = state.shape[0]
+        dev = state.device
+        idx_e = base.project(state[:, :2], tid)[0]
+        L = base.length[tid]
+        parts = []
+
+        def frenet(xy, tid_k):
+            idx = base.project(xy.reshape(-1, 2), tid_k.reshape(-1))[0].view(xy.shape[:-1])
+            nrm = self._normal(tid_k, idx)
+            d = ((xy - base.xy[tid_k, idx]) * nrm).sum(-1)
+            g = torch.remainder((idx - idx_e[:, None]).to(state.dtype) * base.ds[tid][:, None] + 0.5 * L[:, None],
+                                L[:, None]) - 0.5 * L[:, None]
+            return g, d
+
+        if int(getattr(env, "M", 1)) >= 2 and env.sim.other_idx is not None \
+                and self._opp_state(state).shape[0] == env.sim.state.shape[0]:
+            other = self._r(env.sim.other_idx)
+            whole = self._opp_state(state)
+            C = other.shape[1]
+            tid_c = tid[:, None].expand(B, C)
+            g, d = frenet(whole[other, :2], tid_c)
+            half_l = 0.5 * float(env.cfg.vehicle.length)
+            half_w = 0.5 * float(env.cfg.vehicle.width)
+            full = torch.ones_like(g)
+            parts.append({"gap": g, "d": d, "vs": whole[other, 3], "vd": torch.zeros_like(g), "back": full * half_l,
+                          "front": full * half_l, "left": full * half_w, "right": full * half_w,
+                          "ok": torch.ones_like(g, dtype=torch.bool)})
+        if self.props is not None:
+            pr = self.props
+            rows = self._env_rows(B, dev)
+            sid = pr.p_sid[rows]
+            alive = sid >= 0
+            P = sid.shape[1]
+            tid_p = tid[:, None].expand(B, P)
+            g, d = frenet(pr.p_poses[rows, :, :2], tid_p)
+            if not hasattr(self, "_sh_along"):
+                self._sh_along = torch.tensor([s_.along for s_ in pr.shapes], dtype=torch.float32, device=dev)
+            sc = sid.clamp_min(0)
+            half_a = 0.5 * pr.sh_across[sc].to(g.dtype)
+            half_l = 0.5 * self._sh_along[sc].to(g.dtype)
+            parts.append({"gap": g, "d": d, "vs": torch.zeros_like(g), "vd": torch.zeros_like(g), "back": half_l,
+                          "front": half_l, "left": half_a, "right": half_a, "ok": alive})
+        if not parts:
+            return None
+        return {k: torch.cat([p_[k] for p_ in parts], 1) for k in parts[0]}
+
+    def _lane_bounds(self):
+        """(T, N) metres from each reference point to the static map, left and right: upstream's
+        global waypoints' d_left / d_right (the track boundaries the spliner checks against)."""
+        held = getattr(self, "_lanes", None)
+        if held is not None:
+            return held
+        base, tr = self.base, self.track
+        xy, tan = base.xy, base.tan
+        Tn, N, _ = xy.shape
+        tid = torch.arange(Tn, device=xy.device)[:, None].expand(Tn, N)
+        out = []
+        for sign in (1.0, -1.0):
+            nrm = torch.stack([-tan[..., 1], tan[..., 0]], -1) * sign
+            ok = torch.ones(Tn, N, dtype=torch.bool, device=xy.device)
+            w = torch.zeros(Tn, N, device=xy.device)
+            for k in range(1, 61):
+                o = 0.05 * k
+                ok = ok & (tr.sample_edt(xy + nrm * o, tid) > 0.03)
+                w = torch.where(ok, torch.full_like(w, o), w)
+            out.append(w)
+        self._lanes = (out[0], out[1])
+        return self._lanes
+
+    @torch.no_grad()
+    def _decide_simplified(self, state: torch.Tensor, tid: Optional[torch.Tensor] = None
+                           ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """(offset [m left of the reference line], state code, speed scale) per row.
 
         The offset is the spline evaluated at the car's own station: the control points are what
@@ -280,6 +480,9 @@ class SplinerTeacher(FrenetOpponentPlanner):
         d_apex, s_apex, stretch = (t[rows].to(s.dtype) for t in self.last_spline)
         r = (s[None, :] - s_apex[:, None]) / stretch[:, None]
         d = d_apex[:, None] * self._shape_at(r.reshape(-1)).reshape(r.shape)
+        if self.upstream:                                    # upstream clips the spline to [0, d_apex]
+            z = torch.zeros_like(d_apex)
+            d = d.clamp(min=torch.minimum(d_apex, z)[:, None]).clamp(max=torch.maximum(d_apex, z)[:, None])
         passing = (self.last_state[rows] == OVERTAKING)[:, None]
         return torch.where(passing, d, torch.zeros_like(d))
 
@@ -328,3 +531,7 @@ class PredictiveSplinerTeacher(SplinerTeacher):
     def __init__(self, base: RacelineTeacher, env=None, *,
                  fixed_pred_time: float = FIXED_PRED_TIME, **kw):
         super().__init__(base, env=env, fixed_pred_time=fixed_pred_time, **kw)
+
+#: Upstream's spline_planner predicts every obstacle within 10 m by this much at its tracked speed
+#: (`fixed_pred_time`, `_predict_obs_movement` mode "constant"): the ego spliner's default.
+UPSTREAM_PRED_TIME = 0.15
