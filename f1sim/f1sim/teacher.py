@@ -621,6 +621,57 @@ class RacelineTeacher:
             return torch.maximum(torch.minimum(offset, lim[..., 0]), -lim[..., 1])
         return torch.clamp(offset, -lim, lim)
 
+    @torch.no_grad()
+    def explain_rows(self, state: torch.Tensor, P=None, tid: Optional[torch.Tensor] = None,
+                     rows: Optional[torch.Tensor] = None, offset: Optional[torch.Tensor] = None,
+                     horizon_m: float = 12.0, n: int = 49) -> dict:
+        """What `__call__` aims at, for a viewer to draw (the console, 2026-10-18).
+
+        The same latency compensation, projection, lookahead and offset as `__call__` in mode "pp",
+        for `rows` of the batch: the pure-pursuit target the steering is computed from, and the
+        stretch of line ahead with the speed profile the command is read from. `offset` is the
+        whole batch's, exactly as it would be passed to `__call__`. Everything stays on the device,
+        so a caller can take it in the one host copy it already makes.
+
+        Returns `origin` (R, 2) the compensated position the lookahead is measured from, `target`
+        (R, 2), `s` (n,) metres ahead, `line` (R, n, 2) the reference line there, `normal`
+        (R, n, 2) its left normal and `v` (R, n) the profile speed [m/s].
+        """
+        if self.mode != "pp":
+            raise ValueError("explain_rows draws the pure-pursuit target; mode 'stanley' has none")
+        B = state.shape[0]
+        dev = state.device
+        rows = torch.arange(B, device=dev) if rows is None else rows
+        st = state[rows]
+        xy, yaw, vx = st[:, :2], st[:, 2], st[:, 3]
+        td = (torch.zeros(B, dtype=torch.long, device=dev) if tid is None else tid)[rows]
+        if P is not None:
+            dt_c = (P["cmd_delay"] + 0.5 * P["servo_tau"])[rows]
+            yaw_c = yaw + st[:, 5] * dt_c
+            xy = xy + torch.stack([vx * torch.cos(yaw_c), vx * torch.sin(yaw_c)], 1) * dt_c[:, None]
+        idx, _ = self.project(xy, td)
+        ds = self.ds[td]
+        ld = (self.k_ld * vx.abs()).clamp(self.ld_min, self.ld_max)
+        tgt_idx = (idx + (ld / ds).round().long()) % self.N
+        tgt = self.xy[td, tgt_idx]
+        if offset is not None:
+            off = self.clamp_offset(offset[rows], td, idx)
+            tn = self.tan[td, tgt_idx]
+            tgt = tgt + off[:, None] * torch.stack([-tn[:, 1], tn[:, 0]], 1)
+        s = torch.linspace(0.0, float(horizon_m), int(n), device=dev)
+        j = (idx[:, None] + (s[None, :] / ds[:, None]).round().long()) % self.N
+        tn = self.tan[td[:, None], j]
+        gb = self.grip_bin(P, B, dev)[rows]
+        if self.speed_mode == "sqrt":
+            v = self.v[td[:, None], j] * torch.sqrt(self.grip_levels_t[gb])[:, None]
+        else:
+            v = self.v_grip[td[:, None], gb[:, None], j]
+        sc = self.speed_scale
+        if torch.is_tensor(sc) and sc.ndim == 1 and sc.numel() == B:
+            sc = sc[rows][:, None]
+        return {"origin": xy, "target": tgt, "s": s, "line": self.xy[td[:, None], j],
+                "normal": torch.stack([-tn[..., 1], tn[..., 0]], -1), "v": v * sc}
+
     def project(self, xy: torch.Tensor, tid: Optional[torch.Tensor] = None):
         tid = torch.zeros(xy.shape[0], dtype=torch.long, device=xy.device) if tid is None else tid
         d2 = ((xy[:, None, :] - self.xy[tid]) ** 2).sum(-1)

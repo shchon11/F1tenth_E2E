@@ -46,6 +46,8 @@ def test_sat_matches_simulator_for_random_heading_and_rear_boxes():
     sim.car_rear = torch.zeros(b, 4)
     sim.car_rear[:, 0] = torch.rand(b, generator=gen) * .12
     sim.corners = torch.tensor([[.29, .155], [.29, -.155], [-.29, .155], [-.29, -.155]])
+    # The nominal 0.50 m silhouette, so `_car_contacts` scales the corners by exactly 1 (f895dc1).
+    sim.car_dims = torch.tensor([0.50, 0.31, 0.20]).expand(b, 3).clone()
     t.env = SimpleNamespace(sim=sim)
     world, yaw = state[None, :, None, :2], state[None, :, None, 2]
     future = state[sim.other_idx, :2][:, :, None]
@@ -83,6 +85,7 @@ def test_oriented_nose_and_contained_asset_are_hard_violations():
 
 def test_future_yaw_api_preserves_old_result_and_stopped_measured_heading():
     env = F1VecEnv.__new__(F1VecEnv)
+    env.external_drivers = {}           # no baseline drives any row (`car_future` asks)
     state = torch.zeros(2, 8)
     state[:, 2] = torch.tensor([1.1, -2.2])
     env.device = torch.device("cpu")
@@ -98,6 +101,7 @@ def test_future_yaw_api_preserves_old_result_and_stopped_measured_heading():
 
 def test_tracker_yaw_interpolates_on_delay_clock_and_keeps_current_t0():
     env = F1VecEnv.__new__(F1VecEnv)
+    env.external_drivers = {}           # no baseline drives any row (`car_future` asks)
     state = torch.zeros(2, 8)
     state[:, 2] = 1.0
     env.device = torch.device("cpu")
@@ -213,6 +217,7 @@ def test_swept_rotating_body_contains_dense_intermediate_contacts():
 
 def test_reset_rows_do_not_reuse_previous_episode_opponent_prediction():
     env = F1VecEnv.__new__(F1VecEnv)
+    env.external_drivers = {}           # no baseline drives any row (`car_future` asks)
     state = torch.zeros(2, 8)
     state[:, 2] = torch.tensor([0., math.pi / 2])
     state[:, 3] = 3.

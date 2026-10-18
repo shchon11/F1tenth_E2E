@@ -179,6 +179,24 @@ POINT_FS = """
 in vec4 v_col; out vec4 f_col;
 void main() { vec2 d = gl_PointCoord - 0.5; float r2 = dot(d, d); if (r2 > 0.25) discard; f_col = vec4(v_col.rgb, v_col.a * (1.0 - smoothstep(0.14, 0.25, r2))); }
 """
+# A driver's markers (`Scene.set_driver_overlay`): a fixed pixel size whatever the distance -- a
+# waypoint or an aim point has no extent to scale -- as a disc with a dark rim, so it reads on the
+# white hoses and on the dark floor alike.
+DPOINT_VS = """
+#version 330
+in vec3 in_pos; in vec4 in_col; uniform mat4 u_vp; uniform float u_px; out vec4 v_col;
+void main() { v_col = in_col; gl_Position = u_vp * vec4(in_pos, 1.0); gl_PointSize = u_px; }
+"""
+DPOINT_FS = """
+#version 330
+in vec4 v_col; out vec4 f_col;
+void main() {
+    float r = length(gl_PointCoord - 0.5) * 2.0;
+    if (r > 1.0) discard;
+    float rim = smoothstep(0.62, 0.78, r);
+    f_col = vec4(mix(v_col.rgb, vec3(0.05, 0.06, 0.08), rim), v_col.a * (1.0 - smoothstep(0.9, 1.0, r)));
+}
+"""
 # Contact markers (`Scene.set_contact_marks`, built by `viewer.console.contacts.contact_marks`): one
 # sprite per contact, sized in the world -- a hard hit is bigger than a graze from every camera -- but
 # never below a per-marker pixel floor, so it still shows from an overview of a whole circuit.
@@ -312,6 +330,10 @@ class Scene:
         self.point_prog = ctx.program(vertex_shader=POINT_VS, fragment_shader=POINT_FS)
         self.mark_prog = ctx.program(vertex_shader=MARK_VS, fragment_shader=MARK_FS)
         self.marks_vbo = self.marks_vao = None; self.marks_n = 0
+        self.dpoint_prog = ctx.program(vertex_shader=DPOINT_VS, fragment_shader=DPOINT_FS)
+        #: a driver's own lines and markers (`set_driver_overlay`): [(buffer key, vertices, px)]
+        self.drv_lines: List[tuple] = []
+        self.drv_points: List[tuple] = []
         # The largest point this driver draws (llvmpipe: 255 px). Asked once; a sprite larger than
         # this would be clamped by the driver anyway, but silently.
         try:
@@ -436,15 +458,18 @@ class Scene:
         for attr in ("shadow_fbo", "shadow_tex", "hud_tex", "hud_vao", "_quad", "label_tex",
                      "label_pos", "label_vao", "pts_vao", "pts_vbo", "trail_vao", "trail_vbo",
                      "plan0_vao", "plan0_vbo", "plan0c_vao", "plan0c_vbo", "plan1_vao", "plan1_vbo",
-                     "ring_vao", "ring_vbo", "crings_vao", "crings_vbo", "marks_vao", "marks_vbo", "sky_vao"):
+                     "ring_vao", "ring_vbo", "crings_vao", "crings_vbo", "marks_vao", "marks_vbo", "sky_vao",
+                     *[f"drvl{i}_{k}" for i in range(self.DRV_MAX_LINES) for k in ("vao", "vbo")],
+                     *[f"drvp{i}_{k}" for i in range(self.DRV_MAX_POINTS) for k in ("vao", "vbo")]):
             drop(getattr(self, attr, None))
             if hasattr(self, attr):
                 setattr(self, attr, None)
+        self.drv_lines, self.drv_points = [], []
         for tex, _size in list(getattr(self, "panels", {}).values()):
             drop(tex)
         self.panels = {}
-        for prog in ("prog", "shadow_prog", "line_prog", "point_prog", "mark_prog", "hud_prog", "label_prog",
-                     "sky_prog"):
+        for prog in ("prog", "shadow_prog", "line_prog", "point_prog", "mark_prog", "dpoint_prog", "hud_prog",
+                     "label_prog", "sky_prog"):
             drop(getattr(self, prog, None))
             setattr(self, prog, None)
         self.target = None
@@ -667,6 +692,40 @@ class Scene:
             return
         self._upload_dyn(f"plan{slot}", np.concatenate([pts, cols], 1)); setattr(self, n_attr, len(pts))
 
+    #: How many lines and marker groups a driver overlay may carry (each is one buffer).
+    DRV_MAX_LINES = 6
+    DRV_MAX_POINTS = 4
+
+    def set_driver_overlay(self, lines=None, points=None):
+        """What a non-policy driver computed (`viewer.driver_viz`): `lines` [(pts (n, 3), rgba (4,),
+        width px)] drawn as polylines, `points` [(pts (n, 3), rgba (4,), size px)] as fixed-size
+        discs over the scene. None or empty clears them."""
+        self.drv_lines, self.drv_points = [], []
+        for i, (pts, rgba, width) in enumerate((lines or [])[:self.DRV_MAX_LINES]):
+            pts = np.asarray(pts, np.float32).reshape(-1, 3)
+            if len(pts) < 2:
+                continue
+            cols = np.tile(np.asarray(rgba, np.float32), (len(pts), 1))
+            self._upload_dyn(f"drvl{i}", np.concatenate([pts, cols], 1))
+            self.drv_lines.append((f"drvl{i}", len(pts), float(width)))
+        for i, (pts, rgba, px) in enumerate((points or [])[:self.DRV_MAX_POINTS]):
+            pts = np.asarray(pts, np.float32).reshape(-1, 3)
+            if not len(pts):
+                continue
+            key = f"drvp{i}"
+            data = np.ascontiguousarray(np.concatenate([pts, np.tile(np.asarray(rgba, np.float32),
+                                                                     (len(pts), 1))], 1))
+            vbo = getattr(self, f"{key}_vbo", None)
+            if vbo is None or vbo.size < data.nbytes:
+                if vbo is not None:
+                    getattr(self, f"{key}_vao").release(); vbo.release()
+                vbo = self.ctx.buffer(reserve=max(data.nbytes, 256 * 7 * 4), dynamic=True)
+                setattr(self, f"{key}_vbo", vbo)
+                setattr(self, f"{key}_vao", self.ctx.vertex_array(self.dpoint_prog,
+                                                                  [(vbo, "3f 4f", "in_pos", "in_col")]))
+            vbo.write(data.tobytes())
+            self.drv_points.append((key, len(pts), float(px)))
+
     def set_focus_ring(self, x, y, radius=0.34, colour=(0.35, 0.9, 1.0, 0.85), on=True):
         """A thin ring on the ground under the watched car -- the ego marker. None/off clears it."""
         if not on:
@@ -845,6 +904,9 @@ class Scene:
             ctx.depth_mask = True
             self.ctx.line_width = 2.5
             self.plan0c_vao.render(moderngl.LINE_STRIP, vertices=n0)
+        for key, n, width in self.drv_lines:
+            self.ctx.line_width = width
+            getattr(self, f"{key}_vao").render(moderngl.LINE_STRIP, vertices=n)
         if self.ring_n > 1:
             self.ctx.line_width = 2.5
             self.ring_vao.render(moderngl.LINE_STRIP, vertices=self.ring_n)
@@ -855,6 +917,15 @@ class Scene:
         if show_points:
             self.point_prog["u_vp"].write(_u(vp)); self.point_prog["u_size"].value = 12.0
             self.pts_vao.render(moderngl.POINTS, vertices=self.n_pts)
+        # a driver's markers: over the scene like the contact marks -- an aim point under a car's
+        # nose is still where it is aiming
+        if self.drv_points:
+            ctx.disable(moderngl.DEPTH_TEST)
+            self.dpoint_prog["u_vp"].write(_u(vp))
+            for key, n, px in self.drv_points:
+                self.dpoint_prog["u_px"].value = px
+                getattr(self, f"{key}_vao").render(moderngl.POINTS, vertices=n)
+            ctx.enable(moderngl.DEPTH_TEST)
         # contact markers: over everything, depth test off -- a contact under a car's nose or behind
         # a hose is still a contact
         if getattr(self, "marks_n", 0) and self.marks_vao is not None:

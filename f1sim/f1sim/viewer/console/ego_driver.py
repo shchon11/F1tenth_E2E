@@ -1,11 +1,11 @@
 """Who drives the ego car (the console's "내 차", 2026-10-17).
 
 The user: "f1sim console 에서 다 해볼 수 있는 거지? 직접 눈으로 보면서 ... 상대방으로도 싹 다 선택 가능하게".
-The policy run picked above stays what it was -- it still decides the observation contract and the
-overlays -- and this panel can hand the ego car to a published planner (on its own path follower,
-with ground-truth pose: privileged, as the modular baselines are measured) or to a sensor-only
-baseline (TinyLidarNet, End2Race, ForzaETH's Follow-the-Gap, the Disparity Extender). The same
-drivers are opponent kinds in the table under 고급 설정.
+The policy run picked above still decides the session's sensors and observation contract, and this
+panel can hand the ego car to a published planner (on its own path follower) or to a sensor-only
+baseline (TinyLidarNet, End2Race, Follow-the-Gap, the Disparity Extender). The same drivers are
+opponent kinds in the table under 고급 설정. With another driver in the seat our policy is not run
+(`SimWorker._step_once`), and the view draws that driver's own picture (`viewer.driver_viz`).
 """
 from __future__ import annotations
 
@@ -50,8 +50,9 @@ class EgoDriverPanel(QtWidgets.QWidget):
             k = osl.kind_of(name)
             self.kind.addItem(k.label, name)
             self.kind.setItemData(self.kind.count() - 1, k.note, QtCore.Qt.ToolTipRole)
-        self.kind.setToolTip("내 차를 누가 모는지. 정책 런 말고 다른 것을 고르면, 위의 런은 관측·표시에만 쓰고 "
-                             "조향·속도는 여기서 고른 주행기가 냅니다.")
+        self.kind.setToolTip("내 차를 누가 모는지. 정책 런 말고 다른 것을 고르면 우리 정책은 돌리지 않고, "
+                             "조향·속도는 여기서 고른 주행기가 냅니다. 화면에는 그 방법이 계산한 것"
+                             "(경로·웨이포인트·목표점, 빈 틈, 출력 궤적)을 그립니다.")
         row.addWidget(self.kind, 1)
         v.addLayout(row)
 
@@ -98,7 +99,8 @@ class EgoDriverPanel(QtWidgets.QWidget):
         self.weights.setText(os.path.basename(self._weights_path) or "가중치 파일…")
         self.weights.setToolTip(self._weights_path or f"공개 가중치 또는 이 환경에서 학습한 가중치 ({BASELINES_DIR})")
         self.note.setText("" if k == "policy" else
-                          "위의 정책 런은 관측·표시에만 씁니다. 조향·속도는 이 주행기가 냅니다.")
+                          "우리 정책은 돌리지 않습니다 (위의 런은 센서·관측 구성에만 씁니다). 화면에는 이 "
+                          "주행기가 계산한 것을 그립니다.")
         self.changed.emit()
 
     def _pick_weights(self):

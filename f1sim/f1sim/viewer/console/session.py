@@ -80,6 +80,30 @@ def _plan_in_body_frame(fr: dict):
     return np.stack([bx, by, np.zeros_like(bx), speed], 1).astype(np.float32)
 
 
+def _drv_in_body_frame(fr: dict):
+    """The driver overlay (`fr["drv"]`, world coordinates) in the focus car's frame for the 2D panel,
+    the same rotation `_plan_in_body_frame` applies. None when the frame carries none."""
+    drv = fr.get("drv")
+    if not drv:
+        return None
+    f, n = int(fr.get("focus", 0)), int(fr.get("n", 0))
+    if not (0 <= f < n):
+        return None
+    try:
+        x, y, yaw = float(fr["x"][f]), float(fr["y"][f]), float(fr["yaw"][f])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    c, s_ = np.cos(-yaw), np.sin(-yaw)
+
+    def body(xy):
+        p = np.asarray(xy, np.float32).reshape(-1, 2)
+        dx, dy = p[:, 0] - x, p[:, 1] - y
+        return np.stack([dx * c - dy * s_, dx * s_ + dy * c], 1).astype(np.float32)
+    return {"title": drv.get("title", ""), "legend": drv.get("legend", ""),
+            "lines": [dict(l, xy=body(l["xy"])) for l in drv.get("lines") or []],
+            "points": [dict(q, xy=body(q["xy"])) for q in drv.get("points") or []]}
+
+
 def _saliency_colors(sal) -> np.ndarray:
     """Per-beam attention as brightness on one hue (see `overlays.PolicyInputPanel`)."""
     t = np.clip(np.asarray(sal, np.float32), 0.0, 1.0)[:, None]
@@ -959,6 +983,7 @@ class SessionController(QtCore.QObject):
         self.window.viewport.set_geometry(None)
         self.window.viewport.plan = None
         self.window.viewport.plan_pred = None
+        self.window.viewport.drv = None
         self.window.viewport.point_colors = None
         self.window.policy_panel.clear()
         self.window.dash_panel.clear()
@@ -997,8 +1022,9 @@ class SessionController(QtCore.QObject):
         if w.chk_plan.isChecked():
             vp.plan = fr.get("plan")
             vp.plan_pred = fr.get("plan_pred")
+            vp.drv = fr.get("drv")
         else:
-            vp.plan = vp.plan_pred = None
+            vp.plan = vp.plan_pred = vp.drv = None
         sal = fr.get("saliency")
         # The 3D point cloud and the 2D policy panel use the same attention colours, so a bright
         # beam means the same thing in both. Brightness, not hue: hue is already the plan's speed.
@@ -1009,7 +1035,8 @@ class SessionController(QtCore.QObject):
             return                       # the 3D view above is already current; the panels can wait
         self._last_overlay = now
         w.set_policy_overlay(fr.get("scan"), sal, _plan_in_body_frame(fr),
-                             w.viewport.color_v_max, fr.get("saliency_age"))
+                             w.viewport.color_v_max, fr.get("saliency_age"),
+                             drv=_drv_in_body_frame(fr) if w.chk_plan.isChecked() else None)
         dash = fr.get("dash")
         if dash is not None and len(dash) >= 7:
             w.set_dash(dash[0], dash[1], dash[2], dash[3], dash[4], dash[5],

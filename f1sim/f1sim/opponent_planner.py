@@ -161,6 +161,16 @@ class FrenetOpponentPlanner(RowPlanning):
     def decide(self, state: torch.Tensor, tid: Optional[torch.Tensor] = None):
         raise NotImplementedError(f"{type(self).__name__} must choose a lateral offset")
 
+    def path_offsets(self, rows: torch.Tensor, s: torch.Tensor, speed: torch.Tensor) -> Optional[torch.Tensor]:
+        """(R, n) metres left of the reference line where this planner's path lies `s` (n,) metres
+        ahead of each car in `rows` (moving at `speed` (R,)), from the last `decide` -- for a viewer
+        (the console draws the path a planner ego is following). The offset `decide` chose is held
+        along the whole stretch here; a planner whose line moves along the road (a spline, a
+        rate-limited lane change) overrides this. None before the first `decide`."""
+        if self.last_offset is None:
+            return None
+        return self.last_offset[rows].to(s.dtype)[:, None].expand(-1, s.shape[0])
+
     def reset_rows(self, rows: torch.Tensor) -> None:
         """Forget whatever this planner was in the middle of, for the rows that just reset.
 

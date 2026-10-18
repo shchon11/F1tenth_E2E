@@ -265,6 +265,16 @@ class LaneSwitchTeacher(FrenetOpponentPlanner):
         self.last_state, self.last_offset = mode, offset
         return offset, mode, one
 
+    def path_offsets(self, rows: torch.Tensor, s: torch.Tensor, speed: torch.Tensor) -> Optional[torch.Tensor]:
+        """From the offset held now toward the chosen lane, at `lane_rate` per second of travel at
+        the car's speed: the manoeuvre `decide` is in the middle of, laid along the road."""
+        if self._offset is None or self._lane is None:
+            return super().path_offsets(rows, s, speed)
+        cur = self._offset[rows].to(s.dtype)
+        goal = self.lanes.to(s.dtype)[self._lane[rows]]
+        reach = self.lane_rate * s[None, :] / speed.abs().clamp_min(0.5).to(s.dtype)[:, None]
+        return cur[:, None] + torch.maximum(torch.minimum((goal - cur)[:, None], reach), -reach)
+
     def reset_rows(self, rows: torch.Tensor) -> None:
         """A new race starts on the racing line, not in the lane the last one ended in."""
         if self._lane is None:

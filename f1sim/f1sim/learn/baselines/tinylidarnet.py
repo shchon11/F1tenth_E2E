@@ -140,6 +140,13 @@ class TinyLidarNet(BaselineDriver):
         s = np.minimum(s, np.float32(self.clip_m))     # scans[scans>10] = 10
         return s[:, :, None].astype(np.float32)        # expand_dims(-1), batch is already axis 0
 
+    def input_beams(self, ranges_m: np.ndarray):
+        """(bearings [rad], ranges [m]) of the beams the network reads from one adapted scan --
+        every `skip_n`-th, clipped as `_prepare` clips them -- for the console to draw."""
+        bearing = np.linspace(-0.5 * self.scan.fov, 0.5 * self.scan.fov, self.scan.n_beams)[self._idx]
+        r = np.asarray(ranges_m, np.float32).reshape(-1)[self._idx]
+        return bearing, np.minimum(r, np.float32(self.clip_m))
+
     def _forward(self, ranges_m, speed_mps):
         out = np.asarray(self.backend(self._prepare(ranges_m)), dtype=np.float32)
         steer = out[:, 0]                              # `inference.py:120`: radians, as published

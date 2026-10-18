@@ -1,4 +1,4 @@
-"""The reactive classics as baselines: ForzaETH's Follow-the-Gap and the Disparity Extender.
+"""The reactive classics as baselines: Follow-the-Gap and the Disparity Extender.
 
 Neither needs a map, a line or a localisation, so neither carries a privileged input: each reads the
 car's own 270 deg scan (and FTG the odometry speed) and commands a steering angle and a speed, the
@@ -63,7 +63,8 @@ class FollowTheGap(BaselineDriver):
                  track_width=float(track_width))
         super().__init__(ScanContract(n_beams=N_BEAMS, fov=FOV, range_max=RANGE_MAX, control_rate=RATE),
                          _Params("follow_the_gap", p, "ForzaETH/race_stack@e7d07f7 controller/ftg/ftg.py (MIT)"),
-                         note="ForzaETH Follow-the-Gap, line-for-line port; max_speed is the tuned knob")
+                         note="Follow-the-Gap (the RoboRacer course's reactive method), ForzaETH's implementation "
+                              "ported line for line; max_speed is the tuned knob")
         self.MAX_SPEED = p["max_speed"]
         self.SAFETY_RADIUS = p["safety_radius"]
         self.MAX_LIDAR_DIST = p["max_lidar_dist"]
@@ -122,6 +123,11 @@ class FollowTheGap(BaselineDriver):
         return min(5., self.track_width / 2 + 2 * (velocity / self.MAX_SPEED))
 
     def _row(self, ranges: np.ndarray, velocity: float):
+        d = self._decide(ranges, velocity)
+        return d["steer"], d["speed"]
+
+    def _decide(self, ranges: np.ndarray, velocity: float) -> dict:
+        """`process_lidar`, with what it computed on the way kept for a viewer (`explain`)."""
         proc = self._safety_border(self._preprocess_lidar(ranges))
         radius = self._get_radius(velocity)
         gap_left, gap_right = self._find_largest_gap(proc, radius)
@@ -140,7 +146,24 @@ class FollowTheGap(BaselineDriver):
             speed = self.STRAIGHTS_SPEED
         else:
             speed = self.ULTRASTRAIGHTS_SPEED
-        return steering_angle, speed
+        return {"proc": proc, "radius": radius, "gap": (gap_left, gap_right), "best": (best_x, best_y),
+                "steer": steering_angle, "speed": speed}
+
+    def explain(self, ranges: np.ndarray, velocity: float) -> dict:
+        """What FTG decides on one scan (`n_beams` ranges, metres), in the scanner's frame (x
+        forward, y left), for the console to draw: the scan it searched after its safety border
+        (`scan_xy`), the gap it chose at its free-space radius (`gap_xy`), the point it steers at
+        (`target`, the marker upstream publishes as the best point) and the command."""
+        d = self._decide(np.asarray(ranges, np.float64).reshape(-1), float(velocity))
+        rpe, off = self.radians_per_elem, self.range_offset - 180
+        # Bearing of a processed index as `_decide` reads it: index k steers at pi/2 - k * rpe.
+        bearing = lambda k: math.pi / 2 - np.asarray(k, np.float64) * rpe
+        a = bearing(np.arange(len(d["proc"])) + off)
+        g = bearing(np.linspace(d["gap"][0], d["gap"][1], 25))
+        return {"scan_xy": np.stack([d["proc"] * np.cos(a), d["proc"] * np.sin(a)], 1),
+                "gap_xy": np.stack([d["radius"] * np.cos(g), d["radius"] * np.sin(g)], 1),
+                "target": np.array(d["best"], np.float64), "radius": float(d["radius"]),
+                "steer": float(d["steer"]), "speed": float(d["speed"])}
 
     def _forward(self, ranges_m: np.ndarray, speed_mps: Optional[np.ndarray]) -> np.ndarray:
         out = np.empty((ranges_m.shape[0], 2), dtype=np.float32)
@@ -189,6 +212,11 @@ class DisparityExtender(BaselineDriver):
         return out
 
     def _row(self, r: np.ndarray):
+        d = self._decide(r)
+        return d["steer"], d["v"]
+
+    def _decide(self, r: np.ndarray) -> dict:
+        """Steps 2-7, with what they computed kept for a viewer (`explain`)."""
         p = self.p
         f = self._extend(r)
         front = np.abs(self.angles) <= math.pi / 2
@@ -200,7 +228,9 @@ class DisparityExtender(BaselineDriver):
         steer = float(np.clip(target, -p["max_steer"], p["max_steer"]))   # step 5: as sharp as allowed
         # step 6: a wall beside the car on the side it wants to turn into -> go straight
         side = (self.angles > math.pi / 2) if steer > 0 else (self.angles < -math.pi / 2)
-        if steer != 0.0 and np.any(r[side] * np.abs(np.sin(self.angles[side])) < p["car_width"] / 2 + p["side_margin"]):
+        side_block = bool(steer != 0.0 and np.any(r[side] * np.abs(np.sin(self.angles[side]))
+                                                  < p["car_width"] / 2 + p["side_margin"]))
+        if side_block:
             steer = 0.0
         # step 7: speed from the free road straight ahead, two linear pieces
         fw = np.abs(self.angles) <= math.radians(p["forward_halfwidth_deg"])
@@ -213,7 +243,20 @@ class DisparityExtender(BaselineDriver):
             v = 0.5 * p["top_speed"] + 0.5 * p["top_speed"] * (dist - p["d_mid"]) / (p["d_far"] - p["d_mid"])
         else:
             v = p["top_speed"]
-        return steer, v
+        return {"ext": f, "k": int(k), "side_block": side_block, "dist": dist, "steer": steer, "v": v}
+
+    def explain(self, ranges: np.ndarray, velocity: float = 0.0) -> dict:
+        """What the Disparity Extender decides on one scan, in the scanner's frame (x forward, y
+        left): the scan with every disparity extended (`scan_xy` -- the walls it actually avoids),
+        the farthest point ahead it aims at (`target`), the free road straight ahead its speed is
+        read from (`dist`), whether a wall beside it vetoed the turn, and the command."""
+        d = self._decide(np.asarray(ranges, np.float64).reshape(-1))
+        a, f = self.angles, d["ext"]
+        k = d["k"]
+        return {"scan_xy": np.stack([f * np.cos(a), f * np.sin(a)], 1),
+                "target": np.array([f[k] * math.cos(a[k]), f[k] * math.sin(a[k])], np.float64),
+                "dist": float(d["dist"]), "side_block": d["side_block"],
+                "steer": float(d["steer"]), "speed": float(d["v"])}
 
     def _forward(self, ranges_m: np.ndarray, speed_mps: Optional[np.ndarray]) -> np.ndarray:
         out = np.empty((ranges_m.shape[0], 2), dtype=np.float32)

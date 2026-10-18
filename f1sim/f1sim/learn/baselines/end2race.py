@@ -211,6 +211,15 @@ class End2Race(BaselineDriver):
         self._hidden[:, idx, :] = 0.0
         self._prev_speed[m] = np.nan
 
+    def input_beams(self, ranges_m: np.ndarray):
+        """(bearings [rad], ranges [m], seen) of the `n_features` beams the network reads from one
+        adapted scan, for the console to draw. `seen` is False where the bearing is outside the car's
+        own scanner and the range is the declared fill (`map_scan`), not a measurement."""
+        bearing = np.linspace(-0.5 * self.scan.fov, 0.5 * self.scan.fov, self.scan.n_beams)[self._idx]
+        r = np.asarray(ranges_m, np.float32).reshape(-1)[self._idx]
+        half = 0.5 * float((self.source or {}).get("fov", self.scan.fov))
+        return bearing, r, np.abs(bearing) <= half + 1e-9
+
     # -- one step --------------------------------------------------------------------------------
     def _forward(self, ranges_m, speed_mps):
         torch = self.torch

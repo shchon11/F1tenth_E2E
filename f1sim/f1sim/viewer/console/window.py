@@ -1203,6 +1203,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.chk_lidar.setChecked(True)
         self.chk_plan = QtWidgets.QCheckBox("plan / 예측 궤적")
         self.chk_plan.setChecked(True)
+        self.chk_plan.setToolTip("우리 정책이 모는 차: 정책이 낸 plan과 추종기의 예측 궤적.\n"
+                                 "다른 주행기가 모는 차: 그 방법이 계산한 것 — 플래너는 경로·웨이포인트·"
+                                 "추종 목표점, FTG는 고른 빈 틈과 목표점, Disparity는 넓힌 스캔과 목표점, "
+                                 "E2E 망은 읽는 빔과 출력 명령의 궤적.")
         self.chk_trails = QtWidgets.QCheckBox("주행 궤적")
         self.chk_trails.setChecked(True)
         self.chk_raceline = QtWidgets.QCheckBox("레이싱 라인 / 중심선")
@@ -1732,8 +1736,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def push_frame_time(self, ms: float):
         self.spark.push(ms)
 
-    def set_policy_overlay(self, scan, sal, plan_ref, v_max, sal_age=None):
-        self.policy_panel.set_data(scan, sal, plan_ref, v_max, sal_age)
+    def set_policy_overlay(self, scan, sal, plan_ref, v_max, sal_age=None, drv=None):
+        self.policy_panel.set_data(scan, sal, plan_ref, v_max, sal_age, drv=drv)
+        # Whose inputs and outputs the panel shows: our policy's, or the driver steering the car.
+        title = f"{drv['title']} 입·출력과 시뮬 참값" if drv else "정책 입·출력과 시뮬 참값"
+        self.policy_fold.set_title(title)
 
     def set_dash(self, *a):
         self.dash_panel.set_data(*a)
@@ -2411,7 +2418,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v.show_labels = self.chk_labels.isChecked()
         v.show_contacts = self.chk_contacts.isChecked()
         if not self.chk_plan.isChecked():
-            v.plan = v.plan_pred = None
+            v.plan = v.plan_pred = v.drv = None
         v.update()
         self._emit_overlay_request()
 

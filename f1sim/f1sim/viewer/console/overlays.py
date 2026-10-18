@@ -75,6 +75,10 @@ class PolicyInputPanel(QtWidgets.QWidget):
     distance; anything beyond is clipped rather than compressed.
     """
 
+    POLICY_TIP = ("정책이 방금 받은 LiDAR 스캔을 위에서 본 그림.\n"
+                  "점 밝기 = 그 빔이 행동을 얼마나 움직이는가(saliency).\n"
+                  "선 = 정책이 만든 로컬 plan, 색은 그 속도 프로파일.")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(230, 230)
@@ -87,13 +91,12 @@ class PolicyInputPanel(QtWidgets.QWidget):
         self._sal: Optional[np.ndarray] = None
         self._plan: Optional[np.ndarray] = None
         self._sal_age: Optional[float] = None
-        self.setToolTip("정책이 방금 받은 LiDAR 스캔을 위에서 본 그림.\n"
-                        "점 밝기 = 그 빔이 행동을 얼마나 움직이는가(saliency).\n"
-                        "선 = 정책이 만든 로컬 plan, 색은 그 속도 프로파일.")
+        self._drv: Optional[dict] = None
+        self.setToolTip(self.POLICY_TIP)
 
     def set_data(self, scan: Optional[np.ndarray], sal: Optional[np.ndarray],
                  plan_ref: Optional[np.ndarray], v_max: float,
-                 sal_age: Optional[float] = None):
+                 sal_age: Optional[float] = None, drv: Optional[dict] = None):
         """`scan`: ranges in **metres**, as the frame carries them. Not normalised.
 
         The panel used to multiply by `range_max`, which is right for the normalised observation the
@@ -105,10 +108,14 @@ class PolicyInputPanel(QtWidgets.QWidget):
         self._plan = None if plan_ref is None else np.asarray(plan_ref, np.float32)
         self.v_max = float(v_max or 6.0)
         self._sal_age = sal_age
+        # A driver other than our policy (`viewer.driver_viz`, already in the body frame): its own
+        # lines and markers replace the policy's reading of this panel, and its legend says what they are.
+        self._drv = drv
+        self.setToolTip(drv["legend"] if drv else self.POLICY_TIP)
         self.update()
 
     def clear(self):
-        self._scan = self._sal = self._plan = None
+        self._scan = self._sal = self._plan = self._drv = None
         self.update()
 
     def paintEvent(self, _ev):
@@ -192,15 +199,21 @@ class PolicyInputPanel(QtWidgets.QWidget):
             else:
                 p.setPen(QtGui.QPen(QtGui.QColor(245, 245, 250), 3.0))
                 p.drawPolyline(QtGui.QPolygonF(pts))
+        if self._drv:
+            self._draw_driver(p, cx, cy, px_per_m)
         self._draw_car(p, cx, cy)
 
         p.setPen(QtGui.QColor(C["text.2"]))
         f = p.font(); f.setPointSizeF(7.0); p.setFont(f)
-        legend = f"{nb}빔 · 반경 {self.span:.0f}m · plan 색 = 속도 0→{self.v_max:.1f}"
-        if self._sal is None:
-            legend += " · saliency 꺼짐"
-        elif self._sal_age is not None:
-            legend += f" · saliency {self._sal_age:.1f}s 전"
+        if self._drv:
+            # The driver's own legend (hover for all of it): the colours are its method's, not the policy's.
+            legend = f"반경 {self.span:.0f}m · " + str(self._drv.get("legend", ""))
+        else:
+            legend = f"{nb}빔 · 반경 {self.span:.0f}m · plan 색 = 속도 0→{self.v_max:.1f}"
+            if self._sal is None:
+                legend += " · saliency 꺼짐"
+            elif self._sal_age is not None:
+                legend += f" · saliency {self._sal_age:.1f}s 전"
         m = QtGui.QFontMetrics(p.font())
         p.drawText(QtCore.QRectF(5, h - legend_h + 2, w - 10, legend_h - 3),
                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
@@ -208,6 +221,24 @@ class PolicyInputPanel(QtWidgets.QWidget):
         PolicyInputPanel.paint_ms.append((_t.perf_counter() - _t0) * 1e3)
         if len(PolicyInputPanel.paint_ms) > 400:
             del PolicyInputPanel.paint_ms[:200]
+
+    def _draw_driver(self, p, cx, cy, px_per_m):
+        """A non-policy driver's lines and markers, in the body frame (forward up, left left)."""
+        def q(xy):
+            return [QtCore.QPointF(cx - float(b) * px_per_m, cy - float(a) * px_per_m) for a, b in xy]
+        for ln in self._drv.get("lines") or []:
+            pts = q(np.asarray(ln["xy"], np.float32).reshape(-1, 2))
+            if len(pts) > 1:
+                p.setPen(QtGui.QPen(_qc(ln["rgba"], float(ln["rgba"][3])), max(1.0, float(ln.get("w", 2.0)) * 0.8),
+                                    QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+                p.drawPolyline(QtGui.QPolygonF(pts))
+        for grp in self._drv.get("points") or []:
+            r = max(1.5, float(grp.get("px", 6.0)) * 0.35)
+            p.setPen(QtGui.QPen(QtGui.QColor(10, 12, 16, 200), 1.0))
+            p.setBrush(_qc(grp["rgba"], float(grp["rgba"][3])))
+            for pt in q(np.asarray(grp["xy"], np.float32).reshape(-1, 2)):
+                p.drawEllipse(pt, r, r)
+        p.setBrush(QtCore.Qt.NoBrush)
 
     def _draw_car(self, p, cx, cy):
         p.setPen(QtCore.Qt.NoPen)

@@ -106,6 +106,14 @@ class Collapsible(QtWidgets.QWidget):
         self.content.setVisible(on)
         self.toggle.setText(("▾  " if on else "▸  ") + self._title)
 
+    def set_title(self, title: str) -> None:
+        """Rename the section (a no-op when it already has this name, so it can be set per frame)."""
+        if title == self._title:
+            return
+        self._title = title
+        self.toggle.setText(("▾  " if self.toggle.isChecked() else "▸  ") + title)
+        self.toggle.setAccessibleName(f"{title} 접기/펼치기")
+
     def add(self, w):
         if isinstance(w, QtWidgets.QLayout):
             self.content_layout.addLayout(w)

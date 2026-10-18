@@ -133,6 +133,7 @@ def ego_description(kind: str, weights: str = "", options=None, limits=None) -> 
         parts.append("라인 " + "/".join(f"{float(limits[k]):g}" for k in ("a_lat", "a_acc", "a_brake") if k in limits))
     return " · ".join(parts)
 
+from .driver_viz import DriverViz                                                                   # noqa: E402
 from .geometry import prop_batches as _prop_batches_impl                                            # noqa: E402
 from .geometry import shape_meshes                                                                  # noqa: E402
 
@@ -1216,8 +1217,9 @@ class SimWorker:
         env.sim.tid.fill_(0)                       # every car on the map that was asked for
         ego_note = ""
         if ego_kind != "policy":
-            # Another driver for the ego car: the checkpoint keeps the observation contract and the
-            # overlays, and this driver's (steer, speed) replaces its command (`set_ego_driver`).
+            # Another driver for the ego car: the checkpoint keeps the observation contract, and this
+            # driver's (steer, speed) replaces its command (`set_ego_driver`). What is drawn for it is
+            # its own method's picture (`driver_viz`), not the policy's plan.
             ego_rls, ego_lim = rls, dict(TRAIN_LIMITS)
             lim = getattr(cfg, "ego_limits", None)
             try:
@@ -1232,7 +1234,16 @@ class SimWorker:
             env.set_ego_driver(drv)
             ego_note = ego_description(ego_kind, getattr(cfg, "ego_weights", ""), getattr(cfg, "ego_options", None),
                                        ego_lim if ego_kind in common.EGO_PLANNER_KINDS else None)
-            self.say(P.MSG_LOG, gen=gen, text=f"내 차: {ego_note} — 정책 체크포인트는 관측·표시에만 씁니다")
+        # Does any car still drive on the policy's action? A learner row that no external driver
+        # overrides. When none does, the policy is not run at all (`_step_once`): its output would be
+        # discarded every step. The user: "내 정책 말고 다른 방법들 선택할 때 우리정책 planner 추론은
+        # 도대체 왜하는데?" -- the same waste the ROS /drive mode already skips.
+        policy_idle = not bool((env.learner & ~env.external_driven).any())
+        if ego_kind != "policy":
+            self.say(P.MSG_LOG, gen=gen, text=(
+                f"내 차: {ego_note} — " + ("우리 정책은 돌리지 않습니다 (고른 런은 센서·관측 구성에만 씁니다)"
+                                          if policy_idle else "우리 정책은 다른 차만 몹니다")))
+        driver_viz = DriverViz(env) if bool(env.external_drivers) else None
         mu_pin = None
         if str(getattr(cfg, "mu_mode", "random")) == "fixed":
             mu_pin = MuPin(env, float(getattr(cfg, "mu", 1.0489))).install()   # before the first reset
@@ -1272,8 +1283,12 @@ class SimWorker:
             "obs": obs, "speed_cap": speed_cap, "compile": compile_enabled,
             "dial": dial,
             "act_fn": actor_runner(model, device, compile_enabled, dial=dial),
-            "info_line": (f"내 차: {ego_note} · " if ego_note else "") + describe_checkpoint_line(extra, ckpt_path),
+            "info_line": (f"내 차: {ego_note} · 우리 정책 꺼짐" if policy_idle and ego_note else
+                          (f"내 차: {ego_note} · " if ego_note else "") + describe_checkpoint_line(extra, ckpt_path)),
             "ego_kind": ego_kind,
+            "policy_idle": policy_idle,
+            "viz": driver_viz,
+            "viz_failed": False,
             "track": track, "cfg": cfg, "focus": 0, "k": 0,
             "scenario": session_scenario, "map_legacy": map_legacy,
             "gg": deque(maxlen=90),
@@ -1300,7 +1315,10 @@ class SimWorker:
         # through the `sim -> _roll -> fastpath -> sim` cycle.
         if not compile_enabled:
             self._prepare_fastpath(session, gen)
-        if arm != "legacy":
+        if arm != "legacy" and policy_idle:
+            # The controller shapes how the policy's plan is tracked; nothing tracks one here.
+            self.say(P.MSG_LOG, gen=gen, text=f"plan 제어기 {arm} 은(는) 설치하지 않습니다: 정책이 모는 차가 없습니다")
+        elif arm != "legacy":
             # After the graphs: `install` hooks `tracker._solver`, and the fast path's captured MPC
             # arguments let the grip solver capture its own graph instead of running eager.
             from ..learn.grip_runtime import ControllerRuntime
@@ -1640,7 +1658,9 @@ class SimWorker:
         # 없는 상황인데 추론은 왜돌리는거야". With more cars than that the policy still drives them,
         # and runs.
         drive_only = link is not None and link.mode == "drive" and env.B == 1
-        if drive_only:
+        if drive_only or session.get("policy_idle"):
+            # Nothing reads a policy action: every car is driven by something else (`/drive`, or a
+            # baseline in the ego seat and no car on the policy -- `policy_idle`).
             act = torch.zeros(env.B, env.act_dim, device=env.device)
         else:
             if rt is not None:
@@ -1679,6 +1699,8 @@ class SimWorker:
         A newer file can have a different observation layout, so the same compatibility check the
         session was built with runs again; failing it keeps the model that is already loaded.
         """
+        if session.get("policy_idle"):
+            return                      # the checkpoint drives nothing; a newer one would change nothing
         if time.time() - session["last_reload"] < 5.0:
             return
         session["last_reload"] = time.time()
@@ -1772,8 +1794,20 @@ class SimWorker:
             pieces.append(r.imu[focus].mean(0))
 
         plan = pose = plan_pred = None
-        if session["mode"] == "plan" and self._overlay.get("plan", True) and env.tracker is not None \
-                and env.tracker.last_ref is not None:
+        viz = session.get("viz")
+        ext_focus = viz is not None and viz.driver(focus) is not None
+        viz_t = []
+        if ext_focus and self._overlay.get("plan", True) and not session.get("viz_failed"):
+            # A car an external driver steers: the tracker's plan for it is nobody's path. Its own
+            # method's picture instead (`driver_viz`), in the same single copy.
+            try:
+                viz_t = viz.tensors(focus)
+            except Exception as exc:
+                self._viz_failure(session, exc)
+                viz_t = []
+            pieces += viz_t
+        elif not ext_focus and session["mode"] == "plan" and self._overlay.get("plan", True) \
+                and env.tracker is not None and env.tracker.last_ref is not None:
             plan = env.tracker.last_ref[focus]
             pose = sim.state[focus, :3]
             pieces += [plan.reshape(-1), pose]
@@ -1824,6 +1858,16 @@ class SimWorker:
                 rp = flat[i:i + k2 * c2].reshape(k2, c2); i += k2 * c2
                 plan_pred_w = np.stack([ps[0] + rp[:, 0] * cs - rp[:, 1] * sn,
                                         ps[1] + rp[:, 0] * sn + rp[:, 1] * cs, rp[:, 3]], 1).astype(np.float32)
+        drv_fr = None
+        if viz_t:
+            nv = int(sum(int(t.numel()) for t in viz_t))
+            vflat = flat[i:i + nv]; i += nv
+            try:
+                plan_w, drv_fr = viz.decode(focus, vflat, pose=(p[focus, 0], p[focus, 1], p[focus, 2]),
+                                            mount=(pv[0], pv[1], pv[3]), scan_m=scan, cmd=(dash_v[2], dash_v[3]))
+            except Exception as exc:
+                self._viz_failure(session, exc)
+                plan_w = drv_fr = None
         props_dyn = None
         if proc is not None:
             blk = flat[i:i + 4 * int(proc.C)].reshape(-1, 4); i += 4 * int(proc.C)
@@ -1867,6 +1911,8 @@ class SimWorker:
             "info_line": session["info_line"],
             "ckpt_age_s": max(0.0, time.time() - session["mtime"]),
         }
+        if drv_fr is not None:
+            fr["drv"] = drv_fr
         if props_dyn is not None:
             fr["props_dyn"] = props_dyn
         if contact is not None:
@@ -1880,16 +1926,24 @@ class SimWorker:
         if sim.other_idx is not None:
             rivals = set(sim.other_idx[focus].tolist())
             fr["opponent"] = np.array([int(e) in rivals for e in ids], bool)
-        if self._overlay.get("saliency"):
+        # Our policy's attention and activations describe our policy driving; a car something else
+        # drives has neither.
+        if self._overlay.get("saliency") and not ext_focus:
             sal, age = self._saliency(session)
             if sal is not None:
                 fr["saliency"], fr["saliency_age"] = sal, age
-        if self._overlay.get("internals"):
+        if self._overlay.get("internals") and not ext_focus:
             hidden, stem = self._internals(session)
             if hidden is not None:
                 fr["hidden"], fr["stem"] = hidden, stem
         self.seq += 1
         return fr
+
+    def _viz_failure(self, session, exc) -> None:
+        """A driver overlay that fails is switched off for the session and said once: a drawing aid
+        must never stop the simulation it is drawing."""
+        session["viz_failed"] = True
+        self.say(P.MSG_LOG, gen=self.gen, text=f"주행기 시각화를 끕니다 (오류: {type(exc).__name__}: {exc})")
 
     def _saliency(self, session) -> Tuple[Optional[np.ndarray], Optional[float]]:
         """|d action / d beam| for the focus car, throttled.

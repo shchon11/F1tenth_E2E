@@ -169,6 +169,9 @@ class SplinerTeacher(FrenetOpponentPlanner):
         #: Held across steps because the side-switch rule is about *changing* it, not about
         #: picking it in the first place.
         self._side: Optional[torch.Tensor] = None
+        #: The last `decide`'s spline per row, (apex offset, apex station ahead of the car, stretch),
+        #: or None when there was no race to plan against -- what `path_offsets` draws.
+        self.last_spline: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
         if env is not None:
             self.attach(env)
 
@@ -200,7 +203,7 @@ class SplinerTeacher(FrenetOpponentPlanner):
             # the simulator's rows. `None` rather than zeros, so the reference teacher takes the
             # path it takes when nobody asked it for an offset (see `_merge_offset`).
             self._put(self._side, torch.zeros_like(self._r(self._side)))
-            self.last_state, self.last_offset = mode, zero
+            self.last_state, self.last_offset, self.last_spline = mode, zero, None
             return None, mode, one
         gap, d_opp, idx_opp, tid_b, ego_d = seen
 
@@ -266,7 +269,19 @@ class SplinerTeacher(FrenetOpponentPlanner):
         inside = passing & (side * self._corner_sign(idx_opp, tid_b) > 0)
         scale = torch.where(inside, one * self.inside_speed_scale, one)
         self.last_state, self.last_offset = mode, d_out
+        self.last_spline = (d_apex, s_apex, stretch)
         return d_out, mode, scale
+
+    def path_offsets(self, rows: torch.Tensor, s: torch.Tensor, speed: torch.Tensor) -> Optional[torch.Tensor]:
+        """The evasion spline itself along `s` for the rows that are passing, the line elsewhere.
+        At `s = 0` this is the offset `decide` commanded: the curve the car is driving through."""
+        if self.last_spline is None or self.last_state is None:
+            return super().path_offsets(rows, s, speed)
+        d_apex, s_apex, stretch = (t[rows].to(s.dtype) for t in self.last_spline)
+        r = (s[None, :] - s_apex[:, None]) / stretch[:, None]
+        d = d_apex[:, None] * self._shape_at(r.reshape(-1)).reshape(r.shape)
+        passing = (self.last_state[rows] == OVERTAKING)[:, None]
+        return torch.where(passing, d, torch.zeros_like(d))
 
     # ------------------------------------------------------------------ pieces
     def reset_rows(self, rows: torch.Tensor) -> None:

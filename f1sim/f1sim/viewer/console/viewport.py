@@ -288,6 +288,8 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self._chase_ref: Optional[tuple] = None
         self.plan: Optional[np.ndarray] = None
         self.plan_pred: Optional[np.ndarray] = None
+        #: a non-policy driver's own picture (`viewer.driver_viz`): {"lines": [...], "points": [...]}
+        self.drv: Optional[dict] = None
         self.point_colors: Optional[np.ndarray] = None
         self.color_v_max = 6.0
         self.lidar_cfg: Dict[str, float] = {}
@@ -900,6 +902,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                 cols[:, :3] = 0.5 * cols[:, :3] + 0.5
             z = 0.05 if slot == 0 else 0.03
             sc.set_plan(np.concatenate([p_[:, :2], np.full((len(p_), 1), z, np.float32)], 1), cols, slot=slot)
+        self._set_driver_overlay(sc)
 
         seq = int(fr.get("seq", -1))
         if self.show_trails and seq != self._trail_seq:
@@ -972,6 +975,22 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
                 if watched and hit[f]:
                     ring = np.asarray(self.RING_COLLIDED, np.float32)
         return tint, (tuple(float(v) for v in ring) if ring is not None else None), rings
+
+    def _set_driver_overlay(self, sc):
+        """Hand `self.drv` to the scene: polylines just above the plan ribbon, markers above them."""
+        drv = self.drv
+        if not drv:
+            sc.set_driver_overlay(None, None)
+            return
+
+        def lift(xy, z):
+            p = np.asarray(xy, np.float32).reshape(-1, 2)
+            return np.concatenate([p, np.full((len(p), 1), z, np.float32)], 1)
+        try:
+            sc.set_driver_overlay([(lift(l["xy"], 0.07), l["rgba"], l.get("w", 2.0)) for l in drv.get("lines") or []],
+                                  [(lift(q["xy"], 0.09), q["rgba"], q.get("px", 6.0)) for q in drv.get("points") or []])
+        except (KeyError, TypeError, ValueError):
+            sc.set_driver_overlay(None, None)
 
     def _scan_points(self, fr):
         """LiDAR hit points of the focus car, same beam geometry as f1sim.lidar.Lidar.rays."""
