@@ -1760,8 +1760,15 @@ class Simulator:
         vwx = torch.where(into, vwx2, vwx); vwy = torch.where(into, vwy2, vwy)
         st = state.clone()
         st[:, dyn.IR] = torch.where(into, r2, r_now)
-        st[:, dyn.IVX] = vwx * c + vwy * s
-        st[:, dyn.IVY] = -vwx * s + vwy * c
+        # Only where an impulse changed it. Back from the world frame `vwx * c + vwy * s` is not the
+        # body velocity it came from in float32 (c^2 + s^2 rounds), so writing it everywhere nudged
+        # every car that was touching nothing by ~1e-7 a substep -- whenever ANY car in the batch
+        # touched (the eager early-out above skips this function otherwise), and always under a CUDA
+        # graph or torch.compile, which run it branch-free. A car's motion depended on whether some
+        # other env's car was in a wall, and the graphed roll left eager by 1e-5 a step on cars far
+        # from anything (test_a_captured_soft_roll_matches_eager, 2026-10-19).
+        st[:, dyn.IVX] = torch.where(into, vwx * c + vwy * s, state[:, dyn.IVX])
+        st[:, dyn.IVY] = torch.where(into, -vwx * s + vwy * c, state[:, dyn.IVY])
         # The overlap is shared the same way: a crate gets out of the way as much as the car does.
         # The hose gives: the car is returned over the contact rather than teleported clear of it,
         # which is what makes the penetration -- and so the acceleration the IMU and the suspension
