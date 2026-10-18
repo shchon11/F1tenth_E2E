@@ -648,6 +648,9 @@ def viewer_config(compile_enabled: bool, randomize: bool = True) -> Config:
     config = Config()
     config.sim.compile = compile_enabled
     config.sim.compile_mode = "default" if compile_enabled else "none"
+    # Without the whole-roll compile the viewer's CUDA graph records the substep op by op; the two
+    # hot leaves compiled are a third of the roll's time for one car (`SimParams.compile_leaves`).
+    config.sim.compile_leaves = not compile_enabled
     # Randomisation is what training sees, so it is the honest default. But it is per car, per
     # reset -- friction 0.74 on one car and 1.15 on the next -- and a viewer with one car on screen
     # cannot show that the slide you are watching is a low-grip draw and not the policy.

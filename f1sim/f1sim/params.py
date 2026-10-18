@@ -563,6 +563,12 @@ class SimParams:
     device: str = "cuda"
     compile: bool = True          # torch.compile the physics substep loop on CUDA
     compile_mode: str = "default" # "reduce-overhead" = CUDA graphs: one launch per control step (viewers next to a training job)
+    #: With `compile` off on CUDA: torch.compile only the substep's two hot leaves, the tyre/body
+    #: dynamics and the IMU (`sim.compiled_leaves`), which the console's CUDA graph then records as a
+    #: few fused kernels instead of ~450 small ones a substep -- one car's 25-substep roll 15.1 ms ->
+    #: 4.7 ms on the 4070, compiled in seconds, where compiling the whole roll costs a 6-minute first
+    #: start (2026-10-19, the user: "simtime이 왜이리 느리지"). The console turns it on.
+    compile_leaves: bool = False
     seed: int = 0
 
 

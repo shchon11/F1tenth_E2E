@@ -99,6 +99,22 @@ CONTACT_KINDS = ("none", "wall", "prop", "car")
 CONTACT_HOLD_S = 0.3
 
 
+_COMPILED_LEAVES = None
+
+
+def compiled_leaves():
+    """`dynamics.step_dynamics` and `imu.substep` under torch.compile, built once per process
+    (`SimParams.compile_leaves`). Each is a few hundred elementwise ops a substep that inductor fuses
+    into a handful of kernels. The IMU's noise is drawn by inductor's own generator code: the same
+    distribution from the same device generator, not the same numbers as eager, and inside a CUDA
+    graph it advances on every replay like any other draw (`tests/test_compiled_leaves.py`)."""
+    global _COMPILED_LEAVES
+    if _COMPILED_LEAVES is None:
+        _COMPILED_LEAVES = (torch.compile(dyn.step_dynamics, dynamic=False),
+                            torch.compile(imu_model.substep, dynamic=False))
+    return _COMPILED_LEAVES
+
+
 def _capturing() -> bool:
     """Whether this call is being recorded into a CUDA graph or traced by `torch.compile` -- the
     two places a data-dependent Python branch is not allowed."""
@@ -159,6 +175,11 @@ class Simulator:
         self.hist_len = int(math.ceil(max_delay / self.control_dt)) + 2
         self.cmd_hist = torch.zeros(num_envs, self.hist_len, 2, device=self.device)
         self._roll = self._roll_physics; self._post = self._post_roll
+        # The substep's two hot leaves (`SimParams.compile_leaves`): eager unless asked for, and never
+        # under the whole-roll compile, which traces them inline anyway.
+        self._step_dynamics, self._imu_substep = dyn.step_dynamics, imu_model.substep
+        if getattr(self.cfg.sim, "compile_leaves", False) and self.device.type == "cuda" and not self.cfg.sim.compile:
+            self._step_dynamics, self._imu_substep = compiled_leaves()
         # The same reason `lidar.py` compiles `ray_prisms_hits`: `prism_contacts` walks its slots in
         # a Python loop, and one procedural layout is fifty of them. The *eager* function stays the
         # one `_resolve_wall_contact` uses, because that runs inside the already-compiled
@@ -1416,8 +1437,8 @@ class Simulator:
             a_cmd = vesc_accel(eff[:, 1], v_fb, P)
             a_cmd_last = dyn.motor_accel(a_cmd, v_fb, P)     # after the limits: what is applied
             r_old = state[:, dyn.IR]
-            state, ax, ay = dyn.step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt,
-                                              wheel=wheel_on)
+            state, ax, ay = self._step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt,
+                                                wheel=wheel_on)
             # Before the sprung mass, so the springs feel the hit: the body does not deform but it
             # is on suspension, and a car that runs into something dives on its nose. The contact
             # changes the velocity outside the dynamics, so `ax`/`ay` alone never carried it --
@@ -1495,7 +1516,7 @@ class Simulator:
             if imu_on:
                 # `yaw_acc` after the contact's damping, so the gyro sees the jolt too.
                 yaw_acc = (state[:, dyn.IR] - r_old) / self.dt
-                imu_state = imu_model.substep(imu_state, a_x, a_y, state[:, dyn.IVX], roll, pitch, roll_rate, pitch_rate,
+                imu_state = self._imu_substep(imu_state, a_x, a_y, state[:, dyn.IVX], roll, pitch, roll_rate, pitch_rate,
                                               state[:, dyn.IR], roll_acc, pitch_acc, yaw_acc, r_vec, P, self.dt,
                                               shock=wheel_on)
                 if k in self.imu_idx:
