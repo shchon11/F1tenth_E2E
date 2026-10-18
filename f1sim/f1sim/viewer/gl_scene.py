@@ -1093,7 +1093,9 @@ def duct_mesh_arrays(contours, diameter, radial=14, occupied=None, resolution=0.
         ring_n = (np.cos(ang)[None, :, None] * n1[:, None, :] + np.sin(ang)[None, :, None] * n2[None, None, :])   # (n, radial, 3)
         centers = np.concatenate([pts, np.full((n, 1), R)], 1)
         vp = centers[:, None, :] + ring_n * R
-        col = np.tile([0.86, 0.87, 0.9, 0.0], (n, radial, 1)); col[..., 3] = u[:, None]
+        # Grey (the user, 2026-10-18: "덕트 파이프 회색으로"), not the near-white it was: against the
+        # 0.14 ground plate a mid grey still reads as the boundary.
+        col = np.tile([0.50, 0.51, 0.53, 0.0], (n, radial, 1)); col[..., 3] = u[:, None]
         P.append(vp.reshape(-1, 3)); N.append(ring_n.reshape(-1, 3)); C.append(col.reshape(-1, 4))
         i = np.arange(n)[:, None] * radial + np.arange(radial)[None, :]
         i_next_ring = (np.roll(np.arange(n), -1)[:, None] * radial + np.arange(radial)[None, :])
