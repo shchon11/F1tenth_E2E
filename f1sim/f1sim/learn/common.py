@@ -610,13 +610,35 @@ class PlannerEgoDriver:
 
     needs_speed = False
 
-    def __init__(self, teacher, kind: str, stack=None):
+    #: The local waypoint array handed to the MAP controller: this far behind the car's projection on
+    #: the reference line and this far ahead -- past the longest L1 the tuning allows plus the
+    #: furthest speed lookahead, race_stack's own window being about as long.
+    PATH_BEHIND_M, PATH_AHEAD_M = 1.0, 10.0
+
+    def __init__(self, teacher, kind: str, stack=None, ref=None, tracker=None):
         self.teacher, self.kind = teacher, kind
         self.stack = stack
         self.rows = None
+        #: `ref` the reference line teacher (the planner's `base`, or the teacher itself), `tracker` the
+        #: path follower: a `map_controller.MAPController`, or None for the reference teacher's own
+        #: pure pursuit (what every planner baseline drove on before 2026-10-19)
+        self.ref = ref if ref is not None else teacher
+        self.tracker = tracker
 
     def command_env(self, env, rows):
         import torch
+        if self.tracker is not None:
+            st = self.stack.update(env) if self.stack is not None else env.sim.state
+            P = self.stack.nominal_P(env) if self.stack is not None else env.sim.P
+            cmd = self._map_command(env, rows, st, P)
+            if self.stack is not None:
+                follow, v_cap = self.stack.follow_cap(env, st)
+            elif env.M > 1:
+                follow, v_cap = env.follow_cap(env.sim.state)
+            else:
+                return cmd
+            cmd[:, 1] = torch.where(follow[rows], torch.minimum(cmd[:, 1], v_cap[rows]), cmd[:, 1])
+            return cmd
         if self.stack is not None:
             st = self.stack.update(env)
             cmd = self.teacher(st, self.stack.nominal_P(env), env.sim.tid)[rows].clone()
@@ -629,7 +651,80 @@ class PlannerEgoDriver:
             cmd[:, 1] = torch.where(follow[rows], torch.minimum(cmd[:, 1], v_cap[rows]), cmd[:, 1])
         return cmd
 
+    def _map_command(self, env, rows, st, P):
+        """(R, 2) (steer, speed) from the MAP controller on this planner's path. The path is what
+        race_stack's state machine publishes as local waypoints: the reference line displaced by the
+        planner's lateral offsets (`path_offsets`, the evasion spline while passing), with the line's
+        speed profile at this car's grip (x the planner's own speed scale) and its curvature."""
+        import torch
+        from ..spliner_teacher import TRAILING
+        ref, planner, mp = self.ref, self.teacher, self.tracker
+        dev = st.device
+        B = st.shape[0]
+        tid = env.sim.tid
+        if planner is not ref:
+            _d, mode, scale = planner.decide(st, tid)            # what `planner(...)` does first
+        else:
+            mode, scale = None, torch.ones(B, device=dev)
+        s_r, td = st[rows], tid[rows]
+        R = rows.numel()
+        idx, _ = ref.project(s_r[:, :2], td)
+        ds = ref.ds[td]
+        ds0 = float(ds.mean())
+        ks = torch.arange(-int(round(self.PATH_BEHIND_M / ds0)), int(round(self.PATH_AHEAD_M / ds0)) + 1, device=dev)
+        j = torch.remainder(idx[:, None] + ks[None, :], ref.N)                           # (R, n)
+        n = ks.numel()
+        d = None
+        if planner is not ref:
+            d = planner.path_offsets(rows, ks.to(s_r.dtype) * ds0, s_r[:, 3])
+        if d is None:
+            d = torch.zeros(R, n, device=dev, dtype=s_r.dtype)
+        d = ref.clamp_offset(d, td[:, None].expand(-1, n), j)
+        tn = ref.tan[td[:, None], j]
+        path_xy = ref.xy[td[:, None], j] + d[..., None] * torch.stack([-tn[..., 1], tn[..., 0]], -1)
+        gb = ref.grip_bin(P, B, dev)[rows]
+        path_v = ref.speed_at(td[:, None].expand(-1, n), j, gb[:, None].expand(-1, n))
+        path_v = path_v * scale[rows].to(path_v.dtype)[:, None]
+        kappa = ref.kappa[td[:, None], j]
+        t0, p0 = ref.tan[td, idx], ref.xy[td, idx]
+        d_glob = t0[:, 0] * (s_r[:, 1] - p0[:, 1]) - t0[:, 1] * (s_r[:, 0] - p0[:, 0])  # frenet d, left +
+        lr = env.last_result
+        if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
+            mp.push_imu(lr.imu[rows, :, 3])                     # accelerometer x: longitudinal
+        trailing = gap = vs = visible = None
+        if mode is not None and self.stack is not None and self.kind in ("forzaeth", "forzaeth_pred"):
+            trailing, gap, vs, visible = self._trailing_opponent(rows, mode, idx, td)
+        steer, speed = mp(s_r[:, :2], s_r[:, 2], s_r[:, 3], path_xy, path_v, kappa, ds, d_glob, gb,
+                          trailing=trailing, opp_gap=gap, opp_vs=vs, opp_visible=visible, ego_vs=s_r[:, 3])
+        return torch.stack([steer, speed / P["speed_gain"][rows]], 1)
+
+    def _trailing_opponent(self, rows, mode, idx, td):
+        """race_stack's `obstacle_cb` on the stack's tracks: the obstacle whose rear is nearest ahead in
+        s (a dynamic one before any static one, `prioritize_dyn`), its centre gap, speed and whether
+        this scan saw it; `trailing` where the planner is TRAILING and there is one."""
+        import torch
+        from ..spliner_teacher import TRAILING
+        st_, ref = self.stack, self.ref
+        L = ref.length[td][:, None]
+        s_e = (idx.to(st_.obs_s.dtype) * ref.ds[td])[:, None]
+        ok = st_.obs_ok[rows]
+        s_c = st_.obs_s[rows]
+        rear = torch.remainder(s_c - st_.obs_ext[rows][..., 0] - s_e, L)
+        dyn_ = ok & (st_.obs_vs[rows].abs() >= st_.per.tp.static_speed)
+        prefer = dyn_ if self.tracker.p.prioritize_dyn else ok
+        use = torch.where(prefer.any(1, keepdim=True), prefer, ok)
+        j = torch.where(use, rear, torch.full_like(rear, float("inf"))).argmin(1)
+        ar = torch.arange(rows.numel(), device=rows.device)
+        any_ = ok.any(1)
+        gap = torch.remainder(s_c[ar, j] - s_e[:, 0], L[:, 0])
+        visible = st_.per.misses[ar, j] == 0
+        trailing = (mode[rows] == TRAILING) & any_
+        return trailing, gap, st_.obs_vs[rows][ar, j], visible
+
     def reset(self, mask) -> None:
+        if self.tracker is not None:
+            import torch
+            self.tracker.reset(torch.as_tensor(mask, device=self.tracker.curr_steer.device))
         fn = getattr(self.teacher, "reset_rows", None)
         if fn is not None and self.rows is not None:
             import torch
@@ -639,8 +734,25 @@ class PlannerEgoDriver:
 
     def describe(self) -> dict:
         return {"kind": self.kind, "driver": type(self.teacher).__name__,
+                "tracker": ("MAP (ForzaETH race_stack)" if self.tracker is not None else "pure pursuit (reference teacher)"),
                 "perception": ("particle filter + scan detection/tracking, nominal actuators" if self.stack is not None
                                else "ORACLE: ground-truth pose, opponents and actuator parameters")}
+
+
+def build_map_tracker(env, ref, params: Optional[dict] = None):
+    """A `map_controller.MAPController` for the ego rows of `env`, its steering table built (once, then
+    cached on disk) from the NOMINAL car through this simulator's own actuators and tyres, one table per
+    grip level of `ref`'s speed profiles (the planner reads the same level for its speeds)."""
+    import torch as _torch
+    from .. import map_controller as _map
+    sim = env.sim
+    nominal = sim.params.nominal
+    P_row = {k: _torch.tensor([float(v)]) for k, v in nominal.items()}
+    mus = [float(ref.mu_nom * g) for g in ref.grip_levels]
+    lut = _map.lut_for(P_row, mus, wheel=bool(sim.wheel_model), dt=float(sim.dt), s_max=float(nominal["s_max"]),
+                       device=sim.state.device)
+    rows = int((env.slot == 0).sum())
+    return _map.MAPController(lut, _map.MAPParams.from_dict(params), rows, sim.state.device, float(nominal["s_max"]))
 
 
 def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] = None, rls=None,
@@ -682,7 +794,15 @@ def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] 
                                  trk=TrackParams(**sp.get("trk", {})))
             if planner is not ref:
                 planner.observer = stack
-        return PlannerEgoDriver(planner, kind, stack)
+        # The path follower. MAP, ForzaETH's own (`map_controller`), since 2026-10-19 (the user: "waypoint
+        # 추종하는거 pure pursuit이여? 에바야 레이싱에 무슨.. 그 MAP 제어기 ... 그걸로 해봐"); "pp" keeps the
+        # reference teacher's pure pursuit, which is what these baselines drove on before.
+        tracker = None
+        if sp.get("tracker", "map") == "map":
+            tracker = build_map_tracker(env, ref, sp.get("map", {}))
+        elif sp.get("tracker") != "pp":
+            raise ValueError(f"tracker must be 'map' or 'pp', not {sp.get('tracker')!r}")
+        return PlannerEgoDriver(planner, kind, stack, ref=ref, tracker=tracker)
     if kind in EGO_EXTERNAL_KINDS:
         from . import baselines
         opts = dict(options or {})

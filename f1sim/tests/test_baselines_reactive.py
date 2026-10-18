@@ -130,3 +130,51 @@ def test_disparity_extender_does_not_turn_into_a_wall_beside_it():
     assert free > 0.0                                               # nothing beside it: it turns left
     blocked, _ = d._row(_left_turn_scene(0.18))                     # 0.18 m < half width 0.155 + 0.1
     assert blocked == 0.0                                           # a wall right beside it: straight on
+
+
+def _proc(ftg, scan):
+    return ftg._safety_border(ftg._preprocess_lidar(np.asarray(scan, np.float64)))
+
+
+def test_ftg_adaptive_thresholds_answer_their_own_question():
+    """`radius_mode` (2026-10-19; the user: "distance threshold를 고정은 너무 좀 무식하고"): each mode's
+    free-space threshold moves with what it reads; "upstream" is the port the test above pins."""
+    f = reactive.FollowTheGap
+    corridor, _ = _corridor(1.0, 1.0)
+    # stopping: the stopping distance, r_min + v t_react + v^2 / 2 a_brake, clipped
+    st = f(radius_mode="stopping", r_min=1.0, r_max=6.0, t_react=0.3, a_brake=4.0)
+    p = _proc(st, corridor)
+    assert abs(st._get_radius(1.0, p) - (1.0 + 0.3 + 1.0 / 8.0)) < 1e-9
+    assert abs(st._get_radius(5.0, p) - min(6.0, 1.0 + 1.5 + 25.0 / 8.0)) < 1e-9
+    # scan: an open scene looks further than a narrow corridor
+    sc = f(radius_mode="scan", scan_gain=0.6, scan_quantile=0.5, r_min=0.5, r_max=8.0)
+    open_ = np.full(1081, 9.0)
+    narrow, _ = _corridor(0.6, 0.6)
+    assert sc._get_radius(3.0, _proc(sc, open_)) > sc._get_radius(3.0, _proc(sc, narrow)) + 1.0
+    # passable: the threshold it settles on leaves a gap the car fits through at that distance,
+    # and an open scene does not lower it at all
+    ps = f(radius_mode="passable", r_min=0.5, r_max=8.0, car_width=0.31, gap_margin=0.2)
+    for s in _scans(20, seed=5):
+        p = _proc(ps, s)
+        r = ps._get_radius(3.0, p)
+        lo, hi = ps._find_largest_gap(p, r)
+        assert r == 0.5 or (hi - lo) * ps.radians_per_elem * r >= 0.51 - 1e-9, (r, lo, hi)
+    assert ps._get_radius(3.0, _proc(ps, open_)) == 8.0
+    # stopping_passable never looks further than the stopping distance
+    sp = f(radius_mode="stopping_passable", r_min=0.5, r_max=8.0, t_react=0.3, a_brake=4.0)
+    assert sp._get_radius(2.0, _proc(sp, open_)) <= 0.5 + 0.6 + 0.5 + 1e-9
+
+
+def test_ftg_deepest_target_aims_at_the_farthest_beam_of_the_gap():
+    ftg = reactive.FollowTheGap(target="deepest", radius_mode="passable", r_min=0.5, r_max=4.0)
+    scan, ang = _corridor(1.2, 1.2)
+    scan = np.asarray(scan, np.float64).copy()
+    scan[np.abs(ang) < 0.3] = np.minimum(scan[np.abs(ang) < 0.3], 3.0)   # a wall 3 m ahead ...
+    scan[(ang > 0.35) & (ang < 0.45)] = 9.0                   # ... and a deep opening 20-25 deg to the left
+    d = ftg._decide(scan, 2.0)
+    p = d["proc"]
+    lo, hi = ftg._find_largest_gap(p, d["radius"])
+    k = lo + int(np.argmax(p[lo:hi])) + ftg.range_offset - 180
+    want = math.atan2(math.cos(k * ftg.radians_per_elem), math.sin(k * ftg.radians_per_elem))
+    assert abs(d["steer"] - max(-0.4, min(0.4, want))) < 1e-9
+    assert d["steer"] > 0.2                                    # it turns toward the opening

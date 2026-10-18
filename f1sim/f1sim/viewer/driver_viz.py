@@ -139,9 +139,18 @@ def planner_tensors(drv, env, row: int) -> list:
         d = t.path_offsets(rows, ex["s"], state[rows, 3])
         if d is not None:
             path = path + d[..., None] * ex["normal"]
+    origin, target = ex["origin"], ex["target"]
+    trk = getattr(drv, "tracker", None)
+    if trk is not None and trk.last.get("l1_point") is not None and getattr(drv, "rows", None) is not None:
+        # The MAP controller aims from where the car is at its L1 point (`map_controller`), not from a
+        # latency-compensated pose at a pure-pursuit target: draw what it actually steered at last step.
+        hit = (drv.rows == int(row)).nonzero()
+        if hit.numel():
+            i = int(hit[0, 0])
+            origin, target = state[rows, :2], trk.last["l1_point"][i:i + 1]
     last = getattr(t, "last_state", None) if frenet else None
     code = last[rows].float() if last is not None else torch.full((1,), -1.0, device=dev)
-    out = [ex["origin"].reshape(-1).float(), ex["target"].reshape(-1).float(), path.reshape(-1).float(),
+    out = [origin.reshape(-1).float(), target.reshape(-1).float(), path.reshape(-1).float(),
            ex["line"].reshape(-1).float(), ex["v"].reshape(-1).float(), code.reshape(-1)]
     if stack is not None:
         out += stack_tensors(stack, env, int(row))
@@ -183,8 +192,10 @@ def planner_overlay(drv, flat: np.ndarray, n: int = PLAN_POINTS):
     lines.append({"xy": np.stack([o, tgt]), "rgba": TARGET_LINE, "w": 2.0})
     points = [{"xy": path[::WAYPOINT_EVERY], "rgba": WAYPOINT, "px": 5.0},
               {"xy": tgt[None], "rgba": TARGET, "px": 13.0}]
+    aim = ("큰 점 = MAP 제어기가 겨누는 L1 점" if getattr(drv, "tracker", None) is not None
+           else "큰 점 = 경로 추종기(pure pursuit)가 겨누는 점")
     legend = (f"{title} · {state} · 색 띠 = 따라가는 경로와 속도 프로파일 · 작은 점 = 경로 웨이포인트(0.5 m) · "
-              f"큰 점 = 경로 추종기가 겨누는 점" + (" · 회색 = 레이싱 라인" if len(lines) > 1 else ""))
+              f"{aim}" + (" · 회색 = 레이싱 라인" if len(lines) > 1 else ""))
     stack = getattr(drv, "stack", None)
     if stack is not None:
         est = flat[i:i + 3]; i += 3

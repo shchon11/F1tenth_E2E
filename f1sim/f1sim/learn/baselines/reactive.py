@@ -56,11 +56,37 @@ class FollowTheGap(BaselineDriver):
     MILD_CURVE_ANGLE = np.pi / 6
     ULTRASTRAIGHTS_ANGLE = np.pi / 60
 
+    #: How far a beam must reach to count as free (`radius_mode`, 2026-10-19). The user: "Follow the
+    #: gap도 이거 distance threshold를 고정은 너무 좀 무식하고 좀 adaptive하게 할 수 있게 해봐. 변형할 수 있는
+    #: 방법이 좀 있을텐데". "upstream" is ForzaETH's own (half the track width plus a term in speed,
+    #: capped at 5 m). The others make the threshold answer a question about THIS scan and speed:
+    #:   "stopping": the free space the car needs to stop in -- r_min + v t_react + v^2 / (2 a_brake);
+    #:   "scan": a fraction of how open the scene ahead is -- scan_gain x the scan_quantile of the
+    #:           ranges within +-90 deg -- far on an open straight, short in a tight hairpin;
+    #:   "passable": the largest threshold (r_max down to r_min) whose widest gap is wide enough for the
+    #:           car at that distance (chord >= car_width + gap_margin) -- the farthest look that still
+    #:           shows a way through, lowered only as far as the clutter forces;
+    #:   "stopping_passable": "passable" searched down from the stopping distance.
+    RADIUS_MODES = ("upstream", "stopping", "scan", "passable", "stopping_passable")
+    #: Where in the chosen gap to steer: its middle (upstream), its deepest beam (the course's version),
+    #: or the range-weighted mean bearing of the gap.
+    TARGETS = ("middle", "deepest", "weighted")
+
     def __init__(self, *, max_speed: float = 6.0, safety_radius: int = 40, max_lidar_dist: float = 9.0,
-                 range_offset: int = 180, track_width: float = 2.6):
+                 range_offset: int = 180, track_width: float = 2.6, radius_mode: str = "upstream",
+                 r_min: float = 1.0, r_max: float = 5.0, t_react: float = 0.3, a_brake: float = 4.0,
+                 scan_quantile: float = 0.5, scan_gain: float = 0.6, car_width: float = 0.31,
+                 gap_margin: float = 0.2, radius_step: float = 0.25, target: str = "middle"):
+        if radius_mode not in self.RADIUS_MODES:
+            raise BaselineError(f"radius_mode must be one of {self.RADIUS_MODES}, not {radius_mode!r}")
+        if target not in self.TARGETS:
+            raise BaselineError(f"target must be one of {self.TARGETS}, not {target!r}")
         p = dict(max_speed=float(max_speed), safety_radius=int(safety_radius),
                  max_lidar_dist=float(max_lidar_dist), range_offset=int(range_offset),
-                 track_width=float(track_width))
+                 track_width=float(track_width), radius_mode=str(radius_mode), r_min=float(r_min),
+                 r_max=float(r_max), t_react=float(t_react), a_brake=float(a_brake),
+                 scan_quantile=float(scan_quantile), scan_gain=float(scan_gain), car_width=float(car_width),
+                 gap_margin=float(gap_margin), radius_step=float(radius_step), target=str(target))
         super().__init__(ScanContract(n_beams=N_BEAMS, fov=FOV, range_max=RANGE_MAX, control_rate=RATE),
                          _Params("follow_the_gap", p, "ForzaETH/race_stack@e7d07f7 controller/ftg/ftg.py (MIT)"),
                          note="Follow-the-Gap (the RoboRacer course's reactive method), ForzaETH's implementation "
@@ -70,6 +96,7 @@ class FollowTheGap(BaselineDriver):
         self.MAX_LIDAR_DIST = p["max_lidar_dist"]
         self.range_offset = p["range_offset"]
         self.track_width = p["track_width"]
+        self.p = p
         s = self.MAX_SPEED * self.SCALE
         self.CORNERS_SPEED, self.MILD_CORNERS_SPEED = 0.3 * s, 0.45 * s
         self.STRAIGHTS_SPEED, self.ULTRASTRAIGHTS_SPEED = 0.8 * s, s
@@ -119,8 +146,40 @@ class FollowTheGap(BaselineDriver):
         gap_width = np.max(widths)
         return gap_left, gap_left + gap_width
 
-    def _get_radius(self, velocity: float) -> float:
-        return min(5., self.track_width / 2 + 2 * (velocity / self.MAX_SPEED))
+    def _get_radius(self, velocity: float, ranges: Optional[np.ndarray] = None) -> float:
+        """The free-space threshold for this scan (`radius_mode`). `ranges` is the processed scan."""
+        p = self.p
+        mode = p["radius_mode"]
+        if mode == "upstream":
+            return min(5., self.track_width / 2 + 2 * (velocity / self.MAX_SPEED))
+        v = max(0.0, float(velocity))
+        stop = p["r_min"] + v * p["t_react"] + v * v / (2.0 * max(p["a_brake"], 1e-3))
+        if mode == "stopping":
+            return float(np.clip(stop, p["r_min"], p["r_max"]))
+        if mode == "scan":
+            front = self._front(ranges)
+            return float(np.clip(p["scan_gain"] * np.quantile(front, p["scan_quantile"]), p["r_min"], p["r_max"]))
+        top = p["r_max"] if mode == "passable" else float(np.clip(stop, p["r_min"], p["r_max"]))
+        return self._passable_radius(ranges, top)
+
+    def _front(self, ranges: np.ndarray) -> np.ndarray:
+        """The processed ranges within +-90 deg of straight ahead (bearing pi/2 - k * rpe, `_decide`)."""
+        k = np.arange(len(ranges)) + (self.range_offset - 180)
+        bearing = np.pi / 2 - k * self.radians_per_elem
+        sel = np.abs(bearing) <= np.pi / 2
+        return ranges[sel] if sel.any() else ranges
+
+    def _passable_radius(self, ranges: np.ndarray, top: float) -> float:
+        """The largest threshold from `top` down to `r_min` whose widest gap is passable there."""
+        p = self.p
+        need = p["car_width"] + p["gap_margin"]
+        r = top
+        while r > p["r_min"]:
+            lo, hi = self._find_largest_gap(ranges, r)
+            if (hi - lo) * self.radians_per_elem * r >= need:
+                return float(r)
+            r -= p["radius_step"]
+        return float(p["r_min"])
 
     def _row(self, ranges: np.ndarray, velocity: float):
         d = self._decide(ranges, velocity)
@@ -129,11 +188,19 @@ class FollowTheGap(BaselineDriver):
     def _decide(self, ranges: np.ndarray, velocity: float) -> dict:
         """`process_lidar`, with what it computed on the way kept for a viewer (`explain`)."""
         proc = self._safety_border(self._preprocess_lidar(ranges))
-        radius = self._get_radius(velocity)
+        radius = self._get_radius(velocity, proc)
         gap_left, gap_right = self._find_largest_gap(proc, radius)
+        target = self.p["target"]
+        if target == "deepest" and gap_right > gap_left:
+            aim = gap_left + int(np.argmax(proc[gap_left:gap_right]))
+        elif target == "weighted" and gap_right > gap_left:
+            w = proc[gap_left:gap_right]
+            aim = int(round(float(np.sum(w * np.arange(gap_left, gap_right)) / max(float(np.sum(w)), 1e-9))))
+        else:
+            aim = None
         gap_left += self.range_offset - 180
         gap_right += self.range_offset - 180
-        gap_middle = int((gap_right + gap_left) / 2)
+        gap_middle = int((gap_right + gap_left) / 2) if aim is None else aim + self.range_offset - 180
         best_y = np.cos(gap_middle * self.radians_per_elem) * radius
         best_x = np.sin(gap_middle * self.radians_per_elem) * radius
         steering_angle = float(np.clip(math.atan2(best_y, best_x), -0.4, 0.4))
