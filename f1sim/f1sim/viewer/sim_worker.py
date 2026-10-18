@@ -1222,18 +1222,38 @@ class SimWorker:
             # its own method's picture (`driver_viz`), not the policy's plan.
             ego_rls, ego_lim = rls, dict(TRAIN_LIMITS)
             lim = getattr(cfg, "ego_limits", None)
+            ego_opts = dict(getattr(cfg, "ego_options", None) or {})
+            ego_w = str(getattr(cfg, "ego_weights", "") or "")
+            stack_params, tuned = None, None
+            if bool(getattr(cfg, "ego_tuned", True)):
+                # The setting the comparison reports for this method on this map, racing or alone
+                # (`learn.baseline_settings`): the console shows the tuned baseline, not its defaults.
+                from ..learn import baseline_settings
+                tuned = baseline_settings.lookup(track.name, ego_kind, solo=int(cfg.cars_per_race) <= 1)
+                if tuned:
+                    if ego_kind in common.EGO_PLANNER_KINDS:
+                        stack_params = tuned.get("stack_params")
+                        lim = tuned.get("limits") or lim
+                    else:
+                        ego_opts = dict(tuned.get("options") or {})
+                        ego_w = str(tuned.get("weights") or ego_w)
+            if ego_kind in ("tinylidarnet", "end2race") and not ego_w:
+                raise StartConfigError(f"내 차 '{ego_kind}': 가중치 파일을 고르세요 (이 맵에는 튜닝된 설정이 없습니다).")
             try:
                 if ego_kind in common.EGO_PLANNER_KINDS and lim:
                     ego_lim = common.teacher_limits(*[float(x) for x in lim])
                     ego_rls = [Raceline.build_cached(track, objective="min_time", **ego_lim)]
-                drv = common.build_ego_driver(env, ego_kind, str(getattr(cfg, "ego_weights", "") or ""),
-                                              dict(getattr(cfg, "ego_options", None) or {}),
-                                              rls=ego_rls, limits=ego_lim)
+                drv = common.build_ego_driver(env, ego_kind, ego_w, ego_opts, rls=ego_rls, limits=ego_lim,
+                                              stack_params=stack_params)
             except Exception as exc:
                 raise StartConfigError(f"내 차 주행기 '{ego_kind}': {exc}") from exc
             env.set_ego_driver(drv)
-            ego_note = ego_description(ego_kind, getattr(cfg, "ego_weights", ""), getattr(cfg, "ego_options", None),
+            ego_note = ego_description(ego_kind, ego_w, ego_opts if not tuned else None,
                                        ego_lim if ego_kind in common.EGO_PLANNER_KINDS else None)
+            if tuned:
+                ego_note += f" · 맵별 튜닝 설정 ({tuned.get('source', '')})"
+            elif bool(getattr(cfg, "ego_tuned", True)):
+                ego_note += " · 이 맵에는 튜닝된 설정이 없어 공개 기본값"
         # Does any car still drive on the policy's action? A learner row that no external driver
         # overrides. When none does, the policy is not run at all (`_step_once`): its output would be
         # discarded every step. The user: "내 정책 말고 다른 방법들 선택할 때 우리정책 planner 추론은

@@ -42,9 +42,9 @@ class EgoDriverPanel(QtWidgets.QWidget):
         self.kind.addItem("정책 런 (위에서 고른 체크포인트)", "policy")
         for name in PLANNERS:
             k = osl.kind_of(name)
-            self.kind.addItem(f"{k.label} · 위치 참값", name)
-            self.kind.setItemData(self.kind.count() - 1, k.note + "\n자기 경로 추종기로 직접 조향·속도를 냅니다. "
-                                  "위치와 상대 차 상태를 참값으로 받습니다 (모듈형 스택의 특권 조건).",
+            self.kind.addItem(k.label, name)
+            self.kind.setItemData(self.kind.count() - 1, k.note + "\n자기 위치추정(파티클 필터)과 인지(스캔 검출·추적)로 "
+                                  "달리고, 경로는 ForzaETH의 MAP 제어기로 따라갑니다. 참값은 받지 않습니다.",
                                   QtCore.Qt.ToolTipRole)
         for name in EXTERNALS:
             k = osl.kind_of(name)
@@ -71,6 +71,12 @@ class EgoDriverPanel(QtWidgets.QWidget):
             self.line.addItem(text, lim)
         self.line.setToolTip("플래너가 달리는 최소시간 라인의 가속도 한계 (a_lat/a_acc/a_brake). 상대 차는 "
                              "학습 라인 그대로입니다. 빠른 라인은 캐시에 있는 맵에서만 바로 열립니다.")
+        self.tuned = QtWidgets.QCheckBox("맵별 튜닝 설정")
+        self.tuned.setChecked(True)
+        self.tuned.setToolTip("비교표가 쓰는 이 방법의 맵별 튜닝 결과로 달립니다 (상대 차가 있으면 경주용, "
+                              "혼자면 혼자 주행용). 끄면 아래 속도·라인을 직접 정합니다. 튜닝 결과가 없는 맵에서는 "
+                              "공개 기본값으로 달립니다.")
+        opt.addWidget(self.tuned)
         opt.addWidget(self.weights, 1)
         opt.addWidget(self.pace)
         opt.addWidget(self.line)
@@ -80,6 +86,7 @@ class EgoDriverPanel(QtWidgets.QWidget):
         v.addWidget(self.note)
 
         self.kind.currentIndexChanged.connect(self._on_kind)
+        self.tuned.toggled.connect(lambda _b: self._on_kind())
         self.pace.valueChanged.connect(lambda _v: self.changed.emit())
         self.line.currentIndexChanged.connect(lambda _i: self.changed.emit())
         self._on_kind()
@@ -91,9 +98,11 @@ class EgoDriverPanel(QtWidgets.QWidget):
     def _on_kind(self, *_a):
         k = self.kind_name()
         net = k in ("tinylidarnet", "end2race")
-        self.weights.setVisible(net)
-        self.pace.setVisible(k in PACE_KNOB)
-        self.line.setVisible(k in PLANNERS)
+        manual = not self.tuned.isChecked()
+        self.tuned.setVisible(k != "policy")
+        self.weights.setVisible(net and manual)
+        self.pace.setVisible(k in PACE_KNOB and manual)
+        self.line.setVisible(k in PLANNERS and manual)
         if not net:
             self._weights_path = ""
         self.weights.setText(os.path.basename(self._weights_path) or "가중치 파일…")
@@ -113,7 +122,7 @@ class EgoDriverPanel(QtWidgets.QWidget):
 
     def problem(self) -> str:
         k = self.kind_name()
-        if k in ("tinylidarnet", "end2race"):
+        if k in ("tinylidarnet", "end2race") and not self.tuned.isChecked():
             if not self._weights_path:
                 return "내 차 주행기의 가중치 파일을 고르세요."
             if not os.path.isfile(self._weights_path):
@@ -126,10 +135,12 @@ class EgoDriverPanel(QtWidgets.QWidget):
         opts = {PACE_KNOB[k]: float(self.pace.value())} if k in PACE_KNOB and self.pace.value() > 0 else {}
         lim: Optional[List[float]] = self.line.currentData() if k in PLANNERS else None
         return {"ego_kind": k, "ego_weights": self._weights_path if k in ("tinylidarnet", "end2race") else "",
-                "ego_options": opts, "ego_limits": (list(lim) if lim else None)}
+                "ego_options": opts, "ego_limits": (list(lim) if lim else None),
+                "ego_tuned": bool(self.tuned.isChecked())}
 
     def set_config(self, d: Dict[str, Any]) -> None:
         k = str(d.get("ego_kind") or "policy")
+        self.tuned.setChecked(bool(d.get("ego_tuned", True)))
         i = self.kind.findData(k)
         self._weights_path = str(d.get("ego_weights") or "")
         self.kind.setCurrentIndex(max(0, i))

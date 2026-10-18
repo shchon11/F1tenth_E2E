@@ -147,6 +147,9 @@ class SessionConfig:
     ego_options: Dict[str, Any] = field(default_factory=dict)   # e.g. {"max_speed": 8.0} for ftg
     #: A planner ego's own line and profile limits (a_lat, a_acc, a_brake); None = the session's line.
     ego_limits: Optional[List[float]] = None
+    #: Drive the ego baseline on its per-map tuned setting (`learn.baseline_settings`), the one the
+    #: comparison reports, when the map has one -- instead of `ego_options` / `ego_limits` (2026-10-19).
+    ego_tuned: bool = True
     #: Plan-controller arm installed at run time (`learn.grip_runtime`).
     #:
     #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs
