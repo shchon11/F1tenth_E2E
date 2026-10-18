@@ -82,8 +82,24 @@ class Perception:
         #: per track: half extents behind / ahead (along s) and left / right (along d) of its centre [m]
         self.ext = torch.zeros(R, T, 4, device=self.device)
         C = int(self.dp.max_obs)
+        self._kf = self._kalman_constants()
         self.det_xy = torch.zeros(R, C, 2, device=self.device)          # this scan's detections (viewer)
         self.det_valid = torch.zeros(R, C, dtype=torch.bool, device=self.device)
+
+    def _kalman_constants(self):
+        """(F, Q, H, R, P0) of the constant-velocity filter, built once: a tensor made from Python
+        numbers is a host-to-device copy, which a CUDA graph of the step cannot contain."""
+        tp, dt, dev = self.tp, self.dt, self.device
+        F = torch.eye(4, device=dev)
+        F[0, 2] = F[1, 3] = dt
+        G = torch.tensor([0.5 * dt * dt, 0.5 * dt * dt, dt, dt], device=dev)
+        Q = torch.diag(G * G) * tp.sigma_acc ** 2
+        Q[0, 2] = Q[2, 0] = Q[1, 3] = Q[3, 1] = 0.5 * dt ** 3 * tp.sigma_acc ** 2
+        H = torch.zeros(2, 4, device=dev)
+        H[0, 0] = H[1, 1] = 1.0
+        Rm = torch.eye(2, device=dev) * tp.sigma_meas ** 2
+        P0 = torch.diag(torch.tensor([tp.sigma_meas ** 2, tp.sigma_meas ** 2, 9.0, 1.0], device=dev))
+        return F, Q, H, Rm, P0
 
     # ------------------------------------------------------------------ the lane
     def _lane_widths(self):
@@ -234,11 +250,7 @@ class Perception:
         R, T, C = self.R, self.T, cen.shape[1]
         L = self.base.length[tid]                                                  # (R,)
         # predict
-        F = torch.eye(4, device=self.device)
-        F[0, 2] = F[1, 3] = dt
-        G = torch.tensor([0.5 * dt * dt, 0.5 * dt * dt, dt, dt], device=self.device)
-        Q = torch.diag(G * G) * tp.sigma_acc ** 2
-        Q[0, 2] = Q[2, 0] = Q[1, 3] = Q[3, 1] = 0.5 * dt ** 3 * tp.sigma_acc ** 2
+        F, Q, H, Rm, P0 = self._kf
         self.x = self.x @ F.T
         self.x[..., 0] = torch.remainder(self.x[..., 0], L[:, None])
         self.P = F @ self.P @ F.T + Q
@@ -262,13 +274,15 @@ class Perception:
         z_d = torch.gather(d_c, 1, jj)
         z_e = torch.gather(self.det_ext, 1, jj[..., None].expand(R, T, 4))
         # update
-        H = torch.zeros(2, 4, device=self.device)
-        H[0, 0] = H[1, 1] = 1.0
-        Rm = torch.eye(2, device=self.device) * tp.sigma_meas ** 2
         y = torch.stack([torch.remainder(z_s - self.x[..., 0] + 0.5 * L[:, None], L[:, None]) - 0.5 * L[:, None],
                          z_d - self.x[..., 1]], -1)                                     # (R, T, 2)
         S = H @ self.P @ H.T + Rm
-        K = self.P @ H.T @ torch.linalg.inv(S)                                          # (R, T, 4, 2)
+        # S is 2 x 2: its inverse in closed form, which needs no solver and no host synchronise (so the
+        # step can be one CUDA graph, `ModularStack`)
+        det = S[..., 0, 0] * S[..., 1, 1] - S[..., 0, 1] * S[..., 1, 0]
+        S_inv = torch.stack([torch.stack([S[..., 1, 1], -S[..., 0, 1]], -1),
+                             torch.stack([-S[..., 1, 0], S[..., 0, 0]], -1)], -2) / det[..., None, None]
+        K = self.P @ H.T @ S_inv                                                         # (R, T, 4, 2)
         x_new = self.x + (K @ y[..., None])[..., 0]
         P_new = (torch.eye(4, device=self.device) - K @ H) @ self.P
         self.x = torch.where(got[..., None], x_new, self.x)
@@ -281,7 +295,6 @@ class Perception:
         # spawn: the k-th unassociated detection (in detection order) takes the k-th free slot (in slot
         # order) -- what taking "the first free slot" detection by detection did, in one pass instead
         # of a Python loop of a dozen kernels per detection.
-        P0 = torch.diag(torch.tensor([tp.sigma_meas ** 2, tp.sigma_meas ** 2, 9.0, 1.0], device=self.device))
         new = keep & ~used                                                          # (R, C)
         free = ~self.active                                                         # (R, T)
         k_new = torch.cumsum(new.long(), 1) - 1                                     # rank among the new

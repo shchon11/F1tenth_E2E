@@ -88,6 +88,8 @@ class ParticleFilter:
         self._odom_prev = torch.zeros(R, 3, device=self.device)
         self._ready = torch.zeros(R, dtype=torch.bool, device=self.device)
         self._table = self._sensor_table()
+        # built once: a tensor made from Python numbers is a host copy a CUDA graph cannot hold
+        self._spread = torch.tensor(list(self.p.init_spread), device=self.device)
 
     # ------------------------------------------------------------------ the MIT sensor model
     def _sensor_table(self) -> torch.Tensor:
@@ -114,8 +116,7 @@ class ParticleFilter:
         with the odometry pose (R, 3) the next deltas are taken from."""
         # No early exit on an all-false mask: that test was a host synchronise every control step
         # (the stack asks every step), and the masked writes below leave the other rows as they were.
-        sx, sy, st = self.p.init_spread
-        noise = torch.randn(self.R, self.N, 3, device=self.device) * torch.tensor([sx, sy, st], device=self.device)
+        noise = torch.randn(self.R, self.N, 3, device=self.device) * self._spread
         init = pose[:, None, :] + noise
         init[..., 2] = wrap_angle(init[..., 2])
         m = which[:, None, None]

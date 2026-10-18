@@ -17,15 +17,15 @@ from f1sim.learn import common
 from f1sim.localization import ParticleFilter, PFParams
 
 
-def _env(race_size=1, envs=1, seed=7):
+def _env(race_size=1, envs=1, seed=7, device="cpu"):
     from f1sim.raceline import Raceline
     track = maps.load("real:korea_2025_iccas")
     lim = common.teacher_limits(7.0, 6.5, 4.0)
     rl = Raceline.build_cached(track, objective="min_time", **lim)
-    cfg = Config(); cfg.sim.compile_mode = "none"
+    cfg = Config(); cfg.sim.compile_mode = "none"; cfg.sim.compile = False
     ecfg = EnvConfig(max_steps=100000, hist_len=0, race_size=race_size, opponent="teacher", action_mode="direct",
                      opp_speed_range=(0.6, 0.6))
-    env = common.make_env([track], envs * race_size, "cpu", ecfg, cfg=cfg, seed=seed, rls=[rl], teacher_limits=lim)
+    env = common.make_env([track], envs * race_size, device, ecfg, cfg=cfg, seed=seed, rls=[rl], teacher_limits=lim)
     env.reset()
     return env, rl, lim
 
@@ -196,3 +196,45 @@ def test_spawn_gives_the_kth_new_detection_the_kth_free_slot():
         cfs = torch.gather(dor, 1, torch.where(free, k_free, torch.full_like(k_free, C)).clamp(max=C))
         got = torch.where(free & (cfs < C), cfs, torch.full_like(cfs, -1))
         assert torch.equal(got, ref), (got, ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_stack_graph_computes_what_the_eager_stack_computes():
+    """The stack's step as one CUDA graph (2026-10-19: the console's modular baselines ran at half real
+    time, the step being a few hundred small kernels) must be the same computation. Open loop, on the
+    sensor stream of one recorded drive: the same pose estimates and tracks step for step -- which
+    fails at once if any state the graph carries were read from a stale buffer -- and the same random
+    draws after the capture's warm-up. (Closed loop is no test: two eager runs already part at the
+    1e-7 level by step 18, the clustering's atomics, and a drive amplifies that.)"""
+    torch.manual_seed(5)
+    torch.cuda.manual_seed_all(5)
+    env, rl, lim = _env(race_size=2, envs=2, seed=3, device="cuda")
+    drv = common.build_ego_driver(env, "forzaeth", rls=[rl], limits=lim, stack_params={"pf": {"n_particles": 200}})
+    drv.stack.use_graph = False
+    env.set_ego_driver(drv)
+    env.reset()
+    names = ("_in_odom", "_in_scan", "_in_pose", "_in_fresh", "_in_tid")
+    feed = []
+    for _ in range(100):
+        env.step(torch.zeros(env.B, env.act_dim, device=env.device))
+        feed.append([getattr(drv.stack, n).clone() for n in names])
+    runs = []
+    for graph in (False, True):
+        torch.cuda.manual_seed_all(11)
+        st = common.build_ego_driver(env, "forzaeth", rls=[rl], limits=lim,
+                                     stack_params={"pf": {"n_particles": 200}}).stack
+        st.use_graph = graph
+        st.pf.reset(torch.ones_like(feed[0][3]), feed[0][2], feed[0][0])
+        out = []
+        for inputs in feed:
+            for n, v in zip(names, inputs):
+                getattr(st, n).copy_(v)
+            st._advance()
+            out.append((st.pf.estimate.clone(), st.per.x.clone(), st.per.active.clone()))
+        assert (st._graph is not None) == graph, st.graph_note
+        runs.append(out)
+    for k, ((pe, xe, ae), (pg, xg, ag)) in enumerate(zip(*runs)):
+        assert float((pe - pg).abs().max()) < 1e-3, (k, "pose", float((pe - pg).abs().max()))
+        assert torch.equal(ae, ag), (k, "track slots")
+        dx = float(torch.where(ae[..., None], (xe - xg).abs(), torch.zeros_like(xe)).max())
+        assert dx < 1e-3, (k, "tracks", dx)

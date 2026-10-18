@@ -31,6 +31,14 @@ import torch
 from .localization import ParticleFilter, PFParams
 from .perception import DetectParams, Perception, TrackParams
 
+#: What one step rebinds, per object. Each is kept in a fixed buffer and written back in place, so the
+#: whole step can be one CUDA graph: a graph replays addresses, and state rebound to a new tensor would
+#: be read from the old one on every replay.
+_PF_STATE = ("particles", "weights", "estimate", "_odom_prev", "_ready")
+_PER_STATE = ("x", "P", "active", "hits", "misses", "ext", "det_xy", "det_valid", "det_ext")
+#: Eager steps before the capture (kernels compiled, allocator warm).
+_EAGER_BEFORE_CAPTURE = 3
+
 
 class ModularStack:
     def __init__(self, env, rows: torch.Tensor, base, *, pf: Optional[PFParams] = None,
@@ -60,6 +68,23 @@ class ModularStack:
         self._nominal = {"cmd_delay": float(act.cmd_delay), "servo_tau": float(act.servo_tau),
                          "steer_bias": float(act.steer_bias), "steer_gain": float(act.steer_gain),
                          "speed_gain": float(act.speed_gain)}
+        # One step's inputs, in fixed buffers (the graph's), and the graph once captured.
+        R = self.rows.numel()
+        self._in_odom = torch.zeros(R, 3, device=dev)
+        self._in_scan = torch.zeros(R, int(lid.n_beams), device=dev)
+        self._in_pose = torch.zeros(R, 3, device=dev)
+        self._in_fresh = torch.zeros(R, dtype=torch.bool, device=dev)
+        self._in_tid = torch.zeros(R, dtype=torch.long, device=dev)
+        self._bufs = None
+        self._graph = None
+        self._eager_steps = 0
+        #: A CUDA graph of the step (localisation + perception) after a few eager steps: the step is a
+        #: few hundred small kernels, ~16 ms launched one by one for one car, which kept the console's
+        #: modular baselines below real time (2026-10-19). Off on the CPU, with F1SIM_STACK_GRAPH=0, or
+        #: after a capture fails (then the step stays eager, and says so in `graph_note`).
+        import os as _os
+        self.use_graph = dev.type == "cuda" and _os.environ.get("F1SIM_STACK_GRAPH", "1") != "0"
+        self.graph_note = ""
 
     # ------------------------------------------------------------------ one control step
     @torch.no_grad()
@@ -68,21 +93,43 @@ class ModularStack:
         (B, 8): the stack's rows replaced by what the car believes, the rest untouched (and unread)."""
         lr = env.last_result
         rows = self.rows
-        # A new episode: the operator puts the car on the grid and gives the filter its pose. Masked,
-        # every step, rather than behind an `any()` that would synchronise with the GPU each time.
-        fresh = env.ep_step[rows] == 0
-        self.pf.reset(fresh, env.sim.state[rows, :3].clone(), lr.odom[rows, :3].clone())
-        self.per.reset(fresh)
-        tid = env.sim.tid[rows]
-        pose = self.pf.step(lr.odom[rows, :3], lr.scan[rows], tid)
-        self.per.step(pose, lr.scan[rows], tid)
+        # A new episode: the operator puts the car on the grid and gives the filter its pose (`fresh`,
+        # masked every step rather than behind an `any()` that would synchronise with the GPU).
+        self._in_odom.copy_(lr.odom[rows, :3])
+        self._in_scan.copy_(lr.scan[rows])
+        self._in_pose.copy_(env.sim.state[rows, :3])
+        self._in_fresh.copy_(env.ep_step[rows] == 0)
+        self._in_tid.copy_(env.sim.tid[rows])
+        self._advance()
         st = env.sim.state.clone()
         est = torch.zeros(rows.numel(), st.shape[1], device=st.device, dtype=st.dtype)
-        est[:, :3] = pose
+        est[:, :3] = self.pf.estimate
         est[:, 3] = lr.odom[rows, 3]                    # wheel speed
         est[:, 5] = lr.odom[rows, 4]                    # gyro yaw rate
         st[rows] = est
         self.est_state = st
+        return st
+
+    def _advance(self) -> None:
+        """One step on what the input buffers hold: replayed once captured, eager before."""
+        if self._graph is not None:
+            self._graph.replay()
+            return
+        self._core()
+        self._eager_steps += 1
+        if self.use_graph and self._eager_steps >= _EAGER_BEFORE_CAPTURE \
+                and not torch.cuda.is_current_stream_capturing():
+            self._capture()
+
+    def _core(self) -> None:
+        """One step of localisation and perception on the input buffers, every piece of state written
+        back into its own buffer -- eager, or replayed as one CUDA graph (`_capture`)."""
+        self.pf.reset(self._in_fresh, self._in_pose, self._in_odom)
+        pose = self.pf.step(self._in_odom, self._in_scan, self._in_tid)
+        self.per.reset(self._in_fresh)
+        self.per.step(pose, self._in_scan, self._in_tid)
+        self._persist()
+        rows, tid = self.rows, self._in_tid
         ok = self.per.confirmed
         self.obs_ok[rows] = ok
         self.obs_s[rows] = self.per.x[..., 0]
@@ -91,7 +138,57 @@ class ModularStack:
         self.obs_vd[rows] = self.per.x[..., 3]
         self.obs_ext[rows] = self.per.ext
         self.obs_xy[rows] = self.per.to_world(self.per.x[..., 0], self.per.x[..., 1], tid[:, None].expand_as(ok))
-        return st
+
+    def _persist(self) -> None:
+        if self._bufs is None:
+            self._bufs = {(id(o), n): getattr(o, n).clone() for o, names in ((self.pf, _PF_STATE), (self.per, _PER_STATE))
+                          for n in names}
+        for o, names in ((self.pf, _PF_STATE), (self.per, _PER_STATE)):
+            for n in names:
+                buf, v = self._bufs[(id(o), n)], getattr(o, n)
+                if v is not buf:
+                    buf.copy_(v)
+                    setattr(o, n, buf)
+
+    def _capture(self) -> None:
+        """Record `_core` as one CUDA graph and replay it from now on. Warmed up on a side stream with
+        the state saved and put back, so the capture does not advance the filter; captured on that
+        stream, named, on this device (`graph_fastpath.GraphedCallable` says why it must be named)."""
+        dev = self.rows.device
+        saved = {k: v.clone() for k, v in self._bufs.items()}
+        # The warm-up draws random numbers; put the generator back so the first replay draws what the
+        # next eager step would have (the capture itself does not advance it). Same as
+        # `GraphedCallable`, and what makes the graph drive exactly like the eager stack.
+        rng = torch.cuda.get_rng_state(dev)
+        side = torch.cuda.Stream(device=dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        try:
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    self._core()
+            torch.cuda.current_stream(dev).wait_stream(side)
+            torch.cuda.synchronize(dev)
+            for k, v in saved.items():
+                self._bufs[k].copy_(v)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=side):
+                self._core()
+        except Exception as exc:                       # noqa: BLE001 -- stays eager, said once
+            self.use_graph = False
+            self.graph_note = f"stack graph off: {type(exc).__name__}: {exc}"
+            for k, v in saved.items():
+                self._bufs[k].copy_(v)
+            try:
+                torch.cuda.set_rng_state(rng, dev)
+            except RuntimeError:                       # a failed capture can leave it unsettable
+                pass
+            return
+        # This call's step already ran eagerly (`update`) and its state is what `saved` holds -- the
+        # capture recorded the work without running it -- so the graph takes over from the next step.
+        for k, v in saved.items():
+            self._bufs[k].copy_(v)
+        torch.cuda.set_rng_state(rng, dev)
+        self._graph = g
 
     def nominal_P(self, env) -> dict:
         """The simulator's parameter dict with the actuator model at its calibrated nominal values;
