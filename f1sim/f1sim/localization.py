@@ -38,7 +38,11 @@ from .dynamics import wrap_angle
 
 @dataclass
 class PFParams:
-    """The MIT filter's `localize.launch` values, in metres and radians."""
+    """The MIT filter's `localize.launch` values, in metres and radians -- except two, tuned on this
+    simulator the way a team tunes its filter on a bag (2026-10-18, `tools/baselines/pf_grid.sh`: 4 cars
+    driving the raceline, pose error against the truth): disp_theta 0.25 -> 0.05 and sigma_hit 0.40 ->
+    0.10. On ICRA 2022 that took the p95 error from 20.4 to 8.0 cm, the worst from 90 to 22 cm and the
+    time lost beyond 0.5 m from 1.1 % to 0; ICCAS p95 10.5 cm, Korea 2026 9.6 cm, nothing lost."""
     n_particles: int = 1000            # theirs: max_particles 4000 (on a Jetson with RMGPU)
     angle_step: int = 18               # beams used: every 18th of 1081 -> 61
     max_range: float = 10.0
@@ -46,12 +50,12 @@ class PFParams:
     z_short: float = 0.01
     z_max: float = 0.07
     z_rand: float = 0.12
-    sigma_hit: float = 0.40            # 8 px at 0.05 m/px
+    sigma_hit: float = 0.10            # theirs 8 px at 0.05 m/px = 0.40; tuned here (below)
     squash: float = 2.2
     table_res: float = 0.05            # [m] the sensor model's lattice (their map pixel)
     disp_x: float = 0.05               # motion dispersion added every update, world x [m]
     disp_y: float = 0.025              # world y [m] (as theirs: added in the map frame)
-    disp_theta: float = 0.25           # [rad]
+    disp_theta: float = 0.05           # [rad]; theirs 0.25, tuned here (below)
     init_spread: tuple = (0.10, 0.10, 0.05)   # the operator's initial estimate: x, y [m], yaw [rad]
 
 
