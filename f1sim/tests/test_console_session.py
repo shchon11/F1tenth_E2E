@@ -711,3 +711,27 @@ def test_resolving_an_older_start_leaves_a_newer_one_pending(h):
 
     h.wait_for(lambda: h.window.state == STATE_RUNNING, timeout=20, what="gen2 RUNNING")
     assert "start" not in h.window._pending
+
+
+def test_the_picks_come_first_named_and_select_their_map(tmp_path):
+    """`console_picks.json` names the policy to drive per map: those runs head the list under their
+    label, everything else follows newest first (2026-10-19, the user could not tell which to run)."""
+    import json
+    import os
+    import time
+    from f1sim.viewer.console import catalog
+    for name, age in (("exp_new", 0), ("exp_old", 500), ("pick_a", 9000)):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "ppo_latest.pt").write_bytes(b"x")
+        t = time.time() - age
+        os.utime(d / "ppo_latest.pt", (t, t))
+    (tmp_path / catalog.PICKS_FILE).write_text(json.dumps({"picks": [
+        {"run": "pick_a", "label": "A 맵 최종 정책", "map": "real/iccas25", "note": "경주 4.2 m/s"}]}),
+        encoding="utf-8")
+    runs = catalog.list_runs(str(tmp_path))
+    assert [r.name for r in runs] == ["pick_a", "exp_new", "exp_old"]
+    assert runs[0].pinned and runs[0].label == "A 맵 최종 정책" and runs[0].map == "real/iccas25"
+    assert not runs[1].pinned
+    (tmp_path / catalog.PICKS_FILE).write_text("{not json", encoding="utf-8")
+    assert [r.name for r in catalog.list_runs(str(tmp_path))] == ["exp_new", "exp_old", "pick_a"]

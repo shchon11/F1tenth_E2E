@@ -161,3 +161,38 @@ def test_upstream_spliner_trails_where_the_spline_would_meet_the_boundary():
     sp = _upstream_spliner(env, rl, lim, _one_obstacle(env.B, 4.0, 0.0, 1.5))
     d, mode, _ = sp.decide(env.sim.state, env.sim.tid)
     assert bool((mode == 1).all()) and float(d.abs().max()) == 0.0
+
+
+def test_spawn_gives_the_kth_new_detection_the_kth_free_slot():
+    """The batched spawn (`Perception.step`) assigns exactly what the old detection-by-detection loop
+    did: each unassociated detection, in order, takes the first slot still free."""
+    from f1sim.perception import Perception
+    g = torch.Generator().manual_seed(4)
+    R, T, C = 7, 6, 16
+    for _ in range(20):
+        keep = torch.rand(R, C, generator=g) < 0.4
+        used = torch.rand(R, C, generator=g) < 0.3
+        active = torch.rand(R, T, generator=g) < 0.5
+        # reference: the old loop
+        ref = torch.full((R, T), -1, dtype=torch.long)
+        act = active.clone()
+        for c in range(C):
+            new = keep[:, c] & ~used[:, c]
+            free = ~act
+            has = free.any(1) & new
+            slot = free.float().argmax(1)
+            for r in range(R):
+                if bool(has[r]):
+                    ref[r, slot[r]] = c
+                    act[r, slot[r]] = True
+        # the batched rule
+        new = keep & ~used
+        free = ~active
+        k_new = torch.cumsum(new.long(), 1) - 1
+        k_free = torch.cumsum(free.long(), 1) - 1
+        idx_c = torch.arange(C).expand(R, C)
+        dor = torch.full((R, C + 1), C, dtype=torch.long)
+        dor.scatter_(1, torch.where(new, k_new, torch.full_like(k_new, C)), torch.where(new, idx_c, torch.full_like(idx_c, C)))
+        cfs = torch.gather(dor, 1, torch.where(free, k_free, torch.full_like(k_free, C)).clamp(max=C))
+        got = torch.where(free & (cfs < C), cfs, torch.full_like(cfs, -1))
+        assert torch.equal(got, ref), (got, ref)

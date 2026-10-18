@@ -43,6 +43,23 @@ RUNS_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("F1SIM_RUNS") or os.path.join("~", "f1sim_runs")))
 CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt")
 
+#: The policies to drive, one per map, listed first and by name (2026-10-19, the user: "도대체
+#: 정책들중 뭘 실행해야하는거야? 뭐가 뭔지 모르겠네" -- three picks were buried under some 280
+#: experiment runs sorted by save time). A file next to the runs, so a new pick is an edit there:
+#: {"picks": [{"run": dir name, "label": ..., "map": track id, "note": ...}, ...]}.
+PICKS_FILE = "console_picks.json"
+
+
+def load_picks(runs_dir: str = RUNS_DIR) -> List[dict]:
+    """The pick entries in file order; [] when the file is missing or unreadable."""
+    import json
+    try:
+        with open(os.path.join(runs_dir, PICKS_FILE), encoding="utf-8") as f:
+            picks = json.load(f).get("picks") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [p for p in picks if isinstance(p, dict) and p.get("run")]
+
 
 @dataclass
 class RunInfo:
@@ -53,6 +70,15 @@ class RunInfo:
     kind: str                       # "PPO" or "DAgger", from the file name
     mtime: float
     size_mb: float
+    #: Set for a run named in `PICKS_FILE`: what to call it, the map it is for, one line about it.
+    label: str = ""
+    map: str = ""
+    note: str = ""
+    pick_rank: int = -1             # its place in the picks file; -1 = not a pick
+
+    @property
+    def pinned(self) -> bool:
+        return self.pick_rank >= 0
 
     @property
     def age_text(self) -> str:
@@ -100,7 +126,14 @@ def list_runs(runs_dir: str = RUNS_DIR) -> List[RunInfo]:
         out.append(RunInfo(name=entry.name, path=entry.path, checkpoint=path,
                            kind="PPO" if os.path.basename(path).startswith("ppo") else "DAgger",
                            mtime=best_t, size_mb=size / 1e6))
-    out.sort(key=lambda r: r.mtime, reverse=True)
+    picks = {p["run"]: (i, p) for i, p in enumerate(load_picks(runs_dir))}
+    for r in out:
+        if r.name in picks:
+            i, p = picks[r.name]
+            r.pick_rank, r.label = i, str(p.get("label") or r.name)
+            r.map, r.note = str(p.get("map") or ""), str(p.get("note") or "")
+    # the picks first, in the file's order; everything else newest first
+    out.sort(key=lambda r: (not r.pinned, r.pick_rank if r.pinned else 0, -r.mtime))
     return out
 
 

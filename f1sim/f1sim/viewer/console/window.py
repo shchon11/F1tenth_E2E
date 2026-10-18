@@ -1303,9 +1303,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         sc("H", drive_only(self.show_help))
 
     # ================================================================ data in
+    #: The two run groups: the picks (`catalog.PICKS_FILE`), then every other run, newest first.
+    RUN_GROUP_PICKS = "★ 맵별 최종 정책 — 이 중에서 고르세요"
+    RUN_GROUP_OTHER = "실험 런 (최근 저장 순)"
+
     def set_runs(self, runs: List[RunInfo]):
         self.runs = runs
-        items = [("", r.name, r.name, r.subtitle) for r in runs]
+        if any(r.pinned for r in runs):
+            items = [(self.RUN_GROUP_PICKS, r.name, r.label, r.note or r.subtitle) if r.pinned
+                     else (self.RUN_GROUP_OTHER, r.name, r.name, r.subtitle) for r in runs]
+        else:
+            items = [("", r.name, r.name, r.subtitle) for r in runs]
         self.run_list.set_items(items)
         if not runs:
             self.run_list.set_status(f"{catalog.RUNS_DIR} 에 체크포인트가 있는 런이 없습니다.", "warn")
@@ -2008,9 +2016,24 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._selected_run = name
         self.sel_run.setText(f"런: {self._run_label(name)}")
         self.sel_run.setToolTip(name)
+        # A pick is for one map: select it too, so the policy is driven where it was made for.
+        pick = next((r for r in (self.runs or []) if r.name == name and r.pinned and r.map), None)
+        if pick is not None:
+            self._select_map(pick.map)
         self._update_selection_note()
         self._update_start_enabled()
         self.describe_requested.emit(name)
+
+    def _select_map(self, track_id: str) -> bool:
+        """Show `track_id`'s group in the map list and select it. False if the catalogue lacks it."""
+        if not getattr(self.maps, "ready", False):
+            return False
+        g = self.maps.group_of(track_id)
+        if g is not None:
+            i = self.map_group.findData(g)
+            if i >= 0 and i != self.map_group.currentIndex():
+                self.map_group.setCurrentIndex(i)
+        return self.map_list.select(track_id)
 
     def _on_map_selected(self, name: str):
         self._selected_map = name

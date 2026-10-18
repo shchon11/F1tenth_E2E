@@ -1006,6 +1006,9 @@ class F1VecEnv:
         self.teacher_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self.pool_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self.external_driven = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: Every car's command replaced by an external driver (a Python bool, set with the drivers):
+        #: then the plan tracker's answer is read by no one and `step` does not solve it.
+        self._all_external = False
         self.external_slot_rows: Dict[int, torch.Tensor] = {}
         self.external_drivers: Dict[int, object] = {}        # set_external_drivers()
         if self.M > 1 and e.opponent == "teacher":
@@ -1809,6 +1812,7 @@ class F1VecEnv:
         if missing:
             raise ValueError(f"external slot(s) {missing} have no driver")
         self.external_drivers = dict(drivers)
+        self._all_external = bool(self.external_driven.all())
 
     def set_ego_driver(self, driver) -> None:
         """A published driver for the ego car of every race (slot 0) in place of the caller's action
@@ -1820,6 +1824,7 @@ class F1VecEnv:
         self.external_slot_rows[0] = rows
         self.external_drivers[0] = driver
         self.external_driven[rows] = True
+        self._all_external = bool(self.external_driven.all())
         if hasattr(driver, "rows"):
             driver.rows = rows
 
@@ -2800,6 +2805,12 @@ class F1VecEnv:
         if self.act_dim == 2:
             v_cmd = torch.minimum((a[:, 1] + 1) * 0.5 * self.ecfg.v_max_policy, self.speed_cap)
             cmd = torch.stack([a[:, 0] * self.s_max, v_cmd], 1)
+        elif self._all_external:
+            # Every car is driven by an external driver whose command replaces this one below, so
+            # nothing reads the tracker's answer and it is not solved: a baseline alone in the console
+            # paid ~5 ms a step for a plan nobody drove (2026-10-19, "simtime이 왜이리 느리지").
+            cmd = torch.zeros(self.B, 2, device=self.device)
+            self.last_cmd_raw = cmd
         else:                                                  # plan -> (steer, speed) through the tracker
             lr = self.last_result
             v_meas = self._tracker_plan_speed()

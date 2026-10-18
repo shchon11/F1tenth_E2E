@@ -196,10 +196,10 @@ class Perception:
         # clusters a few centimetres apart, and two tracks for one car is a car the planner sees
         # twice. A cluster within `merge_dist` of a nearer kept one is folded into it (count-weighted).
         for c in range(1, C):
+            # No early exit on "nothing close": that test was a host synchronise per cluster, 15 a
+            # scan, and the body below is already a no-op where nothing folds.
             dist_c = (cen[:, :c] - cen[:, c:c + 1]).norm(dim=-1)                        # (R, c)
             close = keep[:, :c] & (dist_c < dp.merge_dist) & keep[:, c:c + 1]
-            if not bool(close.any()):
-                continue
             tgt = torch.where(close, dist_c, torch.full_like(dist_c, float("inf"))).argmin(1)
             fold = close.any(1)
             ar = torch.arange(R, device=self.device)
@@ -278,23 +278,30 @@ class Perception:
         self.hits = torch.where(got, self.hits + 1, self.hits)
         self.misses = torch.where(got, torch.zeros_like(self.misses), self.misses + self.active.long())
         self.active = self.active & (self.misses <= tp.max_misses)
-        # spawn: each unassociated detection takes the first free slot
+        # spawn: the k-th unassociated detection (in detection order) takes the k-th free slot (in slot
+        # order) -- what taking "the first free slot" detection by detection did, in one pass instead
+        # of a Python loop of a dozen kernels per detection.
         P0 = torch.diag(torch.tensor([tp.sigma_meas ** 2, tp.sigma_meas ** 2, 9.0, 1.0], device=self.device))
-        for c in range(C):
-            new = keep[:, c] & ~used[:, c]
-            free = ~self.active
-            has = free.any(1) & new
-            slot = free.float().argmax(1)
-            m = torch.zeros(R, T, dtype=torch.bool, device=self.device)
-            m[ar, slot] = has
-            init = torch.stack([s_c[:, c], d_c[:, c], torch.zeros(R, device=self.device),
-                                torch.zeros(R, device=self.device)], -1)[:, None, :].expand(R, T, 4)
-            self.x = torch.where(m[..., None], init, self.x)
-            self.ext = torch.where(m[..., None], self.det_ext[:, c][:, None, :].expand(R, T, 4), self.ext)
-            self.P = torch.where(m[..., None, None], P0.expand(R, T, 4, 4), self.P)
-            self.hits = torch.where(m, torch.ones_like(self.hits), self.hits)
-            self.misses = torch.where(m, torch.zeros_like(self.misses), self.misses)
-            self.active = self.active | m
+        new = keep & ~used                                                          # (R, C)
+        free = ~self.active                                                         # (R, T)
+        k_new = torch.cumsum(new.long(), 1) - 1                                     # rank among the new
+        k_free = torch.cumsum(free.long(), 1) - 1                                   # rank among the free
+        idx_c = torch.arange(C, device=self.device).expand(R, C)
+        det_of_rank = torch.full((R, C + 1), C, dtype=torch.long, device=self.device)   # C = none
+        det_of_rank.scatter_(1, torch.where(new, k_new, torch.full_like(k_new, C)),
+                             torch.where(new, idx_c, torch.full_like(idx_c, C)))
+        want = torch.where(free, k_free, torch.full_like(k_free, C)).clamp(max=C)
+        c_for_slot = torch.gather(det_of_rank, 1, want)                             # (R, T)
+        m = free & (c_for_slot < C)
+        cs = c_for_slot.clamp(max=C - 1)
+        init = torch.stack([torch.gather(s_c, 1, cs), torch.gather(d_c, 1, cs),
+                            torch.zeros(R, T, device=self.device), torch.zeros(R, T, device=self.device)], -1)
+        self.x = torch.where(m[..., None], init, self.x)
+        self.ext = torch.where(m[..., None], torch.gather(self.det_ext, 1, cs[..., None].expand(R, T, 4)), self.ext)
+        self.P = torch.where(m[..., None, None], P0.expand(R, T, 4, 4), self.P)
+        self.hits = torch.where(m, torch.ones_like(self.hits), self.hits)
+        self.misses = torch.where(m, torch.zeros_like(self.misses), self.misses)
+        self.active = self.active | m
 
     @property
     def confirmed(self) -> torch.Tensor:

@@ -112,8 +112,8 @@ class ParticleFilter:
     def reset(self, which: torch.Tensor, pose: torch.Tensor, odom: torch.Tensor) -> None:
         """Start the filters `which` (bool (R,)) from the operator's estimate around `pose` (R, 3),
         with the odometry pose (R, 3) the next deltas are taken from."""
-        if not bool(which.any()):
-            return
+        # No early exit on an all-false mask: that test was a host synchronise every control step
+        # (the stack asks every step), and the masked writes below leave the other rows as they were.
         sx, sy, st = self.p.init_spread
         noise = torch.randn(self.R, self.N, 3, device=self.device) * torch.tensor([sx, sy, st], device=self.device)
         init = pose[:, None, :] + noise

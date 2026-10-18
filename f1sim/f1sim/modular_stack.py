@@ -68,11 +68,11 @@ class ModularStack:
         (B, 8): the stack's rows replaced by what the car believes, the rest untouched (and unread)."""
         lr = env.last_result
         rows = self.rows
+        # A new episode: the operator puts the car on the grid and gives the filter its pose. Masked,
+        # every step, rather than behind an `any()` that would synchronise with the GPU each time.
         fresh = env.ep_step[rows] == 0
-        if bool(fresh.any()):
-            # A new episode: the operator puts the car on the grid and gives the filter its pose.
-            self.pf.reset(fresh, env.sim.state[rows, :3].clone(), lr.odom[rows, :3].clone())
-            self.per.reset(fresh)
+        self.pf.reset(fresh, env.sim.state[rows, :3].clone(), lr.odom[rows, :3].clone())
+        self.per.reset(fresh)
         tid = env.sim.tid[rows]
         pose = self.pf.step(lr.odom[rows, :3], lr.scan[rows], tid)
         self.per.step(pose, lr.scan[rows], tid)
