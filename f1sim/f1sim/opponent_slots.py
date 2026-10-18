@@ -183,11 +183,12 @@ KINDS: Tuple[DriverKind, ...] = (
                "michigan-traffic-lab End2Race: 라이다 + 속도를 받는 GRU. 공개 가중치 또는 이 환경에서 "
                "학습한 가중치 파일을 고릅니다.",
                external="end2race", needs_weights=True, prop_aware=True, module="f1sim.learn.baselines"),
-    DriverKind("ftg", "ForzaETH FTG",
-               "ForzaETH race stack 의 Follow-the-Gap 을 그대로 옮긴 것. 지도·위치추정 없이 라이다만 "
-               "봅니다. 옵션 max_speed (대회 설정 6.0).",
+    DriverKind("ftg", "Follow-the-Gap",
+               "RoboRacer(F1TENTH) 강의의 기본 반응형 방식: 라이다에서 가장 넓은 빈 틈의 가운데로 조향합니다. 지도·"
+               "위치추정이 필요 없습니다. 구현은 ForzaETH race stack 에 들어 있는 FTG 를 그대로 옮긴 것입니다 (대회 "
+               "파라미터). 옵션 max_speed (기본 6.0).",
                external="ftg", prop_aware=True, module="f1sim.learn.baselines"),
-    DriverKind("disparity", "Disparity Ext.",
+    DriverKind("disparity", "Disparity Extender",
                "UNC 의 Disparity Extender (CPSWeek 2019 우승) 를 원저자 설명대로 구현. 라이다만 봅니다. "
                "옵션 top_speed.",
                external="disparity", prop_aware=True, module="f1sim.learn.baselines"),

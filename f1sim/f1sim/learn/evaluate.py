@@ -86,6 +86,8 @@ def _ego_follow(env, teacher, an: torch.Tensor) -> torch.Tensor:
     the same order, then the same re-certification of the plan.
     """
     from ..gym_env import _plan_layout
+    if env.M < 2:                                      # alone on the track there is no car to trail
+        return an
     follow, v_cap = env.follow_cap(env.sim.state)
     v_max = env.ecfg.v_max_policy
     if env.act_dim == 2:

@@ -612,8 +612,9 @@ class PlannerEgoDriver:
     def command_env(self, env, rows):
         import torch
         cmd = self.teacher(env.sim.state, env.sim.P, env.sim.tid)[rows].clone()
-        follow, v_cap = env.follow_cap(env.sim.state)
-        cmd[:, 1] = torch.where(follow[rows], torch.minimum(cmd[:, 1], v_cap[rows]), cmd[:, 1])
+        if env.M > 1:                                  # alone on the track there is no car to trail
+            follow, v_cap = env.follow_cap(env.sim.state)
+            cmd[:, 1] = torch.where(follow[rows], torch.minimum(cmd[:, 1], v_cap[rows]), cmd[:, 1])
         return cmd
 
     def reset(self, mask) -> None:

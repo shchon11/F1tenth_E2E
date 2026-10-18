@@ -179,6 +179,8 @@ class SlotRow(QtCore.QObject):
         self.car.setAlignment(QtCore.Qt.AlignCenter)
 
         self.kind = QtWidgets.QComboBox()
+        # Wide enough for the longest kind name: a cut name ("Follow-the-Ga") read as a missing driver.
+        self.kind.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
         for k in osl.KINDS:
             # An unavailable kind says so in the row itself, not only in a tooltip: greyed text
             # alone reads as "not applicable here", which is a different thing from "not merged

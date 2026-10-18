@@ -16,7 +16,7 @@ def test_every_ego_planner_kind_resolves_to_an_importable_planner():
 
 
 def _fake_env(follow, v_cap, v_max=10.0):
-    env = types.SimpleNamespace(act_dim=2, ecfg=types.SimpleNamespace(v_max_policy=v_max),
+    env = types.SimpleNamespace(act_dim=2, M=2, ecfg=types.SimpleNamespace(v_max_policy=v_max),
                                 sim=types.SimpleNamespace(state=torch.zeros(len(follow), 7)))
     env.follow_cap = lambda state: (torch.tensor(follow), torch.tensor(v_cap))
     return env
@@ -36,3 +36,10 @@ def test_the_follow_cap_never_raises_a_slower_command():
     env = _fake_env([True], [5.0])
     out = ev._ego_follow(env, None, torch.tensor([[0.0, -0.6]]))   # 2 m/s, below the cap
     assert abs(float((out[0, 1] + 1) / 2 * 10.0) - 2.0) < 1e-5
+
+
+def test_alone_on_the_track_there_is_no_follow_cap():
+    """A solo session has no `other_idx`; the cap must not be asked for (2026-10-18: the console crashed)."""
+    env = _fake_env([True], [1.0]); env.M = 1
+    an = torch.tensor([[0.0, 0.6]])
+    assert torch.equal(ev._ego_follow(env, None, an), an)

@@ -5,7 +5,8 @@ car's own 270 deg scan (and FTG the odometry speed) and commands a steering angl
 same contract as TinyLidarNet and End2Race (`BaselineDriver`). The user asked for the published
 stacks as baselines (2026-10-17); these two are the classics every F1TENTH benchmark carries.
 
-**Follow-the-Gap** is ForzaETH's own (`ForzaETH/race_stack` @ e7d07f7f4ffe0d4c30b90340b0f49a76af2877c0,
+**Follow-the-Gap** is the classic reactive method of the RoboRacer (F1TENTH) course. The implementation here
+is the one in ForzaETH's stack (`ForzaETH/race_stack` @ e7d07f7f4ffe0d4c30b90340b0f49a76af2877c0,
 `controller/ftg/ftg.py`, MIT), ported line for line with the ROS plumbing and the RViz markers
 removed, and with the stack's competition parameters (`stack_master/config/state_machine_params.yaml`:
 safety_radius 40 beams, max_lidar_dist 9 m, range_offset 180, track_width 2.6 m, max_speed 6.0) as
