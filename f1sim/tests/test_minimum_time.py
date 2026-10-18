@@ -118,3 +118,36 @@ def test_periodic_seam_has_true_left_third_derivative():
     spline = CubicSpline(np.arange(85)/84, np.vstack([base, base[0]]), bc_type="periodic")
     np.testing.assert_array_equal(p.third_left[0].numpy(), spline(np.nextafter(1., 0.), nu=3))
     assert not np.array_equal(p.third_left[0].numpy(), p.basis[3][0].numpy())
+
+
+def test_an_iteration_limit_near_feasibility_continues_from_where_it_stopped(monkeypatch):
+    """`_Problem.solve` retries an SLSQP run that hit its iteration limit from the point it reached when
+    that point is nearly feasible (normalized violation <= 1e-2), not from the stage's start, which
+    repeated the same iterations to the same point (gen:competition:2, 2026-10-19)."""
+    import types
+    import numpy as np
+    from f1sim import minimum_time as MT
+    starts = []
+
+    def fake_minimize(fun, x0, **kw):
+        starts.append(np.array(x0, copy=True))
+        n = len(starts)
+        x = np.array(x0, copy=True) + 1.0
+        return types.SimpleNamespace(x=x, fun=1.0, success=n >= 2, status=0 if n >= 2 else 9,
+                                     message="ok" if n >= 2 else "Iteration limit reached", nit=250)
+
+    class P:
+        bounds = None
+        reference_length, vmax = 10.0, 5.0
+
+        def evaluate(self, z, jac=False):
+            # nearly feasible after the first run (violation 4.7e-3), feasible after the second
+            return np.array([1.0, -4.7e-3 if len(starts) == 1 else 0.0])
+
+        def restore(self, z):
+            return np.zeros_like(z)
+
+    monkeypatch.setattr(MT, "minimize", fake_minimize)
+    res = MT._Problem.solve(P(), np.zeros(3), 250)
+    assert res.success and len(starts) == 2
+    assert np.allclose(starts[1], starts[0] + 1.0)        # continued from the first run's point

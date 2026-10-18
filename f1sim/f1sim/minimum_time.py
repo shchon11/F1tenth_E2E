@@ -261,7 +261,7 @@ class _Problem:
             def cb(_x, *_a):
                 counter[0] += 1
                 tick(counter[0])
-        for attempt in range(2):
+        for attempt in range(4):
             result = minimize(lambda x: self.evaluate(x)[0] / scale, z,
                               jac=lambda x: self.evaluate(x, True)[0] / scale, method="SLSQP", bounds=self.bounds,
                               constraints={"type": "ineq", "fun": lambda x: self.evaluate(x)[1:],
@@ -276,7 +276,13 @@ class _Problem:
             # continue from it rather than throwing it away for the initial guess. Restarting was
             # right only for a run that went somewhere infeasible. Seen 2026-09-28: ICCAS with the
             # refitted tyres stopped at maxiter with violation 1.96e-6 and the restart repeated it.
-            z = result.x if (result.status == 9 and violation <= 1e-4) else self.restore(initial)
+            # And nearly feasible is progress too (2026-10-19): gen:competition:2 stopped at maxiter
+            # with normalized violation 4.7e-3 in four refinement stages, the restart from `initial`
+            # repeated the same 250 iterations to the same point, and the map's teacher opponents
+            # could not be built (the console refused the session; the teacher-graph test failed).
+            # Continued from where it stopped, every one of those stages converged within 3-65
+            # iterations (violation <= 1e-9). A point gone far infeasible still restarts.
+            z = result.x if (result.status == 9 and violation <= 1e-2) else self.restore(initial)
         raise ValueError(f"{self.track.name}: minimum-time solve did not converge "
                          f"({result.message}; normalized violation {violation:.3g})")
 
