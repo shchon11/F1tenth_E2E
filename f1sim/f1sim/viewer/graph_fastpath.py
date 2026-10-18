@@ -158,7 +158,13 @@ class GraphedCallable:
             gc.disable()
             try:
                 self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph):
+                # The capture stream is named, on THIS device. Left to itself `torch.cuda.graph` uses
+                # one class-wide stream made on whatever device the process captured on first, so in
+                # a worker whose first session ran on cuda:0 every later capture for cuda:1 recorded
+                # nothing ("The CUDA Graph is empty"): the session started, sim time ran, and every
+                # replay of the physics was a no-op -- the car never moved (2026-10-19, the user:
+                # "계산은 다 되고 시뮬도 잘 실행되는데 차만 출발을 안함", any map, any driver).
+                with torch.cuda.graph(self.graph, stream=side):
                     self._out = fn(*self._static)
             finally:
                 if enabled:

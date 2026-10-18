@@ -367,6 +367,8 @@ def broadcast_boundary(done=None, batch: Optional[int] = None) -> None:
     for rt in list(_LISTENERS):
         if batch is not None and not _runtime_matches(rt, batch):
             continue
+        if not _same_device(rt, done):
+            continue
         rt.reset(done)
 
 
@@ -375,6 +377,17 @@ def _runtime_matches(rt, batch: int) -> bool:
     against, and clearing an empty state is a no-op."""
     b = getattr(rt, "batch", None)
     return b is None or int(b) == int(batch)
+
+
+def _same_device(rt, done) -> bool:
+    """A listener whose state lives on another device is another env's: the console worker holds
+    the outgoing session (`SimWorker._build_hold`) while it builds the next, so both listeners are
+    alive, and the next session may run on the other card. Resetting the old one with the new env's
+    mask raised "Expected all tensors to be on the same device" and refused the session (2026-10-19)."""
+    h = getattr(rt, "h", None)
+    if not (torch.is_tensor(h) and torch.is_tensor(done)):
+        return True
+    return h.device == done.device
 
 
 def describe(meta: dict) -> str:

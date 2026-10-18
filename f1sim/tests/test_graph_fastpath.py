@@ -728,3 +728,23 @@ def test_training_captures_the_opponent_planners_and_they_carry_their_state():
     finally:
         graph_runtime.release_graph_runtime(rt)
     assert "_teacher_normalized" not in env.__dict__
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_a_capture_on_another_device_than_the_first_still_records():
+    """A worker captures one session's graphs on cuda:0 and the next one's on cuda:1 (2026-10-19). With
+    torch's class-wide default capture stream the second capture recorded nothing and its replays left
+    the state where it was: the console's car never moved. Each device's graph must actually run."""
+    from f1sim.viewer.graph_fastpath import GraphedCallable
+    for dev in (0, 1, 0):
+        torch.cuda.set_device(dev)
+        x = torch.zeros(8, device=f"cuda:{dev}")
+
+        def fn(a):
+            return a + 1.0
+
+        g = GraphedCallable(fn, [x], n_warmup=1, name=f"d{dev}")
+        g.adopt()
+        out = g(torch.full((8,), 2.0, device=f"cuda:{dev}"))
+        torch.cuda.synchronize(dev)
+        assert out.device.index == dev and torch.allclose(out, torch.full((8,), 3.0, device=out.device)), (dev, out)
