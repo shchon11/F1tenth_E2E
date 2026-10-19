@@ -63,18 +63,19 @@ def run_plan(env, steps, plan_v=None):
 
 
 def test_a_car_on_its_plan_has_no_tracking_error():
-    r = run_plan(plan_env(3), 60)
+    r = run_plan(plan_env(3), 160)
     assert r["source"].startswith("plan")
     for h in ("0.1", "0.2", "0.3", "0.5"):
         assert r["horizons"][h]["pos_rmse_m"] == pytest.approx(0.0, abs=1e-5)
         assert r["horizons"][h]["speed_rmse_mps"] == pytest.approx(0.0, abs=1e-5)
-    assert r["horizons"]["0.5"]["n"] == 3 * (60 - 20 + 1)
+    # issues from 2 s on (step 80) whose 0.5 s horizon (20 steps) came within the 160 steps run
+    assert r["horizons"]["0.5"]["n"] == 3 * (160 - 20 - 80 + 1)
 
 
 def test_a_sideways_drift_is_lateral_error_growing_with_the_horizon():
     """0.2 m/s across a straight plan re-anchored at the car every step: h seconds later the car is
     0.2 h to the side of where the plan put it, and nothing along it."""
-    r = run_plan(plan_env(2, v=2.0, vy=0.2), 60)
+    r = run_plan(plan_env(2, v=2.0, vy=0.2), 160)
     for hs in (0.1, 0.2, 0.3, 0.5):
         h = r["horizons"][f"{hs:.1f}"]
         assert h["lat_rmse_m"] == pytest.approx(0.2 * hs, rel=1e-3)
@@ -88,17 +89,37 @@ def test_a_sideways_drift_is_lateral_error_growing_with_the_horizon():
 def test_the_path_distance_ignores_where_along_the_path_the_car_is():
     """A car that lags its plan along the path is no farther from the path: the lateral objective does not
     see the longitudinal error, the time-indexed position error does."""
-    r = run_plan(plan_env(2, v=1.5), 60, plan_v=2.0)   # the plan says 2 m/s, the car does 1.5 m/s, straight on
+    r = run_plan(plan_env(2, v=1.5), 160, plan_v=2.0)   # the plan says 2 m/s, the car does 1.5 m/s, straight on
     assert r["horizons"]["0.5"]["xtrack_rmse_m"] == pytest.approx(0.0, abs=1e-5)
     assert r["horizons"]["0.5"]["lon_rmse_m"] == pytest.approx(0.25, rel=1e-3)   # 0.5 m/s x 0.5 s behind
+
+
+def test_the_spawn_convergence_is_left_out():
+    """A car that starts 0.3 m beside its line and is on it from 1 s on: the first 2 s are not scored."""
+    B = 1
+    sim = FakeSim(B, v=2.0)
+    sim.state[:, 1] = 0.3
+    env = SimpleNamespace(sim=sim, tracker=None, act_dim=2, learner=torch.ones(B, dtype=torch.bool))
+    xs = torch.arange(-10, 400, dtype=torch.float32) * 0.1
+    m = TrackingMeter(env)
+    with m:
+        for k in range(200):
+            if k == 40:
+                sim.state[:, 1] = 0.0                     # on the line after 1 s
+            xy = torch.stack([xs, torch.zeros_like(xs)], -1)[None].clone()
+            m._planner_ref = (torch.arange(B), xy, torch.full((B, xs.numel()), 2.0))
+            sim.step()
+    r = m.report()["tracking"]
+    assert r["xtrack_rmse_m"] == pytest.approx(0.0, abs=1e-6)
+    assert r["settle_s"] == 2.0
 
 
 def test_a_reset_row_drops_the_references_of_its_old_episode():
     env = plan_env(2)
     m = TrackingMeter(env)
     with m:
-        for k in range(40):
-            if k == 30:
+        for k in range(140):
+            if k == 110:
                 env.sim.steps[1] = 0                      # row 1 starts a new episode at step 30 ...
                 env.sim.state[1, 1] = 5.0                 # ... somewhere else entirely
             env._plan_pose = env.sim.state[:, :3].clone()
@@ -115,16 +136,18 @@ def test_the_planner_waypoints_are_walked_from_the_cars_projection():
     sim = FakeSim(B, v=2.0)
     sim.state[:, 1] = 0.1
     env = SimpleNamespace(sim=sim, tracker=None, act_dim=2, learner=torch.ones(B, dtype=torch.bool))
-    xs = torch.arange(-10, 200, dtype=torch.float32) * 0.1
+    xs = torch.arange(-10, 400, dtype=torch.float32) * 0.1
     m = TrackingMeter(env)
     with m:
-        for _ in range(50):
+        for _ in range(150):
             xy = torch.stack([xs, torch.zeros_like(xs)], -1)[None].expand(B, -1, -1).clone()
             m._planner_ref = (torch.arange(B), xy, torch.full((B, xs.numel()), 2.0))
             sim.step()
     r = m.report()["tracking"]
     assert r["source"].startswith("planner")
     assert r["xtrack_rmse_m"] == pytest.approx(0.1, rel=1e-4)
+    assert r["objective_per_car"]["median_m"] == pytest.approx(0.1, rel=1e-4)
+    assert r["objective_per_car"]["n"] == B
     for h in ("0.1", "0.5"):
         assert r["horizons"][h]["lat_rmse_m"] == pytest.approx(0.1, rel=1e-3)
         assert r["horizons"][h]["lon_rmse_m"] == pytest.approx(0.0, abs=2e-3)

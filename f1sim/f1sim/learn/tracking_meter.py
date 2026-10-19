@@ -34,6 +34,10 @@ import torch
 from .. import dynamics as dyn
 
 HORIZONS_S = (0.1, 0.2, 0.3, 0.5)
+#: Samples from the first seconds after a car's (re)spawn are left out: cars are placed about 0.2 m off the line,
+#: and on Korea 2026 the convergence carried 62-93 % of the squared error of a whole run (2026-10-20), so an
+#: unfiltered RMSE measured how fast a car joins its line, not how it follows it.
+SETTLE_S = 2.0
 #: The horizon of the time-indexed position RMSE (reported, not optimised since 2026-10-20).
 OBJECTIVE_HORIZON_S = 0.5
 #: A plan's lateral objective: the car's distance from the plan's path this long after it was issued.
@@ -129,10 +133,17 @@ class TrackingMeter:
         self.epi_at = torch.zeros(self.K, B, dtype=torch.long, device=dev)
         self.issued = torch.full((self.K,), -1, dtype=torch.long)
         self.epi = torch.zeros(B, dtype=torch.long, device=dev)
+        self.settle_steps = int(round(SETTLE_S / self.dt))
+        self.age_ok = torch.zeros(self.K, B, dtype=torch.bool, device=dev)
         self.t = 0
         z = lambda: torch.zeros((), dtype=torch.float64, device=dev)
         self.acc = {h: {"n": z(), "e2": z(), "lat2": z(), "lon2": z(), "dv2": z(), "xt2": z()} for h in self.hs}
         self.xt = {"n": z(), "e2": z()}
+        # per car, the lateral objective's samples (cross-track at issue / a plan's path distance at its horizon):
+        # an RMSE over a fleet is carried by its worst cars, so their spread is reported too
+        self.row_n = torch.zeros(B, dtype=torch.float64, device=dev)
+        self.row_e2 = torch.zeros(B, dtype=torch.float64, device=dev)
+        self.h_plan = max(1, int(round(PLAN_XTRACK_HORIZON_S / self.dt)))
         self.source: Optional[str] = None
         self._orig_step = None
         self._orig_map_cmd = None
@@ -188,6 +199,8 @@ class TrackingMeter:
         st = sim.state
         tr = getattr(env, "tracker", None)
         spec = getattr(tr, "spec", None)
+        settled = sim.steps >= self.settle_steps                 # past the spawn's convergence
+        self.age_ok[slot] = settled
         if self._planner_ref is not None:
             rows, xy, v = self._planner_ref
             self._planner_ref = None
@@ -197,8 +210,11 @@ class TrackingMeter:
                                        0.05, T - 1, a_max, a_brk)
             self.ref[slot, rows] = resample(walked, 0.05, self.dt, self.K)
             self.have[slot, rows] = True
-            self.xt["n"] += float(rows.numel())
-            self.xt["e2"] += (xtrack.double() ** 2).sum()
+            w = settled[rows].double()
+            self.xt["n"] += float(w.sum())
+            self.xt["e2"] += (w * xtrack.double() ** 2).sum()
+            self.row_n.index_add_(0, rows, w)
+            self.row_e2.index_add_(0, rows, w * xtrack.double() ** 2)
             self.source = self.source or "planner waypoints (MAP)"
         elif (getattr(env, "act_dim", 2) != 2 and tr is not None and getattr(tr, "last_ref", None) is not None
               and not getattr(env, "_all_external", False) and getattr(env, "_plan_pose", None) is not None):
@@ -227,7 +243,7 @@ class TrackingMeter:
             slot = i % self.K
             if int(self.issued[slot]) != i:
                 continue
-            ok = self.have[slot] & (self.epi_at[slot] == self.epi)
+            ok = self.have[slot] & (self.epi_at[slot] == self.epi) & self.age_ok[slot]
             if not bool(ok.any()):
                 continue
             r = self.ref[slot][:, h]                          # (B, 4)
@@ -241,6 +257,9 @@ class TrackingMeter:
             a = self.acc[h]
             a["n"] += m.sum()
             a["xt2"] += (m * xt.double() ** 2).sum()
+            if h == self.h_plan and self.source and self.source.startswith("plan"):
+                self.row_n += m
+                self.row_e2 += m * xt.double() ** 2
             a["e2"] += (m * (lat.double() ** 2 + lon.double() ** 2)).sum()
             a["lat2"] += (m * lat.double() ** 2).sum()
             a["lon2"] += (m * lon.double() ** 2).sum()
@@ -265,9 +284,21 @@ class TrackingMeter:
         # the lateral objective: a waypoint reference's cross-track error at issue; a plan's distance from its path
         # PLAN_XTRACK_HORIZON_S after issue (at issue it is zero by construction)
         lat_obj = xt0 if xt0 is not None else per.get(f"{PLAN_XTRACK_HORIZON_S:.1f}", {}).get("xtrack_rmse_m")
+        cars = None
+        have = self.row_n > 0
+        if bool(have.any()):
+            per_car = (self.row_e2[have] / self.row_n[have]).sqrt().sort().values
+            k = per_car.numel()
+            share = self.row_e2[have].sort(descending=True).values
+            top = max(1, k // 10)
+            cars = {"n": int(k), "median_m": float(per_car[k // 2]), "p90_m": float(per_car[min(k - 1, int(0.9 * k))]),
+                    "max_m": float(per_car[-1]), "min_m": float(per_car[0]),
+                    "worst10pct_share_of_sq_error": float(share[:top].sum() / share.sum().clamp_min(1e-12))}
         return {"tracking": {
             "source": self.source, "horizons": per,
-            "xtrack_rmse_m": xt0, "objective_xtrack_m": lat_obj,
+            "xtrack_rmse_m": xt0, "objective_xtrack_m": lat_obj, "objective_per_car": cars,
             "objective_pos_rmse_m": obj, "objective_horizon_s": OBJECTIVE_HORIZON_S,
+            "settle_s": SETTLE_S,
             "note": ("the car's TRUE position h control steps after a reference was issued, against where that "
-                     "time-indexed reference put it (f1sim.learn.tracking_meter)")}}
+                     "time-indexed reference put it; references issued in the first settle_s after a (re)spawn are "
+                     "left out (f1sim.learn.tracking_meter)")}}
