@@ -52,12 +52,12 @@ def straight_plan(B, v):
     return ref
 
 
-def run_plan(env, steps):
+def run_plan(env, steps, plan_v=None):
     m = TrackingMeter(env)
     with m:
         for _ in range(steps):
             env._plan_pose = env.sim.state[:, :3].clone()
-            env.tracker.last_ref = straight_plan(env.sim.state.shape[0], env.sim.v)
+            env.tracker.last_ref = straight_plan(env.sim.state.shape[0], env.sim.v if plan_v is None else plan_v)
             env.sim.step()
     return m.report()["tracking"]
 
@@ -78,8 +78,19 @@ def test_a_sideways_drift_is_lateral_error_growing_with_the_horizon():
     for hs in (0.1, 0.2, 0.3, 0.5):
         h = r["horizons"][f"{hs:.1f}"]
         assert h["lat_rmse_m"] == pytest.approx(0.2 * hs, rel=1e-3)
+        assert h["xtrack_rmse_m"] == pytest.approx(0.2 * hs, rel=1e-3)     # the distance from the path itself
         assert h["lon_rmse_m"] == pytest.approx(0.0, abs=1e-5)
     assert r["objective_pos_rmse_m"] == pytest.approx(0.1, rel=1e-3)
+    assert r["xtrack_rmse_m"] is None                                      # a plan starts at the car
+    assert r["objective_xtrack_m"] == pytest.approx(0.04, rel=1e-3)         # 0.2 m/s x 0.2 s
+
+
+def test_the_path_distance_ignores_where_along_the_path_the_car_is():
+    """A car that lags its plan along the path is no farther from the path: the lateral objective does not
+    see the longitudinal error, the time-indexed position error does."""
+    r = run_plan(plan_env(2, v=1.5), 60, plan_v=2.0)   # the plan says 2 m/s, the car does 1.5 m/s, straight on
+    assert r["horizons"]["0.5"]["xtrack_rmse_m"] == pytest.approx(0.0, abs=1e-5)
+    assert r["horizons"]["0.5"]["lon_rmse_m"] == pytest.approx(0.25, rel=1e-3)   # 0.5 m/s x 0.5 s behind
 
 
 def test_a_reset_row_drops_the_references_of_its_old_episode():

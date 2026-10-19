@@ -15,11 +15,14 @@ trajectory in the world frame:
 * a planner ego on MAP (`learn.common.PlannerEgoDriver`, the planner baselines): the waypoints the
   planner handed MAP that step, from the car's projection on them, walked the same way.
 
-h control steps later the car's TRUE position is compared with where that reference put it h steps
-after it was issued. Per horizon: the RMSE of the position error, of its lateral part (across the
-reference heading there) and its longitudinal part, and of the speed error against the reference's
-speed target. For a waypoint reference the cross-track error at issue (the car's distance from the
-path it was handed) is reported too. A reference is dropped when its row was reset before the horizon.
+h control steps later the car's TRUE position is compared with that reference. The measure a controller
+is tuned on is the LATERAL one (the user, 2026-10-20: "세로 오차를 왜재 가로를 재야지"): the car's distance
+from the reference's PATH -- `xtrack_rmse_m`, at issue for a waypoint reference (its cross-track error)
+and per horizon for both kinds (for a plan, which starts at the car, only a horizon means anything).
+The longitudinal error is mostly the motor's lag and a controller's steering cannot remove it, so it is
+reported, never optimised: per horizon also the RMSE of the error to the time-indexed point split into
+lateral and longitudinal parts, and of the speed error. A reference is dropped when its row was reset
+before the horizon came.
 """
 from __future__ import annotations
 
@@ -31,8 +34,23 @@ import torch
 from .. import dynamics as dyn
 
 HORIZONS_S = (0.1, 0.2, 0.3, 0.5)
-#: The objective a controller is tuned on: the position RMSE this far after the reference was issued.
+#: The horizon of the time-indexed position RMSE (reported, not optimised since 2026-10-20).
 OBJECTIVE_HORIZON_S = 0.5
+#: A plan's lateral objective: the car's distance from the plan's path this long after it was issued.
+PLAN_XTRACK_HORIZON_S = 0.2
+
+
+def path_distance(path: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """(R,) distance of points `p` (R, 2) from polylines `path` (R, n, 2), the end segments extended (a car
+    a little ahead of a short reference, or behind its start, is measured against the path's line)."""
+    seg = path[:, 1:] - path[:, :-1]
+    L2 = (seg * seg).sum(-1).clamp_min(1e-12)
+    u = ((p[:, None, :] - path[:, :-1]) * seg).sum(-1) / L2                    # (R, n-1)
+    lo = torch.zeros_like(u); hi = torch.ones_like(u)
+    lo[:, 0] = -float("inf"); hi[:, -1] = float("inf")
+    u = torch.maximum(torch.minimum(u, hi), lo)
+    foot = path[:, :-1] + u[..., None] * seg
+    return (p[:, None, :] - foot).norm(dim=-1).min(1).values
 
 
 def walk_path(xy: torch.Tensor, v_path: torch.Tensor, start_xy: torch.Tensor, v_now: torch.Tensor,
@@ -113,7 +131,7 @@ class TrackingMeter:
         self.epi = torch.zeros(B, dtype=torch.long, device=dev)
         self.t = 0
         z = lambda: torch.zeros((), dtype=torch.float64, device=dev)
-        self.acc = {h: {"n": z(), "e2": z(), "lat2": z(), "lon2": z(), "dv2": z()} for h in self.hs}
+        self.acc = {h: {"n": z(), "e2": z(), "lat2": z(), "lon2": z(), "dv2": z(), "xt2": z()} for h in self.hs}
         self.xt = {"n": z(), "e2": z()}
         self.source: Optional[str] = None
         self._orig_step = None
@@ -218,9 +236,11 @@ class TrackingMeter:
             lon = e[:, 0] * c + e[:, 1] * s_
             lat = -e[:, 0] * s_ + e[:, 1] * c
             dv = v - r[:, 3]
+            xt = path_distance(self.ref[slot][..., :2], pos)    # the distance from the path itself
             m = ok.double()
             a = self.acc[h]
             a["n"] += m.sum()
+            a["xt2"] += (m * xt.double() ** 2).sum()
             a["e2"] += (m * (lat.double() ** 2 + lon.double() ** 2)).sum()
             a["lat2"] += (m * lat.double() ** 2).sum()
             a["lon2"] += (m * lon.double() ** 2).sum()
@@ -234,15 +254,20 @@ class TrackingMeter:
             n = float(a["n"].item())
             if n <= 0:
                 continue
-            per[f"{hs:.1f}"] = {"n": int(n), "pos_rmse_m": math.sqrt(float(a["e2"].item()) / n),
+            per[f"{hs:.1f}"] = {"n": int(n), "xtrack_rmse_m": math.sqrt(float(a["xt2"].item()) / n),
+                                "pos_rmse_m": math.sqrt(float(a["e2"].item()) / n),
                                 "lat_rmse_m": math.sqrt(float(a["lat2"].item()) / n),
                                 "lon_rmse_m": math.sqrt(float(a["lon2"].item()) / n),
                                 "speed_rmse_mps": math.sqrt(float(a["dv2"].item()) / n)}
         n_xt = float(self.xt["n"].item())
         obj = per.get(f"{OBJECTIVE_HORIZON_S:.1f}", {}).get("pos_rmse_m")
+        xt0 = math.sqrt(float(self.xt["e2"].item()) / n_xt) if n_xt > 0 else None
+        # the lateral objective: a waypoint reference's cross-track error at issue; a plan's distance from its path
+        # PLAN_XTRACK_HORIZON_S after issue (at issue it is zero by construction)
+        lat_obj = xt0 if xt0 is not None else per.get(f"{PLAN_XTRACK_HORIZON_S:.1f}", {}).get("xtrack_rmse_m")
         return {"tracking": {
             "source": self.source, "horizons": per,
-            "xtrack_rmse_m": (math.sqrt(float(self.xt["e2"].item()) / n_xt) if n_xt > 0 else None),
+            "xtrack_rmse_m": xt0, "objective_xtrack_m": lat_obj,
             "objective_pos_rmse_m": obj, "objective_horizon_s": OBJECTIVE_HORIZON_S,
             "note": ("the car's TRUE position h control steps after a reference was issued, against where that "
                      "time-indexed reference put it (f1sim.learn.tracking_meter)")}}
