@@ -771,7 +771,10 @@ def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] 
         # v_max_profile, the pure-pursuit lookahead, the off-line slowdown), "planner" -- the
         # spliner's / lane switcher's. They are what a team tunes, and what a fair comparison tunes.
         sp = dict(stack_params or {})
-        ref = make_teacher(rls, env, grip="true", **dict(limits or {}, **sp.get("teacher", {})))
+        # "grip": which friction the planner's speed profile and MAP's steering table are read at -- "true" (each
+        # car's own, a simulator oracle), or "nominal" (one floor for every car, as a team sets it at a venue; the
+        # fair comparison since 2026-10-20: nobody is told the floor)
+        ref = make_teacher(rls, env, grip=str(sp.get("grip", "true")), **dict(limits or {}, **sp.get("teacher", {})))
         planner = ref
         if kind != "raceline":
             from ..opponent_slots import build_teacher, kind_of
