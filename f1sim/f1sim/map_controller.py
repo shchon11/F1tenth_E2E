@@ -463,6 +463,17 @@ def describe(params: MAPParams) -> dict:
 
 
 # ------------------------------------------------------------------------------ our policy's plan
+#: Our policy's plan follower when a run or the console asks for MAP without numbers of its own: the
+#: paper's formulation (ETH-PBL's map_params.yaml numbers; L1 on the commanded speed, the point at
+#: distance L1, v_t in a_lat, the lookup interpolated, none of race_stack's extras) with each car's
+#: calibrated actuation delay. Zero-shot on our ICCAS pick (solo protocol, 128 cars): 7.92 s 128/128
+#: against the iLQR's 8.40 s.
+POLICY_MAP = dict(t_clip_min=0.3, t_clip_max=5.0, m_l1=0.3, q_l1=0.15, speed_lookahead=0.0, lat_err_coeff=0.0,
+                  acc_scaler_for_steer=1.0, dec_scaler_for_steer=1.0, start_scale_speed=7.0, end_scale_speed=8.0,
+                  downscale_factor=0.0, speed_lookahead_for_steer=0.0, v_steer_gain_max=1.0, l1_speed="commanded",
+                  l1_floor=False, l1_point="euclid", steer_speed="measured", lut_interp="linear", delay_comp=-1.0)
+
+
 #: The reference teacher's grip levels (`teacher.RacelineTeacher.grip_levels`): the steering tables are
 #: built at these multiples of the nominal friction and a car reads the one at or below its own.
 GRIP_LEVELS = (0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.1, 1.2)

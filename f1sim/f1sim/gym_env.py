@@ -548,8 +548,8 @@ class EnvConfig:
     #: tracker, every run before. "map": ForzaETH's MAP controller on the plan's own waypoints
     #: (`map_controller.MAPPlanTracker`), for the policy's cars only -- the traffic keeps the iLQR.
     plan_follower: str = "mpc"
-    #: `map_controller.MAPParams` fields for "map"; delay_comp -1 (the default here) compensates each
-    #: car's calibrated actuation delay, the one the iLQR tracker is given.
+    #: `map_controller.MAPParams` fields for "map", over `map_controller.POLICY_MAP` (the paper's
+    #: formulation; delay_comp -1 compensates each car's calibrated delay, the one the iLQR is given).
     plan_follower_map: Optional[Dict[str, Any]] = None
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
@@ -1187,9 +1187,9 @@ class F1VecEnv:
                                        e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
             if e.plan_follower == "map":
-                from .map_controller import MAPParams, MAPPlanTracker, nominal_lut
+                from .map_controller import POLICY_MAP, MAPParams, MAPPlanTracker, nominal_lut
                 self.tracker = MAPPlanTracker(self.tracker, nominal_lut(self.sim),
-                                              MAPParams.from_dict(dict({"delay_comp": -1.0}, **(e.plan_follower_map or {}))),
+                                              MAPParams.from_dict(dict(POLICY_MAP, **(e.plan_follower_map or {}))),
                                               self.sim.params.nominal)
             elif e.plan_follower != "mpc":
                 raise ValueError(f"plan_follower must be 'mpc' or 'map', not {e.plan_follower!r}")

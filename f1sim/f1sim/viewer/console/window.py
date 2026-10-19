@@ -440,6 +440,18 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.row_cap = FieldRow("속도 상한", self.spin_cap, "체크포인트가 학습된 상한을 따릅니다.")
         cfg_card.add(self.row_cap)
 
+        # -- who follows the policy's plan (2026-10-19, the user: "우리도 그냥 map 쓰자")
+        self.combo_follower = QtWidgets.QComboBox()
+        self.combo_follower.addItem("MAP (ForzaETH)", "map")
+        self.combo_follower.addItem("MPC (학습 때 추종기)", "mpc")
+        self.combo_follower.addItem("체크포인트대로", "auto")
+        self.combo_follower.setToolTip(
+            "정책이 낸 계획(경로·속도)을 무엇으로 따라갈지. MAP: ForzaETH의 MAP 제어기(논문 방식, 차별로 측정한 "
+            "지연 보상). MPC: 지금까지의 iLQR 추종기 — 맵별 최종 정책은 이것으로 학습됐습니다. 상대 차는 언제나 MPC입니다.")
+        self.row_follower = FieldRow("계획 추종기", self.combo_follower,
+                                     "MAP: ICCAS 혼자 주행 8.40 → 7.92초 (같은 정책, 128/128 완주).")
+        cfg_card.add(self.row_follower)
+
         # -- surface friction: random per car (what training saw) or one pinned value, changeable
         # while the session runs. The panel's "시뮬 참값 μ" shows what the car actually has.
         mu_row = QtWidgets.QHBoxLayout()
@@ -1455,7 +1467,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
-                  self.spin_cap, self.chk_dr, self.chk_soft, self.chk_stoch, self.opp_table, self.combo_device,
+                  self.spin_cap, self.combo_follower, self.chk_dr, self.chk_soft, self.chk_stoch, self.opp_table,
+                  self.combo_device,
                   self.combo_ros,
                   self.seg_direction, self.combo_obstacle, self.chk_bare_first):
             w.setEnabled(state in (STATE_IDLE, STATE_FAILED, STATE_PREPARING))
@@ -2230,6 +2243,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "randomize": bool(self.chk_dr.isChecked()),
             "collision_soft": bool(self.chk_soft.isChecked()),
             "stochastic": bool(self.chk_stoch.isChecked()),
+            "plan_follower": str(self.combo_follower.currentData() or "map"),
             "bare_first": bool(self.chk_bare_first.isChecked()),
             "mu_mode": str(self.combo_mu.currentData() or "random"),
             "mu": float(self.spin_mu.value()),
@@ -2308,6 +2322,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.chk_dr.setChecked(bool(v)), "randomize")
         attempt(lambda v: self.chk_soft.setChecked(bool(v)), "collision_soft")
         attempt(lambda v: self.chk_stoch.setChecked(bool(v)), "stochastic")
+        attempt(combo_data(self.combo_follower), "plan_follower")
         attempt(lambda v: self.chk_bare_first.setChecked(bool(v)), "bare_first")
         attempt(combo_data(self.combo_mu), "mu_mode")
         attempt(lambda v: self.spin_mu.setValue(float(v)), "mu")
@@ -2360,6 +2375,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             randomize=self.chk_dr.isChecked(),
             collision_mode=("soft" if self.chk_soft.isChecked() else "terminate"),
             stochastic=self.chk_stoch.isChecked(),
+            plan_follower=str(self.combo_follower.currentData() or "map"),
             opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
             opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),
             **self.ego_panel.config(),

@@ -1137,6 +1137,12 @@ class SimWorker:
         exp_meta = extra.get("experiment") or {}
         from ..learn.common import plan_output_of
         _plan_out = plan_output_of(extra)
+        _pf = str(getattr(cfg, "plan_follower", "auto") or "auto")
+        if _pf in ("mpc", "map") and mode == "plan":
+            # the console's choice over the checkpoint's own (`SessionConfig.plan_follower`)
+            _plan_out = dict(_plan_out, plan_follower=_pf)
+            if _pf == "mpc":
+                _plan_out.pop("plan_follower_map", None)
         proc_kw, proc_src = {}, ""
         if getattr(cfg, "procedural", False):
             if scenario.choice:

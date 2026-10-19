@@ -150,6 +150,10 @@ class SessionConfig:
     #: Drive the ego baseline on its per-map tuned setting (`learn.baseline_settings`), the one the
     #: comparison reports, when the map has one -- instead of `ego_options` / `ego_limits` (2026-10-19).
     ego_tuned: bool = True
+    #: Who follows the policy's plan (2026-10-19, the user: "우리도 그냥 map 쓰자"): "map" -- ForzaETH's MAP
+    #: controller (`map_controller.MAPPlanTracker`, `POLICY_MAP`), "mpc" -- the iLQR tracker the picks were
+    #: trained with, "auto" -- whatever the checkpoint records it was fitted to.
+    plan_follower: str = "map"
     #: Plan-controller arm installed at run time (`learn.grip_runtime`).
     #:
     #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs
