@@ -111,3 +111,18 @@ def test_the_plan_waypoints_are_the_plans_path_and_profile():
     i_end = (Lp / PLAN_WP_SPACING).round().long()
     assert abs(float(pv[0, 0]) - 4.0) < 1e-3 and abs(float(pv[0, i_end[0]]) - 6.0) < 0.05   # v0 -> v1 along it
     assert abs(float(pv[1, i_end[1]]) - 3.0) < 0.05 and float(pv[1, -1]) == pytest.approx(3.0, abs=1e-4)
+
+
+def test_a_league_seat_trained_on_map_races_in_any_env():
+    """A checkpoint trained with --plan-follower map carries it in its contract; as a league seat it is
+    followed by the env's iLQR like every seat, so the follower is no part of the contract check (the
+    learner's own snapshot was refused at the first league update otherwise)."""
+    from f1sim.learn.opponent_pool import _check_contract
+    for pf in ("mpc", "map"):
+        cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+        env = common.make_env([maps.load("real:korea_2025_iccas")], 2, "cpu",
+                              EnvConfig(max_steps=100, hist_len=0, action_mode="plan", plan_follower=pf,
+                                        compile_tracker=False), cfg=cfg, seed=1)
+        extra = {"speed_mode": "linear", "speed_command": "tracker", "plan_follower": "map",
+                 "plan_follower_map": {"delay_comp": -1.0}}
+        assert _check_contract("seat.pt", extra, env) == "linear"

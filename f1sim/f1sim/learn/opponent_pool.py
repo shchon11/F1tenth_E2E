@@ -138,7 +138,11 @@ def _check_contract(path: str, extra: Optional[dict], env) -> str:
     """
     from ..mpc import ROW_FORMATS, contract_of
     e = env.ecfg
-    have = contract_of(extra)
+    # Who follows the plan is not part of what an opponent's plan MEANS (2026-10-19): a league seat is
+    # always followed by the env's iLQR (`map_controller.MAPPlanTracker` follows the learner's rows
+    # only), and a plan fitted to MAP is the same path and profile to it. Without this the learner's own
+    # snapshot, trained with --plan-follower map, refused its league seat at the first league update.
+    have = {k: v for k, v in contract_of(extra).items() if k not in ("plan_follower", "plan_follower_map")}
     mode = getattr(e, "opponent_speed_mode", None) or e.speed_mode
     want = {"speed_mode": str(mode), "speed_command": str(e.speed_command)}
     for k in ("tracker_speed_weight", "tracker_a_max"):
