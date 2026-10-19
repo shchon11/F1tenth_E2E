@@ -349,7 +349,8 @@ class MAPController:
                  path_v: torch.Tensor, path_kappa: torch.Tensor, spacing: torch.Tensor, d_global: torch.Tensor,
                  grip: torch.Tensor, trailing: Optional[torch.Tensor] = None, opp_gap: Optional[torch.Tensor] = None,
                  opp_vs: Optional[torch.Tensor] = None, opp_visible: Optional[torch.Tensor] = None,
-                 ego_vs: Optional[torch.Tensor] = None, yaw_rate: Optional[torch.Tensor] = None):
+                 ego_vs: Optional[torch.Tensor] = None, yaw_rate: Optional[torch.Tensor] = None,
+                 delay: Optional[torch.Tensor] = None):
         """-> (steer command [rad], speed command [m/s]), (R,) each. `trailing` (R,) bool marks the
         cars whose planner is TRAILING an opponent that exists (race_stack: ``state == "TRAILING" and
         opponent is not None``); `opp_gap` / `opp_vs` / `opp_visible` describe it, `ego_vs` is the car's
@@ -359,8 +360,9 @@ class MAPController:
         dev = pos.device
         ar = torch.arange(R, device=dev)
         trailing = torch.zeros(R, dtype=torch.bool, device=dev) if trailing is None else trailing
-        if p.delay_comp > 0:
-            t_ = p.delay_comp
+        if delay is not None or p.delay_comp > 0:
+            # `delay` (R,): each car's own calibrated actuation delay, in place of the tuned constant
+            t_ = delay if delay is not None else p.delay_comp
             r_ = torch.zeros_like(yaw) if yaw_rate is None else yaw_rate
             mid = yaw + 0.5 * r_ * t_
             pos = pos + (v_now * t_)[:, None] * torch.stack([torch.cos(mid), torch.sin(mid)], 1)
@@ -458,3 +460,133 @@ class MAPController:
 
 def describe(params: MAPParams) -> dict:
     return {"controller": "MAP (ForzaETH race_stack controller/map.py)", **asdict(params)}
+
+
+# ------------------------------------------------------------------------------ our policy's plan
+#: The reference teacher's grip levels (`teacher.RacelineTeacher.grip_levels`): the steering tables are
+#: built at these multiples of the nominal friction and a car reads the one at or below its own.
+GRIP_LEVELS = (0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.1, 1.2)
+
+
+def nominal_lut(sim, device=None) -> SteerLUT:
+    """The steering tables of `sim`'s nominal car at every grip level (cached; what the planner
+    baselines' MAP reads too, `learn.common.build_map_tracker`)."""
+    nominal = sim.params.nominal
+    P_row = {k: torch.tensor([float(v)]) for k, v in nominal.items()}
+    mu_nom = float(nominal["mu"])
+    return lut_for(P_row, [mu_nom * g for g in GRIP_LEVELS], wheel=bool(sim.wheel_model), dt=float(sim.dt),
+                   s_max=float(nominal["s_max"]), device=device if device is not None else sim.state.device)
+
+
+def grip_index(P, nominal: dict) -> torch.Tensor:
+    """(B,) the steering table a car reads: the grip level at or below its front grip."""
+    lv = torch.tensor(GRIP_LEVELS, device=P["mu"].device, dtype=P["mu"].dtype)
+    g = (P["mu"] * P["mu_f_scale"]) / (float(nominal["mu"]) * float(nominal["mu_f_scale"]))
+    return (torch.searchsorted(lv, g.contiguous(), right=True) - 1).clamp(0, len(GRIP_LEVELS) - 1)
+
+
+#: The plan's waypoint array: 0.1 m apart (race_stack's spacing), as long as the longest plan plus the
+#: furthest a speed lookahead reaches, the last stretch straight on at the plan's end speed.
+PLAN_WP_SPACING = 0.1
+PLAN_WP_EXTRA_M = 4.0
+
+
+class MAPPlanTracker:
+    """Our policy's plan followed by MAP (2026-10-19, the user: "우리도 그냥 map 쓰자").
+
+    Wraps the env's `mpc.PlanTracker` and replaces the commands of `map_rows` (the policy's cars): the
+    plan's own path -- `mpc.path_points` of its curvature knots over its length -- every 0.1 m, with
+    its speed profile, is the waypoint array, and the car stands at its start heading along it (the
+    plan is in the frame of the pose it was made from). The other rows -- the scripted and league
+    cars -- keep the iLQR they were built with, so the traffic a policy races is the traffic it raced.
+    Everything the env and the viewers read off a tracker (`last_ref`, `last_pred`, `u_seq`, the
+    hooks, `spec`) is the wrapped tracker's: for the MAP rows `last_ref` is the reference of the same
+    plan. The actuation delay compensated is each car's calibrated one (`delay`), the tracker's.
+    """
+
+    def __init__(self, inner, lut: SteerLUT, params: MAPParams, nominal: dict):
+        self._inner = inner
+        self.map = MAPController(lut, params, inner.B, inner.device, inner.s_max)
+        self.nominal = nominal
+        self.map_rows = torch.zeros(inner.B, dtype=torch.bool, device=inner.device)
+        #: set by the env each step: its parameter dict (the grip level) and new IMU samples
+        self.P = None
+        self.last_map = None
+
+    def __getattr__(self, name):                       # spec, last_ref, u_seq, hooks, ... are the inner's
+        return getattr(self.__dict__["_inner"], name)
+
+    def __setattr__(self, name, value):
+        if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._inner, name, value)
+
+    def reset(self, ids: torch.Tensor):
+        self._inner.reset(ids)
+        m = torch.zeros(self._inner.B, dtype=torch.bool, device=self._inner.device)
+        m[ids] = True
+        self.map.reset(m)
+
+    def push_imu(self, ax: torch.Tensor) -> None:
+        self.map.push_imu(ax)
+
+    def waypoints(self, action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor):
+        """(path (B, n, 2), speed (B, n), curvature (B, n)) of each plan, body frame, 0.1 m apart."""
+        from . import mpc
+        sp = self._inner.spec
+        if sp.speed_mode == "linear":
+            k, Lp, v0, v1 = mpc.decode(action, v_meas, self._inner.v_max, speed_cap, sp)
+            prof = None
+        elif sp.speed_mode != "wp4":
+            k, Lp, prof = mpc.decode_profile(action, v_meas, self._inner.v_max, speed_cap, sp)
+        else:
+            raise ValueError("MAP follows the linear and profile plan formats; 'wp4' is not wired")
+        x, y, psi, s, kap = mpc.path_points(k, Lp, 49, return_kappa=True)
+        n = int(math.ceil((float(sp.len_max) + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
+        sg = (torch.arange(n, device=k.device, dtype=k.dtype) * PLAN_WP_SPACING)[None].expand(k.shape[0], n)
+        S = s[:, -1:].clamp_min(1e-3)
+        idx = torch.searchsorted(s.contiguous(), sg.clamp(max=S).contiguous()).clamp(1, s.shape[1] - 1)
+        s_lo, s_hi = s.gather(1, idx - 1), s.gather(1, idx)
+        w = ((sg.clamp(max=S) - s_lo) / (s_hi - s_lo).clamp_min(1e-6)).clamp(0.0, 1.0)
+        g_ = lambda a: a.gather(1, idx - 1) * (1 - w) + a.gather(1, idx) * w
+        px, py, pp, pk = g_(x), g_(y), g_(psi), g_(kap)
+        over = (sg - S).clamp_min(0.0)                                  # past the end: straight on
+        pe = psi[:, -1:]
+        px = px + over * torch.cos(pe)
+        py = py + over * torch.sin(pe)
+        pk = torch.where(sg > S, torch.zeros_like(pk), pk)
+        frac = (sg / S).clamp(0.0, 1.0)
+        if prof is None:
+            pv = v0[:, None] + (v1 - v0)[:, None] * frac
+        else:
+            pos = frac * (prof.shape[1] - 1)
+            i0 = pos.floor().clamp(max=prof.shape[1] - 2).long()
+            ww = pos - i0.to(prof.dtype)
+            pv = prof.gather(1, i0) * (1 - ww) + prof.gather(1, i0 + 1) * ww
+        return torch.stack([px, py], -1), pv, pk
+
+    @torch.no_grad()
+    def __call__(self, action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
+                 yaw_rate: Optional[torch.Tensor] = None, delay=None) -> torch.Tensor:
+        out = self._inner(action, v_meas, speed_cap, yaw_rate, delay)     # every row; the traffic keeps it
+        if not bool(self.map_rows.any()) or self.P is None:
+            return out
+        B = action.shape[0]
+        dev = action.device
+        path, pv, pk = self.waypoints(action, v_meas, speed_cap)
+        zeros = torch.zeros(B, device=dev, dtype=action.dtype)
+        dly = None
+        if delay is not None:
+            dly = delay if torch.is_tensor(delay) else torch.full((B,), float(delay), device=dev)
+        steer, speed = self.map(torch.zeros(B, 2, device=dev, dtype=action.dtype), zeros, v_meas.abs(), path, pv, pk,
+                                torch.full((B,), PLAN_WP_SPACING, device=dev), zeros, grip_index(self.P, self.nominal),
+                                yaw_rate=yaw_rate, delay=dly if self.map.p.delay_comp < 0 else None)
+        speed = torch.minimum(speed, speed_cap)
+        sp = self._inner.spec
+        # stopped, asking to stay stopped, and touching something: back out, as the tracker does
+        stalled = (v_meas.abs() < sp.reverse_v_gate) & (speed < sp.reverse_cmd_gate) & self._inner.contact
+        speed = torch.where(stalled, torch.full_like(speed, -sp.v_reverse), speed)
+        mine = torch.stack([steer, speed], 1)
+        self.last_map = self.map.last
+        return torch.where(self.map_rows[:, None], mine, out)

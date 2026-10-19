@@ -125,7 +125,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              external: dict | None = None, research_estimator: bool = False,
              research_profile: str | None = None, graph_runtime: bool = False,
              opponent_speed_mode: str | None = "auto", ego_stack: str = "oracle",
-             ego_stack_params: dict | None = None) -> dict:
+             ego_stack_params: dict | None = None, plan_follower: str | None = None,
+             plan_follower_map: dict | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -322,6 +323,10 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      tracker_a_max=_out.get("tracker_a_max") if mode == "plan" else None,
                      tracker_profile_from_prediction=bool(_out.get("tracker_profile_from_prediction")) and mode == "plan",
                      tracker_speed_ff=bool(_out.get("tracker_speed_ff")) and mode == "plan",
+                     # the follower the checkpoint was fitted to, unless the caller names one
+                     plan_follower=(plan_follower or _out.get("plan_follower", "mpc")) if mode == "plan" else "mpc",
+                     plan_follower_map=(plan_follower_map if plan_follower_map is not None
+                                        else _out.get("plan_follower_map")) if mode == "plan" else None,
                      plan_a_brake=float(metadata.get("plan_a_brake", limits.get("a_brake", 3.0))),
                      compile_tracker=not graph_runtime and bool(cfg.sim.compile),
                      race_size=race_size, opponent=opponent,
@@ -675,6 +680,12 @@ def main() -> None:
                     help="with --teacher: 'modular' runs the planner on its own particle-filter localisation "
                          "and LiDAR detection/tracking with the nominal actuator model (a baseline as on the "
                          "car); 'oracle' hands it the simulator's state (an upper bound, label it so)")
+    ap.add_argument("--plan-follower", default=None, choices=["mpc", "map"],
+                    help="who follows a plan policy's plan: the iLQR tracker or ForzaETH's MAP controller "
+                         "(default: what the checkpoint was fitted to, else mpc)")
+    ap.add_argument("--plan-follower-map", default="", metavar="JSON",
+                    help="map_controller.MAPParams fields for --plan-follower map (delay_comp -1 = each car's "
+                         "calibrated delay)")
     ap.add_argument("--ego-stack-params", default="", metavar="JSON",
                     help='{"pf": {...PFParams}, "det": {...DetectParams}, "trk": {...TrackParams}}')
     ap.add_argument("--ego-teacher-limits", default="", metavar="A_LAT,A_ACC,A_BRAKE",
@@ -822,6 +833,8 @@ def main() -> None:
                                             if a.ego_teacher_limits else None),
                         ego_stack=a.ego_stack,
                         ego_stack_params=(json.loads(a.ego_stack_params) if a.ego_stack_params else None),
+                        plan_follower=a.plan_follower,
+                        plan_follower_map=(json.loads(a.plan_follower_map) if a.plan_follower_map else None),
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,

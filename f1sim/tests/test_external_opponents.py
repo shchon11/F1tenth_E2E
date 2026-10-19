@@ -42,8 +42,11 @@ def test_an_ftg_opponent_executes_exactly_what_ftg_says_on_its_own_scan(mode):
         want = ref.command(ref.adapt(rng.numpy()), lr.odom[rows, 3].float().numpy())
         env.step(act)
         got = env.last_cmd[rows].numpy()
-        steer = np.clip(want[:, 0], -float(env.s_max), float(env.s_max))
-        speed = np.minimum(want[:, 1], env.speed_cap[rows].numpy())
+        # through the car's calibration, as every driver's command is (2026-10-19): FTG asks for a
+        # steering angle, the servo command that gives it on this car is (angle - offset) / gain
+        cal = (env.tracker_cal if getattr(env, "tracker_cal", None) is not None else env._ext_cal)[rows].numpy()
+        steer = np.clip((want[:, 0] - cal[:, 0]) / cal[:, 1], -float(env.s_max), float(env.s_max))
+        speed = np.minimum(want[:, 1] / cal[:, 2], env.speed_cap[rows].numpy())
         assert np.allclose(got[:, 0], steer, atol=1e-6) and np.allclose(got[:, 1], speed, atol=1e-5)
 
 

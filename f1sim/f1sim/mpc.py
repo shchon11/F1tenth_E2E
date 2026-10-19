@@ -295,6 +295,10 @@ def contract_of(extra: Optional[dict]) -> dict:
     for k in ("tracker_profile_from_prediction", "tracker_speed_ff"):
         if extra.get(k, exp.get(k)):
             out[k] = True                                    # present only when on: older contracts compare equal
+    pf = extra.get("plan_follower", exp.get("plan_follower"))
+    if pf and pf != "mpc":                                   # the follower the plan was fitted to (2026-10-19)
+        out["plan_follower"] = str(pf)
+        out["plan_follower_map"] = dict(extra.get("plan_follower_map") or exp.get("plan_follower_map") or {})
     return out
 
 

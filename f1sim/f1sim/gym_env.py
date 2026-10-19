@@ -17,7 +17,7 @@ their first observation of the new episode is returned (standard vector-env sema
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import math
 
@@ -544,6 +544,13 @@ class EnvConfig:
     tracker_profile_from_prediction: bool = False
     plan_kappa_a_lat: float = 8.0    # [m/s^2] "feasible" only: the lateral budget it scales by
     compile_tracker: bool = True
+    #: Who follows the policy's plan (2026-10-19, the user: "우리도 그냥 map 쓰자"). "mpc": the iLQR plan
+    #: tracker, every run before. "map": ForzaETH's MAP controller on the plan's own waypoints
+    #: (`map_controller.MAPPlanTracker`), for the policy's cars only -- the traffic keeps the iLQR.
+    plan_follower: str = "mpc"
+    #: `map_controller.MAPParams` fields for "map"; delay_comp -1 (the default here) compensates each
+    #: car's calibrated actuation delay, the one the iLQR tracker is given.
+    plan_follower_map: Optional[Dict[str, Any]] = None
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -1179,6 +1186,13 @@ class F1VecEnv:
             self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
                                        e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
+            if e.plan_follower == "map":
+                from .map_controller import MAPParams, MAPPlanTracker, nominal_lut
+                self.tracker = MAPPlanTracker(self.tracker, nominal_lut(self.sim),
+                                              MAPParams.from_dict(dict({"delay_comp": -1.0}, **(e.plan_follower_map or {}))),
+                                              self.sim.params.nominal)
+            elif e.plan_follower != "mpc":
+                raise ValueError(f"plan_follower must be 'mpc' or 'map', not {e.plan_follower!r}")
         #: The spec the cars the learner does not drive plan in (`EnvConfig.opponent_speed_mode`): the
         #: tracker's own, the very object, unless that names another format -- then the tracker's with
         #: that speed mode, and the tracker reads every row in its own (`_sync_row_formats`).
@@ -1324,6 +1338,22 @@ class F1VecEnv:
             return obs, act
         except ImportError:
             return None, None
+
+    def _calibrate_external(self, ids: torch.Tensor):
+        """The car calibration an external driver's commands go through when there is no tracker to
+        carry one (direct actions): the same measurement `_calibrate_tracker` gives the tracker -- servo
+        offset to +-0.01 rad, gain to +-4 %, VESC speed gain to +-3 % -- drawn from a generator of its
+        own, so a direct-action run's spawns and randomisation are the ones they always were."""
+        if getattr(self, "_ext_cal", None) is None:
+            self._ext_gen = torch.Generator(device=self.device)
+            self._ext_gen.manual_seed(int(self.sim.gen.initial_seed()) + 7919)
+            self._ext_cal = torch.zeros(self.B, 3, device=self.device)
+            self._ext_cal[:, 1:] = 1.0
+        P = self.sim.P; n = ids.numel(); g = self._ext_gen
+        u = lambda a: (torch.rand(n, device=self.device, generator=g) - 0.5) * 2 * a
+        self._ext_cal[ids, 0] = P["steer_bias"][ids] + u(0.01)
+        self._ext_cal[ids, 1] = P["steer_gain"][ids] * (1 + u(0.04))
+        self._ext_cal[ids, 2] = P["speed_gain"][ids] * (1 + u(0.03))
 
     def _calibrate_tracker(self, ids: torch.Tensor):
         """The tracker is *calibrated* on the real car the way the odometry is (measured once): in sim it
@@ -1838,10 +1868,24 @@ class F1VecEnv:
         if lr is None:
             return cmd
         rmax = float(self.cfg.lidar.range_max)
+        # The car is calibrated whoever drives it (2026-10-19). The tracker our policy drives through has
+        # always been handed the car's measured servo offset / gain and speed gain (`_calibrate_tracker`),
+        # and these drivers command a nominal car (a geometric steering angle, MAP's lookup of the nominal
+        # car); they used to reach the actuators raw, on a servo trimmed up to +-0.03 rad off. A team sets
+        # the trim and gains once whatever runs on the car, so every driver gets the same correction.
+        cal = getattr(self, "tracker_cal", None)
+        cal = cal if cal is not None else getattr(self, "_ext_cal", None)
+        if cal is None:
+            self._calibrate_external(torch.arange(self.B, device=self.device))
+            cal = self._ext_cal
+
+        def calibrated(c, rows):
+            return torch.stack([(c[:, 0] - cal[rows, 0].to(c.dtype)) / cal[rows, 1].to(c.dtype),
+                                c[:, 1] / cal[rows, 2].to(c.dtype)], 1)
         for i, rows in self.external_slot_rows.items():
             drv = self.external_drivers[i]
             if hasattr(drv, "command_env"):                  # a planner: privileged state, not a scan
-                c = drv.command_env(self, rows).to(cmd.dtype)
+                c = calibrated(drv.command_env(self, rows).to(cmd.dtype), rows)
                 steer = c[:, 0].clamp(-float(self.s_max), float(self.s_max))
                 speed = torch.minimum(c[:, 1], self.speed_cap[rows].to(cmd.dtype))
                 cmd = cmd.index_copy(0, rows, torch.stack([steer, speed], 1))
@@ -1849,7 +1893,7 @@ class F1VecEnv:
             rng = torch.nan_to_num(lr.scan[rows].float(), nan=rmax, posinf=rmax, neginf=0.0).clamp(0.0, rmax)
             v = lr.odom[rows, 3].float() if drv.needs_speed else None
             c = drv.command(drv.adapt(rng.cpu().numpy()), None if v is None else v.cpu().numpy())
-            c = torch.as_tensor(c, dtype=cmd.dtype, device=cmd.device)
+            c = calibrated(torch.as_tensor(c, dtype=cmd.dtype, device=cmd.device), rows)
             steer = c[:, 0].clamp(-float(self.s_max), float(self.s_max))
             speed = torch.minimum(c[:, 1], self.speed_cap[rows].to(cmd.dtype))
             cmd = cmd.index_copy(0, rows, torch.stack([steer, speed], 1))
@@ -2327,6 +2371,7 @@ class F1VecEnv:
         self.prev_action[ids] = 0.0
         if self.act_dim == 2:
             self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
+            self._calibrate_external(ids)
         else:
             self.prev_action[ids, self.plan_layout.speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
             if self._row_codes is not None and self._pool_codes is None:
@@ -2819,6 +2864,13 @@ class F1VecEnv:
             # pose and `car_future` has to put it back in the world.
             self._plan_pose = self.sim.state[:, :3].clone()
             self._sync_row_formats()
+            if self.ecfg.plan_follower == "map":
+                # MAP reads the car's grip level and the IMU's longitudinal acceleration (race_stack's
+                # `acc_now`), and follows the plans of the policy's own cars
+                self.tracker.P = self.sim.P
+                self.tracker.map_rows = self.learner
+                if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
+                    self.tracker.push_imu(lr.imu[:, :, 3])
             raw = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
