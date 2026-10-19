@@ -112,7 +112,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
              raceline_objective: str | None = None, teacher_limits: dict | None = None,
              ego_teacher_limits: dict | None = None,
-             speed_mode: str | None = None, dial_offset: float = 0.0, speed_command: str | None = None,
+             speed_mode: str | None = None, dial_offset: float = 0.0, dial_value: float | None = None,
+             speed_command: str | None = None,
              opp_slots="", opp_speed_range: tuple | None = None, opp_events=(), opp_event_rate: float = 0.0,
              opp_reactive_probs: dict | None = None,
              contention_range_m: float = 12.0, attack_range_m: float = 3.0,
@@ -451,11 +452,19 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         # checkpoint it is `model.act` with nothing else happening.
         # A dial student is scored with its dial set `dial_offset` away from the floor's true friction:
         # 0 is "set exactly right" (the reference), negative is the safe side an operator would err on.
-        dial = None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))
+        # A held dial (`dial_value`, or the checkpoint's own `dial_constant`): one number for every car, no friction
+        # information in it -- what a car has when nobody tells it the floor (2026-10-20).
+        _dc = dial_value if dial_value is not None else (metadata or {}).get("dial_constant")
+        dial = ((lambda: torch.full((env.B,), float(_dc), device=env.device)) if _dc is not None else
+                (None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))))
         # A dial student is scored with its dial set `dial_offset` away from the floor's true
         # friction: 0 is "set exactly right" (the reference), negative is the safe side an operator
         # would err on.
-        dial = None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))
+        # A held dial (`dial_value`, or the checkpoint's own `dial_constant`): one number for every car, no friction
+        # information in it -- what a car has when nobody tells it the floor (2026-10-20).
+        _dc = dial_value if dial_value is not None else (metadata or {}).get("dial_constant")
+        dial = ((lambda: torch.full((env.B,), float(_dc), device=env.device)) if _dc is not None else
+                (None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))))
         policy = common.student_policy(model, env, device, dial=dial)
     from .benchmark.overtake import TrafficMeter
     from .encounter import EncounterMeter
@@ -535,7 +544,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         'ego_teacher_limits': (ego_limits if teacher and ego_teacher_limits else None),
         'ego_stack': (ego_stack if teacher else None),
         'ego_stack_params': (ego_stack_params if teacher and ego_stack == "modular" else None),
-        'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset),
+        'speed_mode': env.ecfg.speed_mode, 'dial_offset': float(dial_offset), 'dial_value': dial_value,
         # the format the other cars planned in (None: the policy's own); league seats plan in their own
         'opponent_speed_mode': env.ecfg.opponent_speed_mode,
         # What the run actually drove under, not what was asked for. The cap is part of the
@@ -706,6 +715,9 @@ def main() -> None:
                     help="what the plan's speed dimensions mean (f1sim.mpc.SPEED_MODES; wp4: the v2 network's "
                          "four waypoints). Default: the checkpoint's own; with --teacher, the format the "
                          "teacher writes its labels in")
+    ap.add_argument("--dial-value", type=float, default=None, metavar="MU",
+                    help="dial checkpoints: hold the dial at this one friction for every car (no per-car truth); "
+                         "default: the checkpoint's own dial_constant if it has one, else --dial-offset")
     ap.add_argument("--dial-offset", type=float, default=0.0,
                     help="dial checkpoints: the dial is set to the floor's true friction plus this (default 0: exactly "
                          "right; -0.15 is an operator erring on the safe side)")
@@ -832,6 +844,7 @@ def main() -> None:
                         budget_laps=a.budget_laps if a.budget_laps > 0 else None, max_steps=a.max_steps,
                         raceline_margin=a.raceline_margin, teacher_grip=a.teacher_grip,
                         raceline_objective=a.raceline_objective, speed_mode=a.speed_mode, dial_offset=a.dial_offset,
+                        dial_value=a.dial_value,
                         speed_command=a.speed_command,
                         teacher_limits=common.teacher_limits(a.teacher_a_lat, a.teacher_a_acc, a.teacher_a_brake),
                         ego_teacher_limits=(common.teacher_limits(*(float(x) for x in a.ego_teacher_limits.split(",")))

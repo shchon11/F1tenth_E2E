@@ -445,6 +445,10 @@ def main():
     ap.add_argument("--dial-margin", type=float, default=0.30,
                     help="--cond dial: the dial is the floor's friction minus a per-episode margin in [0, this]")
     ap.add_argument("--dial-exact", type=float, default=0.30, help="--cond dial: share of episodes with no margin")
+    ap.add_argument("--dial-constant", type=float, default=None, metavar="MU",
+                    help="--cond dial: hold the dial at this one friction for every car and episode -- it then carries "
+                         "no friction information and the policy must sense the floor (with --aux-grip the true "
+                         "friction is a target only). Recorded in the checkpoint; evaluation feeds the same number")
     ap.add_argument("--grip-budget-penalty", type=float, default=0.0,
                     help="--cond dial: per second, per (m/s^2)^2 of lateral acceleration beyond what the dial allows. "
                          "This is what makes the dial a command under RL. A dial is a lower bound on the floor's grip, so "
@@ -1697,6 +1701,7 @@ def main():
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
         "fresh_optimizer": bool(a.fresh_opt), "aux_grip": float(a.aux_grip), "aux_opp": float(a.aux_opp),
+        **({"dial_constant": float(a.dial_constant)} if a.dial_constant is not None else {}),
         "aux_future": float(a.aux_future), "future_head": dict(future_cfg) or None,
         "aux_opp_mask": float(a.aux_opp_mask), "aux_motion": float(a.aux_motion),
         "motion": dict(motion_cfg) or None, "motion_heads": list(motion_heads),
@@ -1989,7 +1994,8 @@ def main():
         print(f"recurrent PPO: truncated BPTT over {T} steps, minibatches of {env_chunk} env "
               f"chunk(s) = {env_chunk * T} samples, hidden reset on term|trunc per env")
 
-    dial = cond_mod.DialDraw(env, a.dial_margin, a.dial_exact) if a.cond == "dial" else None
+    dial = ((cond_mod.ConstantDial(env, a.dial_constant) if a.dial_constant is not None
+             else cond_mod.DialDraw(env, a.dial_margin, a.dial_exact)) if a.cond == "dial" else None)
     dial_new = torch.ones(env.B, dtype=torch.bool, device=device)     # rows whose episode just began
 
     def condition_now():

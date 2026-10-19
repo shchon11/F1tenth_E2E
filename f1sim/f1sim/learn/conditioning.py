@@ -166,6 +166,22 @@ class DialDraw:
         return (self.env.sim.P["mu"].reshape(-1) - self.m).clamp_min(self.floor)
 
 
+class ConstantDial:
+    """A dial held at ONE number for every car and episode (2026-10-20, the user: the dial is structurally the wrong
+    direction). The dial then carries no friction information, so whatever a policy knows of the floor it must
+    sense; with `--aux-grip` the true friction is a training TARGET only, never an input. Same interface as
+    `DialDraw`."""
+
+    def __init__(self, env, value: float):
+        self.env, self.const = env, float(value)
+
+    def redraw(self, ids_mask: torch.Tensor) -> None:
+        return None
+
+    def value(self) -> torch.Tensor:
+        return torch.full((self.env.B,), self.const, device=self.env.device)
+
+
 # ---------------------------------------------------------------- critic input adapter
 #: Where the nearest-opponent block sits in `env.privileged()`: after the 8 dynamic-state values
 #: (`gym_env.privileged` / `_priv`, and `gym_env.priv_mu_index` is `8 + (4 if M > 1 else 0)`).
