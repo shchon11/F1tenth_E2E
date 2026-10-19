@@ -2011,7 +2011,10 @@ def main():
         dial.redraw(dial_new); dial_new.zero_()
         d = dial.value()
         if a.grip_budget_penalty > 0:
-            env.set_grip_budget(d)
+            # what the car may use: the dial it was told -- or, with the dial held (--dial-constant), the floor's own
+            # friction. The reward is training-side only; the input stays uninformative, so the policy has to sense
+            # the floor to stay inside it rather than be held to a number that is not the floor's.
+            env.set_grip_budget(env.sim.P["mu"].reshape(-1) if a.dial_constant is not None else d)
         c = cond_mod.mu_to_c(d, cond_spec).to(priv.dtype)
         return c, torch.cat([priv, c], 1)
 
