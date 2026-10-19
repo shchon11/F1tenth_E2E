@@ -469,12 +469,16 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     # `sim.step` like the other two and reads only; it switches `sim.measure_impacts` on for the run.
     from .severity_meter import ContactSeverityMeter
     sev = ContactSeverityMeter(env)
+    # How far the car ends up from the trajectory its controller was handed, h steps after each issue
+    # (the user, 2026-10-20: a controller is judged by its RMSE to the trajectory, not by speed or contacts).
+    from .tracking_meter import TrackingMeter
+    trk = TrackingMeter(env)
     if protocol == "rolling":
         # The meter wraps `sim.step` so every quantity is read BEFORE the auto-reset, the same
         # discipline the benchmark's own loop keeps. `rollout_metrics` is left untouched: it is a
         # validated implementation of a different measurement, and a second caller poking at its
         # internals is how two measurements start disagreeing.
-        with meter, enc, sev:
+        with meter, enc, sev, trk:
             result = common.rollout_metrics(env, policy, steps, speed_cap, controller=ctrl)
         for key, value in result.items():
             if isinstance(value, float) and not math.isfinite(value):
@@ -491,7 +495,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
             raise ValueError("Trial evaluation requires positive centerline lengths")
         trials = TrialAccumulator(lengths, env.sim.control_dt,
                                   time_budget_s=steps * env.sim.control_dt, speed_cap=speed_cap)
-        with meter, enc, sev:
+        with meter, enc, sev, trk:
             for _ in range(steps):
                 ctrl.pre_action(obs)
                 obs, _, term, trunc, info = env.step(policy(obs))
@@ -514,6 +518,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     result.update(meter.report())
     result.update(enc.report())
     result.update(sev.report())
+    result.update(trk.report())
     ctrl_metrics, _ = ctrl.collect_metrics()
     ctrl.release()
     if graph_holder is not None:
