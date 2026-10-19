@@ -781,6 +781,12 @@ def main():
                          "'linear' without one. A different one from the init's is refused")
     ap.add_argument("--speed-command", choices=["tracker", "profile"], default=None,
                     help="who sets the VESC speed command (EnvConfig.speed_command). Default: the init's own")
+    ap.add_argument("--plan-follower", choices=["mpc", "map"], default=None,
+                    help="who follows the policy's plan (EnvConfig.plan_follower): the iLQR tracker or ForzaETH's "
+                         "MAP controller (the user, 2026-10-19: \"우리도 그냥 map 쓰자\"). Default: the init's own. "
+                         "Unlike the speed dimensions this may change: the action means the same plan either way")
+    ap.add_argument("--plan-follower-map", default="", metavar="JSON",
+                    help="map_controller.MAPParams fields over POLICY_MAP for --plan-follower map")
     ap.add_argument("--plan-kappa-mode", choices=["absolute", "feasible"], default="absolute",
                     help="what a curvature knot of +-1 means: +-1.6 1/m ('absolute', every run before "
                          "this) or the tightest arc the tyres hold at the plan's speed ('feasible'). "
@@ -994,6 +1000,10 @@ def main():
     # The plan-output contract comes from the checkpoint the run starts from; a flag may only restate it.
     _init_out = (common.plan_output_of(torch.load(a.init, map_location="cpu", weights_only=False).get("extra") or {})
                  if a.init else {"speed_mode": "linear", "speed_command": "tracker"})
+    if a.plan_follower is None:
+        a.plan_follower = str(_init_out.get("plan_follower", "mpc"))
+    a.plan_follower_map = (json.loads(a.plan_follower_map) if a.plan_follower_map
+                           else dict(_init_out.get("plan_follower_map") or {})) if a.plan_follower == "map" else None
     for _k in ("speed_mode", "speed_command"):
         if getattr(a, _k) is None:
             setattr(a, _k, _init_out[_k])
@@ -1158,6 +1168,8 @@ def main():
                                                               tracker_a_max=_init_out.get("tracker_a_max"),
                                                               tracker_profile_from_prediction=bool(_init_out.get("tracker_profile_from_prediction", False)),
                                                               tracker_speed_ff=bool(_init_out.get("tracker_speed_ff", False)),
+                                                              plan_follower=a.plan_follower,
+                                                              plan_follower_map=a.plan_follower_map,
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,
@@ -1697,6 +1709,9 @@ def main():
         "tracker_speed_weight": _init_out.get("tracker_speed_weight"), "tracker_a_max": _init_out.get("tracker_a_max"),
         **({"tracker_profile_from_prediction": True} if _init_out.get("tracker_profile_from_prediction") else {}),
         **({"tracker_speed_ff": True} if _init_out.get("tracker_speed_ff") else {}),
+        # the follower the plans were fitted to; present only for MAP, so older contracts compare equal
+        **({"plan_follower": "map", "plan_follower_map": dict(a.plan_follower_map or {})}
+           if a.plan_follower == "map" else {}),
         "memory": dict(model.meta.get("memory") or {}) or None,
         "scan_channels": dict(model.meta.get("scan_channels") or {}) or None,
         "wandb_group": a.wandb_group,
