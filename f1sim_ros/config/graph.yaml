@@ -77,6 +77,11 @@
     traction_params: ""       # NAME=VALUE pairs overriding any TractionParams field
 
     # --- the tracker ---------------------------------------------------------
+    # Who follows the plan: "auto" = the checkpoint's contract (the iLQR, or ForzaETH's MAP for a
+    # policy trained with --plan-follower map), "mpc" / "map" to override. MAP needs controller:=legacy
+    # (the arms shape the iLQR) and reads the simulator's nominal steering table at map_grip x mu.
+    plan_follower: "auto"
+    map_grip: 1.0
     device: "cpu"
     speed_cap: 4.0            # must equal the policy's
     steer_max: 0.4189

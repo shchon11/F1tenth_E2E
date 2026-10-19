@@ -476,3 +476,88 @@ def test_the_perception_store_is_bounded():
     for i in range(cn.SNAPSHOT_MAX * 3):
         n.on_perception(perception_msg(ros_time(1.0 + i), floor=[0.1] * 64))
     assert len(n._perception) <= cn.SNAPSHOT_MAX
+
+
+# ==================================================================== the plan follower
+#
+# 2026-10-19, the user: "우리도 그냥 map 쓰자". A checkpoint trained with --plan-follower map records it
+# in its contract, and the car has to follow its plans the way the simulator did: through
+# `map_controller.MAPPlanTracker`, with the same measurements handed over.
+def _small_lut():
+    from f1sim.map_controller import GRIP_LEVELS, SteerLUT
+    steers = torch.linspace(0.0, 0.4189, 12)
+    vels = torch.linspace(0.5, 10.0, 8)
+    # (grip, steer, v) -> lateral acceleration, rising in steer: a kinematic car, more grip, more turn
+    g = torch.tensor(GRIP_LEVELS)[:, None, None]
+    table = torch.tan(steers)[None, :, None] * (vels[None, None, :] ** 2) / 0.3302 * g.clamp(max=1.0)
+    return SteerLUT(steers, vels, table), {"mu": 1.0489, "mu_f_scale": 0.92}
+
+
+def _follower_node(monkeypatch, contract, arm="legacy"):
+    import f1sim.map_controller as mc
+    from f1sim.mpc import PlanTracker, contract_spec
+    lut, nominal = _small_lut()
+    monkeypatch.setattr(mc, "config_lut", lambda cfg=None, device="cpu": (lut, nominal))
+    n = make_node()
+    n.contract = dict(contract)
+    n.controller_arm = arm
+    n.tracker = PlanTracker(1, torch.device("cpu"), 0.3302, 0.4189, 8.0, spec=contract_spec(n.contract))
+    return n, lut, nominal
+
+
+def test_the_plan_follower_is_the_checkpoints_unless_overridden(monkeypatch):
+    from f1sim.map_controller import POLICY_MAP, MAPPlanTracker
+    lin = {"speed_mode": "linear", "speed_command": "tracker"}
+    on_map = dict(lin, plan_follower="map", plan_follower_map={"q_l1": 0.4})
+    n, _, _ = _follower_node(monkeypatch, on_map)
+    n._install_follower("auto", 1.0)
+    assert n.follower == "map" and isinstance(n.tracker, MAPPlanTracker)
+    assert n.tracker.map.p.q_l1 == pytest.approx(0.4)                    # the contract's numbers...
+    assert n.tracker.map.p.l1_point == POLICY_MAP["l1_point"]            # ... over POLICY_MAP
+    n, _, _ = _follower_node(monkeypatch, lin)
+    n._install_follower("auto", 1.0)
+    assert n.follower == "mpc" and not isinstance(n.tracker, MAPPlanTracker)
+    n, _, _ = _follower_node(monkeypatch, on_map)
+    n._install_follower("mpc", 1.0)
+    assert n.follower == "mpc" and not isinstance(n.tracker, MAPPlanTracker)
+    n, _, _ = _follower_node(monkeypatch, lin)
+    n._install_follower("map", 1.0)                                      # an iLQR policy on MAP: POLICY_MAP
+    assert isinstance(n.tracker, MAPPlanTracker) and n.tracker.map.p.q_l1 == pytest.approx(POLICY_MAP["q_l1"])
+    with pytest.raises(ValueError, match="one of auto, mpc, map"):
+        _follower_node(monkeypatch, lin)[0]._install_follower("pp", 1.0)
+
+
+def test_map_refuses_an_arm_that_shapes_the_ilqr(monkeypatch):
+    on_map = {"speed_mode": "linear", "speed_command": "tracker", "plan_follower": "map"}
+    n, _, _ = _follower_node(monkeypatch, on_map, arm="fixed_low")
+    with pytest.raises(ValueError, match="controller:=legacy"):
+        n._install_follower("auto", 1.0)
+
+
+def test_the_car_follows_a_map_plan_as_the_simulator_does(monkeypatch):
+    """The node's command for a plan is the simulator's `MAPPlanTracker` command for the same plan,
+    speed, cap, yaw rate (this scan's gyro mean) and delay (the node's `cmd_delay`), at the nominal
+    grip -- the convention `F1VecEnv.step` calls it with."""
+    from f1sim.map_controller import POLICY_MAP, MAPParams, MAPPlanTracker
+    from f1sim.mpc import PlanTracker, contract_spec
+    on_map = {"speed_mode": "linear", "speed_command": "tracker", "plan_follower": "map"}
+    n, lut, nominal = _follower_node(monkeypatch, on_map)
+    n._install_follower("auto", 1.0)
+    ref = MAPPlanTracker(PlanTracker(1, torch.device("cpu"), 0.3302, 0.4189, 8.0, spec=contract_spec(on_map)),
+                         lut, MAPParams.from_dict(dict(POLICY_MAP)), nominal)
+    ref.map_rows = torch.ones(1, dtype=torch.bool)
+    ref.P = {"mu": torch.tensor([nominal["mu"]]), "mu_f_scale": torch.tensor([nominal["mu_f_scale"]])}
+    plans = ([0.5, -0.2, 0.1, 0.3, 0.2, 0.4, 0.0, 0.0], [-0.3, -0.4, 0.2, 0.0, 0.6, 0.1, 0.0, 0.0])
+    for i, plan in enumerate(plans):
+        stamp = ros_time(1.0 + 0.025 * i)
+        sensors_at(n, 3.0, stamp)
+        n.on_plan(plan_msg(stamp, seq=i, values=plan))
+        got = n.last_cmd
+        ref.push_imu(torch.tensor([[0.0]]))
+        want = ref(torch.tensor([plan]), torch.tensor([3.0]), torch.tensor([n.speed_cap]),
+                   torch.tensor([0.3]), delay=n.delay)[0]
+        assert got[0] == pytest.approx(float(want[0]), abs=1e-6)
+        assert got[1] == pytest.approx(float(want[1]), abs=1e-6)
+        assert n.tracker.last_map is not None and ref.last_map is not None      # MAP drove, not the iLQR
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["plan_follower"] == "map"

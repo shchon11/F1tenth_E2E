@@ -489,6 +489,28 @@ def nominal_lut(sim, device=None) -> SteerLUT:
                    s_max=float(nominal["s_max"]), device=device if device is not None else sim.state.device)
 
 
+def config_nominal(cfg=None):
+    """The simulator's nominal car under `cfg` (default `Config()`): (its parameter dict, wheel model,
+    physics dt) -- what `nominal_lut` reads off a built Sim, for a consumer that has none (the car's
+    controller node)."""
+    from .params import Config
+    from .randomization import ParamSet
+    cfg = cfg if cfg is not None else Config()
+    ps = ParamSet(cfg, 1, torch.device("cpu"), torch.Generator())
+    return dict(ps.nominal), bool(cfg.vehicle.wheel_model), float(cfg.sim.physics_dt)
+
+
+def config_lut(cfg=None, device="cpu"):
+    """(`SteerLUT` at every grip level, nominal dict) of `config_nominal(cfg)`: the same table -- the
+    same cache file -- as `nominal_lut` of a Sim built from `cfg`."""
+    nominal, wheel, dt = config_nominal(cfg)
+    P_row = {k: torch.tensor([float(v)]) for k, v in nominal.items()}
+    mu_nom = float(nominal["mu"])
+    lut = lut_for(P_row, [mu_nom * g for g in GRIP_LEVELS], wheel=wheel, dt=dt, s_max=float(nominal["s_max"]),
+                  device=device)
+    return lut, nominal
+
+
 def grip_index(P, nominal: dict) -> torch.Tensor:
     """(B,) the steering table a car reads: the grip level at or below its front grip."""
     lv = torch.tensor(GRIP_LEVELS, device=P["mu"].device, dtype=P["mu"].dtype)

@@ -126,3 +126,15 @@ def test_a_league_seat_trained_on_map_races_in_any_env():
         extra = {"speed_mode": "linear", "speed_command": "tracker", "plan_follower": "map",
                  "plan_follower_map": {"delay_comp": -1.0}}
         assert _check_contract("seat.pt", extra, env) == "linear"
+
+
+def test_the_cars_steering_table_is_the_simulators_nominal_one():
+    """`config_lut` (the car's controller node, no Sim) keys the same table as `nominal_lut(sim)`:
+    the same nominal car, wheel model and physics step."""
+    from f1sim.map_controller import config_nominal
+    cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+    env = common.make_env([maps.load("real:korea_2025_iccas")], 2, "cpu",
+                          EnvConfig(max_steps=100, hist_len=0, action_mode="plan", compile_tracker=False), cfg=cfg, seed=1)
+    nominal, wheel, dt = config_nominal()
+    assert nominal == dict(env.sim.params.nominal)
+    assert wheel == bool(env.sim.wheel_model) and dt == float(env.sim.dt)

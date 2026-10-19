@@ -207,7 +207,7 @@ def _versions_from_bag(raw_last: dict, types: dict) -> dict:
             m = deserialize_message(raw, get_message(types["/f1sim/controller/diag"]))
             for st in m.status:
                 for kv in st.values:
-                    if kv.key in ("arm", "mu", "traction", "traction_state",
+                    if kv.key in ("arm", "plan_follower", "mu", "traction", "traction_state",
                                   "clearance_margin_m", "speed_cap_mps"):
                         out[kv.key] = str(kv.value)
         except Exception:

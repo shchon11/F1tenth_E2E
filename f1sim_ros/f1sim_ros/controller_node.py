@@ -131,6 +131,10 @@ class ControllerNode(Node):
         # and nothing publishing this, the arm falls back to its own geometric estimate, which is
         # what the gate did before a front-end existed.
         d("perception_topic", "/f1sim/policy/perception")
+        # Who follows the plan: "auto" -- the checkpoint's contract (`EnvConfig.plan_follower`: the iLQR,
+        # or ForzaETH's MAP for a policy trained with it), "mpc" / "map" to override it. MAP reads the
+        # simulator's nominal steering table at `map_grip` x the nominal friction.
+        d("plan_follower", "auto"); d("map_grip", 1.0)
         d("traction", "off"); d("traction_params", "")
         d("sensor_timeout", 0.25); d("plan_timeout", 0.25); d("watchdog_period", 0.01)
         d("viz", False)
@@ -183,6 +187,7 @@ class ControllerNode(Node):
                                                margin=(float(p("clearance_margin")) or None),
                                                floor_gate=bool(p("clearance_floor_gate")),
                                                gate_mode=str(p("clearance_floor_gate_mode")))
+        self._install_follower(str(p("plan_follower")), float(p("map_grip")))
         #: Whether the beam bearings the clearance grid is built from have been checked against a
         #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
         self._scan_geometry_checked = False
@@ -256,6 +261,7 @@ class ControllerNode(Node):
                f", clearance margin {self.clearance.cspec.margin:.2f} m body edge "
                f"({self.clearance.cspec.margin + self.clearance.cspec.body_radius:.2f} m centre) "
                f"on a {self.clearance.cspec.cell * 100:.0f} cm grid from /scan alone")
+            + f", plan follower {self.follower}"
             + f", traction {self.traction_arm}"
             + ("" if self.traction is None else
                f" (lock past {self.traction.p.lock_accel:.1f} m/s^2 wheel decel and "
@@ -451,6 +457,32 @@ class ControllerNode(Node):
                 f"tracking it against the newest one instead. The command is one scan's "
                 f"measurement away from what the plan was made for.")
 
+    def _install_follower(self, pf: str, map_grip: float) -> None:
+        """Who follows the plan: `pf` "auto" -- the checkpoint's contract (`EnvConfig.plan_follower`),
+        else "mpc" / "map". MAP (2026-10-19, the user: "우리도 그냥 map 쓰자") follows it as
+        `map_controller.MAPPlanTracker` does in the simulator -- the decoded plan every 0.1 m with its
+        speed profile, the contract's MAP numbers over `POLICY_MAP` (the paper's formulation with this
+        car's command delay compensated) -- reading the nominal steering table at `map_grip` x the
+        nominal friction. The arms shape the iLQR's solve and plan hook, which MAP never reads, so
+        under MAP only the untouched arm runs."""
+        if pf not in ("auto", "mpc", "map"):
+            raise ValueError(f"plan_follower {pf!r}: one of auto, mpc, map")
+        contract = getattr(self, "contract", None) or {}
+        self.follower = str(contract.get("plan_follower", "mpc")) if pf == "auto" else pf
+        if self.follower != "map":
+            return
+        if self.controller_arm != "legacy":
+            raise ValueError(
+                f"the plan follower is MAP, and the '{self.controller_arm}' arm shapes the iLQR's solve, "
+                f"which MAP does not use; run it with controller:=legacy (or plan_follower:=mpc)")
+        from f1sim.map_controller import POLICY_MAP, MAPParams, MAPPlanTracker, config_lut
+        lut, nominal = config_lut(device=self.device)
+        mp = (contract.get("plan_follower_map") or {}) if contract.get("plan_follower") == "map" else {}
+        self.tracker = MAPPlanTracker(self.tracker, lut, MAPParams.from_dict(dict(POLICY_MAP, **mp)), nominal)
+        self.tracker.map_rows = torch.ones(1, dtype=torch.bool, device=self.device)
+        self.tracker.P = {"mu": torch.tensor([float(nominal["mu"]) * float(map_grip)], device=self.device),
+                          "mu_f_scale": torch.tensor([float(nominal["mu_f_scale"])], device=self.device)}
+
     def _track_and_publish(self, plan, snap: ScanSnapshot):
         a = torch.as_tensor(plan, dtype=torch.float32, device=self.device).reshape(1, -1)
         if self.clearance is not None:
@@ -488,6 +520,10 @@ class ControllerNode(Node):
                         f"clearance grid has {int(self.spec.n_beams)} beams; ignoring it and "
                         f"using the geometry. The two are built from the same ObsSpec, so this "
                         f"means the policy and the controller disagree about the observation.")
+        if getattr(self, "follower", "mpc") == "map":
+            # race_stack's rolling longitudinal acceleration (its steering scalers, 1.0 in POLICY_MAP):
+            # this scan's IMU mean, where the simulator pushes every IMU sample of the control period
+            self.tracker.push_imu(torch.tensor([[float(snap.imu_mean[3])]], device=self.device))
         cmd = self.tracker(a, torch.tensor([snap.v], device=self.device),
                            torch.tensor([self.speed_cap], device=self.device),
                            torch.tensor([float(snap.imu_mean[2])], device=self.device),
@@ -642,7 +678,7 @@ class ControllerNode(Node):
     # ---------------------------------------------------------------- diagnostics
     def diag_values(self):
         """The controller's state as `(name, value)` strings. Also what `system_check` reports."""
-        v = [("arm", self.controller_arm),
+        v = [("arm", self.controller_arm), ("plan_follower", getattr(self, "follower", "mpc")),
              ("mu", f"{float(self.grip.mu[0]):.5f}" if self.grip is not None else ""),
              ("clearance_margin_m",
               f"{self.clearance.cspec.margin:.3f}" if self.clearance is not None else ""),
