@@ -154,6 +154,10 @@ class SessionConfig:
     #: controller (`map_controller.MAPPlanTracker`, `POLICY_MAP`), "mpc" -- the iLQR tracker the picks were
     #: trained with, "auto" -- whatever the checkpoint records it was fitted to.
     plan_follower: str = "map"
+    #: The venue's speed knob (2026-10-20, the user: the floor's friction is set here, the controller answers
+    #: with a speed-profile scale): every driver's plan / profile speeds x this before its follower
+    #: (`EnvConfig.plan_speed_scale`, `PlannerEgoDriver.speed_scale`).
+    plan_speed_scale: float = 1.0
     #: Plan-controller arm installed at run time (`learn.grip_runtime`).
     #:
     #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs

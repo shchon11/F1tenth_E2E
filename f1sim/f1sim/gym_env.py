@@ -551,6 +551,12 @@ class EnvConfig:
     #: `map_controller.MAPParams` fields for "map", over `map_controller.POLICY_MAP` (the paper's
     #: formulation; delay_comp -1 compensates each car's calibrated delay, the one the iLQR is given).
     plan_follower_map: Optional[Dict[str, Any]] = None
+    #: The venue's speed knob (2026-10-20, the user: the floor's friction is the console's to set and the
+    #: controller's to answer with a speed-profile scale, like race_stack's per-track speed scaling): the
+    #: speeds of the policy's plans are multiplied by this before any follower (iLQR or MAP) sees them. The
+    #: policy's own action -- its history, its log-prob -- is untouched; only what is tracked is slower.
+    #: Same grip fraction on a floor of k x the friction at about sqrt(k). 'linear' plans only.
+    plan_speed_scale: float = 1.0
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -2871,7 +2877,8 @@ class F1VecEnv:
                 self.tracker.map_rows = self.learner
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
                     self.tracker.push_imu(lr.imu[:, :, 3])
-            raw = self.tracker(a, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
+            a_trk = a if self.ecfg.plan_speed_scale == 1.0 else self._scale_plan_speeds(a)
+            raw = self.tracker(a_trk, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
             self._capture_plan(self.sim.state)
@@ -4295,6 +4302,18 @@ class F1VecEnv:
     def _tracker_plan_speed(self) -> torch.Tensor:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""
         return self.last_result.odom[:, 3] if self.last_result is not None else self.sim.state[:, 3]
+
+    def _scale_plan_speeds(self, a: torch.Tensor) -> torch.Tensor:
+        """The plans the follower tracks, the learner's speeds x `EnvConfig.plan_speed_scale` (the
+        venue's speed knob); the traffic's rows and every path dimension are left as they are."""
+        from .mpc import _LAYOUTS
+        if self.ecfg.speed_mode != "linear":
+            raise ValueError(f"plan_speed_scale is wired for 'linear' plans; this env runs {self.ecfg.speed_mode!r}")
+        sl = _LAYOUTS["linear"].speed
+        out = a.clone()
+        scaled = ((a[:, sl] + 1.0) * float(self.ecfg.plan_speed_scale) - 1.0).clamp(-1.0, 1.0)
+        out[:, sl] = torch.where(self.learner[:, None], scaled, a[:, sl])
+        return out
 
     def set_grip_budget(self, mu: Optional[torch.Tensor]) -> None:
         """(B,) friction each car is allowed to use from now on, or None for no budget. The trainer

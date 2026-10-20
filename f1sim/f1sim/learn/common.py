@@ -624,6 +624,9 @@ class PlannerEgoDriver:
         #: pure pursuit (what every planner baseline drove on before 2026-10-19)
         self.ref = ref if ref is not None else teacher
         self.tracker = tracker
+        #: the venue's speed knob (`EnvConfig.plan_speed_scale`, the same for every driver): the profile MAP
+        #: is handed, x this
+        self.speed_scale = 1.0
 
     def command_env(self, env, rows):
         import torch
@@ -684,7 +687,7 @@ class PlannerEgoDriver:
         path_xy = ref.xy[td[:, None], j] + d[..., None] * torch.stack([-tn[..., 1], tn[..., 0]], -1)
         gb = ref.grip_bin(P, B, dev)[rows]
         path_v = ref.speed_at(td[:, None].expand(-1, n), j, gb[:, None].expand(-1, n))
-        path_v = path_v * scale[rows].to(path_v.dtype)[:, None]
+        path_v = path_v * scale[rows].to(path_v.dtype)[:, None] * float(self.speed_scale)
         kappa = ref.kappa[td[:, None], j]
         t0, p0 = ref.tan[td, idx], ref.xy[td, idx]
         d_glob = t0[:, 0] * (s_r[:, 1] - p0[:, 1]) - t0[:, 1] * (s_r[:, 0] - p0[:, 0])  # frenet d, left +
@@ -806,7 +809,9 @@ def build_ego_driver(env, kind: str, weights: str = "", options: Optional[dict] 
             tracker = build_map_tracker(env, ref, sp.get("map", {}))
         elif sp.get("tracker") != "pp":
             raise ValueError(f"tracker must be 'map' or 'pp', not {sp.get('tracker')!r}")
-        return PlannerEgoDriver(planner, kind, stack, ref=ref, tracker=tracker)
+        drv = PlannerEgoDriver(planner, kind, stack, ref=ref, tracker=tracker)
+        drv.speed_scale = float(sp.get("speed_scale", 1.0))
+        return drv
     if kind in EGO_EXTERNAL_KINDS:
         from . import baselines
         opts = dict(options or {})

@@ -127,7 +127,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              research_profile: str | None = None, graph_runtime: bool = False,
              opponent_speed_mode: str | None = "auto", ego_stack: str = "oracle",
              ego_stack_params: dict | None = None, plan_follower: str | None = None,
-             plan_follower_map: dict | None = None) -> dict:
+             plan_follower_map: dict | None = None, plan_speed_scale: float = 1.0) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -328,6 +328,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      plan_follower=(plan_follower or _out.get("plan_follower", "mpc")) if mode == "plan" else "mpc",
                      plan_follower_map=(plan_follower_map if plan_follower_map is not None
                                         else _out.get("plan_follower_map")) if mode == "plan" else None,
+                     plan_speed_scale=float(plan_speed_scale) if mode == "plan" else 1.0,
                      plan_a_brake=float(metadata.get("plan_a_brake", limits.get("a_brake", 3.0))),
                      compile_tracker=not graph_runtime and bool(cfg.sim.compile),
                      race_size=race_size, opponent=opponent,
@@ -409,7 +410,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
             raise ValueError("--ego-stack modular takes the planner's own settings; teacher grip/recover/speed "
                              "knobs belong to the teacher path")
         ego_driver = common.build_ego_driver(env, teacher_kind, rls=ego_rls, limits=ego_limits, estimated=True,
-                                             stack_params=ego_stack_params)
+                                             stack_params=(dict(ego_stack_params or {}, speed_scale=float(plan_speed_scale))
+                                                           if plan_speed_scale != 1.0 else ego_stack_params))
         env.set_ego_driver(ego_driver)
         _zeros = torch.zeros(env.B, env.act_dim, device=env.device)
 
@@ -694,6 +696,9 @@ def main() -> None:
                     help="with --teacher: 'modular' runs the planner on its own particle-filter localisation "
                          "and LiDAR detection/tracking with the nominal actuator model (a baseline as on the "
                          "car); 'oracle' hands it the simulator's state (an upper bound, label it so)")
+    ap.add_argument("--plan-speed-scale", type=float, default=1.0, metavar="X",
+                    help="the venue's speed knob: plan / profile speeds x X before the follower (our policy's plans, a "
+                         "modular ego's profile)")
     ap.add_argument("--plan-follower", default=None, choices=["mpc", "map"],
                     help="who follows a plan policy's plan: the iLQR tracker or ForzaETH's MAP controller "
                          "(default: what the checkpoint was fitted to, else mpc)")
@@ -851,7 +856,7 @@ def main() -> None:
                                             if a.ego_teacher_limits else None),
                         ego_stack=a.ego_stack,
                         ego_stack_params=(json.loads(a.ego_stack_params) if a.ego_stack_params else None),
-                        plan_follower=a.plan_follower,
+                        plan_follower=a.plan_follower, plan_speed_scale=a.plan_speed_scale,
                         plan_follower_map=(json.loads(a.plan_follower_map) if a.plan_follower_map else None),
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,

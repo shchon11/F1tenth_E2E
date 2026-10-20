@@ -138,3 +138,22 @@ def test_the_cars_steering_table_is_the_simulators_nominal_one():
     nominal, wheel, dt = config_nominal()
     assert nominal == dict(env.sim.params.nominal)
     assert wheel == bool(env.sim.wheel_model) and dt == float(env.sim.dt)
+
+
+def test_the_speed_knob_slows_the_learners_plans_and_nothing_else():
+    """EnvConfig.plan_speed_scale: the learner's plan speeds x the factor before the follower; the path
+    dimensions and the traffic's rows are untouched (`F1VecEnv._scale_plan_speeds`)."""
+    from f1sim.mpc import _LAYOUTS
+    cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+    env = common.make_env([maps.load("real:korea_2025_iccas")], 2, "cpu",
+                          EnvConfig(max_steps=100, hist_len=0, action_mode="plan", compile_tracker=False,
+                                    plan_speed_scale=0.8), cfg=cfg, seed=1)
+    env.learner[1] = False
+    a = torch.tensor([[0.1, -0.2, 0.3, 0.0, 0.2, 0.6], [0.1, -0.2, 0.3, 0.0, 0.2, 0.6]])
+    a = torch.cat([a, torch.zeros(2, env.act_dim - a.shape[1])], 1) if env.act_dim > a.shape[1] else a[:, :env.act_dim]
+    out = env._scale_plan_speeds(a)
+    sl = _LAYOUTS["linear"].speed
+    assert torch.allclose((out[0, sl] + 1), 0.8 * (a[0, sl] + 1))           # speeds (decoded linearly) x 0.8
+    keep = [i for i in range(a.shape[1]) if i not in range(*sl.indices(a.shape[1]))]
+    assert torch.equal(out[0, keep], a[0, keep])                             # the path untouched
+    assert torch.equal(out[1], a[1])                                         # the traffic untouched

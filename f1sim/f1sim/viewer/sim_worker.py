@@ -1183,6 +1183,7 @@ class SimWorker:
             # (learn.common.plan_output_of): a profile-mode policy read as "linear" would have its
             # grip belief taken for a speed.
             **({k: v for k, v in _plan_out.items()} if mode == "plan" else {}),
+            **({"plan_speed_scale": float(getattr(cfg, "plan_speed_scale", 1.0) or 1.0)} if mode == "plan" else {}),
             **proc_kw)
         if "action_history" in spec:
             # `watch.main` does not pass this through, so a checkpoint trained with a different
@@ -1249,6 +1250,9 @@ class SimWorker:
                 if ego_kind in common.EGO_PLANNER_KINDS and lim:
                     ego_lim = common.teacher_limits(*[float(x) for x in lim])
                     ego_rls = [Raceline.build_cached(track, objective="min_time", **ego_lim)]
+                _sc = float(getattr(cfg, "plan_speed_scale", 1.0) or 1.0)
+                if ego_kind in common.EGO_PLANNER_KINDS and _sc != 1.0:
+                    stack_params = dict(stack_params or {}, speed_scale=_sc)      # the same knob as our policy's
                 drv = common.build_ego_driver(env, ego_kind, ego_w, ego_opts, rls=ego_rls, limits=ego_lim,
                                               stack_params=stack_params)
             except Exception as exc:

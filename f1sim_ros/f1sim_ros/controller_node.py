@@ -135,6 +135,9 @@ class ControllerNode(Node):
         # or ForzaETH's MAP for a policy trained with it), "mpc" / "map" to override it. MAP reads the
         # simulator's nominal steering table at `map_grip` x the nominal friction.
         d("plan_follower", "auto"); d("map_grip", 1.0)
+        # The venue's speed knob (2026-10-20): the plan's speeds x this before either follower -- the floor's
+        # friction answered at the controller, as race_stack scales its speed profile per track ('linear' plans).
+        d("plan_speed_scale", 1.0)
         d("traction", "off"); d("traction_params", "")
         d("sensor_timeout", 0.25); d("plan_timeout", 0.25); d("watchdog_period", 0.01)
         d("viz", False)
@@ -188,6 +191,9 @@ class ControllerNode(Node):
                                                floor_gate=bool(p("clearance_floor_gate")),
                                                gate_mode=str(p("clearance_floor_gate_mode")))
         self._install_follower(str(p("plan_follower")), float(p("map_grip")))
+        self.plan_speed_scale = float(p("plan_speed_scale"))
+        if not (0.2 <= self.plan_speed_scale <= 1.5):
+            raise ValueError(f"plan_speed_scale {self.plan_speed_scale}: expected a factor near 1 (0.2-1.5)")
         #: Whether the beam bearings the clearance grid is built from have been checked against a
         #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
         self._scan_geometry_checked = False
@@ -485,6 +491,13 @@ class ControllerNode(Node):
 
     def _track_and_publish(self, plan, snap: ScanSnapshot):
         a = torch.as_tensor(plan, dtype=torch.float32, device=self.device).reshape(1, -1)
+        sc = float(getattr(self, "plan_speed_scale", 1.0))
+        if sc != 1.0:
+            # the venue's speed knob, as EnvConfig.plan_speed_scale does in the simulator
+            from f1sim.mpc import _LAYOUTS
+            sl = _LAYOUTS["linear"].speed
+            a = a.clone()
+            a[:, sl] = ((a[:, sl] + 1.0) * sc - 1.0).clamp(-1.0, 1.0)
         if self.clearance is not None:
             # This scan, in the observation's own units, before the tracker is asked for anything.
             # The arm holds one frame and nothing else: no map, no pose, no memory across scans.
@@ -679,6 +692,7 @@ class ControllerNode(Node):
     def diag_values(self):
         """The controller's state as `(name, value)` strings. Also what `system_check` reports."""
         v = [("arm", self.controller_arm), ("plan_follower", getattr(self, "follower", "mpc")),
+             ("plan_speed_scale", f"{float(getattr(self, 'plan_speed_scale', 1.0)):.3f}"),
              ("mu", f"{float(self.grip.mu[0]):.5f}" if self.grip is not None else ""),
              ("clearance_margin_m",
               f"{self.clearance.cspec.margin:.3f}" if self.clearance is not None else ""),

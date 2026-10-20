@@ -82,6 +82,7 @@
     # (the arms shape the iLQR) and reads the simulator's nominal steering table at map_grip x mu.
     plan_follower: "auto"
     map_grip: 1.0
+    plan_speed_scale: 1.0       # the venue's speed knob: plan speeds x this (a floor of k x the grip ~ sqrt(k))
     device: "cpu"
     speed_cap: 4.0            # must equal the policy's
     steer_max: 0.4189
