@@ -696,6 +696,9 @@ def main() -> None:
                     help="with --teacher: 'modular' runs the planner on its own particle-filter localisation "
                          "and LiDAR detection/tracking with the nominal actuator model (a baseline as on the "
                          "car); 'oracle' hands it the simulator's state (an upper bound, label it so)")
+    ap.add_argument("--rand-range", action="append", default=[], metavar="GROUP.FIELD=LO,HI",
+                    help="override one randomised parameter's range (as ppo --rand-range), e.g. the representative floor "
+                         "vehicle.mu=1.0,1.0 (a scale field) and vehicle.mu_f_scale=0.92,0.92")
     ap.add_argument("--plan-speed-scale", type=float, default=1.0, metavar="X",
                     help="the venue's speed knob: plan / profile speeds x X before the follower (our policy's plans, a "
                          "modular ego's profile)")
@@ -877,6 +880,14 @@ def main() -> None:
     nominal = Config()
     if a.eager:
         nominal.sim.compile = False
+    for spec_ in a.rand_range:
+        # one randomised parameter's range, as ppo --rand-range takes it: the evaluation's floor (2026-10-20: the
+        # representative floor is `vehicle.mu=1.0,1.0` -- mu is a scale field -- and `vehicle.mu_f_scale=0.92,0.92`)
+        key_, _, rng_ = spec_.partition("=")
+        if key_ not in nominal.rand.ranges:
+            raise SystemExit(f"--rand-range: unknown parameter {key_}")
+        lo_, hi_ = (float(x) for x in rng_.split(","))
+        nominal.rand.ranges[key_] = (lo_, hi_)
     res = {t: run([t], nominal) for t in tracks} if a.per_track else {"nominal": run(tracks, nominal)}
     if a.sweep:
         for name, grp, key, vals in (("mu", "vehicle", "mu", [0.7, 0.85, 1.05]),
