@@ -620,6 +620,7 @@ class MAPPlanTracker:
         # stopped, asking to stay stopped, and touching something: back out, as the tracker does
         stalled = (v_meas.abs() < sp.reverse_v_gate) & (speed < sp.reverse_cmd_gate) & self._inner.contact
         speed = torch.where(stalled, torch.full_like(speed, -sp.v_reverse), speed)
+        steer, speed = self._inner.unwedge(steer, speed, v_meas, advance=False)   # the inner moved the clocks
         mine = torch.stack([steer, speed], 1)
         self.last_map = self.map.last
         return torch.where(self.map_rows[:, None], mine, out)

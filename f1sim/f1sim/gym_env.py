@@ -1191,6 +1191,7 @@ class F1VecEnv:
                 pspec = _dc.replace(pspec, **_kw)
             self.tracker = PlanTracker(self.B, self.device, self.cfg.vehicle.lf + self.cfg.vehicle.lr, self.cfg.vehicle.s_max,
                                        e.v_max_policy, spec=pspec, compile_solver=e.compile_tracker)
+            self.tracker.control_dt = float(self.sim.control_dt)
             self._calibrate_tracker(torch.arange(self.B, device=self.device))
             if e.plan_follower == "map":
                 from .map_controller import POLICY_MAP, MAPParams, MAPPlanTracker, nominal_lut

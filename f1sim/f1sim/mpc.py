@@ -214,6 +214,14 @@ class PlanSpec:
     v_reverse: float = 0.8         # [m/s] how fast backing out goes
     reverse_v_gate: float = 0.4    # [m/s] only from near standstill -- you cannot reverse at pace
     reverse_cmd_gate: float = 0.15 # [m/s] a commanded speed under this is "stop", i.e. the request
+    # Wedged: touching something below `reverse_v_gate` for `wedge_s`, whatever the plan asks. The gate
+    # above needs the policy to ask to stop, and it does not: nose-first against a hose in the console
+    # (2026-10-21) the ICCAS pick asked for 0.9-1.9 m/s through the 6 s measured, the gate never fired,
+    # and the car pushed the hose until the episode ended. Then the tracker backs out for `backout_s` at
+    # `v_reverse`, the steering mirrored so that reversing turns the nose the way the plan points.
+    # 0 turns it off. Nothing sets `PlanTracker.contact` on the car, so it never fires there.
+    wedge_s: float = 1.0           # [s] wedged this long -> back out
+    backout_s: float = 0.75        # [s] how long backing out lasts
     v_cmd_lead: float = 0.15       # [s] the first speed target refers to this far ahead
     N: int = 12                    # MPC steps
     dt: float = 0.05               # [s] MPC step
@@ -1105,6 +1113,11 @@ class PlanTracker:
         #: soft collision; left False, `reverse_cmd_gate` can never fire and the tracker is the one
         #: it has always been.
         self.contact = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: [s] one call per control step (`unwedge` counts in these). `F1VecEnv` sets the simulator's.
+        self.control_dt = 0.025
+        #: (B,) seconds each car has been wedged (touching, near standstill) and seconds of backing out left.
+        self.wedged_t = torch.zeros(num_envs, device=self.device)
+        self.backout_t = torch.zeros(num_envs, device=self.device)
         #: Per-row plan format (output-format design 6): None -- every row's plan is read in
         #: `spec.speed_mode`, as by every tracker before 2026-10-14 -- or (B,) uint8 codes into
         #: `ROW_FORMATS` (`set_row_formats`), each row read in its own format by one solve. A race in
@@ -1151,8 +1164,34 @@ class PlanTracker:
 
     def reset(self, ids: torch.Tensor):
         self.u_prev[ids] = 0.0; self.u_seq[ids] = 0.0
+        self.wedged_t[ids] = 0.0; self.backout_t[ids] = 0.0
         if self._reset_hook is not None:
             self._reset_hook(ids)
+
+    def unwedge(self, steer: torch.Tensor, v_cmd: torch.Tensor, v_meas: torch.Tensor, advance: bool = True):
+        """(steer, speed command) with a wedged car backing out (`PlanSpec.wedge_s`). `advance` moves the
+        clocks on by one control step; the MAP follower applies the verdict its inner tracker reached
+        this step with advance=False. The clocks read only contact and speed, never the plan.
+
+        While touching, a step below `reverse_v_gate` adds dt and one above takes dt off; losing the
+        contact clears it. A reset on every fast step never reached `wedge_s`: the odometry of a car
+        pushing a hose read 0.28 m/s median but above 0.4 on 6 % of the steps (wheel slip and noise)."""
+        sp = self.spec
+        if sp.wedge_s <= 0:
+            return steer, v_cmd
+        if advance:
+            dt = float(self.control_dt)
+            touching = self.contact & (self.backout_t <= 0)
+            step = torch.where(v_meas.abs() < sp.reverse_v_gate, torch.full_like(self.wedged_t, dt),
+                               torch.full_like(self.wedged_t, -dt))
+            self.wedged_t.copy_(torch.where(touching, (self.wedged_t + step).clamp_min(0.0),
+                                            torch.zeros_like(self.wedged_t)))
+            start = self.wedged_t >= sp.wedge_s - 1e-6
+            self.backout_t.copy_(torch.where(start, torch.full_like(self.backout_t, sp.backout_s),
+                                             (self.backout_t - dt).clamp_min(0.0)))
+            self.wedged_t.masked_fill_(start, 0.0)
+        on = self.backout_t > 1e-6
+        return torch.where(on, -steer, steer), torch.where(on, torch.full_like(v_cmd, -sp.v_reverse), v_cmd)
 
     @torch.no_grad()
     def __call__(self, action: torch.Tensor, v_meas: torch.Tensor, speed_cap: torch.Tensor,
@@ -1199,4 +1238,5 @@ class PlanTracker:
         stalled = ((v_meas.abs() < sp.reverse_v_gate) & (v_cmd < sp.reverse_cmd_gate)
                    & self.contact)
         v_cmd = torch.where(stalled, torch.full_like(v_cmd, -sp.v_reverse), v_cmd)
-        return torch.stack([u[:, 0, 0], v_cmd], 1)
+        steer, v_cmd = self.unwedge(u[:, 0, 0], v_cmd, v_meas)
+        return torch.stack([steer, v_cmd], 1)
