@@ -261,6 +261,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                 "max_grad": float(a.max_grad), "critic_warmup": int(a.critic_warmup)},
                   "value_norm_beta": float(a.value_norm_beta), "dial": {"margin": float(a.dial_margin),
                                                                         "exact": float(a.dial_exact)},
+                  # held dial: the key `evaluate` falls back to, as v1 records it
+                  **({"dial_constant": float(a.dial_constant)} if getattr(a, "dial_constant", None) is not None else {}),
                   # the LAST weights are the run's result, never ones picked by a loss (the perception
                   # gate: the risk head overfit at ~2.7 epochs while the perception heads kept improving)
                   "checkpoint_rule": "last",
@@ -342,7 +344,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                   "onset": name.strip() == "car",
                                   **({"anneal": {"frac": float(a.lagrange_anneal), "every": int(a.lagrange_anneal_every)}}
                                      if a.lagrange_anneal > 0 else {})}
-    dial = cond_mod.DialDraw(env, a.dial_margin, a.dial_exact)
+    # The dial: drawn per episode, or held at one number for every car and episode (`--dial-constant`) -- then the
+    # grip budget is the floor's own friction, as `ppo.main` does for v1 (30793bf, 7d63f92). Until 2026-10-22 v2 drew
+    # the dial whatever --dial-constant said.
+    held = getattr(a, "dial_constant", None)
+    dial = (cond_mod.ConstantDial(env, held) if held is not None
+            else cond_mod.DialDraw(env, a.dial_margin, a.dial_exact))
     cspec = cond_mod.CondSpec.from_meta(model.meta["cond"])
     dial_new = torch.ones(env.B, dtype=torch.bool, device=device)
 
@@ -351,7 +358,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         dial.redraw(dial_new); dial_new.zero_()
         d = dial.value()
         if a.grip_budget_penalty > 0:
-            env.set_grip_budget(d)
+            env.set_grip_budget(env.sim.P["mu"].reshape(-1) if held is not None else d)
         return cond_mod.mu_to_c(d, cspec)
 
     env_chunk = max(1, a.minibatch // T)
@@ -374,6 +381,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 "speed_command": str(a.speed_command), "metrics": dict(last_log),
                 "opt": opt.state_dict(), "opt_param_names": opt_param_names,
                 "value_norm": vnorm.state_dict(), "aux_balance": balance.state_dict(),
+                # the follower the plans were fitted to (`mpc.contract_of`), as v1 records it: present only for MAP.
+                # Without it a v2 policy trained with MAP was evaluated on the iLQR (2026-10-22).
+                **({"plan_follower": "map", "plan_follower_map": dict(a.plan_follower_map or {})}
+                   if getattr(a, "plan_follower", None) == "map" else {}),
                 "experiment": {**experiment, "controller": controller.checkpoint_meta()}}
     ac = torch.autocast("cuda", dtype=torch.bfloat16, enabled=a.amp and device.type == "cuda")
     while steps_done < a.total:
