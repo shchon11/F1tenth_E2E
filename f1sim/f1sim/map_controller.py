@@ -568,14 +568,24 @@ class MAPPlanTracker:
         """(path (B, n, 2), speed (B, n), curvature (B, n)) of each plan, body frame, 0.1 m apart."""
         from . import mpc
         sp = self._inner.spec
-        if sp.speed_mode == "linear":
-            k, Lp, v0, v1 = mpc.decode(action, v_meas, self._inner.v_max, speed_cap, sp)
-            prof = None
-        elif sp.speed_mode != "wp4":
-            k, Lp, prof = mpc.decode_profile(action, v_meas, self._inner.v_max, speed_cap, sp)
+        if sp.speed_mode == "wp4":
+            # The iLQR's own wp4 path (`mpc.wp4_reference`), laid out as waypoints: its grid out to
+            # wp_extend * L, kappa_4 held past s_4. The speed is the waypoint speeds, linear in v^2 between
+            # them, held at v_1 over [0, s_1]. The iLQR's profile starts at the measured speed and its
+            # reference walk accelerates from there; MAP commands the speed of the point it stands on, so
+            # a profile starting at the measured speed kept a standing car at 0 (the console, 10-21).
+            # v_1 is the plan's own first speed, as v0 is a linear plan's. Both grids are uniform in arc
+            # length, as the profile lookup below assumes.
+            k, Lp, v_k = mpc.decode_wp4(action, v_meas, self._inner.v_max, speed_cap, sp)
+            x, y, psi, s, kap = mpc.wp4_path(k, Lp, sp)
+            prof = mpc.wp4_profile(v_k[:, 0], v_k, Lp, sp)
         else:
-            raise ValueError("MAP follows the linear and profile plan formats; 'wp4' is not wired")
-        x, y, psi, s, kap = mpc.path_points(k, Lp, 49, return_kappa=True)
+            if sp.speed_mode == "linear":
+                k, Lp, v0, v1 = mpc.decode(action, v_meas, self._inner.v_max, speed_cap, sp)
+                prof = None
+            else:
+                k, Lp, prof = mpc.decode_profile(action, v_meas, self._inner.v_max, speed_cap, sp)
+            x, y, psi, s, kap = mpc.path_points(k, Lp, 49, return_kappa=True)
         n = int(math.ceil((float(sp.len_max) + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
         sg = (torch.arange(n, device=k.device, dtype=k.dtype) * PLAN_WP_SPACING)[None].expand(k.shape[0], n)
         S = s[:, -1:].clamp_min(1e-3)
