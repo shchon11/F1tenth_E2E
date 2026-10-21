@@ -1138,6 +1138,13 @@ class SimWorker:
         from ..learn.common import plan_output_of
         _plan_out = plan_output_of(extra)
         _pf = str(getattr(cfg, "plan_follower", "auto") or "auto")
+        if _pf == "map" and mode == "plan" and str(_plan_out.get("speed_mode", "linear")) == "wp4":
+            # MAP reads the linear and profile plans only (`MAPPlanTracker.waypoints`), and "MAP" is the
+            # console's default: a v2 (wp4) checkpoint keeps the follower it was trained with and the
+            # session says so, as it does for the controller arm above.
+            self.say(P.MSG_LOG, gen=gen, text="v2 정책(WP4 plan)은 MAP 이 따라갈 수 없는 계획 형식이라 "
+                                              "학습 때의 추종기(MPC)로 주행합니다")
+            _pf = "auto"
         if _pf in ("mpc", "map") and mode == "plan":
             # the console's choice over the checkpoint's own (`SessionConfig.plan_follower`)
             _plan_out = dict(_plan_out, plan_follower=_pf)
