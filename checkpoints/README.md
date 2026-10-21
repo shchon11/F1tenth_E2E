@@ -262,3 +262,29 @@ On 2 seeds, `iccas_bootcamp_safe` drove Korea 2026 at 3.44 m/s with 1.63 / 0.42 
 The map-specific training made the car 0.86 s a lap faster and 13 % faster in races. Hard hits rose from 1.0 to 1.6 per
 km, mostly with cars; that is the same level as the ICCAS picks above (1.6-2.1). The pick is nearly the fastest of the
 four and has the fewest hard hits of the trained ones.
+
+## Representative-floor picks (added 2026-10-21)
+
+The user's direction of 2026-10-20: train on one representative floor (friction x1.0 = 1.0489, rear 0.92), with no
+friction randomisation. The venue's floor is answered by a speed knob on the plans (`plan_speed_scale`), not by the
+policy. ForzaETH's MAP follows the plans in the car's controller node and in the console. Optimizer state dropped
+(`extra.opt`); actor, critic, `meta` and `extra` (the contract: MAP follower and its 20 settings, dial held at 1.0489)
+are kept.
+
+| file | what it is | sha256 (first 16) |
+| --- | --- | --- |
+| `korea26_rep_s2001_u256.pt` | `k26rep_s2001` update 256: Korea 2026 retrained on the representative floor with MAP in the loop, from `korea26_fixphys_s1201_u384` | `1853f2bf44a96546` |
+| `icra2022_map3R2_s1321_u384.pt` | `map3R2_s1321` update 384: the ICRA 2022 pick (solo stage then race stage on ICRA) | `2c349e21e49e90d0` |
+
+**Round-6b finals** (representative floor for every car; fresh seeds: race 91-92 x 4 planners, race of 2, props; solo 128
+trials). "Hard" = impact >= 1.5 m/s, walls+props+cars.
+
+| map | policy (MAP follows) | solo lap (done /128) | race speed | hard /km |
+| --- | --- | ---: | ---: | ---: |
+| Korea 2026 | `korea26_rep_s2001_u256` | 9.32 s (128) | 4.40 m/s | 1.92 |
+| Korea 2026 | `korea26_fixphys_s1201_u384` (iLQR) | 9.68 s (127) | 4.14 m/s | 1.54 |
+| ICCAS | `iccas_fixphys_s1102_u384` | 7.73 s (128) | 4.53 m/s | 2.15 |
+| ICRA 2022 | `icra2022_map3R2_s1321_u384` | 14.61 s (127) | 3.61 m/s | 2.88 |
+
+The same retraining did not win on ICCAS or ICRA. On the selection seeds, the retrained checkpoints were slower solo
+(+0.29 s and +0.18 s) and in races, with fewer hard hits, so the earlier picks stay there.
