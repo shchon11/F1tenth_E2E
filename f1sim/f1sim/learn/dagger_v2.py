@@ -194,12 +194,23 @@ def resolve_ego_actions(a) -> bool:
 def explicit_flags(ap: argparse.ArgumentParser, argv=None) -> set:
     """The dests the command line set explicitly. argparse cannot tell "given, equal to the default"
     from "not given", and a v2 default must only replace the latter: parsed once more into a
-    namespace pre-filled with a sentinel, argparse leaves every unset dest at the sentinel."""
+    namespace pre-filled with a sentinel, argparse leaves every unset dest at the sentinel.
+
+    An append-type option (`--rand-range`) copies what the dest holds and appends to the copy, so its
+    sentinel is an empty list of its own: a bare `object()` there crashed every v2 run given such an
+    option ("'object' object has no attribute 'append'", 2026-10-21). Given, the dest holds a new list."""
     import sys
-    sentinel = object()
-    ns = argparse.Namespace(**{x.dest: sentinel for x in ap._actions if x.dest != argparse.SUPPRESS})
+
+    class _Unset(list):
+        pass
+
+    plain = object()
+    sentinels = {x.dest: (_Unset() if isinstance(x, (argparse._AppendAction, argparse._AppendConstAction,
+                                                      argparse._ExtendAction)) else plain)
+                 for x in ap._actions if x.dest != argparse.SUPPRESS}
+    ns = argparse.Namespace(**sentinels)
     ap.parse_args(sys.argv[1:] if argv is None else argv, namespace=ns)
-    return {k for k, v in vars(ns).items() if v is not sentinel}
+    return {k for k, v in vars(ns).items() if v is not sentinels[k]}
 
 
 def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
