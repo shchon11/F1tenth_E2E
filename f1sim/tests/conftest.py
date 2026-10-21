@@ -37,6 +37,27 @@ def _console_prefs_sandbox(tmp_path, monkeypatch):
     monkeypatch.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path / "console_prefs.json"))
 
 
+# The per-test sandbox above is set up after, and torn down before, every module- and session-scoped
+# fixture -- so a window shared by a module (`live` in test_sim_worker_console_integration) restored the
+# user's real file when it was built and wrote the tests' settings back into it when it closed. On
+# 2026-10-21 that left "충돌해도 계속 주행" off in the user's console (every wall contact a reset) and a
+# pytest tmp dir as its recording folder. An autouse fixture is set up before the other fixtures of its
+# scope and torn down after them, so one per scope covers a window of that scope from build to close.
+# Per module rather than one for the session, for the reason the per-test docstring gives.
+@pytest.fixture(scope="session", autouse=True)
+def _console_prefs_sandbox_session(tmp_path_factory):
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path_factory.mktemp("console_prefs") / "session.json"))
+        yield
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _console_prefs_sandbox_module(tmp_path_factory):
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path_factory.mktemp("console_prefs") / "module.json"))
+        yield
+
+
 def pytest_configure(config):
     """Register the shared markers, then keep headless viewer contexts off EGL.
 
