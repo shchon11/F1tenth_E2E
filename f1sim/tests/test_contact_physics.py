@@ -244,13 +244,14 @@ def test_a_crate_hit_while_scraping_a_hose_is_its_own_onset():
 def _contact_accel(monkeypatch, hold: bool, v: float = 4.0, steps: int = 40):
     """A square duct hit at `v`. Per substep, the acceleration the springs and the accelerometer were given
     minus the tyres' own -- what the contact added -- and per resolution the velocity change it made."""
-    import f1sim.dynamics as dyn_mod
-    import f1sim.imu as imu_mod
     cfg = _cfg()
     cfg.sim.contact_accel_hold = hold
     sim = Simulator(_floor(), cfg, num_envs=1, device="cpu")
     tyre, added, dv = [], [], []
-    real_dyn, real_imu, real_res = dyn_mod.step_dynamics, imu_mod.substep, Simulator._resolve_wall_contact
+    # The simulator binds its two leaves when it is built (`Simulator._step_dynamics` / `_imu_substep`,
+    # compiled or not), so the spies go on the instance: on the modules they were never called, and the
+    # check below compared the impact with an empty sum.
+    real_dyn, real_imu, real_res = sim._step_dynamics, sim._imu_substep, Simulator._resolve_wall_contact
 
     def spy_dyn(*a, **kw):
         out = real_dyn(*a, **kw)
@@ -266,8 +267,8 @@ def _contact_accel(monkeypatch, hold: bool, v: float = 4.0, steps: int = 40):
         dv.append(float(out[0][0, 3] - state[0, 3]))
         return out
 
-    monkeypatch.setattr(dyn_mod, "step_dynamics", spy_dyn)
-    monkeypatch.setattr(imu_mod, "substep", spy_imu)
+    monkeypatch.setattr(sim, "_step_dynamics", spy_dyn)
+    monkeypatch.setattr(sim, "_imu_substep", spy_imu)
     monkeypatch.setattr(Simulator, "_resolve_wall_contact", spy_res)
     sim.reset(torch.arange(1), torch.tensor([[10.0, 0.9, -math.pi / 2]]), torch.tensor([v]))
     imu = []
