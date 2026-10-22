@@ -131,6 +131,7 @@ def test_a_v2_dagger_run_learns_from_the_policy_teacher(tmp_path, monkeypatch):
                                           "--tracks", TRACK, "--iters", "1", "--steps", "40", "--epochs", "1",
                                           "--batch", "64", "--device", "cpu", "--eager", "--wandb", "disabled",
                                           "--wp4-label", "policy", "--label-policy", V1, "--label-policy-dial", "1.0489",
+                                          "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92",
                                           "--eval-steps", "20",
                                           "--teacher-eval-steps", "0", "--speed-cap", "8", "--aux-b8", "0",
                                           "--log-every", "1"])

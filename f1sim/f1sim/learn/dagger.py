@@ -804,6 +804,8 @@ def main():
     ap.add_argument("--v2-init-stem", default=None, metavar="CKPT",
                     help="v2: seed a fresh student's two stems from this v1 resnet checkpoint "
                          "(model_v2.init_stems_from_v1, as G1 / G4 did)")
+    ap.add_argument("--rand-range", action="append", default=[], metavar="GROUP.FIELD=LO,HI",
+                    help="override one physics randomisation range, as learn.ppo's (repeatable)")
     ap.add_argument("--label-policy", default=None, metavar="CKPT",
                     help="v2 with --wp4-label policy: the trained v1 checkpoint whose plans (its own observation, "
                          "recurrent state and held dial) refitted to wp4 are the labels (learn.policy_teacher)")
@@ -925,6 +927,17 @@ def main():
         cfg.sim.compile = False
     if a.legacy_contacts:
         legacy_contacts(cfg)
+    # one physics range by name, as `learn.ppo` takes it: the representative floor is
+    # --rand-range vehicle.mu=1.0,1.0 --rand-range vehicle.mu_f_scale=0.92,0.92 (2026-10-22)
+    for spec_ in a.rand_range:
+        key_, _, val_ = spec_.partition("=")
+        lo_, hi_ = (float(x) for x in val_.split(","))
+        grp_, _, fld_ = key_.partition(".")
+        if not hasattr(getattr(cfg, grp_, None), fld_):
+            raise SystemExit(f"--rand-range: unknown parameter {key_}")
+        cfg.rand.ranges[key_] = (lo_, hi_)
+    if a.rand_range:
+        print(f"physics randomisation: extra {list(a.rand_range)}", flush=True)
     env = common.make_env(tracks, a.envs, device,
                           EnvConfig(speed_cap=a.speed_cap, action_mode=a.action_mode, hist_len=a.hist_len,
                       speed_mode=a.speed_mode, speed_command=a.speed_command,
