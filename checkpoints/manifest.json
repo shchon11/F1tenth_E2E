@@ -124,5 +124,19 @@
    "extra.opt"
   ],
   "source_mb": 32.5
+ },
+ {
+  "file": "korea26_v2_distill_s2362_it7.pt",
+  "run": "v2PT_s2362",
+  "update": "it7",
+  "sha256": "e570209f326f2759fdbdca0649cbdf227fc23905960794fb74406128fd9ee5a2",
+  "size_mb": 9.3,
+  "dropped": [],
+  "source_mb": 9.3,
+  "added": [
+   "plan_follower",
+   "plan_follower_map",
+   "dial_constant"
+  ]
  }
 ]

@@ -106,6 +106,15 @@ def _ego_follow(env, teacher, an: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def held_dial_of(extra: Optional[dict]) -> Optional[float]:
+    """The dial a checkpoint was trained with held (`ppo --dial-constant`), or None. `ppo` records it in
+    `extra["experiment"]`; until 2026-10-22 this read the top level only and so never found it -- harmless
+    on the representative floor (the dial then equals the floor) and wrong on any other one."""
+    extra = extra or {}
+    v = extra.get("dial_constant", (extra.get("experiment") or {}).get("dial_constant"))
+    return None if v is None else float(v)
+
+
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
@@ -456,7 +465,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         # 0 is "set exactly right" (the reference), negative is the safe side an operator would err on.
         # A held dial (`dial_value`, or the checkpoint's own `dial_constant`): one number for every car, no friction
         # information in it -- what a car has when nobody tells it the floor (2026-10-20).
-        _dc = dial_value if dial_value is not None else (metadata or {}).get("dial_constant")
+        _dc = dial_value if dial_value is not None else held_dial_of(metadata)
         dial = ((lambda: torch.full((env.B,), float(_dc), device=env.device)) if _dc is not None else
                 (None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))))
         # A dial student is scored with its dial set `dial_offset` away from the floor's true
@@ -464,7 +473,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
         # would err on.
         # A held dial (`dial_value`, or the checkpoint's own `dial_constant`): one number for every car, no friction
         # information in it -- what a car has when nobody tells it the floor (2026-10-20).
-        _dc = dial_value if dial_value is not None else (metadata or {}).get("dial_constant")
+        _dc = dial_value if dial_value is not None else held_dial_of(metadata)
         dial = ((lambda: torch.full((env.B,), float(_dc), device=env.device)) if _dc is not None else
                 (None if not dial_offset else (lambda: env.sim.P["mu"].reshape(-1) + float(dial_offset))))
         policy = common.student_policy(model, env, device, dial=dial)

@@ -19,3 +19,11 @@ def test_the_constant_dial_ignores_the_floor_and_the_episode():
     dd = DialDraw(env, 0.0, 1.0)
     dd.redraw(torch.ones(4, dtype=torch.bool))
     assert torch.allclose(dd.value(), env.sim.P["mu"].clamp_min(dd.floor))
+
+
+def test_evaluate_finds_the_held_dial_where_ppo_records_it():
+    """`ppo --dial-constant` writes it into extra["experiment"]; evaluate's fallback read the top level only."""
+    from f1sim.learn.evaluate import held_dial_of
+    assert held_dial_of({"experiment": {"dial_constant": 1.0489}}) == 1.0489
+    assert held_dial_of({"dial_constant": 0.9}) == 0.9
+    assert held_dial_of({"experiment": {}}) is None and held_dial_of(None) is None

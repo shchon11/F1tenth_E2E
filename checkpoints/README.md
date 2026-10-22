@@ -288,3 +288,27 @@ trials). "Hard" = impact >= 1.5 m/s, walls+props+cars.
 
 The same retraining did not win on ICCAS or ICRA. On the selection seeds, the retrained checkpoints were slower solo
 (+0.29 s and +0.18 s) and in races, with fewer hard hits, so the earlier picks stay there.
+
+## Korea 2026 entry: the v2 network (added 2026-10-23)
+
+`korea26_v2_distill_s2362_it7.pt` is the first entry in the output format the user asked for on 2026-10-13: a
+trajectory of four waypoints, each with its own speed (wp4). It replaces `korea26_rep_s2001_u256` as the Korea pick.
+
+How it was made:
+- The v2 network reached v1 solo pace on Korea (S stage) but raced by following: 3.4 m/s and 0.5-1.3 passes/km, against
+  the v1 pick's 4.5 m/s and 2.5-3.2.
+- PPO variants made it safe or fast, never both.
+- The v1 Korea pick taught it by DAgger (`--wp4-label policy`, `learn/policy_teacher.py`): 6 iterations
+  (v2PT_s2361), then 8 more (v2PT_s2362).
+- Recorded in `extra`: the follower it was selected with (MAP, the Korea round-5 controller) and the held dial (1.0489).
+  DAgger itself does not record them.
+
+**Finals** (fresh seeds: race 91-92 x 4 planners, race of 2, props; solo 128 trials; representative floor; MAP follows):
+
+| policy | solo lap (done /128) | race speed | hard /km | passes /km |
+| --- | ---: | ---: | ---: | ---: |
+| `korea26_v2_distill_s2362_it7` | 9.28 s (128) | 4.51 m/s | 2.68 | 2.94 |
+| `korea26_rep_s2001_u256` (the previous pick) | 9.32 s (128) | 4.43 m/s | 2.35 | 3.17 |
+
+The replacement rule was fixed before the run: solo within +0.05 s, done within -1, race speed at least v1's, hard hits at
+most 1.15x v1's. It passes on every term. The hard-hit term is the tightest: 2.68 against a limit of 2.70.
