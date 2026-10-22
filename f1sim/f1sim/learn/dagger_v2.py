@@ -96,7 +96,7 @@ from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, BC_CONSTANTS, A
                        linear_spec_of, linear_to_wp4, loss_grads, select_tracks, steps_since_window_start)
 
 #: Where a v2 run's teacher labels come from (see the module docstring).
-WP4_LABEL_SOURCES = ("env", "linear-refit")
+WP4_LABEL_SOURCES = ("env", "linear-refit", "policy")
 
 #: The v2 defaults of flags v1 also has, applied when the command line does not set them: the
 #: redesign's burn-in 40 + chunk 80 (G1), and the plan / dial contract every v2 actor is built for.
@@ -238,6 +238,8 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
         raise SystemExit("--mirror-prob is a probability")
     if a.init and a.v2_init_stem:
         raise SystemExit("--init resumes a v2 student; --v2-init-stem seeds a fresh one from a v1 stem -- one or the other")
+    if a.wp4_label == "policy" and not getattr(a, "label_policy", ""):
+        raise SystemExit("--wp4-label policy refits a trained v1 policy's plans: name it with --label-policy CKPT")
     if a.wp4_label == "linear-refit" and a.teacher_kind != "raceline":
         raise SystemExit("--wp4-label linear-refit refits the RACELINE teacher's linear plan; the "
                          f"{a.teacher_kind} teacher's search would be silently dropped")
@@ -319,6 +321,11 @@ class Wp4Labels:
         if self.spec.speed_mode != "wp4":
             raise ValueError(f"a v2 run's env tracks 'wp4' plans; this one tracks {self.spec.speed_mode!r}")
         self.lin = linear_spec_of(self.spec)
+        if source == "policy":
+            from .policy_teacher import PolicyTeacher
+            if not isinstance(teacher, PolicyTeacher):
+                raise ValueError(f"--wp4-label policy reads a learn.policy_teacher.PolicyTeacher; got {type(teacher).__name__}")
+            self.base = teacher
         if source == "linear-refit":
             from ..teacher import RacelineTeacher
             if not isinstance(teacher, RacelineTeacher):
@@ -352,6 +359,19 @@ class Wp4Labels:
             valid = getattr(self.teacher, "last_label_valid", None)
             if valid is not None and valid.shape[0] != lab.shape[0]:
                 valid = None                    # a teacher that does not state validity per labelled row
+        elif self.source == "policy":
+            # a trained v1 policy's plan of this step (its own observation, recurrent state and held dial: `mu` is
+            # not its business), refitted as the raceline's is below, under the same curvature bound
+            v = env._tracker_plan_speed()
+            a_lin = self.base.act()
+            vp, P = env.cfg.vehicle, env.sim.P
+            wb = P.get("lf", vp.lf) + P.get("lr", vp.lr)
+            s_max = torch.as_tensor(P.get("s_max", vp.s_max), device=v.device, dtype=v.dtype).expand_as(v)
+            k_lim = 0.85 * torch.minimum(torch.full_like(v, self.spec.kappa_max), torch.tan(s_max) / wb)
+            lab = linear_to_wp4(a_lin.to(v.dtype), v, self.base.lin, self.spec, env.ecfg.v_max_policy, k_lim=k_lim)
+            if rows is not None:
+                lab = lab[rows]
+            valid = None
         else:
             P = env.sim.P if mu is None else {**env.sim.P, "mu": mu.to(env.sim.P["mu"].dtype)}
             v = env._tracker_plan_speed()
@@ -749,6 +769,11 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                   f"critic {len(rep['critic'])} tensors", flush=True)
     cspec = cond_mod.CondSpec.from_meta(model.meta["cond"])
     dial = cond_mod.DialDraw(env, a.dial_margin, a.dial_exact)
+    if a.wp4_label == "policy":
+        from .policy_teacher import PolicyTeacher
+        teacher = PolicyTeacher(env, a.label_policy, device, dial=getattr(a, "label_policy_dial", None))
+        teacher_desc = teacher.describe()
+        print(f"labels: {teacher_desc}", flush=True)
     labeler = Wp4Labels(env, teacher, a.wp4_label)
     mirror = Mirror(spec) if a.mirror_prob > 0 else None
     dropout = ActionDropout(spec, a.action_dropout) if float(a.action_dropout) > 0 else None

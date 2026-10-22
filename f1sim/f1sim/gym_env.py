@@ -1933,8 +1933,11 @@ class F1VecEnv:
     def _seat_builders(self) -> tuple:
         """The pool's per-seat observation builders (`learn.seat_obs`): one per observation contract an
         entry reads that is not this env's own. Empty -- every v1 pool in a v1 env, every path before
-        2026-10-14 -- and then no hook below does anything."""
-        return getattr(self.pool, "seat_builders", ()) if self.pool is not None else ()
+        2026-10-14 -- and then no hook below does anything. Plus `extra_seat_builders`: builders a
+        consumer other than the pool attached (`learn.policy_teacher`, a v1 DAgger teacher's own view)."""
+        pool = getattr(self.pool, "seat_builders", ()) if self.pool is not None else ()
+        extra = getattr(self, "extra_seat_builders", ())
+        return tuple(pool) + tuple(extra) if extra else pool
 
     def _set_entry_formats(self, formats: list) -> None:
         """Read each league entry's rows in the entry's own plan format (output-format design 6).

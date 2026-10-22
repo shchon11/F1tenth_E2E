@@ -804,7 +804,12 @@ def main():
     ap.add_argument("--v2-init-stem", default=None, metavar="CKPT",
                     help="v2: seed a fresh student's two stems from this v1 resnet checkpoint "
                          "(model_v2.init_stems_from_v1, as G1 / G4 did)")
-    ap.add_argument("--wp4-label", choices=("env", "linear-refit"), default=None,
+    ap.add_argument("--label-policy", default=None, metavar="CKPT",
+                    help="v2 with --wp4-label policy: the trained v1 checkpoint whose plans (its own observation, "
+                         "recurrent state and held dial) refitted to wp4 are the labels (learn.policy_teacher)")
+    ap.add_argument("--label-policy-dial", type=float, default=None, metavar="MU",
+                    help="the dial the label policy is held at (default: the dial_constant it records)")
+    ap.add_argument("--wp4-label", choices=("env", "linear-refit", "policy"), default=None,
                     help="v2: where the WP4 labels come from. 'env' (default): the env's teacher-label API, "
                          "where feat/v2's wp4 teachers plug in. 'linear-refit': the raceline teacher's linear "
                          "plan, first window refitted to the four waypoints -- a stand-in for tests and smoke "
@@ -849,7 +854,7 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
                               "aux_balance_every", "aux_balance_rho", "aux_balance_beta", "opponent_speed_mode",
-                              "v2_ego_actions", "action_dropout", "updates")
+                              "v2_ego_actions", "action_dropout", "updates", "label_policy", "label_policy_dial")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
