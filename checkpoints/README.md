@@ -312,3 +312,13 @@ How it was made:
 
 The replacement rule was fixed before the run: solo within +0.05 s, done within -1, race speed at least v1's, hard hits at
 most 1.15x v1's. It passes on every term. The hard-hit term is the tightest: 2.68 against a limit of 2.70.
+
+### Correction (2026-10-23, later the same night): the Korea entry is `korea26_rep_s2001_u256` again
+
+The distilled v2 policy uses the wp4 format but not its freedom. Over 13,184 executed plans (Korea solo, MAP), its four
+waypoint speeds sit 0.002 m/s (mean) off a straight line through the first and last, and 0 % of them dip in the middle.
+That is v1's two-endpoint linear profile, which it was taught to copy (the labels are v1 plans refitted to wp4). The v2
+policies trained by PPO alone use the freedom: 0.64-0.74 m/s off the line, 44-50 % with a dip in the middle. 256 PPO
+updates of the v1 R recipe after the distillation moved it to 0.027 m/s. A copy of v1 in v2's format gains nothing over
+v1, and v1 hits less hard (2.35 vs 2.68 /km), so v1 is the entry again. The v2 file stays archived as the start of PPO runs
+that may leave the linear profile.
