@@ -1,0 +1,92 @@
+{
+ "forzaeth_pred": {
+  "on": {
+   "km": 23.1,
+   "race": 3.01,
+   "hard_car": 0.52,
+   "hard_wallprop": 1.99,
+   "all_car": 17.2,
+   "passes": 0.39
+  },
+  "off": {
+   "km": 26.6,
+   "race": 3.46,
+   "hard_car": 0.0,
+   "hard_wallprop": 0.08,
+   "all_car": 0.2,
+   "passes": 0.05
+  }
+ },
+ "forzaeth": {
+  "on": {
+   "km": 22.5,
+   "race": 2.93,
+   "hard_car": 0.71,
+   "hard_wallprop": 4.13,
+   "all_car": 7.6,
+   "passes": 0.34
+  },
+  "off": {
+   "km": 27.1,
+   "race": 3.53,
+   "hard_car": 0.04,
+   "hard_wallprop": 0.33,
+   "all_car": 1.0,
+   "passes": 0.08
+  }
+ },
+ "raceline": {
+  "on": {
+   "km": 19.3,
+   "race": 2.51,
+   "hard_car": 3.94,
+   "hard_wallprop": 4.19,
+   "all_car": 10.2,
+   "passes": 0.12
+  },
+  "off": {
+   "km": 26.5,
+   "race": 3.45,
+   "hard_car": 0.0,
+   "hard_wallprop": 0.26,
+   "all_car": 0.6,
+   "passes": 0.08
+  }
+ },
+ "lane_switch": {
+  "on": {
+   "km": 15.7,
+   "race": 2.04,
+   "hard_car": 2.55,
+   "hard_wallprop": 0.26,
+   "all_car": 6.5,
+   "passes": 0.09
+  },
+  "off": {
+   "km": 17.8,
+   "race": 2.32,
+   "hard_car": 0.0,
+   "hard_wallprop": 0.0,
+   "all_car": 0.1,
+   "passes": 0.0
+  }
+ },
+ "ftg": {
+  "on": {
+   "km": 21.7,
+   "race": 2.82,
+   "hard_car": 0.28,
+   "hard_wallprop": 0.51,
+   "all_car": 2.1,
+   "passes": 0.53
+  },
+  "off": {
+   "km": 22.0,
+   "race": 2.86,
+   "hard_car": 0.18,
+   "hard_wallprop": 0.32,
+   "all_car": 3.0,
+   "passes": 0.01
+  }
+ }
+}

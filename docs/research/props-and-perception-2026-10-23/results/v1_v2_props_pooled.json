@@ -1,0 +1,30 @@
+{
+ "v2_on": {
+  "km": 70.4,
+  "hard_car": 1.05,
+  "hard_wallprop": 1.32,
+  "total": 2.37,
+  "se_total": 0.18
+ },
+ "v2_off": {
+  "km": 71.5,
+  "hard_car": 1.09,
+  "hard_wallprop": 0.5,
+  "total": 1.59,
+  "se_total": 0.15
+ },
+ "v1_on": {
+  "km": 68.2,
+  "hard_car": 1.31,
+  "hard_wallprop": 0.87,
+  "total": 2.17,
+  "se_total": 0.18
+ },
+ "v1_off": {
+  "km": 69.1,
+  "hard_car": 1.23,
+  "hard_wallprop": 0.39,
+  "total": 1.62,
+  "se_total": 0.15
+ }
+}
