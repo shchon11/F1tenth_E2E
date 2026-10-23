@@ -1,0 +1,59 @@
+{
+ "ckpt": "/home/shchon11/F1tenth_E2E/checkpoints/korea26_v2_ppo_s2421_u512.pt",
+ "trials": 388,
+ "opp_toward_m": {
+  "cut": 0.3118,
+  "keep": 0.1786,
+  "diff": 0.1332,
+  "ci95": [
+   0.0624,
+   0.2036
+  ],
+  "n_cut": 215,
+  "n_keep": 173
+ },
+ "slowing_mps": {
+  "cut": 0.8094,
+  "keep": 0.7788,
+  "diff": 0.0306,
+  "ci95": [
+   -0.0893,
+   0.1495
+  ],
+  "n_cut": 215,
+  "n_keep": 173
+ },
+ "me_away_m": {
+  "cut": -0.1708,
+  "keep": -0.1895,
+  "diff": 0.0187,
+  "ci95": [
+   -0.0689,
+   0.1099
+  ],
+  "n_cut": 215,
+  "n_keep": 173
+ },
+ "contact_rate": {
+  "cut": 0.0651,
+  "keep": 0.0636,
+  "diff": 0.0015,
+  "ci95": [
+   -0.0495,
+   0.0513
+  ],
+  "n_cut": 215,
+  "n_keep": 173
+ },
+ "hard_contact_rate": {
+  "cut": 0.0047,
+  "keep": 0.0,
+  "diff": 0.0047,
+  "ci95": [
+   0.0,
+   0.014
+  ],
+  "n_cut": 215,
+  "n_keep": 173
+ }
+}

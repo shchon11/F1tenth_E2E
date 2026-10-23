@@ -1,0 +1,122 @@
+[
+ {
+  "tag": "control",
+  "u": 128,
+  "cells": 16,
+  "km": 70.8,
+  "hard_car": 1.06,
+  "se": 0.12,
+  "all_car": 9.3,
+  "hard_wallprop": 1.0,
+  "race": 4.6,
+  "passes": 0.95
+ },
+ {
+  "tag": "control",
+  "u": 256,
+  "cells": 16,
+  "km": 71.5,
+  "hard_car": 1.3,
+  "se": 0.13,
+  "all_car": 9.6,
+  "hard_wallprop": 1.22,
+  "race": 4.65,
+  "passes": 0.94
+ },
+ {
+  "tag": "no league",
+  "u": 128,
+  "cells": 16,
+  "km": 70.2,
+  "hard_car": 1.11,
+  "se": 0.13,
+  "all_car": 10.1,
+  "hard_wallprop": 1.13,
+  "race": 4.57,
+  "passes": 0.84
+ },
+ {
+  "tag": "no league",
+  "u": 256,
+  "cells": 16,
+  "km": 71.2,
+  "hard_car": 1.38,
+  "se": 0.14,
+  "all_car": 10.0,
+  "hard_wallprop": 1.84,
+  "race": 4.63,
+  "passes": 0.85
+ },
+ {
+  "tag": "car price 300",
+  "u": 128,
+  "cells": 16,
+  "km": 71.0,
+  "hard_car": 1.38,
+  "se": 0.14,
+  "all_car": 9.7,
+  "hard_wallprop": 1.23,
+  "race": 4.62,
+  "passes": 0.84
+ },
+ {
+  "tag": "car price 300",
+  "u": 256,
+  "cells": 16,
+  "km": 72.2,
+  "hard_car": 1.44,
+  "se": 0.14,
+  "all_car": 9.1,
+  "hard_wallprop": 1.34,
+  "race": 4.69,
+  "passes": 1.01
+ },
+ {
+  "tag": "control (81-82)",
+  "u": 128,
+  "cells": 8,
+  "km": 35.3,
+  "hard_car": 1.05,
+  "se": 0.17,
+  "all_car": 8.3,
+  "hard_wallprop": 0.99,
+  "race": 4.59,
+  "passes": 0.9
+ },
+ {
+  "tag": "control (81-82)",
+  "u": 256,
+  "cells": 8,
+  "km": 35.7,
+  "hard_car": 1.23,
+  "se": 0.19,
+  "all_car": 9.3,
+  "hard_wallprop": 1.12,
+  "race": 4.65,
+  "passes": 0.88
+ },
+ {
+  "tag": "SEV 0.75 (81-82)",
+  "u": 128,
+  "cells": 8,
+  "km": 35.4,
+  "hard_car": 0.99,
+  "se": 0.17,
+  "all_car": 9.4,
+  "hard_wallprop": 1.07,
+  "race": 4.6,
+  "passes": 0.85
+ },
+ {
+  "tag": "SEV 0.75 (81-82)",
+  "u": 256,
+  "cells": 8,
+  "km": 35.5,
+  "hard_car": 1.21,
+  "se": 0.18,
+  "all_car": 9.7,
+  "hard_wallprop": 0.79,
+  "race": 4.62,
+  "passes": 0.83
+ }
+]
