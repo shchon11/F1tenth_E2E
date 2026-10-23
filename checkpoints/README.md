@@ -322,3 +322,32 @@ policies trained by PPO alone use the freedom: 0.64-0.74 m/s off the line, 44-50
 updates of the v1 R recipe after the distillation moved it to 0.027 m/s. A copy of v1 in v2's format gains nothing over
 v1, and v1 hits less hard (2.35 vs 2.68 /km), so v1 is the entry again. The v2 file stays archived as the start of PPO runs
 that may leave the linear profile.
+
+## Korea 2026 entry (2026-10-23 morning): `korea26_v2_ppo_s2421_u512`, a v2 policy trained past the copy
+
+The distilled v2 above was used only as a start (DAgger = init). PPO followed, with the S stage's update granularity
+(horizon 32, minibatch 1024, lr 2e-5 -> 1e-5), MAP in the loop, the representative floor and the dial held. The lagrange
+multipliers were held at 80: at 40 or adaptive, hard hits stayed at 3.0-3.9 /km. 512 updates, run `v2PH_s2421`. Optimizer
+state dropped; extra records MAP + its 20 settings and the dial 1.0489 (trained so).
+
+| policy (MAP) | solo lap (done /128) | race speed | hard /km | waypoint speeds off a line / dips |
+| --- | ---: | ---: | ---: | ---: |
+| `korea26_v2_ppo_s2421_u512` | 9.01 s (128) | 4.59 m/s | 2.32 | 0.143 m/s / 0 % |
+| `korea26_rep_s2001_u256` (v1, the previous entry) | 9.32 s (128) | 4.43 m/s | 2.35 | linear by format |
+| `korea26_v2_distill_s2362_it7` (the start) | 9.28 s (128) | 4.51 m/s | 2.68 | 0.002 m/s / 0 % |
+
+Finals: fresh seeds, the representative floor. The replacement rule fixed beforehand passes on every term: solo -0.31 s,
+race +3.6 %, hard hits equal, all 128 done.
+
+The profile is curved, not a copy of v1's line, but no plan brakes and accelerates again inside it. PPO runs that did use
+dips (lambda adaptive: 39 % of plans) hit 25-36 % harder and were seed-unstable.
+
+On slipperier floors, without the venue's speed knob, it keeps its speed where v1 slows:
+
+| floor | v2 entry | v1 |
+| --- | --- | --- |
+| x0.85 | 9.28 s (128), 4.50 m/s, 2.66 hard /km | 9.54 s (128), 4.28 m/s, 2.01 |
+| x0.75 | 9.57 s (127), 4.41 m/s, 3.60 | 9.80 s (128), 4.17 m/s, 2.68 |
+
+At a slippery venue, set the knob (`plan_speed_scale`). Console path, Korea, 30 s: solo 5.34 m/s, race of 2 5.22 m/s,
+0 contact steps (v1: 5.02 / 4.57).

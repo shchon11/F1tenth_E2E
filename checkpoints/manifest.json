@@ -138,5 +138,16 @@
    "plan_follower_map",
    "dial_constant"
   ]
+ },
+ {
+  "file": "korea26_v2_ppo_s2421_u512.pt",
+  "run": "v2PH_s2421",
+  "update": 512,
+  "sha256": "23beda4d838598b943b4aec0610b3f524575d95f6f32f7658675f13b2a5d6c72",
+  "size_mb": 9.3,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 28.0
  }
 ]
