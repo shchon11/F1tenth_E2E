@@ -1,0 +1,59 @@
+{
+ "ckpt": "/home/shchon11/F1tenth_E2E/checkpoints/korea26_rep_s2001_u256.pt",
+ "trials": 382,
+ "opp_toward_m": {
+  "cut": 0.4131,
+  "keep": 0.1814,
+  "diff": 0.2317,
+  "ci95": [
+   0.1565,
+   0.3074
+  ],
+  "n_cut": 212,
+  "n_keep": 170
+ },
+ "slowing_mps": {
+  "cut": 0.8805,
+  "keep": 0.7166,
+  "diff": 0.1639,
+  "ci95": [
+   0.0116,
+   0.3032
+  ],
+  "n_cut": 212,
+  "n_keep": 170
+ },
+ "me_away_m": {
+  "cut": -0.1253,
+  "keep": -0.1901,
+  "diff": 0.0648,
+  "ci95": [
+   -0.0172,
+   0.1477
+  ],
+  "n_cut": 212,
+  "n_keep": 170
+ },
+ "contact_rate": {
+  "cut": 0.0613,
+  "keep": 0.0706,
+  "diff": -0.0093,
+  "ci95": [
+   -0.061,
+   0.039
+  ],
+  "n_cut": 212,
+  "n_keep": 170
+ },
+ "hard_contact_rate": {
+  "cut": 0.0236,
+  "keep": 0.0059,
+  "diff": 0.0177,
+  "ci95": [
+   -0.0047,
+   0.0425
+  ],
+  "n_cut": 212,
+  "n_keep": 170
+ }
+}

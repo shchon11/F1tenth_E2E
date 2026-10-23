@@ -116,6 +116,11 @@ _orig_sim_step = Simulator.step
 
 
 def env_step(self, action):
+    # only the evaluated env: a teacher that plans in a shadow env (the rollout teacher) steps F1VecEnv too
+    if "main" not in ST and int(self.B) == ENVS:            # the evaluated env has --envs rows; a shadow env more
+        ST["main"] = id(self)
+    if id(self) != ST["main"]:
+        return _orig_env_step(self, action)
     CUR.update(env=self, in_step=True)
     if self.sim.M > 1:
         pre_step(self)
@@ -129,7 +134,7 @@ def sim_step(self, *a, **kw):
     entry = self.steps.clone()
     r = _orig_sim_step(self, *a, **kw)
     env = CUR["env"]
-    if CUR["in_step"] and env is not None and env.sim is self and self.M > 1:
+    if CUR["in_step"] and env is not None and env.sim is self and self.M > 1 and id(env) == ST.get("main"):
         post_step(env, r, entry)
     return r
 
@@ -141,11 +146,15 @@ for seed in SEEDS:
     random.seed(1000 + seed)
     out = OUT.replace(".json", f"_s{seed}_eval.json")
     slot = {"kind": "raceline", "speed_scale": [0.6, 0.8], "events": ["shift"], "event_rate": 1e-6}   # ~never on its own: the test injects
-    sys.argv = ["evaluate", CK, "--action-mode", "plan", "--tracks", TRACK, "--envs", str(ENVS), "--steps", str(STEPS),
+    # CK "teacher:KIND" drives our car with a privileged teacher (evaluate --teacher --teacher-kind KIND): which existing
+    # driver reacts to a cut-in at all -- the candidate a reaction could be learnt from
+    who = (["--teacher", "--teacher-kind", CK.split(":", 1)[1]] if CK.startswith("teacher:") else [CK])
+    sys.argv = ["evaluate", *who, "--action-mode", "plan", "--tracks", TRACK, "--envs", str(ENVS), "--steps", str(STEPS),
                 "--budget-laps", "0", "--teacher-a-lat", "7.0", "--teacher-a-acc", "6.5", "--teacher-a-brake", "4.0",
                 "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",
                 "--seed", str(seed), "--graphs", "--collision-mode", "soft", "--spawn-runway", "3.0",
-                "--race-size", "2", "--opp-slots", json.dumps([slot]), "--output", out, "--dial-value", "1.0489",
+                "--race-size", "2", "--opp-slots", json.dumps([slot]), "--output", out,
+                *([] if CK.startswith("teacher:") else ["--dial-value", "1.0489"]),
                 "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92"]
     n0 = len(TRIALS)
     ev.main()

@@ -1,0 +1,59 @@
+{
+ "ckpt": "teacher:rollout",
+ "trials": 26,
+ "opp_toward_m": {
+  "cut": 0.5656,
+  "keep": 0.048,
+  "diff": 0.5177,
+  "ci95": [
+   0.2329,
+   0.8011
+  ],
+  "n_cut": 9,
+  "n_keep": 17
+ },
+ "slowing_mps": {
+  "cut": 0.984,
+  "keep": 1.3733,
+  "diff": -0.3893,
+  "ci95": [
+   -1.3469,
+   0.6383
+  ],
+  "n_cut": 9,
+  "n_keep": 17
+ },
+ "me_away_m": {
+  "cut": -0.0378,
+  "keep": -0.4792,
+  "diff": 0.4413,
+  "ci95": [
+   0.086,
+   0.8039
+  ],
+  "n_cut": 9,
+  "n_keep": 17
+ },
+ "contact_rate": {
+  "cut": 0.0,
+  "keep": 0.0,
+  "diff": 0.0,
+  "ci95": [
+   0.0,
+   0.0
+  ],
+  "n_cut": 9,
+  "n_keep": 17
+ },
+ "hard_contact_rate": {
+  "cut": 0.0,
+  "keep": 0.0,
+  "diff": 0.0,
+  "ci95": [
+   0.0,
+   0.0
+  ],
+  "n_cut": 9,
+  "n_keep": 17
+ }
+}
