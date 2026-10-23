@@ -69,6 +69,10 @@ mc.MAPPlanTracker.__call__ = orig
 S = {k: torch.cat(v).to(dev) for k, v in rec.items()}
 N = S["a"].shape[0]
 spec, V_MAX, lut, nominal, params = live["spec"], live["v_max"], live["lut"], live["nominal"], live["p"]
+# AUTH_MAP_OVERRIDE='{"speed_lookahead": 0.235}': the same states, the follower changed (what a design option would do)
+if os.environ.get("AUTH_MAP_OVERRIDE"):
+    import dataclasses
+    params = dataclasses.replace(params, **json.loads(os.environ["AUTH_MAP_OVERRIDE"]))
 
 
 def inner():
@@ -99,7 +103,7 @@ names = [f"kappa{i + 1}" for i in range(4)] + [f"v{i + 1}" for i in range(4)] if
     [f"dim{i}" for i in range(S["a"].shape[1])]
 bins = {"all": torch.ones(N, dtype=torch.bool, device=dev), "v<3": S["v"] < 3, "3-5": (S["v"] >= 3) & (S["v"] < 5),
         "v>=5": S["v"] >= 5}
-res = {"ckpt": CK, "states": N, "track": TRACK, "map_params": MAPJ, "h": H, "v_max": V_MAX, "speed_mode": spec.speed_mode,
+res = {"ckpt": CK, "states": N, "track": TRACK, "map_params": MAPJ, "h": H, "override": os.environ.get("AUTH_MAP_OVERRIDE"), "v_max": V_MAX, "speed_mode": spec.speed_mode,
        "l1_point_over_plan": {"mean": float(l1_frac.mean()), "p10": float(l1_frac.quantile(0.1)),
                               "p90": float(l1_frac.quantile(0.9)), "beyond_plan_share": float((l1_frac > 1.0).float().mean())},
        "speed_read_over_plan": {"mean": float(speed_frac.mean()), "p90": float(speed_frac.quantile(0.9))},
