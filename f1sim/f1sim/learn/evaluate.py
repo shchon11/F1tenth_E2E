@@ -26,6 +26,7 @@ from ..opponent_events import describe as describe_events, parse_events, split_e
 from ..params import Config, legacy_contacts
 from . import common
 from . import grip_runtime
+from .conditioning import held_dial_of  # noqa: F401 -- read here (the held dial), imported from here by tools
 from .evaluation_metrics import TrialAccumulator
 from .model import load_checkpoint
 
@@ -106,15 +107,6 @@ def _ego_follow(env, teacher, an: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def held_dial_of(extra: Optional[dict]) -> Optional[float]:
-    """The dial a checkpoint was trained with held (`ppo --dial-constant`), or None. `ppo` records it in
-    `extra["experiment"]`; until 2026-10-22 this read the top level only and so never found it -- harmless
-    on the representative floor (the dial then equals the floor) and wrong on any other one."""
-    extra = extra or {}
-    v = extra.get("dial_constant", (extra.get("experiment") or {}).get("dial_constant"))
-    return None if v is None else float(v)
-
-
 def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,

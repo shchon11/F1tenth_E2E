@@ -194,6 +194,22 @@ def policy_condition(model, dial, device):
     return mu_to_c(torch.tensor([dial], dtype=torch.float32), spec).to(device)
 
 
+def node_dial(override: str, configured: float, extra) -> tuple:
+    """(dial, where it came from) for the policy node: the launch's `dial:=` when given; else the dial the
+    checkpoint was trained with held (`conditioning.held_dial_of`: every Korea entry since 2026-10-21), the
+    only value that network ever saw on that input and the one it was scored at; else graph.yaml's `dial`,
+    for a checkpoint trained on drawn dials. Until 2026-10-23 graph.yaml's 0.73423 reached every checkpoint,
+    a held-dial one included."""
+    from f1sim.learn.conditioning import held_dial_of
+    override = str(override).strip()
+    if override:
+        return float(override), "launch dial:="
+    held = held_dial_of(extra)
+    if held is not None:
+        return held, "the checkpoint (trained with it held)"
+    return float(configured), "graph.yaml"
+
+
 # ------------------------------------------------------------------ the observation contract
 def observation_builder(model, extra: dict, device):
     """(spec, builder, contract version) the node builds this checkpoint's observation with.

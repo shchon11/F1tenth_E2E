@@ -27,3 +27,11 @@ def test_evaluate_finds_the_held_dial_where_ppo_records_it():
     assert held_dial_of({"experiment": {"dial_constant": 1.0489}}) == 1.0489
     assert held_dial_of({"dial_constant": 0.9}) == 0.9
     assert held_dial_of({"experiment": {}}) is None and held_dial_of(None) is None
+
+
+def test_evaluate_runs_without_autograd():
+    """2b10b8e put held_dial_of between `@torch.no_grad()` and `def evaluate`, so the decorator wrapped the
+    helper and evaluate ran with autograd on (a recurrent policy's graph then spans the whole trial)."""
+    from f1sim.learn import evaluate as ev
+    assert hasattr(ev.evaluate, "__wrapped__")                 # torch.no_grad's wrapper
+    assert not hasattr(ev.held_dial_of, "__wrapped__")

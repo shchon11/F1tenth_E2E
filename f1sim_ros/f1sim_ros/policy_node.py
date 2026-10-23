@@ -40,6 +40,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Empty as EmptyMsg
 
+from f1sim.learn.conditioning import held_dial_of
 from f1sim.learn.memory import describe as describe_memory, runtime_for
 from f1sim.learn.model import load_checkpoint
 # The node's observation is built in `deploy.observation_builder` (v1 `ObsBuilder` or v2
@@ -49,7 +50,7 @@ from f1sim_interfaces.msg import Perception, Plan, PolicyState
 
 from f1sim_ros.deploy import (CONTROL_RATE, G, IMU_BUF_MAX, LIDAR_FOV, LIDAR_MOUNT_X, SensorIntake,
                               attitude_from_orientation, covariance0, header_seconds,
-                              observation_builder, policy_condition, quat_to_rp, resample_ranges)
+                              node_dial, observation_builder, policy_condition, quat_to_rp, resample_ranges)
 
 try:
     from vesc_msgs.msg import VescImuStamped
@@ -149,8 +150,6 @@ class PolicyNode(Node):
         self.declare_parameter("dial_override", "", ParameterDescriptor(
             read_only=True, dynamic_typing=True, description="launch `dial:=`; overrides `dial` when not empty"))
         p = lambda n: self.get_parameter(n).value
-        dial_arg = str(p("dial_override")).strip()
-        self.dial = float(dial_arg) if dial_arg else float(p("dial"))
         self.device = torch.device(p("device"))
         # No `allow_oracle` and no parameter to set one. A checkpoint trained with privileged
         # opponent tokens (`f1sim.opp_token`) reads the simulator's exact description of the other
@@ -169,6 +168,14 @@ class PolicyNode(Node):
         self.spec, self.obs, version = observation_builder(self.model, extra, self.device)
         self.v2 = version == 2
         self.checkpoint_id = checkpoint_id(ckpt)
+        # The dial: the launch's, else the one the checkpoint was trained with held, else graph.yaml's
+        self.dial, self.dial_source = node_dial(p("dial_override"), p("dial"), extra)
+        held = held_dial_of(extra)
+        if held is not None and abs(self.dial - held) > 1e-9:
+            self.get_logger().warning(
+                f"grip dial {self.dial} from {self.dial_source}: this checkpoint was trained with the dial held at "
+                f"{held} and never saw another value on that input. The venue's speed knob is the controller's "
+                f"plan_speed_scale.")
         self.cond = policy_condition(self.model, self.dial, self.device)
         #: The policy's episode state: the recurrent hidden state and the decayed scan-occupancy
         #: channel, for this one car. Empty (and `stateful` False) for a feedforward checkpoint, so
@@ -251,7 +258,7 @@ class PolicyNode(Node):
                 f"load this same checkpoint (and run controller:=legacy) to track them")
         self.get_logger().info(
             f"policy {self.checkpoint_id} on {self.device}, speed cap {self.speed_cap} m/s, "
-            + (f"grip dial mu={self.dial:.4f}, "
+            + (f"grip dial mu={self.dial:.4f} ({self.dial_source}), "
                if (self.model.meta.get("cond") or {}).get("source") == "dial" else "")
             + (f"direct action: publishing {p('drive_topic')} and bypassing the controller"
                if self.direct else

@@ -34,6 +34,10 @@
     # past the trained 0.30 -- slower than the policy can go, not unsafe.
     # SET THIS PER VENUE: once the track's mu is measured, use it (dial-offset 0), or a little under --
     # here, or with the launch argument `dial:=<mu>`, which is laid over this file when given.
+    # A checkpoint trained with the dial HELD at one value (`ppo --dial-constant`, recorded in its extra:
+    # every Korea entry since 2026-10-21, 1.0489) is told that value and this line is not used -- no other
+    # value ever reached that input in training. `dial:=` still overrides it, with a warning; the venue's
+    # speed knob for such a policy is the controller's `plan_speed_scale`.
     # Read-only once the node is up (`ros2 param set` is refused): change it by restarting the node.
     dial: 0.73423
     dial_override: ""        # filled by the launch argument `dial:=<mu>`; leave empty here

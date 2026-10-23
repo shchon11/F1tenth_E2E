@@ -264,3 +264,39 @@ def test_the_running_node_refuses_a_live_dial_change(tmp_path):
     finally:
         if rclpy.ok():
             rclpy.shutdown()
+
+
+def test_a_held_dial_checkpoint_is_told_its_own_dial():
+    """`deploy.node_dial`: the launch's `dial:=`, else the dial the checkpoint was trained with held, else
+    graph.yaml's. Until 2026-10-23 graph.yaml's 0.73423 reached the Korea entries, trained at 1.0489 only."""
+    deploy = _deploy()
+    held = {"spec": {}, "experiment": {"dial_constant": 1.0489}}
+    assert deploy.node_dial("", 0.73423, held) == (1.0489, "the checkpoint (trained with it held)")
+    assert deploy.node_dial("", 0.73423, {"dial_constant": 1.0489})[0] == 1.0489          # an archived copy
+    assert deploy.node_dial(" 0.9 ", 0.73423, held) == (0.9, "launch dial:=")
+    assert deploy.node_dial("", 0.73423, {"spec": {}}) == (0.73423, "graph.yaml")         # drawn dials
+
+
+def test_the_node_tells_a_held_dial_checkpoint_its_dial_over_graph_yaml(tmp_path):
+    rclpy = pytest.importorskip("rclpy")
+    _deploy()
+    from f1sim_ros.policy_node import PolicyNode
+    from f1sim.learn.obs import ObsSpec
+    spec = ObsSpec()
+    cs = C.spec_for("dial")
+    m = ActorCritic(n_stack=spec.scan_stack, n_beams=spec.n_beams, proprio_dim=spec.proprio_dim,
+                    priv_dim=9, act_dim=spec.act_dim, cond_dim=cs.dim, cond=cs.to_meta())
+    path = str(tmp_path / "held_dial_node.pt")
+    save_checkpoint(path, m, {"spec": {}, "experiment": {"dial_constant": 1.0489}})
+    for args, want in ((["-p", "dial:=0.73423"], 1.0489), (["-p", "dial:=0.73423", "-p", "dial_override:=0.9"], 0.9)):
+        if rclpy.ok():
+            rclpy.shutdown()
+        rclpy.init(args=["--ros-args", "-p", f"checkpoint:={path}", "-p", "device:=cpu", *args])
+        try:
+            node = PolicyNode()
+            assert node.dial == pytest.approx(want)
+            assert torch.allclose(node.cond, C.mu_to_c(torch.tensor([want]), cs))
+            node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()

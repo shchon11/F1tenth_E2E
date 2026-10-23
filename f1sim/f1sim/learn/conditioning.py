@@ -182,6 +182,15 @@ class ConstantDial:
         return torch.full((self.env.B,), self.const, device=self.env.device)
 
 
+def held_dial_of(extra: Optional[dict]) -> Optional[float]:
+    """The dial a checkpoint was trained with held (`ppo --dial-constant`, a `ConstantDial`), or None. `ppo`
+    records it in `extra["experiment"]`, an archived copy may carry it at the top level. Any other dial is an
+    input value that network never saw: the evaluator and the car's policy node both tell it this one."""
+    extra = extra or {}
+    v = extra.get("dial_constant", (extra.get("experiment") or {}).get("dial_constant"))
+    return None if v is None else float(v)
+
+
 # ---------------------------------------------------------------- critic input adapter
 #: Where the nearest-opponent block sits in `env.privileged()`: after the 8 dynamic-state values
 #: (`gym_env.privileged` / `_priv`, and `gym_env.priv_mu_index` is `8 + (4 if M > 1 else 0)`).
