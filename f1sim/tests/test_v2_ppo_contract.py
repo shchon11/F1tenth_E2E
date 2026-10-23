@@ -63,3 +63,11 @@ def test_a_v2_run_holds_its_dial_and_records_its_follower(tmp_path, monkeypatch)
         assert ex["experiment"]["dial_constant"] == pytest.approx(1.0489)
     finally:
         torch.set_num_threads(threads)
+
+
+def test_a_constraint_can_start_at_its_own_multiplier():
+    """`--lagrange car=1.0@300`: the car constraint starts at 300 while the wall one keeps --lagrange-init (2026-10-23)."""
+    from f1sim.learn.ppo import parse_lagrange
+    assert parse_lagrange("wall=1.0,car=1.0@300", 80.0) == {"wall": (1.0, 80.0), "car": (1.0, 300.0)}
+    assert parse_lagrange(" wall=0.5 , car=2 ", 8.0) == {"wall": (0.5, 8.0), "car": (2.0, 8.0)}
+    assert parse_lagrange("", 8.0) == {}

@@ -285,6 +285,18 @@ def severity_rates(onsets: torch.Tensor, progress_m: torch.Tensor, mask: torch.T
     return {log_key: (c / km if km > 1e-3 else float("nan")) for (_, log_key), c in zip(SEVERITY_LOG, tot)}
 
 
+def parse_lagrange(spec: str, lam0: float) -> dict:
+    """`--lagrange` -> {name: (target per km, starting multiplier)}. Each item is NAME=PER_KM, or NAME=PER_KM@LAMBDA0
+    to start that constraint's multiplier somewhere other than `--lagrange-init` (2026-10-23: the car constraint priced
+    on its own while the wall one stays where it was)."""
+    out = {}
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        name, rest = item.split("=")
+        target, _, lam = rest.partition("@")
+        out[name.strip()] = (float(target), float(lam) if lam.strip() else float(lam0))
+    return out
+
+
 def lagrange_step(rew: torch.Tensor, components: torch.Tensor, progress_m: torch.Tensor, mask: torch.Tensor,
                   specs: dict, lr: float, lam_max: float) -> torch.Tensor:
     """`--lagrange`: one dual-ascent step per constraint, then the reward with each fixed contact penalty
@@ -885,7 +897,8 @@ def main():
                          "Each gets a multiplier updated by dual ascent after every rollout, lambda += lr * (rate - "
                          "target), and the step reward carries -lambda per contact in place of the fixed penalty. "
                          "Needs that component's own weight nonzero (--collision-penalty / --car-contact-penalty) so "
-                         "the onset is visible; the weight itself is removed from the reward.")
+                         "the onset is visible; the weight itself is removed from the reward. NAME=PER_KM@LAMBDA0 starts "
+                         "that constraint's multiplier at LAMBDA0 instead of --lagrange-init.")
     ap.add_argument("--lagrange-lr", type=float, default=2.0, help="dual step per (contact/km) of violation")
     ap.add_argument("--lagrange-init", type=float, default=8.0)
     ap.add_argument("--lagrange-max", type=float, default=200.0)
@@ -1694,9 +1707,8 @@ def main():
         **({"adaptation": a.adaptation, "original_reference": reference_id,
             "kl_scope": a.kl_scope, "research_estimator": bool(a.research_estimator)} if adaptive else {}),
         "reward": reward_meta,
-        "lagrange": ({x.split("=")[0].strip(): {"target": float(x.split("=")[1]), "lambda_init": float(a.lagrange_init),
-                                                "lr": float(a.lagrange_lr)}
-                      for x in a.lagrange.split(",") if x.strip()} if a.lagrange else None),
+        "lagrange": ({n: {"target": t, "lambda_init": l0, "lr": float(a.lagrange_lr)}
+                      for n, (t, l0) in parse_lagrange(a.lagrange, a.lagrange_init).items()} if a.lagrange else None),
         "stage": "stage1_current_mu_utility", "arm": a.cond, "cond": cond_spec.to_meta(),
         "critic_priv_adapter": priv_adapter, "env_priv_dim": int(priv_dim),
         "critic_priv_dim": int(critic_priv_dim), "priv_mu_index": int(env.priv_mu_index),
@@ -1918,17 +1930,16 @@ def main():
     # --lagrange: constraint name -> the reward component whose onsets it counts, that component's own weight
     # (to turn it back into a count), the target per km and the multiplier
     lagrange = {}
-    for item in filter(None, (x.strip() for x in a.lagrange.split(","))):
-        name, target = item.split("=")
+    for name, (target, lam0) in parse_lagrange(a.lagrange, a.lagrange_init).items():
         key, weight = {"wall": ("collision", abs(env.ecfg.reward_collision)),
-                       "car": ("car_contact", abs(env.ecfg.reward_car_contact))}[name.strip()]
+                       "car": ("car_contact", abs(env.ecfg.reward_car_contact))}[name]
         if weight <= 0:
             raise SystemExit(f"--lagrange {name}: its component '{key}' has weight 0, so its onsets are invisible; "
                              f"give it a nonzero penalty (it is removed from the reward and replaced by the multiplier)")
         # car contacts are charged every step in contact; the constraint counts onsets, the evaluation's unit
-        lagrange[name.strip()] = {"index": REWARD_COMPONENT_KEYS.index(key), "weight": weight,
-                                  "target": float(target), "lam": float(a.lagrange_init), "rate": float("nan"),
-                                  "onset": name.strip() == "car",
+        lagrange[name] = {"index": REWARD_COMPONENT_KEYS.index(key), "weight": weight,
+                                  "target": target, "lam": lam0, "rate": float("nan"),
+                                  "onset": name == "car",
                                   **({"anneal": {"frac": float(a.lagrange_anneal), "every": int(a.lagrange_anneal_every)}}
                                      if a.lagrange_anneal > 0 else {})}
     if lagrange:

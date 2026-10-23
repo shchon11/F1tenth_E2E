@@ -163,7 +163,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
           league_seats=()):
     """The PPO loop for `--arch v2`, from the env `ppo.main` built and reset. `league_seats`: the pool
     entries `--league-slots` named, which the learner's own snapshots take over in turn."""
-    from .ppo import lagrange_step, severity_onsets, severity_rates, SEVERITY_LOG
+    from .ppo import lagrange_step, parse_lagrange, severity_onsets, severity_rates, SEVERITY_LOG
     spec = common.obs_spec(env)
     if not isinstance(spec, ObsSpecV2):
         raise SystemExit("--arch v2 needs the env built with obs_version 2")
@@ -247,8 +247,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     experiment = {"arch": ARCH, "kl_reference": "leg_start_actor_recurrent (monitor only, kl_coef 0)",
                   "reward": reward_meta, "init": a.init, "seed": int(a.seed), "speed_mode": "wp4",
                   "speed_command": str(a.speed_command), "v2_defaults": applied,
-                  "lagrange": ({x.split("=")[0].strip(): {"target": float(x.split("=")[1])}
-                                for x in a.lagrange.split(",") if x.strip()} if a.lagrange else None),
+                  "lagrange": ({n: {"target": t, "lambda_init": l0}
+                                for n, (t, l0) in parse_lagrange(a.lagrange, a.lagrange_init).items()} if a.lagrange else None),
                   "losses": {"vf": float(a.vf), "vf_clip": float(a.vf_clip), "contact_bce": coefs["contact"],
                              "contact_horizon_steps": CONTACT_HORIZON, "aux_b8": coefs["b8"],
                              "aux_near_car": coefs["near"], "ent": float(a.ent),
@@ -333,15 +333,14 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     since = torch.zeros(env.B, dtype=torch.long, device=device)          # steps since each row's episode began
     charge_prev = torch.zeros(env.B, dtype=torch.bool, device=device)
     lagrange = {}
-    for item in filter(None, (x.strip() for x in a.lagrange.split(","))):
-        name, target = item.split("=")
+    for name, (target, lam0) in parse_lagrange(a.lagrange, a.lagrange_init).items():
         key, weight = {"wall": ("collision", abs(env.ecfg.reward_collision)),
-                       "car": ("car_contact", abs(env.ecfg.reward_car_contact))}[name.strip()]
+                       "car": ("car_contact", abs(env.ecfg.reward_car_contact))}[name]
         if weight <= 0:
             raise SystemExit(f"--lagrange {name}: its component '{key}' has weight 0")
-        lagrange[name.strip()] = {"index": REWARD_COMPONENT_KEYS.index(key), "weight": weight,
-                                  "target": float(target), "lam": float(a.lagrange_init), "rate": float("nan"),
-                                  "onset": name.strip() == "car",
+        lagrange[name] = {"index": REWARD_COMPONENT_KEYS.index(key), "weight": weight,
+                                  "target": target, "lam": lam0, "rate": float("nan"),
+                                  "onset": name == "car",
                                   **({"anneal": {"frac": float(a.lagrange_anneal), "every": int(a.lagrange_anneal_every)}}
                                      if a.lagrange_anneal > 0 else {})}
     # The dial: drawn per episode, or held at one number for every car and episode (`--dial-constant`) -- then the
