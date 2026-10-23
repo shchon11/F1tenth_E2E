@@ -1,0 +1,48 @@
+{
+ "ckpt": "/home/shchon11/F1tenth_E2E/checkpoints/korea26_v2_ppo_s2421_u512.pt",
+ "speed_mode": "wp4",
+ "follower": "mpc",
+ "plans": 14016,
+ "by_point": {
+  "p1": {
+   "n": 13837,
+   "mean_arc_m": 0.696,
+   "speed_err_plan": 0.602,
+   "speed_err_hold": 0.2,
+   "speed_err_first": 0.602,
+   "speed_change_mean_abs": 0.2,
+   "pos_err_m": 0.079,
+   "lat_err_m": 0.035
+  },
+  "p2": {
+   "n": 13638,
+   "mean_arc_m": 1.39,
+   "speed_err_plan": 0.735,
+   "speed_err_hold": 0.394,
+   "speed_err_first": 0.533,
+   "speed_change_mean_abs": 0.394,
+   "pos_err_m": 0.116,
+   "lat_err_m": 0.079
+  },
+  "p3": {
+   "n": 13436,
+   "mean_arc_m": 2.084,
+   "speed_err_plan": 0.921,
+   "speed_err_hold": 0.566,
+   "speed_err_first": 0.567,
+   "speed_change_mean_abs": 0.566,
+   "pos_err_m": 0.204,
+   "lat_err_m": 0.176
+  },
+  "p4": {
+   "n": 13235,
+   "mean_arc_m": 2.775,
+   "speed_err_plan": 0.93,
+   "speed_err_hold": 0.717,
+   "speed_err_first": 0.648,
+   "speed_change_mean_abs": 0.717,
+   "pos_err_m": 0.392,
+   "lat_err_m": 0.347
+  }
+ }
+}

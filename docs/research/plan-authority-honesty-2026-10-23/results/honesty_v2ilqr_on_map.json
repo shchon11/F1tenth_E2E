@@ -1,0 +1,48 @@
+{
+ "ckpt": "/home/shchon11/f1sim_runs/v2Krep_s2312/ppo_u960.pt",
+ "speed_mode": "wp4",
+ "follower": "map",
+ "plans": 12384,
+ "by_point": {
+  "p1": {
+   "n": 12177,
+   "mean_arc_m": 0.737,
+   "speed_err_plan": 0.616,
+   "speed_err_hold": 0.261,
+   "speed_err_first": 0.616,
+   "speed_change_mean_abs": 0.261,
+   "pos_err_m": 0.091,
+   "lat_err_m": 0.046
+  },
+  "p2": {
+   "n": 11965,
+   "mean_arc_m": 1.474,
+   "speed_err_plan": 0.648,
+   "speed_err_hold": 0.5,
+   "speed_err_first": 0.581,
+   "speed_change_mean_abs": 0.5,
+   "pos_err_m": 0.146,
+   "lat_err_m": 0.103
+  },
+  "p3": {
+   "n": 11745,
+   "mean_arc_m": 2.21,
+   "speed_err_plan": 1.198,
+   "speed_err_hold": 0.702,
+   "speed_err_first": 0.614,
+   "speed_change_mean_abs": 0.702,
+   "pos_err_m": 0.197,
+   "lat_err_m": 0.153
+  },
+  "p4": {
+   "n": 11516,
+   "mean_arc_m": 2.945,
+   "speed_err_plan": 1.806,
+   "speed_err_hold": 0.874,
+   "speed_err_first": 0.683,
+   "speed_change_mean_abs": 0.874,
+   "pos_err_m": 0.307,
+   "lat_err_m": 0.256
+  }
+ }
+}
