@@ -4310,14 +4310,9 @@ class F1VecEnv:
     def _scale_plan_speeds(self, a: torch.Tensor) -> torch.Tensor:
         """The plans the follower tracks, the learner's speeds x `EnvConfig.plan_speed_scale` (the
         venue's speed knob); the traffic's rows and every path dimension are left as they are."""
-        from .mpc import _LAYOUTS
-        if self.ecfg.speed_mode != "linear":
-            raise ValueError(f"plan_speed_scale is wired for 'linear' plans; this env runs {self.ecfg.speed_mode!r}")
-        sl = _LAYOUTS["linear"].speed
-        out = a.clone()
-        scaled = ((a[:, sl] + 1.0) * float(self.ecfg.plan_speed_scale) - 1.0).clamp(-1.0, 1.0)
-        out[:, sl] = torch.where(self.learner[:, None], scaled, a[:, sl])
-        return out
+        from .mpc import scale_plan_speeds
+        scaled = scale_plan_speeds(a, self.ecfg.speed_mode, self.ecfg.plan_speed_scale)
+        return torch.where(self.learner[:, None], scaled, a)
 
     def set_grip_budget(self, mu: Optional[torch.Tensor]) -> None:
         """(B,) friction each car is allowed to use from now on, or None for no budget. The trainer

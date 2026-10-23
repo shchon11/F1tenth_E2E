@@ -169,6 +169,27 @@ def plan_layout(source=None) -> PlanLayout:
     return lay
 
 
+#: The plan formats whose speed columns are all plain speeds, (a + 1) / 2 x v_max each, so the venue's
+#: speed knob is one multiplication of every column. The other profile modes keep accelerations, a cap or
+#: a grip belief there.
+KNOB_SPEED_MODES = ("linear", "wp4")
+
+
+def scale_plan_speeds(a: torch.Tensor, speed_mode: str, scale: float) -> torch.Tensor:
+    """The venue's speed knob (`EnvConfig.plan_speed_scale`, the controller node's `plan_speed_scale`):
+    the plan `a` (B, act_dim) with every speed x `scale` and its path as it was. One function for the
+    simulator and the car (2026-10-23): each had the linear layout's two columns written in, and on a
+    'wp4' plan the env refused the knob while the node scaled v_3, v_4 and left v_1, v_2 -- the speeds
+    MAP drives now -- as they were."""
+    if speed_mode not in KNOB_SPEED_MODES:
+        raise ValueError(f"the speed knob scales plain speeds ({', '.join(KNOB_SPEED_MODES)} plans); "
+                         f"{speed_mode!r} plans keep something else in their speed columns")
+    sl = _LAYOUTS[speed_mode].speed
+    out = a.clone()
+    out[:, sl] = ((a[:, sl] + 1.0) * float(scale) - 1.0).clamp(-1.0, 1.0)
+    return out
+
+
 def act_dim(speed_mode: str = "linear") -> int:
     if speed_mode not in SPEED_MODES:
         raise ValueError(f"speed_mode must be one of {SPEED_MODES}, got {speed_mode!r}")

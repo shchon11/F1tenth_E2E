@@ -157,3 +157,25 @@ def test_the_speed_knob_slows_the_learners_plans_and_nothing_else():
     keep = [i for i in range(a.shape[1]) if i not in range(*sl.indices(a.shape[1]))]
     assert torch.equal(out[0, keep], a[0, keep])                             # the path untouched
     assert torch.equal(out[1], a[1])                                         # the traffic untouched
+
+
+def test_the_speed_knob_slows_every_speed_of_a_wp4_plan():
+    """A 'wp4' plan under the knob: all four waypoint speeds x the factor after decoding, the curvatures
+    as they were (until 2026-10-23 the env refused the knob for wp4 and the car scaled v_3, v_4 only)."""
+    from f1sim import mpc
+    cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+    env = common.make_env([maps.load("real:korea_2025_iccas")], 2, "cpu",
+                          EnvConfig(max_steps=100, hist_len=0, action_mode="plan", speed_mode="wp4",
+                                    compile_tracker=False, plan_speed_scale=0.8), cfg=cfg, seed=1)
+    env.learner[1] = False
+    sp = mpc.PlanSpec(speed_mode="wp4")
+    vm = torch.full((2,), 3.0)
+    a = mpc.encode_wp4(torch.tensor([[0.2, 0.1, -0.1, 0.0]] * 2), torch.tensor([[3.0, 4.0, 5.0, 5.5]] * 2), 8.0, sp, vm)
+    out = env._scale_plan_speeds(a)
+    _, _, v = mpc.decode_wp4(a, vm, 8.0, torch.full((2,), 9.0), sp)
+    _, _, v_knob = mpc.decode_wp4(out, vm, 8.0, torch.full((2,), 9.0), sp)
+    assert torch.allclose(v_knob[0], 0.8 * v[0], atol=1e-5)                 # v_1 .. v_4 x 0.8
+    assert torch.equal(out[0, :4], a[0, :4])                                 # the curvatures untouched
+    assert torch.equal(out[1], a[1])                                         # the traffic untouched
+    with pytest.raises(ValueError, match="plain speeds"):
+        mpc.scale_plan_speeds(torch.zeros(1, mpc.act_dim("envelope")), "envelope", 0.8)

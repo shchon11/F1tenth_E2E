@@ -194,6 +194,10 @@ class ControllerNode(Node):
         self.plan_speed_scale = float(p("plan_speed_scale"))
         if not (0.2 <= self.plan_speed_scale <= 1.5):
             raise ValueError(f"plan_speed_scale {self.plan_speed_scale}: expected a factor near 1 (0.2-1.5)")
+        from f1sim.mpc import KNOB_SPEED_MODES
+        if self.plan_speed_scale != 1.0 and self.contract["speed_mode"] not in KNOB_SPEED_MODES:
+            raise ValueError(f"plan_speed_scale scales plain speeds ({', '.join(KNOB_SPEED_MODES)} plans); the "
+                             f"checkpoint's plans are '{self.contract['speed_mode']}'")
         #: Whether the beam bearings the clearance grid is built from have been checked against a
         #: real `LaserScan` header yet. Until then they are the nominal 270 deg window.
         self._scan_geometry_checked = False
@@ -493,11 +497,9 @@ class ControllerNode(Node):
         a = torch.as_tensor(plan, dtype=torch.float32, device=self.device).reshape(1, -1)
         sc = float(getattr(self, "plan_speed_scale", 1.0))
         if sc != 1.0:
-            # the venue's speed knob, as EnvConfig.plan_speed_scale does in the simulator
-            from f1sim.mpc import _LAYOUTS
-            sl = _LAYOUTS["linear"].speed
-            a = a.clone()
-            a[:, sl] = ((a[:, sl] + 1.0) * sc - 1.0).clamp(-1.0, 1.0)
+            # the venue's speed knob, the simulator's own function (EnvConfig.plan_speed_scale)
+            from f1sim.mpc import scale_plan_speeds
+            a = scale_plan_speeds(a, (getattr(self, "contract", None) or {}).get("speed_mode", "linear"), sc)
         if self.clearance is not None:
             # This scan, in the observation's own units, before the tracker is asked for anything.
             # The arm holds one frame and nothing else: no map, no pose, no memory across scans.

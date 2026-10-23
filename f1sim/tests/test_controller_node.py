@@ -561,3 +561,31 @@ def test_the_car_follows_a_map_plan_as_the_simulator_does(monkeypatch):
         assert n.tracker.last_map is not None and ref.last_map is not None      # MAP drove, not the iLQR
     kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
     assert kv["plan_follower"] == "map"
+
+
+def test_the_speed_knob_slows_a_wp4_plan_as_the_simulator_does(monkeypatch):
+    """The venue's knob on a v2 (wp4) policy under MAP: the node's command is the simulator's `MAPPlanTracker`
+    command for the plan the simulator's own knob makes (`mpc.scale_plan_speeds`), every waypoint speed x the
+    factor. Until 2026-10-23 the node scaled the linear layout's columns, v_3 and v_4 of a wp4 plan."""
+    from f1sim import mpc
+    from f1sim.map_controller import POLICY_MAP, MAPParams, MAPPlanTracker
+    from f1sim.mpc import PlanTracker, contract_spec
+    on_map = {"speed_mode": "wp4", "speed_command": "tracker", "plan_follower": "map"}
+    n, lut, nominal = _follower_node(monkeypatch, on_map)
+    n._install_follower("auto", 1.0)
+    n.plan_speed_scale = 0.8
+    ref = MAPPlanTracker(PlanTracker(1, torch.device("cpu"), 0.3302, 0.4189, 8.0, spec=contract_spec(on_map)),
+                         lut, MAPParams.from_dict(dict(POLICY_MAP)), nominal)
+    ref.map_rows = torch.ones(1, dtype=torch.bool)
+    ref.P = {"mu": torch.tensor([nominal["mu"]]), "mu_f_scale": torch.tensor([nominal["mu_f_scale"]])}
+    plan = [0.1, 0.05, -0.05, 0.0, -0.1, 0.0, 0.2, 0.25]                  # 3.6, 4.0, 4.8, 5.0 m/s
+    stamp = ros_time(1.0)
+    sensors_at(n, 4.0, stamp)
+    n.on_plan(plan_msg(stamp, seq=0, values=plan))
+    got = n.last_cmd
+    ref.push_imu(torch.tensor([[0.0]]))
+    scaled = mpc.scale_plan_speeds(torch.tensor([plan]), "wp4", 0.8)
+    want = ref(scaled, torch.tensor([4.0]), torch.tensor([n.speed_cap]), torch.tensor([0.3]), delay=n.delay)[0]
+    assert got[0] == pytest.approx(float(want[0]), abs=1e-6)
+    assert got[1] == pytest.approx(float(want[1]), abs=1e-6)
+    assert got[1] == pytest.approx(0.8 * 3.6, abs=0.15)                   # MAP drives v_1, now x 0.8
