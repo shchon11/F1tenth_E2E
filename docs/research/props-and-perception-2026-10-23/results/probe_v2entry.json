@@ -1,0 +1,30 @@
+{
+ "train_seed": 81,
+ "n_train": 45052,
+ "pos_train": 300,
+ "n_test": 39215,
+ "pos_test": 320,
+ "auc_truth": 0.9598,
+ "auc_features": 0.8995,
+ "auc_both": 0.935,
+ "auc_distance_only": 0.7609,
+ "ridge_r2_closing": 0.647,
+ "ridge_r2_v_lat": 0.745,
+ "ridge_r2_distance": 0.8,
+ "near_head": {
+  "closing_r2_close": 0.005,
+  "v_lat_r2_close": 0.744,
+  "closing_mae_close": 0.955,
+  "v_lat_mae_close": 0.511,
+  "closing_true_pre_hit": 1.931,
+  "closing_pred_pre_hit": 1.429,
+  "closing_mae_pre_hit": 0.591,
+  "v_lat_true_abs_pre_hit": 0.769,
+  "v_lat_pred_abs_pre_hit": 0.69,
+  "v_lat_mae_pre_hit": 0.565,
+  "closing_true_other": -0.254,
+  "closing_pred_other": 0.318
+ },
+ "auc_head_closing_alone": 0.7465,
+ "auc_true_closing_alone": 0.8716
+}

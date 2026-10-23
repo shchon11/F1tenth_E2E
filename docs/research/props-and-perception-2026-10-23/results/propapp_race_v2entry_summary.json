@@ -1,0 +1,43 @@
+{
+ "ckpt": "/home/shchon11/F1tenth_E2E/checkpoints/korea26_v2_ppo_s2421_u512.pt",
+ "km": 35.05,
+ "approaches": 2982,
+ "per_km": 85.07,
+ "hard": 37,
+ "soft": 15,
+ "clear": 2930,
+ "p_hard": 0.012,
+ "hard_per_km": 1.06,
+ "opponents_prop_onsets_per_km": 33.04,
+ "opponents_prop_hard_per_km": 9.13,
+ "hard_stats": {
+  "entry_ttr_s": 0.562,
+  "entry_speed": 4.195,
+  "entry_abs_y": 0.421,
+  "displaced_share": 0.784,
+  "turned_share": 0.081,
+  "turn_ttr_s": 1.012,
+  "braked_share": 0.919,
+  "brake_ttr_s": 0.33
+ },
+ "soft_stats": {
+  "entry_ttr_s": 0.602,
+  "entry_speed": 4.009,
+  "entry_abs_y": 0.403,
+  "displaced_share": 0.533,
+  "turned_share": 0.067,
+  "turn_ttr_s": 0.367,
+  "braked_share": 0.867,
+  "brake_ttr_s": 0.368
+ },
+ "clear_stats": {
+  "entry_ttr_s": 0.911,
+  "entry_speed": 4.429,
+  "entry_abs_y": 0.38,
+  "displaced_share": 0.694,
+  "turned_share": 0.233,
+  "turn_ttr_s": 0.918,
+  "braked_share": 0.175,
+  "brake_ttr_s": 0.641
+ }
+}

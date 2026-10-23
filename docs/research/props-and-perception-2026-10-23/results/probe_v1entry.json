@@ -1,0 +1,14 @@
+{
+ "train_seed": 81,
+ "n_train": 45607,
+ "pos_train": 440,
+ "n_test": 38030,
+ "pos_test": 380,
+ "auc_truth": 0.9473,
+ "auc_features": 0.7525,
+ "auc_both": 0.8892,
+ "auc_distance_only": 0.808,
+ "ridge_r2_closing": 0.333,
+ "ridge_r2_v_lat": 0.537,
+ "ridge_r2_distance": 0.314
+}

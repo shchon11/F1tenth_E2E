@@ -1,0 +1,38 @@
+{
+ "ckpt": "/home/shchon11/F1tenth_E2E/checkpoints/korea26_rep_s2001_u256.pt",
+ "km": 17.84,
+ "approaches": 1476,
+ "per_km": 82.72,
+ "hard": 0,
+ "soft": 2,
+ "clear": 1474,
+ "p_hard": 0.0,
+ "hard_per_km": 0.0,
+ "hard_stats": {
+  "entry_ttr_s": null,
+  "entry_speed": null,
+  "entry_abs_y": null,
+  "turned_share": 0.0,
+  "turn_ttr_s": null,
+  "braked_share": 0.0,
+  "brake_ttr_s": null
+ },
+ "soft_stats": {
+  "entry_ttr_s": 0.432,
+  "entry_speed": 3.702,
+  "entry_abs_y": 0.435,
+  "turned_share": 0.0,
+  "turn_ttr_s": null,
+  "braked_share": 1.0,
+  "brake_ttr_s": 0.432
+ },
+ "clear_stats": {
+  "entry_ttr_s": 0.898,
+  "entry_speed": 4.279,
+  "entry_abs_y": 0.384,
+  "turned_share": 0.202,
+  "turn_ttr_s": 0.956,
+  "braked_share": 0.159,
+  "brake_ttr_s": 0.737
+ }
+}
