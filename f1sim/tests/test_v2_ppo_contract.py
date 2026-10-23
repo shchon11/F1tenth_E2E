@@ -5,6 +5,7 @@ Before, `ppo_v2.train` drew the dial per episode whatever `--dial-constant` said
 `ppo.main` does both for v1."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -71,3 +72,32 @@ def test_a_constraint_can_start_at_its_own_multiplier():
     assert parse_lagrange("wall=1.0,car=1.0@300", 80.0) == {"wall": (1.0, 80.0), "car": (1.0, 300.0)}
     assert parse_lagrange(" wall=0.5 , car=2 ", 8.0) == {"wall": (0.5, 8.0), "car": (2.0, 8.0)}
     assert parse_lagrange("", 8.0) == {}
+
+
+def test_a_short_rollout_still_labels_the_critics_contact_head(tmp_path, monkeypatch):
+    """--horizon 16 < CONTACT_HORIZON 40: every window used to run past the buffer, label_valid_frac 0, the critic's
+    contact head never trained (every --horizon 32 run since 2026-10-22). The rollouts are kept and the oldest labelled
+    from the ones after it, ceil(39 / 16) = 3 updates late."""
+    import importlib
+
+    from v2_fixtures import generated_v2_checkpoint
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(2, threads))
+    try:
+        init = generated_v2_checkpoint(str(tmp_path / "student.pt"))
+        monkeypatch.setattr(common, "RUNS_DIR", str(tmp_path))
+        monkeypatch.setenv("WANDB_MODE", "disabled")
+        monkeypatch.setattr(sys, "argv", ["f1sim.learn.ppo", "--arch", "v2", "--name", "cl", "--init", init, "--envs", "4",
+                                          "--tracks", TRACK, "--horizon", "16", "--minibatch", "32", "--grad-accum", "1",
+                                          "--total", str(6 * 16 * 4), "--epochs", "1", "--device", "cpu",
+                                          "--sim-backend", "eager", "--wandb", "disabled", "--log-every", "1",
+                                          "--save-every", "100", "--critic-warmup", "0", "--collision-mode", "soft",
+                                          "--cap0", "9", "--cap1", "9", "--dial-constant", "1.0489"])
+        importlib.import_module("f1sim.learn.ppo").main()
+        rows = [json.loads(line) for line in open(tmp_path / "cl" / "progress.jsonl")]
+        assert [r["update"] for r in rows] == [1, 2, 3, 4, 5, 6]
+        assert all(r["contact/label_delay_updates"] == 3 for r in rows)
+        assert all(r["contact/label_valid_frac"] == 0 for r in rows[:3])      # nothing to label from yet
+        assert all(r["contact/label_valid_frac"] > 0.5 for r in rows[3:])     # the oldest rollout, labelled
+    finally:
+        torch.set_num_threads(threads)

@@ -55,6 +55,7 @@ distribution at the car's 4 m/s (critique B5) -- that nothing measured; see `lea
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import json
 import os
@@ -250,7 +251,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   "lagrange": ({n: {"target": t, "lambda_init": l0}
                                 for n, (t, l0) in parse_lagrange(a.lagrange, a.lagrange_init).items()} if a.lagrange else None),
                   "losses": {"vf": float(a.vf), "vf_clip": float(a.vf_clip), "contact_bce": coefs["contact"],
-                             "contact_horizon_steps": CONTACT_HORIZON, "aux_b8": coefs["b8"],
+                             "contact_horizon_steps": CONTACT_HORIZON,
+                             "contact_label_delay_updates": (-(-(CONTACT_HORIZON - 1) // int(a.horizon))
+                                                             if coefs["contact"] > 0 and int(a.horizon) < CONTACT_HORIZON else 0), "aux_b8": coefs["b8"],
                              "aux_near_car": coefs["near"], "ent": float(a.ent),
                              "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
                              "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
@@ -327,6 +330,16 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         buf_b8_lab, buf_b8_cand, buf_b8_age = z(T, B, 3, 3), z(T, B, 3, dtype=torch.bool), z(T, B, 3, dtype=torch.long)
     if on["near"]:
         buf_near = z(T, B, 5)
+    #: The critic's contact labels need CONTACT_HORIZON steps of the future; a rollout shorter than that labels nothing
+    #: on its own -- every window runs past the buffer. With the fine granularity (--horizon 32, since 2026-10-22) the
+    #: contact head was never trained: label_valid_frac 0 in every run. So the critic's inputs and the onsets of the last
+    #: `label_delay` rollouts are kept, and the oldest is labelled from the rollouts after it, that many updates late
+    #: (2026-10-23). 0 when a rollout is long enough on its own: then nothing changes.
+    label_delay = -(-(CONTACT_HORIZON - 1) // T) if (coefs["contact"] > 0 and T < CONTACT_HORIZON) else 0
+    past = collections.deque(maxlen=label_delay) if label_delay else None
+    if label_delay:
+        print(f"contact labels: rollout {T} < horizon {CONTACT_HORIZON} steps -> labelled {label_delay} update(s) late",
+              flush=True)
     h_actor = model.actor.initial_hidden(env.B, device=device)
     h_ref = ref.initial_hidden(env.B, device=device)
     buf_h0 = z(1, B, model.actor.hidden_size)
@@ -495,6 +508,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 popart = (float((v_after - v_before).abs().max()), float(v_before.abs().max()))
             ret_n = vnorm.normalize(ret)
             y_c, y_valid = contact_labels(buf_onset, buf_done, buf_trunc, CONTACT_HORIZON)
+            late = None
+            if label_delay and len(past) == label_delay:
+                cat_ = lambda k, cur: torch.cat([p_[k] for p_ in past] + [cur])
+                yl_, vl_ = contact_labels(cat_("onset", buf_onset), cat_("done", buf_done), cat_("trunc", buf_trunc),
+                                          CONTACT_HORIZON)
+                late = dict(past[0], y=yl_[:T], valid=vl_[:T] & (past[0]["mask"] > 0))
             if buf_lvl is not None:
                 seat = env.race[lid].cpu().numpy()
                 lv = buf_lvl.cpu().numpy(); aa = adv.abs().float().cpu().numpy()
@@ -554,8 +573,17 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 else:
                     vf = 0.5 * wmean((v_n - tgt) ** 2)
                 yv = fl(y_valid[:, cols]).float() * w
-                bce = (F.binary_cross_entropy_with_logits(logit.float(), fl(y_c[:, cols]), reduction="none") * yv).sum() \
-                    / yv.sum().clamp_min(1.0)
+                bce_sum = (F.binary_cross_entropy_with_logits(logit.float(), fl(y_c[:, cols]), reduction="none") * yv).sum()
+                bce_n = yv.sum()
+                if late is not None:
+                    with ac:
+                        _v, logit_l = model.critic(fl(late["scan"][:, cols].float()), fl(late["ego"][:, cols]),
+                                                   fl(late["c"][:, cols]), fl(late["priv"][:, cols]))
+                    yv_l = fl(late["valid"][:, cols]).float()
+                    bce_sum = bce_sum + (F.binary_cross_entropy_with_logits(logit_l.float(), fl(late["y"][:, cols]),
+                                                                            reduction="none") * yv_l).sum()
+                    bce_n = bce_n + yv_l.sum()
+                bce = bce_sum / bce_n.clamp_min(1.0)
                 ent_w = wmean(ent)
                 zero = torch.zeros((), device=device)
                 b8 = near = zero
@@ -636,7 +664,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         if log_now:                                  # (update % a.log_every == 0 or update == 1)
             n_pol = buf_mask.sum().clamp_min(1.0)
             km = float((buf_prog.clamp_min(0) * buf_mask).sum()) / 1000.0
-            sel = y_valid & (buf_mask > 0)
+            if label_delay:
+                lab_y, lab_v, lab_logit = ((late["y"], late["valid"], late["logit"]) if late is not None else
+                                           (y_c, torch.zeros_like(y_valid), buf_logit))
+            else:
+                lab_y, lab_v, lab_logit = y_c, y_valid, buf_logit
+            sel = lab_v & (buf_mask > 0) if not label_delay else lab_v
             log = {"steps": steps_base + steps_done, "update": update, "speed_cap": cap, "lr": lr,
                    "lr_critic": a.critic_lr, "kl_coef": 0.0,
                    "rollout/reward_per_step": float((buf_rew * buf_mask).sum() / n_pol),
@@ -644,10 +677,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                    "rollout/value_mean": float(buf_val[:T].mean()), "rollout/adv_std": float(adv.std()),
                    "rollout/speed_capped_frac": float((buf_capped.float() * buf_mask).sum() / n_pol),
                    "value_norm/mean": vnorm.mean, "value_norm/std": vnorm.std,
-                   "contact/label_rate": float((y_c * y_valid).sum() / y_valid.sum().clamp_min(1)),
-                   "contact/label_valid_frac": float(y_valid.float().mean()),
+                   "contact/label_rate": float((lab_y * lab_v).sum() / lab_v.sum().clamp_min(1)),
+                   "contact/label_valid_frac": float(lab_v.float().mean()),
+                   "contact/label_delay_updates": float(label_delay),
                    "contact/onsets_per_km": _per_km(float((buf_onset.float() * buf_mask).sum()), km * 1000.0),
-                   "contact/auc_rollout": binary_auc(buf_logit[sel], y_c[sel]) if bool(sel.any()) else float("nan"),
+                   "contact/auc_rollout": binary_auc(lab_logit[sel], lab_y[sel]) if bool(sel.any()) else float("nan"),
                    "policy/actor_move": move, "policy/frozen_actor": float(freeze_actor),
                    "time/rollout_s": t_roll, "time/update_s": t_upd,
                    "time/env_steps_per_s": T * B / max(t_roll + t_upd, 1e-9),
@@ -711,6 +745,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                      f"/{sev_rates['contacts/wall_all_per_km']:.2f} car {sev_rates['contacts/car_onset_hard_per_km']:.2f}"
                      f"/{sev_rates['contacts/car_onset_all_per_km']:.2f}/km" if sev_rates else "")
                   + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
+        if label_delay:
+            # this rollout, for the labels the next one(s) complete (see `label_delay`)
+            past.append({"scan": buf_scan.clone(), "ego": buf_ego.clone(), "c": buf_c.clone(), "priv": buf_priv.clone(),
+                         "onset": buf_onset.clone(), "done": buf_done.clone(), "trunc": buf_trunc.clone(),
+                         "mask": buf_mask.clone(), "logit": buf_logit.clone()})
         t_loop = time.time() - t_loop0
         if getattr(env, "level_replay", None) is not None and update % 16 == 0:
             print("level replay: " + " ".join(f"{k} {v:.3g}" if isinstance(v, float) else f"{k} {v}"
