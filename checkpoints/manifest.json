@@ -118,12 +118,13 @@
   "file": "icra2022_map3R2_s1321_u384.pt",
   "run": "map3R2_s1321",
   "update": 384,
-  "sha256": "2c349e21e49e90d0a1f9f7de8186c5c3fc6a4742c7b3553119c222c6f41f69b6",
+  "sha256": "276b23d12703302cca6729953c548493ce98144e103b5ad687af5645d30bc52a",
   "size_mb": 11.0,
   "dropped": [
    "extra.opt"
   ],
-  "source_mb": 32.5
+  "source_mb": 32.5,
+  "note": "10-23: + MAP contract (round-5 controller)"
  },
  {
   "file": "korea26_v2_distill_s2362_it7.pt",

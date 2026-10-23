@@ -351,3 +351,14 @@ On slipperier floors, without the venue's speed knob, it keeps its speed where v
 
 At a slippery venue, set the knob (`plan_speed_scale`). Console path, Korea, 30 s: solo 5.34 m/s, race of 2 5.22 m/s,
 0 contact steps (v1: 5.02 / 4.57).
+
+## ICCAS and ICRA picks record their follower (2026-10-23)
+
+`iccas_fixphys_s1102_u384` and `icra2022_map3R2_s1321_u384` were selected and scored with MAP (each map's round-5
+controller, chosen on tracking RMSE) at dial 1.0489, but trained with the iLQR, and their files said so: the car's
+controller node and a plain `evaluate` read the contract and ran them on the iLQR. Their `extra` now carries
+`plan_follower: map` and that map's MAP numbers at the top level (`contract_of` reads it before the experiment block, which
+still says how they were trained), plus an `archive_note`. Weights and meta unchanged. Checked on both paths: the console
+drives them with `MAPPlanTracker` (ICCAS solo 5.75 m/s, ICRA 4.26 m/s over 30 s, 0 contact steps), and the controller node
+starts with `plan follower map` and each map's numbers. They were trained on drawn dials and record none, so on the car the
+dial is graph.yaml's (or `dial:=`).
