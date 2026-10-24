@@ -101,3 +101,31 @@ def test_a_short_rollout_still_labels_the_critics_contact_head(tmp_path, monkeyp
         assert all(r["contact/label_valid_frac"] > 0.5 for r in rows[3:])     # the oldest rollout, labelled
     finally:
         torch.set_num_threads(threads)
+
+
+def test_the_shield_hinge_pulls_the_first_speed_under_the_safe_one(tmp_path, monkeypatch):
+    """--shield-aux (2026-10-24): in a race, the steps with a car in our path carry (mu_v1 - v_safe)_+^2; the run
+    logs where it applied and by how much the mean first speed exceeded the safe one."""
+    import importlib
+
+    from f1sim.learn.ppo_v2 import safe_speed
+    from v2_fixtures import generated_v2_checkpoint
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(2, threads))
+    try:
+        init = generated_v2_checkpoint(str(tmp_path / "student.pt"))
+        monkeypatch.setattr(common, "RUNS_DIR", str(tmp_path))
+        monkeypatch.setenv("WANDB_MODE", "disabled")
+        monkeypatch.setattr(sys, "argv", ["f1sim.learn.ppo", "--arch", "v2", "--name", "sh", "--init", init, "--envs", "8",
+                                          "--tracks", TRACK, "--horizon", "16", "--minibatch", "32", "--grad-accum", "1",
+                                          "--total", str(3 * 16 * 4), "--epochs", "1", "--device", "cpu",
+                                          "--sim-backend", "eager", "--wandb", "disabled", "--log-every", "1",
+                                          "--save-every", "100", "--critic-warmup", "0", "--collision-mode", "soft",
+                                          "--cap0", "9", "--cap1", "9", "--dial-constant", "1.0489", "--race-size", "2",
+                                          "--shield-aux", "1.0", "--shield-path-width", "3.0"])
+        importlib.import_module("f1sim.learn.ppo").main()
+        rows = [json.loads(line) for line in open(tmp_path / "sh" / "progress.jsonl")]
+        assert all("loss/shield" in r and "loss/shield_active_frac" in r for r in rows)
+        assert max(r["loss/shield_active_frac"] for r in rows) > 0          # a car was in the (wide) path somewhere
+    finally:
+        torch.set_num_threads(threads)

@@ -972,6 +972,20 @@ def main():
     ap.add_argument("--aux-near-car", type=float, default=None, metavar="COEF",
                     help="v2: weight of the nearest-visible-car head (default 0.5, the perception gate's; "
                          "0 builds no head)")
+    ap.add_argument("--shield-aux", type=float, default=None, metavar="COEF",
+                    help="v2 (2026-10-24): weight of a privileged hinge on the actor's first speed: wherever a car is in "
+                         "our path ahead, (mu_v1 - v_safe)_+^2 with v_safe = the speed we can still bring down to that "
+                         "car's before the gap closes (true states, training only; the deployed policy reads nothing "
+                         "new). The sparse contact cost never taught the policy to brake for a slower car although its "
+                         "state predicts the contact (docs/research/car-contact-learning-2026-10-24). 0 = off")
+    ap.add_argument("--shield-brake", type=float, default=3.0, metavar="M_S2",
+                    help="v2 --shield-aux: the deceleration v_safe assumes [m/s^2]")
+    ap.add_argument("--shield-path-width", type=float, default=0.45, metavar="M",
+                    help="v2 --shield-aux: |lateral| offset [m] in our frame under which a car ahead is in our path")
+    ap.add_argument("--shield-lag", type=float, default=0.2, metavar="S",
+                    help="v2 --shield-aux: drive lag [s] spent at the current closing speed before braking bites")
+    ap.add_argument("--shield-gap-min", type=float, default=0.2, metavar="M",
+                    help="v2 --shield-aux: body gap [m] left when the speeds match")
     ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
                     help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
                          "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
@@ -989,7 +1003,7 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "critic_lr", "value_norm_beta", "contact_bce", "aux_b8",
                               "aux_near_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta",
-                              "opponent_speed_mode")
+                              "opponent_speed_mode", "shield_aux")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")

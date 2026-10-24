@@ -128,6 +128,9 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
         raise SystemExit("--arch v2 reads the grip dial (a deployable input column); no other conditioning")
     if a.init and a.v2_init_stem:
         raise SystemExit("--init continues a v2 policy; --v2-init-stem seeds a fresh one from a v1 stem")
+    a.shield_aux = float(a.shield_aux or 0.0)
+    if a.shield_aux < 0 or a.shield_brake <= 0 or a.shield_path_width <= 0 or a.shield_lag < 0 or a.shield_gap_min < 0:
+        raise SystemExit("--shield-aux >= 0, --shield-brake / --shield-path-width > 0, --shield-lag / --shield-gap-min >= 0")
     if min(a.contact_bce, a.aux_b8, a.aux_near_car) < 0 or not 0 < a.value_norm_beta < 1:
         raise SystemExit("v2 loss weights are >= 0 and --value-norm-beta is in (0, 1)")
     check_balance_args(a)
@@ -158,6 +161,31 @@ def env_kwargs(a) -> dict:
 def _per_km(count, dist_m: float) -> float:
     dist_m = float(dist_m)
     return 1000.0 * float(count) / dist_m if dist_m > 1.0 else float("nan")
+
+
+def safe_speed(env, brake: float, width: float, lag: float, gap_min: float) -> torch.Tensor:
+    """(B,) [m/s] the speed each car can still bring down to the speed of the car in its path ahead before the gap
+    closes -- v_opp + sqrt(2 brake (gap - gap_min - (v_me - v_opp)_+ lag)_+) -- for the nearest such car of its race,
+    inf where none is in the path (x > 0 within 6 m, |y| < width, in our frame). True states: `--shield-aux`'s target,
+    training only."""
+    from .. import dynamics as dyn
+    st = env.sim.state
+    o = env.sim.other_idx                                                   # (B, C)
+    c, s_ = torch.cos(st[:, dyn.IYAW])[:, None], torch.sin(st[:, dyn.IYAW])[:, None]
+    dxw, dyw = st[o, 0] - st[:, None, 0], st[o, 1] - st[:, None, 1]
+    dx, dy = c * dxw + s_ * dyw, -s_ * dxw + c * dyw
+    co, so = torch.cos(st[o, dyn.IYAW]), torch.sin(st[o, dyn.IYAW])
+    vox = st[o, dyn.IVX] * co - st[o, dyn.IVY] * so
+    voy = st[o, dyn.IVX] * so + st[o, dyn.IVY] * co
+    v_opp = (vox * c + voy * s_).clamp_min(0.0)
+    v_me = st[:, dyn.IVX][:, None]
+    gap = (dx - float(env.ecfg.car_len)).clamp_min(0.0)
+    room = (gap - gap_min - (v_me - v_opp).clamp_min(0.0) * lag).clamp_min(0.0)
+    vs = v_opp + torch.sqrt(2.0 * brake * room)
+    inpath = (dx > 0) & (dx < 6.0) & (dy.abs() < width)
+    if getattr(env.sim, "absent_any", False):
+        inpath = inpath & ~env.sim.absent[o]
+    return torch.where(inpath, vs, torch.full_like(vs, float("inf"))).min(1).values
 
 
 def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, applied: dict,
@@ -250,6 +278,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   "speed_command": str(a.speed_command), "v2_defaults": applied,
                   "lagrange": ({n: {"target": t, "lambda_init": l0}
                                 for n, (t, l0) in parse_lagrange(a.lagrange, a.lagrange_init).items()} if a.lagrange else None),
+                  "shield_aux": ({"coef": float(a.shield_aux), "brake": float(a.shield_brake), "path_width": float(a.shield_path_width),
+                                  "lag": float(a.shield_lag), "gap_min": float(a.shield_gap_min)} if a.shield_aux > 0 else None),
                   "losses": {"vf": float(a.vf), "vf_clip": float(a.vf_clip), "contact_bce": coefs["contact"],
                              "contact_horizon_steps": CONTACT_HORIZON,
                              "contact_label_delay_updates": (-(-(CONTACT_HORIZON - 1) // int(a.horizon))
@@ -330,6 +360,13 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         buf_b8_lab, buf_b8_cand, buf_b8_age = z(T, B, 3, 3), z(T, B, 3, dtype=torch.bool), z(T, B, 3, dtype=torch.long)
     if on["near"]:
         buf_near = z(T, B, 5)
+    #: `--shield-aux`: the first-speed ceiling of each step in action units, and where a car is in our path
+    shield_on = a.shield_aux > 0 and env.sim.other_idx is not None
+    if shield_on:
+        from ..mpc import plan_layout
+        i_v1 = plan_layout("wp4").speed.start
+        v_max_pol = float(env.ecfg.v_max_policy)
+        buf_vsafe, buf_shield = z(T, B), z(T, B, dtype=torch.bool)
     #: The critic's contact labels need CONTACT_HORIZON steps of the future; a rollout shorter than that labels nothing
     #: on its own -- every window runs past the buffer. With the fine granularity (--horizon 32, since 2026-10-22) the
     #: contact head was never trained: label_valid_frac 0 in every run. So the critic's inputs and the onsets of the last
@@ -446,6 +483,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     buf_near[t] = env.nearest_visible_car_v2()[lid]
                 if buf_lvl is not None:
                     buf_lvl[t] = env.level_seed[lid]
+                if shield_on:
+                    vs_ = safe_speed(env, a.shield_brake, a.shield_path_width, a.shield_lag, a.shield_gap_min)[lid]
+                    buf_shield[t] = torch.isfinite(vs_) & (vs_ < v_max_pol)
+                    buf_vsafe[t] = (vs_.clamp(max=v_max_pol) / v_max_pol * 2 - 1).clamp(-1.0, 1.0)
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
                 h_actor = h_next.float()
                 controller.post_step(term, trunc)
@@ -587,6 +628,14 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 ent_w = wmean(ent)
                 zero = torch.zeros((), device=device)
                 b8 = near = zero
+                shield = zero
+                if shield_on:
+                    m_s = fl(buf_shield[:, cols]).float() * w
+                    exc = (mu[:, i_v1] - fl(buf_vsafe[:, cols])).clamp_min(0.0)
+                    shield = (exc ** 2 * m_s).sum() / m_s.sum().clamp_min(1.0)
+                    stats.setdefault("shield_excess_mps", []).append(
+                        float((exc * m_s).sum() / m_s.sum().clamp_min(1.0)) * v_max_pol / 2)
+                    stats.setdefault("shield_active_frac", []).append(float(m_s.sum() / w.sum().clamp_min(1.0)))
                 b8_know = None
                 if on["b8"]:
                     b8, st_b8 = b8_sequence_loss(seq["b8"], buf_b8_lab[:, cols], buf_b8_cand[:, cols],
@@ -630,7 +679,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                         stats.setdefault(f"grad/{k}", []).append(v)
                 s_ = balance.scale
                 actor_terms = (pg - a.ent * ent_w + coefs["b8"] * s_.get("b8", 1.0) * b8
-                               + coefs["near"] * s_.get("near", 1.0) * near)
+                               + coefs["near"] * s_.get("near", 1.0) * near + a.shield_aux * shield)
                 loss = a.vf * vf + coefs["contact"] * bce + on_actor * actor_terms
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"non-finite v2 PPO loss at update {update} (pg {float(pg):.4g} vf {float(vf):.4g} "
@@ -650,7 +699,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     opt.step()
                     stats.setdefault("grad_norm_actor", []).append(float(g_a))
                     stats.setdefault("grad_norm_critic", []).append(float(g_c))
-                for k, v in (("pg", pg), ("vf", vf), ("contact_bce", bce), ("entropy", ent.mean()),
+                for k, v in (("pg", pg), ("vf", vf), ("contact_bce", bce), ("entropy", ent.mean()), ("shield", shield),
                              ("kl_ref", kl_ref), ("approx_kl", approx_kl), ("clipfrac", clipfrac),
                              ("b8", b8), ("near_car", near)):
                     stats.setdefault(k, []).append(float(v.detach()))
@@ -744,6 +793,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   + (f" | >={a.contact_severity_min:g} m/s wall {sev_rates['contacts/wall_hard_per_km']:.2f}"
                      f"/{sev_rates['contacts/wall_all_per_km']:.2f} car {sev_rates['contacts/car_onset_hard_per_km']:.2f}"
                      f"/{sev_rates['contacts/car_onset_all_per_km']:.2f}/km" if sev_rates else "")
+                  + (f" | shield exc {log.get('loss/shield_excess_mps', float('nan')):.3f} m/s on "
+                     f"{log.get('loss/shield_active_frac', float('nan')):.3f}" if shield_on else "")
                   + f" | {log['time/env_steps_per_s']:.0f} steps/s", flush=True)
         if label_delay:
             # this rollout, for the labels the next one(s) complete (see `label_delay`)
