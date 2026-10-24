@@ -8,7 +8,9 @@ together, and does not drive. Per learner step: v1 of A and of B [m/s], our spee
 (ego frame: dx, |dy|, our speed advantage, lateral rate toward us) and the nearest live prop ahead. Reported: mean
 v1(B) - v1(A) by situation -- nothing near / a prop ahead (0 < x < 6 m, |y| < 0.45; no car within 3 m) / a car within
 3 m outside the rules / inside the in-lane rule (wholly ahead, |dy| < 0.35) / inside pass-slow (ahead, |dy| < 0.8,
-faster by > 1 m/s). v1 is the plan's first speed column, (a + 1) / 2 x v_max: what the hinge acts on.
+faster by > 1 m/s) / predictive only (wholly ahead in Frenet, not in our lane now, but its lateral offset at the current
+rate comes under 0.35 m within 1 s: what --shield-horizon 1 adds). v1 is the plan's first speed column,
+(a + 1) / 2 x v_max: what the hinge and the price act on.
 usage: policy_diff.py CKPT_A CKPT_B OUT.json [SEEDS=81] [KINDS=solo,forzaeth,lane_switch]"""
 import json
 import os
@@ -53,6 +55,26 @@ def student_policy(model, env, device=None, deterministic=True, dial=None):
     return run
 
 
+def predictive_only(env, H=1.0, W=0.35, car_len=0.5):
+    """wholly ahead (Frenet), not in our lane now, lateral offset at the current rate under W within H s, not passed by then"""
+    sim = env.sim
+    st = sim.state
+    s, d, idx = sim.track.project(st[:, :2], sim.tid, prev_idx=sim.cl_idx)
+    t = sim.track.cl_tangent[sim.tid, idx]
+    c, sn = torch.cos(st[:, dyn.IYAW]), torch.sin(st[:, dyn.IYAW])
+    vxw = st[:, dyn.IVX] * c - st[:, dyn.IVY] * sn
+    vyw = st[:, dyn.IVX] * sn + st[:, dyn.IVY] * c
+    sd = vxw * t[:, 0] + vyw * t[:, 1]
+    dd = -vxw * t[:, 1] + vyw * t[:, 0]
+    L = sim.track.length[sim.tid].clamp_min(1e-6)
+    o = sim.other_idx[:, 0]
+    ds = ((s[o] - s) + L / 2) % L - L / 2
+    dlat, rate = d[o] - d, dd[o] - dd
+    t_in = torch.where((dlat * rate) < 0, (dlat.abs() - W) / rate.abs().clamp_min(1e-6), torch.full_like(dlat, 1e9))
+    past = (ds + (sd[o] - sd) * t_in.clamp(max=H)) < -(car_len + 0.1)
+    return (ds - car_len > 0.1) & (ds < 6.0) & (dlat.abs() >= W) & (t_in <= H) & ~past
+
+
 def record(env, a, b):
     lr = env.learner
     if a.shape[0] != lr.shape[0]:
@@ -83,9 +105,10 @@ def record(env, a, b):
         passslow = (dx > 0) & (dy.abs() < 0.8) & (dv > 1.0)
         lab = torch.where(close, torch.full_like(lab, 2), lab)
         lab = torch.where(passslow, torch.full_like(lab, 4), lab)
+        lab = torch.where(predictive_only(env), torch.full_like(lab, 5), lab)
         lab = torch.where(inlane, torch.full_like(lab, 3), lab)
     d = (vb - va)[lr]; lab = lab[lr]
-    k = ACC.setdefault(CUR["kind"], {x: torch.zeros(5, device=d.device) for x in ("n", "sum", "sq", "va")})
+    k = ACC.setdefault(CUR["kind"], {x: torch.zeros(6, device=d.device) for x in ("n", "sum", "sq", "va")})
     k["n"].index_add_(0, lab, torch.ones_like(d)); k["sum"].index_add_(0, lab, d); k["sq"].index_add_(0, lab, d * d)
     k["va"].index_add_(0, lab, va[lr])
 
@@ -108,9 +131,10 @@ for seed in SEEDS:
         k = ACC[kind]
         n, s, q, va = (k[x].cpu() for x in ("n", "sum", "sq", "va"))
         names = ["nothing near", "prop ahead", "car within 3 m, outside the rules", "in-lane (wholly ahead, |dy|<0.35)",
-                 "pass-slow region"]
+                 "pass-slow region", "predictive only (drifting in within 1 s)"]
         print(f"seed {seed} {kind}: " + " | ".join(f"{names[i]}: n {int(n[i])} v1(A) {float(va[i] / max(n[i], 1)):.2f} "
-              f"dv1 {float(s[i] / max(n[i], 1)):+.3f}" for i in range(5) if n[i] > 0), flush=True)
+              f"dv1 {float(s[i] / max(n[i], 1)):+.3f}" for i in range(6) if n[i] > 0), flush=True)
 res = {kind: {x: [float(v) for v in ACC[kind][x].cpu()] for x in ("n", "sum", "sq", "va")} for kind in ACC}
-json.dump({"a": CKA, "b": CKB, "seeds": SEEDS, "labels": ["nothing", "prop_ahead", "car_close_other", "inlane", "passslow"],
+json.dump({"a": CKA, "b": CKB, "seeds": SEEDS, "labels": ["nothing", "prop_ahead", "car_close_other", "inlane", "passslow",
+                                                           "predictive_only"],
            "acc": res}, open(OUT, "w"))
