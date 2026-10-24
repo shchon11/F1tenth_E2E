@@ -568,8 +568,20 @@ class ControllerNode(Node):
             speed = min(float(profile_speed_command(self.tracker.last_ref[:, :, 3], dt_t, t_land,
                                                     self.motor_tau)[0]), self.speed_cap)
         if getattr(self, "opponent_speed_limit", False) and speed > 0.0:
-            # the speed limit for a car ahead, on the policy's own reading of THIS scan (paired by stamp like the plan)
+            # the speed limit for a car ahead, on the policy's own reading of THIS scan (paired by stamp like the plan);
+            # the two topics are not ordered, so when this scan's perception is not in yet, the newest reading of the
+            # last 0.1 s (a scan or two earlier) stands in (console + ROS end-to-end, 10-25: a third of the plans
+            # arrived before their perception)
             per = self._perception.get(snap.key) if snap.key is not None else None
+            if (per is None or len(per.nearest_car) != 5) and snap.key is not None:
+                per = None
+                t_snap = snap.key[0] + snap.key[1] * 1e-9
+                for k_, m_ in reversed(list(self._perception.items())):
+                    t_k = k_[0] + k_[1] * 1e-9
+                    if len(m_.nearest_car) == 5 and t_snap - 0.1 <= t_k <= t_snap:
+                        per = m_
+                        self._opp_previous_scan = getattr(self, "_opp_previous_scan", 0) + 1
+                        break
             if per is not None and len(per.nearest_car) == 5:
                 from f1sim.opponent_speed_limit import speed_limit
                 lim = float(speed_limit(torch.tensor([list(per.nearest_car)], dtype=torch.float32),
@@ -719,6 +731,7 @@ class ControllerNode(Node):
              ("opponent_speed_limit", "on" if getattr(self, "opponent_speed_limit", False) else "off"),
              ("opponent_limited_commands", str(getattr(self, "_opp_limited", 0))),
              ("opponent_no_reading_commands", str(getattr(self, "_opp_no_reading", 0))),
+             ("opponent_previous_scan_readings", str(getattr(self, "_opp_previous_scan", 0))),
              ("mu", f"{float(self.grip.mu[0]):.5f}" if self.grip is not None else ""),
              ("clearance_margin_m",
               f"{self.clearance.cspec.margin:.3f}" if self.clearance is not None else ""),

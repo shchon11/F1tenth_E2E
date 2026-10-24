@@ -402,6 +402,10 @@ class PolicyNode(Node):
                 self.policy_state.observe(scan, pro), pro, deterministic=True, c=self.cond,
                 h=self.policy_state.hidden)
         self.obs.push_action(a[0])
+        # BEFORE the plan: the controller tracks a plan the moment it arrives, and it pairs this scan's perception (the
+        # floor class, the nearest-car reading for its speed limit) by stamp only if that is already there -- sent after
+        # the plan, it never was (console + ROS end-to-end, 10-25: 3571 of 3572 commands had no reading)
+        self._publish_perception(m.header.stamp, att)
         enabled = bool(self.get_parameter("enabled").value)
         if self.direct:
             act = a[0].cpu().numpy()
@@ -425,7 +429,6 @@ class PolicyNode(Node):
             if enabled:
                 self.pub_plan.publish(plan)
             shown = "plan=[" + " ".join(f"{x:+.2f}" for x in plan.plan) + "]"
-        self._publish_perception(m.header.stamp, att)
         self._publish_state([], m.header.stamp)
         self.seq = (self.seq + 1) % (1 << 32)
         dt = (time.perf_counter() - t0) * 1000

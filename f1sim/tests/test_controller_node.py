@@ -639,3 +639,17 @@ def test_the_speed_limit_off_ignores_the_reading():
     assert n.last_cmd[1] == pytest.approx(3.0)
     kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
     assert kv["opponent_speed_limit"] == "off"
+
+
+def test_a_reading_from_the_scan_just_before_stands_in_when_this_scans_is_not_in_yet():
+    """The plan and the perception are two topics with no order between them: a plan can be tracked before its own
+    scan's perception arrives. A reading from the last 0.1 s stands in, and is counted."""
+    n = make_node(speed=3.0)
+    n.opponent_speed_limit = True; n._opp_limited = 0; n._opp_no_reading = 0
+    n.on_perception(car_ahead_perception(ros_time(0.975)))      # the scan before (25 ms)
+    stamp = ros_time(1.0)
+    sensors_at(n, 2.5, stamp)
+    n.on_plan(plan_msg(stamp))
+    assert n.last_cmd[1] < 3.0
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["opponent_limited_commands"] == "1" and kv["opponent_previous_scan_readings"] == "1"
