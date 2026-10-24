@@ -670,7 +670,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     t_m = time.perf_counter()
                     gn = loss_grad_norms({"pg": pg,
                                           "b8": coefs["b8"] * b8 if on["b8"] else None,
-                                          "near": coefs["near"] * near if on["near"] else None}, actor_trunk)
+                                          "near": coefs["near"] * near if on["near"] else None,
+                                          "shield": a.shield_aux * shield if shield_on else None}, actor_trunk)
                     if due:
                         balance.observe(gn)
                     t_measure += time.perf_counter() - t_m
