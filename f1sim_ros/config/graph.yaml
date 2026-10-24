@@ -87,6 +87,11 @@
     plan_follower: "auto"
     map_grip: 1.0
     plan_speed_scale: 1.0       # the venue's speed knob: plan speeds x this (a floor of k x the grip ~ sqrt(k))
+    # The speed limit for a car ahead (f1sim/opponent_speed_limit.py): hold the speed command to the speed from which
+    # the car can still slow to the speed of a car in its lane, or one moving into it within 1 s, read off the policy's
+    # own nearest-car output (sent with each scan's /f1sim/policy/perception; v2 checkpoints, best with
+    # korea26_v2_ppo_s2421_u512_nearcar.pt). Off by default.
+    opponent_speed_limit: false
     device: "cpu"
     speed_cap: 4.0            # must equal the policy's
     steer_max: 0.4189

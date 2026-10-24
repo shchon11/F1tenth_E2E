@@ -245,8 +245,13 @@ class ActorV2(nn.Module):
         return y[:, 0], h_next
 
     def features(self, e: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """`[e | y]` -- what the action head and every auxiliary head read."""
-        return torch.cat([e, y], -1)
+        """`[e | y]` -- what the action head and every auxiliary head read. With `keep_reading` set, also keeps the
+        nearest-car output of these features in `last_reading` (the speed limit for a car ahead reads it,
+        `opponent_speed_limit.py`; the output does not feed the action)."""
+        z = torch.cat([e, y], -1)
+        if getattr(self, "keep_reading", False) and self.near_car is not None:
+            self.last_reading = self.near_car(z).detach()
+        return z
 
     def action_mean(self, z: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.mu(self.head(z)))

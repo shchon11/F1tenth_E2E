@@ -128,7 +128,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
              research_profile: str | None = None, graph_runtime: bool = False,
              opponent_speed_mode: str | None = "auto", ego_stack: str = "oracle",
              ego_stack_params: dict | None = None, plan_follower: str | None = None,
-             plan_follower_map: dict | None = None, plan_speed_scale: float = 1.0) -> dict:
+             plan_follower_map: dict | None = None, plan_speed_scale: float = 1.0,
+             opponent_speed_limit: bool = False) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -330,6 +331,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
                      plan_follower_map=(plan_follower_map if plan_follower_map is not None
                                         else _out.get("plan_follower_map")) if mode == "plan" else None,
                      plan_speed_scale=float(plan_speed_scale) if mode == "plan" else 1.0,
+                     opponent_speed_limit=bool(opponent_speed_limit) and mode == "plan",
                      plan_a_brake=float(metadata.get("plan_a_brake", limits.get("a_brake", 3.0))),
                      compile_tracker=not graph_runtime and bool(cfg.sim.compile),
                      race_size=race_size, opponent=opponent,
@@ -706,6 +708,9 @@ def main() -> None:
     ap.add_argument("--plan-speed-scale", type=float, default=1.0, metavar="X",
                     help="the venue's speed knob: plan / profile speeds x X before the follower (our policy's plans, a "
                          "modular ego's profile)")
+    ap.add_argument("--opponent-speed-limit", action="store_true",
+                    help="the speed limit for a car ahead (opponent_speed_limit.py): hold the learner's speed command to "
+                         "the speed it can still slow to that car's from, read off the policy's own nearest-car output")
     ap.add_argument("--plan-follower", default=None, choices=["mpc", "map"],
                     help="who follows a plan policy's plan: the iLQR tracker or ForzaETH's MAP controller "
                          "(default: what the checkpoint was fitted to, else mpc)")
@@ -864,6 +869,7 @@ def main() -> None:
                         ego_stack=a.ego_stack,
                         ego_stack_params=(json.loads(a.ego_stack_params) if a.ego_stack_params else None),
                         plan_follower=a.plan_follower, plan_speed_scale=a.plan_speed_scale,
+                        opponent_speed_limit=a.opponent_speed_limit,
                         plan_follower_map=(json.loads(a.plan_follower_map) if a.plan_follower_map else None),
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,

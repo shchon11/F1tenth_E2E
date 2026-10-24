@@ -1005,6 +1005,11 @@ class SimWorker:
                 f"{os.path.basename(ckpt_path)}: 행동 차원 {act_dim} 은 예전 plan 표현입니다 "
                 f"(현재는 {PLAN_DIM}). 더 최신 런을 고르세요.")
         mode = "plan" if act_dim == PLAN_DIM else "direct"
+        if bool(getattr(cfg, "opponent_speed_limit", False)) and (
+                mode != "plan" or getattr(getattr(model, "actor", None), "near_car", None) is None):
+            raise StartConfigError(
+                f"{os.path.basename(ckpt_path)}: 앞차 충돌 방지 감속은 정책 신경망의 '가장 가까운 차' 추정 출력을 씁니다 — "
+                f"이 체크포인트에는 그 출력이 없습니다(v2 체크포인트만 있습니다). 앞차 감속을 끄거나 v2 체크포인트를 고르세요.")
         if mode == "direct" and arm != "legacy":
             # The grip arms bound the *plan tracker*; a direct-action checkpoint has none. Refusing
             # the session for a setting that cannot apply (the deployment default is fixed_low)
@@ -1184,6 +1189,10 @@ class SimWorker:
             # grip belief taken for a speed.
             **({k: v for k, v in _plan_out.items()} if mode == "plan" else {}),
             **({"plan_speed_scale": float(getattr(cfg, "plan_speed_scale", 1.0) or 1.0)} if mode == "plan" else {}),
+            # the speed limit for a car ahead (opponent_speed_limit.py): the env holds the commands, `_step_once`
+            # feeds it the policy's own nearest-car output
+            **({"opponent_speed_limit": True} if mode == "plan" and bool(getattr(cfg, "opponent_speed_limit", False))
+               else {}),
             **proc_kw)
         if "action_history" in spec:
             # `watch.main` does not pass this through, so a checkpoint trained with a different
@@ -1303,6 +1312,9 @@ class SimWorker:
             self.say(P.MSG_LOG, gen=gen,
                      text=f"그립 다이얼 정책입니다 · 다이얼 μ={dial.mu:.3f} 로 시작합니다 "
                           f"(구성 > 그립 다이얼에서 주행 중에 바꿀 수 있습니다)")
+        if getattr(env, "opponent_reading", None) is not None:
+            self.say(P.MSG_LOG, gen=gen, text="앞차 충돌 방지 감속 켜짐 · 정책의 '가장 가까운 차' 추정으로, 앞차에 맞춰 멈출 수 "
+                                              "있는 속도로 속도 명령을 제한합니다")
         session = {
             "mu_pin": mu_pin,
             "env": env, "model": model, "extra": extra, "device": device,
@@ -1313,6 +1325,7 @@ class SimWorker:
             "obs": obs, "speed_cap": speed_cap, "compile": compile_enabled,
             "dial": dial,
             "act_fn": actor_runner(model, device, compile_enabled, dial=dial),
+            "opp_limit_steps": 0, "opp_limit_held": 0,
             "info_line": (f"내 차: {ego_note} · 우리 정책 꺼짐" if policy_idle and ego_note else
                           (f"내 차: {ego_note} · " if ego_note else "") + describe_checkpoint_line(extra, ckpt_path)),
             "ego_kind": ego_kind,
@@ -1696,8 +1709,18 @@ class SimWorker:
             if rt is not None:
                 rt.pre_action(session["obs"])      # history, friction estimate, MPC limits: before the action
             scan, pro = flatten_obs(session["obs"])
+            reading = getattr(env, "opponent_reading", None)
+            actor_ = getattr(session["act_fn"], "actor", None)
+            if reading is not None and actor_ is not None:
+                actor_.keep_reading = True                 # set every step: a reloaded checkpoint brings a new actor
             with torch.no_grad():
                 mu = session["act_fn"](scan, pro).clone()
+                if reading is not None and getattr(actor_, "last_reading", None) is not None:
+                    r_ = actor_.last_reading               # this step's nearest-car output -> the speed limit in env.step
+                    if r_.shape[0] == reading.shape[0]:
+                        reading.copy_(r_)
+                    else:
+                        reading[env.learner] = r_.to(reading.dtype)
                 if session["cfg"].stochastic:
                     act = (mu + model.actor.log_std.exp() * torch.randn_like(mu)).clamp(-1, 1)
                 else:
@@ -1707,6 +1730,15 @@ class SimWorker:
             steer, speed, _fresh = link.command()
             env.set_external_command(link.car, steer, speed)
         session["obs"], _rew, _term, _trunc, _info = env.step(act)
+        if getattr(env, "opponent_reading", None) is not None:
+            # how often the speed limit for a car ahead held the command, said every ~20 s of simulation
+            session["opp_limit_steps"] = session.get("opp_limit_steps", 0) + int(env.learner.sum())
+            session["opp_limit_held"] = session.get("opp_limit_held", 0) + int(env.opponent_limited.sum())
+            if session["k"] % 800 == 799 and session["opp_limit_steps"]:
+                self.say(P.MSG_LOG, gen=self.gen,
+                         text=f"앞차 충돌 방지 감속: 최근 구간 주행 시간의 "
+                              f"{100.0 * session['opp_limit_held'] / session['opp_limit_steps']:.1f} % 에서 속도 제한")
+                session["opp_limit_steps"] = session["opp_limit_held"] = 0
         if rt is not None:
             rt.post_step(_term, _trunc)             # issued command + episode boundaries
         session["k"] += 1

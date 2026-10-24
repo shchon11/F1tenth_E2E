@@ -150,5 +150,17 @@
    "extra.opt"
   ],
   "source_mb": 28.0
+ },
+ {
+  "file": "korea26_v2_ppo_s2421_u512_nearcar.pt",
+  "run": "v2PH_s2421",
+  "update": 512,
+  "sha256": "3e4f4eb8fa38c14e3cad5683f83ba2fdc987ff6603021212a464c65c6914661a",
+  "size_mb": 9.3,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 9.3,
+  "note": "korea26_v2_ppo_s2421_u512 with only actor.near_car.* retrained on its frozen features (head_data.py / head_train.py, seeds 85-86, early-stopped); drives identically"
  }
 ]

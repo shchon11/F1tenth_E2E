@@ -257,3 +257,20 @@ def test_the_simulator_nodes_announce_their_resets():
         src = inspect.getsource(mod)
         assert 'create_publisher(EmptyMsg, "/f1sim/reset"' in src, mod.__name__
         assert "self.pub_reset.publish(EmptyMsg())" in src, mod.__name__
+
+
+def test_the_perception_message_carries_the_policys_nearest_car_reading():
+    """2026-10-25: a v2 checkpoint's nearest-car output rides along with the scan's perception message (the
+    controller's speed limit for a car ahead reads it); a checkpoint without it sends an empty field."""
+    n = pn.PolicyNode.__new__(pn.PolicyNode)
+    n.att_source = "vesc"
+    n.policy_state = SimpleNamespace(scan=None)
+    n.pub_perception = RecordingPub()
+    n.get_parameter = lambda name: SimpleNamespace(value=True)
+    reading = torch.tensor([[3.5, 0.2, -0.1, 0.3, 0.05]])
+    n.model = SimpleNamespace(actor=SimpleNamespace(last_reading=reading))
+    n._publish_perception(ros_time(1.0), (0.0, 0.0))
+    assert list(n.pub_perception.msgs[-1].nearest_car) == pytest.approx(reading[0].tolist())
+    n.model = SimpleNamespace(actor=SimpleNamespace(last_reading=None))
+    n._publish_perception(ros_time(2.0), (0.0, 0.0))
+    assert len(n.pub_perception.msgs[-1].nearest_car) == 0

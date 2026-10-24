@@ -352,6 +352,24 @@ On slipperier floors, without the venue's speed knob, it keeps its speed where v
 At a slippery venue, set the knob (`plan_speed_scale`). Console path, Korea, 30 s: solo 5.34 m/s, race of 2 5.22 m/s,
 0 contact steps (v1: 5.02 / 4.57).
 
+## Korea 2026 entry with a retrained nearest-car output (2026-10-25): `korea26_v2_ppo_s2421_u512_nearcar`
+
+The same policy as `korea26_v2_ppo_s2421_u512`: only the four tensors of `actor.near_car` differ (verified), so it drives
+identically. That output -- the policy's own estimate of the nearest car it sees (exists, dx, dy, closing speed, sideways
+speed) -- does not feed the action. It was retrained on the policy's frozen features from 15 race cells of the entry
+(seeds 85-86), with more weight on the closing and sideways speeds (`docs/research/passing-risk-2026-10-24`, section 6).
+Use this file with the speed limit for a car ahead switched on: the console's 「앞차 충돌 방지 감속」, the controller node's
+`opponent_speed_limit:=true`, `evaluate --opponent-speed-limit`.
+
+| finals race cells, fresh seeds 91-92 (props on the line) | hard car /km | hard all /km | race speed | passes /min |
+| --- | ---: | ---: | ---: | ---: |
+| limit off | 1.22 | 2.32 | 4.59 m/s | 0.87 |
+| limit on | 0.49 | 1.63 | 4.54 m/s | 0.95 |
+
+With the props off the line: 1.34 -> 0.54 hard car /km, 2.12 -> 1.51 all hard. Solo laps unchanged (the limit never
+engaged without another car). 30 % of the limits are ones the true state would not set; most extra wall hits
+(+0.1-0.2 /km) follow those.
+
 ## ICCAS and ICRA picks record their follower (2026-10-23)
 
 `iccas_fixphys_s1102_u384` and `icra2022_map3R2_s1321_u384` were selected and scored with MAP (each map's round-5

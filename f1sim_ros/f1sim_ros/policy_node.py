@@ -160,6 +160,10 @@ class PolicyNode(Node):
         # with the metadata nor one with only the spec can reach the wheels.
         ckpt = str(p("checkpoint"))
         self.model, extra = load_checkpoint(ckpt, self.device); self.model.eval()
+        if getattr(getattr(self.model, "actor", None), "near_car", None) is not None:
+            # a v2 checkpoint's nearest-car output rides along with every scan's perception message: the
+            # controller's speed limit for a car ahead reads it (it does not feed the action)
+            self.model.actor.keep_reading = True
         # The observation contract the checkpoint was trained on: v1 (`ObsBuilder`) or, for a
         # `learn.model_v2` network, v2 (`ObsBuilderV2`) -- `deploy.observation_builder` decides.
         # `ObsSpec.opp_token` is "off" when there is none -- a STRING, so `if self.spec.opp_token`
@@ -450,6 +454,11 @@ class PolicyNode(Node):
         if probs is not None:
             from f1sim.learn.frontend import FLOOR
             msg.floor = [float(x) for x in probs[0, FLOOR].detach().cpu().numpy()]
+        reading = getattr(getattr(self.model, "actor", None), "last_reading", None)
+        if reading is not None:
+            # the policy's own nearest-car output for this scan (`keep_reading`, set at start): what the
+            # controller's speed limit for a car ahead reads
+            msg.nearest_car = [float(x) for x in reading[0].detach().cpu().numpy()]
         if self.pub_perception is not None and bool(self.get_parameter("enabled").value):
             self.pub_perception.publish(msg)
 

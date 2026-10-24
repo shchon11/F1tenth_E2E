@@ -557,6 +557,11 @@ class EnvConfig:
     #: policy's own action -- its history, its log-prob -- is untouched; only what is tracked is slower.
     #: Same grip fraction on a floor of k x the friction at about sqrt(k). 'linear' plans only.
     plan_speed_scale: float = 1.0
+    #: The speed limit for a car ahead (2026-10-25, `opponent_speed_limit.py`): the learner's speed command is held to
+    #: the speed from which it can still slow to the car's speed before the gap closes, for a car in its lane now or
+    #: moving into it within 1 s -- read off the policy's own nearest-car output, which its runner writes into
+    #: `F1VecEnv.opponent_reading` every step (`learn/common.student_policy`, the console's worker). Plan mode only.
+    opponent_speed_limit: bool = False
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -1140,6 +1145,14 @@ class F1VecEnv:
             self._opp_age = torch.full((self.B, C), OPP_NEVER_SEEN, dtype=torch.long, device=self.device)
         #: "no prop anywhere near the plan", as a tensor so the compiled reward takes one shape.
         self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
+        #: `EnvConfig.opponent_speed_limit`: each row's nearest-car reading (the policy's own output, written in place by
+        #: its runner before `step`; one buffer for the session so a captured step reads the live values), and where the
+        #: limit held the speed command this step. None when off.
+        self.opponent_reading = None
+        self.opponent_limited = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        if e.opponent_speed_limit:
+            from .opponent_speed_limit import no_car
+            self.opponent_reading = no_car(self.B, device=self.device)
         #: Whether each car was in contact last step, so a soft collision is charged on its onset.
         self._was_touching = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self._was_touching_wall = torch.zeros(self.B, dtype=torch.bool, device=self.device)
@@ -2916,6 +2929,16 @@ class F1VecEnv:
                     self._v_pr_prev = v_pr.detach()
                 raw = torch.stack([raw[:, 0], torch.where(raw[:, 1] < 0, raw[:, 1],
                                    torch.minimum(v_pr, self.speed_cap))], 1)
+            if self.opponent_reading is not None:
+                # the speed limit for a car ahead, from the policy's own reading of it (`opponent_speed_limit.py`); the
+                # LiDAR's nominal mount, as the car knows it
+                from .opponent_speed_limit import speed_limit
+                lim = speed_limit(self.opponent_reading, self.sim.state[:, 3], float(self.cfg.lidar.mount_x),
+                                  float(self.cfg.lidar.mount_y))
+                v = raw[:, 1]
+                held = self.learner & (v > lim.to(v.dtype))
+                self.opponent_limited = held
+                raw = torch.stack([raw[:, 0], torch.where(held, lim.to(v.dtype), v)], 1)
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)

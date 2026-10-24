@@ -334,6 +334,30 @@ def external_drivers(env) -> dict:
     return out
 
 
+def opponent_reading_feeder(model, env):
+    """`EnvConfig.opponent_speed_limit`: a callable that copies the actor's latest nearest-car output into
+    `env.opponent_reading` (call it after each policy step, before `env.step`), or None when the limit is off. The limit
+    reads the policy's own estimate of the car ahead, so a checkpoint without that output cannot drive with it on."""
+    reading = getattr(env, "opponent_reading", None)
+    if reading is None:
+        return None
+    actor = getattr(model, "actor", None)
+    if getattr(actor, "near_car", None) is None:
+        raise ValueError("the speed limit for a car ahead (opponent_speed_limit) reads the policy's nearest-car output; "
+                         "this checkpoint has none (a v2 policy trained with --aux-near-car has)")
+    actor.keep_reading = True
+
+    def feed():
+        r = getattr(actor, "last_reading", None)
+        if r is None:
+            return
+        if r.shape[0] == reading.shape[0]:
+            reading.copy_(r)
+        else:                                              # the actor ran on the learner rows only
+            reading[env.learner] = r.to(reading.dtype)
+    return feed
+
+
 def student_policy(model, env: F1VecEnv, device=None, deterministic: bool = True, dial=None):
     """`memory.policy_fn` for any student: carries the hidden state, and for a conditional actor reads
     the conditioning at every step (it changes at each reset, so it cannot be fixed).
@@ -347,8 +371,18 @@ def student_policy(model, env: F1VecEnv, device=None, deterministic: bool = True
     from . import conditioning as cond_mod
     from .memory import policy_fn, runtime_for
     from .obs import flatten_obs
+    feed = opponent_reading_feeder(model, env)
     if not int(model.meta.get("cond_dim", 0)):
-        return policy_fn(model, env.B, device=device, deterministic=deterministic)
+        base = policy_fn(model, env.B, device=device, deterministic=deterministic)
+        if feed is None:
+            return base
+
+        def run_fed(obs):
+            action = base(obs)
+            feed()
+            return action
+        run_fed.runtime, run_fed.reset = base.runtime, base.reset
+        return run_fed
     spec = cond_mod.CondSpec.from_meta(model.meta.get("cond"))
     rt = runtime_for(model, env.B, device)
 
@@ -360,6 +394,8 @@ def student_policy(model, env: F1VecEnv, device=None, deterministic: bool = True
         else:
             c = cond_mod.make_condition(spec.source, spec, env.sim.P["mu"].reshape(-1, 1), 0)
         action, _lp, rt.hidden = model.act(rt.observe(scan, proprio), proprio, deterministic=deterministic, c=c, h=rt.hidden)
+        if feed is not None:
+            feed()
         return action
 
     run.runtime = rt

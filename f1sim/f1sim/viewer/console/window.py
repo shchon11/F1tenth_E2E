@@ -465,6 +465,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                         "노면이 미끄러우면 낮추세요 (μ×0.8 → 약 0.90).")
         cfg_card.add(self.row_speed_scale)
 
+        # -- the speed limit for a car ahead (2026-10-25, opponent_speed_limit.py)
+        self.chk_opp_limit = QtWidgets.QCheckBox("앞차 충돌 방지 감속")
+        self.chk_opp_limit.setChecked(False)
+        self.chk_opp_limit.setToolTip(
+            "앞차가 우리 차선에 있거나 지금 옆 속도로 1초 안에 들어올 것으로 보이면, 그 차 속도에 맞춰 멈출 수 있는 속도로 "
+            "속도 명령을 제한합니다. 상대 차 위치·속도는 정책 신경망의 보조 출력(가장 가까운 차 추정)을 씁니다 — v2 체크포인트만. "
+            "한국 대회용 정책(새 시드): 1.5 m/s 이상 차 충돌 −60 %, 경주 속도 −1~2 %, 혼자 주행 영향 없음.")
+        self.row_opp_limit = FieldRow("앞차 감속", self.chk_opp_limit,
+                                      "추정 출력을 다시 학습한 체크포인트(…_nearcar.pt)에서 효과가 가장 큽니다.")
+        cfg_card.add(self.row_opp_limit)
+
         # -- surface friction: random per car (what training saw) or one pinned value, changeable
         # while the session runs. The panel's "시뮬 참값 μ" shows what the car actually has.
         mu_row = QtWidgets.QHBoxLayout()
@@ -1480,7 +1491,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
-                  self.spin_cap, self.combo_follower, self.spin_speed_scale, self.chk_dr, self.chk_soft, self.chk_stoch,
+                  self.spin_cap, self.combo_follower, self.spin_speed_scale, self.chk_opp_limit, self.chk_dr,
+                  self.chk_soft, self.chk_stoch,
                   self.opp_table,
                   self.combo_device,
                   self.combo_ros,
@@ -2259,6 +2271,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "stochastic": bool(self.chk_stoch.isChecked()),
             "plan_follower": str(self.combo_follower.currentData() or "map"),
             "plan_speed_scale": float(self.spin_speed_scale.value()),
+            "opponent_speed_limit": bool(self.chk_opp_limit.isChecked()),
             "bare_first": bool(self.chk_bare_first.isChecked()),
             "mu_mode": str(self.combo_mu.currentData() or "random"),
             "mu": float(self.spin_mu.value()),
@@ -2339,6 +2352,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.chk_stoch.setChecked(bool(v)), "stochastic")
         attempt(combo_data(self.combo_follower), "plan_follower")
         attempt(lambda v: self.spin_speed_scale.setValue(float(v)), "plan_speed_scale")
+        attempt(lambda v: self.chk_opp_limit.setChecked(bool(v)), "opponent_speed_limit")
         attempt(lambda v: self.chk_bare_first.setChecked(bool(v)), "bare_first")
         attempt(combo_data(self.combo_mu), "mu_mode")
         attempt(lambda v: self.spin_mu.setValue(float(v)), "mu")
@@ -2393,6 +2407,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             stochastic=self.chk_stoch.isChecked(),
             plan_follower=str(self.combo_follower.currentData() or "map"),
             plan_speed_scale=float(self.spin_speed_scale.value()),
+            opponent_speed_limit=bool(self.chk_opp_limit.isChecked()),
             opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
             opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),
             **self.ego_panel.config(),

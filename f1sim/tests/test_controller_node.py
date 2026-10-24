@@ -589,3 +589,53 @@ def test_the_speed_knob_slows_a_wp4_plan_as_the_simulator_does(monkeypatch):
     assert got[0] == pytest.approx(float(want[0]), abs=1e-6)
     assert got[1] == pytest.approx(float(want[1]), abs=1e-6)
     assert got[1] == pytest.approx(0.8 * 3.6, abs=0.15)                   # MAP drives v_1, now x 0.8
+
+
+# ==================================================================== the speed limit for a car ahead
+# `opponent_speed_limit` (2026-10-25, `f1sim.opponent_speed_limit`): the policy node sends its own nearest-car
+# reading with each scan's perception message; the controller holds the speed command to the limit it sets for the
+# scan it is tracking. Off by default; with it on and no reading for a scan, that command is not limited.
+def car_ahead_perception(stamp, dx_lidar=0.6, dy=0.0, closing=1.5, v_lat=0.0):
+    m = perception_msg(stamp)
+    m.nearest_car = [4.0, dx_lidar / 5.0, dy / 2.0, closing / 5.0, v_lat / 2.0]
+    return m
+
+
+def test_the_speed_limit_holds_the_command_for_a_car_ahead_in_this_scan():
+    from f1sim.opponent_speed_limit import speed_limit
+    n = make_node(speed=3.0)
+    n.opponent_speed_limit = True; n._opp_limited = 0; n._opp_no_reading = 0
+    stamp = ros_time(1.0)
+    per = car_ahead_perception(stamp)
+    n.on_perception(per)
+    sensors_at(n, 2.5, stamp)
+    n.on_plan(plan_msg(stamp))
+    want = float(speed_limit(torch.tensor([list(per.nearest_car)]), torch.tensor([2.5]), deploy.LIDAR_MOUNT_X, 0.0)[0])
+    assert want < 3.0
+    assert n.last_cmd[1] == pytest.approx(want, abs=1e-5)
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["opponent_speed_limit"] == "on" and kv["opponent_limited_commands"] == "1"
+
+
+def test_no_reading_for_this_scan_leaves_the_command_and_is_counted():
+    n = make_node(speed=3.0)
+    n.opponent_speed_limit = True; n._opp_limited = 0; n._opp_no_reading = 0
+    n.on_perception(car_ahead_perception(ros_time(0.5)))          # another scan's reading
+    stamp = ros_time(1.0)
+    sensors_at(n, 2.5, stamp)
+    n.on_plan(plan_msg(stamp))
+    assert n.last_cmd[1] == pytest.approx(3.0)
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["opponent_no_reading_commands"] == "1" and kv["opponent_limited_commands"] == "0"
+
+
+def test_the_speed_limit_off_ignores_the_reading():
+    n = make_node(speed=3.0)
+    n.opponent_speed_limit = False; n._opp_limited = 0; n._opp_no_reading = 0
+    stamp = ros_time(1.0)
+    n.on_perception(car_ahead_perception(stamp))
+    sensors_at(n, 2.5, stamp)
+    n.on_plan(plan_msg(stamp))
+    assert n.last_cmd[1] == pytest.approx(3.0)
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["opponent_speed_limit"] == "off"

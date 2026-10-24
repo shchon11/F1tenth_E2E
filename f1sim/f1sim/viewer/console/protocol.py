@@ -158,6 +158,10 @@ class SessionConfig:
     #: with a speed-profile scale): every driver's plan / profile speeds x this before its follower
     #: (`EnvConfig.plan_speed_scale`, `PlannerEgoDriver.speed_scale`).
     plan_speed_scale: float = 1.0
+    #: The speed limit for a car ahead (2026-10-25, `opponent_speed_limit.py`): the policy's car slows so it can
+    #: still match the speed of a car in its lane, or one moving into it within 1 s, read off the policy's own
+    #: nearest-car output (v2 checkpoints). Off by default.
+    opponent_speed_limit: bool = False
     #: Plan-controller arm installed at run time (`learn.grip_runtime`).
     #:
     #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs

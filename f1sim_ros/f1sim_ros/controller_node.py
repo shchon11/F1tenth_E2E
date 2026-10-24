@@ -138,6 +138,12 @@ class ControllerNode(Node):
         # The venue's speed knob (2026-10-20): the plan's speeds x this before either follower -- the floor's
         # friction answered at the controller, as race_stack scales its speed profile per track ('linear' plans).
         d("plan_speed_scale", 1.0)
+        # The speed limit for a car ahead (2026-10-25, `f1sim.opponent_speed_limit`): the speed command is held to the
+        # speed from which the car can still slow to the speed of a car in its lane, or one moving into it within
+        # 1 s, read off the policy's own nearest-car output that comes with each scan's perception message. Off by
+        # default; with it on and no reading for a scan, that scan's command is not limited (and the diagnostics
+        # say how often that happened).
+        d("opponent_speed_limit", False)
         d("traction", "off"); d("traction_params", "")
         d("sensor_timeout", 0.25); d("plan_timeout", 0.25); d("watchdog_period", 0.01)
         d("viz", False)
@@ -191,6 +197,9 @@ class ControllerNode(Node):
                                                floor_gate=bool(p("clearance_floor_gate")),
                                                gate_mode=str(p("clearance_floor_gate_mode")))
         self._install_follower(str(p("plan_follower")), float(p("map_grip")))
+        self.opponent_speed_limit = bool(p("opponent_speed_limit"))
+        self._opp_limited = 0
+        self._opp_no_reading = 0
         self.plan_speed_scale = float(p("plan_speed_scale"))
         if not (0.2 <= self.plan_speed_scale <= 1.5):
             raise ValueError(f"plan_speed_scale {self.plan_speed_scale}: expected a factor near 1 (0.2-1.5)")
@@ -558,6 +567,18 @@ class ControllerNode(Node):
             t_land = (self.delay + self.control_dt) / dt_t
             speed = min(float(profile_speed_command(self.tracker.last_ref[:, :, 3], dt_t, t_land,
                                                     self.motor_tau)[0]), self.speed_cap)
+        if getattr(self, "opponent_speed_limit", False) and speed > 0.0:
+            # the speed limit for a car ahead, on the policy's own reading of THIS scan (paired by stamp like the plan)
+            per = self._perception.get(snap.key) if snap.key is not None else None
+            if per is not None and len(per.nearest_car) == 5:
+                from f1sim.opponent_speed_limit import speed_limit
+                lim = float(speed_limit(torch.tensor([list(per.nearest_car)], dtype=torch.float32),
+                                        torch.tensor([float(snap.v)]), LIDAR_MOUNT_X, 0.0)[0])
+                if speed > lim:
+                    speed = lim
+                    self._opp_limited += 1
+            else:
+                self._opp_no_reading += 1
         if self.traction is not None:
             # Last thing before the command leaves, and *before* `speed_gain`: the guard reasons in
             # the car's own m/s -- it compares the command against a body speed estimated from this
@@ -695,6 +716,9 @@ class ControllerNode(Node):
         """The controller's state as `(name, value)` strings. Also what `system_check` reports."""
         v = [("arm", self.controller_arm), ("plan_follower", getattr(self, "follower", "mpc")),
              ("plan_speed_scale", f"{float(getattr(self, 'plan_speed_scale', 1.0)):.3f}"),
+             ("opponent_speed_limit", "on" if getattr(self, "opponent_speed_limit", False) else "off"),
+             ("opponent_limited_commands", str(getattr(self, "_opp_limited", 0))),
+             ("opponent_no_reading_commands", str(getattr(self, "_opp_no_reading", 0))),
              ("mu", f"{float(self.grip.mu[0]):.5f}" if self.grip is not None else ""),
              ("clearance_margin_m",
               f"{self.clearance.cspec.margin:.3f}" if self.clearance is not None else ""),
