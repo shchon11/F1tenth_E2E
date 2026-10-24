@@ -1,0 +1,18 @@
+{
+ "ho_phantom_no_car_ahead": 223,
+ "ho_car_in_lane_truth_ceiling_above_cmd": 553,
+ "ho_car_out_of_lane_head_says_in_lane_now": 202,
+ "ho_car_out_of_lane_head_predicts_entry": 603,
+ "both_caps_head_in_lane_now": 2099,
+ "both_caps_head_predicted": 2091,
+ "steps": 307200,
+ "cap_both": 4190,
+ "cap_head_only": 1581,
+ "cap_true_only_missed": 1858,
+ "hard_wall_after_head_only_cap": 6,
+ "hard_wall_after_both_cap": 1,
+ "hard_wall_no_recent_cap": 1,
+ "hard_prop_after_head_only_cap": 3,
+ "hard_prop_after_both_cap": 0,
+ "hard_prop_no_recent_cap": 4
+}

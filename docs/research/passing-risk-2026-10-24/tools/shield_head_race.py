@@ -14,6 +14,10 @@ RACE_CORRIDOR=on keeps them off). SHIELD_MEASURE_ONLY=1: count, do not cap.
 SOLO=1 (SOURCE=head): the selection's solo protocol instead (64 cars, seed 123, 3 laps, no props, nobody else on the
 track) with the shield live -- a deployed shield runs whether or not a car is there, so any reading of a car where there
 is none (walls?) costs lap time; the stats say how often it capped.
+SHIELD_DEADBAND=x [m/s]: cap only to v_safe + x (a command within x of the ceiling passes) -- 30 % of the head's caps are
+false alarms (shield_dual_diag.py), split over a phantom car (15 %), a misjudged gap / closing speed (35 %), a misjudged
+lateral offset (13 %) and lateral rate (37 %), and they precede 8 of 12 hard wall hits; small reading errors flip a
+command just over the ceiling.
 usage: shield_head_race.py CKPT OUT_DIR SEEDS SOURCE [H=1.0] [A_B=3.0] [W=0.35] [TAU=0.2] [GMIN=0.2]"""
 import json
 import os
@@ -39,6 +43,7 @@ KINDS = ("forzaeth", "forzaeth_pred", "lane_switch", "interactive")
 TRACK = "real:korea_2026_competition"
 CAR_LEN = 0.5
 MEASURE = bool(os.environ.get("SHIELD_MEASURE_ONLY"))
+DEADBAND = float(os.environ.get("SHIELD_DEADBAND", "0") or 0)
 os.makedirs(OUT, exist_ok=True)
 CUR = {"env": None, "near": None}
 STAT = {"steps": 0, "active": 0, "cut_sum": 0.0}
@@ -97,7 +102,7 @@ def map_call(self, action, v_meas, speed_cap, yaw_rate=None, delay=None):
     out = _orig_map_call(self, action, v_meas, speed_cap, yaw_rate, delay)
     env = CUR["env"]
     if env is not None and env.tracker is self and (env.sim.M > 1 or SOURCE == "head"):
-        vs = v_safe(env)
+        vs = v_safe(env) + DEADBAND
         lr = env.learner
         cmd = out[:, 1]
         cut = lr & (cmd > vs)
@@ -163,9 +168,12 @@ for seed in SEEDS:
         if "t_steps" in STAT:
             STAT["steps"] += int(STAT.pop("t_steps")); STAT["active"] += int(STAT.pop("t_active"))
             STAT["cut_sum"] += float(STAT.pop("t_cut"))
+        if "t_read" in STAT:                                   # the head counters (a race fails at the json dump without this)
+            STAT["head_rows_read"] = STAT.get("head_rows_read", 0) + int(STAT.pop("t_read"))
+            STAT["head_rows_seeing_a_car"] = STAT.get("head_rows_seeing_a_car", 0) + int(STAT.pop("t_seen"))
         print(f"seed {seed} {kind}: shield active {STAT['active']}/{STAT['steps']} learner steps "
               f"({100 * STAT['active'] / max(STAT['steps'], 1):.2f} %), mean cut {STAT['cut_sum'] / max(STAT['active'], 1):.2f} m/s",
               flush=True)
 json.dump({"source": SOURCE, "h": H, "a_b": A_B, "w": W, "tau": TAU, "gmin": GMIN, "measure_only": MEASURE,
-           "corridor": os.environ.get("RACE_CORRIDOR", "off"), **STAT},
+           "deadband": DEADBAND, "corridor": os.environ.get("RACE_CORRIDOR", "off"), **STAT},
           open(os.path.join(OUT, f"shield_stats_{'_'.join(map(str, SEEDS))}.json"), "w"))

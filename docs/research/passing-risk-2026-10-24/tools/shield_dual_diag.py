@@ -7,6 +7,9 @@ props on. Here the head shield drives (caps), and at every learner step the TRUE
 beside it: caps are BOTH (the truth would cap too), HEAD-ONLY (false alarm) or the truth's alone (MISSED). Each hard
 (>= 1.5 m/s) wall or prop onset of a learner car is attributed to a head-only cap in the second before it, else to a
 both-cap, else to none. Finals race cells (seeds, 4 kinds); RACE_CORRIDOR=on keeps the props off the line.
+Head-only caps are split by what the truth says: no car wholly ahead within 6 m (a phantom), the car in our lane now but
+the truth's ceiling above the command (a misjudged gap or closing speed), or the car outside our lane and the truth not
+predicting it in within H (a misjudged lateral rate) -- the head's own reason being in lane now or predicted in.
 usage: shield_dual_diag.py CKPT OUT.json SEEDS [H=1.0]"""
 import json
 import os
@@ -63,7 +66,7 @@ def relative(env, source):
     return near[:, 0] > 0, near[:, 1] * 5.0 + mx, near[:, 2] * 2.0 + my, near[:, 3] * 5.0, near[:, 4] * 2.0
 
 
-def v_safe(env, source):
+def v_safe(env, source, parts=False):
     ex, dx, dy, closing, vlat = relative(env, source)
     gap = dx - CAR_LEN
     v_opp = (env.sim.state[:, dyn.IVX] - closing).clamp_min(0.0)
@@ -74,6 +77,8 @@ def v_safe(env, source):
                        torch.where((dy * vlat) < 0, (dy.abs() - W) / vlat.abs().clamp_min(1e-6), torch.full_like(dy, 1e9)))
     past = (dx - closing * t_in.clamp(max=H)) < -(CAR_LEN + 0.1)
     hit = ex & (gap > 0.1) & (dx < 6.0) & (t_in <= H) & ~past
+    if parts:
+        return torch.where(hit, vs, torch.full_like(vs, 1e9)), ex & (gap > 0.1) & (dx < 6.0), in_lane, hit
     return torch.where(hit, vs, torch.full_like(vs, 1e9))
 
 
@@ -83,8 +88,17 @@ def map_call(self, action, v_meas, speed_cap, yaw_rate=None, delay=None):
     if env is not None and env.tracker is self and env.sim.M > 1 and CUR["near"] is not None:
         lr = env.learner
         cmd = out[:, 1]
-        vh, vt = v_safe(env, "head"), v_safe(env, "true")
+        vh, h_ahead, h_inlane, h_hit = v_safe(env, "head", parts=True)
+        vt, t_ahead, t_inlane, t_hit = v_safe(env, "true", parts=True)
         ch, ct = lr & (cmd > vh), lr & (cmd > vt)
+        ho = ch & ~ct
+        for k, m in (("ho_phantom_no_car_ahead", ho & ~t_ahead),
+                     ("ho_car_in_lane_truth_ceiling_above_cmd", ho & t_ahead & t_inlane),
+                     ("ho_car_out_of_lane_head_says_in_lane_now", ho & t_ahead & ~t_inlane & h_inlane),
+                     ("ho_car_out_of_lane_head_predicts_entry", ho & t_ahead & ~t_inlane & ~h_inlane),
+                     ("both_caps_head_in_lane_now", ch & ct & h_inlane), ("both_caps_head_predicted", ch & ct & ~h_inlane)):
+            CNT.setdefault("_t_" + k, torch.zeros((), device=cmd.device))
+            CNT["_t_" + k] += m.sum()
         B = cmd.shape[0]
         if "last_ho" not in ROW or ROW["last_ho"].shape[0] != B:
             ROW["last_ho"] = torch.full((B,), -10 ** 6, dtype=torch.long, device=cmd.device)

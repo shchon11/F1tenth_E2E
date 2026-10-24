@@ -1,0 +1,12 @@
+{
+ "steps": 614400,
+ "cap_both": 8671,
+ "cap_head_only": 3690,
+ "cap_true_only_missed": 3953,
+ "hard_wall_after_head_only_cap": 8,
+ "hard_wall_after_both_cap": 1,
+ "hard_wall_no_recent_cap": 3,
+ "hard_prop_after_head_only_cap": 4,
+ "hard_prop_after_both_cap": 0,
+ "hard_prop_no_recent_cap": 10
+}
