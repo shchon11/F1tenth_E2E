@@ -134,6 +134,8 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
         raise SystemExit("--shield-cost >= 0")
     if a.shield_aux < 0 or a.shield_brake <= 0 or a.shield_path_width <= 0 or a.shield_lag < 0 or a.shield_gap_min < 0:
         raise SystemExit("--shield-aux >= 0, --shield-brake / --shield-path-width > 0, --shield-lag / --shield-gap-min >= 0")
+    if a.shield_horizon < 0 or (a.shield_horizon > 0 and (a.shield_dv > 0 or a.shield_alongside)):
+        raise SystemExit("--shield-horizon >= 0, and a prediction is for the in-lane ceiling (no --shield-dv/--shield-alongside)")
     if a.shield_dv < 0 or (a.shield_alongside and a.shield_dv <= 0):
         raise SystemExit("--shield-dv >= 0; --shield-alongside needs --shield-dv > 0 (a ceiling of the opponent's own speed "
                          "beside it holds us there: car contacts 9.0 -> 15.6 /km with the oracle, 10-24)")
@@ -170,7 +172,7 @@ def _per_km(count, dist_m: float) -> float:
 
 
 def safe_speed(env, brake: float, width: float, lag: float, gap_min: float, dv: float = 0.0,
-               alongside: bool = False) -> torch.Tensor:
+               alongside: bool = False, horizon: float = 0.0) -> torch.Tensor:
     """(B,) [m/s] the speed each car can still bring down to the speed of the car in its path ahead before the gap
     closes -- v_opp + sqrt(2 brake (gap - gap_min - (v_me - v_opp)_+ lag)_+) -- for the nearest such car of its race,
     inf where none is in the path (wholly ahead: body gap > 0.1 m along our heading, within 6 m, |y| < width). True states: `--shield-aux`'s target,
@@ -179,7 +181,12 @@ def safe_speed(env, brake: float, width: float, lag: float, gap_min: float, dv: 
     PASS-SLOW (dv > 0, 2026-10-24): the ceiling allows `dv` over the opponent's speed --
     v_opp + dv + sqrt(2 brake (gap - gap_min - (v_me - v_opp - dv)_+ lag)_+) -- and with `alongside` holds while the
     opponent's centre is ahead of ours (dx > 0), beside it too. Hard car contacts come from closing faster than ~1 m/s
-    within ~0.8 m laterally (docs/research/passing-risk-2026-10-24)."""
+    within ~0.8 m laterally (docs/research/passing-risk-2026-10-24).
+
+    PREDICTIVE (horizon > 0): `_safe_speed_predictive` -- a car wholly ahead counts when its lateral offset, carried on at
+    the current lateral rate, comes under `width` within `horizon` s (Frenet coordinates)."""
+    if horizon > 0:
+        return _safe_speed_predictive(env, brake, width, lag, gap_min, horizon)
     from .. import dynamics as dyn
     st = env.sim.state
     o = env.sim.other_idx                                                   # (B, C)
@@ -199,6 +206,45 @@ def safe_speed(env, brake: float, width: float, lag: float, gap_min: float, dv: 
     inpath = ((dx > 0.0) if alongside else (gap > 0.1)) & (dx < 6.0) & (dy.abs() < width)
     if getattr(env.sim, "absent_any", False):
         inpath = inpath & ~env.sim.absent[o]
+    return torch.where(inpath, vs, torch.full_like(vs, float("inf"))).min(1).values
+
+
+def _safe_speed_predictive(env, brake: float, width: float, lag: float, gap_min: float, horizon: float) -> torch.Tensor:
+    """`safe_speed` for an opponent that is wholly ahead (body gap > 0.1 m along the track, within 6 m) and in our lane
+    now or by `horizon` s: in Frenet coordinates, its lateral offset to us extrapolated at the current lateral rate
+    (constant velocity) comes under `width` -- unless we would be a car length past it by then. Most hard car contacts
+    are a slower car drifting sideways into us while we pass (0.6 m/s, from 0.46 m): the in-lane test sees 15 % of their
+    last 0.5 s, this one (1 s) 45 %; as an oracle cap it cut hard car contacts 44 % (passing-risk-2026-10-24)."""
+    from .. import dynamics as dyn
+    sim = env.sim
+    st = sim.state
+    tr, tid = sim.track, sim.tid
+    s, d, idx = tr.project(st[:, :2], tid, prev_idx=sim.cl_idx)
+    t = tr.cl_tangent[tid, idx]
+    c, sn = torch.cos(st[:, dyn.IYAW]), torch.sin(st[:, dyn.IYAW])
+    vxw = st[:, dyn.IVX] * c - st[:, dyn.IVY] * sn
+    vyw = st[:, dyn.IVX] * sn + st[:, dyn.IVY] * c
+    sd = vxw * t[:, 0] + vyw * t[:, 1]                                       # ds/dt (curvature factor ignored)
+    dd = -vxw * t[:, 1] + vyw * t[:, 0]                                      # dd/dt, left +
+    L = tr.length[tid][:, None].clamp_min(1e-6)
+    o = sim.other_idx                                                        # (B, C)
+    ds = s[o] - s[:, None]
+    ds = (ds + L / 2) % L - L / 2                                            # signed arc distance to each opponent
+    car_len = float(env.ecfg.car_len)
+    gap = ds - car_len
+    dlat, rate = d[o] - d[:, None], dd[o] - dd[:, None]
+    v_me, v_opp = sd[:, None], sd[o].clamp_min(0.0)
+    room = (gap - gap_min - (v_me - v_opp).clamp_min(0.0) * lag).clamp_min(0.0)
+    vs = v_opp + torch.sqrt(2.0 * brake * room)
+    in_lane = dlat.abs() < width
+    closing = (dlat * rate) < 0
+    never = torch.full_like(dlat, 1e9)
+    t_in = torch.where(in_lane, torch.zeros_like(dlat),
+                       torch.where(closing, (dlat.abs() - width) / rate.abs().clamp_min(1e-6), never))
+    past = (ds + (sd[o] - sd[:, None]) * t_in.clamp(max=horizon)) < -(car_len + 0.1)
+    inpath = (gap > 0.1) & (ds < 6.0) & (t_in <= horizon) & ~past
+    if getattr(sim, "absent_any", False):
+        inpath = inpath & ~sim.absent[o]
     return torch.where(inpath, vs, torch.full_like(vs, float("inf"))).min(1).values
 
 
@@ -295,7 +341,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   "shield_aux": ({"coef": float(a.shield_aux), "cost": float(a.shield_cost), "brake": float(a.shield_brake),
                                   "path_width": float(a.shield_path_width), "lag": float(a.shield_lag),
                                   "gap_min": float(a.shield_gap_min), "dv": float(a.shield_dv),
-                                  "alongside": bool(a.shield_alongside)} if (a.shield_aux > 0 or a.shield_cost > 0) else None),
+                                  "alongside": bool(a.shield_alongside), "horizon": float(a.shield_horizon)}
+                                 if (a.shield_aux > 0 or a.shield_cost > 0) else None),
                   "losses": {"vf": float(a.vf), "vf_clip": float(a.vf_clip), "contact_bce": coefs["contact"],
                              "contact_horizon_steps": CONTACT_HORIZON,
                              "contact_label_delay_updates": (-(-(CONTACT_HORIZON - 1) // int(a.horizon))
@@ -502,7 +549,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     buf_lvl[t] = env.level_seed[lid]
                 if shield_on:
                     vs_ = safe_speed(env, a.shield_brake, a.shield_path_width, a.shield_lag, a.shield_gap_min,
-                                     a.shield_dv, a.shield_alongside)[lid]
+                                     a.shield_dv, a.shield_alongside, a.shield_horizon)[lid]
                     buf_shield[t] = torch.isfinite(vs_) & (vs_ < v_max_pol)
                     buf_vsafe[t] = (vs_.clamp(max=v_max_pol) / v_max_pol * 2 - 1).clamp(-1.0, 1.0)
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))

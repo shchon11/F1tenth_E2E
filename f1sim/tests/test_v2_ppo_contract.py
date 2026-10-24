@@ -178,7 +178,8 @@ def test_the_shield_cost_prices_the_risky_command_on_its_own_step(tmp_path, monk
                                           "--sim-backend", "eager", "--wandb", "disabled", "--log-every", "1",
                                           "--save-every", "100", "--critic-warmup", "0", "--collision-mode", "soft",
                                           "--cap0", "9", "--cap1", "9", "--dial-constant", "1.0489", "--race-size", "2",
-                                          "--shield-cost", "0.5", "--shield-path-width", "3.0", "--shield-brake", "0.5"])
+                                          "--shield-cost", "0.5", "--shield-path-width", "3.0", "--shield-brake", "0.5",
+                                          "--shield-horizon", "1.0"])
         importlib.import_module("f1sim.learn.ppo").main()
         rows = [json.loads(line) for line in open(tmp_path / "sc" / "progress.jsonl")]
         assert all("shield_cost/per_step" in r and "loss/shield_excess_mps" in r for r in rows)
@@ -187,3 +188,35 @@ def test_the_shield_cost_prices_the_risky_command_on_its_own_step(tmp_path, monk
         assert all(r["loss/shield"] == r["loss/shield"] for r in rows)        # the hinge's value is still measured
     finally:
         torch.set_num_threads(threads)
+
+
+def test_the_predictive_ceiling_counts_a_car_drifting_into_our_lane_within_the_horizon():
+    """--shield-horizon (2026-10-24): a car wholly ahead but beside our lane counts when its lateral offset, carried on at
+    its current lateral rate, comes under the path width within the horizon -- not when it drifts away, not after the
+    horizon, and not when we would be a car length past it by then. Frenet coordinates (a straight track here)."""
+    from types import SimpleNamespace
+
+    from f1sim import dynamics as dyn
+    from f1sim.learn.ppo_v2 import safe_speed
+
+    track = SimpleNamespace(project=lambda xy, tid, prev_idx=None: (xy[:, 0], xy[:, 1], torch.zeros(xy.shape[0], dtype=torch.long)),
+                            cl_tangent=torch.tensor([[[1.0, 0.0]]]), length=torch.tensor([100.0]))
+
+    def env_with(dx, dy, vy_opp, v_me=5.0, v_opp=3.0):
+        st = torch.zeros(2, dyn.STATE_DIM)
+        st[0, dyn.IX], st[1, dyn.IX], st[1, dyn.IY] = 10.0, 10.0 + dx, dy
+        st[0, dyn.IVX], st[1, dyn.IVX], st[1, dyn.IVY] = v_me, v_opp, vy_opp
+        sim = SimpleNamespace(state=st, other_idx=torch.tensor([[1], [0]]), track=track,
+                              tid=torch.zeros(2, dtype=torch.long), cl_idx=torch.zeros(2, dtype=torch.long))
+        return SimpleNamespace(sim=sim, ecfg=SimpleNamespace(car_len=0.5))
+
+    drifting_in = env_with(2.5, 0.6, -0.5)                          # 0.6 m to the left, coming at 0.5 m/s: under 0.35 in 0.5 s
+    want = 3.0 + (6.0 * (2.0 - 0.2 - 2.0 * 0.2)) ** 0.5
+    assert safe_speed(drifting_in, 3.0, 0.35, 0.2, 0.2, horizon=1.0)[0] == pytest.approx(want)
+    assert torch.isinf(safe_speed(drifting_in, 3.0, 0.35, 0.2, 0.2, horizon=0.25)[0])   # not within the horizon
+    assert torch.isinf(safe_speed(drifting_in, 3.0, 0.35, 0.2, 0.2)[0])                  # the in-lane test does not see it
+    assert torch.isinf(safe_speed(env_with(2.5, 0.6, +0.5), 3.0, 0.35, 0.2, 0.2, horizon=1.0)[0])   # drifting away
+    late = env_with(0.7, 0.9, -0.5)                                 # in our lane after 1.1 s, when we are 1.5 m past it
+    assert torch.isinf(safe_speed(late, 3.0, 0.35, 0.2, 0.2, horizon=1.2)[0])
+    in_lane = env_with(2.5, 0.1, 0.0)                               # already in our lane: the in-lane ceiling, in Frenet
+    assert safe_speed(in_lane, 3.0, 0.35, 0.2, 0.2, horizon=1.0)[0] == pytest.approx(want)

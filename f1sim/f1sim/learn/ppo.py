@@ -994,6 +994,9 @@ def main():
     ap.add_argument("--shield-dv", type=float, default=0.0, metavar="M_S",
                     help="v2 --shield-aux: closing speed [m/s] allowed over the opponent's (pass-slow: hard car contacts "
                          "come from passing faster than ~1 m/s within ~0.8 m laterally); 0 = match its speed")
+    ap.add_argument("--shield-horizon", type=float, default=0.0, metavar="S",
+                    help="v2 --shield-aux/--shield-cost: also count a car wholly ahead whose lateral offset, carried on at "
+                         "its current lateral rate (Frenet), comes under the path width within S seconds (0 = in lane now)")
     ap.add_argument("--shield-alongside", action="store_true",
                     help="v2 --shield-aux: a car counts while its centre is ahead of ours, beside us too (needs "
                          "--shield-dv > 0)")
