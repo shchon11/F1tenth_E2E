@@ -361,13 +361,15 @@ speed) -- does not feed the action. It was retrained on the policy's frozen feat
 Use this file with the speed limit for a car ahead switched on: the console's 「앞차 충돌 방지 감속」, the controller node's
 `opponent_speed_limit:=true`, `evaluate --opponent-speed-limit`.
 
-| finals race cells, fresh seeds 91-92 (props on the line) | hard car /km | hard all /km | race speed | passes /min |
+| finals race cells, fresh seeds 91-94 (~70 km a row) | hard car /km | hard all /km | race speed | passes /min |
 | --- | ---: | ---: | ---: | ---: |
-| limit off | 1.22 | 2.32 | 4.59 m/s | 0.87 |
-| limit on | 0.49 | 1.63 | 4.54 m/s | 0.95 |
+| props on the line, limit off | 1.36 | 2.34 | 4.59 m/s | 0.91 |
+| props on the line, limit on | 0.90 (-34 %) | 2.04 (-13 %) | 4.53 m/s | 0.96 |
+| props off the line, limit off | 1.21 | 1.75 | 4.67 m/s | 0.77 |
+| props off the line, limit on | 0.58 (-52 %) | 1.35 (-23 %) | 4.58 m/s | 0.75 |
 
-With the props off the line: 1.34 -> 0.54 hard car /km, 2.12 -> 1.51 all hard. Solo laps unchanged (the limit never
-engaged without another car). 30 % of the limits are ones the true state would not set; most extra wall hits
+Solo laps unchanged (the limit never engaged without another car). For races with the ROS graph launches, also pass
+`speed_cap:=9.0`: their default cap of 4 m/s leaves no car to catch. 30 % of the limits are ones the true state would not set; most extra wall hits
 (+0.1-0.2 /km) follow those.
 
 ## ICCAS and ICRA picks record their follower (2026-10-23)
