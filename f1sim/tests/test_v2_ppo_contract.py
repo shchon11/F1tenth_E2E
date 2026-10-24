@@ -129,3 +129,61 @@ def test_the_shield_hinge_pulls_the_first_speed_under_the_safe_one(tmp_path, mon
         assert max(r["loss/shield_active_frac"] for r in rows) > 0          # a car was in the (wide) path somewhere
     finally:
         torch.set_num_threads(threads)
+
+
+def test_the_pass_slow_ceiling_allows_a_closing_speed_and_holds_beside_the_car():
+    """--shield-dv / --shield-alongside (2026-10-24): the in-lane ceiling matches the opponent's speed for a car wholly
+    ahead only; pass-slow allows `dv` over it, reaches 0.8 m sideways, and holds while the opponent's centre is ahead of
+    ours -- beside us too, where the in-lane one reads no car (its ceiling there held us beside the opponent)."""
+    from types import SimpleNamespace
+
+    from f1sim import dynamics as dyn
+    from f1sim.learn.ppo_v2 import safe_speed
+
+    def env_with(dx, dy, v_me, v_opp):
+        st = torch.zeros(2, dyn.STATE_DIM)
+        st[1, dyn.IX], st[1, dyn.IY] = dx, dy
+        st[0, dyn.IVX], st[1, dyn.IVX] = v_me, v_opp
+        return SimpleNamespace(sim=SimpleNamespace(state=st, other_idx=torch.tensor([[1], [0]])),
+                               ecfg=SimpleNamespace(car_len=0.5))
+
+    beside = env_with(0.3, 0.6, 5.0, 3.0)                        # centre 0.3 m ahead, overlapping, 0.6 m to the left
+    assert torch.isinf(safe_speed(beside, 3.0, 0.35, 0.2, 0.2)[0])                    # in-lane: not in our path
+    assert torch.isinf(safe_speed(beside, 3.0, 0.8, 0.2, 0.2, dv=1.0)[0])             # wholly-ahead test still applies
+    assert safe_speed(beside, 3.0, 0.8, 0.2, 0.2, dv=1.0, alongside=True)[0] == pytest.approx(4.0)
+    ahead = env_with(2.5, 0.0, 5.0, 3.0)                         # body gap 2.0 m, in lane
+    room = 2.0 - 0.2 - (5.0 - 3.0) * 0.2
+    assert safe_speed(ahead, 3.0, 0.35, 0.2, 0.2)[0] == pytest.approx(3.0 + (6.0 * room) ** 0.5)
+    room = 2.0 - 0.2 - (5.0 - 3.0 - 1.0) * 0.2
+    assert safe_speed(ahead, 3.0, 0.8, 0.2, 0.2, dv=1.0, alongside=True)[0] == pytest.approx(4.0 + (6.0 * room) ** 0.5)
+    behind = env_with(-0.3, 0.6, 5.0, 3.0)                       # its centre behind ours: not ours to slow for
+    assert torch.isinf(safe_speed(behind, 3.0, 0.8, 0.2, 0.2, dv=1.0, alongside=True)[0])
+
+
+def test_the_shield_cost_prices_the_risky_command_on_its_own_step(tmp_path, monkeypatch):
+    """--shield-cost (2026-10-24): with no hinge, a step whose sampled first speed is over the ceiling of a car in our
+    path costs PER_MPS x the excess on that step's reward; the run logs how often and how much, and still monitors the
+    mean's excess (loss/shield_excess_mps) with the hinge itself weighted 0."""
+    import importlib
+    from v2_fixtures import generated_v2_checkpoint
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(2, threads))
+    try:
+        init = generated_v2_checkpoint(str(tmp_path / "student.pt"))
+        monkeypatch.setattr(common, "RUNS_DIR", str(tmp_path))
+        monkeypatch.setenv("WANDB_MODE", "disabled")
+        monkeypatch.setattr(sys, "argv", ["f1sim.learn.ppo", "--arch", "v2", "--name", "sc", "--init", init, "--envs", "8",
+                                          "--tracks", TRACK, "--horizon", "16", "--minibatch", "32", "--grad-accum", "1",
+                                          "--total", str(3 * 16 * 4), "--epochs", "1", "--device", "cpu",
+                                          "--sim-backend", "eager", "--wandb", "disabled", "--log-every", "1",
+                                          "--save-every", "100", "--critic-warmup", "0", "--collision-mode", "soft",
+                                          "--cap0", "9", "--cap1", "9", "--dial-constant", "1.0489", "--race-size", "2",
+                                          "--shield-cost", "0.5", "--shield-path-width", "3.0", "--shield-brake", "0.5"])
+        importlib.import_module("f1sim.learn.ppo").main()
+        rows = [json.loads(line) for line in open(tmp_path / "sc" / "progress.jsonl")]
+        assert all("shield_cost/per_step" in r and "loss/shield_excess_mps" in r for r in rows)
+        assert max(r["shield_cost/active_frac"] for r in rows) > 0           # a car was in the (wide) path somewhere
+        assert max(r["shield_cost/per_step"] for r in rows) > 0              # and some command went over its ceiling
+        assert all(r["loss/shield"] == r["loss/shield"] for r in rows)        # the hinge's value is still measured
+    finally:
+        torch.set_num_threads(threads)

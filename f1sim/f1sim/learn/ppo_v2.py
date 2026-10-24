@@ -129,8 +129,14 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
     if a.init and a.v2_init_stem:
         raise SystemExit("--init continues a v2 policy; --v2-init-stem seeds a fresh one from a v1 stem")
     a.shield_aux = float(a.shield_aux or 0.0)
+    a.shield_cost = float(a.shield_cost or 0.0)
+    if a.shield_cost < 0:
+        raise SystemExit("--shield-cost >= 0")
     if a.shield_aux < 0 or a.shield_brake <= 0 or a.shield_path_width <= 0 or a.shield_lag < 0 or a.shield_gap_min < 0:
         raise SystemExit("--shield-aux >= 0, --shield-brake / --shield-path-width > 0, --shield-lag / --shield-gap-min >= 0")
+    if a.shield_dv < 0 or (a.shield_alongside and a.shield_dv <= 0):
+        raise SystemExit("--shield-dv >= 0; --shield-alongside needs --shield-dv > 0 (a ceiling of the opponent's own speed "
+                         "beside it holds us there: car contacts 9.0 -> 15.6 /km with the oracle, 10-24)")
     if min(a.contact_bce, a.aux_b8, a.aux_near_car) < 0 or not 0 < a.value_norm_beta < 1:
         raise SystemExit("v2 loss weights are >= 0 and --value-norm-beta is in (0, 1)")
     check_balance_args(a)
@@ -163,11 +169,17 @@ def _per_km(count, dist_m: float) -> float:
     return 1000.0 * float(count) / dist_m if dist_m > 1.0 else float("nan")
 
 
-def safe_speed(env, brake: float, width: float, lag: float, gap_min: float) -> torch.Tensor:
+def safe_speed(env, brake: float, width: float, lag: float, gap_min: float, dv: float = 0.0,
+               alongside: bool = False) -> torch.Tensor:
     """(B,) [m/s] the speed each car can still bring down to the speed of the car in its path ahead before the gap
     closes -- v_opp + sqrt(2 brake (gap - gap_min - (v_me - v_opp)_+ lag)_+) -- for the nearest such car of its race,
     inf where none is in the path (wholly ahead: body gap > 0.1 m along our heading, within 6 m, |y| < width). True states: `--shield-aux`'s target,
-    training only."""
+    training only.
+
+    PASS-SLOW (dv > 0, 2026-10-24): the ceiling allows `dv` over the opponent's speed --
+    v_opp + dv + sqrt(2 brake (gap - gap_min - (v_me - v_opp - dv)_+ lag)_+) -- and with `alongside` holds while the
+    opponent's centre is ahead of ours (dx > 0), beside it too. Hard car contacts come from closing faster than ~1 m/s
+    within ~0.8 m laterally (docs/research/passing-risk-2026-10-24)."""
     from .. import dynamics as dyn
     st = env.sim.state
     o = env.sim.other_idx                                                   # (B, C)
@@ -180,11 +192,11 @@ def safe_speed(env, brake: float, width: float, lag: float, gap_min: float) -> t
     v_opp = (vox * c + voy * s_).clamp_min(0.0)
     v_me = st[:, dyn.IVX][:, None]
     gap = (dx - float(env.ecfg.car_len)).clamp_min(0.0)
-    room = (gap - gap_min - (v_me - v_opp).clamp_min(0.0) * lag).clamp_min(0.0)
-    vs = v_opp + torch.sqrt(2.0 * brake * room)
+    room = (gap - gap_min - (v_me - v_opp - dv).clamp_min(0.0) * lag).clamp_min(0.0)
+    vs = v_opp + dv + torch.sqrt(2.0 * brake * room)
     # clearly AHEAD: no longitudinal overlap. A car alongside (gap 0) is not "in our path": capping us to its speed there
     # keeps us stuck beside it mid-pass -- measured with the oracle shield (10-24): car contacts 9.0 -> 15.6 /km
-    inpath = (gap > 0.1) & (dx < 6.0) & (dy.abs() < width)
+    inpath = ((dx > 0.0) if alongside else (gap > 0.1)) & (dx < 6.0) & (dy.abs() < width)
     if getattr(env.sim, "absent_any", False):
         inpath = inpath & ~env.sim.absent[o]
     return torch.where(inpath, vs, torch.full_like(vs, float("inf"))).min(1).values
@@ -280,8 +292,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                   "speed_command": str(a.speed_command), "v2_defaults": applied,
                   "lagrange": ({n: {"target": t, "lambda_init": l0}
                                 for n, (t, l0) in parse_lagrange(a.lagrange, a.lagrange_init).items()} if a.lagrange else None),
-                  "shield_aux": ({"coef": float(a.shield_aux), "brake": float(a.shield_brake), "path_width": float(a.shield_path_width),
-                                  "lag": float(a.shield_lag), "gap_min": float(a.shield_gap_min)} if a.shield_aux > 0 else None),
+                  "shield_aux": ({"coef": float(a.shield_aux), "cost": float(a.shield_cost), "brake": float(a.shield_brake),
+                                  "path_width": float(a.shield_path_width), "lag": float(a.shield_lag),
+                                  "gap_min": float(a.shield_gap_min), "dv": float(a.shield_dv),
+                                  "alongside": bool(a.shield_alongside)} if (a.shield_aux > 0 or a.shield_cost > 0) else None),
                   "losses": {"vf": float(a.vf), "vf_clip": float(a.vf_clip), "contact_bce": coefs["contact"],
                              "contact_horizon_steps": CONTACT_HORIZON,
                              "contact_label_delay_updates": (-(-(CONTACT_HORIZON - 1) // int(a.horizon))
@@ -362,8 +376,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         buf_b8_lab, buf_b8_cand, buf_b8_age = z(T, B, 3, 3), z(T, B, 3, dtype=torch.bool), z(T, B, 3, dtype=torch.long)
     if on["near"]:
         buf_near = z(T, B, 5)
-    #: `--shield-aux`: the first-speed ceiling of each step in action units, and where a car is in our path
-    shield_on = a.shield_aux > 0 and env.sim.other_idx is not None
+    #: `--shield-aux` / `--shield-cost`: the first-speed ceiling of each step in action units, and where a car is in our path
+    shield_on = (a.shield_aux > 0 or a.shield_cost > 0) and env.sim.other_idx is not None
+    shield_cost_sum = shield_cost_n = 0.0
     if shield_on:
         from ..mpc import plan_layout
         i_v1 = plan_layout("wp4").speed.start
@@ -486,10 +501,20 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 if buf_lvl is not None:
                     buf_lvl[t] = env.level_seed[lid]
                 if shield_on:
-                    vs_ = safe_speed(env, a.shield_brake, a.shield_path_width, a.shield_lag, a.shield_gap_min)[lid]
+                    vs_ = safe_speed(env, a.shield_brake, a.shield_path_width, a.shield_lag, a.shield_gap_min,
+                                     a.shield_dv, a.shield_alongside)[lid]
                     buf_shield[t] = torch.isfinite(vs_) & (vs_ < v_max_pol)
                     buf_vsafe[t] = (vs_.clamp(max=v_max_pol) / v_max_pol * 2 - 1).clamp(-1.0, 1.0)
                 obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
+                if shield_on and a.shield_cost > 0:
+                    # `--shield-cost`: the step's own command over the ceiling, charged on this step's reward -- a dense,
+                    # immediate price on the risky action, credited through the advantages to the states where it
+                    # applies (a supervised hinge on mu_v1 shifted the first speed everywhere, solo too: -0.38 m/s)
+                    v1_cmd = (act[lid][:, i_v1].clamp(-1, 1).float() + 1) / 2 * v_max_pol
+                    exc_ = torch.where(buf_shield[t], (v1_cmd - vs_.float()).clamp_min(0.0), torch.zeros_like(v1_cmd))
+                    pen_ = a.shield_cost * exc_
+                    rew = rew.clone(); rew[lid] = rew[lid] - pen_
+                    shield_cost_sum += float(pen_.sum()); shield_cost_n += float(buf_shield[t].sum())
                 h_actor = h_next.float()
                 controller.post_step(term, trunc)
                 done_now = term | trunc
@@ -754,6 +779,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                         for i_, k in enumerate(REWARD_COMPONENT_KEYS)})
             for n_, v_ in lagrange.items():
                 log[f"lagrange/{n_}_lambda"] = v_["lam"]; log[f"lagrange/{n_}_rate_per_km"] = v_["rate"]
+            if shield_on and a.shield_cost > 0:
+                log["shield_cost/per_step"] = shield_cost_sum / max(float(T * B), 1.0)
+                log["shield_cost/per_active_step"] = shield_cost_sum / max(shield_cost_n, 1.0)
+                log["shield_cost/active_frac"] = shield_cost_n / max(float(T * B), 1.0)
+                shield_cost_sum = shield_cost_n = 0.0
             sev_rates = severity_rates(buf_sev, buf_prog, buf_mask) if buf_sev is not None else {}
             log.update(sev_rates)
             if ep_stats["return"]:

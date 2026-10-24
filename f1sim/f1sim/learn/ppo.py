@@ -978,6 +978,10 @@ def main():
                          "car's before the gap closes (true states, training only; the deployed policy reads nothing "
                          "new). The sparse contact cost never taught the policy to brake for a slower car although its "
                          "state predicts the contact (docs/research/car-contact-learning-2026-10-24). 0 = off")
+    ap.add_argument("--shield-cost", type=float, default=None, metavar="PER_MPS",
+                    help="v2 (2026-10-24): a reward cost per step of PER_MPS x (v1 - v_safe)_+ [m/s] wherever a car is in "
+                         "our path (the --shield-* ceiling; true states, training only): the risky action priced on its "
+                         "own step instead of a supervised hinge, which shifted the first speed everywhere. 0 = off")
     ap.add_argument("--shield-brake", type=float, default=3.0, metavar="M_S2",
                     help="v2 --shield-aux: the deceleration v_safe assumes [m/s^2]")
     ap.add_argument("--shield-path-width", type=float, default=0.35, metavar="M",
@@ -987,6 +991,12 @@ def main():
                     help="v2 --shield-aux: drive lag [s] spent at the current closing speed before braking bites")
     ap.add_argument("--shield-gap-min", type=float, default=0.2, metavar="M",
                     help="v2 --shield-aux: body gap [m] left when the speeds match")
+    ap.add_argument("--shield-dv", type=float, default=0.0, metavar="M_S",
+                    help="v2 --shield-aux: closing speed [m/s] allowed over the opponent's (pass-slow: hard car contacts "
+                         "come from passing faster than ~1 m/s within ~0.8 m laterally); 0 = match its speed")
+    ap.add_argument("--shield-alongside", action="store_true",
+                    help="v2 --shield-aux: a car counts while its centre is ahead of ours, beside us too (needs "
+                         "--shield-dv > 0)")
     ap.add_argument("--aux-balance-every", type=int, default=None, metavar="K",
                     help="v2: every K updates, set each auxiliary loss's multiplier from the per-loss gradient "
                          "norms on the shared actor trunk so it pulls the trunk at most --aux-balance-rho x "
@@ -1004,7 +1014,7 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "critic_lr", "value_norm_beta", "contact_bce", "aux_b8",
                               "aux_near_car", "aux_balance_every", "aux_balance_rho", "aux_balance_beta",
-                              "opponent_speed_mode", "shield_aux")
+                              "opponent_speed_mode", "shield_aux", "shield_cost")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
