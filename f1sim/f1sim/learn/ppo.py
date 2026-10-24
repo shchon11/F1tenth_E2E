@@ -980,8 +980,9 @@ def main():
                          "state predicts the contact (docs/research/car-contact-learning-2026-10-24). 0 = off")
     ap.add_argument("--shield-brake", type=float, default=3.0, metavar="M_S2",
                     help="v2 --shield-aux: the deceleration v_safe assumes [m/s^2]")
-    ap.add_argument("--shield-path-width", type=float, default=0.45, metavar="M",
-                    help="v2 --shield-aux: |lateral| offset [m] in our frame under which a car ahead is in our path")
+    ap.add_argument("--shield-path-width", type=float, default=0.35, metavar="M",
+                    help="v2 --shield-aux: |lateral| offset [m] in our frame under which a car wholly ahead is in our "
+                         "path (bodies 0.3 m wide: 0.35 = overlapping lanes)")
     ap.add_argument("--shield-lag", type=float, default=0.2, metavar="S",
                     help="v2 --shield-aux: drive lag [s] spent at the current closing speed before braking bites")
     ap.add_argument("--shield-gap-min", type=float, default=0.2, metavar="M",

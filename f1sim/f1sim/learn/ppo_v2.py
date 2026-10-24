@@ -166,7 +166,7 @@ def _per_km(count, dist_m: float) -> float:
 def safe_speed(env, brake: float, width: float, lag: float, gap_min: float) -> torch.Tensor:
     """(B,) [m/s] the speed each car can still bring down to the speed of the car in its path ahead before the gap
     closes -- v_opp + sqrt(2 brake (gap - gap_min - (v_me - v_opp)_+ lag)_+) -- for the nearest such car of its race,
-    inf where none is in the path (x > 0 within 6 m, |y| < width, in our frame). True states: `--shield-aux`'s target,
+    inf where none is in the path (wholly ahead: body gap > 0.1 m along our heading, within 6 m, |y| < width). True states: `--shield-aux`'s target,
     training only."""
     from .. import dynamics as dyn
     st = env.sim.state
@@ -182,7 +182,9 @@ def safe_speed(env, brake: float, width: float, lag: float, gap_min: float) -> t
     gap = (dx - float(env.ecfg.car_len)).clamp_min(0.0)
     room = (gap - gap_min - (v_me - v_opp).clamp_min(0.0) * lag).clamp_min(0.0)
     vs = v_opp + torch.sqrt(2.0 * brake * room)
-    inpath = (dx > 0) & (dx < 6.0) & (dy.abs() < width)
+    # clearly AHEAD: no longitudinal overlap. A car alongside (gap 0) is not "in our path": capping us to its speed there
+    # keeps us stuck beside it mid-pass -- measured with the oracle shield (10-24): car contacts 9.0 -> 15.6 /km
+    inpath = (gap > 0.1) & (dx < 6.0) & (dy.abs() < width)
     if getattr(env.sim, "absent_any", False):
         inpath = inpath & ~env.sim.absent[o]
     return torch.where(inpath, vs, torch.full_like(vs, float("inf"))).min(1).values
