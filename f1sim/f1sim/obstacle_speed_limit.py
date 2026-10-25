@@ -21,11 +21,14 @@ the speed limit for a car ahead (`opponent_speed_limit`). Nothing reads the simu
 controller node (`f1sim_ros`, parameter `obstacle_speed_limit`), the console and `evaluate --obstacle-speed-limit`.
 
 Measured on the Korea entry (`korea26_v2_ppo_s2421_u512_nearcar_slow`, finals race cells, props on the line, the car limit
-on in both rows, same card per row): all hard contacts 2.19 -> 1.33 /km (seeds 81-84) and 1.95 -> 1.48 (fresh 91-94),
-hard prop contacts 1.24 -> 0.63 and 0.91 -> 0.74, hard car contacts down too, race speed -4 to -5 %, passes about
-the same; in solo laps with props on the line 4.84 -> 4.81 m/s and no more hits (a version from the TRUE prop positions
-cost -3 % and hit props more there). On the real venue runs (open loop) it would have held the car on 3-7 % of the
-scans, on boxes and cars, on wall features 0-20 % of those.
+on in both rows, same card per row, the rule as it stands since 300e051): all hard (>= 1.5 m/s) contacts 2.19 -> 1.74 /km
+(seeds 81-84) and 1.95 -> 1.70 (fresh 91-94), hard prop contacts 1.24 -> 0.72 and 0.91 -> 0.75, race speed -1.1 / -1.6 %,
+passes unchanged. Before 300e051 a missed return counted as background and walls seen at a grazing angle set half of its
+holds: -32 % hard contacts at -4.4 % speed, the extra coming from slowing at walls, not from boxes. What it still misses
+(prop_contact_anatomy.py, 51 hard prop contacts): pieces standing against a wall or another piece (47 %; a wall-attached
+box is part of the wall's cluster), holds that came too late (35 %), the smallest 0.135 m box the 0.11 m scan plane passes
+over at speed. On the real venue runs (open loop) it would have held the car on 3.9-6.8 % of the scans, on boxes and
+objects; wall features 0-8 % of those.
 """
 from __future__ import annotations
 

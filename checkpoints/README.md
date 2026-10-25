@@ -409,11 +409,15 @@ so it needs this file's output too (a v2 checkpoint with `near_car`; refused wit
 | finals race cells, props on the line, `_nearcar_slow` + latch (car limit on in both rows) | hard all /km | hard prop /km | race speed |
 | --- | ---: | ---: | ---: |
 | seeds 81-84, car limit only | 2.19 | 1.24 | 4.46 m/s |
-| seeds 81-84, + obstacle limit | 1.33 (-39 %) | 0.63 | 4.26 m/s |
+| seeds 81-84, + obstacle limit | 1.74 (-21 %) | 0.72 | 4.41 m/s |
 | fresh 91-94, car limit only | 1.95 | 0.91 | 4.51 m/s |
-| fresh 91-94, + obstacle limit | 1.48 (-24 %) | 0.74 | 4.32 m/s |
+| fresh 91-94, + obstacle limit | 1.70 (-13 %) | 0.75 | 4.44 m/s |
 
-Alone with props on the line: 4.84 -> 4.81 m/s, no more hits. One control cycle of it costs 0.6 ms on one core of the lab
+These are the rule since 300e051 (2026-10-26). The first numbers published here (-24..-39 % at -4..-5 % speed) came from a rule
+that read a missed return as background: walls seen at a grazing angle set half of its holds and slowed the car at walls.
+Boxes standing against a wall are read as part of it and not held for.
+
+Alone with props on the line (the earlier rule): 4.84 -> 4.81 m/s, no more hits. One control cycle of it costs 0.6 ms on one core of the lab
 PC (Ryzen 7 260); measure it on the car's AGX Orin before relying on the margin.
 
 ## ICCAS and ICRA picks record their follower (2026-10-23)

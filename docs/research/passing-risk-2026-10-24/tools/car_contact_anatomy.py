@@ -14,7 +14,9 @@ Protocol = the finals' race cells (tools/baselines/final_eval2.ours_race): race 
 speed_scale U(0.7, 1.0), soft contacts, props, rep floor, dial 1.0489, the checkpoint's own follower (its contract).
 usage: car_contact_anatomy.py CKPT OUT_DIR [SEEDS=81,82] [KINDS=forzaeth,forzaeth_pred,lane_switch,interactive]
 env OSL=1 / OBSL=1: the speed limit for a car ahead / for an obstacle on the plan's path on (10-26: each event then also carries the
-last second of what the limits did -- held or not, the policy's nearest-car reading, the command after the limits)."""
+last second of what the limits did -- held or not, the policy's nearest-car reading, the command after the limits).
+env SCANS=1 (10-26): also keep, per event, the last 0.5 s of the scans the policy planned from and the partner's TRUE position in the
+ego frame (OUT/scans.pt), to test a scan-refined reading of where the car is."""
 import json
 import math
 import os
@@ -55,6 +57,7 @@ class Recorder:
         self.held_obs = torch.zeros(K, B, dtype=torch.bool, device=dev)   # the obstacle limit held the command
         self.reading = torch.zeros(K, B, 5, device=dev)                   # the policy's nearest-car reading (raw)
         self.cmd = torch.zeros(K, B, device=dev)                          # the speed command after the limits
+        self.scan = torch.zeros(K, B, int(sim.lidar.angles.shape[0]), device=dev) if os.environ.get("SCANS") else None
 
     def observe(self, env, sim, r, entry, action, v_plan):
         fresh = entry == 0
@@ -72,6 +75,8 @@ class Recorder:
         if rd is not None:
             self.reading[0] = rd.float()
         self.cmd = torch.roll(self.cmd, 1, 0); self.cmd[0] = env.last_cmd_raw[:, 1].float()
+        if self.scan is not None and CUR.get("scan") is not None:
+            self.scan = torch.roll(self.scan, 1, 0); self.scan[0] = CUR["scan"].float()
         self.age += 1
         if r.car_collision is None or r.car_impact is None:
             return
@@ -127,15 +132,27 @@ class Recorder:
                                obs_held_hist=[int(x) for x in self.held_obs[:n, i].tolist()],
                                reading_hist=[[round(float(v), 3) for v in row] for row in self.reading[:n, i].tolist()],
                                cmd_hist=[round(float(x), 2) for x in self.cmd[:n, i].tolist()]))
+            if self.scan is not None:
+                m = min(n, 20)
+                rel = []
+                for t in range(m):                                         # the partner in the ego frame (reference point)
+                    ct, st_ = math.cos(float(self.st[t, i, 2])), math.sin(float(self.st[t, i, 2]))
+                    wx_, wy_ = float(self.st[t, j, 0] - self.st[t, i, 0]), float(self.st[t, j, 1] - self.st[t, i, 1])
+                    rel.append([ct * wx_ + st_ * wy_, -st_ * wx_ + ct * wy_, float(self.st[t, j, 2] - self.st[t, i, 2])])
+                SCANS.append(dict(event=len(EVENTS) - 1, scans=self.scan[:m, i].cpu().half(), rel=torch.tensor(rel),
+                                  reading=self.reading[:m, i].cpu()))
 
 
 RECS = {}
+SCANS = []
 _orig_env_step = gym_env.F1VecEnv.step
 _orig_sim_step = Simulator.step
 
 
 def env_step(self, action):
-    CUR.update(env=self, action=action, in_step=True, v_plan=self._tracker_plan_speed().clone())
+    lr_ = self.last_result
+    CUR.update(env=self, action=action, in_step=True, v_plan=self._tracker_plan_speed().clone(),
+               scan=(lr_.scan.clone() if (os.environ.get("SCANS") and lr_ is not None and lr_.scan is not None) else None))
     try:
         return _orig_env_step(self, action)
     finally:
@@ -184,6 +201,8 @@ for seed in SEEDS:
         print(f"seed {seed} {kind}: {len(EVENTS) - n0} events recorded, the meter's hard car onsets {hard_car}, "
               f"{km:.2f} learner km, race {float(d['mean_speed']):.2f} m/s", flush=True)
         json.dump(EVENTS, open(os.path.join(OUT, "events.json"), "w"))
+        if SCANS:
+            torch.save(SCANS, os.path.join(OUT, "scans.pt"))
 
 from collections import Counter
 cnt = Counter(e["cls"] for e in EVENTS)
