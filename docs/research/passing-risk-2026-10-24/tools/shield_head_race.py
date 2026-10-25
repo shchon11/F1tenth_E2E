@@ -44,6 +44,14 @@ TRACK = "real:korea_2026_competition"
 CAR_LEN = 0.5
 MEASURE = bool(os.environ.get("SHIELD_MEASURE_ONLY"))
 DEADBAND = float(os.environ.get("SHIELD_DEADBAND", "0") or 0)
+#: EXISTS_LOGIT=x: count a car only when the head's existence logit is above x (0 = its own 50 % line); 14 % of the false
+#: limits were a car where there was none (shield_dual_diag.py)
+EXISTS_LOGIT = float(os.environ.get("EXISTS_LOGIT", "0") or 0)
+#: PLAN_CONFLICT=1 (10-25): also count a car wholly ahead whose predicted position (its velocity held) comes within
+#: CONFLICT_R of OUR planned path at the time we would be there, within H -- with the limit on, 74 % of the hard car contacts
+#: left had OUR car moving toward the other in their last 0.5 s (anat_osl_*), which the lateral-rate test cannot see
+PLAN_CONFLICT = bool(os.environ.get("PLAN_CONFLICT"))
+CONFLICT_R = float(os.environ.get("CONFLICT_R", "0.45") or 0.45)
 os.makedirs(OUT, exist_ok=True)
 CUR = {"env": None, "near": None}
 STAT = {"steps": 0, "active": 0, "cut_sum": 0.0}
@@ -80,7 +88,30 @@ def relative(env):
         full[env.learner] = near
         near = full
     near = near.float()
-    return near[:, 0] > 0, near[:, 1] * 5.0 + mx, near[:, 2] * 2.0 + my, near[:, 3] * 5.0, near[:, 4] * 2.0
+    return near[:, 0] > EXISTS_LOGIT, near[:, 1] * 5.0 + mx, near[:, 2] * 2.0 + my, near[:, 3] * 5.0, near[:, 4] * 2.0
+
+
+def plan_conflict(env, ex, dx, dy, closing, vlat):
+    """(B,) a car whose constant-velocity path meets our plan's path within H, within CONFLICT_R (car frame now)"""
+    from f1sim import mpc
+    a = CUR.get("action")
+    B = dx.shape[0]
+    if a is None or a.shape[0] != B:
+        return torch.zeros(B, dtype=torch.bool, device=dx.device)
+    v_me = env.sim.state[:, dyn.IVX].float().clamp_min(0.5)
+    spec, vmax = env.tracker.spec, float(env.tracker.v_max)
+    k, L, _ = mpc.decode_wp4(a.float(), v_me, vmax, torch.full((B,), 9.0, device=a.device), spec)
+    DS, N = 0.1, 40
+    s = torch.arange(1, N + 1, device=a.device, dtype=torch.float32) * DS
+    seg = (s[None, :] / (L[:, None] / k.shape[1]).clamp_min(1e-3)).floor().long().clamp(max=k.shape[1] - 1)
+    th = torch.cumsum(k.gather(1, seg) * DS, 1)
+    px, py = torch.cumsum(torch.cos(th) * DS, 1), torch.cumsum(torch.sin(th) * DS, 1)     # (B, N) our path
+    t = s[None, :] / v_me[:, None]                                                       # when we would be there
+    vox, voy = (v_me - closing)[:, None], vlat[:, None]                                  # its velocity, our frame now
+    ox, oy = dx[:, None] + vox * t, dy[:, None] + voy * t
+    d = torch.hypot(px - ox, py - oy)
+    hit = (d < CONFLICT_R) & (t <= H) & (s[None, :] <= L[:, None].clamp_min(1.0))
+    return ex & hit.any(1)
 
 
 def v_safe(env):
@@ -95,10 +126,13 @@ def v_safe(env):
                        torch.where((dy * vlat) < 0, (dy.abs() - W) / vlat.abs().clamp_min(1e-6), torch.full_like(dy, 1e9)))
     past = (dx - closing * t_in.clamp(max=H)) < -(CAR_LEN + 0.1)
     hit = ex & (gap > 0.1) & (dx < 6.0) & (t_in <= H) & ~past
+    if PLAN_CONFLICT:
+        hit = hit | (ex & (gap > 0.1) & (dx < 6.0) & plan_conflict(env, ex, dx, dy, closing, vlat))
     return torch.where(hit, vs, torch.full_like(vs, 1e9))
 
 
 def map_call(self, action, v_meas, speed_cap, yaw_rate=None, delay=None):
+    CUR["action"] = action
     out = _orig_map_call(self, action, v_meas, speed_cap, yaw_rate, delay)
     env = CUR["env"]
     if env is not None and env.tracker is self and (env.sim.M > 1 or SOURCE == "head"):
