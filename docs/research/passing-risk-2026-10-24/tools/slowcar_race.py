@@ -17,6 +17,8 @@ import torch
 
 from f1sim import gym_env, map_controller as mc, mpc
 from f1sim.learn import evaluate as ev
+if os.environ.get("LATCH"):
+    import latch_patch  # noqa: F401  (10-25: the latched lane check, see latch_patch.py)
 
 CK, OUT = sys.argv[1], sys.argv[2]
 SEEDS = [int(x) for x in sys.argv[3].split(",")]
@@ -83,7 +85,10 @@ for seed in SEEDS:
                 "--procedural-max-props", "10", "--procedural-raceline-corridor", "on",
                 "--opp-slots", json.dumps([{"kind": "raceline", "speed_scale": SCALE}]), "--output", out,
                 "--dial-value", "1.0489", "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92",
-                *(["--opponent-speed-limit"] if os.environ.get("OSL") else [])]
+                *(["--opponent-speed-limit"] if os.environ.get("OSL") else []),
+                # EGO_TEACHER (10-25): a privileged teacher drives our car instead (e.g. interactive) -- is there a label
+                # source that handles a near-stopped car?
+                *(["--teacher", "--teacher-kind", os.environ["EGO_TEACHER"]] if os.environ.get("EGO_TEACHER") else [])]
     ev.main()
     r = torch.cat(ROWS).numpy() if ROWS else np.zeros((0, 5), np.float32)
     np.save(os.path.join(OUT, f"rows_s{seed}.npy"), r)

@@ -162,5 +162,17 @@
   ],
   "source_mb": 9.3,
   "note": "korea26_v2_ppo_s2421_u512 with only actor.near_car.* retrained on its frozen features (head_data.py / head_train.py, seeds 85-86, early-stopped); drives identically"
+ },
+ {
+  "file": "korea26_v2_ppo_s2421_u512_nearcar_slow.pt",
+  "run": "v2PH_s2421",
+  "update": 512,
+  "sha256": "dc111260ebaf3212357e0526bfe143884c9e2b45fc9e2cb0a29ee4df2c611ea9",
+  "size_mb": 9.3,
+  "dropped": [
+   "extra.opt"
+  ],
+  "source_mb": 9.3,
+  "note": "korea26_v2_ppo_s2421_u512_nearcar with only actor.near_car.* retrained again, now with near-stopped cars (head_train.py from the nearcar head: entry race cells seeds 85-86 + a raceline car at x0.05 and x0.2 seeds 85-88, validation seed 81 mixed, weights 10/5/5, pre-contact x6, early-stopped); drives identically. For the speed limit for a car ahead with its latched lane check (10-25)"
  }
 ]

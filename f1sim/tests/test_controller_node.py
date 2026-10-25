@@ -653,3 +653,20 @@ def test_a_reading_from_the_scan_just_before_stands_in_when_this_scans_is_not_in
     assert n.last_cmd[1] < 3.0
     kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
     assert kv["opponent_limited_commands"] == "1" and kv["opponent_previous_scan_readings"] == "1"
+
+
+def test_a_car_the_limit_holds_stays_held_out_to_lane_exit_and_no_reading_lets_go():
+    """2026-10-25: once the limit applies to a car, later scans keep it while its offset is under `lane_exit` (0.5 m);
+    the same offset is out of our lane for a car the limit was not holding, and a scan without a reading lets go."""
+    n = make_node(speed=3.0)
+    n.opponent_speed_limit = True; n._opp_limited = 0; n._opp_no_reading = 0; n._opp_held = False
+    for t, dy, limited in ((1.0, 0.45, False), (1.1, 0.0, True), (1.2, 0.45, True)):
+        s = ros_time(t)
+        n.on_perception(car_ahead_perception(s, dy=dy))
+        sensors_at(n, 2.5, s)
+        n.on_plan(plan_msg(s))
+        assert (n.last_cmd[1] < 3.0) == limited and n._opp_held == limited, (t, dy)
+    s = ros_time(1.5)                                               # nothing from the last 0.1 s
+    sensors_at(n, 2.5, s)
+    n.on_plan(plan_msg(s))
+    assert n.last_cmd[1] == pytest.approx(3.0) and not n._opp_held

@@ -90,7 +90,8 @@
     # The speed limit for a car ahead (f1sim/opponent_speed_limit.py): hold the speed command to the speed from which
     # the car can still slow to the speed of a car in its lane, or one moving into it within 1 s, read off the policy's
     # own nearest-car output (sent with each scan's /f1sim/policy/perception; v2 checkpoints, best with
-    # korea26_v2_ppo_s2421_u512_nearcar.pt). Off by default.
+    # korea26_v2_ppo_s2421_u512_nearcar_slow.pt, whose output also reads near-stopped cars). A car the limit holds stays
+    # held out to 0.5 m sideways (`lane_exit`). Off by default.
     opponent_speed_limit: false
     device: "cpu"
     speed_cap: 4.0            # must equal the policy's

@@ -1150,6 +1150,8 @@ class F1VecEnv:
         #: limit held the speed command this step. None when off.
         self.opponent_reading = None
         self.opponent_limited = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: rows whose speed limit applied last step (`speed_limit(held=...)`): their car stays held to `lane_exit`
+        self.opponent_held = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         if e.opponent_speed_limit:
             from .opponent_speed_limit import no_car
             self.opponent_reading = no_car(self.B, device=self.device)
@@ -2447,6 +2449,7 @@ class F1VecEnv:
             seat.reset_actions(ids, self.prev_action)
         self.ep_step[ids] = 0; self.ep_return[ids] = 0.0; self.ep_progress[ids] = 0.0
         self.ep_limit[ids] = self.NO_LIMIT; self.ep_contacts[ids] = 0.0
+        self.opponent_held[ids] = False                            # a fresh car holds no car ahead
         self.lap_start_step[ids] = 0; self.prev_lap[ids] = 0
         if self.ecfg.reward_lap_time > 0:
             # a car spawns mid-sector, so its first boundary is not a sector it drove: start the clock
@@ -2934,7 +2937,8 @@ class F1VecEnv:
                 # LiDAR's nominal mount, as the car knows it
                 from .opponent_speed_limit import speed_limit
                 lim = speed_limit(self.opponent_reading, self.sim.state[:, 3], float(self.cfg.lidar.mount_x),
-                                  float(self.cfg.lidar.mount_y))
+                                  float(self.cfg.lidar.mount_y), held=self.opponent_held)
+                self.opponent_held = torch.isfinite(lim)
                 v = raw[:, 1]
                 held = self.learner & (v > lim.to(v.dtype))
                 self.opponent_limited = held

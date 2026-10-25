@@ -200,6 +200,8 @@ class ControllerNode(Node):
         self.opponent_speed_limit = bool(p("opponent_speed_limit"))
         self._opp_limited = 0
         self._opp_no_reading = 0
+        #: whether the last reading's limit applied: that car stays held to `lane_exit` (`speed_limit(held=...)`)
+        self._opp_held = False
         self.plan_speed_scale = float(p("plan_speed_scale"))
         if not (0.2 <= self.plan_speed_scale <= 1.5):
             raise ValueError(f"plan_speed_scale {self.plan_speed_scale}: expected a factor near 1 (0.2-1.5)")
@@ -585,12 +587,15 @@ class ControllerNode(Node):
             if per is not None and len(per.nearest_car) == 5:
                 from f1sim.opponent_speed_limit import speed_limit
                 lim = float(speed_limit(torch.tensor([list(per.nearest_car)], dtype=torch.float32),
-                                        torch.tensor([float(snap.v)]), LIDAR_MOUNT_X, 0.0)[0])
+                                        torch.tensor([float(snap.v)]), LIDAR_MOUNT_X, 0.0,
+                                        held=torch.tensor([bool(getattr(self, "_opp_held", False))]))[0])
+                self._opp_held = math.isfinite(lim)
                 if speed > lim:
                     speed = lim
                     self._opp_limited += 1
             else:
                 self._opp_no_reading += 1
+                self._opp_held = False
         if self.traction is not None:
             # Last thing before the command leaves, and *before* `speed_gain`: the guard reasons in
             # the car's own m/s -- it compares the command against a body speed estimated from this

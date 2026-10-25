@@ -85,3 +85,40 @@ def test_the_env_holds_the_learners_speed_command_to_the_limit_and_leaves_other_
     assert float(env.last_cmd_raw[0, 1]) < float(free[0])
     lim = speed_limit(env.opponent_reading, v_me, float(cfg.lidar.mount_x), float(cfg.lidar.mount_y))
     assert float(env.last_cmd_raw[0, 1]) <= float(lim[0]) + 1e-5
+
+
+def test_a_car_already_held_stays_held_out_to_lane_exit_and_is_let_go_beyond():
+    """2026-10-25: closing on a near-stopped car the reading's offset drifts outward at close range, and a 0.35 m check let
+    go of the car just before most rear-ends. A car the limit already holds is measured against `lane_exit` (0.5 m)."""
+    v = torch.tensor([5.0])
+    beside_lane = reading(2.2, 0.45, 2.0, 0.0)                    # 0.45 m to the side, no sideways speed
+    assert torch.isinf(speed_limit(beside_lane, v)).all()                                  # a fresh car: not in our lane
+    assert torch.isinf(speed_limit(beside_lane, v, held=torch.tensor([False]))).all()
+    held = speed_limit(beside_lane, v, held=torch.tensor([True]))                          # the car we were holding
+    assert torch.isfinite(held).all()
+    assert float(held) == pytest.approx(float(speed_limit(reading(2.2, 0.0, 2.0, 0.0), v)), rel=1e-6)
+    assert torch.isinf(speed_limit(reading(2.2, 0.55, 2.0, 0.0), v, held=torch.tensor([True]))).all()   # past lane_exit
+    assert torch.isinf(speed_limit(reading(0.0, 0.2, 2.0, 0.0), v, held=torch.tensor([True]))).all()    # not wholly ahead
+    assert torch.isinf(speed_limit(reading(2.2, 0.2, 2.0, 0.0, seen=False), v, held=torch.tensor([True]))).all()
+    assert DEFAULT.lane_exit == 0.5 and DEFAULT.lane_half_width == 0.35
+
+
+def test_the_env_keeps_holding_the_car_it_holds_and_a_reset_lets_go():
+    cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+    env = common.make_env([maps.load("real:korea_2025_iccas")], 2, "cpu",
+                          EnvConfig(max_steps=100, hist_len=0, action_mode="plan", speed_mode="wp4",
+                                    compile_tracker=False, opponent_speed_limit=True), cfg=cfg, seed=1)
+    env.reset(seed=1)
+    a = torch.zeros(2, env.act_dim)
+    a[:, 4:] = 0.9
+    env.opponent_reading.copy_(torch.cat([reading(1.2, 0.45, 3.0, 0.0)] * 2))   # beside our lane: nothing held yet
+    env.step(a)
+    assert not bool(env.opponent_held.any()) and not bool(env.opponent_limited.any())
+    env.opponent_reading.copy_(torch.cat([reading(1.2, 0.0, 3.0, 0.0)] * 2))    # in our lane: held and limited
+    env.step(a)
+    assert bool(env.opponent_held.all()) and bool(env.opponent_limited.all())
+    env.opponent_reading.copy_(torch.cat([reading(1.2, 0.45, 3.0, 0.0)] * 2))   # the same 0.45 m now: still limited
+    env.step(a)
+    assert bool(env.opponent_held.all()) and bool(env.opponent_limited.all())
+    env._reset_envs(torch.tensor([0]))                                          # a fresh car holds nothing
+    assert not bool(env.opponent_held[0]) and bool(env.opponent_held[1])

@@ -21,10 +21,23 @@ Measured on the Korea entry (finals race cells, fresh seeds 91-92): hard (>= 1.5
 with props on the line and 1.34 -> 0.54 with props off, all hard contacts 2.32 -> 1.63 and 2.12 -> 1.51, race speed
 -1..-2 %, passes unchanged; in solo laps it never limited the speed. 30 % of its limits are ones the true state would
 not set, and they precede most of the extra wall hits (+0.1-0.2 /km).
+
+A near-stopped car on the racing line (2026-10-25; docs/research/passing-risk-2026-10-24, section 11) is where the first
+version failed: the policy rear-ends such a car (2.5 hard /km at x0.05 of the line's speed, 90 % rear-ends), the true
+state would have cut that to 0.94, and this limit managed 2.19. Two causes, two fixes, both needed:
+  * the nearest-car output had never seen a slow car -- it missed 37 % of them and read their closing speed 1.2 m/s low:
+    `checkpoints/korea26_v2_ppo_s2421_u512_nearcar_slow.pt` retrains it with near-stopped cars (head only);
+  * at close range its lateral offset drifts outward and the 0.35 m lane check let go of the car just before the hit:
+    a car the limit already holds is now measured against `lane_exit` (0.5 m; `speed_limit(held=...)`).
+Together: 2.19 -> 1.28 (seeds 81-84) and 2.74 -> 1.33 hard car /km (fresh 91-94). In the ordinary finals race cells (fresh
+91-94, same card each) all hard contacts went 2.25 -> 1.95 /km with props on the line and 1.35 -> 1.21 with props off, at
+the same race speed. Alone on a track with props on the line it holds the speed on ~1 % of the steps (props read as a car;
+0.25 % before), -0.4 % speed.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -42,6 +55,10 @@ class OpponentSpeedLimit:
     gap_min: float = 0.2           # [m] gap left between the bodies when the speeds match
     car_length: float = 0.5        # [m]
     reach: float = 6.0             # [m] the farthest car considered
+    # [m] a car the limit already holds stays held while its |lateral offset| is under this (2026-10-25). Closing on a
+    # near-stopped car the reading's offset drifts outward in the last 0.2 s (|dy| 0.37 against a true 0.27 m), and a
+    # 0.35 m check let go of the car just before 57 % of the rear-ends (docs/research/passing-risk-2026-10-24, section 11)
+    lane_exit: float = 0.5
 
 
 DEFAULT = OpponentSpeedLimit()
@@ -62,17 +79,23 @@ def relative(reading: torch.Tensor, mount_x, mount_y):
 
 
 def speed_limit(reading: torch.Tensor, v_me: torch.Tensor, mount_x=0.297, mount_y=0.0,
-                p: OpponentSpeedLimit = DEFAULT) -> torch.Tensor:
+                p: OpponentSpeedLimit = DEFAULT, held: Optional[torch.Tensor] = None) -> torch.Tensor:
     """(...,) [m/s] the speed limit for the car `reading` describes, +inf where there is none (no car seen, not wholly
-    ahead, beyond `reach`, not in our lane now nor within `horizon`, or passed by then). `v_me`: our forward speed."""
+    ahead, beyond `reach`, not in our lane now nor within `horizon`, or passed by then). `v_me`: our forward speed.
+    `held` (..., bool): where the previous call's limit applied (`torch.isfinite` of its result) -- those rows measure
+    "in our lane" against `lane_exit` instead of `lane_half_width`, so a car being closed on is not let go of because the
+    reading's offset drifts at close range. The caller keeps it per car and clears it when the car is reset."""
     ex, dx, dy, closing, v_lat = relative(reading, mount_x, mount_y)
     gap = dx - p.car_length
     v_opp = (v_me.float() - closing).clamp_min(0.0)
     room = (gap - p.gap_min - closing.clamp_min(0.0) * p.lag).clamp_min(0.0)
     lim = v_opp + torch.sqrt(2.0 * p.brake * room)
-    in_lane = dy.abs() < p.lane_half_width
+    half = torch.full_like(dy, p.lane_half_width)
+    if held is not None:
+        half = torch.where(held.to(dy.device), torch.full_like(dy, p.lane_exit), half)
+    in_lane = dy.abs() < half
     t_in = torch.where(in_lane, torch.zeros_like(dy),
-                       torch.where((dy * v_lat) < 0, (dy.abs() - p.lane_half_width) / v_lat.abs().clamp_min(1e-6),
+                       torch.where((dy * v_lat) < 0, (dy.abs() - half) / v_lat.abs().clamp_min(1e-6),
                                    torch.full_like(dy, float("inf"))))
     passed = (dx - closing * t_in.clamp(max=p.horizon)) < -(p.car_length + 0.1)
     applies = ex & (gap > 0.1) & (dx < p.reach) & (t_in <= p.horizon) & ~passed

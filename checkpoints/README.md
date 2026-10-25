@@ -372,6 +372,31 @@ Solo laps unchanged (the limit never engaged without another car). For races wit
 `speed_cap:=9.0`: their default cap of 4 m/s leaves no car to catch. 30 % of the limits are ones the true state would not set; most extra wall hits
 (+0.1-0.2 /km) follow those.
 
+## The speed limit reads near-stopped cars (2026-10-25): `korea26_v2_ppo_s2421_u512_nearcar_slow`
+
+The same policy again (only `actor.near_car` differs from `korea26_v2_ppo_s2421_u512`, verified; it drives identically),
+with the nearest-car output retrained once more, now with near-stopped cars in its data. Use it instead of
+`korea26_v2_ppo_s2421_u512_nearcar` with the speed limit for a car ahead switched on.
+
+Why: a car crawling on the racing line (a raceline car at x0.05 of the line's speed) is rear-ended at 2.5 hard /km, and
+the first limit barely helped (2.19). Its output had never seen a slow car: it missed 37 % of them and read their closing
+speed 1.2 m/s low -- and on the real venue bags it read the fixed objects on the track as cars doing 1.5 m/s. With this
+output, and with the limit now holding a car it already holds out to 0.5 m sideways (`OpponentSpeedLimit.lane_exit`; the
+output's lateral offset drifts outward in the last 0.2 s before a hit), the limit does most of what the true state would
+(0.94). Details: `docs/research/passing-risk-2026-10-24`, section 11.
+
+| fresh seeds 91-94, same card per row, limit on | hard car /km | hard all /km | race speed |
+| --- | ---: | ---: | ---: |
+| near-stopped car x0.05, `_nearcar` | 2.74 | 2.90 | 4.75 m/s |
+| near-stopped car x0.05, `_nearcar_slow` + latch | 1.33 (-51 %) | 1.55 | 4.69 m/s |
+| finals cells, props on the line, `_nearcar` | 1.01 | 2.25 | 4.53 m/s |
+| finals cells, props on the line, `_nearcar_slow` + latch | 0.85 | 1.95 (-13 %) | 4.51 m/s |
+| finals cells, props off the line, `_nearcar` | 0.58 | 1.35 | 4.58 m/s |
+| finals cells, props off the line, `_nearcar_slow` + latch | 0.58 | 1.21 (-10 %) | 4.58 m/s |
+
+Alone on a track with props on the line the limit now holds the speed on ~1 % of the steps (props read as a car; 0.25 %
+with `_nearcar`), at -0.4 % speed.
+
 ## ICCAS and ICRA picks record their follower (2026-10-23)
 
 `iccas_fixphys_s1102_u384` and `icra2022_map3R2_s1321_u384` were selected and scored with MAP (each map's round-5
