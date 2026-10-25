@@ -490,12 +490,15 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     from .wrong_way_meter import WrongWayMeter
     trk = TrackingMeter(env)
     ww = WrongWayMeter(env)
+    # How often the speed limits for a car ahead and for an obstacle on the plan's path held the command (2026-10-26)
+    from .speed_limit_meter import SpeedLimitMeter
+    slm = SpeedLimitMeter(env)
     if protocol == "rolling":
         # The meter wraps `sim.step` so every quantity is read BEFORE the auto-reset, the same
         # discipline the benchmark's own loop keeps. `rollout_metrics` is left untouched: it is a
         # validated implementation of a different measurement, and a second caller poking at its
         # internals is how two measurements start disagreeing.
-        with meter, enc, sev, trk, ww:
+        with meter, enc, sev, trk, ww, slm:
             result = common.rollout_metrics(env, policy, steps, speed_cap, controller=ctrl)
         for key, value in result.items():
             if isinstance(value, float) and not math.isfinite(value):
@@ -512,7 +515,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
             raise ValueError("Trial evaluation requires positive centerline lengths")
         trials = TrialAccumulator(lengths, env.sim.control_dt,
                                   time_budget_s=steps * env.sim.control_dt, speed_cap=speed_cap)
-        with meter, enc, sev, trk, ww:
+        with meter, enc, sev, trk, ww, slm:
             for _ in range(steps):
                 ctrl.pre_action(obs)
                 obs, _, term, trunc, info = env.step(policy(obs))
@@ -537,6 +540,7 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
     result.update(sev.report())
     result.update(trk.report())
     result.update(ww.report())
+    result.update(slm.report())
     ctrl_metrics, _ = ctrl.collect_metrics()
     ctrl.release()
     if graph_holder is not None:

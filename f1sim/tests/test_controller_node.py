@@ -706,3 +706,22 @@ def test_the_obstacle_limit_holds_the_command_for_a_box_on_the_plan(on, box):
     kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
     assert kv["obstacle_speed_limit"] == ("on" if on else "off")
     assert kv["obstacle_limited_commands"] == ("1" if limited else "0")
+
+
+def test_the_obstacle_limit_leaves_the_policys_car_to_the_car_limit_also_when_that_is_off():
+    """2026-10-26: returns at the policy's own nearest-car reading are the car limit's, with or without the car limit on,
+    and a reading from the scan just before stands in for this scan's as it does for the car limit"""
+    from f1sim.mpc import PlanSpec
+    for car in (False, True):
+        n = make_node(speed=3.0)
+        n.opponent_speed_limit = False; n._opp_limited = 0; n._opp_no_reading = 0
+        n.obstacle_speed_limit = True; n._obs_limited = 0; n._scan_angles = None
+        n.tracker.spec = PlanSpec()
+        if car:
+            n.on_perception(car_ahead_perception(ros_time(0.975), dx_lidar=1.4))   # the scan before: a car where the box is
+        stamp = ros_time(1.0)
+        n.on_odom(odom_msg(2.5)); n.on_imu(imu_msg())
+        n.on_scan(box_scan_msg(stamp))
+        n.on_plan(plan_msg(stamp))
+        assert (n.last_cmd[1] == pytest.approx(3.0)) == car, car
+        assert n._opp_limited == 0

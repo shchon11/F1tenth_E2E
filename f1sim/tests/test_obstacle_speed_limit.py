@@ -122,3 +122,78 @@ def test_the_env_holds_the_learners_speed_command_for_a_box_on_its_path():
     env.last_result.scan = torch.stack([box_scan(0.35), torch.full_like(c, float("inf"))])
     env.step(a)
     assert bool(env.obstacle_limited[0]) and float(env.last_cmd_raw[0, 1]) <= 1e-5
+
+
+def test_with_the_obstacle_limit_alone_the_env_reads_the_car_and_leaves_it_to_the_car_limit():
+    """2026-10-26: the obstacle limit leaves the returns at the policy's own nearest-car reading to the car limit, so the env
+    takes the reading with the obstacle limit alone (before, it had none and held for every car on the path as if it stood
+    still), and the car limit itself stays off. The evaluation meter counts what each limit held."""
+    from f1sim.learn.speed_limit_meter import SpeedLimitMeter
+    from f1sim.opponent_speed_limit import no_car, speed_limit as car_limit
+    cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+    env = common.make_env([maps.load("real:korea_2025_iccas")], 2, "cpu",
+                          EnvConfig(max_steps=100, hist_len=0, action_mode="plan", speed_mode="wp4",
+                                    compile_tracker=False, obstacle_speed_limit=True), cfg=cfg, seed=1)
+    assert env.opponent_reading is not None
+    env.reset(seed=1)
+    a = torch.zeros(2, env.act_dim)
+    a[:, 4:] = 0.9
+    c, s_ = env.sim.lidar.angles.cos(), env.sim.lidar.angles.sin()
+    on = (c > 0) & ((0.9 / c.clamp_min(1e-3)) * s_).abs().le(0.15)
+    box = torch.where(on, 0.9 / c.clamp_min(1e-3), torch.full_like(c, 8.0))      # a box face 0.9 m straight ahead
+    with SpeedLimitMeter(env) as meter:
+        for _ in range(3):
+            env.step(a)
+        env.last_result.scan = torch.stack([box, box])
+        # row 0's reading: a car there (centre 0.2 m behind the face), 2 m/s slower than us; row 1's: no car
+        reading = no_car(2)
+        reading[0] = torch.tensor([4.0, 1.1 / 5.0, 0.0, 2.0 / 5.0, 0.0])
+        env.opponent_reading.copy_(reading)
+        would = car_limit(reading, env.sim.state[:, 3])
+        env.step(a)
+    assert bool(env.obstacle_limited[1]) and not bool(env.obstacle_limited[0])   # row 0's box is the car's
+    assert float(env.last_cmd_raw[0, 1]) > float(would[0])                     # which the car limit would have held...
+    assert not bool(env.opponent_limited.any())                                # ...were it on
+    rep = meter.report()["speed_limits"]
+    assert rep["obstacle_on"] and not rep["car_on"]
+    assert rep["learner_steps"] == 8 and rep["car_share"] == 0.0 and rep["obstacle_share"] == pytest.approx(1 / 8)
+
+
+@pytest.mark.slow
+def test_ppo_with_the_obstacle_limit_feeds_the_policys_nearest_car_output_every_step(tmp_path, monkeypatch):
+    """`ppo --arch v2 --obstacle-speed-limit` (2026-10-26): the rollout writes the actor's nearest-car output into
+    `env.opponent_reading` before every `env.step`, as the evaluation and the console do -- the first fine-tune with the
+    limit left it at 'no car', so every car on the plan's path was held to as if it stood still -- and a v1 run refuses
+    the flag."""
+    import importlib
+    import sys
+    from f1sim.gym_env import F1VecEnv
+    from f1sim.opponent_speed_limit import NO_CAR_LOGIT
+    fed = []
+    orig = F1VecEnv.step
+
+    def spy(self, action):
+        r = getattr(self, "opponent_reading", None)
+        fed.append(None if r is None else bool((r[:, 0] != NO_CAR_LOGIT).all()))
+        return orig(self, action)
+
+    monkeypatch.setattr(F1VecEnv, "step", spy)
+    monkeypatch.setattr(common, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setenv("WANDB_MODE", "disabled")
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(2, threads))
+    try:
+        monkeypatch.setattr(sys, "argv", ["f1sim.learn.ppo", "--arch", "v2", "--name", "po", "--envs", "4",
+                                          "--race-size", "2", "--opponent", "policy", "--tracks", "gen:competition:0",
+                                          "--horizon", "16", "--minibatch", "32", "--grad-accum", "1", "--total", "64",
+                                          "--epochs", "1", "--device", "cpu", "--sim-backend", "eager",
+                                          "--wandb", "disabled", "--log-every", "1", "--save-every", "1",
+                                          "--obstacle-speed-limit"])
+        importlib.import_module("f1sim.learn.ppo").main()
+    finally:
+        torch.set_num_threads(threads)
+    assert len(fed) >= 16 and all(f is True for f in fed), fed[:20]
+    monkeypatch.setattr(sys, "argv", ["f1sim.learn.ppo", "--obstacle-speed-limit"])
+    with pytest.raises(SystemExit) as e:
+        importlib.import_module("f1sim.learn.ppo").main()
+    assert "--arch v2" in str(e.value)

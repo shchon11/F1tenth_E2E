@@ -500,6 +500,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                    if getattr(a, "plan_follower", None) == "map" else {}),
                 "experiment": {**experiment, "controller": controller.checkpoint_meta()}}
     ac = torch.autocast("cuda", dtype=torch.bfloat16, enabled=a.amp and device.type == "cuda")
+    # `--obstacle-speed-limit` (EnvConfig.obstacle_speed_limit): the env leaves the returns at the policy's own nearest-car
+    # output to the car limit, as on the car, so the rollout writes that output into `env.opponent_reading` every step
+    # (2026-10-26: left unfed, every car on the plan's path was held to as if it stood still)
+    reading_buf = getattr(env, "opponent_reading", None)
+    if reading_buf is not None and model.actor.near_car is None:
+        raise SystemExit("--obstacle-speed-limit reads the policy's nearest-car output; this policy has none (--aux-near-car)")
     while steps_done < a.total:
         frac = steps_done / a.total
         cap = a.cap0 + (a.cap1 - a.cap0) * min(1.0, steps_done / a.cap_steps)
@@ -521,6 +527,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         model.eval()
         buf_h0.copy_(h_actor.detach()[:, lid])
         buf_keep.fill_(1.0)
+        model.actor.keep_reading = reading_buf is not None
         with torch.no_grad():
             for t in range(T):
                 scan, ego = obs["scan"], obs["ego"]
@@ -533,6 +540,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     logp = d_act.log_prob(act).sum(1)
                     v_n, logit_roll = model.critic(scan[lid], ego[lid], c[lid], priv[lid])
                     mu_ref, h_ref = ref.step(scan, ego, c, h_ref)
+                if reading_buf is not None:
+                    reading_buf.copy_(model.actor.last_reading)   # this step's nearest-car output -> the limits in env.step
                 buf_scan[t] = scan[lid].half(); buf_ego[t] = ego[lid]; buf_c[t] = c[lid]; buf_priv[t] = priv[lid]
                 buf_act[t] = act[lid].float(); buf_logp[t] = logp[lid].float()
                 buf_val[t] = vnorm.denormalize(v_n.float())
@@ -597,6 +606,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 since = torch.where(done_now, torch.zeros_like(since), since + 1)
                 if t + 1 < T:
                     buf_keep[t + 1] = (~done_now[lid]).float()
+            model.actor.keep_reading = False
             c_boot = condition_now().to(obs["ego"].dtype)
             priv_boot = env.privileged_v2()
             with ac:

@@ -1025,6 +1025,9 @@ def main():
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")
+        if a.obstacle_speed_limit:
+            # the obstacle limit leaves the policy's own nearest car to the car limit; only a v2 policy has that output
+            raise SystemExit("--obstacle-speed-limit belongs to --arch v2 (it reads the policy's nearest-car output)")
     adaptive = a.adaptation != "off"
     if adaptive:
         if a.controller != "auto" or not a.init or a.memory != "gru":

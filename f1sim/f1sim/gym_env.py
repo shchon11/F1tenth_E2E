@@ -565,7 +565,9 @@ class EnvConfig:
     #: The speed limit for an obstacle on the plan's own path (2026-10-26, `obstacle_speed_limit.py`): the learner's speed
     #: command is held to the speed from which it can still stop before the first small isolated cluster of its last
     #: scan that lies on the path its plan draws -- a box, a pole; walls are long and left out, so no map is needed.
-    #: Returns at the nearest-car reading are left to `opponent_speed_limit`. Plan mode only.
+    #: Returns at the nearest-car reading are left to `opponent_speed_limit`, so this one needs the policy's nearest-car
+    #: output too (`F1VecEnv.opponent_reading`, written by the same runners), with or without the car limit on: without
+    #: it a car on the path would be held to as if it stood still (2026-10-26). Plan mode only.
     obstacle_speed_limit: bool = False
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
@@ -1150,16 +1152,17 @@ class F1VecEnv:
             self._opp_age = torch.full((self.B, C), OPP_NEVER_SEEN, dtype=torch.long, device=self.device)
         #: "no prop anywhere near the plan", as a tensor so the compiled reward takes one shape.
         self._no_plan_prop = torch.full((self.B,), float("inf"), device=self.device)
-        #: `EnvConfig.opponent_speed_limit`: each row's nearest-car reading (the policy's own output, written in place by
-        #: its runner before `step`; one buffer for the session so a captured step reads the live values), and where the
-        #: limit held the speed command this step. None when off.
+        #: `EnvConfig.opponent_speed_limit` / `.obstacle_speed_limit`: each row's nearest-car reading (the policy's own
+        #: output, written in place by its runner before `step`; one buffer for the session so a captured step reads the
+        #: live values) -- the car limit reads the car from it, the obstacle limit leaves that car's returns to the car
+        #: limit -- and where the car limit held the speed command this step. None when both are off.
         self.opponent_reading = None
         self.opponent_limited = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         #: rows whose speed limit applied last step (`speed_limit(held=...)`): their car stays held to `lane_exit`
         self.opponent_held = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         #: `EnvConfig.obstacle_speed_limit`: the rows whose speed command the obstacle limit held this step
         self.obstacle_limited = torch.zeros(self.B, dtype=torch.bool, device=self.device)
-        if e.opponent_speed_limit:
+        if e.opponent_speed_limit or e.obstacle_speed_limit:
             from .opponent_speed_limit import no_car
             self.opponent_reading = no_car(self.B, device=self.device)
         #: Whether each car was in contact last step, so a soft collision is charged on its onset.
@@ -2939,7 +2942,7 @@ class F1VecEnv:
                     self._v_pr_prev = v_pr.detach()
                 raw = torch.stack([raw[:, 0], torch.where(raw[:, 1] < 0, raw[:, 1],
                                    torch.minimum(v_pr, self.speed_cap))], 1)
-            if self.opponent_reading is not None:
+            if self.ecfg.opponent_speed_limit and self.opponent_reading is not None:
                 # the speed limit for a car ahead, from the policy's own reading of it (`opponent_speed_limit.py`); the
                 # LiDAR's nominal mount, as the car knows it
                 from .opponent_speed_limit import speed_limit

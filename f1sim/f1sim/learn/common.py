@@ -335,16 +335,18 @@ def external_drivers(env) -> dict:
 
 
 def opponent_reading_feeder(model, env):
-    """`EnvConfig.opponent_speed_limit`: a callable that copies the actor's latest nearest-car output into
-    `env.opponent_reading` (call it after each policy step, before `env.step`), or None when the limit is off. The limit
-    reads the policy's own estimate of the car ahead, so a checkpoint without that output cannot drive with it on."""
+    """`EnvConfig.opponent_speed_limit` / `.obstacle_speed_limit`: a callable that copies the actor's latest nearest-car
+    output into `env.opponent_reading` (call it after each policy step, before `env.step`), or None when both limits are
+    off. Both read the policy's own estimate of the car ahead (the obstacle limit leaves that car to the car limit), so a
+    checkpoint without that output cannot drive with either on."""
     reading = getattr(env, "opponent_reading", None)
     if reading is None:
         return None
     actor = getattr(model, "actor", None)
     if getattr(actor, "near_car", None) is None:
-        raise ValueError("the speed limit for a car ahead (opponent_speed_limit) reads the policy's nearest-car output; "
-                         "this checkpoint has none (a v2 policy trained with --aux-near-car has)")
+        raise ValueError("the speed limits for a car ahead and for an obstacle on the plan's path (opponent_speed_limit, "
+                         "obstacle_speed_limit) read the policy's nearest-car output; this checkpoint has none (a v2 "
+                         "policy trained with --aux-near-car has)")
     actor.keep_reading = True
 
     def feed():

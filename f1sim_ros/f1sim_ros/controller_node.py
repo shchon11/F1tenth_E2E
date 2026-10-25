@@ -518,6 +518,23 @@ class ControllerNode(Node):
         self.tracker.P = {"mu": torch.tensor([float(nominal["mu"]) * float(map_grip)], device=self.device),
                           "mu_f_scale": torch.tensor([float(nominal["mu_f_scale"])], device=self.device)}
 
+    def _nearest_car_for(self, snap):
+        """(reading, stand_in): the policy's nearest-car output (5 floats) for the scan the plan in `snap` was made from --
+        that scan's perception message, paired by stamp like the plan; the two topics are not ordered, so when it is not
+        in yet the newest reading of the last 0.1 s (a scan or two earlier) stands in (console + ROS end-to-end, 10-25: a
+        third of the plans arrived before their perception) -- or (None, False)."""
+        if snap.key is None:
+            return None, False
+        per = self._perception.get(snap.key)
+        if per is not None and len(per.nearest_car) == 5:
+            return [float(x) for x in per.nearest_car], False
+        t_snap = snap.key[0] + snap.key[1] * 1e-9
+        for k_, m_ in reversed(list(self._perception.items())):
+            t_k = k_[0] + k_[1] * 1e-9
+            if len(m_.nearest_car) == 5 and t_snap - 0.1 <= t_k <= t_snap:
+                return [float(x) for x in m_.nearest_car], True
+        return None, False
+
     def _track_and_publish(self, plan, snap: ScanSnapshot):
         a = torch.as_tensor(plan, dtype=torch.float32, device=self.device).reshape(1, -1)
         sc = float(getattr(self, "plan_speed_scale", 1.0))
@@ -584,23 +601,13 @@ class ControllerNode(Node):
             speed = min(float(profile_speed_command(self.tracker.last_ref[:, :, 3], dt_t, t_land,
                                                     self.motor_tau)[0]), self.speed_cap)
         if getattr(self, "opponent_speed_limit", False) and speed > 0.0:
-            # the speed limit for a car ahead, on the policy's own reading of THIS scan (paired by stamp like the plan);
-            # the two topics are not ordered, so when this scan's perception is not in yet, the newest reading of the
-            # last 0.1 s (a scan or two earlier) stands in (console + ROS end-to-end, 10-25: a third of the plans
-            # arrived before their perception)
-            per = self._perception.get(snap.key) if snap.key is not None else None
-            if (per is None or len(per.nearest_car) != 5) and snap.key is not None:
-                per = None
-                t_snap = snap.key[0] + snap.key[1] * 1e-9
-                for k_, m_ in reversed(list(self._perception.items())):
-                    t_k = k_[0] + k_[1] * 1e-9
-                    if len(m_.nearest_car) == 5 and t_snap - 0.1 <= t_k <= t_snap:
-                        per = m_
-                        self._opp_previous_scan = getattr(self, "_opp_previous_scan", 0) + 1
-                        break
-            if per is not None and len(per.nearest_car) == 5:
+            # the speed limit for a car ahead, on the policy's own reading of THIS scan (paired by stamp like the plan)
+            reading_c, stand_in = self._nearest_car_for(snap)
+            if stand_in:
+                self._opp_previous_scan = getattr(self, "_opp_previous_scan", 0) + 1
+            if reading_c is not None:
                 from f1sim.opponent_speed_limit import speed_limit
-                lim = float(speed_limit(torch.tensor([list(per.nearest_car)], dtype=torch.float32),
+                lim = float(speed_limit(torch.tensor([reading_c], dtype=torch.float32),
                                         torch.tensor([float(snap.v)]), LIDAR_MOUNT_X, 0.0,
                                         held=torch.tensor([bool(getattr(self, "_opp_held", False))]))[0])
                 self._opp_held = math.isfinite(lim)
@@ -612,7 +619,8 @@ class ControllerNode(Node):
                 self._opp_held = False
         if getattr(self, "obstacle_speed_limit", False) and speed > 0.0:
             # the speed limit for an obstacle on the plan's own path, on THIS scan (the one the plan was made from), the
-            # plan decoded as the tracker decodes it; this scan's perception, when it is in, says where the car is
+            # plan decoded as the tracker decodes it; the policy's reading of the car for this scan (or its stand-in, as
+            # for the car limit) says which returns are the car's, left to the car limit
             from f1sim import mpc as _mpc
             from f1sim.obstacle_speed_limit import speed_limit as obstacle_limit
             spec_t = self.tracker.spec
@@ -625,9 +633,8 @@ class ControllerNode(Node):
             ranges = torch.where(sn >= 1.0 - 1e-6, torch.full_like(sn, float("inf")), sn * rmax)
             ang = self._scan_angles if getattr(self, "_scan_angles", None) is not None else \
                 torch.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, ranges.shape[1], device=self.device)
-            per_o = self._perception.get(snap.key) if snap.key is not None else None
-            reading = (torch.tensor([list(per_o.nearest_car)], dtype=torch.float32, device=self.device)
-                       if per_o is not None and len(per_o.nearest_car) == 5 else None)
+            reading_o, _ = self._nearest_car_for(snap)
+            reading = None if reading_o is None else torch.tensor([reading_o], dtype=torch.float32, device=self.device)
             lim_o = float(obstacle_limit(ranges, ang, k_o, L_o, v_t, LIDAR_MOUNT_X, 0.0, car_reading=reading,
                                          range_max=rmax)[0])
             if speed > lim_o:

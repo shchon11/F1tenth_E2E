@@ -1010,6 +1010,12 @@ class SimWorker:
             raise StartConfigError(
                 f"{os.path.basename(ckpt_path)}: 앞차 충돌 방지 감속은 정책 신경망의 '가장 가까운 차' 추정 출력을 씁니다 — "
                 f"이 체크포인트에는 그 출력이 없습니다(v2 체크포인트만 있습니다). 앞차 감속을 끄거나 v2 체크포인트를 고르세요.")
+        if bool(getattr(cfg, "obstacle_speed_limit", False)) and (
+                mode != "plan" or getattr(getattr(model, "actor", None), "near_car", None) is None):
+            raise StartConfigError(
+                f"{os.path.basename(ckpt_path)}: 장애물 충돌 방지 감속은 앞차를 멈춰 선 장애물로 보지 않도록 정책 신경망의 "
+                f"'가장 가까운 차' 추정 출력을 씁니다 — 이 체크포인트에는 그 출력이 없습니다(v2 체크포인트만 있습니다). "
+                f"장애물 감속을 끄거나 v2 체크포인트를 고르세요.")
         if mode == "direct" and arm != "legacy":
             # The grip arms bound the *plan tracker*; a direct-action checkpoint has none. Refusing
             # the session for a setting that cannot apply (the deployment default is fixed_low)
@@ -1315,7 +1321,7 @@ class SimWorker:
             self.say(P.MSG_LOG, gen=gen,
                      text=f"그립 다이얼 정책입니다 · 다이얼 μ={dial.mu:.3f} 로 시작합니다 "
                           f"(구성 > 그립 다이얼에서 주행 중에 바꿀 수 있습니다)")
-        if getattr(env, "opponent_reading", None) is not None:
+        if bool(getattr(getattr(env, "ecfg", None), "opponent_speed_limit", False)):
             self.say(P.MSG_LOG, gen=gen, text="앞차 충돌 방지 감속 켜짐 · 정책의 '가장 가까운 차' 추정으로, 앞차에 맞춰 멈출 수 "
                                               "있는 속도로 속도 명령을 제한합니다")
         if bool(getattr(getattr(env, "ecfg", None), "obstacle_speed_limit", False)):
@@ -1736,7 +1742,7 @@ class SimWorker:
             steer, speed, _fresh = link.command()
             env.set_external_command(link.car, steer, speed)
         session["obs"], _rew, _term, _trunc, _info = env.step(act)
-        if getattr(env, "opponent_reading", None) is not None:
+        if bool(getattr(getattr(env, "ecfg", None), "opponent_speed_limit", False)):
             # how often the speed limit for a car ahead held the command, said every ~20 s of simulation
             session["opp_limit_steps"] = session.get("opp_limit_steps", 0) + int(env.learner.sum())
             session["opp_limit_held"] = session.get("opp_limit_held", 0) + int(env.opponent_limited.sum())
