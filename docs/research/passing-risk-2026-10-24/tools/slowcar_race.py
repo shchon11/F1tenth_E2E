@@ -72,6 +72,21 @@ def env_step(self, action):
 
 mc.MAPPlanTracker.__call__ = map_call
 gym_env.F1VecEnv.step = env_step
+if os.environ.get("OPEN_LOOP"):
+    # 10-25: the real bags' situation -- the ForzaETH planner drives our car (true state), our policy only plans alongside;
+    # does it plan for a near-stopped car the way it planned for the real fixed objects (43 % into at 1.5-2.5 m; props 4-5 %)?
+    from f1sim.learn import common as _common
+    _orig_make_env = _common.make_env
+
+    def make_env(*a, **kw):
+        env = _orig_make_env(*a, **kw)
+        lim = dict(a_lat=7.0, a_acc=6.5, a_brake=4.0)
+        _trs, rls = _common.load_tracks([TRACK], racelines=True, objective="min_time", **lim)
+        drv = _common.build_ego_driver(env, os.environ["OPEN_LOOP"], rls=rls, limits=lim, estimated=False)
+        env.set_ego_driver(drv)
+        env._all_external = False
+        return env
+    _common.make_env = make_env
 for seed in SEEDS:
     out = os.path.join(OUT, f"race_s{seed}_slowcar.json")
     if os.path.exists(out):
@@ -82,8 +97,10 @@ for seed in SEEDS:
                 "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",
                 "--seed", str(seed), "--graphs", "--collision-mode", "soft", "--movable-obstacles", "--spawn-runway", "3.0",
                 "--race-size", "2", "--procedural-obstacles", "1.0", "--procedural-density", "1.5",
-                "--procedural-max-props", "10", "--procedural-raceline-corridor", "on",
-                "--opp-slots", json.dumps([{"kind": "raceline", "speed_scale": SCALE}]), "--output", out,
+                # SLOW_KIND / SLOW_CORRIDOR (10-25): the slow car's kind (a prop-aware one when props are on the line) and the
+                # props' corridor ("off" = props on the racing line, the competition-like scene)
+                "--procedural-max-props", "10", "--procedural-raceline-corridor", os.environ.get("SLOW_CORRIDOR", "on"),
+                "--opp-slots", json.dumps([{"kind": os.environ.get("SLOW_KIND", "raceline"), "speed_scale": SCALE}]), "--output", out,
                 "--dial-value", "1.0489", "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92",
                 *(["--opponent-speed-limit"] if os.environ.get("OSL") else []),
                 # EGO_TEACHER (10-25): a privileged teacher drives our car instead (e.g. interactive) -- is there a label

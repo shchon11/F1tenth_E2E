@@ -23,6 +23,21 @@ import torch
 from f1sim import dynamics as dyn
 from f1sim import gym_env, map_controller as mc, mpc
 from f1sim.learn import evaluate as ev
+if os.environ.get("VEIL"):
+    import veil_patch  # noqa: F401  (10-25: mixed pixels at object edges, see veil_patch.py)
+from f1sim.learn import model_v2
+HEAD = {"out": None}
+_orig_features = model_v2.ActorV2.features
+
+
+def _features(self, e, y):
+    z = _orig_features(self, e, y)
+    if self.near_car is not None:
+        HEAD["out"] = self.near_car(z).detach()          # the policy's nearest-car reading this step (exists logit first)
+    return z
+
+
+model_v2.ActorV2.features = _features
 
 CK, OUT = sys.argv[1], sys.argv[2]
 SEEDS = [int(x) for x in sys.argv[3].split(",")]
@@ -65,7 +80,16 @@ def measure(env, action, v_meas):
     clear = torch.where(reach & torch.isfinite(dmin), dmin - 0.30, torch.full_like(dmin, float("nan")))
     b, j = sel.nonzero(as_tuple=True)
     v = st[:, dyn.IVX]
-    ROWS.append(torch.stack([xl[b, j], yl[b, j], v[b], clear[b, j], L[b]], 1).float().cpu())
+    h = HEAD["out"]
+    if h is not None and h.shape[0] != B:
+        full = torch.full((B, h.shape[1]), -10.0, device=h.device); full[env.learner] = h; h = full
+    logit = h[b, 0].float() if h is not None else torch.full_like(v[b], float("nan"))
+    # 10-25: which catalogue shape the prop is (ProceduralObstacles.p_sid -> shapes[sid].style / across), to split by kind
+    sid = ep.p_sid[sim.eid][b, j].float() if hasattr(ep, "p_sid") else torch.full_like(v[b], -1.0)
+    # where the reading says its car is (LiDAR frame -> car frame), to tell a box read as a car from the real car of a race
+    hx = (h[b, 1].float() * 5.0 + float(env.cfg.lidar.mount_x)) if h is not None else torch.full_like(v[b], float("nan"))
+    hy = (h[b, 2].float() * 2.0) if h is not None else torch.full_like(v[b], float("nan"))
+    ROWS.append(torch.stack([xl[b, j], yl[b, j], v[b], clear[b, j], L[b], logit, sid, hx, hy], 1).float().cpu())
 
 
 def map_call(self, action, v_meas, speed_cap, yaw_rate=None, delay=None):
@@ -105,15 +129,19 @@ for seed in SEEDS:
                 "--budget-laps", "0", "--teacher-a-lat", "7.0", "--teacher-a-acc", "6.5", "--teacher-a-brake", "4.0",
                 "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",
                 "--seed", str(seed), "--graphs", "--collision-mode", "soft", "--movable-obstacles", "--spawn-runway", "3.0",
-                "--race-size", "1", "--procedural-obstacles", "1.0", "--procedural-density", "1.5",
+                # RACE_KIND (10-25): a race of 2 with this opponent kind instead of solo -- does another car in the scene make
+                # boxes read as a car (the real bags had one in 11 of 13 runs) and planned around later?
+                *(["--race-size", "2", "--opp-slots", json.dumps([{"kind": os.environ["RACE_KIND"], "speed_scale": [0.7, 1.0]}])]
+                  if os.environ.get("RACE_KIND") else ["--race-size", "1"]),
+                "--procedural-obstacles", "1.0", "--procedural-density", "1.5",
                 "--procedural-max-props", "10", "--procedural-raceline-corridor", "off", "--output", out,
                 "--dial-value", "1.0489", "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92"]
     ev.main()
-    r = torch.cat(ROWS).numpy() if ROWS else np.zeros((0, 5), np.float32)
+    r = torch.cat(ROWS).numpy() if ROWS else np.zeros((0, 9), np.float32)
     np.save(os.path.join(OUT, f"rows_s{seed}.npy"), r)
     for lo, hi in ((0.5, 1.5), (1.5, 2.5), (2.5, 3.5)):
         m = (r[:, 0] >= lo) & (r[:, 0] < hi); c = r[m, 3]; dec = np.isfinite(c)
         if dec.sum():
             print(f"seed {seed} prop {lo}-{hi} m ahead: steps {int(m.sum())}, plan reaches it {int(dec.sum())}: clears (> 0.05) "
                   f"{100 * np.mean(c[dec] > 0.05):.0f} %, into (< 0) {100 * np.mean(c[dec] < 0):.0f} %, clearance p50 {np.median(c[dec]):+.2f} m, "
-                  f"speed p50 {np.median(r[m, 2]):.2f}", flush=True)
+                  f"speed p50 {np.median(r[m, 2]):.2f}, head says 'car' {100 * np.nanmean(r[m, 5] > 0):.1f} % (on the box: {100 * np.nanmean((r[m, 5] > 0) & (np.hypot(r[m, 7] - r[m, 0], r[m, 8] - r[m, 1]) < 0.6)):.1f} %)", flush=True)
