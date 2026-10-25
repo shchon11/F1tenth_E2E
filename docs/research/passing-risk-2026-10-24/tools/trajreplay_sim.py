@@ -1,0 +1,169 @@
+"""Research (2026-10-26): the real runs' MOTION in the simulator. Is it how the real car moved that makes our policy plan through
+the venue boxes (43 % at 1.5-2.5 m on the replays; 32 % even with fully synthetic scans on the real trajectory; sim 4-6 %)?
+
+The simulator's car is made to drive a venue bag's recorded trajectory: every step its state is set to the localisation pose
+(/pf/pose/odom, interpolated), forward speed and yaw rate (/odom), steering atan(L r / v), wheel speed v / r_w, and its command
+for the step is that speed and steering (an external driver), so the scan is cast from where the real car was a step later. Sim
+boxes (0.30 x 0.30 x 0.30 m cardboard) stand where the real boxes stood (clusters of the bag's fixed objects). Our policy plans
+alongside from the simulator's own scans and ego signals (open loop); its plan is measured against the boxes as in
+prop_plan_clearance.py. Rows of the 16 envs start at staggered times through the run (60 s each).
+usage: trajreplay_sim.py CKPT TRAJ.npz BOXES_JSON OUT_DIR SEEDS"""
+import dataclasses
+import json
+import math
+import os
+import sys
+
+import numpy as np
+import torch
+
+from f1sim import dynamics as dyn
+from f1sim import gym_env, map_controller as mc, maps, mpc
+from f1sim.learn import evaluate as ev
+from f1sim.learn import model_v2
+from f1sim.track import StaticProp
+
+CK, TRAJ, BOXES, OUT = sys.argv[1:5]
+SEEDS = [int(x) for x in sys.argv[5].split(",")]
+TRACK = "real:korea_2026_competition"
+DS, N_S, NENV, STEPS = 0.1, 40, 16, 2400
+os.makedirs(OUT, exist_ok=True)
+tz = np.load(TRAJ); pf, od = tz["pf"], tz["odom"]
+boxes = np.array(json.loads(BOXES), dtype=np.float64).reshape(-1, 2)
+T0, T1 = float(max(pf[0, 0], od[0, 0])), float(min(pf[-1, 0], od[-1, 0]))
+span = max(T1 - T0 - STEPS * 0.025, 1.0)
+_orig_load = maps.load
+
+
+def load(name, *a, **kw):
+    t = _orig_load(name, *a, **kw)
+    if name == TRACK:
+        t = dataclasses.replace(t, props=tuple(
+            StaticProp("cardboard_box", float(x), float(y), 0.0, seed=i, dims=(("width", 0.3), ("depth", 0.3), ("height", 0.3)))
+            for i, (x, y) in enumerate(boxes)))
+    return t
+
+
+maps.load = load
+HEAD = {"out": None}
+_orig_features = model_v2.ActorV2.features
+
+
+def _features(self, e, y):
+    z = _orig_features(self, e, y)
+    if self.near_car is not None:
+        HEAD["out"] = self.near_car(z).detach()
+    return z
+
+
+model_v2.ActorV2.features = _features
+CUR = {"env": None, "step": 0, "rec": None}
+ROWS = []
+
+
+def recorded(n_rows, step, device):
+    t = T0 + np.arange(n_rows) * (span / max(n_rows - 1, 1)) + step * 0.025
+    t = np.minimum(t, T1)
+    x, y, yaw = np.interp(t, pf[:, 0], pf[:, 1]), np.interp(t, pf[:, 0], pf[:, 2]), np.interp(t, pf[:, 0], pf[:, 3])
+    v, w = np.interp(t, od[:, 0], od[:, 1]), np.interp(t, od[:, 0], od[:, 2])
+    return [torch.as_tensor(a, dtype=torch.float32, device=device) for a in (x, y, yaw, v, w)]
+
+
+class ReplayDriver:
+    """the external driver: the recorded speed and the steering of the recorded yaw rate"""
+    rows = None
+    resets = 0
+
+    def reset(self, hit):                     # the env calls this on a row's reset; the next step's state comes from the record
+        ReplayDriver.resets += int(np.asarray(hit).sum())
+
+    def command_env(self, env, rows):
+        x, y, yaw, v, w = CUR["rec"]
+        P = env.sim.P
+        L = (P["lf"] + P["lr"]).reshape(-1)[rows] if torch.is_tensor(P["lf"]) else float(P["lf"] + P["lr"])
+        steer = torch.atan(L * w / v.clamp_min(0.3))
+        return torch.stack([steer, v], 1)
+
+
+def measure(env, action, v_meas):
+    B = action.shape[0]
+    spec, vmax = env.tracker.spec, float(env.tracker.v_max)
+    k, L, _ = mpc.decode_wp4(action.float(), v_meas.float(), vmax, torch.full((B,), 9.0, device=action.device), spec)
+    s = torch.arange(1, N_S + 1, device=k.device, dtype=k.dtype) * DS
+    seg = (s[None, :] / (L[:, None] / k.shape[1]).clamp_min(1e-3)).floor().long().clamp(max=k.shape[1] - 1)
+    th = torch.cumsum(k.gather(1, seg) * DS, 1)
+    px, py = torch.cumsum(torch.cos(th) * DS, 1), torch.cumsum(torch.sin(th) * DS, 1)
+    on = s[None, :] <= torch.minimum(L, torch.full_like(L, 4.0))[:, None]
+    st = env.sim.state
+    bx = torch.as_tensor(boxes[:, 0], dtype=torch.float32, device=st.device)[None, :]
+    by = torch.as_tensor(boxes[:, 1], dtype=torch.float32, device=st.device)[None, :]
+    c, sn = torch.cos(st[:, dyn.IYAW])[:, None], torch.sin(st[:, dyn.IYAW])[:, None]
+    qx, qy = bx - st[:, dyn.IX][:, None], by - st[:, dyn.IY][:, None]
+    xl, yl = c * qx + sn * qy, -sn * qx + c * qy
+    sel = (xl > 0.5) & (xl < 3.5) & (yl.abs() < 0.6)
+    if not bool(sel.any()):
+        return
+    d = torch.hypot(px[:, None, :] - xl[:, :, None], py[:, None, :] - yl[:, :, None])
+    rr = torch.hypot(px, py)
+    near = on[:, None, :] & (rr[:, None, :] <= torch.hypot(xl, yl)[:, :, None] + 0.5)
+    dmin = torch.where(near, d, torch.full_like(d, float("inf"))).min(2).values
+    reach = torch.where(on, rr, torch.zeros_like(rr)).max(1).values[:, None] >= torch.hypot(xl, yl) - 0.15
+    clear = torch.where(reach & torch.isfinite(dmin), dmin - 0.30, torch.full_like(dmin, float("nan")))
+    b, j = sel.nonzero(as_tuple=True)
+    h = HEAD["out"]
+    logit = h[b, 0].float() if h is not None and h.shape[0] == B else torch.full_like(xl[b, j], float("nan"))
+    ROWS.append(torch.stack([xl[b, j], yl[b, j], st[b, dyn.IVX], clear[b, j], L[b], logit, st[b, dyn.IR]], 1).float().cpu())
+
+
+_orig_map_call = mc.MAPPlanTracker.__call__
+_orig_step = gym_env.F1VecEnv.step
+
+
+def map_call(self, action, v_meas, speed_cap, yaw_rate=None, delay=None):
+    env = CUR["env"]
+    if env is not None and env.tracker is self:
+        measure(env, action, v_meas)
+    return _orig_map_call(self, action, v_meas, speed_cap, yaw_rate, delay)
+
+
+def env_step(self, action):
+    if CUR["env"] is not self:
+        CUR.update(env=self, step=0)
+        self.set_ego_driver(ReplayDriver())
+        self._all_external = False
+    rec = recorded(self.B, CUR["step"], self.sim.state.device)
+    CUR["rec"] = rec
+    x, y, yaw, v, w = rec
+    st = self.sim.state
+    P = self.sim.P
+    Lw = (P["lf"] + P["lr"]).reshape(-1) if torch.is_tensor(P["lf"]) else float(P["lf"] + P["lr"])
+    rw = P["r_w"].reshape(-1) if torch.is_tensor(P["r_w"]) else float(P["r_w"])
+    st[:, dyn.IX], st[:, dyn.IY], st[:, dyn.IYAW] = x, y, yaw
+    st[:, dyn.IVX], st[:, dyn.IVY], st[:, dyn.IR] = v, torch.zeros_like(v), w
+    st[:, dyn.ISTEER] = torch.atan(Lw * w / v.clamp_min(0.3))
+    st[:, dyn.IOMEGA] = v / rw
+    out = _orig_step(self, action)
+    CUR["step"] += 1
+    return out
+
+
+mc.MAPPlanTracker.__call__ = map_call
+gym_env.F1VecEnv.step = env_step
+for seed in SEEDS:
+    out = os.path.join(OUT, f"replay_s{seed}.json")
+    if os.path.exists(out):
+        continue
+    ROWS.clear(); CUR.update(env=None, step=0)
+    sys.argv = ["evaluate", CK, "--action-mode", "plan", "--tracks", TRACK, "--envs", str(NENV), "--steps", str(STEPS),
+                "--budget-laps", "0", "--teacher-a-lat", "7.0", "--teacher-a-acc", "6.5", "--teacher-a-brake", "4.0",
+                "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",
+                "--seed", str(seed), "--collision-mode", "soft", "--race-size", "1", "--output", out,
+                "--dial-value", "1.0489", "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92"]
+    ev.main()
+    r = torch.cat(ROWS).numpy() if ROWS else np.zeros((0, 7), np.float32)
+    np.save(os.path.join(OUT, f"rows_s{seed}.npy"), r)
+    m = (r[:, 0] >= 1.5) & (r[:, 0] < 2.5) & np.isfinite(r[:, 3]) & (r[:, 2] > 1.0)
+    print(f"seed {seed}: box 1.5-2.5 m ahead, plan reaches it {int(m.sum())}: crosses {100 * np.mean(r[m, 3] < 0):.0f} %, clearance p50 "
+          f"{np.median(r[m, 3]) if m.any() else float('nan'):+.2f} m, read as a car {100 * np.nanmean(r[m, 5] > 0):.0f} %, speed p50 "
+          f"{np.median(r[m, 2]) if m.any() else 0:.2f}, |yaw rate| p50 {np.median(np.abs(r[m, 6])) if m.any() else 0:.2f}, "
+          f"row resets {ReplayDriver.resets}", flush=True)

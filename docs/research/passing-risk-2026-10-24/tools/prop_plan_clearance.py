@@ -89,7 +89,8 @@ def measure(env, action, v_meas):
     # where the reading says its car is (LiDAR frame -> car frame), to tell a box read as a car from the real car of a race
     hx = (h[b, 1].float() * 5.0 + float(env.cfg.lidar.mount_x)) if h is not None else torch.full_like(v[b], float("nan"))
     hy = (h[b, 2].float() * 2.0) if h is not None else torch.full_like(v[b], float("nan"))
-    ROWS.append(torch.stack([xl[b, j], yl[b, j], v[b], clear[b, j], L[b], logit, sid, hx, hy], 1).float().cpu())
+    yr = st[:, dyn.IR]                                                # our yaw rate [rad/s] (10-26: real vs sim states)
+    ROWS.append(torch.stack([xl[b, j], yl[b, j], v[b], clear[b, j], L[b], logit, sid, hx, hy, yr[b]], 1).float().cpu())
 
 
 def map_call(self, action, v_meas, speed_cap, yaw_rate=None, delay=None):
@@ -137,7 +138,7 @@ for seed in SEEDS:
                 "--procedural-max-props", "10", "--procedural-raceline-corridor", "off", "--output", out,
                 "--dial-value", "1.0489", "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92"]
     ev.main()
-    r = torch.cat(ROWS).numpy() if ROWS else np.zeros((0, 9), np.float32)
+    r = torch.cat(ROWS).numpy() if ROWS else np.zeros((0, 10), np.float32)
     np.save(os.path.join(OUT, f"rows_s{seed}.npy"), r)
     for lo, hi in ((0.5, 1.5), (1.5, 2.5), (2.5, 3.5)):
         m = (r[:, 0] >= lo) & (r[:, 0] < hi); c = r[m, 3]; dec = np.isfinite(c)
