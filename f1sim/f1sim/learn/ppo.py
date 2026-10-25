@@ -818,6 +818,10 @@ def main():
     ap.add_argument("--procedural-raceline-margin", type=float, default=0.25, metavar="M",
                     help="[m] kept clear either side of the raceline, beyond the car's half-width, "
                          "so the teacher opponents are never routed through a prop")
+    ap.add_argument("--obstacle-speed-limit", action="store_true",
+                    help="train with the speed limit for an obstacle on the plan's own path on (obstacle_speed_limit.py, "
+                         "EnvConfig.obstacle_speed_limit): the learner's speed command is held before a small isolated "
+                         "cluster of its scan on its plan's path, as on the car when the limit is switched on")
     ap.add_argument("--procedural-raceline-corridor", choices=["on", "off"], default="on",
                     help="whether that corridor is enforced at all. 'off' lets a layout stand ON "
                          "the racing line, which is the only way the policy ever meets an obstacle "
@@ -1220,6 +1224,7 @@ def main():
                                                               procedural_max_props=a.procedural_max_props,
                                                               procedural_raceline_margin=a.procedural_raceline_margin,
                                                               procedural_raceline_corridor=a.procedural_raceline_corridor,
+                                                              obstacle_speed_limit=bool(a.obstacle_speed_limit) and a.action_mode == "plan",
                                                               spawn_runway=a.spawn_runway,
                                                               collision_mode=a.collision_mode,
                                                               contact_severity_min=a.contact_severity_min,
