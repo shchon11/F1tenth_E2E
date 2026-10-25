@@ -670,3 +670,39 @@ def test_a_car_the_limit_holds_stays_held_out_to_lane_exit_and_no_reading_lets_g
     sensors_at(n, 2.5, s)
     n.on_plan(plan_msg(s))
     assert n.last_cmd[1] == pytest.approx(3.0) and not n._opp_held
+
+
+# ==================================================================== the speed limit for an obstacle on the plan's path
+# `obstacle_speed_limit` (2026-10-26, `f1sim.obstacle_speed_limit`): small isolated clusters of THIS scan on the path the
+# plan draws hold the speed command to the speed the car can still stop from. Off by default.
+def box_scan_msg(stamp, n_beams=64, face=1.2, half=0.25, far=5.0):
+    """a box `face` m straight ahead of the LiDAR (half-width `half`), a wall `far` m away everywhere else"""
+    import math
+    r = []
+    for i in range(n_beams):
+        a_ = -2.356 + i * (4.712 / (n_beams - 1))
+        c, s_ = math.cos(a_), math.sin(a_)
+        r.append(face / c if c > 0 and abs(face / c * s_) <= half else far)
+    return SimpleNamespace(ranges=r, range_max=10.0, angle_min=-2.356, angle_max=2.356,
+                           header=SimpleNamespace(stamp=stamp))
+
+
+@pytest.mark.parametrize("on, box", [(True, True), (True, False), (False, True)])
+def test_the_obstacle_limit_holds_the_command_for_a_box_on_the_plan(on, box):
+    from f1sim.mpc import PlanSpec
+    n = make_node(speed=3.0)
+    n.opponent_speed_limit = False; n._opp_limited = 0; n._opp_no_reading = 0
+    n.obstacle_speed_limit = on; n._obs_limited = 0; n._scan_angles = None
+    n.tracker.spec = PlanSpec()                                 # a zero plan: straight, 3.75 m long
+    stamp = ros_time(1.0)
+    n.on_odom(odom_msg(2.5)); n.on_imu(imu_msg())
+    n.on_scan(box_scan_msg(stamp) if box else scan_msg(stamp, r=5.0))
+    n.on_plan(plan_msg(stamp))
+    import math
+    limited = on and box
+    # box face 1.2 m from the LiDAR, 1.497 m from the reference point: the first path point within 0.19 m is s = 1.4
+    want = math.sqrt(2 * 3.0 * (1.4 - 0.45 - 0.1 - 2.5 * 0.2)) if limited else 3.0
+    assert n.last_cmd[1] == pytest.approx(want, abs=1e-4)
+    kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+    assert kv["obstacle_speed_limit"] == ("on" if on else "off")
+    assert kv["obstacle_limited_commands"] == ("1" if limited else "0")

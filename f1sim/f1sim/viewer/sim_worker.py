@@ -1193,6 +1193,9 @@ class SimWorker:
             # feeds it the policy's own nearest-car output
             **({"opponent_speed_limit": True} if mode == "plan" and bool(getattr(cfg, "opponent_speed_limit", False))
                else {}),
+            # the speed limit for an obstacle on the plan's path (obstacle_speed_limit.py): the env holds the commands
+            **({"obstacle_speed_limit": True} if mode == "plan" and bool(getattr(cfg, "obstacle_speed_limit", False))
+               else {}),
             **proc_kw)
         if "action_history" in spec:
             # `watch.main` does not pass this through, so a checkpoint trained with a different
@@ -1315,6 +1318,9 @@ class SimWorker:
         if getattr(env, "opponent_reading", None) is not None:
             self.say(P.MSG_LOG, gen=gen, text="앞차 충돌 방지 감속 켜짐 · 정책의 '가장 가까운 차' 추정으로, 앞차에 맞춰 멈출 수 "
                                               "있는 속도로 속도 명령을 제한합니다")
+        if bool(getattr(getattr(env, "ecfg", None), "obstacle_speed_limit", False)):
+            self.say(P.MSG_LOG, gen=gen, text="장애물 충돌 방지 감속 켜짐 · 계획 경로 위에 스캔의 작고 떨어진 덩어리가 있으면 그 앞에서 "
+                                              "멈출 수 있는 속도로 속도 명령을 제한합니다 (지도 없음)")
         session = {
             "mu_pin": mu_pin,
             "env": env, "model": model, "extra": extra, "device": device,
@@ -1739,6 +1745,15 @@ class SimWorker:
                          text=f"앞차 충돌 방지 감속: 최근 구간 주행 시간의 "
                               f"{100.0 * session['opp_limit_held'] / session['opp_limit_steps']:.1f} % 에서 속도 제한")
                 session["opp_limit_steps"] = session["opp_limit_held"] = 0
+        if bool(getattr(getattr(env, "ecfg", None), "obstacle_speed_limit", False)):
+            # how often the obstacle limit held the command, said every ~20 s of simulation
+            session["obs_limit_steps"] = session.get("obs_limit_steps", 0) + int(env.learner.sum())
+            session["obs_limit_held"] = session.get("obs_limit_held", 0) + int(env.obstacle_limited.sum())
+            if session["k"] % 800 == 799 and session["obs_limit_steps"]:
+                self.say(P.MSG_LOG, gen=self.gen,
+                         text=f"장애물 충돌 방지 감속: 최근 구간 주행 시간의 "
+                              f"{100.0 * session['obs_limit_held'] / session['obs_limit_steps']:.1f} % 에서 속도 제한")
+                session["obs_limit_steps"] = session["obs_limit_held"] = 0
         if rt is not None:
             rt.post_step(_term, _trunc)             # issued command + episode boundaries
         session["k"] += 1

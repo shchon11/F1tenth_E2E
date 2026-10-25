@@ -22,6 +22,9 @@ Still 14-17 % of steps (2.4-3.0 m/s cut) on the raw scan: the plan's path is a s
 on this 2 m wide track, though the car does not. MAP_FILTER=1 drops every return within 0.15 m of the static map (ForzaETH's
 detection step: the map from the track, the pose TRUE here -- a particle filter is within ~5 cm on this car), so only what
 is not wall (props, cars, floor) can hold the speed; with TYPE_FILTER=1 as well, floor and car returns go too.
+CLUSTER_FILTER=1 (10-26, MAP-FREE -- what our map-less stack can run): keep only returns that belong to a small isolated
+cluster of the scan -- a run of >= 3 valid beams with no range jump over 0.15 m between neighbours, end to end under 0.6 m,
+standing at least 0.3 m in front of the beams beyond both of its ends. A wall is long; a box or a pole is not.
 usage: scan_limit_race.py CKPT OUT_DIR SEEDS [THR=0.19] [A_B=3.0] [TAU=0.2] [GMIN=0.1]"""
 import json
 import os
@@ -62,6 +65,26 @@ def path_points(k, L):
     return torch.stack([torch.cumsum(torch.cos(th) * DS, 1), torch.cumsum(torch.sin(th) * DS, 1)], -1), s
 
 
+def cluster_keep(r, ok, px, py, brk_jump=0.15, max_ext=0.6, stand=0.3, min_beams=3):
+    """(B, n) the valid returns that belong to a small isolated cluster (see CLUSTER_FILTER)"""
+    B, n = r.shape
+    dev = r.device
+    rf = torch.where(ok, r, torch.full_like(r, 30.0))                       # no return = far behind
+    jump = (rf[:, 1:] - rf[:, :-1]).abs() > brk_jump
+    brk = torch.cat([torch.ones(B, 1, dtype=torch.bool, device=dev), jump | ~ok[:, 1:] | ~ok[:, :-1]], 1)
+    seg = torch.cumsum(brk.long(), 1)                                       # segment id of every beam
+    gid = (seg + torch.arange(B, device=dev)[:, None] * (n + 2)).flatten()
+    idx = torch.arange(n, device=dev)[None].expand(B, n).flatten()
+    first = torch.full((B * (n + 2),), n, dtype=torch.long, device=dev).scatter_reduce(0, gid, idx, "amin", include_self=True)
+    last = torch.full((B * (n + 2),), -1, dtype=torch.long, device=dev).scatter_reduce(0, gid, idx, "amax", include_self=True)
+    f, l = first[gid].view(B, n), last[gid].view(B, n)
+    bi = torch.arange(B, device=dev)[:, None].expand(B, n)
+    ext = torch.hypot(px[bi, l] - px[bi, f], py[bi, l] - py[bi, f])
+    r_left, r_right = rf[bi, (f - 1).clamp_min(0)], rf[bi, (l + 1).clamp(max=n - 1)]
+    standing = (f > 0) & (l < n - 1) & (r_left > rf[bi, f] + stand) & (r_right > rf[bi, l] + stand)
+    return ok & ((l - f + 1) >= min_beams) & (ext < max_ext) & standing
+
+
 def scan_limit(env, action, v_meas):
     sim = env.sim
     lr = env.last_result
@@ -86,6 +109,8 @@ def scan_limit(env, action, v_meas):
         wx, wy = st0[:, dyn.IX][:, None] + c0 * px - s0 * py, st0[:, dyn.IY][:, None] + s0 * px + c0 * py
         edt = sim.track.sample_edt(torch.stack([wx, wy], -1), sim.tid[:, None].expand(B, n))
         ok = ok & (edt > 0.15)
+    if os.environ.get("CLUSTER_FILTER"):
+        ok = cluster_keep(r, ok, px, py)
     reading = getattr(env, "opponent_reading", None)
     if reading is not None:
         ex, cx, cy, _cl, _vl = relative(reading, mx, my)

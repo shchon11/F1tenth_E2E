@@ -162,6 +162,10 @@ class SessionConfig:
     #: still match the speed of a car in its lane, or one moving into it within 1 s, read off the policy's own
     #: nearest-car output (v2 checkpoints). Off by default.
     opponent_speed_limit: bool = False
+    #: The speed limit for an obstacle on the plan's own path (2026-10-26, `obstacle_speed_limit.py`): the policy's car
+    #: slows so it can still stop before a small isolated cluster of its scan (a box, a pole) on the path its plan draws.
+    #: No map; any plan checkpoint. Off by default.
+    obstacle_speed_limit: bool = False
     #: Plan-controller arm installed at run time (`learn.grip_runtime`).
     #:
     #: `legacy` -- the plain tracker -- is the default because it is the only arm that needs

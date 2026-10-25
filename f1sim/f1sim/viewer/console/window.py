@@ -476,6 +476,18 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                       "추정 출력을 다시 학습한 체크포인트(…_nearcar.pt)에서 효과가 가장 큽니다.")
         cfg_card.add(self.row_opp_limit)
 
+        # -- the speed limit for an obstacle on the plan's path (2026-10-26, obstacle_speed_limit.py)
+        self.chk_obs_limit = QtWidgets.QCheckBox("장애물 충돌 방지 감속")
+        self.chk_obs_limit.setChecked(False)
+        self.chk_obs_limit.setToolTip(
+            "정책이 그린 계획 경로 위에 스캔의 작고 떨어진 덩어리(상자·기둥 등)가 있으면, 그 앞에서 멈출 수 있는 속도로 "
+            "속도 명령을 제한합니다. 벽은 길어서 빠지므로 지도가 필요 없습니다. 차는 앞차 감속에 맡깁니다. "
+            "한국 대회용 정책, 장애물이 라인 위인 경주(앞차 감속과 함께): 1.5 m/s 이상 충돌 −24~39 %, 경주 속도 −4~5 %. "
+            "혼자 주행: 속도 −0.6 %, 충돌 변화 없음.")
+        self.row_obs_limit = FieldRow("장애물 감속", self.chk_obs_limit,
+                                      "장애물이 있는 경주에서 켜세요. 앞차 감속과 함께 쓰는 것을 권합니다.")
+        cfg_card.add(self.row_obs_limit)
+
         # -- surface friction: random per car (what training saw) or one pinned value, changeable
         # while the session runs. The panel's "시뮬 참값 μ" shows what the car actually has.
         mu_row = QtWidgets.QHBoxLayout()
@@ -2272,6 +2284,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "plan_follower": str(self.combo_follower.currentData() or "map"),
             "plan_speed_scale": float(self.spin_speed_scale.value()),
             "opponent_speed_limit": bool(self.chk_opp_limit.isChecked()),
+            "obstacle_speed_limit": bool(self.chk_obs_limit.isChecked()),
             "bare_first": bool(self.chk_bare_first.isChecked()),
             "mu_mode": str(self.combo_mu.currentData() or "random"),
             "mu": float(self.spin_mu.value()),
@@ -2353,6 +2366,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(combo_data(self.combo_follower), "plan_follower")
         attempt(lambda v: self.spin_speed_scale.setValue(float(v)), "plan_speed_scale")
         attempt(lambda v: self.chk_opp_limit.setChecked(bool(v)), "opponent_speed_limit")
+        attempt(lambda v: self.chk_obs_limit.setChecked(bool(v)), "obstacle_speed_limit")
         attempt(lambda v: self.chk_bare_first.setChecked(bool(v)), "bare_first")
         attempt(combo_data(self.combo_mu), "mu_mode")
         attempt(lambda v: self.spin_mu.setValue(float(v)), "mu")
@@ -2408,6 +2422,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             plan_follower=str(self.combo_follower.currentData() or "map"),
             plan_speed_scale=float(self.spin_speed_scale.value()),
             opponent_speed_limit=bool(self.chk_opp_limit.isChecked()),
+            obstacle_speed_limit=bool(self.chk_obs_limit.isChecked()),
             opponent=("slots" if self.spin_grid.value() > 1 else "teacher"),
             opponent_slots=(self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else None),
             **self.ego_panel.config(),

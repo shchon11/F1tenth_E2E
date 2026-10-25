@@ -53,6 +53,9 @@ def common_arguments():
         DeclareLaunchArgument("opponent_speed_limit", default_value="false",
                               description="the speed limit for a car ahead (f1sim/opponent_speed_limit.py), read off "
                                           "the policy's own nearest-car output; best with *_nearcar.pt checkpoints"),
+        DeclareLaunchArgument("obstacle_speed_limit", default_value="false",
+                              description="the speed limit for an obstacle on the plan's own path "
+                                          "(f1sim/obstacle_speed_limit.py): small isolated scan clusters, no map"),
         DeclareLaunchArgument("viz", default_value="false",
                               description="controller markers on /f1sim/viz/plan and /clearance"),
         DeclareLaunchArgument("policy", default_value="true",
@@ -87,7 +90,8 @@ def policy_node(**kw):
 def controller_node(**kw):
     params = dict(_overrides())
     params.update({"controller": arg("controller"), "traction": arg("traction"),
-                   "viz": arg("viz", bool), "opponent_speed_limit": arg("opponent_speed_limit", bool)})
+                   "viz": arg("viz", bool), "opponent_speed_limit": arg("opponent_speed_limit", bool),
+                   "obstacle_speed_limit": arg("obstacle_speed_limit", bool)})
     params.update(kw)
     return Node(package="f1sim_ros", executable="controller", name="f1sim_controller",
                 output="screen", parameters=[LaunchConfiguration("config_yaml"), params])

@@ -144,6 +144,11 @@ class ControllerNode(Node):
         # default; with it on and no reading for a scan, that scan's command is not limited (and the diagnostics
         # say how often that happened).
         d("opponent_speed_limit", False)
+        # The speed limit for an obstacle on the plan's own path (2026-10-26, `f1sim.obstacle_speed_limit`): the speed
+        # command is held to the speed from which the car can still stop before the first small isolated cluster of
+        # this scan (a box, a pole -- walls are long and left out, so no map) on the path the plan draws. Returns at the
+        # perception's nearest-car reading are left to `opponent_speed_limit`. Off by default.
+        d("obstacle_speed_limit", False)
         d("traction", "off"); d("traction_params", "")
         d("sensor_timeout", 0.25); d("plan_timeout", 0.25); d("watchdog_period", 0.01)
         d("viz", False)
@@ -202,6 +207,10 @@ class ControllerNode(Node):
         self._opp_no_reading = 0
         #: whether the last reading's limit applied: that car stays held to `lane_exit` (`speed_limit(held=...)`)
         self._opp_held = False
+        self.obstacle_speed_limit = bool(p("obstacle_speed_limit"))
+        self._obs_limited = 0
+        #: the resampled scan's bearings [rad], from the driver's own window (first scan); nominal until then
+        self._scan_angles = None
         self.plan_speed_scale = float(p("plan_speed_scale"))
         if not (0.2 <= self.plan_speed_scale <= 1.5):
             raise ValueError(f"plan_speed_scale {self.plan_speed_scale}: expected a factor near 1 (0.2-1.5)")
@@ -410,6 +419,11 @@ class ControllerNode(Node):
                               float(self.spec.range_max))
         if self.clearance is not None:
             self._check_scan_geometry(m)
+        if getattr(self, "_scan_angles", None) is None:
+            lo, hi = float(m.angle_min), float(m.angle_max)
+            if not (math.isfinite(lo) and math.isfinite(hi) and hi > lo):
+                lo, hi = -LIDAR_FOV / 2, LIDAR_FOV / 2
+            self._scan_angles = torch.linspace(lo, hi, int(self.spec.n_beams), device=self.device)
         snap = ScanSnapshot(stamp_key(m.header.stamp), now, self.sensors.v, imu_mean, scan_norm,
                             stale, m.header.stamp)
         self._snapshots.append(snap)
@@ -596,6 +610,29 @@ class ControllerNode(Node):
             else:
                 self._opp_no_reading += 1
                 self._opp_held = False
+        if getattr(self, "obstacle_speed_limit", False) and speed > 0.0:
+            # the speed limit for an obstacle on the plan's own path, on THIS scan (the one the plan was made from), the
+            # plan decoded as the tracker decodes it; this scan's perception, when it is in, says where the car is
+            from f1sim import mpc as _mpc
+            from f1sim.obstacle_speed_limit import speed_limit as obstacle_limit
+            spec_t = self.tracker.spec
+            dec = _mpc.decode_wp4 if getattr(spec_t, "speed_mode", "linear") == "wp4" else _mpc.decode
+            v_t = torch.tensor([float(snap.v)], dtype=torch.float32, device=self.device)
+            cap_t = torch.tensor([float(self.speed_cap)], dtype=torch.float32, device=self.device)
+            k_o, L_o = dec(a.float(), v_t, float(self.spec.v_max), cap_t, spec_t)[:2]
+            rmax = float(self.spec.range_max)
+            sn = snap.scan_norm.reshape(1, -1).float()
+            ranges = torch.where(sn >= 1.0 - 1e-6, torch.full_like(sn, float("inf")), sn * rmax)
+            ang = self._scan_angles if getattr(self, "_scan_angles", None) is not None else \
+                torch.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, ranges.shape[1], device=self.device)
+            per_o = self._perception.get(snap.key) if snap.key is not None else None
+            reading = (torch.tensor([list(per_o.nearest_car)], dtype=torch.float32, device=self.device)
+                       if per_o is not None and len(per_o.nearest_car) == 5 else None)
+            lim_o = float(obstacle_limit(ranges, ang, k_o, L_o, v_t, LIDAR_MOUNT_X, 0.0, car_reading=reading,
+                                         range_max=rmax)[0])
+            if speed > lim_o:
+                speed = lim_o
+                self._obs_limited += 1
         if self.traction is not None:
             # Last thing before the command leaves, and *before* `speed_gain`: the guard reasons in
             # the car's own m/s -- it compares the command against a body speed estimated from this
@@ -737,6 +774,8 @@ class ControllerNode(Node):
              ("opponent_limited_commands", str(getattr(self, "_opp_limited", 0))),
              ("opponent_no_reading_commands", str(getattr(self, "_opp_no_reading", 0))),
              ("opponent_previous_scan_readings", str(getattr(self, "_opp_previous_scan", 0))),
+             ("obstacle_speed_limit", "on" if getattr(self, "obstacle_speed_limit", False) else "off"),
+             ("obstacle_limited_commands", str(getattr(self, "_obs_limited", 0))),
              ("mu", f"{float(self.grip.mu[0]):.5f}" if self.grip is not None else ""),
              ("clearance_margin_m",
               f"{self.clearance.cspec.margin:.3f}" if self.clearance is not None else ""),

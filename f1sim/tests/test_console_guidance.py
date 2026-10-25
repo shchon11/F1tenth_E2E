@@ -162,6 +162,7 @@ def _move_every_control(w):
     w.combo_follower.setCurrentIndex(w.combo_follower.findData("mpc"))
     w.spin_speed_scale.setValue(0.85)
     w.chk_opp_limit.setChecked(True)
+    w.chk_obs_limit.setChecked(True)
     w.combo_ros.setCurrentIndex(w.combo_ros.findData("publish"))
     w.combo_obstacle.setCurrentIndex(w.combo_obstacle.count() - 1)   # a family, not 없음/기본
     w.chk_bare_first.setChecked(True)                                # reset unless a family is set

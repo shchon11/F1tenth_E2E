@@ -562,6 +562,11 @@ class EnvConfig:
     #: moving into it within 1 s -- read off the policy's own nearest-car output, which its runner writes into
     #: `F1VecEnv.opponent_reading` every step (`learn/common.student_policy`, the console's worker). Plan mode only.
     opponent_speed_limit: bool = False
+    #: The speed limit for an obstacle on the plan's own path (2026-10-26, `obstacle_speed_limit.py`): the learner's speed
+    #: command is held to the speed from which it can still stop before the first small isolated cluster of its last
+    #: scan that lies on the path its plan draws -- a box, a pole; walls are long and left out, so no map is needed.
+    #: Returns at the nearest-car reading are left to `opponent_speed_limit`. Plan mode only.
+    obstacle_speed_limit: bool = False
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -1152,6 +1157,8 @@ class F1VecEnv:
         self.opponent_limited = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         #: rows whose speed limit applied last step (`speed_limit(held=...)`): their car stays held to `lane_exit`
         self.opponent_held = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        #: `EnvConfig.obstacle_speed_limit`: the rows whose speed command the obstacle limit held this step
+        self.obstacle_limited = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         if e.opponent_speed_limit:
             from .opponent_speed_limit import no_car
             self.opponent_reading = no_car(self.B, device=self.device)
@@ -2943,6 +2950,22 @@ class F1VecEnv:
                 held = self.learner & (v > lim.to(v.dtype))
                 self.opponent_limited = held
                 raw = torch.stack([raw[:, 0], torch.where(held, lim.to(v.dtype), v)], 1)
+            if self.ecfg.obstacle_speed_limit and lr is not None and lr.scan is not None:
+                # the speed limit for an obstacle on the plan's own path (`obstacle_speed_limit.py`), on the scan the
+                # policy planned from, the plan decoded as the tracker decodes it, the LiDAR's nominal mount
+                from .obstacle_speed_limit import speed_limit as obstacle_limit
+                from . import mpc as _mpc
+                spec_t = self.tracker.spec
+                dec = _mpc.decode_wp4 if getattr(spec_t, "speed_mode", "linear") == "wp4" else _mpc.decode
+                k_o, L_o = dec(a_trk.float(), v_meas.float(), float(self.tracker.v_max), self.speed_cap.float(), spec_t)[:2]
+                ang_o = self.sim.lidar.angles
+                lim_o = obstacle_limit(lr.scan, ang_o, k_o, L_o, self.sim.state[:, 3],
+                                       float(self.cfg.lidar.mount_x), float(self.cfg.lidar.mount_y),
+                                       car_reading=self.opponent_reading, range_max=float(self.cfg.lidar.range_max))
+                v = raw[:, 1]
+                held_o = self.learner & (v > lim_o.to(v.dtype))
+                self.obstacle_limited = held_o
+                raw = torch.stack([raw[:, 0], torch.where(held_o, lim_o.to(v.dtype), v)], 1)
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)
