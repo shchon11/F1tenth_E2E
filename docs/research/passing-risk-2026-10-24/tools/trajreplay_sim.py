@@ -7,6 +7,10 @@ for the step is that speed and steering (an external driver), so the scan is cas
 boxes (0.30 x 0.30 x 0.30 m cardboard) stand where the real boxes stood (clusters of the bag's fixed objects). Our policy plans
 alongside from the simulator's own scans and ego signals (open loop); its plan is measured against the boxes as in
 prop_plan_clearance.py. Rows of the 16 envs start at staggered times through the run (60 s each).
+TAKEOVER=1 (closed loop from those states): whenever a box is 1.5-2.5 m ahead within 0.4 m of the heading line, the row is
+handed to our policy for 1.5 s (no pinning, its own plan driven by the tracker), and the box contacts and the closest approach
+in that window are counted; then the replay resumes. Does a plan that crosses a box at 2 m turn into a hit when the policy is
+actually driving from there?
 usage: trajreplay_sim.py CKPT TRAJ.npz BOXES_JSON OUT_DIR SEEDS"""
 import dataclasses
 import json
@@ -57,8 +61,25 @@ def _features(self, e, y):
 
 
 model_v2.ActorV2.features = _features
-CUR = {"env": None, "step": 0, "rec": None}
+CUR = {"env": None, "step": 0, "rec": None, "in_step": False}
 ROWS = []
+TAKEOVER = bool(os.environ.get("TAKEOVER"))
+TK = {"left": None, "min_d": None, "hit": None, "hard": None, "events": []}
+from f1sim.sim import Simulator
+_orig_sim_step = Simulator.step
+
+
+def sim_step(self, *a, **kw):
+    r = _orig_sim_step(self, *a, **kw)
+    if TAKEOVER and CUR["in_step"] and TK["left"] is not None and r.contact_impacts is not None:
+        act = TK["left"] > 0
+        imp = r.contact_impacts[:, 1]
+        TK["hit"] |= act & (imp > 0)
+        TK["hard"] |= act & (imp >= 1.5)
+    return r
+
+
+Simulator.step = sim_step
 
 
 def recorded(n_rows, step, device):
@@ -79,6 +100,7 @@ class ReplayDriver:
 
     def command_env(self, env, rows):
         x, y, yaw, v, w = CUR["rec"]
+        v, w = v[rows], w[rows]
         P = env.sim.P
         L = (P["lf"] + P["lr"]).reshape(-1)[rows] if torch.is_tensor(P["lf"]) else float(P["lf"] + P["lr"])
         steer = torch.atan(L * w / v.clamp_min(0.3))
@@ -136,13 +158,51 @@ def env_step(self, action):
     x, y, yaw, v, w = rec
     st = self.sim.state
     P = self.sim.P
+    dev = st.device
+    if TK["left"] is None:
+        TK["left"] = torch.zeros(self.B, dtype=torch.long, device=dev)
+        TK["min_d"] = torch.full((self.B,), 9.0, device=dev)
+        TK["hit"] = torch.zeros(self.B, dtype=torch.bool, device=dev); TK["hard"] = torch.zeros_like(TK["hit"])
+    pin = TK["left"] == 0
     Lw = (P["lf"] + P["lr"]).reshape(-1) if torch.is_tensor(P["lf"]) else float(P["lf"] + P["lr"])
     rw = P["r_w"].reshape(-1) if torch.is_tensor(P["r_w"]) else float(P["r_w"])
-    st[:, dyn.IX], st[:, dyn.IY], st[:, dyn.IYAW] = x, y, yaw
-    st[:, dyn.IVX], st[:, dyn.IVY], st[:, dyn.IR] = v, torch.zeros_like(v), w
-    st[:, dyn.ISTEER] = torch.atan(Lw * w / v.clamp_min(0.3))
-    st[:, dyn.IOMEGA] = v / rw
-    out = _orig_step(self, action)
+    sel = lambda new, old: torch.where(pin, new, old)
+    st[:, dyn.IX], st[:, dyn.IY], st[:, dyn.IYAW] = sel(x, st[:, dyn.IX]), sel(y, st[:, dyn.IY]), sel(yaw, st[:, dyn.IYAW])
+    st[:, dyn.IVX], st[:, dyn.IVY], st[:, dyn.IR] = sel(v, st[:, dyn.IVX]), sel(torch.zeros_like(v), st[:, dyn.IVY]), sel(w, st[:, dyn.IR])
+    st[:, dyn.ISTEER] = sel(torch.atan(Lw * w / v.clamp_min(0.3)), st[:, dyn.ISTEER])
+    st[:, dyn.IOMEGA] = sel(v / rw, st[:, dyn.IOMEGA])
+    if TAKEOVER:
+        # a box 1.5-2.5 m ahead within 0.4 m of the heading line on a pinned row: hand that row to the policy for 1.5 s
+        bx = torch.as_tensor(boxes[:, 0], dtype=torch.float32, device=dev)[None, :]
+        by = torch.as_tensor(boxes[:, 1], dtype=torch.float32, device=dev)[None, :]
+        c, sn = torch.cos(st[:, dyn.IYAW])[:, None], torch.sin(st[:, dyn.IYAW])[:, None]
+        qx, qy = bx - st[:, dyn.IX][:, None], by - st[:, dyn.IY][:, None]
+        xl, yl = c * qx + sn * qy, -sn * qx + c * qy
+        start = pin & ((xl > 1.5) & (xl < 2.5) & (yl.abs() < 0.4)).any(1) & (v > 1.0) & (TK.get("cool", torch.zeros_like(TK["left"])) == 0)
+        if bool(start.any()):
+            TK["left"] = torch.where(start, torch.full_like(TK["left"], 60), TK["left"])
+            TK["min_d"] = torch.where(start, torch.full_like(TK["min_d"], 9.0), TK["min_d"])
+            TK["hit"] = TK["hit"] & ~start; TK["hard"] = TK["hard"] & ~start
+        d_box = torch.hypot(qx, qy).min(1).values
+        active = TK["left"] > 0
+        TK["min_d"] = torch.where(active, torch.minimum(TK["min_d"], d_box), TK["min_d"])
+        # the policy drives the rows in a takeover: the replay driver's command goes to the other rows only
+        self.external_driven = ~active
+        self.external_slot_rows[0] = (~active).nonzero().flatten()
+        self._all_external = False
+    CUR["in_step"] = True
+    try:
+        out = _orig_step(self, action)
+    finally:
+        CUR["in_step"] = False
+    if TAKEOVER:
+        ending = TK["left"] == 1
+        if bool(ending.any()):
+            for i in ending.nonzero().flatten().tolist():
+                TK["events"].append((float(TK["min_d"][i]), bool(TK["hit"][i]), bool(TK["hard"][i])))
+        TK["left"] = (TK["left"] - 1).clamp_min(0)
+        cool = TK.get("cool", torch.zeros_like(TK["left"]))
+        TK["cool"] = torch.where(ending, torch.full_like(cool, 80), (cool - 1).clamp_min(0))   # 2 s before the next takeover
     CUR["step"] += 1
     return out
 
@@ -167,3 +227,9 @@ for seed in SEEDS:
           f"{np.median(r[m, 3]) if m.any() else float('nan'):+.2f} m, read as a car {100 * np.nanmean(r[m, 5] > 0):.0f} %, speed p50 "
           f"{np.median(r[m, 2]) if m.any() else 0:.2f}, |yaw rate| p50 {np.median(np.abs(r[m, 6])) if m.any() else 0:.2f}, "
           f"row resets {ReplayDriver.resets}", flush=True)
+    if TAKEOVER and TK["events"]:
+        e = np.array(TK["events"], dtype=np.float64)
+        print(f"  TAKEOVERS {len(e)}: box contact {100 * e[:, 1].mean():.0f} %, hard {100 * e[:, 2].mean():.0f} %, closest approach to the box "
+              f"centre p10/p50 {np.percentile(e[:, 0], 10):.2f}/{np.median(e[:, 0]):.2f} m", flush=True)
+        np.save(os.path.join(OUT, f"takeovers_s{seed}.npy"), e)
+    TK.update(left=None, events=[]); TK.pop("cool", None)
