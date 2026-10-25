@@ -65,3 +65,31 @@ for cls in ("ego_hits_rear", "side", "hit_from_behind", "turned", "all"):
     print(f"{cls:16s} n {len(sub):4d} (last 0.3 s) | |dy| error: reading {err('read'):.3f} mid {err('mid'):.3f} cent {err('cent'):.3f} | "
           f"|dx| error: reading {errx('read'):.3f} mid {errx('mid'):.3f} | in-lane agreement: reading {agree('read'):.2f} "
           f"mid {agree('mid'):.2f} | truly in lane but read beyond {EXIT}: reading {missed('read'):.2f} mid {missed('mid'):.2f}")
+
+
+# ---- the car limit's decision along each event's last 0.5 s: with the reading as it was, and with the scan-refined one
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from refine_proto import refine
+from f1sim.opponent_speed_limit import speed_limit
+res = {"read": [], "refined": []}
+for rec in S:
+    e = E[rec["event"]]
+    m = rec["scans"].shape[0]
+    ref, found = refine(rec["reading"], rec["scans"].float(), ANG, range_max=10.0)
+    v = torch.tensor(e["v_ego_hist"][:m], dtype=torch.float32)
+    for name, rd in (("read", rec["reading"].float()), ("refined", ref)):
+        held = torch.zeros(1, dtype=torch.bool)
+        bind = []
+        for t in range(m - 1, -1, -1):                    # oldest first, with the latch carried
+            lim = speed_limit(rd[t:t + 1], v[t:t + 1], held=held)
+            held = torch.isfinite(lim)
+            bind.append(bool(lim[0] < v[t] - 0.1))
+        first = next((m - 1 - k for k, b in enumerate(bind) if b), None)   # steps before the hit of the first binding step
+        res[name].append(dict(cls=e["cls"], any=any(bind), lead=first))
+for cls in ("ego_hits_rear", "side", "hit_from_behind", "turned"):
+    for name in ("read", "refined"):
+        sub = [x for x in res[name] if x["cls"] == cls]
+        if sub:
+            leads = [x["lead"] for x in sub if x["lead"] is not None]
+            print(f"{cls:16s} {name:8s}: the limit would bind in the last 0.5 s for {sum(x['any'] for x in sub)}/{len(sub)} | "
+                  f"first bind {sum(leads) / len(leads) * 0.025 if leads else 0:.2f} s before the hit (mean)")
