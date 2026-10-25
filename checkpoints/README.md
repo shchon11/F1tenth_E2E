@@ -397,6 +397,25 @@ output's lateral offset drifts outward in the last 0.2 s before a hit), the limi
 Alone on a track with props on the line the limit now holds the speed on ~1 % of the steps (props read as a car; 0.25 %
 with `_nearcar`), at -0.4 % speed.
 
+### With the speed limit for an obstacle on the plan's path (2026-10-26)
+
+For races with boxes on the track (the venue had them), also switch on the obstacle limit: the console's 「장애물 충돌 방지
+감속」, the controller node's `obstacle_speed_limit:=true`, `evaluate --obstacle-speed-limit`. It holds the speed command to
+the speed from which the car can still stop before the first small isolated cluster of the scan on the plan's own path (a
+box, a pole; walls are long and left out -- no map). Returns at the policy's nearest-car reading are left to the car limit,
+so it needs this file's output too (a v2 checkpoint with `near_car`; refused without one). Details:
+`docs/research/passing-risk-2026-10-24`, section 13.
+
+| finals race cells, props on the line, `_nearcar_slow` + latch (car limit on in both rows) | hard all /km | hard prop /km | race speed |
+| --- | ---: | ---: | ---: |
+| seeds 81-84, car limit only | 2.19 | 1.24 | 4.46 m/s |
+| seeds 81-84, + obstacle limit | 1.33 (-39 %) | 0.63 | 4.26 m/s |
+| fresh 91-94, car limit only | 1.95 | 0.91 | 4.51 m/s |
+| fresh 91-94, + obstacle limit | 1.48 (-24 %) | 0.74 | 4.32 m/s |
+
+Alone with props on the line: 4.84 -> 4.81 m/s, no more hits. One control cycle of it costs 0.6 ms on one core of the lab
+PC (Ryzen 7 260); measure it on the car's AGX Orin before relying on the margin.
+
 ## ICCAS and ICRA picks record their follower (2026-10-23)
 
 `iccas_fixphys_s1102_u384` and `icra2022_map3R2_s1321_u384` were selected and scored with MAP (each map's round-5
