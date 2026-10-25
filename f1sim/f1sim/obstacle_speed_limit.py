@@ -13,7 +13,8 @@ stop there:
 
 An obstacle return is a return of a SMALL ISOLATED CLUSTER of the scan: a run of at least `min_beams` valid beams with no
 range jump over `break_jump` between neighbours, under `max_extent` end to end, standing at least `stand` in front of
-the beams beyond both of its ends. A wall is long, a box or a pole is not -- so no map and no localisation are needed,
+the beams beyond both of its ends (the farthest of the `stand_look` beams beyond each end: a beam grazing the object's own
+side face is not its background). A wall is long, a box or a pole is not -- so no map and no localisation are needed,
 which our map-less stack does not have. Returns within `car_exclude` of the policy's own nearest-car reading are left to
 the speed limit for a car ahead (`opponent_speed_limit`). Nothing reads the simulator's truth: the same code runs in the
 controller node (`f1sim_ros`, parameter `obstacle_speed_limit`), the console and `evaluate --obstacle-speed-limit`.
@@ -47,6 +48,11 @@ class ObstacleSpeedLimit:
     stand: float = 0.3           # [m] a cluster stands at least this far in front of the beams beyond both its ends
     min_beams: int = 3
     car_exclude: float = 0.45    # [m] returns this close to the nearest-car reading are the car limit's
+    # beams beyond each end the stand test looks at, the farthest of them counting (2026-10-26). Against the one beam next
+    # to the end, a box was missed wherever a beam grazing its own side face (one beam, 0.1-0.2 m behind its front face:
+    # a range jump that ends the cluster) stood next to it -- 12 % of the positions of an isolated 0.3 m box 0.8-4 m
+    # ahead, 30 % at 4 m (synthetic scans), and in closed loop the limit let go and took hold again from scan to scan
+    stand_look: int = 3
 
 
 DEFAULT = ObstacleSpeedLimit()
@@ -68,7 +74,9 @@ def cluster_keep(r: torch.Tensor, ok: torch.Tensor, px: torch.Tensor, py: torch.
     f, l = first[gid].view(B, n), last[gid].view(B, n)
     bi = torch.arange(B, device=dev)[:, None].expand(B, n)
     ext = torch.hypot(px[bi, l] - px[bi, f], py[bi, l] - py[bi, f])
-    r_left, r_right = rf[bi, (f - 1).clamp_min(0)], rf[bi, (l + 1).clamp(max=n - 1)]
+    look = range(1, max(1, int(p.stand_look)) + 1)
+    r_left = torch.stack([rf[bi, (f - j).clamp_min(0)] for j in look]).max(0).values
+    r_right = torch.stack([rf[bi, (l + j).clamp(max=n - 1)] for j in look]).max(0).values
     standing = (f > 0) & (l < n - 1) & (r_left > rf[bi, f] + p.stand) & (r_right > rf[bi, l] + p.stand)
     return ok & ((l - f + 1) >= p.min_beams) & (ext < p.max_extent) & standing
 

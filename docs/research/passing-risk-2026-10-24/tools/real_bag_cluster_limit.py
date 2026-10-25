@@ -35,9 +35,12 @@ from f1sim.learn.obs import spec_from_dict
 
 SC, PL, OBJS = sys.argv[2:5]
 CK = "/home/shchon11/F1tenth_E2E/checkpoints/korea26_v2_ppo_s2421_u512_nearcar_slow.pt"
-src = open("/home/shchon11/f1sim_runs/_eval/mintime-teacher-2026-09-19/pipeline/tools/research/scan_limit_race.py").read()
-ns = {"torch": torch}; exec("def cluster_keep(" + src.split("def cluster_keep(")[1].split("\ndef scan_limit(")[0], ns)
-cluster_keep = ns["cluster_keep"]
+# the shipped rule (f1sim.obstacle_speed_limit.cluster_keep); env LOOK: its stand_look (10-26: 1 = the rule before, 3 = after)
+import os
+from dataclasses import replace
+from f1sim.obstacle_speed_limit import DEFAULT as _P, cluster_keep as _ck
+_PL = replace(_P, stand_look=int(os.environ.get("LOOK", str(_P.stand_look))))
+cluster_keep = lambda r, ok, px, py: _ck(r, ok, px, py, _PL)
 ck = torch.load(CK, map_location="cpu", weights_only=False)
 pspec = mpc.contract_spec(mpc.contract_of(ck.get("extra")))
 v_max = float(spec_from_dict(dict((ck.get("extra") or {}).get("spec") or {})).v_max)

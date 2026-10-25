@@ -12,7 +12,9 @@ Lateral attribution (side / rear, last 0.5 s): the Frenet lateral distance each 
 
 Protocol = the finals' race cells (tools/baselines/final_eval2.ours_race): race of 2, one opponent kind per cell with
 speed_scale U(0.7, 1.0), soft contacts, props, rep floor, dial 1.0489, the checkpoint's own follower (its contract).
-usage: car_contact_anatomy.py CKPT OUT_DIR [SEEDS=81,82] [KINDS=forzaeth,forzaeth_pred,lane_switch,interactive]"""
+usage: car_contact_anatomy.py CKPT OUT_DIR [SEEDS=81,82] [KINDS=forzaeth,forzaeth_pred,lane_switch,interactive]
+env OSL=1 / OBSL=1: the speed limit for a car ahead / for an obstacle on the plan's path on (10-26: each event then also carries the
+last second of what the limits did -- held or not, the policy's nearest-car reading, the command after the limits)."""
 import json
 import math
 import os
@@ -29,7 +31,7 @@ CK, OUT = sys.argv[1], sys.argv[2]
 SEEDS = [int(x) for x in (sys.argv[3] if len(sys.argv) > 3 else "81,82").split(",")]
 KINDS = (sys.argv[4] if len(sys.argv) > 4 else "forzaeth,forzaeth_pred,lane_switch,interactive").split(",")
 TRACK = os.environ.get("ANAT_TRACK", "real:korea_2026_competition")
-HARD = 1.5
+HARD = float(os.environ.get("ANAT_HARD", "1.5"))   # smoke tests lower it
 K = 40                                   # 1 s of history at 40 Hz
 os.makedirs(OUT, exist_ok=True)
 
@@ -49,6 +51,10 @@ class Recorder:
         self.vm = torch.zeros(K, B, device=dev)           # the speed the plan was decoded at
         self.age = torch.zeros(B, dtype=torch.long, device=dev)
         self.prev_car = torch.zeros(B, dtype=torch.bool, device=dev)
+        self.held_car = torch.zeros(K, B, dtype=torch.bool, device=dev)   # the car limit held the command
+        self.held_obs = torch.zeros(K, B, dtype=torch.bool, device=dev)   # the obstacle limit held the command
+        self.reading = torch.zeros(K, B, 5, device=dev)                   # the policy's nearest-car reading (raw)
+        self.cmd = torch.zeros(K, B, device=dev)                          # the speed command after the limits
 
     def observe(self, env, sim, r, entry, action, v_plan):
         fresh = entry == 0
@@ -59,6 +65,13 @@ class Recorder:
         self.lat = torch.roll(self.lat, 1, 0); self.lat[0] = lat.float()
         self.act = torch.roll(self.act, 1, 0); self.act[0] = action.float()
         self.vm = torch.roll(self.vm, 1, 0); self.vm[0] = v_plan.float()
+        self.held_car = torch.roll(self.held_car, 1, 0); self.held_car[0] = env.opponent_limited
+        self.held_obs = torch.roll(self.held_obs, 1, 0); self.held_obs[0] = env.obstacle_limited
+        rd = getattr(env, "opponent_reading", None)
+        self.reading = torch.roll(self.reading, 1, 0)
+        if rd is not None:
+            self.reading[0] = rd.float()
+        self.cmd = torch.roll(self.cmd, 1, 0); self.cmd[0] = env.last_cmd_raw[:, 1].float()
         self.age += 1
         if r.car_collision is None or r.car_impact is None:
             return
@@ -109,7 +122,11 @@ class Recorder:
                                gap_hist=[round(x, 2) for x in gap],
                                plan_v1_hist=[round(float(x), 2) for x in v1], plan_vend_hist=[round(float(x), 2) for x in v_end],
                                yaw_rate_ego=round(float(e[0, 5]), 2), yaw_rate_opp=round(float(o[0, 5]), 2),
-                               lat_ego=round(float(le[0]), 3), lat_opp=round(float(lo[0]), 3), hist_steps=n))
+                               lat_ego=round(float(le[0]), 3), lat_opp=round(float(lo[0]), 3), hist_steps=n,
+                               car_held_hist=[int(x) for x in self.held_car[:n, i].tolist()],
+                               obs_held_hist=[int(x) for x in self.held_obs[:n, i].tolist()],
+                               reading_hist=[[round(float(v), 3) for v in row] for row in self.reading[:n, i].tolist()],
+                               cmd_hist=[round(float(x), 2) for x in self.cmd[:n, i].tolist()]))
 
 
 RECS = {}
@@ -147,15 +164,16 @@ for seed in SEEDS:
         # ANAT_SCALE: the opponent's speed_scale (one number, e.g. 0.05 = a near-stopped car; 10-25), ANAT_CORRIDOR: the
         # props' raceline corridor ("on" keeps them off the line)
         slot = {"kind": kind, "speed_scale": (float(os.environ["ANAT_SCALE"]) if os.environ.get("ANAT_SCALE") else [0.7, 1.0])}
-        sys.argv = ["evaluate", CK, "--action-mode", "plan", "--tracks", TRACK, "--envs", "32", "--steps", "2400",
+        sys.argv = ["evaluate", CK, "--action-mode", "plan", "--tracks", TRACK, "--envs", os.environ.get("ANAT_ENVS", "32"), "--steps", os.environ.get("ANAT_STEPS", "2400"),
                     "--budget-laps", "0", "--teacher-a-lat", "7.0", "--teacher-a-acc", "6.5", "--teacher-a-brake", "4.0",
-                    "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",
+                    "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", os.environ.get("ANAT_DEVICE", "cuda:0"),
                     "--seed", str(seed), "--graphs", "--collision-mode", "soft", "--movable-obstacles", "--spawn-runway", "3.0",
                     "--race-size", "2", "--procedural-obstacles", "1.0", "--procedural-density", "1.5",
                     "--procedural-max-props", "10", "--procedural-raceline-corridor", os.environ.get("ANAT_CORRIDOR", "off"),
                     "--opp-slots", json.dumps([slot]),
                     "--output", out, "--dial-value", "1.0489",
                     *(["--opponent-speed-limit"] if os.environ.get("OSL") else []),
+                    *(["--obstacle-speed-limit"] if os.environ.get("OBSL") else []),
                     "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92"]
         n0 = len(EVENTS)
         ev.main()

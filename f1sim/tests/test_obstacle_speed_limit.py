@@ -50,6 +50,20 @@ def test_a_box_is_an_obstacle_and_walls_are_not():
     assert not bool(keep[~box & ~piece].any())                 # the corridor walls
 
 
+def test_a_beam_grazing_the_boxs_own_side_is_not_what_it_stands_in_front_of():
+    """2026-10-26: seen from (3.0, 0.35) m in a 2 m corridor, one beam grazes the box's side face 0.19 m behind its front --
+    a jump that ends the cluster -- and the stand test against that one beam threw the box away (12 % of an isolated box's
+    positions 0.8-4 m ahead). Against the farthest of the next `stand_look` beams it is kept; the walls still are not."""
+    from dataclasses import replace
+    r, box = with_box(corridor(), 3.0, 0.35)
+    ok = torch.isfinite(r)[None]
+    px, py = points(r)
+    keep = cluster_keep(r[None], ok, px[None], py[None])[0]
+    assert bool(keep[box].any()) and not bool(keep[~box].any())
+    old = cluster_keep(r[None], ok, px[None], py[None], replace(DEFAULT, stand_look=1))[0]
+    assert not bool(old[box].any())
+
+
 def straight_plan(length=4.0, b=1):
     return torch.zeros(b, 4), torch.full((b,), length)
 
