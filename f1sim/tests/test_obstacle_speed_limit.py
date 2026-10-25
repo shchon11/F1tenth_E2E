@@ -64,6 +64,36 @@ def test_a_beam_grazing_the_boxs_own_side_is_not_what_it_stands_in_front_of():
     assert not bool(old[box].any())
 
 
+def test_a_wall_piece_between_two_missed_returns_is_not_a_box_but_a_box_before_open_space_is():
+    """2026-10-26: a wall seen at a grazing angle misses returns (5-9 % of beams on the competition track), and a stretch of
+    wall between two misses read as a small cluster standing in front of 'far' -- half of the limit's speed cut in the race
+    cells. Only beams that returned count as background; a run of no-returns beyond an end is open space."""
+    from dataclasses import replace
+    r = corridor().clone()
+    left = (ANG > 0.25) & (ANG < 0.5)                         # the left wall, seen at a grazing angle
+    i0 = int(left.nonzero()[0])
+    miss = torch.zeros_like(r, dtype=torch.bool)
+    miss[i0 + 10] = True; miss[i0 + 22] = True                # two missed returns 12 beams apart
+    r = torch.where(miss, torch.full_like(r, 65.533), r)
+    ok = (r < 30.0)[None]
+    px, py = points(torch.where(ok[0], r, torch.zeros_like(r)))
+    piece = torch.zeros_like(miss); piece[i0 + 11:i0 + 22] = True
+    assert not bool(cluster_keep(r[None], ok, px[None], py[None])[0][piece].any())
+    assert bool(cluster_keep(r[None], ok, px[None], py[None], replace(DEFAULT, stand_valid_only=False))[0][piece].any())
+    # a box with nothing returning beyond it (open space, or beyond the range the scan was cut at) is still a box
+    rb, box = with_box(torch.full((N,), float("inf")), 2.0, 0.0)
+    okb = torch.isfinite(rb)[None]
+    pxb, pyb = points(torch.where(okb[0], rb, torch.zeros_like(rb)))
+    assert bool(cluster_keep(rb[None], okb, pxb[None], pyb[None])[0][box].all())
+    # and one missed return next to it, the far wall behind, does not hide it
+    rm, box = with_box(corridor(), 2.0, 0.0)
+    j = int(box.nonzero()[-1]) + 1
+    rm[j] = 65.533
+    okm = (rm < 30.0)[None]
+    pxm, pym = points(torch.where(okm[0], rm, torch.zeros_like(rm)))
+    assert bool(cluster_keep(rm[None], okm, pxm[None], pym[None])[0][box].any())
+
+
 def straight_plan(length=4.0, b=1):
     return torch.zeros(b, 4), torch.full((b,), length)
 

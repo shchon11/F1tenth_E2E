@@ -39,7 +39,8 @@ CK = "/home/shchon11/F1tenth_E2E/checkpoints/korea26_v2_ppo_s2421_u512_nearcar_s
 import os
 from dataclasses import replace
 from f1sim.obstacle_speed_limit import DEFAULT as _P, cluster_keep as _ck
-_PL = replace(_P, stand_look=int(os.environ.get("LOOK", str(_P.stand_look))))
+_PL = replace(_P, stand_look=int(os.environ.get("LOOK", str(_P.stand_look))),
+              stand_valid_only=os.environ.get("VALID", "1" if _P.stand_valid_only else "0") == "1")
 cluster_keep = lambda r, ok, px, py: _ck(r, ok, px, py, _PL)
 ck = torch.load(CK, map_location="cpu", weights_only=False)
 pspec = mpc.contract_spec(mpc.contract_of(ck.get("extra")))

@@ -13,8 +13,9 @@ stop there:
 
 An obstacle return is a return of a SMALL ISOLATED CLUSTER of the scan: a run of at least `min_beams` valid beams with no
 range jump over `break_jump` between neighbours, under `max_extent` end to end, standing at least `stand` in front of
-the beams beyond both of its ends (the farthest of the `stand_look` beams beyond each end: a beam grazing the object's own
-side face is not its background). A wall is long, a box or a pole is not -- so no map and no localisation are needed,
+the beams beyond both of its ends (the farthest of the `stand_look` beams beyond each end that returned: a beam grazing the
+object's own side face is not its background, and neither is a beam that returned nothing next to a wall seen at a
+grazing angle; when none of them returned, that is open space). A wall is long, a box or a pole is not -- so no map and no localisation are needed,
 which our map-less stack does not have. Returns within `car_exclude` of the policy's own nearest-car reading are left to
 the speed limit for a car ahead (`opponent_speed_limit`). Nothing reads the simulator's truth: the same code runs in the
 controller node (`f1sim_ros`, parameter `obstacle_speed_limit`), the console and `evaluate --obstacle-speed-limit`.
@@ -53,6 +54,13 @@ class ObstacleSpeedLimit:
     # a range jump that ends the cluster) stood next to it -- 12 % of the positions of an isolated 0.3 m box 0.8-4 m
     # ahead, 30 % at 4 m (synthetic scans), and in closed loop the limit let go and took hold again from scan to scan
     stand_look: int = 3
+    # only beams that RETURNED count as what a cluster stands in front of; when none of the `stand_look` beams beyond an end
+    # returned, that is open space (2026-10-26). A wall seen at a grazing angle misses returns (5-9 % of beams on the
+    # competition track below |cos| 0.3, `LidarParams.duct_graze_dropout`), and a no-return read as far background made
+    # the stretch of wall between two misses a small isolated cluster: measure-only in the race cells, walls set 60 % of
+    # the limit's holds and half of its speed cut, 97 % of them cut out by a no-return beam; synthetic corridors with the
+    # measured miss rates kept a wall piece in 59-67 % of scans, and none with this
+    stand_valid_only: bool = True
 
 
 DEFAULT = ObstacleSpeedLimit()
@@ -75,8 +83,12 @@ def cluster_keep(r: torch.Tensor, ok: torch.Tensor, px: torch.Tensor, py: torch.
     bi = torch.arange(B, device=dev)[:, None].expand(B, n)
     ext = torch.hypot(px[bi, l] - px[bi, f], py[bi, l] - py[bi, f])
     look = range(1, max(1, int(p.stand_look)) + 1)
-    r_left = torch.stack([rf[bi, (f - j).clamp_min(0)] for j in look]).max(0).values
-    r_right = torch.stack([rf[bi, (l + j).clamp(max=n - 1)] for j in look]).max(0).values
+    rs = torch.where(ok, r, torch.full_like(r, -1.0)) if p.stand_valid_only else rf   # -1: no return, no evidence
+    r_left = torch.stack([rs[bi, (f - j).clamp_min(0)] for j in look]).max(0).values
+    r_right = torch.stack([rs[bi, (l + j).clamp(max=n - 1)] for j in look]).max(0).values
+    if p.stand_valid_only:                                                  # nothing beyond returned: open space
+        r_left = torch.where(r_left < 0, torch.full_like(r_left, 30.0), r_left)
+        r_right = torch.where(r_right < 0, torch.full_like(r_right, 30.0), r_right)
     standing = (f > 0) & (l < n - 1) & (r_left > rf[bi, f] + p.stand) & (r_right > rf[bi, l] + p.stand)
     return ok & ((l - f + 1) >= p.min_beams) & (ext < p.max_extent) & standing
 
