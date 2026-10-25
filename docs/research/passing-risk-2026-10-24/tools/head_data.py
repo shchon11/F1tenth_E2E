@@ -108,7 +108,8 @@ for seed in SEEDS:
             REC[k] = []
         CUR.update(z=None, t=0, prev_car=None, onset_now=None)
         out = os.path.join(os.path.dirname(OUT) or ".", f"_hd_{os.path.basename(OUT)}_{seed}_{kind}.json")
-        slot = {"kind": kind, "speed_scale": [0.7, 1.0]}
+        # HD_SCALE (10-25): the opponent's speed_scale as one number (0.05 = a near-stopped car, the head's blind spot)
+        slot = {"kind": kind, "speed_scale": (float(os.environ["HD_SCALE"]) if os.environ.get("HD_SCALE") else [0.7, 1.0])}
         sys.argv = ["evaluate", CK, "--action-mode", "plan", "--tracks", TRACK, "--envs", "32", "--steps", "2400",
                     "--budget-laps", "0", "--teacher-a-lat", "7.0", "--teacher-a-acc", "6.5", "--teacher-a-brake", "4.0",
                     "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",

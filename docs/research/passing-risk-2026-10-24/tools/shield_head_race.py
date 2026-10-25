@@ -182,13 +182,16 @@ if os.environ.get("SOLO"):
           f"{STAT['head_rows_read']} rows, a car seen on {STAT['head_rows_seeing_a_car']}", flush=True)
     json.dump({"source": SOURCE, "h": H, "solo": True, **STAT}, open(os.path.join(OUT, "shield_stats_solo.json"), "w"))
     sys.exit(0)
+# OPP_SLOT (10-25): one opponent slot (JSON) instead of the four kinds, e.g. a near-stopped car {"kind": "raceline",
+# "speed_scale": 0.05} -- the file is named after its kind
+SLOTS = [json.loads(os.environ["OPP_SLOT"])] if os.environ.get("OPP_SLOT") else [{"kind": k, "speed_scale": [0.7, 1.0]} for k in KINDS]
 for seed in SEEDS:
-    for kind in KINDS:
+    for slot in SLOTS:
+        kind = slot["kind"] if not os.environ.get("OPP_SLOT") else "slowcar"
         out = os.path.join(OUT, f"race_s{seed}_{kind}.json")
         if os.path.exists(out):
             continue
         CUR["near"] = None
-        slot = {"kind": kind, "speed_scale": [0.7, 1.0]}
         sys.argv = ["evaluate", CK, "--action-mode", "plan", "--tracks", TRACK, "--envs", "32", "--steps", "2400",
                     "--budget-laps", "0", "--teacher-a-lat", "7.0", "--teacher-a-acc", "6.5", "--teacher-a-brake", "4.0",
                     "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",

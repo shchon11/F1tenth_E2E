@@ -144,13 +144,16 @@ for seed in SEEDS:
         LABEL.clear(); LABEL.update(seed=seed, kind=kind)
         RECS.clear()
         out = os.path.join(OUT, f"race_s{seed}_{kind}.json")
-        slot = {"kind": kind, "speed_scale": [0.7, 1.0]}
+        # ANAT_SCALE: the opponent's speed_scale (one number, e.g. 0.05 = a near-stopped car; 10-25), ANAT_CORRIDOR: the
+        # props' raceline corridor ("on" keeps them off the line)
+        slot = {"kind": kind, "speed_scale": (float(os.environ["ANAT_SCALE"]) if os.environ.get("ANAT_SCALE") else [0.7, 1.0])}
         sys.argv = ["evaluate", CK, "--action-mode", "plan", "--tracks", TRACK, "--envs", "32", "--steps", "2400",
                     "--budget-laps", "0", "--teacher-a-lat", "7.0", "--teacher-a-acc", "6.5", "--teacher-a-brake", "4.0",
                     "--raceline-objective", "min_time", "--dial-offset", "0.0", "--speed-cap", "9.0", "--device", "cuda:0",
                     "--seed", str(seed), "--graphs", "--collision-mode", "soft", "--movable-obstacles", "--spawn-runway", "3.0",
                     "--race-size", "2", "--procedural-obstacles", "1.0", "--procedural-density", "1.5",
-                    "--procedural-max-props", "10", "--procedural-raceline-corridor", "off", "--opp-slots", json.dumps([slot]),
+                    "--procedural-max-props", "10", "--procedural-raceline-corridor", os.environ.get("ANAT_CORRIDOR", "off"),
+                    "--opp-slots", json.dumps([slot]),
                     "--output", out, "--dial-value", "1.0489",
                     *(["--opponent-speed-limit"] if os.environ.get("OSL") else []),
                     "--rand-range", "vehicle.mu=1.0,1.0", "--rand-range", "vehicle.mu_f_scale=0.92,0.92"]
