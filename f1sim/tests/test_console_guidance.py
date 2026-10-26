@@ -147,7 +147,6 @@ def test_notify_ignores_an_empty_message(window):
 def _move_every_control(w):
     w.spin_races.setValue(4)
     w.spin_grid.setValue(3)
-    w.spin_cap.setValue(7.5)
     w.chk_dr.setChecked(False)
     w.chk_soft.setChecked(False)
     w.chk_stoch.setChecked(True)

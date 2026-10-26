@@ -251,7 +251,6 @@ def test_console_remembers_its_settings_between_launches(qapp, tmp_path, monkeyp
     monkeypatch.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path / "console.json"))
 
     w = ConsoleWindow()
-    w.spin_cap.setValue(7.5)
     w.spin_grid.setValue(3)
     w.chk_dr.setChecked(False)
     w.combo_mu.setCurrentIndex(w.combo_mu.findData("fixed"))
@@ -263,7 +262,7 @@ def test_console_remembers_its_settings_between_launches(qapp, tmp_path, monkeyp
     w.save_prefs()
 
     back = ConsoleWindow()
-    assert back.spin_cap.value() == 7.5 and back.spin_grid.value() == 3
+    assert back.spin_grid.value() == 3
     assert back.chk_dr.isChecked() is False
     assert back.combo_mu.currentData() == "fixed" and abs(back.spin_mu.value() - 0.82) < 1e-6
     assert abs(back.spin_dial.value() - 0.90) < 1e-6
@@ -275,11 +274,11 @@ def test_a_setting_that_can_no_longer_be_restored_costs_only_itself(qapp, tmp_pa
     from f1sim.viewer.console.window import ConsoleWindow
     monkeypatch.setenv("F1SIM_CONSOLE_PREFS", str(tmp_path / "console.json"))
     ckpt = tmp_path / "run.pt"; ckpt.write_text("x")
-    w = ConsoleWindow(); w.spin_cap.setValue(7.5); w._on_run_selected(str(ckpt)); w.save_prefs()
+    w = ConsoleWindow(); w.spin_grid.setValue(3); w._on_run_selected(str(ckpt)); w.save_prefs()
 
     ckpt.unlink()                                   # the checkpoint is gone; the rest is still valid
     back = ConsoleWindow()
-    assert back._selected_run is None and back.spin_cap.value() == 7.5
+    assert back._selected_run is None and back.spin_grid.value() == 3
 
     (tmp_path / "console.json").write_text("{ not json")
-    assert ConsoleWindow().spin_cap.value() == 6.0  # unreadable: defaults, silently
+    assert ConsoleWindow().spin_grid.value() == 1  # unreadable: defaults, silently

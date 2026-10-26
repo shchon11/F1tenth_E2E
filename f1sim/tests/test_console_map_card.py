@@ -238,7 +238,7 @@ def test_a_pick_with_settings_sets_up_the_whole_session(win, tmp_path):
     (d / "ppo_latest.pt").write_bytes(b"x")
     (tmp_path / "runs" / catalog.PICKS_FILE).write_text(json.dumps({"picks": [
         {"run": "pick_comp", "label": "대회용", "map": "real/korea26", "note": "",
-         "settings": {"obstacle": "train", "races": 1, "cars_per_race": 2, "speed_cap": 9.0,
+         "settings": {"obstacle": "train", "races": 1, "cars_per_race": 2,
                       "opponent_speed_limit": True, "obstacle_speed_limit": True,
                       "opponent_slots": [{"kind": "forzaeth_pred", "speed_scale": [0.7, 1.0]}]}}]}),
         encoding="utf-8")
@@ -250,7 +250,6 @@ def test_a_pick_with_settings_sets_up_the_whole_session(win, tmp_path):
     assert win._selected_map == "real/korea26"
     assert win.chk_opp_limit.isChecked() and win.chk_obs_limit.isChecked()
     assert win.spin_grid.value() == 2 and win.spin_races.value() == 1
-    assert abs(win.spin_cap.value() - 9.0) < 1e-6
     assert str(win.combo_obstacle.currentData()) == "train"
     slots = win.opp_table.slot_dicts()
     assert len(slots) == 1 and slots[0]["kind"] == "forzaeth_pred"

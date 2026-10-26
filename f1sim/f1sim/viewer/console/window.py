@@ -431,14 +431,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.car_math.setObjectName("Mono")
         cfg_card.add(self.car_math)
 
-        self.spin_cap = QtWidgets.QDoubleSpinBox()
-        self.spin_cap.setRange(0.5, 12.0)
-        self.spin_cap.setSingleStep(0.5)
-        self.spin_cap.setDecimals(1)
-        self.spin_cap.setSuffix(" m/s")
-        self.spin_cap.setValue(6.0)
-        self.row_cap = FieldRow("속도 상한", self.spin_cap, "체크포인트가 학습된 상한을 따릅니다.")
-        cfg_card.add(self.row_cap)
+        # No 속도 상한 control (removed 2026-10-26, the user: "근거가 있는 부분이 아니잖아. 빼 이런건"): a session runs at the
+        # cap its checkpoint was trained with (`SessionConfig.speed_cap` None), the one value its observation knows.
 
         # -- who follows the policy's plan (2026-10-19, the user: "우리도 그냥 map 쓰자")
         self.combo_follower = QtWidgets.QComboBox()
@@ -1460,12 +1454,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.run_note.setText("그립 다이얼 정책입니다. 구성 > 그립 다이얼에서 정책이 쓸 그립을 지정하세요.")
         elif source:
             self.ckpt_info.set("그립 다이얼", f"조건 입력 '{source}' (다이얼 아님)")
-        cap = info.get("speed_cap")
-        if cap:
-            self.spin_cap.setValue(float(cap))
-            self.row_cap.set_hint(f"체크포인트가 학습된 상한 {float(cap):.1f} m/s 를 따릅니다.", "hint")
-        else:
-            self.row_cap.set_hint("체크포인트에 학습 상한 기록이 없어 기본값을 씁니다.", "warn")
 
     # ---------------------------------------------------------------- state machine
     def apply_state(self, state: str, detail: str = ""):
@@ -1503,7 +1491,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # settings stay editable during PREPARING on purpose: waiting is exactly when someone
         # realises they picked the wrong map
         for w in (self.run_list, self.map_list, self.map_group, self.spin_races, self.spin_grid,
-                  self.spin_cap, self.combo_follower, self.spin_speed_scale, self.chk_opp_limit, self.chk_dr,
+                  self.combo_follower, self.spin_speed_scale, self.chk_opp_limit, self.chk_dr,
                   self.chk_soft, self.chk_stoch,
                   self.opp_table,
                   self.combo_device,
@@ -2295,7 +2283,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "obstacle_seed": int(self.spin_seed.value()),
             "races": int(self.spin_races.value()),
             "cars_per_race": int(self.spin_grid.value()),
-            "speed_cap": float(self.spin_cap.value()),
             "device": self.combo_device.currentText(),
             "randomize": bool(self.chk_dr.isChecked()),
             "collision_soft": bool(self.chk_soft.isChecked()),
@@ -2377,7 +2364,6 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.spin_seed.setValue(int(v)), "obstacle_seed")
         attempt(lambda v: self.spin_races.setValue(int(v)), "races")
         attempt(lambda v: self.spin_grid.setValue(int(v)), "cars_per_race")
-        attempt(lambda v: self.spin_cap.setValue(float(v)), "speed_cap")
         attempt(combo_text(self.combo_device), "device")
         attempt(lambda v: self.chk_dr.setChecked(bool(v)), "randomize")
         attempt(lambda v: self.chk_soft.setChecked(bool(v)), "collision_soft")
@@ -2432,7 +2418,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             procedural=self._train_obstacles(),
             races=self.spin_races.value(),
             cars_per_race=self.spin_grid.value(),
-            speed_cap=float(self.spin_cap.value()),
+            speed_cap=None,                     # the checkpoint's own trained cap (no console control since 10-26)
             device=self.combo_device.currentText(),
             compile=False,
             randomize=self.chk_dr.isChecked(),
