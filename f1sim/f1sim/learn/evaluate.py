@@ -439,7 +439,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float | None, 
             teacher_policy = InteractiveTeacher(teacher_policy, env, horizon_s=teacher_horizon,
                                                 cost=TeacherCost(*w) if w else TeacherCost(),
                                                 cand_iters=teacher_cand_iters,
-                                                future_model=opp_future_model)
+                                                future_model=opp_future_model,
+                                                walls_within_plan=env.ecfg.teacher_walls_within_plan)
         elif teacher_kind == "layout":
             from ..layout_line import LayoutLineTeacher
             teacher_policy = LayoutLineTeacher(teacher_policy, env)

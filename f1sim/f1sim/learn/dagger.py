@@ -599,7 +599,8 @@ def build_teacher(kind: str, rls, env, a):
                             speeds=[float(x) for x in a.teacher_speeds.split(",")],
                             horizon_s=a.teacher_horizon, cost=cost,
                             cand_iters=a.teacher_cand_iters,
-                            future_model=a.opp_future_model)
+                            future_model=a.opp_future_model,
+                            walls_within_plan=env.ecfg.teacher_walls_within_plan)
     return it, (f"interactive teacher: {it.n_candidates} candidates "
                 f"({len(it.offsets)} offsets x {len(it.speeds)} speeds + braking/evasion), {it.horizon_s:g} s horizon, "
                 f"futures '{a.opp_future_model}', cost {cost}")
@@ -686,6 +687,11 @@ def main():
                     help="line the teacher follows: 'min_time' refines the minimum-curvature line by descending "
                          "the lap time of the speed profile at the --teacher-a-* limits (default: min_curvature)")
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of the teacher's speed profile (default 6.0)")
+    ap.add_argument("--teacher-profile-a-lat", type=float, default=None, metavar="A",
+                    help="[m/s^2] the lateral limit of the teacher's speed profile only; the line keeps --teacher-a-lat "
+                         "(its geometry and its cache key, 20-70 min a track to rebuild). 2026-10-26, Korea, MAP, the "
+                         "7/6.5/4 line: solo laps 8.74 / 8.59 / 8.51 s at 7 / 8 / 9 with 0 contacts in 9 km each; the "
+                         "real car corners at p90 6.4, p99 ~10 m/s^2 (competition recordings)")
     ap.add_argument("--teacher-a-acc", type=float, default=None, help="[m/s^2] drive limit of the profile (default 6.0)")
     ap.add_argument("--teacher-a-brake", type=float, default=None, help="[m/s^2] braking limit of the profile (default 3.0)")
     ap.add_argument("--teacher-grip", choices=["true", "nominal", "conservative"], default="true",
@@ -926,7 +932,7 @@ def main():
         rl_kw["margin"] = a.raceline_margin
     if a.raceline_objective is not None:
         rl_kw["objective"] = a.raceline_objective
-    a._teacher_limits = limits
+    a._teacher_limits = limits if a.teacher_profile_a_lat is None else {**limits, "a_lat": float(a.teacher_profile_a_lat)}
     tracks, rls = common.load_tracks(names, racelines=need_rl, **rl_kw)
     cfg = Config()
     if a.eager:

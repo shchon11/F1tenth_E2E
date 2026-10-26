@@ -572,12 +572,13 @@ class EnvConfig:
     #: [s] from a held speed command to the brakes biting, as both speed limits assume it (2026-10-26). 0.2; with the
     #: competition car's slower speed loop simulated (`ActuatorParams.motor_delay` 0.1), 0.3 did no better over 63 km.
     speed_limit_lag: float = 0.2
-    #: The guard `teacher_label` puts over a raceline teacher (an `InteractiveTeacher` choosing x1.0 / 0.8 / 0.55 /
-    #: 0.3 of its plan's speeds) checks walls only on the plan's own path, not on the preview's run-on past its end
-    #: (`InteractiveTeacher.walls_within_plan`; 2026-10-26: that run-on raised false wall alarms at full pace and cost
-    #: the Korea teacher 0.48 s a lap under MAP with no contact avoided); props and cars keep the whole preview.
-    #: False: the guard every result before 2026-10-26 used, labels and teacher-driven opponents alike.
-    teacher_guard_plan_only: bool = True
+    #: The label teachers' wall check on the raceline covers the plan's own path, not the preview's run-on past its end
+    #: (`InteractiveTeacher.walls_within_plan`): the guard `teacher_label` puts over a raceline teacher (x1.0 / 0.8 /
+    #: 0.55 / 0.3 of its plan's speeds) and DAgger's / evaluate's interactive teacher. 2026-10-26: that run-on raised
+    #: false wall alarms at full pace and cost the Korea teacher 0.4 s a lap under MAP with no contact avoided. Props,
+    #: cars, offset lines and evasions keep the whole preview. False: what every result before 2026-10-26 used. The
+    #: interactive OPPONENT (`opponent_slots`) keeps the old check either way: it is a benchmark car.
+    teacher_walls_within_plan: bool = True
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -4417,7 +4418,7 @@ class F1VecEnv:
             # A global raceline alone does not certify what this tracker will
             # execute. Keep its line, but check achievable pace/braking choices
             # through the same preview and geometry as the interactive teacher.
-            # Walls on the plan's own path only (`teacher_guard_plan_only`).
+            # Walls on the plan's own path only (`teacher_walls_within_plan`).
             from .interactive_teacher import InteractiveTeacher
             guards = getattr(self, '_raceline_teacher_guards', None)
             if guards is None:
@@ -4425,7 +4426,7 @@ class F1VecEnv:
             guard = guards.get(teacher)
             if guard is None:
                 guard = guards[teacher] = InteractiveTeacher(teacher, self, offsets=(0.0,), cand_iters=6, lane_clamp=True,
-                                                             walls_within_plan=self.ecfg.teacher_guard_plan_only)
+                                                             walls_within_plan=self.ecfg.teacher_walls_within_plan)
             if rows is None:
                 action = guard.plan_action(self.sim.state, P, self.sim.tid, v_max, spec, offset=offset,
                                            plan_speed=v_meas)

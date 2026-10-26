@@ -369,6 +369,16 @@ def test_walls_are_checked_on_the_plan_not_on_the_preview_run_on():
     assert not bool(clear[0, 0])                             # a wall on the path itself still blocks
 
 
-def test_the_env_guard_checks_the_plan_by_default():
+def test_the_label_teachers_check_the_plan_by_default():
     from f1sim.gym_env import EnvConfig
-    assert EnvConfig().teacher_guard_plan_only is True
+    assert EnvConfig().teacher_walls_within_plan is True
+
+
+def test_only_the_line_candidates_drop_the_run_on_check():
+    """An offset or an evasion keeps driving its own line past the plan, so its walls stay checked on the whole preview;
+    the offset-0 candidates and the on-line brake continue on the raceline, which keeps its margin by construction."""
+    track, base, idx0 = _scene_parts()
+    it = _teacher(track, base, offsets=(-0.3, 0.0, 0.3), walls_within_plan=True)
+    n_spd = it.speeds.numel()
+    on = it._on_line(it.n_candidates)
+    assert on.tolist() == [False] * n_spd + [True] * n_spd + [False] * n_spd + [True] + [False] * 4

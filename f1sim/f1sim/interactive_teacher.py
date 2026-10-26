@@ -174,7 +174,9 @@ class InteractiveTeacher(RowPlanning):
         #: 41 % of the steps in the slowest corners (30 % at 7-8 m/s), so the env's guard chose x0.8 /
         #: x0.55 on 19 % of the steps: 9.38 s laps against 8.90 s with the guard off, and 0 wall contacts
         #: either way. Props and opponents keep the whole horizon: the line was planned without them, so
-        #: this preview is all that brakes for them, and stopping from 7 m/s takes more than 0.6 s.
+        #: this preview is all that brakes for them, and stopping from 7 m/s takes more than 0.6 s. So do the
+        #: offset and evasion candidates (`_on_line`): past its plan an offset keeps to its own line, which
+        #: has no margin from the walls by construction.
         self.walls_within_plan = bool(walls_within_plan)
         #: The teacher object the candidate family is generated through. A shallow copy of `base`:
         #: every tensor is shared, so it costs nothing, and the two differ only in `offset_limit`.
@@ -584,7 +586,11 @@ class InteractiveTeacher(RowPlanning):
         idx = self.base.project(state[:, :2], tid)[0] if idx is None else idx
         world, psi, _v = self._tracker_rollout(cand, state, v_max, spec, plan_speed=plan_speed)
         w = self.cost
-        mask = self._within_plan(world, state, spec, plan_speed) if self.walls_within_plan else None
+        mask = None
+        if self.walls_within_plan:
+            # only for the candidates whose continuation past the plan is the raceline; an offset or an evasion keeps
+            # driving its own line, so its run-on stays checked
+            mask = self._within_plan(world, state, spec, plan_speed) | ~self._on_line(cand.shape[0])[:, None, None]
         wall, clear, wall_clear = self._wall_costs(world, tid, psi, return_clear=True, mask=mask)
         opp, hard_clear = self._opp_cost(world, psi, state, spec, return_clear=True)
         hard_clear = hard_clear & wall_clear
@@ -669,6 +675,17 @@ class InteractiveTeacher(RowPlanning):
         ay = torch.stack((-psi.sin(), psi.cos()), -1) * self.half_width
         return torch.stack((world + ax + ay, world + ax - ay,
                             world - ax - ay, world - ax + ay), -2)
+
+    def _on_line(self, K: int) -> torch.Tensor:
+        """(K,) bool: the candidates of a `_candidates` family that drive the raceline itself -- offset 0 at every speed,
+        and the on-line brake that follows them -- as opposed to an offset line or an immediate evasion."""
+        n_spd = int(self.speeds.numel())
+        regular = int(self.offsets.numel()) * n_spd
+        on = torch.zeros(K, dtype=torch.bool, device=self.device)
+        on[self.i0 * n_spd:(self.i0 + 1) * n_spd] = True
+        if K > regular:
+            on[regular] = True
+        return on
 
     def _within_plan(self, world, state, spec, plan_speed=None):
         """(K, B, H) bool: the preview samples on the plan's own path -- arc from the car, summed along the
