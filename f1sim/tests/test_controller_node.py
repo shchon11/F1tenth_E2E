@@ -728,8 +728,8 @@ def test_the_obstacle_limit_leaves_the_policys_car_to_the_car_limit_also_when_th
 
 
 def test_the_limits_lag_is_a_parameter_and_a_longer_one_holds_harder():
-    """`speed_limit_lag` (2026-10-26): the command-to-brakes lag both limits assume; the competition car's speed loop had
-    ~0.1 s more than the simulator, so the node defaults to 0.3 s. A longer lag holds a car closing in harder."""
+    """`speed_limit_lag` (2026-10-26): the command-to-brakes lag both limits assume, a node parameter (default 0.2 s). A
+    longer lag holds a car closing in harder."""
     from dataclasses import replace
     from f1sim.opponent_speed_limit import DEFAULT, speed_limit
     got = {}

@@ -56,9 +56,9 @@ def common_arguments():
         DeclareLaunchArgument("obstacle_speed_limit", default_value="false",
                               description="the speed limit for an obstacle on the plan's own path "
                                           "(f1sim/obstacle_speed_limit.py): small isolated scan clusters, no map"),
-        DeclareLaunchArgument("speed_limit_lag", default_value="0.3",
-                              description="[s] command-to-brakes lag both speed limits assume: 0.3 = the competition "
-                                          "car's speed loop (0.1 s more than the simulator), 0.2 = the simulator's"),
+        DeclareLaunchArgument("speed_limit_lag", default_value="0.2",
+                              description="[s] command-to-brakes lag both speed limits assume (0.2; 0.3 did no better "
+                                          "with the competition car's slower speed loop simulated)"),
         DeclareLaunchArgument("viz", default_value="false",
                               description="controller markers on /f1sim/viz/plan and /clearance"),
         DeclareLaunchArgument("policy", default_value="true",

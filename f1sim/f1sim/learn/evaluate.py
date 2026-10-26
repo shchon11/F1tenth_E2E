@@ -718,8 +718,8 @@ def main() -> None:
                     help="the speed limit for a car ahead (opponent_speed_limit.py): hold the learner's speed command to "
                          "the speed it can still slow to that car's from, read off the policy's own nearest-car output")
     ap.add_argument("--speed-limit-lag", type=float, default=0.2, metavar="S",
-                    help="[s] command-to-brakes lag both speed limits assume (0.2 = this simulator's speed loop; the "
-                         "competition car's had ~0.1 s more: 0.3, as the controller node's speed_limit_lag)")
+                    help="[s] command-to-brakes lag both speed limits assume (0.2; as the controller node's "
+                         "speed_limit_lag)")
     ap.add_argument("--obstacle-speed-limit", action="store_true",
                     help="the speed limit for an obstacle on the plan's own path (obstacle_speed_limit.py): hold the "
                          "learner's speed command to the speed it can still stop from before a small isolated cluster of "

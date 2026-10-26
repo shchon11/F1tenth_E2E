@@ -569,9 +569,8 @@ class EnvConfig:
     #: output too (`F1VecEnv.opponent_reading`, written by the same runners), with or without the car limit on: without
     #: it a car on the path would be held to as if it stood still (2026-10-26). Plan mode only.
     obstacle_speed_limit: bool = False
-    #: [s] from a held speed command to the brakes biting, as both speed limits assume it (2026-10-26). 0.2 = this
-    #: simulator's speed loop; the competition car's had ~0.1 s more (`ActuatorParams.motor_delay`), where 0.3 cut the
-    #: hard contacts with both limits on from 2.32 to 1.99 /km (the controller node's `speed_limit_lag` defaults to 0.3).
+    #: [s] from a held speed command to the brakes biting, as both speed limits assume it (2026-10-26). 0.2; with the
+    #: competition car's slower speed loop simulated (`ActuatorParams.motor_delay` 0.1), 0.3 did no better over 63 km.
     speed_limit_lag: float = 0.2
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1

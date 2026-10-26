@@ -150,11 +150,10 @@ class ControllerNode(Node):
         # perception's nearest-car reading are left to `opponent_speed_limit`. Off by default.
         d("obstacle_speed_limit", False)
         # [s] from a held speed command to the brakes biting, as both limits assume it (`lag`; 2026-10-26). The car at the
-        # 08-26/27 competition had ~0.1 s more in its speed channel than the simulator (params.py `motor_delay`, from 38
-        # speed rises in the recordings); with that loop simulated, 0.3 s here cut the hard contacts with both limits on
-        # from 2.32 to 1.99 /km at the same race speed (docs/research/passing-risk-2026-10-24, section 13j). 0.2 = the
-        # simulator's own loop: set it back if the VESC speed loop is made as quick as that.
-        d("speed_limit_lag", 0.3)
+        # 08-26/27 competition had ~0.1 s more in its speed channel than the simulator (params.py `motor_delay`), but
+        # with that loop simulated 0.3 s did no better than 0.2 over 63 km (1.99 vs 2.01 hard /km; one seed pair alone had
+        # shown 2.32 -> 1.99) and cost 0.7 % race speed on the quick loop (docs/research/passing-risk-2026-10-24, 13j).
+        d("speed_limit_lag", 0.2)
         d("traction", "off"); d("traction_params", "")
         d("sensor_timeout", 0.25); d("plan_timeout", 0.25); d("watchdog_period", 0.01)
         d("viz", False)
