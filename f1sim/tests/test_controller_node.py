@@ -725,3 +725,26 @@ def test_the_obstacle_limit_leaves_the_policys_car_to_the_car_limit_also_when_th
         n.on_plan(plan_msg(stamp))
         assert (n.last_cmd[1] == pytest.approx(3.0)) == car, car
         assert n._opp_limited == 0
+
+
+def test_the_limits_lag_is_a_parameter_and_a_longer_one_holds_harder():
+    """`speed_limit_lag` (2026-10-26): the command-to-brakes lag both limits assume; the competition car's speed loop had
+    ~0.1 s more than the simulator, so the node defaults to 0.3 s. A longer lag holds a car closing in harder."""
+    from dataclasses import replace
+    from f1sim.opponent_speed_limit import DEFAULT, speed_limit
+    got = {}
+    for lag in (0.2, 0.3):
+        n = make_node(speed=3.0)
+        n.opponent_speed_limit = True; n._opp_limited = 0; n._opp_no_reading = 0; n.speed_limit_lag = lag
+        stamp = ros_time(1.0)
+        per = car_ahead_perception(stamp, dx_lidar=1.2, closing=1.5)
+        n.on_perception(per)
+        sensors_at(n, 2.5, stamp)
+        n.on_plan(plan_msg(stamp))
+        want = float(speed_limit(torch.tensor([list(per.nearest_car)]), torch.tensor([2.5]), deploy.LIDAR_MOUNT_X, 0.0,
+                                 p=replace(DEFAULT, lag=lag))[0])
+        assert n.last_cmd[1] == pytest.approx(min(3.0, want), abs=1e-5)
+        kv = {k.key: k.value for k in n.pub_diag.msgs[-1].status[0].values}
+        assert kv["speed_limit_lag_s"] == f"{lag:.2f}"
+        got[lag] = n.last_cmd[1]
+    assert got[0.3] < got[0.2]

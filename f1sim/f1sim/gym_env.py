@@ -569,6 +569,10 @@ class EnvConfig:
     #: output too (`F1VecEnv.opponent_reading`, written by the same runners), with or without the car limit on: without
     #: it a car on the path would be held to as if it stood still (2026-10-26). Plan mode only.
     obstacle_speed_limit: bool = False
+    #: [s] from a held speed command to the brakes biting, as both speed limits assume it (2026-10-26). 0.2 = this
+    #: simulator's speed loop; the competition car's had ~0.1 s more (`ActuatorParams.motor_delay`), where 0.3 cut the
+    #: hard contacts with both limits on from 2.32 to 1.99 /km (the controller node's `speed_limit_lag` defaults to 0.3).
+    speed_limit_lag: float = 0.2
     # races: M cars per track instance, visible to each other's LiDAR, car-car contact = collision
     race_size: int = 1
     opponent: str = "policy"         # "policy": every car is driven by the caller (self-play);
@@ -2945,9 +2949,11 @@ class F1VecEnv:
             if self.ecfg.opponent_speed_limit and self.opponent_reading is not None:
                 # the speed limit for a car ahead, from the policy's own reading of it (`opponent_speed_limit.py`); the
                 # LiDAR's nominal mount, as the car knows it
-                from .opponent_speed_limit import speed_limit
+                from dataclasses import replace as _replace
+                from .opponent_speed_limit import DEFAULT as _OPP, speed_limit
                 lim = speed_limit(self.opponent_reading, self.sim.state[:, 3], float(self.cfg.lidar.mount_x),
-                                  float(self.cfg.lidar.mount_y), held=self.opponent_held)
+                                  float(self.cfg.lidar.mount_y), held=self.opponent_held,
+                                  p=_replace(_OPP, lag=float(self.ecfg.speed_limit_lag)))
                 self.opponent_held = torch.isfinite(lim)
                 v = raw[:, 1]
                 held = self.learner & (v > lim.to(v.dtype))
@@ -2956,7 +2962,8 @@ class F1VecEnv:
             if self.ecfg.obstacle_speed_limit and lr is not None and lr.scan is not None:
                 # the speed limit for an obstacle on the plan's own path (`obstacle_speed_limit.py`), on the scan the
                 # policy planned from, the plan decoded as the tracker decodes it, the LiDAR's nominal mount
-                from .obstacle_speed_limit import speed_limit as obstacle_limit
+                from dataclasses import replace as _replace
+                from .obstacle_speed_limit import DEFAULT as _OBS, speed_limit as obstacle_limit
                 from . import mpc as _mpc
                 spec_t = self.tracker.spec
                 dec = _mpc.decode_wp4 if getattr(spec_t, "speed_mode", "linear") == "wp4" else _mpc.decode
@@ -2964,7 +2971,8 @@ class F1VecEnv:
                 ang_o = self.sim.lidar.angles
                 lim_o = obstacle_limit(lr.scan, ang_o, k_o, L_o, self.sim.state[:, 3],
                                        float(self.cfg.lidar.mount_x), float(self.cfg.lidar.mount_y),
-                                       car_reading=self.opponent_reading, range_max=float(self.cfg.lidar.range_max))
+                                       car_reading=self.opponent_reading, range_max=float(self.cfg.lidar.range_max),
+                                       p=_replace(_OBS, lag=float(self.ecfg.speed_limit_lag)))
                 v = raw[:, 1]
                 held_o = self.learner & (v > lim_o.to(v.dtype))
                 self.obstacle_limited = held_o

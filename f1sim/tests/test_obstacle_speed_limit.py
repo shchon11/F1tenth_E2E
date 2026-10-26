@@ -241,3 +241,26 @@ def test_ppo_with_the_obstacle_limit_feeds_the_policys_nearest_car_output_every_
     with pytest.raises(SystemExit) as e:
         importlib.import_module("f1sim.learn.ppo").main()
     assert "--arch v2" in str(e.value)
+
+
+def test_the_env_passes_its_speed_limit_lag_to_the_obstacle_limit():
+    """EnvConfig.speed_limit_lag (2026-10-26): the lag both limits assume; 0.3 holds a box on the path harder than 0.2."""
+    from f1sim import mpc
+    held = {}
+    for lag in (0.2, 0.3):
+        cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+        env = common.make_env([maps.load("real:korea_2025_iccas")], 1, "cpu",
+                              EnvConfig(max_steps=100, hist_len=0, action_mode="plan", speed_mode="wp4", compile_tracker=False,
+                                        obstacle_speed_limit=True, speed_limit_lag=lag), cfg=cfg, seed=1)
+        env.reset(seed=1)
+        a = torch.zeros(1, env.act_dim)
+        a[:, 4:] = 0.9
+        for _ in range(3):
+            env.step(a)
+        ang = env.sim.lidar.angles
+        c, s_ = ang.cos(), ang.sin()
+        on = (c > 0) & ((0.9 / c.clamp_min(1e-3)) * s_).abs().le(0.15)
+        env.last_result.scan = torch.where(on, 0.9 / c.clamp_min(1e-3), torch.full_like(c, 8.0))[None]
+        env.step(a)
+        held[lag] = float(env.last_cmd_raw[0, 1])
+    assert held[0.3] < held[0.2]

@@ -8,6 +8,10 @@ import sys
 
 from f1sim.learn import evaluate as ev
 
+if os.environ.get("LIMIT_LAG"):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import lag_patch  # noqa: F401  -- the speed limits' lag (10-26)
+
 RAMP, DELAY, TAU = float(os.environ.get("RAMP", "2.5")), float(os.environ.get("DELAY", "0.1")), os.environ.get("TAU", "0.7")
 _C = ev.Config
 

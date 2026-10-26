@@ -97,6 +97,9 @@
     # speed from which the car can still stop before a small isolated cluster of the scan (a box, a pole; walls are long
     # and left out, so no map) on the path the plan draws. For races with boxes on the line. Off by default.
     obstacle_speed_limit: false
+    # [s] from a held speed command to the brakes biting, as both limits assume it. 0.3 = the competition car's speed loop
+    # (0.1 s more delay than the simulator in the 08-26/27 recordings); 0.2 = the simulator's loop (if the VESC is retuned).
+    speed_limit_lag: 0.3
     device: "cpu"
     speed_cap: 4.0            # must equal the policy's
     steer_max: 0.4189

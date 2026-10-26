@@ -149,6 +149,12 @@ class ControllerNode(Node):
         # this scan (a box, a pole -- walls are long and left out, so no map) on the path the plan draws. Returns at the
         # perception's nearest-car reading are left to `opponent_speed_limit`. Off by default.
         d("obstacle_speed_limit", False)
+        # [s] from a held speed command to the brakes biting, as both limits assume it (`lag`; 2026-10-26). The car at the
+        # 08-26/27 competition had ~0.1 s more in its speed channel than the simulator (params.py `motor_delay`, from 38
+        # speed rises in the recordings); with that loop simulated, 0.3 s here cut the hard contacts with both limits on
+        # from 2.32 to 1.99 /km at the same race speed (docs/research/passing-risk-2026-10-24, section 13j). 0.2 = the
+        # simulator's own loop: set it back if the VESC speed loop is made as quick as that.
+        d("speed_limit_lag", 0.3)
         d("traction", "off"); d("traction_params", "")
         d("sensor_timeout", 0.25); d("plan_timeout", 0.25); d("watchdog_period", 0.01)
         d("viz", False)
@@ -208,6 +214,7 @@ class ControllerNode(Node):
         #: whether the last reading's limit applied: that car stays held to `lane_exit` (`speed_limit(held=...)`)
         self._opp_held = False
         self.obstacle_speed_limit = bool(p("obstacle_speed_limit"))
+        self.speed_limit_lag = float(p("speed_limit_lag"))
         self._obs_limited = 0
         #: the resampled scan's bearings [rad], from the driver's own window (first scan); nominal until then
         self._scan_angles = None
@@ -606,9 +613,11 @@ class ControllerNode(Node):
             if stand_in:
                 self._opp_previous_scan = getattr(self, "_opp_previous_scan", 0) + 1
             if reading_c is not None:
-                from f1sim.opponent_speed_limit import speed_limit
+                from dataclasses import replace as _replace
+                from f1sim.opponent_speed_limit import DEFAULT as _OPP, speed_limit
                 lim = float(speed_limit(torch.tensor([reading_c], dtype=torch.float32),
                                         torch.tensor([float(snap.v)]), LIDAR_MOUNT_X, 0.0,
+                                        p=_replace(_OPP, lag=float(getattr(self, "speed_limit_lag", _OPP.lag))),
                                         held=torch.tensor([bool(getattr(self, "_opp_held", False))]))[0])
                 self._opp_held = math.isfinite(lim)
                 if speed > lim:
@@ -621,8 +630,9 @@ class ControllerNode(Node):
             # the speed limit for an obstacle on the plan's own path, on THIS scan (the one the plan was made from), the
             # plan decoded as the tracker decodes it; the policy's reading of the car for this scan (or its stand-in, as
             # for the car limit) says which returns are the car's, left to the car limit
+            from dataclasses import replace as _replace
             from f1sim import mpc as _mpc
-            from f1sim.obstacle_speed_limit import speed_limit as obstacle_limit
+            from f1sim.obstacle_speed_limit import DEFAULT as _OBS, speed_limit as obstacle_limit
             spec_t = self.tracker.spec
             dec = _mpc.decode_wp4 if getattr(spec_t, "speed_mode", "linear") == "wp4" else _mpc.decode
             v_t = torch.tensor([float(snap.v)], dtype=torch.float32, device=self.device)
@@ -636,7 +646,8 @@ class ControllerNode(Node):
             reading_o, _ = self._nearest_car_for(snap)
             reading = None if reading_o is None else torch.tensor([reading_o], dtype=torch.float32, device=self.device)
             lim_o = float(obstacle_limit(ranges, ang, k_o, L_o, v_t, LIDAR_MOUNT_X, 0.0, car_reading=reading,
-                                         range_max=rmax)[0])
+                                         range_max=rmax,
+                                         p=_replace(_OBS, lag=float(getattr(self, "speed_limit_lag", _OBS.lag))))[0])
             if speed > lim_o:
                 speed = lim_o
                 self._obs_limited += 1
@@ -783,6 +794,7 @@ class ControllerNode(Node):
              ("opponent_previous_scan_readings", str(getattr(self, "_opp_previous_scan", 0))),
              ("obstacle_speed_limit", "on" if getattr(self, "obstacle_speed_limit", False) else "off"),
              ("obstacle_limited_commands", str(getattr(self, "_obs_limited", 0))),
+             ("speed_limit_lag_s", f"{float(getattr(self, 'speed_limit_lag', 0.2)):.2f}"),
              ("mu", f"{float(self.grip.mu[0]):.5f}" if self.grip is not None else ""),
              ("clearance_margin_m",
               f"{self.clearance.cspec.margin:.3f}" if self.clearance is not None else ""),
