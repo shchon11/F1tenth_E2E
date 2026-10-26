@@ -107,7 +107,7 @@ def _ego_follow(env, teacher, an: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device, seed=123, cfg: Config = None,
+def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float | None, device, seed=123, cfg: Config = None,
              teacher=False, action_mode="direct", *, protocol="rolling", race_size=1, opponent="policy",
              budget_laps: float | None = None, max_steps: int = 24000, raceline_margin: float | None = None,
              teacher_grip: str = "true", teacher_recover_time: float = 0.0,
@@ -258,6 +258,13 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float, device,
             from .policy_adaptation import require_exact_actor
             require_exact_actor(model, policy_checkpoint)
         model.eval()
+    if speed_cap is None:
+        top = float(EnvConfig.__dataclass_fields__["v_max_policy"].default)
+        if model is not None:
+            from .watch import checkpoint_speed_cap
+            speed_cap = checkpoint_speed_cap(metadata or {}, ckpt, fallback=top)
+        else:
+            speed_cap = top
     mode = ("direct" if external else
             ("plan" if (model is not None and model.meta.get("act_dim", 2) >= 5)
              or (teacher and action_mode == "plan") else "direct"))
@@ -629,7 +636,10 @@ def main() -> None:
                          "circuit is not scored 0 %% for a reason that has nothing to do with the policy. "
                          "0 = use the fixed --steps budget instead")
     ap.add_argument("--max-steps", type=int, default=24000, help="ceiling for the derived budget (10 min at 40 Hz)")
-    ap.add_argument("--speed-cap", type=float, default=8.0)
+    ap.add_argument("--speed-cap", type=float, default=None,
+                    help="[m/s] default: the cap the checkpoint was trained at, which is part of its observation; "
+                         "the command range (EnvConfig.v_max_policy) for a teacher or a published baseline. Was a "
+                         "fixed 8.0 before 2026-10-26")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--sweep", action="store_true", help="robustness: mu, latency, lidar height")
     ap.add_argument("--per-track", action="store_true")

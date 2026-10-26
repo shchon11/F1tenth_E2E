@@ -2,8 +2,9 @@
 
 - KL(pi_IL || pi) regularizer, decayed over the first `kl_decay` env steps, keeps the policy near
   the imitation policy while the critic warms up.
-- Speed-cap curriculum: the commanded speed cap ramps from `cap0` to `cap1` over `cap_steps`
-  env steps (the cap is part of the observation, so the policy stays consistent).
+- Speed-cap curriculum, opt-in: the commanded speed cap ramps from `cap0` to `cap1` over `cap_steps`
+  env steps (the cap is part of the observation, so the policy stays consistent). Both default to the
+  policy's command range since 2026-10-26 (they were 4 -> 8, no limit of the car).
 - Time-limit truncations bootstrap with the final observation value estimate.
 """
 from __future__ import annotations
@@ -514,7 +515,9 @@ def main():
                          "then traded safety for speed the moment it reached zero at 4M (0.33-0.47, lap 12.5 s), "
                          "with KL to the imitation policy rising 0.26 -> 6.8. The leash was holding a "
                          "speed/safety balance the reward alone does not")
-    ap.add_argument("--cap0", type=float, default=4.0); ap.add_argument("--cap1", type=float, default=8.0); ap.add_argument("--cap-steps", type=float, default=40e6)
+    ap.add_argument("--cap0", type=float, default=None, help="[m/s] default: EnvConfig.v_max_policy (was 4.0 before 2026-10-26)")
+    ap.add_argument("--cap1", type=float, default=None, help="[m/s] default: EnvConfig.v_max_policy (was 8.0 before 2026-10-26)")
+    ap.add_argument("--cap-steps", type=float, default=40e6)
     ap.add_argument("--critic-warmup", type=int, default=10, help="updates with the actor frozen")
     ap.add_argument("--league-slots", default="", metavar="A.pt,B.pt",
                     help="growing self-play league: these opponent checkpoints (each must be in a slot's ckpt_mix) "
@@ -1014,6 +1017,9 @@ def main():
                     help="v2: EMA weight of the balance's multipliers per measurement (default 0.8: about the "
                          "last five measurements)")
     a = ap.parse_args()
+    for _k in ("cap0", "cap1"):
+        if getattr(a, _k) is None:
+            setattr(a, _k, float(EnvConfig.__dataclass_fields__["v_max_policy"].default))
     v2_applied = None
     if a.arch == "v2":
         from . import ppo_v2

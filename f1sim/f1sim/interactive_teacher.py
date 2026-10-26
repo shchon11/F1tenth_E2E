@@ -42,7 +42,7 @@ from typing import Optional, Sequence
 import torch
 
 from .row_planning import RowPlanning
-from .mpc import PlanSpec, decode, plan_layout, reference
+from .mpc import PlanSpec, decode, plan_layout, plan_length, reference
 from .teacher import RacelineTeacher, plan_geometry_speed
 
 #: Lateral offsets [m left of the raceline] the candidate family spans. Symmetric, and wide enough
@@ -132,7 +132,7 @@ class InteractiveTeacher(RowPlanning):
                  horizon_s: float = 1.0, cost: Optional[TeacherCost] = None,
                  cand_iters: int = 2,
                  wall_margin: float = 0.25, future_model: Optional[str] = None,
-                 lane_clamp: bool = False):
+                 lane_clamp: bool = False, walls_within_plan: bool = False):
         if not isinstance(base, RacelineTeacher):
             raise TypeError("InteractiveTeacher wraps a RacelineTeacher: the raceline, the speed "
                             "profile and the plan fit are all its reference, not a reimplementation")
@@ -165,6 +165,17 @@ class InteractiveTeacher(RowPlanning):
         #: candidate's OWN trajectory, on the side it actually goes. The clamp exists for the
         #: opponents because nothing else was watching their line; here something is.
         self.lane_clamp = bool(lane_clamp)
+        #: Walls are checked only on the plan's own path (arc <= the plan length), not on the preview's
+        #: run-on past its end. OFF by default (the scoring every result before 2026-10-26 used). Why it
+        #: exists, measured 2026-10-26 on Korea, raceline teacher under MAP, solo, no props: the preview
+        #: is `horizon_s` = 1.0 s but a wp4 plan covers 0.6 s, and past its end the walk holds the last
+        #: curvature and speed -- a line the teacher never planned, while the line it will drive keeps
+        #: its margin from the walls by construction. At full pace that run-on reached into a wall on
+        #: 41 % of the steps in the slowest corners (30 % at 7-8 m/s), so the env's guard chose x0.8 /
+        #: x0.55 on 19 % of the steps: 9.38 s laps against 8.90 s with the guard off, and 0 wall contacts
+        #: either way. Props and opponents keep the whole horizon: the line was planned without them, so
+        #: this preview is all that brakes for them, and stopping from 7 m/s takes more than 0.6 s.
+        self.walls_within_plan = bool(walls_within_plan)
         #: The teacher object the candidate family is generated through. A shallow copy of `base`:
         #: every tensor is shared, so it costs nothing, and the two differ only in `offset_limit`.
         #: A copy rather than a save-and-restore on `base` itself, because in a race `base` is very
@@ -563,7 +574,8 @@ class InteractiveTeacher(RowPlanning):
         `tests/test_interactive_teacher.py` and the report's tables are about *which term* moved a
         decision, and a choice index alone cannot say.
 
-        If any candidate clears walls, props and oriented opponent bodies at every sample,
+        If any candidate clears walls, props and oriented opponent bodies at every sample (walls only on
+        the plan's own path when `walls_within_plan`),
         an explicit finite feasibility term ranks all intersecting candidates below all clear ones.
         If none clears it, `last_blocked` is true and plan_action delays the first
         predicted contact without claiming its fallback valid. The ellipse is only a soft preference.
@@ -572,7 +584,8 @@ class InteractiveTeacher(RowPlanning):
         idx = self.base.project(state[:, :2], tid)[0] if idx is None else idx
         world, psi, _v = self._tracker_rollout(cand, state, v_max, spec, plan_speed=plan_speed)
         w = self.cost
-        wall, clear, wall_clear = self._wall_costs(world, tid, psi, return_clear=True)
+        mask = self._within_plan(world, state, spec, plan_speed) if self.walls_within_plan else None
+        wall, clear, wall_clear = self._wall_costs(world, tid, psi, return_clear=True, mask=mask)
         opp, hard_clear = self._opp_cost(world, psi, state, spec, return_clear=True)
         hard_clear = hard_clear & wall_clear
         terms = {"progress": w.progress * self._progress_cost(world, tid, idx, v_max),
@@ -657,8 +670,20 @@ class InteractiveTeacher(RowPlanning):
         return torch.stack((world + ax + ay, world + ax - ay,
                             world - ax - ay, world - ax + ay), -2)
 
-    def _wall_costs(self, world, tid, psi=None, return_clear=False):
+    def _within_plan(self, world, state, spec, plan_speed=None):
+        """(K, B, H) bool: the preview samples on the plan's own path -- arc from the car, summed along the
+        samples, at most the plan length the candidates were decoded with (`plan_length` of the same
+        geometry speed) -- rather than on the run-on past its end (`walls_within_plan`)."""
+        seg = (world[:, :, 1:] - world[:, :, :-1]).norm(dim=-1)
+        s = torch.cat([torch.zeros_like(seg[:, :, :1]), seg.cumsum(-1)], -1)
+        L = plan_length(plan_geometry_speed(state, plan_speed), spec).to(s.dtype)
+        return s <= L[None, :, None] + 1e-3
+
+    def _wall_costs(self, world, tid, psi=None, return_clear=False, mask=None):
         """Oriented chassis against wall EDT and exact analytic prop sections.
+
+        `mask` (K, B, H) bool, optional: the samples the WALLS are checked on (`_within_plan`); the
+        others count as clear of walls. Props are checked on every sample.
 
         The wall check matches the simulator's four corners and half-cell surface
         correction; props use its polygon SAT, so containment of small assets is
@@ -675,6 +700,8 @@ class InteractiveTeacher(RowPlanning):
         t = tid[None, :, None].expand(K, B, H)
         edt = self.track.sample_edt(corners, t[..., None])
         free = edt.amin(-1) - 0.5 * self.track.t_res[t]
+        if mask is not None:
+            free = torch.where(mask, free, torch.full_like(free, float(self.wall_margin)))
         penetration = (-free).clamp_min(0.0)
         hit = free < 0.0
         if self.track.has_props:

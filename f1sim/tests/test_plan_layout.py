@@ -41,6 +41,10 @@ FORBIDDEN = {
 #: Hits that are not plans, by file and the exact code on the line. Exact, so an edit to one of these
 #: lines has to come back here and say again why it is not a plan.
 ALLOWED = {
+    # the console's contact markers (x, y, ..., alpha, diameter): rows of the marker table, not a plan
+    ("f1sim/f1sim/viewer/console/contacts.py", "rows[:, 6] = fade * (MARK_ALPHA_MIN + (1.0 - MARK_ALPHA_MIN) * s)"),
+    ("f1sim/f1sim/viewer/console/contacts.py", "rows[:, 7] = MARK_D[0] + (MARK_D[1] - MARK_D[0]) * s"),
+    ("f1sim/f1sim/viewer/console/contacts.py", "order = np.lexsort((-rows[:, 6], -sev))"),
     # the simulator's state vector (x, y, yaw, vx, vy, yaw_rate, steer, omega_r): column 6 is steer
     ("f1sim/f1sim/viewer/native.py",
      'return {"x": pack[:, 0], "y": pack[:, 1], "yaw": pack[:, 2], "vx": pack[:, 3], "steer": pack[:, 6],'),

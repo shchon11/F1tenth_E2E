@@ -337,3 +337,38 @@ def test_two_iteration_candidates_are_the_raceline_teachers_own_offset_plans():
         # curvature difference into a different safe speed ceiling.
         worst = max(worst, float((full[:, :-2] - cheap[:, :-2]).abs().max()))
     assert worst < 0.05, f"2 iterations differ from 6 by {worst:.4f} of the normalized plan range"
+
+
+# ----------------------------------------------------------------- the plan's own path (2026-10-26)
+
+
+def test_walls_are_checked_on_the_plan_not_on_the_preview_run_on():
+    """The preview runs 1.0 s; a wp4 plan covers 0.6 s, and past its end the walk holds the last curvature -- a line
+    the teacher never planned. With `walls_within_plan` a wall met only on that run-on is not a reason to slow down;
+    one on the plan's own path still is."""
+    track, base, idx0 = _scene_parts()
+    spec = PlanSpec(speed_mode="wp4")
+    state = _ego(base, idx0, speed=5.0)                     # plan length 0.6 s x 5 m/s = 3.0 m
+    on_line = [_point(base, idx0, a, 0.0) for a in (0.0, 0.75, 1.5, 2.25, 3.0)]
+    beyond = [torch.tensor([1.0e3, 1.0e3])] * 3              # off the map: the distance field reads a wall
+    world = torch.stack(on_line + beyond, 0)[None, None]     # (K=1, B=1, H=8, 2)
+    psi = torch.full(world.shape[:-1], float(state[0, 2]))
+    tid = torch.zeros(1, dtype=torch.long)
+    for plan_only in (False, True):
+        it = _teacher(track, base, walls_within_plan=plan_only)
+        mask = it._within_plan(world, state, spec) if plan_only else None
+        _, _, clear = it._wall_costs(world, tid, psi, return_clear=True, mask=mask)
+        assert bool(clear[0, 0]) is plan_only
+    it = _teacher(track, base, walls_within_plan=True)
+    in_wall = _point(base, idx0, 0.75, 1.5)                  # 1.6 m of arc from the car: on the plan's path
+    assert float(track.sample_edt(in_wall[None], torch.zeros(1, dtype=torch.long))[0]) == 0.0
+    early = torch.stack([on_line[0], in_wall] + on_line[2:] + beyond, 0)[None, None]
+    mask = it._within_plan(early, state, spec)
+    assert bool(mask[0, 0, 1])
+    _, _, clear = it._wall_costs(early, tid, psi, return_clear=True, mask=mask)
+    assert not bool(clear[0, 0])                             # a wall on the path itself still blocks
+
+
+def test_the_env_guard_checks_the_plan_by_default():
+    from f1sim.gym_env import EnvConfig
+    assert EnvConfig().teacher_guard_plan_only is True

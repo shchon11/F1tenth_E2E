@@ -616,7 +616,11 @@ def main():
                     help="optional solo map set; defaults to selected traffic bases; always removes obstacles")
     ap.add_argument("--epochs", type=float, default=3.0); ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--beta0", type=float, default=0.6)
-    ap.add_argument("--speed-cap", type=float, default=8.0); ap.add_argument("--device", default="cuda")
+    ap.add_argument("--speed-cap", type=float, default=None,
+                    help="[m/s] the commanded-speed cap (part of the observation). Default: the policy's command range, "
+                         "EnvConfig.v_max_policy -- the 8.0 every run before 2026-10-26 had was no limit of the car and "
+                         "held the teacher's straights at 8 (the user: '근거가 있는 부분이 아니잖아. 빼')")
+    ap.add_argument("--device", default="cuda")
     ap.add_argument("--action-mode", default="direct", choices=["direct", "plan"], help="plan: the student outputs a local trajectory (f1sim.mpc)")
     ap.add_argument("--teacher-speed", type=float, default=1.0, help="scale on the teacher's speed profile (0.9: fewer teacher crashes through the plan tracker)")
     ap.add_argument("--hist-len", type=int, default=0, help="proprio history rows in the observation")
@@ -849,6 +853,8 @@ def main():
                          "aggregated iteration")
     opp_cfg.add_arguments(ap)
     a = ap.parse_args()
+    if a.speed_cap is None:
+        a.speed_cap = float(EnvConfig.__dataclass_fields__["v_max_policy"].default)
     v2_applied = None
     if a.arch == "v2":
         from . import dagger_v2
