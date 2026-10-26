@@ -828,7 +828,10 @@ def main():
                          "recurrent state and held dial) refitted to wp4 are the labels (learn.policy_teacher)")
     ap.add_argument("--label-policy-dial", type=float, default=None, metavar="MU",
                     help="the dial the label policy is held at (default: the dial_constant it records)")
-    ap.add_argument("--wp4-label", choices=("env", "linear-refit", "policy"), default=None,
+    ap.add_argument("--hybrid-dev", type=float, default=None, metavar="M",
+                    help="v2 with --wp4-label hybrid: [m] how close the policy's and the raceline teacher's paths must "
+                         "stay over the plan for the teacher's speeds to be taken (learn.hybrid_labels; default 0.30)")
+    ap.add_argument("--wp4-label", choices=("env", "linear-refit", "policy", "hybrid"), default=None,
                     help="v2: where the WP4 labels come from. 'env' (default): the env's teacher-label API, "
                          "where feat/v2's wp4 teachers plug in. 'linear-refit': the raceline teacher's linear "
                          "plan, first window refitted to the four waypoints -- a stand-in for tests and smoke "
@@ -875,7 +878,8 @@ def main():
     else:
         set_v2 = [k for k in ("v2_frames", "v2_init_stem", "wp4_label", "mirror_prob", "aux_b8", "aux_near_car",
                               "aux_balance_every", "aux_balance_rho", "aux_balance_beta", "opponent_speed_mode",
-                              "v2_ego_actions", "action_dropout", "updates", "label_policy", "label_policy_dial")
+                              "v2_ego_actions", "action_dropout", "updates", "label_policy", "label_policy_dial",
+                              "hybrid_dev")
                   if getattr(a, k) is not None]
         if set_v2:
             raise SystemExit(f"{', '.join('--' + k.replace('_', '-') for k in set_v2)} belong to --arch v2")

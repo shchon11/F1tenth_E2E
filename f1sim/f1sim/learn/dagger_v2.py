@@ -97,7 +97,7 @@ from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, BC_CONSTANTS, A
                        linear_spec_of, linear_to_wp4, loss_grads, select_tracks, steps_since_window_start)
 
 #: Where a v2 run's teacher labels come from (see the module docstring).
-WP4_LABEL_SOURCES = ("env", "linear-refit", "policy")
+WP4_LABEL_SOURCES = ("env", "linear-refit", "policy", "hybrid")
 
 #: The v2 defaults of flags v1 also has, applied when the command line does not set them: the
 #: redesign's burn-in 40 + chunk 80 (G1), and the plan / dial contract every v2 actor is built for.
@@ -241,6 +241,9 @@ def prepare_args(ap: argparse.ArgumentParser, a, argv=None) -> dict:
         raise SystemExit("--init resumes a v2 student; --v2-init-stem seeds a fresh one from a v1 stem -- one or the other")
     if a.wp4_label == "policy" and not getattr(a, "label_policy", ""):
         raise SystemExit("--wp4-label policy refits a trained v1 policy's plans: name it with --label-policy CKPT")
+    if a.wp4_label == "hybrid" and (not getattr(a, "label_policy", "") or a.teacher_kind != "raceline"):
+        raise SystemExit("--wp4-label hybrid raises a trained v2 policy's speeds (--label-policy CKPT) to the RACELINE "
+                         "teacher's guard (--teacher raceline)")
     if a.wp4_label == "linear-refit" and a.teacher_kind != "raceline":
         raise SystemExit("--wp4-label linear-refit refits the RACELINE teacher's linear plan; the "
                          f"{a.teacher_kind} teacher's search would be silently dropped")
@@ -327,6 +330,14 @@ class Wp4Labels:
             if not isinstance(teacher, PolicyTeacher):
                 raise ValueError(f"--wp4-label policy reads a learn.policy_teacher.PolicyTeacher; got {type(teacher).__name__}")
             self.base = teacher
+        self.policy = None                      # the hybrid label's policy (`attach_policy`)
+        self.hybrid_dev = 0.30
+        self.raised = 0.0                       # the share of the last labelled rows the hybrid rule raised
+        if source == "hybrid":
+            from ..teacher import RacelineTeacher
+            if not isinstance(teacher, RacelineTeacher):
+                raise ValueError("--wp4-label hybrid reads the raceline teacher's guard; "
+                                 f"this teacher is {type(teacher).__name__}")
         if source == "linear-refit":
             from ..teacher import RacelineTeacher
             if not isinstance(teacher, RacelineTeacher):
@@ -335,6 +346,16 @@ class Wp4Labels:
                 raise ValueError("--wp4-label linear-refit refits a raceline teacher's linear plan; "
                                  f"this teacher is {type(teacher).__name__}")
             self.base = teacher
+
+    def attach_policy(self, policy, dev: float) -> None:
+        """The hybrid label's policy (`hybrid_labels.PolicyV2Teacher`) and its path-match threshold [m]."""
+        self.policy, self.hybrid_dev = policy, float(dev)
+
+    @torch.no_grad()
+    def observe(self, scan: torch.Tensor, ego: torch.Tensor, new_ep: torch.Tensor) -> None:
+        """This step's observation, before the label: the hybrid label's policy advances on it. No-op otherwise."""
+        if self.source == "hybrid":
+            self.policy.observe(scan, ego, new_ep)
 
     @torch.no_grad()
     def __call__(self, mu: Optional[torch.Tensor] = None, rows: Optional[torch.Tensor] = None):
@@ -360,6 +381,26 @@ class Wp4Labels:
             valid = getattr(self.teacher, "last_label_valid", None)
             if valid is not None and valid.shape[0] != lab.shape[0]:
                 valid = None                    # a teacher that does not state validity per labelled row
+        elif self.source == "hybrid":
+            # the policy's own plan, its speeds raised to the raceline teacher's where the teacher's guard chose full
+            # pace and the paths match (`hybrid_labels`); valid wherever finite -- the rows the guard found blocked keep
+            # the policy's plan, which is what drove there
+            from .hybrid_labels import combine
+            a_t = env.teacher_label(self.teacher, mu=mu, rows=rows)
+            choice = env._raceline_teacher_guards[self.teacher].last_choice
+            v = env._tracker_plan_speed()
+            cap = env.speed_cap if torch.is_tensor(env.speed_cap) else torch.full_like(v, float(env.speed_cap))
+            cap = cap.to(v.dtype).expand_as(v)
+            a_p = self.policy.last_action.to(v.device)
+            if rows is not None:
+                r = rows.to(v.device)
+                a_p, v, cap = a_p[r], v[r], cap[r]
+                if choice.shape[0] == env.B:
+                    choice = choice[r]
+            lab, raised = combine(a_p, a_t.to(a_p.dtype), choice.to(v.device) == 0, v, cap, self.spec,
+                                  float(env.ecfg.v_max_policy), self.hybrid_dev)
+            self.raised = float(raised.float().mean()) if raised.numel() else 0.0
+            valid = None
         elif self.source == "policy":
             # a trained v1 policy's plan of this step (its own observation, recurrent state and held dial: `mu` is
             # not its business), refitted as the raceline's is below, under the same curvature bound
@@ -507,6 +548,7 @@ def collect(env, model, labeler: Wp4Labels, steps: int, beta: float, device, buf
             c = cond_mod.mu_to_c(mu_dial, cspec).to(scan.dtype)
             # the stored rows are labelled, and any other row the action drives (self-play seats); a
             # scripted or league car's label would be computed for a command `step` overwrites
+            labeler.observe(scan, ego, new_ep)
             label, valid = labeler(mu=mu_dial, rows=label_rows(env))
             student = None
             if beta < 1.0:
@@ -776,6 +818,14 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
         teacher_desc = teacher.describe()
         print(f"labels: {teacher_desc}", flush=True)
     labeler = Wp4Labels(env, teacher, a.wp4_label)
+    if a.wp4_label == "hybrid":
+        from .hybrid_labels import PolicyV2Teacher
+        pol = PolicyV2Teacher(a.label_policy, device, dial=getattr(a, "label_policy_dial", None))
+        dev = getattr(a, "hybrid_dev", None)
+        labeler.attach_policy(pol, 0.30 if dev is None else dev)
+        teacher_desc = f"hybrid: {pol.describe()}, speeds raised to [{teacher_desc}] where its guard is clear and the paths " \
+                       f"match within {labeler.hybrid_dev:g} m"
+        print(f"labels: {teacher_desc}", flush=True)
     mirror = Mirror(spec) if a.mirror_prob > 0 else None
     dropout = ActionDropout(spec, a.action_dropout) if float(a.action_dropout) > 0 else None
     plan_spec = env.tracker.spec

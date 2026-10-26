@@ -269,3 +269,39 @@ def test_the_grip_probe_scores_episodes_not_steps():
     blind = torch.randn(T, L, H)
     res0 = probe(blind, mus, ep, seed=1)
     assert res0["r2_episode"] < 0.5, res0
+
+
+# ----------------------------------------------------------------- the hybrid label (2026-10-27)
+
+
+def test_hybrid_label_raises_only_clear_matching_rows():
+    """`hybrid_labels.combine`: the policy's plan keeps its curvature everywhere; its speeds become max(policy, teacher) only
+    where the teacher's guard was clear AND the two paths stay within `dev`; a slower teacher never lowers them."""
+    import torch
+    from f1sim import mpc
+    from f1sim.learn.hybrid_labels import combine
+    spec = mpc.PlanSpec(speed_mode="wp4")
+    lay = mpc.plan_layout(spec)
+    v_max = 10.0
+    R = 4
+    v_meas = torch.full((R,), 5.0)
+    cap = torch.full((R,), 10.0)
+
+    def plan(kappa, speed):
+        a = torch.zeros(R, mpc.ACT_DIM)
+        a[:, lay.speed] = speed / v_max * 2 - 1
+        a[:, lay.path] = kappa
+        return a
+
+    pol = plan(0.0, 5.0)                                          # straight at 5 m/s
+    fast_straight = plan(0.0, 8.0)                                # the teacher: straight at 8
+    fast_bend = plan(0.8, 8.0)                                    # the teacher, bending away from the policy's path
+    slow_straight = plan(0.0, 3.0)
+    teacher = torch.cat([fast_straight[:1], fast_straight[1:2], fast_bend[2:3], slow_straight[3:4]])
+    clear = torch.tensor([True, False, True, True])
+    out, raised = combine(pol, teacher, clear, v_meas, cap, spec, v_max, dev=0.30)
+    assert raised.tolist() == [True, False, False, False]
+    assert torch.equal(out[:, lay.path], pol[:, lay.path])        # the policy's path, always
+    assert torch.equal(out[1:], pol[1:])                          # untouched where not raised
+    _, _, v_out = mpc.decode_wp4(out[:1], v_meas[:1], v_max, cap[:1], spec)
+    assert float(v_out.min()) > 5.0 + 1e-3                         # raised towards the teacher's 8
