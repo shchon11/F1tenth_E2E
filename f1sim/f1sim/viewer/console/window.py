@@ -2071,9 +2071,28 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         pick = next((r for r in (self.runs or []) if r.name == name and r.pinned and r.map), None)
         if pick is not None:
             self._select_map(pick.map)
+            self._apply_pick_settings(pick)
         self._update_selection_note()
         self._update_start_enabled()
         self.describe_requested.emit(name)
+
+    def _apply_pick_settings(self, pick) -> None:
+        """The rest of what a pick is meant to be driven with (`catalog.PICKS_FILE` "settings"): the same keys the
+        remembered settings use, plus `opponent_slots`. 2026-10-26, the user: "콘솔에서 뭘 골라야할지 찾기가 너무
+        어려워" -- the competition setting was a checkpoint, a map, an obstacle family, a race of 2, an opponent and two
+        checkboxes, chosen by hand in four places."""
+        st = dict(getattr(pick, "settings", None) or {})
+        if not st:
+            return
+        slots = st.pop("opponent_slots", None)
+        st.pop("run", None); st.pop("map", None)
+        self.apply_prefs(st)
+        if slots is not None and hasattr(self, "opp_table"):
+            try:
+                self.opp_table.set_slots(slots)
+            except Exception:
+                pass
+        self._update_start_enabled()
 
     def _select_map(self, track_id: str) -> bool:
         """Show `track_id`'s group in the map list and select it. False if the catalogue lacks it."""

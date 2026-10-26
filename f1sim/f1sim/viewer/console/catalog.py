@@ -46,7 +46,10 @@ CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt")
 #: The policies to drive, one per map, listed first and by name (2026-10-19, the user: "도대체
 #: 정책들중 뭘 실행해야하는거야? 뭐가 뭔지 모르겠네" -- three picks were buried under some 280
 #: experiment runs sorted by save time). A file next to the runs, so a new pick is an edit there:
-#: {"picks": [{"run": dir name, "label": ..., "map": track id, "note": ...}, ...]}.
+#: {"picks": [{"run": dir name, "label": ..., "map": track id, "note": ..., "settings": {...}}, ...]}.
+#: `settings` (2026-10-26, the user: "콘솔에서 뭘 골라야할지 찾기가 너무 어려워"): the rest of what that policy is
+#: meant to be driven with -- the prefs keys `window.apply_prefs` reads (obstacle, cars_per_race, speed_cap,
+#: opponent_speed_limit, obstacle_speed_limit, ...) plus `opponent_slots` -- set the moment the pick is chosen.
 PICKS_FILE = "console_picks.json"
 
 
@@ -75,6 +78,8 @@ class RunInfo:
     map: str = ""
     note: str = ""
     pick_rank: int = -1             # its place in the picks file; -1 = not a pick
+    #: the pick's own settings (`PICKS_FILE`), applied when it is chosen; {} = only the map
+    settings: Dict[str, object] = field(default_factory=dict)
 
     @property
     def pinned(self) -> bool:
@@ -132,6 +137,7 @@ def list_runs(runs_dir: str = RUNS_DIR) -> List[RunInfo]:
             i, p = picks[r.name]
             r.pick_rank, r.label = i, str(p.get("label") or r.name)
             r.map, r.note = str(p.get("map") or ""), str(p.get("note") or "")
+            r.settings = dict(p.get("settings") or {}) if isinstance(p.get("settings"), dict) else {}
     # the picks first, in the file's order; everything else newest first
     out.sort(key=lambda r: (not r.pinned, r.pick_rank if r.pinned else 0, -r.mtime))
     return out

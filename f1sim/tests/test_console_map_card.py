@@ -225,3 +225,33 @@ def test_the_facts_strip_shows_the_scenario_that_was_actually_built(win):
     assert "real/bb22-1@rev#line:4417" in win.header_summary.text()
     assert "4417" in win.header_summary.toolTip()
     assert "real:blackbox2022_1+rlobs4417~rev" in win.header_summary.toolTip()
+
+
+def test_a_pick_with_settings_sets_up_the_whole_session(win, tmp_path):
+    """2026-10-26, the user: "콘솔에서 뭘 골라야할지 찾기가 너무 어려워" -- the competition setting was a checkpoint, a map,
+    an obstacle family, a race of 2 with an opponent and two checkboxes, chosen by hand in four places. A pick's
+    `settings` (console_picks.json) are applied the moment it is chosen."""
+    import json
+    from f1sim.viewer.console import catalog
+    d = tmp_path / "runs" / "pick_comp"
+    d.mkdir(parents=True)
+    (d / "ppo_latest.pt").write_bytes(b"x")
+    (tmp_path / "runs" / catalog.PICKS_FILE).write_text(json.dumps({"picks": [
+        {"run": "pick_comp", "label": "대회용", "map": "real/korea26", "note": "",
+         "settings": {"obstacle": "train", "races": 1, "cars_per_race": 2, "speed_cap": 9.0,
+                      "opponent_speed_limit": True, "obstacle_speed_limit": True,
+                      "opponent_slots": [{"kind": "forzaeth_pred", "speed_scale": [0.7, 1.0]}]}}]}),
+        encoding="utf-8")
+    runs = catalog.list_runs(str(tmp_path / "runs"))
+    assert runs[0].settings["cars_per_race"] == 2
+    win.chk_opp_limit.setChecked(False); win.chk_obs_limit.setChecked(False); win.spin_grid.setValue(1)
+    win.set_runs(runs)
+    win._on_run_selected(runs[0].name)
+    assert win._selected_map == "real/korea26"
+    assert win.chk_opp_limit.isChecked() and win.chk_obs_limit.isChecked()
+    assert win.spin_grid.value() == 2 and win.spin_races.value() == 1
+    assert abs(win.spin_cap.value() - 9.0) < 1e-6
+    assert str(win.combo_obstacle.currentData()) == "train"
+    slots = win.opp_table.slot_dicts()
+    assert len(slots) == 1 and slots[0]["kind"] == "forzaeth_pred"
+    assert win.current_config().opponent_speed_limit and win.current_config().obstacle_speed_limit
