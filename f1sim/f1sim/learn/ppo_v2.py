@@ -65,6 +65,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .. import mpc
 from ..gym_env import PRIV_V2_DIM, REWARD_COMPONENT_KEYS
 from . import common
 from . import conditioning as cond_mod
@@ -348,6 +349,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                              "contact_label_delay_updates": (-(-(CONTACT_HORIZON - 1) // int(a.horizon))
                                                              if coefs["contact"] > 0 and int(a.horizon) < CONTACT_HORIZON else 0), "aux_b8": coefs["b8"],
                              "aux_near_car": coefs["near"], "ent": float(a.ent),
+                             "speed_noise_rho": float(getattr(a, "speed_noise_rho", 0.0) or 0.0),
                              "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
                              "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
                                              "beta": balance.beta, "names": list(balance.names)},
@@ -465,6 +467,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
             else cond_mod.DialDraw(env, a.dial_margin, a.dial_exact))
     cspec = cond_mod.CondSpec.from_meta(model.meta["cond"])
     dial_new = torch.ones(env.B, dtype=torch.bool, device=device)
+    # `--speed-noise-rho`: the speed dimensions' exploration noise, AR(1) per car (see ppo.py's flag)
+    rho_v = float(getattr(a, "speed_noise_rho", 0.0) or 0.0)
+    sp_v = mpc.plan_layout("wp4").speed
+    eps_v = None
+    noise_fresh = torch.ones(env.B, dtype=torch.bool, device=device)
 
     def condition_now():
         """c (B, 1) for the observation in hand; draws the dial of every episode that just began."""
@@ -537,6 +544,13 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 with ac:
                     d_act, h_next = model.actor.step_dist(scan, ego, c, h_actor)
                     act = d_act.sample()
+                    if rho_v > 0:
+                        xi = torch.randn_like(act[:, sp_v])
+                        eps_v = xi if eps_v is None else torch.where(
+                            noise_fresh[:, None], xi, rho_v * eps_v + (1.0 - rho_v * rho_v) ** 0.5 * xi)
+                        act = act.clone()
+                        act[:, sp_v] = d_act.mean[:, sp_v] + d_act.stddev[:, sp_v] * eps_v
+                        noise_fresh.zero_()
                     logp = d_act.log_prob(act).sum(1)
                     v_n, logit_roll = model.critic(scan[lid], ego[lid], c[lid], priv[lid])
                     mu_ref, h_ref = ref.step(scan, ego, c, h_ref)
@@ -602,6 +616,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     ep_stats["return"] += f["return"][mm].tolist(); ep_stats["progress"] += f["progress"][mm].tolist()
                     ep_stats["contacts"] += f["contacts"][mm].float().tolist(); ep_stats["steps"] += f["steps"][mm].tolist()
                 h_actor = reset_hidden(h_actor, done_now)
+                noise_fresh |= done_now
                 h_ref = reset_hidden(h_ref, done_now)
                 since = torch.where(done_now, torch.zeros_like(since), since + 1)
                 if t + 1 < T:

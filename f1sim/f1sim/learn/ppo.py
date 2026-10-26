@@ -434,6 +434,12 @@ def main():
                          "1 = one group, as before")
     ap.add_argument("--gamma", type=float, default=0.99); ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2); ap.add_argument("--ent", type=float, default=0.0)
+    ap.add_argument("--speed-noise-rho", type=float, default=0.0, metavar="RHO",
+                    help="v2: exploration noise on the plan's SPEED dimensions correlated in time, AR(1) per car with unit "
+                         "marginal variance (the policy's own Gaussian, so the log-probability is unchanged), redrawn where "
+                         "an episode starts; 0 = white, every run before 2026-10-27. Why: the policy acts at 40 Hz and the car "
+                         "answers a speed command over ~0.3 s, so white noise averages out and a sustained faster straight "
+                         "is never tried. 0.95 = ~0.5 s correlation")
     ap.add_argument("--vf", type=float, default=0.5); ap.add_argument("--max-grad", type=float, default=0.5)
     ap.add_argument("--vf-clip", type=float, default=None,
                     help="PPO's value clip, in RETURN units (default: --clip, 0.2, as every run so far; 0 = off). The "
