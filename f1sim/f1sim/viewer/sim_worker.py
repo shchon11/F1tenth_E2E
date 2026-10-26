@@ -1154,6 +1154,8 @@ class SimWorker:
             _plan_out = dict(_plan_out, plan_follower=_pf)
             if _pf == "mpc":
                 _plan_out.pop("plan_follower_map", None)
+                _plan_out.pop("decision_every", None)        # a held plan is MAP's waypoints; the iLQR re-plans
+
         proc_kw, proc_src = {}, ""
         if getattr(cfg, "procedural", False):
             if scenario.choice:

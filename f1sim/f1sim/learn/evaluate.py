@@ -129,7 +129,8 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float | None, 
              opponent_speed_mode: str | None = "auto", ego_stack: str = "oracle",
              ego_stack_params: dict | None = None, plan_follower: str | None = None,
              plan_follower_map: dict | None = None, plan_speed_scale: float = 1.0,
-             opponent_speed_limit: bool = False, obstacle_speed_limit: bool = False, speed_limit_lag: float = 0.2) -> dict:
+             opponent_speed_limit: bool = False, obstacle_speed_limit: bool = False, speed_limit_lag: float = 0.2,
+             decision_every: int | None = None) -> dict:
     """Keep rolling metrics compatible; trials count only initial learner attempts.
 
     budget_laps: derive the step budget from the track length instead of using `steps`.
@@ -337,6 +338,9 @@ def evaluate(ckpt: str, tracks, envs: int, steps: int, speed_cap: float | None, 
                      plan_follower=(plan_follower or _out.get("plan_follower", "mpc")) if mode == "plan" else "mpc",
                      plan_follower_map=(plan_follower_map if plan_follower_map is not None
                                         else _out.get("plan_follower_map")) if mode == "plan" else None,
+                     # a plan held on the track between decisions, as the checkpoint was trained (`mpc.contract_of`)
+                     decision_every=int(decision_every if decision_every is not None
+                                        else _out.get("decision_every", 1)) if mode == "plan" else 1,
                      plan_speed_scale=float(plan_speed_scale) if mode == "plan" else 1.0,
                      opponent_speed_limit=bool(opponent_speed_limit) and mode == "plan",
                      obstacle_speed_limit=bool(obstacle_speed_limit) and mode == "plan",
@@ -741,6 +745,9 @@ def main() -> None:
     ap.add_argument("--plan-follower-map", default="", metavar="JSON",
                     help="map_controller.MAPParams fields for --plan-follower map (delay_comp -1 = each car's "
                          "calibrated delay)")
+    ap.add_argument("--decision-every", type=int, default=None, metavar="K",
+                    help="the policy decides every K control steps, its plan held on the track in between "
+                         "(EnvConfig.decision_every; default: what the checkpoint was trained with, else 1)")
     ap.add_argument("--ego-stack-params", default="", metavar="JSON",
                     help='{"pf": {...PFParams}, "det": {...DetectParams}, "trk": {...TrackParams}}')
     ap.add_argument("--ego-teacher-limits", default="", metavar="A_LAT,A_ACC,A_BRAKE",
@@ -896,6 +903,7 @@ def main() -> None:
                         opponent_speed_limit=a.opponent_speed_limit, obstacle_speed_limit=a.obstacle_speed_limit,
                         speed_limit_lag=a.speed_limit_lag,
                         plan_follower_map=(json.loads(a.plan_follower_map) if a.plan_follower_map else None),
+                        decision_every=a.decision_every,
                         teacher_recover_time=a.teacher_recover_time,
                         opp_speed_range=a.opp_speed_range, opp_events=a.opp_events,
                         opp_event_rate=a.opp_event_rate,

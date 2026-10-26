@@ -350,6 +350,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                                              if coefs["contact"] > 0 and int(a.horizon) < CONTACT_HORIZON else 0), "aux_b8": coefs["b8"],
                              "aux_near_car": coefs["near"], "ent": float(a.ent),
                              "speed_noise_rho": float(getattr(a, "speed_noise_rho", 0.0) or 0.0),
+                             "decision_every": int(getattr(a, "decision_every", 1) or 1),
                              "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
                              "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
                                              "beta": balance.beta, "names": list(balance.names)},
@@ -417,6 +418,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     buf_since = z(T, B, dtype=torch.long)
     buf_ref_mu = z(T, B, A)
     buf_prog = z(T, B)
+    #: `--decision-every` (EnvConfig.decision_every): which steps were the learners' decisions. A held step's sampled
+    #: action is never driven -- the env drives the held plan -- so the policy loss reads the decisions only.
+    dec_every = int(getattr(a, "decision_every", 1) or 1)
+    buf_dec = torch.ones(T, B, dtype=torch.bool, device=device)
     buf_comp = z(T, B, len(REWARD_COMPONENT_KEYS))
     # --contact-severity-min: the learner's onsets both ways, all and at or above the threshold
     buf_sev = z(T, B, len(SEVERITY_LOG)) if env.ecfg.contact_severity_min > 0 else None
@@ -505,6 +510,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 # Without it a v2 policy trained with MAP was evaluated on the iLQR (2026-10-22).
                 **({"plan_follower": "map", "plan_follower_map": dict(a.plan_follower_map or {})}
                    if getattr(a, "plan_follower", None) == "map" else {}),
+                # a plan held on the track between decisions (`mpc.contract_of`): the policy is driven that way
+                **({"decision_every": int(a.decision_every)} if int(getattr(a, "decision_every", 1) or 1) > 1 else {}),
                 "experiment": {**experiment, "controller": controller.checkpoint_meta()}}
     ac = torch.autocast("cuda", dtype=torch.bfloat16, enabled=a.amp and device.type == "cuda")
     # `--obstacle-speed-limit` (EnvConfig.obstacle_speed_limit): the env leaves the returns at the policy's own nearest-car
@@ -539,6 +546,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
             for t in range(T):
                 scan, ego = obs["scan"], obs["ego"]
                 c = condition_now().to(ego.dtype)
+                if dec_every > 1:
+                    buf_dec[t] = env.decision_mask()[lid]
                 priv = env.privileged_v2()
                 controller.pre_action(obs)
                 with ac:
@@ -630,7 +639,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
             rew_used = buf_rew
             if lagrange:
                 rew_used = lagrange_step(buf_rew, buf_comp, buf_prog, buf_mask, lagrange, a.lagrange_lr, a.lagrange_max)
-            adv = compute_gae(rew_used, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, a.lam)
+            lam_gae = a.lam
+            if dec_every > 1:
+                dec_next = torch.cat([buf_dec[1:], env.decision_mask()[lid][None]], 0)
+                lam_gae = torch.where(dec_next, torch.full_like(buf_rew, float(a.lam)), torch.ones_like(buf_rew))
+            adv = compute_gae(rew_used, buf_val, buf_done, buf_trunc, buf_final_val, a.gamma, lam_gae)
             ret = adv + buf_val[:T]
             popart = None
             if log_now:
@@ -668,7 +681,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         t_roll = tm.lap()
         # ------------------------------------------------------------ update
         model.train()
-        w_all = buf_mask / buf_mask.sum().clamp_min(1.0)
+        w_dec = buf_mask * buf_dec.float()
+        w_all = w_dec / w_dec.sum().clamp_min(1.0)
         adv_mean = (adv * w_all).sum(); adv_std = ((adv - adv_mean) ** 2 * w_all).sum().sqrt()
         adv_n = (adv - adv_mean) / (adv_std + 1e-8)
         v_old_n = vnorm.normalize(buf_val[:T])
@@ -689,6 +703,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 m = cols.numel()
                 fl = lambda x: x.reshape(T * m, *x.shape[2:])
                 w = fl(buf_mask[:, cols])
+                w_pg = fl(w_dec[:, cols])                          # the decisions (all steps at --decision-every 1)
                 with ac:
                     seq = model.actor.sequence(buf_scan[:, cols].float(), buf_ego[:, cols], buf_c[:, cols],
                                                h0=buf_h0[:, cols].contiguous(), keep=buf_keep[:, cols])
@@ -703,7 +718,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 wmean = lambda x, ww=w: (x * ww).sum() / ww.sum().clamp_min(1.0)
                 ratio = (logp - fl(buf_logp[:, cols])).exp()
                 adv_mb = fl(adv_n[:, cols])
-                pg = -wmean(torch.min(ratio * adv_mb, ratio.clamp(1 - a.clip, 1 + a.clip) * adv_mb))
+                pg = -wmean(torch.min(ratio * adv_mb, ratio.clamp(1 - a.clip, 1 + a.clip) * adv_mb), w_pg)
                 v_n = v_n.float()
                 tgt = fl(ret_n[:, cols]).float()
                 if a.vf_clip > 0:
@@ -724,7 +739,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                                                             reduction="none") * yv_l).sum()
                     bce_n = bce_n + yv_l.sum()
                 bce = bce_sum / bce_n.clamp_min(1.0)
-                ent_w = wmean(ent)
+                ent_w = wmean(ent, w_pg)
                 zero = torch.zeros((), device=device)
                 b8 = near = zero
                 shield = zero
@@ -744,7 +759,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     near = wmean(nearest_car_loss(fl(seq["near_car"]).float(), fl(buf_near[:, cols])))
                 with torch.no_grad():
                     d_ref = torch.distributions.Normal(fl(buf_ref_mu[:, cols]), ref_std.expand_as(mu))
-                    kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist).sum(-1))
+                    kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist).sum(-1), w_pg)
                     approx_kl = ((ratio - 1) - (logp - fl(buf_logp[:, cols]))).mean()
                     clipfrac = ((ratio - 1).abs() > a.clip).float().mean()
                 if log_now and ep == 0 and i == 0:

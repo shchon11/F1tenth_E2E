@@ -440,6 +440,11 @@ def main():
                          "an episode starts; 0 = white, every run before 2026-10-27. Why: the policy acts at 40 Hz and the car "
                          "answers a speed command over ~0.3 s, so white noise averages out and a sustained faster straight "
                          "is never tried. 0.95 = ~0.5 s correlation")
+    ap.add_argument("--decision-every", type=int, default=1, metavar="K",
+                    help="v2 + MAP: the policy decides every K control steps and its plan is HELD ON THE TRACK in between "
+                         "(EnvConfig.decision_every); the PPO loss reads the decisions only, with the decision-level GAE "
+                         "(lambda 1 inside a block). 1 = every step, every run before 2026-10-27. Why: one 25 ms action moves "
+                         "the car by ~2 cm, its advantage drowns (gradient SNR 0.1-0.3 an update, tools/research/rl_speed)")
     ap.add_argument("--vf", type=float, default=0.5); ap.add_argument("--max-grad", type=float, default=0.5)
     ap.add_argument("--vf-clip", type=float, default=None,
                     help="PPO's value clip, in RETURN units (default: --clip, 0.2, as every run so far; 0 = off). The "
@@ -1027,6 +1032,8 @@ def main():
         if getattr(a, _k) is None:
             setattr(a, _k, float(EnvConfig.__dataclass_fields__["v_max_policy"].default))
     v2_applied = None
+    if int(a.decision_every) > 1 and a.arch != "v2":
+        raise SystemExit("--decision-every > 1 is v2's: v1's PPO would score the held steps as decisions")
     if a.arch == "v2":
         from . import ppo_v2
         v2_applied = ppo_v2.prepare_args(ap, a)
@@ -1234,6 +1241,7 @@ def main():
                                                               tracker_speed_ff=bool(_init_out.get("tracker_speed_ff", False)),
                                                               plan_follower=a.plan_follower,
                                                               plan_follower_map=a.plan_follower_map,
+                                                              decision_every=int(getattr(a, "decision_every", 1) or 1),
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,

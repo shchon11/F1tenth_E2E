@@ -551,6 +551,14 @@ class EnvConfig:
     #: `map_controller.MAPParams` fields for "map", over `map_controller.POLICY_MAP` (the paper's
     #: formulation; delay_comp -1 compensates each car's calibrated delay, the one the iLQR is given).
     plan_follower_map: Optional[Dict[str, Any]] = None
+    #: The learner's cars decide every this many control steps (2026-10-27, RL research). One 25 ms decision
+    #: moves the car by about sigma * dt (0.8 m/s * 25 ms = 2 cm), so its advantage drowns: measured with the
+    #: actor frozen, the PPO gradient for "drive faster" had an SNR of 0.1-0.3 an update and no GAE lambda
+    #: lifted it (`tools/research/rl_speed`). Between decisions the last plan is HELD ON THE TRACK -- MAP
+    #: follows the waypoints of the plan as it was issued, in the frame of the pose it was issued from, as a
+    #: 10 Hz planner and a 40 Hz controller on a real stack -- while the scan, the IMU and the policy's memory
+    #: still run every step. The traffic keeps deciding every step. 1: every step (every run before). MAP only.
+    decision_every: int = 1
     #: The venue's speed knob (2026-10-20, the user: the floor's friction is the console's to set and the
     #: controller's to answer with a speed-profile scale, like race_stack's per-track speed scaling): the
     #: speeds of the policy's plans are multiplied by this before any follower (iLQR or MAP) sees them. The
@@ -1235,6 +1243,12 @@ class F1VecEnv:
                                               self.sim.params.nominal)
             elif e.plan_follower != "mpc":
                 raise ValueError(f"plan_follower must be 'mpc' or 'map', not {e.plan_follower!r}")
+        if int(e.decision_every) < 1 or (int(e.decision_every) > 1 and (e.action_mode != "plan" or e.plan_follower != "map")):
+            raise ValueError(f"decision_every {e.decision_every}: >= 1, and above 1 only for plans followed by MAP "
+                             f"(the held plan is MAP's waypoints in the world)")
+        #: control steps since each car's last decision (`EnvConfig.decision_every`); 0 at an episode start
+        self._dec_cnt = torch.zeros(self.B, dtype=torch.long, device=self.device)
+        self._held_action: Optional[torch.Tensor] = None
         #: The spec the cars the learner does not drive plan in (`EnvConfig.opponent_speed_mode`): the
         #: tracker's own, the very object, unless that names another format -- then the tracker's with
         #: that speed mode, and the tracker reads every row in its own (`_sync_row_formats`).
@@ -2440,6 +2454,7 @@ class F1VecEnv:
                 self.prev_action[ids] = out
             self.tracker.reset(ids); self._calibrate_tracker(ids)
         self.prev_steer_norm[ids] = 0.0; self.last_cmd[ids] = 0.0; self.last_cmd[ids, 1] = speed
+        self._dec_cnt[ids] = 0                                     # a respawned car decides on its first step
         if self.events is not None:
             self.events.reset(ids)                                  # a respawned car starts with no event
         for alt in self.alt_teachers:
@@ -2917,6 +2932,19 @@ class F1VecEnv:
                 self.tracker.map_rows = self.learner
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
                     self.tracker.push_imu(lr.imu[:, :, 3])
+            K = int(self.ecfg.decision_every)
+            if K > 1:
+                # Between decisions the learner's cars drive the plan they last issued, held on the track
+                # (`EnvConfig.decision_every`): its action stands for every reader below, and MAP follows its
+                # waypoints from the pose it was issued at. The traffic decides every step.
+                hold = self.learner & ((self._dec_cnt % K) != 0)
+                if self._held_action is None:
+                    self._held_action = a.detach().clone()
+                a = torch.where(hold[:, None], self._held_action, a)
+                self._held_action = a.detach().clone()
+                self.tracker.hold_rows = hold
+                self.tracker.pose_now = self.sim.state[:, :3]
+                self._dec_cnt += 1                                 # a reset below sets its rows back to 0
             a_trk = a if self.ecfg.plan_speed_scale == 1.0 else self._scale_plan_speeds(a)
             raw = self.tracker(a_trk, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
@@ -4385,6 +4413,14 @@ class F1VecEnv:
         """(B,) friction each car is allowed to use from now on, or None for no budget. The trainer
         owns it (it is the policy's dial, redrawn per episode); the env only charges for exceeding it."""
         self.grip_budget = None if mu is None else mu.to(self.device).reshape(-1)
+
+    def decision_mask(self) -> torch.Tensor:
+        """(B,) bool: the cars whose NEXT step is a decision (`EnvConfig.decision_every`) -- every car at 1. A
+        learner row that is not deciding drives its held plan whatever action `step` is given for it."""
+        K = int(self.ecfg.decision_every)
+        if K <= 1:
+            return torch.ones(self.B, dtype=torch.bool, device=self.device)
+        return (self._dec_cnt % K) == 0
 
     def teacher_label(self, teacher, offset: Optional[torch.Tensor] = None,
                       mu: Optional[torch.Tensor] = None, spec=None,

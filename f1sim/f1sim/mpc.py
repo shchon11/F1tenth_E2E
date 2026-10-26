@@ -328,6 +328,9 @@ def contract_of(extra: Optional[dict]) -> dict:
     if pf and pf != "mpc":                                   # the follower the plan was fitted to (2026-10-19)
         out["plan_follower"] = str(pf)
         out["plan_follower_map"] = dict(extra.get("plan_follower_map") or exp.get("plan_follower_map") or {})
+    de = extra.get("decision_every", exp.get("decision_every"))
+    if de is not None and int(de) > 1:                       # a plan held on the track between decisions (2026-10-27)
+        out["decision_every"] = int(de)
     return out
 
 
