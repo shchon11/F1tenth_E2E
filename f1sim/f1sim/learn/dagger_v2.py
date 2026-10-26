@@ -76,6 +76,7 @@ row a race stores.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import time
@@ -893,6 +894,8 @@ def run(a, *, env, teacher, teacher_desc: str, names, device, applied: dict):
                 "metrics": m, "metrics_from_iter": m_iter, "teacher": teacher_metrics,
                 "action_mode": "plan", "teacher_kind": a.teacher_kind, "teacher_desc": teacher_desc,
                 "speed_mode": "wp4", "speed_command": a.speed_command,
+                **({"plan_follower": "map", "plan_follower_map": json.loads(a.plan_follower_map or "{}")}
+                   if getattr(a, "plan_follower", "mpc") == "map" else {}),
                 "tracker_speed_weight": a.tracker_speed_weight, "tracker_a_max": a.tracker_a_max,
                 **({"tracker_profile_from_prediction": True} if a.tracker_profile_from_prediction else {}),
                 **({"tracker_speed_ff": True} if a.tracker_speed_ff else {}),

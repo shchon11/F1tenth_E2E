@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 from dataclasses import replace
 import math
 import os
@@ -687,6 +688,12 @@ def main():
                     help="line the teacher follows: 'min_time' refines the minimum-curvature line by descending "
                          "the lap time of the speed profile at the --teacher-a-* limits (default: min_curvature)")
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of the teacher's speed profile (default 6.0)")
+    ap.add_argument("--plan-follower", choices=["mpc", "map"], default="mpc",
+                    help="who follows the student's plan while the data is collected (EnvConfig.plan_follower): the "
+                         "iLQR tracker (every DAgger run before 2026-10-26) or ForzaETH's MAP, which PPO, the console and "
+                         "the car drive the plan with -- DAgger's states are then the ones the policy will meet")
+    ap.add_argument("--plan-follower-map", default="", metavar="JSON",
+                    help="map_controller.MAPParams fields over POLICY_MAP for --plan-follower map")
     ap.add_argument("--teacher-profile-a-lat", type=float, default=None, metavar="A",
                     help="[m/s^2] the lateral limit of the teacher's speed profile only; the line keeps --teacher-a-lat "
                          "(its geometry and its cache key, 20-70 min a track to rebuild). 2026-10-26, Korea, MAP, the "
@@ -972,6 +979,9 @@ def main():
                                     stagger_first_episode=a.collision_mode == "soft",
                                     kind_mix_assign=a.kind_mix_assign,
                                     movable_obstacles=a.movable_obstacles,
+                                    plan_follower=a.plan_follower,
+                                    plan_follower_map=((json.loads(a.plan_follower_map) if a.plan_follower_map else {})
+                                                       if a.plan_follower == "map" else None),
                                     **({} if v2_applied is None else dagger_v2.env_kwargs(a))),
                           cfg=cfg, seed=a.seed, rls=rls,
                           teacher_grip=a.teacher_grip, teacher_recover_time=a.teacher_recover_time,
