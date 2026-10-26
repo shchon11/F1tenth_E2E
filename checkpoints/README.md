@@ -417,10 +417,10 @@ These are the rule since 300e051 (2026-10-26). The first numbers published here 
 that read a missed return as background: walls seen at a grazing angle set half of its holds and slowed the car at walls.
 Boxes standing against a wall are read as part of it and not held for.
 
-In the props-on FINALS table (docs/research/passing-risk-2026-10-24, section 13f: seeds 91-92, the same protocol as the
-external systems) this file with both limits races at 4.43 m/s with 1.23 hard contacts /km (0.47 car) -- faster than every
-external system (the best, ForzaETH's predictive spliner, 3.01 m/s and 2.51 /km); only Follow-the-Gap hits less (0.78) at
-2.82 m/s.
+In the props-on FINALS table (docs/research/passing-risk-2026-10-24, sections 13f and 13f-2: seeds 91-94, 16 cells a row,
+the same protocol as the external systems) this file with both limits races at 4.44 m/s with 1.53 hard contacts /km (0.75
+car) -- 46 % faster than every external system (the fastest, ForzaETH's predictive spliner: 3.04 m/s, 1.99 /km, 0.30 car);
+only Follow-the-Gap hits less overall (1.18) at 2.81 m/s, and the slower planners touch cars less (0.30-0.35).
 
 Alone with props on the line, both limits, the fixed rule (seeds 81-84, 37 km): 4.84 -> 4.81 m/s (-0.6 %, the car limit's
 share of it -0.4 %), hard contacts 3 -> 4 (noise). One control cycle of it costs 0.6 ms on one core of the lab
