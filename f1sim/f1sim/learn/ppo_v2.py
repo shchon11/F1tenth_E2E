@@ -835,6 +835,13 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist)[:, live].sum(-1), w_pg)
                     approx_kl = ((ratio - 1) - (logp - fl(buf_logp[:, cols]))).mean()
                     clipfrac = ((ratio - 1).abs() > a.clip).float().mean()
+                    # the advantage tail (normalised A < -3: almost always a hard hit within the credit window) -- how
+                    # often the clip has already zeroed its gradient, against the rest (rl-audit 2026-10-28; logging only)
+                    tail = adv_mb < -3.0
+                    clipped = (ratio - 1).abs() > a.clip
+                    clip_tail = (clipped & tail).float().sum() / tail.float().sum().clamp_min(1.0)
+                    clip_rest = (clipped & ~tail).float().sum() / (~tail).float().sum().clamp_min(1.0)
+                    tail_share = (adv_mb.abs() * tail).sum() / adv_mb.abs().sum().clamp_min(1e-8)
                 if log_now and ep == 0 and i == 0:
                     # the heads on this rollout before any of this update's steps: held out for the
                     # weights that drove it (`train_v2.aux_heldout_metrics`; logged, never a selection
@@ -889,6 +896,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     stats.setdefault("grad_norm_critic", []).append(float(g_c))
                 for k, v in (("pg", pg), ("vf", vf), ("contact_bce", bce), ("entropy", ent.mean()), ("shield", shield),
                              ("kl_ref", kl_ref), ("approx_kl", approx_kl), ("clipfrac", clipfrac),
+                             ("clipfrac_tail", clip_tail), ("clipfrac_rest", clip_rest), ("tail_adv_share", tail_share),
                              ("b8", b8), ("near_car", near)):
                     stats.setdefault(k, []).append(float(v.detach()))
                 if b8_know is not None:
