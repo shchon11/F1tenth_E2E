@@ -19,7 +19,10 @@ LEAGUE="[\"$RR/${NAME}_seats/seat0.pt\",\"$RR/${NAME}_seats/seat1.pt\",\"$C/icca
 SEATS="$RR/${NAME}_seats/seat0.pt,$RR/${NAME}_seats/seat1.pt"
 TRACKS="$MAP"; for k in $(seq 0 15); do TRACKS="$TRACKS,$MAP+warp$k"; done
 SLOT='{"kind_mix":["forzaeth","forzaeth_pred","lane_switch","interactive"],"speed_scale":[0.7,1.05],"ckpt_mix":'"$LEAGUE"',"ckpt_p":0.5,"present":0.5,"spawn":"random","reactive":{"defend":0.3,"line":0.2,"oblivious":0.1},"events":["brake","stop","shift","weave"],"event_rate":0.5}'
-SELF='{"kind":"self","present":'"${SELF_PRESENT:-1.0}"',"spawn":"random"}'
+# speed_cap 10: a `self` car is otherwise capped at speed_scale x selfplay_pace_ref (5 m/s, EnvConfig.selfplay_front_cap) --
+# an old trick to make the self-play front car slow. Here the self car is a LEARNER row: 35 % of learner steps were clipped
+# by a cap neither the actor nor the critic observes (rlc2 first attempt, 10-27 18:28-18:38).
+SELF='{"kind":"self","present":'"${SELF_PRESENT:-1.0}"',"spawn":"random","speed_cap":10.0}'
 # SELF_PLAY=1: the first opponent seat is the learner's own current weights (a second learner car in every race when present 1)
 OPP_SLOTS="[$SLOT,$SLOT,$SLOT]"; [ -n "${SELF_PLAY:-}" ] && OPP_SLOTS="[$SELF,$SLOT,$SLOT]"
 OUT=$(cd $(dirname $0)/.. && pwd)/out; mkdir -p $OUT
