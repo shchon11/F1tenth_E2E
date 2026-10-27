@@ -440,6 +440,13 @@ def main():
                          "an episode starts; 0 = white, every run before 2026-10-27. Why: the policy acts at 40 Hz and the car "
                          "answers a speed command over ~0.3 s, so white noise averages out and a sustained faster straight "
                          "is never tried. 0.95 = ~0.5 s correlation")
+    ap.add_argument("--log-std-shift", type=float, default=0.0, metavar="D",
+                    help="v2: add D to every action dimension's exploration log-std at the start (-0.693 halves the noise). "
+                         "Why (2026-10-27, H3): PPO optimises the NOISY policy, so the mean keeps the margin its noise's tails "
+                         "need -- measured, a checkpoint's noisy corner |v r| p90 sat at the grip budget (8.96 vs 9.03) while "
+                         "its deterministic p90 was 8.52, and noise cost 0.5 m/s on the straights")
+    ap.add_argument("--freeze-log-std", action="store_true",
+                    help="v2: keep the exploration log-std where it starts (no gradient), so a run holds the noise it was given")
     ap.add_argument("--decision-every", type=int, default=1, metavar="K",
                     help="v2 + MAP: the policy decides every K control steps and its plan is HELD ON THE TRACK in between "
                          "(EnvConfig.decision_every); the PPO loss reads the decisions only, with the decision-level GAE "
@@ -1037,6 +1044,8 @@ def main():
         if getattr(a, _k) is None:
             setattr(a, _k, float(EnvConfig.__dataclass_fields__["v_max_policy"].default))
     v2_applied = None
+    if (a.log_std_shift or a.freeze_log_std) and a.arch != "v2":
+        raise SystemExit("--log-std-shift / --freeze-log-std are v2's (v1 has --init-log-std)")
     if int(a.decision_every) > 1 and a.arch != "v2":
         raise SystemExit("--decision-every > 1 is v2's: v1's PPO would score the held steps as decisions")
     if a.arch == "v2":

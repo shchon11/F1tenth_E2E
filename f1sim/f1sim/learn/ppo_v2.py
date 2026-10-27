@@ -302,6 +302,16 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     if init_extra.get("aux_balance") and init_extra.get("phase") == "ppo":
         balance.load_state_dict(init_extra["aux_balance"])
         print(f"auxiliary balance restored: {balance.scale} after {balance.measurements} measurements", flush=True)
+    # `--log-std-shift` / `--freeze-log-std`: the exploration noise this leg runs with (before the reference is taken,
+    # so the drift monitor compares against the noise the leg actually has)
+    if float(getattr(a, "log_std_shift", 0.0) or 0.0):
+        with torch.no_grad():
+            model.actor.log_std.add_(float(a.log_std_shift))
+        print(f"actor log_std shifted by {float(a.log_std_shift):+.3f} -> "
+              f"{[round(float(x), 3) for x in model.actor.log_std.detach().cpu()]}", flush=True)
+    if getattr(a, "freeze_log_std", False):
+        model.actor.log_std.requires_grad_(False)
+        print("actor log_std frozen", flush=True)
     # The drift monitor's reference: the actor this leg starts from, frozen, walked with its own state.
     ref = copy.deepcopy(model.actor).eval()
     for p_ in ref.parameters():
@@ -351,6 +361,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                              "aux_near_car": coefs["near"], "ent": float(a.ent),
                              "speed_noise_rho": float(getattr(a, "speed_noise_rho", 0.0) or 0.0),
                              "decision_every": int(getattr(a, "decision_every", 1) or 1),
+                             "log_std_shift": float(getattr(a, "log_std_shift", 0.0) or 0.0),
+                             "freeze_log_std": bool(getattr(a, "freeze_log_std", False)),
                              "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
                              "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
                                              "beta": balance.beta, "names": list(balance.names)},
