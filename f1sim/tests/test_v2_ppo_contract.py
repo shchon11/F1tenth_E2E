@@ -275,3 +275,43 @@ def test_dead_plan_columns_are_driven_at_the_mean_and_the_warm_up_holds_the_acto
         assert not torch.equal(ls0[live], ls1[live])
     finally:
         torch.set_num_threads(threads)
+
+
+def test_a_parked_self_play_car_is_kept_out_of_the_losses(tmp_path, monkeypatch):
+    """A self-play seat (`kind: self`) is a learner row; with `present` < 1 its car is parked off the map in the races that
+    leave the seat empty. Those steps are not driving and get weight 0 in every loss (2026-10-27); the learner's own seat
+    keeps weight 1."""
+    import importlib
+
+    from f1sim.learn import ppo_v2
+    from v2_fixtures import generated_v2_checkpoint
+    seen = []
+    real_gae = ppo_v2.compute_gae
+
+    def gae(*args, **kw):
+        f = sys._getframe(1).f_locals
+        seen.append((f["buf_mask"].clone(), f["env"].slot[f["lid"]].clone()))
+        return real_gae(*args, **kw)
+
+    monkeypatch.setattr(ppo_v2, "compute_gae", gae)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(2, threads))
+    try:
+        init = generated_v2_checkpoint(str(tmp_path / "student.pt"))
+        monkeypatch.setattr(common, "RUNS_DIR", str(tmp_path))
+        monkeypatch.setenv("WANDB_MODE", "disabled")
+        monkeypatch.setattr(sys, "argv", ["f1sim.learn.ppo", "--arch", "v2", "--name", "sp", "--init", init, "--envs", "4",
+                                          "--tracks", TRACK, "--horizon", "16", "--minibatch", "32", "--grad-accum", "1",
+                                          "--total", str(2 * 16 * 4), "--epochs", "1", "--device", "cpu",
+                                          "--sim-backend", "eager", "--wandb", "disabled", "--log-every", "1",
+                                          "--save-every", "100", "--critic-warmup", "0", "--collision-mode", "soft",
+                                          "--cap0", "9", "--cap1", "9", "--dial-constant", "1.0489", "--race-size", "2",
+                                          "--opp-slots", '[{"kind": "self", "present": 0.0}]'])
+        importlib.import_module("f1sim.learn.ppo").main()
+        assert seen, "no update ran"
+        for mask, slot in seen:
+            assert mask.shape[1] == 4, "both seats of both races are learner rows"
+            assert torch.all(mask[:, slot == 1] == 0), "the parked self-play car's steps reached the losses"
+            assert torch.all(mask[:, slot == 0] == 1), "the learner's own seat was masked"
+    finally:
+        torch.set_num_threads(threads)

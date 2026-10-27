@@ -627,6 +627,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     buf_shield[t] = torch.isfinite(vs_) & (vs_ < v_max_pol)
                     buf_vsafe[t] = (vs_.clamp(max=v_max_pol) / v_max_pol * 2 - 1).clamp(-1.0, 1.0)
                 act_full[lid] = act.to(act_full.dtype)
+                # A learner car in an empty seat (a self-play slot's `present`, `Simulator.park`) is parked off the map
+                # until its race resets: its steps are not driving and are kept out of every loss (2026-10-27). Read
+                # before the step -- a race that resets in it may unpark the car for its next episode.
+                parked_l = env.sim.absent[lid].clone() if getattr(env.sim, "absent_any", False) else None
                 obs, rew, term, trunc, info = env.step(act_full.clamp(-1, 1))
                 if shield_on and a.shield_cost > 0:
                     # `--shield-cost`: the step's own command over the ceiling, charged on this step's reward -- a dense,
@@ -644,6 +648,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 buf_rew[t] = rew[lid]; buf_done[t] = term[lid].float(); buf_trunc[t] = trunc[lid].float()
                 if "on_policy" in info:
                     buf_mask[t] = info["on_policy"][lid].float()
+                if parked_l is not None:
+                    buf_mask[t] = buf_mask[t] * (~parked_l).float()
                 buf_comp[t] = torch.stack([info["reward_components"][k][lid] for k in REWARD_COMPONENT_KEYS], 1)
                 buf_prog[t] = info["progress"][lid]
                 if buf_sev is not None:
