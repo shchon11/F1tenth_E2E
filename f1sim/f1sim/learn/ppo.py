@@ -490,6 +490,11 @@ def main():
                          "free (default 0.95). 1.0 = the physical limit: the car may use all of its grip and pays only for "
                          "lateral acceleration beyond it (2026-10-27: at 0.95 the term was what held the straights back; "
                          "without it the policy slid past the limit, corner |v r| p90 10.6 vs 9.0, and hit far more)")
+    ap.add_argument("--contact-potential", type=float, default=0.0, metavar="C",
+                    help="v2: potential-based shaping Phi(s) = -C x P(car contact within 1 s), the critic's contact head "
+                         "(optimum unchanged). Why (2026-10-27): every fine-tune drifted toward more car contacts, even at a "
+                         "4x hit price -- the charge is rare and large while the speed reward is dense, and updates are "
+                         "mostly noise; this spreads the expected charge over the steps that raise the risk. 0 = off")
     ap.add_argument("--grip-budget-ramp", type=int, default=0, metavar="U",
                     help="v2: raise the grip-budget charge linearly from 0 to --grip-budget-penalty over the first U updates "
                          "(0 = full from the start). Why (2026-10-27): a start far over the limit (Monza, corner p90 10.4) met "

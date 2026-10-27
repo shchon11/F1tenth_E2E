@@ -364,6 +364,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                              "log_std_shift": float(getattr(a, "log_std_shift", 0.0) or 0.0),
                              "freeze_log_std": bool(getattr(a, "freeze_log_std", False)),
                              "grip_budget_ramp": int(getattr(a, "grip_budget_ramp", 0) or 0),
+                             "contact_potential": float(getattr(a, "contact_potential", 0.0) or 0.0),
                              "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
                              "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
                                              "beta": balance.beta, "names": list(balance.names)},
@@ -425,6 +426,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     #: the critic's contact logit at rollout time: scored against the labels BEFORE the update has
     #: trained on them, so its AUC is out of sample (the G4 gate's held-out AUC, online)
     buf_logit = z(T, B)
+    #: `--contact-potential`: the critic's contact logit of each truncated episode's final observation (for the shaping's last
+    #: potential) and of the bootstrap state
+    contact_pot = float(getattr(a, "contact_potential", 0.0) or 0.0)
+    buf_final_logit = z(T, B)
     buf_mask, buf_keep = torch.ones(T, B, device=device), torch.ones(T, B, device=device)
     buf_onset = z(T, B, dtype=torch.bool)
     buf_capped = z(T, B, dtype=torch.bool)
@@ -633,10 +638,14 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     fo = info["final_obs"]
                     with ac:
                         # the ended episode's own dial (`c` of this step): the next draw is for the new one
-                        fv, _ = model.critic(fo["scan"], fo["ego"], c[ids], info["final_priv_v2"])
+                        fv, flog = model.critic(fo["scan"], fo["ego"], c[ids], info["final_priv_v2"])
                     all_fv = torch.zeros(env.B, device=device)
                     all_fv[ids] = vnorm.denormalize(fv.float())
                     buf_final_val[t] = all_fv[lid]
+                    if contact_pot > 0:
+                        all_fl = torch.zeros(env.B, device=device)
+                        all_fl[ids] = flog.float()
+                        buf_final_logit[t] = all_fl[lid]
                     mm = env.learner[ids] & ~f["staggered"]
                     ep_stats["return"] += f["return"][mm].tolist(); ep_stats["progress"] += f["progress"][mm].tolist()
                     ep_stats["contacts"] += f["contacts"][mm].float().tolist(); ep_stats["steps"] += f["steps"][mm].tolist()
@@ -650,11 +659,21 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
             c_boot = condition_now().to(obs["ego"].dtype)
             priv_boot = env.privileged_v2()
             with ac:
-                vb, _ = model.critic(obs["scan"][lid], obs["ego"][lid], c_boot[lid], priv_boot[lid])
+                vb, logit_boot = model.critic(obs["scan"][lid], obs["ego"][lid], c_boot[lid], priv_boot[lid])
             buf_val[T] = vnorm.denormalize(vb.float())
             rew_used = buf_rew
             if lagrange:
                 rew_used = lagrange_step(buf_rew, buf_comp, buf_prog, buf_mask, lagrange, a.lagrange_lr, a.lagrange_max)
+            if contact_pot > 0:
+                # `--contact-potential C`: potential-based shaping (Ng et al. 1999, the optimum unchanged) with
+                # Phi(s) = -C x P(car contact within 1 s | s), the critic's own contact head: F = gamma Phi(s') - Phi(s).
+                # A rare, large car-contact charge becomes a dense signal on the steps that raise the risk.
+                p_now = torch.sigmoid(buf_logit)
+                p_next = torch.cat([p_now[1:], torch.sigmoid(logit_boot.float())[None]], 0)
+                p_next = torch.where(buf_trunc.bool(), torch.sigmoid(buf_final_logit), p_next) * (1.0 - buf_done)
+                shaping = contact_pot * (p_now - a.gamma * p_next)
+                rew_used = rew_used + shaping
+                pot_stat = float((shaping.abs() * buf_mask).sum() / buf_mask.sum().clamp_min(1.0))
             lam_gae = a.lam
             if dec_every > 1:
                 dec_next = torch.cat([buf_dec[1:], env.decision_mask()[lid][None]], 0)
@@ -878,6 +897,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 log["value_norm/popart_max_dev"], log["value_norm/popart_value_scale"] = popart
             ls = model.actor.log_std.detach()
             log["policy/log_std_kappa"] = float(ls[:4].mean()); log["policy/log_std_speed"] = float(ls[4:].mean())
+            if contact_pot > 0:
+                log["shaping/contact_potential_abs"] = pot_stat
             log.update({f"reward/{k}_per_step": float((buf_comp[:, :, i_] * buf_mask).sum() / n_pol)
                         for i_, k in enumerate(REWARD_COMPONENT_KEYS)})
             for n_, v_ in lagrange.items():
