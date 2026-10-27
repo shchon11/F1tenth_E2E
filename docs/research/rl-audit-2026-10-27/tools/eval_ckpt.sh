@@ -1,7 +1,10 @@
 #!/bin/bash
 # One checkpoint on the rl-speed yardstick (10-27), on the MAIN checkout's code: Korea solo (no props, rep floor, the checkpoint's
 # own MAP, cap 10, 16 envs x 2400 steps, seed 81: lap, per-raceline-speed-bin command/speed via teacher_speed_chain.py) and races
-# (race of 2 vs each of the 4 kinds, props on the line, 32 envs x 2400 steps, seeds 81-82).
+# (race of 2 vs each of the 4 kinds, 32 envs x 2400 steps, seeds 81-82).
+# CORRIDOR: where the race props stand. Unset = evaluate.py's default (corridor "on": props kept OFF the racing line) -- what
+# every table before 2026-10-27 21:00 ran, although they were described as "props on the line". CORRIDOR=off puts them ON the
+# line, as training does (--procedural-raceline-corridor off).
 # usage: eval_ckpt.sh GPU NAME CKPT [solo|race|both]
 D=$(cd $(dirname $0) && pwd); G=$1; N=$2; CK=$3; WHAT=${4:-both}; MAPJ=$(cat $D/entry_map.json)
 O=${OUT_DIR:-$D/../out}/$N; mkdir -p $O
@@ -19,7 +22,7 @@ if [ "$WHAT" != solo ]; then
     F=$O/race_s${S}_$K.json; [ -f $F ] && continue
     CUDA_VISIBLE_DEVICES=$G WANDB_MODE=disabled F1SIM_RACELINE_CACHE_ONLY=1 $PY -u -m f1sim.learn.evaluate $CK $COMMON \
       --plan-follower map --plan-follower-map "$MAPJ" --output $F --envs 32 --steps 2400 --seed $S --race-size 2 --graphs \
-      --movable-obstacles --spawn-runway 3.0 --procedural-obstacles 1.0 --procedural-density 1.5 --procedural-max-props 10 \
+      --movable-obstacles --spawn-runway 3.0 --procedural-obstacles 1.0 --procedural-density 1.5 --procedural-max-props 10 ${CORRIDOR:+--procedural-raceline-corridor $CORRIDOR} \
       --opp-slots "[{\"kind\": \"$K\", \"speed_scale\": [0.7, 1.0]}]" > $F.log 2>&1 || { echo "$N s$S $K FAILED"; exit 1; }
   done; done
   echo "[$(date +%H:%M)] $N races done"

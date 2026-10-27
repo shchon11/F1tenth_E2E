@@ -76,6 +76,11 @@ from .memory import reset_hidden
 from .model import load_checkpoint, save_checkpoint
 from .model_v2 import ARCH, ActorCriticV2, init_stems_from_v1
 from .obs import ObsSpecV2
+
+#: Measurement only (rl-audit 2026-10-27): F1SIM_ROLLOUT_MEAN=1 drives the actor's mean action, no exploration noise, to
+#: compare a checkpoint's objective with and without its training noise in the same world. The PPO ratio is meaningless
+#: then, so `train` refuses it unless the actor's lr is 0.
+ROLLOUT_MEAN = os.environ.get("F1SIM_ROLLOUT_MEAN", "") == "1"
 from .returns import compute_gae
 from .train_v2 import (BALANCE_BETA, BALANCE_EVERY, BALANCE_RHO, CONTACT_HORIZON, ValueNorm,
                        actor_trunk_parameters, aux_heldout_metrics, b8_sequence_loss, binary_auc, contact_labels,
@@ -257,6 +262,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     spec = common.obs_spec(env)
     if not isinstance(spec, ObsSpecV2):
         raise SystemExit("--arch v2 needs the env built with obs_version 2")
+    if ROLLOUT_MEAN and (float(a.lr) > 0 or float(a.lr_end or 0) > 0):
+        raise SystemExit("F1SIM_ROLLOUT_MEAN=1 is a measurement switch (no exploration noise): it needs --lr 0 --lr-end 0")
     lid = env.learner_ids
     T, B = int(a.horizon), int(lid.numel())
     coefs = {"contact": float(a.contact_bce), "b8": float(a.aux_b8), "near": float(a.aux_near_car)}
@@ -601,6 +608,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                         noise_fresh.zero_()
                     if dead:
                         act = torch.where(live, act, d_act.mean)
+                    if ROLLOUT_MEAN:
+                        act = d_act.mean
                     logp = d_act.log_prob(act)[:, live].sum(1)
                     v_n, logit_roll = model.critic(scan, ego, c, priv)
                     mu_ref, h_ref = ref.step(scan, ego, c, h_ref)
