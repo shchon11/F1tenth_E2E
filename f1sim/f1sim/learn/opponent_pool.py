@@ -67,6 +67,23 @@ def _recorded_arm(path: str) -> str:
         return "legacy"                # the loader below says what is actually wrong with it
 
 
+def _scatter_hidden(full, new, rows: torch.Tensor, batch: int):
+    """`full` (a `Hidden` over `batch` rows, or None) with the columns `rows` replaced by `new` (a `Hidden` over those
+    rows, or None). A field `full` does not have yet is created as zeros -- what a fresh state is."""
+    if new is None:
+        return full
+    fields = []
+    for i, t_new in enumerate(new):
+        t_old = None if full is None else full[i]
+        if t_new is None:
+            fields.append(t_old)
+            continue
+        if t_old is None:
+            t_old = torch.zeros(t_new.shape[0], int(batch), *t_new.shape[2:], device=t_new.device, dtype=t_new.dtype)
+        fields.append(t_old.index_copy(1, rows, t_new.to(t_old.dtype)))
+    return type(new)(*fields)
+
+
 @dataclass
 class PoolEntry:
     """One loaded checkpoint, its inference runtime, and where it came from."""
@@ -248,6 +265,8 @@ class OpponentPool:
                 prm.requires_grad_(False)
             ent.runtime.ensure(self.B, self.device)
             ent.hidden = None
+        #: run each entry on the rows it drives only (`act`); False is the old whole-width forward per entry
+        self.subset = True
         self._prune()
 
     def __len__(self) -> int:
@@ -361,7 +380,10 @@ class OpponentPool:
         scan, proprio = flatten_obs(obs)
         out = torch.zeros(scan.shape[0], self.act_dim, device=scan.device, dtype=scan.dtype)
         flat = {None: (scan, proprio)}
+        rows_of = self._rows_by_entry(driver) if self.subset else None
         for j, ent in enumerate(self.entries):
+            if rows_of is not None and rows_of[j] is None:
+                continue                      # drives no car this step: its state for rows it does not drive is never read
             if ent.seat_key not in flat:
                 seat_obs = self.seats[ent.seat_key].obs
                 if seat_obs is None:
@@ -369,10 +391,40 @@ class OpponentPool:
                                        f"the env was not reset since it was attached")
                 flat[ent.seat_key] = flatten_obs(seat_obs)
             s_, p_ = flat[ent.seat_key]
-            c = None if ent.cond is None else ent.cond.c(s_.shape[0])
-            action, _logp, ent.hidden = ent.model.act(ent.runtime.observe(s_, p_), p_,
-                                                      deterministic=True, c=c, h=ent.hidden)
-            out = torch.where((driver == OPP_DRIVER_POOL + j)[:, None], action.to(out.dtype), out)
+            if rows_of is None:
+                c = None if ent.cond is None else ent.cond.c(s_.shape[0])
+                action, _logp, ent.hidden = ent.model.act(ent.runtime.observe(s_, p_), p_,
+                                                          deterministic=True, c=c, h=ent.hidden)
+                out = torch.where((driver == OPP_DRIVER_POOL + j)[:, None], action.to(out.dtype), out)
+                continue
+            # Only the rows this entry drives (2026-10-27): a forward over the whole width was 24 ms a step at 256 envs and
+            # 137 ms at 1024 for ~5 driven rows per entry. The runtime still observes the full width (a channel-less runtime
+            # returns the scan itself; one with scan channels keeps every row's state as before), and the recurrent state
+            # is gathered and scattered back, so each driven row sees exactly the history it saw before.
+            rows = rows_of[j]
+            s_all = ent.runtime.observe(s_, p_)
+            s_r, p_r = s_all.index_select(0, rows), p_.index_select(0, rows)
+            c = None if ent.cond is None else ent.cond.c(rows.numel())
+            h_r = None if ent.hidden is None else ent.hidden.select(rows)
+            action, _logp, h_new = ent.model.act(s_r, p_r, deterministic=True, c=c, h=h_r)
+            ent.hidden = _scatter_hidden(ent.hidden, h_new, rows, s_.shape[0])
+            out = out.index_copy(0, rows, action.to(out.dtype))
+        return out
+
+    def _rows_by_entry(self, driver: torch.Tensor) -> list:
+        """[rows (n_j,) long or None] per entry: the rows `driver` hands to entry j. One device-to-host read of the
+        counts per step -- the drivers change only at resets, but a cache would need every writer of the env's
+        `opp_driver` to invalidate it, and a stale map silently drives a car with the wrong checkpoint."""
+        K = len(self.entries)
+        j_of = driver - OPP_DRIVER_POOL
+        key = torch.where((j_of >= 0) & (j_of < K), j_of, torch.full_like(j_of, K))
+        order = torch.argsort(key, stable=True)
+        counts = torch.bincount(key, minlength=K + 1).tolist()
+        out, start = [], 0
+        for j in range(K):
+            n = counts[j]
+            out.append(order[start:start + n] if n else None)
+            start += n
         return out
 
     def reset(self, ids: torch.Tensor) -> None:

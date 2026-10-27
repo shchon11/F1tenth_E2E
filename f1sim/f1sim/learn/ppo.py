@@ -447,6 +447,13 @@ def main():
                          "its deterministic p90 was 8.52, and noise cost 0.5 m/s on the straights")
     ap.add_argument("--freeze-log-std", action="store_true",
                     help="v2: keep the exploration log-std where it starts (no gradient), so a run holds the noise it was given")
+    ap.add_argument("--pg-dead-dims", default="", metavar="I,J,..",
+                    help="v2: action columns the plan follower never executes, taken out of the policy gradient: driven at "
+                         "the mean (no exploration noise) and left out of the log-probability, entropy and KL monitor. The "
+                         "network and its outputs are unchanged. '' = every column (every run before 2026-10-27). Why: under "
+                         "MAP the wp4 columns kappa_4, v2, v3, v4 (3,5,6,7) have no authority over the command (10-23, "
+                         "map_authority.py), yet their zero-mean policy-gradient terms put as much gradient into the shared "
+                         "trunk as the live columns (norm ratio 0.93, rl-audit-2026-10-27): half the trunk's update noise")
     ap.add_argument("--decision-every", type=int, default=1, metavar="K",
                     help="v2 + MAP: the policy decides every K control steps and its plan is HELD ON THE TRACK in between "
                          "(EnvConfig.decision_every); the PPO loss reads the decisions only, with the decision-level GAE "

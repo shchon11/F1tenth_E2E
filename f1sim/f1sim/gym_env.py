@@ -2506,8 +2506,21 @@ class F1VecEnv:
         batch on the compiled path (fixed shapes -> one CUDA graph); a per-reset partial batch would run
         eager kernels."""
         e = self.ecfg
-        cars = self.sim._car_boxes(self.sim.state) if self.M > 1 else None
-        scan, scan_true, scan_type = self.sim.lidar.scan(self.sim.state[:, :3], None, self.sim.P, motion_distortion=False, tid=self.sim.tid, cars=cars, compiled=True, eid=self.sim.eid)
+        if self.M > 1:
+            # With other cars in the scan the whole-batch call never reached the compiled path (`Lidar.scan` takes it
+            # only without cars), so it bought nothing and scanned every row to fill a few: 508 ms a reset at 1024
+            # envs, 87 % of the reset (measured 2026-10-27). Only the reset rows are scanned now, eager, and returned
+            # in whole-batch tensors -- every reader takes `[ids]` (`_reset_result`, the seats, the history below).
+            B = self.B
+            cut = lambda t: t[ids] if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] == B else t
+            cars = [tuple(cut(x) for x in entry) for entry in self.sim._car_boxes(self.sim.state)]
+            P = {k: cut(v) for k, v in self.sim.P.items()}
+            sub = self.sim.lidar.scan(self.sim.state[ids, :3], None, P, motion_distortion=False, tid=self.sim.tid[ids],
+                                      cars=cars, compiled=False, eid=self.sim.eid[ids])
+            scan, scan_true, scan_type = (torch.zeros((B,) + t.shape[1:], device=t.device, dtype=t.dtype).index_copy_(0, ids, t)
+                                          for t in sub)
+        else:
+            scan, scan_true, scan_type = self.sim.lidar.scan(self.sim.state[:, :3], None, self.sim.P, motion_distortion=False, tid=self.sim.tid, cars=None, compiled=True, eid=self.sim.eid)
         self.scan_hist[ids] = self._norm_scan(scan[ids])[:, None, :]
         if self.hist is not None:
             feat = torch.zeros(ids.numel(), 9, device=self.device); feat[:, 0] = speed / e.v_max_policy
@@ -2608,9 +2621,13 @@ class F1VecEnv:
                 # No gradient, and on the observation the policy itself last saw: a pool opponent
                 # is a checkpoint driving the same car in the same race, not a privileged
                 # controller.
+                # A parked car (an empty seat, `Simulator.park`) drives nothing -- the sim zeroes its command -- so its
+                # entry is not run for it (`OpponentPool.act` runs each entry on its rows only); a race reset unparks it
+                # and clears its state (`pool.reset`) before it drives again.
+                drv = (torch.where(self.sim.absent, torch.full_like(self.opp_driver, -1), self.opp_driver)
+                       if getattr(self.sim, "absent_any", False) else self.opp_driver)
                 with torch.no_grad():
-                    out = torch.where(self.pool_driven[:, None],
-                                      self.pool.act(obs, self.opp_driver), out)
+                    out = torch.where(self.pool_driven[:, None], self.pool.act(obs, drv), out)
         if not self.teacher_any:
             return out
         if self.teacher is None:
@@ -4567,7 +4584,10 @@ class F1VecEnv:
         # EMA per (track, sector). Many envs finish the same sector on the same step, so their times
         # are averaged and the decay applied once -- stepping it per env would move a busy sector
         # much further than a quiet one for no reason but how many cars happened to be on it.
-        w = scored.to(t_sec.dtype)
+        # The time to beat is the POLICY's own recent pace (the design above): only the learner's cars update it. In a race
+        # the other cars -- scripted planners at 0.7-1.05 of the line, league seats, parked seats -- used to be averaged in
+        # too, so the bar a learner had to beat moved with the opponents' mix (2026-10-27).
+        w = (scored & self.learner).to(t_sec.dtype)
         flat_ref = self.sector_ref.view(-1)
         total = torch.zeros_like(flat_ref).index_add_(0, flat, t_sec * w)
         count = torch.zeros_like(flat_ref).index_add_(0, flat, w)

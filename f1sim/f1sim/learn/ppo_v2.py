@@ -360,6 +360,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                                              if coefs["contact"] > 0 and int(a.horizon) < CONTACT_HORIZON else 0), "aux_b8": coefs["b8"],
                              "aux_near_car": coefs["near"], "ent": float(a.ent),
                              "speed_noise_rho": float(getattr(a, "speed_noise_rho", 0.0) or 0.0),
+                             "pg_dead_dims": [int(x) for x in str(getattr(a, "pg_dead_dims", "") or "").split(",") if x.strip()],
                              "decision_every": int(getattr(a, "decision_every", 1) or 1),
                              "log_std_shift": float(getattr(a, "log_std_shift", 0.0) or 0.0),
                              "freeze_log_std": bool(getattr(a, "freeze_log_std", False)),
@@ -466,8 +467,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     if label_delay:
         print(f"contact labels: rollout {T} < horizon {CONTACT_HORIZON} steps -> labelled {label_delay} update(s) late",
               flush=True)
-    h_actor = model.actor.initial_hidden(env.B, device=device)
-    h_ref = ref.initial_hidden(env.B, device=device)
+    # The actor, its exploration-noise state and the drift monitor's reference run on the LEARNER rows only (2026-10-27):
+    # every other row's action is overwritten by its own driver (`_opponent_actions`: league seat, planner) or zeroed
+    # (an absent seat), so a forward over all `env.B` rows was 3/4 waste in races of 4 (2.5 + 2.4 ms a step at 256 envs,
+    # 15 + 15 ms at 1024, measured). `env.step` still takes a full (env.B, A) action: the learner rows are filled in.
+    h_actor = model.actor.initial_hidden(B, device=device)
+    h_ref = ref.initial_hidden(B, device=device)
     buf_h0 = z(1, B, model.actor.hidden_size)
     since = torch.zeros(env.B, dtype=torch.long, device=device)          # steps since each row's episode began
     charge_prev = torch.zeros(env.B, dtype=torch.bool, device=device)
@@ -493,8 +498,18 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     # `--speed-noise-rho`: the speed dimensions' exploration noise, AR(1) per car (see ppo.py's flag)
     rho_v = float(getattr(a, "speed_noise_rho", 0.0) or 0.0)
     sp_v = mpc.plan_layout("wp4").speed
+    # `--pg-dead-dims`: the columns the follower never executes are driven at the mean and kept out of every log-probability
+    dead = [int(x) for x in str(getattr(a, "pg_dead_dims", "") or "").split(",") if x.strip()]
+    if any(j < 0 or j >= env.act_dim for j in dead):
+        raise SystemExit(f"--pg-dead-dims {dead}: columns are 0..{env.act_dim - 1}")
+    live = torch.ones(env.act_dim, dtype=torch.bool, device=device)
+    live[dead] = False
+    if dead:
+        print(f"policy gradient on action columns {torch.nonzero(live).flatten().tolist()} only; {dead} driven at the mean",
+              flush=True)
     eps_v = None
-    noise_fresh = torch.ones(env.B, dtype=torch.bool, device=device)
+    noise_fresh = torch.ones(B, dtype=torch.bool, device=device)
+    act_full = torch.zeros(env.B, env.act_dim, device=device)
 
     def condition_now():
         """c (B, 1) for the observation in hand; draws the dial of every episode that just began."""
@@ -544,7 +559,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         env.set_speed_cap(cap)
         lr = a.lr + (a.lr_end - a.lr) * frac
         for g in opt.param_groups:
-            g["lr"] = lr if g.get("group") == "actor" else a.critic_lr
+            # The critic warm-up zeroes the actor's loss, but Adam's restored momentum still stepped it (the actor moved
+            # 1.9e-4 .. 5e-5 relative an update while "frozen", 2026-10-27): its learning rate is 0 there as well.
+            g["lr"] = (0.0 if update < a.critic_warmup else lr) if g.get("group") == "actor" else a.critic_lr
         if int(getattr(a, "grip_budget_ramp", 0) or 0) > 0 and a.grip_budget_penalty > 0:
             # `--grip-budget-ramp`: the charge rises from 0 to its value over the first U updates (read by env.step each step)
             env.ecfg.reward_grip_budget = float(a.grip_budget_penalty) * min(1.0, (update + 1) / int(a.grip_budget_ramp))
@@ -560,16 +577,17 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         log_now = (update + 1) % a.log_every == 0 or update == 0
         # ------------------------------------------------------------ rollout
         model.eval()
-        buf_h0.copy_(h_actor.detach()[:, lid])
+        buf_h0.copy_(h_actor.detach())
         buf_keep.fill_(1.0)
         model.actor.keep_reading = reading_buf is not None
         with torch.no_grad():
             for t in range(T):
-                scan, ego = obs["scan"], obs["ego"]
-                c = condition_now().to(ego.dtype)
+                scan, ego = obs["scan"][lid], obs["ego"][lid]
+                c_all = condition_now().to(ego.dtype)
+                c = c_all[lid]
                 if dec_every > 1:
                     buf_dec[t] = env.decision_mask()[lid]
-                priv = env.privileged_v2()
+                priv = env.privileged_v2()[lid]
                 controller.pre_action(obs)
                 with ac:
                     d_act, h_next = model.actor.step_dist(scan, ego, c, h_actor)
@@ -581,16 +599,19 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                         act = act.clone()
                         act[:, sp_v] = d_act.mean[:, sp_v] + d_act.stddev[:, sp_v] * eps_v
                         noise_fresh.zero_()
-                    logp = d_act.log_prob(act).sum(1)
-                    v_n, logit_roll = model.critic(scan[lid], ego[lid], c[lid], priv[lid])
+                    if dead:
+                        act = torch.where(live, act, d_act.mean)
+                    logp = d_act.log_prob(act)[:, live].sum(1)
+                    v_n, logit_roll = model.critic(scan, ego, c, priv)
                     mu_ref, h_ref = ref.step(scan, ego, c, h_ref)
                 if reading_buf is not None:
-                    reading_buf.copy_(model.actor.last_reading)   # this step's nearest-car output -> the limits in env.step
-                buf_scan[t] = scan[lid].half(); buf_ego[t] = ego[lid]; buf_c[t] = c[lid]; buf_priv[t] = priv[lid]
-                buf_act[t] = act[lid].float(); buf_logp[t] = logp[lid].float()
+                    # this step's nearest-car output -> the limits in env.step (they hold learner rows only)
+                    reading_buf[lid] = model.actor.last_reading.to(reading_buf.dtype)
+                buf_scan[t] = scan.half(); buf_ego[t] = ego; buf_c[t] = c; buf_priv[t] = priv
+                buf_act[t] = act.float(); buf_logp[t] = logp.float()
                 buf_val[t] = vnorm.denormalize(v_n.float())
                 buf_logit[t] = logit_roll.float()
-                buf_ref_mu[t] = mu_ref[lid].float()
+                buf_ref_mu[t] = mu_ref.float()
                 buf_since[t] = since[lid]
                 if on["b8"]:
                     tr = env.opponent_tracks_v2()
@@ -605,12 +626,13 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                      a.shield_dv, a.shield_alongside, a.shield_horizon)[lid]
                     buf_shield[t] = torch.isfinite(vs_) & (vs_ < v_max_pol)
                     buf_vsafe[t] = (vs_.clamp(max=v_max_pol) / v_max_pol * 2 - 1).clamp(-1.0, 1.0)
-                obs, rew, term, trunc, info = env.step(act.clamp(-1, 1))
+                act_full[lid] = act.to(act_full.dtype)
+                obs, rew, term, trunc, info = env.step(act_full.clamp(-1, 1))
                 if shield_on and a.shield_cost > 0:
                     # `--shield-cost`: the step's own command over the ceiling, charged on this step's reward -- a dense,
                     # immediate price on the risky action, credited through the advantages to the states where it
                     # applies (a supervised hinge on mu_v1 shifted the first speed everywhere, solo too: -0.38 m/s)
-                    v1_cmd = (act[lid][:, i_v1].clamp(-1, 1).float() + 1) / 2 * v_max_pol
+                    v1_cmd = (act[:, i_v1].clamp(-1, 1).float() + 1) / 2 * v_max_pol
                     exc_ = torch.where(buf_shield[t], (v1_cmd - vs_.float()).clamp_min(0.0), torch.zeros_like(v1_cmd))
                     pen_ = a.shield_cost * exc_
                     rew = rew.clone(); rew[lid] = rew[lid] - pen_
@@ -638,7 +660,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     fo = info["final_obs"]
                     with ac:
                         # the ended episode's own dial (`c` of this step): the next draw is for the new one
-                        fv, flog = model.critic(fo["scan"], fo["ego"], c[ids], info["final_priv_v2"])
+                        fv, flog = model.critic(fo["scan"], fo["ego"], c_all[ids], info["final_priv_v2"])
                     all_fv = torch.zeros(env.B, device=device)
                     all_fv[ids] = vnorm.denormalize(fv.float())
                     buf_final_val[t] = all_fv[lid]
@@ -649,9 +671,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     mm = env.learner[ids] & ~f["staggered"]
                     ep_stats["return"] += f["return"][mm].tolist(); ep_stats["progress"] += f["progress"][mm].tolist()
                     ep_stats["contacts"] += f["contacts"][mm].float().tolist(); ep_stats["steps"] += f["steps"][mm].tolist()
-                h_actor = reset_hidden(h_actor, done_now)
-                noise_fresh |= done_now
-                h_ref = reset_hidden(h_ref, done_now)
+                done_l = done_now[lid]
+                h_actor = reset_hidden(h_actor, done_l)
+                noise_fresh |= done_l
+                h_ref = reset_hidden(h_ref, done_l)
                 since = torch.where(done_now, torch.zeros_like(since), since + 1)
                 if t + 1 < T:
                     buf_keep[t + 1] = (~done_now[lid]).float()
@@ -748,8 +771,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 std = model.actor.log_std.exp().float().expand_as(mu)
                 dist = torch.distributions.Normal(mu, std)
                 act_mb = fl(buf_act[:, cols])
-                logp = dist.log_prob(act_mb).sum(-1)
-                ent = dist.entropy().sum(-1)
+                logp = dist.log_prob(act_mb)[:, live].sum(-1)
+                ent = dist.entropy()[:, live].sum(-1)
                 wmean = lambda x, ww=w: (x * ww).sum() / ww.sum().clamp_min(1.0)
                 ratio = (logp - fl(buf_logp[:, cols])).exp()
                 adv_mb = fl(adv_n[:, cols])
@@ -794,7 +817,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     near = wmean(nearest_car_loss(fl(seq["near_car"]).float(), fl(buf_near[:, cols])))
                 with torch.no_grad():
                     d_ref = torch.distributions.Normal(fl(buf_ref_mu[:, cols]), ref_std.expand_as(mu))
-                    kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist).sum(-1), w_pg)
+                    kl_ref = wmean(torch.distributions.kl_divergence(d_ref, dist)[:, live].sum(-1), w_pg)
                     approx_kl = ((ratio - 1) - (logp - fl(buf_logp[:, cols]))).mean()
                     clipfrac = ((ratio - 1).abs() > a.clip).float().mean()
                 if log_now and ep == 0 and i == 0:
