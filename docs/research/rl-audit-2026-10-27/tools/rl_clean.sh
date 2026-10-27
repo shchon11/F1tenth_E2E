@@ -19,17 +19,20 @@ LEAGUE="[\"$RR/${NAME}_seats/seat0.pt\",\"$RR/${NAME}_seats/seat1.pt\",\"$C/icca
 SEATS="$RR/${NAME}_seats/seat0.pt,$RR/${NAME}_seats/seat1.pt"
 TRACKS="$MAP"; for k in $(seq 0 15); do TRACKS="$TRACKS,$MAP+warp$k"; done
 SLOT='{"kind_mix":["forzaeth","forzaeth_pred","lane_switch","interactive"],"speed_scale":[0.7,1.05],"ckpt_mix":'"$LEAGUE"',"ckpt_p":0.5,"present":0.5,"spawn":"random","reactive":{"defend":0.3,"line":0.2,"oblivious":0.1},"events":["brake","stop","shift","weave"],"event_rate":0.5}'
+SELF='{"kind":"self","present":'"${SELF_PRESENT:-1.0}"',"spawn":"random"}'
+# SELF_PLAY=1: the first opponent seat is the learner's own current weights (a second learner car in every race when present 1)
+OPP_SLOTS="[$SLOT,$SLOT,$SLOT]"; [ -n "${SELF_PLAY:-}" ] && OPP_SLOTS="[$SELF,$SLOT,$SLOT]"
 OUT=$(cd $(dirname $0)/.. && pwd)/out; mkdir -p $OUT
 source /home/shchon11/F1tenth_E2E/.venv/bin/activate
 cd /home/shchon11/F1tenth_E2E/f1sim && export PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim:/home/shchon11/F1tenth_E2E/f1sim_ros TORCHINDUCTOR_COMPILE_THREADS=2 CUDA_VISIBLE_DEVICES=${GPU:-0}
-echo "[$(date +%H:%M:%S)] $NAME start (code $(git -C /home/shchon11/F1tenth_E2E rev-parse --short HEAD), init $INIT, lr ${LR} -> ${LR_END}, rho ${SPEED_RHO:-0})" >> $OUT/$NAME.log
+echo "[$(date +%H:%M:%S)] $NAME start (code $(git -C /home/shchon11/F1tenth_E2E rev-parse --short HEAD), init $INIT, lr ${LR} -> ${LR_END}, rho ${SPEED_RHO:-0}, gamma ${GAMMA:-0.997}, self-play ${SELF_PLAY:-off} ${SELF_PRESENT:-1.0})" >> $OUT/$NAME.log
 python3 -u -m f1sim.learn.ppo --arch v2 --name "$NAME" --init "$INIT" --cond dial \
    --tracks "$TRACKS" --envs ${ENVS:-1024} --epochs 3 --total ${TOTAL:-30000000} \
    --horizon ${HORIZON:-64} --minibatch ${MB:-4096} --grad-accum ${ACCUM:-2} --lr $LR --lr-end $LR_END --critic-lr 3e-4 \
-   --gamma 0.997 --lam 0.97 --cap0 10 --cap1 10 --cap-steps 5e6 --episode-s 40 \
+   --gamma ${GAMMA:-0.997} --lam 0.97 --cap0 10 --cap1 10 --cap-steps 5e6 --episode-s 40 \
    --collision-penalty 1 --collision-speed-penalty 0 --steer-penalty 0.02 --proximity-penalty 0 --sideslip-penalty 0 \
    --lap-bonus 0 --lap-time-bonus 0 --grip-budget-penalty 0 --plan-clearance-penalty 0 --wrong-way-penalty 0.4 \
-   --race-size 4 --opp-slots "[$SLOT,$SLOT,$SLOT]" --rear-end-penalty 0 --merge-penalty 0 \
+   --race-size 4 --opp-slots "$OPP_SLOTS" --rear-end-penalty 0 --merge-penalty 0 \
    --overtake-bonus 0 --car-proximity-penalty 0 --car-contact-penalty 1 --lagrange wall=1.0,car=1.0 --contact-severity-min 1.5 \
    --lagrange-init 80 --lagrange-lr 0 --lagrange-max 300 \
    --procedural-obstacles 1.0 --procedural-density 1.5 --procedural-max-props 18 --procedural-raceline-corridor off --spawn-runway 3.0 \
