@@ -150,13 +150,25 @@ def _large_mesh_parity_case(device: str):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cuda_tiled_mesh_hits_match_original_streamed_mesh(device: str = "cuda") -> None:
+@pytest.mark.parametrize("triton_mesh", [True, False], ids=["triton", "eager_tiles"])
+def test_cuda_tiled_mesh_hits_match_original_streamed_mesh(monkeypatch, triton_mesh: bool,
+                                                           device: str = "cuda") -> None:
+    if triton_mesh and not lidar_module.HAVE_TRITON:
+        pytest.skip("needs Triton")
+    monkeypatch.setattr(lidar_module, "MESH_TRITON", triton_mesh)
     origin, dh, k, poses, scale = _large_mesh_parity_case(device)
     tiled_range, tiled_hit = ray_slices_hits(origin, dh, k, poses, scale)
     oracle_range, oracle_hit = _ray_slices_hits_original_streamed(origin, dh, k, poses, scale)
 
-    assert torch.equal(tiled_hit, oracle_hit)
-    assert torch.equal(tiled_range, oracle_range)
+    if triton_mesh:
+        # The kernel: portable to the float32 rounding band, bit-identical where that was measured
+        # (tests/test_car_mesh_triton.py says why). The eager tiles are torch against torch.
+        from test_car_mesh_triton import _assert_matches_reference
+        _assert_matches_reference((tiled_range, tiled_hit), (oracle_range, oracle_hit),
+                                  (origin, dh, k, poses, scale))
+    else:
+        assert torch.equal(tiled_hit, oracle_hit)
+        assert torch.equal(tiled_range, oracle_range)
     assert bool(torch.isfinite(tiled_range).any())
     assert bool(torch.isinf(tiled_range).any())
 
@@ -168,6 +180,7 @@ def test_cuda_tiled_mesh_hits_match_original_streamed_mesh(device: str = "cuda")
     (4097, 1, [(4096, 1), (1, 1)]),
 ])
 def test_cuda_mesh_dispatch_boundary(monkeypatch, batch: int, beams: int, expected) -> None:
+    """The eager tiling, which is what CUDA runs without the Triton kernel."""
     calls = []
 
     def fake_gathered(*args):
@@ -175,6 +188,7 @@ def test_cuda_mesh_dispatch_boundary(monkeypatch, batch: int, beams: int, expect
         k_arg = args[2]
         return torch.full_like(k_arg, float("inf")), torch.zeros_like(k_arg, dtype=torch.bool)
 
+    monkeypatch.setattr(lidar_module, "MESH_TRITON", False)
     monkeypatch.setattr(lidar_module, "_ray_slices_hits_gathered", fake_gathered)
     origin = torch.zeros(batch, beams, 3, device="cuda")
     dh = torch.zeros(batch, beams, 2, device="cuda")

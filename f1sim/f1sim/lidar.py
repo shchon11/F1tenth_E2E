@@ -13,14 +13,23 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from .track import TrackTensors
-from .lidar_triton import HAVE_TRITON, trace3d_triton
+from .lidar_triton import HAVE_TRITON, car_mesh_hits_triton, trace3d_triton
 from .prop_math import ray_prisms_hits
+from .prop_triton import prism_hits_triton
 
 HIT_NONE, HIT_DUCT, HIT_TALL, HIT_GROUND, HIT_CAR = 0, 1, 2, 3, 4
 
 
 _CAR_SLICES = {}
+_CAR_MESH_TABLES = {}
 _GATHERED_RAY_LIMIT = 4096
+#: CUDA mesh beams go to the Triton kernel (`lidar_triton.car_mesh_hits_triton`). Off -- no Triton,
+#: or a test switching it -- they take the eager gathered tiles below, which stay the reference.
+MESH_TRITON = HAVE_TRITON
+#: CUDA prop sections go to the Triton kernel (`prop_triton.prism_hits_triton`): the eager
+#: `ray_prisms_hits` bit for bit where measured (sm_89, sm_120), within float32 rounding anywhere
+#: (tests/test_prop_triton.py). Off -- no Triton, or a test switching it -- they take `Lidar._prisms`.
+PROP_TRITON = HAVE_TRITON
 
 
 def car_slices(device):
@@ -39,14 +48,44 @@ def car_slices(device):
     return _CAR_SLICES[key]
 
 
+def _car_mesh_tables(device):
+    """The outlines as the Triton kernel reads them, built once per device from `car_slices`:
+    x0, y0, x1, y1 planes (L, S), valid (L, S) uint8, count (L,) int32 = index of the level's last
+    valid segment + 1 (the kernel's loop bound; `valid` still masks inside it), and three float32
+    scalars: z0, inv_dz = fl(1 / dz) -- what torch's CUDA `x / dz` multiplies by when dz is a Python
+    scalar, so the levels round from the same numbers -- and r_bound >= the largest valid endpoint
+    radius, for the kernel's early-out."""
+    key = str(device)
+    if key not in _CAR_MESH_TABLES:
+        z, segs, valid = car_slices("cpu")
+        L, S, _ = segs.shape
+        dz = z[1] - z[0]                                                     # float32, as `_ray_slices_hits_gathered`
+        inv_dz = float(torch.ones((), dtype=torch.float32) / dz)             # IEEE float32 reciprocal
+        idx = torch.arange(1, S + 1, dtype=torch.int32).expand(L, S)
+        count = torch.where(valid, idx, torch.zeros_like(idx)).amax(1).to(torch.int32)
+        ends = torch.cat([segs[..., 0:2], segs[..., 2:4]], 1).double()       # (L, 2S, 2)
+        r = ends.norm(dim=-1)[torch.cat([valid, valid], 1)]
+        r_bound = (float(r.max()) if r.numel() else 0.0) * (1.0 + 1e-6) + 1e-6
+        planes = [segs[..., j].contiguous().to(device) for j in range(4)]
+        _CAR_MESH_TABLES[key] = (*planes, valid.to(torch.uint8).contiguous().to(device), count.to(device),
+                                 float(z[0]), inv_dz, r_bound)
+    return _CAR_MESH_TABLES[key]
+
+
 def ray_slices_hits(origin: torch.Tensor, dh: torch.Tensor, k: torch.Tensor, poses: torch.Tensor,
                     scale: torch.Tensor, chunk: int = 32):
-    """Intersect car outlines, using bounded gathered CUDA tiles when available.
+    """Intersect car outlines: the Triton kernel on CUDA, else bounded gathered CUDA tiles.
 
-    The exact gathered helper is efficient for a few thousand rays, but its per-ray segment
-    gather must stay bounded. CUDA batches are therefore tiled over beams (and over batch rows
-    when a batch itself is larger than the limit); CPU keeps the streamed implementation.
+    The kernel computes what `_ray_slices_hits_gathered` does, bit for bit where measured (sm_89,
+    sm_120) and within float32 rounding anywhere (`lidar_triton`, tests/test_car_mesh_triton.py).
+    Without Triton, the exact gathered helper is efficient for a
+    few thousand rays, but its per-ray segment gather must stay bounded. CUDA batches are therefore
+    tiled over beams (and over batch rows when a batch itself is larger than the limit); CPU keeps
+    the streamed implementation.
     """
+    if (k.is_cuda and MESH_TRITON
+            and all(t.dtype == torch.float32 for t in (origin, dh, k, poses, scale))):
+        return car_mesh_hits_triton(origin, dh, k, poses, scale, _car_mesh_tables(k.device))
     if k.is_cuda and k.numel() <= _GATHERED_RAY_LIMIT:
         return _ray_slices_hits_gathered(origin, dh, k, poses, scale)
     if k.is_cuda:
@@ -250,6 +289,9 @@ class Lidar:
         # digits of how far. That is four orders of magnitude below the 1 cm range noise the sensor
         # model adds anyway, but it is a change to the existing `+props` path and is written down
         # rather than called identical.
+        #
+        # With Triton on CUDA (`PROP_TRITON`), `_merge_props` calls `prop_triton.prism_hits_triton`
+        # instead -- the eager function's bits, compiled or not -- and `_prisms` is the fallback.
         self._prisms = ray_prisms_hits
         if compile and self.device.type == "cuda":
             try:
@@ -295,7 +337,13 @@ class Lidar:
         of how obstacles are *drawn*. The prop's finiteness is in its geometry, not in its label."""
         tr = self.track
         poses, pn, pd, z_lo, z_hi = tr.props_for(tid, eid)
-        r_p, hit_p = self._prisms(origin, direction_h, k, poses, pn, pd, z_lo, z_hi)
+        if (PROP_TRITON and k.is_cuda and pn.shape[2] > 0
+                and all(t.dtype == torch.float32 for t in (origin, direction_h, k, poses, pn, pd, z_lo, z_hi))):
+            # 69.6 ms of a 74 ms scan at 1024 envs in races of 4 with procedural props, eager
+            # (training runs `compile=False`); the kernel, 0.29 ms, returns the eager function's bits.
+            r_p, hit_p = prism_hits_triton(origin, direction_h, k, poses, pn, pd, z_lo, z_hi)
+        else:
+            r_p, hit_p = self._prisms(origin, direction_h, k, poses, pn, pd, z_lo, z_hi)
         closer = hit_p & (r_p < r) & (r_p <= range_max[:, None])
         return (torch.where(closer, r_p.to(r.dtype), r),
                 torch.where(closer, torch.full_like(typ, HIT_TALL), typ))
