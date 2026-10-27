@@ -478,6 +478,11 @@ def main():
                          "This is what makes the dial a command under RL. A dial is a lower bound on the floor's grip, so "
                          "return alone teaches the policy to drive faster than it was told; with the budget charged, what "
                          "is optimised is the lap *inside* the dial")
+    ap.add_argument("--grip-budget-rho", type=float, default=None, metavar="RHO",
+                    help="EnvConfig.grip_budget_rho: the share of the front axle's capacity at the budget's friction that is "
+                         "free (default 0.95). 1.0 = the physical limit: the car may use all of its grip and pays only for "
+                         "lateral acceleration beyond it (2026-10-27: at 0.95 the term was what held the straights back; "
+                         "without it the policy slid past the limit, corner |v r| p90 10.6 vs 9.0, and hit far more)")
     ap.add_argument("--raceline-objective", choices=["min_curvature", "min_time"], default=None,
                     help="line behind the lap-time reference and the teacher-driven opponents (default min_curvature)")
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of that line's speed profile (default 6)")
@@ -1217,6 +1222,8 @@ def main():
                                                               reward_car_proximity=a.car_proximity_penalty,
                                                               reward_sideslip=a.sideslip_penalty,
                                                               reward_grip_budget=a.grip_budget_penalty,
+                                                              **({} if a.grip_budget_rho is None else
+                                                                 {"grip_budget_rho": float(a.grip_budget_rho)}),
                                                               car_safe_gap=a.car_safe_gap,
                                                               reward_ttc=a.ttc_penalty, ttc_safe=a.ttc_safe,
                                                               **({} if a.overtake_sustained is None else
