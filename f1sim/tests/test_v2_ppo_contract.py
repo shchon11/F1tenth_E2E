@@ -220,3 +220,58 @@ def test_the_predictive_ceiling_counts_a_car_drifting_into_our_lane_within_the_h
     assert torch.isinf(safe_speed(late, 3.0, 0.35, 0.2, 0.2, horizon=1.2)[0])
     in_lane = env_with(2.5, 0.1, 0.0)                               # already in our lane: the in-lane ceiling, in Frenet
     assert safe_speed(in_lane, 3.0, 0.35, 0.2, 0.2, horizon=1.0)[0] == pytest.approx(want)
+
+
+def test_dead_plan_columns_are_driven_at_the_mean_and_the_warm_up_holds_the_actor(tmp_path, monkeypatch):
+    """--pg-dead-dims (2026-10-27): the columns the follower never executes are driven at the actor's mean (no noise)
+    and carry no gradient -- their log std never moves while a live one does. And the critic warm-up holds the actor
+    exactly: the restored Adam momentum used to step it while its loss was zeroed."""
+    import importlib
+
+    from f1sim import gym_env
+    from f1sim.learn import model_v2
+    from v2_fixtures import generated_v2_checkpoint
+    dead = [3, 5, 6, 7]
+    seen = {"act": [], "mu": []}
+    real_step, real_dist = gym_env.F1VecEnv.step, model_v2.ActorV2.step_dist
+
+    def step(self, action):
+        seen["act"].append(action[self.learner_ids].detach().clone())
+        return real_step(self, action)
+
+    def step_dist(self, scan, ego, c, h=None):
+        d, h_next = real_dist(self, scan, ego, c, h)
+        seen["mu"].append(d.mean.detach().clone())
+        return d, h_next
+
+    monkeypatch.setattr(gym_env.F1VecEnv, "step", step)
+    monkeypatch.setattr(model_v2.ActorV2, "step_dist", step_dist)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(2, threads))
+    try:
+        init = generated_v2_checkpoint(str(tmp_path / "student.pt"))
+        monkeypatch.setattr(common, "RUNS_DIR", str(tmp_path))
+        monkeypatch.setenv("WANDB_MODE", "disabled")
+        monkeypatch.setattr(sys, "argv", ["f1sim.learn.ppo", "--arch", "v2", "--name", "dd", "--init", init, "--envs", "4",
+                                          "--tracks", TRACK, "--horizon", "16", "--minibatch", "32", "--grad-accum", "1",
+                                          "--total", str(3 * 16 * 4), "--epochs", "2", "--device", "cpu", "--lr", "1e-3",
+                                          "--lr-end", "1e-3", "--sim-backend", "eager", "--wandb", "disabled",
+                                          "--log-every", "1", "--save-every", "100", "--critic-warmup", "1",
+                                          "--collision-mode", "soft", "--cap0", "9", "--cap1", "9",
+                                          "--dial-constant", "1.0489", "--pg-dead-dims", ",".join(map(str, dead))])
+        start = torch.load(init, map_location="cpu", weights_only=True)
+        importlib.import_module("f1sim.learn.ppo").main()
+        # rollout steps: the action handed to the env equals the mean on the dead columns, not on the live ones
+        pairs = [(a, m) for a, m in zip(seen["act"], seen["mu"]) if a.shape == m.shape]
+        assert pairs, "no rollout step was recorded"
+        live = [j for j in range(8) if j not in dead]
+        assert all(torch.equal(a[:, dead], m[:, dead].clamp(-1, 1)) for a, m in pairs)
+        assert any(not torch.equal(a[:, live], m[:, live].clamp(-1, 1)) for a, m in pairs)
+        rows = [json.loads(line) for line in open(tmp_path / "dd" / "progress.jsonl")]
+        assert rows[0]["policy/actor_move"] == 0.0 and rows[-1]["policy/actor_move"] > 0.0
+        end = torch.load(tmp_path / "dd" / "ppo_final.pt", map_location="cpu", weights_only=True)
+        ls0, ls1 = start["state_dict"]["actor.log_std"], end["state_dict"]["actor.log_std"]
+        assert torch.equal(ls0[dead], ls1[dead])
+        assert not torch.equal(ls0[live], ls1[live])
+    finally:
+        torch.set_num_threads(threads)
