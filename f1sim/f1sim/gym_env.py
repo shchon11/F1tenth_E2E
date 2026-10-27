@@ -80,6 +80,14 @@ PRIV_V2_KEYS = (PRIV_V2_EGO_KEYS
                 + tuple(f"opp{j}_{k}" for j in range(PRIV_V2_OPP_SLOTS) for k in PRIV_V2_OPP_KEYS)
                 + PRIV_V2_GEO_KEYS)
 PRIV_V2_DIM = len(PRIV_V2_KEYS)
+#: `EnvConfig.priv_props` (rl-audit 2026-10-28): the props the car is heading into, for the critic only. The nearest
+#: live props not behind the car (body-frame dx > -1 m) within `PRIV_V2_PROP_RANGE`, nearest first, absent slots all
+#: zero: present, dx/5, dy/5, dist/5 -- the opponent block's units. Appended after `PRIV_V2_KEYS`; off, the vector
+#: is exactly `PRIV_V2_DIM` wide as before.
+PRIV_V2_PROP_KEYS = ("present", "dx", "dy", "dist")
+PRIV_V2_PROP_SLOTS = 3
+PRIV_V2_PROP_DIM = PRIV_V2_PROP_SLOTS * len(PRIV_V2_PROP_KEYS)
+PRIV_V2_PROP_RANGE = 12.0
 #: [s] TTC reported when nothing closes faster than `PRIV_V2_TTC_MIN_CLOSING`, and its cap. The
 #: align gate's numbers; with no opponent at all: distance 30 m, closing 0, TTC 10, min TTC 10.
 PRIV_V2_TTC_CAP = 10.0
@@ -565,6 +573,11 @@ class EnvConfig:
     #: policy's own action -- its history, its log-prob -- is untouched; only what is tracked is slower.
     #: Same grip fraction on a floor of k x the friction at about sqrt(k). 'linear' plans only.
     plan_speed_scale: float = 1.0
+    #: Append the props ahead to the v2 critic's privileged vector (`PRIV_V2_PROP_KEYS`). Critic-only, never an
+    #: observation. Why (rl-audit 2026-10-28): the critic saw every opponent but no prop except through the scan and
+    #: the current clearance, and pre-priced ~30 % of a hard wall/prop hit before it (cars ~45 %); the rest of the
+    #: price lands on the onset step, where GAE cannot carry it back to the line choice 1-2 s earlier. Off = as before.
+    priv_props: bool = False
     #: The speed limit for a car ahead (2026-10-25, `opponent_speed_limit.py`): the learner's speed command is held to
     #: the speed from which it can still slow to the car's speed before the gap closes, for a car in its lane now or
     #: moving into it within 1 s -- read off the policy's own nearest-car output, which its runner writes into
@@ -3734,7 +3747,31 @@ class F1VecEnv:
             geo = torch.cat([dist_c.gather(1, j) / S, clos.gather(1, j) / S,
                              ttc.gather(1, j) / PRIV_V2_TTC_CAP,
                              ttc.min(1, keepdim=True).values / PRIV_V2_TTC_CAP], 1)
-        return torch.cat([ego, opp.reshape(self.B, -1), geo], 1)
+        out = torch.cat([ego, opp.reshape(self.B, -1), geo], 1)
+        if self.ecfg.priv_props:
+            out = torch.cat([out, self._prop_block(st)], 1)
+        return out
+
+    def _prop_block(self, st: torch.Tensor) -> torch.Tensor:
+        """(B, PRIV_V2_PROP_DIM) the props the car is heading into (`EnvConfig.priv_props`): per slot present, dx/5,
+        dy/5, dist/5 in the ego body frame, nearest first among live props with dx > -1 m within PRIV_V2_PROP_RANGE."""
+        K, S = PRIV_V2_PROP_SLOTS, PRIV_OPP_DIST_SCALE
+        blk = torch.zeros(self.B, K, len(PRIV_V2_PROP_KEYS), device=st.device, dtype=st.dtype)
+        po = self.procedural
+        if po is None or po.C == 0:
+            return blk.reshape(self.B, -1)
+        d = po.p_poses[:, :, :2].to(st.dtype) - st[:, None, :2]
+        c, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+        dx, dy = d[..., 0] * c + d[..., 1] * s_, -d[..., 0] * s_ + d[..., 1] * c
+        dist = d.norm(dim=-1)
+        live = (po.p_sid >= 0) & (dx > -1.0) & (dist < PRIV_V2_PROP_RANGE)
+        key = torch.where(live, dist, torch.full_like(dist, 1e6))
+        n = min(K, key.shape[1])
+        j = key.topk(n, dim=1, largest=False).indices
+        g = lambda t: t.gather(1, j)
+        pres = g(live).to(st.dtype)
+        blk[:, :n] = torch.stack([pres, g(dx) / S, g(dy) / S, g(dist) / S], 2) * pres[..., None]
+        return blk.reshape(self.B, -1)
 
     def _lidar_pose(self):
         """(mount x, mount y, beam angles (B, N_sensor)) of each car's LiDAR in its body frame: the

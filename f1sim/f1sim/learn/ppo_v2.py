@@ -66,7 +66,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mpc
-from ..gym_env import PRIV_V2_DIM, REWARD_COMPONENT_KEYS
+from ..gym_env import PRIV_V2_DIM, PRIV_V2_PROP_DIM, REWARD_COMPONENT_KEYS
 from . import common
 from . import conditioning as cond_mod
 from .aux_v2 import aux_spec, nearest_car_loss
@@ -254,6 +254,29 @@ def _safe_speed_predictive(env, brake: float, width: float, lag: float, gap_min:
     return torch.where(inpath, vs, torch.full_like(vs, float("inf"))).min(1).values
 
 
+def widen_critic_priv(model, priv_dim: int):
+    """`--priv-props` from a critic that reads fewer privileged columns: append zero-weight inputs for the new
+    columns at the end of `critic.inp`'s Linear ([ego | c | priv] with priv's new columns last), so the value and
+    contact outputs are unchanged until training uses them. Returns (old, new) widths, or None if nothing to do."""
+    cr = model.critic
+    old = int(cr.priv_dim)
+    if old == int(priv_dim):
+        return None
+    if old > int(priv_dim):
+        raise SystemExit(f"--init's critic reads {old} privileged columns, this env makes {priv_dim}")
+    lin = cr.inp[0]
+    new = torch.nn.Linear(lin.in_features + (int(priv_dim) - old), lin.out_features).to(lin.weight.device, lin.weight.dtype)
+    with torch.no_grad():
+        new.weight.zero_()
+        new.weight[:, :lin.in_features] = lin.weight
+        new.bias.copy_(lin.bias)
+    cr.inp[0] = new
+    cr.priv_dim = int(priv_dim)
+    if isinstance(getattr(model, "meta", None), dict):
+        model.meta["priv_dim"] = int(priv_dim)
+    return old, int(priv_dim)
+
+
 def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, applied: dict,
           league_seats=()):
     """The PPO loop for `--arch v2`, from the env `ppo.main` built and reset. `league_seats`: the pool
@@ -269,8 +292,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     coefs = {"contact": float(a.contact_bce), "b8": float(a.aux_b8), "near": float(a.aux_near_car)}
     aux = aux_spec(b8=coefs["b8"] > 0, near_car=coefs["near"] > 0)
     priv_dim = int(env.privileged_v2(env.last_result).shape[1])
-    if priv_dim != PRIV_V2_DIM:
-        raise SystemExit(f"privileged_v2 is {priv_dim} wide, the v2 critic reads {PRIV_V2_DIM}")
+    priv_want = PRIV_V2_DIM + (PRIV_V2_PROP_DIM if getattr(env.ecfg, "priv_props", False) else 0)
+    if priv_dim != priv_want:
+        raise SystemExit(f"privileged_v2 is {priv_dim} wide, the v2 critic reads {priv_want}")
     # ---------------------------------------------------------------- the network
     init_extra = dict(init_ck.get("extra") or {})
     if a.init:
@@ -286,6 +310,10 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
               f"| heads {want}{' fresh: ' + str(fresh) if fresh else ''}", flush=True)
         if model.obs_spec != spec:
             raise SystemExit(f"--init's observation contract {model.obs_spec} is not this env's {spec}")
+        widened = widen_critic_priv(model, priv_dim)
+        if widened:
+            print(f"critic privileged input widened {widened[0]} -> {widened[1]} (new columns zero: it starts as it was)",
+                  flush=True)
     else:
         model = ActorCriticV2(n_beams=spec.n_beams, n_frames=spec.n_frames, ego_dim=spec.ego_dim,
                               act_dim=spec.act_dim, speed_mode=spec.speed_mode, priv_dim=priv_dim,
@@ -336,6 +364,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
             and init_extra.get("opt_param_names") == opt_param_names):
         try:
             opt.load_state_dict(init_extra["opt"])
+            # a widened layer's moments have the old shape: that one parameter starts Adam fresh
+            for p_ in list(opt.state.keys()):
+                if any(torch.is_tensor(v) and v.dim() > 0 and v.shape != p_.shape for v in opt.state[p_].values()):
+                    del opt.state[p_]
+                    print(f"optimizer state of a {tuple(p_.shape)} parameter dropped (shape changed)", flush=True)
             print("optimizer state restored", flush=True)
         except (ValueError, KeyError, RuntimeError) as exc:
             print(f"optimizer state not restored ({exc}); starting Adam fresh", flush=True)
