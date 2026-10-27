@@ -18,7 +18,8 @@ source /home/shchon11/F1tenth_E2E/.venv/bin/activate
 cd /home/shchon11/F1tenth_E2E/f1sim && export PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim:/home/shchon11/F1tenth_E2E/f1sim_ros TORCHINDUCTOR_COMPILE_THREADS=2 CUDA_VISIBLE_DEVICES=${GPU:-0}
 ENVS=${ENVS:-1024}; LR_ROWS=$((ENVS / 4))
 echo "[$(date +%H:%M:%S)] $NAME fixed-world start ($CK, seed $SEED, $(git -C /home/shchon11/F1tenth_E2E rev-parse --short HEAD))" >> $OUT/$NAME.log
-python3 -u -m f1sim.learn.ppo --arch v2 --name "$NAME" --init "$CK" --cond dial \
+# ENTRY: another entry point taking the same argv (e.g. ENTRY="$D/hit_anticipation.py 2400 --"); default the PPO trainer
+python3 -u ${ENTRY:--m f1sim.learn.ppo} --arch v2 --name "$NAME" --init "$CK" --cond dial \
    --tracks "$TRACKS" --envs $ENVS --epochs 1 --total $(( ${UPD:-40} * LR_ROWS * 64 )) \
    --horizon 64 --minibatch 4096 --grad-accum 2 --lr 0 --lr-end 0 --critic-lr 3e-4 \
    --gamma 0.997 --lam 0.97 --cap0 10 --cap1 10 --cap-steps 5e6 --episode-s 40 \
