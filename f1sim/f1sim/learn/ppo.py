@@ -490,6 +490,12 @@ def main():
                          "free (default 0.95). 1.0 = the physical limit: the car may use all of its grip and pays only for "
                          "lateral acceleration beyond it (2026-10-27: at 0.95 the term was what held the straights back; "
                          "without it the policy slid past the limit, corner |v r| p90 10.6 vs 9.0, and hit far more)")
+    ap.add_argument("--grip-budget-ramp", type=int, default=0, metavar="U",
+                    help="v2: raise the grip-budget charge linearly from 0 to --grip-budget-penalty over the first U updates "
+                         "(0 = full from the start). Why (2026-10-27): a start far over the limit (Monza, corner p90 10.4) met "
+                         "the full quadratic charge at once, and PPO cut the lateral g to ~6 and every speed with it within "
+                         "128 updates -- slowing down is learnt from a few large events, speeding up from a 2 cm signal, so a "
+                         "fast early cut does not come back")
     ap.add_argument("--raceline-objective", choices=["min_curvature", "min_time"], default=None,
                     help="line behind the lap-time reference and the teacher-driven opponents (default min_curvature)")
     ap.add_argument("--teacher-a-lat", type=float, default=None, help="[m/s^2] lateral limit of that line's speed profile (default 6)")

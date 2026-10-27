@@ -363,6 +363,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                              "decision_every": int(getattr(a, "decision_every", 1) or 1),
                              "log_std_shift": float(getattr(a, "log_std_shift", 0.0) or 0.0),
                              "freeze_log_std": bool(getattr(a, "freeze_log_std", False)),
+                             "grip_budget_ramp": int(getattr(a, "grip_budget_ramp", 0) or 0),
                              "b8_window": "since the stored state's episode began (train_v2.b8_sequence_loss)",
                              "aux_balance": {"main": "pg", "every": balance.every, "rho": balance.rho,
                                              "beta": balance.beta, "names": list(balance.names)},
@@ -539,6 +540,9 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
         lr = a.lr + (a.lr_end - a.lr) * frac
         for g in opt.param_groups:
             g["lr"] = lr if g.get("group") == "actor" else a.critic_lr
+        if int(getattr(a, "grip_budget_ramp", 0) or 0) > 0 and a.grip_budget_penalty > 0:
+            # `--grip-budget-ramp`: the charge rises from 0 to its value over the first U updates (read by env.step each step)
+            env.ecfg.reward_grip_budget = float(a.grip_budget_penalty) * min(1.0, (update + 1) / int(a.grip_budget_ramp))
         if a.yield_to_viewer > 0 and t_loop > 0 and common.viewer_active():
             time.sleep(min(t_loop * a.yield_to_viewer, 1.0))
         t_loop0 = time.time()
