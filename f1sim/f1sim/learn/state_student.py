@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -298,8 +299,134 @@ def evaluate_student():
           f"추월당함 {tot['passed'] / max(tot['km'], 1e-9):.2f}/km, 3 m 안 뒤따름 {tot['follow'] / max(tot['n'], 1) * 100:.0f} %", flush=True)
 
 
+@torch.no_grad()
+def evaluate_like():
+    """One policy (a state_student or a state_rl checkpoint) on EXACTLY the worlds and metric code of an old eval_ckpt.sh
+    directory (2026-10-29, the user: "이전 데이터들 너 믿지 말고 너가 직접 확인해"): every race's EnvConfig is read back from the
+    reference's JSON (`metadata.env_config`; only the action / observation contract this policy needs is changed), and the
+    metrics are `learn.evaluate`'s own -- `common.rollout_metrics` inside `TrafficMeter`, `EncounterMeter`,
+    `ContactSeverityMeter`, `WrongWayMeter` -- written as race_s<seed>_<kind>.json so `summarize.py` reads both alike.
+    The solo run (race of one, no props) is written as solo_x.json (summarize.py's solo column needs teacher_speed_chain's
+    bins and stays empty)."""
+    import dataclasses
+    import glob
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ckpt")
+    ap.add_argument("--like", required=True, help="an eval_ckpt.sh output directory (its race_s*_*.json)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--steps", type=int, default=2400)
+    ap.add_argument("--device", default="cuda")
+    a = ap.parse_args(sys.argv[2:])
+    device = torch.device(a.device)
+    ck = torch.load(a.ckpt, map_location=device, weights_only=False)
+    is_teacher = "model" in ck
+    n_beams = int(ck["args"].get("beams", 36)) if is_teacher else int(ck["beams"])
+    frames = 1 if is_teacher else int(ck["frames"])
+    stride = 1 if is_teacher else int(ck["args"].get("stride", 3))
+    R = int(ck["args"].get("repeat", 2))
+    from .. import Config
+    from ..gym_env import EnvConfig
+    from .. import opponent_slots as opp_sl
+    from . import common
+    from .benchmark.overtake import TrafficMeter
+    from .encounter import EncounterMeter
+    from .severity_meter import ContactSeverityMeter
+    from .wrong_way_meter import WrongWayMeter
+    os.makedirs(a.out, exist_ok=True)
+    fields = {f.name for f in dataclasses.fields(EnvConfig)}
+    refs = sorted(glob.glob(os.path.join(a.like, "race_s*_*.json")))
+    solo_ref = os.path.join(a.like, "solo.json")
+    jobs = ([("solo", solo_ref)] if os.path.exists(solo_ref) else []) + [(os.path.basename(f)[:-5], f) for f in refs]
+    for tag, ref in jobs:
+        md = json.load(open(ref))["nominal"]["metadata"]
+        ec = {k: v for k, v in md["env_config"].items() if k in fields}
+        if ec.get("opponent_slots"):
+            ec["opponent_slots"] = opp_sl.parse_slots(json.dumps(ec["opponent_slots"]))
+        for k in list(ec):
+            if isinstance(ec[k], list) and k != "opponent_slots":
+                ec[k] = tuple(ec[k])
+        # this policy's contract: a direct command at 20 Hz from the v1 observation (students) or the privileged state
+        # (teachers); the plan / MAP / wp4 fields of the reference only shape a plan policy's output and are reset
+        base = EnvConfig()
+        for k in [k for k in ec if k.startswith("plan_") or k in ("speed_mode", "hist_len", "hist_stride", "ego_actions",
+                                                                   "opp_token", "dial", "speed_command")]:
+            ec[k] = getattr(base, k)
+        ec.update(action_mode="direct", obs_version=1, scan_stack=frames, scan_stride=stride, v_max_policy=10.0)
+        if is_teacher:
+            ec.update(priv_props=True, priv_time=True)
+        ecfg = EnvConfig(**ec)
+        limits = md.get("teacher_limits") or common.teacher_limits(7.0, 6.5, 4.0)
+        race = int(ecfg.race_size) > 1
+        trs, rls = common.load_tracks(list(md["tracks"]), racelines=race,
+                                      **dict(limits, objective=md.get("raceline_objective", "min_time")))
+        cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = n_beams
+        cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0); cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
+        seed = int(md["seed"]); envs = int(md["envs"])
+        env = common.make_env(trs, envs, device, ecfg, cfg=cfg, seed=seed, rls=rls, teacher_limits=limits)
+        from .graph_runtime import prepare_graph_runtime
+        prepare_graph_runtime(env, log=lambda _t: None)
+        env.sim.warmup()
+        lid = env.learner_ids; B = int(lid.numel())
+
+        class Pol:
+            """decides every R steps (the 20 Hz the policies were trained at), holds in between"""
+            def __init__(self):
+                self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
+                if is_teacher:
+                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)))
+                    self.net = None
+                else:
+                    self.st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device)
+                    self.st.load_state_dict(ck["student"]); self.st.eval()
+                    self.keys = ck.get("ego_keys")
+
+            def __call__(self, obs):
+                if self.t % R == 0:
+                    if is_teacher:
+                        o_ = self.sobs(self.last)
+                        if self.net is None:
+                            self.net = ActorCritic(o_.shape[1]).to(device); self.net.load_state_dict(ck["model"], strict=False)
+                            self.net.eval(); self.nrm = RunningNorm(o_.shape[1], device); self.nrm.load_state_dict(ck["norm"])
+                        a_ = self.net.pi(self.nrm(o_)).clamp(-1, 1)
+                    else:
+                        keys = self.keys or sorted(k for k in obs if k != "scan")
+                        ego = torch.cat([obs[k][lid].float().reshape(B, -1) for k in keys], 1)
+                        a_ = self.st(obs["scan"][lid].float(), ego)
+                    self.act[lid] = a_; self.last = a_
+                self.t += 1
+                return self.act
+
+            def reset(self, done=None):
+                if done is None:
+                    self.t = 0; self.last.zero_()
+                else:
+                    self.last[done[lid]] = 0.0
+
+        pol = Pol()
+        meter = TrafficMeter(env, contention_range_m=12.0, attack_range_m=3.0, vehicle_length=cfg.vehicle.length)
+        enc = EncounterMeter(env); sev = ContactSeverityMeter(env); ww = WrongWayMeter(env)
+        with meter, enc, sev, ww:
+            result = common.rollout_metrics(env, pol, int(a.steps), float(ecfg.speed_cap))
+        for k_, v_ in list(result.items()):
+            if isinstance(v_, float) and not math.isfinite(v_):
+                result[k_] = None
+        result.update(meter.report()); result.update(enc.report()); result.update(sev.report()); result.update(ww.report())
+        result["metadata"] = {"checkpoint": a.ckpt, "like": ref, "env_config_overrides": "action/obs contract only",
+                              "seed": seed, "envs": envs, "steps": int(a.steps), "env_config": dataclasses.asdict(ecfg)}
+        name = "solo_x.json" if tag == "solo" else tag + ".json"
+        json.dump({"nominal": result}, open(os.path.join(a.out, name), "w"), indent=1, default=str)
+        cs = result.get("contact_severity") or {}
+        km = float(cs.get("learner_distance_m", 0)) / 1000
+        hard = {k: sum(((cs.get(k) or {}).get("fine_hist") or [])[15:]) for k in ("wall", "prop", "car")}
+        print(f"[같은 평가] {tag}: 진행 {result.get('progress_rate_mps', float('nan')):.2f} m/s, 평균 속력 {result.get('mean_speed', float('nan')):.2f}, "
+              f"랩 {result.get('lap_time_s')}, {km:.1f} km, 강한/km 벽 {hard['wall'] / max(km, 1e-6):.2f} 상자 {hard['prop'] / max(km, 1e-6):.2f} "
+              f"차 {hard['car'] / max(km, 1e-6):.2f}", flush=True)
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "eval":
         evaluate_student()
+    elif len(sys.argv) > 1 and sys.argv[1] == "evalx":
+        evaluate_like()
     else:
         main()
