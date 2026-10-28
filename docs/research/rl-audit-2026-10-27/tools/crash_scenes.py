@@ -95,6 +95,9 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--seed", type=int, default=91)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--gap-rule", type=float, default=0.0,
+                    help="falsifier for 'the teacher is near its optimum on cars': cap its speed command to keep this time "
+                         "gap [s] (+0.3 m) to a car ahead in its lane; compare the J80 rate with the rule off")
     ap.add_argument("--student", default="", help="a state_student checkpoint: the STUDENT drives (its own sensors); the "
                     "teacher CKPT labels every decision, so each hit shows what the teacher would have done instead")
     a = ap.parse_args()
@@ -169,6 +172,8 @@ def main():
     ret_rms = RunningNorm(1, device); ret_rms.load_state_dict(ck["ret_rms"])
     touching = torch.zeros(B, dtype=torch.bool, device=device)
     dif_all = []; dif_hit = []                           # |student - teacher| per decision, overall and before hits
+    gap_on = []                                          # share of decisions the gap rule limited
+    prog_m = 0.0; n_dec_tot = 0
     events, n_img = [], 0
     km = 0.0
     po = env.procedural
@@ -189,6 +194,23 @@ def main():
     for t in range(int(a.steps) // int(a.repeat)):
         ohist = torch.roll(ohist, -1, 0); ohist[-1] = o
         act = model.pi(norm(o)).clamp(-1, 1)
+        if float(a.gap_rule) > 0 and env.M > 1:
+            st0 = env.sim.state
+            dx_, dy_, dyaw_, dvx_, dvy_, dist_, pr_ = env._opp_rel(st0)
+            dx_, dy_, dvx_, pr_ = dx_[lid], dy_[lid], dvx_[lid], pr_[lid]
+            ahead = pr_ & (dx_ > 0.0) & (dy_.abs() < 0.6)
+            key = torch.where(ahead, dx_, torch.full_like(dx_, 1e6))
+            k_ = key.argmin(1, keepdim=True)
+            anyq = ahead.gather(1, k_)[:, 0]
+            gap = dx_.gather(1, k_)[:, 0] - 0.55
+            clos = -dvx_.gather(1, k_)[:, 0]
+            v_e = st0[lid, 3]
+            g_star = 0.3 + float(a.gap_rule) * v_e
+            v_cap = (v_e - clos - 1.5 * (g_star - gap)).clamp(0.0, float(env.ecfg.v_max_policy))
+            a_cap = 2.0 * v_cap / float(env.ecfg.v_max_policy) - 1.0
+            limit = anyq & (gap < g_star)
+            act = act.clone(); act[:, 1] = torch.where(limit, torch.minimum(act[:, 1], a_cap), act[:, 1])
+            gap_on.append(float(limit.float().mean()))
         if sck is not None:
             with torch.no_grad():
                 s_act = student(obs_d["scan"][lid].float(), egov(obs_d)).clamp(-1, 1)
@@ -207,6 +229,7 @@ def main():
             car = comp["car_contact"][lid].float(); tch = car < 0; c_on = tch & ~touching
             d_ = (te | trc)[lid]; touching = tch & ~d_
             km += float(info["progress"][lid].float().clamp_min(0).sum()) / 1000.0
+            prog_m += float(info["progress"][lid].float().sum())
             on, imp = res.contact_onsets[lid], res.contact_impacts[lid]
             hard_w = on[:, 0] & (imp[:, 0] >= 1.5); hard_p = on[:, 1] & (imp[:, 1] >= 1.5)
             if enc_seen is not None:
@@ -360,6 +383,10 @@ def main():
                         draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title)
                         n_img += 1
         o = obs_fn(act)
+    secs = (int(a.steps) // int(a.repeat)) * int(a.repeat) * B * env.sim.control_dt
+    n_hard = len(events)
+    print(f"[J80] 진행 {prog_m / secs:.3f} m/s, 강한 충돌 {n_hard / max(km, 1e-9):.2f}/km, J80 = (진행 - 80 x 충돌)/시간 = "
+          f"{(prog_m - 80.0 * n_hard) / secs:.4f} m/s" + (f" | 간격 규칙이 막은 결정 {np.mean(gap_on) * 100:.1f} %" if gap_on else ""), flush=True)
     if sck is not None and dif_all:
         da = torch.stack(dif_all).mean(0).numpy()
         print(f"[학생] 평소 |학생-선생| 조향 {da[0] * math.degrees(float(env.s_max)):.1f}도, 속도 {da[1] / 2 * float(env.ecfg.v_max_policy):.2f} m/s", flush=True)

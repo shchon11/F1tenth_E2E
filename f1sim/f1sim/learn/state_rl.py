@@ -257,7 +257,10 @@ def train(a):
                     touching = tch
                     onw = (-col / max(w_col, 1e-9)).clamp_min(0)
                     dense = r_[lid].float() - col - car
-                    step_r = dense - price * (onw + onset.float())
+                    # --car-price: a hard car contact can end a 1 vs 1 race; at the shared price the teacher's tailgating
+                    # into braking zones is break-even against a 0.5 s gap rule (10-29 gap test), so cars get their own
+                    price_c = price * (float(a.car_price) / float(a.price)) if float(a.car_price) > 0 else price
+                    step_r = dense - price * onw - price_c * onset.float()
                     alive = (~done).float()
                     rew += step_r * alive
                     prog += float((info["progress"][lid].float().clamp_min(0) * alive).sum())
@@ -436,6 +439,8 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--car-price", type=float, default=0.0,
+                    help="final price of a hard car contact (0 = --price); ramps with the price schedule")
     ap.add_argument("--noise-corr", type=float, default=0.0,
                     help="AR(1) correlation of the exploration noise per decision (0 = white; 0.9 = ~0.5 s at 20 Hz)")
     ap.add_argument("--level-replay", type=float, default=0.0, help="prioritized level replay probability (0 = off)")

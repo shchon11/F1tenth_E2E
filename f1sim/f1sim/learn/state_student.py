@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--frames", type=int, default=3, help="scan frames in the stack")
     ap.add_argument("--stride", type=int, default=3, help="control steps between stacked frames")
     ap.add_argument("--danger-weight", type=float, default=0.0, help="sample weight 1 + X * teacher P(hit within 1 s)")
+    ap.add_argument("--buffer-cpu", type=int, default=0, help="keep the scan buffer in pinned host memory")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     a.price = 80.0
@@ -101,7 +102,10 @@ def main():
     student = Student(F, N, E).to(device)
     opt = torch.optim.Adam(student.parameters(), lr=a.lr)
     cap = int(a.buffer)
-    b_scan = torch.zeros(cap, F, N, dtype=torch.float16, device=device)
+    # the scan buffer can live in host memory (--buffer-cpu): 400k samples x 4 frames x 1081 beams fp16 = 3.5 GB, which
+    # does not fit beside a teacher run on one GPU; minibatches are copied over per step
+    bdev = torch.device("cpu") if a.buffer_cpu else device
+    b_scan = torch.zeros(cap, F, N, dtype=torch.float16, device=bdev, pin_memory=bool(a.buffer_cpu))
     b_ego = torch.zeros(cap, E, device=device); b_y = torch.zeros(cap, 2, device=device)
     b_w = torch.ones(cap, device=device)
     n_buf = 0; ptr = 0
@@ -130,7 +134,7 @@ def main():
                 ego_now = egov(obs)
                 s_act = student(obs["scan"][lid].float(), ego_now)
                 idx = torch.arange(ptr, ptr + B, device=device) % cap
-                b_scan[idx] = obs["scan"][lid].half(); b_ego[idx] = ego_now; b_y[idx] = y; b_w[idx] = w_s
+                b_scan[idx.to(bdev)] = obs["scan"][lid].half().to(bdev); b_ego[idx] = ego_now; b_y[idx] = y; b_w[idx] = w_s
                 ptr = (ptr + B) % cap; n_buf = min(cap, n_buf + B)
                 use_t = torch.rand(B, device=device) < beta
                 act = torch.where(use_t[:, None], y, s_act)
@@ -153,7 +157,7 @@ def main():
             perm = torch.randperm(n_buf, device=device)
             for i in range(0, n_buf, int(a.batch)):
                 j = perm[i:i + int(a.batch)]
-                pred = student(b_scan[j].float(), b_ego[j])
+                pred = student(b_scan[j.to(bdev)].to(device, non_blocking=True).float(), b_ego[j])
                 per = ((pred - b_y[j]) ** 2 * torch.tensor([2.0, 1.0], device=device)).mean(1)
                 loss = (per * b_w[j]).sum() / b_w[j].sum()
                 opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
