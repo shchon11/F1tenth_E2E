@@ -34,6 +34,7 @@ H = int(os.environ.get("H", "120"))
 KP = int(os.environ.get("KP", "20"))
 W0, GAP, VERIFY = int(os.environ.get("W0", "400")), int(os.environ.get("GAP", "200")), int(os.environ.get("VERIFY", "40"))
 PRICE = float(os.environ.get("PRICE", "80"))
+NOISE = os.environ.get("NOISE", "") == "1"     # drive with the policy's own exploration noise, the SAME draw in both twins
 SETS = [(int(c), float(d)) for c, d in (s.split(":") for s in
         os.environ.get("SETS", "4:0,4:0.1,4:0.2,1:0.1,0:0.1,2:0.1").split(","))]
 
@@ -80,11 +81,23 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
     pert = torch.zeros(Bl, env.act_dim, device=device)
     pert[torch.arange(Bl, device=device), col_of] = dlt_of
 
+    dead = [int(x) for x in str(getattr(a, "pg_dead_dims", "") or "").split(",") if x.strip()]
+    live_m = torch.ones(env.act_dim, dtype=torch.bool, device=device); live_m[dead] = False
+    sd = actor.log_std.detach().exp().float()
+    eps_now = [None]
+
     def mean_action(o, h):
+        """the mean action -- plus, with NOISE=1, sd x the step's shared draw on the live columns (PPO's rollout)"""
         c = cond_mod.mu_to_c(dial.value(), cspec).to(o["ego"].dtype)[lid]
         with torch.no_grad(), ac:
             d, hn = actor.step_dist(o["scan"][lid], o["ego"][lid], c, h)
-        return d.mean.float(), hn.float()
+        mu = d.mean.float()
+        if NOISE and eps_now[0] is not None:
+            mu = mu + torch.where(live_m, sd * eps_now[0], torch.zeros_like(mu))
+        return mu, hn.float()
+
+    def draw():
+        eps_now[0] = torch.randn(Bl, env.act_dim, device=device) if NOISE else None
 
     def objective(rew, info, touching_prev):
         comp = info["reward_components"]
@@ -94,6 +107,18 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
         onw = (-col / max(w_col, 1e-9)).clamp_min(0)
         r = rew[lid].float() - col - car - PRICE * onw - PRICE * onset.float()
         return r, touching, onw + onset.float(), info["progress"][lid].float()
+
+    from f1sim.learn.train_v2 import ValueNorm
+    vn = ValueNorm(0.99)
+    if extra.get("value_norm"):
+        vn.load_state_dict(extra["value_norm"])
+
+    def critic_value(e, o):
+        """the checkpoint's own critic, de-normalised: what GAE would read at this state"""
+        c = cond_mod.mu_to_c(dial.value(), cspec).to(o["ego"].dtype)[lid]
+        with torch.no_grad(), ac:
+            v_n, _ = model.critic(o["scan"][lid], o["ego"][lid], c, e.privileged_v2()[lid])
+        return vn.denormalize(v_n.float()).reshape(-1)
 
     def contacts(e, prev_car):
         """this step's contact onsets per learner row with their impact speeds (wall, prop, car; 0 = none)"""
@@ -129,6 +154,7 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
 
     def drive_master(n, o, h):
         for _ in range(n):
+            draw()
             mu, hn = mean_action(o, h)
             fullA[lid] = mu
             o, r, te, tr, i = env.step(fullA.clamp(-1, 1))
@@ -138,12 +164,13 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
     # the twin walks the warm-up in lockstep on A's command, so every lazily created piece of state exists in both
     s0 = _rng_state(); envB.reset(seed=int(a.seed)); _set_rng_state(s0)
     for _ in range(W0):
+        draw()
         mu, hn = mean_action(oA, h)
         fullA[lid] = mu
         (oA, rA, tA, trA, iA), _ = step_both(fullA, fullA)
         h = reset_hidden(hn, (tA | trA)[lid])
     rec = {k: [] for k in ("set", "dJ", "dprog", "dhits", "hitsA", "hitsB", "v0", "nearA", "nearB", "allA", "allB",
-                           "maxA", "maxB")}
+                           "maxA", "maxB", "hkA", "hkB")}
     for trial in range(TRIALS):
         n = sync(env, envB)
         if trial == 0:
@@ -153,6 +180,7 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
             print(f"right after the sync, {len(d0)} differing paths: {d0[:8]}", flush=True)
             hA_ = h.clone()
             for k in range(VERIFY):
+                draw()
                 mu, hn = mean_action(oA, hA_)
                 fullA[lid] = mu
                 (oA, rA, tA, trA, iA), (oB, rB, tB, trB, iB) = step_both(fullA, fullA)
@@ -175,7 +203,9 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
         reset_in = torch.zeros(Bl, dtype=torch.bool, device=device)
         pc = [torch.zeros(Bl, dtype=torch.bool, device=device) for _ in range(2)]
         NEAR = torch.zeros(2, Bl, device=device); ALL = torch.zeros(2, Bl, device=device); MX = torch.zeros(2, Bl, device=device)
+        HK = torch.zeros(2, Bl, 3, device=device)               # raw hard (>= 1.5 m/s) onsets per kind: wall, prop, car
         for k in range(H):
+            draw()                                           # one draw, both twins: common random numbers
             muA, hnA = mean_action(oA, hA)
             muB, hnB = mean_action(oB, hB)
             if k < KP:
@@ -188,15 +218,20 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
                 imps, pc[j] = contacts(env if j == 0 else envB, pc[j])
                 NEAR[j] += ((imps >= 1.0) & (imps < 1.5)).sum(1).float(); ALL[j] += (imps > 0).sum(1).float()
                 MX[j] = torch.maximum(MX[j], imps.max(1).values)
+                HK[j] += (imps >= 1.5).float()
             dA, dB = (tA | trA)[lid], (tB | trB)[lid]
             reset_in |= dA | dB
             tp = [tp[0] & ~dA, tp[1] & ~dB]
             pc = [pc[0] & ~dA, pc[1] & ~dB]
             hA, hB = reset_hidden(hnA, dA), reset_hidden(hnB, dB)
         ok = ~reset_in
+        vA_end, vB_end = critic_value(env, oA), critic_value(envB, oB)
+        for k_, v_ in (("dV", vA_end - vB_end),):
+            rec.setdefault(k_, []).append(v_[ok].cpu().numpy())
         for k_, v_ in (("set", set_of), ("dJ", J[0] - J[1]), ("dprog", P[0] - P[1]), ("dhits", N[0] - N[1]),
                        ("hitsA", N[0]), ("hitsB", N[1]), ("v0", v0), ("nearA", NEAR[0]), ("nearB", NEAR[1]),
-                       ("allA", ALL[0]), ("allB", ALL[1]), ("maxA", MX[0]), ("maxB", MX[1])):
+                       ("allA", ALL[0]), ("allB", ALL[1]), ("maxA", MX[0]), ("maxB", MX[1]),
+                       ("hkA", HK[0]), ("hkB", HK[1])):
             rec[k_].append(v_[ok].cpu().numpy())
         print(f"trial {trial}: {int(ok.sum())}/{Bl} rows without a reset in the branch", flush=True)
         h = hA
@@ -215,11 +250,17 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
         name = {4: "v1", 0: "k0", 1: "k1", 2: "k2", 3: "k3"}.get(c, str(c))
         print(f"{name} {d:+.2f} | {n} | {dj.mean():+.3f} +- {se:.3f} | {dj.std(ddof=1):.3f} | {dp.mean():+.4f} | {dp.std(ddof=1):.4f} | "
               f"{(dh != 0).mean() * 100:.1f} % | {slope:+.3f} | {snr:.2f}")
-        if c == 4 and d:
+        if "dV" in R:
+            dv = R["dV"][m]
+            print(f"   critic at the branch end: V(A) - V(B) {dv.mean():+.3f} +- {dv.std(ddof=1) / np.sqrt(n):.3f} "
+                  f"-> dJ + dV {(dj + dv).mean():+.3f} (what a critic-bootstrapped advantage would see)")
+        if d:
             fast = R["v0"][m] > 6.0
             if fast.sum() > 2:
                 print(f"   on straights (> 6 m/s, {fast.sum()} rows): dJ {dj[fast].mean():+.3f} +- "
-                      f"{dj[fast].std(ddof=1) / np.sqrt(fast.sum()):.3f}, dprog {dp[fast].mean():+.4f} m")
+                      f"{dj[fast].std(ddof=1) / np.sqrt(fast.sum()):.3f}, dprog {dp[fast].mean():+.4f} m"
+                      + (f", critic dV {R['dV'][m][fast].mean():+.3f} +- "
+                         f"{R['dV'][m][fast].std(ddof=1) / np.sqrt(fast.sum()):.3f}" if "dV" in R else ""))
     flip = R["dhits"] != 0
     if flip.any():
         lowA = R["hitsA"] < R["hitsB"]                                    # the twin with fewer hard hits ...
@@ -232,6 +273,9 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
               f"of 1.0-1.5 m/s in {near_low[f].mean() * 100:.0f} %, any contact in {all_low[f].mean() * 100:.0f} %, none in "
               f"{(~all_low[f]).mean() * 100:.0f} %; its fastest onset median {np.median(mx_low[f]):.2f} m/s vs the other twin's "
               f"{np.median(mx_high[f]):.2f} m/s")
+        extra_hits = np.abs(R["hkA"][f] - R["hkB"][f]).sum(0)          # the raw hard onsets the twins disagree on, per kind
+        print(f"   what the flipped hits were (raw hard onsets the twins disagree on): wall {extra_hits[0]:.0f}, "
+              f"prop {extra_hits[1]:.0f}, car {extra_hits[2]:.0f}")
         imp_all = np.concatenate([R["maxA"][R["allA"] > 0], R["maxB"][R["allB"] > 0]])
         if imp_all.size:
             q = np.percentile(imp_all, [10, 25, 50, 75, 90])
