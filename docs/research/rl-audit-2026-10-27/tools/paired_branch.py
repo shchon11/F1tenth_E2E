@@ -117,8 +117,11 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
         """the checkpoint's own critic, de-normalised: what GAE would read at this state"""
         c = cond_mod.mu_to_c(dial.value(), cspec).to(o["ego"].dtype)[lid]
         with torch.no_grad(), ac:
-            v_n, _ = model.critic(o["scan"][lid], o["ego"][lid], c, e.privileged_v2()[lid])
+            v_n, logit = model.critic(o["scan"][lid], o["ego"][lid], c, e.privileged_v2()[lid])
+        risk_now[0] = torch.sigmoid(logit.float()).reshape(-1) if logit is not None else torch.zeros(Bl, device=device)
         return vn.denormalize(v_n.float()).reshape(-1)
+
+    risk_now = [None]
 
     def contacts(e, prev_car):
         """this step's contact onsets per learner row with their impact speeds (wall, prop, car; 0 = none)"""
@@ -225,8 +228,9 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
             pc = [pc[0] & ~dA, pc[1] & ~dB]
             hA, hB = reset_hidden(hnA, dA), reset_hidden(hnB, dB)
         ok = ~reset_in
-        vA_end, vB_end = critic_value(env, oA), critic_value(envB, oB)
-        for k_, v_ in (("dV", vA_end - vB_end),):
+        vA_end = critic_value(env, oA); pA_end = risk_now[0]
+        vB_end = critic_value(envB, oB); pB_end = risk_now[0]
+        for k_, v_ in (("dV", vA_end - vB_end), ("dRisk", pA_end - pB_end), ("riskA", pA_end), ("riskB", pB_end)):
             rec.setdefault(k_, []).append(v_[ok].cpu().numpy())
         for k_, v_ in (("set", set_of), ("dJ", J[0] - J[1]), ("dprog", P[0] - P[1]), ("dhits", N[0] - N[1]),
                        ("hitsA", N[0]), ("hitsB", N[1]), ("v0", v0), ("nearA", NEAR[0]), ("nearB", NEAR[1]),
@@ -250,6 +254,10 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
         name = {4: "v1", 0: "k0", 1: "k1", 2: "k2", 3: "k3"}.get(c, str(c))
         print(f"{name} {d:+.2f} | {n} | {dj.mean():+.3f} +- {se:.3f} | {dj.std(ddof=1):.3f} | {dp.mean():+.4f} | {dp.std(ddof=1):.4f} | "
               f"{(dh != 0).mean() * 100:.1f} % | {slope:+.3f} | {snr:.2f}")
+        if "dRisk" in R:
+            dr = R["dRisk"][m]
+            print(f"   critic contact head at the branch end: P(A) - P(B) {dr.mean():+.4f} +- {dr.std(ddof=1) / np.sqrt(n):.4f} "
+                  f"(sd {dr.std(ddof=1):.4f}; x80 = {80 * dr.mean():+.3f} J)")
         if "dV" in R:
             dv = R["dV"][m]
             print(f"   critic at the branch end: V(A) - V(B) {dv.mean():+.3f} +- {dv.std(ddof=1) / np.sqrt(n):.3f} "
