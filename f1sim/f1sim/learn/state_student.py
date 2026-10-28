@@ -179,6 +179,11 @@ def evaluate_student():
     a = ap.parse_args(sys.argv[2:])
     device = torch.device(a.device)
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
+    # a state_rl teacher checkpoint ("model") drives on the same worlds with its own privileged observation: the
+    # teacher's ceiling next to its student's number separates "the teacher can't" from "the student didn't learn it"
+    is_teacher = "model" in ck
+    n_beams = int(ck["args"].get("beams", 36)) if is_teacher else int(ck["beams"])
+    frames = 1 if is_teacher else int(ck["frames"])
     from .. import Config, maps
     from ..gym_env import EnvConfig
     from .. import opponent_slots as opp_sl
@@ -188,11 +193,13 @@ def evaluate_student():
 
     def run(race_kind, seed, envs):
         trs, rls = common.load_tracks([state_rl.KOREA], racelines=race_kind is not None, **dict(limits, objective="min_time"))
-        cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = int(ck["beams"])
+        cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = n_beams
         cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0); cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
         e = dict(action_mode="direct", max_steps=int(a.steps), speed_cap=10.0, v_max_policy=10.0, collision_mode="soft",
                  contact_severity_min=1.5, stagger_first_episode=False, reward_collision=-1.0, reward_car_contact=1.0,
-                 spawn_runway=3.0, compile_tracker=False, obs_version=1, scan_stack=int(ck["frames"]), scan_stride=3)
+                 spawn_runway=3.0, compile_tracker=False, obs_version=1, scan_stack=frames, scan_stride=3)
+        if is_teacher:
+            e.update(priv_props=True, priv_time=True)
         if race_kind is not None:
             e.update(procedural_obstacles=1.0, procedural_density=1.5, procedural_max_props=10,
                      procedural_raceline_corridor="off", movable_obstacles=True, race_size=2, opponent="slots",
@@ -204,13 +211,32 @@ def evaluate_student():
         lid = env.learner_ids; B = int(lid.numel())
         keys = ck.get("ego_keys") or sorted(k for k in obs if k != "scan")
         egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in keys], 1)
-        st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device); st.load_state_dict(ck["student"]); st.eval()
+        if is_teacher:
+            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)))
+            last = torch.zeros(B, 2, device=device)
+            o_ = sobs(last)
+            tp = ActorCritic(o_.shape[1]).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
+            tn = RunningNorm(o_.shape[1], device); tn.load_state_dict(ck["norm"])
+        else:
+            st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device); st.load_state_dict(ck["student"]); st.eval()
         act_full = torch.zeros(env.B, env.act_dim, device=device)
         touching = torch.zeros(B, dtype=torch.bool, device=device)
         prog = 0.0; hits = {"벽": 0.0, "상자": 0.0, "차": 0.0}; laps = []
         R = int(ck["args"].get("repeat", 2))
+        # passing (1 vs 1): the along-track gap to the opponent, opponent ahead > 0; a pass = the gap crossing from
+        # (0, 4] to [-4, 0) with neither car reset; following = the gap in (0, 3]
+        pas = {"pass": 0, "passed": 0, "follow": 0, "n": 0}
+        opp_row = None
+        if env.M == 2:
+            opp_row = env.race[lid] * 2 + (1 - env.slot[lid])
+        trk = env.sim.track
+        gap_prev = None
         for t in range(int(a.steps) // R):
-            act_full[lid] = st(obs["scan"][lid].float(), egov(obs))
+            if is_teacher:
+                last = tp.pi(tn(sobs(last))).clamp(-1, 1)
+                act_full[lid] = last
+            else:
+                act_full[lid] = st(obs["scan"][lid].float(), egov(obs))
             for r in range(R):
                 obs, r_, te, trc, info = env.step(act_full)
                 res = env.last_result
@@ -221,23 +247,40 @@ def evaluate_student():
                 prog += float(info["progress"][lid].float().clamp_min(0).sum())
                 if info["lap_times"].numel():
                     laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
+                if opp_row is not None:
+                    L_ = trk.length[env.sim.tid[lid]]
+                    g = torch.remainder(res.s[opp_row] - res.s[lid] + L_ / 2, L_) - L_ / 2
+                    ok = ~((te | trc)[lid] | (te | trc)[opp_row])
+                    if gap_prev is not None:
+                        okp = ok & (gap_prev.abs() < 4) & (g.abs() < 4)
+                        pas["pass"] += int((okp & (gap_prev > 0) & (g < 0)).sum())
+                        pas["passed"] += int((okp & (gap_prev < 0) & (g > 0)).sum())
+                    pas["follow"] += int((ok & (g > 0) & (g <= 3.0)).sum()); pas["n"] += int(ok.sum())
+                    gap_prev = torch.where(ok, g, torch.full_like(g, 99.0))
         km = prog / 1000.0; secs = (int(a.steps) // R) * R * B * env.sim.control_dt
-        return km, prog / secs, hits, laps
+        return km, prog / secs, hits, laps, pas
 
-    km, v, h, laps = run(None, 81, 16)
+    km, v, h, laps, _ = run(None, 81, 16)
     solo_lap = float(np.median(laps)) if laps else float("nan")
-    tot = {"km": 0.0, "prog": 0.0, "벽": 0.0, "상자": 0.0, "차": 0.0}
+    tot = {"km": 0.0, "prog": 0.0, "벽": 0.0, "상자": 0.0, "차": 0.0, "pass": 0, "passed": 0, "follow": 0, "n": 0}
     for seed in (81, 82):
         for kind in ("forzaeth", "forzaeth_pred", "lane_switch", "interactive"):
-            km_r, v_r, h_r, _ = run(kind, seed, int(a.envs))
+            km_r, v_r, h_r, _, p_r = run(kind, seed, int(a.envs))
             tot["km"] += km_r; tot["prog"] += v_r * km_r
             for k in ("벽", "상자", "차"):
                 tot[k] += h_r[k]
+            for k in ("pass", "passed", "follow", "n"):
+                tot[k] += p_r[k]
+            print(f"   {kind} 시드 {seed}: {km_r:.1f} km, {v_r:.2f} m/s, 벽 {h_r['벽'] / max(km_r, 1e-9):.2f} 상자 "
+                  f"{h_r['상자'] / max(km_r, 1e-9):.2f} 차 {h_r['차'] / max(km_r, 1e-9):.2f} /km, 추월 {p_r['pass'] / max(km_r, 1e-9):.2f}/km, "
+                  f"추월당함 {p_r['passed'] / max(km_r, 1e-9):.2f}/km, 3 m 안 뒤따름 {p_r['follow'] / max(p_r['n'], 1) * 100:.0f} %", flush=True)
     vr = tot["prog"] / max(tot["km"], 1e-9)
     hk = {k: tot[k] / max(tot["km"], 1e-9) for k in ("벽", "상자", "차")}
-    print(f"[학생 평가] {os.path.basename(a.ckpt)} | 혼자 랩 중앙값 {solo_lap:.2f} s ({len(laps)}개), 혼자 강한 충돌 "
+    who = "선생 평가" if is_teacher else "학생 평가"
+    print(f"[{who}] {os.path.basename(a.ckpt)} | 혼자 랩 중앙값 {solo_lap:.2f} s ({len(laps)}개), 혼자 강한 충돌 "
           f"{sum(h.values()) / max(km, 1e-9):.2f}/km | 경주 {tot['km']:.1f} km, 속도 {vr:.2f} m/s, 강한 충돌 {sum(hk.values()):.2f}/km "
-          f"(벽 {hk['벽']:.2f} / 상자 {hk['상자']:.2f} / 차 {hk['차']:.2f})", flush=True)
+          f"(벽 {hk['벽']:.2f} / 상자 {hk['상자']:.2f} / 차 {hk['차']:.2f}) | 추월 {tot['pass'] / max(tot['km'], 1e-9):.2f}/km, "
+          f"추월당함 {tot['passed'] / max(tot['km'], 1e-9):.2f}/km, 3 m 안 뒤따름 {tot['follow'] / max(tot['n'], 1) * 100:.0f} %", flush=True)
 
 
 if __name__ == "__main__":

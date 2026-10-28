@@ -132,7 +132,9 @@ def main():
         xn = x.detach()[0]
         sal = {k: (float((g_s[idx] * xn[idx]).abs().sum()), float((g_v[idx] * xn[idx]).abs().sum())) for k, idx in groups.items()}
         v = float(model.v(xn[None]).squeeze()) * float(ret_rms.var.sqrt() + 1e-6)
-        return a_.detach()[0].clamp(-1, 1), v, sal
+        # the hit head (P(a hard hit within 20 decisions)); untrained (no --hit-head) checkpoints give noise here
+        ph = float(torch.sigmoid(model.value_and_hit(xn[None])[1]).squeeze())
+        return a_.detach()[0].clamp(-1, 1), v, sal, ph
 
     ret_rms = RunningNorm(1, device); ret_rms.load_state_dict(ck["ret_rms"])
     touching = torch.zeros(B, dtype=torch.bool, device=device)
@@ -146,6 +148,12 @@ def main():
         enc_hit = torch.zeros(env.B, po.C, dtype=torch.bool, device=device)
         enc_log = []                     # (extent, speed at closest, hit) per finished encounter
         enc_vmax = torch.zeros(env.B, po.C, device=device)
+        enc_gmin = torch.full((env.B, po.C), 9.0, device=device)     # the closest the car's centre came to the edge
+        # was the prop shoved before the car reached it (by anyone: in a race the props are shared by the race's cars)?
+        p_moved = torch.zeros(env.B, po.C, dtype=torch.bool, device=device)
+        enc_moved = torch.zeros(env.B, po.C, dtype=torch.bool, device=device)
+        enc_vel = torch.zeros(env.B, po.C, device=device)             # the prop's own speed while the car was near
+        enc_od = torch.full((env.B, po.C), 99.0, device=device)       # the nearest opponent's distance during it
     tracks = env.sim.track.tracks
     for t in range(int(a.steps) // int(a.repeat)):
         ohist = torch.roll(ohist, -1, 0); ohist[-1] = o
@@ -174,8 +182,22 @@ def main():
                 near = live & (gap < 0.6)
                 lrow = torch.zeros(env.B, dtype=torch.bool, device=device); lrow[lid] = True
                 near = near & lrow[:, None]
+                pv_ = po.p_vel.norm(dim=-1)
+                new_enc = near & ~enc_seen
+                enc_moved |= new_enc & p_moved                                 # shoved before this encounter began
+                p_moved |= live & (pv_ > 0.02)
+                enc_vel = torch.where(near, torch.maximum(enc_vel, pv_), enc_vel)
+                if env.M > 1:
+                    oth = torch.full((env.B,), 99.0, device=device)
+                    rr = torch.arange(env.B, device=device)
+                    for k_ in range(env.M):
+                        q_ = (rr // env.M) * env.M + k_
+                        dq = (st[q_, :2] - st[:, :2]).norm(dim=1)
+                        oth = torch.where(q_ != rr, torch.minimum(oth, dq), oth)
+                    enc_od = torch.where(near, torch.minimum(enc_od, oth[:, None].expand_as(enc_od)), enc_od)
                 enc_seen |= near
                 enc_vmax = torch.where(near, torch.maximum(enc_vmax, st[:, 3:4].expand_as(enc_vmax)), enc_vmax)
+                enc_gmin = torch.where(near, torch.minimum(enc_gmin, gap), enc_gmin)
                 hp = torch.zeros(env.B, dtype=torch.bool, device=device); hp[lid] = hard_p
                 jn = torch.where(live, gap, torch.full_like(gap, 1e9)).argmin(1)
                 hitmask = torch.zeros_like(enc_hit); hitmask[torch.arange(env.B, device=device), jn] = hp
@@ -186,9 +208,22 @@ def main():
                 fin = enc_seen & (behind | dn[:, None] | ~live)
                 if fin.any():
                     ii = fin.nonzero()
-                    for b_, c_i in ii.tolist():
-                        enc_log.append((float(ext_all[b_, c_i]), float(enc_vmax[b_, c_i]), bool(enc_hit[b_, c_i])))
+                    # where the prop sits across the track: |lateral| / half width at its arc position (1 = at the wall)
+                    trk_ = env.sim.track; tid_f = env.sim.tid[ii[:, 0]]
+                    pc_f = po.p_poses[ii[:, 0], ii[:, 1], :2]
+                    s_f, lat_f, _ = trk_.project(pc_f, tid_f)
+                    xy_f, _ = trk_.pose_at_s(s_f, tid_f)
+                    half_f = trk_.sample_edt(xy_f, tid_f).clamp_min(0.05)
+                    side_f = (lat_f.abs() / half_f).tolist()
+                    for k_, (b_, c_i) in enumerate(ii.tolist()):
+                        enc_log.append((float(ext_all[b_, c_i]), float(enc_vmax[b_, c_i]), bool(enc_hit[b_, c_i]),
+                                        float(side_f[k_]), float(enc_gmin[b_, c_i]), bool(enc_moved[b_, c_i]),
+                                        float(enc_vel[b_, c_i]), float(enc_od[b_, c_i])))
                     enc_seen &= ~fin; enc_hit &= ~fin; enc_vmax = torch.where(fin, torch.zeros_like(enc_vmax), enc_vmax)
+                    enc_gmin = torch.where(fin, torch.full_like(enc_gmin, 9.0), enc_gmin)
+                    enc_moved &= ~fin; enc_vel = torch.where(fin, torch.zeros_like(enc_vel), enc_vel)
+                    enc_od = torch.where(fin, torch.full_like(enc_od, 99.0), enc_od)
+                p_moved &= ~dn[:, None]
             hard_c = c_on & (res.car_impact[lid] >= 1.5) if res.car_impact is not None else c_on
             for kind, mask, impv in (("벽", hard_w, imp[:, 0]), ("상자", hard_p, imp[:, 1]),
                                      ("차", hard_c, res.car_impact[lid] if res.car_impact is not None else imp[:, 2])):
@@ -196,28 +231,48 @@ def main():
                     row = int(lid[i])
                     n_ep = int(min(H, int(env.ep_step[row]) + 1))          # only this episode's own steps
                     h = hist[H - n_ep:, row].cpu().numpy()
-                    od = float("nan")
+                    od = float("nan"); geo = {}
                     if env.M > 1:
                         race = row // env.M
                         others = [q for q in range(race * env.M, race * env.M + env.M) if q != row]
                         od = float(min((st[q, :2] - st[row, :2]).norm() for q in others))
+                        if kind == "차":
+                            # who ran into whom: the nearest opponent's position in the ego frame and the closing speed
+                            # along the ego heading; and 0.5 s earlier, who was ahead along the track
+                            q = min(others, key=lambda q_: float((st[q_, :2] - st[row, :2]).norm()))
+                            ce, se = math.cos(float(st[row, 2])), math.sin(float(st[row, 2]))
+                            dxq, dyq = float(st[q, 0] - st[row, 0]), float(st[q, 1] - st[row, 1])
+                            fx, fy = dxq * ce + dyq * se, -dxq * se + dyq * ce
+                            vq = float(st[q, 3]); dyaw_q = float(st[q, 2] - st[row, 2])
+                            v_rel = float(st[row, 3]) - vq * math.cos(dyaw_q)          # > 0: the ego closes from behind
+                            h_q = hist[-min(20, n_ep):, q].cpu().numpy(); h_e = hist[-min(20, n_ep):, row].cpu().numpy()
+                            s_e0, _, _ = env.sim.track.project(torch.tensor(h_e[:1, :2], device=device), env.sim.tid[row:row + 1])
+                            s_q0, _, _ = env.sim.track.project(torch.tensor(h_q[:1, :2], device=device), env.sim.tid[row:row + 1])
+                            L_ = float(env.sim.track.length[env.sim.tid[row]]) if hasattr(env.sim.track, "length") else 1e9
+                            ds0 = float(s_q0[0] - s_e0[0]); ds0 = (ds0 + L_ / 2) % L_ - L_ / 2 if L_ < 1e8 else ds0
+                            # the opponent's lateral motion over the last 0.5 s (in the ego's frame at the hit)
+                            lat_q = [(-(x_ - float(st[row, 0])) * se + (y_ - float(st[row, 1])) * ce) for x_, y_ in h_q[:, :2]]
+                            geo = {"opp_fx": fx, "opp_fy": fy, "closing": v_rel, "opp_speed": vq,
+                                   "opp_ahead_0.5s": ds0, "opp_lat_move_0.5s": float(lat_q[-1] - lat_q[0]) if len(lat_q) > 1 else 0.0}
                     ev = {"step": t * int(a.repeat) + r, "row": row, "kind": kind, "impact": float(impv[i]),
-                          "ep_step": int(env.ep_step[row]), "opp_dist": od,
+                          "ep_step": int(env.ep_step[row]), "opp_dist": od, **geo,
                           "speed": float(st[row, 3]), "xy": [float(st[row, 0]), float(st[row, 1])], "yaw": float(st[row, 2]),
                           "traj": h[:, :4].tolist(), "steer_cmd_0.5s": h[-min(20, len(h)):, 4].tolist(), "speed_cmd_0.5s": h[-min(20, len(h)):, 5].tolist()}
                     # the policy's response 0.5 s before the hit (10 decisions back), with the props as seen and erased
                     n_dec = int(min(HD, int(env.ep_step[row]) // int(a.repeat)))
                     if n_dec >= 11:
                         x0 = ohist[-11, i][None].clone()
-                        a_full, v_full, sal = respond(x0)
+                        a_full, v_full, sal, _ = respond(x0)
                         x_np = x0.clone(); x_np[0, 33:45] = 0.0
-                        a_np, v_np, _ = respond(x_np)
-                        vals = [respond(ohist[-k, i][None].clone())[1] for k in (min(n_dec, 40), 21, 11, 1)]
+                        a_np, v_np, _, _ = respond(x_np)
+                        rr = [respond(ohist[-k, i][None].clone()) for k in (min(n_dec, 40), 21, 11, 1)]
+                        vals = [r_[1] for r_ in rr]; phs = [r_[3] for r_ in rr]
                         ev.update(resp={"steer_deg": float(a_full[0]) * math.degrees(float(env.s_max)),
                                         "speed_ms": (float(a_full[1]) + 1) / 2 * float(env.ecfg.v_max_policy),
                                         "steer_deg_noprops": float(a_np[0]) * math.degrees(float(env.s_max)),
                                         "speed_ms_noprops": (float(a_np[1]) + 1) / 2 * float(env.ecfg.v_max_policy),
-                                        "V_2s_1s_05s_0s": vals, "sal": sal, "props_seen": int(float(x0[0, 33]) > 0.5)})
+                                        "V_2s_1s_05s_0s": vals, "Phit_2s_1s_05s_0s": phs, "sal": sal,
+                                        "props_seen": int(float(x0[0, 33]) > 0.5)})
                         probe.append(ev["resp"])
                     # the nearest live prop and the room beside it: track width at its arc position (2 x the centerline's
                     # distance to the wall) minus the prop's own width across the track
@@ -255,7 +310,8 @@ def main():
                             rp = ev["resp"]
                             title += (f"\n0.5초 전: 상자 보임 {'예' if rp['props_seen'] else '아니오'} | 조향 {rp['steer_deg']:+.0f}도 / 상자 지우면 "
                                       f"{rp['steer_deg_noprops']:+.0f}도, 속도 {rp['speed_ms']:.1f} / {rp['speed_ms_noprops']:.1f} m/s"
-                                      f"\n가치 2s/1s/0.5s/0s 전: " + " / ".join(f"{x:.0f}" for x in rp["V_2s_1s_05s_0s"]))
+                                      f"\n가치 2s/1s/0.5s/0s 전: " + " / ".join(f"{x:.0f}" for x in rp["V_2s_1s_05s_0s"])
+                                      + " | 충돌 예측: " + " / ".join(f"{x:.2f}" for x in rp["Phit_2s_1s_05s_0s"]))
                         draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title)
                         n_img += 1
         o = obs_fn(act)
@@ -268,6 +324,8 @@ def main():
               f"{np.median(ds):.1f}도 (90 % {np.percentile(ds, 90):.1f}), 속도 변화 중앙값 {np.median(dv):+.2f} m/s "
               f"(상자가 보일 때 {np.median(dv[seen > 0]) if (seen > 0).any() else float('nan'):+.2f})", flush=True)
         print(f"[반응] 비평가 가치 2초/1초/0.5초/충돌 시점: " + " / ".join(f"{x:.1f}" for x in V.mean(0)), flush=True)
+        PH = np.array([p_["Phit_2s_1s_05s_0s"] for p_ in probe])
+        print(f"[반응] 충돌 예측 머리 P(20결정 안 충돌) 2초/1초/0.5초/충돌 시점 중앙값: " + " / ".join(f"{x:.2f}" for x in np.median(PH, 0)), flush=True)
         tot_s = {k: np.mean([p_["sal"][k][0] for p_ in probe]) for k in groups}
         tot_v = {k: np.mean([p_["sal"][k][1] for p_ in probe]) for k in groups}
         ss, sv = sum(tot_s.values()) + 1e-9, sum(tot_v.values()) + 1e-9
@@ -290,6 +348,25 @@ def main():
             m = (E_[:, 1] >= lo) & (E_[:, 1] < hi)
             if m.sum():
                 print(f"   지날 때 속도 {lo}~{hi} m/s: {m.sum()}번, 충돌률 {E_[m, 2].mean() * 100:.1f} %", flush=True)
+        for lo, hi, nm in ((0, 0.4, "가운데"), (0.4, 0.7, "중간"), (0.7, 9, "벽 쪽")):
+            m = (E_[:, 3] >= lo) & (E_[:, 3] < hi)
+            if m.sum():
+                mi = m & (E_[:, 2] < 0.5)
+                print(f"   상자 위치 {nm}(옆 위치/반폭 {lo}~{hi}): {m.sum()}번 ({m.mean() * 100:.0f} %), 충돌률 {E_[m, 2].mean() * 100:.1f} %, "
+                      f"안 박은 만남의 최소 간격 중앙 {np.median(E_[mi, 4]) if mi.sum() else float('nan'):.2f} m", flush=True)
+        mv = E_[:, 5] > 0.5; mvn = E_[:, 6] > 0.05
+        print(f"   이미 밀린 상자: {mv.sum()}번 ({mv.mean() * 100:.0f} %), 충돌률 {E_[mv, 2].mean() * 100 if mv.sum() else float('nan'):.1f} % | "
+              f"안 밀린 상자: 충돌률 {E_[~mv, 2].mean() * 100:.1f} % | 지날 때 상자가 움직이는 중(>0.05 m/s): {mvn.sum()}번, "
+              f"충돌률 {E_[mvn, 2].mean() * 100 if mvn.sum() else float('nan'):.1f} %", flush=True)
+        for lo, hi in ((0, 1.5), (1.5, 4), (4, 999)):
+            m = (E_[:, 7] >= lo) & (E_[:, 7] < hi)
+            if m.sum() and (E_[:, 7] < 99).any():
+                print(f"   지날 때 상대와 거리 {lo}~{hi} m: {m.sum()}번, 충돌률 {E_[m, 2].mean() * 100:.1f} %", flush=True)
+        fast = E_[:, 1] >= 7
+        for lo, hi, nm in ((0, 0.7, "가운데~중간"), (0.7, 9, "벽 쪽")):
+            m = fast & (E_[:, 3] >= lo) & (E_[:, 3] < hi)
+            if m.sum():
+                print(f"   7 m/s 이상 + {nm}: {m.sum()}번, 충돌률 {E_[m, 2].mean() * 100:.1f} %", flush=True)
     od = np.array([e["opp_dist"] for e in events if e.get("opp_dist") == e.get("opp_dist")])
     if od.size:
         for kind in ("벽", "상자", "차"):
@@ -297,6 +374,21 @@ def main():
             if k_.size:
                 print(f"[상대 거리] {kind} 충돌 {k_.size}건: 상대가 1 m 안 {(k_ < 1).mean() * 100:.0f} %, 1~3 m {((k_ >= 1) & (k_ < 3)).mean() * 100:.0f} %, "
                       f"3 m 밖 {(k_ >= 3).mean() * 100:.0f} %", flush=True)
+        cc = [e for e in events if e["kind"] == "차" and "opp_fx" in e]
+        if cc:
+            fx = np.array([e["opp_fx"] for e in cc]); fy = np.array([e["opp_fy"] for e in cc])
+            cl = np.array([e["closing"] for e in cc]); ah = np.array([e["opp_ahead_0.5s"] for e in cc])
+            lm = np.array([e["opp_lat_move_0.5s"] for e in cc]); vq = np.array([e["opp_speed"] for e in cc])
+            front = (fx > 0.15) & (np.abs(fy) < np.abs(fx) * 1.5)
+            rear = (fx < -0.15) & (np.abs(fy) < np.abs(fx) * 1.5)
+            side = ~front & ~rear
+            print(f"[차 충돌 {len(cc)}건] 상대가 앞 {front.mean() * 100:.0f} % / 옆 {side.mean() * 100:.0f} % / 뒤 {rear.mean() * 100:.0f} % | "
+                  f"내가 다가가는 속도 중앙 {np.median(cl):.2f} m/s | 0.5초 전 상대가 앞(트랙 따라) {(ah > 0).mean() * 100:.0f} % | "
+                  f"상대 속도 중앙 {np.median(vq):.1f} m/s, 0.5초간 상대 옆 이동 |중앙| {np.median(np.abs(lm)):.2f} m", flush=True)
+            for nm, m in (("앞", front), ("옆", side), ("뒤", rear)):
+                if m.sum():
+                    print(f"   상대 {nm} {m.sum()}건: 다가가는 속도 중앙 {np.median(cl[m]):.2f} m/s, 상대 속도 중앙 {np.median(vq[m]):.1f} m/s, "
+                          f"0.5초간 상대 옆 이동 |중앙| {np.median(np.abs(lm[m])):.2f} m, 0.5초 전 상대가 앞 {(ah[m] > 0).mean() * 100:.0f} %", flush=True)
         t_ = np.array([e["ep_step"] / 40 for e in events])
         print(f"[출발 후] 1초 안 {(t_ < 1).mean() * 100:.0f} %, 1~3초 {((t_ >= 1) & (t_ < 3)).mean() * 100:.0f} %, 3초 뒤 {(t_ >= 3).mean() * 100:.0f} %", flush=True)
     by = {}

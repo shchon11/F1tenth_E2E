@@ -165,6 +165,12 @@ def train(a):
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     obs_fn = StateObs(env, scan=bool(a.scan_obs))
+    if float(a.level_replay) > 0:
+        # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
+        # advantages were largest -- the situations the policy gets most wrong come back more often
+        from .level_replay import LevelReplay
+        env.level_replay = LevelReplay(env.B // env.M, p_replay=float(a.level_replay), size=int(a.level_replay_size),
+                                       seed=int(a.seed))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids
     B = int(lid.numel())
@@ -200,6 +206,7 @@ def train(a):
     log = open(os.path.join(out, "progress.jsonl"), "a")
     T, R = int(a.horizon), int(a.repeat)
     touching = torch.zeros(B, dtype=torch.bool, device=device)
+    eps_n = torch.randn(B, 2, device=device)                       # the correlated exploration state (--noise-corr)
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
           f"롤아웃 {T}결정 = {T * R} 스텝, 가격 {a.price:g}", flush=True)
     t0 = time.time()
@@ -215,6 +222,7 @@ def train(a):
         blp = torch.zeros(T, B, device=device); bv = torch.zeros(T + 1, B, device=device)
         br = torch.zeros(T, B, device=device); bd = torch.zeros(T, B, device=device)
         bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
+        blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = 0.0; laps = []
         tr0 = time.time()
         with torch.no_grad():
@@ -222,8 +230,19 @@ def train(a):
                 norm.update(o)
                 on = norm(o)
                 dist = model.dist(on)
-                act = dist.sample()
+                if float(a.noise_corr) > 0:
+                    # temporally correlated exploration (AR(1), marginal N(0, 1)): white noise at 20 Hz averages out within
+                    # a second, so a sampled deviation never becomes a maneuver (brake 0.3 s earlier, hold a gap, move the
+                    # line for a second) whose consequence the advantage could see; held noise does. PPO's per-decision
+                    # ratio uses the Gaussian marginal, as gSDE does (Raffin et al. 2021)
+                    al = float(a.noise_corr)
+                    eps_n = al * eps_n + math.sqrt(1.0 - al * al) * torch.randn_like(eps_n)
+                    act = dist.mean + dist.stddev * eps_n
+                else:
+                    act = dist.sample()
                 bo[t] = on; ba[t] = act; blp[t] = dist.log_prob(act).sum(1)
+                if blv is not None:
+                    blv[t] = env.level_seed[lid]
                 v_t, hl_t = model.value_and_hit(on)
                 bv[t] = v_t * (ret_rms.var.sqrt() + 1e-6); bp[t] = torch.sigmoid(hl_t)
                 rew = torch.zeros(B, device=device); done = torch.zeros(B, dtype=torch.bool, device=device)
@@ -251,6 +270,8 @@ def train(a):
                         laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
                 br[t] = rew; bd[t] = done.float(); bh[t] = hit_now.float()
                 last_a = torch.where(done[:, None], torch.zeros_like(act), act.clamp(-1, 1))
+                if float(a.noise_corr) > 0:
+                    eps_n = torch.where(done[:, None], torch.randn_like(eps_n), eps_n)
                 o = obs_fn(last_a)
             v_T, hl_T = model.value_and_hit(norm(o))
             bv[T] = v_T * (ret_rms.var.sqrt() + 1e-6); bp[T] = torch.sigmoid(hl_T)
@@ -279,6 +300,17 @@ def train(a):
                 last = delta + a.gamma * a.lam * nd * last
                 adv[t] = last
             ret = adv + bv[:T]
+            if blv is not None:
+                seat = env.race[lid].cpu().numpy()
+                lv = blv.cpu().numpy(); aa = adv.abs().float().cpu().numpy()
+                seat_tb = np.broadcast_to(seat[None, :], lv.shape)
+                okl = lv >= 0
+                keys = np.stack([seat_tb[okl], lv[okl]], 1)
+                if keys.shape[0]:
+                    uk, inv = np.unique(keys, axis=0, return_inverse=True)
+                    sums = np.bincount(inv.ravel(), weights=aa[okl]); cnts = np.bincount(inv.ravel())
+                    for (st_, sd_), sm_, cn_ in zip(uk, sums, cnts):
+                        env.level_replay.accumulate(int(st_), int(sd_), float(sm_), int(cn_))
             ret_rms.update(ret.reshape(-1, 1))
             ret_n = ret / (ret_rms.var.sqrt() + 1e-6)
             adv_n = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -404,6 +436,10 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--noise-corr", type=float, default=0.0,
+                    help="AR(1) correlation of the exploration noise per decision (0 = white; 0.9 = ~0.5 s at 20 Hz)")
+    ap.add_argument("--level-replay", type=float, default=0.0, help="prioritized level replay probability (0 = off)")
+    ap.add_argument("--level-replay-size", type=int, default=24)
     ap.add_argument("--prop-density", type=float, default=1.5, help="props / stages: procedural_density (training world)")
     ap.add_argument("--prop-max", type=int, default=18, help="props / stages: procedural_max_props")
     ap.add_argument("--scan-obs", type=int, default=0, help="1: append the noise-free scan (--beams beams) to the observation")
