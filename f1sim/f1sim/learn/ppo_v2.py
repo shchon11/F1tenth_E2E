@@ -559,6 +559,25 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     if dead:
         print(f"policy gradient on action columns {torch.nonzero(live).flatten().tolist()} only; {dead} driven at the mean",
               flush=True)
+    twin = None
+    if float(getattr(a, "twin_progress", 0.0) or 0.0) > 0:
+        # `--twin-progress`: a master env and its twin, the same world as `env` (learn.twin_progress). The dial must be
+        # held: the twins read the policy's condition from it and a drawn dial would differ between the worlds.
+        if held is None:
+            raise SystemExit("--twin-progress needs --dial-constant (the twins condition the policy on the held dial)")
+        from . import common as common_mod
+        from .twin_progress import TwinProgress
+        tw_m = common_mod.make_twin(env, int(a.twin_envs)); tw_t = common_mod.make_twin(env, int(a.twin_envs))
+        if a.sim_backend == "graphs":
+            from .graph_runtime import prepare_graph_runtime
+            prepare_graph_runtime(tw_m, log=lambda _t: None); prepare_graph_runtime(tw_t, log=lambda _t: None)
+        dial_tw = cond_mod.ConstantDial(tw_m, held)
+        twin = TwinProgress(tw_m, tw_t, model.actor, cond=lambda: cond_mod.mu_to_c(dial_tw.value(), cspec),
+                            live=torch.nonzero(live).flatten().tolist(),
+                            deltas=[float(x) for x in str(a.twin_deltas).split(",")], h=int(a.twin_h), kp=int(a.twin_kp),
+                            amp=a.amp, seed=int(a.seed) + 7)
+        print(f"twin progress: x{a.twin_progress:g}, 2 x {tw_m.B} rows ({twin.B} learner rows), branch {a.twin_h} steps, "
+              f"perturbation {a.twin_kp} steps, deltas {a.twin_deltas}", flush=True)
     eps_v = None
     noise_fresh = torch.ones(B, dtype=torch.bool, device=device)
     act_full = torch.zeros(env.B, env.act_dim, device=device)
@@ -797,6 +816,7 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                     sums = np.bincount(inv.ravel(), weights=aa[ok]); cnts = np.bincount(inv.ravel())
                     for (st_, sd_), sm_, cn_ in zip(uk, sums, cnts):
                         env.level_replay.accumulate(int(st_), int(sd_), float(sm_), int(cn_))
+        twin_stats = twin.branch() if twin is not None else None
         t_roll = tm.lap()
         # ------------------------------------------------------------ update
         model.train()
@@ -927,6 +947,12 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                                        f"bce {float(bce):.4g} b8 {float(b8):.4g})")
                 if accum > 1:
                     loss = loss * (w.sum().clamp_min(1.0) / w_group)
+                if twin is not None and last:
+                    # once per optimizer step: d(dense reward per step)/d(mean action) from the twins, over PPO's
+                    # advantage spread -- the normalised surrogate's units, so the sum estimates the objective's gradient
+                    tw_loss = twin.loss() * (float(a.twin_progress) / float(adv_std.clamp_min(1e-6)))
+                    loss = loss + on_actor * tw_loss
+                    stats.setdefault("twin_loss", []).append(float(tw_loss.detach()))
                 if first:
                     opt.zero_grad()
                 loss.backward()
@@ -989,6 +1015,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 log["value_norm/popart_max_dev"], log["value_norm/popart_value_scale"] = popart
             ls = model.actor.log_std.detach()
             log["policy/log_std_kappa"] = float(ls[:4].mean()); log["policy/log_std_speed"] = float(ls[4:].mean())
+            if twin_stats is not None:
+                log.update({f"twin/{k}": v for k, v in twin_stats.items()})
             if contact_pot > 0:
                 log["shaping/contact_potential_abs"] = pot_stat
             log.update({f"reward/{k}_per_step": float((buf_comp[:, :, i_] * buf_mask).sum() / n_pol)

@@ -33,7 +33,7 @@ from f1sim.learn.memory import reset_hidden  # noqa: E402
 from f1sim.learn.model import load_checkpoint  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twin_sync import sync  # noqa: E402
+from f1sim.learn.twin_sync import sync  # noqa: E402
 
 UPDATES = int(os.environ.get("UPDATES", "400"))
 H = int(os.environ.get("H", "120"))

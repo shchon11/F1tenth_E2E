@@ -469,6 +469,18 @@ def main():
                          "frame) to the CRITIC's privileged vector (EnvConfig.priv_props). An --init critic without them is "
                          "widened with zero weights, so it starts as it was. Why: the critic pre-priced ~30 %% of a hard "
                          "wall/prop hit and saw no prop (rl-audit 2026-10-28)")
+    ap.add_argument("--twin-progress", type=float, default=0.0, metavar="B",
+                    help="v2: add the progress the mean action is worth, measured in a pair of twin worlds beside the "
+                         "training env (learn.twin_progress): B x the deterministic-policy-gradient term over PPO's "
+                         "advantage spread, so B 1 puts it in the objective's own units. The twins measure the dense "
+                         "terms (progress, steer, wrong-way), PPO keeps pricing hits. Why: PPO cannot see that term -- "
+                         "2 M samples give t ~0 on straights where twins resolve it from ~17 k (rl-audit 2026-10-28). "
+                         "0 = off")
+    ap.add_argument("--twin-envs", type=int, default=512, help="--twin-progress: rows of EACH twin env")
+    ap.add_argument("--twin-h", type=int, default=120, help="--twin-progress: steps a branch is followed")
+    ap.add_argument("--twin-kp", type=int, default=10, help="--twin-progress: steps the perturbation lasts")
+    ap.add_argument("--twin-deltas", default="0.03,0.1,0.15,0.1",
+                    help="--twin-progress: perturbation sd per live action column (kappa0..2, v1 under MAP)")
     ap.add_argument("--plan-speed-scale", type=float, default=1.0, metavar="X",
                     help="the venue's speed knob (EnvConfig.plan_speed_scale): the learner's plan speeds x X before the "
                          "follower, the policy unaware. 1 = off (every run). For measuring a frozen policy's objective "

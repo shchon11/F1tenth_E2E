@@ -27,7 +27,7 @@ from f1sim.learn.memory import reset_hidden  # noqa: E402
 from f1sim.learn.model import load_checkpoint  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twin_sync import diff, sync  # noqa: E402
+from f1sim.learn.twin_sync import diff, sync  # noqa: E402
 
 TRIALS = int(os.environ.get("TRIALS", "8"))
 H = int(os.environ.get("H", "120"))
@@ -138,7 +138,7 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
         return outA, outB
 
     if os.environ.get("DIAG"):
-        from twin_sync import covered, reach
+        from f1sim.learn.twin_sync import covered, reach
         allA, cov = reach(env), covered(env, envB)
         miss = sorted((v for k, v in allA.items() if k not in cov), key=lambda x: x[0])
         print(f"DIAG: {len(allA)} tensors reachable from env A, {len(cov)} visited by sync, {len(miss)} missed:", flush=True)

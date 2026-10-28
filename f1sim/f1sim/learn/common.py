@@ -308,7 +308,21 @@ def make_env(tracks, num_envs, device, env_cfg: Optional[EnvConfig] = None, cfg:
         attach(env, device=env.device)
     if getattr(env, "external_slot_rows", None):
         env.set_external_drivers(external_drivers(env))
+    # the call, so `make_twin` can build the same world again (twin worlds, `learn.twin_progress`)
+    env._make_call = dict(tracks=tracks, device=device, env_cfg=env_cfg, cfg=cfg, seed=seed, rls=rls,
+                          teacher_grip=teacher_grip, teacher_recover_time=teacher_recover_time,
+                          opponent_pool=opponent_pool, teacher_limits=teacher_limits)
     return env
+
+
+def make_twin(env, num_envs: int):
+    """Another env of the same world as `env` (its own `make_env` call again, with `num_envs` rows). It shares the
+    configuration objects, so a runtime change to `env.ecfg` (a speed-cap curriculum) reaches it too."""
+    call = getattr(env, "_make_call", None)
+    if call is None:
+        raise RuntimeError("this env was not built by common.make_env: no call to repeat")
+    c = dict(call)
+    return make_env(c.pop("tracks"), int(num_envs), c.pop("device"), c.pop("env_cfg"), cfg=c.pop("cfg"), **c)
 
 
 def external_drivers(env) -> dict:
