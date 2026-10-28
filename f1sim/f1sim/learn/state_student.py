@@ -68,10 +68,26 @@ def main():
     env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=3, scan_stride=3))
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env)
+    ck = torch.load(a.teacher, map_location=device, weights_only=False)
+    t_scan = bool(ck["args"].get("scan_obs", 0)); t_beams = int(ck["args"].get("beams", 36))
+    base_obs = StateObs(env)
     obs, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
-    ck = torch.load(a.teacher, map_location=device, weights_only=False)
+    ang_s = env.sim.lidar.angles.float()                                   # the student's beams
+    ang_t = torch.linspace(float(ang_s[0]), float(ang_s[-1]), t_beams, device=device)   # the teacher's (same field of view)
+
+    def obs_fn(last):
+        """the teacher's observation: the state block, plus its noise-free scan at ITS beams, interpolated from this
+        env's full one (the teacher was trained with `t_beams` beams over the same field of view)"""
+        o_ = base_obs(last)
+        if not t_scan:
+            return o_
+        sc = env.last_result.scan_true[lid].float()
+        pos = (ang_t - ang_s[0]) / (ang_s[-1] - ang_s[0]) * (ang_s.numel() - 1)
+        i0 = pos.floor().long().clamp(0, ang_s.numel() - 2); w = (pos - i0.float())[None, :]
+        st_ = sc[:, i0] * (1 - w) + sc[:, i0 + 1] * w
+        return torch.cat([o_, (st_ / 10.0).clamp(0.0, 1.0)], 1)
+
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
     teacher = ActorCritic(o.shape[1]).to(device); teacher.load_state_dict(ck["model"], strict=False); teacher.eval()
