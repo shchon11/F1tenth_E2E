@@ -37,11 +37,11 @@ AHEAD = (1.0, 2.0, 3.0, 4.0, 5.0, 6.5, 8.0, 10.0, 12.0, 15.0, 18.0, 22.0, 26.0)
 KOREA = "real:korea_2026_competition"
 
 
-def build_env(a, device):
+def build_env(a, device, extra=None):
     tracks = [KOREA] + ([f"{KOREA}+warp{k}" for k in range(int(a.warps))] if a.warps else [])
-    trs = [maps.load(n) for n in tracks]
-    from ..raceline import Raceline
-    rls = [Raceline.build_cached(t) for t in trs] if a.stage == "race" else None
+    # the racelines the planner opponents follow: the training world's (the cache key is every Raceline.build argument)
+    limits = common.teacher_limits(7.0, 6.5, 4.0)
+    trs, rls = common.load_tracks(tracks, racelines=(a.stage == "race"), **dict(limits, objective="min_time"))
     cfg = Config()
     cfg.sim.compile = False
     cfg.lidar.n_beams = int(a.beams)
@@ -56,21 +56,29 @@ def build_env(a, device):
         e.update(procedural_obstacles=1.0, procedural_density=1.5, procedural_max_props=18,
                  procedural_raceline_corridor="off", movable_obstacles=True)
     if a.stage == "race":
+        # the competition's format: 1 vs 1, the four planner kinds at 0.7-1.05 of their pace, reacting and with events
+        # (the training world's slot without the league: league entries read a full scan, this env casts --beams)
         slot = {"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", "interactive"], "speed_scale": [0.7, 1.05],
-                "present": 0.5, "spawn": "random"}
-        from .opponent_config import parse_slots_json
-        e.update(race_size=2, opponent="teacher", opp_slots=parse_slots_json(json.dumps([slot])))
-    env = common.make_env(trs, int(a.envs), device, EnvConfig(**e), cfg=cfg, seed=int(a.seed), rls=rls)
+                "present": 1.0, "spawn": "random", "reactive": {"defend": 0.3, "line": 0.2, "oblivious": 0.1},
+                "events": ["brake", "stop", "shift", "weave"], "event_rate": 0.5}
+        from .. import opponent_slots as opp_sl
+        e.update(race_size=2, opponent="slots", opponent_slots=opp_sl.parse_slots(json.dumps([slot])))
+    e.update(extra or {})
+    env = common.make_env(trs, int(a.envs), device, EnvConfig(**e), cfg=cfg, seed=int(a.seed), rls=rls,
+                          teacher_limits=limits)
     return env
 
 
 class StateObs:
-    """The observation, from the env's state after a step."""
+    """The observation, from the env's state after a step. scan: append the env's NOISE-FREE scan (`scan_true`, the
+    beams `--beams` casts) / range: the true shape of every prop, wall and car in view (10-29: three prop centres
+    without their size let the car clip a prop's edge in every narrowing -- crash_scenes.py)."""
 
-    def __init__(self, env):
+    def __init__(self, env, scan: bool = False, scan_range: float = 10.0):
         self.env = env
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
+        self.scan, self.scan_range = bool(scan), float(scan_range)
 
     def __call__(self, last_action):
         env = self.env
@@ -92,7 +100,10 @@ class StateObs:
         w = tr.sample_edt(xy_k, tid[:, None].expand(-1, n))
         ahead = torch.stack([dx / 10.0, dy / 5.0, dyaw / math.pi, w / 2.0], 2).reshape(st.shape[0], -1)
         steer = (st[:, 6] / float(env.s_max))[:, None]
-        out = torch.cat([pv, ahead, steer, last_action], 1).float()
+        parts = [pv, ahead, steer, last_action]
+        if self.scan:
+            parts.append((res.scan_true[lid].float() / self.scan_range).clamp(0.0, 1.0))
+        out = torch.cat(parts, 1).float()
         self.dim = out.shape[1]
         return out
 
@@ -131,6 +142,16 @@ class ActorCritic(nn.Module):
         self.v = mlp(obs_dim, 1, hidden)
         self.log_std = nn.Parameter(torch.full((act_dim,), float(log_std)))
         nn.init.zeros_(self.pi[-1].bias); self.pi[-1].weight.data.mul_(0.01)
+        #: P(a hard hit within the next HIT_HORIZON decisions | s), a head on the critic's trunk (`--hit-head`): supervised
+        #: on every step, so the critic's features learn what danger looks like before the price of a hit reaches them
+        self.hit = nn.Linear(hidden, 1)
+
+    def critic_trunk(self, o):
+        return self.v[:-1](o)
+
+    def value_and_hit(self, o):
+        z = self.critic_trunk(o)
+        return self.v[-1](z).squeeze(-1), self.hit(z).squeeze(-1)
 
     def dist(self, o):
         return torch.distributions.Normal(self.pi(o), self.log_std.exp())
@@ -142,7 +163,7 @@ def train(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env)
+    obs_fn = StateObs(env, scan=bool(a.scan_obs))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids
     B = int(lid.numel())
@@ -156,7 +177,20 @@ def train(a):
     upd0 = 0
     if a.init:
         ck = torch.load(a.init, map_location=device, weights_only=False)
-        model.load_state_dict(ck["model"]); norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
+        d0 = int(ck.get("obs_dim", D))
+        sd = ck["model"]
+        if d0 < D:
+            # the new inputs (the scan) enter with zero weights: the run starts as the --init policy and learns to use them
+            for k in ("pi.0.weight", "v.0.weight"):
+                w = sd[k]; sd[k] = torch.cat([w, torch.zeros(w.shape[0], D - d0, device=w.device, dtype=w.dtype)], 1)
+            nm = ck["norm"]
+            ck["norm"] = {"mean": torch.cat([nm["mean"], torch.zeros(D - d0, device=device)]),
+                          "var": torch.cat([nm["var"], torch.ones(D - d0, device=device)]), "n": nm["n"]}
+            print(f"[state_rl] --init 관측 {d0} -> {D}차원: 새 입력은 가중치 0으로 시작", flush=True)
+        missing = model.load_state_dict(sd, strict=False).missing_keys
+        if missing:
+            print(f"[state_rl] --init에 없는 매개변수(새로 시작): {missing}", flush=True)
+        norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
     w_col, w_car = abs(env.ecfg.reward_collision), abs(env.ecfg.reward_car_contact)
     ci = {k: REWARD_COMPONENT_KEYS.index(k) for k in REWARD_COMPONENT_KEYS}
@@ -179,6 +213,7 @@ def train(a):
         bo = torch.zeros(T, B, D, device=device); ba = torch.zeros(T, B, 2, device=device)
         blp = torch.zeros(T, B, device=device); bv = torch.zeros(T + 1, B, device=device)
         br = torch.zeros(T, B, device=device); bd = torch.zeros(T, B, device=device)
+        bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
         prog = hits_w = hits_c = 0.0; laps = []
         tr0 = time.time()
         with torch.no_grad():
@@ -188,8 +223,10 @@ def train(a):
                 dist = model.dist(on)
                 act = dist.sample()
                 bo[t] = on; ba[t] = act; blp[t] = dist.log_prob(act).sum(1)
-                bv[t] = model.v(on).squeeze(1) * (ret_rms.var.sqrt() + 1e-6)
+                v_t, hl_t = model.value_and_hit(on)
+                bv[t] = v_t * (ret_rms.var.sqrt() + 1e-6); bp[t] = torch.sigmoid(hl_t)
                 rew = torch.zeros(B, device=device); done = torch.zeros(B, dtype=torch.bool, device=device)
+                hit_now = torch.zeros(B, dtype=torch.bool, device=device)
                 act_full[lid] = act.clamp(-1, 1)
                 for k in range(R):
                     _, r_, te, trc, info = env.step(act_full)
@@ -205,19 +242,39 @@ def train(a):
                     rew += step_r * alive
                     prog += float((info["progress"][lid].float().clamp_min(0) * alive).sum())
                     hits_w += float((onw * alive).sum()); hits_c += float((onset.float() * alive).sum())
+                    hit_now |= ((onw > 0) | onset) & ~done
                     d_ = (te | trc)[lid]
                     touching = touching & ~d_
                     done |= d_
                     if info["lap_times"].numel():
                         laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
-                br[t] = rew; bd[t] = done.float()
+                br[t] = rew; bd[t] = done.float(); bh[t] = hit_now.float()
                 last_a = torch.where(done[:, None], torch.zeros_like(act), act.clamp(-1, 1))
                 o = obs_fn(last_a)
-            bv[T] = model.v(norm(o)).squeeze(1) * (ret_rms.var.sqrt() + 1e-6)
+            v_T, hl_T = model.value_and_hit(norm(o))
+            bv[T] = v_T * (ret_rms.var.sqrt() + 1e-6); bp[T] = torch.sigmoid(hl_T)
+            # the hit head's labels: a hard hit within the next K decisions of the same episode (incomplete windows masked)
+            K = int(a.hit_horizon)
+            y_hit = torch.zeros(T, B, device=device); v_hit = torch.zeros(T, B, device=device)
+            run_h = torch.zeros(B, device=device); run_end = torch.zeros(B, device=device); since = torch.full((B,), 1e9, device=device)
+            for t in reversed(range(T)):
+                # since[t] = decisions until the next hit (inf if none in this episode's remaining rollout)
+                since = torch.where(bh[t] > 0, torch.zeros_like(since), torch.where(bd[t] > 0, torch.full_like(since, 1e9), since + 1))
+                y_hit[t] = (since < K).float()
+                ended = torch.zeros(B, dtype=torch.bool, device=device)
+                complete = torch.full((B,), t + K <= T, dtype=torch.bool, device=device)
+                for k in range(t, min(T, t + K)):
+                    ended |= bd[k] > 0
+                v_hit[t] = (complete | ended | (y_hit[t] > 0)).float()
+            # potential-based shaping (Ng et al. 1999, the optimum unchanged): Phi(s) = -price x P(hard hit within K | s)
+            shaping = torch.zeros(T, B, device=device)
+            if a.hit_shaping > 0:
+                phi = -float(a.hit_shaping) * price * bp
+                shaping = a.gamma * phi[1:] * (1.0 - bd) - phi[:-1]
             adv = torch.zeros(T, B, device=device); last = torch.zeros(B, device=device)
             for t in reversed(range(T)):
                 nd = 1.0 - bd[t]
-                delta = br[t] + a.gamma * bv[t + 1] * nd - bv[t]
+                delta = br[t] + shaping[t] + a.gamma * bv[t + 1] * nd - bv[t]
                 last = delta + a.gamma * a.lam * nd * last
                 adv[t] = last
             ret = adv + bv[:T]
@@ -227,6 +284,7 @@ def train(a):
         t_roll = time.time() - tr0
         N = T * B
         fo, fa, flp, fadv, fret = bo.reshape(N, D), ba.reshape(N, 2), blp.reshape(N), adv_n.reshape(N), ret_n.reshape(N)
+        fyh, fvh = y_hit.reshape(N), v_hit.reshape(N)
         mb = N // int(a.minibatches)
         kls, cfs = [], []
         for ep in range(int(a.epochs)):
@@ -237,8 +295,12 @@ def train(a):
                 lp = dist.log_prob(fa[j]).sum(1)
                 ratio = (lp - flp[j]).exp()
                 pg = -torch.min(ratio * fadv[j], ratio.clamp(1 - a.clip, 1 + a.clip) * fadv[j]).mean()
-                vf = 0.5 * (model.v(fo[j]).squeeze(1) - fret[j]).pow(2).mean()
+                v_j, hl_j = model.value_and_hit(fo[j])
+                vf = 0.5 * (v_j - fret[j]).pow(2).mean()
                 loss = pg + a.vf * vf
+                if a.hit_head > 0:
+                    bce = nn.functional.binary_cross_entropy_with_logits(hl_j, fyh[j], reduction="none")
+                    loss = loss + float(a.hit_head) * (bce * fvh[j]).sum() / fvh[j].sum().clamp_min(1.0)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -253,13 +315,16 @@ def train(a):
                  "lap_best_s": float(np.min(laps)) if laps else None, "std": model.log_std.exp().tolist(),
                  "kl": float(np.mean(kls)), "clipfrac": float(np.mean(cfs)), "t_roll": t_roll,
                  "t_upd": time.time() - tr0 - t_roll, "min": (time.time() - t0) / 60, "price": price,
-                 "J80_per_step": float((prog - 80.0 * (hits_w + hits_c)) / (T * R * B))}
+                 "J80_per_step": float((prog - 80.0 * (hits_w + hits_c)) / (T * R * B)),
+                 "hit_p_pos": float((bp[:T] * y_hit * v_hit).sum() / (y_hit * v_hit).sum().clamp_min(1.0)),
+                 "hit_p_neg": float((bp[:T] * (1 - y_hit) * v_hit).sum() / ((1 - y_hit) * v_hit).sum().clamp_min(1.0)),
+                 "shaping_abs": float(shaping.abs().mean())}
         log.write(json.dumps(stats) + "\n"); log.flush()
         if u % 5 == 0 or u == upd0 + 1:
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
             print(f"[{time.strftime('%H:%M')}] 업데이트 {u} | 진행 {stats['progress_ms']:.2f} m/s | 강한 충돌 벽+상자 "
                   f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 랩 {len(laps)}개 평균 {lp_} s | "
-                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
+                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s", flush=True)
         if u % int(a.save_every) == 0 or u == upd0 + int(a.updates):
             torch.save({"model": model.state_dict(), "norm": norm.state_dict(), "ret_rms": ret_rms.state_dict(),
@@ -276,12 +341,12 @@ def evaluate(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env)
+    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
-    model = ActorCritic(o.shape[1]).to(device); model.load_state_dict(ck["model"])
+    model = ActorCritic(o.shape[1]).to(device); model.load_state_dict(ck["model"], strict=False)
     norm = RunningNorm(o.shape[1], device); norm.load_state_dict(ck["norm"])
     w_col = abs(env.ecfg.reward_collision)
     act_full = torch.zeros(env.B, env.act_dim, device=device)
@@ -338,6 +403,11 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--scan-obs", type=int, default=0, help="1: append the noise-free scan (--beams beams) to the observation")
+    ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
+    ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
+    ap.add_argument("--hit-shaping", type=float, default=0.0,
+                    help="potential-based shaping Phi = -X x price x P(hit within K); 0 = off (needs --hit-head)")
     ap.add_argument("--seed", type=int, default=5001)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
