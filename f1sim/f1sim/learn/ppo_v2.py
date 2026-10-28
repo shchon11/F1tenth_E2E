@@ -66,7 +66,7 @@ import torch
 import torch.nn.functional as F
 
 from .. import mpc
-from ..gym_env import PRIV_V2_DIM, PRIV_V2_PROP_DIM, REWARD_COMPONENT_KEYS
+from ..gym_env import PRIV_V2_DIM, PRIV_V2_PROP_DIM, PRIV_V2_TIME_DIM, REWARD_COMPONENT_KEYS
 from . import common
 from . import conditioning as cond_mod
 from .aux_v2 import aux_spec, nearest_car_loss
@@ -254,6 +254,14 @@ def _safe_speed_predictive(env, brake: float, width: float, lag: float, gap_min:
     return torch.where(inpath, vs, torch.full_like(vs, float("inf"))).min(1).values
 
 
+def race_end_flags(term: torch.Tensor, trunc: torch.Tensor, race_end: bool):
+    """(terminated, truncated) as the returns see them. `--race-end-terminal`: a time-limit truncation is the end of
+    the race -- nothing comes after it, so it is terminal and is not bootstrapped (`compute_gae`)."""
+    if not race_end:
+        return term, trunc
+    return term | trunc, torch.zeros_like(trunc)
+
+
 def widen_critic_priv(model, priv_dim: int):
     """`--priv-props` from a critic that reads fewer privileged columns: append zero-weight inputs for the new
     columns at the end of `critic.inp`'s Linear ([ego | c | priv] with priv's new columns last), so the value and
@@ -292,7 +300,11 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
     coefs = {"contact": float(a.contact_bce), "b8": float(a.aux_b8), "near": float(a.aux_near_car)}
     aux = aux_spec(b8=coefs["b8"] > 0, near_car=coefs["near"] > 0)
     priv_dim = int(env.privileged_v2(env.last_result).shape[1])
-    priv_want = PRIV_V2_DIM + (PRIV_V2_PROP_DIM if getattr(env.ecfg, "priv_props", False) else 0)
+    priv_want = (PRIV_V2_DIM + (PRIV_V2_PROP_DIM if getattr(env.ecfg, "priv_props", False) else 0)
+                 + (PRIV_V2_TIME_DIM if getattr(env.ecfg, "priv_time", False) else 0))
+    race_end = bool(getattr(a, "race_end_terminal", False))
+    if race_end and not getattr(env.ecfg, "priv_time", False):
+        raise SystemExit("--race-end-terminal needs the race time in the critic (EnvConfig.priv_time)")
     if priv_dim != priv_want:
         raise SystemExit(f"privileged_v2 is {priv_dim} wide, the v2 critic reads {priv_want}")
     # ---------------------------------------------------------------- the network
@@ -687,7 +699,8 @@ def train(a, *, env, obs, device, names, init_ck: dict, controller, graph_rt, ap
                 controller.post_step(term, trunc)
                 done_now = term | trunc
                 dial_new |= done_now
-                buf_rew[t] = rew[lid]; buf_done[t] = term[lid].float(); buf_trunc[t] = trunc[lid].float()
+                d_, tr_ = race_end_flags(term[lid], trunc[lid], race_end)
+                buf_rew[t] = rew[lid]; buf_done[t] = d_.float(); buf_trunc[t] = tr_.float()
                 if "on_policy" in info:
                     buf_mask[t] = info["on_policy"][lid].float()
                 if parked_l is not None:

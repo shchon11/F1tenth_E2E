@@ -459,6 +459,11 @@ def main():
                          "(EnvConfig.decision_every); the PPO loss reads the decisions only, with the decision-level GAE "
                          "(lambda 1 inside a block). 1 = every step, every run before 2026-10-27. Why: one 25 ms action moves "
                          "the car by ~2 cm, its advantage drowns (gradient SNR 0.1-0.3 an update, tools/research/rl_speed)")
+    ap.add_argument("--race-end-terminal", action="store_true",
+                    help="v2: the episode is one race of --episode-s seconds and its time limit is a true END (no "
+                         "bootstrap past it), with the race time still to run in the critic's privileged vector "
+                         "(EnvConfig.priv_time). The user (2026-10-28): 1 vs 1 over ~10 laps, won by finishing them "
+                         "sooner -- so a pass is worth the speed gained over the REST OF THE RACE. Use with --gamma 1")
     ap.add_argument("--priv-props", action="store_true",
                     help="v2: append the props ahead (nearest 3 not behind, within 12 m: present, dx, dy, dist in the body "
                          "frame) to the CRITIC's privileged vector (EnvConfig.priv_props). An --init critic without them is "
@@ -1287,6 +1292,7 @@ def main():
                                                               decision_every=int(getattr(a, "decision_every", 1) or 1),
                                                               plan_speed_scale=float(getattr(a, "plan_speed_scale", 1.0) or 1.0),
                                                               priv_props=bool(getattr(a, "priv_props", False)),
+                                                              priv_time=bool(getattr(a, "race_end_terminal", False)),
                                                               procedural_obstacles=a.procedural_obstacles,
                                                               procedural_density=a.procedural_density,
                                                               procedural_max_props=a.procedural_max_props,

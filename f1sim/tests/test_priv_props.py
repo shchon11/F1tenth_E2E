@@ -82,3 +82,30 @@ def test_widening_an_init_critic_changes_none_of_its_outputs():
     assert widen_critic_priv(m, PRIV_V2_DIM + PRIV_V2_PROP_DIM) is None   # already wide: nothing to do
     m2 = ActorCriticV2(**m.meta)                                         # a saved checkpoint rebuilds the wide critic
     assert m2.critic.priv_dim == PRIV_V2_DIM + PRIV_V2_PROP_DIM
+
+
+def test_the_race_time_still_to_run_is_the_last_column():
+    from f1sim.gym_env import PRIV_V2_TIME_DIM
+    env = _env(priv_time=True, max_steps=40)
+    pv = env.privileged_v2()
+    assert pv.shape[1] == PRIV_V2_DIM + PRIV_V2_TIME_DIM
+    assert torch.allclose(pv[:, -1], torch.ones(env.B))                 # a fresh race: all of it still to run
+    for _ in range(3):
+        env.step(torch.zeros(env.B, env.act_dim))
+    assert torch.allclose(env.privileged_v2()[:, -1], torch.full((env.B,), 37 / 40))
+    both = _env(priv_props=True, priv_time=True, max_steps=40).privileged_v2()
+    assert both.shape[1] == PRIV_V2_DIM + PRIV_V2_PROP_DIM + PRIV_V2_TIME_DIM
+
+
+def test_the_end_of_a_race_is_terminal_not_bootstrapped():
+    from f1sim.learn.ppo_v2 import race_end_flags
+    from f1sim.learn.returns import compute_gae
+    term = torch.tensor([[0.0], [0.0]]); trunc = torch.tensor([[0.0], [1.0]])
+    d, tr = race_end_flags(term.bool(), trunc.bool(), False)
+    assert torch.equal(d, term.bool()) and torch.equal(tr, trunc.bool())  # off: as before
+    d, tr = race_end_flags(term.bool(), trunc.bool(), True)
+    assert d.tolist() == [[False], [True]] and not tr.any()
+    rew = torch.tensor([[1.0], [1.0]]); val = torch.tensor([[5.0], [5.0], [5.0]]); final = torch.tensor([[0.0], [100.0]])
+    boot = compute_gae(rew, val, term, trunc, final, 1.0, 1.0)            # bootstrapped: the last step sees 100
+    race = compute_gae(rew, val, d.float(), tr.float(), final, 1.0, 1.0)  # the race is over: nothing after it
+    assert float(boot[1, 0]) == 1.0 + 100.0 - 5.0 and float(race[1, 0]) == 1.0 - 5.0

@@ -88,6 +88,9 @@ PRIV_V2_PROP_KEYS = ("present", "dx", "dy", "dist")
 PRIV_V2_PROP_SLOTS = 3
 PRIV_V2_PROP_DIM = PRIV_V2_PROP_SLOTS * len(PRIV_V2_PROP_KEYS)
 PRIV_V2_PROP_RANGE = 12.0
+#: `EnvConfig.priv_time` (2026-10-28): the share of this episode's time still to run, (limit - step) / max_steps --
+#: what a critic needs to value the rest of a fixed-length race (`ppo --race-end-terminal`). Appended last.
+PRIV_V2_TIME_DIM = 1
 #: [s] TTC reported when nothing closes faster than `PRIV_V2_TTC_MIN_CLOSING`, and its cap. The
 #: align gate's numbers; with no opponent at all: distance 30 m, closing 0, TTC 10, min TTC 10.
 PRIV_V2_TTC_CAP = 10.0
@@ -578,6 +581,11 @@ class EnvConfig:
     #: the current clearance, and pre-priced ~30 % of a hard wall/prop hit before it (cars ~45 %); the rest of the
     #: price lands on the onset step, where GAE cannot carry it back to the line choice 1-2 s earlier. Off = as before.
     priv_props: bool = False
+    #: Append the episode time still to run to the v2 critic's privileged vector (`PRIV_V2_TIME_DIM`). Critic-only.
+    #: Why (2026-10-28, the user: a race is 1 vs 1 over ~10 laps and is won by finishing them sooner): with the
+    #: episode = one race and its end a true end (`ppo --race-end-terminal`), the value of a state depends on how
+    #: much race is left, which nothing else in the vector says. Off = as before.
+    priv_time: bool = False
     #: The speed limit for a car ahead (2026-10-25, `opponent_speed_limit.py`): the learner's speed command is held to
     #: the speed from which it can still slow to the car's speed before the gap closes, for a car in its lane now or
     #: moving into it within 1 s -- read off the policy's own nearest-car output, which its runner writes into
@@ -3750,6 +3758,10 @@ class F1VecEnv:
         out = torch.cat([ego, opp.reshape(self.B, -1), geo], 1)
         if self.ecfg.priv_props:
             out = torch.cat([out, self._prop_block(st)], 1)
+        if self.ecfg.priv_time:
+            n = float(self.ecfg.max_steps)
+            lim = self.ep_limit.clamp(max=int(self.ecfg.max_steps))
+            out = torch.cat([out, ((lim - self.ep_step).clamp(min=0).to(st.dtype) / n)[:, None]], 1)
         return out
 
     def _prop_block(self, st: torch.Tensor) -> torch.Tensor:
