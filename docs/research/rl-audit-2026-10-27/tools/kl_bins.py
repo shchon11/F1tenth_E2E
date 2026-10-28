@@ -24,13 +24,13 @@ for arg in sys.argv[1:]:
     rows = [json.loads(l) for l in open(os.path.expanduser(f"~/f1sim_runs/{run}/progress.jsonl"))]
     rows = [r for r in rows if r["update"] > int(first)]
     v, w, c, J, kl, ref = table(rows)
-    print(f"== {run}: {len(rows)} actor updates")
-    print("  actor block | progress m/s | hard wall+prop | hard car | J/step | approx_kl | kl_ref at the end")
+    print(f"== {run}: 액터 업데이트 {len(rows)}회")
+    print("  액터 구간 | 진행 m/s | 강한 벽+상자 | 강한 차 | J/스텝 | 업데이트당 KL | 처음 정책과의 KL(구간 끝)")
     for a in range(0, len(rows), BLOCK):
         s = slice(a, a + BLOCK)
         print(f"  {a:4d}-{min(a + BLOCK, len(rows)) - 1:4d} | {np.nanmean(v[s]):.2f} | {np.nanmean(w[s]):.2f} | {np.nanmean(c[s]):.2f} | "
               f"{np.nanmean(J[s]):.4f} | {np.nanmean(kl[s]):.4f} | {ref[s][-1]:.2f}")
-    print("  kl_ref bin | updates | progress m/s | hard wall+prop | hard car | J/step")
+    print("  처음 정책과의 KL 구간 | 업데이트 | 진행 m/s | 강한 벽+상자 | 강한 차 | J/스텝")
     for lo, hi in zip(EDGES[:-1], EDGES[1:]):
         m = (ref >= lo) & (ref < hi)
         if m.sum():

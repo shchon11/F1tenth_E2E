@@ -9,8 +9,8 @@ import numpy as np
 BLOCK = int(os.environ.get("BLOCK", "20"))
 for run in sys.argv[1:]:
     rows = [json.loads(l) for l in open(os.path.expanduser(f"~/f1sim_runs/{run}/progress.jsonl"))]
-    print(f"== {run}: {len(rows)} updates | block | master progress m/s | hits/km | J/step | dJ sd | hit-flip rows | "
-          f"|move| k0 k1 k2 v1 (x1e-3) | along | s/update")
+    print(f"== {run}: 업데이트 {len(rows)}회 | 구간 | 기준 세계 진행 m/s | 충돌/km | J/스텝 | 목표 차 표준편차 | 충돌 갈린 행 | "
+          f"평균 이동 κ0 κ1 κ2 v1 (x1e-3) | 측정 방향 이동 | 초/업데이트")
     for a in range(0, len(rows), BLOCK):
         b = rows[a:a + BLOCK]
         g = lambda k: np.array([x.get(k, np.nan) for x in b], float)
