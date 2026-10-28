@@ -262,7 +262,9 @@ def train(a, *, env, obs, device, names, init_ck, controller, graph_rt, applied,
                       + (f", critic dV {R['dV'][m][fast].mean():+.3f} +- "
                          f"{R['dV'][m][fast].std(ddof=1) / np.sqrt(fast.sum()):.3f}" if "dV" in R else ""))
     flip = R["dhits"] != 0
-    if flip.any():
+    if not flip.any():
+        print(f"hit flips: 0 rows of {len(flip)} (0.0 %)")
+    else:
         lowA = R["hitsA"] < R["hitsB"]                                    # the twin with fewer hard hits ...
         near_low = np.where(lowA, R["nearA"], R["nearB"]) > 0
         all_low = np.where(lowA, R["allA"], R["allB"]) > 0
