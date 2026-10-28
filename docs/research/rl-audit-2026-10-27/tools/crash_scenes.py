@@ -138,6 +138,14 @@ def main():
     touching = torch.zeros(B, dtype=torch.bool, device=device)
     events, n_img = [], 0
     km = 0.0
+    po = env.procedural
+    enc_seen = None; enc_hit = None
+    if po is not None and po.C > 0:
+        ext_all = torch.where(torch.isfinite(po.p_d), po.p_d, torch.full_like(po.p_d, -1e9)).amax(-1)   # (B, C) extent
+        enc_seen = torch.zeros(env.B, po.C, dtype=torch.bool, device=device)
+        enc_hit = torch.zeros(env.B, po.C, dtype=torch.bool, device=device)
+        enc_log = []                     # (extent, speed at closest, hit) per finished encounter
+        enc_vmax = torch.zeros(env.B, po.C, device=device)
     tracks = env.sim.track.tracks
     for t in range(int(a.steps) // int(a.repeat)):
         ohist = torch.roll(ohist, -1, 0); ohist[-1] = o
@@ -156,6 +164,31 @@ def main():
             km += float(info["progress"][lid].float().clamp_min(0).sum()) / 1000.0
             on, imp = res.contact_onsets[lid], res.contact_impacts[lid]
             hard_w = on[:, 0] & (imp[:, 0] >= 1.5); hard_p = on[:, 1] & (imp[:, 1] >= 1.5)
+            if enc_seen is not None:
+                # encounters: a live prop whose edge comes within 0.6 m of the car's centre; the hard prop onset of a row
+                # is credited to its nearest prop; an encounter ends when the prop falls 2 m behind or the episode resets
+                ext_all = torch.where(torch.isfinite(po.p_d), po.p_d, torch.full_like(po.p_d, -1e9)).amax(-1)
+                dxy = po.p_poses[:, :, :2] - st[:, None, :2]
+                gap = dxy.norm(dim=-1) - ext_all
+                live = po.p_sid >= 0
+                near = live & (gap < 0.6)
+                lrow = torch.zeros(env.B, dtype=torch.bool, device=device); lrow[lid] = True
+                near = near & lrow[:, None]
+                enc_seen |= near
+                enc_vmax = torch.where(near, torch.maximum(enc_vmax, st[:, 3:4].expand_as(enc_vmax)), enc_vmax)
+                hp = torch.zeros(env.B, dtype=torch.bool, device=device); hp[lid] = hard_p
+                jn = torch.where(live, gap, torch.full_like(gap, 1e9)).argmin(1)
+                hitmask = torch.zeros_like(enc_hit); hitmask[torch.arange(env.B, device=device), jn] = hp
+                enc_hit |= hitmask & enc_seen
+                c_, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+                behind = (dxy[..., 0] * c_ + dxy[..., 1] * s_) < -2.0
+                dn = torch.zeros(env.B, dtype=torch.bool, device=device); dn[lid] = d_
+                fin = enc_seen & (behind | dn[:, None] | ~live)
+                if fin.any():
+                    ii = fin.nonzero()
+                    for b_, c_i in ii.tolist():
+                        enc_log.append((float(ext_all[b_, c_i]), float(enc_vmax[b_, c_i]), bool(enc_hit[b_, c_i])))
+                    enc_seen &= ~fin; enc_hit &= ~fin; enc_vmax = torch.where(fin, torch.zeros_like(enc_vmax), enc_vmax)
             hard_c = c_on & (res.car_impact[lid] >= 1.5) if res.car_impact is not None else c_on
             for kind, mask, impv in (("벽", hard_w, imp[:, 0]), ("상자", hard_p, imp[:, 1]),
                                      ("차", hard_c, res.car_impact[lid] if res.car_impact is not None else imp[:, 2])):
@@ -163,8 +196,13 @@ def main():
                     row = int(lid[i])
                     n_ep = int(min(H, int(env.ep_step[row]) + 1))          # only this episode's own steps
                     h = hist[H - n_ep:, row].cpu().numpy()
+                    od = float("nan")
+                    if env.M > 1:
+                        race = row // env.M
+                        others = [q for q in range(race * env.M, race * env.M + env.M) if q != row]
+                        od = float(min((st[q, :2] - st[row, :2]).norm() for q in others))
                     ev = {"step": t * int(a.repeat) + r, "row": row, "kind": kind, "impact": float(impv[i]),
-                          "ep_step": int(env.ep_step[row]),
+                          "ep_step": int(env.ep_step[row]), "opp_dist": od,
                           "speed": float(st[row, 3]), "xy": [float(st[row, 0]), float(st[row, 1])], "yaw": float(st[row, 2]),
                           "traj": h[:, :4].tolist(), "steer_cmd_0.5s": h[-min(20, len(h)):, 4].tolist(), "speed_cmd_0.5s": h[-min(20, len(h)):, 5].tolist()}
                     # the policy's response 0.5 s before the hit (10 decisions back), with the props as seen and erased
@@ -240,6 +278,27 @@ def main():
         print(f"[폭] 상자 충돌 {gp.size}건: 상자 옆 남은 폭(넓은 쪽) 중앙값 {np.median(gp):.2f} m, 차 폭 0.27 m보다 좁은 경우 "
               f"{(gp < 0.27).mean() * 100:.0f} %, 0.27~0.5 m {((gp >= 0.27) & (gp < 0.5)).mean() * 100:.0f} %, 0.5 m 이상 "
               f"{(gp >= 0.5).mean() * 100:.0f} %", flush=True)
+    if enc_seen is not None and enc_log:
+        E_ = np.array(enc_log)
+        print(f"[만남] 상자 {len(E_)}번 가까이 지나감, 그중 강한 충돌 {E_[:, 2].mean() * 100:.1f} %", flush=True)
+        for lo, hi in ((0, 0.12), (0.12, 0.2), (0.2, 0.3), (0.3, 9)):
+            m = (E_[:, 0] >= lo) & (E_[:, 0] < hi)
+            if m.sum():
+                print(f"   상자 크기(중심에서 가장 먼 면) {lo:.2f}~{hi:.2f} m: {m.sum()}번, 충돌률 {E_[m, 2].mean() * 100:.1f} %, "
+                      f"지날 때 최고 속도 중앙 {np.median(E_[m, 1]):.1f} m/s", flush=True)
+        for lo, hi in ((0, 3), (3, 5), (5, 7), (7, 20)):
+            m = (E_[:, 1] >= lo) & (E_[:, 1] < hi)
+            if m.sum():
+                print(f"   지날 때 속도 {lo}~{hi} m/s: {m.sum()}번, 충돌률 {E_[m, 2].mean() * 100:.1f} %", flush=True)
+    od = np.array([e["opp_dist"] for e in events if e.get("opp_dist") == e.get("opp_dist")])
+    if od.size:
+        for kind in ("벽", "상자", "차"):
+            k_ = np.array([e["opp_dist"] for e in events if e["kind"] == kind and e.get("opp_dist") == e.get("opp_dist")])
+            if k_.size:
+                print(f"[상대 거리] {kind} 충돌 {k_.size}건: 상대가 1 m 안 {(k_ < 1).mean() * 100:.0f} %, 1~3 m {((k_ >= 1) & (k_ < 3)).mean() * 100:.0f} %, "
+                      f"3 m 밖 {(k_ >= 3).mean() * 100:.0f} %", flush=True)
+        t_ = np.array([e["ep_step"] / 40 for e in events])
+        print(f"[출발 후] 1초 안 {(t_ < 1).mean() * 100:.0f} %, 1~3초 {((t_ >= 1) & (t_ < 3)).mean() * 100:.0f} %, 3초 뒤 {(t_ >= 3).mean() * 100:.0f} %", flush=True)
     by = {}
     for e in events:
         by[e["kind"]] = by.get(e["kind"], 0) + 1

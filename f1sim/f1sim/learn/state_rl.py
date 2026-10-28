@@ -53,7 +53,8 @@ def build_env(a, device, extra=None):
              reward_wrong_way=0.4, reward_proximity=0.0, reward_lap=0.0, reward_lap_time=0.0,
              spawn_runway=3.0, priv_props=True, priv_time=True, compile_tracker=False)
     if a.stage in ("props", "race"):
-        e.update(procedural_obstacles=1.0, procedural_density=1.5, procedural_max_props=18,
+        e.update(procedural_obstacles=1.0, procedural_density=float(getattr(a, "prop_density", 1.5)),
+                 procedural_max_props=int(getattr(a, "prop_max", 18)),
                  procedural_raceline_corridor="off", movable_obstacles=True)
     if a.stage == "race":
         # the competition's format: 1 vs 1, the four planner kinds at 0.7-1.05 of their pace, reacting and with events
@@ -403,6 +404,8 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--prop-density", type=float, default=1.5, help="props / stages: procedural_density (training world)")
+    ap.add_argument("--prop-max", type=int, default=18, help="props / stages: procedural_max_props")
     ap.add_argument("--scan-obs", type=int, default=0, help="1: append the noise-free scan (--beams beams) to the observation")
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
