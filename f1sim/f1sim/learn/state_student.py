@@ -57,6 +57,9 @@ def main():
     ap.add_argument("--beta0", type=float, default=1.0)
     ap.add_argument("--beta-iters", type=int, default=10, help="iterations over which beta falls to 0")
     ap.add_argument("--seed", type=int, default=6001)
+    ap.add_argument("--frames", type=int, default=3, help="scan frames in the stack")
+    ap.add_argument("--stride", type=int, default=3, help="control steps between stacked frames")
+    ap.add_argument("--danger-weight", type=float, default=0.0, help="sample weight 1 + X * teacher P(hit within 1 s)")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     a.price = 80.0
@@ -65,7 +68,7 @@ def main():
     # the teacher's world with the car's sensors: a full scan, 3 frames 3 steps apart, the v2 ego history
     # (obs_version 2 is the plan policy's contract; with a direct command the v1 dict carries the same: the scan
     # stack, speed, the issued commands, the proprio history)
-    env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=3, scan_stride=3))
+    env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=int(a.frames), scan_stride=int(a.stride)))
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     ck = torch.load(a.teacher, map_location=device, weights_only=False)
@@ -100,6 +103,7 @@ def main():
     cap = int(a.buffer)
     b_scan = torch.zeros(cap, F, N, dtype=torch.float16, device=device)
     b_ego = torch.zeros(cap, E, device=device); b_y = torch.zeros(cap, 2, device=device)
+    b_w = torch.ones(cap, device=device)
     n_buf = 0; ptr = 0
     out = os.path.expanduser(f"~/f1sim_runs/{a.name}"); os.makedirs(out, exist_ok=True)
     json.dump(vars(a), open(os.path.join(out, "args.json"), "w"), indent=1)
@@ -118,10 +122,15 @@ def main():
         with torch.no_grad():
             for t in range(int(a.steps) // R):
                 y = teacher.pi(tnorm(o)).clamp(-1, 1)                      # the label: the teacher's mean action
+                # danger weight (--danger-weight): the student's errors cost hits where the teacher's own hit head sees
+                # one coming (10-29: before its car contacts the student was 0.68 m/s faster than the label in 65 % of
+                # cases); uniform MSE spends the fit on cruising
+                w_s = 1.0 + float(a.danger_weight) * torch.sigmoid(teacher.value_and_hit(tnorm(o))[1]) if float(a.danger_weight) > 0 \
+                    else torch.ones(B, device=device)
                 ego_now = egov(obs)
                 s_act = student(obs["scan"][lid].float(), ego_now)
                 idx = torch.arange(ptr, ptr + B, device=device) % cap
-                b_scan[idx] = obs["scan"][lid].half(); b_ego[idx] = ego_now; b_y[idx] = y
+                b_scan[idx] = obs["scan"][lid].half(); b_ego[idx] = ego_now; b_y[idx] = y; b_w[idx] = w_s
                 ptr = (ptr + B) % cap; n_buf = min(cap, n_buf + B)
                 use_t = torch.rand(B, device=device) < beta
                 act = torch.where(use_t[:, None], y, s_act)
@@ -145,7 +154,8 @@ def main():
             for i in range(0, n_buf, int(a.batch)):
                 j = perm[i:i + int(a.batch)]
                 pred = student(b_scan[j].float(), b_ego[j])
-                loss = ((pred - b_y[j]) ** 2 * torch.tensor([2.0, 1.0], device=device)).mean()
+                per = ((pred - b_y[j]) ** 2 * torch.tensor([2.0, 1.0], device=device)).mean(1)
+                loss = (per * b_w[j]).sum() / b_w[j].sum()
                 opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
                 losses.append(float(loss))
         km = prog / 1000.0
@@ -197,7 +207,8 @@ def evaluate_student():
         cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0); cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
         e = dict(action_mode="direct", max_steps=int(a.steps), speed_cap=10.0, v_max_policy=10.0, collision_mode="soft",
                  contact_severity_min=1.5, stagger_first_episode=False, reward_collision=-1.0, reward_car_contact=1.0,
-                 spawn_runway=3.0, compile_tracker=False, obs_version=1, scan_stack=frames, scan_stride=3)
+                 spawn_runway=3.0, compile_tracker=False, obs_version=1, scan_stack=frames,
+                 scan_stride=int(ck["args"].get("stride", 3)) if not is_teacher else 3)
         if is_teacher:
             e.update(priv_props=True, priv_time=True)
         if race_kind is not None:

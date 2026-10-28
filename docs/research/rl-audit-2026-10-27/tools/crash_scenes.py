@@ -95,17 +95,47 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--seed", type=int, default=91)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--student", default="", help="a state_student checkpoint: the STUDENT drives (its own sensors); the "
+                    "teacher CKPT labels every decision, so each hit shows what the teacher would have done instead")
     a = ap.parse_args()
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "scenes_" + os.path.basename(a.ckpt).replace(".pt", ""))
     os.makedirs(out, exist_ok=True)
     device = torch.device(a.device)
-    env = state_rl.build_env(a, device)
+    ck0 = torch.load(a.ckpt, map_location="cpu", weights_only=False)
+    sck = torch.load(a.student, map_location=device, weights_only=False) if a.student else None
+    if sck is not None:
+        # the student's sensors (its beams, the 3-frame scan stack of the v1 obs dict); the teacher's scan is
+        # interpolated to ITS beams over the same field of view (as state_student does)
+        a.beams = int(sck["beams"])
+        env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=int(sck["frames"]), scan_stride=int(sck["args"].get("stride", 3))))
+    else:
+        env = state_rl.build_env(a, device)
     from f1sim.learn.graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    ck0 = torch.load(a.ckpt, map_location="cpu", weights_only=False)
-    obs_fn = StateObs(env, scan=bool(ck0["args"].get("scan_obs", 0)))
-    env.reset(seed=int(a.seed))
+    t_scan = bool(ck0["args"].get("scan_obs", 0)); t_beams = int(ck0["args"].get("beams", 36))
+    base_fn = StateObs(env, scan=t_scan if sck is None else False)
+    obs_d, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
+    if sck is None:
+        obs_fn = base_fn
+    else:
+        from f1sim.learn.state_student import Student
+        ang_s = env.sim.lidar.angles.float()
+        ang_t = torch.linspace(float(ang_s[0]), float(ang_s[-1]), t_beams, device=device)
+        pos_ = (ang_t - ang_s[0]) / (ang_s[-1] - ang_s[0]) * (ang_s.numel() - 1)
+        i0_ = pos_.floor().long().clamp(0, ang_s.numel() - 2); w_ = (pos_ - i0_.float())[None, :]
+
+        def obs_fn(last):
+            o_ = base_fn(last)
+            if not t_scan:
+                return o_
+            sc = env.last_result.scan_true[lid].float()
+            return torch.cat([o_, ((sc[:, i0_] * (1 - w_) + sc[:, i0_ + 1] * w_) / 10.0).clamp(0.0, 1.0)], 1)
+        student = Student(int(sck["frames"]), int(sck["beams"]), int(sck["ego_dim"])).to(device)
+        student.load_state_dict(sck["student"]); student.eval()
+        ego_keys = sck.get("ego_keys") or sorted(k for k in obs_d if k != "scan")
+        egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in ego_keys], 1)
+    dif_hist = torch.zeros(40, B, 2, device=device)        # (student - teacher) action per decision, last 2 s
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
@@ -138,6 +168,7 @@ def main():
 
     ret_rms = RunningNorm(1, device); ret_rms.load_state_dict(ck["ret_rms"])
     touching = torch.zeros(B, dtype=torch.bool, device=device)
+    dif_all = []; dif_hit = []                           # |student - teacher| per decision, overall and before hits
     events, n_img = [], 0
     km = 0.0
     po = env.procedural
@@ -158,9 +189,15 @@ def main():
     for t in range(int(a.steps) // int(a.repeat)):
         ohist = torch.roll(ohist, -1, 0); ohist[-1] = o
         act = model.pi(norm(o)).clamp(-1, 1)
+        if sck is not None:
+            with torch.no_grad():
+                s_act = student(obs_d["scan"][lid].float(), egov(obs_d)).clamp(-1, 1)
+            dif_hist = torch.roll(dif_hist, -1, 0); dif_hist[-1] = s_act - act
+            dif_all.append((s_act - act).abs().mean(0).cpu())
+            act = s_act
         act_full[lid] = act
         for r in range(int(a.repeat)):
-            _, r_, te, trc, info = env.step(act_full)
+            obs_d, r_, te, trc, info = env.step(act_full)
             st = env.sim.state
             cmd = torch.zeros(env.B, 2, device=device); cmd[lid] = act
             hist = torch.roll(hist, -1, 0)
@@ -293,6 +330,11 @@ def main():
                             ev.update(prop_lat=float(lat_p[0]), track_half_width=half, prop_extent=ext,
                                       gap_beside=max(half - (float(lat_p[0]) + ext), half + (float(lat_p[0]) - ext)),
                                       gap_total=gap)
+                    if sck is not None:
+                        dd = dif_hist[-10:, i].cpu().numpy()                  # last 0.5 s
+                        ev["stud_minus_teach_05s"] = {"steer_deg": float(np.mean(dd[:, 0])) * math.degrees(float(env.s_max)),
+                                                      "speed_ms": float(np.mean(dd[:, 1])) / 2 * float(env.ecfg.v_max_policy)}
+                        dif_hit.append((kind, ev["stud_minus_teach_05s"]["steer_deg"], ev["stud_minus_teach_05s"]["speed_ms"]))
                     events.append({k: v for k, v in ev.items() if k != "traj"})
                     if n_img < int(a.max_images):
                         tid = int(env.sim.tid[row])
@@ -312,9 +354,22 @@ def main():
                                       f"{rp['steer_deg_noprops']:+.0f}도, 속도 {rp['speed_ms']:.1f} / {rp['speed_ms_noprops']:.1f} m/s"
                                       f"\n가치 2s/1s/0.5s/0s 전: " + " / ".join(f"{x:.0f}" for x in rp["V_2s_1s_05s_0s"])
                                       + " | 충돌 예측: " + " / ".join(f"{x:.2f}" for x in rp["Phit_2s_1s_05s_0s"]))
+                        if "stud_minus_teach_05s" in ev:
+                            title += (f"\n학생-선생(직전 0.5초): 조향 {ev['stud_minus_teach_05s']['steer_deg']:+.1f}도, "
+                                      f"속도 {ev['stud_minus_teach_05s']['speed_ms']:+.2f} m/s")
                         draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title)
                         n_img += 1
         o = obs_fn(act)
+    if sck is not None and dif_all:
+        da = torch.stack(dif_all).mean(0).numpy()
+        print(f"[학생] 평소 |학생-선생| 조향 {da[0] * math.degrees(float(env.s_max)):.1f}도, 속도 {da[1] / 2 * float(env.ecfg.v_max_policy):.2f} m/s", flush=True)
+        for kind in ("벽", "상자", "차"):
+            q = [(x, y) for k_, x, y in dif_hit if k_ == kind]
+            if q:
+                q = np.array(q)
+                print(f"[학생] {kind} 충돌 {len(q)}건, 직전 0.5초 학생-선생: 조향 평균 {np.mean(q[:, 0]):+.1f}도 (|중앙| {np.median(np.abs(q[:, 0])):.1f}), "
+                      f"속도 평균 {np.mean(q[:, 1]):+.2f} m/s (|중앙| {np.median(np.abs(q[:, 1])):.2f}); 학생이 0.3 m/s 넘게 더 빨랐던 비율 "
+                      f"{(q[:, 1] > 0.3).mean() * 100:.0f} %", flush=True)
     if probe:
         ds = np.array([abs(p_["steer_deg"] - p_["steer_deg_noprops"]) for p_ in probe])
         dv = np.array([p_["speed_ms_noprops"] - p_["speed_ms"] for p_ in probe])
