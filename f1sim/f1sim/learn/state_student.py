@@ -426,6 +426,7 @@ def evaluate_like():
             def __init__(self):
                 self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
                 self.bound = 0; self.n_rule = 0
+                self.stuck = 0; self.n_live = 0                    # learner steps below 0.3 m/s from 3 s into an episode
                 self.uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
                 if is_teacher:
                     self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)))
@@ -438,6 +439,9 @@ def evaluate_like():
             def __call__(self, obs):
                 if self.uw is not None and self.t > 0:
                     self.uw.after()                       # the clocks advance on the step just taken
+                if self.t > 0:
+                    live = env.ep_step[lid] > int(3.0 / float(env.sim.control_dt))
+                    self.stuck += int((live & (env.sim.state[lid, 3].abs() < 0.3)).sum()); self.n_live += int(live.sum())
                 if self.t % R == 0:
                     if is_teacher:
                         o_ = self.sobs(self.last)
@@ -474,6 +478,11 @@ def evaluate_like():
             if isinstance(v_, float) and not math.isfinite(v_):
                 result[k_] = None
         result.update(meter.report()); result.update(enc.report()); result.update(sev.report()); result.update(ww.report())
+        km_ = float((result.get("contact_severity") or {}).get("learner_distance_m", 0)) / 1000
+        result["stuck"] = {"stuck_frac": pol.stuck / max(pol.n_live, 1),
+                           "unwedge_per_km": (pol.uw.count / max(km_, 1e-6)) if pol.uw is not None else None}
+        print(f"[같은 평가] {tag}: 멈춰 있는 시간 {pol.stuck / max(pol.n_live, 1) * 100:.1f} %, 끼임 복구 "
+              f"{(pol.uw.count / max(km_, 1e-6)) if pol.uw is not None else float('nan'):.2f}/km", flush=True)
         if float(a.follow_rule) > 0:
             result["follow_rule"] = {"decel": float(a.follow_rule), "bound_frac": pol.bound / max(pol.n_rule, 1)}
             print(f"[같은 평가] {tag}: 따라가기 규칙(참 상태, 진단) 감속 {a.follow_rule:g} m/s^2, 묶인 비율 "
