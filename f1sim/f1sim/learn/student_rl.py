@@ -75,7 +75,7 @@ def main():
     lid = env.learner_ids; B = int(lid.numel())
     # the critic's observation: the teacher's, its scan interpolated from this env's full one (as state_student labels)
     t_scan = bool(tck["args"].get("scan_obs", 0)); t_beams = int(tck["args"].get("beams", 36))
-    tobs = StateObs(env, scan=t_scan, corridor=bool(tck["args"].get("corridor_obs", 0)), corridor_cars=bool(tck["args"].get("corridor_cars", 0)), t_beams=t_beams)
+    tobs = StateObs(env, scan=t_scan, corridor=bool(tck["args"].get("corridor_obs", 0)), corridor_cars=bool(tck["args"].get("corridor_cars", 0)), car_channel=bool(tck["args"].get("car_channel", 0)), t_beams=t_beams)
 
     last_a = torch.zeros(B, 2, device=device)
     to = tobs(last_a); Dt = to.shape[1]
