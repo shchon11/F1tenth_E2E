@@ -60,7 +60,7 @@ def build_env(a, device, extra=None):
         # the competition's format: 1 vs 1, the four planner kinds at 0.7-1.05 of their pace, reacting and with events
         # (the training world's slot without the league: league entries read a full scan, this env casts --beams)
         slot = {"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", "interactive"], "speed_scale": [0.7, 1.05],
-                "present": float(getattr(a, "opp_present", 1.0)), "spawn": "random",
+                "present": float(getattr(a, "opp_present", 1.0)), "spawn": str(getattr(a, "opp_spawn", "random")),
                 "reactive": {"defend": 0.3, "line": 0.2, "oblivious": 0.1},
                 "events": ["brake", "stop", "shift", "weave"], "event_rate": 0.5}
         from .. import opponent_slots as opp_sl
@@ -644,6 +644,7 @@ def main():
     ap.add_argument("--init", default="")
     ap.add_argument("--unwedge", type=int, default=0, help="1: back a wedged car out (the old tracker's recovery)")
     ap.add_argument("--opp-present", type=float, default=1.0, help="race stage: share of races with the opponent on track")
+    ap.add_argument("--opp-spawn", default="random", help="race stage: where the opponent starts ('ahead': we start behind it)")
     ap.add_argument("--prop-fraction", type=float, default=1.0, help="share of resets that get a layout (the rest: empty track)")
     ap.add_argument("--removal-p", type=float, default=0.0,
                     help="competition sessions: share of episodes whose props are removed mid-episode")
