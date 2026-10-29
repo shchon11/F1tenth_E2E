@@ -316,6 +316,7 @@ def evaluate_like():
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=2400)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--only", default="", help="'solo' = the solo run only")
     a = ap.parse_args(sys.argv[2:])
     device = torch.device(a.device)
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
@@ -337,6 +338,8 @@ def evaluate_like():
     refs = sorted(glob.glob(os.path.join(a.like, "race_s*_*.json")))
     solo_ref = os.path.join(a.like, "solo.json")
     jobs = ([("solo", solo_ref)] if os.path.exists(solo_ref) else []) + [(os.path.basename(f)[:-5], f) for f in refs]
+    if a.only == "solo":
+        jobs = jobs[:1]
     for tag, ref in jobs:
         md = json.load(open(ref))["nominal"]["metadata"]
         ec = {k: v for k, v in md["env_config"].items() if k in fields}

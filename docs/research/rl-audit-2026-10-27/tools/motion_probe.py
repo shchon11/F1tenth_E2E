@@ -41,12 +41,16 @@ def main():
     ap.add_argument("--iters", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=97)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--no-props", type=int, default=0, help="1: the race world without props (is the car confused with a prop?)")
     a = ap.parse_args()
     a.stage = "race"; a.beams = 1081
     device = torch.device(a.device)
     ck = torch.load(a.teacher, map_location=device, weights_only=False)
     t_beams = int(ck["args"].get("beams", 36)); t_scan = bool(ck["args"].get("scan_obs", 0))
-    env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=int(a.frames), scan_stride=int(a.stride)))
+    extra = dict(obs_version=1, scan_stack=int(a.frames), scan_stride=int(a.stride))
+    if int(a.no_props):
+        extra.update(procedural_obstacles=0.0)
+    env = state_rl.build_env(a, device, extra=extra)
     from f1sim.learn.graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     base = StateObs(env)
@@ -148,9 +152,17 @@ def main():
                 s = torch.cat([s, (s[:, :1] - s[:, 1:]) * 5.0], 1)         # newest minus each older frame
             return self.head(torch.cat([self.conv(s), ze], 1))
 
+    class EgoOnly(nn.Module):
+        def __init__(self, e_in):
+            super().__init__()
+            self.m = nn.Sequential(nn.Linear(e_in, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, len(NAMES)))
+
+        def forward(self, s, e):
+            return self.m(e)
+
     def fit(name, frames_idx, use_ego, trunk="학생"):
         torch.manual_seed(0)
-        net = Net(len(frames_idx), E.shape[1] if use_ego else 0, trunk).to(device)
+        net = (EgoOnly(E.shape[1]) if trunk == "자아만" else Net(len(frames_idx), E.shape[1] if use_ego else 0, trunk)).to(device)
         with torch.no_grad():
             net(S[:2][:, torch.tensor(frames_idx, device=device)].float(), ((E[:2] - mu_e) / sd_e).clamp(-8, 8))
         opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -173,6 +185,7 @@ def main():
               + " | RMSE " + ", ".join(f"{n} {float(rm[j]):.2f}" for j, n in enumerate(NAMES)), flush=True)
 
     # the env's stack is newest first (gym_env: scan_hist[:, 0] = this step)
+    fit("자아만(라이다 없음)", [0], True, "자아만")
     fit("학생 1장+자아", [0], True)
     fit(f"학생 {F}장+자아", list(range(F)), True)
     fit("고해상 1장+자아", [0], True, "고해상도")
