@@ -88,6 +88,8 @@ def main():
     S = torch.zeros(N, B, 1081, dtype=torch.float16, device=device)
     G = torch.zeros(N, B, 9, device=device)                 # extent x3, prop speed x3, opponent accel (ax, ay), |a|
     HW = torch.zeros(N, B, dtype=torch.bool, device=device); HC = torch.zeros(N, B, dtype=torch.bool, device=device)
+    HP = torch.zeros(N, B, dtype=torch.bool, device=device)      # prop hits only
+    GR = torch.zeros(N, B, device=device)                          # state_rl.geo_risk (no learning)
     DN = torch.zeros(N, B, dtype=torch.bool, device=device)
     touching = torch.zeros(B, dtype=torch.bool, device=device)
     po = env.procedural
@@ -121,20 +123,23 @@ def main():
                     g[:, 6:8] = acc.clamp(-20, 20) / 10.0; g[:, 8] = acc.norm(dim=1).clamp(0, 20) / 10.0
                 opp_v_prev = v_now
             G[t] = g
+            GR[t] = state_rl.geo_risk(env, lid)
             act = model.pi(norm(o)).clamp(-1, 1)
             act_full[lid] = act
             hw = torch.zeros(B, dtype=torch.bool, device=device); hc = torch.zeros(B, dtype=torch.bool, device=device)
+            hp_ = torch.zeros(B, dtype=torch.bool, device=device)
             dn = torch.zeros(B, dtype=torch.bool, device=device)
             for r in range(2):
                 _, r_, te, trc, info = env.step(act_full)
                 res = env.last_result
                 on, imp = res.contact_onsets[lid], res.contact_impacts[lid]
                 hw |= (on[:, 0] & (imp[:, 0] >= 1.5)) | (on[:, 1] & (imp[:, 1] >= 1.5))
+                hp_ |= on[:, 1] & (imp[:, 1] >= 1.5)
                 car = info["reward_components"]["car_contact"][lid].float(); tch = car < 0
                 hc |= tch & ~touching
                 d_ = (te | trc)[lid]; touching = tch & ~d_
                 dn |= d_
-            HW[t] = hw; HC[t] = hc; DN[t] = dn
+            HW[t] = hw; HC[t] = hc; DN[t] = dn; HP[t] = hp_
             last = torch.where(dn[:, None], torch.zeros_like(act), act)
             if dn.any():
                 opp_v_prev = None if env.M > 1 and bool(dn.all()) else opp_v_prev
@@ -152,6 +157,34 @@ def main():
         valid[t] &= since >= 10
         since = torch.where(any_hit[t], torch.zeros_like(since), since + 1)
         since = torch.where(DN[t], torch.full_like(since, 999), since)
+    # the geometric risk vs the learned hit head, on PROP hits only, every row (nothing is fit here)
+    with torch.no_grad():
+        PH = torch.zeros(N, B, device=device)
+        for t_ in range(N):
+            PH[t_] = torch.sigmoid(model.value_and_hit(norm(X[t_].float()))[1])
+    epp = torch.cumsum(DN.long(), 0) - DN.long()
+    vld = torch.ones(N, B, dtype=torch.bool, device=device); sinc = torch.full((B,), 999, device=device, dtype=torch.long)
+    for t_ in range(N):
+        vld[t_] &= sinc >= 10
+        sinc = torch.where(HW[t_] | HC[t_], torch.zeros_like(sinc), sinc + 1); sinc = torch.where(DN[t_], torch.full_like(sinc, 999), sinc)
+    for K in HOR:
+        yk = torch.zeros(N, B, dtype=torch.bool, device=device); okk = torch.zeros(N, B, dtype=torch.bool, device=device)
+        for t_ in range(N - K):
+            yk[t_] = (HP[t_:t_ + K] & (epp[t_:t_ + K] == epp[t_][None])).any(0); okk[t_] = True
+        m = okk & vld
+        print(f"[예측성] 상자 충돌 {K / 20:.1f} s 안: 기하 위험 AUC {auc(GR[m], yk[m].float()):.3f} | 학습된 충돌 예측 머리 AUC "
+              f"{auc(PH[m], yk[m].float()):.3f} (양성 {int(yk[m].sum())})", flush=True)
+    # time course before prop hits: median geo risk and P at 2 / 1 / 0.5 / 0.1 s before
+    idx = HP.nonzero()
+    for lag, nm in ((40, "2 s"), (20, "1 s"), (10, "0.5 s"), (2, "0.1 s")):
+        ok_ = idx[:, 0] >= lag
+        tt, bb = idx[ok_, 0] - lag, idx[ok_, 1]
+        same = epp[tt, bb] == epp[idx[ok_, 0], bb]
+        print(f"[예측성] 상자 충돌 {nm} 전 중앙값: 기하 위험 {float(GR[tt[same], bb[same]].median()):.2f}, 충돌 예측 머리 "
+              f"{float(PH[tt[same], bb[same]].median()):.2f} (n {int(same.sum())})", flush=True)
+    print(f"[예측성] 기하 위험 평균 {float(GR.mean()):.3f}, 0보다 큰 결정 {float((GR > 0).float().mean()) * 100:.1f} %", flush=True)
+    if os.environ.get("GEO_ONLY"):
+        return
     for K in HOR:
         for nm, H in (("ob", HW), ("car", HC)):
             y = torch.zeros(N, B, dtype=torch.bool, device=device); ok = torch.zeros(N, B, dtype=torch.bool, device=device)

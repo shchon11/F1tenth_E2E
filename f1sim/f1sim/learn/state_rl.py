@@ -109,6 +109,41 @@ class StateObs:
         return out
 
 
+def geo_risk(env, lid, horizon=1.0, n=10, margin=0.30, radius=0.20):
+    """(B,) in [0, 1]: how deep the car's next `horizon` seconds -- a constant-curvature arc from its speed and yaw rate --
+    run into a live prop, from the props' true shapes (their local half-planes at their poses). 0 while the arc keeps
+    `margin` of clearance beyond the car's `radius`, 1 at contact. A state function: as a potential (Ng et al. 1999) it
+    leaves the optimum alone and only moves the price of a hit to the moment the path first crosses the prop (10-29: the
+    learned hit head rises only 0.5 s before, median P 0.05 at 1 s, though the hits are avoidable and worth avoiding)."""
+    po = env.procedural
+    st = env.last_result.state[lid]
+    B = st.shape[0]
+    if po is None or po.C == 0:
+        return torch.zeros(B, device=st.device)
+    x, y, yaw, v, r = st[:, 0], st[:, 1], st[:, 2], st[:, 3].clamp_min(0.0), st[:, 5]
+    kap = r / v.clamp_min(0.5)
+    t = torch.linspace(horizon / n, horizon, n, device=st.device)
+    sa = v[:, None] * t[None, :]                                          # (B, n) arc length
+    k_ = kap[:, None]
+    small = k_.abs() < 1e-3
+    th = yaw[:, None] + k_ * sa
+    ks = torch.where(small, torch.ones_like(k_), k_)
+    px = torch.where(small, x[:, None] + sa * torch.cos(yaw)[:, None], x[:, None] + (torch.sin(th) - torch.sin(yaw)[:, None]) / ks)
+    py = torch.where(small, y[:, None] + sa * torch.sin(yaw)[:, None], y[:, None] - (torch.cos(th) - torch.cos(yaw)[:, None]) / ks)
+    pp = po.p_poses[lid]                                                  # (B, C, 3)
+    live = po.p_sid[lid] >= 0                                             # (B, C)
+    dx = px[:, None, :] - pp[:, :, None, 0]; dy = py[:, None, :] - pp[:, :, None, 1]   # (B, C, n)
+    c, s_ = torch.cos(pp[..., 2])[..., None], torch.sin(pp[..., 2])[..., None]
+    lx, ly = dx * c + dy * s_, -dx * s_ + dy * c                          # the arc in each prop's own frame
+    nrm, off = po.p_n[lid], po.p_d[lid]                                   # (B, C, k, 2), (B, C, k)
+    fin = torch.isfinite(off)
+    sd = nrm[..., None, :, 0] * lx[..., None] + nrm[..., None, :, 1] * ly[..., None] - torch.where(fin, off, torch.zeros_like(off))[..., None, :]
+    sd = torch.where(fin[..., None, :], sd, torch.full_like(sd, -1e9)).amax(-1)        # (B, C, n): > 0 outside
+    sd = torch.where(live[..., None], sd, torch.full_like(sd, 1e9))
+    clear = sd.amin(-1).amin(-1) - radius
+    return ((margin - clear) / margin).clamp(0.0, 1.0)
+
+
 class RunningNorm:
     def __init__(self, dim, device, clip=8.0):
         self.mean = torch.zeros(dim, device=device); self.var = torch.ones(dim, device=device); self.n = 1e-4
@@ -222,6 +257,7 @@ def train(a):
         blp = torch.zeros(T, B, device=device); bv = torch.zeros(T + 1, B, device=device)
         br = torch.zeros(T, B, device=device); bd = torch.zeros(T, B, device=device)
         bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
+        bg = torch.zeros(T + 1, B, device=device)
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = 0.0; laps = []
         tr0 = time.time()
@@ -245,6 +281,8 @@ def train(a):
                     blv[t] = env.level_seed[lid]
                 v_t, hl_t = model.value_and_hit(on)
                 bv[t] = v_t * (ret_rms.var.sqrt() + 1e-6); bp[t] = torch.sigmoid(hl_t)
+                if float(a.geo_shaping) > 0:
+                    bg[t] = geo_risk(env, lid)
                 rew = torch.zeros(B, device=device); done = torch.zeros(B, dtype=torch.bool, device=device)
                 hit_now = torch.zeros(B, dtype=torch.bool, device=device)
                 act_full[lid] = act.clamp(-1, 1)
@@ -278,6 +316,8 @@ def train(a):
                 o = obs_fn(last_a)
             v_T, hl_T = model.value_and_hit(norm(o))
             bv[T] = v_T * (ret_rms.var.sqrt() + 1e-6); bp[T] = torch.sigmoid(hl_T)
+            if float(a.geo_shaping) > 0:
+                bg[T] = geo_risk(env, lid)
             # the hit head's labels: a hard hit within the next K decisions of the same episode (incomplete windows masked)
             K = int(a.hit_horizon)
             y_hit = torch.zeros(T, B, device=device); v_hit = torch.zeros(T, B, device=device)
@@ -293,8 +333,8 @@ def train(a):
                 v_hit[t] = (complete | ended | (y_hit[t] > 0)).float()
             # potential-based shaping (Ng et al. 1999, the optimum unchanged): Phi(s) = -price x P(hard hit within K | s)
             shaping = torch.zeros(T, B, device=device)
-            if a.hit_shaping > 0:
-                phi = -float(a.hit_shaping) * price * bp
+            if a.hit_shaping > 0 or float(a.geo_shaping) > 0:
+                phi = -float(a.hit_shaping) * price * bp - float(a.geo_shaping) * price * bg
                 shaping = a.gamma * phi[1:] * (1.0 - bd) - phi[:-1]
             adv = torch.zeros(T, B, device=device); last = torch.zeros(B, device=device)
             for t in reversed(range(T)):
@@ -354,7 +394,8 @@ def train(a):
                  "J80_per_step": float((prog - 80.0 * (hits_w + hits_c)) / (T * R * B)),
                  "hit_p_pos": float((bp[:T] * y_hit * v_hit).sum() / (y_hit * v_hit).sum().clamp_min(1.0)),
                  "hit_p_neg": float((bp[:T] * (1 - y_hit) * v_hit).sum() / ((1 - y_hit) * v_hit).sum().clamp_min(1.0)),
-                 "shaping_abs": float(shaping.abs().mean())}
+                 "shaping_abs": float(shaping.abs().mean()), "geo_risk_mean": float(bg[:T].mean()),
+                 "geo_risk_before_hit": float((bg[:T] * y_hit).sum() / y_hit.sum().clamp_min(1.0))}
         log.write(json.dumps(stats) + "\n"); log.flush()
         if u % 5 == 0 or u == upd0 + 1:
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
@@ -439,6 +480,8 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--geo-shaping", type=float, default=0.0,
+                    help="potential -X x price x geo_risk (the 1 s arc's overlap with a prop); 0 = off")
     ap.add_argument("--car-price", type=float, default=0.0,
                     help="final price of a hard car contact (0 = --price); ramps with the price schedule")
     ap.add_argument("--noise-corr", type=float, default=0.0,
