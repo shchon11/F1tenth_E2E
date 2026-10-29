@@ -287,7 +287,7 @@ def evaluate_student():
           f"추월당함 {tot['passed'] / max(tot['km'], 1e-9):.2f}/km, 3 m 안 뒤따름 {tot['follow'] / max(tot['n'], 1) * 100:.0f} %", flush=True)
 
 
-def make_env_like(ref, device, n_beams, frames, stride, is_teacher, envs=None):
+def make_env_like(ref, device, n_beams, frames, stride, is_teacher, envs=None, override=None):
     """The env of one old eval_ckpt.sh run (its JSON's `metadata.env_config`), with only the action / observation contract
     of a direct-command policy changed: (env, cfg, ecfg, metadata)."""
     import dataclasses
@@ -312,6 +312,8 @@ def make_env_like(ref, device, n_beams, frames, stride, is_teacher, envs=None):
     ec.update(action_mode="direct", obs_version=1, scan_stack=frames, scan_stride=stride, v_max_policy=10.0)
     if is_teacher:
         ec.update(priv_props=True, priv_time=True)
+    if override:
+        ec.update(override)
     ecfg = EnvConfig(**ec)
     limits = md.get("teacher_limits") or common.teacher_limits(7.0, 6.5, 4.0)
     race = int(ecfg.race_size) > 1

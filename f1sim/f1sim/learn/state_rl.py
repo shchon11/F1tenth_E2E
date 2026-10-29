@@ -53,14 +53,15 @@ def build_env(a, device, extra=None):
              reward_wrong_way=0.4, reward_proximity=0.0, reward_lap=0.0, reward_lap_time=0.0,
              spawn_runway=3.0, priv_props=True, priv_time=True, compile_tracker=False)
     if a.stage in ("props", "race"):
-        e.update(procedural_obstacles=1.0, procedural_density=float(getattr(a, "prop_density", 1.5)),
+        e.update(procedural_obstacles=float(getattr(a, "prop_fraction", 1.0)), procedural_density=float(getattr(a, "prop_density", 1.5)),
                  procedural_max_props=int(getattr(a, "prop_max", 18)),
                  procedural_raceline_corridor="off", movable_obstacles=True)
     if a.stage == "race":
         # the competition's format: 1 vs 1, the four planner kinds at 0.7-1.05 of their pace, reacting and with events
         # (the training world's slot without the league: league entries read a full scan, this env casts --beams)
         slot = {"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", "interactive"], "speed_scale": [0.7, 1.05],
-                "present": 1.0, "spawn": "random", "reactive": {"defend": 0.3, "line": 0.2, "oblivious": 0.1},
+                "present": float(getattr(a, "opp_present", 1.0)), "spawn": "random",
+                "reactive": {"defend": 0.3, "line": 0.2, "oblivious": 0.1},
                 "events": ["brake", "stop", "shift", "weave"], "event_rate": 0.5}
         from .. import opponent_slots as opp_sl
         e.update(race_size=2, opponent="slots", opponent_slots=opp_sl.parse_slots(json.dumps([slot])))
@@ -217,6 +218,47 @@ def geo_risk(env, lid, horizon=1.0, n=10, margin=0.30, radius=0.20):
     return ((margin - clear) / margin).clamp(0.0, 1.0)
 
 
+class PropRemoval:
+    """The competition's sessions (10-29, user: "혼자 달리는 세션이 있고 1대1로 달리는 세션이 있는데, 둘 다 장애물을 고정된 위치에
+    두고 있다가 시간이 지나면 치우는 식으로 해서 장애물 치우면 또 원래 가장 빠른 라인으로 달려야 함"): per race, with probability `p`
+    the layout vanishes at a time drawn in [lo, hi] s after the episode start (fixed: lo = hi), the same moment for every car of
+    the race. A removed prop is a dead slot like any unused one (`p_sid` -1, z_hi < z_lo, no mass): the beams, the contact test,
+    the privileged obs, the corridor and the prop-aware opponents all read those. Call `step()` after every env step."""
+
+    def __init__(self, env, p: float, lo: float, hi: float, seed: int = 0):
+        self.env, self.p, self.lo, self.hi = env, float(p), float(lo), float(hi)
+        self.R = env.B // env.M
+        dev = env.device
+        self.g = torch.Generator(device=dev); self.g.manual_seed(int(seed))
+        self.t_rm = torch.full((self.R,), float("inf"), device=dev)
+        self.removed = torch.zeros(self.R, dtype=torch.bool, device=dev)
+        self.prev = torch.full((self.R,), 10 ** 9, dtype=torch.long, device=dev)
+        self.first = env.learner_ids if env.M > 1 else torch.arange(env.B, device=dev)
+
+    def step(self):
+        env, po = self.env, self.env.procedural
+        if po is None or self.p <= 0:
+            return
+        es = env.ep_step[self.first].long()
+        new = es < self.prev                                              # this race's episode (and layout) began anew
+        if bool(new.any()):
+            n = int(new.sum())
+            draw = torch.rand(n, device=es.device, generator=self.g) < self.p
+            t = self.lo + (self.hi - self.lo) * torch.rand(n, device=es.device, generator=self.g)
+            self.t_rm[new] = torch.where(draw, t, torch.full_like(t, float("inf")))
+            self.removed[new] = False
+        self.prev = es
+        due = (~self.removed) & (es.float() * float(env.sim.control_dt) >= self.t_rm)
+        if bool(due.any()):
+            races = due.nonzero().flatten()
+            rows = (races[:, None] * env.M + torch.arange(env.M, device=races.device)[None, :]).flatten()
+            po.p_sid[rows] = -1
+            po.p_zhi[rows] = po.p_zlo[rows] - 1.0
+            po.p_mass[rows] = 0.0
+            po.p_vel[rows] = 0.0
+            self.removed |= due
+
+
 class RunningNorm:
     def __init__(self, dim, device, clip=8.0):
         self.mean = torch.zeros(dim, device=device); self.var = torch.ones(dim, device=device); self.n = 1e-4
@@ -315,6 +357,8 @@ def train(a):
     T, R = int(a.horizon), int(a.repeat)
     touching = torch.zeros(B, dtype=torch.bool, device=device)
     eps_n = torch.randn(B, 2, device=device)                       # the correlated exploration state (--noise-corr)
+    remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
+        if float(a.removal_p) > 0 else None
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
           f"롤아웃 {T}결정 = {T * R} 스텝, 가격 {a.price:g}", flush=True)
     t0 = time.time()
@@ -361,6 +405,8 @@ def train(a):
                 act_full[lid] = act.clamp(-1, 1)
                 for k in range(R):
                     _, r_, te, trc, info = env.step(act_full)
+                    if remover is not None:
+                        remover.step()
                     comp = info["reward_components"]
                     col = comp["collision"][lid].float(); car = comp["car_contact"][lid].float()
                     tch = car < 0
@@ -553,6 +599,11 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--opp-present", type=float, default=1.0, help="race stage: share of races with the opponent on track")
+    ap.add_argument("--prop-fraction", type=float, default=1.0, help="share of resets that get a layout (the rest: empty track)")
+    ap.add_argument("--removal-p", type=float, default=0.0,
+                    help="competition sessions: share of episodes whose props are removed mid-episode")
+    ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0), help="the removal time window [s]")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,
