@@ -103,6 +103,7 @@ def main():
     ap.add_argument("--gap-rule", type=float, default=0.0,
                     help="falsifier for 'the teacher is near its optimum on cars': cap its speed command to keep this time "
                          "gap [s] (+0.3 m) to a car ahead in its lane; compare the J80 rate with the rule off")
+    ap.add_argument("--all-car", type=int, default=0, help="1: count every hard car contact, charged or not")
     ap.add_argument("--unwedge", type=int, default=0, help="1: the wedge recovery (as state_student evalx / training)")
     ap.add_argument("--steps-total", type=int, default=0, help="unused")
     ap.add_argument("--overlay-layout", type=int, default=0,
@@ -214,6 +215,8 @@ def main():
         enc_od = torch.full((env.B, po.C), 99.0, device=device)       # the nearest opponent's distance during it
     tracks = env.sim.track.tracks
     uw = Unwedge(env, lid) if int(a.unwedge) else None
+    env.sim.measure_impacts = True                     # car impacts too (as ContactSeverityMeter turns it on for evaluate)
+    car_prev_all = torch.zeros(B, dtype=torch.bool, device=device)
     for t in range(int(a.steps) // int(a.repeat)):
         ohist = torch.roll(ohist, -1, 0); ohist[-1] = o
         act = model.pi(norm(o)).clamp(-1, 1)
@@ -312,6 +315,12 @@ def main():
                     enc_od = torch.where(fin, torch.full_like(enc_od, 99.0), enc_od)
                 p_moved &= ~dn[:, None]
             hard_c = c_on & (res.car_impact[lid] >= 1.5) if res.car_impact is not None else c_on
+            if int(a.all_car) and res.car_collision is not None:
+                # every hard car contact onset (as learn.evaluate's ContactSeverityMeter counts), not only the ones the
+                # reward charges to this car (the car behind / alongside)
+                cc_now = res.car_collision[lid]
+                hard_c = cc_now & ~car_prev_all & (res.car_impact[lid] >= 1.5)
+                car_prev_all = cc_now.clone() & ~d_
             for kind, mask, impv in (("벽", hard_w, imp[:, 0]), ("상자", hard_p, imp[:, 1]),
                                      ("차", hard_c, res.car_impact[lid] if res.car_impact is not None else imp[:, 2])):
                 for i in mask.nonzero().flatten().tolist():
