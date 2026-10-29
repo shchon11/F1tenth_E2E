@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--removal-p", type=float, default=0.0)
     ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0))
     ap.add_argument("--unwedge", type=int, default=0)
+    ap.add_argument("--grid", type=int, default=0, help="1: the student reads a car-centred grid built from its LiDAR stack "
+                                                       "and odometry (learn.lidar_grid), the teacher's --bev cells (10-30)")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     a.price = 80.0
@@ -99,7 +101,12 @@ def main():
     ego_keys = sorted(k for k in obs if k != "scan")
     egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in ego_keys], 1)
     F, N = obs["scan"].shape[1], obs["scan"].shape[2]; E = egov(obs).shape[1]
-    student = Student(F, N, E).to(device)
+    from .lidar_grid import OdomHist, make_student
+    student = make_student(None, env, F, N, E, bool(a.grid), device)
+    oh = OdomHist(env, lid, F, int(a.stride)) if a.grid else None
+    if oh is not None:
+        oh.update()
+    stud = (lambda sc, eg, rl: student(sc, eg, rl)) if a.grid else (lambda sc, eg, rl: student(sc, eg))
     opt = torch.optim.Adam(student.parameters(), lr=a.lr)
     cap = int(a.buffer)
     # the scan buffer can live in host memory (--buffer-cpu): 400k samples x 4 frames x 1081 beams fp16 = 3.5 GB, which
@@ -107,6 +114,7 @@ def main():
     bdev = torch.device("cpu") if a.buffer_cpu else device
     b_scan = torch.zeros(cap, F, N, dtype=torch.float16, device=bdev, pin_memory=bool(a.buffer_cpu))
     b_ego = torch.zeros(cap, E, device=device); b_y = torch.zeros(cap, 2, device=device)
+    b_rel = torch.zeros(cap, F, 3, device=device)                     # the grid student's frame poses (odometry)
     b_w = torch.ones(cap, device=device)
     n_buf = 0; ptr = 0
     out = os.path.expanduser(f"~/f1sim_runs/{a.name}"); os.makedirs(out, exist_ok=True)
@@ -132,9 +140,11 @@ def main():
                 w_s = 1.0 + float(a.danger_weight) * torch.sigmoid(teacher.value_and_hit(tnorm(o))[1]) if float(a.danger_weight) > 0 \
                     else torch.ones(B, device=device)
                 ego_now = egov(obs)
-                s_act = student(obs["scan"][lid].float(), ego_now)
+                rel_now = oh.rel() if oh is not None else torch.zeros(B, F, 3, device=device)
+                s_act = stud(obs["scan"][lid].float(), ego_now, rel_now)
                 idx = torch.arange(ptr, ptr + B, device=device) % cap
                 b_scan[idx.to(bdev)] = obs["scan"][lid].half().to(bdev); b_ego[idx] = ego_now; b_y[idx] = y; b_w[idx] = w_s
+                b_rel[idx] = rel_now
                 ptr = (ptr + B) % cap; n_buf = min(cap, n_buf + B)
                 use_t = torch.rand(B, device=device) < beta
                 act = torch.where(use_t[:, None], y, s_act)
@@ -144,6 +154,8 @@ def main():
                     if unwedge is not None:
                         unwedge.before(act_full)
                     obs, r_, te, trc, info = env.step(act_full)
+                    if oh is not None:
+                        oh.update()
                     if unwedge is not None:
                         unwedge.after()
                     if remover is not None:
@@ -163,7 +175,7 @@ def main():
             perm = torch.randperm(n_buf, device=device)
             for i in range(0, n_buf, int(a.batch)):
                 j = perm[i:i + int(a.batch)]
-                pred = student(b_scan[j.to(bdev)].to(device, non_blocking=True).float(), b_ego[j])
+                pred = stud(b_scan[j.to(bdev)].to(device, non_blocking=True).float(), b_ego[j], b_rel[j])
                 per = ((pred - b_y[j]) ** 2 * torch.tensor([2.0, 1.0], device=device)).mean(1)
                 loss = (per * b_w[j]).sum() / b_w[j].sum()
                 opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
@@ -181,7 +193,7 @@ def main():
               f"학생-선생 차이 {st['student_vs_teacher_abs']:.3f} | 손실 {st['loss']:.4f}", flush=True)
         if it % 5 == 0 or it == int(a.iters):
             torch.save({"student": student.state_dict(), "frames": F, "beams": N, "ego_dim": E, "ego_keys": ego_keys,
-                        "args": vars(a), "iter": it},
+                        "args": vars(a), "iter": it, "grid": bool(a.grid)},
                        os.path.join(out, f"student_i{it}.pt"))
     print(f"[state_student] {a.name} 끝", flush=True)
 
@@ -435,11 +447,13 @@ def evaluate_like():
                     self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
                     self.net = None
                 else:
-                    self.st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device)
-                    self.st.load_state_dict(ck["student"]); self.st.eval()
+                    from .lidar_grid import StudentRunner
+                    self.st = StudentRunner(env, lid, ck, device)
                     self.keys = ck.get("ego_keys")
 
             def __call__(self, obs):
+                if not is_teacher:
+                    self.st.observe()                     # the pose the last step left (a grid student's odometry)
                 if self.uw is not None and self.t > 0:
                     self.uw.after()                       # the clocks advance on the step just taken
                 if self.t > 0:
@@ -455,7 +469,7 @@ def evaluate_like():
                     else:
                         keys = self.keys or sorted(k for k in obs if k != "scan")
                         ego = torch.cat([obs[k][lid].float().reshape(B, -1) for k in keys], 1)
-                        a_ = self.st(obs["scan"][lid].float(), ego)
+                        a_ = self.st(obs, ego)
                     self.act[lid] = a_; self.last = a_
                 out = self.act
                 if float(a.follow_rule) > 0:

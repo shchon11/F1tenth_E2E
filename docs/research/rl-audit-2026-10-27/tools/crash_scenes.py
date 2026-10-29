@@ -154,9 +154,9 @@ def main():
     obs_d, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     if sck is not None:
-        from f1sim.learn.state_student import Student
-        student = Student(int(sck["frames"]), int(sck["beams"]), int(sck["ego_dim"])).to(device)
-        student.load_state_dict(sck["student"]); student.eval()
+        from f1sim.learn.lidar_grid import StudentRunner
+        student = StudentRunner(env, lid, sck, device)              # the 1-D scan student or the grid student
+        student.observe()
         ego_keys = sck.get("ego_keys") or sorted(k for k in obs_d if k != "scan")
         egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in ego_keys], 1)
     dif_hist = torch.zeros(40, B, 2, device=device)        # (student - teacher) action per decision, last 2 s
@@ -258,7 +258,7 @@ def main():
             gap_on.append(float(limit.float().mean()))
         if sck is not None:
             with torch.no_grad():
-                s_act = student(obs_d["scan"][lid].float(), egov(obs_d)).clamp(-1, 1)
+                s_act = student(obs_d, egov(obs_d)).clamp(-1, 1)
             dif_hist = torch.roll(dif_hist, -1, 0); dif_hist[-1] = s_act - act
             dif_all.append((s_act - act).abs().mean(0).cpu())
             act = s_act
@@ -270,6 +270,8 @@ def main():
             if uw is not None:
                 uw.before(act_full)
             obs_d, r_, te, trc, info = env.step(act_full)
+            if sck is not None:
+                student.observe()                                   # the pose this step left (grid student odometry)
             if uw is not None:
                 uw.after()
             st = env.sim.state

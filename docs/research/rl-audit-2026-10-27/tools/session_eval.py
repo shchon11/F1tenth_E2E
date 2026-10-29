@@ -67,7 +67,8 @@ def run(a, ck, solo, device):
         net = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); net.load_state_dict(ck["model"], strict=False); net.eval()
         nrm = RunningNorm(o.shape[1], device); nrm.load_state_dict(ck["norm"])
     else:
-        st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device); st.load_state_dict(ck["student"]); st.eval()
+        from f1sim.learn.lidar_grid import StudentRunner
+        st = StudentRunner(env, lid, ck, device)                  # the 1-D scan student or the grid student
         keys = ck.get("ego_keys") or sorted(k for k in obs if k != "scan")
         egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in keys], 1)
     act_full = torch.zeros(env.B, env.act_dim, device=device)
@@ -85,11 +86,13 @@ def run(a, ck, solo, device):
         p_me = torch.zeros(B, device=device); p_op = torch.zeros(B, device=device)
     with torch.no_grad():
         for t in range(int(a.steps)):
+            if not is_teacher:
+                st.observe()                                         # the pose the last step left
             if t % R == 0:
                 if is_teacher:
                     act = net.pi(nrm(sobs(last))).clamp(-1, 1); last = act
                 else:
-                    act = st(obs["scan"][lid].float(), egov(obs))
+                    act = st(obs, egov(obs))
                 act_full[lid] = act
             if uw is not None:
                 uw.before(act_full)
