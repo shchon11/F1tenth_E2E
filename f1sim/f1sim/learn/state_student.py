@@ -84,7 +84,7 @@ def main():
     t_scan = bool(ck["args"].get("scan_obs", 0)); t_beams = int(ck["args"].get("beams", 36))
     # the teacher's observation: the state block, its noise-free scan at ITS beams (interpolated from this env's full
     # one over the same field of view), its prop corridor if it was trained with one
-    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), t_beams=t_beams)
+    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), t_beams=t_beams)
     obs, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
@@ -232,7 +232,7 @@ def evaluate_student():
         keys = ck.get("ego_keys") or sorted(k for k in obs if k != "scan")
         egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in keys], 1)
         if is_teacher:
-            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
+            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)))
             last = torch.zeros(B, 2, device=device)
             o_ = sobs(last)
             tp = ActorCritic(o_.shape[1]).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
@@ -399,7 +399,7 @@ def evaluate_like():
                 self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
                 self.uw = Unwedge(env, lid) if int(a.unwedge) else None
                 if is_teacher:
-                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
+                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)))
                     self.net = None
                 else:
                     self.st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device)

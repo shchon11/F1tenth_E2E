@@ -79,7 +79,7 @@ CORRIDOR_BINS = 7
 CORRIDOR_S = tuple(float(x) for x in np.arange(0.4, 26.01, 0.4))
 
 
-def corridor_block(env, lid, s, tid, inflate=0.15):
+def corridor_block(env, lid, s, tid, inflate=0.15, cars=False):
     """(B, 13 * 7) in {0, 1}: for each arc segment between consecutive track-ahead points (AHEAD; the first from the car
     to 1 m), which lateral bins across the track a live prop (inflated by the car's half width) covers anywhere along the
     segment -- the free corridor the props leave, in the frame of the centerline points the policy steers by (10-29:
@@ -89,7 +89,7 @@ def corridor_block(env, lid, s, tid, inflate=0.15):
     tr = env.sim.track
     B = s.shape[0]
     n_seg = len(AHEAD)
-    if po is None or po.C == 0:
+    if (po is None or po.C == 0) and not (cars and env.M > 1):
         return torch.zeros(B, n_seg * CORRIDOR_BINS, device=s.device)
     offs = torch.tensor(CORRIDOR_S, device=s.device)
     seg = torch.bucketize(offs, torch.tensor(AHEAD, device=s.device))     # (R,) segment of each dense row
@@ -102,9 +102,11 @@ def corridor_block(env, lid, s, tid, inflate=0.15):
     off = U[None, None, :] * w[..., None]                                 # (B, R, M)
     px = xy[..., 0:1] + off * nx[..., None]; py = xy[..., 1:2] + off * ny[..., None]
     blocked = torch.zeros(B, R, U.numel(), dtype=torch.bool, device=s.device)
-    pp_all = po.p_poses[lid]; live_all = po.p_sid[lid] >= 0
-    nrm_all, dd_all = po.p_n[lid], po.p_d[lid]
-    for c in range(po.C):                                                 # one prop slot at a time: bounded memory
+    n_slots = po.C if po is not None else 0
+    if n_slots:
+        pp_all = po.p_poses[lid]; live_all = po.p_sid[lid] >= 0
+        nrm_all, dd_all = po.p_n[lid], po.p_d[lid]
+    for c in range(n_slots):                                                 # one prop slot at a time: bounded memory
         live = live_all[:, c]
         if not bool(live.any()):
             continue
@@ -118,6 +120,20 @@ def corridor_block(env, lid, s, tid, inflate=0.15):
               - torch.where(fin, dd, torch.zeros_like(dd))[:, None, None, :])
         sd = torch.where(fin[:, None, None, :], sd, torch.full_like(sd, -1e9)).amax(-1)        # (B, R, M)
         blocked |= (sd < inflate) & live[:, None, None]
+    if cars and env.M > 1:
+        # the other cars in the same corridor (`--corridor-cars`, 10-29): a disc of 0.30 m (+ our half width) at each car's
+        # pose now and where its velocity takes it in 0.5 s and 1 s -- the rear-ends were of slower / stopped cars straight
+        # ahead while the policy steers by this channel and barely by the opponent block
+        st_all = env.last_result.state
+        o = env.sim.other_idx[lid]                                         # (B, M-1)
+        so = st_all[o]
+        co, si_ = torch.cos(so[..., 2]), torch.sin(so[..., 2])
+        vx = so[..., 3] * co - so[..., 4] * si_; vy = so[..., 3] * si_ + so[..., 4] * co
+        pres = (~env.sim.absent[o]) if env.sim.absent_any else torch.ones_like(vx, dtype=torch.bool)
+        for tau in (0.0, 0.5, 1.0):
+            cx = so[..., 0] + vx * tau; cy = so[..., 1] + vy * tau          # (B, M-1)
+            d2 = (px[:, None] - cx[..., None, None]) ** 2 + (py[:, None] - cy[..., None, None]) ** 2
+            blocked |= ((d2 < (0.30 + inflate) ** 2) & pres[..., None, None]).any(1)
     bins = blocked.reshape(B, R, CORRIDOR_BINS, -1).any(-1)                # (B, R, 7)
     out = torch.zeros(B, n_seg, CORRIDOR_BINS, dtype=torch.bool, device=s.device)
     for k in range(n_seg):
@@ -132,12 +148,14 @@ class StateObs:
     beams `--beams` casts) / range: the true shape of every prop, wall and car in view (10-29: three prop centres
     without their size let the car clip a prop's edge in every narrowing -- crash_scenes.py)."""
 
-    def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0):
+    def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
+                 corridor_cars: bool = False):
         self.env = env
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
         self.scan, self.scan_range = bool(scan), float(scan_range)
         self.corridor = bool(corridor)
+        self.corridor_cars = bool(corridor_cars)
         # t_beams: the teacher's own beam count when this env casts more (a student's env): its noise-free scan is
         # interpolated to those beams over the same field of view, as the teacher saw it in training
         self.interp = None
@@ -177,7 +195,7 @@ class StateObs:
                 sc = sc[:, i0] * (1 - w_) + sc[:, i0 + 1] * w_
             parts.append((sc / self.scan_range).clamp(0.0, 1.0))
         if self.corridor:
-            parts.append(corridor_block(env, lid, s, tid))
+            parts.append(corridor_block(env, lid, s, tid, cars=self.corridor_cars))
         out = torch.cat(parts, 1).float()
         self.dim = out.shape[1]
         return out
@@ -352,7 +370,7 @@ def train(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs))
+    obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs), corridor_cars=bool(a.corridor_cars))
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -580,7 +598,7 @@ def evaluate(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
+    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     last_a = torch.zeros(B, 2, device=device)
@@ -649,6 +667,7 @@ def main():
     ap.add_argument("--removal-p", type=float, default=0.0,
                     help="competition sessions: share of episodes whose props are removed mid-episode")
     ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0), help="the removal time window [s]")
+    ap.add_argument("--corridor-cars", type=int, default=0, help="1: mark the other cars (now, +0.5 s, +1 s) in the corridor")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,

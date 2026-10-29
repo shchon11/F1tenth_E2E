@@ -6,15 +6,17 @@ sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import state_rl
 from f1sim.learn.state_rl import ActorCritic, RunningNorm, StateObs, AHEAD, CORRIDOR_U, CORRIDOR_S, CORRIDOR_BINS, corridor_block
 
-ap = argparse.ArgumentParser(); ap.add_argument("ckpt"); ap.add_argument("--out", required=True); a0 = ap.parse_args()
+ap = argparse.ArgumentParser(); ap.add_argument("ckpt"); ap.add_argument("--out", required=True); ap.add_argument("--cars", type=int, default=0)
+a0 = ap.parse_args()
 dev = torch.device("cuda")
-a = argparse.Namespace(stage="props", warps=0, beams=108, envs=8, episode_s=40.0, seed=3, prop_density=1.5, prop_max=18)
+a = argparse.Namespace(stage=("race" if a0.cars else "props"), warps=0, beams=108, envs=16, episode_s=40.0, seed=3, prop_density=1.5, prop_max=18,
+                       opp_present=1.0, opp_spawn="ahead")
 env = state_rl.build_env(a, dev, extra=dict(stagger_first_episode=False))
 from f1sim.learn.graph_runtime import prepare_graph_runtime
 prepare_graph_runtime(env, log=lambda _t: None)
 env.reset(seed=3)
 ck = torch.load(a0.ckpt, map_location=dev, weights_only=False)
-sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)))
+sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
 lid = env.learner_ids; B = int(lid.numel()); last = torch.zeros(B, 2, device=dev)
 o = sobs(last); net = ActorCritic(o.shape[1]).to(dev); net.load_state_dict(ck["model"], strict=False)
 nrm = RunningNorm(o.shape[1], dev); nrm.load_state_dict(ck["norm"]); act_full = torch.zeros(env.B, env.act_dim, device=dev)
@@ -27,17 +29,21 @@ with torch.no_grad():
         act = net.pi(nrm(sobs(last))).clamp(-1, 1); last = act; act_full[lid] = act
         for r in range(2):
             env.step(act_full)
-        if t % 60 != 30 or k_img >= 6:
+        if t % 40 != 10 or k_img >= 6:
             continue
         st = env.last_result.state[lid]; s = env.last_result.s[lid]; tid = env.sim.tid[lid]
         n = len(AHEAD)
-        blk = corridor_block(env, lid, s, tid).reshape(B, n, CORRIDOR_BINS).cpu().numpy()
+        blk = corridor_block(env, lid, s, tid, cars=bool(a0.cars)).reshape(B, n, CORRIDOR_BINS).cpu().numpy()
         offs = torch.tensor(CORRIDOR_S, device=dev); R = offs.numel()
         seg = torch.bucketize(offs, torch.tensor(AHEAD, device=dev)).cpu().numpy()
         xy_k, yaw_k = tr.pose_at_s((s[:, None] + offs[None, :]).reshape(-1), tid.repeat_interleave(R))
         xy_k = xy_k.reshape(B, R, 2); yaw_k = yaw_k.reshape(B, R)
         w = tr.sample_edt(xy_k, tid[:, None].expand(-1, R))
-        i = int(np.argmax(blk.reshape(B, -1).sum(1)))           # the car with the most blocked cells ahead
+        if env.M > 1:
+            o_ = env.sim.other_idx[lid][:, 0]; dd_ = (env.last_result.state[o_, :2] - st[:, :2]).norm(dim=1).cpu().numpy()
+            i = int(np.argmin(np.where(dd_ > 0.5, dd_, 99)))     # the car closest behind / beside its opponent
+        else:
+            i = int(np.argmax(blk.reshape(B, -1).sum(1)))           # the car with the most blocked cells ahead
         ax = axs.flat[k_img]; k_img += 1
         track = tr.tracks[0]; occ = track.occupancy; res = track.resolution; ox, oy = track.origin
         x0, y0 = [float(v) for v in st[i, :2]]; W = 9.0
@@ -60,6 +66,13 @@ with torch.no_grad():
                 bad = blk[i, seg[kk], m // 2] > 0.5
                 ax.plot(px_, py_, "o", ms=2.5, color=("red" if bad else "limegreen"), alpha=(0.9 if bad else 0.35))
         yaw0 = float(st[i, 2]); ax.arrow(x0, y0, 0.6 * math.cos(yaw0), 0.6 * math.sin(yaw0), width=0.08, color="blue")
+        if env.M > 1:
+            for q in env.sim.other_idx[int(lid[i])].tolist():
+                so = env.last_result.state[q]
+                ax.plot(float(so[0]), float(so[1]), "s", color="purple", ms=9)
+                c_, s_ = math.cos(float(so[2])), math.sin(float(so[2]))
+                vx_ = float(so[3]) * c_ - float(so[4]) * s_; vy_ = float(so[3]) * s_ + float(so[4]) * c_
+                ax.plot([float(so[0]), float(so[0]) + vx_], [float(so[1]), float(so[1]) + vy_], "-", color="purple", lw=2)
         ax.set_xlim(x0 - W, x0 + W); ax.set_ylim(y0 - W, y0 + W); ax.set_aspect("equal")
         ax.set_title(f"차 {i}, 결정 {t}: 앞 13구간 x 가로 7칸 (빨강 = 그 구간·칸이 상자에 막힘, 차 반폭 0.15 m 부풀림)", fontsize=8)
 fig.tight_layout(); fig.savefig(a0.out); print("saved", a0.out)
