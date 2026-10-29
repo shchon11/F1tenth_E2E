@@ -476,7 +476,7 @@ class BevNet(nn.Module):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None, bev=None):
+    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None, bev=None, shared_enc=False):
         super().__init__()
         self.bev = tuple(bev) if bev else None
         #: `--std-floor` (10-29): the race teachers cut their speed noise 0.66 -> 0.20 m/s, the cheapest way to fewer hits,
@@ -485,6 +485,11 @@ class ActorCritic(nn.Module):
         if self.bev:
             self.pi = BevNet(obs_dim, self.bev, act_dim, hidden)
             self.v = BevNet(obs_dim, self.bev, 1, hidden)
+            if shared_enc:
+                # `--shared-enc` (10-30): ONE grid encoder for actor and critic -- the value / hit-head losses are supervised and
+                # build prop / car features fast, the policy gradient alone did not (srl31 100 updates: the critic's first-layer
+                # prop weights 0 -> 0.106, the actor's 0 -> 0.022; the actor's steering ignored the prop channel)
+                self.v.conv = self.pi.conv; self.v.proj = self.pi.proj
             last_pi = self.pi.mlp[-1]
         else:
             self.pi = mlp(obs_dim, act_dim, hidden)
@@ -531,7 +536,7 @@ def train(a):
     D = obs_fn.dim
     bev = (BEV_C, BEV_H, BEV_W) if a.bev else None
     model = ActorCritic(D, log_std=a.log_std, std_floor=[float(x) for x in a.std_floor] if a.std_floor else None,
-                        bev=bev).to(device)
+                        bev=bev, shared_enc=bool(a.shared_enc)).to(device)
     norm = RunningNorm(D, device, raw_tail=obs_fn.grid_dim)
     ret_rms = RunningNorm(1, device)
     upd0 = 0
@@ -547,6 +552,11 @@ def train(a):
             ck["norm"] = {"mean": torch.cat([nm["mean"], torch.zeros(D - d0, device=device)]),
                           "var": torch.cat([nm["var"], torch.ones(D - d0, device=device)]), "n": nm["n"]}
             print(f"[state_rl] --init 관측 {d0} -> {D}차원: 새 입력은 가중치 0으로 시작", flush=True)
+        if a.bev and a.shared_enc and not ck["args"].get("shared_enc"):
+            # the shared encoder starts as the ACTOR's (its head keeps the features it was trained on; the critic re-fits)
+            for k in [k for k in sd if k.startswith("pi.conv.") or k.startswith("pi.proj.")]:
+                sd["v." + k[3:]] = sd[k].clone()
+            print("[state_rl] --init: 공유 격자 인코더를 부모 정책의 것에서 시작", flush=True)
         if a.bev and ck["args"].get("stage") == "solo" and a.stage != "solo":
             # a solo parent never saw a prop or a car: its first conv layer's weights on those grid channels (1..) got no
             # gradient and are still the random init -- zero them, so the first update drives as the parent did
@@ -830,6 +840,7 @@ def main():
     ap.add_argument("--car-channel", type=int, default=0, help="1: the other cars in their own corridor block (appended)")
     ap.add_argument("--bev", type=int, default=0, help="1: the car-centred grid of walls / props / cars + a conv (10-30)")
     ap.add_argument("--v-min", type=float, default=0.0, help="[m/s] the slowest command, < 0 lets the policy reverse")
+    ap.add_argument("--shared-enc", type=int, default=0, help="1: actor and critic share the --bev grid encoder")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,
