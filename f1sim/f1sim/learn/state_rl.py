@@ -547,6 +547,12 @@ def train(a):
             ck["norm"] = {"mean": torch.cat([nm["mean"], torch.zeros(D - d0, device=device)]),
                           "var": torch.cat([nm["var"], torch.ones(D - d0, device=device)]), "n": nm["n"]}
             print(f"[state_rl] --init 관측 {d0} -> {D}차원: 새 입력은 가중치 0으로 시작", flush=True)
+        if a.bev and ck["args"].get("stage") == "solo" and a.stage != "solo":
+            # a solo parent never saw a prop or a car: its first conv layer's weights on those grid channels (1..) got no
+            # gradient and are still the random init -- zero them, so the first update drives as the parent did
+            for k in ("pi.conv.0.weight", "v.conv.0.weight"):
+                sd[k] = sd[k].clone(); sd[k][:, 1:] = 0.0
+            print("[state_rl] --init 혼자 부모: 격자 상자·차 채널의 첫 합성곱 가중치를 0에서 시작", flush=True)
         missing = [k for k in model.load_state_dict(sd, strict=False).missing_keys if k != "std_floor"]
         if a.std_floor:                                    # this run's floor, not the one an --init checkpoint carried
             model.std_floor.copy_(torch.tensor([float(x) for x in a.std_floor], device=device))

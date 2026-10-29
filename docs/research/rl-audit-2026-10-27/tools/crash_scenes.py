@@ -183,6 +183,17 @@ def main():
         groups["상자 통로"] = corr_cols
     if n_car:
         groups["차 통로"] = list(range(D_all - n_car, D_all))
+    slot_cols = list(range(33, 45))                       # what "props erased" zeroes besides the corridor
+    is_bev = bool(ck0["args"].get("bev", 0))
+    if is_bev:
+        # state_rl.StateObs(bev=True): own state 8, time left, track ahead 13 x 4, steer, last action, then the grid
+        from f1sim.learn.state_rl import BEV_C, BEV_H, BEV_W
+        HW = BEV_H * BEV_W; G0 = D_all - BEV_C * HW
+        groups = {"내 차": list(range(0, 8)), "남은 시간": [8], "앞 트랙": list(range(9, 61)), "조향각": [61],
+                  "직전 행동": [62, 63], "격자 벽": list(range(G0, G0 + HW)), "격자 상자": list(range(G0 + HW, G0 + 2 * HW)),
+                  "격자 차": list(range(G0 + 2 * HW, D_all))}
+        slot_cols = list(range(G0 + HW, G0 + 2 * HW))      # the grid's prop channel
+        corr_cols = []
     probe = []                                           # per hit: the policy's response 0.5 s before it
 
     def respond(x_raw):
@@ -264,7 +275,7 @@ def main():
             st = env.sim.state
             cmd = torch.zeros(env.B, 2, device=device); cmd[lid] = act
             hist = torch.roll(hist, -1, 0)
-            hist[-1] = torch.cat([st[:, :4], cmd[:, :1] * float(env.s_max), (cmd[:, 1:2] + 1) / 2 * float(env.ecfg.v_max_policy)], 1)
+            hist[-1] = torch.cat([st[:, :4], cmd[:, :1] * float(env.s_max), a.v_min + (cmd[:, 1:2] + 1) / 2 * (float(env.ecfg.v_max_policy) - a.v_min)], 1)
             res = env.last_result
             comp = info["reward_components"]
             car = comp["car_contact"][lid].float(); tch = car < 0; c_on = tch & ~touching
@@ -370,12 +381,12 @@ def main():
                     if n_dec >= 11:
                         x0 = ohist[-11, i][None].clone()
                         a_full, v_full, sal, _ = respond(x0)
-                        x_np = x0.clone(); x_np[0, 33:45] = 0.0
+                        x_np = x0.clone(); x_np[0, slot_cols] = 0.0
                         if corr_cols:
                             x_np[0, corr_cols] = 0.0          # the prop corridor is props too
                         a_np, v_np, _, _ = respond(x_np)
                         # which prop input drives it: the 3 nearest-prop slots alone / the prop corridor alone erased
-                        x_ns = x0.clone(); x_ns[0, 33:45] = 0.0
+                        x_ns = x0.clone(); x_ns[0, slot_cols] = 0.0
                         a_ns, _, _, _ = respond(x_ns)
                         x_nc = x0.clone()
                         if corr_cols:
@@ -384,18 +395,18 @@ def main():
                         rr = [respond(ohist[-k, i][None].clone()) for k in (min(n_dec, 40), 21, 11, 1)]
                         vals = [r_[1] for r_ in rr]; phs = [r_[3] for r_ in rr]
                         ev.update(resp={"steer_deg": float(a_full[0]) * math.degrees(float(env.s_max)),
-                                        "speed_ms": (float(a_full[1]) + 1) / 2 * float(env.ecfg.v_max_policy),
+                                        "speed_ms": a.v_min + (float(a_full[1]) + 1) / 2 * (float(env.ecfg.v_max_policy) - a.v_min),
                                         "steer_deg_noprops": float(a_np[0]) * math.degrees(float(env.s_max)),
                                         "steer_deg_noslots": float(a_ns[0]) * math.degrees(float(env.s_max)),
                                         "steer_deg_nocorr": float(a_nc[0]) * math.degrees(float(env.s_max)),
-                                        "speed_ms_noprops": (float(a_np[1]) + 1) / 2 * float(env.ecfg.v_max_policy),
+                                        "speed_ms_noprops": a.v_min + (float(a_np[1]) + 1) / 2 * (float(env.ecfg.v_max_policy) - a.v_min),
                                         "V_2s_1s_05s_0s": vals, "Phit_2s_1s_05s_0s": phs, "sal": sal,
-                                        "props_seen": int(float(x0[0, 33]) > 0.5)})
+                                        "props_seen": int(float(x0[0, slot_cols].max() if is_bev else x0[0, 33]) > 0.5)})
                         probe.append(ev["resp"])
                     # the nearest live prop and the room beside it: track width at its arc position (2 x the centerline's
                     # distance to the wall) minus the prop's own width across the track
                     po = env.procedural
-                    if po is not None and kind == "상자":
+                    if po is not None and kind == "상자" and not is_bev:
                         live = (po.p_sid[row] >= 0)
                         if live.any():
                             pc = po.p_poses[row, :, :2]
@@ -439,7 +450,7 @@ def main():
                     if sck is not None:
                         dd = dif_hist[-10:, i].cpu().numpy()                  # last 0.5 s
                         ev["stud_minus_teach_05s"] = {"steer_deg": float(np.mean(dd[:, 0])) * math.degrees(float(env.s_max)),
-                                                      "speed_ms": float(np.mean(dd[:, 1])) / 2 * float(env.ecfg.v_max_policy)}
+                                                      "speed_ms": float(np.mean(dd[:, 1])) / 2 * (float(env.ecfg.v_max_policy) - a.v_min)}
                         dif_hit.append((kind, ev["stud_minus_teach_05s"]["steer_deg"], ev["stud_minus_teach_05s"]["speed_ms"]))
                     events.append({k: v for k, v in ev.items() if k != "traj"})
                     if n_img < int(a.max_images):
@@ -488,7 +499,7 @@ def main():
           f"{(prog_m - 80.0 * n_hard) / secs:.4f} m/s" + (f" | 간격 규칙이 막은 결정 {np.mean(gap_on) * 100:.1f} %" if gap_on else ""), flush=True)
     if sck is not None and dif_all:
         da = torch.stack(dif_all).mean(0).numpy()
-        print(f"[학생] 평소 |학생-선생| 조향 {da[0] * math.degrees(float(env.s_max)):.1f}도, 속도 {da[1] / 2 * float(env.ecfg.v_max_policy):.2f} m/s", flush=True)
+        print(f"[학생] 평소 |학생-선생| 조향 {da[0] * math.degrees(float(env.s_max)):.1f}도, 속도 {da[1] / 2 * (float(env.ecfg.v_max_policy) - a.v_min):.2f} m/s", flush=True)
         for kind in ("벽", "상자", "차"):
             q = [(x, y) for k_, x, y in dif_hit if k_ == kind]
             if q:
