@@ -56,7 +56,7 @@ def run(a, ck, solo, device):
     obs, _ = env.reset(seed=int(md["seed"]))
     lid = env.learner_ids; B = int(lid.numel())
     rem = PropRemoval(env, 1.0, float(a.remove_at), float(a.remove_at), seed=1)
-    uw = Unwedge(env, lid) if int(a.unwedge) else None
+    uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     R = int(ck["args"].get("repeat", 2))
     if is_teacher:
         sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)))

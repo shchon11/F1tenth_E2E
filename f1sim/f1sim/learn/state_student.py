@@ -89,7 +89,7 @@ def main():
     lid = env.learner_ids; B = int(lid.numel())
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
         if float(a.removal_p) > 0 else None
-    unwedge = Unwedge(env, lid) if int(a.unwedge) else None
+    unwedge = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
 
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
@@ -426,7 +426,7 @@ def evaluate_like():
             def __init__(self):
                 self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
                 self.bound = 0; self.n_rule = 0
-                self.uw = Unwedge(env, lid) if int(a.unwedge) else None
+                self.uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
                 if is_teacher:
                     self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)))
                     self.net = None

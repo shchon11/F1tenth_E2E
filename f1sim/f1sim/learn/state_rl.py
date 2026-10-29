@@ -291,8 +291,14 @@ class Unwedge:
     wall). It drives through the env's external-command override, vectorised; the policy's own action is what is
     recorded. Call `before(act_full)` before `env.step` and `after()` right after it."""
 
-    def __init__(self, env, rows, wedge_s=1.0, backout_s=0.75, v_gate=0.4, v_reverse=0.8):
+    def __init__(self, env, rows, wedge_s=1.0, backout_s=0.75, v_gate=0.4, v_reverse=0.8, mode=1):
         self.env, self.rows = env, rows
+        #: mode 1: the old tracker's mirrored steering. mode 2 (10-30): the back-out steering turns the nose toward the
+        #: freer side of the car's own front scan, latched for the back-out -- the mirror assumes the policy was steering
+        #: away from what it hit; in the srl21 loop it steered INTO a prop at the inner wall, the mirrored back-out turned
+        #: the nose further toward it, and the car re-hit the same prop 15 times in 37 s
+        self.mode = int(mode)
+        self.rev_steer = torch.zeros(env.B, device=env.device)
         dev = env.device
         self.mask = torch.zeros(env.B, dtype=torch.bool, device=dev); self.mask[rows] = True
         self.wedged_t = torch.zeros(env.B, device=dev); self.backout_t = torch.zeros(env.B, device=dev)
@@ -305,7 +311,10 @@ class Unwedge:
         env = self.env
         on = (self.backout_t > 1e-6) & self.mask
         env.ext_mask.copy_(on)
-        env.ext_cmd[:, 0] = -act_full[:, 0] * float(env.s_max)
+        if self.mode == 2:
+            env.ext_cmd[:, 0] = self.rev_steer
+        else:
+            env.ext_cmd[:, 0] = -act_full[:, 0] * float(env.s_max)
         env.ext_cmd[:, 1] = -self.v_rev
 
     def after(self):
@@ -317,6 +326,15 @@ class Unwedge:
         self.wedged_t = torch.where(touching, (self.wedged_t + step).clamp_min(0.0), torch.zeros_like(self.wedged_t))
         start = self.wedged_t >= self.wedge_s - 1e-6
         self.count += int(start.sum()) if bool(start.any()) else 0
+        if self.mode == 2 and bool(start.any()):
+            # reversing, a left steer swings the nose right: steer toward the MORE blocked front side
+            sc = env.last_result.scan.float()
+            ang = env.sim.lidar.angles
+            left = (ang > math.radians(10)) & (ang < math.radians(80))
+            right = (ang < -math.radians(10)) & (ang > -math.radians(80))
+            cl = torch.quantile(sc[:, left], 0.2, dim=1); cr = torch.quantile(sc[:, right], 0.2, dim=1)
+            st = torch.where(cl < cr, torch.full_like(cl, 0.7), torch.full_like(cl, -0.7)) * float(env.s_max)
+            self.rev_steer = torch.where(start, st, self.rev_steer)
         self.backout_t = torch.where(start, torch.full_like(self.backout_t, self.backout_s), (self.backout_t - dt).clamp_min(0.0))
         self.wedged_t = self.wedged_t.masked_fill(start, 0.0)
 
@@ -427,7 +445,7 @@ def train(a):
     eps_n = torch.randn(B, 2, device=device)                       # the correlated exploration state (--noise-corr)
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
         if float(a.removal_p) > 0 else None
-    unwedge = Unwedge(env, lid) if int(a.unwedge) else None
+    unwedge = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
           f"롤아웃 {T}결정 = {T * R} 스텝, 가격 {a.price:g}", flush=True)
     t0 = time.time()
@@ -673,7 +691,7 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
-    ap.add_argument("--unwedge", type=int, default=0, help="1: back a wedged car out (the old tracker's recovery)")
+    ap.add_argument("--unwedge", type=int, default=0, help="1: back a wedged car out (the old tracker's recovery, mirrored steering); 2: back-out steering from the front scan (10-30)")
     ap.add_argument("--opp-present", type=float, default=1.0, help="race stage: share of races with the opponent on track")
     ap.add_argument("--opp-spawn", default="random", help="race stage: where the opponent starts ('ahead': we start behind it)")
     ap.add_argument("--prop-fraction", type=float, default=1.0, help="share of resets that get a layout (the rest: empty track)")

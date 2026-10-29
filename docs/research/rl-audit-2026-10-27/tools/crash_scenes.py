@@ -216,7 +216,7 @@ def main():
         enc_vel = torch.zeros(env.B, po.C, device=device)             # the prop's own speed while the car was near
         enc_od = torch.full((env.B, po.C), 99.0, device=device)       # the nearest opponent's distance during it
     tracks = env.sim.track.tracks
-    uw = Unwedge(env, lid) if int(a.unwedge) else None
+    uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     env.sim.measure_impacts = True                     # car impacts too (as ContactSeverityMeter turns it on for evaluate)
     car_prev_all = torch.zeros(B, dtype=torch.bool, device=device)
     for t in range(int(a.steps) // int(a.repeat)):
