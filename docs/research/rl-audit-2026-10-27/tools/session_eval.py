@@ -77,6 +77,12 @@ def run(a, ck, solo, device):
     laps = {"전": [], "후": []}; prog = {"전": 0.0, "후": 0.0}; hits = {"전": 0, "후": 0}; secs = {"전": 0.0, "후": 0.0}
     lap_start = torch.zeros(B, device=device)
     touching = torch.zeros(B, dtype=torch.bool, device=device)
+    # the race result (10-30, the user: speed is judged solo; a 1 vs 1 is judged by who is ahead): the arc gap to the
+    # opponent at the start (signed, + = we lead; we start behind) plus the progress both make
+    opp = env.sim.other_idx[lid][:, 0] if (not solo and env.sim.other_idx is not None) else None
+    if opp is not None:
+        g0 = env.signed_gaps(env.last_result.s, env.sim.tid)[lid][:, 0].neg()           # + = we are ahead
+        p_me = torch.zeros(B, device=device); p_op = torch.zeros(B, device=device)
     with torch.no_grad():
         for t in range(int(a.steps)):
             if t % R == 0:
@@ -94,6 +100,8 @@ def run(a, ck, solo, device):
             ph = "전" if t * dt < t_rm else "후"
             path[t] = env.sim.state[lid, :2].cpu().numpy()
             prog[ph] += float(info["progress"][lid].float().sum()); secs[ph] += B * dt
+            if opp is not None:
+                p_me += info["progress"][lid].float(); p_op += info["progress"][opp].float()
             res = env.last_result
             on, imp = res.contact_onsets[lid], res.contact_impacts[lid]
             hits[ph] += int(((on[:, 0] & (imp[:, 0] >= 1.5)) | (on[:, 1] & (imp[:, 1] >= 1.5))).sum())
@@ -111,6 +119,10 @@ def run(a, ck, solo, device):
                     elif t_beg >= t_rm:
                         laps["후"].append(lt)
     out = {}
+    if opp is not None:
+        lead = (g0 + p_me - p_op).cpu().numpy()
+        out["결과"] = {"앞선 비율": float((lead > 0).mean()), "끝 차이 중앙 m": float(np.median(lead)),
+                      "출발 차이 중앙 m": float(np.median(g0.cpu().numpy()))}
     for ph in ("전", "후"):
         km = max(prog[ph], 1e-6) / 1000
         out[ph] = {"랩 중앙": float(np.median(laps[ph])) if laps[ph] else None, "랩 수": len(laps[ph]),
@@ -143,6 +155,10 @@ def main():
         tag = "혼자" if solo else "1대1"
         res, path, props, track, k_rm = run(a, ck, solo, device)
         summary[tag] = res
+        if "결과" in res:
+            r_ = res["결과"]
+            print(f"[대회 형식] {name} {tag} 결과: 뒤에서 출발(중앙 {r_['출발 차이 중앙 m']:+.1f} m) -> {a.steps * 0.025:.0f} s 뒤 상대보다 앞선 "
+                  f"경주 {r_['앞선 비율'] * 100:.0f} %, 끝 차이 중앙 {r_['끝 차이 중앙 m']:+.1f} m", flush=True)
         print(f"[대회 형식] {name} {tag}: 치우기 전 랩 {res['전']['랩 중앙']} ({res['전']['랩 수']}개) 진행 {res['전']['진행 m/s']:.2f} "
               f"강한 {res['전']['강한/km']:.2f}/km | 치운 뒤 랩 {res['후']['랩 중앙']} ({res['후']['랩 수']}개) 진행 {res['후']['진행 m/s']:.2f} "
               f"강한 {res['후']['강한/km']:.2f}/km", flush=True)
