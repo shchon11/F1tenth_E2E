@@ -346,6 +346,31 @@ def make_env_like(ref, device, n_beams, frames, stride, is_teacher, envs=None, o
 
 
 @torch.no_grad()
+def follow_cap(env, lid, decel, gap0=0.25, lane=0.55, reach=10.0):
+    """(B,) the normalized speed command cap of the `--follow-rule` ORACLE (10-29 diagnostic: would braking in time have
+    avoided the car contacts?): for the nearest other car ahead of us in our lane (body frame: 0 < dx < reach, |dy| <
+    lane), the speed from which we can still slow to its speed along our heading at `decel` before the bumper gap
+    (dx - one car length) closes to gap0; +1 (no cap) without such a car. Reads the TRUE states -- an oracle, not a policy."""
+    if env.sim.other_idx is None:                                          # a race of one
+        return torch.ones(lid.numel(), device=lid.device)
+    st = env.last_result.state
+    me = st[lid]
+    o = env.sim.other_idx[lid]                                             # (B, M-1)
+    so = st[o]
+    c, s_ = torch.cos(me[:, 2])[:, None], torch.sin(me[:, 2])[:, None]
+    ddx, ddy = so[..., 0] - me[:, None, 0], so[..., 1] - me[:, None, 1]
+    dx, dy = ddx * c + ddy * s_, -ddx * s_ + ddy * c
+    co, so_ = torch.cos(so[..., 2]), torch.sin(so[..., 2])
+    vxw = so[..., 3] * co - so[..., 4] * so_; vyw = so[..., 3] * so_ + so[..., 4] * co
+    v_along = (vxw * c + vyw * s_).clamp_min(0.0)                          # its speed along our heading
+    pres = (~env.sim.absent[o]) if env.sim.absent_any else torch.ones_like(dx, dtype=torch.bool)
+    ahead = pres & (dx > 0) & (dx < reach) & (dy.abs() < lane)
+    gap = (dx - float(env.cfg.vehicle.length) - gap0).clamp_min(0.0)
+    v_lim = v_along + torch.sqrt(2.0 * decel * gap)
+    v_lim = torch.where(ahead, v_lim, torch.full_like(v_lim, 1e9)).amin(1)
+    return (v_lim / float(env.ecfg.v_max_policy) * 2 - 1).clamp(-1.0, 1.0)
+
+
 def evaluate_like():
     """One policy (a state_student or a state_rl checkpoint) on EXACTLY the worlds and metric code of an old eval_ckpt.sh
     directory (2026-10-29, the user: "이전 데이터들 너 믿지 말고 너가 직접 확인해"): every race's EnvConfig is read back from the
@@ -365,6 +390,9 @@ def evaluate_like():
     ap.add_argument("--only", default="", help="'solo' = the solo run only")
     ap.add_argument("--unwedge", type=int, default=1,
                     help="the wedge recovery rlc6's plan tracker ran (state_rl.Unwedge); 0 = as before 10-29 13:20")
+    ap.add_argument("--follow-rule", type=float, default=0.0,
+                    help="ORACLE diagnostic (true opponent state, never a policy): cap the speed command to the speed that "
+                         "can still slow to a car ahead in our lane at this deceleration [m/s^2]; 0 = off")
     a = ap.parse_args(sys.argv[2:])
     device = torch.device(a.device)
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
@@ -397,6 +425,7 @@ def evaluate_like():
             """decides every R steps (the 20 Hz the policies were trained at), holds in between"""
             def __init__(self):
                 self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
+                self.bound = 0; self.n_rule = 0
                 self.uw = Unwedge(env, lid) if int(a.unwedge) else None
                 if is_teacher:
                     self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)))
@@ -421,10 +450,14 @@ def evaluate_like():
                         ego = torch.cat([obs[k][lid].float().reshape(B, -1) for k in keys], 1)
                         a_ = self.st(obs["scan"][lid].float(), ego)
                     self.act[lid] = a_; self.last = a_
+                out = self.act
+                if float(a.follow_rule) > 0:
+                    out = self.act.clone(); out[lid, 1] = torch.minimum(out[lid, 1], follow_cap(env, lid, float(a.follow_rule)))
+                    self.bound += int((out[lid, 1] < self.act[lid, 1] - 1e-6).sum()); self.n_rule += B
                 if self.uw is not None:
-                    self.uw.before(self.act)
+                    self.uw.before(out)
                 self.t += 1
-                return self.act
+                return out
 
             def reset(self, done=None):
                 if done is None:
@@ -441,6 +474,10 @@ def evaluate_like():
             if isinstance(v_, float) and not math.isfinite(v_):
                 result[k_] = None
         result.update(meter.report()); result.update(enc.report()); result.update(sev.report()); result.update(ww.report())
+        if float(a.follow_rule) > 0:
+            result["follow_rule"] = {"decel": float(a.follow_rule), "bound_frac": pol.bound / max(pol.n_rule, 1)}
+            print(f"[같은 평가] {tag}: 따라가기 규칙(참 상태, 진단) 감속 {a.follow_rule:g} m/s^2, 묶인 비율 "
+                  f"{pol.bound / max(pol.n_rule, 1) * 100:.1f} %", flush=True)
         result["metadata"] = {"checkpoint": a.ckpt, "like": ref, "env_config_overrides": "action/obs contract only",
                               "seed": seed, "envs": envs, "steps": int(a.steps), "env_config": dataclasses.asdict(ecfg)}
         name = "solo_x.json" if tag == "solo" else tag + ".json"

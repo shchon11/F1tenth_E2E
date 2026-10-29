@@ -105,6 +105,8 @@ def main():
                          "gap [s] (+0.3 m) to a car ahead in its lane; compare the J80 rate with the rule off")
     ap.add_argument("--all-car", type=int, default=0, help="1: count every hard car contact, charged or not")
     ap.add_argument("--unwedge", type=int, default=0, help="1: the wedge recovery (as state_student evalx / training)")
+    ap.add_argument("--follow-rule", type=float, default=0.0,
+                    help="ORACLE diagnostic: state_student.follow_cap at this deceleration [m/s^2] on every step; 0 = off")
     ap.add_argument("--steps-total", type=int, default=0, help="unused")
     ap.add_argument("--overlay-layout", type=int, default=0,
                     help="1: draw the layout-line planner's line for the hit row's layout (one-track envs: --like / --warps 0)")
@@ -245,6 +247,9 @@ def main():
             act = s_act
         act_full[lid] = act
         for r in range(int(a.repeat)):
+            if float(a.follow_rule) > 0:
+                from f1sim.learn.state_student import follow_cap
+                act_full[lid, 1] = torch.minimum(act[:, 1], follow_cap(env, lid, float(a.follow_rule)))
             if uw is not None:
                 uw.before(act_full)
             obs_d, r_, te, trc, info = env.step(act_full)

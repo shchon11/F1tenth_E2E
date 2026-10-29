@@ -343,8 +343,11 @@ def mlp(i, o, h=256):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256):
+    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None):
         super().__init__()
+        #: `--std-floor` (10-29): the race teachers cut their speed noise 0.66 -> 0.20 m/s, the cheapest way to fewer hits,
+        #: after which no cautious maneuver (3-5 m/s less behind a car) is ever tried; the floor keeps it explored
+        self.register_buffer("std_floor", torch.tensor(std_floor if std_floor is not None else [0.0] * act_dim, dtype=torch.float32))
         self.pi = mlp(obs_dim, act_dim, hidden)
         self.v = mlp(obs_dim, 1, hidden)
         self.log_std = nn.Parameter(torch.full((act_dim,), float(log_std)))
@@ -361,7 +364,7 @@ class ActorCritic(nn.Module):
         return self.v[-1](z).squeeze(-1), self.hit(z).squeeze(-1)
 
     def dist(self, o):
-        return torch.distributions.Normal(self.pi(o), self.log_std.exp())
+        return torch.distributions.Normal(self.pi(o), torch.maximum(self.log_std.exp(), self.std_floor))
 
 
 def train(a):
@@ -384,7 +387,7 @@ def train(a):
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
     D = obs_fn.dim
-    model = ActorCritic(D, log_std=a.log_std).to(device)
+    model = ActorCritic(D, log_std=a.log_std, std_floor=[float(x) for x in a.std_floor] if a.std_floor else None).to(device)
     norm = RunningNorm(D, device)
     ret_rms = RunningNorm(1, device)
     upd0 = 0
@@ -400,7 +403,9 @@ def train(a):
             ck["norm"] = {"mean": torch.cat([nm["mean"], torch.zeros(D - d0, device=device)]),
                           "var": torch.cat([nm["var"], torch.ones(D - d0, device=device)]), "n": nm["n"]}
             print(f"[state_rl] --init 관측 {d0} -> {D}차원: 새 입력은 가중치 0으로 시작", flush=True)
-        missing = model.load_state_dict(sd, strict=False).missing_keys
+        missing = [k for k in model.load_state_dict(sd, strict=False).missing_keys if k != "std_floor"]
+        if a.std_floor:                                    # this run's floor, not the one an --init checkpoint carried
+            model.std_floor.copy_(torch.tensor([float(x) for x in a.std_floor], device=device))
         if missing:
             print(f"[state_rl] --init에 없는 매개변수(새로 시작): {missing}", flush=True)
         norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
@@ -568,7 +573,7 @@ def train(a):
         stats = {"update": u, "progress_ms": prog / secs, "hits_wall_prop_per_km": hits_w / max(km, 1e-3),
                  "hits_car_per_km": hits_c / max(km, 1e-3), "J_per_step": float(br.sum() / (T * R * B)),
                  "laps": len(laps), "lap_mean_s": float(np.mean(laps)) if laps else None,
-                 "lap_best_s": float(np.min(laps)) if laps else None, "std": model.log_std.exp().tolist(),
+                 "lap_best_s": float(np.min(laps)) if laps else None, "std": torch.maximum(model.log_std.exp(), model.std_floor).tolist(),
                  "kl": float(np.mean(kls)), "clipfrac": float(np.mean(cfs)), "t_roll": t_roll,
                  "t_upd": time.time() - tr0 - t_roll, "min": (time.time() - t0) / 60, "price": price,
                  "J80_per_step": float((prog - 80.0 * (hits_w + hits_c)) / (T * R * B)),
@@ -654,6 +659,7 @@ def main():
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--vf", type=float, default=0.5)
     ap.add_argument("--log-std", type=float, default=-0.5)
+    ap.add_argument("--std-floor", type=float, nargs=2, default=None, help="floor of the exploration std (steer, speed) in action units")
     ap.add_argument("--price", type=float, default=80.0)
     ap.add_argument("--price-start", type=float, default=0.0)
     ap.add_argument("--price-hold", type=int, default=60, help="updates at --price-start before the ramp")
