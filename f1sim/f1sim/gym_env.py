@@ -224,6 +224,10 @@ class EnvConfig:
     imu_gyro_scale: float = 5.0      # [rad/s] normalization
     imu_accel_scale: float = 10.0    # [m/s^2]
     v_max_policy: float = 10.0       # top speed the policy may command (raceline profile peaks here)
+    #: [m/s] the slowest speed a LEARNER may command in direct mode, <= 0 (2026-10-30): a = -1 maps here instead of to 0,
+    #: so a negative value lets the policy back out of a wedge itself instead of an outside recovery rule; opponents keep
+    #: the [0, v_max_policy] map. 0 = as before.
+    v_min_policy: float = 0.0
     max_steps: int = 1600            # 40 s at 40 Hz
     # Give each race's FIRST episode after `reset()` a random length in [1, max_steps] instead of
     # max_steps; every later episode is full length. Under `collision_mode="soft"` nothing
@@ -2450,7 +2454,8 @@ class F1VecEnv:
         self.sim.odom.state[ids, 3] = speed
         self.prev_action[ids] = 0.0
         if self.act_dim == 2:
-            self.prev_action[ids, 1] = speed / e.v_max_policy * 2 - 1
+            v_lo = self._v_lo()[ids]
+            self.prev_action[ids, 1] = (speed - v_lo) / (e.v_max_policy - v_lo) * 2 - 1
             self._calibrate_external(ids)
         else:
             self.prev_action[ids, self.plan_layout.speed] = (speed / e.v_max_policy * 2 - 1)[:, None]
@@ -2947,7 +2952,8 @@ class F1VecEnv:
     def step(self, action: torch.Tensor):
         a = self._opponent_actions(action.to(self.device).clamp(-1.0, 1.0))
         if self.act_dim == 2:
-            v_cmd = torch.minimum((a[:, 1] + 1) * 0.5 * self.ecfg.v_max_policy, self.speed_cap)
+            v_lo = self._v_lo()
+            v_cmd = torch.minimum(v_lo + (a[:, 1] + 1) * 0.5 * (self.ecfg.v_max_policy - v_lo), self.speed_cap)
             cmd = torch.stack([a[:, 0] * self.s_max, v_cmd], 1)
         elif self._all_external:
             # Every car is driven by an external driver whose command replaces this one below, so
@@ -4423,9 +4429,17 @@ class F1VecEnv:
     def state(self) -> torch.Tensor:
         return self.sim.state
 
+    def _v_lo(self) -> torch.Tensor:
+        """(B,) the speed a = -1 commands: `v_min_policy` for learners, 0 for everyone else."""
+        v_min = float(self.ecfg.v_min_policy)
+        if v_min == 0.0:
+            return torch.zeros(self.B, device=self.device)
+        return torch.where(self.learner, torch.full((self.B,), v_min, device=self.device), torch.zeros(self.B, device=self.device))
+
     def teacher_action_to_normalized(self, cmd: torch.Tensor) -> torch.Tensor:
         """(steer [rad], speed [m/s]) -> policy action in [-1, 1] (direct action space)."""
-        return torch.stack([cmd[:, 0] / self.s_max, cmd[:, 1] / self.ecfg.v_max_policy * 2 - 1], 1).clamp(-1, 1)
+        v_lo = self._v_lo()[: cmd.shape[0]] if cmd.shape[0] == self.B else torch.zeros(cmd.shape[0], device=cmd.device)
+        return torch.stack([cmd[:, 0] / self.s_max, (cmd[:, 1] - v_lo) / (self.ecfg.v_max_policy - v_lo) * 2 - 1], 1).clamp(-1, 1)
 
     @property
     def plan_layout(self):

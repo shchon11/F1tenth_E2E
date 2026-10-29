@@ -77,14 +77,15 @@ def main():
     # the teacher's world with the car's sensors: a full scan, 3 frames 3 steps apart, the v2 ego history
     # (obs_version 2 is the plan policy's contract; with a direct command the v1 dict carries the same: the scan
     # stack, speed, the issued commands, the proprio history)
+    ck = torch.load(a.teacher, map_location=device, weights_only=False)
+    a.v_min = float(ck["args"].get("v_min", 0.0) or 0.0)       # the teacher's command range (it may reverse), saved in args
     env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=int(a.frames), scan_stride=int(a.stride)))
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    ck = torch.load(a.teacher, map_location=device, weights_only=False)
     t_scan = bool(ck["args"].get("scan_obs", 0)); t_beams = int(ck["args"].get("beams", 36))
     # the teacher's observation: the state block, its noise-free scan at ITS beams (interpolated from this env's full
     # one over the same field of view), its prop corridor if it was trained with one
-    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), t_beams=t_beams)
+    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), t_beams=t_beams)
     obs, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
@@ -93,7 +94,7 @@ def main():
 
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
-    teacher = ActorCritic(o.shape[1]).to(device); teacher.load_state_dict(ck["model"], strict=False); teacher.eval()
+    teacher = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); teacher.load_state_dict(ck["model"], strict=False); teacher.eval()
     tnorm = RunningNorm(o.shape[1], device); tnorm.load_state_dict(ck["norm"])
     ego_keys = sorted(k for k in obs if k != "scan")
     egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in ego_keys], 1)
@@ -232,10 +233,10 @@ def evaluate_student():
         keys = ck.get("ego_keys") or sorted(k for k in obs if k != "scan")
         egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in keys], 1)
         if is_teacher:
-            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)))
+            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
             last = torch.zeros(B, 2, device=device)
             o_ = sobs(last)
-            tp = ActorCritic(o_.shape[1]).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
+            tp = ActorCritic(o_.shape[1], bev=ck.get("bev")).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
             tn = RunningNorm(o_.shape[1], device); tn.load_state_dict(ck["norm"])
         else:
             st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device); st.load_state_dict(ck["student"]); st.eval()
@@ -417,7 +418,9 @@ def evaluate_like():
     if a.only == "solo":
         jobs = jobs[:1]
     for tag, ref in jobs:
-        env, cfg, ecfg, md = make_env_like(ref, device, n_beams, frames, stride, is_teacher)
+        v_min = float(ck["args"].get("v_min", 0.0) or 0.0)       # a policy that may reverse (state_rl --v-min)
+        env, cfg, ecfg, md = make_env_like(ref, device, n_beams, frames, stride, is_teacher,
+                                           override=(dict(v_min_policy=v_min) if v_min else None))
         seed = int(md["seed"]); envs = int(md["envs"])
         lid = env.learner_ids; B = int(lid.numel())
 
@@ -429,7 +432,7 @@ def evaluate_like():
                 self.stuck = 0; self.n_live = 0                    # learner steps below 0.3 m/s from 3 s into an episode
                 self.uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
                 if is_teacher:
-                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)))
+                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
                     self.net = None
                 else:
                     self.st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device)
@@ -446,7 +449,7 @@ def evaluate_like():
                     if is_teacher:
                         o_ = self.sobs(self.last)
                         if self.net is None:
-                            self.net = ActorCritic(o_.shape[1]).to(device); self.net.load_state_dict(ck["model"], strict=False)
+                            self.net = ActorCritic(o_.shape[1], bev=ck.get("bev")).to(device); self.net.load_state_dict(ck["model"], strict=False)
                             self.net.eval(); self.nrm = RunningNorm(o_.shape[1], device); self.nrm.load_state_dict(ck["norm"])
                         a_ = self.net.pi(self.nrm(o_)).clamp(-1, 1)
                     else:

@@ -48,6 +48,7 @@ def build_env(a, device, extra=None):
     cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0)
     cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
     e = dict(action_mode="direct", max_steps=int(a.episode_s * 40), speed_cap=10.0, v_max_policy=10.0,
+             v_min_policy=float(getattr(a, "v_min", 0.0) or 0.0),
              collision_mode="soft", contact_severity_min=1.5, stagger_first_episode=True,
              reward_progress=1.0, reward_collision=-1.0, reward_car_contact=1.0, reward_steer_rate=0.02,
              reward_wrong_way=0.4, reward_proximity=0.0, reward_lap=0.0, reward_lap_time=0.0,
@@ -143,13 +144,82 @@ def corridor_block(env, lid, s, tid, inflate=0.15, cars=False, props=True):
     return out.float().reshape(B, -1)
 
 
+#: `--bev` (10-30): the car-centred grid -- forward x in [BEV_X0, BEV_X0 + BEV_H * BEV_RES), lateral y (left +) in
+#: [-BEV_W * BEV_RES / 2, +BEV_W * BEV_RES / 2), cells of BEV_RES m, each the mean of 2 x 2 samples
+BEV_X0, BEV_RES, BEV_H, BEV_W = -2.0, 0.25, 56, 28
+#: channels: walls, props, cars, the cars' velocity relative to ours along our x and y [/5 m/s]
+BEV_C = 5
+
+
+def bev_grid(env, lid, margin=0.125):
+    """(B, BEV_C, BEV_H, BEV_W): what is around the car, in its own frame, from the TRUE geometry -- one representation
+    for walls, props and cars instead of centerline-frame features (10-30: the prop corridor, built on the centerline,
+    told a car standing beside the line to steer into the prop it was wedged on). Occupancy is soft: 1 inside, falling
+    to 0 at `margin` outside, so a thin wall or a small prop between two samples still shows."""
+    res = env.last_result
+    st = res.state[lid]
+    B = st.shape[0]
+    dev = st.device
+    k = 2
+    fx = BEV_X0 + (torch.arange(BEV_H * k, device=dev) + 0.5) * (BEV_RES / k)
+    fy = (torch.arange(BEV_W * k, device=dev) + 0.5) * (BEV_RES / k) - BEV_W * BEV_RES / 2
+    gx, gy = torch.meshgrid(fx, fy, indexing="ij")                     # (Hk, Wk) car frame
+    gx = gx.reshape(-1); gy = gy.reshape(-1); P = gx.numel()
+    c, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+    px = st[:, 0:1] + gx[None] * c - gy[None] * s_                       # (B, P) world
+    py = st[:, 1:2] + gx[None] * s_ + gy[None] * c
+    tid = env.sim.tid[lid]
+    edt = env.sim.track.sample_edt(torch.stack([px, py], -1), tid[:, None].expand(-1, P))
+    walls = (1.0 - edt / margin).clamp(0.0, 1.0)
+    props = torch.zeros(B, P, device=dev)
+    po = env.procedural
+    if po is not None and po.C > 0:
+        pp_all = po.p_poses[lid]; live_all = po.p_sid[lid] >= 0
+        nrm_all, dd_all = po.p_n[lid], po.p_d[lid]
+        for ci in range(po.C):
+            live = live_all[:, ci]
+            if not bool(live.any()):
+                continue
+            pp = pp_all[:, ci]
+            dx = px - pp[:, None, 0]; dy = py - pp[:, None, 1]
+            cc, ss = torch.cos(pp[:, 2])[:, None], torch.sin(pp[:, 2])[:, None]
+            lx, ly = dx * cc + dy * ss, -dx * ss + dy * cc
+            nrm, dd = nrm_all[:, ci], dd_all[:, ci]                         # (B, k, 2), (B, k)
+            fin = torch.isfinite(dd)
+            sd = nrm[:, None, :, 0] * lx[..., None] + nrm[:, None, :, 1] * ly[..., None] - torch.where(fin, dd, torch.zeros_like(dd))[:, None, :]
+            sd = torch.where(fin[:, None, :], sd, torch.full_like(sd, -1e9)).amax(-1)              # (B, P)
+            props = torch.maximum(props, (1.0 - sd.clamp_min(0.0) / margin).clamp(0.0, 1.0) * live[:, None].float())
+    cars = torch.zeros(B, P, device=dev); cvx = torch.zeros(B, P, device=dev); cvy = torch.zeros(B, P, device=dev)
+    if env.M > 1 and env.sim.other_idx is not None:
+        so_all = res.state[env.sim.other_idx[lid]]                         # (B, M-1, 7+)
+        pres = (~env.sim.absent[env.sim.other_idx[lid]]) if env.sim.absent_any else torch.ones(so_all.shape[:2], dtype=torch.bool, device=dev)
+        hl, hw = 0.5 * float(env.cfg.vehicle.length), 0.5 * float(env.cfg.vehicle.width)
+        # our own velocity in the world frame, to make the others' relative
+        vxe = st[:, 3] * c[:, 0] - st[:, 4] * s_[:, 0]; vye = st[:, 3] * s_[:, 0] + st[:, 4] * c[:, 0]
+        for q in range(so_all.shape[1]):
+            so = so_all[:, q]
+            dx = px - so[:, None, 0]; dy = py - so[:, None, 1]
+            cq, sq = torch.cos(so[:, 2])[:, None], torch.sin(so[:, 2])[:, None]
+            lx, ly = dx * cq + dy * sq, -dx * sq + dy * cq
+            out_ = torch.maximum(lx.abs() - hl, ly.abs() - hw).clamp_min(0.0)
+            occ = (1.0 - out_ / margin).clamp(0.0, 1.0) * pres[:, q, None].float()
+            vxw = so[:, 3] * cq[:, 0] - so[:, 4] * sq[:, 0]; vyw = so[:, 3] * sq[:, 0] + so[:, 4] * cq[:, 0]
+            rvx, rvy = vxw - vxe, vyw - vye
+            rx = (rvx * c[:, 0] + rvy * s_[:, 0]) / 5.0; ry = (-rvx * s_[:, 0] + rvy * c[:, 0]) / 5.0   # in our frame
+            new = occ > cars
+            cvx = torch.where(new, occ * rx[:, None], cvx); cvy = torch.where(new, occ * ry[:, None], cvy)
+            cars = torch.maximum(cars, occ)
+    g = torch.stack([walls, props, cars, cvx, cvy], 1).reshape(B, BEV_C, BEV_H, k, BEV_W, k).mean((3, 5))
+    return g
+
+
 class StateObs:
     """The observation, from the env's state after a step. scan: append the env's NOISE-FREE scan (`scan_true`, the
     beams `--beams` casts) / range: the true shape of every prop, wall and car in view (10-29: three prop centres
     without their size let the car clip a prop's edge in every narrowing -- crash_scenes.py)."""
 
     def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
-                 corridor_cars: bool = False, car_channel: bool = False):
+                 corridor_cars: bool = False, car_channel: bool = False, bev: bool = False):
         self.env = env
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
@@ -160,6 +230,10 @@ class StateObs:
         #: appended last -- the prop corridor keeps its meaning (srl19 put cars into it and the parent's prop avoidance broke),
         #: and an --init parent starts with zero weights on it, so update 1 drives as the parent did
         self.car_channel = bool(car_channel)
+        #: `--bev` (10-30): the observation is [own state, time left, track ahead, steer, last action] + the car-centred
+        #: grid (`bev_grid`, flattened, LAST) -- no prop / opponent slots, no corridor, no scan
+        self.bev = bool(bev)
+        self.grid_dim = BEV_C * BEV_H * BEV_W if self.bev else 0
         # t_beams: the teacher's own beam count when this env casts more (a student's env): its noise-free scan is
         # interpolated to those beams over the same field of view, as the teacher saw it in training
         self.interp = None
@@ -191,6 +265,11 @@ class StateObs:
         w = tr.sample_edt(xy_k, tid[:, None].expand(-1, n))
         ahead = torch.stack([dx / 10.0, dy / 5.0, dyaw / math.pi, w / 2.0], 2).reshape(st.shape[0], -1)
         steer = (st[:, 6] / float(env.s_max))[:, None]
+        if self.bev:
+            # own state (privileged_v2's first 8) and the time left (its last); everything else is in the grid
+            out = torch.cat([pv[:, :8], pv[:, -1:], ahead, steer, last_action, bev_grid(env, lid).reshape(st.shape[0], -1)], 1).float()
+            self.dim = out.shape[1]
+            return out
         parts = [pv, ahead, steer, last_action]
         if self.scan:
             sc = res.scan_true[lid].float()
@@ -340,9 +419,12 @@ class Unwedge:
 
 
 class RunningNorm:
-    def __init__(self, dim, device, clip=8.0):
+    def __init__(self, dim, device, clip=8.0, raw_tail=0):
         self.mean = torch.zeros(dim, device=device); self.var = torch.ones(dim, device=device); self.n = 1e-4
         self.clip = clip
+        #: the last `raw_tail` dims pass unnormalised (the --bev grid: already in [-2, 1], and a cell that is almost
+        #: always empty would be blown up to the clip by its tiny variance)
+        self.raw_tail = int(raw_tail)
 
     def update(self, x):
         x = x.reshape(-1, x.shape[-1])
@@ -353,39 +435,74 @@ class RunningNorm:
         self.n = tot
 
     def __call__(self, x):
-        return ((x - self.mean) / (self.var.sqrt() + 1e-6)).clamp(-self.clip, self.clip)
+        y = ((x - self.mean) / (self.var.sqrt() + 1e-6)).clamp(-self.clip, self.clip)
+        if self.raw_tail:
+            y = torch.cat([y[..., :-self.raw_tail], x[..., -self.raw_tail:]], -1)
+        return y
 
     def state_dict(self):
-        return {"mean": self.mean, "var": self.var, "n": self.n}
+        return {"mean": self.mean, "var": self.var, "n": self.n, "raw_tail": self.raw_tail}
 
     def load_state_dict(self, d):
         self.mean, self.var, self.n = d["mean"], d["var"], float(d["n"])
+        self.raw_tail = int(d.get("raw_tail", 0))
 
 
 def mlp(i, o, h=256):
     return nn.Sequential(nn.Linear(i, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, o))
 
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None):
+class BevNet(nn.Module):
+    """obs = [vector, grid (C * H * W) last] -> a small conv over the grid, joined with the vector, -> the MLP"""
+
+    def __init__(self, obs_dim, bev, out, hidden=256, feat=128):
         super().__init__()
+        C, H, W = (int(x) for x in bev)
+        self.bev = (C, H, W); self.vec = obs_dim - C * H * W
+        self.conv = nn.Sequential(nn.Conv2d(C, 16, 3, 2, 1), nn.ReLU(), nn.Conv2d(16, 32, 3, 2, 1), nn.ReLU(),
+                                  nn.Conv2d(32, 32, 3, 2, 1), nn.ReLU(), nn.Flatten())
+        n = int(self.conv(torch.zeros(1, C, H, W)).shape[1])
+        self.proj = nn.Sequential(nn.Linear(n, feat), nn.Tanh())
+        self.mlp = mlp(self.vec + feat, out, hidden)
+
+    def trunk(self, o):
+        C, H, W = self.bev
+        g = o[..., self.vec:].reshape(-1, C, H, W)
+        z = torch.cat([o[..., :self.vec].reshape(-1, self.vec), self.proj(self.conv(g))], -1)
+        return self.mlp[:-1](z).reshape(*o.shape[:-1], -1)
+
+    def forward(self, o):
+        return self.mlp[-1](self.trunk(o))
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None, bev=None):
+        super().__init__()
+        self.bev = tuple(bev) if bev else None
         #: `--std-floor` (10-29): the race teachers cut their speed noise 0.66 -> 0.20 m/s, the cheapest way to fewer hits,
         #: after which no cautious maneuver (3-5 m/s less behind a car) is ever tried; the floor keeps it explored
         self.register_buffer("std_floor", torch.tensor(std_floor if std_floor is not None else [0.0] * act_dim, dtype=torch.float32))
-        self.pi = mlp(obs_dim, act_dim, hidden)
-        self.v = mlp(obs_dim, 1, hidden)
+        if self.bev:
+            self.pi = BevNet(obs_dim, self.bev, act_dim, hidden)
+            self.v = BevNet(obs_dim, self.bev, 1, hidden)
+            last_pi = self.pi.mlp[-1]
+        else:
+            self.pi = mlp(obs_dim, act_dim, hidden)
+            self.v = mlp(obs_dim, 1, hidden)
+            last_pi = self.pi[-1]
         self.log_std = nn.Parameter(torch.full((act_dim,), float(log_std)))
-        nn.init.zeros_(self.pi[-1].bias); self.pi[-1].weight.data.mul_(0.01)
+        nn.init.zeros_(last_pi.bias); last_pi.weight.data.mul_(0.01)
         #: P(a hard hit within the next HIT_HORIZON decisions | s), a head on the critic's trunk (`--hit-head`): supervised
         #: on every step, so the critic's features learn what danger looks like before the price of a hit reaches them
         self.hit = nn.Linear(hidden, 1)
 
     def critic_trunk(self, o):
-        return self.v[:-1](o)
+        return self.v.trunk(o) if self.bev else self.v[:-1](o)
 
     def value_and_hit(self, o):
         z = self.critic_trunk(o)
-        return self.v[-1](z).squeeze(-1), self.hit(z).squeeze(-1)
+        head = self.v.mlp[-1] if self.bev else self.v[-1]
+        return head(z).squeeze(-1), self.hit(z).squeeze(-1)
 
     def dist(self, o):
         return torch.distributions.Normal(self.pi(o), torch.maximum(self.log_std.exp(), self.std_floor))
@@ -398,7 +515,7 @@ def train(a):
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs), corridor_cars=bool(a.corridor_cars),
-                      car_channel=bool(a.car_channel))
+                      car_channel=bool(a.car_channel), bev=bool(a.bev))
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -412,8 +529,10 @@ def train(a):
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
     D = obs_fn.dim
-    model = ActorCritic(D, log_std=a.log_std, std_floor=[float(x) for x in a.std_floor] if a.std_floor else None).to(device)
-    norm = RunningNorm(D, device)
+    bev = (BEV_C, BEV_H, BEV_W) if a.bev else None
+    model = ActorCritic(D, log_std=a.log_std, std_floor=[float(x) for x in a.std_floor] if a.std_floor else None,
+                        bev=bev).to(device)
+    norm = RunningNorm(D, device, raw_tail=obs_fn.grid_dim)
     ret_rms = RunningNorm(1, device)
     upd0 = 0
     if a.init:
@@ -457,7 +576,9 @@ def train(a):
         # still (measured 10-29: 2.0 -> 0.2 m/s in 10 updates); progress first, then the price, then the full objective
         k = (u - upd0 - 1 - int(a.price_hold)) / max(1, int(a.price_ramp))
         price = a.price_start + (a.price - a.price_start) * min(1.0, max(0.0, k))
-        bo = torch.zeros(T, B, D, device=device); ba = torch.zeros(T, B, 2, device=device)
+        # the --bev observation is ~7.9k wide: held in half precision (occupancy in [0, 1], velocities /5), 2 GB at 2048 envs
+        bo = torch.zeros(T, B, D, device=device, dtype=torch.float16 if a.bev else torch.float32)
+        ba = torch.zeros(T, B, 2, device=device)
         blp = torch.zeros(T, B, device=device); bv = torch.zeros(T + 1, B, device=device)
         br = torch.zeros(T, B, device=device); bd = torch.zeros(T, B, device=device)
         bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
@@ -577,11 +698,12 @@ def train(a):
             perm = torch.randperm(N, device=device)
             for i in range(0, N, mb):
                 j = perm[i:i + mb]
-                dist = model.dist(fo[j])
+                fo_j = fo[j].float()
+                dist = model.dist(fo_j)
                 lp = dist.log_prob(fa[j]).sum(1)
                 ratio = (lp - flp[j]).exp()
                 pg = -torch.min(ratio * fadv[j], ratio.clamp(1 - a.clip, 1 + a.clip) * fadv[j]).mean()
-                v_j, hl_j = model.value_and_hit(fo[j])
+                v_j, hl_j = model.value_and_hit(fo_j)
                 vf = 0.5 * (v_j - fret[j]).pow(2).mean()
                 loss = pg + a.vf * vf
                 if a.hit_head > 0:
@@ -615,7 +737,7 @@ def train(a):
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s", flush=True)
         if u % int(a.save_every) == 0 or u == upd0 + int(a.updates):
             torch.save({"model": model.state_dict(), "norm": norm.state_dict(), "ret_rms": ret_rms.state_dict(),
-                        "obs_dim": D, "args": vars(a), "update": u, "ahead": AHEAD},
+                        "obs_dim": D, "args": vars(a), "update": u, "ahead": AHEAD, "bev": bev},
                        os.path.join(out, f"state_u{u}.pt"))
     print(f"[state_rl] {a.name} 끝", flush=True)
 
@@ -628,12 +750,12 @@ def evaluate(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)))
+    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
-    model = ActorCritic(o.shape[1]).to(device); model.load_state_dict(ck["model"], strict=False)
+    model = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); model.load_state_dict(ck["model"], strict=False)
     norm = RunningNorm(o.shape[1], device); norm.load_state_dict(ck["norm"])
     w_col = abs(env.ecfg.reward_collision)
     act_full = torch.zeros(env.B, env.act_dim, device=device)
@@ -700,6 +822,8 @@ def main():
     ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0), help="the removal time window [s]")
     ap.add_argument("--corridor-cars", type=int, default=0, help="1: mark the other cars (now, +0.5 s, +1 s) in the corridor")
     ap.add_argument("--car-channel", type=int, default=0, help="1: the other cars in their own corridor block (appended)")
+    ap.add_argument("--bev", type=int, default=0, help="1: the car-centred grid of walls / props / cars + a conv (10-30)")
+    ap.add_argument("--v-min", type=float, default=0.0, help="[m/s] the slowest command, < 0 lets the policy reverse")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,

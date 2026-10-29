@@ -49,6 +49,8 @@ def run(a, ck, solo, device):
     frames = 1 if is_teacher else int(ck["frames"])
     stride = 1 if is_teacher else int(ck["args"].get("stride", 3))
     ov = dict(max_steps=int(a.steps) + 10)
+    if float(ck["args"].get("v_min", 0.0) or 0.0):
+        ov.update(v_min_policy=float(ck["args"]["v_min"]))
     if solo:
         from f1sim.gym_env import EnvConfig
         ov.update(race_size=1, opponent=EnvConfig().opponent, opponent_slots=None)
@@ -59,10 +61,10 @@ def run(a, ck, solo, device):
     uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     R = int(ck["args"].get("repeat", 2))
     if is_teacher:
-        sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)))
+        sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
         last = torch.zeros(B, 2, device=device)
         o = sobs(last)
-        net = ActorCritic(o.shape[1]).to(device); net.load_state_dict(ck["model"], strict=False); net.eval()
+        net = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); net.load_state_dict(ck["model"], strict=False); net.eval()
         nrm = RunningNorm(o.shape[1], device); nrm.load_state_dict(ck["norm"])
     else:
         st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device); st.load_state_dict(ck["student"]); st.eval()

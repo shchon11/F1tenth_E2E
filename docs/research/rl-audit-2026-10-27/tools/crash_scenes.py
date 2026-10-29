@@ -119,6 +119,7 @@ def main():
     device = torch.device(a.device)
     ck0 = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     sck = torch.load(a.student, map_location=device, weights_only=False) if a.student else None
+    a.v_min = float(ck0["args"].get("v_min", 0.0) or 0.0)       # build_env reads it: a policy that may reverse
     if a.like:
         from f1sim.learn.state_student import make_env_like
         fr_ = int(sck["frames"]) if sck is not None else 1
@@ -126,7 +127,9 @@ def main():
         if sck is not None:
             a.beams = int(sck["beams"])
         # priv flags on in both modes: the teacher's StateObs labels / probes every decision
-        env, _cfg, _ecfg, _md = make_env_like(a.like, device, int(a.beams), fr_, sd_, True, envs=int(a.envs))
+        vmin_ = float(ck0["args"].get("v_min", 0.0) or 0.0)
+        env, _cfg, _ecfg, _md = make_env_like(a.like, device, int(a.beams), fr_, sd_, True, envs=int(a.envs),
+                                              override=(dict(v_min_policy=vmin_) if vmin_ else None))
     elif sck is not None:
         # the student's sensors (its beams, the 3-frame scan stack of the v1 obs dict); the teacher's scan is
         # interpolated to ITS beams over the same field of view (as state_student does)
@@ -147,7 +150,7 @@ def main():
     t_scan = bool(ck0["args"].get("scan_obs", 0)); t_beams = int(ck0["args"].get("beams", 36))
     # the teacher's observation (its scan interpolated to its beams when the student's env casts more; its prop corridor
     # if it was trained with one) -- state_rl.StateObs builds it in the training order
-    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck0["args"].get("corridor_obs", 0)), corridor_cars=bool(ck0["args"].get("corridor_cars", 0)), car_channel=bool(ck0["args"].get("car_channel", 0)), t_beams=t_beams)
+    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck0["args"].get("corridor_obs", 0)), corridor_cars=bool(ck0["args"].get("corridor_cars", 0)), car_channel=bool(ck0["args"].get("car_channel", 0)), bev=bool(ck0["args"].get("bev", 0)), t_beams=t_beams)
     obs_d, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     if sck is not None:
@@ -160,7 +163,7 @@ def main():
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
-    model = ActorCritic(o.shape[1]).to(device); model.load_state_dict(ck["model"], strict=False)
+    model = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); model.load_state_dict(ck["model"], strict=False)
     norm = RunningNorm(o.shape[1], device); norm.load_state_dict(ck["norm"])
     act_full = torch.zeros(env.B, env.act_dim, device=device)
     hist = torch.zeros(H, env.B, 6, device=device)     # x, y, yaw, vx, steer cmd, speed cmd -- every car
@@ -174,9 +177,12 @@ def main():
     D_all = int(o.shape[1]); n_sc = t_beams if t_scan else 0
     if n_sc:
         groups["라이다"] = list(range(101, 101 + n_sc))
-    corr_cols = list(range(101 + n_sc, D_all)) if bool(ck0["args"].get("corridor_obs", 0)) else []
+    n_car = 91 if bool(ck0["args"].get("car_channel", 0)) else 0       # the car corridor block, appended last
+    corr_cols = list(range(101 + n_sc, D_all - n_car)) if bool(ck0["args"].get("corridor_obs", 0)) else []
     if corr_cols:
         groups["상자 통로"] = corr_cols
+    if n_car:
+        groups["차 통로"] = list(range(D_all - n_car, D_all))
     probe = []                                           # per hit: the policy's response 0.5 s before it
 
     def respond(x_raw):
@@ -368,11 +374,20 @@ def main():
                         if corr_cols:
                             x_np[0, corr_cols] = 0.0          # the prop corridor is props too
                         a_np, v_np, _, _ = respond(x_np)
+                        # which prop input drives it: the 3 nearest-prop slots alone / the prop corridor alone erased
+                        x_ns = x0.clone(); x_ns[0, 33:45] = 0.0
+                        a_ns, _, _, _ = respond(x_ns)
+                        x_nc = x0.clone()
+                        if corr_cols:
+                            x_nc[0, corr_cols] = 0.0
+                        a_nc, _, _, _ = respond(x_nc)
                         rr = [respond(ohist[-k, i][None].clone()) for k in (min(n_dec, 40), 21, 11, 1)]
                         vals = [r_[1] for r_ in rr]; phs = [r_[3] for r_ in rr]
                         ev.update(resp={"steer_deg": float(a_full[0]) * math.degrees(float(env.s_max)),
                                         "speed_ms": (float(a_full[1]) + 1) / 2 * float(env.ecfg.v_max_policy),
                                         "steer_deg_noprops": float(a_np[0]) * math.degrees(float(env.s_max)),
+                                        "steer_deg_noslots": float(a_ns[0]) * math.degrees(float(env.s_max)),
+                                        "steer_deg_nocorr": float(a_nc[0]) * math.degrees(float(env.s_max)),
                                         "speed_ms_noprops": (float(a_np[1]) + 1) / 2 * float(env.ecfg.v_max_policy),
                                         "V_2s_1s_05s_0s": vals, "Phit_2s_1s_05s_0s": phs, "sal": sal,
                                         "props_seen": int(float(x0[0, 33]) > 0.5)})
