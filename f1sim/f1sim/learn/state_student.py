@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from . import state_rl
-from .state_rl import ActorCritic, RunningNorm, StateObs
+from .state_rl import ActorCritic, PropRemoval, RunningNorm, StateObs, Unwedge
 
 
 class Student(nn.Module):
@@ -62,6 +62,13 @@ def main():
     ap.add_argument("--stride", type=int, default=3, help="control steps between stacked frames")
     ap.add_argument("--danger-weight", type=float, default=0.0, help="sample weight 1 + X * teacher P(hit within 1 s)")
     ap.add_argument("--buffer-cpu", type=int, default=0, help="keep the scan buffer in pinned host memory")
+    # the competition's session world (state_rl's options, 10-29): opponent on track for a share of races, some resets with
+    # an empty track, props removed mid-episode; and the wedge recovery on the learner's car
+    ap.add_argument("--opp-present", type=float, default=1.0)
+    ap.add_argument("--prop-fraction", type=float, default=1.0)
+    ap.add_argument("--removal-p", type=float, default=0.0)
+    ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0))
+    ap.add_argument("--unwedge", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     a.price = 80.0
@@ -80,6 +87,9 @@ def main():
     obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), t_beams=t_beams)
     obs, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
+    remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
+        if float(a.removal_p) > 0 else None
+    unwedge = Unwedge(env, lid) if int(a.unwedge) else None
 
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
@@ -130,7 +140,13 @@ def main():
                 agree.append(float((s_act - y).abs().mean()))
                 act_full[lid] = act
                 for r in range(R):
+                    if unwedge is not None:
+                        unwedge.before(act_full)
                     obs, r_, te, trc, info = env.step(act_full)
+                    if unwedge is not None:
+                        unwedge.after()
+                    if remover is not None:
+                        remover.step()
                     comp = info["reward_components"]
                     col = comp["collision"][lid].float(); car = comp["car_contact"][lid].float()
                     tch = car < 0; onset = tch & ~touching; d_ = (te | trc)[lid]; touching = tch & ~d_
@@ -347,6 +363,8 @@ def evaluate_like():
     ap.add_argument("--steps", type=int, default=2400)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--only", default="", help="'solo' = the solo run only")
+    ap.add_argument("--unwedge", type=int, default=1,
+                    help="the wedge recovery rlc6's plan tracker ran (state_rl.Unwedge); 0 = as before 10-29 13:20")
     a = ap.parse_args(sys.argv[2:])
     device = torch.device(a.device)
     ck = torch.load(a.ckpt, map_location=device, weights_only=False)
@@ -379,6 +397,7 @@ def evaluate_like():
             """decides every R steps (the 20 Hz the policies were trained at), holds in between"""
             def __init__(self):
                 self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
+                self.uw = Unwedge(env, lid) if int(a.unwedge) else None
                 if is_teacher:
                     self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
                     self.net = None
@@ -388,6 +407,8 @@ def evaluate_like():
                     self.keys = ck.get("ego_keys")
 
             def __call__(self, obs):
+                if self.uw is not None and self.t > 0:
+                    self.uw.after()                       # the clocks advance on the step just taken
                 if self.t % R == 0:
                     if is_teacher:
                         o_ = self.sobs(self.last)
@@ -400,6 +421,8 @@ def evaluate_like():
                         ego = torch.cat([obs[k][lid].float().reshape(B, -1) for k in keys], 1)
                         a_ = self.st(obs["scan"][lid].float(), ego)
                     self.act[lid] = a_; self.last = a_
+                if self.uw is not None:
+                    self.uw.before(self.act)
                 self.t += 1
                 return self.act
 
