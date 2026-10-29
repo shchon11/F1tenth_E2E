@@ -259,6 +259,44 @@ class PropRemoval:
             self.removed |= due
 
 
+class Unwedge:
+    """The old pipeline's wedge recovery (`mpc.PlanSpec.wedge_s`, which its plan tracker runs on the car), for a direct
+    command: touching something below 0.4 m/s for 1 s -> back out at 0.8 m/s for 0.75 s with the steering mirrored.
+    10-29: without it a direct-command car that hit a wall stayed pinned for the rest of the episode -- the speed is
+    0..10 m/s, no reverse (solo session of srl13: cars wedged in 1-8 s and stood 25 s, one at full throttle into the
+    wall). It drives through the env's external-command override, vectorised; the policy's own action is what is
+    recorded. Call `before(act_full)` before `env.step` and `after()` right after it."""
+
+    def __init__(self, env, rows, wedge_s=1.0, backout_s=0.75, v_gate=0.4, v_reverse=0.8):
+        self.env, self.rows = env, rows
+        dev = env.device
+        self.mask = torch.zeros(env.B, dtype=torch.bool, device=dev); self.mask[rows] = True
+        self.wedged_t = torch.zeros(env.B, device=dev); self.backout_t = torch.zeros(env.B, device=dev)
+        self.wedge_s, self.backout_s, self.v_gate, self.v_rev = float(wedge_s), float(backout_s), float(v_gate), float(v_reverse)
+        if not env._ext_ids:
+            env._ext_ids.add(-1)                         # keep the env's override path on; the mask decides per row
+        self.count = 0
+
+    def before(self, act_full):
+        env = self.env
+        on = (self.backout_t > 1e-6) & self.mask
+        env.ext_mask.copy_(on)
+        env.ext_cmd[:, 0] = -act_full[:, 0] * float(env.s_max)
+        env.ext_cmd[:, 1] = -self.v_rev
+
+    def after(self):
+        env = self.env
+        dt = float(env.sim.control_dt)
+        touching = env._was_touching & self.mask & (self.backout_t <= 0)
+        v = env.sim.state[:, 3].abs()
+        step = torch.where(v < self.v_gate, torch.full_like(self.wedged_t, dt), torch.full_like(self.wedged_t, -dt))
+        self.wedged_t = torch.where(touching, (self.wedged_t + step).clamp_min(0.0), torch.zeros_like(self.wedged_t))
+        start = self.wedged_t >= self.wedge_s - 1e-6
+        self.count += int(start.sum()) if bool(start.any()) else 0
+        self.backout_t = torch.where(start, torch.full_like(self.backout_t, self.backout_s), (self.backout_t - dt).clamp_min(0.0))
+        self.wedged_t = self.wedged_t.masked_fill(start, 0.0)
+
+
 class RunningNorm:
     def __init__(self, dim, device, clip=8.0):
         self.mean = torch.zeros(dim, device=device); self.var = torch.ones(dim, device=device); self.n = 1e-4
@@ -359,6 +397,7 @@ def train(a):
     eps_n = torch.randn(B, 2, device=device)                       # the correlated exploration state (--noise-corr)
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
         if float(a.removal_p) > 0 else None
+    unwedge = Unwedge(env, lid) if int(a.unwedge) else None
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
           f"롤아웃 {T}결정 = {T * R} 스텝, 가격 {a.price:g}", flush=True)
     t0 = time.time()
@@ -404,7 +443,11 @@ def train(a):
                 hit_now = torch.zeros(B, dtype=torch.bool, device=device)
                 act_full[lid] = act.clamp(-1, 1)
                 for k in range(R):
+                    if unwedge is not None:
+                        unwedge.before(act_full)
                     _, r_, te, trc, info = env.step(act_full)
+                    if unwedge is not None:
+                        unwedge.after()
                     if remover is not None:
                         remover.step()
                     comp = info["reward_components"]
@@ -599,6 +642,7 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--unwedge", type=int, default=0, help="1: back a wedged car out (the old tracker's recovery)")
     ap.add_argument("--opp-present", type=float, default=1.0, help="race stage: share of races with the opponent on track")
     ap.add_argument("--prop-fraction", type=float, default=1.0, help="share of resets that get a layout (the rest: empty track)")
     ap.add_argument("--removal-p", type=float, default=0.0,

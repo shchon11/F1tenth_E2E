@@ -21,7 +21,7 @@ import torch
 
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import state_rl  # noqa: E402
-from f1sim.learn.state_rl import ActorCritic, PropRemoval, RunningNorm, StateObs  # noqa: E402
+from f1sim.learn.state_rl import ActorCritic, PropRemoval, RunningNorm, StateObs, Unwedge  # noqa: E402
 from f1sim.learn.state_student import Student, make_env_like  # noqa: E402
 
 
@@ -56,6 +56,7 @@ def run(a, ck, solo, device):
     obs, _ = env.reset(seed=int(md["seed"]))
     lid = env.learner_ids; B = int(lid.numel())
     rem = PropRemoval(env, 1.0, float(a.remove_at), float(a.remove_at), seed=1)
+    uw = Unwedge(env, lid) if int(a.unwedge) else None
     R = int(ck["args"].get("repeat", 2))
     if is_teacher:
         sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
@@ -82,7 +83,11 @@ def run(a, ck, solo, device):
                 else:
                     act = st(obs["scan"][lid].float(), egov(obs))
                 act_full[lid] = act
+            if uw is not None:
+                uw.before(act_full)
             obs, r_, te, trc, info = env.step(act_full)
+            if uw is not None:
+                uw.after()
             rem.step()
             ph = "전" if t * dt < t_rm else "후"
             path[t] = env.sim.state[lid, :2].cpu().numpy()
@@ -120,6 +125,7 @@ def main():
     ap.add_argument("--steps", type=int, default=1600)
     ap.add_argument("--envs", type=int, default=32)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--unwedge", type=int, default=1, help="the old tracker's wedge recovery (rlc6 had it)")
     a = ap.parse_args()
     device = torch.device(a.device)
     os.makedirs(a.out, exist_ok=True)
