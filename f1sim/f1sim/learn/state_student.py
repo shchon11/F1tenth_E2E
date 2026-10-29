@@ -75,23 +75,11 @@ def main():
     prepare_graph_runtime(env, log=lambda _t: None)
     ck = torch.load(a.teacher, map_location=device, weights_only=False)
     t_scan = bool(ck["args"].get("scan_obs", 0)); t_beams = int(ck["args"].get("beams", 36))
-    base_obs = StateObs(env)
+    # the teacher's observation: the state block, its noise-free scan at ITS beams (interpolated from this env's full
+    # one over the same field of view), its prop corridor if it was trained with one
+    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), t_beams=t_beams)
     obs, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
-    ang_s = env.sim.lidar.angles.float()                                   # the student's beams
-    ang_t = torch.linspace(float(ang_s[0]), float(ang_s[-1]), t_beams, device=device)   # the teacher's (same field of view)
-
-    def obs_fn(last):
-        """the teacher's observation: the state block, plus its noise-free scan at ITS beams, interpolated from this
-        env's full one (the teacher was trained with `t_beams` beams over the same field of view)"""
-        o_ = base_obs(last)
-        if not t_scan:
-            return o_
-        sc = env.last_result.scan_true[lid].float()
-        pos = (ang_t - ang_s[0]) / (ang_s[-1] - ang_s[0]) * (ang_s.numel() - 1)
-        i0 = pos.floor().long().clamp(0, ang_s.numel() - 2); w = (pos - i0.float())[None, :]
-        st_ = sc[:, i0] * (1 - w) + sc[:, i0 + 1] * w
-        return torch.cat([o_, (st_ / 10.0).clamp(0.0, 1.0)], 1)
 
     last_a = torch.zeros(B, 2, device=device)
     o = obs_fn(last_a)
@@ -228,7 +216,7 @@ def evaluate_student():
         keys = ck.get("ego_keys") or sorted(k for k in obs if k != "scan")
         egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in keys], 1)
         if is_teacher:
-            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)))
+            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
             last = torch.zeros(B, 2, device=device)
             o_ = sobs(last)
             tp = ActorCritic(o_.shape[1]).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
@@ -299,6 +287,46 @@ def evaluate_student():
           f"추월당함 {tot['passed'] / max(tot['km'], 1e-9):.2f}/km, 3 m 안 뒤따름 {tot['follow'] / max(tot['n'], 1) * 100:.0f} %", flush=True)
 
 
+def make_env_like(ref, device, n_beams, frames, stride, is_teacher, envs=None):
+    """The env of one old eval_ckpt.sh run (its JSON's `metadata.env_config`), with only the action / observation contract
+    of a direct-command policy changed: (env, cfg, ecfg, metadata)."""
+    import dataclasses
+    from .. import Config
+    from ..gym_env import EnvConfig
+    from .. import opponent_slots as opp_sl
+    from . import common
+    fields = {f.name for f in dataclasses.fields(EnvConfig)}
+    md = json.load(open(ref))["nominal"]["metadata"]
+    ec = {k: v for k, v in md["env_config"].items() if k in fields}
+    if ec.get("opponent_slots"):
+        ec["opponent_slots"] = opp_sl.parse_slots(json.dumps(ec["opponent_slots"]))
+    for k in list(ec):
+        if isinstance(ec[k], list) and k != "opponent_slots":
+            ec[k] = tuple(ec[k])
+    # this policy's contract: a direct command at 20 Hz from the v1 observation (students) or the privileged state
+    # (teachers); the plan / MAP / wp4 fields of the reference only shape a plan policy's output and are reset
+    base = EnvConfig()
+    for k in [k for k in ec if k.startswith("plan_") or k in ("speed_mode", "hist_len", "hist_stride", "ego_actions",
+                                                               "opp_token", "dial", "speed_command")]:
+        ec[k] = getattr(base, k)
+    ec.update(action_mode="direct", obs_version=1, scan_stack=frames, scan_stride=stride, v_max_policy=10.0)
+    if is_teacher:
+        ec.update(priv_props=True, priv_time=True)
+    ecfg = EnvConfig(**ec)
+    limits = md.get("teacher_limits") or common.teacher_limits(7.0, 6.5, 4.0)
+    race = int(ecfg.race_size) > 1
+    trs, rls = common.load_tracks(list(md["tracks"]), racelines=race,
+                                  **dict(limits, objective=md.get("raceline_objective", "min_time")))
+    cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = n_beams
+    cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0); cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
+    env = common.make_env(trs, int(envs or md["envs"]), device, ecfg, cfg=cfg, seed=int(md["seed"]), rls=rls,
+                          teacher_limits=limits)
+    from .graph_runtime import prepare_graph_runtime
+    prepare_graph_runtime(env, log=lambda _t: None)
+    env.sim.warmup()
+    return env, cfg, ecfg, md
+
+
 @torch.no_grad()
 def evaluate_like():
     """One policy (a state_student or a state_rl checkpoint) on EXACTLY the worlds and metric code of an old eval_ckpt.sh
@@ -341,34 +369,8 @@ def evaluate_like():
     if a.only == "solo":
         jobs = jobs[:1]
     for tag, ref in jobs:
-        md = json.load(open(ref))["nominal"]["metadata"]
-        ec = {k: v for k, v in md["env_config"].items() if k in fields}
-        if ec.get("opponent_slots"):
-            ec["opponent_slots"] = opp_sl.parse_slots(json.dumps(ec["opponent_slots"]))
-        for k in list(ec):
-            if isinstance(ec[k], list) and k != "opponent_slots":
-                ec[k] = tuple(ec[k])
-        # this policy's contract: a direct command at 20 Hz from the v1 observation (students) or the privileged state
-        # (teachers); the plan / MAP / wp4 fields of the reference only shape a plan policy's output and are reset
-        base = EnvConfig()
-        for k in [k for k in ec if k.startswith("plan_") or k in ("speed_mode", "hist_len", "hist_stride", "ego_actions",
-                                                                   "opp_token", "dial", "speed_command")]:
-            ec[k] = getattr(base, k)
-        ec.update(action_mode="direct", obs_version=1, scan_stack=frames, scan_stride=stride, v_max_policy=10.0)
-        if is_teacher:
-            ec.update(priv_props=True, priv_time=True)
-        ecfg = EnvConfig(**ec)
-        limits = md.get("teacher_limits") or common.teacher_limits(7.0, 6.5, 4.0)
-        race = int(ecfg.race_size) > 1
-        trs, rls = common.load_tracks(list(md["tracks"]), racelines=race,
-                                      **dict(limits, objective=md.get("raceline_objective", "min_time")))
-        cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = n_beams
-        cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0); cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
+        env, cfg, ecfg, md = make_env_like(ref, device, n_beams, frames, stride, is_teacher)
         seed = int(md["seed"]); envs = int(md["envs"])
-        env = common.make_env(trs, envs, device, ecfg, cfg=cfg, seed=seed, rls=rls, teacher_limits=limits)
-        from .graph_runtime import prepare_graph_runtime
-        prepare_graph_runtime(env, log=lambda _t: None)
-        env.sim.warmup()
         lid = env.learner_ids; B = int(lid.numel())
 
         class Pol:
@@ -376,7 +378,7 @@ def evaluate_like():
             def __init__(self):
                 self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
                 if is_teacher:
-                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)))
+                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
                     self.net = None
                 else:
                     self.st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device)

@@ -19,7 +19,7 @@ from f1sim.learn.state_rl import ActorCritic, RunningNorm, StateObs  # noqa: E40
 H = 80          # 2 s of history at 40 Hz
 
 
-def draw(path, ev, track, props_in, opp_hist, title):
+def draw(path, ev, track, props_in, opp_hist, title, plan_xy=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -51,6 +51,11 @@ def draw(path, ev, track, props_in, opp_hist, title):
     R = np.array([[c, -s], [s, c]])
     poly = corners @ R.T + np.array([x0, y0])
     ax.plot(poly[:, 0], poly[:, 1], "r-", lw=2)
+    if plan_xy is not None:
+        # the layout-line planner's minimum-time line for THIS layout (privileged, re-planned around the props)
+        m = (np.abs(plan_xy[:, 0] - x0) < W) & (np.abs(plan_xy[:, 1] - y0) < W)
+        ax.plot(plan_xy[m, 0], plan_xy[m, 1], ".", color="magenta", ms=2.5, label="계획기 선(이 배치)")
+        ax.legend(loc="lower right", fontsize=7)
     for oh in opp_hist:
         oh = np.array(oh)
         ax.plot(oh[:, 0], oh[:, 1], "-", color="royalblue", lw=1.2)
@@ -98,6 +103,9 @@ def main():
     ap.add_argument("--gap-rule", type=float, default=0.0,
                     help="falsifier for 'the teacher is near its optimum on cars': cap its speed command to keep this time "
                          "gap [s] (+0.3 m) to a car ahead in its lane; compare the J80 rate with the rule off")
+    ap.add_argument("--overlay-layout", type=int, default=0,
+                    help="1: draw the layout-line planner's line for the hit row's layout (one-track envs: --like / --warps 0)")
+    ap.add_argument("--like", default="", help="an eval_ckpt.sh race JSON: drive in exactly that world (state_student.make_env_like)")
     ap.add_argument("--student", default="", help="a state_student checkpoint: the STUDENT drives (its own sensors); the "
                     "teacher CKPT labels every decision, so each hit shows what the teacher would have done instead")
     a = ap.parse_args()
@@ -106,7 +114,15 @@ def main():
     device = torch.device(a.device)
     ck0 = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     sck = torch.load(a.student, map_location=device, weights_only=False) if a.student else None
-    if sck is not None:
+    if a.like:
+        from f1sim.learn.state_student import make_env_like
+        fr_ = int(sck["frames"]) if sck is not None else 1
+        sd_ = int(sck["args"].get("stride", 3)) if sck is not None else 1
+        if sck is not None:
+            a.beams = int(sck["beams"])
+        # priv flags on in both modes: the teacher's StateObs labels / probes every decision
+        env, _cfg, _ecfg, _md = make_env_like(a.like, device, int(a.beams), fr_, sd_, True, envs=int(a.envs))
+    elif sck is not None:
         # the student's sensors (its beams, the 3-frame scan stack of the v1 obs dict); the teacher's scan is
         # interpolated to ITS beams over the same field of view (as state_student does)
         a.beams = int(sck["beams"])
@@ -114,26 +130,23 @@ def main():
     else:
         env = state_rl.build_env(a, device)
     from f1sim.learn.graph_runtime import prepare_graph_runtime
-    prepare_graph_runtime(env, log=lambda _t: None)
+    if not a.like:
+        prepare_graph_runtime(env, log=lambda _t: None)        # make_env_like already did
+    lt = None
+    if int(a.overlay_layout):
+        from f1sim.learn import common as _cm
+        from f1sim.layout_line import LayoutLineTeacher
+        _lim = _cm.teacher_limits(7.0, 6.5, 4.0)
+        _trs, _rls = _cm.load_tracks([state_rl.KOREA], racelines=True, **dict(_lim, objective="min_time"))
+        lt = LayoutLineTeacher(_cm.make_teacher(_rls, env, **_lim), env)
     t_scan = bool(ck0["args"].get("scan_obs", 0)); t_beams = int(ck0["args"].get("beams", 36))
-    base_fn = StateObs(env, scan=t_scan if sck is None else False)
+    # the teacher's observation (its scan interpolated to its beams when the student's env casts more; its prop corridor
+    # if it was trained with one) -- state_rl.StateObs builds it in the training order
+    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck0["args"].get("corridor_obs", 0)), t_beams=t_beams)
     obs_d, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
-    if sck is None:
-        obs_fn = base_fn
-    else:
+    if sck is not None:
         from f1sim.learn.state_student import Student
-        ang_s = env.sim.lidar.angles.float()
-        ang_t = torch.linspace(float(ang_s[0]), float(ang_s[-1]), t_beams, device=device)
-        pos_ = (ang_t - ang_s[0]) / (ang_s[-1] - ang_s[0]) * (ang_s.numel() - 1)
-        i0_ = pos_.floor().long().clamp(0, ang_s.numel() - 2); w_ = (pos_ - i0_.float())[None, :]
-
-        def obs_fn(last):
-            o_ = base_fn(last)
-            if not t_scan:
-                return o_
-            sc = env.last_result.scan_true[lid].float()
-            return torch.cat([o_, ((sc[:, i0_] * (1 - w_) + sc[:, i0_ + 1] * w_) / 10.0).clamp(0.0, 1.0)], 1)
         student = Student(int(sck["frames"]), int(sck["beams"]), int(sck["ego_dim"])).to(device)
         student.load_state_dict(sck["student"]); student.eval()
         ego_keys = sck.get("ego_keys") or sorted(k for k in obs_d if k != "scan")
@@ -153,6 +166,12 @@ def main():
     groups = {"내 차": list(range(0, 8)), "상대": list(range(8, 29)), "상대 기하": list(range(29, 33)),
               "상자": list(range(33, 45)), "남은 시간": [45], "앞 트랙": list(range(46, 98)), "조향각": [98],
               "직전 행동": [99, 100]}
+    D_all = int(o.shape[1]); n_sc = t_beams if t_scan else 0
+    if n_sc:
+        groups["라이다"] = list(range(101, 101 + n_sc))
+    corr_cols = list(range(101 + n_sc, D_all)) if bool(ck0["args"].get("corridor_obs", 0)) else []
+    if corr_cols:
+        groups["상자 통로"] = corr_cols
     probe = []                                           # per hit: the policy's response 0.5 s before it
 
     def respond(x_raw):
@@ -173,6 +192,7 @@ def main():
     touching = torch.zeros(B, dtype=torch.bool, device=device)
     dif_all = []; dif_hit = []                           # |student - teacher| per decision, overall and before hits
     gap_on = []                                          # share of decisions the gap rule limited
+    slot_log = []                                        # per prop hit: was the prop in the obs's 3 slots 1 s / 0.5 s before
     prog_m = 0.0; n_dec_tot = 0
     events, n_img = [], 0
     km = 0.0
@@ -324,6 +344,8 @@ def main():
                         x0 = ohist[-11, i][None].clone()
                         a_full, v_full, sal, _ = respond(x0)
                         x_np = x0.clone(); x_np[0, 33:45] = 0.0
+                        if corr_cols:
+                            x_np[0, corr_cols] = 0.0          # the prop corridor is props too
                         a_np, v_np, _, _ = respond(x_np)
                         rr = [respond(ohist[-k, i][None].clone()) for k in (min(n_dec, 40), 21, 11, 1)]
                         vals = [r_[1] for r_ in rr]; phs = [r_[3] for r_ in rr]
@@ -343,6 +365,31 @@ def main():
                             pc = po.p_poses[row, :, :2]
                             dd = (pc - st[row, :2]).norm(dim=1); dd = torch.where(live, dd, torch.full_like(dd, 1e9))
                             j = int(dd.argmin())
+                            # the obs slots back then: ohist holds the raw teacher obs of the last 40 decisions (cols 33:45 =
+                            # 3 x (present, dx/5, dy/5, dist/5)); hist the poses per step (2 steps per decision)
+                            slot_info = {}
+                            for lag_d, nm in ((20, "1s"), (10, "0.5s")):
+                                if int(env.ep_step[row]) // int(a.repeat) < lag_d + 1:
+                                    continue
+                                ob = ohist[-lag_d - 1, i]
+                                hx, hy, hyaw = [float(v) for v in hist[-(2 * lag_d) - 1, row, :3]]
+                                ddx, ddy = float(pc[j, 0]) - hx, float(pc[j, 1]) - hy
+                                ex = ddx * math.cos(hyaw) + ddy * math.sin(hyaw); ey = -ddx * math.sin(hyaw) + ddy * math.cos(hyaw)
+                                found = False
+                                for q in range(3):
+                                    if float(ob[33 + 4 * q]) > 0.5:
+                                        sx, sy = float(ob[34 + 4 * q]) * 5.0, float(ob[35 + 4 * q]) * 5.0
+                                        if abs(sx - ex) < 0.3 and abs(sy - ey) < 0.3:
+                                            found = True
+                                # its rank among live props ahead (dx > -1 m, < 12 m) by distance, as the env sorts them
+                                pp = po.p_poses[row, :, :2].cpu().numpy(); lv = live.cpu().numpy()
+                                rx = (pp[:, 0] - hx) * math.cos(hyaw) + (pp[:, 1] - hy) * math.sin(hyaw)
+                                rd = np.hypot(pp[:, 0] - hx, pp[:, 1] - hy)
+                                ok_ = lv & (rx > -1.0) & (rd < 12.0)
+                                rank = int((rd[ok_] < math.hypot(ex, ey) - 1e-6).sum()) + 1 if math.hypot(ex, ey) < 12.0 and ex > -1.0 else 99
+                                slot_info[nm] = {"in_slots": found, "rank": rank, "dist": math.hypot(ex, ey)}
+                            ev["slot_info"] = slot_info
+                            slot_log.append(slot_info)
                             ext = float(po.p_d[row, j][torch.isfinite(po.p_d[row, j])].max())   # farthest face from the pose
                             trk = env.sim.track
                             tid_t = env.sim.tid[row:row + 1]
@@ -380,9 +427,20 @@ def main():
                         if "stud_minus_teach_05s" in ev:
                             title += (f"\n학생-선생(직전 0.5초): 조향 {ev['stud_minus_teach_05s']['steer_deg']:+.1f}도, "
                                       f"속도 {ev['stud_minus_teach_05s']['speed_ms']:+.2f} m/s")
-                        draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title)
+                        plan_xy = None
+                        if lt is not None:
+                            lt.refresh([row])
+                            plan_xy = lt.lines.xy[row].cpu().numpy()
+                        draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title, plan_xy)
                         n_img += 1
         o = obs_fn(act)
+    for nm in ("1s", "0.5s"):
+        q = [x[nm] for x in slot_log if nm in x]
+        if q:
+            ins = np.array([x["in_slots"] for x in q]); rk = np.array([x["rank"] for x in q]); dist = np.array([x["dist"] for x in q])
+            print(f"[관측 칸] 상자 충돌 {len(q)}건, {nm} 전: 박은 상자가 관측 3칸 안에 있었음 {ins.mean() * 100:.0f} % | 그 상자의 거리 순위 "
+                  f"1위 {(rk == 1).mean() * 100:.0f} %, 2~3위 {((rk >= 2) & (rk <= 3)).mean() * 100:.0f} %, 4위 이하 {((rk >= 4) & (rk < 99)).mean() * 100:.0f} %, "
+                  f"12 m 밖·뒤 {(rk == 99).mean() * 100:.0f} % | 거리 중앙 {np.median(dist):.1f} m", flush=True)
     secs = (int(a.steps) // int(a.repeat)) * int(a.repeat) * B * env.sim.control_dt
     n_hard = len(events)
     print(f"[J80] 진행 {prog_m / secs:.3f} m/s, 강한 충돌 {n_hard / max(km, 1e-9):.2f}/km, J80 = (진행 - 80 x 충돌)/시간 = "

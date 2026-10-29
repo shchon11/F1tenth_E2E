@@ -75,18 +75,7 @@ def main():
     lid = env.learner_ids; B = int(lid.numel())
     # the critic's observation: the teacher's, its scan interpolated from this env's full one (as state_student labels)
     t_scan = bool(tck["args"].get("scan_obs", 0)); t_beams = int(tck["args"].get("beams", 36))
-    base = StateObs(env)
-    ang_s = env.sim.lidar.angles.float()
-    ang_t = torch.linspace(float(ang_s[0]), float(ang_s[-1]), t_beams, device=device)
-    pos = (ang_t - ang_s[0]) / (ang_s[-1] - ang_s[0]) * (ang_s.numel() - 1)
-    i0 = pos.floor().long().clamp(0, ang_s.numel() - 2); wgt = (pos - i0.float())[None, :]
-
-    def tobs(last):
-        o_ = base(last)
-        if not t_scan:
-            return o_
-        sc = env.last_result.scan_true[lid].float()
-        return torch.cat([o_, ((sc[:, i0] * (1 - wgt) + sc[:, i0 + 1] * wgt) / 10.0).clamp(0.0, 1.0)], 1)
+    tobs = StateObs(env, scan=t_scan, corridor=bool(tck["args"].get("corridor_obs", 0)), t_beams=t_beams)
 
     last_a = torch.zeros(B, 2, device=device)
     to = tobs(last_a); Dt = to.shape[1]

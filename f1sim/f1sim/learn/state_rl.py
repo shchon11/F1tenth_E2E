@@ -70,16 +70,83 @@ def build_env(a, device, extra=None):
     return env
 
 
+#: `--corridor-obs`: 7 lateral bins across the track (left positive), each 2 samples wide, over 13 arc segments ahead
+CORRIDOR_U = tuple(float(x) for x in np.linspace(-0.93, 0.93, 14))
+CORRIDOR_BINS = 7
+#: dense arc offsets [m] the segments are swept with: every 0.4 m to 26 m (10-29 check: at 1 m a small prop fell between
+#: two rows)
+CORRIDOR_S = tuple(float(x) for x in np.arange(0.4, 26.01, 0.4))
+
+
+def corridor_block(env, lid, s, tid, inflate=0.15):
+    """(B, 13 * 7) in {0, 1}: for each arc segment between consecutive track-ahead points (AHEAD; the first from the car
+    to 1 m), which lateral bins across the track a live prop (inflated by the car's half width) covers anywhere along the
+    segment -- the free corridor the props leave, in the frame of the centerline points the policy steers by (10-29:
+    the hit prop was outside the 3 nearest-prop slots 1 s before 24 % of the teacher's prop hits; in the scenes the
+    policy kept its line through apex props). Swept every 0.4 m, so no prop falls between rows."""
+    po = env.procedural
+    tr = env.sim.track
+    B = s.shape[0]
+    n_seg = len(AHEAD)
+    if po is None or po.C == 0:
+        return torch.zeros(B, n_seg * CORRIDOR_BINS, device=s.device)
+    offs = torch.tensor(CORRIDOR_S, device=s.device)
+    seg = torch.bucketize(offs, torch.tensor(AHEAD, device=s.device))     # (R,) segment of each dense row
+    R = offs.numel()
+    xy, yaw = tr.pose_at_s((s[:, None] + offs[None, :]).reshape(-1), tid.repeat_interleave(R))
+    xy = xy.reshape(B, R, 2); yaw = yaw.reshape(B, R)
+    w = tr.sample_edt(xy, tid[:, None].expand(-1, R))                      # (B, R) half width
+    U = torch.tensor(CORRIDOR_U, device=s.device)
+    nx, ny = -torch.sin(yaw), torch.cos(yaw)
+    off = U[None, None, :] * w[..., None]                                 # (B, R, M)
+    px = xy[..., 0:1] + off * nx[..., None]; py = xy[..., 1:2] + off * ny[..., None]
+    blocked = torch.zeros(B, R, U.numel(), dtype=torch.bool, device=s.device)
+    pp_all = po.p_poses[lid]; live_all = po.p_sid[lid] >= 0
+    nrm_all, dd_all = po.p_n[lid], po.p_d[lid]
+    for c in range(po.C):                                                 # one prop slot at a time: bounded memory
+        live = live_all[:, c]
+        if not bool(live.any()):
+            continue
+        pp = pp_all[:, c]
+        dx = px - pp[:, None, None, 0]; dy = py - pp[:, None, None, 1]
+        cc, ss = torch.cos(pp[:, 2])[:, None, None], torch.sin(pp[:, 2])[:, None, None]
+        lx, ly = dx * cc + dy * ss, -dx * ss + dy * cc
+        nrm, dd = nrm_all[:, c], dd_all[:, c]                             # (B, k, 2), (B, k)
+        fin = torch.isfinite(dd)
+        sd = (nrm[:, None, None, :, 0] * lx[..., None] + nrm[:, None, None, :, 1] * ly[..., None]
+              - torch.where(fin, dd, torch.zeros_like(dd))[:, None, None, :])
+        sd = torch.where(fin[:, None, None, :], sd, torch.full_like(sd, -1e9)).amax(-1)        # (B, R, M)
+        blocked |= (sd < inflate) & live[:, None, None]
+    bins = blocked.reshape(B, R, CORRIDOR_BINS, -1).any(-1)                # (B, R, 7)
+    out = torch.zeros(B, n_seg, CORRIDOR_BINS, dtype=torch.bool, device=s.device)
+    for k in range(n_seg):
+        m = seg == k
+        if bool(m.any()):
+            out[:, k] = bins[:, m].any(1)
+    return out.float().reshape(B, -1)
+
+
 class StateObs:
     """The observation, from the env's state after a step. scan: append the env's NOISE-FREE scan (`scan_true`, the
     beams `--beams` casts) / range: the true shape of every prop, wall and car in view (10-29: three prop centres
     without their size let the car clip a prop's edge in every narrowing -- crash_scenes.py)."""
 
-    def __init__(self, env, scan: bool = False, scan_range: float = 10.0):
+    def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0):
         self.env = env
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
         self.scan, self.scan_range = bool(scan), float(scan_range)
+        self.corridor = bool(corridor)
+        # t_beams: the teacher's own beam count when this env casts more (a student's env): its noise-free scan is
+        # interpolated to those beams over the same field of view, as the teacher saw it in training
+        self.interp = None
+        if self.scan and t_beams:
+            ang_s = env.sim.lidar.angles.float()
+            if ang_s.numel() != int(t_beams):
+                ang_t = torch.linspace(float(ang_s[0]), float(ang_s[-1]), int(t_beams), device=env.device)
+                pos = (ang_t - ang_s[0]) / (ang_s[-1] - ang_s[0]) * (ang_s.numel() - 1)
+                i0 = pos.floor().long().clamp(0, ang_s.numel() - 2)
+                self.interp = (i0, (pos - i0.float())[None, :])
 
     def __call__(self, last_action):
         env = self.env
@@ -103,7 +170,13 @@ class StateObs:
         steer = (st[:, 6] / float(env.s_max))[:, None]
         parts = [pv, ahead, steer, last_action]
         if self.scan:
-            parts.append((res.scan_true[lid].float() / self.scan_range).clamp(0.0, 1.0))
+            sc = res.scan_true[lid].float()
+            if self.interp is not None:
+                i0, w_ = self.interp
+                sc = sc[:, i0] * (1 - w_) + sc[:, i0 + 1] * w_
+            parts.append((sc / self.scan_range).clamp(0.0, 1.0))
+        if self.corridor:
+            parts.append(corridor_block(env, lid, s, tid))
         out = torch.cat(parts, 1).float()
         self.dim = out.shape[1]
         return out
@@ -199,7 +272,7 @@ def train(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(a.scan_obs))
+    obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs))
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -418,7 +491,7 @@ def evaluate(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)))
+    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     last_a = torch.zeros(B, 2, device=device)
@@ -480,6 +553,8 @@ def main():
     ap.add_argument("--price-ramp", type=int, default=200, help="updates of the linear ramp to --price")
     ap.add_argument("--save-every", type=int, default=50)
     ap.add_argument("--init", default="")
+    ap.add_argument("--corridor-obs", type=int, default=0,
+                    help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,
                     help="potential -X x price x geo_risk (the 1 s arc's overlap with a prop); 0 = off")
     ap.add_argument("--car-price", type=float, default=0.0,
