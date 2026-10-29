@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from f1sim.learn import state_rl  # noqa: E402
-from f1sim.learn.state_rl import ActorCritic, RunningNorm, StateObs  # noqa: E402
+from f1sim.learn.state_rl import ActorCritic, RunningNorm, StateObs, Unwedge  # noqa: E402
 
 H = 80          # 2 s of history at 40 Hz
 
@@ -103,6 +103,8 @@ def main():
     ap.add_argument("--gap-rule", type=float, default=0.0,
                     help="falsifier for 'the teacher is near its optimum on cars': cap its speed command to keep this time "
                          "gap [s] (+0.3 m) to a car ahead in its lane; compare the J80 rate with the rule off")
+    ap.add_argument("--unwedge", type=int, default=0, help="1: the wedge recovery (as state_student evalx / training)")
+    ap.add_argument("--steps-total", type=int, default=0, help="unused")
     ap.add_argument("--overlay-layout", type=int, default=0,
                     help="1: draw the layout-line planner's line for the hit row's layout (one-track envs: --like / --warps 0)")
     ap.add_argument("--like", default="", help="an eval_ckpt.sh race JSON: drive in exactly that world (state_student.make_env_like)")
@@ -211,6 +213,7 @@ def main():
         enc_vel = torch.zeros(env.B, po.C, device=device)             # the prop's own speed while the car was near
         enc_od = torch.full((env.B, po.C), 99.0, device=device)       # the nearest opponent's distance during it
     tracks = env.sim.track.tracks
+    uw = Unwedge(env, lid) if int(a.unwedge) else None
     for t in range(int(a.steps) // int(a.repeat)):
         ohist = torch.roll(ohist, -1, 0); ohist[-1] = o
         act = model.pi(norm(o)).clamp(-1, 1)
@@ -239,7 +242,11 @@ def main():
             act = s_act
         act_full[lid] = act
         for r in range(int(a.repeat)):
+            if uw is not None:
+                uw.before(act_full)
             obs_d, r_, te, trc, info = env.step(act_full)
+            if uw is not None:
+                uw.after()
             st = env.sim.state
             cmd = torch.zeros(env.B, 2, device=device); cmd[lid] = act
             hist = torch.roll(hist, -1, 0)
@@ -443,6 +450,11 @@ def main():
                   f"12 m 밖·뒤 {(rk == 99).mean() * 100:.0f} % | 거리 중앙 {np.median(dist):.1f} m", flush=True)
     secs = (int(a.steps) // int(a.repeat)) * int(a.repeat) * B * env.sim.control_dt
     n_hard = len(events)
+    if events:
+        from collections import Counter
+        per_row = Counter(e["row"] for e in events)
+        top = per_row.most_common(3)
+        print(f"[차별] 충돌 {n_hard}회가 {len(per_row)}대에서: 가장 많은 차 {top} | 끼임 복구 {uw.count if uw is not None else '-'}회", flush=True)
     print(f"[J80] 진행 {prog_m / secs:.3f} m/s, 강한 충돌 {n_hard / max(km, 1e-9):.2f}/km, J80 = (진행 - 80 x 충돌)/시간 = "
           f"{(prog_m - 80.0 * n_hard) / secs:.4f} m/s" + (f" | 간격 규칙이 막은 결정 {np.mean(gap_on) * 100:.1f} %" if gap_on else ""), flush=True)
     if sck is not None and dif_all:
