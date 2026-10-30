@@ -19,7 +19,7 @@ from f1sim.learn.state_rl import ActorCritic, RunningNorm, StateObs, Unwedge  # 
 H = 80          # 2 s of history at 40 Hz
 
 
-def draw(path, ev, track, props_in, opp_hist, title, plan_xy=None):
+def draw(path, ev, track, props_in, opp_hist, title, plan_xy=None, my_paths=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -55,6 +55,11 @@ def draw(path, ev, track, props_in, opp_hist, title, plan_xy=None):
         # the layout-line planner's minimum-time line for THIS layout (privileged, re-planned around the props)
         m = (np.abs(plan_xy[:, 0] - x0) < W) & (np.abs(plan_xy[:, 1] - y0) < W)
         ax.plot(plan_xy[m, 0], plan_xy[m, 1], ".", color="magenta", ms=2.5, label="계획기 선(이 배치)")
+        ax.legend(loc="lower right", fontsize=7)
+    if my_paths is not None:
+        # the teacher's own planned path (learn.path_plan) 1 s / 0.5 s before the hit and at it
+        for pth, col, lab in zip(my_paths, ("lightskyblue", "deepskyblue", "navy"), ("내 계획 1 s 전", "0.5 s 전", "충돌 때")):
+            ax.plot(pth[:, 0], pth[:, 1], "-", color=col, lw=1.6, label=lab)
         ax.legend(loc="lower right", fontsize=7)
     for oh in opp_hist:
         oh = np.array(oh)
@@ -236,8 +241,15 @@ def main():
     uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     env.sim.measure_impacts = True                     # car impacts too (as ContactSeverityMeter turns it on for evaluate)
     car_prev_all = torch.zeros(B, dtype=torch.bool, device=device)
+    my_pl = getattr(obs_fn, "planner", None)               # the teacher's own path planner (state_rl --path-plan)
+    if my_pl is not None:
+        pl_ds = torch.arange(0.0, 15.01, 0.4, device=device)
+        planhist = torch.zeros(HD, B, pl_ds.numel(), 2, device=device)
     for t in range(int(a.steps) // int(a.repeat)):
         ohist = torch.roll(ohist, -1, 0); ohist[-1] = o
+        if my_pl is not None:
+            planhist = torch.roll(planhist, -1, 0)
+            planhist[-1] = my_pl.path_xy(env.last_result.s[lid][:, None] + pl_ds[None], env.sim.tid[lid])[0]
         act = model.pi(norm(o)).clamp(-1, 1)
         if float(a.gap_rule) > 0 and env.M > 1:
             st0 = env.sim.state
@@ -480,7 +492,10 @@ def main():
                         if lt is not None:
                             lt.refresh([row])
                             plan_xy = lt.lines.xy[row].cpu().numpy()
-                        draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title, plan_xy)
+                        my_paths = None
+                        if my_pl is not None:
+                            my_paths = [planhist[-21, i].cpu().numpy(), planhist[-11, i].cpu().numpy(), planhist[-1, i].cpu().numpy()]
+                        draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title, plan_xy, my_paths)
                         n_img += 1
         o = obs_fn(act)
     for nm in ("1s", "0.5s"):

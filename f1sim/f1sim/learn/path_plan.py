@@ -32,7 +32,9 @@ PROP_MARGIN = 0.15        # [m] clearance kept from a prop beyond the half width
 WALL_MARGIN = 0.15        # [m] clearance kept from a wall beyond the half width
 CAR_R = 0.55              # [m] centre distance under which two cars touch (0.5 m long, a little more)
 OFFSETS = tuple(float(x) for x in np.linspace(-1.2, 1.2, 13))   # [m] candidate held offsets from the raceline
-RAMPS = (2.5, 5.0)        # [m] candidate ramp lengths
+RAMPS = (2.5, 5.0, 8.0)   # [m] candidate ramp lengths
+A_LAT = 5.0               # [m/s^2] the lateral acceleration a ramp may ask at the current speed (10-30: a 0.8 m move in 2.5 m
+                          # at 4.5 m/s asked ~15 and the car hit the chicane corner it was moved towards)
 NEAR_M = 1.2              # [m] checks start here: nearer is committed whatever the plan
 
 
@@ -171,14 +173,19 @@ class PathPlanner:
         return torch.stack([xy[..., 0] + d * nx, xy[..., 1] + d * ny], -1), d
 
     # --- checking candidates -----------------------------------------------------------------------------------------
-    def _blocked(self, pts, tid, t_reach):
-        """pts (B, C, K, 2) world, t_reach (B, K) seconds until we get there -> (B, C, K) bool"""
+    def _blocked(self, pts, tid, t_reach, moved=None):
+        """pts (B, C, K, 2) world, t_reach (B, K) seconds until we get there, moved (B, C, K) how far each point is off the
+        reference line -> (B, C, K) bool"""
         env = self.env
         B, C, K, _ = pts.shape
         lid = self.lid
         tr = env.sim.track
         edt = tr.sample_edt(pts, tid[:, None, None].expand(B, C, K))
-        bad = edt < HALF_W + 0.05                      # walls: the clamp keeps the margin; this catches a curve's inside
+        # walls: a point on the reference line is where the car drives anyway (not checked); a point moved off it must keep
+        # half the body + WALL_MARGIN
+        bad = edt < HALF_W + WALL_MARGIN
+        if moved is not None:
+            bad = bad & (moved > 0.05)
         po = env.procedural
         if po is not None and po.C > 0:
             pp_all = po.p_poses[lid]; live_all = po.p_sid[lid] >= 0
@@ -245,7 +252,12 @@ class PathPlanner:
         pts = torch.stack([xy[:, None, :, 0] + d_c * nx[:, None], xy[:, None, :, 1] + d_c * ny[:, None]], -1)  # (B, C, K, 2)
         v = st[:, 3].abs().clamp_min(1.5)
         t_reach = self.ds[None] / v[:, None]
-        bad = self._blocked(pts, tid, t_reach)                                # (B, C, K)
+        moved = (d_c - base_d[:, None]).abs()
+        bad = self._blocked(pts, tid, t_reach, moved)                         # (B, C, K)
+        # a ramp the car cannot follow at its speed: the smoothstep's peak curvature 6 |de| / L^2 times v^2
+        de = (self.cand_o[None] - e_now[:, None]).abs()                        # (B, C)
+        a_need = st[:, 3:4].abs() ** 2 * 6.0 * de / self.cand_r[None] ** 2
+        steep = a_need > A_LAT
         # the first metre is committed (a car beside a wall would find every candidate blocked at 0.4 m)
         bad = bad & (self.ds >= NEAR_M)[None, None]
         first = torch.where(bad, self.ds[None, None].expand_as(bad), torch.full_like(bad, HORIZON + 1.0, dtype=torch.float32)).amin(-1)
@@ -254,6 +266,7 @@ class PathPlanner:
         cost = (self.cand_o.abs()[None] + 0.5 * (self.cand_o[None] - self.e_to[:, None]).abs()
                 + 0.2 * (self.cand_r[None] < 4.0).float())
         cost = torch.where(blocked, 1000.0 + (HORIZON - free_c) * 10.0, cost)
+        cost = cost + 2000.0 * steep.float()                                  # a ramp the car cannot follow is worse than a block ahead
         best = cost.argmin(1)
         ar = torch.arange(B, device=self.dev)
         # adopt: a new plan from where the old one is now, unless the chosen target is the current one (keep its ramp)
