@@ -228,6 +228,12 @@ class EnvConfig:
     #: so a negative value lets the policy back out of a wedge itself instead of an outside recovery rule; opponents keep
     #: the [0, v_max_policy] map. 0 = as before.
     v_min_policy: float = 0.0
+    #: Reverse BELOW the usual range (2026-10-30), for a learner in direct mode: its speed action may go down to
+    #: -1 - reverse_ext, and a in [-1 - reverse_ext, -1) commands -reverse_speed * (-(a + 1) / reverse_ext); a in [-1, 1]
+    #: keeps exactly the [0, v_max_policy] map, so a policy trained without it drives the same and can learn to back out
+    #: of a wedge itself (the outside recovery rule re-wedged cars on the same prop). 0 = as before.
+    reverse_ext: float = 0.0
+    reverse_speed: float = 2.0
     max_steps: int = 1600            # 40 s at 40 Hz
     # Give each race's FIRST episode after `reset()` a random length in [1, max_steps] instead of
     # max_steps; every later episode is full length. Under `collision_mode="soft"` nothing
@@ -2950,10 +2956,21 @@ class F1VecEnv:
         return obs, {"priv": self._priv(r)}
 
     def step(self, action: torch.Tensor):
-        a = self._opponent_actions(action.to(self.device).clamp(-1.0, 1.0))
+        ext = float(self.ecfg.reverse_ext)
+        if ext > 0 and self.act_dim == 2:
+            # the learners' speed may reach into the reverse extension; everything else stays in [-1, 1]
+            act_in = action.to(self.device)
+            lo = torch.where(self.learner, torch.full((self.B,), -1.0 - ext, device=self.device), torch.full((self.B,), -1.0, device=self.device))
+            a = torch.stack([act_in[:, 0].clamp(-1.0, 1.0), torch.maximum(torch.minimum(act_in[:, 1], torch.ones_like(lo)), lo)], 1)
+            a = self._opponent_actions(a)
+        else:
+            a = self._opponent_actions(action.to(self.device).clamp(-1.0, 1.0))
         if self.act_dim == 2:
             v_lo = self._v_lo()
             v_cmd = torch.minimum(v_lo + (a[:, 1] + 1) * 0.5 * (self.ecfg.v_max_policy - v_lo), self.speed_cap)
+            if ext > 0:
+                v_rev = -float(self.ecfg.reverse_speed) * (-(a[:, 1] + 1.0) / ext)
+                v_cmd = torch.where(a[:, 1] < -1.0, v_rev, v_cmd)
             cmd = torch.stack([a[:, 0] * self.s_max, v_cmd], 1)
         elif self._all_external:
             # Every car is driven by an external driver whose command replaces this one below, so

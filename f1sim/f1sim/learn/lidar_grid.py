@@ -111,8 +111,12 @@ class StudentGrid(nn.Module):
     def grid(self, scan, rel):
         return lidar_grid(scan, rel, self.angles, self.mount.tolist(), self.range_max)
 
+    rev_ext = 0.0
+
     def forward(self, scan, ego, rel):
-        return self.head(torch.cat([self.proj(self.conv(self.grid(scan, rel))), self.ego(ego)], 1))
+        from .state_student import _rev_scale
+        y = self.head(torch.cat([self.proj(self.conv(self.grid(scan, rel))), self.ego(ego)], 1))
+        return _rev_scale(y, self.rev_ext)
 
 
 def lidar_mount(env):
@@ -132,6 +136,7 @@ def make_student(sck_or_none, env, frames, beams, ego_dim, grid, device):
         m = Student(frames, beams, ego_dim).to(device)
     if sck_or_none is not None:
         m.load_state_dict(sck_or_none["student"])
+    m.rev_ext = float(getattr(env.ecfg, "reverse_ext", 0.0) or 0.0)      # the env's range (built from the teacher's)
     return m
 
 

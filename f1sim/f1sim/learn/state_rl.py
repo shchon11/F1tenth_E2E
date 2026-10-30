@@ -49,7 +49,7 @@ def build_env(a, device, extra=None):
     cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0)
     cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
     e = dict(action_mode="direct", max_steps=int(a.episode_s * 40), speed_cap=10.0, v_max_policy=10.0,
-             v_min_policy=float(getattr(a, "v_min", 0.0) or 0.0),
+             v_min_policy=float(getattr(a, "v_min", 0.0) or 0.0), reverse_ext=float(getattr(a, "reverse_ext", 0.0) or 0.0),
              collision_mode="soft", contact_severity_min=1.5, stagger_first_episode=True,
              reward_progress=1.0, reward_collision=-1.0, reward_car_contact=1.0, reward_steer_rate=0.02,
              reward_wrong_way=0.4, reward_proximity=0.0, reward_lap=0.0, reward_lap_time=0.0,
@@ -487,6 +487,14 @@ class RunningNorm:
         self.raw_tail = int(d.get("raw_tail", 0))
 
 
+def clamp_act(a, ext=0.0):
+    """the action range: steer in [-1, 1]; speed in [-1 - ext, 1] -- `EnvConfig.reverse_ext` (below -1 = reverse)"""
+    ext = float(ext or 0.0)
+    if ext <= 0:
+        return a.clamp(-1, 1)
+    return torch.stack([a[..., 0].clamp(-1, 1), a[..., 1].clamp(-1 - ext, 1)], -1)
+
+
 def mlp(i, o, h=256):
     return nn.Sequential(nn.Linear(i, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, o))
 
@@ -665,7 +673,7 @@ def train(a):
                     bg[t] = geo_risk(env, lid)
                 rew = torch.zeros(B, device=device); done = torch.zeros(B, dtype=torch.bool, device=device)
                 hit_now = torch.zeros(B, dtype=torch.bool, device=device)
-                act_full[lid] = act.clamp(-1, 1)
+                act_full[lid] = clamp_act(act, a.reverse_ext)
                 for k in range(R):
                     if unwedge is not None:
                         unwedge.before(act_full)
@@ -709,7 +717,7 @@ def train(a):
                     if info["lap_times"].numel():
                         laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
                 br[t] = rew; bd[t] = done.float(); bh[t] = hit_now.float()
-                last_a = torch.where(done[:, None], torch.zeros_like(act), act.clamp(-1, 1))
+                last_a = torch.where(done[:, None], torch.zeros_like(act), clamp_act(act, a.reverse_ext))
                 if float(a.noise_corr) > 0:
                     eps_n = torch.where(done[:, None], torch.randn_like(eps_n), eps_n)
                 o = obs_fn(last_a)
@@ -832,7 +840,7 @@ def evaluate(a):
     prog = hw = hc = 0.0; laps = []; steps = 0
     R = int(a.repeat)
     for t in range(int(a.eval_steps) // R):
-        act = model.pi(norm(o)).clamp(-1, 1)
+        act = clamp_act(model.pi(norm(o)), ck["args"].get("reverse_ext", 0.0))
         act_full[lid] = act
         for k in range(R):
             _, r_, te, trc, info = env.step(act_full)
@@ -894,6 +902,7 @@ def main():
     ap.add_argument("--bev", type=int, default=0, help="1: the car-centred grid of walls / props / cars + a conv (10-30)")
     ap.add_argument("--v-min", type=float, default=0.0, help="[m/s] the slowest command, < 0 lets the policy reverse")
     ap.add_argument("--shared-enc", type=int, default=0, help="1: actor and critic share the --bev grid encoder")
+    ap.add_argument("--reverse-ext", type=float, default=0.0, help="speed action down to -1 - X = reverse (EnvConfig.reverse_ext)")
     ap.add_argument("--path-plan", type=int, default=0, help="1: drive a planned path (learn.path_plan) given as the track-ahead block")
     ap.add_argument("--track-k", type=float, default=0.5, help="--path-plan: price per m and step of leaving the plan beyond --track-dead")
     ap.add_argument("--track-dead", type=float, default=0.15, help="[m] --path-plan: free lateral room around the plan")

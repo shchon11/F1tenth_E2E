@@ -51,6 +51,8 @@ def run(a, ck, solo, device):
     ov = dict(max_steps=int(a.steps) + 10)
     if float(ck["args"].get("v_min", 0.0) or 0.0):
         ov.update(v_min_policy=float(ck["args"]["v_min"]))
+    if float(ck["args"].get("reverse_ext", 0.0) or 0.0):
+        ov.update(reverse_ext=float(ck["args"]["reverse_ext"]))
     if solo:
         from f1sim.gym_env import EnvConfig
         ov.update(race_size=1, opponent=EnvConfig().opponent, opponent_slots=None)
@@ -90,7 +92,7 @@ def run(a, ck, solo, device):
                 st.observe()                                         # the pose the last step left
             if t % R == 0:
                 if is_teacher:
-                    act = net.pi(nrm(sobs(last))).clamp(-1, 1); last = act
+                    act = state_rl.clamp_act(net.pi(nrm(sobs(last))), ck["args"].get("reverse_ext", 0.0)); last = act
                 else:
                     act = st(obs, egov(obs))
                 act_full[lid] = act

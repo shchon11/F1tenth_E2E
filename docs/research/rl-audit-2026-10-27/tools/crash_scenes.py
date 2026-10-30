@@ -125,6 +125,7 @@ def main():
     ck0 = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     sck = torch.load(a.student, map_location=device, weights_only=False) if a.student else None
     a.v_min = float(ck0["args"].get("v_min", 0.0) or 0.0)       # build_env reads it: a policy that may reverse
+    a.reverse_ext = float(ck0["args"].get("reverse_ext", 0.0) or 0.0)
     if a.like:
         from f1sim.learn.state_student import make_env_like
         fr_ = int(sck["frames"]) if sck is not None else 1
@@ -132,9 +133,10 @@ def main():
         if sck is not None:
             a.beams = int(sck["beams"])
         # priv flags on in both modes: the teacher's StateObs labels / probes every decision
-        vmin_ = float(ck0["args"].get("v_min", 0.0) or 0.0)
+        vmin_ = float(ck0["args"].get("v_min", 0.0) or 0.0); rext_ = float(ck0["args"].get("reverse_ext", 0.0) or 0.0)
+        ov_ = dict(**({"v_min_policy": vmin_} if vmin_ else {}), **({"reverse_ext": rext_} if rext_ else {}))
         env, _cfg, _ecfg, _md = make_env_like(a.like, device, int(a.beams), fr_, sd_, True, envs=int(a.envs),
-                                              override=(dict(v_min_policy=vmin_) if vmin_ else None))
+                                              override=(ov_ or None))
     elif sck is not None:
         # the student's sensors (its beams, the 3-frame scan stack of the v1 obs dict); the teacher's scan is
         # interpolated to ITS beams over the same field of view (as state_student does)
@@ -213,7 +215,7 @@ def main():
         v = float(model.v(xn[None]).squeeze()) * float(ret_rms.var.sqrt() + 1e-6)
         # the hit head (P(a hard hit within 20 decisions)); untrained (no --hit-head) checkpoints give noise here
         ph = float(torch.sigmoid(model.value_and_hit(xn[None])[1]).squeeze())
-        return a_.detach()[0].clamp(-1, 1), v, sal, ph
+        return state_rl.clamp_act(a_.detach()[0], ck0["args"].get("reverse_ext", 0.0)), v, sal, ph
 
     ret_rms = RunningNorm(1, device); ret_rms.load_state_dict(ck["ret_rms"])
     touching = torch.zeros(B, dtype=torch.bool, device=device)
@@ -250,7 +252,7 @@ def main():
         if my_pl is not None:
             planhist = torch.roll(planhist, -1, 0)
             planhist[-1] = my_pl.path_xy(env.last_result.s[lid][:, None] + pl_ds[None], env.sim.tid[lid])[0]
-        act = model.pi(norm(o)).clamp(-1, 1)
+        act = state_rl.clamp_act(model.pi(norm(o)), ck0["args"].get("reverse_ext", 0.0))
         if float(a.gap_rule) > 0 and env.M > 1:
             st0 = env.sim.state
             dx_, dy_, dyaw_, dvx_, dvy_, dist_, pr_ = env._opp_rel(st0)
@@ -270,7 +272,7 @@ def main():
             gap_on.append(float(limit.float().mean()))
         if sck is not None:
             with torch.no_grad():
-                s_act = student(obs_d, egov(obs_d)).clamp(-1, 1)
+                s_act = state_rl.clamp_act(student(obs_d, egov(obs_d)), sck["args"].get("reverse_ext", 0.0))
             dif_hist = torch.roll(dif_hist, -1, 0); dif_hist[-1] = s_act - act
             dif_all.append((s_act - act).abs().mean(0).cpu())
             act = s_act

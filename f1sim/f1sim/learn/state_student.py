@@ -24,6 +24,13 @@ from . import state_rl
 from .state_rl import ActorCritic, PropRemoval, RunningNorm, StateObs, Unwedge
 
 
+def _rev_scale(y, ext):
+    """tanh outputs -> the action range with the reverse extension: speed (1 + ext / 2) y - ext / 2 spans [-1 - ext, 1]"""
+    if not ext:
+        return y
+    return torch.stack([y[:, 0], (1.0 + ext / 2.0) * y[:, 1] - ext / 2.0], 1)
+
+
 class Student(nn.Module):
     """scan frames (B, F, N) + ego (B, E) -> (steer, speed) in [-1, 1] (tanh)."""
 
@@ -35,8 +42,11 @@ class Student(nn.Module):
         self.ego = nn.Sequential(nn.Linear(ego_dim, 128), nn.ReLU())
         self.head = nn.Sequential(nn.Linear(384, 256), nn.ReLU(), nn.Linear(256, 2), nn.Tanh())
 
+    rev_ext = 0.0                                   # `EnvConfig.reverse_ext`: the speed output spans [-1 - ext, 1]
+
     def forward(self, scan, ego):
-        return self.head(torch.cat([self.conv(scan), self.ego(ego)], 1))
+        y = self.head(torch.cat([self.conv(scan), self.ego(ego)], 1))
+        return _rev_scale(y, self.rev_ext)
 
 
 def main():
@@ -81,6 +91,7 @@ def main():
     # stack, speed, the issued commands, the proprio history)
     ck = torch.load(a.teacher, map_location=device, weights_only=False)
     a.v_min = float(ck["args"].get("v_min", 0.0) or 0.0)       # the teacher's command range (it may reverse), saved in args
+    a.reverse_ext = float(ck["args"].get("reverse_ext", 0.0) or 0.0)
     env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=int(a.frames), scan_stride=int(a.stride)))
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
@@ -133,7 +144,7 @@ def main():
         student.eval()
         with torch.no_grad():
             for t in range(int(a.steps) // R):
-                y = teacher.pi(tnorm(o)).clamp(-1, 1)                      # the label: the teacher's mean action
+                y = state_rl.clamp_act(teacher.pi(tnorm(o)), ck["args"].get("reverse_ext", 0.0))   # the label: the teacher's mean action
                 # danger weight (--danger-weight): the student's errors cost hits where the teacher's own hit head sees
                 # one coming (10-29: before its car contacts the student was 0.68 m/s faster than the label in 65 % of
                 # cases); uniform MSE spends the fit on cruising
@@ -430,9 +441,14 @@ def evaluate_like():
     if a.only == "solo":
         jobs = jobs[:1]
     for tag, ref in jobs:
-        v_min = float(ck["args"].get("v_min", 0.0) or 0.0)       # a policy that may reverse (state_rl --v-min)
-        env, cfg, ecfg, md = make_env_like(ref, device, n_beams, frames, stride, is_teacher,
-                                           override=(dict(v_min_policy=v_min) if v_min else None))
+        v_min = float(ck["args"].get("v_min", 0.0) or 0.0)       # a policy that may reverse (state_rl --v-min / --reverse-ext)
+        r_ext = float(ck["args"].get("reverse_ext", 0.0) or 0.0)
+        ov_ = {}
+        if v_min:
+            ov_["v_min_policy"] = v_min
+        if r_ext:
+            ov_["reverse_ext"] = r_ext
+        env, cfg, ecfg, md = make_env_like(ref, device, n_beams, frames, stride, is_teacher, override=(ov_ or None))
         seed = int(md["seed"]); envs = int(md["envs"])
         lid = env.learner_ids; B = int(lid.numel())
 
@@ -465,7 +481,7 @@ def evaluate_like():
                         if self.net is None:
                             self.net = ActorCritic(o_.shape[1], bev=ck.get("bev")).to(device); self.net.load_state_dict(ck["model"], strict=False)
                             self.net.eval(); self.nrm = RunningNorm(o_.shape[1], device); self.nrm.load_state_dict(ck["norm"])
-                        a_ = self.net.pi(self.nrm(o_)).clamp(-1, 1)
+                        a_ = state_rl.clamp_act(self.net.pi(self.nrm(o_)), ck["args"].get("reverse_ext", 0.0))
                     else:
                         keys = self.keys or sorted(k for k in obs if k != "scan")
                         ego = torch.cat([obs[k][lid].float().reshape(B, -1) for k in keys], 1)
