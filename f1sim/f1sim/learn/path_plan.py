@@ -131,7 +131,19 @@ class PathPlanner:
         check the line it moves -- checking the raceline let the policy's own line + the offset run into a chicane wall)"""
         t = torch.as_tensor(table, dtype=torch.float32, device=self.dev)[: self.d_rl.shape[0]]
         m = min(t.shape[1], self.d_rl.shape[1])
-        self.d_rl[: t.shape[0], :m] = t[:, :m]
+        # a recorded line is noisy where few passes landed (spikes at the U-turns drew kinked plans): +-0.5 m moving average,
+        # cyclic over each track's own length
+        k = int(round(0.5 / self.res))
+        out = t[:, :m].clone()
+        for r in range(t.shape[0]):
+            n_r = int(self.n_s[r]) if r < self.n_s.numel() else m
+            n_r = min(n_r, m)
+            v = t[r, :n_r]
+            acc = torch.zeros_like(v)
+            for j in range(-k, k + 1):
+                acc += torch.roll(v, j)
+            out[r, :n_r] = acc / (2 * k + 1)
+        self.d_rl[: t.shape[0], :m] = out
 
     # --- the reference and a plan's offset ---------------------------------------------------------------------------
     def rl_speed(self, s, tid):
@@ -161,12 +173,29 @@ class PathPlanner:
         a = self._arc(s, s_from.view(shp), tid.view(shp) if tid.dim() == 1 and s.dim() > 1 else tid)
         return e_from.view(shp) + (e_to - e_from).view(shp) * _smoothstep(a / ramp.view(shp))
 
+    def offset(self, s, tid):
+        """the plan's lateral offset FROM THE CENTERLINE at stations s (B, K) -- the reference plus the plan's own offset,
+        kept inside the track there (half width less the body and the margins). 10-30: unclamped, an offset chosen where
+        the track was wide ran on into a U-turn and the path the policy was given (and paid to follow) went through the wall"""
+        tr = self.env.sim.track
+        B, K = s.shape
+        tk = tid[:, None].expand(B, K)
+        d_ref = self.rl_offset(s, tk)
+        e = self.plan_offset(s, tid)
+        xy, _ = tr.pose_at_s(s.reshape(-1), tk.reshape(-1))
+        half = tr.sample_edt(xy.reshape(B, K, 2), tk)
+        lim = (half - HALF_W - WALL_MARGIN - 0.10).clamp_min(0.0)
+        # only the plan's own move is limited; the reference line stays where the car drives it (a fast line may pass a wall
+        # closer than the margin -- moving the reference there would change the open-track input)
+        lo = torch.minimum(-lim - d_ref, torch.zeros_like(d_ref)); hi = torch.maximum(lim - d_ref, torch.zeros_like(d_ref))
+        return d_ref + torch.maximum(torch.minimum(e, hi), lo)
+
     def path_xy(self, s, tid):
         """world points of the plan at stations s (B, K) -> (B, K, 2), and the path offset from the centerline (B, K)"""
         tr = self.env.sim.track
         B, K = s.shape
         tk = tid[:, None].expand(B, K)
-        d = self.rl_offset(s, tk) + self.plan_offset(s, tid)
+        d = self.offset(s, tid)
         xy, yaw = tr.pose_at_s(s.reshape(-1), tk.reshape(-1))
         xy = xy.reshape(B, K, 2); yaw = yaw.reshape(B, K)
         nx, ny = -torch.sin(yaw), torch.cos(yaw)
@@ -245,7 +274,9 @@ class PathPlanner:
         # keep every candidate inside the track: clamp the held offset to the half width there (less the margins)
         half = tr.sample_edt(tr.pose_at_s(s_k.reshape(-1), tk.reshape(-1))[0].reshape(B, K, 2), tk)
         lim = (half - HALF_W - WALL_MARGIN - 0.10).clamp_min(0.0)   # a buffer: a clamped candidate is not "at the wall"
-        d_c = (base_d[:, None] + e_c).clamp(-lim[:, None], lim[:, None])
+        lo = torch.minimum(-lim - base_d, torch.zeros_like(base_d))[:, None]
+        hi = torch.maximum(lim - base_d, torch.zeros_like(base_d))[:, None]
+        d_c = base_d[:, None] + torch.maximum(torch.minimum(e_c, hi), lo)       # as `offset`: only the move is limited
         xy, yaw = tr.pose_at_s(s_k.reshape(-1), tk.reshape(-1))
         xy = xy.reshape(B, K, 2); yaw = yaw.reshape(B, K)
         nx, ny = -torch.sin(yaw), torch.cos(yaw)
@@ -269,6 +300,13 @@ class PathPlanner:
         cost = cost + 2000.0 * steep.float()                                  # a ramp the car cannot follow is worse than a block ahead
         best = cost.argmin(1)
         ar = torch.arange(B, device=self.dev)
+        # hysteresis: keep the current target (its nearest candidate) unless it is blocked / steep or a candidate is clearly
+        # cheaper -- re-deciding every 50 ms flipped the target and the path zigzagged between decisions
+        cur = (self.cand_o[None] - self.e_to[:, None]).abs() + 0.01 * (self.cand_r[None] - self.ramp[:, None]).abs()
+        ic = cur.argmin(1)
+        c_cur = cost[ar, ic]
+        keep = (c_cur < 1000.0) & (c_cur - cost[ar, best] < 0.3)
+        best = torch.where(keep, ic, best)
         # adopt: a new plan from where the old one is now, unless the chosen target is the current one (keep its ramp)
         new_o = self.cand_o[best]; new_r = self.cand_r[best]
         same = (new_o - self.e_to).abs() < 1e-4
@@ -285,7 +323,7 @@ class PathPlanner:
         res = env.last_result
         tid = env.sim.tid[lid]
         s_car = res.s[lid]
-        return res.lateral[lid] - (self.rl_offset(s_car, tid) + self.plan_offset(s_car, tid))
+        return res.lateral[lid] - self.offset(s_car[:, None], tid)[:, 0]
 
 
 @torch.no_grad()

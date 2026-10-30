@@ -288,7 +288,9 @@ class StateObs:
             xy_k, yaw_k = tr.pose_at_s(s_k.reshape(-1), tid.repeat_interleave(n))
             xy_k = xy_k.reshape(-1, n, 2); yaw_k = yaw_k.reshape(-1, n)
             w_cl = tr.sample_edt(xy_k, tid[:, None].expand(-1, n))         # the centerline's half width, as the solo teacher saw
-            e_k = self.planner.plan_offset(s_k, tid)
+            # the shift actually applied: the (in-track) plan offset less the reference line it moves
+            tk_ = tid[:, None].expand(-1, n)
+            e_k = self.planner.offset(s_k, tid) - self.planner.rl_offset(s_k, tk_)
             xy_k = torch.stack([xy_k[..., 0] - e_k * torch.sin(yaw_k), xy_k[..., 1] + e_k * torch.cos(yaw_k)], -1)
         else:
             xy_k, yaw_k = tr.pose_at_s(s_k.reshape(-1), tid.repeat_interleave(n))
@@ -691,7 +693,8 @@ def train(a):
                             # only where the plan leaves the raceline (to get round something): the open track is the
                             # policy's own (10-30: tracking everywhere held srl40 at 3.7-3.8 m/s for 50 updates)
                             pl_ = obs_fn.planner
-                            e_ = pl_.plan_offset(env.last_result.s[lid], env.sim.tid[lid]).abs()
+                            s_l, t_l = env.last_result.s[lid], env.sim.tid[lid]
+                            e_ = (pl_.offset(s_l[:, None], t_l)[:, 0] - pl_.rl_offset(s_l, t_l)).abs()
                             w_ = (e_ / 0.2).clamp(0.0, 1.0)
                         step_r = step_r - float(a.track_k) * w_ * (dev_ - float(a.track_dead)).clamp_min(0.0)
                         dev_sum += float((dev_ * (~done).float()).sum()); dev_n += float((~done).float().sum())
