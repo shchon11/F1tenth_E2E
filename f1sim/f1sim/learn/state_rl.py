@@ -670,7 +670,14 @@ def train(a):
                     if obs_fn.planner is not None:
                         # drive the plan: leaving it by more than --track-dead costs --track-k per m and step
                         dev_ = obs_fn.planner.deviation().abs()
-                        step_r = step_r - float(a.track_k) * (dev_ - float(a.track_dead)).clamp_min(0.0)
+                        w_ = torch.ones_like(dev_)
+                        if a.track_where == "shifted":
+                            # only where the plan leaves the raceline (to get round something): the open track is the
+                            # policy's own (10-30: tracking everywhere held srl40 at 3.7-3.8 m/s for 50 updates)
+                            pl_ = obs_fn.planner
+                            e_ = pl_.plan_offset(env.last_result.s[lid], env.sim.tid[lid]).abs()
+                            w_ = (e_ / 0.2).clamp(0.0, 1.0)
+                        step_r = step_r - float(a.track_k) * w_ * (dev_ - float(a.track_dead)).clamp_min(0.0)
                         dev_sum += float((dev_ * (~done).float()).sum()); dev_n += float((~done).float().sum())
                     alive = (~done).float()
                     rew += step_r * alive
@@ -871,6 +878,8 @@ def main():
     ap.add_argument("--path-plan", type=int, default=0, help="1: drive a planned path (learn.path_plan) given as the track-ahead block")
     ap.add_argument("--track-k", type=float, default=0.5, help="--path-plan: price per m and step of leaving the plan beyond --track-dead")
     ap.add_argument("--track-dead", type=float, default=0.15, help="[m] --path-plan: free lateral room around the plan")
+    ap.add_argument("--track-where", default="all", choices=("all", "shifted"),
+                    help="--path-plan: price leaving the plan everywhere, or only where the plan is off the raceline")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,
