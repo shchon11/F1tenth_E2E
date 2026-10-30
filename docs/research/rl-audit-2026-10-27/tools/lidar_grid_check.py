@@ -32,7 +32,7 @@ prepare_graph_runtime(env, log=lambda _t: None)
 obs, _ = env.reset(seed=7)
 lid = env.learner_ids; B = int(lid.numel())
 sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)),
-                car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)),
+                car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)), plan_ref=ck["args"].get("plan_ref"),
                 t_beams=int(ck["args"].get("beams", 36)))
 last = torch.zeros(B, 2, device=dev)
 o = sobs(last)

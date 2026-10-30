@@ -221,7 +221,8 @@ class StateObs:
     without their size let the car clip a prop's edge in every narrowing -- crash_scenes.py)."""
 
     def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
-                 corridor_cars: bool = False, car_channel: bool = False, bev: bool = False, path_plan: bool = False):
+                 corridor_cars: bool = False, car_channel: bool = False, bev: bool = False, path_plan: bool = False,
+                 plan_ref=None):
         self.env = env
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
@@ -252,6 +253,9 @@ class StateObs:
                 names = getattr(env, "_track_names", None) or [KOREA]
                 _, rls = common.load_tracks(names, racelines=True, **dict(common.teacher_limits(7.0, 6.5, 4.0), objective="min_time"))
             self.planner = PathPlanner(env, env.learner_ids, rls)
+            if plan_ref:
+                # the reference the plan moves: a recorded line of the policy itself (path_plan.record_line), not the raceline
+                self.planner.set_reference(np.load(os.path.expanduser(plan_ref)))
         # t_beams: the teacher's own beam count when this env casts more (a student's env): its noise-free scan is
         # interpolated to those beams over the same field of view, as the teacher saw it in training
         self.interp = None
@@ -553,7 +557,7 @@ def train(a):
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs), corridor_cars=bool(a.corridor_cars),
-                      car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=int(a.path_plan))
+                      car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=int(a.path_plan), plan_ref=a.plan_ref)
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -812,7 +816,7 @@ def evaluate(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)))
+    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)), plan_ref=ck["args"].get("plan_ref"))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     last_a = torch.zeros(B, 2, device=device)
@@ -890,6 +894,7 @@ def main():
     ap.add_argument("--path-plan", type=int, default=0, help="1: drive a planned path (learn.path_plan) given as the track-ahead block")
     ap.add_argument("--track-k", type=float, default=0.5, help="--path-plan: price per m and step of leaving the plan beyond --track-dead")
     ap.add_argument("--track-dead", type=float, default=0.15, help="[m] --path-plan: free lateral room around the plan")
+    ap.add_argument("--plan-ref", default="", help="--path-plan: .npy of the line the plan moves (path_plan.record_line)")
     ap.add_argument("--track-where", default="all", choices=("all", "shifted"),
                     help="--path-plan: price leaving the plan everywhere, or only where the plan is off the raceline")
     ap.add_argument("--corridor-obs", type=int, default=0,

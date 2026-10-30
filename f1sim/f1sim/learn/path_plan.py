@@ -123,6 +123,14 @@ class PathPlanner:
             LAT[j] = rel[0] * -tg[k, 1] + rel[1] * tg[k, 0]
         return torch.as_tensor(S, dtype=torch.float32, device=xy.device), torch.as_tensor(LAT, dtype=torch.float32, device=xy.device)
 
+    def set_reference(self, table):
+        """use another reference line than the raceline: `table` (T, n) lateral offsets from the centerline per `res` of s
+        (10-30: the fast solo policy's OWN line, recorded by `record_line`; mode 2 moves that line, so the planner must
+        check the line it moves -- checking the raceline let the policy's own line + the offset run into a chicane wall)"""
+        t = torch.as_tensor(table, dtype=torch.float32, device=self.dev)[: self.d_rl.shape[0]]
+        m = min(t.shape[1], self.d_rl.shape[1])
+        self.d_rl[: t.shape[0], :m] = t[:, :m]
+
     # --- the reference and a plan's offset ---------------------------------------------------------------------------
     def rl_speed(self, s, tid):
         L = self.env.sim.track.length[tid]
@@ -265,3 +273,41 @@ class PathPlanner:
         tid = env.sim.tid[lid]
         s_car = res.s[lid]
         return res.lateral[lid] - (self.rl_offset(s_car, tid) + self.plan_offset(s_car, tid))
+
+
+@torch.no_grad()
+def record_line(env, act_fn, n_steps, res=0.1, skip_steps=80):
+    """(T, n) the lateral offset from the centerline at which `act_fn` (obs-free callable env -> (B, 2) actions for the
+    learner rows, decided every 2 steps) drives each track, per `res` m of s, averaged over every learner on that track and
+    every pass; cells never visited are filled from their neighbours along s"""
+    tr = env.sim.track
+    lid = env.learner_ids
+    T = int(tr.length.numel())
+    L = tr.length.float()
+    n = int(math.ceil(float(L.max()) / res)) + 2
+    acc = torch.zeros(T, n, device=env.device); cnt = torch.zeros(T, n, device=env.device)
+    act = torch.zeros(env.B, env.act_dim, device=env.device)
+    for t in range(int(n_steps)):
+        if t % 2 == 0:
+            act[lid] = act_fn(env)
+        env.step(act)
+        if t >= skip_steps:
+            res_ = env.last_result
+            tid = env.sim.tid[lid]; s = res_.s[lid]
+            i = (s / res).long().clamp(0, n - 1)
+            ok = res_.state[lid, 3] > 1.0
+            flat = tid * n + i
+            acc.view(-1).index_add_(0, flat[ok], res_.lateral[lid][ok])
+            cnt.view(-1).index_add_(0, flat[ok], torch.ones_like(s[ok]))
+    out = np.zeros((T, n), np.float32)
+    A = acc.cpu().numpy(); C = cnt.cpu().numpy()
+    for t in range(T):
+        m = int(math.ceil(float(L[t]) / res))
+        v = np.where(C[t, :m] > 0, A[t, :m] / np.maximum(C[t, :m], 1), np.nan)
+        good = np.flatnonzero(np.isfinite(v))
+        if good.size:
+            v = np.interp(np.arange(m), good, v[good], period=m)
+        else:
+            v = np.zeros(m)
+        out[t, :m] = v
+    return out, (C > 0).mean()
