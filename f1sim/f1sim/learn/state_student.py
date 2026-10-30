@@ -87,7 +87,7 @@ def main():
     t_scan = bool(ck["args"].get("scan_obs", 0)); t_beams = int(ck["args"].get("beams", 36))
     # the teacher's observation: the state block, its noise-free scan at ITS beams (interpolated from this env's full
     # one over the same field of view), its prop corridor if it was trained with one
-    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), t_beams=t_beams)
+    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=bool(ck["args"].get("path_plan", 0)), t_beams=t_beams)
     obs, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
@@ -245,7 +245,7 @@ def evaluate_student():
         keys = ck.get("ego_keys") or sorted(k for k in obs if k != "scan")
         egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in keys], 1)
         if is_teacher:
-            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
+            sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=bool(ck["args"].get("path_plan", 0)))
             last = torch.zeros(B, 2, device=device)
             o_ = sobs(last)
             tp = ActorCritic(o_.shape[1], bev=ck.get("bev")).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
@@ -444,7 +444,7 @@ def evaluate_like():
                 self.stuck = 0; self.n_live = 0                    # learner steps below 0.3 m/s from 3 s into an episode
                 self.uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
                 if is_teacher:
-                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
+                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=bool(ck["args"].get("path_plan", 0)))
                     self.net = None
                 else:
                     from .lidar_grid import StudentRunner

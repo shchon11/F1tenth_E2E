@@ -150,7 +150,7 @@ def main():
     t_scan = bool(ck0["args"].get("scan_obs", 0)); t_beams = int(ck0["args"].get("beams", 36))
     # the teacher's observation (its scan interpolated to its beams when the student's env casts more; its prop corridor
     # if it was trained with one) -- state_rl.StateObs builds it in the training order
-    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck0["args"].get("corridor_obs", 0)), corridor_cars=bool(ck0["args"].get("corridor_cars", 0)), car_channel=bool(ck0["args"].get("car_channel", 0)), bev=bool(ck0["args"].get("bev", 0)), t_beams=t_beams)
+    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck0["args"].get("corridor_obs", 0)), corridor_cars=bool(ck0["args"].get("corridor_cars", 0)), car_channel=bool(ck0["args"].get("car_channel", 0)), bev=bool(ck0["args"].get("bev", 0)), path_plan=bool(ck0["args"].get("path_plan", 0)), t_beams=t_beams)
     obs_d, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     if sck is not None:

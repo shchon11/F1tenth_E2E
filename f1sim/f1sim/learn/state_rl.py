@@ -41,7 +41,8 @@ def build_env(a, device, extra=None):
     tracks = [KOREA] + ([f"{KOREA}+warp{k}" for k in range(int(a.warps))] if a.warps else [])
     # the racelines the planner opponents follow: the training world's (the cache key is every Raceline.build argument)
     limits = common.teacher_limits(7.0, 6.5, 4.0)
-    trs, rls = common.load_tracks(tracks, racelines=(a.stage == "race"), **dict(limits, objective="min_time"))
+    trs, rls = common.load_tracks(tracks, racelines=(a.stage == "race" or bool(getattr(a, "path_plan", 0))),
+                                  **dict(limits, objective="min_time"))
     cfg = Config()
     cfg.sim.compile = False
     cfg.lidar.n_beams = int(a.beams)
@@ -69,6 +70,7 @@ def build_env(a, device, extra=None):
     e.update(extra or {})
     env = common.make_env(trs, int(a.envs), device, EnvConfig(**e), cfg=cfg, seed=int(a.seed), rls=rls,
                           teacher_limits=limits)
+    env._track_names = list(tracks); env._rls = rls          # `--path-plan`: the planner's reference lines
     return env
 
 
@@ -219,7 +221,7 @@ class StateObs:
     without their size let the car clip a prop's edge in every narrowing -- crash_scenes.py)."""
 
     def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
-                 corridor_cars: bool = False, car_channel: bool = False, bev: bool = False):
+                 corridor_cars: bool = False, car_channel: bool = False, bev: bool = False, path_plan: bool = False):
         self.env = env
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
@@ -234,6 +236,17 @@ class StateObs:
         #: grid (`bev_grid`, flattened, LAST) -- no prop / opponent slots, no corridor, no scan
         self.bev = bool(bev)
         self.grid_dim = BEV_C * BEV_H * BEV_W if self.bev else 0
+        #: `--path-plan` (10-30): the track-ahead block is the PLANNED path (`learn.path_plan`: the raceline moved round
+        #: props and cars by a sampling planner on the true geometry) instead of the centerline, plus the free distance
+        #: along the plan; the policy drives the given path, the planner does the geometry
+        self.planner = None
+        if path_plan:
+            from .path_plan import PathPlanner
+            rls = getattr(env, "_rls", None)
+            if rls is None:
+                names = getattr(env, "_track_names", None) or [KOREA]
+                _, rls = common.load_tracks(names, racelines=True, **dict(common.teacher_limits(7.0, 6.5, 4.0), objective="min_time"))
+            self.planner = PathPlanner(env, env.learner_ids, rls)
         # t_beams: the teacher's own beam count when this env casts more (a student's env): its noise-free scan is
         # interpolated to those beams over the same field of view, as the teacher saw it in training
         self.interp = None
@@ -256,13 +269,19 @@ class StateObs:
         tr = env.sim.track
         n = self.ahead.numel()
         s_k = s[:, None] + self.ahead[None, :]
-        xy_k, yaw_k = tr.pose_at_s(s_k.reshape(-1), tid.repeat_interleave(n))
-        xy_k = xy_k.reshape(-1, n, 2); yaw_k = yaw_k.reshape(-1, n)
+        if self.planner is not None:
+            self.planner.update()
+            xy_k, _ = self.planner.path_xy(s_k, tid)
+            xy_n, _ = self.planner.path_xy(s_k + 0.2, tid)
+            yaw_k = torch.atan2(xy_n[..., 1] - xy_k[..., 1], xy_n[..., 0] - xy_k[..., 0])
+        else:
+            xy_k, yaw_k = tr.pose_at_s(s_k.reshape(-1), tid.repeat_interleave(n))
+            xy_k = xy_k.reshape(-1, n, 2); yaw_k = yaw_k.reshape(-1, n)
         d = xy_k - st[:, None, :2]
         c, si = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
         dx, dy = d[..., 0] * c + d[..., 1] * si, -d[..., 0] * si + d[..., 1] * c
         dyaw = torch.remainder(yaw_k - st[:, 2:3] + math.pi, 2 * math.pi) - math.pi
-        w = tr.sample_edt(xy_k, tid[:, None].expand(-1, n))
+        w = tr.sample_edt(xy_k, tid[:, None].expand(-1, n))              # path mode: the clearance at the planned points
         ahead = torch.stack([dx / 10.0, dy / 5.0, dyaw / math.pi, w / 2.0], 2).reshape(st.shape[0], -1)
         steer = (st[:, 6] / float(env.s_max))[:, None]
         if self.bev:
@@ -277,6 +296,8 @@ class StateObs:
                 i0, w_ = self.interp
                 sc = sc[:, i0] * (1 - w_) + sc[:, i0 + 1] * w_
             parts.append((sc / self.scan_range).clamp(0.0, 1.0))
+        if self.planner is not None:
+            parts.append((self.planner.free / 15.0)[:, None])             # how far the plan is free [/15 m]
         if self.corridor:
             parts.append(corridor_block(env, lid, s, tid, cars=self.corridor_cars))
         if self.car_channel:
@@ -520,7 +541,7 @@ def train(a):
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs), corridor_cars=bool(a.corridor_cars),
-                      car_channel=bool(a.car_channel), bev=bool(a.bev))
+                      car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=bool(a.path_plan))
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -600,7 +621,7 @@ def train(a):
         bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
         bg = torch.zeros(T + 1, B, device=device)
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
-        prog = hits_w = hits_c = 0.0; laps = []
+        prog = hits_w = hits_c = 0.0; laps = []; dev_sum = dev_n = 0.0
         tr0 = time.time()
         with torch.no_grad():
             for t in range(T):
@@ -646,6 +667,11 @@ def train(a):
                     # into braking zones is break-even against a 0.5 s gap rule (10-29 gap test), so cars get their own
                     price_c = price * (float(a.car_price) / float(a.price)) if float(a.car_price) > 0 else price
                     step_r = dense - price * onw - price_c * onset.float()
+                    if obs_fn.planner is not None:
+                        # drive the plan: leaving it by more than --track-dead costs --track-k per m and step
+                        dev_ = obs_fn.planner.deviation().abs()
+                        step_r = step_r - float(a.track_k) * (dev_ - float(a.track_dead)).clamp_min(0.0)
+                        dev_sum += float((dev_ * (~done).float()).sum()); dev_n += float((~done).float().sum())
                     alive = (~done).float()
                     rew += step_r * alive
                     prog += float((info["progress"][lid].float().clamp_min(0) * alive).sum())
@@ -740,6 +766,7 @@ def train(a):
                  "kl": float(np.mean(kls)), "clipfrac": float(np.mean(cfs)), "t_roll": t_roll,
                  "t_upd": time.time() - tr0 - t_roll, "min": (time.time() - t0) / 60, "price": price,
                  "J80_per_step": float((prog - 80.0 * (hits_w + hits_c)) / (T * R * B)),
+                 "plan_dev_m": dev_sum / max(dev_n, 1.0),
                  "hit_p_pos": float((bp[:T] * y_hit * v_hit).sum() / (y_hit * v_hit).sum().clamp_min(1.0)),
                  "hit_p_neg": float((bp[:T] * (1 - y_hit) * v_hit).sum() / ((1 - y_hit) * v_hit).sum().clamp_min(1.0)),
                  "shaping_abs": float(shaping.abs().mean()), "geo_risk_mean": float(bg[:T].mean()),
@@ -749,7 +776,7 @@ def train(a):
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
             print(f"[{time.strftime('%H:%M')}] 업데이트 {u} | 진행 {stats['progress_ms']:.2f} m/s | 강한 충돌 벽+상자 "
                   f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 랩 {len(laps)}개 평균 {lp_} s | "
-                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
+                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s", flush=True)
         if u % int(a.save_every) == 0 or u == upd0 + int(a.updates):
             torch.save({"model": model.state_dict(), "norm": norm.state_dict(), "ret_rms": ret_rms.state_dict(),
@@ -766,7 +793,7 @@ def evaluate(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)))
+    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=bool(ck["args"].get("path_plan", 0)))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     last_a = torch.zeros(B, 2, device=device)
@@ -841,6 +868,9 @@ def main():
     ap.add_argument("--bev", type=int, default=0, help="1: the car-centred grid of walls / props / cars + a conv (10-30)")
     ap.add_argument("--v-min", type=float, default=0.0, help="[m/s] the slowest command, < 0 lets the policy reverse")
     ap.add_argument("--shared-enc", type=int, default=0, help="1: actor and critic share the --bev grid encoder")
+    ap.add_argument("--path-plan", type=int, default=0, help="1: drive a planned path (learn.path_plan) given as the track-ahead block")
+    ap.add_argument("--track-k", type=float, default=0.5, help="--path-plan: price per m and step of leaving the plan beyond --track-dead")
+    ap.add_argument("--track-dead", type=float, default=0.15, help="[m] --path-plan: free lateral room around the plan")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,
