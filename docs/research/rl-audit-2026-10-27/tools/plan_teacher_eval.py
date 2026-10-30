@@ -23,7 +23,14 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--like", required=True)
 ap.add_argument("--steps", type=int, default=2400)
 ap.add_argument("--no-plan", type=int, default=0)
+ap.add_argument("--margin", type=float, default=None, help="override path_plan.PROP_MARGIN and WALL_MARGIN [m]")
+ap.add_argument("--a-lat", type=float, default=None, help="override path_plan.A_LAT [m/s^2]")
 a0 = ap.parse_args()
+import f1sim.learn.path_plan as _pp  # noqa: E402
+if a0.margin is not None:
+    _pp.PROP_MARGIN = _pp.WALL_MARGIN = float(a0.margin)
+if a0.a_lat is not None:
+    _pp.A_LAT = float(a0.a_lat)
 dev = torch.device("cuda")
 env, cfg, ecfg, md = make_env_like(a0.like, dev, 36, 1, 1, True)
 env.sim.measure_impacts = True
@@ -66,7 +73,7 @@ for t in range(int(a0.steps)):
     if info["lap_times"].numel():
         laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
 km = prog / 1000.0; secs = int(a0.steps) * B * float(env.sim.control_dt)
-tag = "주행선 선생만" if a0.no_plan else "주행선 선생 + 계획기"
+tag = "주행선 선생만" if a0.no_plan else f"주행선 선생 + 계획기 (여유 {_pp.PROP_MARGIN:g}, 옆 가속 {_pp.A_LAT:g})"
 print(f"[계획기 시험] {tag} | {a0.like.split('/')[-1]} | {km:.1f} km, 진행 {prog / secs:.2f} m/s, 랩 중앙 "
       f"{np.median(laps) if laps else float('nan'):.2f} s ({len(laps)}개) | 강한 충돌/km 벽 {hits['벽'] / km:.2f} 상자 {hits['상자'] / km:.2f} "
       f"차 {hits['차'] / km:.2f} (합 {sum(hits.values()) / km:.2f})", flush=True)

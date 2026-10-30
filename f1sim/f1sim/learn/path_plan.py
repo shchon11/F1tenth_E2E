@@ -28,8 +28,8 @@ import torch
 HORIZON = 15.0            # [m] of arc checked ahead
 STEP = 0.4                # [m] spacing of the checks along the path
 HALF_W = 0.16             # [m] the car's half width (0.31 m body)
-PROP_MARGIN = 0.15        # [m] clearance kept from a prop beyond the half width
-WALL_MARGIN = 0.15        # [m] clearance kept from a wall beyond the half width
+PROP_MARGIN = 0.25        # [m] clearance kept from a prop beyond the half width (10-30 plan_teacher_eval: 0.15 -> 0.25 cut 2 races 8.6 / 10.9 -> 7.5 / 6.5 per km)
+WALL_MARGIN = 0.25        # [m] clearance kept from a wall beyond the half width (as PROP_MARGIN)
 CAR_R = 0.55              # [m] centre distance under which two cars touch (0.5 m long, a little more)
 OFFSETS = tuple(float(x) for x in np.linspace(-1.2, 1.2, 13))   # [m] candidate held offsets from the raceline
 RAMPS = (2.5, 5.0, 8.0)   # [m] candidate ramp lengths
