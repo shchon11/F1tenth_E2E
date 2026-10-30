@@ -61,7 +61,7 @@ def run(a, ck, solo, device):
     uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     R = int(ck["args"].get("repeat", 2))
     if is_teacher:
-        sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=bool(ck["args"].get("path_plan", 0)))
+        sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)))
         last = torch.zeros(B, 2, device=device)
         o = sobs(last)
         net = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); net.load_state_dict(ck["model"], strict=False); net.eval()

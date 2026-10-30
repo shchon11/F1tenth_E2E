@@ -240,6 +240,11 @@ class StateObs:
         #: props and cars by a sampling planner on the true geometry) instead of the centerline, plus the free distance
         #: along the plan; the policy drives the given path, the planner does the geometry
         self.planner = None
+        #: 1: the block is the planned path itself (raceline + plan offset). 2 (10-30): the CENTERLINE moved sideways by the
+        #: plan's offset -- on the open track the plan is the raceline (offset 0) and the block is exactly the solo teacher's,
+        #: so a fast solo teacher keeps its line; near a prop the line it follows moves by what the planner moved (mode 1
+        #: from scratch drove the empty track in 9.0 s against the solo teachers' 7.5-7.8)
+        self.plan_mode = int(path_plan)
         if path_plan:
             from .path_plan import PathPlanner
             rls = getattr(env, "_rls", None)
@@ -269,11 +274,18 @@ class StateObs:
         tr = env.sim.track
         n = self.ahead.numel()
         s_k = s[:, None] + self.ahead[None, :]
-        if self.planner is not None:
+        if self.planner is not None and self.plan_mode == 1:
             self.planner.update()
             xy_k, _ = self.planner.path_xy(s_k, tid)
             xy_n, _ = self.planner.path_xy(s_k + 0.2, tid)
             yaw_k = torch.atan2(xy_n[..., 1] - xy_k[..., 1], xy_n[..., 0] - xy_k[..., 0])
+        elif self.planner is not None:
+            self.planner.update()
+            xy_k, yaw_k = tr.pose_at_s(s_k.reshape(-1), tid.repeat_interleave(n))
+            xy_k = xy_k.reshape(-1, n, 2); yaw_k = yaw_k.reshape(-1, n)
+            w_cl = tr.sample_edt(xy_k, tid[:, None].expand(-1, n))         # the centerline's half width, as the solo teacher saw
+            e_k = self.planner.plan_offset(s_k, tid)
+            xy_k = torch.stack([xy_k[..., 0] - e_k * torch.sin(yaw_k), xy_k[..., 1] + e_k * torch.cos(yaw_k)], -1)
         else:
             xy_k, yaw_k = tr.pose_at_s(s_k.reshape(-1), tid.repeat_interleave(n))
             xy_k = xy_k.reshape(-1, n, 2); yaw_k = yaw_k.reshape(-1, n)
@@ -281,7 +293,7 @@ class StateObs:
         c, si = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
         dx, dy = d[..., 0] * c + d[..., 1] * si, -d[..., 0] * si + d[..., 1] * c
         dyaw = torch.remainder(yaw_k - st[:, 2:3] + math.pi, 2 * math.pi) - math.pi
-        w = tr.sample_edt(xy_k, tid[:, None].expand(-1, n))              # path mode: the clearance at the planned points
+        w = tr.sample_edt(xy_k, tid[:, None].expand(-1, n)) if self.plan_mode != 2 else w_cl   # mode 1: clearance at the plan
         ahead = torch.stack([dx / 10.0, dy / 5.0, dyaw / math.pi, w / 2.0], 2).reshape(st.shape[0], -1)
         steer = (st[:, 6] / float(env.s_max))[:, None]
         if self.bev:
@@ -541,7 +553,7 @@ def train(a):
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs), corridor_cars=bool(a.corridor_cars),
-                      car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=bool(a.path_plan))
+                      car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=int(a.path_plan))
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -800,7 +812,7 @@ def evaluate(a):
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
-    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=bool(ck["args"].get("path_plan", 0)))
+    obs_fn = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)))
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     last_a = torch.zeros(B, 2, device=device)
