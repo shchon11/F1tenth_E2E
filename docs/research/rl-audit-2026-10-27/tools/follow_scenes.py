@@ -6,6 +6,8 @@
 내 혼자 속도(같은 위치의 `--solo-ref` 프로파일 없으면 생략). 그림: 가장 긴 구간 6개 — 왼쪽 = 그 구간의 두 차 경로(내 차 속도 색, 상대 보라)와 트랙,
 오른쪽 = 시간에 따라 간격(상대가 앞 +), 두 차 속도, 두 차 옆 위치와 트랙 반폭, 내 속도 명령, 몬 정책(경주 1 / 혼자 0).
 사용: python follow_scenes.py CKPT --like RACE_JSON --out DIR [--envs 32 --steps 1600]
+CKPT 대신 planner:KIND(forzaeth / forzaeth_pred / lane_switch / raceline)면 그 플래너가 내 차를 몬다(11-01: 이 세계에서 앞지르기가
+가능한지 — 참 상태(GT) 오라클, MAP 추종기; `--tracker pp`면 순수 추종). 앞지름 수 = 간격 부호가 5 m 안에서 +에서 −로 바뀐 횟수(따라가기 구간 없이 바로 지나간 것 포함).
 """
 from __future__ import annotations
 
@@ -30,10 +32,14 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--envs", type=int, default=32)
 ap.add_argument("--steps", type=int, default=1600)
 ap.add_argument("--images", type=int, default=6)
+ap.add_argument("--tracker", default="map", help="planner:KIND only: the planner's path follower, map or pp")
+ap.add_argument("--opp-slot", default="", help="JSON merged into the world's opponent slot (e.g. the school world's slow cars)")
 a0 = ap.parse_args()
 os.makedirs(a0.out, exist_ok=True)
 dev = torch.device("cuda")
-ck = torch.load(a0.ckpt, map_location=dev, weights_only=False)
+planner = a0.ckpt[len("planner:"):] if a0.ckpt.startswith("planner:") else ""
+ck = (dict(model=None, args=dict(beams=108, repeat=2)) if planner
+      else torch.load(a0.ckpt, map_location=dev, weights_only=False))
 is_teacher = "model" in ck
 n_beams = int(ck["args"].get("beams", 36)) if is_teacher else int(ck["beams"])
 frames = 1 if is_teacher else int(ck["frames"])
@@ -41,12 +47,25 @@ stride = 1 if is_teacher else int(ck["args"].get("stride", 3))
 ov = dict(max_steps=int(a0.steps) + 10)
 if float(ck["args"].get("reverse_ext", 0.0) or 0.0):
     ov.update(reverse_ext=float(ck["args"]["reverse_ext"]))
+if a0.opp_slot:
+    from f1sim import opponent_slots as _osl
+    _slot = dict(json.load(open(a0.like))["nominal"]["metadata"]["env_config"]["opponent_slots"][0])
+    _slot.update(json.loads(a0.opp_slot))
+    ov.update(opponent_slots=_osl.parse_slots(json.dumps([_slot])))
 env, cfg, ecfg, md = make_env_like(a0.like, dev, n_beams, frames, stride, True, envs=int(a0.envs), override=ov)
+env.sim.measure_impacts = True                                  # car impacts (as crash_scenes / evalx)
 obs, _ = env.reset(seed=int(md["seed"]))
 lid = env.learner_ids; B = int(lid.numel())
 rem = PropRemoval(env, 1.0, 0.0, 0.0, seed=1)                  # no props: the 1 vs 1 after removal
 R = int(ck["args"].get("repeat", 2))
-if is_teacher:
+if planner:
+    from f1sim.learn import common as _common
+    mc = env._make_call
+    drv = _common.build_ego_driver(env, planner, rls=mc["rls"], limits=mc["teacher_limits"], estimated=False,
+                                   stack_params=dict(tracker=a0.tracker))
+    env.set_ego_driver(drv)
+    tp = lambda last_: torch.zeros(B, 2, device=dev)
+elif is_teacher:
     tp = state_rl.TeacherPolicy(env, ck, dev)
 else:
     from f1sim.learn.lidar_grid import StudentRunner
@@ -67,7 +86,7 @@ with torch.no_grad():
         if t % R == 0:
             if is_teacher:
                 a_ = tp(last)
-                if tp.mix is not None:
+                if getattr(tp, "mix", None) is not None:
                     gate = tp.mix.gate.float()
             else:
                 a_ = st_run(obs, egov(obs))
@@ -85,8 +104,12 @@ with torch.no_grad():
         rec["gate"][t] = gate.cpu().numpy()
         rec["x"][t] = st[lid, 0].cpu().numpy(); rec["y"][t] = st[lid, 1].cpu().numpy()
         rec["xo"][t] = st[opp, 0].cpu().numpy(); rec["yo"][t] = st[opp, 1].cpu().numpy()
-        car = info["reward_components"]["car_contact"][lid].float() if "car_contact" in info["reward_components"] else torch.zeros(B, device=dev)
-        rec["contact"][t] = (car < 0).float().cpu().numpy()
+        # a hard car hit: a contact ONSET with the simulator's impact >= 1.5 m/s, as crash_scenes --all-car and evalx count
+        # (11-01: this read the car_contact reward before, which the eval world prices at 0 -- every table's "접촉 0" was that)
+        cc = res.car_collision[lid] if res.car_collision is not None else torch.zeros(B, dtype=torch.bool, device=dev)
+        onset = cc & ~touching; touching = cc.clone()
+        imp_c = res.car_impact[lid] if res.car_impact is not None else torch.zeros(B, device=dev)
+        rec["contact"][t] = (onset & (imp_c >= 1.5)).float().cpu().numpy()
 dt = float(env.sim.control_dt)
 # following stretches: the opponent 0..4 m ahead along the track for more than 1 s
 segs = []
@@ -106,6 +129,13 @@ for i in range(B):
             t = t1
         else:
             t += 1
+# every overtake / being overtaken: the gap changes sign within 5 m (a sign change at half a lap is the wrap, not a pass)
+gp = rec["gap"][40:]
+cross = (np.abs(gp[1:]) < 5.0) & (np.abs(gp[:-1]) < 5.0)
+n_over = int(((gp[:-1] > 0) & (gp[1:] <= 0) & cross).sum()); n_under = int(((gp[:-1] <= 0) & (gp[1:] > 0) & cross).sum())
+km = float(np.abs(rec["v"]).sum() * float(env.sim.control_dt)) / 1000.0
+print(f"[앞지름] 전체: 내가 앞지름 {n_over}회, 앞지름 당함 {n_under}회 | 차 강한 충돌 {int(rec['contact'].sum())}회 / {km:.1f} km = "
+      f"{rec['contact'].sum() / max(km, 1e-6):.2f}/km | 평균 속도 {rec['v'].mean():.2f} m/s", flush=True)
 total_follow = sum(s["dur"] for s in segs)
 n_pass = sum(s["passed"] for s in segs)
 lead_end = float((rec["gap"][-1] < 0).mean())
@@ -126,7 +156,8 @@ for lab, lo, hi in (("상대가 20 m 넘게 앞", 20, 1e9), ("10~20 m 앞", 10, 
         print(f"[간격 대역] {lab}: 시간 {m.mean() * 100:.0f} %, 내 속도 {bands[lab]['v']:.2f} / 상대 {bands[lab]['vo']:.2f} m/s, "
               f"경주 정책이 몬 비율 {bands[lab]['race_policy'] * 100:.0f} %", flush=True)
 print(f"[간격] 출발 간격 중앙 {np.median(rec['gap'][1]):+.1f} m -> 끝 중앙 {np.median(rec['gap'][-1]):+.1f} m (상대가 앞 +)", flush=True)
-json.dump(dict(follow_share=total_follow / (B * N * dt), segments=segs, lead_end=lead_end, bands=bands),
+json.dump(dict(follow_share=total_follow / (B * N * dt), segments=segs, lead_end=lead_end, bands=bands, overtakes=n_over,
+               overtaken=n_under, car_hits=float(rec["contact"].sum()), km=km),
           open(os.path.join(a0.out, "follow.json"), "w"), indent=1)
 import matplotlib  # noqa: E402
 matplotlib.use("Agg")

@@ -117,6 +117,8 @@ def main():
                     help="1: draw the layout-line planner's line for the hit row's layout (one-track envs: --like / --warps 0)")
     ap.add_argument("--prop-fraction", type=float, default=1.0, help="training world (no --like): share of races with props")
     ap.add_argument("--like", default="", help="an eval_ckpt.sh race JSON: drive in exactly that world (state_student.make_env_like)")
+    ap.add_argument("--opp-slot", default="", help="--like only: JSON merged into the world's opponent slot (11-01: the slow / stopping cars)")
+    ap.add_argument("--no-props", type=int, default=0, help="--like only: 1 = the props removed from the start (the 1 vs 1 after removal)")
     ap.add_argument("--student", default="", help="a state_student checkpoint: the STUDENT drives (its own sensors); the "
                     "teacher CKPT labels every decision, so each hit shows what the teacher would have done instead")
     a = ap.parse_args()
@@ -136,6 +138,11 @@ def main():
         # priv flags on in both modes: the teacher's StateObs labels / probes every decision
         vmin_ = float(ck0["args"].get("v_min", 0.0) or 0.0); rext_ = float(ck0["args"].get("reverse_ext", 0.0) or 0.0)
         ov_ = dict(**({"v_min_policy": vmin_} if vmin_ else {}), **({"reverse_ext": rext_} if rext_ else {}))
+        if a.opp_slot:
+            from f1sim import opponent_slots as _osl
+            _slot = dict(json.load(open(a.like))["nominal"]["metadata"]["env_config"]["opponent_slots"][0])
+            _slot.update(json.loads(a.opp_slot))
+            ov_["opponent_slots"] = _osl.parse_slots(json.dumps([_slot]))
         env, _cfg, _ecfg, _md = make_env_like(a.like, device, int(a.beams), fr_, sd_, True, envs=int(a.envs),
                                               override=(ov_ or None))
     elif sck is not None:
@@ -161,6 +168,7 @@ def main():
     obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck0["args"].get("corridor_obs", 0)), corridor_cars=bool(ck0["args"].get("corridor_cars", 0)), car_channel=bool(ck0["args"].get("car_channel", 0)), bev=bool(ck0["args"].get("bev", 0)), path_plan=int(ck0["args"].get("path_plan", 0)), plan_ref=ck0["args"].get("plan_ref"), t_beams=t_beams, car_st=bool(ck0["args"].get("car_st", 0)), scan_nocars=bool(ck0["args"].get("scan_nocars", 0)))
     obs_d, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
+    rem_ = state_rl.PropRemoval(env, 1.0, 0.0, 0.0, seed=1) if (a.like and int(a.no_props)) else None
     if sck is not None:
         from f1sim.learn.lidar_grid import StudentRunner
         student = StudentRunner(env, lid, sck, device)              # the 1-D scan student or the grid student
@@ -293,6 +301,8 @@ def main():
             if uw is not None:
                 uw.before(act_full)
             obs_d, r_, te, trc, info = env.step(act_full)
+            if rem_ is not None:
+                rem_.step()
             if sck is not None:
                 student.observe()                                   # the pose this step left (grid student odometry)
             if uw is not None:

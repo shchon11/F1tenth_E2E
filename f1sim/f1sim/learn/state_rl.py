@@ -659,6 +659,12 @@ def clamp_act(a, ext=0.0):
     return torch.stack([a[..., 0].clamp(-1, 1), a[..., 1].clamp(-1 - ext, 1)], -1)
 
 
+def soft_bound(z, lo, hi, m):
+    """the identity on [lo + m, hi - m]; beyond, lo / hi approached smoothly (tanh, slope 1 at the knee)"""
+    up, dn = hi - m, lo + m
+    return torch.where(z > up, up + m * torch.tanh((z - up) / m), torch.where(z < dn, dn + m * torch.tanh((z - dn) / m), z))
+
+
 def mlp(i, o, h=256):
     return nn.Sequential(nn.Linear(i, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, o))
 
@@ -708,9 +714,30 @@ class ActorCritic(nn.Module):
             last_pi = self.pi[-1]
         self.log_std = nn.Parameter(torch.full((act_dim,), float(log_std)))
         nn.init.zeros_(last_pi.bias); last_pi.weight.data.mul_(0.01)
+        #: `--soft-bound` (11-01): the policy MEAN is squashed into the executable range near its ends -- the identity on
+        #: [lo + m, hi - m], smoothly saturating to lo / hi beyond (`soft_bound`). A clamped Gaussian's mean drifts far past
+        #: the bound where the bound is good (measured: mix0's race policy 34 % of its decisions speed-dead, 31 % steer-dead,
+        #: 47 % speed-dead in the second before a hard hit); there every sample executes the bound and PPO cannot learn that
+        #: dimension (the command stays 10 m/s into a slow car). Buffers, so every tool that loads the checkpoint drives the
+        #: same mean (a forward hook on `pi`); a checkpoint without them loads +-1e6 = the identity. `raw_mean`: the last
+        #: pre-squash output (`--bound-loss`)
+        self.register_buffer("mean_lo", torch.full((act_dim,), -1e6))
+        self.register_buffer("mean_hi", torch.full((act_dim,), 1e6))
+        self.register_buffer("mean_m", torch.ones(act_dim))
+        self.raw_mean = None
+        self.pi.register_forward_hook(self._soft_bound)
         #: P(a hard hit within the next HIT_HORIZON decisions | s), a head on the critic's trunk (`--hit-head`): supervised
         #: on every step, so the critic's features learn what danger looks like before the price of a hit reaches them
         self.hit = nn.Linear(hidden, 1)
+
+    def set_mean_bounds(self, lo, hi, m):
+        dev = self.mean_lo.device
+        self.mean_lo.copy_(torch.tensor(lo, device=dev)); self.mean_hi.copy_(torch.tensor(hi, device=dev))
+        self.mean_m.copy_(torch.tensor(m, device=dev))
+
+    def _soft_bound(self, _mod, _inp, z):
+        self.raw_mean = z
+        return soft_bound(z, self.mean_lo, self.mean_hi, self.mean_m)
 
     def critic_trunk(self, o):
         return self.v.trunk(o) if self.bev else self.v[:-1](o)
@@ -786,12 +813,17 @@ def train(a):
             nm["mean"] = nm["mean"].clone(); nm["var"] = nm["var"].clone()
             nm["mean"][cc] = nm["mean"][pc]; nm["var"][cc] = nm["var"][pc]
             print("[state_rl] --init: 시공간 차 칸을 부모의 상자 통로 가중치·통계에서 시작", flush=True)
-        missing = [k for k in model.load_state_dict(sd, strict=False).missing_keys if k != "std_floor"]
+        missing = [k for k in model.load_state_dict(sd, strict=False).missing_keys
+                   if k not in ("std_floor", "mean_lo", "mean_hi", "mean_m")]
         if a.std_floor:                                    # this run's floor, not the one an --init checkpoint carried
             model.std_floor.copy_(torch.tensor([float(x) for x in a.std_floor], device=device))
         if missing:
             print(f"[state_rl] --init에 없는 매개변수(새로 시작): {missing}", flush=True)
         norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
+    if int(a.soft_bound):
+        model.set_mean_bounds([-1.0, -1.0 - float(a.reverse_ext)], [1.0, 1.0], [0.1, 0.2])
+    elif bool((model.mean_hi < 1e5).any()):
+        print("[state_rl] --init의 정책 평균 부드러운 범위를 이어받음", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
     w_col, w_car = abs(env.ecfg.reward_collision), abs(env.ecfg.reward_car_contact)
     ci = {k: REWARD_COMPONENT_KEYS.index(k) for k in REWARD_COMPONENT_KEYS}
@@ -828,6 +860,7 @@ def train(a):
         bm = torch.ones(T, B, device=device)                     # 1 = this policy's action was executed (`--base`)
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = 0.0; laps = []; dev_sum = dev_n = 0.0
+        dead_n = torch.zeros(3, device=device)                   # decisions this policy drove; of them speed / steer dead
         tr0 = time.time()
         with torch.no_grad():
             for t in range(T):
@@ -856,6 +889,12 @@ def train(a):
                 exe = clamp_act(act, a.reverse_ext)
                 if mix is not None:
                     exe = mix(exe, last_a); bm[t] = mix.gate.float()
+                # dead decisions (11-01): the mean beyond the action bound by more than 2 sigma -- every sample executes the
+                # bound, so the advantage says nothing about that dimension there (`--bound-loss`)
+                mu_, sd_ = model.raw_mean, dist.stddev                   # the network's own output, before any squash
+                dead_n += torch.stack([bm[t].sum(), (bm[t] * ((mu_[:, 1] > 1 + 2 * sd_[:, 1])
+                                                              | (mu_[:, 1] < -1 - float(a.reverse_ext) - 2 * sd_[:, 1])).float()).sum(),
+                                       (bm[t] * (mu_[:, 0].abs() > 1 + 2 * sd_[:, 0]).float()).sum()])
                 act_full[lid] = exe
                 for k in range(R):
                     if unwedge is not None:
@@ -971,6 +1010,15 @@ def train(a):
                 v_j, hl_j = model.value_and_hit(fo_j)
                 vf = 0.5 * (v_j - fret[j]).pow(2).mean()
                 loss = pg + a.vf * vf
+                if float(a.bound_loss) > 0:
+                    # `--bound-loss` (11-01): the network's raw output pulled back into the executable range (see
+                    # `--soft-bound`: there the squash keeps the executed mean, this only restores the gradient through it).
+                    # Alone and at weight 1 it wrecked the policy (srl57: KL 5.8 on update 1, 4.1 -> 1.7 m/s and 16 wall /
+                    # prop hits per km by update 5 -- pulling the far-out outputs moved the in-range ones with them)
+                    mu_j = model.raw_mean
+                    lo_ = torch.tensor([-1.0, -1.0 - float(a.reverse_ext)], device=device)
+                    over = (mu_j - 1.0).clamp_min(0) ** 2 + (lo_ - mu_j).clamp_min(0) ** 2
+                    loss = loss + float(a.bound_loss) * over.sum(1).mean()
                 if a.hit_head > 0:
                     bce = nn.functional.binary_cross_entropy_with_logits(hl_j, fyh[j], reduction="none")
                     loss = loss + float(a.hit_head) * (bce * fvh[j]).sum() / fvh[j].sum().clamp_min(1.0)
@@ -995,13 +1043,14 @@ def train(a):
                  "hit_p_neg": float((bp[:T] * (1 - y_hit) * v_hit).sum() / ((1 - y_hit) * v_hit).sum().clamp_min(1.0)),
                  "shaping_abs": float(shaping.abs().mean()), "geo_risk_mean": float(bg[:T].mean()),
                  "geo_risk_before_hit": float((bg[:T] * y_hit).sum() / y_hit.sum().clamp_min(1.0)),
-                 "policy_share": float(bm.mean())}
+                 "policy_share": float(bm.mean()),
+                 "dead_speed": float(dead_n[1] / dead_n[0].clamp_min(1.0)), "dead_steer": float(dead_n[2] / dead_n[0].clamp_min(1.0))}
         log.write(json.dumps(stats) + "\n"); log.flush()
         if u % 5 == 0 or u == upd0 + 1:
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
             print(f"[{time.strftime('%H:%M')}] 업데이트 {u} | 진행 {stats['progress_ms']:.2f} m/s | 강한 충돌 벽+상자 "
                   f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 랩 {len(laps)}개 평균 {lp_} s | "
-                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 경주 정책 몫 {stats['policy_share']:.2f} | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
+                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 경주 정책 몫 {stats['policy_share']:.2f} | 죽은 결정 속도 {stats['dead_speed'] * 100:.0f} % 조향 {stats['dead_steer'] * 100:.0f} % | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s", flush=True)
         if u % int(a.save_every) == 0 or u == upd0 + int(a.updates):
             torch.save({"model": model.state_dict(), "norm": norm.state_dict(), "ret_rms": ret_rms.state_dict(),
@@ -1128,6 +1177,10 @@ def main():
     ap.add_argument("--prop-density", type=float, default=1.5, help="props / stages: procedural_density (training world)")
     ap.add_argument("--prop-max", type=int, default=18, help="props / stages: procedural_max_props")
     ap.add_argument("--scan-obs", type=int, default=0, help="1: append the noise-free scan (--beams beams) to the observation")
+    ap.add_argument("--soft-bound", type=int, default=0, help="1: the policy mean squashed into the action range near its ends "
+                    "(margins steer 0.1, speed 0.2; `soft_bound`) -- exploration reaches inside the range everywhere")
+    ap.add_argument("--bound-loss", type=float, default=0.0, help="weight of the penalty on the policy mean outside the "
+                    "executable action range (11-01: clamped-Gaussian dead zone); 0 = off")
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
     ap.add_argument("--hit-shaping", type=float, default=0.0,
