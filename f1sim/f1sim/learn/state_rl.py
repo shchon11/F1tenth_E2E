@@ -65,6 +65,7 @@ def build_env(a, device, extra=None):
                 "present": float(getattr(a, "opp_present", 1.0)), "spawn": str(getattr(a, "opp_spawn", "random")),
                 "reactive": {"defend": 0.3, "line": 0.2, "oblivious": 0.1},
                 "events": ["brake", "stop", "shift", "weave"], "event_rate": 0.5}
+        slot.update(json.loads(getattr(a, "opp_slot", "") or "{}"))          # `--opp-slot`: a stage's opponents
         from .. import opponent_slots as opp_sl
         e.update(race_size=2, opponent="slots", opponent_slots=opp_sl.parse_slots(json.dumps([slot])))
     e.update(extra or {})
@@ -1091,6 +1092,7 @@ def main():
     ap.add_argument("--init", default="")
     ap.add_argument("--unwedge", type=int, default=0, help="1: back a wedged car out (the old tracker's recovery, mirrored steering); 2: back-out steering from the front scan (10-30)")
     ap.add_argument("--opp-present", type=float, default=1.0, help="race stage: share of races with the opponent on track")
+    ap.add_argument("--opp-slot", default="", help="race stage: JSON merged into the opponent slot (speed_scale, reactive, events, ...)")
     ap.add_argument("--opp-spawn", default="random", help="race stage: where the opponent starts ('ahead': we start behind it)")
     ap.add_argument("--prop-fraction", type=float, default=1.0, help="share of resets that get a layout (the rest: empty track)")
     ap.add_argument("--removal-p", type=float, default=0.0,
