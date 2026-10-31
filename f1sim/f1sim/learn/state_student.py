@@ -98,7 +98,6 @@ def main():
     t_scan = bool(ck["args"].get("scan_obs", 0)); t_beams = int(ck["args"].get("beams", 36))
     # the teacher's observation: the state block, its noise-free scan at ITS beams (interpolated from this env's full
     # one over the same field of view), its prop corridor if it was trained with one
-    obs_fn = StateObs(env, scan=t_scan, corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)), plan_ref=ck["args"].get("plan_ref"), t_beams=t_beams)
     obs, _ = env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
@@ -106,9 +105,9 @@ def main():
     unwedge = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
 
     last_a = torch.zeros(B, 2, device=device)
-    o = obs_fn(last_a)
-    teacher = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); teacher.load_state_dict(ck["model"], strict=False); teacher.eval()
-    tnorm = RunningNorm(o.shape[1], device); tnorm.load_state_dict(ck["norm"])
+    # the teacher as it drives (state_rl.TeacherPolicy): its observation, norm, mean action and, with --base, the mixture
+    tp = state_rl.TeacherPolicy(env, ck, device, t_beams=t_beams if t_scan else 0)
+    teacher, tnorm = tp.net, tp.nrm
     ego_keys = sorted(k for k in obs if k != "scan")
     egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in ego_keys], 1)
     F, N = obs["scan"].shape[1], obs["scan"].shape[2]; E = egov(obs).shape[1]
@@ -144,7 +143,8 @@ def main():
         student.eval()
         with torch.no_grad():
             for t in range(int(a.steps) // R):
-                y = state_rl.clamp_act(teacher.pi(tnorm(o)), ck["args"].get("reverse_ext", 0.0))   # the label: the teacher's mean action
+                y = tp(last_a)                                           # the label: the teacher's mean action
+                o = tp.o
                 # danger weight (--danger-weight): the student's errors cost hits where the teacher's own hit head sees
                 # one coming (10-29: before its car contacts the student was 0.68 m/s faster than the label in 65 % of
                 # cases); uniform MSE spends the fit on cruising
@@ -179,7 +179,6 @@ def main():
                     if info["lap_times"].numel():
                         laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
                 last_a = act
-                o = obs_fn(last_a)
         student.train()
         losses = []
         for ep in range(int(a.epochs)):
@@ -457,11 +456,11 @@ def evaluate_like():
             def __init__(self):
                 self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
                 self.bound = 0; self.n_rule = 0
+                self.n_gate = 0; self.n_dec = 0                    # --base mixtures: decisions the race policy drove
                 self.stuck = 0; self.n_live = 0                    # learner steps below 0.3 m/s from 3 s into an episode
                 self.uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
                 if is_teacher:
-                    self.sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)), plan_ref=ck["args"].get("plan_ref"))
-                    self.net = None
+                    self.tp = None                         # state_rl.TeacherPolicy, built at the first decision
                 else:
                     from .lidar_grid import StudentRunner
                     self.st = StudentRunner(env, lid, ck, device)
@@ -477,11 +476,11 @@ def evaluate_like():
                     self.stuck += int((live & (env.sim.state[lid, 3].abs() < 0.3)).sum()); self.n_live += int(live.sum())
                 if self.t % R == 0:
                     if is_teacher:
-                        o_ = self.sobs(self.last)
-                        if self.net is None:
-                            self.net = ActorCritic(o_.shape[1], bev=ck.get("bev")).to(device); self.net.load_state_dict(ck["model"], strict=False)
-                            self.net.eval(); self.nrm = RunningNorm(o_.shape[1], device); self.nrm.load_state_dict(ck["norm"])
-                        a_ = state_rl.clamp_act(self.net.pi(self.nrm(o_)), ck["args"].get("reverse_ext", 0.0))
+                        if self.tp is None:
+                            self.tp = state_rl.TeacherPolicy(env, ck, device)
+                        a_ = self.tp(self.last)
+                        if self.tp.mix is not None:
+                            self.n_gate += int(self.tp.mix.gate.sum()); self.n_dec += B
                     else:
                         keys = self.keys or sorted(k for k in obs if k != "scan")
                         ego = torch.cat([obs[k][lid].float().reshape(B, -1) for k in keys], 1)
@@ -514,7 +513,9 @@ def evaluate_like():
         km_ = float((result.get("contact_severity") or {}).get("learner_distance_m", 0)) / 1000
         result["stuck"] = {"stuck_frac": pol.stuck / max(pol.n_live, 1),
                            "unwedge_per_km": (pol.uw.count / max(km_, 1e-6)) if pol.uw is not None else None}
-        print(f"[같은 평가] {tag}: 멈춰 있는 시간 {pol.stuck / max(pol.n_live, 1) * 100:.1f} %, 끼임 복구 "
+        if pol.n_dec:
+            result["stuck"]["policy_share"] = pol.n_gate / pol.n_dec
+        print(f"[같은 평가] {tag}: 경주 정책이 몬 결정 {pol.n_gate / max(pol.n_dec, 1) * 100:.0f} %, 멈춰 있는 시간 {pol.stuck / max(pol.n_live, 1) * 100:.1f} %, 끼임 복구 "
               f"{(pol.uw.count / max(km_, 1e-6)) if pol.uw is not None else float('nan'):.2f}/km", flush=True)
         if float(a.follow_rule) > 0:
             result["follow_rule"] = {"decel": float(a.follow_rule), "bound_frac": pol.bound / max(pol.n_rule, 1)}

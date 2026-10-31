@@ -325,6 +325,96 @@ class StateObs:
         return out
 
 
+#: `--base` (10-31): race training slowed the empty-track lap in every lineage (srl14 7.72 -> 8.05 s over 250 updates,
+#: srl50 8.52 -> 8.68 s by u300) and none of the causes tested was it (prop share srl51, hit-head shaping, price srl52,
+#: the noise floor srl53) -- so the solo optimum is kept by construction: a gated mixture of two drivers
+BASE_REACH = 10.0          # [m] what counts as near: the grid student sees 12 m ahead, so its labels stay learnable
+BASE_HOLD = 10             # decisions (0.5 s) the race policy keeps the car after the last thing near has gone
+
+
+class SoloMix:
+    """The frozen SOLO teacher (`--base`, e.g. srl1: empty track 7.53 s) drives while nothing is near; the race policy only
+    when a live prop is on the track within `reach` m ahead, another car is within `reach` m (no more than 2 m behind),
+    or the car is below 1 m/s (starts, wedges: only the race policy can reverse), and `hold` decisions after. The solo
+    teacher sees the world without props and cars -- its prop / opponent slots as on the empty track it was trained on."""
+
+    def __init__(self, env, path, device, reach=BASE_REACH, hold=BASE_HOLD):
+        from ..gym_env import (PRIV_OPP_DIST_SCALE, PRIV_V2_NO_OPP_DIST, PRIV_V2_OPP_KEYS, PRIV_V2_OPP_SLOTS,
+                               PRIV_V2_PROP_DIM)
+        ckb = torch.load(os.path.expanduser(path), map_location=device, weights_only=False)
+        ar = ckb["args"]
+        if ar.get("scan_obs") or ar.get("corridor_obs") or ar.get("car_channel") or ar.get("bev") or ar.get("path_plan"):
+            raise ValueError("--base must be a plain state teacher (privileged vector + track ahead), e.g. srl1_solo")
+        self.env, self.lid = env, env.learner_ids
+        B = int(self.lid.numel())
+        self.sobs = StateObs(env)
+        o = self.sobs(torch.zeros(B, 2, device=device))
+        self.net = ActorCritic(o.shape[1]).to(device); self.net.load_state_dict(ckb["model"], strict=False); self.net.eval()
+        self.nrm = RunningNorm(o.shape[1], device); self.nrm.load_state_dict(ckb["norm"])
+        self.reach, self.hold = float(reach), int(hold)
+        ko = PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS)
+        self.opp_cols = slice(8, 8 + ko)
+        self.geo_cols = slice(8 + ko, 12 + ko)
+        self.prop_cols = slice(12 + ko, 12 + ko + PRIV_V2_PROP_DIM)
+        self.geo_empty = torch.tensor([PRIV_V2_NO_OPP_DIST / PRIV_OPP_DIST_SCALE, 0.0, 1.0, 1.0], device=device)
+        self.n_seg = sum(1 for x in AHEAD if x <= self.reach + 1e-6)
+        self.left = torch.zeros(B, dtype=torch.long, device=device)
+        self.gate = torch.ones(B, dtype=torch.bool, device=device)
+
+    def near(self):
+        """(B,) bool: something the race policy must handle"""
+        env, lid = self.env, self.lid
+        st = env.last_result.state
+        s, tid = env.last_result.s[lid], env.sim.tid[lid]
+        B = s.shape[0]
+        cb = corridor_block(env, lid, s, tid).reshape(B, len(AHEAD), CORRIDOR_BINS)[:, :self.n_seg]
+        out = cb.flatten(1).any(1) | (st[lid, 3] < 1.0)
+        if env.M > 1:
+            dx, dy, _, _, _, dist, pres = env._opp_rel(st)
+            out |= (pres & (dx > -2.0) & (dist < self.reach))[lid].any(1)
+        return out
+
+    def __call__(self, a_pol, last):
+        """the executed action: the race policy's `a_pol` where gated, the solo teacher's mean action elsewhere"""
+        self.left = torch.where(self.near(), torch.full_like(self.left, self.hold), (self.left - 1).clamp_min(0))
+        self.gate = self.left > 0
+        o = self.sobs(last.clamp(-1, 1))
+        o[:, self.opp_cols] = 0.0
+        o[:, self.geo_cols] = self.geo_empty
+        o[:, self.prop_cols] = 0.0
+        a_b = self.net.pi(self.nrm(o)).clamp(-1, 1)
+        return torch.where(self.gate[:, None], a_pol, a_b)
+
+
+class TeacherPolicy:
+    """A state_rl checkpoint as a driver -- for the tools and the student's labels: its observation, input norm and MEAN
+    action in its action range; with `--base` the gated mixture (`SoloMix`). `self.o` is the last observation."""
+
+    def __init__(self, env, ck, device, t_beams=0):
+        ar = ck["args"]
+        self.ck, self.ext = ck, float(ar.get("reverse_ext", 0.0) or 0.0)
+        self.sobs = StateObs(env, scan=bool(ar.get("scan_obs", 0)), corridor=bool(ar.get("corridor_obs", 0)),
+                             corridor_cars=bool(ar.get("corridor_cars", 0)), car_channel=bool(ar.get("car_channel", 0)),
+                             bev=bool(ar.get("bev", 0)), path_plan=int(ar.get("path_plan", 0) or 0),
+                             plan_ref=ar.get("plan_ref"), t_beams=int(t_beams))
+        B = int(env.learner_ids.numel())
+        self.o = self.sobs(torch.zeros(B, 2, device=device))
+        self.net = ActorCritic(self.o.shape[1], bev=ck.get("bev")).to(device)
+        self.net.load_state_dict(ck["model"], strict=False); self.net.eval()
+        self.nrm = RunningNorm(self.o.shape[1], device); self.nrm.load_state_dict(ck["norm"])
+        self.mix = SoloMix(env, ar["base"], device, float(ar.get("base_reach", BASE_REACH)),
+                           int(ar.get("base_hold", BASE_HOLD))) if ar.get("base") else None
+
+    def policy(self, o):
+        """the race policy alone at observation `o`"""
+        return clamp_act(self.net.pi(self.nrm(o)), self.ext)
+
+    def __call__(self, last):
+        self.o = self.sobs(last)
+        a = self.policy(self.o)
+        return self.mix(a, last) if self.mix is not None else a
+
+
 def geo_risk(env, lid, horizon=1.0, n=10, margin=0.30, radius=0.20):
     """(B,) in [0, 1]: how deep the car's next `horizon` seconds -- a constant-curvature arc from its speed and yaw rate --
     run into a live prop, from the props' true shapes (their local half-planes at their poses). 0 while the arc keeps
@@ -628,6 +718,9 @@ def train(a):
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
         if float(a.removal_p) > 0 else None
     unwedge = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
+    # the gated mixture (`--base`): the solo teacher drives where nothing is near; the policy gradient only on the
+    # decisions this policy drove (elsewhere its sampled action was not executed), the critic on all
+    mix = SoloMix(env, a.base, device, float(a.base_reach), int(a.base_hold)) if a.base else None
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
           f"롤아웃 {T}결정 = {T * R} 스텝, 가격 {a.price:g}", flush=True)
     t0 = time.time()
@@ -646,6 +739,7 @@ def train(a):
         br = torch.zeros(T, B, device=device); bd = torch.zeros(T, B, device=device)
         bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
         bg = torch.zeros(T + 1, B, device=device)
+        bm = torch.ones(T, B, device=device)                     # 1 = this policy's action was executed (`--base`)
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = 0.0; laps = []; dev_sum = dev_n = 0.0
         tr0 = time.time()
@@ -673,7 +767,10 @@ def train(a):
                     bg[t] = geo_risk(env, lid)
                 rew = torch.zeros(B, device=device); done = torch.zeros(B, dtype=torch.bool, device=device)
                 hit_now = torch.zeros(B, dtype=torch.bool, device=device)
-                act_full[lid] = clamp_act(act, a.reverse_ext)
+                exe = clamp_act(act, a.reverse_ext)
+                if mix is not None:
+                    exe = mix(exe, last_a); bm[t] = mix.gate.float()
+                act_full[lid] = exe
                 for k in range(R):
                     if unwedge is not None:
                         unwedge.before(act_full)
@@ -717,7 +814,7 @@ def train(a):
                     if info["lap_times"].numel():
                         laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
                 br[t] = rew; bd[t] = done.float(); bh[t] = hit_now.float()
-                last_a = torch.where(done[:, None], torch.zeros_like(act), clamp_act(act, a.reverse_ext))
+                last_a = torch.where(done[:, None], torch.zeros_like(act), exe)
                 if float(a.noise_corr) > 0:
                     eps_n = torch.where(done[:, None], torch.randn_like(eps_n), eps_n)
                 o = obs_fn(last_a)
@@ -763,11 +860,16 @@ def train(a):
                         env.level_replay.accumulate(int(st_), int(sd_), float(sm_), int(cn_))
             ret_rms.update(ret.reshape(-1, 1))
             ret_n = ret / (ret_rms.var.sqrt() + 1e-6)
-            adv_n = (adv - adv.mean()) / (adv.std() + 1e-8)
+            if mix is not None and bool((bm > 0).any()):
+                am = adv[bm > 0]
+                adv_n = (adv - am.mean()) / (am.std() + 1e-8)
+            else:
+                adv_n = (adv - adv.mean()) / (adv.std() + 1e-8)
         t_roll = time.time() - tr0
         N = T * B
         fo, fa, flp, fadv, fret = bo.reshape(N, D), ba.reshape(N, 2), blp.reshape(N), adv_n.reshape(N), ret_n.reshape(N)
         fyh, fvh = y_hit.reshape(N), v_hit.reshape(N)
+        fm = bm.reshape(N)
         mb = N // int(a.minibatches)
         kls, cfs = [], []
         for ep in range(int(a.epochs)):
@@ -778,7 +880,8 @@ def train(a):
                 dist = model.dist(fo_j)
                 lp = dist.log_prob(fa[j]).sum(1)
                 ratio = (lp - flp[j]).exp()
-                pg = -torch.min(ratio * fadv[j], ratio.clamp(1 - a.clip, 1 + a.clip) * fadv[j]).mean()
+                m_j = fm[j]
+                pg = -(torch.min(ratio * fadv[j], ratio.clamp(1 - a.clip, 1 + a.clip) * fadv[j]) * m_j).sum() / m_j.sum().clamp_min(1.0)
                 v_j, hl_j = model.value_and_hit(fo_j)
                 vf = 0.5 * (v_j - fret[j]).pow(2).mean()
                 loss = pg + a.vf * vf
@@ -790,7 +893,8 @@ def train(a):
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 with torch.no_grad():
-                    kls.append(float(((ratio - 1) - (lp - flp[j])).mean())); cfs.append(float(((ratio - 1).abs() > a.clip).float().mean()))
+                    n_m = m_j.sum().clamp_min(1.0)
+                    kls.append(float((((ratio - 1) - (lp - flp[j])) * m_j).sum() / n_m)); cfs.append(float((((ratio - 1).abs() > a.clip).float() * m_j).sum() / n_m))
         km = prog / 1000.0
         secs = T * R * B * env.sim.control_dt
         stats = {"update": u, "progress_ms": prog / secs, "hits_wall_prop_per_km": hits_w / max(km, 1e-3),
@@ -804,13 +908,14 @@ def train(a):
                  "hit_p_pos": float((bp[:T] * y_hit * v_hit).sum() / (y_hit * v_hit).sum().clamp_min(1.0)),
                  "hit_p_neg": float((bp[:T] * (1 - y_hit) * v_hit).sum() / ((1 - y_hit) * v_hit).sum().clamp_min(1.0)),
                  "shaping_abs": float(shaping.abs().mean()), "geo_risk_mean": float(bg[:T].mean()),
-                 "geo_risk_before_hit": float((bg[:T] * y_hit).sum() / y_hit.sum().clamp_min(1.0))}
+                 "geo_risk_before_hit": float((bg[:T] * y_hit).sum() / y_hit.sum().clamp_min(1.0)),
+                 "policy_share": float(bm.mean())}
         log.write(json.dumps(stats) + "\n"); log.flush()
         if u % 5 == 0 or u == upd0 + 1:
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
             print(f"[{time.strftime('%H:%M')}] 업데이트 {u} | 진행 {stats['progress_ms']:.2f} m/s | 강한 충돌 벽+상자 "
                   f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 랩 {len(laps)}개 평균 {lp_} s | "
-                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
+                  f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 경주 정책 몫 {stats['policy_share']:.2f} | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s", flush=True)
         if u % int(a.save_every) == 0 or u == upd0 + int(a.updates):
             torch.save({"model": model.state_dict(), "norm": norm.state_dict(), "ret_rms": ret_rms.state_dict(),
@@ -897,6 +1002,9 @@ def main():
     ap.add_argument("--removal-p", type=float, default=0.0,
                     help="competition sessions: share of episodes whose props are removed mid-episode")
     ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0), help="the removal time window [s]")
+    ap.add_argument("--base", default="", help="the gated mixture (10-31): this frozen SOLO teacher drives while nothing is near")
+    ap.add_argument("--base-reach", type=float, default=BASE_REACH, help="--base: near = a prop on the track / a car within this [m]")
+    ap.add_argument("--base-hold", type=int, default=BASE_HOLD, help="--base: decisions the policy keeps the car after")
     ap.add_argument("--corridor-cars", type=int, default=0, help="1: mark the other cars (now, +0.5 s, +1 s) in the corridor")
     ap.add_argument("--car-channel", type=int, default=0, help="1: the other cars in their own corridor block (appended)")
     ap.add_argument("--bev", type=int, default=0, help="1: the car-centred grid of walls / props / cars + a conv (10-30)")

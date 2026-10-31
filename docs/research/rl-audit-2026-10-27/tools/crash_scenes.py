@@ -172,6 +172,11 @@ def main():
     o = obs_fn(last_a)
     model = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); model.load_state_dict(ck["model"], strict=False)
     norm = RunningNorm(o.shape[1], device); norm.load_state_dict(ck["norm"])
+    # `--base` checkpoints (10-31): the gated mixture drives -- the frozen solo teacher where nothing is near
+    mix = state_rl.SoloMix(env, ck0["args"]["base"], device, float(ck0["args"].get("base_reach", state_rl.BASE_REACH)),
+                           int(ck0["args"].get("base_hold", state_rl.BASE_HOLD))) if ck0["args"].get("base") else None
+    ghist = torch.ones(40, B, device=device)                # 1 = the race policy drove that decision
+    last_exec = last_a
     act_full = torch.zeros(env.B, env.act_dim, device=device)
     hist = torch.zeros(H, env.B, 6, device=device)     # x, y, yaw, vx, steer cmd, speed cmd -- every car
     HD = 40                                              # 2 s of decisions (20 Hz)
@@ -253,6 +258,9 @@ def main():
             planhist = torch.roll(planhist, -1, 0)
             planhist[-1] = my_pl.path_xy(env.last_result.s[lid][:, None] + pl_ds[None], env.sim.tid[lid])[0]
         act = state_rl.clamp_act(model.pi(norm(o)), ck0["args"].get("reverse_ext", 0.0))
+        if mix is not None:
+            act = mix(act, last_exec)
+            ghist = torch.roll(ghist, -1, 0); ghist[-1] = mix.gate.float()
         if float(a.gap_rule) > 0 and env.M > 1:
             st0 = env.sim.state
             dx_, dy_, dyaw_, dvx_, dvy_, dist_, pr_ = env._opp_rel(st0)
@@ -391,7 +399,16 @@ def main():
                     ev = {"step": t * int(a.repeat) + r, "row": row, "kind": kind, "impact": float(impv[i]),
                           "ep_step": int(env.ep_step[row]), "opp_dist": od, **geo,
                           "speed": float(st[row, 3]), "xy": [float(st[row, 0]), float(st[row, 1])], "yaw": float(st[row, 2]),
-                          "traj": h[:, :4].tolist(), "steer_cmd_0.5s": h[-min(20, len(h)):, 4].tolist(), "speed_cmd_0.5s": h[-min(20, len(h)):, 5].tolist()}
+                          "traj": h[:, :4].tolist(), "steer_cmd_0.5s": h[-min(20, len(h)):, 4].tolist(), "speed_cmd_0.5s": h[-min(20, len(h)):, 5].tolist(),
+                          "race_policy_1s": float(ghist[-20:, i].mean()), "race_policy_2s": float(ghist[:, i].mean()),
+                          "race_policy_now": float(ghist[-1, i])}
+                    if mix is not None:
+                        # the handover: the speed the car had when the race policy last took it over from the solo teacher
+                        g_ = ghist[:, i].cpu().numpy(); k_ = np.nonzero(g_ < 0.5)[0]
+                        ev["takeover_s_before"] = (len(g_) - 1 - int(k_[-1])) / 20.0 if len(k_) else None
+                        if len(k_) and int(k_[-1]) + 1 < len(g_):
+                            j_ = H - (len(g_) - 1 - int(k_[-1])) * int(a.repeat)
+                            ev["takeover_speed"] = float(hist[max(j_, 0), row, 3])
                     # the policy's response 0.5 s before the hit (10 decisions back), with the props as seen and erased
                     n_dec = int(min(HD, int(env.ep_step[row]) // int(a.repeat)))
                     if n_dec >= 11:
@@ -481,6 +498,11 @@ def main():
                         sc = np.array(ev["speed_cmd_0.5s"]); stc = np.degrees(np.array(ev["steer_cmd_0.5s"]))
                         title = (f"#{n_img} {kind} 충돌, 충격 {ev['impact']:.2f} m/s, 속도 {ev['speed']:.2f} m/s, 출발 후 {ev['ep_step'] / 40:.1f} s\n"
                                  f"직전 0.5초 속도 명령 {sc[0]:.1f} -> {sc[-1]:.1f} m/s, 조향 {stc[0]:+.0f} -> {stc[-1]:+.0f} 도")
+                        if mix is not None:
+                            title += (f" | 몬 정책: 지금 {'경주' if ev['race_policy_now'] > 0.5 else '혼자'}, "
+                                      f"직전 2 s 경주 {ev['race_policy_2s'] * 100:.0f} %")
+                            if ev.get("takeover_s_before") is not None:
+                                title += f"\n경주 정책이 넘겨받은 때: {ev['takeover_s_before']:.2f} s 전, 그때 속도 {ev.get('takeover_speed', float('nan')):.1f} m/s"
                         if "resp" in ev:
                             rp = ev["resp"]
                             title += (f"\n0.5초 전: 상자 보임 {'예' if rp['props_seen'] else '아니오'} | 조향 {rp['steer_deg']:+.0f}도 / 상자 지우면 "
@@ -500,6 +522,7 @@ def main():
                         draw(os.path.join(out, f"scene_{n_img:03d}.png"), ev, tracks[tid], props, opp, title, plan_xy, my_paths)
                         n_img += 1
         o = obs_fn(act)
+        last_exec = act
     for nm in ("1s", "0.5s"):
         q = [x[nm] for x in slot_log if nm in x]
         if q:

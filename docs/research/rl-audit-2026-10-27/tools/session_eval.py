@@ -21,7 +21,7 @@ import torch
 
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import state_rl  # noqa: E402
-from f1sim.learn.state_rl import ActorCritic, PropRemoval, RunningNorm, StateObs, Unwedge  # noqa: E402
+from f1sim.learn.state_rl import PropRemoval, Unwedge  # noqa: E402
 from f1sim.learn.state_student import Student, make_env_like  # noqa: E402
 
 
@@ -63,11 +63,8 @@ def run(a, ck, solo, device):
     uw = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     R = int(ck["args"].get("repeat", 2))
     if is_teacher:
-        sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)), plan_ref=ck["args"].get("plan_ref"))
+        tp = state_rl.TeacherPolicy(env, ck, device)          # with --base: the gated mixture
         last = torch.zeros(B, 2, device=device)
-        o = sobs(last)
-        net = ActorCritic(o.shape[1], bev=ck.get("bev")).to(device); net.load_state_dict(ck["model"], strict=False); net.eval()
-        nrm = RunningNorm(o.shape[1], device); nrm.load_state_dict(ck["norm"])
     else:
         from f1sim.learn.lidar_grid import StudentRunner
         st = StudentRunner(env, lid, ck, device)                  # the 1-D scan student or the grid student
@@ -92,7 +89,7 @@ def run(a, ck, solo, device):
                 st.observe()                                         # the pose the last step left
             if t % R == 0:
                 if is_teacher:
-                    act = state_rl.clamp_act(net.pi(nrm(sobs(last))), ck["args"].get("reverse_ext", 0.0)); last = act
+                    act = tp(last); last = act
                 else:
                     act = st(obs, egov(obs))
                 act_full[lid] = act

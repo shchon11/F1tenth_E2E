@@ -14,7 +14,6 @@ import torch
 
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import state_rl  # noqa: E402
-from f1sim.learn.state_rl import ActorCritic, RunningNorm, StateObs, clamp_act  # noqa: E402
 
 ap = argparse.ArgumentParser(); ap.add_argument("--out", required=True); ap.add_argument("pol", nargs="+")
 ap.add_argument("--steps", type=int, default=1400)
@@ -34,18 +33,15 @@ for item in a0.pol:
     prepare_graph_runtime(env, log=lambda _t: None)
     env.reset(seed=5)
     lid = env.learner_ids; B = int(lid.numel())
-    sobs = StateObs(env, scan=bool(ar.get("scan_obs", 0)), corridor=bool(ar.get("corridor_obs", 0)),
-                    car_channel=bool(ar.get("car_channel", 0)), bev=bool(ar.get("bev", 0)), t_beams=int(ar.get("beams", 36)))
-    last = torch.zeros(B, 2, device=dev); o = sobs(last)
-    net = ActorCritic(o.shape[1], bev=ck.get("bev")).to(dev); net.load_state_dict(ck["model"], strict=False); net.eval()
-    nrm = RunningNorm(o.shape[1], dev); nrm.load_state_dict(ck["norm"])
+    tp = state_rl.TeacherPolicy(env, ck, dev)                    # with --base: the gated mixture
+    last = torch.zeros(B, 2, device=dev)
     act = torch.zeros(env.B, env.act_dim, device=dev)
     L = float(env.sim.track.length[0]); n = int(L / RES) + 1
     acc = np.zeros(n); cnt = np.zeros(n); laps = []
     with torch.no_grad():
         for t in range(int(a0.steps)):
             if t % 2 == 0:
-                last = clamp_act(net.pi(nrm(sobs(last))), ar.get("reverse_ext", 0.0)); act[lid] = last
+                last = tp(last); act[lid] = last
             _, _, _, _, info = env.step(act)
             if t > 120:
                 s = env.last_result.s[lid].cpu().numpy(); v = env.sim.state[lid, 3].cpu().numpy()
@@ -53,7 +49,8 @@ for item in a0.pol:
                 np.add.at(acc, i, v); np.add.at(cnt, i, 1)
             if info["lap_times"].numel():
                 laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
-    prof[name] = (acc / np.maximum(cnt, 1), float(np.median(laps)) if laps else float("nan"))
+    # bins no car passed (the centerline's s jumps where the line crosses itself closely) are gaps, not 0 m/s
+    prof[name] = (np.where(cnt > 0, acc / np.maximum(cnt, 1), np.nan), float(np.median(laps)) if laps else float("nan"))
     track = env.sim.track.tracks[0]
     cl = env.sim.track.cl[0].cpu().numpy(); cls = env.sim.track.cl_s[0].cpu().numpy()
     print(f"[속도 프로파일] {name}: 랩 중앙 {prof[name][1]:.2f} s", flush=True)
@@ -85,7 +82,7 @@ seg = 5.0
 for nm in names[1:]:
     lost = []
     for k in np.arange(0, L, seg):
-        m = (s_ax >= k) & (s_ax < k + seg)
+        m = (s_ax >= k) & (s_ax < k + seg) & np.isfinite(ref) & np.isfinite(prof[nm][0])
         t_ref = np.sum(RES / np.maximum(ref[m], 0.3)); t_nm = np.sum(RES / np.maximum(prof[nm][0][m], 0.3))
         lost.append(t_nm - t_ref)
     ax4.bar(np.arange(0, L, seg) + (names.index(nm) - 1) * 1.2, lost, width=1.2, label=nm)
