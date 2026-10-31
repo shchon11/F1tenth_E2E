@@ -1011,7 +1011,8 @@ def train(a):
 
 @torch.no_grad()
 def evaluate(a):
-    """The checkpoint's MEAN action (no exploration noise) in its stage's world: lap times, progress, hard hits per km."""
+    """The checkpoint's MEAN action (no exploration noise; `--eval-noise 1`: with it) in its stage's world: lap times,
+    progress, hard hits per km."""
     device = torch.device(a.device)
     ck = torch.load(a.eval, map_location=device, weights_only=False)
     env = build_env(a, device)
@@ -1026,8 +1027,19 @@ def evaluate(a):
     touching = torch.zeros(B, dtype=torch.bool, device=device)
     prog = hw = hc = 0.0; laps = []; steps = 0
     R = int(a.repeat)
+    eps = torch.zeros(B, 2, device=device)
     for t in range(int(a.eval_steps) // R):
-        act = tp(act)
+        if a.eval_noise:
+            # the training's exploration (AR(1) noise at the policy's std) on the race policy: the J that PPO's gradient
+            # follows, beside the mean action's J that the evaluations judge (11-01)
+            tp.o = tp.sobs(act)
+            dist = tp.net.dist(tp.nrm(tp.o))
+            al = float(a.noise_corr)
+            eps = al * eps + math.sqrt(1.0 - al * al) * torch.randn_like(eps)
+            a_pol = clamp_act(dist.mean + dist.stddev * eps, tp.ext)
+            act = tp.mix(a_pol, act) if tp.mix is not None else a_pol
+        else:
+            act = tp(act)
         act_full[lid] = act
         for k in range(R):
             _, r_, te, trc, info = env.step(act_full)
@@ -1041,7 +1053,7 @@ def evaluate(a):
     km = prog / 1000.0
     secs = steps * B * env.sim.control_dt
     q = np.percentile(laps, [10, 50, 90]) if laps else [float("nan")] * 3
-    print(f"[평가] {os.path.basename(a.eval)} 단계 {a.stage}, 평균 행동, {B}대 x {steps * env.sim.control_dt:.0f} s = {km:.1f} km | "
+    print(f"[평가] {os.path.basename(a.eval)} 단계 {a.stage}, {'탐색 잡음 행동' if a.eval_noise else '평균 행동'}, {B}대 x {steps * env.sim.control_dt:.0f} s = {km:.1f} km | "
           f"진행 {prog / secs:.2f} m/s | 강한 충돌 벽+상자 {hw / max(km, 1e-3):.2f}, 차 {hc / max(km, 1e-3):.2f} /km | "
           f"랩 {len(laps)}개, 중앙값 {q[1]:.2f} s (p10 {q[0]:.2f}, p90 {q[2]:.2f}) | J80/스텝 {(prog - 80 * (hw + hc)) / (steps * B):.4f}",
           flush=True)
@@ -1051,6 +1063,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval", default="", help="evaluate this checkpoint's mean action instead of training")
     ap.add_argument("--eval-steps", type=int, default=2400)
+    ap.add_argument("--eval-noise", type=int, default=0, help="--eval: 1 = with the training's exploration noise on the race policy")
     ap.add_argument("--name", required=True)
     ap.add_argument("--stage", default="solo", choices=("solo", "props", "race"))
     ap.add_argument("--envs", type=int, default=4096)

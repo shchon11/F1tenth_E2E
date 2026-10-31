@@ -115,6 +115,7 @@ def main():
     ap.add_argument("--steps-total", type=int, default=0, help="unused")
     ap.add_argument("--overlay-layout", type=int, default=0,
                     help="1: draw the layout-line planner's line for the hit row's layout (one-track envs: --like / --warps 0)")
+    ap.add_argument("--prop-fraction", type=float, default=1.0, help="training world (no --like): share of races with props")
     ap.add_argument("--like", default="", help="an eval_ckpt.sh race JSON: drive in exactly that world (state_student.make_env_like)")
     ap.add_argument("--student", default="", help="a state_student checkpoint: the STUDENT drives (its own sensors); the "
                     "teacher CKPT labels every decision, so each hit shows what the teacher would have done instead")
