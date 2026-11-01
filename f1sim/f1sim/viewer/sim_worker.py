@@ -461,6 +461,11 @@ def auto_device() -> str:
     the other was not -- 56 % free against 86 %. A fraction says "not in use", which is the thing
     actually being asked. Cards with too little free memory to hold a session are dropped first,
     so an almost-empty tiny card cannot win on percentage alone.
+
+    11-02: the BIGGEST card with room wins instead (on this machine the 4070, the fast one). The user's rule is that
+    the console owns the 4070 while it is open: a training run there is paused for as long as the console uses the card
+    (docs/research/plan-output-2026-11-01/tools/gpu_guard3.sh). By free fraction the viewer had landed on the 5060 next
+    to a run that left it 2.3 GB, and drove at 0.76x real time.
     """
     import torch
     forced = os.environ.get("F1SIM_VIEWER_DEVICE")
@@ -476,7 +481,7 @@ def auto_device() -> str:
         usable = [i for i, (free, _tot) in enumerate(info) if free >= VIEWER_MIN_FREE_BYTES]
         if not usable:
             usable = list(range(n))
-        return f"cuda:{max(usable, key=lambda i: info[i][0] / max(1, info[i][1]))}"
+        return f"cuda:{max(usable, key=lambda i: (info[i][1], info[i][0]))}"
     except Exception:
         return "cuda"
 
@@ -1916,9 +1921,14 @@ class SimWorker:
         # `r.state` gained an eighth column (omega_r) on 2026-09-13. The console's frame layout
         # below indexes this pack by position, so take the seven the console draws with and leave
         # the layout where it was; nothing in the console reads the rear-axle speed.
+        # 11-02: column 18, the time on the current lap -- steps since the car last crossed the line (the env's own
+        # lap clock). The console's lap times are `t - lap_t` at the frame after a crossing, exact to a control step
+        # whatever the frame rate (timed from frames alone they were off by up to a frame interval: 6.30 s for 6.50)
+        lap_t = ((env.ep_step[sel] - env.lap_start_step[sel]).float() * float(sim.control_dt)
+                 if hasattr(env, "lap_start_step") and hasattr(env, "ep_step") else torch.zeros_like(r.s[sel]))
         pack = torch.cat([r.state[sel, :7], r.attitude[sel], r.lap[sel, None].float(),
                           r.collision[sel, None].float(), r.s[sel, None], r.wall_dist[sel, None],
-                          sim.car_rear[sel], sim.car_dims[sel, 0:1]], 1)
+                          sim.car_rear[sel], sim.car_dims[sel, 0:1], lap_t[:, None].to(r.s.dtype)], 1)
         nb = int(r.scan.shape[1])
         dash = torch.cat([sim.state[focus, [3, 6]], env.last_cmd[focus],
                           env.speed_cap[focus:focus + 1], sim.ay[focus:focus + 1],
@@ -2025,7 +2035,7 @@ class SimWorker:
             "x": _copy(p[:, 0]), "y": _copy(p[:, 1]), "yaw": _copy(p[:, 2]), "vx": _copy(p[:, 3]),
             "steer": _copy(p[:, 6]), "roll": _copy(p[:, 7]), "pitch": _copy(p[:, 8]),
             "lap": _copy(p[:, 9]), "coll": _copy(p[:, 10]), "s": _copy(p[:, 11]),
-            "wall": _copy(p[:, 12]), "rear": _copy(p[:, 13:17]), "len": _copy(p[:, 17]),
+            "wall": _copy(p[:, 12]), "rear": _copy(p[:, 13:17]), "len": _copy(p[:, 17]), "lap_t": _copy(p[:, 18]),
             "scan": _copy(scan).astype(np.float32), "scan_type": _copy(styp).astype(np.int32),
             "focus": focus, "focus_env": focus, "ids": ids,
             "P": {k: float(pv[j]) for j, k in enumerate(Pk)},

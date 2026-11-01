@@ -66,6 +66,7 @@ def settle(qapp, times=10):
 SIZES = [(1600, 950), (1120, 700), (1920, 1043)]
 
 
+@pytest.mark.skip(reason="11-02: the policy I/O panel is no longer on screen (console redesign: top bar, 3D view, HUD)")
 @pytest.mark.parametrize("size", SIZES)
 def test_panel_is_capped_to_its_content_and_never_clips(window, qapp, size):
     w, h = size
@@ -99,6 +100,7 @@ def test_the_viewport_takes_the_slack(window, qapp, size):
         f"3D view {window.viewport.height()}px vs panel {window.policy_scroll.height()}px at {w}x{h}")
 
 
+@pytest.mark.skip(reason="11-02: the policy I/O panel is no longer on screen (console redesign: top bar, 3D view, HUD)")
 def test_collapsing_the_fold_returns_the_space(window, qapp):
     window.resize(1600, 950)
     settle(qapp)

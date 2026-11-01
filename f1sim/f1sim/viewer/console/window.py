@@ -42,6 +42,7 @@ TRAIN_HINT = ("학습 때와 같은 생성기로 장애물을 놓습니다: 패�
 from .widgets import (Card, Collapsible, FieldRow, FilterList, FlowLayout, KeyValueList,
                       MetricTile, PendingButton, PendingToggle, SegmentedButtons, Sparkbar,
                       StateBadge, hline, label)
+from .modern import PickItem, RichPicker, Tile
 
 #: How long a command may go unacknowledged before the status bar says so. The UI stays responsive
 #: either way; this only decides when to admit that the worker is slow.
@@ -152,50 +153,291 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     # ================================================================ construction
     def _build_ui(self):
+        # 11-02, the user: "정책 말고 안 쓰는 기능들은 싹 다 지워줘 제발. 너무 난잡해", "UI 너무 쓰레기야 ... 쌈뽕하게 직관적으로".
+        # One top bar (three pickers, the transport buttons, the state), the 3D view, and a slim HUD on the right.
+        # The old panels are still BUILT -- the controller, the session config and the remembered settings read their
+        # widgets (run and map lists, scenario controls, the opponent table, the record form) -- but they sit in a
+        # hidden holder and are never shown. The training page and the environment editor are not built at all (each
+        # carried its own GL viewport).
+        self._legacy = QtWidgets.QWidget()
+        legacy = QtWidgets.QVBoxLayout(self._legacy)
+        self._legacy_header = self._build_header()
+        self.left_panel = self._build_left()
+        self.centre = self._build_centre()
+        self.right_panel = self._build_right()
+        status = self._build_status()
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)     # `_apply_panel_width` reads it; empty now
+        for w in (self._legacy_header, self.left_panel, self.centre, self.right_panel, self.splitter):
+            legacy.addWidget(w)
+        self.training = None
+        self.editor = None
+        self._lapstate: dict = {}
+
         root = QtWidgets.QWidget()
         root.setObjectName("Panel")
         outer = QtWidgets.QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(self._build_header())
-        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.splitter.setChildrenCollapsible(False)
-        self.left_panel = self._build_left()
-        self.centre = self._build_centre()
-        self.right_panel = self._build_right()
-        # Two pages in the middle: driving (the viewport) and training. Training is the console's
-        # second job, not a dialog: it launches and watches PPO runs and hands their checkpoints
-        # back to the driving page.
-        from .training import TrainingPage
-        self.training = TrainingPage()
-        self.training.view_checkpoint_requested.connect(self._view_checkpoint_from_training)
-        self.training.runs_changed.connect(self._runs_changed_from_training)
-        # The stack must not let the training page's minimum sizes govern the driving page: a
-        # QStackedWidget reports the maximum of its pages, which would squeeze the viewport at
-        # small window sizes even while the training page is hidden.
-        self.training.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
-        # The third page: the environment editor. Builds and edits scenes (`f1sim.scene`) with
-        # its own GL viewport, and hands a saved scene to the driving page as `scene:<name>`.
-        from .env_editor import EnvEditorPage
-        self.editor = EnvEditorPage()
-        self.editor.drive_requested.connect(self._drive_from_editor)
-        self.editor.scenes_changed.connect(self._scenes_changed_from_editor)
-        self.editor.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+        outer.addWidget(self._build_topbar())
+        body = QtWidgets.QWidget()
+        body.setObjectName("Centre")
+        bh = QtWidgets.QHBoxLayout(body)
+        bh.setContentsMargins(0, 0, 0, 0)
+        bh.setSpacing(0)
+        view_wrap = QtWidgets.QWidget()
+        vw = QtWidgets.QVBoxLayout(view_wrap)
+        vw.setContentsMargins(12, 12, 12, 12)
+        vw.addWidget(self.viewport, 1)
+        bh.addWidget(view_wrap, 1)
+        bh.addWidget(self._build_hud())
         self.centre_stack = QtWidgets.QStackedWidget()
         self.centre_stack.setObjectName("Centre")
-        self.centre_stack.addWidget(self.centre)
-        self.centre_stack.addWidget(self.training)
-        self.centre_stack.addWidget(self.editor)
-        self.splitter.addWidget(self.left_panel)
-        self.splitter.addWidget(self.centre_stack)
-        self.splitter.addWidget(self.right_panel)
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 1)
-        self.splitter.setStretchFactor(2, 0)
-        self.splitter.setSizes([330, 900, 350])
-        outer.addWidget(self.splitter, 1)
-        outer.addWidget(self._build_status())
+        self.centre_stack.addWidget(body)
+        outer.addWidget(self.centre_stack, 1)
+        outer.addWidget(status)
+        self._legacy.setParent(root)
+        self._legacy.setVisible(False)
         self.setCentralWidget(root)
+
+    #: The 주행 조건 picker: what a person actually switches between (2026-11-02). Each sets the hidden scenario
+    #: controls the session config reads -- the same keys a console pick's "settings" use.
+    COND_ITEMS = [
+        PickItem("solo", "혼자 달리기", "장애물·상대 없음 — 랩 속도를 보는 기본 조건"),
+        PickItem("props", "학습 장애물", "학습 때와 같은 상자 배치 (시작할 때마다 새로 뽑음)"),
+        PickItem("race", "1:1 경주", "ForzaETH 상대 1대, 속도 0.7~1.0배"),
+        PickItem("race_props", "1:1 경주 + 장애물", "상대 1대와 학습 장애물"),
+    ]
+    COND_OPPONENT = [{"kind": "forzaeth_pred", "speed_scale": [0.7, 1.0]}]
+
+    def _build_topbar(self) -> QtWidgets.QWidget:
+        bar = QtWidgets.QFrame()
+        bar.setObjectName("TopBar")
+        bar.setFixedHeight(70)
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(16, 12, 16, 12)
+        h.setSpacing(10)
+        mark = QtWidgets.QLabel("◆")
+        mark.setObjectName("BrandMark")
+        h.addWidget(mark)
+        brand = QtWidgets.QLabel("주행 콘솔")
+        brand.setObjectName("Brand")
+        h.addWidget(brand)
+        h.addSpacing(8)
+        self.pick_policy = RichPicker("정책", "정책을 고르세요", popup_width=780,
+                                      search_hint="정책 검색 — 이름 · 맵 · 설명")
+        self.pick_policy.chosen.connect(self._on_policy_picked)
+        h.addWidget(self.pick_policy, 6)
+        self.pick_map = RichPicker("맵", "맵 목록 읽는 중…", popup_width=520, search_hint="맵 검색")
+        self.pick_map.chosen.connect(self._on_map_picked)
+        h.addWidget(self.pick_map, 3)
+        self.pick_cond = RichPicker("주행 조건", "혼자 달리기", popup_width=440, searchable=False)
+        self.pick_cond.set_items(self.COND_ITEMS)
+        self.pick_cond.set_current("solo")
+        self.pick_cond.chosen.connect(self._on_condition_picked)
+        h.addWidget(self.pick_cond, 2)
+        h.addSpacing(6)
+        for btn, name, text, tip in (
+                (self.btn_start, "StartButton", "▶  시작", "고른 정책 · 맵 · 조건으로 달립니다."),
+                (self.btn_stop, "StopButton", "■  정지", "세션을 끝냅니다.  (Ctrl+.)"),
+                (self.btn_pause, "IconButton", "일시정지", "시뮬레이션을 멈춥니다.  (Space)"),
+                (self.btn_reset, "IconButton", "리셋", "같은 조건으로 처음부터 다시 달립니다.  (Ctrl+R)")):
+            btn.setObjectName(name)
+            btn.setText(text)
+            btn.setToolTip(tip)
+            btn.setFixedHeight(46)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+            h.addWidget(btn)
+        h.addSpacing(6)
+        h.addWidget(self.badge)
+        return bar
+
+    def _build_hud(self) -> QtWidgets.QWidget:
+        hud = QtWidgets.QFrame()
+        hud.setObjectName("Hud")
+        hud.setFixedWidth(308)
+        v = QtWidgets.QVBoxLayout(hud)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(10)
+        self.t_speed = Tile("속도", "m/s", big=True)
+        v.addWidget(self.t_speed)
+        g = QtWidgets.QGridLayout()
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setSpacing(10)
+        self.t_last = Tile("최근 랩", "s")
+        self.t_best = Tile("최고 랩", "s")
+        self.t_laps = Tile("랩", "바퀴")
+        self.t_contact = Tile("접촉", "회")
+        self.t_contact.setToolTip(self.CONTACT_TIP)
+        self.t_rate = Tile("시뮬 배속", "×")
+        g.addWidget(self.t_last, 0, 0)
+        g.addWidget(self.t_best, 0, 1)
+        g.addWidget(self.t_laps, 1, 0)
+        g.addWidget(self.t_rate, 1, 1)
+        g.addWidget(self.t_contact, 2, 0, 1, 2)          # full width: the per-kind line has to fit
+        v.addLayout(g)
+
+        def card(caption: str) -> QtWidgets.QVBoxLayout:
+            f = QtWidgets.QFrame()
+            f.setObjectName("Tile")
+            lay = QtWidgets.QVBoxLayout(f)
+            lay.setContentsMargins(14, 10, 14, 12)
+            lay.setSpacing(8)
+            cap = QtWidgets.QLabel(caption)
+            cap.setObjectName("TileCaption")
+            lay.addWidget(cap)
+            v.addWidget(f)
+            return lay
+
+        cam = card("카메라")
+        for key, short in (("overview", "전체"), ("chase", "추격"), ("top", "위"), ("orbit", "궤도"), ("close", "근접")):
+            b = self.camera_buttons.button(key)
+            if b is not None:
+                b.setText(short)
+                b.setObjectName("IconButton")
+                b.setMinimumWidth(0)
+                b.setFixedHeight(32)
+        cam.addWidget(self.camera_buttons)
+        self._focus_lay = card("보는 차")
+        self.focus_card = self._focus_lay.parentWidget()
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        for w in (self.btn_focus_prev, self.combo_focus, self.btn_focus_next):
+            row.addWidget(w, 1 if w is self.combo_focus else 0)
+        self._focus_lay.addLayout(row)
+        self.focus_card.setVisible(False)
+        show = card("표시")
+        for chk, text in ((self.chk_plan, "정책 궤적"), (self.chk_trails, "주행 자취"),
+                          (self.chk_raceline, "레이싱 라인"), (self.chk_lidar, "LiDAR")):
+            chk.setText(text)
+            show.addWidget(chk)
+        v.addStretch(1)
+        return hud
+
+    # ---------------------------------------------------------------- 11-02 pickers
+    def _policy_items(self) -> List[PickItem]:
+        items: List[PickItem] = []
+        for r in self.runs or []:
+            if r.pinned:
+                badge = (self.maps.entry(r.map).get("display") or r.map) if (r.map and getattr(self.maps, "ready", False)) \
+                    else (r.map or "")
+                items.append(PickItem(r.name, r.label or r.name, r.note or r.subtitle or "", "추천 정책", badge))
+        for r in self.runs or []:
+            if not r.pinned:
+                items.append(PickItem(r.name, r.name, r.subtitle or "", "모든 런 (최근 저장 순)"))
+        return items
+
+    def _refresh_policy_picker(self):
+        if hasattr(self, "pick_policy"):
+            self.pick_policy.set_items(self._policy_items())
+            self.pick_policy.set_current(self._selected_run)
+
+    def _refresh_map_picker(self):
+        if not hasattr(self, "pick_map"):
+            return
+        if not getattr(self.maps, "ready", False):
+            self.pick_map.set_items([])
+            self.pick_map.placeholder = "맵 목록 실패" if getattr(self.maps, "error", None) else "맵 목록 읽는 중…"
+            self.pick_map.update()
+            return
+        self.pick_map.placeholder = "맵을 고르세요"
+        # The measured venues first -- the maps the policies are made for -- the Korean ones leading; every other map
+        # (racetracks, generator seeds, gym maps, scenes) after them, searchable
+        ids = self.maps.ids()
+        lead = ("real/korea26", "real/korea26x12", "real/iccas25", "real/icra22")
+        real = [i for i in lead if i in ids] + [i for i in ids if i.startswith("real/") and i not in lead]
+        items: List[PickItem] = []
+        for grp, tid, disp, sub in self._map_rows(real, with_group=False):
+            items.append(PickItem(tid, disp, sub, "대회장 실측 맵"))
+        for grp, tid, disp, sub in self._map_rows([i for i in ids if i not in set(real)], with_group=False):
+            items.append(PickItem(tid, disp, sub, "그 밖의 맵"))
+        self.pick_map.set_items(items)
+        self.pick_map.set_current(self._selected_map)
+
+    def _on_policy_picked(self, name: str):
+        self.run_list.select(name)
+        self._on_run_selected(name)
+
+    def _on_map_picked(self, track_id: str):
+        self._select_map(track_id)
+        self._on_map_selected(track_id)
+
+    def _on_condition_picked(self, key: str):
+        race = key in ("race", "race_props")
+        props = key in ("props", "race_props")
+        self.apply_prefs({"obstacle": "train" if props else "bare", "races": 1, "cars_per_race": 2 if race else 1})
+        if race and hasattr(self, "opp_table"):
+            try:
+                self.opp_table.set_slots(self.COND_OPPONENT)
+            except Exception:
+                pass
+        self._sync_condition()
+        self._update_start_enabled()
+
+    def _sync_condition(self):
+        """The 주행 조건 picker from the hidden controls (a pick's settings, the remembered prefs, a choice above)."""
+        if not hasattr(self, "pick_cond"):
+            return
+        race = self.spin_grid.value() > 1
+        props = self._train_obstacles()
+        key = ("race_props" if props else "race") if race else ("props" if props else "solo")
+        self.pick_cond.set_current(key)
+
+    def _update_hud(self, frame: Optional[dict], sim_rate: Optional[float]):
+        """The right-hand HUD: speed, lap times (timed here from the lap counter and the sim clock), laps, contacts."""
+        if not hasattr(self, "t_speed"):
+            return
+        self.t_rate.set_value(f"{sim_rate:4.2f}" if sim_rate is not None else "—",
+                              None if sim_rate is None or sim_rate > 0.9 else C["warn"])
+        if frame is None:
+            for t in (self.t_speed, self.t_last, self.t_best, self.t_laps, self.t_contact):
+                t.set_value("—")
+            self.t_speed.set_sub("")
+            return
+        f, n = int(frame.get("focus", 0)), int(frame.get("n", 0))
+        self.focus_card.setVisible(n > 1)
+        if not 0 <= f < n:
+            return
+        v = float(frame["vx"][f])
+        key = (self.generation, f)
+        st = self._lapstate
+        if st.get("key") != key:
+            st = self._lapstate = {"key": key, "lap": None, "t0": None, "times": [], "vmax": 0.0}
+        st["vmax"] = max(st["vmax"], v)
+        self.t_speed.set_value(f"{v:4.2f}")
+        self.t_speed.set_sub(f"최고 {st['vmax']:.1f} m/s")
+        lap = int(frame["lap"][f])
+        t = frame.get("t")
+        if st["lap"] is None:
+            st["lap"] = lap
+        elif lap < st["lap"]:                         # the episode was reset
+            st.update(lap=lap, t0=None)
+        elif lap > st["lap"]:
+            # The line was crossed some time before this frame: frames come at the render rate (0.2 s apart when
+            # drawing is slow -- a lap read 6.30 s against the sim's 6.50). The worker sends the env's own clock on
+            # the current lap (`lap_t`), so the crossing is exact to a control step.
+            t_cross = None
+            if t is not None:
+                lt = frame.get("lap_t")
+                t_cross = float(t) - (float(lt[f]) if lt is not None else 0.0)
+            if st["t0"] is not None and t_cross is not None:
+                st["times"].append(t_cross - st["t0"])
+            st["t0"] = t_cross
+            st["lap"] = lap
+        times = st["times"]
+        lt = frame.get("lap_t")
+        self.t_laps.set_sub(f"이번 랩 {float(lt[f]):5.2f} s" if (lt is not None and st["t0"] is not None) else "")
+        self.t_laps.set_value(str(lap))
+        self.t_last.set_value(f"{times[-1]:.2f}" if times else "—")
+        self.t_best.set_value(f"{min(times):.2f}" if times else "—", C["best"] if times else None)
+        s = CT.focus_summary(frame, f)
+        if s is not None:
+            self.t_contact.set_value(str(s.total), {"hard": C["danger"], "graze": C["warn"]}.get(s.level))
+            self.t_contact.set_sub(CT.breakdown_html(s))
+        else:
+            crashed = int((frame["coll"] > 0.5).sum()) if frame.get("coll") is not None else 0
+            self.t_contact.set_value(str(crashed), C["danger"] if crashed else None)
 
     # ---------------------------------------------------------------- header
     def _build_header(self) -> QtWidgets.QWidget:
@@ -1338,9 +1580,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         sc("]", drive_only(lambda: self._step_focus(1)))
         sc("Ctrl+R", drive_only(lambda: self.btn_reset.click() if self.btn_reset.isEnabled() else None))
         sc("Ctrl+.", drive_only(lambda: self.btn_stop.click() if self.btn_stop.isEnabled() else None))
-        sc("Ctrl+F", drive_only(lambda: self.map_list.search.setFocus(QtCore.Qt.ShortcutFocusReason)))
-        sc("S", drive_only(lambda: self._on_screenshot()))
-        sc("R", drive_only(lambda: self._on_record_toggle()))
+        sc("Ctrl+F", drive_only(lambda: self.pick_policy.open_popup()))
         sc("F1", self.show_help)
         sc("H", drive_only(self.show_help))
 
@@ -1357,6 +1597,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         else:
             items = [("", r.name, r.name, r.subtitle) for r in runs]
         self.run_list.set_items(items)
+        self._refresh_policy_picker()
         if not runs:
             self.run_list.set_status(f"{catalog.RUNS_DIR} 에 체크포인트가 있는 런이 없습니다.", "warn")
         self._update_start_enabled()
@@ -1364,7 +1605,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def set_maps(self, cat: MapCatalog):
         self.maps = self._with_local_scenes(cat)
         cat = self.maps
-        self.editor.set_maps(cat)
+        if self.editor is not None:
+            self.editor.set_maps(cat)
         self.map_group.blockSignals(True)
         self.map_group.clear()
         if cat.error:
@@ -1389,6 +1631,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 self.map_group.setCurrentIndex(best)
         self.map_group.blockSignals(False)
         self._refresh_map_list()
+        self._refresh_map_picker()
+        self._refresh_policy_picker()          # pick badges name their maps once the catalogue is here
         if self._pref_map and cat.ready and self._pref_map in set(cat.ids()):
             self._on_map_selected(self._pref_map)      # the map this window was last used with
             self.map_list.select(self._pref_map)
@@ -1526,7 +1770,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if state == STATE_IDLE:
             self._update_start_hint()
             self.btn_pause.settle(False)
-            self.viewport.set_empty_text("맵과 정책 런을 고르고 <b>시작</b>을 누르세요.")
+            self.viewport.set_empty_text("위에서 <b>정책</b>을 고르고 <b>▶ 시작</b>을 누르세요.")
         elif preparing:
             self.status_text.setText(f"준비 중 — {STAGE_TEXT.get(detail, detail or '')}")
             self.viewport.set_empty_text(
@@ -1640,7 +1884,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.dash_panel.v_max = float(facts.get("v_max_policy", 8.0) or 8.0)
         self.dash_panel.clear_grip_estimate()
         self.drive_info.set("추정 μ", "추정 대기")
-        self.viewport.set_corner_text(f"{mp}\n{run}")
+        self.viewport.set_corner_text("")          # 11-02: the top bar names the policy and the map
         self._update_running_note()
 
     def set_gl_info(self, text: str):
@@ -1676,6 +1920,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.m_simrate.set_value(f"{sim_rate:5.2f}" if sim_rate is not None else "—",
                                  None if sim_rate is None or sim_rate > 0.9 else C["warn"])
         self.m_fps.set_value(f"{fps:5.1f}" if fps is not None else "—")
+        self._update_hud(frame, sim_rate)
         if frame_ms is not None:
             p50, p95, mx = frame_ms
             n = self.viewport.rate.count
@@ -1851,13 +2096,17 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         """Driving, training or the environment editor. The full-width pages hide the driving
         panels; they come back with the driving page."""
         key = key if key in self.MODE_INDEX else "drive"
+        if (key == "train" and self.training is None) or (key == "edit" and self.editor is None):
+            key = "drive"                          # 11-02: the driving page is the console
         drive = key == "drive"
         self.mode_buttons.set_current(key)
         self.centre_stack.setCurrentIndex(self.MODE_INDEX[key])
         self.left_panel.setVisible(drive and self.btn_left_panel.isChecked())
         self.right_panel.setVisible(drive and self.btn_right_panel.isChecked())
-        self.training.set_active(key == "train")
-        self.editor.set_active(key == "edit")
+        if self.training is not None:
+            self.training.set_active(key == "train")
+        if self.editor is not None:
+            self.editor.set_active(key == "edit")
         if self.state == STATE_IDLE and hasattr(self, "status_text"):
             if drive:
                 self._update_start_hint()
@@ -2055,6 +2304,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._selected_run = name
         self.sel_run.setText(f"런: {self._run_label(name)}")
         self.sel_run.setToolTip(name)
+        if hasattr(self, "pick_policy"):
+            self.pick_policy.set_current(name)
         # A pick is for one map: select it too, so the policy is driven where it was made for.
         pick = next((r for r in (self.runs or []) if r.name == name and r.pinned and r.map), None)
         if pick is not None:
@@ -2080,6 +2331,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 self.opp_table.set_slots(slots)
             except Exception:
                 pass
+        self._sync_condition()
         self._update_start_enabled()
 
     def _select_map(self, track_id: str) -> bool:
@@ -2095,6 +2347,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
 
     def _on_map_selected(self, name: str):
         self._selected_map = name
+        if hasattr(self, "pick_map"):
+            self.pick_map.set_current(name)
         self._sync_obstacle_options()
         self._on_scenario_changed()
         self._update_start_enabled()
@@ -2404,6 +2658,18 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def restore_prefs(self) -> None:
         from . import prefs
         self.apply_prefs(prefs.load())
+        # 11-02: no longer on screen, so not left on from an old session: the device is the worker's choice (the
+        # biggest card, `sim_worker.auto_device`), and the GPU-heavy explanation overlays stay off
+        self.combo_device.setCurrentIndex(0)
+        self.chk_saliency.setChecked(False)
+        self.chk_internals.setChecked(False)
+        # the road grip as the policies are evaluated: a remembered "fixed 1.2" (no control for it any more) made the
+        # console's laps 3 % faster than every number reported for the same checkpoint (6.32 s against 6.50)
+        i_mu = self.combo_mu.findData(SessionConfig.mu_mode)
+        if i_mu >= 0:
+            self.combo_mu.setCurrentIndex(i_mu)
+        self.spin_mu.setValue(float(SessionConfig.mu))
+        self._sync_condition()
 
     def _train_obstacles(self) -> bool:
         return str(self.combo_obstacle.currentData() or "") == TRAIN_OBSTACLES

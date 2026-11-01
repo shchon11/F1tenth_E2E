@@ -264,7 +264,10 @@ def test_console_remembers_its_settings_between_launches(qapp, tmp_path, monkeyp
     back = ConsoleWindow()
     assert back.spin_grid.value() == 3
     assert back.chk_dr.isChecked() is False
-    assert back.combo_mu.currentData() == "fixed" and abs(back.spin_mu.value() - 0.82) < 1e-6
+    # 11-02: the road grip is no longer a console control; a remembered value goes back to the evaluation default
+    # rather than silently changing every lap time (a stale "fixed 1.2" made laps 3 % fast)
+    from f1sim.viewer.console.protocol import SessionConfig
+    assert back.combo_mu.currentData() == SessionConfig.mu_mode and abs(back.spin_mu.value() - SessionConfig.mu) < 1e-3
     assert abs(back.spin_dial.value() - 0.90) < 1e-6
     assert back._selected_run == str(ckpt)
     assert back._pref_map == "real/map12x16"       # applied when the worker's catalogue arrives

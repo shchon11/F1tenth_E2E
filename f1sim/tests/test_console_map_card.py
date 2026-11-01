@@ -48,7 +48,8 @@ def win(qapp, tmp_path, monkeypatch):
     try:
         yield w
     finally:
-        w.editor.shutdown()
+        if w.editor is not None:                   # 11-02: the console no longer builds the editor page
+            w.editor.shutdown()
         w.deleteLater()
 
 

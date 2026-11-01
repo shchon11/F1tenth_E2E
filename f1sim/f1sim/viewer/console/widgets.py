@@ -375,9 +375,11 @@ class StateBadge(QtWidgets.QLabel):
     def set_state(self, state: str, detail: str = ""):
         glyph, text, colour = self.STYLES.get(state, self.STYLES["IDLE"])
         self.setText(f"{glyph}  {text}" + (f" · {detail}" if detail else ""))
+        q = QtGui.QColor(colour)
+        # 11-02: a pill tinted with the state's colour (14 %), the text in that colour -- no outline
         self.setStyleSheet(
-            f"color: {colour}; background: {C['bg.card']}; border: 1px solid {colour};"
-            f"border-radius: 12px; padding: 3px 12px; font-weight: 600; font-size: {theme.SIZE['label']}px;")
+            f"color: {colour}; background: rgba({q.red()},{q.green()},{q.blue()},36); border: none;"
+            f"border-radius: 14px; padding: 6px 14px; font-weight: 700; font-size: {theme.SIZE['label']}px;")
 
 
 # ---------------------------------------------------------------- filtered pickers

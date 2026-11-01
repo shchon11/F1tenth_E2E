@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional
+from typing import List, Optional
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -96,7 +96,22 @@ def app_icon() -> QtGui.QIcon:
     return icon
 
 
+def register_fonts() -> List[str]:
+    """The bundled fonts (f1sim/assets/fonts: Pretendard, JetBrains Mono; SIL OFL) added to this process's font
+    database, so the console looks the same on any machine whether or not they are installed. Returns the families."""
+    import glob
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))                     # .../f1sim/viewer/console
+    fams: List[str] = []
+    for path in sorted(glob.glob(os.path.join(os.path.dirname(os.path.dirname(here)), "assets", "fonts", "*.[ot]tf"))):
+        fid = QtGui.QFontDatabase.addApplicationFont(path)
+        if fid >= 0:
+            fams += QtGui.QFontDatabase.applicationFontFamilies(fid)
+    return sorted(set(fams))
+
+
 def apply_theme(app: QtWidgets.QApplication) -> None:
+    register_fonts()
     font = QtGui.QFont()
     # Korean text needs a font that has it; DejaVu (the scene's HUD font) does not. Ask for the
     # families we checked are installed and let fontconfig fall back through the rest.

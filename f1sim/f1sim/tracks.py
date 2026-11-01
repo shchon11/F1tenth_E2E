@@ -225,7 +225,7 @@ _REAL: Tuple[Tuple[str, str, str, str], ...] = (
      "pre-competition floor, 15.5 x 7.0 m hairpin loop, from the team's own recordings"),
     ("lab12x16", "map12x16", "실측 12×16 m",
      "pre-competition floor, 12.3 x 16.4 m loop, from the team's own recordings"),
-    ("iccas25", "korea_2025_iccas", "ICCAS 2025",
+    ("iccas25", "korea_2025_iccas", "Korea 2025 (ICCAS)",
      "4th F1TENTH Korea Championship 2025 (ICCAS) race track, team SLAM map"),
     ("korea26x12", "korea_2026_x1p2", "Korea 2026 ×1.2",
      "2026 competition venue scaled x1.2 (lanes and lap 20 % bigger)"),

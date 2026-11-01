@@ -499,6 +499,7 @@ def test_validate_extracts_centerline_and_hands_off(page, scenes_root):
     assert saved["centerline"] is not None
 
 
+@pytest.mark.skip(reason="11-02 console redesign: the window no longer builds the editor page or the S / R shortcuts")
 # ================================================================ window wiring
 def test_window_has_editor_mode_and_hand_off(qapp, scenes_root, monkeypatch):
     from f1sim.viewer.console import window as W
@@ -527,6 +528,7 @@ def test_window_has_editor_mode_and_hand_off(qapp, scenes_root, monkeypatch):
         win.deleteLater()
 
 
+@pytest.mark.skip(reason="11-02 console redesign: the window no longer builds the editor page or the S / R shortcuts")
 def test_driving_shortcuts_are_inert_on_editor_page(qapp, scenes_root):
     from f1sim.viewer.console import window as W
     win = W.ConsoleWindow()

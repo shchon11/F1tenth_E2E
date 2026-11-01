@@ -52,6 +52,10 @@ def _u(M):
 CLEAR_RGB = (0.071, 0.075, 0.086)
 HORIZON_RGB = (0.165, 0.180, 0.205)
 ZENITH_RGB = (0.040, 0.046, 0.060)
+#: The ground (floor quad, the console's apron and its backdrop disc). 11-02: a dark slate -- lit and gamma-encoded,
+#: the old 0.135 grey came out #757575 and washed the scene out against the dark console; white hoses and the coloured
+#: lines read on this one.
+FLOOR_RGBA = (0.042, 0.047, 0.058, 0.0)
 
 # ---------------------------------------------------------------- shaders
 SKY_VS = """
@@ -133,7 +137,7 @@ void main() {
         float w5 = clamp(px, 0.02, 1.2) / 5.0;
         vec2 g5 = abs(fract(v_wpos.xy / 5.0) - 0.5);
         float l5 = smoothstep(0.5 - w5, 0.5, max(g5.x, g5.y)) * (1.0 - smoothstep(0.6, 2.4, px));
-        base += vec3(0.055) * l1 + vec3(0.11) * l5;
+        base += vec3(0.022) * l1 + vec3(0.05) * l5;
     }
     vec3 l = normalize(u_light_dir);
     float nl = max(dot(n, l), 0.0);
@@ -1161,7 +1165,9 @@ def floor_mesh_arrays(bounds, margin=3.0):
     x0, y0, x1, y1 = bounds[0] - margin, bounds[1] - margin, bounds[2] + margin, bounds[3] + margin
     pos = np.array([[x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0]], np.float32)
     nrm = np.tile([0, 0, 1.0], (4, 1)).astype(np.float32)
-    col = np.tile([0.135, 0.140, 0.155, 0.0], (4, 1)).astype(np.float32)
+    # 11-02: a dark slate floor (lit and gamma-encoded, 0.135 came out a light grey #75 that washed the scene out
+    # against the dark console); the white duct hoses and the coloured lines read on it
+    col = np.tile(list(FLOOR_RGBA), (4, 1)).astype(np.float32)
     return pos, nrm, col, np.array([0, 1, 2, 0, 2, 3], np.int32)
 
 
@@ -1251,7 +1257,7 @@ def _fan(poly, z, colour, centre_colour=None):
     return (pos.astype(np.float32), nrm.astype(np.float32), col.astype(np.float32), idx.astype(np.int32))
 
 
-def apron_mesh_arrays(angle, centre, extent, margin=2.5, colour=(0.135, 0.140, 0.155, 0.0)):
+def apron_mesh_arrays(angle, centre, extent, margin=2.5, colour=FLOOR_RGBA):
     """The ground plate, oriented with the track and sized to it rather than to the map file."""
     half = 0.5 * np.asarray(extent, np.float64) + margin
     poly = _rounded_rect(half, radius=min(2.0, 0.18 * float(min(half))))
@@ -1261,7 +1267,7 @@ def apron_mesh_arrays(angle, centre, extent, margin=2.5, colour=(0.135, 0.140, 0
 
 
 def backdrop_mesh_arrays(centre, extent, margin=2.5, segments=64,
-                         inner=(0.135, 0.140, 0.155, 0.0), outer=CLEAR_RGB + (0.0,)):
+                         inner=FLOOR_RGBA, outer=CLEAR_RGB + (0.0,)):
     """A disc under and around the apron whose rim fades to the clear colour.
 
     Without it the ground ends in a hard edge and the eye reads that edge as the extent of the world.

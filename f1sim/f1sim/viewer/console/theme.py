@@ -19,26 +19,34 @@ C = {
     # the panel columns, a card on a panel, and a control raised off a card. They used to span 22
     # points of grey in total, so a card was invisible against the panel it sat on and the whole
     # window read as one flat sheet with text scattered over it.
-    "bg.window": "#0e0e10",
-    "bg.panel": "#121215",
-    "bg.card": "#212128",
-    "bg.raised": "#31313a",
-    "bg.sunken": "#000000",          # inputs and lists: the well a value sits in
-    "bg.viewport": "#101114",
-    "line": "#3a3a45",
-    "line.strong": "#54545f",
-    "text.0": "#f2f2f4",
-    "text.1": "#b6b6c0",
-    "text.2": "#7e7e8a",
-    "accent": "#5aa9ff",
-    "accent.deep": "#1d4b7a",
-    "primary": "#3d6f0b",
-    "primary.hover": "#4c8a10",
-    "primary.line": "#76b900",
+    # 11-02 (the user: "UI 너무 쓰레기야 ... 쌈뽕하게 직관적으로"): a blue-black ramp in the manner of Linear / Raycast /
+    # VS Code dark -- four surfaces a few points apart with a faint cool cast, hairline borders instead of boxes,
+    # one blue accent, green only for the start action and "running".
+    "bg.window": "#0a0c10",
+    "bg.panel": "#0f1218",
+    "bg.card": "#151922",
+    "bg.raised": "#1c212c",
+    "bg.hover": "#252b38",
+    "bg.sunken": "#080a0e",          # inputs and lists: the well a value sits in
+    "bg.viewport": "#0b0d11",
+    "line": "#232834",
+    "line.strong": "#323949",
+    "text.0": "#eef1f6",
+    "text.1": "#a7b0c0",
+    "text.2": "#8a909d",             # 4.6:1 on every surface (was #6b7485, under 4:1)
+    "accent": "#4c8dff",
+    "accent.soft": "#172744",        # a selected row / segment
+    "accent.deep": "#1d3f7a",
+    "accent.fill": "#2f6feb",        # a filled accent button: white text at 4.6:1
+    "accent.fill.hover": "#3d7ef5",
+    "best": "#b98cff",               # the session's best lap: F1's purple
+    "primary": "#1fb866",
+    "primary.hover": "#25cc72",
+    "primary.line": "#1fb866",
     "ego": "#59e6ff",
-    "ok": "#76b900",
-    "warn": "#f0a030",
-    "danger": "#ff5c5c",
+    "ok": "#34d399",
+    "warn": "#f5a524",
+    "danger": "#f04848",
     "rival": "#f2a044",
     # -- contacts, by what was touched (`console.contacts`): the marker at the contact point, the
     # flash on the car and the kind's name on the panel. Saturated and brighter than `rival`, and the
@@ -60,22 +68,24 @@ C = {
 }
 
 # ---------------------------------------------------------------- type
-UI_FONT = "Noto Sans CJK KR"
-MONO_FONT = "DejaVu Sans Mono"
-FONT_FALLBACK = ["Noto Sans CJK KR", "NanumGothic", "Noto Sans", "DejaVu Sans"]
+#: Bundled (f1sim/assets/fonts, SIL OFL; registered by `app.register_fonts`): Pretendard for the Korean UI, JetBrains
+#: Mono for every number that changes while you watch it (fixed-width digits do not jitter).
+UI_FONT = "Pretendard"
+MONO_FONT = "JetBrains Mono"
+FONT_FALLBACK = ["Pretendard", "Noto Sans CJK KR", "NanumGothic", "Noto Sans", "DejaVu Sans"]
 
 #: Type scale. `section` is small on purpose -- a heading reads as a heading through weight,
 #: letter-spacing and colour, not through size, and making it big would compete with the values
 #: underneath it, which are the thing being read.
-SIZE = {"title": 15, "section": 11, "body": 12, "label": 11, "hint": 11,
-        "metric": 27, "metric.sm": 15}
+SIZE = {"title": 15, "section": 11, "body": 13, "label": 12, "hint": 12,
+        "metric": 27, "metric.sm": 15, "hud": 40, "hud.sm": 22}
 
 # ---------------------------------------------------------------- spacing
 SP = (4, 8, 12, 16, 24)
-RADIUS_CTL = 5
-RADIUS_CARD = 8
-MIN_CTL_H = 28
-MAIN_BTN_H = 34
+RADIUS_CTL = 8
+RADIUS_CARD = 12
+MIN_CTL_H = 30
+MAIN_BTN_H = 40
 
 
 def _asset(name: str) -> str:
@@ -284,4 +294,54 @@ QProgressBar::chunk {{ background: {c['accent']}; border-radius: 3px; }}
    centre bar is twelve identical grey rectangles and nothing says which belong together. */
 #BarSep {{ background: {c['line']}; max-width: 1px; min-width: 1px; }}
 QFrame[frameShape="4"] {{ color: {c['line']}; max-height: 1px; }}
+
+/* ---------------------------------------------------------------- 11-02 layout: top bar, pickers, HUD */
+#TopBar {{ background: {c['bg.panel']}; border-bottom: 1px solid {c['line']}; }}
+#Brand {{ font-size: 15px; font-weight: 700; color: {c['text.0']}; letter-spacing: 0.3px; }}
+#BrandMark {{ color: {c['accent']}; font-size: 15px; font-weight: 800; }}
+QPushButton#Picker {{
+    background: {c['bg.raised']}; border: 1px solid {c['line']}; border-radius: 10px;
+    padding: 0px; text-align: left;
+}}
+QPushButton#Picker:hover:!disabled {{ background: {c['bg.hover']}; border-color: {c['line.strong']}; }}
+QPushButton#Picker:pressed:!disabled {{ background: {c['bg.hover']}; border-color: {c['accent']}; }}
+QPushButton#Picker:focus {{ border: 1px solid {c['accent']}; }}
+QPushButton#Picker:disabled {{ background: {c['bg.panel']}; border-color: {c['line']}; }}
+#PickerPopup {{ background: {c['bg.card']}; border: 1px solid {c['line.strong']}; border-radius: 12px; }}
+QLineEdit#PickerSearch {{
+    background: {c['bg.sunken']}; border: 1px solid {c['line']}; border-radius: 8px;
+    padding: 8px 12px; font-size: 13px;
+}}
+QLineEdit#PickerSearch:focus {{ border: 1px solid {c['accent']}; padding: 8px 12px; }}
+QListView#PickerList {{ background: transparent; border: none; outline: none; }}
+QPushButton#StartButton {{
+    background: {c['accent.fill']}; border: 1px solid {c['accent.fill']}; color: #ffffff;
+    font-size: 14px; font-weight: 700; border-radius: 10px; padding: 0px 22px; min-height: 26px;
+}}
+QPushButton#StartButton:hover:!disabled {{ background: {c['accent.fill.hover']}; border-color: {c['accent.fill.hover']}; }}
+QPushButton#StartButton:disabled {{ background: {c['bg.raised']}; border-color: {c['line']}; color: {c['text.2']}; }}
+/* Neutral, not red: in this window red means a car contact. */
+QPushButton#StopButton {{
+    background: {c['bg.raised']}; border: 1px solid {c['line.strong']}; color: {c['text.0']};
+    font-size: 14px; font-weight: 700; border-radius: 10px; padding: 0px 18px; min-height: 26px;
+}}
+QPushButton#StopButton:hover:!disabled {{ background: {c['bg.hover']}; border-color: {c['text.2']}; }}
+QPushButton#StopButton:disabled {{ color: {c['text.2']}; border-color: {c['line']}; }}
+QPushButton#IconButton {{
+    background: {c['bg.raised']}; border: 1px solid {c['line']}; border-radius: 10px;
+    padding: 0px 12px; font-size: 13px; font-weight: 600; color: {c['text.1']}; min-height: 26px;
+}}
+QPushButton#IconButton:hover:!disabled {{ background: {c['bg.hover']}; color: {c['text.0']}; }}
+QPushButton#IconButton:checked {{ background: {c['accent.soft']}; border-color: {c['accent']}; color: {c['text.0']}; }}
+QPushButton#IconButton:disabled {{ color: {c['text.2']}; background: {c['bg.panel']}; }}
+#Hud {{ background: {c['bg.panel']}; border-left: 1px solid {c['line']}; }}
+#Tile {{ background: {c['bg.card']}; border: 1px solid {c['line']}; border-radius: 12px; }}
+#TileCaption {{ font-size: 11px; font-weight: 600; color: {c['text.2']}; letter-spacing: 0.8px; }}
+#TileValue {{ font-family: "{MONO_FONT}", monospace; font-size: {SIZE['hud.sm']}px; font-weight: 600; color: {c['text.0']}; }}
+#TileValueBig {{ font-family: "{MONO_FONT}", monospace; font-size: {SIZE['hud']}px; font-weight: 600; color: {c['text.0']}; }}
+#TileUnit {{ font-size: 12px; color: {c['text.2']}; }}
+#TileSub {{ font-family: "{MONO_FONT}", monospace; font-size: 12px; color: {c['text.1']}; }}
+#Viewport {{ border: none; }}
+#Chip {{ font-family: "{MONO_FONT}", monospace; font-size: 12px; color: {c['text.1']}; }}
+#StatusBar QLabel {{ font-size: 12px; color: {c['text.2']}; }}
 """
