@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--stage", default="solo", choices=("solo", "props", "race"))
     ap.add_argument("--envs", type=int, default=1024)
     ap.add_argument("--warps", type=int, default=16)
+    ap.add_argument("--tracks", default="", help="base maps (state_rl --tracks); default: the teacher's")
     ap.add_argument("--beams", type=int, default=1081)
     ap.add_argument("--episode-s", type=float, default=40.0)
     ap.add_argument("--iters", type=int, default=40)
@@ -98,6 +99,8 @@ def main():
     if state_rl.plan_of(a):
         a.plan_lookahead, a.plan_horizon = ck["args"].get("plan_lookahead", 0.235), ck["args"].get("plan_horizon", 0.6)
         a.repeat = int(ck["args"].get("repeat", a.repeat))
+    # the teacher's map (11-01: one PPO teacher per map): the student learns where its teacher was trained
+    a.tracks = a.tracks or str(ck["args"].get("tracks", "") or "")
     A = state_rl.act_dim_of(a)
     env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=int(a.frames), scan_stride=int(a.stride)))
     from .graph_runtime import prepare_graph_runtime
@@ -244,7 +247,8 @@ def evaluate_student():
     rows = []
 
     def run(race_kind, seed, envs):
-        trs, rls = common.load_tracks([state_rl.KOREA], racelines=race_kind is not None, **dict(limits, objective="min_time"))
+        bases = [t for t in str(ck["args"].get("tracks", "") or state_rl.KOREA).split(",") if t]   # the checkpoint's maps
+        trs, rls = common.load_tracks(bases, racelines=race_kind is not None, **dict(limits, objective="min_time"))
         cfg = Config(); cfg.sim.compile = False; cfg.lidar.n_beams = n_beams
         cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0); cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
         e = dict(action_mode="direct", max_steps=int(a.steps), speed_cap=10.0, v_max_policy=10.0, collision_mode="soft",

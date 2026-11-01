@@ -1166,6 +1166,7 @@ def evaluate(a):
         # a plan checkpoint drives through the follower it was trained with, whatever this command line says
         for k in ("action", "plan_lookahead", "plan_horizon", "repeat"):
             setattr(a, k, ck["args"].get(k, getattr(a, k)))
+    a.tracks = a.tracks or str(ck["args"].get("tracks", "") or "")       # the map it was trained on, unless --tracks says
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)

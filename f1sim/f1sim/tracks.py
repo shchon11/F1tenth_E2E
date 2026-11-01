@@ -227,12 +227,8 @@ _REAL: Tuple[Tuple[str, str, str, str], ...] = (
      "pre-competition floor, 12.3 x 16.4 m loop, from the team's own recordings"),
     ("iccas25", "korea_2025_iccas", "ICCAS 2025",
      "4th F1TENTH Korea Championship 2025 (ICCAS) race track, team SLAM map"),
-    ("gen-wide", "gen_wide", "생성 · 넓은 맵",
-     "Generated F1TENTH-style venue (duct-finger serpentine after the ICRA 2025 track): wide lanes 1.7-2.7 m, 51 m lap"),
-    ("gen-narrow", "gen_narrow", "생성 · 좁고 어려운 맵",
-     "Generated F1TENTH-style venue (duct-finger serpentine after the ICRA 2025 track): narrow lanes 0.9-1.3 m, 57 m lap"),
-    ("gen-mixed", "gen_mixed", "생성 · 넓고 좁은 곳이 섞인 맵",
-     "Generated F1TENTH-style venue (duct-finger serpentine after the ICRA 2025 track): 1.1 m and 2.7 m pockets, 55 m lap"),
+    ("korea26x12", "korea_2026_x1p2", "Korea 2026 ×1.2",
+     "2026 competition venue scaled x1.2 (lanes and lap 20 % bigger)"),
 )
 
 #: The racetrack directories of `external/f1tenth_racetracks`, so an id resolves with the submodule

@@ -57,12 +57,10 @@ REAL = {
                  "pre-competition floor, 15.5 x 7.0 m hairpin loop, from the team's own recordings"),
     "map12x16": (os.path.join(ASSET_MAPS, "map12x16.yaml"), "duct", 0.35,
                  "pre-competition floor, 12.3 x 16.4 m loop, from the team's own recordings"),
-    # `f1sim.mapgen` (11-01): venue-style maps made from the competition references, not measured
-    "gen_wide": (os.path.join(ASSET_MAPS, "generated", "gen_wide.yaml"), "duct", 0.35, "Generated F1TENTH-style venue (duct-finger serpentine after the ICRA 2025 track): wide lanes 1.7-2.7 m, 51 m lap"),
-    # `f1sim.mapgen` (11-01): venue-style maps made from the competition references, not measured
-    "gen_narrow": (os.path.join(ASSET_MAPS, "generated", "gen_narrow.yaml"), "duct", 0.3, "Generated F1TENTH-style venue (duct-finger serpentine after the ICRA 2025 track): narrow lanes 0.9-1.3 m, 57 m lap"),
-    # `f1sim.mapgen` (11-01): venue-style maps made from the competition references, not measured
-    "gen_mixed": (os.path.join(ASSET_MAPS, "generated", "gen_mixed.yaml"), "duct", 0.35, "Generated F1TENTH-style venue (duct-finger serpentine after the ICRA 2025 track): 1.1 m and 2.7 m pockets, 55 m lap"),
+    # The 2026 venue 20 % bigger (11-01, the user: "Korea 2026 ... 스케일링 조금"): the same grid read at 0.06 m a cell,
+    # so the lanes, the walls and the lap all grow by 1.2 while the car does not. Clearance scaled with it.
+    "korea_2026_x1p2": (os.path.join(ASSET_MAPS, "korea_2026_x1p2.yaml"), "duct", 0.42,
+                        "2026 competition venue scaled x1.2 (lanes and lap 20 % bigger)"),
     "korea_2025_iccas": (os.path.join(KOR, "KORA_K3", "src", "kora_k3", "maps", "real.yaml"), "duct", 0.35, "4th F1TENTH Korea Championship 2025 (ICCAS) race track, team SLAM map", (3.0, 0.0), 0.05,
                          dict(keep_region=True, unknown_floor_depth=5.0)),   # raw SLAM: spray, specks. The outline is a hose too
                                                                               # (track built from ducts in a bigger hall): floor beyond
