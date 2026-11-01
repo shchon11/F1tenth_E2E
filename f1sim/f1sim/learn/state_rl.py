@@ -739,16 +739,23 @@ def apply_plan_spec(env, ar) -> None:
         inner.spec = dataclasses.replace(inner.spec, wp_horizon_s=float(_ar(ar).get("plan_horizon", 0.6) or 0.6))
 
 
-#: `--plan-relabel`: the plan is compared with the driven path over [0, RELABEL_EXT * L] -- the plan and the stretch
-#: past its end that MAP aims into (L1 = 1.2-1.4 L at 4-9 m/s) and the console draws (its 0.6 s walk, ~2 L) --
-#: at RELABEL_PTS points per L, and its speed at the WP_K waypoints
-RELABEL_EXT = 2
+#: `--plan-relabel`: the plan is compared with the driven path at RELABEL_PTS points per plan length L, over the
+#: RELABEL_SPAN_S of planned travel the console draws (the tracker's 0.6 s reference walk): [0, 2 L] for a 0.3 s plan,
+#: whose last stretch MAP aims into (L1 = 1.2-1.4 L at 4-9 m/s), [0, L] for a 0.6 s one; and at its WP_K waypoints'
+#: speeds. The driven path is read over RELABEL_WINDOW_S, twice the span, so a braking car still covers it
 RELABEL_PTS = 8
+RELABEL_SPAN_S = 0.6
+RELABEL_WINDOW_S = 1.2
 
 
-def plan_relabel_targets(env, pose_s, d_s, vm, acts, R, window_s=0.8):
+def relabel_ext(spec) -> int:
+    """plan lengths the relabel compares over: the console's 0.6 s walk in units of this spec's plan"""
+    return max(1, int(round(RELABEL_SPAN_S / float(spec.wp_horizon_s))))
+
+
+def plan_relabel_targets(env, pose_s, d_s, vm, acts, R, window_s=RELABEL_WINDOW_S):
     """`--plan-relabel` (11-01): for each decision, the path the car then DROVE, in the body frame of the pose its plan
-    was issued from, at arc lengths j L / RELABEL_PTS (j = 1 .. RELABEL_EXT RELABEL_PTS), and its speed where it passed
+    was issued from, at arc lengths j L / RELABEL_PTS (j = 1 .. relabel_ext RELABEL_PTS), and its speed where it passed
     the plan's waypoints (k L / WP_K). `relabel_loss` pulls the mean plan onto them.
 
     Why: MAP steers by one point of the plan and reads its speed at one point, so the rest of the plan is free, and the
@@ -760,8 +767,9 @@ def plan_relabel_targets(env, pose_s, d_s, vm, acts, R, window_s=0.8):
     pose_s (T R + 1, B, 4): x, y, yaw, v before every control step and after the last; d_s (T R, B): an episode ended
     in that step; vm (T, B): the odometry speed each plan was decoded at; acts (T, B, A): the sampled actions.
     Returns points (T, B, n, 2), speeds (T, B, WP_K), a (T, B) mask -- the next `window_s` inside this rollout and one
-    episode, and the car covered RELABEL_EXT L in it -- and, over the masked rows, the executed plans' farthest point
-    from the driven path on [0, L] and on [0, RELABEL_EXT L] [m]."""
+    episode, and the car covered the compared span in it -- and, over the masked rows, the executed plans' farthest
+    point from the driven path on [0, L] and on the whole span [m]. (11-02: a 0.8 s window and [0, 2 L] under a 0.6 s
+    plan left 0-6 % of the decisions valid -- 1.2 s of travel never fits in 0.8 s.)"""
     from .. import mpc
     inner = env.tracker._inner if hasattr(env.tracker, "_inner") else env.tracker
     spec, v_max = inner.spec, float(inner.v_max)
@@ -769,7 +777,8 @@ def plan_relabel_targets(env, pose_s, d_s, vm, acts, R, window_s=0.8):
     T = (S1 - 1) // R
     Wn = int(round(window_s / float(env.sim.control_dt)))
     dev, dt_ = pose_s.device, pose_s.dtype
-    n = RELABEL_EXT * RELABEL_PTS
+    ext = relabel_ext(spec)
+    n = ext * RELABEL_PTS
     pts = torch.zeros(T, B, n, 2, device=dev); vks = torch.zeros(T, B, mpc.WP_K, device=dev)
     msk = torch.zeros(T, B, device=dev)
     cap = torch.full((B,), float(env.ecfg.speed_cap), device=dev, dtype=dt_)
@@ -787,7 +796,7 @@ def plan_relabel_targets(env, pose_s, d_s, vm, acts, R, window_s=0.8):
         arc = torch.cat([torch.zeros(B, 1, device=dev, dtype=dt_),
                          torch.cumsum(torch.hypot(bx.diff(dim=1), by.diff(dim=1)), 1)], 1).contiguous()
         L = mpc.plan_length(vm[t], spec)
-        ok &= arc[:, -1] >= RELABEL_EXT * L
+        ok &= arc[:, -1] >= ext * L
 
         def at(q, val):                                                        # val (B, Wn + 1) at arc lengths q (B, m)
             idx = torch.searchsorted(arc, q.contiguous()).clamp(1, Wn)
@@ -802,7 +811,7 @@ def plan_relabel_targets(env, pose_s, d_s, vm, acts, R, window_s=0.8):
         vks[t] = at(fk, win[:, :, 3].T.contiguous()).clamp_min(0.0)
         msk[t] = ok.float()
         k_exe, _, _ = mpc.decode_wp4(acts[t], vm[t], v_max, cap, spec)
-        px, py, _, _, _ = mpc.wp4_path(k_exe, L, spec, extend=float(RELABEL_EXT))
+        px, py, _, _, _ = mpc.wp4_path(k_exe, L, spec, extend=float(ext))
         e = torch.hypot(px[:, gi] - tx, py[:, gi] - ty)
         d1.append(e[:, :RELABEL_PTS].amax(1)[ok]); d2.append(e.amax(1)[ok])
     cat = lambda xs: torch.cat(xs) if xs else torch.zeros(0, device=dev)
@@ -817,7 +826,7 @@ def relabel_loss(env, mean, vm, pts, vks, w_speed=0.0):
     spec, v_max = inner.spec, float(inner.v_max)
     cap = torch.full_like(vm, float(env.ecfg.speed_cap))
     k, L, v = mpc.decode_wp4(mean, vm, v_max, cap, spec)
-    px, py, _, _, _ = mpc.wp4_path(k, L, spec, extend=float(RELABEL_EXT))
+    px, py, _, _, _ = mpc.wp4_path(k, L, spec, extend=float(pts.shape[1] // RELABEL_PTS))
     gi = torch.arange(1, pts.shape[1] + 1, device=mean.device) * (spec.wp_grid // RELABEL_PTS)
     e_pos = (px[:, gi] - pts[..., 0]).square() + (py[:, gi] - pts[..., 1]).square()
     return e_pos.mean(1) + float(w_speed) * (v - vks).square().mean(1)
@@ -1262,7 +1271,7 @@ def train(a):
                   f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 경주 정책 몫 {stats['policy_share']:.2f} | 죽은 결정 속도 {stats['dead_speed'] * 100:.0f} % 조향 {stats['dead_steer'] * 100:.0f} % | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s"
                   + (f" | 계획-실제 길 어긋남 [0,L] 중앙 {stats['plan_vs_driven_m']:.2f} p90 {stats['plan_vs_driven_p90_m']:.2f} m, "
-                     f"[0,2L] 중앙 {stats['plan2L_vs_driven_m']:.2f} m (유효 {stats['relabel_valid'] * 100:.0f} %)"
+                     f"그리는 길이 전체 중앙 {stats['plan2L_vs_driven_m']:.2f} m (유효 {stats['relabel_valid'] * 100:.0f} %)"
                      if relabel and stats.get("plan_vs_driven_m") is not None else ""),
                   flush=True)
         if u % int(a.save_every) == 0 or u == upd0 + int(a.updates):
