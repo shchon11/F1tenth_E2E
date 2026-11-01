@@ -36,6 +36,12 @@ ap.add_argument("--images", type=int, default=6)
 ap.add_argument("--stuck-images", type=int, default=0, help="pictures of the first stretch per race where my car stands (|v| < 0.5 m/s) > 3 s")
 ap.add_argument("--dip-images", type=int, default=0, help="pictures of the first dip per race: my speed < 0.3 m/s while the opponent "
                 "is 2-12 m ahead and moving > 1 m/s (11-01: stop-go behind slow cars)")
+ap.add_argument("--hit-images", type=int, default=0, help="pictures of hard car hits (impact >= 1.5 m/s): 3 s before to 1 s after")
+ap.add_argument("--noise", type=int, default=0, help="state_rl checkpoint only: drive with the training's exploration (AR(1) noise at the "
+                "policy's std, its noise_corr) instead of the mean action -- what PPO's advantages see (11-01)")
+ap.add_argument("--seed", type=int, default=0, help="--noise: the noise seed")
+ap.add_argument("--noise-floor", type=float, nargs=2, default=None, help="--noise: the std floor (steer, speed) instead of the checkpoint's "
+                "(11-01: a policy trained before --std-floor driven with the floor's noise)")
 ap.add_argument("--tracker", default="map", help="planner:KIND only: the planner's path follower, map or pp")
 ap.add_argument("--opp-slot", default="", help="JSON merged into the world's opponent slot (e.g. the school world's slow cars)")
 a0 = ap.parse_args()
@@ -79,22 +85,40 @@ else:
 opp = env.sim.other_idx[lid][:, 0]
 act = torch.zeros(env.B, env.act_dim, device=dev); last = torch.zeros(B, 2, device=dev)
 N = int(a0.steps)
-rec = {k: np.zeros((N, B), np.float32) for k in ("gap", "v", "vo", "lat", "lato", "hw", "cmd", "gate", "x", "y", "xo", "yo", "contact", "steer", "yaw")}
+rec = {k: np.zeros((N, B), np.float32) for k in ("gap", "v", "vo", "lat", "lato", "hw", "cmd", "gate", "x", "y", "xo", "yo", "contact", "steer", "yaw",
+                                                 "phit")}
+phit = torch.zeros(B, device=dev)
 gate = torch.ones(B, device=dev)
 tr = env.sim.track
 touching = torch.zeros(B, dtype=torch.bool, device=dev)
 ext_ = float(env.ecfg.reverse_ext); rev_v = float(env.ecfg.reverse_speed)
+al_n = float(ck["args"].get("noise_corr", 0.0) or 0.0) if is_teacher else 0.0
+if is_teacher and a0.noise:
+    print(f"[잡음] 상관 {al_n}, 정책 표준편차 {tp.net.dist(tp.nrm(tp.o)).stddev[0].tolist()}, 바닥 {a0.noise_floor}", flush=True)
+eps_n = torch.zeros(B, 2, device=dev); gen_n = torch.Generator(device=dev); gen_n.manual_seed(int(a0.seed))
 with torch.no_grad():
     for t in range(N):
         if not is_teacher:
             st_run.observe()
         if t % R == 0:
-            if is_teacher:
+            if is_teacher and a0.noise:
+                tp.o = tp.sobs(last)
+                dist_ = tp.net.dist(tp.nrm(tp.o))
+                eps_n = al_n * eps_n + math.sqrt(1.0 - al_n * al_n) * torch.randn(eps_n.shape, device=dev, generator=gen_n)
+                sd_ = dist_.stddev if a0.noise_floor is None else torch.maximum(dist_.stddev, torch.tensor(a0.noise_floor, device=dev))
+                a_pol = state_rl.clamp_act(dist_.mean + sd_ * eps_n, tp.ext)
+                a_ = tp.mix(a_pol, last) if tp.mix is not None else a_pol
+                if getattr(tp, "mix", None) is not None:
+                    gate = tp.mix.gate.float()
+            elif is_teacher:
                 a_ = tp(last)
                 if getattr(tp, "mix", None) is not None:
                     gate = tp.mix.gate.float()
             else:
                 a_ = st_run(obs, egov(obs))
+            if is_teacher and not planner:
+                # the race policy's own hit head: P(a hard hit within its horizon | s) -- what it believes about this moment
+                phit = torch.sigmoid(tp.net.value_and_hit(tp.nrm(tp.o))[1])
             act[lid] = a_; last = a_
         obs, r_, te, trc, info = env.step(act)
         rem.step()
@@ -109,7 +133,7 @@ with torch.no_grad():
         a1 = a_[:, 1].clamp(-1.0 - ext_, 1.0)
         rec["cmd"][t] = torch.where(a1 < -1.0, -rev_v * (-(a1 + 1.0) / max(ext_, 1e-6)),
                                     (a1 + 1.0) / 2 * float(env.ecfg.v_max_policy)).cpu().numpy()
-        rec["gate"][t] = gate.cpu().numpy()
+        rec["gate"][t] = gate.cpu().numpy(); rec["phit"][t] = phit.cpu().numpy()
         rec["steer"][t] = np.degrees((a_[:, 0].clamp(-1, 1) * float(env.s_max)).cpu().numpy()); rec["yaw"][t] = st[lid, 2].cpu().numpy()
         rec["x"][t] = st[lid, 0].cpu().numpy(); rec["y"][t] = st[lid, 1].cpu().numpy()
         rec["xo"][t] = st[opp, 0].cpu().numpy(); rec["yo"][t] = st[opp, 1].cpu().numpy()
@@ -233,7 +257,7 @@ for i in range(B):
         else:
             k += 1
 print(f"[서 있음] 전체: 3 s 넘게 선 구간 {n_stuck}개, 합 {t_stuck:.1f} s / {B}경기 x {N * dt:.0f} s", flush=True)
-def scene_pic(i, t, t1, fname, what):
+def scene_pic(i, t, t1, fname, what, tc=None, win=3.0):
     """the map +-3 m around my car where the window [t, t1) starts (blue box = start, red = end, purple = the opponent) and the time
     series from 2 s before to 1 s after: speed / command, steer command, lateral position / half width, gate / car contact"""
     t0 = max(0, t - int(2.0 / dt))
@@ -249,12 +273,14 @@ def scene_pic(i, t, t1, fname, what):
         ax.plot(x_ + box[:, 0] * c - box[:, 1] * s_, y_ + box[:, 0] * s_ + box[:, 1] * c, color=col, lw=1.5)
     ax.plot(rec["xo"][t0:t1, i], rec["yo"][t0:t1, i], "-", color="purple", lw=0.8)
     ax.plot(rec["xo"][t, i], rec["yo"][t, i], "s", color="purple", ms=6)
-    cx, cy = rec["x"][t, i], rec["y"][t, i]
-    ax.set_xlim(cx - 3, cx + 3); ax.set_ylim(cy - 3, cy + 3); ax.set_aspect("equal")
+    if tc is not None:                                           # the moment the map is centred on (a hit), marked in red
+        ax.plot(rec["xo"][tc, i], rec["yo"][tc, i], "s", color="red", ms=6)
+    cx, cy = rec["x"][t if tc is None else tc, i], rec["y"][t if tc is None else tc, i]
+    ax.set_xlim(cx - win, cx + win); ax.set_ylim(cy - win, cy + win); ax.set_aspect("equal")
     ax.set_title(f"경기 {i}: {t * dt:.1f}~{t1 * dt:.1f} s {what} | 파랑 = 시작, 빨강 = 끝, 보라 = 상대(시작 때 간격 {rec['gap'][t, i]:+.1f} m)", fontsize=9)
     tt = np.arange(t0, min(t1 + int(1.0 / dt), N)) * dt; sl = slice(t0, min(t1 + int(1.0 / dt), N))
     for r, (keys_, lab) in enumerate(((("v", "cmd", "vo"), "속도 m/s: 나 / 내 명령 / 상대"), (("steer",), "조향 명령 도 (왼쪽 +)"),
-                                      (("lat", "hw", "lato"), "옆 위치 m (왼쪽 +): 나 / 트랙 반폭 ± / 상대"), (("gate", "contact"), "경주 정책이 몲 / 차 접촉"))):
+                                      (("lat", "hw", "lato"), "옆 위치 m (왼쪽 +): 나 / 트랙 반폭 ± / 상대"), (("gate", "contact", "phit"), "경주 정책이 몲 / 차 접촉 / 충돌 예측"))):
         axr = fig.add_subplot(4, 2, 2 * r + 2)
         for kk, col in zip(keys_, ("tab:blue", "tab:gray", "purple")):
             y = rec[kk][sl, i]
@@ -291,6 +317,13 @@ dip[:80] = False
 on = dip & ~np.vstack([np.zeros((1, B), bool), dip[:-1]])
 print(f"[멈칫] 전체: 상대가 2~12 m 앞에서 1 m/s 넘게 가는데 내 속도 < 0.3 m/s로 떨어진 횟수 {int(on.sum())} / {B}경기 x {N * dt:.0f} s, "
       f"그 시간 {dip.sum() * dt:.1f} s", flush=True)
+if is_teacher and not planner:
+    beh = (rec["gap"] > 2.0) & (rec["gap"] < 12.0) & (rec["vo"] > 1.0); beh[:80] = False
+    clos = beh & (rec["v"] > rec["vo"] + 1.0)
+    far = (np.abs(rec["gap"]) > 20.0); far[:80] = False
+    md = lambda m: float(np.median(rec["phit"][m])) if m.any() else float("nan")
+    print(f"[충돌 예측] 상대 2~12 m 앞(1 m/s 넘게 감) {beh.mean() * 100:.0f} % 시간: 중앙 {md(beh):.3f}, 그중 1 m/s 넘게 다가갈 때 {md(clos):.3f} "
+          f"(p90 {np.quantile(rec['phit'][clos], 0.9) if clos.any() else float('nan'):.3f}) | 상대 20 m 넘게 떨어짐 {md(far):.3f} | 실제 강한 차 충돌 {int(rec['contact'].sum())}회", flush=True)
 n_dp = 0
 for i in range(B):
     if n_dp >= int(a0.dip_images):
@@ -304,7 +337,20 @@ for i in range(B):
     scene_pic(i, t, max(t1, t + 1), f"dip_{n_dp:02d}.png", f"멈칫 ({(t1 - t) * dt:.1f} s, 최저 {rec['v'][t:t1 + 1, i].min():+.1f} m/s)")
     print(f"[멈칫] 경기 {i}: {t * dt:.1f} s, 자리 ({rec['x'][t, i]:.2f}, {rec['y'][t, i]:.2f}), 간격 {rec['gap'][t, i]:+.1f} m, 상대 {rec['vo'][t, i]:.1f} m/s, "
           f"직전 1 s 명령 {rec['cmd'][max(0, t - 40):t, i].min():+.1f}~{rec['cmd'][max(0, t - 40):t, i].max():+.1f} m/s, "
-          f"조향 {rec['steer'][max(0, t - 40):t, i].min():+.0f}~{rec['steer'][max(0, t - 40):t, i].max():+.0f}도, 경주 정책 {rec['gate'][max(0, t - 40):t, i].mean():.2f}", flush=True)
+          f"조향 {rec['steer'][max(0, t - 40):t, i].min():+.0f}~{rec['steer'][max(0, t - 40):t, i].max():+.0f}도, 경주 정책 {rec['gate'][max(0, t - 40):t, i].mean():.2f}, "
+          f"충돌 예측 직전 1 s 최고 {rec['phit'][max(0, t - 40):t, i].max():.2f}", flush=True)
     n_dp += 1
+# hard car hits: how a pass (or a follow) ends in a hit -- the 3 s before, both cars, the gap and the commands
+n_h = 0
+for i in range(B):
+    for t in np.nonzero(rec["contact"][:, i] > 0)[0]:
+        if n_h >= int(a0.hit_images):
+            break
+        t = int(t); t0 = max(0, t - int(3.0 / dt))
+        scene_pic(i, t0, t + 1, f"hit_{n_h:02d}.png", f"차 충돌 {t * dt:.1f} s (빨강 = 닿을 때)", tc=t, win=5.0)
+        print(f"[차 충돌] 경기 {i}: {t * dt:.1f} s, 자리 ({rec['x'][t, i]:.2f}, {rec['y'][t, i]:.2f}), 3 s 전 간격 {rec['gap'][t0, i]:+.1f} → {rec['gap'][t, i]:+.1f} m, "
+              f"옆 위치 나 {rec['lat'][t0, i]:+.2f} → {rec['lat'][t, i]:+.2f}, 상대 {rec['lato'][t0, i]:+.2f} → {rec['lato'][t, i]:+.2f} m, 속도 나 {rec['v'][t, i]:.1f} 상대 {rec['vo'][t, i]:.1f} m/s, "
+              f"직전 1 s 명령 {rec['cmd'][max(0, t - 40):t, i].min():+.1f}~{rec['cmd'][max(0, t - 40):t, i].max():+.1f} m/s, 충돌 예측 최고 {rec['phit'][max(0, t - 40):t + 1, i].max():.2f}", flush=True)
+        n_h += 1
 np.savez_compressed(os.path.join(a0.out, "rec.npz"), dt=dt, **rec)
 print("saved", a0.out)
