@@ -8,6 +8,7 @@
 사용: python follow_scenes.py CKPT --like RACE_JSON --out DIR [--envs 32 --steps 1600]
 CKPT 대신 planner:KIND(forzaeth / forzaeth_pred / lane_switch / raceline)면 그 플래너가 내 차를 몬다(11-01: 이 세계에서 앞지르기가
 가능한지 — 참 상태(GT) 오라클, MAP 추종기; `--tracker pp`면 순수 추종). 앞지름 수 = 간격 부호가 5 m 안에서 +에서 −로 바뀐 횟수(따라가기 구간 없이 바로 지나간 것 포함).
+`--stuck-images N`: 3 s 넘게 선 구간 그림, `--dip-images N`: 상대가 2~12 m 앞에서 가는데 내가 0.3 m/s 아래로 선 순간(멈칫) 그림. 기록 전체는 DIR/rec.npz.
 """
 from __future__ import annotations
 
@@ -33,6 +34,8 @@ ap.add_argument("--envs", type=int, default=32)
 ap.add_argument("--steps", type=int, default=1600)
 ap.add_argument("--images", type=int, default=6)
 ap.add_argument("--stuck-images", type=int, default=0, help="pictures of the first stretch per race where my car stands (|v| < 0.5 m/s) > 3 s")
+ap.add_argument("--dip-images", type=int, default=0, help="pictures of the first dip per race: my speed < 0.3 m/s while the opponent "
+                "is 2-12 m ahead and moving > 1 m/s (11-01: stop-go behind slow cars)")
 ap.add_argument("--tracker", default="map", help="planner:KIND only: the planner's path follower, map or pp")
 ap.add_argument("--opp-slot", default="", help="JSON merged into the world's opponent slot (e.g. the school world's slow cars)")
 a0 = ap.parse_args()
@@ -80,6 +83,7 @@ rec = {k: np.zeros((N, B), np.float32) for k in ("gap", "v", "vo", "lat", "lato"
 gate = torch.ones(B, device=dev)
 tr = env.sim.track
 touching = torch.zeros(B, dtype=torch.bool, device=dev)
+ext_ = float(env.ecfg.reverse_ext); rev_v = float(env.ecfg.reverse_speed)
 with torch.no_grad():
     for t in range(N):
         if not is_teacher:
@@ -101,7 +105,10 @@ with torch.no_grad():
         rec["v"][t] = st[lid, 3].cpu().numpy(); rec["vo"][t] = st[opp, 3].cpu().numpy()
         rec["lat"][t] = res.lateral[lid].cpu().numpy(); rec["lato"][t] = res.lateral[opp].cpu().numpy()
         rec["hw"][t] = tr.sample_edt(xy_c[:, None], env.sim.tid[lid][:, None])[:, 0].cpu().numpy()
-        rec["cmd"][t] = (a_[:, 1].clamp(-1, 1) + 1).cpu().numpy() / 2 * float(env.ecfg.v_max_policy)
+        # the commanded speed as the env maps it, reverse included (11-01: clamp(-1, 1) showed reverse commands as 0)
+        a1 = a_[:, 1].clamp(-1.0 - ext_, 1.0)
+        rec["cmd"][t] = torch.where(a1 < -1.0, -rev_v * (-(a1 + 1.0) / max(ext_, 1e-6)),
+                                    (a1 + 1.0) / 2 * float(env.ecfg.v_max_policy)).cpu().numpy()
         rec["gate"][t] = gate.cpu().numpy()
         rec["steer"][t] = np.degrees((a_[:, 0].clamp(-1, 1) * float(env.s_max)).cpu().numpy()); rec["yaw"][t] = st[lid, 2].cpu().numpy()
         rec["x"][t] = st[lid, 0].cpu().numpy(); rec["y"][t] = st[lid, 1].cpu().numpy()
@@ -226,19 +233,9 @@ for i in range(B):
         else:
             k += 1
 print(f"[서 있음] 전체: 3 s 넘게 선 구간 {n_stuck}개, 합 {t_stuck:.1f} s / {B}경기 x {N * dt:.0f} s", flush=True)
-n_st = 0
-for i in range(B):
-    if n_st >= int(a0.stuck_images):
-        break
-    slow = np.abs(rec["v"][:, i]) < 0.5
-    t = 40
-    while t < N and not (slow[t] and slow[t:t + int(3.0 / dt)].all() and t + int(3.0 / dt) <= N):
-        t += 1
-    if t >= N:
-        continue
-    t1 = t
-    while t1 < N and slow[t1]:
-        t1 += 1
+def scene_pic(i, t, t1, fname, what):
+    """the map +-3 m around my car where the window [t, t1) starts (blue box = start, red = end, purple = the opponent) and the time
+    series from 2 s before to 1 s after: speed / command, steer command, lateral position / half width, gate / car contact"""
     t0 = max(0, t - int(2.0 / dt))
     fig = plt.figure(figsize=(17, 8), dpi=80)
     ax = fig.add_subplot(1, 2, 1)
@@ -254,20 +251,60 @@ for i in range(B):
     ax.plot(rec["xo"][t, i], rec["yo"][t, i], "s", color="purple", ms=6)
     cx, cy = rec["x"][t, i], rec["y"][t, i]
     ax.set_xlim(cx - 3, cx + 3); ax.set_ylim(cy - 3, cy + 3); ax.set_aspect("equal")
-    ax.set_title(f"경기 {i}: {t * dt:.1f}~{t1 * dt:.1f} s 서 있음 ({(t1 - t) * dt:.1f} s) | 파랑 = 서기 시작, 빨강 = 끝, 보라 = 상대", fontsize=9)
+    ax.set_title(f"경기 {i}: {t * dt:.1f}~{t1 * dt:.1f} s {what} | 파랑 = 시작, 빨강 = 끝, 보라 = 상대(시작 때 간격 {rec['gap'][t, i]:+.1f} m)", fontsize=9)
     tt = np.arange(t0, min(t1 + int(1.0 / dt), N)) * dt; sl = slice(t0, min(t1 + int(1.0 / dt), N))
-    for r, (keys_, lab) in enumerate(((("v", "cmd"), "속도 m/s: 나 / 내 명령"), (("steer",), "조향 명령 도 (왼쪽 +)"),
-                                      (("lat", "hw"), "옆 위치 m (왼쪽 +) / 트랙 반폭 ±"), (("gate", "contact"), "경주 정책이 몲 / 차 접촉"))):
+    for r, (keys_, lab) in enumerate(((("v", "cmd", "vo"), "속도 m/s: 나 / 내 명령 / 상대"), (("steer",), "조향 명령 도 (왼쪽 +)"),
+                                      (("lat", "hw", "lato"), "옆 위치 m (왼쪽 +): 나 / 트랙 반폭 ± / 상대"), (("gate", "contact"), "경주 정책이 몲 / 차 접촉"))):
         axr = fig.add_subplot(4, 2, 2 * r + 2)
-        for kk, col in zip(keys_, ("tab:blue", "tab:gray")):
+        for kk, col in zip(keys_, ("tab:blue", "tab:gray", "purple")):
             y = rec[kk][sl, i]
             axr.plot(tt, y, color=col, lw=1.2, label=kk)
             if kk == "hw":
                 axr.plot(tt, -y, color=col, lw=1.2)
         axr.axvspan(t * dt, t1 * dt, color="red", alpha=0.08)
         axr.axhline(0, color="k", lw=0.4); axr.set_ylabel(lab, fontsize=8)
-    fig.tight_layout(); fig.savefig(os.path.join(a0.out, f"stuck_{n_st:02d}.png")); plt.close(fig)
+    fig.tight_layout(); fig.savefig(os.path.join(a0.out, fname)); plt.close(fig)
+
+
+n_st = 0
+for i in range(B):
+    if n_st >= int(a0.stuck_images):
+        break
+    slow = np.abs(rec["v"][:, i]) < 0.5
+    t = 40
+    while t < N and not (slow[t] and slow[t:t + int(3.0 / dt)].all() and t + int(3.0 / dt) <= N):
+        t += 1
+    if t >= N:
+        continue
+    t1 = t
+    while t1 < N and slow[t1]:
+        t1 += 1
+    cx, cy = rec["x"][t, i], rec["y"][t, i]
+    scene_pic(i, t, t1, f"stuck_{n_st:02d}.png", f"서 있음 ({(t1 - t) * dt:.1f} s)")
     print(f"[서 있음] 경기 {i}: {t * dt:.1f}~{t1 * dt:.1f} s, 자리 ({cx:.2f}, {cy:.2f}), 명령 속도 중앙 {np.median(rec['cmd'][t:t1, i]):.2f} m/s, "
           f"조향 명령 중앙 {np.median(rec['steer'][t:t1, i]):+.0f}도 (범위 {rec['steer'][t:t1, i].min():+.0f}~{rec['steer'][t:t1, i].max():+.0f})", flush=True)
     n_st += 1
+# dips behind a moving car: my speed falls below 0.3 m/s while the opponent is 2-12 m ahead and moving > 1 m/s (from 2 s on) --
+# how many, where, and the first per race as a picture
+dip = (rec["v"] < 0.3) & (rec["gap"] > 2.0) & (rec["gap"] < 12.0) & (rec["vo"] > 1.0)
+dip[:80] = False
+on = dip & ~np.vstack([np.zeros((1, B), bool), dip[:-1]])
+print(f"[멈칫] 전체: 상대가 2~12 m 앞에서 1 m/s 넘게 가는데 내 속도 < 0.3 m/s로 떨어진 횟수 {int(on.sum())} / {B}경기 x {N * dt:.0f} s, "
+      f"그 시간 {dip.sum() * dt:.1f} s", flush=True)
+n_dp = 0
+for i in range(B):
+    if n_dp >= int(a0.dip_images):
+        break
+    ks = np.nonzero(on[:, i])[0]
+    if not len(ks):
+        continue
+    t = int(ks[0]); t1 = t
+    while t1 < N and rec["v"][t1, i] < 0.3:
+        t1 += 1
+    scene_pic(i, t, max(t1, t + 1), f"dip_{n_dp:02d}.png", f"멈칫 ({(t1 - t) * dt:.1f} s, 최저 {rec['v'][t:t1 + 1, i].min():+.1f} m/s)")
+    print(f"[멈칫] 경기 {i}: {t * dt:.1f} s, 자리 ({rec['x'][t, i]:.2f}, {rec['y'][t, i]:.2f}), 간격 {rec['gap'][t, i]:+.1f} m, 상대 {rec['vo'][t, i]:.1f} m/s, "
+          f"직전 1 s 명령 {rec['cmd'][max(0, t - 40):t, i].min():+.1f}~{rec['cmd'][max(0, t - 40):t, i].max():+.1f} m/s, "
+          f"조향 {rec['steer'][max(0, t - 40):t, i].min():+.0f}~{rec['steer'][max(0, t - 40):t, i].max():+.0f}도, 경주 정책 {rec['gate'][max(0, t - 40):t, i].mean():.2f}", flush=True)
+    n_dp += 1
+np.savez_compressed(os.path.join(a0.out, "rec.npz"), dt=dt, **rec)
 print("saved", a0.out)
