@@ -423,11 +423,23 @@ class SoloMix:
         ar = ckb["args"]
         if ar.get("scan_obs") or ar.get("corridor_obs") or ar.get("car_channel") or ar.get("bev") or ar.get("path_plan"):
             raise ValueError("--base must be a plain state teacher (privileged vector + track ahead), e.g. srl1_solo")
+        # 11-02: a plan solo teacher (`--action plan`, e.g. srp25h2_solo2) mixes into a plan run -- the same trajectory
+        # format through the same follower, so its plan and the race policy's mean the same thing
+        env_plan = str(getattr(env.ecfg, "action_mode", "direct")) == "plan"
+        if plan_of(ar) != env_plan:
+            raise ValueError(f"--base {path}: a {'plan' if plan_of(ar) else 'direct'} teacher cannot drive this "
+                             f"{'plan' if env_plan else 'direct'} run")
+        if env_plan:
+            inner = env.tracker._inner if hasattr(env.tracker, "_inner") else env.tracker
+            if abs(float(ar.get("plan_horizon", 0.6) or 0.6) - float(inner.spec.wp_horizon_s)) > 1e-9 \
+                    or int(ar.get("repeat", 2)) != int(env.ecfg.decision_every):
+                raise ValueError(f"--base {path}: plan length / decision rate differ from this run's")
         self.env, self.lid = env, env.learner_ids
         B = int(self.lid.numel())
         self.sobs = StateObs(env)
-        o = self.sobs(torch.zeros(B, 2, device=device))
-        self.net = ActorCritic(o.shape[1]).to(device); self.net.load_state_dict(ckb["model"], strict=False); self.net.eval()
+        o = self.sobs(torch.zeros(B, act_dim_of(ar), device=device))
+        self.net = ActorCritic(o.shape[1], act_dim=act_dim_of(ar)).to(device)
+        self.net.load_state_dict(ckb["model"], strict=False); self.net.eval()
         self.nrm = RunningNorm(o.shape[1], device); self.nrm.load_state_dict(ckb["norm"])
         self.reach, self.hold = float(reach), int(hold)
         ko = PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS)
@@ -954,8 +966,8 @@ def train(a):
     B = int(lid.numel())
     act_full = torch.zeros(env.B, env.act_dim, device=device)
     A = act_dim_of(a)
-    if plan_of(a) and (a.base or int(a.unwedge) or float(a.reverse_ext)):
-        raise SystemExit("--action plan: no --base (a direct solo teacher), --unwedge or --reverse-ext (MAP backs a stalled car out)")
+    if plan_of(a) and (int(a.unwedge) or float(a.reverse_ext)):
+        raise SystemExit("--action plan: no --unwedge or --reverse-ext (MAP backs a stalled car out); --base must be a plan teacher")
     if int(env.act_dim) != A:
         raise SystemExit(f"the env's action is {env.act_dim}-wide, this run's {A}")
     if float(a.plan_relabel) > 0 and not plan_of(a):
