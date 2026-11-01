@@ -32,6 +32,7 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--envs", type=int, default=32)
 ap.add_argument("--steps", type=int, default=1600)
 ap.add_argument("--images", type=int, default=6)
+ap.add_argument("--stuck-images", type=int, default=0, help="pictures of the first stretch per race where my car stands (|v| < 0.5 m/s) > 3 s")
 ap.add_argument("--tracker", default="map", help="planner:KIND only: the planner's path follower, map or pp")
 ap.add_argument("--opp-slot", default="", help="JSON merged into the world's opponent slot (e.g. the school world's slow cars)")
 a0 = ap.parse_args()
@@ -75,7 +76,7 @@ else:
 opp = env.sim.other_idx[lid][:, 0]
 act = torch.zeros(env.B, env.act_dim, device=dev); last = torch.zeros(B, 2, device=dev)
 N = int(a0.steps)
-rec = {k: np.zeros((N, B), np.float32) for k in ("gap", "v", "vo", "lat", "lato", "hw", "cmd", "gate", "x", "y", "xo", "yo", "contact")}
+rec = {k: np.zeros((N, B), np.float32) for k in ("gap", "v", "vo", "lat", "lato", "hw", "cmd", "gate", "x", "y", "xo", "yo", "contact", "steer", "yaw")}
 gate = torch.ones(B, device=dev)
 tr = env.sim.track
 touching = torch.zeros(B, dtype=torch.bool, device=dev)
@@ -102,6 +103,7 @@ with torch.no_grad():
         rec["hw"][t] = tr.sample_edt(xy_c[:, None], env.sim.tid[lid][:, None])[:, 0].cpu().numpy()
         rec["cmd"][t] = (a_[:, 1].clamp(-1, 1) + 1).cpu().numpy() / 2 * float(env.ecfg.v_max_policy)
         rec["gate"][t] = gate.cpu().numpy()
+        rec["steer"][t] = np.degrees((a_[:, 0].clamp(-1, 1) * float(env.s_max)).cpu().numpy()); rec["yaw"][t] = st[lid, 2].cpu().numpy()
         rec["x"][t] = st[lid, 0].cpu().numpy(); rec["y"][t] = st[lid, 1].cpu().numpy()
         rec["xo"][t] = st[opp, 0].cpu().numpy(); rec["yo"][t] = st[opp, 1].cpu().numpy()
         # a hard car hit: a contact ONSET with the simulator's impact >= 1.5 m/s, as crash_scenes --all-car and evalx count
@@ -207,4 +209,65 @@ for k, s in enumerate(sorted(segs, key=lambda z: -z["dur"])[:int(a0.images)]):
         axr.axvspan(s["t0"] * dt, s["t1"] * dt, color="orange", alpha=0.12)
         axr.axhline(0, color="k", lw=0.4); axr.set_ylabel(lab, fontsize=8)
     fig.tight_layout(); fig.savefig(os.path.join(a0.out, f"follow_{k:02d}.png")); plt.close(fig)
+# where my car stands: the first stretch per race (from 1 s on) with |v| < 0.5 m/s for more than 3 s -- the place, the pose,
+# the opponent, and what the policy commanded there
+w3 = int(3.0 / dt); n_stuck = 0; t_stuck = 0.0
+for i in range(B):
+    sl_ = np.abs(rec["v"][40:, i]) < 0.5
+    k = 0
+    while k < len(sl_):
+        if sl_[k]:
+            k1 = k
+            while k1 < len(sl_) and sl_[k1]:
+                k1 += 1
+            if k1 - k > w3:
+                n_stuck += 1; t_stuck += (k1 - k) * dt
+            k = k1
+        else:
+            k += 1
+print(f"[서 있음] 전체: 3 s 넘게 선 구간 {n_stuck}개, 합 {t_stuck:.1f} s / {B}경기 x {N * dt:.0f} s", flush=True)
+n_st = 0
+for i in range(B):
+    if n_st >= int(a0.stuck_images):
+        break
+    slow = np.abs(rec["v"][:, i]) < 0.5
+    t = 40
+    while t < N and not (slow[t] and slow[t:t + int(3.0 / dt)].all() and t + int(3.0 / dt) <= N):
+        t += 1
+    if t >= N:
+        continue
+    t1 = t
+    while t1 < N and slow[t1]:
+        t1 += 1
+    t0 = max(0, t - int(2.0 / dt))
+    fig = plt.figure(figsize=(17, 8), dpi=80)
+    ax = fig.add_subplot(1, 2, 1)
+    occ = track.occupancy; rs = track.resolution; ox, oy = track.origin
+    ax.imshow(occ, origin="lower", cmap="Greys", extent=(ox, ox + occ.shape[1] * rs, oy, oy + occ.shape[0] * rs), vmin=0, vmax=1.5)
+    ax.plot(rec["x"][t0:t1, i], rec["y"][t0:t1, i], "-", color="tab:blue", lw=1.0)
+    for tq, col in ((t, "tab:blue"), (min(t1, N - 1), "red")):
+        x_, y_, h_ = rec["x"][tq, i], rec["y"][tq, i], rec["yaw"][tq, i]
+        c, s_ = np.cos(h_), np.sin(h_)
+        box = np.array([[0.32, 0.15], [0.32, -0.15], [-0.22, -0.15], [-0.22, 0.15], [0.32, 0.15]])
+        ax.plot(x_ + box[:, 0] * c - box[:, 1] * s_, y_ + box[:, 0] * s_ + box[:, 1] * c, color=col, lw=1.5)
+    ax.plot(rec["xo"][t0:t1, i], rec["yo"][t0:t1, i], "-", color="purple", lw=0.8)
+    ax.plot(rec["xo"][t, i], rec["yo"][t, i], "s", color="purple", ms=6)
+    cx, cy = rec["x"][t, i], rec["y"][t, i]
+    ax.set_xlim(cx - 3, cx + 3); ax.set_ylim(cy - 3, cy + 3); ax.set_aspect("equal")
+    ax.set_title(f"경기 {i}: {t * dt:.1f}~{t1 * dt:.1f} s 서 있음 ({(t1 - t) * dt:.1f} s) | 파랑 = 서기 시작, 빨강 = 끝, 보라 = 상대", fontsize=9)
+    tt = np.arange(t0, min(t1 + int(1.0 / dt), N)) * dt; sl = slice(t0, min(t1 + int(1.0 / dt), N))
+    for r, (keys_, lab) in enumerate(((("v", "cmd"), "속도 m/s: 나 / 내 명령"), (("steer",), "조향 명령 도 (왼쪽 +)"),
+                                      (("lat", "hw"), "옆 위치 m (왼쪽 +) / 트랙 반폭 ±"), (("gate", "contact"), "경주 정책이 몲 / 차 접촉"))):
+        axr = fig.add_subplot(4, 2, 2 * r + 2)
+        for kk, col in zip(keys_, ("tab:blue", "tab:gray")):
+            y = rec[kk][sl, i]
+            axr.plot(tt, y, color=col, lw=1.2, label=kk)
+            if kk == "hw":
+                axr.plot(tt, -y, color=col, lw=1.2)
+        axr.axvspan(t * dt, t1 * dt, color="red", alpha=0.08)
+        axr.axhline(0, color="k", lw=0.4); axr.set_ylabel(lab, fontsize=8)
+    fig.tight_layout(); fig.savefig(os.path.join(a0.out, f"stuck_{n_st:02d}.png")); plt.close(fig)
+    print(f"[서 있음] 경기 {i}: {t * dt:.1f}~{t1 * dt:.1f} s, 자리 ({cx:.2f}, {cy:.2f}), 명령 속도 중앙 {np.median(rec['cmd'][t:t1, i]):.2f} m/s, "
+          f"조향 명령 중앙 {np.median(rec['steer'][t:t1, i]):+.0f}도 (범위 {rec['steer'][t:t1, i].min():+.0f}~{rec['steer'][t:t1, i].max():+.0f})", flush=True)
+    n_st += 1
 print("saved", a0.out)
