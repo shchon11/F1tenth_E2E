@@ -407,6 +407,19 @@ def main():
                             lat_q = [(-(x_ - float(st[row, 0])) * se + (y_ - float(st[row, 1])) * ce) for x_, y_ in h_q[:, :2]]
                             geo = {"opp_fx": fx, "opp_fy": fy, "closing": v_rel, "opp_speed": vq,
                                    "opp_ahead_0.5s": ds0, "opp_lat_move_0.5s": float(lat_q[-1] - lat_q[0]) if len(lat_q) > 1 else 0.0}
+                            # 0.5 s before: both cars' lateral offsets, the opponent's yaw to the track, and whether the car
+                            # channel (state_rl.car_spacetime_block: the other car's centre +- 0.35 m, whatever its yaw)
+                            # blocked the lateral bin we were in
+                            tt = env.sim.tid[row:row + 1].repeat(2)
+                            s0_, l0_, _ = env.sim.track.project(torch.tensor(np.stack([h_e[0, :2], h_q[0, :2]]), device=device, dtype=torch.float32), tt)
+                            _, yaw_t = env.sim.track.pose_at_s(s0_[1:], tt[1:])
+                            geo["opp_yaw_rel_0.5s"] = math.degrees((float(h_q[0, 2]) - float(yaw_t[0]) + math.pi) % (2 * math.pi) - math.pi)
+                            geo["lat_gap_0.5s"] = abs(float(l0_[0] - l0_[1]))
+                            if n_car and int(env.ep_step[row]) // int(a.repeat) >= 11:
+                                w_ = float(env.sim.track.sample_edt(torch.tensor(h_e[None, :1, :2], device=device, dtype=torch.float32), tt[None, :1]).reshape(-1)[0])
+                                j_ = int(np.argmin(np.abs(np.array(state_rl.CORRIDOR_U) * w_ - float(l0_[0]))))
+                                cb = ohist[-11, i, D_all - n_car:].reshape(len(state_rl.AHEAD), state_rl.CORRIDOR_BINS)
+                                geo["carst_mine_0.5s"] = float(cb[:, j_ // 2].max()); geo["carst_any_0.5s"] = float(cb.max())
                     ev = {"step": t * int(a.repeat) + r, "row": row, "kind": kind, "impact": float(impv[i]),
                           "ep_step": int(env.ep_step[row]), "opp_dist": od, **geo,
                           "speed": float(st[row, 3]), "xy": [float(st[row, 0]), float(st[row, 1])], "yaw": float(st[row, 2]),
@@ -634,6 +647,11 @@ def main():
                 if m.sum():
                     print(f"   상대 {nm} {m.sum()}건: 다가가는 속도 중앙 {np.median(cl[m]):.2f} m/s, 상대 속도 중앙 {np.median(vq[m]):.1f} m/s, "
                           f"0.5초간 상대 옆 이동 |중앙| {np.median(np.abs(lm[m])):.2f} m, 0.5초 전 상대가 앞 {(ah[m] > 0).mean() * 100:.0f} %", flush=True)
+            for e in cc:
+                if "lat_gap_0.5s" in e:
+                    print(f"   [차 칸] 행 {e['row']} 충격 {e['impact']:.1f}: 0.5초 전 옆 간격 {e['lat_gap_0.5s']:.2f} m, 상대 트랙 대비 기울기 "
+                          f"{e['opp_yaw_rel_0.5s']:+.0f}도, 차 칸이 내 자리 막음 {e.get('carst_mine_0.5s', float('nan')):.0f}, "
+                          f"어디든 막음 {e.get('carst_any_0.5s', float('nan')):.0f}", flush=True)
         t_ = np.array([e["ep_step"] / 40 for e in events])
         print(f"[출발 후] 1초 안 {(t_ < 1).mean() * 100:.0f} %, 1~3초 {((t_ >= 1) & (t_ < 3)).mean() * 100:.0f} %, 3초 뒤 {(t_ >= 3).mean() * 100:.0f} %", flush=True)
     by = {}
