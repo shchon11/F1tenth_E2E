@@ -176,10 +176,8 @@ FREE_CELL = (0.70, 0.75, 0.82, 0.35)      # a corridor cell left free
 AHEAD_PT = (0.95, 0.95, 0.98, 0.85)       # the track points ahead the teacher steers by
 GRID_HIT = (1.00, 0.45, 0.20, 0.90)       # a grid cell where a beam ended (occupied)
 HOT = (1.00, 0.95, 0.35, 1.00)            # the cells the action is most sensitive to
-#: the student's imagined drive: decisions rolled out, [s] per decision is the env's (repeat x control_dt)
-IMAGINE_STEPS = 30
 #: the overlay's heavy part (a backward pass, the imagined drive) is refreshed this often [s]; frames in between reuse it
-REFRESH_S = 0.2
+REFRESH_S = 0.5
 #: hot cells drawn in 3D (the panel draws the whole heat map)
 HOT_CELLS = 24
 
@@ -205,9 +203,7 @@ class StateViz:
         occupied cells orange, in the car frame, as an image under the panel's scan;
       * where it looks: the cells its (steer, speed) output is most sensitive to, gradient x input summed over the stacked
         frames (an inferno heat map on the grid; the hottest cells as markers in 3D);
-      * where it means to go: the policy driven forward `IMAGINE_STEPS` decisions on a kinematic bicycle with the grid
-        re-read from each imagined pose -- the scans held still, so the world is taken as frozen (a car ahead is a
-        wall here). Not a plan the network outputs: it commands (steer, speed) only; this is that command, repeated.
+      * its command rolled out for one second (it outputs (steer, speed) only, no path).
     Teacher -- its two corridor channels on the 13 x 7 cells along the track it reads them on (props orange, the other
       car where it will be when we get there magenta, free grey), outlined by how strongly its action reacts to each cell
       (gradient magnitude), the track points it steers by, its hit head's P(a hard hit within 1 s), which policy drives,
@@ -310,53 +306,7 @@ class StateViz:
         g = g.detach()
         a0 = (g0 * g).abs().sum(1)[0]; a1 = (g1 * g).abs().sum(1)[0]
         heat = 0.5 * (a0 / (a0.max() + 1e-9) + a1 / (a1.max() + 1e-9))                            # (H, W)
-        traj = self._imagine(row, scan, ego0, rel0, keys)
-        return [g[0, 0].reshape(-1), g[0, 1].reshape(-1), heat.reshape(-1).float(), traj.reshape(-1).float()]
-
-    @torch.no_grad()
-    def _imagine(self, row, scan, ego0, rel0, keys):
-        """(K, 3) [x, y, v] in the car's frame now: the student driven forward on a kinematic bicycle, re-reading its grid
-        from each imagined pose (the scans held still), its last actions and its speed fed back into its ego vector."""
-        env, net = self.env, self.r.sr.net
-        dev = scan.device
-        # where the speed and the action history sit in the ego vector (`StateObs`-free: the v1 observation's keys)
-        sizes = {k: int(self.r.session["obs"][k].shape[1]) if self.r.session is not None else 0 for k in keys}
-        off, pos = 0, {}
-        for k in keys:
-            pos[k] = (off, off + sizes[k]); off += sizes[k]
-        vmax = float(env.ecfg.v_max_policy)
-        ext = float(getattr(env.ecfg, "reverse_ext", 0.0) or 0.0)
-        rev = float(getattr(env.ecfg, "reverse_speed", 2.0) or 2.0)
-        smax = float(env.s_max)
-        L = self.wheelbase
-        x = y = yaw = 0.0
-        v = float(env.sim.state[row, 3]); d = float(env.sim.state[row, 6])
-        ego = ego0.clone()
-        hist = ego[0, pos["prev_action"][0]:pos["prev_action"][1]].clone() if "prev_action" in pos else None
-        out = []
-        dt = self.dt
-        for _ in range(IMAGINE_STEPS):
-            c, s_ = math.cos(yaw), math.sin(yaw)
-            dx, dy = rel0[..., 0] - x, rel0[..., 1] - y
-            rel = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c, rel0[..., 2] - yaw], -1)
-            if "speed" in pos:
-                ego[0, pos["speed"][0]] = v / vmax
-            if hist is not None:
-                ego[0, pos["prev_action"][0]:pos["prev_action"][1]] = hist
-            a = net(scan, ego, rel)[0]
-            st_n, sp_n = float(a[0].clamp(-1, 1)), float(a[1])
-            v_cmd = (sp_n + 1.0) * 0.5 * vmax if sp_n >= -1.0 else -rev * (-(sp_n + 1.0) / max(ext, 1e-6))
-            d_cmd = st_n * smax
-            if hist is not None:
-                hist = torch.cat([a.reshape(-1), hist[:-2]]) if hist.numel() > 2 else a.reshape(-1)
-            for _sub in range(5):                                     # 5 substeps per decision
-                h = dt / 5
-                v += max(-8.0 * h, min(5.0 * h, v_cmd - v))
-                d += max(-4.0 * h, min(4.0 * h, d_cmd - d))
-                yaw += v * math.tan(d) / L * h
-                x += v * math.cos(yaw) * h; y += v * math.sin(yaw) * h
-            out.append((x, y, v))
-        return torch.tensor(out, device=dev, dtype=torch.float32)
+        return [g[0, 0].reshape(-1), g[0, 1].reshape(-1), heat.reshape(-1).float()]
 
     # ------------------------------------------------------------------ host side
     def decode(self, row: int, flat, *, pose, mount, scan_m, cmd):
@@ -405,7 +355,6 @@ class StateViz:
             n = H * W
             free = flat[:n].reshape(H, W); hit = flat[n:2 * n].reshape(H, W)
             heat = flat[2 * n:3 * n].reshape(H, W)
-            tr_ = flat[3 * n:].reshape(-1, 3)
             occ = hit > 0.25
             fr_ = (free > 0.5) & ~occ
             # the panel's image: free / occupied as the network reads them, the heat map over both
@@ -424,13 +373,12 @@ class StateViz:
             hot = np.argsort(-heat.reshape(-1))[:HOT_CELLS]
             points += [{"xy": np.stack([wx[occ], wy[occ]], 1), "rgba": GRID_HIT, "px": 4.0, "panel": False},
                        {"xy": np.stack([wx.reshape(-1)[hot], wy.reshape(-1)[hot]], 1), "rgba": HOT, "px": 7.0, "panel": False}]
-            # the imagined drive, world frame, as the speed ribbon (the 3D view and the panel draw `plan` coloured by speed)
-            traj = np.stack([px + tr_[:, 0] * cs - tr_[:, 1] * sn, py + tr_[:, 0] * sn + tr_[:, 1] * cs, tr_[:, 2]], 1)
-            traj = np.concatenate([np.array([[px, py, tr_[0, 2] if len(tr_) else 0.0]], np.float32), traj], 0).astype(np.float32)
+            # the command rolled out for one second, as for every sensor driver (11-01: an imagined drive that re-read the
+            # grid from poses the scans no longer matched drew a deformed path the policy never planned -- removed)
+            traj = command_arc(pose, steer, v, self.wheelbase)
             legend = (f"라이다 격자 학생 · 입력 = 최근 스캔 4장(100 ms)을 자기 오도메트리로 맞춘 점유 격자({H * res:.0f} x {W * res:.0f} m, "
                       f"{res:.2f} m 칸) 최신 장: 짙은 청록 = 빈 곳, 흰색 = 점유 · 열지도 = 조향·속도가 그 칸에 얼마나 반응하나(기울기 x 입력) · "
-                      f"색 띠 = 정책을 {IMAGINE_STEPS * self.dt:.1f} s 굴린 상상 궤적(세상이 멈췄다고 보고 격자를 다시 읽음) · "
-                      f"지금 명령 조향 {np.degrees(steer):+.0f}도, {v:.1f} m/s")
+                      f"색 띠 = 지금 명령(조향 {np.degrees(steer):+.0f}도, {v:.1f} m/s)을 1초 굴린 호 — 이 정책은 궤적을 내지 않고 조향·속도만 냄")
             title = "라이다 격자 학생"
             body = {"grid": {"x0": x0, "res": res, "H": H, "W": W, "rgba": (np.clip(img, 0, 1) * 255).astype(np.uint8)}}
         return traj, dict({"kind": self.r.kind, "title": title, "legend": legend, "lines": lines, "points": points}, **body)
