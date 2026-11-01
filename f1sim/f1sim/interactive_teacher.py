@@ -684,7 +684,7 @@ class InteractiveTeacher(RowPlanning):
         on = torch.zeros(K, dtype=torch.bool, device=self.device)
         on[self.i0 * n_spd:(self.i0 + 1) * n_spd] = True
         if K > regular:
-            on[regular] = True
+            on[regular:regular + 1] = True          # a slice fill: an int index copies a CPU scalar, which CUDA graph capture refuses
         return on
 
     def _within_plan(self, world, state, spec, plan_speed=None):

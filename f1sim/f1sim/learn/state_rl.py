@@ -739,6 +739,90 @@ def apply_plan_spec(env, ar) -> None:
         inner.spec = dataclasses.replace(inner.spec, wp_horizon_s=float(_ar(ar).get("plan_horizon", 0.6) or 0.6))
 
 
+#: `--plan-relabel`: the plan is compared with the driven path over [0, RELABEL_EXT * L] -- the plan and the stretch
+#: past its end that MAP aims into (L1 = 1.2-1.4 L at 4-9 m/s) and the console draws (its 0.6 s walk, ~2 L) --
+#: at RELABEL_PTS points per L, and its speed at the WP_K waypoints
+RELABEL_EXT = 2
+RELABEL_PTS = 8
+
+
+def plan_relabel_targets(env, pose_s, d_s, vm, acts, R, window_s=0.8):
+    """`--plan-relabel` (11-01): for each decision, the path the car then DROVE, in the body frame of the pose its plan
+    was issued from, at arc lengths j L / RELABEL_PTS (j = 1 .. RELABEL_EXT RELABEL_PTS), and its speed where it passed
+    the plan's waypoints (k L / WP_K). `relabel_loss` pulls the mean plan onto them.
+
+    Why: MAP steers by one point of the plan and reads its speed at one point, so the rest of the plan is free, and the
+    PPO plans drifted into a steering lever (11-01, srp1 / srp25 / srp26x: the plan's own [0, L] ends 0.4-0.6 m off the
+    path the car then drove, the console's drawing 1.2-1.8 m, hooks through walls). Pulled onto what was driven, the
+    plan is the trajectory the car follows. Compared in position, not as fitted curvatures: kappa_4 moves [0, L] by
+    millimetres, so a fit to it turns the path's sampling error into 0.1 1/m (measured on a sampled circle).
+
+    pose_s (T R + 1, B, 4): x, y, yaw, v before every control step and after the last; d_s (T R, B): an episode ended
+    in that step; vm (T, B): the odometry speed each plan was decoded at; acts (T, B, A): the sampled actions.
+    Returns points (T, B, n, 2), speeds (T, B, WP_K), a (T, B) mask -- the next `window_s` inside this rollout and one
+    episode, and the car covered RELABEL_EXT L in it -- and, over the masked rows, the executed plans' farthest point
+    from the driven path on [0, L] and on [0, RELABEL_EXT L] [m]."""
+    from .. import mpc
+    inner = env.tracker._inner if hasattr(env.tracker, "_inner") else env.tracker
+    spec, v_max = inner.spec, float(inner.v_max)
+    S1, B, _ = pose_s.shape
+    T = (S1 - 1) // R
+    Wn = int(round(window_s / float(env.sim.control_dt)))
+    dev, dt_ = pose_s.device, pose_s.dtype
+    n = RELABEL_EXT * RELABEL_PTS
+    pts = torch.zeros(T, B, n, 2, device=dev); vks = torch.zeros(T, B, mpc.WP_K, device=dev)
+    msk = torch.zeros(T, B, device=dev)
+    cap = torch.full((B,), float(env.ecfg.speed_cap), device=dev, dtype=dt_)
+    gi = torch.arange(1, n + 1, device=dev) * (spec.wp_grid // RELABEL_PTS)
+    d1, d2 = [], []
+    for t in range(T):
+        i0 = t * R
+        if i0 + Wn > S1 - 1:
+            break
+        win = pose_s[i0:i0 + Wn + 1]                                           # (Wn + 1, B, 4)
+        ok = ~d_s[i0:i0 + Wn].any(0)
+        c0, s0 = torch.cos(win[0, :, 2]), torch.sin(win[0, :, 2])
+        dx, dy = win[:, :, 0] - win[0, :, 0], win[:, :, 1] - win[0, :, 1]
+        bx, by = (c0 * dx + s0 * dy).T.contiguous(), (-s0 * dx + c0 * dy).T.contiguous()   # (B, Wn + 1)
+        arc = torch.cat([torch.zeros(B, 1, device=dev, dtype=dt_),
+                         torch.cumsum(torch.hypot(bx.diff(dim=1), by.diff(dim=1)), 1)], 1).contiguous()
+        L = mpc.plan_length(vm[t], spec)
+        ok &= arc[:, -1] >= RELABEL_EXT * L
+
+        def at(q, val):                                                        # val (B, Wn + 1) at arc lengths q (B, m)
+            idx = torch.searchsorted(arc, q.contiguous()).clamp(1, Wn)
+            a0, a1 = arc.gather(1, idx - 1), arc.gather(1, idx)
+            w = ((q - a0) / (a1 - a0).clamp_min(1e-6)).clamp(0.0, 1.0)
+            return val.gather(1, idx - 1) * (1 - w) + val.gather(1, idx) * w
+
+        q = torch.arange(1, n + 1, device=dev, dtype=dt_)[None] / RELABEL_PTS * L[:, None]
+        tx, ty = at(q, bx), at(q, by)
+        pts[t] = torch.stack([tx, ty], -1)
+        fk = torch.arange(1, mpc.WP_K + 1, device=dev, dtype=dt_)[None] / mpc.WP_K * L[:, None]
+        vks[t] = at(fk, win[:, :, 3].T.contiguous()).clamp_min(0.0)
+        msk[t] = ok.float()
+        k_exe, _, _ = mpc.decode_wp4(acts[t], vm[t], v_max, cap, spec)
+        px, py, _, _, _ = mpc.wp4_path(k_exe, L, spec, extend=float(RELABEL_EXT))
+        e = torch.hypot(px[:, gi] - tx, py[:, gi] - ty)
+        d1.append(e[:, :RELABEL_PTS].amax(1)[ok]); d2.append(e.amax(1)[ok])
+    cat = lambda xs: torch.cat(xs) if xs else torch.zeros(0, device=dev)
+    return pts, vks, msk, cat(d1), cat(d2)
+
+
+def relabel_loss(env, mean, vm, pts, vks, w_speed=0.0):
+    """(N,) the mean plan's squared distance to the driven path at the relabel points (mean over points) +
+    `w_speed` x its waypoint speeds' squared error to the driven ones -- differentiable in `mean` (`--plan-relabel`)"""
+    from .. import mpc
+    inner = env.tracker._inner if hasattr(env.tracker, "_inner") else env.tracker
+    spec, v_max = inner.spec, float(inner.v_max)
+    cap = torch.full_like(vm, float(env.ecfg.speed_cap))
+    k, L, v = mpc.decode_wp4(mean, vm, v_max, cap, spec)
+    px, py, _, _, _ = mpc.wp4_path(k, L, spec, extend=float(RELABEL_EXT))
+    gi = torch.arange(1, pts.shape[1] + 1, device=mean.device) * (spec.wp_grid // RELABEL_PTS)
+    e_pos = (px[:, gi] - pts[..., 0]).square() + (py[:, gi] - pts[..., 1]).square()
+    return e_pos.mean(1) + float(w_speed) * (v - vks).square().mean(1)
+
+
 def plan_env_fields(ar) -> dict:
     """EnvConfig fields of a plan run (`--action plan`); {} for a direct one"""
     if not plan_of(ar):
@@ -865,6 +949,8 @@ def train(a):
         raise SystemExit("--action plan: no --base (a direct solo teacher), --unwedge or --reverse-ext (MAP backs a stalled car out)")
     if int(env.act_dim) != A:
         raise SystemExit(f"the env's action is {env.act_dim}-wide, this run's {A}")
+    if float(a.plan_relabel) > 0 and not plan_of(a):
+        raise SystemExit("--plan-relabel relabels wp4 plans: it needs --action plan")
     last_a = torch.zeros(B, A, device=device)
     o = obs_fn(last_a)
     D = obs_fn.dim
@@ -958,6 +1044,10 @@ def train(a):
         bm = torch.ones(T, B, device=device)                     # 1 = this policy's action was executed (`--base`)
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = 0.0; laps = []; dev_sum = dev_n = 0.0
+        relabel = float(getattr(a, "plan_relabel", 0.0) or 0.0) > 0
+        if relabel:                                              # `--plan-relabel`: the path each plan was followed by
+            pose_s = torch.zeros(T * R + 1, B, 4, device=device); d_s = torch.zeros(T * R, B, dtype=torch.bool, device=device)
+            vm_t = torch.zeros(T, B, device=device)
         dead_n = torch.zeros(3, device=device)                   # decisions this policy drove; of them speed / steer dead
         tr0 = time.time()
         with torch.no_grad():
@@ -994,7 +1084,12 @@ def train(a):
                 dead_n += torch.stack([bm[t].sum(), (bm[t] * dd_[:, d_speed].any(1).float()).sum(),
                                        (bm[t] * dd_[:, d_steer].any(1).float()).sum()])
                 act_full[lid] = exe
+                if relabel:
+                    lr_ = env.last_result
+                    vm_t[t] = (lr_.odom[lid, 3] if lr_ is not None else env.sim.state[lid, 3]).float()
                 for k in range(R):
+                    if relabel:
+                        pose_s[t * R + k] = env.sim.state[lid, :4].float()
                     if unwedge is not None:
                         unwedge.before(act_full)
                     _, r_, te, trc, info = env.step(act_full)
@@ -1032,6 +1127,8 @@ def train(a):
                     hits_w += float((onw * alive).sum()); hits_c += float((onset.float() * alive).sum())
                     hit_now |= ((onw > 0) | onset) & ~done
                     d_ = (te | trc)[lid]
+                    if relabel:
+                        d_s[t * R + k] = d_
                     touching = touching & ~d_
                     done |= d_
                     if info["lap_times"].numel():
@@ -1043,6 +1140,9 @@ def train(a):
                 o = obs_fn(last_a)
             v_T, hl_T = model.value_and_hit(norm(o))
             bv[T] = v_T * (ret_rms.var.sqrt() + 1e-6); bp[T] = torch.sigmoid(hl_T)
+            if relabel:
+                pose_s[T * R] = env.sim.state[lid, :4].float()
+                rl_pts, rl_vk, rl_msk, rl_d1, rl_d2 = plan_relabel_targets(env, pose_s, d_s, vm_t, ba, R)
             if float(a.geo_shaping) > 0:
                 bg[T] = geo_risk(env, lid)
             # the hit head's labels: a hard hit within the next K decisions of the same episode (incomplete windows masked)
@@ -1093,6 +1193,9 @@ def train(a):
         fo, fa, flp, fadv, fret = bo.reshape(N, D), ba.reshape(N, A), blp.reshape(N), adv_n.reshape(N), ret_n.reshape(N)
         fyh, fvh = y_hit.reshape(N), v_hit.reshape(N)
         fm = bm.reshape(N)
+        if relabel:
+            f_rp, f_rv = rl_pts.reshape(N, -1, 2), rl_vk.reshape(N, -1)
+            f_vm, f_rm = vm_t.reshape(N), (rl_msk * bm).reshape(N)
         mb = N // int(a.minibatches)
         kls, cfs = [], []
         for ep in range(int(a.epochs)):
@@ -1116,6 +1219,10 @@ def train(a):
                     mu_j = model.raw_mean
                     over = (mu_j - hi_b).clamp_min(0) ** 2 + (lo_b - mu_j).clamp_min(0) ** 2
                     loss = loss + float(a.bound_loss) * over.sum(1).mean()
+                if relabel:
+                    # `--plan-relabel`: the mean plan pulled towards the plan of what the car then drove (plan_relabel_targets)
+                    e_j = relabel_loss(env, dist.mean, f_vm[j], f_rp[j], f_rv[j], w_speed=float(a.plan_relabel_speed))
+                    loss = loss + float(a.plan_relabel) * (e_j * f_rm[j]).sum() / f_rm[j].sum().clamp_min(1.0)
                 if a.hit_head > 0:
                     bce = nn.functional.binary_cross_entropy_with_logits(hl_j, fyh[j], reduction="none")
                     loss = loss + float(a.hit_head) * (bce * fvh[j]).sum() / fvh[j].sum().clamp_min(1.0)
@@ -1142,13 +1249,22 @@ def train(a):
                  "geo_risk_before_hit": float((bg[:T] * y_hit).sum() / y_hit.sum().clamp_min(1.0)),
                  "policy_share": float(bm.mean()),
                  "dead_speed": float(dead_n[1] / dead_n[0].clamp_min(1.0)), "dead_steer": float(dead_n[2] / dead_n[0].clamp_min(1.0))}
+        if relabel:
+            stats["plan_vs_driven_m"] = float(rl_d1.median()) if rl_d1.numel() else None
+            stats["plan_vs_driven_p90_m"] = float(rl_d1.quantile(0.9)) if rl_d1.numel() else None
+            stats["plan2L_vs_driven_m"] = float(rl_d2.median()) if rl_d2.numel() else None
+            stats["relabel_valid"] = float(rl_msk.mean())
         log.write(json.dumps(stats) + "\n"); log.flush()
         if u % 5 == 0 or u == upd0 + 1:
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
             print(f"[{time.strftime('%H:%M')}] 업데이트 {u} | 진행 {stats['progress_ms']:.2f} m/s | 강한 충돌 벽+상자 "
                   f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 랩 {len(laps)}개 평균 {lp_} s | "
                   f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 경주 정책 몫 {stats['policy_share']:.2f} | 죽은 결정 속도 {stats['dead_speed'] * 100:.0f} % 조향 {stats['dead_steer'] * 100:.0f} % | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
-                  f"{t_roll:.1f}+{stats['t_upd']:.1f} s", flush=True)
+                  f"{t_roll:.1f}+{stats['t_upd']:.1f} s"
+                  + (f" | 계획-실제 길 어긋남 [0,L] 중앙 {stats['plan_vs_driven_m']:.2f} p90 {stats['plan_vs_driven_p90_m']:.2f} m, "
+                     f"[0,2L] 중앙 {stats['plan2L_vs_driven_m']:.2f} m (유효 {stats['relabel_valid'] * 100:.0f} %)"
+                     if relabel and stats.get("plan_vs_driven_m") is not None else ""),
+                  flush=True)
         if u % int(a.save_every) == 0 or u == upd0 + int(a.updates):
             torch.save({"model": model.state_dict(), "norm": norm.state_dict(), "ret_rms": ret_rms.state_dict(),
                         "obs_dim": D, "args": vars(a), "update": u, "ahead": AHEAD, "bev": bev},
@@ -1287,6 +1403,14 @@ def main():
     ap.add_argument("--scan-obs", type=int, default=0, help="1: append the noise-free scan (--beams beams) to the observation")
     ap.add_argument("--soft-bound", type=int, default=0, help="1: the policy mean squashed into the action range near its ends "
                     "(margins steer 0.1, speed 0.2; `soft_bound`) -- exploration reaches inside the range everywhere")
+    ap.add_argument("--plan-relabel", type=float, default=0.0,
+                    help="weight of the loss pulling the mean plan towards the wp4 plan of the path the car then drove "
+                         "(--action plan; plan_relabel_targets)")
+    ap.add_argument("--plan-relabel-speed", type=float, default=0.0,
+                    help="--plan-relabel's weight on the waypoint speeds [per (m/s)^2]. 0 (11-01): pulled onto the speeds "
+                         "the car then had, the plan stops asking for more than it gets and the car stops accelerating "
+                         "(srp25r_test: top speed 9.2 -> 6.1 m/s, laps 6.5 -> 7.8 s) -- a planner's speeds are a reference the "
+                         "car lags, its path is not")
     ap.add_argument("--bound-loss", type=float, default=0.0, help="weight of the penalty on the policy mean outside the "
                     "executable action range (11-01: clamped-Gaussian dead zone); 0 = off")
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
