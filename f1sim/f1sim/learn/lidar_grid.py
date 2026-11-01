@@ -94,7 +94,7 @@ class StudentGrid(nn.Module):
     """(scan stack, ego, odometry-relative frame poses) -> (steer, speed) in [-1, 1]: the LiDAR grid (`lidar_grid`) read by
     the same small conv as the teacher's `state_rl.BevNet`, joined with the ego vector."""
 
-    def __init__(self, frames, beams, ego_dim, angles, mount, range_max, feat=256):
+    def __init__(self, frames, beams, ego_dim, angles, mount, range_max, feat=256, act_dim=2):
         super().__init__()
         self.frames, self.beams = int(frames), int(beams)
         self.register_buffer("angles", torch.as_tensor(angles, dtype=torch.float32).clone())
@@ -106,7 +106,7 @@ class StudentGrid(nn.Module):
         n = int(self.conv(torch.zeros(1, C, BEV_H, BEV_W)).shape[1])
         self.proj = nn.Sequential(nn.Linear(n, feat), nn.ReLU())
         self.ego = nn.Sequential(nn.Linear(ego_dim, 128), nn.ReLU())
-        self.head = nn.Sequential(nn.Linear(feat + 128, 256), nn.ReLU(), nn.Linear(256, 2), nn.Tanh())
+        self.head = nn.Sequential(nn.Linear(feat + 128, 256), nn.ReLU(), nn.Linear(256, act_dim), nn.Tanh())
 
     def grid(self, scan, rel):
         return lidar_grid(scan, rel, self.angles, self.mount.tolist(), self.range_max)
@@ -124,16 +124,19 @@ def lidar_mount(env):
     return (float(env.cfg.lidar.mount_x), float(env.cfg.lidar.mount_y), float(env.cfg.lidar.mount_yaw))
 
 
-def make_student(sck_or_none, env, frames, beams, ego_dim, grid, device):
-    """a state_student checkpoint's network (or a fresh one): the 1-D scan student or the grid student"""
+def make_student(sck_or_none, env, frames, beams, ego_dim, grid, device, act_dim=2):
+    """a state_student checkpoint's network (or a fresh one): the 1-D scan student or the grid student; `act_dim` 2 =
+    (steer, speed), 8 = a plan (`state_rl --action plan`, the checkpoint's own "act_dim")"""
     from .state_student import Student
     g = bool(sck_or_none.get("grid", False)) if sck_or_none is not None else bool(grid)
+    if sck_or_none is not None:
+        act_dim = int(sck_or_none.get("act_dim", 2))
     if g:
         sub = int(env.ecfg.scan_subsample)
         m = StudentGrid(frames, beams, ego_dim, env.sim.lidar.angles[::sub].float().cpu(), lidar_mount(env),
-                        float(env.cfg.lidar.range_max)).to(device)
+                        float(env.cfg.lidar.range_max), act_dim=act_dim).to(device)
     else:
-        m = Student(frames, beams, ego_dim).to(device)
+        m = Student(frames, beams, ego_dim, act_dim).to(device)
     if sck_or_none is not None:
         m.load_state_dict(sck_or_none["student"])
     m.rev_ext = float(getattr(env.ecfg, "reverse_ext", 0.0) or 0.0)      # the env's range (built from the teacher's)

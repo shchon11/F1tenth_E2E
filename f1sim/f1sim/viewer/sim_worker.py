@@ -981,7 +981,9 @@ class SimWorker:
         state_ck = None
         if skind:
             state_ck = state_policy.load(ckpt_path)
-            model, extra, mode, is_v2 = None, {}, "direct", False
+            model, extra, is_v2 = None, {}, False
+            # a trajectory checkpoint is a plan session (the console draws the plan MAP follows); else direct
+            mode = "plan" if state_policy.is_plan(state_ck) else "direct"
             recorded, policy_checkpoint, controller_record, embedded = "legacy", None, None, None
             if arm != "legacy":
                 self.say(P.MSG_LOG, gen=gen, text=f"plan 제어기 '{arm}' 은 직접 행동 체크포인트에 적용되지 않아 legacy 로 실행합니다")
@@ -1258,6 +1260,8 @@ class SimWorker:
         if skind:
             for _k, _v in state_policy.env_overrides(state_ck, skind).items():
                 setattr(env_cfg, _k, _v)
+            # the v2 limits read a v2 network's nearest-car head, which these checkpoints do not have
+            env_cfg.opponent_speed_limit = False; env_cfg.obstacle_speed_limit = False
         sim_cfg = viewer_config(compile_enabled, randomize=cfg.randomize)
         if skind:
             sim_cfg.lidar.n_beams = int(state_policy.contract(state_ck, skind)["beams"])
@@ -1339,6 +1343,8 @@ class SimWorker:
         if skind:
             env._track_names = [track.name]
             env._rls = rls                         # `state_rl._line_speed`: the line this session built
+            from ..learn import state_rl as _srl
+            _srl.apply_plan_spec(env, state_ck.get("args") or {})      # a trajectory checkpoint's plan length
         problems = [] if skind else (obs_spec_problems(model.meta, env_spec, extra.get("skipped") or [], env.act_dim)
                                      + normalizer_problems(spec, env_spec))
         if problems:
@@ -1399,8 +1405,9 @@ class SimWorker:
         if skind:
             session["act_fn"].session = session        # a student reads the session's observation dict
             session["intro"] = session["act_fn"].intro = state_policy.StateIntro(session["act_fn"])
-            if session["viz"] is None:
-                # what this driver reads, drawn the way the console draws any driver (`state_policy.StateViz`)
+            if session["viz"] is None and mode != "plan":
+                # what this driver reads, drawn the way the console draws any driver (`state_policy.StateViz`); a
+                # trajectory checkpoint's own plan is drawn instead, as for every plan policy
                 session["viz"] = state_policy.StateViz(session["act_fn"])
         if compile_enabled:
             for i in range(8):

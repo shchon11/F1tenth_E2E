@@ -1,0 +1,91 @@
+{
+ "ckpt": "/home/shchon11/F1tenth_E2E/checkpoints/korea26_v2_ppo_s2421_u512_nearcar_slow.pt",
+ "K": 1,
+ "speed_lookahead": 0.15,
+ "wp_horizon_s": 0.3,
+ "windows": 2560,
+ "rows": 2560,
+ "lap": 9.506250000000069,
+ "dims": {
+  "kappa1": {
+   "steer_deg": 43.811,
+   "v_cmd": 0.068,
+   "by_step": [
+    [
+     43.81,
+     0.068
+    ]
+   ]
+  },
+  "kappa2": {
+   "steer_deg": 21.015,
+   "v_cmd": 0.022,
+   "by_step": [
+    [
+     21.01,
+     0.022
+    ]
+   ]
+  },
+  "kappa3": {
+   "steer_deg": 14.233,
+   "v_cmd": 0.002,
+   "by_step": [
+    [
+     14.23,
+     0.002
+    ]
+   ]
+  },
+  "kappa4": {
+   "steer_deg": 9.455,
+   "v_cmd": 0.0,
+   "by_step": [
+    [
+     9.45,
+     0.0
+    ]
+   ]
+  },
+  "v1": {
+   "steer_deg": 13.212,
+   "v_cmd": 0.221,
+   "by_step": [
+    [
+     13.21,
+     0.221
+    ]
+   ]
+  },
+  "v2": {
+   "steer_deg": 1.595,
+   "v_cmd": 3.606,
+   "by_step": [
+    [
+     1.59,
+     3.606
+    ]
+   ]
+  },
+  "v3": {
+   "steer_deg": 0.0,
+   "v_cmd": 1.15,
+   "by_step": [
+    [
+     0.0,
+     1.15
+    ]
+   ]
+  },
+  "v4": {
+   "steer_deg": 0.0,
+   "v_cmd": 0.014,
+   "by_step": [
+    [
+     0.0,
+     0.014
+    ]
+   ]
+  }
+ }
+}

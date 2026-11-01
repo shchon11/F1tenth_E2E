@@ -57,12 +57,21 @@ def contract(ck: dict, kind: str) -> dict:
                 reverse_ext=float(a.get("reverse_ext", 0.0) or 0.0), repeat=rep)
 
 
+def is_plan(ck: dict) -> bool:
+    """a checkpoint that outputs a trajectory followed by MAP (`state_rl --action plan`, 11-01)"""
+    from ..learn import state_rl
+    return state_rl.plan_of(ck.get("args") or {})
+
+
 def env_overrides(ck: dict, kind: str) -> dict:
     """EnvConfig fields for this checkpoint's contract (as `state_student.make_env_like` sets them): a direct command
-    over [0, 10] m/s from the v1 observation (students) or the privileged state (teachers)."""
+    over [0, 10] m/s, or a plan and its follower (`state_rl.plan_env_fields`), from the v1 observation (students) or the
+    privileged state (teachers)."""
+    from ..learn import state_rl
     c = contract(ck, kind)
     kw = dict(action_mode="direct", obs_version=1, scan_stack=c["frames"], scan_stride=c["stride"], v_max_policy=10.0,
               reverse_ext=c["reverse_ext"])
+    kw.update(state_rl.plan_env_fields(ck.get("args") or {}))
     if kind == "teacher":
         kw.update(priv_props=True, priv_time=True)
     return kw
@@ -72,10 +81,13 @@ def describe(ck: dict, kind: str, path: str) -> str:
     """one line for the console's header"""
     run = os.path.basename(os.path.dirname(os.path.realpath(path)))
     name = os.path.basename(os.path.realpath(path))
+    a = ck.get("args") or {}
+    out = (f"궤적(경로점 4 x 곡률·속도, {float(a.get('plan_horizon', 0.6)):.1f} s) -> MAP, {40 // max(1, int(a.get('repeat', 2)))} Hz"
+           if is_plan(ck) else "직접 행동 20 Hz")
     if kind == "teacher":
-        base = " + 혼자 선생 혼합" if (ck.get("args") or {}).get("base") else ""
-        return f"참 상태 선생(오라클){base}: {run}/{name} · 직접 행동 20 Hz"
-    return f"라이다 격자 학생: {run}/{name} · 반복 {ck.get('iter', '?')} · 스캔 {ck['frames']}장 · 직접 행동 20 Hz"
+        base = " + 혼자 선생 혼합" if a.get("base") else ""
+        return f"참 상태 선생(오라클){base}: {run}/{name} · {out}"
+    return f"라이다 격자 학생: {run}/{name} · 반복 {ck.get('iter', '?')} · 스캔 {ck['frames']}장 · {out}"
 
 
 def _to(x, device):
@@ -104,7 +116,7 @@ class StatePolicyRunner:
         self.k = 0
         self.session: Optional[dict] = None
         B = int(self.lid.numel())
-        self.last = torch.zeros(B, 2, device=device)
+        self.last = torch.zeros(B, state_rl.act_dim_of(ck.get("args") or {}), device=device)
         if kind == "teacher":
             self.tp = state_rl.TeacherPolicy(env, ck, device)
         else:

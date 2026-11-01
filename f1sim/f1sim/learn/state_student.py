@@ -32,15 +32,15 @@ def _rev_scale(y, ext):
 
 
 class Student(nn.Module):
-    """scan frames (B, F, N) + ego (B, E) -> (steer, speed) in [-1, 1] (tanh)."""
+    """scan frames (B, F, N) + ego (B, E) -> the action in [-1, 1] (tanh): (steer, speed), or a plan's numbers."""
 
-    def __init__(self, frames, beams, ego_dim):
+    def __init__(self, frames, beams, ego_dim, act_dim=2):
         super().__init__()
         self.conv = nn.Sequential(nn.Conv1d(frames, 32, 7, stride=3), nn.ReLU(), nn.Conv1d(32, 64, 5, stride=2), nn.ReLU(),
                                   nn.Conv1d(64, 64, 5, stride=2), nn.ReLU(), nn.AdaptiveAvgPool1d(32), nn.Flatten(),
                                   nn.Linear(64 * 32, 256), nn.ReLU())
         self.ego = nn.Sequential(nn.Linear(ego_dim, 128), nn.ReLU())
-        self.head = nn.Sequential(nn.Linear(384, 256), nn.ReLU(), nn.Linear(256, 2), nn.Tanh())
+        self.head = nn.Sequential(nn.Linear(384, 256), nn.ReLU(), nn.Linear(256, act_dim), nn.Tanh())
 
     rev_ext = 0.0                                   # `EnvConfig.reverse_ext`: the speed output spans [-1 - ext, 1]
 
@@ -92,6 +92,13 @@ def main():
     ck = torch.load(a.teacher, map_location=device, weights_only=False)
     a.v_min = float(ck["args"].get("v_min", 0.0) or 0.0)       # the teacher's command range (it may reverse), saved in args
     a.reverse_ext = float(ck["args"].get("reverse_ext", 0.0) or 0.0)
+    # a plan teacher (`state_rl --action plan`, 11-01): the student outputs the same trajectory through the same follower,
+    # decided at the teacher's rate
+    a.action = str(ck["args"].get("action", "direct") or "direct")
+    if state_rl.plan_of(a):
+        a.plan_lookahead, a.plan_horizon = ck["args"].get("plan_lookahead", 0.235), ck["args"].get("plan_horizon", 0.6)
+        a.repeat = int(ck["args"].get("repeat", a.repeat))
+    A = state_rl.act_dim_of(a)
     env = state_rl.build_env(a, device, extra=dict(obs_version=1, scan_stack=int(a.frames), scan_stride=int(a.stride)))
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
@@ -104,7 +111,7 @@ def main():
         if float(a.removal_p) > 0 else None
     unwedge = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
 
-    last_a = torch.zeros(B, 2, device=device)
+    last_a = torch.zeros(B, A, device=device)
     # the teacher as it drives (state_rl.TeacherPolicy): its observation, norm, mean action and, with --base, the mixture
     tp = state_rl.TeacherPolicy(env, ck, device, t_beams=t_beams if t_scan else 0)
     teacher, tnorm = tp.net, tp.nrm
@@ -112,7 +119,7 @@ def main():
     egov = lambda ob: torch.cat([ob[k][lid].float().reshape(B, -1) for k in ego_keys], 1)
     F, N = obs["scan"].shape[1], obs["scan"].shape[2]; E = egov(obs).shape[1]
     from .lidar_grid import OdomHist, make_student
-    student = make_student(None, env, F, N, E, bool(a.grid), device)
+    student = make_student(None, env, F, N, E, bool(a.grid), device, act_dim=A)
     oh = OdomHist(env, lid, F, int(a.stride)) if a.grid else None
     if oh is not None:
         oh.update()
@@ -123,7 +130,10 @@ def main():
     # does not fit beside a teacher run on one GPU; minibatches are copied over per step
     bdev = torch.device("cpu") if a.buffer_cpu else device
     b_scan = torch.zeros(cap, F, N, dtype=torch.float16, device=bdev, pin_memory=bool(a.buffer_cpu))
-    b_ego = torch.zeros(cap, E, device=device); b_y = torch.zeros(cap, 2, device=device)
+    b_ego = torch.zeros(cap, E, device=device); b_y = torch.zeros(cap, A, device=device)
+    # the loss weight per action dimension: steering twice the speed's, as for (steer, speed); a plan's curvatures steer
+    w_dim = torch.tensor([2.0, 1.0] if A == 2 else [2.0] * state_rl.PLAN_KAPPA_DIMS + [1.0] * (A - state_rl.PLAN_KAPPA_DIMS),
+                         device=device)
     b_rel = torch.zeros(cap, F, 3, device=device)                     # the grid student's frame poses (odometry)
     b_w = torch.ones(cap, device=device)
     n_buf = 0; ptr = 0
@@ -186,7 +196,7 @@ def main():
             for i in range(0, n_buf, int(a.batch)):
                 j = perm[i:i + int(a.batch)]
                 pred = stud(b_scan[j.to(bdev)].to(device, non_blocking=True).float(), b_ego[j], b_rel[j])
-                per = ((pred - b_y[j]) ** 2 * torch.tensor([2.0, 1.0], device=device)).mean(1)
+                per = ((pred - b_y[j]) ** 2 * w_dim).mean(1)
                 loss = (per * b_w[j]).sum() / b_w[j].sum()
                 opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
                 losses.append(float(loss))
@@ -203,7 +213,7 @@ def main():
               f"학생-선생 차이 {st['student_vs_teacher_abs']:.3f} | 손실 {st['loss']:.4f}", flush=True)
         if it % 5 == 0 or it == int(a.iters):
             torch.save({"student": student.state_dict(), "frames": F, "beams": N, "ego_dim": E, "ego_keys": ego_keys,
-                        "args": vars(a), "iter": it, "grid": bool(a.grid)},
+                        "args": vars(a), "iter": it, "grid": bool(a.grid), "act_dim": A},
                        os.path.join(out, f"student_i{it}.pt"))
     print(f"[state_student] {a.name} 끝", flush=True)
 
@@ -447,14 +457,17 @@ def evaluate_like():
             ov_["v_min_policy"] = v_min
         if r_ext:
             ov_["reverse_ext"] = r_ext
+        ov_.update(state_rl.plan_env_fields(ck["args"]))         # a plan checkpoint: its trajectory and MAP (11-01)
         env, cfg, ecfg, md = make_env_like(ref, device, n_beams, frames, stride, is_teacher, override=(ov_ or None))
+        state_rl.apply_plan_spec(env, ck["args"])
         seed = int(md["seed"]); envs = int(md["envs"])
         lid = env.learner_ids; B = int(lid.numel())
 
         class Pol:
             """decides every R steps (the 20 Hz the policies were trained at), holds in between"""
             def __init__(self):
-                self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device); self.last = torch.zeros(B, 2, device=device)
+                self.t = 0; self.act = torch.zeros(env.B, env.act_dim, device=device)
+                self.last = torch.zeros(B, state_rl.act_dim_of(ck["args"]), device=device)
                 self.bound = 0; self.n_rule = 0
                 self.n_gate = 0; self.n_dec = 0                    # --base mixtures: decisions the race policy drove
                 self.stuck = 0; self.n_live = 0                    # learner steps below 0.3 m/s from 3 s into an episode

@@ -68,9 +68,11 @@ def build_env(a, device, extra=None):
         slot.update(json.loads(getattr(a, "opp_slot", "") or "{}"))          # `--opp-slot`: a stage's opponents
         from .. import opponent_slots as opp_sl
         e.update(race_size=2, opponent="slots", opponent_slots=opp_sl.parse_slots(json.dumps([slot])))
+    e.update(plan_env_fields(a))
     e.update(extra or {})
     env = common.make_env(trs, int(a.envs), device, EnvConfig(**e), cfg=cfg, seed=int(a.seed), rls=rls,
                           teacher_limits=limits)
+    apply_plan_spec(env, a)
     env._track_names = list(tracks); env._rls = rls          # `--path-plan`: the planner's reference lines
     return env
 
@@ -466,14 +468,15 @@ class TeacherPolicy:
     def __init__(self, env, ck, device, t_beams=0):
         ar = ck["args"]
         self.ck, self.ext = ck, float(ar.get("reverse_ext", 0.0) or 0.0)
+        self.ar, self.A = ar, act_dim_of(ar)
         self.sobs = StateObs(env, scan=bool(ar.get("scan_obs", 0)), corridor=bool(ar.get("corridor_obs", 0)),
                              corridor_cars=bool(ar.get("corridor_cars", 0)), car_channel=bool(ar.get("car_channel", 0)),
                              bev=bool(ar.get("bev", 0)), path_plan=int(ar.get("path_plan", 0) or 0),
                              plan_ref=ar.get("plan_ref"), t_beams=int(t_beams), car_st=bool(ar.get("car_st", 0)),
                              scan_nocars=bool(ar.get("scan_nocars", 0)))
         B = int(env.learner_ids.numel())
-        self.o = self.sobs(torch.zeros(B, 2, device=device))
-        self.net = ActorCritic(self.o.shape[1], bev=ck.get("bev")).to(device)
+        self.o = self.sobs(torch.zeros(B, self.A, device=device))
+        self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev")).to(device)
         self.net.load_state_dict(ck["model"], strict=False); self.net.eval()
         self.nrm = RunningNorm(self.o.shape[1], device); self.nrm.load_state_dict(ck["norm"])
         self.mix = SoloMix(env, ar["base"], device, float(ar.get("base_reach", BASE_REACH)),
@@ -481,7 +484,7 @@ class TeacherPolicy:
 
     def policy(self, o):
         """the race policy alone at observation `o`"""
-        return clamp_act(self.net.pi(self.nrm(o)), self.ext)
+        return clamp_any(self.net.pi(self.nrm(o)), self.ar)
 
     def __call__(self, last):
         self.o = self.sobs(last)
@@ -659,6 +662,90 @@ def clamp_act(a, ext=0.0):
     return torch.stack([a[..., 0].clamp(-1, 1), a[..., 1].clamp(-1 - ext, 1)], -1)
 
 
+#: `--action plan` (11-01; the user: "누가 제어기까지 시뮬에서 쳐 먹이래? sim2real 갭을 늘리는 짓거리를 왜하고있는건데?",
+#: "trajectory 로 e2e 하라니까"): the policy outputs a TRAJECTORY -- the v2 plan, 4 waypoints x (curvature, speed) in its
+#: own frame (`mpc` speed mode "wp4") -- and ForzaETH's MAP follows it, as the car's controller node does; the plan is
+#: decided every --repeat control steps and held on the track in between (`EnvConfig.decision_every`). Every direct
+#: (steer, speed) policy before learned the simulator's tyres and steering itself (sst12: |side slip| > 10 deg 11-15 % of
+#: the time, p99 40-47 deg). The follower is the v2 entry's tuned Korea MAP (`korea26_v2_ppo_s2421_u512`'s contract),
+#: its speed read --plan-lookahead s ahead (10-24: the drivetrain lag 0.235 s gives v2 its authority), the plan
+#: --plan-horizon s of the measured speed long (`docs/research/plan-output-2026-11-01`).
+PLAN_MAP = {"t_clip_min": 0.9573609450243445, "t_clip_max": 4.779545745206895, "m_l1": 0.4731895571264694,
+            "q_l1": -0.4957209879277062, "speed_lookahead": 0.0, "lat_err_coeff": 0.0, "acc_scaler_for_steer": 0.8857957332213734,
+            "dec_scaler_for_steer": 0.8092827304787531, "start_scale_speed": 8.700352304982314,
+            "downscale_factor": 0.24481196266259284, "speed_lookahead_for_steer": 0.060053547789199635,
+            "v_steer_gain_max": 1.2810367013484487, "l1_speed": "measured", "l1_floor": True, "l1_point": "arc",
+            "steer_speed": "planned", "lut_interp": "code", "delay_comp": 0.021416617709494996, "lat_slow": 0.0,
+            "end_scale_speed": 9.580093136639107}
+PLAN_KAPPA_DIMS = 4                 # wp4: kappa_1..4 first, then v_1..4
+
+
+def _ar(x) -> dict:
+    return x if isinstance(x, dict) else vars(x)
+
+
+def plan_of(ar) -> bool:
+    """a run (its argparse namespace or a checkpoint's args) that outputs plans"""
+    return str((_ar(ar) or {}).get("action", "direct") or "direct") == "plan"
+
+
+def act_dim_of(ar) -> int:
+    from ..mpc import act_dim as _act_dim
+    return _act_dim("wp4") if plan_of(ar) else 2
+
+
+def clamp_any(a, ar):
+    """this run's executable action: a plan's numbers in [-1, 1]; (steer, speed) as `clamp_act`"""
+    if plan_of(ar):
+        return a.clamp(-1.0, 1.0)
+    return clamp_act(a, float(_ar(ar).get("reverse_ext", 0.0) or 0.0))
+
+
+def mean_bounds(ar, A: int):
+    """(lo, hi, margin) of each action dimension, for `--soft-bound` / `--bound-loss` / the dead-decision count"""
+    if plan_of(ar):
+        return [-1.0] * A, [1.0] * A, [0.1] * PLAN_KAPPA_DIMS + [0.2] * (A - PLAN_KAPPA_DIMS)
+    ext = float(_ar(ar).get("reverse_ext", 0.0) or 0.0)
+    return [-1.0, -1.0 - ext], [1.0, 1.0], [0.1, 0.2]
+
+
+def steer_speed_dims(ar, A: int):
+    """(steering dims, speed dims): the plan's curvatures and speeds, or (steer,) and (speed,)"""
+    if plan_of(ar):
+        return list(range(PLAN_KAPPA_DIMS)), list(range(PLAN_KAPPA_DIMS, A))
+    return [0], [1]
+
+
+def std_floor_of(ar, A: int):
+    """`--std-floor` (steer, speed) per action dimension: a plan's curvatures take the steer floor, its speeds the speed's"""
+    f = _ar(ar).get("std_floor")
+    if not f:
+        return None
+    f = [float(x) for x in f]
+    if plan_of(ar) and len(f) == 2:
+        return [f[0]] * PLAN_KAPPA_DIMS + [f[1]] * (A - PLAN_KAPPA_DIMS)
+    return f
+
+
+def apply_plan_spec(env, ar) -> None:
+    """the plan's length (`--plan-horizon`, `mpc.PlanSpec.wp_horizon_s`) on the env's follower -- every env a plan
+    checkpoint drives in (training, the tools, the console) calls this after building it"""
+    if plan_of(ar) and getattr(env, "tracker", None) is not None:
+        import dataclasses
+        inner = env.tracker._inner if hasattr(env.tracker, "_inner") else env.tracker
+        inner.spec = dataclasses.replace(inner.spec, wp_horizon_s=float(_ar(ar).get("plan_horizon", 0.6) or 0.6))
+
+
+def plan_env_fields(ar) -> dict:
+    """EnvConfig fields of a plan run (`--action plan`); {} for a direct one"""
+    if not plan_of(ar):
+        return {}
+    a = _ar(ar)
+    return dict(action_mode="plan", speed_mode="wp4", speed_command="tracker", plan_follower="map",
+                plan_follower_map=dict(PLAN_MAP, speed_lookahead=float(a.get("plan_lookahead", 0.235))),
+                decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0)
+
+
 def soft_bound(z, lo, hi, m):
     """the identity on [lo + m, hi - m]; beyond, lo / hi approached smoothly (tanh, slope 1 at the knee)"""
     up, dn = hi - m, lo + m
@@ -770,11 +857,16 @@ def train(a):
     lid = env.learner_ids
     B = int(lid.numel())
     act_full = torch.zeros(env.B, env.act_dim, device=device)
-    last_a = torch.zeros(B, 2, device=device)
+    A = act_dim_of(a)
+    if plan_of(a) and (a.base or int(a.unwedge) or float(a.reverse_ext)):
+        raise SystemExit("--action plan: no --base (a direct solo teacher), --unwedge or --reverse-ext (MAP backs a stalled car out)")
+    if int(env.act_dim) != A:
+        raise SystemExit(f"the env's action is {env.act_dim}-wide, this run's {A}")
+    last_a = torch.zeros(B, A, device=device)
     o = obs_fn(last_a)
     D = obs_fn.dim
     bev = (BEV_C, BEV_H, BEV_W) if a.bev else None
-    model = ActorCritic(D, log_std=a.log_std, std_floor=[float(x) for x in a.std_floor] if a.std_floor else None,
+    model = ActorCritic(D, act_dim=A, log_std=a.log_std, std_floor=std_floor_of(a, A),
                         bev=bev, shared_enc=bool(a.shared_enc)).to(device)
     norm = RunningNorm(D, device, raw_tail=obs_fn.grid_dim)
     ret_rms = RunningNorm(1, device)
@@ -816,12 +908,12 @@ def train(a):
         missing = [k for k in model.load_state_dict(sd, strict=False).missing_keys
                    if k not in ("std_floor", "mean_lo", "mean_hi", "mean_m")]
         if a.std_floor:                                    # this run's floor, not the one an --init checkpoint carried
-            model.std_floor.copy_(torch.tensor([float(x) for x in a.std_floor], device=device))
+            model.std_floor.copy_(torch.tensor(std_floor_of(a, A), device=device))
         if missing:
             print(f"[state_rl] --init에 없는 매개변수(새로 시작): {missing}", flush=True)
         norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
     if int(a.soft_bound):
-        model.set_mean_bounds([-1.0, -1.0 - float(a.reverse_ext)], [1.0, 1.0], [0.1, 0.2])
+        model.set_mean_bounds(*mean_bounds(a, A))
     elif bool((model.mean_hi < 1e5).any()):
         print("[state_rl] --init의 정책 평균 부드러운 범위를 이어받음", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
@@ -832,7 +924,10 @@ def train(a):
     log = open(os.path.join(out, "progress.jsonl"), "a")
     T, R = int(a.horizon), int(a.repeat)
     touching = torch.zeros(B, dtype=torch.bool, device=device)
-    eps_n = torch.randn(B, 2, device=device)                       # the correlated exploration state (--noise-corr)
+    eps_n = torch.randn(B, A, device=device)                       # the correlated exploration state (--noise-corr)
+    lo_b, hi_b, _m = mean_bounds(a, A)
+    lo_b, hi_b = torch.tensor(lo_b, device=device), torch.tensor(hi_b, device=device)
+    d_steer, d_speed = steer_speed_dims(a, A)
     remover = PropRemoval(env, float(a.removal_p), float(a.removal_s[0]), float(a.removal_s[1]), seed=int(a.seed)) \
         if float(a.removal_p) > 0 else None
     unwedge = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
@@ -852,7 +947,7 @@ def train(a):
         price = a.price_start + (a.price - a.price_start) * min(1.0, max(0.0, k))
         # the --bev observation is ~7.9k wide: held in half precision (occupancy in [0, 1], velocities /5), 2 GB at 2048 envs
         bo = torch.zeros(T, B, D, device=device, dtype=torch.float16 if a.bev else torch.float32)
-        ba = torch.zeros(T, B, 2, device=device)
+        ba = torch.zeros(T, B, A, device=device)
         blp = torch.zeros(T, B, device=device); bv = torch.zeros(T + 1, B, device=device)
         br = torch.zeros(T, B, device=device); bd = torch.zeros(T, B, device=device)
         bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
@@ -886,15 +981,15 @@ def train(a):
                     bg[t] = geo_risk(env, lid)
                 rew = torch.zeros(B, device=device); done = torch.zeros(B, dtype=torch.bool, device=device)
                 hit_now = torch.zeros(B, dtype=torch.bool, device=device)
-                exe = clamp_act(act, a.reverse_ext)
+                exe = clamp_any(act, a)
                 if mix is not None:
                     exe = mix(exe, last_a); bm[t] = mix.gate.float()
                 # dead decisions (11-01): the mean beyond the action bound by more than 2 sigma -- every sample executes the
                 # bound, so the advantage says nothing about that dimension there (`--bound-loss`)
                 mu_, sd_ = model.raw_mean, dist.stddev                   # the network's own output, before any squash
-                dead_n += torch.stack([bm[t].sum(), (bm[t] * ((mu_[:, 1] > 1 + 2 * sd_[:, 1])
-                                                              | (mu_[:, 1] < -1 - float(a.reverse_ext) - 2 * sd_[:, 1])).float()).sum(),
-                                       (bm[t] * (mu_[:, 0].abs() > 1 + 2 * sd_[:, 0]).float()).sum()])
+                dd_ = (mu_ > hi_b + 2 * sd_) | (mu_ < lo_b - 2 * sd_)    # (B, A): this dimension dead here
+                dead_n += torch.stack([bm[t].sum(), (bm[t] * dd_[:, d_speed].any(1).float()).sum(),
+                                       (bm[t] * dd_[:, d_steer].any(1).float()).sum()])
                 act_full[lid] = exe
                 for k in range(R):
                     if unwedge is not None:
@@ -992,7 +1087,7 @@ def train(a):
                 adv_n = (adv - adv.mean()) / (adv.std() + 1e-8)
         t_roll = time.time() - tr0
         N = T * B
-        fo, fa, flp, fadv, fret = bo.reshape(N, D), ba.reshape(N, 2), blp.reshape(N), adv_n.reshape(N), ret_n.reshape(N)
+        fo, fa, flp, fadv, fret = bo.reshape(N, D), ba.reshape(N, A), blp.reshape(N), adv_n.reshape(N), ret_n.reshape(N)
         fyh, fvh = y_hit.reshape(N), v_hit.reshape(N)
         fm = bm.reshape(N)
         mb = N // int(a.minibatches)
@@ -1016,8 +1111,7 @@ def train(a):
                     # Alone and at weight 1 it wrecked the policy (srl57: KL 5.8 on update 1, 4.1 -> 1.7 m/s and 16 wall /
                     # prop hits per km by update 5 -- pulling the far-out outputs moved the in-range ones with them)
                     mu_j = model.raw_mean
-                    lo_ = torch.tensor([-1.0, -1.0 - float(a.reverse_ext)], device=device)
-                    over = (mu_j - 1.0).clamp_min(0) ** 2 + (lo_ - mu_j).clamp_min(0) ** 2
+                    over = (mu_j - hi_b).clamp_min(0) ** 2 + (lo_b - mu_j).clamp_min(0) ** 2
                     loss = loss + float(a.bound_loss) * over.sum(1).mean()
                 if a.hit_head > 0:
                     bce = nn.functional.binary_cross_entropy_with_logits(hl_j, fyh[j], reduction="none")
@@ -1065,19 +1159,23 @@ def evaluate(a):
     progress, hard hits per km."""
     device = torch.device(a.device)
     ck = torch.load(a.eval, map_location=device, weights_only=False)
+    if plan_of(ck["args"]):
+        # a plan checkpoint drives through the follower it was trained with, whatever this command line says
+        for k in ("action", "plan_lookahead", "plan_horizon", "repeat"):
+            setattr(a, k, ck["args"].get(k, getattr(a, k)))
     env = build_env(a, device)
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     env.reset(seed=int(a.seed))
     lid = env.learner_ids; B = int(lid.numel())
     tp = TeacherPolicy(env, ck, device)                   # its observation and, with --base, the gated mixture
-    act = torch.zeros(B, 2, device=device)
+    act = torch.zeros(B, tp.A, device=device)
     w_col = abs(env.ecfg.reward_collision)
     act_full = torch.zeros(env.B, env.act_dim, device=device)
     touching = torch.zeros(B, dtype=torch.bool, device=device)
     prog = hw = hc = 0.0; laps = []; steps = 0
     R = int(a.repeat)
-    eps = torch.zeros(B, 2, device=device)
+    eps = torch.zeros(B, tp.A, device=device)
     for t in range(int(a.eval_steps) // R):
         if a.eval_noise:
             # the training's exploration (AR(1) noise at the policy's std) on the race policy: the J that PPO's gradient
@@ -1086,7 +1184,7 @@ def evaluate(a):
             dist = tp.net.dist(tp.nrm(tp.o))
             al = float(a.noise_corr)
             eps = al * eps + math.sqrt(1.0 - al * al) * torch.randn_like(eps)
-            a_pol = clamp_act(dist.mean + dist.stddev * eps, tp.ext)
+            a_pol = clamp_any(dist.mean + dist.stddev * eps, tp.ar)
             act = tp.mix(a_pol, act) if tp.mix is not None else a_pol
         else:
             act = tp(act)
@@ -1122,7 +1220,12 @@ def main():
     ap.add_argument("--episode-s", type=float, default=40.0)
     ap.add_argument("--updates", type=int, default=600)
     ap.add_argument("--horizon", type=int, default=64)
-    ap.add_argument("--repeat", type=int, default=2)
+    ap.add_argument("--repeat", type=int, default=2, help="control steps per decision (40 Hz / X); with --action plan the plan "
+                    "is held on the track for these steps (EnvConfig.decision_every)")
+    ap.add_argument("--action", default="direct", choices=("direct", "plan"),
+                    help="plan (11-01): a trajectory, 4 waypoints x (curvature, speed), followed by MAP; direct: (steer, speed)")
+    ap.add_argument("--plan-lookahead", type=float, default=0.235, help="--action plan: MAP reads the plan's speed this far ahead [s]")
+    ap.add_argument("--plan-horizon", type=float, default=0.6, help="--action plan: the plan is this many s of the measured speed long")
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--minibatches", type=int, default=8)
     ap.add_argument("--lr", type=float, default=3e-4)
