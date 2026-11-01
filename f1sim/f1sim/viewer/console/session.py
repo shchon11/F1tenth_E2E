@@ -99,9 +99,17 @@ def _drv_in_body_frame(fr: dict):
         p = np.asarray(xy, np.float32).reshape(-1, 2)
         dx, dy = p[:, 0] - x, p[:, 1] - y
         return np.stack([dx * c - dy * s_, dx * s_ + dy * c], 1).astype(np.float32)
-    return {"title": drv.get("title", ""), "legend": drv.get("legend", ""),
-            "lines": [dict(l, xy=body(l["xy"])) for l in drv.get("lines") or []],
-            "points": [dict(q, xy=body(q["xy"])) for q in drv.get("points") or []]}
+    out = {"title": drv.get("title", ""), "legend": drv.get("legend", ""),
+           "lines": [dict(l, xy=body(l["xy"])) for l in drv.get("lines") or []],
+           "points": [dict(q, xy=body(q["xy"])) for q in drv.get("points") or []]}
+    if drv.get("quads") is not None:
+        # a state teacher's corridor cells (`state_policy.StateViz`): (N, 4) corners each
+        qd = drv["quads"]
+        xy = np.asarray(qd["xy"], np.float32)
+        out["quads"] = dict(qd, xy=body(xy.reshape(-1, 2)).reshape(xy.shape))
+    if drv.get("grid") is not None:
+        out["grid"] = drv["grid"]          # a grid student's input image, already in the car frame
+    return out
 
 
 def _saliency_colors(sal) -> np.ndarray:

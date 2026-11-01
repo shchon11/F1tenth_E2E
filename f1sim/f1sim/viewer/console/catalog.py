@@ -41,7 +41,7 @@ TEACHER_KINDS_MODULE = "f1sim.opponent_slots"
 #: Not imported from there: that module pulls in torch, and this one is on the first-paint path.
 RUNS_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("F1SIM_RUNS") or os.path.join("~", "f1sim_runs")))
-CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt")
+CHECKPOINT_NAMES = ("ppo_latest.pt", "student_latest.pt", "state_latest.pt")    # state_latest: a state_rl teacher / grid student
 
 #: The policies to drive, one per map, listed first and by name (2026-10-19, the user: "도대체
 #: 정책들중 뭘 실행해야하는거야? 뭐가 뭔지 모르겠네" -- three picks were buried under some 280
@@ -129,7 +129,8 @@ def list_runs(runs_dir: str = RUNS_DIR) -> List[RunInfo]:
             continue
         path, size = best
         out.append(RunInfo(name=entry.name, path=entry.path, checkpoint=path,
-                           kind="PPO" if os.path.basename(path).startswith("ppo") else "DAgger",
+                           kind=("PPO" if os.path.basename(path).startswith("ppo") else
+                                 "상태" if os.path.basename(path).startswith("state") else "DAgger"),
                            mtime=best_t, size_mb=size / 1e6))
     picks = {p["run"]: (i, p) for i, p in enumerate(load_picks(runs_dir))}
     for r in out:

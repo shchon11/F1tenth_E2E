@@ -143,6 +143,8 @@ class PolicyInputPanel(QtWidgets.QWidget):
         for r_ in range(step, int(self.span) + 1, step):
             p.drawText(QtCore.QPointF(cx + 3, cy - r_ * px_per_m - 3), f"{r_}m")
 
+        if self._drv and (self._drv.get("grid") is not None or self._drv.get("quads") is not None):
+            self._draw_under(p, cx, cy, px_per_m)
         if self._scan is None:
             p.setPen(QtGui.QColor(C["text.2"]))
             p.drawText(self.rect(), QtCore.Qt.AlignCenter, "데이터 없음")
@@ -222,8 +224,45 @@ class PolicyInputPanel(QtWidgets.QWidget):
         if len(PolicyInputPanel.paint_ms) > 400:
             del PolicyInputPanel.paint_ms[:200]
 
+    def _draw_under(self, p, cx, cy, px_per_m):
+        """Under the scan: a grid student's occupancy-grid image (`grid`) or a state teacher's corridor cells (`quads`),
+        from `viewer.state_policy.StateViz`, in the body frame."""
+        def q(xy):
+            return [QtCore.QPointF(cx - float(b) * px_per_m, cy - float(a) * px_per_m) for a, b in xy]
+        g = self._drv.get("grid")
+        if g is not None:
+            # rows = forward cells, columns = left cells from the right edge; on screen forward is up and left is left,
+            # so the image is the grid flipped on both axes, its top-left at (left edge, far edge)
+            img_a = np.ascontiguousarray(np.asarray(g["rgba"], np.uint8)[::-1, ::-1])
+            H, W = img_a.shape[:2]
+            res, x0 = float(g["res"]), float(g["x0"])
+            qi = QtGui.QImage(img_a.data, W, H, 4 * W, QtGui.QImage.Format_RGBA8888)
+            tgt = QtCore.QRectF(cx - (W * res / 2) * px_per_m, cy - (x0 + H * res) * px_per_m,
+                                W * res * px_per_m, H * res * px_per_m)
+            p.save()
+            p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
+            p.drawImage(tgt, qi)
+            p.setPen(QtGui.QPen(QtGui.QColor(120, 130, 150, 120), 1.0, QtCore.Qt.DashLine))
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawRect(tgt)
+            p.restore()
+        qd = self._drv.get("quads")
+        if qd is not None:
+            xy = np.asarray(qd["xy"], np.float32)
+            fill, edge = np.asarray(qd["fill"], np.float32), np.asarray(qd["edge"], np.float32)
+            p.save()
+            for k in np.argsort(edge[:, 3]):                     # the cells the action reacts to most, drawn last
+                p.setBrush(_qc(fill[k], float(fill[k][3])))
+                if edge[k][3] < 0.05:
+                    p.setPen(QtCore.Qt.NoPen)
+                else:
+                    p.setPen(QtGui.QPen(_qc(edge[k], float(edge[k][3])), 0.6 + 2.2 * float(edge[k][3])))
+                p.drawPolygon(QtGui.QPolygonF(q(xy[k])))
+            p.restore()
+
     def _draw_driver(self, p, cx, cy, px_per_m):
-        """A non-policy driver's lines and markers, in the body frame (forward up, left left)."""
+        """A non-policy driver's lines and markers, in the body frame (forward up, left left). Marker groups flagged
+        `panel: False` are for the 3D view only (a state student's grid cells, which the panel draws as its image)."""
         def q(xy):
             return [QtCore.QPointF(cx - float(b) * px_per_m, cy - float(a) * px_per_m) for a, b in xy]
         for ln in self._drv.get("lines") or []:
@@ -237,6 +276,8 @@ class PolicyInputPanel(QtWidgets.QWidget):
                 else:
                     p.drawPolyline(QtGui.QPolygonF(pts))
         for grp in self._drv.get("points") or []:
+            if grp.get("panel", True) is False:
+                continue
             r = max(1.5, float(grp.get("px", 6.0)) * 0.35)
             p.setPen(QtGui.QPen(QtGui.QColor(10, 12, 16, 200), 1.0))
             p.setBrush(_qc(grp["rgba"], float(grp["rgba"][3])))

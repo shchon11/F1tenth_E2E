@@ -501,11 +501,11 @@ def resolve_checkpoint(run: str, runs_dir: str, latest: str = "") -> str:
         return path
     if not os.path.isdir(path):
         raise FileNotFoundError(f"런 디렉터리가 없습니다: {path}")
-    for name in ("ppo_latest.pt", "student_latest.pt"):
+    for name in ("ppo_latest.pt", "student_latest.pt", "state_latest.pt"):
         candidate = os.path.join(path, name)
         if os.path.exists(candidate):
             return candidate
-    raise FileNotFoundError(f"{path} 에 ppo_latest.pt / student_latest.pt 가 없습니다.")
+    raise FileNotFoundError(f"{path} 에 ppo_latest.pt / student_latest.pt / state_latest.pt 가 없습니다.")
 
 
 #: A v2 checkpoint (`learn.model_v2`, `meta["arch"] == "v2"`) reads observation contract v2: the
@@ -851,6 +851,16 @@ class SimWorker:
         from ..learn.model import controller_arm_of
         from ..learn.watch import checkpoint_speed_cap, describe_checkpoint_line, latest_run
         ckpt = resolve_checkpoint(run, common.RUNS_DIR, latest_run())
+        from . import state_policy
+        skind = state_policy.state_kind(ckpt)
+        if skind:
+            # a state teacher / grid student (`state_policy`): its own description, no v1 / v2 metadata to read
+            ck = state_policy.load(ckpt)
+            return {"run": run, "path": ckpt, "file": os.path.basename(os.path.realpath(ckpt)),
+                    "age_s": max(0.0, time.time() - os.path.getmtime(ckpt)),
+                    "progress": state_policy.describe(ck, skind, ckpt),
+                    "metrics": "직접 행동 20 Hz · 속도 상한 10 m/s" + (" · 참 상태(오라클, 실차 불가)" if skind == "teacher" else ""),
+                    "speed_cap": 10.0, "cond_source": "", "controller_arm": "legacy"}
         extra = (torch.load(ckpt, map_location="cpu", weights_only=True) or {}).get("extra", {})
         blob = torch.load(ckpt, map_location="cpu", weights_only=False) or {}
         extra = blob.get("extra", {})
@@ -964,81 +974,97 @@ class SimWorker:
             raise StartConfigError(f"plan 제어기 '{arm}' 은 레이스당 차량 수 1에서만 지원합니다 "
                                    f"(학습·벤치마크와 같은 조건). 레이스당 차량 수를 1로 두거나 legacy 를 고르세요.")
         estimator_path = ""
-        # Peek the arm the checkpoint was trained under before loading, so a mismatch is a start
-        # message that names the setting to change rather than the loader's refusal.
-        from ..learn.model import controller_arm_of
-        from ..learn.grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
-        policy_checkpoint = torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=True)
-        recorded = controller_arm_of(policy_checkpoint)
-        if recorded != "legacy" and recorded != arm:
-            raise StartConfigError(f"{os.path.basename(ckpt_path)}: '{recorded}' 제어기로 학습된 체크포인트입니다. "
-                                   "자동 주행에는 기본 정책 또는 자동 제어로 학습된 체크포인트를 선택하세요.")
-        is_v2 = (policy_checkpoint.get("meta") or {}).get("arch") == "v2"
-        if is_v2 and arm not in V2_ARMS:
-            # A v2 policy plans in WP4 (four waypoints x curvature, speed), trained and evaluated under
-            # the legacy tracker only (`ppo_v2` refuses a controller arm); the grip / clearance arms
-            # read a plan's speed columns as linear's two speeds -- the car's controller node refuses
-            # the same combination. "자동" asks the worker to choose, so it chooses legacy and says so.
-            if arm == "auto":
-                self.say(P.MSG_LOG, gen=gen, text="v2 정책(WP4 plan)은 legacy 제어기로 학습된 정책이라 "
-                                                  "자동 제어기 대신 legacy 로 주행합니다")
-                arm = "legacy"
-            else:
-                raise StartConfigError(
-                    f"{os.path.basename(ckpt_path)}: v2 정책(WP4 plan)은 legacy 제어기로만 주행합니다. "
-                    f"'{arm}' 은 plan 의 속도 열을 linear 형식의 두 속도로 읽는 제어기라 WP4 계획을 해석하지 "
-                    f"못합니다. 제어기를 legacy 로 두세요.")
-        controller_record = validate_runtime_checkpoint(policy_checkpoint, arm)
-        if autoselect:
-            refusal = automatic_selection_refusal(controller_record)
-            if refusal is not None:
-                raise StartConfigError(refusal)
-        model, extra = load_checkpoint(ckpt_path, device, allow_controller=(arm != "legacy"))
-        if recorded == "auto":
-            from ..learn.policy_adaptation import require_exact_actor
-            require_exact_actor(model, policy_checkpoint)
-        model.eval()
-        act_dim = model.meta.get("act_dim", 2)
-        from ..mpc import ACT_DIM as PLAN_DIM
-        if act_dim not in (2, PLAN_DIM):
-            raise StartConfigError(
-                f"{os.path.basename(ckpt_path)}: 행동 차원 {act_dim} 은 예전 plan 표현입니다 "
-                f"(현재는 {PLAN_DIM}). 더 최신 런을 고르세요.")
-        mode = "plan" if act_dim == PLAN_DIM else "direct"
-        if bool(getattr(cfg, "opponent_speed_limit", False)) and (
-                mode != "plan" or getattr(getattr(model, "actor", None), "near_car", None) is None):
-            raise StartConfigError(
-                f"{os.path.basename(ckpt_path)}: 앞차 충돌 방지 감속은 정책 신경망의 '가장 가까운 차' 추정 출력을 씁니다 — "
-                f"이 체크포인트에는 그 출력이 없습니다(v2 체크포인트만 있습니다). 앞차 감속을 끄거나 v2 체크포인트를 고르세요.")
-        if bool(getattr(cfg, "obstacle_speed_limit", False)) and (
-                mode != "plan" or getattr(getattr(model, "actor", None), "near_car", None) is None):
-            raise StartConfigError(
-                f"{os.path.basename(ckpt_path)}: 장애물 충돌 방지 감속은 앞차를 멈춰 선 장애물로 보지 않도록 정책 신경망의 "
-                f"'가장 가까운 차' 추정 출력을 씁니다 — 이 체크포인트에는 그 출력이 없습니다(v2 체크포인트만 있습니다). "
-                f"장애물 감속을 끄거나 v2 체크포인트를 고르세요.")
-        if mode == "direct" and arm != "legacy":
-            # The grip arms bound the *plan tracker*; a direct-action checkpoint has none. Refusing
-            # the session for a setting that cannot apply (the deployment default is fixed_low)
-            # made every direct checkpoint unopenable; say what happened and run it as it is.
-            self.say(P.MSG_LOG, gen=gen,
-                     text=f"plan 제어기 '{arm}' 은 직접 행동(direct) 체크포인트에 적용되지 않아 legacy 로 실행합니다")
-            arm = "legacy"
-            estimator_path = ""
-        embedded = controller_record if recorded == "auto" else None
-        if (arm == "auto" or arm.startswith("estimated")) and embedded is None:
-            from .console.protocol import SessionConfig as _SC
-            estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
-            if not estimator_path or not os.path.isfile(estimator_path):
+        # A state_rl teacher or a LiDAR grid student (`state_policy`, 11-01) is not the v1 / v2 format: its own
+        # contract (a direct command at its teacher's rate, the v1 observation or the privileged state) and runner.
+        from . import state_policy
+        skind = state_policy.state_kind(ckpt_path)
+        state_ck = None
+        if skind:
+            state_ck = state_policy.load(ckpt_path)
+            model, extra, mode, is_v2 = None, {}, "direct", False
+            recorded, policy_checkpoint, controller_record, embedded = "legacy", None, None, None
+            if arm != "legacy":
+                self.say(P.MSG_LOG, gen=gen, text=f"plan 제어기 '{arm}' 은 직접 행동 체크포인트에 적용되지 않아 legacy 로 실행합니다")
+            arm, estimator_path = "legacy", ""
+            if bool(getattr(cfg, "opponent_speed_limit", False)) or bool(getattr(cfg, "obstacle_speed_limit", False)):
+                self.say(P.MSG_LOG, gen=gen, text="앞차·장애물 감속은 v2 정책의 출력을 쓰므로 이 체크포인트에는 적용하지 않습니다")
+            speed_cap = float(cfg.speed_cap or 10.0)
+        else:
+            # Peek the arm the checkpoint was trained under before loading, so a mismatch is a start
+            # message that names the setting to change rather than the loader's refusal.
+            from ..learn.model import controller_arm_of
+            from ..learn.grip_runtime import automatic_selection_refusal, validate_runtime_checkpoint
+            policy_checkpoint = torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=True)
+            recorded = controller_arm_of(policy_checkpoint)
+            if recorded != "legacy" and recorded != arm:
+                raise StartConfigError(f"{os.path.basename(ckpt_path)}: '{recorded}' 제어기로 학습된 체크포인트입니다. "
+                                       "자동 주행에는 기본 정책 또는 자동 제어로 학습된 체크포인트를 선택하세요.")
+            is_v2 = (policy_checkpoint.get("meta") or {}).get("arch") == "v2"
+            if is_v2 and arm not in V2_ARMS:
+                # A v2 policy plans in WP4 (four waypoints x curvature, speed), trained and evaluated under
+                # the legacy tracker only (`ppo_v2` refuses a controller arm); the grip / clearance arms
+                # read a plan's speed columns as linear's two speeds -- the car's controller node refuses
+                # the same combination. "자동" asks the worker to choose, so it chooses legacy and says so.
                 if arm == "auto":
-                    self.say(P.MSG_LOG, gen=gen,
-                             text="자동 노면 추정 모델이 없어 기본 제어기(legacy)로 주행합니다. "
-                                  "추정기를 쓰려면 F1SIM_GRIP_ESTIMATOR 를 지정하세요.")
-                    arm, estimator_path = "legacy", ""
+                    self.say(P.MSG_LOG, gen=gen, text="v2 정책(WP4 plan)은 legacy 제어기로 학습된 정책이라 "
+                                                      "자동 제어기 대신 legacy 로 주행합니다")
+                    arm = "legacy"
                 else:
                     raise StartConfigError(
-                        f"제어기 '{arm}' 는 노면 추정 모델이 필요합니다. F1SIM_GRIP_ESTIMATOR 를 "
-                        f"지정하거나, 제어기를 'legacy' 로 두세요 (기본값).")
-        speed_cap = float(cfg.speed_cap or checkpoint_speed_cap(extra, ckpt_path))
+                        f"{os.path.basename(ckpt_path)}: v2 정책(WP4 plan)은 legacy 제어기로만 주행합니다. "
+                        f"'{arm}' 은 plan 의 속도 열을 linear 형식의 두 속도로 읽는 제어기라 WP4 계획을 해석하지 "
+                        f"못합니다. 제어기를 legacy 로 두세요.")
+            controller_record = validate_runtime_checkpoint(policy_checkpoint, arm)
+            if autoselect:
+                refusal = automatic_selection_refusal(controller_record)
+                if refusal is not None:
+                    raise StartConfigError(refusal)
+            model, extra = load_checkpoint(ckpt_path, device, allow_controller=(arm != "legacy"))
+            if recorded == "auto":
+                from ..learn.policy_adaptation import require_exact_actor
+                require_exact_actor(model, policy_checkpoint)
+            model.eval()
+            act_dim = model.meta.get("act_dim", 2)
+            from ..mpc import ACT_DIM as PLAN_DIM
+            if act_dim not in (2, PLAN_DIM):
+                raise StartConfigError(
+                    f"{os.path.basename(ckpt_path)}: 행동 차원 {act_dim} 은 예전 plan 표현입니다 "
+                    f"(현재는 {PLAN_DIM}). 더 최신 런을 고르세요.")
+            mode = "plan" if act_dim == PLAN_DIM else "direct"
+            if bool(getattr(cfg, "opponent_speed_limit", False)) and (
+                    mode != "plan" or getattr(getattr(model, "actor", None), "near_car", None) is None):
+                raise StartConfigError(
+                    f"{os.path.basename(ckpt_path)}: 앞차 충돌 방지 감속은 정책 신경망의 '가장 가까운 차' 추정 출력을 씁니다 — "
+                    f"이 체크포인트에는 그 출력이 없습니다(v2 체크포인트만 있습니다). 앞차 감속을 끄거나 v2 체크포인트를 고르세요.")
+            if bool(getattr(cfg, "obstacle_speed_limit", False)) and (
+                    mode != "plan" or getattr(getattr(model, "actor", None), "near_car", None) is None):
+                raise StartConfigError(
+                    f"{os.path.basename(ckpt_path)}: 장애물 충돌 방지 감속은 앞차를 멈춰 선 장애물로 보지 않도록 정책 신경망의 "
+                    f"'가장 가까운 차' 추정 출력을 씁니다 — 이 체크포인트에는 그 출력이 없습니다(v2 체크포인트만 있습니다). "
+                    f"장애물 감속을 끄거나 v2 체크포인트를 고르세요.")
+            if mode == "direct" and arm != "legacy":
+                # The grip arms bound the *plan tracker*; a direct-action checkpoint has none. Refusing
+                # the session for a setting that cannot apply (the deployment default is fixed_low)
+                # made every direct checkpoint unopenable; say what happened and run it as it is.
+                self.say(P.MSG_LOG, gen=gen,
+                         text=f"plan 제어기 '{arm}' 은 직접 행동(direct) 체크포인트에 적용되지 않아 legacy 로 실행합니다")
+                arm = "legacy"
+                estimator_path = ""
+            embedded = controller_record if recorded == "auto" else None
+            if (arm == "auto" or arm.startswith("estimated")) and embedded is None:
+                from .console.protocol import SessionConfig as _SC
+                estimator_path = (getattr(cfg, "estimator", "") or "").strip() or _SC.default_estimator()
+                if not estimator_path or not os.path.isfile(estimator_path):
+                    if arm == "auto":
+                        self.say(P.MSG_LOG, gen=gen,
+                                 text="자동 노면 추정 모델이 없어 기본 제어기(legacy)로 주행합니다. "
+                                      "추정기를 쓰려면 F1SIM_GRIP_ESTIMATOR 를 지정하세요.")
+                        arm, estimator_path = "legacy", ""
+                    else:
+                        raise StartConfigError(
+                            f"제어기 '{arm}' 는 노면 추정 모델이 필요합니다. F1SIM_GRIP_ESTIMATOR 를 "
+                            f"지정하거나, 제어기를 'legacy' 로 두세요 (기본값).")
+            speed_cap = float(cfg.speed_cap or checkpoint_speed_cap(extra, ckpt_path))
         self._check_cancel(gen)
 
         # The scenario, resolved once. `cfg.map_name` may be the short grammar with an open seed
@@ -1086,6 +1112,8 @@ class SimWorker:
         ego_kind = str(getattr(cfg, "ego_kind", "policy") or "policy")
         if ego_kind in common.EGO_PLANNER_KINDS:
             need_rl = True                         # the ego itself drives the line
+        if skind == "teacher":
+            need_rl = True                         # the teacher's space-time car channel reads the line's speed profile
 
         self.stage(gen, "raceline")
         rls = None
@@ -1145,6 +1173,10 @@ class SimWorker:
         else:
             obs_kw = dict(scan_stack=spec.get("scan_stack", 3), scan_stride=spec.get("scan_stride", 1),
                           hist_len=spec.get("hist_len", 0), hist_stride=spec.get("hist_stride", 2))
+        if skind:
+            # the v1 observation with this checkpoint's scan frames / stride (a teacher reads one scan of its own)
+            _sc = state_policy.contract(state_ck, skind)
+            obs_kw = dict(obs_version=1, scan_stack=_sc["frames"], scan_stride=_sc["stride"], hist_len=0, hist_stride=2)
         exp_meta = extra.get("experiment") or {}
         from ..learn.common import plan_output_of
         _plan_out = plan_output_of(extra)
@@ -1223,7 +1255,12 @@ class SimWorker:
                 f"{os.path.basename(ckpt_path)}: roll/pitch 정규화가 {float(spec['att_scale']):g} 로 "
                 f"학습됐는데 시뮬레이터는 {ATT_SCALE_FIXED:g} 로 고정돼 있습니다 "
                 f"(gym_env._obs). 이 체크포인트는 이 뷰어로 관측을 재현할 수 없습니다.")
+        if skind:
+            for _k, _v in state_policy.env_overrides(state_ck, skind).items():
+                setattr(env_cfg, _k, _v)
         sim_cfg = viewer_config(compile_enabled, randomize=cfg.randomize)
+        if skind:
+            sim_cfg.lidar.n_beams = int(state_policy.contract(state_ck, skind)["beams"])
         if "range_max" in spec:
             sim_cfg.lidar.range_max = float(spec["range_max"])
         try:
@@ -1299,8 +1336,11 @@ class SimWorker:
             mu_pin = MuPin(env, float(getattr(cfg, "mu", 1.0489))).install()   # before the first reset
 
         env_spec = common.obs_spec(env)
-        problems = (obs_spec_problems(model.meta, env_spec, extra.get("skipped") or [], env.act_dim)
-                    + normalizer_problems(spec, env_spec))
+        if skind:
+            env._track_names = [track.name]
+            env._rls = rls                         # `state_rl._line_speed`: the line this session built
+        problems = [] if skind else (obs_spec_problems(model.meta, env_spec, extra.get("skipped") or [], env.act_dim)
+                                     + normalizer_problems(spec, env_spec))
         if problems:
             raise StartConfigError(
                 f"{os.path.basename(ckpt_path)} 의 관측 구성이 이 세션과 다릅니다 — "
@@ -1318,7 +1358,7 @@ class SimWorker:
         # A `dial` checkpoint drives on a number somebody chooses: it is an input, not a reading.
         # Defaulted to the session's fixed friction when one is pinned (the honest setting for a
         # floor you have measured), else to the bottom of the training range, which is the safe end.
-        dial = dial_for(model, device, float(cfg.mu) if str(getattr(cfg, "mu_mode", "random")) == "fixed" else None)
+        dial = None if skind else dial_for(model, device, float(cfg.mu) if str(getattr(cfg, "mu_mode", "random")) == "fixed" else None)
         if dial is not None:
             self.say(P.MSG_LOG, gen=gen,
                      text=f"그립 다이얼 정책입니다 · 다이얼 μ={dial.mu:.3f} 로 시작합니다 "
@@ -1333,15 +1373,18 @@ class SimWorker:
             "mu_pin": mu_pin,
             "env": env, "model": model, "extra": extra, "device": device,
             # after the dial: the saliency forward needs the same `c` the driving forward gets
-            "intro": Introspector(model, dial=dial),
+            "intro": None if skind else Introspector(model, dial=dial),       # a state session's is set below
+            "state_kind": skind,
             "mode": mode, "ckpt_path": ckpt_path, "mtime": os.path.getmtime(ckpt_path),
             "autoselect": autoselect,
             "obs": obs, "speed_cap": speed_cap, "compile": compile_enabled,
             "dial": dial,
-            "act_fn": actor_runner(model, device, compile_enabled, dial=dial),
+            "act_fn": (state_policy.StatePolicyRunner(env, state_ck, skind, device) if skind
+                       else actor_runner(model, device, compile_enabled, dial=dial)),
             "opp_limit_steps": 0, "opp_limit_held": 0,
             "info_line": (f"내 차: {ego_note} · 우리 정책 꺼짐" if policy_idle and ego_note else
-                          (f"내 차: {ego_note} · " if ego_note else "") + describe_checkpoint_line(extra, ckpt_path)),
+                          (f"내 차: {ego_note} · " if ego_note else "")
+                          + (state_policy.describe(state_ck, skind, ckpt_path) if skind else describe_checkpoint_line(extra, ckpt_path))),
             "ego_kind": ego_kind,
             "policy_idle": policy_idle,
             "viz": driver_viz,
@@ -1353,6 +1396,12 @@ class SimWorker:
             "raceline": rls[0] if rls else None,
             "procedural_src": proc_src,
         }
+        if skind:
+            session["act_fn"].session = session        # a student reads the session's observation dict
+            session["intro"] = session["act_fn"].intro = state_policy.StateIntro(session["act_fn"])
+            if session["viz"] is None:
+                # what this driver reads, drawn the way the console draws any driver (`state_policy.StateViz`)
+                session["viz"] = state_policy.StateViz(session["act_fn"])
         if compile_enabled:
             for i in range(8):
                 self.stage(gen, "compile", f"{i + 1}/8")
@@ -1735,7 +1784,7 @@ class SimWorker:
                         reading.copy_(r_)
                     else:
                         reading[env.learner] = r_.to(reading.dtype)
-                if session["cfg"].stochastic:
+                if session["cfg"].stochastic and model is not None:
                     act = (mu + model.actor.log_std.exp() * torch.randn_like(mu)).clamp(-1, 1)
                 else:
                     act = mu
@@ -1784,8 +1833,8 @@ class SimWorker:
         A newer file can have a different observation layout, so the same compatibility check the
         session was built with runs again; failing it keeps the model that is already loaded.
         """
-        if session.get("policy_idle"):
-            return                      # the checkpoint drives nothing; a newer one would change nothing
+        if session.get("policy_idle") or session.get("state_kind"):
+            return                      # the checkpoint drives nothing (or is not the v1 / v2 format this reload reads)
         if time.time() - session["last_reload"] < 5.0:
             return
         session["last_reload"] = time.time()
@@ -2017,7 +2066,7 @@ class SimWorker:
             sal, age = self._saliency(session)
             if sal is not None:
                 fr["saliency"], fr["saliency_age"] = sal, age
-        if self._overlay.get("internals") and not ext_focus:
+        if self._overlay.get("internals") and (not ext_focus or session.get("state_kind")):
             hidden, stem = self._internals(session)
             if hidden is not None:
                 fr["hidden"], fr["stem"] = hidden, stem
@@ -2039,6 +2088,8 @@ class SimWorker:
         """
         from ..learn.obs import flatten_obs
         now = _now()
+        if session.get("intro") is None or session.get("state_kind"):
+            return None, None                   # a state teacher / grid student: its heat map is in the overlay
         if self._sal_cache is not None and now - self._sal_time < 0.5:
             return self._sal_cache, now - self._sal_time
         scan, pro = flatten_obs(session["obs"])
@@ -2054,6 +2105,8 @@ class SimWorker:
         return self._sal_cache, 0.0
 
     def _internals(self, session) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if session.get("intro") is None:
+            return None, None
         h = session["intro"].h
         if "hidden" not in h or "stem" not in h:
             return None, None
