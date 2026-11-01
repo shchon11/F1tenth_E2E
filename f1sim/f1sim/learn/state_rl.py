@@ -38,7 +38,10 @@ KOREA = "real:korea_2026_competition"
 
 
 def build_env(a, device, extra=None):
-    tracks = [KOREA] + ([f"{KOREA}+warp{k}" for k in range(int(a.warps))] if a.warps else [])
+    # `--tracks` (11-01): the base maps, each with its --warps variants -- Korea alone left the plan teacher unable to
+    # drive ICRA 2022 (laps 20-22 s, 26 wall touches a minute) or ICCAS (19 a minute) in the console
+    bases = [t.strip() for t in str(getattr(a, "tracks", "") or KOREA).split(",") if t.strip()]
+    tracks = [x for b in bases for x in [b] + ([f"{b}+warp{k}" for k in range(int(a.warps))] if a.warps else [])]
     # the racelines the planner opponents follow: the training world's (the cache key is every Raceline.build argument)
     limits = common.teacher_limits(7.0, 6.5, 4.0)
     trs, rls = common.load_tracks(tracks, racelines=(a.stage == "race" or bool(getattr(a, "path_plan", 0))),
@@ -1222,6 +1225,7 @@ def main():
     ap.add_argument("--horizon", type=int, default=64)
     ap.add_argument("--repeat", type=int, default=2, help="control steps per decision (40 Hz / X); with --action plan the plan "
                     "is held on the track for these steps (EnvConfig.decision_every)")
+    ap.add_argument("--tracks", default="", help="comma-separated base maps (each with its --warps variants); default Korea 2026")
     ap.add_argument("--action", default="direct", choices=("direct", "plan"),
                     help="plan (11-01): a trajectory, 4 waypoints x (curvature, speed), followed by MAP; direct: (steer, speed)")
     ap.add_argument("--plan-lookahead", type=float, default=0.235, help="--action plan: MAP reads the plan's speed this far ahead [s]")
