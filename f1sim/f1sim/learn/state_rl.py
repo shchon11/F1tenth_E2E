@@ -1045,6 +1045,7 @@ def train(a):
     # decisions this policy drove (elsewhere its sampled action was not executed), the critic on all
     mix = SoloMix(env, a.base, device, float(a.base_reach), int(a.base_hold)) if a.base else None
     ptp = float(getattr(a, "prop_touch_price", 0.0) or 0.0)
+    ptv = float(getattr(a, "prop_touch_vmax", 0.0) or 0.0)
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
           f"롤아웃 {T}결정 = {T * R} 스텝, 가격 {a.price:g}", flush=True)
     t0 = time.time()
@@ -1065,7 +1066,7 @@ def train(a):
         bg = torch.zeros(T + 1, B, device=device)
         bm = torch.ones(T, B, device=device)                     # 1 = this policy's action was executed (`--base`)
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
-        prog = hits_w = hits_c = prop_s = 0.0; laps = []; dev_sum = dev_n = 0.0
+        prog = hits_w = hits_c = prop_s = push_s = 0.0; laps = []; dev_sum = dev_n = 0.0
         relabel = float(getattr(a, "plan_relabel", 0.0) or 0.0) > 0
         if relabel:                                              # `--plan-relabel`: the path each plan was followed by
             pose_s = torch.zeros(T * R + 1, B, 4, device=device); d_s = torch.zeros(T * R, B, dtype=torch.bool, device=device)
@@ -1134,8 +1135,11 @@ def train(a):
                     # above contact_severity_min were charged, so braking under it and shoving a crate off the line was free
                     # -- the props teachers did exactly that on 2-3 of 30 console layouts (stuck 4-11 s, 7-18 touches)
                     ptch = env.sim.kind_prev[lid, 1].float()
+                    # --prop-touch-vmax: only while the car itself is slower than this -- a push, not a graze in passing (11-02:
+                    # charged at any speed, the teacher kept a margin for its own exploration noise and lost 7-8 % of pace)
+                    pch = ptch * (env.sim.state[lid, 3].abs() < ptv).float() if ptv > 0 else ptch
                     if ptp > 0:
-                        step_r = step_r - ptp * (price / max(float(a.price), 1e-9)) * env.sim.control_dt * ptch
+                        step_r = step_r - ptp * (price / max(float(a.price), 1e-9)) * env.sim.control_dt * pch
                     if obs_fn.planner is not None:
                         # drive the plan: leaving it by more than --track-dead costs --track-k per m and step
                         dev_ = obs_fn.planner.deviation().abs()
@@ -1153,6 +1157,7 @@ def train(a):
                     rew += step_r * alive
                     prog += float((info["progress"][lid].float().clamp_min(0) * alive).sum())
                     prop_s += float((ptch * alive).sum()) * env.sim.control_dt
+                    push_s += float((ptch * (env.sim.state[lid, 3].abs() < 1.5).float() * alive).sum()) * env.sim.control_dt
                     hits_w += float((onw * alive).sum()); hits_c += float((onset.float() * alive).sum())
                     hit_now |= ((onw > 0) | onset) & ~done
                     d_ = (te | trc)[lid]
@@ -1265,7 +1270,7 @@ def train(a):
         km = prog / 1000.0
         secs = T * R * B * env.sim.control_dt
         stats = {"update": u, "progress_ms": prog / secs, "hits_wall_prop_per_km": hits_w / max(km, 1e-3),
-                 "prop_touch_s_per_km": prop_s / max(km, 1e-3),
+                 "prop_touch_s_per_km": prop_s / max(km, 1e-3), "prop_push_s_per_km": push_s / max(km, 1e-3),
                  "hits_car_per_km": hits_c / max(km, 1e-3), "J_per_step": float(br.sum() / (T * R * B)),
                  "laps": len(laps), "lap_mean_s": float(np.mean(laps)) if laps else None,
                  "lap_best_s": float(np.min(laps)) if laps else None, "std": torch.maximum(model.log_std.exp(), model.std_floor).tolist(),
@@ -1288,7 +1293,7 @@ def train(a):
         if u % 5 == 0 or u == upd0 + 1:
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
             print(f"[{time.strftime('%H:%M')}] 업데이트 {u} | 진행 {stats['progress_ms']:.2f} m/s | 강한 충돌 벽+상자 "
-                  f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 상자 닿음 {stats['prop_touch_s_per_km']:.1f} s/km | "
+                  f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 상자 닿음 {stats['prop_touch_s_per_km']:.1f} (1.5 m/s 미만 {stats['prop_push_s_per_km']:.1f}) s/km | "
                   f"랩 {len(laps)}개 평균 {lp_} s | "
                   f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 경주 정책 몫 {stats['policy_share']:.2f} | 죽은 결정 속도 {stats['dead_speed'] * 100:.0f} % 조향 {stats['dead_steer'] * 100:.0f} % | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s"
@@ -1324,7 +1329,7 @@ def evaluate(a):
     w_col = abs(env.ecfg.reward_collision)
     act_full = torch.zeros(env.B, env.act_dim, device=device)
     touching = torch.zeros(B, dtype=torch.bool, device=device)
-    prog = hw = hc = 0.0; laps = []; steps = 0
+    prog = hw = hc = prop_s = push_s = 0.0; laps = []; steps = 0
     R = int(a.repeat)
     eps = torch.zeros(B, tp.A, device=device)
     for t in range(int(a.eval_steps) // R):
@@ -1347,6 +1352,8 @@ def evaluate(a):
             tch = car < 0; onset = tch & ~touching; d_ = (te | trc)[lid]; touching = tch & ~d_
             hw += float((-col / max(w_col, 1e-9)).clamp_min(0).sum()); hc += float(onset.float().sum())
             prog += float(info["progress"][lid].float().clamp_min(0).sum()); steps += 1
+            prop_s += float(env.sim.kind_prev[lid, 1].float().sum()) * env.sim.control_dt
+            push_s += float((env.sim.kind_prev[lid, 1] & (env.sim.state[lid, 3].abs() < 1.5)).float().sum()) * env.sim.control_dt
             if info["lap_times"].numel():
                 laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
     km = prog / 1000.0
@@ -1354,7 +1361,7 @@ def evaluate(a):
     q = np.percentile(laps, [10, 50, 90]) if laps else [float("nan")] * 3
     print(f"[평가] {os.path.basename(a.eval)} 단계 {a.stage}, {'탐색 잡음 행동' if a.eval_noise else '평균 행동'}, {B}대 x {steps * env.sim.control_dt:.0f} s = {km:.1f} km | "
           f"진행 {prog / secs:.2f} m/s | 강한 충돌 벽+상자 {hw / max(km, 1e-3):.2f}, 차 {hc / max(km, 1e-3):.2f} /km | "
-          f"랩 {len(laps)}개, 중앙값 {q[1]:.2f} s (p10 {q[0]:.2f}, p90 {q[2]:.2f}) | J80/스텝 {(prog - 80 * (hw + hc)) / (steps * B):.4f}",
+          f"상자 닿음 {prop_s / max(km, 1e-3):.1f} (1.5 m/s 미만 {push_s / max(km, 1e-3):.1f}) s/km | 랩 {len(laps)}개, 중앙값 {q[1]:.2f} s (p10 {q[0]:.2f}, p90 {q[2]:.2f}) | J80/스텝 {(prog - 80 * (hw + hc)) / (steps * B):.4f}",
           flush=True)
 
 
@@ -1425,6 +1432,8 @@ def main():
                     help="potential -X x price x geo_risk (the 1 s arc's overlap with a prop); 0 = off")
     ap.add_argument("--car-price", type=float, default=0.0,
                     help="final price of a hard car contact (0 = --price); ramps with the price schedule")
+    ap.add_argument("--prop-touch-vmax", type=float, default=0.0,
+                    help="--prop-touch-price only while the car is slower than this [m/s] (a push, not a graze); 0 = any speed")
     ap.add_argument("--prop-touch-price", type=float, default=0.0,
                     help="price per second in contact with a prop at any speed (ramps with --price); 0 = off (11-02: soft "
                          "pushes were free, so the props teachers shoved crates off the line)")
