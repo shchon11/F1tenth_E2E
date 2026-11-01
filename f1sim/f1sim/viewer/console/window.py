@@ -333,6 +333,10 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self.pick_policy.set_items(self._policy_items())
             self.pick_policy.set_current(self._selected_run)
 
+    def _catalogue_ids(self) -> List[str]:
+        """Every map the worker's catalogue holds, any group or none; empty until it has arrived."""
+        return list(self.maps.ids()) if getattr(self.maps, "ready", False) else []
+
     def _refresh_map_picker(self):
         if not hasattr(self, "pick_map"):
             return
@@ -2309,7 +2313,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # A pick is for one map: select it too, so the policy is driven where it was made for.
         pick = next((r for r in (self.runs or []) if r.name == name and r.pinned and r.map), None)
         if pick is not None:
+            # As the 맵 picker above does, never relying on the hidden list's change signal: that list only holds the
+            # current group, so a map outside every group (real/korea26x12, 11-02) was never selected and the pick
+            # drove the previous map (ICRA 2022); and re-selecting its current row emits nothing, so after such a map
+            # a pick for that row kept the other map.
             self._select_map(pick.map)
+            if pick.map in self._catalogue_ids():
+                self._on_map_selected(pick.map)
             self._apply_pick_settings(pick)
         self._update_selection_note()
         self._update_start_enabled()

@@ -1,5 +1,5 @@
 """실제 콘솔(창 + SessionController + 워커 프로세스)을 화면 밖(offscreen)에서 띄워 찍는다 (11-02): 대기, 첫 추천 정책 선택, 주행 중.
-인자: 출력 접두어 [주행 초]"""
+인자: 출력 접두어 [주행 초] [주행 조건] [추천 이름(없으면 첫 추천)]"""
 import os, sys, time
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
@@ -14,6 +14,7 @@ from f1sim.viewer.console.window import ConsoleWindow
 def main():
     out = sys.argv[1]; drive_s = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
     cond = sys.argv[3] if len(sys.argv) > 3 else ""          # 주행 조건 key (solo / props / race / race_props)
+    want = sys.argv[4] if len(sys.argv) > 4 else ""          # 고를 추천 이름
     app = create_app(["shot"])
     w = ConsoleWindow(); c = SessionController(w)
     w.set_runs(list_runs()); w.set_maps(c._maps); w.resize(1600, 950); w.show()
@@ -32,7 +33,7 @@ def main():
             break
     step(2)
     w.grab().save(out + "_1idle.png")
-    first = next((r for r in w.runs if r.pinned), None)
+    first = next((r for r in w.runs if (r.name == want if want else r.pinned)), None)
     if first is not None:
         w.run_list.select(first.name); w._on_run_selected(first.name)
         step(2)
@@ -45,6 +46,9 @@ def main():
     w.pick_map.popup.grab().save(out + "_2popup_map.png"); w.pick_map.popup.hide(); step(0.3)
     if cond:
         w._on_condition_picked(cond); step(1)
+    cfg = w.current_config()
+    print("세션 설정: 시드", cfg.seed, "| 학습 장애물", cfg.procedural, "| 무작위화", cfg.randomize, "| 충돌", cfg.collision_mode,
+          "| 확률 행동", cfg.stochastic, "| mu", cfg.mu_mode, cfg.mu, "| 추종", cfg.plan_follower, cfg.plan_speed_scale, flush=True)
     w._on_start()
     step(drive_s)
     w.grab().save(out + "_3running.png")

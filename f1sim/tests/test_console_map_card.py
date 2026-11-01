@@ -228,6 +228,26 @@ def test_the_facts_strip_shows_the_scenario_that_was_actually_built(win):
     assert "real:blackbox2022_1+rlobs4417~rev" in win.header_summary.toolTip()
 
 
+def test_a_pick_drives_its_own_map_outside_every_group_and_after_one(win, tmp_path):
+    """11-02: real/korea26x12 is in no group, and the hidden map list holds only the current group -- so the x1.2
+    picks never selected their map and drove the previous one (ICRA 2022). And after such a pick, a pick whose map
+    was that list's current row emitted no change and kept the x1.2 map."""
+    import json
+    from f1sim.viewer.console import catalog
+    assert win.maps.group_of("real/korea26x12") is None and "real/korea26x12" in win.maps.ids()
+    order = (("pick_a", "real/iccas25"), ("pick_x", "real/korea26x12"), ("pick_b", "real/iccas25"))
+    for name, _ in order:
+        d = tmp_path / "runs" / name
+        d.mkdir(parents=True)
+        (d / "ppo_latest.pt").write_bytes(b"x")
+    (tmp_path / "runs" / catalog.PICKS_FILE).write_text(json.dumps({"picks": [
+        {"run": name, "label": name, "map": mp, "note": ""} for name, mp in order]}), encoding="utf-8")
+    win.set_runs(catalog.list_runs(str(tmp_path / "runs")))
+    for name, mp in order:
+        win._on_run_selected(name)
+        assert win._selected_map == mp and win._scenario().startswith(mp), name
+
+
 def test_a_pick_with_settings_sets_up_the_whole_session(win, tmp_path):
     """2026-10-26, the user: "콘솔에서 뭘 골라야할지 찾기가 너무 어려워" -- the competition setting was a checkpoint, a map,
     an obstacle family, a race of 2 with an opponent and two checkboxes, chosen by hand in four places. A pick's
