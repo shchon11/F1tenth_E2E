@@ -1,0 +1,22 @@
+{
+ "kind": "mixed",
+ "seed": 2,
+ "attempt": 0,
+ "hall_m": [
+  12.2,
+  22.9
+ ],
+ "branches": 2,
+ "length_m": 54.9,
+ "tightest_radius_m": 0.69,
+ "track_width_m": {
+  "min": 1.09,
+  "p10": 1.14,
+  "median": 2.06,
+  "max": 2.72
+ },
+ "size_m": [
+  13.0,
+  18.1
+ ]
+}

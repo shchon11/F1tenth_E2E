@@ -1,0 +1,22 @@
+{
+ "kind": "wide",
+ "seed": 1,
+ "attempt": 0,
+ "hall_m": [
+  13.3,
+  20.1
+ ],
+ "branches": 2,
+ "length_m": 50.7,
+ "tightest_radius_m": 0.74,
+ "track_width_m": {
+  "min": 1.74,
+  "p10": 1.75,
+  "median": 2.19,
+  "max": 2.67
+ },
+ "size_m": [
+  14.0,
+  15.9
+ ]
+}
