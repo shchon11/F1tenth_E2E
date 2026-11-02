@@ -344,6 +344,7 @@ class SessionController(QtCore.QObject):
         w.overlay_requested.connect(self.set_overlay)
         w.mu_requested.connect(self.set_mu)
         w.dial_requested.connect(self.set_dial)
+        w.layout_requested.connect(self.set_layout)
         w.describe_requested.connect(self.describe)
         w.retry_requested.connect(self.retry)
         w.viewport.frame_timed.connect(w.push_frame_time)
@@ -639,6 +640,18 @@ class SessionController(QtCore.QObject):
             return
         self.send(P.CMD_SET_DIAL, for_gen=self._active_gen, mu=float(mu))
 
+    def set_layout(self, req: dict):
+        """The obstacle layout of the running session (`CMD_SET_LAYOUT`): {"seed": n} or {"pieces": [...]}, and
+        "reset". Answered by an ack carrying the layout as held, which `window.settle_layout` shows."""
+        if self._active_gen < 0:
+            return
+        fields = {"reset": bool(req.get("reset", True))}
+        if req.get("pieces") is not None:
+            fields["pieces"] = list(req["pieces"])
+        else:
+            fields["seed"] = int(req.get("seed", 0))
+        self.send(P.CMD_SET_LAYOUT, for_gen=self._active_gen, **fields)
+
     def set_overlay(self, overlay: dict):
         if self._proc is None or not self._proc.is_alive():
             return
@@ -901,7 +914,7 @@ class SessionController(QtCore.QObject):
             self._ignore(f"'{command}' 확인", issued_gen if issued_gen is not None else ack_gen,
                          "worker가 더 새로운 세션으로 넘어감")
             return
-        if command in ("pause", "reset", "focus", "overlay", "set_mu", "set_dial"):
+        if command in ("pause", "reset", "focus", "overlay", "set_mu", "set_dial", "set_layout"):
             # session-scoped: only meaningful for the session that is actually on screen
             if self._active_gen < 0 or (issued_gen is not None and issued_gen != self._active_gen):
                 self._ignore(f"'{command}' 확인", issued_gen, "그 세션은 이미 끝났습니다")
@@ -923,6 +936,7 @@ class SessionController(QtCore.QObject):
         elif command == "reset":
             self.buffer.clear()
             self.window.spark.clear()
+            self.window.viewport.reset_trails()
         elif command == "focus":
             self.window._pending.pop("focus", None)
         elif command == "set_mu":
@@ -930,6 +944,12 @@ class SessionController(QtCore.QObject):
         elif command == "set_dial":
             d = state.get("dial")
             self.window.settle_dial(None if d is None else float(d))
+        elif command == "set_layout":
+            if state.get("reset"):
+                self.buffer.clear()             # the episode started again: no frame of the old one is current
+                self.window.spark.clear()
+                self.window.viewport.reset_trails()
+            self.window.settle_layout(dict(state))
 
     def _on_error(self, msg: dict):
         gen = int(msg.get("gen", -1))

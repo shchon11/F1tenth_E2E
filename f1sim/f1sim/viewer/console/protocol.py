@@ -41,6 +41,10 @@ CMD_FOCUS = "focus"                # {"env": int} which car the overlays describ
 CMD_OVERLAY = "overlay"            # {"saliency": bool, "internals": bool, "plan": bool}
 CMD_SET_MU = "set_mu"              # {"mode": "random"|"fixed", "mu": float} live friction control
 CMD_SET_DIAL = "set_dial"          # {"mu": float} live grip dial for a conditional ("dial") policy
+#: {"seed": int} or {"pieces": [portable piece, ...]}, and "reset": bool -- the obstacle layout a session holds
+#: (`viewer.prop_layout.LayoutHold`): a new seed's draw, or a layout made by hand, written into the running
+#: generator's slots; with "reset" the episode starts again on it. Acked with the layout as held.
+CMD_SET_LAYOUT = "set_layout"
 CMD_CANCEL = "cancel"              # abandon an in-flight start (by generation)
 CMD_SHUTDOWN = "shutdown"
 
@@ -112,6 +116,16 @@ class SessionConfig:
     #: redrawn at every 리셋. `map_name` then names the bare map (no `#family`), and `seed` seeds
     #: the draw, so 다시 뽑기 is a new sequence of layouts.
     procedural: bool = False
+    #: The console's obstacle seed (2026-11-03): with the training generator on, the layout is the one this seed
+    #: draws with a generator of its own (`viewer.prop_layout.draw_seed`) -- the same for any car count, domain
+    #: randomisation or policy -- and every 리셋 puts it back rather than drawing the next one. None keeps the old
+    #: behaviour (a new layout from the simulator's generator at every reset), which scripts that drive the worker
+    #: directly rely on.
+    layout_seed: Optional[int] = None
+    #: A layout made by hand (`console.layout_file`, portable pieces: style, dims, x, y, yaw). Not None turns the
+    #: training generator on even for a solo condition, holds exactly these pieces across resets, and gives the
+    #: session room to add more (`sim_worker.CONSOLE_PROP_SLOTS`). Wins over `layout_seed`.
+    prop_layout: Optional[List[Dict[str, Any]]] = None
     races: int = 1
     cars_per_race: int = 1
     speed_cap: Optional[float] = None    # None = whatever the checkpoint was trained at

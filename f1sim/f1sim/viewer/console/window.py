@@ -96,6 +96,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     describe_requested = QtCore.pyqtSignal(str)
     mu_requested = QtCore.pyqtSignal(str, float)          # (mode, mu) live friction control
     dial_requested = QtCore.pyqtSignal(float)             # grip dial for a conditional ("dial") policy
+    layout_requested = QtCore.pyqtSignal(dict)            # {"seed"} or {"pieces"}, "reset": the obstacle layout
     retry_requested = QtCore.pyqtSignal()
     close_requested = QtCore.pyqtSignal()
 
@@ -143,6 +144,23 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._closing_allowed = False
         #: The watched car's most recent contact, kept after its marker has faded (`최근 접촉`).
         self._last_contact = CT.LastContact()
+        #: 11-03, the obstacle layout. `_custom_layout`: a layout made by hand or loaded from a file (portable
+        #: pieces, `layout_file`), which the next session holds instead of a seed's draw; None = the seed decides.
+        #: `_layout_now` / `_prop_catalogue`: what the running session holds and the shapes it can place, from its
+        #: facts and every `set_layout` ack. `_editing`: 장애물 편집 is on; `_edit_on_ready`: open it once the
+        #: session being started is up.
+        self._custom_layout: Optional[List[dict]] = None
+        self._custom_name = ""
+        self._layout_now: dict = {}
+        self._prop_catalogue: List[dict] = []
+        self._editing = False
+        self._edit_on_ready = False
+        self._resume_after_edit = False
+        self._edit_shortcuts: List[QtWidgets.QShortcut] = []
+        #: (cars per race, slot table) the running session was started with, so the bar can offer a restart
+        #: when the opponent is changed under it
+        self._started_opp: Optional[tuple] = None
+        self._opp_slot_of: Dict[str, dict] = {}
 
         self._build_ui()
         self._install_shortcuts()
@@ -179,6 +197,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(self._build_topbar())
+        outer.addWidget(self._build_condbar())
         body = QtWidgets.QWidget()
         body.setObjectName("Centre")
         bh = QtWidgets.QHBoxLayout(body)
@@ -189,7 +208,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         vw.setContentsMargins(12, 12, 12, 12)
         vw.addWidget(self.viewport, 1)
         bh.addWidget(view_wrap, 1)
-        bh.addWidget(self._build_hud())
+        # The HUD, and in its place while 장애물 편집 is on, the editor's card (`layout_editor`).
+        self.hud_stack = QtWidgets.QStackedWidget()
+        self.hud_stack.setFixedWidth(308)
+        self.hud_stack.addWidget(self._build_hud())
+        self.hud_stack.addWidget(self._build_edit_page())
+        bh.addWidget(self.hud_stack)
         self.centre_stack = QtWidgets.QStackedWidget()
         self.centre_stack.setObjectName("Centre")
         self.centre_stack.addWidget(body)
@@ -200,13 +224,15 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(root)
 
     #: The 주행 조건 picker: what a person actually switches between (2026-11-02). Each sets the hidden scenario
-    #: controls the session config reads -- the same keys a console pick's "settings" use.
+    #: controls the session config reads -- the same keys a console pick's "settings" use. 11-03: the seed, the
+    #: hand-made layout and the opponent of the chosen condition are set in the bar under it (`_build_condbar`).
     COND_ITEMS = [
         PickItem("solo", "혼자 달리기", "장애물·상대 없음 — 랩 속도를 보는 기본 조건"),
-        PickItem("props", "학습 장애물", "학습 때와 같은 상자 배치 (시작할 때마다 새로 뽑음)"),
-        PickItem("race", "1:1 경주", "ForzaETH 상대 1대, 속도 0.7~1.0배"),
-        PickItem("race_props", "1:1 경주 + 장애물", "상대 1대와 학습 장애물"),
+        PickItem("props", "학습 장애물", "학습 때와 같은 생성기의 상자 배치 — 시드로 고르고, 직접 고칠 수 있음"),
+        PickItem("race", "1:1 경주", "상대차와 경주 — 종류·속도·대수는 아래 줄에서 (기본: ForzaETH 1대, 0.7~1.0배)"),
+        PickItem("race_props", "1:1 경주 + 장애물", "상대차와 학습 장애물"),
     ]
+    #: The default opponent: what the race conditions drove before the bar existed.
     COND_OPPONENT = [{"kind": "forzaeth_pred", "speed_scale": [0.7, 1.0]}]
 
     def _build_topbar(self) -> QtWidgets.QWidget:
@@ -315,6 +341,537 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v.addStretch(1)
         return hud
 
+    # ---------------------------------------------------------------- 11-03: the condition bar
+    # The user, 11-03: "콘솔에서 왜 장애물 시드 못바꾸게해? 그리고 시드만 바꾸는게 아니라 내가 직접 장애물을
+    # 추가/제거/위치/변경해서 바로 돌리게 할 수도 있었으면 좋겠어." and "상대차도 왜 forza eth밖에 선택 못해?".
+    # The 11-02 redesign hid the seed row and the opponent table with the old panels and hard-wired the race
+    # conditions to one ForzaETH car. This bar is what the chosen condition can be set to, one line, right under it:
+    # the obstacle seed, 다시 뽑기, 장애물 편집 and a saved layout; the opponent's kind, speed and count.
+
+    #: Seeds drawn by 다시 뽑기: short enough to read off the screen and type back in.
+    SEED_RANGE = (1, 999999)
+
+    def _opp_choices(self) -> List[Tuple[str, str, dict, str]]:
+        """(key, label, slot dict without speed, tooltip) for every opponent this console can actually race.
+
+        From the slot registry (`opponent_slots.KINDS`): the teacher kinds, the planners mix, the sensor-only
+        baselines that need no weights file (and TinyLidarNet when its published weights are on this machine), the
+        policy itself, and the recommended policies as checkpoint opponents. Kinds whose module is missing are
+        left out rather than listed and refused at start."""
+        from ... import opponent_slots as osl
+        out: List[Tuple[str, str, dict, str]] = []
+        names = {"forzaeth_pred": "ForzaETH 예측 spliner", "forzaeth": "ForzaETH spliner",
+                 "lane_switch": "lane-switch (고정 레인 바꾸기)", "interactive": "interactive 티처 (예측 보고 추월)",
+                 "layout": "layout 티처 (장애물 피하는 최소시간 라인)", "raceline": "raceline 티처 (레이싱 라인만, 장애물 못 봄)",
+                 "ftg": "Follow-the-Gap (라이다만)", "disparity": "Disparity Extender (라이다만)"}
+        for name in ("forzaeth_pred", "forzaeth", "lane_switch", "interactive", "layout", "raceline"):
+            k = osl.KIND_BY_NAME.get(name)
+            if k is not None and k.available:
+                out.append((name, names[name], {"kind": name}, k.note))
+        for key, label_, mix, note in osl.KIND_MIXES:
+            if key == "planners" and all(osl.KIND_BY_NAME[n].available for n in mix):
+                out.append((f"mix:{key}", "혼합 · 플래너 4종 (레이스마다 무작위)", {"kind_mix": list(mix)}, note))
+        for name in ("ftg", "disparity"):
+            k = osl.KIND_BY_NAME.get(name)
+            if k is not None and k.available:
+                out.append((name, names[name], {"kind": name}, k.note))
+        from .opponent_table import BASELINES_DIR
+        tln = os.path.join(BASELINES_DIR, "tln_L_published.pt")
+        k = osl.KIND_BY_NAME.get("tinylidarnet")
+        if k is not None and k.available and os.path.isfile(tln):
+            out.append(("tinylidarnet", "TinyLidarNet (공개 가중치, 라이다만)", {"kind": "tinylidarnet", "weights": tln},
+                        k.note))
+        out.append(("self", "같은 정책 (내 차와 같은 정책)", {"kind": "self"},
+                    "고른 정책이 상대 차도 몹니다 (자기 자신과의 경주)."))
+        for r in self.runs or []:
+            if r.pinned and getattr(r, "checkpoint", "") and getattr(r, "kind", "") != "상태":
+                out.append((f"policy:{r.checkpoint}", f"정책: {r.label or r.name}",
+                            {"kind": "policy", "checkpoint": r.checkpoint},
+                            f"저장된 정책이 상대 차를 몹니다: {r.checkpoint}\n"
+                            f"상대 정책은 내 차 정책과 관측 형식이 같은 계열이어야 합니다 (다르면 시작할 때 알려 줍니다)."))
+        return out
+
+    def _build_condbar(self) -> QtWidgets.QWidget:
+        bar = QtWidgets.QFrame()
+        bar.setObjectName("CondBar")
+        bar.setFixedHeight(52)
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(16, 7, 16, 7)
+        h.setSpacing(8)
+
+        def lab(text: str, name: str = "CondLabel") -> QtWidgets.QLabel:
+            w = QtWidgets.QLabel(text)
+            w.setObjectName(name)
+            return w
+
+        def btn(text: str, tip: str) -> QtWidgets.QPushButton:
+            b = QtWidgets.QPushButton(text)
+            b.setObjectName("IconButton")
+            b.setToolTip(tip)
+            b.setFixedHeight(36)
+            b.setCursor(QtCore.Qt.PointingHandCursor)
+            return b
+
+        # -- obstacles
+        self.cb_obstacles = QtWidgets.QWidget()
+        oh = QtWidgets.QHBoxLayout(self.cb_obstacles)
+        oh.setContentsMargins(0, 0, 0, 0)
+        oh.setSpacing(8)
+        oh.addWidget(lab("장애물"))
+        self.lab_seed = lab("시드", "CondChip")
+        oh.addWidget(self.lab_seed)
+        self.seed_box = QtWidgets.QSpinBox()
+        self.seed_box.setRange(0, 999999999)
+        self.seed_box.setFixedWidth(104)
+        self.seed_box.setFixedHeight(36)
+        self.seed_box.setToolTip("장애물 배치의 시드. 같은 시드 = 같은 배치 (정책·상대·차 대수와 상관없이).\n"
+                                 "숫자를 바꾸고 Enter 를 누르면 주행 중에도 그 배치로 처음부터 다시 달립니다.")
+        self.seed_box.setKeyboardTracking(False)
+        self.seed_box.editingFinished.connect(self._on_seed_entered)
+        oh.addWidget(self.seed_box)
+        self.btn_seed_roll = btn("다시 뽑기", "새 시드로 배치를 새로 뽑습니다. 주행 중이면 바로 그 배치로 처음부터 다시 달립니다.")
+        self.btn_seed_roll.clicked.connect(self._on_seed_roll)
+        oh.addWidget(self.btn_seed_roll)
+        self.btn_edit_layout = btn("✎ 장애물 편집", "지도 위에서 장애물을 직접 놓고·옮기고·돌리고·바꾸고·지웁니다.\n"
+                                                    "편집하는 동안 시뮬레이션은 멈추고, '이 배치로 달리기'로 바로 달립니다.")
+        self.btn_edit_layout.clicked.connect(self._on_edit_layout)
+        oh.addWidget(self.btn_edit_layout)
+        self.btn_load_layout = btn("불러오기…", "저장해 둔 장애물 배치(JSON)를 불러와 그 배치로 달립니다.")
+        self.btn_load_layout.clicked.connect(self._on_load_layout_file)
+        oh.addWidget(self.btn_load_layout)
+        self.layout_chip = lab("", "CondChip")
+        self.layout_chip.setMinimumWidth(80)
+        oh.addWidget(self.layout_chip, 1)
+        h.addWidget(self.cb_obstacles, 1)
+
+        # -- opponents
+        self.cb_opponents = QtWidgets.QWidget()
+        ph = QtWidgets.QHBoxLayout(self.cb_opponents)
+        ph.setContentsMargins(0, 0, 0, 0)
+        ph.setSpacing(8)
+        sep = QtWidgets.QFrame()
+        sep.setObjectName("BarSep")
+        sep.setFrameShape(QtWidgets.QFrame.VLine)
+        sep.setFixedWidth(1)
+        ph.addWidget(sep)
+        ph.addWidget(lab("상대차"))
+        self.combo_opp_kind = QtWidgets.QComboBox()
+        self.combo_opp_kind.setFixedHeight(36)
+        self.combo_opp_kind.setMinimumWidth(230)
+        self.combo_opp_kind.setMaximumWidth(330)
+        self.combo_opp_kind.setToolTip("상대 차를 누가 모는지. 항목에 마우스를 올리면 설명이 나옵니다.")
+        self.combo_opp_kind.activated.connect(lambda _i: self._on_opp_changed())
+        ph.addWidget(self.combo_opp_kind)
+        ph.addWidget(lab("속도", "CondChip"))
+        self.spin_opp_lo = QtWidgets.QDoubleSpinBox()
+        self.spin_opp_hi = QtWidgets.QDoubleSpinBox()
+        for sp, tip in ((self.spin_opp_lo, "속도 배율 하한"), (self.spin_opp_hi, "속도 배율 상한")):
+            sp.setRange(0.30, 1.50)
+            sp.setSingleStep(0.05)
+            sp.setDecimals(2)
+            sp.setFixedWidth(70)
+            sp.setFixedHeight(36)
+            sp.setKeyboardTracking(False)
+            sp.setToolTip(tip + " — 상대 차의 속도 프로파일(정책이면 속도 상한)에 곱합니다. "
+                                "하한과 상한이 다르면 리셋마다 그 사이에서 뽑습니다.")
+        self.spin_opp_lo.setValue(0.70)
+        self.spin_opp_hi.setValue(1.00)
+        ph.addWidget(self.spin_opp_lo)
+        ph.addWidget(lab("~", "CondChip"))
+        ph.addWidget(self.spin_opp_hi)
+        ph.addWidget(lab("배", "CondChip"))
+        ph.addSpacing(8)
+        ph.addWidget(lab("대수", "CondChip"))
+        self.spin_opp_n = QtWidgets.QSpinBox()
+        self.spin_opp_n.setRange(1, 3)
+        self.spin_opp_n.setFixedWidth(56)
+        self.spin_opp_n.setFixedHeight(36)
+        self.spin_opp_n.setToolTip("상대 차 수 (모두 같은 종류·속도). 차량마다 다르게 하려면 정책의 추천 설정을 쓰세요.")
+        for sp in (self.spin_opp_lo, self.spin_opp_hi, self.spin_opp_n):     # connected once all three exist
+            sp.valueChanged.connect(lambda _v: self._on_opp_changed())
+        ph.addWidget(self.spin_opp_n)
+        self.btn_opp_apply = btn("이 상대로 다시 시작", "바꾼 상대차 설정으로 세션을 다시 시작합니다.")
+        self.btn_opp_apply.setVisible(False)
+        self.btn_opp_apply.clicked.connect(self._on_start)
+        ph.addWidget(self.btn_opp_apply)
+        h.addWidget(self.cb_opponents, 0)
+        self._refresh_opp_choices()
+        return bar
+
+    def _build_edit_page(self) -> QtWidgets.QWidget:
+        from .layout_editor import LayoutEditor, LayoutEditPanel
+        self.layout_ed = LayoutEditor(self)
+        self.layout_panel = LayoutEditPanel(self.layout_ed)
+        self.layout_panel.run_requested.connect(self._on_edit_run)
+        self.layout_panel.cancel_requested.connect(self._on_edit_cancel)
+        self.layout_panel.save_requested.connect(self._on_save_layout_file)
+        self.layout_panel.load_requested.connect(self._on_load_layout_file)
+        self.layout_panel.fit_requested.connect(lambda: self._edit_key("fit"))
+        page = QtWidgets.QScrollArea()
+        page.setObjectName("PanelScroll")
+        page.setWidgetResizable(True)
+        page.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        inner = QtWidgets.QWidget()
+        inner.setObjectName("Hud")
+        v = QtWidgets.QVBoxLayout(inner)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.addWidget(self.layout_panel)
+        v.addStretch(1)
+        page.setWidget(inner)
+        return page
+
+    # -- the seed
+    def _seed(self) -> int:
+        return int(self.seed_box.value())
+
+    def _set_seed(self, seed: int) -> None:
+        """The seed every obstacle draw uses, in the bar and in the hidden controls the config reads: the session
+        seed (what a "무작위" family draws from, and the training generator's when the seed mode is left open)
+        and the 고정 number. The hidden mode itself is left alone -- a family's spec keeps its `:*`."""
+        seed = int(seed)
+        for w, v in ((self.seed_box, seed), (self.spin_seed, seed)):
+            w.blockSignals(True)
+            w.setValue(v)
+            w.blockSignals(False)
+        self._session_seed = seed
+        self._on_scenario_changed()
+
+    def _on_seed_roll(self):
+        import random as _random
+        self._set_seed(_random.randint(*self.SEED_RANGE))
+        self._apply_seed()
+
+    def _on_seed_entered(self):
+        if self._seed() != getattr(self, "_seed_applied", None):
+            self._set_seed(self._seed())
+            self._apply_seed()
+
+    def _apply_seed(self):
+        """A seed is a layout: drop a hand-made one, and on a running session with obstacles put the seed's layout
+        in now and start the episode again on it (no rebuild). Otherwise the next ▶ 시작 draws it."""
+        self._seed_applied = self._seed()
+        self._custom_layout = None
+        self._custom_name = ""
+        if self._session_holds_layout():
+            self.layout_requested.emit({"seed": self._seed(), "reset": True})
+            self.viewport.notify(f"장애물 시드 {self._seed()} — 처음부터 다시", "info", 1.8)
+        self._refresh_condbar()
+
+    # -- the layout of the running session
+    def _session_holds_layout(self) -> bool:
+        """Is a session running whose obstacle layout can be changed in place (`CMD_SET_LAYOUT`)?"""
+        return (self.state in (STATE_RUNNING, STATE_PAUSED) and bool(self._running_facts.get("procedural"))
+                and bool(self._prop_catalogue))
+
+    def settle_layout(self, state: dict) -> None:
+        """The worker's answer to a layout change: the layout as held, or why it was refused."""
+        err = state.get("error")
+        if err:
+            self.status_text.setText(f"장애물 배치를 바꾸지 못했습니다 — {err}")
+            self.log(f"장애물 배치 거부: {err}", "warn")
+            if self._editing:
+                self.layout_panel.set_note(str(err))
+            return
+        self._layout_now = {k: state.get(k) for k in ("layout", "layout_seed", "layout_custom", "prop_slots",
+                                                       "prop_keep")}
+        n = len(state.get("layout") or [])
+        where = (f"시드 {state.get('layout_seed')}" if state.get("layout_seed") is not None else "직접 편집한 배치")
+        self.status_text.setText(f"장애물 {where} · {n}개 — 처음부터 다시 달립니다.")
+        self.log(f"장애물 배치: {where} · {n}개", "done")
+        self._refresh_condbar()
+
+    # -- 장애물 편집
+    def _on_edit_layout(self):
+        if self._editing:
+            return
+        if self._session_holds_layout():
+            self._begin_edit()
+            return
+        # Nothing to edit in place: no session, or one without the generator. Start one that has it -- a solo or
+        # race condition gets an empty hand-made layout -- and open the editor when it is up.
+        if not self._train_obstacles():
+            self._custom_layout = []
+            self._custom_name = "편집"
+            self.apply_prefs({"obstacle": "train"})
+            self._sync_condition()
+        if not self._can_start():
+            self.status_text.setText("장애물 편집: 먼저 정책과 맵을 고르세요.")
+            return
+        self._edit_on_ready = True
+        self.status_text.setText("장애물 편집: 세션을 시작한 뒤 편집 화면을 엽니다…")
+        self._on_start()
+
+    def _begin_edit(self):
+        lay = self._layout_now or {}
+        cl = getattr(self.viewport.geometry_data, "centerline", None) if self.viewport.geometry_data else None
+        self.layout_ed.begin(lay.get("layout") or [], self._prop_catalogue, int(lay.get("prop_slots") or 0),
+                             centerline=cl, seed=lay.get("layout_seed"))
+        self.layout_panel.set_catalogue(self._prop_catalogue)
+        self.layout_panel.set_note("")
+        self._editing = True
+        self._resume_after_edit = self.state == STATE_RUNNING
+        if self.state == STATE_RUNNING:
+            self.pause_requested.emit(True)
+        self.hud_stack.setCurrentIndex(1)
+        self.viewport.begin_layout_edit(self.layout_ed)
+        for s in self._edit_shortcuts:
+            s.setEnabled(True)
+        self.viewport.notify("장애물 편집 — 시뮬레이션은 멈춰 있습니다", "info", 2.4)
+        self._apply_edit_lock()
+
+    EDIT_STATUS = ("장애물 편집 중 — 클릭해서 고르고, 끌어서 옮기고, '＋ 놓기'로 더합니다. "
+                   "다 되면 오른쪽 '▶ 이 배치로 달리기'.")
+
+    def _end_edit(self, resume: bool):
+        if not self._editing:
+            return
+        self._editing = False
+        for s in self._edit_shortcuts:
+            s.setEnabled(False)
+        self.viewport.end_layout_edit()
+        self.hud_stack.setCurrentIndex(0)
+        if resume and self._resume_after_edit and self.state in (STATE_RUNNING, STATE_PAUSED):
+            # also when the pause asked for at the start has not been acked yet: the worker applies them in order
+            self.pause_requested.emit(False)
+        self._resume_after_edit = False
+        self._apply_edit_lock()
+
+    def _on_edit_run(self):
+        """▶ 이 배치로 달리기: the edited layout into the running session (episode from the start), or -- when it does
+        not fit the session's slots -- a new session built for it."""
+        ed = self.layout_ed
+        if not ed.dirty and (self._layout_now or {}).get("layout") is not None:
+            self._end_edit(resume=True)               # nothing changed: carry on as before
+            return
+        portable = ed.portable()
+        self._custom_layout = portable
+        self._custom_name = "편집"
+        slots = int((self._layout_now or {}).get("prop_slots") or 0)
+        if self._session_holds_layout() and len(portable) <= slots:
+            self.layout_requested.emit({"pieces": portable, "reset": True})
+            self._end_edit(resume=True)
+            self.viewport.notify(f"편집한 배치 ({len(portable)}개)로 처음부터", "good", 2.0)
+        else:
+            self._end_edit(resume=False)
+            self.status_text.setText(f"편집한 배치 ({len(portable)}개)에 맞게 세션을 다시 시작합니다…")
+            self._on_start()
+        self._refresh_condbar()
+
+    def _on_edit_cancel(self):
+        self._end_edit(resume=True)
+        self.status_text.setText("장애물 편집을 취소했습니다 — 배치는 그대로입니다.")
+
+    def _edit_key(self, what: str):
+        if not self._editing:
+            return
+        ed = self.layout_ed
+        if what == "delete":
+            ed.remove()
+        elif what == "ccw":
+            ed.rotate(15.0)
+        elif what == "cw":
+            ed.rotate(-15.0)
+        elif what == "undo":
+            ed.undo()
+        elif what == "add":
+            ed.set_mode("add" if ed.mode != "add" else "select")
+        elif what == "escape":
+            if ed.mode == "add":
+                ed.set_mode("select")
+            else:
+                ed.select(None)
+        elif what == "fit":
+            self.viewport.fit_layout_edit()
+
+    # -- layout files
+    def save_layout_to(self, path: str) -> str:
+        """The layout being edited (or the one held) as a JSON file; returns the path written."""
+        from . import layout_file as LF
+        if self._editing:
+            pieces, seed = self.layout_ed.portable(), self.layout_ed.seed_origin
+        elif self._custom_layout is not None:
+            pieces, seed = list(self._custom_layout), None
+        else:
+            lay = self._layout_now or {}
+            pieces = LF.to_portable(lay.get("layout") or [], self._prop_catalogue)
+            seed = lay.get("layout_seed")
+        return LF.save(path, pieces, map_id=self._selected_map or "", seed=seed)
+
+    def load_layout_from(self, path: str) -> int:
+        """A saved layout: into the editor when editing, else held for the session (in place when it can be,
+        else the next start). Returns the number of pieces. ValueError, in Korean, when the file cannot be used."""
+        from . import layout_file as LF
+        data = LF.load(path)
+        other = data["map"] and self._selected_map and data["map"] != self._selected_map
+        warn = f"다른 맵({data['map']})에서 저장한 배치입니다 — 위치가 맞지 않을 수 있습니다." if other else ""
+        if self._editing:
+            self.layout_ed.replace(LF.from_portable(data["pieces"], self._prop_catalogue))
+            self.layout_panel.set_note(warn)
+            return len(data["pieces"])
+        if self._prop_catalogue:
+            LF.from_portable(data["pieces"], self._prop_catalogue)        # refuse a shape this console lacks now
+        self._custom_layout = list(data["pieces"])
+        self._custom_name = os.path.basename(path)
+        if not self._train_obstacles():
+            self.apply_prefs({"obstacle": "train"})
+            self._sync_condition()
+        slots = int((self._layout_now or {}).get("prop_slots") or 0)
+        if self._session_holds_layout() and len(data["pieces"]) <= slots:
+            self.layout_requested.emit({"pieces": list(data["pieces"]), "reset": True})
+        elif self.state in (STATE_RUNNING, STATE_PAUSED) and self._can_start():
+            self._on_start()
+        if warn:
+            self.status_text.setText(warn)
+        self._refresh_condbar()
+        return len(data["pieces"])
+
+    def _on_save_layout_file(self):
+        from . import layout_file as LF
+        os.makedirs(LF.LAYOUT_DIR, exist_ok=True)
+        seed = self.layout_ed.seed_origin if self._editing else (self._layout_now or {}).get("layout_seed")
+        start = os.path.join(LF.LAYOUT_DIR, LF.default_name(self._selected_map or "", seed))
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "장애물 배치 저장", start, "장애물 배치 (*.json)")
+        if not path:
+            return
+        if not path.endswith(".json"):
+            path += ".json"
+        try:
+            self.save_layout_to(path)
+        except (OSError, ValueError) as exc:
+            self.status_text.setText(f"배치를 저장하지 못했습니다 — {exc}")
+            return
+        self.status_text.setText(f"장애물 배치 저장: {path}")
+        self.viewport.notify(f"저장 — {os.path.basename(path)}", "good", 2.0)
+
+    def _on_load_layout_file(self):
+        from . import layout_file as LF
+        start = LF.LAYOUT_DIR if os.path.isdir(LF.LAYOUT_DIR) else os.path.expanduser("~")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "장애물 배치 불러오기", start, "장애물 배치 (*.json)")
+        if not path:
+            return
+        try:
+            n = self.load_layout_from(path)
+        except ValueError as exc:
+            self.status_text.setText(f"배치를 불러오지 못했습니다 — {exc}")
+            if self._editing:
+                self.layout_panel.set_note(str(exc))
+            return
+        self.viewport.notify(f"불러옴 — {os.path.basename(path)} ({n}개)", "good", 2.0)
+
+    # -- the opponent
+    def _refresh_opp_choices(self):
+        """Fill the kind list (again: the recommended policies arrive with the run list), keeping the choice."""
+        if not hasattr(self, "combo_opp_kind"):
+            return
+        want = self.combo_opp_kind.currentData() or "forzaeth_pred"
+        self.combo_opp_kind.blockSignals(True)
+        self.combo_opp_kind.clear()
+        self._opp_slot_of: Dict[str, dict] = {}
+        for key, text, slot, tip in self._opp_choices():
+            self.combo_opp_kind.addItem(text, key)
+            self.combo_opp_kind.setItemData(self.combo_opp_kind.count() - 1, tip, QtCore.Qt.ToolTipRole)
+            self._opp_slot_of[key] = slot
+        i = self.combo_opp_kind.findData(want)
+        self.combo_opp_kind.setCurrentIndex(i if i >= 0 else 0)
+        self.combo_opp_kind.blockSignals(False)
+
+    def _opp_slots(self) -> List[dict]:
+        """The bar's choice as the slot table: `spin_opp_n` identical rows."""
+        key = str(self.combo_opp_kind.currentData() or "forzaeth_pred")
+        slot = dict(self._opp_slot_of.get(key) or {"kind": "forzaeth_pred"})
+        lo, hi = float(self.spin_opp_lo.value()), float(self.spin_opp_hi.value())
+        if hi < lo:
+            lo, hi = hi, lo
+        slot["speed_scale"] = [round(lo, 3), round(hi, 3)]
+        return [dict(slot) for _ in range(int(self.spin_opp_n.value()))]
+
+    def _on_opp_changed(self):
+        if getattr(self, "_syncing_opp", False):
+            return
+        if self.spin_grid.value() > 1:
+            self.spin_grid.setValue(int(self.spin_opp_n.value()) + 1)
+            try:
+                self.opp_table.set_slots(self._opp_slots())
+            except Exception as exc:
+                self.status_text.setText(f"상대차 설정을 쓸 수 없습니다 — {exc}")
+        self._refresh_condbar()
+        self._update_start_enabled()
+
+    def _sync_opp_from_table(self):
+        """The bar from the hidden table (a pick's settings): the first car's kind and speed, and the count."""
+        if not hasattr(self, "combo_opp_kind"):
+            return
+        try:
+            slots = self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else []
+        except Exception:
+            slots = []
+        self._set_opp_bar(slots)
+
+    def _set_opp_bar(self, slots: List[dict]):
+        """The bar showing `slots` (a table's rows as dicts); an empty list leaves the choice as it is."""
+        self._syncing_opp = True
+        try:
+            self._refresh_opp_choices()
+            if slots:
+                s0 = slots[0]
+                if s0.get("kind_mix"):
+                    key = "mix:planners"
+                elif s0.get("kind") == "policy" and s0.get("checkpoint"):
+                    key = f"policy:{s0['checkpoint']}"
+                else:
+                    key = str(s0.get("kind") or "forzaeth_pred")
+                i = self.combo_opp_kind.findData(key)
+                if i < 0 and key.startswith("policy:"):
+                    # a checkpoint that is not among the picks: listed for this session as it is
+                    self.combo_opp_kind.addItem(f"정책: {os.path.basename(os.path.dirname(key[7:]))}", key)
+                    self._opp_slot_of[key] = {"kind": "policy", "checkpoint": key[7:]}
+                    i = self.combo_opp_kind.count() - 1
+                if i >= 0:
+                    self.combo_opp_kind.setCurrentIndex(i)
+                sc = s0.get("speed_scale", 1.0)
+                lo, hi = (float(sc), float(sc)) if isinstance(sc, (int, float)) else (float(sc[0]), float(sc[-1]))
+                self.spin_opp_lo.setValue(lo)
+                self.spin_opp_hi.setValue(hi)
+                self.spin_opp_n.setValue(max(1, min(3, len(slots))))
+        finally:
+            self._syncing_opp = False
+        self._refresh_condbar()
+
+    # -- what the bar shows
+    def _refresh_condbar(self):
+        if not hasattr(self, "cb_obstacles"):
+            return
+        props = self._train_obstacles()
+        race = self.spin_grid.value() > 1
+        self.cb_opponents.setVisible(race)
+        for w in (self.lab_seed, self.seed_box, self.btn_seed_roll):
+            w.setVisible(props)
+        self.btn_edit_layout.setText("✎ 장애물 편집" if props else "✎ 장애물 놓기")
+        lay = self._layout_now or {}
+        running_props = self._session_holds_layout()
+        if not props:
+            chip = "없음 — '장애물 놓기'로 직접 놓을 수 있습니다"
+        elif self._custom_layout is not None:
+            name = self._custom_name if self._custom_name and self._custom_name != "편집" else "직접 편집한 배치"
+            chip = f"{name} · {len(self._custom_layout)}개 · 리셋해도 그대로"
+        elif running_props and lay.get("layout_seed") is not None:
+            chip = f"시드 {lay['layout_seed']} · {len(lay.get('layout') or [])}개 · 리셋해도 그대로"
+        else:
+            chip = "학습 생성기 · 시드가 같으면 같은 배치"
+        if running_props and self._custom_layout is None and lay.get("layout_seed") not in (None, self._seed()):
+            chip += f"  (지금 화면: 시드 {lay.get('layout_seed')})"
+        self.layout_chip.setText(chip)
+        self.layout_chip.setToolTip(chip)
+        busy = self.state in (STATE_PREPARING, STATE_STOPPING) or self._editing
+        for w in (self.seed_box, self.btn_seed_roll, self.btn_edit_layout, self.btn_load_layout, self.combo_opp_kind,
+                  self.spin_opp_lo, self.spin_opp_hi, self.spin_opp_n):
+            w.setEnabled(not busy)
+        # opponents changed under a running session: offer the restart that applies them
+        started = getattr(self, "_started_opp", None)
+        now = (int(self.spin_grid.value()), self.opp_table.slot_dicts() if race else [])
+        self.btn_opp_apply.setVisible(self.state in (STATE_RUNNING, STATE_PAUSED) and started is not None
+                                      and race and now != started and not self._editing)
+
     # ---------------------------------------------------------------- 11-02 pickers
     def _policy_items(self) -> List[PickItem]:
         items: List[PickItem] = []
@@ -370,10 +927,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
     def _on_condition_picked(self, key: str):
         race = key in ("race", "race_props")
         props = key in ("props", "race_props")
-        self.apply_prefs({"obstacle": "train" if props else "bare", "races": 1, "cars_per_race": 2 if race else 1})
+        # A condition picked is the condition: a hand-made layout from before gives way to the seed's draw.
+        self._custom_layout = None
+        self._custom_name = ""
+        n = int(self.spin_opp_n.value()) if hasattr(self, "spin_opp_n") else 1
+        self.apply_prefs({"obstacle": "train" if props else "bare", "races": 1,
+                          "cars_per_race": (n + 1) if race else 1})
         if race and hasattr(self, "opp_table"):
             try:
-                self.opp_table.set_slots(self.COND_OPPONENT)
+                # the opponent the bar under the pickers shows (ForzaETH 0.7-1.0 until someone changes it)
+                self.opp_table.set_slots(self._opp_slots() if hasattr(self, "combo_opp_kind") else self.COND_OPPONENT)
             except Exception:
                 pass
         self._sync_condition()
@@ -387,6 +950,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         props = self._train_obstacles()
         key = ("race_props" if props else "race") if race else ("props" if props else "solo")
         self.pick_cond.set_current(key)
+        self._refresh_condbar()
 
     def _update_hud(self, frame: Optional[dict], sim_rate: Optional[float]):
         """The right-hand HUD: speed, lap times (timed here from the lap counter and the sim clock), laps, contacts."""
@@ -632,7 +1196,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.combo_seed.currentIndexChanged.connect(self._on_seed_mode)
         seed_row.addWidget(self.combo_seed, 1)
         self.spin_seed = QtWidgets.QSpinBox()
-        self.spin_seed.setRange(0, 999999)
+        self.spin_seed.setRange(0, 999999999)          # 11-03: the condition bar's seed box writes here
         self.spin_seed.setValue(44)
         self.spin_seed.setEnabled(False)
         self.spin_seed.valueChanged.connect(lambda _: self._on_scenario_changed())
@@ -1575,7 +2139,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         # one checks the page before acting; application context is kept so they work with focus
         # anywhere in the window.
         def drive_only(fn: Callable):
-            return lambda: fn() if self.current_mode() == "drive" else None
+            # 11-03: and not while 장애물 편집 is on -- Space would run the paused session under the editor
+            return lambda: fn() if self.current_mode() == "drive" and not self._editing else None
+
+        # 장애물 편집's keys, enabled only while it is on: an enabled shortcut takes its key from every widget,
+        # so Escape would stop closing a picker's popup and Delete would stop deleting text.
+        for seq, what in (("Delete", "delete"), ("Backspace", "delete"), ("Q", "ccw"), ("E", "cw"),
+                          ("Ctrl+Z", "undo"), ("A", "add"), ("Escape", "escape"), ("F", "fit")):
+            s = sc(seq, lambda w=what: self._edit_key(w))
+            s.setEnabled(False)
+            self._edit_shortcuts.append(s)
 
         sc("Space", drive_only(lambda: self.btn_pause.click() if self.btn_pause.isEnabled() else None))
         for i, key in enumerate(CAMERA_KEYS):
@@ -1602,6 +2175,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             items = [("", r.name, r.name, r.subtitle) for r in runs]
         self.run_list.set_items(items)
         self._refresh_policy_picker()
+        self._sync_opp_from_table()            # the recommended policies are opponents too
         if not runs:
             self.run_list.set_status(f"{catalog.RUNS_DIR} 에 체크포인트가 있는 런이 없습니다.", "warn")
         self._update_start_enabled()
@@ -1794,6 +2368,32 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._apply_responsive()
         if hasattr(self, "sel_running"):
             self._update_running_note()
+        # 11-03: 장애물 편집 lives on a paused session; anything else ends it. While it is on, the top bar's
+        # transport and pickers wait (■ 정지 stays, and ends it).
+        if self._editing and state not in (STATE_RUNNING, STATE_PAUSED):
+            self._end_edit(resume=False)
+        if state in (STATE_IDLE, STATE_FAILED):
+            self._started_opp = None
+        if state == STATE_FAILED:
+            self._edit_on_ready = False
+        self._apply_edit_lock()
+
+    def _apply_edit_lock(self):
+        """While 장애물 편집 is on the pickers and the transport wait; ■ 정지 stays (and ends it)."""
+        if hasattr(self, "pick_policy"):
+            for w in (self.pick_policy, self.pick_map, self.pick_cond):
+                w.setEnabled(not self._editing)
+            if self._editing:
+                for w in (self.btn_start, self.btn_pause, self.btn_reset):
+                    w.setEnabled(False)
+                # the pause ack's "일시정지 — 시뮬레이션이 멈춰 있습니다" is true, and says nothing about what to do now
+                self.status_text.setText(self.EDIT_STATUS)
+            else:
+                running = self.state in (STATE_RUNNING, STATE_PAUSED)
+                self.btn_pause.setEnabled(running)
+                self.btn_reset.setEnabled(running)
+                self._update_start_enabled()
+        self._refresh_condbar()
 
     def set_stage(self, stage: str, note: str = ""):
         if self.state == STATE_PREPARING:
@@ -1890,6 +2490,20 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.drive_info.set("추정 μ", "추정 대기")
         self.viewport.set_corner_text("")          # 11-02: the top bar names the policy and the map
         self._update_running_note()
+        # 11-03: the layout the session holds and the shapes 장애물 편집 may place (`sim_worker._procedural_facts`)
+        self._prop_catalogue = list(facts.get("prop_catalogue") or [])
+        self._layout_now = ({k: facts.get(k) for k in ("layout", "layout_seed", "layout_custom", "prop_slots",
+                                                        "prop_keep")} if self._prop_catalogue else {})
+        if self._layout_now.get("layout_seed") is not None and self._custom_layout is None:
+            self._seed_applied = int(self._layout_now["layout_seed"])
+        self._refresh_condbar()
+        if self._edit_on_ready:
+            self._edit_on_ready = False
+            if facts.get("procedural") and self._prop_catalogue:
+                # once RUNNING (the controller applies it right after these facts) and the first frames are in:
+                # the editor draws over the paused picture
+                QtCore.QTimer.singleShot(400, lambda: self._begin_edit() if self._session_holds_layout()
+                                         and not self._editing else None)
 
     def set_gl_info(self, text: str):
         self.trust_info.set("렌더러", text)
@@ -2253,7 +2867,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             return "② 맵을 고르세요."
         if hasattr(self, "opp_table") and self.spin_grid.value() > 1 \
                 and self.opp_table.problem(self.spin_grid.value()):
-            return "고급 설정의 상대차 표를 먼저 고치세요."
+            return f"상대차 설정을 고치세요 — {self.opp_table.problem(self.spin_grid.value())}"
         if hasattr(self, "ego_panel") and self.ego_panel.problem():
             return self.ego_panel.problem()
         return ""
@@ -2341,6 +2955,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 self.opp_table.set_slots(slots)
             except Exception:
                 pass
+        # A hand-made layout stays: driving another policy on the same crates is the point of making one. It applies
+        # while the condition has obstacles (`current_config`).
+        self._sync_opp_from_table()
         self._sync_condition()
         self._update_start_enabled()
 
@@ -2474,12 +3091,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self._on_scenario_changed()
 
     def _on_reroll(self):
-        """A new placement is a new map, so this is a new session seed and a restart -- not a live
-        command. Pressing it while nothing is running just changes what the next 시작 will build."""
-        import random as _random
-        self._session_seed = _random.randrange(1, 10 ** 9)
-        self._on_scenario_changed()
-        if self.state in (STATE_RUNNING, STATE_PAUSED):
+        """The hidden panel's 다시 뽑기 (11-03): the condition bar's, which changes a running session's layout in place
+        when it has the generator, and otherwise what the next 시작 builds. A baked family (`#line:<seed>`) is a
+        different map, so a running session of one is rebuilt."""
+        self._on_seed_roll()
+        if self.state in (STATE_RUNNING, STATE_PAUSED) and not self._session_holds_layout() \
+                and not self._train_obstacles():
             self._on_start()
 
     def _update_selection_note(self):
@@ -2534,6 +3151,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         else:
             self.row_opp.reset_hint()
         self._update_start_enabled()
+        self._refresh_condbar()
 
     # ---------------------------------------------------------------- remembered settings
     def collect_prefs(self) -> dict:
@@ -2576,6 +3194,8 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "fold_advanced": bool(self.adv_fold.toggle.isChecked()),
             "fold_checkpoint": bool(self.ckpt_fold.toggle.isChecked()),
             "ego": self.ego_panel.config(),
+            # 11-03: the opponent the condition bar was left on (the race conditions use it)
+            "opponent_slots": self._opp_slots() if hasattr(self, "combo_opp_kind") else None,
         }
 
     def apply_prefs(self, p: dict) -> None:
@@ -2661,6 +3281,16 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         attempt(lambda v: self.ckpt_fold.toggle.setChecked(bool(v)), "fold_checkpoint")
         attempt(lambda v: self.ego_panel.set_config(dict(v or {})), "ego")
 
+        def restore_opponents(value):
+            if value and hasattr(self, "combo_opp_kind"):
+                self._set_opp_bar(list(value))
+                if self.spin_grid.value() > 1:
+                    self.opp_table.set_slots(list(value))
+        attempt(restore_opponents, "opponent_slots")
+        if "obstacle_seed" in p and hasattr(self, "seed_box"):
+            # a seed someone set (a pick's settings) is the seed: the bar shows it and the draw uses it
+            attempt(lambda v: self._set_seed(int(v)), "obstacle_seed")
+
     def save_prefs(self) -> None:
         from . import prefs
         prefs.save(self.collect_prefs())
@@ -2679,19 +3309,29 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         if i_mu >= 0:
             self.combo_mu.setCurrentIndex(i_mu)
         self.spin_mu.setValue(float(SessionConfig.mu))
+        # 11-03: a fresh obstacle seed per launch, shown in the bar (`prefs`: a remembered seed would quietly turn
+        # every launch into a replay of the last); type one back in to see a layout again.
+        import random as _random
+        self._set_seed(_random.randint(*self.SEED_RANGE))
+        self._seed_applied = self._seed()
         self._sync_condition()
 
     def _train_obstacles(self) -> bool:
         return str(self.combo_obstacle.currentData() or "") == TRAIN_OBSTACLES
 
     def current_config(self) -> SessionConfig:
+        props = self._train_obstacles()
+        # 11-03: the obstacles are the seed's layout (the bar's number) or the hand-made one, held across resets.
+        custom = list(self._custom_layout) if (props and self._custom_layout is not None) else None
         return SessionConfig(
             run=self._selected_run or "latest",
             map_name=self._scenario(),
             # 학습과 같음 has no spec seed to fix: 고정 seeds the generator itself.
-            seed=(int(self.spin_seed.value()) if self._train_obstacles()
+            seed=(int(self.spin_seed.value()) if props
                   and str(self.combo_seed.currentData()) == "fixed" else int(self._session_seed)),
-            procedural=self._train_obstacles(),
+            procedural=props,
+            layout_seed=(int(self.spin_seed.value()) if props and custom is None else None),
+            prop_layout=custom,
             races=self.spin_races.value(),
             cars_per_race=self.spin_grid.value(),
             speed_cap=None,                     # the checkpoint's own trained cap (no console control since 10-26)
@@ -2728,8 +3368,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         )
 
     def _on_start(self):
+        if self._editing:
+            self._end_edit(resume=False)
         self.clear_error()
         self.save_prefs()              # the settings that were actually driven with
+        self._seed_applied = self._seed()
+        self._started_opp = (int(self.spin_grid.value()),
+                             self.opp_table.slot_dicts() if self.spin_grid.value() > 1 else [])
         self.btn_start.mark_pending()
         self._pending["start"] = time.monotonic()
         self.start_requested.emit(self.current_config())
@@ -2738,6 +3383,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.cancel_requested.emit()
 
     def _on_stop(self):
+        self._edit_on_ready = False
+        if self._editing:
+            self._end_edit(resume=False)
         self.btn_stop.mark_pending()
         self._pending["stop"] = time.monotonic()
         self.stop_requested.emit()
@@ -2838,6 +3486,12 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 ("S", "3D 화면 스크린샷"),
                 ("R", "녹화 시작 / 중지"),
                 ("드래그 / 휠", "궤도 카메라 회전 / 확대"),
+                ("장애물 시드", "위 두 번째 줄의 숫자 = 장애물 배치. 같은 숫자면 같은 배치, '다시 뽑기'는 새 배치 "
+                             "(주행 중이면 바로 그 배치로 처음부터)"),
+                ("장애물 편집", "'✎ 장애물 편집' → 클릭 고르기 · 끌기 옮기기 · '＋ 놓기'(A) 후 클릭 놓기 · Q/E·Shift+휠 돌리기 · "
+                             "Delete 지우기 · Ctrl+Z 되돌리기 · 휠 확대 · 오른쪽 끌기 이동 · F 전체 보기 · "
+                             "'▶ 이 배치로 달리기'"),
+                ("상대차", "경주 조건에서 두 번째 줄 오른쪽: 종류 · 속도 배율(하한~상한) · 대수"),
                 ("환경 페이지", "V 선택 · B 덕트 · W 벽 · E 지우개 · L/K 선 · M 사각형 · P 다각형 · A 배치 · "
                            "Ctrl+Z/Y 되돌리기 · F 전체 보기 · 5 위에서 · 가운데/Alt+드래그 회전 · "
                            "오른쪽/Shift+드래그 이동 · 휠 확대"),

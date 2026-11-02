@@ -297,6 +297,13 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
 
         self._orbit = [math.radians(-35), math.radians(30), 4.0]
         self._drag: Optional[Tuple[float, float]] = None
+        #: 장애물 편집 (2026-11-03, `layout_editor`): the editor while the mode is on, the top-down camera it uses
+        #: ([centre x, centre y, height, up x, up y]), the camera to go back to, and the drag in progress.
+        self.layout_editor = None
+        self._edit_cam: Optional[List[float]] = None
+        self._cam_before_edit: Optional[str] = None
+        self._edit_drag: Optional[Tuple[int, float, float]] = None       # (piece, offset x, offset y)
+        self._edit_pan: Optional[Tuple[float, float]] = None              # the floor point held under the cursor
         self._cam_eye = None
         self._cam_tgt = None
         self._spin = np.zeros(MAX_RENDER_CARS)
@@ -612,7 +619,8 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             arrays = tuple(batch[k] for k in ("pos", "nrm", "col", "idx"))
             self._upload_static("props", arrays, material=str(batch.get("material", "plastic")))
         if geom.dyn_props:
-            self.scene.set_dyn_props(geom.dyn_props, max(1, int(geom.dyn_prop_slots)))
+            # Room for 장애물 편집, where one shape may stand more times than the session has slots.
+            self.scene.set_dyn_props(geom.dyn_props, max(self.DYN_PROP_INSTANCES, int(geom.dyn_prop_slots)))
         else:
             self.scene.clear_dyn_props()
         if geom.centerline is not None and len(geom.centerline) > 1:
@@ -648,6 +656,10 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self._n_beams = n_beams
 
     def set_camera(self, mode: str):
+        if self.layout_editor is not None:
+            # the edit view stays until 장애물 편집 ends; the choice is where it goes back to
+            self._cam_before_edit = mode if mode in CAMERA_KEYS else self._cam_before_edit
+            return
         if mode in CAMERA_KEYS and mode != self.camera:
             self.camera = mode
             self._cam_eye = self._cam_tgt = None
@@ -874,8 +886,26 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         else:
             sc.set_focus_ring(0.0, 0.0, on=False)
         sc.set_contact_rings(*(rings or (None, None)), radius=self.CONTACT_RING_M)
+        ed = self.layout_editor
+        if ed is not None:
+            # the ring round the picked crate, in place of the contact rings (nothing moves while editing)
+            if ed.selected is not None and ed.selected < len(ed.pieces):
+                p = ed.pieces[ed.selected]
+                r = float(np.max(np.linalg.norm(ed.footprint_world(ed.selected) - [p["x"], p["y"]], axis=1))) + 0.08
+                sc.set_contact_rings(np.array([[p["x"], p["y"]]], np.float32),
+                                     np.array([self.EDIT_RING_RGBA], np.float32), radius=r)
+            else:
+                sc.set_contact_rings(None, None)
         sc.set_car_instances(mats, tint, labels=fr.get("ids") if self.show_labels else None)
-        sc.set_dyn_prop_poses(fr.get("props_dyn"))
+        if ed is None:
+            sc.set_dyn_prop_poses(fr.get("props_dyn"))
+        else:
+            # 장애물 편집: the layout being edited, not the paused frame's -- and the picked crate lit up
+            rows = ed.rows()
+            tints = np.ones((len(rows), 4), np.float32)
+            if ed.selected is not None and ed.selected < len(rows):
+                tints[ed.selected] = self.EDIT_PICK_TINT
+            sc.set_dyn_prop_poses(rows, tints)
         # Where each held contact touched, what it was and how hard (`contacts.contact_marks`).
         sc.set_contact_marks(CT.contact_marks(fr) if self.show_contacts else None)
 
@@ -1159,7 +1189,12 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             eye = np.array([x, y, 14.0])
             target = np.array([x, y, 0.0])
             up = np.array([math.cos(yaw), math.sin(yaw), 0.0])
-        elif m == "overview":
+        elif m == "edit" and self._edit_cam is not None:
+            cx, cy, d, ux, uy = self._edit_cam
+            eye = np.array([cx, cy, d])
+            target = np.array([cx, cy, 0.0])
+            up = np.array([ux, uy, 0.0])
+        elif m in ("overview", "edit"):
             aspect = w / max(1, h)
             t = math.tan(math.radians(55.0) / 2)
             frame = self.geometry_data.frame() if self.geometry_data else None
@@ -1213,8 +1248,177 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         self._cam_eye, self._cam_tgt = eye, target
         return self._cam_eye, self._cam_tgt, up
 
+    # ---------------------------------------------------------------- 장애물 편집
+    #: Instances each catalogue shape's mesh holds (one shape may be every piece of an edited layout).
+    DYN_PROP_INSTANCES = 96
+    #: The picked crate's tint (multiplies its colours) and the ring drawn round it.
+    EDIT_PICK_TINT = (0.55, 1.25, 1.9, 1.0)
+    EDIT_RING_RGBA = (0.35, 0.75, 1.0, 0.95)
+    #: How far the edit camera may come down and go up [m], and how much one wheel notch zooms.
+    EDIT_D_RANGE = (1.5, 400.0)
+    EDIT_ZOOM_STEP = 0.85
+
+    def reset_trails(self) -> None:
+        """Forget the 주행 자취: an episode started again (리셋, a new obstacle layout) is not a continuation, and a
+        trail kept across it draws a line from where each car was to where it respawned."""
+        if self.scene is not None:
+            self.scene.trail_fill = 0
+        self._trail_seq = -1
+
+    def begin_layout_edit(self, editor) -> None:
+        """Look straight down at the whole map and hand the mouse to `editor` (`layout_editor.LayoutEditor`)."""
+        if self.layout_editor is None:
+            self._cam_before_edit = self.camera
+        self.layout_editor = editor
+        editor.changed.connect(self.update)
+        self._edit_cam = self._overview_cam()
+        self.camera = "edit"
+        self._edit_drag = self._edit_pan = None
+        self.setMouseTracking(True)
+        self.setFocus(QtCore.Qt.OtherFocusReason)
+        self.update()
+
+    def fit_layout_edit(self) -> None:
+        """The edit view back on the whole map (전체 보기)."""
+        if self.layout_editor is not None:
+            self._edit_cam = self._overview_cam()
+            self.update()
+
+    def end_layout_edit(self) -> None:
+        ed, self.layout_editor = self.layout_editor, None
+        if ed is not None:
+            try:
+                ed.changed.disconnect(self.update)
+            except TypeError:
+                pass
+        self.camera = self._cam_before_edit or "overview"
+        self._cam_before_edit = None
+        self._cam_eye = self._cam_tgt = None
+        self._edit_drag = self._edit_pan = None
+        self.setMouseTracking(False)
+        self.unsetCursor()
+        self.update()
+
+    def _overview_cam(self) -> List[float]:
+        """[cx, cy, height, up x, up y] of the 전체 view as `_camera_pose` frames it: where the edit camera starts."""
+        saved = self.camera
+        try:
+            self.camera = "overview"
+            eye, target, up = self._camera_pose({"focus": 0, "n": 0})
+        finally:
+            self.camera = saved
+        return [float(target[0]), float(target[1]), float(eye[2] - target[2]), float(up[0]), float(up[1])]
+
+    def _edit_vp(self) -> np.ndarray:
+        """proj @ view of the edit camera, as `_draw` builds it, for the widget's own aspect."""
+        cx, cy, d, ux, uy = self._edit_cam
+        eye, target = np.array([cx, cy, d]), np.array([cx, cy, 0.0])
+        view = G.look_at(eye, target, np.array([ux, uy, 0.0]))
+        near, far, _f0, _f1 = self._depth_range(eye, target)
+        proj = G.perspective(55.0, max(1, self.width()) / max(1, self.height()), near, far)
+        return np.asarray(proj, np.float64) @ np.asarray(view, np.float64)
+
+    def floor_point(self, px: float, py: float, z: float = 0.0) -> Optional[Tuple[float, float]]:
+        """Where the ray through widget pixel (px, py) crosses height `z` [m] in the edit view, or None."""
+        if self._edit_cam is None:
+            return None
+        inv = np.linalg.inv(self._edit_vp())
+        nx = 2.0 * float(px) / max(1, self.width()) - 1.0
+        ny = 1.0 - 2.0 * float(py) / max(1, self.height())
+        a = inv @ np.array([nx, ny, -1.0, 1.0])
+        b = inv @ np.array([nx, ny, 1.0, 1.0])
+        a, b = a[:3] / a[3], b[:3] / b[3]
+        dz = b[2] - a[2]
+        if abs(dz) < 1e-12:
+            return None
+        q = a + (z - a[2]) / dz * (b - a)
+        return float(q[0]), float(q[1])
+
+    def screen_point(self, x: float, y: float, z: float = 0.0) -> Optional[Tuple[float, float]]:
+        """The widget pixel world point (x, y, z) is drawn at in the edit view (the inverse of `floor_point`)."""
+        if self._edit_cam is None:
+            return None
+        c = self._edit_vp() @ np.array([x, y, z, 1.0])
+        if c[3] <= 0:
+            return None
+        nx, ny = c[0] / c[3], c[1] / c[3]
+        return (nx + 1.0) * 0.5 * max(1, self.width()), (1.0 - ny) * 0.5 * max(1, self.height())
+
+    def _editing(self) -> bool:
+        return self.layout_editor is not None and self.camera == "edit" and self._edit_cam is not None
+
+    def _edit_press(self, ev) -> None:
+        ed = self.layout_editor
+        x, y = ev.x(), ev.y()
+        g = self.floor_point(x, y)
+        if g is None:
+            return
+        if ev.button() == QtCore.Qt.LeftButton:
+            i = ed.hit(lambda z: self.floor_point(x, y, z))
+            if i is not None:
+                ed.checkpoint()                    # one undo step for the whole drag
+                ed.select(i)
+                p = ed.pieces[i]
+                self._edit_drag = (i, p["x"] - g[0], p["y"] - g[1])
+                self.setCursor(QtCore.Qt.ClosedHandCursor)
+            elif ed.mode == "add":
+                i = ed.add(g[0], g[1])
+                if i is not None:
+                    self._edit_drag = (i, 0.0, 0.0)
+            else:
+                ed.select(None)
+                self._edit_pan = g
+        elif ev.button() in (QtCore.Qt.RightButton, QtCore.Qt.MiddleButton):
+            self._edit_pan = g
+
+    def _edit_move(self, ev) -> None:
+        ed = self.layout_editor
+        x, y = ev.x(), ev.y()
+        if self._edit_drag is not None:
+            g = self.floor_point(x, y)
+            if g is not None:
+                i, ox, oy = self._edit_drag
+                ed.move(i, g[0] + ox, g[1] + oy)
+            return
+        if self._edit_pan is not None:
+            g = self.floor_point(x, y)
+            if g is not None:                      # keep the floor point that was grabbed under the cursor
+                self._edit_cam[0] += self._edit_pan[0] - g[0]
+                self._edit_cam[1] += self._edit_pan[1] - g[1]
+                self.update()
+            return
+        # hovering: the cursor says what a click would do
+        if ed.hit(lambda z: self.floor_point(x, y, z)) is not None:
+            self.setCursor(QtCore.Qt.OpenHandCursor)
+        elif ed.mode == "add":
+            self.setCursor(QtCore.Qt.CrossCursor)
+        else:
+            self.unsetCursor()
+
+    def _edit_wheel(self, ev) -> None:
+        d = ev.angleDelta().y() or ev.angleDelta().x()       # Shift turns a vertical wheel horizontal on some systems
+        if not d:
+            return
+        steps = d / 120.0
+        ed = self.layout_editor
+        if ev.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.ControlModifier) and ed.selected is not None:
+            ed.rotate(15.0 if steps > 0 else -15.0)
+            return
+        x, y = ev.pos().x(), ev.pos().y()
+        before = self.floor_point(x, y)
+        lo, hi = self.EDIT_D_RANGE
+        self._edit_cam[2] = float(np.clip(self._edit_cam[2] * (self.EDIT_ZOOM_STEP ** steps), lo, hi))
+        after = self.floor_point(x, y)
+        if before is not None and after is not None:          # zoom about the point under the cursor
+            self._edit_cam[0] += before[0] - after[0]
+            self._edit_cam[1] += before[1] - after[1]
+        self.update()
+
     # ---------------------------------------------------------------- input
     def mousePressEvent(self, ev):
+        if self._editing():
+            self._edit_press(ev)
+            return
         """A click never changes the camera mode.
 
         Pressing anywhere in the picture used to switch to 궤도 -- so glancing at the window, or
@@ -1233,11 +1437,19 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             w.sync_camera_buttons(self.camera)
 
     def mouseReleaseEvent(self, ev):
+        if self._editing():
+            if self._edit_drag is not None:
+                self.setCursor(QtCore.Qt.OpenHandCursor)
+            self._edit_drag = self._edit_pan = None
+            return
         if ev.button() == QtCore.Qt.LeftButton:
             self._drag = None
         super().mouseReleaseEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if self._editing():
+            self._edit_move(ev)
+            return
         if self._drag is None or self.camera != "orbit":
             return
         dx, dy = ev.x() - self._drag[0], ev.y() - self._drag[1]
@@ -1252,6 +1464,9 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
         The orbit distance is still updated in other modes so that turning the wheel and *then*
         choosing 궤도 lands where the user expected, but nothing about the current view changes.
         """
+        if self._editing():
+            self._edit_wheel(ev)
+            return
         steps = ev.angleDelta().y() / 120.0
         self._orbit[2] = float(np.clip(self._orbit[2] * (0.9 ** steps), 0.5, 80.0))
         if self.camera == "orbit":
