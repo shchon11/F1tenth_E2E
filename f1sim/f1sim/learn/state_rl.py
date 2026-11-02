@@ -327,6 +327,49 @@ def bev_grid(env, lid, margin=0.125):
     return g
 
 
+class RacePosition:
+    """`--pos-bonus` (11-02): the race's order in the reward, zero-sum -- +1 the step this car takes a place from a car
+    within `rng` m (from more than `hyst` m behind it to more than `hyst` m ahead), -1 the step it loses one. A side is only
+    known while the other car is within `rng` m: out of range it is forgotten (no change is paid), and it is set without
+    pay on entering range or after a reset -- so a spawn, a lap of the track and a car that falls out of range pay nothing,
+    and handing a place back to take it again pays nothing either. 11-02: with progress and the hit price alone a pass of
+    a 0.6x car was worth ~22 (10 s horizon) against ~24 of expected hits at 0.3 hard hits per pass, and every race-stage
+    run (raceb, racec, racew) erased passing between update 50 and 100 while it kept following safely."""
+
+    def __init__(self, env, lid, hyst=1.0, rng=8.0, void_s=0.0):
+        self.env, self.lid, self.hyst, self.rng, self.void_s = env, lid, float(hyst), float(rng), float(void_s)
+        self.side = torch.zeros(int(lid.numel()), max(1, env.M - 1), dtype=torch.long, device=lid.device)
+        self.t_hit = torch.full((int(lid.numel()),), 1e9, device=lid.device)
+
+    def step(self, hit=None):
+        """(gained places that pay (B,), lost (B,), gained (B,)) this step. `hit` (B,): this car's hard car contact this
+        step -- with `void_s` > 0 a place taken within `void_s` s of one does not pay (`--pos-void`, 11-02: at +80 a pass
+        and -80 a hard hit, shoving a same-pace car off at a hairpin exit and driving past it came out even plus the time
+        it lost -- racep u100 passed a 1.0x car in 13 races of 20 with 12 hard hits; a race gives no place for a contact)"""
+        env = self.env
+        z = torch.zeros(self.side.shape[0], device=self.side.device)
+        if hit is not None:
+            self.t_hit = torch.where(hit, torch.zeros_like(self.t_hit), self.t_hit + env.sim.control_dt)
+        if env.M <= 1:
+            return z, z, z
+        g = env.signed_gaps(env.last_result.s, env.sim.tid)[self.lid]              # (B, M-1), + = that car ahead
+        o = env.sim.other_idx[self.lid]
+        pres = (~env.sim.absent[o]) if env.sim.absent_any else torch.ones_like(g, dtype=torch.bool)
+        lead = -g
+        new = torch.where(lead > self.hyst, torch.ones_like(self.side),
+                          torch.where(lead < -self.hyst, -torch.ones_like(self.side), self.side))
+        new = torch.where((g.abs() < self.rng) & pres, new, torch.zeros_like(new))
+        gained = ((self.side == -1) & (new == 1)).sum(1).float()
+        lost = ((self.side == 1) & (new == -1)).sum(1).float()
+        self.side = new
+        paid = gained * (self.t_hit > self.void_s).float() if self.void_s > 0 else gained
+        return paid, lost, gained
+
+    def reset(self, d):
+        self.side[d] = 0
+        self.t_hit[d] = 1e9
+
+
 class StateObs:
     """The observation, from the env's state after a step. scan: append the env's NOISE-FREE scan (`scan_true`, the
     beams `--beams` casts) / range: the true shape of every prop, wall and car in view (10-29: three prop centres
@@ -1112,6 +1155,8 @@ def train(a):
     mix = SoloMix(env, a.base, device, float(a.base_reach), int(a.base_hold)) if a.base else None
     ptp = float(getattr(a, "prop_touch_price", 0.0) or 0.0)
     ptv = float(getattr(a, "prop_touch_vmax", 0.0) or 0.0)
+    posb = float(getattr(a, "pos_bonus", 0.0) or 0.0)
+    rpos = RacePosition(env, lid, void_s=float(getattr(a, "pos_void", 0.0) or 0.0)) if posb > 0 and env.M > 1 else None
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
           f"롤아웃 {T}결정 = {T * R} 스텝, 가격 {a.price:g}", flush=True)
     t0 = time.time()
@@ -1132,7 +1177,7 @@ def train(a):
         bg = torch.zeros(T + 1, B, device=device)
         bm = torch.ones(T, B, device=device)                     # 1 = this policy's action was executed (`--base`)
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
-        prog = hits_w = hits_c = prop_s = push_s = 0.0; laps = []; dev_sum = dev_n = 0.0
+        prog = hits_w = hits_c = prop_s = push_s = 0.0; laps = []; dev_sum = dev_n = 0.0; n_gain = n_lost = n_void = 0.0
         relabel = float(getattr(a, "plan_relabel", 0.0) or 0.0) > 0
         if relabel:                                              # `--plan-relabel`: the path each plan was followed by
             pose_s = torch.zeros(T * R + 1, B, 4, device=device); d_s = torch.zeros(T * R, B, dtype=torch.bool, device=device)
@@ -1220,6 +1265,11 @@ def train(a):
                         step_r = step_r - float(a.track_k) * w_ * (dev_ - float(a.track_dead)).clamp_min(0.0)
                         dev_sum += float((dev_ * (~done).float()).sum()); dev_n += float((~done).float().sum())
                     alive = (~done).float()
+                    if rpos is not None:
+                        paid_, lost_, gain_ = rpos.step(onset)
+                        step_r = step_r + posb * (paid_ - lost_)
+                        n_gain += float((gain_ * alive).sum()); n_lost += float((lost_ * alive).sum())
+                        n_void += float(((gain_ - paid_) * alive).sum())
                     rew += step_r * alive
                     prog += float((info["progress"][lid].float().clamp_min(0) * alive).sum())
                     prop_s += float((ptch * alive).sum()) * env.sim.control_dt
@@ -1230,6 +1280,8 @@ def train(a):
                     if relabel:
                         d_s[t * R + k] = d_
                     touching = touching & ~d_
+                    if rpos is not None:
+                        rpos.reset(d_)
                     done |= d_
                     if info["lap_times"].numel():
                         laps += info["lap_times"][env.learner[info["lap_ids"]]].tolist()
@@ -1337,7 +1389,9 @@ def train(a):
         secs = T * R * B * env.sim.control_dt
         stats = {"update": u, "progress_ms": prog / secs, "hits_wall_prop_per_km": hits_w / max(km, 1e-3),
                  "prop_touch_s_per_km": prop_s / max(km, 1e-3), "prop_push_s_per_km": push_s / max(km, 1e-3),
-                 "hits_car_per_km": hits_c / max(km, 1e-3), "J_per_step": float(br.sum() / (T * R * B)),
+                 "hits_car_per_km": hits_c / max(km, 1e-3),
+                 "passes_per_km": n_gain / max(km, 1e-3), "passed_per_km": n_lost / max(km, 1e-3),
+                 "passes_void_per_km": n_void / max(km, 1e-3), "J_per_step": float(br.sum() / (T * R * B)),
                  "laps": len(laps), "lap_mean_s": float(np.mean(laps)) if laps else None,
                  "lap_best_s": float(np.min(laps)) if laps else None, "std": torch.maximum(model.log_std.exp(), model.std_floor).tolist(),
                  "kl": float(np.mean(kls)), "clipfrac": float(np.mean(cfs)), "t_roll": t_roll,
@@ -1359,7 +1413,7 @@ def train(a):
         if u % 5 == 0 or u == upd0 + 1:
             lp_ = f"{stats['lap_mean_s']:.2f}" if laps else "-"
             print(f"[{time.strftime('%H:%M')}] 업데이트 {u} | 진행 {stats['progress_ms']:.2f} m/s | 강한 충돌 벽+상자 "
-                  f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 상자 닿음 {stats['prop_touch_s_per_km']:.1f} (1.5 m/s 미만 {stats['prop_push_s_per_km']:.1f}) s/km | "
+                  f"{stats['hits_wall_prop_per_km']:.2f} 차 {stats['hits_car_per_km']:.2f} /km | 추월 {stats['passes_per_km']:.2f} (부딪혀 무효 {stats['passes_void_per_km']:.2f}) 추월당함 {stats['passed_per_km']:.2f} /km | 상자 닿음 {stats['prop_touch_s_per_km']:.1f} (1.5 m/s 미만 {stats['prop_push_s_per_km']:.1f}) s/km | "
                   f"랩 {len(laps)}개 평균 {lp_} s | "
                   f"J(가격 {price:.0f}) {stats['J_per_step']:.4f} J80 {stats['J80_per_step']:.4f} | 길 벗어남 {stats['plan_dev_m']:.2f} m | 충돌 예측 {stats['hit_p_pos']:.2f}/{stats['hit_p_neg']:.3f} | 경주 정책 몫 {stats['policy_share']:.2f} | 죽은 결정 속도 {stats['dead_speed'] * 100:.0f} % 조향 {stats['dead_steer'] * 100:.0f} % | 표준편차 {[round(x, 3) for x in stats['std']]} | KL {stats['kl']:.4f} | "
                   f"{t_roll:.1f}+{stats['t_upd']:.1f} s"
@@ -1503,6 +1557,10 @@ def main():
                     help="potential -X x price x geo_risk (the 1 s arc's overlap with a prop); 0 = off")
     ap.add_argument("--car-price", type=float, default=0.0,
                     help="final price of a hard car contact (0 = --price); ramps with the price schedule")
+    ap.add_argument("--pos-void", type=float, default=0.0,
+                    help="--pos-bonus: a place taken within this many seconds of a hard car contact does not pay (11-02)")
+    ap.add_argument("--pos-bonus", type=float, default=0.0,
+                    help="race stage: + this when taking a place from a car within 8 m (1 m hysteresis), - when losing one (11-02)")
     ap.add_argument("--prop-touch-vmax", type=float, default=0.0,
                     help="--prop-touch-price only while the car is slower than this [m/s] (a push, not a graze); 0 = any speed")
     ap.add_argument("--prop-touch-price", type=float, default=0.0,
