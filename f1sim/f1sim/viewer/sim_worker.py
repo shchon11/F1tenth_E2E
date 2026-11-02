@@ -295,6 +295,14 @@ PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "
 PROCEDURAL_OPPONENT = {"kind_mix": ["forzaeth", "forzaeth_pred", "lane_switch", "interactive"],
                        "speed_scale": [0.7, 1.0]}
 
+#: Prop slots a console session with a hand-made layout gets (2026-11-03): its pieces plus `CONSOLE_PROP_SPARE`, and
+#: never fewer than `CONSOLE_PROP_SLOTS` or the run's own -- room to add pieces in 장애물 편집 without rebuilding the
+#: session. A seed's session keeps the run's own count: measured on the 5060, 32 slots against 18 cost the state
+#: teacher (pick_srp26h2) 10 % of its step (50 -> 55 ms) and the students nothing; a layout that outgrows the slots
+#: is started again with room for it (`window._on_edit_run`).
+CONSOLE_PROP_SLOTS = 18
+CONSOLE_PROP_SPARE = 12
+
 
 def contact_frame_dict(blk: np.ndarray) -> dict:
     """A frame's per-car contact record (`Simulator.contact_frame`, rows = the drawn cars) as named arrays:
@@ -400,12 +408,23 @@ def _procedural_facts(session: dict) -> dict:
     # and a user who sees an empty lap on this choice should be able to read why. Shown only when
     # it is not 1, because every run since s911 trained at 1 and the strip is already long.
     share = "" if e.procedural_obstacles >= 1.0 else f" · 리셋의 {e.procedural_obstacles:.0%}만"
+    hold = session.get("layout_hold")
+    if hold is None:
+        return {"obstacle_choice": "train",
+                "obstacle_text": (f"학습과 같음 · {e.procedural_density:g}개/10 m · 슬롯 {proc.C} · "
+                                  f"주행선 {'비움' if e.procedural_raceline_corridor == 'on' else '위에도'}"
+                                  f"{' · 밀림' if e.movable_obstacles else ''}{share}"
+                                  f" ({session.get('procedural_src') or '?'})"),
+                "procedural": True}
+    # The console's held layout (`prop_layout.LayoutHold`): where it came from, the pieces, and the shapes the
+    # 장애물 편집 panel offers -- the same catalogue the session draws from.
+    st = hold.state()
+    origin = (f"시드 {st['layout_seed']}" if st["layout_seed"] is not None else "직접 편집")
     return {"obstacle_choice": "train",
-            "obstacle_text": (f"학습과 같음 · {e.procedural_density:g}개/10 m · 슬롯 {proc.C} · "
-                              f"주행선 {'비움' if e.procedural_raceline_corridor == 'on' else '위에도'}"
-                              f"{' · 밀림' if e.movable_obstacles else ''}{share}"
+            "obstacle_text": (f"{origin} · {len(st['layout'])}개 · 리셋해도 그대로"
+                              f"{' · 밀림' if e.movable_obstacles else ''}"
                               f" ({session.get('procedural_src') or '?'})"),
-            "procedural": True}
+            "procedural": True, "prop_catalogue": session.get("prop_catalogue") or [], **st}
 
 
 def _obstacle_facts(spec: str, track) -> dict:
@@ -1099,7 +1118,11 @@ class SimWorker:
             raise StartConfigError(f"상대차 표: {exc}") from exc
         if slots is not None and grid < 2:
             slots = None                       # a solo session has no other car to configure
-        if getattr(cfg, "procedural", False) and grid > 1:
+        # A layout made by hand turns the training generator on whatever the obstacle choice: its pieces live in
+        # the generator's slots (`prop_layout`).
+        custom = getattr(cfg, "prop_layout", None)
+        proc_on = bool(getattr(cfg, "procedural", False)) or custom is not None
+        if proc_on and grid > 1:
             slots, how = procedural_opponents(slots, grid - 1)
             try:
                 from ..opponent_slots import validate_slots
@@ -1196,12 +1219,21 @@ class SimWorker:
                 _plan_out.pop("decision_every", None)        # a held plan is MAP's waypoints; the iLQR re-plans
 
         proc_kw, proc_src = {}, ""
-        if getattr(cfg, "procedural", False):
+        layout_seed = getattr(cfg, "layout_seed", None)
+        hold_layout = proc_on and (custom is not None or layout_seed is not None)
+        run_max_props = 0
+        if proc_on:
             if scenario.choice:
                 raise StartConfigError(
                     f"장애물 '학습과 같음' 은 맵에 굽는 장애물('{scenario.choice}')과 함께 쓸 수 없습니다 — "
                     f"맵은 장애물 없이 고르세요.")
             proc_kw, proc_src = procedural_settings(ckpt_path, getattr(cfg, "collision_mode", "soft"))
+            run_max_props = int(proc_kw.get("procedural_max_props") or 0)
+            if custom is not None:
+                # Room for 장애물 편집 (`CONSOLE_PROP_SLOTS`); a seed's session keeps the run's own count, which is
+                # also what its draw keeps.
+                proc_kw["procedural_max_props"] = max(CONSOLE_PROP_SLOTS, run_max_props, len(custom) + CONSOLE_PROP_SPARE)
+                proc_kw["procedural_obstacles"] = 1.0
         env_cfg = EnvConfig(
             speed_cap=speed_cap, action_mode=mode, race_size=grid,
             opponent=("slots" if slots is not None else cfg.opponent),
@@ -1279,6 +1311,12 @@ class SimWorker:
                                   seed=int(cfg.seed) if proc_kw else 0,
                                   rls=rls if need_rl else None, teacher_limits=TRAIN_LIMITS)
         except (ValueError, RuntimeError) as exc:
+            if "does not fit this env" in str(exc):
+                # 11-03: a policy opponent (the condition bar's 정책: ...) reads the same observation as the ego car;
+                # say so in Korean rather than in the pool's English
+                raise StartConfigError(
+                    "상대 정책이 고른 정책(내 차)과 관측 형식이 달라 같은 경주에 넣을 수 없습니다 — 같은 계열의 정책"
+                    f"(예: 둘 다 v2)을 상대로 고르거나 다른 종류의 상대차를 고르세요. (자세히: {exc})") from exc
             if proc_kw and isinstance(exc, ValueError):
                 raise StartConfigError(f"학습과 같은 장애물: {exc}") from exc
             # A slot's checkpoint is loaded here (`learn.opponent_pool`), which is where an oracle
@@ -1288,6 +1326,21 @@ class SimWorker:
                 raise
             raise StartConfigError(f"상대차 표: {exc}") from exc
         env.sim.tid.fill_(0)                       # every car on the map that was asked for
+        # The console's layout (`prop_layout.LayoutHold`): a seed's draw or a hand-made layout, written now and put
+        # back at every reset -- before the reset below, so the spawn is tested against the crates it will meet.
+        hold, prop_cat = None, None
+        if hold_layout and env.procedural is not None:
+            from . import prop_layout as PL
+            prop_cat = PL.catalogue(env.procedural)
+            hold = PL.LayoutHold(env.procedural, PL.run_slots(env.procedural, run_max_props), env.sim.tid[:1])
+            try:
+                if custom is not None:
+                    hold.set_pieces(PL.LF.from_portable(custom, prop_cat))
+                else:
+                    hold.set_seed(int(layout_seed))
+            except ValueError as exc:
+                raise StartConfigError(f"장애물 배치: {exc}") from exc
+            hold.install()
         ego_note = ""
         if ego_kind != "policy":
             # Another driver for the ego car: the checkpoint keeps the observation contract, and this
@@ -1406,6 +1459,7 @@ class SimWorker:
             "last_reload": time.time(),
             "raceline": rls[0] if rls else None,
             "procedural_src": proc_src,
+            "layout_hold": hold, "prop_catalogue": prop_cat,
         }
         if skind:
             session["act_fn"].session = session        # a student reads the session's observation dict
@@ -2185,14 +2239,16 @@ class SimWorker:
                      state={"dial": (None if dial is None else round(float(dial.mu), 4)),
                             "last_seq": self.seq - 1, "t": float(session["env"].sim.t)})
         elif kind == P.CMD_RESET:
-            session["obs"], _ = session["env"].reset()
-            if session.get("controller") is not None:
-                session["controller"].begin(session["obs"])
-            session["gg"].clear()
-            self._sal_cache = None
+            self._reset_episode(session)
             reanchor = True
             self.say(P.MSG_ACK, seq=seq, command="reset", gen=self.gen,
                      state={"last_seq": self.seq - 1, "t": float(session["env"].sim.t)})
+        elif kind == P.CMD_SET_LAYOUT:
+            state = self._set_layout(session, msg)
+            if state.get("reset"):
+                reanchor = True
+            self.say(P.MSG_ACK, seq=seq, command="set_layout", gen=self.gen,
+                     state=dict(state, last_seq=self.seq - 1, t=float(session["env"].sim.t)))
         elif kind == P.CMD_FOCUS:
             shown = min(int(session["env"].sim.B), int(session["cfg"].max_render_cars))
             session["focus"] = max(0, min(shown - 1, int(msg.get("env", 0))))
@@ -2206,6 +2262,41 @@ class SimWorker:
                 self._sal_cache = None
             self.say(P.MSG_ACK, seq=seq, command="overlay", gen=self.gen, state=dict(self._overlay))
         return reanchor
+
+    def _reset_episode(self, session) -> None:
+        """What 리셋 does: a full env reset (the held layout goes back where it was put), the controller restarted."""
+        session["obs"], _ = session["env"].reset()
+        if session.get("controller") is not None:
+            session["controller"].begin(session["obs"])
+        session["gg"].clear()
+        self._sal_cache = None
+
+    def _set_layout(self, session, msg: dict) -> dict:
+        """CMD_SET_LAYOUT on the sim thread: hold a new seed's draw or the pieces sent, then (by default) start the
+        episode again on it. Returns the ack state -- the layout as held, or `error` and the layout unchanged."""
+        from . import prop_layout as PL
+        env = session["env"]
+        proc = getattr(env, "procedural", None)
+        if proc is None:
+            return {"error": "이 세션에는 장애물 생성기가 없습니다 — 장애물이 있는 조건으로 다시 시작해야 합니다"}
+        hold = session.get("layout_hold")
+        if hold is None:
+            # A session started without a held layout (a script's config): hold from now on, keeping its slots.
+            hold = PL.LayoutHold(proc, int(proc.C), env.sim.tid[:1]).install()
+            session["layout_hold"] = hold
+        if session.get("prop_catalogue") is None:
+            session["prop_catalogue"] = PL.catalogue(proc)
+        try:
+            if msg.get("pieces") is not None:
+                hold.set_pieces(PL.LF.from_portable(msg["pieces"], session["prop_catalogue"]))
+            else:
+                hold.set_seed(int(msg.get("seed", 0)))
+        except (ValueError, TypeError) as exc:
+            return dict(hold.state(), error=str(exc))
+        reset = bool(msg.get("reset", True))
+        if reset:
+            self._reset_episode(session)
+        return dict(hold.state(), reset=reset)
 
     # ---------------------------------------------------------------- training courtesy flag
     def _heartbeat(self) -> None:
@@ -2352,7 +2443,8 @@ class SimWorker:
             self.say(P.MSG_ACK, seq=seq, command="cancel", gen=gen,
                      state={"preparing": self.prepare_gen})
 
-        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU, P.CMD_SET_DIAL):
+        elif kind in (P.CMD_PAUSE, P.CMD_RESET, P.CMD_FOCUS, P.CMD_OVERLAY, P.CMD_SET_MU, P.CMD_SET_DIAL,
+                      P.CMD_SET_LAYOUT):
             # These act on a live session. If one is running, its own thread applies them and acks
             # from there, so the ack means "done" rather than "heard".
             if self._sim_thread is not None and self._sim_thread.is_alive():
@@ -2402,6 +2494,8 @@ class SimWorker:
         elif kind == P.CMD_OVERLAY:
             self._overlay.update({k: bool(v) for k, v in (msg.get("overlay") or {}).items()})
             state = dict(self._overlay, session=False)
+        elif kind == P.CMD_SET_LAYOUT:
+            state = {"session": False, "error": "주행 중인 세션이 없습니다"}
         else:                                     # reset
             state = {"session": False}
         self.say(P.MSG_ACK, seq=seq, command=str(kind), gen=self.gen, state=state)

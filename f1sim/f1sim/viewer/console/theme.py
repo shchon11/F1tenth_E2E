@@ -341,6 +341,10 @@ QPushButton#IconButton:disabled {{ color: {c['text.2']}; background: {c['bg.pane
 #TileValueBig {{ font-family: "{MONO_FONT}", monospace; font-size: {SIZE['hud']}px; font-weight: 600; color: {c['text.0']}; }}
 #TileUnit {{ font-size: 12px; color: {c['text.2']}; }}
 #TileSub {{ font-family: "{MONO_FONT}", monospace; font-size: 12px; color: {c['text.1']}; }}
+/* 11-03: the condition bar under the top bar -- the obstacle seed / layout and the opponent of the chosen condition */
+#CondBar {{ background: {c['bg.panel']}; border-bottom: 1px solid {c['line']}; }}
+#CondBar QLabel#CondLabel {{ font-size: 11px; font-weight: 700; color: {c['text.2']}; letter-spacing: 0.8px; }}
+#CondBar QLabel#CondChip {{ font-size: 12px; color: {c['text.1']}; }}
 #Viewport {{ border: none; }}
 #Chip {{ font-family: "{MONO_FONT}", monospace; font-size: 12px; color: {c['text.1']}; }}
 #StatusBar QLabel {{ font-size: 12px; color: {c['text.2']}; }}

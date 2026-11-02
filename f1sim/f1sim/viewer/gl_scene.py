@@ -292,6 +292,7 @@ class Mesh:
         self.ibo = ctx.buffer(np.ascontiguousarray(idx.astype(np.int32)).tobytes())
         self.inst = ctx.buffer(reserve=max_instances * 20 * 4, dynamic=True)
         self.inst.write(np.tile(IDENT_INST, max_instances).tobytes())
+        self.max_instances = int(max_instances)
         self.n_inst = 1
         self.vao = ctx.vertex_array(prog, [(self.vbo, "3f 3f 4f", "in_pos", "in_nrm", "in_col"),
                                            (self.inst, "4f 4f 4f 4f 4f/i", "i_c0", "i_c1", "i_c2", "i_c3", "i_tint")], self.ibo)
@@ -532,27 +533,31 @@ class Scene:
                 meshes.append(m)
             self.dyn_props.append(meshes)
 
-    def set_dyn_prop_poses(self, rows):
-        """(k, 4) rows of [shape id, x, y, yaw], one per live piece, or None for none."""
+    def set_dyn_prop_poses(self, rows, tints=None):
+        """(k, 4) rows of [shape id, x, y, yaw], one per live piece, or None for none. `tints` (k, 4), optional,
+        multiplies each piece's colours -- the console's 장애물 편집 lights the picked one up with it."""
         for meshes in self.dyn_props:
             for m in meshes:
                 m.n_inst = 0
         if rows is None or not len(self.dyn_props):
             return
         rows = np.asarray(rows, np.float32).reshape(-1, 4)
+        all_tints = (np.ones((len(rows), 4), np.float32) if tints is None
+                     else np.asarray(tints, np.float32).reshape(-1, 4))
         sid = rows[:, 0].astype(np.int64)
         for k in np.unique(sid):
             if not 0 <= k < len(self.dyn_props):
                 continue
-            sel = rows[sid == k]
+            pick = sid == k
+            sel = rows[pick]
             c, s = np.cos(sel[:, 3]), np.sin(sel[:, 3])
             mats = np.zeros((len(sel), 4, 4), np.float32)
             mats[:, 0, 0], mats[:, 0, 1], mats[:, 1, 0], mats[:, 1, 1] = c, -s, s, c
             mats[:, 2, 2] = mats[:, 3, 3] = 1.0
             mats[:, 0, 3], mats[:, 1, 3] = sel[:, 1], sel[:, 2]
-            tints = np.ones((len(sel), 4), np.float32)
             for m in self.dyn_props[k]:
-                m.set_instances(mats, tints)
+                cap = int(getattr(m, "max_instances", len(mats)))      # never write past the instance buffer
+                m.set_instances(mats[:cap], all_tints[pick][:cap])
 
     def clear_dyn_props(self):
         for meshes in self.dyn_props:

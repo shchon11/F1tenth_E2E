@@ -179,6 +179,10 @@ def _move_every_control(w):
     w.ckpt_fold.toggle.setChecked(True)
     w.ego_panel.kind.setCurrentIndex(w.ego_panel.kind.findData("ftg"))
     w.ego_panel.pace.setValue(8.0)
+    # 11-03: the condition bar's opponent (two cars of it, so the race of 3 above stays 3)
+    w.combo_opp_kind.setCurrentIndex(w.combo_opp_kind.findData("lane_switch"))
+    w.spin_opp_lo.setValue(0.6)
+    w.spin_opp_n.setValue(2)
 
 
 #: `run` needs a checkpoint on disk and `map` needs the worker's catalogue (`set_maps` applies it),
