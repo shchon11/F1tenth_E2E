@@ -9,7 +9,7 @@ decisions whose effect (2 cm) drowns in the return's noise -- the policies only 
   ahead, the race time left) + the track AHEAD: the centerline at fixed arc distances, in the car's frame, with the half
   width there + the steering angle + the last action. Running mean / std normalised.
 * Action: the car's own command, steer and speed (`EnvConfig.action_mode "direct"`), held REPEAT control steps.
-* Reward per decision: progress + steer-rate + wrong-way - PRICE x charged hard (>= 1.5 m/s) onsets (walls, props, cars):
+* Reward per decision: progress + steer-rate + wrong-way - PRICE x charged hard (>= --severity-min, 1.5 m/s) onsets (walls, props, cars):
   the objective every table reports.
 * PPO, MLP actor-critic, many envs (no LiDAR to cast for the learner: --beams small).
 
@@ -53,7 +53,7 @@ def build_env(a, device, extra=None):
     cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
     e = dict(action_mode="direct", max_steps=int(a.episode_s * 40), speed_cap=10.0, v_max_policy=10.0,
              v_min_policy=float(getattr(a, "v_min", 0.0) or 0.0), reverse_ext=float(getattr(a, "reverse_ext", 0.0) or 0.0),
-             collision_mode="soft", contact_severity_min=1.5, stagger_first_episode=True,
+             collision_mode="soft", contact_severity_min=float(getattr(a, "severity_min", 1.5)), stagger_first_episode=True,
              reward_progress=1.0, reward_collision=-1.0, reward_car_contact=1.0, reward_steer_rate=0.02,
              reward_wrong_way=0.4, reward_proximity=0.0, reward_lap=0.0, reward_lap_time=0.0,
              spawn_runway=3.0, priv_props=True, priv_time=True, compile_tracker=False)
@@ -1557,6 +1557,9 @@ def main():
                     help="potential -X x price x geo_risk (the 1 s arc's overlap with a prop); 0 = off")
     ap.add_argument("--car-price", type=float, default=0.0,
                     help="final price of a hard car contact (0 = --price); ramps with the price schedule")
+    ap.add_argument("--severity-min", type=float, default=1.5,
+                    help="[m/s] the impact a contact needs to be charged (EnvConfig.contact_severity_min). 1.0 = what the console "
+                         "and every report call hard (contact_severity.HARD_MPS); 1.5 left 1.0-1.5 m/s hits free (11-02)")
     ap.add_argument("--pos-void", type=float, default=0.0,
                     help="--pos-bonus: a place taken within this many seconds of a hard car contact does not pay (11-02)")
     ap.add_argument("--pos-bonus", type=float, default=0.0,
