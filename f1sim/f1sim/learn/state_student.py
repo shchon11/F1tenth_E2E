@@ -76,6 +76,7 @@ def main():
     # the competition's session world (state_rl's options, 10-29): opponent on track for a share of races, some resets with
     # an empty track, props removed mid-episode; and the wedge recovery on the learner's car
     ap.add_argument("--opp-present", type=float, default=1.0)
+    ap.add_argument("--opp-slot", default="", help="race stage: JSON merged into the opponent slot (state_rl --opp-slot)")
     ap.add_argument("--prop-fraction", type=float, default=1.0)
     ap.add_argument("--removal-p", type=float, default=0.0)
     ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0))

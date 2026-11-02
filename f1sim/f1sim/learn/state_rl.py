@@ -166,7 +166,25 @@ def _line_speed(env):
     return lp.rl_speed
 
 
-def car_spacetime_block(env, lid, s, tid, a_acc=5.0, v_floor=1.0, half_len=0.55, half_wid=0.35, grow=0.10):
+def _line_planner(env):
+    """the PathPlanner `_line_speed` builds (the min-time raceline per track: its speed and its offset from the centerline)"""
+    _line_speed(env)
+    return env._line_speed_pl
+
+
+def _arc_time(T_ext, x, g, v_first, v_last):
+    """the time [s] a car at arc gap g needs to reach arc x (B, R'): `T_ext` (B, R + 1) its times at 0, 0.4, ..., 0.4 R;
+    before the grid at the first row's speed (0 for an x it is already past), beyond it at the last row's"""
+    R1 = T_ext.shape[1]
+    pos = x / 0.4
+    j0 = pos.floor().clamp(0, R1 - 2).long()
+    w_ = (pos - j0.float()).clamp(0.0, 1.0)
+    T = T_ext.gather(1, j0) * (1 - w_) + T_ext.gather(1, j0 + 1) * w_
+    T = torch.where(x < 0, (x - g).clamp_min(0.0) / v_first, T)
+    return torch.where(x > 0.4 * (R1 - 1), T_ext[:, -1:] + (x - 0.4 * (R1 - 1)) / v_last, T)
+
+
+def car_spacetime_block(env, lid, s, tid, a_acc=5.0, v_floor=1.0, half_len=0.55, half_wid=0.35, grow=0.10, line=False):
     """(B, 13 * 7) in {0, 1} (`--car-st`, 10-31): the other cars in the corridor grid at the time WE would get there if we
     drove our fast line: row d (every 0.4 m ahead) is reached at tau(d) = sum of 0.4 m / v_plan, v_plan = min(the raceline's
     speed there, sqrt(v^2 + 2 a_acc d)) (from our speed now, at most `a_acc`), at least `v_floor`; a car with arc gap g
@@ -175,7 +193,13 @@ def car_spacetime_block(env, lid, s, tid, a_acc=5.0, v_floor=1.0, half_len=0.55,
     `half_len` + `grow` tau (its prediction, along the track, gets less sure with time). A car pulling away blocks nothing;
     a slower car blocks the rows where we would reach it, the lanes beside it stay free -- the same picture a prop gives.
     (10-31: the static car channel -- the car now / +0.5 s / +1 s -- and the car in the scan made the race policy brake to
-    0 m/s for a car 5.6 m ahead closing at 0.8 m/s, 18 % of the time 4-10 m behind a car, and never close in to pass.)"""
+    0 m/s for a car 5.6 m ahead closing at 0.8 m/s, 18 % of the time 4-10 m behind a car, and never close in to pass.)
+
+    `line` (`--car-st-line`, 11-02): the car drives the raceline at its present fraction of the line's speed and keeps its
+    present offset from the line, instead of holding its speed and its offset from the centerline. 11-02: a props policy
+    reading this block in its corridor passed a 0.6x car 20 races in 20 but hit it hard 15 times, every one at a hairpin --
+    it took the lane beside the car, and the car, on the raceline to the metre (0.01-0.07 m off it), followed the line
+    0.9 m across into that lane within 2 m of arc while braking to half the line's speed."""
     B = s.shape[0]
     n_seg = len(AHEAD)
     out = torch.zeros(B, n_seg, CORRIDOR_BINS, device=s.device)
@@ -204,9 +228,27 @@ def car_spacetime_block(env, lid, s, tid, a_acc=5.0, v_floor=1.0, half_len=0.55,
     v_plan = torch.minimum(v_line, torch.sqrt(v0 ** 2 + 2 * a_acc * offs[None, :])).clamp_min(v_floor)
     tau = torch.cumsum(0.4 / v_plan, 1)                                   # (B, R) [s] to reach each row
     blocked = torch.zeros(B, R, U.numel(), dtype=torch.bool, device=s.device)
+    if line:
+        pl = _line_planner(env)
+        tid_o = env.sim.tid[o]
+        r_o = (v_o / pl.rl_speed(s_o, tid_o).clamp_min(0.5)).clamp(0.0, 1.3)          # (B, M-1) its pace on the line
+        dl_o = l_o - pl.rl_offset(s_o, tid_o)                                          # (B, M-1) its offset from it
+        l_line = pl.rl_offset(s[:, None] + offs[None, :], tid[:, None].expand(-1, R))  # (B, R) the line at each row
     for q in range(o.shape[1]):
-        along = (g[:, q:q + 1] + v_o[:, q:q + 1] * tau - offs[None, :]).abs() < half_len + grow * tau      # (B, R)
-        side = (lat - l_o[:, q, None, None]).abs() < half_wid                                              # (B, R, 14)
+        if line:
+            gq = g[:, q:q + 1]
+            v_pred = (v_line * r_o[:, q:q + 1]).clamp_min(0.05)                         # (B, R) its speed at each row
+            ell = (offs[None, :] - torch.maximum(offs[None, :] - 0.4, gq)).clamp_min(0.0)   # its stretch of each cell
+            T0 = (-gq).clamp_min(0.0) / v_pred[:, :1]                                    # behind us: up to our arc
+            T_ext = torch.cat([T0, T0 + torch.cumsum(ell / v_pred, 1)], 1)               # (B, R + 1) at 0, 0.4, ...
+            h = half_len + grow * tau
+            t_in = _arc_time(T_ext, offs[None, :] - h, gq, v_pred[:, :1], v_pred[:, -1:])
+            t_out = _arc_time(T_ext, offs[None, :] + h, gq, v_pred[:, :1], v_pred[:, -1:])
+            along = (t_in <= tau) & (tau <= t_out)                                       # its centre within h of the row
+            side = (lat - (l_line + dl_o[:, q:q + 1])[..., None]).abs() < half_wid
+        else:
+            along = (g[:, q:q + 1] + v_o[:, q:q + 1] * tau - offs[None, :]).abs() < half_len + grow * tau      # (B, R)
+            side = (lat - l_o[:, q, None, None]).abs() < half_wid                                              # (B, R, 14)
         blocked |= along[..., None] & side & pres[:, q, None, None]
     bins = blocked.reshape(B, R, CORRIDOR_BINS, -1).any(-1)
     for k in range(n_seg):
@@ -292,13 +334,22 @@ class StateObs:
 
     def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
                  corridor_cars: bool = False, car_channel: bool = False, bev: bool = False, path_plan: bool = False,
-                 plan_ref=None, car_st: bool = False, scan_nocars: bool = False):
+                 plan_ref=None, car_st: bool = False, scan_nocars: bool = False, corridor_car_st: bool = False,
+                 blank_opp: bool = False, car_st_line: bool = False):
         self.env = env
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
         self.scan, self.scan_range = bool(scan), float(scan_range)
         self.corridor = bool(corridor)
         self.corridor_cars = bool(corridor_cars)
+        #: `--corridor-car-st` (11-02): the other cars' `car_spacetime_block` OR'ed INTO the prop corridor -- a slower car
+        #: is then a prop where we would reach it, so a props policy's swerve applies to it from the first decision (the
+        #: race stage's own car block starts at zero weights, and every race lineage learned to hang back, never to pass:
+        #: 0-1 of 20 races past a 0.6x car). srl19's cars-in-the-corridor were the cars NOW, a prop that moves away.
+        #: `--blank-opp`: the privileged opponent slots as on the empty track (`blank_opponents`), the props policy's own
+        self.corridor_car_st, self.blank_opp = bool(corridor_car_st), bool(blank_opp)
+        #: `--car-st-line`: the cars predicted along the raceline (`car_spacetime_block(line=True)`)
+        self.car_st_line = bool(car_st_line)
         #: `--car-channel` (10-30): the other cars (now, +0.5 s, +1 s) in the same 13 x 7 corridor grid but as their OWN block
         #: appended last -- the prop corridor keeps its meaning (srl19 put cars into it and the parent's prop avoidance broke),
         #: and an --init parent starts with zero weights on it, so update 1 drives as the parent did
@@ -345,6 +396,8 @@ class StateObs:
         env = self.env
         lid = env.learner_ids
         pv = env.privileged_v2()[lid]
+        if self.blank_opp:
+            pv = blank_opponents(pv)
         res = env.last_result
         st = res.state[lid]
         tid = env.sim.tid[lid]
@@ -395,9 +448,13 @@ class StateObs:
         if self.planner is not None:
             parts.append((self.planner.free / 15.0)[:, None])             # how far the plan is free [/15 m]
         if self.corridor:
-            parts.append(corridor_block(env, lid, s, tid, cars=self.corridor_cars))
+            cb = corridor_block(env, lid, s, tid, cars=self.corridor_cars)
+            if self.corridor_car_st:
+                cb = torch.maximum(cb, car_spacetime_block(env, lid, s, tid, line=self.car_st_line))
+            parts.append(cb)
         if self.car_channel:
-            parts.append(car_spacetime_block(env, lid, s, tid) if self.car_st else corridor_block(env, lid, s, tid, cars=True, props=False))
+            parts.append(car_spacetime_block(env, lid, s, tid, line=self.car_st_line) if self.car_st
+                         else corridor_block(env, lid, s, tid, cars=True, props=False))
         out = torch.cat(parts, 1).float()
         self.dim = out.shape[1]
         return out
@@ -410,6 +467,18 @@ BASE_REACH = 10.0          # [m] what counts as near: the grid student sees 12 m
 BASE_HOLD = 10             # decisions (0.5 s) the race policy keeps the car after the last thing near has gone
 
 
+def blank_opponents(o):
+    """`o` (B, D) starting with `privileged_v2`, its opponent slots and nearest-car geometry as on a track with no other
+    car -- what a policy trained without opponents (solo, props) saw there"""
+    from ..gym_env import PRIV_OPP_DIST_SCALE, PRIV_V2_NO_OPP_DIST, PRIV_V2_OPP_KEYS, PRIV_V2_OPP_SLOTS
+    ko = PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS)
+    o = o.clone()
+    o[:, 8:8 + ko] = 0.0
+    o[:, 8 + ko:12 + ko] = torch.tensor([PRIV_V2_NO_OPP_DIST / PRIV_OPP_DIST_SCALE, 0.0, 1.0, 1.0], device=o.device,
+                                        dtype=o.dtype)
+    return o
+
+
 class SoloMix:
     """The frozen SOLO teacher (`--base`, e.g. srl1: empty track 7.53 s) drives while nothing is near; the race policy only
     when a live prop is on the track within `reach` m ahead, another car is within `reach` m (no more than 2 m behind),
@@ -417,8 +486,7 @@ class SoloMix:
     teacher sees the world without props and cars -- its prop / opponent slots as on the empty track it was trained on."""
 
     def __init__(self, env, path, device, reach=BASE_REACH, hold=BASE_HOLD):
-        from ..gym_env import (PRIV_OPP_DIST_SCALE, PRIV_V2_NO_OPP_DIST, PRIV_V2_OPP_KEYS, PRIV_V2_OPP_SLOTS,
-                               PRIV_V2_PROP_DIM)
+        from ..gym_env import PRIV_V2_OPP_KEYS, PRIV_V2_OPP_SLOTS, PRIV_V2_PROP_DIM
         ckb = torch.load(os.path.expanduser(path), map_location=device, weights_only=False)
         ar = ckb["args"]
         if ar.get("scan_obs") or ar.get("corridor_obs") or ar.get("car_channel") or ar.get("bev") or ar.get("path_plan"):
@@ -443,10 +511,7 @@ class SoloMix:
         self.nrm = RunningNorm(o.shape[1], device); self.nrm.load_state_dict(ckb["norm"])
         self.reach, self.hold = float(reach), int(hold)
         ko = PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS)
-        self.opp_cols = slice(8, 8 + ko)
-        self.geo_cols = slice(8 + ko, 12 + ko)
         self.prop_cols = slice(12 + ko, 12 + ko + PRIV_V2_PROP_DIM)
-        self.geo_empty = torch.tensor([PRIV_V2_NO_OPP_DIST / PRIV_OPP_DIST_SCALE, 0.0, 1.0, 1.0], device=device)
         self.n_seg = sum(1 for x in AHEAD if x <= self.reach + 1e-6)
         self.left = torch.zeros(B, dtype=torch.long, device=device)
         self.gate = torch.ones(B, dtype=torch.bool, device=device)
@@ -468,9 +533,7 @@ class SoloMix:
         """the executed action: the race policy's `a_pol` where gated, the solo teacher's mean action elsewhere"""
         self.left = torch.where(self.near(), torch.full_like(self.left, self.hold), (self.left - 1).clamp_min(0))
         self.gate = self.left > 0
-        o = self.sobs(last.clamp(-1, 1))
-        o[:, self.opp_cols] = 0.0
-        o[:, self.geo_cols] = self.geo_empty
+        o = blank_opponents(self.sobs(last.clamp(-1, 1)))
         o[:, self.prop_cols] = 0.0
         a_b = self.net.pi(self.nrm(o)).clamp(-1, 1)
         return torch.where(self.gate[:, None], a_pol, a_b)
@@ -488,7 +551,9 @@ class TeacherPolicy:
                              corridor_cars=bool(ar.get("corridor_cars", 0)), car_channel=bool(ar.get("car_channel", 0)),
                              bev=bool(ar.get("bev", 0)), path_plan=int(ar.get("path_plan", 0) or 0),
                              plan_ref=ar.get("plan_ref"), t_beams=int(t_beams), car_st=bool(ar.get("car_st", 0)),
-                             scan_nocars=bool(ar.get("scan_nocars", 0)))
+                             scan_nocars=bool(ar.get("scan_nocars", 0)),
+                             corridor_car_st=bool(ar.get("corridor_car_st", 0)), blank_opp=bool(ar.get("blank_opp", 0)),
+                             car_st_line=bool(ar.get("car_st_line", 0)))
         B = int(env.learner_ids.numel())
         self.o = self.sobs(torch.zeros(B, self.A, device=device))
         self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev")).to(device)
@@ -954,7 +1019,8 @@ def train(a):
     prepare_graph_runtime(env, log=lambda _t: None)
     obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs), corridor_cars=bool(a.corridor_cars),
                       car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=int(a.path_plan), plan_ref=a.plan_ref,
-                      car_st=bool(a.car_st), scan_nocars=bool(a.scan_nocars))
+                      car_st=bool(a.car_st), scan_nocars=bool(a.scan_nocars),
+                      corridor_car_st=bool(a.corridor_car_st), blank_opp=bool(a.blank_opp), car_st_line=bool(a.car_st_line))
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -1411,6 +1477,11 @@ def main():
     ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0), help="the removal time window [s]")
     ap.add_argument("--car-st", type=int, default=0, help="1: the car channel = the cars where they will be when we get there (10-31)")
     ap.add_argument("--scan-nocars", type=int, default=0, help="1: the scan obs is cast without the other cars (10-31)")
+    ap.add_argument("--corridor-car-st", type=int, default=0,
+                    help="1: the cars where they will be when we get there, INTO the prop corridor (11-02)")
+    ap.add_argument("--blank-opp", type=int, default=0, help="1: the privileged opponent slots as on the empty track (11-02)")
+    ap.add_argument("--car-st-line", type=int, default=0,
+                    help="1: the car space-time block predicts the cars along the raceline (its pace on it, its offset from it)")
     ap.add_argument("--base", default="", help="the gated mixture (10-31): this frozen SOLO teacher drives while nothing is near")
     ap.add_argument("--base-reach", type=float, default=BASE_REACH, help="--base: near = a prop on the track / a car within this [m]")
     ap.add_argument("--base-hold", type=int, default=BASE_HOLD, help="--base: decisions the policy keeps the car after")
