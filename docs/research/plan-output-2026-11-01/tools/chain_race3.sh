@@ -2,7 +2,7 @@
 # 상대 단계 다시 (11-03, 사용자: "상대방 대응까지도 되면 계속 파봐"): 고친 상자 단계(chain_props3.sh)에서 이어서, 같은 원칙으로 --
 # 탐색 잡음은 혼자 단계와 같게(상관 0, 하한 없음; racec~raceh는 모두 상관 0.9 + 하한), 배우는 학생이 볼 수 있는 상대 차만(학생 격자 안,
 # 무잡음 라이다 시선 -- 정답 상대 칸·가까운 차 기하는 비평가만), 상자 수 1..7 고르게. 나머지는 racep(순위 보상 ±80, 상자 30 %,
-# 상대 4종 0.4~1.05배, 100회)와 같음. 기각(전과 같음, 같은 20판 시드 777): 0.6배속 추월 < 15/20, 추월당 세게 > 0.2, 1.0배속 세게 > 2;
+# 상대 4종 0.4~1.05배, 100회)와 같음. 세게 문턱은 콘솔과 같은 1.0 m/s(--severity-min 1.0; 1.5면 콘솔이 세게로 세는 1.0~1.5 m/s 차 충돌이 학습에선 공짜). 기각(전과 같음, 같은 20판 시드 777): 0.6배속 추월 < 15/20, 추월당 세게 > 0.2, 1.0배속 세게 > 2;
 # 혼자 랩이 상자 단계 선생보다 느려짐.
 # 인자: 이름머리 맵 콘솔맵 혼자체크포인트 GPU 환경수 시드머리 지킴이(1/0)
 TAG=$1; M=$2; MC=$3; SOLO=$4; GPU=$5; ENVS=$6; S=$7; GUARD=$8
@@ -15,7 +15,7 @@ cd /home/shchon11/F1tenth_E2E/f1sim
 PL="--action plan --plan-lookahead 0.235 --plan-horizon 0.6 --repeat 2 --tracks $M --plan-relabel 1.0 --plan-relabel-speed 0"
 COMMON="--envs $ENVS --warps 16 --beams 108 --episode-s 40 --horizon 64 --epochs 4 --minibatches 8 --gamma 0.995 --lam 0.95 --clip 0.2 --save-every 25 \
   --noise-corr 0 --soft-bound 1 --bound-loss 1.0 --hit-head 1.0 --hit-shaping 1.0 --level-replay 0.5 \
-  --corridor-obs 1 --scan-obs 1 --prop-fraction 0.3 --removal-p 0.5 --removal-s 10 30 --prop-count uniform --vis-actor 1"
+  --corridor-obs 1 --scan-obs 1 --prop-fraction 0.3 --removal-p 0.5 --removal-s 10 30 --prop-count uniform --vis-actor 1 --severity-min 1.0"
 if [ "$GUARD" = 1 ]; then
   bash $T/gpu_guard3.sh "state_[r]l --name ${TAG}_race|console_[r]aces.py $R/${TAG}_race" $D/chain_${TAG}_race.done > $D/gpu_guard_${TAG}_race.log 2>&1 &
 fi
