@@ -52,6 +52,8 @@ def _u(M):
 CLEAR_RGB = (0.071, 0.075, 0.086)
 HORIZON_RGB = (0.165, 0.180, 0.205)
 ZENITH_RGB = (0.040, 0.046, 0.060)
+#: glEnable enum moderngl has no name for: point sprites, i.e. a gl_PointCoord that runs across the point (see Scene)
+GL_POINT_SPRITE = 0x8861
 #: The ground (floor quad, the console's apron and its backdrop disc). 11-02: a dark slate -- lit and gamma-encoded,
 #: the old 0.135 grey came out #757575 and washed the scene out against the dark console; white hoses and the coloured
 #: lines read on this one.
@@ -376,6 +378,12 @@ class Scene:
         self._build_label_atlas()
         self._make_targets()
         ctx.enable(moderngl.DEPTH_TEST); ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+        # 11-02: this NVIDIA driver (595) leaves gl_PointCoord at (0, 0) unless GL_POINT_SPRITE is on, even in the 3.3 core
+        # context -- every fragment of the LiDAR points, the drivers' markers and the contact marks was discarded, none of
+        # them was ever on screen. A strict core driver rejects the enum (GL_INVALID_ENUM, read off and dropped here) and
+        # has sprites on regardless.
+        ctx.enable_direct(GL_POINT_SPRITE)
+        _ = ctx.error
 
     # ---------------------------------------------------------------- render targets
     def _make_targets(self):
