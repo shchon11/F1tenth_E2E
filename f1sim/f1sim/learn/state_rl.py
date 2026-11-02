@@ -59,7 +59,7 @@ def build_env(a, device, extra=None):
              spawn_runway=3.0, priv_props=True, priv_time=True, compile_tracker=False)
     if a.stage in ("props", "race"):
         e.update(procedural_obstacles=float(getattr(a, "prop_fraction", 1.0)), procedural_density=float(getattr(a, "prop_density", 1.5)),
-                 procedural_max_props=int(getattr(a, "prop_max", 18)),
+                 procedural_max_props=int(getattr(a, "prop_max", 18)), procedural_count=str(getattr(a, "prop_count", "fixed") or "fixed"),
                  procedural_raceline_corridor="off", movable_obstacles=True)
     if a.stage == "race":
         # the competition's format: 1 vs 1, the four planner kinds at 0.7-1.05 of their pace, reacting and with events
@@ -88,12 +88,13 @@ CORRIDOR_BINS = 7
 CORRIDOR_S = tuple(float(x) for x in np.arange(0.4, 26.01, 0.4))
 
 
-def corridor_block(env, lid, s, tid, inflate=0.15, cars=False, props=True):
+def corridor_block(env, lid, s, tid, inflate=0.15, cars=False, props=True, visible=None):
     """(B, 13 * 7) in {0, 1}: for each arc segment between consecutive track-ahead points (AHEAD; the first from the car
     to 1 m), which lateral bins across the track a live prop (inflated by the car's half width) covers anywhere along the
     segment -- the free corridor the props leave, in the frame of the centerline points the policy steers by (10-29:
     the hit prop was outside the 3 nearest-prop slots 1 s before 24 % of the teacher's prop hits; in the scenes the
-    policy kept its line through apex props). Swept every 0.4 m, so no prop falls between rows."""
+    policy kept its line through apex props). Swept every 0.4 m, so no prop falls between rows. `visible` (B, C) bool:
+    only those props (`visible_props`, 11-03)."""
     po = env.procedural
     tr = env.sim.track
     B = s.shape[0]
@@ -114,6 +115,8 @@ def corridor_block(env, lid, s, tid, inflate=0.15, cars=False, props=True):
     n_slots = po.C if (po is not None and props) else 0
     if n_slots:
         pp_all = po.p_poses[lid]; live_all = po.p_sid[lid] >= 0
+        if visible is not None:
+            live_all = live_all & visible
         nrm_all, dd_all = po.p_n[lid], po.p_d[lid]
     for c in range(n_slots):                                                 # one prop slot at a time: bounded memory
         live = live_all[:, c]
@@ -370,6 +373,79 @@ class RacePosition:
         self.t_hit[d] = 1e9
 
 
+#: [m] the LiDAR student's grid (`lidar_grid`, `BEV_*`): what a prop must be inside to be something the car can see
+VIS_X0, VIS_X1, VIS_Y = BEV_X0, BEV_X0 + BEV_H * BEV_RES, BEV_W * BEV_RES / 2
+
+
+def visible_props(env, lid, tol=0.20):
+    """(B, C) bool (`--vis-actor`, 11-03): the live props the car itself can see now -- inside the LiDAR student's grid
+    (x in [VIS_X0, VIS_X1], |y| <= VIS_Y in the car frame), within the LiDAR's range, and in line of sight: the noise-free
+    scan at the bearing of the prop's centre or of one of four points at its extent (its largest half-plane offset)
+    reaches that point (range >= distance - `tol`); a wall or another prop in front cuts the beam short. The privileged
+    teacher's prop inputs read only these, so it reacts to nothing the student cannot see (11-03, the user: no
+    privileged input far from what the student has -- the corridor reached 26 m along the track, round hairpins and
+    behind walls)."""
+    po = env.procedural
+    if po is None or po.C == 0:
+        return None
+    res = env.last_result
+    st = res.state[lid]
+    B, C = st.shape[0], po.C
+    pp = po.p_poses[lid]                                                  # (B, C, 3)
+    dd = po.p_d[lid]
+    ext = torch.where(torch.isfinite(dd), dd, torch.zeros_like(dd)).amax(-1).clamp_min(0.05)   # (B, C)
+    cp, sp = torch.cos(pp[..., 2]), torch.sin(pp[..., 2])
+    off = torch.tensor([[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]], device=st.device)   # (5, 2)
+    ox = off[None, None, :, 0] * ext[..., None]; oy = off[None, None, :, 1] * ext[..., None]
+    px = pp[..., 0:1] + ox * cp[..., None] - oy * sp[..., None]           # (B, C, 5) world
+    py = pp[..., 1:2] + ox * sp[..., None] + oy * cp[..., None]
+    c, s_ = torch.cos(st[:, 2])[:, None, None], torch.sin(st[:, 2])[:, None, None]
+    dx, dy = px - st[:, 0, None, None], py - st[:, 1, None, None]
+    bx, by = dx * c + dy * s_, -dx * s_ + dy * c                          # car frame
+    inwin = (bx >= VIS_X0) & (bx <= VIS_X1) & (by.abs() <= VIS_Y)
+    mx, my, ang = env._lidar_pose()
+    ang = ang.expand(env.B, -1)
+    mx, my, ang = mx[lid], my[lid], ang[lid].float()                      # (B,), (B,), (B, N)
+    lx, ly = bx - mx[:, None, None], by - my[:, None, None]
+    d = torch.hypot(lx, ly); th = torch.atan2(ly, lx)
+    N = ang.shape[1]
+    a0, a1 = ang[:, :1, None], ang[:, -1:, None]
+    pos = (th - a0) / (a1 - a0) * (N - 1)                                 # (B, C, 5) fractional beam index
+    infov = (pos >= 0) & (pos <= N - 1)
+    i0 = pos.floor().clamp(0, N - 2).long(); w = (pos - i0.float()).clamp(0, 1)
+    sc = res.scan_true[lid].float()                                       # (B, N) [m]
+    r0 = sc.gather(1, i0.reshape(B, -1)).reshape(B, C, 5); r1 = sc.gather(1, (i0 + 1).reshape(B, -1)).reshape(B, C, 5)
+    r = r0 * (1 - w) + r1 * w
+    rmax = float(env.range_max)
+    seen = infov & inwin & (d < rmax) & (r >= d - tol)
+    return (po.p_sid[lid] >= 0) & seen.any(-1)
+
+
+def visible_prop_slots(env, lid, visible):
+    """(B, PRIV_V2_PROP_DIM): the privileged prop slots (`GymEnv._prop_block`: present, dx/5, dy/5, dist/5, nearest first,
+    dx > -1 m, within PRIV_V2_PROP_RANGE) over the `visible` props only"""
+    from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_RANGE, PRIV_V2_PROP_SLOTS, PRIV_OPP_DIST_SCALE
+    st = env.last_result.state[lid]
+    B = st.shape[0]
+    K, S = PRIV_V2_PROP_SLOTS, PRIV_OPP_DIST_SCALE
+    blk = torch.zeros(B, K, len(PRIV_V2_PROP_KEYS), device=st.device, dtype=st.dtype)
+    po = env.procedural
+    if po is None or po.C == 0 or visible is None:
+        return blk.reshape(B, -1)
+    d = po.p_poses[lid][:, :, :2].to(st.dtype) - st[:, None, :2]
+    c, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+    dx, dy = d[..., 0] * c + d[..., 1] * s_, -d[..., 0] * s_ + d[..., 1] * c
+    dist = d.norm(dim=-1)
+    live = visible & (dx > -1.0) & (dist < PRIV_V2_PROP_RANGE)
+    key = torch.where(live, dist, torch.full_like(dist, 1e6))
+    n = min(K, key.shape[1])
+    j = key.topk(n, dim=1, largest=False).indices
+    g = lambda t: t.gather(1, j)
+    pres = g(live).to(st.dtype)
+    blk[:, :n] = torch.stack([pres, g(dx) / S, g(dy) / S, g(dist) / S], 2) * pres[..., None]
+    return blk.reshape(B, -1)
+
+
 class StateObs:
     """The observation, from the env's state after a step. scan: append the env's NOISE-FREE scan (`scan_true`, the
     beams `--beams` casts) / range: the true shape of every prop, wall and car in view (10-29: three prop centres
@@ -378,8 +454,13 @@ class StateObs:
     def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
                  corridor_cars: bool = False, car_channel: bool = False, bev: bool = False, path_plan: bool = False,
                  plan_ref=None, car_st: bool = False, scan_nocars: bool = False, corridor_car_st: bool = False,
-                 blank_opp: bool = False, car_st_line: bool = False):
+                 blank_opp: bool = False, car_st_line: bool = False, vis_actor: bool = False):
         self.env = env
+        #: `--vis-actor` (11-03): append the prop slots and the prop corridor over the props the car can SEE
+        #: (`visible_props`) after everything else, and list in `actor_hide` the columns the actor must not read -- the
+        #: full-truth prop slots and corridor and the time left; the critic keeps all of them (asymmetric actor-critic)
+        self.vis_actor = bool(vis_actor)
+        self.actor_hide = []
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
         self.scan, self.scan_range = bool(scan), float(scan_range)
@@ -498,6 +579,27 @@ class StateObs:
         if self.car_channel:
             parts.append(car_spacetime_block(env, lid, s, tid, line=self.car_st_line) if self.car_st
                          else corridor_block(env, lid, s, tid, cars=True, props=False))
+        if self.vis_actor:
+            from ..gym_env import PRIV_V2_OPP_KEYS, PRIV_V2_OPP_SLOTS, PRIV_V2_PROP_DIM
+            n0 = sum(int(p_.shape[1]) for p_ in parts)
+            vis = visible_props(env, lid)
+            parts.append(visible_prop_slots(env, lid, vis))
+            if self.corridor:
+                cb_v = corridor_block(env, lid, s, tid, cars=self.corridor_cars, visible=vis) if vis is not None \
+                    else torch.zeros(st.shape[0], len(AHEAD) * CORRIDOR_BINS, device=st.device)
+                if self.corridor_car_st:
+                    cb_v = torch.maximum(cb_v, car_spacetime_block(env, lid, s, tid, line=self.car_st_line))
+                parts.append(cb_v)
+            if not self.actor_hide:
+                # privileged_v2: ego 8, opponents, nearest-car geometry 4, the prop slots, [time left]
+                p0 = 8 + PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS) + 4
+                hide = list(range(p0, p0 + PRIV_V2_PROP_DIM))
+                if bool(env.ecfg.priv_time):
+                    hide.append(int(pv.shape[1]) - 1)
+                if self.corridor:
+                    c0 = n0 - len(AHEAD) * CORRIDOR_BINS * (1 + int(self.car_channel))
+                    hide += list(range(c0, c0 + len(AHEAD) * CORRIDOR_BINS))
+                self.actor_hide = hide
         out = torch.cat(parts, 1).float()
         self.dim = out.shape[1]
         return out
@@ -528,7 +630,7 @@ class SoloMix:
     or the car is below 1 m/s (starts, wedges: only the race policy can reverse), and `hold` decisions after. The solo
     teacher sees the world without props and cars -- its prop / opponent slots as on the empty track it was trained on."""
 
-    def __init__(self, env, path, device, reach=BASE_REACH, hold=BASE_HOLD):
+    def __init__(self, env, path, device, reach=BASE_REACH, hold=BASE_HOLD, visible=False):
         from ..gym_env import PRIV_V2_OPP_KEYS, PRIV_V2_OPP_SLOTS, PRIV_V2_PROP_DIM
         ckb = torch.load(os.path.expanduser(path), map_location=device, weights_only=False)
         ar = ckb["args"]
@@ -553,6 +655,8 @@ class SoloMix:
         self.net.load_state_dict(ckb["model"], strict=False); self.net.eval()
         self.nrm = RunningNorm(o.shape[1], device); self.nrm.load_state_dict(ckb["norm"])
         self.reach, self.hold = float(reach), int(hold)
+        #: `--vis-actor`: "near" means a prop the car can SEE (`visible_props`), as the actor's own inputs
+        self.visible = bool(visible)
         ko = PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS)
         self.prop_cols = slice(12 + ko, 12 + ko + PRIV_V2_PROP_DIM)
         self.n_seg = sum(1 for x in AHEAD if x <= self.reach + 1e-6)
@@ -565,7 +669,8 @@ class SoloMix:
         st = env.last_result.state
         s, tid = env.last_result.s[lid], env.sim.tid[lid]
         B = s.shape[0]
-        cb = corridor_block(env, lid, s, tid).reshape(B, len(AHEAD), CORRIDOR_BINS)[:, :self.n_seg]
+        cb = corridor_block(env, lid, s, tid, visible=visible_props(env, lid) if self.visible else None
+                            ).reshape(B, len(AHEAD), CORRIDOR_BINS)[:, :self.n_seg]
         out = cb.flatten(1).any(1) | (st[lid, 3] < 1.0)
         if env.M > 1:
             dx, dy, _, _, _, dist, pres = env._opp_rel(st)
@@ -596,14 +701,14 @@ class TeacherPolicy:
                              plan_ref=ar.get("plan_ref"), t_beams=int(t_beams), car_st=bool(ar.get("car_st", 0)),
                              scan_nocars=bool(ar.get("scan_nocars", 0)),
                              corridor_car_st=bool(ar.get("corridor_car_st", 0)), blank_opp=bool(ar.get("blank_opp", 0)),
-                             car_st_line=bool(ar.get("car_st_line", 0)))
+                             car_st_line=bool(ar.get("car_st_line", 0)), vis_actor=bool(ar.get("vis_actor", 0)))
         B = int(env.learner_ids.numel())
         self.o = self.sobs(torch.zeros(B, self.A, device=device))
         self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev")).to(device)
         self.net.load_state_dict(ck["model"], strict=False); self.net.eval()
         self.nrm = RunningNorm(self.o.shape[1], device); self.nrm.load_state_dict(ck["norm"])
         self.mix = SoloMix(env, ar["base"], device, float(ar.get("base_reach", BASE_REACH)),
-                           int(ar.get("base_hold", BASE_HOLD))) if ar.get("base") else None
+                           int(ar.get("base_hold", BASE_HOLD)), visible=bool(ar.get("vis_actor", 0))) if ar.get("base") else None
 
     def policy(self, o):
         """the race policy alone at observation `o`"""
@@ -1029,6 +1134,11 @@ class ActorCritic(nn.Module):
         self.register_buffer("mean_m", torch.ones(act_dim))
         self.raw_mean = None
         self.pi.register_forward_hook(self._soft_bound)
+        #: `--vis-actor` (11-03): which normalised inputs the ACTOR reads (1) -- 0 on the full-truth prop slots and corridor
+        #: and the time left, which only the critic keeps (`StateObs.actor_hide`). A buffer, so every tool that loads the
+        #: checkpoint drives the actor the student is taught by; a checkpoint without it loads all ones (as before)
+        self.register_buffer("actor_keep", torch.ones(obs_dim))
+        self.pi.register_forward_pre_hook(lambda _m, inp: (inp[0] * self.actor_keep,) + tuple(inp[1:]))
         #: P(a hard hit within the next HIT_HORIZON decisions | s), a head on the critic's trunk (`--hit-head`): supervised
         #: on every step, so the critic's features learn what danger looks like before the price of a hit reaches them
         self.hit = nn.Linear(hidden, 1)
@@ -1063,7 +1173,8 @@ def train(a):
     obs_fn = StateObs(env, scan=bool(a.scan_obs), corridor=bool(a.corridor_obs), corridor_cars=bool(a.corridor_cars),
                       car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=int(a.path_plan), plan_ref=a.plan_ref,
                       car_st=bool(a.car_st), scan_nocars=bool(a.scan_nocars),
-                      corridor_car_st=bool(a.corridor_car_st), blank_opp=bool(a.blank_opp), car_st_line=bool(a.car_st_line))
+                      corridor_car_st=bool(a.corridor_car_st), blank_opp=bool(a.blank_opp), car_st_line=bool(a.car_st_line),
+                      vis_actor=bool(a.vis_actor))
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -1125,12 +1236,15 @@ def train(a):
             nm["mean"][cc] = nm["mean"][pc]; nm["var"][cc] = nm["var"][pc]
             print("[state_rl] --init: 시공간 차 칸을 부모의 상자 통로 가중치·통계에서 시작", flush=True)
         missing = [k for k in model.load_state_dict(sd, strict=False).missing_keys
-                   if k not in ("std_floor", "mean_lo", "mean_hi", "mean_m")]
+                   if k not in ("std_floor", "mean_lo", "mean_hi", "mean_m", "actor_keep")]
         if a.std_floor:                                    # this run's floor, not the one an --init checkpoint carried
             model.std_floor.copy_(torch.tensor(std_floor_of(a, A), device=device))
         if missing:
             print(f"[state_rl] --init에 없는 매개변수(새로 시작): {missing}", flush=True)
         norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
+    if obs_fn.actor_hide:
+        model.actor_keep.fill_(1.0); model.actor_keep[torch.tensor(obs_fn.actor_hide, device=device)] = 0.0
+        print(f"[state_rl] --vis-actor: 배우는 {len(obs_fn.actor_hide)}칸(전체 정답 상자 칸·통로, 남은 시간)을 못 봄 -- 비평가만 봄", flush=True)
     if int(a.soft_bound):
         model.set_mean_bounds(*mean_bounds(a, A))
     elif bool((model.mean_hi < 1e5).any()):
@@ -1152,7 +1266,7 @@ def train(a):
     unwedge = Unwedge(env, lid, mode=int(a.unwedge)) if int(a.unwedge) else None
     # the gated mixture (`--base`): the solo teacher drives where nothing is near; the policy gradient only on the
     # decisions this policy drove (elsewhere its sampled action was not executed), the critic on all
-    mix = SoloMix(env, a.base, device, float(a.base_reach), int(a.base_hold)) if a.base else None
+    mix = SoloMix(env, a.base, device, float(a.base_reach), int(a.base_hold), visible=bool(a.vis_actor)) if a.base else None
     ptp = float(getattr(a, "prop_touch_price", 0.0) or 0.0)
     ptv = float(getattr(a, "prop_touch_vmax", 0.0) or 0.0)
     posb = float(getattr(a, "pos_bonus", 0.0) or 0.0)
@@ -1560,6 +1674,9 @@ def main():
     ap.add_argument("--severity-min", type=float, default=1.5,
                     help="[m/s] the impact a contact needs to be charged (EnvConfig.contact_severity_min). 1.0 = what the console "
                          "and every report call hard (contact_severity.HARD_MPS); 1.5 left 1.0-1.5 m/s hits free (11-02)")
+    ap.add_argument("--vis-actor", type=int, default=0,
+                    help="the actor reads props only as the car can SEE them (in the student's grid, in line of sight) and "
+                         "not the time left; the critic keeps the full truth (11-03)")
     ap.add_argument("--pos-void", type=float, default=0.0,
                     help="--pos-bonus: a place taken within this many seconds of a hard car contact does not pay (11-02)")
     ap.add_argument("--pos-bonus", type=float, default=0.0,
@@ -1574,6 +1691,8 @@ def main():
     ap.add_argument("--level-replay", type=float, default=0.0, help="prioritized level replay probability (0 = off)")
     ap.add_argument("--level-replay-size", type=int, default=24)
     ap.add_argument("--prop-density", type=float, default=1.5, help="props / stages: procedural_density (training world)")
+    ap.add_argument("--prop-count", default="fixed", choices=("fixed", "uniform"),
+                    help="patterns per layout: all of the lap's (fixed) or 1 .. all, uniform (11-03: fixed = always dense)")
     ap.add_argument("--prop-max", type=int, default=18, help="props / stages: procedural_max_props")
     ap.add_argument("--scan-obs", type=int, default=0, help="1: append the noise-free scan (--beams beams) to the observation")
     ap.add_argument("--soft-bound", type=int, default=0, help="1: the policy mean squashed into the action range near its ends "

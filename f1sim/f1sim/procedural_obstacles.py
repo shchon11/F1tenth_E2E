@@ -313,13 +313,21 @@ class ProceduralObstacles:
 
     def __init__(self, tracks, B: int, gen: torch.Generator, *, density: float = 1.0,
                  fraction: float = 1.0, max_props: int = 0, raceline_margin: float = 0.25,
-                 car_half_width: float = 0.15):
+                 car_half_width: float = 0.15, count: str = "fixed"):
         self.tr = tracks
         self.B = int(B)
         self.gen = gen
         self.device = tracks.device
         self.density = float(density)
         self.fraction = float(fraction)
+        #: How many of the lap's patterns a layout gets. "fixed": all of them, every layout (every run before
+        #: 2026-11-03). "uniform": a number drawn uniformly from 1 .. all, the kept ones a random subset of the
+        #: lap's sectors. 11-03: at "fixed" every layout on Korea 2025 (43.4 m, density 1.5) had 7 patterns
+        #: (13-18 pieces) or none, the car was clear of props within 10 m 34 % of the time, and the props policy
+        #: drove a narrow centre line on the empty track too (7.18 s against the solo policy's 6.50 s).
+        if count not in ("fixed", "uniform"):
+            raise ValueError(f"procedural count must be 'fixed' or 'uniform', got {count!r}")
+        self.count = count
         self.raceline_margin = float(raceline_margin)
         self.car_half_width = float(car_half_width)
         if tracks.cl is None:
@@ -549,6 +557,13 @@ class ProceduralObstacles:
         n_pat = self.n_pat[t][:, None]
         use = (self._rand((D, 1)) < self.fraction)
         act = (pat < n_pat) & use
+        if self.count == "uniform":
+            # keep k of the lap's patterns, k uniform in 1 .. n_pat, a random subset (not the first k sectors,
+            # which would put every prop of a sparse layout in one stretch of the lap)
+            k = 1 + torch.floor(self._rand((D, 1)) * n_pat.float()).long()
+            pr = torch.where(pat < n_pat, self._rand((D, P)), torch.full((D, P), 2.0, device=dev))
+            rank = pr.argsort(1).argsort(1)
+            act = act & (rank < k)
 
         # --- where each pattern sits on the lap ------------------------------------------------
         L = self.tr.length[t][:, None]

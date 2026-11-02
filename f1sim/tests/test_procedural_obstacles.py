@@ -716,3 +716,27 @@ def test_evaluation_passes_the_option_through_when_it_is_asked_for(capsys):
                                  "--procedural-obstacles", "1.0", "--procedural-density", "1.5"])
     capsys.readouterr()
     assert extra == {"procedural_obstacles": 1.0, "procedural_density": 1.5}
+
+
+# ==================================================================== how many patterns a layout gets (11-03)
+def test_count_uniform_spreads_the_pattern_count(catalogue_tracks):
+    """`procedural_count="uniform"`: the number of patterns a layout gets is spread over 1 .. the lap's, where "fixed"
+    gives every layout (that has props) the same count -- the training world that left Korea 2025 always dense"""
+    counts = {}
+    for mode in ("fixed", "uniform"):
+        env = make_env(catalogue_tracks[:1], B=64, seed=3, procedural_obstacles=1.0, procedural_density=1.0,
+                       procedural_count=mode)
+        env.reset(seed=3)
+        p = env.procedural
+        counts[mode] = p.last_live.sum(1).numpy()
+        n_max = int(p.n_pat.max())
+    assert len(set(counts["fixed"].tolist())) <= 2                      # all the lap's (a pattern that did not fit aside)
+    u = counts["uniform"]
+    assert u.min() >= 0 and u.max() <= n_max
+    assert len(set(u.tolist())) >= max(3, n_max // 2)                   # spread over many counts
+    assert u.mean() < counts["fixed"].mean() - 1.0
+
+
+def test_count_rejects_unknown_modes(catalogue_tracks):
+    with pytest.raises(ValueError):
+        make_env(catalogue_tracks[:1], B=4, procedural_obstacles=1.0, procedural_count="dense")

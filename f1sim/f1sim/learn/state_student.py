@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--opp-present", type=float, default=1.0)
     ap.add_argument("--opp-slot", default="", help="race stage: JSON merged into the opponent slot (state_rl --opp-slot)")
     ap.add_argument("--prop-fraction", type=float, default=1.0)
+    ap.add_argument("--prop-count", default="fixed", choices=("fixed", "uniform"),
+                    help="patterns per layout (state_rl --prop-count): all of the lap's, or 1 .. all (11-03)")
     ap.add_argument("--removal-p", type=float, default=0.0)
     ap.add_argument("--removal-s", type=float, nargs=2, default=(10.0, 30.0))
     ap.add_argument("--unwedge", type=int, default=0)
