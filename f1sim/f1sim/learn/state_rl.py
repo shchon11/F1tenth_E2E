@@ -187,7 +187,8 @@ def _arc_time(T_ext, x, g, v_first, v_last):
     return torch.where(x > 0.4 * (R1 - 1), T_ext[:, -1:] + (x - 0.4 * (R1 - 1)) / v_last, T)
 
 
-def car_spacetime_block(env, lid, s, tid, a_acc=5.0, v_floor=1.0, half_len=0.55, half_wid=0.35, grow=0.10, line=False):
+def car_spacetime_block(env, lid, s, tid, a_acc=5.0, v_floor=1.0, half_len=0.55, half_wid=0.35, grow=0.10, line=False,
+                        visible=None):
     """(B, 13 * 7) in {0, 1} (`--car-st`, 10-31): the other cars in the corridor grid at the time WE would get there if we
     drove our fast line: row d (every 0.4 m ahead) is reached at tau(d) = sum of 0.4 m / v_plan, v_plan = min(the raceline's
     speed there, sqrt(v^2 + 2 a_acc d)) (from our speed now, at most `a_acc`), at least `v_floor`; a car with arc gap g
@@ -212,6 +213,8 @@ def car_spacetime_block(env, lid, s, tid, a_acc=5.0, v_floor=1.0, half_len=0.55,
     st_all = env.last_result.state
     o = env.sim.other_idx[lid]                                             # (B, M-1)
     pres = (~env.sim.absent[o]) if env.sim.absent_any else torch.ones(o.shape, dtype=torch.bool, device=s.device)
+    if visible is not None:                                                # `--vis-actor`: the cars the car can see
+        pres = pres & visible
     g = env.signed_gaps(env.last_result.s, env.sim.tid)[lid]               # (B, M-1), + = ahead of us
     so = st_all[o]
     s_o = env.last_result.s[o]
@@ -421,6 +424,46 @@ def visible_props(env, lid, tol=0.20):
     return (po.p_sid[lid] >= 0) & seen.any(-1)
 
 
+def visible_cars(env, lid, tol=0.20):
+    """(B, M-1) bool (`--vis-actor`, 11-03): the other cars (in `sim.other_idx` order) the car itself can see now -- as
+    `visible_props`: a point of the car (its centre or a corner of its footprint) inside the LiDAR student's grid, within
+    the LiDAR's range, and the noise-free scan at its bearing reaches it (the scan sees cars; a wall or a prop in front
+    cuts it short). None in a solo env."""
+    if env.M <= 1:
+        return None
+    res = env.last_result
+    st_all = res.state
+    st = st_all[lid]
+    o = env.sim.other_idx[lid]                                             # (B, M-1)
+    so = st_all[o]
+    B, Q = o.shape
+    hl, hw = 0.5 * float(env.cfg.vehicle.length), 0.5 * float(env.cfg.vehicle.width)
+    off = torch.tensor([[0.0, 0.0], [hl, hw], [hl, -hw], [-hl, hw], [-hl, -hw]], device=st.device)   # (5, 2)
+    co, si = torch.cos(so[..., 2])[..., None], torch.sin(so[..., 2])[..., None]
+    px = so[..., 0:1] + off[None, None, :, 0] * co - off[None, None, :, 1] * si     # (B, Q, 5) world
+    py = so[..., 1:2] + off[None, None, :, 0] * si + off[None, None, :, 1] * co
+    c, s_ = torch.cos(st[:, 2])[:, None, None], torch.sin(st[:, 2])[:, None, None]
+    dx, dy = px - st[:, 0, None, None], py - st[:, 1, None, None]
+    bx, by = dx * c + dy * s_, -dx * s_ + dy * c
+    inwin = (bx >= VIS_X0) & (bx <= VIS_X1) & (by.abs() <= VIS_Y)
+    mx, my, ang = env._lidar_pose()
+    ang = ang.expand(env.B, -1)
+    mx, my, ang = mx[lid], my[lid], ang[lid].float()
+    lx, ly = bx - mx[:, None, None], by - my[:, None, None]
+    d = torch.hypot(lx, ly); th = torch.atan2(ly, lx)
+    N = ang.shape[1]
+    a0, a1 = ang[:, :1, None], ang[:, -1:, None]
+    pos = (th - a0) / (a1 - a0) * (N - 1)
+    infov = (pos >= 0) & (pos <= N - 1)
+    i0 = pos.floor().clamp(0, N - 2).long(); w = (pos - i0.float()).clamp(0, 1)
+    sc = res.scan_true[lid].float()
+    r0 = sc.gather(1, i0.reshape(B, -1)).reshape(B, Q, 5); r1 = sc.gather(1, (i0 + 1).reshape(B, -1)).reshape(B, Q, 5)
+    r = r0 * (1 - w) + r1 * w
+    seen = infov & inwin & (d < float(env.range_max)) & (r >= d - tol)
+    pres = (~env.sim.absent[o]) if env.sim.absent_any else torch.ones(o.shape, dtype=torch.bool, device=st.device)
+    return pres & seen.any(-1)
+
+
 def visible_prop_slots(env, lid, visible):
     """(B, PRIV_V2_PROP_DIM): the privileged prop slots (`GymEnv._prop_block`: present, dx/5, dy/5, dist/5, nearest first,
     dx > -1 m, within PRIV_V2_PROP_RANGE) over the `visible` props only"""
@@ -588,12 +631,15 @@ class StateObs:
                 cb_v = corridor_block(env, lid, s, tid, cars=self.corridor_cars, visible=vis) if vis is not None \
                     else torch.zeros(st.shape[0], len(AHEAD) * CORRIDOR_BINS, device=st.device)
                 if self.corridor_car_st:
-                    cb_v = torch.maximum(cb_v, car_spacetime_block(env, lid, s, tid, line=self.car_st_line))
+                    cb_v = torch.maximum(cb_v, car_spacetime_block(env, lid, s, tid, line=self.car_st_line,
+                                                                   visible=visible_cars(env, lid)))
                 parts.append(cb_v)
             if not self.actor_hide:
                 # privileged_v2: ego 8, opponents, nearest-car geometry 4, the prop slots, [time left]
                 p0 = 8 + PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS) + 4
-                hide = list(range(p0, p0 + PRIV_V2_PROP_DIM))
+                # the opponent slots and the nearest-car geometry (full truth: cars behind walls, beyond the grid) and the
+                # full-truth prop slots
+                hide = list(range(8, p0)) + list(range(p0, p0 + PRIV_V2_PROP_DIM))
                 if bool(env.ecfg.priv_time):
                     hide.append(int(pv.shape[1]) - 1)
                 if self.corridor:
@@ -674,7 +720,10 @@ class SoloMix:
         out = cb.flatten(1).any(1) | (st[lid, 3] < 1.0)
         if env.M > 1:
             dx, dy, _, _, _, dist, pres = env._opp_rel(st)
-            out |= (pres & (dx > -2.0) & (dist < self.reach))[lid].any(1)
+            nc = (pres & (dx > -2.0) & (dist < self.reach))[lid]
+            if self.visible:
+                nc = nc & visible_cars(env, lid)
+            out |= nc.any(1)
         return out
 
     def __call__(self, a_pol, last):
