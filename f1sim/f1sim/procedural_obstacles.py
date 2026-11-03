@@ -136,7 +136,7 @@ PIECE_BUDGET = 3.5        # mean pieces a pattern actually places, used to size 
                           # count when the caller does not set one. Measured over the six patterns.
 CONTACT_SLOTS = 8         # slots the contact tests look at (see `ProceduralObstacles.near`)
 #: `line_share` (11-03): a pattern slot turned into ONE piece standing on the racing line, its centre the line's lateral
-#: offset +- this. The six wall-measured patterns cannot reach a line that runs mid-lane in a wide stretch (the band is
+#: offset +- this (moved toward a wall only as far as one side needs to keep GAP_MIN). The six wall-measured patterns cannot reach a line that runs mid-lane in a wide stretch (the band is
 #: `width - gap` from one wall): on Korea 2025 the line-blocking pieces per 2 % of lap were 200-390 on most of it and
 #: 21-42 over 84-96 % of the lap (the wide stretch before the start line), and every teacher hit exactly those crates
 LINE_JITTER = 0.30        # [m]
@@ -650,16 +650,25 @@ class ProceduralObstacles:
             kind, act, row_ok, span, span2, side, chic_along, wl, wr, hi, lo, curv)
         is_line = None
         if self.line_share > 0 and self.line_off is not None and not self.has_raceline:
-            # one catalogue box on the line, kept only where one side still leaves GAP_MIN
+            # one catalogue box on the line; where that leaves less than GAP_MIN on both sides it moves the least it
+            # must toward a wall so one side keeps GAP_MIN (11-03: dropping it emptied the narrow Korea 2026 stretches)
             is_line = act & (self._rand((D, P)) < self.line_share)
             n_pool = self.line_pool.numel()
             sid_l = self.line_pool[(self._rand((D, P)) * n_pool).long().clamp_max(n_pool - 1)]
             a_l = 0.5 * self.sh_across[sid_l]
             tj = t[:, None].expand(D, P)
             v_l = self.line_off[tj, j] + (self._rand((D, P)) * 2.0 - 1.0) * LINE_JITTER
-            free_l = self.lane_l[tj, j] - (v_l + a_l)
-            free_r = self.lane_r[tj, j] + (v_l - a_l)
-            ok_l = is_line & (free_l >= 0) & (free_r >= 0) & (torch.maximum(free_l, free_r) >= GAP_MIN)
+            wl_j, wr_j = self.lane_l[tj, j], self.lane_r[tj, j]
+            lo_a, hi_a = -wr_j + a_l, wl_j - a_l - GAP_MIN                # the way past on the + side
+            lo_b, hi_b = -wr_j + a_l + GAP_MIN, wl_j - a_l                # ... on the - side
+            v_a = torch.minimum(torch.maximum(v_l, lo_a), hi_a)
+            v_b = torch.minimum(torch.maximum(v_l, lo_b), hi_b)
+            ok_a, ok_b = lo_a <= hi_a, lo_b <= hi_b
+            inf = torch.full_like(v_l, float("inf"))
+            d_a = torch.where(ok_a, (v_a - v_l).abs(), inf)
+            d_b = torch.where(ok_b, (v_b - v_l).abs(), inf)
+            v_l = torch.where(d_a <= d_b, v_a, v_b)
+            ok_l = is_line & (ok_a | ok_b)
             q0 = (torch.arange(self.Q, device=dev) == 0)[None, None, :]
             live = torch.where(is_line[..., None], ok_l[..., None] & q0, live)
             sid = torch.where(is_line[..., None], sid_l[..., None].expand_as(sid), sid)
