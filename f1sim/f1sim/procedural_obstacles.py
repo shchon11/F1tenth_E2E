@@ -135,6 +135,11 @@ CANDIDATES = 8            # stratified arc candidates per pattern slot (apex tak
 PIECE_BUDGET = 3.5        # mean pieces a pattern actually places, used to size the per-env slot
                           # count when the caller does not set one. Measured over the six patterns.
 CONTACT_SLOTS = 8         # slots the contact tests look at (see `ProceduralObstacles.near`)
+#: `line_share` (11-03): a pattern slot turned into ONE piece standing on the racing line, its centre the line's lateral
+#: offset +- this. The six wall-measured patterns cannot reach a line that runs mid-lane in a wide stretch (the band is
+#: `width - gap` from one wall): on Korea 2025 the line-blocking pieces per 2 % of lap were 200-390 on most of it and
+#: 21-42 over 84-96 % of the lap (the wide stretch before the start line), and every teacher hit exactly those crates
+LINE_JITTER = 0.30        # [m]
 CURVE_INSET = 0.08        # [m] the blocked band is inset by this before anything is placed.
                           # A piece is set down square to the tangent at its own centerline index,
                           # and over the 0.30-0.44 m it is long the frame turns: on a 0.8 m-radius
@@ -313,7 +318,7 @@ class ProceduralObstacles:
 
     def __init__(self, tracks, B: int, gen: torch.Generator, *, density: float = 1.0,
                  fraction: float = 1.0, max_props: int = 0, raceline_margin: float = 0.25,
-                 car_half_width: float = 0.15, count: str = "fixed"):
+                 car_half_width: float = 0.15, count: str = "fixed", line_share: float = 0.0):
         self.tr = tracks
         self.B = int(B)
         self.gen = gen
@@ -328,6 +333,10 @@ class ProceduralObstacles:
         if count not in ("fixed", "uniform"):
             raise ValueError(f"procedural count must be 'fixed' or 'uniform', got {count!r}")
         self.count = count
+        #: share of the drawn pattern slots that become one piece on the racing line (`LINE_JITTER`); needs `set_line`.
+        #: Off while a raceline corridor is installed: the planner opponents are blind to props and drive that line.
+        self.line_share = float(line_share)
+        self.line_off = None
         self.raceline_margin = float(raceline_margin)
         self.car_half_width = float(car_half_width)
         if tracks.cl is None:
@@ -350,6 +359,7 @@ class ProceduralObstacles:
         self.small_id = torch.tensor(small_ids, dtype=torch.long, device=dev)
         self.small_across = torch.tensor([shapes[i].across for i in small_ids], dtype=torch.float32, device=dev)
         self.sh_across = torch.tensor([s_.across for s_ in shapes], dtype=torch.float32, device=dev)
+        self.line_pool = torch.cat([self.row_id, self.small_id]).unique()
 
         self.N = int(tracks.n_cl)
         self._build_track_geometry()
@@ -448,6 +458,10 @@ class ProceduralObstacles:
         big = torch.full_like(self.lane_l, 1e3)
         self.rl_hi, self.rl_lo = -big, big
         self.has_raceline = False
+
+    def set_line(self, offset: torch.Tensor):
+        """(T, N) the racing line's lateral offset [m, left +] at every centerline point, for `line_share`"""
+        self.line_off = offset.to(self.device, torch.float32)
 
     def set_raceline(self, teacher):
         """Install the raceline corridor the pieces must stay out of, from the opponents' teacher.
@@ -634,6 +648,22 @@ class ProceduralObstacles:
 
         off, live, sid, along, pside = self._pieces(
             kind, act, row_ok, span, span2, side, chic_along, wl, wr, hi, lo, curv)
+        is_line = None
+        if self.line_share > 0 and self.line_off is not None and not self.has_raceline:
+            # one catalogue box on the line, kept only where one side still leaves GAP_MIN
+            is_line = act & (self._rand((D, P)) < self.line_share)
+            n_pool = self.line_pool.numel()
+            sid_l = self.line_pool[(self._rand((D, P)) * n_pool).long().clamp_max(n_pool - 1)]
+            a_l = 0.5 * self.sh_across[sid_l]
+            tj = t[:, None].expand(D, P)
+            v_l = self.line_off[tj, j] + (self._rand((D, P)) * 2.0 - 1.0) * LINE_JITTER
+            free_l = self.lane_l[tj, j] - (v_l + a_l)
+            free_r = self.lane_r[tj, j] + (v_l - a_l)
+            ok_l = is_line & (free_l >= 0) & (free_r >= 0) & (torch.maximum(free_l, free_r) >= GAP_MIN)
+            q0 = (torch.arange(self.Q, device=dev) == 0)[None, None, :]
+            live = torch.where(is_line[..., None], ok_l[..., None] & q0, live)
+            sid = torch.where(is_line[..., None], sid_l[..., None].expand_as(sid), sid)
+            along = torch.where(is_line[..., None], torch.zeros_like(along), along)
 
         # --- from lane coordinates to world ----------------------------------------------------
         jq = (j[..., None] + torch.round(along / self.ds[t][:, None, None]).long()) % self.N
@@ -644,6 +674,8 @@ class ProceduralObstacles:
         edge = torch.where(pside > 0, self.lane_l[tid_q, jq], -self.lane_r[tid_q, jq])
         v = edge - pside * off
         v, live = self._clear_raceline(v, live, sid, pside, edge, tid_q, jq)
+        if is_line is not None:
+            v = torch.where(is_line[..., None], v_l[..., None].expand_as(v), v)
         xy = c + nrm * v[..., None]
         yaw = (torch.atan2(tan[..., 1], tan[..., 0]) + 0.5 * math.pi
                + (self._rand(along.shape) * 2.0 - 1.0) * YAW_JITTER)

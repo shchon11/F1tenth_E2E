@@ -802,6 +802,8 @@ class EnvConfig:
     procedural_max_props: int = 0       # prop slots per env; 0 = from the density and the longest lap
     procedural_count: str = "fixed"     # "fixed": every layout gets all the lap's patterns; "uniform": 1 .. all
                                       # (`ProceduralObstacles.count`, 2026-11-03)
+    procedural_line_share: float = 0.0  # share of pattern slots that become one piece on the racing line
+                                      # (`ProceduralObstacles.line_share`, 2026-11-03); the line comes from `set_line`
     procedural_raceline_margin: float = 0.25   # [m] kept clear either side of the raceline, beyond the
                                       # car's half-width, wherever a pattern reaches -- so the line the
                                       # teacher opponents drive is never the thing that is blocked
@@ -1116,7 +1118,7 @@ class F1VecEnv:
                 self.sim.track, self.B, self.sim.gen, density=e.procedural_density,
                 fraction=e.procedural_obstacles, max_props=e.procedural_max_props,
                 raceline_margin=e.procedural_raceline_margin, count=str(e.procedural_count),
-                car_half_width=0.5 * self.cfg.vehicle.width)
+                car_half_width=0.5 * self.cfg.vehicle.width, line_share=e.procedural_line_share)
             self.sim.track.attach_env_props(self.procedural)
             # how far a prop centre can be from the car's and still touch it: the contact tests cull
             # to the slots inside this, and count anything they dropped that was not

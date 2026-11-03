@@ -60,7 +60,8 @@ def build_env(a, device, extra=None):
     if a.stage in ("props", "race"):
         e.update(procedural_obstacles=float(getattr(a, "prop_fraction", 1.0)), procedural_density=float(getattr(a, "prop_density", 1.5)),
                  procedural_max_props=int(getattr(a, "prop_max", 18)), procedural_count=str(getattr(a, "prop_count", "fixed") or "fixed"),
-                 procedural_raceline_corridor="off", movable_obstacles=True)
+                 procedural_raceline_corridor="off", movable_obstacles=True,
+                 procedural_line_share=float(getattr(a, "prop_line", 0.0) or 0.0) if a.stage == "props" else 0.0)
     if a.stage == "race":
         # the competition's format: 1 vs 1, the four planner kinds at 0.7-1.05 of their pace, reacting and with events
         # (the training world's slot without the league: league entries read a full scan, this env casts --beams)
@@ -77,6 +78,13 @@ def build_env(a, device, extra=None):
                           teacher_limits=limits)
     apply_plan_spec(env, a)
     env._track_names = list(tracks); env._rls = rls          # `--path-plan`: the planner's reference lines
+    if env.procedural is not None and env.procedural.line_share > 0:
+        # `--prop-line`: the min-time raceline's offset at every centerline point of every track, then fresh layouts
+        tr = env.sim.track
+        T = int(tr.cl_s.shape[0])
+        tid = torch.arange(T, device=device)[:, None].expand_as(tr.cl_s)
+        env.procedural.set_line(_line_planner(env).rl_offset(tr.cl_s, tid))
+        env.reset()
     return env
 
 
@@ -1766,6 +1774,9 @@ def main():
                     help="--path-plan: price leaving the plan everywhere, or only where the plan is off the raceline")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
+    ap.add_argument("--prop-line", type=float, default=0.0,
+                    help="props stage: share of the layout's pattern slots that become one piece on the racing line "
+                         "(ProceduralObstacles.line_share, 11-03: the wall-measured patterns never reach a mid-lane line)")
     ap.add_argument("--geo-shaping", type=float, default=0.0,
                     help="potential -X x price x geo_risk (the 1 s arc's overlap with a prop); 0 = off")
     ap.add_argument("--car-price", type=float, default=0.0,
