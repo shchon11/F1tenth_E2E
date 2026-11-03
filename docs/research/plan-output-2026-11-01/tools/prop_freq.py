@@ -1,9 +1,10 @@
 """학습 상자 빈도 지도 (11-03, 사용자: "맵에 그냥 빈도수 map을 입히면 되잖어"): 체크포인트의 학습 인자 그대로(라인 위 상자 비율, 밀도,
 개수 포함) 원본 트랙에서만 리셋을 거듭해 상자를 뽑고, 지도 칸(0.05 m)마다 상자에 덮인 판의 비율을 색으로 칠함. 상자 모양은 생성기의
-반평면 그대로(회전 포함). 학습은 원본 + 뒤튼 트랙 16개지만 생성기는 같음. 파란 선 = 최소시간 레이싱 라인.
+반평면 그대로(회전 포함). 학습은 원본 + 뒤튼 트랙 16개지만 생성기는 같음.
 인자: 체크포인트 환경수 리셋수 출력png 제목 [배치방식 pattern|uniform: 체크포인트 인자 대신]
 (11-03 밤) 통과 시험: 첫 리셋의 판마다 상자를 지도 칸에 찍고 빈 곳을 0.20 m(차 반폭 0.15 + 0.05) 깎은 뒤, 시작선 단면을 막고 그 바로 뒤와
-바로 앞이 같은 연결 덩어리인지 = 한 바퀴를 돌 길이 남았는지. 상자 통계: 라인 막음(|상자-라인| < 반크기 + 0.155), 벽 틈 0.3 m 미만."""
+바로 앞이 같은 연결 덩어리인지 = 한 바퀴를 돌 길이 남았는지. 고른지: 상자가 놓인 영역에서 벽 0.3 m 안 면적 비율 대 상자가 덮은 양 비율
+(같으면 고름). (11-04 사용자: 최소시간 라인 기준 '라인 막음'은 강화학습 정책이 그 라인을 안 따르니 의미 없음 -> 뺌.)"""
 import os, sys, argparse
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
@@ -44,8 +45,6 @@ pr, pc = torch.meshgrid(g, g, indexing="ij")
 pr, pc = pr.reshape(-1), pc.reshape(-1)
 cover = torch.zeros(H * W, device=dev, dtype=torch.float64)
 T, N = tr.cl_s.shape
-rl_all = SR._line_planner(env).rl_offset(tr.cl_s, torch.arange(T, device=dev)[:, None].expand_as(tr.cl_s))
-n_blk = n_wall = 0
 n_layout = 0
 n_crate = 0
 for rep in range(n_rep):
@@ -55,13 +54,6 @@ for rep in range(n_rep):
     n_layout += int(live.any(1).sum())
     pose, nn, dd = proc.p_poses[live].float(), proc.p_n[live].float(), proc.p_d[live].float()
     n_crate += pose.shape[0]
-    ext = torch.where(torch.isfinite(dd), dd, torch.zeros_like(dd)).amax(-1)
-    tid0 = torch.zeros(pose.shape[0], dtype=torch.long, device=dev)
-    s_, lat, ix = tr.project(pose[:, :2], tid0)
-    ix = ix.long() % N
-    wl_, wr_ = proc.lane_l[0, ix], proc.lane_r[0, ix]
-    n_blk += int(((lat - rl_all[0, ix]).abs() < ext + 0.155).sum())
-    n_wall += int((torch.minimum(wl_ - (lat + ext), (lat - ext) + wr_) < 0.3).sum())
     r0 = torch.floor((pose[:, 1] - oy) / res).long(); c0 = torch.floor((pose[:, 0] - ox) / res).long()
     rr, cc = r0[:, None] + pr[None], c0[:, None] + pc[None]              # (M, S)
     px, py = ox + (cc.float() + 0.5) * res - pose[:, :1], oy + (rr.float() + 0.5) * res - pose[:, 1:2]
@@ -77,9 +69,7 @@ for rep in range(n_rep):
         occ_e = occ_e.reshape(n_env, H, W).cpu().numpy()
         has = live.any(1).cpu().numpy()
 freq = (cover / max(n_layout, 1)).reshape(H, W).cpu().numpy() * 100.0
-rl0 = rl_all[0].cpu().numpy()
 cl0 = tr.cl[0].cpu().numpy(); tg0 = tr.cl_tangent[0].cpu().numpy()
-line0 = cl0 + rl0[:, None] * np.stack([-tg0[:, 1], tg0[:, 0]], 1)
 L0 = float(tr.length[0])
 
 # 통과 시험
@@ -118,7 +108,10 @@ for e in range(n_env):
     else:
         bad.append(e)
 print(f"== {title} ({place}): 통과 시험 판 {n_try}개 중 한 바퀴 길 남음 {n_ok}개 (막힌 판 {bad[:10]}), 시작선 차선 왼 {wl0:.2f} 오른 {wr0:.2f} m", flush=True)
-print(f"   상자 {n_crate}개 중 라인 막음 {n_blk / max(n_crate, 1):.0%}, 벽 틈 0.3 m 미만 {n_wall / max(n_crate, 1):.0%}", flush=True)
+edt = ndimage.distance_transform_edt(~occ) * res
+reg = freq > 0
+near = reg & (edt < 0.3)
+print(f"   벽 0.3 m 안: 면적 {near.sum() / max(reg.sum(), 1):.0%}, 상자가 덮은 양 {freq[near].sum() / max(freq[reg].sum(), 1e-9):.0%}", flush=True)
 np.save(out.replace(".png", "_freq.npy"), freq)
 ys, xs = np.where(~occ)
 pad = 0.6
@@ -127,8 +120,6 @@ ext = (ox, ox + W * res, oy, oy + H * res)
 ax.imshow(np.where(occ, 0.45, 1.0), origin="lower", cmap="gray", vmin=0, vmax=1, extent=ext)
 vmax = float(np.percentile(freq[freq > 0], 99.5))
 im = ax.imshow(np.ma.masked_less_equal(freq, 0.0), origin="lower", cmap="turbo", vmin=0, vmax=vmax, extent=ext, alpha=0.9)
-ax.plot(line0[:, 0], line0[:, 1], "-", c="white", lw=3.0)
-ax.plot(line0[:, 0], line0[:, 1], "-", c="black", lw=1.2, label="레이싱 라인")
 ax.plot(*cl0[0], "^", c="lime", mec="k", ms=12, label="시작선")
 for fr in np.arange(0.1, 1, 0.1):
     i = int(fr * N)
