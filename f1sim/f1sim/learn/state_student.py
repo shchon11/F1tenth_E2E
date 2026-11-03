@@ -80,6 +80,12 @@ def main():
     ap.add_argument("--prop-fraction", type=float, default=1.0)
     ap.add_argument("--prop-line", type=float, default=0.0,
                     help="props stage: share of pattern slots that become one piece on the racing line (state_rl --prop-line, 11-03)")
+    ap.add_argument("--prop-bank", default="",
+                    help="file or dir of uniform layouts the per-layout line generator judged drivable (tools/layout_bank.py, "
+                         "11-03 night); each reset takes one of its own track's and keeps 1 .. all of its pieces")
+    ap.add_argument("--prop-place", default="pattern", choices=("pattern", "uniform"),
+                    help="where props stand (ProceduralObstacles place, 11-03 night): wall-measured patterns, or uniform over the "
+                         "lane area keeping a 0.7 m way past every piece")
     ap.add_argument("--prop-count", default="fixed", choices=("fixed", "uniform"),
                     help="patterns per layout (state_rl --prop-count): all of the lap's, or 1 .. all (11-03)")
     ap.add_argument("--removal-p", type=float, default=0.0)

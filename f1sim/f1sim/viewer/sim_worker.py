@@ -287,9 +287,14 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
 #: Korea 2025 only 12 % of the pieces block the racing line (8 % on Korea 2026) and none in its wide stretches. A share of
 #: the pattern slots becomes one piece on the racing line (`ProceduralObstacles.line_share`, the training world's
 #: `--prop-line 0.3`), placed from this session's cached raceline.
+#: `procedural_place` / `procedural_bank` (11-03 night, user: "고르게 뽑히라고 uniform하게. 다만 지나갈 차 폭 고려해서 아예
+#: 못지나가게만 배치하지 말고" + "그 주행가능한지는 path generator 로직 사용해서 판단하는거지?"): even with the line share,
+#: 42 % (Korea 2025) and 71 % (Korea 2026) of the pieces stood within 0.3 m of a wall. The bank holds layouts drawn uniformly over
+#: the free area and judged drivable by the per-layout line generator (`tools/layout_bank.py`); a map without one draws uniform.
 PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "procedural_max_props": 18,
                        "procedural_raceline_corridor": "off", "procedural_raceline_margin": 0.25,
-                       "spawn_runway": 3.0, "movable_obstacles": True, "procedural_line_share": 0.3}
+                       "spawn_runway": 3.0, "movable_obstacles": True, "procedural_line_share": 0.3,
+                       "procedural_place": "uniform", "procedural_bank": "/home/shchon11/f1sim_runs/prop_banks"}
 
 #: 장애물 "학습과 같음" with more than one car: the other cars of the race, as the runs since s911
 #: drove them (`--opp-slots`). Not a preference -- with the corridor off there are crates on the

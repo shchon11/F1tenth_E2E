@@ -73,6 +73,7 @@ something the policy has to look at. See `docs/training.md`.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -140,6 +141,16 @@ CONTACT_SLOTS = 8         # slots the contact tests look at (see `ProceduralObst
 #: `width - gap` from one wall): on Korea 2025 the line-blocking pieces per 2 % of lap were 200-390 on most of it and
 #: 21-42 over 84-96 % of the lap (the wide stretch before the start line), and every teacher hit exactly those crates
 LINE_JITTER = 0.30        # [m]
+#: `place="uniform"` (11-03, user: "고르게 뽑히라고 uniform하게. 다만 지나갈 차 폭 고려해서 아예 못지나가게만 배치하지 말고. 사실상
+#: 거의 전 영역에 고르게 뽑혀야해"): the patterns above put 42-87 % of pieces within 0.3 m of a wall and only 8-26 % on the line.
+#: Uniform draws every piece anywhere on the lane, area-weighted, and keeps only the one guarantee: in every cross-section
+#: from PASS_SMEAR before a piece to PASS_SMEAR after it, some straight way of PASS_MIN is left (checked on a lane grid
+#: of PASS_BIN x PASS_CELL as the pieces are put down; a piece that would close the way is not placed).
+PASS_MIN = 0.70           # [m] a car (0.30 m) and 0.20 m each side -- CENTER_SIDE_MIN's narrow way
+PASS_SMEAR = 0.50         # [m] of arc before and after a piece over which that way must run straight, about a car length
+PASS_BIN = 0.10           # [m] of arc per cross-section of the passage grid
+PASS_CELL = 0.05          # [m] across the lane per cell of the passage grid
+U_CANDIDATES = 8          # area-weighted resampling candidates per piece
 CURVE_INSET = 0.08        # [m] the blocked band is inset by this before anything is placed.
                           # A piece is set down square to the tangent at its own centerline index,
                           # and over the 0.30-0.44 m it is long the frame turns: on a 0.8 m-radius
@@ -318,7 +329,8 @@ class ProceduralObstacles:
 
     def __init__(self, tracks, B: int, gen: torch.Generator, *, density: float = 1.0,
                  fraction: float = 1.0, max_props: int = 0, raceline_margin: float = 0.25,
-                 car_half_width: float = 0.15, count: str = "fixed", line_share: float = 0.0):
+                 car_half_width: float = 0.15, count: str = "fixed", line_share: float = 0.0,
+                 place: str = "pattern", bank: str = ""):
         self.tr = tracks
         self.B = int(B)
         self.gen = gen
@@ -337,6 +349,10 @@ class ProceduralObstacles:
         #: Off while a raceline corridor is installed: the planner opponents are blind to props and drive that line.
         self.line_share = float(line_share)
         self.line_off = None
+        #: "pattern": the seven wall-measured kinds (every run before 11-03 night); "uniform": see PASS_MIN
+        if place not in ("pattern", "uniform"):
+            raise ValueError(f"procedural place must be 'pattern' or 'uniform', got {place!r}")
+        self.place = place
         self.raceline_margin = float(raceline_margin)
         self.car_half_width = float(car_half_width)
         if tracks.cl is None:
@@ -359,6 +375,7 @@ class ProceduralObstacles:
         self.small_id = torch.tensor(small_ids, dtype=torch.long, device=dev)
         self.small_across = torch.tensor([shapes[i].across for i in small_ids], dtype=torch.float32, device=dev)
         self.sh_across = torch.tensor([s_.across for s_ in shapes], dtype=torch.float32, device=dev)
+        self.sh_along = torch.tensor([s_.along for s_ in shapes], dtype=torch.float32, device=dev)
         self.line_pool = torch.cat([self.row_id, self.small_id]).unique()
 
         self.N = int(tracks.n_cl)
@@ -375,6 +392,10 @@ class ProceduralObstacles:
         self.Q = PIECES_PER_PATTERN
         auto = int(min(self.P * self.Q, max(6, round(self.P * PIECE_BUDGET))))
         self.C = int(max_props) if max_props else auto
+        if bank:
+            self._load_bank(bank)
+        if self.place == "uniform":
+            self._build_passage_grid()
 
         z = lambda *s: torch.zeros(*s, device=dev, dtype=torch.float32)
         self.p_poses = z(self.B, self.C, 3)
@@ -458,6 +479,130 @@ class ProceduralObstacles:
         big = torch.full_like(self.lane_l, 1e3)
         self.rl_hi, self.rl_lo = -big, big
         self.has_raceline = False
+
+    def _load_bank(self, path: str):
+        """`bank` (11-03 night, user: "그 주행가능한지는 path generator 로직 사용해서 판단하는거지?"): layouts drawn by
+        `place="uniform"` and kept only where the per-layout line generator (`layout_line.LayoutLines`) found a line a car
+        body drives within its steering limit, 0.10 m clear of every prop and wall (docs/.../tools/layout_bank.py). A file
+        or a directory of them, keyed by track name. Every track of this set must be in it; when one is not, the draw falls
+        back to `place="uniform"` and says so."""
+        import glob
+        files = sorted(glob.glob(os.path.join(path, "*.pt"))) if os.path.isdir(path) else [path]
+        per = {}
+        for f in files:
+            per.update(torch.load(f, map_location="cpu", weights_only=False)["per_track"])
+        names = [t.name for t in self.tr.tracks]
+        missing = [n for n in names if n not in per]
+        if missing:
+            print(f"[procedural] bank {path}: no layouts for {missing}; drawing uniform instead", flush=True)
+            self.place = "uniform"
+            return
+        dev = self.device
+        for ti, n in enumerate(names):
+            if abs(per[n]["length"] - float(self.tr.length[ti])) > 0.01:
+                raise ValueError(f"bank {path}: track {n} is {per[n]['length']:.3f} m there, {float(self.tr.length[ti]):.3f} m here")
+        K = max(int(per[n]["sid"].shape[0]) for n in names)
+        Cb = max(int(per[n]["sid"].shape[1]) for n in names)
+        if Cb > self.C:
+            raise ValueError(f"bank {path}: layouts of {Cb} pieces, this env has {self.C} slots")
+        T = len(names)
+        self.b_sid = torch.full((T, K, self.C), -1, dtype=torch.long)
+        self.b_pose = torch.zeros(T, K, self.C, 3)
+        self.b_n = torch.zeros(T, dtype=torch.long)
+        for ti, n in enumerate(names):
+            s_, p_ = per[n]["sid"], per[n]["pose"]
+            self.b_sid[ti, :s_.shape[0], :s_.shape[1]] = s_
+            self.b_pose[ti, :p_.shape[0], :p_.shape[1]] = p_
+            self.b_n[ti] = s_.shape[0]
+        self.b_sid, self.b_pose, self.b_n = self.b_sid.to(dev), self.b_pose.to(dev), self.b_n.to(dev)
+        # each piece's centerline index and offset, for keeping a raceline corridor clear when one is installed
+        tq = torch.arange(T, device=dev)[:, None, None].expand(T, K, self.C).reshape(-1)
+        xy = self.b_pose[..., :2].reshape(-1, 2)
+        parts = [self.tr.project(xy[i:i + 4096], tq[i:i + 4096]) for i in range(0, xy.shape[0], 4096)]
+        self.b_j = (torch.cat([p_[2] for p_ in parts]).long() % self.N).reshape(T, K, self.C)
+        self.b_v = torch.cat([p_[1] for p_ in parts]).reshape(T, K, self.C).float()
+        self.place = "bank"
+        print(f"[procedural] bank {path}: {int(self.b_n.min())}-{int(self.b_n.max())} layouts per track, {T} tracks", flush=True)
+
+    def _redraw_bank(self, t: torch.Tensor, dst: torch.Tensor, src: torch.Tensor):
+        """`bank`: one stored layout of the env's own track, 1 .. all of its pieces (count "uniform") or all ("fixed")."""
+        D, C, dev = int(t.numel()), self.C, self.device
+        k_idx = (self._rand((D,)) * self.b_n[t]).long().clamp_max(self.b_n[t] - 1)
+        sid = self.b_sid[t, k_idx]                                               # (D, C)
+        pose = self.b_pose[t, k_idx]
+        live = sid >= 0
+        n_live = live.sum(1, keepdim=True)
+        k = n_live if self.count == "fixed" else 1 + torch.floor(self._rand((D, 1)) * n_live).long()
+        r = torch.where(live, self._rand((D, C)), torch.full((D, C), 2.0, device=dev))
+        live = live & (r.argsort(1).argsort(1) < k) & (self._rand((D, 1)) < self.fraction)
+        sid = sid.clamp_min(0)
+        if self.has_raceline:
+            j, v = self.b_j[t, k_idx], self.b_v[t, k_idx]
+            tq = t[:, None].expand(D, C)
+            a = 0.5 * self.sh_across[sid] + CURVE_INSET
+            live = live & ((v - a >= self.rl_hi[tq, j]) | (v + a <= self.rl_lo[tq, j]))
+        self.last_live.index_copy_(0, dst, torch.zeros(D, self.P, dtype=torch.bool, device=dev)[src])
+        self._write(dst, src, pose[..., :2], pose[..., 2], sid, live, P=C, Q=1)
+
+    def _build_passage_grid(self):
+        """`place="uniform"`'s lane grid: (T, n_bins, n_cells) True where a cell lies inside the lane over its whole bin."""
+        dev = self.device
+        T = self.lane_l.shape[0]
+        self.u_g = max(1, int(round(PASS_BIN / float(self.ds.min()))))          # centerline points per bin
+        self.u_nb = -(-self.N // self.u_g)
+        idx = torch.arange(self.u_nb * self.u_g, device=dev) % self.N
+        ll = self.lane_l[:, idx].reshape(T, self.u_nb, self.u_g).amin(-1)
+        lr = self.lane_r[:, idx].reshape(T, self.u_nb, self.u_g).amin(-1)
+        nu = int(round(2.0 * LANE_LIMIT / PASS_CELL))
+        self.u_cell_lo = -LANE_LIMIT + torch.arange(nu, device=dev, dtype=torch.float32) * PASS_CELL
+        self.u_cell_hi = self.u_cell_lo + PASS_CELL
+        self.u_lane = (self.u_cell_lo >= -lr[..., None]) & (self.u_cell_hi <= ll[..., None])
+        self.u_run = int(math.ceil(PASS_MIN / PASS_CELL - 1e-6))
+        bin_len = float(self.ds.min()) * self.u_g
+        self.u_hmax = int(math.ceil((0.5 * float(self.sh_along.max()) + PASS_SMEAR) / bin_len))
+        # Where a piece may stand: every free map cell connected to the centerline and within LANE_LIMIT of it, drawn
+        # uniformly as cells (= uniformly by area). Drawing (arc, offset) and stepping out along the normal instead
+        # over-weighted the cells where the normals of a bent centerline cross: Korea 2025 showed 2x stripes along them.
+        from scipy import ndimage
+        from scipy.spatial import cKDTree
+        cl_all = self.tr.cl.detach().cpu().numpy().astype(np.float64)
+        nrm_all = self.cl_nrm.detach().cpu().numpy().astype(np.float64)
+        per = []
+        for ti, track in enumerate(self.tr.tracks):
+            occ = np.asarray(track.occupancy, bool)
+            res, ox, oy = float(track.resolution), float(track.origin[0]), float(track.origin[1])
+            free = ~occ
+            lab, _ = ndimage.label(free)
+            cl = cl_all[ti]
+            rc = np.floor((cl[:, 1] - oy) / res).astype(int), np.floor((cl[:, 0] - ox) / res).astype(int)
+            inb = (rc[0] >= 0) & (rc[0] < occ.shape[0]) & (rc[1] >= 0) & (rc[1] < occ.shape[1])
+            ids = np.setdiff1d(np.unique(lab[rc[0][inb], rc[1][inb]]), [0])
+            rr, cc = np.nonzero(np.isin(lab, ids))
+            xy = np.stack([ox + (cc + 0.5) * res, oy + (rr + 0.5) * res], 1)
+            dist, j = cKDTree(cl).query(xy)
+            keep = dist <= LANE_LIMIT
+            xy, j = xy[keep], j[keep]
+            v = ((xy - cl[j]) * nrm_all[ti, j]).sum(1)
+            room = (ndimage.distance_transform_edt(free) * res)[rr[keep], cc[keep]]   # [m] to the nearest wall cell
+            per.append((xy, j, v, room, res))
+        kmax = max(len(p[0]) for p in per)
+        T = len(per)
+        f32 = lambda: torch.zeros(T, kmax, dtype=torch.float32)
+        self.u_xy, self.u_v, self.u_room = torch.zeros(T, kmax, 2), f32(), f32()
+        self.u_j = torch.zeros(T, kmax, dtype=torch.long)
+        self.u_ncell = torch.zeros(T, dtype=torch.long)
+        self.u_res = torch.zeros(T)
+        for ti, (xy, j, v, room, res) in enumerate(per):
+            k = len(xy)
+            self.u_xy[ti, :k] = torch.as_tensor(xy, dtype=torch.float32)
+            self.u_j[ti, :k] = torch.as_tensor(j)
+            self.u_v[ti, :k] = torch.as_tensor(v, dtype=torch.float32)
+            self.u_room[ti, :k] = torch.as_tensor(room, dtype=torch.float32)
+            self.u_ncell[ti], self.u_res[ti] = k, res
+        for name in ("u_xy", "u_v", "u_room", "u_j", "u_ncell", "u_res"):
+            setattr(self, name, getattr(self, name).to(dev))
+        #: [m] half the larger side of each shape: a piece stands only where the nearest wall is at least this far
+        self.sh_rad = 0.5 * torch.maximum(self.sh_across, self.sh_along)
 
     def set_line(self, offset: torch.Tensor):
         """(T, N) the racing line's lateral offset [m, left +] at every centerline point, for `line_share`"""
@@ -564,6 +709,10 @@ class ProceduralObstacles:
         D = int(draw_tid.numel())
         if D == 0:
             return
+        if self.place == "uniform":
+            return self._redraw_uniform(draw_tid, dst, src)
+        if self.place == "bank":
+            return self._redraw_bank(draw_tid, dst, src)
         t = draw_tid
         P, Q = self.P, self.Q
         dev = self.device
@@ -694,6 +843,64 @@ class ProceduralObstacles:
         self.last_live.index_copy_(0, dst, (act & live.any(-1))[src])
         self._write(dst, src, xy.reshape(D, P * Q, 2), yaw.reshape(D, P * Q),
                     sid.reshape(D, P * Q), live.reshape(D, P * Q))
+
+    def _redraw_uniform(self, t: torch.Tensor, dst: torch.Tensor, src: torch.Tensor):
+        """`place="uniform"`: C pieces per layout (1 .. C at count "uniform"), each a random catalogue shape at a point
+        drawn uniformly over the lane's area, kept only while a PASS_MIN way stays open around it (`PASS_MIN`)."""
+        D, C, M, dev = int(t.numel()), self.C, U_CANDIDATES, self.device
+        use = self._rand((D, 1)) < self.fraction
+        k = (torch.full((D, 1), C, device=dev) if self.count == "fixed"
+             else 1 + torch.floor(self._rand((D, 1)) * C).long())
+        live = use & (torch.arange(C, device=dev)[None, :] < k)                  # (D,C)
+        n_pool = self.line_pool.numel()
+        sid = self.line_pool[(self._rand((D, C)) * n_pool).long().clamp_max(n_pool - 1)]
+        a = 0.5 * self.sh_across[sid]                                            # (D,C) half across, yaw jitter included
+        # M candidates per piece, each a uniformly drawn free cell (+ a uniform point inside it); a candidate counts only
+        # where the piece fits clear of the walls, and the first that does is taken (Gumbel-max over equal weights)
+        k_t = self.u_ncell[t][:, None, None]
+        ci = (self._rand((D, C, M)) * k_t).long().clamp_max(k_t - 1)
+        tq = t[:, None, None].expand_as(ci)
+        res = self.u_res[t][:, None, None, None]
+        xy_c = self.u_xy[tq, ci] + (self._rand((D, C, M, 2)) - 0.5) * res
+        j_c = self.u_j[tq, ci]
+        v_c = self.u_v[tq, ci]
+        w = (self.u_room[tq, ci] >= self.sh_rad[sid][..., None]).float()
+        if self.has_raceline:
+            # the planner opponents are blind to props and drive that line: a piece stays out of its corridor
+            ac = a[..., None] + CURVE_INSET
+            w = w * ((v_c - ac >= self.rl_hi[tq, j_c]) | (v_c + ac <= self.rl_lo[tq, j_c])).float()
+        u = self._rand((D, C, M)).clamp(1e-12, 1.0 - 1e-7)
+        key = torch.log(w.clamp_min(1e-30)) - torch.log(-torch.log(u))         # Gumbel-max = draw by weight
+        pick = key.argmax(-1, keepdim=True)
+        j = torch.gather(j_c, -1, pick)[..., 0]
+        v = torch.gather(v_c, -1, pick)[..., 0]
+        xy = torch.gather(xy_c, 2, pick[..., None].expand(D, C, 1, 2))[:, :, 0]
+        live = live & (torch.gather(w, -1, pick)[..., 0] > 0)
+
+        # the passage: put the pieces down one slot at a time on the lane grid, each only if every bin it reaches
+        # (its own length plus PASS_SMEAR either side) keeps a free run of u_run cells
+        grid = self.u_lane[t].clone()                                            # (D, nb, nu)
+        H = self.u_hmax
+        offs = torch.arange(-H, H + 1, device=dev)
+        half = torch.ceil((0.5 * self.sh_along[sid] + PASS_SMEAR) / (self.ds[t][:, None] * self.u_g)).long()
+        ar = torch.arange(D, device=dev)[:, None]
+        m = self.u_run
+        for c in range(C):
+            bins = (j[:, c:c + 1] // self.u_g + offs[None]) % self.u_nb           # (D, W)
+            inwin = offs[None].abs() <= half[:, c:c + 1]
+            rows = grid[ar, bins]                                                # (D, W, nu)
+            lat = (self.u_cell_hi > (v[:, c] - a[:, c])[:, None]) & (self.u_cell_lo < (v[:, c] + a[:, c])[:, None])
+            new = rows & ~(inwin[..., None] & lat[:, None, :])
+            cs = torch.nn.functional.pad(new.int().cumsum(-1), (1, 0))
+            run_ok = ((cs[..., m:] - cs[..., :-m]) == m).any(-1)
+            ok = live[:, c] & (run_ok | ~inwin).all(-1)
+            live[:, c] = ok
+            grid[ar, bins] = torch.where(ok[:, None, None], new, rows)
+
+        tan = self.tr.cl_tangent[t[:, None].expand(D, C), j]
+        yaw =torch.atan2(tan[..., 1], tan[..., 0]) + 0.5 * math.pi + (self._rand((D, C)) * 2.0 - 1.0) * YAW_JITTER
+        self.last_live.index_copy_(0, dst, torch.zeros(D, self.P, dtype=torch.bool, device=dev)[src])
+        self._write(dst, src, xy, yaw, sid, live, P=C, Q=1)
 
     def _clear_raceline(self, v, live, sid, pside, edge, tid_q, jq):
         """Push each piece out of the raceline corridor **at its own arc index**, or drop it.
@@ -850,7 +1057,7 @@ class ProceduralObstacles:
         return off, live, sid, along, pside
 
     # ------------------------------------------------------------------ writing the slots
-    def _write(self, dst, src, xy, yaw, sid, live):
+    def _write(self, dst, src, xy, yaw, sid, live, P=None, Q=None):
         """Compact each layout's live pieces into the first `C` slots and copy them into `dst`.
 
         When there are more live pieces than slots, the patterns are kept in a random order, whole,
@@ -858,7 +1065,8 @@ class ProceduralObstacles:
         10 slots for seven patterns on ICCAS, the last three were dropped at nearly every reset
         (51 of 640 kept pieces), so the last 40 % of the lap almost never had an obstacle."""
         D = xy.shape[0]
-        P, Q = self.P, self.Q
+        P = self.P if P is None else P
+        Q = self.Q if Q is None else Q
         rank = torch.argsort(self._rand((D, P)), dim=1)                # a random order of the patterns
         prio = torch.empty_like(rank).scatter_(1, rank, torch.arange(P, device=rank.device).expand(D, P))
         key = (prio[:, :, None] * Q + torch.arange(Q, device=rank.device)[None, None]).reshape(D, P * Q)
@@ -872,7 +1080,7 @@ class ProceduralObstacles:
         d = self.sh_d[sid_k]
         z0 = self.sh_z0[sid_k]
         z1 = torch.where(keep, self.sh_z1[sid_k], self.sh_z0[sid_k] - 1.0)   # dead: z_hi < z_lo
-        self.slot_pattern.index_copy_(0, dst, (order // self.Q)[src])
+        self.slot_pattern.index_copy_(0, dst, (order // Q)[src])
         self.p_sid.index_copy_(0, dst, torch.where(keep, sid_k, torch.full_like(sid_k, -1))[src])
         self._stat[0] += float(D)
         self._stat[1] += keep.sum().to(torch.float64)
