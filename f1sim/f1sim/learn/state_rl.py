@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 
 from .. import Config, maps
-from ..gym_env import REWARD_COMPONENT_KEYS, EnvConfig
+from ..gym_env import PRIV_V2_EGO_KEYS, REWARD_COMPONENT_KEYS, EnvConfig
 from . import common
 
 #: arc distances ahead [m] where the centerline is shown to the policy
@@ -503,7 +503,8 @@ class StateObs:
         #: (`visible_props`) after everything else, and list in `actor_hide` the columns the actor must not read -- the
         #: full-truth prop slots and corridor and the time left; the critic keeps all of them (asymmetric actor-critic)
         self.vis_actor = bool(vis_actor)
-        self.actor_hide = []
+        self.actor_hide = [ACTOR_NO_LAP]
+        self._hide_full = False
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
         self.scan, self.scan_range = bool(scan), float(scan_range)
@@ -634,7 +635,7 @@ class StateObs:
                     cb_v = torch.maximum(cb_v, car_spacetime_block(env, lid, s, tid, line=self.car_st_line,
                                                                    visible=visible_cars(env, lid)))
                 parts.append(cb_v)
-            if not self.actor_hide:
+            if not self._hide_full:
                 # privileged_v2: ego 8, opponents, nearest-car geometry 4, the prop slots, [time left]
                 p0 = 8 + PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS) + 4
                 # the opponent slots and the nearest-car geometry (full truth: cars behind walls, beyond the grid) and the
@@ -645,7 +646,8 @@ class StateObs:
                 if self.corridor:
                     c0 = n0 - len(AHEAD) * CORRIDOR_BINS * (1 + int(self.car_channel))
                     hide += list(range(c0, c0 + len(AHEAD) * CORRIDOR_BINS))
-                self.actor_hide = hide
+                self.actor_hide = [ACTOR_NO_LAP] + hide
+                self._hide_full = True
         out = torch.cat(parts, 1).float()
         self.dim = out.shape[1]
         return out
@@ -1174,6 +1176,17 @@ def widen_mlp_state(sd, h0, h):
     return sd
 
 
+#: The actor never reads the lap position (11-03, user: "랩 위치를 주지 마 ... 숏컷러닝"): `privileged_v2`'s lap_frac is a
+#: global place index the LiDAR student has no counterpart for (its inputs: scan frames, speed, gyro, past actions). Every
+#: StateObs layout starts with privileged_v2's ego keys, so it is this column everywhere; the critic keeps it.
+ACTOR_NO_LAP = PRIV_V2_EGO_KEYS.index("lap_frac")
+
+
+def _hide_lap(m, _incompatible):
+    """load_state_dict post-hook: a checkpoint saved before 11-03 carries actor_keep 1 at the lap column"""
+    m.actor_keep[ACTOR_NO_LAP] = 0.0
+
+
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None, bev=None, shared_enc=False):
         super().__init__()
@@ -1212,6 +1225,8 @@ class ActorCritic(nn.Module):
         #: and the time left, which only the critic keeps (`StateObs.actor_hide`). A buffer, so every tool that loads the
         #: checkpoint drives the actor the student is taught by; a checkpoint without it loads all ones (as before)
         self.register_buffer("actor_keep", torch.ones(obs_dim))
+        self.actor_keep[ACTOR_NO_LAP] = 0.0
+        self.register_load_state_dict_post_hook(_hide_lap)
         self.pi.register_forward_pre_hook(lambda _m, inp: (inp[0] * self.actor_keep,) + tuple(inp[1:]))
         #: P(a hard hit within the next HIT_HORIZON decisions | s), a head on the critic's trunk (`--hit-head`): supervised
         #: on every step, so the critic's features learn what danger looks like before the price of a hit reaches them
@@ -1326,7 +1341,7 @@ def train(a):
         norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
     if obs_fn.actor_hide:
         model.actor_keep.fill_(1.0); model.actor_keep[torch.tensor(obs_fn.actor_hide, device=device)] = 0.0
-        print(f"[state_rl] --vis-actor: 배우는 {len(obs_fn.actor_hide)}칸(전체 정답 상자 칸·통로, 남은 시간)을 못 봄 -- 비평가만 봄", flush=True)
+        print(f"[state_rl] 배우는 쪽이 못 보는 {len(obs_fn.actor_hide)}칸(랩 위치{', 전체 정답 상자 칸·통로, 남은 시간' if a.vis_actor else ''}) -- 비평가만 봄", flush=True)
     if int(a.soft_bound):
         model.set_mean_bounds(*mean_bounds(a, A))
     elif bool((model.mean_hi < 1e5).any()):
