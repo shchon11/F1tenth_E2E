@@ -1347,6 +1347,12 @@ def train(a):
         if missing:
             print(f"[state_rl] --init에 없는 매개변수(새로 시작): {missing}", flush=True)
         norm.load_state_dict(ck["norm"]); ret_rms.load_state_dict(ck["ret_rms"])
+        if float(a.log_std_shift):
+            # `--log-std-shift` (11-03): PPO optimises the noisy policy, so the margins it keeps scale with the noise (g 8.21 s
+            # with correlated noise, g2 7.88 s after white noise); log_std barely moves on its own (10-27 audit)
+            with torch.no_grad():
+                model.log_std.add_(float(a.log_std_shift))
+            print(f"[state_rl] --init log_std {float(a.log_std_shift):+.3f} -> 표준편차 {[round(float(x), 3) for x in model.log_std.exp()]}", flush=True)
     if obs_fn.actor_hide:
         model.actor_keep.fill_(1.0); model.actor_keep[torch.tensor(obs_fn.actor_hide, device=device)] = 0.0
         print(f"[state_rl] 배우는 쪽이 못 보는 {len(obs_fn.actor_hide)}칸(랩 위치{', 전체 정답 상자 칸·통로, 남은 시간' if a.vis_actor else ''}) -- 비평가만 봄", flush=True)
@@ -1735,6 +1741,7 @@ def main():
     ap.add_argument("--log-std", type=float, default=-0.5)
     ap.add_argument("--hidden", type=int, default=256,
                     help="width of the actor / critic MLP layers; an --init of a narrower net is widened function-preservingly (11-03)")
+    ap.add_argument("--log-std-shift", type=float, default=0.0, help="added to the --init checkpoint's log_std (-0.693 = half the noise)")
     ap.add_argument("--std-floor", type=float, nargs=2, default=None, help="floor of the exploration std (steer, speed) in action units")
     ap.add_argument("--price", type=float, default=80.0)
     ap.add_argument("--price-start", type=float, default=0.0)
