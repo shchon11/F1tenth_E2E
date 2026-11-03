@@ -79,7 +79,7 @@ def main():
 
     last_a = torch.zeros(B, 2, device=device)
     to = tobs(last_a); Dt = to.shape[1]
-    critic = ActorCritic(Dt).to(device); critic.load_state_dict(tck["model"], strict=False)
+    critic = ActorCritic(Dt, hidden=int(tck["args"].get("hidden", 256) or 256)).to(device); critic.load_state_dict(tck["model"], strict=False)
     tnorm = RunningNorm(Dt, device); tnorm.load_state_dict(tck["norm"])
     ret_rms = RunningNorm(1, device); ret_rms.load_state_dict(tck["ret_rms"])
     keys = sck.get("ego_keys") or sorted(k for k in obs if k != "scan")

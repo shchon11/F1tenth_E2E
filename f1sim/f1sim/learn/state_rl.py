@@ -697,7 +697,7 @@ class SoloMix:
         B = int(self.lid.numel())
         self.sobs = StateObs(env)
         o = self.sobs(torch.zeros(B, act_dim_of(ar), device=device))
-        self.net = ActorCritic(o.shape[1], act_dim=act_dim_of(ar)).to(device)
+        self.net = ActorCritic(o.shape[1], act_dim=act_dim_of(ar), hidden=int(ar.get("hidden", 256) or 256)).to(device)
         self.net.load_state_dict(ckb["model"], strict=False); self.net.eval()
         self.nrm = RunningNorm(o.shape[1], device); self.nrm.load_state_dict(ckb["norm"])
         self.reach, self.hold = float(reach), int(hold)
@@ -753,7 +753,7 @@ class TeacherPolicy:
                              car_st_line=bool(ar.get("car_st_line", 0)), vis_actor=bool(ar.get("vis_actor", 0)))
         B = int(env.learner_ids.numel())
         self.o = self.sobs(torch.zeros(B, self.A, device=device))
-        self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev")).to(device)
+        self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev"), hidden=int(ar.get("hidden", 256) or 256)).to(device)
         self.net.load_state_dict(ck["model"], strict=False); self.net.eval()
         self.nrm = RunningNorm(self.o.shape[1], device); self.nrm.load_state_dict(ck["norm"])
         self.mix = SoloMix(env, ar["base"], device, float(ar.get("base_reach", BASE_REACH)),
@@ -1149,6 +1149,31 @@ class BevNet(nn.Module):
         return self.mlp[-1](self.trunk(o))
 
 
+def widen_mlp_state(sd, h0, h):
+    """`--hidden` (11-03): a 2-hidden-layer actor / critic MLP state (`mlp`) widened h0 -> h units per layer, the function
+    unchanged (Net2Net-style, Chen et al. 2016): the new units read every input with fresh random weights, nothing reads
+    them yet (zero weights from them into the old second layer, the output and the hit head). The new units' outgoing
+    weights get gradient from the first update. 11-03 question: is the 2 x 256 teacher too small to hold the solo line and
+    the prop behaviour at once (each props continuation traded pace for fewer hits)?"""
+    sd = dict(sd)
+    for net in ("pi", "v"):
+        w0, b0 = sd[f"{net}.0.weight"], sd[f"{net}.0.bias"]
+        w2, b2 = sd[f"{net}.2.weight"], sd[f"{net}.2.bias"]
+        w4 = sd[f"{net}.4.weight"]
+        l0, l2 = nn.Linear(w0.shape[1], h - h0), nn.Linear(h, h - h0)
+        dev, dt = w0.device, w0.dtype
+        sd[f"{net}.0.weight"] = torch.cat([w0, l0.weight.data.to(dev, dt)], 0)
+        sd[f"{net}.0.bias"] = torch.cat([b0, l0.bias.data.to(dev, dt)], 0)
+        top = torch.cat([w2, torch.zeros(h0, h - h0, device=dev, dtype=dt)], 1)
+        sd[f"{net}.2.weight"] = torch.cat([top, l2.weight.data.to(dev, dt)], 0)
+        sd[f"{net}.2.bias"] = torch.cat([b2, l2.bias.data.to(dev, dt)], 0)
+        sd[f"{net}.4.weight"] = torch.cat([w4, torch.zeros(w4.shape[0], h - h0, device=dev, dtype=dt)], 1)
+    if "hit.weight" in sd:
+        w = sd["hit.weight"]
+        sd["hit.weight"] = torch.cat([w, torch.zeros(w.shape[0], h - h0, device=w.device, dtype=w.dtype)], 1)
+    return sd
+
+
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None, bev=None, shared_enc=False):
         super().__init__()
@@ -1246,7 +1271,7 @@ def train(a):
     D = obs_fn.dim
     bev = (BEV_C, BEV_H, BEV_W) if a.bev else None
     model = ActorCritic(D, act_dim=A, log_std=a.log_std, std_floor=std_floor_of(a, A),
-                        bev=bev, shared_enc=bool(a.shared_enc)).to(device)
+                        bev=bev, shared_enc=bool(a.shared_enc), hidden=int(a.hidden)).to(device)
     norm = RunningNorm(D, device, raw_tail=obs_fn.grid_dim)
     ret_rms = RunningNorm(1, device)
     upd0 = 0
@@ -1262,6 +1287,14 @@ def train(a):
             ck["norm"] = {"mean": torch.cat([nm["mean"], torch.zeros(D - d0, device=device)]),
                           "var": torch.cat([nm["var"], torch.ones(D - d0, device=device)]), "n": nm["n"]}
             print(f"[state_rl] --init 관측 {d0} -> {D}차원: 새 입력은 가중치 0으로 시작", flush=True)
+        h0 = int(ck["args"].get("hidden", 256) or 256)
+        if h0 < int(a.hidden):
+            if a.bev:
+                raise SystemExit("--hidden: widening an --init is for the plain MLP teachers only")
+            sd = widen_mlp_state(sd, h0, int(a.hidden))
+            print(f"[state_rl] --init 은닉 {h0} -> {int(a.hidden)}: 새 단위는 나가는 가중치 0 (처음엔 부모와 같은 출력)", flush=True)
+        elif h0 > int(a.hidden):
+            raise SystemExit(f"--hidden {a.hidden} is narrower than the --init's {h0}")
         if a.bev and a.shared_enc and not ck["args"].get("shared_enc"):
             # the shared encoder starts as the ACTOR's (its head keeps the features it was trained on; the critic re-fits)
             for k in [k for k in sd if k.startswith("pi.conv.") or k.startswith("pi.proj.")]:
@@ -1677,6 +1710,8 @@ def main():
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--vf", type=float, default=0.5)
     ap.add_argument("--log-std", type=float, default=-0.5)
+    ap.add_argument("--hidden", type=int, default=256,
+                    help="width of the actor / critic MLP layers; an --init of a narrower net is widened function-preservingly (11-03)")
     ap.add_argument("--std-floor", type=float, nargs=2, default=None, help="floor of the exploration std (steer, speed) in action units")
     ap.add_argument("--price", type=float, default=80.0)
     ap.add_argument("--price-start", type=float, default=0.0)
