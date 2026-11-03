@@ -282,9 +282,14 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
 #: 장애물 "학습과 같음" when the run did not record its own settings: the recipe every run since
 #: s911 trained on (density 1.5 per 10 m, obstacles allowed on the racing line, a 3 m spawn runway,
 #: movable props), with the 18 slots s914 moved to so a draw keeps all of its patterns.
+#: `procedural_line_share` (11-03, user: "장애물 배치들이 왜이리 벽쪽으로 편향되게 뽑히는 것 같지? 너무 쉬운 상황들 위주로밖에
+#: 안나오는데?"): the six patterns all stand in a band measured from one wall with 55-75 % of the lane left open, so on
+#: Korea 2025 only 12 % of the pieces block the racing line (8 % on Korea 2026) and none in its wide stretches. A share of
+#: the pattern slots becomes one piece on the racing line (`ProceduralObstacles.line_share`, the training world's
+#: `--prop-line 0.3`), placed from this session's cached raceline.
 PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "procedural_max_props": 18,
                        "procedural_raceline_corridor": "off", "procedural_raceline_margin": 0.25,
-                       "spawn_runway": 3.0, "movable_obstacles": True}
+                       "spawn_runway": 3.0, "movable_obstacles": True, "procedural_line_share": 0.3}
 
 #: 장애물 "학습과 같음" with more than one car: the other cars of the race, as the runs since s911
 #: drove them (`--opp-slots`). Not a preference -- with the corridor off there are crates on the
@@ -1412,6 +1417,19 @@ class SimWorker:
                 + ". 이대로 돌리면 파일에 없는 가중치가 초기값으로 남은 채 주행하게 되므로 "
                   "화면의 주행을 그 체크포인트의 정책으로 볼 수 없습니다. 다른 런을 고르세요.")
 
+        if getattr(env, "procedural", None) is not None and env.procedural.line_share > 0:
+            # the line pieces stand on the racing line: its offset at every centerline point of this track
+            if rls:
+                from ..learn import state_rl as _srl
+                env._track_names = [track.name]
+                env._rls = rls
+                tr_ = env.sim.track
+                tid_ = torch.arange(int(tr_.cl_s.shape[0]), device=tr_.cl_s.device)[:, None].expand_as(tr_.cl_s)
+                env.procedural.set_line(_srl._line_planner(env).rl_offset(tr_.cl_s, tid_))
+            else:
+                env.procedural.line_share = 0.0
+                self.say(P.MSG_LOG, gen=gen, text="레이싱 라인이 캐시에 없어 학습 장애물에 라인 위 상자를 넣지 않습니다 "
+                                                  "(벽 쪽 패턴만 나옵니다).")
         obs, _info = env.reset()
         self._check_cancel(gen)
 
