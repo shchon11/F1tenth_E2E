@@ -497,6 +497,39 @@ def visible_prop_slots(env, lid, visible):
     return blk.reshape(B, -1)
 
 
+def visible_car_slots(env, lid, visible, K=3):
+    """(B, K * 6) `--car-slots` (11-03): the other cars the car itself can see (`visible_cars`: inside the LiDAR student's
+    grid, which reaches 2 m behind and 3.5 m to each side, and in the scan's line of sight), nearest first --
+    present, dx/5, dy/5, dist/5 and their velocity relative to ours, dvx/5, dvy/5, all in our frame. The corridor's car
+    channel starts 0.4 m ahead along the track, so a car beside and just behind us (the one we cut in front of after a
+    pass: 3 of 8 hard hits of srp25h3gwt_race u50, `car_cf.py`) was only in the raw scan; the student's grid has it."""
+    from ..gym_env import PRIV_OPP_DIST_SCALE
+    st_all = env.last_result.state
+    st = st_all[lid]
+    B = st.shape[0]
+    blk = torch.zeros(B, K, 6, device=st.device, dtype=st.dtype)
+    if env.M <= 1 or visible is None:
+        return blk.reshape(B, -1)
+    o = env.sim.other_idx[lid]                                             # (B, M-1)
+    so = st_all[o]
+    c, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+    d = so[..., :2] - st[:, None, :2]
+    dx, dy = d[..., 0] * c + d[..., 1] * s_, -d[..., 0] * s_ + d[..., 1] * c
+    vel = lambda q: torch.stack([q[..., 3] * torch.cos(q[..., 2]) - q[..., 4] * torch.sin(q[..., 2]),
+                                 q[..., 3] * torch.sin(q[..., 2]) + q[..., 4] * torch.cos(q[..., 2])], -1)
+    dv = vel(so) - vel(st)[:, None, :]
+    dvx, dvy = dv[..., 0] * c + dv[..., 1] * s_, -dv[..., 0] * s_ + dv[..., 1] * c
+    dist = d.norm(dim=-1)
+    key = torch.where(visible, dist, torch.full_like(dist, 1e6))
+    n = min(K, key.shape[1])
+    j = key.topk(n, dim=1, largest=False).indices
+    g = lambda t: t.gather(1, j)
+    pres = g(visible).to(st.dtype)
+    S = PRIV_OPP_DIST_SCALE
+    blk[:, :n] = torch.stack([pres, g(dx) / S, g(dy) / S, g(dist) / S, g(dvx) / S, g(dvy) / S], 2) * pres[..., None]
+    return blk.reshape(B, -1)
+
+
 class StateObs:
     """The observation, from the env's state after a step. scan: append the env's NOISE-FREE scan (`scan_true`, the
     beams `--beams` casts) / range: the true shape of every prop, wall and car in view (10-29: three prop centres
@@ -505,12 +538,14 @@ class StateObs:
     def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
                  corridor_cars: bool = False, car_channel: bool = False, bev: bool = False, path_plan: bool = False,
                  plan_ref=None, car_st: bool = False, scan_nocars: bool = False, corridor_car_st: bool = False,
-                 blank_opp: bool = False, car_st_line: bool = False, vis_actor: bool = False):
+                 blank_opp: bool = False, car_st_line: bool = False, vis_actor: bool = False, car_slots: bool = False):
         self.env = env
         #: `--vis-actor` (11-03): append the prop slots and the prop corridor over the props the car can SEE
         #: (`visible_props`) after everything else, and list in `actor_hide` the columns the actor must not read -- the
         #: full-truth prop slots and corridor and the time left; the critic keeps all of them (asymmetric actor-critic)
         self.vis_actor = bool(vis_actor)
+        #: `--car-slots` (11-03): the visible other cars' positions and relative velocities, appended last (`visible_car_slots`)
+        self.car_slots = bool(car_slots)
         self.actor_hide = [ACTOR_NO_LAP]
         self._hide_full = False
         self.ahead = torch.tensor(AHEAD, device=env.device)
@@ -643,6 +678,8 @@ class StateObs:
                     cb_v = torch.maximum(cb_v, car_spacetime_block(env, lid, s, tid, line=self.car_st_line,
                                                                    visible=visible_cars(env, lid)))
                 parts.append(cb_v)
+            if self.car_slots:
+                parts.append(visible_car_slots(env, lid, visible_cars(env, lid)))
             if not self._hide_full:
                 # privileged_v2: ego 8, opponents, nearest-car geometry 4, the prop slots, [time left]
                 p0 = 8 + PRIV_V2_OPP_SLOTS * len(PRIV_V2_OPP_KEYS) + 4
@@ -760,7 +797,8 @@ class TeacherPolicy:
                              plan_ref=ar.get("plan_ref"), t_beams=int(t_beams), car_st=bool(ar.get("car_st", 0)),
                              scan_nocars=bool(ar.get("scan_nocars", 0)),
                              corridor_car_st=bool(ar.get("corridor_car_st", 0)), blank_opp=bool(ar.get("blank_opp", 0)),
-                             car_st_line=bool(ar.get("car_st_line", 0)), vis_actor=bool(ar.get("vis_actor", 0)))
+                             car_st_line=bool(ar.get("car_st_line", 0)), vis_actor=bool(ar.get("vis_actor", 0)),
+                             car_slots=bool(ar.get("car_slots", 0)))
         B = int(env.learner_ids.numel())
         self.o = self.sobs(torch.zeros(B, self.A, device=device))
         self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev"), hidden=int(ar.get("hidden", 256) or 256)).to(device)
@@ -1271,7 +1309,9 @@ def train(a):
                       car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=int(a.path_plan), plan_ref=a.plan_ref,
                       car_st=bool(a.car_st), scan_nocars=bool(a.scan_nocars),
                       corridor_car_st=bool(a.corridor_car_st), blank_opp=bool(a.blank_opp), car_st_line=bool(a.car_st_line),
-                      vis_actor=bool(a.vis_actor))
+                      vis_actor=bool(a.vis_actor), car_slots=bool(a.car_slots))
+    if a.car_slots and not a.vis_actor:
+        raise SystemExit("--car-slots needs --vis-actor (the slots are the cars the car itself can see)")
     if float(a.level_replay) > 0:
         # prioritized level replay (Jiang et al. 2021, `learn.level_replay`): resets replay the layouts / spawns whose
         # advantages were largest -- the situations the policy gets most wrong come back more often
@@ -1309,6 +1349,7 @@ def train(a):
             nm = ck["norm"]
             ck["norm"] = {"mean": torch.cat([nm["mean"], torch.zeros(D - d0, device=device)]),
                           "var": torch.cat([nm["var"], torch.ones(D - d0, device=device)]), "n": nm["n"]}
+            sd.pop("actor_keep", None)             # rebuilt from this run's StateObs.actor_hide below, at the new width
             print(f"[state_rl] --init 관측 {d0} -> {D}차원: 새 입력은 가중치 0으로 시작", flush=True)
         h0 = int(ck["args"].get("hidden", 256) or 256)
         if h0 < int(a.hidden):
@@ -1781,6 +1822,9 @@ def main():
                     help="--path-plan: price leaving the plan everywhere, or only where the plan is off the raceline")
     ap.add_argument("--corridor-obs", type=int, default=0,
                     help="1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)")
+    ap.add_argument("--car-slots", type=int, default=0,
+                    help="1: append the visible other cars' positions and relative velocities (visible_car_slots, 11-03); "
+                         "an --init without them starts these inputs at zero weight")
     ap.add_argument("--prop-line", type=float, default=0.0,
                     help="props stage: share of the layout's pattern slots that become one piece on the racing line "
                          "(ProceduralObstacles.line_share, 11-03: the wall-measured patterns never reach a mid-lane line)")
