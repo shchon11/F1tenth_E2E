@@ -958,3 +958,25 @@
   - srp25own5 200 update + 전체 평가
   - std 0.35배(srp25own35). 판정: u50·u100 solo lap <= 6.55 s, 8 layout hard가 srp25own5보다 나쁘지 않을 것.
 - 주의: `one_world_f2.sh` 머리줄의 "속도 신호 고침(...)" 문구는 EXTRA 인자로 덮어쓴 설정을 반영하지 않음. 실제 설정은 각 run의 args.json을 볼 것.
+
+### 11-05 02:20 실력을 갖고 시작하기 실패, 긴 학습으로
+
+- srp25own5(빠른 solo 시작 + std 절반) u200:
+  - solo lap 6.60 s(u50~u200 6.58~6.60)
+  - obstacle 30 layout hard 288 (벽 6 + obstacle 282, 29/30)
+  - race forzaeth 0.6 / 1.0 / 1.2배: 추월 20 / 20 / 20, hard 차 충돌 29 / 16 / 12
+  - obstacle + 0.6 / 1.0배: hard 차 충돌 32 / 36, 멈춤 96 / 101 s
+  - 따라가기 0.8배: 앞 차 근처 2.5 %
+  - 빠르고 추월은 다 하지만 obstacle·차를 처음부터 배우는 중
+- supervised 512칸 시작점은 무엇을 해도 PPO에서 속도가 무너짐:
+
+| run | 바꾼 것 | u50 solo lap | u50 앞 8 layout hard |
+|---|---|---|---|
+| srp25owdn5 | std 절반 | 8.85 s | |
+| srp25owdw | std 절반 + critic 20 update 예열(`--critic-warmup`) | 8.36 s | 21 |
+
+  KL은 solo 시작 run과 비슷함(0.015 대 0.011). 함수 하나로 흉내 낸 base -> race policy의 급한 전환이 update마다 흐려지며 느린 운전이 번지는 것으로 봄.
+- 긴 학습 (`tools/one_world_long.sh`, 속도가 지켜지는 설정):
+  - srp25own5L: srp25own5 u200에서 +600
+  - srp26own5: srp26h2_solo2에서 600, std 절반
+  - 기각(미리 정함): u600까지 obstacle 30 layout hard가 100 아래로 안 내려가거나, solo lap > 6.65 s(2025) / 7.55 s(2026)
