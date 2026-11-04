@@ -936,3 +936,25 @@
   -> 충돌은 측정되지 않음(PCGrad 대상 아님). update 하나의 gradient는 모든 경우에서 잡음 수준이고, 빈 트랙은 크기만 3~7배 작음. 빈 트랙에서 "빨리" 쪽으로 쌓이는 성분이 없음.
 - convex reward는 빈 트랙에서 신호와 잡음을 함께 키워서 효과가 없었음. 대신 obstacle 근처 감속이 사라져 충돌이 늘었음 -> 기각.
 - 준비만 함(사용자 결정 대기): `--anchor-solo`. 네트워크 하나, 그리고 base 섞기의 "주변에 아무것도 없음" 조건(SoloMix.near + hold)에서만 평균 action을 solo policy action에 맞추는 항(`--anchor-w`)을 둠. lr 0 시험에서 이 조건인 결정이 47~65 %였음.
+
+### 11-05 00:00 원인: 탐색 noise
+
+- 빈 트랙 reward 흔들림 (`tools/reward_snr.py`, 학습 noise, 10 s 구간 640개):
+  - 6.50 s policy 58.7 ± 13.7, 6.90 s policy 54.6 ± 14.9
+  - 차이는 구간 표준편차의 0.29배이고, 한 update의 빈 트랙 결정으로 보면 1.3 표준오차
+  - 흔들림은 탐색 noise가 내는 드문 벽 hard 충돌(가격 80)에서 옴
+- 사용자: "성격이 다른 task" -> time trial은 정밀함, obstacle·차는 탐색이 필요함. 사용자 결정: `--anchor-solo`는 최후의 방법으로 남김.
+
+| run (빠른 solo 시작, 네 경우 world, srp25ows 설정) | u50 solo lap | u100 solo lap | u50 앞 8 layout hard |
+|---|---|---|---|
+| 보통 noise (srp25ows) | 6.71 s | 6.90 s | |
+| std 절반, 아무것도 없을 때만 (`--calm-std 0.5`, srp25owq5) | 6.64 s | | |
+| **std 절반, 전체 (`--log-std-shift -0.693`, srp25own5)** | **6.58 s** | **6.58 s** | 45 |
+| 빈 트랙만 학습 (audit A) | 6.55 s | 6.55 s | |
+
+- std 절반이면 섞인 world에서도 빈 트랙 속도 손실이 멈춤. 10-27의 "PPO는 noise 섞인 policy를 최적화한다"와 같은 현상.
+- obstacle 근처 noise도 손실에 기여함(빈 상태만 줄이면 효과가 절반).
+- 진행 중:
+  - srp25own5 200 update + 전체 평가
+  - std 0.35배(srp25own35). 판정: u50·u100 solo lap <= 6.55 s, 8 layout hard가 srp25own5보다 나쁘지 않을 것.
+- 주의: `one_world_f2.sh` 머리줄의 "속도 신호 고침(...)" 문구는 EXTRA 인자로 덮어쓴 설정을 반영하지 않음. 실제 설정은 각 run의 args.json을 볼 것.
