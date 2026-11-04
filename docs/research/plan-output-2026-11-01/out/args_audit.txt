@@ -1,0 +1,91 @@
+eval	''	''	''	evaluate this checkpoint's mean action instead of training
+eval_steps	2400	2400	2400	
+eval_noise	0	0	0	--eval: 1 = with the training's exploration noise on the race policy
+name	'srp25ows'	'srp25h2_solo2'	None	
+stage	'race'	'solo'	'solo'	
+envs	1024	2048	4096	
+warps	16	16	16	
+beams	108	36	36	
+episode_s	40.0	40.0	40.0	
+updates	200	300	600	
+horizon	64	64	64	
+repeat	2	2	2	control steps per decision (40 Hz / X); with --action plan the plan is held on the track for these steps (EnvConfig.decision_every)
+tracks	'real:korea_2025_iccas'	'real:korea_2025_iccas'	''	comma-separated base maps (each with its --warps variants); default Korea 2026
+action	'plan'	'plan'	'direct'	plan (11-01): a trajectory, 4 waypoints x (curvature, speed), followed by MAP; direct: (steer, speed)
+plan_lookahead	0.235	0.235	0.235	--action plan: MAP reads the plan's speed this far ahead [s]
+plan_horizon	0.6	0.6	0.6	--action plan: the plan is this many s of the measured speed long
+epochs	4	4	4	
+minibatches	8	8	8	
+lr	5e-05	0.0001	0.0003	
+lr_end	5e-05	5e-05	0.0001	
+gamma	0.995	0.995	0.995	
+lam	0.95	0.95	0.95	
+clip	0.2	0.2	0.2	
+vf	0.5	0.5	0.5	
+log_std	-0.5	-0.5	-0.5	
+hidden	256	None	256	width of the actor / critic MLP layers; an --init of a narrower net is widened function-preservingly (11-03)
+log_std_shift	0.0	None	0.0	added to the --init checkpoint's log_std (-0.693 = half the noise)
+std_floor	None	None	None	floor of the exploration std (steer, speed) in action units
+price	80.0	80.0	80.0	
+price_start	80.0	80.0	0.0	
+price_hold	0	0	60	updates at --price-start before the ramp
+price_ramp	1	1	200	updates of the linear ramp to --price
+save_every	50	50	50	
+init	'/home/shchon11/f1sim_runs/srp25h2_solo2/state_u300.pt'	'/home/shchon11/f1sim_runs/srp25h2_solo/state_u150.pt'	''	
+unwedge	0	0	0	1: back a wedged car out (the old tracker's recovery, mirrored steering); 2: back-out steering from the front scan (10-30)
+opp_present	0.5	1.0	1.0	race stage: share of races with the opponent on track
+opp_slot	'{"speed_scale": [0.4, 1.2]}'	''	''	race stage: JSON merged into the opponent slot (speed_scale, reactive, events, ...)
+opp_spawn	'random'	'random'	'random'	race stage: where the opponent starts ('ahead': we start behind it)
+prop_fraction	0.5	1.0	1.0	share of resets that get a layout (the rest: empty track)
+removal_p	0.5	0.0	0.0	competition sessions: share of episodes whose props are removed mid-episode
+removal_s	[10.0, 30.0]	[10.0, 30.0]	(10.0, 30.0)	the removal time window [s]
+car_st	0	0	0	1: the car channel = the cars where they will be when we get there (10-31)
+scan_nocars	0	0	0	1: the scan obs is cast without the other cars (10-31)
+corridor_car_st	1	None	0	1: the cars where they will be when we get there, INTO the prop corridor (11-02)
+blank_opp	1	None	0	1: the privileged opponent slots as on the empty track (11-02)
+car_st_line	0	None	0	1: the car space-time block predicts the cars along the raceline (its pace on it, its offset from it)
+base	''	''	''	the gated mixture (10-31): this frozen SOLO teacher drives while nothing is near
+residual_solo	None	None	''	ResidualPi (11-04): this frozen SOLO policy + a change that is 0 while no prop / car is in view (--vis-actor); input statistics frozen
+residual_init	None	None	0	--residual-solo: R starts as the --init checkpoint's actor (the change = how it reacts to what it sees), its input statistics folded into R's first layer
+base_reach	10.0	10.0	10.0	--base: near = a prop on the track / a car within this [m]
+base_hold	10	10	10	--base: decisions the policy keeps the car after
+corridor_cars	0	0	0	1: mark the other cars (now, +0.5 s, +1 s) in the corridor
+car_channel	0	0	0	1: the other cars in their own corridor block (appended)
+bev	0	0	0	1: the car-centred grid of walls / props / cars + a conv (10-30)
+v_min	0.0	0.0	0.0	[m/s] the slowest command, < 0 lets the policy reverse
+shared_enc	0	0	0	1: actor and critic share the --bev grid encoder
+reverse_ext	0.0	0.0	0.0	speed action down to -1 - X = reverse (EnvConfig.reverse_ext)
+path_plan	0	0	0	1: drive a planned path (learn.path_plan) given as the track-ahead block
+track_k	0.5	0.5	0.5	--path-plan: price per m and step of leaving the plan beyond --track-dead
+track_dead	0.15	0.15	0.15	[m] --path-plan: free lateral room around the plan
+plan_ref	''	''	''	--path-plan: .npy of the line the plan moves (path_plan.record_line)
+track_where	'all'	'all'	'all'	--path-plan: price leaving the plan everywhere, or only where the plan is off the raceline
+corridor_obs	1	0	0	1: append which lateral positions props block at each track-ahead point (13 x 7, appended last)
+car_slots	0	None	0	1: append the visible other cars' positions and relative velocities (visible_car_slots, 11-03); an --init without them starts these inputs at zero weight
+prop_line	0.0	None	0.0	props stage: share of the layout's pattern slots that become one piece on the racing line (ProceduralObstacles.line_share, 11-03: the wall-measured patterns never reach a mid-lane line)
+prop_bank	'/home/shchon11/f1sim_runs/prop_banks'	None	''	file or dir of uniform layouts the per-layout line generator judged drivable (tools/layout_bank.py, 11-03 night); each reset takes one of its own track's and keeps 1 .. all of its pieces
+prop_place	'pattern'	None	'pattern'	where props stand (ProceduralObstacles place, 11-03 night): wall-measured patterns, or uniform over the lane area keeping a 0.7 m way past every piece
+geo_shaping	0.0	0.0	0.0	potential -X x price x geo_risk (the 1 s arc's overlap with a prop); 0 = off
+car_price	0.0	0.0	0.0	final price of a hard car contact (0 = --price); ramps with the price schedule
+severity_min	1.0	None	1.5	[m/s] the impact a contact needs to be charged (EnvConfig.contact_severity_min). 1.0 = what the console and every report call hard (contact_severity.HARD_MPS); 1.5 left 1.0-1.5 m/s hits free (11-02)
+vis_actor	1	None	0	the actor reads props only as the car can SEE them (in the student's grid, in line of sight) and not the time left; the critic keeps the full truth (11-03)
+pos_void	0.0	None	0.0	--pos-bonus: a place taken within this many seconds of a hard car contact does not pay (11-02)
+pos_bonus	80.0	None	0.0	race stage: + this when taking a place from a car within 8 m (1 m hysteresis), - when losing one (11-02)
+prop_touch_vmax	0.0	None	0.0	--prop-touch-price only while the car is slower than this [m/s] (a push, not a graze); 0 = any speed
+prop_touch_price	40.0	None	0.0	price per second in contact with a prop at any speed (ramps with --price); 0 = off (11-02: soft pushes were free, so the props teachers shoved crates off the line)
+noise_corr	0.0	0.0	0.0	AR(1) correlation of the exploration noise per decision (0 = white; 0.9 = ~0.5 s at 20 Hz)
+level_replay	0.5	0.0	0.0	prioritized level replay probability (0 = off)
+level_replay_size	24	24	24	
+prop_density	1.5	1.5	1.5	props / stages: procedural_density (training world)
+prop_count	'uniform'	None	'fixed'	patterns per layout: all of the lap's (fixed) or 1 .. all, uniform (11-03: fixed = always dense)
+prop_max	18	18	18	props / stages: procedural_max_props
+scan_obs	1	0	0	1: append the noise-free scan (--beams beams) to the observation
+soft_bound	1	0	0	1: the policy mean squashed into the action range near its ends (margins steer 0.1, speed 0.2; `soft_bound`) -- exploration reaches inside the range everywhere
+plan_relabel	1.0	1.0	0.0	weight of the loss pulling the mean plan towards the wp4 plan of the path the car then drove (--action plan; plan_relabel_targets)
+plan_relabel_speed	0.0	0.0	0.0	--plan-relabel's weight on the waypoint speeds [per (m/s)^2]. 0 (11-01): pulled onto the speeds the car then had, the plan stops asking for more than it gets and the car stops accelerating (srp25r_test: top speed 9.2 -> 6.1 m/s, laps 6.5 -> 7.8 s) -- a planner's speeds are a reference the car lags, its path is not
+bound_loss	1.0	0.0	0.0	weight of the penalty on the policy mean outside the executable action range (11-01: clamped-Gaussian dead zone); 0 = off
+hit_head	1.0	0.0	0.0	weight of the critic's hit-within-K head (BCE); 0 = off
+hit_horizon	20	20	20	K decisions (20 = 1 s at 20 Hz)
+hit_shaping	1.0	0.0	0.0	potential-based shaping Phi = -X x price x P(hit within K); 0 = off (needs --hit-head)
+seed	4101	915	5001	
+device	'cuda'	'cuda'	'cuda'	

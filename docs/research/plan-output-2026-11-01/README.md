@@ -880,3 +880,40 @@
 - 다음 (`tools/one_world_g.sh`): base 섞기는 유지하고 props 단계와 race 단계를 합침. world는 one-world 그대로(obstacle 50 % x 상대 차 50 %, 0.4~1.2배).
   - 시작: 2025 race u50(srp25h3gwt_race), 2026 props correlated u100(srp26bkc_props).
   - 기각선: obstacle 30 layout hard 47 / 26, 2025 race forzaeth 0.6 / 1.0배 hard 차 충돌 8 / 3, 0.6배 추월 15/20. 따라가기 0.8배도 함께 봄.
+
+### 11-04 저녁: 네트워크 하나로 되돌림, 학습 설정 전수조사
+
+- 사용자 결정(19:10): teacher도 네트워크 하나(base 섞기 없음). base 섞은 run은 참고값으로만 남김:
+  - srp25owg2 u100: obstacle 30 layout hard 32
+  - 상대 forzaeth 0.6배: 추월 20/20, hard 차 충돌 6
+  - 1.0배: hard 차 충돌 5, 5~9 m 뒤에서 따라가기만 함
+  - obstacle + 0.6배: hard 차 충돌 16
+  - 2026 srp26owg u100: obstacle hard 30, 0.6배 추월 4/20
+- 전수조사 (`tools/audit_split.sh`, `audit_split2.sh`, 인자 91개 비교 `out/args_audit.txt`). 빠른 solo policy(6.50 s)에서 시작:
+
+| | u50 solo lap | u100 solo lap |
+|---|---|---|
+| A: 빈 트랙만 + srp25ows 설정 | 6.55 s | 6.55 s |
+| B: 네 경우 world + solo 학습 설정(soft bound·bound loss·hit head 0, severity 1.5, level replay 0, lr 1e-4) | 6.61 s | 6.75 s |
+| C: 네 경우 world + srp25ows 설정, hit-shaping만 0 | 6.73 s | |
+| srp25owf: 경우별 advantage 정규화(`--adv-norm-case`) + level replay 0 + hit-shaping 0 | 6.71 s | |
+| srp25ows (네 경우 world + 설정 그대로) | 6.71 s | 6.90 s |
+
+- 원인이 아닌 것(측정):
+  - soft bound / bound loss를 학습 전 solo policy에 씌워도 6.50 s(`tools/bound_speed.py`)
+  - 입력 정규화 통계 이동: 중앙 0.001 표준편차, 바뀐 통계로도 6.50 s
+  - hit-shaping(C)
+  - advantage 정규화(srp25owf)
+- 원인: 네 경우가 섞인 world에서 PPO가 빈 트랙 속도를 잃음(forgetting). 빈 트랙에서는 "더 빨리" gradient가 잡음 수준이라 되돌리는 힘이 없음(10-27 SNR 측정).
+- hit head는 빈 트랙에서도 P(hit) 0.01~0.016을 예측함(`tools/hit_head_empty.py`). hit-shaping 항의 크기는 step당 0.8 -> 1.9로 컸지만, potential 형태라 상쇄되어 속도에는 영향이 없었음.
+- level replay는 빈 트랙 혼자 비율을 약 13 %로 줄임.
+- 네트워크 크기 (`tools/capacity_test.py`): base 섞은 checkpoint의 action을 같은 크기 네트워크 하나에 supervised + DAgger 4회차로 맞춤.
+
+| 같은 앞 8 layout | solo lap | obstacle hard |
+|---|---|---|
+| 정답 checkpoint | 6.50 s | 9 |
+| 256칸 | 6.50 s | 18 |
+| 512칸 | 6.50 s | 14 |
+
+  -> 크기는 주된 문제가 아님. supervised로는 네트워크 하나가 빈 트랙을 지킴.
+- 다음: 512칸 supervised 네트워크에서 PPO 시작. srp25owd는 srp25owf 설정, srp25owdb는 solo 학습 설정. 기각(미리 정함): u50 solo lap > 6.58 s면 시작점 문제 아님.

@@ -1185,6 +1185,16 @@ def mlp(i, o, h=256):
     return nn.Sequential(nn.Linear(i, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, o))
 
 
+def world_case(env, lid):
+    """(B,) long: 2 x (a live prop on the track) + (an opponent in the race) -- empty 0, car 1, props 2, both 3"""
+    po = env.procedural
+    props = (po.p_sid[lid] >= 0).any(1) if po is not None and po.C > 0 else torch.zeros(lid.numel(), dtype=torch.bool, device=lid.device)
+    opp = torch.zeros_like(props)
+    if env.M > 1:
+        opp = env._opp_rel(env.last_result.state)[-1][lid].any(1)
+    return 2 * props.long() + opp.long()
+
+
 def residual_of(ar):
     """`--residual-solo`: (the frozen solo policy's obs width, its hidden width), or None"""
     ar = _ar(ar)
@@ -1536,6 +1546,7 @@ def train(a):
         bh = torch.zeros(T, B, device=device); bp = torch.zeros(T + 1, B, device=device)
         bg = torch.zeros(T + 1, B, device=device)
         bm = torch.ones(T, B, device=device)                     # 1 = this policy's action was executed (`--base`)
+        bcase = torch.zeros(T, B, dtype=torch.long, device=device)  # `--adv-norm-case`: 2 x props on track + an opponent in the race
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = prop_s = push_s = 0.0; laps = []; dev_sum = dev_n = 0.0; n_gain = n_lost = n_void = 0.0
         relabel = float(getattr(a, "plan_relabel", 0.0) or 0.0) > 0
@@ -1560,6 +1571,7 @@ def train(a):
                 else:
                     act = dist.sample()
                 bo[t] = on; ba[t] = act; blp[t] = dist.log_prob(act).sum(1)
+                bcase[t] = world_case(env, lid)
                 if blv is not None:
                     blv[t] = env.level_seed[lid]
                 v_t, hl_t = model.value_and_hit(on)
@@ -1698,6 +1710,18 @@ def train(a):
             if mix is not None and bool((bm > 0).any()):
                 am = adv[bm > 0]
                 adv_n = (adv - am.mean()) / (am.std() + 1e-8)
+            elif int(a.adv_norm_case):
+                # `--adv-norm-case` (11-04): each of the four worlds (empty / props / car / both) normalised on its own --
+                # one network in the mixed world lost empty-track pace 6.50 -> 6.75 s by u100 even with the solo run's settings
+                # (audit B), 6.55 s on the empty track alone (audit A): the price-80 hits of the prop / car worlds set the
+                # advantage scale, and an empty-track decision's pace advantage (~0.02 m a decision) came out near 0. Per task,
+                # as multi-task RL does for tasks of different reward scales (PopArt, Hessel et al. 2019)
+                adv_n = torch.zeros_like(adv)
+                for g in range(4):
+                    mg = bcase == g
+                    if int(mg.sum()) > 1:
+                        ag = adv[mg]
+                        adv_n[mg] = (ag - ag.mean()) / (ag.std() + 1e-8)
             else:
                 adv_n = (adv - adv.mean()) / (adv.std() + 1e-8)
         t_roll = time.time() - tr0
@@ -1763,6 +1787,7 @@ def train(a):
                  "shaping_abs": float(shaping.abs().mean()), "geo_risk_mean": float(bg[:T].mean()),
                  "geo_risk_before_hit": float((bg[:T] * y_hit).sum() / y_hit.sum().clamp_min(1.0)),
                  "policy_share": float(bm.mean()),
+                 "case_share": [float((bcase == g).float().mean()) for g in range(4)],
                  "dead_speed": float(dead_n[1] / dead_n[0].clamp_min(1.0)), "dead_steer": float(dead_n[2] / dead_n[0].clamp_min(1.0))}
         if relabel:
             stats["plan_vs_driven_m"] = float(rl_d1.median()) if rl_d1.numel() else None
@@ -1974,6 +1999,8 @@ def main():
                     "executable action range (11-01: clamped-Gaussian dead zone); 0 = off")
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
+    ap.add_argument("--adv-norm-case", type=int, default=0, help="1: normalise the advantages within each world (empty / props / "
+                    "car / both, `world_case`) instead of over the whole batch (11-04)")
     ap.add_argument("--hit-shaping", type=float, default=0.0,
                     help="potential-based shaping Phi = -X x price x P(hit within K); 0 = off (needs --hit-head)")
     ap.add_argument("--seed", type=int, default=5001)
