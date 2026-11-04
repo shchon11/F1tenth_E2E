@@ -550,6 +550,7 @@ class StateObs:
         self.car_slots = bool(car_slots)
         self.actor_hide = [ACTOR_NO_LAP]
         self._hide_full = False
+        self.vis0 = None
         self.ahead = torch.tensor(AHEAD, device=env.device)
         self.dim = None
         self.scan, self.scan_range = bool(scan), float(scan_range)
@@ -671,6 +672,9 @@ class StateObs:
         if self.vis_actor:
             from ..gym_env import PRIV_V2_OPP_KEYS, PRIV_V2_OPP_SLOTS, PRIV_V2_PROP_DIM
             n0 = sum(int(p_.shape[1]) for p_ in parts)
+            #: from here on (visible prop slots, visible corridor + cars, visible car slots) every input is 0 while
+            #: nothing is in view (`ResidualPi`)
+            self.vis0 = n0
             vis = visible_props(env, lid)
             parts.append(visible_prop_slots(env, lid, vis))
             if self.corridor:
@@ -803,7 +807,8 @@ class TeacherPolicy:
                              car_slots=bool(ar.get("car_slots", 0)))
         B = int(env.learner_ids.numel())
         self.o = self.sobs(torch.zeros(B, self.A, device=device))
-        self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev"), hidden=int(ar.get("hidden", 256) or 256)).to(device)
+        self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev"), hidden=int(ar.get("hidden", 256) or 256),
+                               residual=residual_of(ar)).to(device)
         self.net.load_state_dict(ck["model"], strict=False); self.net.eval()
         self.nrm = RunningNorm(self.o.shape[1], device); self.nrm.load_state_dict(ck["norm"])
         self.mix = SoloMix(env, ar["base"], device, float(ar.get("base_reach", BASE_REACH)),
@@ -955,11 +960,15 @@ class RunningNorm:
     def __init__(self, dim, device, clip=8.0, raw_tail=0):
         self.mean = torch.zeros(dim, device=device); self.var = torch.ones(dim, device=device); self.n = 1e-4
         self.clip = clip
+        #: `--residual-solo`: the statistics stay as loaded (the frozen solo policy reads its own, `vis_empty` stays exact)
+        self.frozen = False
         #: the last `raw_tail` dims pass unnormalised (the --bev grid: already in [-2, 1], and a cell that is almost
         #: always empty would be blown up to the clip by its tiny variance)
         self.raw_tail = int(raw_tail)
 
     def update(self, x):
+        if self.frozen:
+            return
         x = x.reshape(-1, x.shape[-1])
         bm, bv, bn = x.mean(0), x.var(0, unbiased=False), x.shape[0]
         d = bm - self.mean; tot = self.n + bn
@@ -1176,6 +1185,40 @@ def mlp(i, o, h=256):
     return nn.Sequential(nn.Linear(i, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, o))
 
 
+def residual_of(ar):
+    """`--residual-solo`: (the frozen solo policy's obs width, its hidden width), or None"""
+    ar = _ar(ar)
+    return (int(ar["residual_d0"]), int(ar.get("residual_h0") or 256)) if ar.get("residual_solo") else None
+
+
+class ResidualPi(nn.Module):
+    """`--residual-solo` (11-04): the actor mean = a FROZEN solo policy + a learned change that is exactly 0 while no prop
+    and no car is in view. One network in one world (empty track / props / cars, srp25ows, srp26ows) slowed the empty-track
+    lap 6.50 -> 6.71 -> 6.90 s at u50 / u100 (2026 7.40 -> 7.65 s at u50): most episodes pay for speed near props and cars
+    and the net slows everywhere (10-31: the same in every race lineage, `--base`). change = R(x) - R(x with the visible
+    prop / car inputs (`StateObs.vis0` on) at their empty value): on an empty track both are the same input. Unlike the
+    `--base` mixture there is no hand-over: whatever is in view, this one actor drives. The solo policy's own clamp plus a
+    soft-bounded change: the empty-track action is the solo one bit for bit, and the change never sits in a clamped zone."""
+
+    def __init__(self, obs_dim, act_dim, d0, h0, hidden):
+        super().__init__()
+        self.d0 = int(d0)
+        self.base = mlp(self.d0, act_dim, h0).requires_grad_(False)
+        self.res = mlp(obs_dim, act_dim, hidden)
+        nn.init.zeros_(self.res[-1].bias); self.res[-1].weight.data.mul_(0.01)
+        self.register_buffer("vis_mask", torch.zeros(obs_dim, dtype=torch.bool))
+        self.register_buffer("vis_empty", torch.zeros(obs_dim))
+        self.register_buffer("lo", torch.full((act_dim,), -1e6))
+        self.register_buffer("hi", torch.full((act_dim,), 1e6))
+        self.register_buffer("m", torch.ones(act_dim))
+
+    def forward(self, x):
+        with torch.no_grad():
+            c = torch.maximum(torch.minimum(self.base(x[..., :self.d0]), self.hi), self.lo)
+        d = self.res(x) - self.res(torch.where(self.vis_mask, self.vis_empty, x))
+        return c + soft_bound(c + d, self.lo, self.hi, self.m) - soft_bound(c, self.lo, self.hi, self.m)
+
+
 class BevNet(nn.Module):
     """obs = [vector, grid (C * H * W) last] -> a small conv over the grid, joined with the vector, -> the MLP"""
 
@@ -1236,9 +1279,10 @@ def _hide_lap(m, _incompatible):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None, bev=None, shared_enc=False):
+    def __init__(self, obs_dim, act_dim=2, log_std=-0.5, hidden=256, std_floor=None, bev=None, shared_enc=False, residual=None):
         super().__init__()
         self.bev = tuple(bev) if bev else None
+        self.residual = residual is not None
         #: `--std-floor` (10-29): the race teachers cut their speed noise 0.66 -> 0.20 m/s, the cheapest way to fewer hits,
         #: after which no cautious maneuver (3-5 m/s less behind a car) is ever tried; the floor keeps it explored
         self.register_buffer("std_floor", torch.tensor(std_floor if std_floor is not None else [0.0] * act_dim, dtype=torch.float32))
@@ -1251,12 +1295,17 @@ class ActorCritic(nn.Module):
                 # prop weights 0 -> 0.106, the actor's 0 -> 0.022; the actor's steering ignored the prop channel)
                 self.v.conv = self.pi.conv; self.v.proj = self.pi.proj
             last_pi = self.pi.mlp[-1]
+        elif self.residual:
+            self.pi = ResidualPi(obs_dim, act_dim, *residual, hidden)
+            self.v = mlp(obs_dim, 1, hidden)
+            last_pi = None
         else:
             self.pi = mlp(obs_dim, act_dim, hidden)
             self.v = mlp(obs_dim, 1, hidden)
             last_pi = self.pi[-1]
         self.log_std = nn.Parameter(torch.full((act_dim,), float(log_std)))
-        nn.init.zeros_(last_pi.bias); last_pi.weight.data.mul_(0.01)
+        if last_pi is not None:
+            nn.init.zeros_(last_pi.bias); last_pi.weight.data.mul_(0.01)
         #: `--soft-bound` (11-01): the policy MEAN is squashed into the executable range near its ends -- the identity on
         #: [lo + m, hi - m], smoothly saturating to lo / hi beyond (`soft_bound`). A clamped Gaussian's mean drifts far past
         #: the bound where the bound is good (measured: mix0's race policy 34 % of its decisions speed-dead, 31 % steer-dead,
@@ -1284,10 +1333,12 @@ class ActorCritic(nn.Module):
         dev = self.mean_lo.device
         self.mean_lo.copy_(torch.tensor(lo, device=dev)); self.mean_hi.copy_(torch.tensor(hi, device=dev))
         self.mean_m.copy_(torch.tensor(m, device=dev))
+        if self.residual:
+            self.pi.lo.copy_(self.mean_lo); self.pi.hi.copy_(self.mean_hi); self.pi.m.copy_(self.mean_m)
 
     def _soft_bound(self, _mod, _inp, z):
         self.raw_mean = z
-        return soft_bound(z, self.mean_lo, self.mean_hi, self.mean_m)
+        return z if self.residual else soft_bound(z, self.mean_lo, self.mean_hi, self.mean_m)
 
     def critic_trunk(self, o):
         return self.v.trunk(o) if self.bev else self.v[:-1](o)
@@ -1335,8 +1386,16 @@ def train(a):
     o = obs_fn(last_a)
     D = obs_fn.dim
     bev = (BEV_C, BEV_H, BEV_W) if a.bev else None
+    ck_solo = None
+    if a.residual_solo:
+        if a.bev or a.base or not a.vis_actor or obs_fn.vis0 is None:
+            raise SystemExit("--residual-solo: plain MLP with --vis-actor, no --base")
+        ck_solo = torch.load(a.residual_solo, map_location=device, weights_only=False)
+        if ck_solo["args"].get("stage") != "solo" or ck_solo["args"].get("bev"):
+            raise SystemExit("--residual-solo takes a plain solo-stage checkpoint")
+        a.residual_d0, a.residual_h0 = int(ck_solo["obs_dim"]), int(ck_solo["args"].get("hidden") or 256)
     model = ActorCritic(D, act_dim=A, log_std=a.log_std, std_floor=std_floor_of(a, A),
-                        bev=bev, shared_enc=bool(a.shared_enc), hidden=int(a.hidden)).to(device)
+                        bev=bev, shared_enc=bool(a.shared_enc), hidden=int(a.hidden), residual=residual_of(a)).to(device)
     norm = RunningNorm(D, device, raw_tail=obs_fn.grid_dim)
     ret_rms = RunningNorm(1, device)
     upd0 = 0
@@ -1403,6 +1462,23 @@ def train(a):
         model.set_mean_bounds(*mean_bounds(a, A))
     elif bool((model.mean_hi < 1e5).any()):
         print("[state_rl] --init의 정책 평균 부드러운 범위를 이어받음", flush=True)
+    if ck_solo is not None:
+        # the frozen solo policy, its input statistics in the first d0 columns (the obs starts with the solo obs), all
+        # statistics frozen; the visible-prop / car columns' empty value as the actor reads it (normalised, actor_keep)
+        d0 = model.pi.d0
+        model.pi.base.load_state_dict({k[3:]: v for k, v in ck_solo["model"].items() if k.startswith("pi.")})
+        sn = ck_solo["norm"]
+        norm.mean = norm.mean.clone(); norm.var = norm.var.clone()
+        norm.mean[:d0] = sn["mean"].to(device); norm.var[:d0] = sn["var"].to(device)
+        norm.frozen = True
+        with torch.no_grad():
+            model.pi.vis_mask.zero_(); model.pi.vis_mask[obs_fn.vis0:] = True
+            model.pi.vis_empty.copy_(norm(torch.zeros(1, D, device=device))[0] * model.actor_keep)
+        if model.pi.lo[0] < -1e5:
+            # the solo policy ran under the env's clamp; the change is bounded the same way
+            model.set_mean_bounds(*mean_bounds(a, A))
+        print(f"[state_rl] --residual-solo {a.residual_solo}: 고정된 solo policy(관측 {d0}) + 보이는 obstacle·차 입력 "
+              f"{D - obs_fn.vis0}칸이 있을 때만 0이 아닌 보정, 입력 통계 고정", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
     w_col, w_car = abs(env.ecfg.reward_collision), abs(env.ecfg.reward_car_contact)
     ci = {k: REWARD_COMPONENT_KEYS.index(k) for k in REWARD_COMPONENT_KEYS}
@@ -1808,6 +1884,8 @@ def main():
     ap.add_argument("--car-st-line", type=int, default=0,
                     help="1: the car space-time block predicts the cars along the raceline (its pace on it, its offset from it)")
     ap.add_argument("--base", default="", help="the gated mixture (10-31): this frozen SOLO teacher drives while nothing is near")
+    ap.add_argument("--residual-solo", default="", help="ResidualPi (11-04): this frozen SOLO policy + a change that is 0 "
+                    "while no prop / car is in view (--vis-actor); input statistics frozen")
     ap.add_argument("--base-reach", type=float, default=BASE_REACH, help="--base: near = a prop on the track / a car within this [m]")
     ap.add_argument("--base-hold", type=int, default=BASE_HOLD, help="--base: decisions the policy keeps the car after")
     ap.add_argument("--corridor-cars", type=int, default=0, help="1: mark the other cars (now, +0.5 s, +1 s) in the corridor")

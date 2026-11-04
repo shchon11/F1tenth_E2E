@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from . import state_rl
-from .state_rl import ActorCritic, PropRemoval, RunningNorm, StateObs, Unwedge
+from .state_rl import ActorCritic, PropRemoval, RunningNorm, StateObs, Unwedge, residual_of
 
 
 def _rev_scale(y, ext):
@@ -283,7 +283,8 @@ def evaluate_student():
             sobs = StateObs(env, scan=bool(ck["args"].get("scan_obs", 0)), corridor=bool(ck["args"].get("corridor_obs", 0)), corridor_cars=bool(ck["args"].get("corridor_cars", 0)), car_channel=bool(ck["args"].get("car_channel", 0)), bev=bool(ck["args"].get("bev", 0)), path_plan=int(ck["args"].get("path_plan", 0)), plan_ref=ck["args"].get("plan_ref"))
             last = torch.zeros(B, 2, device=device)
             o_ = sobs(last)
-            tp = ActorCritic(o_.shape[1], bev=ck.get("bev"), hidden=int(ck["args"].get("hidden", 256) or 256)).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
+            tp = ActorCritic(o_.shape[1], bev=ck.get("bev"), hidden=int(ck["args"].get("hidden", 256) or 256),
+                              residual=residual_of(ck["args"])).to(device); tp.load_state_dict(ck["model"], strict=False); tp.eval()
             tn = RunningNorm(o_.shape[1], device); tn.load_state_dict(ck["norm"])
         else:
             st = Student(int(ck["frames"]), int(ck["beams"]), int(ck["ego_dim"])).to(device); st.load_state_dict(ck["student"]); st.eval()
