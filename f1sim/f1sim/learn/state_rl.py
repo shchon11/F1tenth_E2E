@@ -1872,6 +1872,13 @@ def train(a):
                     loss = loss + float(a.hit_head) * (bce * fvh[j]).sum() / fvh[j].sum().clamp_min(1.0)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
+                if u - upd0 <= int(a.critic_warmup):
+                    # `--critic-warmup` (11-05): the first N updates train the critic / hit head only; the actor's grads are
+                    # dropped (grad None: Adam leaves those weights and their moments alone). A supervised single-network start
+                    # (capacity_test.py: 6.50 s, 8-layout hard 14) carries the gated run's critic, which never valued the empty
+                    # track it now drives -- every PPO start from it collapsed (7.65 / 8.25 / 8.85 s by u50, noise x1 / x1 / x0.5)
+                    for p_ in list(model.pi.parameters()) + [model.log_std]:
+                        p_.grad = None
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 with torch.no_grad():
@@ -2111,6 +2118,7 @@ def main():
                     "executable action range (11-01: clamped-Gaussian dead zone); 0 = off")
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
+    ap.add_argument("--critic-warmup", type=int, default=0, help="the first N updates train the critic only (actor grads dropped, 11-05)")
     ap.add_argument("--calm-std", type=float, default=1.0, help="exploration std x this where nothing is near (CalmGate: the --base "
                     "test without a solo policy); 1 = off (11-04)")
     ap.add_argument("--anchor-solo", default="", help="ONE network: where nothing is near (the --base test) its mean action is "
