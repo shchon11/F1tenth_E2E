@@ -917,3 +917,22 @@
 
   -> 크기는 주된 문제가 아님. supervised로는 네트워크 하나가 빈 트랙을 지킴.
 - 다음: 512칸 supervised 네트워크에서 PPO 시작. srp25owd는 srp25owf 설정, srp25owdb는 solo 학습 설정. 기각(미리 정함): u50 solo lap > 6.58 s면 시작점 문제 아님.
+- 21:00~22:50 추가 측정 (모두 빠른 solo policy 6.50 s 또는 512칸 supervised 네트워크에서 시작, 네 경우 world PPO):
+
+| run | 바꾼 것 | u50 solo lap | u100 solo lap | 앞 8 layout hard |
+|---|---|---|---|---|
+| srp25owd | 512칸 supervised 시작 + srp25owf 설정 | 7.65 s | | |
+| srp25owdb | 512칸 supervised 시작 + solo 학습 설정(lr 1e-4) | 8.25 s | | |
+| srp25owp3 | progress x (v / 5)^2 (`--speed-pow 3`, 사용자 제안: 7 -> 6 s가 15 -> 10 s보다 더 값지게) | 6.70 s | 6.86 s | u50 58 |
+
+- gradient 진단 (`--grad-diag`, `tools/grad_diag.sh`, srp25ows 조건 20 update):
+
+| | 빈 트랙 | 차 | obstacle | 둘 다 |
+|---|---|---|---|---|
+| \|g\| | 0.81 | 2.25 | 5.13 | 5.48 |
+| 반쪽끼리 cos | 0.06 ± 0.08 | 0.08 ± 0.08 | 0.08 ± 0.08 | 0.03 ± 0.08 |
+| cos(빈 트랙, ·) | | -0.10 ± 0.06 | 0.01 ± 0.08 | -0.03 ± 0.07 |
+
+  -> 충돌은 측정되지 않음(PCGrad 대상 아님). update 하나의 gradient는 모든 경우에서 잡음 수준이고, 빈 트랙은 크기만 3~7배 작음. 빈 트랙에서 "빨리" 쪽으로 쌓이는 성분이 없음.
+- convex reward는 빈 트랙에서 신호와 잡음을 함께 키워서 효과가 없었음. 대신 obstacle 근처 감속이 사라져 충돌이 늘었음 -> 기각.
+- 준비만 함(사용자 결정 대기): `--anchor-solo`. 네트워크 하나, 그리고 base 섞기의 "주변에 아무것도 없음" 조건(SoloMix.near + hold)에서만 평균 action을 solo policy action에 맞추는 항(`--anchor-w`)을 둠. lr 0 시험에서 이 조건인 결정이 47~65 %였음.

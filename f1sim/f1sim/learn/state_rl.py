@@ -779,6 +779,14 @@ class SoloMix:
             out |= nc.any(1)
         return out
 
+    def solo(self, last):
+        """(the solo teacher's mean action, the gate) -- `__call__` without the mixing (`--anchor-solo`)"""
+        self.left = torch.where(self.near(), torch.full_like(self.left, self.hold), (self.left - 1).clamp_min(0))
+        self.gate = self.left > 0
+        o = blank_opponents(self.sobs(last.clamp(-1, 1)))
+        o[:, self.prop_cols] = 0.0
+        return self.net.pi(self.nrm(o)).clamp(-1, 1), self.gate
+
     def __call__(self, a_pol, last):
         """the executed action: the race policy's `a_pol` where gated, the solo teacher's mean action elsewhere"""
         self.left = torch.where(self.near(), torch.full_like(self.left, self.hold), (self.left - 1).clamp_min(0))
@@ -1185,6 +1193,36 @@ def mlp(i, o, h=256):
     return nn.Sequential(nn.Linear(i, h), nn.Tanh(), nn.Linear(h, h), nn.Tanh(), nn.Linear(h, o))
 
 
+def grad_conflict(model, fo, fa, fadv, fcase, fm, n_max=16384):
+    """`--grad-diag` (11-04, the user: "gradient conflict ?"): the actor's policy gradient (PPO's at ratio 1: -E[adv log pi])
+    of each world (`world_case`: empty / car / props / both) on this update's batch, and of two random halves of each world.
+    Logs |g| per world, the cosine between every pair, and each world's half-vs-half cosine (does its gradient have a
+    direction at all, or is it noise?). Conflict = a world with a consistent direction (halves cos > 0.3) whose cosine to
+    the others is < 0; no signal = halves cos ~ 0 (then gradient surgery has nothing to keep)."""
+    params = [p for p in model.pi.parameters() if p.requires_grad] + [model.log_std]
+    def g_of(idx):
+        if idx.numel() < 64:
+            return None
+        idx = idx[torch.randperm(idx.numel(), device=idx.device)[:n_max]]
+        d = model.dist(fo[idx].float())
+        lp = d.log_prob(fa[idx]).sum(1)
+        w = fm[idx]
+        loss = -(lp * fadv[idx] * w).sum() / w.sum().clamp_min(1.0)
+        gs = torch.autograd.grad(loss, params, allow_unused=True)
+        return torch.cat([(g if g is not None else torch.zeros_like(p)).reshape(-1) for g, p in zip(gs, params)])
+    cos = lambda x, y: float((x @ y) / (x.norm() * y.norm() + 1e-12)) if x is not None and y is not None else None
+    full, half = [], []
+    for c in range(4):
+        idx = torch.nonzero(fcase == c).squeeze(1)
+        full.append(g_of(idx))
+        h = idx[torch.randperm(idx.numel(), device=idx.device)]
+        k = h.numel() // 2
+        half.append(cos(g_of(h[:k]), g_of(h[k:])))
+    return {"norm": [float(g.norm()) if g is not None else None for g in full],
+            "cos": [[cos(full[i], full[j]) for j in range(4)] for i in range(4)],
+            "half_cos": half}
+
+
 def world_case(env, lid):
     """(B,) long: 2 x (a live prop on the track) + (an opponent in the race) -- empty 0, car 1, props 2, both 3"""
     po = env.procedural
@@ -1523,6 +1561,15 @@ def train(a):
     # the gated mixture (`--base`): the solo teacher drives where nothing is near; the policy gradient only on the
     # decisions this policy drove (elsewhere its sampled action was not executed), the critic on all
     mix = SoloMix(env, a.base, device, float(a.base_reach), int(a.base_hold), visible=bool(a.vis_actor)) if a.base else None
+    #: `--anchor-solo` (11-04): ONE network, but where nothing is near (SoloMix's own test: no visible prop in the corridor
+    #: within reach, no car within reach, for `hold` decisions) its mean action is pulled onto the solo policy's -- every PPO
+    #: variant in the mixed world lost empty-track pace (6.50 -> 6.70 s by u50: settings, hit-shaping, per-world advantage
+    #: normalisation, a speed-convex reward, a supervised start), while a supervised fit of one network kept 6.50 s: PPO has
+    #: no consistent 'faster' gradient on the empty track (per-world gradient cosines, `--grad-diag`), so nothing pulls back
+    anchor = SoloMix(env, a.anchor_solo, device, float(a.base_reach), int(a.base_hold), visible=bool(a.vis_actor)) \
+        if a.anchor_solo else None
+    if anchor is not None and mix is not None:
+        raise SystemExit("--anchor-solo is for one network: no --base")
     ptp = float(getattr(a, "prop_touch_price", 0.0) or 0.0)
     ptv = float(getattr(a, "prop_touch_vmax", 0.0) or 0.0)
     posb = float(getattr(a, "pos_bonus", 0.0) or 0.0)
@@ -1547,6 +1594,8 @@ def train(a):
         bg = torch.zeros(T + 1, B, device=device)
         bm = torch.ones(T, B, device=device)                     # 1 = this policy's action was executed (`--base`)
         bcase = torch.zeros(T, B, dtype=torch.long, device=device)  # `--adv-norm-case`: 2 x props on track + an opponent in the race
+        bsolo = torch.zeros(T, B, A, device=device) if anchor is not None else None    # `--anchor-solo`: its action
+        banch = torch.zeros(T, B, device=device)                                    # 1 = nothing near: anchored
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = prop_s = push_s = 0.0; laps = []; dev_sum = dev_n = 0.0; n_gain = n_lost = n_void = 0.0
         relabel = float(getattr(a, "plan_relabel", 0.0) or 0.0) > 0
@@ -1581,6 +1630,9 @@ def train(a):
                 rew = torch.zeros(B, device=device); done = torch.zeros(B, dtype=torch.bool, device=device)
                 hit_now = torch.zeros(B, dtype=torch.bool, device=device)
                 exe = clamp_any(act, a)
+                if anchor is not None:
+                    a_s, g_s = anchor.solo(last_a)
+                    bsolo[t] = a_s; banch[t] = (~g_s).float()
                 if mix is not None:
                     exe = mix(exe, last_a); bm[t] = mix.gate.float()
                 # dead decisions (11-01): the mean beyond the action bound by more than 2 sigma -- every sample executes the
@@ -1610,6 +1662,14 @@ def train(a):
                     touching = tch
                     onw = (-col / max(w_col, 1e-9)).clamp_min(0)
                     dense = r_[lid].float() - col - car
+                    if float(a.speed_pow) != 1.0:
+                        # `--speed-pow` (11-04, the user: "한 랩이 15->10초보다 7->6초로 가는게 훨씬 더 보상을 키워버리는거지"): the
+                        # metre at speed v pays (v / --speed-ref)^(p - 1) -- progress alone pays a lap 15 -> 10 s (x1.5) more than
+                        # 7 -> 6 s (x1.17); at p 3 the near-limit gain is worth more, and the empty track's small 'faster' share of
+                        # the gradient grows p-fold against the props / cars' 'slower' one (audit: 6.50 -> 6.71 s by u50 in the mixed world)
+                        ds_ = info["progress"][lid].float().clamp_min(0)
+                        v_ = env.sim.state[lid, 3].float().clamp_min(0)
+                        dense = dense + float(env.ecfg.reward_progress) * ds_ * ((v_ / float(a.speed_ref)) ** (float(a.speed_pow) - 1.0) - 1.0)
                     # --car-price: a hard car contact can end a 1 vs 1 race; at the shared price the teacher's tailgating
                     # into braking zones is break-even against a 0.5 s gap rule (10-29 gap test), so cars get their own
                     price_c = price * (float(a.car_price) / float(a.price)) if float(a.car_price) > 0 else price
@@ -1732,8 +1792,12 @@ def train(a):
         if relabel:
             f_rp, f_rv = rl_pts.reshape(N, -1, 2), rl_vk.reshape(N, -1)
             f_vm, f_rm = vm_t.reshape(N), (rl_msk * bm).reshape(N)
+        if anchor is not None:
+            f_solo, f_anch = bsolo.reshape(N, A), banch.reshape(N)
+        anch_mse = []
         mb = N // int(a.minibatches)
         kls, cfs = [], []
+        gdiag = grad_conflict(model, fo, fa, fadv, bcase.reshape(N), fm) if int(a.grad_diag) else None
         for ep in range(int(a.epochs)):
             perm = torch.randperm(N, device=device)
             for i in range(0, N, mb):
@@ -1759,6 +1823,11 @@ def train(a):
                     # `--plan-relabel`: the mean plan pulled towards the plan of what the car then drove (plan_relabel_targets)
                     e_j = relabel_loss(env, dist.mean, f_vm[j], f_rp[j], f_rv[j], w_speed=float(a.plan_relabel_speed))
                     loss = loss + float(a.plan_relabel) * (e_j * f_rm[j]).sum() / f_rm[j].sum().clamp_min(1.0)
+                if anchor is not None:
+                    w_a = f_anch[j]
+                    e_a = (dist.mean - f_solo[j]).pow(2).sum(1)
+                    loss = loss + float(a.anchor_w) * (e_a * w_a).sum() / w_a.sum().clamp_min(1.0)
+                    anch_mse.append(float((e_a * w_a).sum() / w_a.sum().clamp_min(1.0)))
                 if a.hit_head > 0:
                     bce = nn.functional.binary_cross_entropy_with_logits(hl_j, fyh[j], reduction="none")
                     loss = loss + float(a.hit_head) * (bce * fvh[j]).sum() / fvh[j].sum().clamp_min(1.0)
@@ -1788,6 +1857,9 @@ def train(a):
                  "geo_risk_before_hit": float((bg[:T] * y_hit).sum() / y_hit.sum().clamp_min(1.0)),
                  "policy_share": float(bm.mean()),
                  "case_share": [float((bcase == g).float().mean()) for g in range(4)],
+                 "grad_diag": gdiag,
+                 "anchor_share": float(banch.mean()) if anchor is not None else None,
+                 "anchor_mse": float(np.mean(anch_mse)) if anch_mse else None,
                  "dead_speed": float(dead_n[1] / dead_n[0].clamp_min(1.0)), "dead_steer": float(dead_n[2] / dead_n[0].clamp_min(1.0))}
         if relabel:
             stats["plan_vs_driven_m"] = float(rl_d1.median()) if rl_d1.numel() else None
@@ -1999,6 +2071,13 @@ def main():
                     "executable action range (11-01: clamped-Gaussian dead zone); 0 = off")
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
+    ap.add_argument("--anchor-solo", default="", help="ONE network: where nothing is near (the --base test) its mean action is "
+                    "pulled onto this frozen solo policy's (11-04)")
+    ap.add_argument("--anchor-w", type=float, default=1.0, help="--anchor-solo: weight of the squared action distance")
+    ap.add_argument("--speed-pow", type=float, default=1.0, help="progress paid per metre x (v / --speed-ref)^(p - 1); 1 = plain progress (11-04)")
+    ap.add_argument("--speed-ref", type=float, default=5.0, help="[m/s] --speed-pow: the speed at which a metre pays 1")
+    ap.add_argument("--grad-diag", type=int, default=0, help="1: log the per-world policy gradients' norms and cosines each update "
+                    "(`grad_conflict`, 11-04)")
     ap.add_argument("--adv-norm-case", type=int, default=0, help="1: normalise the advantages within each world (empty / props / "
                     "car / both, `world_case`) instead of over the whole batch (11-04)")
     ap.add_argument("--hit-shaping", type=float, default=0.0,
