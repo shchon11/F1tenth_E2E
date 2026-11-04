@@ -1477,6 +1477,22 @@ def train(a):
         if model.pi.lo[0] < -1e5:
             # the solo policy ran under the env's clamp; the change is bounded the same way
             model.set_mean_bounds(*mean_bounds(a, A))
+        if int(a.residual_init):
+            # `--residual-init` (11-04 14:45): R starts as the --init checkpoint's ACTOR, so the change starts as how that
+            # policy changes its action for what it sees (a zero-started R learned no avoiding in 100 updates: srp25owr u100
+            # hard 272 on the 30 console layouts, the solo line straight into the crates). Its own input statistics are
+            # folded into R's first layer: x_init = x * s_f / s_i + (m_f - m_i) / s_i on the columns the actor reads
+            if not a.init or ck["model"].get("pi.0.weight") is None or ck["model"]["pi.0.weight"].shape != model.pi.res[0].weight.shape:
+                raise SystemExit("--residual-init needs an --init plain actor of this obs width and hidden size")
+            ni = ck["norm"]
+            s_i, s_f = ni["var"].to(device).sqrt() + 1e-6, norm.var.sqrt() + 1e-6
+            sc = s_f / s_i
+            sh = (norm.mean - ni["mean"].to(device)) / s_i * model.actor_keep
+            r_sd = {k[3:]: v.clone() for k, v in ck["model"].items() if k.startswith("pi.") and k[3:4].isdigit()}
+            W = r_sd["0.weight"]
+            r_sd["0.weight"] = W * sc[None, :]; r_sd["0.bias"] = r_sd["0.bias"] + W @ sh
+            model.pi.res.load_state_dict(r_sd)
+            print(f"[state_rl] --residual-init: 보정 R을 {a.init}의 actor에서 시작(입력 통계 첫 층에 합침)", flush=True)
         print(f"[state_rl] --residual-solo {a.residual_solo}: 고정된 solo policy(관측 {d0}) + 보이는 obstacle·차 입력 "
               f"{D - obs_fn.vis0}칸이 있을 때만 0이 아닌 보정, 입력 통계 고정", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
@@ -1886,6 +1902,8 @@ def main():
     ap.add_argument("--base", default="", help="the gated mixture (10-31): this frozen SOLO teacher drives while nothing is near")
     ap.add_argument("--residual-solo", default="", help="ResidualPi (11-04): this frozen SOLO policy + a change that is 0 "
                     "while no prop / car is in view (--vis-actor); input statistics frozen")
+    ap.add_argument("--residual-init", type=int, default=0, help="--residual-solo: R starts as the --init checkpoint's actor "
+                    "(the change = how it reacts to what it sees), its input statistics folded into R's first layer")
     ap.add_argument("--base-reach", type=float, default=BASE_REACH, help="--base: near = a prop on the track / a car within this [m]")
     ap.add_argument("--base-hold", type=int, default=BASE_HOLD, help="--base: decisions the policy keeps the car after")
     ap.add_argument("--corridor-cars", type=int, default=0, help="1: mark the other cars (now, +0.5 s, +1 s) in the corridor")

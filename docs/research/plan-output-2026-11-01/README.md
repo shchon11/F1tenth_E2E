@@ -862,3 +862,21 @@
   - u50마다 solo lap.
   - 평가에 forzaeth 1.2배와 obstacle + 상대 차 추가.
   - 2025 u50 solo lap 6.71 s(시작 6.50 s, 지금 설정으로 다시 재서 확인). 기각선 6.65 s는 u100/u200에 적용.
+
+### 11-04 오후: 빈 트랙 속도를 지키는 구조 찾기
+
+- 빠른 solo policy(srp25h2_solo2 / srp26h2_solo2 u300)에서 시작한 one-world(`tools/one_world_y.sh`)도 학습할수록 느려짐:
+
+| | 시작 | u50 | u100 |
+|---|---|---|---|
+| 2025 solo lap | 6.50 s | 6.71 s | 6.90 s |
+| 2026 solo lap | 7.40 s | 7.65 s | |
+
+  - 트랙 위치별 속도(`tools/speed_profile.py`, `out/speed_srp25ows_u50.png`): 라인은 같고 빠른 구간만 0.3~0.5 m/s씩 고르게 낮아짐. obstacle·차 상황에서 배운 감속이 빈 트랙에도 적용됨(10-31 race 단계와 같은 현상, `--base`를 만든 이유).
+- 고정 solo policy + 보정(`ResidualPi`, `--residual-solo`): actor = solo(x) + R(x) - R(보이는 obstacle·차 입력을 비운 x).
+  - 빈 트랙에서는 solo와 비트 단위로 같음(lr 0, u50, u100 모두 6.50 s / 7.42 s; 테스트 `f1sim/tests/test_residual_pi.py`).
+  - R을 0에서 시작(srp25owr): u100 obstacle 30 layout hard 272(1 + 271), solo 라인 그대로 상자에 4.8 m/s로 박고 무더기에서 밀기(`out/layouts/o_srp25owr_u100_L10.png`). 보정이 처음에 0이라 obstacle 입력 쪽 학습 신호가 약함.
+  - R을 one-world actor에서 시작(`--residual-init 1`, 입력 통계를 첫 층에 합침, 차이 2e-7, srp25owi): 앞 8 layout hard u0 38 -> u50 39(같은 8 layout: 첫 one-world 9). 2026 u0 85(첫 one-world 6). 라인 위 상자를 3~4 m/s로 그대로 지나감(`out/layouts/q_srp25owi_u50_L0.png`, `_L6.png`). 보정이 다른 policy의 상대값이라 빠른 solo 라인에서 비키기에 모자람 -> 기각.
+- 다음 (`tools/one_world_g.sh`): base 섞기는 유지하고 props 단계와 race 단계를 합침. world는 one-world 그대로(obstacle 50 % x 상대 차 50 %, 0.4~1.2배).
+  - 시작: 2025 race u50(srp25h3gwt_race), 2026 props correlated u100(srp26bkc_props).
+  - 기각선: obstacle 30 layout hard 47 / 26, 2025 race forzaeth 0.6 / 1.0배 hard 차 충돌 8 / 3, 0.6배 추월 15/20. 따라가기 0.8배도 함께 봄.

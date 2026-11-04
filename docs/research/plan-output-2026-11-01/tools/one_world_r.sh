@@ -6,8 +6,10 @@
 # --init은 같은 world의 one-world checkpoint(critic, std, obstacle·차 입력 통계), 입력 통계 고정, bound-loss 0. world·reward는 one_world_y.sh 그대로.
 # 기각(미리 정함, 시드 777): obstacle 30 layout hard(벽+obstacle) > base 섞은 props 최고(2025 47, 2026 26), 또는 2025 race 20판 forzaeth
 # 0.6 / 1.0배 hard 차 충돌 > 8 / 3 또는 0.6배 추월 < 15/20. solo lap은 구조상 그대로(u50마다 확인만).
-# 인자: solo체크포인트 init체크포인트 이름 GPU 환경수 시드 업데이트 지도(25|26) 중간평가를학습과동시에(1/0)
-SOLO=$1; INIT=$2; NAME=$3; GPU=$4; ENVS=$5; S=$6; U=$7; MAPK=$8; PAR=$9
+# 11-04 14:45: 보정을 0에서 시작한 srp25owr는 u100 obstacle 30 layout hard 272(solo 라인 그대로 상자에 박음) -> 10번째 인자 1 = --residual-init 1
+# (보정 R을 --init checkpoint의 actor에서 시작: 그 policy가 보이는 것에 따라 행동을 바꾸는 만큼이 처음 보정).
+# 인자: solo체크포인트 init체크포인트 이름 GPU 환경수 시드 업데이트 지도(25|26) 중간평가를학습과동시에(1/0) [residual-init(1/0)]
+SOLO=$1; INIT=$2; NAME=$3; GPU=$4; ENVS=$5; S=$6; U=$7; MAPK=$8; PAR=$9; RINIT=${10:-0}
 if [ "$MAPK" = 26 ]; then M=real:korea_2026_competition; MC=real/korea26; else M=real:korea_2025_iccas; MC=real/iccas25; fi
 D=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out
 T=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/tools
@@ -35,6 +37,7 @@ evalc() {
     until [ -e $R/${NAME}/state_u${UU}.pt ] || [ -e $D/one_${NAME}.done ]; do sleep 20; done
     [ -e $R/${NAME}/state_u${UU}.pt ] || break
     echo "  u${UU} solo: $(CUDA_VISIBLE_DEVICES=$GPU timeout 900 python3 $T/console_laps.py $R/${NAME}/state_u${UU}.pt $MC 60 2>&1 | grep '주행' | cut -c1-200)" >> $L
+    echo "  u${UU} obstacle 앞 8 layout: $(CUDA_VISIBLE_DEVICES=$GPU timeout 1800 python3 $T/console_layouts.py $R/${NAME}/state_u${UU}.pt $MC 40 8 777 $D/layouts/q_${NAME}_u${UU} 2>&1 | grep '합계' | cut -c1-200)" >> $L
     if [ "$PAR" = 1 ] && [ $UU = $((U / 2)) ]; then evalc $UU; fi
   done ) &
 PL="--action plan --plan-lookahead 0.235 --plan-horizon 0.6 --repeat 2 --tracks $M --plan-relabel 1.0 --plan-relabel-speed 0"
@@ -45,7 +48,7 @@ COMMON="--envs $ENVS --warps 16 --beams 108 --episode-s 40 --horizon 64 --epochs
 CUDA_VISIBLE_DEVICES=$GPU python3 -u -m f1sim.learn.state_rl --name ${NAME} --stage race $PL $COMMON --updates $U \
   --lr 5e-5 --lr-end 5e-5 --price 80 --price-start 80 --price-hold 0 --price-ramp 1 --seed $S \
   --opp-present 0.5 --car-channel 0 --corridor-car-st 1 --blank-opp 1 --scan-nocars 0 --pos-bonus 80 --opp-slot '{"speed_scale": [0.4, 1.2]}' \
-  --init $INIT --residual-solo $SOLO > $D/${NAME}.log 2>&1 || { echo fail > $D/one_${NAME}.done; exit 1; }
+  --init $INIT --residual-solo $SOLO --residual-init $RINIT > $D/${NAME}.log 2>&1 || { echo fail > $D/one_${NAME}.done; exit 1; }
 wait
 [ "$PAR" = 1 ] || evalc $((U / 2))
 evalc $U
