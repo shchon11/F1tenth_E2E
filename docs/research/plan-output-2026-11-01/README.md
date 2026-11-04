@@ -830,3 +830,35 @@
   - `tools/props_bank_x.sh` 2026 u100 + `--noise-corr 0.9`(예전 world에서 피하기를 가르친 상관 잡음 단계).
   - `tools/one_world.sh`: 사용자 "base policy와 props 를 별개로 학습하는 이유가 있나?", "상대차 있는 경우도 별개로 나누는 이유를 모르겠네", "장애물 없고 혼자/상대방 포함, 장애물 있고 혼자/상대방 포함 이렇게 네개", 상대 속도 "1.2배까지" -> `--stage race` 하나에 obstacle 50 % x 상대 차 50 %(4종, 0.4~1.2배), removal 50 %, `--base` 없음, 200 update, race checkpoint u50에서 시작. 기각선은 스크립트 머리. 네 번째 경우(obstacle + 상대 차)는 `tools/eval_obs_race.sh`.
   - 4070 감시 스크립트는 하나로 합침(따로 붙은 감시 스크립트끼리 서로를 멈춤).
+
+### 11-04 one-world 첫 시도: 기각 (solo lap이 느림)
+
+- 설정 (`tools/one_world_x.sh`, `_x26.sh`, 연쇄 `tools/one_world_chain.sh`, `_chain26.sh`):
+  - obstacle 50 % x 상대 차 50 %(4종 0.4~1.2배), base 없음.
+  - correlated noise 0.9 100 update 뒤 white 100 update.
+  - 시작: 2025 race u50(srp25h3gwt_race), 2026 props correlated u100(srp26bkc_props).
+- 평가 (시드 777, hard = 세게):
+
+| | 2025 이전 | 2025 u50 / u100 | 2026 이전 | 2026 u50 / u100 |
+|---|---|---|---|---|
+| solo lap | 6.50 s (base) | 7.7 / 7.8 s | 7.40 s (base) | 9.6 / 9.4 s |
+| obstacle 30 layout hard(벽+obstacle) | 57 (props u100) | 64 / 41 | 26 | 28 / 30 |
+| forzaeth 0.6배 추월, hard 차 (기각선 >= 15, <= 8) | | 20, 6 / 20, 4 | | 11, 15 / 4, 4 (멈춤 33 / 22 s) |
+| forzaeth 1.0배 추월, hard 차 (기각선 <= 3) | | 2, 7 / 4, 5 | | 0, 0 / 0, 0 |
+| forzaeth 1.2배 추월, hard 차 | race u50: 0, 0 | 2, 3 / 1, 3 | | |
+
+- follow probe (`tools/follow_probe.py`, 0.8배, u100):
+  - 앞 차 3~6 m 뒤에 머무는 비율 32.5 % -> 3.4 %
+  - 나란히 달릴 때 속도(raceline 속도 대비) 0.33 -> 0.80
+- correlated 단계에서는 두 지도 모두 학습 중 obstacle 닿은 시간이 늘었음(2025 3.5 -> 5.3 s/km, 2026 0.9 -> 12.4 s/km).
+- 2025 one-world의 obstacle + 상대 차 평가는 결과가 없음. 5060에 작업 3개가 겹쳐 시간 초과.
+- 원인: 시작 checkpoint를 base 없이 solo lap으로 재 봄.
+  - 2025 race u50 8.30 s, props u100 8.25 s
+  - 2026 props u100 12.6 s
+  - one-world는 오히려 빠르게 만들었음(8.3 -> 7.7 s, 12.6 -> 9.4 s). 느린 원인은 시작점.
+  - base를 섞은 단계에서는 빈 구간을 base가 운전함. 그래서 그 policy는 빈 트랙 속도를 배운 적이 없고, 지금까지 props/race 평가에서 나온 속도는 base 덕분이었음.
+- 다음 (`tools/one_world_y.sh`): 빈 트랙이 빠른 solo policy(srp25h2_solo2 / srp26h2_solo2 u300)에서 one-world 200 update.
+  - obstacle·상대 차 입력은 가중치 0에서 시작, white noise.
+  - u50마다 solo lap.
+  - 평가에 forzaeth 1.2배와 obstacle + 상대 차 추가.
+  - 2025 u50 solo lap 6.71 s(시작 6.50 s, 지금 설정으로 다시 재서 확인). 기각선 6.65 s는 u100/u200에 적용.
