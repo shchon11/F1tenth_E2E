@@ -980,3 +980,7 @@
   - srp25own5L: srp25own5 u200에서 +600
   - srp26own5: srp26h2_solo2에서 600, std 절반
   - 기각(미리 정함): u600까지 obstacle 30 layout hard가 100 아래로 안 내려가거나, solo lap > 6.65 s(2025) / 7.55 s(2026)
+- 03:15: srp25own5L(std 절반, u200에서 이어 학습)은 solo lap 6.60 -> 6.69(+50) -> 6.78 s(+100)로 다시 느려져 멈춤. std는 절반 그대로였음. noise 절반은 속도 손실을 늦출 뿐 막지는 못함(처음 200 update에서 안정적이었던 건 obstacle·차를 아직 거의 못 배워서로 봄).
+- srp26own5(2026, std 절반) u50: 7.44 s(시작 7.40), 계속 학습.
+- srp25own35b: 빠른 solo에서 std 0.35배, 600 update. 판정: solo lap u100 <= 6.62 s, u200 <= 6.65 s.
+- 콘솔: `watch_<run>/state_latest.pt`가 가장 최근 checkpoint를 가리킴(`tools/watch_latest.sh`). console_picks 맨 위.
