@@ -723,6 +723,33 @@ def blank_opponents(o):
     return o
 
 
+class CalmGate:
+    """`--calm-std` (11-04): SoloMix's 'nothing near' test without a solo policy -- (B,) bool `near` per decision (a visible prop
+    in the corridor within `reach` m, a car within `reach` m no more than 2 m behind, or below 1 m/s, held `hold` decisions)"""
+
+    def __init__(self, env, reach=10.0, hold=10, visible=True):
+        self.env, self.lid, self.reach, self.hold, self.visible = env, env.learner_ids, float(reach), int(hold), bool(visible)
+        self.n_seg = sum(1 for x in AHEAD if x <= self.reach + 1e-6)
+        self.left = torch.zeros(int(self.lid.numel()), dtype=torch.long, device=env.device)
+
+    def step(self):
+        env, lid = self.env, self.lid
+        st = env.last_result.state
+        s, tid = env.last_result.s[lid], env.sim.tid[lid]
+        B = s.shape[0]
+        cb = corridor_block(env, lid, s, tid, visible=visible_props(env, lid) if self.visible else None
+                            ).reshape(B, len(AHEAD), CORRIDOR_BINS)[:, :self.n_seg]
+        near = cb.flatten(1).any(1) | (st[lid, 3] < 1.0)
+        if env.M > 1:
+            dx, dy, _, _, _, dist, pres = env._opp_rel(st)
+            nc = (pres & (dx > -2.0) & (dist < self.reach))[lid]
+            if self.visible:
+                nc = nc & visible_cars(env, lid)
+            near |= nc.any(1)
+        self.left = torch.where(near, torch.full_like(self.left, self.hold), (self.left - 1).clamp_min(0))
+        return self.left > 0
+
+
 class SoloMix:
     """The frozen SOLO teacher (`--base`, e.g. srl1: empty track 7.53 s) drives while nothing is near; the race policy only
     when a live prop is on the track within `reach` m ahead, another car is within `reach` m (no more than 2 m behind),
@@ -1568,6 +1595,11 @@ def train(a):
     #: no consistent 'faster' gradient on the empty track (per-world gradient cosines, `--grad-diag`), so nothing pulls back
     anchor = SoloMix(env, a.anchor_solo, device, float(a.base_reach), int(a.base_hold), visible=bool(a.vis_actor)) \
         if a.anchor_solo else None
+    #: `--calm-std` (11-04): the exploration std x this where nothing is near (`CalmGate`). On the empty track the training
+    #: noise's rare hard wall hits (price 80) set the reward's spread: 10 s windows 58.7 +- 13.7 (6.50 s policy) vs 54.6 +- 14.9
+    #: (6.90 s), the pace gap 0.29 sd, 1.3 se over one update (`tools/reward_snr.py`) -- the time trial needs precision, the
+    #: props / cars need exploration; one std for both serves the second only
+    calm = CalmGate(env, float(a.base_reach), int(a.base_hold), visible=bool(a.vis_actor)) if float(a.calm_std) != 1.0 else None
     if anchor is not None and mix is not None:
         raise SystemExit("--anchor-solo is for one network: no --base")
     ptp = float(getattr(a, "prop_touch_price", 0.0) or 0.0)
@@ -1596,6 +1628,7 @@ def train(a):
         bcase = torch.zeros(T, B, dtype=torch.long, device=device)  # `--adv-norm-case`: 2 x props on track + an opponent in the race
         bsolo = torch.zeros(T, B, A, device=device) if anchor is not None else None    # `--anchor-solo`: its action
         banch = torch.zeros(T, B, device=device)                                    # 1 = nothing near: anchored
+        bscale = torch.ones(T, B, device=device)                                    # `--calm-std`: the std factor used
         blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = prop_s = push_s = 0.0; laps = []; dev_sum = dev_n = 0.0; n_gain = n_lost = n_void = 0.0
         relabel = float(getattr(a, "plan_relabel", 0.0) or 0.0) > 0
@@ -1609,6 +1642,9 @@ def train(a):
                 norm.update(o)
                 on = norm(o)
                 dist = model.dist(on)
+                if calm is not None:
+                    bscale[t] = torch.where(calm.step(), torch.ones(B, device=device), torch.full((B,), float(a.calm_std), device=device))
+                    dist = torch.distributions.Normal(dist.mean, dist.stddev * bscale[t][:, None])
                 if float(a.noise_corr) > 0:
                     # temporally correlated exploration (AR(1), marginal N(0, 1)): white noise at 20 Hz averages out within
                     # a second, so a sampled deviation never becomes a maneuver (brake 0.3 s earlier, hold a gap, move the
@@ -1794,6 +1830,7 @@ def train(a):
             f_vm, f_rm = vm_t.reshape(N), (rl_msk * bm).reshape(N)
         if anchor is not None:
             f_solo, f_anch = bsolo.reshape(N, A), banch.reshape(N)
+        f_scale = bscale.reshape(N)
         anch_mse = []
         mb = N // int(a.minibatches)
         kls, cfs = [], []
@@ -1804,6 +1841,8 @@ def train(a):
                 j = perm[i:i + mb]
                 fo_j = fo[j].float()
                 dist = model.dist(fo_j)
+                if calm is not None:
+                    dist = torch.distributions.Normal(dist.mean, dist.stddev * f_scale[j][:, None])
                 lp = dist.log_prob(fa[j]).sum(1)
                 ratio = (lp - flp[j]).exp()
                 m_j = fm[j]
@@ -1859,6 +1898,7 @@ def train(a):
                  "case_share": [float((bcase == g).float().mean()) for g in range(4)],
                  "grad_diag": gdiag,
                  "anchor_share": float(banch.mean()) if anchor is not None else None,
+                 "calm_share": float((bscale != 1.0).float().mean()) if calm is not None else None,
                  "anchor_mse": float(np.mean(anch_mse)) if anch_mse else None,
                  "dead_speed": float(dead_n[1] / dead_n[0].clamp_min(1.0)), "dead_steer": float(dead_n[2] / dead_n[0].clamp_min(1.0))}
         if relabel:
@@ -2071,6 +2111,8 @@ def main():
                     "executable action range (11-01: clamped-Gaussian dead zone); 0 = off")
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
+    ap.add_argument("--calm-std", type=float, default=1.0, help="exploration std x this where nothing is near (CalmGate: the --base "
+                    "test without a solo policy); 1 = off (11-04)")
     ap.add_argument("--anchor-solo", default="", help="ONE network: where nothing is near (the --base test) its mean action is "
                     "pulled onto this frozen solo policy's (11-04)")
     ap.add_argument("--anchor-w", type=float, default=1.0, help="--anchor-solo: weight of the squared action distance")
