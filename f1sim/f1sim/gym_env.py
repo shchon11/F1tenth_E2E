@@ -234,6 +234,13 @@ class EnvConfig:
     #: of a wedge itself (the outside recovery rule re-wedged cars on the same prop). 0 = as before.
     reverse_ext: float = 0.0
     reverse_speed: float = 2.0
+    #: The plan's own reverse (2026-11-05, the user: "정책 자체에서 찾아내가야지 이걸 규칙화하면 좀 이상할 것 같은데"): a
+    #: learner's first plan speed (wp4 v_1) may go down to -1 - plan_reverse_ext, and below -1 the car backs along the plan's
+    #: curve at -reverse_speed * (-(a + 1) / plan_reverse_ext) -- MAP's steering for the plan with the speed reversed, so the
+    #: same arc is driven backwards. MAP's own back-out rules are off for those cars (`MAPPlanTracker.auto_backout`): on the
+    #: real car nothing sets the contact they read, and in the sim they backed 0.6 m out and the plan drove straight back in
+    #: (srp26owp u550 layout 2: 35 s on one fixed crate). a in [-1, 1] keeps exactly the forward map. 0 = as before.
+    plan_reverse_ext: float = 0.0
     max_steps: int = 1600            # 40 s at 40 Hz
     # Give each race's FIRST episode after `reset()` a random length in [1, max_steps] instead of
     # max_steps; every later episode is full length. Under `collision_mode="soft"` nothing
@@ -2970,6 +2977,15 @@ class F1VecEnv:
             lo = torch.where(self.learner, torch.full((self.B,), -1.0 - ext, device=self.device), torch.full((self.B,), -1.0, device=self.device))
             a = torch.stack([act_in[:, 0].clamp(-1.0, 1.0), torch.maximum(torch.minimum(act_in[:, 1], torch.ones_like(lo)), lo)], 1)
             a = self._opponent_actions(a)
+        elif float(self.ecfg.plan_reverse_ext) > 0 and self.act_dim != 2:
+            # the learners' first plan speed may reach into the plan's reverse extension; everything else stays in [-1, 1]
+            act_in = action.to(self.device)
+            iv = self._plan_v1_dim()
+            lo = torch.where(self.learner, torch.full((self.B,), -1.0 - float(self.ecfg.plan_reverse_ext), device=self.device),
+                             torch.full((self.B,), -1.0, device=self.device))
+            a = act_in.clamp(-1.0, 1.0)
+            a[:, iv] = torch.maximum(torch.minimum(act_in[:, iv], torch.ones_like(lo)), lo)
+            a = self._opponent_actions(a)
         else:
             a = self._opponent_actions(action.to(self.device).clamp(-1.0, 1.0))
         if self.act_dim == 2:
@@ -2998,6 +3014,7 @@ class F1VecEnv:
                 # `acc_now`), and follows the plans of the policy's own cars
                 self.tracker.P = self.sim.P
                 self.tracker.map_rows = self.learner
+                self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
                     self.tracker.push_imu(lr.imu[:, :, 3])
             K = int(self.ecfg.decision_every)
@@ -3013,7 +3030,8 @@ class F1VecEnv:
                 self.tracker.hold_rows = hold
                 self.tracker.pose_now = self.sim.state[:, :3]
                 self._dec_cnt += 1                                 # a reset below sets its rows back to 0
-            a_trk = a if self.ecfg.plan_speed_scale == 1.0 else self._scale_plan_speeds(a)
+            a_trk = a.clamp(-1.0, 1.0) if float(self.ecfg.plan_reverse_ext) > 0 else a
+            a_trk = a_trk if self.ecfg.plan_speed_scale == 1.0 else self._scale_plan_speeds(a_trk)
             raw = self.tracker(a_trk, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
@@ -3079,6 +3097,11 @@ class F1VecEnv:
                 held_o = self.learner & (v > lim_o.to(v.dtype))
                 self.obstacle_limited = held_o
                 raw = torch.stack([raw[:, 0], torch.where(held_o, lim_o.to(v.dtype), v)], 1)
+            if float(self.ecfg.plan_reverse_ext) > 0:
+                # the plan's reverse: MAP's steering for the plan, its speed below -1 a backing speed
+                av = a[:, self._plan_v1_dim()]
+                v_rev = -float(self.ecfg.reverse_speed) * (-(av + 1.0) / float(self.ecfg.plan_reverse_ext))
+                raw = torch.stack([raw[:, 0], torch.where(self.learner & (av < -1.0), v_rev.to(raw.dtype), raw[:, 1])], 1)
             self.last_cmd_raw = raw                                # what the tracker asked for (before calibration)
             cal = self.tracker_cal
             cmd = torch.stack([((raw[:, 0] - cal[:, 0]) / cal[:, 1]).clamp(-self.s_max, self.s_max), raw[:, 1] / cal[:, 2]], 1)
@@ -4505,6 +4528,11 @@ class F1VecEnv:
     def _tracker_plan_speed(self) -> torch.Tensor:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""
         return self.last_result.odom[:, 3] if self.last_result is not None else self.sim.state[:, 3]
+
+    def _plan_v1_dim(self) -> int:
+        """the action column of the plan's first speed (`EnvConfig.plan_reverse_ext` reaches below -1 there)"""
+        from .mpc import _LAYOUTS
+        return int(_LAYOUTS[self.ecfg.speed_mode].speed.start)
 
     def _scale_plan_speeds(self, a: torch.Tensor) -> torch.Tensor:
         """The plans the follower tracks, the learner's speeds x `EnvConfig.plan_speed_scale` (the

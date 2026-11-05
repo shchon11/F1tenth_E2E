@@ -1066,16 +1066,24 @@ def act_dim_of(ar) -> int:
 
 
 def clamp_any(a, ar):
-    """this run's executable action: a plan's numbers in [-1, 1]; (steer, speed) as `clamp_act`"""
+    """this run's executable action: a plan's numbers in [-1, 1] (its first speed down to -1 - `--plan-reverse-ext`);
+    (steer, speed) as `clamp_act`"""
     if plan_of(ar):
-        return a.clamp(-1.0, 1.0)
+        pext = float(_ar(ar).get("plan_reverse_ext", 0.0) or 0.0)
+        if pext <= 0:
+            return a.clamp(-1.0, 1.0)
+        lo = torch.full((a.shape[-1],), -1.0, device=a.device, dtype=a.dtype)
+        lo[PLAN_KAPPA_DIMS] = -1.0 - pext
+        return torch.maximum(torch.minimum(a, torch.ones_like(lo)), lo)
     return clamp_act(a, float(_ar(ar).get("reverse_ext", 0.0) or 0.0))
 
 
 def mean_bounds(ar, A: int):
     """(lo, hi, margin) of each action dimension, for `--soft-bound` / `--bound-loss` / the dead-decision count"""
     if plan_of(ar):
-        return [-1.0] * A, [1.0] * A, [0.1] * PLAN_KAPPA_DIMS + [0.2] * (A - PLAN_KAPPA_DIMS)
+        lo = [-1.0] * A
+        lo[PLAN_KAPPA_DIMS] -= float(_ar(ar).get("plan_reverse_ext", 0.0) or 0.0)
+        return lo, [1.0] * A, [0.1] * PLAN_KAPPA_DIMS + [0.2] * (A - PLAN_KAPPA_DIMS)
     ext = float(_ar(ar).get("reverse_ext", 0.0) or 0.0)
     return [-1.0, -1.0 - ext], [1.0, 1.0], [0.1, 0.2]
 
@@ -1207,7 +1215,8 @@ def plan_env_fields(ar) -> dict:
     a = _ar(ar)
     return dict(action_mode="plan", speed_mode="wp4", speed_command="tracker", plan_follower="map",
                 plan_follower_map=dict(PLAN_MAP, speed_lookahead=float(a.get("plan_lookahead", 0.235))),
-                decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0)
+                decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0,
+                plan_reverse_ext=float(a.get("plan_reverse_ext", 0.0) or 0.0))
 
 
 def soft_bound(z, lo, hi, m):
@@ -2073,6 +2082,9 @@ def main():
     ap.add_argument("--v-min", type=float, default=0.0, help="[m/s] the slowest command, < 0 lets the policy reverse")
     ap.add_argument("--shared-enc", type=int, default=0, help="1: actor and critic share the --bev grid encoder")
     ap.add_argument("--reverse-ext", type=float, default=0.0, help="speed action down to -1 - X = reverse (EnvConfig.reverse_ext)")
+    ap.add_argument("--plan-reverse-ext", type=float, default=0.0,
+                    help="--action plan: the first plan speed down to -1 - X = the car backs along the plan's curve; MAP's own "
+                         "back-out rules off (EnvConfig.plan_reverse_ext, 11-05)")
     ap.add_argument("--path-plan", type=int, default=0, help="1: drive a planned path (learn.path_plan) given as the track-ahead block")
     ap.add_argument("--track-k", type=float, default=0.5, help="--path-plan: price per m and step of leaving the plan beyond --track-dead")
     ap.add_argument("--track-dead", type=float, default=0.15, help="[m] --path-plan: free lateral room around the plan")

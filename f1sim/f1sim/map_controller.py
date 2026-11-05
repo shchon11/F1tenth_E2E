@@ -551,12 +551,15 @@ class MAPPlanTracker:
         self.hold_rows = None
         self.pose_now = None
         self._held = None
+        #: the follower's own back-out rules for `map_rows` (the stalled-and-touching reverse, `PlanSpec.wedge_s`); the env
+        #: turns them off when the policy reverses itself (`EnvConfig.plan_reverse_ext`, 11-05)
+        self.auto_backout = True
 
     def __getattr__(self, name):                       # spec, last_ref, u_seq, hooks, ... are the inner's
         return getattr(self.__dict__["_inner"], name)
 
     def __setattr__(self, name, value):
-        if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held"):
+        if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._inner, name, value)
@@ -654,10 +657,11 @@ class MAPPlanTracker:
                                 yaw_rate=yaw_rate, delay=dly if self.map.p.delay_comp < 0 else None)
         speed = torch.minimum(speed, speed_cap)
         sp = self._inner.spec
-        # stopped, asking to stay stopped, and touching something: back out, as the tracker does
-        stalled = (v_meas.abs() < sp.reverse_v_gate) & (speed < sp.reverse_cmd_gate) & self._inner.contact
-        speed = torch.where(stalled, torch.full_like(speed, -sp.v_reverse), speed)
-        steer, speed = self._inner.unwedge(steer, speed, v_meas, advance=False)   # the inner moved the clocks
+        if self.auto_backout:
+            # stopped, asking to stay stopped, and touching something: back out, as the tracker does
+            stalled = (v_meas.abs() < sp.reverse_v_gate) & (speed < sp.reverse_cmd_gate) & self._inner.contact
+            speed = torch.where(stalled, torch.full_like(speed, -sp.v_reverse), speed)
+            steer, speed = self._inner.unwedge(steer, speed, v_meas, advance=False)   # the inner moved the clocks
         mine = torch.stack([steer, speed], 1)
         self.last_map = self.map.last
         return torch.where(self.map_rows[:, None], mine, out)
