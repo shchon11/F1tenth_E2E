@@ -984,3 +984,24 @@
 - srp26own5(2026, std 절반) u50: 7.44 s(시작 7.40), 계속 학습.
 - srp25own35b: 빠른 solo에서 std 0.35배, 600 update. 판정: solo lap u100 <= 6.62 s, u200 <= 6.65 s.
 - 콘솔: `watch_<run>/state_latest.pt`가 가장 최근 checkpoint를 가리킴(`tools/watch_latest.sh`). console_picks 맨 위.
+
+### 11-05 아침: 빈 상태 solo 정답 + PPO (사용자: "일단 시도하긴 해봐")
+
+- 2025 srp25own35b(std 0.35배, 빠른 solo 시작):
+  - solo lap 6.52~6.62 s(u50~u400)
+  - obstacle 30 layout hard u200 289 -> u400 265
+  - race u200 0.6 / 1.0배: 추월 20 / 20, hard 차 충돌 41 / 17
+  - obstacle 학습이 너무 느려 멈춤.
+- 2026 srp26own35(std 0.35배) u200: solo lap 7.50 s, obstacle 30 layout hard 329.
+- 사용자(08:20): 따로 학습한 solo policy에 기대는 구조(base 섞기, 보정, distill) 금지. 08:25: 네트워크 하나가 주변에 아무것도 없을 때만 solo action을 정답으로 받는 것(`--anchor-solo`)은 시도.
+- srp25owa: 첫 one-world srp25oww u100(30 layout hard 41, 빈 트랙 7.8 s)에서 시작, `--anchor-solo srp25h2_solo2 u300 --anchor-w 1.0`, 보통 noise.
+
+| | solo lap | 앞 8 layout hard |
+|---|---|---|
+| 시작 | 7.8 s | 9 |
+| u50 | 6.55 s | 33 (벽 8) |
+| u100 | 6.58 s | 18 (벽 1) |
+
+  - 정답 오차: 1.12 -> 0.056 (28 update)
+  - 정답 항이 걸리는 결정: 42~59 %
+  - 판정: u200 30 layout hard <= 47, race 기준
