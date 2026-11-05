@@ -291,9 +291,12 @@ def validate_start_config(cfg: P.SessionConfig) -> None:
 #: 못지나가게만 배치하지 말고" + "그 주행가능한지는 path generator 로직 사용해서 판단하는거지?"): even with the line share,
 #: 42 % (Korea 2025) and 71 % (Korea 2026) of the pieces stood within 0.3 m of a wall. The bank holds layouts drawn uniformly over
 #: the free area and judged drivable by the per-layout line generator (`tools/layout_bank.py`); a map without one draws uniform.
+#: `movable_obstacles` False (11-05, the user: "장애물이 거의 밀리지 않은 상자로" + "콘솔도 바꿔놔"): props as fixed as walls, as the
+#: training now has them (`state_rl --prop-movable 0`) -- a shove made progress, so the policies pushed crates aside instead of
+#: driving round them.
 PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "procedural_max_props": 18,
                        "procedural_raceline_corridor": "off", "procedural_raceline_margin": 0.25,
-                       "spawn_runway": 3.0, "movable_obstacles": True, "procedural_line_share": 0.3,
+                       "spawn_runway": 3.0, "movable_obstacles": False, "procedural_line_share": 0.3,
                        "procedural_place": "uniform", "procedural_bank": "/home/shchon11/f1sim_runs/prop_banks"}
 
 #: 장애물 "학습과 같음" with more than one car: the other cars of the race, as the runs since s911
