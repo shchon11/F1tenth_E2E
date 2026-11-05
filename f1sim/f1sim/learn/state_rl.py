@@ -474,6 +474,69 @@ def visible_cars(env, lid, tol=0.20):
     return pres & seen.any(-1)
 
 
+def scan_point_masks(env, lid, sc, typ, pad=0.05):
+    """(prop (B, N), car (B, N)) bool (`--scan-points`, 11-06): which beams of the noise-free scan `sc` (B, N) [m] ended on a
+    prop / on another car. Cars from the scan's own hit type (`lidar.HIT_CAR`); props report as HIT_TALL like a tall wall
+    (`Lidar._merge_props`), so a HIT_TALL beam is a prop's when its end point lies within a live prop's bounding circle
+    (its largest half-plane offset) + `pad`. The beams in the order of `env.sim.lidar.angles` (the env's own cast)."""
+    from ..lidar import HIT_CAR, HIT_TALL
+    car = typ == HIT_CAR
+    prop = torch.zeros_like(car)
+    po = env.procedural
+    if po is None or po.C == 0:
+        return prop, car
+    st = env.last_result.state[lid]
+    mx, my, ang = env._lidar_pose()
+    ang = ang.expand(env.B, -1)[lid].float()
+    ex = mx[lid, None] + sc * torch.cos(ang); ey = my[lid, None] + sc * torch.sin(ang)          # end points, car frame
+    c, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+    wx = st[:, 0:1] + ex * c - ey * s_; wy = st[:, 1:2] + ex * s_ + ey * c                     # world
+    pp = po.p_poses[lid]; live = po.p_sid[lid] >= 0
+    dd = po.p_d[lid]
+    rad = torch.where(torch.isfinite(dd), dd, torch.zeros_like(dd)).amax(-1).clamp_min(0.05) + pad   # (B, C)
+    tall = typ == HIT_TALL
+    for j in range(po.C):                                                  # one prop slot at a time: bounded memory
+        lj = live[:, j]
+        if not bool(lj.any()):
+            continue
+        d2 = (wx - pp[:, j, 0:1]).square() + (wy - pp[:, j, 1:2]).square()
+        prop |= tall & lj[:, None] & (d2 <= rad[:, j:j + 1].square())
+    return prop, car
+
+
+def grow_to_scan_points(sd, nm, scan0, b0, b1, vis0, D, device):
+    """An --init without `--scan-points` moved to this run's columns (11-06), so update 1 drives (nearly) as the parent:
+    the first layers' (pi.0, v.0) columns before the scan as they were; each of the b1 new scan beams takes the weight of
+    the parent's nearest beam over the number of new beams sharing it (the parent's response to the scan, smoothed over
+    its beam's sector) and its input statistics; the prop / car point rows start with zero weights (statistics: the
+    range cap 1.0, var 0.05); the columns between the scan and the visible block as they were; the parent's three visible
+    prop slots (`visible_prop_slots`, PRIV_V2_PROP_DIM columns at its vis0) dropped; the rest of the visible block as it was."""
+    from ..gym_env import PRIV_V2_PROP_DIM
+    mid = vis0 - (scan0 + 3 * b1)                                          # corridor (+ car channel) between scan and vis
+    vis0_old = scan0 + b0 + mid
+    tail = D - vis0
+    d0 = int(sd["pi.0.weight"].shape[1])
+    if d0 != vis0_old + PRIV_V2_PROP_DIM + tail:
+        raise SystemExit(f"--init: {d0} columns, not the expected parent layout ({vis0_old} + {PRIV_V2_PROP_DIM} + {tail})")
+    near = torch.round(torch.arange(b1, device=device, dtype=torch.float32) * (b0 - 1) / max(b1 - 1, 1)).long()
+    share = torch.bincount(near, minlength=b0).float()
+    src = torch.cat([torch.arange(scan0, device=device), scan0 + near])     # old column of each new pre-scan / scan column
+    def move(x, new_fill, scale=None):
+        # x (..., d0) -> (..., D)
+        pre = x[..., src]
+        if scale is not None:
+            pre = torch.cat([pre[..., :scan0], pre[..., scan0:] / scale], -1)
+        pts = new_fill.expand(*x.shape[:-1], 2 * b1).to(x.dtype)
+        midc = x[..., scan0 + b0: vis0_old]
+        rest = x[..., vis0_old + PRIV_V2_PROP_DIM:]
+        return torch.cat([pre, pts, midc, rest], -1)
+    for k in ("pi.0.weight", "v.0.weight"):
+        sd[k] = move(sd[k].to(device), torch.zeros(1, device=device), scale=share[near])
+    nm = {"mean": move(nm["mean"].to(device), torch.ones(1, device=device)),
+          "var": move(nm["var"].to(device), torch.full((1,), 0.05, device=device)), "n": nm["n"]}
+    return sd, nm
+
+
 def visible_prop_slots(env, lid, visible):
     """(B, PRIV_V2_PROP_DIM): the privileged prop slots (`GymEnv._prop_block`: present, dx/5, dy/5, dist/5, nearest first,
     dx > -1 m, within PRIV_V2_PROP_RANGE) over the `visible` props only"""
@@ -540,8 +603,16 @@ class StateObs:
     def __init__(self, env, scan: bool = False, scan_range: float = 10.0, corridor: bool = False, t_beams: int = 0,
                  corridor_cars: bool = False, car_channel: bool = False, bev: bool = False, path_plan: bool = False,
                  plan_ref=None, car_st: bool = False, scan_nocars: bool = False, corridor_car_st: bool = False,
-                 blank_opp: bool = False, car_st_line: bool = False, vis_actor: bool = False, car_slots: bool = False):
+                 blank_opp: bool = False, car_st_line: bool = False, vis_actor: bool = False, car_slots: bool = False,
+                 scan_points: bool = False):
         self.env = env
+        #: `--scan-points` (11-06, the user: "장애물이나 상대차의 라이다 포인트를 주면 그만 아님?", "라이다 1081 그대로 안 주는 이유가
+        #: 뭔데"): the scan as three rows of the same beams -- every range, the ranges that ended on a prop (others at the
+        #: range cap), the ranges that ended on a car (`scan_point_masks`) -- and no prop slots / prop corridor: the props
+        #: reach the actor as their points, size and shape included (the slots held centres only: 20 of 22 hard hits of
+        #: srp25owp u450 were on crates smaller than the layout median, each in view 1.4 s before, `plan_vs_hit.py`).
+        #: Meant with --beams 1081, the car's own LiDAR (108 beams put a 0.22 m crate at 3 m on 1-2 beams).
+        self.scan_points = bool(scan_points)
         #: `--vis-actor` (11-03): append the prop slots and the prop corridor over the props the car can SEE
         #: (`visible_props`) after everything else, and list in `actor_hide` the columns the actor must not read -- the
         #: full-truth prop slots and corridor and the time left; the critic keeps all of them (asymmetric actor-critic)
@@ -649,16 +720,26 @@ class StateObs:
             self.dim = out.shape[1]
             return out
         parts = [pv, ahead, steer, last_action]
+        self.scan0 = sum(int(p_.shape[1]) for p_ in parts)                     # the first scan column
         if self.scan:
             if self.scan_nocars and env.M > 1:
                 sc = env.sim.lidar.scan(env.sim.state[:, :3], None, env.sim.P, motion_distortion=False, tid=env.sim.tid,
                                         cars=None, compiled=True, eid=env.sim.eid)[1][lid].float()
             else:
                 sc = res.scan_true[lid].float()
+            if self.scan_points:
+                pm, cm = scan_point_masks(env, lid, sc, res.scan_type[lid])
             if self.interp is not None:
                 i0, w_ = self.interp
                 sc = sc[:, i0] * (1 - w_) + sc[:, i0 + 1] * w_
+                if self.scan_points:
+                    near = (i0 + (w_[0] >= 0.5).long())                     # labels: the nearer cast beam
+                    pm, cm = pm[:, near], cm[:, near]
             parts.append((sc / self.scan_range).clamp(0.0, 1.0))
+            if self.scan_points:
+                cap = torch.full_like(sc, self.scan_range)
+                parts.append((torch.where(pm, sc, cap) / self.scan_range).clamp(0.0, 1.0))
+                parts.append((torch.where(cm, sc, cap) / self.scan_range).clamp(0.0, 1.0))
         if self.planner is not None:
             parts.append((self.planner.free / 15.0)[:, None])             # how far the plan is free [/15 m]
         if self.corridor:
@@ -676,10 +757,15 @@ class StateObs:
             #: nothing is in view (`ResidualPi`)
             self.vis0 = n0
             vis = visible_props(env, lid)
-            parts.append(visible_prop_slots(env, lid, vis))
+            if not self.scan_points:
+                parts.append(visible_prop_slots(env, lid, vis))
             if self.corridor:
-                cb_v = corridor_block(env, lid, s, tid, cars=self.corridor_cars, visible=vis) if vis is not None \
-                    else torch.zeros(st.shape[0], len(AHEAD) * CORRIDOR_BINS, device=st.device)
+                if self.scan_points:                                       # the cars' part of the corridor only
+                    cb_v = corridor_block(env, lid, s, tid, cars=self.corridor_cars, props=False)
+                elif vis is not None:
+                    cb_v = corridor_block(env, lid, s, tid, cars=self.corridor_cars, visible=vis)
+                else:
+                    cb_v = torch.zeros(st.shape[0], len(AHEAD) * CORRIDOR_BINS, device=st.device)
                 if self.corridor_car_st:
                     cb_v = torch.maximum(cb_v, car_spacetime_block(env, lid, s, tid, line=self.car_st_line,
                                                                    visible=visible_cars(env, lid)))
@@ -839,7 +925,7 @@ class TeacherPolicy:
                              scan_nocars=bool(ar.get("scan_nocars", 0)),
                              corridor_car_st=bool(ar.get("corridor_car_st", 0)), blank_opp=bool(ar.get("blank_opp", 0)),
                              car_st_line=bool(ar.get("car_st_line", 0)), vis_actor=bool(ar.get("vis_actor", 0)),
-                             car_slots=bool(ar.get("car_slots", 0)))
+                             car_slots=bool(ar.get("car_slots", 0)), scan_points=bool(ar.get("scan_points", 0)))
         B = int(env.learner_ids.numel())
         self.o = self.sobs(torch.zeros(B, self.A, device=device))
         self.net = ActorCritic(self.o.shape[1], act_dim=self.A, bev=ck.get("bev"), hidden=int(ar.get("hidden", 256) or 256),
@@ -1446,7 +1532,9 @@ def train(a):
                       car_channel=bool(a.car_channel), bev=bool(a.bev), path_plan=int(a.path_plan), plan_ref=a.plan_ref,
                       car_st=bool(a.car_st), scan_nocars=bool(a.scan_nocars),
                       corridor_car_st=bool(a.corridor_car_st), blank_opp=bool(a.blank_opp), car_st_line=bool(a.car_st_line),
-                      vis_actor=bool(a.vis_actor), car_slots=bool(a.car_slots))
+                      vis_actor=bool(a.vis_actor), car_slots=bool(a.car_slots), scan_points=bool(a.scan_points))
+    if a.scan_points and not a.scan_obs:
+        raise SystemExit("--scan-points needs --scan-obs 1")
     if a.car_slots and not a.vis_actor:
         raise SystemExit("--car-slots needs --vis-actor (the slots are the cars the car itself can see)")
     if float(a.level_replay) > 0:
@@ -1487,6 +1575,13 @@ def train(a):
         ck = torch.load(a.init, map_location=device, weights_only=False)
         d0 = int(ck.get("obs_dim", D))
         sd = ck["model"]
+        if a.scan_points and not ck["args"].get("scan_points"):
+            sd, ck["norm"] = grow_to_scan_points(sd, ck["norm"], obs_fn.scan0, int(ck["args"].get("beams", 108) or 108),
+                                                 int(a.beams), obs_fn.vis0, D, device)
+            sd.pop("actor_keep", None)
+            print(f"[state_rl] --init 관측 {d0} -> {D}차원: scan {int(ck['args'].get('beams', 108) or 108)} -> {int(a.beams)}빔(가까운 옛 빔의 "
+                  f"가중치를 나눠 씀), 상자·차 점 줄은 가중치 0, 보이는 상자 slot은 뺌", flush=True)
+            d0 = D
         if d0 < D:
             # the new inputs (the scan) enter with zero weights: the run starts as the --init policy and learns to use them
             for k in ("pi.0.weight", "v.0.weight"):
@@ -2082,6 +2177,9 @@ def main():
     ap.add_argument("--v-min", type=float, default=0.0, help="[m/s] the slowest command, < 0 lets the policy reverse")
     ap.add_argument("--shared-enc", type=int, default=0, help="1: actor and critic share the --bev grid encoder")
     ap.add_argument("--reverse-ext", type=float, default=0.0, help="speed action down to -1 - X = reverse (EnvConfig.reverse_ext)")
+    ap.add_argument("--scan-points", type=int, default=0,
+                    help="the actor's scan as three rows (every range / prop points / car points), no prop slots or prop corridor "
+                         "(StateObs.scan_points, 11-06); with --beams 1081")
     ap.add_argument("--plan-reverse-ext", type=float, default=0.0,
                     help="--action plan: the first plan speed down to -1 - X = the car backs along the plan's curve; MAP's own "
                          "back-out rules off (EnvConfig.plan_reverse_ext, 11-05)")
