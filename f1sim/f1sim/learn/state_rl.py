@@ -1876,7 +1876,10 @@ def train(a):
                     # `--plan-relabel`: the mean plan pulled towards the plan of what the car then drove (plan_relabel_targets)
                     e_j = relabel_loss(env, dist.mean, f_vm[j], f_rp[j], f_rv[j], w_speed=float(a.plan_relabel_speed))
                     loss = loss + float(a.plan_relabel) * (e_j * f_rm[j]).sum() / f_rm[j].sum().clamp_min(1.0)
-                if anchor is not None:
+                if anchor is not None and (int(a.anchor_updates) <= 0 or u - upd0 <= int(a.anchor_updates)):
+                    # `--anchor-updates N` (11-05): the solo target only for the first N updates -- it brought the empty-track pace
+                    # back within 50 (srp25owa 7.8 -> 6.55 s, srp26owa 9.4 -> 7.45 s) but, left on, it pulled every decision with
+                    # nothing near onto the solo line and the avoiding never came back (the user: "그냥 냅다 때려박으려고 하니까")
                     w_a = f_anch[j]
                     e_a = (dist.mean - f_solo[j]).pow(2).sum(1)
                     loss = loss + float(a.anchor_w) * (e_a * w_a).sum() / w_a.sum().clamp_min(1.0)
@@ -2142,6 +2145,7 @@ def main():
                     "pulled onto this frozen solo policy's (11-04)")
     ap.add_argument("--anchor-gate", default="near", choices=["near", "seen"], help="--anchor-solo: anchored where nothing is near "
                     "(SoloMix's 10 m corridor test) or where no prop / car is in the LiDAR's view at all ('seen', 11-05)")
+    ap.add_argument("--anchor-updates", type=int, default=0, help="--anchor-solo only for the first N updates; 0 = always (11-05)")
     ap.add_argument("--anchor-w", type=float, default=1.0, help="--anchor-solo: weight of the squared action distance")
     ap.add_argument("--speed-pow", type=float, default=1.0, help="progress paid per metre x (v / --speed-ref)^(p - 1); 1 = plain progress (11-04)")
     ap.add_argument("--speed-ref", type=float, default=5.0, help="[m/s] --speed-pow: the speed at which a metre pays 1")
