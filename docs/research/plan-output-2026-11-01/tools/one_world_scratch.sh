@@ -3,8 +3,8 @@
 # "틈만 나면 꼼수 쓰려고"). 이전 checkpoint 없이(--init 없음) 처음부터: 입력 = LiDAR 1081빔(전체 / obstacle에 맞은 빔 / 차에 맞은 빔, 가까운
 # obstacle 위치 입력 없음), policy 후진, 고정 obstacle, 네 경우 world 그대로. 학습률·충돌 값은 state_rl 기본값(lr 3e-4 -> 1e-4, 탐색 std 0.61,
 # 충돌 값 0에서 60 update 뒤 200 update 동안 80까지) = 10-29 처음부터 학습이 쓴 값. 평가는 EVAL_GPU에서(5060은 1081빔 학습으로 꽉 참).
-# 인자: 이름 학습GPU 평가GPU 환경수 시드 업데이트 지도(25|26) [EXTRA]
-NAME=$1; GPU=$2; EGPU=$3; ENVS=$4; S=$5; U=$6; MAPK=$7; PAR=0; EXTRA=$8; INIT=scratch
+# 인자: 이름 학습GPU 평가GPU 환경수 시드 업데이트 지도(25|26) [EXTRA] [평가 간격, 기본 50: EXTRA에 --save-every를 같게]
+NAME=$1; GPU=$2; EGPU=$3; ENVS=$4; S=$5; U=$6; MAPK=$7; PAR=0; EXTRA=$8; EVERY=${9:-50}; INIT=scratch
 if [ "$MAPK" = 26 ]; then M=real:korea_2026_competition; MC=real/korea26; else M=real:korea_2025_iccas; MC=real/iccas25; fi
 D=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out
 T=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/tools
@@ -30,7 +30,7 @@ evalc() {
   echo "  u${UU} 따라가기 0.8배: $(grep '+3 ~   +6\|-1 ~   +1' $D/follow_probe_${NAME}_u${UU}_x0.8.log | tr -s ' ' | tr '\n' ';')" >> $L
   echo done > $D/one_${NAME}_u${UU}.done
 }
-( for UU in $(seq 50 50 $U); do
+( for UU in $(seq $EVERY $EVERY $U); do
     until [ -e $R/${NAME}/state_u${UU}.pt ] || [ -e $D/one_${NAME}.done ]; do sleep 20; done
     [ -e $R/${NAME}/state_u${UU}.pt ] || break
     echo "  u${UU} solo: $(CUDA_VISIBLE_DEVICES=$EGPU timeout 900 python3 $T/console_laps.py $R/${NAME}/state_u${UU}.pt $MC 60 2>&1 | grep '주행' | cut -c1-200)" >> $L
