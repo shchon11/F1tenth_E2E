@@ -1668,6 +1668,20 @@ def train(a):
                 exe = clamp_any(act, a)
                 if anchor is not None:
                     a_s, g_s = anchor.solo(last_a)
+                    if a.anchor_gate == "seen":
+                        # `--anchor-gate seen` (11-05, the user: "장애물이나 상대차가 ego 라이다 포인트에 찍히는 순간부터는 정책
+                        # supervised를 안쓰게" + "벽 안쪽만 해당이여"): anchored only while no prop and no car is in the LiDAR's view
+                        # (`visible_props` / `visible_cars`: in the student's grid, in range, in line of sight -- a wall in front hides
+                        # it). The 10 m corridor gate also anchored states with props in view beside the corridor, so the solo target
+                        # taught 'ignore what you see' (srp25owa: 8-layout hard 9 -> 33 -> 18, 30-layout 41 -> 82 by u200)
+                        seen = torch.zeros(B, dtype=torch.bool, device=device)
+                        vp = visible_props(env, lid)
+                        if vp is not None:
+                            seen |= vp.any(1)
+                        vc = visible_cars(env, lid)
+                        if vc is not None:
+                            seen |= vc.any(1)
+                        g_s = seen
                     bsolo[t] = a_s; banch[t] = (~g_s).float()
                 if mix is not None:
                     exe = mix(exe, last_a); bm[t] = mix.gate.float()
@@ -2123,6 +2137,8 @@ def main():
                     "test without a solo policy); 1 = off (11-04)")
     ap.add_argument("--anchor-solo", default="", help="ONE network: where nothing is near (the --base test) its mean action is "
                     "pulled onto this frozen solo policy's (11-04)")
+    ap.add_argument("--anchor-gate", default="near", choices=["near", "seen"], help="--anchor-solo: anchored where nothing is near "
+                    "(SoloMix's 10 m corridor test) or where no prop / car is in the LiDAR's view at all ('seen', 11-05)")
     ap.add_argument("--anchor-w", type=float, default=1.0, help="--anchor-solo: weight of the squared action distance")
     ap.add_argument("--speed-pow", type=float, default=1.0, help="progress paid per metre x (v / --speed-ref)^(p - 1); 1 = plain progress (11-04)")
     ap.add_argument("--speed-ref", type=float, default=5.0, help="[m/s] --speed-pow: the speed at which a metre pays 1")
