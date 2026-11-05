@@ -1005,3 +1005,13 @@
   - 정답 오차: 1.12 -> 0.056 (28 update)
   - 정답 항이 걸리는 결정: 42~59 %
   - 판정: u200 30 layout hard <= 47, race 기준
+
+## 11-06 07:30 — LiDAR 1081빔 + 처음부터 학습: obstacle 충돌 1/9
+
+- 원인: actor의 LiDAR scan이 108빔(2.5° 간격)이었고(10-29 actor에 LiDAR가 없던 때의 학습 속도용 값을 그대로 씀), obstacle은 가까운 3개의 중심 위치만
+  받았음. 세게 부딪히기 0.25 s 전 plan이 상자를 그대로 지나감 21/22, 부딪힌 상자 20/22가 작은 상자, 부딪히기 전 1.4 s 동안 보였음(`tools/plan_vs_hit.py`).
+- 고침(사용자: "라이다 1081 그대로 안 주는 이유가 뭔데", "scratch에서"): `--beams 1081 --scan-points 1`(scan 세 줄: 전체 / obstacle에 맞은 빔 / 차에 맞은
+  빔, obstacle 위치 입력 없음), policy 후진(`--plan-reverse-ext 0.5`, MAP 자동 후진 끔), 이전 checkpoint 없이 처음부터(`tools/one_world_scratch.sh`),
+  학습률·충돌 값은 state_rl 기본값(충돌 값 0 -> 60 update 뒤 200 update 동안 80).
+- srp25sc4(4070, 평가 5060): u500 obstacle 배치 30개 세게 7번(이전 PPO만 u600 62번, 목표 47 이하 달성), 벽 세게 0번, 빈 트랙 한 바퀴 8.29 s
+  (이전 7.8-8.0 s, 목표 6.65 s 미달). 배치 8개 추이: u375-u550 obstacle 세게 1-4번(이전 16-22번). 추이 표 = `tools/trend_table.py`.
