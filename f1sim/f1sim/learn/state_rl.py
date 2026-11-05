@@ -60,7 +60,7 @@ def build_env(a, device, extra=None):
     if a.stage in ("props", "race"):
         e.update(procedural_obstacles=float(getattr(a, "prop_fraction", 1.0)), procedural_density=float(getattr(a, "prop_density", 1.5)),
                  procedural_max_props=int(getattr(a, "prop_max", 18)), procedural_count=str(getattr(a, "prop_count", "fixed") or "fixed"),
-                 procedural_raceline_corridor="off", movable_obstacles=True,
+                 procedural_raceline_corridor="off", movable_obstacles=bool(int(getattr(a, "prop_movable", 1))),
                  procedural_line_share=float(getattr(a, "prop_line", 0.0) or 0.0) if a.stage == "props" else 0.0,
                  procedural_place=str(getattr(a, "prop_place", "pattern") or "pattern"),
                  procedural_bank=str(getattr(a, "prop_bank", "") or ""))
@@ -2135,6 +2135,9 @@ def main():
     ap.add_argument("--critic-warmup", type=int, default=0, help="the first N updates train the critic only (actor grads dropped, 11-05)")
     ap.add_argument("--calm-std", type=float, default=1.0, help="exploration std x this where nothing is near (CalmGate: the --base "
                     "test without a solo policy); 1 = off (11-04)")
+    ap.add_argument("--prop-movable", type=int, default=1, help="1: props can be shoved (their STYLE_MASS); 0: every prop as fixed as "
+                    "a wall (11-05, the user: '장애물이 거의 밀리지 않은 상자로' -- a shove still made progress, so PPO pushed crates "
+                    "aside instead of driving round them)")
     ap.add_argument("--anchor-solo", default="", help="ONE network: where nothing is near (the --base test) its mean action is "
                     "pulled onto this frozen solo policy's (11-04)")
     ap.add_argument("--anchor-gate", default="near", choices=["near", "seen"], help="--anchor-solo: anchored where nothing is near "
