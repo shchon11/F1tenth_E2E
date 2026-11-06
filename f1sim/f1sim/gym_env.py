@@ -241,6 +241,11 @@ class EnvConfig:
     #: real car nothing sets the contact they read, and in the sim they backed 0.6 m out and the plan drove straight back in
     #: (srp26owp u550 layout 2: 35 s on one fixed crate). a in [-1, 1] keeps exactly the forward map. 0 = as before.
     plan_reverse_ext: float = 0.0
+    #: The learner's plan format under the MAP follower (2026-11-06, the user: "t=n 까지의 waypoint 모음으로 만드는게
+    #: 정석 아잉교?", no MPC): "" = the env's speed_mode as always; "tw4" = time waypoints (`plan_tw`), the same 8 numbers
+    #: read as K curvatures + K signed speeds over 0.375 s segments, forward runs to MAP and backward runs to a pure
+    #: pursuit. Only the learner's rows: the traffic and the inner tracker keep `speed_mode`.
+    learner_plan: str = ""
     max_steps: int = 1600            # 40 s at 40 Hz
     # Give each race's FIRST episode after `reset()` a random length in [1, max_steps] instead of
     # max_steps; every later episode is full length. Under `collision_mode="soft"` nothing
@@ -3025,7 +3030,8 @@ class F1VecEnv:
                 # `acc_now`), and follows the plans of the policy's own cars
                 self.tracker.P = self.sim.P
                 self.tracker.map_rows = self.learner
-                self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0
+                self.tracker.tw = self.ecfg.learner_plan == "tw4"
+                self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0 and not self.tracker.tw
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
                     self.tracker.push_imu(lr.imu[:, :, 3])
             K = int(self.ecfg.decision_every)
@@ -4775,6 +4781,13 @@ class F1VecEnv:
         """Env i's current plan (or the tracker's predicted motion) as world (K,3) x, y, speed for viewers."""
         if self.tracker is None or self.tracker.last_ref is None:
             return None
+        tw = getattr(self.tracker, "tw_plan", None) if getattr(self.tracker, "tw", False) else None
+        if tw is not None and bool(self.learner[i]) and not predicted:
+            # a time-waypoint plan (`plan_tw`): its whole 1.5 s, backward stretches included, x / y / signed speed
+            ref = tw[i].cpu().numpy()
+            x, y, yaw = (self._plan_pose[i] if self._plan_pose is not None else self.sim.state[i, :3]).tolist()
+            c, s_ = math.cos(yaw), math.sin(yaw)
+            return np.stack([x + ref[:, 0] * c - ref[:, 1] * s_, y + ref[:, 0] * s_ + ref[:, 1] * c, ref[:, 3]], 1)
         src = self.tracker.last_pred if predicted else self.tracker.last_ref
         if src is None:
             return None

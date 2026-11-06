@@ -82,8 +82,11 @@ def describe(ck: dict, kind: str, path: str) -> str:
     run = os.path.basename(os.path.dirname(os.path.realpath(path)))
     name = os.path.basename(os.path.realpath(path))
     a = ck.get("args") or {}
-    out = (f"궤적(경로점 4 x 곡률·속도, {float(a.get('plan_horizon', 0.6)):.1f} s) -> MAP, {40 // max(1, int(a.get('repeat', 2)))} Hz"
-           if is_plan(ck) else "직접 행동 20 Hz")
+    if is_plan(ck) and str(a.get("plan_format", "wp4") or "wp4") == "tw4":
+        out = f"궤적(시간 waypoint 4 x 0.375 s, 전진·후진) -> MAP·후진 추종, {40 // max(1, int(a.get('repeat', 2)))} Hz"
+    else:
+        out = (f"궤적(경로점 4 x 곡률·속도, {float(a.get('plan_horizon', 0.6)):.1f} s) -> MAP, {40 // max(1, int(a.get('repeat', 2)))} Hz"
+               if is_plan(ck) else "직접 행동 20 Hz")
     if kind == "teacher":
         base = " + 혼자 선생 혼합" if a.get("base") else ""
         return f"참 상태 선생(오라클){base}: {run}/{name} · {out}"

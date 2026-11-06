@@ -918,6 +918,7 @@ class TeacherPolicy:
 
     def __init__(self, env, ck, device, t_beams=0):
         ar = ck["args"]
+        self.env = env
         self.ck, self.ext = ck, float(ar.get("reverse_ext", 0.0) or 0.0)
         self.ar, self.A = ar, act_dim_of(ar)
         self.sobs = StateObs(env, scan=bool(ar.get("scan_obs", 0)), corridor=bool(ar.get("corridor_obs", 0)),
@@ -945,6 +946,15 @@ class TeacherPolicy:
         if k_ > 0:
             nn_ = self.nrm(o)
             d_ = self.net.dist(nn_)
+            se_ = os.environ.get("F1SIM_SLOW_EXPLORE")
+            if se_:
+                # F1SIM_SLOW_EXPLORE=V0,STEER,SPEED (a diagnostic, 11-06): the distribution `--slow-explore` trained with --
+                # does a stop the mean holds after a hard hit go when the slow-speed floor's noise is on?
+                v0_, fk_, fs_ = (float(x) for x in se_.split(","))
+                s_ = (v0_ / self.env.sim.state[self.env.learner_ids, 3].float().abs().clamp_min(1e-3)).square().clamp(max=1.0)
+                fl_ = torch.cat([fk_ * s_[:, None].expand(-1, PLAN_KAPPA_DIMS),
+                                 fs_ * s_[:, None].expand(-1, self.A - PLAN_KAPPA_DIMS)], 1)
+                d_ = torch.distributions.Normal(d_.mean, torch.maximum(d_.stddev, fl_))
             # F1SIM_POLICY_NOISE_CORR=c: AR(1) noise held across decisions, as --noise-corr trains with
             c_ = float(os.environ.get("F1SIM_POLICY_NOISE_CORR", "0") or 0)
             e_ = torch.randn_like(d_.mean)
@@ -1316,10 +1326,15 @@ def plan_env_fields(ar) -> dict:
     if not plan_of(ar):
         return {}
     a = _ar(ar)
+    tw = str(a.get("plan_format", "wp4") or "wp4") == "tw4"
+    # tw4: MAP commands the speed of the segment the car is in. A speed lookahead reads the waypoint array 0.235 s of the
+    # measured speed ahead -- past a slow first segment (0.1 m/s x 0.375 s is 4 cm) into the next one's speed: the
+    # tracking test drove at 5-6 m/s on plans that said 0.1 (11-06)
     return dict(action_mode="plan", speed_mode="wp4", speed_command="tracker", plan_follower="map",
-                plan_follower_map=dict(PLAN_MAP, speed_lookahead=float(a.get("plan_lookahead", 0.235))),
+                plan_follower_map=dict(PLAN_MAP, speed_lookahead=0.0 if tw else float(a.get("plan_lookahead", 0.235))),
                 decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0,
-                plan_reverse_ext=float(a.get("plan_reverse_ext", 0.0) or 0.0))
+                plan_reverse_ext=float(a.get("plan_reverse_ext", 0.0) or 0.0),
+                learner_plan="tw4" if str(a.get("plan_format", "wp4") or "wp4") == "tw4" else "")
 
 
 def soft_bound(z, lo, hi, m):
@@ -1571,6 +1586,9 @@ def train(a):
         raise SystemExit(f"the env's action is {env.act_dim}-wide, this run's {A}")
     if float(a.plan_relabel) > 0 and not plan_of(a):
         raise SystemExit("--plan-relabel relabels wp4 plans: it needs --action plan")
+    if str(getattr(a, "plan_format", "wp4")) == "tw4" and (float(a.plan_relabel) > 0 or float(a.plan_reverse_ext) > 0):
+        raise SystemExit("--plan-format tw4: no --plan-relabel (it relabels wp4 geometry) and no --plan-reverse-ext (tw4 "
+                         "plans reverse in their own speeds)")
     last_a = torch.zeros(B, A, device=device)
     o = obs_fn(last_a)
     D = obs_fn.dim
@@ -1754,7 +1772,8 @@ def train(a):
         bsolo = torch.zeros(T, B, A, device=device) if anchor is not None else None    # `--anchor-solo`: its action
         banch = torch.zeros(T, B, device=device)                                    # 1 = nothing near: anchored
         bscale = torch.ones(T, B, device=device)                                    # `--calm-std`: the std factor used
-        blv = torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
+        bfl = torch.zeros(T, B, A, device=device) if a.slow_explore else None        # `--slow-explore`: the std floor used
+        blv =torch.full((T, B), -1, dtype=torch.long, device=device) if env.level_replay is not None else None
         prog = hits_w = hits_c = prop_s = push_s = 0.0; laps = []; dev_sum = dev_n = 0.0; n_gain = n_lost = n_void = 0.0
         relabel = float(getattr(a, "plan_relabel", 0.0) or 0.0) > 0
         if relabel:                                              # `--plan-relabel`: the path each plan was followed by
@@ -1770,6 +1789,17 @@ def train(a):
                 if calm is not None:
                     bscale[t] = torch.where(calm.step(), torch.ones(B, device=device), torch.full((B,), float(a.calm_std), device=device))
                     dist = torch.distributions.Normal(dist.mean, dist.stddev * bscale[t][:, None])
+                if bfl is not None:
+                    # `--slow-explore V0 STEER SPEED` (11-06): a std floor that lives where the car is slow. A flat floor of 0.2
+                    # (srp25exp) is 0.32 1/m of curvature at any speed -- 8 m/s^2 of lateral noise at 5 m/s -- and took the
+                    # training from ~5 to 80 hard hits per km; a stopped car needs the whole range to find a way round a box
+                    # (about 0.4 of steer held ~0.5 s, ~10 sigma of the collapsed 0.04). The floor scales as (V0 / v)^2, a
+                    # fixed lateral acceleration like `kappa_mode feasible`: full below V0, a quarter at 2 V0
+                    v0_, fk_, fs_ = (float(x) for x in a.slow_explore)
+                    s_ = (v0_ / env.sim.state[lid, 3].float().abs().clamp_min(1e-3)).square().clamp(max=1.0)
+                    bfl[t, :, :PLAN_KAPPA_DIMS] = fk_ * s_[:, None]
+                    bfl[t, :, PLAN_KAPPA_DIMS:] = fs_ * s_[:, None]
+                    dist = torch.distributions.Normal(dist.mean, torch.maximum(dist.stddev, bfl[t]))
                 if float(a.noise_corr) > 0:
                     # temporally correlated exploration (AR(1), marginal N(0, 1)): white noise at 20 Hz averages out within
                     # a second, so a sampled deviation never becomes a maneuver (brake 0.3 s earlier, hold a gap, move the
@@ -1993,6 +2023,7 @@ def train(a):
         if anchor is not None:
             f_solo, f_anch = bsolo.reshape(N, A), banch.reshape(N)
         f_scale = bscale.reshape(N)
+        f_floor = bfl.reshape(N, A) if bfl is not None else None
         anch_mse = []
         mb = N // int(a.minibatches)
         kls, cfs = [], []
@@ -2005,6 +2036,8 @@ def train(a):
                 dist = model.dist(fo_j)
                 if calm is not None:
                     dist = torch.distributions.Normal(dist.mean, dist.stddev * f_scale[j][:, None])
+                if bfl is not None:
+                    dist = torch.distributions.Normal(dist.mean, torch.maximum(dist.stddev, f_floor[j]))
                 lp = dist.log_prob(fa[j]).sum(1)
                 ratio = (lp - flp[j]).exp()
                 m_j = fm[j]
@@ -2300,6 +2333,11 @@ def main():
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
     ap.add_argument("--critic-warmup", type=int, default=0, help="the first N updates train the critic only (actor grads dropped, 11-05)")
+    ap.add_argument("--plan-format", default="wp4", choices=("wp4", "tw4"),
+                    help="the plan's 8 numbers: wp4 = 4 curvature + 4 speed knots over 0.6 s of the measured speed; tw4 = time "
+                         "waypoints (plan_tw): 4 x 0.375 s segments of curvature and signed speed, reverse and forward in one plan")
+    ap.add_argument("--slow-explore", type=float, nargs=3, default=None, metavar=("V0", "STEER", "SPEED"),
+                    help="exploration std floor for the plan's curvatures / speeds, full below V0 m/s and x (V0/v)^2 above")
     ap.add_argument("--calm-std", type=float, default=1.0, help="exploration std x this where nothing is near (CalmGate: the --base "
                     "test without a solo policy); 1 = off (11-04)")
     ap.add_argument("--prop-movable", type=int, default=1, help="1: props can be shoved (their STYLE_MASS); 0: every prop as fixed as "

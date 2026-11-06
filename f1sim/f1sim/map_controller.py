@@ -554,12 +554,20 @@ class MAPPlanTracker:
         #: the follower's own back-out rules for `map_rows` (the stalled-and-touching reverse, `PlanSpec.wedge_s`); the env
         #: turns them off when the policy reverses itself (`EnvConfig.plan_reverse_ext`, 11-05)
         self.auto_backout = True
+        #: `map_rows` plan in time waypoints (`plan_tw`, `EnvConfig.learner_plan` "tw4", 11-06): forward runs to MAP,
+        #: backward runs to `plan_tw.pursue_back`; `tw_plan` (B, n, 5) is each row's whole plan for the viewers and
+        #: `_held_tw` the direction / run length of a held plan
+        self.tw = False
+        self.tw_plan = None
+        self._held_tw = None
+        self.wheelbase = float(nominal.get("lf", 0.15875)) + float(nominal.get("lr", 0.17145))
 
     def __getattr__(self, name):                       # spec, last_ref, u_seq, hooks, ... are the inner's
         return getattr(self.__dict__["_inner"], name)
 
     def __setattr__(self, name, value):
-        if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout"):
+        if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
+                    "tw", "tw_plan", "_held_tw", "wheelbase"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._inner, name, value)
@@ -626,7 +634,15 @@ class MAPPlanTracker:
             return out
         B = action.shape[0]
         dev = action.device
-        path, pv, pk = self.waypoints(action, v_meas, speed_cap)
+        if self.tw:
+            from . import plan_tw
+            k_tw, v_tw = plan_tw.decode(action)
+            n_tw = int(math.ceil((plan_tw.TW_K * plan_tw.TW_DT * plan_tw.V_FWD + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
+            path, pv, pk, d_tw, tot_tw = plan_tw.run_path(k_tw, v_tw, PLAN_WP_SPACING, n_tw)
+            v1_tw = torch.where(v_tw[:, 0].abs() < plan_tw.V_STOP, torch.zeros_like(v_tw[:, 0]), v_tw[:, 0])
+            self.tw_plan = plan_tw.dense(k_tw, v_tw)
+        else:
+            path, pv, pk = self.waypoints(action, v_meas, speed_cap)
         zeros = torch.zeros(B, device=dev, dtype=action.dtype)
         pos, yaw = torch.zeros(B, 2, device=dev, dtype=action.dtype), zeros
         if self.pose_now is not None:
@@ -638,9 +654,15 @@ class MAPPlanTracker:
             h = self.hold_rows if (self.hold_rows is not None and self._held is not None) else None
             if h is not None:
                 hp, hv, hk, h0 = self._held
+                if hp.shape != path.shape:                     # the format changed under a held plan: drop the hold
+                    h = torch.zeros_like(h)
                 path = torch.where(h[:, None, None], hp, path)
                 pv = torch.where(h[:, None], hv, pv)
                 pk = torch.where(h[:, None], hk, pk)
+                if self.tw and self._held_tw is not None:
+                    d_tw = torch.where(h, self._held_tw[0], d_tw)
+                    tot_tw = torch.where(h, self._held_tw[1], tot_tw)
+                    v1_tw = torch.where(h, self._held_tw[2], v1_tw)
                 d = pose[:, :2] - h0[:, :2]
                 c, s = torch.cos(h0[:, 2]), torch.sin(h0[:, 2])
                 rel = torch.stack([c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]], 1)
@@ -649,6 +671,8 @@ class MAPPlanTracker:
                 yaw = torch.where(h, dyaw, yaw)
                 pose = torch.where(h[:, None], h0, pose)
             self._held = (path, pv, pk, pose)
+            if self.tw:
+                self._held_tw = (d_tw, tot_tw, v1_tw)
         dly = None
         if delay is not None:
             dly = delay if torch.is_tensor(delay) else torch.full((B,), float(delay), device=dev)
@@ -656,6 +680,29 @@ class MAPPlanTracker:
                                 torch.full((B,), PLAN_WP_SPACING, device=dev), zeros, grip_index(self.P, self.nominal),
                                 yaw_rate=yaw_rate, delay=dly if self.map.p.delay_comp < 0 else None)
         speed = torch.minimum(speed, speed_cap)
+        if self.tw:
+            # The speed is the first segment's, whatever MAP read off the array: a plan is re-issued every 0.05 s, inside
+            # its first 0.375 s segment, while MAP's nearest waypoint (in metres) passes a short slow first segment within
+            # a step or two -- held one control step, a 0.1 m/s segment is 4 cm long and MAP drove the next segment's speed
+            # (the tracking test, 11-06: 1-5 m/s commanded on plans that said 0.1)
+            speed = torch.minimum(v1_tw, speed_cap)
+            # a backward first run: pure pursuit to the point 0.6 m (or 0.5 s) back along it
+            from . import plan_tw
+            back = d_tw < 0
+            if bool(back.any()):
+                ar_ = torch.arange(B, device=dev)
+                near = ((path - pos[:, None, :]) ** 2).sum(-1).argmin(1)
+                la = torch.clamp(0.5 * v_meas.abs(), min=0.6)
+                j = torch.minimum(near + (la / PLAN_WP_SPACING).round().long(),
+                                  (tot_tw / PLAN_WP_SPACING).round().long().clamp(1, path.shape[1] - 1))
+                j = torch.maximum(j, near + 1).clamp(max=path.shape[1] - 1)
+                tgt = path[ar_, j] - pos
+                c_, s_ = torch.cos(yaw), torch.sin(yaw)
+                rel = torch.stack([c_ * tgt[:, 0] + s_ * tgt[:, 1], -s_ * tgt[:, 0] + c_ * tgt[:, 1]], 1)
+                kap_b = 2.0 * rel[:, 1] / (rel ** 2).sum(1).clamp_min(1e-6)
+                st_b = torch.atan(kap_b * self.wheelbase).clamp(-self._inner.s_max, self._inner.s_max)
+                steer = torch.where(back, st_b, steer)
+            self.map.curr_steer = torch.where(back, steer, self.map.curr_steer)
         sp = self._inner.spec
         if self.auto_backout:
             # stopped, asking to stay stopped, and touching something: back out, as the tracker does
