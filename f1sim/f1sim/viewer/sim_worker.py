@@ -298,8 +298,9 @@ PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "
                        "procedural_raceline_corridor": "off", "procedural_raceline_margin": 0.25,
                        "spawn_runway": 3.0, "movable_obstacles": False, "procedural_line_share": 0.3,
                        "procedural_place": "uniform",
-                       # F1SIM_PROP_BANK (11-06): another bank dir, e.g. prop_banks_box (box-sized pieces only)
-                       "procedural_bank": os.environ.get("F1SIM_PROP_BANK", "/home/shchon11/f1sim_runs/prop_banks")}
+                       # box-sized pieces only since 11-06 (the user: "장애물 크기 좀 박스크기로"); F1SIM_PROP_BANK picks another
+                       # bank dir, e.g. /home/shchon11/f1sim_runs/prop_banks (every catalogue piece, before 11-06)
+                       "procedural_bank": os.environ.get("F1SIM_PROP_BANK", "/home/shchon11/f1sim_runs/prop_banks_box")}
 
 #: 장애물 "학습과 같음" with more than one car: the other cars of the race, as the runs since s911
 #: drove them (`--opp-slots`). Not a preference -- with the corridor off there are crates on the
