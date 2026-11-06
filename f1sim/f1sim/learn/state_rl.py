@@ -64,7 +64,8 @@ def build_env(a, device, extra=None):
                  procedural_line_share=float(getattr(a, "prop_line", 0.0) or 0.0) if a.stage == "props" else 0.0,
                  procedural_place=str(getattr(a, "prop_place", "pattern") or "pattern"),
                  procedural_bank=str(getattr(a, "prop_bank", "") or ""),
-                 procedural_shapes=str(getattr(a, "prop_shapes", "all") or "all"))
+                 procedural_shapes=str(getattr(a, "prop_shapes", "all") or "all"),
+                 spawn_behind_prop=float(getattr(a, "spawn_behind_prop", 0.0) or 0.0))
     if a.stage == "race":
         # the competition's format: 1 vs 1, the four planner kinds at 0.7-1.05 of their pace, reacting and with events
         # (the training world's slot without the league: league entries read a full scan, this env casts --beams)
@@ -2231,6 +2232,8 @@ def main():
     ap.add_argument("--prop-count", default="fixed", choices=("fixed", "uniform"),
                     help="patterns per layout: all of the lap's (fixed) or 1 .. all, uniform (11-03: fixed = always dense)")
     ap.add_argument("--prop-max", type=int, default=18, help="props / stages: procedural_max_props")
+    ap.add_argument("--spawn-behind-prop", type=float, default=0.0,
+                    help="share of the learner's resets that start 0.65-1.6 m behind an obstacle of its layout (11-06)")
     ap.add_argument("--prop-shapes", default="all", choices=("all", "boxes"),
                     help="the obstacle pieces: all catalogue pieces, or box-sized ones only (11-06; a bank keeps what it was made with)")
     ap.add_argument("--scan-obs", type=int, default=0, help="1: append the noise-free scan (--beams beams) to the observation")

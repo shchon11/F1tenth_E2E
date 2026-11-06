@@ -496,6 +496,13 @@ class EnvConfig:
     # that puts something worth avoiding directly in front of a spawn.
     spawn_runway: float = 0.0
     spawn_speed_max: float = 3.0     # random initial speed in [0, this]
+    #: Share of a learner's resets that start just behind an obstacle (2026-11-06, the user: "장애물 거의 뒤에 스폰되도록도
+    #: 하면 좋을 듯"): after the layout is drawn, the car is set 0.65-1.6 m of arc behind a random live piece of its own
+    #: layout (front 0.15-1.15 m short of it), at the piece's lateral offset +-0.15 m, along the lane, at 0-1 m/s --
+    #: when that pose is clear of the walls (EDT 0.35 m), of every other piece and of the other cars (1.5 m); otherwise
+    #: the ordinary spawn stands. A stuck car (nose on a box) was 0.3 % of the obstacle time in the training world and
+    #: the policy never learned to back out and go round. 0 = off.
+    spawn_behind_prop: float = 0.0
     resample_track_on_reset: bool = True   # multi-track sets: pick a random track for each new episode
     scan_stride: int = 1             # frames between stacked scans (3 x stride 3 = 225 ms of history: velocity cues)
     hist_len: int = 0                # >0: proprioceptive history rows (speed, imu, roll/pitch, action) in the observation
@@ -2458,6 +2465,8 @@ class F1VecEnv:
         poses = self.sim.sample_spawn(n, e.spawn_lateral_std, yaw_std, s=s, tid=self.sim.tid[ids],
                                       min_clearance=min_clear, lat=lat, eid=ids, **race_kw)
         speed = torch.rand(n, device=self.device, generator=gen) * e.spawn_speed_max
+        if float(e.spawn_behind_prop) > 0 and self.procedural is not None and self.procedural.C > 0:
+            poses, speed = self._spawn_behind_prop(ids, poses, speed, gen)
         if self._replay is not None and self.M == 2:
             poses, speed, replayed = self._replay.apply(self, ids, poses, speed, gen)
             abreast_rows = abreast_rows & ~replayed          # a recorded scene, not a grid
@@ -4530,6 +4539,47 @@ class F1VecEnv:
     def _tracker_plan_speed(self) -> torch.Tensor:
         """The incoming SI odometry sample shared by teacher geometry and the plan decoder."""
         return self.last_result.odom[:, 3] if self.last_result is not None else self.sim.state[:, 3]
+
+    def _spawn_behind_prop(self, ids, poses, speed, gen):
+        """`EnvConfig.spawn_behind_prop`: (poses, speed) with some learner rows moved just behind a piece of their layout."""
+        po, dev = self.procedural, self.device
+        n = int(ids.numel())
+        pick = self.learner[ids] & (torch.rand(n, device=dev, generator=gen) < float(self.ecfg.spawn_behind_prop))
+        if not bool(pick.any()):
+            return poses, speed
+        r = torch.nonzero(pick, as_tuple=True)[0]
+        eid = ids[r]; tid = self.sim.tid[eid]; k = int(r.numel())
+        live = po.p_sid[eid] >= 0                                                # (k, C)
+        has = live.any(1)
+        j = torch.multinomial(live.float() + (~has).float()[:, None], 1, generator=gen)[:, 0]
+        pp = po.p_poses[eid, j]                                                  # (k, 3)
+        sp, lp, _ = self.sim.track.project(pp[:, :2], tid)
+        rnd = torch.rand(k, 4, device=dev, generator=gen)
+        L = self.sim.track.length[tid]
+        sc = torch.remainder(sp - (0.65 + 0.95 * rnd[:, 0]), L)
+        xy0, yaw0 = self.sim.track.pose_at_s(sc, tid)
+        lat = lp + (rnd[:, 1] - 0.5) * 0.3
+        xy = xy0 + torch.stack([-torch.sin(yaw0), torch.cos(yaw0)], 1) * lat[:, None]
+        yaw = yaw0 + (rnd[:, 2] - 0.5) * 0.2
+        ok = has & (self.sim.track.sample_edt(xy, tid) >= 0.35)
+        dd = po.p_d[eid]
+        rad = torch.where(torch.isfinite(dd), dd, torch.zeros_like(dd)).amax(-1)  # (k, C)
+        dist = (po.p_poses[eid][..., :2] - xy[:, None, :]).norm(dim=-1)
+        others = live & (torch.arange(po.C, device=dev)[None, :] != j[:, None])
+        ok = ok & ~((dist < 0.38 + rad) & others).any(1)
+        if self.M > 1:
+            pos_b = self.sim.state[:, :2].clone()
+            pos_b[ids] = poses[:, :2].to(pos_b.dtype)
+            op = pos_b[self.sim.other_idx[eid]]                                  # (k, M-1, 2)
+            ok = ok & ((op - xy[:, None, :]).norm(dim=-1) > 1.5).all(1)
+        if not bool(ok.any()):
+            return poses, speed
+        poses = poses.clone(); speed = speed.clone()
+        rr = r[ok]
+        poses[rr] = torch.cat([xy[ok], yaw[ok][:, None]], 1).to(poses.dtype)
+        speed[rr] = rnd[ok, 3].to(speed.dtype)
+        self.behind_prop_spawns = getattr(self, "behind_prop_spawns", 0) + int(rr.numel())
+        return poses, speed
 
     def _plan_v1_dim(self) -> int:
         """the action column of the plan's first speed (`EnvConfig.plan_reverse_ext` reaches below -1 there)"""
