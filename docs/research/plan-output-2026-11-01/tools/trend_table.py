@@ -18,6 +18,9 @@ def table(run, start):
         if m:
             r = rows.setdefault(int(m.group(1)), {})
             r["hard"], r["touch"], r["bad"], r["whard"] = int(m.group(5)), int(m.group(4)), int(m.group(2)), int(m.group(3))
+            m2 = re.search(r"멈춰 있던 시간 (\d+) s / (\d+) s, 5 s 넘게 멈춘 배치 (\d+)/8 \| 완주한 랩 (\d+)", l)
+            if m2:
+                r["stop"], r["stopall"], r["stoplay"], r["laps"] = int(m2.group(1)), int(m2.group(2)), int(m2.group(3)), int(m2.group(4))
         m = re.search(r"u(\d+) obstacle 30 layout: .*접촉 난 배치 (\d+)/30 \| 벽 \d+\(세게 (\d+)\) 장애물 \d+\(세게 (\d+)\)", l)
         if m:
             extra.append(f"u{m.group(1)} 30 layout: obstacle 세게 {m.group(4)}번, 벽 세게 {m.group(3)}번, 부딪힌 layout {m.group(2)}/30")
@@ -33,15 +36,16 @@ def table(run, start):
         price = None
     out = ["빈 트랙 한 바퀴 = obstacle·상대 없이 60 s 달린 랩 시간의 중간값. 나머지 칸 = obstacle 배치 8개(늘 같은 8개)를 40 s씩 "
            "달리며 센 횟수. 세게 = 부딪히는 방향 속도 1 m/s 이상. 그때 벌점 = 그 checkpoint를 학습할 때 세게 부딪힐 때마다 받던 벌점.", "",
-           "| checkpoint | 그때 벌점 | 빈 트랙 한 바퀴 | obstacle에 세게 부딪힘 | 벽에 세게 부딪힘 | obstacle에 닿음 (가볍게 포함) | 부딪힌 배치 (8개 중) |",
-           "|---|---|---|---|---|---|---|"]
+           "| checkpoint | 그때 벌점 | 빈 트랙 한 바퀴 | obstacle에 세게 부딪힘 | 벽에 세게 부딪힘 | obstacle에 닿음 (가볍게 포함) | 부딪힌 배치 (8개 중) | 멈춰 있던 시간 | 완주한 랩 (8개 배치 합) |",
+           "|---|---|---|---|---|---|---|---|---|"]
     if lap0 != "-":
-        out.append(f"| 시작점 | - | {lap0} s | {h0} | - | {t0} | {b0} |")
+        out.append(f"| 시작점 | - | {lap0} s | {h0} | - | {t0} | {b0} | - | - |")
     for u in sorted(rows):
         r = rows[u]
         lap = f"{r['lap']:.2f} s" if "lap" in r else "-"
         pz = f"{price(u):.0f}" if price else "-"
-        out.append(f"| u{u} | {pz} | {lap} | {r.get('hard', '-')} | {r.get('whard', '-')} | {r.get('touch', '-')} | {r.get('bad', '-')} |")
+        stop = f"{r['stop']} / {r['stopall']} s ({r['stoplay']}개 배치)" if "stop" in r else "-"
+        out.append(f"| u{u} | {pz} | {lap} | {r.get('hard', '-')} | {r.get('whard', '-')} | {r.get('touch', '-')} | {r.get('bad', '-')} | {stop} | {r.get('laps', '-')} |")
     return "\n".join(out) + ("\n\n" + "\n".join("- " + e for e in extra) if extra else "")
 
 

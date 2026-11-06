@@ -93,6 +93,7 @@ def picture(L, props0, props1, xs, ys, vs, plans, hits, png):
 
 
 tot = np.zeros(3, int); toth = np.zeros(3, int); bad = 0; t_all = time.time()
+stuck_tot, laps_tot, stopped_lay = 0.0, 0, 0          # 11-06: the stopped time too (a car standing in front of a box has no contact)
 for L in range(n_lay):
     if L > 0:
         s["obs"], _ = env.reset()                          # what the console's 리셋 does (CMD_RESET)
@@ -132,8 +133,10 @@ for L in range(n_lay):
         png = f"{head}_L{L}.png"
         picture(L, props0, footprints(), np.asarray(xs), np.asarray(ys), vs_a, plans, hits, png)
         flag = f" | 그림 {png}"
+    stuck_tot += stuck; laps_tot += len(laps); stopped_lay += int(stuck >= 5.0)
     print(f"배치 {L}: 장애물 {len(props0)}개 | 랩 {laps} | 평균 속도 {vs_a.mean():.2f} | 접촉 벽 {c[0]}(세게 {ch[0]}) 장애물 {c[1]}(세게 {ch[1]}) "
           f"| 멈춤 {stuck:.1f} s{flag}", flush=True)
 km = 0.0
 print(f"합계 {n_lay}배치 x {secs:.0f} s ({time.time() - t_all:.0f} s 걸림): 접촉 난 배치 {bad}/{n_lay} | 벽 {tot[0]}(세게 {toth[0]}) "
-      f"장애물 {tot[1]}(세게 {toth[1]})", flush=True)
+      f"장애물 {tot[1]}(세게 {toth[1]}) | 멈춰 있던 시간 {stuck_tot:.0f} s / {n_lay * (secs - 3):.0f} s, 5 s 넘게 멈춘 배치 {stopped_lay}/{n_lay} | "
+      f"완주한 랩 {laps_tot}", flush=True)

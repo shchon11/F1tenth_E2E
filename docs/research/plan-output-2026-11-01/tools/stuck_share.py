@@ -1,4 +1,5 @@
-"""학습 world에서 상자에 걸려 서 있는 시간 (11-05 22:40). 장면: 고정 상자(--prop-movable 0, 16:42부터)에 앞이 닿으면 후진 action이
+"""학습 world에서 서 있는 시간 (11-06 12:30 추가: 상자와 거리 상관없이 0.3 m/s 아래로 2 s 넘게 서 있는 시간, 깔린 상자 수별 -- 콘솔에서 상자 앞
+1~2 m에 멈춰 끝까지 서 있는 장면은 '상자 중심 0.8 m 안' 조건에 안 잡혔음). 원래 설명: 학습 world에서 상자에 걸려 서 있는 시간 (11-05 22:40). 장면: 고정 상자(--prop-movable 0, 16:42부터)에 앞이 닿으면 후진 action이
 없고(v_min 0) 멈춘 차는 MAP로 돌지 못해 그 episode 끝까지 갇힘(srp26owp u550 layout 2: 35 s, srp25owp u350 layout 6: 25 s 동안 6번).
 체크포인트를 그 학습과 똑같은 world(args 그대로)에서 학습 때처럼 탐색 noise로 몰고, 결정마다 '상자 옆에 서 있음'(속도 < 0.3 m/s, 가장
 가까운 상자 중심 0.8 m 안)을 셈. 미리 정한 판정: obstacle이 깔린 시간 중 그 몫이 10 % 이상이면 갇힘이 학습을 크게 갉아먹는 것 -> 갇히면
@@ -30,6 +31,8 @@ R = int(a.repeat); dt = env.sim.control_dt
 po = env.procedural
 t_props = t_stuck = t_all = 0.0
 run = torch.zeros(B, device=dev)                  # how long each car has stood beside a prop [s]
+srun = torch.zeros(B, device=dev)                 # how long each car has stood anywhere [s]
+t_bin = [0.0, 0.0, 0.0]; s_bin = [0.0, 0.0, 0.0]   # time / time stood > 2 s, by live props: none, 1-8, 9+
 t_long = 0.0                                      # time inside stands longer than 2 s
 hits = hits_stuck = 0
 for t in range(int(secs / dt) // R):
@@ -50,6 +53,13 @@ for t in range(int(secs / dt) // R):
                          torch.full(live.shape, 99.0, device=dev)).amin(1)
         stuck = has & (st[:, 3].abs() < 0.3) & (dp < 0.8)
         run = torch.where(stuck, run + dt, torch.zeros_like(run))
+        slow = st[:, 3].abs() < 0.3
+        srun = torch.where(slow, srun + dt, torch.zeros_like(srun))
+        nlive = live.sum(1)
+        for bi, (lo, hi) in enumerate(((0, 1), (1, 9), (9, 99))):
+            m = (nlive >= lo) & (nlive < hi)
+            t_bin[bi] += float(m.sum()) * dt
+            s_bin[bi] += float((m & (srun > 2.0)).sum()) * dt
         t_all += B * dt
         t_props += float(has.sum()) * dt
         t_stuck += float(stuck.sum()) * dt
@@ -62,3 +72,6 @@ name = f"{os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}"
 print(f"{name}: obstacle 깔린 시간 {t_props / t_all * 100:.0f} % | 그중 상자 옆에 서 있음 {t_stuck / max(t_props, 1e-9) * 100:.1f} % "
       f"(2 s 넘게 이어진 것 {t_long / max(t_props, 1e-9) * 100:.1f} %) | 상자에 세게 부딪힘 {hits}번, 그중 거의 선 채(0.5 m/s 미만) {hits_stuck}번",
       flush=True)
+print("  어디서든 2 s 넘게 서 있던 시간 비율(깔린 상자 수별): " + " | ".join(
+    f"{lab} {s_bin[i] / max(t_bin[i], 1e-9) * 100:.1f} % (시간 몫 {t_bin[i] / max(sum(t_bin), 1e-9) * 100:.0f} %)"
+    for i, lab in enumerate(("상자 없음", "상자 1~8개", "상자 9개 이상"))), flush=True)

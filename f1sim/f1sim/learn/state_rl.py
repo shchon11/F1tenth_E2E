@@ -1839,6 +1839,13 @@ def train(a):
                     pch = ptch * (env.sim.state[lid, 3].abs() < ptv).float() if ptv > 0 else ptch
                     if ptp > 0:
                         step_r = step_r - ptp * (price / max(float(a.price), 1e-9)) * env.sim.control_dt * pch
+                    if float(a.stall_price) > 0:
+                        # --stall-price (11-06, the user: "실격이 아니라 지속적으로 벌점을 계속 주는건?"): every second below
+                        # --stall-vmin costs the shortfall's share of the price (speed magnitude, so backing out is not charged). In
+                        # the box layouts the policy stood still 75-82 % of the time: standing was free and a retry risked -80
+                        sv_ = env.sim.state[lid, 3].float().abs()
+                        short_ = ((float(a.stall_vmin) - sv_) / max(float(a.stall_vmin), 1e-6)).clamp(0.0, 1.0)
+                        step_r = step_r - float(a.stall_price) * (price / max(float(a.price), 1e-9)) * env.sim.control_dt * short_
                     if obs_fn.planner is not None:
                         # drive the plan: leaving it by more than --track-dead costs --track-k per m and step
                         dev_ = obs_fn.planner.deviation().abs()
@@ -2232,6 +2239,9 @@ def main():
     ap.add_argument("--prop-count", default="fixed", choices=("fixed", "uniform"),
                     help="patterns per layout: all of the lap's (fixed) or 1 .. all, uniform (11-03: fixed = always dense)")
     ap.add_argument("--prop-max", type=int, default=18, help="props / stages: procedural_max_props")
+    ap.add_argument("--stall-price", type=float, default=0.0,
+                    help="price per second standing still, linear in the shortfall below --stall-vmin (ramps with --price); 0 = off (11-06)")
+    ap.add_argument("--stall-vmin", type=float, default=1.0, help="[m/s] --stall-price charges below this speed magnitude")
     ap.add_argument("--spawn-behind-prop", type=float, default=0.0,
                     help="share of the learner's resets that start 0.65-1.6 m behind an obstacle of its layout (11-06)")
     ap.add_argument("--prop-shapes", default="all", choices=("all", "boxes"),
