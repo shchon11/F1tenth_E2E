@@ -554,12 +554,21 @@ class MAPPlanTracker:
         #: the follower's own back-out rules for `map_rows` (the stalled-and-touching reverse, `PlanSpec.wedge_s`); the env
         #: turns them off when the policy reverses itself (`EnvConfig.plan_reverse_ext`, 11-05)
         self.auto_backout = True
-        #: `map_rows` plan in time waypoints (`plan_tw`, `EnvConfig.learner_plan` "tw4", 11-06): forward runs to MAP,
+        #: `map_rows` plan in time waypoints (`plan_tw`, `EnvConfig.learner_plan` "tw", 11-06): forward runs to MAP,
         #: backward runs to `plan_tw.pursue_back`; `tw_plan` (B, n, 5) is each row's whole plan for the viewers and
         #: `_held_tw` the direction / run length of a held plan
         self.tw = False
         self.tw_plan = None
         self._held_tw = None
+        self.tw_action = None
+        #: the backward pure pursuit's lookahead [m]: max(back_la_min, back_la_t x |v|), tuned by the distance to given
+        #: backing paths (`tools/tw_tune.py`, 11-06: 0.8 / 8.8 cm straight / curving; MAP turned round 0.8 / 13.4)
+        self.back_la_min = 0.35
+        self.back_la_t = 0.3
+        #: how backward runs are steered: "pp" = `plan_tw`-style pure pursuit (wheelbase only), "map" = MAP itself on the
+        #: car turned round (heading + pi, speed |v|) with its steering negated -- a car backing with steering delta turns
+        #: as a forward car with -delta does (11-06, the user: "후진도 map를 안쓸 이유가 있니?")
+        self.back_mode = "pp"
         self.wheelbase = float(nominal.get("lf", 0.15875)) + float(nominal.get("lr", 0.17145))
 
     def __getattr__(self, name):                       # spec, last_ref, u_seq, hooks, ... are the inner's
@@ -567,7 +576,7 @@ class MAPPlanTracker:
 
     def __setattr__(self, name, value):
         if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
-                    "tw", "tw_plan", "_held_tw", "wheelbase"):
+                    "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._inner, name, value)
@@ -636,7 +645,7 @@ class MAPPlanTracker:
         dev = action.device
         if self.tw:
             from . import plan_tw
-            k_tw, v_tw = plan_tw.decode(action)
+            k_tw, v_tw = plan_tw.decode(self.tw_action if self.tw_action is not None else action)
             n_tw = int(math.ceil((plan_tw.TW_K * plan_tw.TW_DT * plan_tw.V_FWD + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
             path, pv, pk, d_tw, tot_tw = plan_tw.run_path(k_tw, v_tw, PLAN_WP_SPACING, n_tw)
             v1_tw = torch.where(v_tw[:, 0].abs() < plan_tw.V_STOP, torch.zeros_like(v_tw[:, 0]), v_tw[:, 0])
@@ -676,23 +685,31 @@ class MAPPlanTracker:
         dly = None
         if delay is not None:
             dly = delay if torch.is_tensor(delay) else torch.full((B,), float(delay), device=dev)
+        flip = (d_tw < 0) if (self.tw and self.back_mode == "map") else None
+        if flip is not None:
+            # MAP on the car turned round: its heading + pi, its steering memory negated (the rate limit's reference)
+            yaw = torch.where(flip, yaw + math.pi, yaw)
+            self.map.curr_steer = torch.where(flip, -self.map.curr_steer, self.map.curr_steer)
         steer, speed = self.map(pos, yaw, v_meas.abs(), path, pv, pk,
                                 torch.full((B,), PLAN_WP_SPACING, device=dev), zeros, grip_index(self.P, self.nominal),
                                 yaw_rate=yaw_rate, delay=dly if self.map.p.delay_comp < 0 else None)
+        if flip is not None:
+            steer = torch.where(flip, -steer, steer)
+            self.map.curr_steer = torch.where(flip, -self.map.curr_steer, self.map.curr_steer)
         speed = torch.minimum(speed, speed_cap)
         if self.tw:
             # The speed is the first segment's, whatever MAP read off the array: a plan is re-issued every 0.05 s, inside
-            # its first 0.375 s segment, while MAP's nearest waypoint (in metres) passes a short slow first segment within
-            # a step or two -- held one control step, a 0.1 m/s segment is 4 cm long and MAP drove the next segment's speed
-            # (the tracking test, 11-06: 1-5 m/s commanded on plans that said 0.1)
+            # its first segment, while MAP's nearest waypoint (in metres) passes a short slow first segment within a step or
+            # two -- held one control step, a 0.1 m/s segment is a few cm long and MAP drove the next segment's speed (the
+            # tracking test, 11-06: 1-5 m/s commanded on plans that said 0.1)
             speed = torch.minimum(v1_tw, speed_cap)
-            # a backward first run: pure pursuit to the point 0.6 m (or 0.5 s) back along it
+            # a backward first run: pure pursuit (kinematic bicycle) to the point `back_la_min` m (or `back_la_t` s) back along it
             from . import plan_tw
             back = d_tw < 0
-            if bool(back.any()):
+            if bool(back.any()) and self.back_mode == "pp":
                 ar_ = torch.arange(B, device=dev)
                 near = ((path - pos[:, None, :]) ** 2).sum(-1).argmin(1)
-                la = torch.clamp(0.5 * v_meas.abs(), min=0.6)
+                la = torch.clamp(self.back_la_t * v_meas.abs(), min=self.back_la_min)
                 j = torch.minimum(near + (la / PLAN_WP_SPACING).round().long(),
                                   (tot_tw / PLAN_WP_SPACING).round().long().clamp(1, path.shape[1] - 1))
                 j = torch.maximum(j, near + 1).clamp(max=path.shape[1] - 1)

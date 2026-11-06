@@ -952,8 +952,8 @@ class TeacherPolicy:
                 # does a stop the mean holds after a hard hit go when the slow-speed floor's noise is on?
                 v0_, fk_, fs_ = (float(x) for x in se_.split(","))
                 s_ = (v0_ / self.env.sim.state[self.env.learner_ids, 3].float().abs().clamp_min(1e-3)).square().clamp(max=1.0)
-                fl_ = torch.cat([fk_ * s_[:, None].expand(-1, PLAN_KAPPA_DIMS),
-                                 fs_ * s_[:, None].expand(-1, self.A - PLAN_KAPPA_DIMS)], 1)
+                kd_ = kappa_dims_of(self.ar)
+                fl_ = torch.cat([fk_ * s_[:, None].expand(-1, kd_), fs_ * s_[:, None].expand(-1, self.A - kd_)], 1)
                 d_ = torch.distributions.Normal(d_.mean, torch.maximum(d_.stddev, fl_))
             # F1SIM_POLICY_NOISE_CORR=c: AR(1) noise held across decisions, as --noise-corr trains with
             c_ = float(os.environ.get("F1SIM_POLICY_NOISE_CORR", "0") or 0)
@@ -1173,8 +1173,22 @@ def plan_of(ar) -> bool:
     return str((_ar(ar) or {}).get("action", "direct") or "direct") == "plan"
 
 
+def tw_of(ar) -> bool:
+    """a time-waypoint plan (`--plan-format tw`, `plan_tw`)"""
+    return plan_of(ar) and str(_ar(ar).get("plan_format", "wp4") or "wp4") == "tw"
+
+
+def kappa_dims_of(ar) -> int:
+    """how many of a plan's numbers are curvatures (they come first): wp4's 4, a time-waypoint plan's TW_K"""
+    from .. import plan_tw
+    return plan_tw.TW_K if tw_of(ar) else PLAN_KAPPA_DIMS
+
+
 def act_dim_of(ar) -> int:
     from ..mpc import act_dim as _act_dim
+    from .. import plan_tw
+    if tw_of(ar):
+        return 2 * plan_tw.TW_K
     return _act_dim("wp4") if plan_of(ar) else 2
 
 
@@ -1196,7 +1210,8 @@ def mean_bounds(ar, A: int):
     if plan_of(ar):
         lo = [-1.0] * A
         lo[PLAN_KAPPA_DIMS] -= float(_ar(ar).get("plan_reverse_ext", 0.0) or 0.0)
-        return lo, [1.0] * A, [0.1] * PLAN_KAPPA_DIMS + [0.2] * (A - PLAN_KAPPA_DIMS)
+        kd = kappa_dims_of(ar)
+        return lo, [1.0] * A, [0.1] * kd + [0.2] * (A - kd)
     ext = float(_ar(ar).get("reverse_ext", 0.0) or 0.0)
     return [-1.0, -1.0 - ext], [1.0, 1.0], [0.1, 0.2]
 
@@ -1204,7 +1219,8 @@ def mean_bounds(ar, A: int):
 def steer_speed_dims(ar, A: int):
     """(steering dims, speed dims): the plan's curvatures and speeds, or (steer,) and (speed,)"""
     if plan_of(ar):
-        return list(range(PLAN_KAPPA_DIMS)), list(range(PLAN_KAPPA_DIMS, A))
+        kd = kappa_dims_of(ar)
+        return list(range(kd)), list(range(kd, A))
     return [0], [1]
 
 
@@ -1215,7 +1231,8 @@ def std_floor_of(ar, A: int):
         return None
     f = [float(x) for x in f]
     if plan_of(ar) and len(f) == 2:
-        return [f[0]] * PLAN_KAPPA_DIMS + [f[1]] * (A - PLAN_KAPPA_DIMS)
+        kd = kappa_dims_of(ar)
+        return [f[0]] * kd + [f[1]] * (A - kd)
     return f
 
 
@@ -1326,15 +1343,20 @@ def plan_env_fields(ar) -> dict:
     if not plan_of(ar):
         return {}
     a = _ar(ar)
-    tw = str(a.get("plan_format", "wp4") or "wp4") == "tw4"
-    # tw4: MAP commands the speed of the segment the car is in. A speed lookahead reads the waypoint array 0.235 s of the
+    tw = str(a.get("plan_format", "wp4") or "wp4") == "tw"
+    # tw: MAP commands the speed of the segment the car is in. A speed lookahead reads the waypoint array 0.235 s of the
     # measured speed ahead -- past a slow first segment (0.1 m/s x 0.375 s is 4 cm) into the next one's speed: the
     # tracking test drove at 5-6 m/s on plans that said 0.1 (11-06)
+    # tw's lookahead, tuned by the distance to given reference paths (`tools/tw_tune.py`, 11-06, the user: "ld가 먼저"): L1 =
+    # max(0.35, 0.47 v) -- centreline 3 / 4 m/s 6.2 / 12.4 cm (7.1 / 14.6 at wp4's max(0.96, 0.47 v - 0.50)), the turn after a
+    # change of direction 23.5 / 33.8 cm (25.9 / 36.7), wall contacts 6 (15) of 128
+    mp = dict(PLAN_MAP, speed_lookahead=0.0, t_clip_min=0.35, m_l1=0.47, q_l1=0.0) if tw else \
+        dict(PLAN_MAP, speed_lookahead=float(a.get("plan_lookahead", 0.235)))
     return dict(action_mode="plan", speed_mode="wp4", speed_command="tracker", plan_follower="map",
-                plan_follower_map=dict(PLAN_MAP, speed_lookahead=0.0 if tw else float(a.get("plan_lookahead", 0.235))),
+                plan_follower_map=mp,
                 decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0,
                 plan_reverse_ext=float(a.get("plan_reverse_ext", 0.0) or 0.0),
-                learner_plan="tw4" if str(a.get("plan_format", "wp4") or "wp4") == "tw4" else "")
+                learner_plan="tw" if tw else "")
 
 
 def soft_bound(z, lo, hi, m):
@@ -1586,9 +1608,9 @@ def train(a):
         raise SystemExit(f"the env's action is {env.act_dim}-wide, this run's {A}")
     if float(a.plan_relabel) > 0 and not plan_of(a):
         raise SystemExit("--plan-relabel relabels wp4 plans: it needs --action plan")
-    if str(getattr(a, "plan_format", "wp4")) == "tw4" and (float(a.plan_relabel) > 0 or float(a.plan_reverse_ext) > 0):
-        raise SystemExit("--plan-format tw4: no --plan-relabel (it relabels wp4 geometry) and no --plan-reverse-ext (tw4 "
-                         "plans reverse in their own speeds)")
+    if tw_of(a) and (float(a.plan_relabel) > 0 or float(a.plan_reverse_ext) > 0):
+        raise SystemExit("--plan-format tw: no --plan-relabel (it relabels wp4 geometry) and no --plan-reverse-ext (time "
+                         "waypoint plans reverse in their own speeds)")
     last_a = torch.zeros(B, A, device=device)
     o = obs_fn(last_a)
     D = obs_fn.dim
@@ -1797,8 +1819,8 @@ def train(a):
                     # fixed lateral acceleration like `kappa_mode feasible`: full below V0, a quarter at 2 V0
                     v0_, fk_, fs_ = (float(x) for x in a.slow_explore)
                     s_ = (v0_ / env.sim.state[lid, 3].float().abs().clamp_min(1e-3)).square().clamp(max=1.0)
-                    bfl[t, :, :PLAN_KAPPA_DIMS] = fk_ * s_[:, None]
-                    bfl[t, :, PLAN_KAPPA_DIMS:] = fs_ * s_[:, None]
+                    bfl[t, :, :kappa_dims_of(a)] = fk_ * s_[:, None]
+                    bfl[t, :, kappa_dims_of(a):] = fs_ * s_[:, None]
                     dist = torch.distributions.Normal(dist.mean, torch.maximum(dist.stddev, bfl[t]))
                 if float(a.noise_corr) > 0:
                     # temporally correlated exploration (AR(1), marginal N(0, 1)): white noise at 20 Hz averages out within
@@ -2333,9 +2355,9 @@ def main():
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
     ap.add_argument("--critic-warmup", type=int, default=0, help="the first N updates train the critic only (actor grads dropped, 11-05)")
-    ap.add_argument("--plan-format", default="wp4", choices=("wp4", "tw4"),
-                    help="the plan's 8 numbers: wp4 = 4 curvature + 4 speed knots over 0.6 s of the measured speed; tw4 = time "
-                         "waypoints (plan_tw): 4 x 0.375 s segments of curvature and signed speed, reverse and forward in one plan")
+    ap.add_argument("--plan-format", default="wp4", choices=("wp4", "tw"),
+                    help="wp4 = 4 curvature + 4 speed knots over 0.6 s of the measured speed (8 numbers); tw = time waypoints "
+                         "(plan_tw): TW_K segments of TW_DT s, each a curvature and a signed speed, reverse and forward in one plan")
     ap.add_argument("--slow-explore", type=float, nargs=3, default=None, metavar=("V0", "STEER", "SPEED"),
                     help="exploration std floor for the plan's curvatures / speeds, full below V0 m/s and x (V0/v)^2 above")
     ap.add_argument("--calm-std", type=float, default=1.0, help="exploration std x this where nothing is near (CalmGate: the --base "

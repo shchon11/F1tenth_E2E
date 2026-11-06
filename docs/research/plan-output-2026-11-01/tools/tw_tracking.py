@@ -22,14 +22,15 @@ dev = torch.device("cuda")
 ck = torch.load(path, map_location="cpu", weights_only=False)
 a = argparse.Namespace(**ck["args"])
 a.envs, a.seed, a.device = n_env, 51, "cuda"
-a.plan_format, a.plan_reverse_ext, a.plan_relabel = "tw4", 0.0, 0.0
+a.plan_format, a.plan_reverse_ext, a.plan_relabel = "tw", 0.0, 0.0
 a.prop_fraction, a.removal_p, a.warps, a.opp_present, a.spawn_behind_prop, a.stage = 0.0, 0.0, 0, 0.0, 0.0, "props"
 a.episode_s = 3600.0
 env = SR.build_env(a, dev); prepare_graph_runtime(env, log=lambda _t: None)
-assert env.ecfg.learner_plan == "tw4", env.ecfg.learner_plan
+assert env.ecfg.learner_plan == "tw", env.ecfg.learner_plan
 lid = env.learner_ids; B = int(lid.numel()); dt = env.sim.control_dt; R = int(a.repeat)
 i_w = CC.index("hard_wall") if "hard_wall" in CC else None
 tr = env.sim.track
+ONSET_COLS = [CC.index("onsets_wall"), CC.index("onsets_prop"), CC.index("onsets_car")]
 
 
 def ref_pieces(pieces, x0, y0, p0, step):
@@ -73,7 +74,10 @@ def plan_from_ref(ref, prog, step, pose):
         arg = (kap * ch / 2).clamp(-1, 1)
         sabs = torch.where(kap.abs() * ch < 1e-4, ch, 2 * torch.asin(arg.abs()) / kap.abs().clamp_min(1e-9))
         sabs = torch.where(d2 < 1e-6, torch.zeros_like(sabs), sabs)
-        v = (dirn * sabs / plan_tw.TW_DT).clamp(-plan_tw.V_REV, plan_tw.V_FWD)
+        # the reference's own speed (not distance / DT: with 0.1 s segments a car 0.5 m off the reference got a 5-7 m/s
+        # first segment to catch up -- the test measured that planner, not the follower); the curvature points at the
+        # reference point, the next plan corrects the rest
+        v = (dirn * ref[ar_, i_m, 3].abs()).clamp(-plan_tw.V_REV, plan_tw.V_FWD)
         ks.append(kap); vs.append(v)
         x, y, p = plan_tw._arc(x, y, p, kap, v * plan_tw.TW_DT)
     return plan_tw.encode(torch.stack(ks, 1), torch.stack(vs, 1))
@@ -95,7 +99,7 @@ def open_start(tid, n_try=256):
     return best_xy, best_yaw, best_e
 
 
-def run(name, make_ref, dur, open_space=False):
+def run(name, make_ref, dur, open_space=False, quiet=False):
     env.reset(seed=51)
     st0 = env.sim.state[lid].clone()
     tid = env.sim.tid[lid]
@@ -122,7 +126,7 @@ def run(name, make_ref, dur, open_space=False):
         if k % R == 0:
             idx = (prog[:, None] + torch.arange(win, device=dev)[None, :]).clamp(max=T - 1)
             dist = (ref[ar_[:, None], idx, :2] - env.sim.state[lid, None, :2]).norm(dim=-1)
-            prog = idx.gather(1, dist.argmin(1, keepdim=True))[:, 0]
+            prog = idx.gather(1, (dist - 1e-4 * torch.arange(win, device=dev)[None, :]).argmin(1, keepdim=True))[:, 0]  # ties (a stop in the reference) go to the latest
             act = plan_from_ref(ref, prog, dt, env.sim.state[lid, :3])
             act_full[lid] = act
         env.step(act_full)
@@ -133,7 +137,7 @@ def run(name, make_ref, dur, open_space=False):
                   f"명령 {float(env.last_cmd_raw[lid, 1].mean()):.2f} 조향 {float(env.last_cmd_raw[lid, 0].mean()):.3f} "
                   f"진행 {float(prog.float().mean() * dt):.2f} s", flush=True)
         cf = env.sim.contact_frame()[lid].float()
-        wall |= ((cf - cf0) > 0).any(1)
+        wall |= ((cf - cf0)[:, ONSET_COLS] > 0).any(1)
     P = torch.stack(pos, 1)                                    # (B, T, 2)
     dist_all = (P[:, :, None, :] - ref[:, None, :, :2]).norm(dim=-1)
     d, inear = dist_all.min(-1)                                           # cross-track: nearest reference point
@@ -143,18 +147,30 @@ def run(name, make_ref, dur, open_space=False):
     dd = d[ok][:, k0:]
     done = (prog.float() * dt)[ok]
     bp = back_ph[ok][:, k0:]
+    out = dict(n_wall=int(wall.sum()), done=float(done.median()) if done.numel() else 0.0,
+               rmse=float(dd.square().mean().sqrt()) if dd.numel() else float("nan"),
+               rmse_back=float(dd[bp].square().mean().sqrt()) if bool(bp.any()) else float("nan"),
+               rmse_fwd=float(dd[~bp].square().mean().sqrt()) if bool((~bp).any()) else float("nan"))
+    if quiet:
+        return out
     if bool(bp.any()) and bool((~bp).any()):
         print(f"  {name}: 후진 구간 RMSE {float(dd[bp].square().mean().sqrt()) * 100:.1f} cm (최대 {float(dd[bp].max()) * 100:.1f}), "
               f"전진 구간 RMSE {float(dd[~bp].square().mean().sqrt()) * 100:.1f} cm (최대 {float(dd[~bp].max()) * 100:.1f})", flush=True)
     if dd.numel() == 0:
-        print(f"{name}: 모든 차가 벽에 닿음", flush=True); return
+        print(f"{name}: 모든 차가 벽에 닿음", flush=True); return out
     print(f"{name}: 차 {int(ok.sum())}/{B}대 (벽 접촉 {int(wall.sum())}대 뺌, 출발 자리 여유 중앙 {float(room.median()):.2f} m) | "
           f"기준 경로와 거리 RMSE {float(dd.square().mean().sqrt()) * 100:.1f} cm, p95 {float(dd.flatten().quantile(0.95)) * 100:.1f} cm, "
           f"최대 {float(dd.max()) * 100:.1f} cm | {dur:.1f} s 동안 기준 궤적 {float(done.median()):.2f} s 분량 진행", flush=True)
+    return out
 
 
 step = dt
-run("A 중앙선 3 m/s", lambda x, y, p, s, t: ref_center(3.0, 10.0, s, t, step), 7.0)
-run("B 중앙선 4 m/s", lambda x, y, p, s, t: ref_center(4.0, 8.0, s, t, step), 5.0)
-run("C 후진 1 m -> 왼쪽 꺾어 전진", lambda x, y, p, s, t: ref_pieces([(1.0, -1.0, 0.0), (0.2, 0.0, 0.0), (1.4, 1.5, 1.2), (1.5, 0.0, 0.0)], x, y, p, step), 5.0, True)
-run("D 오른쪽 꺾어 후진 -> 왼쪽 꺾어 전진", lambda x, y, p, s, t: ref_pieces([(0.8, -1.5, -0.8), (0.2, 0.0, 0.0), (1.25, 2.0, 1.0), (1.5, 0.0, 0.0)], x, y, p, step), 5.0, True)
+SCENARIOS = [
+    ("A 중앙선 3 m/s", lambda x, y, p, s, t: ref_center(3.0, 10.0, s, t, step), 7.0, False),
+    ("B 중앙선 4 m/s", lambda x, y, p, s, t: ref_center(4.0, 8.0, s, t, step), 5.0, False),
+    ("C 후진 1 m -> 왼쪽 꺾어 전진", lambda x, y, p, s, t: ref_pieces([(1.0, -1.0, 0.0), (0.2, 0.0, 0.0), (1.4, 1.5, 1.2), (1.5, 0.0, 0.0)], x, y, p, step), 5.0, True),
+    ("D 오른쪽 꺾어 후진 -> 왼쪽 꺾어 전진", lambda x, y, p, s, t: ref_pieces([(0.8, -1.5, -0.8), (0.2, 0.0, 0.0), (1.25, 2.0, 1.0), (1.5, 0.0, 0.0)], x, y, p, step), 5.0, True),
+]
+if __name__ == "__main__":
+    for nm, mk, du, op in SCENARIOS:
+        run(nm, mk, du, op)

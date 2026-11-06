@@ -242,9 +242,10 @@ class EnvConfig:
     #: (srp26owp u550 layout 2: 35 s on one fixed crate). a in [-1, 1] keeps exactly the forward map. 0 = as before.
     plan_reverse_ext: float = 0.0
     #: The learner's plan format under the MAP follower (2026-11-06, the user: "t=n 까지의 waypoint 모음으로 만드는게
-    #: 정석 아잉교?", no MPC): "" = the env's speed_mode as always; "tw4" = time waypoints (`plan_tw`), the same 8 numbers
-    #: read as K curvatures + K signed speeds over 0.375 s segments, forward runs to MAP and backward runs to a pure
-    #: pursuit. Only the learner's rows: the traffic and the inner tracker keep `speed_mode`.
+    #: 정석 아잉교?", no MPC): "" = the env's speed_mode as always; "tw" = time waypoints (`plan_tw`): the learner sends
+    #: 2 TW_K numbers (TW_K curvatures + TW_K signed speeds over TW_DT segments), forward runs go to MAP and backward runs
+    #: to a pure pursuit. Only the learner's rows: the traffic and the inner tracker keep `speed_mode`, and `act_dim` is
+    #: the learner's width while `plan_dim` stays the internal plan's.
     learner_plan: str = ""
     max_steps: int = 1600            # 40 s at 40 Hz
     # Give each race's FIRST episode after `reset()` a random length in [1, max_steps] instead of
@@ -1404,6 +1405,15 @@ class F1VecEnv:
             self.opp_token_keep_alt = False
             self._plan_alt = torch.zeros(self.B, self.tracker.spec.N + 1, 4, device=self.device)
         self.single_observation_space, self.single_action_space = self._spaces()
+        #: the internal plan's width (`speed_mode`): the traffic's, the inner tracker's, `prev_action`'s. `act_dim` is what
+        #: `step` takes -- the learner's time-waypoint plan when `learner_plan` is "tw" (`plan_tw`), else the same
+        self.plan_dim = self.act_dim
+        self._tw_action = None
+        if e.learner_plan == "tw":
+            if e.action_mode != "plan" or e.plan_follower != "map":
+                raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
+            from . import plan_tw
+            self.act_dim = 2 * plan_tw.TW_K
 
     def _check_obs_v2(self) -> None:
         """Refuse a v2 env that could not produce the v2 observation honestly."""
@@ -2162,7 +2172,7 @@ class F1VecEnv:
         speed = norm_speed(r.odom[:, 3], e.v_max_policy)[:, None]
         gz = norm_gyro_z(r.imu.mean(1)[:, 2:3], e.imu_gyro_scale)
         feat = torch.cat([speed, gz], 1)
-        fill = torch.cat([feat, torch.zeros(self.B, self.act_dim, device=feat.device, dtype=feat.dtype)], 1)
+        fill = torch.cat([feat, torch.zeros(self.B, self.plan_dim, device=feat.device, dtype=feat.dtype)], 1)
         self.hist2 = torch.where(self._fresh2[:, None, None], fill[:, None, :].expand_as(self.hist2), self.hist2)
         self._fresh2 = torch.zeros_like(self._fresh2)
         self._last_feat2 = feat
@@ -2586,7 +2596,7 @@ class F1VecEnv:
         self.scan_hist[ids] = self._norm_scan(scan[ids])[:, None, :]
         if self.hist is not None:
             feat = torch.zeros(ids.numel(), 9, device=self.device); feat[:, 0] = speed / e.v_max_policy
-            self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.act_dim, device=self.device)], 1)[:, None, :]
+            self.hist[ids] = torch.cat([feat, torch.zeros(ids.numel(), self.plan_dim, device=self.device)], 1)[:, None, :]
         if self.hist2 is not None:
             self._fresh2[ids] = True                     # filled from the row's first observation
         for seat in self._seat_builders():
@@ -2976,7 +2986,7 @@ class F1VecEnv:
         self.lead_steps.zero_(); self.lead_paid.fill_(1.0)
         obs = self._obs(r)
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
-            self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.act_dim, device=self.device)], 1)[:, None, :]
+            self.hist[:] = torch.cat([self._last_feat, torch.zeros(self.B, self.plan_dim, device=self.device)], 1)[:, None, :]
             obs = self._obs(r)
         for seat in self._seat_builders():
             seat.begin(r)                                          # the same start, in each league contract
@@ -2987,6 +2997,11 @@ class F1VecEnv:
 
     def step(self, action: torch.Tensor):
         ext = float(self.ecfg.reverse_ext)
+        if self.ecfg.learner_plan == "tw":
+            # the learner's time-waypoint plans go to MAP's own decoder (`MAPPlanTracker.tw_action`); the internal plan
+            # every other reader sees for those rows is zeros (the traffic's rows are the env's own, as always)
+            self._tw_action = action.to(self.device).clamp(-1.0, 1.0)
+            action = torch.zeros(self.B, self.plan_dim, device=self.device)
         if ext > 0 and self.act_dim == 2:
             # the learners' speed may reach into the reverse extension; everything else stays in [-1, 1]
             act_in = action.to(self.device)
@@ -3030,7 +3045,8 @@ class F1VecEnv:
                 # `acc_now`), and follows the plans of the policy's own cars
                 self.tracker.P = self.sim.P
                 self.tracker.map_rows = self.learner
-                self.tracker.tw = self.ecfg.learner_plan == "tw4"
+                self.tracker.tw = self.ecfg.learner_plan == "tw"
+                self.tracker.tw_action = self._tw_action
                 self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0 and not self.tracker.tw
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
                     self.tracker.push_imu(lr.imu[:, :, 3])

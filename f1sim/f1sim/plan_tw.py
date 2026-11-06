@@ -7,7 +7,7 @@ curvature's at one exact moment -- exploration never found it and the policy lea
 world: 24-61 % of the cars started behind a box passed it under the mean action, 70 % of the closest ones stood still).
 Here one plan says it: each of the K segments has its own signed speed, so a plan can run backwards and then forwards.
 
-The action keeps the 8 numbers of the wire (`mpc.PLAN_WIRE_DIM`) and wp4's column layout, curvatures first:
+The action is 2K numbers, curvatures first as in wp4's layout:
 
     a[:, 0:K]   kappa_k = a * KAPPA_MAX       the steering curvature over segment k (+ = wheels left), either direction
     a[:, K:2K]  v_k = a * V_FWD (a >= 0)       the signed speed over segment k; a = 0 is a stop, the middle of the range
@@ -25,8 +25,10 @@ from typing import Tuple
 
 import torch
 
-TW_K = 4                  # segments (the wire's 8 numbers: K curvatures + K speeds)
-TW_DT = 0.375             # [s] per segment: 1.5 s ahead
+TW_K = 10                 # segments: K curvatures + K speeds
+TW_DT = 0.1               # [s] per segment: 1.0 s ahead. 0.375 s segments (4, the old 8-number wire) left MAP's lookahead
+                          # (1-2 m) inside the first one: only kappa_1 and v_1 moved the command (tw_authority.py, 11-06), a
+                          # curvature-and-speed command in a plan's clothes; the user: "좀더 촘촘하게", and the wire can change
 KAPPA_MAX = 1.6           # [1/m] as wp4 (`mpc.PlanSpec.kappa_max`); the car's full lock is ~1.35
 V_FWD = 10.0              # [m/s] a = +1
 V_REV = 2.0               # [m/s] a = -1 (`EnvConfig.reverse_speed`)
