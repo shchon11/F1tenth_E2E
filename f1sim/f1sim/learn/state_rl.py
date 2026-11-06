@@ -960,8 +960,16 @@ class TeacherPolicy:
             e_ = torch.randn_like(d_.mean)
             if c_ > 0:
                 prev = getattr(self, "_eps_c", None)
+                cs_ = os.environ.get("F1SIM_CORR_SLOW")
+                if cs_:
+                    # the hold only below V0 (x (V0 / v)^2 above), as `--corr-slow` trains with
+                    v0c_ = float(cs_)
+                    s2_ = (v0c_ / self.env.sim.state[self.env.learner_ids, 3].float().abs().clamp_min(1e-3)).square().clamp(max=1.0)
+                    cc_ = (c_ * s2_)[:, None]
+                else:
+                    cc_ = c_
                 if prev is not None and prev.shape == e_.shape:
-                    e_ = c_ * prev + math.sqrt(1.0 - c_ * c_) * e_
+                    e_ = cc_ * prev + torch.sqrt(1.0 - torch.as_tensor(cc_) ** 2) * e_
                 self._eps_c = e_
             return clamp_any(d_.mean + k_ * d_.stddev * e_, self.ar)
         return clamp_any(self.net.pi(self.nrm(o)), self.ar)
@@ -1828,7 +1836,16 @@ def train(a):
                     # line for a second) whose consequence the advantage could see; held noise does. PPO's per-decision
                     # ratio uses the Gaussian marginal, as gSDE does (Raffin et al. 2021)
                     al = float(a.noise_corr)
-                    eps_n = al * eps_n + math.sqrt(1.0 - al * al) * torch.randn_like(eps_n)
+                    if float(getattr(a, "corr_slow", 0.0) or 0.0) > 0:
+                        # `--corr-slow V0` (11-07): the hold only where the car is slow, x (V0 / v)^2 above -- held at speed, a
+                        # fresh network's curvature noise (~0.45 of 1.6 1/m for 0.5 s) is ~18 m/s^2 sideways at 5 m/s: srp25tw2's
+                        # training hit walls at speed 26 times a km and the policy slowed to a stop as the price rose; the same
+                        # checkpoint with the hold below 1.5 m/s only hit 14.7 a km in all (38.2)
+                        s2_ = (float(a.corr_slow) / env.sim.state[lid, 3].float().abs().clamp_min(1e-3)).square().clamp(max=1.0)
+                        al_t = (al * s2_)[:, None]
+                        eps_n = al_t * eps_n + torch.sqrt(1.0 - al_t * al_t) * torch.randn_like(eps_n)
+                    else:
+                        eps_n = al * eps_n + math.sqrt(1.0 - al * al) * torch.randn_like(eps_n)
                     act = dist.mean + dist.stddev * eps_n
                 else:
                     act = dist.sample()
@@ -2355,6 +2372,8 @@ def main():
     ap.add_argument("--hit-head", type=float, default=0.0, help="weight of the critic's hit-within-K head (BCE); 0 = off")
     ap.add_argument("--hit-horizon", type=int, default=20, help="K decisions (20 = 1 s at 20 Hz)")
     ap.add_argument("--critic-warmup", type=int, default=0, help="the first N updates train the critic only (actor grads dropped, 11-05)")
+    ap.add_argument("--corr-slow", type=float, default=0.0,
+                    help="hold the --noise-corr noise only below this speed [m/s] (x (V0/v)^2 above); 0 = at every speed")
     ap.add_argument("--plan-format", default="wp4", choices=("wp4", "tw"),
                     help="wp4 = 4 curvature + 4 speed knots over 0.6 s of the measured speed (8 numbers); tw = time waypoints "
                          "(plan_tw): TW_K segments of TW_DT s, each a curvature and a signed speed, reverse and forward in one plan")
