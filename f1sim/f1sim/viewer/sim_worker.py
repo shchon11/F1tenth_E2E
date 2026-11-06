@@ -1245,12 +1245,13 @@ class SimWorker:
                     f"맵은 장애물 없이 고르세요.")
             proc_kw, proc_src = procedural_settings(ckpt_path, getattr(cfg, "collision_mode", "soft"))
             run_max_props = int(proc_kw.get("procedural_max_props") or 0)
-            if os.environ.get("F1SIM_PROP_COUNT") and custom is None:
-                # F1SIM_PROP_COUNT=N (11-06, the user: "너무 장애물 많아 평가환경에서", "2개임 대회에서는"): at most N pieces of
-                # each drawn layout (`ProceduralObstacles` count "max<N>")
-                n_ = os.environ["F1SIM_PROP_COUNT"]
-                # "uniform": 1 .. all of each layout's pieces, as the training world draws them (11-06, the user: "최대한 다양한 상황")
-                proc_kw["procedural_count"] = "uniform" if n_ == "uniform" else f"max{int(n_)}"
+            if custom is None:
+                # How many of each drawn layout's pieces the session lays (11-06): default "uniform" = 1 .. all, as the training
+                # world draws them (the user: "최대한 다양한 상황", and the console laid all 14-18 while training drew 1 .. all);
+                # F1SIM_PROP_COUNT=all for every piece, =N for at most N (`ProceduralObstacles` count "max<N>")
+                n_ = os.environ.get("F1SIM_PROP_COUNT", "uniform")
+                proc_kw["procedural_count"] = ("uniform" if n_ == "uniform" else "fixed" if n_ in ("all", "fixed")
+                                               else f"max{int(n_)}")
             if custom is not None:
                 # Room for 장애물 편집 (`CONSOLE_PROP_SLOTS`); a seed's session keeps the run's own count, which is
                 # also what its draw keeps.
