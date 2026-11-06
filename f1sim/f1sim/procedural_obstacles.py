@@ -183,6 +183,16 @@ SMALL_SHAPES: Tuple[Tuple[str, dict], ...] = tuple(
     + [("steel_drum", dict(radius=0.11, height=0.30, facets=8))]
 )
 
+#: Box pieces (11-06, the user: "장애물 크기 좀 박스 크기로 해서 좀 해라" -- after a policy stood 38 s nose-on against a
+#: 0.05-0.11 m marker post): the venue's obstacles were cardboard boxes about 0.3 m (10-25 bags; real-size 0.3 m boxes
+#: are read as boxes, narrow 0.12-0.18 m ones as a car). `shapes="boxes"` draws only these. Appended after the other
+#: two groups so the shape ids an existing bank stores keep their meaning.
+BOX_SHAPES: Tuple[Tuple[str, dict], ...] = tuple(
+    [("cardboard_box", dict(width=s, depth=s, height=0.30)) for s in (0.27, 0.30, 0.33, 0.36)]
+    + [("wooden_crate", dict(width=w, depth=0.34, height=0.36)) for w in (0.30, 0.36, 0.42)]
+)
+
+
 @dataclass(frozen=True)
 class Shape:
     """One catalogue entry: a prop at a fixed size, reduced to what the GPU needs.
@@ -226,12 +236,14 @@ STYLE_MASS = {
 PROP_GROUND_DECEL = 4.9
 
 
-def build_catalogue(k_pad: int) -> Tuple[List[Shape], List[int], List[int]]:
-    """Every shape, plus the indices of the row ladder (sorted by extent) and the small set."""
+def build_catalogue(k_pad: int, box_ids: Optional[List[int]] = None) -> Tuple[List[Shape], List[int], List[int]]:
+    """Every shape, plus the indices of the row ladder (sorted by extent) and the small set; `box_ids`, when given, is
+    filled with the indices of `BOX_SHAPES`."""
     shapes: List[Shape] = []
     row_ids: List[int] = []
     small_ids: List[int] = []
-    for group, sink in ((ROW_SHAPES, row_ids), (SMALL_SHAPES, small_ids)):
+    box_sink: List[int] = box_ids if box_ids is not None else []
+    for group, sink in ((ROW_SHAPES, row_ids), (SMALL_SHAPES, small_ids), (BOX_SHAPES, box_sink)):
         for style, dims in group:
             prop = _props.build(style, seed=0, **dims)
             env = prop.envelope
@@ -250,7 +262,7 @@ def build_catalogue(k_pad: int) -> Tuple[List[Shape], List[int], List[int]]:
 def catalogue_k_pad() -> int:
     """Widest footprint in the catalogue -- the padded half-plane count every slot pays for."""
     k = 3
-    for group in (ROW_SHAPES, SMALL_SHAPES):
+    for group in (ROW_SHAPES, SMALL_SHAPES, BOX_SHAPES):
         for style, dims in group:
             k = max(k, len(_props.build(style, seed=0, **dims).envelope.footprint))
     return k
@@ -330,10 +342,11 @@ class ProceduralObstacles:
     def __init__(self, tracks, B: int, gen: torch.Generator, *, density: float = 1.0,
                  fraction: float = 1.0, max_props: int = 0, raceline_margin: float = 0.25,
                  car_half_width: float = 0.15, count: str = "fixed", line_share: float = 0.0,
-                 place: str = "pattern", bank: str = ""):
+                 place: str = "pattern", bank: str = "", shapes: str = "all"):
         self.tr = tracks
         self.B = int(B)
         self.gen = gen
+        shape_set = str(shapes)                          # `shapes` is reused below for the catalogue list
         self.device = tracks.device
         self.density = float(density)
         self.fraction = float(fraction)
@@ -363,7 +376,8 @@ class ProceduralObstacles:
         if k_pad < need:
             raise ValueError(f"track prop slots are padded to {k_pad} half-planes, the procedural "
                              f"catalogue needs {need}")
-        shapes, row_ids, small_ids = build_catalogue(k_pad)
+        box_ids: List[int] = []
+        shapes, row_ids, small_ids = build_catalogue(k_pad, box_ids)
         self.shapes = shapes
         self.sh_n = torch.tensor(np.stack([s.n for s in shapes]), dtype=torch.float32, device=dev)
         self.sh_d = torch.tensor(np.stack([s.d for s in shapes]), dtype=torch.float32, device=dev)
@@ -377,6 +391,13 @@ class ProceduralObstacles:
         self.sh_across = torch.tensor([s_.across for s_ in shapes], dtype=torch.float32, device=dev)
         self.sh_along = torch.tensor([s_.along for s_ in shapes], dtype=torch.float32, device=dev)
         self.line_pool = torch.cat([self.row_id, self.small_id]).unique()
+        #: "all": the row and small pieces (every run before 11-06); "boxes": `BOX_SHAPES` only (`_redraw_uniform`, the line
+        #: pieces and every layout a bank made with it)
+        if shape_set not in ("all", "boxes"):
+            raise ValueError(f"procedural shapes must be 'all' or 'boxes', got {shape_set!r}")
+        self.shape_set = shape_set
+        if shape_set == "boxes":
+            self.line_pool = torch.tensor(box_ids, dtype=torch.long, device=dev)
 
         self.N = int(tracks.n_cl)
         self._build_track_geometry()

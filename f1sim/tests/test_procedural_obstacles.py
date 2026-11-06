@@ -85,7 +85,8 @@ def test_pattern_rules_are_hard_obstacles_rules():
 def test_catalogue_pieces_are_the_props_they_name():
     """Every catalogue slot is exactly `props.build(...)`'s declared envelope, not a box drawn here."""
     k_pad = po.catalogue_k_pad()
-    shapes, row_ids, small_ids = po.build_catalogue(k_pad)
+    box_ids = []
+    shapes, row_ids, small_ids = po.build_catalogue(k_pad, box_ids)
     assert shapes, "empty catalogue"
     for sh in shapes:
         prop = props_mod.build(sh.style, seed=0, **dict(sh.dims))
@@ -99,7 +100,10 @@ def test_catalogue_pieces_are_the_props_they_name():
         nominal = float(fp[:, 0].max() - fp[:, 0].min())
         assert sh.across >= nominal
         assert sh.across <= nominal + float(fp[:, 1].max() - fp[:, 1].min()) * math.sin(po.YAW_JITTER) + 1e-9
-    assert sorted(row_ids + small_ids) == list(range(len(shapes)))
+    assert sorted(row_ids + small_ids + box_ids) == list(range(len(shapes)))
+    # the box set (11-06): box-sized pieces, appended last so a bank's stored ids keep their meaning
+    assert box_ids == list(range(len(shapes) - len(po.BOX_SHAPES), len(shapes)))
+    assert all(0.27 <= shapes[i].along <= 0.42 for i in box_ids)
     # the small set is small: the user's point is that avoiding only big boxes is not avoiding
     assert max(shapes[i].across for i in small_ids) <= 0.30
 
