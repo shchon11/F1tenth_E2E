@@ -1710,6 +1710,10 @@ def train(a):
         raise SystemExit("--anchor-solo is for one network: no --base")
     ptp = float(getattr(a, "prop_touch_price", 0.0) or 0.0)
     ptv = float(getattr(a, "prop_touch_vmax", 0.0) or 0.0)
+    # --stall-mode progress: each learner's progress over the last --stall-window s (ring buffer of per-step progress)
+    W_st = max(1, int(round(float(a.stall_window) / env.sim.control_dt)))
+    win_buf = torch.zeros(W_st, B, device=device); win_sum = torch.zeros(B, device=device)
+    win_n = torch.zeros(B, dtype=torch.long, device=device); win_ptr = 0
     posb = float(getattr(a, "pos_bonus", 0.0) or 0.0)
     rpos = RacePosition(env, lid, void_s=float(getattr(a, "pos_void", 0.0) or 0.0)) if posb > 0 and env.M > 1 else None
     print(f"[state_rl] {a.name}: 단계 {a.stage}, 환경 {env.B} (학습 행 {B}), 관측 {D}차원, 결정 {40 // R} Hz, "
@@ -1839,7 +1843,23 @@ def train(a):
                     pch = ptch * (env.sim.state[lid, 3].abs() < ptv).float() if ptv > 0 else ptch
                     if ptp > 0:
                         step_r = step_r - ptp * (price / max(float(a.price), 1e-9)) * env.sim.control_dt * pch
-                    if float(a.stall_price) > 0:
+                    if float(a.stall_price) > 0 and a.stall_mode == "progress":
+                        # --stall-mode progress (11-06, the user on rocking back and forth to dodge a speed rule: "이거는 어떻게
+                        # 방지하려나"): the rate is the progress along the lane over the last --stall-window s (signed), so standing,
+                        # rocking and going the wrong way all pay; a quick back-out pays only while it lasts
+                        p_now = info["progress"][lid].float()
+                        win_sum = win_sum + p_now - win_buf[win_ptr]
+                        win_buf[win_ptr] = p_now
+                        win_ptr = (win_ptr + 1) % win_buf.shape[0]
+                        win_n = (win_n + 1).clamp(max=win_buf.shape[0])
+                        rate_ = win_sum / (win_n.float() * env.sim.control_dt)
+                        short_ = ((float(a.stall_vmin) - rate_) / max(float(a.stall_vmin), 1e-6)).clamp(0.0, 1.0)
+                        step_r = step_r - float(a.stall_price) * (price / max(float(a.price), 1e-9)) * env.sim.control_dt * short_
+                        d_w = (te | trc)[lid]
+                        if bool(d_w.any()):                                   # a new episode starts its own window
+                            win_buf[:, d_w] = 0.0; win_sum = torch.where(d_w, torch.zeros_like(win_sum), win_sum)
+                            win_n = torch.where(d_w, torch.zeros_like(win_n), win_n)
+                    elif float(a.stall_price) > 0:
                         # --stall-price (11-06, the user: "실격이 아니라 지속적으로 벌점을 계속 주는건?"): every second below
                         # --stall-vmin costs the shortfall's share of the price (speed magnitude, so backing out is not charged). In
                         # the box layouts the policy stood still 75-82 % of the time: standing was free and a retry risked -80
@@ -2242,6 +2262,9 @@ def main():
     ap.add_argument("--stall-price", type=float, default=0.0,
                     help="price per second standing still, linear in the shortfall below --stall-vmin (ramps with --price); 0 = off (11-06)")
     ap.add_argument("--stall-vmin", type=float, default=1.0, help="[m/s] --stall-price charges below this speed magnitude")
+    ap.add_argument("--stall-mode", default="speed", choices=("speed", "progress"),
+                    help="--stall-price on the speed magnitude now, or on the progress rate over the last --stall-window s (11-06)")
+    ap.add_argument("--stall-window", type=float, default=2.0, help="[s] --stall-mode progress: the progress window")
     ap.add_argument("--spawn-behind-prop", type=float, default=0.0,
                     help="share of the learner's resets that start 0.65-1.6 m behind an obstacle of its layout (11-06)")
     ap.add_argument("--prop-shapes", default="all", choices=("all", "boxes"),
