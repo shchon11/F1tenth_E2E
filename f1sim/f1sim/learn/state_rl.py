@@ -945,7 +945,15 @@ class TeacherPolicy:
         if k_ > 0:
             nn_ = self.nrm(o)
             d_ = self.net.dist(nn_)
-            return clamp_any(d_.mean + k_ * d_.stddev * torch.randn_like(d_.mean), self.ar)
+            # F1SIM_POLICY_NOISE_CORR=c: AR(1) noise held across decisions, as --noise-corr trains with
+            c_ = float(os.environ.get("F1SIM_POLICY_NOISE_CORR", "0") or 0)
+            e_ = torch.randn_like(d_.mean)
+            if c_ > 0:
+                prev = getattr(self, "_eps_c", None)
+                if prev is not None and prev.shape == e_.shape:
+                    e_ = c_ * prev + math.sqrt(1.0 - c_ * c_) * e_
+                self._eps_c = e_
+            return clamp_any(d_.mean + k_ * d_.stddev * e_, self.ar)
         return clamp_any(self.net.pi(self.nrm(o)), self.ar)
 
     def __call__(self, last):
