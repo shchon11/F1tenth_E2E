@@ -17,7 +17,7 @@ export PYTHONPATH=/home/shchon11/F1tenth_E2E/f1sim:/home/shchon11/F1tenth_E2E/f1
 export F1SIM_PROP_BANK=/home/shchon11/f1sim_runs/prop_banks_box2 F1SIM_PROP_COUNT=uniform
 cd /home/shchon11/F1tenth_E2E/f1sim
 L=$D/one_${NAME}.log
-echo "== ${NAME}: 시간별 waypoint plan(0.1 s x 10), 처음부터, 상자만 있는 묶음, 멈춤 벌점, 느릴 때 큰 흔들림" > $L
+echo "== ${NAME}: 시간별 waypoint plan(시점 0.1/0.2/0.4/0.7/1.0 s의 곡률·속도 -> 0.1 s x 10구간), 처음부터, 상자만 있는 묶음, 멈춤 벌점, 느릴 때 큰 흔들림" > $L
 evalc() {
   local UU=$1; local C=$R/${NAME}/state_u${UU}.pt
   CUDA_VISIBLE_DEVICES=$EGPU timeout 7200 python3 $T/console_layouts.py $C $MC 40 30 777 $D/layouts/o_${NAME}_u${UU} 2>&1 | grep "배치\|합계\|Error" > $D/layouts_o_${NAME}_u${UU}.log

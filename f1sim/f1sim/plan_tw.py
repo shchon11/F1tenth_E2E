@@ -7,11 +7,18 @@ curvature's at one exact moment -- exploration never found it and the policy lea
 world: 24-61 % of the cars started behind a box passed it under the mean action, 70 % of the closest ones stood still).
 Here one plan says it: each of the K segments has its own signed speed, so a plan can run backwards and then forwards.
 
-The action is 2K numbers, curvatures first as in wp4's layout:
+The policy sends 2 N_KNOT numbers, curvatures first as in wp4's layout -- the curvature and signed speed at the knot times
+KNOT_T (0.1 .. 1.0 s, denser near) -- and the plan the follower reads is TW_K segments of TW_DT, each the knots linearly
+interpolated in time at its midpoint:
 
-    a[:, 0:K]   kappa_k = a * KAPPA_MAX       the steering curvature over segment k (+ = wheels left), either direction
-    a[:, K:2K]  v_k = a * V_FWD (a >= 0)       the signed speed over segment k; a = 0 is a stop, the middle of the range
-                    = a * V_REV (a < 0)
+    a[:, 0:N]    kappa_j = a * KAPPA_MAX                         the steering curvature at knot j (+ = wheels left)
+    a[:, N:2N]   v_j = (a + 1) / 2 (V_FWD + V_REV) - V_REV       signed speed: a = -1 -> -2 m/s, the stop at a = -2/3,
+                                                                  a = 0 -> 4 m/s, a = +1 -> 10 m/s
+
+Why knots (11-06 23:40): one number per 0.1 s segment (20) trained with KL 0.2-0.3 a step and 60 % of the samples clipped
+against 0.01 and 15 % for the 8-number plan, and drove 0.6 m/s at update 100 against 2+: 13 of the 20 never touched the
+command (tw_authority.py), and Adam moves a number with no signal as far as one with. A speed of 0 at a = 0 also started
+every fresh network standing still (its mean action drove at -0.03 m/s at update 75).
 
 Segment k runs for DT seconds: a constant-curvature arc of signed length v_k * DT from the end of segment k - 1. A
 negative length backs along the arc (heading changes by kappa * ds, as a car backing with that steering angle does).
@@ -25,29 +32,61 @@ from typing import Tuple
 
 import torch
 
-TW_K = 10                 # segments: K curvatures + K speeds
+TW_K = 10                 # segments the follower reads
 TW_DT = 0.1               # [s] per segment: 1.0 s ahead. 0.375 s segments (4, the old 8-number wire) left MAP's lookahead
                           # (1-2 m) inside the first one: only kappa_1 and v_1 moved the command (tw_authority.py, 11-06), a
                           # curvature-and-speed command in a plan's clothes; the user: "좀더 촘촘하게", and the wire can change
+KNOT_T = (0.1, 0.2, 0.4, 0.7, 1.0)   # [s] the knots the policy sets (see the docstring)
+N_KNOT = len(KNOT_T)
 KAPPA_MAX = 1.6           # [1/m] as wp4 (`mpc.PlanSpec.kappa_max`); the car's full lock is ~1.35
 V_FWD = 10.0              # [m/s] a = +1
 V_REV = 2.0               # [m/s] a = -1 (`EnvConfig.reverse_speed`)
 V_STOP = 0.05             # [m/s] below this a segment is a stop: no direction of its own
 
 
+def _interp_w():
+    """(K, N) weights taking knot values to segment midpoints, linear in time, held past the first / last knot"""
+    tk = torch.tensor(KNOT_T, dtype=torch.float64)
+    tm = (torch.arange(TW_K, dtype=torch.float64) + 0.5) * TW_DT
+    W = torch.zeros(TW_K, N_KNOT, dtype=torch.float64)
+    for i, t in enumerate(tm.tolist()):
+        if t <= tk[0]:
+            W[i, 0] = 1.0
+        elif t >= tk[-1]:
+            W[i, -1] = 1.0
+        else:
+            j = int((tk <= t).nonzero().max())
+            w = (t - float(tk[j])) / float(tk[j + 1] - tk[j])
+            W[i, j], W[i, j + 1] = 1.0 - w, w
+    return W
+
+
+_W = _interp_w()
+
+
+def knot_speed(a: torch.Tensor) -> torch.Tensor:
+    return (a + 1.0) * 0.5 * (V_FWD + V_REV) - V_REV
+
+
 def decode(action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """(B, 2K) action -> (kappa (B, K) [1/m], signed speed (B, K) [m/s])."""
+    """(B, 2 N_KNOT) action -> (kappa (B, K) [1/m], signed speed (B, K) [m/s]) of the K segments."""
     a = action.clamp(-1.0, 1.0)
-    k = a[:, :TW_K] * KAPPA_MAX
-    s = a[:, TW_K:2 * TW_K]
-    v = torch.where(s >= 0, s * V_FWD, s * V_REV)
+    W = _W.to(device=a.device, dtype=a.dtype)
+    k = (a[:, :N_KNOT] * KAPPA_MAX) @ W.T
+    v = knot_speed(a[:, N_KNOT:2 * N_KNOT]) @ W.T
     return k, v
 
 
+_W_PINV = torch.linalg.pinv(_W)
+
+
 def encode(kappa: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """The inverse of `decode` (clamped to the action range)."""
-    ak = (kappa / KAPPA_MAX).clamp(-1.0, 1.0)
-    av = torch.where(v >= 0, v / V_FWD, v / V_REV).clamp(-1.0, 1.0)
+    """(B, K) segment curvatures / speeds -> the knot action whose interpolation is closest to them (least squares;
+    clamped)."""
+    P = _W_PINV.to(device=kappa.device, dtype=kappa.dtype)
+    kk, vv = kappa @ P.T, v @ P.T
+    ak = (kk / KAPPA_MAX).clamp(-1.0, 1.0)
+    av = ((vv + V_REV) / (V_FWD + V_REV) * 2.0 - 1.0).clamp(-1.0, 1.0)
     return torch.cat([ak, av], 1)
 
 

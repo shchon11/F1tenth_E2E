@@ -1181,14 +1181,14 @@ def tw_of(ar) -> bool:
 def kappa_dims_of(ar) -> int:
     """how many of a plan's numbers are curvatures (they come first): wp4's 4, a time-waypoint plan's TW_K"""
     from .. import plan_tw
-    return plan_tw.TW_K if tw_of(ar) else PLAN_KAPPA_DIMS
+    return plan_tw.N_KNOT if tw_of(ar) else PLAN_KAPPA_DIMS
 
 
 def act_dim_of(ar) -> int:
     from ..mpc import act_dim as _act_dim
     from .. import plan_tw
     if tw_of(ar):
-        return 2 * plan_tw.TW_K
+        return 2 * plan_tw.N_KNOT
     return _act_dim("wp4") if plan_of(ar) else 2
 
 

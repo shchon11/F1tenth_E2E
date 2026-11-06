@@ -1413,7 +1413,7 @@ class F1VecEnv:
             if e.action_mode != "plan" or e.plan_follower != "map":
                 raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
             from . import plan_tw
-            self.act_dim = 2 * plan_tw.TW_K
+            self.act_dim = 2 * plan_tw.N_KNOT
 
     def _check_obs_v2(self) -> None:
         """Refuse a v2 env that could not produce the v2 observation honestly."""

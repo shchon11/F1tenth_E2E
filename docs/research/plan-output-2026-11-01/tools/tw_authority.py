@@ -77,6 +77,6 @@ for v_ref in (3.0, 5.0):
         env.step(act_full)
     ds = torch.cat(dst, 0).mean(0) * 180 / math.pi / 0.1
     dv = torch.cat(dsp, 0).mean(0) / 0.1
-    names = [f"곡률{i + 1}" for i in range(plan_tw.TW_K)] + [f"속도{i + 1}" for i in range(plan_tw.TW_K)]
+    names = [f"곡률@{t:g}s" for t in plan_tw.KNOT_T] + [f"속도@{t:g}s" for t in plan_tw.KNOT_T]
     print(f"중앙선 {v_ref:.0f} m/s, 숫자 1만큼 바꿀 때 명령 변화 (평균): " + " | ".join(
         f"{n} 조향 {s:.2f} deg·속도 {v:.2f} m/s" for n, s, v in zip(names, ds.tolist(), dv.tolist())), flush=True)

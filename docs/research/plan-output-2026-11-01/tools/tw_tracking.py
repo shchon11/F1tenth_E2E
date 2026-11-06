@@ -80,7 +80,22 @@ def plan_from_ref(ref, prog, step, pose):
         v = (dirn * ref[ar_, i_m, 3].abs()).clamp(-plan_tw.V_REV, plan_tw.V_FWD)
         ks.append(kap); vs.append(v)
         x, y, p = plan_tw._arc(x, y, p, kap, v * plan_tw.TW_DT)
-    return plan_tw.encode(torch.stack(ks, 1), torch.stack(vs, 1))
+    a0 = plan_tw.encode(torch.stack(ks, 1), torch.stack(vs, 1))
+    if os.environ.get("TW_FIT", "1") == "0":
+        return a0
+    # the knot action whose path passes closest to the reference points (the dense arcs above integrated from the car)
+    tgt = plan_tw.waypoints(torch.stack(ks, 1), torch.stack(vs, 1))[:, 1:, :2]
+    with torch.enable_grad():
+        a_ = a0.clone().requires_grad_(True)
+        opt = torch.optim.Adam([a_], lr=0.05)
+        for _ in range(60):
+            k_, v_ = plan_tw.decode(a_)
+            w_ = plan_tw.waypoints(k_, v_)[:, 1:, :2]
+            loss = (w_ - tgt).square().sum(-1).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+            with torch.no_grad():
+                a_.clamp_(-1.0, 1.0)
+    return a_.detach()
 
 
 def open_start(tid, n_try=256):
