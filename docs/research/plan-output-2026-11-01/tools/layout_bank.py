@@ -30,6 +30,9 @@ a = argparse.Namespace(**ck["args"])
 a.envs, a.seed, a.device = 64, int(time.time()) % 100000, "cuda"
 a.prop_place, a.prop_count, a.prop_fraction = "uniform", "fixed", 1.0
 a.prop_shapes = os.environ.get("BANK_SHAPES", getattr(a, "prop_shapes", "all"))   # 11-06: "boxes" = box-sized pieces only
+# 11-06 14:20: the checkpoint's own --prop-bank made the env draw from THAT bank (place "bank"), so the first "box" bank was the
+# old one re-judged (every catalogue piece); a bank is always drawn fresh
+a.prop_bank = ""
 env = SR.build_env(a, dev)
 proc = env.procedural
 names = getattr(env, "_track_names", None) or [SR.KOREA]

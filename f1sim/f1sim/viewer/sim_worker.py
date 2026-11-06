@@ -299,8 +299,8 @@ PROCEDURAL_DEFAULTS = {"procedural_obstacles": 1.0, "procedural_density": 1.5, "
                        "spawn_runway": 3.0, "movable_obstacles": False, "procedural_line_share": 0.3,
                        "procedural_place": "uniform",
                        # box-sized pieces only since 11-06 (the user: "장애물 크기 좀 박스크기로"); F1SIM_PROP_BANK picks another
-                       # bank dir, e.g. /home/shchon11/f1sim_runs/prop_banks (every catalogue piece, before 11-06)
-                       "procedural_bank": os.environ.get("F1SIM_PROP_BANK", "/home/shchon11/f1sim_runs/prop_banks_box")}
+                       # bank dir, e.g. /home/shchon11/f1sim_runs/prop_banks (every catalogue piece, before 11-06; prop_banks_box is the same, re-judged)
+                       "procedural_bank": os.environ.get("F1SIM_PROP_BANK", "/home/shchon11/f1sim_runs/prop_banks_box2")}
 
 #: 장애물 "학습과 같음" with more than one car: the other cars of the race, as the runs since s911
 #: drove them (`--opp-slots`). Not a preference -- with the corridor off there are crates on the
@@ -1245,6 +1245,12 @@ class SimWorker:
                     f"맵은 장애물 없이 고르세요.")
             proc_kw, proc_src = procedural_settings(ckpt_path, getattr(cfg, "collision_mode", "soft"))
             run_max_props = int(proc_kw.get("procedural_max_props") or 0)
+            if os.environ.get("F1SIM_PROP_COUNT") and custom is None:
+                # F1SIM_PROP_COUNT=N (11-06, the user: "너무 장애물 많아 평가환경에서", "2개임 대회에서는"): at most N pieces of
+                # each drawn layout (`ProceduralObstacles` count "max<N>")
+                n_ = os.environ["F1SIM_PROP_COUNT"]
+                # "uniform": 1 .. all of each layout's pieces, as the training world draws them (11-06, the user: "최대한 다양한 상황")
+                proc_kw["procedural_count"] = "uniform" if n_ == "uniform" else f"max{int(n_)}"
             if custom is not None:
                 # Room for 장애물 편집 (`CONSOLE_PROP_SLOTS`); a seed's session keeps the run's own count, which is
                 # also what its draw keeps.

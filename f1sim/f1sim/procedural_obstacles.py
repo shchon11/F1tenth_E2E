@@ -355,8 +355,14 @@ class ProceduralObstacles:
         #: lap's sectors. 11-03: at "fixed" every layout on Korea 2025 (43.4 m, density 1.5) had 7 patterns
         #: (13-18 pieces) or none, the car was clear of props within 10 m 34 % of the time, and the props policy
         #: drove a narrow centre line on the empty track too (7.18 s against the solo policy's 6.50 s).
+        #: "max<N>" (11-06, the user: "너무 장애물 많아 평가환경에서", "2개임 대회에서는"): a bank layout's pieces, at most N of
+        #: them, a random subset (a subset of a layout keeps its drivable way); the venue had two boxes
+        self.keep = 0
+        if count.startswith("max") and count[3:].isdigit():
+            self.keep = int(count[3:])
+            count = "fixed"
         if count not in ("fixed", "uniform"):
-            raise ValueError(f"procedural count must be 'fixed' or 'uniform', got {count!r}")
+            raise ValueError(f"procedural count must be 'fixed', 'uniform' or 'max<N>', got {count!r}")
         self.count = count
         #: share of the drawn pattern slots that become one piece on the racing line (`LINE_JITTER`); needs `set_line`.
         #: Off while a raceline corridor is installed: the planner opponents are blind to props and drive that line.
@@ -554,6 +560,8 @@ class ProceduralObstacles:
         live = sid >= 0
         n_live = live.sum(1, keepdim=True)
         k = n_live if self.count == "fixed" else 1 + torch.floor(self._rand((D, 1)) * n_live).long()
+        if self.keep > 0:
+            k = k.clamp_max(self.keep)
         r = torch.where(live, self._rand((D, C)), torch.full((D, C), 2.0, device=dev))
         live = live & (r.argsort(1).argsort(1) < k) & (self._rand((D, 1)) < self.fraction)
         sid = sid.clamp_min(0)

@@ -938,7 +938,14 @@ class TeacherPolicy:
                            int(ar.get("base_hold", BASE_HOLD)), visible=bool(ar.get("vis_actor", 0))) if ar.get("base") else None
 
     def policy(self, o):
-        """the race policy alone at observation `o`"""
+        """the race policy alone at observation `o`. F1SIM_POLICY_NOISE=k (a diagnostic, 11-06): sample with k x the
+        policy's own exploration std instead of the mean -- does the training noise carry the car out of stops the mean
+        action stays in?"""
+        k_ = float(os.environ.get("F1SIM_POLICY_NOISE", "0") or 0)
+        if k_ > 0:
+            nn_ = self.nrm(o)
+            d_ = self.net.dist(nn_)
+            return clamp_any(d_.mean + k_ * d_.stddev * torch.randn_like(d_.mean), self.ar)
         return clamp_any(self.net.pi(self.nrm(o)), self.ar)
 
     def __call__(self, last):

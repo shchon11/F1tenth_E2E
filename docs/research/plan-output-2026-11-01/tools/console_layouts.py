@@ -28,7 +28,8 @@ w = sim_worker.SimWorker(_N(), _N())
 w.say = lambda k, **f: None; w.stage = lambda *a, **k: None; w._hold_parked_ok = True
 w._overlay = dict(getattr(w, "_overlay", {}) or {}, plan=True)
 s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, cars_per_race=1, device="cuda", compile=False,
-                                    collision_mode="soft", procedural=True, episode_s=3600.0, randomize=False), 0)
+                                    collision_mode="soft", procedural=True, episode_s=3600.0,
+                                    randomize=bool(int(os.environ.get("F1SIM_EVAL_RANDOMIZE", "0")))), 0)   # 11-06: physics randomisation as in training
 env = s["env"]; proc = env.procedural
 from f1sim import maps, tracks
 tr = maps.load(tracks.resolve(mp))

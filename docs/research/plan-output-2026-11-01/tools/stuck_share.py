@@ -3,7 +3,7 @@
 없고(v_min 0) 멈춘 차는 MAP로 돌지 못해 그 episode 끝까지 갇힘(srp26owp u550 layout 2: 35 s, srp25owp u350 layout 6: 25 s 동안 6번).
 체크포인트를 그 학습과 똑같은 world(args 그대로)에서 학습 때처럼 탐색 noise로 몰고, 결정마다 '상자 옆에 서 있음'(속도 < 0.3 m/s, 가장
 가까운 상자 중심 0.8 m 안)을 셈. 미리 정한 판정: obstacle이 깔린 시간 중 그 몫이 10 % 이상이면 갇힘이 학습을 크게 갉아먹는 것 -> 갇히면
-episode를 끝내도록 고침. 인자: 체크포인트 대수 초 시드"""
+episode를 끝내도록 고침. 인자: 체크포인트 대수 초 시드 [dense]"""
 import os, sys, math, argparse
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
@@ -16,6 +16,20 @@ dev = torch.device("cuda")
 ck = torch.load(path, map_location=dev, weights_only=False)
 a = argparse.Namespace(**ck["args"])
 a.envs, a.seed, a.device = n_env, seed, "cuda"
+if len(sys.argv) > 5 and sys.argv[5] == "dense":
+    # 11-06 14:00: the evaluation's density in the training world -- every piece of the layout, always, never removed
+    a.prop_count, a.prop_fraction, a.removal_p = "fixed", 1.0, 0.0
+    print("[dense] 상자 전부, 늘, 안 치움", flush=True)
+if len(sys.argv) > 5 and sys.argv[5] == "evallike":
+    # 11-06 14:15: the console evaluation's world inside the training env -- every piece, always, never removed, the original
+    # track only, no opponent, no spawn behind a box (dense alone stood 8 % vs the console's 50-57 %)
+    a.prop_count, a.prop_fraction, a.removal_p, a.warps, a.opp_present, a.spawn_behind_prop = "fixed", 1.0, 0.0, 0, 0.0, 0.0
+    print("[evallike] 상자 전부·안 치움·원래 트랙만·상대 없음·상자 뒤 출발 없음", flush=True)
+if len(sys.argv) > 5 and sys.argv[5] == "solo1":
+    # 11-06 14:30: evallike + one car per env (stage props: no opponent slot at all), as the console's solo session
+    a.prop_count, a.prop_fraction, a.removal_p, a.warps, a.opp_present, a.spawn_behind_prop = "fixed", 1.0, 0.0, 0, 0.0, 0.0
+    a.stage = "props"
+    print("[solo1] evallike + 환경당 차 1대", flush=True)
 env = SR.build_env(a, dev)
 prepare_graph_runtime(env, log=lambda _t: None)
 env.reset(seed=seed)
