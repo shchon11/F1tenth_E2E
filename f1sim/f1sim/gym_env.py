@@ -1411,13 +1411,14 @@ class F1VecEnv:
         self.plan_dim = self.act_dim
         self._tw_action = None
         self._tw_carry = None
-        if e.learner_plan in ("tw", "tw5", "tw5c"):
+        if e.learner_plan in ("tw", "tw5", "tw5c", "tw5g"):
             if e.action_mode != "plan" or e.plan_follower != "map":
                 raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
             from . import plan_tw
             self.act_dim = 2 * plan_tw.N_KNOT
-            if e.learner_plan == "tw5c":
-                self._tw_carry = plan_tw.Carry(self.B, self.sim.control_dt, self.device)
+            if e.learner_plan in ("tw5c", "tw5g"):
+                self._tw_carry = plan_tw.Carry(self.B, self.sim.control_dt, self.device, grip=e.learner_plan == "tw5g")
+            self._tw_amax = None                            # tw5g: (G, V) steady-state lateral acceleration of MAP's table
 
     def _check_obs_v2(self) -> None:
         """Refuse a v2 env that could not produce the v2 observation honestly."""
@@ -3003,13 +3004,15 @@ class F1VecEnv:
 
     def step(self, action: torch.Tensor):
         ext = float(self.ecfg.reverse_ext)
-        if self.ecfg.learner_plan in ("tw", "tw5", "tw5c"):
+        if self.ecfg.learner_plan in ("tw", "tw5", "tw5c", "tw5g"):
             # the learner's time-waypoint plans go to MAP's own decoder (`MAPPlanTracker.tw_action`); the internal plan
             # every other reader sees for those rows is zeros (the traffic's rows are the env's own, as always)
             self._tw_action = action.to(self.device).clamp(-1.0, 1.0)
             if self._tw_carry is not None:
                 # "tw5c": the action is the change of the carried plan (`plan_tw.Carry`)
                 self._tw_carry.step(self._tw_action, self.learner)
+                if self._tw_carry.grip:
+                    self._tw_carry.kcap = self._tw_kcap(self._tw_carry.v)
             action = torch.zeros(self.B, self.plan_dim, device=self.device)
         if ext > 0 and self.act_dim == 2:
             # the learners' speed may reach into the reverse extension; everything else stays in [-1, 1]
@@ -3054,7 +3057,7 @@ class F1VecEnv:
                 # `acc_now`), and follows the plans of the policy's own cars
                 self.tracker.P = self.sim.P
                 self.tracker.map_rows = self.learner
-                self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5", "tw5c")
+                self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5", "tw5c", "tw5g")
                 from . import plan_tw as _ptw
                 self.tracker.tw_fmt = _ptw.geom(self.ecfg.learner_plan) if self.tracker.tw else "tw"
                 self.tracker.tw_kv = self._tw_carry.segments() if self._tw_carry is not None else None
@@ -4313,6 +4316,20 @@ class F1VecEnv:
         self._plan_real.fill_(True)
         if self.opp_token_keep_alt:
             self._plan_alt.copy_(alt)
+
+    def _tw_kcap(self, v: torch.Tensor) -> torch.Tensor:
+        """(B, n) tw5g's curvature limit at planned speeds `v` (B, n): min(KAPPA_MAX, a_max / v^2), a_max the most
+        lateral acceleration MAP's steering table reaches in a steady state at that speed on each car's grip level"""
+        from . import plan_tw
+        from .map_controller import grip_index
+        lut = self.tracker.map.lut
+        if self._tw_amax is None:
+            self._tw_amax = torch.nan_to_num(lut.table, nan=-1.0).amax(1).clamp_min(0.5).float()     # (G, V)
+        g = grip_index(self.sim.P, self.tracker.nominal)                                                   # (B,)
+        sp = v.abs()
+        j = (lut.vels.float()[None, None, :] - sp[..., None]).abs().argmin(-1)                            # (B, n)
+        a = self._tw_amax[g[:, None].expand_as(j), j]
+        return torch.minimum(torch.full_like(sp, plan_tw.KAPPA_MAX), a / sp.clamp_min(0.3) ** 2)
 
     def _plan_fallback(self, ids: torch.Tensor, state: torch.Tensor) -> None:
         """Give `ids` a constant-velocity stand-in plan anchored at their current pose.

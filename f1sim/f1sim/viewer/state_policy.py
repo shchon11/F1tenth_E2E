@@ -82,10 +82,10 @@ def describe(ck: dict, kind: str, path: str) -> str:
     run = os.path.basename(os.path.dirname(os.path.realpath(path)))
     name = os.path.basename(os.path.realpath(path))
     a = ck.get("args") or {}
-    if is_plan(ck) and str(a.get("plan_format", "wp4") or "wp4") in ("tw", "tw5", "tw5c"):
+    if is_plan(ck) and str(a.get("plan_format", "wp4") or "wp4") in ("tw", "tw5", "tw5c", "tw5g"):
         from .. import plan_tw
         k_ = plan_tw.FORMATS[str(a.get("plan_format"))][1]
-        cc_ = ", 직전 plan 이어받기" if str(a.get("plan_format")) == "tw5c" else ""
+        cc_ = {"tw5c": ", 직전 plan 이어받기", "tw5g": ", 직전 plan 이어받기, 곡률은 타이어 한계 안"}.get(str(a.get("plan_format")), "")
         out = (f"궤적(시간 waypoint {k_} x {plan_tw.TW_DT:g} s, 전진·후진{cc_}) -> MAP·후진 추종, "
                f"{40 // max(1, int(a.get('repeat', 2)))} Hz")
     else:

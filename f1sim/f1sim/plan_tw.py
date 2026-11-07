@@ -49,6 +49,16 @@ FORMATS = {"tw": (KNOT_T, 10), "tw5": ((0.1, 0.2, 0.3, 0.4, 0.5), 5)}
 #: the next (the user: "이리갔다가 저리갔다가 줏대가 없어"). Here the plan is state: each control step it moves on by one
 #: step of time and the learner's action is only the change, so with nothing to change it stays the plan it was.
 FORMATS["tw5c"] = FORMATS["tw5"]
+#: "tw5g" (11-07 16:10): tw5c whose curvature lives inside what the tyres hold at each point's planned speed. tw5c u100
+#: (srp25tw5c) drove the empty track in 11-13 s with 28 hard wall hits a minute against tw5's 7.4 s and 0: its carried
+#: curvature kept growing through a corner until the 1.6 1/m clamp -- plans that were full circles of 0.6 m radius at
+#: 5-6 m/s, where the tyres hold ~0.3 -- MAP steered off a point on the circle, the car swung into the inside wall, and
+#: undoing 1.6 1/m at 0.4 per decision took 0.2 s. Here the carried number is the share u in [-1, 1] of the curvature
+#: limit at that point's speed, min(KAPPA_MAX, a_max(v) / v^2) with a_max the steady-state lateral acceleration of MAP's
+#: own steering table (`Carry.kcap`, set by the env from the car's grip level) -- the plan is always one the car can drive
+#: and a full-scale action means the same "turn as hard as it holds" at every speed
+FORMATS["tw5g"] = FORMATS["tw5"]
+CARRY_U_RATE = 5.0        # [1/s] tw5g: a = +-1 moves the share u this fast -- the whole range in 0.2 s, 0.25 per decision
 CARRY_K_RATE = 8.0        # [1/m per s] a = +-1 moves a knot's curvature this fast: 0.4 1/m per 0.05 s decision, the
                           # whole range in 0.4 s; at 6 m/s the tyres' limit (~0.28 1/m) in one decision. The exploration noise
                           # is a random walk of the plan now: std 0.61 (from scratch) is 1.1 1/m over a second
@@ -58,7 +68,7 @@ CARRY_V_INIT = 4.0        # [m/s] a fresh plan's speed at least (what tw's mean 
 
 def geom(fmt: str) -> str:
     """the format whose knots / segments a format's plans have (`Carry` keeps tw5's)"""
-    return "tw5" if fmt == "tw5c" else fmt
+    return "tw5" if fmt in ("tw5c", "tw5g") else fmt
 KAPPA_MAX = 1.6           # [1/m] as wp4 (`mpc.PlanSpec.kappa_max`); the car's full lock is ~1.35
 V_FWD = 10.0              # [m/s] a = +1
 V_REV = 2.0               # [m/s] a = -1 (`EnvConfig.reverse_speed`)
@@ -229,9 +239,12 @@ class Carry:
     follower's 0.1 s segments (the grid's means), `obs` the same 10 numbers scaled as an action, what the policy sees in
     place of its last action."""
 
-    def __init__(self, B: int, dt: float, device, fmt: str = "tw5"):
+    def __init__(self, B: int, dt: float, device, fmt: str = "tw5", grip: bool = False):
         knots, K = FORMATS[fmt]
         self.K, self.dt = K, float(dt)
+        #: tw5g: `k` holds the share u of the curvature limit and `kcap` (B, n) is that limit, set by the env each step
+        self.grip = bool(grip)
+        self.kcap = None
         self.n = int(round(K * TW_DT / self.dt))
         assert self.n % K == 0, (self.n, K)
         self.Wg = _interp_grid(knots, self.n, self.dt).to(device=device, dtype=torch.float32)
@@ -248,19 +261,31 @@ class Carry:
         a = action.float().clamp(-1.0, 1.0)
         k = torch.cat([self.k[:, 1:], self.k[:, -1:]], 1)
         v = torch.cat([self.v[:, 1:], self.v[:, -1:]], 1)
-        k = (k + (a[:, :N_KNOT] * (CARRY_K_RATE * self.dt)) @ self.Wg.T).clamp(-KAPPA_MAX, KAPPA_MAX)
+        if self.grip:
+            k = (k + (a[:, :N_KNOT] * (CARRY_U_RATE * self.dt)) @ self.Wg.T).clamp(-1.0, 1.0)
+        else:
+            k = (k + (a[:, :N_KNOT] * (CARRY_K_RATE * self.dt)) @ self.Wg.T).clamp(-KAPPA_MAX, KAPPA_MAX)
         v = (v + (a[:, N_KNOT:2 * N_KNOT] * (CARRY_V_RATE * self.dt)) @ self.Wg.T).clamp(-V_REV, V_FWD)
         r = rows[:, None]
         self.k = torch.where(r, k, self.k)
         self.v = torch.where(r, v, self.v)
 
+    def curvature(self) -> torch.Tensor:
+        """(B, n) the plan's curvature on the grid [1/m]"""
+        if not self.grip:
+            return self.k
+        cap = self.kcap if self.kcap is not None else torch.full_like(self.k, KAPPA_MAX)
+        return self.k * cap
+
     def segments(self) -> Tuple[torch.Tensor, torch.Tensor]:
         B = self.k.shape[0]
-        return self.k.view(B, self.K, -1).mean(2), self.v.view(B, self.K, -1).mean(2)
+        return self.curvature().view(B, self.K, -1).mean(2), self.v.view(B, self.K, -1).mean(2)
 
     def obs(self) -> torch.Tensor:
-        ks, vs = self.segments()
-        return torch.cat([ks / KAPPA_MAX, (vs + V_REV) / (V_FWD + V_REV) * 2.0 - 1.0], 1)
+        B = self.k.shape[0]
+        ks = self.k.view(B, self.K, -1).mean(2) * (1.0 if self.grip else 1.0 / KAPPA_MAX)
+        vs = self.v.view(B, self.K, -1).mean(2)
+        return torch.cat([ks, (vs + V_REV) / (V_FWD + V_REV) * 2.0 - 1.0], 1)
 
 
 def _interp_grid(knots, n: int, dt: float) -> torch.Tensor:
