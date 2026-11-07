@@ -251,6 +251,14 @@ class Simulator:
         #: (`SimParams.contact_accel_hold`): it covers the window that resolution resolved, which runs on
         #: into the next control step. Written in place at the end of the roll.
         self.contact_acc = torch.zeros(num_envs, 2, device=self.device)
+        #: Ideal execution (11-07 redesign, `EnvConfig.learner_exec` "ideal"): rows flagged here drive their command
+        #: exactly -- the steering angle and the speed of `cmd`, no delay, no servo, no motor, no tyre slip (the
+        #: kinematic bicycle of `dynamics.step_dynamics`' low-speed branch) -- while the contacts are resolved as for
+        #: every car. After a contact took speed off, the row's speed stays under what the contact left until
+        #: `ideal_vcap` is reset (the env does at every new plan): a plan does not grind along a wall at its own
+        #: speed. None = off; set before the roll is first compiled / captured.
+        self.ideal_rows = None
+        self.ideal_vcap = torch.full((num_envs,), 1e3, device=self.device)
         #: Car-car contact seen inside the roll (`SimParams.car_response`), latched like `wall_touched`: the
         #: response pushes two cars apart within the step, so the step-end test alone would miss it.
         self.car_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
@@ -1437,8 +1445,34 @@ class Simulator:
             a_cmd = vesc_accel(eff[:, 1], v_fb, P)
             a_cmd_last = dyn.motor_accel(a_cmd, v_fb, P)     # after the limits: what is applied
             r_old = state[:, dyn.IR]
+            st_prev = state
             state, ax, ay = self._step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt,
                                                 wheel=wheel_on)
+            if self.ideal_rows is not None:
+                # the command, exactly: kinematic bicycle about the CoG (beta = atan(lr / L tan delta)), the
+                # speed capped by what the last contact left (`ideal_vcap`)
+                d_i = cmd_hist[:, 0, 0]
+                v_i = torch.maximum(torch.minimum(cmd_hist[:, 0, 1], self.ideal_vcap), -self.ideal_vcap)
+                L_i = P["lf"] + P["lr"]
+                tan_i = torch.tan(d_i)
+                b_i = torch.atan(P["lr"] / L_i * tan_i)
+                r_i = v_i * torch.cos(b_i) * tan_i / L_i
+                vy_i = v_i * torch.tan(b_i)
+                psi0 = st_prev[:, dyn.IYAW]
+                psim = psi0 + 0.5 * r_i * self.dt
+                kin = st_prev.clone()
+                kin[:, dyn.IX] = st_prev[:, dyn.IX] + (v_i * torch.cos(psim) - vy_i * torch.sin(psim)) * self.dt
+                kin[:, dyn.IY] = st_prev[:, dyn.IY] + (v_i * torch.sin(psim) + vy_i * torch.cos(psim)) * self.dt
+                kin[:, dyn.IYAW] = psi0 + r_i * self.dt
+                kin[:, dyn.IVX] = v_i
+                kin[:, dyn.IVY] = vy_i
+                kin[:, dyn.IR] = r_i
+                kin[:, dyn.ISTEER] = d_i
+                kin[:, dyn.IOMEGA] = v_i / P["r_w"]
+                m_i = self.ideal_rows[:, None]
+                ax = torch.where(self.ideal_rows, (v_i - st_prev[:, dyn.IVX]) / self.dt, ax)
+                ay = torch.where(self.ideal_rows, v_i * r_i, ay)
+                state = torch.where(m_i, kin, state)
             # Before the sprung mass, so the springs feel the hit: the body does not deform but it
             # is on suspension, and a car that runs into something dives on its nose. The contact
             # changes the velocity outside the dynamics, so `ax`/`ay` alone never carried it --
@@ -1460,6 +1494,7 @@ class Simulator:
                     # prop shoved into a wall stops at it
                     self.track.env_props.drift(self.dt * span, self.tid)
                 v_pre = state[:, dyn.IVX:dyn.IVY + 1]
+                vx_pre = state[:, dyn.IVX]
                 state, a_contact = self._resolve_wall_contact(state, dt=self.dt * span)
                 if cars:
                     v_wall = state[:, dyn.IVX:dyn.IVY + 1]
@@ -1469,6 +1504,11 @@ class Simulator:
                         a_car = (state[:, dyn.IVX:dyn.IVY + 1] - v_wall) / (self.dt * span)
                         mag = a_car.norm(dim=1, keepdim=True).clamp_min(1e-9)
                         a_contact = a_contact + a_car * (mag.clamp(max=self.cfg.imu.accel_range) / mag)
+                if self.ideal_rows is not None:
+                    # a contact took speed off an ideal row: it stays under that until the next plan
+                    lost = self.ideal_rows & (state[:, dyn.IVX].abs() < vx_pre.abs() - 1e-4)
+                    self.ideal_vcap.copy_(torch.where(lost, torch.minimum(self.ideal_vcap, state[:, dyn.IVX].abs()),
+                                                      self.ideal_vcap))
                 if hold:
                     # Everything this window's contacts did to the velocity, spread over the window and
                     # applied for its length -- so the springs and the accelerometer integrate the whole

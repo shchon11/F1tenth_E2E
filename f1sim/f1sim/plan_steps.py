@@ -38,6 +38,7 @@ class Limits:
     a_acc: float            # [m/s^2] motor
     a_brake: float          # [m/s^2] brakes
     wheelbase: float        # [m]
+    lr: float               # [m] CoG -> rear axle (the kinematic bicycle about the CoG, as the simulator's)
     v_grid: torch.Tensor    # (G,) [m/s] speeds of the tyre table
     k_tyre: torch.Tensor    # (G,) [1/m] curvature the tyres hold at each speed, non-increasing
 
@@ -54,7 +55,7 @@ class Limits:
         k = torch.minimum(torch.full_like(v_grid, k_lock), a_g / v_grid.clamp_min(1e-3) ** 2)
         k = torch.cummin(k, 0).values                       # non-increasing in speed, so the inverse below is one-valued
         return Limits(s_max, float(nominal["sv_max"]), float(nominal["a_max"]), float(nominal["a_brake"]), L,
-                      v_grid.to(device), k.to(device))
+                      float(nominal["lr"]), v_grid.to(device), k.to(device))
 
     def kappa_at(self, v: torch.Tensor) -> torch.Tensor:
         """curvature the tyres hold at speed |v| (linear in the table)"""
@@ -126,29 +127,36 @@ def step_targets(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: 
 
 
 def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: Limits) -> Dict[str, torch.Tensor]:
-    """The plan in the car's frame now: dense poses on the control grid, (B, N SUB + 1) each of x, y, psi, v, delta, t
-    (index 0 = now), and the 10 points `pts` (B, N, 2) / their speeds `pv` (B, N)."""
+    """The plan in the car's frame now (its CoG): dense poses on the control grid, (B, N SUB + 1) each of x, y, psi, v,
+    delta, t (index 0 = now), the 10 points `pts` (B, N, 2) / their speeds `pv` (B, N), and the command of every control
+    step `cmd_d` / `cmd_v` (B, N SUB) -- held over its 0.025 s, the kinematic bicycle about the CoG driven by them is
+    exactly these poses (`Sim.ideal_rows`)."""
     d_end, v_end, forced = step_targets(action, v0, d0, lim)
     B = action.shape[0]
     dev = action.device
     h = DT / SUB
     x = torch.zeros(B, device=dev); y = torch.zeros(B, device=dev); psi = torch.zeros(B, device=dev)
     v_prev, d_prev = v0.float(), d0.float()
-    X, Y, P, V, D = [x], [y], [psi], [v_prev], [d_prev]
+    X, Y, P, V, D, CD, CV = [x], [y], [psi], [v_prev], [d_prev], [], []
     for k in range(N_STEP):
         for j in range(1, SUB + 1):
             w0, w1 = (j - 1) / SUB, j / SUB
             va = v_prev + (v_end[:, k] - v_prev) * (0.5 * (w0 + w1))       # the substep's mean speed and steering
             da = d_prev + (d_end[:, k] - d_prev) * (0.5 * (w0 + w1))
-            kap = steer_to_kappa(da, lim)
-            dpsi = kap * va * h
-            mid = psi + 0.5 * dpsi
-            x = x + va * h * torch.cos(mid); y = y + va * h * torch.sin(mid); psi = psi + dpsi
+            tan_d = torch.tan(da)
+            beta = torch.atan(lim.lr / lim.wheelbase * tan_d)
+            r = va * torch.cos(beta) * tan_d / lim.wheelbase
+            vy = va * torch.tan(beta)
+            mid = psi + 0.5 * r * h
+            x = x + (va * torch.cos(mid) - vy * torch.sin(mid)) * h
+            y = y + (va * torch.sin(mid) + vy * torch.cos(mid)) * h
+            psi = psi + r * h
+            CD.append(da); CV.append(va)
             X.append(x); Y.append(y); P.append(psi)
             V.append(v_prev + (v_end[:, k] - v_prev) * w1); D.append(d_prev + (d_end[:, k] - d_prev) * w1)
         v_prev, d_prev = v_end[:, k], d_end[:, k]
     out = {"x": torch.stack(X, 1), "y": torch.stack(Y, 1), "psi": torch.stack(P, 1), "v": torch.stack(V, 1),
-           "delta": torch.stack(D, 1), "forced": forced}
+           "delta": torch.stack(D, 1), "forced": forced, "cmd_d": torch.stack(CD, 1), "cmd_v": torch.stack(CV, 1)}
     out["t"] = torch.arange(N_STEP * SUB + 1, device=dev, dtype=torch.float32) * h
     idx = torch.arange(1, N_STEP + 1, device=dev) * SUB
     out["pts"] = torch.stack([out["x"][:, idx], out["y"][:, idx]], -1)

@@ -1411,6 +1411,7 @@ class F1VecEnv:
         self.plan_dim = self.act_dim
         self._tw_action = None
         self._tw_carry = None
+        self.ideal_cmd = None                                       # `enable_ideal`
         if e.learner_plan in ("tw", "tw5", "tw5c", "tw5g"):
             if e.action_mode != "plan" or e.plan_follower != "map":
                 raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
@@ -1419,6 +1420,13 @@ class F1VecEnv:
             if e.learner_plan in ("tw5c", "tw5g"):
                 self._tw_carry = plan_tw.Carry(self.B, self.sim.control_dt, self.device, grip=e.learner_plan == "tw5g")
             self._tw_amax = None                            # tw5g: (G, V) steady-state lateral acceleration of MAP's table
+
+    def enable_ideal(self) -> None:
+        """Ideal execution for the learner's rows (11-07 redesign): set `ideal_cmd` (B, 2) -- steering [rad], speed [m/s,
+        signed] -- before every `step` and the rows drive exactly that (`Sim.ideal_rows`), contacts resolved as usual.
+        Before the first step / graph capture: the roll reads the flag when it is compiled."""
+        self.sim.ideal_rows = self.learner.clone()
+        self.ideal_cmd = torch.zeros(self.B, 2, device=self.device)
 
     def _check_obs_v2(self) -> None:
         """Refuse a v2 env that could not produce the v2 observation honestly."""
@@ -3163,6 +3171,11 @@ class F1VecEnv:
             cmd = self._external_commands(cmd)
         if self._ext_ids:
             cmd = torch.where(self.ext_mask[:, None], self.ext_cmd, cmd)
+        if self.ideal_cmd is not None:
+            # ideal execution (`enable_ideal`, 11-07 redesign): the learner's rows drive the command they were handed
+            # exactly (`Sim.ideal_rows`); whatever the tracker made of their action is not used
+            self.sim.ideal_rows.copy_(self.learner)
+            cmd = torch.where(self.learner[:, None], self.ideal_cmd, cmd)
         steer_norm = cmd[:, 0] / self.s_max
         r = self.sim.step(cmd)
         self.last_cmd = cmd
