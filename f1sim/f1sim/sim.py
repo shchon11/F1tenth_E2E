@@ -1453,6 +1453,12 @@ class Simulator:
                 # speed capped by what the last contact left (`ideal_vcap`)
                 d_i = cmd_hist[:, 0, 0]
                 v_i = torch.maximum(torch.minimum(cmd_hist[:, 0, 1], self.ideal_vcap), -self.ideal_vcap)
+                # within what the car can do from its TRUE state this substep (11-08: the plan starts from the policy's own
+                # speed estimate, so a wrong estimate is a command the car cannot follow, not a jump): motor / brakes,
+                # servo rate. A plan made from the true state never touches these
+                v0_i, s0_i = st_prev[:, dyn.IVX], st_prev[:, dyn.ISTEER]
+                v_i = torch.minimum(torch.maximum(v_i, v0_i - P["a_brake"] * self.dt), v0_i + P["a_max"] * self.dt)
+                d_i = torch.minimum(torch.maximum(d_i, s0_i - P["sv_max"] * self.dt), s0_i + P["sv_max"] * self.dt)
                 L_i = P["lf"] + P["lr"]
                 tan_i = torch.tan(d_i)
                 b_i = torch.atan(P["lr"] / L_i * tan_i)

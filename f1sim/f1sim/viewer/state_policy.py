@@ -28,7 +28,7 @@ def state_kind(path: str) -> str:
         return ""
     if not isinstance(ck, dict):
         return ""
-    if ck.get("format") == "plan_steps" and "actor" in ck:
+    if ck.get("format") in ("plan_steps", "plan_steps2") and "actor" in ck:
         return "plan"                                     # `learn.plan_rl` (11-07 redesign)
     if "student" in ck and "ego_keys" in ck:
         return "student"
@@ -63,7 +63,7 @@ def contract(ck: dict, kind: str) -> dict:
 
 def is_plan(ck: dict) -> bool:
     """a checkpoint that outputs a trajectory followed by MAP (`state_rl --action plan`, 11-01)"""
-    if ck.get("format") == "plan_steps":
+    if ck.get("format") in ("plan_steps", "plan_steps2"):
         return True
     from ..learn import state_rl
     return state_rl.plan_of(ck.get("args") or {})
@@ -96,6 +96,9 @@ def describe(ck: dict, kind: str, path: str) -> str:
     name = os.path.basename(os.path.realpath(path))
     a = ck.get("args") or {}
     if kind == "plan":
+        if ck.get("format") == "plan_steps2":
+            return (f"planner(재설계 v2): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan, "
+                    f"속도는 스스로 짐작 -> 점 10개 x 0.1 s(차 한계 안) -> MAP·후진 추종, 10 Hz")
         return (f"planner(재설계): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + 속도·핸들·회전 + 직전 plan -> "
                 f"점 10개 x 0.1 s(걸음마다 꺾기·속도, 차 한계 안) -> MAP·후진 추종, 10 Hz")
     if is_plan(ck) and str(a.get("plan_format", "wp4") or "wp4") in ("tw", "tw5", "tw5c", "tw5g"):
@@ -189,7 +192,7 @@ class StateIntro:
         self.h: dict = {}
         self.paused = False
         if runner.kind == "plan":
-            mlp = runner.actor.mlp
+            mlp = runner.actor.trunk if hasattr(runner.actor, "trunk") else runner.actor.mlp
             mlp[1].register_forward_hook(self._hook("stem"))
             mlp[3].register_forward_hook(self._hook("hidden"))
         elif runner.kind == "teacher":

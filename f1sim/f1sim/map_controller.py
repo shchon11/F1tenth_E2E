@@ -562,6 +562,10 @@ class MAPPlanTracker:
         self._held_tw = None
         self.tw_action = None
         self.tw_fmt = "tw"                             # `plan_tw.FORMATS` key
+        #: [s] speed command read this far ahead on a time-waypoint plan instead of its first segment (11-08, the user:
+        #: "제어기에 딜레이 감안해서 미리 state 추정해서 제어"): the motor follows a speed step with ~0.25 s of lag (a step to the
+        #: plan's 0.56 m/s per 0.1 s gave 0.15 in 0.1 s), so commanding the plan's speed this much later leads it. 0 = as before
+        self.tw_speed_lead = 0.0
         self.tw_kv = None                              # (kappa, v) (B, K) segments of a carried plan, else None
         #: the backward pure pursuit's lookahead [m]: max(back_la_min, back_la_t x |v|), tuned by the distance to given
         #: backing paths (`tools/tw_tune.py`, 11-06: 0.8 / 8.8 cm straight / curving; MAP turned round 0.8 / 13.4)
@@ -578,7 +582,7 @@ class MAPPlanTracker:
 
     def __setattr__(self, name, value):
         if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
-                    "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt", "tw_kv"):
+                    "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt", "tw_kv", "tw_speed_lead"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._inner, name, value)
@@ -725,7 +729,14 @@ class MAPPlanTracker:
             # its first segment, while MAP's nearest waypoint (in metres) passes a short slow first segment within a step or
             # two -- held one control step, a 0.1 m/s segment is a few cm long and MAP drove the next segment's speed (the
             # tracking test, 11-06: 1-5 m/s commanded on plans that said 0.1)
-            speed = torch.minimum(v1_tw, speed_cap)
+            v_cmd_tw = v1_tw
+            if self.tw_speed_lead > 0 and self.tw_plan is not None:
+                tp_ = self.tw_plan
+                j_ = int(round(self.tw_speed_lead / float(tp_[0, -1, 4]) * (tp_.shape[1] - 1)))
+                v_lead = tp_[:, min(j_, tp_.shape[1] - 1), 3].to(v1_tw.dtype)
+                # the lead only on a run that keeps its direction (a change of direction is a stop first)
+                v_cmd_tw = torch.where(torch.sign(v_lead) == torch.sign(v1_tw), v_lead, v1_tw)
+            speed = torch.minimum(v_cmd_tw, speed_cap)
             # a backward first run: pure pursuit (kinematic bicycle) to the point `back_la_min` m (or `back_la_t` s) back along it
             from . import plan_tw
             back = d_tw < 0

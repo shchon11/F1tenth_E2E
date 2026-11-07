@@ -80,11 +80,11 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, beams: int, priv_dim: int, hidden: int = 256):
+    def __init__(self, beams: int, priv_dim: int, hidden: int = 256, state_dim: int = STATE_DIM):
         super().__init__()
         self.enc = ScanEncoder(beams)
-        self.norm = RunningNorm(STATE_DIM + priv_dim)
-        self.mlp = nn.Sequential(nn.Linear(256 + STATE_DIM + priv_dim, hidden), nn.Tanh(), nn.Linear(hidden, hidden),
+        self.norm = RunningNorm(state_dim + priv_dim)
+        self.mlp = nn.Sequential(nn.Linear(256 + state_dim + priv_dim, hidden), nn.Tanh(), nn.Linear(hidden, hidden),
                                  nn.Tanh(), nn.Linear(hidden, 1))
 
     def forward(self, scans: torch.Tensor, state: torch.Tensor, priv: torch.Tensor) -> torch.Tensor:
@@ -206,9 +206,15 @@ class PlanRunner:
         self.env, self.device, self.mode = env, device, mode
         self.kind = "plan"
         self.lid = env.learner_ids
-        self.actor = load_actor(ck, device)
+        self.v2 = ck.get("format") == "plan_steps2"
         self.lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), device)
-        self.obs = PlanObs(env, self.lim, None)
+        if self.v2:
+            self.actor = load_actor2(ck, device)
+            self.obs = PlanObs2(env, self.lim, None)
+        else:
+            self.actor = load_actor(ck, device)
+            self.obs = PlanObs(env, self.lim, None)
+        self.v_hat = None
         Bl = int(self.lid.numel())
         self.cmd_d = torch.zeros(Bl, PS.N_STEP * PS.SUB, device=device)
         self.cmd_v = torch.zeros(Bl, PS.N_STEP * PS.SUB, device=device)
@@ -233,14 +239,19 @@ class PlanRunner:
         if bool(due.any()):
             self.obs.push_scan(due & ~self.first)                 # a fresh start already holds its scan three times
             self.first &= ~due
-            s = self.obs.state()
-            mean, _ = self.actor(self.obs.scans, s)
-            self.last_mean = mean
             st = env.sim.state[lid].clone()
-            p = PS.roll(torch.tanh(mean), st[:, dyn.IVX], st[:, dyn.ISTEER], self.lim)
+            if self.v2:
+                _, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
+                self.v_hat = v_hat
+            else:
+                mean, _ = self.actor(self.obs.scans, self.obs.state())
+                p = PS.roll(torch.tanh(mean), st[:, dyn.IVX], st[:, dyn.ISTEER], self.lim)
+            self.last_mean = mean
             x, y, _ = plan_world(p, st)
             idx = PT_IDX.to(self.device)
             self.obs.set_plan(torch.stack([x[:, idx], y[:, idx]], -1), p["pv"], due)
+            if self.v2:
+                self.obs.set_plan2(p, due)
             self.cmd_d = torch.where(due[:, None], p["cmd_d"], self.cmd_d)
             self.cmd_v = torch.where(due[:, None], p["cmd_v"], self.cmd_v)
             if self.mode == "map":
@@ -255,3 +266,101 @@ class PlanRunner:
             env.ideal_cmd[lid, 0] = self.cmd_d.gather(1, jj)[:, 0]
             env.ideal_cmd[lid, 1] = self.cmd_v.gather(1, jj)[:, 0]
         return torch.zeros(env.B, env.act_dim, device=self.device)
+
+
+# ------------------------------------------------------------------------------------------------ v2 (11-08)
+# The user: "Imu랑 모터에 주는 전류값정도밖에 모르잖슴", "추정하라 하는게 낫지않냐 원시센서값만 주고" (raw sensors only, the policy
+# estimates its own speed), "2" (the plan starts from that estimate). What v2's actor sees:
+#   * the LiDAR ranges of the last 3 scans (as v1)
+#   * the IMU, raw: gyro xyz [rad/s], accelerometer xyz [m/s^2] (the last control step's mean)
+#   * what it last commanded: the steering and the speed of its last plan 0.1 s in
+#   * its last plan, in the frame of the pose that plan said the car would be in now: points 2..10 and the 10 speeds
+#     -- no measurement needed (v1 moved it with the TRUE pose)
+# No wheel speed, no true steering angle, no pose. The plan starts from the actor's own speed estimate (a head trained on
+# the simulator's true speed, training only) and the last steering command.
+STATE_DIM2 = 6 + 2 + 2 * (PS.N_STEP - 1) + PS.N_STEP
+FORMAT2 = "plan_steps2"
+
+
+class Actor2(nn.Module):
+    """v2: a trunk, the plan's Gaussian mean (20) and a speed estimate [m/s]"""
+
+    def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6):
+        super().__init__()
+        self.enc = ScanEncoder(beams)
+        self.norm = RunningNorm(STATE_DIM2)
+        self.trunk = nn.Sequential(nn.Linear(256 + STATE_DIM2, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh())
+        self.pi = nn.Linear(hidden, PS.ACT_DIM)
+        nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
+        self.v_est = nn.Linear(hidden, 1)
+        self.log_std = nn.Parameter(torch.full((PS.ACT_DIM,), math.log(std0)))
+
+    def forward(self, scans: torch.Tensor, state: torch.Tensor):
+        h = self.trunk(torch.cat([self.enc(scans), self.norm(state)], 1))
+        return self.pi(h), self.log_std.expand(scans.shape[0], -1), self.v_est(h)[:, 0] * 5.0
+
+
+class PlanObs2(PlanObs):
+    """v2's inputs: LiDAR (as v1), the raw IMU, the last commands, the last plan in its own frame"""
+
+    def __init__(self, env, lim: PS.Limits, goal=None):
+        Bl = int(env.learner_ids.numel())
+        dev = env.device
+        self.rel = torch.zeros(Bl, PS.N_STEP - 1, 2, device=dev)     # last plan's points 2..10 in its 0.1 s pose's frame
+        self.rel_v = torch.zeros(Bl, PS.N_STEP, device=dev)          # its speeds
+        self.cmd_d = torch.zeros(Bl, device=dev)                     # its steering / speed 0.1 s in: what was commanded
+        self.cmd_v = torch.zeros(Bl, device=dev)
+        super().__init__(env, lim, goal)
+
+    def reset_rows(self, rows: torch.Tensor) -> None:
+        super().reset_rows(rows)
+        if rows.numel() == 0:
+            return
+        self.rel[rows] = 0.0; self.rel_v[rows] = 0.0; self.cmd_d[rows] = 0.0; self.cmd_v[rows] = 0.0
+
+    def set_plan2(self, p: Dict[str, torch.Tensor], rows: Optional[torch.Tensor] = None) -> None:
+        """the plan just drawn (`plan_steps.roll`, in the frame it was drawn from): kept in its own 0.1 s pose's frame"""
+        i1 = PS.SUB
+        x1, y1, h1 = p["x"][:, i1], p["y"][:, i1], p["psi"][:, i1]
+        idx = (torch.arange(2, PS.N_STEP + 1, device=x1.device) * PS.SUB)
+        dx = p["x"][:, idx] - x1[:, None]; dy = p["y"][:, idx] - y1[:, None]
+        c, s_ = torch.cos(h1)[:, None], torch.sin(h1)[:, None]
+        rel = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c], -1)
+        cd, cv = p["delta"][:, i1], p["v"][:, i1]
+        if rows is None:
+            self.rel, self.rel_v, self.cmd_d, self.cmd_v = rel, p["pv"], cd, cv
+        else:
+            self.rel = torch.where(rows[:, None, None], rel, self.rel)
+            self.rel_v = torch.where(rows[:, None], p["pv"], self.rel_v)
+            self.cmd_d = torch.where(rows, cd, self.cmd_d)
+            self.cmd_v = torch.where(rows, cv, self.cmd_v)
+
+    def state(self) -> torch.Tensor:
+        r = self.env.last_result
+        Bl = self.rel.shape[0]
+        if r is not None and r.imu is not None and r.imu.shape[1] > 0:
+            imu = r.imu[self.lid].float().mean(1)                  # gyro xyz, accel xyz
+        else:
+            imu = torch.zeros(Bl, 6, device=self.rel.device)
+        return torch.cat([imu, self.cmd_d[:, None], self.cmd_v[:, None], self.rel.reshape(Bl, -1), self.rel_v], 1)
+
+    def priv(self) -> torch.Tensor:
+        """v1's critic extras and the true speed / steering (training only)"""
+        st = self.env.sim.state[self.lid]
+        return torch.cat([super().priv(), st[:, dyn.IVX:dyn.IVX + 1].float(), st[:, dyn.ISTEER:dyn.ISTEER + 1].float()], 1)
+
+
+def load_actor2(ck: dict, device) -> Actor2:
+    actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6))).to(device)
+    actor.load_state_dict(ck["actor"])
+    actor.eval()
+    return actor
+
+
+def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False):
+    """one decision of a v2 policy: (u, mean, log_std, v_hat, plan). The plan starts from the speed estimate and the last
+    steering command."""
+    mean, log_std, v_hat = actor(obs.scans, obs.state())
+    u = mean + log_std.exp() * torch.randn_like(mean) if sample else mean
+    p = PS.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
+    return u, mean, log_std, v_hat, p
