@@ -1183,7 +1183,7 @@ def plan_of(ar) -> bool:
 
 def tw_of(ar) -> bool:
     """a time-waypoint plan (`--plan-format tw`, `plan_tw`)"""
-    return plan_of(ar) and str(_ar(ar).get("plan_format", "wp4") or "wp4") == "tw"
+    return plan_of(ar) and str(_ar(ar).get("plan_format", "wp4") or "wp4") in ("tw", "tw5")
 
 
 def kappa_dims_of(ar) -> int:
@@ -1351,7 +1351,7 @@ def plan_env_fields(ar) -> dict:
     if not plan_of(ar):
         return {}
     a = _ar(ar)
-    tw = str(a.get("plan_format", "wp4") or "wp4") == "tw"
+    tw = str(a.get("plan_format", "wp4") or "wp4") in ("tw", "tw5")
     # tw: MAP commands the speed of the segment the car is in. A speed lookahead reads the waypoint array 0.235 s of the
     # measured speed ahead -- past a slow first segment (0.1 m/s x 0.375 s is 4 cm) into the next one's speed: the
     # tracking test drove at 5-6 m/s on plans that said 0.1 (11-06)
@@ -1364,7 +1364,7 @@ def plan_env_fields(ar) -> dict:
                 plan_follower_map=mp,
                 decision_every=int(a.get("repeat", 2) or 2), reverse_ext=0.0, v_min_policy=0.0,
                 plan_reverse_ext=float(a.get("plan_reverse_ext", 0.0) or 0.0),
-                learner_plan="tw" if tw else "")
+                learner_plan=str(a.get("plan_format")) if tw else "")
 
 
 def soft_bound(z, lo, hi, m):
@@ -2374,7 +2374,7 @@ def main():
     ap.add_argument("--critic-warmup", type=int, default=0, help="the first N updates train the critic only (actor grads dropped, 11-05)")
     ap.add_argument("--corr-slow", type=float, default=0.0,
                     help="hold the --noise-corr noise only below this speed [m/s] (x (V0/v)^2 above); 0 = at every speed")
-    ap.add_argument("--plan-format", default="wp4", choices=("wp4", "tw"),
+    ap.add_argument("--plan-format", default="wp4", choices=("wp4", "tw", "tw5"),
                     help="wp4 = 4 curvature + 4 speed knots over 0.6 s of the measured speed (8 numbers); tw = time waypoints "
                          "(plan_tw): TW_K segments of TW_DT s, each a curvature and a signed speed, reverse and forward in one plan")
     ap.add_argument("--slow-explore", type=float, nargs=3, default=None, metavar=("V0", "STEER", "SPEED"),

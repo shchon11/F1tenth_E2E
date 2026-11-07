@@ -38,17 +38,21 @@ TW_DT = 0.1               # [s] per segment: 1.0 s ahead. 0.375 s segments (4, t
                           # curvature-and-speed command in a plan's clothes; the user: "좀더 촘촘하게", and the wire can change
 KNOT_T = (0.1, 0.2, 0.4, 0.7, 1.0)   # [s] the knots the policy sets (see the docstring)
 N_KNOT = len(KNOT_T)
+#: The formats: knot times and segment count. "tw5" (11-07, the user picking "plan을 쓰는 만큼만 내기"): 0.5 s, every knot
+#: inside the stretch the follower reads -- "tw"'s 0.7 / 1.0 s knots never moved the command (tw_authority.py), so nothing
+#: trained them and the plan's far half jumped 0.5-3 m between decisions and 1.5-5 m off where the car went (plan_jitter.py)
+FORMATS = {"tw": (KNOT_T, 10), "tw5": ((0.1, 0.2, 0.3, 0.4, 0.5), 5)}
 KAPPA_MAX = 1.6           # [1/m] as wp4 (`mpc.PlanSpec.kappa_max`); the car's full lock is ~1.35
 V_FWD = 10.0              # [m/s] a = +1
 V_REV = 2.0               # [m/s] a = -1 (`EnvConfig.reverse_speed`)
 V_STOP = 0.05             # [m/s] below this a segment is a stop: no direction of its own
 
 
-def _interp_w():
+def _interp_w(knots=KNOT_T, k=TW_K):
     """(K, N) weights taking knot values to segment midpoints, linear in time, held past the first / last knot"""
-    tk = torch.tensor(KNOT_T, dtype=torch.float64)
-    tm = (torch.arange(TW_K, dtype=torch.float64) + 0.5) * TW_DT
-    W = torch.zeros(TW_K, N_KNOT, dtype=torch.float64)
+    tk = torch.tensor(knots, dtype=torch.float64)
+    tm = (torch.arange(k, dtype=torch.float64) + 0.5) * TW_DT
+    W = torch.zeros(k, len(knots), dtype=torch.float64)
     for i, t in enumerate(tm.tolist()):
         if t <= tk[0]:
             W[i, 0] = 1.0
@@ -61,29 +65,27 @@ def _interp_w():
     return W
 
 
-_W = _interp_w()
+_W = {f: _interp_w(*FORMATS[f]) for f in FORMATS}
+_W_PINV = {f: torch.linalg.pinv(w) for f, w in _W.items()}
 
 
 def knot_speed(a: torch.Tensor) -> torch.Tensor:
     return (a + 1.0) * 0.5 * (V_FWD + V_REV) - V_REV
 
 
-def decode(action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """(B, 2 N_KNOT) action -> (kappa (B, K) [1/m], signed speed (B, K) [m/s]) of the K segments."""
+def decode(action: torch.Tensor, fmt: str = "tw") -> Tuple[torch.Tensor, torch.Tensor]:
+    """(B, 2 N_KNOT) action -> (kappa (B, K) [1/m], signed speed (B, K) [m/s]) of the format's K segments."""
     a = action.clamp(-1.0, 1.0)
-    W = _W.to(device=a.device, dtype=a.dtype)
+    W = _W[fmt].to(device=a.device, dtype=a.dtype)
     k = (a[:, :N_KNOT] * KAPPA_MAX) @ W.T
     v = knot_speed(a[:, N_KNOT:2 * N_KNOT]) @ W.T
     return k, v
 
 
-_W_PINV = torch.linalg.pinv(_W)
-
-
-def encode(kappa: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def encode(kappa: torch.Tensor, v: torch.Tensor, fmt: str = "tw") -> torch.Tensor:
     """(B, K) segment curvatures / speeds -> the knot action whose interpolation is closest to them (least squares;
     clamped)."""
-    P = _W_PINV.to(device=kappa.device, dtype=kappa.dtype)
+    P = _W_PINV[fmt].to(device=kappa.device, dtype=kappa.dtype)
     kk, vv = kappa @ P.T, v @ P.T
     ak = (kk / KAPPA_MAX).clamp(-1.0, 1.0)
     av = ((vv + V_REV) / (V_FWD + V_REV) * 2.0 - 1.0).clamp(-1.0, 1.0)
@@ -106,7 +108,7 @@ def waypoints(kappa: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     x = torch.zeros(B, device=kappa.device, dtype=kappa.dtype)
     y, psi = torch.zeros_like(x), torch.zeros_like(x)
     out = [torch.stack([x, y, psi, torch.zeros_like(x)], 1)]
-    for k in range(TW_K):
+    for k in range(kappa.shape[1]):
         x, y, psi = _arc(x, y, psi, kappa[:, k], v[:, k] * TW_DT)
         out.append(torch.stack([x, y, psi, torch.full_like(x, (k + 1) * TW_DT)], 1))
     return torch.stack(out, 1)
@@ -119,7 +121,7 @@ def dense(kappa: torch.Tensor, v: torch.Tensor, n_per: int = 12) -> torch.Tensor
     x = torch.zeros(B, device=kappa.device, dtype=kappa.dtype)
     y, psi = torch.zeros_like(x), torch.zeros_like(x)
     pts = [torch.stack([x, y, psi, v[:, 0], torch.zeros_like(x)], 1)]
-    for k in range(TW_K):
+    for k in range(kappa.shape[1]):
         ds = v[:, k] * TW_DT / n_per
         for j in range(n_per):
             x, y, psi = _arc(x, y, psi, kappa[:, k], ds)
@@ -160,13 +162,14 @@ def run_path(kappa: torch.Tensor, v: torch.Tensor, spacing: float, n: int):
     nseg = seg.sum(1).clamp_min(1)
     kidx = torch.minimum(kidx.clamp_min(0), (nseg - 1)[:, None])
     # integrate the run's arcs exactly at the waypoints: pose at the start of segment k, then the arc into it
-    x0 = torch.zeros(B, TW_K, device=dev, dtype=dt_)
+    K = v.shape[1]
+    x0 = torch.zeros(B, K, device=dev, dtype=dt_)
     y0, p0 = torch.zeros_like(x0), torch.zeros_like(x0)
     x = torch.zeros(B, device=dev, dtype=dt_)
     y, psi = torch.zeros_like(x), torch.zeros_like(x)
     dd = d.clamp(min=0) * 2 - 1                                                       # +1 forward / stop, -1 backward
     dd = torch.where(d == 0, torch.ones_like(dd), dd).to(dt_)
-    for k in range(TW_K):
+    for k in range(K):
         x0[:, k], y0[:, k], p0[:, k] = x, y, psi
         x, y, psi = _arc(x, y, psi, kappa[:, k], dd * seg_len[:, k])
     kk = kappa.gather(1, kidx)

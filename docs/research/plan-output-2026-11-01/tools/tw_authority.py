@@ -18,18 +18,19 @@ dev = torch.device("cuda")
 ck = torch.load(path, map_location="cpu", weights_only=False)
 a = argparse.Namespace(**ck["args"])
 a.envs, a.seed, a.device = n_env, 61, "cuda"
-a.plan_format, a.plan_reverse_ext, a.plan_relabel = "tw", 0.0, 0.0
+FMT = os.environ.get("TW_FMT", "tw")              # plan_tw.FORMATS key
+a.plan_format, a.plan_reverse_ext, a.plan_relabel = FMT, 0.0, 0.0
 a.prop_fraction, a.removal_p, a.warps, a.opp_present, a.spawn_behind_prop, a.stage = 0.0, 0.0, 0, 0.0, 0.0, "props"
 a.episode_s = 3600.0
 env = SR.build_env(a, dev); prepare_graph_runtime(env, log=lambda _t: None)
 lid = env.learner_ids; B = int(lid.numel()); dt = env.sim.control_dt; R = int(a.repeat); tr = env.sim.track
 trk = env.tracker
-n_tw = int(math.ceil((plan_tw.TW_K * plan_tw.TW_DT * plan_tw.V_FWD + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
+n_tw = int(math.ceil((plan_tw.FORMATS[os.environ.get("TW_FMT", "tw")][1] * plan_tw.TW_DT * plan_tw.V_FWD + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
 
 
 def commands(act, mp):
     """(steer, speed) of the learner rows for plan `act` from where they stand, through a copy of MAP `mp`"""
-    k_, v_ = plan_tw.decode(act)
+    k_, v_ = plan_tw.decode(act, FMT)
     pth, pv, pk, d_, tot = plan_tw.run_path(k_, v_, PLAN_WP_SPACING, n_tw)
     z = torch.zeros(B, device=dev)
     vm = env.sim.state[lid, 3].abs()
@@ -64,7 +65,7 @@ for v_ref in (3.0, 5.0):
             idx = (prog[:, None] + torch.arange(win, device=dev)[None, :]).clamp(max=T - 1)
             dist = (ref[ar_[:, None], idx, :2] - env.sim.state[lid, None, :2]).norm(dim=-1)
             prog = idx.gather(1, (dist - 1e-4 * torch.arange(win, device=dev)[None, :]).argmin(1, keepdim=True))[:, 0]  # ties (a stop in the reference) go to the latest
-            act = core.plan_from_ref(ref, prog, dt, env.sim.state[lid, :3], dev)
+            act = core.plan_from_ref(ref, prog, dt, env.sim.state[lid, :3], dev, FMT)
             if k * dt >= 1.5:                                  # up to speed
                 st0, sp0 = commands(act, copy.deepcopy(trk.map))
                 row_st, row_sp = [], []
@@ -77,6 +78,6 @@ for v_ref in (3.0, 5.0):
         env.step(act_full)
     ds = torch.cat(dst, 0).mean(0) * 180 / math.pi / 0.1
     dv = torch.cat(dsp, 0).mean(0) / 0.1
-    names = [f"곡률@{t:g}s" for t in plan_tw.KNOT_T] + [f"속도@{t:g}s" for t in plan_tw.KNOT_T]
+    names = [f"곡률@{t:g}s" for t in plan_tw.FORMATS[FMT][0]] + [f"속도@{t:g}s" for t in plan_tw.FORMATS[FMT][0]]
     print(f"중앙선 {v_ref:.0f} m/s, 숫자 1만큼 바꿀 때 명령 변화 (평균): " + " | ".join(
         f"{n} 조향 {s:.2f} deg·속도 {v:.2f} m/s" for n, s, v in zip(names, ds.tolist(), dv.tolist())), flush=True)

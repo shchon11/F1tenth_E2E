@@ -242,7 +242,8 @@ class EnvConfig:
     #: (srp26owp u550 layout 2: 35 s on one fixed crate). a in [-1, 1] keeps exactly the forward map. 0 = as before.
     plan_reverse_ext: float = 0.0
     #: The learner's plan format under the MAP follower (2026-11-06, the user: "t=n 까지의 waypoint 모음으로 만드는게
-    #: 정석 아잉교?", no MPC): "" = the env's speed_mode as always; "tw" = time waypoints (`plan_tw`): the learner sends
+    #: 정석 아잉교?", no MPC): "" = the env's speed_mode as always; "tw" / "tw5" = time waypoints (`plan_tw.FORMATS`, 1.0 /
+    #: 0.5 s): the learner sends
     #: 2 TW_K numbers (TW_K curvatures + TW_K signed speeds over TW_DT segments), forward runs go to MAP and backward runs
     #: to a pure pursuit. Only the learner's rows: the traffic and the inner tracker keep `speed_mode`, and `act_dim` is
     #: the learner's width while `plan_dim` stays the internal plan's.
@@ -1409,7 +1410,7 @@ class F1VecEnv:
         #: `step` takes -- the learner's time-waypoint plan when `learner_plan` is "tw" (`plan_tw`), else the same
         self.plan_dim = self.act_dim
         self._tw_action = None
-        if e.learner_plan == "tw":
+        if e.learner_plan in ("tw", "tw5"):
             if e.action_mode != "plan" or e.plan_follower != "map":
                 raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
             from . import plan_tw
@@ -2997,7 +2998,7 @@ class F1VecEnv:
 
     def step(self, action: torch.Tensor):
         ext = float(self.ecfg.reverse_ext)
-        if self.ecfg.learner_plan == "tw":
+        if self.ecfg.learner_plan in ("tw", "tw5"):
             # the learner's time-waypoint plans go to MAP's own decoder (`MAPPlanTracker.tw_action`); the internal plan
             # every other reader sees for those rows is zeros (the traffic's rows are the env's own, as always)
             self._tw_action = action.to(self.device).clamp(-1.0, 1.0)
@@ -3045,7 +3046,8 @@ class F1VecEnv:
                 # `acc_now`), and follows the plans of the policy's own cars
                 self.tracker.P = self.sim.P
                 self.tracker.map_rows = self.learner
-                self.tracker.tw = self.ecfg.learner_plan == "tw"
+                self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5")
+                self.tracker.tw_fmt = self.ecfg.learner_plan if self.tracker.tw else "tw"
                 self.tracker.tw_action = self._tw_action
                 self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0 and not self.tracker.tw
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:

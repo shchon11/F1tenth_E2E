@@ -22,11 +22,12 @@ dev = torch.device("cuda")
 ck = torch.load(path, map_location="cpu", weights_only=False)
 a = argparse.Namespace(**ck["args"])
 a.envs, a.seed, a.device = n_env, 51, "cuda"
-a.plan_format, a.plan_reverse_ext, a.plan_relabel = "tw", 0.0, 0.0
+FMT = os.environ.get("TW_FMT", "tw")              # plan_tw.FORMATS key
+a.plan_format, a.plan_reverse_ext, a.plan_relabel = FMT, 0.0, 0.0
 a.prop_fraction, a.removal_p, a.warps, a.opp_present, a.spawn_behind_prop, a.stage = 0.0, 0.0, 0, 0.0, 0.0, "props"
 a.episode_s = 3600.0
 env = SR.build_env(a, dev); prepare_graph_runtime(env, log=lambda _t: None)
-assert env.ecfg.learner_plan == "tw", env.ecfg.learner_plan
+assert env.ecfg.learner_plan == FMT, env.ecfg.learner_plan
 lid = env.learner_ids; B = int(lid.numel()); dt = env.sim.control_dt; R = int(a.repeat)
 i_w = CC.index("hard_wall") if "hard_wall" in CC else None
 tr = env.sim.track
@@ -60,7 +61,7 @@ def plan_from_ref(ref, prog, step, pose):
     x, y, p = pose[:, 0].clone(), pose[:, 1].clone(), pose[:, 2].clone()
     ar_ = torch.arange(ref.shape[0], device=dev)
     ks, vs = [], []
-    for k in range(1, plan_tw.TW_K + 1):
+    for k in range(1, plan_tw.FORMATS[FMT][1] + 1):
         i_t = (prog + int(round(k * plan_tw.TW_DT / step))).clamp(max=T - 1)
         i_m = (prog + int(round((k - 0.5) * plan_tw.TW_DT / step))).clamp(max=T - 1)
         tx, ty = ref[ar_, i_t, 0], ref[ar_, i_t, 1]
@@ -80,7 +81,7 @@ def plan_from_ref(ref, prog, step, pose):
         v = (dirn * ref[ar_, i_m, 3].abs()).clamp(-plan_tw.V_REV, plan_tw.V_FWD)
         ks.append(kap); vs.append(v)
         x, y, p = plan_tw._arc(x, y, p, kap, v * plan_tw.TW_DT)
-    a0 = plan_tw.encode(torch.stack(ks, 1), torch.stack(vs, 1))
+    a0 = plan_tw.encode(torch.stack(ks, 1), torch.stack(vs, 1), FMT)
     if os.environ.get("TW_FIT", "1") == "0":
         return a0
     # the knot action whose path passes closest to the reference points (the dense arcs above integrated from the car)
@@ -89,7 +90,7 @@ def plan_from_ref(ref, prog, step, pose):
         a_ = a0.clone().requires_grad_(True)
         opt = torch.optim.Adam([a_], lr=0.05)
         for _ in range(60):
-            k_, v_ = plan_tw.decode(a_)
+            k_, v_ = plan_tw.decode(a_, FMT)
             w_ = plan_tw.waypoints(k_, v_)[:, 1:, :2]
             loss = (w_ - tgt).square().sum(-1).mean()
             opt.zero_grad(); loss.backward(); opt.step()
@@ -147,7 +148,7 @@ def run(name, make_ref, dur, open_space=False, quiet=False):
         env.step(act_full)
         pos.append(env.sim.state[lid, :2].clone())
         if os.environ.get("TW_DEBUG") and k % 20 == 0:
-            kk_, vv_ = plan_tw.decode(act)
+            kk_, vv_ = plan_tw.decode(act, FMT)
             print(f"  {name[:1]} t={k * dt:.2f} 속도 {float(env.sim.state[lid, 3].mean()):.2f} 계획 v1 {float(vv_[:, 0].mean()):.2f} "
                   f"명령 {float(env.last_cmd_raw[lid, 1].mean()):.2f} 조향 {float(env.last_cmd_raw[lid, 0].mean()):.3f} "
                   f"진행 {float(prog.float().mean() * dt):.2f} s", flush=True)

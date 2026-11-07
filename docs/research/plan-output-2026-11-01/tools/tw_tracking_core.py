@@ -3,14 +3,14 @@ import torch
 from f1sim import plan_tw
 
 
-def plan_from_ref(ref, prog, step, pose, dev):
+def plan_from_ref(ref, prog, step, pose, dev, fmt="tw"):
     """tw4 action from the car's pose along the reference from its progress point `prog` (B,) on: the reference points
     DT, .., K DT later joined by arcs -- following the path at the reference's speed, no catching up on time lost"""
     T = ref.shape[1]
     x, y, p = pose[:, 0].clone(), pose[:, 1].clone(), pose[:, 2].clone()
     ar_ = torch.arange(ref.shape[0], device=dev)
     ks, vs = [], []
-    for k in range(1, plan_tw.TW_K + 1):
+    for k in range(1, plan_tw.FORMATS[fmt][1] + 1):
         i_t = (prog + int(round(k * plan_tw.TW_DT / step))).clamp(max=T - 1)
         i_m = (prog + int(round((k - 0.5) * plan_tw.TW_DT / step))).clamp(max=T - 1)
         tx, ty = ref[ar_, i_t, 0], ref[ar_, i_t, 1]
@@ -30,6 +30,6 @@ def plan_from_ref(ref, prog, step, pose, dev):
         v = (dirn * ref[ar_, i_m, 3].abs()).clamp(-plan_tw.V_REV, plan_tw.V_FWD)
         ks.append(kap); vs.append(v)
         x, y, p = plan_tw._arc(x, y, p, kap, v * plan_tw.TW_DT)
-    return plan_tw.encode(torch.stack(ks, 1), torch.stack(vs, 1))
+    return plan_tw.encode(torch.stack(ks, 1), torch.stack(vs, 1), fmt)
 
 
