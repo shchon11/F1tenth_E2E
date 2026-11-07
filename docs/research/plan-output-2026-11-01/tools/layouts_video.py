@@ -33,8 +33,10 @@ first_L = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 w = sim_worker.SimWorker(_N(), _N())
 w.say = lambda k, **f: None; w.stage = lambda *a, **k: None; w._hold_parked_ok = True
 w._overlay = dict(getattr(w, "_overlay", {}) or {}, plan=True)
+#: F1SIM_VIDEO_EMPTY=1 (11-07, the user: "영상뽑을 때 빈트랙도 뽑아주셈"): the same run on the empty track, no obstacles
+EMPTY = os.environ.get("F1SIM_VIDEO_EMPTY", "0") == "1"
 s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, cars_per_race=1, device="cuda", compile=False,
-                                    collision_mode="soft", procedural=True, episode_s=3600.0, randomize=False), 0)
+                                    collision_mode="soft", procedural=not EMPTY, episode_s=3600.0, randomize=False), 0)
 env = s["env"]; proc = env.procedural
 tr = maps.load(tracks.resolve(mp))
 occ = tr.occupancy; res = tr.resolution; H, W = occ.shape
@@ -48,6 +50,8 @@ name = f"{os.path.basename(os.path.dirname(run))}/{os.path.basename(run).replace
 
 def footprints():
     out_ = []
+    if proc is None:                                   # the empty track
+        return out_
     sid = proc.p_sid[0].cpu().numpy(); pose = proc.p_poses[0].cpu().numpy()
     for j, k in enumerate(sid):
         if k < 0:
@@ -121,7 +125,7 @@ for L in range(n_lay):
         xa = np.array(xs_all)
         ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[2], ext[3])
         bx.set_xlim(st[0] - 4, st[0] + 4); bx.set_ylim(st[1] - 4, st[1] + 4)
-        title.set_text(f"{name} · obstacle 배치 {L} · {k * 0.025:4.1f} s · 속도 {st[3]:4.1f} m/s · "
+        title.set_text(f"{name} · {'빈 트랙' if EMPTY else f'obstacle 배치 {L}'} · {k * 0.025:4.1f} s · 속도 {st[3]:4.1f} m/s · "
                        f"obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) · 벽 접촉 {cnt[0]}(세게 {hcnt[0]})")
         fig.canvas.draw()
         buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]

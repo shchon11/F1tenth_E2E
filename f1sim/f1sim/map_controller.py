@@ -650,6 +650,24 @@ class MAPPlanTracker:
             path, pv, pk, d_tw, tot_tw = plan_tw.run_path(k_tw, v_tw, PLAN_WP_SPACING, n_tw)
             v1_tw = torch.where(v_tw[:, 0].abs() < plan_tw.V_STOP, torch.zeros_like(v_tw[:, 0]), v_tw[:, 0])
             self.tw_plan = plan_tw.dense(k_tw, v_tw)
+            # Every viewer (the console, the videos, the ROS link) draws `last_ref`, the inner tracker's plan: for these
+            # rows that is the inner's reading of the zeros the env hands it in their place -- a straight 0.6 s line along
+            # the heading, not the policy's plan (11-07, the user: "trajectory가 왜 직선이야"). Give them the time-waypoint
+            # plan instead, its whole 1.0 s resampled to the inner's N + 1 points (x, y, heading, speed)
+            lr_ = getattr(self._inner, "last_ref", None)
+            if lr_ is not None and lr_.shape[0] == B:
+                n1 = lr_.shape[1]
+                tp = self.tw_plan
+                pos_ = torch.linspace(0, tp.shape[1] - 1, n1, device=dev)
+                i0 = pos_.floor().long().clamp(max=tp.shape[1] - 2)
+                w_ = (pos_ - i0.to(pos_.dtype))[None, :, None]
+                smp = tp[:, i0, :4] * (1 - w_) + tp[:, i0 + 1, :4] * w_
+                ref_tw = smp.to(lr_.dtype)
+                m_ = self.map_rows[:, None, None]
+                self._inner.last_ref = torch.where(m_, ref_tw, lr_)
+                lp_ = getattr(self._inner, "last_pred", None)
+                if lp_ is not None and lp_.shape == lr_.shape:
+                    self._inner.last_pred = torch.where(m_, ref_tw, lp_)
         else:
             path, pv, pk = self.waypoints(action, v_meas, speed_cap)
         zeros = torch.zeros(B, device=dev, dtype=action.dtype)
