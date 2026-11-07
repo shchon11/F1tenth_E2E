@@ -11,6 +11,14 @@
   next plan) and a time penalty on every contact, (CONTACT_S + CONTACT_S_PER_MPS x the impact's normal speed) seconds,
   in laps of T_REF seconds. Every contact is bad, a graze only less bad (the user, 11-07). A car contact is charged only
   if a LiDAR beam hit a car within SEEN_S before it (the user: "시야에서 아예 안보이는 상태였으면 그건 주면 안되는겨").
+* The whole plan counts (the user agreed 11-07: the car drives only a plan's first 0.1 s, so without these the other
+  nine points would touch nothing and come out anyhow again):
+  - Phi is read at the PLAN's points: the mean distance left over its 10 points. The plan is part of the state (the
+    policy sees it), so this is still exact shaping: every point is pushed to be as far along as the car can reach,
+    and the lap objective is unchanged.
+  - A plan that runs into a wall or a box within its second (any footprint corner of its poses inside one) costs
+    PLAN_HIT_SHARE of the contact it would be, at the plan's speed there: drawn every 0.1 s, a second of such plans
+    costs about one contact.
 * No stall price, no other shaping: standing still earns no laps."""
 import hashlib
 import math
@@ -24,6 +32,7 @@ T_REF = 7.5               # [s] a lap, to put seconds in laps
 CONTACT_S = 0.5           # [s] every contact
 CONTACT_S_PER_MPS = 1.0   # [s per m/s of impact normal speed]
 SEEN_S = 1.0              # [s] a car contact counts if a beam hit a car this recently
+PLAN_HIT_SHARE = 0.1      # a plan that hits something: this share of the contact it plans
 CACHE = os.path.expanduser("~/.cache/f1sim/goal_field")
 
 
@@ -109,30 +118,46 @@ class GoalField:
 
 
 class PlanReward:
-    """Per learner row: call `begin(ids)` after resets, `control_step()` after every control step, and `decision()` once
-    a decision's control steps are done; `decision` returns the reward (B_l,) and its parts."""
+    """Per learner row: `begin(rows)` after resets, `control_step()` after every control step, and once a decision's
+    control steps are done `decision(pts)` with the plan just driven (its 10 points in the world); `plan_cost(...)` prices
+    a plan when it is drawn. `decision` returns the reward (B_l,) and its parts."""
 
     def __init__(self, env, gamma: float, device):
         self.env, self.gamma = env, float(gamma)
         self.lid = env.learner_ids
         self.goal = GoalField(env.sim.track, device)
         Bl = int(self.lid.numel())
-        self.phi = torch.zeros(Bl, device=device)              # Phi at the last decision
-        self.d_prev = torch.zeros(Bl, device=device)
+        self.phi = torch.zeros(Bl, device=device)              # Phi of the state at the last decision
+        self.d_prev = torch.zeros(Bl, device=device)           # the CAR's distance left there (laps are the car's)
         self.cost = torch.zeros(Bl, device=device)             # [laps] contacts since the last decision
         self.seen_t = torch.full((Bl,), 1e9, device=device)    # [s] since a beam last hit a car
         self.n_contacts = torch.zeros(Bl, 3, device=device)
+        self.corners = env.sim.corners.float()                 # (4, 2) footprint about the CoG
         self.begin(torch.arange(Bl, device=device))
 
-    def _d(self) -> torch.Tensor:
+    def _d_car(self) -> torch.Tensor:
         st = self.env.sim.state[self.lid]
         return self.goal.remaining(st[:, :2], self.env.sim.tid[self.lid])
 
+    def _phi_pts(self, pts: torch.Tensor, d_car: torch.Tensor) -> torch.Tensor:
+        """-(mean distance left over the plan's points) / lap. A point in a wall reads the one before it (the car's for
+        the first), so the potential stays a function of the plan. A point past the line reads a lap more than the
+        car's side: the potential jumps once per point per lap, and the sum over a lap still telescopes."""
+        tid = self.env.sim.tid[self.lid]
+        L = self.goal.lap[tid]
+        d = self.goal.remaining(pts, tid[:, None].expand(-1, pts.shape[1]))
+        prev = d_car
+        cols = []
+        for k in range(d.shape[1]):
+            cur = torch.where(torch.isfinite(d[:, k]), d[:, k], prev)
+            cols.append(cur); prev = cur
+        return -torch.stack(cols, 1).mean(1) / L
+
     def begin(self, rows: torch.Tensor) -> None:
-        """rows (indices into the learner rows) just (re)started: Phi from where they stand, nothing owed"""
+        """rows (indices into the learner rows) just (re)started: no plan yet, Phi from where the car stands"""
         if rows.numel() == 0:
             return
-        d = self._d()[rows]
+        d = self._d_car()[rows]
         L = self.goal.lap[self.env.sim.tid[self.lid][rows]]
         d = torch.where(torch.isfinite(d), d, L)
         self.d_prev[rows] = d
@@ -157,20 +182,48 @@ class PlanReward:
         self.cost = self.cost + ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge).sum(1) / T_REF
         self.n_contacts = self.n_contacts + on
 
-    def decision(self, restarted: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """the reward of the decision just driven. `restarted` (B_l,) bool: rows reset during it -- no shaping across an
-        episode boundary (their Phi starts again from where they stand), their contact cost still charged"""
-        d = self._d()
-        L = self.goal.lap[self.env.sim.tid[self.lid]]
+    def plan_cost(self, x: torch.Tensor, y: torch.Tensor, psi: torch.Tensor, v: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """A plan just drawn, its poses in the world (B_l, n) each and speeds (B_l, n): the first pose whose footprint
+        is in a wall or a box, and its price [laps] (0 for a clear plan). The pose now (index 0) is the car, not the plan."""
+        tid = self.env.sim.tid[self.lid]
+        c, s = torch.cos(psi)[..., None], torch.sin(psi)[..., None]
+        cx = x[..., None] + self.corners[:, 0] * c - self.corners[:, 1] * s           # (B_l, n, 4)
+        cy = y[..., None] + self.corners[:, 0] * s + self.corners[:, 1] * c
+        pts = torch.stack([cx, cy], -1)
+        tt = tid[:, None, None].expand_as(cx)
+        hit = (self.env.sim.track.sample_edt(pts, tt) <= 0.0).any(-1)                  # (B_l, n)
+        proc = getattr(self.env, "procedural", None)
+        if proc is not None:
+            eid = self.env.sim.eid[self.lid][:, None, None].expand_as(cx).reshape(-1)
+            cl = proc.clearance(pts.reshape(-1, 2), eid).reshape(cx.shape)
+            hit = hit | (cl <= 0.0).any(-1)
+        hit[:, 0] = False
+        any_ = hit.any(1)
+        first = torch.where(any_, hit.float().argmax(1), torch.zeros_like(any_, dtype=torch.long))
+        v_hit = v.gather(1, first[:, None])[:, 0].abs()
+        price = torch.where(any_, PLAN_HIT_SHARE * (CONTACT_S + CONTACT_S_PER_MPS * v_hit) / T_REF, torch.zeros_like(v_hit))
+        return {"hit": any_, "first": first, "price": price}
+
+    def decision(self, pts: torch.Tensor, plan_price: Optional[torch.Tensor] = None,
+                 restarted: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """The reward of the decision just driven. `pts` (B_l, 10, 2): the plan driven, its points in the world (it is
+        the state's plan now). `plan_price` (B_l,) [laps] from `plan_cost` when it was drawn. `restarted` (B_l,) bool:
+        rows reset during it -- no shaping across an episode boundary (their Phi starts again from where they stand),
+        their costs still charged."""
+        d = self._d_car()
+        tid = self.env.sim.tid[self.lid]
+        L = self.goal.lap[tid]
         d = torch.where(torch.isfinite(d), d, self.d_prev)      # inside a wall for a moment: hold the last reading
         jump = d - self.d_prev
-        lap = (jump > 0.5 * L).float() - (jump < -0.5 * L).float()   # crossed the line forwards / backwards
-        phi = -d / L
+        lap = (jump > 0.5 * L).float() - (jump < -0.5 * L).float()   # the car crossed the line forwards / backwards
+        phi = self._phi_pts(pts, d)
         shaping = self.gamma * phi - self.phi
         if restarted is not None:
             shaping = torch.where(restarted, torch.zeros_like(shaping), shaping)
             lap = torch.where(restarted, torch.zeros_like(lap), lap)
-        out = {"lap": lap, "shaping": shaping, "contact": -self.cost, "reward": lap + shaping - self.cost}
+        pp = plan_price if plan_price is not None else torch.zeros_like(lap)
+        out = {"lap": lap, "shaping": shaping, "contact": -self.cost, "plan_hit": -pp,
+               "reward": lap + shaping - self.cost - pp}
         self.phi, self.d_prev = phi, d
         self.cost = torch.zeros_like(self.cost)
         if restarted is not None and bool(restarted.any()):
