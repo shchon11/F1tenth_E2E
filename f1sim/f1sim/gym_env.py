@@ -1410,11 +1410,14 @@ class F1VecEnv:
         #: `step` takes -- the learner's time-waypoint plan when `learner_plan` is "tw" (`plan_tw`), else the same
         self.plan_dim = self.act_dim
         self._tw_action = None
-        if e.learner_plan in ("tw", "tw5"):
+        self._tw_carry = None
+        if e.learner_plan in ("tw", "tw5", "tw5c"):
             if e.action_mode != "plan" or e.plan_follower != "map":
                 raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
             from . import plan_tw
             self.act_dim = 2 * plan_tw.N_KNOT
+            if e.learner_plan == "tw5c":
+                self._tw_carry = plan_tw.Carry(self.B, self.sim.control_dt, self.device)
 
     def _check_obs_v2(self) -> None:
         """Refuse a v2 env that could not produce the v2 observation honestly."""
@@ -2984,6 +2987,8 @@ class F1VecEnv:
         self.last_result = r
         self._note_imu_yaw_rate(r)
         self._plan_fallback(torch.arange(self.B, device=self.device), r.state)
+        if self._tw_carry is not None:
+            self._tw_carry.reset(torch.arange(self.B, device=self.device), r.state[:, 3])
         self.lead_steps.zero_(); self.lead_paid.fill_(1.0)
         obs = self._obs(r)
         if self.hist is not None:                                  # history starts from the first real observation (as the car's builder does)
@@ -2998,10 +3003,13 @@ class F1VecEnv:
 
     def step(self, action: torch.Tensor):
         ext = float(self.ecfg.reverse_ext)
-        if self.ecfg.learner_plan in ("tw", "tw5"):
+        if self.ecfg.learner_plan in ("tw", "tw5", "tw5c"):
             # the learner's time-waypoint plans go to MAP's own decoder (`MAPPlanTracker.tw_action`); the internal plan
             # every other reader sees for those rows is zeros (the traffic's rows are the env's own, as always)
             self._tw_action = action.to(self.device).clamp(-1.0, 1.0)
+            if self._tw_carry is not None:
+                # "tw5c": the action is the change of the carried plan (`plan_tw.Carry`)
+                self._tw_carry.step(self._tw_action, self.learner)
             action = torch.zeros(self.B, self.plan_dim, device=self.device)
         if ext > 0 and self.act_dim == 2:
             # the learners' speed may reach into the reverse extension; everything else stays in [-1, 1]
@@ -3046,8 +3054,10 @@ class F1VecEnv:
                 # `acc_now`), and follows the plans of the policy's own cars
                 self.tracker.P = self.sim.P
                 self.tracker.map_rows = self.learner
-                self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5")
-                self.tracker.tw_fmt = self.ecfg.learner_plan if self.tracker.tw else "tw"
+                self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5", "tw5c")
+                from . import plan_tw as _ptw
+                self.tracker.tw_fmt = _ptw.geom(self.ecfg.learner_plan) if self.tracker.tw else "tw"
+                self.tracker.tw_kv = self._tw_carry.segments() if self._tw_carry is not None else None
                 self.tracker.tw_action = self._tw_action
                 self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0 and not self.tracker.tw
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:
@@ -3312,6 +3322,8 @@ class F1VecEnv:
             scans = self._reset_envs(ids)
             r = self._reset_result(r, ids, scans)
             self._plan_fallback(ids, r.state)
+            if self._tw_carry is not None:
+                self._tw_carry.reset(ids, r.state[ids, 3])
             obs = self._obs(r)
             for seat in self._seat_builders():
                 seat.refresh(r)                                    # the reset rows' first observation

@@ -42,6 +42,23 @@ N_KNOT = len(KNOT_T)
 #: inside the stretch the follower reads -- "tw"'s 0.7 / 1.0 s knots never moved the command (tw_authority.py), so nothing
 #: trained them and the plan's far half jumped 0.5-3 m between decisions and 1.5-5 m off where the car went (plan_jitter.py)
 FORMATS = {"tw": (KNOT_T, 10), "tw5": ((0.1, 0.2, 0.3, 0.4, 0.5), 5)}
+#: "tw5c" (11-07, the user: "이어받게 하는걸로"): the tw5 plan carried over between decisions (`Carry`). A tw / tw5 policy
+#: drew every plan from nothing, 0.05 s after the last: frames 0.1 s apart (srp25tw5 u100) flipped up, flat, hooked
+#: down, right, down within a second, S-shapes, a U-turn's plans pointing into the island for 0.7 s while the car drove
+#: a smooth line -- MAP steers off one point ~0.5 s ahead, the rest of the shape was free and nothing tied one plan to
+#: the next (the user: "이리갔다가 저리갔다가 줏대가 없어"). Here the plan is state: each control step it moves on by one
+#: step of time and the learner's action is only the change, so with nothing to change it stays the plan it was.
+FORMATS["tw5c"] = FORMATS["tw5"]
+CARRY_K_RATE = 8.0        # [1/m per s] a = +-1 moves a knot's curvature this fast: 0.4 1/m per 0.05 s decision, the
+                          # whole range in 0.4 s; at 6 m/s the tyres' limit (~0.28 1/m) in one decision. The exploration noise
+                          # is a random walk of the plan now: std 0.61 (from scratch) is 1.1 1/m over a second
+CARRY_V_RATE = 30.0       # [m/s per s]: 1.5 m/s per decision, 8 -> 0 m/s in 0.27 s (the car itself brakes in ~1.6 s)
+CARRY_V_INIT = 4.0        # [m/s] a fresh plan's speed at least (what tw's mean action 0 drove)
+
+
+def geom(fmt: str) -> str:
+    """the format whose knots / segments a format's plans have (`Carry` keeps tw5's)"""
+    return "tw5" if fmt == "tw5c" else fmt
 KAPPA_MAX = 1.6           # [1/m] as wp4 (`mpc.PlanSpec.kappa_max`); the car's full lock is ~1.35
 V_FWD = 10.0              # [m/s] a = +1
 V_REV = 2.0               # [m/s] a = -1 (`EnvConfig.reverse_speed`)
@@ -202,3 +219,62 @@ def pursue_back(path_xy: torch.Tensor, total: torch.Tensor, wheelbase: float, lo
     d2 = (tgt ** 2).sum(1).clamp_min(1e-6)
     kappa = 2.0 * tgt[:, 1] / d2
     return torch.atan(kappa * wheelbase).clamp(-s_max, s_max)
+
+
+class Carry:
+    """Each row's plan kept between decisions ("tw5c"): curvature and signed speed on a `dt` grid over the horizon
+    (t = dt .. K TW_DT). `step` moves it on by one grid step (the last value held) and adds the action as a rate --
+    its knots (`KNOT_T` of tw5) x `CARRY_K_RATE` / `CARRY_V_RATE` x dt, linear in time between them -- so an action held
+    over a decision's control steps changes the plan by rate x decision time, and zeros keep it. `segments` are the
+    follower's 0.1 s segments (the grid's means), `obs` the same 10 numbers scaled as an action, what the policy sees in
+    place of its last action."""
+
+    def __init__(self, B: int, dt: float, device, fmt: str = "tw5"):
+        knots, K = FORMATS[fmt]
+        self.K, self.dt = K, float(dt)
+        self.n = int(round(K * TW_DT / self.dt))
+        assert self.n % K == 0, (self.n, K)
+        self.Wg = _interp_grid(knots, self.n, self.dt).to(device=device, dtype=torch.float32)
+        self.k = torch.zeros(B, self.n, device=device)
+        self.v = torch.full((B, self.n), CARRY_V_INIT, device=device)
+
+    def reset(self, ids: torch.Tensor, v_now: torch.Tensor) -> None:
+        if ids.numel() == 0:
+            return
+        self.k[ids] = 0.0
+        self.v[ids] = v_now.float().clamp(CARRY_V_INIT, V_FWD)[:, None].expand(-1, self.n)
+
+    def step(self, action: torch.Tensor, rows: torch.Tensor) -> None:
+        a = action.float().clamp(-1.0, 1.0)
+        k = torch.cat([self.k[:, 1:], self.k[:, -1:]], 1)
+        v = torch.cat([self.v[:, 1:], self.v[:, -1:]], 1)
+        k = (k + (a[:, :N_KNOT] * (CARRY_K_RATE * self.dt)) @ self.Wg.T).clamp(-KAPPA_MAX, KAPPA_MAX)
+        v = (v + (a[:, N_KNOT:2 * N_KNOT] * (CARRY_V_RATE * self.dt)) @ self.Wg.T).clamp(-V_REV, V_FWD)
+        r = rows[:, None]
+        self.k = torch.where(r, k, self.k)
+        self.v = torch.where(r, v, self.v)
+
+    def segments(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = self.k.shape[0]
+        return self.k.view(B, self.K, -1).mean(2), self.v.view(B, self.K, -1).mean(2)
+
+    def obs(self) -> torch.Tensor:
+        ks, vs = self.segments()
+        return torch.cat([ks / KAPPA_MAX, (vs + V_REV) / (V_FWD + V_REV) * 2.0 - 1.0], 1)
+
+
+def _interp_grid(knots, n: int, dt: float) -> torch.Tensor:
+    """(n, N) weights taking knot values to the grid t = dt .. n dt, linear in time, held past the first / last knot"""
+    tk = torch.tensor(knots, dtype=torch.float64)
+    W = torch.zeros(n, len(knots), dtype=torch.float64)
+    for i in range(n):
+        t = (i + 1) * dt
+        if t <= tk[0] + 1e-9:
+            W[i, 0] = 1.0
+        elif t >= tk[-1] - 1e-9:
+            W[i, -1] = 1.0
+        else:
+            j = int((tk <= t + 1e-9).nonzero().max())
+            w = (t - float(tk[j])) / float(tk[j + 1] - tk[j])
+            W[i, j], W[i, j + 1] = 1.0 - w, w
+    return W

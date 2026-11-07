@@ -562,6 +562,7 @@ class MAPPlanTracker:
         self._held_tw = None
         self.tw_action = None
         self.tw_fmt = "tw"                             # `plan_tw.FORMATS` key
+        self.tw_kv = None                              # (kappa, v) (B, K) segments of a carried plan, else None
         #: the backward pure pursuit's lookahead [m]: max(back_la_min, back_la_t x |v|), tuned by the distance to given
         #: backing paths (`tools/tw_tune.py`, 11-06: 0.8 / 8.8 cm straight / curving; MAP turned round 0.8 / 13.4)
         self.back_la_min = 0.35
@@ -577,7 +578,7 @@ class MAPPlanTracker:
 
     def __setattr__(self, name, value):
         if name in ("_inner", "map", "nominal", "map_rows", "P", "last_map", "hold_rows", "pose_now", "_held", "auto_backout",
-                    "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt"):
+                    "tw", "tw_plan", "_held_tw", "wheelbase", "tw_action", "back_la_min", "back_la_t", "back_mode", "tw_fmt", "tw_kv"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._inner, name, value)
@@ -646,7 +647,10 @@ class MAPPlanTracker:
         dev = action.device
         if self.tw:
             from . import plan_tw
-            k_tw, v_tw = plan_tw.decode(self.tw_action if self.tw_action is not None else action, self.tw_fmt)
+            if self.tw_kv is not None:                       # a carried plan (`plan_tw.Carry`): the env's segments
+                k_tw, v_tw = self.tw_kv
+            else:
+                k_tw, v_tw = plan_tw.decode(self.tw_action if self.tw_action is not None else action, self.tw_fmt)
             n_tw = int(math.ceil((k_tw.shape[1] * plan_tw.TW_DT * plan_tw.V_FWD + PLAN_WP_EXTRA_M) / PLAN_WP_SPACING)) + 1
             path, pv, pk, d_tw, tot_tw = plan_tw.run_path(k_tw, v_tw, PLAN_WP_SPACING, n_tw)
             v1_tw = torch.where(v_tw[:, 0].abs() < plan_tw.V_STOP, torch.zeros_like(v_tw[:, 0]), v_tw[:, 0])
