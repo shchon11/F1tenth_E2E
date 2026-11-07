@@ -1412,6 +1412,7 @@ class F1VecEnv:
         self._tw_action = None
         self._tw_carry = None
         self.ideal_cmd = None                                       # `enable_ideal`
+        self.ext_plan_kv = None                                     # (kappa, v) (B, 10) segments MAP follows, see `step`
         if e.learner_plan in ("tw", "tw5", "tw5c", "tw5g"):
             if e.action_mode != "plan" or e.plan_follower != "map":
                 raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
@@ -3069,6 +3070,10 @@ class F1VecEnv:
                 from . import plan_tw as _ptw
                 self.tracker.tw_fmt = _ptw.geom(self.ecfg.learner_plan) if self.tracker.tw else "tw"
                 self.tracker.tw_kv = self._tw_carry.segments() if self._tw_carry is not None else None
+                if self.ext_plan_kv is not None:
+                    # a plan handed in from outside as (curvature, signed speed) per 0.1 s segment (`plan_policy.PlanRunner`
+                    # in the console / evaluation, 11-07 redesign): MAP follows it as a time-waypoint plan
+                    self.tracker.tw_kv = self.ext_plan_kv
                 self.tracker.tw_action = self._tw_action
                 self.tracker.auto_backout = float(self.ecfg.plan_reverse_ext) <= 0 and not self.tracker.tw
                 if lr is not None and lr.imu is not None and lr.imu.shape[1] > 0:

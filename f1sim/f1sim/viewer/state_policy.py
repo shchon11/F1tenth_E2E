@@ -28,6 +28,8 @@ def state_kind(path: str) -> str:
         return ""
     if not isinstance(ck, dict):
         return ""
+    if ck.get("format") == "plan_steps" and "actor" in ck:
+        return "plan"                                     # `learn.plan_rl` (11-07 redesign)
     if "student" in ck and "ego_keys" in ck:
         return "student"
     if "model" in ck and "norm" in ck and isinstance(ck.get("args"), dict):
@@ -42,6 +44,8 @@ def load(path: str) -> dict:
 def contract(ck: dict, kind: str) -> dict:
     """What the env must be for this checkpoint: beams, scan frames / stride, reverse extension, decision repeat."""
     a = dict(ck.get("args") or {})
+    if kind == "plan":
+        return dict(beams=int(ck["beams"]), frames=3, stride=1, reverse_ext=0.0, repeat=4)
     if kind == "teacher":
         return dict(beams=int(a.get("beams", 36)), frames=1, stride=1,
                     reverse_ext=float(a.get("reverse_ext", 0.0) or 0.0), repeat=int(a.get("repeat", 2) or 2))
@@ -59,6 +63,8 @@ def contract(ck: dict, kind: str) -> dict:
 
 def is_plan(ck: dict) -> bool:
     """a checkpoint that outputs a trajectory followed by MAP (`state_rl --action plan`, 11-01)"""
+    if ck.get("format") == "plan_steps":
+        return True
     from ..learn import state_rl
     return state_rl.plan_of(ck.get("args") or {})
 
@@ -68,6 +74,13 @@ def env_overrides(ck: dict, kind: str) -> dict:
     over [0, 10] m/s, or a plan and its follower (`state_rl.plan_env_fields`), from the v1 observation (students) or the
     privileged state (teachers)."""
     from ..learn import state_rl
+    if kind == "plan":
+        # MAP follows the plan as a time-waypoint plan (`GymEnv.ext_plan_kv`): the "tw" follower and its tuned lookahead
+        w = dict(ck.get("world") or {})
+        w.update(action="plan", plan_format="tw", plan_relabel=0.0, plan_reverse_ext=0.0, repeat=4)   # a decision per 0.1 s
+        kw = dict(obs_version=1, v_max_policy=10.0)
+        kw.update(state_rl.plan_env_fields(w))
+        return kw
     c = contract(ck, kind)
     kw = dict(action_mode="direct", obs_version=1, scan_stack=c["frames"], scan_stride=c["stride"], v_max_policy=10.0,
               reverse_ext=c["reverse_ext"])
@@ -82,6 +95,9 @@ def describe(ck: dict, kind: str, path: str) -> str:
     run = os.path.basename(os.path.dirname(os.path.realpath(path)))
     name = os.path.basename(os.path.realpath(path))
     a = ck.get("args") or {}
+    if kind == "plan":
+        return (f"planner(재설계): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + 속도·핸들·회전 + 직전 plan -> "
+                f"점 10개 x 0.1 s(걸음마다 꺾기·속도, 차 한계 안) -> MAP·후진 추종, 10 Hz")
     if is_plan(ck) and str(a.get("plan_format", "wp4") or "wp4") in ("tw", "tw5", "tw5c", "tw5g"):
         from .. import plan_tw
         k_ = plan_tw.FORMATS[str(a.get("plan_format"))][1]
@@ -113,6 +129,12 @@ class StatePolicyRunner:
     flattened v1 observation and are not used: a teacher builds its own observation from the env, a student reads the
     session's observation dict (`self.session["obs"]`, set by the worker) and keeps its odometry history itself. Called
     once per control step; a new decision every `repeat` calls, held in between, as in training."""
+
+    def __new__(cls, env, ck: dict, kind: str, device):
+        if kind == "plan":
+            from ..learn.plan_policy import PlanRunner
+            return PlanRunner(env, _to(ck, device), device, mode="map")
+        return super().__new__(cls)
 
     def __init__(self, env, ck: dict, kind: str, device):
         from ..learn import state_rl
@@ -166,7 +188,11 @@ class StateIntro:
     def __init__(self, runner: "StatePolicyRunner"):
         self.h: dict = {}
         self.paused = False
-        if runner.kind == "teacher":
+        if runner.kind == "plan":
+            mlp = runner.actor.mlp
+            mlp[1].register_forward_hook(self._hook("stem"))
+            mlp[3].register_forward_hook(self._hook("hidden"))
+        elif runner.kind == "teacher":
             pi = runner.tp.net.pi
             if isinstance(pi, torch.nn.Sequential) and len(pi) >= 4:
                 pi[1].register_forward_hook(self._hook("stem"))
