@@ -10,8 +10,10 @@ the brakes (`a_brake`), against rolling resistance and drag (`actuators.vesc_acc
 Here the policy's 20 numbers are COMMANDS, two per 0.1 s step, and the plan is the car's response to them through that
 delay and those lags (the nominal car), integrated every 5 ms, the poses by the kinematic bicycle about the CoG:
 
-  steering command  a_turn x (the full-lock angle the tyres hold at the car's speed at that control step), so the
-                    commanded turn is always one the grip allows, and every output is a different command (no clamp)
+  steering command  the last steering command +- what the servo turns in a step (sv_max x 0.1 s), inside the steering
+                    the tyres hold at the step's start speed (MAP's table), spread over that range as v2's steering is
+                    (11-09: as a_turn x the grip, mean-reverting to straight, an untrained policy drove into the corners'
+                    walls 40x as often as v2 and learned to stand still)
   speed command     the speed at the step's start + a_speed x DV_CMD (1.5 m/s: through the speed loop's lag that is the
                     motor's full drive and the brakes' full stop), inside [-V_REV, V_FWD]. Relative, as v2's: an untrained
                     policy holds its speed (11-09: spread over [-2, 10] its mean was 'go 4 m/s straight', the cars ran into
@@ -148,10 +150,17 @@ def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, c_prev: torch
     prev_d, prev_v = c_prev[:, 0].float(), c_prev[:, 1].float()
     n_delay = int(round(act.delay / H))
     X, Y, P, V, D, CD, CV = [x], [y], [psi], [v], [d], [], []
+    dd = lim.sv_max * DT
     for k in range(N_STEP):
         cv = (v + a_speed[:, k] * DV_CMD).clamp(-V_REV, V_FWD)      # the step's speed command
+        g = grip_steer(v, lim, turn)
+        lo = torch.maximum(prev_d - dd, -g); hi = torch.minimum(prev_d + dd, g)
+        bad = lo > hi                                     # the last command is past the grip now: unwind to its edge
+        edge = torch.where(prev_d > 0, g, -g)
+        lo = torch.where(bad, edge, lo); hi = torch.where(bad, edge, hi)
+        cd_k = lo + (a_turn[:, k] + 1.0) * 0.5 * (hi - lo)
         for j in range(SUB):
-            cd = a_turn[:, k] * grip_steer(v, lim, turn)      # the command sent at this control step
+            cd = cd_k                                          # the command sent at this control step
             for i in range(N_H):
                 in_d, in_v = (prev_d, prev_v) if i < n_delay else (cd, cv)
                 d = servo_step(d, in_d, act, lim, H)

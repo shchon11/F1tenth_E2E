@@ -120,6 +120,8 @@ def main(argv=None):
                     help="v2 (11-08): raw sensors only, the plan starts from the policy's own speed estimate")
     ap.add_argument("--vest-coef", type=float, default=1.0, help="v2: weight of the speed estimate's loss [per (m/s)^2]")
     ap.add_argument("--save-every", type=int, default=25)
+    ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
+    ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
@@ -133,6 +135,8 @@ def main(argv=None):
     env, lim, world = build(args.world, args.envs, args.seed, dev, fmt=args.format)
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
+    pr.plan_hit_share = float(args.plan_hit_share)
+    pr.plan_hit_n = None if args.plan_hit_s >= PS.N_STEP * PS.DT else int(round(args.plan_hit_s / PS.DT * PS.SUB))
     v3 = args.format == "v3"
     v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
     obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)

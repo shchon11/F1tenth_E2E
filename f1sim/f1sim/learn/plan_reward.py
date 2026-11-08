@@ -133,6 +133,8 @@ class PlanReward:
         self.seen_t = torch.full((Bl,), 1e9, device=device)    # [s] since a beam last hit a car
         self.n_contacts = torch.zeros(Bl, 3, device=device)
         self.corners = env.sim.corners.float()                 # (4, 2) footprint about the CoG
+        # the plan-hit cost's share of a contact and how far into the plan it looks (poses on the control grid; None = all)
+        self.plan_hit_share, self.plan_hit_n = PLAN_HIT_SHARE, None
         self.begin(torch.arange(Bl, device=device))
 
     def _d_car(self) -> torch.Tensor:
@@ -198,10 +200,12 @@ class PlanReward:
             cl = proc.clearance(pts.reshape(-1, 2), eid).reshape(cx.shape)
             hit = hit | (cl <= 0.0).any(-1)
         hit[:, 0] = False
+        if self.plan_hit_n is not None:                                               # only the plan's first poses
+            hit[:, self.plan_hit_n + 1:] = False
         any_ = hit.any(1)
         first = torch.where(any_, hit.float().argmax(1), torch.zeros_like(any_, dtype=torch.long))
         v_hit = v.gather(1, first[:, None])[:, 0].abs()
-        price = torch.where(any_, PLAN_HIT_SHARE * (CONTACT_S + CONTACT_S_PER_MPS * v_hit) / T_REF, torch.zeros_like(v_hit))
+        price = torch.where(any_, self.plan_hit_share * (CONTACT_S + CONTACT_S_PER_MPS * v_hit) / T_REF, torch.zeros_like(v_hit))
         return {"hit": any_, "first": first, "price": price}
 
     def decision(self, pts: torch.Tensor, plan_price: Optional[torch.Tensor] = None,
