@@ -59,7 +59,8 @@ kk = torch.zeros(env.B, PS.N_STEP, device=dev); vv = torch.zeros(env.B, PS.N_STE
 has_props = torch.zeros(B, dtype=torch.bool, device=dev)
 proc = getattr(env, "procedural", None)
 if proc is not None:
-    sid = proc.p_sid[lid] if proc.p_sid.shape[0] == env.B else proc.p_sid[env.sim.eid[lid]]
+    # the props of a car's world sit at its world index (`Sim.eid`: both cars of a race share one), not at its row
+    sid = proc.p_sid[env.sim.eid[lid]]
     has_props = (sid >= 0).any(-1)
 absent = env.sim.absent if getattr(env.sim, "absent_any", False) else torch.zeros(env.B, dtype=torch.bool, device=dev)
 others = env.sim.other_idx[lid] if env.M > 1 else None
