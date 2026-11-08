@@ -224,6 +224,14 @@ class PlanRunner:
         self.last_ep = env.ep_step[self.lid].clone()
         self.session = None
         self.last_mean = None
+        # mode "track" (11-09, the user: "얼추 여기에 맞는 제어기 좀 만들어놔"): full physics, `plan_follow.PlanFollower` follows
+        # the plan in time (actuator lags inverted), its command goes in through the env's external-command path
+        self.follower = None
+        if mode == "track":
+            from ..plan_follow import PlanFollower
+            self.follower = PlanFollower(Bl, device, s_max=float(env.s_max))
+            env.ext_mask[self.lid] = True
+            env._ext_ids.update(int(i) for i in self.lid.tolist())
 
     @torch.no_grad()
     def __call__(self, scan=None, ego=None):
@@ -247,7 +255,9 @@ class PlanRunner:
                 mean, _ = self.actor(self.obs.scans, self.obs.state())
                 p = PS.roll(torch.tanh(mean), st[:, dyn.IVX], st[:, dyn.ISTEER], self.lim)
             self.last_mean = mean
-            x, y, _ = plan_world(p, st)
+            x, y, psi = plan_world(p, st)
+            if self.follower is not None:
+                self.follower.set_plan(due, x[due], y[due], psi[due], p["v"][due], p["delta"][due])
             idx = PT_IDX.to(self.device)
             self.obs.set_plan(torch.stack([x[:, idx], y[:, idx]], -1), p["pv"], due)
             if self.v2:
@@ -262,6 +272,8 @@ class PlanRunner:
             env.ext_plan_kv = (self.kk, self.vv)
             if self.mode == "ideal":
                 env.sim.ideal_vcap[lid[due]] = 1e3
+        if self.follower is not None:
+            env.ext_cmd[lid] = self.follower.command(env.sim.state[lid])
         if self.mode == "ideal":
             jj = j[:, None]
             env.ideal_cmd[lid, 0] = self.cmd_d.gather(1, jj)[:, 0]

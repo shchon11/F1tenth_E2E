@@ -1,7 +1,7 @@
 """빈 트랙에서 학습된 planner가 달린 라인이 보상 때문에 어느 쪽으로 끌렸나 (11-08 05:00, 사용자: "빈 트랙에서 달리는 저 라인이 보상설계에
 의해 편향될가능성이 있나?"). 원래 트랙(변형 없음), 빈 트랙, 상대 없음으로 차 N대를 몰아(조건: ideal = 학습 조건 / map = 실차 조건) 지나간
-자리·속도를 기록하고, 두 선과 겹쳐 그림: (1) 결승선까지 벽 사이 최단 경로(중간 점수의 기준) -- 여기 붙으면 중간 점수 쪽으로 끌린 것,
-(2) 랩타임 최소 레이싱라인(상대 차가 쓰는 min_time 선, 비교용) -- 여기 붙으면 랩타임 쪽. 각 선까지의 거리 중앙도 셈.
+자리·속도를 기록하고, 두 선과 겹쳐 그림: 결승선까지 벽 사이 최단 경로(중간 점수의 기준) -- 여기 붙으면 중간 점수 쪽으로 끌린 것. 그 선까지의 거리 중앙도 셈.
+(11-09 사용자: 레이싱라인은 쓰지 않으니 그림·계산에서 뺌)
 인자: checkpoint 조건(ideal|map) 차수 초 출력png"""
 import os, sys, math, argparse, json
 import numpy as np
@@ -35,6 +35,11 @@ if mode == "ideal":
     env.enable_ideal()
 prepare_graph_runtime(env, log=lambda _t: None); env.reset(seed=7)
 lid = env.learner_ids; B = int(lid.numel())
+follower = None
+if mode == "track":                                          # 11-09: physics + plan_follow.PlanFollower
+    from f1sim.plan_follow import PlanFollower
+    follower = PlanFollower(B, dev, s_max=float(env.s_max))
+    env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
 V2 = ck.get("format") == "plan_steps2"
@@ -50,6 +55,8 @@ for kd in range(int(secs / PS.DT)):
         mean, _ = actor(obs.scans, obs.state())
         p = PS.roll(torch.tanh(mean), st[:, dyn.IVX], st[:, dyn.ISTEER], lim)
     x, y, psi = plan_world(p, st)
+    if follower is not None:
+        follower.set_plan(slice(None), x, y, psi, p["v"], p["delta"])
     if mode == "map":
         k_, v_ = plan_segments(p, lim); kk[lid] = k_; vv[lid] = v_; env.ext_plan_kv = (kk, vv)
     else:
@@ -57,6 +64,8 @@ for kd in range(int(secs / PS.DT)):
     for j in range(PS.SUB):
         if mode == "ideal":
             env.ideal_cmd[lid, 0] = p["cmd_d"][:, j]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, j]
+        if follower is not None:
+            env.ext_cmd[lid] = follower.command(env.sim.state[lid])
         env.step(act0)
         XY.append(env.sim.state[lid, :2].cpu().numpy().copy()); SP.append(env.sim.state[lid, dyn.IVX].cpu().numpy().copy())
     idx = PT_IDX.to(dev)
@@ -69,9 +78,6 @@ XYd, SPd = XY[:, skip:], SP[:, skip:]
 # the lines to compare with: the shortest path to the finish (the shaping's measure) and the min-time raceline
 tr = env.sim.track
 goal = GoalField(tr, dev)
-rl = env._rls[0] if getattr(env, "_rls", None) else None
-rl_xy = np.asarray(rl.xy, float) if rl is not None else None
-rl_v = np.asarray(rl.v, float) if rl is not None else None
 # shortest path: from just past the finish line, follow the distance field down (8-neighbour descent on the grid)
 res = float(tr.t_res[0]); ox, oy = [float(v) for v in tr.t_origin[0]]; H, W = int(tr.t_H[0]), int(tr.t_W[0]); off = int(tr.t_off[0])
 D = goal.field[off: off + H * W].view(H, W).cpu().numpy()
@@ -95,7 +101,7 @@ def dist_to(line, pts):
     d = np.sqrt(((pts[:, None, :] - line[None, ::2, :]) ** 2).sum(-1)).min(1)
     return d
 pts = XYd.reshape(-1, 2)[::5]
-d_sp = dist_to(sp_path, pts); d_rl = dist_to(rl_xy, pts) if rl_xy is not None else np.full(len(pts), np.nan)
+d_sp = dist_to(sp_path, pts)
 occ = tr.edt[off: off + H * W].view(H, W).cpu().numpy() <= 0
 ext = [ox - res / 2, ox + (W - 0.5) * res, oy - res / 2, oy + (H - 0.5) * res]
 fig, ax = plt.subplots(1, 1, figsize=(16, 9))
@@ -103,12 +109,10 @@ ax.imshow(~occ, cmap="gray", origin="lower", extent=ext, alpha=0.5)
 for b in range(B):
     sc = ax.scatter(XYd[b, ::4, 0], XYd[b, ::4, 1], c=SPd[b, ::4], s=2, cmap="turbo", vmin=0, vmax=8)
 ax.plot(sp_path[:, 0], sp_path[:, 1], "k--", lw=1.6, label="결승선까지 최단 경로 (중간 점수 기준)")
-if rl_xy is not None:
-    ax.plot(rl_xy[:, 0], rl_xy[:, 1], "m-", lw=1.4, label=f"랩타임 최소 레이싱라인 (비교용, 최고 {rl_v.max():.1f} m/s)")
 plt.colorbar(sc, ax=ax, fraction=0.03, label="policy 속도 [m/s]")
 ax.legend(loc="upper left", fontsize=10); ax.set_aspect("equal")
 name = f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"
-ax.set_title(f"{name} [{'학습 조건' if mode == 'ideal' else '실차 조건'}] 빈 트랙 차 {B}대 x {secs:.0f} s: 달린 자리(색 = 속도) | 최단 경로까지 거리 중앙 "
-             f"{np.median(d_sp) * 100:.0f} cm, 레이싱라인까지 {np.nanmedian(d_rl) * 100:.0f} cm", fontsize=11)
+ax.set_title(f"{name} [{dict(ideal='학습 조건', map='실차 조건 MAP', track='물리 + 새 제어기')[mode]}] 빈 트랙 차 {B}대 x {secs:.0f} s: 달린 자리(색 = 속도) | 최단 경로까지 거리 중앙 "
+             f"{np.median(d_sp) * 100:.0f} cm", fontsize=11)
 plt.tight_layout(); plt.savefig(out, dpi=70)
-print(f"{out} | 최단 경로까지 중앙 {np.median(d_sp) * 100:.0f} cm, 레이싱라인까지 중앙 {np.nanmedian(d_rl) * 100:.0f} cm | 평균 속도 {SPd.mean():.2f} m/s")
+print(f"{out} | 최단 경로까지 중앙 {np.median(d_sp) * 100:.0f} cm | 평균 속도 {SPd.mean():.2f} m/s")

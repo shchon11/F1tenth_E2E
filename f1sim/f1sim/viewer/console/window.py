@@ -2062,7 +2062,9 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.chk_trails = QtWidgets.QCheckBox("주행 궤적")
         self.chk_trails.setChecked(True)
         self.chk_raceline = QtWidgets.QCheckBox("레이싱 라인 / 중심선")
-        self.chk_raceline.setChecked(True)
+        # off by default (11-09, the user: "레이싱라인좀 시각화나 뭐 계산할때 쳐 지워라 쓰지도않는거"): the planners shown
+        # here do not use one
+        self.chk_raceline.setChecked(False)
         self.chk_labels = QtWidgets.QCheckBox("차량 번호")
         self.chk_labels.setChecked(True)
         self.chk_contacts = QtWidgets.QCheckBox("접촉 지점")
