@@ -154,6 +154,10 @@ class PlanObs:
         """(B_l, P): the simulator's state for the critic"""
         env = self.env
         pv = env.privileged_v2()[self.lid].float()
+        # no centerline (11-09, the user: "레이싱라인 ... 쓰지도않는거", "Centerline 도 마찬가지야"): the offset / heading to it,
+        # the lap fraction and the progress rate along it are left out; the distance left to the line is the walls-only one below
+        keep = torch.ones(pv.shape[1], dtype=torch.bool, device=pv.device); keep[_PRIV_DROP] = False
+        pv = pv[:, keep]
         extra = []
         if self.goal is not None:
             tid = env.sim.tid[self.lid]
@@ -174,6 +178,14 @@ def plan_world(p: Dict[str, torch.Tensor], st: torch.Tensor):
 
 
 PT_IDX = torch.arange(1, PS.N_STEP + 1) * PS.SUB             # the 10 points among the dense poses
+
+def _priv_drop() -> list:
+    """the centerline columns of `GymEnv.privileged_v2` (the columns after its keys -- props -- are kept)"""
+    from ..gym_env import PRIV_V2_KEYS
+    return [i for i, k in enumerate(PRIV_V2_KEYS) if k in ("lateral", "heading_err", "lap_frac", "progress_rate")]
+
+
+_PRIV_DROP = _priv_drop()
 
 
 def plan_segments(p: Dict[str, torch.Tensor], lim: PS.Limits) -> Tuple[torch.Tensor, torch.Tensor]:
