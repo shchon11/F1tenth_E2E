@@ -254,12 +254,13 @@ class PlanRunner:
                 self.obs.set_plan2(p, due)
             self.cmd_d = torch.where(due[:, None], p["cmd_d"], self.cmd_d)
             self.cmd_v = torch.where(due[:, None], p["cmd_v"], self.cmd_v)
-            if self.mode == "map":
-                k_, v_ = plan_segments(p, self.lim)
-                rows = lid[due]
-                self.kk[rows] = k_[due]; self.vv[rows] = v_[due]
-                env.ext_plan_kv = (self.kk, self.vv)
-            else:
+            # MAP follows these segments; in "ideal" its command is not used, but the viewers draw the plan from them
+            # (11-08: without, the console / videos showed a stale straight line as the policy's plan)
+            k_, v_ = plan_segments(p, self.lim)
+            rows = lid[due]
+            self.kk[rows] = k_[due]; self.vv[rows] = v_[due]
+            env.ext_plan_kv = (self.kk, self.vv)
+            if self.mode == "ideal":
                 env.sim.ideal_vcap[lid[due]] = 1e3
         if self.mode == "ideal":
             jj = j[:, None]
