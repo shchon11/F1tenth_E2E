@@ -12,7 +12,10 @@ the two actuator lags the simulator models -- the speed loop and the servo (`dyn
 steering command the plan's angle plus servo_tau x its rate, both read at (now + delay + half a step). The plan keeps
 inside the motor, brakes, servo rate and tyre table (`plan_steps.Limits`), so on the nominal car these are commands the
 car can carry out. A small feedback on the error to the plan's pose at this instant (lateral, heading, speed) takes up
-what the inversion misses (a randomised car, tyre slip, contacts). The constants are the nominal car's, not the
+what the inversion misses (a randomised car, tyre slip, contacts). Gains chosen by the error to a whole plan followed
+1 s (11-09, u1500, 64 cars x 40 s): (k_v, k_lat, k_head) 0,0,0 -> 23.1 cm at 1 s, 1,0,0 15.2, 1,.2,.2 14.5, 1,.5,.5 14.0,
+2,1,1 12.1 (MAP 46.2). The lateral gains barely change the closed-loop lap: the weave there is the policy re-planning
+every 0.1 s for an instant car, not this follower. The constants are the nominal car's, not the
 randomised ones: the real car's are not known to it either."""
 import math
 import torch
@@ -26,7 +29,7 @@ class PlanFollower:
     + 1)); `command(state)` is called once per control step and returns (n, 2), stepping each row's clock."""
 
     def __init__(self, n: int, device, motor_tau: float = 0.20, servo_tau: float = 0.08, delay: float = 0.015,
-                 k_v: float = 1.0, k_lat: float = 0.5, k_head: float = 0.5, s_max: float = 0.4189):
+                 k_v: float = 2.0, k_lat: float = 1.0, k_head: float = 1.0, s_max: float = 0.4189):
         self.n, self.device = n, device
         self.h = PS.DT / PS.SUB
         self.motor_tau, self.servo_tau, self.delay = motor_tau, servo_tau, delay
