@@ -259,6 +259,10 @@ class Simulator:
         #: speed. None = off; set before the roll is first compiled / captured.
         self.ideal_rows = None
         self.ideal_vcap = torch.full((num_envs,), 1e3, device=self.device)
+        #: ideal execution through the command delay and the actuator lags (`plan_steps3`, 11-09): the rows' servo and
+        #: speed follow the nominal car's command path from their true state, the poses the kinematic bicycle
+        self.ideal_lag = False
+        self.ideal_turn = None                 # `plan_steps3.Turning`: how much the car turns (MAP's table), with ideal_lag
         #: Car-car contact seen inside the roll (`SimParams.car_response`), latched like `wall_touched`: the
         #: response pushes two cars apart within the step, so the step-end test alone would miss it.
         self.car_touched = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
@@ -1448,7 +1452,22 @@ class Simulator:
             st_prev = state
             state, ax, ay = self._step_dynamics(state, steer_tgt, a_cmd, ax, P, P["servo_tau"], self.dt,
                                                 wheel=wheel_on)
-            if self.ideal_rows is not None:
+            if self.ideal_rows is not None and self.ideal_lag:
+                # the command through the nominal car's path (`plan_steps3`): the last control step's command for the
+                # first `delay`, then this one's; the servo and the speed loop as first-order lags inside their limits
+                from . import plan_steps3 as _P3
+                _act = _P3.Actuators()
+                c_i = cmd_hist[:, 1] if (k + 1) < int(round(_act.delay / self.dt)) else cmd_hist[:, 0]
+                s0_i, v0_i = st_prev[:, dyn.ISTEER], st_prev[:, dyn.IVX]
+                rate_i = ((c_i[:, 0] - s0_i) / _act.servo_tau).clamp(-_act.sv_max, _act.sv_max)
+                d_i = (s0_i + rate_i * self.dt).clamp(-_act.s_max, _act.s_max)
+                a_i = (c_i[:, 1] - v0_i) / _act.motor_tau
+                a_l = _act.a_max * torch.clamp(_act.v_switch / v0_i.abs().clamp_min(1e-3), max=1.0)
+                a_i = torch.maximum(torch.minimum(a_i, a_l), torch.full_like(a_i, -_act.a_brake))
+                res_i = _act.c_roll * torch.tanh(v0_i / 0.05) + _act.c_drag * v0_i * v0_i.abs()
+                res_i = torch.sign(v0_i) * torch.minimum(res_i.abs(), v0_i.abs() / self.dt)
+                v_i = v0_i + (a_i - res_i) * self.dt
+            elif self.ideal_rows is not None:
                 # the command, exactly: kinematic bicycle about the CoG (beta = atan(lr / L tan delta)), the
                 # speed capped by what the last contact left (`ideal_vcap`)
                 d_i = cmd_hist[:, 0, 0]
@@ -1459,8 +1478,9 @@ class Simulator:
                 v0_i, s0_i = st_prev[:, dyn.IVX], st_prev[:, dyn.ISTEER]
                 v_i = torch.minimum(torch.maximum(v_i, v0_i - P["a_brake"] * self.dt), v0_i + P["a_max"] * self.dt)
                 d_i = torch.minimum(torch.maximum(d_i, s0_i - P["sv_max"] * self.dt), s0_i + P["sv_max"] * self.dt)
+            if self.ideal_rows is not None:
                 L_i = P["lf"] + P["lr"]
-                tan_i = torch.tan(d_i)
+                tan_i = torch.tan(self.ideal_turn.eff(d_i, v_i) if (self.ideal_lag and self.ideal_turn is not None) else d_i)
                 b_i = torch.atan(P["lr"] / L_i * tan_i)
                 r_i = v_i * torch.cos(b_i) * tan_i / L_i
                 vy_i = v_i * torch.tan(b_i)

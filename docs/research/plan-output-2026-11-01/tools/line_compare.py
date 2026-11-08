@@ -37,8 +37,9 @@ prepare_graph_runtime(env, log=lambda _t: None); env.reset(seed=7)
 lid = env.learner_ids; B = int(lid.numel())
 follower = None
 if mode == "track":                                          # 11-09: physics + plan_follow.PlanFollower
-    from f1sim.plan_follow import PlanFollower
-    follower = PlanFollower(B, dev, s_max=float(env.s_max))
+    from f1sim.plan_follow import PlanFollower, to_car
+    follower = PlanFollower(B, dev, s_max=float(env.s_max), lut=env.tracker.map.lut,
+                            grip=M.GRIP_LEVELS.index(1.0), wheelbase=float(env.tracker.nominal["lf"]) + float(env.tracker.nominal["lr"]))
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
@@ -65,7 +66,7 @@ for kd in range(int(secs / PS.DT)):
         if mode == "ideal":
             env.ideal_cmd[lid, 0] = p["cmd_d"][:, j]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, j]
         if follower is not None:
-            env.ext_cmd[lid] = follower.command(env.sim.state[lid])
+            env.ext_cmd[lid] = to_car(env, lid, follower.command(env.sim.state[lid]))
         env.step(act0)
         XY.append(env.sim.state[lid, :2].cpu().numpy().copy()); SP.append(env.sim.state[lid, dyn.IVX].cpu().numpy().copy())
     idx = PT_IDX.to(dev)

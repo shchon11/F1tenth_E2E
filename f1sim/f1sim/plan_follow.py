@@ -29,11 +29,15 @@ class PlanFollower:
     + 1)); `command(state)` is called once per control step and returns (n, 2), stepping each row's clock."""
 
     def __init__(self, n: int, device, motor_tau: float = 0.20, servo_tau: float = 0.08, delay: float = 0.015,
-                 k_v: float = 2.0, k_lat: float = 1.0, k_head: float = 1.0, s_max: float = 0.4189):
+                 k_v: float = 2.0, k_lat: float = 1.0, k_head: float = 1.0, s_max: float = 0.4189,
+                 lut=None, grip: int = 0, wheelbase: float = 0.3302):
         self.n, self.device = n, device
         self.h = PS.DT / PS.SUB
         self.motor_tau, self.servo_tau, self.delay = motor_tau, servo_tau, delay
         self.k_v, self.k_lat, self.k_head, self.s_max = k_v, k_lat, k_head, s_max
+        # MAP's steering table (11-09): the plan's steering is the kinematic bicycle's; the car understeers (at 7 m/s it
+        # turns 30 % of that), so the feedforward is the table's steering for the plan's curvature, as MAP's is
+        self.lut, self.grip, self.L = lut, grip, wheelbase
         m = PS.N_STEP * PS.SUB + 1
         z = lambda: torch.zeros(n, m, device=device)
         self.X, self.Y, self.PSI, self.V, self.D = z(), z(), z(), z(), z()
@@ -56,12 +60,24 @@ class PlanFollower:
         past = f >= float(last)                                        # beyond the plan's end: hold, no rate
         return val, torch.where(past, torch.zeros_like(slope), slope)
 
+    def _table_steer(self, d_kin: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """the steering the car needs for the curvature the kinematic steering d_kin means, at speed v (MAP's table;
+        below 0.5 m/s, the table's first column, the kinematic one)"""
+        acc = v * v * torch.tan(d_kin) / self.L
+        g = torch.full_like(v, self.grip, dtype=torch.long)
+        d = self.lut.lookup(acc, v.abs().clamp_min(0.5), g, interp="linear")
+        slow = v.abs() < 0.5
+        return torch.where(slow, d_kin, torch.nan_to_num(d, nan=0.0)).clamp(-self.s_max, self.s_max)
+
     def command(self, st: torch.Tensor) -> torch.Tensor:
         """st (n, >= 4): x, y, yaw, vx (the car's estimate of itself). (n, 2) steering [rad], speed [m/s]."""
         kf = self.k.float()
         f_lead = kf + (self.delay + 0.5 * self.h) / self.h
         v_ff, a_ff = self._at(self.V, f_lead)
         d_ff, w_ff = self._at(self.D, f_lead)
+        if self.lut is not None:
+            d_ff, w_ff = self._table_steer(d_ff, v_ff), (self._table_steer(d_ff + w_ff * self.h, v_ff + a_ff * self.h)
+                                                       - self._table_steer(d_ff, v_ff)) / self.h
         # the error to where the plan is now, in the plan's frame
         x_p, _ = self._at(self.X, kf); y_p, _ = self._at(self.Y, kf); psi_p, _ = self._at(self.PSI, kf)
         v_p, _ = self._at(self.V, kf)
@@ -73,3 +89,14 @@ class PlanFollower:
         steer = d_ff + self.servo_tau * w_ff - sgn * (self.k_lat * e_lat + self.k_head * e_head)
         self.k += 1
         return torch.stack([steer.clamp(-self.s_max, self.s_max), speed], 1)
+
+
+def to_car(env, rows: torch.Tensor, cmd: torch.Tensor) -> torch.Tensor:
+    """(steering, speed) commands meant for the car -> what goes to its servo / VESC, through the car's calibration as MAP's
+    commands go (`GymEnv.tracker_cal`: the servo's trim and gain, the VESC's speed gain, measured once). 11-09: sent raw,
+    the simulator's trim error (+-0.03 rad) bent every plan 40-70 cm off in 1 s at 4 m/s."""
+    cal = getattr(env, "tracker_cal", None)
+    if cal is None:
+        return cmd
+    c = cal[rows]
+    return torch.stack([((cmd[:, 0] - c[:, 0]) / c[:, 1]).clamp(-float(env.s_max), float(env.s_max)), cmd[:, 1] / c[:, 2]], 1)

@@ -1422,12 +1422,15 @@ class F1VecEnv:
                 self._tw_carry = plan_tw.Carry(self.B, self.sim.control_dt, self.device, grip=e.learner_plan == "tw5g")
             self._tw_amax = None                            # tw5g: (G, V) steady-state lateral acceleration of MAP's table
 
-    def enable_ideal(self) -> None:
+    def enable_ideal(self, lag: bool = False, turn=None) -> None:
         """Ideal execution for the learner's rows (11-07 redesign): set `ideal_cmd` (B, 2) -- steering [rad], speed [m/s,
         signed] -- before every `step` and the rows drive exactly that (`Sim.ideal_rows`), contacts resolved as usual.
         Before the first step / graph capture: the roll reads the flag when it is compiled."""
         self.sim.ideal_rows = self.learner.clone()
         self.ideal_cmd = torch.zeros(self.B, 2, device=self.device)
+        # `lag` (11-09, `plan_steps3`): the command goes through the nominal car's delay, servo and speed loop
+        self.sim.ideal_lag = bool(lag)
+        self.sim.ideal_turn = turn                                   # `plan_steps3.Turning` (MAP's table), else the bicycle
 
     def _check_obs_v2(self) -> None:
         """Refuse a v2 env that could not produce the v2 observation honestly."""

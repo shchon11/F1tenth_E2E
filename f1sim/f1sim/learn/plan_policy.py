@@ -241,7 +241,8 @@ class PlanRunner:
         self.follower = None
         if mode == "track":
             from ..plan_follow import PlanFollower
-            self.follower = PlanFollower(Bl, device, s_max=float(env.s_max))
+            self.follower = PlanFollower(Bl, device, s_max=float(env.s_max), lut=env.tracker.map.lut,
+                                         grip=M.GRIP_LEVELS.index(1.0), wheelbase=self.lim.wheelbase)
             env.ext_mask[self.lid] = True
             env._ext_ids.update(int(i) for i in self.lid.tolist())
 
@@ -285,7 +286,8 @@ class PlanRunner:
             if self.mode == "ideal":
                 env.sim.ideal_vcap[lid[due]] = 1e3
         if self.follower is not None:
-            env.ext_cmd[lid] = self.follower.command(env.sim.state[lid])
+            from ..plan_follow import to_car
+            env.ext_cmd[lid] = to_car(env, lid, self.follower.command(env.sim.state[lid]))
         if self.mode == "ideal":
             jj = j[:, None]
             env.ideal_cmd[lid, 0] = self.cmd_d.gather(1, jj)[:, 0]

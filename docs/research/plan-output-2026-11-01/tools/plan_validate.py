@@ -53,9 +53,10 @@ lid = env.learner_ids; B = int(lid.numel())
 HOLD = int(os.environ.get("F1SIM_HOLD", "1"))
 follower = None
 if mode == "track":
-    from f1sim.plan_follow import PlanFollower
+    from f1sim.plan_follow import PlanFollower, to_car
     _g = [float(v) for v in os.environ.get("F1SIM_TRACK_GAINS", "2.0,1.0,1.0").split(",")]
-    follower = PlanFollower(B, dev, k_v=_g[0], k_lat=_g[1], k_head=_g[2], s_max=float(env.s_max))
+    follower = PlanFollower(B, dev, k_v=_g[0], k_lat=_g[1], k_head=_g[2], s_max=float(env.s_max), lut=env.tracker.map.lut,
+                            grip=M.GRIP_LEVELS.index(1.0), wheelbase=float(env.tracker.nominal["lf"]) + float(env.tracker.nominal["lr"]))
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
     tag = tag + f"(추종 이득 속도 {_g[0]:g} 옆 {_g[1]:g} 방향 {_g[2]:g}) "
 hold_err = {h: [] for h in range(1, PS.N_STEP + 1)}
@@ -120,7 +121,7 @@ for kd in range(n_dec):
             jj = min((kd - kd0) * PS.SUB + j, p["cmd_d"].shape[1] - 1)
             env.ideal_cmd[lid, 0] = p["cmd_d"][:, jj]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, jj]
         if follower is not None:
-            env.ext_cmd[lid] = follower.command(env.sim.state[lid])
+            env.ext_cmd[lid] = to_car(env, lid, follower.command(env.sim.state[lid]))
         env.step(act0)
         r = env.last_result
         if others is not None and getattr(env.sim, "absent_any", False):
