@@ -62,9 +62,11 @@ if proc is not None:
     # the props of a car's world sit at its world index (`Sim.eid`: both cars of a race share one), not at its row
     sid = proc.p_sid[env.sim.eid[lid]]
     has_props = (sid >= 0).any(-1)
+props_ever = has_props.clone()                             # boxes in its world at any moment
 absent = env.sim.absent if getattr(env.sim, "absent_any", False) else torch.zeros(env.B, dtype=torch.bool, device=dev)
 others = env.sim.other_idx[lid] if env.M > 1 else None
 has_opp = torch.zeros(B, dtype=torch.bool, device=dev) if others is None else (~absent[others]).any(-1)
+opp_ever = has_opp.clone()                                 # an opponent present at any moment (a seat can be refilled)
 i_on = [CC.index(k) for k in ("onsets_wall", "onsets_prop", "onsets_car")]
 i_hd = [CC.index(k) for k in ("hard_wall", "hard_prop", "hard_car")]
 cf0 = env.sim.contact_frame()[lid].float()
@@ -93,6 +95,10 @@ for kd in range(n_dec):
             env.ideal_cmd[lid, 0] = p["cmd_d"][:, j]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, j]
         env.step(act0)
         r = env.last_result
+        if others is not None and getattr(env.sim, "absent_any", False):
+            opp_ever |= (~env.sim.absent[others]).any(-1)
+        if proc is not None:
+            props_ever |= (proc.p_sid[env.sim.eid[lid]] >= 0).any(-1)
         pr.control_step((r.scan_type[lid] == HIT_CAR).any(1))
     idx = PT_IDX.to(dev)
     out = pr.decision(torch.stack([x[:, idx], y[:, idx]], -1), pc["price"])
@@ -123,6 +129,12 @@ def honest(m, h):
     k = int(round(h / PS.DT))
     d = (W[:-k, :, k] - X[k:, :, :2]).norm(dim=-1)[:, m]
     return float(d.median()) * 100
+# 11-09: a seat or a layout can be filled mid-run (a race that resets whole redraws them), so the 'empty' case collected car
+# and box contacts -- a car is put in a case by what it met at any moment, not by its start
+_late_o, _late_p = int((opp_ever & ~has_opp).sum()), int((props_ever & ~has_props).sum())
+if _late_o or _late_p:
+    print(f"{tag}  (도중에 상대 차가 나타난 차 {_late_o}대, 상자가 나타난 차 {_late_p}대: 칸은 40 s 동안 한 번이라도 있었는지로 나눔)", flush=True)
+has_opp, has_props = opp_ever, props_ever
 cases = (("빈 트랙", ~has_props & ~has_opp), ("상대 차", ~has_props & has_opp), ("상자", has_props & ~has_opp), ("상자+상대", has_props & has_opp))
 name = f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"
 _ve = f", 속도 짐작 오차 중앙 {float(torch.cat(vest).median()):.2f} m/s" if vest else ""
