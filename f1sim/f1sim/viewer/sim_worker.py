@@ -1455,7 +1455,14 @@ class SimWorker:
         # the plan exactly, contacts the simulator's -- to tell a policy fault from a MAP-following one on the same layout.
         # Before the warmup: the compiled roll reads the flag when it is captured.
         if skind == "plan" and os.environ.get("F1SIM_PLAN_MODE", "map") == "ideal":
-            env.enable_ideal()
+            if (state_ck or {}).get("format") == "plan_steps3":
+                # a plan that knows the control delay: the training's execution through the same delay, lags and table
+                from .. import plan_steps3 as _P3
+                from .. import map_controller as _M
+                _L = float(env.tracker.nominal["lf"]) + float(env.tracker.nominal["lr"])
+                env.enable_ideal(lag=True, turn=_P3.Turning(env.tracker.map.lut, _M.GRIP_LEVELS.index(1.0), _L, device))
+            else:
+                env.enable_ideal()
         self.stage(gen, "warmup")
         env.sim.warmup()
         self._check_cancel(gen)

@@ -19,6 +19,7 @@ from f1sim.learn import state_rl as SR
 from f1sim.learn.graph_runtime import prepare_graph_runtime
 from f1sim.learn.plan_reward import PlanReward
 from f1sim.learn.plan_policy import PlanObs, load_actor, plan_world, plan_segments, PT_IDX, PlanObs2, load_actor2, plan_v2
+from f1sim.learn.plan_policy import PlanObs3, load_actor3, plan_v3, plan_segments3, plan3_models
 from f1sim.learn.plan_rl import WORLD
 from f1sim import plan_steps as PS
 from f1sim import dynamics as dyn
@@ -38,8 +39,12 @@ if mode == "map":
     a.plan_format, a.repeat = "tw", 4
 torch.manual_seed(SEED)
 env = SR.build_env(a, dev)
+ck = torch.load(ck_path, map_location=dev, weights_only=False)
+V3 = ck.get("format") == "plan_steps3"
+lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
+act3, turn3 = plan3_models(env, lim, dev) if V3 else (None, None)
 if mode == "ideal":
-    env.enable_ideal()
+    env.enable_ideal(lag=V3, turn=turn3)                       # v3: the delay-aware execution (before the graphs)
 if mode == "map":
     # the controller's delay handling under test (11-08): F1SIM_MAP_DELAY [s] (MAP's pose prediction), F1SIM_SPEED_LEAD [s]
     if os.environ.get("F1SIM_MAP_DELAY"):
@@ -62,11 +67,10 @@ if mode == "track":
 hold_err = {h: [] for h in range(1, PS.N_STEP + 1)}
 kd0, cur_pts, kd0_prev = 0, None, -9
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
-ck = torch.load(ck_path, map_location=dev, weights_only=False)
-V2 = ck.get("format") == "plan_steps2"
-actor = (load_actor2 if V2 else load_actor)(ck, dev)
+V2 = ck.get("format") == "plan_steps2" or V3
+actor = (load_actor3 if V3 else load_actor2 if V2 else load_actor)(ck, dev)
 pr = PlanReward(env, float(ck["args"].get("gamma", 0.995)), dev)
-obs = (PlanObs2 if V2 else PlanObs)(env, lim, pr.goal)
+obs = (PlanObs3 if V3 else PlanObs2 if V2 else PlanObs)(env, lim, pr.goal)
 vest, vest_s, v01, vnow, v01_act = [], [], [], [], []
 act0 = torch.zeros(env.B, env.act_dim, device=dev)
 kk = torch.zeros(env.B, PS.N_STEP, device=dev); vv = torch.zeros(env.B, PS.N_STEP, device=dev)
@@ -99,7 +103,12 @@ for kd in range(n_dec):
     new = kd % HOLD == 0
     if new:
         kd0 = kd; kd0_prev = kd
-        if V2:
+        if V3:
+            _, mean, _, v_hat, p = plan_v3(actor, obs, lim, act3, turn3)
+            vest.append(
+                (v_hat - st[:, dyn.IVX]).abs()); vest_s.append(v_hat - st[:, dyn.IVX])
+            v01.append(p["v"][:, PS.SUB]); vnow.append(st[:, dyn.IVX])
+        elif V2:
             _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
             vest.append((v_hat - st[:, dyn.IVX]).abs()); vest_s.append(v_hat - st[:, dyn.IVX])
             v01.append(p["v"][:, PS.SUB]); vnow.append(st[:, dyn.IVX])
@@ -110,10 +119,10 @@ for kd in range(n_dec):
         pc = pr.plan_cost(x, y, psi, p["v"])
         cur_pts = torch.stack([x[:, PT_IDX.to(dev)], y[:, PT_IDX.to(dev)]], -1)
         if follower is not None:
-            follower.set_plan(slice(None), x, y, psi, p["v"], p["delta"])
+            follower.set_plan(slice(None), x, y, psi, p["v"], p["delta"], *((p["cmd_d"], p["cmd_v"]) if V3 else ()))
     plans.append(torch.stack([x[:, ::PS.SUB], y[:, ::PS.SUB]], -1)); poses.append(st[:, :3].clone())
     if mode == "map":
-        k_, v_ = plan_segments(p, lim); kk[lid] = k_; vv[lid] = v_; env.ext_plan_kv = (kk, vv)
+        k_, v_ = plan_segments3(p, lim, turn3) if V3 else plan_segments(p, lim); kk[lid] = k_; vv[lid] = v_; env.ext_plan_kv = (kk, vv)
     else:
         env.sim.ideal_vcap[lid] = 1e3
     for j in range(PS.SUB):
@@ -142,7 +151,10 @@ for kd in range(n_dec):
     elif V2:
         # a held plan: the next plan starts from the steering / speed the held one has reached by now (its 'last command')
         _i = min((kd - kd0 + 1) * PS.SUB, p["delta"].shape[1] - 1)
-        obs.cmd_d, obs.cmd_v = p["delta"][:, _i], p["v"][:, _i]
+        if V3:
+            obs.servo, obs.cmd_d, obs.cmd_v = p["delta"][:, _i], p["cmd_d"][:, _i - 1], p["cmd_v"][:, _i - 1]
+        else:
+            obs.cmd_d, obs.cmd_v = p["delta"][:, _i], p["v"][:, _i]
     tnow = (kd + 1) * PS.DT
     crossed = out["lap"] > 0
     if bool(crossed.any()):

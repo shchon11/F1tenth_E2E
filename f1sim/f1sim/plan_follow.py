@@ -42,10 +42,16 @@ class PlanFollower:
         z = lambda: torch.zeros(n, m, device=device)
         self.X, self.Y, self.PSI, self.V, self.D = z(), z(), z(), z(), z()
         self.k = torch.zeros(n, dtype=torch.long, device=device)      # control steps since each row's plan began
+        # a plan that knows the control delay (`plan_steps3`) carries its own commands: sent as they are, the feedback on top
+        self.CD = torch.zeros(n, m - 1, device=device); self.CV = torch.zeros(n, m - 1, device=device)
+        self.has_cmd = False
 
-    def set_plan(self, rows, x, y, psi, v, delta) -> None:
+    def set_plan(self, rows, x, y, psi, v, delta, cmd_d=None, cmd_v=None) -> None:
         self.X[rows], self.Y[rows], self.PSI[rows] = x.float(), y.float(), psi.float()
         self.V[rows], self.D[rows] = v.float(), delta.float()
+        if cmd_d is not None:
+            self.CD[rows], self.CV[rows] = cmd_d.float(), cmd_v.float()
+            self.has_cmd = True
         self.k[rows] = 0
 
     def _at(self, A: torch.Tensor, f: torch.Tensor):
@@ -85,8 +91,13 @@ class PlanFollower:
         e_lat = -torch.sin(psi_p) * ex + torch.cos(psi_p) * ey          # + = the car is left of the plan
         e_head = torch.remainder(st[:, 2] - psi_p + math.pi, 2 * math.pi) - math.pi
         sgn = torch.where(v_p < 0, -torch.ones_like(v_p), torch.ones_like(v_p))   # backwards, steering turns the other way
-        speed = v_ff + self.motor_tau * a_ff + self.k_v * (v_p - st[:, 3])
-        steer = d_ff + self.servo_tau * w_ff - sgn * (self.k_lat * e_lat + self.k_head * e_head)
+        if self.has_cmd:
+            kc = self.k.clamp(max=self.CD.shape[1] - 1)[:, None]
+            speed = self.CV.gather(1, kc)[:, 0] + self.k_v * (v_p - st[:, 3])
+            steer = self.CD.gather(1, kc)[:, 0] - sgn * (self.k_lat * e_lat + self.k_head * e_head)
+        else:
+            speed = v_ff + self.motor_tau * a_ff + self.k_v * (v_p - st[:, 3])
+            steer = d_ff + self.servo_tau * w_ff - sgn * (self.k_lat * e_lat + self.k_head * e_head)
         self.k += 1
         return torch.stack([steer.clamp(-self.s_max, self.s_max), speed], 1)
 

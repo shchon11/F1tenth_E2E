@@ -218,9 +218,14 @@ class PlanRunner:
         self.env, self.device, self.mode = env, device, mode
         self.kind = "plan"
         self.lid = env.learner_ids
-        self.v2 = ck.get("format") == "plan_steps2"
+        self.v3 = ck.get("format") == "plan_steps3"
+        self.v2 = ck.get("format") == "plan_steps2" or self.v3
         self.lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), device)
-        if self.v2:
+        if self.v3:
+            self.actor = load_actor3(ck, device)
+            self.obs = PlanObs3(env, self.lim, None)
+            self.act3, self.turn3 = plan3_models(env, self.lim, device)
+        elif self.v2:
             self.actor = load_actor2(ck, device)
             self.obs = PlanObs2(env, self.lim, None)
         else:
@@ -261,7 +266,10 @@ class PlanRunner:
             self.obs.push_scan(due & ~self.first)                 # a fresh start already holds its scan three times
             self.first &= ~due
             st = env.sim.state[lid].clone()
-            if self.v2:
+            if self.v3:
+                _, mean, _, v_hat, p = plan_v3(self.actor, self.obs, self.lim, self.act3, self.turn3)
+                self.v_hat = v_hat
+            elif self.v2:
                 _, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
                 self.v_hat = v_hat
             else:
@@ -270,7 +278,8 @@ class PlanRunner:
             self.last_mean = mean
             x, y, psi = plan_world(p, st)
             if self.follower is not None:
-                self.follower.set_plan(due, x[due], y[due], psi[due], p["v"][due], p["delta"][due])
+                self.follower.set_plan(due, x[due], y[due], psi[due], p["v"][due], p["delta"][due],
+                                       *((p["cmd_d"][due], p["cmd_v"][due]) if self.v3 else ()))
             idx = PT_IDX.to(self.device)
             self.obs.set_plan(torch.stack([x[:, idx], y[:, idx]], -1), p["pv"], due)
             if self.v2:
@@ -279,7 +288,7 @@ class PlanRunner:
             self.cmd_v = torch.where(due[:, None], p["cmd_v"], self.cmd_v)
             # MAP follows these segments; in "ideal" its command is not used, but the viewers draw the plan from them
             # (11-08: without, the console / videos showed a stale straight line as the policy's plan)
-            k_, v_ = plan_segments(p, self.lim)
+            k_, v_ = plan_segments3(p, self.lim, self.turn3) if self.v3 else plan_segments(p, self.lim)
             rows = lid[due]
             self.kk[rows] = k_[due]; self.vv[rows] = v_[due]
             env.ext_plan_kv = (self.kk, self.vv)
@@ -312,11 +321,12 @@ FORMAT2 = "plan_steps2"
 class Actor2(nn.Module):
     """v2: a trunk, the plan's Gaussian mean (20) and a speed estimate [m/s]"""
 
-    def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6):
+    def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None):
         super().__init__()
+        sd = STATE_DIM2 if state_dim is None else int(state_dim)
         self.enc = ScanEncoder(beams)
-        self.norm = RunningNorm(STATE_DIM2)
-        self.trunk = nn.Sequential(nn.Linear(256 + STATE_DIM2, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh())
+        self.norm = RunningNorm(sd)
+        self.trunk = nn.Sequential(nn.Linear(256 + sd, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh())
         self.pi = nn.Linear(hidden, PS.ACT_DIM)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
         self.v_est = nn.Linear(hidden, 1)
@@ -391,3 +401,76 @@ def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False):
     u = mean + log_std.exp() * torch.randn_like(mean) if sample else mean
     p = PS.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
     return u, mean, log_std, v_hat, p
+
+
+# ------------------------------------------------------------------------------------------------ v3 (11-09)
+# The user: "저만큼 제어딜레이 가정해서 출력하게하면 되잖아". The plan knows the car's control delay (`plan_steps3`): the 20
+# numbers are commands, the plan is the car's response through the command delay, the servo, the speed loop and MAP's
+# steering table. v3's actor sees v2's inputs and the servo angle the last plan says the car has now (nothing measures
+# it); "the last commands" are the commands last sent, which are still in effect for the first 15 ms of the next plan.
+STATE_DIM3 = STATE_DIM2 + 1
+FORMAT3 = "plan_steps3"
+
+
+class PlanObs3(PlanObs2):
+    """v3's inputs: v2's and the servo angle (from the last plan)"""
+
+    def __init__(self, env, lim: PS.Limits, goal=None):
+        Bl = int(env.learner_ids.numel())
+        self.servo = torch.zeros(Bl, device=env.device)
+        super().__init__(env, lim, goal)
+
+    def reset_rows(self, rows: torch.Tensor) -> None:
+        super().reset_rows(rows)
+        if rows.numel():
+            self.servo[rows] = 0.0
+
+    def set_plan2(self, p: Dict[str, torch.Tensor], rows: Optional[torch.Tensor] = None) -> None:
+        super().set_plan2(p, rows)
+        i1 = PS.SUB
+        sv, cd, cv = p["delta"][:, i1], p["cmd_d"][:, i1 - 1], p["cmd_v"][:, i1 - 1]
+        if rows is None:
+            self.servo, self.cmd_d, self.cmd_v = sv, cd, cv
+        else:
+            self.servo = torch.where(rows, sv, self.servo)
+            self.cmd_d = torch.where(rows, cd, self.cmd_d)
+            self.cmd_v = torch.where(rows, cv, self.cmd_v)
+
+    def state(self) -> torch.Tensor:
+        return torch.cat([super().state(), self.servo[:, None]], 1)
+
+
+def plan3_models(env, lim: PS.Limits, device):
+    """(actuators, turning) of the nominal car for `plan_steps3`"""
+    from .. import plan_steps3 as P3
+    from .. import map_controller as M
+    return (P3.Actuators.nominal(env.tracker.nominal),
+            P3.Turning(env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), lim.wheelbase, device))
+
+
+def plan_v3(actor: Actor2, obs: PlanObs3, lim: PS.Limits, act, turn, sample: bool = False):
+    """one decision of a v3 policy: (u, mean, log_std, v_hat, plan). The plan starts from the speed estimate, the servo
+    angle the last plan left and the command still in effect."""
+    from .. import plan_steps3 as P3
+    mean, log_std, v_hat = actor(obs.scans, obs.state())
+    u = mean + log_std.exp() * torch.randn_like(mean) if sample else mean
+    p = P3.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.servo,
+                torch.stack([obs.cmd_d, obs.cmd_v], 1), lim, act, turn)
+    return u, mean, log_std, v_hat, p
+
+
+def load_actor3(ck: dict, device) -> Actor2:
+    actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)), state_dim=STATE_DIM3).to(device)
+    actor.load_state_dict(ck["actor"])
+    actor.eval()
+    return actor
+
+
+def plan_segments3(p: Dict[str, torch.Tensor], lim: PS.Limits, turn) -> Tuple[torch.Tensor, torch.Tensor]:
+    """a v3 plan as MAP reads one: each 0.1 s step's curvature (the table's, for the servo angle and the speed) and mean
+    speed"""
+    d = p["delta"]; v = p["v"]
+    idx = torch.arange(0, PS.N_STEP + 1, device=d.device) * PS.SUB
+    dk, vk = d[:, idx], v[:, idx]
+    d_mid = 0.5 * (dk[:, 1:] + dk[:, :-1]); v_mid = 0.5 * (vk[:, 1:] + vk[:, :-1])
+    return torch.tan(turn.eff(d_mid, v_mid)) / lim.wheelbase, v_mid

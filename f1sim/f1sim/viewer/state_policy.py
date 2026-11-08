@@ -28,7 +28,7 @@ def state_kind(path: str) -> str:
         return ""
     if not isinstance(ck, dict):
         return ""
-    if ck.get("format") in ("plan_steps", "plan_steps2") and "actor" in ck:
+    if ck.get("format") in ("plan_steps", "plan_steps2", "plan_steps3") and "actor" in ck:
         return "plan"                                     # `learn.plan_rl` (11-07 redesign)
     if "student" in ck and "ego_keys" in ck:
         return "student"
@@ -63,7 +63,7 @@ def contract(ck: dict, kind: str) -> dict:
 
 def is_plan(ck: dict) -> bool:
     """a checkpoint that outputs a trajectory followed by MAP (`state_rl --action plan`, 11-01)"""
-    if ck.get("format") in ("plan_steps", "plan_steps2"):
+    if ck.get("format") in ("plan_steps", "plan_steps2", "plan_steps3"):
         return True
     from ..learn import state_rl
     return state_rl.plan_of(ck.get("args") or {})
@@ -96,6 +96,9 @@ def describe(ck: dict, kind: str, path: str) -> str:
     name = os.path.basename(os.path.realpath(path))
     a = ck.get("args") or {}
     if kind == "plan":
+        if ck.get("format") == "plan_steps3":
+            return (f"planner(v3, 제어 지연을 앎): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan·서보 각, "
+                    f"속도는 스스로 짐작 -> 0.1 s마다 조향·속도 명령 10개(지연·서보·속도 루프·조향표를 거친 차의 반응이 plan), 10 Hz")
         if ck.get("format") == "plan_steps2":
             return (f"planner(재설계 v2): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan, "
                     f"속도는 스스로 짐작 -> 점 10개 x 0.1 s(차 한계 안) -> MAP·후진 추종, 10 Hz")

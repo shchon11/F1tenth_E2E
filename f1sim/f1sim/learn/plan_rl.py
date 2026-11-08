@@ -27,18 +27,26 @@ from .. import dynamics as dyn
 from .. import map_controller as M
 from . import state_rl as SR
 from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, Actor2, PlanObs2, FORMAT2
+from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models
+from .. import plan_steps3 as P3
 from .plan_reward import PlanReward
 
 WORLD = os.path.join(os.path.dirname(__file__), "configs", "plan_world_korea25.json")
 
 
-def build(world: str, envs: int, seed: int, device, overrides=None):
+def build(world: str, envs: int, seed: int, device, overrides=None, fmt: str = "v2"):
     a = argparse.Namespace(**json.load(open(world)))
     a.envs, a.seed, a.device = envs, seed, str(device)
     for k, v in (overrides or {}).items():
         setattr(a, k, v)
     env = SR.build_env(a, device)
-    env.enable_ideal()
+    if fmt == "v3":
+        # the plan knows the control delay (11-09): the training's execution goes through the same delay, lags and table;
+        # set before the graphs are captured (the roll reads it then)
+        _lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), device)
+        env.enable_ideal(lag=True, turn=plan3_models(env, _lim, device)[1])
+    else:
+        env.enable_ideal()
     from .graph_runtime import prepare_graph_runtime
     prepare_graph_runtime(env, log=lambda _t: None)
     env.reset(seed=seed)
@@ -108,7 +116,7 @@ def main(argv=None):
     ap.add_argument("--std0", type=float, default=0.6)
     ap.add_argument("--vf-coef", type=float, default=0.5)
     ap.add_argument("--max-grad", type=float, default=0.5)
-    ap.add_argument("--format", default="v2", choices=("v1", "v2"),
+    ap.add_argument("--format", default="v2", choices=("v1", "v2", "v3"),
                     help="v2 (11-08): raw sensors only, the plan starts from the policy's own speed estimate")
     ap.add_argument("--vest-coef", type=float, default=1.0, help="v2: weight of the speed estimate's loss [per (m/s)^2]")
     ap.add_argument("--save-every", type=int, default=25)
@@ -122,14 +130,16 @@ def main(argv=None):
     if os.path.exists(os.path.join(run, "progress.jsonl")):
         raise SystemExit(f"{run} already has a run: pick an unused name")
     os.makedirs(run, exist_ok=True)
-    env, lim, world = build(args.world, args.envs, args.seed, dev)
+    env, lim, world = build(args.world, args.envs, args.seed, dev, fmt=args.format)
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
-    v2 = args.format == "v2"
-    obs = (PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
+    v3 = args.format == "v3"
+    v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
+    obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
+    act3, turn3 = plan3_models(env, lim, dev) if v3 else (None, None)
     drv = Driver(env, lim, pr, obs)
     priv_dim = int(obs.priv().shape[1])
-    actor = (Actor2 if v2 else Actor)(obs.beams, std0=args.std0).to(dev)
+    actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else (Actor2 if v2 else Actor)(obs.beams, std0=args.std0)).to(dev)
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
     opt = torch.optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=args.lr, eps=1e-5)
     json.dump({"args": vars(args), "world": vars(world), "priv_dim": priv_dim, "beams": obs.beams},
@@ -164,7 +174,13 @@ def main(argv=None):
                 v = critic(sc, s, pv_)
                 v_true = env.sim.state[lid, dyn.IVX].float().clone()
                 p = None
-                if v2:
+                if v3:
+                    # the plan knows the control delay: from the speed estimate, the servo angle the last plan left and the
+                    # command still in effect
+                    p = P3.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.servo,
+                                torch.stack([obs.cmd_d, obs.cmd_v], 1), lim, act3, turn3)
+                    vest_err.append((v_hat - v_true).abs())
+                elif v2:
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
                     vest_err.append((v_hat - v_true).abs())
@@ -238,7 +254,7 @@ def main(argv=None):
               f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
-                        "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT2 if v2 else "plan_steps"},
+                        "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},
                        os.path.join(run, f"plan_u{upd}.pt"))
 
 
