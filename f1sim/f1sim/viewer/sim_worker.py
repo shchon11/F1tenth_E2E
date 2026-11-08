@@ -1451,6 +1451,11 @@ class SimWorker:
         obs, _info = env.reset()
         self._check_cancel(gen)
 
+        # F1SIM_PLAN_MODE=ideal (11-08, a diagnosis tool): a plan checkpoint drives the training's way -- the car drives
+        # the plan exactly, contacts the simulator's -- to tell a policy fault from a MAP-following one on the same layout.
+        # Before the warmup: the compiled roll reads the flag when it is captured.
+        if skind == "plan" and os.environ.get("F1SIM_PLAN_MODE", "map") == "ideal":
+            env.enable_ideal()
         self.stage(gen, "warmup")
         env.sim.warmup()
         self._check_cancel(gen)

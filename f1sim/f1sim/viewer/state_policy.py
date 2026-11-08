@@ -136,7 +136,7 @@ class StatePolicyRunner:
     def __new__(cls, env, ck: dict, kind: str, device):
         if kind == "plan":
             from ..learn.plan_policy import PlanRunner
-            return PlanRunner(env, _to(ck, device), device, mode="map")
+            return PlanRunner(env, _to(ck, device), device, mode=os.environ.get("F1SIM_PLAN_MODE", "map"))
         return super().__new__(cls)
 
     def __init__(self, env, ck: dict, kind: str, device):
