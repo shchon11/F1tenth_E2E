@@ -12,7 +12,10 @@ delay and those lags (the nominal car), integrated every 5 ms, the poses by the 
 
   steering command  a_turn x (the full-lock angle the tyres hold at the car's speed at that control step), so the
                     commanded turn is always one the grip allows, and every output is a different command (no clamp)
-  speed command     spread over [-V_REV, V_FWD]: the speed loop's target
+  speed command     the speed at the step's start + a_speed x DV_CMD (1.5 m/s: through the speed loop's lag that is the
+                    motor's full drive and the brakes' full stop), inside [-V_REV, V_FWD]. Relative, as v2's: an untrained
+                    policy holds its speed (11-09: spread over [-2, 10] its mean was 'go 4 m/s straight', the cars ran into
+                    the walls and could not back out -- 95 % of the plans hit for 23 updates)
 
 The plan starts from the car's state: its speed, its servo angle (the previous plan's, carried: nothing measures it) and
 the last command sent, which is still the one in effect for the first 15 ms. The commands per control step (`cmd_d`,
@@ -27,6 +30,7 @@ import torch
 from .plan_steps import N_STEP, DT, SUB, V_FWD, V_REV, ACT_DIM, Limits, steer_to_kappa, kappa_to_steer   # noqa: F401
 
 H = 0.005                 # [s] integration step
+DV_CMD = 1.5              # [m/s] the speed command's span around the step's start speed
 N_H = int(round(DT / SUB / H))   # integration steps per control step (5)
 
 
@@ -137,7 +141,6 @@ def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, c_prev: torch
     -> the plan in the car's frame now: dense x, y, psi, v, delta, t (B, N SUB + 1) on the control grid, the 10 points
     `pts` (B, N, 2) and their speeds `pv`, the commands per control step `cmd_d` / `cmd_v` (B, N SUB)"""
     a_turn, a_speed = action[:, :N_STEP].clamp(-1, 1), action[:, N_STEP:].clamp(-1, 1)
-    v_cmd_steps = -V_REV + (a_speed + 1.0) * 0.5 * (V_FWD + V_REV)            # (B, N)
     B = action.shape[0]
     dev = action.device
     x = torch.zeros(B, device=dev); y = torch.zeros(B, device=dev); psi = torch.zeros(B, device=dev)
@@ -146,9 +149,9 @@ def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, c_prev: torch
     n_delay = int(round(act.delay / H))
     X, Y, P, V, D, CD, CV = [x], [y], [psi], [v], [d], [], []
     for k in range(N_STEP):
+        cv = (v + a_speed[:, k] * DV_CMD).clamp(-V_REV, V_FWD)      # the step's speed command
         for j in range(SUB):
             cd = a_turn[:, k] * grip_steer(v, lim, turn)      # the command sent at this control step
-            cv = v_cmd_steps[:, k]
             for i in range(N_H):
                 in_d, in_v = (prev_d, prev_v) if i < n_delay else (cd, cv)
                 d = servo_step(d, in_d, act, lim, H)
