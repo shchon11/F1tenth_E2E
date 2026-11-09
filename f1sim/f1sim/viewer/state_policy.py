@@ -96,14 +96,17 @@ def describe(ck: dict, kind: str, path: str) -> str:
     name = os.path.basename(os.path.realpath(path))
     a = ck.get("args") or {}
     if kind == "plan":
+        # the controller that follows the plan (11-09: the new time-indexed follower is the console's default; MAP on request)
+        mode = os.environ.get("F1SIM_PLAN_MODE", "track")
+        follow = {"track": "새 제어기(plan을 시각대로 추종)", "map": "MAP·후진 추종", "ideal": "plan대로 정확히(학습 조건)"}.get(mode, mode)
         if ck.get("format") == "plan_steps3":
             return (f"planner(v3, 제어 지연을 앎): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan·서보 각, "
                     f"속도는 스스로 짐작 -> 0.1 s마다 조향·속도 명령 10개(지연·서보·속도 루프·조향표를 거친 차의 반응이 plan), 10 Hz")
         if ck.get("format") == "plan_steps2":
             return (f"planner(재설계 v2): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + IMU 원시값 + 직전 명령·plan, "
-                    f"속도는 스스로 짐작 -> 점 10개 x 0.1 s(차 한계 안) -> MAP·후진 추종, 10 Hz")
+                    f"속도는 스스로 짐작 -> 점 10개 x 0.1 s(차 한계 안) -> {follow}, 10 Hz")
         return (f"planner(재설계): {run}/{name} · update {ck.get('update', '?')} · LiDAR 3장 + 속도·핸들·회전 + 직전 plan -> "
-                f"점 10개 x 0.1 s(걸음마다 꺾기·속도, 차 한계 안) -> MAP·후진 추종, 10 Hz")
+                f"점 10개 x 0.1 s(걸음마다 꺾기·속도, 차 한계 안) -> {follow}, 10 Hz")
     if is_plan(ck) and str(a.get("plan_format", "wp4") or "wp4") in ("tw", "tw5", "tw5c", "tw5g"):
         from .. import plan_tw
         k_ = plan_tw.FORMATS[str(a.get("plan_format"))][1]
@@ -139,7 +142,7 @@ class StatePolicyRunner:
     def __new__(cls, env, ck: dict, kind: str, device):
         if kind == "plan":
             from ..learn.plan_policy import PlanRunner
-            return PlanRunner(env, _to(ck, device), device, mode=os.environ.get("F1SIM_PLAN_MODE", "map"))
+            return PlanRunner(env, _to(ck, device), device, mode=os.environ.get("F1SIM_PLAN_MODE", "track"))
         return super().__new__(cls)
 
     def __init__(self, env, ck: dict, kind: str, device):
