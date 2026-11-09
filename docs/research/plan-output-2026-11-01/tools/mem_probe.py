@@ -100,27 +100,37 @@ def probe(X, y, tr, te):
     return ((Xe @ w + b) > 0).cpu().numpy()
 
 
-fig, axs = plt.subplots(2, 3, figsize=(21, 11))
+# 11-09, the user: "그 두번째 시각화는 뭘 어떻게 해석해야하는지 모르겠네" -- four questions, each with how to read it, and a one-line
+# verdict on top
+fig, axs = plt.subplots(2, 2, figsize=(18, 12))
 cars = np.arange(Bl)
 tr_c, te_c = cars[0::2], cars[1::2]
-# (1) "boxes now?" -- memory vs the features of this moment, by time since the start
+READ = dict(fontsize=9, color="0.25", ha="left", va="top", transform=None)
+
+
+def note(ax, text):
+    ax.text(0.01, -0.13, "읽는 법: " + text, transform=ax.transAxes, fontsize=9.5, color="0.2", ha="left", va="top")
+
+
+# A: does the memory know more than the view now?
 y_now = HP.astype(np.float32)
-idx = np.argwhere(valid)                                    # (n, 2) [t, car]
+idx = np.argwhere(valid)
 trm = np.isin(idx[:, 1], tr_c); tem = ~trm
 Xh = H[idx[:, 0], idx[:, 1]]; Xf = F[idx[:, 0], idx[:, 1]]; yy = y_now[idx[:, 0], idx[:, 1]]
 ph = probe(Xh, yy, trm, tem); pf = probe(Xf, yy, trm, tem)
 tt = idx[tem, 0] * PS.DT; ye = yy[tem]
+acc_h, acc_f = float(np.mean(ph == ye)), float(np.mean(pf == ye))
 ax = axs[0, 0]
 bins = np.arange(0, secs + 0.01, 2.0)
-for pred, lab, c in ((ph, "기억 상태로", "tab:red"), (pf, "지금 보는 것(몸통 특징)으로", "tab:gray")):
+for pred, lab, c in ((ph, f"기억으로 맞힘 (평균 {acc_h * 100:.0f} %)", "tab:red"), (pf, f"지금 보이는 것으로 맞힘 (평균 {acc_f * 100:.0f} %)", "tab:gray")):
     acc = [np.mean(pred[(tt >= lo) & (tt < lo + 2)] == ye[(tt >= lo) & (tt < lo + 2)]) if np.any((tt >= lo) & (tt < lo + 2)) else np.nan
            for lo in bins[:-1]]
     ax.plot(bins[:-1] + 1, np.array(acc) * 100, "-o", color=c, ms=3, label=lab)
 ax.set_ylim(40, 101); ax.axhline(50, color="0.7", lw=0.8)
-ax.set_title("(1) '지금 상자가 있나'를 맞히는 비율 [%] (선형 판별기, 다른 차들로 확인)", fontsize=10)
-ax.set_xlabel("에피소드 시작부터 [s]"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
-acc_h, acc_f = float(np.mean(ph == ye)), float(np.mean(pf == ye))
-# (2) "were they taken away?" among the removal worlds, after the removal
+ax.set_title("A. 기억이 '지금 보이는 것'보다 더 아나? -- 이 트랙에 상자가 있는지 맞히기", fontsize=11)
+ax.set_xlabel("에피소드 시작부터 [s]"); ax.set_ylabel("맞힌 비율 [%]"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
+note(ax, "빨강이 회색보다 위면 기억이 시야 밖(지나온 곳)의 상자를 기억하는 것. 둘이 겹치면 기억이 더 아는 게 없음")
+# B: does it notice the boxes were taken away?
 ax = axs[0, 1]
 sel = valid & rm_world[None, :]
 idx2 = np.argwhere(sel)
@@ -129,38 +139,29 @@ if len(idx2) > 50:
     trm2 = np.isin(idx2[:, 1], tr_c); tem2 = ~trm2
     ph2 = probe(H[idx2[:, 0], idx2[:, 1]], y2, trm2, tem2); pf2 = probe(F[idx2[:, 0], idx2[:, 1]], y2, trm2, tem2)
     tt2 = idx2[tem2, 0] * PS.DT - T_RM; ye2 = y2[tem2]
-    b2 = np.arange(-T_RM, secs - T_RM + 0.01, 1.0)
-    for pred, lab, c in ((ph2, "기억 상태로", "tab:red"), (pf2, "지금 보는 것으로", "tab:gray")):
-        acc = [np.mean(pred[(tt2 >= lo) & (tt2 < lo + 1)] == ye2[(tt2 >= lo) & (tt2 < lo + 1)]) if np.any((tt2 >= lo) & (tt2 < lo + 1)) else np.nan
+    b2 = np.arange(-T_RM, secs - T_RM + 0.01, 2.0)
+    for pred, lab, c in ((ph2, "기억으로", "tab:red"), (pf2, "지금 보이는 것으로", "tab:gray")):
+        acc = [np.mean(pred[(tt2 >= lo) & (tt2 < lo + 2)] == ye2[(tt2 >= lo) & (tt2 < lo + 2)]) if np.any((tt2 >= lo) & (tt2 < lo + 2)) else np.nan
                for lo in b2[:-1]]
-        ax.plot(b2[:-1] + 0.5, np.array(acc) * 100, "-", color=c, label=lab)
-    ax.axvline(0, color="k", lw=1, ls="--"); ax.set_ylim(0, 101)
-    ax.legend(fontsize=9)
-ax.set_title("(2) 상자를 치운 세계: '이미 치웠나'를 맞히는 비율 [%]", fontsize=10)
-ax.set_xlabel("치운 때부터 [s] (음수 = 치우기 전)"); ax.grid(alpha=0.3)
-# (3) PCA of the memory
-ax = axs[0, 2]
-Xall = H[valid]
-mu = Xall.mean(0); U, S, Vt = np.linalg.svd(Xall - mu, full_matrices=False)
-ev = S ** 2 / np.sum(S ** 2)
-proj = lambda Z: (Z - mu) @ Vt[:2].T
-for c_ in (0, 1, 2):
-    cs = np.nonzero(cond == c_)[0][:3]
-    for b in cs:
-        e = first_end[b]
-        P2 = proj(H[:e, b])
-        if c_ == 2:
-            k = min(e, int(T_RM / PS.DT))
-            ax.plot(P2[:k, 0], P2[:k, 1], "-", color="saddlebrown", lw=0.8, alpha=0.8)
-            ax.plot(P2[k:, 0], P2[k:, 1], "-", color="tab:orange", lw=1.0, alpha=0.9)
-        else:
-            ax.plot(P2[:, 0], P2[:, 1], "-", color=cols[c_], lw=0.8, alpha=0.8)
-for c_, lab in ((0, "빈 트랙"), (1, "상자 그대로"), (2, "상자 치운 뒤 (치우기 전 = 갈색)")):
-    ax.plot([], [], color=cols[c_], label=lab)
-ax.legend(fontsize=9); ax.grid(alpha=0.3)
-ax.set_title(f"(3) 기억 상태의 주성분 2개 (설명 {ev[0] * 100:.0f} %, {ev[1] * 100:.0f} %): 차별 궤적", fontsize=10)
-# (4) heatmap of one removal car's memory
+        ax.plot(b2[:-1] + 1, np.array(acc) * 100, "-o", color=c, ms=3, label=lab)
+    ax.axvline(0, color="k", lw=1, ls="--"); ax.set_ylim(0, 101); ax.legend(fontsize=9)
+ax.set_title("B. 상자를 치운 걸 알아차리나? -- '이미 치웠나' 맞히기 (상자 치운 차들)", fontsize=11)
+ax.set_xlabel("치운 때부터 [s] (점선 = 치운 순간)"); ax.set_ylabel("맞힌 비율 [%]"); ax.grid(alpha=0.3)
+note(ax, "점선 뒤에 빨강이 회색보다 빨리, 높이 오르면 기억이 '치워졌다'를 알아차리는 것")
+# C: does the memory change the driving?
 ax = axs[1, 0]
+means = {}
+for c_ in (0, 1, 2):
+    m = valid & (cond[None, :] == c_)
+    y6 = np.array([np.mean(np.abs(SP[t] - SP0[t])[m[t]]) if m[t].any() else np.nan for t in range(T)])
+    means[c_] = float(np.nanmean(y6))
+    ax.plot(t_s, smooth_(y6) if False else y6, color=cols[c_], lw=1, label=f"{names[c_]} (평균 {means[c_]:.3f})")
+ax.axvline(T_RM, color="k", lw=1, ls="--")
+ax.set_title("C. 기억이 운전을 바꾸나? -- 기억을 지웠을 때 첫 단계 속도 출력(-1..1)이 바뀌는 크기", fontsize=11)
+ax.set_xlabel("시간 [s] (점선 = 치운 순간)"); ax.set_ylabel("|바뀐 크기|"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
+note(ax, "0이면 기억을 운전에 안 씀. 클수록 기억이 운전을 바꿈(0.1 = 최대 가속 대비 5 %). 색끼리 다르면 상황에 따라 다르게 씀")
+# D: the memory's values for one car whose boxes were taken away
+ax = axs[1, 1]
 rcars = np.nonzero((cond == 2) & (first_end >= T))[0]
 if len(rcars) == 0:
     rcars = np.nonzero(cond == 2)[0]
@@ -170,32 +171,18 @@ if len(rcars):
     im = ax.imshow(H[:e, b].T, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1, extent=[0, e * PS.DT, H.shape[2], 0])
     ax.axvline(T_RM, color="k", lw=1.5, ls="--")
     plt.colorbar(im, ax=ax, fraction=0.03)
-ax.set_title("(4) 상자 치운 차 하나의 기억 128개 값 (세로 점선 = 치운 때)", fontsize=10)
-ax.set_xlabel("시간 [s]"); ax.set_ylabel("기억 값 번호")
-# (5) how much the memory changes the trunk's features
-ax = axs[1, 1]
-for c_ in (0, 1, 2):
-    m = valid & (cond[None, :] == c_)
-    y5 = np.array([np.mean(CR[t][m[t]]) if m[t].any() else np.nan for t in range(T)])
-    ax.plot(t_s, y5 * 100, color=cols[c_], label=names[c_])
-ax.axvline(T_RM, color="k", lw=1, ls="--")
-ax.set_title("(5) 기억이 몸통 특징을 바꾸는 크기: |기억이 더한 것| / |특징| [%]", fontsize=10)
-ax.set_xlabel("시간 [s]"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
-# (6) the speed output with the memory wiped
-ax = axs[1, 2]
-for c_ in (0, 1, 2):
-    m = valid & (cond[None, :] == c_)
-    y6 = np.array([np.mean(np.abs(SP[t] - SP0[t])[m[t]]) if m[t].any() else np.nan for t in range(T)])
-    y6b = np.array([np.mean(SP[t][m[t]]) if m[t].any() else np.nan for t in range(T)])
-    ax.plot(t_s, y6, color=cols[c_], label=f"{names[c_]}: |바뀐 크기|")
-ax.axvline(T_RM, color="k", lw=1, ls="--")
-ax.set_title("(6) 기억을 지우면 첫 단계 속도 출력(-1..1)이 바뀌는 크기", fontsize=10)
-ax.set_xlabel("시간 [s]"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
+ax.set_title("D. 기억 128칸의 값 (상자 치운 차 1대, 점선 = 치운 순간)", fontsize=11)
+ax.set_xlabel("시간 [s]"); ax.set_ylabel("기억 칸 번호")
+note(ax, "세로 줄무늬가 바퀴마다 되풀이되면 트랙 위 위치를 따라가는 것. 점선 뒤 무늬가 바뀌면 기억이 치운 걸 반영하는 것")
 name = f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"
-fig.suptitle(f"{name} 기억(GRU {actor.memory}) 들여다보기 -- 학습 세계 원래 트랙, 학습 조건, 학습 차 {Bl}대 x {secs:.0f} s "
-             f"(빈 트랙 {np.sum(cond == 0)}대, 상자 그대로 {np.sum(cond == 1)}대, 치움 {np.sum(cond == 2)}대)", fontsize=12)
-plt.tight_layout(rect=(0, 0, 1, 0.95)); plt.savefig(out, dpi=70)
 cr_all = float(np.mean(CR[valid]))
 dsp = float(np.mean(np.abs(SP - SP0)[valid]))
+verdict = ("기억이 시야보다 더 앎" if acc_h - acc_f >= 0.03 else "기억이 시야보다 더 아는 게 거의 없음") + " · " + \
+          ("기억이 운전을 바꿈" if dsp >= 0.03 else ("기억이 운전을 조금 바꿈" if dsp >= 0.01 else "기억이 운전을 거의 안 바꿈"))
+fig.suptitle(f"{name} 기억(GRU {actor.memory}) -- 한 줄 요약: {verdict}\n"
+             f"학습 세계 원래 트랙, 학습 조건, 학습 차 {Bl}대 x {secs:.0f} s (빈 트랙 {np.sum(cond == 0)}대, 상자 그대로 {np.sum(cond == 1)}대, "
+             f"상자 {T_RM:.0f} s에 치움 {np.sum(cond == 2)}대)", fontsize=13)
+plt.tight_layout(rect=(0, 0.02, 1, 0.93)); plt.subplots_adjust(hspace=0.42)
+plt.savefig(out, dpi=70)
 print(f"{name}: '상자 있나' 맞힘 기억 {acc_h * 100:.0f} % / 지금 특징 {acc_f * 100:.0f} % | 기억이 특징을 바꾸는 크기 평균 {cr_all * 100:.1f} % | "
       f"기억을 지우면 첫 단계 속도 출력 평균 {dsp:.3f} 바뀜 | 그림 {out}", flush=True)
