@@ -345,9 +345,13 @@ class Actor2(nn.Module):
     track stays empty -- what the car saw a lap ago tells it what is behind the chicane's walls now. The state is passed
     in and out (`forward(..., h)` sets `h_out`); `PlanObs2.mem_h` carries it between decisions and clears it at a restart.
     `log_std_floor` (a buffer, not saved): the exploration noise's floor per output (11-09: the first step's speed output had
-    shrunk to 0.17 and the policy never tried full throttle at the end of the straight)."""
+    shrunk to 0.17 and the policy never tried full throttle at the end of the straight).
+    `aux_dim` > 0 (11-10, the user: "기억은 필요해 ... 사각지대에 장애물이 있어서 사고나는거"): a linear read-out of the memory's
+    state, trained (plan_rl --mem-aux) to say where the boxes ahead are -- hidden ones too -- so the memory holds what it saw a
+    lap ago. It is a training aid only: driving never reads it."""
 
-    def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0):
+    def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
+                 aux_dim: int = 0):
         super().__init__()
         sd = STATE_DIM2 if state_dim is None else int(state_dim)
         self.enc = ScanEncoder(beams)
@@ -362,6 +366,8 @@ class Actor2(nn.Module):
             self.gru = nn.GRUCell(hidden, self.memory)
             self.mem_out = nn.Linear(self.memory, hidden)
             nn.init.zeros_(self.mem_out.weight); nn.init.zeros_(self.mem_out.bias)
+            if aux_dim:
+                self.aux = nn.Linear(self.memory, int(aux_dim))
         self.register_buffer("log_std_floor", torch.full((PS.ACT_DIM,), -math.inf), persistent=False)
         self.h_out = None
 
@@ -438,8 +444,9 @@ class PlanObs2(PlanObs):
 
 
 def load_actor2(ck: dict, device) -> Actor2:
+    aux = ck["actor"].get("aux.weight")
     actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)),
-                   memory=int(ck["args"].get("memory", 0) or 0)).to(device)
+                   memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor

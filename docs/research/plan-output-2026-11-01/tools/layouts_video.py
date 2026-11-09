@@ -38,6 +38,11 @@ EMPTY = os.environ.get("F1SIM_VIDEO_EMPTY", "0") == "1"
 #: F1SIM_VIDEO_OPP=<speed scale> (11-09, the user: "상대 있는것도좀 부탁"): one opponent, the training world's kind (a raceline
 #: driver) at that share of the raceline's speed, drawn red; its contacts with the policy's car in the title
 OPP = float(os.environ["F1SIM_VIDEO_OPP"]) if os.environ.get("F1SIM_VIDEO_OPP") else None
+#: F1SIM_VIDEO_REMOVE_AT=<s> (11-10, the user: "한 영상에 네 경우(빈, 장애물 있다없어진, +상대차)다 들어가게"): every obstacle vanishes
+#: in place at that time of each run, as in the competition and the training world's `state_rl.PropRemoval` (dead slots)
+REMOVE_AT = float(os.environ["F1SIM_VIDEO_REMOVE_AT"]) if os.environ.get("F1SIM_VIDEO_REMOVE_AT") else None
+#: F1SIM_VIDEO_CASE=<text>: which of the four cases, in front of the title
+CASE = os.environ.get("F1SIM_VIDEO_CASE", "")
 s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, cars_per_race=2 if OPP else 1, device="cuda",
                                     compile=False, collision_mode="soft", procedural=not EMPTY, episode_s=3600.0, randomize=False,
                                     opponent_slots=[{"kind": "raceline", "speed_scale": OPP}] if OPP else None), 0)
@@ -89,11 +94,13 @@ for L in range(n_lay):
     if L < first_L:
         continue
     props = footprints()
+    prop_art = []
     for a in (ax, bx):
         a.clear(); a.imshow(~occ, cmap="gray", origin="lower", extent=ext, alpha=0.6)
         for poly in props:
-            a.fill(poly[:, 0], poly[:, 1], color="saddlebrown", alpha=0.9, lw=0)
+            prop_art += a.fill(poly[:, 0], poly[:, 1], color="saddlebrown", alpha=0.9, lw=0)
         a.set_aspect("equal"); a.set_xticks([]); a.set_yticks([])
+    removed = False
     xs_all = []
     hits = []
     trail_sc = [a.scatter([], [], c=[], s=6, cmap="turbo", vmin=0, vmax=8) for a in (ax, bx)]
@@ -106,6 +113,11 @@ for L in range(n_lay):
     cnt = np.zeros(3, int); hcnt = np.zeros(3, int)
     trail = []
     for k in range(int(secs / 0.025)):
+        if REMOVE_AT is not None and not removed and proc is not None and k * 0.025 >= REMOVE_AT:
+            proc.p_sid[:] = -1; proc.p_zhi[:] = proc.p_zlo[:] - 1.0; proc.p_mass[:] = 0.0; proc.p_vel[:] = 0.0
+            for pa in prop_art:
+                pa.remove()
+            prop_art, removed = [], True
         w._step_once(s)
         st = env.sim.state[0].cpu().numpy()
         cf = env.sim.contact_frame()[0].float().cpu().numpy()
@@ -136,7 +148,8 @@ for L in range(n_lay):
         xa = np.array(xs_all)
         ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[2], ext[3])
         bx.set_xlim(st[0] - 4, st[0] + 4); bx.set_ylim(st[1] - 4, st[1] + 4)
-        title.set_text(f"{name} · {'빈 트랙' if EMPTY else f'obstacle 배치 {L}'} · {k * 0.025:4.1f} s · 속도 {st[3]:4.1f} m/s · "
+        title.set_text(f"{CASE + ' · ' if CASE else ''}{name} · {'빈 트랙' if EMPTY else f'obstacle 배치 {L}'}"
+                       + (" (치움)" if removed else "") + f" · {k * 0.025:4.1f} s · 속도 {st[3]:4.1f} m/s · "
                        f"obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) · 벽 접촉 {cnt[0]}(세게 {hcnt[0]})"
                        + (f" · 상대 차({OPP:.0%} 속도) 접촉 {cnt[2]}(세게 {hcnt[2]})" if OPP else ""))
         fig.canvas.draw()
@@ -144,7 +157,7 @@ for L in range(n_lay):
         enc.write(np.ascontiguousarray(buf).tobytes()); tot_frames += 1
     for h in hit_art:
         h.remove()
-    print(f"배치 {L}: obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) 벽 {cnt[0]}(세게 {hcnt[0]})"
+    print(f"{CASE + ' | ' if CASE else ''}배치 {L}: obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) 벽 {cnt[0]}(세게 {hcnt[0]})"
           + (f" 상대 차 {cnt[2]}(세게 {hcnt[2]})" if OPP else ""), flush=True)
 rc = enc.close()
 print(f"영상 {out} | {tot_frames}장, {tot_frames / 20:.0f} s | {REC.describe_size(out)} | ffmpeg {rc} {enc.error or ''}", flush=True)

@@ -35,6 +35,7 @@ from . import state_rl as SR
 from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, Actor2, PlanObs2, FORMAT2
 from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models
 from .. import plan_steps3 as P3
+from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
 from .plan_reward import PlanReward
 
 WORLD = os.path.join(os.path.dirname(__file__), "configs", "plan_world_korea25.json")
@@ -150,6 +151,11 @@ def main(argv=None):
     ap.add_argument("--memory", type=int, default=0,
                     help="v2: a GRU of this size in the actor (11-09, the user: \"A1\" -- adapt by remembering); 0 = none")
     ap.add_argument("--mem-chunk", type=int, default=32, help="the memory's update replays sequences of this many decisions")
+    ap.add_argument("--mem-aux", type=float, default=0.0,
+                    help="with --memory: the weight of a side task for the memory alone -- from its state, say where the boxes ahead are"
+                         " (the critic's privileged block: the nearest 3 live boxes not behind the car within 12 m, hidden ones too) every"
+                         " decision (11-10, the user: \"기억은 필요해 ... 사각지대에 장애물이 있어서 사고나는거\"; --mem-chunk 128 alone left"
+                         " the memory unused for 100 updates). The LiDAR features feed it detached; driving never reads it. 0 = off")
     ap.add_argument("--speed-std-floor", type=float, default=0.0,
                     help="v2: the exploration noise's floor on the first step's speed output (11-09: it had shrunk to 0.17)")
     ap.add_argument("--removal-p", type=float, default=-1.0,
@@ -207,8 +213,13 @@ def main(argv=None):
     remover = SR.PropRemoval(env, rm_p, float(rm_s[0]), float(rm_s[1]), seed=args.seed) if rm_p > 0 else None
     if args.memory and (not v2 or v3):
         raise SystemExit("--memory needs --format v2")
+    aux_on = args.mem_aux > 0
+    if aux_on and not args.memory:
+        raise SystemExit("--mem-aux needs --memory")
+    AUXK = PRIV_V2_PROP_SLOTS
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
-             Actor2(obs.beams, std0=args.std0, memory=args.memory) if v2 else Actor(obs.beams, std0=args.std0)).to(dev)
+             Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=AUXK * len(PRIV_V2_PROP_KEYS) if aux_on else 0) if v2
+             else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
         raise SystemExit("--tail-consistency needs --format v2 and no holding")
@@ -260,6 +271,7 @@ def main(argv=None):
             opt.param_groups[0]["lr"] = 0.0                    # the critic catches up with a started actor first
         S, X, PV, U, LP, V, R, D, VT, FM, HM = [], [], [], [], [], [], [], [], [], [], []
         V0, D0, ST0, PTS, PVS = [], [], [], [], []
+        AX = []                                                # --mem-aux: the boxes ahead at each decision
         n_removed = 0
         near_sum = torch.zeros(Bl, device=dev)
         vest_err = []
@@ -282,6 +294,8 @@ def main(argv=None):
                 actor.norm.update(s); critic.norm.update(torch.cat([s, pv_], 1))
                 if args.memory:
                     HM.append(obs.mem_h.clone())                  # the state this decision starts from
+                    if aux_on:
+                        AX.append(env._prop_block(env.sim.state)[lid].float().clone())
                     mean, log_std, v_hat = actor(sc, s, obs.mem_h)
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
                 elif v2:
@@ -366,6 +380,7 @@ def main(argv=None):
             # one clears the state for the decisions after it
             Lc = args.mem_chunk; nC = T // Lc
             bHM, bD = torch.cat(HM), D_.reshape(-1)
+            bAX = torch.cat(AX) if aux_on else None
             tt = torch.arange(nC * Lc, device=dev).view(nC, Lc)
             seq_idx = (tt[:, :, None] * Bl + torch.arange(Bl, device=dev)[None, None, :]).permute(1, 0, 2).reshape(Lc, nC * Bl)
 
@@ -391,10 +406,21 @@ def main(argv=None):
                 fi, h = actor.remember(f[i], h)
                 outs.append(fi)
             fc = torch.cat(outs, 0)
+            if aux_on:
+                # the side task's own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
+                h2, hs = bHM[sel[0]], []
+                for i in range(sel.shape[0]):
+                    if i > 0:
+                        h2 = h2 * (1.0 - bD[sel[i - 1]])[:, None]
+                    h2 = actor.gru(f[i].detach(), h2)
+                    hs.append(h2)
+                aux_box["pred"] = actor.aux(torch.cat(hs, 0))
             return (*actor.heads(fc), mb_, fc)
 
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
+        als, aac, aac_far = [], [], []
+        aux_box = {}
         if tailc:
             bV0, bD0, bST0 = torch.cat(V0), torch.cat(D0), torch.cat(ST0)
             bPTS, bPVS = torch.cat(PTS), torch.cat(PVS)
@@ -442,6 +468,19 @@ def main(argv=None):
                         loss = loss + args.tail_consistency * lc
                         cls_.append(float(lc.detach()))
                         ce5.append(float((pts_c[:, 5] - tgt[:, 4]).norm(dim=-1).median()))
+                if aux_on:
+                    pa = aux_box["pred"].view(-1, AUXK, len(PRIV_V2_PROP_KEYS)); ta = bAX[mb].view(-1, AUXK, len(PRIV_V2_PROP_KEYS))
+                    m_p = ta[..., 0]
+                    l_pres = nn.functional.binary_cross_entropy_with_logits(pa[..., 0], m_p)
+                    l_pos = (nn.functional.smooth_l1_loss(pa[..., 1:], ta[..., 1:], reduction="none").sum(-1) * m_p).sum() / m_p.sum().clamp_min(1.0)
+                    la = l_pres + l_pos
+                    loss = loss + args.mem_aux * la
+                    with torch.no_grad():
+                        als.append(float(la)); aac.append(float(((pa[..., 0] > 0).float() == m_p).float().mean()))
+                        far = m_p[:, 0] > 0.5
+                        far = far & (ta[:, 0, 3] * 5.0 > 4.0)          # the nearest box 4-12 m away: mostly not yet seen up close
+                        if bool(far.any()):
+                            aac_far.append(float((pa[far, 0, 0] > 0).float().mean()))
                 opt.zero_grad(set_to_none=True); loss.backward()
                 nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad)
                 opt.step()
@@ -462,7 +501,9 @@ def main(argv=None):
                "kl": sum(kls) / len(kls), "clipfrac": sum(cfs) / len(cfs), "vloss": sum(vls) / len(vls),
                "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()), "removed": n_removed,
                "tail_loss": (sum(cls_) / len(cls_)) if cls_ else None, "tail_next_05": (sum(ce5) / len(ce5)) if ce5 else None, "near_share": float(near_sum.mean()) / T,
-               "std": [round(float(x), 3) for x in actor.log_std.detach().exp()]}
+               "std": [round(float(x), 3) for x in actor.log_std.detach().exp()],
+               "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
+               "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None}
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % | 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
@@ -471,6 +512,8 @@ def main(argv=None):
               + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "")
               + (f"가까이 차·상자 {row['near_share'] * 100:.0f} % | " if hold and args.hold_clear > 0 else "")
               + (f"상자 치움 {n_removed}판 | " if remover is not None else "")
+              + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "
+                 f"{(row['aux_far_recall'] or 0) * 100:.0f} % | " if row.get("aux_loss") is not None else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, 다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm | " if row.get("tail_loss") is not None else "")
               + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:

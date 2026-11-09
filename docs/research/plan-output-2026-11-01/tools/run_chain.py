@@ -4,7 +4,9 @@ STAGE_NOTE = 단계마다 바꾼 것(새 단계를 시작할 때 여기에 한 �
 import os, re, json
 
 R = os.path.expanduser("~/f1sim_runs")
-STAGE_NOTE = {"plan25m": "기억 + 상자 치우기 + 가속 탐색", "plan25n": "+ plan 뒷부분 예측", "plan25n2": "+ plan 충돌 감점 끔"}
+STAGE_NOTE = {"plan25m": "기억 + 상자 치우기 + 가속 탐색", "plan25n": "+ plan 뒷부분 예측", "plan25n2": "+ plan 충돌 감점 끔",
+              "plan25n3": "+ 기억 학습 구간 2바퀴(12.8초)",
+              "plan25n4": "+ 기억 보조 문제(앞 12 m 상자 위치, 안 보이는 것 포함)"}
 
 
 def run_args(name):
