@@ -138,6 +138,15 @@ def main(argv=None):
     ap.add_argument("--hold-p", type=float, default=0.0,
                     help="v2/v3: the share of new plans driven longer than 0.1 s without a new one (11-09, the user: 0.2)")
     ap.add_argument("--hold-len", default="2,4", help="a held plan drives this many decisions, drawn uniformly (2,4 = 0.2-0.4 s)")
+    ap.add_argument("--hold-clear", type=float, default=0.0,
+                    help="hold only when no other car and no box is within this many metres; one that comes inside it ends a "
+                         "hold at once (11-09, the user: racing needs the reaction -- holds near them teach timid plans). 0 = anywhere")
+    ap.add_argument("--init-critic", action="store_true", help="with --init: the critic too, when its inputs match (a run continued)")
+    ap.add_argument("--tail-consistency", type=float, default=0.0,
+                    help="v2: only the plan's first 0.1 s is the RL action (its noise and log-probability); the other 18 outputs are "
+                         "taught, with this weight, to say what the NEXT plan says for the same moments (11-09, the user chose (가): "
+                         "the previous plan's 0.1-1.0 s pulled toward the new plan's 0-0.9 s, never the other way). The output layer "
+                         "alone learns it: nothing that drives is touched. 0 = off (all 20 outputs are actions)")
     ap.add_argument("--memory", type=int, default=0,
                     help="v2: a GRU of this size in the actor (11-09, the user: \"A1\" -- adapt by remembering); 0 = none")
     ap.add_argument("--mem-chunk", type=int, default=32, help="the memory's update replays sequences of this many decisions")
@@ -173,6 +182,20 @@ def main(argv=None):
     hold_left = torch.zeros(Bl, dtype=torch.long, device=dev)      # decisions a held plan still drives after this one
     hold_k = torch.zeros(Bl, dtype=torch.long, device=dev)         # whole steps of the held plan already driven
     p_held = None
+    others = env.sim.other_idx[lid] if env.M > 1 else None
+
+    def near_threat() -> torch.Tensor:
+        """(Bl,) another car of the race or a live box within `--hold-clear` metres of the car"""
+        st_ = env.sim.state[lid, :2]
+        near = torch.zeros(Bl, dtype=torch.bool, device=dev)
+        if others is not None:
+            d = (env.sim.state[others, :2] - st_[:, None, :]).norm(dim=-1)
+            if getattr(env.sim, "absent_any", False):
+                d = torch.where(env.sim.absent[others], torch.full_like(d, float("inf")), d)
+            near |= d.min(1).values < args.hold_clear
+        if env.procedural is not None:
+            near |= env.procedural.clearance(st_, env.sim.eid[lid]) < args.hold_clear
+        return near
     # the critic is told how many decisions the plan in hand still drives (the policy is not: it cannot know which plan
     # will be held, so every plan's later steps have to be ones the car can drive)
     priv_h = (lambda: torch.cat([obs.priv(), hold_left[:, None].float() / max(1, h_hi - 1)], 1)) if hold else obs.priv
@@ -186,6 +209,12 @@ def main(argv=None):
         raise SystemExit("--memory needs --format v2")
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
              Actor2(obs.beams, std0=args.std0, memory=args.memory) if v2 else Actor(obs.beams, std0=args.std0)).to(dev)
+    tailc = args.tail_consistency > 0
+    if tailc and (not v2 or v3 or args.hold_p > 0):
+        raise SystemExit("--tail-consistency needs --format v2 and no holding")
+    rl_mask = torch.zeros(PS.ACT_DIM, dtype=torch.bool, device=dev)
+    rl_mask[0] = True; rl_mask[PS.N_STEP] = True                   # the first step's steering and speed
+    rl_idx = torch.nonzero(rl_mask)[:, 0]
     if args.speed_std_floor > 0:
         actor.log_std_floor[PS.N_STEP] = math.log(args.speed_std_floor)        # the first step's speed: the one driven
     if args.memory:
@@ -207,6 +236,13 @@ def main(argv=None):
         actor.load_state_dict(sd)
         enc = {k_[4:]: v_ for k_, v_ in ck0["critic"].items() if k_.startswith("enc.")}
         critic.enc.load_state_dict(enc)
+        if args.init_critic:
+            c_sd = ck0["critic"]
+            if all(k_ in c_sd and c_sd[k_].shape == v_.shape for k_, v_ in critic.state_dict().items()):
+                critic.load_state_dict(c_sd)
+                print("[plan_rl] critic too (its inputs match)", flush=True)
+            else:
+                print("[plan_rl] critic NOT taken: its inputs differ", flush=True)
         print(f"[plan_rl] actor from {args.init} (update {ck0.get('update')}), critic's scan encoder too", flush=True)
     opt = torch.optim.Adam([{"params": list(actor.parameters())}, {"params": list(critic.parameters())}], lr=args.lr, eps=1e-5)
     json.dump({"args": vars(args), "world": vars(world), "priv_dim": priv_dim, "beams": obs.beams},
@@ -223,7 +259,9 @@ def main(argv=None):
         if upd <= args.actor_freeze:
             opt.param_groups[0]["lr"] = 0.0                    # the critic catches up with a started actor first
         S, X, PV, U, LP, V, R, D, VT, FM, HM = [], [], [], [], [], [], [], [], [], [], []
+        V0, D0, ST0, PTS, PVS = [], [], [], [], []
         n_removed = 0
+        near_sum = torch.zeros(Bl, device=dev)
         vest_err = []
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
         speed_sum, stop_sum = torch.zeros(Bl, device=dev), torch.zeros(Bl, device=dev)
@@ -234,6 +272,12 @@ def main(argv=None):
             with torch.no_grad():
                 sc, s = obs.scans.clone(), obs.state()
                 pv_ = priv_h()
+                if hold and args.hold_clear > 0:
+                    # another car or a box within reach: no hold, and one in progress ends now (the car re-plans as it will
+                    # on the road)
+                    near = near_threat()
+                    hold_left = torch.where(near, torch.zeros_like(hold_left), hold_left)
+                    near_sum += near.float()
                 newp = hold_left == 0                              # rows that draw a plan now (the others drive a held one)
                 actor.norm.update(s); critic.norm.update(torch.cat([s, pv_], 1))
                 if args.memory:
@@ -244,8 +288,12 @@ def main(argv=None):
                     mean, log_std, v_hat = actor(sc, s)
                 else:
                     mean, log_std = actor(sc, s)
-                u = mean + log_std.exp() * torch.randn_like(mean)
-                lp = tanh_logp(u, mean, log_std)
+                if tailc:
+                    u = mean + log_std.exp() * torch.randn_like(mean) * rl_mask      # the tail: its mean, no noise
+                    lp = tanh_logp(u[:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
+                else:
+                    u = mean + log_std.exp() * torch.randn_like(mean)
+                    lp = tanh_logp(u, mean, log_std)
                 v = critic(sc, s, pv_)
                 v_true = env.sim.state[lid, dyn.IVX].float().clone()
                 p = None
@@ -259,6 +307,9 @@ def main(argv=None):
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
                     vest_err.append((v_hat - v_true).abs())
+                    if tailc:
+                        V0.append(v_hat.clamp(-PS.V_REV, PS.V_FWD).clone()); D0.append(obs.cmd_d.clone())
+                        ST0.append(env.sim.state[lid].clone())
                 if hold:
                     # a new plan is kept; rows inside a held plan drive its next 0.1 s, re-expressed from where they are
                     sel = lambda A, B_: torch.where(newp.view(-1, *([1] * (A.dim() - 1))), A, B_)
@@ -268,8 +319,13 @@ def main(argv=None):
                     p = PS.shift_plan(p_held, hold_k)
                     more = torch.randint(h_lo - 1, h_hi, (Bl,), device=dev)
                     start = newp & (torch.rand(Bl, device=dev) < args.hold_p)
+                    if args.hold_clear > 0:
+                        start &= ~near
                     hold_left = torch.where(start, more, torch.where(newp, torch.zeros_like(hold_left), hold_left - 1))
-                out, p, _ = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                if tailc:
+                    ii_ = PT_IDX.to(dev)
+                    PTS.append(torch.stack([xw_[:, ii_], yw_[:, ii_]], -1)); PVS.append(p["pv"].clone())
                 if remover is not None:
                     was = remover.removed.clone()
                     remover.step()
@@ -323,7 +379,8 @@ def main(argv=None):
 
         def actor_on(sel):
             if not args.memory:
-                return (*actor(bX[sel], bS[sel]), sel)
+                f = actor.features(bX[sel], bS[sel])
+                return (*actor.heads(f), sel, f)
             mb_ = sel.reshape(-1)
             f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
             h = bHM[sel[0]]
@@ -333,21 +390,32 @@ def main(argv=None):
                     h = h * (1.0 - bD[sel[i - 1]])[:, None]
                 fi, h = actor.remember(f[i], h)
                 outs.append(fi)
-            return (*actor.heads(torch.cat(outs, 0)), mb_)
+            fc = torch.cat(outs, 0)
+            return (*actor.heads(fc), mb_, fc)
 
         actor.train(); critic.train()
-        kls, cfs, vls, els = [], [], [], []
+        kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
+        if tailc:
+            bV0, bD0, bST0 = torch.cat(V0), torch.cat(D0), torch.cat(ST0)
+            bPTS, bPVS = torch.cat(PTS), torch.cat(PVS)
+            NB = bV0.shape[0]
+            # a decision has a next plan to learn from unless it is the rollout's last or its car restarted in it
+            c_ok = torch.ones(NB, dtype=torch.bool, device=dev); c_ok[-Bl:] = False
+            c_ok &= D_.reshape(-1) <= 0
         tu0 = time.time()
         for ep in range(args.epochs):
             for sel in batches():
                 if v2:
-                    mean, log_std, v_hat, mb = actor_on(sel)
+                    mean, log_std, v_hat, mb, f_heads = actor_on(sel)
                     el = (v_hat - bVT[mb]).pow(2).mean()
                 else:
                     mb = sel
                     mean, log_std = actor(bX[mb], bS[mb])
                     el = torch.zeros((), device=dev)
-                lp = tanh_logp(bU[mb], mean, log_std)
+                if tailc:
+                    lp = tanh_logp(bU[mb][:, rl_idx], mean[:, rl_idx], log_std[:, rl_idx])
+                else:
+                    lp = tanh_logp(bU[mb], mean, log_std)
                 ratio = (lp - bLP[mb]).exp()
                 m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0)
                 a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
@@ -355,6 +423,25 @@ def main(argv=None):
                 pl = -(torch.min(ratio * a_, ratio.clamp(1 - args.clip, 1 + args.clip) * a_) * m_).sum() / n_
                 vl = 0.5 * (critic(bX[mb], bS[mb], bPV[mb]) - bR[mb]).pow(2).mean()
                 loss = pl + args.vf_coef * vl + args.vest_coef * el
+                if tailc:
+                    # (가): this decision's plan, its first step as driven, its tail from the output layer on features it
+                    # does not move, laid where the car was -- against the next decision's plan for the same moments
+                    ok_ = c_ok[mb]
+                    if bool(ok_.any()):
+                        mb_c = mb[ok_]
+                        tail_mean = actor.pi(f_heads[ok_].detach())
+                        a_c = torch.where(rl_mask[None, :], torch.tanh(bU[mb_c]), torch.tanh(tail_mean))
+                        pc_ = PS.roll(a_c, bV0[mb_c], bD0[mb_c], lim)
+                        xw_c, yw_c, _ = plan_world(pc_, bST0[mb_c])
+                        ii_ = PT_IDX.to(dev)
+                        pts_c = torch.stack([xw_c[:, ii_], yw_c[:, ii_]], -1)
+                        tgt, tgv = bPTS[mb_c + Bl], bPVS[mb_c + Bl]
+                        lpos = nn.functional.smooth_l1_loss(pts_c[:, 1:], tgt[:, :-1], reduction="none").sum(-1)
+                        lv = nn.functional.smooth_l1_loss(pc_["pv"][:, 1:], tgv[:, :-1], reduction="none")
+                        lc = (lpos + lv).mean()
+                        loss = loss + args.tail_consistency * lc
+                        cls_.append(float(lc.detach()))
+                        ce5.append(float((pts_c[:, 5] - tgt[:, 4]).norm(dim=-1).median()))
                 opt.zero_grad(set_to_none=True); loss.backward()
                 nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad)
                 opt.step()
@@ -374,6 +461,7 @@ def main(argv=None):
                "shaping": float(stats["shaping"].mean()) / T, "contact_cost": float(stats["contact"].mean()) / T,
                "kl": sum(kls) / len(kls), "clipfrac": sum(cfs) / len(cfs), "vloss": sum(vls) / len(vls),
                "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()), "removed": n_removed,
+               "tail_loss": (sum(cls_) / len(cls_)) if cls_ else None, "tail_next_05": (sum(ce5) / len(ce5)) if ce5 else None, "near_share": float(near_sum.mean()) / T,
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()]}
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
@@ -381,7 +469,10 @@ def main(argv=None):
               f"{row['contacts_car_per_min']:.2f} /분 | 박는 plan {row['plan_hit_share'] * 100:.0f} % | 보상 {row['reward']:.4f} | "
               f"KL {row['kl']:.4f} 잘림 {row['clipfrac'] * 100:.0f} % | 속도 짐작 오차 {row['vest_mae']:.2f} m/s | 표준편차 {sum(row['std']) / len(row['std']):.3f} | "
               + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "")
-              + (f"상자 치움 {n_removed}판 | " if remover is not None else "") + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
+              + (f"가까이 차·상자 {row['near_share'] * 100:.0f} % | " if hold and args.hold_clear > 0 else "")
+              + (f"상자 치움 {n_removed}판 | " if remover is not None else "")
+              + (f"뒷부분 손실 {row['tail_loss']:.3f}, 다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm | " if row.get("tail_loss") is not None else "")
+              + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
                         "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},
