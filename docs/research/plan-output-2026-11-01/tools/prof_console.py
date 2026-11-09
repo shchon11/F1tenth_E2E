@@ -21,9 +21,14 @@ run = sys.argv[1]; n = int(sys.argv[2]) if len(sys.argv) > 2 else 400
 w = sim_worker.SimWorker(_N(), _N()); logs = []
 w.say = lambda k, **f: logs.append(f.get("text") or ""); w.stage = lambda *a, **k: None; w._hold_parked_ok = True
 w._overlay = dict(getattr(w, "_overlay", {}) or {}, plan=True)
-s = w.build_session(P.SessionConfig(run=run, map_name="real/iccas25", seed=0, races=1, cars_per_race=1, device="cuda", compile=False,
-                                    collision_mode="soft", procedural=False, episode_s=120.0, randomize=False), 0)
-print("모드", os.environ.get("F1SIM_PLAN_MODE", "track"), "| 그래프:", [x for x in logs if "그래프" in x][:2])
+#: F1SIM_PROF_OPP=<kind> (11-09, the user: "상대차 있는곳도 simtime 신경좀"): the console's 1:1 race, one opponent of that kind
+#: at the console's default speeds (ForzaETH with prediction, 0.7-1.0)
+OPP = os.environ.get("F1SIM_PROF_OPP", "")
+s = w.build_session(P.SessionConfig(run=run, map_name="real/iccas25", seed=0, races=1, cars_per_race=2 if OPP else 1, device="cuda",
+                                    compile=False, collision_mode="soft", procedural=False, episode_s=120.0, randomize=False,
+                                    opponent="slots" if OPP else "teacher",
+                                    opponent_slots=[{"kind": OPP, "speed_scale": [0.7, 1.0]}] if OPP else None), 0)
+print("모드", os.environ.get("F1SIM_PLAN_MODE", "track"), "| 상대", OPP or "없음", "| 그래프:", [x for x in logs if "그래프" in x][:2])
 for _ in range(120):
     w._step_once(s)
 torch.cuda.synchronize()
@@ -42,5 +47,5 @@ for k in range(200):
         w._snapshot(s)
 torch.cuda.synchronize()
 pr.disable()
-st = io.StringIO(); pstats.Stats(pr, stream=st).sort_stats("cumulative").print_stats(28)
-print("\n".join(l[:170] for l in st.getvalue().splitlines()[:60]))
+st = io.StringIO(); pstats.Stats(pr, stream=st).sort_stats("cumulative").print_stats(40)
+print("\n".join(l[:170] for l in st.getvalue().splitlines()[:70]))

@@ -1413,6 +1413,9 @@ class F1VecEnv:
         self._tw_carry = None
         self.ideal_cmd = None                                       # `enable_ideal`
         self.ext_plan_kv = None                                     # (kappa, v) (B, 10) segments MAP follows, see `step`
+        # (B, n, 4) x, y, heading, speed in each car's frame now: the plan of a car on an external command, for the viewers
+        # (`plan_policy.PlanRunner` "track", 11-09) -- MAP is not run for those cars, and its reference was what they drew
+        self.ext_ref = None
         if e.learner_plan in ("tw", "tw5", "tw5c", "tw5g"):
             if e.action_mode != "plan" or e.plan_follower != "map":
                 raise ValueError("learner_plan 'tw' is followed by MAP: it needs action_mode 'plan' and plan_follower 'map'")
@@ -3059,6 +3062,8 @@ class F1VecEnv:
             # "simtime 왜이렇게 느려?"); that runner hands the viewers its plan itself.
             cmd = torch.zeros(self.B, 2, device=self.device)
             self.last_cmd_raw = cmd
+            if self.ext_ref is not None and self.tracker is not None:
+                self.tracker.last_ref, self.tracker.last_pred = self.ext_ref, None
             if int(self.ecfg.decision_every) > 1:
                 # the decision clock still runs: a plan policy decides on it every `decision_every` steps (PlanRunner)
                 self._dec_cnt += 1
@@ -3074,7 +3079,9 @@ class F1VecEnv:
                 # MAP reads the car's grip level and the IMU's longitudinal acceleration (race_stack's
                 # `acc_now`), and follows the plans of the policy's own cars
                 self.tracker.P = self.sim.P
-                self.tracker.map_rows = self.learner
+                # not the cars on an external command (11-09: a plan policy on its own follower in a race paid 18 ms a step
+                # for MAP's answer for its car, which `ext_cmd` then replaced); the traffic is the inner tracker's
+                self.tracker.map_rows = self.learner & ~self.ext_mask if self._ext_ids else self.learner
                 self.tracker.tw = self.ecfg.learner_plan in ("tw", "tw5", "tw5c", "tw5g")
                 from . import plan_tw as _ptw
                 self.tracker.tw_fmt = _ptw.geom(self.ecfg.learner_plan) if self.tracker.tw else "tw"
@@ -3103,6 +3110,8 @@ class F1VecEnv:
             a_trk = a.clamp(-1.0, 1.0) if float(self.ecfg.plan_reverse_ext) > 0 else a
             a_trk = a_trk if self.ecfg.plan_speed_scale == 1.0 else self._scale_plan_speeds(a_trk)
             raw = self.tracker(a_trk, v_meas, self.speed_cap, yaw_rate, delay=self.tracker_delay)
+            if self._ext_ids and self.ext_ref is not None:
+                self._ext_ref_to_viewers()
             # Before the physics: `sim.state` is still the pose the plan was issued from, which is
             # the frame `last_ref` lives in.
             self._capture_plan(self.sim.state)
@@ -4321,6 +4330,25 @@ class F1VecEnv:
         return fut[o], present, yaw[o]
 
     # ------------------------------------------------------------------ privileged opponent tokens
+    def _ext_ref_to_viewers(self) -> None:
+        """The plans of the cars on an external command (`ext_ref`) into the tracker's reference the viewers draw, resampled
+        to its points: MAP ran for the others only (`map_rows`), and the inner tracker's row for these is a reading of
+        the zeros the env hands it."""
+        lr_ = getattr(self.tracker, "last_ref", None)
+        er = self.ext_ref
+        if lr_ is None or lr_.shape[0] != self.B or er.shape[0] != self.B:
+            return
+        n1 = lr_.shape[1]
+        pos_ = torch.linspace(0, er.shape[1] - 1, n1, device=self.device)
+        i0 = pos_.floor().long().clamp(max=er.shape[1] - 2)
+        w_ = (pos_ - i0.to(pos_.dtype))[None, :, None]
+        smp = (er[:, i0, :4] * (1 - w_) + er[:, i0 + 1, :4] * w_).to(lr_.dtype)
+        m_ = self.ext_mask[:, None, None]
+        self.tracker.last_ref = torch.where(m_, smp, lr_)
+        lp_ = getattr(self.tracker, "last_pred", None)
+        if lp_ is not None and lp_.shape == lr_.shape:
+            self.tracker.last_pred = torch.where(m_, smp, lp_)
+
     def _capture_plan(self, pose_before: torch.Tensor) -> None:
         """Keep this step's plan and the pose it is anchored at, for `opp_tokens`.
 

@@ -301,18 +301,15 @@ class PlanRunner:
             from ..plan_follow import to_car
             st_now = env.sim.state[lid]
             env.ext_cmd[lid] = to_car(env, lid, self.follower.command(st_now))
-            # the plan for the viewers (`tracker.last_ref`: x, y, heading, speed in the car's frame now): with every car
-            # on its own follower the env does not run MAP, whose reference the console drew the plan from (11-09)
+            # the plan for the viewers (x, y, heading, speed in the car's frame now, `GymEnv.ext_ref`): the env does not run
+            # MAP for a car on its own follower, and MAP's reference is what the console drew the plan from (11-09)
             f = self.follower
             c, s_ = torch.cos(st_now[:, 2:3]), torch.sin(st_now[:, 2:3])
             dx, dy = f.X - st_now[:, 0:1], f.Y - st_now[:, 1:2]
             ref = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c, f.PSI - st_now[:, 2:3], f.V], -1)
-            lr = env.tracker.last_ref
-            if lr is None or lr.shape[1:] != ref.shape[1:] or lr.shape[0] != env.B:
-                lr = torch.zeros(env.B, *ref.shape[1:], device=self.device)
-            lr[lid] = ref
-            env.tracker.last_ref = lr
-            env.tracker.last_pred = None
+            if env.ext_ref is None or env.ext_ref.shape[1:] != ref.shape[1:]:
+                env.ext_ref = torch.zeros(env.B, *ref.shape[1:], device=self.device)
+            env.ext_ref[lid] = ref
         if self.mode == "ideal":
             jj = j[:, None]
             env.ideal_cmd[lid, 0] = self.cmd_d.gather(1, jj)[:, 0]
