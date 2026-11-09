@@ -270,7 +270,12 @@ class PlanRunner:
                 _, mean, _, v_hat, p = plan_v3(self.actor, self.obs, self.lim, self.act3, self.turn3)
                 self.v_hat = v_hat
             elif self.v2:
+                h_old = getattr(self.obs, "mem_h", None)
+                h_old = h_old.clone() if h_old is not None else None
                 _, mean, _, v_hat, p = plan_v2(self.actor, self.obs, self.lim)
+                if h_old is not None and getattr(self.actor, "memory", 0):
+                    # a memory steps once per decision: rows not deciding now keep theirs
+                    self.obs.mem_h = torch.where(due[:, None], self.obs.mem_h, h_old)
                 self.v_hat = v_hat
             else:
                 mean, _ = self.actor(self.obs.scans, self.obs.state())
@@ -332,9 +337,17 @@ FORMAT2 = "plan_steps2"
 
 
 class Actor2(nn.Module):
-    """v2: a trunk, the plan's Gaussian mean (20) and a speed estimate [m/s]"""
+    """v2: a trunk, the plan's Gaussian mean (20) and a speed estimate [m/s].
 
-    def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None):
+    `memory` > 0 (11-09, the user chose "A1": adapt by remembering): a GRU of that size reads the trunk's features every
+    decision and its state is added back to them (`mem_out`, zero at the start, so a memory actor made from a v2 one
+    drives exactly as it did). In a session the obstacles stay where they are until they are taken away, and an empty
+    track stays empty -- what the car saw a lap ago tells it what is behind the chicane's walls now. The state is passed
+    in and out (`forward(..., h)` sets `h_out`); `PlanObs2.mem_h` carries it between decisions and clears it at a restart.
+    `log_std_floor` (a buffer, not saved): the exploration noise's floor per output (11-09: the first step's speed output had
+    shrunk to 0.17 and the policy never tried full throttle at the end of the straight)."""
+
+    def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0):
         super().__init__()
         sd = STATE_DIM2 if state_dim is None else int(state_dim)
         self.enc = ScanEncoder(beams)
@@ -344,10 +357,32 @@ class Actor2(nn.Module):
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
         self.v_est = nn.Linear(hidden, 1)
         self.log_std = nn.Parameter(torch.full((PS.ACT_DIM,), math.log(std0)))
+        self.memory = int(memory)
+        if self.memory:
+            self.gru = nn.GRUCell(hidden, self.memory)
+            self.mem_out = nn.Linear(self.memory, hidden)
+            nn.init.zeros_(self.mem_out.weight); nn.init.zeros_(self.mem_out.bias)
+        self.register_buffer("log_std_floor", torch.full((PS.ACT_DIM,), -math.inf), persistent=False)
+        self.h_out = None
 
-    def forward(self, scans: torch.Tensor, state: torch.Tensor):
-        h = self.trunk(torch.cat([self.enc(scans), self.norm(state)], 1))
-        return self.pi(h), self.log_std.expand(scans.shape[0], -1), self.v_est(h)[:, 0] * 5.0
+    def features(self, scans: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        return self.trunk(torch.cat([self.enc(scans), self.norm(state)], 1))
+
+    def heads(self, f: torch.Tensor):
+        log_std = torch.maximum(self.log_std, self.log_std_floor)
+        return self.pi(f), log_std.expand(f.shape[0], -1), self.v_est(f)[:, 0] * 5.0
+
+    def remember(self, f: torch.Tensor, h: Optional[torch.Tensor]):
+        """one decision of the memory: (features with the memory added, the new state)"""
+        h0 = h if h is not None else torch.zeros(f.shape[0], self.memory, device=f.device, dtype=f.dtype)
+        h1 = self.gru(f, h0)
+        return f + self.mem_out(h1), h1
+
+    def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None):
+        f = self.features(scans, state)
+        if self.memory:
+            f, self.h_out = self.remember(f, h)
+        return self.heads(f)
 
 
 class PlanObs2(PlanObs):
@@ -367,6 +402,8 @@ class PlanObs2(PlanObs):
         if rows.numel() == 0:
             return
         self.rel[rows] = 0.0; self.rel_v[rows] = 0.0; self.cmd_d[rows] = 0.0; self.cmd_v[rows] = 0.0
+        if getattr(self, "mem_h", None) is not None:
+            self.mem_h[rows] = 0.0                                   # a new episode remembers nothing
 
     def set_plan2(self, p: Dict[str, torch.Tensor], rows: Optional[torch.Tensor] = None) -> None:
         """the plan just drawn (`plan_steps.roll`, in the frame it was drawn from): kept in its own 0.1 s pose's frame"""
@@ -401,7 +438,8 @@ class PlanObs2(PlanObs):
 
 
 def load_actor2(ck: dict, device) -> Actor2:
-    actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6))).to(device)
+    actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)),
+                   memory=int(ck["args"].get("memory", 0) or 0)).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor
@@ -409,8 +447,16 @@ def load_actor2(ck: dict, device) -> Actor2:
 
 def plan_v2(actor: Actor2, obs: PlanObs2, lim: PS.Limits, sample: bool = False):
     """one decision of a v2 policy: (u, mean, log_std, v_hat, plan). The plan starts from the speed estimate and the last
-    steering command."""
-    mean, log_std, v_hat = actor(obs.scans, obs.state())
+    steering command. A memory actor's state is `obs.mem_h` (made here, cleared by `obs.reset_rows`), stepped once per call:
+    call once per decision."""
+    h = None
+    if getattr(actor, "memory", 0):
+        h = getattr(obs, "mem_h", None)
+        if h is None or h.shape != (obs.scans.shape[0], actor.memory):
+            h = obs.mem_h = torch.zeros(obs.scans.shape[0], actor.memory, device=obs.scans.device)
+    mean, log_std, v_hat = actor(obs.scans, obs.state(), h)
+    if getattr(actor, "memory", 0):
+        obs.mem_h = actor.h_out.detach()
     u = mean + log_std.exp() * torch.randn_like(mean) if sample else mean
     p = PS.roll(torch.tanh(u), v_hat.detach().clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
     return u, mean, log_std, v_hat, p

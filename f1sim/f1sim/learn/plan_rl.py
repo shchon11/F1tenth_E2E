@@ -138,6 +138,14 @@ def main(argv=None):
     ap.add_argument("--hold-p", type=float, default=0.0,
                     help="v2/v3: the share of new plans driven longer than 0.1 s without a new one (11-09, the user: 0.2)")
     ap.add_argument("--hold-len", default="2,4", help="a held plan drives this many decisions, drawn uniformly (2,4 = 0.2-0.4 s)")
+    ap.add_argument("--memory", type=int, default=0,
+                    help="v2: a GRU of this size in the actor (11-09, the user: \"A1\" -- adapt by remembering); 0 = none")
+    ap.add_argument("--mem-chunk", type=int, default=32, help="the memory's update replays sequences of this many decisions")
+    ap.add_argument("--speed-std-floor", type=float, default=0.0,
+                    help="v2: the exploration noise's floor on the first step's speed output (11-09: it had shrunk to 0.17)")
+    ap.add_argument("--removal-p", type=float, default=-1.0,
+                    help="the share of races whose obstacles are taken away mid-episode (-1 = the world's `removal_p`; 0 = none). "
+                         "11-09: plan_rl never ran it, so no plan policy had seen the competition's removal")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
@@ -169,7 +177,19 @@ def main(argv=None):
     # will be held, so every plan's later steps have to be ones the car can drive)
     priv_h = (lambda: torch.cat([obs.priv(), hold_left[:, None].float() / max(1, h_hi - 1)], 1)) if hold else obs.priv
     priv_dim = int(priv_h().shape[1])
-    actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else (Actor2 if v2 else Actor)(obs.beams, std0=args.std0)).to(dev)
+    # the competition's sessions: the obstacles stay where they are for a while, then go (`state_rl.PropRemoval`, per race,
+    # at a time drawn in removal_s after the episode's start)
+    rm_p = float(getattr(world, "removal_p", 0.0)) if args.removal_p < 0 else float(args.removal_p)
+    rm_s = tuple(getattr(world, "removal_s", (10.0, 30.0)))
+    remover = SR.PropRemoval(env, rm_p, float(rm_s[0]), float(rm_s[1]), seed=args.seed) if rm_p > 0 else None
+    if args.memory and (not v2 or v3):
+        raise SystemExit("--memory needs --format v2")
+    actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
+             Actor2(obs.beams, std0=args.std0, memory=args.memory) if v2 else Actor(obs.beams, std0=args.std0)).to(dev)
+    if args.speed_std_floor > 0:
+        actor.log_std_floor[PS.N_STEP] = math.log(args.speed_std_floor)        # the first step's speed: the one driven
+    if args.memory:
+        obs.mem_h = torch.zeros(Bl, args.memory, device=dev)
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
     if args.init:
         # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
@@ -181,6 +201,9 @@ def main(argv=None):
         for k_, fill in (("norm.mean", 0.0), ("norm.var", 1.0)):
             v_ = sd[k_]
             sd[k_] = torch.cat([v_, torch.full((actor.norm.mean.numel() - v_.numel(),), fill, device=v_.device)])
+        for k_, v_ in actor.state_dict().items():
+            if k_ not in sd:                                    # a memory actor from one without: its GRU fresh, output zero
+                sd[k_] = v_
         actor.load_state_dict(sd)
         enc = {k_[4:]: v_ for k_, v_ in ck0["critic"].items() if k_.startswith("enc.")}
         critic.enc.load_state_dict(enc)
@@ -199,7 +222,8 @@ def main(argv=None):
             gp["lr"] = args.lr + (args.lr_end - args.lr) * frac
         if upd <= args.actor_freeze:
             opt.param_groups[0]["lr"] = 0.0                    # the critic catches up with a started actor first
-        S, X, PV, U, LP, V, R, D, VT, FM = [], [], [], [], [], [], [], [], [], []
+        S, X, PV, U, LP, V, R, D, VT, FM, HM = [], [], [], [], [], [], [], [], [], [], []
+        n_removed = 0
         vest_err = []
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
         speed_sum, stop_sum = torch.zeros(Bl, device=dev), torch.zeros(Bl, device=dev)
@@ -212,7 +236,11 @@ def main(argv=None):
                 pv_ = priv_h()
                 newp = hold_left == 0                              # rows that draw a plan now (the others drive a held one)
                 actor.norm.update(s); critic.norm.update(torch.cat([s, pv_], 1))
-                if v2:
+                if args.memory:
+                    HM.append(obs.mem_h.clone())                  # the state this decision starts from
+                    mean, log_std, v_hat = actor(sc, s, obs.mem_h)
+                    obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
+                elif v2:
                     mean, log_std, v_hat = actor(sc, s)
                 else:
                     mean, log_std = actor(sc, s)
@@ -242,6 +270,10 @@ def main(argv=None):
                     start = newp & (torch.rand(Bl, device=dev) < args.hold_p)
                     hold_left = torch.where(start, more, torch.where(newp, torch.zeros_like(hold_left), hold_left - 1))
                 out, p, _ = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                if remover is not None:
+                    was = remover.removed.clone()
+                    remover.step()
+                    n_removed += int((remover.removed & ~was).sum())
                 if hold:
                     hold_left = torch.where(out["restarted"], torch.zeros_like(hold_left), hold_left)
             S.append(s); X.append(sc); PV.append(pv_); U.append(u); LP.append(lp); V.append(v); VT.append(v_true)
@@ -273,16 +305,46 @@ def main(argv=None):
         bLP, bA, bR, bV = torch.stack(LP).reshape(-1), adv.reshape(-1), ret.reshape(-1), V_.reshape(-1)
         bFM = FM_.reshape(-1)                                  # the policy learns from the decisions it made
         N = bS.shape[0]
+        if args.memory:
+            # whole sequences of `mem_chunk` decisions per car, replayed from the state each began with; a restart inside
+            # one clears the state for the decisions after it
+            Lc = args.mem_chunk; nC = T // Lc
+            bHM, bD = torch.cat(HM), D_.reshape(-1)
+            tt = torch.arange(nC * Lc, device=dev).view(nC, Lc)
+            seq_idx = (tt[:, :, None] * Bl + torch.arange(Bl, device=dev)[None, None, :]).permute(1, 0, 2).reshape(Lc, nC * Bl)
+
+        def batches():
+            if args.memory:
+                for sq in torch.randperm(seq_idx.shape[1], device=dev).chunk(args.minibatches):
+                    yield seq_idx[:, sq]
+            else:
+                for mb_ in torch.randperm(N, device=dev).chunk(args.minibatches):
+                    yield mb_
+
+        def actor_on(sel):
+            if not args.memory:
+                return (*actor(bX[sel], bS[sel]), sel)
+            mb_ = sel.reshape(-1)
+            f = actor.features(bX[mb_], bS[mb_]).view(sel.shape[0], sel.shape[1], -1)
+            h = bHM[sel[0]]
+            outs = []
+            for i in range(sel.shape[0]):
+                if i > 0:
+                    h = h * (1.0 - bD[sel[i - 1]])[:, None]
+                fi, h = actor.remember(f[i], h)
+                outs.append(fi)
+            return (*actor.heads(torch.cat(outs, 0)), mb_)
+
         actor.train(); critic.train()
         kls, cfs, vls, els = [], [], [], []
         tu0 = time.time()
         for ep in range(args.epochs):
-            perm = torch.randperm(N, device=dev)
-            for mb in perm.chunk(args.minibatches):
+            for sel in batches():
                 if v2:
-                    mean, log_std, v_hat = actor(bX[mb], bS[mb])
+                    mean, log_std, v_hat, mb = actor_on(sel)
                     el = (v_hat - bVT[mb]).pow(2).mean()
                 else:
+                    mb = sel
                     mean, log_std = actor(bX[mb], bS[mb])
                     el = torch.zeros((), device=dev)
                 lp = tanh_logp(bU[mb], mean, log_std)
@@ -311,14 +373,15 @@ def main(argv=None):
                "plan_hit_share": float(stats["plan_hit"].mean()) / T, "reward": float(R_.mean()),
                "shaping": float(stats["shaping"].mean()) / T, "contact_cost": float(stats["contact"].mean()) / T,
                "kl": sum(kls) / len(kls), "clipfrac": sum(cfs) / len(cfs), "vloss": sum(vls) / len(vls),
-               "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()),
+               "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()), "removed": n_removed,
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()]}
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % | 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
               f"{row['contacts_car_per_min']:.2f} /분 | 박는 plan {row['plan_hit_share'] * 100:.0f} % | 보상 {row['reward']:.4f} | "
               f"KL {row['kl']:.4f} 잘림 {row['clipfrac'] * 100:.0f} % | 속도 짐작 오차 {row['vest_mae']:.2f} m/s | 표준편차 {sum(row['std']) / len(row['std']):.3f} | "
-              + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "") + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
+              + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "")
+              + (f"상자 치움 {n_removed}판 | " if remover is not None else "") + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
                         "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},
