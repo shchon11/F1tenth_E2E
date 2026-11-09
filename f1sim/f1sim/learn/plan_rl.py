@@ -61,6 +61,36 @@ def build(world: str, envs: int, seed: int, device, overrides=None, fmt: str = "
     return env, lim, a
 
 
+def track_boxes(env, goal, lid: torch.Tensor, K: int, R: float) -> torch.Tensor:
+    """(B_l, K*4) the boxes ahead ALONG THE TRACK (11-10, the user, of the straight-line block that also lists the boxes behind
+    a wall on the opposite straight: \"이건 아니지\"): live boxes whose walls-only distance to go (`plan_reward.GoalField`, the
+    reward's own field -- no centerline) is 0..R m less than the car's (from -1 m: beside it), nearest along the track first:
+    present, dx/5, dy/5 in the car's frame, the along-track distance/5 -- hidden ones too. The lap's wrap is taken care of."""
+    po = env.procedural
+    Bl = int(lid.numel())
+    out = torch.zeros(Bl, K, 4, device=lid.device)
+    if po is None or po.C == 0:
+        return out.reshape(Bl, -1)
+    st = env.sim.state[lid].float()
+    tid = env.sim.tid[lid]
+    pos = po.p_poses[lid, :, :2].float()                                   # (B_l, C, 2)
+    C = pos.shape[1]
+    r_car = goal.remaining(st[:, :2], tid)
+    r_box = goal.remaining(pos.reshape(-1, 2), tid.repeat_interleave(C)).view(Bl, C)
+    L = goal.lap[tid].float()[:, None]
+    ds = torch.remainder(r_car[:, None] - r_box + 0.5 * L, L) - 0.5 * L     # ahead along the track, in (-L/2, L/2]
+    live = (po.p_sid[lid] >= 0) & torch.isfinite(ds) & (ds > -1.0) & (ds <= R)
+    d = pos - st[:, None, :2]
+    c, s_ = torch.cos(st[:, 2])[:, None], torch.sin(st[:, 2])[:, None]
+    dx, dy = d[..., 0] * c + d[..., 1] * s_, -d[..., 0] * s_ + d[..., 1] * c
+    blk = torch.stack([live.float(), dx / 5.0, dy / 5.0, torch.nan_to_num(ds) / 5.0], 2) * live[..., None].float()
+    order = torch.where(live, ds, torch.full_like(ds, 1e6)).argsort(1)
+    blk = blk.gather(1, order[..., None].expand(-1, -1, 4))
+    n = min(K, C)
+    out[:, :n] = blk[:, :n]
+    return out.reshape(Bl, -1)
+
+
 class Driver:
     """drives the learner rows one decision: plan from the action, the 4 control steps, the reward"""
 
@@ -151,6 +181,9 @@ def main(argv=None):
     ap.add_argument("--memory", type=int, default=0,
                     help="v2: a GRU of this size in the actor (11-09, the user: \"A1\" -- adapt by remembering); 0 = none")
     ap.add_argument("--mem-chunk", type=int, default=32, help="the memory's update replays sequences of this many decisions")
+    ap.add_argument("--box-range", type=float, default=0.0,
+                    help="> 0: the boxes ahead -- the critic's box block and --mem-aux's target -- counted ALONG THE TRACK within this many"
+                         " metres (`track_boxes`) instead of the straight-line 12 m that also lists boxes behind a wall (11-10). 0 = as before")
     ap.add_argument("--mem-aux", type=float, default=0.0,
                     help="with --memory: the weight of a side task for the memory alone -- from its state, say where the boxes ahead are"
                          " (the critic's privileged block: the nearest 3 live boxes not behind the car within 12 m, hidden ones too) every"
@@ -205,6 +238,20 @@ def main(argv=None):
     # the critic is told how many decisions the plan in hand still drives (the policy is not: it cannot know which plan
     # will be held, so every plan's later steps have to be ones the car can drive)
     priv_h = (lambda: torch.cat([obs.priv(), hold_left[:, None].float() / max(1, h_hi - 1)], 1)) if hold else obs.priv
+    if args.box_range > 0:
+        # the critic's box block, along the track: find its columns (they must equal the straight-line block now), then refill them
+        _pv0, _pb0 = obs.priv(), env._prop_block(env.sim.state)[lid].float()
+        _w = _pb0.shape[1]
+        _hit = [j for j in range(_pv0.shape[1] - _w + 1) if torch.allclose(_pv0[:, j:j + _w].float(), _pb0, atol=1e-5)]
+        if len(_hit) != 1 or float(_pb0.abs().sum()) == 0.0:
+            raise SystemExit(f"--box-range: the critic's box block not found unambiguously ({_hit})")
+        _P0, _priv_base = _hit[0], priv_h
+        def priv_h():
+            pv = _priv_base()
+            pv[:, _P0:_P0 + _w] = track_boxes(env, pr.goal, lid, PRIV_V2_PROP_SLOTS, args.box_range)
+            return pv
+        print(f"[plan_rl] the boxes ahead along the track within {args.box_range:g} m (critic columns {_P0}-{_P0 + _w - 1}, "
+              f"--mem-aux target)", flush=True)
     priv_dim = int(priv_h().shape[1])
     # the competition's sessions: the obstacles stay where they are for a while, then go (`state_rl.PropRemoval`, per race,
     # at a time drawn in removal_s after the episode's start)
@@ -295,7 +342,8 @@ def main(argv=None):
                 if args.memory:
                     HM.append(obs.mem_h.clone())                  # the state this decision starts from
                     if aux_on:
-                        AX.append(env._prop_block(env.sim.state)[lid].float().clone())
+                        AX.append(track_boxes(env, pr.goal, lid, AUXK, args.box_range) if args.box_range > 0
+                                  else env._prop_block(env.sim.state)[lid].float().clone())
                     mean, log_std, v_hat = actor(sc, s, obs.mem_h)
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
                 elif v2:
