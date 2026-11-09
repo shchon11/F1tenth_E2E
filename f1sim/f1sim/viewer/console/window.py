@@ -335,7 +335,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.focus_card.setVisible(False)
         show = card("표시")
         for chk, text in ((self.chk_plan, "정책 궤적"), (self.chk_trails, "주행 자취"),
-                          (self.chk_raceline, "레이싱 라인"), (self.chk_lidar, "LiDAR")):
+                          (self.chk_lidar, "LiDAR")):
             chk.setText(text)
             show.addWidget(chk)
         v.addStretch(1)
@@ -2061,10 +2061,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                  "E2E 망은 읽는 빔과 출력 명령의 궤적.")
         self.chk_trails = QtWidgets.QCheckBox("주행 궤적")
         self.chk_trails.setChecked(True)
-        self.chk_raceline = QtWidgets.QCheckBox("레이싱 라인 / 중심선")
-        # off by default (11-09, the user: "레이싱라인좀 시각화나 뭐 계산할때 쳐 지워라 쓰지도않는거"): the planners shown
-        # here do not use one
-        self.chk_raceline.setChecked(False)
+        # no racing line / centerline toggle (11-09, the user: "레이싱라인도 아예 지워"): neither is drawn any more
         self.chk_labels = QtWidgets.QCheckBox("차량 번호")
         self.chk_labels.setChecked(True)
         self.chk_contacts = QtWidgets.QCheckBox("접촉 지점")
@@ -2075,7 +2072,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             "센 접촉입니다.\n부딪힌 표시는 0.3초 동안 퍼지며 사라지고, 계속 닿아 있는 동안에는 지금 닿은 "
             "자리에 작은 표시가 남습니다. 차 자체도 같은 색으로 빛나고 바닥에 같은 색 고리가 생깁니다 "
             "(이 둘은 끄지 않습니다).")
-        for w in (self.chk_lidar, self.chk_plan, self.chk_trails, self.chk_raceline, self.chk_labels,
+        for w in (self.chk_lidar, self.chk_plan, self.chk_trails, self.chk_labels,
                   self.chk_contacts):
             show.add(w)
             w.toggled.connect(self._apply_local_overlays)
@@ -3431,7 +3428,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         v = self.viewport
         v.show_lidar = self.chk_lidar.isChecked()
         v.show_trails = self.chk_trails.isChecked()
-        v.show_raceline = self.chk_raceline.isChecked()
+        v.show_raceline = False
         v.show_labels = self.chk_labels.isChecked()
         v.show_contacts = self.chk_contacts.isChecked()
         if not self.chk_plan.isChecked():

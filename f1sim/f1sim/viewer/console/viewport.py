@@ -272,7 +272,7 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
 
         self.camera = "overview"
         self.show_lidar = True
-        self.show_raceline = True
+        self.show_raceline = False             # nothing is drawn for it any more (see _apply_geometry)
         self.show_trails = True
         self.show_labels = True
         #: Contact markers at the points the cars touched (`contacts.contact_marks`). The cars' own
@@ -623,15 +623,10 @@ class ViewportWidget(QtWidgets.QOpenGLWidget):
             self.scene.set_dyn_props(geom.dyn_props, max(self.DYN_PROP_INSTANCES, int(geom.dyn_prop_slots)))
         else:
             self.scene.clear_dyn_props()
-        if geom.centerline is not None and len(geom.centerline) > 1:
-            cl = np.vstack([geom.centerline, geom.centerline[:1]])
-            self.scene.add_line("centerline", cl, (0.35, 0.55, 0.9, 0.35), z=0.008)
-        if geom.raceline_xy is not None and len(geom.raceline_xy) > 1:
-            v = geom.raceline_v if geom.raceline_v is not None else np.zeros(len(geom.raceline_xy), np.float32)
-            t = (v - v.min()) / (v.max() - v.min() + 1e-6)
-            cols = np.stack([t, 1 - np.abs(2 * t - 1), 1 - t, np.ones_like(t)], 1).astype(np.float32)
-            self.scene.add_line("raceline", np.vstack([geom.raceline_xy, geom.raceline_xy[:1]]),
-                                np.vstack([cols, cols[:1]]), z=0.012)
+        # No centerline and no racing line on screen (11-09, the user: "centerline은 왜자꾸 쳐 보이는거야? 레이싱라인도 아예
+        # 지워"): the planners shown here use neither. The centerline drew whatever the overlay toggle said -- only the
+        # racing line was behind it. The geometry still carries both (the camera reads the track's heading off the
+        # centerline, the layout editor squares pieces to it).
         self.geometry_data = geom
         self._cam_eye = self._cam_tgt = None
         self.scene.trail_fill = 0

@@ -619,16 +619,12 @@ class NativeViewer:
             return 0 <= row < H and 0 <= col < W and bool(tr.tall[row, col])
 
         self.scene.build_walls(track_contours_mask(tr, tr.tall), height=1.0, is_solid=is_solid)
-        if tr.centerline is not None:
-            self.scene.add_line("centerline", np.vstack([tr.centerline, tr.centerline[:1]]), (0.35, 0.55, 0.9, 0.35), z=0.008)
+        # no centerline / racing line drawn (11-09, the user: "레이싱라인도 아예 지워"); the raceline object is still kept
+        # for the drivers that follow it
         rl = self._racelines
         if isinstance(rl, (list, tuple)):
             rl = rl[self.track_index] if self.track_index < len(rl) else None
         self.raceline = rl
-        if rl is not None:
-            v = rl.v; t = (v - v.min()) / (v.max() - v.min() + 1e-6)
-            cols = np.stack([t, 1 - np.abs(2 * t - 1), 1 - t, np.ones_like(t)], 1)
-            self.scene.add_line("raceline", np.vstack([rl.xy, rl.xy[:1]]), np.vstack([cols, cols[:1]]), z=0.012)
 
     def _track_hud(self) -> str:
         """Which map, out of which set -- the set matters as much as the number: 3 of 24 held-out
