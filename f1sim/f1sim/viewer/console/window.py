@@ -439,6 +439,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.btn_load_layout = btn("불러오기…", "저장해 둔 장애물 배치(JSON)를 불러와 그 배치로 달립니다.")
         self.btn_load_layout.clicked.connect(self._on_load_layout_file)
         oh.addWidget(self.btn_load_layout)
+        # 11-09, the user: "콘솔에서도 장애물 치우기 기능이 있었으면" -- the competition's sessions hold the obstacles for a
+        # while, then take them away mid-session: here at once, without a reset, and back again
+        self.btn_remove_layout = btn("장애물 치우기", "대회처럼 달리는 도중에 장애물을 모두 치웁니다(리셋 없이). 리셋해도 치운 채로 "
+                                                    "있습니다.\n다시 누르면 치우기 전 배치를 그 자리에 되돌립니다.")
+        self.btn_remove_layout.clicked.connect(self._on_remove_layout)
+        oh.addWidget(self.btn_remove_layout)
+        self._removed_from = None                         # the layout taken away ({"seed"} or {"pieces"}), None = not removed
         self.layout_chip = lab("", "CondChip")
         self.layout_chip.setMinimumWidth(80)
         oh.addWidget(self.layout_chip, 1)
@@ -563,6 +570,24 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         return (self.state in (STATE_RUNNING, STATE_PAUSED) and bool(self._running_facts.get("procedural"))
                 and bool(self._prop_catalogue))
 
+    def _on_remove_layout(self):
+        """장애물 치우기 / 다시 놓기: every obstacle gone in place (`CMD_SET_LAYOUT` with no pieces, no reset), or the layout
+        taken away put back where it was."""
+        if not self._session_holds_layout():
+            return
+        if self._removed_from is not None:
+            back, self._removed_from = self._removed_from, None
+            self.layout_requested.emit(dict(back, reset=False))
+            return
+        lay = self._layout_now or {}
+        if self._custom_layout is not None:
+            self._removed_from = {"pieces": list(self._custom_layout)}
+        elif lay.get("layout_seed") is not None:
+            self._removed_from = {"seed": int(lay["layout_seed"])}
+        else:
+            self._removed_from = {"seed": int(self._seed())}
+        self.layout_requested.emit({"pieces": [], "reset": False})
+
     def settle_layout(self, state: dict) -> None:
         """The worker's answer to a layout change: the layout as held, or why it was refused."""
         err = state.get("error")
@@ -576,8 +601,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                                                        "prop_keep")}
         n = len(state.get("layout") or [])
         where = (f"시드 {state.get('layout_seed')}" if state.get("layout_seed") is not None else "직접 편집한 배치")
-        self.status_text.setText(f"장애물 {where} · {n}개 — 처음부터 다시 달립니다.")
-        self.log(f"장애물 배치: {where} · {n}개", "done")
+        if not state.get("reset", True):
+            msg = "장애물을 치웠습니다 — 그대로 달립니다" if n == 0 else f"장애물 {where} · {n}개를 되돌렸습니다 — 그대로 달립니다"
+            self.status_text.setText(msg)
+            self.log(msg, "done")
+        else:
+            self.status_text.setText(f"장애물 {where} · {n}개 — 처음부터 다시 달립니다.")
+            self.log(f"장애물 배치: {where} · {n}개", "done")
         self._refresh_condbar()
 
     # -- 장애물 편집
@@ -860,6 +890,13 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             chip = "학습 생성기 · 시드가 같으면 같은 배치"
         if running_props and self._custom_layout is None and lay.get("layout_seed") not in (None, self._seed()):
             chip += f"  (지금 화면: 시드 {lay.get('layout_seed')})"
+        if self._removed_from is not None and running_props:
+            chip = "치움 · 리셋해도 그대로 · '다시 놓기'로 되돌림"
+        if not running_props:
+            self._removed_from = None                     # a new session holds its own layout
+        self.btn_remove_layout.setText("다시 놓기" if self._removed_from is not None else "장애물 치우기")
+        self.btn_remove_layout.setVisible(props or running_props)
+        self.btn_remove_layout.setEnabled(running_props and not self._editing)
         self.layout_chip.setText(chip)
         self.layout_chip.setToolTip(chip)
         busy = self.state in (STATE_PREPARING, STATE_STOPPING) or self._editing
@@ -2933,6 +2970,11 @@ class ConsoleWindow(QtWidgets.QMainWindow):
             self._select_map(pick.map)
             if pick.map in self._catalogue_ids():
                 self._on_map_selected(pick.map)
+            elif not getattr(self.maps, "ready", False):
+                # The catalogue is not here yet -- the console restores its last pick at start, before the worker has
+                # sent it -- so `set_maps` would select the map this window was last used with: select the pick's
+                # instead when it arrives (11-09, the user: "최신 체크포인트 맵 자동설정이 안되어있어서 매번 지정해줘야함").
+                self._pref_map = pick.map
             self._apply_pick_settings(pick)
         self._update_selection_note()
         self._update_start_enabled()

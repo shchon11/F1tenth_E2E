@@ -2344,6 +2344,10 @@ class SimWorker:
         reset = bool(msg.get("reset", True))
         if reset:
             self._reset_episode(session)
+        elif msg.get("pieces") is None:
+            # a seed's draw is only held until the next redraw: without a reset, into the slots now (장애물 다시 놓기,
+            # 11-09); a hand-made layout is written by `set_pieces` already
+            PL.write(proc, hold.pieces)
         return dict(hold.state(), reset=reset)
 
     # ---------------------------------------------------------------- training courtesy flag
