@@ -9,6 +9,12 @@ exploration floors, correlated noise, KL leashes): the world, the plan format, t
   simulator's own.
 * PPO: gamma 0.995 per decision (a ~20 s horizon, about three laps), lambda 0.95, 4 epochs x 8 minibatches, clip 0.2,
   lr 3e-4 -> 1e-4, exploration std 0.6 at the start and learned.
+* `--hold-p` (11-09, agreed with the user): that share of new plans is driven 0.2-0.4 s (`--hold-len`) without a new
+  one, from where the car is (`plan_steps.shift_plan`). Re-planning every 0.1 s, only a plan's first 0.1 s was ever
+  driven, and its later points were a rough shape (0.3 / 0.5 s on, 12 / 44 cm off where the car went) that MAP and
+  the real car's controller follow. The policy cannot tell which plan will be held; the critic is told how many
+  decisions the plan in hand still drives; held decisions are left out of the policy loss and the advantage runs
+  through them undiscounted by lambda. Drive time (evaluation, console, car) re-plans every 0.1 s as before.
 
 usage: python -m f1sim.learn.plan_rl --name NAME [--updates 2000] [--envs 1024] [--seed 1]"""
 from __future__ import annotations
@@ -64,9 +70,10 @@ class Driver:
         from ..lidar import HIT_CAR
         self._hit_car = HIT_CAR
 
-    def decision(self, a: torch.Tensor, p=None):
+    def decision(self, a: torch.Tensor, p=None, charge=None):
         """drive one decision: `p` a plan already made (v2: from the policy's speed estimate and last command), else
-        made from `a` at the car's true state (v1)"""
+        made from `a` at the car's true state (v1). `charge` (B_l,) bool: rows whose plan is new this decision -- the
+        plan-hit cost is charged once, when a plan is drawn (a held plan's later decisions pay none)"""
         env, lid = self.env, self.lid
         st = env.sim.state[lid].clone()
         if p is None:
@@ -85,9 +92,12 @@ class Driver:
             restarted |= (te | trc)[lid]
             r = env.last_result
             self.pr.control_step((r.scan_type[lid] == self._hit_car).any(1))     # a beam ended on a car
-        out = self.pr.decision(pts, pc["price"], restarted)
+        price, hit = pc["price"], pc["hit"].float()
+        if charge is not None:
+            price, hit = torch.where(charge, price, torch.zeros_like(price)), hit * charge.float()
+        out = self.pr.decision(pts, price, restarted)
         out["plan_hit_price"] = out.pop("plan_hit")
-        out["plan_hit"] = pc["hit"].float()
+        out["plan_hit"] = hit
         self.obs.push_scan()
         self.obs.set_plan(pts, p["pv"])
         if hasattr(self.obs, "set_plan2"):
@@ -125,6 +135,9 @@ def main(argv=None):
     ap.add_argument("--actor-freeze", type=int, default=0, help="updates in which only the critic learns (a started actor)")
     ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
+    ap.add_argument("--hold-p", type=float, default=0.0,
+                    help="v2/v3: the share of new plans driven longer than 0.1 s without a new one (11-09, the user: 0.2)")
+    ap.add_argument("--hold-len", default="2,4", help="a held plan drives this many decisions, drawn uniformly (2,4 = 0.2-0.4 s)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
@@ -145,7 +158,17 @@ def main(argv=None):
     obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
     act3, turn3 = plan3_models(env, lim, dev) if v3 else (None, None)
     drv = Driver(env, lim, pr, obs)
-    priv_dim = int(obs.priv().shape[1])
+    hold = args.hold_p > 0
+    if hold and not v2:
+        raise SystemExit("--hold-p needs --format v2 or v3")
+    h_lo, h_hi = (int(x_) for x_ in args.hold_len.split(","))
+    hold_left = torch.zeros(Bl, dtype=torch.long, device=dev)      # decisions a held plan still drives after this one
+    hold_k = torch.zeros(Bl, dtype=torch.long, device=dev)         # whole steps of the held plan already driven
+    p_held = None
+    # the critic is told how many decisions the plan in hand still drives (the policy is not: it cannot know which plan
+    # will be held, so every plan's later steps have to be ones the car can drive)
+    priv_h = (lambda: torch.cat([obs.priv(), hold_left[:, None].float() / max(1, h_hi - 1)], 1)) if hold else obs.priv
+    priv_dim = int(priv_h().shape[1])
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else (Actor2 if v2 else Actor)(obs.beams, std0=args.std0)).to(dev)
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
     if args.init:
@@ -176,7 +199,7 @@ def main(argv=None):
             gp["lr"] = args.lr + (args.lr_end - args.lr) * frac
         if upd <= args.actor_freeze:
             opt.param_groups[0]["lr"] = 0.0                    # the critic catches up with a started actor first
-        S, X, PV, U, LP, V, R, D, VT = [], [], [], [], [], [], [], [], []
+        S, X, PV, U, LP, V, R, D, VT, FM = [], [], [], [], [], [], [], [], [], []
         vest_err = []
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
         speed_sum, stop_sum = torch.zeros(Bl, device=dev), torch.zeros(Bl, device=dev)
@@ -186,7 +209,8 @@ def main(argv=None):
         for t in range(T):
             with torch.no_grad():
                 sc, s = obs.scans.clone(), obs.state()
-                pv_ = obs.priv()
+                pv_ = priv_h()
+                newp = hold_left == 0                              # rows that draw a plan now (the others drive a held one)
                 actor.norm.update(s); critic.norm.update(torch.cat([s, pv_], 1))
                 if v2:
                     mean, log_std, v_hat = actor(sc, s)
@@ -207,8 +231,21 @@ def main(argv=None):
                     # the plan starts from what the policy thinks its speed is and what it last commanded
                     p = PS.roll(torch.tanh(u), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
                     vest_err.append((v_hat - v_true).abs())
-                out, p, _ = drv.decision(torch.tanh(u), p)
+                if hold:
+                    # a new plan is kept; rows inside a held plan drive its next 0.1 s, re-expressed from where they are
+                    sel = lambda A, B_: torch.where(newp.view(-1, *([1] * (A.dim() - 1))), A, B_)
+                    p_held = p if p_held is None else {k_: sel(p[k_], p_held[k_]) if p[k_].dim() and p[k_].shape[0] == Bl
+                                                       else p[k_] for k_ in p}
+                    hold_k = torch.where(newp, torch.zeros_like(hold_k), hold_k + 1)
+                    p = PS.shift_plan(p_held, hold_k)
+                    more = torch.randint(h_lo - 1, h_hi, (Bl,), device=dev)
+                    start = newp & (torch.rand(Bl, device=dev) < args.hold_p)
+                    hold_left = torch.where(start, more, torch.where(newp, torch.zeros_like(hold_left), hold_left - 1))
+                out, p, _ = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                if hold:
+                    hold_left = torch.where(out["restarted"], torch.zeros_like(hold_left), hold_left)
             S.append(s); X.append(sc); PV.append(pv_); U.append(u); LP.append(lp); V.append(v); VT.append(v_true)
+            FM.append(newp.float())
             R.append(out["reward"]); D.append(out["restarted"].float())
             for k in ("lap", "shaping", "contact"):
                 stats[k] += out[k]
@@ -217,20 +254,24 @@ def main(argv=None):
             sp = env.sim.state[lid, dyn.IVX].abs()
             speed_sum += sp; stop_sum += (sp < 0.3).float()
         with torch.no_grad():
-            v_last = critic(obs.scans, obs.state(), obs.priv())
+            v_last = critic(obs.scans, obs.state(), priv_h())
         t_roll = time.time() - tr0
         # GAE; a restart (episode end) cuts the trace and bootstraps from the value before it
-        V_ = torch.stack(V); R_ = torch.stack(R); D_ = torch.stack(D)
+        V_ = torch.stack(V); R_ = torch.stack(R); D_ = torch.stack(D); FM_ = torch.stack(FM)
         adv = torch.zeros_like(R_); gae = torch.zeros(Bl, device=dev)
         for t in reversed(range(T)):
             v_next = v_last if t == T - 1 else V_[t + 1]
             v_next = torch.where(D_[t] > 0, V_[t], v_next)
             delta = R_[t] + args.gamma * v_next - V_[t]
-            gae = delta + args.gamma * args.lam * (1.0 - D_[t]) * gae
+            # inside a held plan the trace runs on undiscounted by lambda: a plan's advantage is all it drove, then
+            # lambda from the next plan on
+            lam_t = args.lam if t == T - 1 else torch.where(FM_[t + 1] > 0, torch.full_like(gae, args.lam), torch.ones_like(gae))
+            gae = delta + args.gamma * lam_t * (1.0 - D_[t]) * gae
             adv[t] = gae
         ret = adv + V_
         bS, bX, bPV, bU, bVT = torch.cat(S), torch.cat(X), torch.cat(PV), torch.cat(U), torch.cat(VT)
         bLP, bA, bR, bV = torch.stack(LP).reshape(-1), adv.reshape(-1), ret.reshape(-1), V_.reshape(-1)
+        bFM = FM_.reshape(-1)                                  # the policy learns from the decisions it made
         N = bS.shape[0]
         actor.train(); critic.train()
         kls, cfs, vls, els = [], [], [], []
@@ -246,15 +287,18 @@ def main(argv=None):
                     el = torch.zeros((), device=dev)
                 lp = tanh_logp(bU[mb], mean, log_std)
                 ratio = (lp - bLP[mb]).exp()
-                a_ = bA[mb]; a_ = (a_ - a_.mean()) / (a_.std() + 1e-8)
-                pl = -torch.min(ratio * a_, ratio.clamp(1 - args.clip, 1 + args.clip) * a_).mean()
+                m_ = bFM[mb]; n_ = m_.sum().clamp_min(1.0)
+                a_ = bA[mb]; mu_ = (a_ * m_).sum() / n_
+                a_ = (a_ - mu_) / (((a_ - mu_).pow(2) * m_).sum() / n_).sqrt().add(1e-8)
+                pl = -(torch.min(ratio * a_, ratio.clamp(1 - args.clip, 1 + args.clip) * a_) * m_).sum() / n_
                 vl = 0.5 * (critic(bX[mb], bS[mb], bPV[mb]) - bR[mb]).pow(2).mean()
                 loss = pl + args.vf_coef * vl + args.vest_coef * el
                 opt.zero_grad(set_to_none=True); loss.backward()
                 nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad)
                 opt.step()
                 with torch.no_grad():
-                    kls.append(float((bLP[mb] - lp).mean())); cfs.append(float(((ratio - 1).abs() > args.clip).float().mean()))
+                    kls.append(float(((bLP[mb] - lp) * m_).sum() / n_))
+                    cfs.append(float((((ratio - 1).abs() > args.clip).float() * m_).sum() / n_))
                     vls.append(float(vl)); els.append(float(el))
         t_upd = time.time() - tu0
         secs = T * PS.DT
@@ -267,14 +311,14 @@ def main(argv=None):
                "plan_hit_share": float(stats["plan_hit"].mean()) / T, "reward": float(R_.mean()),
                "shaping": float(stats["shaping"].mean()) / T, "contact_cost": float(stats["contact"].mean()) / T,
                "kl": sum(kls) / len(kls), "clipfrac": sum(cfs) / len(cfs), "vloss": sum(vls) / len(vls),
-               "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0,
+               "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()),
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()]}
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % | 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
               f"{row['contacts_car_per_min']:.2f} /분 | 박는 plan {row['plan_hit_share'] * 100:.0f} % | 보상 {row['reward']:.4f} | "
               f"KL {row['kl']:.4f} 잘림 {row['clipfrac'] * 100:.0f} % | 속도 짐작 오차 {row['vest_mae']:.2f} m/s | 표준편차 {sum(row['std']) / len(row['std']):.3f} | "
-              f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
+              + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "") + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
                         "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},

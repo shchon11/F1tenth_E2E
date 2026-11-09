@@ -35,8 +35,12 @@ w.say = lambda k, **f: None; w.stage = lambda *a, **k: None; w._hold_parked_ok =
 w._overlay = dict(getattr(w, "_overlay", {}) or {}, plan=True)
 #: F1SIM_VIDEO_EMPTY=1 (11-07, the user: "영상뽑을 때 빈트랙도 뽑아주셈"): the same run on the empty track, no obstacles
 EMPTY = os.environ.get("F1SIM_VIDEO_EMPTY", "0") == "1"
-s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, cars_per_race=1, device="cuda", compile=False,
-                                    collision_mode="soft", procedural=not EMPTY, episode_s=3600.0, randomize=False), 0)
+#: F1SIM_VIDEO_OPP=<speed scale> (11-09, the user: "상대 있는것도좀 부탁"): one opponent, the training world's kind (a raceline
+#: driver) at that share of the raceline's speed, drawn red; its contacts with the policy's car in the title
+OPP = float(os.environ["F1SIM_VIDEO_OPP"]) if os.environ.get("F1SIM_VIDEO_OPP") else None
+s = w.build_session(P.SessionConfig(run=run, map_name=mp, seed=seed, races=1, cars_per_race=2 if OPP else 1, device="cuda",
+                                    compile=False, collision_mode="soft", procedural=not EMPTY, episode_s=3600.0, randomize=False,
+                                    opponent_slots=[{"kind": "raceline", "speed_scale": OPP}] if OPP else None), 0)
 env = s["env"]; proc = env.procedural
 tr = maps.load(tracks.resolve(mp))
 occ = tr.occupancy; res = tr.resolution; H, W = occ.shape
@@ -74,8 +78,8 @@ WPX, HPX, DPI = 1280, 720, 80
 fig = plt.figure(figsize=(WPX / DPI, HPX / DPI), dpi=DPI, facecolor="white")
 ax = fig.add_axes([0.01, 0.03, 0.58, 0.86]); bx = fig.add_axes([0.61, 0.03, 0.38, 0.86])
 title = fig.text(0.01, 0.95, "", fontsize=13, va="center")
-sub = fig.text(0.01, 0.91, "흰 = 달릴 수 있는 곳, 회색 = 벽, 갈색 = obstacle, 파랑 = 차, 검은 선 = policy의 계획 경로, 색 점 = 지나온 3 s(속도 색), "
-               "X = 접촉(빨강 벽 · 주황 obstacle, 굵게 = 세게)", fontsize=9, color="0.3", va="center")
+sub = fig.text(0.01, 0.91, "흰 = 달릴 수 있는 곳, 회색 = 벽, 갈색 = obstacle, 파랑 = 차, 빨강 = 상대 차, 검은 선 = policy의 계획 경로, 색 점 = 지나온 3 s(속도 색), "
+               "X = 접촉(빨강 벽 · 주황 obstacle · 자홍 차, 굵게 = 세게)", fontsize=9, color="0.3", va="center")
 enc = REC.FfmpegEncoder(out, WPX, HPX, 20)
 KCOL = ("red", "darkorange", "magenta")
 tot_frames = 0
@@ -94,6 +98,8 @@ for L in range(n_lay):
     hits = []
     trail_sc = [a.scatter([], [], c=[], s=6, cmap="turbo", vmin=0, vmax=8) for a in (ax, bx)]
     car_p = [a.add_patch(Polygon(np.zeros((4, 2)), closed=True, fc="tab:blue", ec="k", lw=1.0, zorder=5)) for a in (ax, bx)]
+    opp_p = [[a.add_patch(Polygon(np.zeros((4, 2)), closed=True, fc="tab:red", ec="k", lw=1.0, zorder=5)) for a in (ax, bx)]
+             for _ in range(env.B - 1)]
     plan_l = [a.plot([], [], "k-", lw=1.4, zorder=4)[0] for a in (ax, bx)]
     hit_art = []
     prev_on = env.sim.contact_frame()[0].float().cpu().numpy()[i_on]; prev_hd = env.sim.contact_frame()[0].float().cpu().numpy()[i_hd]
@@ -118,6 +124,11 @@ for L in range(n_lay):
         fr = w._snapshot(s)
         plan = np.asarray(fr["plan"], dtype=float)[:, :2] if fr.get("plan") is not None else np.zeros((0, 2))
         cp = car_poly(st[0], st[1], st[2])
+        for oi, pp in enumerate(opp_p):
+            so = env.sim.state[oi + 1].cpu().numpy()
+            gone = bool(env.sim.absent[oi + 1]) if getattr(env.sim, "absent_any", False) else False
+            for q in pp:
+                q.set_xy(car_poly(so[0], so[1], so[2]) if not gone else np.zeros((4, 2)))
         for i, a in enumerate((ax, bx)):
             trail_sc[i].set_offsets(tp[:, :2]); trail_sc[i].set_array(tp[:, 2])
             car_p[i].set_xy(cp)
@@ -126,12 +137,14 @@ for L in range(n_lay):
         ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[2], ext[3])
         bx.set_xlim(st[0] - 4, st[0] + 4); bx.set_ylim(st[1] - 4, st[1] + 4)
         title.set_text(f"{name} · {'빈 트랙' if EMPTY else f'obstacle 배치 {L}'} · {k * 0.025:4.1f} s · 속도 {st[3]:4.1f} m/s · "
-                       f"obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) · 벽 접촉 {cnt[0]}(세게 {hcnt[0]})")
+                       f"obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) · 벽 접촉 {cnt[0]}(세게 {hcnt[0]})"
+                       + (f" · 상대 차({OPP:.0%} 속도) 접촉 {cnt[2]}(세게 {hcnt[2]})" if OPP else ""))
         fig.canvas.draw()
         buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
         enc.write(np.ascontiguousarray(buf).tobytes()); tot_frames += 1
     for h in hit_art:
         h.remove()
-    print(f"배치 {L}: obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) 벽 {cnt[0]}(세게 {hcnt[0]})", flush=True)
+    print(f"배치 {L}: obstacle 접촉 {cnt[1]}(세게 {hcnt[1]}) 벽 {cnt[0]}(세게 {hcnt[0]})"
+          + (f" 상대 차 {cnt[2]}(세게 {hcnt[2]})" if OPP else ""), flush=True)
 rc = enc.close()
 print(f"영상 {out} | {tot_frames}장, {tot_frames / 20:.0f} s | {REC.describe_size(out)} | ffmpeg {rc} {enc.error or ''}", flush=True)

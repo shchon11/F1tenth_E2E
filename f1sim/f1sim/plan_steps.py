@@ -162,3 +162,38 @@ def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, lim: Limits) 
     out["pts"] = torch.stack([out["x"][:, idx], out["y"][:, idx]], -1)
     out["pv"] = out["v"][:, idx]
     return out
+
+
+def shift_plan(p: Dict[str, torch.Tensor], k: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """The plan `k` (B,) whole steps on, as if drawn now from its pose there (11-09, agreed with the user: in training 20 %
+    of the plans are driven 0.2-0.4 s without a new one, so the policy cannot leave a plan's later steps a rough shape --
+    it re-plans every 0.1 s, only the first 0.1 s was ever driven, and the points 0.3 / 0.5 s on were 12 / 44 cm off where
+    the car went). The dense arrays move k SUB places on, in the frame of the pose at step k; past the plan's end the car
+    goes on at the last speed and yaw rate, the steering and the commands held. k = 0 is the plan itself."""
+    M = p["x"].shape[1]
+    dev = p["x"].device
+    h = DT / SUB
+    j = torch.arange(M, device=dev)[None, :] + (k.long() * SUB)[:, None]
+    jc = j.clamp(max=M - 1)
+    over = (j - (M - 1)).clamp(min=0).float() * h                    # [s] past the plan's end
+    g = lambda A: A.gather(1, jc)
+    v_e = p["v"][:, -1:]
+    r_e = (p["psi"][:, -1:] - p["psi"][:, -2:-1]) / h
+    hd = p["psi"][:, -1:] + 0.5 * r_e * over
+    x = g(p["x"]) + v_e * over * torch.cos(hd)
+    y = g(p["y"]) + v_e * over * torch.sin(hd)
+    psi = g(p["psi"]) + r_e * over
+    c, s = torch.cos(psi[:, :1]), torch.sin(psi[:, :1])
+    dx, dy = x - x[:, :1], y - y[:, :1]
+    out = dict(p)
+    out["x"], out["y"], out["psi"] = dx * c + dy * s, -dx * s + dy * c, psi - psi[:, :1]
+    out["v"], out["delta"] = g(p["v"]), g(p["delta"])
+    jc1 = jc[:, :M - 1].clamp(max=M - 2)
+    out["cmd_d"], out["cmd_v"] = p["cmd_d"].gather(1, jc1), p["cmd_v"].gather(1, jc1)
+    if "forced" in p:
+        jf = torch.arange(N_STEP, device=dev)[None, :] + k.long()[:, None]
+        out["forced"] = torch.where(jf < N_STEP, p["forced"].gather(1, jf.clamp(max=N_STEP - 1)), torch.zeros_like(p["forced"]))
+    idx = torch.arange(1, N_STEP + 1, device=dev) * SUB
+    out["pts"] = torch.stack([out["x"][:, idx], out["y"][:, idx]], -1)
+    out["pv"] = out["v"][:, idx]
+    return out
