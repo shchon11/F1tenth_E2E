@@ -278,8 +278,11 @@ class PlanRunner:
             self.last_mean = mean
             x, y, psi = plan_world(p, st)
             if self.follower is not None:
-                self.follower.set_plan(due, x[due], y[due], psi[due], p["v"][due], p["delta"][due],
-                                       *((p["cmd_d"][due], p["cmd_v"][due]) if self.v3 else ()))
+                # v3 too follows the plan's poses in time (11-09: its own commands sent as they are, plus a small feedback,
+                # hit the walls 5 / min -- the car is off the plan's model 37 cm in 1 s); its servo angle as the kinematic
+                # steering of the same turn, which the follower turns back into the car's through MAP's table
+                d_kin = self.turn3.eff(p["delta"], p["v"]) if self.v3 else p["delta"]
+                self.follower.set_plan(due, x[due], y[due], psi[due], p["v"][due], d_kin[due])
             idx = PT_IDX.to(self.device)
             self.obs.set_plan(torch.stack([x[:, idx], y[:, idx]], -1), p["pv"], due)
             if self.v2:

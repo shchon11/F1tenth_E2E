@@ -119,7 +119,8 @@ for kd in range(n_dec):
         pc = pr.plan_cost(x, y, psi, p["v"])
         cur_pts = torch.stack([x[:, PT_IDX.to(dev)], y[:, PT_IDX.to(dev)]], -1)
         if follower is not None:
-            follower.set_plan(slice(None), x, y, psi, p["v"], p["delta"], *((p["cmd_d"], p["cmd_v"]) if V3 else ()))
+            # v3: the plan's poses in time too, its servo angle as the kinematic steering of the same turn (11-09)
+            follower.set_plan(slice(None), x, y, psi, p["v"], turn3.eff(p["delta"], p["v"]) if V3 else p["delta"])
     plans.append(torch.stack([x[:, ::PS.SUB], y[:, ::PS.SUB]], -1)); poses.append(st[:, :3].clone())
     if mode == "map":
         k_, v_ = plan_segments3(p, lim, turn3) if V3 else plan_segments(p, lim); kk[lid] = k_; vv[lid] = v_; env.ext_plan_kv = (kk, vv)
