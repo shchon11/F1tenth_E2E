@@ -14,10 +14,10 @@ delay and those lags (the nominal car), integrated every 5 ms, the poses by the 
                     the tyres hold at the step's start speed (MAP's table), spread over that range as v2's steering is
                     (11-09: as a_turn x the grip, mean-reverting to straight, an untrained policy drove into the corners'
                     walls 40x as often as v2 and learned to stand still)
-  speed command     the speed at the step's start + a_speed x DV_CMD (1.5 m/s: through the speed loop's lag that is the
-                    motor's full drive and the brakes' full stop), inside [-V_REV, V_FWD]. Relative, as v2's: an untrained
-                    policy holds its speed (11-09: spread over [-2, 10] its mean was 'go 4 m/s straight', the cars ran into
-                    the walls and could not back out -- 95 % of the plans hit for 23 updates)
+  speed command     the last speed command - a_brake x 0.1 s ... + a_max x 0.1 s (reversed when backing), inside [-V_REV,
+                    V_FWD], spread over that range: v2's speed step on the COMMAND (11-09: from scratch every v3 form
+                    learned to stand still -- the lagging car crashed while learning to drive; with v2's step sizes on
+                    the commands a v2 policy's outputs mean the same commands, and v3 starts from it)
 
 The plan starts from the car's state: its speed, its servo angle (the previous plan's, carried: nothing measures it) and
 the last command sent, which is still the one in effect for the first 15 ms. The commands per control step (`cmd_d`,
@@ -152,7 +152,10 @@ def roll(action: torch.Tensor, v0: torch.Tensor, d0: torch.Tensor, c_prev: torch
     X, Y, P, V, D, CD, CV = [x], [y], [psi], [v], [d], [], []
     dd = lim.sv_max * DT
     for k in range(N_STEP):
-        cv = (v + a_speed[:, k] * DV_CMD).clamp(-V_REV, V_FWD)      # the step's speed command
+        fwd = prev_v >= 0
+        v_lo = torch.where(fwd, prev_v - lim.a_brake * DT, prev_v - lim.a_acc * DT).clamp(min=-V_REV)
+        v_hi = torch.where(fwd, prev_v + lim.a_acc * DT, prev_v + lim.a_brake * DT).clamp(max=V_FWD)
+        cv = v_lo + (a_speed[:, k] + 1.0) * 0.5 * (v_hi - v_lo)      # the step's speed command
         g = grip_steer(v, lim, turn)
         lo = torch.maximum(prev_d - dd, -g); hi = torch.minimum(prev_d + dd, g)
         bad = lo > hi                                     # the last command is past the grip now: unwind to its edge

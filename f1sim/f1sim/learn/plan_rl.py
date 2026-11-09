@@ -120,6 +120,9 @@ def main(argv=None):
                     help="v2 (11-08): raw sensors only, the plan starts from the policy's own speed estimate")
     ap.add_argument("--vest-coef", type=float, default=1.0, help="v2: weight of the speed estimate's loss [per (m/s)^2]")
     ap.add_argument("--save-every", type=int, default=25)
+    ap.add_argument("--init", default="", help="v3: start the actor from this v2 checkpoint (its 36 inputs + the servo angle at 0), "
+                    "the critic's scan encoder too")
+    ap.add_argument("--actor-freeze", type=int, default=0, help="updates in which only the critic learns (a started actor)")
     ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
     ap.add_argument("--seed", type=int, default=1)
@@ -145,7 +148,21 @@ def main(argv=None):
     priv_dim = int(obs.priv().shape[1])
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else (Actor2 if v2 else Actor)(obs.beams, std0=args.std0)).to(dev)
     critic = Critic(obs.beams, priv_dim, state_dim=int(obs.state().shape[1])).to(dev)
-    opt = torch.optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=args.lr, eps=1e-5)
+    if args.init:
+        # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
+        # commands take v2's step sizes, so a v2 policy's outputs mean the same commands -- start from one, RL on from there
+        ck0 = torch.load(args.init, map_location=dev, weights_only=False)
+        sd = dict(ck0["actor"])
+        w = sd["trunk.0.weight"]
+        sd["trunk.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], actor.trunk[0].in_features - w.shape[1], device=w.device)], 1)
+        for k_, fill in (("norm.mean", 0.0), ("norm.var", 1.0)):
+            v_ = sd[k_]
+            sd[k_] = torch.cat([v_, torch.full((actor.norm.mean.numel() - v_.numel(),), fill, device=v_.device)])
+        actor.load_state_dict(sd)
+        enc = {k_[4:]: v_ for k_, v_ in ck0["critic"].items() if k_.startswith("enc.")}
+        critic.enc.load_state_dict(enc)
+        print(f"[plan_rl] actor from {args.init} (update {ck0.get('update')}), critic's scan encoder too", flush=True)
+    opt = torch.optim.Adam([{"params": list(actor.parameters())}, {"params": list(critic.parameters())}], lr=args.lr, eps=1e-5)
     json.dump({"args": vars(args), "world": vars(world), "priv_dim": priv_dim, "beams": obs.beams},
               open(os.path.join(run, "args.json"), "w"), indent=1, default=str)
     print(f"[plan_rl] {args.name}: 환경 {env.B} (학습 차 {Bl}), 결정 0.1 s, 롤아웃 {args.horizon}결정, LiDAR {obs.beams}빔 x {3}장, "
@@ -157,6 +174,8 @@ def main(argv=None):
         frac = (upd - 1) / max(1, args.updates - 1)
         for gp in opt.param_groups:
             gp["lr"] = args.lr + (args.lr_end - args.lr) * frac
+        if upd <= args.actor_freeze:
+            opt.param_groups[0]["lr"] = 0.0                    # the critic catches up with a started actor first
         S, X, PV, U, LP, V, R, D, VT = [], [], [], [], [], [], [], [], []
         vest_err = []
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
