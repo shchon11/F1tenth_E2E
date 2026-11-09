@@ -3050,12 +3050,18 @@ class F1VecEnv:
                 v_rev = -float(self.ecfg.reverse_speed) * (-(a[:, 1] + 1.0) / ext)
                 v_cmd = torch.where(a[:, 1] < -1.0, v_rev, v_cmd)
             cmd = torch.stack([a[:, 0] * self.s_max, v_cmd], 1)
-        elif self._all_external:
+        elif self._all_external or len(self._ext_ids) >= self.B:
             # Every car is driven by an external driver whose command replaces this one below, so
             # nothing reads the tracker's answer and it is not solved: a baseline alone in the console
-            # paid ~5 ms a step for a plan nobody drove (2026-10-19, "simtime이 왜이리 느리지").
+            # paid ~5 ms a step for a plan nobody drove (2026-10-19, "simtime이 왜이리 느리지"). Also every car
+            # on an external command (`ext_mask`): a plan policy alone in the console with its own follower
+            # (`plan_policy.PlanRunner` "track") paid 24 ms of a 39 ms step for MAP's answer (11-09, the user:
+            # "simtime 왜이렇게 느려?"); that runner hands the viewers its plan itself.
             cmd = torch.zeros(self.B, 2, device=self.device)
             self.last_cmd_raw = cmd
+            if int(self.ecfg.decision_every) > 1:
+                # the decision clock still runs: a plan policy decides on it every `decision_every` steps (PlanRunner)
+                self._dec_cnt += 1
         else:                                                  # plan -> (steer, speed) through the tracker
             lr = self.last_result
             v_meas = self._tracker_plan_speed()
