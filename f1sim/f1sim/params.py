@@ -65,7 +65,13 @@ class VehicleParams:
     sv_max: float = 3.2        # [rad/s] max steering rate (servo)
     v_max: float = 12.0        # [m/s]
     v_min: float = -3.0        # [m/s] reverse limit
-    a_max: float = 5.6         # [m/s^2] motor accel limit (VESC current limit); traction limit applies on top.
+    a_max: float = 5.0         # [m/s^2] motor accel limit (VESC current limit); traction limit applies on top.
+                               # 11-09 re-measured from scratch on the competition recordings: whenever the
+                               # motor current sat at its limit (>= 55 A), the car accelerated (median of the
+                               # wheel ERPM and the IMU) 4.8-5.2 m/s^2 at 1-6 m/s, 4.3-4.5 at 6-8, 4.0-4.3 at
+                               # 8-9 -- 5.0 flat to v_switch 7.0 is the closest fit of this form (the 5.6 / 6.0
+                               # below asked 8-20 % more than the car gave at 2-6 m/s).
+                               # docs/research/sim2real-2026-11-09/README.md
                                # 5.6 / v_switch 6.0 is the p90 envelope of every current-limited 200 ms
                                # window in the recordings (docs/research/sim2real-audit-2026-09-21.md
                                # section 4.1); no window exceeds 5.9. It was 7.0 / 7.319.
@@ -81,7 +87,7 @@ class VehicleParams:
                                # speed twice as fast as the real car can.
                                # (-9.2 and -10.6 also appear in the recordings, but the motor
                                # current is *positive* at those instants: they are impacts.)
-    v_switch: float = 6.0      # [m/s] above this, accel scales with v_switch/v (power limit)
+    v_switch: float = 7.0      # [m/s] above this, accel scales with v_switch/v (power limit); 6.0 before 11-09
     # ---- rear axle as a rotating body (2026-09-13) ----------------------------------------
     # `wheel_model` off reproduces the model that was here before: rear longitudinal force set
     # straight from the commanded acceleration, wheel speed == body speed, so the wheel can neither
@@ -212,10 +218,13 @@ class VehicleParams:
 @dataclass
 class ActuatorParams:
     # Steering servo: first-order lag + rate limit + angle bias
-    servo_tau: float = 0.08        # [s] time constant. 0.08 minimises the yaw-rate error of the
-                                   # recordings' replay (0.04: 0.282, 0.08: 0.241, 0.12: 0.254 rad/s);
-                                   # the 09-21 audit's 0.12 came from delay alone, before the tyres
-                                   # were fitted. It was 0.04.
+    servo_tau: float = 0.04        # [s] time constant. 11-09, re-measured from scratch (the VESC's own
+                                   # commands replayed through this physics, 3200 one-second windows of the
+                                   # competition recordings, docs/research/sim2real-2026-11-09): the
+                                   # yaw-rate error has a valley along cmd_delay + servo_tau ~ 0.065-0.08 s
+                                   # (0.03 + 0.04: 0.254 rad/s on the held-out bags, against 0.286 for the
+                                   # 0.015 + 0.08 here before, which turned 30 % late); the split between the
+                                   # two is not pinned by the recordings. Was 0.08 (and 0.04 before that).
     steer_bias: float = 0.0        # [rad] mechanical trim error (randomized)
     steer_gain: float = 1.0        # command scaling error
     # VESC speed loop: first-order tracking of commanded speed via PID-like accel
@@ -239,7 +248,11 @@ class ActuatorParams:
                                    # the +63 A peak in the recordings comes out as 10.5 m/s^2, above
                                    # the sustained a_max of 7 as a launch transient should be.
     # Command latency (sensor -> policy -> actuator), applied as delay buffer on commands
-    cmd_delay: float = 0.015       # [s] LiDAR -> policy -> VESC on the Jetson. Calibrated against the
+    cmd_delay: float = 0.03        # [s] LiDAR -> policy -> VESC on the Jetson. 11-09: the /drive -> VESC ->
+                                   # yaw response in the recordings fits 0.03-0.045 with the servo above;
+                                   # our own inference and scan transport come on top of it (not in the
+                                   # recordings: the urg driver stamps its scans itself). Was 0.015.
+                                   # Calibrated against the
                                    # *total* command-to-yaw lag, which is what a recording can show:
                                    # cross-correlating servo command with yaw rate peaks at 100 ms on
                                    # the car. That total also contains servo slew, tyre force build-up
@@ -622,12 +635,12 @@ class RandomizationConfig:
                                             # 0 is a clean floor, 2.5x the fitted rate is a bad one
         "imu.shock_accel": (0.7, 1.5),
         "vehicle.c_roll": (0.5, 2.0),
-        "actuator.servo_tau": (0.05, 0.11),     # around the replay-fitted 0.08 (was 0.02-0.06)
+        "actuator.servo_tau": (0.025, 0.07),    # around the replay-fitted 0.04 (11-09; was 0.05-0.11)
         "actuator.steer_bias": (-0.03, 0.03),
         "actuator.steer_gain": (0.92, 1.08),
         "actuator.motor_tau": (0.10, 0.30),
         "actuator.speed_gain": (0.92, 1.08),
-        "actuator.cmd_delay": (0.005, 0.03),
+        "actuator.cmd_delay": (0.02, 0.05),     # 11-09: 0.03 measured from /drive on, + our inference (was 0.005-0.03)
         "vehicle.roll_per_g": (0.6, 1.6),       # 1.0-2.75 deg/g around the measured 1.7
         "vehicle.pitch_per_g": (0.6, 1.4),      # 1.0-2.4 deg/g squat; 2x draws sat 2-4x above the recordings
         "vehicle.dive_per_g": (0.5, 2.0),       # 0.2-0.9 deg/g dive: measured ~0, kept open upward

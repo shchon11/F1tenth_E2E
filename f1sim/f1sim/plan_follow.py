@@ -16,7 +16,8 @@ what the inversion misses (a randomised car, tyre slip, contacts). Gains chosen 
 1 s (11-09, u1500, 64 cars x 40 s): (k_v, k_lat, k_head) 0,0,0 -> 23.1 cm at 1 s, 1,0,0 15.2, 1,.2,.2 14.5, 1,.5,.5 14.0,
 2,1,1 12.1 (MAP 46.2). The lateral gains barely change the closed-loop lap: the weave there is the policy re-planning
 every 0.1 s for an instant car, not this follower. The constants are the nominal car's, not the
-randomised ones: the real car's are not known to it either."""
+randomised ones: the real car's are not known to it either. 11-09: servo_tau 0.04 / delay 0.03, the nominal car
+re-measured on the recordings (docs/research/sim2real-2026-11-09)."""
 import math
 import torch
 
@@ -28,7 +29,7 @@ class PlanFollower:
     rows a new plan (the dense world-frame poses from `plan_policy.plan_world` and the plan's `v` / `delta`, (n_r, N SUB
     + 1)); `command(state)` is called once per control step and returns (n, 2), stepping each row's clock."""
 
-    def __init__(self, n: int, device, motor_tau: float = 0.20, servo_tau: float = 0.08, delay: float = 0.015,
+    def __init__(self, n: int, device, motor_tau: float = 0.20, servo_tau: float = 0.04, delay: float = 0.03,
                  k_v: float = 2.0, k_lat: float = 1.0, k_head: float = 1.0, s_max: float = 0.4189,
                  lut=None, grip: int = 0, wheelbase: float = 0.3302):
         self.n, self.device = n, device
