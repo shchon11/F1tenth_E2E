@@ -207,6 +207,10 @@ def main(argv=None):
     ap.add_argument("--memory", type=int, default=0,
                     help="v2: a GRU of this size in the actor (11-09, the user: \"A1\" -- adapt by remembering); 0 = none")
     ap.add_argument("--mem-chunk", type=int, default=32, help="the memory's update replays sequences of this many decisions")
+    ap.add_argument("--mem-front", action="store_true",
+                    help="with --memory: the memory before the trunk (`Actor2.mem_front`; 11-11, the user: \"앞쪽으로 가자\") -- the"
+                         " GRU reads the LiDAR encoding and the state, the trunk reads them plus the memory's state. From scratch,"
+                         " or continued from a run that had it")
     ap.add_argument("--plan-lat-margin", type=float, default=1.0,
                     help="the plans' tyre limit as this share of the steering table's highest steady-state lateral acceleration"
                          " (11-10, the user: \"ㅇㅋ\" to 0.95): at 1 the policy drove >= 95 %% of it 29 %% of the time, where the table's"
@@ -305,6 +309,8 @@ def main(argv=None):
     remover = SR.PropRemoval(env, rm_p, float(rm_s[0]), float(rm_s[1]), seed=args.seed) if rm_p > 0 else None
     if args.memory and (not v2 or v3):
         raise SystemExit("--memory needs --format v2")
+    if args.mem_front and not args.memory:
+        raise SystemExit("--mem-front needs --memory")
     aux_on = args.mem_aux > 0
     if aux_on and not args.memory:
         raise SystemExit("--mem-aux needs --memory")
@@ -312,7 +318,8 @@ def main(argv=None):
     AUXB = AUXK * len(PRIV_V2_PROP_KEYS)                            # the boxes' part of the read-out; the car's 5 follow
     aux_opp = aux_on and args.aux_opp > 0
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
-             Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0) if v2
+             Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
+                    mem_front=args.mem_front) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -329,6 +336,8 @@ def main(argv=None):
         # 11-09: every v3 run from scratch learned to stand still (the lagging car crashed while learning to drive); v3's
         # commands take v2's step sizes, so a v2 policy's outputs mean the same commands -- start from one, RL on from there
         ck0 = torch.load(args.init, map_location=dev, weights_only=False)
+        if bool((ck0.get("args") or {}).get("mem_front", False)) != bool(args.mem_front):
+            raise SystemExit("--init: the checkpoint's memory sits elsewhere (--mem-front differs); train from scratch")
         sd = dict(ck0["actor"])
         w = sd["trunk.0.weight"]
         sd["trunk.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], actor.trunk[0].in_features - w.shape[1], device=w.device)], 1)

@@ -36,6 +36,19 @@ def memory_rows(lines):
     return rows
 
 
+def wipe_rows(lines):
+    """lap_memory's summary line per checkpoint: {u: (lap time, contacts per lap) of memory kept - memory wiped every lap}"""
+    rows, cur = {}, None
+    for l in lines:
+        m = re.match(r"== u(\d+)", l)
+        if m:
+            cur = int(m.group(1)); continue
+        m = re.search(r"기억 그대로 - 지움: 바퀴 시간 ([+-][\d.]+) s, 접촉 ([+-][\d.]+)/바퀴", l)
+        if m and cur is not None:
+            rows[cur] = (float(m.group(1)), float(m.group(2)))
+    return rows
+
+
 def eval_rows(lines, want):
     """one condition (ideal / track / map) of plan_validate lines: {u: {case: (lap median, hard contacts /min)}}"""
     rows, cond = {}, None
@@ -78,15 +91,24 @@ if 0 in I and main:
     # the start evaluated under this run's own conditions (11-10: plan25n8 changed the plans' tyre limit -- the parent's row was
     # measured under the old one)
     main[0] = ("시작", I.pop(0), MEM.pop(0) if 0 in MEM else main[0][2])
-for u in sorted(set(I) | set(MEM)):
-    main.append((f"u{u}", I.get(u, {}), MEM.get(u)))
+WIPE = wipe_rows(read_lines(f"{D}/analysis/{run}_summary.log"))
+for u in sorted(set(I) | set(MEM) | set(WIPE)):
+    main.append((f"u{u}", I.get(u, {}), WIPE.get(u) if WIPE else MEM.get(u)))
 for u, t in sorted(eval_rows(read_lines(f"{D}/one_{run}.log"), "track").items()):
     sub.append((f"u{u}", t))
 print(f"**지금 학습 {run}** ({STAGE_NOTE.get(run, '')}{f', {p} u{cut}에서 이어 받음' if p else ''}) · 학습 조건(plan대로 정확히 실행), 학습 차 512대\n")
-print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억이 더 아는 것 (목표 +10 %p) |")
-print("|---|---|---|---|---|")
-for lab, q, mem in main:
-    print(f"| {lab} | {cells(q)} | {f'{mem:+d} %p' if mem is not None else '–'} |")
+if WIPE or p is None:
+    # 11-11 (the user agreed): the memory is judged by driving -- the same policy with its memory kept minus with its memory
+    # wiped at every lap (alone, boxes staying, laps 2 on; lap_memory.py). Negative = the memory helps
+    print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억을 지울 때와 비교 (−면 기억이 이득) |")
+    print("|---|---|---|---|---|")
+    for lab, q, mem in main:
+        print(f"| {lab} | {cells(q)} | {f'바퀴 {mem[0]:+.2f}초, 접촉 {mem[1]:+.2f}/바퀴' if isinstance(mem, tuple) else '–'} |")
+else:
+    print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억이 더 아는 것 (목표 +10 %p) |")
+    print("|---|---|---|---|---|")
+    for lab, q, mem in main:
+        print(f"| {lab} | {cells(q)} | {f'{mem:+d} %p' if mem is not None else '–'} |")
 if sub and "--sub" in sys.argv:          # the controller's tracking is analysed separately (11-10), not in the routine table
     print("\n참고 · 실제 차(물리 + 새 제어기), 100 update마다\n")
     print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 |")

@@ -373,31 +373,42 @@ class Actor2(nn.Module):
     shrunk to 0.17 and the policy never tried full throttle at the end of the straight).
     `aux_dim` > 0 (11-10, the user: "기억은 필요해 ... 사각지대에 장애물이 있어서 사고나는거"): a linear read-out of the memory's
     state, trained (plan_rl --mem-aux) to say where the boxes ahead are -- hidden ones too -- so the memory holds what it saw a
-    lap ago. It is a training aid only: driving never reads it."""
+    lap ago. It is a training aid only: driving never reads it.
+    `mem_front` (11-11, the user: "앞쪽으로 가자"): the memory sits BEFORE the trunk. The GRU reads the trunk's own inputs (the
+    LiDAR encoding and the normalised state -- the speed and steering it needs to carry what it saw forward) and the trunk
+    reads those inputs plus the memory's state, so two nonlinear layers mix what is remembered with what is seen now and
+    the reaction to what is in view does not have to pass through the memory. Why: added after the trunk, only a linear
+    layer followed the memory -- wiping it moved the plans 12-17 cm at 1 s, toward the hidden boxes, and laps were no
+    faster for it (plan25n8). No `mem_out`; such an actor is trained from scratch with its memory."""
 
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
-                 aux_dim: int = 0):
+                 aux_dim: int = 0, mem_front: bool = False):
         super().__init__()
         sd = STATE_DIM2 if state_dim is None else int(state_dim)
+        self.mem_front = bool(mem_front) and int(memory) > 0
         self.enc = ScanEncoder(beams)
         self.norm = RunningNorm(sd)
-        self.trunk = nn.Sequential(nn.Linear(256 + sd, hidden), nn.Tanh(), nn.Linear(hidden, hidden), nn.Tanh())
+        self.trunk = nn.Sequential(nn.Linear(256 + sd + (int(memory) if self.mem_front else 0), hidden), nn.Tanh(),
+                                   nn.Linear(hidden, hidden), nn.Tanh())
         self.pi = nn.Linear(hidden, PS.ACT_DIM)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias)
         self.v_est = nn.Linear(hidden, 1)
         self.log_std = nn.Parameter(torch.full((PS.ACT_DIM,), math.log(std0)))
         self.memory = int(memory)
         if self.memory:
-            self.gru = nn.GRUCell(hidden, self.memory)
-            self.mem_out = nn.Linear(self.memory, hidden)
-            nn.init.zeros_(self.mem_out.weight); nn.init.zeros_(self.mem_out.bias)
+            self.gru = nn.GRUCell(256 + sd if self.mem_front else hidden, self.memory)
+            if not self.mem_front:
+                self.mem_out = nn.Linear(self.memory, hidden)
+                nn.init.zeros_(self.mem_out.weight); nn.init.zeros_(self.mem_out.bias)
             if aux_dim:
                 self.aux = nn.Linear(self.memory, int(aux_dim))
         self.register_buffer("log_std_floor", torch.full((PS.ACT_DIM,), -math.inf), persistent=False)
         self.h_out = None
 
     def features(self, scans: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        return self.trunk(torch.cat([self.enc(scans), self.norm(state)], 1))
+        """what the memory reads: the trunk's output, or with `mem_front` the trunk's inputs (`remember` runs the trunk)"""
+        x = torch.cat([self.enc(scans), self.norm(state)], 1)
+        return x if self.mem_front else self.trunk(x)
 
     def heads(self, f: torch.Tensor):
         log_std = torch.maximum(self.log_std, self.log_std_floor)
@@ -407,6 +418,8 @@ class Actor2(nn.Module):
         """one decision of the memory: (features with the memory added, the new state)"""
         h0 = h if h is not None else torch.zeros(f.shape[0], self.memory, device=f.device, dtype=f.dtype)
         h1 = self.gru(f, h0)
+        if self.mem_front:
+            return self.trunk(torch.cat([f, h1], 1)), h1
         return f + self.mem_out(h1), h1
 
     def forward(self, scans: torch.Tensor, state: torch.Tensor, h: Optional[torch.Tensor] = None):
@@ -471,7 +484,8 @@ class PlanObs2(PlanObs):
 def load_actor2(ck: dict, device) -> Actor2:
     aux = ck["actor"].get("aux.weight")
     actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)),
-                   memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0).to(device)
+                   memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0,
+                   mem_front=bool(ck["args"].get("mem_front", False))).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor

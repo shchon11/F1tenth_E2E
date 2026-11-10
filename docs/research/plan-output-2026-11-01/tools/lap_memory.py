@@ -101,3 +101,18 @@ for title, sel in (("모든 상자 배치", None), ("'거시기한' 배치만", 
         es = f"{e[0]:.2f} s" if e else "–"
         print(f"  {k}번 바퀴 | {es} | {a[0]:.2f} s, {a[1]:.2f}({a[2]:.2f}) [{a[3]}대] | {n[0]:.2f} s, {n[1]:.2f}({n[2]:.2f}) [{n[3]}대] | "
               f"{a[0] - n[0]:+.2f} s, 접촉 {a[1] - n[1]:+.2f}", flush=True)
+
+# one line for the table (11-11, the user agreed: judge the memory by whether wiping it makes driving worse, not by what it
+# knows): the laps after the first (the memory has seen the layout once), all layouts pooled
+def pooled(D):
+    L = [x for k, v in D.items() if k >= 2 for x in v]
+    return (float(np.mean([x[1] for x in L])), float(np.mean([x[2] for x in L])), float(np.mean([x[3] for x in L])), len(L)) if len(L) >= 20 else None
+
+
+a, n = pooled(A), pooled(N)
+if a and n:
+    print(f"요약 2번 바퀴부터(혼자, 상자 계속): 기억 그대로 평균 {a[0]:.2f} s 접촉 {a[1]:.2f}/바퀴(세게 {a[2]:.2f}) [{a[3]}바퀴] | 바퀴마다 지움 "
+          f"{n[0]:.2f} s 접촉 {n[1]:.2f}/바퀴(세게 {n[2]:.2f}) [{n[3]}바퀴] | 기억 그대로 - 지움: 바퀴 시간 {a[0] - n[0]:+.2f} s, "
+          f"접촉 {a[1] - n[1]:+.2f}/바퀴", flush=True)
+else:
+    print("요약 2번 바퀴부터: 바퀴가 모자람(20바퀴 미만)", flush=True)
