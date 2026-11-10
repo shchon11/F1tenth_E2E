@@ -210,6 +210,15 @@ def main(argv=None):
     ap.add_argument("--box-range", type=float, default=0.0,
                     help="> 0: the boxes ahead -- the critic's box block and --mem-aux's target -- counted ALONG THE TRACK within this many"
                          " metres (`track_boxes`) instead of the straight-line 12 m that also lists boxes behind a wall (11-10). 0 = as before")
+    ap.add_argument("--smooth-reg", type=float, default=0.0,
+                    help="with --memory: the weight of a cost on the plans' zigzag (11-10, the user approved a small cost on the"
+                         " executed first step's steering change between decisions: the car wobbled more and more in the console, the"
+                         " plans' first-step steering reversed every ~8th decision, 14 %% at u300, and the tyre table near the limit made"
+                         " that 3-4x). On the policy's mean, along each replayed sequence: the change of the first step's steering"
+                         " action between consecutive decisions (a reversal of the steering rate, not the rate itself, so a steady"
+                         " turn-in costs nothing), in lateral-jerk units v^2 ds/L (ds = the servo's 0.1 s range), over 4 m/s^2, squared."
+                         " Not in the reward: there the exploration noise's own reversals were twice the policy's and would pull the"
+                         " noise down. 0 = off")
     ap.add_argument("--aux-opp", type=float, default=0.0,
                     help="> 0, with --mem-aux: the memory's side task also says where the nearest other car is along the track"
                          " (-3 .. this many m) and how fast it closes (`track_opp`; 11-10). 0 = boxes only")
@@ -504,7 +513,7 @@ def main(argv=None):
 
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
-        als, aac, aac_far, alo = [], [], [], []
+        als, aac, aac_far, alo, sms = [], [], [], [], []
         aux_box = {}
         if tailc:
             bV0, bD0, bST0 = torch.cat(V0), torch.cat(D0), torch.cat(ST0)
@@ -575,6 +584,17 @@ def main(argv=None):
                         far = far & (ta[:, 0, 3] * 5.0 > 4.0)          # the nearest box 4-12 m away: mostly not yet seen up close
                         if bool(far.any()):
                             aac_far.append(float((pa[far, 0, 0] > 0).float().mean()))
+                if args.smooth_reg > 0 and args.memory:
+                    Ls_, ns_ = sel.shape
+                    m0 = torch.tanh(mean[:, 0]).view(Ls_, ns_)
+                    vv = bVT[mb].view(Ls_, ns_)
+                    ok_s = 1.0 - bD[sel[:-1]]                       # no pair across a restart
+                    jerk = vv[1:].pow(2) * (lim.sv_max * PS.DT) / lim.wheelbase * (m0[1:] - m0[:-1]) / 4.0
+                    # Huber (11-10 test: squared, the mean was 5.7-7.6 -- reversals of ~0.2 in the action at 5-7 m/s -- and the
+                    # first update's KL 0.20): linear past 4 m/s^2 so a few large reversals do not outweigh the policy's own loss
+                    ls_ = (nn.functional.smooth_l1_loss(jerk, torch.zeros_like(jerk), reduction="none") * ok_s).sum() / ok_s.sum().clamp_min(1.0)
+                    loss = loss + args.smooth_reg * ls_
+                    sms.append(float(ls_.detach()))
                 opt.zero_grad(set_to_none=True); loss.backward()
                 nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad)
                 opt.step()
@@ -598,7 +618,8 @@ def main(argv=None):
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()],
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
                "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
-               "aux_opp_loss": (sum(alo) / len(alo)) if alo else None}
+               "aux_opp_loss": (sum(alo) / len(alo)) if alo else None,
+               "smooth_loss": (sum(sms) / len(sms)) if sms else None}
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % | 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
@@ -610,6 +631,7 @@ def main(argv=None):
               + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "
                  f"{(row['aux_far_recall'] or 0) * 100:.0f} % | " if row.get("aux_loss") is not None else "")
               + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")
+              + (f"지그재그 비용 {row['smooth_loss']:.3f} | " if row.get("smooth_loss") is not None else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, 다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm | " if row.get("tail_loss") is not None else "")
               + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:

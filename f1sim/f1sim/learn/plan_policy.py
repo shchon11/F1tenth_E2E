@@ -12,6 +12,7 @@ The action: 20 numbers, `plan_steps` (each 0.1 s step's turn and speed, spread o
 outputs the mean of a Gaussian in an unbounded space and the action is its tanh (so the whole output range maps to
 distinct plans and the gradient never meets a clamp)."""
 import math
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -246,8 +247,15 @@ class PlanRunner:
         self.follower = None
         if mode == "track":
             from ..plan_follow import PlanFollower
-            self.follower = PlanFollower(Bl, device, s_max=float(env.s_max), lut=env.tracker.map.lut,
-                                         grip=M.GRIP_LEVELS.index(1.0), wheelbase=self.lim.wheelbase)
+            # diagnosis knobs (11-10, the user: the car wobbles more and more in the console): F1SIM_TRACK_GAINS="k_v,k_lat,k_head",
+            # F1SIM_TRACK_SERVO_TAU (the servo-lag lead; 0 = none), F1SIM_TRACK_NOLUT=1 (the plan's own steering, no table)
+            _g = [float(v) for v in os.environ.get("F1SIM_TRACK_GAINS", "2.0,1.0,1.0").split(",")]
+            _kw = {"servo_tau": float(os.environ["F1SIM_TRACK_SERVO_TAU"])} if os.environ.get("F1SIM_TRACK_SERVO_TAU") else {}
+            self.follower = PlanFollower(Bl, device, s_max=float(env.s_max),
+                                         lut=None if os.environ.get("F1SIM_TRACK_NOLUT") == "1" else env.tracker.map.lut,
+                                         grip=M.GRIP_LEVELS.index(1.0), wheelbase=self.lim.wheelbase,
+                                         k_v=_g[0], k_lat=_g[1], k_head=_g[2],
+                                         ff_window=float(os.environ.get("F1SIM_TRACK_FFWIN", "0")), **_kw)
             env.ext_mask[self.lid] = True
             env._ext_ids.update(int(i) for i in self.lid.tolist())
 

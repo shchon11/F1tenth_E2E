@@ -31,7 +31,7 @@ class PlanFollower:
 
     def __init__(self, n: int, device, motor_tau: float = 0.20, servo_tau: float = 0.04, delay: float = 0.03,
                  k_v: float = 2.0, k_lat: float = 1.0, k_head: float = 1.0, s_max: float = 0.4189,
-                 lut=None, grip: int = 0, wheelbase: float = 0.3302):
+                 lut=None, grip: int = 0, wheelbase: float = 0.3302, ff_window: float = 0.0):
         self.n, self.device = n, device
         self.h = PS.DT / PS.SUB
         self.motor_tau, self.servo_tau, self.delay = motor_tau, servo_tau, delay
@@ -39,6 +39,12 @@ class PlanFollower:
         # MAP's steering table (11-09): the plan's steering is the kinematic bicycle's; the car understeers (at 7 m/s it
         # turns 30 % of that), so the feedforward is the table's steering for the plan's curvature, as MAP's is
         self.lut, self.grip, self.L = lut, grip, wheelbase
+        # 11-10 (the user: the car wobbles more and more, "제어기좀 똑바로 만들어라"): the table is steep near the tyres' limit, so
+        # its input taken from the plan's instant (each new plan's small jitter) came out several times larger -- 4.3 deg per
+        # 0.1 s of steering against 0.84 for the plan driven exactly, 1.1 with the table off (u300). ff_window > 0: the
+        # table reads the plan's MEAN lateral-acceleration demand over [effect time, + ff_window] (the smooth part), no lead
+        # term on its output (the window already looks ahead); the feedback takes up the rest
+        self.ff_window = float(ff_window)
         m = PS.N_STEP * PS.SUB + 1
         z = lambda: torch.zeros(n, m, device=device)
         self.X, self.Y, self.PSI, self.V, self.D = z(), z(), z(), z(), z()
@@ -67,6 +73,12 @@ class PlanFollower:
         past = f >= float(last)                                        # beyond the plan's end: hold, no rate
         return val, torch.where(past, torch.zeros_like(slope), slope)
 
+    def _mean_on(self, A: torch.Tensor, f0: torch.Tensor, n_w: int) -> torch.Tensor:
+        """each row's mean of the dense profile A over grid indices f0 .. f0 + n_w (clamped to the plan)"""
+        last = A.shape[1] - 1
+        idx = (f0.round().long()[:, None] + torch.arange(n_w + 1, device=A.device)[None, :]).clamp(0, last)
+        return A.gather(1, idx).mean(1)
+
     def _table_steer(self, d_kin: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """the steering the car needs for the curvature the kinematic steering d_kin means, at speed v (MAP's table;
         below 0.5 m/s, the table's first column, the kinematic one)"""
@@ -82,7 +94,15 @@ class PlanFollower:
         f_lead = kf + (self.delay + 0.5 * self.h) / self.h
         v_ff, a_ff = self._at(self.V, f_lead)
         d_ff, w_ff = self._at(self.D, f_lead)
-        if self.lut is not None:
+        if self.lut is not None and self.ff_window > 0:
+            n_w = max(1, int(round(self.ff_window / self.h)))
+            acc_m = self._mean_on(self.V * self.V * torch.tan(self.D) / self.L, f_lead, n_w)
+            v_m = self._mean_on(self.V, f_lead, n_w)
+            g = torch.full_like(v_m, self.grip, dtype=torch.long)
+            d_t = self.lut.lookup(acc_m, v_m.abs().clamp_min(0.5), g, interp="linear")
+            d_ff = torch.where(v_m.abs() < 0.5, d_ff, torch.nan_to_num(d_t, nan=0.0)).clamp(-self.s_max, self.s_max)
+            w_ff = torch.zeros_like(d_ff)
+        elif self.lut is not None:
             d_ff, w_ff = self._table_steer(d_ff, v_ff), (self._table_steer(d_ff + w_ff * self.h, v_ff + a_ff * self.h)
                                                        - self._table_steer(d_ff, v_ff)) / self.h
         # the error to where the plan is now, in the plan's frame

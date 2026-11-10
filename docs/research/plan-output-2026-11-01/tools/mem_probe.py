@@ -150,14 +150,29 @@ ax.set_xlabel("치운 때부터 [s] (점선 = 치운 순간)"); ax.set_ylabel("�
 note(ax, "점선 뒤에 빨강이 회색보다 빨리, 높이 오르면 기억이 '치워졌다'를 알아차리는 것")
 # C: does the memory change the driving?
 ax = axs[1, 0]
-means = {}
+
+
+def ma_(y, n=10):
+    """the 1 s running mean (10 decisions), centred, NaN-safe (11-10, the user: \"C 좀 smoothing해서 좀 그려봐\")"""
+    v = np.where(np.isfinite(y), y, 0.0); w = np.isfinite(y).astype(float); k = np.ones(n)
+    num, den = np.convolve(v, k, "same"), np.convolve(w, k, "same")
+    return np.where(den > 0, num / np.maximum(den, 1e-9), np.nan)
+
+
+means, c_series = {}, {}
 for c_ in (0, 1, 2):
     m = valid & (cond[None, :] == c_)
     y6 = np.array([np.mean(np.abs(SP[t] - SP0[t])[m[t]]) if m[t].any() else np.nan for t in range(T)])
     means[c_] = float(np.nanmean(y6))
-    ax.plot(t_s, smooth_(y6) if False else y6, color=cols[c_], lw=1, label=f"{names[c_]} (평균 {means[c_]:.3f})")
+    c_series[c_] = y6
+    ax.plot(t_s, y6, color=cols[c_], lw=0.6, alpha=0.3)
+    ax.plot(t_s, ma_(y6), color=cols[c_], lw=2.2, label=f"{names[c_]} (평균 {means[c_]:.3f})")
+try:                                                        # the C panel's series, to redraw it in a second (11-10)
+    np.savez(os.path.splitext(sys.argv[2])[0] + "_C.npz", t=t_s, **{f"c{k}": v for k, v in c_series.items()})
+except Exception:
+    pass
 ax.axvline(T_RM, color="k", lw=1, ls="--")
-ax.set_title("C. 기억이 운전을 바꾸나? -- 기억을 지웠을 때 첫 단계 속도 출력(-1..1)이 바뀌는 크기", fontsize=11)
+ax.set_title("C. 기억이 운전을 바꾸나? -- 기억을 지웠을 때 첫 단계 속도 출력(-1..1)이 바뀌는 크기 (굵은 선 = 1초 평균)", fontsize=11)
 ax.set_xlabel("시간 [s] (점선 = 치운 순간)"); ax.set_ylabel("|바뀐 크기|"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
 note(ax, "0이면 기억을 운전에 안 씀. 클수록 기억이 운전을 바꿈(0.1 = 최대 가속 대비 5 %). 색끼리 다르면 상황에 따라 다르게 씀")
 # D: the memory's values for one car whose boxes were taken away
