@@ -10,7 +10,7 @@
 # (v5) 빠른 평가를 100 update 평가의 새 제어기 조건과 같은 크기(환경 256, 학습 차 128대)로 -- 128 환경은 빈 트랙 차가 3대뿐이라
 # 벽 한 번이 0.5/분으로 잡혀 시작 행과 비교가 안 됐음(u25: 세게 0.97 vs 시작 0.50). 결과: out/analysis/, 요약 out/analysis/NAME_summary.log
 # (v8, 11-11 사용자 동의: 기억의 판정은 "기억을 지우면 운전이 나빠지는가") 기억 들여다보기(mem_probe: 기억이 뭘 아는가) 대신
-# lap_memory(혼자·상자 계속, 기억 그대로 / 바퀴마다 지움, 환경 512 x 60 s) -> 요약 줄이 표의 다섯째 칸. 표의 평가를 먼저 돌림.
+# lap_memory(혼자·상자 계속, 기억 그대로 / 바퀴마다 지움, 환경 256 x 60 s: 512는 5060에서 약 30분이라 checkpoint 간격 50분에 안 맞음) -> 요약 줄이 표의 다섯째 칸. 표의 평가를 먼저 돌림.
 # 인자: 이름 시작 간격 끝 [추이 그림 시작 run]
 NAME=$1; U0=$2; STEP=$3; U1=$4; ROOT=${5:-$1}
 D=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out
@@ -33,7 +33,7 @@ for UU in $(seq $U0 $STEP $U1); do
   python3 $T/trend_plot.py $NAME $A/${NAME}_trend.png --chain $ROOT > /dev/null 2>&1
   cp $A/${NAME}_trend.png $A/${NAME}_u${UU}_trend.png
   CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 $T/plan_validate.py $C ideal 1024 40 "  u${UU} " 2>&1 | grep "^  u${UU}" >> $D/one_${NAME}_i.log
-  CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 -u $T/lap_memory.py $C 512 60 > $A/${NAME}_u${UU}_lapmem.log 2>&1; grep "^요약" $A/${NAME}_u${UU}_lapmem.log >> $L
+  CUDA_VISIBLE_DEVICES=1 $S timeout 2400 python3 -u $T/lap_memory.py $C 256 60 > $A/${NAME}_u${UU}_lapmem.log 2>&1; grep "^요약" $A/${NAME}_u${UU}_lapmem.log >> $L
   if [ $((UU % 100)) -eq 0 ]; then CUDA_VISIBLE_DEVICES=1 $S timeout 1200 python3 -u $T/accel_usage.py $C 64 60 2>&1 | grep "올릴 때\|회전이 막지\|내릴 때" >> $L; fi
   if [ $((UU % 100)) -eq 0 ]; then CUDA_VISIBLE_DEVICES=1 $S timeout 1200 python3 -u $T/line_mintime.py $C 64 2>&1 | grep "실제 바퀴\|plan 모델 한계" >> $L; fi
   CUDA_VISIBLE_DEVICES=1 $S timeout 1200 python3 -u $T/line_compare.py $C ideal 32 40 $A/${NAME}_u${UU}_line.png 2>&1 | grep "png" >> $L
