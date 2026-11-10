@@ -72,6 +72,9 @@ name = f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)
 E, tid_e = run(False, False)
 A, tid = run(True, False)
 N, _ = run(True, True)
+# the control (11-11): wiping on the EMPTY track -- if that slows the car too, the wipe disturbs the driving itself (the memory
+# carries more than the layout) and the boxes' difference is not layout memory
+EN, _ = run(False, True)
 # the empty track's lap per track (laps 1..)
 emp = {}
 for k, L in E.items():
@@ -110,9 +113,12 @@ def pooled(D):
 
 
 a, n = pooled(A), pooled(N)
+e, en = pooled(E), pooled(EN)
 if a and n:
     print(f"요약 2번 바퀴부터(혼자, 상자 계속): 기억 그대로 평균 {a[0]:.2f} s 접촉 {a[1]:.2f}/바퀴(세게 {a[2]:.2f}) [{a[3]}바퀴] | 바퀴마다 지움 "
           f"{n[0]:.2f} s 접촉 {n[1]:.2f}/바퀴(세게 {n[2]:.2f}) [{n[3]}바퀴] | 기억 그대로 - 지움: 바퀴 시간 {a[0] - n[0]:+.2f} s, "
-          f"접촉 {a[1] - n[1]:+.2f}/바퀴", flush=True)
+          f"접촉 {a[1] - n[1]:+.2f}/바퀴"
+          + (f" | 빈 트랙에서 같은 비교: 바퀴 시간 {e[0] - en[0]:+.2f} s, 접촉 {e[1] - en[1]:+.2f}/바퀴 [{e[3]}/{en[3]}바퀴]" if e and en else ""),
+          flush=True)
 else:
     print("요약 2번 바퀴부터: 바퀴가 모자람(20바퀴 미만)", flush=True)

@@ -45,7 +45,8 @@ def wipe_rows(lines):
             cur = int(m.group(1)); continue
         m = re.search(r"기억 그대로 - 지움: 바퀴 시간 ([+-][\d.]+) s, 접촉 ([+-][\d.]+)/바퀴", l)
         if m and cur is not None:
-            rows[cur] = (float(m.group(1)), float(m.group(2)))
+            e = re.search(r"빈 트랙에서 같은 비교: 바퀴 시간 ([+-][\d.]+) s", l)   # the control (11-11): the wipe on the empty track
+            rows[cur] = (float(m.group(1)), float(m.group(2)), float(e.group(1)) if e else None)
     return rows
 
 
@@ -92,6 +93,7 @@ if 0 in I and main:
     # measured under the old one)
     main[0] = ("시작", I.pop(0), MEM.pop(0) if 0 in MEM else main[0][2])
 WIPE = wipe_rows(read_lines(f"{D}/analysis/{run}_summary.log"))
+WIPE.update(wipe_rows(read_lines(f"{D}/analysis/{run}_summary_fix.log")))      # re-measured rows
 for u in sorted(set(I) | set(MEM) | set(WIPE)):
     main.append((f"u{u}", I.get(u, {}), WIPE.get(u) if WIPE else MEM.get(u)))
 for u, t in sorted(eval_rows(read_lines(f"{D}/one_{run}.log"), "track").items()):
@@ -103,7 +105,7 @@ if WIPE or p is None:
     print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억을 지울 때와 비교 (−면 기억이 이득) |")
     print("|---|---|---|---|---|")
     for lab, q, mem in main:
-        print(f"| {lab} | {cells(q)} | {f'바퀴 {mem[0]:+.2f}초, 접촉 {mem[1]:+.2f}/바퀴' if isinstance(mem, tuple) else '–'} |")
+        print(f"| {lab} | {cells(q)} | {(f'바퀴 {mem[0]:+.2f}초, 접촉 {mem[1]:+.2f}/바퀴' + (f' (빈 트랙에서 {mem[2]:+.2f}초)' if mem[2] is not None else '')) if isinstance(mem, tuple) else '–'} |")
 else:
     print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억이 더 아는 것 (목표 +10 %p) |")
     print("|---|---|---|---|---|")
