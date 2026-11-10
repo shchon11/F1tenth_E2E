@@ -255,7 +255,18 @@ class PlanRunner:
                                          lut=None if os.environ.get("F1SIM_TRACK_NOLUT") == "1" else env.tracker.map.lut,
                                          grip=M.GRIP_LEVELS.index(1.0), wheelbase=self.lim.wheelbase,
                                          k_v=_g[0], k_lat=_g[1], k_head=_g[2],
-                                         ff_window=float(os.environ.get("F1SIM_TRACK_FFWIN", "0")), **_kw)
+                                         ff_window=float(os.environ.get("F1SIM_TRACK_FFWIN", "0")),
+                                         slow_tau=float(os.environ.get("F1SIM_TRACK_SLOWTAU", "0")),
+                                         k_yaw=float(os.environ.get("F1SIM_TRACK_KYAW", "0")), **_kw)
+            if os.environ.get("F1SIM_TRACK_MPC") == "1":
+                # 11-10 (the user: "제어기좀 똑바로 만들어라"): the model-predictive follower (`plan_mpc.PlanMPC`); weights
+                # F1SIM_MPC_W="w_lat,w_head,w_rate,w_yaw", horizon F1SIM_MPC_H, device F1SIM_MPC_DEV (cpu for one car)
+                from ..plan_mpc import PlanMPC
+                self.follower = PlanMPC(Bl, os.environ.get("F1SIM_MPC_DEV", str(device)), env.tracker.nominal,
+                                        s_max=float(env.s_max), k_v=_g[0], horizon=int(os.environ.get("F1SIM_MPC_H", "20")),
+                                        sub=int(os.environ.get("F1SIM_MPC_SUB", "4")),
+                                        **dict(zip(("w_lat", "w_head", "w_rate", "w_yaw"),
+                                                   [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")])))
             env.ext_mask[self.lid] = True
             env._ext_ids.update(int(i) for i in self.lid.tolist())
 
@@ -267,6 +278,8 @@ class PlanRunner:
         if bool(back.any()):
             self.obs.reset_rows(torch.nonzero(back)[:, 0])
             self.first |= back
+            if hasattr(self.follower, "reset_rows"):
+                self.follower.reset_rows(torch.nonzero(back)[:, 0])
         self.last_ep = ep.clone()
         j = env._dec_cnt[lid] % PS.SUB
         due = j == 0
@@ -318,8 +331,9 @@ class PlanRunner:
             # MAP for a car on its own follower, and MAP's reference is what the console drew the plan from (11-09)
             f = self.follower
             c, s_ = torch.cos(st_now[:, 2:3]), torch.sin(st_now[:, 2:3])
-            dx, dy = f.X - st_now[:, 0:1], f.Y - st_now[:, 1:2]
-            ref = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c, f.PSI - st_now[:, 2:3], f.V], -1)
+            _d = st_now.device                                      # the follower may keep its plan elsewhere (an MPC on the cpu)
+            dx, dy = f.X.to(_d) - st_now[:, 0:1], f.Y.to(_d) - st_now[:, 1:2]
+            ref = torch.stack([dx * c + dy * s_, -dx * s_ + dy * c, f.PSI.to(_d) - st_now[:, 2:3], f.V.to(_d)], -1)
             if env.ext_ref is None or env.ext_ref.shape[1:] != ref.shape[1:]:
                 env.ext_ref = torch.zeros(env.B, *ref.shape[1:], device=self.device)
             env.ext_ref[lid] = ref

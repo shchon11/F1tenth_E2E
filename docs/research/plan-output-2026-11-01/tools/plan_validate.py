@@ -63,7 +63,16 @@ if mode == "track":
     follower = PlanFollower(B, dev, k_v=_g[0], k_lat=_g[1], k_head=_g[2], s_max=float(env.s_max),
                             lut=None if os.environ.get("F1SIM_TRACK_NOLUT") == "1" else env.tracker.map.lut,
                             ff_window=float(os.environ.get("F1SIM_TRACK_FFWIN", "0")),
+                            slow_tau=float(os.environ.get("F1SIM_TRACK_SLOWTAU", "0")),
+                            k_yaw=float(os.environ.get("F1SIM_TRACK_KYAW", "0")),
                             grip=M.GRIP_LEVELS.index(1.0), wheelbase=float(env.tracker.nominal["lf"]) + float(env.tracker.nominal["lr"]))
+    if os.environ.get("F1SIM_TRACK_MPC") == "1":
+        from f1sim.plan_mpc import PlanMPC
+        _w = [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")]
+        follower = PlanMPC(B, os.environ.get("F1SIM_MPC_DEV", "cuda"), env.tracker.nominal, s_max=float(env.s_max), k_v=_g[0],
+                           horizon=int(os.environ.get("F1SIM_MPC_H", "20")), sub=int(os.environ.get("F1SIM_MPC_SUB", "4")),
+                           **dict(zip(("w_lat", "w_head", "w_rate", "w_yaw"), _w)))
+        tag = tag + f"(MPC 무게 옆 {_w[0]:g} 방향 {_w[1]:g} 조향 변화 {_w[2]:g} 요 {_w[3]:g}, {follower.H} 걸음) "
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
     tag = tag + f"(추종 이득 속도 {_g[0]:g} 옆 {_g[1]:g} 방향 {_g[2]:g}" + (f", 표 입력 {follower.ff_window:g} s 평균" if follower.ff_window > 0 else "") + ") "
 hold_err = {h: [] for h in range(1, PS.N_STEP + 1)}
@@ -94,6 +103,8 @@ cf0 = env.sim.contact_frame()[lid].float()
 t0 = time.time()
 n_dec = int(secs / PS.DT)
 plans, poses = [], []
+SDs, YRs = [], []                                          # the car's steering angle / yaw rate every control step (11-10)
+LIMR, TBS = [], []                                         # the plan's 0.1 s point: share of the tyre limit, the table's steering
 parts = {k: torch.zeros(B, device=dev) for k in ("lap", "shaping", "contact", "plan_hit")}
 stop = torch.zeros(B, device=dev); lap_t0 = torch.full((B,), float("nan"), device=dev); lap_times = [[] for _ in range(B)]
 for kd in range(n_dec):
@@ -119,6 +130,14 @@ for kd in range(n_dec):
             p = PS.roll(torch.tanh(mean), st[:, dyn.IVX], st[:, dyn.ISTEER], lim)
         x, y, psi = plan_world(p, st)
         pc = pr.plan_cost(x, y, psi, p["v"])
+        if V2 and not V3:
+            # 11-10: how close to the tyres' limit the plan drives (`plan_steps.Limits.kappa_at`: the table's highest
+            # steady-state lateral acceleration, i.e. at full lock) and the steering the car needs for it there (MAP's table)
+            _v1, _d1 = p["v"][:, PS.SUB], p["delta"][:, PS.SUB]
+            LIMR.append((torch.tan(_d1).abs() / lim.wheelbase / lim.kappa_at(_v1).clamp_min(1e-6)).float())
+            _acc = _v1 * _v1 * torch.tan(_d1) / lim.wheelbase
+            _tb = env.tracker.map.lut.lookup(_acc, _v1.abs().clamp_min(0.5), torch.full_like(_v1, M.GRIP_LEVELS.index(1.0), dtype=torch.long), interp="linear")
+            TBS.append(torch.rad2deg(torch.nan_to_num(_tb, nan=float(env.s_max)).abs()).float())
         cur_pts = torch.stack([x[:, PT_IDX.to(dev)], y[:, PT_IDX.to(dev)]], -1)
         if follower is not None:
             # v3: the plan's poses in time too, its servo angle as the kinematic steering of the same turn (11-09)
@@ -141,6 +160,7 @@ for kd in range(n_dec):
         if proc is not None:
             props_ever |= (proc.p_sid[env.sim.eid[lid]] >= 0).any(-1)
         pr.control_step((r.scan_type[lid] == HIT_CAR).any(1))
+        SDs.append(env.sim.state[lid, dyn.ISTEER].float()); YRs.append(env.sim.state[lid, dyn.IR].float())
     idx = PT_IDX.to(dev)
     out = pr.decision(torch.stack([x[:, idx], y[:, idx]], -1), pc["price"])
     for k in ("lap", "shaping", "contact"):
@@ -208,3 +228,24 @@ if HOLD > 1:
     hs = [h for h in hold_err if hold_err[h]]
     print(f"{tag}  plan 하나를 {HOLD * PS.DT:.1f} s 동안 따라감: plan이 말한 자리와 실제 위치 차이 중앙 "
           + ", ".join(f"{h * PS.DT:.1f} s {float(torch.cat(hold_err[h]).median()) * 100:.1f}" for h in hs) + " cm", flush=True)
+# 11-10 (the user: "결국 planner 출력 자체가 흔들리게 나온다는거야?"): does the car itself wobble -- its steering angle's change every
+# 0.1 s, the share of those changes that flip sign at once (both > 0.5 deg), and the yaw rate's oscillation (minus its 1 s mean);
+# the same measures as console_wobble.py, over all cars and the empty-track ones, the first 2 s left out. With F1SIM_HOLD=10 the
+# controller follows each plan a whole second -- the controller on its own, without the policy re-planning
+_SD = torch.rad2deg(torch.stack(SDs))[80:]; _YR = torch.rad2deg(torch.stack(YRs))[80:]
+def _wob(msk):
+    s10 = _SD[::PS.SUB][:, msk]; dd = s10[1:] - s10[:-1]
+    zz = ((dd[1:] * dd[:-1] < 0) & (dd[1:].abs() > 0.5) & (dd[:-1].abs() > 0.5)).float().mean()
+    yr = _YR[:, msk].T[:, None]
+    yrs = torch.nn.functional.avg_pool1d(yr, 40, 1, padding=20, count_include_pad=False)[:, 0, :yr.shape[-1]]
+    return float(dd.abs().mean()), float(zz) * 100, float((yr[:, 0] - yrs)[:, 20:-20].std())
+_wa, _we = _wob(torch.ones_like(cases[0][1])), _wob(cases[0][1])
+if LIMR:
+    _lr = torch.cat(LIMR); _tb = torch.cat(TBS)
+    print(f"{tag}  plan의 0.1 s 점이 타이어 한계(조향 끝에서 버티는 횡가속도)의 80/90/95 % 넘는 결정: "
+          f"{float((_lr > 0.8).float().mean()) * 100:.0f} / {float((_lr > 0.9).float().mean()) * 100:.0f} / "
+          f"{float((_lr > 0.95).float().mean()) * 100:.0f} % | 그 횡가속도에 차가 필요한 조향(정상 상태 표) 18/20/22 deg 넘음: "
+          f"{float((_tb > 18).float().mean()) * 100:.0f} / {float((_tb > 20).float().mean()) * 100:.0f} / "
+          f"{float((_tb > 22).float().mean()) * 100:.0f} % (조향 끝 {math.degrees(float(env.s_max)):.0f} deg)", flush=True)
+print(f"{tag}  차의 실제 조향: 0.1 s마다 바뀌는 크기 전체 {_wa[0]:.2f} deg · 방향 바로 뒤집힘 {_wa[1]:.0f} % · 요 각속도 떨림 {_wa[2]:.1f} deg/s"
+      f" | 빈 트랙 {_we[0]:.2f} deg · {_we[1]:.0f} % · {_we[2]:.1f} deg/s", flush=True)

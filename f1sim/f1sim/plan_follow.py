@@ -31,7 +31,8 @@ class PlanFollower:
 
     def __init__(self, n: int, device, motor_tau: float = 0.20, servo_tau: float = 0.04, delay: float = 0.03,
                  k_v: float = 2.0, k_lat: float = 1.0, k_head: float = 1.0, s_max: float = 0.4189,
-                 lut=None, grip: int = 0, wheelbase: float = 0.3302, ff_window: float = 0.0):
+                 lut=None, grip: int = 0, wheelbase: float = 0.3302, ff_window: float = 0.0, slow_tau: float = 0.0,
+                 k_yaw: float = 0.0):
         self.n, self.device = n, device
         self.h = PS.DT / PS.SUB
         self.motor_tau, self.servo_tau, self.delay = motor_tau, servo_tau, delay
@@ -45,6 +46,19 @@ class PlanFollower:
         # table reads the plan's MEAN lateral-acceleration demand over [effect time, + ff_window] (the smooth part), no lead
         # term on its output (the window already looks ahead); the feedback takes up the rest
         self.ff_window = float(ff_window)
+        # slow_tau > 0 (11-10, the averaged table input cost 6x the hard wall hits -- the mean of a steep table's input
+        # under-steers the apex): the table is the STEADY-STATE steering for a turn; the tyres do not follow a fast
+        # change with that gain. So the command = the plan's own (kinematic) steering, fast changes and all, + the table's
+        # extra over it (the understeer allowance) followed through a first-order lag of slow_tau -- turn-in starts at once,
+        # the allowance builds as the tyre force does, and a held turn gets the table's full value. Servo lead on the fast
+        # part only (the plan's own rate)
+        self.slow_tau = float(slow_tau)
+        # k_yaw > 0 (11-10: the console wobble is a yaw oscillation -- 60 deg/s against 19 for the plan driven exactly, and
+        # filtering the table's input either way only traded it for wall hits): damping on the yaw rate the gyro measures,
+        # steer += k_yaw x (L / v) x (the plan's yaw rate now - the car's) -- the kinematic steering per unit yaw rate, so
+        # k_yaw = 1 takes a whole overshoot back in one step's worth of steering
+        self.k_yaw = float(k_yaw)
+        self.extra_lp = torch.zeros(n, device=device)
         m = PS.N_STEP * PS.SUB + 1
         z = lambda: torch.zeros(n, m, device=device)
         self.X, self.Y, self.PSI, self.V, self.D = z(), z(), z(), z(), z()
@@ -94,7 +108,11 @@ class PlanFollower:
         f_lead = kf + (self.delay + 0.5 * self.h) / self.h
         v_ff, a_ff = self._at(self.V, f_lead)
         d_ff, w_ff = self._at(self.D, f_lead)
-        if self.lut is not None and self.ff_window > 0:
+        if self.lut is not None and self.slow_tau > 0:
+            extra = self._table_steer(d_ff, v_ff) - d_ff
+            self.extra_lp += min(1.0, self.h / self.slow_tau) * (extra - self.extra_lp)
+            d_ff = (d_ff + self.extra_lp).clamp(-self.s_max, self.s_max)
+        elif self.lut is not None and self.ff_window > 0:
             n_w = max(1, int(round(self.ff_window / self.h)))
             acc_m = self._mean_on(self.V * self.V * torch.tan(self.D) / self.L, f_lead, n_w)
             v_m = self._mean_on(self.V, f_lead, n_w)
@@ -112,13 +130,18 @@ class PlanFollower:
         e_lat = -torch.sin(psi_p) * ex + torch.cos(psi_p) * ey          # + = the car is left of the plan
         e_head = torch.remainder(st[:, 2] - psi_p + math.pi, 2 * math.pi) - math.pi
         sgn = torch.where(v_p < 0, -torch.ones_like(v_p), torch.ones_like(v_p))   # backwards, steering turns the other way
+        if self.k_yaw > 0 and st.shape[1] > 5:
+            _, r_p = self._at(self.PSI, kf)                          # the plan's yaw rate now
+            yaw_damp = self.k_yaw * self.L / st[:, 3].abs().clamp_min(1.0) * (r_p - st[:, 5])
+        else:
+            yaw_damp = torch.zeros_like(e_lat)
         if self.has_cmd:
             kc = self.k.clamp(max=self.CD.shape[1] - 1)[:, None]
             speed = self.CV.gather(1, kc)[:, 0] + self.k_v * (v_p - st[:, 3])
             steer = self.CD.gather(1, kc)[:, 0] - sgn * (self.k_lat * e_lat + self.k_head * e_head)
         else:
             speed = v_ff + self.motor_tau * a_ff + self.k_v * (v_p - st[:, 3])
-            steer = d_ff + self.servo_tau * w_ff - sgn * (self.k_lat * e_lat + self.k_head * e_head)
+            steer = d_ff + self.servo_tau * w_ff - sgn * (self.k_lat * e_lat + self.k_head * e_head) + sgn * yaw_damp
         self.k += 1
         return torch.stack([steer.clamp(-self.s_max, self.s_max), speed], 1)
 

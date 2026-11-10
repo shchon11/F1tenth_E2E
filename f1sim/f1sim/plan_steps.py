@@ -49,6 +49,10 @@ class Limits:
         s_max = float(nominal["s_max"])
         k_lock = float(torch.tan(torch.tensor(s_max))) / L
         a_lat = torch.nan_to_num(lut.table[grip_level].float(), nan=-1.0).amax(0).clamp_min(0.1).cpu()   # (V,)
+        # diagnosis (11-10): F1SIM_PLAN_LAT_MARGIN < 1 scales the tyres' limit -- the table's top is flat (at 5 m/s the last
+        # 5 % of lateral acceleration takes 18 -> 24 deg of steering), and the policy drove >= 95 % of it 29 % of the time
+        # (u300), leaving a real car's follower no steering to correct with. Default 1: unchanged
+        a_lat = a_lat * float(__import__("os").environ.get("F1SIM_PLAN_LAT_MARGIN", "1"))
         vt = lut.vels.float().cpu()
         v_grid = torch.linspace(0.0, V_FWD + 2.0, 241)
         a_g = torch.from_numpy(__import__("numpy").interp(v_grid.numpy(), vt.numpy(), a_lat.numpy())).float()
