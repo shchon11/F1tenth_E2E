@@ -47,6 +47,11 @@ def wipe_rows(lines):
         if m and cur is not None:
             e = re.search(r"빈 트랙에서 같은 비교: 바퀴 시간 ([+-][\d.]+) s", l)   # the control (11-11): the wipe on the empty track
             rows[cur] = (float(m.group(1)), float(m.group(2)), float(e.group(1)) if e else None)
+            # the same cars paired with a 95 % interval (11-11), when measured: replaces the pooled means
+            P = r"차별 짝 비교 \[\d+대\]: 바퀴 ([+-][\d.]+) s \[([+-][\d.]+), ([+-][\d.]+)\], 접촉 ([+-][\d.]+)/바퀴"
+            pb, pe = re.search("상자 " + P, l), re.search("빈 트랙 " + P, l)
+            if pb:
+                rows[cur] = ("paired", [float(x) for x in pb.groups()], [float(x) for x in pe.groups()] if pe else None)
     return rows
 
 
@@ -105,7 +110,15 @@ if WIPE or p is None:
     print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억을 지울 때와 비교 (−면 기억이 이득) |")
     print("|---|---|---|---|---|")
     for lab, q, mem in main:
-        print(f"| {lab} | {cells(q)} | {(f'바퀴 {mem[0]:+.2f}초, 접촉 {mem[1]:+.2f}/바퀴' + (f' (빈 트랙에서 {mem[2]:+.2f}초)' if mem[2] is not None else '')) if isinstance(mem, tuple) else '–'} |")
+        if isinstance(mem, tuple) and mem[0] == "paired":
+            b_, e_ = mem[1], mem[2]
+            c5 = f"상자: 바퀴 {b_[0]:+.2f}초 [{b_[1]:+.2f}, {b_[2]:+.2f}], 접촉 {b_[3]:+.2f}/바퀴" + \
+                 (f" · 빈 트랙: {e_[0]:+.2f}초 [{e_[1]:+.2f}, {e_[2]:+.2f}]" if e_ else "")
+        elif isinstance(mem, tuple):
+            c5 = f'바퀴 {mem[0]:+.2f}초, 접촉 {mem[1]:+.2f}/바퀴' + (f' (빈 트랙에서 {mem[2]:+.2f}초)' if mem[2] is not None else '')
+        else:
+            c5 = '–'
+        print(f"| {lab} | {cells(q)} | {c5} |")
 else:
     print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억이 더 아는 것 (목표 +10 %p) |")
     print("|---|---|---|---|---|")

@@ -112,13 +112,42 @@ def pooled(D):
     return (float(np.mean([x[1] for x in L])), float(np.mean([x[2] for x in L])), float(np.mean([x[3] for x in L])), len(L)) if len(L) >= 20 else None
 
 
+# the same cars paired (11-11: u50's pooled means went +0.19 s while every lap's median was 0.1-0.2 s faster -- a few long stuck
+# laps decide a pooled mean): per car the mean of its laps from lap 2, kept minus wiped (same seed = same car, same layout), mean
+# over the cars and a 95 % bootstrap interval over the cars
+def paired(D1, D2):
+    def per_car(D):
+        m = {}
+        for k, v in D.items():
+            if k >= 2:
+                for (i, t, c, h) in v:
+                    m.setdefault(i, []).append((t, c))
+        return {i: np.mean(np.array(v), 0) for i, v in m.items()}
+    p1, p2 = per_car(D1), per_car(D2)
+    ids = sorted(set(p1) & set(p2))
+    if len(ids) < 10:
+        return None
+    d = np.array([p1[i] - p2[i] for i in ids])                 # (cars, [time, contacts])
+    rng = np.random.default_rng(0)
+    bs = d[rng.integers(0, len(d), (2000, len(d)))].mean(1)    # (2000, 2)
+    lo, hi = np.percentile(bs, 2.5, 0), np.percentile(bs, 97.5, 0)
+    return d.mean(0), lo, hi, len(ids)
+
+
+def ptxt(r):
+    m, lo, hi, n = r
+    return f"[{n}대]: 바퀴 {m[0]:+.2f} s [{lo[0]:+.2f}, {hi[0]:+.2f}], 접촉 {m[1]:+.2f}/바퀴 [{lo[1]:+.2f}, {hi[1]:+.2f}]"
+
+
 a, n = pooled(A), pooled(N)
 e, en = pooled(E), pooled(EN)
+pb, pe = paired(A, N), paired(E, EN)
 if a and n:
     print(f"요약 2번 바퀴부터(혼자, 상자 계속): 기억 그대로 평균 {a[0]:.2f} s 접촉 {a[1]:.2f}/바퀴(세게 {a[2]:.2f}) [{a[3]}바퀴] | 바퀴마다 지움 "
           f"{n[0]:.2f} s 접촉 {n[1]:.2f}/바퀴(세게 {n[2]:.2f}) [{n[3]}바퀴] | 기억 그대로 - 지움: 바퀴 시간 {a[0] - n[0]:+.2f} s, "
           f"접촉 {a[1] - n[1]:+.2f}/바퀴"
-          + (f" | 빈 트랙에서 같은 비교: 바퀴 시간 {e[0] - en[0]:+.2f} s, 접촉 {e[1] - en[1]:+.2f}/바퀴 [{e[3]}/{en[3]}바퀴]" if e and en else ""),
+          + (f" | 빈 트랙에서 같은 비교: 바퀴 시간 {e[0] - en[0]:+.2f} s, 접촉 {e[1] - en[1]:+.2f}/바퀴 [{e[3]}/{en[3]}바퀴]" if e and en else "")
+          + (f" | 상자 차별 짝 비교 {ptxt(pb)}" if pb else "") + (f" | 빈 트랙 차별 짝 비교 {ptxt(pe)}" if pe else ""),
           flush=True)
 else:
     print("요약 2번 바퀴부터: 바퀴가 모자람(20바퀴 미만)", flush=True)
