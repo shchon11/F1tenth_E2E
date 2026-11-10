@@ -91,6 +91,32 @@ def track_boxes(env, goal, lid: torch.Tensor, K: int, R: float) -> torch.Tensor:
     return out.reshape(Bl, -1)
 
 
+def track_opp(env, goal, lid: torch.Tensor, ahead: float, behind: float = 3.0) -> torch.Tensor:
+    """(B_l, 5) the nearest other car ALONG THE TRACK within -behind..ahead m (11-10: the plans drove through slower cars ahead --
+    the driving features explained only 0.21-0.47 of where they are and how fast they close, `opp_probe.py`): measured like
+    `track_boxes` (no car behind a wall on the opposite straight), its seat picked by the smallest |along-track distance|:
+    present, dx/5, dy/5 in the car's frame, the relative speed dvx/5, dvy/5 (the critic's `_opp_rel` arithmetic)."""
+    Bl = int(lid.numel())
+    out = torch.zeros(Bl, 5, device=lid.device)
+    if env.sim.other_idx is None:
+        return out
+    st = env.sim.state.float()
+    dx, dy, _, dvx, dvy, _, present = env._opp_rel(st)
+    dx, dy, dvx, dvy, present = dx[lid], dy[lid], dvx[lid], dvy[lid], present[lid]
+    o = env.sim.other_idx[lid]
+    tid = env.sim.tid[lid]
+    C = o.shape[1]
+    r_car = goal.remaining(st[lid, :2], tid)
+    r_o = goal.remaining(st[o.reshape(-1), :2], tid.repeat_interleave(C)).view(Bl, C)
+    L = goal.lap[tid].float()[:, None]
+    ds = torch.remainder(r_car[:, None] - r_o + 0.5 * L, L) - 0.5 * L
+    ok = present & torch.isfinite(ds) & (ds > -behind) & (ds <= ahead)
+    j = torch.where(ok, ds.abs(), torch.full_like(ds, 1e6)).argmin(1, keepdim=True)
+    okj = ok.gather(1, j)[:, 0].float()
+    sel = lambda v: v.gather(1, j)[:, 0] / 5.0 * okj
+    return torch.stack([okj, sel(dx), sel(dy), sel(dvx), sel(dvy)], 1)
+
+
 class Driver:
     """drives the learner rows one decision: plan from the action, the 4 control steps, the reward"""
 
@@ -184,6 +210,9 @@ def main(argv=None):
     ap.add_argument("--box-range", type=float, default=0.0,
                     help="> 0: the boxes ahead -- the critic's box block and --mem-aux's target -- counted ALONG THE TRACK within this many"
                          " metres (`track_boxes`) instead of the straight-line 12 m that also lists boxes behind a wall (11-10). 0 = as before")
+    ap.add_argument("--aux-opp", type=float, default=0.0,
+                    help="> 0, with --mem-aux: the memory's side task also says where the nearest other car is along the track"
+                         " (-3 .. this many m) and how fast it closes (`track_opp`; 11-10). 0 = boxes only")
     ap.add_argument("--mem-aux", type=float, default=0.0,
                     help="with --memory: the weight of a side task for the memory alone -- from its state, say where the boxes ahead are"
                          " (the critic's privileged block: the nearest 3 live boxes not behind the car within 12 m, hidden ones too) every"
@@ -264,8 +293,10 @@ def main(argv=None):
     if aux_on and not args.memory:
         raise SystemExit("--mem-aux needs --memory")
     AUXK = PRIV_V2_PROP_SLOTS
+    AUXB = AUXK * len(PRIV_V2_PROP_KEYS)                            # the boxes' part of the read-out; the car's 5 follow
+    aux_opp = aux_on and args.aux_opp > 0
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
-             Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=AUXK * len(PRIV_V2_PROP_KEYS) if aux_on else 0) if v2
+             Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -291,6 +322,9 @@ def main(argv=None):
         for k_, v_ in actor.state_dict().items():
             if k_ not in sd:                                    # a memory actor from one without: its GRU fresh, output zero
                 sd[k_] = v_
+            elif k_ in ("aux.weight", "aux.bias") and sd[k_].shape != v_.shape:
+                # a wider read-out (--aux-opp) from a boxes-only one: the boxes' rows kept, the new ones fresh
+                nv = v_.clone(); nv[: sd[k_].shape[0]] = sd[k_]; sd[k_] = nv
         actor.load_state_dict(sd)
         enc = {k_[4:]: v_ for k_, v_ in ck0["critic"].items() if k_.startswith("enc.")}
         critic.enc.load_state_dict(enc)
@@ -342,8 +376,11 @@ def main(argv=None):
                 if args.memory:
                     HM.append(obs.mem_h.clone())                  # the state this decision starts from
                     if aux_on:
-                        AX.append(track_boxes(env, pr.goal, lid, AUXK, args.box_range) if args.box_range > 0
-                                  else env._prop_block(env.sim.state)[lid].float().clone())
+                        ax_ = (track_boxes(env, pr.goal, lid, AUXK, args.box_range) if args.box_range > 0
+                               else env._prop_block(env.sim.state)[lid].float().clone())
+                        if aux_opp:
+                            ax_ = torch.cat([ax_, track_opp(env, pr.goal, lid, args.aux_opp)], 1)
+                        AX.append(ax_)
                     mean, log_std, v_hat = actor(sc, s, obs.mem_h)
                     obs.mem_h = actor.h_out.detach()               # a restart below clears its rows (`obs.reset_rows`)
                 elif v2:
@@ -467,7 +504,7 @@ def main(argv=None):
 
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
-        als, aac, aac_far = [], [], []
+        als, aac, aac_far, alo = [], [], [], []
         aux_box = {}
         if tailc:
             bV0, bD0, bST0 = torch.cat(V0), torch.cat(D0), torch.cat(ST0)
@@ -517,11 +554,20 @@ def main(argv=None):
                         cls_.append(float(lc.detach()))
                         ce5.append(float((pts_c[:, 5] - tgt[:, 4]).norm(dim=-1).median()))
                 if aux_on:
-                    pa = aux_box["pred"].view(-1, AUXK, len(PRIV_V2_PROP_KEYS)); ta = bAX[mb].view(-1, AUXK, len(PRIV_V2_PROP_KEYS))
+                    pa_all, ta_all = aux_box["pred"], bAX[mb]
+                    pa = pa_all[:, :AUXB].reshape(-1, AUXK, len(PRIV_V2_PROP_KEYS)); ta = ta_all[:, :AUXB].reshape(-1, AUXK, len(PRIV_V2_PROP_KEYS))
                     m_p = ta[..., 0]
                     l_pres = nn.functional.binary_cross_entropy_with_logits(pa[..., 0], m_p)
                     l_pos = (nn.functional.smooth_l1_loss(pa[..., 1:], ta[..., 1:], reduction="none").sum(-1) * m_p).sum() / m_p.sum().clamp_min(1.0)
                     la = l_pres + l_pos
+                    if aux_opp:
+                        po_, to_ = pa_all[:, AUXB:], ta_all[:, AUXB:]
+                        m_o = to_[:, 0]
+                        lo = nn.functional.binary_cross_entropy_with_logits(po_[:, 0], m_o) + (
+                            nn.functional.smooth_l1_loss(po_[:, 1:], to_[:, 1:], reduction="none").sum(-1) * m_o).sum() / m_o.sum().clamp_min(1.0)
+                        la = la + lo
+                        with torch.no_grad():
+                            alo.append(float(lo))
                     loss = loss + args.mem_aux * la
                     with torch.no_grad():
                         als.append(float(la)); aac.append(float(((pa[..., 0] > 0).float() == m_p).float().mean()))
@@ -551,7 +597,8 @@ def main(argv=None):
                "tail_loss": (sum(cls_) / len(cls_)) if cls_ else None, "tail_next_05": (sum(ce5) / len(ce5)) if ce5 else None, "near_share": float(near_sum.mean()) / T,
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()],
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
-               "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None}
+               "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
+               "aux_opp_loss": (sum(alo) / len(alo)) if alo else None}
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % | 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
@@ -562,6 +609,7 @@ def main(argv=None):
               + (f"상자 치움 {n_removed}판 | " if remover is not None else "")
               + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "
                  f"{(row['aux_far_recall'] or 0) * 100:.0f} % | " if row.get("aux_loss") is not None else "")
+              + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, 다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm | " if row.get("tail_loss") is not None else "")
               + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:
