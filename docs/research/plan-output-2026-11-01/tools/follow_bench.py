@@ -53,7 +53,7 @@ for kind in kinds:
         fol = PlanFollower(1, "cpu", lut=None, wheelbase=L, s_max=float(nom["s_max"]))
     else:
         # "mpc" or "mpc:key=value,...": PlanMPC's arguments (w_lat, w_head, w_rate, w_yaw, horizon, sub)
-        kw = {a.split("=")[0]: (int if a.split("=")[0] in ("horizon", "sub") else float)(a.split("=")[1])
+        kw = {a.split("=")[0]: (int if a.split("=")[0] in ("horizon", "sub", "every") else float)(a.split("=")[1])
               for a in kind.split(":")[1].split(";")} if ":" in kind else {}
         fol = PlanMPC(1, "cpu", nom, s_max=float(nom["s_max"]), **kw)
     st = torch.zeros(1, dyn.STATE_DIM); st[0, dyn.IVX] = v0; st[0, dyn.IOMEGA] = v0 / float(nom["r_w"])

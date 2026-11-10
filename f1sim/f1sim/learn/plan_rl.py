@@ -207,6 +207,11 @@ def main(argv=None):
     ap.add_argument("--memory", type=int, default=0,
                     help="v2: a GRU of this size in the actor (11-09, the user: \"A1\" -- adapt by remembering); 0 = none")
     ap.add_argument("--mem-chunk", type=int, default=32, help="the memory's update replays sequences of this many decisions")
+    ap.add_argument("--plan-lat-margin", type=float, default=1.0,
+                    help="the plans' tyre limit as this share of the steering table's highest steady-state lateral acceleration"
+                         " (11-10, the user: \"ㅇㅋ\" to 0.95): at 1 the policy drove >= 95 %% of it 29 %% of the time, where the table's"
+                         " flat top needs 18 -> 24 deg (lock) for the last 5 %% -- a real car's follower had no steering left to correct"
+                         " with and the car wobbled. Every Limits of this run (and its evaluations, read from the checkpoint) use it")
     ap.add_argument("--box-range", type=float, default=0.0,
                     help="> 0: the boxes ahead -- the critic's box block and --mem-aux's target -- counted ALONG THE TRACK within this many"
                          " metres (`track_boxes`) instead of the straight-line 12 m that also lists boxes behind a wall (11-10). 0 = as before")
@@ -242,6 +247,8 @@ def main(argv=None):
     if os.path.exists(os.path.join(run, "progress.jsonl")):
         raise SystemExit(f"{run} already has a run: pick an unused name")
     os.makedirs(run, exist_ok=True)
+    if args.plan_lat_margin != 1.0:
+        os.environ["F1SIM_PLAN_LAT_MARGIN"] = str(args.plan_lat_margin)   # every Limits built in this process
     env, lim, world = build(args.world, args.envs, args.seed, dev, fmt=args.format)
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)

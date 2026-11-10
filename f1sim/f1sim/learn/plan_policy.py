@@ -221,7 +221,9 @@ class PlanRunner:
         self.lid = env.learner_ids
         self.v3 = ck.get("format") == "plan_steps3"
         self.v2 = ck.get("format") == "plan_steps2" or self.v3
-        self.lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), device)
+        _mg = (ck.get("args") or {}).get("plan_lat_margin")      # the limit the checkpoint was trained with (11-10)
+        self.lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), device,
+                                          margin=None if _mg is None else float(_mg))
         if self.v3:
             self.actor = load_actor3(ck, device)
             self.obs = PlanObs3(env, self.lim, None)
@@ -264,7 +266,8 @@ class PlanRunner:
                 from ..plan_mpc import PlanMPC
                 self.follower = PlanMPC(Bl, os.environ.get("F1SIM_MPC_DEV", str(device)), env.tracker.nominal,
                                         s_max=float(env.s_max), k_v=_g[0], horizon=int(os.environ.get("F1SIM_MPC_H", "20")),
-                                        sub=int(os.environ.get("F1SIM_MPC_SUB", "4")),
+                                        sub=int(os.environ.get("F1SIM_MPC_SUB", "4")), every=int(os.environ.get("F1SIM_MPC_EVERY", "1")),
+                                        lut=env.tracker.map.lut, grip=M.GRIP_LEVELS.index(1.0),
                                         **dict(zip(("w_lat", "w_head", "w_rate", "w_yaw"),
                                                    [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")])))
             env.ext_mask[self.lid] = True

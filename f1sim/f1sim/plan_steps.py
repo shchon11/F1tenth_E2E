@@ -43,16 +43,19 @@ class Limits:
     k_tyre: torch.Tensor    # (G,) [1/m] curvature the tyres hold at each speed, non-increasing
 
     @staticmethod
-    def from_nominal(nominal: Dict, lut, grip_level: int, device) -> "Limits":
+    def from_nominal(nominal: Dict, lut, grip_level: int, device, margin=None) -> "Limits":
         """`nominal` the car's parameter dict, `lut` MAP's `SteerLUT`, `grip_level` the table to read (nominal grip)"""
         L = float(nominal["lf"]) + float(nominal["lr"])
         s_max = float(nominal["s_max"])
         k_lock = float(torch.tan(torch.tensor(s_max))) / L
         a_lat = torch.nan_to_num(lut.table[grip_level].float(), nan=-1.0).amax(0).clamp_min(0.1).cpu()   # (V,)
-        # diagnosis (11-10): F1SIM_PLAN_LAT_MARGIN < 1 scales the tyres' limit -- the table's top is flat (at 5 m/s the last
-        # 5 % of lateral acceleration takes 18 -> 24 deg of steering), and the policy drove >= 95 % of it 29 % of the time
-        # (u300), leaving a real car's follower no steering to correct with. Default 1: unchanged
-        a_lat = a_lat * float(__import__("os").environ.get("F1SIM_PLAN_LAT_MARGIN", "1"))
+        # 11-10 (the user: "ㅇㅋ" to a 95 % limit): `margin` < 1 scales the tyres' limit -- the table's top is flat (at 5 m/s
+        # the last 5 % of lateral acceleration takes 18 -> 24 deg of steering), and the policy drove >= 95 % of it 29 % of the
+        # time (u300), leaving a real car's follower no steering to correct with. A checkpoint's own value is
+        # `args.plan_lat_margin` (plan_rl --plan-lat-margin); None = F1SIM_PLAN_LAT_MARGIN (default 1: as before)
+        if margin is None:
+            margin = float(__import__("os").environ.get("F1SIM_PLAN_LAT_MARGIN", "1"))
+        a_lat = a_lat * float(margin)
         vt = lut.vels.float().cpu()
         v_grid = torch.linspace(0.0, V_FWD + 2.0, 241)
         a_g = torch.from_numpy(__import__("numpy").interp(v_grid.numpy(), vt.numpy(), a_lat.numpy())).float()

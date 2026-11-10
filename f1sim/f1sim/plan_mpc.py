@@ -38,10 +38,14 @@ IX, IY, IPSI, IVX, IVY, IR, ID, IAX, IU = range(NZ)
 class PlanMPC(PlanFollower):
     def __init__(self, n: int, device, nominal: dict, s_max: float = 0.4189, k_v: float = 2.0, horizon: int = 20,
                  sub: int = 4, w_lat: float = 400.0, w_head: float = 100.0, w_yaw: float = 0.0, w_rate: float = 2500.0,
-                 w_end: float = 2.0):
+                 w_end: float = 2.0, every: int = 1, lut=None, grip: int = 0):
         f = lambda k: float(nominal[k])
+        if lut is not None:
+            lut = lut.to(device)                                       # the fallback's table where this follower runs (the cpu)
+        # the parent's own law (MAP's table + feedback) is the fallback below 1 m/s and when the plan stops or backs out:
+        # the model and the path cost assume forward motion (11-10: without it 12-21 % of the cars stood against walls)
         super().__init__(n, device, motor_tau=f("motor_tau"), servo_tau=f("servo_tau"), delay=f("cmd_delay"), k_v=k_v,
-                         k_lat=0.0, k_head=0.0, s_max=s_max, wheelbase=f("lf") + f("lr"))
+                         k_lat=1.0, k_head=1.0, s_max=s_max, wheelbase=f("lf") + f("lr"), lut=lut, grip=grip)
         self.m, self.Iz, self.lf, self.lr, self.hcg = f("m"), f("Iz"), f("lf"), f("lr"), f("h")
         self.muf, self.mur = f("mu") * f("mu_f_scale"), f("mu") * f("mu_r_scale")
         kB = (f("mu_ref") / f("mu")) ** (1.0 - f("mu_stiffness_exp"))
@@ -60,6 +64,9 @@ class PlanMPC(PlanFollower):
         self.eps = torch.full((NZ,), 1e-3, device=device)
         # the last forward pass's states (positions about the car's position then): the next step's linearisation, shifted
         self.Zl, self.xy_l, self.have_l = None, None, False
+        # every > 1: solve every `every` control steps (and on every new plan); in between, the last solution's commands
+        # with its time-varying feedback gains on the error to its predicted states (the console runs one car on the cpu)
+        self.every, self.since, self.Kl = max(1, int(every)), 0, None
 
     # ---------------------------------------------------------------- the model
     def _kin(self, d, vx):
@@ -197,6 +204,8 @@ class PlanMPC(PlanFollower):
         out_dev = st.device
         st = st.to(self.device).float()
         n, H, h, dev = self.n, self.H, self.h, st.device
+        fb_steer = PlanFollower.command(self, st)[:, 0]                # the fallback's steering (it steps the clock: undo)
+        self.k -= 1
         kf = self.k.float()
         # the speed: PlanFollower's (the speed loop's inversion at the command's landing + feedback on the speed now)
         f_lead = kf + (self.delay + 0.5 * h) / h
@@ -213,11 +222,6 @@ class PlanMPC(PlanFollower):
         x0, y0 = st[:, 0], st[:, 1]
         z = torch.stack([torch.zeros_like(x0), torch.zeros_like(y0), st[:, 2], st[:, 3], st[:, 4], st[:, 5], self.servo,
                          self.axf, self.hist[:, 0]], 1)
-        # the plan from 2 steps before now to past the horizon's end, on the control grid (the path the cost reads)
-        M = H + 12
-        fi = kf[:, None] - 2.0 + torch.arange(M, device=dev, dtype=torch.float32)[None, :]
-        px, py, pc, pv, pvff, pr = self._ref(fi)
-        P = (px - x0[:, None], py - y0[:, None], pc, pr)
         # the speed law's inputs at each model step's time (now + delay + k h)
         tk = kf[:, None] + (self.delay + h * torch.arange(H + 1, device=dev, dtype=torch.float32))[None, :] / h
         _, _, _, vref, vff, _ = self._ref(tk)
@@ -226,11 +230,35 @@ class PlanMPC(PlanFollower):
             nsub = max(1, int(math.ceil(T / 0.005 - 1e-9)))
             z = self._f(z, self.hist[:, j], vref[:, 0], vff[:, 0], T / nsub, nsub)
         z[:, IU] = self.hist[:, 0]
-        # warm start: the last solution one step on; linearised along the last forward pass one step on (real-time
+        slow = (st[:, 3].abs() < 1.0) | (vref.min(1).values < 0.3)    # below 1 m/s, or the plan stops / backs out
+        if bool(slow.any()):
+            self.U = torch.where(slow[:, None], fb_steer[:, None].expand_as(self.U), self.U)
+            if bool(slow.all()):
+                self.have_l = False
+                return self._sent(st, fb_steer, speed, vref, vff, x0, y0, out_dev)
+        s_sh = self.since + 1                                          # control steps since the last solution
+        if self.have_l and not bool(new_rows.any()) and not bool((self.k == 0).any()) and s_sh < min(self.every, H - 1):
+            # between solutions: its command for now + its feedback on the error to its prediction (in its frame)
+            z[:, IX] += x0 - self.xy_l[:, 0]
+            z[:, IY] += y0 - self.xy_l[:, 1]
+            dz = z - self.Zl[:, s_sh]
+            dz[:, IPSI] = torch.remainder(dz[:, IPSI] + math.pi, 2 * math.pi) - math.pi
+            steer = (self.U[:, s_sh] + (self.Kl[:, s_sh] * dz).sum(1)).clamp(-self.s_max, self.s_max)
+            self.since = s_sh
+            return self._sent(st, torch.where(slow, fb_steer, steer), speed, vref, vff, x0, y0, out_dev)
+        # the plan from 2 steps before now to past the horizon's end, on the control grid (the path the cost reads)
+        M = H + 12
+        fi = kf[:, None] - 2.0 + torch.arange(M, device=dev, dtype=torch.float32)[None, :]
+        px, py, pc, pv, pvff, pr = self._ref(fi)
+        P = (px - x0[:, None], py - y0[:, None], pc, pr)
+        # warm start: the last solution s_sh steps on; linearised along the last forward pass s_sh steps on (real-time
         # iteration) -- a fresh start rolls the model out instead
-        U = torch.cat([self.U[:, 1:], self.U[:, -1:]], 1)
+        U = torch.cat([self.U[:, s_sh:], self.U[:, -1:].expand(n, s_sh)], 1)
         if self.have_l and not bool(new_rows.any()):
-            Z = torch.cat([self.Zl[:, 1:], self._step(self.Zl[:, -1], U[:, -1], vref[:, H - 1], vff[:, H - 1])[:, None]], 1)
+            ext = [self.Zl[:, -1]]
+            for _ in range(s_sh):
+                ext.append(self._step(ext[-1], U[:, -1], vref[:, H - 1], vff[:, H - 1]))
+            Z = torch.cat([self.Zl[:, s_sh:], torch.stack(ext[1:], 1)], 1)
             Z[..., IX] += (self.xy_l[:, 0] - x0)[:, None]
             Z[..., IY] += (self.xy_l[:, 1] - y0)[:, None]
             # the car's yaw is wrapped to (-pi, pi], the stored states run on continuously: the yaw now on their branch
@@ -288,7 +316,14 @@ class PlanMPC(PlanFollower):
             Zn.append(zn)
         self.U = Un
         self.Zl, self.xy_l, self.have_l = torch.stack(Zn, 1), torch.stack([x0, y0], 1), True
-        steer = Un[:, 0]
+        self.Kl, self.since = Kfb, 0
+        if bool(slow.any()):
+            self.have_l = False                                        # a row on the fallback: roll out afresh next time
+        return self._sent(st, torch.where(slow, fb_steer, Un[:, 0]), speed, vref, vff, x0, y0, out_dev)
+
+    def _sent(self, st, steer, speed, vref, vff, x0, y0, out_dev):
+        """book the command sent now: the model's servo angle and drive force one control step on, the history"""
+        h = self.h
         # the model's own servo angle and drive force one control step on, under the commands in effect over it
         zs = torch.stack([torch.zeros_like(x0), torch.zeros_like(y0), st[:, 2], st[:, 3], st[:, 4], st[:, 5], self.servo,
                           self.axf, self.hist[:, 0]], 1)

@@ -40,6 +40,8 @@ if mode == "map":
 torch.manual_seed(SEED)
 env = SR.build_env(a, dev)
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
+if (ck.get("args") or {}).get("plan_lat_margin") is not None:          # the tyre limit the checkpoint was trained with (11-10)
+    os.environ["F1SIM_PLAN_LAT_MARGIN"] = str(ck["args"]["plan_lat_margin"])
 V3 = ck.get("format") == "plan_steps3"
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
 act3, turn3 = plan3_models(env, lim, dev) if V3 else (None, None)
@@ -71,6 +73,7 @@ if mode == "track":
         _w = [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")]
         follower = PlanMPC(B, os.environ.get("F1SIM_MPC_DEV", "cuda"), env.tracker.nominal, s_max=float(env.s_max), k_v=_g[0],
                            horizon=int(os.environ.get("F1SIM_MPC_H", "20")), sub=int(os.environ.get("F1SIM_MPC_SUB", "4")),
+                           every=int(os.environ.get("F1SIM_MPC_EVERY", "1")), lut=env.tracker.map.lut, grip=M.GRIP_LEVELS.index(1.0),
                            **dict(zip(("w_lat", "w_head", "w_rate", "w_yaw"), _w)))
         tag = tag + f"(MPC 무게 옆 {_w[0]:g} 방향 {_w[1]:g} 조향 변화 {_w[2]:g} 요 {_w[3]:g}, {follower.H} 걸음) "
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())

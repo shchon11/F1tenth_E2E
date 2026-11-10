@@ -70,6 +70,10 @@ if p is not None:
         sub.append(("시작", t))
 I = eval_rows(read_lines(f"{D}/one_{run}_i.log"), "ideal")
 MEM = memory_rows(read_lines(f"{D}/analysis/{run}_summary.log"))
+if 0 in I and main:
+    # the start evaluated under this run's own conditions (11-10: plan25n8 changed the plans' tyre limit -- the parent's row was
+    # measured under the old one)
+    main[0] = ("시작", I.pop(0), main[0][2])
 for u in sorted(set(I) | set(MEM)):
     main.append((f"u{u}", I.get(u, {}), MEM.get(u)))
 for u, t in sorted(eval_rows(read_lines(f"{D}/one_{run}.log"), "track").items()):
