@@ -4,6 +4,7 @@
 학습과 같은 Huber(v^2 ds/L dm / 4). 두 가지: 학습처럼 탐색 잡음을 섞어 몰 때 / 평균으로만 몰 때.
 인자: checkpoint [차 수, 기본 128] [초, 기본 30]"""
 import os, sys
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")

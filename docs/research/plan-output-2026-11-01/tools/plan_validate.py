@@ -13,6 +13,7 @@ and the hard ones (>= 1 m/s), stopped share, the reward's parts a decision, plan
 where the car was 0.1 / 0.3 / 0.5 s later). One line per case, prefixed by `tag`.
 args: checkpoint condition(ideal|map) envs secs [tag]"""
 import os, sys, math, argparse, json, time
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import state_rl as SR

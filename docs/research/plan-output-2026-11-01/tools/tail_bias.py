@@ -3,6 +3,7 @@
 비교. 붙잡기가 효과가 있으면 뒷부분의 속도 차이(지금까지 0.5 s에서 plan이 약 1 m/s 느림)와 자리 차이가 줄어야 함.
 인자: checkpoint [차수] [초]   (여러 checkpoint를 차례로: 쉼표로)"""
 import os, sys, argparse, json
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")

@@ -7,6 +7,7 @@
 커 가므로 앞에 상자가 없을 때 '있음'이라 한 비율(헛짚음)도 첫 바퀴/다음 바퀴로 같이 -- 맞힘이 오른 만큼 헛짚음도 오르면 아는 게 아님.
 인자: checkpoint [차수, 기본 256] [초, 기본 30]"""
 import os, sys
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import plan_rl as PR

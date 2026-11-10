@@ -6,6 +6,7 @@
     우리, 빨강 = 상대), 닿기 0.5 s 전 우리 plan(검은 선)
 인자: checkpoint 출력머리 [환경 수, 기본 512] [초, 기본 40]"""
 import os, sys
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import torch

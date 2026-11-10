@@ -7,6 +7,7 @@
 그림: checkpoint마다 차 한 대의 조향 명령 10 s(같은 출발).
 인자: 출력png checkpoint1,checkpoint2,... [차 수, 기본 64] [초, 기본 30]"""
 import os, sys
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
 import matplotlib; matplotlib.use("Agg")

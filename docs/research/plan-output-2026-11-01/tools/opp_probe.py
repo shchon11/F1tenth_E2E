@@ -5,6 +5,7 @@ dvx, dvy, 차 기준)과, policy 안의 세 가지를 모음: 지금 LiDAR·상�
 읽는 것). 앞 70 %로 선형 회귀(능선)를 맞추고 뒤 30 %에서 설명력(R²)을 잼 -- 1이면 그 값을 다 앎, 0이면 모름.
 인자: checkpoint [환경 수, 기본 512] [초, 기본 40]"""
 import os, sys
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import plan_rl as PR

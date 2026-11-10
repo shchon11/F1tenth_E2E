@@ -10,6 +10,7 @@
  (6) 기억을 지웠을 때 첫 단계 속도 출력이 바뀌는 크기, 상황별
 인자: checkpoint 출력png [초] [환경 수]"""
 import os, sys, math
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
 import matplotlib

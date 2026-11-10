@@ -7,6 +7,7 @@
 를 비교. 라인을 바꾸지 않으니 '앞뒤 가속을 덜 써서 잃는 시간'만 남음.
 인자: checkpoint 차수"""
 import os, sys, argparse, json
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")

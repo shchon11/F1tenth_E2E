@@ -70,10 +70,14 @@ if p is not None:
         sub.append(("시작", t))
 I = eval_rows(read_lines(f"{D}/one_{run}_i.log"), "ideal")
 MEM = memory_rows(read_lines(f"{D}/analysis/{run}_summary.log"))
+# re-measured rows (11-10: the evaluations had the training's staggered first episode on -- ~90 % of the cars restarted
+# mid-way with a fresh layout / opponent draw; re-run with whole episodes) override the loop's own
+I.update(eval_rows(read_lines(f"{D}/one_{run}_i_fix.log"), "ideal"))
+MEM.update(memory_rows(read_lines(f"{D}/analysis/{run}_summary_fix.log")))
 if 0 in I and main:
     # the start evaluated under this run's own conditions (11-10: plan25n8 changed the plans' tyre limit -- the parent's row was
     # measured under the old one)
-    main[0] = ("시작", I.pop(0), main[0][2])
+    main[0] = ("시작", I.pop(0), MEM.pop(0) if 0 in MEM else main[0][2])
 for u in sorted(set(I) | set(MEM)):
     main.append((f"u{u}", I.get(u, {}), MEM.get(u)))
 for u, t in sorted(eval_rows(read_lines(f"{D}/one_{run}.log"), "track").items()):

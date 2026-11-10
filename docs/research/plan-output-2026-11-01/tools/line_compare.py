@@ -4,6 +4,7 @@
 (11-09 사용자: 레이싱라인은 쓰지 않으니 그림·계산에서 뺌)
 인자: checkpoint 조건(ideal|map) 차수 초 출력png"""
 import os, sys, math, argparse, json
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
 import matplotlib

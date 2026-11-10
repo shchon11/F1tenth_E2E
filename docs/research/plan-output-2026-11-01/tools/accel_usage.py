@@ -6,6 +6,7 @@
   * 바퀴 위치(결승선까지 벽 사이 최단 거리)별로 모아 어디서 덜 쓰는지
 인자: checkpoint 차수 초"""
 import os, sys, argparse, json
+os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")

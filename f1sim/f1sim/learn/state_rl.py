@@ -53,7 +53,11 @@ def build_env(a, device, extra=None):
     cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
     e = dict(action_mode="direct", max_steps=int(a.episode_s * 40), speed_cap=10.0, v_max_policy=10.0,
              v_min_policy=float(getattr(a, "v_min", 0.0) or 0.0), reverse_ext=float(getattr(a, "reverse_ext", 0.0) or 0.0),
-             collision_mode="soft", contact_severity_min=float(getattr(a, "severity_min", 1.5)), stagger_first_episode=True,
+             collision_mode="soft", contact_severity_min=float(getattr(a, "severity_min", 1.5)),
+             # training staggers the first episode (a random length per race, so the cars do not all restart together);
+             # an evaluation wants whole episodes -- F1SIM_NO_STAGGER=1 (11-10: plan_validate's 40 s had ~90 % of the cars
+             # restart mid-way, with a fresh layout / opponent draw, though it meant "one episode per car")
+             stagger_first_episode=__import__("os").environ.get("F1SIM_NO_STAGGER") != "1",
              reward_progress=1.0, reward_collision=-1.0, reward_car_contact=1.0, reward_steer_rate=0.02,
              reward_wrong_way=0.4, reward_proximity=0.0, reward_lap=0.0, reward_lap_time=0.0,
              spawn_runway=3.0, priv_props=True, priv_time=True, compile_tracker=False)
