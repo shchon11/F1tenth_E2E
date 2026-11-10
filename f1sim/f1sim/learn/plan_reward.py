@@ -34,29 +34,13 @@ CONTACT_S_PER_MPS = 1.0   # [s per m/s of impact normal speed]
 SEEN_S = 1.0              # [s] a car contact counts if a beam hit a car this recently
 PLAN_HIT_SHARE = 0.1      # a plan that hits something: this share of the contact it plans
 CACHE = os.path.expanduser("~/.cache/f1sim/goal_field")
+CLEAR = 0.5               # [m] the distance field's route keeps this far from the walls (`_field_one`)
 
 
-def _field_one(edt: np.ndarray, res: float, origin, start_xy, start_yaw) -> np.ndarray:
-    """(H, W) shortest distance [m] to the finish line through the free cells, not crossing the line backwards; NaN in
-    the walls. The line: across the track through `start_xy`, square to `start_yaw`."""
-    from scipy import ndimage, sparse
-    from scipy.sparse.csgraph import dijkstra
-    H, W = edt.shape
-    free = edt > res                                          # a cell clear of the wall
-    ii, jj = np.mgrid[0:H, 0:W]
-    X = origin[0] + jj * res; Y = origin[1] + ii * res        # cell centres as `Track.sample_edt` rounds them
-    i0 = int(round((start_xy[1] - origin[1]) / res)); j0 = int(round((start_xy[0] - origin[0]) / res))
-    lab, _ = ndimage.label(free)
-    if lab[i0, j0] == 0:
-        raise ValueError("the start point is not in the free space")
-    free &= lab == lab[i0, j0]
-    t = np.array([math.cos(start_yaw), math.sin(start_yaw)])
-    A = (X - start_xy[0]) * t[0] + (Y - start_xy[1]) * t[1]
-    band = free & (np.abs(A) < res)
-    bl, _ = ndimage.label(band, structure=np.ones((3, 3)))
-    barrier = bl == bl[i0, j0]
-    src = free & ~barrier & ndimage.binary_dilation(barrier, iterations=2) & (A < 0)
-    node = free & ~barrier
+def _grid_graph(node: np.ndarray, res: float):
+    """8 + 8 (knight) neighbour graph over the `node` cells: (csr matrix, (H, W) node index, -1 off the graph)"""
+    from scipy import sparse
+    H, W = node.shape
     idx = -np.ones((H, W), np.int64); idx[node] = np.arange(int(node.sum()))
     rows, cols, wts = [], [], []
     ia0, ja0 = np.nonzero(node)
@@ -75,11 +59,58 @@ def _field_one(edt: np.ndarray, res: float, origin, start_xy, start_yaw) -> np.n
         w = res * math.hypot(di, dj)
         rows += [idx[ia, ja], idx[ib, jb]]; cols += [idx[ib, jb], idx[ia, ja]]; wts += [np.full(ia.size, w)] * 2
     n = int(node.sum())
-    G = sparse.csr_matrix((np.concatenate(wts), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
+    return sparse.csr_matrix((np.concatenate(wts), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n)), idx
+
+
+def _field_one(edt: np.ndarray, res: float, origin, start_xy, start_yaw, clear: float = CLEAR) -> np.ndarray:
+    """(H, W) shortest distance [m] to the finish line, not crossing the line backwards; NaN in the walls. The line:
+    across the track through `start_xy`, square to `start_yaw`.
+    The route keeps `clear` from every wall, so it follows the course: one cell of clearance let it cut through the
+    gaps between an island and a partition wall (0.2 m on the original track, up to 0.7 m on its variants, 11-11), and
+    the distance left then GREW along 5-40 % of a lap driven forwards. A free cell nearer a wall than `clear` reads the
+    nearest (through the free space) cell that is not."""
+    from scipy import ndimage
+    from scipy.sparse.csgraph import dijkstra
+    H, W = edt.shape
+    free = edt > res                                          # a cell clear of the wall
+    ii, jj = np.mgrid[0:H, 0:W]
+    X = origin[0] + jj * res; Y = origin[1] + ii * res        # cell centres as `Track.sample_edt` rounds them
+    i0 = int(round((start_xy[1] - origin[1]) / res)); j0 = int(round((start_xy[0] - origin[0]) / res))
+    lab, _ = ndimage.label(free)
+    if lab[i0, j0] == 0:
+        raise ValueError("the start point is not in the free space")
+    free &= lab == lab[i0, j0]
+    wide = free & (edt > max(clear, res))
+    lab, _ = ndimage.label(wide)
+    if lab[i0, j0] == 0:
+        raise ValueError(f"the start point is nearer a wall than {clear} m")
+    wide &= lab == lab[i0, j0]
+    t = np.array([math.cos(start_yaw), math.sin(start_yaw)])
+    A = (X - start_xy[0]) * t[0] + (Y - start_xy[1]) * t[1]
+    band = free & (np.abs(A) < res)
+    bl, _ = ndimage.label(band, structure=np.ones((3, 3)))
+    barrier = bl == bl[i0, j0]
+    src = wide & ~barrier & ndimage.binary_dilation(barrier, iterations=2) & (A < 0)
+    node = wide & ~barrier
+    G, idx = _grid_graph(node, res)
     d = dijkstra(G, directed=False, indices=idx[src], min_only=True)
     D = np.full((H, W), np.nan, np.float32); D[node] = d
-    D[barrier] = 0.0                                          # on the line: just crossed / about to
     D[~np.isfinite(D)] = np.nan
+    # the free cells near the walls: the value of the nearest cell that has one, through the free space (not over the line)
+    node2 = free & ~barrier
+    known = node2 & np.isfinite(D)
+    if bool((node2 & ~known).any()):
+        G2, idx2 = _grid_graph(node2, res)
+        edge = known & ndimage.binary_dilation(node2 & ~known, structure=np.ones((5, 5)))
+        _, _, near = dijkstra(G2, directed=False, indices=idx2[edge], min_only=True, return_predecessors=True)
+        flat_i = np.flatnonzero(node2.reshape(-1))            # graph node -> cell
+        fill = node2 & ~known
+        got = near[idx2[fill]]
+        vals = np.full(got.shape, np.nan, np.float32)
+        ok = got >= 0
+        vals[ok] = D.reshape(-1)[flat_i[got[ok]]]
+        D[fill] = vals
+    D[barrier] = 0.0                                          # on the line: just crossed / about to
     return D
 
 
@@ -99,7 +130,7 @@ class GoalField:
         os.makedirs(CACHE, exist_ok=True)
         for k in range(T):
             g = edt[off[k]: off[k] + Hs[k] * Ws[k]].reshape(Hs[k], Ws[k])
-            key = hashlib.sha1(g.tobytes() + np.array([res[k], *org[k], *xy0[k], yaw0[k]], np.float64).tobytes()).hexdigest()[:20]
+            key = hashlib.sha1(g.tobytes() + np.array([res[k], *org[k], *xy0[k], yaw0[k], CLEAR], np.float64).tobytes()).hexdigest()[:20]
             fn = os.path.join(CACHE, key + ".npy")
             if os.path.exists(fn):
                 D = np.load(fn)
