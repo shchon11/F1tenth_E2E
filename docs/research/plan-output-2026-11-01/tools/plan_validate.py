@@ -58,6 +58,9 @@ if mode == "map":
 prepare_graph_runtime(env, log=lambda _t: None)
 env.reset(seed=SEED)
 lid = env.learner_ids; B = int(lid.numel())
+# the stuck-opponent restart the checkpoint was trained with (11-11, plan_rl --opp-restart-s; F1SIM_OPP_RESTART_S overrides)
+_rs = os.environ.get("F1SIM_OPP_RESTART_S") or (ck.get("args") or {}).get("opp_restart_s") or 0.0
+restarter = SR.OppRestart(env, float(_rs), PS.DT) if float(_rs) > 0 and env.M > 1 else None
 HOLD = int(os.environ.get("F1SIM_HOLD", "1"))
 follower = None
 if mode == "track":
@@ -190,6 +193,8 @@ for kd in range(n_dec):
                 lap_times[i].append(tnow - float(lap_t0[i]))
             lap_t0[i] = tnow
     stop += (env.sim.state[lid, dyn.IVX].abs() < 0.3).float() * PS.DT
+    if restarter is not None:
+        restarter.step()
 cf = env.sim.contact_frame()[lid].float() - cf0
 on, hd = cf[:, i_on], cf[:, i_hd]
 W = torch.stack(plans); X = torch.stack(poses)            # (T, B, 11, 2) plan points every 0.1 s (index 0 = the car), (T, B, 3)

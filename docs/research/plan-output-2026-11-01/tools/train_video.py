@@ -47,6 +47,9 @@ rm_p = float(getattr(world, "removal_p", 0.0))
 remover = SR.PropRemoval(env, rm_p, *[float(v) for v in getattr(world, "removal_s", (10.0, 30.0))], seed=SEED) if rm_p > 0 else None
 if remover is not None:
     remover.step()                                               # draws each race's removal time (nothing is due at 0 s)
+# the stuck-opponent restart the checkpoint was trained with (11-11, plan_rl --opp-restart-s; F1SIM_OPP_RESTART_S overrides)
+_rs = os.environ.get("F1SIM_OPP_RESTART_S") or (ck.get("args") or {}).get("opp_restart_s") or 0.0
+restarter = SR.OppRestart(env, float(_rs), PS.DT) if float(_rs) > 0 and env.M > 1 else None
 M = int(env.M)
 eid = env.sim.eid[lid]
 others = env.sim.other_idx[lid][:, 0] if M > 1 else None
@@ -85,6 +88,8 @@ for kd in range(int(secs / PS.DT)):
     out, _, (x, y, _) = drv.decision(torch.tanh(mean), p)
     if remover is not None:
         remover.step()
+    if restarter is not None:
+        restarter.step()
     b_ = lid[B_]
     REC_["st"].append(env.sim.state[b_, :4].float().cpu().numpy())
     if others is not None:

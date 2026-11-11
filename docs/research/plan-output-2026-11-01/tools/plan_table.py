@@ -1,5 +1,6 @@
 """지금 학습의 표 (11-09/10, 사용자: "뭐이리 표가 난잡해. 지금 돌리고 있는 학습만 보여줘. 그리고 읽기 좀 쉽게 해라", "학습 환경 평가나 잘해.
 제어기까지 돌린건 서브로 두고"). 보고마다 그대로 붙임 -- 지금 run만, 행만 늘어남.
+(11-11: 기억 비교를 재지 않는 run은 다섯째 칸 = 세게 닿은 것의 갈래, 벽 · 상자 · 상대 차.)
 본 표 = 학습 조건(plan대로 정확히 실행) 평가: 학습 세계 그대로, 고정 시드, 학습 차 512대 x 40 s(out/one_RUN_i.log, analysis_loop6이
 25 update마다). 칸: 빈 트랙 한 바퀴 / 상자+상대 한 바퀴(중앙) / 세게 닿음 /분(빈 트랙·상대·상자·상자+상대 네 경우 평균; 벽+상자+차) /
 기억이 더 아는 것(기억으로 '이 트랙에 상자가 있나'를 맞힌 비율 - 지금 보이는 것으로 맞힌 비율, analysis/RUN_summary.log).
@@ -67,7 +68,7 @@ def eval_rows(lines, want):
                       r"상자 [\d.]+\(세게 ([\d.]+)\) 차 [\d.]+\(세게 ([\d.]+)\)", l)
         if m and cond == want:
             hard = float(m.group(4)) + float(m.group(5)) + float(m.group(6))
-            rows.setdefault(int(m.group(1)), {})[m.group(2)] = (float(m.group(3)), hard)
+            rows.setdefault(int(m.group(1)), {})[m.group(2)] = (float(m.group(3)), hard, [float(m.group(i)) for i in (4, 5, 6)])
     return rows
 
 
@@ -76,6 +77,14 @@ def cells(q):
     hard = float(np.mean([v[1] for v in q.values()])) if q else None
     f = lambda v, fmt: (fmt.format(v) if v is not None and v == v else "–")
     return f"{f(emp, '{:.2f}초')} | {f(both, '{:.2f}초')} | {f(hard, '{:.2f}')}"
+
+
+def split(q):
+    """the hard contacts of column 4 by what was hit (wall, box, car), the same mean over the four cases"""
+    if not q:
+        return "–"
+    w, b, c = np.mean([v[2] for v in q.values()], axis=0)
+    return f"{w:.2f} · {b:.2f} · {c:.2f}"
 
 
 run = sys.argv[1]
@@ -105,7 +114,13 @@ for u in sorted(set(I) | set(MEM) | set(WIPE)):
 for u, t in sorted(eval_rows(read_lines(f"{D}/one_{run}.log"), "track").items()):
     sub.append((f"u{u}", t))
 print(f"**지금 학습 {run}** ({STAGE_NOTE.get(run, '')}{f', {p} u{cut}에서 이어 받음' if p else ''}) · 학습 조건(plan대로 정확히 실행), 학습 차 512대\n")
-if WIPE or p is None:
+if not WIPE and not MEM:
+    # 11-11 (the memory shelved, the user agreed): no memory column -- what the hard contacts of column 4 were against
+    print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 그중 벽 · 상자 · 상대 차 |")
+    print("|---|---|---|---|---|")
+    for lab, q, mem in main:
+        print(f"| {lab} | {cells(q)} | {split(q)} |")
+elif WIPE or p is None:
     # 11-11 (the user agreed): the memory is judged by driving -- the same policy with its memory kept minus with its memory
     # wiped at every lap (alone, boxes staying, laps 2 on; lap_memory.py). Negative = the memory helps
     print("| checkpoint | 빈 트랙 한 바퀴 | 상자+상대 한 바퀴 | 세게 닿음 /분 | 기억을 지울 때와 비교 (−면 기억이 이득) |")
