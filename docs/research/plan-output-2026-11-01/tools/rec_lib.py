@@ -18,10 +18,11 @@ class Rec:
         z = np.load(fn, allow_pickle=False)
         self.z = z
         for k in ("st", "op", "on", "pl", "rs", "cnt", "held", "sid", "pose", "tid", "kind", "scale"):
-            setattr(self, k, z[k])
+            setattr(self, k, z[k] if k in z.files else None)     # box_response.py records carry no opponent
         self.dt = float(z["dt"]); self.T, self.B = self.rs.shape
-        self.hl, self.hw = 0.5 * float(z["car"][0]), 0.5 * float(z["car"][1])
-        self.name = str(z["name"]); self.kinds = [str(k) for k in z["kinds"]]
+        car = z["car"] if "car" in z.files else (0.58, 0.31)                # box_response.py records: the same car
+        self.hl, self.hw = 0.5 * float(car[0]), 0.5 * float(car[1])
+        self.name = str(z["name"]); self.kinds = [str(k) for k in z["kinds"]] if "kinds" in z.files else []
         self._edt, self._off, self._H, self._W = z["edt"], z["t_off"], z["t_H"].astype(int), z["t_W"].astype(int)
         self._res, self._org = z["t_res"], z["t_origin"]
         self._grid, self._fp = {}, {}
