@@ -241,6 +241,9 @@ def main(argv=None):
     ap.add_argument("--removal-p", type=float, default=-1.0,
                     help="the share of races whose obstacles are taken away mid-episode (-1 = the world's `removal_p`; 0 = none). "
                          "11-09: plan_rl never ran it, so no plan policy had seen the competition's removal")
+    ap.add_argument("--opp-restart-s", type=float, default=-1.0,
+                    help="an opponent that has stood still this long restarts half a lap away (-1 = the world's `opp_restart_s`; "
+                         "0 = never). 11-11: the opponents stood against boxes 18 % of a box race (`state_rl.OppRestart`)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
@@ -307,6 +310,9 @@ def main(argv=None):
     rm_p = float(getattr(world, "removal_p", 0.0)) if args.removal_p < 0 else float(args.removal_p)
     rm_s = tuple(getattr(world, "removal_s", (10.0, 30.0)))
     remover = SR.PropRemoval(env, rm_p, float(rm_s[0]), float(rm_s[1]), seed=args.seed) if rm_p > 0 else None
+    if args.opp_restart_s >= 0:
+        world.opp_restart_s = float(args.opp_restart_s)
+    restarter = SR.opp_restart(env, world, PS.DT)
     if args.memory and (not v2 or v3):
         raise SystemExit("--memory needs --format v2")
     if args.mem_front and not args.memory:
@@ -379,6 +385,7 @@ def main(argv=None):
         V0, D0, ST0, PTS, PVS = [], [], [], [], []
         AX = []                                                # --mem-aux: the boxes ahead at each decision
         n_removed = 0
+        n_restarted = 0
         near_sum = torch.zeros(Bl, device=dev)
         vest_err = []
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
@@ -454,6 +461,8 @@ def main(argv=None):
                     was = remover.removed.clone()
                     remover.step()
                     n_removed += int((remover.removed & ~was).sum())
+                if restarter is not None:
+                    n_restarted += restarter.step()
                 if hold:
                     hold_left = torch.where(out["restarted"], torch.zeros_like(hold_left), hold_left)
             S.append(s); X.append(sc); PV.append(pv_); U.append(u); LP.append(lp); V.append(v); VT.append(v_true)
@@ -629,7 +638,7 @@ def main(argv=None):
                "plan_hit_share": float(stats["plan_hit"].mean()) / T, "reward": float(R_.mean()),
                "shaping": float(stats["shaping"].mean()) / T, "contact_cost": float(stats["contact"].mean()) / T,
                "kl": sum(kls) / len(kls), "clipfrac": sum(cfs) / len(cfs), "vloss": sum(vls) / len(vls),
-               "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()), "removed": n_removed,
+               "vest_mae": float(torch.stack(vest_err).mean()) if vest_err else 0.0, "held_share": 1.0 - float(FM_.mean()), "removed": n_removed, "opp_restarted": n_restarted,
                "tail_loss": (sum(cls_) / len(cls_)) if cls_ else None, "tail_next_05": (sum(ce5) / len(ce5)) if ce5 else None, "near_share": float(near_sum.mean()) / T,
                "std": [round(float(x), 3) for x in actor.log_std.detach().exp()],
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
@@ -644,6 +653,7 @@ def main(argv=None):
               + (f"붙잡은 결정 {row['held_share'] * 100:.0f} % | " if hold else "")
               + (f"가까이 차·상자 {row['near_share'] * 100:.0f} % | " if hold and args.hold_clear > 0 else "")
               + (f"상자 치움 {n_removed}판 | " if remover is not None else "")
+              + (f"선 상대 차 다시 출발 {n_restarted}번 | " if restarter is not None else "")
               + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "
                  f"{(row['aux_far_recall'] or 0) * 100:.0f} % | " if row.get("aux_loss") is not None else "")
               + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")

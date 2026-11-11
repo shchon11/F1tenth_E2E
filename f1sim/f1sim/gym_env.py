@@ -2457,6 +2457,8 @@ class F1VecEnv:
                     abreast_rows = abreast
             other = self.sim.other_idx[ids, 0]
             s_part = self.sim.s[other] - gap                                  # behind the next car of the race
+            if getattr(self, "_respawn_far", False):
+                s_part = self.sim.s[other] + 0.5 * L                          # `restart_cars`: half a lap from it instead
             s = torch.remainder(torch.where(is_full, s_full, s_part), L)
             if self.slots is not None:
                 # Each car draws from its own band, and what the draw scales -- a teacher's profile
@@ -2588,6 +2590,32 @@ class F1VecEnv:
         if not fill:
             return None
         return self._fill_scans(ids, speed)
+
+    def restart_cars(self, ids: torch.Tensor, far: bool = True) -> None:
+        """Respawn these cars now, between two steps, in the race they are in (same track, same layout, same driver):
+        what `step` does for a car whose episode ended, for a caller that decides it from outside (`state_rl.OppRestart`,
+        11-11: the training world's opponents stood against boxes 18 % of a box race). `far`: half a lap from its race
+        mate rather than a spawn gap behind it -- a car that restarts mid-race should not appear at the learner's tail."""
+        if ids.numel() == 0:
+            return
+        self._respawn_far = bool(far)
+        try:
+            scans = self._reset_envs(ids)
+        finally:
+            self._respawn_far = False
+        r = self._reset_result(self.last_result, ids, scans)
+        self._plan_fallback(ids, r.state)
+        if self._tw_carry is not None:
+            self._tw_carry.reset(ids, r.state[ids, 3])
+        self._last_obs = self._obs(r)
+        for seat in self._seat_builders():
+            seat.refresh(r)
+        if self._opp_age is not None and self.M > 1:
+            # the seat's track ends (`_update_opp_visibility`'s rule), without advancing anyone's age a second time
+            done = torch.zeros(self.B, dtype=torch.bool, device=self.device); done[ids] = True
+            gone = done[:, None] | done[self.sim.other_idx]
+            self._opp_age = torch.where(gone, torch.full_like(self._opp_age, OPP_NEVER_SEEN), self._opp_age)
+        self.last_result = r
 
     def _note_spawn_formation(self, ids: torch.Tensor, abreast: torch.Tensor) -> None:
         """Record which resetting cars were placed abreast (a parked seat is in no row)."""

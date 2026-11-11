@@ -3,7 +3,7 @@
 상대 차가 있는 결정마다: 상대 차가 섰나(0.3 m/s 아래), 그때 가장 가까운 상자가 1 m 안인가, 상대 차가 상자에 닿은 횟수, 우리 차가 선 상대
 차 3 m 안에 있나. 경주에 상자가 있을 때 / 없을 때로 나눔.
 인자: checkpoint [환경 수, 기본 512] [초, 기본 40] [상대 차 설정 JSON(학습 세계의 opp_slot 대신, 예 '{"speed_scale": [0.4, 1.2],
-"kind_mix": ["layout"]}')]"""
+"kind_mix": ["layout"]}', 빈 문자열 = 그대로)] [선 상대 차를 다시 출발시키는 시간 s (0 = 안 함, 기본)]"""
 import os, sys
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import torch
@@ -25,7 +25,7 @@ ck = torch.load(ck_path, map_location=dev, weights_only=False)
 if (ck.get("args") or {}).get("plan_lat_margin") is not None:
     os.environ["F1SIM_PLAN_LAT_MARGIN"] = str(ck["args"]["plan_lat_margin"])
 OV = {"episode_s": secs + 5.0}
-if len(sys.argv) > 4:
+if len(sys.argv) > 4 and sys.argv[4]:
     OV["opp_slot"] = sys.argv[4]                                 # a different opponent set, the rest of the world unchanged
 import time
 t_b = time.time()
@@ -39,6 +39,7 @@ drv = PR.Driver(env, lim, pr, obs)
 po = env.procedural
 rm_p = float(getattr(world, "removal_p", 0.0))
 remover = SR.PropRemoval(env, rm_p, *[float(v) for v in getattr(world, "removal_s", (10.0, 30.0))], seed=SEED) if rm_p > 0 else None
+restarter = SR.OppRestart(env, float(sys.argv[5]), PS.DT) if len(sys.argv) > 5 and float(sys.argv[5]) > 0 else None
 if env.M < 2:
     raise SystemExit("이 세계에는 상대 차 자리가 없음")
 others = env.sim.other_idx[lid][:, 0]
@@ -66,6 +67,8 @@ for kd in range(int(secs / PS.DT)):
     out, _, _ = drv.decision(torch.tanh(mean), p)
     if remover is not None:
         remover.step()
+    if restarter is not None:
+        restarter.step()
     so = env.sim.state[others].float(); st = env.sim.state[lid].float()
     on = ~absent[others]
     live = po.p_sid[eid] >= 0
@@ -110,7 +113,8 @@ for kd in range(int(secs / PS.DT)):
                                ((stop_run > 2.0).float() * mm).sum(), (ours_near.float() * mm).sum(), (dc * mm).sum()])
 name = f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"
 print(f"주행 {time.time() - t_run:.0f} s ({int(secs / PS.DT)}결정, 결정당 {(time.time() - t_run) / int(secs / PS.DT) * 1000:.0f} ms, 측정 포함)", flush=True)
-print(f"{name}: 학습 세계, 학습 조건, 학습 차 {Bl}대 x {secs:.0f} s, 상대 차가 있는 결정만", flush=True)
+print(f"{name}: 학습 세계, 학습 조건, 학습 차 {Bl}대 x {secs:.0f} s, 상대 차가 있는 결정만"
+      + (f" | {restarter.after_s:g} s 동안 {restarter.move_m:g} m도 못 간 상대 차 다시 출발 {restarter.count}번" if restarter is not None else ""), flush=True)
 for k, lab in (("box", "경주에 상자 있음"), ("nobox", "상자 없음(처음부터 없거나 치운 뒤)")):
     v = acc[k]; n = max(float(v[0]), 1.0); mins = float(v[0]) * PS.DT / 60.0
     print(f"  {lab}: 상대 차 {mins:.0f}대·분 | 상대 차가 서 있음 {float(v[1]) / n * 100:.1f} % (그중 상자 1 m 안 "

@@ -1063,6 +1063,63 @@ class PropRemoval:
             self.removed |= due
 
 
+class OppRestart:
+    """A training-world opponent that has stood still restarts (11-11: in a box race the four opponent kinds hit boxes 9 times
+    a minute and made no way against them 24 % of the time -- the competition's opponents drive around the boxes; a car parked
+    on a box for the rest of the episode is this world's artefact. The user chose this small fix over opponents that follow the
+    layout's line). "Stood" is NET movement: a present opponent that is less than `move_m` from where it was `after_s` ago, a
+    scripted `stop` event not counted, is respawned in its race half a lap from the learner (`F1VecEnv.restart_cars`: same
+    track, layout, kind and speed scale). Speed is the wrong test -- the opponents' tracker backs a wedged car out after 1 s
+    and it drives into the same box again, so 40 % of the stuck time is above 0.3 m/s (a speed test found 3 % of the time,
+    median stuck episode 9 s, some to the end of the race).
+    Call `step()` once per decision (`dt_s` apart); `count` restarts so far."""
+
+    def __init__(self, env, after_s: float = 2.0, dt_s: float = 0.1, move_m: float = 0.5):
+        self.env, self.after_s, self.dt_s, self.move_m = env, float(after_s), float(dt_s), float(move_m)
+        self.opp = (env.slot > 0).nonzero().flatten() if env.M > 1 else torch.zeros(0, dtype=torch.long, device=env.device)
+        n = self.opp.numel()
+        self.K = max(int(round(self.after_s / self.dt_s)), 1)
+        self.hist = torch.zeros(self.K, n, 2, device=env.device)            # where each was at the last K calls (a ring)
+        self.i = 0
+        self.age = torch.zeros(n, dtype=torch.long, device=env.device)      # calls in a row it has been driving its episode
+        self.prev = torch.zeros(n, dtype=torch.long, device=env.device)
+        self.count = 0
+        from ..opponent_events import EVENT_ID
+        self._stop_id = int(EVENT_ID["stop"])
+
+    def step(self) -> int:
+        env = self.env
+        if self.opp.numel() == 0 or self.after_s <= 0:
+            return 0
+        o = self.opp
+        on = ~env.sim.absent[o] if getattr(env.sim, "absent_any", False) else torch.ones_like(o, dtype=torch.bool)
+        ev = getattr(env, "events", None)
+        if ev is not None:
+            on &= ~(ev.gate[o] & (ev.kind[o] == self._stop_id))            # told to stand: not stuck
+        es = env.ep_step[o].long()
+        fresh = es < self.prev                                              # its episode began anew since the last call
+        self.prev = es
+        xy = env.sim.state[o, :2].float()
+        self.age = torch.where(on & ~fresh, self.age + 1, torch.zeros_like(self.age))
+        # hist[i] is where it was K calls ago; `age > K` = that call and every one since belong to this stretch of driving
+        due = (self.age > self.K) & ((xy - self.hist[self.i]).norm(dim=1) < self.move_m)
+        self.hist[self.i] = xy
+        self.i = (self.i + 1) % self.K
+        n = int(due.sum())
+        if n:
+            env.restart_cars(o[due], far=True)
+            self.age[due] = 0
+            self.prev[due] = 0
+            self.count += n
+        return n
+
+
+def opp_restart(env, world, dt_s: float = 0.1):
+    """the world's `opp_restart_s` (0 / missing = off) as an `OppRestart`, or None"""
+    s_ = float(getattr(world, "opp_restart_s", 0.0) or 0.0)
+    return OppRestart(env, s_, dt_s) if s_ > 0 and env.M > 1 else None
+
+
 class Unwedge:
     """The old pipeline's wedge recovery (`mpc.PlanSpec.wedge_s`, which its plan tracker runs on the car), for a direct
     command: touching something below 0.4 m/s for 1 s -> back out at 0.8 m/s for 0.75 s with the steering mirrored.
