@@ -322,8 +322,15 @@ for b in range(Bl):
                 sides.append(float(np.sign(tg[0] * (c[1] - pl[i, 1]) - tg[1] * (c[0] - pl[i, 0]))))
                 touch.append(float(poly_dist(pl, q).min() < hw))
             sd = np.array(sides); sd = sd[np.isfinite(sd) & (sd != 0)]
+            # the room either side of the box and the speed, 1 s before (the walls and the other boxes; across the car's heading)
+            k1 = kc - 10 if kc >= 10 and np.hypot(*(ST[kc - 10, b, :2] - ST[kc, b, :2])) < 12.0 else kc
+            perp = np.array([-np.sin(ST[k1, b, 2]), np.cos(ST[k1, b, 2])])
+            lat = (q - c[None]) @ perp
+            rest = sid.copy(); rest[j] = -1
+            oth = boxes(rest, pose)
+            wl = free(int(TID[b]), c + perp * lat.max(), perp, oth); wr = free(int(TID[b]), c + perp * lat.min(), -perp, oth)
             passes.append(dict(b=b, j=j, kc=int(kc), clr=clr, hit=bool(hits), hard=any(hits), flips=int((np.diff(sd) != 0).sum()) if len(sd) > 1 else 0,
-                               touch=touch, v=float(np.abs(ST[k_in:k_out + 1, b, 3]).mean())))
+                               touch=touch, v=float(np.abs(ST[k_in:k_out + 1, b, 3]).mean()), wl=wl, wr=wr, v1=float(abs(ST[k1, b, 3]))))
 if passes:
     cl = np.array([p_["clr"] for p_ in passes]); hd = np.array([p_["hard"] for p_ in passes]); ht = np.array([p_["hit"] for p_ in passes])
     ok = np.isfinite(cl)
@@ -337,6 +344,21 @@ if passes:
         tc = np.array([p_["touch"] for p_ in sel], float)             # (n, 11): 1.0 s before .. the closest decision
         txt = " · ".join(f"{(10 - i) / 10:.1f} s 전 {np.nanmean(tc[:, i]) * 100:.0f} %" for i in (0, 3, 5, 7, 9) if np.isfinite(tc[:, i]).any())
         print(f"    {lab} {len(sel)}건: 앞 1 s 동안 plan이 지나가는 쪽(왼/오)이 바뀐 건 {fl:.0f} % | plan이 그 상자를 스치는 결정의 비율: {txt}", flush=True)
+    # is a hard contact likelier when both sides are open and alike (an output that cannot pick a side) or at speed?
+    wl_, wr_ = np.array([p_["wl"] for p_ in passes]), np.array([p_["wr"] for p_ in passes])
+    v1_ = np.array([p_["v1"] for p_ in passes])
+    both = np.minimum(wl_, wr_) >= NEED
+    asym = np.abs(wl_ - wr_) / np.maximum(wl_ + wr_, 1e-6)
+
+    def rate(m):
+        return f"{int(m.sum())}건 중 세게 {int(hd[m].sum())}건 = {hd[m].mean() * 100 if m.any() else 0:.2f} %"
+    print(f"    [양옆 빈 폭, 1 s 전] 양쪽 다 차가 지나갈 폭({NEED:.2f} m 이상): {rate(both)} | 한쪽만: {rate(~both)}", flush=True)
+    if both.sum() >= 30:
+        q1, q2 = np.percentile(asym[both], [33.3, 66.7])
+        print(f"    [양쪽 다 열린 건, 두 폭의 차이 |왼-오|/(왼+오)] 비슷함(<{q1:.2f}): {rate(both & (asym < q1))} | 중간: "
+              f"{rate(both & (asym >= q1) & (asym < q2))} | 한쪽이 훨씬 넓음(>{q2:.2f}): {rate(both & (asym >= q2))}", flush=True)
+    s1, s2 = np.percentile(v1_, [33.3, 66.7])
+    print(f"    [1 s 전 속도] {s1:.1f} m/s 아래: {rate(v1_ < s1)} | {s1:.1f}~{s2:.1f}: {rate((v1_ >= s1) & (v1_ < s2))} | {s2:.1f} m/s 넘게: {rate(v1_ >= s2)}", flush=True)
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.6))
     bins = np.arange(-0.2, 1.21, 0.05)
     a1.hist(np.clip(cl[ok & ~ht], -0.2, 1.2) , bins=bins, color="#4c78a8", label=f"안 닿음 {int((ok & ~ht).sum())}건")
