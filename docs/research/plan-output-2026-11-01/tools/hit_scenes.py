@@ -93,6 +93,16 @@ ST.append(env.sim.state[lid, :4].float().cpu()); OP.append(env.sim.state[others,
 ST, OP, ON, PL = torch.stack(ST).numpy(), torch.stack(OP).numpy(), torch.stack(ON).numpy(), torch.stack(PL).numpy()
 BS, BP = torch.stack(BS).numpy(), torch.stack(BP).numpy()
 TID = env.sim.tid[lid].cpu().numpy()
+_TN = list(getattr(env, "_track_names", []))
+
+
+def trk_label(t):
+    """the track's own name spelled out (a world cut down with F1SIM_WORLD_TRACKS has no 'track 0 = the original')"""
+    if t >= len(_TN):
+        return "원래 트랙" if t == 0 else f"변형 {t}"
+    import re as _re
+    w = _re.search(r"\+warp(\d+)", _TN[t]); sc = _re.search(r"\+scale(\d+)", _TN[t])
+    return ("원래 트랙" if w is None else f"변형 {int(w.group(1)) + 1}") + ("" if sc is None else f" · 크기 x{int(sc.group(1)) / 100:.2f}")
 trk = env.sim.track
 _edt = trk.edt.float().cpu().numpy(); _off = trk.t_off.cpu().numpy(); _H = trk.t_H.cpu().numpy().astype(int); _W = trk.t_W.cpu().numpy().astype(int)
 _res = trk.t_res.cpu().numpy(); _org = trk.t_origin.cpu().numpy()
@@ -424,7 +434,7 @@ for k in range(3):
             t2 = f"틈: 택한 쪽 {r['wt']:.2f} / 반대쪽 {r['wo']:.2f} m" if np.isfinite(r["wt"]) else (f"상대 {r['vo']:.1f} m/s" if r["on"] else "")
             ax.set_title(f"{'세게' if r['hard'] else '살짝'} · {r['case']} · 1 s 전 {r['v1']:.1f} -> {r['v0']:.1f} m/s"
                          + (f" · 충격 {r['sev']:.1f}" if np.isfinite(r["sev"]) else "") + f"\n{t2} · {kd * PS.DT:.1f} s"
-                         + (" · 원래 트랙" if r["tid"] == 0 else f" · 변형 {r['tid']}"), fontsize=10)
+                         + " · " + trk_label(r["tid"]), fontsize=10)
         nh = sum(r["hard"] for r in rc)
         fig.suptitle(f"{name} · {KIND[k]}에 닿음 · 갈래 '{cls}' (세게 {nh}건, 전체 {len(rc)}건) -- 파랑 = 우리 차와 2 s 자취, 빨강 = 상대 차, 갈색 = 상자, "
                      f"검은 선 = 0.5 s 전 plan, 분홍 선 = 닿는 결정의 plan, 별 = 닿은 점", fontsize=13)
