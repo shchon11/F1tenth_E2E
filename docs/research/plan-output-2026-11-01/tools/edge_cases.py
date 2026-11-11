@@ -61,7 +61,9 @@ for b in range(B):
                         u = W
                         while u > 0 and (sn[u - 1] or (u > 1 and sn[u - 2])):
                             u -= 1
-                        seg = v[t - 10: t + 1]
+                        hit_k = np.nonzero(dprop[w0: w1 + 1, b, 1] * mine > 0.5)[0]
+                        ke = w0 + int(hit_k[0]) if len(hit_k) else t          # braking up to the contact, not the speed lost IN it (11-12:
+                        seg = v[ke - 10: ke + 1]                              # that made 43 % of "hurried" passes look like hard hits)
                         drop = float((np.maximum.accumulate(seg) - seg).max())
                         pt = np.nan
                         if s[t] - s[ep0] >= 5.0 and s[ep1 - 1] - s[t] >= 2.0:
@@ -101,7 +103,7 @@ def row(m, label):
     if n == 0:
         print(f"  {label} | 0건"); return
     print(f"  {label} | {n}건 | 세게 닿음 {wil(r[:, IHARD].sum(), n)} | 닿음 전체 {r[:, ITOUCH].mean() * 100:.1f} % | 2 s 전 속도 {med(r[:, IVIN]):.2f} m/s | "
-          f"가장 느린 속도 {med(r[:, IVMIN]):.2f} m/s | 1 s 안에 1 m/s 넘게 감속 {(r[:, IDROP] >= 1.0).mean() * 100:.0f} % | 횡가속도 최대 {med(r[:, IAL]):.1f} m/s2 | "
+          f"가장 느린 속도(닿아서 멈춘 것 포함) {med(r[:, IVMIN]):.2f} m/s | 닿기 전 1 s 안에 1 m/s 넘게 감속 {(r[:, IDROP] >= 1.0).mean() * 100:.0f} % | 횡가속도 최대 {med(r[:, IAL]):.1f} m/s2 | "
           f"지나는 시간(5 m 전~2 m 뒤) {med(r[:, IPT]):.2f} s | 차가 실제로 비키기 시작 {med(r[:, IO1]):+.2f} s (끝까지 안 비킴 {np.isnan(r[:, IO1]).mean() * 100:.0f} %) | "
           f"처음 보인 때 {med(r[:, ITAU]):+.1f} s | 두 번째 이후 통과 {(r[:, IN] >= 1).mean() * 100:.0f} %")
 
@@ -149,7 +151,7 @@ print("\n[7] 길을 막은 상자, 상자 때문에 plan의 0.5 s 점이 옮겨�
 sh = R[:, ISHIFT]
 for lo_, hi_ in ((0, 0.15), (0.15, 0.4), (0.4, 0.8), (0.8, 99)):
     row(way & (sh >= lo_) & (sh < hi_), f"{lo_:g}~{hi_:g} m")
-print("\n[8] 길을 막은 상자, 지나가기 전 1 s 안에 1 m/s 넘게 감속했나 (급하게 대응한 통과)")
+print("\n[8] 길을 막은 상자, 지나가기(닿았으면 닿기) 전 1 s 안에 1 m/s 넘게 감속했나 (급하게 대응한 통과; 닿으면서 잃은 속도는 뺌)")
 row(way & (R[:, IDROP] >= 1.0), "급감속 있음"); row(way & (R[:, IDROP] < 1.0), "없음")
 if len(sys.argv) > 2:
     E = np.load(sys.argv[2]); s2, op, on, c2 = E["st"].astype(float), E["op"].astype(float), E["on"], E["cnt"]
