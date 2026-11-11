@@ -31,7 +31,7 @@ from f1sim.lidar import HIT_CAR
 torch.set_grad_enabled(False)
 ck_path, mode, n_env, secs = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
 tag = sys.argv[5] if len(sys.argv) > 5 else ""
-SEED = 4242
+SEED = int(os.environ.get("F1SIM_EVAL_SEED", 4242))      # a second seed tells how far apart two checkpoints must be to differ (11-11)
 dev = torch.device("cuda")
 a = argparse.Namespace(**json.load(open(WORLD)))
 a.envs, a.seed, a.device = n_env, SEED, "cuda"
