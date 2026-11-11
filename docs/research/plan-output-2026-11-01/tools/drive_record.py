@@ -3,7 +3,10 @@
 결정(0.1 s)마다 학습 차·상대 차의 자세와 속도, 상대 차가 있나, plan 10점, 다시 출발했나, 접촉 누적(벽·상자·상대 차, 전체 / 세게),
 상자 종류·자세, 상대 차 종류·속도 배율을 npz 하나로 저장. 지도(벽 거리 격자)와 상자 외곽선도 같이.
 인자: checkpoint 출력npz [환경 수, 기본 512] [초, 기본 40] [에피소드 길이 s, 기본 초 + 5 = 통째] [세계 설정 덮어쓰기 JSON]
-덮어쓰기 JSON의 "opp_restart_s"는 세계 설정이 아니라 선 상대 차를 다시 출발시키는 시간(state_rl.OppRestart); 그 결정은 `ors`에 기록."""
+덮어쓰기 JSON의 "opp_restart_s"는 세계 설정이 아니라 선 상대 차를 다시 출발시키는 시간(state_rl.OppRestart); 그 결정은 `ors`에 기록.
+F1SIM_HOLD=N (11-11): plan 하나를 N x 0.1 s 동안 그대로 달린 뒤에야 새 plan을 씀 (plan이 궤적으로 쓸 만한가). 학습의 --hold-p와 같은
+방식: policy는 결정마다 불려 기억이 0.1 s마다 돌고, 붙잡은 plan의 남은 부분을 지금 자세 기준으로 옮겨(`plan_steps.shift_plan`) 달리며 그것이
+다음 입력의 '지난 plan'이 됨. 새 plan을 쓴 결정은 `newp`에 기록."""
 import os, sys, json
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
@@ -50,7 +53,10 @@ i_hk, i_hx, i_hy, i_hs = (CC.index(k) for k in ("held_kind", "held_x", "held_y",
 KN = list(getattr(env, "alt_teacher_kinds", ())) + ["raceline"]
 ii = PT_IDX.to(dev)
 T = int(secs / PS.DT)
-R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors")}
+R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors", "newp")}
+HOLD = int(os.environ.get("F1SIM_HOLD", "1"))
+p_held, hold_k = None, torch.zeros(Bl, dtype=torch.long, device=dev)
+fresh = torch.ones(Bl, dtype=torch.bool, device=dev)              # rows that must plan anew (the start, a restart)
 
 
 def snap():
@@ -68,7 +74,17 @@ def snap():
 for kd in range(T):
     snap()
     _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
+    newp = fresh | (hold_k >= HOLD - 1)
+    if HOLD > 1:
+        # as plan_rl's --hold-p: a new plan is kept; rows inside a held one drive its next 0.1 s, re-expressed from where they are
+        sel = lambda A, B_: torch.where(newp.view(-1, *([1] * (A.dim() - 1))), A, B_)
+        p_held = p if p_held is None else {k_: sel(p[k_], p_held[k_]) if torch.is_tensor(p[k_]) and p[k_].dim() and p[k_].shape[0] == Bl
+                                           else p[k_] for k_ in p}
+        hold_k = torch.where(newp, torch.zeros_like(hold_k), hold_k + 1)
+        p = PS.shift_plan(p_held, hold_k)
     out, _, (x, y, _) = drv.decision(torch.tanh(mean), p)
+    fresh = out["restarted"].clone()
+    R["newp"].append(newp.cpu())
     if remover is not None:
         remover.step()
     ors = torch.zeros(env.B, dtype=torch.bool, device=dev)
