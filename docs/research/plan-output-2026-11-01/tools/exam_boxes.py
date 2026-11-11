@@ -116,7 +116,9 @@ for b in np.nonzero(box)[0]:
                             see = (W - k0) * dt; see_d = float(np.linalg.norm(pose[t - W + k0, b, j, :2] - xy[t - W + k0, b]))
                         a0 = np.searchsorted(s[: t + 1], s[t] - 4.0); a1 = min(np.searchsorted(s[: T + 1], s[t] + 2.0), T)
                         t_pass = (a1 - a0) * dt if (s[t] - s[a0] > 3.5 and s[a1] - s[t] > 1.5) else np.nan
-                        rows.append([b, j, t, n_pass, 0.0, see, see_d, touch, hard, prev_hard, v[t - n10], v[t - n10] - v[t - n10: t + 1].min(),
+                        hit_k = np.nonzero(R.d[w0: w1 + 1, b, 1] * mine > 0.5)[0]
+                        ke = max(w0 + int(hit_k[0]), n10) if len(hit_k) else t      # speed up to the contact, not through it
+                        rows.append([b, j, t, n_pass, 0.0, see, see_d, touch, hard, prev_hard, v[ke - n10], v[ke - n10] - v[ke - n10: ke + 1].min(),
                                      0.0, t_pass, float(opp[b]), c[0], c[1]])
                         i_last = len(rows) - 1
                     prev_hard = hard
@@ -167,7 +169,7 @@ if pair:
 print("\n(라) 길 위의 상자, 둘째 통과부터: 지난번 통과에서 세게 닿았나")
 line("지난번에 세게 닿음", way & (rows[:, IN] >= 2) & (rows[:, IPREV] > 0))
 line("지난번에 안 닿거나 약하게", way & (rows[:, IN] >= 2) & (rows[:, IPREV] == 0))
-print("\n(마) 길 위의 상자: 지나가기 전 1 s 동안 속도를 얼마나 줄였나")
+print("\n(마) 길 위의 상자: 닿기 직전까지(안 닿았으면 가장 가까운 순간까지) 1 s 동안 속도를 얼마나 줄였나")
 for name, lo, hi in (("거의 안 줄임 (0.5 m/s 안)", -1e9, 0.5), ("0.5-1.5 m/s", 0.5, 1.5), ("1.5 m/s 넘게 (급하게)", 1.5, 1e9)):
     line(name, way & (rows[:, IDROP] >= lo) & (rows[:, IDROP] < hi))
 print("\n(바) 길 위의 상자: 혼자 / 상대 차 있는 세션")
