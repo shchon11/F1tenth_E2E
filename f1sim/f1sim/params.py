@@ -11,6 +11,11 @@ from dataclasses import dataclass, field, fields
 from typing import Dict, Tuple
 
 
+#: The scanner's place ahead of the CoG on the car: base_link -> laser is 0.297 m (/tf_static of the recordings) and
+#: base_link is the rear axle centre, `VehicleParams.lr` behind the CoG.
+LIDAR_MOUNT_X_COG = 0.297 - 0.17145
+
+
 @dataclass
 class VehicleParams:
     # Mass / geometry (f1tenth_gym defaults, measured on the reference car)
@@ -275,7 +280,11 @@ class LidarParams:
     # which matters twice over: a lower scanner sees less over an obstacle, and where the boundary
     # is duct hose it cuts the pipe at a different height, so the gap the policy reads is not the
     # gap the car has.
-    mount_x: float = 0.297         # [m] forward of base_link (rear axle center)
+    # 2026-11-12: the simulator's pose is the CoG (dynamics.py), not base_link, and the scan is cast from pose + mount_x:
+    # with 0.297 the scanner sits at the nose tip (the body ends at CoG + 0.29), 0.171 m ahead of where it is on the car
+    # (rear axle + 0.297 = CoG + 0.126). Every policy up to plan25r was trained and is driven that way, so the default
+    # stays; a new run asks for `LIDAR_MOUNT_X_COG` (`plan_rl --lidar-mount-x`, stored in its checkpoints).
+    mount_x: float = 0.297         # [m] forward of the simulator's pose (the CoG); the car's own is LIDAR_MOUNT_X_COG
     mount_y: float = 0.0
     mount_z: float = 0.110         # [m] scan plane height above the floor at rest
     mount_yaw: float = 0.0         # [rad] mounting misalignment (randomized)

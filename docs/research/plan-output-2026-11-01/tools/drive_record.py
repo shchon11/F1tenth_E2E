@@ -29,17 +29,42 @@ OV = {"episode_s": ep_s}
 if len(sys.argv) > 6:
     OV.update(json.loads(sys.argv[6]))
 restart_s = float(OV.pop("opp_restart_s", 0.0))
+# other cars driven by copies of a policy (`plan_rl.SelfOpponents`): "self_opp" = the share of races, "self_ckpts" = the
+# checkpoints the copies come from (default: the one being recorded)
+self_share = float(OV.pop("self_opp", 0.0)); self_ckpts = OV.pop("self_ckpts", None)
+# "levels": N -> every race is reset under its own seed (the list drawn from N), the way `gym_env._reset_envs` names a level
+# for a level replay: the same N brings the same races back (track variant, boxes, opponent, start). "sample": K -> the
+# actions are drawn as in training (noise on the first step's steering and speed, the policy's own std), noise seed K
+levels = OV.pop("levels", None); noise_seed = OV.pop("sample", None)
 SEED = 4242
 dev = torch.device("cuda")
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
 if (ck.get("args") or {}).get("plan_lat_margin") is not None:
     os.environ["F1SIM_PLAN_LAT_MARGIN"] = str(ck["args"]["plan_lat_margin"])
 env, lim, world = PR.build(PR.WORLD, n_env, SEED, dev, fmt="v2", overrides=OV)
+if levels is not None:
+    class _Levels:
+        """one fixed level seed per race seat"""
+        def __init__(self, seeds):
+            self.seeds = [int(v) for v in seeds]
+
+        def choose(self, seat):
+            return self.seeds[seat]
+    env.level_replay = _Levels(np.random.default_rng(int(levels)).integers(1, 2 ** 62, env.B // env.M))
+    env.reset(seed=SEED)
 lid = env.learner_ids; Bl = int(lid.numel())
 actor = load_actor2(ck, dev)
+g_noise = None
+if noise_seed is not None:
+    g_noise = torch.Generator(device=dev); g_noise.manual_seed(int(noise_seed))
+    n_mask = torch.zeros(PS.ACT_DIM, device=dev); n_mask[0] = 1.0; n_mask[PS.N_STEP] = 1.0
 pr = PlanReward(env, float(ck["args"].get("gamma", 0.995)), dev)
 obs = PlanObs2(env, lim, pr.goal)
 drv = PR.Driver(env, lim, pr, obs)
+if self_share > 0 and env.M > 1:
+    drv.opp = PR.SelfOpponents(env, lim, self_share, seed=SEED, p_newest=0.0)
+    for pth in (self_ckpts or [ck_path]):
+        drv.opp.add(load_actor2(torch.load(pth, map_location=dev, weights_only=False), dev), os.path.basename(pth))
 po = env.procedural
 rm_p = float(getattr(world, "removal_p", 0.0))
 remover = SR.PropRemoval(env, rm_p, *[float(v) for v in getattr(world, "removal_s", (10.0, 30.0))], seed=SEED) if rm_p > 0 else None
@@ -53,7 +78,8 @@ i_hk, i_hx, i_hy, i_hs = (CC.index(k) for k in ("held_kind", "held_x", "held_y",
 KN = list(getattr(env, "alt_teacher_kinds", ())) + ["raceline"]
 ii = PT_IDX.to(dev)
 T = int(secs / PS.DT)
-R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors", "newp")}
+R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors", "newp",
+                     "copy")}
 HOLD = int(os.environ.get("F1SIM_HOLD", "1"))
 p_held, hold_k = None, torch.zeros(Bl, dtype=torch.long, device=dev)
 fresh = torch.ones(Bl, dtype=torch.bool, device=dev)              # rows that must plan anew (the start, a restart)
@@ -63,17 +89,30 @@ def snap():
     """the world as the decision about to be made sees it"""
     R["st"].append(env.sim.state[lid, :4].float().cpu()); R["op"].append(env.sim.state[others, :4].float().cpu())
     R["on"].append((~absent[others]).cpu())
-    R["sid"].append(po.p_sid[eid].to(torch.int16).cpu()); R["pose"].append(po.p_poses[eid].float().cpu())
+    if po is None:                                                 # a world without boxes (prop_fraction 0)
+        R["sid"].append(torch.full((Bl, 1), -1, dtype=torch.int16)); R["pose"].append(torch.zeros(Bl, 1, 3))
+    else:
+        R["sid"].append(po.p_sid[eid].to(torch.int16).cpu()); R["pose"].append(po.p_poses[eid].float().cpu())
     R["tid"].append(env.sim.tid[lid].to(torch.int16).cpu())
     code = env.slot_kind_code[others] if hasattr(env, "slot_kind_code") else torch.full((Bl,), -1, device=dev, dtype=torch.long)
     R["kind"].append(torch.where(code < 0, torch.full_like(code, len(KN) - 1), code).to(torch.int8).cpu())
     sc = env.teacher.speed_scale[others] if torch.is_tensor(getattr(env.teacher, "speed_scale", None)) else torch.ones(Bl, device=dev)
     R["scale"].append(sc.float().cpu())
+    # which copy drives the other car (-1: its scripted driver)
+    if drv.opp is None:
+        R["copy"].append(torch.full((Bl,), -1, dtype=torch.int8))
+    else:
+        w = torch.full((env.B,), -1, dtype=torch.long, device=dev)
+        w[drv.opp.rows] = torch.where(drv.opp.on, drv.opp.which, torch.full_like(drv.opp.which, -1))
+        R["copy"].append(w[others].to(torch.int8).cpu())
 
 
 for kd in range(T):
     snap()
-    _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
+    _, mean, log_std, v_hat, p = plan_v2(actor, obs, lim)
+    if g_noise is not None:
+        mean = mean + log_std.exp() * torch.randn(mean.shape, device=dev, generator=g_noise) * n_mask
+        p = PS.roll(torch.tanh(mean), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, lim)
     newp = fresh | (hold_k >= HOLD - 1)
     if HOLD > 1:
         # as plan_rl's --hold-p: a new plan is kept; rows inside a held one drive its next 0.1 s, re-expressed from where they are
@@ -107,7 +146,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          t_res=trk.t_res.cpu().numpy(), t_origin=trk.t_origin.cpu().numpy(),
          car=np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)]), dt=np.array(PS.DT),
          kinds=np.array(KN), cols=np.array(COLS), name=np.array(f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"),
-         ep_s=np.array(ep_s))
+         ep_s=np.array(ep_s), level=env.level_seed[lid].cpu().numpy())
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)

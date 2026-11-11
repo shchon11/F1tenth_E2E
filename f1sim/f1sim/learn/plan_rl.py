@@ -1,5 +1,5 @@
 """PPO for the redesigned planner (11-07, every choice agreed with the user step by step; see plan_steps, plan_reward,
-plan_policy). A new, plain trainer -- none of state_rl's switches (spawn behind boxes, level replay, stall price,
+plan_policy). A new, plain trainer -- none of state_rl's switches (spawn behind boxes, stall price,
 exploration floors, correlated noise, KL leashes): the world, the plan format, the reward, and PPO.
 
 * World: `configs/plan_world_korea25.json` -- Korea 2025 and 16 warped variants, the four cases (empty, opponent,
@@ -15,6 +15,10 @@ exploration floors, correlated noise, KL leashes): the world, the plan format, t
   the real car's controller follow. The policy cannot tell which plan will be held; the critic is told how many
   decisions the plan in hand still drives; held decisions are left out of the policy loss and the advantage runs
   through them undiscounted by lambda. Drive time (evaluation, console, car) re-plans every 0.1 s as before.
+* `--level-replay` (11-12, opt-in): that share of race resets replays a race this seat has had before, picked by what
+  went wrong in it (`HitLevels`). Measured on plan25r u300 before it was built (`tools/level_repeat.py`, 512 races
+  driven twice, only the exploration noise differing): a race with a hard contact has one again 59 % of the time,
+  one without 13 %; the 20 % of races that scored highest hold 55-59 % of the second drive's hard contacts.
 
 usage: python -m f1sim.learn.plan_rl --name NAME [--updates 2000] [--envs 1024] [--seed 1]"""
 from __future__ import annotations
@@ -36,7 +40,8 @@ from .plan_policy import Actor, Critic, PlanObs, plan_world, tanh_logp, PT_IDX, 
 from .plan_policy import PlanObs3, FORMAT3, STATE_DIM3, plan3_models
 from .. import plan_steps3 as P3
 from ..gym_env import PRIV_V2_PROP_KEYS, PRIV_V2_PROP_SLOTS
-from .plan_reward import PlanReward
+from .plan_reward import PlanReward, SEEN_S
+from .level_replay import LevelReplay
 
 WORLD = os.path.join(os.path.dirname(__file__), "configs", "plan_world_korea25.json")
 
@@ -46,6 +51,7 @@ def build(world: str, envs: int, seed: int, device, overrides=None, fmt: str = "
     a.envs, a.seed, a.device = envs, seed, str(device)
     for k, v in (overrides or {}).items():
         setattr(a, k, v)
+    # the scanner's place (`--lidar-mount-x` -> F1SIM_LIDAR_MOUNT_X) is read by `state_rl.build_env` itself
     env = SR.build_env(a, device)
     if fmt == "v3":
         # the plan knows the control delay (11-09): the training's execution goes through the same delay, lags and table;
@@ -117,12 +123,177 @@ def track_opp(env, goal, lid: torch.Tensor, ahead: float, behind: float = 3.0) -
     return torch.stack([okj, sel(dx), sel(dy), sel(dvx), sel(dvy)], 1)
 
 
+class SelfOpponents:
+    """A share of the other cars is driven by frozen copies of the policy (11-12). Measured that day (`opp_encounters.py`,
+    `opp_audit_scenes.py`): the four scripted kinds are one line follower (same line, same speed profile, 7-8 % off our lap
+    at scale 1.0, no perception), the training mix leaves the car near ours at 2.8 m/s against our 4.7, and our car is
+    passed 0.04 times a minute -- it never races a car of its own pace. A copy drives at our pace by construction and sees
+    with its own LiDAR.
+
+    Each race, with probability `share`, the other car is handed to one of `pool` (the learner's weights at earlier
+    updates, `add`): its inputs are its own row's LiDAR / IMU (`PlanObs2` on that row), it draws the plan's mean, and the
+    plan's first 0.1 s is driven exactly, like the learner's (`env.ideal_extra`). The scripted driver's command for such a
+    row is computed and not used (its speed scale and injected events with it). `Driver` calls `plan` / `command` /
+    `stepped` / `after` around a decision's control steps."""
+
+    def __init__(self, env, lim, share: float, seed: int = 0, max_pool: int = 4, p_newest: float = 0.5):
+        self.env, self.lim, self.share = env, lim, float(share)
+        self.rows = torch.nonzero(~env.learner).flatten()
+        dev = env.device
+        Bo = int(self.rows.numel())
+        self.obs = PlanObs2(env, lim, None, rows=self.rows)
+        self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by a copy this race
+        self.which = torch.zeros(Bo, dtype=torch.long, device=dev)    # by which of the pool
+        self.pool, self.tags, self.newest = [], [], -1
+        self.max_pool, self.p_newest = int(max_pool), float(p_newest)
+        self.gen = torch.Generator(device="cpu"); self.gen.manual_seed(int(seed) + 7717)
+        self.p = None
+        self.restarted = torch.zeros(Bo, dtype=torch.bool, device=dev)
+        self.xy = env.sim.state[self.rows, :2].clone()
+        env.ideal_extra = torch.zeros(env.B, dtype=torch.bool, device=dev)
+
+    def add(self, actor, tag) -> None:
+        """a frozen copy of `actor` joins the pool; a full pool gives up a random one of its older copies"""
+        import copy
+        a = copy.deepcopy(actor).eval()
+        for q in a.parameters():
+            q.requires_grad_(False)
+        if len(self.pool) < self.max_pool:
+            self.pool.append(a); self.tags.append(tag); self.newest = len(self.pool) - 1
+        else:
+            old = [k for k in range(len(self.pool)) if k != self.newest]
+            k = old[int(torch.randint(len(old), (1,), generator=self.gen))] if old else self.newest
+            self.pool[k], self.tags[k], self.newest = a, tag, k
+        if len(self.pool) == 1:
+            every = torch.arange(self.on.numel(), device=self.on.device)
+            self.obs.reset_rows(every)
+            self.draw(every)
+
+    def draw(self, rows: torch.Tensor) -> None:
+        """rows (into the opponent rows) whose race just started: a copy or the scripted driver, and which copy"""
+        n = int(rows.numel())
+        if n == 0:
+            return
+        dev = self.on.device
+        if not self.pool:
+            self.on[rows] = False
+            return
+        u = torch.rand(n, 3, generator=self.gen).to(dev)
+        self.on[rows] = u[:, 0] < self.share
+        k = (u[:, 2] * len(self.pool)).long().clamp_max(len(self.pool) - 1)
+        self.which[rows] = torch.where(u[:, 1] < self.p_newest, torch.full_like(k, self.newest), k)
+
+    @torch.no_grad()
+    def plan(self) -> None:
+        """before a decision's control steps: each copy-driven car's plan from its own inputs"""
+        env, obs = self.env, self.obs
+        Bo = int(self.on.numel())
+        dev = self.on.device
+        live = self.on & ~env.sim.absent[self.rows] if getattr(env.sim, "absent_any", False) else self.on
+        mean = torch.zeros(Bo, PS.ACT_DIM, device=dev)
+        v_hat = torch.zeros(Bo, device=dev)
+        if bool(live.any()):
+            s = obs.state()
+            for k, actor in enumerate(self.pool):
+                idx = torch.nonzero(live & (self.which == k)).flatten()
+                if idx.numel() == 0:
+                    continue
+                h = None
+                if getattr(actor, "memory", 0):
+                    if getattr(obs, "mem_h", None) is None or obs.mem_h.shape[1] != actor.memory:
+                        obs.mem_h = torch.zeros(Bo, actor.memory, device=dev)
+                    h = obs.mem_h[idx]
+                m, _, vh = actor(obs.scans[idx], s[idx], h)
+                if h is not None:
+                    obs.mem_h[idx] = actor.h_out
+                mean[idx] = m.float(); v_hat[idx] = vh.float()
+        self.live = live
+        self.p = PS.roll(torch.tanh(mean), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, self.lim)
+        self.restarted.zero_()
+        env.sim.ideal_vcap[self.rows[live]] = 1e3
+        env.ideal_extra.zero_()
+        env.ideal_extra[self.rows] = live
+
+    def command(self, j: int) -> None:
+        go = self.live & ~self.restarted
+        z = torch.zeros_like(self.p["cmd_d"][:, j])
+        self.env.ideal_cmd[self.rows, 0] = torch.where(go, self.p["cmd_d"][:, j], z)
+        self.env.ideal_cmd[self.rows, 1] = torch.where(go, self.p["cmd_v"][:, j], z)
+
+    def stepped(self, done: torch.Tensor) -> None:
+        self.restarted |= done[self.rows]
+
+    def after(self) -> None:
+        obs = self.obs
+        obs.push_scan()
+        obs.set_plan2(self.p)
+        # a car put somewhere else without a new race (`state_rl.OppRestart`): its scans and last plan are of the old place
+        xy = self.env.sim.state[self.rows, :2]
+        moved = (xy - self.xy).norm(dim=1) > 2.0
+        self.xy = xy.clone()
+        new = self.restarted | moved
+        if bool(new.any()):
+            obs.reset_rows(torch.nonzero(new).flatten())
+        if bool(self.restarted.any()):
+            self.draw(torch.nonzero(self.restarted).flatten())
+
+    def share_on(self) -> float:
+        """the share of the other cars in a race that a copy drives now"""
+        pres = ~self.env.sim.absent[self.rows] if getattr(self.env.sim, "absent_any", False) else torch.ones_like(self.on)
+        return float((self.on & pres).float().sum() / pres.float().sum().clamp_min(1.0))
+
+
+class HitLevels(LevelReplay):
+    """Level replay (`learn.level_replay`, one buffer per race seat) scored by what went wrong in the race instead of by
+    |advantage|: per decision played, the learner's hard contacts (walls, boxes, and cars the reward charges: seen
+    within `plan_reward.SEEN_S`) + 0.05 for a decision that ends standing (2 s standing = one hard contact). This is
+    the score `tools/level_repeat.py` ranked the races by. A race replayed keeps half of its old score (one clean
+    drive of a race the car hit in is no proof), so a race is replayed until it is driven clean a few times.
+
+    `add` after every decision (sums per seat on the GPU), `choose` (called by the env when a race resets whole) hands
+    the seat's sums over first. A race that began before the replay was switched on has no name and is not stored."""
+
+    STAND = 0.05
+
+    def __init__(self, env, lid, **kw):
+        super().__init__(env.B // env.M, **kw)
+        self.seat = env.race[lid]
+        self.sum = torch.zeros(self.n, device=env.device)
+        self.cnt = torch.zeros(self.n, device=env.device)
+        self.ended, self.ended_hit = 0, 0                      # races handed over / of them with a score above 0
+
+    def add(self, score: torch.Tensor, live: torch.Tensor) -> None:
+        """score (B_l,) of the decision just driven; live (B_l,) bool = rows whose race did not reset in it"""
+        self.sum.index_add_(0, self.seat[live], score[live].float())
+        self.cnt.index_add_(0, self.seat[live], torch.ones_like(score[live], dtype=torch.float))
+
+    def choose(self, seat: int) -> int:
+        n = int(self.cnt[seat])
+        if self.cur[seat] >= 0 and n > 0:
+            sm = float(self.sum[seat])
+            self.accumulate(seat, self.cur[seat], sm, n)
+            self.ended += 1; self.ended_hit += int(sm > 0)
+        self.sum[seat] = 0.0; self.cnt[seat] = 0.0
+        return super().choose(seat)
+
+    def _commit(self, seat: int) -> None:
+        s = self.cur[seat]
+        if s < 0 or self.play_cnt[seat] == 0:
+            return
+        b = self.buf[seat]
+        new = self.play_sum[seat] / self.play_cnt[seat]
+        b[s] = [0.5 * b[s][0] + 0.5 * new if s in b else new, self.tick]
+        if len(b) > self.size:
+            del b[min(b, key=lambda k: b[k][0])]
+
+
 class Driver:
     """drives the learner rows one decision: plan from the action, the 4 control steps, the reward"""
 
     def __init__(self, env, lim, pr: PlanReward, obs: PlanObs):
         self.env, self.lim, self.pr, self.obs = env, lim, pr, obs
         self.lid = env.learner_ids
+        self.opp = None                                        # `SelfOpponents`: other cars driven by copies of the policy
         self.act0 = torch.zeros(env.B, env.act_dim, device=env.device)
         from ..lidar import HIT_CAR
         self._hit_car = HIT_CAR
@@ -141,12 +312,18 @@ class Driver:
         pts = torch.stack([x[:, idx], y[:, idx]], -1)
         env.sim.ideal_vcap[lid] = 1e3
         restarted = torch.zeros(lid.numel(), dtype=torch.bool, device=a.device)
+        if self.opp is not None:
+            self.opp.plan()
         for j in range(PS.SUB):
             cmd_d = torch.where(restarted, torch.zeros_like(p["cmd_d"][:, j]), p["cmd_d"][:, j])
             cmd_v = torch.where(restarted, torch.zeros_like(p["cmd_v"][:, j]), p["cmd_v"][:, j])
             env.ideal_cmd[lid, 0] = cmd_d; env.ideal_cmd[lid, 1] = cmd_v
+            if self.opp is not None:
+                self.opp.command(j)
             _, _, te, trc, _ = env.step(self.act0)
             restarted |= (te | trc)[lid]
+            if self.opp is not None:
+                self.opp.stepped(te | trc)
             r = env.last_result
             self.pr.control_step((r.scan_type[lid] == self._hit_car).any(1))     # a beam ended on a car
         price, hit = pc["price"], pc["hit"].float()
@@ -162,6 +339,8 @@ class Driver:
         if bool(restarted.any()):
             rows = torch.nonzero(restarted)[:, 0]
             self.obs.reset_rows(rows)
+        if self.opp is not None:
+            self.opp.after()
         out["restarted"] = restarted
         return out, p, (x, y, psi)
 
@@ -244,6 +423,21 @@ def main(argv=None):
     ap.add_argument("--opp-restart-s", type=float, default=-1.0,
                     help="an opponent that has stood still this long restarts half a lap away (-1 = the world's `opp_restart_s`; "
                          "0 = never). 11-11: the opponents stood against boxes 18 % of a box race (`state_rl.OppRestart`)")
+    ap.add_argument("--level-replay", type=float, default=0.0,
+                    help="share of race resets that replay a race this seat had before, picked by its hard contacts and "
+                         "standing time (`HitLevels`); 0 = every race new")
+    ap.add_argument("--level-replay-size", type=int, default=24, help="races kept per seat")
+    ap.add_argument("--level-replay-from", type=int, default=0,
+                    help="switch the replay on at this update: before the car laps, the standing-time score ranks the "
+                         "races by how badly the policy drives everywhere, not by the race")
+    ap.add_argument("--lidar-mount-x", type=float, default=0.0,
+                    help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
+                         "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
+                         "axle + 0.297). Stored in the checkpoint; tools take it from F1SIM_LIDAR_MOUNT_X")
+    ap.add_argument("--track-scales", default="",
+                    help="size variants added to the world's tracks: per cents, comma-separated, or 'korea25' = "
+                         "`state_rl.TRACK_SCALES_25` (0.60-0.92 and 1.08-1.20 of a warp each; 11-12, the user: \"트랙 변형도 스케일 "
+                         "자체가 변하는것도\"). '' = the world's `track_scales` (none in plan_world_korea25)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--runs", default=os.path.expanduser("~/f1sim_runs"))
@@ -256,7 +450,16 @@ def main(argv=None):
     os.makedirs(run, exist_ok=True)
     if args.plan_lat_margin != 1.0:
         os.environ["F1SIM_PLAN_LAT_MARGIN"] = str(args.plan_lat_margin)   # every Limits built in this process
-    env, lim, world = build(args.world, args.envs, args.seed, dev, fmt=args.format)
+    if args.lidar_mount_x > 0:
+        os.environ["F1SIM_LIDAR_MOUNT_X"] = str(args.lidar_mount_x)
+    else:
+        os.environ.pop("F1SIM_LIDAR_MOUNT_X", None)                       # the checkpoint says 0: build it that way
+    os.environ.pop("F1SIM_WORLD_TRACKS", None)                            # a measurement tool's track choice never trains
+    ov = {}
+    if args.track_scales:
+        ov["track_scales"] = (list(SR.TRACK_SCALES_25) if args.track_scales == "korea25"
+                              else [int(x_) for x_ in args.track_scales.split(",")])
+    env, lim, world = build(args.world, args.envs, args.seed, dev, overrides=ov, fmt=args.format)
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
     pr.plan_hit_share = float(args.plan_hit_share)
@@ -313,6 +516,8 @@ def main(argv=None):
     if args.opp_restart_s >= 0:
         world.opp_restart_s = float(args.opp_restart_s)
     restarter = SR.opp_restart(env, world, PS.DT)
+    levels = (HitLevels(env, lid, p_replay=args.level_replay, size=args.level_replay_size, seed=args.seed)
+              if args.level_replay > 0 else None)
     if args.memory and (not v2 or v3):
         raise SystemExit("--memory needs --format v2")
     if args.mem_front and not args.memory:
@@ -391,6 +596,11 @@ def main(argv=None):
         stats = {k: torch.zeros(Bl, device=dev) for k in ("lap", "shaping", "contact", "plan_hit_cost", "plan_hit")}
         speed_sum, stop_sum = torch.zeros(Bl, device=dev), torch.zeros(Bl, device=dev)
         c0 = pr.n_contacts.clone()
+        if levels is not None and upd == max(1, args.level_replay_from):
+            env.level_replay = levels                          # races reset from here on are named and scored
+            print(f"[plan_rl] level replay on: {args.level_replay:g} of the resets, {args.level_replay_size} races per seat",
+                  flush=True)
+        lv0 = (levels.n_new, levels.n_replay, levels.ended, levels.ended_hit) if levels is not None else None
         tr0 = time.time()
         actor.eval(); critic.eval()
         for t in range(T):
@@ -453,7 +663,14 @@ def main(argv=None):
                     if args.hold_clear > 0:
                         start &= ~near
                     hold_left = torch.where(start, more, torch.where(newp, torch.zeros_like(hold_left), hold_left - 1))
+                if levels is not None:
+                    hard0 = env.sim.contact_counts[lid, 3:6].clone()
                 out, p, (xw_, yw_, _) = drv.decision(torch.tanh(u), p, charge=newp if hold else None)
+                if levels is not None and env.level_replay is not None:
+                    hd = (env.sim.contact_counts[lid, 3:6] - hard0).clamp_min(0).float()
+                    hd[:, 2] = hd[:, 2] * (pr.seen_t <= SEEN_S + PS.DT).float()      # a car the reward charges for
+                    levels.add(hd.sum(1) + HitLevels.STAND * (env.sim.state[lid, dyn.IVX].abs() < 0.3).float(),
+                               ~out["restarted"])
                 if tailc:
                     ii_ = PT_IDX.to(dev)
                     PTS.append(torch.stack([xw_[:, ii_], yw_[:, ii_]], -1)); PVS.append(p["pv"].clone())
@@ -645,6 +862,11 @@ def main(argv=None):
                "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
                "aux_opp_loss": (sum(alo) / len(alo)) if alo else None,
                "smooth_loss": (sum(sms) / len(sms)) if sms else None}
+        if levels is not None:
+            n_new, n_rep = levels.n_new - lv0[0], levels.n_replay - lv0[1]
+            n_end, n_hit = levels.ended - lv0[2], levels.ended_hit - lv0[3]
+            row.update(replay_share=n_rep / max(1, n_new + n_rep), replay_ended=n_end, replay_ended_scored=n_hit,
+                       replay_buffer=levels.stats()["buffer_mean"], replay_score=levels.stats()["score_mean"])
         log.write(json.dumps(row) + "\n"); log.flush()
         print(f"[{time.strftime('%H:%M')}] 업데이트 {upd} | 바퀴 {row['laps_per_min']:.2f}/분 | 속도 {row['speed']:.2f} m/s | 멈춤 "
               f"{row['stopped'] * 100:.0f} % | 접촉 벽 {row['contacts_wall_per_min']:.2f} 상자 {row['contacts_prop_per_min']:.2f} 차 "
@@ -654,6 +876,8 @@ def main(argv=None):
               + (f"가까이 차·상자 {row['near_share'] * 100:.0f} % | " if hold and args.hold_clear > 0 else "")
               + (f"상자 치움 {n_removed}판 | " if remover is not None else "")
               + (f"선 상대 차 다시 출발 {n_restarted}번 | " if restarter is not None else "")
+              + (f"다시 낸 경주 {row['replay_share'] * 100:.0f} % (끝난 경주 {row['replay_ended']} 중 점수 있는 것 "
+                 f"{row['replay_ended_scored']}, 자리당 {row['replay_buffer']:.1f}개) | " if levels is not None else "")
               + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "
                  f"{(row['aux_far_recall'] or 0) * 100:.0f} % | " if row.get("aux_loss") is not None else "")
               + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")

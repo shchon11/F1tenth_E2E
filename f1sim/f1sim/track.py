@@ -280,7 +280,7 @@ class Track:
         through and the infield never opens. A widening that would join two parts of the lap that a
         thin wall separates is detected (adjacent lane cells whose nearest centerline points are
         > 2 m of lap apart) and that edit is dropped. The lane never goes below `min_half` per side
-        at the centerline. New wall cells take the duct / tall class of the nearest old wall cell."""
+        at the centerline. New wall cells take the duct / tall class of the nearest old cell that has one."""
         if self.centerline is None:
             raise ValueError("a warp needs a centerline")
         if getattr(self, "props", ()):
@@ -391,7 +391,15 @@ class Track:
         occ = occ0.copy()
         occ[drive_new] = False
         occ |= new_wall
-        idx = ndimage.distance_transform_edt(~occ0, return_distances=False, return_indices=True)
+        # The class comes from the nearest old cell that HAS one (duct or tall), not from the nearest old wall cell: where
+        # the lane moves outward past the old shell, a new wall cell lies in the old unseen band (occupied, neither duct nor
+        # tall -- the unknown space around a SLAM map, the floor behind a shell) and is its own nearest wall cell, so it
+        # stayed unseen: a wall the car hits and the LiDAR reads through (12 m of 2311 m over Korea 2025's 16 warps)
+        classed = np.zeros_like(occ0)
+        for m_ in (self.duct, self.tall):
+            if m_ is not None:
+                classed = classed | m_
+        idx = ndimage.distance_transform_edt(~(classed if classed.any() else occ0), return_distances=False, return_indices=True)
         nearest = lambda m: m[idx[0], idx[1]]
         duct = tall = None
         if self.duct is not None:
@@ -406,6 +414,34 @@ class Track:
                                  duct_height=self.duct_height)
         t.warp_edits = [f"scale {sc:.3f}"] + edits
         # what `Raceline.build_cached` needs to start the warped venue's line from the original's
+        t.warp_parent, t.warp_scale, t.warp_center = self, sc, (cx, cy)
+        return t
+
+    def with_scale(self, sc: float) -> "Track":
+        """The same venue built `sc` times as big (2026-11-12, the user: "트랙 변형도 스케일 자체가 변하는것도"): lane
+        width, corner radius and lap length all times `sc`, about the grid's centre. `with_warp` moves the size by a few per
+        cent only (0.96-1.04 over Korea 2025's sixteen); the real venues' lanes run from 1.4 m to 3.4 m at the median (Korea
+        2025: 3.1 m, Korea 2026: 1.9 m), which is this factor at 0.45-1.1.
+
+        Done by the cell size, as `with_warp` does it, so no cell is resampled and every wall keeps its class; the price is
+        that a wall's thickness scales too (the car reads and touches its face, so only wall ends differ). Heights do not
+        scale. The line the opponents follow starts from this track's own (`warp_parent`)."""
+        sc = float(sc)
+        if not 0.3 <= sc <= 3.0:
+            raise ValueError(f"scale {sc}: outside 0.3-3")
+        if getattr(self, "props", ()):
+            raise ValueError("a scale changes the grid; placed props would have to move with it (not done)")
+        res = self.resolution
+        H, W = self.occupancy.shape
+        cx, cy = self.origin[0] + W * res / 2, self.origin[1] + H * res / 2
+        origin = (cx - (cx - self.origin[0]) * sc, cy - (cy - self.origin[1]) * sc)
+        cl = self.centerline
+        if cl is not None:
+            cl = np.stack([cx + (cl[:, 0] - cx) * sc, cy + (cl[:, 1] - cy) * sc], 1)
+        t = Track.from_occupancy(self.occupancy.copy(), res * sc, origin, cl, f"{self.name}_scale{sc:.2f}",
+                                 duct=None if self.duct is None else self.duct.copy(),
+                                 tall=None if self.tall is None else self.tall.copy(), duct_height=self.duct_height)
+        t.warp_edits = list(getattr(self, "warp_edits", [])) + [f"scale x{sc:.2f}"]
         t.warp_parent, t.warp_scale, t.warp_center = self, sc, (cx, cy)
         return t
 

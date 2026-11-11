@@ -101,9 +101,9 @@ def tanh_logp(u: torch.Tensor, mean: torch.Tensor, log_std: torch.Tensor) -> tor
 class PlanObs:
     """the actor's and the critic's inputs for the learner rows of `env`, and each row's last plan"""
 
-    def __init__(self, env, lim: PS.Limits, goal=None):
+    def __init__(self, env, lim: PS.Limits, goal=None, rows: Optional[torch.Tensor] = None):
         self.env, self.lim, self.goal = env, lim, goal
-        self.lid = env.learner_ids
+        self.lid = env.learner_ids if rows is None else rows       # `rows`: other cars' rows (a policy-driven opponent)
         Bl = int(self.lid.numel())
         self.beams = int(env.sim.lidar.angles.numel())
         self.range = float(env.sim.cfg.lidar.range_max)
@@ -229,7 +229,13 @@ class PlanRunner:
             self.obs = PlanObs3(env, self.lim, None)
             self.act3, self.turn3 = plan3_models(env, self.lim, device)
         elif self.v2:
-            self.actor = load_actor2(ck, device)
+            # the console's env is not built per checkpoint: move its scanner to where this one's training had it
+            mx = lidar_mount_of(ck) or float(type(env.cfg.lidar)().mount_x)
+            if abs(float(env.cfg.lidar.mount_x) - mx) > 1e-6:
+                env.cfg.lidar.mount_x = mx
+                env.sim.params.set_all("mount_x", mx)
+                print(f"[plan] LiDAR {mx:.3f} m ahead of the CoG (the checkpoint's)", flush=True)
+            self.actor = load_actor2(ck, device, check_mount=False)
             self.obs = PlanObs2(env, self.lim, None)
         else:
             self.actor = load_actor(ck, device)
@@ -432,14 +438,14 @@ class Actor2(nn.Module):
 class PlanObs2(PlanObs):
     """v2's inputs: LiDAR (as v1), the raw IMU, the last commands, the last plan in its own frame"""
 
-    def __init__(self, env, lim: PS.Limits, goal=None):
-        Bl = int(env.learner_ids.numel())
+    def __init__(self, env, lim: PS.Limits, goal=None, rows: Optional[torch.Tensor] = None):
+        Bl = int((env.learner_ids if rows is None else rows).numel())
         dev = env.device
         self.rel = torch.zeros(Bl, PS.N_STEP - 1, 2, device=dev)     # last plan's points 2..10 in its 0.1 s pose's frame
         self.rel_v = torch.zeros(Bl, PS.N_STEP, device=dev)          # its speeds
         self.cmd_d = torch.zeros(Bl, device=dev)                     # its steering / speed 0.1 s in: what was commanded
         self.cmd_v = torch.zeros(Bl, device=dev)
-        super().__init__(env, lim, goal)
+        super().__init__(env, lim, goal, rows)
 
     def reset_rows(self, rows: torch.Tensor) -> None:
         super().reset_rows(rows)
@@ -481,7 +487,19 @@ class PlanObs2(PlanObs):
         return torch.cat([super().priv(), st[:, dyn.IVX:dyn.IVX + 1].float(), st[:, dyn.ISTEER:dyn.ISTEER + 1].float()], 1)
 
 
-def load_actor2(ck: dict, device) -> Actor2:
+def lidar_mount_of(ck: dict) -> float:
+    """the scanner's place ahead of the CoG a checkpoint was trained with (0 = the config's default, the nose tip)"""
+    return float((ck.get("args") or {}).get("lidar_mount_x") or 0.0)
+
+
+def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
+    # 11-12: a policy reads the scan from where its training's scanner sat; `state_rl.build_env` places it by F1SIM_LIDAR_MOUNT_X
+    if check_mount:
+        want, have = lidar_mount_of(ck), float(os.environ.get("F1SIM_LIDAR_MOUNT_X") or 0.0)
+        if abs(want - have) > 1e-6:
+            raise SystemExit(f"this checkpoint was trained with the LiDAR at {want or 'the default 0.297'} m ahead of the CoG, the "
+                             f"environment is built with {have or 'the default 0.297'}: set F1SIM_LIDAR_MOUNT_X="
+                             f"{want if want else ''} before the environment is built")
     aux = ck["actor"].get("aux.weight")
     actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)),
                    memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0,

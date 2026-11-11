@@ -1431,6 +1431,9 @@ class F1VecEnv:
         Before the first step / graph capture: the roll reads the flag when it is compiled."""
         self.sim.ideal_rows = self.learner.clone()
         self.ideal_cmd = torch.zeros(self.B, 2, device=self.device)
+        # other cars that drive `ideal_cmd` too (B,) bool, e.g. the ones a frozen copy of the policy plans for
+        # (`plan_rl.SelfOpponents`); their scripted driver's command is then not used. None = the learner's rows only
+        self.ideal_extra = None
         # `lag` (11-09, `plan_steps3`): the command goes through the nominal car's delay, servo and speed loop
         self.sim.ideal_lag = bool(lag)
         self.sim.ideal_turn = turn                                   # `plan_steps3.Turning` (MAP's table), else the bicycle
@@ -3225,8 +3228,9 @@ class F1VecEnv:
         if self.ideal_cmd is not None:
             # ideal execution (`enable_ideal`, 11-07 redesign): the learner's rows drive the command they were handed
             # exactly (`Sim.ideal_rows`); whatever the tracker made of their action is not used
-            self.sim.ideal_rows.copy_(self.learner)
-            cmd = torch.where(self.learner[:, None], self.ideal_cmd, cmd)
+            m_i = self.learner if getattr(self, "ideal_extra", None) is None else (self.learner | self.ideal_extra)
+            self.sim.ideal_rows.copy_(m_i)
+            cmd = torch.where(m_i[:, None], self.ideal_cmd, cmd)
         steer_norm = cmd[:, 0] / self.s_max
         r = self.sim.step(cmd)
         self.last_cmd = cmd

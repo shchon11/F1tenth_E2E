@@ -38,6 +38,22 @@ def test_warp_is_deterministic_keeps_one_lane_and_its_width_floor():
         assert not drive[0, :].any() and not drive[-1, :].any()      # the outside never opens
 
 
+def test_every_wall_of_a_warp_is_seen_by_the_lidar():
+    """a boundary moved outward past the old shell lands in the band the LiDAR does not see (occupied, neither duct nor
+    tall); its new wall must still get a class, or the car hits a wall its scan reads through"""
+    t = ring()
+    assert (t.occupancy & ~t.duct & ~t.tall).any()                    # the ring has such a band behind its shell
+    for seed in range(6):
+        w = t.with_warp(seed)
+        cl = w.centerline
+        j = ((cl[:, 0] - w.origin[0]) / w.resolution).astype(int)
+        i = ((cl[:, 1] - w.origin[1]) / w.resolution).astype(int)
+        lab, _ = ndimage.label(~w.occupancy)
+        drive = lab == lab[i[0], j[0]]
+        edge = w.occupancy & ndimage.binary_dilation(drive)           # the cells a beam leaving the lane enters first
+        assert not (edge & ~(w.duct | w.tall)).any()
+
+
 def test_slot_present_round_trips_and_is_validated():
     s = OpponentSlot.from_dict({"kind": "forzaeth", "present": 0.4})
     assert s.present == 0.4 and OpponentSlot.from_dict(s.to_dict()).present == 0.4

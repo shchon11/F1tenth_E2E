@@ -235,6 +235,13 @@ def _load_base(name: str, bare: bool = False, **kw) -> Track:
     """
     name, b = _split_bare(name)
     bare = bare or b
+    if "+scale" in name:                                   # x+scale<per cent>: the venue built that much bigger / smaller
+        base, _, spec = name.rpartition("+scale")
+        if not spec.isdigit():
+            raise ValueError(f"+scale takes a whole per cent (x+scale072 = 0.72 times the size): {name!r}")
+        t = _load_base(base, bare=bare, **kw).with_scale(int(spec) / 100.0)
+        t.name = name
+        return t
     if "+warp" in name:                                    # x+warp<seed>: the venue as rebuilt another day
         base, _, spec = name.rpartition("+warp")
         if not spec.isdigit():

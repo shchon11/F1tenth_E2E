@@ -33,6 +33,9 @@ a.prop_shapes = os.environ.get("BANK_SHAPES", getattr(a, "prop_shapes", "all")) 
 # 11-06 14:20: the checkpoint's own --prop-bank made the env draw from THAT bank (place "bank"), so the first "box" bank was the
 # old one re-judged (every catalogue piece); a bank is always drawn fresh
 a.prop_bank = ""
+# 11-12: BANK_TRACKS="이름,이름" = 이 트랙들만(뒤튼 것·크기 바꾼 것을 이름 그대로; 이미 있는 은행 옆에 새 파일로 더할 때)
+if os.environ.get("BANK_TRACKS"):
+    a.tracks, a.warps, a.track_scales = os.environ["BANK_TRACKS"], 0, None
 env = SR.build_env(a, dev)
 proc = env.procedural
 names = getattr(env, "_track_names", None) or [SR.KOREA]

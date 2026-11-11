@@ -37,11 +37,39 @@ AHEAD = (1.0, 2.0, 3.0, 4.0, 5.0, 6.5, 8.0, 10.0, 12.0, 15.0, 18.0, 22.0, 26.0)
 KOREA = "real:korea_2026_competition"
 
 
+#: Korea 2025's size variants (per cent of the warp they are made from; the warp's own 0.96-1.04 multiplies in, so the sizes
+#: applied are 0.58-1.19). Lane width of the real venues (median over the driving region's middle ridge,
+#: tools/scale_variants_fig.py): Korea 2025 2.8 m, Korea 2026 1.9 m (0.67 of it), ICRA 2022 1.7 m (0.59), map16x07 1.4 m
+#: (0.50), the widest (TU Wien 2021) 3.4 m (1.21). 0.95-1.05 is left out: the warps themselves are there.
+TRACK_SCALES_25 = [60, 63, 65, 68, 71, 74, 78, 81, 84, 88, 92, 108, 111, 114, 117, 120]
+
+
+def scale_variants(bases, warps, scales):
+    """`track_scales` (11-12, the user: "트랙 변형도 스케일 자체가 변하는것도"): the names of the size variants a world adds to
+    its tracks. `scales` = the sizes in per cent ([60, 63, ... 120]); the k-th goes to warp (7 k mod warps) of each base (the
+    base itself without warps), so the sizes spread over the warps' own wall edits instead of following their order. The
+    unscaled tracks stay in the set, first, with their indices."""
+    if not scales:
+        return []
+    out = []
+    for b in bases:
+        for k, pc in enumerate(scales):
+            src = f"{b}+warp{(7 * k) % warps}" if warps else b
+            out.append(f"{src}+scale{int(pc):03d}")
+    if len(set(out)) != len(out):
+        raise ValueError(f"track_scales {scales}: the same variant twice (more sizes than warps need distinct sizes per warp)")
+    return out
+
+
 def build_env(a, device, extra=None):
     # `--tracks` (11-01): the base maps, each with its --warps variants -- Korea alone left the plan teacher unable to
     # drive ICRA 2022 (laps 20-22 s, 26 wall touches a minute) or ICCAS (19 a minute) in the console
     bases = [t.strip() for t in str(getattr(a, "tracks", "") or KOREA).split(",") if t.strip()]
     tracks = [x for b in bases for x in [b] + ([f"{b}+warp{k}" for k in range(int(a.warps))] if a.warps else [])]
+    tracks += scale_variants(bases, int(a.warps or 0), getattr(a, "track_scales", None))
+    if os.environ.get("F1SIM_WORLD_TRACKS"):
+        # measurement tools: the same world on exactly these tracks (e.g. the size variants of one band), nothing else changed
+        tracks = [t.strip() for t in os.environ["F1SIM_WORLD_TRACKS"].split(",") if t.strip()]
     # the racelines the planner opponents follow: the training world's (the cache key is every Raceline.build argument)
     limits = common.teacher_limits(7.0, 6.5, 4.0)
     trs, rls = common.load_tracks(tracks, racelines=(a.stage == "race" or bool(getattr(a, "path_plan", 0))),
@@ -49,6 +77,13 @@ def build_env(a, device, extra=None):
     cfg = Config()
     cfg.sim.compile = False
     cfg.lidar.n_beams = int(a.beams)
+    # the scanner where it is on the car (params.LIDAR_MOUNT_X_COG): the world's own `lidar_mount_x`, else F1SIM_LIDAR_MOUNT_X --
+    # read HERE so that every tool building this world (plan_rl.build or directly) gets the place `plan_policy.load_actor2`
+    # checks the checkpoint against; an explicit 0 keeps the old nose-tip place
+    _mx = getattr(a, "lidar_mount_x", None)
+    _mx = float(os.environ.get("F1SIM_LIDAR_MOUNT_X") or 0.0) if _mx is None else float(_mx or 0.0)
+    if _mx > 0:
+        cfg.lidar.mount_x = _mx
     cfg.rand.ranges["vehicle.mu"] = (1.0, 1.0)
     cfg.rand.ranges["vehicle.mu_f_scale"] = (0.92, 0.92)
     e = dict(action_mode="direct", max_steps=int(a.episode_s * 40), speed_cap=10.0, v_max_policy=10.0,

@@ -7,7 +7,7 @@
 # 쓰는 법: CUDA_VISIBLE_DEVICES=1 bash slot5060.sh timeout 1500 python3 ...
 L=/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/out/.slot5060
 ALL=0
-case " $* " in *plan_validate.py*" 1024 "*) ALL=1 ;; esac
+case " $* " in *plan_validate.py*" 1024 "*|*box_response.py*" 1024 "*) ALL=1 ;; esac    # (11-12) box_response runs the policy twice
 if [ $ALL = 1 ]; then
   while [ "$(awk '/MemAvailable/ {print $2}' /proc/meminfo)" -lt 3500000 ]; do sleep 10; done
   exec 8>$L.0; flock 8
