@@ -1,9 +1,9 @@
 """빈 트랙에서 학습된 planner가 달린 라인이 보상 때문에 어느 쪽으로 끌렸나 (11-08 05:00, 사용자: "빈 트랙에서 달리는 저 라인이 보상설계에
 의해 편향될가능성이 있나?"). 원래 트랙(변형 없음), 빈 트랙, 상대 없음으로 차 N대를 몰아(조건: ideal = 학습 조건 / map = 실차 조건) 지나간
-자리·속도를 기록하고, 두 선과 겹쳐 그림: 결승선까지 벽 사이 최단 경로(중간 점수의 기준) -- 여기 붙으면 중간 점수 쪽으로 끌린 것. 그 선까지의 거리 중앙도 셈.
+자리·속도를 기록해 지도 위에 그림(색 = 속도). 겹쳐 그리는 선은 없음(11-12: 보상의 거리장을 따라 내려가 그리던 최단 경로가 몇 m에서 끊겨 있었음 -> 뺌).
 (11-09 사용자: 레이싱라인은 쓰지 않으니 그림·계산에서 뺌)
 인자: checkpoint 조건(ideal|map) 차수 초 출력png"""
-import os, sys, math, argparse, json
+import os, sys, argparse, json
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 import numpy as np
 import torch
@@ -14,7 +14,6 @@ from matplotlib import font_manager as fm
 sys.path.insert(0, "/home/shchon11/F1tenth_E2E/f1sim")
 from f1sim.learn import state_rl as SR
 from f1sim.learn.graph_runtime import prepare_graph_runtime
-from f1sim.learn.plan_reward import GoalField
 from f1sim.learn.plan_policy import PlanObs, load_actor, plan_world, plan_segments, PT_IDX, PlanObs2, load_actor2, plan_v2
 from f1sim.learn.plan_rl import WORLD
 from f1sim import plan_steps as PS
@@ -77,44 +76,20 @@ for kd in range(int(secs / PS.DT)):
 XY = np.stack(XY, 1); SP = np.stack(SP, 1)                    # (B, T, 2), (B, T)
 skip = int(3.0 / env.sim.control_dt)                          # the start (standing) aside
 XYd, SPd = XY[:, skip:], SP[:, skip:]
-# the lines to compare with: the shortest path to the finish (the shaping's measure) and the min-time raceline
+# no line is overlaid: the descent along the reward's distance field stopped a few metres after the start (cause not looked into),
+# so the dashed "shortest path" was a stub and the "distance to it" read 6.3-6.9 m in every plan25r / plan25x picture
 tr = env.sim.track
-goal = GoalField(tr, dev)
-# shortest path: from just past the finish line, follow the distance field down (8-neighbour descent on the grid)
 res = float(tr.t_res[0]); ox, oy = [float(v) for v in tr.t_origin[0]]; H, W = int(tr.t_H[0]), int(tr.t_W[0]); off = int(tr.t_off[0])
-D = goal.field[off: off + H * W].view(H, W).cpu().numpy()
-xy0, yaw0 = tr.pose_at_s(torch.zeros(1, device=tr.t_res.device), torch.zeros(1, dtype=torch.long, device=tr.t_res.device))
-p0 = xy0[0].cpu().numpy() + 0.3 * np.array([math.cos(float(yaw0[0])), math.sin(float(yaw0[0]))])
-i, j = int(round((p0[1] - oy) / res)), int(round((p0[0] - ox) / res))
-sp_path = []
-for _ in range(20000):
-    sp_path.append((ox + j * res, oy + i * res))
-    best, bi, bj = D[i, j], i, j
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            ii, jj = i + di, j + dj
-            if 0 <= ii < H and 0 <= jj < W and np.isfinite(D[ii, jj]) and D[ii, jj] < best:
-                best, bi, bj = D[ii, jj], ii, jj
-    if (bi, bj) == (i, j) or best <= 0.05:
-        break
-    i, j = bi, bj
-sp_path = np.array(sp_path)
-def dist_to(line, pts):
-    d = np.sqrt(((pts[:, None, :] - line[None, ::2, :]) ** 2).sum(-1)).min(1)
-    return d
-pts = XYd.reshape(-1, 2)[::5]
-d_sp = dist_to(sp_path, pts)
 occ = tr.edt[off: off + H * W].view(H, W).cpu().numpy() <= 0
 ext = [ox - res / 2, ox + (W - 0.5) * res, oy - res / 2, oy + (H - 0.5) * res]
-fig, ax = plt.subplots(1, 1, figsize=(16, 9))
+fig, ax = plt.subplots(1, 1, figsize=(11.5, 9))
 ax.imshow(~occ, cmap="gray", origin="lower", extent=ext, alpha=0.5)
 for b in range(B):
     sc = ax.scatter(XYd[b, ::4, 0], XYd[b, ::4, 1], c=SPd[b, ::4], s=2, cmap="turbo", vmin=0, vmax=8)
-ax.plot(sp_path[:, 0], sp_path[:, 1], "k--", lw=1.6, label="결승선까지 최단 경로 (중간 점수 기준)")
 plt.colorbar(sc, ax=ax, fraction=0.03, label="policy 속도 [m/s]")
-ax.legend(loc="upper left", fontsize=10); ax.set_aspect("equal")
+ax.set_aspect("equal")
 name = f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"
-ax.set_title(f"{name} [{dict(ideal='학습 조건', map='실차 조건 MAP', track='물리 + 새 제어기')[mode]}] 빈 트랙 차 {B}대 x {secs:.0f} s: 달린 자리(색 = 속도) | 최단 경로까지 거리 중앙 "
-             f"{np.median(d_sp) * 100:.0f} cm", fontsize=11)
-plt.tight_layout(); plt.savefig(out, dpi=70)
-print(f"{out} | 최단 경로까지 중앙 {np.median(d_sp) * 100:.0f} cm | 평균 속도 {SPd.mean():.2f} m/s")
+ax.set_title(f"{name} [{dict(ideal='학습 조건', map='실차 조건 MAP', track='물리 + 새 제어기')[mode]}] 빈 트랙 차 {B}대 x {secs:.0f} s: 달린 자리(색 = 속도) | 평균 속도 "
+             f"{SPd.mean():.2f} m/s", fontsize=11)
+plt.tight_layout(); plt.savefig(out, dpi=70, bbox_inches="tight")
+print(f"{out} | 평균 속도 {SPd.mean():.2f} m/s")

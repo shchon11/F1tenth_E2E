@@ -10,7 +10,15 @@
 기록 형식은 drive_record.py와 같아(장면 도구가 그대로 읽음) 거기에 두 차의 '트랙 따라 남은 거리'(보상의 벽 기준 거리장, 중심선 없음)와
 한 바퀴 길이를 더함 -> 누가 더 멀리 갔나·앞지름을 exam_table.py가 셈.
 인자: checkpoint 출력npz [제어기 map|track|ideal, 기본 map] [환경 수, 기본 1024] [상자 개수 max2|uniform, 기본 max2] [초 90] [치우는 시각 50]
-F1SIM_EXAM_SEED: 두 번째 시드(같은 조건에서 숫자가 얼마나 흔들리나)."""
+F1SIM_EXAM_SEED: 두 번째 시드(같은 조건에서 숫자가 얼마나 흔들리나).
+F1SIM_EXAM_SLIP_FRAME=oracle (11-12, 원인 검증용이지 시험 점수가 아님): plan의 모형은 미끄러지지 않는 차(차체 방향에서 조금 안쪽으로 나아감)인데
+실제 차는 코너에서 차체 방향보다 바깥쪽으로 나아감 -> policy가 보는 스캔·가속도계와 plan의 출발 방향을 '미끄러지지 않는 차라면 지금 진행
+방향으로 나아가고 있을 차체 방향'으로 돌려 줌 (돌리는 각 = 실제 진행 방향(시뮬레이터의 참 옆속도: 실차에는 없는 값) − 모형의 진행 방향).
+MAP이 받는 구간별 곡률·속도는 그대로. 기록에 그 각(dlt, 결정마다)을 남김.
+F1SIM_EXAM_SLIP_FRAME=table + F1SIM_EXAM_SLIP_TABLE=표npz: 같은 일을 참 옆속도 없이, 차가 스스로 아는 값(속도 x 회전 속도 = 옆가속도, 속도)으로
+표(ay, v, beta[rad])에서 읽은 미끄럼 각으로 함 (속도와 회전 속도는 시뮬레이터의 참값: 센서 잡음은 안 넣음). 참 옆속도(vy)는 기록에만 남김.
+F1SIM_EXAM_SPEED_LEAD=초 (제어기 쪽 진단, 시험 점수가 아님): MAP이 속도 명령으로 plan의 첫 0.1 s 구간 속도 대신 그 초만큼 뒤의 속도를 냄
+(속도 루프가 명령을 시간 상수 0.2 s로 따라가서, 첫 구간 속도를 그대로 주면 plan이 낸 가속의 절반도 안 나옴)."""
 import os, sys, json, argparse, hashlib, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -22,6 +30,9 @@ EXAM = "exam1"
 BANK = "/home/shchon11/f1sim_runs/prop_banks_exam1"
 SEED = int(os.environ.get("F1SIM_EXAM_SEED", 20261112))
 OPP_RESTART_S = 2.0
+SLIP = os.environ.get("F1SIM_EXAM_SLIP_FRAME", "")
+assert SLIP in ("", "oracle", "table"), SLIP
+LEAD = float(os.environ.get("F1SIM_EXAM_SPEED_LEAD") or 0.0)
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -53,6 +64,7 @@ from f1sim.learn.plan_policy import PlanObs2, load_actor2, plan_v2, plan_world, 
 from f1sim.learn.plan_rl import WORLD
 from f1sim import plan_steps as PS
 from f1sim import map_controller as M
+from f1sim import dynamics as dyn
 from f1sim.sim import CONTACT_FRAME_COLUMNS as CC
 from f1sim.lidar import HIT_CAR
 from f1sim import props as _props
@@ -69,6 +81,9 @@ env = SR.build_env(a, dev)
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
 if mode == "ideal":
     env.enable_ideal()
+if LEAD > 0:
+    assert mode == "map", mode
+    env.tracker.tw_speed_lead = LEAD
 prepare_graph_runtime(env, log=lambda _t: None)
 env.reset(seed=SEED)
 lid = env.learner_ids; Bl = int(lid.numel())
@@ -81,7 +96,55 @@ if mode == "track":
     env.ext_mask[lid] = True; env._ext_ids.update(int(i) for i in lid.tolist())
 actor = load_actor2(ck, dev)
 pr = PlanReward(env, float(ck["args"].get("gamma", 0.995)), dev)
-obs = PlanObs2(env, lim, pr.goal)
+
+
+class SlipObs(PlanObs2):
+    """`PlanObs2` from the frame turned by `turn` (B_l,) [rad] about the CoG: the accelerometer's x / y in that frame (the scan
+    is turned at the scanner, `sim.P["mount_yaw"]`; the gyro's z and the last plan in its own frame do not change)"""
+    turn = None
+
+    def state(self) -> torch.Tensor:
+        s = super().state()
+        if self.turn is None:
+            return s
+        c, s_ = torch.cos(self.turn), torch.sin(self.turn)
+        o = s.clone()
+        o[:, 3] = s[:, 3] * c + s[:, 4] * s_
+        o[:, 4] = -s[:, 3] * s_ + s[:, 4] * c
+        return o
+
+
+if SLIP == "table":
+    _t = np.load(os.environ["F1SIM_EXAM_SLIP_TABLE"])
+    TAB_A, TAB_V, TAB_B = (torch.tensor(_t[k], dtype=torch.float32, device=dev) for k in ("ay", "v", "beta"))
+    assert TAB_B.shape == (len(TAB_A), len(TAB_V)) and float(TAB_B.abs().max()) < 0.5
+
+
+def table_slip(ay: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """[rad] slip angle read from the table (rows = lateral acceleration, columns = speed), bilinear, held at the table's edges"""
+    def cell(x, g):
+        x = x.clamp(g[0], g[-1]); i = torch.bucketize(x, g).clamp(1, len(g) - 1)
+        return i, (x - g[i - 1]) / (g[i] - g[i - 1])
+    ia, wa = cell(ay, TAB_A); iv, wv = cell(v, TAB_V)
+    return ((1 - wa) * (1 - wv) * TAB_B[ia - 1, iv - 1] + wa * (1 - wv) * TAB_B[ia, iv - 1]
+            + (1 - wa) * wv * TAB_B[ia - 1, iv] + wa * wv * TAB_B[ia, iv])
+
+
+def slip_turn(d_next: torch.Tensor) -> torch.Tensor:
+    """[rad] (B_l,) the car's true direction of travel relative to its body (atan2(vy, vx)) minus the plan model's (a
+    kinematic bicycle about the CoG at the next plan's first steering angle `d_next`); fades to 0 below 1.5 m/s, 0 backward"""
+    s = env.sim.state[lid]
+    vx, vy = s[:, dyn.IVX], s[:, dyn.IVY]
+    if SLIP == "table":                                         # from what the car knows: speed and yaw rate
+        b_real = table_slip(vx * s[:, dyn.IR], vx)
+    else:
+        b_real = torch.atan2(vy, vx.clamp_min(1e-3))
+    b_kin = torch.atan(lim.lr / lim.wheelbase * torch.tan(d_next))
+    w = (vx - 0.5).clamp(0.0, 1.0)
+    return (w * (b_real - b_kin)).clamp(-0.35, 0.35)
+
+
+obs = (SlipObs if SLIP else PlanObs2)(env, lim, pr.goal)
 po = env.procedural
 remover = SR.PropRemoval(env, 1.0, rm_t, rm_t, seed=SEED) if po is not None else None
 restarter = SR.OppRestart(env, OPP_RESTART_S, PS.DT) if env.M > 1 else None
@@ -98,6 +161,21 @@ R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid",
                      "rem", "orem")}
 act0 = torch.zeros(env.B, env.act_dim, device=dev)
 kk = torch.zeros(env.B, PS.N_STEP, device=dev); vv = torch.zeros(env.B, PS.N_STEP, device=dev)
+turn = torch.zeros(Bl, device=dev)                          # the frame the newest scan was taken in (SLIP)
+if SLIP:
+    R["dlt"] = []; R["vy"] = []
+    yaw0 = env.sim.P["mount_yaw"][lid].clone()
+    # the scanner does turn with P["mount_yaw"] (a compiled scan path could have kept its angles): a scan taken 0.2 rad round
+    # must be the scan before, 0.2 rad of beams along (one control step of a standing car, before the session's first decision)
+    if mode == "map":
+        env.ext_plan_kv = (kk, vv)                          # a standing plan
+    _s0 = obs._scan().clone(); env.sim.P["mount_yaw"][lid] = yaw0 + 0.2; env.step(act0)
+    _s1 = obs._scan().clone(); env.sim.P["mount_yaw"][lid] = yaw0
+    _n = int(round(0.2 / float(env.sim.lidar.angles[1] - env.sim.lidar.angles[0])))
+    _e_turn = float((_s1[:, :-_n] - _s0[:, _n:]).abs().median()); _e_same = float((_s1 - _s0).abs().median())
+    print(f"스캐너 돌림 확인: 0.2 rad({_n} 빔) 돌린 스캔과 원래 스캔을 {_n} 빔 민 것의 차 중앙 {_e_turn:.4f}, 안 민 것과의 차 {_e_same:.4f} (거리/최대거리)", flush=True)
+    assert _e_turn < 0.25 * max(_e_same, 1e-4), "the scan did not turn with P['mount_yaw']"
+    env.step(act0); obs.reset_rows(torch.arange(Bl, device=dev))
 
 
 def snap():
@@ -122,6 +200,10 @@ t0 = time.time()
 for kd in range(T):
     snap()
     st = env.sim.state[lid].clone()
+    if SLIP:
+        R["dlt"].append(turn.float().cpu()); R["vy"].append(st[:, dyn.IVY].float().cpu())
+        st[:, dyn.IYAW] = st[:, dyn.IYAW] + turn            # the plan starts in the frame its scan was taken in
+        obs.turn = turn
     _, mean, _, v_hat, p = plan_v2(actor, obs, lim)
     x, y, psi = plan_world(p, st)
     pc = pr.plan_cost(x, y, psi, p["v"])
@@ -138,6 +220,8 @@ for kd in range(T):
             env.ideal_cmd[lid, 0] = p["cmd_d"][:, j]; env.ideal_cmd[lid, 1] = p["cmd_v"][:, j]
         if follower is not None:
             env.ext_cmd[lid] = to_car(env, lid, follower.command(env.sim.state[lid]))
+        if SLIP:
+            turn = slip_turn(p["delta"][:, PS.SUB]); env.sim.P["mount_yaw"][lid] = yaw0 + turn
         _, _, te, trc, _ = env.step(act0)
         restarted |= (te | trc)[lid]
         pr.control_step((env.last_result.scan_type[lid] == HIT_CAR).any(1))
@@ -172,7 +256,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          car=np.array([float(env.cfg.vehicle.length), float(env.cfg.vehicle.width)]), dt=np.array(PS.DT),
          kinds=np.array(KN), cols=np.array(COLS), name=np.array(f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)}"),
          ep_s=np.array(secs + 5.0), level=env.level_seed[lid].cpu().numpy(), lapL=pr.goal.lap.float().cpu().numpy(),
-         exam=np.array(EXAM), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
+         exam=np.array(EXAM + ("+slip_" + SLIP if SLIP else "") + (f"+lead{LEAD:.2f}" if LEAD > 0 else "")), speed_lead=np.array(LEAD), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
          bank=np.array(f"{BANK} ({', '.join(_bank)}; sha256 {_sha})"), opp_restart_s=np.array(OPP_RESTART_S),
          lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0))
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
@@ -181,6 +265,6 @@ for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
 os.makedirs(os.path.dirname(os.path.abspath(out_npz)), exist_ok=True)
 np.savez_compressed(out_npz, **D)
 c = D["cnt"][-1].sum(0)
-print(f"[{EXAM} · {mode} · 상자 {count} · 시드 {SEED}] {D['name']}: 세션 {Bl}개 x {secs:.0f} s (상자는 {rm_t:g} s에 치움), 도중 다시 출발 "
+print(f"[{EXAM}{' · 진행 방향 틀(' + SLIP + ')' if SLIP else ''} · {mode} · 상자 {count} · 시드 {SEED}] {D['name']}: 세션 {Bl}개 x {secs:.0f} s (상자는 {rm_t:g} s에 치움), 도중 다시 출발 "
       f"{int(D['rs'].sum())}번, 선 상대 차 다시 출발 {restarter.count if restarter is not None else 0}번 | 누적: "
       + " · ".join(f"{k} {int(v)}" for k, v in zip(COLS, c)) + f" | {time.time() - t0:.0f} s | 저장 {out_npz}", flush=True)
