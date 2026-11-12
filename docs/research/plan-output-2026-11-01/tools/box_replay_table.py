@@ -14,8 +14,8 @@ from rec_lib import Rec, plt, C_BOX
 
 NEAR, FAR, AFTER = 1.5, 3.0, 10          # [m] a pass: box within NEAR at the crossing; a new pass needs FAR in between; decisions after
 BINS = [(0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.0), (2.0, 2.9)]
-ARM = {0: "원본", 1: "A 그대로", 2: "B 지난 바퀴 기억", 3: "C 기억 0", 4: "L 왼쪽으로 틂", 5: "R 오른쪽으로 틂"}
-COL = {0: "#0b0b0b", 1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#8a5cd0", 5: "#d0a020"}
+ARM = {0: "원본", 1: "A 그대로", 2: "B 지난 바퀴 기억", 3: "C 기억 0", 4: "L 왼쪽으로 틂", 5: "R 오른쪽으로 틂", 6: "S 잠깐 느리게"}
+COL = {0: "#0b0b0b", 1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#8a5cd0", 5: "#d0a020", 6: "#1baf7a"}
 C_HIT, MUTED = "#d03b3b", "#898781"
 rng = np.random.default_rng(0)
 
