@@ -80,6 +80,8 @@ for b in range(B):
                     n_pass += 1; t = hi + 1; continue
             t += 1
 R = np.array(rows, float)
+if len(rows) == 0:
+    print("상자 통과가 하나도 없음 (policy가 거의 안 달림)"); sys.exit(0)
 if os.environ.get("EDGE_ROWS"):
     np.save(os.environ["EDGE_ROWS"], R)                    # for edge_scenes.py
 way = R[:, IWAY] > 0.5; late = -R[:, ITAU]

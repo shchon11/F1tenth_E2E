@@ -86,6 +86,8 @@ for b in range(B):
     t_car, w_car = mintime(lambda u: a_max * min(1.0, v_sw / max(u, 1e-3)))
     out.append((t_drv, t_plan, t_car, float(ds.sum()), float(np.max(v)), float(np.max(w_plan)), float(np.max(w_car))))
 O = np.array(out)
+if len(out) == 0:
+    print("둘째 바퀴를 마친 차가 없음 (policy가 거의 안 달림)"); sys.exit(0)
 print(f"{os.path.basename(os.path.dirname(ck_path))}/{os.path.basename(ck_path)} 학습 조건, 원래 트랙 빈 트랙, 차 {len(O)}대의 둘째 바퀴 | "
       f"plan 한계: 가속 {a_acc:.1f}, 감속 {a_brk:.1f}, 최고 {PS.V_FWD:.0f} m/s; 실차 가속 {a_max:.1f} x min(1, {v_sw:.0f}/v)", flush=True)
 print(f"  라인 길이 중앙 {np.median(O[:, 3]):.2f} m | 실제 바퀴 시간 중앙 {np.median(O[:, 0]):.2f} s (최고 속도 {np.median(O[:, 4]):.2f} m/s)")
