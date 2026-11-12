@@ -136,7 +136,7 @@ class SelfOpponents:
     row is computed and not used (its speed scale and injected events with it). `Driver` calls `plan` / `command` /
     `stepped` / `after` around a decision's control steps."""
 
-    def __init__(self, env, lim, share: float, seed: int = 0, max_pool: int = 4, p_newest: float = 0.5):
+    def __init__(self, env, lim, share: float, seed: int = 0, max_pool: int = 4, p_newest: float = 0.5, vcap=None):
         self.env, self.lim, self.share = env, lim, float(share)
         self.rows = torch.nonzero(~env.learner).flatten()
         dev = env.device
@@ -144,6 +144,12 @@ class SelfOpponents:
         self.obs = PlanObs2(env, lim, None, rows=self.rows)
         self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by a copy this race
         self.which = torch.zeros(Bo, dtype=torch.long, device=dev)    # by which of the pool
+        # `vcap` (lo, hi) [m/s]: each copy-driven race draws a top speed for its copy (11-12: copies of our own pace gave
+        # 0.00-0.02 passes a minute either way, `out/self_meas_summary.txt`). The cap is on the speed driven
+        # (`sim.ideal_vcap`), not on the command: a command scaled down would shrink the speed decision after decision,
+        # since a plan's speeds start from the car's own
+        self.vcap_range = None if vcap is None else (float(vcap[0]), float(vcap[1]))
+        self.cap = torch.full((Bo,), 1e3, device=dev)
         self.pool, self.tags, self.newest = [], [], -1
         self.max_pool, self.p_newest = int(max_pool), float(p_newest)
         self.gen = torch.Generator(device="cpu"); self.gen.manual_seed(int(seed) + 7717)
@@ -178,10 +184,26 @@ class SelfOpponents:
         if not self.pool:
             self.on[rows] = False
             return
-        u = torch.rand(n, 3, generator=self.gen).to(dev)
+        u = torch.rand(n, 3, generator=self.gen)
+        up = torch.rand(n, generator=self.gen) if self.vcap_range is not None else None
+        # a race with a name (level replay, `env.level_seed`) draws the same every time it is played: the replay is of the
+        # race as it was, a copy at the wheel included (which of the pool's copies moves on with the pool)
+        seed = getattr(self.env, "level_seed", None)
+        if seed is not None:
+            seed = seed[self.rows[rows]].tolist()
+            for i, sd in enumerate(seed):
+                if sd >= 0:
+                    g = torch.Generator(device="cpu"); g.manual_seed(int(sd) + 7717)
+                    u[i] = torch.rand(3, generator=g)
+                    if up is not None:
+                        up[i] = torch.rand(1, generator=g)
+        u = u.to(dev)
         self.on[rows] = u[:, 0] < self.share
         k = (u[:, 2] * len(self.pool)).long().clamp_max(len(self.pool) - 1)
         self.which[rows] = torch.where(u[:, 1] < self.p_newest, torch.full_like(k, self.newest), k)
+        if up is not None:
+            lo, hi = self.vcap_range
+            self.cap[rows] = lo + (hi - lo) * up.to(dev)
 
     @torch.no_grad()
     def plan(self) -> None:
@@ -189,6 +211,13 @@ class SelfOpponents:
         env, obs = self.env, self.obs
         Bo = int(self.on.numel())
         dev = self.on.device
+        # a car put somewhere else since the last decision (`state_rl.OppRestart` runs after it): its scans, last plan and
+        # memory are of the old place, and it would drive one decision on them
+        xy = env.sim.state[self.rows, :2]
+        moved = (xy - self.xy).norm(dim=1) > 2.0
+        if bool(moved.any()):
+            obs.reset_rows(torch.nonzero(moved).flatten())
+            self.xy = xy.clone()
         live = self.on & ~env.sim.absent[self.rows] if getattr(env.sim, "absent_any", False) else self.on
         mean = torch.zeros(Bo, PS.ACT_DIM, device=dev)
         v_hat = torch.zeros(Bo, device=dev)
@@ -210,7 +239,7 @@ class SelfOpponents:
         self.live = live
         self.p = PS.roll(torch.tanh(mean), v_hat.clamp(-PS.V_REV, PS.V_FWD), obs.cmd_d, self.lim)
         self.restarted.zero_()
-        env.sim.ideal_vcap[self.rows[live]] = 1e3
+        env.sim.ideal_vcap[self.rows[live]] = self.cap[live]
         env.ideal_extra.zero_()
         env.ideal_extra[self.rows] = live
 
@@ -410,11 +439,24 @@ def main(argv=None):
     ap.add_argument("--aux-opp", type=float, default=0.0,
                     help="> 0, with --mem-aux: the memory's side task also says where the nearest other car is along the track"
                          " (-3 .. this many m) and how fast it closes (`track_opp`; 11-10). 0 = boxes only")
+    ap.add_argument("--grad-split", action="store_true",
+                    help="a measurement, nothing learns from it: in each update's first pass, what the policy loss and the speed "
+                         "estimate's loss each send to the memory's weights (progress.jsonl: g_mem_*). 11-12: the GRU has these "
+                         "two teachers and nobody had measured which one moves it")
     ap.add_argument("--mem-aux", type=float, default=0.0,
                     help="with --memory: the weight of a side task for the memory alone -- from its state, say where the boxes ahead are"
                          " (the critic's privileged block: the nearest 3 live boxes not behind the car within 12 m, hidden ones too) every"
                          " decision (11-10, the user: \"기억은 필요해 ... 사각지대에 장애물이 있어서 사고나는거\"; --mem-chunk 128 alone left"
                          " the memory unused for 100 updates). The LiDAR features feed it detached; driving never reads it. 0 = off")
+    ap.add_argument("--mem-value", type=float, default=0.0,
+                    help="with --memory: the weight of a value read-out of the memory's state (`Actor2.mem_value`; 11-12, the user:"
+                         " \"ㅇㅋ\") -- taught this update's returns, each update's scaled to mean 0 and spread 1, so the logged loss is"
+                         " the share of the returns' spread it does not explain. The features feed it detached; driving never reads"
+                         " it; the privileged critic still makes the advantages. 0 = off")
+    ap.add_argument("--mem-keep-s", type=float, default=0.0,
+                    help="with --memory, from scratch: the GRU's update gate starts holding, keep times spread over 0.2 s .. this many"
+                         " seconds (`Actor2.keep_init`). 0 = PyTorch's default (every value ~0.2 s)")
+    ap.add_argument("--mem-keep-log", action="store_true", help="with --mem-keep-s: as many values per octave of keep time")
     ap.add_argument("--speed-std-floor", type=float, default=0.0,
                     help="v2: the exploration noise's floor on the first step's speed output (11-09: it had shrunk to 0.17)")
     ap.add_argument("--removal-p", type=float, default=-1.0,
@@ -430,6 +472,19 @@ def main(argv=None):
     ap.add_argument("--level-replay-from", type=int, default=0,
                     help="switch the replay on at this update: before the car laps, the standing-time score ranks the "
                          "races by how badly the policy drives everywhere, not by the race")
+    ap.add_argument("--self-opp", type=float, default=0.0,
+                    help="share of races whose other car is driven by a frozen copy of this policy (`SelfOpponents`, v2); "
+                         "0 = the world's scripted cars only. 11-12: the scripted kinds are one line follower 7-8 %% off our "
+                         "lap, and the car near ours runs 2.8 m/s against our 4.7 (`tools/opp_encounters.py`)")
+    ap.add_argument("--self-opp-every", type=int, default=25, help="a copy of the learner joins the pool every this many updates")
+    ap.add_argument("--self-opp-from", type=int, default=0,
+                    help="the first copy joins at this update (0 = at the first --self-opp-every); a copy of a policy that "
+                         "does not lap yet is a car standing on the track")
+    ap.add_argument("--self-opp-pool", type=int, default=4, help="copies kept; a full pool gives up a random one of its older copies")
+    ap.add_argument("--self-opp-newest", type=float, default=0.5, help="share of the copy-driven cars that get the newest copy")
+    ap.add_argument("--self-opp-vcap", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="each copy-driven race draws its copy's top speed from [LO, HI] m/s (a cap on the speed driven); "
+                         "off = copies at their own pace, which gives almost no passing either way")
     ap.add_argument("--lidar-mount-x", type=float, default=0.0,
                     help="the scanner's place ahead of the simulator's pose (the CoG) in metres; 0 = the config's 0.297, the nose "
                          "tip every policy up to plan25r saw from. The car's own is 0.12555 (`params.LIDAR_MOUNT_X_COG`: rear "
@@ -469,6 +524,11 @@ def main(argv=None):
     obs = (PlanObs3 if v3 else PlanObs2 if v2 else PlanObs)(env, lim, pr.goal)
     act3, turn3 = plan3_models(env, lim, dev) if v3 else (None, None)
     drv = Driver(env, lim, pr, obs)
+    if args.self_opp > 0:
+        if not v2 or v3 or env.M < 2:
+            raise SystemExit("--self-opp needs --format v2 and a world with another car")
+        drv.opp = SelfOpponents(env, lim, args.self_opp, seed=args.seed, max_pool=args.self_opp_pool, p_newest=args.self_opp_newest,
+                                vcap=args.self_opp_vcap)
     hold = args.hold_p > 0
     if hold and not v2:
         raise SystemExit("--hold-p needs --format v2 or v3")
@@ -525,12 +585,18 @@ def main(argv=None):
     aux_on = args.mem_aux > 0
     if aux_on and not args.memory:
         raise SystemExit("--mem-aux needs --memory")
+    memv_on = args.mem_value > 0
+    if (memv_on or args.mem_keep_s > 0) and not args.memory:
+        raise SystemExit("--mem-value / --mem-keep-s need --memory")
+    if args.mem_keep_s > 0 and args.init:
+        raise SystemExit("--mem-keep-s is a starting value: it has no meaning with --init (the checkpoint's GRU is loaded)")
     AUXK = PRIV_V2_PROP_SLOTS
     AUXB = AUXK * len(PRIV_V2_PROP_KEYS)                            # the boxes' part of the read-out; the car's 5 follow
     aux_opp = aux_on and args.aux_opp > 0
     actor = (Actor2(obs.beams, std0=args.std0, state_dim=STATE_DIM3) if v3 else
              Actor2(obs.beams, std0=args.std0, memory=args.memory, aux_dim=(AUXB + (5 if aux_opp else 0)) if aux_on else 0,
-                    mem_front=args.mem_front) if v2
+                    mem_front=args.mem_front, mem_value=memv_on, mem_keep_s=args.mem_keep_s,
+                    mem_keep_log=args.mem_keep_log) if v2
              else Actor(obs.beams, std0=args.std0)).to(dev)
     tailc = args.tail_consistency > 0
     if tailc and (not v2 or v3 or args.hold_p > 0):
@@ -742,21 +808,22 @@ def main(argv=None):
                 fi, h = actor.remember(f[i], h)
                 outs.append(fi)
             fc = torch.cat(outs, 0)
-            if aux_on:
-                # the side task's own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
-                h2, hs = bHM[sel[0]], []
-                for i in range(sel.shape[0]):
-                    if i > 0:
-                        h2 = h2 * (1.0 - bD[sel[i - 1]])[:, None]
-                    h2 = actor.gru(f[i].detach(), h2)
-                    hs.append(h2)
-                aux_box["pred"] = actor.aux(torch.cat(hs, 0))
+            if aux_on or memv_on:
+                # the read-outs' own replay: the same memory on features it cannot move (the LiDAR part stays the policy's)
+                hs = actor.memory_alone(f, bHM[sel[0]], bD[sel])
+                if aux_on:
+                    aux_box["pred"] = actor.aux(hs)
+                if memv_on:
+                    aux_box["v"] = actor.v_mem(hs)[:, 0]
             return (*actor.heads(fc), mb_, fc)
 
         actor.train(); critic.train()
         kls, cfs, vls, els, cls_, ce5 = [], [], [], [], [], []
-        als, aac, aac_far, alo, sms = [], [], [], [], []
+        als, aac, aac_far, alo, sms, mvs = [], [], [], [], [], []
         aux_box = {}
+        g_split = {"policy": [], "speed": [], "value": []}
+        if memv_on:
+            bRn = (bR - bR.mean()) / bR.std().clamp_min(1e-6)
         if tailc:
             bV0, bD0, bST0 = torch.cat(V0), torch.cat(D0), torch.cat(ST0)
             bPTS, bPVS = torch.cat(PTS), torch.cat(PVS)
@@ -785,6 +852,13 @@ def main(argv=None):
                 pl = -(torch.min(ratio * a_, ratio.clamp(1 - args.clip, 1 + args.clip) * a_) * m_).sum() / n_
                 vl = 0.5 * (critic(bX[mb], bS[mb], bPV[mb]) - bR[mb]).pow(2).mean()
                 loss = pl + args.vf_coef * vl + args.vest_coef * el
+                if memv_on:
+                    lmv = (aux_box["v"] - bRn[mb]).pow(2).mean()
+                    loss = loss + args.mem_value * lmv
+                    mvs.append(float(lmv.detach()))
+                if args.grad_split and args.memory and v2 and ep == 0:
+                    for k_, l_ in (("policy", pl), ("speed", args.vest_coef * el)) + ((("value", args.mem_value * lmv),) if memv_on else ()):
+                        g_split[k_].append(torch.cat([g_.reshape(-1) for g_ in torch.autograd.grad(l_, list(actor.gru.parameters()), retain_graph=True)]))
                 if tailc:
                     # (가): this decision's plan, its first step as driven, its tail from the output layer on features it
                     # does not move, laid where the car was -- against the next decision's plan for the same moments
@@ -861,7 +935,19 @@ def main(argv=None):
                "aux_loss": (sum(als) / len(als)) if als else None, "aux_acc": (sum(aac) / len(aac)) if aac else None,
                "aux_far_recall": (sum(aac_far) / len(aac_far)) if aac_far else None,
                "aux_opp_loss": (sum(alo) / len(alo)) if alo else None,
-               "smooth_loss": (sum(sms) / len(sms)) if sms else None}
+               "smooth_loss": (sum(sms) / len(sms)) if sms else None,
+               "mem_value_loss": (sum(mvs) / len(mvs)) if mvs else None}
+        if g_split["policy"]:
+            # size = a minibatch's gradient on the GRU's weights; agree = the mean cosine between two minibatches' gradients:
+            # 1 when every minibatch pushes the same way, 0 when they are unrelated (then the steps cancel)
+            gp_, ge_ = torch.stack(g_split["policy"]), torch.stack(g_split["speed"])
+            for k_, g_ in (("policy", gp_), ("speed", ge_)) + ((("value", torch.stack(g_split["value"])),) if g_split["value"] else ()):
+                gn_ = nn.functional.normalize(g_, dim=1); c_ = gn_ @ gn_.T; n_g = g_.shape[0]
+                row[f"g_mem_{k_}"] = float(g_.norm(dim=1).mean())
+                row[f"g_mem_{k_}_agree"] = float((c_.sum() - c_.diagonal().sum()) / max(1, n_g * (n_g - 1)))
+            row["g_mem_cos"] = float(nn.functional.cosine_similarity(gp_.mean(0), ge_.mean(0), dim=0))
+        if drv.opp is not None:
+            row.update(self_opp_share=drv.opp.share_on(), self_opp_pool=[int(t_) for t_ in drv.opp.tags])
         if levels is not None:
             n_new, n_rep = levels.n_new - lv0[0], levels.n_replay - lv0[1]
             n_end, n_hit = levels.ended - lv0[2], levels.ended_hit - lv0[3]
@@ -876,18 +962,22 @@ def main(argv=None):
               + (f"가까이 차·상자 {row['near_share'] * 100:.0f} % | " if hold and args.hold_clear > 0 else "")
               + (f"상자 치움 {n_removed}판 | " if remover is not None else "")
               + (f"선 상대 차 다시 출발 {n_restarted}번 | " if restarter is not None else "")
+              + (f"복사본이 모는 상대 차 {row['self_opp_share'] * 100:.0f} % (update {row['self_opp_pool']}의 복사본) | " if drv.opp is not None else "")
               + (f"다시 낸 경주 {row['replay_share'] * 100:.0f} % (끝난 경주 {row['replay_ended']} 중 점수 있는 것 "
                  f"{row['replay_ended_scored']}, 자리당 {row['replay_buffer']:.1f}개) | " if levels is not None else "")
               + (f"기억 보조: 손실 {row['aux_loss']:.3f}, 상자 있음 맞힘 {row['aux_acc'] * 100:.0f} %, 4-12 m 앞 상자 맞힘 "
                  f"{(row['aux_far_recall'] or 0) * 100:.0f} % | " if row.get("aux_loss") is not None else "")
               + (f"상대 차 보조 손실 {row['aux_opp_loss']:.3f} | " if row.get("aux_opp_loss") is not None else "")
               + (f"지그재그 비용 {row['smooth_loss']:.3f} | " if row.get("smooth_loss") is not None else "")
+              + (f"기억이 읽은 value: return 퍼짐의 {(1 - row['mem_value_loss']) * 100:.0f} % 설명 | " if row.get("mem_value_loss") is not None else "")
               + (f"뒷부분 손실 {row['tail_loss']:.3f}, 다음 plan과 0.5 s 차이 {row['tail_next_05'] * 100:.0f} cm | " if row.get("tail_loss") is not None else "")
               + f"{t_roll:.1f}+{t_upd:.1f} s", flush=True)
         if upd % args.save_every == 0 or upd == args.updates:
             torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(), "args": vars(args), "world": vars(world),
                         "priv_dim": priv_dim, "beams": obs.beams, "update": upd, "format": FORMAT3 if v3 else FORMAT2 if v2 else "plan_steps"},
                        os.path.join(run, f"plan_u{upd}.pt"))
+        if drv.opp is not None and upd >= max(args.self_opp_from, 1) and (upd - args.self_opp_from) % args.self_opp_every == 0:
+            drv.opp.add(actor, upd)
 
 
 if __name__ == "__main__":

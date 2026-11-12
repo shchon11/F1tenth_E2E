@@ -385,10 +385,20 @@ class Actor2(nn.Module):
     reads those inputs plus the memory's state, so two nonlinear layers mix what is remembered with what is seen now and
     the reaction to what is in view does not have to pass through the memory. Why: added after the trunk, only a linear
     layer followed the memory -- wiping it moved the plans 12-17 cm at 1 s, toward the hidden boxes, and laps were no
-    faster for it (plan25n8). No `mem_out`; such an actor is trained from scratch with its memory."""
+    faster for it (plan25n8). No `mem_out`; such an actor is trained from scratch with its memory.
+    `mem_value` (11-12, the user: "ㅇㅋ"): a linear read-out of the memory's state that is taught the return (plan_rl
+    --mem-value). Measured: of the memory's two teachers only the speed estimate pushed it one way (agreement between
+    minibatches 0.8-1.0, the policy loss -0.1..0.1), and a memory the same size taught a value-like target on recorded inputs
+    came to hold "this session has boxes" (0.92 against the policy's own 0.61) -- with `mem_keep_s`. A training aid only:
+    driving never reads it; the privileged critic still makes the advantages.
+    `mem_keep_s` > 0 (11-12, at the start only): the GRU's update gate begins holding, each value's keep time spread over
+    0.2 s .. this long (Tallec & Ollivier 2018; `mem_keep_log`: as many values per octave, so half of them stay short).
+    PyTorch's default starts every value at ~0.2 s: the learning signal a lap back was 1e-12, and the value-like target
+    above left the memory at 0.56 (= no memory) without this."""
 
     def __init__(self, beams: int, hidden: int = 256, std0: float = 0.6, state_dim: int = None, memory: int = 0,
-                 aux_dim: int = 0, mem_front: bool = False):
+                 aux_dim: int = 0, mem_front: bool = False, mem_value: bool = False, mem_keep_s: float = 0.0,
+                 mem_keep_log: bool = False):
         super().__init__()
         sd = STATE_DIM2 if state_dim is None else int(state_dim)
         self.mem_front = bool(mem_front) and int(memory) > 0
@@ -408,6 +418,10 @@ class Actor2(nn.Module):
                 nn.init.zeros_(self.mem_out.weight); nn.init.zeros_(self.mem_out.bias)
             if aux_dim:
                 self.aux = nn.Linear(self.memory, int(aux_dim))
+            if mem_value:
+                self.v_mem = nn.Linear(self.memory, 1)
+            if mem_keep_s > 0:
+                self.keep_init(float(mem_keep_s), bool(mem_keep_log))
         self.register_buffer("log_std_floor", torch.full((PS.ACT_DIM,), -math.inf), persistent=False)
         self.h_out = None
 
@@ -419,6 +433,27 @@ class Actor2(nn.Module):
     def heads(self, f: torch.Tensor):
         log_std = torch.maximum(self.log_std, self.log_std_floor)
         return self.pi(f), log_std.expand(f.shape[0], -1), self.v_est(f)[:, 0] * 5.0
+
+    def keep_init(self, keep_s: float, log: bool = False) -> None:
+        """the update gate's bias so that value k of the memory, left alone, keeps 1 - 1/T_k of itself per decision"""
+        n, t_max = self.memory, keep_s / PS.DT
+        with torch.no_grad():
+            t = (torch.exp(torch.empty(n).uniform_(0.0, math.log(t_max))).clamp_min(1.0 + 1e-3) if log
+                 else torch.empty(n).uniform_(2.0, t_max))
+            self.gru.bias_ih[n: 2 * n] = torch.log(t - 1.0).to(self.gru.bias_ih)
+            self.gru.bias_hh[n: 2 * n] = 0.0
+
+    def memory_alone(self, f_seq: torch.Tensor, h: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+        """the memory's states along a replayed sequence on features it cannot move: (L, n, F) from the state `h` each began
+        with -> (L * n, memory). What the training's read-outs (`aux`, `v_mem`) learn from: they teach the memory and leave
+        what feeds it -- the LiDAR part, the policy's -- alone. `done` (L, n): a restart clears the state for the decisions after it"""
+        hs = []
+        for i in range(f_seq.shape[0]):
+            if i > 0:
+                h = h * (1.0 - done[i - 1])[:, None]
+            h = self.gru(f_seq[i].detach(), h)
+            hs.append(h)
+        return torch.cat(hs, 0)
 
     def remember(self, f: torch.Tensor, h: Optional[torch.Tensor]):
         """one decision of the memory: (features with the memory added, the new state)"""
@@ -503,7 +538,7 @@ def load_actor2(ck: dict, device, check_mount: bool = True) -> Actor2:
     aux = ck["actor"].get("aux.weight")
     actor = Actor2(int(ck["beams"]), std0=float(ck["args"].get("std0", 0.6)),
                    memory=int(ck["args"].get("memory", 0) or 0), aux_dim=int(aux.shape[0]) if aux is not None else 0,
-                   mem_front=bool(ck["args"].get("mem_front", False))).to(device)
+                   mem_front=bool(ck["args"].get("mem_front", False)), mem_value="v_mem.weight" in ck["actor"]).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor

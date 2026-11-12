@@ -32,6 +32,7 @@ restart_s = float(OV.pop("opp_restart_s", 0.0))
 # other cars driven by copies of a policy (`plan_rl.SelfOpponents`): "self_opp" = the share of races, "self_ckpts" = the
 # checkpoints the copies come from (default: the one being recorded)
 self_share = float(OV.pop("self_opp", 0.0)); self_ckpts = OV.pop("self_ckpts", None)
+self_vcap = OV.pop("self_vcap", None)     # [lo, hi] m/s: each copy-driven race draws its copy's top speed (`SelfOpponents(vcap=)`)
 # "levels": N -> every race is reset under its own seed (the list drawn from N), the way `gym_env._reset_envs` names a level
 # for a level replay: the same N brings the same races back (track variant, boxes, opponent, start). "sample": K -> the
 # actions are drawn as in training (noise on the first step's steering and speed, the policy's own std), noise seed K
@@ -41,6 +42,10 @@ dev = torch.device("cuda")
 ck = torch.load(ck_path, map_location=dev, weights_only=False)
 if (ck.get("args") or {}).get("plan_lat_margin") is not None:
     os.environ["F1SIM_PLAN_LAT_MARGIN"] = str(ck["args"]["plan_lat_margin"])
+if "F1SIM_LIDAR_MOUNT_X" not in os.environ:               # the checkpoint's own scanner place, unless the caller exported one
+    from f1sim.learn.plan_policy import lidar_mount_of
+    if lidar_mount_of(ck) > 0:
+        os.environ["F1SIM_LIDAR_MOUNT_X"] = str(lidar_mount_of(ck))
 env, lim, world = PR.build(PR.WORLD, n_env, SEED, dev, fmt="v2", overrides=OV)
 if levels is not None:
     class _Levels:
@@ -62,7 +67,7 @@ pr = PlanReward(env, float(ck["args"].get("gamma", 0.995)), dev)
 obs = PlanObs2(env, lim, pr.goal)
 drv = PR.Driver(env, lim, pr, obs)
 if self_share > 0 and env.M > 1:
-    drv.opp = PR.SelfOpponents(env, lim, self_share, seed=SEED, p_newest=0.0)
+    drv.opp = PR.SelfOpponents(env, lim, self_share, seed=SEED, p_newest=0.0, vcap=self_vcap)
     for pth in (self_ckpts or [ck_path]):
         drv.opp.add(load_actor2(torch.load(pth, map_location=dev, weights_only=False), dev), os.path.basename(pth))
 po = env.procedural
@@ -79,7 +84,7 @@ KN = list(getattr(env, "alt_teacher_kinds", ())) + ["raceline"]
 ii = PT_IDX.to(dev)
 T = int(secs / PS.DT)
 R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors", "newp",
-                     "copy")}
+                     "copy", "cap")}
 HOLD = int(os.environ.get("F1SIM_HOLD", "1"))
 p_held, hold_k = None, torch.zeros(Bl, dtype=torch.long, device=dev)
 fresh = torch.ones(Bl, dtype=torch.bool, device=dev)              # rows that must plan anew (the start, a restart)
@@ -100,11 +105,14 @@ def snap():
     R["scale"].append(sc.float().cpu())
     # which copy drives the other car (-1: its scripted driver)
     if drv.opp is None:
-        R["copy"].append(torch.full((Bl,), -1, dtype=torch.int8))
+        R["copy"].append(torch.full((Bl,), -1, dtype=torch.int8)); R["cap"].append(torch.full((Bl,), 1e3))
     else:
         w = torch.full((env.B,), -1, dtype=torch.long, device=dev)
         w[drv.opp.rows] = torch.where(drv.opp.on, drv.opp.which, torch.full_like(drv.opp.which, -1))
         R["copy"].append(w[others].to(torch.int8).cpu())
+        cp = torch.full((env.B,), 1e3, device=dev)                 # the copy's top speed this race [m/s] (1e3: none)
+        cp[drv.opp.rows] = torch.where(drv.opp.on, drv.opp.cap, torch.full_like(drv.opp.cap, 1e3))
+        R["cap"].append(cp[others].float().cpu())
 
 
 for kd in range(T):
