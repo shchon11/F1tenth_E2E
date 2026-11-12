@@ -21,7 +21,15 @@ F1SIM_EXAM_SPEED_LEAD=초 (제어기 쪽 진단, 시험 점수가 아님): MAP�
 (속도 루프가 명령을 시간 상수 0.2 s로 따라가서, 첫 구간 속도를 그대로 주면 plan이 낸 가속의 절반도 안 나옴).
 F1SIM_EXAM_SAVE_MEM=1 (11-12, 사용자: "기억이 반복이 되던데 그 반복되는거에서 특정 구간을 뭔가 이용할 수는 없나"): 결정마다 policy가 읽은
 특징(스캔 인코더 출력 + 정규화한 상태 입력; 기억이 읽는 것)과 그 결정 뒤의 기억 상태를 `출력_mem.npz`(feat, mem; float16)에 따로 남김.
-주행·기록은 그대로."""
+주행·기록은 그대로.
+F1SIM_EXAM_OPP_SLOT=JSON (11-12, 시험 점수가 아니라 상대 차 하나를 따로 보는 기록): 상대 차 자리 설정에 덮어씀(state_rl.build_env의
+`--opp-slot`과 같음). 예: AuRoRus 포팅본만 상대로 `{"kind": "aurorus", "kind_mix": [], "reactive": {}, "events": [], "event_rate": 0.0,
+"speed_scale": [1.0, 1.0]}` (그 차는 자기 선 속도의 0.8 x speed_scale로 달리고, 자기 LiDAR로 본 점만으로 비켜 감). 기록의 opp_slot에 남김.
+F1SIM_EXAM_START_REST=1 (11-12, 대회 규칙의 출발을 따로 보는 기록): 모든 차가 선 채로(0 m/s) 출발. 규칙(RoboRacer 2025)은 1대1을 같은 출발선에서
+30 cm 떨어져 나란히 세움 -> `F1SIM_EXAM_OPP_SLOT='{"spawn": "alongside"}'`(상대 차 종류·속도는 그대로, 배치만 나란히)와 같이 씀.
+기록의 start_rest에 남김.
+F1SIM_EXAM_HALF_LAP=1 (11-12, 사용자가 나간 대회의 1대1 출발): 상대 차를 반 바퀴 떨어진 반대쪽에 세움(spawn_gap = 트랙 길이의 절반).
+`F1SIM_EXAM_OPP_SLOT='{"spawn": "ahead"}'` + F1SIM_EXAM_START_REST=1과 같이 씀. 기록의 half_lap에 남김."""
 import os, sys, json, argparse, hashlib, time
 os.environ["F1SIM_NO_STAGGER"] = "1"      # whole episodes: no staggered first-episode restarts (11-10)
 os.environ.pop("F1SIM_WORLD_TRACKS", None)
@@ -37,6 +45,9 @@ SLIP = os.environ.get("F1SIM_EXAM_SLIP_FRAME", "")
 assert SLIP in ("", "oracle", "table"), SLIP
 LEAD = float(os.environ.get("F1SIM_EXAM_SPEED_LEAD") or 0.0)
 SAVE_MEM = os.environ.get("F1SIM_EXAM_SAVE_MEM", "") == "1"
+OPP_SLOT = os.environ.get("F1SIM_EXAM_OPP_SLOT", "")                # "" = the training world's opponents
+REST = os.environ.get("F1SIM_EXAM_START_REST", "") == "1"        # every car starts standing (the rule's grid)
+HALF = os.environ.get("F1SIM_EXAM_HALF_LAP", "") == "1"          # the opponent starts half a lap away (the user's events)
 
 torch.set_grad_enabled(False)
 ck_path, out_npz = sys.argv[1], sys.argv[2]
@@ -78,16 +89,22 @@ a.envs, a.seed, a.device = n_env, SEED, dev.type
 a.episode_s = secs + 5.0                                   # one episode per car: no respawn inside the session
 a.warps, a.track_scales = 0, None                          # the real map only
 a.prop_bank, a.prop_count = BANK, count
+if OPP_SLOT:
+    a.opp_slot = OPP_SLOT                                   # merged over the training world's slot (`state_rl.build_env`)
 if mode == "map":
     a.plan_format, a.repeat = "tw", 4
 torch.manual_seed(SEED)
-env = SR.build_env(a, dev)
+env = SR.build_env(a, dev, extra={"spawn_speed_max": 0.0} if REST else None)
 lim = PS.Limits.from_nominal(env.tracker.nominal, env.tracker.map.lut, M.GRIP_LEVELS.index(1.0), dev)
 if mode == "ideal":
     env.enable_ideal()
 if LEAD > 0:
     assert mode == "map", mode
     env.tracker.tw_speed_lead = LEAD
+if HALF:
+    h = 0.5 * float(env.sim.track.length.min())                 # the real map only: one lap length
+    env.ecfg.spawn_gap = (h, h)                                 # read when the reset lays the race out
+    print(f"반 바퀴 출발: 트랙 길이 {[round(float(x), 1) for x in env.sim.track.length]} m -> 간격 {h:.1f} m", flush=True)
 prepare_graph_runtime(env, log=lambda _t: None)
 env.reset(seed=SEED)
 lid = env.learner_ids; Bl = int(lid.numel())
@@ -158,7 +175,7 @@ absent = env.sim.absent if getattr(env.sim, "absent_any", False) else torch.zero
 COLS = ("onsets_wall", "onsets_prop", "onsets_car", "hard_wall", "hard_prop", "hard_car")
 I_CNT = [CC.index(k) for k in COLS]
 i_hk, i_hx, i_hy, i_hs = (CC.index(k) for k in ("held_kind", "held_x", "held_y", "held_severity"))
-KN = list(getattr(env, "alt_teacher_kinds", ())) + ["raceline"]
+KN = list(getattr(env, "alt_teacher_kinds", ())) + [str(json.loads(OPP_SLOT).get("kind", "raceline")) if OPP_SLOT else "raceline"]
 ii = PT_IDX.to(dev)
 T = int(round(secs / PS.DT))
 R = {k: [] for k in ("st", "op", "on", "pl", "rs", "cnt", "ocnt", "held", "sid", "pose", "tid", "kind", "scale", "lap", "ors",
@@ -269,7 +286,7 @@ D.update(edt=trk.edt.float().cpu().numpy(), t_off=trk.t_off.cpu().numpy(), t_H=t
          ep_s=np.array(secs + 5.0), level=env.level_seed[lid].cpu().numpy(), lapL=pr.goal.lap.float().cpu().numpy(),
          exam=np.array(EXAM + ("+slip_" + SLIP if SLIP else "") + (f"+lead{LEAD:.2f}" if LEAD > 0 else "")), speed_lead=np.array(LEAD), mode=np.array(mode), count=np.array(count), rm_t=np.array(rm_t), seed=np.array(SEED),
          bank=np.array(f"{BANK} ({', '.join(_bank)}; sha256 {_sha})"), opp_restart_s=np.array(OPP_RESTART_S),
-         lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0))
+         lidar_mount_x=np.array(_mx), lat_margin=np.array(float(_mg) if _mg is not None else 1.0), opp_slot=np.array(OPP_SLOT), start_rest=np.array(REST), half_lap=np.array(HALF))
 for k in sorted({int(s) for s in np.unique(D["sid"]) if s >= 0}):
     sh = po.shapes[k]
     D[f"fp_{k}"] = np.asarray(_props.build(sh.style, seed=0, **dict(sh.dims)).envelope.footprint, np.float32)

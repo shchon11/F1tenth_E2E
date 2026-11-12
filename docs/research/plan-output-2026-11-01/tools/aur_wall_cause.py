@@ -1,5 +1,6 @@
 """포팅본의 벽 접촉이 '고른 경로가 벽에 가까워서'인지 '경로는 떨어져 있었는데 차가 벗어나서'인지 (기록만으로, 11-12).
 접촉 0.3 s 전에 쥐고 있던 회피 경로에서 접촉 지점과 가장 가까운 점의 벽 거리(경로 중심) + 접촉 때 차 중심이 그 경로에서 벗어난 거리.
+배율마다 첫 줄: 회피 중이던 결정의 비율, 벽 검사를 뺀 경로를 고른 비율, 고른 경로 전체의 가장 가까운 벽 거리.
 인자: 기록npz [기록npz ...]"""
 import os, sys
 import numpy as np
@@ -47,6 +48,15 @@ for fn in sys.argv[1:]:
                 c_near = float(r.wall_dist(k, q[None])[0])                       # path centre's wall distance beside the car
                 c_min = float(r.wall_dist(k, P).min())                           # the whole path's smallest
                 rows.append((hard, c_near, c_min, e, float(st[t, b, 3])))
+        m = np.abs(ps - sc) < 1e-3; av = avoid & m; held = np.isfinite(path).all((-1, -2))
+        if "pfree" in z.files and av.any():
+            # 벽·장애물에 안 닿는 후보가 없어 벽 검사를 뺀 경로를 고른 결정, 고른 경로 전체에서 가장 가까운 벽 거리
+            fb = ~z["pfree"][:T].astype(bool) & av
+            k_all = np.broadcast_to(r.tid[:T], av.shape)[av & held]
+            cmin = np.array([r.wall_dist(int(k), P).min() for k, P in zip(k_all[::7], path[av & held][::7])])
+            print(f"{sc:g}배: 회피 중이던 결정 {100 * av.sum() / max(m.sum(), 1):.0f} % · 그중 안 닿는 경로가 없어 벽 검사를 뺀 경로 "
+                  f"{100 * fb.sum() / av.sum():.1f} % · 고른 경로의 가장 가까운 벽 거리 중앙값 {np.median(cmin):.2f} m "
+                  f"(0.25 m 미만 {100 * (cmin < 0.25).mean():.0f} %, 0.35 m 미만 {100 * (cmin < 0.35).mean():.0f} %)")
         if not rows:
             print(f"{sc:g}배: 회피 중 벽 접촉 없음 (회피 아닐 때 {n_plain}건)"); continue
         a = np.array(rows, float); n = len(a)
