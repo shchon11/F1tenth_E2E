@@ -5,7 +5,7 @@ import numpy as np
 sys.path.insert(0, '/home/shchon11/F1tenth_E2E/docs/research/plan-output-2026-11-01/tools')
 from rec_lib import Rec
 rng = np.random.default_rng(0)
-REG = (("짧은 벽 끝 둘레", (-2, 0, -2, 0)), ("섬 왼쪽 위 끝 둘레", (-4, -2, 4, 6)))
+REG = (("짧은 벽 끝 둘레", (-2, 0, -2, 0)), ("섬 왼쪽 위 끝 둘레", (-4, -2, 4, 6)), ("오른쪽 위 바깥 벽(굽은 길을 나오며 가속하는 곳)", (4, 9, 0, 3)))
 def ci(x):
     m = [rng.choice(x, len(x)).mean() for _ in range(2000)]
     return f"{x.mean():.2f} [{np.percentile(m, 2.5):.2f}-{np.percentile(m, 97.5):.2f}]"
