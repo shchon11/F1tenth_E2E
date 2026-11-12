@@ -166,6 +166,8 @@ class PlanReward:
         self.corners = env.sim.corners.float()                 # (4, 2) footprint about the CoG
         # the plan-hit cost's share of a contact and how far into the plan it looks (poses on the control grid; None = all)
         self.plan_hit_share, self.plan_hit_n = PLAN_HIT_SHARE, None
+        # (11-13) a factor on every contact's time penalty (and so on the plan-hit cost, a share of it); 1 = the 11-07 prices
+        self.contact_scale = 1.0
         self.begin(torch.arange(Bl, device=device))
 
     def _d_car(self) -> torch.Tensor:
@@ -212,7 +214,7 @@ class PlanReward:
         imp = r.contact_impacts[self.lid].float().clamp_min(0.0)
         charge = on.clone()
         charge[:, 2] = charge[:, 2] * (self.seen_t <= SEEN_S).float()
-        self.cost = self.cost + ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge).sum(1) / T_REF
+        self.cost = self.cost + self.contact_scale * ((CONTACT_S + CONTACT_S_PER_MPS * imp) * charge).sum(1) / T_REF
         self.n_contacts = self.n_contacts + on
 
     def plan_cost(self, x: torch.Tensor, y: torch.Tensor, psi: torch.Tensor, v: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -236,7 +238,8 @@ class PlanReward:
         any_ = hit.any(1)
         first = torch.where(any_, hit.float().argmax(1), torch.zeros_like(any_, dtype=torch.long))
         v_hit = v.gather(1, first[:, None])[:, 0].abs()
-        price = torch.where(any_, self.plan_hit_share * (CONTACT_S + CONTACT_S_PER_MPS * v_hit) / T_REF, torch.zeros_like(v_hit))
+        price = torch.where(any_, self.contact_scale * self.plan_hit_share * (CONTACT_S + CONTACT_S_PER_MPS * v_hit) / T_REF,
+                            torch.zeros_like(v_hit))
         return {"hit": any_, "first": first, "price": price}
 
     def decision(self, pts: torch.Tensor, plan_price: Optional[torch.Tensor] = None,

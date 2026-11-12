@@ -412,6 +412,8 @@ def main(argv=None):
                     "the critic's scan encoder too")
     ap.add_argument("--actor-freeze", type=int, default=0, help="updates in which only the critic learns (a started actor)")
     ap.add_argument("--plan-hit-share", type=float, default=0.1, help="the plan-hit cost's share of a contact (0 = off)")
+    ap.add_argument("--contact-scale", type=float, default=1.0,
+                    help="a factor on every contact's time penalty, (0.5 s + 1 s per m/s of impact) x this (11-13; 1 = the 11-07 prices)")
     ap.add_argument("--plan-hit-s", type=float, default=1.0, help="the plan-hit cost looks this far into the plan [s]")
     ap.add_argument("--hold-p", type=float, default=0.0,
                     help="v2/v3: the share of new plans driven longer than 0.1 s without a new one (11-09, the user: 0.2)")
@@ -543,6 +545,7 @@ def main(argv=None):
     lid = env.learner_ids; Bl = int(lid.numel())
     pr = PlanReward(env, args.gamma, dev)
     pr.plan_hit_share = float(args.plan_hit_share)
+    pr.contact_scale = float(args.contact_scale)
     pr.plan_hit_n = None if args.plan_hit_s >= PS.N_STEP * PS.DT else int(round(args.plan_hit_s / PS.DT * PS.SUB))
     v3 = args.format == "v3"
     v2 = args.format == "v2" or v3                     # v3 is v2 with the delay-aware plan and the servo angle
