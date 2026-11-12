@@ -43,12 +43,22 @@ What is not the original's, plainly:
     every wall contact of the solo record came while it was avoiding them. The gate uses what the car has: its gyro
     and speed for the body's tilt, and how its scanner is mounted;
   * `AurorusOpponents(drive="physics")` sends the steering and speed through the simulator's car (tyres, command
-    delay, servo, motor), as the original's go to a car. "exact" is the kinematic execution the learner's plans get,
-    which has no tyre limit: at the line's full speed the port cornered at up to 14 m/s^2 there;
+    delay, servo, motor), as the original's go to a car, and through that car's measured steering trim, steering gain
+    and speed gain as every other driver's commands go (`gym_env._external_commands`; until 11-12 evening they went
+    raw, to a servo trimmed up to +-0.03 rad off with gains up to 8 % off). "exact" is the kinematic execution the
+    learner's plans get, which has no tyre limit: at the line's full speed the port cornered at up to 14 m/s^2 there;
   * free space = `TrackTensors.sample_edt` > 0.2 m (nearest-cell look-up of the distance to the nearest mapped wall);
   * its own pose is the simulator's (the original's `pose_source = 1`, its simulation-only ground-truth mode; on the
     car it localises). Other cars and boxes come from its LiDAR only;
-  * the unused second controller (`controller = 1`) is not ported.
+  * the unused second controller (`controller = 1`) is not ported;
+  * `AurorusConfig(follower="map")` hands the path to the MAP controller (`map_controller.MAPController`, the
+    race_stack's, its steering table of this simulator's car) in place of the aim point of step 4 and the steering of
+    step 5, which were made for the original's 4 m/s simulator. The path is waypoints 0.1 m apart along the line from
+    1 m behind the car to 10 m ahead: the line itself, or while it avoids the chosen path -- its cubic offset to its
+    end, then alongside the line at the end's offset -- with the line's speeds (x the car's multiple x step 4's cut for
+    a bending path) at each. MAP's speed is still capped by step 4's stopping speed. What it sees and which path it
+    picks are untouched. MAP's parameters are the caller's (`map_params`), tuned on the distance from the path it was
+    handed, never on lap time or contacts; unnamed, the ones on file for the env's map (`map_params_for`).
 The geometry is float64 as the original's: in float32 the curvature of a candidate path (points 0.2 m apart at
 coordinates of tens of metres) is noise of 1e-5..1e-4 1/m, and the curvature ratio of step 4 turns that into a speed
 cut on a straight line.
@@ -97,6 +107,12 @@ class AurorusConfig:
     speed_curvature_exponent: float = 0.3
     braking_margin_m: float = 0.3
     max_speed: float = 1e3               # the original clamps to its simulator's 4 m/s; none here
+    # not the original's (module notes): what turns its path into steering and speed. "original" = the lines above;
+    # "map" = the MAP controller on waypoints laid along the line / the chosen path
+    follower: str = "original"
+    map_spacing_m: float = 0.1           # the waypoints handed to MAP: this far apart along the line,
+    map_behind_m: float = 1.0            # from this far behind the car's place on the line
+    map_ahead_m: float = 10.0            # to this far ahead of it
 
 
 def wrap(a: torch.Tensor) -> torch.Tensor:
@@ -268,13 +284,17 @@ class AurorusCore:
     from where the car was at that moment (between the last cycle's pose and this one's). None = every beam from this
     cycle's pose, as the original does;
     floor: `FloorGate` -- with the body's tilt handed to `cycle`, returns from the floor are not obstacle points. None
-    = every return on free space is one, as the original has it."""
+    = every return on free space is one, as the original has it;
+    map_ctrl: a `map_controller.MAPController` of n cars, for `cfg.follower == "map"` (`build_map`); map_grip: which
+    of its steering tables the cars read (the nominal grip's: a car does not know its own)."""
 
     def __init__(self, line: Line, free: Callable, n: int, n_beams: int, fov: float, wheelbase: float, max_steer: float,
                  mount=(0.0, 0.0), dt: float = 0.025, range_min: float = 0.02, range_max: float = 10.0,
                  cfg: Optional[AurorusConfig] = None, device=None, chunk: int = 128, sweep: Optional[torch.Tensor] = None,
-                 floor: Optional[FloorGate] = None):
+                 floor: Optional[FloorGate] = None, map_ctrl=None, map_grip: Optional[int] = None):
         self.cfg = cfg = cfg or AurorusConfig()
+        assert cfg.follower in ("original", "map"), cfg.follower
+        assert cfg.follower != "map" or map_ctrl is not None, 'follower "map" needs its controller (`build_map`)'
         self.line, self.free, self.n = line, free, int(n)
         self.dev = dev = torch.device(device) if device is not None else line.P.device
         self.dtype = ft = line.dtype
@@ -322,9 +342,21 @@ class AurorusCore:
         self.lost = torch.zeros(n, dtype=torch.bool, device=dev)       # last cycle: further than max_cross_track_m from the line
         self.last = {}                                                 # what the last cycle saw and chose, for drawing and tests
         self.last_plan = {}
+        self.map = map_ctrl if cfg.follower == "map" else None
+        if self.map is not None:
+            from ..map_controller import GRIP_LEVELS
+            g = GRIP_LEVELS.index(1.0) if map_grip is None else int(map_grip)
+            self.map_grip = torch.full((n,), g, dtype=torch.long, device=dev)
+        # the waypoints' places along the line, from the car's own
+        self.wu = torch.arange(-cfg.map_behind_m, cfg.map_ahead_m + 0.5 * cfg.map_spacing_m, cfg.map_spacing_m, dtype=ft, device=dev)
+        self.keep_way = False                                          # True: `last["way"]` under the original follower too (to measure tracking)
 
     def reset(self, mask: torch.Tensor) -> None:
         """cars (bool (n,) or indices) that start anew: no nearest-point hint, on the line, the planner's memory blank"""
+        if self.map is not None:
+            m = torch.zeros(self.n, dtype=torch.bool, device=self.dev)
+            m[mask] = True
+            self.map.reset(m)
         self.hint[mask] = -1
         self.avoiding[mask] = False
         self.since[mask] = -1
@@ -386,14 +418,20 @@ class AurorusCore:
 
     @torch.no_grad()
     def cycle(self, pose: torch.Tensor, speed: torch.Tensor, scan: torch.Tensor, tid: torch.Tensor, a_brake: torch.Tensor,
-              scale: torch.Tensor, live: Optional[torch.Tensor] = None, tilt: Optional[torch.Tensor] = None):
+              scale: torch.Tensor, live: Optional[torch.Tensor] = None, tilt: Optional[torch.Tensor] = None,
+              yaw_rate: Optional[torch.Tensor] = None, accel: Optional[torch.Tensor] = None):
         """One control cycle. pose (n, 3) = x, y, heading of the centre of gravity; speed (n,) forward [m/s];
         scan (n, n_beams) ranges [m] (inf = no return); tid (n,); a_brake (n,) [m/s^2]; scale (n,): each car's multiple
         of the line's speeds; live (n,) bool: cars this drives now (the others get 0, 0 and keep their state);
-        tilt (n, 2): the body's roll and pitch [rad] as the car estimates them (`TiltEstimate`), for `floor`.
+        tilt (n, 2): the body's roll and pitch [rad] as the car estimates them (`TiltEstimate`), for `floor`;
+        yaw_rate (n,) [rad/s] and accel (n, k) -- the IMU's forward accelerations since the last cycle [m/s^2], oldest
+        first -- are read by the "map" follower only (MAP's delay compensation and its steering scaling).
         -> steering [rad] (n,), speed [m/s] (n,)"""
         cfg, line, dev, ft = self.cfg, self.line, self.dev, self.dtype
         self.k += 1
+        use_map = self.map is not None
+        if use_map and accel is not None and accel.shape[1] > 0:
+            self.map.push_imu(accel.to(self.map.acc_now.dtype))
         steer_out = torch.zeros(self.n, dtype=ft, device=dev)
         v_out = torch.zeros(self.n, dtype=ft, device=dev)
         idx = torch.arange(self.n, device=dev) if live is None else torch.nonzero(live).flatten()
@@ -430,12 +468,16 @@ class AurorusCore:
         plan_rows = torch.nonzero(av & ~lost).flatten()
         reach_all = torch.full_like(ref, float("inf"))
         gain_all = torch.ones_like(ref)
+        stop_all = torch.full_like(ref, float("inf"))
+        cubic = torch.zeros(int(idx.numel()), 6, dtype=ft, device=dev)
         for a in range(0, int(plan_rows.numel()), self.chunk):
             j = plan_rows[a:a + self.chunk]
-            tg, gain, reach, d_w[j], blocked[j] = self._plan(t[j], p[j], s0[j], npt[j], look[j], pts[j], ok[j], d_w[j], blocked[j])
+            tg, gain, reach, d_w[j], blocked[j], cubic[j] = self._plan(t[j], p[j], s0[j], npt[j], look[j], pts[j], ok[j],
+                                                                       d_w[j], blocked[j])
             target[j] = tg
             v = ref[j] * gain
-            v_cmd[j] = torch.minimum(v, stopping_speed(reach, cfg.braking_margin_m, a_brake[idx][j].to(ft)))
+            stop_all[j] = stopping_speed(reach, cfg.braking_margin_m, a_brake[idx][j].to(ft))
+            v_cmd[j] = torch.minimum(v, stop_all[j])
             reach_all[j], gain_all[j] = reach, gain
         # steering (`steering.rs`): the aim point's bearing from one wheelbase behind the centre of gravity
         bx = p[:, 0] - self.wheelbase * torch.cos(p[:, 2])
@@ -444,6 +486,16 @@ class AurorusCore:
         prev = self.prev_err[idx]
         deriv = torch.where(torch.isnan(prev), torch.zeros_like(err), (err - prev) / self.dt)
         steer = (cfg.kk_s * err + (cfg.kd_s * deriv).clamp(-0.2, 0.2)).clamp(-self.max_steer, self.max_steer)
+        way = way_v = way_k = None
+        if use_map or self.keep_way:
+            planned = torch.zeros_like(lost); planned[plan_rows] = True
+            way, way_v, way_k = self._waypoints(t, s0, scale[idx].to(ft), planned, cubic, gain_all)
+        if use_map:
+            # MAP on the path as waypoints, in place of the aim point and the steering above; step 4's stopping speed stays
+            h0 = line.heading_at(t, s0[:, None]).squeeze(1)
+            off = -torch.sin(h0) * (p[:, 0] - npt[:, 0]) + torch.cos(h0) * (p[:, 1] - npt[:, 1])
+            steer, v_map, target = self._map_call(idx, p, sp, way, way_v, way_k, off, None if yaw_rate is None else yaw_rate[idx])
+            v_cmd = torch.minimum(v_map, stop_all)
         v_cmd = v_cmd.clamp(0.0, cfg.max_speed)
 
         zero = torch.zeros_like(steer)
@@ -457,14 +509,72 @@ class AurorusCore:
         self.prev_err[idx] = torch.where(lost, torch.full_like(err, float("nan")), err)
         self.lost[idx] = lost
         # `pts` / `ok`: the scan points and which of them it took for obstacles; `plan_rows`: the rows (into `idx`) that
-        # planned a path -- `last_plan` holds the last chunk of them; `pose` / `npt`: the car and its nearest line point
+        # planned a path -- `last_plan` holds the last chunk of them; `pose` / `npt`: the car and its nearest line point;
+        # `way` (R, n, 2), `way_v`, `way_k` (R, n): the waypoints MAP was handed with their speeds and curvature ("map"
+        # follower; `target` is then MAP's aim point), else None; `stop` (R,): step 4's stopping speed (inf = none)
         self.last = dict(idx=idx, target=target, s0=s0, dist=dist, obst=obst, n_obst=ok.sum(1), reach=reach_all, gain=gain_all,
-                         look=look, ref=ref, pts=pts, ok=ok, plan_rows=plan_rows, pose=p, npt=npt, n_floor=self.n_floor)
+                         look=look, ref=ref, pts=pts, ok=ok, plan_rows=plan_rows, pose=p, npt=npt, n_floor=self.n_floor,
+                         way=way, way_v=way_v, way_k=way_k, stop=stop_all)
         return steer_out, v_out
+
+    def _waypoints(self, tid, s0, scale, planned, cubic, gain):
+        """The path as MAP's waypoints, for the "map" follower: xy (R, n, 2), speed (R, n), curvature (R, n), one every
+        `map_spacing_m` of the PATH's own length (MAP counts waypoints for its look-ahead distance) from `map_behind_m`
+        behind the car's place on the line. Rows not `planned`: the line. Rows `planned`: the chosen path -- `cubic`
+        (R, 6) = d0, slope0, a2, a3, length, end offset of its `LateralCubic` -- then alongside the line at the end's
+        offset; behind the car, straight back from where it is. Speeds: the line's x `scale` (x `gain` where planned)."""
+        cfg, line = self.cfg, self.line
+        R, n = int(tid.numel()), int(self.wu.numel())
+        u = self.wu[None]
+        s = s0[:, None] + u
+        base, v = line.at(tid, s)
+        hd = line.heading_at(tid, s)
+        d0, sl, a2, a3, L, d1 = (c[:, None] for c in cubic.unbind(1))
+        d = torch.where(u < 0, d0 + sl * u, torch.where(u <= L, d0 + u * (sl + u * (a2 + u * a3)), d1.expand(R, n)))
+        d = torch.where(planned[:, None], d, torch.zeros_like(d))
+        P = torch.stack([base[..., 0] - d * torch.sin(hd), base[..., 1] + d * torch.cos(hd)], -1)
+        v = scale[:, None] * v * torch.where(planned, gain, torch.ones_like(gain))[:, None]
+        # evenly along the path itself: an offset path's points are closer together inside a corner, further apart outside
+        al = torch.cat([torch.zeros_like(d[:, :1]), (P[:, 1:] - P[:, :-1]).norm(dim=-1).cumsum(1)], 1)
+        q = torch.minimum((cfg.map_spacing_m * torch.arange(n, dtype=d.dtype, device=d.device))[None].expand(R, n), al[:, -1:])
+        i = (torch.searchsorted(al, q.contiguous(), right=True) - 1).clamp(0, n - 2)
+        a, b = al.gather(1, i), al.gather(1, i + 1)
+        w = ((q - a) / (b - a).clamp_min(1e-9)).clamp(0.0, 1.0)
+        g2 = lambda A, k: A.gather(1, k[..., None].expand(-1, -1, 2))
+        P = g2(P, i) + w[..., None] * (g2(P, i + 1) - g2(P, i))
+        v = v.gather(1, i) + w * (v.gather(1, i + 1) - v.gather(1, i))
+        # curvature as `_plan` takes a path's: the heading's change over the mean of the two steps
+        dP = P[:, 1:] - P[:, :-1]
+        st = dP.norm(dim=-1)
+        yaw = torch.atan2(dP[..., 1], dP[..., 0])
+        both = (st[:, 1:] > 1e-6) & (st[:, :-1] > 1e-6)                # the array's end repeats where the path ran out
+        k = torch.where(both, wrap(yaw[:, 1:] - yaw[:, :-1]) / ((st[:, 1:] + st[:, :-1]) / 2).clamp_min(1e-6), torch.zeros_like(st[:, 1:]))
+        return P, v, torch.cat([k[:, :1], k, k[:, -1:]], 1)
+
+    def _map_call(self, idx, pose, speed, way, way_v, way_k, off, yaw_rate):
+        """MAP for the cars `idx` (its state holds all n). off (R,): the car's offset from the line, MAP's lateral error
+        to the global line. -> steering (R,), speed (R,), MAP's aim point (R, 2)"""
+        m, f = self.map, self.map.curr_steer.dtype
+        names = ("curr_steer", "i_gap", "acc_now", "curv_wp")
+        full = [getattr(m, k) for k in names]
+        for k, x in zip(names, full):
+            setattr(m, k, x[idx])
+        try:
+            R = int(idx.numel())
+            steer, v = m(pose[:, :2].to(f), pose[:, 2].to(f), speed.to(f), way.to(f), way_v.to(f), way_k.to(f),
+                         torch.full((R,), self.cfg.map_spacing_m, dtype=f, device=self.dev), off.to(f), self.map_grip[idx],
+                         yaw_rate=None if yaw_rate is None else yaw_rate.to(f))
+            for k, x in zip(names, full):
+                x[idx] = getattr(m, k)
+        finally:
+            for k, x in zip(names, full):
+                setattr(m, k, x)
+        return steer.to(self.dtype), v.to(self.dtype), m.last["l1_point"].to(self.dtype)
 
     def _plan(self, tid, pose, s0, npt, look, obs, obs_ok, d_weight, blocked):
         """`Planner::plan` for rows that avoid. -> aim point (R, 2), speed gain (R,), reach (R,; inf = no stop needed),
-        the planner's two remembered values after it"""
+        the planner's two remembered values after it, the chosen path's `LateralCubic` (R, 6) = d0, slope0, a2, a3, its
+        length along the line, its end offset (for the "map" follower's waypoints)"""
         cfg, line = self.cfg, self.line
         R, C, K = int(tid.numel()), int(self.cd1.numel()), self.K
         dev = self.dev
@@ -543,7 +653,49 @@ class AurorusCore:
         gain = (blocked * factor).clamp(min(cfg.min_speed_reduction_gain, 1.0), 1.0)
         self.last_plan = dict(P=P, d=d, keep=keep, cost=cost, hit=coll, reached=reached, on_map=on_map, chosen=sel, free=has1,
                               aim=tgt, points=self.cn)
-        return target, gain, reach, d_weight, blocked
+        cubic = torch.stack([d0, slope0, a2[rows, sel], a3[rows, sel], self.cL[sel], self.cd1[sel]], 1)
+        return target, gain, reach, d_weight, blocked, cubic
+
+
+def map_params_for(env) -> Optional[dict]:
+    """MAP's parameters on file for the env's map (`baseline_settings`): the port's own set when there is one (kind
+    "aurorus", `options.map_params`: the steering-side values searched by the lateral RMSE to its own line, 11-12),
+    else the set tuned per map for a car that follows a line alone (`raceline` / solo). A warped or scaled copy of a
+    map reads its map's. None: nothing on file."""
+    from . import baseline_settings
+    maps = baseline_settings.load_all()
+    for tr in env.sim.tracks:
+        for name in sorted((m for m in maps if tr.name.startswith(m)), key=len, reverse=True):
+            own = baseline_settings.lookup(name, "aurorus", solo=True)
+            mp = ((own or {}).get("options") or {}).get("map_params")
+            if mp:
+                return dict(mp)
+            st = baseline_settings.lookup(name, "raceline", solo=True)
+            mp = ((st or {}).get("stack_params") or {}).get("map")
+            if mp:
+                return dict(mp)
+    return None
+
+
+def build_map(env, n: int, params: Optional[dict] = None):
+    """The MAP controller of `n` cars of `env` for `AurorusConfig(follower="map")`: the steering table of the
+    simulator's nominal car (cached, the one the planner baselines' MAP reads) and `params` (`MAPParams` fields);
+    None = the ones on file for the env's map (`map_params_for`), else `MAPParams`' own (the race_stack's car's)."""
+    from .. import map_controller as M
+    params = map_params_for(env) if params is None else params
+    return M.MAPController(M.nominal_lut(env.sim), M.MAPParams.from_dict(params), int(n), env.device,
+                           float(env.sim.params.nominal["s_max"]))
+
+
+def car_calibration(env) -> torch.Tensor:
+    """(B, 3) each car's measured steering trim [rad], steering gain and speed gain, the correction every driver's
+    command gets on its way to the actuators (`gym_env._external_commands`)"""
+    cal = getattr(env, "tracker_cal", None)
+    cal = cal if cal is not None else getattr(env, "_ext_cal", None)
+    if cal is None:
+        env._calibrate_external(torch.arange(env.B, device=env.device))
+        cal = env._ext_cal
+    return cal
 
 
 class AurorusOpponents:
@@ -556,9 +708,11 @@ class AurorusOpponents:
     drive: "exact" -- its steering and speed are driven exactly (`env.ideal_cmd`, `env.ideal_extra`: the kinematic
       execution the learner's plans get, with the car's steering-rate and acceleration limits and no tyre limit);
       "physics" -- they are the command to the simulator's car (`env.ext_cmd`, `env.ext_mask`: tyres, command delay,
-      servo, motor). For rows of the learner this needs the env's exact execution off: `env.ideal_cmd = None` and
+      servo, motor), corrected by that car's measured steering trim and gains (`car_calibration`) as every driver's
+      is. For rows of the learner this needs the env's exact execution off: `env.ideal_cmd = None` and
       `env.sim.ideal_rows.zero_()` IN PLACE (a GPU env's captured physics graph keeps reading that tensor; setting the
       attribute to None leaves those rows exact).
+    map_params: `MAPParams` fields for `cfg.follower == "map"` (`build_map`; None = the ones on file for the map).
     floor: "off" -- every return on free space is an obstacle point, as the original has it;
       "gate" -- returns at the range where the car's own tilt estimate (gyro + speed, `TiltEstimate` with the nominal
       car's gains) puts the floor are dropped (`FloorGate`: the car's scanner height, a mount assumed level, `floor_tol`
@@ -568,7 +722,7 @@ class AurorusOpponents:
 
     def __init__(self, env, share: float = 1.0, scale=(0.6, 1.0), seed: int = 0, cfg: Optional[AurorusConfig] = None,
                  rows: Optional[torch.Tensor] = None, deskew: bool = True, drive: str = "exact", floor: str = "off",
-                 floor_tol: float = 0.03):
+                 floor_tol: float = 0.03, map_params: Optional[dict] = None):
         assert drive in ("exact", "physics") and floor in ("off", "gate", "oracle"), (drive, floor)
         self.env, self.share = env, float(share)
         self.drive, self.floor = drive, floor
@@ -597,7 +751,7 @@ class AurorusOpponents:
             mount=(mx[self.rows].float(), my[self.rows].float()), dt=float(env.sim.control_dt),
             range_min=float(env.cfg.lidar.range_min), range_max=float(env.cfg.lidar.range_max), cfg=cfg, device=dev,
             sweep=env.sim.lidar.time_frac if deskew and getattr(env.cfg.lidar, "motion_distortion", False) else None,
-            floor=gate)
+            floor=gate, map_ctrl=build_map(env, Bo, map_params) if (cfg or AurorusConfig()).follower == "map" else None)
         self._row_ids = self.rows.tolist()
         self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by this driver this race
         self.scale = torch.ones(Bo, device=dev)
@@ -665,14 +819,18 @@ class AurorusOpponents:
         st = env.sim.state[rows]
         pose = torch.stack([st[:, dyn.IX], st[:, dyn.IY], st[:, dyn.IYAW]], -1)
         scan, tilt = res.scan[rows], None
+        imu = getattr(res, "imu", None)
         if self.floor == "oracle":
             scan = torch.where(res.scan_type[rows] == HIT_GROUND, torch.full_like(scan, float("inf")), scan)
         elif self.floor == "gate":
-            imu = getattr(res, "imu", None)
             tilt = self.tilt.update(st[:, dyn.IVX], st[:, dyn.IR], None if imu is None else imu[rows][:, :, :2], self.imu_ts,
                                     self.core.dt)
         steer, v = self.core.cycle(pose, st[:, dyn.IVX], scan, env.sim.tid[rows], env.sim.P["a_brake"][rows], self.scale,
-                                   self.live & ~self.restarted, tilt)
+                                   self.live & ~self.restarted, tilt, st[:, dyn.IR], None if imu is None else imu[rows][:, :, 3])
+        if self.drive == "physics":
+            cal = car_calibration(env)[rows].to(steer.dtype)
+            steer = ((steer - cal[:, 0]) / cal[:, 1]).clamp(-self.core.max_steer, self.core.max_steer)
+            v = v / cal[:, 2]
         out = env.ext_cmd if self.drive == "physics" else env.ideal_cmd
         out[rows, 0] = steer.to(out.dtype)
         out[rows, 1] = v.to(out.dtype)
@@ -703,8 +861,9 @@ VIZ_AHEAD_POINTS = 33
 
 
 def build_core(env, rows: torch.Tensor, line: Line, cfg: Optional[AurorusConfig] = None, deskew: bool = True,
-               floor: str = "off", floor_tol: float = 0.03):
+               floor: str = "off", floor_tol: float = 0.03, map_params: Optional[dict] = None):
     """`AurorusCore` for the cars `rows` of `env` on `line`, and what `floor="gate"` needs besides.
+    map_params: `MAPParams` fields for `cfg.follower == "map"` (`build_map`).
     -> core, the tilt estimate (None unless "gate"), the IMU's sample time [s] (None unless "gate")"""
     dev = env.device
     Bo = int(rows.numel())
@@ -729,7 +888,7 @@ def build_core(env, rows: torch.Tensor, line: Line, cfg: Optional[AurorusConfig]
         mount=(mx[rows].float(), my[rows].float()), dt=float(env.sim.control_dt),
         range_min=float(env.cfg.lidar.range_min), range_max=float(env.cfg.lidar.range_max), cfg=cfg, device=dev,
         sweep=env.sim.lidar.time_frac if deskew and getattr(env.cfg.lidar, "motion_distortion", False) else None,
-        floor=gate)
+        floor=gate, map_ctrl=build_map(env, Bo, map_params) if (cfg or AurorusConfig()).follower == "map" else None)
     return core, tilt, imu_ts
 
 
@@ -758,15 +917,20 @@ class AurorusDriver:
       draw for the race (`OpponentSlot.speed_scale`, `env.slot_scale`) multiplies it, so a slot's 1.0 is this driver's
       own full pace as it is a scripted car's.
     floor: as `AurorusOpponents` ("gate" here: the simulator's LiDAR sees the floor when the body tilts, and the
-      original, written for a flat 2D scanner, takes those returns for obstacles)."""
+      original, written for a flat 2D scanner, takes those returns for obstacles).
+    follower: "original" | "map" (`AurorusConfig.follower`; a `cfg` handed in keeps its own); map_params: `MAPParams`
+      fields for "map" (`build_map`; None = the ones on file for the map)."""
 
     KIND = kind = "aurorus"
     needs_speed = False
 
     def __init__(self, line: Line, scale: Optional[float] = None, cfg: Optional[AurorusConfig] = None, deskew: bool = True,
-                 floor: str = "gate", floor_tol: float = 0.03):
+                 floor: str = "gate", floor_tol: float = 0.03, follower: Optional[str] = None, map_params: Optional[dict] = None):
         assert floor in ("off", "gate", "oracle"), floor
+        if cfg is None and follower is not None:
+            cfg = AurorusConfig(follower=follower)
         self.line, self.scale, self.cfg = line, float(SOLO_SCALE if scale is None else scale), cfg
+        self.map_params = map_params
         self.deskew, self.floor, self.floor_tol = bool(deskew), floor, float(floor_tol)
         self.rows = None                                              # `set_ego_driver` fills it; else the first command's
         self.core = None
@@ -780,7 +944,8 @@ class AurorusDriver:
 
     def _build(self, env, rows: torch.Tensor) -> None:
         self.rows = rows
-        self.core, self.tilt, self.imu_ts = build_core(env, rows, self.line, self.cfg, self.deskew, self.floor, self.floor_tol)
+        self.core, self.tilt, self.imu_ts = build_core(env, rows, self.line, self.cfg, self.deskew, self.floor, self.floor_tol,
+                                                       self.map_params)
         self.xy = env.sim.state[rows, :2].clone()
         self._at = {int(r): j for j, r in enumerate(rows.tolist())}
 
@@ -809,15 +974,16 @@ class AurorusDriver:
             self._reset(moved)
         self.xy = pose[:, :2].clone()
         scan, tilt = res.scan[rows], None
+        imu = getattr(res, "imu", None)
         if self.floor == "oracle":
             scan = torch.where(res.scan_type[rows] == HIT_GROUND, torch.full_like(scan, float("inf")), scan)
         elif self.floor == "gate":
-            imu = getattr(res, "imu", None)
             tilt = self.tilt.update(st[:, dyn.IVX], st[:, dyn.IR], None if imu is None else imu[rows][:, :, :2], self.imu_ts,
                                     self.core.dt)
         scale = self.scale * env.slot_scale[rows]
         live = ~env.sim.absent[rows] if getattr(env.sim, "absent_any", False) else None
-        steer, v = self.core.cycle(pose, st[:, dyn.IVX], scan, env.sim.tid[rows], env.sim.P["a_brake"][rows], scale, live, tilt)
+        steer, v = self.core.cycle(pose, st[:, dyn.IVX], scan, env.sim.tid[rows], env.sim.P["a_brake"][rows], scale, live, tilt,
+                                   st[:, dyn.IR], None if imu is None else imu[rows][:, :, 3])
         self.last_cmd = torch.stack([steer, v], -1)
         return self.last_cmd
 

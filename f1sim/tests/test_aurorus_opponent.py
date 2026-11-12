@@ -10,6 +10,7 @@ paths (the sideways offsets -1.0 + k 0.1 are not exactly symmetric in floating p
 assertions are made, on each."""
 import bisect
 import dataclasses
+import json
 import math
 import types
 
@@ -279,11 +280,13 @@ def port_plans(core, tid, pose, s0, npt, look, obstacles, d_weight, blocked):
             obs[r, :len(o)] = torch.tensor(o, dtype=F64); ok[r, :len(o)] = True
     t = lambda v: torch.tensor(v, dtype=F64)
     s0 = t(s0)
-    target, gain, reach, dw, bl = core._plan(torch.tensor(tid), t(pose), s0, t(npt), t(look), obs, ok, t(d_weight), t(blocked))
+    target, gain, reach, dw, bl, cubic = core._plan(torch.tensor(tid), t(pose), s0, t(npt), t(look), obs, ok, t(d_weight), t(blocked))
     lp = core.last_plan
     out = []
     for r in range(R):
         sel = int(lp["chosen"][r]); n = int(core.cn[sel])
+        want = r_cubic(lp["d"][r, sel, 0].item(), cubic[r, 1].item(), float(core.cd1[sel]), float(core.cL[sel]))
+        assert np.allclose(cubic[r].tolist(), want + [float(core.cL[sel]), float(core.cd1[sel])], atol=1e-12)   # for the "map" follower
         out.append(dict(free=bool(lp["free"][r]), d=lp["d"][r, sel, :n].tolist(), s=(s0[r] + core.u[:n]).tolist(),
                         xy=[tuple(q) for q in lp["P"][r, sel, :n].tolist()], target=tuple(target[r].tolist()), gain=float(gain[r]),
                         reach=None if math.isinf(float(reach[r])) else float(reach[r]), d_weight=float(dw[r]),
@@ -331,6 +334,9 @@ def both_plans(obstacles, d0=0.0, slope0=0.0, band=None, s0=5.0, lookahead=1.0):
 def test_config_is_the_originals():
     mine = dataclasses.asdict(AO.AurorusConfig())
     assert mine.pop("max_speed") >= 1e3                                # the original's 4 m/s clamp is its simulator's
+    assert mine.pop("follower") == "original"                          # the MAP follower is not the original's: off unless asked
+    way = {k: mine.pop(k) for k in list(mine) if k.startswith("map_")}
+    assert way == dict(map_spacing_m=0.1, map_behind_m=1.0, map_ahead_m=10.0)      # as the planner baselines hand MAP a path
     assert mine == CFG
 
 
@@ -803,6 +809,225 @@ def test_control_cycles_match_with_the_derivative_term():
     assert any(log["avoid"][1]) and sum(log["lost"][3]) == 5
 
 
+# ---------------------------------------------------------------- the MAP follower (not the original's)
+@pytest.fixture(scope="module")
+def map_lut():
+    """the steering tables of the simulator's nominal car (cached on disk; what `build_map` reads off an env)"""
+    from f1sim import map_controller as M
+    return M.config_lut()[0]
+
+
+def map_core(pts, free, n, lut, params=None, **kw):
+    from f1sim import map_controller as M
+    ctrl = M.MAPController(lut, M.MAPParams.from_dict(params), n, torch.device("cpu"), STEER_MAX)
+    return make_core(pts, free, n=n, wheelbase=WB, max_steer=STEER_MAX, dt=DT, cfg=AO.AurorusConfig(follower="map"),
+                     map_ctrl=ctrl, **kw), ctrl
+
+
+def r_waypoints(P, line, s0, scale, cubic, gain):
+    """the "map" follower's waypoints in plain floats. cubic None: the line. Else [d0, slope0, a2, a3, length, end offset]:
+    the chosen path, then alongside the line at its end's offset. One every `map_spacing_m` of the path's own length.
+    -> [(x, y, speed)], [curvature]"""
+    sp = P["map_spacing_m"]
+    n = int(round((P["map_behind_m"] + P["map_ahead_m"]) / sp)) + 1
+    raw = []
+    for i in range(n):
+        u = -P["map_behind_m"] + i * sp
+        bx, by, v = line.at(s0 + u)
+        h = line.heading_at(s0 + u)
+        d, g = 0.0, 1.0
+        if cubic is not None:
+            d = cubic[0] + cubic[1] * u if u < 0 else (r_cubic_at(cubic[:4], u) if u <= cubic[4] else cubic[5])
+            g = gain
+        raw.append((bx - d * math.sin(h), by + d * math.cos(h), scale * v * g))
+    al = [0.0]
+    for i in range(1, n):
+        al.append(al[-1] + math.hypot(raw[i][0] - raw[i - 1][0], raw[i][1] - raw[i - 1][1]))
+    out = []
+    for i in range(n):
+        q = min(i * sp, al[-1])
+        j = min(max(bisect.bisect_right(al, q) - 1, 0), n - 2)
+        w = min(max((q - al[j]) / max(al[j + 1] - al[j], 1e-9), 0.0), 1.0)
+        out.append(tuple(raw[j][k] + w * (raw[j + 1][k] - raw[j][k]) for k in range(3)))
+    ds = [math.hypot(out[i + 1][0] - out[i][0], out[i + 1][1] - out[i][1]) for i in range(n - 1)]
+    yaw = [math.atan2(out[i + 1][1] - out[i][1], out[i + 1][0] - out[i][0]) for i in range(n - 1)]
+    curv = [0.0] * n
+    for i in range(1, n - 1):
+        if ds[i - 1] > 1e-6 and ds[i] > 1e-6:
+            curv[i] = r_wrap(yaw[i] - yaw[i - 1]) / ((ds[i - 1] + ds[i]) / 2.0)
+    curv[0], curv[n - 1] = curv[1], curv[n - 2]
+    return out, curv
+
+
+def test_the_map_followers_waypoints_match_the_reference(map_lut):
+    """on the line, on a path to either side from on and off the line, short and long, on both tracks"""
+    par, pts = wavy_tracks(seed=31)
+    _, f_batched = wavy_free(par, [0.8, 0.8])
+    RL = [RLine(q) for q in pts]
+    core, _ = map_core(pts, f_batched, 1, map_lut)
+    P = dataclasses.asdict(core.cfg)
+    rng = np.random.default_rng(11)
+    rows = []
+    for k in range(16):
+        t = k % 2
+        cub = None
+        if k >= 4:
+            d0, sl, d1, L = rng.uniform(-0.6, 0.6), rng.uniform(-0.4, 0.4), rng.uniform(-1.0, 1.0), (1.25, 2.75, 4.25)[k % 3]
+            cub = r_cubic(d0, sl, d1, L) + [L, d1]
+        rows.append((t, rng.uniform(0, RL[t].lap), rng.uniform(0.6, 1.0), cub, rng.uniform(0.7, 1.0)))
+    f = lambda v: torch.tensor(v, dtype=F64)
+    way, v, k = core._waypoints(torch.tensor([r[0] for r in rows]), f([r[1] for r in rows]), f([r[2] for r in rows]),
+                                torch.tensor([r[3] is not None for r in rows]), f([r[3] or [0.0] * 6 for r in rows]),
+                                f([r[4] for r in rows]))
+    assert way.shape == (16, 111, 2) and v.shape == k.shape == (16, 111)
+    for i, (t, s0, scale, cub, gain) in enumerate(rows):
+        ref, curv = r_waypoints(P, RL[t], s0, scale, cub, gain)
+        assert np.allclose(way[i].numpy(), [q[:2] for q in ref], atol=1e-9), i
+        assert np.allclose(v[i].numpy(), [q[2] for q in ref], atol=1e-9) and np.allclose(k[i].numpy(), curv, atol=1e-6), i
+        step = (way[i, 1:] - way[i, :-1]).norm(dim=-1)
+        run = step[step > 1e-6]                                        # the array's end repeats where an inside path ran out
+        # MAP counts waypoints for a distance: 0.1 m apart (a chord across a sharp bend of the path is up to 2 % short)
+        assert run.numel() >= 100 and float((run[:-1] - 0.1).abs().max()) < 2e-3 and float((run[:-1] - 0.1).abs().median()) < 1e-5, i
+        if cub is None:                                                # the line itself, from 1 m behind the car's place on it
+            assert max(RL[t].nearest(x, y, None, 0.0)["distance"] for x, y in way[i].tolist()) < 1e-3
+            assert math.hypot(way[i, 0, 0].item() - RL[t].at(s0 - 1.0)[0], way[i, 0, 1].item() - RL[t].at(s0 - 1.0)[1]) < 1e-9
+            assert abs(v[i, 10].item() - scale * RL[t].at(s0)[2]) < 0.02
+        else:                                                          # past the path's end: alongside the line at the end's offset
+            tail = [RL[t].nearest(x, y, None, 0.0)["distance"] for x, y in way[i, -40:].tolist()]
+            assert max(abs(q - abs(cub[5])) for q in tail) < 5e-3, i
+            here = torch.tensor(off_line(RL[t], s0, cub[0])[:2], dtype=F64)        # and it goes through where the car is
+            assert float((way[i] - here).norm(dim=-1).min()) < 0.051 and 5 <= int((way[i] - here).norm(dim=-1).argmin()) <= 15, i
+
+
+def avoid_scene(lut, follower, params=None, n_cycles=6):
+    """two cars at 4 m/s, a disc on each one's line 3 m ahead, the same poses and scans every cycle"""
+    par, pts = wavy_tracks(seed=23)
+    _, f_batched = wavy_free(par, [0.8, 0.8])
+    RL = [RLine(q) for q in pts]
+    pose = [off_line(RL[t], 2.0, 0.1) for t in (0, 1)]
+    discs = [[off_line(RL[t], 5.0, 0.0)[:2] + (0.15,)] for t in (0, 1)]
+    scans = torch.tensor(np.stack([disc_scan(pose[t][:2], pose[t][2], discs[t]) for t in (0, 1)]))
+    if follower == "map":
+        core, ctrl = map_core(pts, f_batched, 2, lut, params)
+    else:
+        core, ctrl = make_core(pts, f_batched, n=2, wheelbase=WB, max_steer=STEER_MAX, dt=DT), None
+    args = (torch.tensor(pose, dtype=F64), torch.full((2,), 4.0, dtype=F64), scans, torch.tensor([0, 1]),
+            torch.full((2,), 5.0, dtype=F64), torch.full((2,), 0.8, dtype=F64))
+    seen = []
+    for _ in range(n_cycles):
+        out = core.cycle(*args, yaw_rate=torch.tensor([0.3, -0.2], dtype=F64), accel=torch.tensor([[0.5, 1.5], [-2.0, -1.0]], dtype=F64))
+        L = core.last
+        seen.append((L["n_obst"].clone(), L["pts"][L["ok"]].clone(), core.avoiding.clone(), L["reach"].clone(), L["gain"].clone()))
+    return core, ctrl, args, out, seen, discs
+
+
+def test_the_map_follower_changes_nothing_of_what_it_sees_or_picks(map_lut):
+    """the same obstacle points, the same switch, the same reach and speed cut, cycle by cycle"""
+    a, b = avoid_scene(map_lut, "original"), avoid_scene(map_lut, "map")
+    for (n1, p1, av1, r1, g1), (n2, p2, av2, r2, g2) in zip(a[4], b[4]):
+        assert int(n1.sum()) > 0 and torch.equal(n1, n2) and torch.equal(p1, p2) and torch.equal(av1, av2)
+        assert torch.equal(r1, r2) and torch.equal(g1, g2)
+    assert a[0].avoiding.all() and b[0].avoiding.all()
+    lp1, lp2 = a[0].last_plan, b[0].last_plan
+    assert torch.equal(lp1["chosen"], lp2["chosen"]) and torch.equal(lp1["P"], lp2["P"])
+    assert (a[3][0] - b[3][0]).abs().max() > 1e-3                      # and the steering is not the original's
+
+
+def test_the_map_follower_is_map_on_the_chosen_path(map_lut):
+    """steering and speed are the MAP controller's on the waypoints, the speed capped by the stopping speed; the waypoints
+    go through the chosen path's points and round the disc"""
+    from f1sim import map_controller as M
+    params = dict(t_clip_min=0.6, m_l1=0.3, q_l1=0.1, speed_lookahead=0.2, lat_err_coeff=0.5, delay_comp=0.04)
+    core, ctrl, args, (steer, v), _, discs = avoid_scene(map_lut, "map", params, n_cycles=5)
+    L, lp = core.last, core.last_plan
+    assert L["way"].shape == (2, 111, 2) and bool(core.avoiding.all())
+    for r in range(2):
+        sel = int(lp["chosen"][r])
+        path = lp["P"][r, sel, :int(core.cn[sel])]
+        gap = (path[:, None] - L["way"][r][None]).norm(dim=-1).min(1).values
+        assert float(gap.max()) < 0.051                                # each of its points within half a waypoint step
+        clear = (L["way"][r] - torch.tensor(discs[r][0][:2], dtype=F64)).norm(dim=-1).min()
+        assert float(clear) > 0.15 + 0.15                              # round the disc
+    # a controller of its own, driven the same five cycles by hand
+    twin = M.MAPController(map_lut, M.MAPParams.from_dict(params), 2, torch.device("cpu"), STEER_MAX)
+    pose, speed = args[0], args[1]
+    h0 = torch.stack([core.line.heading_at(args[3][r:r + 1], L["s0"][r:r + 1, None]).squeeze() for r in range(2)])
+    off = -torch.sin(h0) * (pose[:, 0] - L["npt"][:, 0]) + torch.cos(h0) * (pose[:, 1] - L["npt"][:, 1])
+    assert float(off.abs().max()) > 0.05                               # MAP's lateral error to the line: the cars are 0.1 m off it
+    for _ in range(5):                                                 # (the same waypoints each cycle: nothing moves)
+        twin.push_imu(torch.tensor([[0.5, 1.5], [-2.0, -1.0]]))
+        ts, tv = twin(pose[:, :2].float(), pose[:, 2].float(), speed.float(), L["way"].float(), L["way_v"].float(), L["way_k"].float(),
+                      torch.full((2,), 0.1), off.float(), torch.full((2,), M.GRIP_LEVELS.index(1.0)),
+                      yaw_rate=torch.tensor([0.3, -0.2]))
+    assert torch.allclose(steer.float(), ts, atol=1e-6) and float(steer.abs().max()) > 0.01
+    assert torch.allclose(v.float(), torch.minimum(tv, L["stop"].float()), atol=1e-5)
+    assert torch.equal(ctrl.curr_steer, twin.curr_steer) and torch.equal(ctrl.acc_now, twin.acc_now)
+    assert torch.allclose(L["target"].float(), twin.last["l1_point"], atol=1e-6)
+
+
+def test_the_map_follower_keeps_each_cars_state_and_forgets_on_reset(map_lut):
+    """cars it does not drive this cycle keep their MAP state (the steering rate limit's last value); a reset clears it"""
+    par, pts = wavy_tracks(seed=23)
+    _, f_batched = wavy_free(par, [0.8, 0.8])
+    RL = [RLine(q) for q in pts]
+    core, ctrl = map_core(pts, f_batched, 4, map_lut)
+    pose = [off_line(RL[c % 2], 3.0 + c, 0.3, 0.2) for c in range(4)]  # off the line and turned: MAP steers
+    scans = torch.tensor(np.stack([disc_scan(q[:2], q[2], []) for q in pose]))
+    args = (torch.tensor(pose, dtype=F64), torch.full((4,), 4.0, dtype=F64), scans, torch.tensor([0, 1, 0, 1]),
+            torch.full((4,), 5.0, dtype=F64), torch.full((4,), 0.8, dtype=F64))
+    core.cycle(*args)
+    first = ctrl.curr_steer.clone()
+    assert bool((first.abs() > 0.01).all()) and ctrl.curr_steer.shape == (4,)
+    steer, v = core.cycle(*args, live=torch.tensor([True, False, True, False]))
+    assert torch.equal(ctrl.curr_steer[[1, 3]], first[[1, 3]]) and steer[[1, 3]].abs().max() == 0 and v[[1, 3]].abs().max() == 0
+    assert torch.allclose(ctrl.curr_steer[[0, 2]], steer[[0, 2]].float())
+    core.reset(torch.tensor([0, 3]))
+    assert ctrl.curr_steer[[0, 3]].abs().max() == 0 and torch.equal(ctrl.curr_steer[1], first[1])
+    with pytest.raises(AssertionError):
+        make_core(pts, f_batched, n=1, cfg=AO.AurorusConfig(follower="map"))       # no controller handed
+    with pytest.raises(AssertionError):
+        make_core(pts, f_batched, n=1, cfg=AO.AurorusConfig(follower="race"))      # the pure-pursuit option is gone
+
+
+def drive_alone(lut, follower, understeer, n_cycles=800, scale=1.0, params=None):
+    """one car a track on the wavy lines, nothing in the way, on the port's commands: its largest distance from the line.
+    The car turns as a bicycle whose wheelbase grows with speed^2 (`understeer` [s^2/m]; 0 = the kinematic bicycle, 0.02 =
+    about what the simulator's car needs in a steady corner) and takes the commanded speed at up to 5 m/s^2."""
+    par, pts = wavy_tracks(seed=23)
+    _, f_batched = wavy_free(par, [0.8, 0.8])
+    RL = [RLine(q) for q in pts]
+    if follower == "map":
+        core, _ = map_core(pts, f_batched, 2, lut, params)
+    else:
+        core = make_core(pts, f_batched, n=2, wheelbase=WB, max_steer=STEER_MAX, dt=DT)
+    car = [list(off_line(RL[t], 0.0, 0.0)) + [RL[t].at(0.0)[2] * scale, 0.0] for t in (0, 1)]     # x, y, heading, speed, yaw rate
+    off = []
+    for _ in range(n_cycles):
+        scans = torch.tensor(np.stack([disc_scan(q[:2], q[2], []) for q in car]))
+        steer, v = core.cycle(torch.tensor([q[:3] for q in car], dtype=F64), torch.tensor([q[3] for q in car], dtype=F64), scans,
+                              torch.tensor([0, 1]), torch.full((2,), 5.0, dtype=F64), torch.full((2,), scale, dtype=F64),
+                              yaw_rate=torch.tensor([q[4] for q in car], dtype=F64))
+        assert not core.avoiding.any()
+        for t in (0, 1):
+            x, y, h, sp, _ = car[t]
+            sp += min(max(v[t].item() - sp, -5.0 * DT), 5.0 * DT)
+            r = sp / (WB + understeer * sp ** 2) * math.tan(steer[t].item())
+            car[t] = [x + sp * math.cos(h) * DT, y + sp * math.sin(h) * DT, h + r * DT, sp, r]
+            off.append(RL[t].nearest(car[t][0], car[t][1], None, 0.0)["distance"])
+    return max(off)
+
+
+def test_the_map_follower_holds_the_line_with_a_car_that_understeers(map_lut):
+    """lines of 6-8 m radius at 2-6 m/s. A car that understeers about as the simulator's runs wide under the original's
+    steering (0.8 x the bearing, made for a car that turns as its wheelbase says) and stays near the line under MAP, whose
+    steering table is that car's. (How well MAP tracks in the simulator is measured there, not here.)"""
+    got = {f: drive_alone(map_lut, f, 0.02) for f in ("original", "map")}
+    got["original, kinematic"] = drive_alone(map_lut, "original", 0.0)
+    print({k: round(v, 3) for k, v in got.items()})
+    assert got["map"] < 0.15 and got["original"] > 2 * got["map"]
+    assert got["original, kinematic"] < 0.1                            # the original with the car it was made for
+
+
 # ---------------------------------------------------------------- the opponents' driver on a stand-in environment
 def stand_in_env(n_races=6, mount_in_P=False):
     """rows 2k = the learner's car, 2k + 1 = the other car of race k; only what `AurorusOpponents` reads and writes"""
@@ -1045,11 +1270,15 @@ def physics_env(n_races=6):
     env.cfg.vehicle = types.SimpleNamespace(roll_per_g=0.03, pitch_per_g=0.03, dive_per_g=0.008)
     env.cfg.imu = types.SimpleNamespace(imu_rate=50.0)
     env.cfg.lidar.mount_z = 0.11
+    # each car's measured steering trim [rad], steering gain, speed gain (`gym_env._calibrate_tracker`)
+    env.tracker_cal = torch.stack([0.03 * torch.sin(torch.arange(B) * 1.3), 1.0 + 0.08 * torch.cos(torch.arange(B) * 0.7),
+                                   1.0 + 0.07 * torch.sin(torch.arange(B) * 0.4)], 1)
     return env
 
 
 def test_commands_through_the_simulators_car():
-    """`drive="physics"`: the same steering and speed, as the command of an externally driven row"""
+    """`drive="physics"`: the same steering and speed as the command of an externally driven row, corrected by that
+    car's measured steering trim and gains as the env corrects every driver's (`_external_commands`)"""
     env, ref = physics_env(), stand_in_env()[0]
     B = env.B
     env.ideal_cmd = None                                               # nothing of the exact execution is touched
@@ -1063,7 +1292,14 @@ def test_commands_through_the_simulators_car():
     opp.plan(); twin.plan()
     assert env.ext_mask.tolist() == [i % 2 == 1 and i != 1 for i in range(B)] and env._ext_ids == {0, 3, 5, 7, 9, 11}
     opp.command(0); twin.command(0)
-    assert torch.equal(env.ext_cmd[rows[1:]], ref.ideal_cmd[rows[1:]]) and bool((env.ext_cmd[rows[1:], 1] > 1.0).all())
+    r, cal = rows[1:], env.tracker_cal[rows[1:]]
+    want = torch.stack([((ref.ideal_cmd[r, 0] - cal[:, 0]) / cal[:, 1]).clamp(-0.4189, 0.4189), ref.ideal_cmd[r, 1] / cal[:, 2]], 1)
+    assert torch.allclose(env.ext_cmd[r], want, atol=1e-6) and bool((env.ext_cmd[r, 1] > 1.0).all())
+    assert float((env.ext_cmd[r] - ref.ideal_cmd[r]).abs().max()) > 0.02   # and that is not the raw command
+    del env.tracker_cal                                                # an env without a plan tracker: its external calibration
+    env._ext_cal = torch.tensor([[0.0, 1.0, 1.0]]).repeat(B, 1)
+    opp.command(1); twin.command(1)
+    assert torch.allclose(env.ext_cmd[r], ref.ideal_cmd[r], atol=1e-6)
     assert not bool(env.ext_cmd[env.learner].any()) and not bool(env.ext_cmd[rows[0]].any())
     env.sim.absent[rows[0]] = False
     opp.plan()
@@ -1236,3 +1472,86 @@ def test_the_ego_driver_and_its_picture():
     assert len(fr["lines"]) == 2 and len(fr["points"]) == 2
     path0, fr0 = picture(0)                                            # the other car is still on its line
     assert path0.shape == (AO.VIZ_AHEAD_POINTS, 3) and "자기 선" in fr0["legend"]
+
+
+MAP_SET = dict(t_clip_min=1.0, m_l1=0.35, q_l1=-0.2, speed_lookahead=0.25, lat_err_coeff=0.2, delay_comp=0.05)
+
+
+def settings_file(tmp_path, monkeypatch, maps):
+    from f1sim.learn import baseline_settings as BS
+    f = tmp_path / "baseline_settings.json"
+    f.write_text(json.dumps({"version": 1, "maps": maps}))
+    monkeypatch.setattr(BS, "SETTINGS_FILE", str(f))
+
+
+def test_the_map_follower_takes_the_maps_tuned_controller(tmp_path, monkeypatch):
+    """`map_params_for`: the MAP settings `baseline_settings` holds for the line follower on the env's map (a variant of the
+    map is named after it), the solo ones before the race ones; none -> None (the controller's own defaults)"""
+    env, rl = real_env(None, envs=2)
+    name = env.sim.tracks[0].name
+    assert name == "korea_2025_iccas"
+    other = dict(MAP_SET, m_l1=0.5)
+    settings_file(tmp_path, monkeypatch, {name: {"raceline": {"race": {"stack_params": {"map": other}},
+                                                             "solo": {"stack_params": {"map": MAP_SET}}}},
+                                          "korea": {"raceline": {"solo": {"stack_params": {"map": other}}}}})
+    assert AO.map_params_for(env) == MAP_SET
+    ctrl = AO.build_map(env, 2)
+    assert (ctrl.p.m_l1, ctrl.p.delay_comp, ctrl.p.t_clip_max) == (0.35, 0.05, 5.0) and ctrl.curr_steer.shape == (2,)
+    assert AO.build_map(env, 2, {"m_l1": 0.4}).p.m_l1 == 0.4           # handed settings go before the file's
+    fake = types.SimpleNamespace(sim=types.SimpleNamespace(tracks=[types.SimpleNamespace(name=name + "+scale090")]))
+    assert AO.map_params_for(fake) == MAP_SET                          # the longest map name its name starts with
+    settings_file(tmp_path, monkeypatch, {name: {"raceline": {"race": {"stack_params": {"map": other}}}}})
+    assert AO.map_params_for(env) == other
+    settings_file(tmp_path, monkeypatch, {"icra2022": {"raceline": {"solo": {"stack_params": {"map": other}}}}})
+    assert AO.map_params_for(env) is None and AO.build_map(env, 2).p.m_l1 == 0.583
+    own = dict(MAP_SET, t_clip_min=0.65)                                # the port's own set goes before the line follower's
+    settings_file(tmp_path, monkeypatch, {name: {"raceline": {"solo": {"stack_params": {"map": MAP_SET}}},
+                                                 "aurorus": {"solo": {"options": {"follower": "map", "map_params": own}}}}})
+    assert AO.map_params_for(env) == own and AO.build_map(env, 2).p.t_clip_min == 0.65
+    settings_file(tmp_path, monkeypatch, {name: {"raceline": {"solo": {"stack_params": {"map": MAP_SET}}},
+                                                 "aurorus": {"solo": {"options": {"follower": "map"}}}}})
+    assert AO.map_params_for(env) == MAP_SET                           # an entry without a set: the line follower's
+
+
+def test_the_map_follower_drives_the_simulators_cars(tmp_path, monkeypatch):
+    """an "aurorus" slot and the console's 내 차 with `follower: "map"` in their options: the command is MAP's on the
+    port's waypoints, through each car's calibration; the cars follow the line"""
+    from f1sim.learn import common
+    settings_file(tmp_path, monkeypatch, {"korea_2025_iccas": {"raceline": {"solo": {"stack_params": {"map": MAP_SET}}}}})
+    env, rl = real_env({"kind": "aurorus", "speed_scale": [0.7, 1.0], "options": {"floor": "off", "follower": "map"}})
+    env.reset()
+    rows, drv = env.external_slot_rows[1], env.external_drivers[1]
+    act = torch.zeros(env.B, env.act_dim)
+    env.step(act)
+    core = drv.core
+    assert core.cfg.follower == "map" and core.map.p.m_l1 == 0.35 and core.map.curr_steer.shape == (3,)
+    ref, _, _ = AO.build_core(env, rows, AO.driver_line(env, [rl]), cfg=AO.AurorusConfig(follower="map"), floor="off")
+    for k in range(6):
+        st = env.sim.state[rows]
+        pose = torch.stack([st[:, AO.dyn.IX], st[:, AO.dyn.IY], st[:, AO.dyn.IYAW]], -1)
+        for q in ("curr_steer", "i_gap", "acc_now", "curv_wp"):       # the twin starts each cycle from the driver's MAP state
+            setattr(ref.map, q, getattr(core.map, q).clone())
+        steer, v = ref.cycle(pose, st[:, AO.dyn.IVX], env.last_result.scan[rows], env.sim.tid[rows], env.sim.P["a_brake"][rows],
+                             AO.SOLO_SCALE * env.slot_scale[rows], None, None, st[:, AO.dyn.IR], env.last_result.imu[rows][:, :, 3])
+        env.step(act)
+        got = env.last_cmd[rows]
+        cal = (env.tracker_cal if getattr(env, "tracker_cal", None) is not None else env._ext_cal)[rows]
+        want_s = ((steer.float() - cal[:, 0]) / cal[:, 1]).clamp(-float(env.s_max), float(env.s_max))
+        want_v = torch.minimum(v.float() / cal[:, 2], env.speed_cap[rows])
+        assert torch.allclose(got[:, 0], want_s, atol=1e-5) and torch.allclose(got[:, 1], want_v, atol=1e-4), k
+        go = ~ref.lost                                                 # (a car that starts 1.3 m off the line and turned away
+        assert core.last["way"].shape == (3, 111, 2) and int(go.sum()) >= 2 and bool((v[go] > 0.5).all())   # leaves it: the original stops)
+    # 내 차: three seconds of driving alone, on the line
+    env, rl = real_env(None, envs=2)
+    env.reset()
+    drv = common.build_ego_driver(env, "aurorus", options={"floor": "off", "scale": 0.6, "follower": "map"}, rls=[rl])
+    env.set_ego_driver(drv)
+    act = torch.zeros(env.B, env.act_dim)
+    far = []
+    for k in range(120):
+        env.step(act)
+        if k >= 40:
+            far.append(float(drv.core.last["dist"].abs().max()))
+    assert drv.core.map is not None and not bool(drv.core.avoiding.any())
+    assert bool((env.sim.state[:, AO.dyn.IVX] > 1.5).all()) and max(far) < 0.15, max(far)
+    print("내 차, MAP, 0.6배: 선에서 가장 멀 때", round(max(far), 3), "m")

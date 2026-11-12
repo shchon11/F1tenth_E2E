@@ -61,7 +61,10 @@ for i, sc in enumerate(scales):
     if len(pick):
         fig.colorbar(last, ax=list(axes[i]), fraction=0.02, pad=0.01, label="속도 m/s")
 HOW = (f" · 주행 {dict(exact='정확 실행', physics='보통 물리')[str(z['drive'])]} · 바닥 점 "
-       f"{dict(off='그대로', gate='자기 센서로 거름', oracle='정답으로 거름')[str(z['floor'])]}") if "drive" in z.files else ""
+       f"{dict(off='그대로', gate='자기 센서로 거름', oracle='정답으로 거름')[str(z['floor'])]}"
+       + ((" · 경로 추종 " + ("pure pursuit(버린 옵션)" if '"race"' in str(z["aur_cfg"]) else "MAP 제어기" if '"map"' in str(z["aur_cfg"])
+                              else "원본")) if "aur_cfg" in z.files else "")
+       + ("" if "calibrated" in z.files or str(z["drive"]) != "physics" else " · 차 보정 없는 명령")) if "drive" in z.files else ""
 fig.suptitle(f"{r.name}{HOW}: 혼자 달린 길 (차 {B}대 x {T * dt:.0f} s 가운데; 칸 = 첫 차 / 접촉 가장 많은 차 / 가장 오래 선 차)", fontsize=12)
 fig.savefig(out + "_runs.png", dpi=95); plt.close(fig)
 
