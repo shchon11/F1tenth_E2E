@@ -341,10 +341,11 @@ def external_drivers(env, rls=None, limits: Optional[dict] = None, tracks=None) 
             continue
         opts = dict(sl.options or {})
         if sl.driver.external == "aurorus":
-            from .aurorus_opponent import AurorusDriver, driver_line
+            from .aurorus_opponent import AurorusDriver, driver_line, tuned_options
             if rls is None and tracks is not None and getattr(env, "teacher", None) is None:
                 rls = [Raceline.build_cached(t) for t in tracks]
-            out[i] = AurorusDriver(driver_line(env, rls, limits), **opts)
+            # the follower on file for this map unless the slot names its own (as the console's 내 차 reads it)
+            out[i] = AurorusDriver(driver_line(env, rls, limits), **{**tuned_options(env), **opts})
             continue
         if sl.driver.external == "end2race":
             opts.setdefault("repo", _os.path.join(_os.path.dirname(__file__), "..", "..", "..",

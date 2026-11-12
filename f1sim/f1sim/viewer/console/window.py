@@ -2977,9 +2977,24 @@ class ConsoleWindow(QtWidgets.QMainWindow):
                 # instead when it arrives (11-09, the user: "최신 체크포인트 맵 자동설정이 안되어있어서 매번 지정해줘야함").
                 self._pref_map = pick.map
             self._apply_pick_settings(pick)
+        self._ego_from_run(pick)
         self._update_selection_note()
         self._update_start_enabled()
         self.describe_requested.emit(name)
+
+    def _ego_from_run(self, pick=None) -> None:
+        """내 차 is the run picked, unless its pick names another driver (`settings` "ego": a baseline or an opponent
+        candidate shown driving alone). The 내 차 panel has not been on screen since 11-02, so one left on another driver
+        would drive every run chosen after it with nothing on screen saying so."""
+        if not hasattr(self, "ego_panel"):
+            return
+        if pick is None:
+            pick = next((r for r in (self.runs or []) if r.name == self._selected_run and r.pinned), None)
+        ego = (getattr(pick, "settings", None) or {}).get("ego")
+        try:
+            self.ego_panel.set_config(dict(ego) if ego else {"ego_kind": "policy"})
+        except Exception:
+            pass
 
     def _apply_pick_settings(self, pick) -> None:
         """The rest of what a pick is meant to be driven with (`catalog.PICKS_FILE` "settings"): the same keys the
@@ -3345,6 +3360,7 @@ class ConsoleWindow(QtWidgets.QMainWindow):
         self.combo_device.setCurrentIndex(0)
         self.chk_saliency.setChecked(False)
         self.chk_internals.setChecked(False)
+        self._ego_from_run()                 # 내 차 too: the remembered run's own driver, not one left from an old session
         # the road grip as the policies are evaluated: a remembered "fixed 1.2" (no control for it any more) made the
         # console's laps 3 % faster than every number reported for the same checkpoint (6.32 s against 6.50)
         i_mu = self.combo_mu.findData(SessionConfig.mu_mode)

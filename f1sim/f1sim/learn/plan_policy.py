@@ -276,8 +276,7 @@ class PlanRunner:
                                         lut=env.tracker.map.lut, grip=M.GRIP_LEVELS.index(1.0),
                                         **dict(zip(("w_lat", "w_head", "w_rate", "w_yaw"),
                                                    [float(v) for v in os.environ.get("F1SIM_MPC_W", "400,100,2500,0").split(",")])))
-            env.ext_mask[self.lid] = True
-            env._ext_ids.update(int(i) for i in self.lid.tolist())
+            env.claim_external(self.lid)
 
     @torch.no_grad()
     def __call__(self, scan=None, ego=None):

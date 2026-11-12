@@ -87,6 +87,12 @@ class AurorusConfig:
     lidar_downsample: int = 5
     desired_fov_deg: float = 200.0
     wall_clearance_m: float = 0.2
+    #: not the original's (None = it has one value, the one above, for both): the distance from the mapped walls a
+    #: candidate path's centre must keep, apart from the one that makes a scan point an obstacle. 11-12, 2 boxes on
+    #: Korea 2025: at a wall contact while avoiding the car was on its path (0.01-0.06 m) and the path's centre
+    #: 0.29-0.32 m from the wall -- a 0.31 x 0.58 m body does not fit there at an angle. Raising the one value
+    #: instead would also stop it seeing boxes that close to a wall.
+    path_wall_clearance_m: Optional[float] = None
     switch_on_s: float = 0.07
     hysteresis_s: float = 2.07
     max_road_width_m: float = 1.0
@@ -277,6 +283,7 @@ class AurorusCore:
     """The controller's state and one control cycle for `n` cars.
 
     line: `Line`; free(xy (..., 2), tid (R,)) -> bool (...): the map's free space (see the module notes);
+    free_path: the same for the candidate paths' points when they are to keep further from the walls (None = `free`);
     n_beams / fov / range_min / range_max: the scanner, beam i at -fov/2 + i fov/(n_beams-1);
     mount: the scanner's place ahead / left of the centre of gravity [m] (floats or (n,) tensors);
     wheelbase, max_steer: the car's; dt: the cycle [s] (the switch counts cycles);
@@ -291,11 +298,13 @@ class AurorusCore:
     def __init__(self, line: Line, free: Callable, n: int, n_beams: int, fov: float, wheelbase: float, max_steer: float,
                  mount=(0.0, 0.0), dt: float = 0.025, range_min: float = 0.02, range_max: float = 10.0,
                  cfg: Optional[AurorusConfig] = None, device=None, chunk: int = 128, sweep: Optional[torch.Tensor] = None,
-                 floor: Optional[FloorGate] = None, map_ctrl=None, map_grip: Optional[int] = None):
+                 floor: Optional[FloorGate] = None, map_ctrl=None, map_grip: Optional[int] = None,
+                 free_path: Optional[Callable] = None):
         self.cfg = cfg = cfg or AurorusConfig()
         assert cfg.follower in ("original", "map"), cfg.follower
         assert cfg.follower != "map" or map_ctrl is not None, 'follower "map" needs its controller (`build_map`)'
         self.line, self.free, self.n = line, free, int(n)
+        self.free_path = free_path or free                             # `AurorusConfig.path_wall_clearance_m`
         self.dev = dev = torch.device(device) if device is not None else line.P.device
         self.dtype = ft = line.dtype
         self.wheelbase, self.max_steer, self.dt = float(wheelbase), float(max_steer), float(dt)
@@ -614,7 +623,7 @@ class AurorusCore:
         k_hit = hit.float().argmax(-1)
         inf = torch.full_like(cost, float("inf"))
         reached = torch.where(coll, along.gather(2, k_hit[..., None]).squeeze(2), inf)
-        on_map = (self.free(P, tid) | ~self.check[None]).all(-1)
+        on_map = (self.free_path(P, tid) | ~self.check[None]).all(-1)
         length_m = along.gather(2, last).squeeze(2)
         # the choice
         m1 = keep & ~coll & on_map
@@ -675,6 +684,19 @@ def map_params_for(env) -> Optional[dict]:
             if mp:
                 return dict(mp)
     return None
+
+
+def tuned_options(env) -> dict:
+    """`AurorusDriver`'s options on file for the env's map (`baseline_settings`, kind "aurorus"): which follower drives
+    its path and, when named, its scale. The MAP values themselves are read by `map_params_for`. {}: nothing on file."""
+    from . import baseline_settings
+    maps = baseline_settings.load_all()
+    for tr in env.sim.tracks:
+        for name in sorted((m for m in maps if tr.name.startswith(m)), key=len, reverse=True):
+            own = baseline_settings.lookup(name, "aurorus", solo=False)
+            if own:
+                return {k: v for k, v in (own.get("options") or {}).items() if k != "map_params"}
+    return {}
 
 
 def build_map(env, n: int, params: Optional[dict] = None):
@@ -745,13 +767,16 @@ class AurorusOpponents:
             cv = env.cfg.vehicle
             self.tilt = TiltEstimate(Bo, cv.roll_per_g, cv.pitch_per_g, cv.dive_per_g, device=dev)
             self.imu_ts = 1.0 / float(env.cfg.imu.imu_rate)
+        clear_p = (cfg or AurorusConfig()).path_wall_clearance_m
         self.core = AurorusCore(
             Line(env.teacher.xy, env.teacher.v), lambda xy, tid: track.sample_edt(xy, tid.view(-1, *([1] * (xy.dim() - 2)))) > clear,
             Bo, int(env.last_result.scan.shape[1]), float(env.cfg.lidar.fov), float(P["lf"][r0] + P["lr"][r0]), float(P["s_max"][r0]),
             mount=(mx[self.rows].float(), my[self.rows].float()), dt=float(env.sim.control_dt),
             range_min=float(env.cfg.lidar.range_min), range_max=float(env.cfg.lidar.range_max), cfg=cfg, device=dev,
             sweep=env.sim.lidar.time_frac if deskew and getattr(env.cfg.lidar, "motion_distortion", False) else None,
-            floor=gate, map_ctrl=build_map(env, Bo, map_params) if (cfg or AurorusConfig()).follower == "map" else None)
+            floor=gate, map_ctrl=build_map(env, Bo, map_params) if (cfg or AurorusConfig()).follower == "map" else None,
+            free_path=None if clear_p is None else
+            (lambda xy, tid: track.sample_edt(xy, tid.view(-1, *([1] * (xy.dim() - 2)))) > clear_p))
         self._row_ids = self.rows.tolist()
         self.on = torch.zeros(Bo, dtype=torch.bool, device=dev)       # driven by this driver this race
         self.scale = torch.ones(Bo, device=dev)
@@ -882,13 +907,16 @@ def build_core(env, rows: torch.Tensor, line: Line, cfg: Optional[AurorusConfig]
         cv = env.cfg.vehicle
         tilt = TiltEstimate(Bo, cv.roll_per_g, cv.pitch_per_g, cv.dive_per_g, device=dev)
         imu_ts = 1.0 / float(env.cfg.imu.imu_rate)
+    clear_p = (cfg or AurorusConfig()).path_wall_clearance_m
     core = AurorusCore(
         line, lambda xy, tid: track.sample_edt(xy, tid.view(-1, *([1] * (xy.dim() - 2)))) > clear,
         Bo, int(env.last_result.scan.shape[1]), float(env.cfg.lidar.fov), float(P["lf"][r0] + P["lr"][r0]), float(P["s_max"][r0]),
         mount=(mx[rows].float(), my[rows].float()), dt=float(env.sim.control_dt),
         range_min=float(env.cfg.lidar.range_min), range_max=float(env.cfg.lidar.range_max), cfg=cfg, device=dev,
         sweep=env.sim.lidar.time_frac if deskew and getattr(env.cfg.lidar, "motion_distortion", False) else None,
-        floor=gate, map_ctrl=build_map(env, Bo, map_params) if (cfg or AurorusConfig()).follower == "map" else None)
+        floor=gate, map_ctrl=build_map(env, Bo, map_params) if (cfg or AurorusConfig()).follower == "map" else None,
+        free_path=None if clear_p is None else
+        (lambda xy, tid: track.sample_edt(xy, tid.view(-1, *([1] * (xy.dim() - 2)))) > clear_p))
     return core, tilt, imu_ts
 
 
@@ -918,8 +946,9 @@ class AurorusDriver:
       own full pace as it is a scripted car's.
     floor: as `AurorusOpponents` ("gate" here: the simulator's LiDAR sees the floor when the body tilts, and the
       original, written for a flat 2D scanner, takes those returns for obstacles).
-    follower: "original" | "map" (`AurorusConfig.follower`; a `cfg` handed in keeps its own); map_params: `MAPParams`
-      fields for "map" (`build_map`; None = the ones on file for the map)."""
+    follower: "map" | "original" (`AurorusConfig.follower`; a `cfg` handed in keeps its own). None = "map": a car that
+      races follows its path with the MAP controller, the original's aimed-point steering is for the comparison with
+      the Rust code. map_params: `MAPParams` fields for "map" (`build_map`; None = the ones on file for the map)."""
 
     KIND = kind = "aurorus"
     needs_speed = False
@@ -927,8 +956,8 @@ class AurorusDriver:
     def __init__(self, line: Line, scale: Optional[float] = None, cfg: Optional[AurorusConfig] = None, deskew: bool = True,
                  floor: str = "gate", floor_tol: float = 0.03, follower: Optional[str] = None, map_params: Optional[dict] = None):
         assert floor in ("off", "gate", "oracle"), floor
-        if cfg is None and follower is not None:
-            cfg = AurorusConfig(follower=follower)
+        if cfg is None:
+            cfg = AurorusConfig(follower="map" if follower is None else follower)
         self.line, self.scale, self.cfg = line, float(SOLO_SCALE if scale is None else scale), cfg
         self.map_params = map_params
         self.deskew, self.floor, self.floor_tol = bool(deskew), floor, float(floor_tol)

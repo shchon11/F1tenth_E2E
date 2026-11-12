@@ -335,6 +335,7 @@ def test_config_is_the_originals():
     mine = dataclasses.asdict(AO.AurorusConfig())
     assert mine.pop("max_speed") >= 1e3                                # the original's 4 m/s clamp is its simulator's
     assert mine.pop("follower") == "original"                          # the MAP follower is not the original's: off unless asked
+    assert mine.pop("path_wall_clearance_m") is None                   # nor a second wall distance for the paths: one value
     way = {k: mine.pop(k) for k in list(mine) if k.startswith("map_")}
     assert way == dict(map_spacing_m=0.1, map_behind_m=1.0, map_ahead_m=10.0)      # as the planner baselines hand MAP a path
     assert mine == CFG
@@ -412,6 +413,22 @@ def test_without_a_free_path_it_still_keeps_clear_of_the_obstacles():
         assert not p["free"], name
         assert not p["collides"], name
         assert all(math.hypot(x - ox, y - oy) > CFG["robot_radius_m"] for x, y in p["xy"][1:] for ox, oy in obstacles), name
+
+
+def test_a_wall_distance_of_their_own_for_the_paths_leaves_what_it_sees_alone():
+    """`AurorusConfig.path_wall_clearance_m` (not the original's): the chosen path keeps to the free space handed for
+    paths, while a scan point is an obstacle on the map's as before."""
+    pts, obstacles = loop_line(), [(8.5, 0.0), (8.5, 0.1), (8.5, 0.2)]          # the short way round is to the right
+    wide = corridor_free_t(1.0)
+    right_shut = lambda xy, tid: wide(xy, tid) & (xy[..., 1] > -0.3)             # as a wall on the right would shut it
+    plan = lambda core: port_plans(core, [0], [[5.0, 0.0, 0.0]], [5.0], [[5.0, 0.0]], [1.0], [obstacles], [0.0], [1.0])[0]
+    one = plan(make_core([pts], wide))
+    core = make_core([pts], wide, free_path=right_shut)
+    two = plan(core)
+    assert one["free"] and one["d"][-1] < -0.3
+    assert two["free"] and two["d"][-1] > 0.5 and min(y for _, y in two["xy"]) > -0.3
+    assert all(math.hypot(x - ox, y - oy) > CFG["robot_radius_m"] for x, y in two["xy"] for ox, oy in obstacles)
+    assert bool(core.free(torch.tensor([[8.5, -0.6]], dtype=F64), torch.tensor([0])))   # a point there is still an obstacle
 
 
 def test_a_path_starts_along_the_vehicle_slope():
@@ -1368,7 +1385,7 @@ def real_env(slot=None, envs=3):
 def test_an_aurorus_slot_executes_what_its_controller_says_on_its_own_scan():
     """as `test_external_opponents` asks of every external driver: the car's command is the driver's, read from that car's
     own row and sent through its calibration -- here against a second controller fed by hand"""
-    env, rl = real_env({"kind": "aurorus", "speed_scale": [0.7, 1.0], "options": {"floor": "off"}})
+    env, rl = real_env({"kind": "aurorus", "speed_scale": [0.7, 1.0], "options": {"floor": "off", "follower": "original"}})
     env.reset()
     rows = env.external_slot_rows[1]
     drv = env.external_drivers[1]
@@ -1393,7 +1410,7 @@ def test_an_aurorus_slot_executes_what_its_controller_says_on_its_own_scan():
 
 
 def test_the_driver_forgets_a_car_that_starts_again():
-    env, rl = real_env({"kind": "aurorus", "options": {"floor": "gate"}})
+    env, rl = real_env({"kind": "aurorus", "options": {"floor": "gate", "follower": "original"}})
     env.reset()
     rows = env.external_slot_rows[1]
     drv = env.external_drivers[1]
@@ -1482,6 +1499,35 @@ def settings_file(tmp_path, monkeypatch, maps):
     f = tmp_path / "baseline_settings.json"
     f.write_text(json.dumps({"version": 1, "maps": maps}))
     monkeypatch.setattr(BS, "SETTINGS_FILE", str(f))
+
+
+@pytest.fixture(autouse=True)
+def nothing_on_file(tmp_path, monkeypatch):
+    """no test reads the map settings of the runs folder (`baseline_settings.SETTINGS_FILE`): one that needs some writes
+    its own (`settings_file`)"""
+    settings_file(tmp_path, monkeypatch, {})
+
+
+def test_an_aurorus_slot_follows_its_path_with_map_unless_told_otherwise(tmp_path, monkeypatch):
+    """a slot that names no follower drives with MAP (`AurorusDriver`), with the set on file for its map when there is
+    one; what the file says for the map (`tuned_options` through `common.external_drivers`) goes before that default,
+    and the slot's own option before the file"""
+    own = dict(MAP_SET, t_clip_min=0.65)
+    slot = {"kind": "aurorus", "speed_scale": [0.7, 1.0], "options": {"floor": "off"}}
+
+    def follower(sl):
+        env, rl = real_env(sl)
+        env.reset(); env.step(torch.zeros(env.B, env.act_dim))
+        return env, env.external_drivers[1].core
+
+    env, core = follower(slot)
+    assert AO.tuned_options(env) == {} and core.cfg.follower == "map"
+    settings_file(tmp_path, monkeypatch, {"korea_2025_iccas": {"aurorus": {"solo": {"options": {"follower": "map", "map_params": own}}}}})
+    env, core = follower(slot)
+    assert AO.tuned_options(env) == {"follower": "map"} and core.cfg.follower == "map" and core.map.p.t_clip_min == 0.65
+    assert follower(dict(slot, options={"floor": "off", "follower": "original"}))[1].cfg.follower == "original"
+    settings_file(tmp_path, monkeypatch, {"korea_2025_iccas": {"aurorus": {"race": {"options": {"follower": "original"}}}}})
+    assert follower(slot)[1].cfg.follower == "original"
 
 
 def test_the_map_follower_takes_the_maps_tuned_controller(tmp_path, monkeypatch):

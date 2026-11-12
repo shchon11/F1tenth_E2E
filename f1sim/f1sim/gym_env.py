@@ -2003,6 +2003,9 @@ class F1VecEnv:
         self.external_drivers[0] = driver
         self.external_driven[rows] = True
         self._all_external = bool(self.external_driven.all())
+        # the driver has these cars now: a follower that claimed them before (`claim_external`) would replace its command
+        self.ext_mask[rows] = False
+        self._ext_ids.difference_update(int(i) for i in rows.tolist())
         if hasattr(driver, "rows"):
             driver.rows = rows
 
@@ -4610,6 +4613,15 @@ class F1VecEnv:
         if idx not in self._ext_ids:
             self.ext_mask[idx] = True
             self._ext_ids.add(int(idx))
+
+    def claim_external(self, rows: torch.Tensor) -> None:
+        """Rows whose command a follower outside the env writes into `ext_cmd` every step (`plan_policy.PlanRunner`
+        "track"). Not a car an external driver has (`set_ego_driver`, the console's 내 차 with another method): that
+        driver's command is the car's, and with the policy idle the follower's is never written -- the car stood still
+        under every plan checkpoint (found 2026-11-12)."""
+        rows = rows[~self.external_driven[rows]]
+        self.ext_mask[rows] = True
+        self._ext_ids.update(int(i) for i in rows.tolist())
 
     def clear_external_command(self, idx: Optional[int] = None) -> None:
         """Hand car `idx` (or every car) back to the policy."""

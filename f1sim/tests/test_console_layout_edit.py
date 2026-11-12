@@ -261,6 +261,29 @@ def test_the_seed_box_is_the_seed_the_session_draws(window):
     assert w.current_config().layout_seed is None and not w.current_config().procedural
 
 
+def test_my_car_follows_the_run_picked_unless_its_pick_names_another_driver(window, tmp_path):
+    """The 내 차 panel is off screen (11-02): a pick may put another driver in the seat ("ego" in its settings -- an
+    opponent candidate shown driving alone), and the next run picked is driven by its own checkpoint again."""
+    from f1sim.viewer.console.catalog import RunInfo
+    w = window
+    runs = []
+    for i, (name, st) in enumerate((("port", {"ego": {"ego_kind": "aurorus"}, "obstacle": "train"}), ("ours", {}))):
+        d = tmp_path / name; d.mkdir(); (d / "state_latest.pt").write_bytes(b"x")
+        runs.append(RunInfo(name=str(d), path=str(d), checkpoint=str(d / "state_latest.pt"), kind="상태", mtime=1.0,
+                            size_mb=0.0, label=name, map="real/iccas25", pick_rank=i, settings=st))
+    plain = tmp_path / "plain"; plain.mkdir(); (plain / "state_latest.pt").write_bytes(b"x")
+    runs.append(RunInfo(name=str(plain), path=str(plain), checkpoint=str(plain / "state_latest.pt"), kind="상태",
+                        mtime=1.0, size_mb=0.0))
+    w.set_runs(runs)
+    w._on_policy_picked(runs[0].name)
+    assert w.current_config().ego_kind == "aurorus"
+    w._on_policy_picked(runs[1].name)
+    assert w.current_config().ego_kind == "policy"
+    w._on_policy_picked(runs[0].name)
+    w._on_policy_picked(runs[2].name)                                 # not a pick at all
+    assert w.current_config().ego_kind == "policy"
+
+
 def test_a_seed_change_on_a_running_session_is_sent_live_not_rebuilt(window):
     w = window
     w._on_condition_picked("props")

@@ -50,6 +50,26 @@ def test_an_external_driver_steers_a_calibrated_car(mode):
     assert float((servo - 0.10).abs().max()) < 0.015, servo.tolist()
 
 
+@pytest.mark.parametrize("first", ["driver", "follower"])
+def test_an_external_ego_driver_keeps_its_car_from_a_follower_on_the_external_command_path(first):
+    """`PlanRunner` "track" claims the learner's rows for its follower's command (`claim_external`); a car an external
+    driver has (the console's 내 차 with another method) stays that driver's, whichever came first. 2026-11-12: under every
+    plan checkpoint such a car stood still -- the follower's command, never written with the policy idle, replaced it."""
+    cfg = Config(); cfg.sim.compile = False; cfg.sim.compile_mode = "none"
+    ecfg = EnvConfig(max_steps=1000, hist_len=0, action_mode="plan")
+    env = common.make_env([maps.load("real:korea_2025_iccas")], 2, "cpu", ecfg, cfg=cfg, seed=5)
+    env.reset()
+    drv = _Steady(0.10, 2.0)
+    if first == "driver":
+        env.set_ego_driver(drv); env.claim_external(env.learner_ids)
+    else:
+        env.claim_external(env.learner_ids); env.set_ego_driver(drv)
+    env.step(torch.zeros(env.B, env.act_dim))
+    rows = env.external_slot_rows[0]
+    assert not bool(env.ext_mask[rows].any())
+    assert float(env.last_cmd[rows, 1].min()) > 1.5, env.last_cmd.tolist()      # the driver's 2 m/s, not the unwritten 0
+
+
 def test_map_follows_the_policy_rows_and_leaves_the_traffic_alone():
     """On the same inputs the wrapped tracker answers the traffic rows exactly as the bare iLQR tracker,
     and MAP answers the policy's rows (a race couples the cars, so whole trajectories would not show it)."""
