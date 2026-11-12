@@ -1528,6 +1528,9 @@ def test_an_aurorus_slot_follows_its_path_with_map_unless_told_otherwise(tmp_pat
     assert follower(dict(slot, options={"floor": "off", "follower": "original"}))[1].cfg.follower == "original"
     settings_file(tmp_path, monkeypatch, {"korea_2025_iccas": {"aurorus": {"race": {"options": {"follower": "original"}}}}})
     assert follower(slot)[1].cfg.follower == "original"
+    assert follower(slot)[1].cfg.path_wall_clearance_m is None
+    settings_file(tmp_path, monkeypatch, {"korea_2025_iccas": {"aurorus": {"race": {"options": {"path_wall_clearance_m": 0.3}}}}})
+    assert follower(slot)[1].cfg.path_wall_clearance_m == 0.3
 
 
 def test_the_map_follower_takes_the_maps_tuned_controller(tmp_path, monkeypatch):

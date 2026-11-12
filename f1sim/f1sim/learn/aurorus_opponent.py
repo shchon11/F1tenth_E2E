@@ -948,16 +948,19 @@ class AurorusDriver:
       original, written for a flat 2D scanner, takes those returns for obstacles).
     follower: "map" | "original" (`AurorusConfig.follower`; a `cfg` handed in keeps its own). None = "map": a car that
       races follows its path with the MAP controller, the original's aimed-point steering is for the comparison with
-      the Rust code. map_params: `MAPParams` fields for "map" (`build_map`; None = the ones on file for the map)."""
+      the Rust code. map_params: `MAPParams` fields for "map" (`build_map`; None = the ones on file for the map).
+    path_wall_clearance_m: `AurorusConfig.path_wall_clearance_m` (the value on file arrives here through `tuned_options`;
+      a `cfg` handed in keeps its own)."""
 
     KIND = kind = "aurorus"
     needs_speed = False
 
     def __init__(self, line: Line, scale: Optional[float] = None, cfg: Optional[AurorusConfig] = None, deskew: bool = True,
-                 floor: str = "gate", floor_tol: float = 0.03, follower: Optional[str] = None, map_params: Optional[dict] = None):
+                 floor: str = "gate", floor_tol: float = 0.03, follower: Optional[str] = None, map_params: Optional[dict] = None,
+                 path_wall_clearance_m: Optional[float] = None):
         assert floor in ("off", "gate", "oracle"), floor
         if cfg is None:
-            cfg = AurorusConfig(follower="map" if follower is None else follower)
+            cfg = AurorusConfig(follower="map" if follower is None else follower, path_wall_clearance_m=path_wall_clearance_m)
         self.line, self.scale, self.cfg = line, float(SOLO_SCALE if scale is None else scale), cfg
         self.map_params = map_params
         self.deskew, self.floor, self.floor_tol = bool(deskew), floor, float(floor_tol)
